@@ -31,9 +31,10 @@ use rmcp::{
     model::{
         Annotated, CallToolResult, Content, ListResourcesResult, PaginatedRequestParams,
         ProtocolVersion, RawResource, ReadResourceRequestParams, ReadResourceResult, Resource,
-        ResourceContents, ServerCapabilities, ServerInfo,
+        ResourceContents, ResourceUpdatedNotificationParam, ResourcesCapability,
+        ServerCapabilities, ServerInfo, ToolsCapability,
     },
-    service::{RequestContext, RoleServer, serve_server},
+    service::{Peer, RequestContext, RoleServer, serve_server},
     tool, tool_handler, tool_router,
     transport::io::stdio,
 };
@@ -221,16 +222,23 @@ impl FfxiServer {
 #[tool_handler]
 impl ServerHandler for FfxiServer {
     fn get_info(&self) -> ServerInfo {
+        // Advertise resources/subscribe so MCP clients can call
+        // resources/subscribe and receive ResourceUpdated notifications
+        // when the underlying state changes (low_hp, party update, etc.).
+        let mut caps = ServerCapabilities::default();
+        caps.tools = Some(ToolsCapability { list_changed: None });
+        caps.resources = Some(ResourcesCapability {
+            subscribe: Some(true),
+            list_changed: None,
+        });
+
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::V_2025_03_26;
-        info.capabilities = ServerCapabilities::builder()
-            .enable_tools()
-            .enable_resources()
-            .build();
+        info.capabilities = caps;
         info.instructions = Some(
             "FFXI agent harness. Use `set_goal`-style tools (follow, engage, path_to) \
              not raw moves — the reactor handles per-tick motion. Read `scene://current` \
-             for a compact prose summary; pull `entities://nearby` only when planning."
+             for a compact prose summary; subscribe to scene://current for wake-on-event."
                 .into(),
         );
         info
@@ -347,6 +355,76 @@ async fn run_state_mirror(
     }
 }
 
+/// Background task: subscribe to the event broadcast and emit
+/// `notifications/resources/updated` to the MCP client for events that
+/// change resource content. The client can then re-read the affected
+/// resource (e.g. `scene://current`) on its own schedule.
+///
+/// We *don't* notify on every position change or every chat line —
+/// those would defeat the point of subscription. Filtered to events
+/// the LLM should actually wake on.
+async fn run_notifier(
+    peer: Peer<RoleServer>,
+    mut event_rx: broadcast::Receiver<AgentEvent>,
+) {
+    loop {
+        match event_rx.recv().await {
+            Ok(ev) => {
+                for uri in uris_for_event(&ev) {
+                    let params = ResourceUpdatedNotificationParam {
+                        uri: (*uri).into(),
+                    };
+                    if let Err(e) = peer.notify_resource_updated(params).await {
+                        tracing::warn!(error = %e, uri = uri, "notify_resource_updated failed");
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "notifier lagged");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Map an `AgentEvent` to the set of resource URIs whose content the
+/// event invalidated. Empty slice = don't notify.
+fn uris_for_event(ev: &AgentEvent) -> &'static [&'static str] {
+    match ev {
+        // High-signal events that the LLM strategy layer cares about —
+        // re-read scene to get the latest prose with the updated context.
+        AgentEvent::LowHp { .. }
+        | AgentEvent::PartyMemberLowHp { .. }
+        | AgentEvent::EngagedBy { .. }
+        | AgentEvent::TellReceived { .. }
+        | AgentEvent::Reconnected { .. }
+        | AgentEvent::SceneSummary { .. } => &["scene://current"],
+
+        // Zone changes invalidate scene + party + diagnostics.
+        AgentEvent::ZoneChanged { .. } => {
+            &["scene://current", "party://members", "diagnostics://session"]
+        }
+
+        // Party-roster changes touch party and (incidentally) scene's
+        // party-size summary.
+        AgentEvent::PartyMemberUpdated { .. } => &["party://members", "scene://current"],
+
+        // Stage / diagnostics updates are diagnostics only.
+        AgentEvent::StageChanged { .. } | AgentEvent::Diagnostics { .. } => {
+            &["diagnostics://session"]
+        }
+
+        // Disconnected blanks the scene; resource list itself is unchanged.
+        AgentEvent::Disconnected { .. } => &["scene://current", "diagnostics://session"],
+
+        // Position / entity / chat / event flow signals are tactical
+        // detail. They DO change `scene://current` cosmetically (last
+        // chat line) but the LLM doesn't need to wake for those — that
+        // would defeat the wake-on-signal contract.
+        _ => &[],
+    }
+}
+
 fn read_env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("env var {name} required"))
 }
@@ -405,16 +483,27 @@ async fn main() -> Result<()> {
     // Mirror task — folds events into `state` for resource reads.
     let mirror_handle = tokio::spawn(run_state_mirror(state.clone(), event_rx));
 
+    // Subscribe BEFORE serve_server so we don't miss early events emitted
+    // while the MCP handshake is still in progress.
+    let notifier_event_rx = event_tx.subscribe();
+
     // Build the MCP server and serve over stdio.
     let server = FfxiServer::new(cmd_tx, state, goal_store);
     let running = serve_server(server, stdio())
         .await
         .context("serve MCP server")?;
+
+    // Now that the server is running we can grab its peer and start
+    // forwarding broadcast events as ResourceUpdated notifications.
+    let peer = running.peer().clone();
+    let notifier_handle = tokio::spawn(run_notifier(peer, notifier_event_rx));
+
     running.waiting().await.context("MCP server crashed")?;
 
     // Once the MCP transport closes, shut down background tasks.
     supervisor_handle.abort();
     mirror_handle.abort();
+    notifier_handle.abort();
     Ok(())
 }
 
