@@ -75,10 +75,18 @@ struct PathToParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ChatParams {
-    /// 0=say, 1=shout, 4=party, 5=linkshell, 6=tell. Server-side say
-    /// messages beginning with `@` dispatch as GM commands when the
-    /// account has `gmlevel ≥ 1`.
+    /// 0=say, 1=shout, 4=party, 5=linkshell. **`/tell` does not go here**
+    /// — use the dedicated `tell` tool instead (different opcode).
+    /// Server-side say messages beginning with `@` dispatch as GM
+    /// commands when the account has `gmlevel ≥ 1`.
     kind: u8,
+    text: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TellParams {
+    /// Recipient character name. Resolved cross-zone by the server.
+    to: String,
     text: String,
 }
 
@@ -175,7 +183,7 @@ impl FfxiServer {
     }
 
     #[tool(
-        description = "Send a chat-channel message. `kind`: 0=say, 1=shout, 4=party, 5=linkshell."
+        description = "Send a chat-channel message. `kind`: 0=say, 1=shout, 4=party, 5=linkshell. For /tell use the `tell` tool — it's a different opcode."
     )]
     async fn chat(
         &self,
@@ -183,6 +191,20 @@ impl FfxiServer {
     ) -> Result<CallToolResult, McpError> {
         self.send(AgentCommand::Chat {
             kind: p.kind,
+            text: p.text,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Send a /tell to another player by character name. Server resolves the recipient cross-zone."
+    )]
+    async fn tell(
+        &self,
+        Parameters(p): Parameters<TellParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(AgentCommand::Tell {
+            to: p.to,
             text: p.text,
         })
         .await
@@ -312,9 +334,19 @@ impl ServerHandler for FfxiServer {
                 drop(state);
                 let store = self.goal_store.lock().await;
                 let body = match store.load() {
-                    Ok(g) => serde_json::to_string_pretty(&g).map_err(|e| {
+                    // Active goal: return the persisted command + timestamp.
+                    Ok(Some(g)) => serde_json::to_string_pretty(&serde_json::json!({
+                        "goal": "active",
+                        "command": g.command,
+                        "set_at_unix": g.set_at_unix,
+                    }))
+                    .map_err(|e| {
                         McpError::internal_error(format!("serialize goal: {e}"), None)
                     })?,
+                    // No active goal — explicit "idle" sentinel beats raw `null`.
+                    // Indistinguishable on disk between "never set" and "canceled";
+                    // both render the same to the LLM, which is the intended UX.
+                    Ok(None) => "{\n  \"goal\": \"idle\"\n}".to_string(),
                     Err(e) => {
                         return Err(McpError::internal_error(
                             format!("read goal store: {e}"),

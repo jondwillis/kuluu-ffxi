@@ -293,6 +293,7 @@ fn handle_sub_packet(
                         },
                         heading: head.dir,
                         hp_pct: Some(head.hpp),
+                        bt_target_id: head.bt_target_id,
                     },
                 });
             }
@@ -312,6 +313,7 @@ fn handle_sub_packet(
                         },
                         heading: head.dir,
                         hp_pct: Some(head.hpp),
+                        bt_target_id: head.bt_target_id,
                     },
                 });
             }
@@ -442,6 +444,20 @@ async fn keepalive_loop(
                             .await
                         {
                             tracing::warn!(error = %e, "chat send failed");
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
+                    }
+                    Some(AgentCommand::Tell { to, text }) => {
+                        let payload = build_subpacket_tell(sub_seq, &to, &text);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "tell send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("tell send: {e}"),
+                            });
                         }
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
@@ -644,6 +660,24 @@ fn emit_stage(tx: &broadcast::Sender<AgentEvent>, stage: Stage) {
     let _ = tx.send(AgentEvent::StageChanged { stage });
 }
 
+/// Drain the broadcast event log and fold each event into a watch-published
+/// `SessionState`. Lagged events are skipped (not re-driven) — the watch
+/// view is "latest snapshot" semantics, so missing intermediate state under
+/// load is correct, not lossy.
+pub async fn run_event_folder(
+    mut event_rx: broadcast::Receiver<AgentEvent>,
+    state_tx: tokio::sync::watch::Sender<crate::state::SessionState>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match event_rx.recv().await {
+            Ok(event) => state_tx.send_modify(|s| s.apply_event(&event)),
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => break,
+        }
+    }
+}
+
 fn build_subpacket_header(opcode: u16, size_words: u16, sync: u16) -> [u8; 4] {
     let id_and_size = opcode | (size_words << 9);
     let mut h = [0u8; 4];
@@ -688,6 +722,33 @@ fn build_subpacket_chat(sync: u16, kind: u8, text: &str) -> Vec<u8> {
     // buf[5] = unknown00 (padding) stays 0
     buf[6..6 + str_len].copy_from_slice(&str_bytes[..str_len]);
     // NUL terminator implicit in the zeroed buffer
+    buf
+}
+
+/// `GP_CLI_COMMAND_CHAT_NAME` (0x0B6) — `/tell`. 4-byte header + 1B
+/// unknown00 + 1B unknown01 + 15B sName + variable Mes (≤128). Layout:
+/// `Phoenix/src/map/packets/c2s/0x0b6_chat_name.h`. We pack tightly
+/// (variable Mes length, NUL-terminated, padded up to a 4-byte
+/// boundary) like `build_subpacket_chat` — same `size_words` math.
+fn build_subpacket_tell(sync: u16, recipient: &str, text: &str) -> Vec<u8> {
+    let r_bytes = recipient.as_bytes();
+    let r_len = r_bytes.len().min(14); // leave 1 byte NUL in sName[15]
+    let t_bytes = text.as_bytes();
+    let t_len = t_bytes.len().min(127); // leave 1 byte NUL in Mes[128]
+    // body = 1 unknown00 + 1 unknown01 + 15 sName + variable Mes + 1 NUL
+    let body_unpadded = 1 + 1 + 15 + t_len + 1;
+    let body_padded = (body_unpadded + 3) & !3;
+    let total = 4 + body_padded;
+    let size_words = (total / 4) as u16;
+
+    let mut buf = vec![0u8; total];
+    buf[0..4].copy_from_slice(&build_subpacket_header(0x0B6, size_words, sync));
+    // buf[4] = unknown00 stays 0
+    // buf[5] = unknown01 stays 0
+    // sName at body offset 2 = absolute 6.
+    buf[6..6 + r_len].copy_from_slice(&r_bytes[..r_len]);
+    // Mes at body offset 17 = absolute 21. NUL at end implicit (zero-init).
+    buf[21..21 + t_len].copy_from_slice(&t_bytes[..t_len]);
     buf
 }
 
@@ -801,4 +862,51 @@ fn build_subpacket_pos(sync: u16, x: f32, y: f32, z: f32, heading: u8) -> Vec<u8
 #[allow(dead_code)]
 fn _hint() -> Result<()> {
     bail!("compile guard")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tell_packet_layout_matches_phoenix_struct() {
+        // Build a /tell to "Vanari" with body "hi". Phoenix layout:
+        //   header(4) + unknown00(1) + unknown01(1) + sName[15] + Mes[…] + NUL
+        // Body unpadded = 1 + 1 + 15 + 2 + 1 = 20 → padded to 20 (mul-of-4) →
+        // total 24 → size_words = 6.
+        let buf = build_subpacket_tell(0xABCD, "Vanari", "hi");
+        assert_eq!(buf.len(), 24, "total = 4 hdr + 20 body, padded to mul-of-4");
+
+        // Header: opcode 0x0B6 in low 9 bits, size_words=6 in next 7,
+        // sync=0xABCD in next 16. id_and_size = 0x0B6 | (6 << 9) = 0x0CB6.
+        let id_and_size = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(id_and_size & 0x1FF, 0x0B6, "opcode");
+        assert_eq!(id_and_size >> 9, 6, "size_words");
+        let sync = u16::from_le_bytes([buf[2], buf[3]]);
+        assert_eq!(sync, 0xABCD, "sync passed through");
+
+        // Body field offsets:
+        //   buf[4] = unknown00 = 0
+        //   buf[5] = unknown01 = 0
+        //   buf[6..21] = sName[15], NUL-padded: "Vanari" + 9 NULs
+        //   buf[21..23] = Mes "hi"
+        //   buf[23] = NUL terminator
+        assert_eq!(buf[4], 0, "unknown00");
+        assert_eq!(buf[5], 0, "unknown01");
+        assert_eq!(&buf[6..12], b"Vanari", "recipient name");
+        assert!(buf[12..21].iter().all(|&b| b == 0), "sName NUL-padded");
+        assert_eq!(&buf[21..23], b"hi", "message body");
+        assert_eq!(buf[23], 0, "trailing NUL");
+    }
+
+    #[test]
+    fn tell_packet_truncates_oversize_inputs() {
+        // Recipient longer than 14 chars (sName[15] - NUL) is truncated.
+        let long_name = "a".repeat(50);
+        let buf = build_subpacket_tell(0, &long_name, "x");
+        // sName starts at body offset 2 = absolute 6, occupies 15 bytes,
+        // last byte must be NUL.
+        assert_eq!(&buf[6..20], &[b'a'; 14][..], "first 14 chars of name");
+        assert_eq!(buf[20], 0, "sName NUL-terminated even on truncation");
+    }
 }

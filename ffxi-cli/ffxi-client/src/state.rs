@@ -63,6 +63,10 @@ pub struct Entity {
     pub heading: u8,
     /// HP percentage, 0..=100. None if unknown.
     pub hp_pct: Option<u8>,
+    /// `BtTargetID` from `GP_SERV_POS_HEAD`. Zero = not in combat.
+    /// Drives `EngagedBy` aggro detection in the reactor.
+    #[serde(default)]
+    pub bt_target_id: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +390,10 @@ pub enum AgentCommand {
     /// `@` are dispatched as GM commands when the account has gmlevel ≥ 1.
     /// `kind` matches `GP_CLI_COMMAND_CHAT_STD::Kind` (0=say, 1=shout, 4=party, …).
     Chat { kind: u8, text: String },
+    /// Send a `/tell` to another player. Uses `GP_CLI_COMMAND_CHAT_NAME`
+    /// (0x0B6) — a separate opcode from `Chat`. `to` is the recipient's
+    /// character name; the server resolves it cross-zone.
+    Tell { to: String, text: String },
     /// `GP_CLI_COMMAND_ACTION` — universal "do thing to target" packet.
     /// `target_index` is the server-side `ActIndex` of the entity to target;
     /// `target_id` is its `UniqueNo`. `kind` is a strictly enumerated
@@ -720,7 +728,7 @@ mod tests {
                 name: Some("Other".into()),
                 pos: Vec3 { x: 1.0, y: 0.0, z: 2.0 },
                 heading: 64,
-                hp_pct: Some(80),
+                hp_pct: Some(80), bt_target_id: 0,
             },
         });
         assert_eq!(s.entities.len(), 1);
@@ -734,7 +742,7 @@ mod tests {
                 name: Some("Other".into()),
                 pos: Vec3 { x: 5.0, y: 0.0, z: 6.0 },
                 heading: 32,
-                hp_pct: Some(50),
+                hp_pct: Some(50), bt_target_id: 0,
             },
         });
         assert_eq!(s.entities.len(), 1, "upsert must not duplicate by id");

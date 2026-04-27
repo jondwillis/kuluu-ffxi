@@ -58,7 +58,16 @@ pub enum DecodeError {
 }
 
 impl PosHead {
+    /// Minimum body length for a POS_HEAD without `BtTargetID` — older
+    /// PS2-era layouts ended at `Flags3`. We accept these but report
+    /// `bt_target_id = 0`.
     pub const SIZE: usize = 40;
+
+    /// Body length when the trailing `BtTargetID` field is present.
+    /// Phoenix and modern LSB always send this — see
+    /// `Phoenix/src/map/packets/char_update.cpp:187`. Below this length,
+    /// `bt_target_id` decodes as 0 (= "no target").
+    pub const SIZE_WITH_BT_TARGET: usize = 44;
 
     /// Decode from the *body* of a CHAR_PC/CHAR_NPC sub-packet
     /// (`SubPacket::data`).
@@ -66,6 +75,11 @@ impl PosHead {
         if body.len() < Self::SIZE {
             return Err(DecodeError::Truncated(Self::SIZE, body.len()));
         }
+        let bt_target_id = if body.len() >= Self::SIZE_WITH_BT_TARGET {
+            u32::from_le_bytes(body[40..44].try_into().unwrap())
+        } else {
+            0
+        };
         Ok(Self {
             unique_no: u32::from_le_bytes(body[0..4].try_into().unwrap()),
             act_index: u16::from_le_bytes(body[4..6].try_into().unwrap()),
@@ -82,9 +96,7 @@ impl PosHead {
             flags1: u32::from_le_bytes(body[28..32].try_into().unwrap()),
             flags2: u32::from_le_bytes(body[32..36].try_into().unwrap()),
             flags3: u32::from_le_bytes(body[36..40].try_into().unwrap()),
-            bt_target_id: 0, // BtTargetID is at offset 36..40 in some clients;
-                             // older POS_HEAD ends at flags3. Surface as 0
-                             // until we know which the live server emits.
+            bt_target_id,
         })
     }
 
@@ -342,6 +354,25 @@ mod tests {
             PosHead::decode(&buf),
             Err(DecodeError::Truncated(_, _))
         ));
+    }
+
+    #[test]
+    fn pos_head_extracts_bt_target_id_when_present() {
+        // 44-byte body — full Phoenix layout including BtTargetID.
+        let mut buf = vec![0u8; PosHead::SIZE_WITH_BT_TARGET];
+        buf[0..4].copy_from_slice(&0xCAFE_F00Du32.to_le_bytes()); // UniqueNo
+        buf[40..44].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // BtTargetID
+        let h = PosHead::decode(&buf).unwrap();
+        assert_eq!(h.unique_no, 0xCAFE_F00D);
+        assert_eq!(h.bt_target_id, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn pos_head_legacy_40_byte_body_yields_zero_bt_target() {
+        // PS2-era layout ended at Flags3. We accept these but bt_target_id is 0.
+        let buf = vec![0u8; PosHead::SIZE];
+        let h = PosHead::decode(&buf).unwrap();
+        assert_eq!(h.bt_target_id, 0);
     }
 
     #[test]

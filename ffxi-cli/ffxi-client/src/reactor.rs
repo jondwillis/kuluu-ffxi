@@ -32,7 +32,7 @@ use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::state::{
-    ActionKind, AgentCommand, AgentEvent, SessionState, Vec3,
+    ActionKind, AgentCommand, AgentEvent, EntityKind, SessionState, Vec3,
 };
 
 /// Reactor parameters. Defaults match the plan's "tactical loop" target.
@@ -130,8 +130,52 @@ impl Reactor {
     /// Fold an event into the mirror, then derive any threshold-crossing
     /// events the reactor wants to broadcast.
     pub fn observe_event(&mut self, ev: &AgentEvent) -> Vec<AgentEvent> {
+        // Aggro-edge detection runs *before* apply_event because we need
+        // the old `bt_target_id` to detect a transition into us.
+        let mut out = self.detect_aggro_edge(ev);
         self.state.apply_event(ev);
-        self.detect_threshold_events(ev)
+        out.extend(self.detect_threshold_events(ev));
+        out
+    }
+
+    /// Detect a `BtTargetID` transition where some non-self entity goes
+    /// from "not targeting me" to "targeting me". Emits exactly one
+    /// `EngagedBy` per such transition.
+    fn detect_aggro_edge(&self, ev: &AgentEvent) -> Vec<AgentEvent> {
+        let Some(self_id) = self.state.char_id else {
+            return Vec::new();
+        };
+        let AgentEvent::EntityUpserted { entity } = ev else {
+            return Vec::new();
+        };
+        if entity.id == self_id {
+            return Vec::new();
+        }
+        // We can't reliably distinguish mobs from trusts/pets via our
+        // current `EntityKind` (both come through 0x067/0x068 as Other).
+        // We DO want to skip Pcs and Npcs — friendly entities targeting
+        // us aren't aggro. False positives for trusts/pets are the
+        // tolerable tradeoff for catching real mob aggro.
+        if matches!(entity.kind, EntityKind::Pc | EntityKind::Npc) {
+            return Vec::new();
+        }
+        let now_targeting_self = entity.bt_target_id == self_id;
+        if !now_targeting_self {
+            return Vec::new();
+        }
+        let was_targeting_self = self
+            .state
+            .entities
+            .iter()
+            .find(|e| e.id == entity.id)
+            .map(|prev| prev.bt_target_id == self_id)
+            .unwrap_or(false);
+        if was_targeting_self {
+            return Vec::new();
+        }
+        vec![AgentEvent::EngagedBy {
+            entity_id: entity.id,
+        }]
     }
 
     fn detect_threshold_events(&mut self, ev: &AgentEvent) -> Vec<AgentEvent> {
@@ -429,6 +473,17 @@ mod tests {
     use crate::state::{Entity, EntityKind, PartyMember};
 
     fn upsert(id: u32, pos: Vec3, hp_pct: u8, kind: EntityKind, act_index: u16) -> AgentEvent {
+        upsert_with_bt(id, pos, hp_pct, kind, act_index, 0)
+    }
+
+    fn upsert_with_bt(
+        id: u32,
+        pos: Vec3,
+        hp_pct: u8,
+        kind: EntityKind,
+        act_index: u16,
+        bt_target_id: u32,
+    ) -> AgentEvent {
         AgentEvent::EntityUpserted {
             entity: Entity {
                 id,
@@ -438,6 +493,7 @@ mod tests {
                 pos,
                 heading: 0,
                 hp_pct: Some(hp_pct),
+                bt_target_id,
             },
         }
     }
@@ -698,6 +754,59 @@ mod tests {
         // step_size > distance: clamp at target.
         let p = step_point(from, to, 100.0);
         assert!((p.x - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn engaged_by_emits_on_mob_targeting_self() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        // First sighting: mob isn't targeting us.
+        let derived = r.observe_event(&upsert_with_bt(
+            99, Vec3::default(), 100, EntityKind::Other, 7, 0,
+        ));
+        assert!(derived.is_empty(), "no aggro on initial sighting");
+
+        // Mob now targets self → emit EngagedBy.
+        let derived = r.observe_event(&upsert_with_bt(
+            99, Vec3::default(), 100, EntityKind::Other, 7, 1,
+        ));
+        assert!(matches!(
+            derived.as_slice(),
+            [AgentEvent::EngagedBy { entity_id: 99 }]
+        ));
+    }
+
+    #[test]
+    fn engaged_by_does_not_repeat_while_target_held() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        // Initial state: not targeting.
+        r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 0));
+        // Aggro!
+        let d1 = r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 1));
+        assert_eq!(d1.len(), 1);
+        // Same target across the next tick — not a new edge.
+        let d2 = r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 1));
+        assert!(d2.is_empty(), "no repeat while target unchanged");
+        // Mob disengages and re-engages → emits again.
+        r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 0));
+        let d3 = r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 1));
+        assert_eq!(d3.len(), 1, "re-engage after release fires again");
+    }
+
+    #[test]
+    fn engaged_by_skips_friendly_entities_and_self() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        // PC targeting us — skipped.
+        let d = r.observe_event(&upsert_with_bt(50, Vec3::default(), 100, EntityKind::Pc, 2, 1));
+        assert!(d.is_empty(), "PCs aren't aggro");
+        // NPC targeting us — skipped.
+        let d = r.observe_event(&upsert_with_bt(60, Vec3::default(), 100, EntityKind::Npc, 3, 1));
+        assert!(d.is_empty(), "NPCs aren't aggro");
+        // Self entity (id == char_id) — skipped.
+        let d = r.observe_event(&upsert_with_bt(1, Vec3::default(), 100, EntityKind::Pc, 1, 1));
+        assert!(d.is_empty(), "self isn't aggroing self");
     }
 
     #[test]
