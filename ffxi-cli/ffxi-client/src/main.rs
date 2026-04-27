@@ -2,6 +2,8 @@
 
 use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session, state};
 mod tui;
+#[cfg(feature = "view-3d")]
+mod view3d;
 
 use anyhow::{self, Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -85,6 +87,11 @@ enum Command {
         char_id: u32,
         char_name: String,
     },
+    /// Stage-1 spike for the 3D operator dashboard: spinning cube rendered
+    /// into the terminal via `bevy_ratatui_camera`. No FFXI session involved.
+    /// Build with `--features view-3d`. Press `q` (or Esc) to quit.
+    #[cfg(feature = "view-3d")]
+    Spike3d,
 }
 
 #[tokio::main]
@@ -103,7 +110,17 @@ async fn main() -> Result<()> {
     // so the alternate-screen view stays readable.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    if matches!(args.command, Command::Tui { .. }) {
+    let alternate_screen_cmd = matches!(args.command, Command::Tui { .. }) || {
+        #[cfg(feature = "view-3d")]
+        {
+            matches!(args.command, Command::Spike3d)
+        }
+        #[cfg(not(feature = "view-3d"))]
+        {
+            false
+        }
+    };
+    if alternate_screen_cmd {
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -433,6 +450,21 @@ async fn main() -> Result<()> {
             // execute (e.g., we exited via session error while TUI was
             // mid-render), this prevents leaving the user in alternate-screen
             // raw-mode hell.
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+
+            outcome?;
+        }
+        #[cfg(feature = "view-3d")]
+        Command::Spike3d => {
+            // Bevy's `App::run()` is a blocking call that owns its own loop;
+            // `spawn_blocking` parks it on the runtime's blocking pool so
+            // the tokio worker stays free.
+            let outcome = tokio::task::spawn_blocking(view3d::run_spike).await?;
+
+            // Same alternate-screen safety net as the TUI arm — RatatuiPlugins
+            // owns terminal teardown but a panic mid-render could leave us
+            // in raw mode.
             let _ = crossterm::terminal::disable_raw_mode();
             let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ffxi-proto", "ffxi-client"]
+members = ["ffxi-proto", "ffxi-client", "ffxi-mcp"]
 
 [workspace.package]
 version = "0.1.0"
@@ -25,6 +25,21 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 3D operator dashboard. Pinned to the only working triple today:
+# `bevy_ratatui_camera` 0.16 wants Bevy 0.17 + ratatui 0.29, and
+# `bevy_ratatui` 0.10 is the matching companion. Gated behind the
+# `view-3d` feature on `ffxi-client` so the default build stays lean.
+# We don't trim Bevy default features here: bevy_ratatui_camera 0.16
+# transitively requests `bevy = "0.17"` with defaults, and Cargo unifies
+# feature sets across the dep graph — pruning here would be a no-op.
+bevy = "0.17"
+bevy_ratatui = "0.10"
+bevy_ratatui_camera = "0.16"
+
+# MCP server SDK for the ffxi-mcp crate (Stage 4).
+rmcp = { version = "1.5", features = ["server", "macros", "schemars", "transport-io"] }
+schemars = "1"
 
 # Test fixtures: direct MariaDB access so each integration test can stamp
 # out an isolated account+char and clean up after itself.
