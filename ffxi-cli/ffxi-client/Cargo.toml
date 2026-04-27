@@ -1,0 +1,36 @@
+[package]
+name = "ffxi-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TUI/agent-driven client for LSB/Phoenix FFXI private servers."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ffxi-client"
+path = "src/main.rs"
+
+[dependencies]
+ffxi-proto = { path = "../ffxi-proto" }
+
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+flate2.workspace = true
+ratatui.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+mysql_async.workspace = true
