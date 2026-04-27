@@ -284,15 +284,161 @@ pub enum AgentCommand {
     Chat { kind: u8, text: String },
     /// `GP_CLI_COMMAND_ACTION` — universal "do thing to target" packet.
     /// `target_index` is the server-side `ActIndex` of the entity to target;
-    /// `target_id` is its `UniqueNo`. `action_id` matches
-    /// `GP_CLI_COMMAND_ACTION_ACTIONID` (0=Talk, 2=Attack, 4=AttackOff, …).
-    /// Strict enumeration is the lid: an agent cannot send arbitrary opcodes,
-    /// only this curated `Action` with a known `action_id`.
+    /// `target_id` is its `UniqueNo`. `kind` is a strictly enumerated
+    /// `ActionKind` carrying both the action type and any sub-parameters
+    /// (spell id, weaponskill id, mount id, ground-target position, …).
+    /// Strict enumeration is the lid: an agent cannot pair an arbitrary
+    /// `action_id` with mismatched parameters — the type system says no.
     Action {
         target_id: u32,
         target_index: u16,
-        action_id: u16,
+        kind: ActionKind,
     },
+}
+
+/// Tagged-union of every `0x01A` action the agent can perform. The variant
+/// chosen determines both the wire `ActionID` and the layout of the 16-byte
+/// `ActionBuf` payload — this is the typed alternative to letting the agent
+/// invent (action_id, buf) pairs.
+///
+/// Mirrors `Phoenix/src/map/packets/c2s/0x01a_action.h`. Variants are
+/// additive — when a new action type ships in LSB upstream, add a variant
+/// here without breaking existing agents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActionKind {
+    /// 0x00 — Interact with NPC/Trust.
+    Talk,
+    /// 0x02 — Engage auto-attack on `target_id`.
+    Attack,
+    /// 0x03 — Cast magic. `spell_id` indexes into `Spells.dat`. `pos_*` are
+    /// the ground-target position for AoE-target spells (Tractor, certain
+    /// black/blue magic); zero for self/single-target casts.
+    CastMagic {
+        spell_id: u32,
+        pos_x: f32,
+        pos_y: f32,
+        pos_z: f32,
+    },
+    /// 0x04 — Disengage auto-attack.
+    AttackOff,
+    /// 0x05 — Help flag (call for help on a mob).
+    Help,
+    /// 0x07 — Use a weaponskill.
+    Weaponskill { skill_id: u32 },
+    /// 0x09 — Use a job ability.
+    JobAbility { ability_id: u32 },
+    /// 0x0B — Respond to homepoint warp menu. 0=Accept, 1=MonstrosityCancel,
+    /// 2=MonstrosityRetry.
+    HomepointMenu { status_id: u32 },
+    /// 0x0C — /assist (acquire your target's target).
+    Assist,
+    /// 0x0D — Respond to /raise menu.
+    RaiseMenu { accept: bool },
+    /// 0x0E — Fishing.
+    Fish,
+    /// 0x0F — Change target without engaging.
+    ChangeTarget,
+    /// 0x10 — Ranged attack.
+    Shoot,
+    /// 0x11 — Chocobo dig.
+    ChocoboDig,
+    /// 0x12 — Dismount.
+    Dismount,
+    /// 0x13 — Respond to /tractor menu.
+    TractorMenu { accept: bool },
+    /// 0x14 — Request character update from the server (rarely useful for
+    /// agents; the server pushes updates unprompted).
+    SendResRdy,
+    /// 0x15 — Mining / Quarrying gather attempt.
+    Quarry,
+    /// 0x16 — Sprint (Run mode).
+    Sprint,
+    /// 0x17 — Scout.
+    Scout,
+    /// 0x18 — Toggle blockaid. 0=Disable, 1=Enable, 2=Toggle.
+    Blockaid { status_id: u32 },
+    /// 0x19 — Use a monster skill (Monstrosity).
+    MonsterSkill { skill_id: u32 },
+    /// 0x1A — Summon a mount (chocobo etc.) by `mount_id`.
+    Mount { mount_id: u32 },
+}
+
+impl ActionKind {
+    /// Wire `ActionID` for this action.
+    pub fn action_id(&self) -> u16 {
+        match self {
+            ActionKind::Talk => 0x00,
+            ActionKind::Attack => 0x02,
+            ActionKind::CastMagic { .. } => 0x03,
+            ActionKind::AttackOff => 0x04,
+            ActionKind::Help => 0x05,
+            ActionKind::Weaponskill { .. } => 0x07,
+            ActionKind::JobAbility { .. } => 0x09,
+            ActionKind::HomepointMenu { .. } => 0x0B,
+            ActionKind::Assist => 0x0C,
+            ActionKind::RaiseMenu { .. } => 0x0D,
+            ActionKind::Fish => 0x0E,
+            ActionKind::ChangeTarget => 0x0F,
+            ActionKind::Shoot => 0x10,
+            ActionKind::ChocoboDig => 0x11,
+            ActionKind::Dismount => 0x12,
+            ActionKind::TractorMenu { .. } => 0x13,
+            ActionKind::SendResRdy => 0x14,
+            ActionKind::Quarry => 0x15,
+            ActionKind::Sprint => 0x16,
+            ActionKind::Scout => 0x17,
+            ActionKind::Blockaid { .. } => 0x18,
+            ActionKind::MonsterSkill { .. } => 0x19,
+            ActionKind::Mount { .. } => 0x1A,
+        }
+    }
+
+    /// Fill the 16-byte `ActionBuf` slot per the union layout in
+    /// `Phoenix/src/map/packets/c2s/0x01a_action.h`. Variants without a
+    /// payload leave the buffer zero-filled, which the server tolerates.
+    pub fn fill_action_buf(&self, buf: &mut [u8; 16]) {
+        buf.fill(0);
+        match self {
+            ActionKind::CastMagic {
+                spell_id,
+                pos_x,
+                pos_y,
+                pos_z,
+            } => {
+                buf[0..4].copy_from_slice(&spell_id.to_le_bytes());
+                buf[4..8].copy_from_slice(&pos_x.to_le_bytes());
+                // Wire order is (PosX, PosZ, PosY) per ACTIONBUF_CASTMAGIC,
+                // matching 0x015 POS — different from 0x05E MAPRECT's
+                // (x, y, z). FFXI is inconsistent about this; mirror it.
+                buf[8..12].copy_from_slice(&pos_z.to_le_bytes());
+                buf[12..16].copy_from_slice(&pos_y.to_le_bytes());
+            }
+            ActionKind::Weaponskill { skill_id }
+            | ActionKind::MonsterSkill { skill_id } => {
+                buf[0..4].copy_from_slice(&skill_id.to_le_bytes());
+            }
+            ActionKind::JobAbility { ability_id } => {
+                buf[0..4].copy_from_slice(&ability_id.to_le_bytes());
+            }
+            ActionKind::HomepointMenu { status_id }
+            | ActionKind::Blockaid { status_id } => {
+                buf[0..4].copy_from_slice(&status_id.to_le_bytes());
+            }
+            ActionKind::RaiseMenu { accept }
+            | ActionKind::TractorMenu { accept } => {
+                let id: u32 = if *accept { 0 } else { 1 };
+                buf[0..4].copy_from_slice(&id.to_le_bytes());
+            }
+            ActionKind::Mount { mount_id } => {
+                buf[0..4].copy_from_slice(&mount_id.to_le_bytes());
+            }
+            // Buf-less actions: Talk, Attack, AttackOff, Help, Assist, Fish,
+            // ChangeTarget, Shoot, ChocoboDig, Dismount, SendResRdy, Quarry,
+            // Sprint, Scout. Already zeroed.
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +474,53 @@ mod tests {
             }
             _ => panic!("wrong variant: {cmd:?}"),
         }
+    }
+
+    #[test]
+    fn action_kind_talk_decodes() {
+        let line = r#"{"cmd":"action","target_id":42,"target_index":7,"kind":{"kind":"talk"}}"#;
+        let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+        match cmd {
+            AgentCommand::Action { target_id, target_index, kind } => {
+                assert_eq!((target_id, target_index), (42, 7));
+                assert!(matches!(kind, ActionKind::Talk));
+                assert_eq!(kind.action_id(), 0x00);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn action_kind_castmagic_fills_buf() {
+        let kind = ActionKind::CastMagic { spell_id: 0x101, pos_x: 1.5, pos_y: 0.0, pos_z: -2.5 };
+        assert_eq!(kind.action_id(), 0x03);
+        let mut buf = [0u8; 16];
+        kind.fill_action_buf(&mut buf);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0x101);
+        assert_eq!(f32::from_le_bytes(buf[4..8].try_into().unwrap()), 1.5);
+        // Wire order is (PosX, PosZ, PosY) — matches ACTIONBUF_CASTMAGIC.
+        assert_eq!(f32::from_le_bytes(buf[8..12].try_into().unwrap()), -2.5);
+        assert_eq!(f32::from_le_bytes(buf[12..16].try_into().unwrap()), 0.0);
+    }
+
+    #[test]
+    fn action_kind_weaponskill_fills_skill_id() {
+        let kind = ActionKind::Weaponskill { skill_id: 0xCAFE };
+        assert_eq!(kind.action_id(), 0x07);
+        let mut buf = [0u8; 16];
+        kind.fill_action_buf(&mut buf);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0xCAFE);
+        // Trailing bytes stay zero.
+        assert!(buf[4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn action_kind_raise_menu_accept_zero_reject_one() {
+        let mut buf = [0u8; 16];
+        ActionKind::RaiseMenu { accept: true }.fill_action_buf(&mut buf);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0);
+        ActionKind::RaiseMenu { accept: false }.fill_action_buf(&mut buf);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 1);
     }
 
     #[test]

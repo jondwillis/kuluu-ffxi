@@ -434,10 +434,10 @@ async fn keepalive_loop(
                     Some(AgentCommand::Action {
                         target_id,
                         target_index,
-                        action_id,
+                        kind,
                     }) => {
                         let payload =
-                            build_subpacket_action(sub_seq, target_id, target_index, action_id);
+                            build_subpacket_action(sub_seq, target_id, target_index, &kind);
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
                             .send_encrypted(&payload, bundle_seq, server_last_seq)
@@ -679,17 +679,23 @@ fn build_subpacket_event_end(sync: u16, unique_no: u32, act_index: u16, event_nu
 }
 
 /// `GP_CLI_COMMAND_ACTION` (0x01A) — 4-byte header + 4 UniqueNo + 2 ActIndex
-/// + 2 ActionID + 16 ActionBuf = 28 bytes (size_words=7). For `Talk` (0x00)
-/// the ActionBuf is unused / zero-filled, which the server tolerates.
-fn build_subpacket_action(sync: u16, unique_no: u32, act_index: u16, action_id: u16) -> Vec<u8> {
+/// + 2 ActionID + 16 ActionBuf = 28 bytes (size_words=7). The `ActionKind`
+/// determines both the wire `ActionID` and the layout of the 16-byte buf
+/// (see `ActionKind::fill_action_buf`).
+fn build_subpacket_action(
+    sync: u16,
+    unique_no: u32,
+    act_index: u16,
+    kind: &crate::state::ActionKind,
+) -> Vec<u8> {
     let mut buf = vec![0u8; 28];
     buf[0..4].copy_from_slice(&build_subpacket_header(0x01A, 7, sync));
     buf[4..8].copy_from_slice(&unique_no.to_le_bytes());
     buf[8..10].copy_from_slice(&act_index.to_le_bytes());
-    buf[10..12].copy_from_slice(&action_id.to_le_bytes());
-    // ActionBuf (16 bytes) stays zero — Talk/Attack/AttackOff/ChangeTarget
-    // don't consult it; magic/WS/JA/Mount need real fill which we'll add when
-    // those commands ship.
+    buf[10..12].copy_from_slice(&kind.action_id().to_le_bytes());
+    let mut action_buf = [0u8; 16];
+    kind.fill_action_buf(&mut action_buf);
+    buf[12..28].copy_from_slice(&action_buf);
     buf
 }
 

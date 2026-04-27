@@ -206,7 +206,7 @@ async fn send_enter_action(
     let cmd = AgentCommand::Action {
         target_id: e.id,
         target_index: e.act_index,
-        action_id: ffxi_proto::map::action_id::TALK,
+        kind: crate::state::ActionKind::Talk,
     };
     let _ = cmd_tx.send(cmd).await;
     Some(format!(
