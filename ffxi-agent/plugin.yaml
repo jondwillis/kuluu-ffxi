@@ -1,0 +1,13 @@
+ir_version: "0.1"
+name: ffxi-agent
+version: "0.1.0"
+description: |
+  LLM-driven agent harness for FFXI on LandSandBoat-family servers. Wraps the
+  ffxi-mcp Rust binary in this repo and ships a tiered loop: a 200ms
+  deterministic reactor handles keepalive/follow/auto-attack, the LLM steers
+  by goal.
+author:
+  name: jw
+license: "MIT"
+keywords: [ffxi, mcp, agent-harness, landsandboat]
+targets: [claude-code, opencode, codex]

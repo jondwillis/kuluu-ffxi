@@ -1,0 +1,23 @@
+[submodule "research/Phoenix"]
+	path = research/Phoenix
+	url = git@github.com:phoenixffxi/Phoenix.git
+	branch = beta
+[submodule "server"]
+	path = vendor/server
+	url = git@github.com:LandSandBoat/server.git
+	branch = base
+[submodule "vendor/POLUtils"]
+	path = vendor/POLUtils
+	url = https://github.com/Windower/POLUtils.git
+[submodule "research/AltanaViewer"]
+	path = research/AltanaViewer
+	url = https://github.com/voliathon/AltanaViewer.git
+[submodule "vendor/AltanaListener"]
+	path = vendor/AltanaListener
+	url = https://github.com/voliathon/AltanaListener.git
+[submodule "research/XiEvents"]
+	path = research/XiEvents
+	url = https://github.com/atom0s/XiEvents.git
+[submodule "research/XiPackets"]
+	path = research/XiPackets
+	url = https://github.com/atom0s/XiPackets.git

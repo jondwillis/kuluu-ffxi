@@ -1,0 +1,144 @@
+[package]
+name = "ffxi-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TUI/agent-driven client for LSB/Phoenix FFXI private servers."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ffxi-client"
+path = "src/main.rs"
+
+[features]
+# The native windowed viewer is the mode we develop and ship by default, so
+# enable it out of the box: a bare `cargo build`/`cargo test -p ffxi-client`
+# then compiles `view_native` and runs its tests instead of silently skipping
+# them (its tests only exist under this feature). CI / release / checks.sh
+# still pass `--features native-window` explicitly, so this only affects bare
+# invocations. For the lean headless/relay-only binary (no Bevy), build with
+# `--no-default-features`.
+default = ["native-window"]
+# Enable the native windowed viewer (`native` subcommand). Opens a real
+# OS window via bevy_winit. Bevy's winit event loop must run on the OS
+# main thread on macOS, so main.rs handles the dispatch specially when
+# this feature is active.
+native-window = [
+    "dep:bevy",
+    "dep:bevy_framepace",
+    "dep:arboard",
+    "dep:rfd",
+    "dep:ffxi-viewer-core",
+    "dep:ffxi-viewer-wire",
+]
+# Enable the WebSocket relay listener (`--relay-listen <addr>` global flag).
+# Publishes the same `ffxi-viewer-wire` frames the in-process bridge produces,
+# so external tools (and the future wasm browser viewer) can consume the
+# state stream without the FFXI session having to know about them.
+relay = [
+    "dep:ffxi-viewer-wire",
+    "dep:tokio-tungstenite",
+    "dep:postcard",
+    "dep:futures-util",
+]
+# Per-system tracing. `bevy/trace_chrome` turns on Bevy's instrumentation spans
+# (it implies `bevy/trace`); the chrome *layer* that records them is installed
+# by us in main.rs, because this app disables Bevy's LogPlugin and owns the
+# tracing subscriber. Run with `--features trace` to emit `trace-<n>.json` in
+# CWD on clean exit; load in ui.perfetto.dev. Heavy — strictly for profiling.
+trace = ["bevy/trace_chrome", "dep:tracing-chrome"]
+# DEV-ONLY build-speed feature. Compiles Bevy as a shared `.dylib` so the
+# final link of this large binary becomes a quick relink against the dylib
+# instead of statically linking all of Bevy on every rebuild — the biggest
+# edit->run win for a Bevy app. NEVER ship a release built with this (the
+# binary then depends on libstd/bevy dylibs at the exact toolchain version).
+# Combine with native-window, e.g.:
+#   cargo run -p ffxi-client --features=native-window,relay,dynamic_linking
+dynamic_linking = ["bevy/dynamic_linking"]
+
+[dependencies]
+ffxi-proto = { path = "../ffxi-proto" }
+ffxi-nav = { path = "../ffxi-nav" }
+ffxi-nav-recast = { path = "../ffxi-nav-recast" }
+ffxi-dat = { path = "../ffxi-dat" }
+ffxi-event = { path = "../ffxi-event" }
+
+anyhow.workspace = true
+clap.workspace = true
+# Binary xiloader auth (e.g. HorizonXI's hxiloader v1.3) embeds the local
+# MAC at offset 0x50 of the login payload. mac_address resolves the
+# primary interface MAC cross-platform; thiserror gives us typed errors
+# distinct from the JSON flavor's anyhow! bails.
+mac_address = "1"
+thiserror = "1"
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Chrome/Perfetto trace output for the `trace` feature. Installed manually in
+# main.rs since this app owns its tracing subscriber (LogPlugin is disabled).
+tracing-chrome = { version = "0.7", optional = true }
+# Cross-platform secret storage (macOS Keychain / Windows Credential
+# Manager / Linux Secret Service) for opt-in password remember on the
+# launcher screen. v3 is the current stable line.
+#
+# keyring 3 ships every backend behind a feature — without one, `Entry`
+# constructs fine but every get/set returns `NoStorageAccess`, silently
+# breaking the Remember-password flow. We opt in to the native backend
+# for each platform we ship binaries on.
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+] }
+
+bevy = { workspace = true, optional = true, features = [
+    # Bevy 0.17's official widget kit (button/checkbox/slider/radio/
+    # toggle_switch/virtual_keyboard + dark theme). `experimental_bevy_feathers`
+    # transitively pulls `experimental_bevy_ui_widgets` (headless primitives +
+    # `ValueChange` event), but we list both so a future split doesn't
+    # silently lose widget support.
+    "experimental_bevy_feathers",
+    "experimental_bevy_ui_widgets",
+] }
+# Frame-rate limiter for the native window. Pinned to 0.20.x because that's
+# the line tracking Bevy 0.17 — 0.21 jumps to Bevy 0.18 and would clash.
+# `default-features = false` strips the debug overlay we don't need.
+bevy_framepace = { version = "0.21", optional = true, default-features = false }
+# System clipboard. Used by `/copy` to push recent system-toast lines to
+# the OS clipboard. Optional + gated on `native-window` because the
+# headless/relay binary has no GUI session and no clipboard to write to.
+arboard = { version = "3", optional = true, default-features = false }
+# Native folder picker for the launcher Settings screen (FFXI_DAT_PATH /
+# FFXI_NAVMESH_DIR "Browse…" buttons). On Linux we deliberately select the
+# `xdg-portal` backend instead of rfd's default `gtk3` so the Steam Deck
+# cross-build (docker/build-linux.sh) doesn't need GTK3 dev libs in the
+# image — the portal talks to the desktop's file chooser over D-Bus.
+# macOS / Windows ignore these Linux-only features and use the native
+# Cocoa / Win32 dialogs. `tokio` satisfies the portal backend's
+# async-runtime requirement; the launcher calls the *blocking* API from
+# the winit main thread (never inside a tokio runtime), so no nesting.
+rfd = { version = "0.15", optional = true, default-features = false, features = [
+    "xdg-portal",
+    "tokio",
+] }
+
+ffxi-viewer-wire = { path = "../ffxi-viewer-wire", optional = true }
+ffxi-viewer-core = { path = "../ffxi-viewer-core", optional = true }
+
+# Relay-only deps. Postcard is the canonical encoding; tokio-tungstenite is
+# the WebSocket server. futures-util gives us the SinkExt/StreamExt traits
+# tungstenite's split sink/stream rely on.
+tokio-tungstenite = { version = "0.24", optional = true }
+postcard = { version = "1", optional = true, features = ["use-std"] }
+futures-util = { version = "0.3", optional = true }
+
+[dev-dependencies]
+mysql_async.workspace = true

@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Newer pushes to the same ref cancel in-flight runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # fmt does no compilation, so it gets its own tiny job: it needs neither the
+  # submodules nor the apt/C++ toolchain, finishes in seconds, and runs in
+  # parallel with the heavy job below for fast "you forgot to format" feedback.
+  format:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: scripts/checks.sh fmt
+
+  # clippy, test, and build all share one warm target/ — the bulk of the time
+  # is compiling the Bevy/wgpu/Recast dependency tree, which happens once and is
+  # reused across the three steps. Splitting them into separate jobs would force
+  # each onto a cold cache (caches only save at job end) and recompile that tree
+  # 3× in parallel — more total compute for marginal latency. So they stay
+  # sequential here; only fmt, which compiles nothing, is hived off above.
+  checks:
+    name: clippy · test · build
+    runs-on: ubuntu-latest
+    # Neutralise the macOS -isysroot CXXFLAGS in the committed .cargo/config.toml
+    # (it is a dev-machine workaround); on Linux it points the C++ Recast bridge
+    # at a non-existent macOS SDK. Cargo's non-forced [env] won't override a var
+    # already present in the environment, so setting it here wins.
+    env:
+      CXXFLAGS: ""
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-build
+        with:
+          components: clippy
+          cache-key: ci
+
+      # Every stage delegates to scripts/checks.sh — the same script the local
+      # pre-push hook runs — so the flags live in exactly one place and CI can't
+      # drift from the gate developers run. Stages stay as separate steps for
+      # per-stage pass/fail reporting in the Actions UI.
+      - name: Clippy
+        run: scripts/checks.sh clippy
+
+      # Comment/doc discipline, advisory for now: continue-on-error keeps it
+      # non-blocking until the tree reports zero. Promote to a hard gate (drop
+      # continue-on-error) once it's clean. See run_doc() in scripts/checks.sh.
+      - name: Doc lints (advisory)
+        continue-on-error: true
+        run: scripts/checks.sh doc
+
+      - name: Test
+        run: scripts/checks.sh test
+
+      - name: Build
+        run: scripts/checks.sh build

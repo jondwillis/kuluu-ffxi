@@ -1,0 +1,13 @@
+name: ffxi
+command: ffxi-mcp
+args: []
+env:
+  FFXI_SERVER: "${FFXI_SERVER:-127.0.0.1}"
+  FFXI_AUTH_PORT: "${FFXI_AUTH_PORT:-54231}"
+  FFXI_DATA_PORT: "${FFXI_DATA_PORT:-54230}"
+  FFXI_VIEW_PORT: "${FFXI_VIEW_PORT:-54001}"
+  FFXI_USER: "${FFXI_USER}"
+  FFXI_PASS: "${FFXI_PASS}"
+  FFXI_CHAR_ID: "${FFXI_CHAR_ID}"
+  FFXI_CHAR: "${FFXI_CHAR}"
+  RUST_LOG: "${RUST_LOG:-info}"

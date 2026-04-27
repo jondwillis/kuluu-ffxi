@@ -1,0 +1,51 @@
+[package]
+name = "ffxi-viewer-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Browser front-end for the operator viewer. Renders the same Bevy scene
+# and HUD as the native windowed viewer (`ffxi-client/src/view_native/`),
+# but consumes wire frames from a WebSocket relay (Stage 2) instead of
+# the in-process tokio bridge.
+#
+# Strict consumer: cannot depend on `ffxi-client` (tokio + rustls + raw
+# sockets are native-only). State arrives as `ffxi_viewer_wire::Frame`
+# values, which the `WasmSource` decodes off a `gloo_net` WebSocket and
+# forwards to the core ECS via flume channels.
+#
+# Bevy here is the workspace 0.17 pin, but with `default-features = false`
+# and only the renderer/UI features needed in the browser. `webgl2` is
+# load-bearing — `webgpu` is still gated by browser flags as of early 2026.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pinned to "0.17" directly (matches `workspace.dependencies.bevy`) rather
+# than `workspace = true` because Cargo ignores `default-features = false`
+# on a workspace inherit when the workspace entry itself doesn't disable
+# defaults — and the workspace pin keeps full defaults to satisfy
+# `bevy_ratatui_camera`'s transitive requirement on the native side.
+bevy = { version = "0.18", default-features = false, features = [
+    "bevy_winit",
+    "bevy_render",
+    "bevy_pbr",
+    "bevy_ui",
+    "bevy_text",
+    "webgl2",
+] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+gloo-net = { version = "0.7", features = ["websocket"] }
+gloo-utils = "0.2"
+postcard = { version = "1", features = ["use-std"] }
+flume = { version = "0.11", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+log = "0.4"
+console_log = { version = "1", features = ["color"] }
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = ["Location", "UrlSearchParams", "Window"] }
+
+ffxi-viewer-wire = { path = "../ffxi-viewer-wire" }
+ffxi-viewer-core = { path = "../ffxi-viewer-core" }

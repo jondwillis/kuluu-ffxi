@@ -1,0 +1,14 @@
+[package]
+name = "ffxi-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protocol layer for the LSB/Phoenix FFXI private-server emulators."
+build = "build.rs"
+
+[dependencies]
+md-5.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true

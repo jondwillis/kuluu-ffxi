@@ -1,0 +1,11 @@
+[package]
+name = "ffxi-event"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FFXI client event/cutscene bytecode VM (atom0s/XiEvents), drives faithful NPC dialog and scripted scenes."
+
+[dependencies]
+ffxi-dat = { path = "../ffxi-dat" }
+
+[dev-dependencies]

@@ -1,0 +1,22 @@
+[package]
+name = "ffxi-dat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Rust parser for FFXI client DAT files (VTABLE/FTABLE, MZB, MMB, ANI, textures)."
+build = "build.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+# Used by the `dat-scan-sounds` example for one-job-per-file
+# parallel scanning. Examples can't see `dev-dependencies`, so
+# rayon lives in the regular dep set; it's a small no_std-friendly
+# crate and library consumers that don't use the example pay only
+# a trivial compile-time cost.
+rayon = "1"
+
+[build-dependencies]
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

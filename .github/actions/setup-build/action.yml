@@ -1,0 +1,101 @@
+name: Setup build environment
+description: >-
+  Initialise the build-time submodules, install system dependencies (Linux),
+  and provision a cached Rust toolchain. Shared by CI and release workflows so
+  the dependency list lives in one place.
+
+inputs:
+  components:
+    description: Extra rustup components (comma separated), e.g. "rustfmt, clippy".
+    required: false
+    default: ""
+  targets:
+    description: Extra rustup targets, e.g. "wasm32-unknown-unknown".
+    required: false
+    default: ""
+  cache-key:
+    description: Suffix to distinguish the rust-cache entry between jobs.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # vendor/server (LSB) is consumed at build time by ffxi-proto / ffxi-nav /
+    # ffxi-dat build.rs scripts and is REQUIRED — the build panics without it.
+    # .gitmodules declares it (and Phoenix) with git@ SSH URLs; rewrite the
+    # public LandSandBoat repo to HTTPS so no SSH key is needed. We init only the
+    # public submodules the build actually reads and deliberately skip Phoenix /
+    # AltanaViewer to avoid private-repo auth.
+    # The Bevy/wgpu/Recast test+build artifacts are huge; on a stock runner the
+    # ~14 GB disk fills and `ld` dies with SIGBUS. Reclaim the big preinstalled
+    # toolchains the Rust build never touches. The maintained action deletes the
+    # selected categories in parallel (faster than a serial rm -rf) and tracks
+    # runner-image path changes for us. We enable only android (~9 GB), dotnet
+    # (~2.7 GB) and haskell (~5 GB) — definitely unused and the bulk of the
+    # space — and skip the slow ones: large-packages (apt purge, minutes for
+    # little gain), docker-images and swap-storage (not needed here).
+    - name: Free disk space (Linux)
+      if: runner.os == 'Linux'
+      uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      with:
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: false
+        docker-images: false
+        swap-storage: false
+        tool-cache: false
+
+    - name: Slim dev/test build artifacts
+      shell: bash
+      run: |
+        # Strip debug info from dev/test builds (object files stay small).
+        echo "CARGO_PROFILE_DEV_DEBUG=0" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
+        # Incremental compilation only speeds up *local* rebuilds; on a cold CI
+        # checkout it just bloats target/ and slows the rust-cache save/restore.
+        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+
+    - name: Rewrite SSH submodule URLs to HTTPS
+      shell: bash
+      run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+    - name: Initialise build submodules
+      shell: bash
+      # --depth 1: the build.rs scripts read files, never git history, so a
+      # shallow clone of the (large) LSB server repo is enough and much faster.
+      run: git submodule update --init --depth 1 vendor/server vendor/AltanaListener vendor/POLUtils
+
+    # Mirrors docker/Dockerfile.linux-build. macOS runners already ship clang /
+    # cmake / pkg-config via Xcode, so this step is Linux-only.
+    - name: Install Linux system dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential clang cmake pkg-config \
+          libasound2-dev libudev-dev libdbus-1-dev \
+          libwayland-dev libxkbcommon-dev \
+          libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+          libgl1-mesa-dev
+        # The cxx/Recast C++ bridge needs the glibc dev headers (features.h);
+        # build-essential pulls libc6-dev. Belt-and-suspenders in case the
+        # runner image ships without it.
+        sudo apt-get install -y --no-install-recommends libc6-dev
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - name: Rust build cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
+        # Save the dep/target cache even when a later step (test/build) fails,
+        # so an iterative red→green push sequence doesn't recompile the whole
+        # Bevy/wgpu/Recast tree cold on every attempt.
+        cache-on-failure: "true"

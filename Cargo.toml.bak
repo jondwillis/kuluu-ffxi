@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = ["ffxi-proto", "ffxi-client", "ffxi-mcp", "ffxi-nav", "ffxi-nav-recast", "ffxi-viewer-wire", "ffxi-viewer-core", "ffxi-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "xtask"]
+# `xtask` is project automation run on demand via `cargo xtask` — exclude it
+# from the default set so plain `cargo build`/`test` don't compile it.
+default-members = ["ffxi-proto", "ffxi-client", "ffxi-mcp", "ffxi-nav", "ffxi-nav-recast", "ffxi-viewer-wire", "ffxi-viewer-core", "ffxi-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event"]
+
+# Vendored fork of recastnavigation-rs 0.1.0 with a one-line `#include
+# <cstddef>` in Deterministic.h. Without it, `cargo test` fails with
+# "unknown type name 'size_t'" because cxx-bridge-generated TUs don't
+# transitively include stdlib. See vendor/recastnavigation-rs/recastnavigation/
+# Deterministic/Include/Deterministic.h for the patch comment.
+[patch.crates-io]
+recastnavigation-rs = { path = "vendor/recastnavigation-rs" }
+
+# Bevy's recommended dev profile: build our own crates at opt-level=1
+# (still fast to compile, still debuggable) but compile every dependency
+# at opt-level=3. Without this, `cargo run` of the native-window client
+# spends seconds in unoptimized wgpu/naga/bevy_render startup before the
+# window appears. One-time first-build cost is ~30-60s; incremental
+# rebuilds of workspace crates are unaffected.
+#
+# Build-speed tuning (requires the nightly toolchain pinned in
+# rust-toolchain.toml and `[unstable] codegen-backend = true` in
+# .cargo/config.toml):
+#   * codegen-backend = "cranelift" for *our* crates — Cranelift's debug
+#     codegen is much faster than LLVM, which is the bulk of the wait when
+#     rebuilding a Bevy-dependent workspace crate like ffxi-viewer-core.
+#   * deps keep the LLVM backend at opt-level=3, so their runtime perf is
+#     unchanged (Cranelift does not optimize like LLVM).
+#   * debug = "line-tables-only" keeps file:line in panics/backtraces but
+#     drops variable-level debuginfo, cutting codegen + final link time on
+#     the large client binary. Use debug = true if you need lldb stepping.
+# Cranelift is dev-only; release/wasm builds are untouched (LLVM).
+# opt-level = 2 (not 1): the viewer-core hot paths — per-vertex overbright
+# scanning, cloud/zone mesh building, texture decode — run in *our* crates,
+# so opt-level=1 left them slow enough to stutter zone-loads in dev (release
+# is unaffected). opt-level=2 with Cranelift recovers most of that runtime
+# speed for a modest codegen-time hit; drop back to 1 if rebuilds feel slow.
+[profile.dev]
+opt-level = 2
+debug = "line-tables-only"
+codegen-backend = "cranelift"
+
+[profile.dev.package."*"]
+opt-level = 3
+codegen-backend = "llvm"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/jondwillis/kuluu-ffxi"
+homepage = "https://github.com/jondwillis/kuluu-ffxi"
+authors = ["The Kuluu contributors"]
+description = "A faithful open-source FINAL FANTASY XI client in Rust + Bevy."
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+md-5 = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 3D viewer engine, used by the native windowed client. No longer
+# constrained by `bevy_ratatui_camera`'s feature requirements (the TUI
+# subcommand was removed); future work can now trim Bevy default
+# features per `[features]` of the native-window build.
+bevy = "0.18"
+
+# MCP server SDK for the ffxi-mcp crate (Stage 4).
+rmcp = { version = "1.7", features = ["server", "macros", "schemars", "transport-io"] }
+schemars = "1"
+
+# Test fixtures: direct MariaDB access so each integration test can stamp
+# out an isolated account+char and clean up after itself.
+mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }

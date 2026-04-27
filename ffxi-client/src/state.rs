@@ -1,0 +1,2330 @@
+use std::collections::{HashMap, VecDeque};
+use std::sync::OnceLock;
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+pub fn process_monotonic_ms() -> u64 {
+    static ANCHOR: OnceLock<Instant> = OnceLock::new();
+    let start = ANCHOR.get_or_init(Instant::now);
+    start.elapsed().as_millis() as u64
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum Stage {
+    #[default]
+    Idle,
+    Authenticating,
+    LobbyHandshake,
+    MapBootstrap,
+    Zoning,
+    InZone,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlowfishStatus {
+    Waiting,
+    Sent,
+    Accepted,
+    PendingZone,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Vec3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Position {
+    pub pos: Vec3,
+
+    pub heading: u8,
+
+    #[serde(default = "default_speed")]
+    pub speed: u8,
+
+    #[serde(default = "default_speed")]
+    pub speed_base: u8,
+}
+
+fn default_speed() -> u8 {
+    25
+}
+
+fn default_fps() -> u32 {
+    60
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        Self {
+            pos: Vec3::default(),
+            heading: 0,
+            speed: default_speed(),
+            speed_base: default_speed(),
+        }
+    }
+}
+
+#[inline]
+pub fn heading_to_forward(heading: u8) -> (f32, f32) {
+    let angle = (heading as f32) * std::f32::consts::TAU / 256.0;
+    (angle.cos(), -angle.sin())
+}
+
+pub fn next_target_by_distance(
+    entities: &[Entity],
+    from: Vec3,
+    current: Option<u32>,
+) -> Option<u32> {
+    if entities.is_empty() {
+        return None;
+    }
+    let mut order: Vec<(&Entity, f32)> = entities
+        .iter()
+        .map(|e| {
+            let dx = e.pos.x - from.x;
+            let dy = e.pos.y - from.y;
+            (e, dx * dx + dy * dy)
+        })
+        .collect();
+    order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let ids: Vec<u32> = order.iter().map(|(e, _)| e.id).collect();
+    match current.and_then(|id| ids.iter().position(|&i| i == id)) {
+        Some(p) => Some(ids[(p + 1) % ids.len()]),
+        None => Some(ids[0]),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityKind {
+    Pc,
+    Npc,
+    Mob,
+    Pet,
+    Other,
+}
+
+pub const MODEL_RADIUS_PC: f32 = 0.35;
+pub const MODEL_RADIUS_NPC: f32 = 0.5;
+pub const MODEL_RADIUS_MOB: f32 = 0.55;
+pub const MODEL_RADIUS_PET: f32 = 0.4;
+pub const MODEL_RADIUS_OTHER: f32 = 0.5;
+
+pub const CONTACT_GAP: f32 = 0.0;
+
+pub fn model_radius(kind: EntityKind) -> f32 {
+    match kind {
+        EntityKind::Pc => MODEL_RADIUS_PC,
+        EntityKind::Npc => MODEL_RADIUS_NPC,
+        EntityKind::Mob => MODEL_RADIUS_MOB,
+        EntityKind::Pet => MODEL_RADIUS_PET,
+        EntityKind::Other => MODEL_RADIUS_OTHER,
+    }
+}
+
+fn merge_kind(existing: EntityKind, incoming: EntityKind) -> EntityKind {
+    use EntityKind::*;
+    match (existing, incoming) {
+        (Pc | Npc | Mob | Pet, Other) => existing,
+        _ => incoming,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Entity {
+    pub id: u32,
+
+    pub act_index: u16,
+    pub kind: EntityKind,
+    pub name: Option<String>,
+    pub pos: Vec3,
+    pub heading: u8,
+
+    pub hp_pct: Option<u8>,
+
+    #[serde(default)]
+    pub bt_target_id: u32,
+
+    #[serde(default)]
+    pub claim_id: u32,
+
+    #[serde(default)]
+    pub speed: u8,
+
+    #[serde(default)]
+    pub speed_base: u8,
+
+    #[serde(skip)]
+    pub look: Option<ffxi_proto::decode::LookData>,
+
+    /// NPC animation/animationsub; `animationsub != 0` marks effect NPCs
+    /// (brazier/lamp/torch flames). Preserved across pos-only updates like `look`.
+    #[serde(skip)]
+    pub npc_state: Option<ffxi_proto::decode::NpcState>,
+
+    /// Live LSB STATUS_TYPE byte, refreshed every update (the server writes it
+    /// unconditionally, unlike npc_state's UPDATE_HP-gated fields). 0 = NORMAL.
+    /// Authoritative for target eligibility; see `ffxi_viewer_wire::Entity`.
+    #[serde(default)]
+    pub status: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatLine {
+    pub channel: ChatChannel,
+    pub sender: String,
+    pub text: String,
+
+    pub server_ts: u32,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatChannel {
+    Say,
+    Shout,
+    Tell,
+    Party,
+    Linkshell,
+    Yell,
+    System,
+    Other,
+
+    Battle,
+
+    Debug,
+}
+
+impl ChatChannel {
+    pub fn from_chat_kind(kind: u8) -> Self {
+        use ffxi_proto::map::chat_kind as k;
+        match kind {
+            k::SAY | k::NS_SAY => Self::Say,
+            k::SHOUT | k::NS_SHOUT => Self::Shout,
+            k::TELL => Self::Tell,
+            k::PARTY | k::NS_PARTY => Self::Party,
+            k::LINKSHELL | k::NS_LINKSHELL | k::LINKSHELL2 | k::NS_LINKSHELL2 => Self::Linkshell,
+            k::YELL => Self::Yell,
+            k::SYSTEM_1 | k::SYSTEM_2 | k::SYSTEM_3 => Self::System,
+
+            k::EMOTION => Self::Say,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Diagnostics {
+    pub stage: Option<Stage>,
+    pub blowfish_status: Option<BlowfishStatus>,
+    pub sync_in: Option<u16>,
+    pub sync_out: Option<u16>,
+
+    pub last_server_packet_age_ms: Option<u64>,
+
+    pub cert_sha256: Option<String>,
+    pub map_server_addr: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionState {
+    pub stage: Stage,
+    pub account_id: Option<u32>,
+    pub char_id: Option<u32>,
+    pub character: Option<String>,
+    pub zone_id: Option<u16>,
+    pub entities: Vec<Entity>,
+    pub party: Vec<PartyMember>,
+    pub chat: Vec<ChatLine>,
+    pub diagnostics: Diagnostics,
+
+    #[serde(default)]
+    pub inventory: Inventory,
+
+    #[serde(default)]
+    pub current_goal: Option<ReactorGoalSnapshot>,
+
+    #[serde(default)]
+    pub last_reconnect: Option<ReconnectInfo>,
+
+    #[serde(default = "default_fps")]
+    pub target_fps: u32,
+
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub name_misses: VecDeque<NameExtractionMiss>,
+
+    #[serde(default)]
+    pub dialog: Option<DialogState>,
+
+    #[serde(default)]
+    pub shop: Option<ShopState>,
+
+    #[serde(default)]
+    pub status_icons: Vec<u16>,
+
+    #[serde(default)]
+    pub status_icon_expiries: Vec<u32>,
+
+    #[serde(default)]
+    pub ability_recasts: Vec<(u16, u32)>,
+
+    #[serde(default)]
+    pub logout_countdown: Option<LogoutCountdown>,
+
+    #[serde(default)]
+    pub death_homepoint_secs: Option<u32>,
+
+    #[serde(default)]
+    pub current_weather: Option<u16>,
+
+    #[serde(default = "default_equipment")]
+    pub equipment: [Option<EquippedRef>; EQUIPMENT_SLOTS],
+
+    #[serde(default)]
+    pub spells_known: Vec<u16>,
+
+    #[serde(default)]
+    pub job_abilities_known: Vec<u16>,
+
+    #[serde(default)]
+    pub weaponskills_known: Vec<u16>,
+
+    #[serde(default)]
+    pub pet_abilities_known: Vec<u16>,
+}
+
+pub const EQUIPMENT_SLOTS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EquippedRef {
+    pub container: u8,
+    pub container_index: u8,
+}
+
+fn default_equipment() -> [Option<EquippedRef>; EQUIPMENT_SLOTS] {
+    [None; EQUIPMENT_SLOTS]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LogoutCountdown {
+    pub seconds_remaining: u16,
+
+    pub shutdown: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DialogState {
+    pub event_id: u32,
+    pub npc_id: u32,
+
+    #[serde(default)]
+    pub npc_name: Option<String>,
+    pub act_index: u16,
+    pub event_num: u16,
+    pub event_para: u16,
+    pub mode: u16,
+    pub event_num2: u16,
+    pub event_para2: u16,
+    pub strings: Vec<String>,
+    pub nums: Vec<i32>,
+    /// Event-VM-rendered NPC speech (real dialog text); `None` on the raw-packet
+    /// fallback path (when no event DAT could drive the dialog).
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Event-VM-rendered menu option labels for a choice frame.
+    #[serde(default)]
+    pub choices: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShopState {
+    pub offset_index: u16,
+    pub items: Vec<ShopItem>,
+    pub opened: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShopItem {
+    pub price: u32,
+    pub item_no: u16,
+    pub shop_index: u8,
+    pub skill: u16,
+    pub guild_info: u16,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Inventory {
+    pub containers: HashMap<u8, ContainerInfo>,
+
+    pub all_loaded: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContainerInfo {
+    pub capacity: u8,
+    pub slots: Vec<ItemSlot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemSlot {
+    pub index: u8,
+    pub item_no: u16,
+    pub quantity: u32,
+    pub locked: bool,
+    pub price: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InventoryUpdate {
+    Capacities {
+        capacities: Vec<u16>,
+    },
+
+    SlotChanged {
+        slot: ItemSlot,
+    },
+
+    QuantityChanged {
+        index: u8,
+        quantity: u32,
+        locked: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Default)]
+pub enum ReactorGoalSnapshot {
+    #[default]
+    Idle,
+    Following {
+        target_id: u32,
+        distance: f32,
+    },
+    Engaged {
+        target_id: u32,
+        attack_issued: bool,
+    },
+
+    Pathing {
+        x: f32,
+        y: f32,
+        z: f32,
+        #[serde(default = "one_u32")]
+        waypoints_remaining: u32,
+    },
+
+    Banking {
+        threshold: u8,
+        mog_house_zoneline: u32,
+    },
+}
+
+fn one_u32() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconnectInfo {
+    pub downtime_ms: u64,
+    pub at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameMissKind {
+    NameBitClear,
+
+    NameBitSetExtractionFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NameExtractionMiss {
+    pub opcode: u16,
+    pub unique_no: u32,
+    pub act_index: u16,
+
+    pub send_flag: u8,
+    pub body_len: usize,
+
+    pub body_hex: String,
+    pub miss_kind: NameMissKind,
+
+    pub at_unix_ms: u64,
+}
+
+const NAME_MISSES_CAP: usize = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartyMember {
+    pub id: u32,
+    pub act_index: u16,
+    pub name: Option<String>,
+    pub hp: u32,
+    pub mp: u32,
+    pub tp: u32,
+    pub hp_pct: u8,
+    pub mp_pct: u8,
+    pub zone_no: u16,
+    pub main_job: u8,
+    pub main_job_lv: u8,
+    pub sub_job: u8,
+    pub sub_job_lv: u8,
+    pub is_party_leader: bool,
+    pub is_alliance_leader: bool,
+
+    #[serde(default)]
+    pub in_mog_house: bool,
+}
+
+const CHAT_HISTORY_CAP: usize = 256;
+
+impl SessionState {
+    pub fn self_in_mog_house(&self) -> bool {
+        let Some(char_id) = self.char_id else {
+            return false;
+        };
+        self.party
+            .iter()
+            .find(|m| m.id == char_id)
+            .map(|m| m.in_mog_house)
+            .unwrap_or(false)
+    }
+
+    pub fn self_position(&self) -> Option<Position> {
+        let char_id = self.char_id?;
+        self.entities
+            .iter()
+            .find(|e| e.id == char_id)
+            .map(|e| Position {
+                pos: e.pos,
+                heading: e.heading,
+                speed: e.speed,
+                speed_base: e.speed_base,
+            })
+    }
+
+    pub fn apply_event(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::Connected {
+                account_id,
+                char_id,
+                character,
+                zone_id,
+            } => {
+                self.account_id = Some(*account_id);
+                self.char_id = Some(*char_id);
+                self.character = Some(character.clone());
+                self.zone_id = Some(*zone_id);
+            }
+            AgentEvent::StageChanged { stage } => {
+                self.stage = *stage;
+                self.diagnostics.stage = Some(*stage);
+            }
+            AgentEvent::ZoneChanged { to, .. } => {
+                self.zone_id = if *to == 0 { None } else { Some(*to) };
+
+                self.logout_countdown = None;
+                self.death_homepoint_secs = None;
+
+                self.entities.clear();
+                self.party.clear();
+
+                self.current_weather = None;
+            }
+            AgentEvent::PositionChanged { pos } => {
+                if let Some(char_id) = self.char_id {
+                    if let Some(ent) = self.entities.iter_mut().find(|e| e.id == char_id) {
+                        ent.pos = pos.pos;
+                        ent.heading = pos.heading;
+                        ent.speed = pos.speed;
+                        ent.speed_base = pos.speed_base;
+                    }
+                }
+            }
+            AgentEvent::EntityUpserted {
+                entity,
+                pos_present,
+            } => {
+                if let Some(existing) = self.entities.iter_mut().find(|e| e.id == entity.id) {
+                    let preserved_name = entity.name.clone().or_else(|| existing.name.clone());
+                    let merged_kind = merge_kind(existing.kind, entity.kind);
+
+                    let preserved_hp_pct = entity.hp_pct.or(existing.hp_pct);
+
+                    let preserved_look = entity.look.or(existing.look);
+                    let preserved_npc_state = entity.npc_state.or(existing.npc_state);
+
+                    let (preserved_pos, preserved_heading, preserved_speed, preserved_speed_base) =
+                        if *pos_present {
+                            (entity.pos, entity.heading, entity.speed, entity.speed_base)
+                        } else {
+                            (
+                                existing.pos,
+                                existing.heading,
+                                existing.speed,
+                                existing.speed_base,
+                            )
+                        };
+                    *existing = Entity {
+                        name: preserved_name,
+                        kind: merged_kind,
+                        hp_pct: preserved_hp_pct,
+                        look: preserved_look,
+                        npc_state: preserved_npc_state,
+                        pos: preserved_pos,
+                        heading: preserved_heading,
+                        speed: preserved_speed,
+                        speed_base: preserved_speed_base,
+                        ..entity.clone()
+                    };
+                } else {
+                    self.entities.push(entity.clone());
+                }
+            }
+            AgentEvent::EntityRemoved { id } => {
+                self.entities.retain(|e| e.id != *id);
+            }
+            AgentEvent::NameExtractionMiss { miss } => {
+                self.name_misses.push_back(miss.clone());
+                while self.name_misses.len() > NAME_MISSES_CAP {
+                    self.name_misses.pop_front();
+                }
+            }
+            AgentEvent::EntityPatched {
+                id,
+                act_index,
+                name,
+                kind,
+                hp_pct,
+            } => {
+                let existing = self.entities.iter_mut().find(|e| {
+                    id.is_some_and(|target| e.id == target)
+                        || act_index.is_some_and(|target| e.act_index == target)
+                });
+                if let Some(existing) = existing {
+                    if let Some(n) = name {
+                        existing.name = Some(n.clone());
+                    }
+                    if let Some(k) = kind {
+                        existing.kind = merge_kind(existing.kind, *k);
+                    }
+                    if let Some(hp) = hp_pct {
+                        existing.hp_pct = Some(*hp);
+                    }
+                }
+            }
+            AgentEvent::ChatLine { line } => {
+                self.chat.push(line.clone());
+                if self.chat.len() > CHAT_HISTORY_CAP {
+                    let drop = self.chat.len() - CHAT_HISTORY_CAP;
+                    self.chat.drain(0..drop);
+                }
+            }
+            AgentEvent::LogoutCountdown {
+                seconds_remaining,
+                shutdown,
+            } => {
+                self.logout_countdown = Some(LogoutCountdown {
+                    seconds_remaining: *seconds_remaining,
+                    shutdown: *shutdown,
+                });
+            }
+            AgentEvent::Diagnostics { diagnostics } => {
+                self.diagnostics = diagnostics.clone();
+            }
+            AgentEvent::SetFps { max } => {
+                self.target_fps = *max;
+            }
+            AgentEvent::Disconnected { .. } => {
+                self.stage = Stage::Disconnected;
+                self.diagnostics.stage = Some(Stage::Disconnected);
+
+                self.logout_countdown = None;
+            }
+
+            AgentEvent::Error { message } => {
+                self.chat.push(ChatLine {
+                    channel: ChatChannel::System,
+                    sender: "<error>".into(),
+                    text: message.clone(),
+                    server_ts: 0,
+                });
+                if self.chat.len() > CHAT_HISTORY_CAP {
+                    let drop = self.chat.len() - CHAT_HISTORY_CAP;
+                    self.chat.drain(0..drop);
+                }
+            }
+            AgentEvent::PartyMemberUpdated { member } => {
+                if let Some(existing) = self.party.iter_mut().find(|m| m.id == member.id) {
+                    let preserved_name = if member.name.is_some() {
+                        member.name.clone()
+                    } else {
+                        existing.name.clone()
+                    };
+                    let preserved_leader = if member.name.is_none() {
+                        existing.is_party_leader
+                    } else {
+                        member.is_party_leader
+                    };
+                    let preserved_alliance = if member.name.is_none() {
+                        existing.is_alliance_leader
+                    } else {
+                        member.is_alliance_leader
+                    };
+                    *existing = PartyMember {
+                        name: preserved_name,
+                        is_party_leader: preserved_leader,
+                        is_alliance_leader: preserved_alliance,
+                        ..member.clone()
+                    };
+                } else {
+                    self.party.push(member.clone());
+                }
+            }
+            AgentEvent::Reconnected { downtime_ms } => {
+                let at_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                self.last_reconnect = Some(ReconnectInfo {
+                    downtime_ms: *downtime_ms,
+                    at_unix_ms,
+                });
+            }
+            AgentEvent::ReactorGoalChanged { goal } => {
+                self.current_goal = Some(goal.clone());
+            }
+            AgentEvent::InventoryReady => {
+                self.inventory.all_loaded = true;
+            }
+
+            AgentEvent::ForcedMove { target, .. } => {
+                if let Some(char_id) = self.char_id {
+                    if let Some(ent) = self.entities.iter_mut().find(|e| e.id == char_id) {
+                        ent.pos = target.pos;
+                        ent.heading = target.heading;
+                    }
+                }
+            }
+            AgentEvent::LowHp { .. }
+            | AgentEvent::PartyMemberLowHp { .. }
+            | AgentEvent::EngagedBy { .. }
+            | AgentEvent::TellReceived { .. }
+            | AgentEvent::SceneSummary { .. }
+            | AgentEvent::ActionStarted { .. }
+            | AgentEvent::HumanInControl { .. }
+            | AgentEvent::HumanReleased
+            | AgentEvent::MusicChanged { .. }
+            | AgentEvent::MusicVolumeChanged { .. }
+            | AgentEvent::LevelUp { .. }
+            | AgentEvent::SkillLevelUp { .. }
+            | AgentEvent::VanaTimeSynced { .. } => {}
+            AgentEvent::InventoryUpdated { container, update } => {
+                let entry = self.inventory.containers.entry(*container).or_default();
+                match update {
+                    InventoryUpdate::Capacities { capacities } => {
+                        for (id, cap) in capacities.iter().enumerate() {
+                            if *cap == 0 {
+                                continue;
+                            }
+                            self.inventory
+                                .containers
+                                .entry(id as u8)
+                                .or_default()
+                                .capacity = (*cap).min(u8::MAX as u16) as u8;
+                        }
+                    }
+                    InventoryUpdate::SlotChanged { slot } => {
+                        if slot.quantity == 0 {
+                            entry.slots.retain(|s| s.index != slot.index);
+                        } else if let Some(existing) =
+                            entry.slots.iter_mut().find(|s| s.index == slot.index)
+                        {
+                            *existing = slot.clone();
+                        } else {
+                            entry.slots.push(slot.clone());
+                        }
+                    }
+                    InventoryUpdate::QuantityChanged {
+                        index,
+                        quantity,
+                        locked,
+                    } => {
+                        if *quantity == 0 {
+                            entry.slots.retain(|s| s.index != *index);
+                        } else if let Some(existing) =
+                            entry.slots.iter_mut().find(|s| s.index == *index)
+                        {
+                            existing.quantity = *quantity;
+                            existing.locked = *locked;
+                        }
+                    }
+                }
+            }
+            AgentEvent::EquipUpdated {
+                slot,
+                container,
+                container_index,
+            } => {
+                if let Some(cell) = self.equipment.get_mut(*slot as usize) {
+                    *cell = Some(EquippedRef {
+                        container: *container,
+                        container_index: *container_index,
+                    });
+                }
+            }
+            AgentEvent::EquipCleared => {
+                self.equipment = [None; EQUIPMENT_SLOTS];
+            }
+            AgentEvent::SpellsKnownUpdated { ids } => {
+                self.spells_known = ids.clone();
+            }
+            AgentEvent::CommandDataUpdated {
+                weapon_skills,
+                job_abilities,
+                pet_abilities,
+            } => {
+                self.weaponskills_known = weapon_skills.clone();
+                self.job_abilities_known = job_abilities.clone();
+                self.pet_abilities_known = pet_abilities.clone();
+            }
+
+            AgentEvent::EventStart { .. } | AgentEvent::KeyRotated { .. } => {}
+            AgentEvent::EventDialog { dialog } => {
+                self.dialog = Some(dialog.clone());
+            }
+            AgentEvent::ShopUpdated { shop } => {
+                self.shop = Some(shop.clone());
+            }
+            AgentEvent::StatusIconsUpdated { icons, expiries } => {
+                self.status_icons = icons.clone();
+                self.status_icon_expiries = expiries.clone();
+            }
+            AgentEvent::AbilityRecastsUpdated { recasts } => {
+                self.ability_recasts = recasts.clone();
+            }
+            AgentEvent::DeathTimerUpdated {
+                seconds_until_homepoint,
+            } => {
+                self.death_homepoint_secs = Some(*seconds_until_homepoint);
+            }
+            AgentEvent::WeatherUpdated { weather_number } => {
+                self.current_weather = Some(*weather_number);
+            }
+            AgentEvent::EventEnded => {
+                self.dialog = None;
+
+                self.shop = None;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEvent {
+    Connected {
+        account_id: u32,
+        char_id: u32,
+        character: String,
+        zone_id: u16,
+    },
+    StageChanged {
+        stage: Stage,
+    },
+    ZoneChanged {
+        from: Option<u16>,
+        to: u16,
+    },
+    PositionChanged {
+        pos: Position,
+    },
+    EntityUpserted {
+        entity: Entity,
+
+        #[serde(default = "default_true")]
+        pos_present: bool,
+    },
+    EntityRemoved {
+        id: u32,
+    },
+
+    NameExtractionMiss {
+        miss: NameExtractionMiss,
+    },
+
+    EntityPatched {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        act_index: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<EntityKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hp_pct: Option<u8>,
+    },
+    ChatLine {
+        line: ChatLine,
+    },
+    EventStart {
+        event_id: u32,
+    },
+
+    EventDialog {
+        dialog: DialogState,
+    },
+
+    ShopUpdated {
+        shop: ShopState,
+    },
+
+    StatusIconsUpdated {
+        icons: Vec<u16>,
+        #[serde(default)]
+        expiries: Vec<u32>,
+    },
+
+    AbilityRecastsUpdated {
+        recasts: Vec<(u16, u32)>,
+    },
+
+    WeatherUpdated {
+        weather_number: u16,
+    },
+
+    VanaTimeSynced {
+        game_time: u32,
+    },
+
+    LogoutCountdown {
+        seconds_remaining: u16,
+
+        shutdown: bool,
+    },
+    EventEnded,
+
+    ActionStarted {
+        actor_id: u32,
+        action_id: u32,
+        action_kind: u8,
+    },
+    KeyRotated {
+        previous_status: BlowfishStatus,
+    },
+    Disconnected {
+        reason: String,
+    },
+    Error {
+        message: String,
+    },
+    Diagnostics {
+        diagnostics: Diagnostics,
+    },
+
+    PartyMemberUpdated {
+        member: PartyMember,
+    },
+
+    LowHp {
+        pct: u8,
+    },
+
+    PartyMemberLowHp {
+        id: u32,
+        pct: u8,
+    },
+
+    EngagedBy {
+        entity_id: u32,
+    },
+
+    ForcedMove {
+        mode: u8,
+        target: Position,
+
+        duration_ms: u32,
+    },
+
+    SetFps {
+        max: u32,
+    },
+
+    TellReceived {
+        from: String,
+        text: String,
+    },
+
+    Reconnected {
+        downtime_ms: u64,
+    },
+
+    SceneSummary {
+        text: String,
+    },
+
+    InventoryUpdated {
+        container: u8,
+        update: InventoryUpdate,
+    },
+
+    InventoryReady,
+
+    EquipUpdated {
+        slot: u8,
+        container: u8,
+        container_index: u8,
+    },
+
+    EquipCleared,
+
+    SpellsKnownUpdated {
+        ids: Vec<u16>,
+    },
+
+    CommandDataUpdated {
+        weapon_skills: Vec<u16>,
+        job_abilities: Vec<u16>,
+        pet_abilities: Vec<u16>,
+    },
+
+    ReactorGoalChanged {
+        goal: ReactorGoalSnapshot,
+    },
+
+    HumanInControl {
+        reason: String,
+    },
+
+    HumanReleased,
+
+    MusicChanged {
+        slot: u8,
+        track_id: u16,
+    },
+
+    DeathTimerUpdated {
+        seconds_until_homepoint: u32,
+    },
+
+    MusicVolumeChanged {
+        slot: u8,
+        volume: u8,
+    },
+
+    LevelUp {
+        player_id: u32,
+    },
+
+    SkillLevelUp {
+        skill_id: u16,
+        level: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum AgentCommand {
+    Move {
+        x: f32,
+        y: f32,
+        z: f32,
+        heading: u8,
+    },
+
+    StopMove,
+
+    RequestZoneChange {
+        line_id: u32,
+    },
+
+    MogHouseExit {
+        kind: MogHouseExit,
+    },
+
+    EndEvent,
+
+    EndEventChoice {
+        event_id: u32,
+        act_index: u16,
+        event_num: u16,
+        choice: u32,
+    },
+
+    Disconnect,
+
+    ReqLogout {
+        kind: ReqLogoutKind,
+    },
+
+    Snapshot,
+
+    Chat {
+        kind: u8,
+        text: String,
+    },
+
+    Tell {
+        to: String,
+        text: String,
+    },
+
+    Action {
+        target_id: u32,
+        target_index: u16,
+        kind: ActionKind,
+    },
+
+    ReturnToHomePoint,
+
+    SetFps {
+        max: u32,
+    },
+
+    Follow {
+        target_id: u32,
+        distance: f32,
+    },
+
+    Engage {
+        target_id: u32,
+    },
+
+    PathTo {
+        x: f32,
+        y: f32,
+        z: f32,
+        force: bool,
+    },
+
+    Cancel,
+
+    UseItem {
+        container: u8,
+        slot: u8,
+        item_no: u32,
+        target_id: u32,
+        target_index: u16,
+    },
+
+    Equip {
+        container: u8,
+
+        container_index: u8,
+
+        equip_slot: u8,
+    },
+
+    BankWhenFull {
+        threshold: u8,
+        mog_house_zoneline: u32,
+    },
+
+    ShopBuy {
+        shop_no: u16,
+        shop_index: u8,
+        qty: u32,
+    },
+
+    CheckTarget {
+        target_id: u32,
+        target_index: u16,
+        kind: CheckKind,
+    },
+
+    Heal {
+        mode: HealMode,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckKind {
+    Check,
+
+    CheckName,
+
+    CheckParam,
+}
+
+impl CheckKind {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            CheckKind::Check => 0,
+            CheckKind::CheckName => 1,
+            CheckKind::CheckParam => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealMode {
+    Toggle,
+
+    On,
+
+    Off,
+}
+
+impl HealMode {
+    pub fn as_u32(self) -> u32 {
+        match self {
+            HealMode::Toggle => 0,
+            HealMode::On => 1,
+            HealMode::Off => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReqLogoutKind {
+    LogoutToggle,
+
+    LogoutOn,
+
+    LogoutOff,
+
+    ShutdownToggle,
+
+    ShutdownOn,
+
+    ShutdownOff,
+}
+
+impl ReqLogoutKind {
+    pub fn wire_pair(self) -> (u16, u16) {
+        use ffxi_proto::map::reqlogout::{kind, mode};
+        match self {
+            ReqLogoutKind::LogoutToggle => (mode::TOGGLE, kind::LOGOUT),
+            ReqLogoutKind::LogoutOn => (mode::LOGOUT_ON, kind::LOGOUT),
+            ReqLogoutKind::LogoutOff => (mode::OFF, kind::LOGOUT),
+            ReqLogoutKind::ShutdownToggle => (mode::TOGGLE, kind::SHUTDOWN),
+            ReqLogoutKind::ShutdownOn => (mode::SHUTDOWN_ON, kind::SHUTDOWN),
+            ReqLogoutKind::ShutdownOff => (mode::OFF, kind::SHUTDOWN),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MogHouseExit {
+    Home,
+
+    Sandoria { slot: u8 },
+
+    Bastok { slot: u8 },
+
+    Windurst { slot: u8 },
+
+    Jeuno { slot: u8 },
+
+    Whitegate { slot: u8 },
+
+    Adoulin { slot: u8 },
+
+    Mog1F,
+
+    Mog2F,
+
+    MogGarden,
+}
+
+impl MogHouseExit {
+    pub fn wire_pair(self) -> (u8, u8) {
+        match self {
+            MogHouseExit::Home => (1, 0),
+            MogHouseExit::Sandoria { slot } => (1, slot),
+            MogHouseExit::Bastok { slot } => (2, slot),
+            MogHouseExit::Windurst { slot } => (3, slot),
+            MogHouseExit::Jeuno { slot } => (4, slot),
+            MogHouseExit::Whitegate { slot } => (5, slot),
+            MogHouseExit::Adoulin { slot } => (9, slot),
+            MogHouseExit::Mog1F => (0, 126),
+            MogHouseExit::Mog2F => (0, 125),
+            MogHouseExit::MogGarden => (0, 127),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActionKind {
+    Talk,
+
+    Attack,
+
+    CastMagic {
+        spell_id: u32,
+        pos_x: f32,
+        pos_y: f32,
+        pos_z: f32,
+    },
+
+    AttackOff,
+
+    Help,
+
+    Weaponskill {
+        skill_id: u32,
+    },
+
+    JobAbility {
+        ability_id: u32,
+    },
+
+    HomepointMenu {
+        status_id: u32,
+    },
+
+    Assist,
+
+    RaiseMenu {
+        accept: bool,
+    },
+
+    Fish,
+
+    ChangeTarget,
+
+    Shoot,
+
+    ChocoboDig,
+
+    Dismount,
+
+    TractorMenu {
+        accept: bool,
+    },
+
+    SendResRdy,
+
+    Quarry,
+
+    Sprint,
+
+    Scout,
+
+    Blockaid {
+        status_id: u32,
+    },
+
+    MonsterSkill {
+        skill_id: u32,
+    },
+
+    Mount {
+        mount_id: u32,
+    },
+}
+
+impl ActionKind {
+    pub fn action_id(&self) -> u16 {
+        match self {
+            ActionKind::Talk => 0x00,
+            ActionKind::Attack => 0x02,
+            ActionKind::CastMagic { .. } => 0x03,
+            ActionKind::AttackOff => 0x04,
+            ActionKind::Help => 0x05,
+            ActionKind::Weaponskill { .. } => 0x07,
+            ActionKind::JobAbility { .. } => 0x09,
+            ActionKind::HomepointMenu { .. } => 0x0B,
+            ActionKind::Assist => 0x0C,
+            ActionKind::RaiseMenu { .. } => 0x0D,
+            ActionKind::Fish => 0x0E,
+            ActionKind::ChangeTarget => 0x0F,
+            ActionKind::Shoot => 0x10,
+            ActionKind::ChocoboDig => 0x11,
+            ActionKind::Dismount => 0x12,
+            ActionKind::TractorMenu { .. } => 0x13,
+            ActionKind::SendResRdy => 0x14,
+            ActionKind::Quarry => 0x15,
+            ActionKind::Sprint => 0x16,
+            ActionKind::Scout => 0x17,
+            ActionKind::Blockaid { .. } => 0x18,
+            ActionKind::MonsterSkill { .. } => 0x19,
+            ActionKind::Mount { .. } => 0x1A,
+        }
+    }
+
+    pub fn fill_action_buf(&self, buf: &mut [u8; 16]) {
+        buf.fill(0);
+        match self {
+            ActionKind::CastMagic {
+                spell_id,
+                pos_x,
+                pos_y,
+                pos_z,
+            } => {
+                buf[0..4].copy_from_slice(&spell_id.to_le_bytes());
+                buf[4..8].copy_from_slice(&pos_x.to_le_bytes());
+
+                buf[8..12].copy_from_slice(&pos_z.to_le_bytes());
+                buf[12..16].copy_from_slice(&pos_y.to_le_bytes());
+            }
+            ActionKind::Weaponskill { skill_id } | ActionKind::MonsterSkill { skill_id } => {
+                buf[0..4].copy_from_slice(&skill_id.to_le_bytes());
+            }
+            ActionKind::JobAbility { ability_id } => {
+                buf[0..4].copy_from_slice(&ability_id.to_le_bytes());
+            }
+            ActionKind::HomepointMenu { status_id } | ActionKind::Blockaid { status_id } => {
+                buf[0..4].copy_from_slice(&status_id.to_le_bytes());
+            }
+            ActionKind::RaiseMenu { accept } | ActionKind::TractorMenu { accept } => {
+                let id: u32 = if *accept { 0 } else { 1 };
+                buf[0..4].copy_from_slice(&id.to_le_bytes());
+            }
+            ActionKind::Mount { mount_id } => {
+                buf[0..4].copy_from_slice(&mount_id.to_le_bytes());
+            }
+
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weather_fold_sets_and_zone_change_clears() {
+        let mut s = SessionState::default();
+        assert_eq!(s.current_weather, None);
+        s.apply_event(&AgentEvent::WeatherUpdated { weather_number: 6 });
+        assert_eq!(s.current_weather, Some(6));
+        s.apply_event(&AgentEvent::ZoneChanged {
+            from: Some(230),
+            to: 231,
+        });
+        assert_eq!(s.current_weather, None);
+    }
+
+    #[test]
+    fn agent_event_roundtrip() {
+        let ev = AgentEvent::PositionChanged {
+            pos: Position {
+                pos: Vec3 {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                },
+                heading: 64,
+                ..Position::default()
+            },
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: AgentEvent = serde_json::from_str(&s).unwrap();
+        match back {
+            AgentEvent::PositionChanged { pos } => {
+                assert_eq!(pos.heading, 64);
+                assert_eq!(pos.pos.y, 2.0);
+            }
+            _ => panic!("wrong variant: {back:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_command_roundtrip() {
+        let line = r#"{"cmd":"move","x":1.0,"y":2.0,"z":3.0,"heading":42}"#;
+        let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+        match cmd {
+            AgentCommand::Move { x, y, z, heading } => {
+                assert_eq!((x, y, z, heading), (1.0, 2.0, 3.0, 42));
+            }
+            _ => panic!("wrong variant: {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn action_kind_talk_decodes() {
+        let line = r#"{"cmd":"action","target_id":42,"target_index":7,"kind":{"kind":"talk"}}"#;
+        let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+        match cmd {
+            AgentCommand::Action {
+                target_id,
+                target_index,
+                kind,
+            } => {
+                assert_eq!((target_id, target_index), (42, 7));
+                assert!(matches!(kind, ActionKind::Talk));
+                assert_eq!(kind.action_id(), 0x00);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn action_kind_castmagic_fills_buf() {
+        let kind = ActionKind::CastMagic {
+            spell_id: 0x101,
+            pos_x: 1.5,
+            pos_y: 0.0,
+            pos_z: -2.5,
+        };
+        assert_eq!(kind.action_id(), 0x03);
+        let mut buf = [0u8; 16];
+        kind.fill_action_buf(&mut buf);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0x101);
+        assert_eq!(f32::from_le_bytes(buf[4..8].try_into().unwrap()), 1.5);
+
+        assert_eq!(f32::from_le_bytes(buf[8..12].try_into().unwrap()), -2.5);
+        assert_eq!(f32::from_le_bytes(buf[12..16].try_into().unwrap()), 0.0);
+    }
+
+    #[test]
+    fn action_kind_weaponskill_fills_skill_id() {
+        let kind = ActionKind::Weaponskill { skill_id: 0xCAFE };
+        assert_eq!(kind.action_id(), 0x07);
+        let mut buf = [0u8; 16];
+        kind.fill_action_buf(&mut buf);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0xCAFE);
+
+        assert!(buf[4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn party_member_upsert_preserves_name_across_attr_only_update() {
+        let mut s = SessionState::default();
+        let from_list = PartyMember {
+            id: 42,
+            act_index: 7,
+            name: Some("Vanari".into()),
+            hp: 2000,
+            mp: 100,
+            tp: 0,
+            hp_pct: 100,
+            mp_pct: 100,
+            zone_no: 230,
+            main_job: 1,
+            main_job_lv: 75,
+            sub_job: 6,
+            sub_job_lv: 37,
+            is_party_leader: true,
+            is_alliance_leader: false,
+            in_mog_house: false,
+        };
+        s.apply_event(&AgentEvent::PartyMemberUpdated { member: from_list });
+        assert_eq!(s.party.len(), 1);
+        assert_eq!(s.party[0].name.as_deref(), Some("Vanari"));
+        assert!(s.party[0].is_party_leader);
+
+        let from_attr = PartyMember {
+            id: 42,
+            act_index: 7,
+            name: None,
+            hp: 1500,
+            mp: 100,
+            tp: 1234,
+            hp_pct: 75,
+            mp_pct: 100,
+            zone_no: 230,
+            main_job: 1,
+            main_job_lv: 75,
+            sub_job: 6,
+            sub_job_lv: 37,
+            is_party_leader: false,
+            is_alliance_leader: false,
+            in_mog_house: false,
+        };
+        s.apply_event(&AgentEvent::PartyMemberUpdated { member: from_attr });
+        assert_eq!(s.party.len(), 1, "upsert by id");
+        assert_eq!(s.party[0].name.as_deref(), Some("Vanari"), "name preserved");
+        assert!(s.party[0].is_party_leader, "leader preserved");
+        assert_eq!(s.party[0].hp, 1500, "HP overwritten");
+        assert_eq!(s.party[0].hp_pct, 75);
+    }
+
+    #[test]
+    fn action_kind_raise_menu_accept_zero_reject_one() {
+        let mut buf = [0u8; 16];
+        ActionKind::RaiseMenu { accept: true }.fill_action_buf(&mut buf);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0);
+        ActionKind::RaiseMenu { accept: false }.fill_action_buf(&mut buf);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn apply_event_folds_in_documented_order() {
+        let mut s = SessionState::default();
+        assert_eq!(s.stage, Stage::Idle);
+
+        s.apply_event(&AgentEvent::StageChanged {
+            stage: Stage::Authenticating,
+        });
+        assert_eq!(s.stage, Stage::Authenticating);
+        assert_eq!(s.diagnostics.stage, Some(Stage::Authenticating));
+
+        s.apply_event(&AgentEvent::Connected {
+            account_id: 42,
+            char_id: 7,
+            character: "Tester".into(),
+            zone_id: 100,
+        });
+        assert_eq!(s.account_id, Some(42));
+        assert_eq!(s.char_id, Some(7));
+        assert_eq!(s.character.as_deref(), Some("Tester"));
+        assert_eq!(s.zone_id, Some(100));
+
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: Entity {
+                id: 999,
+                act_index: 1,
+                kind: EntityKind::Pc,
+                name: Some("Other".into()),
+                pos: Vec3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 2.0,
+                },
+                heading: 64,
+                hp_pct: Some(80),
+                bt_target_id: 0,
+                claim_id: 0,
+                speed: 0,
+                speed_base: 0,
+                look: None,
+                npc_state: None,
+                status: 0,
+            },
+            pos_present: true,
+        });
+        assert_eq!(s.entities.len(), 1);
+
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: Entity {
+                id: 999,
+                act_index: 1,
+                kind: EntityKind::Pc,
+                name: Some("Other".into()),
+                pos: Vec3 {
+                    x: 5.0,
+                    y: 0.0,
+                    z: 6.0,
+                },
+                heading: 32,
+                hp_pct: Some(50),
+                bt_target_id: 0,
+                claim_id: 0,
+                speed: 0,
+                speed_base: 0,
+                look: None,
+                npc_state: None,
+                status: 0,
+            },
+            pos_present: true,
+        });
+        assert_eq!(s.entities.len(), 1, "upsert must not duplicate by id");
+        assert_eq!(s.entities[0].pos.x, 5.0, "upsert must overwrite");
+
+        s.party.push(PartyMember {
+            id: 1,
+            act_index: 1,
+            name: None,
+            hp: 0,
+            mp: 0,
+            tp: 0,
+            hp_pct: 0,
+            mp_pct: 100,
+            zone_no: 100,
+            main_job: 0,
+            main_job_lv: 0,
+            sub_job: 0,
+            sub_job_lv: 0,
+            is_party_leader: true,
+            is_alliance_leader: false,
+            in_mog_house: false,
+        });
+        s.apply_event(&AgentEvent::ZoneChanged {
+            from: Some(100),
+            to: 230,
+        });
+        assert_eq!(s.zone_id, Some(230));
+        assert!(
+            s.entities.is_empty(),
+            "zone change must clear stale entities"
+        );
+        assert!(
+            s.party.is_empty(),
+            "zone change must clear stale party (avoids stale dead-state on home-point warp)"
+        );
+
+        s.apply_event(&AgentEvent::Disconnected {
+            reason: "test".into(),
+        });
+        assert_eq!(s.stage, Stage::Disconnected);
+    }
+
+    #[test]
+    fn merge_kind_specialized_wins_over_other() {
+        use EntityKind::*;
+
+        assert_eq!(merge_kind(Pc, Other), Pc);
+        assert_eq!(merge_kind(Npc, Other), Npc);
+        assert_eq!(merge_kind(Mob, Other), Mob);
+        assert_eq!(merge_kind(Pet, Other), Pet);
+
+        assert_eq!(merge_kind(Other, Pet), Pet);
+        assert_eq!(merge_kind(Other, Npc), Npc);
+
+        assert_eq!(merge_kind(Npc, Pet), Pet);
+        assert_eq!(merge_kind(Pet, Npc), Npc);
+
+        assert_eq!(merge_kind(Other, Other), Other);
+    }
+
+    fn make_test_entity(id: u32, name: Option<&str>, kind: EntityKind) -> Entity {
+        Entity {
+            id,
+            act_index: id as u16,
+            kind,
+            name: name.map(str::to_string),
+            pos: Vec3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            heading: 0,
+            hp_pct: Some(100),
+            bt_target_id: 0,
+            claim_id: 0,
+            speed: 0,
+            speed_base: 0,
+            look: None,
+            npc_state: None,
+            status: 0,
+        }
+    }
+
+    #[test]
+    fn entity_upserted_preserves_name_across_attr_only_update() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: make_test_entity(42, Some("Sigli-Sea"), EntityKind::Npc),
+            pos_present: true,
+        });
+        assert_eq!(s.entities[0].name.as_deref(), Some("Sigli-Sea"));
+
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: make_test_entity(42, None, EntityKind::Npc),
+            pos_present: true,
+        });
+        assert_eq!(
+            s.entities[0].name.as_deref(),
+            Some("Sigli-Sea"),
+            "name must persist across attr-only update"
+        );
+    }
+
+    #[test]
+    fn entity_upserted_status_refreshes_on_pos_only_tick() {
+        let mut s = SessionState::default();
+        let mut ent = make_test_entity(42, Some("Antlion"), EntityKind::Mob);
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: ent.clone(),
+            pos_present: true,
+        });
+        assert_eq!(s.entities[0].status, 0, "spawns NORMAL");
+
+        ent.npc_state = None;
+        ent.status = 3;
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: ent,
+            pos_present: true,
+        });
+        assert_eq!(
+            s.entities[0].status, 3,
+            "a pos-only tick (no npc_state) must still refresh STATUS_TYPE"
+        );
+    }
+
+    #[test]
+    fn entity_upserted_preserves_position_when_pos_absent() {
+        let mut s = SessionState::default();
+        let mut ent = make_test_entity(42, Some("Tunnel Worm"), EntityKind::Mob);
+        ent.pos = Vec3 {
+            x: 123.0,
+            y: 4.0,
+            z: -89.0,
+        };
+        ent.heading = 200;
+        ent.speed = 40;
+        ent.speed_base = 40;
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: ent,
+            pos_present: true,
+        });
+        assert_eq!(s.entities[0].pos.x, 123.0);
+
+        let mut hp_only = make_test_entity(42, None, EntityKind::Mob);
+        hp_only.pos = Vec3::default();
+        hp_only.heading = 0;
+        hp_only.speed = 0;
+        hp_only.speed_base = 0;
+        hp_only.hp_pct = Some(75);
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: hp_only,
+            pos_present: false,
+        });
+        assert_eq!(
+            s.entities[0].pos,
+            Vec3 {
+                x: 123.0,
+                y: 4.0,
+                z: -89.0
+            },
+            "position must persist across a non-UPDATE_POS tick (no teleport to origin)"
+        );
+        assert_eq!(s.entities[0].heading, 200, "heading must persist too");
+        assert_eq!(s.entities[0].speed, 40, "speed must persist too");
+        assert_eq!(
+            s.entities[0].hp_pct,
+            Some(75),
+            "the HP this tick *did* carry must still apply"
+        );
+
+        let mut moved = make_test_entity(42, None, EntityKind::Mob);
+        moved.pos = Vec3 {
+            x: 200.0,
+            y: 4.0,
+            z: -50.0,
+        };
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: moved,
+            pos_present: true,
+        });
+        assert_eq!(
+            s.entities[0].pos.x, 200.0,
+            "a genuine position update must overwrite, not get preserved"
+        );
+    }
+
+    #[test]
+    fn entity_upserted_preserves_hp_pct_across_position_only_update() {
+        let mut s = SessionState::default();
+        let mut ent = make_test_entity(42, Some("Worker Bee"), EntityKind::Npc);
+        ent.hp_pct = Some(50);
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: ent,
+            pos_present: true,
+        });
+        assert_eq!(s.entities[0].hp_pct, Some(50));
+
+        let mut pos_only = make_test_entity(42, None, EntityKind::Npc);
+        pos_only.hp_pct = None;
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: pos_only,
+            pos_present: true,
+        });
+        assert_eq!(
+            s.entities[0].hp_pct,
+            Some(50),
+            "hp_pct must persist across UPDATE_POS-only follow-up (no UPDATE_HP bit set)"
+        );
+
+        let mut died = make_test_entity(42, None, EntityKind::Npc);
+        died.hp_pct = Some(0);
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: died,
+            pos_present: true,
+        });
+        assert_eq!(
+            s.entities[0].hp_pct,
+            Some(0),
+            "Some(0) (mob died) must overwrite, not get preserved as Some(50)"
+        );
+    }
+
+    #[test]
+    fn entity_upserted_preserves_look_across_position_only_update() {
+        use ffxi_proto::decode::LookData;
+        let mut s = SessionState::default();
+        let mut ent = make_test_entity(42, Some("Jonisbarius"), EntityKind::Pc);
+        let look = LookData::Equipped {
+            face: 3,
+            race: 3,
+            head: 0x1000,
+            body: 0x2004,
+            hands: 0x3000,
+            legs: 0x4000,
+            feet: 0x5000,
+            main: 0x6000,
+            sub: 0x7000,
+            ranged: 0x8000,
+        };
+        ent.look = Some(look);
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: ent,
+            pos_present: true,
+        });
+        assert!(matches!(
+            s.entities[0].look,
+            Some(LookData::Equipped { race: 3, .. })
+        ));
+
+        let mut pos_only = make_test_entity(42, None, EntityKind::Pc);
+        pos_only.look = None;
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: pos_only,
+            pos_present: true,
+        });
+        assert!(
+            matches!(s.entities[0].look, Some(LookData::Equipped { race: 3, .. })),
+            "look must persist across position-only refresh (no look bits set)"
+        );
+
+        let mut changed = make_test_entity(42, None, EntityKind::Pc);
+        changed.look = Some(LookData::Standard { modelid: 99 });
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: changed,
+            pos_present: true,
+        });
+        assert!(
+            matches!(s.entities[0].look, Some(LookData::Standard { modelid: 99 })),
+            "Some(new_look) must overwrite, not get preserved as the prior Equipped value"
+        );
+    }
+
+    #[test]
+    fn entity_upserted_specialized_kind_resists_demotion_to_other() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: make_test_entity(7, Some("Stout Servitor"), EntityKind::Npc),
+            pos_present: true,
+        });
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: make_test_entity(7, Some("Stout Servitor"), EntityKind::Other),
+            pos_present: true,
+        });
+        assert_eq!(s.entities[0].kind, EntityKind::Npc);
+    }
+
+    #[test]
+    fn entity_patched_by_id_sets_name_on_existing_entity() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: make_test_entity(99, None, EntityKind::Other),
+            pos_present: true,
+        });
+        s.apply_event(&AgentEvent::EntityPatched {
+            id: Some(99),
+            act_index: None,
+            name: Some("Mihli Aliapoh".into()),
+            kind: Some(EntityKind::Pet),
+            hp_pct: None,
+        });
+        assert_eq!(s.entities[0].name.as_deref(), Some("Mihli Aliapoh"));
+        assert_eq!(s.entities[0].kind, EntityKind::Pet);
+    }
+
+    #[test]
+    fn entity_patched_by_act_index_resolves_when_id_unknown() {
+        let mut s = SessionState::default();
+        let mut ent = make_test_entity(0xABCD, None, EntityKind::Other);
+        ent.act_index = 0x07A5;
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: ent,
+            pos_present: true,
+        });
+        s.apply_event(&AgentEvent::EntityPatched {
+            id: None,
+            act_index: Some(0x07A5),
+            name: Some("Crab Familiar".into()),
+            kind: Some(EntityKind::Pet),
+            hp_pct: Some(75),
+        });
+        assert_eq!(s.entities[0].name.as_deref(), Some("Crab Familiar"));
+        assert_eq!(s.entities[0].kind, EntityKind::Pet);
+        assert_eq!(s.entities[0].hp_pct, Some(75));
+    }
+
+    #[test]
+    fn name_extraction_miss_appends_to_ring_buffer_with_cap() {
+        let mut s = SessionState::default();
+
+        for i in 0..(NAME_MISSES_CAP as u32 + 5) {
+            s.apply_event(&AgentEvent::NameExtractionMiss {
+                miss: NameExtractionMiss {
+                    opcode: 0x00E,
+                    unique_no: i,
+                    act_index: i as u16,
+                    send_flag: 0,
+                    body_len: 64,
+                    body_hex: format!("{:02x}", i & 0xFF),
+                    miss_kind: NameMissKind::NameBitClear,
+                    at_unix_ms: 1000 + u64::from(i),
+                },
+            });
+        }
+        assert_eq!(s.name_misses.len(), NAME_MISSES_CAP);
+
+        assert_eq!(s.name_misses.front().unwrap().unique_no, 5);
+
+        assert_eq!(
+            s.name_misses.back().unwrap().unique_no,
+            NAME_MISSES_CAP as u32 + 4
+        );
+    }
+
+    #[test]
+    fn name_extraction_miss_round_trips_serde() {
+        let miss = NameExtractionMiss {
+            opcode: 0x00D,
+            unique_no: 0x0102_0304,
+            act_index: 0x07A5,
+            send_flag: 0x09,
+            body_len: 72,
+            body_hex: "deadbeef".into(),
+            miss_kind: NameMissKind::NameBitSetExtractionFailed,
+            at_unix_ms: 1_700_000_000_123,
+        };
+        let s = serde_json::to_string(&miss).unwrap();
+        let back: NameExtractionMiss = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.unique_no, 0x0102_0304);
+        assert_eq!(back.miss_kind, NameMissKind::NameBitSetExtractionFailed);
+
+        assert!(s.contains("name_bit_set_extraction_failed"));
+    }
+
+    #[test]
+    fn entity_patched_for_unknown_entity_is_dropped() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::EntityPatched {
+            id: Some(1234),
+            act_index: None,
+            name: Some("Ghost".into()),
+            kind: Some(EntityKind::Pet),
+            hp_pct: None,
+        });
+        assert!(s.entities.is_empty());
+    }
+
+    #[test]
+    fn heal_command_roundtrip() {
+        for (line, expect) in [
+            (r#"{"cmd":"heal","mode":"toggle"}"#, HealMode::Toggle),
+            (r#"{"cmd":"heal","mode":"on"}"#, HealMode::On),
+            (r#"{"cmd":"heal","mode":"off"}"#, HealMode::Off),
+        ] {
+            let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+            match cmd {
+                AgentCommand::Heal { mode } => assert_eq!(mode, expect, "for line {line}"),
+                _ => panic!("wrong variant for {line}: {cmd:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn use_item_command_roundtrip() {
+        let line = r#"{"cmd":"use_item","container":0,"slot":3,"item_no":4112,"target_id":42,"target_index":7}"#;
+        let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+        match cmd {
+            AgentCommand::UseItem {
+                container,
+                slot,
+                item_no,
+                target_id,
+                target_index,
+            } => {
+                assert_eq!(
+                    (container, slot, item_no, target_id, target_index),
+                    (0, 3, 4112, 42, 7)
+                );
+            }
+            _ => panic!("wrong variant: {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn bank_when_full_command_roundtrip() {
+        let line = r#"{"cmd":"bank_when_full","threshold":90,"mog_house_zoneline":12345}"#;
+        let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+        match cmd {
+            AgentCommand::BankWhenFull {
+                threshold,
+                mog_house_zoneline,
+            } => {
+                assert_eq!((threshold, mog_house_zoneline), (90, 12345));
+            }
+            _ => panic!("wrong variant: {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn reactor_goal_changed_event_roundtrip() {
+        let ev = AgentEvent::ReactorGoalChanged {
+            goal: ReactorGoalSnapshot::Engaged {
+                target_id: 99,
+                attack_issued: true,
+            },
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: AgentEvent = serde_json::from_str(&s).unwrap();
+        match back {
+            AgentEvent::ReactorGoalChanged {
+                goal:
+                    ReactorGoalSnapshot::Engaged {
+                        target_id,
+                        attack_issued,
+                    },
+            } => {
+                assert_eq!(target_id, 99);
+                assert!(attack_issued);
+            }
+            other => panic!("wrong shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconnected_fold_writes_last_reconnect() {
+        let mut s = SessionState::default();
+        assert!(s.last_reconnect.is_none());
+        s.apply_event(&AgentEvent::Reconnected { downtime_ms: 1234 });
+        let info = s.last_reconnect.expect("set");
+        assert_eq!(info.downtime_ms, 1234);
+        assert!(info.at_unix_ms > 0, "wall-clock stamped");
+    }
+
+    #[test]
+    fn self_position_returns_self_entity_pos() {
+        let mut s = SessionState::default();
+
+        assert!(s.self_position().is_none());
+
+        s.apply_event(&AgentEvent::Connected {
+            account_id: 1,
+            char_id: 99,
+            character: "Self".into(),
+            zone_id: 230,
+        });
+
+        assert!(s.self_position().is_none());
+
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: Entity {
+                id: 99,
+                act_index: 5,
+                kind: EntityKind::Pc,
+                name: Some("Self".into()),
+                pos: Vec3 {
+                    x: 10.0,
+                    y: 20.0,
+                    z: 30.0,
+                },
+                heading: 64,
+                hp_pct: Some(100),
+                bt_target_id: 0,
+                claim_id: 0,
+                speed: 40,
+                speed_base: 40,
+                look: None,
+                npc_state: None,
+                status: 0,
+            },
+            pos_present: true,
+        });
+        let p = s.self_position().expect("self entity present");
+        assert_eq!(
+            p.pos,
+            Vec3 {
+                x: 10.0,
+                y: 20.0,
+                z: 30.0
+            }
+        );
+        assert_eq!(p.heading, 64);
+        assert_eq!(p.speed, 40);
+        assert_eq!(p.speed_base, 40);
+
+        s.apply_event(&AgentEvent::PositionChanged {
+            pos: Position {
+                pos: Vec3 {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                },
+                heading: 32,
+                speed: 25,
+                speed_base: 25,
+            },
+        });
+        let p = s.self_position().expect("self entity present");
+        assert_eq!(
+            p.pos,
+            Vec3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0
+            }
+        );
+        assert_eq!(p.heading, 32);
+    }
+
+    #[test]
+    fn reactor_goal_changed_fold_writes_current_goal() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::ReactorGoalChanged {
+            goal: ReactorGoalSnapshot::Following {
+                target_id: 42,
+                distance: 3.0,
+            },
+        });
+        match s.current_goal {
+            Some(ReactorGoalSnapshot::Following {
+                target_id,
+                distance,
+            }) => {
+                assert_eq!(target_id, 42);
+                assert!((distance - 3.0).abs() < 1e-3);
+            }
+            other => panic!("expected Following, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inventory_ready_sets_all_loaded() {
+        let mut s = SessionState::default();
+        assert!(!s.inventory.all_loaded);
+        s.apply_event(&AgentEvent::InventoryReady);
+        assert!(s.inventory.all_loaded);
+    }
+
+    #[test]
+    fn inventory_fold_capacities_writes_each_container() {
+        let mut s = SessionState::default();
+        let mut caps = vec![0u16; 18];
+        caps[0] = 80;
+        caps[1] = 200;
+        caps[5] = 30;
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::Capacities { capacities: caps },
+        });
+        assert_eq!(s.inventory.containers[&0].capacity, 80);
+        assert_eq!(s.inventory.containers[&1].capacity, 200);
+        assert_eq!(s.inventory.containers[&5].capacity, 30);
+        assert!(
+            !s.inventory.containers.contains_key(&7),
+            "zero-capacity entries skipped"
+        );
+    }
+
+    #[test]
+    fn inventory_fold_slot_changed_inserts_then_updates_then_removes() {
+        let mut s = SessionState::default();
+        let slot = ItemSlot {
+            index: 3,
+            item_no: 4112,
+            quantity: 5,
+            locked: false,
+            price: 0,
+        };
+
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::SlotChanged { slot: slot.clone() },
+        });
+        assert_eq!(s.inventory.containers[&0].slots.len(), 1);
+        assert_eq!(s.inventory.containers[&0].slots[0].quantity, 5);
+
+        let mut updated = slot.clone();
+        updated.quantity = 12;
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::SlotChanged { slot: updated },
+        });
+        assert_eq!(s.inventory.containers[&0].slots.len(), 1, "no duplication");
+        assert_eq!(s.inventory.containers[&0].slots[0].quantity, 12);
+
+        let mut removed = slot.clone();
+        removed.quantity = 0;
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::SlotChanged { slot: removed },
+        });
+        assert!(s.inventory.containers[&0].slots.is_empty());
+    }
+
+    #[test]
+    fn inventory_fold_quantity_changed_updates_existing_slot_only() {
+        let mut s = SessionState::default();
+
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::QuantityChanged {
+                index: 7,
+                quantity: 99,
+                locked: false,
+            },
+        });
+
+        assert!(
+            s.inventory
+                .containers
+                .get(&0)
+                .map(|c| c.slots.is_empty())
+                .unwrap_or(true),
+            "ITEM_NUM without prior ITEM_LIST drops"
+        );
+
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::SlotChanged {
+                slot: ItemSlot {
+                    index: 7,
+                    item_no: 4112,
+                    quantity: 1,
+                    locked: false,
+                    price: 0,
+                },
+            },
+        });
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::QuantityChanged {
+                index: 7,
+                quantity: 25,
+                locked: true,
+            },
+        });
+        let slot = &s.inventory.containers[&0].slots[0];
+        assert_eq!(slot.quantity, 25);
+        assert!(slot.locked, "lock flag updated");
+        assert_eq!(slot.item_no, 4112, "item_no preserved (qty-only update)");
+    }
+
+    #[test]
+    fn apply_event_caps_chat_history() {
+        let mut s = SessionState::default();
+        for i in 0..(CHAT_HISTORY_CAP + 50) {
+            s.apply_event(&AgentEvent::ChatLine {
+                line: ChatLine {
+                    channel: ChatChannel::Say,
+                    sender: "x".into(),
+                    text: format!("msg {i}"),
+                    server_ts: 0,
+                },
+            });
+        }
+        assert_eq!(s.chat.len(), CHAT_HISTORY_CAP);
+
+        assert_eq!(s.chat[0].text, "msg 50");
+    }
+}

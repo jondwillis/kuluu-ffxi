@@ -1,0 +1,57 @@
+# Workspace-local cargo config.
+#
+# ## CXXFLAGS workaround for `recastnavigation-rs` build (macOS)
+#
+# `recastnavigation-rs` (used by `ffxi-nav-recast`) is a `cxx`-bridged
+# Rust binding to the C++ Recast/Detour library. On macOS it requires a
+# functioning Apple Clang + libc++ install.
+#
+# On at least one developer machine, the Command Line Tools install has
+# a stale layout where clang's first C++ search path
+# (`/Library/Developer/CommandLineTools/usr/include/c++/v1/`) is empty,
+# while the actual headers live in the SDK at
+# `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/`.
+# Without this `-isystem`, cxx-build fails with `'algorithm' file not found`.
+#
+# The proper fix is to reinstall Command Line Tools:
+#     sudo rm -rf /Library/Developer/CommandLineTools
+#     xcode-select --install
+# After which this `[env]` block can be removed.
+#
+# `MACOSX_DEPLOYMENT_TARGET` is pinned because some `cxx` versions emit a
+# default that targets the *current* macOS, which on bleeding-edge macOS
+# (e.g. 26.x) is past what the Recast C++ source has been verified
+# against. 14.0 is a safe modern floor.
+[env]
+CXXFLAGS = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1"
+
+# ## Build-speed tuning
+#
+# Enables the per-profile `codegen-backend` key used by [profile.dev] in the
+# workspace Cargo.toml. Requires a nightly cargo (see rust-toolchain.toml).
+# NOTE: this block makes a *stable* cargo error out, so every consumer of this
+# repo must be on nightly — including the Steam Deck cross-build container
+# (docker/Dockerfile.linux-build), which auto-switches to nightly because it
+# bind-mounts this repo and reads rust-toolchain.toml. That build is --release,
+# so Cranelift (dev-only) never runs there; it just uses LLVM.
+[unstable]
+codegen-backend = true
+
+# NOTE: sccache was tried here and removed — measured 0.32% hit rate in this
+# tree (it only helps clean/cross-machine rebuilds, not the incremental edit
+# loop) while adding per-rustc wrapper overhead. Re-add `[build] rustc-wrapper
+# = "sccache"` only if you start doing frequent from-scratch builds.
+
+# Link the large client binary with LLVM lld instead of Apple ld. Modest here
+# (Apple ld-1267 is already the fast "ld-prime") but still typically quicker on
+# a binary this size. macOS-target-scoped, so the Linux/Deck cross-build is
+# untouched. Install with `brew install lld` (the `ld64.lld` Mach-O driver
+# lives in the standalone `lld` formula, not `llvm`).
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=--ld-path=/opt/homebrew/opt/lld/bin/ld64.lld"]
+
+# Project automation. `cargo xtask game` wires a retail FFXI install into
+# vendor/game-files/ — see xtask/src/main.rs and the README "Getting the game
+# files" section.
+[alias]
+xtask = "run --quiet --package xtask --"

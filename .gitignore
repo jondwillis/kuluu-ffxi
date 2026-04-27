@@ -1,0 +1,71 @@
+# Rust workspace artifacts (defense-in-depth; component .gitignores cover this too)
+**/target/
+**/*.rs.bk
+
+# Node / abandoned scaffolds
+**/node_modules/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+
+# Claude Code per-user settings + plugin runtime state
+.claude/settings.local.json
+.claude/.*/
+
+# OpenCode / sibling-agent harness session state — ephemeral, per-user.
+.omo/
+.omc/
+
+# Environment / credentials
+.env
+.env.local
+*.env
+
+# Logs
+*.log
+log/
+
+# jacq build output — regenerate via `jacq build` in ffxi-agent/.
+ffxi-agent/dist/
+
+# FFXI client DATs — SE-copyrighted, NEVER commit. Local copy of the user's
+# HorizonXI install lives here (see ffxi-dat/README or the async-watching-waffle
+# plan for layout). See README "Getting the game files"; FFXI_DAT_PATH points at
+# vendor/game-files/SquareEnix/FINAL FANTASY XI/.
+vendor/game-files/
+
+# xi-tinkerer — vendored as AGPL-3 reference only (read-only, never linked).
+# See vendor/xi-tinkerer/CLAIM.md and memory note `xi_tinkerer_agpl_reference`.
+vendor/xi-tinkerer/
+
+# RZN MapViewer (galkareeve/ffxi backup) — STRICT cite-only. NO LICENSE in repo,
+# and mapViewer/mapViewer/model_ff11.cpp is verbatim Noesis plugin source
+# (Rich Whitehouse, "all rights to be taken to the grave"). Treat as
+# all-rights-reserved: do NOT copy, derive, paste, or link from any crate.
+# See vendor/RZN-mapviewer/CLAIM.md and memory note `rzn_mapviewer_cite_only`.
+vendor/RZN-mapviewer/
+
+# XIM browser FFXI client (GPL-3) — read-only feature reference, NEVER commit.
+# Fetch a local copy with `research/fetch-xim.sh`. See research/README.md.
+research/xim/
+# stray top-level copy (older fetch location)
+/xim/
+.functional-emotions
+.claude/worktrees/
+
+# WASM build outputs — each bundle is ~150MB and exceeds GitHub's 100MB
+# blob limit. Regenerate locally via the wasm toolchain.
+ffxi-viewer-wasm/dist/
+profile.json.gz
+
+# Container-built Linux binaries (docker/build-linux.sh)
+/dist/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/

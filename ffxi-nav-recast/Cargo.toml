@@ -1,0 +1,18 @@
+[package]
+name = "ffxi-nav-recast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Recast/Detour-backed NavMesh for FFXI zones, sourced from LandSandBoat/xiNavmeshes."
+
+[dependencies]
+ffxi-nav = { path = "../ffxi-nav" }
+recastnavigation-rs = "0.1"
+glam = "0.30"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+dirs = "5"
+
+[dev-dependencies]
+tempfile = "3"

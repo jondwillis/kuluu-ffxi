@@ -1,0 +1,70 @@
+[package]
+name = "ffxi-viewer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Bevy ECS plugins, world model, camera, and HUD shared by both the native
+# windowed viewer (ffxi-client/src/view_native/) and the browser viewer
+# (ffxi-viewer-wasm/). No tokio, no I/O — state arrives through the
+# `SceneSource` trait, implemented separately by each front-end.
+#
+# Stage-3 wasm build will need to override `bevy` to use webgl2 features
+# and drop platform backends that are linux-only — this Cargo.toml uses
+# the workspace bevy (full default features) for the native build.
+
+[dependencies]
+# `serialize` enables serde derives on `KeyCode`, `Modifiers` modifiers, and
+# the rest of `bevy_input` — needed by `keybinds::KeyBind` so the on-disk
+# `keybinds.json` can name keys (`"KeyW"`, `"Numpad8"`, etc.) without a
+# hand-rolled match table covering every variant.
+bevy = { workspace = true, features = ["serialize"] }
+ffxi-viewer-wire = { path = "../ffxi-viewer-wire" }
+ffxi-dat = { path = "../ffxi-dat" }
+# Phase 3 faithful character render path: pure-Rust XIM port of per-joint
+# world pose (`skeleton_instance`), the 8-slot animation coordinator
+# (`animation`), and animation *selection* (`actor_state`). Glam-only, no
+# Bevy — `ffxi_actor_render` adapts its glam `Mat4` pose into the custom
+# skinned material's bone uniform.
+ffxi-actor = { path = "../ffxi-actor" }
+# Compile-time name tables (spell / ability / item id → English name)
+# scraped from LSB SQL. The HUD's menu modules — Equipment (Stage 1),
+# Magic / Abilities (Stage 2), Items (Stage 3) — look up display
+# strings here so SceneSnapshot stays small (carries u16 ids only).
+ffxi-proto = { path = "../ffxi-proto" }
+serde = { workspace = true }
+# Glyph rasterizer for the 3D nameplate billboards. Bevy's text path is
+# locked to the 2D pipeline (UI / Text2d), which doesn't depth-test
+# against 3D meshes — so for true world-space occluded labels we
+# rasterize text → Image ourselves and stamp it onto a 3D quad. ab_glyph
+# is already a transitive dep (bevy_text pulls it in); declaring it
+# directly keeps that path stable across future Bevy version bumps.
+ab_glyph = "0.2"
+
+# Native-only: ADPCM/PCM decoders for `.bgw` / `.spw`. The audio plugin
+# (see `audio.rs`) reads BGM tracks from the local install in response
+# to LSB's 0x05F music-change packets. wasm has no local install to
+# read from; a browser viewer would have to receive pre-decoded PCM
+# over the websocket if/when that's wanted.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ffxi-audio = { path = "../ffxi-audio" }
+# Stable id for the synthetic picking pointer that bridges window-space mouse
+# input onto the off-screen render-scale target (graphics::render_scale, which
+# is itself native-only). from_u128 only — no getrandom needed.
+uuid = { version = "1", default-features = false }
+# We bypass rodio's format detection entirely (see audio.rs ::
+# `RawPcmSource`) because Bevy 0.17 builds rodio without any
+# decoder features. So no hound dep needed — we feed rodio
+# pre-decoded f32 samples directly.
+
+# wasm32 has no syscall for wall-clock time; std::time::SystemTime::now()
+# panics there. The HUD's reconnect-age line needs millis-since-epoch, so
+# we delegate to JS's `Date.now()` on wasm targets only.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
+[dev-dependencies]
+# JSON round-trip test for `GraphicsSettings`. Not in the runtime deps:
+# the resource itself only needs `serde` derives; serialization is the
+# `ffxi-client::graphics_store` layer's concern.
+serde_json = { workspace = true }

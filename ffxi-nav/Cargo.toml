@@ -1,0 +1,21 @@
+[package]
+name = "ffxi-nav"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "2D/3D navigation and pathfinding for FFXI agent harness."
+build = "build.rs"
+
+[dependencies]
+pathfinding = "4"
+serde = { workspace = true }
+bincode = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+glam = "0.30"
+thiserror = { workspace = true }
+
+[build-dependencies]
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

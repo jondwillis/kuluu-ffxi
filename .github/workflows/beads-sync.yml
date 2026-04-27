@@ -1,0 +1,59 @@
+name: beads-sync (GitHub Issues → beads)
+
+# Opt-in, one-way mirror of GitHub Issues into the committed beads backlog.
+# Manual-only for now (workflow_dispatch) — flip on the schedule below once
+# you've confirmed a run works end to end. See scripts/beads-github-sync.sh for
+# the local, already-tested variant.
+#
+# ⚠️ UNVERIFIED IN CI. A fresh checkout carries only `.beads/issues.jsonl` (the
+# Dolt working db is gitignored), and `bd init` here configures a Dolt remote
+# over SSH that CI can't reach. The bootstrap step below rebuilds a local db
+# from the committed JSONL; verify it on a manual run before trusting this. The
+# reliable path today is running scripts/beads-github-sync.sh in a working clone.
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "17 * * * *"   # hourly; enable once a manual run is verified
+
+permissions:
+  contents: write   # commit the refreshed .beads/issues.jsonl back
+  issues: read
+
+concurrency:
+  group: beads-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install beads
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Rebuild local beads db from committed JSONL
+        # The Dolt working db isn't in git; reconstruct it from the tracked
+        # export so `bd import` has somewhere to upsert into. --sandbox keeps bd
+        # from trying to reach the SSH Dolt remote during CI.
+        run: bd init --from-jsonl --non-interactive --sandbox --skip-agents --skip-hooks || true
+
+      - name: Sync GitHub Issues → beads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/beads-github-sync.sh
+
+      - name: Commit refreshed export
+        run: |
+          if git diff --quiet -- .beads/issues.jsonl; then
+            echo "No beads changes to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .beads/issues.jsonl
+          git commit -m "chore(beads): sync GitHub Issues → beads"
+          git push

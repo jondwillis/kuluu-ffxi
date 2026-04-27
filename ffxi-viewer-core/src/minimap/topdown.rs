@@ -1,0 +1,354 @@
+use bevy::asset::RenderAssetUsages;
+use bevy::camera::ScalingMode;
+use bevy::camera::{ClearColorConfig, RenderTarget};
+use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+
+pub const MINIMAP_BAKE_LAYER: usize = 3;
+
+use crate::components::InGameEntity;
+use crate::dat_mzb::{LoadMzbInFlight, MzbCollisionGeometry};
+use crate::snapshot::SceneState;
+
+use super::{MinimapAabb, MinimapState, MINIMAP_TEX_SIZE};
+
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct TopdownCullPolicy {
+    pub top_cull_yalms: f32,
+}
+
+impl Default for TopdownCullPolicy {
+    fn default() -> Self {
+        Self {
+            top_cull_yalms: 6.0,
+        }
+    }
+}
+
+#[derive(Resource, Debug, Default)]
+pub enum BakeStage {
+    #[default]
+    Idle,
+
+    Requested {
+        waited: u8,
+    },
+
+    Awaiting {
+        entity: Entity,
+        frames_remaining: u8,
+    },
+}
+
+const BAKE_FRAMES_TO_HOLD: u8 = 2;
+
+const BAKE_MIN_WARMUP_FRAMES: u8 = 4;
+
+#[derive(Component)]
+pub struct MinimapBakeCamera;
+
+#[derive(Component)]
+pub struct MinimapBakeMesh;
+
+pub struct TopdownBackendPlugin;
+
+impl Plugin for TopdownBackendPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<TopdownCullPolicy>()
+            .init_resource::<BakeStage>()
+            .add_systems(
+                Update,
+                (
+                    bake_topdown_on_zone_or_policy_change,
+                    spawn_bake_camera,
+                    despawn_bake_camera,
+                )
+                    .chain(),
+            );
+    }
+}
+
+pub fn bake_topdown_on_zone_or_policy_change(
+    geom: Res<MzbCollisionGeometry>,
+    policy: Res<TopdownCullPolicy>,
+    scene_state: Res<SceneState>,
+    state: Res<MinimapState>,
+    mut stage: ResMut<BakeStage>,
+) {
+    let geom_changed = geom.is_changed();
+    let policy_changed = policy.is_changed();
+    if !geom_changed && !policy_changed {
+        return;
+    }
+    if geom.positions.is_empty() {
+        return;
+    }
+    let snapshot_zone = scene_state.snapshot.zone_id;
+
+    if !matches!(*stage, BakeStage::Idle) {
+        return;
+    }
+    if snapshot_zone == state.zone_id && !policy_changed {
+        return;
+    }
+    *stage = BakeStage::Requested { waited: 0 };
+}
+
+pub fn spawn_bake_camera(
+    geom: Res<MzbCollisionGeometry>,
+    policy: Res<TopdownCullPolicy>,
+    scene_state: Res<SceneState>,
+    mzb_in_flight: Res<LoadMzbInFlight>,
+    mut state: ResMut<MinimapState>,
+    mut stage: ResMut<BakeStage>,
+    mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut commands: Commands,
+) {
+    let BakeStage::Requested { waited } = *stage else {
+        return;
+    };
+
+    let collision_pending = !mzb_in_flight.tasks.is_empty();
+    if waited < BAKE_MIN_WARMUP_FRAMES || collision_pending {
+        *stage = BakeStage::Requested {
+            waited: waited.saturating_add(1),
+        };
+        return;
+    }
+    let Some(aabb_3d) = compute_world_aabb(&geom.positions) else {
+        *stage = BakeStage::Idle;
+        return;
+    };
+
+    let span_x = (aabb_3d.max_x - aabb_3d.min_x).max(1.0);
+    let span_z = (aabb_3d.max_z - aabb_3d.min_z).max(1.0);
+    let center_x = 0.5 * (aabb_3d.min_x + aabb_3d.max_x);
+    let center_z = 0.5 * (aabb_3d.min_z + aabb_3d.max_z);
+
+    let ceiling_y = aabb_3d.max_y - policy.top_cull_yalms;
+    let span_y_below_camera = (ceiling_y - aabb_3d.min_y).max(1.0) + 10.0;
+
+    let render_target = create_render_target_image(&mut images);
+
+    let aabb = MinimapAabb {
+        min: Vec2::new(aabb_3d.min_x, aabb_3d.min_z),
+        max: Vec2::new(aabb_3d.max_x, aabb_3d.max_z),
+    };
+
+    let bake_mesh = meshes.add(build_bake_mesh(&geom.positions, &geom.indices, &aabb_3d));
+    let bake_material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        unlit: true,
+        cull_mode: None,
+        ..default()
+    });
+    commands.spawn((
+        InGameEntity,
+        MinimapBakeMesh,
+        Mesh3d(bake_mesh),
+        MeshMaterial3d(bake_material),
+        Transform::IDENTITY,
+        Visibility::Visible,
+        bevy::camera::visibility::RenderLayers::layer(MINIMAP_BAKE_LAYER),
+    ));
+
+    let camera_entity = commands
+        .spawn((
+            InGameEntity,
+            MinimapBakeCamera,
+            bevy::camera::visibility::RenderLayers::layer(MINIMAP_BAKE_LAYER),
+            Camera3d::default(),
+            Camera {
+                order: -1,
+
+                clear_color: ClearColorConfig::Custom(Color::NONE),
+                ..default()
+            },
+            RenderTarget::Image(render_target.clone().into()),
+            Projection::Orthographic(OrthographicProjection {
+                scaling_mode: ScalingMode::Fixed {
+                    width: span_x,
+                    height: span_z,
+                },
+                near: 0.0,
+                far: span_y_below_camera,
+                ..OrthographicProjection::default_3d()
+            }),
+            Transform::from_xyz(center_x, ceiling_y, center_z)
+                .looking_at(Vec3::new(center_x, ceiling_y - 1.0, center_z), Vec3::NEG_Z),
+        ))
+        .id();
+
+    state.zone_id = scene_state.snapshot.zone_id;
+    state.topdown_image = Some(render_target);
+    state.aabb = Some(aabb);
+
+    *stage = BakeStage::Awaiting {
+        entity: camera_entity,
+        frames_remaining: BAKE_FRAMES_TO_HOLD,
+    };
+}
+
+pub fn despawn_bake_camera(
+    mut stage: ResMut<BakeStage>,
+    bake_meshes: Query<Entity, With<MinimapBakeMesh>>,
+    mut commands: Commands,
+) {
+    let BakeStage::Awaiting {
+        entity,
+        frames_remaining,
+    } = *stage
+    else {
+        return;
+    };
+    if frames_remaining > 0 {
+        *stage = BakeStage::Awaiting {
+            entity,
+            frames_remaining: frames_remaining - 1,
+        };
+        return;
+    }
+    if let Ok(mut ec) = commands.get_entity(entity) {
+        ec.despawn();
+    }
+    for mesh in &bake_meshes {
+        if let Ok(mut ec) = commands.get_entity(mesh) {
+            ec.despawn();
+        }
+    }
+    *stage = BakeStage::Idle;
+}
+
+fn build_bake_mesh(positions: &[Vec3], indices: &[u32], aabb: &WorldAabb3) -> Mesh {
+    let verts: Vec<[f32; 3]> = positions.iter().map(|p| [p.x, p.y, p.z]).collect();
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, verts);
+    mesh.insert_indices(Indices::U32(indices.to_vec()));
+    mesh.compute_smooth_normals();
+
+    let span_y = (aabb.max_y - aabb.min_y).max(1.0);
+    if let Some(normals) = mesh
+        .attribute(Mesh::ATTRIBUTE_NORMAL)
+        .and_then(|a| a.as_float3())
+    {
+        let colors: Vec<[f32; 4]> = normals
+            .iter()
+            .zip(positions.iter())
+            .map(|(n, p)| {
+                let height = ((p.y - aabb.min_y) / span_y).clamp(0.0, 1.0);
+                let shade = 0.45 + 0.55 * (n[1] * 0.5 + 0.5);
+                let lo = Vec3::new(0.32, 0.40, 0.46);
+                let hi = Vec3::new(0.62, 0.66, 0.58);
+                let c = lo.lerp(hi, height) * shade;
+                [c.x, c.y, c.z, 1.0]
+            })
+            .collect();
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    }
+    mesh
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WorldAabb3 {
+    pub min_x: f32,
+    pub max_x: f32,
+    pub min_y: f32,
+    pub max_y: f32,
+    pub min_z: f32,
+    pub max_z: f32,
+}
+
+pub(crate) fn compute_world_aabb(positions: &[Vec3]) -> Option<WorldAabb3> {
+    let mut iter = positions.iter().copied().filter(|p| p.is_finite());
+    let first = iter.next()?;
+    let mut min = first;
+    let mut max = first;
+    for p in iter {
+        min = min.min(p);
+        max = max.max(p);
+    }
+    Some(WorldAabb3 {
+        min_x: min.x,
+        max_x: max.x,
+        min_y: min.y,
+        max_y: max.y,
+        min_z: min.z,
+        max_z: max.z,
+    })
+}
+
+fn create_render_target_image(images: &mut Assets<Image>) -> Handle<Image> {
+    let size = Extent3d {
+        width: MINIMAP_TEX_SIZE,
+        height: MINIMAP_TEX_SIZE,
+        depth_or_array_layers: 1,
+    };
+    let mut image = Image::new_fill(
+        size,
+        TextureDimension::D2,
+        &[0u8, 0, 0, 0],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+
+    image.texture_descriptor.usage =
+        TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
+    images.add(image)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aabb_single_position_is_degenerate() {
+        let aabb = compute_world_aabb(&[Vec3::new(1.0, 2.0, 3.0)]).unwrap();
+        assert_eq!(aabb.min_x, 1.0);
+        assert_eq!(aabb.max_x, 1.0);
+        assert_eq!(aabb.min_y, 2.0);
+        assert_eq!(aabb.max_y, 2.0);
+        assert_eq!(aabb.min_z, 3.0);
+        assert_eq!(aabb.max_z, 3.0);
+    }
+
+    #[test]
+    fn aabb_two_opposite_corners_bound_the_box() {
+        let aabb = compute_world_aabb(&[
+            Vec3::new(-100.0, -5.0, -200.0),
+            Vec3::new(50.0, 30.0, 150.0),
+        ])
+        .unwrap();
+        assert_eq!(aabb.min_x, -100.0);
+        assert_eq!(aabb.max_x, 50.0);
+        assert_eq!(aabb.min_y, -5.0);
+        assert_eq!(aabb.max_y, 30.0);
+        assert_eq!(aabb.min_z, -200.0);
+        assert_eq!(aabb.max_z, 150.0);
+    }
+
+    #[test]
+    fn aabb_empty_returns_none() {
+        assert!(compute_world_aabb(&[]).is_none());
+    }
+
+    #[test]
+    fn aabb_ignores_nan_positions() {
+        let nan = f32::NAN;
+        let aabb = compute_world_aabb(&[
+            Vec3::new(nan, nan, nan),
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(nan, nan, nan),
+        ])
+        .unwrap();
+        assert_eq!(aabb.min_x, 1.0);
+        assert_eq!(aabb.max_x, 1.0);
+
+        assert!(compute_world_aabb(&[Vec3::new(nan, nan, nan)]).is_none());
+    }
+}
