@@ -32,7 +32,8 @@ use rmcp::{
         Annotated, CallToolResult, Content, ListResourcesResult, PaginatedRequestParams,
         ProtocolVersion, RawResource, ReadResourceRequestParams, ReadResourceResult, Resource,
         ResourceContents, ResourceUpdatedNotificationParam, ResourcesCapability,
-        ServerCapabilities, ServerInfo, ToolsCapability,
+        ServerCapabilities, ServerInfo, SubscribeRequestParams, ToolsCapability,
+        UnsubscribeRequestParams,
     },
     service::{Peer, RequestContext, RoleServer, serve_server},
     tool, tool_handler, tool_router,
@@ -305,6 +306,29 @@ impl ServerHandler for FfxiServer {
             ),
         ];
         Ok(result)
+    }
+
+    /// Honour the `resources.subscribe = true` capability. The notifier task
+    /// fans out `notifications/resources/updated` to every connected peer
+    /// regardless of per-URI subscription state, so this handler doesn't need
+    /// to maintain a subscription set — it just has to ack the call so the
+    /// capability advertisement isn't a lie.
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        tracing::debug!(uri = %request.uri, "client subscribed to resource");
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        tracing::debug!(uri = %request.uri, "client unsubscribed from resource");
+        Ok(())
     }
 
     async fn read_resource(
