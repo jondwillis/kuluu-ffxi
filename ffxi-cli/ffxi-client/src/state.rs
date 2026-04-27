@@ -362,7 +362,7 @@ pub enum AgentEvent {
 /// Strictly enumerated commands an agent can issue. **Do not** add a generic
 /// `SendPacket` escape hatch — Claude Code knows about FFXI from training and
 /// will hallucinate opcodes; the lid stays on by design.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum AgentCommand {
     /// Set the next position the keepalive will report.
@@ -421,7 +421,7 @@ pub enum AgentCommand {
 /// Mirrors `Phoenix/src/map/packets/c2s/0x01a_action.h`. Variants are
 /// additive — when a new action type ships in LSB upstream, add a variant
 /// here without breaking existing agents.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActionKind {
     /// 0x00 — Interact with NPC/Trust.

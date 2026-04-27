@@ -3,10 +3,12 @@
 
 pub mod agent_io;
 pub mod auth_client;
+pub mod goal_store;
 pub mod lobby_client;
 pub mod map_client;
 pub mod reactor;
 pub mod scene;
 pub mod session;
 pub mod state;
+pub mod supervisor;
 pub mod tls;
