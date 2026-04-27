@@ -341,32 +341,6 @@ fn handle_sub_packet(
     }
 }
 
-fn handle_logout(
-    sub: &framing::SubPacket<'_>,
-    event_tx: &broadcast::Sender<AgentEvent>,
-) -> Option<decode::ServerLogout> {
-    let logout = decode::ServerLogout::decode(sub.data).ok()?;
-    if logout.is_zone_change() {
-        // v1: surface as Disconnected for the agent; full
-        // reconnect+key-rotate flow is the next step.
-        let _ = event_tx.send(AgentEvent::Disconnected {
-            reason: format!(
-                "zone change to {}.{}.{}.{}:{}",
-                logout.new_server_ip & 0xFF,
-                (logout.new_server_ip >> 8) & 0xFF,
-                (logout.new_server_ip >> 16) & 0xFF,
-                (logout.new_server_ip >> 24) & 0xFF,
-                logout.new_server_port,
-            ),
-        });
-    } else {
-        let _ = event_tx.send(AgentEvent::Disconnected {
-            reason: format!("server logout state={}", logout.logout_state),
-        });
-    }
-    Some(logout)
-}
-
 async fn keepalive_loop(
     map: MapClient,
     mut bundle_seq: u16,
@@ -409,7 +383,6 @@ async fn keepalive_loop(
                     }
                     Some(AgentCommand::Disconnect) => {
                         let _ = event_tx.send(AgentEvent::Disconnected { reason: "agent requested disconnect".into() });
-                        terminal_disconnect = true;
                         break;
                     }
                     Some(AgentCommand::Snapshot) => {
@@ -529,7 +502,6 @@ async fn keepalive_loop(
             let _ = event_tx.send(AgentEvent::Disconnected {
                 reason: "no server packets for 60s".into(),
             });
-            terminal_disconnect = true;
             break;
         }
     }

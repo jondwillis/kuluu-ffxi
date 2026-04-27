@@ -24,11 +24,6 @@ use crate::auth_client::AuthSession;
 // silently true at runtime — easy to miss from the per-port handler<T>
 // template scaffolding.
 
-/// `getHashFromPacket()` reads 16 bytes starting at offset 12 (see
-/// `server/src/login/login_helpers.cpp:328`). Both the data and view sessions
-/// rely on this for first-packet auth correlation.
-const HASH_OFFSET: usize = 12;
-
 /// The data-port 0xA1 response is a fixed 328-byte buffer.
 const DATA_CHARLIST_SIZE: usize = 0x148;
 

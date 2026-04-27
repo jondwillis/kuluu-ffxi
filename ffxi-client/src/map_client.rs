@@ -203,16 +203,6 @@ impl MapClient {
     }
 }
 
-fn inflate_zlib(input: &[u8]) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let mut decoder = flate2::read::ZlibDecoder::new(input);
-    let mut out = Vec::with_capacity(input.len() * 4);
-    decoder
-        .read_to_end(&mut out)
-        .context("zlib decompress (response payload)")?;
-    Ok(out)
-}
-
 /// Apply the same key rotation the server runs in
 /// `MapSession::incrementBlowfish()` — `blowfish.key[4] += 2`, where `key` is
 /// `uint32[5]` covering the 20-byte session_key. We mirror this by reading

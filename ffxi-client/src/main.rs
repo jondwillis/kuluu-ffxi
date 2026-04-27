@@ -1,6 +1,6 @@
 //! FFXI CLI/TUI client — entry point.
 
-use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session, state, tls};
+use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session, state};
 mod tui;
 
 use anyhow::{self, Context, Result, bail};
@@ -320,9 +320,9 @@ async fn main() -> Result<()> {
             // 1 Hz keepalive loop: send 0x015 POS with last-known position.
             // Server-side `cleanupSessions` expires sessions after ~60s of silence.
             // We also drain incoming bundles to keep the parse loop healthy.
-            let mut self_x = 0.0f32;
-            let mut self_y = 0.0f32;
-            let mut self_z = 0.0f32;
+            let self_x = 0.0f32;
+            let self_y = 0.0f32;
+            let self_z = 0.0f32;
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
             tick.tick().await; // first tick fires immediately
             let mut last_recv = std::time::Instant::now();
