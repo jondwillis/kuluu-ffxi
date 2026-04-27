@@ -513,3 +513,103 @@ fn parse_port(name: &str, default: u16) -> Result<u16> {
         Err(_) => Ok(default),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ffxi_client::state::{PartyMember, Position, Stage, Vec3};
+
+    #[test]
+    fn high_signal_events_invalidate_scene() {
+        let cases: Vec<AgentEvent> = vec![
+            AgentEvent::LowHp { pct: 20 },
+            AgentEvent::PartyMemberLowHp { id: 1, pct: 15 },
+            AgentEvent::EngagedBy { entity_id: 99 },
+            AgentEvent::TellReceived {
+                from: "X".into(),
+                text: "hi".into(),
+            },
+            AgentEvent::Reconnected { downtime_ms: 1000 },
+            AgentEvent::SceneSummary { text: "x".into() },
+        ];
+        for ev in cases {
+            assert_eq!(uris_for_event(&ev), &["scene://current"], "ev: {ev:?}");
+        }
+    }
+
+    #[test]
+    fn zone_change_invalidates_scene_party_diagnostics() {
+        let ev = AgentEvent::ZoneChanged {
+            from: Some(100),
+            to: 230,
+        };
+        assert_eq!(
+            uris_for_event(&ev),
+            &["scene://current", "party://members", "diagnostics://session"]
+        );
+    }
+
+    #[test]
+    fn party_update_invalidates_party_and_scene() {
+        let ev = AgentEvent::PartyMemberUpdated {
+            member: PartyMember {
+                id: 1,
+                act_index: 1,
+                name: None,
+                hp: 100,
+                mp: 100,
+                tp: 0,
+                hp_pct: 100,
+                mp_pct: 100,
+                zone_no: 230,
+                main_job: 1,
+                main_job_lv: 75,
+                sub_job: 6,
+                sub_job_lv: 37,
+                is_party_leader: false,
+                is_alliance_leader: false,
+            },
+        };
+        assert_eq!(uris_for_event(&ev), &["party://members", "scene://current"]);
+    }
+
+    #[test]
+    fn stage_and_diagnostics_only_invalidate_diagnostics() {
+        assert_eq!(
+            uris_for_event(&AgentEvent::StageChanged { stage: Stage::InZone }),
+            &["diagnostics://session"]
+        );
+        assert_eq!(
+            uris_for_event(&AgentEvent::Diagnostics {
+                diagnostics: Default::default()
+            }),
+            &["diagnostics://session"]
+        );
+    }
+
+    #[test]
+    fn tactical_events_do_not_notify() {
+        // The wake-on-signal contract: tactical detail mustn't notify.
+        let cases: Vec<AgentEvent> = vec![
+            AgentEvent::PositionChanged {
+                pos: Position {
+                    pos: Vec3::default(),
+                    heading: 0,
+                },
+            },
+            AgentEvent::EntityRemoved { id: 99 },
+            AgentEvent::EventStart { event_id: 1 },
+            AgentEvent::EventEnded,
+            AgentEvent::KeyRotated {
+                previous_status: ffxi_client::state::BlowfishStatus::Accepted,
+            },
+            AgentEvent::Error { message: "x".into() },
+        ];
+        for ev in cases {
+            assert!(
+                uris_for_event(&ev).is_empty(),
+                "should not notify for {ev:?}"
+            );
+        }
+    }
+}
