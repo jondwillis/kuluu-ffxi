@@ -113,8 +113,33 @@ pub struct SessionState {
     pub zone_id: Option<u16>,
     pub self_pos: Position,
     pub entities: Vec<Entity>,
+    pub party: Vec<PartyMember>,
     pub chat: Vec<ChatLine>,
     pub diagnostics: Diagnostics,
+}
+
+/// One row in the agent's view of the party. Populated from
+/// `0x0DD GROUP_LIST` (other members; provides name + leader flags) and
+/// `0x0DF GROUP_ATTR` (self + Trusts; HP/MP/TP refreshes only). Apply
+/// rules: same-id updates merge, with `name`/`is_party_leader` preserved
+/// across attr-only refreshes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartyMember {
+    pub id: u32,
+    pub act_index: u16,
+    pub name: Option<String>,
+    pub hp: u32,
+    pub mp: u32,
+    pub tp: u32,
+    pub hp_pct: u8,
+    pub mp_pct: u8,
+    pub zone_no: u16,
+    pub main_job: u8,
+    pub main_job_lv: u8,
+    pub sub_job: u8,
+    pub sub_job_lv: u8,
+    pub is_party_leader: bool,
+    pub is_alliance_leader: bool,
 }
 
 /// Cap on retained chat history. The TUI only ever shows the last N visible
@@ -191,6 +216,45 @@ impl SessionState {
                     self.chat.drain(0..drop);
                 }
             }
+            AgentEvent::PartyMemberUpdated { member } => {
+                if let Some(existing) = self.party.iter_mut().find(|m| m.id == member.id) {
+                    // Preserve name / leader flags across 0x0DF attr-only updates
+                    // (which don't carry them). The new packet always wins for
+                    // HP/MP/TP/job/zone — those it always has.
+                    let preserved_name = if member.name.is_some() {
+                        member.name.clone()
+                    } else {
+                        existing.name.clone()
+                    };
+                    let preserved_leader = if !member.name.is_some() {
+                        existing.is_party_leader
+                    } else {
+                        member.is_party_leader
+                    };
+                    let preserved_alliance = if !member.name.is_some() {
+                        existing.is_alliance_leader
+                    } else {
+                        member.is_alliance_leader
+                    };
+                    *existing = PartyMember {
+                        name: preserved_name,
+                        is_party_leader: preserved_leader,
+                        is_alliance_leader: preserved_alliance,
+                        ..member.clone()
+                    };
+                } else {
+                    self.party.push(member.clone());
+                }
+            }
+            // High-signal events the LLM wakes for. They don't mutate
+            // SessionState — the data is already there (HP via entity
+            // updates, chat via ChatLine). They're notifications, not state.
+            AgentEvent::LowHp { .. }
+            | AgentEvent::PartyMemberLowHp { .. }
+            | AgentEvent::EngagedBy { .. }
+            | AgentEvent::TellReceived { .. }
+            | AgentEvent::Reconnected { .. }
+            | AgentEvent::SceneSummary { .. } => {}
             // EventStart / EventEnded / KeyRotated are flow signals; the TUI
             // doesn't render them as state today. Left as no-ops — extending
             // is a non-breaking change.
@@ -252,6 +316,46 @@ pub enum AgentEvent {
     },
     Diagnostics {
         diagnostics: Diagnostics,
+    },
+    /// 0x0DD GROUP_LIST (other) or 0x0DF GROUP_ATTR (self + Trust). The
+    /// merge rules in `apply_event` preserve `name` / `is_party_leader`
+    /// across attr-only refreshes.
+    PartyMemberUpdated {
+        member: PartyMember,
+    },
+    /// Self HP crossed below a low-HP threshold (default 25%, configurable
+    /// in the reactor). Wakes the LLM strategically without burning
+    /// tokens on every HP tick.
+    LowHp {
+        pct: u8,
+    },
+    /// A party member's HP crossed below the low-HP threshold. Drives
+    /// healer co-play.
+    PartyMemberLowHp {
+        id: u32,
+        pct: u8,
+    },
+    /// A mob took the player as its battle target — i.e. aggro. The agent
+    /// may want to react (engage, flee, kite).
+    EngagedBy {
+        entity_id: u32,
+    },
+    /// Received a /tell from another player. The most user-directed
+    /// channel; nearly always worth waking the LLM for.
+    TellReceived {
+        from: String,
+        text: String,
+    },
+    /// Supervisor restored the session after a disconnect. The agent
+    /// should re-orient to the (possibly changed) zone state.
+    Reconnected {
+        downtime_ms: u64,
+    },
+    /// Pre-rendered scene summary, emitted in response to `Snapshot`.
+    /// Distinct from `Diagnostics` (operational) — this is the agent's
+    /// view of "what's happening right now" in compact prose.
+    SceneSummary {
+        text: String,
     },
 }
 
@@ -512,6 +616,58 @@ mod tests {
         assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0xCAFE);
         // Trailing bytes stay zero.
         assert!(buf[4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn party_member_upsert_preserves_name_across_attr_only_update() {
+        let mut s = SessionState::default();
+        let from_list = PartyMember {
+            id: 42,
+            act_index: 7,
+            name: Some("Vanari".into()),
+            hp: 2000,
+            mp: 100,
+            tp: 0,
+            hp_pct: 100,
+            mp_pct: 100,
+            zone_no: 230,
+            main_job: 1,
+            main_job_lv: 75,
+            sub_job: 6,
+            sub_job_lv: 37,
+            is_party_leader: true,
+            is_alliance_leader: false,
+        };
+        s.apply_event(&AgentEvent::PartyMemberUpdated { member: from_list });
+        assert_eq!(s.party.len(), 1);
+        assert_eq!(s.party[0].name.as_deref(), Some("Vanari"));
+        assert!(s.party[0].is_party_leader);
+
+        // Subsequent 0x0DF GROUP_ATTR-shaped update: name None, leader false
+        // (since attr-only). Must NOT clobber the preserved fields.
+        let from_attr = PartyMember {
+            id: 42,
+            act_index: 7,
+            name: None,
+            hp: 1500, // took damage
+            mp: 100,
+            tp: 1234,
+            hp_pct: 75,
+            mp_pct: 100,
+            zone_no: 230,
+            main_job: 1,
+            main_job_lv: 75,
+            sub_job: 6,
+            sub_job_lv: 37,
+            is_party_leader: false,
+            is_alliance_leader: false,
+        };
+        s.apply_event(&AgentEvent::PartyMemberUpdated { member: from_attr });
+        assert_eq!(s.party.len(), 1, "upsert by id");
+        assert_eq!(s.party[0].name.as_deref(), Some("Vanari"), "name preserved");
+        assert!(s.party[0].is_party_leader, "leader preserved");
+        assert_eq!(s.party[0].hp, 1500, "HP overwritten");
+        assert_eq!(s.party[0].hp_pct, 75);
     }
 
     #[test]

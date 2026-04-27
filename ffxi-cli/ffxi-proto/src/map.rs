@@ -58,4 +58,12 @@ pub mod s2c {
     pub const GRAP_LIST: u16 = 0x051;
     pub const ENTITY_UPDATE1: u16 = 0x067;
     pub const ENTITY_UPDATE2: u16 = 0x068;
+    /// `GP_SERV_COMMAND_GROUP_LIST` — sent for OTHER party members
+    /// (other PCs and Trusts). Carries name + leader flags, in addition
+    /// to HP/MP/TP/job. See `Phoenix/src/map/packets/s2c/0x0dd_group_list.h`.
+    pub const GROUP_LIST: u16 = 0x0DD;
+    /// `GP_SERV_COMMAND_GROUP_ATTR` — sent for the LOCAL player and
+    /// Trust members. Same HP/MP/TP/job fields, no name (we know our own)
+    /// and no leader flag. See `Phoenix/src/map/packets/s2c/0x0df_group_attr.h`.
+    pub const GROUP_ATTR: u16 = 0x0DF;
 }

@@ -353,6 +353,20 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
         }
+        op if op == s2c::GROUP_LIST => {
+            if let Ok((attrs, extra)) = decode::PartyAttrs::decode_group_list(sub.data) {
+                let _ = event_tx.send(AgentEvent::PartyMemberUpdated {
+                    member: party_member_from_attrs(&attrs, Some(&extra)),
+                });
+            }
+        }
+        op if op == s2c::GROUP_ATTR => {
+            if let Ok(attrs) = decode::PartyAttrs::decode_group_attr(sub.data) {
+                let _ = event_tx.send(AgentEvent::PartyMemberUpdated {
+                    member: party_member_from_attrs(&attrs, None),
+                });
+            }
+        }
         _ => {
             // Surface unknown opcodes at debug level; not an error.
             tracing::trace!(opcode = format!("0x{:03x}", sub.opcode), len = sub.data.len(), "unhandled sub-packet");
@@ -697,6 +711,34 @@ fn build_subpacket_action(
     kind.fill_action_buf(&mut action_buf);
     buf[12..28].copy_from_slice(&action_buf);
     buf
+}
+
+/// Convert a `decode::PartyAttrs` (+ optional list-only extras) into the
+/// state-layer `PartyMember` the agent sees. When `extra` is `None` (we're
+/// processing a `0x0DF GROUP_ATTR` for self / Trust), `name` and the
+/// leader flags are left empty — `apply_event` preserves whatever the
+/// previous `0x0DD` set.
+fn party_member_from_attrs(
+    attrs: &decode::PartyAttrs,
+    extra: Option<&decode::PartyListExtra>,
+) -> crate::state::PartyMember {
+    crate::state::PartyMember {
+        id: attrs.unique_no,
+        act_index: attrs.act_index,
+        name: extra.and_then(|e| e.name.clone()),
+        hp: attrs.hp,
+        mp: attrs.mp,
+        tp: attrs.tp,
+        hp_pct: attrs.hpp,
+        mp_pct: attrs.mpp,
+        zone_no: attrs.zone_no,
+        main_job: attrs.mjob_no,
+        main_job_lv: attrs.mjob_lv,
+        sub_job: attrs.sjob_no,
+        sub_job_lv: attrs.sjob_lv,
+        is_party_leader: extra.map(|e| e.is_party_leader).unwrap_or(false),
+        is_alliance_leader: extra.map(|e| e.is_alliance_leader).unwrap_or(false),
+    }
 }
 
 /// `GP_CLI_COMMAND_MAPRECT` (0x05E) — 4-byte header + RectID(4) + x/y/z(12)
