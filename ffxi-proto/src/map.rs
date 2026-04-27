@@ -1,0 +1,61 @@
+//! Map-server packet types — UDP, encrypted with per-session FFXI Blowfish.
+//!
+//! Filled in by Steps 6–10 of the build sequence; this module is a stub now.
+
+/// Default UDP port for the map server (`MAP_PORT` in
+/// `server/settings/default/network.lua`).
+pub const MAP_PORT: u16 = 54230;
+
+/// Maximum UDP datagram size the map server accepts. Source:
+/// `server/src/map/map_constants.h::kMaxBufferSize = 2500`.
+pub const MAX_DATAGRAM: usize = 2500;
+
+/// Selected client→server opcodes used by v1.
+pub mod c2s {
+    pub const LOGIN: u16 = 0x00A;
+    pub const NETEND: u16 = 0x00D;
+    pub const ZONE_TRANSITION: u16 = 0x011;
+    pub const POS: u16 = 0x015;
+    /// `GP_CLI_COMMAND_ACTION` — universal "perform action on target" packet.
+    /// Body: `UniqueNo:u32 ActIndex:u16 ActionID:u16 ActionBuf[16]`.
+    /// `ActionID` 0=Talk, 0x02=Attack, 0x04=AttackOff, 0x0F=ChangeTarget…
+    pub const ACTION: u16 = 0x01A;
+    pub const EVENT_END: u16 = 0x05B;
+    /// `GP_CLI_COMMAND_CHAT_STD` — see `session::build_subpacket_chat`.
+    pub const CHAT: u16 = 0x0B5;
+}
+
+/// `GP_CLI_COMMAND_ACTION_ACTIONID` — see
+/// `Phoenix/src/map/packets/c2s/0x01a_action.h`. We only enumerate the values
+/// the TUI/agent can drive today; rest are u16 passthrough.
+pub mod action_id {
+    pub const TALK: u16 = 0x00;
+    pub const ATTACK: u16 = 0x02;
+    pub const CAST_MAGIC: u16 = 0x03;
+    pub const ATTACK_OFF: u16 = 0x04;
+    pub const HELP: u16 = 0x05;
+    pub const WEAPONSKILL: u16 = 0x07;
+    pub const JOB_ABILITY: u16 = 0x09;
+    pub const ASSIST: u16 = 0x0C;
+    pub const CHANGE_TARGET: u16 = 0x0F;
+    pub const SHOOT: u16 = 0x10;
+}
+
+/// Selected server→client opcodes used by v1.
+pub mod s2c {
+    pub const ENTERZONE: u16 = 0x008;
+    pub const MESSAGE: u16 = 0x009;
+    pub const LOGIN: u16 = 0x00A;
+    pub const LOGOUT: u16 = 0x00B;
+    pub const CHAR_PC: u16 = 0x00D;
+    pub const CHAR_NPC: u16 = 0x00E;
+    pub const ITEM_MAX: u16 = 0x01C;
+    pub const EVENT: u16 = 0x032;
+    pub const EVENTSTR: u16 = 0x033;
+    pub const EVENTNUM: u16 = 0x034;
+    pub const EQUIP_CLEAR: u16 = 0x04F;
+    pub const EQUIP_LIST: u16 = 0x050;
+    pub const GRAP_LIST: u16 = 0x051;
+    pub const ENTITY_UPDATE1: u16 = 0x067;
+    pub const ENTITY_UPDATE2: u16 = 0x068;
+}

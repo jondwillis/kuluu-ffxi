@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["ffxi-proto", "ffxi-client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+flate2 = "1"
+md-5 = "0.10"
+ratatui = "0.29"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Test fixtures: direct MariaDB access so each integration test can stamp
+# out an isolated account+char and clean up after itself.
+mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
