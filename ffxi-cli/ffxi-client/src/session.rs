@@ -182,6 +182,7 @@ async fn run_map_session(
     let mut server_last_seq: u16 = 0;
     let mut total_subs = 0usize;
     let mut pending_event_end: Vec<(u32, u16, u16)> = Vec::new();
+    let mut self_act_index: Option<u16> = None;
     while std::time::Instant::now() < flood_deadline {
         match tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -194,7 +195,13 @@ async fn run_map_session(
                 server_last_seq = header.id_and_size;
                 for sub in framing::walk_sub_packets(&buf[framing::FFXI_HEADER_SIZE..]).flatten() {
                     total_subs += 1;
-                    handle_sub_packet(&sub, event_tx, &mut pending_event_end);
+                    handle_sub_packet(
+                        &sub,
+                        event_tx,
+                        &mut pending_event_end,
+                        bootstrap.char_id,
+                        &mut self_act_index,
+                    );
                 }
             }
             _ => break,
@@ -237,6 +244,8 @@ async fn run_map_session(
         sub_seq,
         server_last_seq,
         pending_event_end,
+        bootstrap.char_id,
+        self_act_index,
         cmd_rx,
         event_tx.clone(),
     )
@@ -246,10 +255,17 @@ async fn run_map_session(
 /// Decode a single S2C sub-packet and emit typed `AgentEvent`s. Returns the
 /// `(UniqueNo, ActIndex, EventNum)` triple if it's an event-start packet so
 /// the caller can queue an auto-dismiss `0x05B EVENT_END`.
+///
+/// `self_char_id` lets us recognize the player's own CHAR_PC packet during
+/// the zone-in flood and stash the player's per-zone `ActIndex` in
+/// `self_act_index` — required when sending packets that target the player
+/// (e.g. `0x05E` MAPRECT for zone-line transitions).
 fn handle_sub_packet(
     sub: &framing::SubPacket<'_>,
     event_tx: &broadcast::Sender<AgentEvent>,
     pending_event_end: &mut Vec<(u32, u16, u16)>,
+    self_char_id: u32,
+    self_act_index: &mut Option<u16>,
 ) {
     use ffxi_proto::map::s2c;
     match sub.opcode {
@@ -260,6 +276,9 @@ fn handle_sub_packet(
                 } else {
                     EntityKind::Npc
                 };
+                if op == s2c::CHAR_PC && head.unique_no == self_char_id {
+                    *self_act_index = Some(head.act_index);
+                }
                 let name = decode::PosHead::try_extract_name(op, sub.data);
                 let _ = event_tx.send(AgentEvent::EntityUpserted {
                     entity: Entity {
@@ -341,12 +360,15 @@ fn handle_sub_packet(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn keepalive_loop(
     map: MapClient,
     mut bundle_seq: u16,
     mut sub_seq: u16,
     mut server_last_seq: u16,
     mut pending_event_end: Vec<(u32, u16, u16)>,
+    self_char_id: u32,
+    mut self_act_index: Option<u16>,
     cmd_rx: &mut mpsc::Receiver<AgentCommand>,
     event_tx: broadcast::Sender<AgentEvent>,
 ) -> Result<MapOutcome> {
@@ -428,8 +450,41 @@ async fn keepalive_loop(
                         }
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
-                    Some(other) => {
-                        tracing::debug!(?other, "command not yet handled");
+                    Some(AgentCommand::RequestZoneChange { line_id }) => {
+                        // 0x05E `GP_CLI_COMMAND_MAPRECT` — sent when the player
+                        // crosses a zoneline. The server validates that
+                        // `PChar->loc.p` is within ~40 yalms of the zoneline's
+                        // `originPos` (Phoenix/src/map/packets/c2s/0x05e_maprect.cpp:212),
+                        // so the agent must walk into range first; this command
+                        // is "I'm at the zoneline, take me through," not a
+                        // free-form warp.
+                        let Some(act_index) = self_act_index else {
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: "RequestZoneChange before self ActIndex \
+                                          known (no CHAR_PC for self yet)"
+                                    .into(),
+                            });
+                            continue;
+                        };
+                        let payload = build_subpacket_maprect(
+                            sub_seq,
+                            line_id,
+                            self_pos.pos.x,
+                            self_pos.pos.y,
+                            self_pos.pos.z,
+                            act_index,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "MAPRECT send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("MAPRECT send: {e}"),
+                            });
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                 }
             }
@@ -487,7 +542,13 @@ async fn keepalive_loop(
                                 terminal_disconnect = true;
                             }
                         } else {
-                            handle_sub_packet(&sub, &event_tx, &mut pending_event_end);
+                            handle_sub_packet(
+                                &sub,
+                                &event_tx,
+                                &mut pending_event_end,
+                                self_char_id,
+                                &mut self_act_index,
+                            );
                         }
                     }
                 }
@@ -629,6 +690,34 @@ fn build_subpacket_action(sync: u16, unique_no: u32, act_index: u16, action_id: 
     // ActionBuf (16 bytes) stays zero — Talk/Attack/AttackOff/ChangeTarget
     // don't consult it; magic/WS/JA/Mount need real fill which we'll add when
     // those commands ship.
+    buf
+}
+
+/// `GP_CLI_COMMAND_MAPRECT` (0x05E) — 4-byte header + RectID(4) + x/y/z(12)
+/// + ActIndex(2) + MyRoomExitBit(1) + MyRoomExitMode(1) = 24 bytes
+/// (size_words=6). Wire field order is (x, y, z) — note this differs from
+/// 0x015 POS (x, z, y).
+///
+/// `MyRoomExitBit`/`MyRoomExitMode` are zeroed for non-Mog-House zonelines;
+/// the server only consults them when `RectID` is the universal Mog House
+/// exit tag (`"zmrq"`) per Phoenix/src/map/packets/c2s/0x05e_maprect.cpp:71.
+fn build_subpacket_maprect(
+    sync: u16,
+    rect_id: u32,
+    x: f32,
+    y: f32,
+    z: f32,
+    act_index: u16,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 24];
+    buf[0..4].copy_from_slice(&build_subpacket_header(0x05E, 6, sync));
+    buf[4..8].copy_from_slice(&rect_id.to_le_bytes());
+    buf[8..12].copy_from_slice(&x.to_le_bytes());
+    buf[12..16].copy_from_slice(&y.to_le_bytes());
+    buf[16..20].copy_from_slice(&z.to_le_bytes());
+    buf[20..22].copy_from_slice(&act_index.to_le_bytes());
+    // buf[22] = MyRoomExitBit, buf[23] = MyRoomExitMode — zero for
+    // non-Mog-House zonelines.
     buf
 }
 
