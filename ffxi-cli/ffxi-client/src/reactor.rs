@@ -81,6 +81,25 @@ impl Default for Goal {
     }
 }
 
+/// What `handle_command` decided to do with a client command:
+/// optionally forward something to the session, optionally broadcast
+/// some derived events. Most paths produce one or the other; `Snapshot`
+/// produces both.
+#[derive(Debug, Default)]
+pub struct CommandRouting {
+    pub forward: Option<AgentCommand>,
+    pub derived_events: Vec<AgentEvent>,
+}
+
+impl CommandRouting {
+    fn absorbed() -> Self {
+        Self::default()
+    }
+    fn forward(cmd: AgentCommand) -> Self {
+        Self { forward: Some(cmd), derived_events: Vec::new() }
+    }
+}
+
 /// Pure reactor — no I/O. Drives a state machine off observed events and
 /// emits commands on tick. The async `run` wraps this with channels.
 pub struct Reactor {
@@ -156,34 +175,44 @@ impl Reactor {
     /// Process a command from a client. Goal commands are absorbed and
     /// return `None`; everything else passes through. An explicit `Move`
     /// also clears the goal — the agent has overridden tactical control.
-    pub fn handle_command(&mut self, cmd: AgentCommand) -> Option<AgentCommand> {
+    /// `Snapshot` is forwarded to the session (for `Diagnostics`) but the
+    /// reactor *also* renders a `SceneSummary` from its mirror — that's
+    /// the one place the SessionState mirror surfaces to clients.
+    pub fn handle_command(&mut self, cmd: AgentCommand) -> CommandRouting {
         match cmd {
             AgentCommand::Follow { target_id, distance } => {
                 self.goal = Goal::Following { target_id, distance };
-                None
+                CommandRouting::absorbed()
             }
             AgentCommand::Engage { target_id } => {
                 self.goal = Goal::Engaged {
                     target_id,
                     attack_issued: false,
                 };
-                None
+                CommandRouting::absorbed()
             }
             AgentCommand::PathTo { x, y, z } => {
                 self.goal = Goal::Pathing {
                     target: Vec3 { x, y, z },
                 };
-                None
+                CommandRouting::absorbed()
             }
             AgentCommand::Cancel => {
                 self.goal = Goal::Idle;
-                None
+                CommandRouting::absorbed()
             }
             AgentCommand::Move { .. } => {
                 self.goal = Goal::Idle;
-                Some(cmd)
+                CommandRouting::forward(cmd)
             }
-            other => Some(other),
+            AgentCommand::Snapshot => {
+                let summary = crate::scene::SceneSummary::from_state(&self.state);
+                CommandRouting {
+                    forward: Some(AgentCommand::Snapshot),
+                    derived_events: vec![AgentEvent::SceneSummary { text: summary.text }],
+                }
+            }
+            other => CommandRouting::forward(other),
         }
     }
 
@@ -356,7 +385,11 @@ pub async fn run(
                         .and_then(|r| r);
                 }
                 Some(cmd) => {
-                    if let Some(forward) = reactor.handle_command(cmd) {
+                    let routing = reactor.handle_command(cmd);
+                    for ev in routing.derived_events {
+                        let _ = event_tx.send(ev);
+                    }
+                    if let Some(forward) = routing.forward {
                         if internal_cmd_tx.send(forward).await.is_err() {
                             // Session-side closed — wait for join.
                             break (&mut session_handle).await
@@ -519,8 +552,9 @@ mod tests {
         r.handle_command(AgentCommand::Follow { target_id: 2, distance: 5.0 });
         assert!(matches!(r.current_goal(), Goal::Following { .. }));
         let m = AgentCommand::Move { x: 1.0, y: 2.0, z: 3.0, heading: 64 };
-        let forwarded = r.handle_command(m);
-        assert!(matches!(forwarded, Some(AgentCommand::Move { .. })), "Move passes through");
+        let routing = r.handle_command(m);
+        assert!(matches!(routing.forward, Some(AgentCommand::Move { .. })), "Move passes through");
+        assert!(routing.derived_events.is_empty());
         assert!(matches!(r.current_goal(), Goal::Idle));
     }
 
@@ -528,8 +562,35 @@ mod tests {
     fn passthrough_chat_unchanged() {
         let mut r = Reactor::new(ReactorConfig::default());
         let chat = AgentCommand::Chat { kind: 0, text: "hello".into() };
-        let forwarded = r.handle_command(chat);
-        assert!(matches!(forwarded, Some(AgentCommand::Chat { .. })));
+        let routing = r.handle_command(chat);
+        assert!(matches!(routing.forward, Some(AgentCommand::Chat { .. })));
+        assert!(routing.derived_events.is_empty());
+    }
+
+    #[test]
+    fn snapshot_emits_scene_summary_and_forwards() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        let routing = r.handle_command(AgentCommand::Snapshot);
+        assert!(matches!(routing.forward, Some(AgentCommand::Snapshot)),
+                "Snapshot still forwards to session for Diagnostics");
+        assert_eq!(routing.derived_events.len(), 1);
+        assert!(matches!(&routing.derived_events[0], AgentEvent::SceneSummary { .. }));
+    }
+
+    #[test]
+    fn goal_commands_produce_no_forward_or_events() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        for cmd in [
+            AgentCommand::Follow { target_id: 1, distance: 5.0 },
+            AgentCommand::Engage { target_id: 1 },
+            AgentCommand::PathTo { x: 1.0, y: 0.0, z: 0.0 },
+            AgentCommand::Cancel,
+        ] {
+            let routing = r.handle_command(cmd);
+            assert!(routing.forward.is_none());
+            assert!(routing.derived_events.is_empty());
+        }
     }
 
     #[test]
