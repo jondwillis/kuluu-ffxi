@@ -26,7 +26,7 @@ pub enum BlowfishStatus {
     PendingZone,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Vec3 {
     pub x: f32,
     pub y: f32,
@@ -398,6 +398,19 @@ pub enum AgentCommand {
         target_index: u16,
         kind: ActionKind,
     },
+    /// Reactor goal: keep stepping toward `target_id`, holding `distance`
+    /// yalms once close. Works for follow-leader (party PC) and chase-mob.
+    /// Handled by `crate::reactor`; if it reaches the session loop the
+    /// reactor wasn't wired in front and the command is logged as an error.
+    Follow { target_id: u32, distance: f32 },
+    /// Reactor goal: face `target_id` and engage auto-attack. The reactor
+    /// emits a single `Action::Attack` on transition, then keeps facing.
+    Engage { target_id: u32 },
+    /// Reactor goal: walk to `(x, y, z)` along a single straight segment.
+    /// Multi-waypoint paths land in a future iteration.
+    PathTo { x: f32, y: f32, z: f32 },
+    /// Reactor: clear any active goal, return to `Idle`.
+    Cancel,
 }
 
 /// Tagged-union of every `0x01A` action the agent can perform. The variant

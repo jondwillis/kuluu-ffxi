@@ -5,6 +5,7 @@ pub mod agent_io;
 pub mod auth_client;
 pub mod lobby_client;
 pub mod map_client;
+pub mod reactor;
 pub mod session;
 pub mod state;
 pub mod tls;

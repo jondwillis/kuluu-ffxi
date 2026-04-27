@@ -464,6 +464,20 @@ async fn keepalive_loop(
                         }
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
+                    Some(AgentCommand::Follow { .. })
+                    | Some(AgentCommand::Engage { .. })
+                    | Some(AgentCommand::PathTo { .. })
+                    | Some(AgentCommand::Cancel) => {
+                        // These are reactor-handled goal commands. If they
+                        // reach the session loop, the reactor middleware
+                        // (`crate::reactor::run`) wasn't wired in front —
+                        // surface that as an error rather than silently drop.
+                        let _ = event_tx.send(AgentEvent::Error {
+                            message: "reactor goal command reached session loop \
+                                      (reactor middleware not wired)"
+                                .into(),
+                        });
+                    }
                     Some(AgentCommand::RequestZoneChange { line_id }) => {
                         // 0x05E `GP_CLI_COMMAND_MAPRECT` — sent when the player
                         // crosses a zoneline. The server validates that
