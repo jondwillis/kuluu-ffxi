@@ -1,0 +1,8 @@
+[submodule "Phoenix"]
+	path = Phoenix
+	url = git@github.com:phoenixffxi/Phoenix.git
+	branch = beta
+[submodule "server"]
+	path = server
+	url = git@github.com:LandSandBoat/server.git
+	branch = base
