@@ -1,0 +1,25 @@
+# Rust workspace artifacts (defense-in-depth; component .gitignores cover this too)
+**/target/
+**/*.rs.bk
+
+# Node / abandoned scaffolds
+**/node_modules/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+
+# Claude Code per-user settings + plugin runtime state
+.claude/settings.local.json
+.claude/.*/
+
+# Environment / credentials
+.env
+.env.local
+*.env
+
+# Logs
+*.log
+log/
