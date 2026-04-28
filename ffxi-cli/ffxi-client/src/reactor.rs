@@ -457,9 +457,22 @@ pub async fn run(
                 }
             },
             _ = tick.tick() => {
+                // Trace-level: 5 Hz at the default 200 ms tick. Opt in via
+                // `RUST_LOG=ffxi_client::reactor=trace` to profile the loop.
+                // Plain event (not span) because EnteredSpan is `!Send` and
+                // we await inside the loop.
+                let tick_started = std::time::Instant::now();
+                let mut cmds_emitted = 0usize;
                 for cmd in reactor.tick() {
+                    cmds_emitted += 1;
                     if internal_cmd_tx.send(cmd).await.is_err() { break; }
                 }
+                tracing::trace!(
+                    target: "ffxi_client::reactor",
+                    elapsed_us = tick_started.elapsed().as_micros() as u64,
+                    cmds_emitted,
+                    "reactor.tick"
+                );
             }
         }
     };

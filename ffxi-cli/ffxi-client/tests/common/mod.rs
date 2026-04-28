@@ -20,6 +20,8 @@
 
 #![allow(dead_code)] // Used by integration test crates; rustc analyzes per-target.
 
+pub mod mcp_client;
+
 use anyhow::{Context, Result, anyhow};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Pool};

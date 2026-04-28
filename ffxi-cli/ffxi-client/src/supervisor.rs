@@ -87,6 +87,13 @@ pub async fn run(
     let mut user_requested_disconnect = false;
 
     loop {
+        let attempt_id = consecutive_failures + 1;
+        tracing::info!(
+            attempt = attempt_id,
+            replaying_goal = last_goal.is_some(),
+            "supervisor.attempt.start"
+        );
+
         let (inner_tx, inner_rx) = mpsc::channel::<AgentCommand>(64);
 
         // Replay persisted goal first thing on reconnect so the reactor
@@ -161,6 +168,12 @@ pub async fn run(
         };
 
         let attempt_duration = attempt_started.elapsed();
+        tracing::info!(
+            attempt = attempt_id,
+            duration_ms = attempt_duration.as_millis() as u64,
+            outcome = ?attempt_result,
+            "supervisor.attempt.end"
+        );
 
         let attempt_error: anyhow::Error = match attempt_result {
             AttemptOutcome::CleanExit | AttemptOutcome::CallerDropped => {
@@ -208,9 +221,13 @@ pub async fn run(
         // Emit Reconnected *before* the next loop iteration spawns the
         // reactor — clients listening on the broadcast see "we're trying
         // again now" with the cumulative downtime so far.
-        let _ = event_tx.send(AgentEvent::Reconnected {
-            downtime_ms: downtime_started.elapsed().as_millis() as u64,
-        });
+        let downtime_ms = downtime_started.elapsed().as_millis() as u64;
+        tracing::info!(
+            attempt = attempt_id + 1,
+            downtime_ms,
+            "supervisor.reconnected"
+        );
+        let _ = event_tx.send(AgentEvent::Reconnected { downtime_ms });
     }
 }
 

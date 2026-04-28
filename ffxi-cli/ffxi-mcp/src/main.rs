@@ -125,13 +125,28 @@ impl FfxiServer {
     }
 
     async fn send(&self, cmd: AgentCommand) -> Result<CallToolResult, McpError> {
-        match self.cmd_tx.send(cmd).await {
+        // The dispatch latency the LLM observes is just the channel push —
+        // tools return "ok" as soon as the command lands in cmd_tx, before
+        // the session actually executes it. Recording elapsed_us here gives
+        // the operator the exact number to compare against the plan's
+        // `MCP dispatch ≤50 ms p99` budget. Event (not span) because
+        // EnteredSpan is `!Send` and we await on cmd_tx.
+        let kind = cmd_kind_label(&cmd);
+        let started = std::time::Instant::now();
+        let result = match self.cmd_tx.send(cmd).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text("ok")])),
             Err(_) => Err(McpError::internal_error(
                 "session command channel closed",
                 None,
             )),
-        }
+        };
+        tracing::debug!(
+            kind,
+            elapsed_us = started.elapsed().as_micros() as u64,
+            ok = result.is_ok(),
+            "mcp.tool_dispatch"
+        );
+        result
     }
 
     #[tool(
@@ -337,6 +352,10 @@ impl ServerHandler for FfxiServer {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         let uri = request.uri.as_str();
+        // Event (not span) because EnteredSpan is `!Send` and we await on
+        // self.state.read().await below; the elapsed_us field on the trailing
+        // event captures the same latency information.
+        let started = std::time::Instant::now();
         let state = self.state.read().await;
         let contents = match uri {
             "scene://current" => {
@@ -387,7 +406,34 @@ impl ServerHandler for FfxiServer {
                 ));
             }
         };
+        tracing::debug!(
+            uri,
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "mcp.resource_read"
+        );
         Ok(ReadResourceResult::new(vec![contents]))
+    }
+}
+
+/// Stable, low-cardinality label per `AgentCommand` variant for use as a
+/// span/log field. Mirrors the MCP tool names so log analysis can join
+/// dispatch latency back to the tool the LLM called.
+fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
+    use ffxi_client::state::AgentCommand::*;
+    match cmd {
+        Move { .. } => "move",
+        StopMove => "stop_move",
+        Chat { .. } => "chat",
+        Tell { .. } => "tell",
+        Action { .. } => "action",
+        EndEvent => "end_event",
+        Snapshot => "snapshot",
+        Disconnect => "disconnect",
+        Follow { .. } => "follow",
+        Engage { .. } => "engage",
+        PathTo { .. } => "path_to",
+        Cancel => "cancel",
+        RequestZoneChange { .. } => "request_zone_change",
     }
 }
 
