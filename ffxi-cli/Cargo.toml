@@ -29,7 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 3D operator dashboard. Pinned to the only working triple today:
 # `bevy_ratatui_camera` 0.16 wants Bevy 0.17 + ratatui 0.29, and
 # `bevy_ratatui` 0.10 is the matching companion. Gated behind the
-# `view-3d` feature on `ffxi-client` so the default build stays lean.
+# `tui` feature on `ffxi-client` so the default build stays lean.
 # We don't trim Bevy default features here: bevy_ratatui_camera 0.16
 # transitively requests `bevy = "0.17"` with defaults, and Cargo unifies
 # feature sets across the dep graph — pruning here would be a no-op.

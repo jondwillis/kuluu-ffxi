@@ -1,9 +1,10 @@
 //! FFXI CLI/TUI client — entry point.
 
-use ffxi_client::{
-    SessionHandle, agent_io, auth_client, lobby_client, map_client, session, spawn_session, state,
-};
+use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session};
+#[cfg(feature = "tui")]
+use ffxi_client::{spawn_session, state, SessionHandle};
 mod launcher;
+#[cfg(feature = "tui")]
 mod view3d;
 
 use anyhow::{self, Context, Result, bail};
@@ -96,6 +97,7 @@ enum Command {
     /// and lets you pick one before entering the TUI's alt-screen mode.
     /// The numeric charid is resolved by name against the lobby's
     /// character list — agents and humans don't need to know it.
+    #[cfg(feature = "tui")]
     Tui {
         user: Option<String>,
         password: Option<String>,
@@ -120,7 +122,11 @@ async fn main() -> Result<()> {
     // instead.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    if matches!(args.command, Command::Tui { .. }) {
+    #[cfg(feature = "tui")]
+    let is_tui = matches!(args.command, Command::Tui { .. });
+    #[cfg(not(feature = "tui"))]
+    let is_tui = false;
+    if is_tui {
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -468,6 +474,7 @@ async fn main() -> Result<()> {
                 r = agent_task => r??,
             }
         }
+        #[cfg(feature = "tui")]
         Command::Tui {
             user,
             password,

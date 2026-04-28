@@ -12,13 +12,20 @@ path = "src/lib.rs"
 name = "ffxi-client"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enable the Bevy-driven 3D terminal dashboard (`tui` subcommand).
+# Without this feature, only the `play` subcommand (JSON-line agent mode)
+# is compiled — significantly faster compile times.
+tui = ["dep:crossterm", "dep:bevy", "dep:bevy_ratatui", "dep:bevy_ratatui_camera"]
+
 [dependencies]
 ffxi-proto = { path = "../ffxi-proto" }
 
 anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
-crossterm.workspace = true
+crossterm = { workspace = true, optional = true }
 flate2.workspace = true
 ratatui.workspace = true
 rustls.workspace = true
@@ -32,11 +39,9 @@ tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# 3D operator dashboard deps. The TUI is Bevy-rendered; there's no
-# fallback, so these aren't optional.
-bevy.workspace = true
-bevy_ratatui.workspace = true
-bevy_ratatui_camera.workspace = true
+bevy = { workspace = true, optional = true }
+bevy_ratatui = { workspace = true, optional = true }
+bevy_ratatui_camera = { workspace = true, optional = true }
 
 [dev-dependencies]
 mysql_async.workspace = true
