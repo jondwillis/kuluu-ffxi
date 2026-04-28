@@ -40,6 +40,42 @@ pub struct Position {
     pub heading: u8,
 }
 
+/// Compute (dx, dy) for "1 unit forward at heading h". FFXI heading is u8
+/// where 0 = +y axis (north), increasing clockwise viewed from above,
+/// wrapping at 256 = 360°. Lives on `state` so both the 2D minimap TUI and
+/// the 3D view share one wire-convention truth.
+#[inline]
+pub fn heading_to_forward(heading: u8) -> (f32, f32) {
+    let angle = (heading as f32) * std::f32::consts::TAU / 256.0;
+    (angle.sin(), angle.cos())
+}
+
+/// Cycle to the next nearby entity by 2D (xy-plane) distance from `from`.
+/// Identifies the target by `Entity::id` rather than slice index because
+/// the entity list reshuffles between snapshots — an index from one frame
+/// would cycle to the wrong entity (or panic) on the next.
+///
+/// Both renderers use this so Tab semantics stay identical.
+pub fn next_target_by_distance(entities: &[Entity], from: Vec3, current: Option<u32>) -> Option<u32> {
+    if entities.is_empty() {
+        return None;
+    }
+    let mut order: Vec<(&Entity, f32)> = entities
+        .iter()
+        .map(|e| {
+            let dx = e.pos.x - from.x;
+            let dy = e.pos.y - from.y;
+            (e, dx * dx + dy * dy)
+        })
+        .collect();
+    order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let ids: Vec<u32> = order.iter().map(|(e, _)| e.id).collect();
+    match current.and_then(|id| ids.iter().position(|&i| i == id)) {
+        Some(p) => Some(ids[(p + 1) % ids.len()]),
+        None => Some(ids[0]),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {

@@ -32,15 +32,11 @@ tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# 3D operator dashboard deps. Optional + gated behind the `view-3d`
-# feature so a stock build doesn't pay the multi-minute Bevy compile cost.
-bevy = { workspace = true, optional = true }
-bevy_ratatui = { workspace = true, optional = true }
-bevy_ratatui_camera = { workspace = true, optional = true }
-
-[features]
-default = []
-view-3d = ["dep:bevy", "dep:bevy_ratatui", "dep:bevy_ratatui_camera"]
+# 3D operator dashboard deps. The TUI is Bevy-rendered; there's no
+# fallback, so these aren't optional.
+bevy.workspace = true
+bevy_ratatui.workspace = true
+bevy_ratatui_camera.workspace = true
 
 [dev-dependencies]
 mysql_async.workspace = true

@@ -1,8 +1,8 @@
 //! FFXI CLI/TUI client — entry point.
 
-use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session, state};
-mod tui;
-#[cfg(feature = "view-3d")]
+use ffxi_client::{
+    SessionHandle, agent_io, auth_client, lobby_client, map_client, session, spawn_session, state,
+};
 mod view3d;
 
 use anyhow::{self, Context, Result, bail};
@@ -79,19 +79,15 @@ enum Command {
         char_id: u32,
         char_name: String,
     },
-    /// Same session as `Play`, but renders a ratatui human-facing TUI on the
-    /// terminal instead of streaming JSON. Press `q` to disconnect cleanly.
+    /// Same session as `Play`, but renders a Bevy-driven 3D operator
+    /// dashboard into the terminal via `bevy_ratatui_camera`. Press `q`,
+    /// `Esc`, or `Ctrl+C` to disconnect cleanly.
     Tui {
         user: String,
         password: String,
         char_id: u32,
         char_name: String,
     },
-    /// Stage-1 spike for the 3D operator dashboard: spinning cube rendered
-    /// into the terminal via `bevy_ratatui_camera`. No FFXI session involved.
-    /// Build with `--features view-3d`. Press `q` (or Esc) to quit.
-    #[cfg(feature = "view-3d")]
-    Spike3d,
 }
 
 #[tokio::main]
@@ -106,21 +102,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Logs go to stderr by default (so stdout stays clean for `play`'s
-    // JSON-line event stream). For `tui`, redirect to /tmp/ffxi-client.log
-    // so the alternate-screen view stays readable.
+    // JSON-line event stream). `tui` enters alt-screen mode (Bevy +
+    // RatatuiPlugins own the terminal) so its logs route to a file
+    // instead.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let alternate_screen_cmd = matches!(args.command, Command::Tui { .. }) || {
-        #[cfg(feature = "view-3d")]
-        {
-            matches!(args.command, Command::Spike3d)
-        }
-        #[cfg(not(feature = "view-3d"))]
-        {
-            false
-        }
-    };
-    if alternate_screen_cmd {
+    if matches!(args.command, Command::Tui { .. }) {
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -419,52 +406,92 @@ async fn main() -> Result<()> {
                 char_id,
                 char_name,
             };
-            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<state::AgentCommand>(64);
-            let (event_tx, event_rx_for_folder) =
-                tokio::sync::broadcast::channel::<state::AgentEvent>(256);
-            let (state_tx, state_rx) =
-                tokio::sync::watch::channel(state::SessionState::default());
+            let SessionHandle {
+                state_rx,
+                cmd_tx,
+                event_tx,
+                session_task,
+                folder_task,
+            } = spawn_session(cfg);
 
-            let session_task = tokio::spawn(session::run(cfg, cmd_rx, event_tx));
+            // JSON event/command log: tokio task subscribes to the broadcast
+            // and feeds an unbounded mpsc; Bevy drains it each frame. The
+            // shared `show_all` flag is flipped by the `L` key in the input
+            // handler — the feeder reads it before pushing each event so the
+            // ring buffer doesn't fill with Position spam unless asked.
+            let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
+            let show_all = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let log_feeder = tokio::spawn({
+                let mut event_rx = event_tx.subscribe();
+                let log_tx = log_tx.clone();
+                let show_all = show_all.clone();
+                async move {
+                    while let Ok(ev) = event_rx.recv().await {
+                        let suppress = !show_all.load(std::sync::atomic::Ordering::Relaxed)
+                            && matches!(
+                                &ev,
+                                state::AgentEvent::PositionChanged { .. }
+                                    | state::AgentEvent::Diagnostics { .. }
+                            );
+                        if suppress {
+                            continue;
+                        }
+                        if let Ok(json) = serde_json::to_string(&ev) {
+                            if log_tx.send(format!("→ {json}")).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
 
-            // Folder: subscribes to the broadcast event log, applies each
-            // event to a SessionState, publishes the result on a watch so
-            // the TUI can render at its own pace without ever blocking the
-            // session actor's RX loop. Watch's "always-latest" semantics
-            // mean the TUI naturally drops intermediate states under load
-            // — it's a snapshot view, not an event log.
-            let folder_task = tokio::spawn(run_event_folder(event_rx_for_folder, state_tx));
+            // Bevy owns its loop; park it on the blocking pool so the
+            // tokio runtime keeps draining session/folder tasks.
+            let mut view_task = tokio::task::spawn_blocking({
+                let state_rx = state_rx.clone();
+                let cmd_tx = cmd_tx.clone();
+                let log_tx = log_tx.clone();
+                let show_all = show_all.clone();
+                move || view3d::run(state_rx, cmd_tx, log_rx, log_tx, show_all)
+            });
+            let mut session_task = session_task;
 
-            let tui_task = tokio::spawn(tui::run(state_rx, cmd_tx));
-
-            // Whichever ends first triggers shutdown of the others.
+            // Whichever side finishes first triggers shutdown of the other.
+            // - View exits first (q/Esc/Ctrl+C) → input handler already sent
+            //   `AgentCommand::Disconnect`; give the session 2s to drain its
+            //   shutdown sequence then force-abort if it's stuck.
+            // - Session exits first (server disconnect) → no clean way to
+            //   tell the Bevy app; abort the view task.
             let outcome: Result<()> = tokio::select! {
-                r = session_task => r?.context("session task"),
-                r = tui_task => r?.context("TUI task"),
+                r = &mut session_task => {
+                    view_task.abort();
+                    let _ = (&mut view_task).await;
+                    r?.context("session task")
+                }
+                r = &mut view_task => {
+                    let view_result = r?.context("view task");
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        &mut session_task,
+                    ).await {
+                        Ok(_) => {}
+                        Err(_) => session_task.abort(),
+                    }
+                    view_result
+                }
             };
 
-            // Folder will exit on its own when the broadcast sender drops.
+            // Folder + log_feeder are blocked on `event_rx.recv()`, which
+            // only returns `Closed` when *every* broadcast sender drops.
+            // session::run's clone is gone by now, but `event_tx` here in
+            // main outlives the select! above — drop it explicitly so the
+            // receivers wake up. Without this, `q` hangs the process.
+            drop(event_tx);
             let _ = folder_task.await;
+            let _ = log_feeder.await;
 
-            // Best-effort terminal restore — if `tui::run`'s teardown didn't
-            // execute (e.g., we exited via session error while TUI was
-            // mid-render), this prevents leaving the user in alternate-screen
-            // raw-mode hell.
-            let _ = crossterm::terminal::disable_raw_mode();
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-
-            outcome?;
-        }
-        #[cfg(feature = "view-3d")]
-        Command::Spike3d => {
-            // Bevy's `App::run()` is a blocking call that owns its own loop;
-            // `spawn_blocking` parks it on the runtime's blocking pool so
-            // the tokio worker stays free.
-            let outcome = tokio::task::spawn_blocking(view3d::run_spike).await?;
-
-            // Same alternate-screen safety net as the TUI arm — RatatuiPlugins
-            // owns terminal teardown but a panic mid-render could leave us
-            // in raw mode.
+            // Best-effort terminal restore — RatatuiPlugins owns teardown
+            // but a panic mid-render could leave us in raw-mode hell.
             let _ = crossterm::terminal::disable_raw_mode();
             let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
 
@@ -516,23 +543,6 @@ async fn main() -> Result<()> {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-/// Drain the broadcast event log and fold into a watch-published SessionState.
-/// Lagged events are skipped (not re-driven) — the watch view is "latest
-/// snapshot", so missing intermediate state under load is correct, not lossy.
-async fn run_event_folder(
-    mut event_rx: tokio::sync::broadcast::Receiver<state::AgentEvent>,
-    state_tx: tokio::sync::watch::Sender<state::SessionState>,
-) {
-    use tokio::sync::broadcast::error::RecvError;
-    loop {
-        match event_rx.recv().await {
-            Ok(event) => state_tx.send_modify(|s| s.apply_event(&event)),
-            Err(RecvError::Lagged(_)) => continue,
-            Err(RecvError::Closed) => break,
-        }
-    }
 }
 
 /// Build a single GP_CLI_COMMAND_LOGIN sub-packet (4-byte header + 88-byte

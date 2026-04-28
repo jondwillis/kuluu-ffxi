@@ -1,109 +1,249 @@
 //! 3D operator dashboard — a headless Bevy app rendered into the terminal
-//! via `bevy_ratatui_camera`. Stage 1 here is a self-contained spike:
-//! a spinning cube, no FFXI session involvement, used to validate the
-//! dependency stack and the main-thread/tokio split before wiring the
-//! actual session in Stage 2.
+//! via `bevy_ratatui_camera`. Subscribes to `SessionState` via a tokio
+//! `watch::Receiver` (see the `bridge` module) and dispatches keyboard
+//! input as `AgentCommand`s back over an `mpsc::Sender`.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bevy::{
-    app::{AppExit, ScheduleRunnerPlugin},
+    app::ScheduleRunnerPlugin,
     log::LogPlugin,
     prelude::*,
+    time::Fixed,
     winit::WinitPlugin,
 };
-use bevy_ratatui::{RatatuiContext, RatatuiPlugins, event::KeyMessage};
-use bevy_ratatui_camera::{
-    RatatuiCamera, RatatuiCameraPlugin, RatatuiCameraStrategy, RatatuiCameraWidget,
+use bevy_ratatui::{RatatuiContext, RatatuiPlugins, kitty::KittyEnabled};
+use bevy_ratatui_camera::{RatatuiCameraPlugin, RatatuiCameraWidget};
+use ratatui::{
+    layout::{Constraint, Direction as LayoutDirection, Layout, Rect},
+    style::{Color as TuiColor, Modifier, Style},
+    text::Span,
+    widgets::{Paragraph, Widget},
 };
-use crossterm::event::{KeyCode, KeyEventKind};
-use ratatui::widgets::Widget;
+use tokio::sync::{mpsc, watch};
 
-#[derive(Component)]
-struct Spinner;
+use ffxi_client::chrome;
+use crate::state::{AgentCommand, EntityKind, SessionState};
 
-/// Stage-1 spike entry point. Blocks the calling thread until the user
-/// presses `q` (or any other AppExit trigger). Returns once Bevy's event
-/// loop drains.
-///
-/// Bevy's `App::run()` is synchronous and never returns to async; callers
-/// from a tokio runtime must invoke this via `spawn_blocking` (or just
-/// drop into it from a sync context — there's no FFXI session running
-/// alongside the spike).
-pub fn run_spike() -> anyhow::Result<()> {
+use scene::{IsSelf, Target, WorldEntity};
+
+pub mod bridge;
+pub mod camera;
+pub mod floor;
+pub mod input;
+pub mod scene;
+
+/// Build and run the dashboard. Blocks the calling thread; intended to be
+/// called from inside `tokio::task::spawn_blocking` so the tokio runtime
+/// keeps draining the session and folder tasks.
+pub fn run(
+    state_rx: watch::Receiver<SessionState>,
+    cmd_tx: mpsc::Sender<AgentCommand>,
+    log_rx: mpsc::UnboundedReceiver<String>,
+    log_tx: mpsc::UnboundedSender<String>,
+    show_all_events: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     App::new()
         .add_plugins((
-            // `WinitPlugin` would try to open an OS window; we want headless
-            // rendering into the terminal instead. `LogPlugin` would write
-            // to stderr and corrupt the alternate-screen view, so it's off
-            // too — bevy_ratatui owns terminal output now.
             DefaultPlugins
                 .build()
                 .disable::<WinitPlugin>()
                 .disable::<LogPlugin>(),
-            // Without winit there's no event-driven loop, so we drive Update
-            // ourselves at 60 Hz. Keeps CPU bounded and matches the example.
             ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(1.0 / 60.0)),
             RatatuiPlugins::default(),
             RatatuiCameraPlugin,
         ))
-        .insert_resource(ClearColor(Color::BLACK))
-        .add_systems(Startup, setup_scene)
-        .add_systems(PreUpdate, handle_input)
-        .add_systems(Update, (rotate_spinner, draw_terminal))
+        .insert_resource(ClearColor(Color::srgb(0.05, 0.05, 0.08)))
+        .insert_resource(bridge::SessionStateRx(state_rx))
+        .insert_resource(bridge::CommandTx(cmd_tx))
+        .insert_resource(bridge::EventLogRx(log_rx))
+        .insert_resource(bridge::LogTx(log_tx))
+        .insert_resource(bridge::ShowAllEvents(show_all_events))
+        .init_resource::<bridge::SessionStateSnapshot>()
+        .init_resource::<bridge::EventLog>()
+        .init_resource::<input::HeldDirs>()
+        .init_resource::<input::KittyHintLogged>()
+        .init_resource::<scene::Target>()
+        // 20 Hz movement dispatch matches `tui.rs:88` TICK_MS=50, so the
+        // wire-side cadence (and per-tick step size) is identical between
+        // the 2D TUI and the 3D view. The render loop still runs at 60 Hz.
+        .insert_resource(Time::<Fixed>::from_hz(20.0))
+        .add_systems(
+            Startup,
+            (scene::setup_scene, camera::setup_camera, floor::setup_floor),
+        )
+        .add_systems(
+            PreUpdate,
+            (
+                input::log_kitty_hint_system,
+                input::handle_input_system,
+                bridge::ingest_state_system,
+                bridge::ingest_log_system,
+            )
+                .chain(),
+        )
+        .add_systems(FixedUpdate, input::dispatch_movement_system)
+        .add_systems(
+            Update,
+            (
+                scene::sync_entities_system,
+                floor::swap_floor_system,
+                camera::chase_camera_system,
+                draw_terminal,
+            )
+                .chain(),
+        )
         .run();
     Ok(())
 }
 
-fn setup_scene(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    commands.spawn((
-        Spinner,
-        Mesh3d(meshes.add(Cuboid::default())),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.4, 0.54, 0.7),
-            ..default()
-        })),
-    ));
-    commands.spawn((
-        PointLight {
-            intensity: 2_000_000.0,
-            shadows_enabled: false,
-            ..default()
-        },
-        Transform::from_xyz(3.0, 4.0, 6.0),
-    ));
-    commands.spawn((
-        RatatuiCamera::default(),
-        RatatuiCameraStrategy::halfblocks(),
-        Camera3d::default(),
-        Transform::from_xyz(2.5, 2.5, 2.5).looking_at(Vec3::ZERO, Vec3::Z),
-    ));
-}
-
-fn handle_input(mut keys: MessageReader<KeyMessage>, mut exit: MessageWriter<AppExit>) {
-    for k in keys.read() {
-        if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            && matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-        {
-            exit.write_default();
-        }
-    }
-}
-
-fn rotate_spinner(time: Res<Time>, mut spinner: Single<&mut Transform, With<Spinner>>) {
-    spinner.rotate_z(time.delta_secs());
-}
-
+/// Compose the full dashboard frame:
+///  - top: stage bar (chrome)
+///  - body left: 3D camera widget + entity nametag overlays
+///  - body right: chat panel (chrome)
+///  - bottom: diagnostics (chrome)
+///
+/// Nametags use ratatui text overlays (not 3D-baked text quads) — at
+/// halfblock resolution, glyphs rendered into the framebuffer would be
+/// unreadable. Projecting world positions through `Camera::world_to_viewport`
+/// then mapping pixel coords → terminal cells lets us paint real glyphs
+/// directly into the ratatui buffer after the camera widget renders.
 fn draw_terminal(
     mut ratatui: ResMut<RatatuiContext>,
     mut camera_widget: Single<&mut RatatuiCameraWidget>,
+    snapshot: Res<bridge::SessionStateSnapshot>,
+    event_log: Res<bridge::EventLog>,
+    show_all: Res<bridge::ShowAllEvents>,
+    target: Res<Target>,
+    cam_q: Query<(&Camera, &GlobalTransform), (With<Camera3d>, Without<WorldEntity>, Without<IsSelf>)>,
+    entity_q: Query<(&WorldEntity, &Transform), Without<IsSelf>>,
+    kitty: Option<Res<KittyEnabled>>,
 ) -> Result {
+    let kitty_ok = kitty.is_some();
+    let show_all = show_all.0.load(Ordering::Relaxed);
     ratatui.draw(|frame| {
-        camera_widget.render(frame.area(), frame.buffer_mut());
+        let chunks = Layout::default()
+            .direction(LayoutDirection::Vertical)
+            .constraints([
+                Constraint::Length(3), // stage bar
+                Constraint::Min(8),    // body
+                Constraint::Length(3), // diagnostics
+            ])
+            .split(frame.area());
+
+        chrome::draw_stage_bar(frame, chunks[0], &snapshot.0);
+
+        let body = Layout::default()
+            .direction(LayoutDirection::Horizontal)
+            // Bias toward the 3D viewport — chat is text-dense and works
+            // narrow, the 3D camera needs every cell it can get.
+            .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+            .split(chunks[1]);
+
+        let camera_area = body[0];
+        camera_widget.render(camera_area, frame.buffer_mut());
+        if let Ok((cam, cam_xform)) = cam_q.single() {
+            render_nametags(frame, camera_area, cam, cam_xform, &entity_q, &target);
+        }
+
+        // Right column: chat on top, JSON event/command log below.
+        // 60/40 split favors chat — chat lines are short and context-rich,
+        // JSON lines are long but truncated at the right edge anyway, so
+        // a smaller pane still surfaces ~10 recent events at typical
+        // terminal heights.
+        let right = Layout::default()
+            .direction(LayoutDirection::Vertical)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(body[1]);
+
+        chrome::draw_chat(frame, right[0], &snapshot.0);
+        chrome::draw_event_log(frame, right[1], &event_log.lines, show_all);
+        chrome::draw_diagnostics(frame, chunks[2], &snapshot.0, None, kitty_ok);
     })?;
     Ok(())
 }
+
+/// Project each entity's world position through the camera and paint a
+/// short text label one cell above its head. Skips entities behind the
+/// camera (`world_to_viewport` returns Err) or with no name yet.
+///
+/// Pixel-to-cell mapping is the load-bearing detail: `bevy_ratatui_camera`
+/// 0.16's autoresize sets the framebuffer to `(area.width * 2,
+/// area.height * 4)` pixels (see `camera_readback.rs:372` in that crate),
+/// so `world_to_viewport` returns x in `[0..2W]` and y in `[0..4H]`. The
+/// strategy downsamples that to one cell per 2×4 pixel block. Earlier
+/// math here treated y as `[0..2H]` (assumed halfblocks took 2 px / cell
+/// vertically) — that's wrong, the framebuffer is over-sampled. Labels
+/// drifted variably down and right because the divisors were off by 2×.
+fn render_nametags(
+    frame: &mut ratatui::Frame,
+    camera_area: Rect,
+    cam: &Camera,
+    cam_xform: &GlobalTransform,
+    entity_q: &Query<(&WorldEntity, &Transform), Without<IsSelf>>,
+    target: &Target,
+) {
+    // Framebuffer dimensions per `bevy_ratatui_camera`'s autoresize.
+    let fb_w = (camera_area.width as f32) * 2.0;
+    let fb_h = (camera_area.height as f32) * 4.0;
+
+    for (we, t) in entity_q.iter() {
+        let Some(name) = we.name.as_deref() else { continue };
+        if name.is_empty() {
+            continue;
+        }
+        // Lift the projection point well above the capsule head. The
+        // capsule extends from world y=0 to ~1.0; +1.6 puts the label
+        // anchor 0.6 units above its top so the row-shift below stays
+        // safely above the rendered glyphs even at extreme camera pitch.
+        let head_world = t.translation + Vec3::Y * 1.6;
+        let Ok(viewport_px) = cam.world_to_viewport(cam_xform, head_world) else {
+            continue;
+        };
+        if viewport_px.x < 0.0
+            || viewport_px.x >= fb_w
+            || viewport_px.y < 0.0
+            || viewport_px.y >= fb_h
+        {
+            continue;
+        }
+        let display: String = name.chars().take(10).collect();
+        let label_w = display.chars().count() as u16;
+        // Pixel → cell. With the 2×4-px-per-cell oversampling, divide x
+        // by 2 and y by 4. round() (not as-cast truncation) gives the
+        // closest cell, important so half-cell offsets don't always
+        // round down (which biased every label one row below the model).
+        let cell_x = camera_area.x + (viewport_px.x / 2.0).round() as u16;
+        let cell_y_anchor = camera_area.y + (viewport_px.y / 4.0).round() as u16;
+        // Label one row above the projected anchor.
+        let cell_y = cell_y_anchor.saturating_sub(1).max(camera_area.y);
+        let mut start_x = cell_x.saturating_sub(label_w / 2);
+        if start_x + label_w > camera_area.x + camera_area.width {
+            start_x = (camera_area.x + camera_area.width).saturating_sub(label_w);
+        }
+        if start_x < camera_area.x {
+            start_x = camera_area.x;
+        }
+        let label_area = Rect::new(start_x, cell_y, label_w, 1);
+        let color = if Some(we.id) == target.id {
+            TuiColor::Yellow
+        } else {
+            kind_color(we.kind)
+        };
+        let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+        frame.render_widget(Paragraph::new(Span::styled(display, style)), label_area);
+    }
+}
+
+fn kind_color(kind: EntityKind) -> TuiColor {
+    match kind {
+        EntityKind::Pc => TuiColor::Cyan,
+        EntityKind::Npc => TuiColor::White,
+        EntityKind::Mob => TuiColor::Red,
+        EntityKind::Pet => TuiColor::Yellow,
+        EntityKind::Other => TuiColor::DarkGray,
+    }
+}
+
