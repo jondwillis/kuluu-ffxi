@@ -2,3 +2,7 @@ target/
 Cargo.lock
 *.swp
 .DS_Store
+
+# Claude Code per-session hook telemetry (functional-emotions plugin).
+# Per-session TSVs + markdown summaries; not project state.
+.claude/.functional-emotions/
