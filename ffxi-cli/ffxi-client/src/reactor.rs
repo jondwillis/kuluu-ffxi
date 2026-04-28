@@ -245,6 +245,13 @@ impl Reactor {
                 self.goal = Goal::Idle;
                 CommandRouting::absorbed()
             }
+            AgentCommand::BankWhenFull { .. } => {
+                // Stage-9 wires the actual Goal::Banking variant + tick branch.
+                // For now: forward as a no-op pass-through so the command
+                // round-trips (the supervisor still persists it via
+                // goal_store::is_persistable_goal once that's extended).
+                CommandRouting::forward(cmd)
+            }
             AgentCommand::Move { .. } => {
                 self.goal = Goal::Idle;
                 CommandRouting::forward(cmd)

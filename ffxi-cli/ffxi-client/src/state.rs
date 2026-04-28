@@ -1,6 +1,8 @@
 //! Session state — the single source of truth that both the TUI and the
 //! JSON sidechannel subscribe to.
 
+use std::collections::{HashMap, VecDeque};
+
 use serde::{Deserialize, Serialize};
 
 /// Stage of the end-to-end login flow we're currently in.
@@ -156,7 +158,116 @@ pub struct SessionState {
     pub party: Vec<PartyMember>,
     pub chat: Vec<ChatLine>,
     pub diagnostics: Diagnostics,
+    /// Mirrored inventory state. Populated by the Stage-9 0x01C/D/E/F/0x020
+    /// decoders. Empty until the first `InventoryReady` event lands.
+    #[serde(default)]
+    pub inventory: Inventory,
+    /// Live snapshot of the reactor's current `Goal`. The reactor emits
+    /// `ReactorGoalChanged` on every mutation; the fold here mirrors it
+    /// for renderers (Bevy HUD) and resources (`goal://current` could
+    /// soon read this in addition to `goal_store`).
+    #[serde(default)]
+    pub current_goal: Option<ReactorGoalSnapshot>,
+    /// Most recent supervisor reconnect, for display in the operator HUD.
+    #[serde(default)]
+    pub last_reconnect: Option<ReconnectInfo>,
+    /// Bounded ring of recent LLM decisions (notifications fired + tool
+    /// dispatches), capped at `RECENT_DECISIONS_CAP`. Drives the
+    /// LLM-decision badge in the operator dashboard.
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub recent_decisions: VecDeque<LlmDecision>,
 }
+
+/// Inventory mirror, populated by Stage-9 decoders. Container ids match
+/// `Phoenix/src/map/packets/s2c/0x01c_item_max.h`'s `Container` enum
+/// (0=Inventory, 1=Safe, 2=Storage, …, 13=Wardrobe1, …). Storing as a
+/// HashMap keeps the layer flexible against new container slots in
+/// upstream LSB without breaking serialization.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Inventory {
+    pub containers: HashMap<u8, ContainerInfo>,
+    /// Set when 0x01D `ITEM_SAME` arrives with `State::AllLoaded`.
+    /// Indicates the initial zone-in inventory flood has finished and the
+    /// agent can rely on capacity / slot counts being authoritative.
+    pub all_loaded: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContainerInfo {
+    pub capacity: u8,
+    pub slots: Vec<ItemSlot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemSlot {
+    pub index: u8,
+    pub item_no: u16,
+    pub quantity: u32,
+    pub locked: bool,
+    pub price: u32,
+}
+
+/// Serializable mirror of `crate::reactor::Goal`. Lives here (not in
+/// reactor.rs) so the state crate can be consumed without pulling in
+/// reactor internals — the renderers care about *what* the goal is, not
+/// how the reactor implements it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReactorGoalSnapshot {
+    Idle,
+    Following { target_id: u32, distance: f32 },
+    Engaged { target_id: u32, attack_issued: bool },
+    Pathing { x: f32, y: f32, z: f32 },
+    /// Stage-9 reactor goal: monitor inventory and zone to mog house when
+    /// any non-mog container reaches `threshold` slots filled.
+    Banking { threshold: u8, mog_house_zoneline: u32 },
+}
+
+impl Default for ReactorGoalSnapshot {
+    fn default() -> Self {
+        ReactorGoalSnapshot::Idle
+    }
+}
+
+/// Last supervisor reconnect, surfaced to the operator HUD.
+/// `monotonic_at_unix_ms` is wall-clock — the dashboard compares against
+/// `SystemTime::now()` to render "1.2s ago". Wall-clock (not monotonic)
+/// because `SessionState` round-trips through serde and crosses process
+/// boundaries; pairing two `Instant`s across processes is meaningless.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconnectInfo {
+    pub downtime_ms: u64,
+    pub at_unix_ms: u64,
+}
+
+/// One LLM-decision data point: either a notification we fired toward
+/// the harness, or a tool the harness dispatched. Pairing across the
+/// two surfaces the round-trip "thinking time" the operator sees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmDecision {
+    pub kind: LlmDecisionKind,
+    /// Microseconds elapsed for the in-process side (notification send,
+    /// tool dispatch). LLM round-trip across `NotificationFired →
+    /// ToolDispatched` is computed at render time by pairing entries.
+    pub latency_us: u64,
+    /// Process-monotonic timestamp in milliseconds since process start.
+    /// Used by the dashboard's "pulse" decay; not meaningful across
+    /// processes.
+    pub at_monotonic_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LlmDecisionKind {
+    /// MCP fired a `notifications/resources/updated` toward the harness.
+    NotificationFired { uri: String },
+    /// Harness invoked a tool; `tool` is the cmd_kind_label.
+    ToolDispatched { tool: String },
+}
+
+/// Cap on retained decisions. The HUD sparkline shows the most recent
+/// 32; 64 leaves headroom for histograms without unbounded growth.
+const RECENT_DECISIONS_CAP: usize = 64;
 
 /// One row in the agent's view of the party. Populated from
 /// `0x0DD GROUP_LIST` (other members; provides name + leader flags) and
@@ -286,6 +397,28 @@ impl SessionState {
                     self.party.push(member.clone());
                 }
             }
+            AgentEvent::Reconnected { downtime_ms } => {
+                let at_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                self.last_reconnect = Some(ReconnectInfo {
+                    downtime_ms: *downtime_ms,
+                    at_unix_ms,
+                });
+            }
+            AgentEvent::ReactorGoalChanged { goal } => {
+                self.current_goal = Some(goal.clone());
+            }
+            AgentEvent::LlmDecision { decision } => {
+                self.recent_decisions.push_back(decision.clone());
+                while self.recent_decisions.len() > RECENT_DECISIONS_CAP {
+                    self.recent_decisions.pop_front();
+                }
+            }
+            AgentEvent::InventoryReady => {
+                self.inventory.all_loaded = true;
+            }
             // High-signal events the LLM wakes for. They don't mutate
             // SessionState — the data is already there (HP via entity
             // updates, chat via ChatLine). They're notifications, not state.
@@ -293,8 +426,14 @@ impl SessionState {
             | AgentEvent::PartyMemberLowHp { .. }
             | AgentEvent::EngagedBy { .. }
             | AgentEvent::TellReceived { .. }
-            | AgentEvent::Reconnected { .. }
             | AgentEvent::SceneSummary { .. } => {}
+            // InventoryUpdated is a notification — the actual slot data lands
+            // through a side channel (Stage-9 will wire the apply path
+            // directly into SessionState.inventory in session.rs's
+            // handle_sub_packet, similar to how PartyMemberUpdated carries
+            // its data inline). Left as a no-op here so the foundation
+            // commit stays minimal.
+            AgentEvent::InventoryUpdated { .. } => {}
             // EventStart / EventEnded / KeyRotated are flow signals; the TUI
             // doesn't render them as state today. Left as no-ops — extending
             // is a non-breaking change.
@@ -397,6 +536,31 @@ pub enum AgentEvent {
     SceneSummary {
         text: String,
     },
+    /// One container's inventory contents changed. The fold replaces the
+    /// container's slots in `SessionState.inventory`; the LLM wakes only
+    /// for `InventoryReady` (initial flood done) — per-slot churn is
+    /// tactical detail.
+    InventoryUpdated {
+        container: u8,
+    },
+    /// Initial zone-in inventory flood is complete (0x01D `ITEM_SAME`
+    /// with `State::AllLoaded`). After this point the agent can rely
+    /// on container capacities and slot counts being authoritative for
+    /// `bank_when_full` checks.
+    InventoryReady,
+    /// Reactor goal transitioned. Mirrored into
+    /// `SessionState.current_goal` so renderers can show the active
+    /// intent. Fires on every `handle_command` mutation and on the
+    /// `Pathing → Idle` self-clearing tick.
+    ReactorGoalChanged {
+        goal: ReactorGoalSnapshot,
+    },
+    /// One LLM-decision data point. Emitted from the in-process MCP
+    /// server (combined-binary mode) — the headless `ffxi-mcp` does not
+    /// emit these because it has no broadcast peer.
+    LlmDecision {
+        decision: LlmDecision,
+    },
 }
 
 /// Strictly enumerated commands an agent can issue. **Do not** add a generic
@@ -455,6 +619,26 @@ pub enum AgentCommand {
     PathTo { x: f32, y: f32, z: f32 },
     /// Reactor: clear any active goal, return to `Idle`.
     Cancel,
+    /// `GP_CLI_COMMAND_ITEM_USE` (0x037) — use a consumable / equipment
+    /// item. **Not** an `ActionKind` variant: the wire opcode is `0x037`,
+    /// not `0x01A`. `container` and `slot` index into `Inventory.containers`
+    /// (the slot's `item_no` becomes the wire `ItemNum`); `target_id` /
+    /// `target_index` identify the recipient (self for potions / scrolls;
+    /// another entity for ranged items).
+    UseItem {
+        container: u8,
+        slot: u8,
+        target_id: u32,
+        target_index: u16,
+    },
+    /// Reactor goal: monitor inventory; when any non-mog container reaches
+    /// `threshold` slots filled, request a zone change to `mog_house_zoneline`.
+    /// Survives reconnects via `goal_store`. One-shot per banking cycle —
+    /// once the zone change fires, the goal clears.
+    BankWhenFull {
+        threshold: u8,
+        mog_house_zoneline: u32,
+    },
 }
 
 /// Tagged-union of every `0x01A` action the agent can perform. The variant
@@ -792,6 +976,117 @@ mod tests {
         // Disconnected lands the terminal stage.
         s.apply_event(&AgentEvent::Disconnected { reason: "test".into() });
         assert_eq!(s.stage, Stage::Disconnected);
+    }
+
+    #[test]
+    fn use_item_command_roundtrip() {
+        let line = r#"{"cmd":"use_item","container":0,"slot":3,"target_id":42,"target_index":7}"#;
+        let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+        match cmd {
+            AgentCommand::UseItem {
+                container,
+                slot,
+                target_id,
+                target_index,
+            } => {
+                assert_eq!((container, slot, target_id, target_index), (0, 3, 42, 7));
+            }
+            _ => panic!("wrong variant: {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn bank_when_full_command_roundtrip() {
+        let line = r#"{"cmd":"bank_when_full","threshold":90,"mog_house_zoneline":12345}"#;
+        let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+        match cmd {
+            AgentCommand::BankWhenFull {
+                threshold,
+                mog_house_zoneline,
+            } => {
+                assert_eq!((threshold, mog_house_zoneline), (90, 12345));
+            }
+            _ => panic!("wrong variant: {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn reactor_goal_changed_event_roundtrip() {
+        let ev = AgentEvent::ReactorGoalChanged {
+            goal: ReactorGoalSnapshot::Engaged {
+                target_id: 99,
+                attack_issued: true,
+            },
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: AgentEvent = serde_json::from_str(&s).unwrap();
+        match back {
+            AgentEvent::ReactorGoalChanged {
+                goal: ReactorGoalSnapshot::Engaged { target_id, attack_issued },
+            } => {
+                assert_eq!(target_id, 99);
+                assert!(attack_issued);
+            }
+            other => panic!("wrong shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconnected_fold_writes_last_reconnect() {
+        let mut s = SessionState::default();
+        assert!(s.last_reconnect.is_none());
+        s.apply_event(&AgentEvent::Reconnected { downtime_ms: 1234 });
+        let info = s.last_reconnect.expect("set");
+        assert_eq!(info.downtime_ms, 1234);
+        assert!(info.at_unix_ms > 0, "wall-clock stamped");
+    }
+
+    #[test]
+    fn reactor_goal_changed_fold_writes_current_goal() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::ReactorGoalChanged {
+            goal: ReactorGoalSnapshot::Following {
+                target_id: 42,
+                distance: 3.0,
+            },
+        });
+        match s.current_goal {
+            Some(ReactorGoalSnapshot::Following { target_id, distance }) => {
+                assert_eq!(target_id, 42);
+                assert!((distance - 3.0).abs() < 1e-3);
+            }
+            other => panic!("expected Following, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn llm_decision_fold_appends_and_caps() {
+        let mut s = SessionState::default();
+        for i in 0..(RECENT_DECISIONS_CAP + 5) {
+            s.apply_event(&AgentEvent::LlmDecision {
+                decision: LlmDecision {
+                    kind: LlmDecisionKind::ToolDispatched {
+                        tool: format!("t{i}"),
+                    },
+                    latency_us: i as u64,
+                    at_monotonic_ms: i as u64,
+                },
+            });
+        }
+        assert_eq!(s.recent_decisions.len(), RECENT_DECISIONS_CAP);
+        // Oldest 5 dropped.
+        match &s.recent_decisions.front().unwrap().kind {
+            LlmDecisionKind::ToolDispatched { tool } => assert_eq!(tool, "t5"),
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inventory_ready_sets_all_loaded() {
+        let mut s = SessionState::default();
+        assert!(!s.inventory.all_loaded);
+        s.apply_event(&AgentEvent::InventoryReady);
+        assert!(s.inventory.all_loaded);
     }
 
     #[test]

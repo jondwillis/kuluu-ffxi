@@ -434,6 +434,8 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         PathTo { .. } => "path_to",
         Cancel => "cancel",
         RequestZoneChange { .. } => "request_zone_change",
+        UseItem { .. } => "use_item",
+        BankWhenFull { .. } => "bank_when_full",
     }
 }
 

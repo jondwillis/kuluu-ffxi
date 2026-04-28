@@ -512,7 +512,8 @@ async fn keepalive_loop(
                     Some(AgentCommand::Follow { .. })
                     | Some(AgentCommand::Engage { .. })
                     | Some(AgentCommand::PathTo { .. })
-                    | Some(AgentCommand::Cancel) => {
+                    | Some(AgentCommand::Cancel)
+                    | Some(AgentCommand::BankWhenFull { .. }) => {
                         // These are reactor-handled goal commands. If they
                         // reach the session loop, the reactor middleware
                         // (`crate::reactor::run`) wasn't wired in front —
@@ -520,6 +521,16 @@ async fn keepalive_loop(
                         let _ = event_tx.send(AgentEvent::Error {
                             message: "reactor goal command reached session loop \
                                       (reactor middleware not wired)"
+                                .into(),
+                        });
+                    }
+                    Some(AgentCommand::UseItem { .. }) => {
+                        // Stage 8 wires the 0x037 GP_CLI_COMMAND_ITEM_USE
+                        // packet builder. Until then, surface as an error
+                        // rather than silently drop — keeps the foundation
+                        // commit honest about what's not yet implemented.
+                        let _ = event_tx.send(AgentEvent::Error {
+                            message: "use_item: 0x037 packet builder not yet wired (Stage 8)"
                                 .into(),
                         });
                     }
