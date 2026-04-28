@@ -143,7 +143,6 @@ impl MapClient {
             .recv_from(&mut buf)
             .await
             .context("UDP recv_from")?;
-        tracing::info!(bytes = n, src = %src, "recv");
         buf.truncate(n);
 
         if n < framing::MIN_FRAME_SIZE {
@@ -195,6 +194,21 @@ impl MapClient {
         let mut out = Vec::with_capacity(framing::FFXI_HEADER_SIZE + decompressed.len());
         out.extend_from_slice(&buf[..framing::FFXI_HEADER_SIZE]);
         out.extend_from_slice(&decompressed);
+
+        // Log sub-packet opcodes for the decompressed payload.
+        let opcodes: Vec<String> = framing::walk_sub_packets(&decompressed)
+            .filter_map(|r| r.ok().map(|s| format!("0x{:03x}", s.opcode)))
+            .collect();
+        if !opcodes.is_empty() {
+            tracing::info!(
+                bytes = n,
+                src = %src,
+                sub_count = opcodes.len(),
+                sub_opcodes = opcodes.join(" "),
+                "recv"
+            );
+        }
+
         Ok(out)
     }
 
