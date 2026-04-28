@@ -207,6 +207,38 @@ pub struct ItemSlot {
     pub price: u32,
 }
 
+/// Specifics of an inventory mutation. The umbrella `InventoryUpdated`
+/// AgentEvent carries one of these so `apply_event` can fold the change
+/// into `SessionState.inventory` without the session loop touching
+/// state directly. Mirrors the union of the four "inventory-mutating"
+/// s2c packets: `0x01C ITEM_MAX` (capacity table), `0x01E ITEM_NUM`
+/// (quantity-only), `0x01F ITEM_LIST` (full slot), `0x020 ITEM_ATTR`
+/// (full slot + extdata, which we discard in state).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InventoryUpdate {
+    /// 0x01C ITEM_MAX — full capacity table for all 18 CONTAINER_IDs.
+    /// The fold writes each non-zero capacity into the corresponding
+    /// `ContainerInfo`; zero-capacity entries leave the container
+    /// unmodified (the table is sparse — only meaningful entries are
+    /// populated by the server).
+    Capacities { capacities: Vec<u16> },
+    /// 0x01F ITEM_LIST or 0x020 ITEM_ATTR — full slot definition. The
+    /// fold replaces (or inserts) the slot at `slot.index`. A
+    /// `quantity == 0` removes the slot — that's how upstream LSB
+    /// clears a slot when the player drops the last stack.
+    SlotChanged { slot: ItemSlot },
+    /// 0x01E ITEM_NUM — quantity-only update for an existing slot. If
+    /// the slot doesn't exist yet (race with ITEM_LIST during zone-in),
+    /// the update is dropped — ITEM_LIST will arrive with the full row.
+    /// `quantity == 0` removes the slot.
+    QuantityChanged {
+        index: u8,
+        quantity: u32,
+        locked: bool,
+    },
+}
+
 /// Serializable mirror of `crate::reactor::Goal`. Lives here (not in
 /// reactor.rs) so the state crate can be consumed without pulling in
 /// reactor internals — the renderers care about *what* the goal is, not
@@ -427,13 +459,57 @@ impl SessionState {
             | AgentEvent::EngagedBy { .. }
             | AgentEvent::TellReceived { .. }
             | AgentEvent::SceneSummary { .. } => {}
-            // InventoryUpdated is a notification — the actual slot data lands
-            // through a side channel (Stage-9 will wire the apply path
-            // directly into SessionState.inventory in session.rs's
-            // handle_sub_packet, similar to how PartyMemberUpdated carries
-            // its data inline). Left as a no-op here so the foundation
-            // commit stays minimal.
-            AgentEvent::InventoryUpdated { .. } => {}
+            AgentEvent::InventoryUpdated { container, update } => {
+                let entry = self
+                    .inventory
+                    .containers
+                    .entry(*container)
+                    .or_default();
+                match update {
+                    InventoryUpdate::Capacities { capacities } => {
+                        // Capacities are container-indexed; the
+                        // umbrella event uses container=0 as a
+                        // placeholder. Iterate and set each non-zero.
+                        for (id, cap) in capacities.iter().enumerate() {
+                            if *cap == 0 {
+                                continue;
+                            }
+                            self.inventory
+                                .containers
+                                .entry(id as u8)
+                                .or_default()
+                                .capacity = (*cap).min(u8::MAX as u16) as u8;
+                        }
+                    }
+                    InventoryUpdate::SlotChanged { slot } => {
+                        if slot.quantity == 0 {
+                            entry.slots.retain(|s| s.index != slot.index);
+                        } else if let Some(existing) =
+                            entry.slots.iter_mut().find(|s| s.index == slot.index)
+                        {
+                            *existing = slot.clone();
+                        } else {
+                            entry.slots.push(slot.clone());
+                        }
+                    }
+                    InventoryUpdate::QuantityChanged {
+                        index,
+                        quantity,
+                        locked,
+                    } => {
+                        if *quantity == 0 {
+                            entry.slots.retain(|s| s.index != *index);
+                        } else if let Some(existing) =
+                            entry.slots.iter_mut().find(|s| s.index == *index)
+                        {
+                            existing.quantity = *quantity;
+                            existing.locked = *locked;
+                        }
+                        // Race with ITEM_LIST: drop silently — the
+                        // full-slot packet will arrive separately.
+                    }
+                }
+            }
             // EventStart / EventEnded / KeyRotated are flow signals; the TUI
             // doesn't render them as state today. Left as no-ops — extending
             // is a non-breaking change.
@@ -536,12 +612,15 @@ pub enum AgentEvent {
     SceneSummary {
         text: String,
     },
-    /// One container's inventory contents changed. The fold replaces the
-    /// container's slots in `SessionState.inventory`; the LLM wakes only
-    /// for `InventoryReady` (initial flood done) — per-slot churn is
-    /// tactical detail.
+    /// One container's inventory contents changed. The `update`
+    /// payload carries the specifics (capacity table / full-slot
+    /// row / quantity-only delta); `apply_event` folds it into
+    /// `SessionState.inventory.containers[container]`. The LLM wakes
+    /// only for `InventoryReady` (initial flood done) — per-slot churn
+    /// is tactical detail and the MCP notifier filters accordingly.
     InventoryUpdated {
         container: u8,
+        update: InventoryUpdate,
     },
     /// Initial zone-in inventory flood is complete (0x01D `ITEM_SAME`
     /// with `State::AllLoaded`). After this point the agent can rely
@@ -1099,6 +1178,109 @@ mod tests {
         assert!(!s.inventory.all_loaded);
         s.apply_event(&AgentEvent::InventoryReady);
         assert!(s.inventory.all_loaded);
+    }
+
+    #[test]
+    fn inventory_fold_capacities_writes_each_container() {
+        let mut s = SessionState::default();
+        let mut caps = vec![0u16; 18];
+        caps[0] = 80; // LOC_INVENTORY
+        caps[1] = 200; // LOC_MOGSAFE
+        caps[5] = 30; // LOC_MOGSATCHEL
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0, // unused for Capacities
+            update: InventoryUpdate::Capacities { capacities: caps },
+        });
+        assert_eq!(s.inventory.containers[&0].capacity, 80);
+        assert_eq!(s.inventory.containers[&1].capacity, 200);
+        assert_eq!(s.inventory.containers[&5].capacity, 30);
+        assert!(
+            !s.inventory.containers.contains_key(&7),
+            "zero-capacity entries skipped"
+        );
+    }
+
+    #[test]
+    fn inventory_fold_slot_changed_inserts_then_updates_then_removes() {
+        let mut s = SessionState::default();
+        let slot = ItemSlot {
+            index: 3,
+            item_no: 4112,
+            quantity: 5,
+            locked: false,
+            price: 0,
+        };
+        // Insert.
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::SlotChanged { slot: slot.clone() },
+        });
+        assert_eq!(s.inventory.containers[&0].slots.len(), 1);
+        assert_eq!(s.inventory.containers[&0].slots[0].quantity, 5);
+
+        // Update same index.
+        let mut updated = slot.clone();
+        updated.quantity = 12;
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::SlotChanged { slot: updated },
+        });
+        assert_eq!(s.inventory.containers[&0].slots.len(), 1, "no duplication");
+        assert_eq!(s.inventory.containers[&0].slots[0].quantity, 12);
+
+        // Quantity 0 removes.
+        let mut removed = slot.clone();
+        removed.quantity = 0;
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::SlotChanged { slot: removed },
+        });
+        assert!(s.inventory.containers[&0].slots.is_empty());
+    }
+
+    #[test]
+    fn inventory_fold_quantity_changed_updates_existing_slot_only() {
+        let mut s = SessionState::default();
+        // Race condition: ITEM_NUM arrives before ITEM_LIST.
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::QuantityChanged {
+                index: 7,
+                quantity: 99,
+                locked: false,
+            },
+        });
+        // Should have been silently dropped — no slot to update.
+        assert!(
+            s.inventory.containers.get(&0).map(|c| c.slots.is_empty()).unwrap_or(true),
+            "ITEM_NUM without prior ITEM_LIST drops"
+        );
+
+        // Now seed via SlotChanged, then ITEM_NUM updates the qty.
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::SlotChanged {
+                slot: ItemSlot {
+                    index: 7,
+                    item_no: 4112,
+                    quantity: 1,
+                    locked: false,
+                    price: 0,
+                },
+            },
+        });
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::QuantityChanged {
+                index: 7,
+                quantity: 25,
+                locked: true,
+            },
+        });
+        let slot = &s.inventory.containers[&0].slots[0];
+        assert_eq!(slot.quantity, 25);
+        assert!(slot.locked, "lock flag updated");
+        assert_eq!(slot.item_no, 4112, "item_no preserved (qty-only update)");
     }
 
     #[test]

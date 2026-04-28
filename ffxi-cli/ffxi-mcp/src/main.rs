@@ -132,6 +132,19 @@ struct JobAbilityParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct BankWhenFullParams {
+    /// Slot count at which any field bag (Inventory / Mog Satchel /
+    /// Mog Sack / Mog Case) triggers a zone change. 30 is a safe
+    /// "almost full" threshold for an 80-slot Inventory; 60 lets
+    /// the agent fight longer before banking.
+    threshold: u8,
+    /// `RectID` of the mog-house zoneline from the agent's current
+    /// home city. Typical values vary per city — caller picks the
+    /// right one for where the agent is farming.
+    mog_house_zoneline: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct UseItemParams {
     /// Container id (`CONTAINER_ID`): 0=Inventory, 1=Safe, 2=Storage,
     /// 8=Wardrobe, 10..16=Wardrobe2..Wardrobe8.
@@ -248,6 +261,20 @@ impl FfxiServer {
     )]
     async fn cancel(&self) -> Result<CallToolResult, McpError> {
         self.send(AgentCommand::Cancel).await
+    }
+
+    #[tool(
+        description = "Reactor goal: monitor inventory and zone to mog house when any field bag (Inventory / Mog Satchel / Mog Sack / Mog Case) reaches `threshold` slots filled. One-shot — clears after firing the zone change. Holds until `inventory://current` reports `all_loaded == true`. Persists across reconnects."
+    )]
+    async fn bank_when_full(
+        &self,
+        Parameters(p): Parameters<BankWhenFullParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(AgentCommand::BankWhenFull {
+            threshold: p.threshold,
+            mog_house_zoneline: p.mog_house_zoneline,
+        })
+        .await
     }
 
     #[tool(
@@ -442,6 +469,12 @@ impl ServerHandler for FfxiServer {
                 "application/json",
                 "Last goal command (Follow/Engage/PathTo) — persisted to ~/.config/ffxi-mcp/goal.json.",
             ),
+            mk(
+                "inventory://current",
+                "inventory",
+                "application/json",
+                "Container-keyed slot map: capacity + populated slots (item_no, quantity, locked, price). `all_loaded` flips true after the initial zone-in flood completes.",
+            ),
         ];
         Ok(result)
     }
@@ -493,6 +526,12 @@ impl ServerHandler for FfxiServer {
             "diagnostics://session" => {
                 let body = serde_json::to_string_pretty(&state.diagnostics).map_err(|e| {
                     McpError::internal_error(format!("serialize diagnostics: {e}"), None)
+                })?;
+                ResourceContents::text(body, uri)
+            }
+            "inventory://current" => {
+                let body = serde_json::to_string_pretty(&state.inventory).map_err(|e| {
+                    McpError::internal_error(format!("serialize inventory: {e}"), None)
                 })?;
                 ResourceContents::text(body, uri)
             }
@@ -635,6 +674,13 @@ fn uris_for_event(ev: &AgentEvent) -> &'static [&'static str] {
         // Party-roster changes touch party and (incidentally) scene's
         // party-size summary.
         AgentEvent::PartyMemberUpdated { .. } => &["party://members", "scene://current"],
+
+        // Inventory: per-slot churn invalidates only the inventory
+        // resource (tactical, doesn't wake the LLM via scene). The
+        // initial "all loaded" signal is high-signal — that's when
+        // bank_when_full can start trusting slot counts.
+        AgentEvent::InventoryUpdated { .. } => &["inventory://current"],
+        AgentEvent::InventoryReady => &["inventory://current", "scene://current"],
 
         // Stage / diagnostics updates are diagnostics only.
         AgentEvent::StageChanged { .. } | AgentEvent::Diagnostics { .. } => {
@@ -854,6 +900,31 @@ mod tests {
                 diagnostics: Default::default()
             }),
             &["diagnostics://session"]
+        );
+    }
+
+    #[test]
+    fn inventory_events_invalidate_inventory_resource() {
+        // Per-slot churn → inventory only (tactical, not high-signal).
+        let upd = AgentEvent::InventoryUpdated {
+            container: 0,
+            update: ffxi_client::state::InventoryUpdate::SlotChanged {
+                slot: ffxi_client::state::ItemSlot {
+                    index: 7,
+                    item_no: 4112,
+                    quantity: 1,
+                    locked: false,
+                    price: 0,
+                },
+            },
+        };
+        assert_eq!(uris_for_event(&upd), &["inventory://current"]);
+
+        // InventoryReady (initial-flood-done) is high-signal; also wakes
+        // scene because it changes the agent's banking-eligibility.
+        assert_eq!(
+            uris_for_event(&AgentEvent::InventoryReady),
+            &["inventory://current", "scene://current"]
         );
     }
 

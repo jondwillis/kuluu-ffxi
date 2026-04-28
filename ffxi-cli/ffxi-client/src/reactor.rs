@@ -73,6 +73,15 @@ pub enum Goal {
     /// FFXI's collision is server-validated, so we step in straight lines
     /// and rely on the server to reject illegal moves.
     Pathing { target: Vec3 },
+    /// Stage-9 banking goal: monitor inventory; when any field bag
+    /// (Inventory / Mog Satchel / Mog Sack / Mog Case) reaches
+    /// `threshold` slots filled, emit a `RequestZoneChange` to the
+    /// configured mog-house zoneline and clear the goal (one-shot per
+    /// banking cycle). Persists across reconnects.
+    Banking {
+        threshold: u8,
+        mog_house_zoneline: u32,
+    },
 }
 
 impl Default for Goal {
@@ -102,8 +111,27 @@ fn snapshot_goal(goal: &Goal) -> ReactorGoalSnapshot {
             y: target.y,
             z: target.z,
         },
+        Goal::Banking {
+            threshold,
+            mog_house_zoneline,
+        } => ReactorGoalSnapshot::Banking {
+            threshold: *threshold,
+            mog_house_zoneline: *mog_house_zoneline,
+        },
     }
 }
+
+/// CONTAINER_IDs the banking goal monitors. Mirrors
+/// `Phoenix/src/map/item_container.h::CONTAINER_ID`. We watch the four
+/// "field bags" — the containers that fill during play. Wardrobes are
+/// equipment slots (don't fill in normal play); safes / lockers are
+/// where banking _puts_ items, not where it triggers.
+const FIELD_BAG_CONTAINERS: [u8; 4] = [
+    0, // LOC_INVENTORY
+    5, // LOC_MOGSATCHEL
+    6, // LOC_MOGSACK
+    7, // LOC_MOGCASE
+];
 
 /// What `handle_command` decided to do with a client command:
 /// optionally forward something to the session, optionally broadcast
@@ -290,12 +318,15 @@ impl Reactor {
                 self.goal = Goal::Idle;
                 CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
-            AgentCommand::BankWhenFull { .. } => {
-                // Stage-9 wires the actual Goal::Banking variant + tick branch.
-                // For now: forward as a no-op pass-through so the command
-                // round-trips (the supervisor still persists it via
-                // goal_store::is_persistable_goal once that's extended).
-                CommandRouting::forward(cmd)
+            AgentCommand::BankWhenFull {
+                threshold,
+                mog_house_zoneline,
+            } => {
+                self.goal = Goal::Banking {
+                    threshold,
+                    mog_house_zoneline,
+                };
+                CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
             AgentCommand::Move { .. } => {
                 // Manual `Move` overrides whatever goal was active. Only
@@ -372,6 +403,40 @@ impl Reactor {
                 TickOutput {
                     commands: vec![mk_move(stepped, heading_toward(cur, target))],
                     derived_events: Vec::new(),
+                }
+            }
+            Goal::Banking {
+                threshold,
+                mog_house_zoneline,
+            } => {
+                // Wait for the inventory mirror to be authoritative —
+                // pre-flood, slot counts are unreliable and we'd
+                // false-trigger on an empty bag.
+                if !self.state.inventory.all_loaded {
+                    return TickOutput::default();
+                }
+                let any_full = FIELD_BAG_CONTAINERS.iter().any(|id| {
+                    self.state
+                        .inventory
+                        .containers
+                        .get(id)
+                        .map(|c| c.slots.len() as u8 >= threshold)
+                        .unwrap_or(false)
+                });
+                if !any_full {
+                    return TickOutput::default();
+                }
+                // One-shot: clear the goal so we don't re-emit on every
+                // tick while the zone change is in flight. The agent
+                // can re-issue `bank_when_full` after dropping items.
+                self.goal = Goal::Idle;
+                TickOutput {
+                    commands: vec![AgentCommand::RequestZoneChange {
+                        line_id: mog_house_zoneline,
+                    }],
+                    derived_events: vec![AgentEvent::ReactorGoalChanged {
+                        goal: snapshot_goal(&self.goal),
+                    }],
                 }
             }
         }
@@ -1022,6 +1087,154 @@ mod tests {
         // Self entity (id == char_id) — skipped.
         let d = r.observe_event(&upsert_with_bt(1, Vec3::default(), 100, EntityKind::Pc, 1, 1));
         assert!(d.is_empty(), "self isn't aggroing self");
+    }
+
+    fn inv_capacities(caps: [u16; 18]) -> AgentEvent {
+        AgentEvent::InventoryUpdated {
+            container: 0,
+            update: crate::state::InventoryUpdate::Capacities {
+                capacities: caps.to_vec(),
+            },
+        }
+    }
+
+    fn inv_slot(container: u8, index: u8, item_no: u16) -> AgentEvent {
+        AgentEvent::InventoryUpdated {
+            container,
+            update: crate::state::InventoryUpdate::SlotChanged {
+                slot: crate::state::ItemSlot {
+                    index,
+                    item_no,
+                    quantity: 1,
+                    locked: false,
+                    price: 0,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn bank_when_full_holds_until_all_loaded() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        // Configure capacities & seed a full bag, but don't signal AllLoaded.
+        let mut caps = [0u16; 18];
+        caps[0] = 80;
+        r.observe_event(&inv_capacities(caps));
+        for i in 0..30u8 {
+            r.observe_event(&inv_slot(0, i, 4112));
+        }
+        r.handle_command(AgentCommand::BankWhenFull {
+            threshold: 30,
+            mog_house_zoneline: 12345,
+        });
+        let out = r.tick();
+        assert!(
+            out.commands.is_empty(),
+            "must wait for InventoryReady before triggering"
+        );
+        assert!(matches!(r.current_goal(), Goal::Banking { .. }));
+    }
+
+    #[test]
+    fn bank_when_full_emits_zoneline_when_threshold_crossed() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        let mut caps = [0u16; 18];
+        caps[0] = 80;
+        r.observe_event(&inv_capacities(caps));
+        for i in 0..30u8 {
+            r.observe_event(&inv_slot(0, i, 4112));
+        }
+        r.observe_event(&AgentEvent::InventoryReady);
+        r.handle_command(AgentCommand::BankWhenFull {
+            threshold: 30,
+            mog_house_zoneline: 12345,
+        });
+        let out = r.tick();
+        assert!(matches!(
+            out.commands.as_slice(),
+            [AgentCommand::RequestZoneChange { line_id: 12345 }]
+        ));
+        assert!(
+            matches!(r.current_goal(), Goal::Idle),
+            "one-shot — goal clears after firing"
+        );
+        assert!(matches!(
+            out.derived_events.as_slice(),
+            [AgentEvent::ReactorGoalChanged {
+                goal: ReactorGoalSnapshot::Idle
+            }]
+        ));
+    }
+
+    #[test]
+    fn bank_when_full_holds_when_under_threshold() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        let mut caps = [0u16; 18];
+        caps[0] = 80;
+        r.observe_event(&inv_capacities(caps));
+        // Only 5 slots in inventory; threshold = 30.
+        for i in 0..5u8 {
+            r.observe_event(&inv_slot(0, i, 4112));
+        }
+        r.observe_event(&AgentEvent::InventoryReady);
+        r.handle_command(AgentCommand::BankWhenFull {
+            threshold: 30,
+            mog_house_zoneline: 12345,
+        });
+        let out = r.tick();
+        assert!(out.commands.is_empty());
+        assert!(matches!(r.current_goal(), Goal::Banking { .. }));
+    }
+
+    #[test]
+    fn bank_when_full_triggers_on_any_field_bag() {
+        // A full Mog Satchel (LOC_MOGSATCHEL = 5) should trigger even
+        // if Inventory itself isn't full.
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        let mut caps = [0u16; 18];
+        caps[5] = 30;
+        r.observe_event(&inv_capacities(caps));
+        for i in 0..30u8 {
+            r.observe_event(&inv_slot(5, i, 4112));
+        }
+        r.observe_event(&AgentEvent::InventoryReady);
+        r.handle_command(AgentCommand::BankWhenFull {
+            threshold: 30,
+            mog_house_zoneline: 7777,
+        });
+        let out = r.tick();
+        assert!(matches!(
+            out.commands.as_slice(),
+            [AgentCommand::RequestZoneChange { line_id: 7777 }]
+        ));
+    }
+
+    #[test]
+    fn bank_when_full_ignores_safe_and_storage() {
+        // Filling LOC_MOGSAFE (1) or LOC_STORAGE (2) — bank containers,
+        // not field bags — must NOT trigger banking. Banking is for
+        // overflowing field bags, the safes are the destination.
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        let mut caps = [0u16; 18];
+        caps[1] = 80;
+        caps[2] = 80;
+        r.observe_event(&inv_capacities(caps));
+        for i in 0..40u8 {
+            r.observe_event(&inv_slot(1, i, 4112));
+            r.observe_event(&inv_slot(2, i, 4112));
+        }
+        r.observe_event(&AgentEvent::InventoryReady);
+        r.handle_command(AgentCommand::BankWhenFull {
+            threshold: 30,
+            mog_house_zoneline: 12345,
+        });
+        let out = r.tick();
+        assert!(out.commands.is_empty(), "safe/storage are bank dest, not field bag");
     }
 
     #[test]

@@ -304,6 +304,181 @@ pub fn decode_logout(sub: &SubPacket<'_>) -> Result<ServerLogout, DecodeError> {
     ServerLogout::decode(sub.data)
 }
 
+/// `GP_SERV_COMMAND_ITEM_MAX` (0x01C) — container size table. Phoenix
+/// sends this once during zone-in to tell the client how many slots
+/// every container can hold.
+///
+/// Wire layout (`Phoenix/src/map/packets/s2c/0x01c_item_max.h`):
+///   `uint8_t ItemNum[18]; uint8_t padding00[14]; uint16_t ItemNum2[18];
+///    uint8_t padding01[28];` → 18 + 14 + 36 + 28 = 96 bytes total.
+///
+/// `ItemNum[i]` is the legacy PS2-era u8 capacity (0..=255) for container
+/// `i`; `ItemNum2[i]` is the modern u16 capacity (used when capacity
+/// exceeds 255). The decoder returns the wider value when non-zero,
+/// otherwise falls back to the u8 — matches how the retail client
+/// resolves the two fields.
+#[derive(Debug, Clone)]
+pub struct ItemMax {
+    /// Capacity per CONTAINER_ID (0..=17). Length = 18.
+    pub capacities: [u16; 18],
+}
+
+impl ItemMax {
+    pub const SIZE: usize = 96;
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        let mut capacities = [0u16; 18];
+        for (i, cap) in capacities.iter_mut().enumerate() {
+            let legacy = body[i] as u16;
+            let wide_off = 18 + 14 + i * 2;
+            let wide = u16::from_le_bytes(body[wide_off..wide_off + 2].try_into().unwrap());
+            *cap = if wide != 0 { wide } else { legacy };
+        }
+        Ok(Self { capacities })
+    }
+}
+
+/// `GP_SERV_COMMAND_ITEM_SAME` (0x01D) — load-state signal. After the
+/// initial flood the server emits this with `state == 1` to signal
+/// "all containers populated, you can rely on slot counts now."
+///
+/// Body: `State:u8 padding00[3] Flags:u32` → 8 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemSameState {
+    StillLoading,
+    AllLoaded,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ItemSame {
+    pub state: ItemSameState,
+    pub flags: u32,
+}
+
+impl ItemSame {
+    pub const SIZE: usize = 8;
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        let state = match body[0] {
+            0 => ItemSameState::StillLoading,
+            // Phoenix only emits 0 or 1; any non-zero value reads as
+            // "loaded" for forward-compat (newer LSB might add a third
+            // state, but we want our existing logic to fire on the
+            // existing terminal state without false negatives).
+            _ => ItemSameState::AllLoaded,
+        };
+        let flags = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        Ok(Self { state, flags })
+    }
+}
+
+/// `GP_SERV_COMMAND_ITEM_NUM` (0x01E) — quantity change for one slot.
+/// Server emits this when the player picks up a stack increment or
+/// uses a charge of an existing item.
+///
+/// Body: `ItemNum:u32 Category:u8 ItemIndex:u8 LockFlg:u8 padding00:u8`
+/// → 8 bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct ItemNum {
+    /// New quantity for the slot.
+    pub quantity: u32,
+    /// CONTAINER_ID (0..=17).
+    pub category: u8,
+    /// Slot index inside the container.
+    pub index: u8,
+    /// Item-lock flag — server-side bookkeeping; we surface the raw value.
+    pub lock_flg: u8,
+}
+
+impl ItemNum {
+    pub const SIZE: usize = 8;
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        Ok(Self {
+            quantity: u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            category: body[4],
+            index: body[5],
+            lock_flg: body[6],
+        })
+    }
+}
+
+/// `GP_SERV_COMMAND_ITEM_LIST` (0x01F) — full slot definition without
+/// extdata. Sent during the zone-in flood for every populated slot.
+///
+/// Body: `ItemNum:u32 ItemNo:u16 Category:u8 ItemIndex:u8 LockFlg:u8
+/// padding00[3]` → 12 bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct ItemList {
+    pub quantity: u32,
+    /// FFXI item id from `Items.dat`.
+    pub item_no: u16,
+    pub category: u8,
+    pub index: u8,
+    pub lock_flg: u8,
+}
+
+impl ItemList {
+    pub const SIZE: usize = 12;
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        Ok(Self {
+            quantity: u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            item_no: u16::from_le_bytes(body[4..6].try_into().unwrap()),
+            category: body[6],
+            index: body[7],
+            lock_flg: body[8],
+        })
+    }
+}
+
+/// `GP_SERV_COMMAND_ITEM_ATTR` (0x0020) — slot definition with
+/// item-type-specific extdata. Sent on equip changes, augment updates,
+/// and other "the slot's attributes changed" events. We surface the
+/// 24-byte `Attr` payload as raw bytes — interpretation lives in
+/// upstream item logic and isn't needed for v1 banking.
+///
+/// Body: `ItemNum:u32 Price:u32 ItemNo:u16 Category:u8 ItemIndex:u8
+/// LockFlg:u8 Attr[24]` → 37 bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct ItemAttr {
+    pub quantity: u32,
+    pub price: u32,
+    pub item_no: u16,
+    pub category: u8,
+    pub index: u8,
+    pub lock_flg: u8,
+    pub extdata: [u8; 24],
+}
+
+impl ItemAttr {
+    pub const SIZE: usize = 37;
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        let mut extdata = [0u8; 24];
+        extdata.copy_from_slice(&body[13..37]);
+        Ok(Self {
+            quantity: u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            price: u32::from_le_bytes(body[4..8].try_into().unwrap()),
+            item_no: u16::from_le_bytes(body[8..10].try_into().unwrap()),
+            category: body[10],
+            index: body[11],
+            lock_flg: body[12],
+            extdata,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +619,112 @@ mod tests {
         assert!(matches!(
             PartyAttrs::decode_group_list(&buf),
             Err(DecodeError::Truncated(52, 40))
+        ));
+    }
+
+    #[test]
+    fn item_max_decodes_legacy_and_wide_capacity() {
+        // 18 legacy u8 caps, 14 padding, 18 wide u16 caps, 28 padding.
+        let mut buf = vec![0u8; ItemMax::SIZE];
+        // Inventory (id=0): legacy 80, wide 0 → resolves to 80.
+        buf[0] = 80;
+        // Mog Safe (id=1): legacy 80, wide 200 → resolves to 200 (modern).
+        buf[1] = 80;
+        let wide_off = 18 + 14 + 1 * 2;
+        buf[wide_off..wide_off + 2].copy_from_slice(&200u16.to_le_bytes());
+        // Wardrobe2 (id=10): legacy 0, wide 80 → resolves to 80.
+        let wide_off = 18 + 14 + 10 * 2;
+        buf[wide_off..wide_off + 2].copy_from_slice(&80u16.to_le_bytes());
+
+        let m = ItemMax::decode(&buf).unwrap();
+        assert_eq!(m.capacities[0], 80, "Inventory: legacy fallback");
+        assert_eq!(m.capacities[1], 200, "Mog Safe: wide takes precedence");
+        assert_eq!(m.capacities[10], 80, "Wardrobe2: wide-only");
+        assert_eq!(m.capacities[17], 0, "Recycle Bin: zeroed");
+    }
+
+    #[test]
+    fn item_max_truncated_errors() {
+        let buf = vec![0u8; ItemMax::SIZE - 1];
+        assert!(matches!(
+            ItemMax::decode(&buf),
+            Err(DecodeError::Truncated(96, _))
+        ));
+    }
+
+    #[test]
+    fn item_same_decodes_state_and_flags() {
+        // StillLoading
+        let mut buf = vec![0u8; ItemSame::SIZE];
+        buf[0] = 0;
+        buf[4..8].copy_from_slice(&0xCAFEu32.to_le_bytes());
+        let s = ItemSame::decode(&buf).unwrap();
+        assert_eq!(s.state, ItemSameState::StillLoading);
+        assert_eq!(s.flags, 0xCAFE);
+
+        // AllLoaded
+        buf[0] = 1;
+        let s = ItemSame::decode(&buf).unwrap();
+        assert_eq!(s.state, ItemSameState::AllLoaded);
+    }
+
+    #[test]
+    fn item_num_decodes() {
+        let mut buf = vec![0u8; ItemNum::SIZE];
+        buf[0..4].copy_from_slice(&12345u32.to_le_bytes()); // ItemNum (quantity)
+        buf[4] = 0; // Category = LOC_INVENTORY
+        buf[5] = 7; // ItemIndex
+        buf[6] = 1; // LockFlg
+        let n = ItemNum::decode(&buf).unwrap();
+        assert_eq!(n.quantity, 12345);
+        assert_eq!(n.category, 0);
+        assert_eq!(n.index, 7);
+        assert_eq!(n.lock_flg, 1);
+    }
+
+    #[test]
+    fn item_list_decodes() {
+        let mut buf = vec![0u8; ItemList::SIZE];
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes()); // qty
+        buf[4..6].copy_from_slice(&4112u16.to_le_bytes()); // ItemNo (Hi-Potion)
+        buf[6] = 5; // LOC_MOGSATCHEL
+        buf[7] = 12; // slot
+        buf[8] = 0; // LockFlg
+        let l = ItemList::decode(&buf).unwrap();
+        assert_eq!(l.quantity, 1);
+        assert_eq!(l.item_no, 4112);
+        assert_eq!(l.category, 5);
+        assert_eq!(l.index, 12);
+    }
+
+    #[test]
+    fn item_attr_decodes_with_extdata() {
+        let mut buf = vec![0u8; ItemAttr::SIZE];
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes()); // qty
+        buf[4..8].copy_from_slice(&500_000u32.to_le_bytes()); // Price
+        buf[8..10].copy_from_slice(&8000u16.to_le_bytes()); // ItemNo
+        buf[10] = 0; // LOC_INVENTORY
+        buf[11] = 3; // slot
+        buf[12] = 0; // LockFlg
+        for (i, b) in buf[13..37].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let a = ItemAttr::decode(&buf).unwrap();
+        assert_eq!(a.quantity, 1);
+        assert_eq!(a.price, 500_000);
+        assert_eq!(a.item_no, 8000);
+        assert_eq!(a.category, 0);
+        assert_eq!(a.index, 3);
+        assert_eq!(a.extdata[0], 0);
+        assert_eq!(a.extdata[23], 23);
+    }
+
+    #[test]
+    fn item_attr_truncated_errors() {
+        let buf = vec![0u8; ItemAttr::SIZE - 1];
+        assert!(matches!(
+            ItemAttr::decode(&buf),
+            Err(DecodeError::Truncated(37, _))
         ));
     }
 }

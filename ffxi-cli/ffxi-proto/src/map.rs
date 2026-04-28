@@ -49,7 +49,22 @@ pub mod s2c {
     pub const LOGOUT: u16 = 0x00B;
     pub const CHAR_PC: u16 = 0x00D;
     pub const CHAR_NPC: u16 = 0x00E;
+    /// `GP_SERV_COMMAND_ITEM_MAX` — container size table. Body carries
+    /// `ItemNum[18]` (legacy u8 capacity) + padding + `ItemNum2[18]`
+    /// (u16 capacity for >255-slot containers) for all 18 CONTAINER_IDs.
     pub const ITEM_MAX: u16 = 0x01C;
+    /// `GP_SERV_COMMAND_ITEM_SAME` — load-state flag. `State == 1`
+    /// (`AllLoaded`) signals the initial inventory flood is complete.
+    pub const ITEM_SAME: u16 = 0x01D;
+    /// `GP_SERV_COMMAND_ITEM_NUM` — quantity change for one slot.
+    pub const ITEM_NUM: u16 = 0x01E;
+    /// `GP_SERV_COMMAND_ITEM_LIST` — full slot definition (item_no + qty
+    /// + lock flags). Sent during the zone-in flood and on item swaps.
+    pub const ITEM_LIST: u16 = 0x01F;
+    /// `GP_SERV_COMMAND_ITEM_ATTR` — slot definition + 24-byte
+    /// item-type-specific extdata. We surface the extdata as raw bytes;
+    /// interpretation lives in upstream (Phoenix's per-item logic).
+    pub const ITEM_ATTR: u16 = 0x020;
     pub const EVENT: u16 = 0x032;
     pub const EVENTSTR: u16 = 0x033;
     pub const EVENTNUM: u16 = 0x034;

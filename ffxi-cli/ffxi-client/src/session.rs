@@ -17,7 +17,7 @@ use crate::lobby_client::LobbyClient;
 use crate::map_client::{self, BootstrapArgs, MapClient};
 use crate::state::{
     AgentCommand, AgentEvent, BlowfishStatus, ChatChannel, ChatLine, Diagnostics, Entity,
-    EntityKind, Position, Stage, Vec3,
+    EntityKind, InventoryUpdate, ItemSlot, Position, Stage, Vec3,
 };
 
 #[allow(dead_code)]
@@ -396,6 +396,75 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::PartyMemberUpdated {
                     member: party_member_from_attrs(&attrs, None),
                 });
+            }
+        }
+        op if op == s2c::ITEM_MAX => {
+            if let Ok(m) = decode::ItemMax::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::InventoryUpdated {
+                    container: 0,
+                    update: InventoryUpdate::Capacities {
+                        capacities: m.capacities.to_vec(),
+                    },
+                });
+            }
+        }
+        op if op == s2c::ITEM_SAME => {
+            if let Ok(s) = decode::ItemSame::decode(sub.data) {
+                if matches!(s.state, decode::ItemSameState::AllLoaded) {
+                    let _ = event_tx.send(AgentEvent::InventoryReady);
+                }
+            }
+        }
+        op if op == s2c::ITEM_NUM => {
+            if let Ok(n) = decode::ItemNum::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::InventoryUpdated {
+                    container: n.category,
+                    update: InventoryUpdate::QuantityChanged {
+                        index: n.index,
+                        quantity: n.quantity,
+                        locked: n.lock_flg != 0,
+                    },
+                });
+            }
+        }
+        op if op == s2c::ITEM_LIST => {
+            if let Ok(l) = decode::ItemList::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::InventoryUpdated {
+                    container: l.category,
+                    update: InventoryUpdate::SlotChanged {
+                        slot: ItemSlot {
+                            index: l.index,
+                            item_no: l.item_no,
+                            quantity: l.quantity,
+                            locked: l.lock_flg != 0,
+                            // ITEM_LIST doesn't carry price; ITEM_ATTR does.
+                            // Default to 0; if the slot already has a price
+                            // from a prior ITEM_ATTR it'll be overwritten,
+                            // which is fine — bazaar prices are for trading
+                            // only and the agent doesn't use them.
+                            price: 0,
+                        },
+                    },
+                });
+            }
+        }
+        op if op == s2c::ITEM_ATTR => {
+            if let Ok(a) = decode::ItemAttr::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::InventoryUpdated {
+                    container: a.category,
+                    update: InventoryUpdate::SlotChanged {
+                        slot: ItemSlot {
+                            index: a.index,
+                            item_no: a.item_no,
+                            quantity: a.quantity,
+                            locked: a.lock_flg != 0,
+                            price: a.price,
+                        },
+                    },
+                });
+                // The 24-byte extdata payload (`a.extdata`) is discarded
+                // here — it's item-type-specific (augments, charges, etc.)
+                // and not needed for v1 banking decisions.
             }
         }
         _ => {
