@@ -174,13 +174,22 @@ pub fn draw_agent_hud(f: &mut ratatui::Frame, area: Rect, state: &SessionState) 
                 Span::styled(suffix, Style::default().fg(Color::DarkGray)),
             ])
         }
-        Some(ReactorGoalSnapshot::Pathing { x, y, z }) => Line::from(vec![
-            Span::styled("goal: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("path → ({x:.0},{y:.0},{z:.0})"),
-                Style::default().fg(Color::White),
-            ),
-        ]),
+        Some(ReactorGoalSnapshot::Pathing {
+            x,
+            y,
+            z,
+            waypoints_remaining,
+        }) => {
+            let label = if *waypoints_remaining > 1 {
+                format!("path → ({x:.0},{y:.0},{z:.0}) [{waypoints_remaining} wp]")
+            } else {
+                format!("path → ({x:.0},{y:.0},{z:.0})")
+            };
+            Line::from(vec![
+                Span::styled("goal: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(label, Style::default().fg(Color::White)),
+            ])
+        }
         Some(ReactorGoalSnapshot::Banking {
             threshold,
             mog_house_zoneline,

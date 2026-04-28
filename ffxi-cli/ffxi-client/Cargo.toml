@@ -21,6 +21,7 @@ tui = ["dep:crossterm", "dep:bevy", "dep:bevy_ratatui", "dep:bevy_ratatui_camera
 
 [dependencies]
 ffxi-proto = { path = "../ffxi-proto" }
+ffxi-nav = { path = "../ffxi-nav" }
 
 anyhow.workspace = true
 bytes.workspace = true

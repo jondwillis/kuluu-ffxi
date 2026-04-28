@@ -249,7 +249,19 @@ pub enum ReactorGoalSnapshot {
     Idle,
     Following { target_id: u32, distance: f32 },
     Engaged { target_id: u32, attack_issued: bool },
-    Pathing { x: f32, y: f32, z: f32 },
+    /// Pathing toward `(x, y, z)`. Stage 10b added multi-waypoint
+    /// pathing via `ffxi-nav`; `waypoints_remaining` is the count of
+    /// waypoints still ahead of the agent (including the destination
+    /// itself), so a fresh straight-line path reads as 1 and a navmesh
+    /// path with three corners reads as 3 and counts down. Renderers
+    /// that don't care can keep showing just the final destination.
+    Pathing {
+        x: f32,
+        y: f32,
+        z: f32,
+        #[serde(default = "one_u32")]
+        waypoints_remaining: u32,
+    },
     /// Stage-9 reactor goal: monitor inventory and zone to mog house when
     /// any non-mog container reaches `threshold` slots filled.
     Banking { threshold: u8, mog_house_zoneline: u32 },
@@ -259,6 +271,10 @@ impl Default for ReactorGoalSnapshot {
     fn default() -> Self {
         ReactorGoalSnapshot::Idle
     }
+}
+
+fn one_u32() -> u32 {
+    1
 }
 
 /// Last supervisor reconnect, surfaced to the operator HUD.

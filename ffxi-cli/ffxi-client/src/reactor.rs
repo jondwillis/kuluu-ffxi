@@ -26,9 +26,11 @@
 //! without I/O) and an async `run` that wires it to channels.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
+use ffxi_nav::{glam, GridNav, NavMesh};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::state::{
@@ -69,10 +71,12 @@ pub enum Goal {
     /// initial `Action::Attack` packet on transition; subsequent ticks
     /// only re-face the target.
     Engaged { target_id: u32, attack_issued: bool },
-    /// Single-segment path. Multi-waypoint paths are a future extension —
-    /// FFXI's collision is server-validated, so we step in straight lines
-    /// and rely on the server to reject illegal moves.
-    Pathing { target: Vec3 },
+    /// Pathing toward a destination, possibly via intermediate
+    /// waypoints from `ffxi-nav`. `idx` indexes into `waypoints`; the
+    /// final element is the requested destination. A straight-line
+    /// path (no navmesh available) holds a single-element `waypoints`.
+    /// Each tick steps toward `waypoints[idx]`; arrival advances idx.
+    Pathing { waypoints: Vec<Vec3>, idx: usize },
     /// Stage-9 banking goal: monitor inventory; when any field bag
     /// (Inventory / Mog Satchel / Mog Sack / Mog Case) reaches
     /// `threshold` slots filled, emit a `RequestZoneChange` to the
@@ -106,11 +110,24 @@ fn snapshot_goal(goal: &Goal) -> ReactorGoalSnapshot {
             target_id: *target_id,
             attack_issued: *attack_issued,
         },
-        Goal::Pathing { target } => ReactorGoalSnapshot::Pathing {
-            x: target.x,
-            y: target.y,
-            z: target.z,
-        },
+        Goal::Pathing { waypoints, idx } => {
+            // Surface the *final* destination so renderers stay simple
+            // ("path → (x,y,z)"); attach the count of waypoints still
+            // ahead (including the destination) so a multi-waypoint
+            // route can show a "[3 wp]" badge.
+            let dest = waypoints.last().copied().unwrap_or(Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            });
+            let remaining = waypoints.len().saturating_sub(*idx).max(1) as u32;
+            ReactorGoalSnapshot::Pathing {
+                x: dest.x,
+                y: dest.y,
+                z: dest.z,
+                waypoints_remaining: remaining,
+            }
+        }
         Goal::Banking {
             threshold,
             mog_house_zoneline,
@@ -183,6 +200,12 @@ pub struct Reactor {
     /// stays latched until HP rises back above. Same pattern per-party-member.
     self_low_hp_latched: bool,
     party_low_hp_latched: HashMap<u32, bool>,
+    /// Single-zone navmesh cache. When the agent zones, the next
+    /// `PathTo` reloads. `None` means we either haven't tried to load
+    /// for the current zone yet or there's no heightmap available
+    /// (Stage 10b ships the wiring; per-zone PNG acquisition is a
+    /// later operator task).
+    nav_cache: Option<(u16, GridNav)>,
 }
 
 impl Reactor {
@@ -193,11 +216,68 @@ impl Reactor {
             goal: Goal::Idle,
             self_low_hp_latched: false,
             party_low_hp_latched: HashMap::new(),
+            nav_cache: None,
         }
     }
 
     pub fn current_goal(&self) -> &Goal {
         &self.goal
+    }
+
+    /// Test escape hatch: pre-populate the navmesh cache with a
+    /// fixture so unit tests can exercise the multi-waypoint pathing
+    /// branch without writing a PNG to disk.
+    #[cfg(test)]
+    pub fn set_nav_for_test(&mut self, zone_id: u16, nav: GridNav) {
+        self.nav_cache = Some((zone_id, nav));
+    }
+
+    /// Resolve the current zone's navmesh, lazy-loading it from
+    /// `~/.config/ffxi-mcp/heightmaps/<zone_id>.png` on the first
+    /// `PathTo` after a zone change. Returns `None` (and leaves the
+    /// cache unset) when no heightmap is available — the caller falls
+    /// back to a single-segment straight-line path.
+    fn ensure_nav_loaded(&mut self) -> Option<&GridNav> {
+        let zone_id = self.state.zone_id?;
+        let cached = matches!(&self.nav_cache, Some((z, _)) if *z == zone_id);
+        if !cached {
+            self.nav_cache = default_load_navmesh(zone_id).map(|n| (zone_id, n));
+        }
+        self.nav_cache.as_ref().map(|(_, n)| n)
+    }
+
+    /// Build the waypoint list for a `PathTo`. Uses navmesh A* when
+    /// available; otherwise a single-segment straight line. Either
+    /// way, the final element is always the requested destination.
+    fn build_waypoints(&mut self, target: Vec3) -> Vec<Vec3> {
+        let cur = self.self_pos();
+        let nav = self.ensure_nav_loaded();
+        if let Some(nav) = nav {
+            let from = glam::Vec3::new(cur.x, cur.y, cur.z);
+            let to = glam::Vec3::new(target.x, target.y, target.z);
+            if let Some(path) = nav.path(from, to) {
+                let mut waypoints: Vec<Vec3> = path
+                    .into_iter()
+                    .map(|v| Vec3 { x: v.x, y: v.y, z: v.z })
+                    .collect();
+                // The first waypoint coincides with `from`; skip it so
+                // the agent starts moving toward the next corner.
+                if waypoints.first().map_or(false, |w| {
+                    horizontal_distance(*w, cur) < self.cfg.max_step_per_tick
+                }) {
+                    waypoints.remove(0);
+                }
+                if waypoints.is_empty() {
+                    waypoints.push(target);
+                }
+                return waypoints;
+            }
+            tracing::warn!(
+                zone = self.state.zone_id,
+                "navmesh found but produced no path — straight-lining"
+            );
+        }
+        vec![target]
     }
 
     /// Fold an event into the mirror, then derive any threshold-crossing
@@ -309,9 +389,9 @@ impl Reactor {
                 CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
             AgentCommand::PathTo { x, y, z } => {
-                self.goal = Goal::Pathing {
-                    target: Vec3 { x, y, z },
-                };
+                let target = Vec3 { x, y, z };
+                let waypoints = self.build_waypoints(target);
+                self.goal = Goal::Pathing { waypoints, idx: 0 };
                 CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
             AgentCommand::Cancel => {
@@ -386,23 +466,53 @@ impl Reactor {
                     derived_events: Vec::new(),
                 }
             }
-            Goal::Pathing { target } => {
+            Goal::Pathing { waypoints, idx } => {
                 let cur = self.self_pos();
-                let dist = horizontal_distance(cur, target);
-                if dist <= self.cfg.max_step_per_tick {
-                    // Path complete — clear to Idle and notify renderers.
+                let Some(wp) = waypoints.get(idx).copied() else {
+                    // Empty or exhausted — clear to Idle defensively.
                     self.goal = Goal::Idle;
                     return TickOutput {
-                        commands: vec![mk_move(target, heading_toward(cur, target))],
+                        commands: Vec::new(),
                         derived_events: vec![AgentEvent::ReactorGoalChanged {
                             goal: snapshot_goal(&self.goal),
                         }],
                     };
-                }
-                let stepped = step_point(cur, target, self.cfg.max_step_per_tick);
-                TickOutput {
-                    commands: vec![mk_move(stepped, heading_toward(cur, target))],
-                    derived_events: Vec::new(),
+                };
+                let dist = horizontal_distance(cur, wp);
+                if dist <= self.cfg.max_step_per_tick {
+                    // Reached this waypoint. If it's the last, complete
+                    // the path and notify renderers; otherwise advance
+                    // and keep moving (no Idle transition yet).
+                    let is_last = idx + 1 >= waypoints.len();
+                    let mv = mk_move(wp, heading_toward(cur, wp));
+                    if is_last {
+                        self.goal = Goal::Idle;
+                        TickOutput {
+                            commands: vec![mv],
+                            derived_events: vec![AgentEvent::ReactorGoalChanged {
+                                goal: snapshot_goal(&self.goal),
+                            }],
+                        }
+                    } else {
+                        if let Goal::Pathing { idx: ref mut i, .. } = self.goal {
+                            *i = idx + 1;
+                        }
+                        // Surface the waypoint advance as a
+                        // ReactorGoalChanged so the HUD's "[N wp]"
+                        // count decreases visibly per corner.
+                        TickOutput {
+                            commands: vec![mv],
+                            derived_events: vec![AgentEvent::ReactorGoalChanged {
+                                goal: snapshot_goal(&self.goal),
+                            }],
+                        }
+                    }
+                } else {
+                    let stepped = step_point(cur, wp, self.cfg.max_step_per_tick);
+                    TickOutput {
+                        commands: vec![mk_move(stepped, heading_toward(cur, wp))],
+                        derived_events: Vec::new(),
+                    }
                 }
             }
             Goal::Banking {
@@ -533,6 +643,107 @@ fn mk_move(pos: Vec3, heading: u8) -> AgentCommand {
         y: pos.y,
         z: pos.z,
         heading,
+    }
+}
+
+/// Resolve the LSB Detour navmesh path: `<dir>/<zone_id>.nav` where
+/// `<dir>` is `$FFXI_NAVMESH_DIR` if set, otherwise the
+/// `server/navmeshes` submodule walking up from the current working
+/// directory. The submodule ships zone-id-numbered `.nav` files for
+/// some zones and zone-name-named files for others — id-only lookup
+/// here means we only resolve the numbered subset, which is fine for
+/// the zones we care about right now (and `FFXI_NAVMESH_DIR` lets an
+/// operator point elsewhere if they have a name-keyed mirror).
+fn detour_navmesh_path(zone_id: u16) -> Option<PathBuf> {
+    let base = if let Ok(custom) = std::env::var("FFXI_NAVMESH_DIR") {
+        PathBuf::from(custom)
+    } else {
+        let cwd = std::env::current_dir().ok()?;
+        find_navmesh_dir(&cwd)?
+    };
+    Some(base.join(format!("{zone_id}.nav")))
+}
+
+/// Walk up from `start` looking for either `server/navmeshes/` or
+/// `Phoenix/navmeshes/` — the LSB / Phoenix submodule layouts.
+/// Returns the first directory that exists.
+fn find_navmesh_dir(start: &std::path::Path) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        for sib in ["server/navmeshes", "Phoenix/navmeshes"] {
+            let candidate = ancestor.join(sib);
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// PNG heightmap fallback: `~/.config/ffxi-mcp/heightmaps/<zone_id>.png`.
+/// Used when no Detour `.nav` is available (or the loader for that
+/// format isn't implemented yet — Stage 10c).
+fn heightmap_png_path(zone_id: u16) -> Option<PathBuf> {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
+    Some(
+        base.join("ffxi-mcp")
+            .join("heightmaps")
+            .join(format!("{zone_id}.png")),
+    )
+}
+
+/// Try to load a navmesh for `zone_id`. Priority:
+///
+///   1. LSB Detour `.nav` from the `server/navmeshes` submodule (or
+///      `$FFXI_NAVMESH_DIR`). **NOT YET IMPLEMENTED** — the file
+///      format is Recast/Detour (`TESM`/`MSET` magic) and `ffxi-nav`
+///      currently only reads PNG occupancy bitmaps. This branch logs
+///      a one-time warning and falls through to step 2.
+///   2. PNG occupancy heightmap from `~/.config/ffxi-mcp/heightmaps/`.
+///   3. None → caller straight-lines, accepting that the path may
+///      clip walls. The server validates moves so an illegal path
+///      ends in a server-side reject, not undefined behavior.
+fn default_load_navmesh(zone_id: u16) -> Option<GridNav> {
+    if let Some(detour_path) = detour_navmesh_path(zone_id) {
+        if detour_path.exists() {
+            // Stage 10c will implement the Detour reader. Until then,
+            // existence-check + log so operators can see we found the
+            // file but don't yet know how to parse it.
+            tracing::warn!(
+                zone_id,
+                path = %detour_path.display(),
+                "Detour .nav file present but loader not yet implemented (Stage 10c) — falling through to PNG heightmap or straight-line"
+            );
+        }
+    }
+    let png = heightmap_png_path(zone_id)?;
+    if !png.exists() {
+        return None;
+    }
+    match GridNav::from_png(&png, 128, glam::Vec2::ZERO, 1.0) {
+        Ok(nav) => {
+            tracing::info!(
+                zone_id,
+                path = %png.display(),
+                "navmesh loaded (PNG fallback)"
+            );
+            Some(nav)
+        }
+        Err(e) => {
+            tracing::warn!(
+                zone_id,
+                path = %png.display(),
+                error = %e,
+                "navmesh PNG load failed — straight-lining"
+            );
+            None
+        }
     }
 }
 
@@ -880,14 +1091,70 @@ mod tests {
         assert!(routing.forward.is_none());
         match routing.derived_events.as_slice() {
             [AgentEvent::ReactorGoalChanged {
-                goal: ReactorGoalSnapshot::Pathing { x, y, z },
+                goal:
+                    ReactorGoalSnapshot::Pathing {
+                        x,
+                        y,
+                        z,
+                        waypoints_remaining,
+                    },
             }] => {
                 assert!((*x - 1.0).abs() < 1e-3);
                 assert!((*y - 2.0).abs() < 1e-3);
                 assert!((*z - 3.0).abs() < 1e-3);
+                // No navmesh in this test → straight-line single waypoint.
+                assert_eq!(*waypoints_remaining, 1);
             }
             other => panic!("expected ReactorGoalChanged(Pathing), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pathing_uses_navmesh_when_available() {
+        // 10×10 grid, all walkable except a wall at column 5 (rows 0..7
+        // blocked, rows 7..10 walkable). Start at (0, 0), goal at (9,
+        // 0). The only route goes through some row >= 7. Without a
+        // navmesh, the straight-line path would clip the wall.
+        let mut walkable = vec![true; 100];
+        for row in 0..7u32 {
+            walkable[(row * 10 + 5) as usize] = false;
+        }
+        let nav = ffxi_nav::GridNav::from_walkable(
+            10,
+            10,
+            walkable,
+            ffxi_nav::glam::Vec2::ZERO,
+            1.0,
+        );
+
+        let mut r = Reactor::new(ReactorConfig::default());
+        // Establish a zone so ensure_nav_loaded considers the cache key.
+        r.state.zone_id = Some(123);
+        r.set_nav_for_test(123, nav);
+
+        let routing = r.handle_command(AgentCommand::PathTo {
+            x: 9.0,
+            y: 0.0,
+            z: 0.0,
+        });
+        assert!(routing.forward.is_none());
+        // The navmesh path must include at least one waypoint that
+        // routes around the wall (row >= 7 in grid coords; since the
+        // grid maps `x` → col and `z` → row at cell_size=1, that's
+        // any waypoint with z >= 7).
+        let goal = r.current_goal().clone();
+        let Goal::Pathing { waypoints, idx } = &goal else {
+            panic!("expected Pathing goal, got {goal:?}");
+        };
+        assert_eq!(*idx, 0);
+        assert!(
+            waypoints.iter().any(|w| w.z >= 7.0),
+            "navmesh path should route around the wall, got {waypoints:?}"
+        );
+        assert!(
+            waypoints.last().map(|w| w.x as i32 == 9).unwrap_or(false),
+            "last waypoint should be the destination"
+        );
     }
 
     #[test]

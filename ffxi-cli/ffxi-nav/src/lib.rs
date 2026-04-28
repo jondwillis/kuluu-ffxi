@@ -4,6 +4,7 @@
 //! Phase 10b will add cliff-aware (3D) navigation; this crate's [`NavMesh`]
 //! trait is the seam where richer implementations will plug in.
 
+pub use glam;
 use glam::Vec3;
 
 pub mod grid;
