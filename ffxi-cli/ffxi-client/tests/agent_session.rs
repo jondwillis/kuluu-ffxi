@@ -139,6 +139,10 @@ async fn run_protocol(client: &mut McpClient, charname: &str) -> Result<()> {
         "request_zone_change",
         "end_event",
         "snapshot",
+        "cast",
+        "weaponskill",
+        "job_ability",
+        "use_item",
         "disconnect",
     ];
     for need in required_tools {

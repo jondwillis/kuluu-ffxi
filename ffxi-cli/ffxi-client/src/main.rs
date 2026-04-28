@@ -74,11 +74,17 @@ enum Command {
     /// End-to-end session: auth → lobby → map → zone-in → keepalive,
     /// emitting JSON-line `AgentEvent`s on stdout and reading `AgentCommand`s
     /// from stdin.
+    ///
+    /// All three positional args are optional; when any are missing, the
+    /// command drops into an interactive launcher (see `launcher.rs`)
+    /// that prompts for credentials, lists characters on the account,
+    /// and lets you pick one. The numeric charid is resolved by name
+    /// against the lobby's character list — agents and humans don't
+    /// need to know it.
     Play {
-        user: String,
-        password: String,
-        char_id: u32,
-        char_name: String,
+        user: Option<String>,
+        password: Option<String>,
+        char_name: Option<String>,
     },
     /// Same session as `Play`, but renders a Bevy-driven 3D operator
     /// dashboard into the terminal via `bevy_ratatui_camera`. Press `q`,
@@ -372,9 +378,74 @@ async fn main() -> Result<()> {
         Command::Play {
             user,
             password,
-            char_id,
             char_name,
         } => {
+            let lobby = lobby_client::LobbyClient::new(
+                args.server.clone(),
+                args.data_port,
+                args.view_port,
+            );
+
+            let (user, password, char_id, char_name, initial_state) =
+                match (user, password, char_name) {
+                    (Some(u), Some(p), Some(name)) => {
+                        let session = auth
+                            .login(&u, &p)
+                            .await
+                            .context("auth precheck (play direct mode)")?;
+                        let handle = lobby
+                            .open(&session)
+                            .await
+                            .context("opening lobby (play direct mode)")?;
+                        let slot = handle
+                            .chars()
+                            .iter()
+                            .find(|c| c.name == name)
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "no character named '{name}' on account '{u}' (have: {:?})",
+                                    handle
+                                        .chars()
+                                        .iter()
+                                        .map(|c| c.name.as_str())
+                                        .collect::<Vec<_>>()
+                                )
+                            })?;
+                        let mut key3 = [0u8; 20];
+                        for (i, b) in key3.iter_mut().enumerate() {
+                            *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
+                        }
+                        let handoff = handle
+                            .select(slot.char_id, &slot.name, key3)
+                            .await
+                            .context("lobby select (play direct mode)")?;
+                        let initial_state = session::InitialState {
+                            auth: session,
+                            handoff,
+                            key3,
+                        };
+                        (u, p, slot.char_id, slot.name, initial_state)
+                    }
+                    (u, p, n) => {
+                        let defaults = launcher::Defaults {
+                            user: u,
+                            password: p,
+                            char_name: n,
+                        };
+                        let sel = launcher::run(&args.server, &auth, &lobby, defaults)
+                            .await
+                            .context("interactive launcher")?;
+                        (
+                            sel.user,
+                            sel.password,
+                            sel.char_id,
+                            sel.char_name,
+                            sel.initial_state,
+                        )
+                    }
+                };
+
             let cfg = session::Config {
                 server: args.server.clone(),
                 map_host_override: args.map_host_override.clone(),
@@ -385,7 +456,7 @@ async fn main() -> Result<()> {
                 password,
                 char_id,
                 char_name,
-                initial_state: None,
+                initial_state: Some(initial_state),
             };
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
             let (event_tx, event_rx) = tokio::sync::broadcast::channel(256);

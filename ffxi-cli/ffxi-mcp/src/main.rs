@@ -48,7 +48,7 @@ use ffxi_client::{
     reactor::ReactorConfig,
     scene::SceneSummary,
     session,
-    state::{AgentCommand, AgentEvent, SessionState},
+    state::{ActionKind, AgentCommand, AgentEvent, SessionState},
     supervisor::{self, SupervisorConfig},
 };
 
@@ -96,6 +96,58 @@ struct ZoneChangeParams {
     /// `RectID` of the zoneline. The agent must walk into ~40 yalms of
     /// the zoneline first; this command is "I'm here, take me through".
     line_id: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CastParams {
+    /// FFXI spell id (Spells.dat index). E.g. Cure = 1, Tractor = 39.
+    spell_id: u32,
+    /// `UniqueNo` of the recipient (self for self-target, mob for
+    /// offensive, party member for healing).
+    target_id: u32,
+    /// Per-zone `ActIndex` of the recipient.
+    target_index: u16,
+    /// Ground-target world coords for AoE-target spells (Tractor,
+    /// certain blue magic). `None` → 0.0 — single-target casts ignore
+    /// these fields server-side.
+    pos_x: Option<f32>,
+    pos_y: Option<f32>,
+    pos_z: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WeaponskillParams {
+    /// FFXI weaponskill id. Must be unlocked on the active weapon.
+    skill_id: u32,
+    target_id: u32,
+    target_index: u16,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct JobAbilityParams {
+    /// FFXI job-ability id (e.g. WAR Mighty Strikes, RDM Convert).
+    ability_id: u32,
+    target_id: u32,
+    target_index: u16,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct UseItemParams {
+    /// Container id (`CONTAINER_ID`): 0=Inventory, 1=Safe, 2=Storage,
+    /// 8=Wardrobe, 10..16=Wardrobe2..Wardrobe8.
+    container: u8,
+    /// Slot index inside the container (`PropertyItemIndex`).
+    slot: u8,
+    /// FFXI item id. Hint for the LLM's bookkeeping; the wire `ItemNum`
+    /// is server-forced to 0 and the real lookup is `(container, slot)`.
+    /// Stage 9's inventory mirror will let agents read this from
+    /// `SessionState.inventory`; until then, pass it inline.
+    item_no: u32,
+    /// `UniqueNo` of the recipient (self for potions / scrolls, mob for
+    /// ranged items like Soultrapper).
+    target_id: u32,
+    /// Per-zone `ActIndex` of the recipient.
+    target_index: u16,
 }
 
 // ----- Server state -------------------------------------------------
@@ -249,6 +301,77 @@ impl FfxiServer {
     )]
     async fn snapshot(&self) -> Result<CallToolResult, McpError> {
         self.send(AgentCommand::Snapshot).await
+    }
+
+    #[tool(
+        description = "Cast a spell (FFXI Spells.dat id). For self-target casts pass your own UniqueNo + ActIndex; for ground-target spells (Tractor, certain blue magic) supply pos_x/y/z. 0x01A action wire."
+    )]
+    async fn cast(
+        &self,
+        Parameters(p): Parameters<CastParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(AgentCommand::Action {
+            target_id: p.target_id,
+            target_index: p.target_index,
+            kind: ActionKind::CastMagic {
+                spell_id: p.spell_id,
+                pos_x: p.pos_x.unwrap_or(0.0),
+                pos_y: p.pos_y.unwrap_or(0.0),
+                pos_z: p.pos_z.unwrap_or(0.0),
+            },
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Use an unlocked weaponskill on a target. Requires sufficient TP (server-validated). 0x01A action wire."
+    )]
+    async fn weaponskill(
+        &self,
+        Parameters(p): Parameters<WeaponskillParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(AgentCommand::Action {
+            target_id: p.target_id,
+            target_index: p.target_index,
+            kind: ActionKind::Weaponskill {
+                skill_id: p.skill_id,
+            },
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Use a job ability (e.g. WAR Mighty Strikes, RDM Convert). Server-validated for cooldown / job. 0x01A action wire."
+    )]
+    async fn job_ability(
+        &self,
+        Parameters(p): Parameters<JobAbilityParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(AgentCommand::Action {
+            target_id: p.target_id,
+            target_index: p.target_index,
+            kind: ActionKind::JobAbility {
+                ability_id: p.ability_id,
+            },
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Use a consumable / scroll / charged item. (container, slot) identifies the item; target is self for potions or another entity for ranged items (Soultrapper, etc.). 0x037 wire."
+    )]
+    async fn use_item(
+        &self,
+        Parameters(p): Parameters<UseItemParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(AgentCommand::UseItem {
+            container: p.container,
+            slot: p.slot,
+            item_no: p.item_no,
+            target_id: p.target_id,
+            target_index: p.target_index,
+        })
+        .await
     }
 
     #[tool(description = "Disconnect cleanly. The supervisor will not reconnect.")]
@@ -622,7 +745,49 @@ fn parse_port(name: &str, default: u16) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ffxi_client::state::{PartyMember, Position, Stage, Vec3};
+    use ffxi_client::state::{ActionKind, PartyMember, Position, Stage, Vec3};
+
+    #[test]
+    fn cmd_kind_label_for_action_surface_tools() {
+        // The four new MCP tools all flow through existing AgentCommand
+        // variants. `cast` / `weaponskill` / `job_ability` are sugar for
+        // `AgentCommand::Action { kind: … }` → label "action"; `use_item`
+        // is its own top-level variant → label "use_item".
+        let cast = AgentCommand::Action {
+            target_id: 1,
+            target_index: 1,
+            kind: ActionKind::CastMagic {
+                spell_id: 1,
+                pos_x: 0.0,
+                pos_y: 0.0,
+                pos_z: 0.0,
+            },
+        };
+        assert_eq!(cmd_kind_label(&cast), "action");
+
+        let ws = AgentCommand::Action {
+            target_id: 1,
+            target_index: 1,
+            kind: ActionKind::Weaponskill { skill_id: 100 },
+        };
+        assert_eq!(cmd_kind_label(&ws), "action");
+
+        let ja = AgentCommand::Action {
+            target_id: 1,
+            target_index: 1,
+            kind: ActionKind::JobAbility { ability_id: 50 },
+        };
+        assert_eq!(cmd_kind_label(&ja), "action");
+
+        let item = AgentCommand::UseItem {
+            container: 0,
+            slot: 3,
+            item_no: 4112,
+            target_id: 42,
+            target_index: 7,
+        };
+        assert_eq!(cmd_kind_label(&item), "use_item");
+    }
 
     #[test]
     fn high_signal_events_invalidate_scene() {

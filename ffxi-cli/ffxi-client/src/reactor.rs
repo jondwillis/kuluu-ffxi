@@ -32,7 +32,7 @@ use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::state::{
-    ActionKind, AgentCommand, AgentEvent, EntityKind, SessionState, Vec3,
+    ActionKind, AgentCommand, AgentEvent, EntityKind, ReactorGoalSnapshot, SessionState, Vec3,
 };
 
 /// Reactor parameters. Defaults match the plan's "tactical loop" target.
@@ -81,10 +81,36 @@ impl Default for Goal {
     }
 }
 
+/// Project the reactor's internal `Goal` into the serializable
+/// `ReactorGoalSnapshot` mirror in `state.rs`. Exhaustive on the current
+/// `Goal` enum on purpose — when Stage 9 adds `Goal::Banking` the merge
+/// will surface a non-exhaustive-match compile error here, which is the
+/// right outcome (forces the merger to wire `Banking → ReactorGoalSnapshot::Banking`).
+fn snapshot_goal(goal: &Goal) -> ReactorGoalSnapshot {
+    match goal {
+        Goal::Idle => ReactorGoalSnapshot::Idle,
+        Goal::Following { target_id, distance } => ReactorGoalSnapshot::Following {
+            target_id: *target_id,
+            distance: *distance,
+        },
+        Goal::Engaged { target_id, attack_issued } => ReactorGoalSnapshot::Engaged {
+            target_id: *target_id,
+            attack_issued: *attack_issued,
+        },
+        Goal::Pathing { target } => ReactorGoalSnapshot::Pathing {
+            x: target.x,
+            y: target.y,
+            z: target.z,
+        },
+    }
+}
+
 /// What `handle_command` decided to do with a client command:
 /// optionally forward something to the session, optionally broadcast
 /// some derived events. Most paths produce one or the other; `Snapshot`
-/// produces both.
+/// produces both. Goal-mutating commands (Follow/Engage/PathTo/Cancel
+/// and Move's goal-clear) emit a `ReactorGoalChanged` so renderers can
+/// reflect the live intent.
 #[derive(Debug, Default)]
 pub struct CommandRouting {
     pub forward: Option<AgentCommand>,
@@ -92,12 +118,31 @@ pub struct CommandRouting {
 }
 
 impl CommandRouting {
-    fn absorbed() -> Self {
-        Self::default()
+    fn absorbed_with_goal(goal: ReactorGoalSnapshot) -> Self {
+        Self {
+            forward: None,
+            derived_events: vec![AgentEvent::ReactorGoalChanged { goal }],
+        }
     }
     fn forward(cmd: AgentCommand) -> Self {
         Self { forward: Some(cmd), derived_events: Vec::new() }
     }
+    fn forward_with_goal(cmd: AgentCommand, goal: ReactorGoalSnapshot) -> Self {
+        Self {
+            forward: Some(cmd),
+            derived_events: vec![AgentEvent::ReactorGoalChanged { goal }],
+        }
+    }
+}
+
+/// One reactor-tick's output. Most ticks produce zero commands and zero
+/// derived events; `Pathing → Idle` self-clearing surfaces a
+/// `ReactorGoalChanged` so the operator HUD reflects it without
+/// requiring the agent to issue an explicit `Cancel`.
+#[derive(Debug, Default)]
+pub struct TickOutput {
+    pub commands: Vec<AgentCommand>,
+    pub derived_events: Vec<AgentEvent>,
 }
 
 /// Pure reactor — no I/O. Drives a state machine off observed events and
@@ -226,24 +271,24 @@ impl Reactor {
         match cmd {
             AgentCommand::Follow { target_id, distance } => {
                 self.goal = Goal::Following { target_id, distance };
-                CommandRouting::absorbed()
+                CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
             AgentCommand::Engage { target_id } => {
                 self.goal = Goal::Engaged {
                     target_id,
                     attack_issued: false,
                 };
-                CommandRouting::absorbed()
+                CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
             AgentCommand::PathTo { x, y, z } => {
                 self.goal = Goal::Pathing {
                     target: Vec3 { x, y, z },
                 };
-                CommandRouting::absorbed()
+                CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
             AgentCommand::Cancel => {
                 self.goal = Goal::Idle;
-                CommandRouting::absorbed()
+                CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
             AgentCommand::BankWhenFull { .. } => {
                 // Stage-9 wires the actual Goal::Banking variant + tick branch.
@@ -253,8 +298,16 @@ impl Reactor {
                 CommandRouting::forward(cmd)
             }
             AgentCommand::Move { .. } => {
+                // Manual `Move` overrides whatever goal was active. Only
+                // emit ReactorGoalChanged if we actually transitioned —
+                // otherwise spurious Idle→Idle events flood the log.
+                let was_active = !matches!(self.goal, Goal::Idle);
                 self.goal = Goal::Idle;
-                CommandRouting::forward(cmd)
+                if was_active {
+                    CommandRouting::forward_with_goal(cmd, snapshot_goal(&self.goal))
+                } else {
+                    CommandRouting::forward(cmd)
+                }
             }
             AgentCommand::Snapshot => {
                 let summary = crate::scene::SceneSummary::from_state(&self.state);
@@ -267,19 +320,24 @@ impl Reactor {
         }
     }
 
-    /// One tick. Returns the commands to issue (most ticks: zero or one).
-    pub fn tick(&mut self) -> Vec<AgentCommand> {
+    /// One tick. Returns commands to issue plus any derived events
+    /// (e.g. `ReactorGoalChanged` when `Pathing` self-clears to `Idle`).
+    /// Most ticks: zero or one command, zero events.
+    pub fn tick(&mut self) -> TickOutput {
         match self.goal.clone() {
-            Goal::Idle => Vec::new(),
-            Goal::Following { target_id, distance } => self
-                .step_toward_entity(target_id, distance)
-                .map(|m| vec![m])
-                .unwrap_or_default(),
+            Goal::Idle => TickOutput::default(),
+            Goal::Following { target_id, distance } => TickOutput {
+                commands: self
+                    .step_toward_entity(target_id, distance)
+                    .map(|m| vec![m])
+                    .unwrap_or_default(),
+                derived_events: Vec::new(),
+            },
             Goal::Engaged { target_id, attack_issued } => {
-                let mut out = Vec::new();
+                let mut commands = Vec::new();
                 if !attack_issued {
                     if let Some((act_index, _)) = self.entity_target_info(target_id) {
-                        out.push(AgentCommand::Action {
+                        commands.push(AgentCommand::Action {
                             target_id,
                             target_index: act_index,
                             kind: ActionKind::Attack,
@@ -290,19 +348,31 @@ impl Reactor {
                     }
                 }
                 if let Some(m) = self.face_entity(target_id) {
-                    out.push(m);
+                    commands.push(m);
                 }
-                out
+                TickOutput {
+                    commands,
+                    derived_events: Vec::new(),
+                }
             }
             Goal::Pathing { target } => {
                 let cur = self.self_pos();
                 let dist = horizontal_distance(cur, target);
                 if dist <= self.cfg.max_step_per_tick {
+                    // Path complete — clear to Idle and notify renderers.
                     self.goal = Goal::Idle;
-                    return vec![mk_move(target, heading_toward(cur, target))];
+                    return TickOutput {
+                        commands: vec![mk_move(target, heading_toward(cur, target))],
+                        derived_events: vec![AgentEvent::ReactorGoalChanged {
+                            goal: snapshot_goal(&self.goal),
+                        }],
+                    };
                 }
                 let stepped = step_point(cur, target, self.cfg.max_step_per_tick);
-                vec![mk_move(stepped, heading_toward(cur, target))]
+                TickOutput {
+                    commands: vec![mk_move(stepped, heading_toward(cur, target))],
+                    derived_events: Vec::new(),
+                }
             }
         }
     }
@@ -469,9 +539,12 @@ pub async fn run(
                 // Plain event (not span) because EnteredSpan is `!Send` and
                 // we await inside the loop.
                 let tick_started = std::time::Instant::now();
-                let mut cmds_emitted = 0usize;
-                for cmd in reactor.tick() {
-                    cmds_emitted += 1;
+                let TickOutput { commands, derived_events } = reactor.tick();
+                let cmds_emitted = commands.len();
+                for ev in derived_events {
+                    let _ = event_tx.send(ev);
+                }
+                for cmd in commands {
                     if internal_cmd_tx.send(cmd).await.is_err() { break; }
                 }
                 tracing::trace!(
@@ -552,7 +625,9 @@ mod tests {
     #[test]
     fn idle_tick_produces_nothing() {
         let mut r = Reactor::new(ReactorConfig::default());
-        assert!(r.tick().is_empty());
+        let out = r.tick();
+        assert!(out.commands.is_empty());
+        assert!(out.derived_events.is_empty());
     }
 
     #[test]
@@ -563,7 +638,7 @@ mod tests {
         r.observe_event(&upsert(2, Vec3 { x: 20.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 2));
         r.handle_command(AgentCommand::Follow { target_id: 2, distance: 5.0 });
 
-        let cmds = r.tick();
+        let cmds = r.tick().commands;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             AgentCommand::Move { x, .. } => {
@@ -575,7 +650,7 @@ mod tests {
 
         // Self moves into the hold distance — reactor stops.
         r.observe_event(&upsert(1, Vec3 { x: 17.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 1));
-        assert!(r.tick().is_empty(), "within distance: hold");
+        assert!(r.tick().commands.is_empty(), "within distance: hold");
     }
 
     #[test]
@@ -584,7 +659,7 @@ mod tests {
         r.observe_event(&connected(1));
         r.observe_event(&upsert(1, Vec3::default(), 100, EntityKind::Pc, 1));
         r.handle_command(AgentCommand::Follow { target_id: 999, distance: 5.0 });
-        assert!(r.tick().is_empty(), "no entity → no movement");
+        assert!(r.tick().commands.is_empty(), "no entity → no movement");
     }
 
     #[test]
@@ -595,14 +670,14 @@ mod tests {
         r.observe_event(&upsert(99, Vec3 { x: 5.0, y: 0.0, z: 0.0 }, 100, EntityKind::Mob, 7));
         r.handle_command(AgentCommand::Engage { target_id: 99 });
 
-        let t1 = r.tick();
+        let t1 = r.tick().commands;
         let attacks_t1 = t1
             .iter()
             .filter(|c| matches!(c, AgentCommand::Action { kind: ActionKind::Attack, .. }))
             .count();
         assert_eq!(attacks_t1, 1, "tick 1 emits exactly one Attack");
 
-        let t2 = r.tick();
+        let t2 = r.tick().commands;
         let attacks_t2 = t2
             .iter()
             .filter(|c| matches!(c, AgentCommand::Action { kind: ActionKind::Attack, .. }))
@@ -619,7 +694,7 @@ mod tests {
         assert!(matches!(r.current_goal(), Goal::Engaged { .. }));
         r.handle_command(AgentCommand::Cancel);
         assert!(matches!(r.current_goal(), Goal::Idle));
-        assert!(r.tick().is_empty());
+        assert!(r.tick().commands.is_empty());
     }
 
     #[test]
@@ -630,8 +705,25 @@ mod tests {
         let m = AgentCommand::Move { x: 1.0, y: 2.0, z: 3.0, heading: 64 };
         let routing = r.handle_command(m);
         assert!(matches!(routing.forward, Some(AgentCommand::Move { .. })), "Move passes through");
-        assert!(routing.derived_events.is_empty());
+        // Move-with-active-goal transitions to Idle; renderers learn via the
+        // goal-changed event.
+        assert!(matches!(
+            routing.derived_events.as_slice(),
+            [AgentEvent::ReactorGoalChanged { goal: ReactorGoalSnapshot::Idle }]
+        ));
         assert!(matches!(r.current_goal(), Goal::Idle));
+    }
+
+    #[test]
+    fn explicit_move_while_idle_emits_no_goal_event() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        let m = AgentCommand::Move { x: 0.0, y: 0.0, z: 0.0, heading: 0 };
+        let routing = r.handle_command(m);
+        assert!(matches!(routing.forward, Some(AgentCommand::Move { .. })));
+        assert!(
+            routing.derived_events.is_empty(),
+            "no transition → no goal event (avoids Idle→Idle log spam)"
+        );
     }
 
     #[test]
@@ -655,7 +747,10 @@ mod tests {
     }
 
     #[test]
-    fn goal_commands_produce_no_forward_or_events() {
+    fn goal_commands_are_absorbed_no_forward() {
+        // Goal-mutating commands stay in the reactor (no session forward).
+        // The contract that's *changed* from the original test:
+        // they now emit ReactorGoalChanged so renderers see live intent.
         let mut r = Reactor::new(ReactorConfig::default());
         for cmd in [
             AgentCommand::Follow { target_id: 1, distance: 5.0 },
@@ -665,8 +760,85 @@ mod tests {
         ] {
             let routing = r.handle_command(cmd);
             assert!(routing.forward.is_none());
-            assert!(routing.derived_events.is_empty());
         }
+    }
+
+    #[test]
+    fn follow_emits_reactor_goal_changed() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        let routing = r.handle_command(AgentCommand::Follow {
+            target_id: 42,
+            distance: 3.0,
+        });
+        assert!(routing.forward.is_none());
+        match routing.derived_events.as_slice() {
+            [AgentEvent::ReactorGoalChanged {
+                goal: ReactorGoalSnapshot::Following { target_id, distance },
+            }] => {
+                assert_eq!(*target_id, 42);
+                assert!((*distance - 3.0).abs() < 1e-3);
+            }
+            other => panic!("expected single ReactorGoalChanged(Following), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engage_emits_reactor_goal_changed() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        let routing = r.handle_command(AgentCommand::Engage { target_id: 99 });
+        assert!(routing.forward.is_none());
+        match routing.derived_events.as_slice() {
+            [AgentEvent::ReactorGoalChanged {
+                goal:
+                    ReactorGoalSnapshot::Engaged {
+                        target_id,
+                        attack_issued,
+                    },
+            }] => {
+                assert_eq!(*target_id, 99);
+                // The reactor sets attack_issued=false until the first tick;
+                // the snapshot must reflect that.
+                assert!(!*attack_issued, "attack_issued is false until first tick");
+            }
+            other => panic!("expected ReactorGoalChanged(Engaged), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_to_emits_reactor_goal_changed() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        let routing = r.handle_command(AgentCommand::PathTo {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        });
+        assert!(routing.forward.is_none());
+        match routing.derived_events.as_slice() {
+            [AgentEvent::ReactorGoalChanged {
+                goal: ReactorGoalSnapshot::Pathing { x, y, z },
+            }] => {
+                assert!((*x - 1.0).abs() < 1e-3);
+                assert!((*y - 2.0).abs() < 1e-3);
+                assert!((*z - 3.0).abs() < 1e-3);
+            }
+            other => panic!("expected ReactorGoalChanged(Pathing), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_clears_goal_emits_idle_event() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        // Seed a non-idle goal first.
+        let _ = r.handle_command(AgentCommand::Engage { target_id: 1 });
+        // Now Cancel should emit Idle.
+        let routing = r.handle_command(AgentCommand::Cancel);
+        assert!(routing.forward.is_none());
+        assert!(matches!(
+            routing.derived_events.as_slice(),
+            [AgentEvent::ReactorGoalChanged {
+                goal: ReactorGoalSnapshot::Idle,
+            }]
+        ));
     }
 
     #[test]
@@ -727,9 +899,9 @@ mod tests {
         r.observe_event(&upsert(1, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 1));
         // Target 3 yalms away — within max_step (5.0); reaches in one tick.
         r.handle_command(AgentCommand::PathTo { x: 3.0, y: 0.0, z: 0.0 });
-        let t1 = r.tick();
-        assert_eq!(t1.len(), 1);
-        match &t1[0] {
+        let out = r.tick();
+        assert_eq!(out.commands.len(), 1);
+        match &out.commands[0] {
             AgentCommand::Move { x, z, .. } => {
                 assert!((x - 3.0).abs() < 1e-3);
                 assert!(z.abs() < 1e-3);
@@ -740,18 +912,41 @@ mod tests {
     }
 
     #[test]
+    fn pathing_self_clear_emits_idle_event() {
+        // Tick-side emission: a pathing tick that completes the segment
+        // must surface ReactorGoalChanged(Idle) so the operator HUD sees
+        // the transition without needing the agent to issue Cancel.
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        r.observe_event(&upsert(1, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 1));
+        r.handle_command(AgentCommand::PathTo { x: 3.0, y: 0.0, z: 0.0 });
+        let out = r.tick();
+        assert!(matches!(r.current_goal(), Goal::Idle));
+        assert!(matches!(
+            out.derived_events.as_slice(),
+            [AgentEvent::ReactorGoalChanged {
+                goal: ReactorGoalSnapshot::Idle,
+            }]
+        ));
+    }
+
+    #[test]
     fn pathing_takes_multiple_ticks_for_distant_target() {
         let mut r = Reactor::new(ReactorConfig::default());
         r.observe_event(&connected(1));
         r.observe_event(&upsert(1, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 1));
         r.handle_command(AgentCommand::PathTo { x: 12.0, y: 0.0, z: 0.0 });
         // Tick 1: step 5 yalms, still pathing.
-        let t1 = r.tick();
-        match &t1[0] {
+        let out = r.tick();
+        match &out.commands[0] {
             AgentCommand::Move { x, .. } => assert!((x - 5.0).abs() < 1e-3),
             other => panic!("got {other:?}"),
         }
         assert!(matches!(r.current_goal(), Goal::Pathing { .. }));
+        assert!(
+            out.derived_events.is_empty(),
+            "mid-path tick should not emit goal-changed"
+        );
     }
 
     #[test]

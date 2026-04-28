@@ -524,15 +524,36 @@ async fn keepalive_loop(
                                 .into(),
                         });
                     }
-                    Some(AgentCommand::UseItem { .. }) => {
-                        // Stage 8 wires the 0x037 GP_CLI_COMMAND_ITEM_USE
-                        // packet builder. Until then, surface as an error
-                        // rather than silently drop — keeps the foundation
-                        // commit honest about what's not yet implemented.
-                        let _ = event_tx.send(AgentEvent::Error {
-                            message: "use_item: 0x037 packet builder not yet wired (Stage 8)"
-                                .into(),
-                        });
+                    Some(AgentCommand::UseItem {
+                        container,
+                        slot,
+                        item_no: _,
+                        target_id,
+                        target_index,
+                    }) => {
+                        // 0x037 GP_CLI_COMMAND_ITEM_USE. UniqueNo carries
+                        // the recipient (target) UniqueNo — same target as
+                        // the AI-side `PChar->GetEntity(this->ActIndex)`
+                        // lookup in Phoenix/0x037_item_use.cpp. ActIndex is
+                        // the recipient's per-zone ActIndex.
+                        let payload = build_subpacket_item_use(
+                            sub_seq,
+                            target_id,
+                            target_index,
+                            container,
+                            slot,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "use_item send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("use_item send: {e}"),
+                            });
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::RequestZoneChange { line_id }) => {
                         // 0x05E `GP_CLI_COMMAND_MAPRECT` — sent when the player
@@ -811,7 +832,7 @@ fn build_subpacket_event_end(sync: u16, unique_no: u32, act_index: u16, event_nu
 /// + 2 ActionID + 16 ActionBuf = 28 bytes (size_words=7). The `ActionKind`
 /// determines both the wire `ActionID` and the layout of the 16-byte buf
 /// (see `ActionKind::fill_action_buf`).
-fn build_subpacket_action(
+pub fn build_subpacket_action(
     sync: u16,
     unique_no: u32,
     act_index: u16,
@@ -825,6 +846,37 @@ fn build_subpacket_action(
     let mut action_buf = [0u8; 16];
     kind.fill_action_buf(&mut action_buf);
     buf[12..28].copy_from_slice(&action_buf);
+    buf
+}
+
+/// `GP_CLI_COMMAND_ITEM_USE` (0x037) — 4-byte header + 4 UniqueNo + 4 ItemNum
+/// + 2 ActIndex + 1 PropertyItemIndex + 1 padding00 + 4 Category = 20 bytes
+/// (size_words=5). Per Phoenix/src/map/packets/c2s/0x037_item_use.cpp the
+/// server validates `ItemNum == 0` and looks up the item via
+/// `getStorage(Category)->GetItem(PropertyItemIndex)`, then resolves the
+/// target via `PChar->GetEntity(ActIndex)` — so:
+///
+/// - `unique_no`  → wire `UniqueNo`     = recipient UniqueNo (self for potions).
+/// - `act_index`  → wire `ActIndex`     = recipient ActIndex.
+/// - `category`   → wire `Category`     = container id (0 LOC_INVENTORY,
+///                                                     1 LOC_TEMPITEMS, …).
+/// - `slot`       → wire `PropertyItemIndex` = slot index within the container.
+/// - `ItemNum`    → forced to 0 (server enforces).
+pub fn build_subpacket_item_use(
+    sync: u16,
+    unique_no: u32,
+    act_index: u16,
+    category: u8,
+    slot: u8,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 20];
+    buf[0..4].copy_from_slice(&build_subpacket_header(0x037, 5, sync));
+    buf[4..8].copy_from_slice(&unique_no.to_le_bytes());
+    // buf[8..12] = ItemNum, must stay 0 — server-validated.
+    buf[12..14].copy_from_slice(&act_index.to_le_bytes());
+    buf[14] = slot;
+    // buf[15] = padding00 stays 0
+    buf[16..20].copy_from_slice(&(category as u32).to_le_bytes());
     buf
 }
 
@@ -948,5 +1000,62 @@ mod tests {
         // last byte must be NUL.
         assert_eq!(&buf[6..20], &[b'a'; 14][..], "first 14 chars of name");
         assert_eq!(buf[20], 0, "sName NUL-terminated even on truncation");
+    }
+
+    #[test]
+    fn item_use_packet_layout_matches_phoenix_struct() {
+        // GP_CLI_COMMAND_ITEM_USE body is:
+        //   UniqueNo:u32 ItemNum:u32 ActIndex:u16 PropertyItemIndex:u8
+        //   padding00:u8 Category:u32  → 16 body + 4 hdr = 20 total,
+        // size_words = 5.
+        let buf = build_subpacket_item_use(
+            0xBEEF,        // sync
+            0x12345678,    // recipient UniqueNo (self)
+            0x0042,        // recipient ActIndex
+            0x00,          // category = LOC_INVENTORY
+            7,             // slot
+        );
+        assert_eq!(buf.len(), 20);
+
+        let id_and_size = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(id_and_size & 0x1FF, 0x037, "opcode");
+        assert_eq!(id_and_size >> 9, 5, "size_words");
+        let sync = u16::from_le_bytes([buf[2], buf[3]]);
+        assert_eq!(sync, 0xBEEF, "sync passed through");
+
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            0x12345678,
+            "UniqueNo (recipient)"
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            0,
+            "ItemNum must be 0 — server-validated (mustEqual 0)"
+        );
+        assert_eq!(
+            u16::from_le_bytes(buf[12..14].try_into().unwrap()),
+            0x0042,
+            "ActIndex (recipient)"
+        );
+        assert_eq!(buf[14], 7, "PropertyItemIndex (slot)");
+        assert_eq!(buf[15], 0, "padding00");
+        assert_eq!(
+            u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            0,
+            "Category = LOC_INVENTORY"
+        );
+    }
+
+    #[test]
+    fn item_use_with_nonzero_category_writes_full_u32() {
+        // Sanity: a higher category id (8 = LOC_WARDROBE) lands in all
+        // four bytes of the Category field, not just the low byte.
+        let buf = build_subpacket_item_use(0, 0, 0, 8, 0);
+        assert_eq!(
+            u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            8,
+            "Category u32 LE"
+        );
     }
 }

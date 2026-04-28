@@ -41,6 +41,10 @@ and clears the goal — only do that when you genuinely want manual control.
 | `request_zone_change { line_id }` | Trigger a zoneline. The character must already be standing in the zoneline rect. |
 | `end_event` | Dismiss any in-progress NPC event/cutscene. Cheap; safe when no event is active. |
 | `snapshot` | Force-emit a fresh `SceneSummary` event and `Diagnostics`. Triggers re-fetch of `scene://current`. |
+| `cast { spell_id, target_id, target_index, pos_x?, pos_y?, pos_z? }` | Cast a spell by FFXI Spells.dat id. Self-target casts pass own UniqueNo+ActIndex; ground-target spells (Tractor) supply pos_*. |
+| `weaponskill { skill_id, target_id, target_index }` | Use an unlocked weaponskill. Server validates TP / weapon. |
+| `job_ability { ability_id, target_id, target_index }` | Use a job ability (e.g. WAR Mighty Strikes, RDM Convert). Server validates cooldown / job. |
+| `use_item { container, slot, item_no, target_id, target_index }` | Use a consumable / scroll / charged item. `(container, slot)` identify the item; `target` is self for potions or another entity for ranged items (Soultrapper). |
 | `disconnect` | Clean exit. Supervisor will not reconnect. |
 
 ## Resources

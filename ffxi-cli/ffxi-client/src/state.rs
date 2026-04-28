@@ -621,13 +621,21 @@ pub enum AgentCommand {
     Cancel,
     /// `GP_CLI_COMMAND_ITEM_USE` (0x037) — use a consumable / equipment
     /// item. **Not** an `ActionKind` variant: the wire opcode is `0x037`,
-    /// not `0x01A`. `container` and `slot` index into `Inventory.containers`
-    /// (the slot's `item_no` becomes the wire `ItemNum`); `target_id` /
-    /// `target_index` identify the recipient (self for potions / scrolls;
-    /// another entity for ranged items).
+    /// not `0x01A`. `container` is the storage id (0=Inventory, 1=Safe,
+    /// 8=Wardrobe, …) and `slot` is the property-item index inside that
+    /// container; together they identify the item server-side. `item_no`
+    /// is the FFXI item id (the LLM's bookkeeping hint — Stage 9's
+    /// inventory mirror will let agents look this up themselves; until
+    /// then it's passed inline so `use_item` doesn't soft-depend on
+    /// Stage 9). The wire `ItemNum` field is **always sent as 0** —
+    /// Phoenix's `0x037_item_use.cpp::validate` enforces
+    /// `mustEqual(this->ItemNum, 0)`. `target_id` / `target_index`
+    /// identify the recipient (self for potions / scrolls; another
+    /// entity for ranged items like Soultrapper).
     UseItem {
         container: u8,
         slot: u8,
+        item_no: u32,
         target_id: u32,
         target_index: u16,
     },
@@ -980,16 +988,20 @@ mod tests {
 
     #[test]
     fn use_item_command_roundtrip() {
-        let line = r#"{"cmd":"use_item","container":0,"slot":3,"target_id":42,"target_index":7}"#;
+        let line = r#"{"cmd":"use_item","container":0,"slot":3,"item_no":4112,"target_id":42,"target_index":7}"#;
         let cmd: AgentCommand = serde_json::from_str(line).unwrap();
         match cmd {
             AgentCommand::UseItem {
                 container,
                 slot,
+                item_no,
                 target_id,
                 target_index,
             } => {
-                assert_eq!((container, slot, target_id, target_index), (0, 3, 42, 7));
+                assert_eq!(
+                    (container, slot, item_no, target_id, target_index),
+                    (0, 3, 4112, 42, 7)
+                );
             }
             _ => panic!("wrong variant: {cmd:?}"),
         }
