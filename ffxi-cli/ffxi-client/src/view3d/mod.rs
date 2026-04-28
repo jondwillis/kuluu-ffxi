@@ -29,6 +29,7 @@ use crate::state::{AgentCommand, EntityKind, SessionState};
 
 use scene::{IsSelf, Target, WorldEntity};
 
+pub mod aggro;
 pub mod bridge;
 pub mod camera;
 pub mod floor;
@@ -89,6 +90,10 @@ pub fn run(
             Update,
             (
                 scene::sync_entities_system,
+                // After sync_entities so we have the last word on
+                // material assignment for entities that just became
+                // aggro on this snapshot tick.
+                aggro::sync_aggro_system,
                 floor::swap_floor_system,
                 camera::chase_camera_system,
                 draw_terminal,

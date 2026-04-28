@@ -9,6 +9,7 @@ use bevy::prelude::*;
 
 use crate::state::{Entity as ProtoEntity, EntityKind, SessionState, Vec3 as ProtoVec3};
 
+use super::aggro::Aggroing;
 use super::bridge::SessionStateSnapshot;
 
 /// Marker for the player's own avatar capsule. Exactly one expected.
@@ -55,6 +56,11 @@ pub struct EntityPalette {
     /// Highlight material applied to whichever entity is the current
     /// `Target`. Reverted to `material_for(kind)` when target changes.
     pub target: Handle<StandardMaterial>,
+    /// Aggro override applied by `view3d::aggro::sync_aggro_system` to
+    /// any mob whose `bt_target_id` points at the player. Bright red
+    /// + emissive so it's still legible at halfblock terminal
+    /// resolution where the standard mob material can fade into shadow.
+    pub aggro: Handle<StandardMaterial>,
     pub capsule_mesh: Handle<Mesh>,
     pub self_mesh: Handle<Mesh>,
     pub hp_bar_mesh: Handle<Mesh>,
@@ -102,6 +108,15 @@ pub fn setup_scene(
         target: materials.add(StandardMaterial {
             base_color: Color::srgb(1.00, 0.95, 0.20),
             emissive: LinearRgba::new(1.0, 0.95, 0.0, 1.0) * 0.6,
+            perceptual_roughness: 0.4,
+            ..default()
+        }),
+        // Aggro: saturated red, emissive cranked > 1.0 so the color
+        // survives the halfblock cell-averaging that bevy_ratatui_camera
+        // performs on readback.
+        aggro: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.00, 0.10, 0.10),
+            emissive: LinearRgba::new(1.5, 0.0, 0.0, 1.0),
             perceptual_roughness: 0.4,
             ..default()
         }),
@@ -175,6 +190,7 @@ pub fn sync_entities_system(
             &mut WorldEntity,
             &mut Transform,
             &mut MeshMaterial3d<StandardMaterial>,
+            Option<&Aggroing>,
         ),
         (Without<IsSelf>, Without<HpBar>),
     >,
@@ -196,7 +212,10 @@ pub fn sync_entities_system(
         t.rotation = ffxi_heading_to_bevy_rotation(state.self_pos.heading);
     }
 
-    // 2) Index existing ECS entities by FFXI id for the diff.
+    // 2) Index existing ECS entities by FFXI id for the diff. The
+    //    `is_aggro` flag is captured at iteration time so we can
+    //    decide later in the loop whether to skip the material write
+    //    (precedence: aggro > target > kind, owned by sync_aggro_system).
     let mut existing: HashMap<
         u32,
         (
@@ -204,10 +223,12 @@ pub fn sync_entities_system(
             Mut<WorldEntity>,
             Mut<Transform>,
             Mut<MeshMaterial3d<StandardMaterial>>,
+            bool,
         ),
     > = HashMap::new();
-    for (e, w, t, m) in entity_q.iter_mut() {
-        existing.insert(w.id, (e, w, t, m));
+    for (e, w, t, m, agg) in entity_q.iter_mut() {
+        let is_aggro = agg.is_some();
+        existing.insert(w.id, (e, w, t, m, is_aggro));
     }
 
     // 3) Update or spawn each entity in the snapshot. Material updates
@@ -226,9 +247,13 @@ pub fn sync_entities_system(
             palette.material_for(ent.kind)
         };
         match existing.remove(&ent.id) {
-            Some((_, mut w, mut t, mut m)) => {
+            Some((_, mut w, mut t, mut m, is_aggro)) => {
                 t.translation = translation;
-                if m.0 != want_mat {
+                // Skip material write when this entity is aggroing the
+                // player — sync_aggro_system owns the material for
+                // those, and overwriting here would just race it back
+                // to kind/target on every snapshot tick.
+                if !is_aggro && m.0 != want_mat {
                     m.0 = want_mat;
                 }
                 // Names occasionally backfill late (server sends them as
@@ -245,7 +270,7 @@ pub fn sync_entities_system(
 
     // 4) Despawn entities that disappeared from the snapshot. Children
     //    (HP bars) go with them via Bevy's hierarchy semantics.
-    for (id, (entity, _, _, _)) in existing {
+    for (id, (entity, _, _, _, _)) in existing {
         if !seen.contains(&id) {
             commands.entity(entity).despawn();
         }
