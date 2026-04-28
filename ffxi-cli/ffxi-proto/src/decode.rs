@@ -312,14 +312,18 @@ pub fn decode_logout(sub: &SubPacket<'_>) -> Result<ServerLogout, DecodeError> {
 ///   `uint8_t ItemNum[18]; uint8_t padding00[14]; uint16_t ItemNum2[18];
 ///    uint8_t padding01[28];` → 18 + 14 + 36 + 28 = 96 bytes total.
 ///
-/// `ItemNum[i]` is the legacy PS2-era u8 capacity (0..=255) for container
-/// `i`; `ItemNum2[i]` is the modern u16 capacity (used when capacity
-/// exceeds 255). The decoder returns the wider value when non-zero,
-/// otherwise falls back to the u8 — matches how the retail client
-/// resolves the two fields.
+/// `ItemNum[i]` is the legacy PS2-era u8 capacity for container `i`;
+/// `ItemNum2[i]` is the modern u16 capacity used when capacity exceeds
+/// 255. **Both fields are sent as `1 + GetSize()`** by Phoenix
+/// (`0x01c_item_max.cpp:32–69`), so the decoder subtracts 1 (saturating)
+/// to reconstruct the real slot count. A wire `ItemNum2 == 0` is a
+/// sentinel — Phoenix uses it to disable a container (e.g. moglocker
+/// without access). When wide == 0 we fall back to legacy, which mirrors
+/// how the retail client resolves the two fields.
 #[derive(Debug, Clone)]
 pub struct ItemMax {
-    /// Capacity per CONTAINER_ID (0..=17). Length = 18.
+    /// Capacity per CONTAINER_ID (0..=17). Length = 18. Already
+    /// normalized: 0 means "disabled", non-zero means real slot count.
     pub capacities: [u16; 18],
 }
 
@@ -334,7 +338,8 @@ impl ItemMax {
             let legacy = body[i] as u16;
             let wide_off = 18 + 14 + i * 2;
             let wide = u16::from_le_bytes(body[wide_off..wide_off + 2].try_into().unwrap());
-            *cap = if wide != 0 { wide } else { legacy };
+            let raw = if wide != 0 { wide } else { legacy };
+            *cap = raw.saturating_sub(1);
         }
         Ok(Self { capacities })
     }
@@ -624,23 +629,42 @@ mod tests {
 
     #[test]
     fn item_max_decodes_legacy_and_wide_capacity() {
+        // Phoenix writes `1 + size` / `1 + buff` to the wire (see
+        // `0x01c_item_max.cpp`), so the decoder must subtract 1.
         // 18 legacy u8 caps, 14 padding, 18 wide u16 caps, 28 padding.
         let mut buf = vec![0u8; ItemMax::SIZE];
-        // Inventory (id=0): legacy 80, wide 0 → resolves to 80.
-        buf[0] = 80;
-        // Mog Safe (id=1): legacy 80, wide 200 → resolves to 200 (modern).
-        buf[1] = 80;
+        // Inventory (id=0): legacy 81, wide 0 → resolves to legacy → 80.
+        buf[0] = 81;
+        // Mog Safe (id=1): legacy 81, wide 201 → wide wins → 200.
+        buf[1] = 81;
         let wide_off = 18 + 14 + 1 * 2;
-        buf[wide_off..wide_off + 2].copy_from_slice(&200u16.to_le_bytes());
-        // Wardrobe2 (id=10): legacy 0, wide 80 → resolves to 80.
+        buf[wide_off..wide_off + 2].copy_from_slice(&201u16.to_le_bytes());
+        // Wardrobe2 (id=10): legacy 0, wide 81 → wide-only → 80.
         let wide_off = 18 + 14 + 10 * 2;
-        buf[wide_off..wide_off + 2].copy_from_slice(&80u16.to_le_bytes());
+        buf[wide_off..wide_off + 2].copy_from_slice(&81u16.to_le_bytes());
 
         let m = ItemMax::decode(&buf).unwrap();
-        assert_eq!(m.capacities[0], 80, "Inventory: legacy fallback");
-        assert_eq!(m.capacities[1], 200, "Mog Safe: wide takes precedence");
-        assert_eq!(m.capacities[10], 80, "Wardrobe2: wide-only");
-        assert_eq!(m.capacities[17], 0, "Recycle Bin: zeroed");
+        assert_eq!(m.capacities[0], 80, "Inventory: legacy fallback, +1 inverted");
+        assert_eq!(m.capacities[1], 200, "Mog Safe: wide takes precedence, +1 inverted");
+        assert_eq!(m.capacities[10], 80, "Wardrobe2: wide-only, +1 inverted");
+        assert_eq!(m.capacities[17], 0, "Recycle Bin: zeroed (disabled sentinel)");
+    }
+
+    #[test]
+    fn item_max_disabled_container_stays_zero() {
+        // Phoenix sets `ItemNum2 = 0` to disable a container (e.g.
+        // moglocker without access). A naive `- 1` would underflow to
+        // u16::MAX; the saturating sub keeps it at 0.
+        let mut buf = vec![0u8; ItemMax::SIZE];
+        // Moglocker (id=4): legacy 1+size=21, but disabled wide=0.
+        // Falls back to legacy and decodes the real size.
+        buf[4] = 21;
+        // Mog Safe (id=1): both zero → both disabled → 0.
+        // (Pure sentinel; nothing to assert beyond the absence of
+        // underflow.)
+        let m = ItemMax::decode(&buf).unwrap();
+        assert_eq!(m.capacities[4], 20, "moglocker: legacy decoded with -1");
+        assert_eq!(m.capacities[1], 0, "fully-disabled stays at 0, no underflow");
     }
 
     #[test]
