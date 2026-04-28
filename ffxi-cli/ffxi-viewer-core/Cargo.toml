@@ -1,0 +1,20 @@
+[package]
+name = "ffxi-viewer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Bevy ECS plugins, world model, camera, and HUD shared by both the native
+# windowed viewer (ffxi-client/src/view_native/) and the browser viewer
+# (ffxi-viewer-wasm/). No tokio, no I/O — state arrives through the
+# `SceneSource` trait, implemented separately by each front-end.
+#
+# Stage-3 wasm build will need to override `bevy` to use webgl2 features
+# and drop platform backends that are linux-only — this Cargo.toml uses
+# the workspace bevy (full default features) for the native build.
+
+[dependencies]
+bevy = { workspace = true }
+ffxi-viewer-wire = { path = "../ffxi-viewer-wire" }
+
+[dev-dependencies]

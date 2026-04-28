@@ -1,0 +1,318 @@
+//! Snapshot ingest: pulls fresh `SceneSnapshot`s and `SceneDelta`s from the
+//! `SceneSource` and folds them into a Bevy resource.
+//!
+//! Why a resource and not direct trait access? Bevy systems that read
+//! viewer state would otherwise each call `poll_snapshot`, racing each
+//! other and confusing the source's "since last poll" semantics. The
+//! single `ingest_system` is the only caller of `poll_*` per frame; every
+//! other system reads `SceneState` instead.
+
+use bevy::prelude::*;
+use ffxi_viewer_wire::{Entity, PartyMember, SceneDelta, SceneSnapshot, ViewerEvent};
+
+use crate::source::SceneSource;
+
+/// Cap on retained chat lines mirrored on the renderer side. Matches the
+/// producer-side cap (`state::CHAT_HISTORY_CAP`) so a long session doesn't
+/// grow unbounded if the relay sends snapshot+delta sequences without ever
+/// re-baselining via a fresh full snapshot.
+pub const CHAT_HISTORY_CAP: usize = 256;
+
+/// Latest viewer-side scene state. Folded each frame from the source.
+/// Systems read this; nothing writes except `ingest_system`.
+#[derive(Resource, Default)]
+pub struct SceneState {
+    pub snapshot: SceneSnapshot,
+    /// Set on every frame where the snapshot changed (full or delta).
+    /// Sync-driven systems (entity sync, HUD) check this and skip work
+    /// when nothing changed.
+    pub dirty: bool,
+}
+
+/// Ring buffer of recent `ViewerEvent`s. HUD systems drain it for
+/// notifications (Tell toasts, aggro flashes); `ingest_system` appends.
+#[derive(Resource, Default)]
+pub struct EventLog {
+    pub recent: std::collections::VecDeque<ViewerEvent>,
+}
+
+const EVENT_LOG_CAP: usize = 64;
+
+/// Pull fresh state from the `SceneSource` into the Bevy resource. Runs in
+/// `PreUpdate` so downstream systems see a coherent view for the rest of
+/// the frame.
+pub fn ingest_system<S: SceneSource + Resource>(
+    mut source: ResMut<S>,
+    mut state: ResMut<SceneState>,
+    mut events: ResMut<EventLog>,
+) {
+    state.dirty = false;
+
+    if let Some(snap) = source.poll_snapshot() {
+        state.snapshot = *snap;
+        state.dirty = true;
+    }
+
+    for delta in source.drain_deltas() {
+        apply_delta(&mut state.snapshot, &delta);
+        state.dirty = true;
+    }
+
+    for ev in source.drain_events() {
+        if events.recent.len() >= EVENT_LOG_CAP {
+            events.recent.pop_front();
+        }
+        events.recent.push_back(ev);
+    }
+}
+
+/// Pure fold: merge a delta into a snapshot. Mirrors the apply rules from
+/// `state::SessionState::apply_event` for the same wire signals — in
+/// particular the party-member name preservation across attr-only updates
+/// (`0x0DF GROUP_ATTR` payloads carry HP/MP/TP but not name/leader flags).
+pub fn apply_delta(snap: &mut SceneSnapshot, delta: &SceneDelta) {
+    if let Some(stage) = delta.stage {
+        snap.stage = stage;
+    }
+    if let Some(zone) = delta.zone_id {
+        snap.zone_id = Some(zone);
+    }
+    if let Some(pos) = delta.self_pos {
+        snap.self_pos = pos;
+    }
+
+    upsert_entities(&mut snap.entities, &delta.entities_upserted);
+    for &id in &delta.entities_removed {
+        snap.entities.retain(|e| e.id != id);
+    }
+
+    upsert_party(&mut snap.party, &delta.party_upserted);
+
+    for line in &delta.chat_appended {
+        snap.chat.push(line.clone());
+    }
+    if snap.chat.len() > CHAT_HISTORY_CAP {
+        let drop_n = snap.chat.len() - CHAT_HISTORY_CAP;
+        snap.chat.drain(0..drop_n);
+    }
+
+    if let Some(d) = &delta.diagnostics {
+        snap.diagnostics = d.clone();
+    }
+}
+
+fn upsert_entities(list: &mut Vec<Entity>, ups: &[Entity]) {
+    for e in ups {
+        if let Some(existing) = list.iter_mut().find(|x| x.id == e.id) {
+            *existing = e.clone();
+        } else {
+            list.push(e.clone());
+        }
+    }
+}
+
+/// Party upsert preserves `name` and `is_party_leader` across attr-only
+/// refreshes (where `name == None` indicates a `0x0DF GROUP_ATTR` payload).
+fn upsert_party(list: &mut Vec<PartyMember>, ups: &[PartyMember]) {
+    for m in ups {
+        if let Some(existing) = list.iter_mut().find(|x| x.id == m.id) {
+            let preserved_name = if m.name.is_some() {
+                m.name.clone()
+            } else {
+                existing.name.clone()
+            };
+            let preserved_leader = if m.name.is_some() {
+                m.is_party_leader
+            } else {
+                existing.is_party_leader
+            };
+            let preserved_alliance = if m.name.is_some() {
+                m.is_alliance_leader
+            } else {
+                existing.is_alliance_leader
+            };
+            *existing = PartyMember {
+                name: preserved_name,
+                is_party_leader: preserved_leader,
+                is_alliance_leader: preserved_alliance,
+                ..m.clone()
+            };
+        } else {
+            list.push(m.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ffxi_viewer_wire::{ChatChannel, ChatLine, EntityKind, Position, Stage, Vec3};
+
+    fn ent(id: u32, x: f32) -> Entity {
+        Entity {
+            id,
+            act_index: 1,
+            kind: EntityKind::Pc,
+            name: Some(format!("e{id}")),
+            pos: Vec3 { x, y: 0.0, z: 0.0 },
+            heading: 0,
+            hp_pct: Some(100),
+            bt_target_id: 0,
+        }
+    }
+
+    #[test]
+    fn delta_upserts_and_removes_entities() {
+        let mut snap = SceneSnapshot::default();
+        snap.entities.push(ent(1, 0.0));
+        snap.entities.push(ent(2, 5.0));
+
+        let delta = SceneDelta {
+            entities_upserted: vec![ent(1, 99.0), ent(3, 7.0)],
+            entities_removed: vec![2],
+            ..Default::default()
+        };
+        apply_delta(&mut snap, &delta);
+
+        assert_eq!(snap.entities.len(), 2);
+        let e1 = snap.entities.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e1.pos.x, 99.0, "id=1 must be updated, not duplicated");
+        assert!(snap.entities.iter().any(|e| e.id == 3), "id=3 must be inserted");
+        assert!(!snap.entities.iter().any(|e| e.id == 2), "id=2 must be removed");
+    }
+
+    #[test]
+    fn delta_replaces_self_pos_and_stage() {
+        let mut snap = SceneSnapshot::default();
+        let delta = SceneDelta {
+            stage: Some(Stage::InZone),
+            self_pos: Some(Position {
+                pos: Vec3 { x: 1.0, y: 2.0, z: 3.0 },
+                heading: 64,
+            }),
+            ..Default::default()
+        };
+        apply_delta(&mut snap, &delta);
+        assert_eq!(snap.stage, Stage::InZone);
+        assert_eq!(snap.self_pos.heading, 64);
+        assert_eq!(snap.self_pos.pos.y, 2.0);
+    }
+
+    #[test]
+    fn party_upsert_preserves_name_across_attr_only_update() {
+        let mut snap = SceneSnapshot::default();
+        let from_list = PartyMember {
+            id: 42,
+            act_index: 7,
+            name: Some("Vanari".into()),
+            hp: 2000,
+            mp: 100,
+            tp: 0,
+            hp_pct: 100,
+            mp_pct: 100,
+            zone_no: 230,
+            main_job: 1,
+            main_job_lv: 75,
+            sub_job: 6,
+            sub_job_lv: 37,
+            is_party_leader: true,
+            is_alliance_leader: false,
+        };
+        apply_delta(
+            &mut snap,
+            &SceneDelta {
+                party_upserted: vec![from_list],
+                ..Default::default()
+            },
+        );
+        assert_eq!(snap.party.len(), 1);
+        assert!(snap.party[0].is_party_leader);
+
+        // Attr-only update: name=None, leader=false. Must NOT clobber.
+        let from_attr = PartyMember {
+            id: 42,
+            act_index: 7,
+            name: None,
+            hp: 1500,
+            mp: 100,
+            tp: 1234,
+            hp_pct: 75,
+            mp_pct: 100,
+            zone_no: 230,
+            main_job: 1,
+            main_job_lv: 75,
+            sub_job: 6,
+            sub_job_lv: 37,
+            is_party_leader: false,
+            is_alliance_leader: false,
+        };
+        apply_delta(
+            &mut snap,
+            &SceneDelta {
+                party_upserted: vec![from_attr],
+                ..Default::default()
+            },
+        );
+        assert_eq!(snap.party.len(), 1, "upsert by id");
+        assert_eq!(snap.party[0].name.as_deref(), Some("Vanari"));
+        assert!(snap.party[0].is_party_leader);
+        assert_eq!(snap.party[0].hp, 1500, "HP overwritten");
+    }
+
+    #[test]
+    fn chat_appends_and_caps() {
+        let mut snap = SceneSnapshot::default();
+        let line = ChatLine {
+            channel: ChatChannel::Say,
+            sender: "x".into(),
+            text: "hi".into(),
+            server_ts: 0,
+        };
+        let delta = SceneDelta {
+            chat_appended: vec![line; CHAT_HISTORY_CAP + 5],
+            ..Default::default()
+        };
+        apply_delta(&mut snap, &delta);
+        assert_eq!(snap.chat.len(), CHAT_HISTORY_CAP);
+    }
+
+    /// Confirm `ingest_system::<S>` compiles when S is a Resource +
+    /// SceneSource — the generic-bound shape that the plugin uses.
+    #[test]
+    fn ingest_system_compiles_with_test_source() {
+        #[derive(Resource, Default)]
+        struct TestSource {
+            next_snapshot: Option<Box<SceneSnapshot>>,
+        }
+        impl SceneSource for TestSource {
+            fn poll_snapshot(&mut self) -> Option<Box<SceneSnapshot>> {
+                self.next_snapshot.take()
+            }
+            fn drain_deltas(&mut self) -> Vec<SceneDelta> {
+                vec![]
+            }
+            fn drain_events(&mut self) -> Vec<ViewerEvent> {
+                vec![]
+            }
+        }
+        let mut app = App::new();
+        app.init_resource::<TestSource>();
+        app.init_resource::<SceneState>();
+        app.init_resource::<EventLog>();
+        app.add_systems(Update, ingest_system::<TestSource>);
+
+        // Hand the source a snapshot, run one update, verify it lands.
+        let mut s = SceneSnapshot::default();
+        s.stage = Stage::InZone;
+        app.world_mut()
+            .resource_mut::<TestSource>()
+            .next_snapshot = Some(Box::new(s));
+        app.update();
+        assert_eq!(app.world().resource::<SceneState>().snapshot.stage, Stage::InZone);
+        assert!(app.world().resource::<SceneState>().dirty);
+
+        // Next frame with no new snapshot — dirty must clear.
+        app.update();
+        assert!(!app.world().resource::<SceneState>().dirty);
+    }
+}

@@ -1,11 +1,15 @@
 //! FFXI CLI/TUI client — entry point.
 
 use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session};
-#[cfg(feature = "tui")]
-use ffxi_client::{spawn_session, state, SessionHandle};
+#[cfg(any(feature = "tui", feature = "native-window"))]
+use ffxi_client::{spawn_session, SessionHandle};
+#[cfg(any(feature = "tui", feature = "native-window"))]
+use ffxi_client::state;
 mod launcher;
 #[cfg(feature = "tui")]
 mod view3d;
+#[cfg(feature = "native-window")]
+mod view_native;
 
 use anyhow::{self, Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -103,10 +107,21 @@ enum Command {
         password: Option<String>,
         char_name: Option<String>,
     },
+    /// Same session as `Play`, but renders into a real native OS window
+    /// via `bevy_winit` (no terminal involved). Esc to disconnect.
+    ///
+    /// All three positional args are optional; when any are missing, the
+    /// command drops into the same interactive launcher as `tui`/`play`,
+    /// then opens the window once a character is selected.
+    #[cfg(feature = "native-window")]
+    Native {
+        user: Option<String>,
+        password: Option<String>,
+        char_name: Option<String>,
+    },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Parse args *before* tracing init so we can route logs differently
     // for TUI mode — stderr writes corrupt ratatui's alternate-screen
     // buffer, so the TUI command routes logs to a file instead.
@@ -119,7 +134,8 @@ async fn main() -> Result<()> {
     // Logs go to stderr by default (so stdout stays clean for `play`'s
     // JSON-line event stream). `tui` enters alt-screen mode (Bevy +
     // RatatuiPlugins own the terminal) so its logs route to a file
-    // instead.
+    // instead. `native` opens its own OS window and leaves the launching
+    // terminal alone, so stderr is fine.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     #[cfg(feature = "tui")]
@@ -146,6 +162,25 @@ async fn main() -> Result<()> {
 
     let auth = auth_client::AuthClient::new(args.server.clone(), args.auth_port);
 
+    // Bevy/winit on macOS strictly requires its event loop on the OS main
+    // thread (Cocoa restriction). Build the tokio runtime explicitly so the
+    // Native command can run preflight async work via `block_on`, then run
+    // Bevy synchronously on this (main) thread. All other commands run
+    // entirely inside the runtime.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+
+    #[cfg(feature = "native-window")]
+    if matches!(args.command, Command::Native { .. }) {
+        return run_native_main_thread(&rt, args, auth);
+    }
+
+    rt.block_on(async move { run_command_async(args, auth).await })
+}
+
+async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<()> {
     match args.command {
         Command::Provision { user, password } => {
             auth.ensure_account(&user, &password)
@@ -657,6 +692,13 @@ async fn main() -> Result<()> {
 
             outcome?;
         }
+        #[cfg(feature = "native-window")]
+        Command::Native { .. } => {
+            unreachable!(
+                "Native is dispatched on the main thread by run_native_main_thread; \
+                 it must not reach the tokio runtime body"
+            );
+        }
         Command::Lobby {
             user,
             password,
@@ -699,6 +741,149 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "native-window")]
+struct NativePreflight {
+    user: String,
+    password: String,
+    char_id: u32,
+    char_name: String,
+    initial: session::InitialState,
+}
+
+#[cfg(feature = "native-window")]
+fn run_native_main_thread(
+    rt: &tokio::runtime::Runtime,
+    args: Args,
+    auth: auth_client::AuthClient,
+) -> Result<()> {
+    let Args {
+        server,
+        auth_port,
+        data_port,
+        view_port,
+        map_host_override,
+        command,
+    } = args;
+    let Command::Native {
+        user,
+        password,
+        char_name,
+    } = command
+    else {
+        unreachable!("dispatched only when args.command is Command::Native");
+    };
+
+    let lobby = lobby_client::LobbyClient::new(server.clone(), data_port, view_port);
+    let server_for_launcher = server.clone();
+
+    // Auth + lobby preflight — same shape as Tui's direct/launcher branches.
+    let prep: NativePreflight = rt
+        .block_on(async move {
+            match (user, password, char_name) {
+                (Some(u), Some(p), Some(name)) => {
+                    let session = auth
+                        .login(&u, &p)
+                        .await
+                        .context("auth precheck (native direct mode)")?;
+                    let handle = lobby
+                        .open(&session)
+                        .await
+                        .context("opening lobby (native direct mode)")?;
+                    let slot = handle
+                        .chars()
+                        .iter()
+                        .find(|c| c.name == name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "no character named '{name}' on account '{u}' (have: {:?})",
+                                handle
+                                    .chars()
+                                    .iter()
+                                    .map(|c| c.name.as_str())
+                                    .collect::<Vec<_>>()
+                            )
+                        })?;
+                    let mut key3 = [0u8; 20];
+                    for (i, b) in key3.iter_mut().enumerate() {
+                        *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
+                    }
+                    let handoff = handle
+                        .select(slot.char_id, &slot.name, key3)
+                        .await
+                        .context("lobby select (native direct mode)")?;
+                    Ok::<_, anyhow::Error>(NativePreflight {
+                        user: u,
+                        password: p,
+                        char_id: slot.char_id,
+                        char_name: slot.name,
+                        initial: session::InitialState {
+                            auth: session,
+                            handoff,
+                            key3,
+                        },
+                    })
+                }
+                (u, p, n) => {
+                    let defaults = launcher::Defaults {
+                        user: u,
+                        password: p,
+                        char_name: n,
+                    };
+                    let sel = launcher::run(&server_for_launcher, &auth, &lobby, defaults)
+                        .await
+                        .context("interactive launcher")?;
+                    Ok(NativePreflight {
+                        user: sel.user,
+                        password: sel.password,
+                        char_id: sel.char_id,
+                        char_name: sel.char_name,
+                        initial: sel.initial_state,
+                    })
+                }
+            }
+        })
+        .context("native preflight")?;
+
+    let cfg = session::Config {
+        server,
+        map_host_override,
+        auth_port,
+        data_port,
+        view_port,
+        user: prep.user,
+        password: prep.password,
+        char_id: prep.char_id,
+        char_name: prep.char_name,
+        initial_state: Some(prep.initial),
+    };
+
+    // Spawn the session on the runtime; cross-thread channels carry state
+    // and commands to the (main-thread) Bevy app.
+    let SessionHandle {
+        state_rx,
+        cmd_tx,
+        event_tx,
+        session_task,
+        folder_task,
+    } = rt.block_on(async { spawn_session(cfg) });
+    let event_rx = event_tx.subscribe();
+
+    // Run Bevy synchronously on this (main) thread. Returns when the user
+    // presses Esc, closes the window, or AppExit fires.
+    let view_outcome = view_native::run(state_rx, event_rx, cmd_tx);
+
+    // Drop the broadcast sender so folder_task can finish (it loops on
+    // `event_rx.recv()` which only unblocks when *all* senders drop).
+    drop(event_tx);
+    rt.block_on(async {
+        let _ = folder_task.await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), session_task).await;
+    });
+
+    view_outcome
 }
 
 fn hex(b: &[u8]) -> String {
