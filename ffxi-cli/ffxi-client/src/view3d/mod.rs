@@ -101,8 +101,10 @@ pub fn run(
 
 /// Compose the full dashboard frame:
 ///  - top: stage bar (chrome)
-///  - body left: 3D camera widget + entity nametag overlays
-///  - body right: chat panel (chrome)
+///  - body: three columns
+///     - left (28 cells): agent state HUD + LLM decision badge
+///     - middle (Min 20 cells, fills): 3D camera + entity nametags
+///     - right (38 cells): party roster + chat + JSON event log
 ///  - bottom: diagnostics (chrome)
 ///
 /// Nametags use ratatui text overlays (not 3D-baked text quads) — at
@@ -110,6 +112,11 @@ pub fn run(
 /// unreadable. Projecting world positions through `Camera::world_to_viewport`
 /// then mapping pixel coords → terminal cells lets us paint real glyphs
 /// directly into the ratatui buffer after the camera widget renders.
+///
+/// Same pattern applies to all chrome: the camera widget is rendered
+/// first, then the chrome paints over the surrounding cells (which were
+/// outside the camera region anyway). The left HUD column lives entirely
+/// outside the camera area, so it never collides.
 fn draw_terminal(
     mut ratatui: ResMut<RatatuiContext>,
     mut camera_widget: Single<&mut RatatuiCameraWidget>,
@@ -135,31 +142,51 @@ fn draw_terminal(
 
         chrome::draw_stage_bar(frame, chunks[0], &snapshot.0);
 
+        // Three-column body. Left and right columns are fixed-width so
+        // text-dense chrome keeps a consistent footprint at any terminal
+        // size; the camera takes the rest. Right column is wider than
+        // the left because party rows + JSON event log are wider than
+        // the agent HUD's three lines.
         let body = Layout::default()
             .direction(LayoutDirection::Horizontal)
-            // Bias toward the 3D viewport — chat is text-dense and works
-            // narrow, the 3D camera needs every cell it can get.
-            .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+            .constraints([
+                Constraint::Length(28), // agent HUD + LLM badge
+                Constraint::Min(20),    // 3D camera (fills remainder)
+                Constraint::Length(38), // party + chat + event log
+            ])
             .split(chunks[1]);
 
-        let camera_area = body[0];
+        // Left column: agent HUD on top (5 lines: 3 borders + content),
+        // LLM badge below (4 lines). The badge is a stub until V4
+        // surfaces real MCP-side timing.
+        let left = Layout::default()
+            .direction(LayoutDirection::Vertical)
+            .constraints([Constraint::Length(5), Constraint::Min(4)])
+            .split(body[0]);
+        chrome::draw_agent_hud(frame, left[0], &snapshot.0);
+        chrome::draw_llm_badge(frame, left[1], &snapshot.0.recent_decisions);
+
+        let camera_area = body[1];
         camera_widget.render(camera_area, frame.buffer_mut());
         if let Ok((cam, cam_xform)) = cam_q.single() {
             render_nametags(frame, camera_area, cam, cam_xform, &entity_q, &target);
         }
 
-        // Right column: chat on top, JSON event/command log below.
-        // 60/40 split favors chat — chat lines are short and context-rich,
-        // JSON lines are long but truncated at the right edge anyway, so
-        // a smaller pane still surfaces ~10 recent events at typical
-        // terminal heights.
+        // Right column: party roster on top (one row per member, ~9
+        // lines max for a full alliance + borders), then chat in the
+        // middle, JSON event log on the bottom. Chat gets 50% of the
+        // post-party space and the log gets the other 50%.
         let right = Layout::default()
             .direction(LayoutDirection::Vertical)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(body[1]);
-
-        chrome::draw_chat(frame, right[0], &snapshot.0);
-        chrome::draw_event_log(frame, right[1], &event_log.lines, show_all);
+            .constraints([
+                Constraint::Length(8), // party roster (6 rows + borders)
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ])
+            .split(body[2]);
+        chrome::draw_party_roster(frame, right[0], &snapshot.0.party);
+        chrome::draw_chat(frame, right[1], &snapshot.0);
+        chrome::draw_event_log(frame, right[2], &event_log.lines, show_all);
         chrome::draw_diagnostics(frame, chunks[2], &snapshot.0, None, kitty_ok);
     })?;
     Ok(())
