@@ -57,6 +57,18 @@ pub struct CharList {
     pub characters: Vec<CharListEntry>,
 }
 
+/// Parsed entry from the view-port `lpkt_chr_info2` push. Carries the full
+/// `u32` charid (the data-port 0xA1 only gives a 16-bit `char_id_main`,
+/// inadequate for accounts with millions-range ids) and the user-visible
+/// name. Empty slots arrive with status=0x01 and a space-prefixed name —
+/// `list_characters` filters those out before returning.
+#[derive(Debug, Clone)]
+pub struct CharSlot {
+    pub char_id: u32,
+    pub name: String,
+    pub status: u16,
+}
+
 #[derive(Debug, Clone)]
 pub struct MapHandoff {
     pub char_id: u32,
@@ -74,6 +86,60 @@ pub struct LobbyClient {
     pub view_port: u16,
 }
 
+/// A live lobby session: both TLS-TCP sockets remain open after `open()`
+/// so multiple operations (select / create / delete) share one server-side
+/// `session_t` lifecycle. Drop the handle to close cleanly without picking
+/// a character — the server's `handle_error` path will null both slots and
+/// remove the entry from `authenticatedSessions_`.
+pub struct LobbyHandle {
+    view: TcpStream,
+    data: TcpStream,
+    /// Populated character slots only (empty slots from the server are
+    /// filtered out at construction time).
+    chars: Vec<CharSlot>,
+    session_hash: [u8; 16],
+}
+
+impl LobbyHandle {
+    pub fn chars(&self) -> &[CharSlot] {
+        &self.chars
+    }
+
+    /// Run the second half of the lobby flow: view 0x07 select → wait for
+    /// data 0x02 ack → data 0xA2 with key3 → read view `lpkt_next_login`.
+    /// Consumes the handle (sockets close on drop after this returns).
+    pub async fn select(
+        mut self,
+        char_id: u32,
+        char_name: &str,
+        key3: [u8; 20],
+    ) -> Result<MapHandoff> {
+        let req_select = build_view_select(char_id, char_name, &self.session_hash);
+        self.view.write_all(&req_select).await?;
+        self.view.flush().await?;
+        tracing::debug!(char_id, "lobby: 0x07 select sent");
+
+        let mut ack = [0u8; 5];
+        self.data
+            .read_exact(&mut ack)
+            .await
+            .context("reading 0x07 ack on data port")?;
+        if ack[0] != 0x02 {
+            bail!("expected 0x02 ack after view select, got {ack:?}");
+        }
+        tracing::debug!("lobby: 0x02 ack received");
+
+        let req_a2 = build_data_a2(&key3);
+        self.data.write_all(&req_a2).await?;
+        self.data.flush().await?;
+        tracing::debug!("lobby: 0xA2 handoff sent");
+
+        let handoff = read_lpkt_next_login(&mut self.view, char_id, &key3).await?;
+        tracing::debug!(server_port = handoff.server_port, "lobby: lpkt_next_login received");
+        Ok(handoff)
+    }
+}
+
 impl LobbyClient {
     pub fn new(host: impl Into<String>, data_port: u16, view_port: u16) -> Self {
         Self {
@@ -83,78 +149,67 @@ impl LobbyClient {
         }
     }
 
-    /// Run the full lobby handshake. Returns the map handoff bundle on success.
-    pub async fn handshake(
-        &self,
-        auth: &AuthSession,
-        char_id: u32,
-        char_name: &str,
-        search_server_ip: u32,
-        key3: [u8; 20],
-    ) -> Result<MapHandoff> {
-        // 1) Open both sockets.
+    /// Open a lobby session: connect both sockets, register the view
+    /// session, fire `0xA1`, parse both responses, and hand back a
+    /// `LobbyHandle` that *retains* the live sockets. Subsequent
+    /// operations (`select`, `create_character`, `delete_character`)
+    /// reuse those sockets so the server's `session_t::view_session`
+    /// and `session_t::data_session` slots stay coherent across the
+    /// entire flow — closing and reopening between steps races the
+    /// server's async cleanup and routes responses to dead pointers
+    /// (the bug that surfaced as `early eof`).
+    pub async fn open(&self, auth: &AuthSession) -> Result<LobbyHandle> {
         let mut view = self.connect(self.view_port).await?;
         tracing::debug!("lobby: view socket connected");
         let mut data = self.connect(self.data_port).await?;
         tracing::debug!("lobby: data socket connected");
 
-        // 2) Register the view session so the server's lpkt_chr_info2 push
-        //    during the 0xA1 response has a target. Send a no-op IXFF packet
-        //    with command=0; the server's switch falls through but creates
-        //    `session.view_session` as a side effect of the read.
         let register = ixff_header(IXFF_HEADER_SIZE as u32, VIEW_CMD_REGISTER, &auth.session_hash);
         view.write_all(&register).await?;
         view.flush().await?;
         tracing::debug!("lobby: VIEW_CMD_REGISTER sent");
 
-        // 3) Send 0xA1 on data: char-list request + session_hash.
-        let req_a1 = build_data_a1(auth.account_id, search_server_ip, &auth.session_hash);
+        let req_a1 = build_data_a1(auth.account_id, 0, &auth.session_hash);
         data.write_all(&req_a1).await?;
         data.flush().await?;
         tracing::debug!(account_id = auth.account_id, "lobby: 0xA1 char-list request sent");
 
-        // 4) Read the 328-byte char list response. (We don't return this;
-        //    the caller already named the char by id+name. But we do parse
-        //    enough to confirm the requested char_id is in the list.)
         let charlist = read_data_charlist(&mut data).await?;
         tracing::debug!(count = charlist.characters.len(), "lobby: 0xA1 char-list received");
-        if charlist.characters.is_empty() {
+        let slots = parse_view_chr_info2(&mut view).await?;
+        // Drop empty slots (server marks them with status=0x01 and a leading
+        // space byte in `character_name`, see view_session.cpp:222).
+        let chars: Vec<CharSlot> = slots
+            .into_iter()
+            .filter(|s| s.char_id != 0 && !s.name.starts_with(' '))
+            .collect();
+        tracing::debug!(populated = chars.len(), "lobby: chr_info2 parsed");
+
+        Ok(LobbyHandle {
+            view,
+            data,
+            chars,
+            session_hash: auth.session_hash,
+        })
+    }
+
+    /// Convenience wrapper for the original "open + select" flow. Most
+    /// callers should prefer `open()` to keep the sockets alive across
+    /// multiple operations; this exists for the MCP path that does the
+    /// whole handshake in one shot inside `session::run`.
+    pub async fn handshake(
+        &self,
+        auth: &AuthSession,
+        char_id: u32,
+        char_name: &str,
+        _search_server_ip: u32,
+        key3: [u8; 20],
+    ) -> Result<MapHandoff> {
+        let handle = self.open(auth).await?;
+        if handle.chars.is_empty() {
             bail!("no characters found for account");
         }
-        // We *also* expect the server to have pushed lpkt_chr_info2 to the
-        // view socket. We can drain it but don't need to interpret it —
-        // the caller selected the char by id already.
-        drain_view_chr_info2(&mut view).await?;
-        tracing::debug!("lobby: lpkt_chr_info2 drained");
-
-        // 5) Send 0x07 on view: select character.
-        let req_select = build_view_select(char_id, char_name, &auth.session_hash);
-        view.write_all(&req_select).await?;
-        view.flush().await?;
-        tracing::debug!(char_id, "lobby: 0x07 select sent");
-
-        // 6) Server replies on data port with [0x02, 0, 0, 0, 0].
-        let mut ack = [0u8; 5];
-        data.read_exact(&mut ack).await
-            .context("reading 0x07 ack on data port")?;
-        if ack[0] != 0x02 {
-            bail!("expected 0x02 ack after view select, got {ack:?}");
-        }
-        tracing::debug!("lobby: 0x02 ack received");
-
-        // 7) Send 0xA2 on data with key3.
-        let req_a2 = build_data_a2(&key3);
-        data.write_all(&req_a2).await?;
-        data.flush().await?;
-        tracing::debug!("lobby: 0xA2 handoff sent");
-
-        // 8) Server pushes lpkt_next_login on view (and closes view socket).
-        let handoff = read_lpkt_next_login(&mut view, char_id, &key3).await?;
-        tracing::debug!(server_port = handoff.server_port, "lobby: lpkt_next_login received");
-
-        // View is closed by server; nothing more to do with it.
-        // Data socket may also be closed; we don't reuse it after this.
-        Ok(handoff)
+        handle.select(char_id, char_name, key3).await
     }
 
     pub async fn create_character(
@@ -331,7 +386,14 @@ async fn read_data_charlist(stream: &mut TcpStream) -> Result<CharList> {
 }
 
 async fn drain_view_chr_info2(stream: &mut TcpStream) -> Result<()> {
-    // Read the 4-byte size header, then size-4 more bytes. See login_packets.h.
+    parse_view_chr_info2(stream).await.map(|_| ())
+}
+
+/// Parse the size-prefixed `lpkt_chr_info2` push that the server emits to
+/// the view socket immediately after handling a data-port 0xA1. Each slot
+/// is 76 bytes (`lpkt_chr_info_sub2`); we only extract the fields the
+/// launcher cares about — `ffxi_id`, `status`, and `character_name`.
+async fn parse_view_chr_info2(stream: &mut TcpStream) -> Result<Vec<CharSlot>> {
     let mut size_bytes = [0u8; 4];
     stream
         .read_exact(&mut size_bytes)
@@ -346,7 +408,69 @@ async fn drain_view_chr_info2(stream: &mut TcpStream) -> Result<()> {
         .read_exact(&mut rest)
         .await
         .context("reading lpkt_chr_info2 body")?;
-    Ok(())
+
+    // Body layout after the 4-byte size we already consumed:
+    //   rest[0..4]   terminator
+    //   rest[4..8]   command (0x20)
+    //   rest[8..24]  identifier (16B)
+    //   rest[24..28] characters: u32
+    //   rest[28..]   lpkt_chr_info_sub2 [characters]   (76B each)
+    if rest.len() < 28 {
+        bail!("chr_info2 body too short ({})", rest.len());
+    }
+    let count = u32::from_le_bytes(rest[24..28].try_into().unwrap()) as usize;
+    // 4 ffxi_id + 2 ffxi_id_world + 2 worldid + 2 status + 1 bitfield + 1
+    // ffxi_id_world_tbl + 16 character_name + 16 world_name + 96
+    // TC_OPERATION_MAKE. The TC_OPERATION_MAKE size is the easy thing to
+    // get wrong: the *full* struct in `login_packets.h` runs through
+    // skill1..skill9, ChatCounter, PartyCounter, FirstLoginDate, etc. — not
+    // the 32-byte truncation I had on first read. Verified empirically by
+    // hex-dump: a 16-slot response is 28 + 16*140 = 2268 bytes, matching
+    // the wire size when the server fills empty slots.
+    const SUB2_SIZE: usize = 140;
+    let needed = 28 + count * SUB2_SIZE;
+    if rest.len() < needed {
+        bail!(
+            "chr_info2 body short: have {} bytes, need {} for {} slot(s)",
+            rest.len(),
+            needed,
+            count
+        );
+    }
+    // Diagnostic — emitted at TRACE so it stays out of normal output. Useful
+    // when a populated slot looks wrong (off-by-N alignment, unexpected
+    // padding, server reusing a stale `data_session`'s `characterInfoResponse`
+    // because of session-hash collision). Set RUST_LOG=ffxi_client=trace to see.
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let total = 28 + count * SUB2_SIZE;
+        let hex: String = rest[..rest.len().min(total)]
+            .chunks(16)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let off = i * 16;
+                let bytes: String =
+                    chunk.iter().map(|b| format!("{b:02x} ")).collect();
+                format!("  {off:04x}: {bytes}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        tracing::trace!(count, total_bytes = rest.len(), "chr_info2 raw:\n{hex}");
+    }
+    let mut slots = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 28 + i * SUB2_SIZE;
+        let char_id = u32::from_le_bytes(rest[off..off + 4].try_into().unwrap());
+        let status = u16::from_le_bytes(rest[off + 8..off + 10].try_into().unwrap());
+        let name_bytes = &rest[off + 12..off + 28];
+        let nul = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
+        let name = String::from_utf8_lossy(&name_bytes[..nul]).into_owned();
+        slots.push(CharSlot {
+            char_id,
+            name,
+            status,
+        });
+    }
+    Ok(slots)
 }
 
 async fn read_lpkt_next_login(

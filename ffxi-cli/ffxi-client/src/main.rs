@@ -3,6 +3,7 @@
 use ffxi_client::{
     SessionHandle, agent_io, auth_client, lobby_client, map_client, session, spawn_session, state,
 };
+mod launcher;
 mod view3d;
 
 use anyhow::{self, Context, Result, bail};
@@ -82,11 +83,17 @@ enum Command {
     /// Same session as `Play`, but renders a Bevy-driven 3D operator
     /// dashboard into the terminal via `bevy_ratatui_camera`. Press `q`,
     /// `Esc`, or `Ctrl+C` to disconnect cleanly.
+    ///
+    /// All three positional args are optional; when any are missing, the
+    /// command drops into an interactive launcher (see `launcher.rs`)
+    /// that prompts for credentials, lists characters on the account,
+    /// and lets you pick one before entering the TUI's alt-screen mode.
+    /// The numeric charid is resolved by name against the lobby's
+    /// character list — agents and humans don't need to know it.
     Tui {
-        user: String,
-        password: String,
-        char_id: u32,
-        char_name: String,
+        user: Option<String>,
+        password: Option<String>,
+        char_name: Option<String>,
     },
 }
 
@@ -378,6 +385,7 @@ async fn main() -> Result<()> {
                 password,
                 char_id,
                 char_name,
+                initial_state: None,
             };
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
             let (event_tx, event_rx) = tokio::sync::broadcast::channel(256);
@@ -392,9 +400,82 @@ async fn main() -> Result<()> {
         Command::Tui {
             user,
             password,
-            char_id,
             char_name,
         } => {
+            let lobby = lobby_client::LobbyClient::new(
+                args.server.clone(),
+                args.data_port,
+                args.view_port,
+            );
+
+            // Direct mode: all three CLI args present → log in, open the
+            // lobby (which fetches the char list), resolve name → charid,
+            // run the lobby select on the same handle. Else hand off to
+            // the interactive launcher with whatever we *do* have as
+            // defaults. Both paths complete the lobby flow *before*
+            // entering alt-screen so errors surface cleanly to stderr,
+            // and both pass the resulting `InitialState` through to
+            // `session::run` so it skips auth + lobby entirely.
+            let (user, password, char_id, char_name, initial_state) =
+                match (user, password, char_name) {
+                    (Some(u), Some(p), Some(name)) => {
+                        let session = auth
+                            .login(&u, &p)
+                            .await
+                            .context("auth precheck (tui direct mode)")?;
+                        let handle = lobby
+                            .open(&session)
+                            .await
+                            .context("opening lobby (tui direct mode)")?;
+                        let slot = handle
+                            .chars()
+                            .iter()
+                            .find(|c| c.name == name)
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "no character named '{name}' on account '{u}' (have: {:?})",
+                                    handle
+                                        .chars()
+                                        .iter()
+                                        .map(|c| c.name.as_str())
+                                        .collect::<Vec<_>>()
+                                )
+                            })?;
+                        let mut key3 = [0u8; 20];
+                        for (i, b) in key3.iter_mut().enumerate() {
+                            *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
+                        }
+                        let handoff = handle
+                            .select(slot.char_id, &slot.name, key3)
+                            .await
+                            .context("lobby select (tui direct mode)")?;
+                        let initial_state = session::InitialState {
+                            auth: session,
+                            handoff,
+                            key3,
+                        };
+                        (u, p, slot.char_id, slot.name, initial_state)
+                    }
+                    (u, p, n) => {
+                        let defaults = launcher::Defaults {
+                            user: u,
+                            password: p,
+                            char_name: n,
+                        };
+                        let sel = launcher::run(&args.server, &auth, &lobby, defaults)
+                            .await
+                            .context("interactive launcher")?;
+                        (
+                            sel.user,
+                            sel.password,
+                            sel.char_id,
+                            sel.char_name,
+                            sel.initial_state,
+                        )
+                    }
+                };
+
             let cfg = session::Config {
                 server: args.server.clone(),
                 map_host_override: args.map_host_override.clone(),
@@ -405,6 +486,7 @@ async fn main() -> Result<()> {
                 password,
                 char_id,
                 char_name,
+                initial_state: Some(initial_state),
             };
             let SessionHandle {
                 state_rx,

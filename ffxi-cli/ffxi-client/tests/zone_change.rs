@@ -69,6 +69,7 @@ async fn zone_change_reconnects_with_rotated_key() {
         password: fixture.password.clone(),
         char_id: fixture.charid,
         char_name: fixture.charname.clone(),
+        initial_state: None,
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCommand>(32);

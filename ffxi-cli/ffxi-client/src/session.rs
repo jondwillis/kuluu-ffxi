@@ -47,6 +47,26 @@ pub struct Config {
     pub password: String,
     pub char_id: u32,
     pub char_name: String,
+    /// Pre-prepared auth + lobby state. When `Some(...)`, `run` skips its
+    /// own `auth.login` *and* `lobby.handshake` steps and goes straight to
+    /// the map bootstrap with the supplied handoff/key. Required for the
+    /// launcher path: the server's `session_t` is keyed on
+    /// `(ip, session_hash)` and tracks `data_session` / `view_session`
+    /// shared_ptrs — re-handshaking with the same hash routes responses
+    /// to stale (closed) sockets and produces silent EOFs.
+    /// MCP / `Play` callers that don't pre-resolve set this to `None`.
+    pub initial_state: Option<InitialState>,
+}
+
+/// Caller-supplied lobby completion. All three fields are required
+/// together: the bootstrap needs `auth.session_hash` for the ticket,
+/// `handoff.server_ip/server_port` for the map endpoint, and `key3` is
+/// the blowfish seed the map server reads back from `accounts_sessions`.
+#[derive(Clone, Debug)]
+pub struct InitialState {
+    pub auth: crate::auth_client::AuthSession,
+    pub handoff: crate::lobby_client::MapHandoff,
+    pub key3: [u8; 20],
 }
 
 pub async fn run(
@@ -54,26 +74,35 @@ pub async fn run(
     mut cmd_rx: mpsc::Receiver<AgentCommand>,
     event_tx: broadcast::Sender<AgentEvent>,
 ) -> Result<()> {
-    // Phase 1 — auth + lobby (one shot per session).
-    emit_stage(&event_tx, Stage::Authenticating);
     let auth = AuthClient::new(cfg.server.clone(), cfg.auth_port);
-    auth.ensure_account(&cfg.user, &cfg.password).await.ok();
-    let auth_session = auth
-        .login(&cfg.user, &cfg.password)
-        .await
-        .context("auth login")?;
     let cert_sha256 = auth.verifier.fingerprint_hex();
 
-    emit_stage(&event_tx, Stage::LobbyHandshake);
-    let lobby = LobbyClient::new(cfg.server.clone(), cfg.data_port, cfg.view_port);
-    let mut key3 = [0u8; 20];
-    for (i, b) in key3.iter_mut().enumerate() {
-        *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
-    }
-    let handoff = lobby
-        .handshake(&auth_session, cfg.char_id, &cfg.char_name, 0, key3)
-        .await
-        .context("lobby handshake")?;
+    // Phase 1 — auth + lobby. Skipped entirely when the caller has already
+    // run them (launcher path); needed for MCP / `Play` which only get
+    // raw credentials and a charid.
+    let (auth_session, handoff, key3) = match cfg.initial_state.clone() {
+        Some(state) => (state.auth, state.handoff, state.key3),
+        None => {
+            emit_stage(&event_tx, Stage::Authenticating);
+            auth.ensure_account(&cfg.user, &cfg.password).await.ok();
+            let auth_session = auth
+                .login(&cfg.user, &cfg.password)
+                .await
+                .context("auth login")?;
+
+            emit_stage(&event_tx, Stage::LobbyHandshake);
+            let lobby = LobbyClient::new(cfg.server.clone(), cfg.data_port, cfg.view_port);
+            let mut key3 = [0u8; 20];
+            for (i, b) in key3.iter_mut().enumerate() {
+                *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
+            }
+            let handoff = lobby
+                .handshake(&auth_session, cfg.char_id, &cfg.char_name, 0, key3)
+                .await
+                .context("lobby handshake")?;
+            (auth_session, handoff, key3)
+        }
+    };
 
     let lobby_ip = format!(
         "{}.{}.{}.{}",

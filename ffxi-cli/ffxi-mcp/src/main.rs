@@ -554,6 +554,7 @@ async fn main() -> Result<()> {
             .parse()
             .context("FFXI_CHAR_ID must be a u32")?,
         char_name: read_env("FFXI_CHAR")?,
+        initial_state: None,
     };
 
     let goal_path = match std::env::var("FFXI_MCP_GOAL_PATH") {
