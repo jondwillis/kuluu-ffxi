@@ -19,9 +19,13 @@ pub struct WorldEntity {
 #[derive(Component, Debug, Clone, Copy)]
 pub struct IsSelf;
 
-/// Marks a `Text2d` child that follows its parent and faces the camera.
+/// Marks a UI nameplate node that displays the name of a `WorldEntity`.
+/// Updated each frame by `nameplate::update_nameplates_system` to track the
+/// owning entity's screen-projected position.
 #[derive(Component, Debug, Clone, Copy)]
-pub struct Nameplate;
+pub struct Nameplate {
+    pub entity_id: u32,
+}
 
 /// Marks an HP bar / dot child of a `WorldEntity`. Stage 0d wires this up;
 /// the marker is here in scaffold so other systems can query for it.

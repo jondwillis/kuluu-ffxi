@@ -51,11 +51,38 @@ pub struct Vec3 {
     pub z: f32,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Position {
     pub pos: Vec3,
     /// 0..=255 mapping to 0°..360°, matches `GP_CLI_COMMAND_POS::dir`.
     pub heading: u8,
+    /// Current effective movement speed (server-set). FFXI's typical PC base
+    /// is 25 → 5 yalms/sec; modifiers (Bind/Quickening/etc.) scale this.
+    /// Source byte: `PosHead::speed` in the server `0x00D` packet. Not
+    /// populated from packets today — all writers leave it at the
+    /// [`Default`] of 25 — but the field is here so wire consumers
+    /// (relay/wasm/native viewer) can read it once the decoder threads it
+    /// through.
+    #[serde(default = "default_speed")]
+    pub speed: u8,
+    /// Unmodified base speed. Same caveat as `speed`.
+    #[serde(default = "default_speed")]
+    pub speed_base: u8,
+}
+
+fn default_speed() -> u8 {
+    25
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        Self {
+            pos: Vec3::default(),
+            heading: 0,
+            speed: default_speed(),
+            speed_base: default_speed(),
+        }
+    }
 }
 
 /// Compute (dx, dy) for "1 unit forward at heading h". FFXI heading is u8
@@ -915,6 +942,7 @@ mod tests {
             pos: Position {
                 pos: Vec3 { x: 1.0, y: 2.0, z: 3.0 },
                 heading: 64,
+                ..Position::default()
             },
         };
         let s = serde_json::to_string(&ev).unwrap();

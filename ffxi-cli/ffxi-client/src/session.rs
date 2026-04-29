@@ -498,7 +498,7 @@ async fn keepalive_loop(
                 match cmd {
                     None => break,
                     Some(AgentCommand::Move { x, y, z, heading }) => {
-                        self_pos = Position { pos: Vec3 { x, y, z }, heading };
+                        self_pos = Position { pos: Vec3 { x, y, z }, heading, ..self_pos };
                         let _ = event_tx.send(AgentEvent::PositionChanged { pos: self_pos });
                     }
                     Some(AgentCommand::StopMove) => { /* keepalive resends current pos */ }

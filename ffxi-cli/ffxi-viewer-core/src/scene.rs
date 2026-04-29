@@ -53,9 +53,17 @@ pub struct HpBar {
     pub owner_id: u32,
 }
 
-/// Cached entity mesh — single capsule shared by all spawned entities.
+/// Cached per-kind entity meshes. Distinct silhouettes give the operator a
+/// cheap visual differentiator before nameplates load. PC = tall slim
+/// capsule (humanoid); Mob = boxy cuboid; Pet = short capsule; everything
+/// else (NPC, Other) shares a "default" mid-sized capsule.
 #[derive(Resource)]
-pub struct EntityMesh(pub Handle<Mesh>);
+pub struct EntityMesh {
+    pub default: Handle<Mesh>,
+    pub pc: Handle<Mesh>,
+    pub mob: Handle<Mesh>,
+    pub pet: Handle<Mesh>,
+}
 
 /// HP bar mesh — a horizontal cuboid used for all HP indicators.
 #[derive(Resource)]
@@ -108,9 +116,16 @@ pub fn setup_world(
             ..default()
         }),
     });
-    commands.insert_resource(EntityMesh(
-        meshes.add(Capsule3d::new(0.5, 1.4)),
-    ));
+    commands.insert_resource(EntityMesh {
+        default: meshes.add(Capsule3d::new(0.5, 1.4)),
+        // PCs: noticeably taller and thinner than NPCs so player characters
+        // pop visually in the world.
+        pc: meshes.add(Capsule3d::new(0.35, 1.9)),
+        // Mobs: boxy. Distinct silhouette from anything humanoid.
+        mob: meshes.add(Cuboid::new(1.1, 1.1, 1.1)),
+        // Pets: small capsule, hugs the ground.
+        pet: meshes.add(Capsule3d::new(0.4, 0.6)),
+    });
     commands.insert_resource(HpBarMesh(
         meshes.add(Cuboid::new(1.0, 0.12, 0.12)),
     ));
@@ -195,7 +210,7 @@ pub fn sync_entities_system(
                             act_index: wire.act_index,
                             kind: wire.kind,
                         },
-                        Mesh3d(mesh.0.clone()),
+                        Mesh3d(pick_mesh(&mesh, wire.kind)),
                         MeshMaterial3d(mat),
                         Transform {
                             translation: world_pos,
@@ -221,6 +236,20 @@ pub fn sync_entities_system(
                         ChildOf(bevy_e),
                     ));
                 }
+
+                // Nameplate for any entity with a name. Skip empty/missing
+                // names (most untargetable scenery NPCs come through this
+                // way). Color matches the entity-kind palette so labels
+                // double as a kind indicator at a glance.
+                if let Some(name) = wire.name.as_deref().filter(|s| !s.is_empty()) {
+                    let label_color = nameplate_color(wire.kind);
+                    crate::nameplate::spawn_nameplate(
+                        &mut commands,
+                        wire.id,
+                        name,
+                        label_color,
+                    );
+                }
             }
         }
     }
@@ -245,7 +274,7 @@ pub fn sync_entities_system(
                         kind: EntityKind::Pc,
                     },
                     IsSelf,
-                    Mesh3d(mesh.0.clone()),
+                    Mesh3d(mesh.pc.clone()),
                     MeshMaterial3d(mats.self_pc.clone()),
                     Transform {
                         translation: self_pos,
@@ -255,6 +284,16 @@ pub fn sync_entities_system(
                 ))
                 .id();
             tracked.by_id.insert(self_id, bevy_e);
+
+            // Self nameplate uses the snapshot's char_name.
+            if let Some(name) = snap.char_name.as_deref().filter(|s| !s.is_empty()) {
+                crate::nameplate::spawn_nameplate(
+                    &mut commands,
+                    self_id,
+                    name,
+                    nameplate_color(EntityKind::Pc),
+                );
+            }
         }
     }
 
@@ -355,6 +394,27 @@ pub fn sync_aggro_system(
                 gizmos.line(sp, t.translation, Color::srgb(1.0, 0.15, 0.15));
             }
         }
+    }
+}
+
+fn pick_mesh(m: &EntityMesh, kind: EntityKind) -> Handle<Mesh> {
+    match kind {
+        EntityKind::Pc => m.pc.clone(),
+        EntityKind::Mob => m.mob.clone(),
+        EntityKind::Pet => m.pet.clone(),
+        EntityKind::Npc | EntityKind::Other => m.default.clone(),
+    }
+}
+
+/// Nameplate text color per entity kind. Matches the body-material palette
+/// roughly, brightened so the label is legible against the dark scene.
+fn nameplate_color(kind: EntityKind) -> Color {
+    match kind {
+        EntityKind::Pc => Color::srgb(0.55, 0.95, 1.0),
+        EntityKind::Npc => Color::srgb(1.0, 0.92, 0.55),
+        EntityKind::Mob => Color::srgb(1.0, 0.55, 0.55),
+        EntityKind::Pet => Color::srgb(0.55, 0.95, 0.65),
+        EntityKind::Other => Color::srgb(0.85, 0.85, 0.85),
     }
 }
 

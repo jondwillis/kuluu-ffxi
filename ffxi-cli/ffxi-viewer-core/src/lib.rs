@@ -19,11 +19,15 @@
 pub mod camera;
 pub mod components;
 pub mod hud;
+pub mod nameplate;
 pub mod scene;
 pub mod snapshot;
 pub mod source;
 
-pub use camera::{chase_camera_system, follow_self_system, spawn_camera, CameraFollow, OperatorCamera};
+pub use camera::{
+    chase_camera_system, heading_for_yaw, spawn_camera, yaw_for_heading, ChaseCamera,
+    OperatorCamera,
+};
 pub use components::{HpIndicator, IsSelf, Nameplate, WorldEntity};
 pub use hud::HudPlugin;
 pub use scene::{
@@ -65,7 +69,16 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<Target>()
             .add_systems(PreUpdate, ingest_system::<S>)
             .add_systems(Startup, (setup_world, spawn_camera))
-            .add_systems(Update, (sync_entities_system, chase_camera_system, sync_aggro_system).chain())
+            .add_systems(
+                Update,
+                (
+                    sync_entities_system,
+                    chase_camera_system,
+                    sync_aggro_system,
+                    nameplate::update_nameplates_system,
+                )
+                    .chain(),
+            )
             .add_plugins(HudPlugin);
     }
 }

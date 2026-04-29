@@ -28,7 +28,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol version. Bump on incompatible schema changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 added agent-observability fields to [`SceneSnapshot`]: `current_goal`,
+/// `last_reconnect`, `recent_decisions`, `producer_monotonic_ms`. Postcard
+/// is positional, so a v1 viewer cannot deserialize a v2 snapshot — the
+/// `Hello { protocol_version }` mismatch refusal already gates this.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Vec3 {
@@ -37,11 +42,27 @@ pub struct Vec3 {
     pub z: f32,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Position {
     pub pos: Vec3,
     /// 0..=255 mapping to 0°..360°. Mirrors `state::Position::heading`.
     pub heading: u8,
+    /// Current effective movement speed (server-set). FFXI PC base = 25 →
+    /// 5 yalms/sec; modifiers scale this. Mirrors `state::Position::speed`.
+    pub speed: u8,
+    /// Unmodified base speed.
+    pub speed_base: u8,
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        Self {
+            pos: Vec3::default(),
+            heading: 0,
+            speed: 25,
+            speed_base: 25,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -143,6 +164,55 @@ pub struct Diagnostics {
     pub map_server_addr: Option<String>,
 }
 
+/// Reactor goal mirror. Wire-side projection of
+/// `state::ReactorGoalSnapshot`. Variant set is identical; we re-declare
+/// here so the wire crate stays free of the producer-side state types.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ReactorGoal {
+    Idle,
+    Following { target_id: u32, distance: f32 },
+    Engaged { target_id: u32, attack_issued: bool },
+    Pathing {
+        x: f32,
+        y: f32,
+        z: f32,
+        waypoints_remaining: u32,
+    },
+    Banking { threshold: u8, mog_house_zoneline: u32 },
+}
+
+/// Last supervisor reconnect. `at_unix_ms` is wall-clock, since it crosses
+/// process boundaries (across the relay) and pairing two `Instant`s
+/// across processes is meaningless.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconnectInfo {
+    pub downtime_ms: u64,
+    pub at_unix_ms: u64,
+}
+
+/// One LLM-decision data point — a notification we fired toward the
+/// harness, or a tool the harness dispatched. Pairing the two surfaces
+/// the round-trip "thinking time" the operator sees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmDecision {
+    pub kind: LlmDecisionKind,
+    /// Microseconds for the in-process side of the call (notification
+    /// send or tool dispatch). Round-trip across paired entries is
+    /// computed at render time.
+    pub latency_us: u64,
+    /// Producer-process monotonic ms since process start. Only meaningful
+    /// against `SceneSnapshot::producer_monotonic_ms` from the same
+    /// process — viewers compute pulse-decay age as
+    /// `producer_now - decision.at_monotonic_ms`.
+    pub at_monotonic_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LlmDecisionKind {
+    NotificationFired { uri: String },
+    ToolDispatched { tool: String },
+}
+
 /// Full state at a point in time. Sent on connect, and (Stage 2.0) on every
 /// `state_rx.changed()` tick. Stage 2.1 may switch to delta-only with
 /// periodic snapshot resync.
@@ -158,6 +228,19 @@ pub struct SceneSnapshot {
     /// match `state::CHAT_HISTORY_CAP`.
     pub chat: Vec<ChatLine>,
     pub diagnostics: Diagnostics,
+    /// Active reactor goal at snapshot time. `None` when the supervisor
+    /// hasn't emitted a `ReactorGoalChanged` yet (fresh process).
+    pub current_goal: Option<ReactorGoal>,
+    /// Most recent supervisor reconnect, if any.
+    pub last_reconnect: Option<ReconnectInfo>,
+    /// LLM-decision log capped at the producer side
+    /// (`state::RECENT_DECISIONS_CAP = 64`). Oldest-first.
+    pub recent_decisions: Vec<LlmDecision>,
+    /// Producer-process monotonic ms at the moment this snapshot was
+    /// stamped. Paired with `LlmDecision::at_monotonic_ms` for pulse-
+    /// decay age. Defaults to 0 when the producer hasn't stamped (e.g.
+    /// in unit tests).
+    pub producer_monotonic_ms: u64,
 }
 
 /// Minimal patch between snapshots. Reserved for Stage 2.1; the Stage 2.0
@@ -240,6 +323,8 @@ mod tests {
             self_pos: Position {
                 pos: Vec3 { x: -10.5, y: 0.0, z: 42.25 },
                 heading: 64,
+                speed: 25,
+                speed_base: 25,
             },
             entities: vec![Entity {
                 id: 0x1701234,
@@ -266,6 +351,29 @@ mod tests {
                 last_server_packet_age_ms: Some(123),
                 map_server_addr: Some("127.0.0.1:54230".into()),
             },
+            current_goal: Some(ReactorGoal::Engaged {
+                target_id: 0x99,
+                attack_issued: true,
+            }),
+            last_reconnect: Some(ReconnectInfo {
+                downtime_ms: 1234,
+                at_unix_ms: 1_700_000_001_000,
+            }),
+            recent_decisions: vec![
+                LlmDecision {
+                    kind: LlmDecisionKind::NotificationFired {
+                        uri: "scene://current".into(),
+                    },
+                    latency_us: 412,
+                    at_monotonic_ms: 1000,
+                },
+                LlmDecision {
+                    kind: LlmDecisionKind::ToolDispatched { tool: "engage".into() },
+                    latency_us: 25_000,
+                    at_monotonic_ms: 1100,
+                },
+            ],
+            producer_monotonic_ms: 1_500,
         }
     }
 
@@ -281,6 +389,22 @@ mod tests {
                 assert_eq!(s.entities.len(), 1);
                 assert_eq!(s.entities[0].id, 0x1701234);
                 assert_eq!(s.chat[0].text, "hi");
+                // v2 fields survive roundtrip.
+                match s.current_goal {
+                    Some(ReactorGoal::Engaged { target_id, attack_issued }) => {
+                        assert_eq!(target_id, 0x99);
+                        assert!(attack_issued);
+                    }
+                    other => panic!("goal: {other:?}"),
+                }
+                let rc = s.last_reconnect.expect("last_reconnect");
+                assert_eq!(rc.downtime_ms, 1234);
+                assert_eq!(s.recent_decisions.len(), 2);
+                match &s.recent_decisions[1].kind {
+                    LlmDecisionKind::ToolDispatched { tool } => assert_eq!(tool, "engage"),
+                    other => panic!("decision: {other:?}"),
+                }
+                assert_eq!(s.producer_monotonic_ms, 1_500);
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -330,7 +454,9 @@ mod tests {
         assert!(s.contains("\"Hello\""), "shape: {s}");
         let back: Frame = serde_json::from_str(&s).unwrap();
         match back {
-            Frame::Hello { protocol_version } => assert_eq!(protocol_version, 1),
+            Frame::Hello { protocol_version } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION)
+            }
             other => panic!("wrong variant: {other:?}"),
         }
     }

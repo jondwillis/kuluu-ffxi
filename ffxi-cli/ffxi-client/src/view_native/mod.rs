@@ -25,7 +25,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::state::{AgentCommand, AgentEvent, SessionState};
 
 use self::bridge::NativeSource;
-use self::input::CommandTx;
+use self::input::{AutoRun, CommandTx};
 
 pub fn run(
     state_rx: watch::Receiver<SessionState>,
@@ -54,9 +54,14 @@ pub fn run(
     // 20 Hz movement dispatch — match the wire-side keepalive cadence used
     // by view3d's input.rs. Without this override, FixedUpdate runs at
     // Bevy's default 64 Hz, which floods the session with `Move` commands.
+    //
+    // `Target` is initialized by `ViewerCorePlugin`, so we don't init it
+    // here — the duplicate would shadow the one the scene system reads
+    // for highlight materials, breaking Tab targeting visuals.
     app.insert_resource(Time::<Fixed>::from_hz(20.0))
         .insert_resource(NativeSource::new(state_rx, event_rx))
         .insert_resource(CommandTx(cmd_tx))
+        .init_resource::<AutoRun>()
         .add_plugins(ViewerCorePlugin::<NativeSource>::default())
         .add_systems(Update, input::handle_input_system)
         .add_systems(FixedUpdate, input::dispatch_movement_system);
