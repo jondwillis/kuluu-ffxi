@@ -812,8 +812,15 @@ async fn main() -> Result<()> {
     // while the MCP handshake is still in progress.
     let notifier_event_rx = event_tx.subscribe();
 
-    // Build the MCP server and serve over stdio.
-    let server = FfxiServer::new(cmd_tx, state, goal_store);
+    // Build the MCP server and serve over stdio. Wire the same event_tx
+    // for decisions so `LlmDecision::ToolDispatched` and
+    // `LlmDecision::NotificationFired` fold into `state.recent_decisions`
+    // alongside session events. The notifier doesn't fan these out to MCP
+    // clients (uris_for_event returns empty for LlmDecision), so there's
+    // no recursive notification loop. A future combined-binary dashboard
+    // can subscribe to the same broadcast and render the chrome badge
+    // without changing this wiring.
+    let server = FfxiServer::new(cmd_tx, state, goal_store).with_decision_tx(event_tx.clone());
     let running = serve_server(server, stdio())
         .await
         .context("serve MCP server")?;
@@ -821,7 +828,11 @@ async fn main() -> Result<()> {
     // Now that the server is running we can grab its peer and start
     // forwarding broadcast events as ResourceUpdated notifications.
     let peer = running.peer().clone();
-    let notifier_handle = tokio::spawn(run_notifier(peer, notifier_event_rx, None));
+    let notifier_handle = tokio::spawn(run_notifier(
+        peer,
+        notifier_event_rx,
+        Some(event_tx.clone()),
+    ));
 
     running.waiting().await.context("MCP server crashed")?;
 
