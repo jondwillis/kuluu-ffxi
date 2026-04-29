@@ -8,8 +8,10 @@ pub use glam;
 use glam::Vec3;
 
 pub mod grid;
+pub mod zone_names;
 
 pub use grid::{GridNav, NavError};
+pub use zone_names::zone_name;
 
 /// Trait implemented by any navigable representation of a zone.
 ///

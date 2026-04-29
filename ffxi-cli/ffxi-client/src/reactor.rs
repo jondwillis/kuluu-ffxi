@@ -654,6 +654,12 @@ fn mk_move(pos: Vec3, heading: u8) -> AgentCommand {
 /// here means we only resolve the numbered subset, which is fine for
 /// the zones we care about right now (and `FFXI_NAVMESH_DIR` lets an
 /// operator point elsewhere if they have a name-keyed mirror).
+/// Find the on-disk Detour `.nav` for a zone. LSB ships the bulk of
+/// these as zone-name-keyed (`Rabao.nav`, `West_Sarutabaruta.nav`); a
+/// handful of legacy zones use numeric (`133.nav`). We try the name
+/// first when known (covers most of the table), then fall back to
+/// `<zone_id>.nav` (covers the legacy three). Unknown zone ids only
+/// get the numeric attempt — we don't synthesize a name from `unknown`.
 fn detour_navmesh_path(zone_id: u16) -> Option<PathBuf> {
     let base = if let Ok(custom) = std::env::var("FFXI_NAVMESH_DIR") {
         PathBuf::from(custom)
@@ -661,7 +667,20 @@ fn detour_navmesh_path(zone_id: u16) -> Option<PathBuf> {
         let cwd = std::env::current_dir().ok()?;
         find_navmesh_dir(&cwd)?
     };
-    Some(base.join(format!("{zone_id}.nav")))
+    if let Some(name) = ffxi_nav::zone_name(zone_id) {
+        let by_name = base.join(format!("{name}.nav"));
+        if by_name.exists() {
+            return Some(by_name);
+        }
+    }
+    let by_id = base.join(format!("{zone_id}.nav"));
+    if by_id.exists() {
+        return Some(by_id);
+    }
+    // Return the name-or-id-shaped path the caller would have built
+    // anyway, so the warn-log surfaces the right candidate even when
+    // the file isn't there yet (operators may be hand-installing).
+    Some(by_id)
 }
 
 /// Walk up from `start` looking for either `server/navmeshes/` or
@@ -712,13 +731,17 @@ fn heightmap_png_path(zone_id: u16) -> Option<PathBuf> {
 fn default_load_navmesh(zone_id: u16) -> Option<GridNav> {
     if let Some(detour_path) = detour_navmesh_path(zone_id) {
         if detour_path.exists() {
-            // Stage 10c will implement the Detour reader. Until then,
-            // existence-check + log so operators can see we found the
-            // file but don't yet know how to parse it.
+            // The Detour binary format is documented at
+            // `ffxi-nav/docs/detour_format.md`. Existence-check + warn so
+            // operators can see we found the file but don't yet know how
+            // to parse it; the PNG fallback below handles the common
+            // farming zones.
+            let name = ffxi_nav::zone_name(zone_id).unwrap_or("?");
             tracing::warn!(
                 zone_id,
+                zone_name = %name,
                 path = %detour_path.display(),
-                "Detour .nav file present but loader not yet implemented (Stage 10c) — falling through to PNG heightmap or straight-line"
+                "found Detour .nav but Rust reader is not implemented; falling through to PNG heightmap or straight-line"
             );
         }
     }
