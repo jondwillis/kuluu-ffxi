@@ -131,6 +131,49 @@ Then:
 The inspector is the fastest way to confirm tools/resources surface
 correctly without involving an LLM.
 
+## 5b. Watching the agent — native viewer HUD
+
+The `ffxi-client` binary opens a Bevy-windowed 3D scene of the FFXI world
+plus an operator HUD that mirrors what the harness is currently driving.
+Useful when an LLM is on the wheel and you want a glanceable picture of
+what it's deciding.
+
+```bash
+cargo run -p ffxi-client --bin ffxi-client -- native
+```
+
+(Direct mode — pass `--user`, `--password`, `--char` to skip the launcher.
+Without them, the windowed launcher prompts.)
+
+What's painted:
+
+| Region | What it shows | When it changes |
+|---|---|---|
+| Top stage bar | Auth/zoning stage, character, zone | Stage transitions |
+| Top-left **agent HUD** | Current reactor goal, color-coded state pill, last-reconnect age | Every `ReactorGoalChanged`; recon clock counts up continuously |
+| Top-right **LLM badge** | Pulse dot, latency sparkline (last 32), p50/p99, paired/solo count | Every `LlmDecision` (notification fired or tool dispatched) |
+| Right-side roster | Party HP/MP/TP per member | Party packets (`0x0DD` / `0x0DF`) |
+| Bottom-left chat | Recent chat lines | Every `ChatLine` |
+
+Reading the LLM badge:
+
+* **Cyan ◉ (bright)** — the harness dispatched a tool within the last
+  200 ms in response to a notification we fired. Healthy round-trip.
+* **Cyan ●** — same as above, fading over ~2 s.
+* **White ●** — tool dispatched without a preceding notification. The
+  LLM is acting on its own initiative (e.g. periodic re-poll), not
+  reacting to a `notifications/resources/updated`.
+* **Gray ●** — no decision in the last 600 ms, log is settling.
+* **Dark ●/○** — log empty or stale.
+
+The sparkline is window-max scaled to the visible 32-sample slice, so a
+single big outlier compresses the rest. Read p50/p99 for absolute
+numbers.
+
+If the agent HUD shows `[IDLE]` when you expect it to be working, the
+LLM has either not issued a goal yet or sent `cancel`. The reactor
+still keepalives but won't auto-attack/follow/path.
+
 ## 6. Stage 7 verification scenarios
 
 ### 6a. Autonomous goal — 60-minute farming loop
