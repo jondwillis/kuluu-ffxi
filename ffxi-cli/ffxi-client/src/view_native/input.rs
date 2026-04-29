@@ -9,8 +9,12 @@
 //!   Q/E       strafe left/right perpendicular to current player heading.
 //!             No camera-snap — strafe respects whatever direction A/D
 //!             rotated the player to.
-//!   A/D       rotate player heading only (no strafe). Camera is unaffected.
-//!   ←/→       rotate camera yaw only (player unaffected — until W/S snap).
+//!   A/D       rotate player heading AND camera yaw lock-step. Camera
+//!             stays behind player when turning in place, AND A/D
+//!             actually steers the path during W-held movement (yaw
+//!             moves with heading, so snap is a no-op).
+//!   ←/→       rotate camera yaw ONLY (free-look). Player heading
+//!             unchanged until W/S press, which snaps it to camera-forward.
 //!   ↑/↓       camera pitch (↑ raises camera/more overhead, ↓ lowers it).
 //!   R         toggle autorun while forward is currently held.
 //!   Tab       cycle target by 2D distance from self.
@@ -209,9 +213,13 @@ pub fn dispatch_movement_system(
     //      inverse heading from camera" rule). This lets W/S walk in the
     //      direction the camera looks regardless of where the player was
     //      previously facing — FFXI third-person default.
-    //   2. A/D rotation is applied AFTER the snap, so during W+A you walk
-    //      in a curving path away from camera-forward. During pure A/D
-    //      (stationary), the snap is skipped so A/D rotates in place.
+    //   2. A/D rotation is applied AFTER the snap. Crucially, A/D rotates
+    //      BOTH player heading AND camera yaw lock-step — so the camera
+    //      stays fixed behind the player while turning in place, AND
+    //      A/D actually steers the path during W-held movement (because
+    //      yaw moved with heading, the next tick's snap is a no-op).
+    //      ←/→ rotates ONLY camera yaw — that's the "free look" path,
+    //      and W/S's snap is what makes the player follow camera direction.
     let mut heading = self_pos.heading;
     if forward != 0 {
         heading = heading_for_yaw(chase.yaw);
@@ -219,6 +227,12 @@ pub fn dispatch_movement_system(
     if player_rotate != 0 {
         let delta = (ROTATE_STEP_HELD as i32 * player_rotate).rem_euclid(256) as u8;
         heading = heading.wrapping_add(delta);
+        // Lock-step camera rotation: yaw = -heading_angle, so a +Δh in
+        // heading u8 → -Δh·τ/256 in yaw radians.
+        chase.yaw -= player_rotate as f32
+            * ROTATE_STEP_HELD as f32
+            * std::f32::consts::TAU
+            / 256.0;
     }
 
     // Step magnitude scales with server-driven speed. `speed=0` (entity hasn't
