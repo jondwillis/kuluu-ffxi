@@ -231,3 +231,218 @@ pub fn decision_kind_to_wire(k: &LlmDecisionKind) -> wire::LlmDecisionKind {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+
+    #[test]
+    fn goal_to_wire_covers_all_variants() {
+        let cases = vec![
+            (
+                ReactorGoalSnapshot::Idle,
+                matches_idle as fn(&wire::ReactorGoal) -> bool,
+            ),
+            (
+                ReactorGoalSnapshot::Following { target_id: 0x42, distance: 3.0 },
+                matches_following,
+            ),
+            (
+                ReactorGoalSnapshot::Engaged { target_id: 0x99, attack_issued: true },
+                matches_engaged,
+            ),
+            (
+                ReactorGoalSnapshot::Pathing {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                    waypoints_remaining: 4,
+                },
+                matches_pathing,
+            ),
+            (
+                ReactorGoalSnapshot::Banking {
+                    threshold: 60,
+                    mog_house_zoneline: 0xDEAD,
+                },
+                matches_banking,
+            ),
+        ];
+        for (g, check) in cases {
+            let w = goal_to_wire(&g);
+            assert!(check(&w), "wire form of {g:?} failed shape-check ({w:?})");
+        }
+    }
+
+    fn matches_idle(w: &wire::ReactorGoal) -> bool {
+        matches!(w, wire::ReactorGoal::Idle)
+    }
+    fn matches_following(w: &wire::ReactorGoal) -> bool {
+        matches!(w, wire::ReactorGoal::Following { target_id: 0x42, distance } if (distance - 3.0).abs() < f32::EPSILON)
+    }
+    fn matches_engaged(w: &wire::ReactorGoal) -> bool {
+        matches!(
+            w,
+            wire::ReactorGoal::Engaged { target_id: 0x99, attack_issued: true }
+        )
+    }
+    fn matches_pathing(w: &wire::ReactorGoal) -> bool {
+        match w {
+            wire::ReactorGoal::Pathing { x, y, z, waypoints_remaining } => {
+                (*x - 1.0).abs() < f32::EPSILON
+                    && (*y - 2.0).abs() < f32::EPSILON
+                    && (*z - 3.0).abs() < f32::EPSILON
+                    && *waypoints_remaining == 4
+            }
+            _ => false,
+        }
+    }
+    fn matches_banking(w: &wire::ReactorGoal) -> bool {
+        matches!(
+            w,
+            wire::ReactorGoal::Banking { threshold: 60, mog_house_zoneline: 0xDEAD }
+        )
+    }
+
+    #[test]
+    fn reconnect_to_wire_passes_through() {
+        let r = ReconnectInfo { downtime_ms: 1234, at_unix_ms: 1_700_000_001_000 };
+        let w = reconnect_to_wire(&r);
+        assert_eq!(w.downtime_ms, 1234);
+        assert_eq!(w.at_unix_ms, 1_700_000_001_000);
+    }
+
+    #[test]
+    fn decision_to_wire_covers_both_kinds() {
+        let nf = LlmDecision {
+            kind: LlmDecisionKind::NotificationFired { uri: "scene://current".into() },
+            latency_us: 412,
+            at_monotonic_ms: 1000,
+        };
+        let w = decision_to_wire(&nf);
+        assert_eq!(w.latency_us, 412);
+        assert_eq!(w.at_monotonic_ms, 1000);
+        match w.kind {
+            wire::LlmDecisionKind::NotificationFired { uri } => {
+                assert_eq!(uri, "scene://current");
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+
+        let td = LlmDecision {
+            kind: LlmDecisionKind::ToolDispatched { tool: "engage".into() },
+            latency_us: 25_000,
+            at_monotonic_ms: 1_100,
+        };
+        match decision_to_wire(&td).kind {
+            wire::LlmDecisionKind::ToolDispatched { tool } => assert_eq!(tool, "engage"),
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn state_to_snapshot_populates_v2_fields() {
+        // SessionState::default + manual writes to the four observability
+        // fields. The translator must surface every one of them.
+        let mut s = SessionState::default();
+        s.character = Some("Sylvie".into());
+        s.zone_id = Some(230);
+        s.current_goal = Some(ReactorGoalSnapshot::Engaged {
+            target_id: 0xCAFE,
+            attack_issued: true,
+        });
+        s.last_reconnect = Some(ReconnectInfo {
+            downtime_ms: 800,
+            at_unix_ms: 1_700_000_002_000,
+        });
+        s.recent_decisions = VecDeque::from(vec![
+            LlmDecision {
+                kind: LlmDecisionKind::NotificationFired { uri: "scene://current".into() },
+                latency_us: 200,
+                at_monotonic_ms: 100,
+            },
+            LlmDecision {
+                kind: LlmDecisionKind::ToolDispatched { tool: "engage".into() },
+                latency_us: 25_000,
+                at_monotonic_ms: 200,
+            },
+        ]);
+
+        let snap = state_to_snapshot(&s);
+        assert_eq!(snap.char_name.as_deref(), Some("Sylvie"));
+        assert_eq!(snap.zone_id, Some(230));
+
+        // Goal mirror.
+        match snap.current_goal {
+            Some(wire::ReactorGoal::Engaged { target_id, attack_issued }) => {
+                assert_eq!(target_id, 0xCAFE);
+                assert!(attack_issued);
+            }
+            other => panic!("goal: {other:?}"),
+        }
+
+        // Reconnect mirror.
+        let rc = snap.last_reconnect.expect("last_reconnect");
+        assert_eq!(rc.downtime_ms, 800);
+        assert_eq!(rc.at_unix_ms, 1_700_000_002_000);
+
+        // Decisions vec preserves order and pairing-relevant kind variants.
+        assert_eq!(snap.recent_decisions.len(), 2);
+        assert!(matches!(
+            &snap.recent_decisions[0].kind,
+            wire::LlmDecisionKind::NotificationFired { uri } if uri == "scene://current"
+        ));
+        assert!(matches!(
+            &snap.recent_decisions[1].kind,
+            wire::LlmDecisionKind::ToolDispatched { tool } if tool == "engage"
+        ));
+
+        // producer_monotonic_ms is stamped from the live process clock.
+        // The first call to `process_monotonic_ms()` initializes the
+        // `OnceLock<Instant>` anchor, so the value can legitimately be 0
+        // (zero ms elapsed since anchor set on this very call). We can't
+        // meaningfully cross-compare with the hand-fabricated decision
+        // timestamps either — those are arbitrary fixture values, not
+        // anchored to the same clock.
+        //
+        // Monotonicity is what the badge clock actually relies on:
+        // a snapshot taken later must have a >= producer_monotonic_ms.
+        let snap2 = state_to_snapshot(&s);
+        assert!(
+            snap2.producer_monotonic_ms >= snap.producer_monotonic_ms,
+            "producer_monotonic_ms must be monotonic across snapshots; \
+             got {} then {}",
+            snap.producer_monotonic_ms,
+            snap2.producer_monotonic_ms,
+        );
+    }
+
+    #[test]
+    fn state_to_snapshot_v2_fields_default_empty() {
+        // Default SessionState — no goal, no reconnect, empty decisions.
+        // The translator should write `None` / empty Vec, not panic or
+        // fabricate data.
+        let s = SessionState::default();
+        let snap = state_to_snapshot(&s);
+        assert!(snap.current_goal.is_none());
+        assert!(snap.last_reconnect.is_none());
+        assert!(snap.recent_decisions.is_empty());
+
+        // producer_monotonic_ms is still stamped from the live process
+        // clock. We can't assert `> 0` — `process_monotonic_ms()` may
+        // legitimately return 0 if this test is the first caller (the
+        // OnceLock<Instant> anchor sets to `Instant::now()` on that
+        // same call). Assert the real contract instead: monotonicity
+        // across consecutive snapshots, which the badge clock relies on
+        // to extrapolate `producer_now_ms` between fresh snapshots.
+        let snap2 = state_to_snapshot(&s);
+        assert!(
+            snap2.producer_monotonic_ms >= snap.producer_monotonic_ms,
+            "monotonic violation: {} then {}",
+            snap.producer_monotonic_ms,
+            snap2.producer_monotonic_ms,
+        );
+    }
+}
