@@ -131,6 +131,43 @@ Then:
 The inspector is the fastest way to confirm tools/resources surface
 correctly without involving an LLM.
 
+### 5a. Harness compatibility matrix
+
+All supported harnesses speak MCP over stdio with the same `.mcp.json`.
+None require special transport flags or wrapper scripts — the binary
+target is identical regardless of who's driving.
+
+| Harness         | Config file        | Transport | Env interpolation | Auto-discovery | Notifications |
+|-----------------|--------------------|-----------|-------------------|----------------|---------------|
+| Claude Code     | `.mcp.json`        | stdio     | `${VAR}`          | yes (CWD)      | yes           |
+| OpenCode        | `.mcp.json`        | stdio     | `${VAR}`          | yes (CWD)      | yes           |
+| pi.dev          | `.mcp.json`        | stdio     | `${VAR}`          | yes (CWD)      | yes           |
+| MCP Inspector   | n/a (CLI args)     | stdio     | shell             | n/a            | yes           |
+
+Cross-harness invariants:
+
+- Tool surface — 13 tools, same shape (`follow`, `engage`, `path_to`,
+  `cancel`, `chat`, `tell`, `request_zone_change`, `end_event`,
+  `snapshot`, `cast`, `weaponskill`, `job_ability`, `use_item`,
+  `bank_when_full`, `disconnect`).
+- Resource surface — 5 resources (`scene://current`, `party://members`,
+  `diagnostics://session`, `goal://current`, `inventory://current`).
+- Notifications — `notifications/resources/updated` fires on the
+  `AgentEvent`s gated in `ffxi-mcp/src/main.rs::uris_for_event`.
+- Working directory — start the harness from `ffxi-cli/` so the
+  `.mcp.json` (and `cargo run -p ffxi-mcp`) resolve correctly.
+
+Per-harness gotchas that have been observed:
+
+- **OpenCode** may surface env-interpolation errors if your shell
+  doesn't export the referenced variables before the harness launches.
+  Confirm with `env | grep FFXI_` before starting.
+- **MCP Inspector** doesn't auto-discover `.mcp.json`; pass the binary
+  path directly, and set env vars in your shell first.
+- **All three** assume one MCP server per harness — running two
+  harnesses against the same Phoenix container with the same `FFXI_USER`
+  produces "char already logged in" errors from the lobby.
+
 ## 5b. Watching the agent — native viewer HUD
 
 The `ffxi-client` binary opens a Bevy-windowed 3D scene of the FFXI world
