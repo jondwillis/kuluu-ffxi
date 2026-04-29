@@ -212,6 +212,38 @@ impl LobbyClient {
         handle.select(char_id, char_name, key3).await
     }
 
+    /// Open lobby, resolve char_name to char_id from the roster, then select.
+    /// Returns the resolved char_id alongside the handoff so the caller
+    /// (session::run) can store it for the map bootstrap.
+    pub async fn handshake_by_name(
+        &self,
+        auth: &AuthSession,
+        char_name: &str,
+        key3: [u8; 20],
+    ) -> Result<(u32, MapHandoff)> {
+        let handle = self.open(auth).await?;
+        if handle.chars.is_empty() {
+            bail!("no characters found for account");
+        }
+        let slot = handle
+            .chars()
+            .iter()
+            .find(|c| c.name == char_name)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no character named '{char_name}' on account (have: {:?})",
+                    handle
+                        .chars()
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                )
+            })?;
+        let handoff = handle.select(slot.char_id, &slot.name, key3).await?;
+        Ok((slot.char_id, handoff))
+    }
+
     pub async fn create_character(
         &self,
         auth: &AuthSession,

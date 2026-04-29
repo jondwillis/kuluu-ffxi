@@ -16,6 +16,8 @@
 pub mod bridge;
 pub mod input;
 pub mod launcher_ui;
+pub mod slash_commands;
+pub mod text_input;
 
 use anyhow::Result;
 use bevy::log::LogPlugin;
@@ -64,7 +66,10 @@ pub fn run(
         .insert_resource(CommandTx(cmd_tx))
         .init_resource::<AutoRun>()
         .add_plugins(ViewerCorePlugin::<NativeSource>::default())
-        .add_systems(Update, input::handle_input_system)
+        .add_systems(
+            Update,
+            (input::handle_input_system, text_input::text_input_system),
+        )
         .add_systems(FixedUpdate, input::dispatch_movement_system);
 
     app.run();

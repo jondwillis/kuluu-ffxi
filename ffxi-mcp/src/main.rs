@@ -26,7 +26,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
     handler::server::wrapper::Parameters,
     model::{
         Annotated, CallToolResult, Content, ListResourcesResult, PaginatedRequestParams,
@@ -35,13 +34,14 @@ use rmcp::{
         ServerCapabilities, ServerInfo, SubscribeRequestParams, ToolsCapability,
         UnsubscribeRequestParams,
     },
-    service::{Peer, RequestContext, RoleServer, serve_server},
+    service::{serve_server, Peer, RequestContext, RoleServer},
     tool, tool_handler, tool_router,
     transport::io::stdio,
+    ErrorData as McpError, ServerHandler,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 
 use ffxi_client::{
     goal_store::GoalStore,
@@ -166,6 +166,12 @@ struct UseItemParams {
     target_index: u16,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReadResourceParams {
+    /// Resource URI to read (e.g. `scene://current`, `party://members`).
+    uri: String,
+}
+
 // ----- Server state -------------------------------------------------
 
 #[derive(Clone)]
@@ -223,12 +229,7 @@ impl FfxiServer {
             )),
         };
         let elapsed_us = started.elapsed().as_micros() as u64;
-        tracing::debug!(
-            kind,
-            elapsed_us,
-            ok = result.is_ok(),
-            "mcp.tool_dispatch"
-        );
+        tracing::debug!(kind, elapsed_us, ok = result.is_ok(), "mcp.tool_dispatch");
         // Emit a ToolDispatched decision regardless of dispatch outcome —
         // a closed channel still occupied the LLM's attention. Lossy by
         // design (try_send): if the broadcast is full or has no live
@@ -438,6 +439,32 @@ impl FfxiServer {
     async fn disconnect(&self) -> Result<CallToolResult, McpError> {
         self.send(AgentCommand::Disconnect).await
     }
+
+    /// Fallback for MCP clients that do not support the `resources`
+    /// capability. Mirrors `resources/read` — returns the same content
+    /// as a tool result so clients without resource support can still
+    /// read `scene://current`, `party://members`, etc.
+    #[tool(
+        description = "Fallback for clients that do not support MCP `resources/read`. Read a resource by URI: `scene://current`, `party://members`, `diagnostics://session`, `goal://current`, `inventory://current`."
+    )]
+    async fn read_resource(
+        &self,
+        Parameters(p): Parameters<ReadResourceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let uri = p.uri.as_str();
+        let started = std::time::Instant::now();
+        let state = self.state.read().await;
+        let content = read_resource(&state, &*self.goal_store, uri)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        tracing::debug!(
+            uri,
+            elapsed_us,
+            "mcp.tool_read_resource"
+        );
+        Ok(CallToolResult::success(vec![Content::text(content)]))
+    }
 }
 
 #[tool_handler]
@@ -454,12 +481,15 @@ impl ServerHandler for FfxiServer {
         });
 
         let mut info = ServerInfo::default();
-        info.protocol_version = ProtocolVersion::V_2025_03_26;
+        info.protocol_version = ProtocolVersion::V_2025_11_25;
         info.capabilities = caps;
-        info.instructions = Some(
-            "FFXI agent harness. Use `set_goal`-style tools (follow, engage, path_to) \
-             not raw moves — the reactor handles per-tick motion. Read `scene://current` \
-             for a compact prose summary; subscribe to scene://current for wake-on-event."
+       info.instructions = Some(
+            "FFXI agent harness. Use tools (follow, engage, path_to, …) for \
+              actions. Read resources for state: `scene://current` (compact prose \
+              summary), `party://members`, `diagnostics://session`, `goal://current`, \
+              `inventory://current`. Clients that do not support the MCP `resources` \
+              capability should use the `read_resource { uri }` tool instead — it \
+              returns identical content."
                 .into(),
         );
         info
@@ -474,7 +504,10 @@ impl ServerHandler for FfxiServer {
             let raw = RawResource::new(uri, name)
                 .with_description(desc)
                 .with_mime_type(mime);
-            Annotated { raw, annotations: None }
+            Annotated {
+                raw,
+                annotations: None,
+            }
         };
         let mut result = ListResourcesResult::default();
         result.resources = vec![
@@ -535,78 +568,66 @@ impl ServerHandler for FfxiServer {
         Ok(())
     }
 
-    async fn read_resource(
+   async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         let uri = request.uri.as_str();
-        // Event (not span) because EnteredSpan is `!Send` and we await on
-        // self.state.read().await below; the elapsed_us field on the trailing
-        // event captures the same latency information.
         let started = std::time::Instant::now();
         let state = self.state.read().await;
-        let contents = match uri {
-            "scene://current" => {
-                let summary = SceneSummary::from_state(&state);
-                ResourceContents::text(summary.text, uri)
-            }
-            "party://members" => {
-                let body = serde_json::to_string_pretty(&state.party)
-                    .map_err(|e| McpError::internal_error(format!("serialize party: {e}"), None))?;
-                ResourceContents::text(body, uri)
-            }
-            "diagnostics://session" => {
-                let body = serde_json::to_string_pretty(&state.diagnostics).map_err(|e| {
-                    McpError::internal_error(format!("serialize diagnostics: {e}"), None)
-                })?;
-                ResourceContents::text(body, uri)
-            }
-            "inventory://current" => {
-                let body = serde_json::to_string_pretty(&state.inventory).map_err(|e| {
-                    McpError::internal_error(format!("serialize inventory: {e}"), None)
-                })?;
-                ResourceContents::text(body, uri)
-            }
-            "goal://current" => {
-                drop(state);
-                let store = self.goal_store.lock().await;
-                let body = match store.load() {
-                    // Active goal: return the persisted command + timestamp.
-                    Ok(Some(g)) => serde_json::to_string_pretty(&serde_json::json!({
-                        "goal": "active",
-                        "command": g.command,
-                        "set_at_unix": g.set_at_unix,
-                    }))
-                    .map_err(|e| {
-                        McpError::internal_error(format!("serialize goal: {e}"), None)
-                    })?,
-                    // No active goal — explicit "idle" sentinel beats raw `null`.
-                    // Indistinguishable on disk between "never set" and "canceled";
-                    // both render the same to the LLM, which is the intended UX.
-                    Ok(None) => "{\n  \"goal\": \"idle\"\n}".to_string(),
-                    Err(e) => {
-                        return Err(McpError::internal_error(
-                            format!("read goal store: {e}"),
-                            None,
-                        ));
-                    }
-                };
-                ResourceContents::text(body, uri)
-            }
-            other => {
-                return Err(McpError::resource_not_found(
-                    format!("unknown resource: {other}"),
-                    None,
-                ));
-            }
-        };
+        let body = read_resource(&state, &*self.goal_store, uri)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
+        let elapsed_us = started.elapsed().as_micros() as u64;
         tracing::debug!(
             uri,
-            elapsed_us = started.elapsed().as_micros() as u64,
+            elapsed_us,
             "mcp.resource_read"
         );
-        Ok(ReadResourceResult::new(vec![contents]))
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(body, uri)]))
+    }
+}
+
+/// Shared helper: read a resource by URI from the current state.
+/// Used by both `ServerHandler::read_resource` (MCP protocol) and
+/// the `read_resource` tool (fallback for clients without resource
+/// support).
+async fn read_resource(
+    state: &SessionState,
+    goal_store: &tokio::sync::Mutex<GoalStore>,
+    uri: &str,
+) -> Result<String, String> {
+    match uri {
+        "scene://current" => {
+            let summary = SceneSummary::from_state(state);
+            Ok(summary.text)
+        }
+        "party://members" => {
+            serde_json::to_string_pretty(&state.party).map_err(|e| format!("serialize party: {e}"))
+        }
+        "diagnostics://session" => {
+            serde_json::to_string_pretty(&state.diagnostics)
+                .map_err(|e| format!("serialize diagnostics: {e}"))
+        }
+        "inventory://current" => {
+            serde_json::to_string_pretty(&state.inventory)
+                .map_err(|e| format!("serialize inventory: {e}"))
+        }
+        "goal://current" => {
+            let store = goal_store.lock().await;
+            match store.load() {
+                Ok(Some(g)) => serde_json::to_string_pretty(&serde_json::json!({
+                    "goal": "active",
+                    "command": g.command,
+                    "set_at_unix": g.set_at_unix,
+                }))
+                .map_err(|e| format!("serialize goal: {e}")),
+                Ok(None) => Ok("{\n  \"goal\": \"idle\"\n}".to_string()),
+                Err(e) => Err(format!("read goal store: {e}")),
+            }
+        }
+        other => Err(format!("unknown resource: {other}")),
     }
 }
 
@@ -672,9 +693,7 @@ async fn run_notifier(
             Ok(ev) => {
                 for uri in uris_for_event(&ev) {
                     let started = std::time::Instant::now();
-                    let params = ResourceUpdatedNotificationParam {
-                        uri: (*uri).into(),
-                    };
+                    let params = ResourceUpdatedNotificationParam { uri: (*uri).into() };
                     let send_result = peer.notify_resource_updated(params).await;
                     let latency_us = started.elapsed().as_micros() as u64;
                     if let Err(e) = send_result {
@@ -718,9 +737,11 @@ fn uris_for_event(ev: &AgentEvent) -> &'static [&'static str] {
         | AgentEvent::SceneSummary { .. } => &["scene://current"],
 
         // Zone changes invalidate scene + party + diagnostics.
-        AgentEvent::ZoneChanged { .. } => {
-            &["scene://current", "party://members", "diagnostics://session"]
-        }
+        AgentEvent::ZoneChanged { .. } => &[
+            "scene://current",
+            "party://members",
+            "diagnostics://session",
+        ],
 
         // Party-roster changes touch party and (incidentally) scene's
         // party-size summary.
@@ -764,6 +785,17 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    let char_id_env = std::env::var("FFXI_CHAR_ID").ok();
+    let char_name_env = std::env::var("FFXI_CHAR").ok();
+    let char_selection = match (char_id_env, char_name_env) {
+        (Some(id_str), _) => {
+            let id = id_str.parse::<u32>().context("FFXI_CHAR_ID must be a u32")?;
+            session::CharSelection::Id(id)
+        }
+        (None, Some(name)) => session::CharSelection::Name(name),
+        (None, None) => anyhow::bail!("set either FFXI_CHAR_ID or FFXI_CHAR in .env"),
+    };
+
     let cfg = session::Config {
         server: read_env("FFXI_SERVER").unwrap_or_else(|_| "127.0.0.1".into()),
         map_host_override: std::env::var("FFXI_MAP_HOST_OVERRIDE").ok(),
@@ -772,10 +804,7 @@ async fn main() -> Result<()> {
         view_port: parse_port("FFXI_VIEW_PORT", 54001)?,
         user: read_env("FFXI_USER")?,
         password: read_env("FFXI_PASS")?,
-        char_id: read_env("FFXI_CHAR_ID")?
-            .parse()
-            .context("FFXI_CHAR_ID must be a u32")?,
-        char_name: read_env("FFXI_CHAR")?,
+        char_selection,
         initial_state: None,
     };
 
@@ -798,9 +827,7 @@ async fn main() -> Result<()> {
     let reactor_cfg = ReactorConfig::default();
     let event_tx_for_sup = event_tx.clone();
     let supervisor_handle = tokio::spawn(async move {
-        if let Err(e) =
-            supervisor::run(cfg, cmd_rx, event_tx_for_sup, sup_cfg, reactor_cfg).await
-        {
+        if let Err(e) = supervisor::run(cfg, cmd_rx, event_tx_for_sup, sup_cfg, reactor_cfg).await {
             tracing::error!(error = %e, "supervisor exited with error");
         }
     });
@@ -923,7 +950,11 @@ mod tests {
         };
         assert_eq!(
             uris_for_event(&ev),
-            &["scene://current", "party://members", "diagnostics://session"]
+            &[
+                "scene://current",
+                "party://members",
+                "diagnostics://session"
+            ]
         );
     }
 
@@ -954,7 +985,9 @@ mod tests {
     #[test]
     fn stage_and_diagnostics_only_invalidate_diagnostics() {
         assert_eq!(
-            uris_for_event(&AgentEvent::StageChanged { stage: Stage::InZone }),
+            uris_for_event(&AgentEvent::StageChanged {
+                stage: Stage::InZone
+            }),
             &["diagnostics://session"]
         );
         assert_eq!(
@@ -998,6 +1031,8 @@ mod tests {
                 pos: Position {
                     pos: Vec3::default(),
                     heading: 0,
+                    speed: 0,
+                    speed_base: 0,
                 },
             },
             AgentEvent::EntityRemoved { id: 99 },
@@ -1006,7 +1041,9 @@ mod tests {
             AgentEvent::KeyRotated {
                 previous_status: ffxi_client::state::BlowfishStatus::Accepted,
             },
-            AgentEvent::Error { message: "x".into() },
+            AgentEvent::Error {
+                message: "x".into(),
+            },
         ];
         for ev in cases {
             assert!(
@@ -1036,7 +1073,13 @@ mod tests {
             .send(AgentCommand::Engage { target_id: 42 })
             .await
             .expect("dispatch ok");
-        assert!(matches!(dispatched, CallToolResult { is_error: Some(false) | None, .. }));
+        assert!(matches!(
+            dispatched,
+            CallToolResult {
+                is_error: Some(false) | None,
+                ..
+            }
+        ));
         let received = cmd_rx.try_recv().expect("cmd landed in channel");
         assert!(matches!(received, AgentCommand::Engage { target_id: 42 }));
         let ev = decision_rx.try_recv().expect("decision event fired");

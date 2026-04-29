@@ -23,6 +23,14 @@ use crate::state::{
 #[allow(dead_code)]
 const _UNUSED: Option<crate::state::SessionState> = None;
 
+/// Which method to use for character selection.
+/// Exactly one of `char_id` or `char_name` is allowed — the type system enforces it.
+#[derive(Clone, Debug)]
+pub enum CharSelection {
+    Id(u32),
+    Name(String),
+}
+
 /// Outcome of one map session attempt — `run()`'s outer loop drives the
 /// reconnect flow when the server signals a zone change via `0x00B`.
 #[derive(Debug)]
@@ -45,8 +53,7 @@ pub struct Config {
     pub view_port: u16,
     pub user: String,
     pub password: String,
-    pub char_id: u32,
-    pub char_name: String,
+    pub char_selection: CharSelection,
     /// Pre-prepared auth + lobby state. When `Some(...)`, `run` skips its
     /// own `auth.login` *and* `lobby.handshake` steps and goes straight to
     /// the map bootstrap with the supplied handoff/key. Required for the
@@ -80,8 +87,14 @@ pub async fn run(
     // Phase 1 — auth + lobby. Skipped entirely when the caller has already
     // run them (launcher path); needed for MCP / `Play` which only get
     // raw credentials and a charid.
-    let (auth_session, handoff, key3) = match cfg.initial_state.clone() {
-        Some(state) => (state.auth, state.handoff, state.key3),
+    let (auth_session, handoff, key3, resolved_char_id) = match cfg.initial_state.clone() {
+        Some(state) => {
+            let char_id = match &cfg.char_selection {
+                CharSelection::Id(id) => *id,
+                CharSelection::Name(_) => state.handoff.char_id,
+            };
+            (state.auth, state.handoff, state.key3, char_id)
+        }
         None => {
             emit_stage(&event_tx, Stage::Authenticating);
             auth.ensure_account(&cfg.user, &cfg.password).await.ok();
@@ -96,11 +109,23 @@ pub async fn run(
             for (i, b) in key3.iter_mut().enumerate() {
                 *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
             }
-            let handoff = lobby
-                .handshake(&auth_session, cfg.char_id, &cfg.char_name, 0, key3)
-                .await
-                .context("lobby handshake")?;
-            (auth_session, handoff, key3)
+            let (char_id, handoff) = match &cfg.char_selection {
+                CharSelection::Id(cid) => {
+                    let handoff = lobby
+                        .handshake(&auth_session, *cid, "", 0, key3)
+                        .await
+                        .context("lobby handshake")?;
+                    (*cid, handoff)
+                }
+                CharSelection::Name(name) => {
+                    let (char_id, handoff) = lobby
+                        .handshake_by_name(&auth_session, name, key3)
+                        .await
+                        .context("lobby handshake by name")?;
+                    (char_id, handoff)
+                }
+            };
+            (auth_session, handoff, key3, char_id)
         }
     };
 
@@ -122,9 +147,13 @@ pub async fn run(
             .context("parsing map server address from lobby")?,
     };
 
+    let char_name_for_bootstrap = match &cfg.char_selection {
+        CharSelection::Id(_) => &handoff.character_name,
+        CharSelection::Name(n) => n,
+    };
     let bootstrap = BootstrapArgs {
-        char_id: cfg.char_id,
-        char_name: &cfg.char_name,
+        char_id: resolved_char_id,
+        char_name: char_name_for_bootstrap,
         account_name: &cfg.user,
         ticket: auth_session.session_hash,
         version: 0,

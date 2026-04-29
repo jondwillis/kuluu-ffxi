@@ -7,9 +7,9 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-const LSB_BLOWFISH_CPP: &str = "../../server/src/common/blowfish.cpp";
-const LSB_COMPRESS_DAT: &str = "../../server/res/compress.dat";
-const LSB_DECOMPRESS_DAT: &str = "../../server/res/decompress.dat";
+const LSB_BLOWFISH_CPP: &str = "../vendor/server/src/common/blowfish.cpp";
+const LSB_COMPRESS_DAT: &str = "../vendor/server/res/compress.dat";
+const LSB_DECOMPRESS_DAT: &str = "../vendor/server/res/decompress.dat";
 const SUBKEY_LEN: usize = 4168;
 
 fn main() -> Result<()> {

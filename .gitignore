@@ -1,6 +1,7 @@
 # Rust workspace artifacts (defense-in-depth; component .gitignores cover this too)
 **/target/
 **/*.rs.bk
+Cargo.lock
 
 # Node / abandoned scaffolds
 **/node_modules/
@@ -23,3 +24,6 @@
 # Logs
 *.log
 log/
+
+# jacq build output — regenerate via `jacq build` in ffxi-agent/.
+ffxi-agent/dist/

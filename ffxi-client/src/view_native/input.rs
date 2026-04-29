@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use bevy::window::WindowCloseRequested;
-use ffxi_viewer_core::{heading_for_yaw, ChaseCamera, SceneState, Target};
+use ffxi_viewer_core::{heading_for_yaw, ChaseCamera, InputMode, SceneState, Target};
 use ffxi_viewer_wire::{Entity as WireEntity, Vec3 as WireVec3};
 use tokio::sync::mpsc;
 
@@ -78,17 +78,25 @@ pub struct AutoRun {
 }
 
 /// Edge-trigger handler: window-close shortcuts, Tab/Esc/R.
+///
+/// Window-close runs *before* the [`InputMode`] gate so Cmd+Q / Cmd+W /
+/// the red traffic light always work — even mid-chat-typing or with a
+/// menu open. Tab/Esc/R are world-mode actions and only run when the
+/// user isn't focused in some other UI (`text_input_system` owns those
+/// keys when chat / menu / quick-action is active).
 pub fn handle_input_system(
     keys: Res<ButtonInput<KeyCode>>,
     mut window_close: MessageReader<WindowCloseRequested>,
     state: Res<SceneState>,
     cmd_tx: Res<CommandTx>,
+    mode: Res<InputMode>,
     mut target: ResMut<Target>,
     mut autorun: ResMut<AutoRun>,
     mut exit: MessageWriter<AppExit>,
 ) {
     // Close-window: Cmd+Q, Cmd+W, or the OS-level WindowCloseRequested
     // event (red traffic light, App→Quit menu, etc.). Esc no longer quits.
+    // Runs unconditionally — quitting must work in any input mode.
     let cmd_held = keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight);
     let close_shortcut =
         cmd_held && (keys.just_pressed(KeyCode::KeyQ) || keys.just_pressed(KeyCode::KeyW));
@@ -96,6 +104,12 @@ pub fn handle_input_system(
     if close_shortcut || os_close {
         let _ = cmd_tx.0.try_send(AgentCommand::Disconnect);
         exit.write_default();
+        return;
+    }
+
+    // Anything below is a world-mode action — let the text-input router
+    // own these keys when a UI is focused.
+    if !matches!(*mode, InputMode::World) {
         return;
     }
 
@@ -119,14 +133,25 @@ pub fn handle_input_system(
 }
 
 /// 20 Hz movement + camera-pitch/yaw dispatch. One Move command per tick
-/// (or none if no inputs are active).
+/// (or none if no inputs are active). Suspended while any non-`World`
+/// [`InputMode`] is active so the player doesn't walk into a wall while
+/// typing in chat or navigating a menu.
 pub fn dispatch_movement_system(
     keys: Res<ButtonInput<KeyCode>>,
     state: Res<SceneState>,
     cmd_tx: Res<CommandTx>,
+    mode: Res<InputMode>,
     mut autorun: ResMut<AutoRun>,
     mut chase: ResMut<ChaseCamera>,
 ) {
+    if !matches!(*mode, InputMode::World) {
+        // Drop any pending autorun so a chat session doesn't auto-resume
+        // a forward run on Esc-back-to-world.
+        autorun.phantom_forward = false;
+        autorun.strafe_held_since = None;
+        return;
+    }
+
     // --- camera pitch: ↑ raises camera (more overhead), ↓ lowers it. ---
     let mut pitch_d = 0.0;
     if keys.pressed(KeyCode::ArrowUp) {

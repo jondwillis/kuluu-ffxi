@@ -1,0 +1,33 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "farm": {
+      "model": "llama.cpp/qwen-3.6-35b-a3b",
+      "prompt": "Headless mode, no giving up or asking the user for anything. Use `ffxi-mcp` to drive @playbooks/farming.md"
+    }
+  },
+  "mcp": {
+    "ffxi-mcp": {
+      "type": "local",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "--manifest-path",
+        "../Cargo.toml",
+        "-p",
+        "ffxi-mcp"
+      ],
+      "environment": {
+        "FFXI_SERVER": "127.0.0.1",
+        "FFXI_AUTH_PORT": "54231",
+        "FFXI_DATA_PORT": "54230",
+        "FFXI_VIEW_PORT": "54001",
+        "FFXI_USER": "claude",
+        "FFXI_PASS": "testpass123",
+        "FFXI_CHAR_ID": "4",
+        "FFXI_CHAR": "Cleric"
+      }
+    }
+  }
+}

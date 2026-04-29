@@ -683,12 +683,12 @@ fn detour_navmesh_path(zone_id: u16) -> Option<PathBuf> {
     Some(by_id)
 }
 
-/// Walk up from `start` looking for either `server/navmeshes/` or
-/// `Phoenix/navmeshes/` — the LSB / Phoenix submodule layouts.
+/// Walk up from `start` looking for either `vendor/server/navmeshes/` or
+/// `vendor/Phoenix/navmeshes/` — the LSB / Phoenix vendored submodule layout.
 /// Returns the first directory that exists.
 fn find_navmesh_dir(start: &std::path::Path) -> Option<PathBuf> {
     for ancestor in start.ancestors() {
-        for sib in ["server/navmeshes", "Phoenix/navmeshes"] {
+        for sib in ["vendor/server/navmeshes", "vendor/Phoenix/navmeshes"] {
             let candidate = ancestor.join(sib);
             if candidate.is_dir() {
                 return Some(candidate);

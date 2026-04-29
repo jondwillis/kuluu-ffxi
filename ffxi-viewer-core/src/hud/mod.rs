@@ -16,9 +16,12 @@
 //! ```
 
 pub mod agent_hud;
+pub mod chat_input;
 pub mod chat_panel;
 pub mod diagnostics;
 pub mod llm_badge;
+pub mod menu;
+pub mod quick_action;
 pub mod roster;
 pub mod stage_bar;
 
@@ -59,6 +62,9 @@ impl Plugin for HudPlugin {
                 agent_hud::spawn_agent_hud,
                 llm_badge::spawn_llm_badge,
                 roster::spawn_roster_panel,
+                chat_input::spawn_chat_input,
+                menu::spawn_main_menu,
+                quick_action::spawn_quick_action,
             ),
         );
         app.add_systems(
@@ -71,6 +77,9 @@ impl Plugin for HudPlugin {
                 llm_badge::refresh_badge_clock_system,
                 llm_badge::update_llm_badge_system,
                 roster::update_roster_panel_system,
+                chat_input::update_chat_input,
+                menu::update_main_menu,
+                quick_action::update_quick_action,
             ),
         );
     }

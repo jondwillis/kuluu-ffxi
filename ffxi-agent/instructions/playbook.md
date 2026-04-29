@@ -96,7 +96,7 @@ export FFXI_SERVER=127.0.0.1   # or HorizonXI hostname
 The MCP server invocation expects `ffxi-mcp` on PATH. Install with:
 
 ```bash
-cargo install --path ffxi-cli/ffxi-mcp
+cargo install --path ffxi-mcp
 ```
 
 ## Live calibration caveats

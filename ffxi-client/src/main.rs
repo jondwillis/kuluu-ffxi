@@ -439,7 +439,7 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                 args.view_port,
             );
 
-            let (user, password, char_id, char_name, initial_state) =
+            let (user, password, char_id, _char_name, initial_state) =
                 match (user, password, char_name) {
                     (Some(u), Some(p), Some(name)) => {
                         let session = auth
@@ -507,8 +507,7 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                 view_port: args.view_port,
                 user,
                 password,
-                char_id,
-                char_name,
+                char_selection: session::CharSelection::Id(char_id),
                 initial_state: Some(initial_state),
             };
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
@@ -565,7 +564,7 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             // entering alt-screen so errors surface cleanly to stderr,
             // and both pass the resulting `InitialState` through to
             // `session::run` so it skips auth + lobby entirely.
-            let (user, password, char_id, char_name, initial_state) =
+            let (user, password, char_id, _char_name, initial_state) =
                 match (user, password, char_name) {
                     (Some(u), Some(p), Some(name)) => {
                         let session = auth
@@ -633,8 +632,7 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                 view_port: args.view_port,
                 user,
                 password,
-                char_id,
-                char_name,
+                char_selection: session::CharSelection::Id(char_id),
                 initial_state: Some(initial_state),
             };
             let SessionHandle {
@@ -913,8 +911,7 @@ fn run_native_main_thread(
         view_port,
         user: prep.user,
         password: prep.password,
-        char_id: prep.char_id,
-        char_name: prep.char_name,
+        char_selection: session::CharSelection::Id(prep.char_id),
         initial_state: Some(prep.initial),
     };
 

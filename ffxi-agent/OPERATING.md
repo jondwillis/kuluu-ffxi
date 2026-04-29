@@ -123,8 +123,8 @@ export RUST_LOG=info,ffxi_client=info,ffxi_mcp=debug
 
 Then:
 
-* **Claude Code**: `cd ffxi-cli && claude` (auto-discovers `.mcp.json`).
-* **OpenCode**: `cd ffxi-cli && opencode` (same `.mcp.json`).
+* **Claude Code**: `cd ffxi-agent && claude` (auto-discovers `.mcp.json`).
+* **OpenCode**: `cd ffxi-agent && opencode` (same `.mcp.json`).
 * **MCP Inspector** (UI for poking at the server):
   `npx @modelcontextprotocol/inspector ./target/debug/ffxi-mcp`
 
@@ -154,8 +154,10 @@ Cross-harness invariants:
   `diagnostics://session`, `goal://current`, `inventory://current`).
 - Notifications — `notifications/resources/updated` fires on the
   `AgentEvent`s gated in `ffxi-mcp/src/main.rs::uris_for_event`.
-- Working directory — start the harness from `ffxi-cli/` so the
-  `.mcp.json` (and `cargo run -p ffxi-mcp`) resolve correctly.
+- Working directory — start the harness from `ffxi-agent/` so the
+  `.mcp.json` resolves; that file points to `../Cargo.toml -p ffxi-mcp`,
+  which compiles the MCP binary against the workspace at the repo root.
+  `cargo test -p ffxi-client` etc. run from the repo root, not `ffxi-agent/`.
 
 Per-harness gotchas that have been observed:
 
