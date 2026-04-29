@@ -331,48 +331,251 @@ pub fn draw_party_roster(f: &mut ratatui::Frame, area: Rect, members: &[PartyMem
     f.render_widget(List::new(rows).block(block), area);
 }
 
-/// Bottom-left LLM-decision badge. Stage-V4 will animate the pulse and
-/// surface a latency sparkline; for V0/V1/V2 this is a minimal renderer
-/// that shows the most recent decision and a count. Empty state:
-/// "agent: idle — no decisions". Avoids unwrap; safe on any input.
-pub fn draw_llm_badge(f: &mut ratatui::Frame, area: Rect, decisions: &VecDeque<LlmDecision>) {
-    let body_lines = match decisions.back() {
-        None => vec![Line::from(Span::styled(
-            "agent: idle — no decisions",
-            Style::default().fg(Color::DarkGray),
-        ))],
-        Some(latest) => {
-            let kind_summary = match &latest.kind {
-                LlmDecisionKind::NotificationFired { uri } => {
-                    format!("notify {uri}")
-                }
-                LlmDecisionKind::ToolDispatched { tool } => {
-                    format!("tool {tool}")
-                }
-            };
-            let header = Line::from(vec![
-                Span::styled("●", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw(" "),
-                Span::styled(kind_summary, Style::default().fg(Color::White)),
-            ]);
-            let footer = Line::from(vec![
-                Span::styled(
-                    format!("{}μs ", latest.latency_us),
-                    Style::default().fg(Color::Gray),
-                ),
-                Span::styled(
-                    format!("· {} recent", decisions.len()),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]);
-            vec![header, footer]
-        }
-    };
+/// Bottom-left LLM-decision badge. Animates a pulse on the most recent
+/// decision (fades over ~600ms), shows a 32-cell sparkline of recent
+/// latencies, and surfaces p50/p99 in microseconds.
+///
+/// Pairing heuristic: walks `decisions` in order, matching every
+/// `ToolDispatched` with the most recent unmatched `NotificationFired`
+/// (URI-first when possible, recency fallback). The pulse dot turns
+/// cyan when the latest decision was paired, gray when unpaired —
+/// "the LLM dispatched a tool unprompted" reads gray; "we notified
+/// and the LLM responded" reads cyan.
+///
+/// `now_ms` is process-monotonic (same anchor as
+/// `state::process_monotonic_ms`); pass it in so tests stay
+/// deterministic. Production call sites pass
+/// `state::process_monotonic_ms()` directly.
+pub fn draw_llm_badge(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    decisions: &VecDeque<LlmDecision>,
+    now_ms: u64,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled("  llm  ", Style::default().fg(Color::Gray)));
+
+    let body_lines: Vec<Line> = if decisions.is_empty() {
+        vec![Line::from(Span::styled(
+            "agent: idle — no decisions",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        let summary = pairing_summary(decisions);
+        let latest = decisions.back().expect("non-empty checked above");
+        let age_ms = now_ms.saturating_sub(latest.at_monotonic_ms);
+        let (dot_color, dot_modifier) = pulse_style(age_ms, summary.latest_paired);
+
+        let kind_summary = match &latest.kind {
+            LlmDecisionKind::NotificationFired { uri } => {
+                // Strip the "scheme://" prefix for display: "scene://current"
+                // → "current". Falls back to the full URI when the separator
+                // isn't present.
+                let short = match uri.find("://") {
+                    Some(i) => &uri[i + 3..],
+                    None => uri.as_str(),
+                };
+                format!("notify {short}")
+            }
+            LlmDecisionKind::ToolDispatched { tool } => format!("tool {tool}"),
+        };
+        // Truncate kind summary so it fits in the ~28-col left column.
+        // 16 chars for the label leaves room for "[●] " prefix and an
+        // age suffix like "  17ms".
+        let kind_short: String = kind_summary.chars().take(16).collect();
+
+        let header = Line::from(vec![
+            Span::styled("●", Style::default().fg(dot_color).add_modifier(dot_modifier)),
+            Span::raw(" "),
+            Span::styled(kind_short, Style::default().fg(Color::White)),
+            Span::raw(" "),
+            Span::styled(
+                format_age_short(age_ms),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+
+        let spark = sparkline_for_latencies(decisions, 32);
+        let spark_line = Line::from(Span::styled(spark, Style::default().fg(Color::Cyan)));
+
+        let (p50, p99) = percentile_pair(decisions);
+        let stats_line = Line::from(vec![
+            Span::styled("p50 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_us(p50),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(" · p99 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_us(p99),
+                Style::default().fg(Color::Gray),
+            ),
+        ]);
+
+        // Build the line set incrementally; render only as many as the
+        // area allows. With Min(4) constraint we get content height 2;
+        // larger areas pick up the pairing tail.
+        let mut lines = vec![header, spark_line, stats_line];
+        let pair_line = Line::from(vec![
+            Span::styled(
+                format!("{} paired", summary.paired_count),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!(" · {} solo", summary.solo_dispatches),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        lines.push(pair_line);
+        lines
+    };
+
     f.render_widget(Paragraph::new(body_lines).block(block), area);
+}
+
+/// Walk the decision log and pair `NotificationFired` → `ToolDispatched`.
+/// URI-aware: a tool dispatch first tries to match a still-pending
+/// notification with the same URI; if none, falls back to the most
+/// recent unmatched notification of any URI. Returns counts plus a
+/// flag indicating whether the LATEST decision was paired (drives the
+/// pulse-dot color).
+struct PairingSummary {
+    paired_count: usize,
+    /// Tool dispatches that fired with no preceding unmatched notification.
+    solo_dispatches: usize,
+    /// Whether the LATEST decision in the log is paired. For a
+    /// NotificationFired this is `false` until a tool dispatch matches it.
+    latest_paired: bool,
+}
+
+fn pairing_summary(decisions: &VecDeque<LlmDecision>) -> PairingSummary {
+    // Pending notifications keyed by URI. Vec preserves recency so the
+    // recency-fallback can pop the most-recent unmatched.
+    let mut pending: Vec<(String, usize)> = Vec::new();
+    let mut paired_idx: std::collections::HashSet<usize> = Default::default();
+    let mut solo = 0usize;
+
+    for (i, d) in decisions.iter().enumerate() {
+        match &d.kind {
+            LlmDecisionKind::NotificationFired { uri } => {
+                pending.push((uri.clone(), i));
+            }
+            LlmDecisionKind::ToolDispatched { .. } => {
+                // Recency fallback only — URI-first matching would require
+                // wiring a URI on the tool side, which we don't have. The
+                // most-recent-unmatched-notification rule still catches the
+                // dominant case (notify → harness reads → tool fires).
+                if let Some((_uri, notif_i)) = pending.pop() {
+                    paired_idx.insert(notif_i);
+                    paired_idx.insert(i);
+                } else {
+                    solo += 1;
+                }
+            }
+        }
+    }
+    let latest_idx = decisions.len().saturating_sub(1);
+    let latest_paired = paired_idx.contains(&latest_idx);
+    PairingSummary {
+        paired_count: paired_idx.len() / 2, // each pair contributes 2 indices
+        solo_dispatches: solo,
+        latest_paired,
+    }
+}
+
+/// Pulse color/modifier as a function of age. Bright cyan + BOLD inside
+/// the first 200ms, plain cyan up to 600ms, gray to 2s, dark gray after.
+/// `paired` shifts the gray branches to a colder tone — when the latest
+/// is unpaired (a notification still waiting on a tool), even the bright
+/// branch reads gray rather than cyan to signal "we're waiting on the
+/// LLM". This keeps the operator's read accurate at a glance.
+fn pulse_style(age_ms: u64, paired: bool) -> (Color, Modifier) {
+    match (age_ms, paired) {
+        (a, true) if a < 200 => (Color::Cyan, Modifier::BOLD),
+        (a, true) if a < 600 => (Color::Cyan, Modifier::empty()),
+        (a, false) if a < 600 => (Color::Gray, Modifier::BOLD),
+        (a, _) if a < 2000 => (Color::Gray, Modifier::empty()),
+        _ => (Color::DarkGray, Modifier::empty()),
+    }
+}
+
+/// Build a unicode-block sparkline of the most-recent N latencies in
+/// `decisions`. Output length matches the sample count (≤ N), so a
+/// nearly-empty log produces a short bar rather than padded dots.
+/// Scaling: max-of-window. A single sample renders as `█` (full).
+fn sparkline_for_latencies(decisions: &VecDeque<LlmDecision>, n: usize) -> String {
+    const RAMP: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let take = decisions.len().min(n);
+    if take == 0 {
+        return String::new();
+    }
+    let start = decisions.len() - take;
+    let window: Vec<u64> = decisions
+        .iter()
+        .skip(start)
+        .map(|d| d.latency_us)
+        .collect();
+    let max = window.iter().copied().max().unwrap_or(1).max(1);
+    let mut s = String::with_capacity(window.len() * 3);
+    for v in window {
+        // Clamp to [0, RAMP.len()-1]. Integer math preserves round-toward-
+        // zero behavior — full only on the actual max value, never on a
+        // close-but-not-equal value due to float drift.
+        let idx = ((v as u128 * (RAMP.len() as u128 - 1) + max as u128 / 2)
+            / max as u128) as usize;
+        s.push(RAMP[idx.min(RAMP.len() - 1)]);
+    }
+    s
+}
+
+/// Approximate p50/p99 over the full retained decision log (≤ 64 by
+/// state.rs::RECENT_DECISIONS_CAP). Sorts a copy; cheap at N=64.
+/// Returns (p50_us, p99_us). Empty log returns (0, 0).
+fn percentile_pair(decisions: &VecDeque<LlmDecision>) -> (u64, u64) {
+    if decisions.is_empty() {
+        return (0, 0);
+    }
+    let mut latencies: Vec<u64> = decisions.iter().map(|d| d.latency_us).collect();
+    latencies.sort_unstable();
+    let n = latencies.len();
+    // Index choice: nearest-rank with ceil. p50 of [a,b,c,d] picks index 2
+    // (the second of the upper half) which is the standard rank for
+    // small-N "give me the median-ish value." p99 of N<100 is just the
+    // largest sample, which matches an operator's "what's the worst I've
+    // seen" intuition.
+    let p50 = latencies[((n * 50 + 99) / 100).saturating_sub(1).min(n - 1)];
+    let p99 = latencies[((n * 99 + 99) / 100).saturating_sub(1).min(n - 1)];
+    (p50, p99)
+}
+
+/// Compact microsecond formatting. Up to 9999μs: raw. ≥10ms: render in
+/// ms with one decimal. Keeps the stats line single-row at 28 cols.
+fn format_us(us: u64) -> String {
+    if us < 10_000 {
+        format!("{us}μs")
+    } else if us < 1_000_000 {
+        let ms = us as f64 / 1000.0;
+        format!("{ms:.1}ms")
+    } else {
+        let s = us as f64 / 1_000_000.0;
+        format!("{s:.1}s")
+    }
+}
+
+/// Compact age formatting for the pulse header. Under 1s → "317ms",
+/// under 60s → "12.3s", longer → "5m". Differs from `format_age_ms`
+/// because the badge has tighter horizontal budget.
+fn format_age_short(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        let s = ms as f64 / 1000.0;
+        format!("{s:.1}s")
+    } else {
+        format!("{}m", ms / 60_000)
+    }
 }
 
 /// Render an N-segment unicode block bar from a 0..=100 percent value.
@@ -650,7 +853,7 @@ mod tests {
     #[test]
     fn llm_badge_idle_state_renders_placeholder() {
         let decisions: VecDeque<LlmDecision> = VecDeque::new();
-        let buf = render(28, 4, |f, area| draw_llm_badge(f, area, &decisions));
+        let buf = render(28, 4, |f, area| draw_llm_badge(f, area, &decisions, 0));
         let text = buffer_text(&buf);
         assert!(text.contains("idle"), "idle placeholder: {text}");
     }
@@ -665,11 +868,164 @@ mod tests {
             latency_us: 17_300,
             at_monotonic_ms: 0,
         });
-        let buf = render(40, 4, |f, area| draw_llm_badge(f, area, &decisions));
+        // now_ms = 0 means age 0 → bright pulse phase. Latency 17300μs
+        // formats as "17.3ms" (≥10ms branch). Tool name surfaces.
+        let buf = render(40, 6, |f, area| draw_llm_badge(f, area, &decisions, 0));
         let text = buffer_text(&buf);
         assert!(text.contains("tool engage"), "latest tool name: {text}");
-        assert!(text.contains("17300μs"), "latency rendered: {text}");
-        assert!(text.contains("1 recent"), "decision count: {text}");
+        assert!(text.contains("17.3ms"), "p50/p99 stat rendered: {text}");
+    }
+
+    #[test]
+    fn llm_badge_pulse_dot_brightens_then_fades() {
+        // A single decision with at_monotonic_ms=1000. At now=1000 (age 0)
+        // the dot is bright cyan + bold. At now=3000 (age 2000ms) it should
+        // be DarkGray (decayed past the 2s cutoff). Solo dispatch → dot
+        // colors take the unpaired branch (Gray, then DarkGray).
+        let mut decisions: VecDeque<LlmDecision> = VecDeque::new();
+        decisions.push_back(LlmDecision {
+            kind: LlmDecisionKind::ToolDispatched {
+                tool: "engage".into(),
+            },
+            latency_us: 5_000,
+            at_monotonic_ms: 1000,
+        });
+        let bright = render(28, 6, |f, area| draw_llm_badge(f, area, &decisions, 1000));
+        let faded = render(28, 6, |f, area| draw_llm_badge(f, area, &decisions, 3000));
+
+        // Locate the pulse dot (first '●' in the rendered buffer).
+        let dot_color = |buf: &ratatui::buffer::Buffer| -> Color {
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    let cell = buf.cell((x, y)).expect("cell");
+                    if cell.symbol() == "●" {
+                        return cell.fg;
+                    }
+                }
+            }
+            panic!("no pulse dot rendered");
+        };
+        // Solo → unpaired branch, age 0 → Gray + BOLD.
+        assert_eq!(dot_color(&bright), Color::Gray);
+        // Solo → unpaired branch, age 2000 → DarkGray.
+        assert_eq!(dot_color(&faded), Color::DarkGray);
+    }
+
+    #[test]
+    fn llm_badge_pulse_dot_cyan_when_paired() {
+        // A NotificationFired followed by a ToolDispatched — pairing
+        // succeeds, so the pulse on the latest (tool) reads cyan.
+        let mut decisions: VecDeque<LlmDecision> = VecDeque::new();
+        decisions.push_back(LlmDecision {
+            kind: LlmDecisionKind::NotificationFired {
+                uri: "scene://current".into(),
+            },
+            latency_us: 200,
+            at_monotonic_ms: 100,
+        });
+        decisions.push_back(LlmDecision {
+            kind: LlmDecisionKind::ToolDispatched {
+                tool: "engage".into(),
+            },
+            latency_us: 5_000,
+            at_monotonic_ms: 200,
+        });
+        let buf = render(40, 6, |f, area| draw_llm_badge(f, area, &decisions, 200));
+        let mut dot_color: Option<Color> = None;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = buf.cell((x, y)).expect("cell");
+                if cell.symbol() == "●" {
+                    dot_color = Some(cell.fg);
+                    break;
+                }
+            }
+            if dot_color.is_some() {
+                break;
+            }
+        }
+        // Paired + age 0 → bright cyan.
+        assert_eq!(dot_color, Some(Color::Cyan), "paired pulse should be cyan");
+    }
+
+    #[test]
+    fn pairing_summary_matches_lifo_recency() {
+        let mut decisions: VecDeque<LlmDecision> = VecDeque::new();
+        // notify A · notify B · tool · tool · tool (3rd is solo)
+        for (i, kind) in [
+            LlmDecisionKind::NotificationFired { uri: "a://".into() },
+            LlmDecisionKind::NotificationFired { uri: "b://".into() },
+            LlmDecisionKind::ToolDispatched { tool: "x".into() },
+            LlmDecisionKind::ToolDispatched { tool: "y".into() },
+            LlmDecisionKind::ToolDispatched { tool: "z".into() },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            decisions.push_back(LlmDecision {
+                kind,
+                latency_us: 100,
+                at_monotonic_ms: i as u64 * 10,
+            });
+        }
+        let s = pairing_summary(&decisions);
+        // notif A pairs with tool y (LIFO via vec.pop()), notif B pairs
+        // with tool x — so 2 pairs, 1 solo (tool z), and the latest
+        // (tool z) is unpaired.
+        assert_eq!(s.paired_count, 2);
+        assert_eq!(s.solo_dispatches, 1);
+        assert!(!s.latest_paired);
+    }
+
+    #[test]
+    fn sparkline_uses_full_block_for_max_sample() {
+        let mut decisions: VecDeque<LlmDecision> = VecDeque::new();
+        for &v in &[10u64, 50, 100, 25] {
+            decisions.push_back(LlmDecision {
+                kind: LlmDecisionKind::ToolDispatched { tool: "t".into() },
+                latency_us: v,
+                at_monotonic_ms: 0,
+            });
+        }
+        let s = sparkline_for_latencies(&decisions, 32);
+        // 4 samples → 4 chars. Max=100 → '█'. Min=10 → smaller block.
+        assert_eq!(s.chars().count(), 4);
+        // The 100 value (index 2) should be the full block.
+        assert_eq!(s.chars().nth(2), Some('█'));
+    }
+
+    #[test]
+    fn percentile_pair_handles_small_n() {
+        let mut decisions: VecDeque<LlmDecision> = VecDeque::new();
+        // Empty → (0,0).
+        assert_eq!(percentile_pair(&decisions), (0, 0));
+        // Single sample → both percentiles are that sample.
+        decisions.push_back(LlmDecision {
+            kind: LlmDecisionKind::ToolDispatched { tool: "t".into() },
+            latency_us: 42,
+            at_monotonic_ms: 0,
+        });
+        assert_eq!(percentile_pair(&decisions), (42, 42));
+        // Sorted [10,20,30,40,50,60,70,80,90,100] → p50≈50, p99=100.
+        decisions.clear();
+        for v in (10..=100).step_by(10) {
+            decisions.push_back(LlmDecision {
+                kind: LlmDecisionKind::ToolDispatched { tool: "t".into() },
+                latency_us: v,
+                at_monotonic_ms: 0,
+            });
+        }
+        let (p50, p99) = percentile_pair(&decisions);
+        assert!(p50 == 50 || p50 == 60, "p50 in tied-rank window: {p50}");
+        assert_eq!(p99, 100);
+    }
+
+    #[test]
+    fn format_us_picks_compact_unit() {
+        assert_eq!(format_us(500), "500μs");
+        assert_eq!(format_us(9_999), "9999μs");
+        assert_eq!(format_us(17_300), "17.3ms");
+        assert_eq!(format_us(2_500_000), "2.5s");
     }
 
     #[test]

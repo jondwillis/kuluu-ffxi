@@ -169,7 +169,12 @@ fn draw_terminal(
             .constraints([Constraint::Length(5), Constraint::Min(4)])
             .split(body[0]);
         chrome::draw_agent_hud(frame, left[0], &snapshot.0);
-        chrome::draw_llm_badge(frame, left[1], &snapshot.0.recent_decisions);
+        chrome::draw_llm_badge(
+            frame,
+            left[1],
+            &snapshot.0.recent_decisions,
+            crate::state::process_monotonic_ms(),
+        );
 
         let camera_area = body[1];
         camera_widget.render(camera_area, frame.buffer_mut());
