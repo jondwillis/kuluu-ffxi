@@ -249,11 +249,14 @@ where
     Ok(())
 }
 
-/// Map a `wire::ViewerCommand` (a deliberately small subset of
-/// `state::AgentCommand`) onto the full session command. The wire's
-/// command vocabulary is a strict subset by design — adding a richer
-/// command requires extending the wire schema first.
+/// Map a `wire::ViewerCommand` onto the full session command. The wire
+/// vocabulary is intentionally narrower than `AgentCommand` — viewers see
+/// the operator-relevant action surface (cast/ws/ja/use_item plus the
+/// reactor goals), not every internal variant. New `ActionKind`s in
+/// `state.rs` don't automatically become viewer-callable; that's a
+/// deliberate gating point.
 fn viewer_command_to_agent(cmd: wire::ViewerCommand) -> Option<AgentCommand> {
+    use crate::state::ActionKind;
     Some(match cmd {
         wire::ViewerCommand::Move { x, y, z, heading } => {
             AgentCommand::Move { x, y, z, heading }
@@ -269,5 +272,169 @@ fn viewer_command_to_agent(cmd: wire::ViewerCommand) -> Option<AgentCommand> {
         wire::ViewerCommand::Engage { target_id } => AgentCommand::Engage { target_id },
         wire::ViewerCommand::PathTo { x, y, z } => AgentCommand::PathTo { x, y, z },
         wire::ViewerCommand::Cancel => AgentCommand::Cancel,
+        wire::ViewerCommand::Cast {
+            spell_id,
+            target_id,
+            target_index,
+            pos_x,
+            pos_y,
+            pos_z,
+        } => AgentCommand::Action {
+            target_id,
+            target_index,
+            kind: ActionKind::CastMagic { spell_id, pos_x, pos_y, pos_z },
+        },
+        wire::ViewerCommand::Weaponskill { skill_id, target_id, target_index } => {
+            AgentCommand::Action {
+                target_id,
+                target_index,
+                kind: ActionKind::Weaponskill { skill_id },
+            }
+        }
+        wire::ViewerCommand::JobAbility { ability_id, target_id, target_index } => {
+            AgentCommand::Action {
+                target_id,
+                target_index,
+                kind: ActionKind::JobAbility { ability_id },
+            }
+        }
+        wire::ViewerCommand::UseItem {
+            container,
+            slot,
+            item_no,
+            target_id,
+            target_index,
+        } => AgentCommand::UseItem {
+            container,
+            slot,
+            item_no,
+            target_id,
+            target_index,
+        },
+        wire::ViewerCommand::BankWhenFull { threshold, mog_house_zoneline } => {
+            AgentCommand::BankWhenFull { threshold, mog_house_zoneline }
+        }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ActionKind;
+
+    #[test]
+    fn cast_translates_to_action_castmagic() {
+        let translated = viewer_command_to_agent(wire::ViewerCommand::Cast {
+            spell_id: 0x101,
+            target_id: 0xCAFE,
+            target_index: 7,
+            pos_x: 1.5,
+            pos_y: 0.0,
+            pos_z: -2.5,
+        })
+        .expect("translation");
+        match translated {
+            AgentCommand::Action {
+                target_id,
+                target_index,
+                kind:
+                    ActionKind::CastMagic {
+                        spell_id,
+                        pos_x,
+                        pos_y,
+                        pos_z,
+                    },
+            } => {
+                assert_eq!(target_id, 0xCAFE);
+                assert_eq!(target_index, 7);
+                assert_eq!(spell_id, 0x101);
+                assert_eq!(pos_x, 1.5);
+                assert_eq!(pos_y, 0.0);
+                assert_eq!(pos_z, -2.5);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn weaponskill_and_job_ability_share_action_envelope() {
+        match viewer_command_to_agent(wire::ViewerCommand::Weaponskill {
+            skill_id: 0xBEEF,
+            target_id: 0xCAFE,
+            target_index: 7,
+        })
+        .expect("translation")
+        {
+            AgentCommand::Action {
+                kind: ActionKind::Weaponskill { skill_id },
+                target_id,
+                target_index,
+            } => {
+                assert_eq!(skill_id, 0xBEEF);
+                assert_eq!(target_id, 0xCAFE);
+                assert_eq!(target_index, 7);
+            }
+            other => panic!("ws: {other:?}"),
+        }
+        match viewer_command_to_agent(wire::ViewerCommand::JobAbility {
+            ability_id: 0xABCD,
+            target_id: 0,
+            target_index: 0,
+        })
+        .expect("translation")
+        {
+            AgentCommand::Action {
+                kind: ActionKind::JobAbility { ability_id },
+                ..
+            } => assert_eq!(ability_id, 0xABCD),
+            other => panic!("ja: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn use_item_passes_through_all_fields() {
+        match viewer_command_to_agent(wire::ViewerCommand::UseItem {
+            container: 8,
+            slot: 4,
+            item_no: 4112,
+            target_id: 0xCAFE,
+            target_index: 7,
+        })
+        .expect("translation")
+        {
+            AgentCommand::UseItem {
+                container,
+                slot,
+                item_no,
+                target_id,
+                target_index,
+            } => {
+                assert_eq!(container, 8);
+                assert_eq!(slot, 4);
+                assert_eq!(item_no, 4112);
+                assert_eq!(target_id, 0xCAFE);
+                assert_eq!(target_index, 7);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bank_when_full_passes_through() {
+        match viewer_command_to_agent(wire::ViewerCommand::BankWhenFull {
+            threshold: 60,
+            mog_house_zoneline: 0xDEAD_BEEF,
+        })
+        .expect("translation")
+        {
+            AgentCommand::BankWhenFull {
+                threshold,
+                mog_house_zoneline,
+            } => {
+                assert_eq!(threshold, 60);
+                assert_eq!(mog_house_zoneline, 0xDEAD_BEEF);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 }

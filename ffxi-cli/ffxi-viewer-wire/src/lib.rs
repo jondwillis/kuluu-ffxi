@@ -286,10 +286,13 @@ pub enum Frame {
     Event(ViewerEvent),
 }
 
-/// Viewer→server commands. Subset of `state::AgentCommand` excluding
-/// commands that need richer payloads (`Action` carries `ActionKind`,
-/// `UseItem` and `BankWhenFull` are tactical reactor goals not yet in the
-/// viewer's vocabulary). Adding them later is an additive schema change.
+/// Viewer→server commands. Mirrors the operator-relevant subset of
+/// `state::AgentCommand`. The action surface (Cast/Weaponskill/JobAbility/
+/// UseItem) is flattened into named-field variants rather than nesting a
+/// full `ActionKind` enum — viewers don't need the 25+ niche actions
+/// (Fish, ChocoboDig, Sprint, …); just the tactical four. New variants
+/// are additive — appending preserves compatibility with v2 clients that
+/// only know the original 10 variants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ViewerCommand {
     Move { x: f32, y: f32, z: f32, heading: u8 },
@@ -302,6 +305,47 @@ pub enum ViewerCommand {
     Engage { target_id: u32 },
     PathTo { x: f32, y: f32, z: f32 },
     Cancel,
+    /// 0x01A action 0x03 — magic. `pos_*` are the ground-target position
+    /// for AoE-target spells (Tractor, certain BLU); zero for self/single-
+    /// target casts.
+    Cast {
+        spell_id: u32,
+        target_id: u32,
+        target_index: u16,
+        pos_x: f32,
+        pos_y: f32,
+        pos_z: f32,
+    },
+    /// 0x01A action 0x07 — weaponskill. Server validates TP / weapon.
+    Weaponskill {
+        skill_id: u32,
+        target_id: u32,
+        target_index: u16,
+    },
+    /// 0x01A action 0x09 — job ability. Server validates cooldown / job.
+    JobAbility {
+        ability_id: u32,
+        target_id: u32,
+        target_index: u16,
+    },
+    /// 0x037 — use a consumable / scroll / charged item. `(container,
+    /// slot)` is the server-resolvable pair; `item_no` is the LLM's
+    /// bookkeeping hint and goes on the wire as 0 (Phoenix's
+    /// `0x037_item_use.cpp::validate` enforces `mustEqual(ItemNum, 0)`).
+    UseItem {
+        container: u8,
+        slot: u8,
+        item_no: u32,
+        target_id: u32,
+        target_index: u16,
+    },
+    /// Reactor goal: monitor inventory, zone to mog house when any
+    /// non-mog container hits `threshold` slots filled. Survives
+    /// reconnects via `goal_store`.
+    BankWhenFull {
+        threshold: u8,
+        mog_house_zoneline: u32,
+    },
 }
 
 /// Viewer→server frame on the WebSocket.
@@ -441,6 +485,49 @@ mod tests {
                 assert!((distance - 3.0).abs() < f32::EPSILON);
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn viewer_command_action_surface_postcard_roundtrip() {
+        let cmds = vec![
+            ViewerCommand::Cast {
+                spell_id: 0x101,
+                target_id: 0xCAFE,
+                target_index: 7,
+                pos_x: 1.5,
+                pos_y: 0.0,
+                pos_z: -2.5,
+            },
+            ViewerCommand::Weaponskill {
+                skill_id: 0xBEEF,
+                target_id: 0xCAFE,
+                target_index: 7,
+            },
+            ViewerCommand::JobAbility {
+                ability_id: 0xABCD,
+                target_id: 0,
+                target_index: 0,
+            },
+            ViewerCommand::UseItem {
+                container: 0,
+                slot: 4,
+                item_no: 4112,
+                target_id: 0,
+                target_index: 0,
+            },
+            ViewerCommand::BankWhenFull {
+                threshold: 60,
+                mog_house_zoneline: 0xDEAD_BEEF,
+            },
+        ];
+        for c in cmds {
+            let bytes = postcard::to_allocvec(&c).expect("encode");
+            let back: ViewerCommand = postcard::from_bytes(&bytes).expect("decode");
+            // Round-trip equality via Debug — the variants don't impl Eq
+            // because of f32 fields; a debug-string compare is sufficient
+            // and avoids hand-matching every variant.
+            assert_eq!(format!("{c:?}"), format!("{back:?}"));
         }
     }
 
