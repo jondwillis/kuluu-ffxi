@@ -15,6 +15,7 @@
 
 pub mod bridge;
 pub mod input;
+pub mod launcher_ui;
 
 use anyhow::Result;
 use bevy::log::LogPlugin;

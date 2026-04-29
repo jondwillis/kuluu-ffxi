@@ -815,76 +815,95 @@ fn run_native_main_thread(
     };
 
     let lobby = lobby_client::LobbyClient::new(server.clone(), data_port, view_port);
-    let server_for_launcher = server.clone();
 
-    // Auth + lobby preflight — same shape as Tui's direct/launcher branches.
-    let prep: NativePreflight = rt
-        .block_on(async move {
-            match (user, password, char_name) {
-                (Some(u), Some(p), Some(name)) => {
-                    let session = auth
-                        .login(&u, &p)
-                        .await
-                        .context("auth precheck (native direct mode)")?;
-                    let handle = lobby
-                        .open(&session)
-                        .await
-                        .context("opening lobby (native direct mode)")?;
-                    let slot = handle
-                        .chars()
-                        .iter()
-                        .find(|c| c.name == name)
-                        .cloned()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "no character named '{name}' on account '{u}' (have: {:?})",
-                                handle
-                                    .chars()
-                                    .iter()
-                                    .map(|c| c.name.as_str())
-                                    .collect::<Vec<_>>()
-                            )
-                        })?;
-                    let mut key3 = [0u8; 20];
-                    for (i, b) in key3.iter_mut().enumerate() {
-                        *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
-                    }
-                    let handoff = handle
-                        .select(slot.char_id, &slot.name, key3)
-                        .await
-                        .context("lobby select (native direct mode)")?;
-                    Ok::<_, anyhow::Error>(NativePreflight {
-                        user: u,
-                        password: p,
-                        char_id: slot.char_id,
-                        char_name: slot.name,
-                        initial: session::InitialState {
-                            auth: session,
-                            handoff,
-                            key3,
-                        },
-                    })
+    // Auth + lobby preflight — two paths:
+    //
+    //   * **Direct mode** (all three positional args present): same shape as
+    //     `Tui`'s direct branch. Run auth + lobby inside `block_on`, no GUI
+    //     launcher. Errors surface as anyhow before the window opens.
+    //   * **Launcher mode** (any arg missing): run the windowed Bevy
+    //     launcher (`view_native::launcher_ui::run`) synchronously on the
+    //     main thread. It owns its own Bevy `App` (login → char list →
+    //     connect), uses the tokio runtime handle to spawn auth/lobby
+    //     work, and returns a `Selection` matching the stdin launcher's
+    //     contract. The launcher window closes on success; the next Bevy
+    //     `App` (the in-game viewer below) opens fresh.
+    let prep: NativePreflight = match (user, password, char_name) {
+        (Some(u), Some(p), Some(name)) => rt
+            .block_on(async {
+                let session = auth
+                    .login(&u, &p)
+                    .await
+                    .context("auth precheck (native direct mode)")?;
+                let handle = lobby
+                    .open(&session)
+                    .await
+                    .context("opening lobby (native direct mode)")?;
+                let slot = handle
+                    .chars()
+                    .iter()
+                    .find(|c| c.name == name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no character named '{name}' on account '{u}' (have: {:?})",
+                            handle
+                                .chars()
+                                .iter()
+                                .map(|c| c.name.as_str())
+                                .collect::<Vec<_>>()
+                        )
+                    })?;
+                let mut key3 = [0u8; 20];
+                for (i, b) in key3.iter_mut().enumerate() {
+                    *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
                 }
-                (u, p, n) => {
-                    let defaults = launcher::Defaults {
-                        user: u,
-                        password: p,
-                        char_name: n,
-                    };
-                    let sel = launcher::run(&server_for_launcher, &auth, &lobby, defaults)
-                        .await
-                        .context("interactive launcher")?;
-                    Ok(NativePreflight {
-                        user: sel.user,
-                        password: sel.password,
-                        char_id: sel.char_id,
-                        char_name: sel.char_name,
-                        initial: sel.initial_state,
-                    })
-                }
+                let handoff = handle
+                    .select(slot.char_id, &slot.name, key3)
+                    .await
+                    .context("lobby select (native direct mode)")?;
+                Ok::<_, anyhow::Error>(NativePreflight {
+                    user: u,
+                    password: p,
+                    char_id: slot.char_id,
+                    char_name: slot.name,
+                    initial: session::InitialState {
+                        auth: session,
+                        handoff,
+                        key3,
+                    },
+                })
+            })
+            .context("native preflight (direct)")?,
+        (u, p, n) => {
+            let defaults = launcher::Defaults {
+                user: u,
+                password: p,
+                char_name: n,
+            };
+            // The launcher app is a self-contained Bevy `App` and must run
+            // on the OS main thread (same Cocoa restriction as the in-game
+            // viewer). It blocks until the user finishes selection or
+            // closes the window.
+            let auth_arc = std::sync::Arc::new(auth);
+            let lobby_arc = std::sync::Arc::new(lobby);
+            let sel = view_native::launcher_ui::run(
+                &server,
+                auth_arc,
+                lobby_arc,
+                defaults,
+                rt.handle().clone(),
+            )
+            .context("native windowed launcher")?;
+            NativePreflight {
+                user: sel.user,
+                password: sel.password,
+                char_id: sel.char_id,
+                char_name: sel.char_name,
+                initial: sel.initial_state,
             }
-        })
-        .context("native preflight")?;
+        }
+    };
 
     let cfg = session::Config {
         server,
