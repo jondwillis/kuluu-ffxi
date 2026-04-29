@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 use ffxi_viewer_wire::{EntityKind, Vec3 as WireVec3};
 
-use crate::components::{IsSelf, WorldEntity};
+use crate::components::{IsSelf, Nameplate, WorldEntity};
 use crate::snapshot::SceneState;
 
 /// Map a wire-side FFXI position to a Bevy world position.
@@ -168,6 +168,7 @@ pub fn sync_entities_system(
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     mut q_mat: Query<&mut MeshMaterial3d<StandardMaterial>, With<WorldEntity>>,
     mut q_hp: Query<(&HpBar, &mut Transform, &mut MeshMaterial3d<StandardMaterial>), Without<WorldEntity>>,
+    q_nameplates: Query<&Nameplate>,
 ) {
     if !state.dirty && !target.is_changed() {
         return;
@@ -175,6 +176,14 @@ pub fn sync_entities_system(
 
     let snap = &state.snapshot;
     let self_id: u32 = 0;
+
+    // Set of entity ids that already own a nameplate. We mutate this as we
+    // spawn new ones below so a single tick can't double-spawn for the
+    // same id (the ECS Commands queue won't materialize until after this
+    // system finishes, so a `Query<&Nameplate>` lookup mid-system would
+    // miss anything spawned earlier this tick).
+    let mut nameplated: std::collections::HashSet<u32> =
+        q_nameplates.iter().map(|n| n.entity_id).collect();
 
     // Wire entities first.
     let mut seen: std::collections::HashSet<u32> =
@@ -236,20 +245,24 @@ pub fn sync_entities_system(
                         ChildOf(bevy_e),
                     ));
                 }
+            }
+        }
 
-                // Nameplate for any entity with a name. Skip empty/missing
-                // names (most untargetable scenery NPCs come through this
-                // way). Color matches the entity-kind palette so labels
-                // double as a kind indicator at a glance.
-                if let Some(name) = wire.name.as_deref().filter(|s| !s.is_empty()) {
-                    let label_color = nameplate_color(wire.kind);
-                    crate::nameplate::spawn_nameplate(
-                        &mut commands,
-                        wire.id,
-                        name,
-                        label_color,
-                    );
-                }
+        // Reconcile nameplate independently of the spawn-vs-update branch:
+        // a PC that first appeared with `name = None` (common — names
+        // resolve a frame after the entity does) must still get a label
+        // once the name fills in. Skip empty/missing names (untargetable
+        // scenery NPCs come through this way).
+        if let Some(name) = wire.name.as_deref().filter(|s| !s.is_empty()) {
+            if !nameplated.contains(&wire.id) {
+                crate::nameplate::spawn_nameplate(
+                    &mut commands,
+                    wire.id,
+                    wire.kind,
+                    name,
+                    nameplate_color(wire.kind),
+                );
+                nameplated.insert(wire.id);
             }
         }
     }
@@ -284,16 +297,23 @@ pub fn sync_entities_system(
                 ))
                 .id();
             tracked.by_id.insert(self_id, bevy_e);
+        }
+    }
 
-            // Self nameplate uses the snapshot's char_name.
-            if let Some(name) = snap.char_name.as_deref().filter(|s| !s.is_empty()) {
-                crate::nameplate::spawn_nameplate(
-                    &mut commands,
-                    self_id,
-                    name,
-                    nameplate_color(EntityKind::Pc),
-                );
-            }
+    // Self nameplate reconciliation: same pattern as wire entities.
+    // `char_name` is `None` on the very first frame (before the lobby
+    // reply lands), so the first-spawn-only path used to permanently
+    // miss it.
+    if let Some(name) = snap.char_name.as_deref().filter(|s| !s.is_empty()) {
+        if !nameplated.contains(&self_id) {
+            crate::nameplate::spawn_nameplate(
+                &mut commands,
+                self_id,
+                EntityKind::Pc,
+                name,
+                nameplate_color(EntityKind::Pc),
+            );
+            nameplated.insert(self_id);
         }
     }
 

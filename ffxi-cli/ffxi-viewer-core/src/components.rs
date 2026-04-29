@@ -21,10 +21,14 @@ pub struct IsSelf;
 
 /// Marks a UI nameplate node that displays the name of a `WorldEntity`.
 /// Updated each frame by `nameplate::update_nameplates_system` to track the
-/// owning entity's screen-projected position.
+/// owning entity's screen-projected position. `kind` lets the label
+/// formatter branch on entity type — PCs (and self) display the bare name
+/// without the HP% suffix that mobs/pets get, matching vanilla FFXI's
+/// convention of not exposing other players' health to onlookers.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Nameplate {
     pub entity_id: u32,
+    pub kind: EntityKind,
 }
 
 /// Marks an HP bar / dot child of a `WorldEntity`. Stage 0d wires this up;

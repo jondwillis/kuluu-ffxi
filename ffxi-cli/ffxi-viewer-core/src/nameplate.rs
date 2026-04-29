@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
+use ffxi_viewer_wire::EntityKind;
 
 use crate::camera::OperatorCamera;
 use crate::components::{Nameplate, WorldEntity};
@@ -42,11 +43,17 @@ pub struct NameplateLabel {
 /// Spawn a UI nameplate for a wire entity. Returns the spawned UI entity so
 /// callers can keep a handle if they want; ignoring the return is fine —
 /// `update_nameplates_system` reconciles via `entity_id`.
-pub fn spawn_nameplate(commands: &mut Commands, entity_id: u32, name: &str, color: Color) -> Entity {
+pub fn spawn_nameplate(
+    commands: &mut Commands,
+    entity_id: u32,
+    kind: EntityKind,
+    name: &str,
+    color: Color,
+) -> Entity {
     let owned = name.to_string();
     commands
         .spawn((
-            Nameplate { entity_id },
+            Nameplate { entity_id, kind },
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Px(-1000.0),
@@ -71,14 +78,16 @@ pub fn spawn_nameplate(commands: &mut Commands, entity_id: u32, name: &str, colo
         .id()
 }
 
-/// Build the label text for an entity. PCs/mobs/pets have HP and get a
-/// `"Name 73%"` suffix; NPCs/Other show only the name. `hp_pct == None`
-/// also falls back to the bare name (the wire flagged HP as unavailable
-/// for that entity this frame).
-pub fn format_label(base_name: &str, hp_pct: Option<u8>) -> String {
-    match hp_pct {
-        Some(pct) => format!("{base_name} {pct}%"),
-        None => base_name.to_string(),
+/// Build the label text for an entity. Mobs and pets get the `"Name 73%"`
+/// HP suffix; PCs (including the local player) and NPCs/Other always show
+/// the bare name — vanilla FFXI does not surface other players' HP, and
+/// most NPCs lack HP at all. `hp_pct == None` also falls back to the bare
+/// name (the wire flagged HP as unavailable for that entity this frame).
+pub fn format_label(base_name: &str, hp_pct: Option<u8>, kind: EntityKind) -> String {
+    let show_hp = matches!(kind, EntityKind::Mob | EntityKind::Pet);
+    match (show_hp, hp_pct) {
+        (true, Some(pct)) => format!("{base_name} {pct}%"),
+        _ => base_name.to_string(),
     }
 }
 
@@ -139,7 +148,7 @@ pub fn update_nameplates_system(
                 let hp_pct = hp_by_id.get(&np.entity_id).copied().flatten();
                 for child in children.iter() {
                     if let Ok((label, mut text)) = label_q.get_mut(child) {
-                        let want = format_label(&label.base_name, hp_pct);
+                        let want = format_label(&label.base_name, hp_pct, np.kind);
                         if **text != want {
                             **text = want;
                         }

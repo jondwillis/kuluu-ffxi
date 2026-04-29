@@ -19,6 +19,7 @@
 pub mod camera;
 pub mod components;
 pub mod hud;
+pub mod input_mode;
 pub mod nameplate;
 pub mod scene;
 pub mod snapshot;
@@ -31,6 +32,7 @@ pub use camera::{
 };
 pub use components::{HpIndicator, IsSelf, Nameplate, WorldEntity};
 pub use hud::HudPlugin;
+pub use input_mode::{ChatBuffer, InputMode, MenuKind, MenuLevel, MenuStack, QuickActionState};
 pub use scene::{
     ffxi_to_bevy, setup_world, sync_entities_system, sync_aggro_system,
     Aggroing, EntityMaterials, EntityMesh, HpBar, HpBarMesh, Target, TrackedEntities,
@@ -68,6 +70,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<EventLog>()
             .init_resource::<TrackedEntities>()
             .init_resource::<Target>()
+            .init_resource::<InputMode>()
             .add_systems(PreUpdate, ingest_system::<S>)
             .add_systems(Startup, (setup_world, spawn_camera))
             .add_systems(
