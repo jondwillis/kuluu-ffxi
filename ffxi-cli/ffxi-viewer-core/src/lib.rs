@@ -23,6 +23,7 @@ pub mod nameplate;
 pub mod scene;
 pub mod snapshot;
 pub mod source;
+pub mod target_ring;
 
 pub use camera::{
     chase_camera_system, heading_for_yaw, spawn_camera, yaw_for_heading, ChaseCamera,
@@ -76,6 +77,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                     chase_camera_system,
                     sync_aggro_system,
                     nameplate::update_nameplates_system,
+                    target_ring::draw_target_ring_system,
                 )
                     .chain(),
             )
