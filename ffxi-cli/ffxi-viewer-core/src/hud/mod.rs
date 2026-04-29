@@ -15,8 +15,11 @@
 //! └────────────────────────────────────────────────────┘
 //! ```
 
+pub mod agent_hud;
 pub mod chat_panel;
 pub mod diagnostics;
+pub mod llm_badge;
+pub mod roster;
 pub mod stage_bar;
 
 use bevy::prelude::*;
@@ -46,12 +49,16 @@ pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<llm_badge::BadgeClock>();
         app.add_systems(
             Startup,
             (
                 stage_bar::spawn_stage_bar,
                 chat_panel::spawn_chat_panel,
                 diagnostics::spawn_diagnostics,
+                agent_hud::spawn_agent_hud,
+                llm_badge::spawn_llm_badge,
+                roster::spawn_roster_panel,
             ),
         );
         app.add_systems(
@@ -60,6 +67,10 @@ impl Plugin for HudPlugin {
                 stage_bar::update_stage_bar,
                 chat_panel::update_chat_panel,
                 diagnostics::update_diagnostics,
+                agent_hud::update_agent_hud_system,
+                llm_badge::refresh_badge_clock_system,
+                llm_badge::update_llm_badge_system,
+                roster::update_roster_panel_system,
             ),
         );
     }

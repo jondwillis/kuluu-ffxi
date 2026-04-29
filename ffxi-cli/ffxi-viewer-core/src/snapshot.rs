@@ -189,6 +189,8 @@ mod tests {
             self_pos: Some(Position {
                 pos: Vec3 { x: 1.0, y: 2.0, z: 3.0 },
                 heading: 64,
+                speed: 25,
+                speed_base: 25,
             }),
             ..Default::default()
         };
