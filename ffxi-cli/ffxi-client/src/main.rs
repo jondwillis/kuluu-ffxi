@@ -3,13 +3,17 @@
 use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session};
 #[cfg(any(feature = "tui", feature = "native-window"))]
 use ffxi_client::{spawn_session, SessionHandle};
-#[cfg(any(feature = "tui", feature = "native-window"))]
+#[cfg(any(feature = "tui", feature = "native-window", feature = "relay"))]
 use ffxi_client::state;
 mod launcher;
+#[cfg(feature = "relay")]
+mod relay;
 #[cfg(feature = "tui")]
 mod view3d;
 #[cfg(feature = "native-window")]
 mod view_native;
+#[cfg(any(feature = "native-window", feature = "relay"))]
+mod wire_translate;
 
 use anyhow::{self, Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -38,6 +42,14 @@ struct Args {
     /// docker network — supply the container hostname `map` here).
     #[arg(long)]
     map_host_override: Option<String>,
+
+    /// Bind a WebSocket relay on `<addr>` that publishes
+    /// `ffxi-viewer-wire` frames (same shape the native viewer reads).
+    /// Compatible with `play`, `tui`, and `native`. Defaults to off; clients
+    /// can use `?format=json` for human-readable JSON instead of postcard.
+    #[cfg(feature = "relay")]
+    #[arg(long)]
+    relay_listen: Option<std::net::SocketAddr>,
 
     #[command(subcommand)]
     command: Command,
@@ -502,7 +514,31 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
             let (event_tx, event_rx) = tokio::sync::broadcast::channel(256);
             let session_task = tokio::spawn(session::run(cfg, cmd_rx, event_tx.clone()));
-            let agent_task = tokio::spawn(agent_io::run(cmd_tx, event_rx));
+            let agent_task = tokio::spawn(agent_io::run(cmd_tx.clone(), event_rx));
+
+            // Optional WebSocket relay. Needs a `watch::Receiver<SessionState>`,
+            // so we run a folder task that converts the broadcast event stream
+            // into the same canonical state the native viewer reads.
+            #[cfg(feature = "relay")]
+            let _relay_keepalive = if let Some(addr) = args.relay_listen {
+                let (state_tx, state_rx) =
+                    tokio::sync::watch::channel(state::SessionState::default());
+                let folder_rx = event_tx.subscribe();
+                let _folder = tokio::spawn(session::run_event_folder(folder_rx, state_tx));
+                let relay_event_tx = event_tx.clone();
+                let relay_cmd_tx = cmd_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        relay::serve(addr, state_rx, relay_event_tx, relay_cmd_tx).await
+                    {
+                        tracing::warn!(error = %err, "relay listener exited");
+                    }
+                });
+                Some(_folder)
+            } else {
+                None
+            };
+
             // Whichever finishes first ends the session.
             tokio::select! {
                 r = session_task => r??,
@@ -758,6 +794,8 @@ fn run_native_main_thread(
     args: Args,
     auth: auth_client::AuthClient,
 ) -> Result<()> {
+    #[cfg(feature = "relay")]
+    let relay_listen = args.relay_listen;
     let Args {
         server,
         auth_port,
@@ -765,6 +803,7 @@ fn run_native_main_thread(
         view_port,
         map_host_override,
         command,
+        ..
     } = args;
     let Command::Native {
         user,
@@ -870,6 +909,23 @@ fn run_native_main_thread(
         folder_task,
     } = rt.block_on(async { spawn_session(cfg) });
     let event_rx = event_tx.subscribe();
+
+    // Optional WebSocket relay alongside the native viewer. Subscribers see
+    // the same state stream the in-process bridge publishes — Bevy reads
+    // `state_rx` directly; the relay clones it for each client.
+    #[cfg(feature = "relay")]
+    if let Some(addr) = relay_listen {
+        let state_rx_relay = state_rx.clone();
+        let event_tx_relay = event_tx.clone();
+        let cmd_tx_relay = cmd_tx.clone();
+        rt.spawn(async move {
+            if let Err(err) =
+                relay::serve(addr, state_rx_relay, event_tx_relay, cmd_tx_relay).await
+            {
+                tracing::warn!(error = %err, "relay listener exited");
+            }
+        });
+    }
 
     // Run Bevy synchronously on this (main) thread. Returns when the user
     // presses Esc, closes the window, or AppExit fires.

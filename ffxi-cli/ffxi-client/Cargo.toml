@@ -24,6 +24,16 @@ tui = ["dep:crossterm", "dep:bevy", "dep:bevy_ratatui", "dep:bevy_ratatui_camera
 # macOS, so main.rs handles the dispatch specially when this feature
 # is active.
 native-window = ["dep:bevy", "dep:ffxi-viewer-core", "dep:ffxi-viewer-wire"]
+# Enable the WebSocket relay listener (`--relay-listen <addr>` global flag).
+# Publishes the same `ffxi-viewer-wire` frames the in-process bridge produces,
+# so external tools (and the future wasm browser viewer) can consume the
+# state stream without the FFXI session having to know about them.
+relay = [
+    "dep:ffxi-viewer-wire",
+    "dep:tokio-tungstenite",
+    "dep:postcard",
+    "dep:futures-util",
+]
 
 [dependencies]
 ffxi-proto = { path = "../ffxi-proto" }
@@ -52,6 +62,13 @@ bevy_ratatui_camera = { workspace = true, optional = true }
 
 ffxi-viewer-wire = { path = "../ffxi-viewer-wire", optional = true }
 ffxi-viewer-core = { path = "../ffxi-viewer-core", optional = true }
+
+# Relay-only deps. Postcard is the canonical encoding; tokio-tungstenite is
+# the WebSocket server. futures-util gives us the SinkExt/StreamExt traits
+# tungstenite's split sink/stream rely on.
+tokio-tungstenite = { version = "0.24", optional = true }
+postcard = { version = "1", optional = true, features = ["use-std"] }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 mysql_async.workspace = true
