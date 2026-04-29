@@ -19,13 +19,13 @@ pub mod input;
 use anyhow::Result;
 use bevy::log::LogPlugin;
 use bevy::prelude::*;
-use ffxi_viewer_core::{ViewerCorePlugin, WorldEntity};
+use ffxi_viewer_core::ViewerCorePlugin;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::state::{AgentCommand, AgentEvent, SessionState};
 
 use self::bridge::NativeSource;
-use self::input::{CommandTx, Target};
+use self::input::CommandTx;
 
 pub fn run(
     state_rx: watch::Receiver<SessionState>,
@@ -57,36 +57,10 @@ pub fn run(
     app.insert_resource(Time::<Fixed>::from_hz(20.0))
         .insert_resource(NativeSource::new(state_rx, event_rx))
         .insert_resource(CommandTx(cmd_tx))
-        .init_resource::<Target>()
         .add_plugins(ViewerCorePlugin::<NativeSource>::default())
-        .add_systems(Update, (input::handle_input_system, target_visual_system))
+        .add_systems(Update, input::handle_input_system)
         .add_systems(FixedUpdate, input::dispatch_movement_system);
 
     app.run();
     Ok(())
-}
-
-/// Minimal target highlight — scale the selected entity 1.4x so the user
-/// can see Tab is working. Proper outline/ring visualization lands with
-/// Stage 0e (nameplate billboards + roster). Cheap: only writes Transform
-/// for entities whose state changed since last frame.
-fn target_visual_system(
-    target: Res<Target>,
-    mut last_target: Local<Option<u32>>,
-    mut q: Query<(&WorldEntity, &mut Transform)>,
-) {
-    if target.id == *last_target {
-        return;
-    }
-    let prev = *last_target;
-    let next = target.id;
-    for (we, mut xform) in &mut q {
-        if Some(we.id) == prev {
-            xform.scale = Vec3::ONE;
-        }
-        if Some(we.id) == next {
-            xform.scale = Vec3::splat(1.4);
-        }
-    }
-    *last_target = target.id;
 }

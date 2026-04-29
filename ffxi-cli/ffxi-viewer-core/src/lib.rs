@@ -23,10 +23,13 @@ pub mod scene;
 pub mod snapshot;
 pub mod source;
 
-pub use camera::{follow_self_system, spawn_camera, CameraFollow, OperatorCamera};
+pub use camera::{chase_camera_system, follow_self_system, spawn_camera, CameraFollow, OperatorCamera};
 pub use components::{HpIndicator, IsSelf, Nameplate, WorldEntity};
 pub use hud::HudPlugin;
-pub use scene::{ffxi_to_bevy, setup_world, sync_entities_system, EntityMaterials, EntityMesh, TrackedEntities};
+pub use scene::{
+    ffxi_to_bevy, setup_world, sync_entities_system, sync_aggro_system,
+    Aggroing, EntityMaterials, EntityMesh, HpBar, HpBarMesh, Target, TrackedEntities,
+};
 pub use snapshot::{apply_delta, ingest_system, EventLog, SceneState, CHAT_HISTORY_CAP};
 pub use source::SceneSource;
 
@@ -59,9 +62,10 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         app.init_resource::<SceneState>()
             .init_resource::<EventLog>()
             .init_resource::<TrackedEntities>()
+            .init_resource::<Target>()
             .add_systems(PreUpdate, ingest_system::<S>)
             .add_systems(Startup, (setup_world, spawn_camera))
-            .add_systems(Update, (sync_entities_system, follow_self_system).chain())
+            .add_systems(Update, (sync_entities_system, chase_camera_system, sync_aggro_system).chain())
             .add_plugins(HudPlugin);
     }
 }

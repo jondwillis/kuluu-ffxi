@@ -48,7 +48,10 @@ use ffxi_client::{
     reactor::ReactorConfig,
     scene::SceneSummary,
     session,
-    state::{ActionKind, AgentCommand, AgentEvent, SessionState},
+    state::{
+        process_monotonic_ms, ActionKind, AgentCommand, AgentEvent, LlmDecision, LlmDecisionKind,
+        SessionState,
+    },
     supervisor::{self, SupervisorConfig},
 };
 
@@ -173,6 +176,12 @@ struct FfxiServer {
     state: Arc<RwLock<SessionState>>,
     /// Persisted goal store. Resources read via `goal://current`.
     goal_store: Arc<Mutex<GoalStore>>,
+    /// Dashboard observability sink: when wired (combined-binary mode),
+    /// every tool dispatch emits `LlmDecision::ToolDispatched` so the
+    /// view's badge can pulse and the latency sparkline can plot. None
+    /// in headless harness mode — the harness reads its own latency from
+    /// MCP transport instead.
+    decision_tx: Option<broadcast::Sender<AgentEvent>>,
 }
 
 #[tool_router]
@@ -186,7 +195,15 @@ impl FfxiServer {
             cmd_tx,
             state,
             goal_store: Arc::new(Mutex::new(goal_store)),
+            decision_tx: None,
         }
+    }
+
+    /// Builder: wire a broadcast sender so `LlmDecision` events flow into
+    /// the same stream the view consumes. Combined-binary mode only.
+    fn with_decision_tx(mut self, tx: broadcast::Sender<AgentEvent>) -> Self {
+        self.decision_tx = Some(tx);
+        self
     }
 
     async fn send(&self, cmd: AgentCommand) -> Result<CallToolResult, McpError> {
@@ -205,12 +222,28 @@ impl FfxiServer {
                 None,
             )),
         };
+        let elapsed_us = started.elapsed().as_micros() as u64;
         tracing::debug!(
             kind,
-            elapsed_us = started.elapsed().as_micros() as u64,
+            elapsed_us,
             ok = result.is_ok(),
             "mcp.tool_dispatch"
         );
+        // Emit a ToolDispatched decision regardless of dispatch outcome —
+        // a closed channel still occupied the LLM's attention. Lossy by
+        // design (try_send): if the broadcast is full or has no live
+        // receivers we drop silently rather than block the tool path.
+        if let Some(tx) = &self.decision_tx {
+            let _ = tx.send(AgentEvent::LlmDecision {
+                decision: LlmDecision {
+                    kind: LlmDecisionKind::ToolDispatched {
+                        tool: kind.to_string(),
+                    },
+                    latency_us: elapsed_us,
+                    at_monotonic_ms: process_monotonic_ms(),
+                },
+            });
+        }
         result
     }
 
@@ -632,16 +665,34 @@ async fn run_state_mirror(
 async fn run_notifier(
     peer: Peer<RoleServer>,
     mut event_rx: broadcast::Receiver<AgentEvent>,
+    decision_tx: Option<broadcast::Sender<AgentEvent>>,
 ) {
     loop {
         match event_rx.recv().await {
             Ok(ev) => {
                 for uri in uris_for_event(&ev) {
+                    let started = std::time::Instant::now();
                     let params = ResourceUpdatedNotificationParam {
                         uri: (*uri).into(),
                     };
-                    if let Err(e) = peer.notify_resource_updated(params).await {
+                    let send_result = peer.notify_resource_updated(params).await;
+                    let latency_us = started.elapsed().as_micros() as u64;
+                    if let Err(e) = send_result {
                         tracing::warn!(error = %e, uri = uri, "notify_resource_updated failed");
+                    }
+                    // Emit a NotificationFired even on send failure: the
+                    // attempt counts as a wake signal the LLM might miss.
+                    // Lossy try-send via broadcast::Sender.send semantics.
+                    if let Some(tx) = &decision_tx {
+                        let _ = tx.send(AgentEvent::LlmDecision {
+                            decision: LlmDecision {
+                                kind: LlmDecisionKind::NotificationFired {
+                                    uri: (*uri).to_string(),
+                                },
+                                latency_us,
+                                at_monotonic_ms: process_monotonic_ms(),
+                            },
+                        });
                     }
                 }
             }
@@ -770,7 +821,7 @@ async fn main() -> Result<()> {
     // Now that the server is running we can grab its peer and start
     // forwarding broadcast events as ResourceUpdated notifications.
     let peer = running.peer().clone();
-    let notifier_handle = tokio::spawn(run_notifier(peer, notifier_event_rx));
+    let notifier_handle = tokio::spawn(run_notifier(peer, notifier_event_rx, None));
 
     running.waiting().await.context("MCP server crashed")?;
 

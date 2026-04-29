@@ -35,11 +35,37 @@ pub struct EntityMaterials {
     pub mob: Handle<StandardMaterial>,
     pub pet: Handle<StandardMaterial>,
     pub other: Handle<StandardMaterial>,
+    /// Bright yellow + emissive so the targeted entity stands out.
+    pub target: Handle<StandardMaterial>,
+    /// Aggro override: saturated red + emissive for mobs targeting the player.
+    pub aggro: Handle<StandardMaterial>,
+}
+
+/// Marker for entities currently aggroing the player. Inserted by
+/// `sync_aggro_system`.
+#[derive(Component)]
+pub struct Aggroing;
+
+/// HP bar quad parented to a `WorldEntity`. Width rescaled per tick from
+/// entity hp_pct; color lerps red↔green by HP fraction.
+#[derive(Component)]
+pub struct HpBar {
+    pub owner_id: u32,
 }
 
 /// Cached entity mesh — single capsule shared by all spawned entities.
 #[derive(Resource)]
 pub struct EntityMesh(pub Handle<Mesh>);
+
+/// HP bar mesh — a horizontal cuboid used for all HP indicators.
+#[derive(Resource)]
+pub struct HpBarMesh(pub Handle<Mesh>);
+
+/// Currently-targeted FFXI entity id. `None` when no target is selected.
+#[derive(Resource, Default)]
+pub struct Target {
+    pub id: Option<u32>,
+}
 
 /// Tracks which Bevy entity represents each wire entity id, so we can
 /// move/despawn it across frames without scanning the world.
@@ -54,16 +80,39 @@ pub fn setup_world(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let mk = |c: Color, m: &mut Assets<StandardMaterial>| {
+        m.add(StandardMaterial {
+            base_color: c,
+            perceptual_roughness: 0.7,
+            metallic: 0.0,
+            ..default()
+        })
+    };
     commands.insert_resource(EntityMaterials {
-        pc: materials.add(color_material(Color::srgb(0.40, 0.85, 1.00))),
-        self_pc: materials.add(color_material(Color::srgb(0.20, 1.00, 1.00))),
-        npc: materials.add(color_material(Color::srgb(0.95, 0.85, 0.30))),
-        mob: materials.add(color_material(Color::srgb(0.95, 0.40, 0.40))),
-        pet: materials.add(color_material(Color::srgb(0.40, 0.85, 0.50))),
-        other: materials.add(color_material(Color::srgb(0.60, 0.60, 0.60))),
+        pc: mk(Color::srgb(0.40, 0.85, 1.00), &mut materials),
+        self_pc: mk(Color::srgb(0.20, 1.00, 1.00), &mut materials),
+        npc: mk(Color::srgb(0.95, 0.85, 0.30), &mut materials),
+        mob: mk(Color::srgb(0.95, 0.40, 0.40), &mut materials),
+        pet: mk(Color::srgb(0.40, 0.85, 0.50), &mut materials),
+        other: mk(Color::srgb(0.60, 0.60, 0.60), &mut materials),
+        target: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.00, 0.95, 0.20),
+            emissive: LinearRgba::new(1.0, 0.95, 0.0, 1.0) * 0.6,
+            perceptual_roughness: 0.4,
+            ..default()
+        }),
+        aggro: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.00, 0.10, 0.10),
+            emissive: LinearRgba::new(1.5, 0.0, 0.0, 1.0),
+            perceptual_roughness: 0.4,
+            ..default()
+        }),
     });
     commands.insert_resource(EntityMesh(
         meshes.add(Capsule3d::new(0.5, 1.4)),
+    ));
+    commands.insert_resource(HpBarMesh(
+        meshes.add(Cuboid::new(1.0, 0.12, 0.12)),
     ));
 
     // Ground: a 200×200 plane at y=0 in muted dark slate.
@@ -86,8 +135,7 @@ pub fn setup_world(
 
 /// Sync wire-side entities with the Bevy world. Spawns new entities,
 /// updates transforms for existing ones, despawns missing ones. Also
-/// tracks the player's own avatar via `IsSelf` for the camera follow
-/// system to find.
+/// applies target highlight and manages HP bars.
 ///
 /// Heuristic for "self": the snapshot's `self_pos` is the truth, but it
 /// doesn't carry an id. We mirror it as a *synthetic* tracked entity at
@@ -95,32 +143,51 @@ pub fn setup_world(
 /// other world entities.
 pub fn sync_entities_system(
     state: Res<SceneState>,
+    target: Res<Target>,
     mesh: Res<EntityMesh>,
+    hp_bar_mesh: Res<HpBarMesh>,
     mats: Res<EntityMaterials>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut tracked: ResMut<TrackedEntities>,
     mut commands: Commands,
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
+    mut q_mat: Query<&mut MeshMaterial3d<StandardMaterial>, With<WorldEntity>>,
+    mut q_hp: Query<(&HpBar, &mut Transform, &mut MeshMaterial3d<StandardMaterial>), Without<WorldEntity>>,
 ) {
-    if !state.dirty {
+    if !state.dirty && !target.is_changed() {
         return;
     }
 
+    let snap = &state.snapshot;
+    let self_id: u32 = 0;
+
     // Wire entities first.
     let mut seen: std::collections::HashSet<u32> =
-        std::collections::HashSet::with_capacity(state.snapshot.entities.len() + 1);
+        std::collections::HashSet::with_capacity(snap.entities.len() + 1);
+    let mut hp_by_id: HashMap<u32, Option<u8>> = HashMap::new();
 
-    for wire in &state.snapshot.entities {
+    for wire in &snap.entities {
         seen.insert(wire.id);
+        hp_by_id.insert(wire.id, wire.hp_pct);
         let world_pos = ffxi_to_bevy(wire.pos);
+        let is_target = target.id == Some(wire.id);
+        let mat = if is_target {
+            mats.target.clone()
+        } else {
+            pick_material(&mats, wire.kind, false)
+        };
+
         match tracked.by_id.get(&wire.id).copied() {
             Some(existing) => {
                 if let Ok(mut t) = q_xform.get_mut(existing) {
                     t.translation = world_pos;
                     t.rotation = heading_to_quat(wire.heading);
                 }
+                if let Ok(mut m) = q_mat.get_mut(existing) {
+                    m.0 = mat;
+                }
             }
             None => {
-                let mat = pick_material(&mats, wire.kind, false);
                 let bevy_e = commands
                     .spawn((
                         WorldEntity {
@@ -138,15 +205,31 @@ pub fn sync_entities_system(
                     ))
                     .id();
                 tracked.by_id.insert(wire.id, bevy_e);
+
+                // Spawn HP bar for kinds that have HP.
+                if matches!(wire.kind, EntityKind::Mob | EntityKind::Pc | EntityKind::Pet) {
+                    let bar_color = hp_color(wire.hp_pct);
+                    commands.spawn((
+                        HpBar { owner_id: wire.id },
+                        Mesh3d(hp_bar_mesh.0.clone()),
+                        MeshMaterial3d(materials.add(StandardMaterial {
+                            base_color: bar_color,
+                            perceptual_roughness: 0.5,
+                            ..default()
+                        })),
+                        Transform::from_xyz(0.0, 1.5, 0.0),
+                        ChildOf(bevy_e),
+                    ));
+                }
             }
         }
     }
 
     // Synthetic self at id=0.
-    seen.insert(0);
-    let self_pos = ffxi_to_bevy(state.snapshot.self_pos.pos);
-    let self_rot = heading_to_quat(state.snapshot.self_pos.heading);
-    match tracked.by_id.get(&0).copied() {
+    seen.insert(self_id);
+    let self_pos = ffxi_to_bevy(snap.self_pos.pos);
+    let self_rot = heading_to_quat(snap.self_pos.heading);
+    match tracked.by_id.get(&self_id).copied() {
         Some(existing) => {
             if let Ok(mut t) = q_xform.get_mut(existing) {
                 t.translation = self_pos;
@@ -157,7 +240,7 @@ pub fn sync_entities_system(
             let bevy_e = commands
                 .spawn((
                     WorldEntity {
-                        id: 0,
+                        id: self_id,
                         act_index: 0,
                         kind: EntityKind::Pc,
                     },
@@ -171,7 +254,7 @@ pub fn sync_entities_system(
                     },
                 ))
                 .id();
-            tracked.by_id.insert(0, bevy_e);
+            tracked.by_id.insert(self_id, bevy_e);
         }
     }
 
@@ -185,6 +268,92 @@ pub fn sync_entities_system(
     for id in stale {
         if let Some(bevy_e) = tracked.by_id.remove(&id) {
             commands.entity(bevy_e).despawn();
+        }
+    }
+
+    // Update HP bars.
+    for (bar, mut t, mut hm) in q_hp.iter_mut() {
+        if let Some(Some(pct)) = hp_by_id.get(&bar.owner_id).copied() {
+            let frac = (pct as f32 / 100.0).clamp(0.0, 1.0);
+            t.scale.x = frac;
+            t.translation.x = -(1.0 - frac) * 0.5;
+            hm.0 = materials.add(StandardMaterial {
+                base_color: hp_color(Some(pct)),
+                perceptual_roughness: 0.5,
+                ..default()
+            });
+        } else {
+            t.scale.x = 0.0;
+        }
+    }
+}
+
+/// Per-tick: reconcile the `Aggroing` marker on each ECS entity and
+/// override its material. Runs in `Update` after `sync_entities_system`
+/// so any kind/target material write from that pass is overwritten on
+/// the same frame for entities that just became aggro.
+///
+/// Uses `bt_target_id` from the snapshot — any mob whose bt_target_id
+/// matches the player's UniqueNo is considered aggroing.
+pub fn sync_aggro_system(
+    mut commands: Commands,
+    state: Res<SceneState>,
+    target: Res<Target>,
+    mats: Res<EntityMaterials>,
+    self_q: Query<&Transform, (With<IsSelf>, Without<WorldEntity>)>,
+    mut q: Query<
+        (
+            Entity,
+            Ref<WorldEntity>,
+            &mut Transform,
+            &mut MeshMaterial3d<StandardMaterial>,
+            Option<&Aggroing>,
+        ),
+        Without<IsSelf>,
+    >,
+    mut gizmos: Gizmos,
+) {
+    let snap = &state.snapshot;
+    let self_id = snap.diagnostics.sync_in;
+    let Some(self_uid) = self_id else { return };
+
+    let mut aggroing: HashMap<u32, bool> = HashMap::new();
+    for ent in &snap.entities {
+        if ent.bt_target_id as u16 == self_uid
+            && matches!(ent.kind, EntityKind::Mob | EntityKind::Pet)
+        {
+            aggroing.insert(ent.id, true);
+        }
+    }
+
+    let self_pos = self_q.single().ok().map(|t| t.translation);
+
+    for (e, w, t, mut m, has_aggro) in q.iter_mut() {
+        let should_aggro = aggroing.get(&w.id).copied().unwrap_or(false);
+        match (should_aggro, has_aggro.is_some()) {
+            (true, false) => {
+                commands.entity(e).insert(Aggroing);
+                m.0 = mats.aggro.clone();
+            }
+            (true, true) => {
+                m.0 = mats.aggro.clone();
+            }
+            (false, true) => {
+                commands.entity(e).remove::<Aggroing>();
+                let restore = if Some(w.id) == target.id {
+                    mats.target.clone()
+                } else {
+                    pick_material(&mats, w.kind, false)
+                };
+                m.0 = restore;
+            }
+            (false, false) => {}
+        }
+
+        if should_aggro {
+            if let Some(sp) = self_pos {
+                gizmos.line(sp, t.translation, Color::srgb(1.0, 0.15, 0.15));
+            }
         }
     }
 }
@@ -215,4 +384,12 @@ fn color_material(color: Color) -> StandardMaterial {
         perceptual_roughness: 0.85,
         ..default()
     }
+}
+
+/// HP bar color: green at 100%, yellow at 50%, red at 0%.
+fn hp_color(pct: Option<u8>) -> Color {
+    let frac = pct.unwrap_or(100) as f32 / 100.0;
+    let r = frac.min(1.0);
+    let g = (1.0 - frac).min(1.0);
+    Color::srgb(r, g, 0.0)
 }

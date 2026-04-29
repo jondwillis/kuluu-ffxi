@@ -2,8 +2,24 @@
 //! JSON sidechannel subscribe to.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+
+/// Process-monotonic clock: ms elapsed since the first call. Used to stamp
+/// `LlmDecision.at_monotonic_ms` (producer) and to compute pulse-decay age
+/// at render time (consumer). Both sides must share this anchor or the
+/// "ms since most recent decision" math goes negative.
+///
+/// The anchor lazy-inits on first call. In ffxi-mcp the supervisor and
+/// notifier both call this early, so by the time chrome renders the
+/// anchor is guaranteed set.
+pub fn process_monotonic_ms() -> u64 {
+    static ANCHOR: OnceLock<Instant> = OnceLock::new();
+    let start = ANCHOR.get_or_init(Instant::now);
+    start.elapsed().as_millis() as u64
+}
 
 /// Stage of the end-to-end login flow we're currently in.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
