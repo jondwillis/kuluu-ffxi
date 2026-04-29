@@ -1004,4 +1004,39 @@ mod tests {
             );
         }
     }
+
+    /// V4a contract: when `decision_tx` is wired, a tool dispatch fires
+    /// exactly one `LlmDecision::ToolDispatched` whose `tool` matches the
+    /// command's `cmd_kind_label`. Headless mode (no decision_tx) emits
+    /// nothing — that path is exercised by the absence of a panic when
+    /// `with_decision_tx` is not called in `main()`.
+    #[tokio::test]
+    async fn tool_dispatch_emits_llm_decision_when_wired() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<AgentCommand>(8);
+        let (decision_tx, mut decision_rx) = broadcast::channel::<AgentEvent>(8);
+        let state = Arc::new(RwLock::new(SessionState::default()));
+        let goal_store = GoalStore::new(std::env::temp_dir().join("ffxi-mcp-test-goal.json"));
+        let server = FfxiServer::new(cmd_tx, state, goal_store).with_decision_tx(decision_tx);
+
+        // Dispatch an Engage command and assert it both lands on cmd_rx
+        // and emits a single LlmDecision event with kind=ToolDispatched
+        // and tool="engage" (matches cmd_kind_label).
+        let dispatched = server
+            .send(AgentCommand::Engage { target_id: 42 })
+            .await
+            .expect("dispatch ok");
+        assert!(matches!(dispatched, CallToolResult { is_error: Some(false) | None, .. }));
+        let received = cmd_rx.try_recv().expect("cmd landed in channel");
+        assert!(matches!(received, AgentCommand::Engage { target_id: 42 }));
+        let ev = decision_rx.try_recv().expect("decision event fired");
+        match ev {
+            AgentEvent::LlmDecision { decision } => match &decision.kind {
+                LlmDecisionKind::ToolDispatched { tool } => assert_eq!(tool, "engage"),
+                other => panic!("expected ToolDispatched, got {other:?}"),
+            },
+            other => panic!("expected LlmDecision, got {other:?}"),
+        }
+        // Channel should be empty now — exactly one decision per dispatch.
+        assert!(decision_rx.try_recv().is_err());
+    }
 }
