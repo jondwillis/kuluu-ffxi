@@ -17,7 +17,7 @@ use crate::lobby_client::LobbyClient;
 use crate::map_client::{self, BootstrapArgs, MapClient};
 use crate::state::{
     AgentCommand, AgentEvent, BlowfishStatus, ChatChannel, ChatLine, Diagnostics, Entity,
-    EntityKind, InventoryUpdate, ItemSlot, Position, Stage, Vec3,
+    EntityKind, InventoryUpdate, ItemSlot, Position, ShopItem, ShopState, Stage, Vec3,
 };
 
 #[allow(dead_code)]
@@ -63,6 +63,13 @@ pub struct Config {
     /// to stale (closed) sockets and produces silent EOFs.
     /// MCP / `Play` callers that don't pre-resolve set this to `None`.
     pub initial_state: Option<InitialState>,
+    /// When `true`, the keepalive tick will *not* auto-flush
+    /// `pending_event_end` — the operator (or the dialog HUD) is expected
+    /// to issue `AgentCommand::EndEvent` explicitly. The native viewer
+    /// sets this to `true` so the dialog panel stays visible long enough
+    /// to read; headless MCP/agent callers leave it at `false` so
+    /// unattended sessions don't get stuck in events.
+    pub user_driven_events: bool,
 }
 
 /// Caller-supplied lobby completion. All three fields are required
@@ -203,7 +210,7 @@ pub async fn run(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_map_session(
-    _cfg: &Config,
+    cfg: &Config,
     _auth_session: &crate::auth_client::AuthSession,
     bootstrap: &BootstrapArgs<'_>,
     server_addr: std::net::SocketAddr,
@@ -241,6 +248,7 @@ async fn run_map_session(
     let mut total_subs = 0usize;
     let mut pending_event_end: Vec<(u32, u16, u16)> = Vec::new();
     let mut self_act_index: Option<u16> = None;
+    let mut name_cache: std::collections::HashMap<u32, String> = Default::default();
     while std::time::Instant::now() < flood_deadline {
         match tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -259,6 +267,7 @@ async fn run_map_session(
                         &mut pending_event_end,
                         bootstrap.char_id,
                         &mut self_act_index,
+                        &mut name_cache,
                     );
                 }
             }
@@ -306,6 +315,8 @@ async fn run_map_session(
         self_act_index,
         cmd_rx,
         event_tx.clone(),
+        cfg.user_driven_events,
+        name_cache,
     )
     .await
 }
@@ -318,15 +329,37 @@ async fn run_map_session(
 /// the zone-in flood and stash the player's per-zone `ActIndex` in
 /// `self_act_index` — required when sending packets that target the player
 /// (e.g. `0x05E` MAPRECT for zone-line transitions).
+///
+/// `name_cache` is a small id→name table accumulated from CHAR_PC/CHAR_NPC
+/// packets. The 0x029/0x02D battle-message decoders look names up here to
+/// substitute `<user>`/`<target>` placeholders without re-reading the
+/// snapshot. It's a session-loop-local mirror of the entity name set; a
+/// miss falls back to a hex id rather than failing.
 fn handle_sub_packet(
     sub: &framing::SubPacket<'_>,
     event_tx: &broadcast::Sender<AgentEvent>,
     pending_event_end: &mut Vec<(u32, u16, u16)>,
     self_char_id: u32,
     self_act_index: &mut Option<u16>,
+    name_cache: &mut std::collections::HashMap<u32, String>,
 ) {
     use ffxi_proto::map::s2c;
     match sub.opcode {
+        op if op == s2c::LOGIN => {
+            // 0x00A carries the zone-in payload — `ZoneNo` lives at body
+            // [44..48]. Without this handler the agent's `zone_id` stays
+            // pinned at the placeholder `0` set in `run_map_session`,
+            // breaking nav lookups, floor-tile loading, and any tool that
+            // keys on the current zone. Re-emit on every LOGIN so the
+            // post-zone-change reconnect's stale `ZoneChanged{to:0}` from
+            // the LOGOUT path is overwritten with the real new zone.
+            if let Ok(login) = decode::ServerLogin::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::ZoneChanged {
+                    from: None,
+                    to: login.zone_no,
+                });
+            }
+        }
         op if op == s2c::CHAR_PC || op == s2c::CHAR_NPC => {
             if let Ok(head) = decode::PosHead::decode(sub.data) {
                 let kind = if op == s2c::CHAR_PC {
@@ -338,6 +371,21 @@ fn handle_sub_packet(
                     *self_act_index = Some(head.act_index);
                 }
                 let name = decode::PosHead::try_extract_name(op, sub.data);
+                if let Some(n) = name.as_ref() {
+                    if !n.is_empty() {
+                        name_cache.insert(head.unique_no, n.clone());
+                    }
+                }
+                // CHAR_NPC body[40..44] holds `m_OwnerID` (claim id); CHAR_PC
+                // uses the same slot for `BtTargetID`. Decode them under
+                // their semantic names.
+                let claim_id = if op == s2c::CHAR_NPC {
+                    decode::PosHead::decode_char_npc(sub.data)
+                        .map(|(_, claim)| claim)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 let _ = event_tx.send(AgentEvent::EntityUpserted {
                     entity: Entity {
                         id: head.unique_no,
@@ -352,6 +400,7 @@ fn handle_sub_packet(
                         heading: head.dir,
                         hp_pct: Some(head.hpp),
                         bt_target_id: head.bt_target_id,
+                        claim_id,
                     },
                 });
             }
@@ -372,34 +421,78 @@ fn handle_sub_packet(
                         heading: head.dir,
                         hp_pct: Some(head.hpp),
                         bt_target_id: head.bt_target_id,
+                        claim_id: 0,
                     },
                 });
             }
         }
-        op if op == s2c::EVENT || op == s2c::EVENTSTR => {
-            // 0x032/0x033 share the same UniqueNo @ [0..4], ActIndex @ [4..6],
-            // EventNum @ [6..8] prefix.
-            if sub.data.len() >= 8 {
-                let unique_no = u32::from_le_bytes(sub.data[0..4].try_into().unwrap());
-                let act_index = u16::from_le_bytes(sub.data[4..6].try_into().unwrap());
-                let event_num = u16::from_le_bytes(sub.data[6..8].try_into().unwrap());
-                let _ = event_tx.send(AgentEvent::EventStart {
-                    event_id: ((unique_no as u64) << 16 | event_num as u64) as u32,
-                });
-                pending_event_end.push((unique_no, act_index, event_num));
+        op if op == s2c::BATTLE_MESSAGE => {
+            if let Some(line) = decode_battle_message(sub.data, name_cache, false) {
+                let _ = event_tx.send(AgentEvent::ChatLine { line });
+            }
+        }
+        op if op == s2c::BATTLE_MESSAGE2 => {
+            if let Some(line) = decode_battle_message(sub.data, name_cache, true) {
+                let _ = event_tx.send(AgentEvent::ChatLine { line });
+            }
+        }
+        op if op == s2c::SHOP_LIST => {
+            // 0x03C body = 4 header + 10*N item rows. Reassembly across
+            // multiple packets (>19 items) lands when we see one in the
+            // wild; today the fold replaces the previous list outright.
+            if let Some(shop) = decode_shop_list(sub.data) {
+                let _ = event_tx.send(AgentEvent::ShopUpdated { shop });
+            }
+        }
+        op if op == s2c::SHOP_OPEN => {
+            // 0x03E carries no item data — it just signals "the list you
+            // accumulated so far is final, render the window now". We
+            // translate this to a flag flip on the existing ShopState
+            // via a tiny helper event-fold rather than introducing a new
+            // event variant for what is essentially observability.
+            // Implementation: emit ShopUpdated with the current shop +
+            // opened=true. Since we don't have the previous state here,
+            // the fold downstream is what flips opened; we just signal.
+            //
+            // Simpler: rely on the `items.is_empty()` check in the HUD —
+            // a non-empty list is enough to draw. The opened flag is
+            // an extra hint; a follow-up can plumb it in if needed.
+        }
+        op if op == s2c::BATTLE2 => {
+            // Heavily bitpacked combat-action stream — see header note.
+            // Listed explicitly so the diagnostic dispatcher doesn't log
+            // it as "unknown opcode" once per action frame; intentionally
+            // a no-op until we ship a bitstream decoder.
+        }
+        op if op == s2c::MISCDATA => {
+            // 0x063 multiplexes by `type:u16`. Today we only consume
+            // type=0x09 STATUS_ICONS — other types (Merits, JobPoints,
+            // Homepoints, Unity) are nice-to-have HUD data but the
+            // decoder for each lives behind a per-type switch we'll
+            // grow as features need them.
+            if let Some(icons) = decode_miscdata_status_icons(sub.data) {
+                let _ = event_tx.send(AgentEvent::StatusIconsUpdated { icons });
+            }
+        }
+        op if op == s2c::EVENT => {
+            // 0x032 layout per server header:
+            //   u32 UniqueNo, u16 ActIndex, u16 EventNum, u16 EventPara,
+            //   u16 Mode, u16 EventNum2, u16 EventPara2 = 16 bytes.
+            if let Some(dialog) = decode_event_0x032(sub.data) {
+                emit_event_dialog(event_tx, &dialog, pending_event_end, name_cache);
+            }
+        }
+        op if op == s2c::EVENTSTR => {
+            // 0x033: 0x032 prefix + char String[4][16] + u32 Data[8].
+            if let Some(dialog) = decode_event_0x033(sub.data) {
+                emit_event_dialog(event_tx, &dialog, pending_event_end, name_cache);
             }
         }
         op if op == s2c::EVENTNUM => {
-            // 0x034: UniqueNo @ [0..4], num[8] @ [4..36], ActIndex @ [36..38],
-            // EventNum @ [38..40].
-            if sub.data.len() >= 40 {
-                let unique_no = u32::from_le_bytes(sub.data[0..4].try_into().unwrap());
-                let act_index = u16::from_le_bytes(sub.data[36..38].try_into().unwrap());
-                let event_num = u16::from_le_bytes(sub.data[38..40].try_into().unwrap());
-                let _ = event_tx.send(AgentEvent::EventStart {
-                    event_id: ((unique_no as u64) << 16 | event_num as u64) as u32,
-                });
-                pending_event_end.push((unique_no, act_index, event_num));
+            // 0x034: u32 UniqueNo, i32 num[8], u16 ActIndex, u16 EventNum,
+            // u16 EventPara, u16 Mode, u16 EventNum2, u16 EventPara2.
+            if let Some(dialog) = decode_event_0x034(sub.data) {
+                emit_event_dialog(event_tx, &dialog, pending_event_end, name_cache);
             }
         }
         op if op == s2c::MESSAGE => {
@@ -410,6 +503,34 @@ fn handle_sub_packet(
                     text: text.trim_end_matches('\0').to_string(),
                     server_ts: 0,
                 };
+                let _ = event_tx.send(AgentEvent::ChatLine { line });
+            }
+        }
+        op if op == s2c::CHAT => {
+            // `Kind:u8 Attr:u8 Data:u16 sName[15] Mes[var]`. Mes is variable
+            // — it runs to the sub-packet's reported length, which `framing`
+            // already trimmed for us in `sub.data`. Trim trailing NULs from
+            // both name and message; the server zero-pads.
+            if let Some(line) = decode_chat_std(sub.data) {
+                let _ = event_tx.send(AgentEvent::ChatLine { line });
+            }
+        }
+        op if op == s2c::SYSTEMMES => {
+            // 0x053 — formatted system message. Used by the /logout (id=7)
+            // and /shutdown (id=35) tickers, plus a handful of trust /
+            // treasure-pool messages. Look up the text in `msg_system`
+            // and substitute `<seconds>`/`<number>` from para/para2;
+            // unknown ids fall through to a visible `[system] msg #N`
+            // line so we never silently drop a packet.
+            if let Ok(m) = decode::SystemMessage::decode(sub.data) {
+                let line = build_system_message_line(m);
+                tracing::trace!(
+                    msg_id = m.message_id,
+                    para = m.para,
+                    para2 = m.para2,
+                    text = %line.text,
+                    "0x053 SYSTEMMES",
+                );
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
         }
@@ -514,6 +635,8 @@ async fn keepalive_loop(
     mut self_act_index: Option<u16>,
     cmd_rx: &mut mpsc::Receiver<AgentCommand>,
     event_tx: broadcast::Sender<AgentEvent>,
+    user_driven_events: bool,
+    mut name_cache: std::collections::HashMap<u32, String>,
 ) -> Result<MapOutcome> {
     let mut self_pos = Position::default();
     let mut last_recv = std::time::Instant::now();
@@ -524,6 +647,9 @@ async fn keepalive_loop(
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
+                if let Some(c) = cmd.as_ref() {
+                    tracing::info!(variant = ?std::mem::discriminant(c), "cmd_rx recv");
+                }
                 match cmd {
                     None => break,
                     Some(AgentCommand::Move { x, y, z, heading }) => {
@@ -536,7 +662,7 @@ async fn keepalive_loop(
                         if !pending_event_end.is_empty() {
                             let mut payload = Vec::new();
                             for (unique_no, act_index, event_num) in pending_event_end.drain(..) {
-                                payload.extend(build_subpacket_event_end(sub_seq, unique_no, act_index, event_num));
+                                payload.extend(build_subpacket_event_end(sub_seq, unique_no, act_index, event_num, 0));
                                 sub_seq = sub_seq.wrapping_add(1);
                             }
                             if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
@@ -546,9 +672,66 @@ async fn keepalive_loop(
                             let _ = event_tx.send(AgentEvent::EventEnded);
                         }
                     }
+                    Some(AgentCommand::EndEventChoice {
+                        event_id,
+                        act_index,
+                        event_num,
+                        choice,
+                    }) => {
+                        let payload = build_subpacket_event_end(
+                            sub_seq, event_id, act_index, event_num, choice,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "EVENT_END (choice) send failed");
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
+                        // Also drop this event from the auto-drain queue so
+                        // the keepalive tick doesn't double-end it.
+                        pending_event_end.retain(|(uid, _, en)| {
+                            !(*uid == event_id && *en == event_num)
+                        });
+                        let _ = event_tx.send(AgentEvent::EventEnded);
+                    }
                     Some(AgentCommand::Disconnect) => {
                         let _ = event_tx.send(AgentEvent::Disconnected { reason: "agent requested disconnect".into() });
                         break;
+                    }
+                    Some(AgentCommand::ReqLogout { kind }) => {
+                        // 0x0E7 ReqLogout. We do *not* break out of the
+                        // session loop — the server runs `EFFECT_LEAVEGAME`
+                        // (≈30s for normal players, immediate for GMs /
+                        // Mog House per `scripts/effects/leavegame.lua`),
+                        // and the closing s2c 0x00B LOGOUT
+                        // (state != ZONECHANGE) is what actually drops
+                        // us. Tearing down here would skip the server's
+                        // `blockedBy: { InEvent, AbnormalStatus, Crafting,
+                        // PreventAction }` validator — exactly the
+                        // misuse `AgentCommand::Disconnect` is for.
+                        let (mode, kind_wire) = kind.wire_pair();
+                        let payload = build_subpacket_reqlogout(sub_seq, mode, kind_wire);
+                        tracing::info!(
+                            ?kind,
+                            mode,
+                            kind_wire,
+                            sub_seq,
+                            bundle_seq,
+                            "reqlogout send (0x0E7)"
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "reqlogout send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("reqlogout send: {e}"),
+                            });
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::Snapshot) => {
                         let _ = event_tx.send(AgentEvent::Diagnostics {
@@ -565,6 +748,14 @@ async fn keepalive_loop(
                     }
                     Some(AgentCommand::Chat { kind, text }) => {
                         let payload = build_subpacket_chat(sub_seq, kind, &text);
+                        tracing::info!(
+                            kind,
+                            len = text.len(),
+                            sub_seq,
+                            bundle_seq,
+                            payload_bytes = payload.len(),
+                            "chat send (0x0B5)"
+                        );
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
                             .send_encrypted(&payload, bundle_seq, server_last_seq)
@@ -621,6 +812,47 @@ async fn keepalive_loop(
                                       (reactor middleware not wired)"
                                 .into(),
                         });
+                    }
+                    Some(AgentCommand::ShopBuy {
+                        shop_no,
+                        shop_index,
+                        qty,
+                    }) => {
+                        let payload = build_subpacket_shop_buy(sub_seq, qty, shop_no, shop_index);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "shop_buy send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("buy send: {e}"),
+                            });
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
+                    }
+                    Some(AgentCommand::CheckTarget {
+                        target_id,
+                        target_index,
+                        kind,
+                    }) => {
+                        let payload = build_subpacket_equip_inspect(
+                            sub_seq,
+                            target_id,
+                            target_index,
+                            kind.as_u8(),
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "equip_inspect send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("check send: {e}"),
+                            });
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::UseItem {
                         container,
@@ -693,11 +925,18 @@ async fn keepalive_loop(
             }
             _ = tick.tick() => {
                 // Build a bundle: any auto-event-ends drained, then a POS keepalive.
+                // `user_driven_events` suppresses the auto-drain so the dialog HUD
+                // gets a chance to display the event; the operator (or HUD-side
+                // input handler) sends `EndEvent` explicitly to advance.
                 let mut payload = Vec::new();
-                for (unique_no, act_index, event_num) in pending_event_end.drain(..) {
-                    payload.extend(build_subpacket_event_end(sub_seq, unique_no, act_index, event_num));
-                    sub_seq = sub_seq.wrapping_add(1);
-                    let _ = event_tx.send(AgentEvent::EventEnded);
+                if !user_driven_events {
+                    for (unique_no, act_index, event_num) in pending_event_end.drain(..) {
+                        payload.extend(build_subpacket_event_end(
+                            sub_seq, unique_no, act_index, event_num, 0,
+                        ));
+                        sub_seq = sub_seq.wrapping_add(1);
+                        let _ = event_tx.send(AgentEvent::EventEnded);
+                    }
                 }
                 payload.extend(build_subpacket_pos(
                     sub_seq,
@@ -751,6 +990,7 @@ async fn keepalive_loop(
                                 &mut pending_event_end,
                                 self_char_id,
                                 &mut self_act_index,
+                                &mut name_cache,
                             );
                         }
                     }
@@ -861,6 +1101,418 @@ fn build_subpacket_zone_transition(sync: u16) -> Vec<u8> {
     buf
 }
 
+/// Render a `0x053 SYSTEMMES` packet as a chat line. The message text
+/// comes from `xi.msg.system` and substitution fills `<seconds>` /
+/// `<number>` / `<param>` from `para`/`para2`. Unknown ids surface as
+/// `[system] msg #N para=A,B` so a missing scrape entry is visible
+/// rather than silent.
+fn build_system_message_line(m: decode::SystemMessage) -> ChatLine {
+    let text = match ffxi_proto::msg_system::lookup(m.message_id) {
+        Some(raw) => substitute_system_placeholders(raw, m.para, m.para2),
+        None => format!(
+            "[system] msg #{} para={},{}",
+            m.message_id, m.para, m.para2
+        ),
+    };
+    ChatLine {
+        channel: ChatChannel::System,
+        sender: "<server>".into(),
+        text,
+        server_ts: 0,
+    }
+}
+
+/// Replace numeric placeholders in `xi.msg.system` text with `para` /
+/// `para2`. The /logout countdown uses `<seconds>`; treasure-pool gil
+/// and trust messages use `<number>` / `<param>` / `<value>`. We map
+/// every numeric placeholder we've seen so far to `para`, with
+/// `<number2>` reaching `para2` to mirror the battle-message pattern.
+fn substitute_system_placeholders(raw: &str, para: u32, para2: u32) -> String {
+    let p = para.to_string();
+    let mut s = raw.to_string();
+    for tag in ["<seconds>", "<number>", "<param>", "<value>", "<amount>", "<n>", "<gil>"] {
+        s = s.replace(tag, &p);
+    }
+    if s.contains("<number2>") {
+        s = s.replace("<number2>", &para2.to_string());
+    }
+    s
+}
+
+/// `GP_SERV_COMMAND_BATTLE_MESSAGE` (0x029) and `BATTLE_MESSAGE2` (0x02D)
+/// share the same set of fields but in two different orderings:
+///
+/// - 0x029: `u32 UniqueNoCas, u32 UniqueNoTar, u32 Data, u32 Data2,
+///   u16 ActIndexCas, u16 ActIndexTar, u16 MessageNum, u8 Type, u8 pad`
+/// - 0x02D: `u32 UniqueNoCas, u32 UniqueNoTar, u16 ActIndexCas, u16 ActIndexTar,
+///   u32 Data, u32 Data2, u16 MessageNum, u8 Type, u8 pad`
+///
+/// Both are 24 bytes. `is_029` selects the layout. The text is looked up
+/// in `ffxi_proto::msg_basic`; `<user>`/`<target>`/`<amount>` placeholders
+/// are substituted against `name_cache` (session-local id→name table)
+/// and the `Data`/`Data2` fields. Returns `None` if the body is too short
+/// or the message id has no entry in `msg_basic` (rare ids live in
+/// `msg_combat` / `msg_status` tables we don't ship yet).
+fn decode_battle_message(
+    data: &[u8],
+    name_cache: &std::collections::HashMap<u32, String>,
+    is_029: bool,
+) -> Option<ChatLine> {
+    if data.len() < 24 {
+        return None;
+    }
+    let cas_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let tar_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let (data1, data2) = if is_029 {
+        (
+            u32::from_le_bytes(data[8..12].try_into().unwrap()),
+            u32::from_le_bytes(data[12..16].try_into().unwrap()),
+        )
+    } else {
+        (
+            u32::from_le_bytes(data[12..16].try_into().unwrap()),
+            u32::from_le_bytes(data[16..20].try_into().unwrap()),
+        )
+    };
+    let message_num = u16::from_le_bytes(data[20..22].try_into().unwrap());
+
+    let raw = ffxi_proto::msg_basic::lookup(message_num)?;
+    let cas_name = name_for_id(cas_id, name_cache);
+    let tar_name = name_for_id(tar_id, name_cache);
+    let text = substitute_battle_placeholders(raw, &cas_name, &tar_name, data1, data2);
+    Some(ChatLine {
+        channel: ChatChannel::Battle,
+        // Use the actor's name as the sender so the chat row reads
+        // "Cas: hits Tar for X damage." — same shape as social channels.
+        sender: cas_name,
+        text,
+        server_ts: 0,
+    })
+}
+
+/// Resolve a `UniqueNo` to a display name via the session-local cache;
+/// fall back to the hex id when the entity hasn't been seen yet (common
+/// right after a zone-in before CHAR_PC/CHAR_NPC has flooded). `id == 0`
+/// is the "no actor" sentinel some battle messages carry.
+fn name_for_id(id: u32, name_cache: &std::collections::HashMap<u32, String>) -> String {
+    if id == 0 {
+        return "<no one>".to_string();
+    }
+    name_cache
+        .get(&id)
+        .cloned()
+        .unwrap_or_else(|| format!("#{:08X}", id))
+}
+
+/// Substitute the FFXI placeholder tokens used in `msg_basic.h` comments.
+/// We handle the high-frequency tokens directly; rare ones (`<spell>`,
+/// `<item>`, `<job>`, …) require lookup tables we don't ship yet and are
+/// left as-is so the operator at least sees the literal token rather
+/// than a hidden gap.
+fn substitute_battle_placeholders(
+    raw: &str,
+    cas_name: &str,
+    tar_name: &str,
+    data1: u32,
+    data2: u32,
+) -> String {
+    let mut s = raw.to_string();
+    for tag in ["<user>", "<attacker>", "<caster>", "<player>"] {
+        s = s.replace(tag, cas_name);
+    }
+    for tag in ["<target>"] {
+        s = s.replace(tag, tar_name);
+    }
+    let amount = data1.to_string();
+    for tag in ["<amount>", "<number>"] {
+        s = s.replace(tag, &amount);
+    }
+    if s.contains("<number2>") {
+        s = s.replace("<number2>", &data2.to_string());
+    }
+    s
+}
+
+/// `GP_SERV_COMMAND_EVENT` (0x032) decoder. Body layout per
+/// `vendor/server/src/map/packets/s2c/0x032_event.h`:
+/// `u32 UniqueNo, u16 ActIndex, u16 EventNum, u16 EventPara, u16 Mode,
+///  u16 EventNum2, u16 EventPara2` = 16 bytes.
+fn decode_event_0x032(data: &[u8]) -> Option<crate::state::DialogState> {
+    if data.len() < 16 {
+        return None;
+    }
+    let unique_no = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let act_index = u16::from_le_bytes(data[4..6].try_into().unwrap());
+    let event_num = u16::from_le_bytes(data[6..8].try_into().unwrap());
+    let event_para = u16::from_le_bytes(data[8..10].try_into().unwrap());
+    let mode = u16::from_le_bytes(data[10..12].try_into().unwrap());
+    let event_num2 = u16::from_le_bytes(data[12..14].try_into().unwrap());
+    let event_para2 = u16::from_le_bytes(data[14..16].try_into().unwrap());
+    Some(crate::state::DialogState {
+        event_id: ((unique_no as u64) << 16 | event_num as u64) as u32,
+        npc_id: unique_no,
+        npc_name: None,
+        act_index,
+        event_num,
+        event_para,
+        mode,
+        event_num2,
+        event_para2,
+        strings: Vec::new(),
+        nums: Vec::new(),
+    })
+}
+
+/// `GP_SERV_COMMAND_EVENTSTR` (0x033) decoder. Body layout per
+/// `vendor/server/src/map/packets/s2c/0x033_eventstr.h`:
+/// 0x032 prefix (without EventNum2/EventPara2) + `char String[4][16]` +
+/// `u32 Data[8]`. The strings are NUL-trimmed; runs of empty strings are
+/// dropped from the tail to keep the surfaced list compact.
+fn decode_event_0x033(data: &[u8]) -> Option<crate::state::DialogState> {
+    // 12 (UniqueNo+ActIndex+EventNum+EventPara+Mode) + 64 (4×16 strings)
+    // + 32 (8×u32) = 108 bytes minimum.
+    if data.len() < 108 {
+        return None;
+    }
+    let unique_no = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let act_index = u16::from_le_bytes(data[4..6].try_into().unwrap());
+    let event_num = u16::from_le_bytes(data[6..8].try_into().unwrap());
+    let event_para = u16::from_le_bytes(data[8..10].try_into().unwrap());
+    let mode = u16::from_le_bytes(data[10..12].try_into().unwrap());
+
+    let mut strings: Vec<String> = (0..4)
+        .map(|i| {
+            let off = 12 + i * 16;
+            trim_nul_string(&data[off..off + 16])
+        })
+        .collect();
+    while strings.last().map(String::is_empty).unwrap_or(false) {
+        strings.pop();
+    }
+
+    // Data[8] runs at offset 12 + 64 = 76.
+    let nums: Vec<i32> = (0..8)
+        .map(|i| {
+            let off = 76 + i * 4;
+            i32::from_le_bytes(data[off..off + 4].try_into().unwrap())
+        })
+        .collect();
+
+    Some(crate::state::DialogState {
+        event_id: ((unique_no as u64) << 16 | event_num as u64) as u32,
+        npc_id: unique_no,
+        npc_name: None,
+        act_index,
+        event_num,
+        event_para,
+        mode,
+        // 0x033 doesn't carry EventNum2/EventPara2 — leave at default 0.
+        event_num2: 0,
+        event_para2: 0,
+        strings,
+        nums,
+    })
+}
+
+/// `GP_SERV_COMMAND_EVENTNUM` (0x034) decoder. Body layout per
+/// `vendor/server/src/map/packets/s2c/0x034_eventnum.h`:
+/// `u32 UniqueNo, i32 num[8], u16 ActIndex, u16 EventNum, u16 EventPara,
+///  u16 Mode, u16 EventNum2, u16 EventPara2` = 48 bytes.
+fn decode_event_0x034(data: &[u8]) -> Option<crate::state::DialogState> {
+    if data.len() < 48 {
+        return None;
+    }
+    let unique_no = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let nums: Vec<i32> = (0..8)
+        .map(|i| {
+            let off = 4 + i * 4;
+            i32::from_le_bytes(data[off..off + 4].try_into().unwrap())
+        })
+        .collect();
+    let act_index = u16::from_le_bytes(data[36..38].try_into().unwrap());
+    let event_num = u16::from_le_bytes(data[38..40].try_into().unwrap());
+    let event_para = u16::from_le_bytes(data[40..42].try_into().unwrap());
+    let mode = u16::from_le_bytes(data[42..44].try_into().unwrap());
+    let event_num2 = u16::from_le_bytes(data[44..46].try_into().unwrap());
+    let event_para2 = u16::from_le_bytes(data[46..48].try_into().unwrap());
+    Some(crate::state::DialogState {
+        event_id: ((unique_no as u64) << 16 | event_num as u64) as u32,
+        npc_id: unique_no,
+        npc_name: None,
+        act_index,
+        event_num,
+        event_para,
+        mode,
+        event_num2,
+        event_para2,
+        strings: Vec::new(),
+        nums,
+    })
+}
+
+/// `GP_SERV_COMMAND_SHOP_LIST` (0x03C) decoder. Body layout per
+/// `vendor/server/src/map/packets/s2c/0x03c_shop_list.h`:
+///   u16 ShopItemOffsetIndex, u8 Flags, u8 pad, GP_SHOP[N]
+///   GP_SHOP = u32 ItemPrice, u16 ItemNo, u8 ShopIndex, u8 pad,
+///             u16 Skill, u16 GuildInfo  (12 bytes)
+///
+/// The number of items is implied by the body length: `(len - 4) / 12`.
+/// Items beyond what fits in the body are dropped silently — the server
+/// chunks lists >19 items across multiple packets, and the simple fold
+/// replaces the prior list rather than appending. Reassembly lands when
+/// we see a >19-item shop in practice.
+fn decode_shop_list(data: &[u8]) -> Option<ShopState> {
+    const HEADER_LEN: usize = 4;
+    const ROW_LEN: usize = 12;
+    if data.len() < HEADER_LEN {
+        return None;
+    }
+    let offset_index = u16::from_le_bytes(data[0..2].try_into().unwrap());
+    let row_bytes = &data[HEADER_LEN..];
+    let row_count = row_bytes.len() / ROW_LEN;
+    let mut items = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        let off = i * ROW_LEN;
+        let row = &row_bytes[off..off + ROW_LEN];
+        let item_no = u16::from_le_bytes(row[4..6].try_into().unwrap());
+        // Some servers pad the unused tail of the array with zeroed rows;
+        // skip those (item_no == 0 is the sentinel) so the HUD doesn't
+        // show empty rows. A real shop never sells item id 0.
+        if item_no == 0 {
+            continue;
+        }
+        items.push(ShopItem {
+            price: u32::from_le_bytes(row[0..4].try_into().unwrap()),
+            item_no,
+            shop_index: row[6],
+            // row[7] = padding byte
+            skill: u16::from_le_bytes(row[8..10].try_into().unwrap()),
+            guild_info: u16::from_le_bytes(row[10..12].try_into().unwrap()),
+        });
+    }
+    Some(ShopState {
+        offset_index,
+        items,
+        // 0x03E `SHOP_OPEN` flips this to true in a follow-up; phase 1
+        // leaves it false — the HUD draws on `!items.is_empty()` anyway.
+        opened: false,
+    })
+}
+
+/// `GP_SERV_COMMAND_MISCDATA` (0x063) → STATUS_ICONS variant.
+///
+/// Body layout per `0x063_miscdata_status_icons.h`:
+///
+/// ```text
+///   u16 type           // == 0x09 for StatusIcons; we ignore other types here
+///   u16 unknown06      // server uses sizeof(PacketData)
+///   u16 icons[32]      // 64 bytes
+///   u32 timestamps[32] // 128 bytes  (ignored by the basic decoder)
+/// ```
+///
+/// Total body = 196 bytes. `0x00FF` is the "no icon" placeholder; we
+/// drop those from the returned vec. Returns `None` if the body is
+/// truncated or the type field isn't `0x09`.
+fn decode_miscdata_status_icons(data: &[u8]) -> Option<Vec<u16>> {
+    const TYPE_OFFSET: usize = 0;
+    const ICONS_OFFSET: usize = 4;
+    const ICONS_COUNT: usize = 32;
+    const ICONS_BYTES: usize = ICONS_COUNT * 2;
+    const PLACEHOLDER: u16 = 0x00FF;
+
+    if data.len() < ICONS_OFFSET + ICONS_BYTES {
+        return None;
+    }
+    let kind = u16::from_le_bytes(data[TYPE_OFFSET..TYPE_OFFSET + 2].try_into().unwrap());
+    if kind != 0x0009 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for i in 0..ICONS_COUNT {
+        let off = ICONS_OFFSET + i * 2;
+        let icon = u16::from_le_bytes(data[off..off + 2].try_into().unwrap());
+        if icon != PLACEHOLDER && icon != 0 {
+            out.push(icon);
+        }
+    }
+    Some(out)
+}
+
+/// `GP_CLI_COMMAND_SHOP_BUY` (0x083) builder. 4-byte sub-packet header
+/// + 12-byte body = 16 bytes (size_words = 4).
+///
+/// Body per `vendor/server/src/map/packets/c2s/0x083_shop_buy.h`:
+///   u32 ItemNum (qty), u16 ShopNo, u16 ShopItemIndex,
+///   u8 PropertyItemIndex, u8 pad[3]
+///
+/// `PropertyItemIndex` selects which of the player's containers to
+/// deposit into; `0` (= LOC_INVENTORY) is the universal default and what
+/// classic FFXI clients send for NPC purchases. We hard-code it for v1.
+pub fn build_subpacket_shop_buy(sync: u16, qty: u32, shop_no: u16, shop_index: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 16];
+    buf[0..4].copy_from_slice(&build_subpacket_header(0x083, 4, sync));
+    buf[4..8].copy_from_slice(&qty.to_le_bytes());
+    buf[8..10].copy_from_slice(&shop_no.to_le_bytes());
+    buf[10..12].copy_from_slice(&(shop_index as u16).to_le_bytes());
+    buf[12] = 0; // PropertyItemIndex = LOC_INVENTORY
+    buf
+}
+
+/// Emit both the lean `EventStart` (event_id only — preserves the legacy
+/// agent JSON contract) and the rich `EventDialog` (drives the HUD), and
+/// queue the auto-end so an unattended session doesn't sit in an event
+/// indefinitely. The auto-end is still wired the same way it was before
+/// the C5 split — wiring user-driven event dismissal lands in C5 phase 2.
+fn emit_event_dialog(
+    event_tx: &broadcast::Sender<AgentEvent>,
+    dialog: &crate::state::DialogState,
+    pending_event_end: &mut Vec<(u32, u16, u16)>,
+    name_cache: &std::collections::HashMap<u32, String>,
+) {
+    let _ = event_tx.send(AgentEvent::EventStart {
+        event_id: dialog.event_id,
+    });
+    // Resolve from the session's id→name cache so off-screen NPCs (which
+    // can fire events before their CHAR_NPC packet lands in the snapshot)
+    // still surface a readable name. The HUD downstream further falls
+    // back to `Entity.name` then to a hex placeholder.
+    let mut dialog = dialog.clone();
+    if dialog.npc_name.is_none() {
+        dialog.npc_name = name_cache.get(&dialog.npc_id).cloned();
+    }
+    let _ = event_tx.send(AgentEvent::EventDialog {
+        dialog: dialog.clone(),
+    });
+    pending_event_end.push((dialog.npc_id, dialog.act_index, dialog.event_num));
+}
+
+/// `GP_SERV_COMMAND_CHAT_STD` (0x017) decoder. Body layout per
+/// `vendor/server/src/map/packets/s2c/0x017_chat_std.h`:
+/// `Kind:u8 Attr:u8 Data:u16 sName[15] Mes[var]`. Returns `None` if the
+/// body is shorter than the fixed prefix.
+fn decode_chat_std(data: &[u8]) -> Option<ChatLine> {
+    const PREFIX: usize = 4 + 15; // Kind + Attr + Data + sName
+    if data.len() < PREFIX {
+        return None;
+    }
+    let kind = data[0];
+    let sender = trim_nul_string(&data[4..PREFIX]);
+    let text = trim_nul_string(&data[PREFIX..]);
+    Some(ChatLine {
+        channel: ChatChannel::from_chat_kind(kind),
+        sender,
+        text,
+        server_ts: 0,
+    })
+}
+
+/// Decode a NUL-terminated, possibly NUL-padded byte slice as UTF-8 with
+/// lossy fallback. Used for both `sName` and `Mes` fields in 0x017.
+fn trim_nul_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
 /// `GP_CLI_COMMAND_CHAT_STD` (0x0B5) — 4-byte header + 1B Kind + 1B padding +
 /// up to 128B Str. We round the total body length up to a 4-byte boundary
 /// because the sub-packet `size_words` field is in 4-byte units (i.e.
@@ -912,13 +1564,20 @@ fn build_subpacket_tell(sync: u16, recipient: &str, text: &str) -> Vec<u8> {
 }
 
 /// `GP_CLI_COMMAND_EVENTEND` (0x05B) — 4-byte header + 16-byte body = 20 bytes
-/// (size_words=5). We send Mode=0, EndPara=0 — the "skip whatever the NPC was
-/// trying to say" form.
-fn build_subpacket_event_end(sync: u16, unique_no: u32, act_index: u16, event_num: u16) -> Vec<u8> {
+/// (size_words=5). `Mode=0`, `EndPara=choice` — choice 0 is the canonical
+/// "skip whatever the NPC was trying to say" form; nonzero values pick a
+/// branch in the event's lua-side `onEventFinish(choice)` handler.
+fn build_subpacket_event_end(
+    sync: u16,
+    unique_no: u32,
+    act_index: u16,
+    event_num: u16,
+    choice: u32,
+) -> Vec<u8> {
     let mut buf = vec![0u8; 20];
     buf[0..4].copy_from_slice(&build_subpacket_header(0x05B, 5, sync));
     buf[4..8].copy_from_slice(&unique_no.to_le_bytes());
-    // EndPara u32 stays 0
+    buf[8..12].copy_from_slice(&choice.to_le_bytes());
     buf[12..14].copy_from_slice(&act_index.to_le_bytes());
     // Mode u16 stays 0
     buf[16..18].copy_from_slice(&event_num.to_le_bytes());
@@ -960,6 +1619,52 @@ pub fn build_subpacket_action(
 ///                                                     1 LOC_TEMPITEMS, …).
 /// - `slot`       → wire `PropertyItemIndex` = slot index within the container.
 /// - `ItemNum`    → forced to 0 (server enforces).
+/// `GP_CLI_COMMAND_EQUIP_INSPECT` (0x0DD) — `/check` and friends. 4-byte
+/// header + 4 UniqueNo + 4 ActIndex + 1 Kind + 3 padding = 16 bytes
+/// (size_words=4). `kind` is `0=Check, 1=CheckName, 2=CheckParam` per
+/// `vendor/server/src/map/packets/c2s/0x0dd_equip_inspect.h`. The server
+/// replies with 0x0C9 (`equip_inspect_general` or
+/// `equip_inspect_equipment`) once the inspect is resolved.
+pub fn build_subpacket_equip_inspect(
+    sync: u16,
+    unique_no: u32,
+    act_index: u16,
+    kind: u8,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 16];
+    buf[0..4].copy_from_slice(&build_subpacket_header(0x0DD, 4, sync));
+    buf[4..8].copy_from_slice(&unique_no.to_le_bytes());
+    // Wire ActIndex is u32, but our internal representation tops out at
+    // u16 (ActIndex is bounded by zone entity count). Zero-extend.
+    buf[8..12].copy_from_slice(&(act_index as u32).to_le_bytes());
+    buf[12] = kind;
+    // buf[13..16] is padding00, already zeroed.
+    buf
+}
+
+/// `GP_CLI_COMMAND_REQLOGOUT` (0x0E7) — `/logout` / `/shutdown` request.
+/// 4-byte header + 2 Mode + 2 Kind = 8 bytes (size_words=2). The server
+/// validates `(Mode, Kind)` via `oneOf<...>` (see
+/// `vendor/server/src/map/packets/c2s/0x0e7_reqlogout.cpp::validate`);
+/// callers route through [`AgentCommand::ReqLogout`] +
+/// [`crate::state::ReqLogoutKind`] which only emit pairs the server
+/// accepts. Once the server's `EFFECT_LEAVEGAME` ticks down (≈30s for
+/// normal players, immediate for GMs / Mog House per
+/// `scripts/effects/leavegame.lua`), an s2c 0x00B `LOGOUT` lands and
+/// the session loop's terminal-state path (state != ZONECHANGE) tears
+/// down the connection.
+pub fn build_subpacket_reqlogout(sync: u16, mode: u16, kind: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::REQ_LOGOUT,
+        2,
+        sync,
+    ));
+    buf[4..6].copy_from_slice(&mode.to_le_bytes());
+    buf[6..8].copy_from_slice(&kind.to_le_bytes());
+    buf
+}
+
 pub fn build_subpacket_item_use(
     sync: u16,
     unique_no: u32,
@@ -1146,6 +1851,272 @@ mod tests {
     }
 
     #[test]
+    fn event_0x032_decodes_full_layout() {
+        // 16-byte body. Hand-fill each field with a distinct value so the
+        // mapping is obvious if any offset slips.
+        let mut data = vec![0u8; 16];
+        data[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes()); // UniqueNo
+        data[4..6].copy_from_slice(&7u16.to_le_bytes()); // ActIndex
+        data[6..8].copy_from_slice(&42u16.to_le_bytes()); // EventNum
+        data[8..10].copy_from_slice(&3u16.to_le_bytes()); // EventPara
+        data[10..12].copy_from_slice(&1u16.to_le_bytes()); // Mode
+        data[12..14].copy_from_slice(&5u16.to_le_bytes()); // EventNum2
+        data[14..16].copy_from_slice(&9u16.to_le_bytes()); // EventPara2
+
+        let d = decode_event_0x032(&data).expect("decoded");
+        assert_eq!(d.npc_id, 0x1234_5678);
+        assert_eq!(d.act_index, 7);
+        assert_eq!(d.event_num, 42);
+        assert_eq!(d.event_para, 3);
+        assert_eq!(d.mode, 1);
+        assert_eq!(d.event_num2, 5);
+        assert_eq!(d.event_para2, 9);
+        assert!(d.strings.is_empty());
+        assert!(d.nums.is_empty());
+        assert_eq!(d.event_id, ((0x1234_5678u64 << 16) | 42u64) as u32);
+    }
+
+    #[test]
+    fn event_0x033_extracts_strings_and_data() {
+        let mut data = vec![0u8; 108];
+        data[0..4].copy_from_slice(&100u32.to_le_bytes());
+        data[4..6].copy_from_slice(&1u16.to_le_bytes());
+        data[6..8].copy_from_slice(&50u16.to_le_bytes());
+        // String[0] = "Selh"
+        data[12..16].copy_from_slice(b"Selh");
+        // String[1] = "Bastok"
+        data[28..34].copy_from_slice(b"Bastok");
+        // String[2,3] empty — should be trimmed from tail.
+        // Data[0..2] = 100, 200
+        data[76..80].copy_from_slice(&100i32.to_le_bytes());
+        data[80..84].copy_from_slice(&200i32.to_le_bytes());
+
+        let d = decode_event_0x033(&data).expect("decoded");
+        assert_eq!(d.strings, vec!["Selh".to_string(), "Bastok".to_string()]);
+        assert_eq!(d.nums.len(), 8);
+        assert_eq!(d.nums[0], 100);
+        assert_eq!(d.nums[1], 200);
+        assert_eq!(d.nums[2], 0);
+    }
+
+    #[test]
+    fn event_0x034_extracts_nums_and_param_block() {
+        let mut data = vec![0u8; 48];
+        data[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        // num[0] = -5, num[1] = 1234
+        data[4..8].copy_from_slice(&(-5i32).to_le_bytes());
+        data[8..12].copy_from_slice(&1234i32.to_le_bytes());
+        // ActIndex/EventNum at the end.
+        data[36..38].copy_from_slice(&3u16.to_le_bytes());
+        data[38..40].copy_from_slice(&77u16.to_le_bytes());
+        data[40..42].copy_from_slice(&2u16.to_le_bytes()); // EventPara
+        data[42..44].copy_from_slice(&1u16.to_le_bytes()); // Mode
+
+        let d = decode_event_0x034(&data).expect("decoded");
+        assert_eq!(d.npc_id, 0xDEAD_BEEF);
+        assert_eq!(d.act_index, 3);
+        assert_eq!(d.event_num, 77);
+        assert_eq!(d.event_para, 2);
+        assert_eq!(d.mode, 1);
+        assert_eq!(d.nums.len(), 8);
+        assert_eq!(d.nums[0], -5);
+        assert_eq!(d.nums[1], 1234);
+    }
+
+    #[test]
+    fn battle_message_0x029_substitutes_user_target_amount() {
+        // msg_basic id 1 is the canonical "<user> hits <target> for <amount>
+        // points of damage." line. We hand-build a 0x029 body matching the
+        // header struct, populate the cache for both ids, and assert the
+        // substituted text.
+        use std::collections::HashMap;
+
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0x1111_1111u32.to_le_bytes()); // cas
+        data[4..8].copy_from_slice(&0x2222_2222u32.to_le_bytes()); // tar
+        data[8..12].copy_from_slice(&12u32.to_le_bytes()); // Data (amount)
+        data[12..16].copy_from_slice(&0u32.to_le_bytes()); // Data2
+        data[16..18].copy_from_slice(&3u16.to_le_bytes()); // ActIndexCas
+        data[18..20].copy_from_slice(&4u16.to_le_bytes()); // ActIndexTar
+        data[20..22].copy_from_slice(&1u16.to_le_bytes()); // MessageNum
+
+        let mut cache = HashMap::new();
+        cache.insert(0x1111_1111u32, "Sylvie".to_string());
+        cache.insert(0x2222_2222u32, "Mandy".to_string());
+
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert_eq!(line.channel, ChatChannel::Battle);
+        assert_eq!(line.sender, "Sylvie");
+        assert!(line.text.contains("Sylvie"));
+        assert!(line.text.contains("Mandy"));
+        assert!(line.text.contains("12"));
+    }
+
+    #[test]
+    fn battle_message_0x02d_uses_reordered_data_offsets() {
+        // 0x02D moves Data/Data2 *after* the ActIndex pair. If the decoder
+        // confused the two layouts, the amount substitution would pull
+        // from the ActIndex slot and yield nonsense (a tiny number that
+        // looks like an act_index, not an actual damage value).
+        use std::collections::HashMap;
+
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&1u32.to_le_bytes()); // cas
+        data[4..8].copy_from_slice(&2u32.to_le_bytes()); // tar
+        data[8..10].copy_from_slice(&7u16.to_le_bytes()); // ActIndexCas
+        data[10..12].copy_from_slice(&8u16.to_le_bytes()); // ActIndexTar
+        data[12..16].copy_from_slice(&999u32.to_le_bytes()); // Data (amount)
+        data[16..20].copy_from_slice(&0u32.to_le_bytes()); // Data2
+        data[20..22].copy_from_slice(&1u16.to_le_bytes()); // MessageNum=1
+
+        let cache = HashMap::new();
+        let line = decode_battle_message(&data, &cache, false).expect("decoded");
+        assert!(
+            line.text.contains("999"),
+            "expected amount=999 from offsets [12..16], got: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn battle_message_falls_back_to_hex_id_for_unknown_actor() {
+        // A cas_id we haven't seen yet (e.g., a mob right after zone-in
+        // before its CHAR_NPC arrives) must resolve to a hex token, not
+        // panic and not silently drop the line.
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        data[4..8].copy_from_slice(&0u32.to_le_bytes()); // tar = 0 → "<no one>"
+        data[8..12].copy_from_slice(&5u32.to_le_bytes());
+        data[20..22].copy_from_slice(&1u16.to_le_bytes());
+        let line = decode_battle_message(&data, &HashMap::new(), true).expect("decoded");
+        assert_eq!(line.sender, "#DEADBEEF");
+        assert!(line.text.contains("<no one>") || line.text.contains("#DEADBEEF"));
+    }
+
+    #[test]
+    fn battle_message_unknown_id_returns_none() {
+        // Message id 0xFFFF isn't in msg_basic (and won't be — it's a
+        // sentinel). The decoder must return None so the dispatcher
+        // skips emitting an empty chat line.
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[20..22].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        assert!(decode_battle_message(&data, &HashMap::new(), true).is_none());
+    }
+
+    #[test]
+    fn miscdata_status_icons_drops_placeholder_slots() {
+        // Body layout: u16 type, u16 unknown06, 32×u16 icons, 32×u32 timestamps.
+        let mut data = vec![0u8; 4 + 64 + 128];
+        data[0..2].copy_from_slice(&0x0009u16.to_le_bytes()); // type=StatusIcons
+        // Slot 0: real icon 33
+        data[4..6].copy_from_slice(&33u16.to_le_bytes());
+        // Slot 1: placeholder 0x00FF — must be dropped.
+        data[6..8].copy_from_slice(&0x00FFu16.to_le_bytes());
+        // Slot 2: real icon 12
+        data[8..10].copy_from_slice(&12u16.to_le_bytes());
+        // Remaining slots stay 0 — also dropped.
+        let icons = decode_miscdata_status_icons(&data).expect("decoded");
+        assert_eq!(icons, vec![33, 12]);
+    }
+
+    #[test]
+    fn miscdata_status_icons_rejects_wrong_type() {
+        let mut data = vec![0u8; 4 + 64 + 128];
+        data[0..2].copy_from_slice(&0x0005u16.to_le_bytes()); // JobPoints, not StatusIcons
+        // Even with valid icon bytes, the type guard should bail.
+        data[4..6].copy_from_slice(&33u16.to_le_bytes());
+        assert!(decode_miscdata_status_icons(&data).is_none());
+    }
+
+    #[test]
+    fn miscdata_status_icons_truncated_returns_none() {
+        let data = vec![0u8; 10]; // way under the icons array
+        assert!(decode_miscdata_status_icons(&data).is_none());
+    }
+
+    #[test]
+    fn shop_list_decodes_rows_and_skips_zero_padding() {
+        // Two real rows + one zeroed-out tail row. Decoder must keep the
+        // two real ones and drop the padding row.
+        let mut data = vec![0u8; 4 + 12 * 3];
+        data[0..2].copy_from_slice(&5u16.to_le_bytes()); // ShopItemOffsetIndex
+
+        // Row 0 at offset 4: price=100, item=4096, idx=0
+        data[4..8].copy_from_slice(&100u32.to_le_bytes());
+        data[8..10].copy_from_slice(&4096u16.to_le_bytes());
+        data[10] = 0; // shop_index
+        // Row 1 at offset 16: price=99999, item=256, idx=1
+        data[16..20].copy_from_slice(&99999u32.to_le_bytes());
+        data[20..22].copy_from_slice(&256u16.to_le_bytes());
+        data[22] = 1; // shop_index
+        // Row 2 at offset 28: zeroed (item_no = 0) → must be skipped.
+
+        let shop = decode_shop_list(&data).expect("decoded");
+        assert_eq!(shop.offset_index, 5);
+        assert_eq!(shop.items.len(), 2);
+        assert_eq!(shop.items[0].price, 100);
+        assert_eq!(shop.items[0].item_no, 4096);
+        assert_eq!(shop.items[1].item_no, 256);
+        assert_eq!(shop.items[1].price, 99999);
+        assert!(!shop.opened);
+    }
+
+    #[test]
+    fn shop_buy_packet_layout_matches_server_struct() {
+        // Layout per vendor/server/src/map/packets/c2s/0x083_shop_buy.h:
+        //   u32 ItemNum, u16 ShopNo, u16 ShopItemIndex,
+        //   u8 PropertyItemIndex, u8 pad[3]
+        let buf = build_subpacket_shop_buy(0xABCD, 5, 12, 3);
+        assert_eq!(buf.len(), 16);
+        let hdr = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(hdr & 0x01FF, 0x083);
+        assert_eq!((hdr >> 9) & 0x7F, 4);
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 5, "qty");
+        assert_eq!(u16::from_le_bytes(buf[8..10].try_into().unwrap()), 12, "shop_no");
+        assert_eq!(
+            u16::from_le_bytes(buf[10..12].try_into().unwrap()),
+            3,
+            "shop_index zero-extended to u16"
+        );
+        assert_eq!(buf[12], 0, "PropertyItemIndex = LOC_INVENTORY");
+        assert_eq!(&buf[13..16], &[0u8; 3], "padding");
+    }
+
+    #[test]
+    fn event_decoders_reject_short_bodies() {
+        assert!(decode_event_0x032(&[0u8; 15]).is_none());
+        assert!(decode_event_0x033(&[0u8; 107]).is_none());
+        assert!(decode_event_0x034(&[0u8; 47]).is_none());
+    }
+
+    #[test]
+    fn equip_inspect_packet_layout_matches_server_struct() {
+        // Layout per vendor/server/src/map/packets/c2s/0x0dd_equip_inspect.h:
+        //   u32 UniqueNo, u32 ActIndex, u8 Kind, u8 padding00[3]
+        // Sub-packet header (4 bytes) is 0x0DD opcode + size_words=4 + sync.
+        let buf = build_subpacket_equip_inspect(0xABCD, 0x1234_5678, 42, 1);
+        assert_eq!(buf.len(), 16, "header (4) + body (12)");
+        // Header opcode + size_words. Header layout: opcode | (size_words << 9).
+        let hdr_word = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(hdr_word & 0x01FF, 0x0DD, "opcode in low 9 bits");
+        assert_eq!((hdr_word >> 9) & 0x7F, 4, "size_words=4");
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            0x1234_5678,
+            "UniqueNo LE"
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            42,
+            "ActIndex zero-extended to u32 LE"
+        );
+        assert_eq!(buf[12], 1, "Kind=CheckName");
+        assert_eq!(&buf[13..16], &[0u8; 3], "padding00");
+    }
+
+    #[test]
     fn item_use_with_nonzero_category_writes_full_u32() {
         // Sanity: a higher category id (8 = LOC_WARDROBE) lands in all
         // four bytes of the Category field, not just the low byte.
@@ -1155,5 +2126,98 @@ mod tests {
             8,
             "Category u32 LE"
         );
+    }
+
+    /// Hand-build a 0x017 sub-packet body and verify the decoder maps each
+    /// `CHAT_MESSAGE_TYPE` byte to the expected `ChatChannel`. The kinds we
+    /// surface with full fidelity are the ones the chat panel filters on;
+    /// the rest collapse to `Other`.
+    #[test]
+    fn chat_std_decoder_maps_each_channel() {
+        use ffxi_proto::map::chat_kind as k;
+        let cases = [
+            (k::SAY, ChatChannel::Say),
+            (k::SHOUT, ChatChannel::Shout),
+            (k::TELL, ChatChannel::Tell),
+            (k::PARTY, ChatChannel::Party),
+            (k::LINKSHELL, ChatChannel::Linkshell),
+            (k::YELL, ChatChannel::Yell),
+            (k::SYSTEM_1, ChatChannel::System),
+            (k::SYSTEM_3, ChatChannel::System),
+            (k::EMOTION, ChatChannel::Say),
+            (k::NS_PARTY, ChatChannel::Party),
+            (k::LINKSHELL2, ChatChannel::Linkshell),
+            (200u8, ChatChannel::Other),
+        ];
+        for (kind, expected) in cases {
+            let mut body = vec![0u8; 4 + 15];
+            body[0] = kind;
+            body.extend_from_slice(b"Hello there");
+            body.push(0);
+            let line = decode_chat_std(&body).expect("decoder accepts well-formed body");
+            assert_eq!(line.channel, expected, "kind {kind} → {expected:?}");
+            assert_eq!(line.text, "Hello there");
+        }
+    }
+
+    #[test]
+    fn chat_std_decoder_extracts_sender_and_message() {
+        // Kind = SAY, sName = "Sylvie", Mes = "hi all". `sName` lives at
+        // body offset 4..19 (15 bytes, NUL-padded).
+        let mut body = vec![0u8; 4 + 15];
+        body[0] = ffxi_proto::map::chat_kind::SAY;
+        body[4..10].copy_from_slice(b"Sylvie");
+        // sName[10..19] stays zero
+        body.extend_from_slice(b"hi all");
+        body.push(0);
+        let line = decode_chat_std(&body).unwrap();
+        assert_eq!(line.sender, "Sylvie");
+        assert_eq!(line.text, "hi all");
+        assert_eq!(line.channel, ChatChannel::Say);
+    }
+
+    #[test]
+    fn chat_std_decoder_rejects_truncated_body() {
+        // Anything shorter than the fixed prefix (Kind+Attr+Data+sName = 19)
+        // is unparseable — return None instead of panicking.
+        assert!(decode_chat_std(&[0u8; 5]).is_none());
+        assert!(decode_chat_std(&[0u8; 18]).is_none());
+        assert!(decode_chat_std(&[0u8; 19]).is_some());
+    }
+
+    #[test]
+    fn system_message_substitutes_seconds() {
+        let raw = "Executing logout in <seconds> seconds. Cancel healing to remain logged in.";
+        let s = substitute_system_placeholders(raw, 30, 0);
+        assert_eq!(
+            s,
+            "Executing logout in 30 seconds. Cancel healing to remain logged in.",
+        );
+    }
+
+    #[test]
+    fn system_message_unknown_id_falls_through() {
+        let line = build_system_message_line(decode::SystemMessage {
+            para: 7,
+            para2: 42,
+            message_id: 0xBEEF,
+        });
+        assert!(line.text.contains("msg #48879"), "{}", line.text);
+        assert!(line.text.contains("para=7,42"), "{}", line.text);
+        assert!(matches!(line.channel, ChatChannel::System));
+    }
+
+    #[test]
+    fn system_message_executing_logout_full_line() {
+        // EXECUTING_LOGOUT (id=7) — the /logout countdown ticker. The
+        // scraped text from `xi.msg.system` should land here verbatim
+        // with `<seconds>` filled from para.
+        let line = build_system_message_line(decode::SystemMessage {
+            para: 25,
+            para2: 0,
+            message_id: 7,
+        });
+        assert!(line.text.starts_with("Executing logout in 25 seconds."), "{}", line.text);
+        assert!(matches!(line.channel, ChatChannel::System));
     }
 }

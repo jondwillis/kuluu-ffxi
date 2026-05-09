@@ -148,6 +148,13 @@ pub struct Entity {
     /// Drives `EngagedBy` aggro detection in the reactor.
     #[serde(default)]
     pub bt_target_id: u32,
+    /// `m_OwnerID` for mobs (the canonical FFXI claim id). The byte slot
+    /// shared with `BtTargetID` in the wire layout is repurposed for mobs
+    /// in the CHAR_NPC packet (`entity_update.cpp::updateWith`). `0` for
+    /// PCs/NPCs and unclaimed mobs. Drives mob capsule color in the
+    /// viewer.
+    #[serde(default)]
+    pub claim_id: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +177,34 @@ pub enum ChatChannel {
     Yell,
     System,
     Other,
+    /// Combat-log line: substituted text from `ffxi_proto::msg_basic`
+    /// driven by 0x029 / 0x02D battle messages. Translated to
+    /// `wire::ChatChannel::Battle` and rendered in orange.
+    Battle,
+}
+
+impl ChatChannel {
+    /// Map the wire `CHAT_MESSAGE_TYPE` byte (0x017's first body byte, also
+    /// the kind echoed back in our own outgoing 0x0B5) onto the operator-
+    /// facing channel taxonomy. Unknown kinds collapse to `Other` so we
+    /// don't lose visibility on novel server messages — they just stack in
+    /// the catch-all bucket until a real channel is added.
+    pub fn from_chat_kind(kind: u8) -> Self {
+        use ffxi_proto::map::chat_kind as k;
+        match kind {
+            k::SAY | k::NS_SAY => Self::Say,
+            k::SHOUT | k::NS_SHOUT => Self::Shout,
+            k::TELL => Self::Tell,
+            k::PARTY | k::NS_PARTY => Self::Party,
+            k::LINKSHELL | k::NS_LINKSHELL | k::LINKSHELL2 | k::NS_LINKSHELL2 => Self::Linkshell,
+            k::YELL => Self::Yell,
+            k::SYSTEM_1 | k::SYSTEM_2 | k::SYSTEM_3 => Self::System,
+            // Emotes render alongside Say in retail; same channel keeps them
+            // visually grouped without inventing a new variant.
+            k::EMOTION => Self::Say,
+            _ => Self::Other,
+        }
+    }
 }
 
 /// Per-connection diagnostics surfaced to humans (TUI footer) and agents
@@ -219,6 +254,62 @@ pub struct SessionState {
     /// LLM-decision badge in the operator dashboard.
     #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
     pub recent_decisions: VecDeque<LlmDecision>,
+    /// Active NPC event dialog metadata. `Some(...)` from `EventDialog`
+    /// arrival until `EventEnded` clears it. Mirrored to the wire in
+    /// `wire_translate::dialog_to_wire`. The fields are the wire ground
+    /// truth — no DAT text — so the operator sees event_id, NPC reference,
+    /// mode, and runtime parameters but not the canned English dialog
+    /// (that lives in client-side DAT files we don't ship).
+    #[serde(default)]
+    pub dialog: Option<DialogState>,
+    /// Active NPC shop window. `Some(...)` while a shop is open; cleared
+    /// on `EventEnded`. Driven by 0x03C `SHOP_LIST` (item rows) and
+    /// 0x03E `SHOP_OPEN` (the "show window" signal).
+    #[serde(default)]
+    pub shop: Option<ShopState>,
+    /// Active status-effect icon ids on the operator. Decoded from 0x063
+    /// type=0x09 STATUS_ICONS. Placeholder slots (`0x00FF`) are dropped
+    /// before insertion so the list represents only real effects.
+    #[serde(default)]
+    pub status_icons: Vec<u16>,
+}
+
+/// Mirror of `ffxi_viewer_wire::DialogState` defined locally so `state.rs`
+/// stays decoupled from the optional `ffxi-viewer-wire` crate (only
+/// pulled in via the `native-window` / `relay` features).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DialogState {
+    pub event_id: u32,
+    pub npc_id: u32,
+    /// See `ffxi_viewer_wire::DialogState::npc_name`.
+    #[serde(default)]
+    pub npc_name: Option<String>,
+    pub act_index: u16,
+    pub event_num: u16,
+    pub event_para: u16,
+    pub mode: u16,
+    pub event_num2: u16,
+    pub event_para2: u16,
+    pub strings: Vec<String>,
+    pub nums: Vec<i32>,
+}
+
+/// Mirror of `ffxi_viewer_wire::ShopState`. Same decoupling rationale as
+/// `DialogState`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShopState {
+    pub offset_index: u16,
+    pub items: Vec<ShopItem>,
+    pub opened: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShopItem {
+    pub price: u32,
+    pub item_no: u16,
+    pub shop_index: u8,
+    pub skill: u16,
+    pub guild_info: u16,
 }
 
 /// Inventory mirror, populated by Stage-9 decoders. Container ids match
@@ -569,12 +660,28 @@ impl SessionState {
                     }
                 }
             }
-            // EventStart / EventEnded / KeyRotated are flow signals; the TUI
-            // doesn't render them as state today. Left as no-ops — extending
-            // is a non-breaking change.
-            AgentEvent::EventStart { .. }
-            | AgentEvent::EventEnded
-            | AgentEvent::KeyRotated { .. } => {}
+            // EventStart is the lean signal (event_id only); EventDialog
+            // is its richer companion that fills in the dialog HUD state.
+            // EventEnded clears the dialog. KeyRotated is internal-only.
+            AgentEvent::EventStart { .. } | AgentEvent::KeyRotated { .. } => {}
+            AgentEvent::EventDialog { dialog } => {
+                self.dialog = Some(dialog.clone());
+            }
+            AgentEvent::ShopUpdated { shop } => {
+                self.shop = Some(shop.clone());
+            }
+            AgentEvent::StatusIconsUpdated { icons } => {
+                self.status_icons = icons.clone();
+            }
+            AgentEvent::EventEnded => {
+                self.dialog = None;
+                // Shops live inside an event in vanilla; clearing on
+                // EventEnded matches the user-facing "talk → buy → walk
+                // away" lifecycle without needing a separate shop-close
+                // packet (none exists in the wire protocol — the server
+                // just stops responding to 0x083s after the event ends).
+                self.shop = None;
+            }
         }
     }
 }
@@ -617,6 +724,27 @@ pub enum AgentEvent {
     },
     EventStart {
         event_id: u32,
+    },
+    /// Richer companion to `EventStart` — carries the full decoded
+    /// `DialogState` so the viewer can render an NPC dialog HUD. Always
+    /// emitted alongside `EventStart` (same packet); kept as a separate
+    /// variant so the existing JSON contract for agents that only care
+    /// about the `event_id` remains stable.
+    EventDialog {
+        dialog: DialogState,
+    },
+    /// 0x03C `SHOP_LIST` — full or partial item list for an NPC shop.
+    /// The fold replaces `SessionState.shop`; partial-list reassembly
+    /// (for shops with >19 items) lands when we see one in the wild.
+    ShopUpdated {
+        shop: ShopState,
+    },
+    /// Status-effect icon list refreshed (0x063 type=0x09). Carries the
+    /// non-placeholder icon ids in display order; consumers should
+    /// replace, not merge, since the server sends the full list every
+    /// time an effect lands or expires.
+    StatusIconsUpdated {
+        icons: Vec<u16>,
     },
     EventEnded,
     KeyRotated {
@@ -718,10 +846,42 @@ pub enum AgentCommand {
     StopMove,
     /// Request a zone change at a known zoneline. Server still has to honor it.
     RequestZoneChange { line_id: u32 },
-    /// Auto-end any in-progress event/cutscene.
+    /// Auto-end any in-progress event/cutscene. Sends `EndPara=0` for the
+    /// queued event id — appropriate for informational dialogs that need
+    /// a single "advance" press.
     EndEvent,
-    /// Disconnect cleanly.
+    /// End the in-progress event with a specific `choice` (the server's
+    /// `EndPara`). For multi-option NPC dialogs, `choice` selects which
+    /// branch — typically 0..7 indexing into the option list. Targets one
+    /// specific event — `event_id`/`act_index`/`event_num` come from the
+    /// `AgentEvent::EventDialog` payload that opened the dialog so we
+    /// don't accidentally close someone else's queued event.
+    EndEventChoice {
+        event_id: u32,
+        act_index: u16,
+        event_num: u16,
+        choice: u32,
+    },
+    /// Drop the TCP connections (lobby + map) without going through the
+    /// in-world `/logout` flow. Use this for "abandon the session right
+    /// now" — process exit, crash recovery, keepalive timeout. Players
+    /// who want a clean retail-style return to char-select should issue
+    /// [`AgentCommand::ReqLogout`] instead, which respects the server's
+    /// `EFFECT_LEAVEGAME` validator (no logout while in-event /
+    /// abnormal-status / crafting).
     Disconnect,
+    /// `GP_CLI_COMMAND_REQLOGOUT` (0x0E7) — request `/logout` (return to
+    /// character select) or `/shutdown` (exit game) the in-world way.
+    /// Server arms `EFFECT_LEAVEGAME`; for normal players the Lua
+    /// handler runs `leaveGame()` after ~30s, but GMs and players
+    /// inside a Mog House short-circuit to immediate disconnect (see
+    /// `scripts/effects/leavegame.lua::onEffectGain`). The s2c 0x00B
+    /// `LOGOUT` lands once `leaveGame()` fires. Toggling again while
+    /// the effect is active cancels it (matching retail UI confirm
+    /// behavior). Each [`ReqLogoutKind`] variant maps to one
+    /// server-validated `(Mode, Kind)` pair — agents can't pair
+    /// forbidden combinations.
+    ReqLogout { kind: ReqLogoutKind },
     /// Echo back the current SessionState as a JSON event (debugging convenience).
     Snapshot,
     /// Send a chat-channel message. Server-side say messages beginning with
@@ -785,6 +945,96 @@ pub enum AgentCommand {
         threshold: u8,
         mog_house_zoneline: u32,
     },
+    /// `GP_CLI_COMMAND_SHOP_BUY` (0x083) — purchase from an open NPC shop.
+    /// `shop_index` is the row in the shop list (0..N-1, matching
+    /// `ShopItem.shop_index`). `qty` is the number of items to buy; for
+    /// most NPC shops the server caps this server-side based on the row.
+    /// `shop_no` is the `ShopItemOffsetIndex` from the matching 0x03C
+    /// header (echoed back so the server resolves which list).
+    ShopBuy {
+        shop_no: u16,
+        shop_index: u8,
+        qty: u32,
+    },
+    /// `GP_CLI_COMMAND_EQUIP_INSPECT` (0x0DD) — `/check` family. Asks the
+    /// server to send back the target's inspection info via 0x0C9
+    /// (`equip_inspect_general` / `equip_inspect_equipment`). Distinct
+    /// opcode from `Action`/0x01A; the FFXI client uses 0x0DD for /check,
+    /// /checkname, /checkparam. `kind` selects which.
+    CheckTarget {
+        target_id: u32,
+        target_index: u16,
+        kind: CheckKind,
+    },
+}
+
+/// Sub-kind for [`AgentCommand::CheckTarget`]. Mirrors
+/// `GP_CLI_COMMAND_EQUIP_INSPECT_KIND` in
+/// `vendor/server/src/map/packets/c2s/0x0dd_equip_inspect.h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckKind {
+    /// `/check` — full inspect (level estimate + visible equipment).
+    Check,
+    /// `/checkname` — short-form check (name + race + sex).
+    CheckName,
+    /// `/checkparam` — base parameter check.
+    CheckParam,
+}
+
+impl CheckKind {
+    /// Server `Kind` byte. Matches `GP_CLI_COMMAND_EQUIP_INSPECT_KIND`.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            CheckKind::Check => 0,
+            CheckKind::CheckName => 1,
+            CheckKind::CheckParam => 2,
+        }
+    }
+}
+
+/// Sub-kind for [`AgentCommand::ReqLogout`]. Each variant pins down one
+/// server-validated `(Mode, Kind)` pair on the 0x0E7 wire packet —
+/// `Mode` selects toggle / arm / cancel and `Kind` selects logout vs.
+/// shutdown. Wire enums live in `ffxi_proto::map::reqlogout::{mode, kind}`.
+///
+/// `Off` is symmetric on the server — cancelling a LeaveGame works the
+/// same way regardless of which kind originally armed it — but we keep
+/// both `LogoutOff` and `ShutdownOff` so the variant carries which slash
+/// command the user typed (useful for echo / event tracing without
+/// having to also stash a tag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReqLogoutKind {
+    /// `/logout` — toggle a return-to-char-select timer (~30s for
+    /// normal players; immediate for GMs / inside Mog House). (Mode=Toggle, Kind=Logout)
+    LogoutToggle,
+    /// `/logout on` — arm the logout timer; no-op if already running. (Mode=LogoutOn, Kind=Logout)
+    LogoutOn,
+    /// `/logout off` — cancel any in-progress LeaveGame. (Mode=Off, Kind=Logout)
+    LogoutOff,
+    /// `/shutdown` — toggle an exit-to-pol timer (~30s for normal
+    /// players; immediate for GMs / inside Mog House). (Mode=Toggle, Kind=Shutdown)
+    ShutdownToggle,
+    /// `/shutdown on` — arm the shutdown timer; no-op if already running. (Mode=ShutdownOn, Kind=Shutdown)
+    ShutdownOn,
+    /// `/shutdown off` — cancel any in-progress LeaveGame. (Mode=Off, Kind=Shutdown)
+    ShutdownOff,
+}
+
+impl ReqLogoutKind {
+    /// Resolve to the wire `(Mode, Kind)` pair for the 0x0E7 body.
+    pub fn wire_pair(self) -> (u16, u16) {
+        use ffxi_proto::map::reqlogout::{kind, mode};
+        match self {
+            ReqLogoutKind::LogoutToggle => (mode::TOGGLE, kind::LOGOUT),
+            ReqLogoutKind::LogoutOn => (mode::LOGOUT_ON, kind::LOGOUT),
+            ReqLogoutKind::LogoutOff => (mode::OFF, kind::LOGOUT),
+            ReqLogoutKind::ShutdownToggle => (mode::TOGGLE, kind::SHUTDOWN),
+            ReqLogoutKind::ShutdownOn => (mode::SHUTDOWN_ON, kind::SHUTDOWN),
+            ReqLogoutKind::ShutdownOff => (mode::OFF, kind::SHUTDOWN),
+        }
+    }
 }
 
 /// Tagged-union of every `0x01A` action the agent can perform. The variant
@@ -1095,7 +1345,7 @@ mod tests {
                 name: Some("Other".into()),
                 pos: Vec3 { x: 1.0, y: 0.0, z: 2.0 },
                 heading: 64,
-                hp_pct: Some(80), bt_target_id: 0,
+                hp_pct: Some(80), bt_target_id: 0, claim_id: 0,
             },
         });
         assert_eq!(s.entities.len(), 1);
@@ -1109,7 +1359,7 @@ mod tests {
                 name: Some("Other".into()),
                 pos: Vec3 { x: 5.0, y: 0.0, z: 6.0 },
                 heading: 32,
-                hp_pct: Some(50), bt_target_id: 0,
+                hp_pct: Some(50), bt_target_id: 0, claim_id: 0,
             },
         });
         assert_eq!(s.entities.len(), 1, "upsert must not duplicate by id");
