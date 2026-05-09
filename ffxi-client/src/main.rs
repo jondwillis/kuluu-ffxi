@@ -1,19 +1,25 @@
 //! FFXI CLI/TUI client — entry point.
 
 use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session};
-#[cfg(any(feature = "tui", feature = "native-window"))]
+#[cfg(feature = "tui")]
 use ffxi_client::{spawn_session, SessionHandle};
 #[cfg(any(feature = "tui", feature = "native-window", feature = "relay"))]
 use ffxi_client::state;
-mod launcher;
+// Re-import the lib-level relay/wire_translate at the binary crate root
+// so that submodules under main.rs can keep referring to them via
+// `crate::wire_translate` / `crate::relay`. `wire_translate` is only
+// reached via `view_native::bridge`, hence the narrower gate; `relay` is
+// reached directly from main.rs's Play / native paths. Same re-import
+// trick `state` uses above.
+#[cfg(feature = "native-window")]
+use ffxi_client::wire_translate;
 #[cfg(feature = "relay")]
-mod relay;
+use ffxi_client::relay;
+mod launcher;
 #[cfg(feature = "tui")]
 mod view3d;
 #[cfg(feature = "native-window")]
 mod view_native;
-#[cfg(any(feature = "native-window", feature = "relay"))]
-mod wire_translate;
 
 use anyhow::{self, Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -45,10 +51,14 @@ struct Args {
 
     /// Bind a WebSocket relay on `<addr>` that publishes
     /// `ffxi-viewer-wire` frames (same shape the native viewer reads).
-    /// Compatible with `play`, `tui`, and `native`. Defaults to off; clients
-    /// can use `?format=json` for human-readable JSON instead of postcard.
+    /// Compatible with `play`, `tui`, and `native`. Accepts either
+    /// `host:port` (e.g. `127.0.0.1:7777`) or the literal `auto` (alias
+    /// for `127.0.0.1:0` — the OS picks a free port and the chosen
+    /// address is printed to stderr at startup). Defaults to off;
+    /// clients can use `?format=json` for human-readable JSON instead
+    /// of postcard.
     #[cfg(feature = "relay")]
-    #[arg(long)]
+    #[arg(long, value_parser = ffxi_client::relay::parse_relay_listen)]
     relay_listen: Option<std::net::SocketAddr>,
 
     #[command(subcommand)]
@@ -509,6 +519,9 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                 password,
                 char_selection: session::CharSelection::Id(char_id),
                 initial_state: Some(initial_state),
+                // Headless agent path: keep auto-dismiss on so unattended
+                // sessions don't stall when an event packet arrives.
+                user_driven_events: false,
             };
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
             let (event_tx, event_rx) = tokio::sync::broadcast::channel(256);
@@ -518,6 +531,23 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             // Optional WebSocket relay. Needs a `watch::Receiver<SessionState>`,
             // so we run a folder task that converts the broadcast event stream
             // into the same canonical state the native viewer reads.
+            //
+            // Pre-flight is a synchronous TcpListener::bind/drop — the
+            // session task wouldn't start in time to surface a port
+            // collision before agent_io blocks on stdin, so we'd appear
+            // hung. Failing fast here makes the misconfig obvious.
+            #[cfg(feature = "relay")]
+            if let Some(addr) = args.relay_listen {
+                if let Err(err) = relay::preflight_bind(addr) {
+                    eprintln!("error: {err:#}");
+                    eprintln!(
+                        "hint: pass `--relay-listen auto` to let the OS assign a free port,",
+                    );
+                    eprintln!("      or pick a different `host:port`.");
+                    std::process::exit(2);
+                }
+            }
+
             #[cfg(feature = "relay")]
             let _relay_keepalive = if let Some(addr) = args.relay_listen {
                 let (state_tx, state_rx) =
@@ -634,6 +664,10 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                 password,
                 char_selection: session::CharSelection::Id(char_id),
                 initial_state: Some(initial_state),
+                // The TUI / `play` paths run an attended session; the
+                // operator can issue `EndEvent` themselves, so don't
+                // auto-flush.
+                user_driven_events: true,
             };
             let SessionHandle {
                 state_rx,
@@ -778,15 +812,6 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
 }
 
 #[cfg(feature = "native-window")]
-struct NativePreflight {
-    user: String,
-    password: String,
-    char_id: u32,
-    char_name: String,
-    initial: session::InitialState,
-}
-
-#[cfg(feature = "native-window")]
 fn run_native_main_thread(
     rt: &tokio::runtime::Runtime,
     args: Args,
@@ -794,6 +819,21 @@ fn run_native_main_thread(
 ) -> Result<()> {
     #[cfg(feature = "relay")]
     let relay_listen = args.relay_listen;
+    #[cfg(not(feature = "relay"))]
+    let relay_listen: Option<std::net::SocketAddr> = None;
+    // Fail fast on EADDRINUSE before we open the launcher window. A
+    // post-bind error from the relay task would only emit a buried
+    // `tracing::warn!` and the user would silently end up with no
+    // browser-visible relay.
+    #[cfg(feature = "relay")]
+    if let Some(addr) = relay_listen {
+        if let Err(err) = relay::preflight_bind(addr) {
+            eprintln!("error: {err:#}");
+            eprintln!("hint: pass `--relay-listen auto` to let the OS assign a free port,");
+            eprintln!("      or pick a different `host:port`.");
+            std::process::exit(2);
+        }
+    }
     let Args {
         server,
         auth_port,
@@ -812,150 +852,39 @@ fn run_native_main_thread(
         unreachable!("dispatched only when args.command is Command::Native");
     };
 
+    // Direct mode = all three positional args provided. The launcher
+    // pre-fills its form with `defaults` and auto-advances past Login
+    // and CharList when this marker is present (see launcher_ui's
+    // direct_mode_login_autostart / direct_mode_charlist_autoselect).
+    // No more synchronous block_on preflight — the launcher's async
+    // tasks handle both modes uniformly.
+    let direct_mode_autostart =
+        user.is_some() && password.is_some() && char_name.is_some();
+
+    let defaults = launcher::Defaults {
+        user,
+        password,
+        char_name,
+    };
+
     let lobby = lobby_client::LobbyClient::new(server.clone(), data_port, view_port);
 
-    // Auth + lobby preflight — two paths:
-    //
-    //   * **Direct mode** (all three positional args present): same shape as
-    //     `Tui`'s direct branch. Run auth + lobby inside `block_on`, no GUI
-    //     launcher. Errors surface as anyhow before the window opens.
-    //   * **Launcher mode** (any arg missing): run the windowed Bevy
-    //     launcher (`view_native::launcher_ui::run`) synchronously on the
-    //     main thread. It owns its own Bevy `App` (login → char list →
-    //     connect), uses the tokio runtime handle to spawn auth/lobby
-    //     work, and returns a `Selection` matching the stdin launcher's
-    //     contract. The launcher window closes on success; the next Bevy
-    //     `App` (the in-game viewer below) opens fresh.
-    let prep: NativePreflight = match (user, password, char_name) {
-        (Some(u), Some(p), Some(name)) => rt
-            .block_on(async {
-                let session = auth
-                    .login(&u, &p)
-                    .await
-                    .context("auth precheck (native direct mode)")?;
-                let handle = lobby
-                    .open(&session)
-                    .await
-                    .context("opening lobby (native direct mode)")?;
-                let slot = handle
-                    .chars()
-                    .iter()
-                    .find(|c| c.name == name)
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no character named '{name}' on account '{u}' (have: {:?})",
-                            handle
-                                .chars()
-                                .iter()
-                                .map(|c| c.name.as_str())
-                                .collect::<Vec<_>>()
-                        )
-                    })?;
-                let mut key3 = [0u8; 20];
-                for (i, b) in key3.iter_mut().enumerate() {
-                    *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
-                }
-                let handoff = handle
-                    .select(slot.char_id, &slot.name, key3)
-                    .await
-                    .context("lobby select (native direct mode)")?;
-                Ok::<_, anyhow::Error>(NativePreflight {
-                    user: u,
-                    password: p,
-                    char_id: slot.char_id,
-                    char_name: slot.name,
-                    initial: session::InitialState {
-                        auth: session,
-                        handoff,
-                        key3,
-                    },
-                })
-            })
-            .context("native preflight (direct)")?,
-        (u, p, n) => {
-            let defaults = launcher::Defaults {
-                user: u,
-                password: p,
-                char_name: n,
-            };
-            // The launcher app is a self-contained Bevy `App` and must run
-            // on the OS main thread (same Cocoa restriction as the in-game
-            // viewer). It blocks until the user finishes selection or
-            // closes the window.
-            let auth_arc = std::sync::Arc::new(auth);
-            let lobby_arc = std::sync::Arc::new(lobby);
-            let sel = view_native::launcher_ui::run(
-                &server,
-                auth_arc,
-                lobby_arc,
-                defaults,
-                rt.handle().clone(),
-            )
-            .context("native windowed launcher")?;
-            NativePreflight {
-                user: sel.user,
-                password: sel.password,
-                char_id: sel.char_id,
-                char_name: sel.char_name,
-                initial: sel.initial_state,
-            }
-        }
-    };
-
-    let cfg = session::Config {
+    view_native::run(view_native::NativeRunArgs {
         server,
-        map_host_override,
-        auth_port,
-        data_port,
-        view_port,
-        user: prep.user,
-        password: prep.password,
-        char_selection: session::CharSelection::Id(prep.char_id),
-        initial_state: Some(prep.initial),
-    };
-
-    // Spawn the session on the runtime; cross-thread channels carry state
-    // and commands to the (main-thread) Bevy app.
-    let SessionHandle {
-        state_rx,
-        cmd_tx,
-        event_tx,
-        session_task,
-        folder_task,
-    } = rt.block_on(async { spawn_session(cfg) });
-    let event_rx = event_tx.subscribe();
-
-    // Optional WebSocket relay alongside the native viewer. Subscribers see
-    // the same state stream the in-process bridge publishes — Bevy reads
-    // `state_rx` directly; the relay clones it for each client.
-    #[cfg(feature = "relay")]
-    if let Some(addr) = relay_listen {
-        let state_rx_relay = state_rx.clone();
-        let event_tx_relay = event_tx.clone();
-        let cmd_tx_relay = cmd_tx.clone();
-        rt.spawn(async move {
-            if let Err(err) =
-                relay::serve(addr, state_rx_relay, event_tx_relay, cmd_tx_relay).await
-            {
-                tracing::warn!(error = %err, "relay listener exited");
-            }
-        });
-    }
-
-    // Run Bevy synchronously on this (main) thread. Returns when the user
-    // presses Esc, closes the window, or AppExit fires.
-    let view_outcome = view_native::run(state_rx, event_rx, cmd_tx);
-
-    // Drop the broadcast sender so folder_task can finish (it loops on
-    // `event_rx.recv()` which only unblocks when *all* senders drop).
-    drop(event_tx);
-    rt.block_on(async {
-        let _ = folder_task.await;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), session_task).await;
-    });
-
-    view_outcome
+        ports: view_native::SessionPorts {
+            auth_port,
+            data_port,
+            view_port,
+            map_host_override,
+        },
+        auth: std::sync::Arc::new(auth),
+        lobby: std::sync::Arc::new(lobby),
+        defaults,
+        direct_mode_autostart,
+        runtime: rt.handle().clone(),
+        relay_listen,
+    })
+    .context("native viewer")
 }
 
 fn hex(b: &[u8]) -> String {

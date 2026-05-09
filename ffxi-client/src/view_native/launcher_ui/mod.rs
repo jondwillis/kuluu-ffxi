@@ -1,24 +1,23 @@
 //! Native windowed launcher: graphical login + character-select flow.
 //!
 //! Sibling to `crate::launcher` (the stdin/stdout TUI launcher). When the
-//! `native` subcommand is invoked without all three positional args, we'd
-//! like the user to *see* the login form in the same window the game
-//! eventually opens — not in their terminal. This module owns that flow.
+//! `native` subcommand is invoked without all three positional args, we
+//! show the login form in the same window the in-game viewer eventually
+//! takes over.
 //!
-//! # Architecture: separate Bevy `App`s
+//! # Architecture: one Bevy `App`
 //!
-//! Rather than tangle [`ffxi_viewer_core::ViewerCorePlugin`] with state
-//! machinery (its `Startup` systems unconditionally spawn the world,
-//! camera, and HUD), we run the launcher as its own short-lived Bevy
-//! `App`. When the user has finished selecting a character, the launcher
-//! `App` exits via `AppExit` and the caller (`main.rs::run_native_main_thread`)
-//! continues into the existing `view_native::run` — same pattern the TUI
-//! launcher used: complete pre-flight first, then enter the game viewer.
+//! winit-0.30 enforces a process-singleton `EventLoop` (see
+//! `winit-0.30.13/src/event_loop.rs:118`), so the launcher and the
+//! in-game viewer **must** share a single `App`. The launcher is now a
+//! set of state-driven systems registered via [`register`] onto the
+//! caller's app. Entry to `LauncherState::Done` transitions
+//! `AppPhase::Connecting`; the bridge there picks up [`PendingConnect`]
+//! and continues into the viewer.
 //!
-//! The cost is one window-close + one window-open between launcher and
-//! game; the upside is `ViewerCorePlugin` stays untouched and the
-//! launcher's UI doesn't have to fight the HUD's `Startup`-spawned
-//! nodes for z-order.
+//! `LauncherState` is a [`SubStates`] of `AppPhase::Launcher` — Bevy
+//! creates and destroys the `State<LauncherState>` resource
+//! automatically as `AppPhase` enters and leaves `Launcher`.
 //!
 //! # State machine
 //!
@@ -43,12 +42,9 @@
 //!                              │ ok
 //!                              ▼
 //!                       ┌────────────────┐
-//!                       │     Done       │ → AppExit
+//!                       │     Done       │ → AppPhase::Connecting
 //!                       └────────────────┘
 //! ```
-//!
-//! `Done` triggers `AppExit::Success`. The result is plucked from a
-//! [`LauncherOutcome`] resource on the way out.
 
 mod async_work;
 mod char_list;
@@ -56,8 +52,6 @@ mod login;
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow};
-use bevy::log::LogPlugin;
 use bevy::prelude::*;
 use ffxi_client::auth_client::AuthClient;
 use ffxi_client::lobby_client::LobbyClient;
@@ -65,8 +59,14 @@ use tokio::runtime::Handle as RtHandle;
 
 use crate::launcher::{Defaults, Selection};
 
-/// Top-level Bevy state driving the launcher UI.
-#[derive(States, Default, Debug, Clone, Eq, PartialEq, Hash)]
+use super::AppPhase;
+
+/// Bevy state driving the launcher UI. `SubStates` of
+/// `AppPhase::Launcher` — only exists while the parent phase is
+/// `Launcher`. Re-created at `#[default]` (`Login`) on every entry to
+/// `AppPhase::Launcher`, including return-from-failure.
+#[derive(SubStates, Default, Debug, Clone, Eq, PartialEq, Hash)]
+#[source(super::AppPhase = super::AppPhase::Launcher)]
 pub(crate) enum LauncherState {
     #[default]
     Login,
@@ -74,8 +74,9 @@ pub(crate) enum LauncherState {
     CharList,
     ConnectInFlight,
     LoginError,
-    /// Terminal: triggers `AppExit::Success`. The result is in
-    /// `LauncherOutcome`.
+    /// Terminal for the launcher: triggers transition to
+    /// `AppPhase::Connecting`. The bridge system there picks up
+    /// `PendingConnect` and continues the flow.
     Done,
 }
 
@@ -97,6 +98,9 @@ pub(crate) struct LoginForm {
 }
 
 /// Carries the failure message displayed by the `LoginError` state.
+/// Survives across `AppPhase` transitions: when `Connecting` fails it's
+/// populated, then the bridge drops `AppPhase` back to `Launcher` and
+/// the LoginError state reads this resource.
 #[derive(Resource, Default)]
 pub(crate) struct LoginErrorMsg(pub String);
 
@@ -135,8 +139,7 @@ pub(crate) struct OpenedLobbyInner {
 pub(crate) struct OpenedLobby(pub Mutex<OpenedLobbyInner>);
 
 /// Auth credentials carried from `Login` through the rest of the flow,
-/// so the final `Selection` can echo them back to the caller (matching
-/// the stdin launcher's contract).
+/// so the final `Selection` can echo them back to the bridge.
 #[derive(Resource, Clone, Default)]
 pub(crate) struct Credentials {
     pub user: String,
@@ -154,26 +157,48 @@ pub(crate) struct CharListData(pub Vec<ffxi_client::lobby_client::CharSlot>);
 #[derive(Resource, Default)]
 pub(crate) struct SelectedChar(pub Option<ffxi_client::lobby_client::CharSlot>);
 
-/// What gets handed back to the caller when the launcher exits cleanly.
-/// Wrapped in `Mutex` so the `Done`-on-enter system can fill it from a
-/// `&mut` system param while the outer caller (which holds an `Arc`) can
-/// pluck the result after `app.run()` returns.
-#[derive(Resource, Default, Clone)]
-pub(crate) struct LauncherOutcome(pub Arc<Mutex<Option<Result<Selection>>>>);
+/// The launcher's terminal output: the connecting bridge in
+/// `super::run` consumes this on entering `AppPhase::Connecting`,
+/// builds a `session::Config`, calls `spawn_session`, and inserts
+/// `NativeSource`/`CommandTx` into the world.
+#[derive(Resource, Default)]
+pub(crate) struct PendingConnect(pub Option<Selection>);
 
-/// Run the launcher Bevy app. Returns the user's selection (matching the
-/// stdin launcher's `Selection` shape) or an error if the user closed
-/// the window before completing the flow.
-pub fn run(
+/// Optional default char name pulled from CLI args. Used by `char_list`
+/// to highlight a matching row, and by `direct_mode_charlist_autoselect`
+/// to auto-click that row when present.
+#[derive(Resource, Default)]
+pub(crate) struct DefaultCharName(pub Option<String>);
+
+/// Marker resource. When present (set by `main.rs` when all three CLI
+/// args are supplied) the launcher auto-advances past both `Login` (if
+/// creds are prefilled) and `CharList` (if the named char exists).
+/// Removed at the natural ends of the auto-advance chain:
+///   - by `direct_mode_charlist_autoselect` when the named char is
+///     successfully picked (full auto-advance succeeded);
+///   - on `OnEnter(LauncherState::LoginError)` (auth or lobby failed;
+///     user must retype creds rather than enter a retry loop).
+#[derive(Resource)]
+pub(crate) struct DirectModeAutostart;
+
+/// 2D-camera marker. Spawned `OnEnter(AppPhase::Launcher)`, despawned
+/// `OnExit(AppPhase::Launcher)` so the in-game 3D camera (spawned by
+/// `OnEnter(AppPhase::InGame)`) doesn't compete with this 2D one.
+#[derive(Component)]
+pub(crate) struct LauncherCamera;
+
+/// Register the launcher's resources, sub-state, and systems on the
+/// caller's app. Called from `view_native::run`. The caller is
+/// responsible for `init_state::<AppPhase>()` and adding the
+/// `OnEnter(AppPhase::Connecting)` bridge.
+pub(crate) fn register(
+    app: &mut App,
     server: &str,
     auth: Arc<AuthClient>,
     lobby: Arc<LobbyClient>,
     defaults: Defaults,
     runtime: RtHandle,
-) -> Result<Selection> {
-    let outcome = LauncherOutcome::default();
-    let outcome_for_app = outcome.clone();
-
+) {
     let mut form = LoginForm::default();
     if let Some(u) = defaults.user {
         form.user = u;
@@ -181,28 +206,8 @@ pub fn run(
     if let Some(p) = defaults.password {
         form.pass = p;
     }
-    // If both fields prefilled and we're missing only the char_name, the
-    // user should still see the login screen — the simplest behaviour is
-    // to start in `Login` always. Auto-advance is left to the user
-    // pressing Enter; that mirrors the stdin launcher (which also
-    // re-prompts even with `Some` defaults).
 
-    let mut app = App::new();
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: format!("ffxi-client — login [{server}]"),
-                    resolution: (800u32, 500u32).into(),
-                    ..default()
-                }),
-                ..default()
-            })
-            .build()
-            .disable::<LogPlugin>(),
-    );
-
-    app.init_state::<LauncherState>()
+    app.add_sub_state::<LauncherState>()
         .insert_resource(form)
         .insert_resource(LoginErrorMsg::default())
         .insert_resource(RuntimeHandle(runtime))
@@ -214,8 +219,18 @@ pub fn run(
         .insert_resource(Credentials::default())
         .insert_resource(CharListData::default())
         .insert_resource(SelectedChar::default())
-        .insert_resource(outcome_for_app)
+        .insert_resource(PendingConnect::default())
         .insert_resource(DefaultCharName(defaults.char_name));
+
+    // Launcher's 2D camera tracks the launcher phase exactly. The
+    // in-game 3D camera spawns OnEnter(AppPhase::InGame) — see
+    // `super::run`.
+    app.add_systems(OnEnter(AppPhase::Launcher), spawn_launcher_camera)
+        .add_systems(OnExit(AppPhase::Launcher), despawn_launcher_camera);
+
+    // Re-entry hook: if returning to Launcher from a failed Connecting
+    // bridge, jump straight to LoginError.
+    app.add_systems(OnEnter(AppPhase::Launcher), restore_login_error_on_reentry);
 
     // Login screen: builds UI on enter, eats keys, redraws on each frame
     // it's active.
@@ -224,6 +239,7 @@ pub fn run(
         .add_systems(
             Update,
             (
+                direct_mode_login_autostart,
                 login::keyboard_input_system,
                 login::redraw_login_form_system,
             )
@@ -233,9 +249,8 @@ pub fn run(
     // Auth in flight: spawn task on enter, poll its oneshot every frame.
     app.add_systems(
         OnEnter(LauncherState::AuthInFlight),
-        async_work::spawn_auth_task,
+        (async_work::spawn_auth_task, async_work::spawn_auth_ui),
     )
-    .add_systems(OnEnter(LauncherState::AuthInFlight), async_work::spawn_auth_ui)
     .add_systems(OnExit(LauncherState::AuthInFlight), async_work::despawn_auth_ui)
     .add_systems(
         Update,
@@ -248,6 +263,7 @@ pub fn run(
         .add_systems(
             Update,
             (
+                direct_mode_charlist_autoselect,
                 char_list::handle_click_system,
                 char_list::handle_keyboard_system,
             )
@@ -257,11 +273,7 @@ pub fn run(
     // Connect in flight: spawn task, poll oneshot.
     app.add_systems(
         OnEnter(LauncherState::ConnectInFlight),
-        async_work::spawn_connect_task,
-    )
-    .add_systems(
-        OnEnter(LauncherState::ConnectInFlight),
-        async_work::spawn_connect_ui,
+        (async_work::spawn_connect_task, async_work::spawn_connect_ui),
     )
     .add_systems(
         OnExit(LauncherState::ConnectInFlight),
@@ -272,77 +284,101 @@ pub fn run(
         async_work::poll_connect_system.run_if(in_state(LauncherState::ConnectInFlight)),
     );
 
-    // Login error: simple message; Esc returns to Login.
-    app.add_systems(OnEnter(LauncherState::LoginError), login::spawn_error_ui)
-        .add_systems(OnExit(LauncherState::LoginError), login::despawn_error_ui)
-        .add_systems(
-            Update,
-            login::error_keyboard_system.run_if(in_state(LauncherState::LoginError)),
-        );
+    // Login error: simple message; Esc returns to Login. Also clears
+    // any DirectModeAutostart marker so we don't auto-retry the same
+    // failing credentials in a loop.
+    app.add_systems(
+        OnEnter(LauncherState::LoginError),
+        (login::spawn_error_ui, clear_direct_mode_on_error),
+    )
+    .add_systems(OnExit(LauncherState::LoginError), login::despawn_error_ui)
+    .add_systems(
+        Update,
+        login::error_keyboard_system.run_if(in_state(LauncherState::LoginError)),
+    );
 
-    // Done: write outcome (already populated) + emit AppExit.
-    app.add_systems(OnEnter(LauncherState::Done), exit_on_done);
-
-    // 2D camera so UI nodes render. Spawned once at Startup; no per-state
-    // teardown needed since the launcher app lives only as long as this
-    // flow.
-    app.add_systems(Startup, spawn_camera);
-
-    // Window-close: write a Cancelled result if the user shut the window
-    // before completing the flow.
-    app.add_systems(Update, handle_close_request);
-
-    app.run();
-
-    // Pluck the result out from the shared slot. If the user closed the
-    // window before any state landed an outcome, we report that as a
-    // user-cancelled error.
-    let mut slot = outcome
-        .0
-        .lock()
-        .map_err(|_| anyhow!("launcher outcome mutex poisoned"))?;
-    slot.take()
-        .unwrap_or_else(|| Err(anyhow!("launcher window closed before selection completed")))
-        .context("launcher Bevy app")
+    // Done: hand off to AppPhase::Connecting. The launcher's camera
+    // and any remaining UI are torn down by OnExit(AppPhase::Launcher).
+    app.add_systems(OnEnter(LauncherState::Done), advance_to_connecting);
 }
 
-/// Optional default char name pulled from CLI args. Used by the char_list
-/// system to highlight a row matching the name (UX nicety; not required
-/// for the flow to work).
-#[derive(Resource, Default)]
-pub(crate) struct DefaultCharName(pub Option<String>);
-
-fn spawn_camera(mut commands: Commands) {
-    commands.spawn(Camera2d);
+fn spawn_launcher_camera(mut commands: Commands) {
+    commands.spawn((Camera2d, LauncherCamera));
 }
 
-/// Final-state hook: emit `AppExit`. The `LauncherOutcome` resource has
-/// already been populated by the system that transitioned us into `Done`
-/// (either `poll_connect_system`, which writes the success path, or
-/// `handle_close_request`, which writes the cancellation path).
-fn exit_on_done(mut exit: MessageWriter<AppExit>) {
-    exit.write_default();
-}
-
-/// If the window-close-requested message fires before we've reached
-/// `Done`, write a cancellation outcome and exit. Without this the
-/// launcher would close cleanly but the caller would receive an
-/// ambiguous "outcome slot empty" error.
-fn handle_close_request(
-    mut close: MessageReader<bevy::window::WindowCloseRequested>,
-    state: Res<State<LauncherState>>,
-    outcome: Res<LauncherOutcome>,
-    mut exit: MessageWriter<AppExit>,
+fn despawn_launcher_camera(
+    mut commands: Commands,
+    q: Query<Entity, With<LauncherCamera>>,
 ) {
-    if close.read().next().is_none() {
+    for e in q.iter() {
+        commands.entity(e).despawn();
+    }
+}
+
+/// On entering `LauncherState::Done`, advance the top-level phase to
+/// `Connecting`. The bridge there consumes `PendingConnect`.
+fn advance_to_connecting(mut next_phase: ResMut<NextState<AppPhase>>) {
+    next_phase.set(AppPhase::Connecting);
+}
+
+/// If we re-enter `AppPhase::Launcher` after a `Connecting` failure,
+/// the bridge has populated `LoginErrorMsg.0`. Skip past `Login` and
+/// show the error directly so the user sees what happened.
+fn restore_login_error_on_reentry(
+    err: Res<LoginErrorMsg>,
+    mut next: ResMut<NextState<LauncherState>>,
+) {
+    if !err.0.is_empty() {
+        next.set(LauncherState::LoginError);
+    }
+}
+
+/// Direct-mode helper: if creds are prefilled and `DirectModeAutostart`
+/// is set, jump straight to AuthInFlight on the first frame in `Login`.
+/// We do NOT remove the marker here — it has to survive through to
+/// `direct_mode_charlist_autoselect`. Cleanup happens at the natural
+/// ends of the chain (charlist pick or LoginError).
+fn direct_mode_login_autostart(
+    autostart: Option<Res<DirectModeAutostart>>,
+    form: Res<LoginForm>,
+    mut next: ResMut<NextState<LauncherState>>,
+) {
+    if autostart.is_none() {
         return;
     }
-    if *state.get() != LauncherState::Done {
-        if let Ok(mut slot) = outcome.0.lock() {
-            if slot.is_none() {
-                *slot = Some(Err(anyhow!("launcher window closed by user")));
-            }
-        }
+    if form.user.is_empty() || form.pass.is_empty() {
+        return;
     }
-    exit.write_default();
+    next.set(LauncherState::AuthInFlight);
+}
+
+/// On entering `LauncherState::LoginError`, drop the `DirectModeAutostart`
+/// marker (if any). Without this, a user who hits Esc from LoginError
+/// back to Login would auto-advance into the same failing creds — an
+/// infinite-retry loop.
+fn clear_direct_mode_on_error(mut commands: Commands) {
+    commands.remove_resource::<DirectModeAutostart>();
+}
+
+/// Direct-mode helper: if `DirectModeAutostart` is still set when the
+/// char list lands and `DefaultCharName` matches a row, auto-pick it.
+fn direct_mode_charlist_autoselect(
+    mut commands: Commands,
+    autostart: Option<Res<DirectModeAutostart>>,
+    chars: Res<CharListData>,
+    default_name: Res<DefaultCharName>,
+    mut sel: ResMut<SelectedChar>,
+    mut next: ResMut<NextState<LauncherState>>,
+) {
+    if autostart.is_none() {
+        return;
+    }
+    let Some(name) = default_name.0.as_deref() else {
+        return;
+    };
+    if let Some(slot) = chars.0.iter().find(|c| c.name == name) {
+        sel.0 = Some(slot.clone());
+        next.set(LauncherState::ConnectInFlight);
+        commands.remove_resource::<DirectModeAutostart>();
+    }
 }

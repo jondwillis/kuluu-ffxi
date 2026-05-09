@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ffxi-proto", "ffxi-client", "ffxi-mcp", "ffxi-nav", "ffxi-viewer-wire", "ffxi-viewer-core", "ffxi-viewer-wasm"]
+members = ["ffxi-proto", "ffxi-client", "ffxi-mcp", "ffxi-nav", "ffxi-nav-recast", "ffxi-viewer-wire", "ffxi-viewer-core", "ffxi-viewer-wasm"]
 
 [workspace.package]
 version = "0.1.0"

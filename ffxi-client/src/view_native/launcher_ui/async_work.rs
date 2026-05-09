@@ -29,8 +29,8 @@ use tokio::sync::oneshot;
 use crate::launcher::Selection;
 
 use super::{
-    CharListData, Credentials, LauncherClients, LauncherOutcome, LauncherState,
-    LoginErrorMsg, LoginForm, OpenedLobby, RuntimeHandle, SelectedChar,
+    CharListData, Credentials, LauncherClients, LauncherState, LoginErrorMsg,
+    LoginForm, OpenedLobby, PendingConnect, RuntimeHandle, SelectedChar,
 };
 
 /// Auth + lobby-open in one task: succeeds when both auth and the lobby
@@ -80,10 +80,12 @@ async fn run_auth_then_open(
     user: &str,
     pass: &str,
 ) -> Result<AuthOk> {
+    tracing::debug!(user, "auth task: logging in");
     let session = auth
         .login(user, pass)
         .await
         .map_err(|e| anyhow!("login: {e}"))?;
+    tracing::debug!("auth task: login succeeded, opening lobby");
     let handle = lobby
         .open(&session)
         .await
@@ -92,6 +94,7 @@ async fn run_auth_then_open(
     // shipped to `session::run` must be the same one the lobby was
     // opened against (re-logging in produces a new `session_hash` that
     // doesn't match the lobby's view of the world).
+    tracing::info!(char_count = handle.chars().len(), "auth task: lobby opened, sending result");
     Ok(AuthOk {
         handle,
         auth: session,
@@ -111,6 +114,10 @@ pub(super) fn poll_auth_system(
 ) {
     match chan.rx.try_recv() {
         Ok(Ok(ok)) => {
+            tracing::info!(
+                char_count = ok.handle.chars().len(),
+                "auth succeeded, transitioning to CharList"
+            );
             chars.0 = ok.handle.chars().to_vec();
             // Stash the live LobbyHandle + AuthSession for the connect
             // step.
@@ -124,6 +131,7 @@ pub(super) fn poll_auth_system(
             next_state.set(LauncherState::CharList);
         }
         Ok(Err(e)) => {
+            tracing::error!(error = %e, "auth failed");
             err.0 = format!("{e:#}");
             commands.remove_resource::<AuthInFlightChan>();
             next_state.set(LauncherState::LoginError);
@@ -132,6 +140,7 @@ pub(super) fn poll_auth_system(
             // Still in flight; come back next frame.
         }
         Err(oneshot::error::TryRecvError::Closed) => {
+            tracing::error!("auth task dropped its sender unexpectedly");
             err.0 = "auth task dropped its sender unexpectedly".into();
             commands.remove_resource::<AuthInFlightChan>();
             next_state.set(LauncherState::LoginError);
@@ -311,17 +320,17 @@ pub(super) fn poll_connect_system(
     mut err: ResMut<LoginErrorMsg>,
     sel: Res<SelectedChar>,
     creds: Res<Credentials>,
-    outcome: Res<LauncherOutcome>,
+    mut pending: ResMut<PendingConnect>,
 ) {
     match chan.rx.try_recv() {
         Ok(Ok(ok)) => {
-            // Build the Selection result and stash it for the caller to
-            // pick up after `app.run()` returns.
+            // Stash the Selection for the OnEnter(AppPhase::Connecting)
+            // bridge to pick up.
             let slot = sel
                 .0
                 .clone()
                 .expect("SelectedChar must be set when ConnectInFlight succeeds");
-            let selection = Selection {
+            pending.0 = Some(Selection {
                 user: creds.user.clone(),
                 password: creds.pass.clone(),
                 char_id: slot.char_id,
@@ -331,10 +340,7 @@ pub(super) fn poll_connect_system(
                     handoff: ok.handoff,
                     key3: ok.key3,
                 },
-            };
-            if let Ok(mut s) = outcome.0.lock() {
-                *s = Some(Ok(selection));
-            }
+            });
             commands.remove_resource::<ConnectInFlightChan>();
             next_state.set(LauncherState::Done);
         }

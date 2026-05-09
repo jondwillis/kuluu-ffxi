@@ -77,7 +77,13 @@ pub fn spawn_roster_panel(mut commands: Commands) {
         RosterPanel,
         Node {
             position_type: PositionType::Absolute,
-            top: Val::Px(36.0), // below the stage bar
+            // Top-right column, slot 4: under the LLM badge. Retail
+            // FFXI puts the party list mid-right; this top: 200
+            // anchor approximates that while keeping the column
+            // sequence (compass / clock / llm-badge / roster)
+            // collision-free. See `hud/vana_clock.rs` for the
+            // canonical column layout.
+            top: Val::Px(200.0),
             right: Val::Px(8.0),
             width: Val::Px(280.0),
             padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),

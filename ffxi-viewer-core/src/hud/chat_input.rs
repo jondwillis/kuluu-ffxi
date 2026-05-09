@@ -1,5 +1,8 @@
-//! Chat input bar — single-line text entry that overlays the bottom of
-//! the chat panel while [`InputMode::Chat`] is active.
+//! Chat input bar — single-line text entry that slots into the 24px gap
+//! between the chat panel (`bottom: 54`) and the diagnostics strip
+//! (`bottom: 0, height: 28`) while [`InputMode::Chat`] is active. Sits
+//! beneath the chat panel rather than over it, so the bottommost chat
+//! row stays visible while the operator is typing.
 //!
 //! Visual: matches the chat-panel backdrop (same dark fill, same border
 //! color) so it reads as a continuation of the chat region rather than
@@ -33,9 +36,9 @@ pub fn spawn_chat_input(mut commands: Commands) {
             ChatInputBar,
             Node {
                 position_type: PositionType::Absolute,
-                // Same `bottom` as chat_panel so the bar sits flush
-                // against the diagnostics strip; same `width` and `left`
-                // so it visually extends the chat region.
+                // 28px diagnostics bar + 0px = sits directly on top of
+                // the diagnostics strip, in the gap chat_panel leaves
+                // (panel starts at bottom: 54).
                 bottom: Val::Px(28.0),
                 left: Val::Px(0.0),
                 width: Val::Percent(60.0),

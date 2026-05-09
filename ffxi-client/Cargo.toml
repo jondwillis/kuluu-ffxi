@@ -38,6 +38,7 @@ relay = [
 [dependencies]
 ffxi-proto = { path = "../ffxi-proto" }
 ffxi-nav = { path = "../ffxi-nav" }
+ffxi-nav-recast = { path = "../ffxi-nav-recast" }
 
 anyhow.workspace = true
 bytes.workspace = true

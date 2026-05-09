@@ -1,12 +1,17 @@
 //! Bottom diagnostics strip mirroring `chrome::draw_diagnostics`:
 //!
 //! ```text
-//! bf=ok  sync=42/43  last=120ms  map=127.0.0.1:54230   [hint]
+//! bf=ok  sync=42/43  last=120ms  map=127.0.0.1:54230  fps=60   [hint]
 //! ```
 //!
 //! Color: muted gray for the labels (`bf=`, `sync=`, …), white for values,
 //! red for `last=` if the server packet age exceeds 5s, cyan for the hint.
+//!
+//! `fps=` reads from Bevy's `FrameTimeDiagnosticsPlugin` (registered by
+//! `HudPlugin`); the smoothed-average value is shown so it doesn't flicker
+//! frame-to-frame.
 
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use ffxi_viewer_wire::BlowfishStatus;
 
@@ -29,6 +34,9 @@ pub struct DiagLastValue;
 
 #[derive(Component)]
 pub struct DiagMapValue;
+
+#[derive(Component)]
+pub struct DiagFpsValue;
 
 pub fn spawn_diagnostics(mut commands: Commands) {
     commands
@@ -58,6 +66,8 @@ pub fn spawn_diagnostics(mut commands: Commands) {
             spawn_label_value(p, "last=", DiagLastValue, "—");
             spawn_separator(p);
             spawn_label_value(p, "map=", DiagMapValue, "—");
+            spawn_separator(p);
+            spawn_label_value(p, "fps=", DiagFpsValue, "—");
             // Spacer + hint right-aligned.
             p.spawn(Node {
                 flex_grow: 1.0,
@@ -195,5 +205,28 @@ pub fn update_diagnostics(
             .map_server_addr
             .clone()
             .unwrap_or_else(|| "—".into());
+    }
+}
+
+/// FPS updater. Runs every frame (not gated on `state.dirty`) because the
+/// FPS reading changes independently of server snapshots. The
+/// change-detection guard (`**text != want`) keeps the write cheap when
+/// the smoothed value hasn't moved.
+pub fn update_fps_system(
+    diagnostics: Res<DiagnosticsStore>,
+    mut fps_q: Query<&mut Text, With<DiagFpsValue>>,
+) {
+    let Ok(mut text) = fps_q.single_mut() else {
+        return;
+    };
+    let want = match diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|d| d.smoothed())
+    {
+        Some(fps) => format!("{:.0}", fps),
+        None => "—".into(),
+    };
+    if **text != want {
+        **text = want;
     }
 }

@@ -10,7 +10,10 @@ name = "ffxi-mcp"
 path = "src/main.rs"
 
 [dependencies]
-ffxi-client = { path = "../ffxi-client" }
+# `relay` enables the WebSocket viewer relay so an LLM-driven session can
+# be observed in the browser viewer (`ffxi-viewer-wasm`) while the agent
+# is operating. Opt-in at runtime via the `FFXI_RELAY_LISTEN` env var.
+ffxi-client = { path = "../ffxi-client", features = ["relay"] }
 
 anyhow.workspace = true
 rmcp.workspace = true

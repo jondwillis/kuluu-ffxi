@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Protocol layer for the LSB/Phoenix FFXI private-server emulators."
+build = "build.rs"
 
 [dependencies]
 bytes.workspace = true

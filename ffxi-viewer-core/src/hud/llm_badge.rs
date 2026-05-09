@@ -75,7 +75,9 @@ pub fn spawn_llm_badge(mut commands: Commands) {
             LlmBadge,
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(36.0),
+                // Top-right column, slot 3: under the Vana clock. See
+                // `hud/vana_clock.rs` for the full column ordering.
+                top: Val::Px(140.0),
                 right: Val::Px(8.0),
                 width: Val::Px(220.0),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),

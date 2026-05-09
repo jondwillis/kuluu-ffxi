@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use ffxi_client::{
     agent_io,
-    session::{self, Config},
+    session::{self, CharSelection, Config},
     state::{AgentCommand, AgentEvent, EntityKind, Stage},
 };
 use tokio::{
@@ -86,8 +86,7 @@ async fn play_lifecycle_against_live_lsb() {
         view_port,
         user: fixture.username.clone(),
         password: fixture.password.clone(),
-        char_id: fixture.charid,
-        char_name: fixture.charname.clone(),
+        char_selection: CharSelection::Name(fixture.charname.clone()),
         initial_state: None,
     };
 

@@ -20,25 +20,39 @@ pub mod camera;
 pub mod components;
 pub mod hud;
 pub mod input_mode;
+pub mod lock_on;
+pub mod mouse;
 pub mod nameplate;
+pub mod picking;
 pub mod scene;
 pub mod snapshot;
 pub mod source;
 pub mod target_ring;
+pub mod zone_lines;
 
 pub use camera::{
-    chase_camera_system, heading_for_yaw, spawn_camera, yaw_for_heading, ChaseCamera,
-    OperatorCamera,
+    chase_camera_system, firstperson_camera_system, heading_for_yaw, spawn_camera,
+    toggle_camera_mode, yaw_for_heading, CameraMode, ChaseCamera, OperatorCamera,
 };
 pub use components::{HpIndicator, IsSelf, Nameplate, WorldEntity};
-pub use hud::HudPlugin;
-pub use input_mode::{ChatBuffer, InputMode, MenuKind, MenuLevel, MenuStack, QuickActionState};
+pub use hud::{add_hud_spawners, HudPlugin};
+pub use input_mode::{
+    ChatBuffer, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack, QuickActionState,
+    DIALOG_MAX_CHOICE,
+};
+pub use lock_on::{LockOn, ToggleResult as LockOnToggle};
+pub use mouse::{CursorLockRequest, MousePlugin, MousePointer};
+pub use picking::{click_to_target_system, resolve_click_target, ClickResolution, PickingPlugin};
 pub use scene::{
     ffxi_to_bevy, setup_world, sync_entities_system, sync_aggro_system,
     Aggroing, EntityMaterials, EntityMesh, HpBar, HpBarMesh, Target, TrackedEntities,
 };
 pub use snapshot::{apply_delta, ingest_system, EventLog, SceneState, CHAT_HISTORY_CAP};
 pub use source::SceneSource;
+pub use zone_lines::{
+    setup_zone_line_assets, sync_zone_lines_system, ZoneLineAssets, ZoneLineDescriptor,
+    ZoneLineMarker, ZoneLineResolver, ZoneLineState,
+};
 
 use std::marker::PhantomData;
 
@@ -71,19 +85,40 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<TrackedEntities>()
             .init_resource::<Target>()
             .init_resource::<InputMode>()
-            .add_systems(PreUpdate, ingest_system::<S>)
-            .add_systems(Startup, (setup_world, spawn_camera))
+            .init_resource::<CameraMode>()
+            .init_resource::<LockOn>()
+            .init_resource::<ZoneLineState>()
+            // PickingPlugin owns the mesh raycast backend + the click→target
+            // reader. `DefaultPickingPlugins` (input/hover/interaction) is
+            // already added by `DefaultPlugins` on both front-ends.
+            .add_plugins(PickingPlugin)
+            .add_systems(
+                PreUpdate,
+                ingest_system::<S>.run_if(resource_exists::<S>),
+            )
+            // The Update tuple needs the world resources `setup_world`
+            // inserts (EntityMesh/EntityMaterials/HpBarMesh) — those
+            // are `Res<>` params, which Bevy treats as hard requirements
+            // and panics on at parameter validation. Native gates this
+            // via OnEnter(InGame); wasm runs `setup_world` at Startup.
+            // EntityMesh is the canonical "world ready" canary.
+            //
+            // `chase_camera_system` and `firstperson_camera_system` both
+            // run every frame; each early-returns when its mode isn't
+            // active, so exactly one moves the camera.
             .add_systems(
                 Update,
                 (
                     sync_entities_system,
                     chase_camera_system,
+                    firstperson_camera_system,
                     sync_aggro_system,
                     nameplate::update_nameplates_system,
                     target_ring::draw_target_ring_system,
+                    sync_zone_lines_system,
                 )
-                    .chain(),
-            )
-            .add_plugins(HudPlugin);
+                    .chain()
+                    .run_if(resource_exists::<EntityMesh>),
+            );
     }
 }

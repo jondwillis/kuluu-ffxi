@@ -48,6 +48,38 @@ use tokio_tungstenite::tungstenite::{
 use crate::state::{AgentCommand, AgentEvent, SessionState};
 use crate::wire_translate::{event_to_viewer_event, state_to_snapshot};
 
+/// Parse a `--relay-listen` / `FFXI_RELAY_LISTEN` value: either the
+/// literal `auto` (alias for `127.0.0.1:0` — OS picks an ephemeral port)
+/// or a `host:port` string. Returns `Result<_, String>` so it works as a
+/// clap `value_parser` directly; callers that need an `anyhow::Error`
+/// can `.map_err(anyhow::Error::msg)`.
+pub fn parse_relay_listen(s: &str) -> std::result::Result<SocketAddr, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+    s.parse()
+        .map_err(|e: std::net::AddrParseError| format!("expected `auto` or `host:port`: {e}"))
+}
+
+/// Synchronous pre-flight that surfaces an EADDRINUSE before we go
+/// further into setup. Skips port 0 (always succeeds; the actual port
+/// is picked by the kernel when the relay task binds for real).
+///
+/// Drops the listener immediately on success — the relay task rebinds
+/// when it starts. There's a tiny TOCTOU window between drop and
+/// rebind, but in practice it only matters when another process is
+/// actively racing for the same port; the second bind will then fail
+/// with the same error and `serve()` will surface it via the existing
+/// `with_context` path.
+pub fn preflight_bind(addr: SocketAddr) -> Result<()> {
+    if addr.port() == 0 {
+        return Ok(());
+    }
+    let _l = std::net::TcpListener::bind(addr)
+        .with_context(|| format!("--relay-listen {addr}: pre-flight bind failed"))?;
+    Ok(())
+}
+
 /// Run the WebSocket listener until the listener task is cancelled or the
 /// channels shut down. One `serve` call per `--relay-listen` flag — call
 /// from `tokio::spawn`.
@@ -70,6 +102,10 @@ pub async fn serve(
         .ok()
         .map(|a| a.to_string())
         .unwrap_or_else(|| addr.to_string());
+    // Loud, unconditional stderr line so the chosen port is visible
+    // even when RUST_LOG filters out tracing::info — this is the URL
+    // a browser viewer will need.
+    eprintln!("relay listening on ws://{bound}/ (use `?ws=ws://{bound}` from the browser viewer)");
     tracing::info!(addr = %bound, "ffxi viewer relay listening");
 
     let cmd_tx = Arc::new(cmd_tx);

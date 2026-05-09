@@ -138,6 +138,7 @@ mod tests {
             heading: 0,
             hp_pct: None,
             bt_target_id: bt,
+            claim_id: 0,
         }
     }
 

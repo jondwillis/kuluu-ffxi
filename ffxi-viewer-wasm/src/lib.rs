@@ -12,7 +12,9 @@
 mod source;
 
 use bevy::prelude::*;
-use ffxi_viewer_core::ViewerCorePlugin;
+use ffxi_viewer_core::{
+    add_hud_spawners, setup_world, spawn_camera, HudPlugin, MousePlugin, ViewerCorePlugin,
+};
 use wasm_bindgen::prelude::*;
 use web_sys::UrlSearchParams;
 
@@ -54,19 +56,28 @@ pub fn run() {
     let ws_url = resolve_ws_url();
     log::info!("ffxi-viewer-wasm: starting, ws_url={ws_url}");
 
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                // Trunk targets the `<canvas id="bevy">` in index.html.
-                canvas: Some("#bevy".to_string()),
-                fit_canvas_to_parent: true,
-                prevent_default_event_handling: false,
-                title: "ffxi-viewer".to_string(),
-                ..default()
-            }),
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            // Trunk targets the `<canvas id="bevy">` in index.html.
+            canvas: Some("#bevy".to_string()),
+            fit_canvas_to_parent: true,
+            prevent_default_event_handling: false,
+            title: "ffxi-viewer".to_string(),
             ..default()
-        }))
-        .insert_resource(WasmSource::connect(&ws_url))
-        .add_plugins(ViewerCorePlugin::<WasmSource>::default())
-        .run();
+        }),
+        ..default()
+    }))
+    .insert_resource(WasmSource::connect(&ws_url))
+    // ViewerCorePlugin no longer registers world/camera/HUD itself
+    // (the native client must defer those until a session exists).
+    // Wasm wants the old behavior — register them on Startup explicitly.
+    .add_systems(Startup, (setup_world, spawn_camera))
+    .add_plugins((
+        ViewerCorePlugin::<WasmSource>::default(),
+        HudPlugin,
+        MousePlugin,
+    ));
+    add_hud_spawners(&mut app, Startup);
+    app.run();
 }

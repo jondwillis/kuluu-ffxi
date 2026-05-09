@@ -36,6 +36,27 @@ pub enum InputMode {
     /// The Enter-from-rest quick-action picker is open. Up/Down moves the
     /// cursor; Enter selects; Esc returns to `World`.
     QuickAction(QuickActionState),
+    /// An NPC event dialog is on screen. Up/Down moves the choice cursor
+    /// `0..=DIALOG_MAX_CHOICE`; Enter dispatches `EndEventChoice` with the
+    /// chosen `EndPara`; Esc sends `EndEvent` (which uses choice 0). The
+    /// router pushes this mode whenever `SceneState.snapshot.dialog` is
+    /// `Some` and pops back to `World` when it clears.
+    Dialog(DialogCursor),
+}
+
+/// Cap on the dialog choice cursor. FFXI events that take a numeric
+/// EndPara almost always operate in 0..7 (`/buy /sell /trade /quit` shop,
+/// 0..3 for Mog House menus, etc.) — eight rows is plenty without
+/// scrolling the picker. Operators picking an out-of-range value can
+/// always retry; the server treats out-of-bound EndPara as
+/// "cancel/default" anyway.
+pub const DIALOG_MAX_CHOICE: u32 = 7;
+
+/// Currently-selected event choice. Lives inside `InputMode::Dialog` so
+/// the cursor and the "dialog is open" flag can never desync.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DialogCursor {
+    pub cursor: u32,
 }
 
 /// In-progress chat text. Submission semantics live in the keyboard handler
@@ -124,9 +145,22 @@ impl MenuStack {
     }
 }
 
-/// Quick-action picker state — just a cursor index. The entry list is
-/// fixed (defined in `hud::quick_action`) so we don't need to carry it.
+/// Quick-action picker state.
+///
+/// `has_target` is captured at the moment the picker opens; it decides
+/// whether the entry list shows target-relevant verbs (Attack/Check/Talk)
+/// or no-target stubs (Magic/Items/Macros). Capturing it once at open
+/// time means the entry list won't shift mid-navigation if a server
+/// snapshot drops the target between keypresses.
 #[derive(Debug, Clone, Default)]
 pub struct QuickActionState {
     pub cursor: usize,
+    pub has_target: bool,
+}
+
+impl QuickActionState {
+    /// Open the picker with knowledge of whether a target is selected.
+    pub fn for_target(has_target: bool) -> Self {
+        Self { cursor: 0, has_target }
+    }
 }

@@ -112,6 +112,13 @@ pub struct Entity {
     pub heading: u8,
     pub hp_pct: Option<u8>,
     pub bt_target_id: u32,
+    /// `m_OwnerID` for mobs (the canonical FFXI claim id) — the player's
+    /// `UniqueNo` who has tagged this mob. `0` means unclaimed and is the
+    /// default for entities that don't carry a claim semantic (PCs, NPCs).
+    /// Drives mob capsule color in the viewer (white = self-claim, red =
+    /// other-claim, default = unclaimed).
+    #[serde(default)]
+    pub claim_id: u32,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -125,6 +132,10 @@ pub enum ChatChannel {
     Yell,
     System,
     Other,
+    /// Combat log line — substituted text from `msg_basic` driven by
+    /// 0x029 / 0x02D battle messages. Drawn in orange in the chat panel
+    /// to mirror classic FFXI's combat-log color.
+    Battle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +252,108 @@ pub struct SceneSnapshot {
     /// decay age. Defaults to 0 when the producer hasn't stamped (e.g.
     /// in unit tests).
     pub producer_monotonic_ms: u64,
+    /// The player's own `UniqueNo` (= server-side character id). Required
+    /// for mob-claim coloring: `Entity::claim_id == self_char_id` means
+    /// "claimed by me → render white". `None` until the lobby/zone-in
+    /// flow resolves the player's id.
+    #[serde(default)]
+    pub self_char_id: Option<u32>,
+    /// Active NPC event/dialog. `Some(...)` from `EventStart`/`EventDialog`
+    /// arrival until `EventEnded` clears it. The dialog HUD reads this.
+    /// Per the C5 plan note: 0x032/0x033/0x034 carry no dialog *text*
+    /// (that lives in client-side DAT files we don't have), only metadata
+    /// and runtime parameters. The fields here are the wire ground truth;
+    /// the HUD surfaces them directly.
+    #[serde(default)]
+    pub dialog: Option<DialogState>,
+    /// Active NPC shop. `Some(...)` while a shop window is open; cleared
+    /// on `EventEnded` (vanilla shops live inside an event).
+    #[serde(default)]
+    pub shop: Option<ShopState>,
+    /// Active status-effect icon ids on the operator. Decoded from
+    /// 0x063 type=0x09 `STATUS_ICONS`; `0x00FF` placeholder rows are
+    /// dropped. The server's icon ids index a static FFXI buff/debuff
+    /// table — translation to text/sprite lives in the front-end.
+    #[serde(default)]
+    pub status_icons: Vec<u16>,
+}
+
+/// Active NPC event/dialog metadata. Built from 0x032 (event), 0x033
+/// (eventstr — adds string params), and 0x034 (eventnum — adds numeric
+/// params). The latter two are richer flavors of 0x032; an event can
+/// arrive as any of the three opcodes, distinguished by which payload
+/// fields the server populated.
+///
+/// `event_id` collapses `(unique_no, event_num)` into a single u32 the
+/// way the existing `AgentEvent::EventStart` already does, so the agent
+/// JSON contract doesn't change shape.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DialogState {
+    pub event_id: u32,
+    /// `UniqueNo` of the NPC/object that opened the event. Cross-references
+    /// `Entity.id` so the HUD can resolve a name.
+    pub npc_id: u32,
+    /// Pre-resolved NPC display name. Session-side fills this from its
+    /// id→name cache (built from CHAR_PC/CHAR_NPC packets) so off-screen
+    /// NPCs that fired an event still surface a readable name. `None`
+    /// when the cache hasn't seen this NPC yet — the HUD falls back to
+    /// `Entity.name` lookup, then to a hex `#NNNNNNNN` placeholder.
+    #[serde(default)]
+    pub npc_name: Option<String>,
+    pub act_index: u16,
+    pub event_num: u16,
+    pub event_para: u16,
+    pub mode: u16,
+    /// `EventNum2`/`EventPara2` from 0x032/0x034 — a secondary event
+    /// number/param the PS2-era client never had. Nonzero in chained
+    /// events. Both default to 0 when not present in the wire packet.
+    pub event_num2: u16,
+    pub event_para2: u16,
+    /// Up to 4 NUL-trimmed strings from 0x033 `String[4][16]`. Often
+    /// player names referenced by the event (e.g. quest givers naming
+    /// other characters). Empty for plain 0x032/0x034 events.
+    pub strings: Vec<String>,
+    /// Up to 8 signed integers from 0x034 `num[8]`. Often counts /
+    /// item ids / numeric thresholds. Empty for plain 0x032/0x033 events.
+    pub nums: Vec<i32>,
+}
+
+/// Active NPC shop window. Built from 0x03C `SHOP_LIST` (which carries
+/// the actual item rows) plus 0x03E `SHOP_OPEN` (which signals the row
+/// count is final and the window should appear). The HUD draws an
+/// item-list panel; phase 1 of C8 surfaces price + item id (no name
+/// resolution — item names live in `item_basic.h` / DAT files we don't
+/// scrape yet, that's a follow-up).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShopState {
+    /// `ShopItemOffsetIndex` from the 0x03C header — the per-shop offset
+    /// the server uses to compose successive list packets for shops with
+    /// >19 items. Echoed back in `ShopBuy` via `ShopNo` so the server
+    /// resolves which shop list this is referring to.
+    pub offset_index: u16,
+    /// One row per item the shop sells. Order matches the wire `ShopIndex`,
+    /// so the HUD's selected-row index maps directly to the `ShopIndex`
+    /// the buy command needs to echo.
+    pub items: Vec<ShopItem>,
+    /// Set to `true` when the matching 0x03E `SHOP_OPEN` arrives. Some
+    /// shops emit only 0x03C (no separate open frame); when 0x03E is
+    /// missing, the HUD still draws because `items.is_empty() == false`.
+    /// This flag is observability for the operator, not a gate on display.
+    pub opened: bool,
+}
+
+/// Single row in a shop list (mirror of server `GP_SHOP`, 10 bytes).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShopItem {
+    pub price: u32,
+    pub item_no: u16,
+    /// 0..N index into the shop's row list. The `ShopBuy` packet echoes
+    /// this back so the server picks the correct row.
+    pub shop_index: u8,
+    /// Guild-shop skill cap (0 for vanilla NPC shops).
+    pub skill: u16,
+    /// Guild-shop info bitfield (0 for vanilla NPC shops).
+    pub guild_info: u16,
 }
 
 /// Minimal patch between snapshots. Reserved for Stage 2.1; the Stage 2.0
@@ -379,6 +492,7 @@ mod tests {
                 heading: 32,
                 hp_pct: Some(80),
                 bt_target_id: 0,
+                claim_id: 0,
             }],
             party: vec![],
             chat: vec![ChatLine {
@@ -418,6 +532,10 @@ mod tests {
                 },
             ],
             producer_monotonic_ms: 1_500,
+            self_char_id: Some(0xCAFE_F00D),
+            dialog: None,
+            shop: None,
+            status_icons: Vec::new(),
         }
     }
 

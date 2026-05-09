@@ -99,17 +99,27 @@ pub fn format_label(base_name: &str, hp_pct: Option<u8>, kind: EntityKind) -> St
 /// default-sized capsule. Off-screen labels are pushed far off-canvas
 /// (`-9999`) rather than hidden, so we don't have to manage `Visibility`
 /// on each node — the cheap path stays cheap.
+///
+/// We read the camera's local `Transform` rather than `GlobalTransform`
+/// and convert via `GlobalTransform::from(*cam_t)`. Reason: this system
+/// runs in `Update`, and `GlobalTransform` propagation lives in
+/// `PostUpdate::TransformSystem::TransformPropagate` — so the global
+/// version we'd otherwise see is one frame stale, which produces a visible
+/// nameplate-vs-capsule desync (the capsule renders against this frame's
+/// global, the label against last frame's). The operator camera has no
+/// parent, so `local == global` and the construction is exact.
 pub fn update_nameplates_system(
     state: Res<SceneState>,
-    cam_q: Query<(&Camera, &GlobalTransform), (With<OperatorCamera>, Without<WorldEntity>)>,
+    cam_q: Query<(&Camera, &Transform), (With<OperatorCamera>, Without<WorldEntity>)>,
     world_q: Query<(&Transform, &WorldEntity), Without<Nameplate>>,
     mut nameplate_q: Query<(Entity, &Nameplate, &mut Node, &Children)>,
     mut label_q: Query<(&NameplateLabel, &mut Text)>,
     mut commands: Commands,
 ) {
-    let Ok((camera, cam_global)) = cam_q.single() else {
+    let Ok((camera, cam_t)) = cam_q.single() else {
         return;
     };
+    let cam_global = GlobalTransform::from(*cam_t);
 
     let mut pos_by_id: HashMap<u32, Vec3> = HashMap::new();
     for (t, w) in &world_q {
@@ -127,7 +137,7 @@ pub fn update_nameplates_system(
         match pos_by_id.get(&np.entity_id) {
             Some(&world_pos) => {
                 let head = world_pos + Vec3::Y * 2.4;
-                match camera.world_to_viewport(cam_global, head) {
+                match camera.world_to_viewport(&cam_global, head) {
                     Ok(screen) => {
                         // Approximate horizontal centering: assume ~7 px per
                         // glyph and a typical name <= 16 chars. Refining

@@ -46,6 +46,7 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use ffxi_client::{
     goal_store::GoalStore,
     reactor::ReactorConfig,
+    relay,
     scene::SceneSummary,
     session,
     state::{
@@ -167,9 +168,52 @@ struct UseItemParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct RaiseMenuParams {
+    /// `true` accepts the raise; `false` declines (return to homepoint).
+    accept: bool,
+    /// Your own `UniqueNo` (from `diagnostics://session.char_id` or
+    /// `scene://entities.self.char_id`).
+    target_id: u32,
+    /// Your own per-zone `ActIndex`.
+    target_index: u16,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TractorMenuParams {
+    /// `true` accepts the tractor; `false` declines.
+    accept: bool,
+    target_id: u32,
+    target_index: u16,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct HomepointMenuParams {
+    /// 0=Accept (warp), 1=MonstrosityCancel, 2=MonstrosityRetry. For
+    /// the post-KO homepoint warp, pass 0.
+    status_id: u32,
+    target_id: u32,
+    target_index: u16,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct ReadResourceParams {
     /// Resource URI to read (e.g. `scene://current`, `party://members`).
     uri: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WaitForEventParams {
+    /// Event kinds to wait for. Snake-case names matching `AgentEvent`'s
+    /// serde tag: `low_hp`, `engaged_by`, `tell_received`,
+    /// `party_member_low_hp`, `scene_summary`, `reconnected`,
+    /// `zone_changed`, `inventory_ready`, `disconnected`. An empty list
+    /// matches every high-signal event.
+    #[serde(default)]
+    kinds: Vec<String>,
+    /// Maximum time to wait, in milliseconds. Capped at 60_000 server-side
+    /// to keep MCP transport timeouts honest. On timeout the tool returns
+    /// `{"matched": false, "waited_ms": <elapsed>}` rather than erroring.
+    timeout_ms: u64,
 }
 
 // ----- Server state -------------------------------------------------
@@ -188,6 +232,10 @@ struct FfxiServer {
     /// in headless harness mode — the harness reads its own latency from
     /// MCP transport instead.
     decision_tx: Option<broadcast::Sender<AgentEvent>>,
+    /// Broadcast sender used by `wait_for_event` to spawn fresh
+    /// subscribers per call. Always wired in `main` — kept Optional so
+    /// unit tests can construct a server without an event channel.
+    event_tx: Option<broadcast::Sender<AgentEvent>>,
 }
 
 #[tool_router]
@@ -202,6 +250,7 @@ impl FfxiServer {
             state,
             goal_store: Arc::new(Mutex::new(goal_store)),
             decision_tx: None,
+            event_tx: None,
         }
     }
 
@@ -209,6 +258,14 @@ impl FfxiServer {
     /// the same stream the view consumes. Combined-binary mode only.
     fn with_decision_tx(mut self, tx: broadcast::Sender<AgentEvent>) -> Self {
         self.decision_tx = Some(tx);
+        self
+    }
+
+    /// Builder: wire the same broadcast sender for `wait_for_event` to
+    /// subscribe to. Distinct field from `decision_tx` so the test
+    /// surface that exercises one doesn't have to wire the other.
+    fn with_event_tx(mut self, tx: broadcast::Sender<AgentEvent>) -> Self {
+        self.event_tx = Some(tx);
         self
     }
 
@@ -440,6 +497,104 @@ impl FfxiServer {
         self.send(AgentCommand::Disconnect).await
     }
 
+    #[tool(
+        description = "Respond to a /raise menu (after KO). `accept: true` raises in place; `false` returns to homepoint. Self-targeted: pass your own UniqueNo + ActIndex. 0x01A action wire (ActionID 0x0D)."
+    )]
+    async fn raise_menu(
+        &self,
+        Parameters(p): Parameters<RaiseMenuParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(AgentCommand::Action {
+            target_id: p.target_id,
+            target_index: p.target_index,
+            kind: ActionKind::RaiseMenu { accept: p.accept },
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Respond to a /tractor menu. `accept: true` warps to the caster's location; `false` declines. Self-targeted. 0x01A action wire (ActionID 0x13)."
+    )]
+    async fn tractor_menu(
+        &self,
+        Parameters(p): Parameters<TractorMenuParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(AgentCommand::Action {
+            target_id: p.target_id,
+            target_index: p.target_index,
+            kind: ActionKind::TractorMenu { accept: p.accept },
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Respond to the homepoint warp menu (post-KO when you decline a raise, or any homepoint NPC). status_id: 0=Accept warp, 1=MonstrosityCancel, 2=MonstrosityRetry. Self-targeted. 0x01A action wire (ActionID 0x0B)."
+    )]
+    async fn homepoint_menu(
+        &self,
+        Parameters(p): Parameters<HomepointMenuParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(AgentCommand::Action {
+            target_id: p.target_id,
+            target_index: p.target_index,
+            kind: ActionKind::HomepointMenu { status_id: p.status_id },
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Block until one of the named events fires (or `timeout_ms` elapses). Use this instead of polling scene://current — it collapses 3-5 idle wakes into one. Returns JSON: `{matched: true, kind, payload, waited_ms}` on event, `{matched: false, waited_ms}` on timeout. Latency contract: wakes within ~1 reactor tick (~200ms) of the event."
+    )]
+    async fn wait_for_event(
+        &self,
+        Parameters(p): Parameters<WaitForEventParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(tx) = self.event_tx.as_ref() else {
+            return Err(McpError::internal_error(
+                "wait_for_event: event broadcaster not wired",
+                None,
+            ));
+        };
+        let timeout = std::time::Duration::from_millis(p.timeout_ms.min(60_000));
+        let mut rx = tx.subscribe();
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(timeout, async {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        let kind = event_kind_label(&ev);
+                        if p.kinds.is_empty() || p.kinds.iter().any(|k| k == kind) {
+                            return Ok::<_, ()>(Some((kind, ev)));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return Ok(None),
+                }
+            }
+        })
+        .await;
+        let waited_ms = started.elapsed().as_millis() as u64;
+        let body = match result {
+            Ok(Ok(Some((kind, ev)))) => serde_json::json!({
+                "matched": true,
+                "kind": kind,
+                "payload": ev,
+                "waited_ms": waited_ms,
+            }),
+            Ok(Ok(None)) | Ok(Err(_)) => serde_json::json!({
+                "matched": false,
+                "reason": "channel_closed",
+                "waited_ms": waited_ms,
+            }),
+            Err(_) => serde_json::json!({
+                "matched": false,
+                "reason": "timeout",
+                "waited_ms": waited_ms,
+            }),
+        };
+        Ok(CallToolResult::success(vec![Content::text(body.to_string())]))
+    }
+
     /// Fallback for MCP clients that do not support the `resources`
     /// capability. Mirrors `resources/read` — returns the same content
     /// as a tool result so clients without resource support can still
@@ -541,6 +696,12 @@ impl ServerHandler for FfxiServer {
                 "application/json",
                 "Container-keyed slot map: capacity + populated slots (item_no, quantity, locked, price). `all_loaded` flips true after the initial zone-in flood completes.",
             ),
+            mk(
+                "scene://entities",
+                "entities",
+                "application/json",
+                "Structured nearest-N entities (id, act_index, kind, name, distance, hp_pct, claimed_by, pos) plus self pos+heading+zone. Use this when scene://current's prose lacks the IDs/coords you need to engage/follow/path_to.",
+            ),
         ];
         Ok(result)
     }
@@ -614,6 +775,8 @@ async fn read_resource(
             serde_json::to_string_pretty(&state.inventory)
                 .map_err(|e| format!("serialize inventory: {e}"))
         }
+        "scene://entities" => serde_json::to_string_pretty(&entities_view(state))
+            .map_err(|e| format!("serialize entities: {e}")),
         "goal://current" => {
             let store = goal_store.lock().await;
             match store.load() {
@@ -631,6 +794,93 @@ async fn read_resource(
     }
 }
 
+/// Cap on entities returned by `scene://entities`. The LLM cares about
+/// the nearest few targets; dumping a full 200-entity zone roster would
+/// just burn tokens. 30 covers a tight farming pull plus the camp PCs.
+const SCENE_ENTITIES_CAP: usize = 30;
+
+/// Build the `scene://entities` payload: nearest-N entities by 2D
+/// distance, plus self pos/heading/zone. Distance is xy-plane only —
+/// matches `next_target_by_distance` so the agent's "what's nearest"
+/// is consistent with the renderers' Tab cycle.
+fn entities_view(state: &SessionState) -> serde_json::Value {
+    use ffxi_client::state::Vec3;
+    let from: Vec3 = state.self_pos.pos;
+    let mut scored: Vec<(&ffxi_client::state::Entity, f32)> = state
+        .entities
+        .iter()
+        .map(|e| {
+            let dx = e.pos.x - from.x;
+            let dy = e.pos.y - from.y;
+            (e, (dx * dx + dy * dy).sqrt())
+        })
+        .collect();
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let entities: Vec<serde_json::Value> = scored
+        .into_iter()
+        .take(SCENE_ENTITIES_CAP)
+        .map(|(e, dist)| {
+            serde_json::json!({
+                "id": e.id,
+                "act_index": e.act_index,
+                "kind": e.kind,
+                "name": e.name,
+                "distance": dist,
+                "hp_pct": e.hp_pct,
+                "claimed_by": if e.bt_target_id == 0 { None } else { Some(e.bt_target_id) },
+                "pos": { "x": e.pos.x, "y": e.pos.y, "z": e.pos.z },
+                "heading": e.heading,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "self": {
+            "pos": { "x": from.x, "y": from.y, "z": from.z },
+            "heading": state.self_pos.heading,
+            "zone_id": state.zone_id,
+            "char_id": state.char_id,
+        },
+        "entities": entities,
+        "total_known": state.entities.len(),
+        "cap": SCENE_ENTITIES_CAP,
+    })
+}
+
+/// Stable, snake_case label per `AgentEvent` variant. Matches the
+/// serde tag the events serialize with, so callers can filter
+/// `wait_for_event` by the same string they'd see in JSON.
+fn event_kind_label(ev: &AgentEvent) -> &'static str {
+    match ev {
+        AgentEvent::Connected { .. } => "connected",
+        AgentEvent::StageChanged { .. } => "stage_changed",
+        AgentEvent::ZoneChanged { .. } => "zone_changed",
+        AgentEvent::PositionChanged { .. } => "position_changed",
+        AgentEvent::EntityUpserted { .. } => "entity_upserted",
+        AgentEvent::EntityRemoved { .. } => "entity_removed",
+        AgentEvent::ChatLine { .. } => "chat_line",
+        AgentEvent::EventStart { .. } => "event_start",
+        AgentEvent::EventDialog { .. } => "event_dialog",
+        AgentEvent::ShopUpdated { .. } => "shop_updated",
+        AgentEvent::StatusIconsUpdated { .. } => "status_icons_updated",
+        AgentEvent::EventEnded => "event_ended",
+        AgentEvent::KeyRotated { .. } => "key_rotated",
+        AgentEvent::Disconnected { .. } => "disconnected",
+        AgentEvent::Error { .. } => "error",
+        AgentEvent::Diagnostics { .. } => "diagnostics",
+        AgentEvent::PartyMemberUpdated { .. } => "party_member_updated",
+        AgentEvent::LowHp { .. } => "low_hp",
+        AgentEvent::PartyMemberLowHp { .. } => "party_member_low_hp",
+        AgentEvent::EngagedBy { .. } => "engaged_by",
+        AgentEvent::TellReceived { .. } => "tell_received",
+        AgentEvent::Reconnected { .. } => "reconnected",
+        AgentEvent::SceneSummary { .. } => "scene_summary",
+        AgentEvent::InventoryUpdated { .. } => "inventory_updated",
+        AgentEvent::InventoryReady => "inventory_ready",
+        AgentEvent::ReactorGoalChanged { .. } => "reactor_goal_changed",
+        AgentEvent::LlmDecision { .. } => "llm_decision",
+    }
+}
+
 /// Stable, low-cardinality label per `AgentCommand` variant for use as a
 /// span/log field. Mirrors the MCP tool names so log analysis can join
 /// dispatch latency back to the tool the LLM called.
@@ -643,6 +893,7 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         Tell { .. } => "tell",
         Action { .. } => "action",
         EndEvent => "end_event",
+        EndEventChoice { .. } => "end_event_choice",
         Snapshot => "snapshot",
         Disconnect => "disconnect",
         Follow { .. } => "follow",
@@ -652,6 +903,8 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         RequestZoneChange { .. } => "request_zone_change",
         UseItem { .. } => "use_item",
         BankWhenFull { .. } => "bank_when_full",
+        CheckTarget { .. } => "check_target",
+        ShopBuy { .. } => "shop_buy",
     }
 }
 
@@ -721,6 +974,85 @@ async fn run_notifier(
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+/// Background task: write high-signal events to `<dir>/last-event.json`
+/// atomically, one event at a time. Read by the Claude Code Stop hook
+/// to decide whether to keep the agent looping (recent event = pending
+/// work) or sit idle. Same atomic tmp+rename pattern as `GoalStore`.
+async fn run_event_sidecar(
+    path: std::path::PathBuf,
+    mut event_rx: broadcast::Receiver<AgentEvent>,
+) {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(error = %e, dir = %parent.display(), "create event sidecar dir");
+            return;
+        }
+    }
+    loop {
+        match event_rx.recv().await {
+            Ok(ev) => {
+                if !is_high_signal(&ev) {
+                    continue;
+                }
+                let kind = event_kind_label(&ev);
+                let at_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let body = serde_json::json!({
+                    "kind": kind,
+                    "at_unix_ms": at_unix_ms,
+                    "payload": ev,
+                });
+                let bytes = match serde_json::to_vec_pretty(&body) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "serialize last-event sidecar");
+                        continue;
+                    }
+                };
+                let tmp = path.with_extension("json.tmp");
+                if let Err(e) = std::fs::write(&tmp, &bytes) {
+                    tracing::warn!(error = %e, "write last-event tmp");
+                    continue;
+                }
+                if let Err(e) = std::fs::rename(&tmp, &path) {
+                    tracing::warn!(error = %e, "rename last-event sidecar");
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "event sidecar lagged");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Subset of events that are worth waking the LLM for — same set the
+/// notifier uses for `scene://current`-class invalidations, plus the
+/// inventory ready/zone change signals that gate banking.
+fn is_high_signal(ev: &AgentEvent) -> bool {
+    matches!(
+        ev,
+        AgentEvent::LowHp { .. }
+            | AgentEvent::PartyMemberLowHp { .. }
+            | AgentEvent::EngagedBy { .. }
+            | AgentEvent::TellReceived { .. }
+            | AgentEvent::Reconnected { .. }
+            | AgentEvent::ZoneChanged { .. }
+            | AgentEvent::InventoryReady
+            | AgentEvent::Disconnected { .. }
+    )
+}
+
+/// Default sidecar location: same parent dir as `goal.json`. Honored by
+/// the FFXI_MCP_EVENT_PATH override so tests can redirect.
+fn default_event_sidecar_path() -> Option<std::path::PathBuf> {
+    GoalStore::default_path().ok().and_then(|p| {
+        p.parent().map(|d| d.join("last-event.json"))
+    })
 }
 
 /// Map an `AgentEvent` to the set of resource URIs whose content the
@@ -806,6 +1138,9 @@ async fn main() -> Result<()> {
         password: read_env("FFXI_PASS")?,
         char_selection,
         initial_state: None,
+        // MCP is the headless agent path — auto-dismiss events so an
+        // unattended LLM session doesn't get stuck if an NPC trigger fires.
+        user_driven_events: false,
     };
 
     let goal_path = match std::env::var("FFXI_MCP_GOAL_PATH") {
@@ -814,6 +1149,32 @@ async fn main() -> Result<()> {
             .context("resolve goal_store path; set FFXI_MCP_GOAL_PATH to override")?,
     };
     let goal_store = GoalStore::new(goal_path);
+
+    // Optional WebSocket viewer relay. `FFXI_RELAY_LISTEN=auto` is the
+    // recommended setting for harness use — the OS picks an ephemeral
+    // port and the chosen address is printed to stderr by relay::serve.
+    // Pre-flight here so a misconfigured port fails fast, before we take
+    // over stdin/stdout for the MCP transport.
+    let relay_addr: Option<std::net::SocketAddr> = match std::env::var("FFXI_RELAY_LISTEN") {
+        Ok(s) if !s.is_empty() => match relay::parse_relay_listen(&s) {
+            Ok(addr) => {
+                if let Err(err) = relay::preflight_bind(addr) {
+                    eprintln!("error: {err:#}");
+                    eprintln!(
+                        "hint: set FFXI_RELAY_LISTEN=auto to let the OS assign a free port,",
+                    );
+                    eprintln!("      or pick a different host:port.");
+                    std::process::exit(2);
+                }
+                Some(addr)
+            }
+            Err(msg) => {
+                eprintln!("error: FFXI_RELAY_LISTEN={s:?}: {msg}");
+                std::process::exit(2);
+            }
+        },
+        _ => None,
+    };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCommand>(64);
     let (event_tx, event_rx) = broadcast::channel::<AgentEvent>(256);
@@ -835,6 +1196,43 @@ async fn main() -> Result<()> {
     // Mirror task — folds events into `state` for resource reads.
     let mirror_handle = tokio::spawn(run_state_mirror(state.clone(), event_rx));
 
+    // Optional viewer relay. Two tasks: a `run_event_folder` that turns
+    // the broadcast event stream into a watch::Receiver<SessionState>
+    // (the relay's snapshot source — independent of `run_state_mirror`,
+    // which is keyed off `Arc<RwLock<SessionState>>` for resource reads),
+    // and the WebSocket listener itself. The bound address is logged to
+    // stderr by relay::serve so the user sees the URL the browser viewer
+    // should connect to.
+    let relay_handles = if let Some(addr) = relay_addr {
+        let (state_tx, state_rx) = tokio::sync::watch::channel(SessionState::default());
+        let folder_rx = event_tx.subscribe();
+        let folder_h = tokio::spawn(session::run_event_folder(folder_rx, state_tx));
+        let relay_event_tx = event_tx.clone();
+        let relay_cmd_tx = cmd_tx.clone();
+        let serve_h = tokio::spawn(async move {
+            if let Err(err) =
+                relay::serve(addr, state_rx, relay_event_tx, relay_cmd_tx).await
+            {
+                tracing::warn!(error = %err, "relay listener exited");
+            }
+        });
+        Some((folder_h, serve_h))
+    } else {
+        None
+    };
+
+    // Sidecar task — writes high-signal events to ~/.config/ffxi-mcp/last-event.json
+    // so the Claude Code Stop hook can decide whether the agent should keep
+    // looping (recent event = pending work) or quietly idle.
+    let event_sidecar_path = match std::env::var("FFXI_MCP_EVENT_PATH") {
+        Ok(p) => Some(std::path::PathBuf::from(p)),
+        Err(_) => default_event_sidecar_path(),
+    };
+    let sidecar_handle = event_sidecar_path.map(|path| {
+        let rx = event_tx.subscribe();
+        tokio::spawn(run_event_sidecar(path, rx))
+    });
+
     // Subscribe BEFORE serve_server so we don't miss early events emitted
     // while the MCP handshake is still in progress.
     let notifier_event_rx = event_tx.subscribe();
@@ -847,7 +1245,9 @@ async fn main() -> Result<()> {
     // no recursive notification loop. A future combined-binary dashboard
     // can subscribe to the same broadcast and render the chrome badge
     // without changing this wiring.
-    let server = FfxiServer::new(cmd_tx, state, goal_store).with_decision_tx(event_tx.clone());
+    let server = FfxiServer::new(cmd_tx, state, goal_store)
+        .with_decision_tx(event_tx.clone())
+        .with_event_tx(event_tx.clone());
     let running = serve_server(server, stdio())
         .await
         .context("serve MCP server")?;
@@ -867,6 +1267,13 @@ async fn main() -> Result<()> {
     supervisor_handle.abort();
     mirror_handle.abort();
     notifier_handle.abort();
+    if let Some(h) = sidecar_handle {
+        h.abort();
+    }
+    if let Some((folder_h, serve_h)) = relay_handles {
+        folder_h.abort();
+        serve_h.abort();
+    }
     Ok(())
 }
 
@@ -880,7 +1287,7 @@ fn parse_port(name: &str, default: u16) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ffxi_client::state::{ActionKind, PartyMember, Position, Stage, Vec3};
+    use ffxi_client::state::{ActionKind, Entity, EntityKind, PartyMember, Position, Stage, Vec3};
 
     #[test]
     fn cmd_kind_label_for_action_surface_tools() {
@@ -1051,6 +1458,153 @@ mod tests {
                 "should not notify for {ev:?}"
             );
         }
+    }
+
+    #[test]
+    fn entities_view_sorts_by_distance_and_caps() {
+        let mut s = SessionState::default();
+        s.zone_id = Some(230);
+        s.char_id = Some(7);
+        s.self_pos = Position {
+            pos: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            heading: 64,
+            speed: 25,
+            speed_base: 25,
+        };
+        // Seed 35 entities at increasing distances; only nearest 30 should
+        // appear, sorted ascending.
+        for i in 0..35u32 {
+            s.entities.push(Entity {
+                id: 1000 + i,
+                act_index: i as u16,
+                kind: EntityKind::Mob,
+                name: Some(format!("Mob{i}")),
+                pos: Vec3 { x: i as f32, y: 0.0, z: 0.0 },
+                heading: 0,
+                hp_pct: Some(100),
+                bt_target_id: 0,
+                claim_id: 0,
+            });
+        }
+        let v = entities_view(&s);
+        let arr = v["entities"].as_array().expect("entities array");
+        assert_eq!(arr.len(), SCENE_ENTITIES_CAP);
+        assert_eq!(arr[0]["id"], 1000, "nearest is id 1000 (distance 0)");
+        assert_eq!(arr[29]["id"], 1029, "30th is id 1029");
+        assert_eq!(v["self"]["zone_id"], 230);
+        assert_eq!(v["self"]["char_id"], 7);
+        assert_eq!(v["total_known"], 35);
+    }
+
+    #[test]
+    fn entities_view_marks_claimed_targets() {
+        let mut s = SessionState::default();
+        s.entities.push(Entity {
+            id: 99,
+            act_index: 1,
+            kind: EntityKind::Mob,
+            name: Some("Bee".into()),
+            pos: Vec3::default(),
+            heading: 0,
+            hp_pct: Some(60),
+            bt_target_id: 4242,
+            claim_id: 0,
+        });
+        s.entities.push(Entity {
+            id: 100,
+            act_index: 2,
+            kind: EntityKind::Mob,
+            name: Some("Worm".into()),
+            pos: Vec3 { x: 1.0, y: 0.0, z: 0.0 },
+            heading: 0,
+            hp_pct: Some(100),
+            bt_target_id: 0,
+            claim_id: 0,
+        });
+        let v = entities_view(&s);
+        assert_eq!(v["entities"][0]["claimed_by"], 4242);
+        assert!(v["entities"][1]["claimed_by"].is_null());
+    }
+
+    #[test]
+    fn event_kind_label_round_trips_to_serde_tag() {
+        // Sanity: a few labels match the serde tag downstream consumers
+        // (the sidecar JSON, wait_for_event filter strings) rely on.
+        assert_eq!(
+            event_kind_label(&AgentEvent::LowHp { pct: 25 }),
+            "low_hp"
+        );
+        assert_eq!(
+            event_kind_label(&AgentEvent::EngagedBy { entity_id: 1 }),
+            "engaged_by"
+        );
+        assert_eq!(
+            event_kind_label(&AgentEvent::TellReceived {
+                from: "x".into(),
+                text: "y".into()
+            }),
+            "tell_received"
+        );
+        assert_eq!(event_kind_label(&AgentEvent::InventoryReady), "inventory_ready");
+    }
+
+    #[tokio::test]
+    async fn wait_for_event_returns_matched_payload() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<AgentCommand>(8);
+        let (event_tx, _) = broadcast::channel::<AgentEvent>(8);
+        let state = Arc::new(RwLock::new(SessionState::default()));
+        let goal_store = GoalStore::new(std::env::temp_dir().join("ffxi-mcp-test-wait-goal.json"));
+        let server = FfxiServer::new(cmd_tx, state, goal_store).with_event_tx(event_tx.clone());
+
+        let server_for_call = server.clone();
+        let handle = tokio::spawn(async move {
+            server_for_call
+                .wait_for_event(Parameters(WaitForEventParams {
+                    kinds: vec!["low_hp".into()],
+                    timeout_ms: 2_000,
+                }))
+                .await
+        });
+        // Give wait_for_event a moment to subscribe; without this the
+        // event can race ahead of the subscription and fail the test.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // First, an event we DON'T want — should be ignored.
+        let _ = event_tx.send(AgentEvent::PositionChanged {
+            pos: Position::default(),
+        });
+        let _ = event_tx.send(AgentEvent::LowHp { pct: 17 });
+        let result = handle.await.unwrap().unwrap();
+        let text = match result.content.first().unwrap().raw {
+            rmcp::model::RawContent::Text(ref t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["matched"], true);
+        assert_eq!(v["kind"], "low_hp");
+        assert_eq!(v["payload"]["pct"], 17);
+    }
+
+    #[tokio::test]
+    async fn wait_for_event_times_out_cleanly() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<AgentCommand>(8);
+        let (event_tx, _) = broadcast::channel::<AgentEvent>(8);
+        let state = Arc::new(RwLock::new(SessionState::default()));
+        let goal_store = GoalStore::new(std::env::temp_dir().join("ffxi-mcp-test-wait-timeout-goal.json"));
+        let server = FfxiServer::new(cmd_tx, state, goal_store).with_event_tx(event_tx);
+        let result = server
+            .wait_for_event(Parameters(WaitForEventParams {
+                kinds: vec!["low_hp".into()],
+                timeout_ms: 100,
+            }))
+            .await
+            .unwrap();
+        let text = match result.content.first().unwrap().raw {
+            rmcp::model::RawContent::Text(ref t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["matched"], false);
+        assert_eq!(v["reason"], "timeout");
     }
 
     /// V4a contract: when `decision_tx` is wired, a tool dispatch fires

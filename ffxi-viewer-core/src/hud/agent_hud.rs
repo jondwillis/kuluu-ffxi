@@ -16,6 +16,7 @@
 //! events. `update_agent_hud_system` runs every frame because the recon
 //! age decays continuously, even when no fresh snapshot has arrived.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
@@ -158,10 +159,19 @@ fn format_reconnect(rc: Option<&ffxi_viewer_wire::ReconnectInfo>, now_ms: u64) -
 }
 
 fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    #[cfg(target_arch = "wasm32")]
+    {
+        // js_sys::Date::now() returns millis-since-epoch as f64; the
+        // browser exposes it via the JS `Date.now()` builtin.
+        js_sys::Date::now() as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
 }
 
 fn format_age_short(ms: u64) -> String {

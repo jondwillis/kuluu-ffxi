@@ -35,10 +35,15 @@ pub fn draw_stage_bar(f: &mut ratatui::Frame, area: Rect, state: &SessionState) 
     let line = Line::from(vec![
         Span::styled(
             "▌ ffxi-client ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("● ", Style::default().fg(color)),
-        Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(format!("  ▪  {charname}  ▪  {zone}")),
     ]);
     let block = Block::default()
@@ -64,6 +69,7 @@ pub fn draw_chat(f: &mut ratatui::Frame, area: Rect, state: &SessionState) {
                 ChatChannel::Linkshell => ("[lin]", Color::Green),
                 ChatChannel::Yell => ("[yel]", Color::Yellow),
                 ChatChannel::System => ("[sys]", Color::Gray),
+                ChatChannel::Battle => ("[bat]", Color::LightRed),
                 ChatChannel::Other => ("[---]", Color::DarkGray),
             };
             let body = format!(" {}: {}", line.sender, line.text);
@@ -155,16 +161,29 @@ pub fn draw_agent_hud(f: &mut ratatui::Frame, area: Rect, state: &SessionState) 
             "goal: —",
             Style::default().fg(Color::DarkGray),
         )),
-        Some(ReactorGoalSnapshot::Following { target_id, distance }) => Line::from(vec![
+        Some(ReactorGoalSnapshot::Following {
+            target_id,
+            distance,
+        }) => Line::from(vec![
             Span::styled("goal: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("follow #{target_id}"),
                 Style::default().fg(Color::White),
             ),
-            Span::styled(format!(" d={distance:.1}y"), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!(" d={distance:.1}y"),
+                Style::default().fg(Color::Gray),
+            ),
         ]),
-        Some(ReactorGoalSnapshot::Engaged { target_id, attack_issued }) => {
-            let suffix = if *attack_issued { " (atk sent)" } else { " (atk pending)" };
+        Some(ReactorGoalSnapshot::Engaged {
+            target_id,
+            attack_issued,
+        }) => {
+            let suffix = if *attack_issued {
+                " (atk sent)"
+            } else {
+                " (atk pending)"
+            };
             Line::from(vec![
                 Span::styled("goal: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -230,10 +249,7 @@ pub fn draw_agent_hud(f: &mut ratatui::Frame, area: Rect, state: &SessionState) 
             let ago_ms = now_ms.saturating_sub(*at_unix_ms);
             Line::from(vec![
                 Span::styled("reconnect: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format_age_ms(ago_ms),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(format_age_ms(ago_ms), Style::default().fg(Color::White)),
                 Span::styled(
                     format!(" ({downtime_ms}ms down)"),
                     Style::default().fg(Color::Gray),
@@ -268,13 +284,7 @@ pub fn draw_party_roster(f: &mut ratatui::Frame, area: Rect, members: &[PartyMem
             } else {
                 Color::DarkGray
             };
-            let name_display: String = m
-                .name
-                .as_deref()
-                .unwrap_or("(?)")
-                .chars()
-                .take(8)
-                .collect();
+            let name_display: String = m.name.as_deref().unwrap_or("(?)").chars().take(8).collect();
             let job_str = format!(
                 "{}{}/{}{}",
                 job_code(m.main_job),
@@ -387,7 +397,10 @@ pub fn draw_llm_badge(
         let kind_short: String = kind_summary.chars().take(16).collect();
 
         let header = Line::from(vec![
-            Span::styled("●", Style::default().fg(dot_color).add_modifier(dot_modifier)),
+            Span::styled(
+                "●",
+                Style::default().fg(dot_color).add_modifier(dot_modifier),
+            ),
             Span::raw(" "),
             Span::styled(kind_short, Style::default().fg(Color::White)),
             Span::raw(" "),
@@ -403,15 +416,9 @@ pub fn draw_llm_badge(
         let (p50, p99) = percentile_pair(decisions);
         let stats_line = Line::from(vec![
             Span::styled("p50 ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format_us(p50),
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(format_us(p50), Style::default().fg(Color::Gray)),
             Span::styled(" · p99 ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format_us(p99),
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(format_us(p99), Style::default().fg(Color::Gray)),
         ]);
 
         // Build the line set incrementally; render only as many as the
@@ -512,19 +519,14 @@ fn sparkline_for_latencies(decisions: &VecDeque<LlmDecision>, n: usize) -> Strin
         return String::new();
     }
     let start = decisions.len() - take;
-    let window: Vec<u64> = decisions
-        .iter()
-        .skip(start)
-        .map(|d| d.latency_us)
-        .collect();
+    let window: Vec<u64> = decisions.iter().skip(start).map(|d| d.latency_us).collect();
     let max = window.iter().copied().max().unwrap_or(1).max(1);
     let mut s = String::with_capacity(window.len() * 3);
     for v in window {
         // Clamp to [0, RAMP.len()-1]. Integer math preserves round-toward-
         // zero behavior — full only on the actual max value, never on a
         // close-but-not-equal value due to float drift.
-        let idx = ((v as u128 * (RAMP.len() as u128 - 1) + max as u128 / 2)
-            / max as u128) as usize;
+        let idx = ((v as u128 * (RAMP.len() as u128 - 1) + max as u128 / 2) / max as u128) as usize;
         s.push(RAMP[idx.min(RAMP.len() - 1)]);
     }
     s
@@ -698,7 +700,7 @@ mod tests {
     use super::*;
 
     use crate::state::{LlmDecision, LlmDecisionKind, PartyMember, ReconnectInfo, SessionState};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
 
     fn render<F>(width: u16, height: u16, draw: F) -> ratatui::buffer::Buffer
     where
@@ -798,9 +800,9 @@ mod tests {
             hp_pct,
             mp_pct,
             zone_no: 230,
-            main_job: 3,    // WHM
+            main_job: 3, // WHM
             main_job_lv: 75,
-            sub_job: 4,     // BLM
+            sub_job: 4, // BLM
             sub_job_lv: 37,
             is_party_leader: false,
             is_alliance_leader: false,

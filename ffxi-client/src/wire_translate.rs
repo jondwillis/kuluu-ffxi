@@ -15,9 +15,9 @@
 use ffxi_viewer_wire as wire;
 
 use crate::state::{
-    process_monotonic_ms, AgentEvent, BlowfishStatus, ChatChannel, ChatLine, Diagnostics, Entity,
-    EntityKind, LlmDecision, LlmDecisionKind, PartyMember, Position, ReactorGoalSnapshot,
-    ReconnectInfo, SessionState, Stage, Vec3,
+    process_monotonic_ms, AgentEvent, BlowfishStatus, ChatChannel, ChatLine, Diagnostics,
+    DialogState, Entity, EntityKind, LlmDecision, LlmDecisionKind, PartyMember, Position,
+    ReactorGoalSnapshot, ReconnectInfo, SessionState, ShopItem, ShopState, Stage, Vec3,
 };
 
 /// Snapshot the full `SessionState` into a wire `SceneSnapshot`.
@@ -44,6 +44,50 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         // *emitted*, so the viewer can compute `producer_now -
         // decision.at_monotonic_ms` and get a useful "age".
         producer_monotonic_ms: process_monotonic_ms(),
+        // Surface the player's UniqueNo so the viewer can compare it
+        // against per-mob `claim_id` for self-claim coloring.
+        self_char_id: s.char_id,
+        // Active NPC dialog, if any. Translated field-for-field from the
+        // in-house `state::DialogState` to the wire form.
+        dialog: s.dialog.as_ref().map(dialog_to_wire),
+        // Active NPC shop, same translation pattern.
+        shop: s.shop.as_ref().map(shop_to_wire),
+        // Plain `Vec<u16>` clone — no per-element translation needed.
+        status_icons: s.status_icons.clone(),
+    }
+}
+
+pub fn shop_to_wire(s: &ShopState) -> wire::ShopState {
+    wire::ShopState {
+        offset_index: s.offset_index,
+        items: s.items.iter().map(shop_item_to_wire).collect(),
+        opened: s.opened,
+    }
+}
+
+pub fn shop_item_to_wire(i: &ShopItem) -> wire::ShopItem {
+    wire::ShopItem {
+        price: i.price,
+        item_no: i.item_no,
+        shop_index: i.shop_index,
+        skill: i.skill,
+        guild_info: i.guild_info,
+    }
+}
+
+pub fn dialog_to_wire(d: &DialogState) -> wire::DialogState {
+    wire::DialogState {
+        event_id: d.event_id,
+        npc_id: d.npc_id,
+        npc_name: d.npc_name.clone(),
+        act_index: d.act_index,
+        event_num: d.event_num,
+        event_para: d.event_para,
+        mode: d.mode,
+        event_num2: d.event_num2,
+        event_para2: d.event_para2,
+        strings: d.strings.clone(),
+        nums: d.nums.clone(),
     }
 }
 
@@ -113,6 +157,7 @@ pub fn entity_to_wire(e: &Entity) -> wire::Entity {
         heading: e.heading,
         hp_pct: e.hp_pct,
         bt_target_id: e.bt_target_id,
+        claim_id: e.claim_id,
     }
 }
 
@@ -145,6 +190,7 @@ pub fn channel_to_wire(c: ChatChannel) -> wire::ChatChannel {
         ChatChannel::Yell => wire::ChatChannel::Yell,
         ChatChannel::System => wire::ChatChannel::System,
         ChatChannel::Other => wire::ChatChannel::Other,
+        ChatChannel::Battle => wire::ChatChannel::Battle,
     }
 }
 

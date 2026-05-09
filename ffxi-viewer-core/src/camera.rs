@@ -15,6 +15,23 @@ use crate::snapshot::SceneState;
 #[derive(Component)]
 pub struct OperatorCamera;
 
+/// Active camera projection. `Chase` is the FFXI-default third-person
+/// orbit, `FirstPerson` snaps the camera to the player's eyes and lets the
+/// look direction track [`ChaseCamera::yaw`]/`pitch` 1:1 (so mouse-look in
+/// FP turns the avatar). Defaults to `Chase`; F8 toggles it from
+/// `view_native/input.rs`.
+///
+/// Both modes share `ChaseCamera::yaw`/`pitch` storage to avoid cross-mode
+/// jumps in the look direction. Pitch range differs (chase is clamped to
+/// `[PITCH_MIN, PITCH_MAX]`; FP allows near-vertical), so the toggle
+/// handler clamps pitch back into chase range when leaving FP.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CameraMode {
+    #[default]
+    Chase,
+    FirstPerson,
+}
+
 /// Tunable chase-camera state. Yaw is the angle (Bevy radians, around +Y)
 /// pointing from player toward camera. Default 0 = camera at player+Z. The
 /// `synced_initial` flag lets the input layer one-shot align yaw to the
@@ -47,6 +64,16 @@ impl ChaseCamera {
     /// Ceiling pitch ≈ 80° — leaves a small angle so the camera doesn't go
     /// fully top-down (which would lose the chase aesthetic).
     pub const PITCH_MAX: f32 = 1.40;
+    /// First-person look-down ceiling. Clamped just shy of -π/2 so the
+    /// up-vector stays unambiguous (looking straight down would singularly
+    /// flip yaw).
+    pub const FP_PITCH_MIN: f32 = -std::f32::consts::FRAC_PI_2 + 0.05;
+    /// First-person look-up ceiling. Symmetric with `FP_PITCH_MIN`.
+    pub const FP_PITCH_MAX: f32 = std::f32::consts::FRAC_PI_2 - 0.05;
+    /// Bevy units from feet to eye for first-person. Capsule mesh has
+    /// `height = 1.9` per `scene::EntityMesh`; eye sits below the top so
+    /// the cap doesn't intersect the near-clip.
+    pub const FP_EYE_HEIGHT: f32 = 1.6;
 }
 
 impl Default for ChaseCamera {
@@ -77,12 +104,20 @@ pub fn spawn_camera(mut commands: Commands) {
 /// Geometry: camera_offset = (sin(yaw)·cos(pitch), sin(pitch), cos(yaw)·cos(pitch)) · distance.
 /// At yaw=0, pitch=0, the camera sits at player + (0, 0, distance) — straight
 /// behind a player that faces -Z (= FFXI heading 0 / north).
+///
+/// Early-returns when [`CameraMode`] is `FirstPerson` — that mode is owned
+/// by [`firstperson_camera_system`].
 pub fn chase_camera_system(
+    mode: Res<CameraMode>,
     mut chase: ResMut<ChaseCamera>,
     state: Res<SceneState>,
     q_self: Query<&Transform, (With<IsSelf>, Without<OperatorCamera>)>,
     mut q_cam: Query<&mut Transform, (With<OperatorCamera>, Without<IsSelf>)>,
 ) {
+    if !matches!(*mode, CameraMode::Chase) {
+        return;
+    }
+
     let Ok(self_t) = q_self.single() else {
         return;
     };
@@ -105,6 +140,64 @@ pub fn chase_camera_system(
 
     cam_t.translation = cam_t.translation.lerp(desired, chase.smoothing);
     cam_t.look_at(self_t.translation + Vec3::Y * chase.height_target, Vec3::Y);
+}
+
+/// First-person camera. Snaps the camera origin to the player's eye and
+/// orients the look direction by `(yaw, pitch)` directly — opposite sign of
+/// the chase parameterization, since chase yaw points *from* player *to*
+/// camera (behind), while FP looks *forward* from the player.
+///
+/// Geometry: look_dir = (-sin(yaw)·cos(pitch), sin(pitch), -cos(yaw)·cos(pitch)).
+/// Symmetry check: at chase.yaw = `yaw_for_heading(0) = 0`, `look_dir =
+/// (0, 0, -1)` — exactly Bevy-forward for a player heading FFXI-north.
+///
+/// Early-returns when [`CameraMode`] is `Chase` — that mode is owned by
+/// [`chase_camera_system`].
+pub fn firstperson_camera_system(
+    mode: Res<CameraMode>,
+    chase: Res<ChaseCamera>,
+    q_self: Query<&Transform, (With<IsSelf>, Without<OperatorCamera>)>,
+    mut q_cam: Query<&mut Transform, (With<OperatorCamera>, Without<IsSelf>)>,
+) {
+    if !matches!(*mode, CameraMode::FirstPerson) {
+        return;
+    }
+    let Ok(self_t) = q_self.single() else {
+        return;
+    };
+    let Ok(mut cam_t) = q_cam.single_mut() else {
+        return;
+    };
+
+    let eye = self_t.translation + Vec3::Y * ChaseCamera::FP_EYE_HEIGHT;
+    let cos_p = chase.pitch.cos();
+    let look_dir = Vec3::new(
+        -chase.yaw.sin() * cos_p,
+        chase.pitch.sin(),
+        -chase.yaw.cos() * cos_p,
+    );
+    cam_t.translation = eye;
+    cam_t.look_at(eye + look_dir, Vec3::Y);
+}
+
+/// Toggle the camera between Chase and FirstPerson, applying mode-specific
+/// invariants:
+/// - Entering FP: leaves yaw/pitch alone (the FP system can use the wider
+///   range immediately).
+/// - Returning to Chase: clamps pitch back into `[PITCH_MIN, PITCH_MAX]` so
+///   the chase camera doesn't end up inside the ground or fully overhead.
+///
+/// Lives on [`ChaseCamera`] (not `CameraMode`) because it touches both —
+/// callers in input handlers grab `ResMut<ChaseCamera>` + `ResMut<CameraMode>`
+/// and call this.
+pub fn toggle_camera_mode(mode: &mut CameraMode, chase: &mut ChaseCamera) {
+    *mode = match *mode {
+        CameraMode::Chase => CameraMode::FirstPerson,
+        CameraMode::FirstPerson => {
+            chase.pitch = chase.pitch.clamp(ChaseCamera::PITCH_MIN, ChaseCamera::PITCH_MAX);
+            CameraMode::Chase
+        }
+    };
 }
 
 /// FFXI heading u8 → camera yaw radians (camera-behind-player).
@@ -142,6 +235,54 @@ mod tests {
             let back = heading_for_yaw(y);
             assert_eq!(back, h, "roundtrip for heading {h}");
         }
+    }
+
+    /// `toggle_camera_mode` flips the mode; pitch is preserved when going
+    /// into FP (FP allows the wider range) and clamped back into chase
+    /// range when leaving FP.
+    #[test]
+    fn toggle_camera_mode_clamps_pitch_only_on_chase_entry() {
+        let mut mode = CameraMode::Chase;
+        let mut chase = ChaseCamera {
+            pitch: 0.55,
+            ..Default::default()
+        };
+        toggle_camera_mode(&mut mode, &mut chase);
+        assert_eq!(mode, CameraMode::FirstPerson);
+        assert_eq!(chase.pitch, 0.55, "FP entry preserves pitch");
+
+        // Mouse-look down past the chase floor while in FP.
+        chase.pitch = -0.7;
+        toggle_camera_mode(&mut mode, &mut chase);
+        assert_eq!(mode, CameraMode::Chase);
+        assert_eq!(
+            chase.pitch,
+            ChaseCamera::PITCH_MIN,
+            "Chase re-entry clamps pitch up to the floor"
+        );
+
+        // Looking far up in FP also clamps on chase re-entry.
+        toggle_camera_mode(&mut mode, &mut chase); // -> FP
+        chase.pitch = 1.5;
+        toggle_camera_mode(&mut mode, &mut chase); // -> Chase
+        assert_eq!(chase.pitch, ChaseCamera::PITCH_MAX);
+    }
+
+    /// FP look direction is the negation of the chase camera-from-player
+    /// vector: at chase.yaw = 0, pitch = 0, FP forward must be Bevy -Z (the
+    /// direction a player at FFXI heading 0 / north faces).
+    #[test]
+    fn firstperson_look_dir_matches_player_forward_at_default_yaw() {
+        let yaw = 0.0_f32;
+        let pitch = 0.0_f32;
+        let cos_p = pitch.cos();
+        let look = Vec3::new(-yaw.sin() * cos_p, pitch.sin(), -yaw.cos() * cos_p);
+        // Forward for heading=0 (FFXI north) is Bevy -Z.
+        let expected = Vec3::new(0.0, 0.0, -1.0);
+        assert!(
+            (look - expected).length() < 1e-6,
+            "look {look:?} != expected {expected:?}"
+        );
     }
 }
 

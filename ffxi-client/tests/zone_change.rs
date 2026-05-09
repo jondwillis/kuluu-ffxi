@@ -14,7 +14,7 @@ mod common;
 use std::time::Duration;
 
 use ffxi_client::{
-    session::{self, Config},
+    session::{self, CharSelection, Config},
     state::{AgentCommand, AgentEvent, Stage},
 };
 use tokio::{
@@ -67,8 +67,7 @@ async fn zone_change_reconnects_with_rotated_key() {
         view_port: 54001,
         user: fixture.username.clone(),
         password: fixture.password.clone(),
-        char_id: fixture.charid,
-        char_name: fixture.charname.clone(),
+        char_selection: CharSelection::Name(fixture.charname.clone()),
         initial_state: None,
     };
 

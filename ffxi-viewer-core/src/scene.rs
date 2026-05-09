@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use bevy::picking::Pickable;
 use bevy::prelude::*;
 use ffxi_viewer_wire::{EntityKind, Vec3 as WireVec3};
 
@@ -24,6 +25,28 @@ use crate::snapshot::SceneState;
 #[inline]
 pub fn ffxi_to_bevy(p: WireVec3) -> Vec3 {
     Vec3::new(p.x, p.z, -p.y)
+}
+
+/// Per-frame visual smoothing for *non-self* entity transforms.
+///
+/// Self position is updated 60 Hz from `dispatch_movement_system`'s
+/// FixedUpdate, so it's snapped directly — any smoothing on self compounds
+/// with the chase-camera lerp into perceptible input lag. Other entities
+/// (mobs, PCs) come from server packets at variable cadence (often below
+/// 60 Hz), so smoothing hides that stair-step.
+///
+/// Snaps when the gap exceeds the threshold so zone transitions / warps
+/// don't interpolate through walls — anything ≥ 2 yalms is a discontinuity.
+const VISUAL_SMOOTH: f32 = 0.4;
+const SNAP_DIST_SQ: f32 = 4.0;
+
+#[inline]
+fn apply_visual_smoothing(current: Vec3, target: Vec3) -> Vec3 {
+    if current.distance_squared(target) >= SNAP_DIST_SQ {
+        target
+    } else {
+        current.lerp(target, VISUAL_SMOOTH)
+    }
 }
 
 /// Cached materials per entity kind. Spawned once at startup.
@@ -39,6 +62,13 @@ pub struct EntityMaterials {
     pub target: Handle<StandardMaterial>,
     /// Aggro override: saturated red + emissive for mobs targeting the player.
     pub aggro: Handle<StandardMaterial>,
+    /// Mob claimed by the player: bright white. Canonical FFXI cue that
+    /// "this mob is mine — fight it, don't worry about claim contention".
+    pub mob_claimed_self: Handle<StandardMaterial>,
+    /// Mob claimed by another player: muted red. Distinct from the
+    /// brighter, emissive `aggro` red so the operator can tell at a glance
+    /// "someone else is fighting this" vs. "this is fighting me".
+    pub mob_claimed_other: Handle<StandardMaterial>,
 }
 
 /// Marker for entities currently aggroing the player. Inserted by
@@ -115,6 +145,15 @@ pub fn setup_world(
             perceptual_roughness: 0.4,
             ..default()
         }),
+        // Self-claimed mob: bright matte white. No emissive — the visual
+        // weight of pure white against the dim ground reads as "ours" without
+        // competing with the aggro material.
+        mob_claimed_self: mk(Color::srgb(0.96, 0.96, 0.96), &mut materials),
+        // Other-claimed mob: deep, slightly desaturated red. Calibrated to
+        // sit between the unclaimed mob's pinkish red (0.95, 0.40, 0.40)
+        // and the aggro material's saturated emissive red — same hue
+        // family, distinguishable side-by-side.
+        mob_claimed_other: mk(Color::srgb(0.65, 0.10, 0.10), &mut materials),
     });
     commands.insert_resource(EntityMesh {
         default: meshes.add(Capsule3d::new(0.5, 1.4)),
@@ -190,21 +229,37 @@ pub fn sync_entities_system(
         std::collections::HashSet::with_capacity(snap.entities.len() + 1);
     let mut hp_by_id: HashMap<u32, Option<u8>> = HashMap::new();
 
+    // Player's own UniqueNo, used to recognize self-claimed mobs. `None` /
+    // 0 until the lobby resolves the player id; falls through to "any
+    // non-zero claim is other-claim" in the picker.
+    let self_char_id = snap.self_char_id.unwrap_or(0);
     for wire in &snap.entities {
         seen.insert(wire.id);
         hp_by_id.insert(wire.id, wire.hp_pct);
         let world_pos = ffxi_to_bevy(wire.pos);
         let is_target = target.id == Some(wire.id);
-        let mat = if is_target {
-            mats.target.clone()
-        } else {
-            pick_material(&mats, wire.kind, false)
+        // Mob coloring routes through `pick_mob_material` so claim status
+        // (white/red) overrides the default mob tint while keeping the
+        // existing target/aggro priority. The `is_aggro` arg is `false`
+        // here — `sync_aggro_system` runs after this system and rewrites
+        // the material for entities that should glow red.
+        let mat = match wire.kind {
+            EntityKind::Mob => pick_mob_material(
+                &mats,
+                wire.claim_id,
+                self_char_id,
+                is_target,
+                false,
+            )
+            .clone(),
+            _ if is_target => mats.target.clone(),
+            _ => pick_material(&mats, wire.kind, false),
         };
 
         match tracked.by_id.get(&wire.id).copied() {
             Some(existing) => {
                 if let Ok(mut t) = q_xform.get_mut(existing) {
-                    t.translation = world_pos;
+                    t.translation = apply_visual_smoothing(t.translation, world_pos);
                     t.rotation = heading_to_quat(wire.heading);
                 }
                 if let Ok(mut m) = q_mat.get_mut(existing) {
@@ -219,6 +274,11 @@ pub fn sync_entities_system(
                             act_index: wire.act_index,
                             kind: wire.kind,
                         },
+                        // Click-to-target (C4): wire entities are pickable
+                        // by the mesh raycast backend. `Pickable::default()`
+                        // = blocks lower entities + emits hover/click
+                        // events. The default is fine here.
+                        Pickable::default(),
                         Mesh3d(pick_mesh(&mesh, wire.kind)),
                         MeshMaterial3d(mat),
                         Transform {
@@ -235,6 +295,11 @@ pub fn sync_entities_system(
                     let bar_color = hp_color(wire.hp_pct);
                     commands.spawn((
                         HpBar { owner_id: wire.id },
+                        // HP bars hover above an entity; without `IGNORE`
+                        // they would intercept clicks aimed at the capsule
+                        // beneath them and the click-to-target system
+                        // would think the operator clicked a non-entity.
+                        Pickable::IGNORE,
                         Mesh3d(hp_bar_mesh.0.clone()),
                         MeshMaterial3d(materials.add(StandardMaterial {
                             base_color: bar_color,
@@ -274,6 +339,9 @@ pub fn sync_entities_system(
     match tracked.by_id.get(&self_id).copied() {
         Some(existing) => {
             if let Ok(mut t) = q_xform.get_mut(existing) {
+                // Self is dispatched at 60 Hz already (see
+                // `view_native::dispatch_movement_system`), so snap rather
+                // than lerp — extra smoothing here only adds input lag.
                 t.translation = self_pos;
                 t.rotation = self_rot;
             }
@@ -287,6 +355,14 @@ pub fn sync_entities_system(
                         kind: EntityKind::Pc,
                     },
                     IsSelf,
+                    // Click-to-target (C4): the self capsule sits under the
+                    // chase camera and would otherwise reliably intercept
+                    // every click aimed past it. `IGNORE` removes it from
+                    // the picking pipeline entirely — the operator can
+                    // never click-target themselves, which matches the
+                    // resolve-time guard in `picking::resolve_click_target`
+                    // (id == 0 → Clear) but saves a raycast hit-test.
+                    Pickable::IGNORE,
                     Mesh3d(mesh.pc.clone()),
                     MeshMaterial3d(mats.self_pc.clone()),
                     Transform {
@@ -375,6 +451,14 @@ pub fn sync_aggro_system(
     let snap = &state.snapshot;
     let self_id = snap.diagnostics.sync_in;
     let Some(self_uid) = self_id else { return };
+    // Full u32 player id for claim coloring. Falls back to 0 (unknown)
+    // when the lobby hasn't resolved it yet — the picker treats 0 as
+    // "can't distinguish self vs. other" and routes any non-zero claim
+    // to the "other-claim" branch.
+    let self_char_id = snap.self_char_id.unwrap_or(0);
+    // Map per-id claim_id so the restore branch below can pick the
+    // right "not-aggroing-anymore" material without re-scanning entities.
+    let mut claim_by_id: HashMap<u32, u32> = HashMap::new();
 
     let mut aggroing: HashMap<u32, bool> = HashMap::new();
     for ent in &snap.entities {
@@ -383,12 +467,16 @@ pub fn sync_aggro_system(
         {
             aggroing.insert(ent.id, true);
         }
+        if matches!(ent.kind, EntityKind::Mob) {
+            claim_by_id.insert(ent.id, ent.claim_id);
+        }
     }
 
     let self_pos = self_q.single().ok().map(|t| t.translation);
 
     for (e, w, t, mut m, has_aggro) in q.iter_mut() {
         let should_aggro = aggroing.get(&w.id).copied().unwrap_or(false);
+        let is_target = Some(w.id) == target.id;
         match (should_aggro, has_aggro.is_some()) {
             (true, false) => {
                 commands.entity(e).insert(Aggroing);
@@ -399,7 +487,13 @@ pub fn sync_aggro_system(
             }
             (false, true) => {
                 commands.entity(e).remove::<Aggroing>();
-                let restore = if Some(w.id) == target.id {
+                // Restore through the picker so claim-color survives the
+                // aggro→clear transition (white/red mob stays white/red
+                // after the player breaks aggro).
+                let restore = if matches!(w.kind, EntityKind::Mob) {
+                    let claim = claim_by_id.get(&w.id).copied().unwrap_or(0);
+                    pick_mob_material(&mats, claim, self_char_id, is_target, false).clone()
+                } else if is_target {
                     mats.target.clone()
                 } else {
                     pick_material(&mats, w.kind, false)
@@ -451,6 +545,44 @@ fn pick_material(m: &EntityMaterials, kind: EntityKind, is_self: bool) -> Handle
     }
 }
 
+/// Pure decision: which material should a mob capsule use?
+///
+/// Priority (high → low):
+///   1. **Aggro** — the mob is targeting the player. Always wins; the
+///      operator needs to see "this is fighting me" regardless of who
+///      claimed it (especially the case of a kited claimed mob aggroing
+///      a passerby).
+///   2. **Target ring** — the operator's selected target. Yellow.
+///   3. **Self-claim** — `claim_id == self_id`, both non-zero. White.
+///   4. **Other-claim** — `claim_id != 0 && claim_id != self_id`. Muted red.
+///   5. **Unclaimed** — `claim_id == 0`. Default mob material (yellow tint).
+///
+/// `self_id == 0` means "we don't know our own UniqueNo yet"; in that
+/// state we can't distinguish self-claim from other-claim, so any
+/// non-zero `claim_id` falls through to "other".
+pub fn pick_mob_material<'a>(
+    mats: &'a EntityMaterials,
+    claim_id: u32,
+    self_id: u32,
+    is_target: bool,
+    is_aggro: bool,
+) -> &'a Handle<StandardMaterial> {
+    if is_aggro {
+        return &mats.aggro;
+    }
+    if is_target {
+        return &mats.target;
+    }
+    if claim_id == 0 {
+        return &mats.mob;
+    }
+    if self_id != 0 && claim_id == self_id {
+        &mats.mob_claimed_self
+    } else {
+        &mats.mob_claimed_other
+    }
+}
+
 /// FFXI heading 0..=255 maps to 0..2π. Heading 0 = +y in FFXI = -z in Bevy
 /// = "camera-forward in default pose". Rotation axis is Bevy's Y-up.
 fn heading_to_quat(heading: u8) -> Quat {
@@ -472,4 +604,129 @@ fn hp_color(pct: Option<u8>) -> Color {
     let r = frac.min(1.0);
     let g = (1.0 - frac).min(1.0);
     Color::srgb(r, g, 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Small deltas (normal movement) lerp toward the target so the
+    /// rendered position catches up over a few frames; large deltas (zone
+    /// transitions, warps) snap so the avatar doesn't slide across the map.
+    #[test]
+    fn visual_smoothing_lerps_short_then_snaps_long() {
+        // 0.25-yalm tick (= one server-cadence step at speed=25).
+        let near = apply_visual_smoothing(Vec3::ZERO, Vec3::new(0.25, 0.0, 0.0));
+        assert!(near.x > 0.0 && near.x < 0.25, "lerp partial: {}", near.x);
+        assert!(
+            (near.x - 0.1).abs() < 1e-6,
+            "VISUAL_SMOOTH=0.4 → 0.25 * 0.4 = 0.1, got {}",
+            near.x
+        );
+
+        // 50-yalm jump (zone change). Snap.
+        let far = apply_visual_smoothing(Vec3::ZERO, Vec3::new(50.0, 0.0, 0.0));
+        assert_eq!(far, Vec3::new(50.0, 0.0, 0.0));
+    }
+
+    /// Build an `EntityMaterials` whose handles are all `Handle::default()`
+    /// — *distinct values* aren't required because the tests compare
+    /// `&Handle` references for pointer equality, not the underlying
+    /// `AssetId`. Using `Handle::default()` keeps the fixture tiny and
+    /// avoids dragging in `App` / `MinimalPlugins` for a pure decision-
+    /// logic test.
+    fn dummy_materials() -> EntityMaterials {
+        EntityMaterials {
+            pc: Handle::default(),
+            self_pc: Handle::default(),
+            npc: Handle::default(),
+            mob: Handle::default(),
+            pet: Handle::default(),
+            other: Handle::default(),
+            target: Handle::default(),
+            aggro: Handle::default(),
+            mob_claimed_self: Handle::default(),
+            mob_claimed_other: Handle::default(),
+        }
+    }
+
+    /// Mob with no owner gets the default mob material — preserves the
+    /// pre-claim behavior for unclaimed mobs.
+    #[test]
+    fn pick_mob_material_unclaimed_uses_default_mob() {
+        let mats = dummy_materials();
+        let h = pick_mob_material(&mats, 0, 0xCAFE, false, false);
+        assert!(std::ptr::eq(h, &mats.mob), "unclaimed mob → mats.mob");
+    }
+
+    /// `claim_id == self_id` (both non-zero) → self-claim white.
+    #[test]
+    fn pick_mob_material_self_claim_uses_white() {
+        let mats = dummy_materials();
+        let h = pick_mob_material(&mats, 0xCAFE, 0xCAFE, false, false);
+        assert!(std::ptr::eq(h, &mats.mob_claimed_self));
+    }
+
+    /// `claim_id != 0 && claim_id != self_id` → other-claim red.
+    /// Also exercises the `self_id == 0` (unknown player id) path: any
+    /// non-zero claim falls through to "other".
+    #[test]
+    fn pick_mob_material_other_claim_uses_muted_red() {
+        let mats = dummy_materials();
+        let h = pick_mob_material(&mats, 0x4242, 0xCAFE, false, false);
+        assert!(std::ptr::eq(h, &mats.mob_claimed_other), "other player's claim");
+        let h_unknown_self = pick_mob_material(&mats, 0x4242, 0, false, false);
+        assert!(
+            std::ptr::eq(h_unknown_self, &mats.mob_claimed_other),
+            "unknown self_id falls through to other-claim",
+        );
+    }
+
+    /// Aggro must override every claim state — even a self-claimed mob
+    /// shows aggro red when it's targeting the player. The operator
+    /// needs the "this is fighting me" cue to dominate.
+    #[test]
+    fn pick_mob_material_aggro_overrides_claim() {
+        let mats = dummy_materials();
+        let h_self = pick_mob_material(&mats, 0xCAFE, 0xCAFE, false, true);
+        assert!(std::ptr::eq(h_self, &mats.aggro), "aggro > self-claim");
+        let h_other = pick_mob_material(&mats, 0x4242, 0xCAFE, false, true);
+        assert!(std::ptr::eq(h_other, &mats.aggro), "aggro > other-claim");
+        let h_unclaimed = pick_mob_material(&mats, 0, 0xCAFE, false, true);
+        assert!(std::ptr::eq(h_unclaimed, &mats.aggro), "aggro > unclaimed");
+        // Aggro also beats target highlight — the existing system already
+        // had this implicit ordering; the helper makes it explicit.
+        let h_target_too = pick_mob_material(&mats, 0xCAFE, 0xCAFE, true, true);
+        assert!(std::ptr::eq(h_target_too, &mats.aggro), "aggro > target");
+    }
+
+    /// Target ring beats claim coloring (when not aggroing): the operator
+    /// needs the "this is what I selected" cue regardless of who claimed
+    /// it. Aggro still beats target — the priority chain is aggro >
+    /// target > claim > unclaimed.
+    #[test]
+    fn pick_mob_material_target_overrides_claim_when_not_aggro() {
+        let mats = dummy_materials();
+        let h = pick_mob_material(&mats, 0xCAFE, 0xCAFE, true, false);
+        assert!(std::ptr::eq(h, &mats.target));
+    }
+
+    /// At exactly the snap threshold, snap (not lerp). Below threshold,
+    /// lerp. The boundary catches the off-by-one error of using a strict
+    /// inequality the wrong way.
+    #[test]
+    fn visual_smoothing_snap_threshold_boundary() {
+        let just_under = (SNAP_DIST_SQ - 1e-3).sqrt();
+        let result = apply_visual_smoothing(Vec3::ZERO, Vec3::new(just_under, 0.0, 0.0));
+        // Lerp would give result.x = just_under * VISUAL_SMOOTH ≈ 0.8.
+        assert!(
+            result.x < just_under,
+            "below threshold should lerp, got {}",
+            result.x
+        );
+
+        let at_threshold = SNAP_DIST_SQ.sqrt();
+        let result = apply_visual_smoothing(Vec3::ZERO, Vec3::new(at_threshold, 0.0, 0.0));
+        assert_eq!(result.x, at_threshold, "at threshold should snap");
+    }
 }

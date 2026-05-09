@@ -9,9 +9,11 @@ use glam::Vec3;
 
 pub mod grid;
 pub mod zone_names;
+pub mod zonelines;
 
 pub use grid::{GridNav, NavError};
 pub use zone_names::zone_name;
+pub use zonelines::{zone_lines_for, ZoneLine};
 
 /// Trait implemented by any navigable representation of a zone.
 ///

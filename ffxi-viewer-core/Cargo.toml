@@ -17,4 +17,10 @@ license.workspace = true
 bevy = { workspace = true }
 ffxi-viewer-wire = { path = "../ffxi-viewer-wire" }
 
+# wasm32 has no syscall for wall-clock time; std::time::SystemTime::now()
+# panics there. The HUD's reconnect-age line needs millis-since-epoch, so
+# we delegate to JS's `Date.now()` on wasm targets only.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
 [dev-dependencies]

@@ -31,6 +31,27 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ffxi_nav::{glam, GridNav, NavMesh};
+use ffxi_nav_recast::RecastNavMesh;
+
+/// One-of-N nav implementation. Enum dispatch (vs `Box<dyn NavMesh>`)
+/// avoids the trait-object `Send`-bound question — `RecastNavMesh`
+/// holds raw FFI pointers from `recastnavigation-rs` whose `Send`-ness
+/// isn't guaranteed by the binding crate. Adding new variants is the
+/// natural place to hang Stage-3 zone collision or future tile-cache
+/// formats.
+enum LoadedNav {
+    Recast(RecastNavMesh),
+    Grid(GridNav),
+}
+
+impl NavMesh for LoadedNav {
+    fn path(&self, from: glam::Vec3, to: glam::Vec3) -> Option<Vec<glam::Vec3>> {
+        match self {
+            LoadedNav::Recast(n) => n.path(from, to),
+            LoadedNav::Grid(n) => n.path(from, to),
+        }
+    }
+}
 use tokio::sync::{broadcast, mpsc};
 
 use crate::state::{
@@ -205,7 +226,7 @@ pub struct Reactor {
     /// for the current zone yet or there's no heightmap available
     /// (Stage 10b ships the wiring; per-zone PNG acquisition is a
     /// later operator task).
-    nav_cache: Option<(u16, GridNav)>,
+    nav_cache: Option<(u16, LoadedNav)>,
 }
 
 impl Reactor {
@@ -229,15 +250,16 @@ impl Reactor {
     /// branch without writing a PNG to disk.
     #[cfg(test)]
     pub fn set_nav_for_test(&mut self, zone_id: u16, nav: GridNav) {
-        self.nav_cache = Some((zone_id, nav));
+        self.nav_cache = Some((zone_id, LoadedNav::Grid(nav)));
     }
 
     /// Resolve the current zone's navmesh, lazy-loading it from
-    /// `~/.config/ffxi-mcp/heightmaps/<zone_id>.png` on the first
-    /// `PathTo` after a zone change. Returns `None` (and leaves the
-    /// cache unset) when no heightmap is available — the caller falls
+    /// upstream xiNavmeshes (Recast/Detour) or the
+    /// `~/.config/ffxi-mcp/heightmaps/<zone_id>.png` fallback on the
+    /// first `PathTo` after a zone change. Returns `None` (and leaves
+    /// the cache unset) when neither is available — the caller falls
     /// back to a single-segment straight-line path.
-    fn ensure_nav_loaded(&mut self) -> Option<&GridNav> {
+    fn ensure_nav_loaded(&mut self) -> Option<&LoadedNav> {
         let zone_id = self.state.zone_id?;
         let cached = matches!(&self.nav_cache, Some((z, _)) if *z == zone_id);
         if !cached {
@@ -719,32 +741,69 @@ fn heightmap_png_path(zone_id: u16) -> Option<PathBuf> {
 
 /// Try to load a navmesh for `zone_id`. Priority:
 ///
-///   1. LSB Detour `.nav` from the `server/navmeshes` submodule (or
-///      `$FFXI_NAVMESH_DIR`). **NOT YET IMPLEMENTED** — the file
-///      format is Recast/Detour (`TESM`/`MSET` magic) and `ffxi-nav`
-///      currently only reads PNG occupancy bitmaps. This branch logs
-///      a one-time warning and falls through to step 2.
-///   2. PNG occupancy heightmap from `~/.config/ffxi-mcp/heightmaps/`.
-///   3. None → caller straight-lines, accepting that the path may
+///   1. xiNavmeshes Recast/Detour `.nav` (auto-fetched + cached by
+///      `ffxi-nav-recast::fetch`). Covers all 299 zones LSB ships.
+///   2. Locally-installed Detour `.nav` under `$FFXI_NAVMESH_DIR` or
+///      a sibling `vendor/server/navmeshes/` dir. Same file format,
+///      different source — useful when running offline.
+///   3. PNG occupancy heightmap from `~/.config/ffxi-mcp/heightmaps/`.
+///   4. None → caller straight-lines, accepting that the path may
 ///      clip walls. The server validates moves so an illegal path
 ///      ends in a server-side reject, not undefined behavior.
-fn default_load_navmesh(zone_id: u16) -> Option<GridNav> {
+fn default_load_navmesh(zone_id: u16) -> Option<LoadedNav> {
+    // Zone 0 is the "unknown" sentinel (`ffxi_nav::zone_name(0)` →
+    // `"unknown"`). No real play session uses it; a unit-test or
+    // packet-decode glitch can report it spuriously. Short-circuit
+    // before any disk / network side effect so tests stay hermetic.
+    if zone_id == 0 {
+        return None;
+    }
+
+    // 1. Local override path takes precedence over the auto-fetch
+    //    cache, so operators with a hand-managed copy aren't forced
+    //    onto the GitHub-hosted version.
     if let Some(detour_path) = detour_navmesh_path(zone_id) {
         if detour_path.exists() {
-            // The Detour binary format is documented at
-            // `ffxi-nav/docs/detour_format.md`. Existence-check + warn so
-            // operators can see we found the file but don't yet know how
-            // to parse it; the PNG fallback below handles the common
-            // farming zones.
-            let name = ffxi_nav::zone_name(zone_id).unwrap_or("?");
+            match RecastNavMesh::from_path(&detour_path) {
+                Ok(nav) => {
+                    tracing::info!(
+                        zone_id,
+                        path = %detour_path.display(),
+                        "navmesh loaded (local Detour)"
+                    );
+                    return Some(LoadedNav::Recast(nav));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        zone_id,
+                        path = %detour_path.display(),
+                        error = %e,
+                        "local Detour .nav rejected; trying upstream"
+                    );
+                }
+            }
+        }
+    }
+
+    // 2. Upstream xiNavmeshes (download-on-first-use, cached after).
+    match RecastNavMesh::for_zone(zone_id) {
+        Ok(nav) => {
+            tracing::info!(zone_id, "navmesh loaded (xiNavmeshes upstream)");
+            return Some(LoadedNav::Recast(nav));
+        }
+        Err(ffxi_nav_recast::LoadError::NotAvailable(_)) => {
+            tracing::debug!(zone_id, "no xiNavmeshes navmesh upstream; trying PNG");
+        }
+        Err(e) => {
             tracing::warn!(
                 zone_id,
-                zone_name = %name,
-                path = %detour_path.display(),
-                "found Detour .nav but Rust reader is not implemented; falling through to PNG heightmap or straight-line"
+                error = %e,
+                "xiNavmeshes load failed; trying PNG fallback"
             );
         }
     }
+
+    // 3. PNG heightmap fallback.
     let png = heightmap_png_path(zone_id)?;
     if !png.exists() {
         return None;
@@ -756,7 +815,7 @@ fn default_load_navmesh(zone_id: u16) -> Option<GridNav> {
                 path = %png.display(),
                 "navmesh loaded (PNG fallback)"
             );
-            Some(nav)
+            Some(LoadedNav::Grid(nav))
         }
         Err(e) => {
             tracing::warn!(
@@ -886,6 +945,7 @@ mod tests {
                 heading: 0,
                 hp_pct: Some(hp_pct),
                 bt_target_id,
+                claim_id: 0,
             },
         }
     }

@@ -25,8 +25,9 @@
         "FFXI_VIEW_PORT": "54001",
         "FFXI_USER": "claude",
         "FFXI_PASS": "testpass123",
-        "FFXI_CHAR_ID": "4",
-        "FFXI_CHAR": "Cleric"
+        "FFXI_CHAR": "Cleric",
+        "FFXI-RELAY_LISTEN": "auto",
+        "RUST_LOG": "info"
       }
     }
   }

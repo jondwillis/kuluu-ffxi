@@ -1,0 +1,22 @@
+2026-04-29T21:00:14Z	session_start	baseline injected
+2026-04-29T21:03:01Z	transcript_path	/Users/jon/.claude/projects/-Volumes-Sidecar-ffxi-ffxi-agent/c84bb73c-7f0d-41ff-9cf2-a0187b0eaf59.jsonl
+2026-04-29T21:03:03Z	tool_fail	Read
+2026-04-29T21:03:06Z	bash_ok	
+2026-04-29T21:03:08Z	bash_ok	
+2026-04-29T21:03:10Z	bash_ok	
+2026-04-29T21:03:12Z	bash_ok	
+2026-04-29T21:03:14Z	bash_ok	
+2026-04-29T21:03:16Z	bash_ok	
+2026-04-29T21:03:20Z	tool_fail	Bash:tail -c 5000 /Users/jon/.claude/projects/-Volumes-Sidecar-ffxi-ffxi-agent/c84bb7
+2026-04-29T21:03:25Z	tool_fail	Read
+2026-04-29T21:03:28Z	bash_ok	
+2026-04-29T21:03:30Z	tool_fail	Read
+2026-04-29T21:03:32Z	bash_ok	
+2026-04-29T21:03:34Z	bash_ok	
+2026-04-29T21:03:38Z	bash_ok	
+2026-04-29T21:03:40Z	bash_ok	
+2026-04-29T21:03:50Z	bash_ok	
+2026-04-29T21:03:53Z	bash_ok	
+2026-04-29T21:03:58Z	bash_ok	
+2026-04-29T21:04:01Z	bash_ok	
+2026-04-29T21:04:09Z	bash_ok	

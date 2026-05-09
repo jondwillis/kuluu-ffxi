@@ -134,6 +134,15 @@ impl LobbyHandle {
         self.data.flush().await?;
         tracing::debug!("lobby: 0xA2 handoff sent");
 
+        // Same race-mitigation rationale as the sleep in `open()` before
+        // 0xA1: LSB's 0xA2 handler writes lpkt_next_login to
+        // view_session->buffer_, but the view socket's read state and
+        // the data session's write must serialize cleanly. Locally
+        // observed: ~4ms is enough on a warm server, but cold/contended
+        // races see the next_login push silently dropped. 50ms is a
+        // generous nudge that costs nothing on the happy path.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
         let handoff = read_lpkt_next_login(&mut self.view, char_id, &key3).await?;
         tracing::debug!(server_port = handoff.server_port, "lobby: lpkt_next_login received");
         Ok(handoff)
@@ -168,6 +177,18 @@ impl LobbyClient {
         view.write_all(&register).await?;
         view.flush().await?;
         tracing::debug!("lobby: VIEW_CMD_REGISTER sent");
+
+        // Race-condition mitigation: LSB's data_session::read_func handles
+        // 0xA1 by writing chr_info2 to `session.view_session->buffer_`, but
+        // `session.view_session` is only populated when view_session::
+        // read_func has run for the first time. If we send 0xA1 before
+        // the server's asio reactor has dispatched VIEW_CMD_REGISTER on
+        // the view socket, the data handler sees a null view_session and
+        // never sends chr_info2 — client then blocks forever in
+        // `parse_view_chr_info2`. 100ms is a generous nudge; LSB
+        // typically dispatches the view read in under 1ms locally, but
+        // the kernel-level ordering of two TCP sockets isn't guaranteed.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let req_a1 = build_data_a1(auth.account_id, 0, &auth.session_hash);
         data.write_all(&req_a1).await?;
@@ -426,11 +447,12 @@ async fn drain_view_chr_info2(stream: &mut TcpStream) -> Result<()> {
 /// is 76 bytes (`lpkt_chr_info_sub2`); we only extract the fields the
 /// launcher cares about — `ffxi_id`, `status`, and `character_name`.
 async fn parse_view_chr_info2(stream: &mut TcpStream) -> Result<Vec<CharSlot>> {
+    tracing::debug!("lobby: waiting for chr_info2 packet on view socket");
     let mut size_bytes = [0u8; 4];
     stream
         .read_exact(&mut size_bytes)
         .await
-        .context("reading lpkt_chr_info2 size header")?;
+        .context("reading lpkt_chr_info2 size header — server may not be sending chr_info2")?;
     let size = u32::from_le_bytes(size_bytes) as usize;
     if size < IXFF_HEADER_SIZE || size > 64 * 1024 {
         bail!("implausible lpkt_chr_info2 size {size}");

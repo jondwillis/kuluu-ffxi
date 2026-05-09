@@ -1,0 +1,26 @@
+# Workspace-local cargo config.
+#
+# ## CXXFLAGS workaround for `recastnavigation-rs` build (macOS)
+#
+# `recastnavigation-rs` (used by `ffxi-nav-recast`) is a `cxx`-bridged
+# Rust binding to the C++ Recast/Detour library. On macOS it requires a
+# functioning Apple Clang + libc++ install.
+#
+# On at least one developer machine, the Command Line Tools install has
+# a stale layout where clang's first C++ search path
+# (`/Library/Developer/CommandLineTools/usr/include/c++/v1/`) is empty,
+# while the actual headers live in the SDK at
+# `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/`.
+# Without this `-isystem`, cxx-build fails with `'algorithm' file not found`.
+#
+# The proper fix is to reinstall Command Line Tools:
+#     sudo rm -rf /Library/Developer/CommandLineTools
+#     xcode-select --install
+# After which this `[env]` block can be removed.
+#
+# `MACOSX_DEPLOYMENT_TARGET` is pinned because some `cxx` versions emit a
+# default that targets the *current* macOS, which on bleeding-edge macOS
+# (e.g. 26.x) is past what the Recast C++ source has been verified
+# against. 14.0 is a safe modern floor.
+[env]
+CXXFLAGS = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1"
