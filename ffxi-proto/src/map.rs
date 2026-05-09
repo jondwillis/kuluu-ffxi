@@ -23,6 +23,52 @@ pub mod c2s {
     pub const EVENT_END: u16 = 0x05B;
     /// `GP_CLI_COMMAND_CHAT_STD` — see `session::build_subpacket_chat`.
     pub const CHAT: u16 = 0x0B5;
+    /// `GP_CLI_COMMAND_SHOP_BUY` — purchase an item from an open NPC shop.
+    /// Body: `u32 ItemNum (qty), u16 ShopNo, u16 ShopItemIndex, u8 PropertyItemIndex, u8 pad[3]`.
+    /// See `vendor/server/src/map/packets/c2s/0x083_shop_buy.h`.
+    pub const SHOP_BUY: u16 = 0x083;
+    /// `GP_CLI_COMMAND_REQLOGOUT` — request `/logout` (return to char-select)
+    /// or `/shutdown` (exit game). Body: `u16 Mode, u16 Kind` = 4 bytes
+    /// (size_words=2). The server applies `EFFECT_LEAVEGAME` (5s tick
+    /// interval); the Lua handler at `scripts/effects/leavegame.lua`
+    /// calls `leaveGame()` after `elapsedTicks > 5` (≈30s total) for
+    /// normal players, and **immediately** in `onEffectGain` if the
+    /// player is a GM (`getGMLevel() > 0`) or in a Mog House. The s2c
+    /// 0x00B `LOGOUT` lands when `leaveGame()` fires. Sending a second
+    /// `Toggle` while the effect is active cancels it. See
+    /// `vendor/server/src/map/packets/c2s/0x0e7_reqlogout.{h,cpp}`.
+    pub const REQ_LOGOUT: u16 = 0x0E7;
+}
+
+/// `GP_CLI_COMMAND_REQLOGOUT_MODE` / `_KIND` — wire enums for the 0x0E7
+/// `/logout` and `/shutdown` request packet. Mirrors
+/// `vendor/server/src/map/packets/c2s/0x0e7_reqlogout.h`.
+pub mod reqlogout {
+    /// `Mode` field. The server validates the value is one of these via
+    /// `oneOf<GP_CLI_COMMAND_REQLOGOUT_MODE>` (see 0x0e7_reqlogout.cpp);
+    /// any other value is rejected outright.
+    pub mod mode {
+        /// `/logout` and `/shutdown` with no argument — flips the
+        /// in-progress LeaveGame effect on or off.
+        pub const TOGGLE: u16 = 0x00;
+        /// `/logout on` — start the logout timer (no-op if already running).
+        pub const LOGOUT_ON: u16 = 0x01;
+        /// `/logout off` and `/shutdown off` — cancel an in-progress
+        /// LeaveGame effect of either kind.
+        pub const OFF: u16 = 0x02;
+        /// `/shutdown on` — start the shutdown timer (no-op if running).
+        pub const SHUTDOWN_ON: u16 = 0x03;
+    }
+
+    /// `Kind` field. Selects between returning to char-select (`LOGOUT`)
+    /// and fully closing the game (`SHUTDOWN`). Note the wire enum jumps
+    /// 1 → 3; `2` is intentionally unused.
+    pub mod kind {
+        /// `/logout` — return to character select.
+        pub const LOGOUT: u16 = 0x01;
+        /// `/shutdown` — exit the game entirely.
+        pub const SHUTDOWN: u16 = 0x03;
+    }
 }
 
 /// `GP_CLI_COMMAND_ACTION_ACTIONID` — see
@@ -41,6 +87,29 @@ pub mod action_id {
     pub const SHOOT: u16 = 0x10;
 }
 
+/// `CHAT_MESSAGE_TYPE` byte carried in s2c 0x017 and as the high byte of c2s
+/// 0x0B5's `Kind`. Mirrors `vendor/server/src/map/enums/chat_message_type.h`
+/// — only the values the chat panel actually surfaces are listed; unknown
+/// kinds fall through to `ChatChannel::Other` at the call site.
+pub mod chat_kind {
+    pub const SAY: u8 = 0;
+    pub const SHOUT: u8 = 1;
+    pub const TELL: u8 = 3;
+    pub const PARTY: u8 = 4;
+    pub const LINKSHELL: u8 = 5;
+    pub const SYSTEM_1: u8 = 6;
+    pub const SYSTEM_2: u8 = 7;
+    pub const EMOTION: u8 = 8;
+    pub const NS_SAY: u8 = 13;
+    pub const NS_SHOUT: u8 = 14;
+    pub const NS_PARTY: u8 = 15;
+    pub const NS_LINKSHELL: u8 = 16;
+    pub const YELL: u8 = 26;
+    pub const LINKSHELL2: u8 = 27;
+    pub const NS_LINKSHELL2: u8 = 28;
+    pub const SYSTEM_3: u8 = 29;
+}
+
 /// Selected server→client opcodes used by v1.
 pub mod s2c {
     pub const ENTERZONE: u16 = 0x008;
@@ -49,6 +118,10 @@ pub mod s2c {
     pub const LOGOUT: u16 = 0x00B;
     pub const CHAR_PC: u16 = 0x00D;
     pub const CHAR_NPC: u16 = 0x00E;
+    /// `GP_SERV_COMMAND_CHAT_STD` — player/NPC chat. Body: `Kind:u8 Attr:u8
+    /// Data:u16 sName[15] Mes[var]`. See
+    /// `vendor/server/src/map/packets/s2c/0x017_chat_std.h`.
+    pub const CHAT: u16 = 0x017;
     /// `GP_SERV_COMMAND_ITEM_MAX` — container size table. Body carries
     /// `ItemNum[18]` (legacy u8 capacity) + padding + `ItemNum2[18]`
     /// (u16 capacity for >255-slot containers) for all 18 CONTAINER_IDs.
@@ -65,9 +138,53 @@ pub mod s2c {
     /// item-type-specific extdata. We surface the extdata as raw bytes;
     /// interpretation lives in upstream (Phoenix's per-item logic).
     pub const ITEM_ATTR: u16 = 0x020;
+    /// `GP_SERV_COMMAND_BATTLE2` — bitpacked combat-action stream. The wire
+    /// format isn't directly mappable; we don't decode it, but the symbolic
+    /// id is here so the dispatcher can ignore it explicitly without an
+    /// "unknown opcode" line each frame of combat.
+    pub const BATTLE2: u16 = 0x028;
+    /// `GP_SERV_COMMAND_BATTLE_MESSAGE` — combat text message. Body:
+    /// `UniqueNoCas:u32 UniqueNoTar:u32 Data:u32 Data2:u32 ActIndexCas:u16
+    /// ActIndexTar:u16 MessageNum:u16 Type:u8 padding:u8` = 24 bytes. The
+    /// text is looked up in `msg_basic` and `<user>`/`<target>`/`<amount>`
+    /// placeholders are substituted client-side from the cas/tar entity
+    /// names + Data fields. See
+    /// `vendor/server/src/map/packets/s2c/0x029_battle_message.h`.
+    pub const BATTLE_MESSAGE: u16 = 0x029;
     pub const EVENT: u16 = 0x032;
     pub const EVENTSTR: u16 = 0x033;
     pub const EVENTNUM: u16 = 0x034;
+    /// `GP_SERV_COMMAND_BATTLE_MESSAGE2` — end-of-combat / chain / XP gain
+    /// messages. Same 24-byte layout as 0x029 but field order differs:
+    /// `UniqueNoCas:u32 UniqueNoTar:u32 ActIndexCas:u16 ActIndexTar:u16
+    /// Data:u32 Data2:u32 MessageNum:u16 Type:u8 padding:u8`. See
+    /// `vendor/server/src/map/packets/s2c/0x02d_battle_message2.h`.
+    pub const BATTLE_MESSAGE2: u16 = 0x02D;
+    /// `GP_SERV_COMMAND_SHOP_LIST` — list of items an NPC shop is selling.
+    /// Body: `u16 ShopItemOffsetIndex, u8 Flags, u8 pad, GP_SHOP[N]` where
+    /// each `GP_SHOP` is 10 bytes:
+    /// `u32 ItemPrice, u16 ItemNo, u8 ShopIndex, u8 pad, u16 Skill, u16 GuildInfo`.
+    /// `N = (body_len - 4) / 10`. See
+    /// `vendor/server/src/map/packets/s2c/0x03c_shop_list.h`.
+    pub const SHOP_LIST: u16 = 0x03C;
+    /// `GP_SERV_COMMAND_SHOP_OPEN` — "show the shop window now". Body:
+    /// `u16 ShopListNum, u16 pad`. See
+    /// `vendor/server/src/map/packets/s2c/0x03e_shop_open.h`.
+    pub const SHOP_OPEN: u16 = 0x03E;
+    /// `GP_SERV_COMMAND_MISCDATA` — multiplexed misc-data carrier. The
+    /// first u16 of the body is a `GP_SERV_COMMAND_MISCDATA_TYPE`:
+    /// `0x02 Merits, 0x03/0x04 Monstrosity, 0x05 JobPoints, 0x06 Homepoints,
+    /// 0x07 Unity, 0x09 StatusIcons, 0x0A Unknown`. See
+    /// `vendor/server/src/map/packets/s2c/0x063_miscdata.h`.
+    pub const MISCDATA: u16 = 0x063;
+    /// `GP_SERV_COMMAND_SYSTEMMES` — formatted system message. Body:
+    /// `u32 para, u32 para2, MsgStd Number(u16), u16 padding` = 12 bytes.
+    /// `Number` is an id into `xi.msg.system` (see
+    /// `ffxi_proto::msg_system`); `<seconds>` etc. placeholders in the
+    /// looked-up text are filled from `para`/`para2`. The /logout
+    /// countdown ticker (id 7) hits this opcode every 5s. See
+    /// `vendor/server/src/map/packets/s2c/0x053_systemmes.h`.
+    pub const SYSTEMMES: u16 = 0x053;
     pub const EQUIP_CLEAR: u16 = 0x04F;
     pub const EQUIP_LIST: u16 = 0x050;
     pub const GRAP_LIST: u16 = 0x051;

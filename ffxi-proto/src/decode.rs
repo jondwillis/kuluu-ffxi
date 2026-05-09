@@ -100,6 +100,38 @@ impl PosHead {
         })
     }
 
+    /// Decode a CHAR_NPC (0x00E) body, surfacing the mob-owner / claim id.
+    ///
+    /// CHAR_PC and CHAR_NPC share the same first 44 bytes of body layout:
+    /// `GP_SERV_POS_HEAD` followed by what looks structurally like
+    /// `BtTargetID` at body[40..44]. For CHAR_PC that slot is genuinely the
+    /// battle-target id; for CHAR_NPC the same byte slot is repurposed as
+    /// `m_OwnerID` — the FFXI claim-id, set when a player tags a mob.
+    ///
+    /// Server reference: `entity_update.cpp::updateWith` writes
+    /// `ref<uint32>(0x2C) = PMob->m_OwnerID.id` (packet-absolute 0x2C =
+    /// body offset 0x28, with the 4-byte sub-packet header subtracted).
+    /// Width: u32. `0` means "unclaimed".
+    ///
+    /// Returns `(PosHead, claim_id)`. The PosHead's `bt_target_id` field
+    /// will hold the same u32 — semantically it's the claim id when this
+    /// helper is the entry point. We surface it under a distinct name so
+    /// callers don't have to remember the dual semantics.
+    pub fn decode_char_npc(body: &[u8]) -> Result<(Self, u32), DecodeError> {
+        let head = Self::decode(body)?;
+        // The same 4 bytes the PosHead decoder reads as `bt_target_id` —
+        // CHAR_NPC repurposes that slot as `m_OwnerID`. We re-expose with
+        // the right name; bodies shorter than 44 bytes (legacy / position-
+        // only updates) report claim_id = 0, matching `bt_target_id`'s
+        // truncation fallback.
+        let claim_id = if body.len() >= Self::SIZE_WITH_BT_TARGET {
+            u32::from_le_bytes(body[40..44].try_into().unwrap())
+        } else {
+            0
+        };
+        Ok((head, claim_id))
+    }
+
     /// Extract the NUL-terminated ASCII name from a CHAR_PC or CHAR_NPC body.
     ///
     /// `CHAR_PC` (0x00D): name lives at `body[body.len() - 16..]`. LSB's
@@ -145,6 +177,52 @@ impl PosHead {
     }
 }
 
+/// Server's `GP_SERV_COMMAND_LOGIN` (0x00A) — sent on zone-in (both initial
+/// connect and after every zone transition). Reference:
+/// `vendor/Phoenix/src/map/packets/s2c/0x00a_login.h::GP_SERV_COMMAND_LOGIN`.
+///
+/// Body layout (bytes after the 4-byte sub-packet header):
+/// ```text
+///   [ 0..44]  GP_SERV_POS_HEAD       (UniqueNo..BtTargetID — 44B with BT)
+///   [44..48]  ZoneNo:u32             (low 16 bits = FFXI zone id)
+///   [48..52]  ntTime, ntTimeSec, GameTime …
+///   …         (many trailing fields — see header for full layout)
+/// ```
+///
+/// The wire field is a `u32` but FFXI zone ids fit in `u16` (max ~300);
+/// we surface it as `u16` to match `state::SessionState::zone_id` and
+/// `PartyAttrs::zone_no`. We only decode the fields needed for v1 zone
+/// tracking; the rest of the packet is ignored.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerLogin {
+    pub unique_no: u32,
+    pub act_index: u16,
+    pub zone_no: u16,
+}
+
+impl ServerLogin {
+    /// Minimum body length to safely read `ZoneNo` — `PosHead` (44B) +
+    /// `ZoneNo` (4B) = 48 bytes. Phoenix's full LOGIN body is much larger
+    /// (~180+ bytes) but we only need the prefix.
+    pub const SIZE: usize = 48;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        // The trailing BT-target slot may legitimately be absent on legacy
+        // 40-byte heads, but a real LOGIN body always carries the full
+        // 44-byte head plus ZoneNo — Phoenix sends `sizeof(PacketData)`
+        // every time. So we read at the fixed offset.
+        let zone_u32 = u32::from_le_bytes(body[44..48].try_into().unwrap());
+        Ok(Self {
+            unique_no: u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            act_index: u16::from_le_bytes(body[4..6].try_into().unwrap()),
+            zone_no: zone_u32 as u16,
+        })
+    }
+}
+
 /// Server's `GP_SERV_COMMAND_LOGOUT` (0x00B) — used for zone changes and
 /// disconnects. Carries the destination map server's IP/port and the
 /// reason code.
@@ -185,6 +263,37 @@ impl ServerLogout {
     pub fn is_zone_change(&self) -> bool {
         self.logout_state == 2 // ZONECHANGE
     }
+}
+
+/// `GP_SERV_COMMAND_SYSTEMMES` (0x053) — formatted system message. Body
+/// layout per `vendor/server/src/map/packets/s2c/0x053_systemmes.h`:
+/// `u32 para, u32 para2, u16 Number, u16 padding` = 12 bytes. `Number`
+/// is an id into `xi.msg.system`; `para`/`para2` substitute into
+/// placeholders like `<seconds>` in the message text.
+#[derive(Debug, Clone, Copy)]
+pub struct SystemMessage {
+    pub para: u32,
+    pub para2: u32,
+    pub message_id: u16,
+}
+
+impl SystemMessage {
+    pub const SIZE: usize = 12;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        Ok(Self {
+            para: u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            para2: u32::from_le_bytes(body[4..8].try_into().unwrap()),
+            message_id: u16::from_le_bytes(body[8..10].try_into().unwrap()),
+        })
+    }
+}
+
+pub fn decode_system_message(sub: &SubPacket<'_>) -> Result<SystemMessage, DecodeError> {
+    SystemMessage::decode(sub.data)
 }
 
 /// Common party-member fields shared by `0x0DD GROUP_LIST` (other members)
@@ -302,6 +411,10 @@ pub fn decode_pos_head(sub: &SubPacket<'_>) -> Result<PosHead, DecodeError> {
 
 pub fn decode_logout(sub: &SubPacket<'_>) -> Result<ServerLogout, DecodeError> {
     ServerLogout::decode(sub.data)
+}
+
+pub fn decode_login(sub: &SubPacket<'_>) -> Result<ServerLogin, DecodeError> {
+    ServerLogin::decode(sub.data)
 }
 
 /// `GP_SERV_COMMAND_ITEM_MAX` (0x01C) — container size table. Phoenix
@@ -516,6 +629,53 @@ mod tests {
     }
 
     #[test]
+    fn server_login_decodes_zone_no() {
+        // Fabricate a 48-byte LOGIN body prefix with PosHead + ZoneNo.
+        // ZoneNo for Southern San d'Oria is 230 (0xE6) per
+        // `vendor/Phoenix/src/map/zone_id.h`.
+        let mut buf = vec![0u8; ServerLogin::SIZE];
+        buf[0..4].copy_from_slice(&0x0123_4567u32.to_le_bytes()); // UniqueNo
+        buf[4..6].copy_from_slice(&0x00FFu16.to_le_bytes()); // ActIndex
+        buf[44..48].copy_from_slice(&230u32.to_le_bytes()); // ZoneNo
+        let l = ServerLogin::decode(&buf).unwrap();
+        assert_eq!(l.unique_no, 0x0123_4567);
+        assert_eq!(l.act_index, 0x00FF);
+        assert_eq!(l.zone_no, 230);
+    }
+
+    #[test]
+    fn server_login_truncated_errors() {
+        // 47 bytes — one byte short of ZoneNo's tail.
+        let buf = vec![0u8; ServerLogin::SIZE - 1];
+        assert!(matches!(
+            ServerLogin::decode(&buf),
+            Err(DecodeError::Truncated(48, _))
+        ));
+    }
+
+    #[test]
+    fn system_message_decodes() {
+        // EXECUTING_LOGOUT (id=7) with 30 seconds remaining.
+        let mut buf = vec![0u8; SystemMessage::SIZE];
+        buf[0..4].copy_from_slice(&30u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&0u32.to_le_bytes());
+        buf[8..10].copy_from_slice(&7u16.to_le_bytes());
+        let m = SystemMessage::decode(&buf).unwrap();
+        assert_eq!(m.para, 30);
+        assert_eq!(m.para2, 0);
+        assert_eq!(m.message_id, 7);
+    }
+
+    #[test]
+    fn system_message_truncated_errors() {
+        let buf = vec![0u8; SystemMessage::SIZE - 1];
+        assert!(matches!(
+            SystemMessage::decode(&buf),
+            Err(DecodeError::Truncated(12, _))
+        ));
+    }
+
+    #[test]
     fn server_logout_zone_change() {
         let mut buf = vec![0u8; ServerLogout::SIZE];
         buf[0..4].copy_from_slice(&2u32.to_le_bytes()); // ZONECHANGE
@@ -545,6 +705,32 @@ mod tests {
         let h = PosHead::decode(&buf).unwrap();
         assert_eq!(h.unique_no, 0xCAFE_F00D);
         assert_eq!(h.bt_target_id, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn decode_char_npc_extracts_claim_id() {
+        // Fabricate a CHAR_NPC body with a non-zero claim_id (= m_OwnerID).
+        // Per `entity_update.cpp::updateWith`, packet-absolute 0x2C is the
+        // owner-id slot; subtracting the 4-byte sub-packet header puts it
+        // at body offset 40..44 — the same slot PosHead names
+        // `bt_target_id` for the CHAR_PC repurposing.
+        let mut buf = vec![0u8; PosHead::SIZE_WITH_BT_TARGET];
+        buf[0..4].copy_from_slice(&0xAABB_CCDDu32.to_le_bytes()); // UniqueNo (mob id)
+        buf[4..6].copy_from_slice(&0x07F0u16.to_le_bytes()); // ActIndex (mob range)
+        buf[40..44].copy_from_slice(&0x0123_4567u32.to_le_bytes()); // m_OwnerID
+        let (head, claim_id) = PosHead::decode_char_npc(&buf).unwrap();
+        assert_eq!(head.unique_no, 0xAABB_CCDD);
+        assert_eq!(head.act_index, 0x07F0);
+        assert_eq!(claim_id, 0x0123_4567);
+    }
+
+    #[test]
+    fn decode_char_npc_unclaimed_yields_zero_claim() {
+        // Position-only body (40 bytes) — pre-claim layout / not a status
+        // update. claim_id reads as 0, matching unclaimed semantics.
+        let buf = vec![0u8; PosHead::SIZE];
+        let (_, claim_id) = PosHead::decode_char_npc(&buf).unwrap();
+        assert_eq!(claim_id, 0);
     }
 
     #[test]
