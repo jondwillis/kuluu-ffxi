@@ -48,8 +48,9 @@ use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use bevy::window::WindowCloseRequested;
 use ffxi_viewer_core::{
-    heading_for_yaw, toggle_camera_mode, CameraMode, ChaseCamera, CursorLockRequest, InputMode,
-    LockOn, LockOnToggle, OperatorCamera, SceneState, Target,
+    heading_for_yaw, toggle_camera_mode, Action, Bindings, CameraMode, ChaseCamera,
+    ChatBuffer, CursorLockRequest, InputMode, LockOn, LockOnToggle, MenuStack, OperatorCamera,
+    SceneState, Target,
 };
 use ffxi_viewer_wire::{Entity as WireEntity, Vec3 as WireVec3};
 use tokio::sync::mpsc;
@@ -87,19 +88,23 @@ pub struct AutoRun {
     pub strafe_held_since: Option<Instant>,
 }
 
-/// Edge-trigger handler: window-close shortcuts, Tab/Esc/R.
+/// Edge-trigger handler: window-close shortcuts, target/autorun/lock-on
+/// toggles, and the Slash/Minus chat/menu opens (moved here from
+/// `text_input.rs` so they're keyboard-layout-safe — see
+/// `keybinds::mod` doc-comment).
 ///
 /// Window-close runs *before* the [`InputMode`] gate so Cmd+Q / Cmd+W /
 /// the red traffic light always work — even mid-chat-typing or with a
-/// menu open. Tab/Esc/R are world-mode actions and only run when the
-/// user isn't focused in some other UI (`text_input_system` owns those
-/// keys when chat / menu / quick-action is active).
+/// menu open. World-only actions only run when the user isn't focused in
+/// some other UI (`text_input_system` owns most logical-key routing when
+/// chat / menu / quick-action is active).
 pub fn handle_input_system(
     keys: Res<ButtonInput<KeyCode>>,
+    bindings: Res<Bindings>,
     mut window_close: MessageReader<WindowCloseRequested>,
     mut state: ResMut<SceneState>,
     cmd_tx: Res<CommandTx>,
-    mode: Res<InputMode>,
+    mut mode: ResMut<InputMode>,
     mut target: ResMut<Target>,
     mut autorun: ResMut<AutoRun>,
     mut camera_mode: ResMut<CameraMode>,
@@ -110,8 +115,9 @@ pub fn handle_input_system(
     mut exit: MessageWriter<AppExit>,
 ) {
     // Close-window: Cmd+Q, Cmd+W, or the OS-level WindowCloseRequested
-    // event (red traffic light, App→Quit menu, etc.). Esc no longer quits.
-    // Runs unconditionally — quitting must work in any input mode.
+    // event (red traffic light, App→Quit menu, etc.). Hard-wired (not
+    // bindings-driven) — quitting must work in any input mode and isn't
+    // an Action the user should ever rebind away.
     let cmd_held = keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight);
     let close_shortcut =
         cmd_held && (keys.just_pressed(KeyCode::KeyQ) || keys.just_pressed(KeyCode::KeyW));
@@ -122,10 +128,11 @@ pub fn handle_input_system(
         return;
     }
 
-    // F8 toggles first-person mode. Runs unconditionally so the user can
-    // always escape FP — even while a chat/menu UI is focused — and the
-    // browser/macOS pointer-lock is satisfied by the real key event (a
-    // real user gesture is required for `requestPointerLock` on web).
+    // F8 toggles first-person mode. Hard-wired and runs unconditionally:
+    // the operator must always be able to escape FP even while a UI is
+    // focused, and the browser/macOS pointer-lock requires a real user
+    // gesture (`ToggleFirstPerson` is in the bindings table for the
+    // `/keybinds list` display, but the toggle itself stays inline).
     if keys.just_pressed(KeyCode::F8) {
         toggle_camera_mode(&mut camera_mode, &mut chase);
         cursor_lock.locked = matches!(*camera_mode, CameraMode::FirstPerson);
@@ -137,11 +144,27 @@ pub fn handle_input_system(
         return;
     }
 
-    if keys.just_pressed(KeyCode::Escape) {
+    // UI activation triggers — moved from `text_input.rs`'s logical-key
+    // handler to keep them layout-safe. The triggering KeyboardInput
+    // event still flows through `text_input_system` after the mode
+    // change; for `/` it lands in handle_chat_key and appends `/` to the
+    // (now Chat) buffer, reproducing the prior `with_prefix("/")` shape.
+    // For `-` and Space, handle_chat_key/handle_menu_key either no-op or
+    // produce the documented buffer state.
+    if bindings.just_pressed(Action::OpenChatCommand, &keys) {
+        *mode = InputMode::Chat(ChatBuffer::empty());
+        return;
+    }
+    if bindings.just_pressed(Action::OpenMenu, &keys) {
+        *mode = InputMode::Menu(MenuStack::root());
+        return;
+    }
+
+    if bindings.just_pressed(Action::ClearTarget, &keys) {
         // FFXI: Esc deselects (target → none, menus close). No quit.
         target.id = None;
     }
-    if keys.just_pressed(KeyCode::Tab) {
+    if bindings.just_pressed(Action::CycleTarget, &keys) {
         // Viewport-aware Tab: only entities currently inside the camera
         // frustum are candidates. First press picks the *nearest*; later
         // presses cycle left-to-right across the screen. Mirrors retail
@@ -157,13 +180,15 @@ pub fn handle_input_system(
             );
         }
     }
-    if keys.just_pressed(KeyCode::KeyR) {
-        let forward_held = keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp);
-        if forward_held {
+    if bindings.just_pressed(Action::ToggleAutorun, &keys) {
+        // Tap-from-standstill is a no-op (FFXI parity). "Forward held"
+        // means the rebound MoveForward key (KeyW under Compact 2,
+        // Numpad8 under Standard) is currently down.
+        if bindings.pressed(Action::MoveForward, &keys) {
             autorun.phantom_forward = !autorun.phantom_forward;
         }
     }
-    if keys.just_pressed(KeyCode::KeyH) {
+    if bindings.just_pressed(Action::ToggleLockOn, &keys) {
         let result = lock_on.toggle(target.id);
         let toast = match result {
             LockOnToggle::Locked(id) => {
@@ -255,6 +280,7 @@ pub fn dispatch_target_change_system(
 /// typing in chat or navigating a menu.
 pub fn dispatch_movement_system(
     keys: Res<ButtonInput<KeyCode>>,
+    bindings: Res<Bindings>,
     time: Res<Time<Fixed>>,
     state: Res<SceneState>,
     cmd_tx: Res<CommandTx>,
@@ -284,10 +310,10 @@ pub fn dispatch_movement_system(
     // FP gets a wider clamp so the operator can mouse-/keyboard-look up
     // and down past horizontal; chase keeps the orbit-style range.
     let mut pitch_d = 0.0;
-    if !in_picker && keys.pressed(KeyCode::ArrowUp) {
+    if !in_picker && bindings.pressed(Action::CameraPitchUp, &keys) {
         pitch_d += PITCH_STEP_HELD;
     }
-    if !in_picker && keys.pressed(KeyCode::ArrowDown) {
+    if !in_picker && bindings.pressed(Action::CameraPitchDown, &keys) {
         pitch_d -= PITCH_STEP_HELD;
     }
     if pitch_d != 0.0 {
@@ -300,10 +326,10 @@ pub fn dispatch_movement_system(
 
     // --- camera yaw: ←/→ orbit the camera (player unaffected). ---
     let mut yaw_d = 0.0;
-    if !in_picker && keys.pressed(KeyCode::ArrowLeft) {
+    if !in_picker && bindings.pressed(Action::CameraYawLeft, &keys) {
         yaw_d += CAMERA_YAW_STEP;
     }
-    if !in_picker && keys.pressed(KeyCode::ArrowRight) {
+    if !in_picker && bindings.pressed(Action::CameraYawRight, &keys) {
         yaw_d -= CAMERA_YAW_STEP;
     }
     if yaw_d != 0.0 {
@@ -312,32 +338,34 @@ pub fn dispatch_movement_system(
 
     // --- forward / back ---
     let mut forward: i32 = 0;
-    if keys.pressed(KeyCode::KeyW) {
+    if bindings.pressed(Action::MoveForward, &keys) {
         forward += 1;
     }
-    if keys.pressed(KeyCode::KeyS) {
+    if bindings.pressed(Action::MoveBackward, &keys) {
         forward -= 1;
     }
-    // S press immediately kills autorun (FFXI: backing out drops the lock).
-    if keys.just_pressed(KeyCode::KeyS) {
+    // Back-press immediately kills autorun (FFXI: backing out drops the lock).
+    if bindings.just_pressed(Action::MoveBackward, &keys) {
         autorun.phantom_forward = false;
     }
 
-    // --- A/D rotate player only (no strafe, no camera). ---
+    // --- rotate player only (no strafe, no camera). ---
     let mut player_rotate: i32 = 0;
-    if keys.pressed(KeyCode::KeyA) {
+    if bindings.pressed(Action::RotateLeft, &keys) {
         player_rotate -= 1;
     }
-    if keys.pressed(KeyCode::KeyD) {
+    if bindings.pressed(Action::RotateRight, &keys) {
         player_rotate += 1;
     }
 
-    // --- Q/E strafe perpendicular to current heading. ---
+    // --- strafe perpendicular to current heading. Unbound under
+    //     Compact 1 / Standard — `pressed` returns false for unbound
+    //     actions, so the strafe contribution is naturally zero there. ---
     let mut strafe: i32 = 0;
-    if keys.pressed(KeyCode::KeyQ) {
+    if bindings.pressed(Action::StrafeLeft, &keys) {
         strafe -= 1;
     }
-    if keys.pressed(KeyCode::KeyE) {
+    if bindings.pressed(Action::StrafeRight, &keys) {
         strafe += 1;
     }
 

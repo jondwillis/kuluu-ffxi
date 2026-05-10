@@ -87,6 +87,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<TrackedEntities>()
             .init_resource::<Target>()
             .init_resource::<InputMode>()
+            .init_resource::<Bindings>()
             .init_resource::<CameraMode>()
             .init_resource::<LockOn>()
             .init_resource::<ZoneLineState>()

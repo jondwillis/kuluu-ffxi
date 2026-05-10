@@ -165,11 +165,17 @@ fn handle_world_key(
         // consumed (don't seed the buffer — would just be a leading
         // whitespace that's awkward to delete).
         Key::Space => Some(InputMode::Chat(ChatBuffer::empty())),
-        // `/` opens chat with the slash already in the buffer so the
-        // user sees they're entering a command.
-        Key::Character(s) if s.as_str() == "/" => Some(InputMode::Chat(ChatBuffer::with_prefix("/"))),
-        // `-` opens the main menu.
-        Key::Character(s) if s.as_str() == "-" => Some(InputMode::Menu(MenuStack::root())),
+        // NOTE: `/` (OpenChatCommand) and `-` (OpenMenu) used to live
+        // here as logical-key matches against `Key::Character("/")` and
+        // `Key::Character("-")`. They moved to `input.rs`'s
+        // physical-key reader (`bindings.just_pressed(Action::OpenChat
+        // Command|OpenMenu)`) because matching on the *character* is
+        // keyboard-layout-fragile — on AZERTY, the physical key under
+        // `/` produces `:`, etc. The triggering KeyboardInput event
+        // still flows through this system after the mode change; for
+        // `/` it lands in handle_chat_key, which appends `/` to the
+        // (now Chat) buffer — same final state as the old
+        // `with_prefix("/")` shortcut.
         // Enter:
         // - With a current target → open the contextual menu (FFXI-retail:
         //   Enter on a target brings up the action ring, not a direct
