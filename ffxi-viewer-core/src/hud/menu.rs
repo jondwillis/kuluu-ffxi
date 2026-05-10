@@ -1,11 +1,12 @@
 //! Main menu (`-` to open) — vanilla-FFXI-styled vertical list anchored
 //! to the right side of the screen.
 //!
-//! The menu is a *scaffold* in this stage: the entry list is fixed and
-//! selecting an entry just emits a `[menu] Magic — not implemented`
-//! chat line. Wiring the entries to real spell / ability / item lookups
-//! lands in subsequent stages alongside the data mirrors that populate
-//! them. The point of this stage is the input plumbing.
+//! The menu is *mostly* a scaffold today: most root-level entries still
+//! emit `[menu] Magic — not implemented` when selected. The exception is
+//! `Config`, which pushes a [`MenuKind::Config`] submenu listing the
+//! keybind presets — selecting one is equivalent to
+//! `/keybinds preset <name>`. The Logout entry is wired to the real
+//! `ReqLogout` packet.
 //!
 //! Look:
 //!   - right-anchored, dark backdrop with a thin border,
@@ -17,12 +18,12 @@
 use bevy::prelude::*;
 
 use crate::hud::palette;
-use crate::input_mode::InputMode;
+use crate::input_mode::{InputMode, MenuKind};
 
 /// Fixed root-level entry labels. Order matches vanilla FFXI's main menu
 /// roughly. `text_input::handle_menu_key` reads this list (via
-/// [`root_entry_label`] / [`root_entry_count`]) so cursor bounds match
-/// what the user actually sees.
+/// [`entry_label`] / [`entry_count`]) so cursor bounds match what the
+/// user actually sees.
 const ROOT_ENTRIES: &[&str] = &[
     "Magic",
     "Abilities",
@@ -35,17 +36,47 @@ const ROOT_ENTRIES: &[&str] = &[
     "Logout",
 ];
 
-/// Number of entries on the root menu. Used by the input router to clamp
-/// cursor movement.
-pub fn root_entry_count() -> usize {
-    ROOT_ENTRIES.len()
+/// Config submenu entries. Order is "presets first, smallest delta from
+/// retail names first; meta-entries last." The labels pass through to
+/// `text_input::resolve_menu_entry` for `MenuKind::Config`, which maps
+/// each one to a `KeybindUpdate`. Keep the labels stable — they're the
+/// match-string surface for the dispatcher.
+const CONFIG_ENTRIES: &[&str] = &[
+    "Standard",
+    "Compact 1",
+    "Compact 2",
+    "Reset to defaults",
+    "Show current bindings",
+];
+
+/// Largest entry count across all menu kinds. Drives the spawn-time row
+/// pool — we spawn this many rows once and toggle their visibility per
+/// frame depending on the active menu kind, instead of spawning/despawning
+/// when the menu changes screens.
+const MAX_ENTRY_COUNT: usize = {
+    let r = ROOT_ENTRIES.len();
+    let c = CONFIG_ENTRIES.len();
+    if r >= c { r } else { c }
+};
+
+/// Number of entries on the named menu screen. Used by the input router
+/// to clamp cursor movement.
+pub fn entry_count(kind: MenuKind) -> usize {
+    entries(kind).len()
 }
 
-/// Label for a given root-menu cursor index. Out-of-range returns
+/// Label for a given menu screen + cursor index. Out-of-range returns
 /// `"<unknown>"` rather than panicking, since the input router clamps
 /// cursor bounds independently and a stale index would otherwise crash.
-pub fn root_entry_label(idx: usize) -> &'static str {
-    ROOT_ENTRIES.get(idx).copied().unwrap_or("<unknown>")
+pub fn entry_label(kind: MenuKind, idx: usize) -> &'static str {
+    entries(kind).get(idx).copied().unwrap_or("<unknown>")
+}
+
+fn entries(kind: MenuKind) -> &'static [&'static str] {
+    match kind {
+        MenuKind::Root => ROOT_ENTRIES,
+        MenuKind::Config => CONFIG_ENTRIES,
+    }
 }
 
 /// Marker on the menu root.
@@ -78,10 +109,14 @@ pub fn spawn_main_menu(mut commands: Commands) {
             BorderColor::all(palette::ACCENT),
         ))
         .with_children(|p| {
-            for (slot, label) in ROOT_ENTRIES.iter().enumerate() {
+            // Spawn the maximum-sized row pool once. The update system
+            // hides rows past `entry_count(kind)` per frame so smaller
+            // submenus (Config has 5 entries, Root has 9) don't leave
+            // ghost rows visible.
+            for slot in 0..MAX_ENTRY_COUNT {
                 p.spawn((
                     MainMenuRow { slot },
-                    Text::new(format!("  {label}")),
+                    Text::new(""),
                     TextFont {
                         font_size: 14.0,
                         ..default()
@@ -92,38 +127,60 @@ pub fn spawn_main_menu(mut commands: Commands) {
         });
 }
 
-/// Per-frame: toggle visibility, update cursor highlighting.
+/// Per-frame: toggle visibility, update cursor highlighting, swap entry
+/// labels when the active `MenuKind` changes (e.g. Root → Config).
 pub fn update_main_menu(
     mode: Res<InputMode>,
-    mut menu_q: Query<&mut Node, With<MainMenu>>,
-    mut row_q: Query<(&MainMenuRow, &mut Text, &mut TextColor)>,
+    mut menu_q: Query<&mut Node, (With<MainMenu>, Without<MainMenuRow>)>,
+    mut row_q: Query<(&MainMenuRow, &mut Node, &mut Text, &mut TextColor)>,
 ) {
     let Ok(mut node) = menu_q.single_mut() else {
         return;
     };
 
-    let cursor: Option<usize> = match &*mode {
-        InputMode::Menu(stack) => stack.current().map(|l| l.cursor),
+    // Pull the active screen + cursor from the menu stack's *top* frame.
+    // `stack.current()` is the deepest-pushed menu — Root by default,
+    // Config after the operator selects "Config" from Root.
+    let active: Option<(MenuKind, usize)> = match &*mode {
+        InputMode::Menu(stack) => stack.current().map(|l| (l.kind, l.cursor)),
         _ => None,
     };
 
-    match cursor {
-        Some(c) => {
+    match active {
+        Some((kind, c)) => {
             node.display = Display::Flex;
-            for (row, mut text, mut color) in row_q.iter_mut() {
-                let label = ROOT_ENTRIES.get(row.slot).copied().unwrap_or("");
-                let is_cursor = row.slot == c;
-                let want = if is_cursor {
-                    format!("> {label}")
-                } else {
-                    format!("  {label}")
-                };
-                if **text != want {
-                    **text = want;
-                }
-                let want_color = if is_cursor { palette::ACCENT } else { palette::MUTED };
-                if color.0 != want_color {
-                    color.0 = want_color;
+            let labels = entries(kind);
+            for (row, mut row_node, mut text, mut color) in row_q.iter_mut() {
+                match labels.get(row.slot).copied() {
+                    Some(label) => {
+                        // Slot is in-range for the active screen — make
+                        // sure it's visible and rendering the cursor or
+                        // the label as appropriate.
+                        if row_node.display != Display::Flex {
+                            row_node.display = Display::Flex;
+                        }
+                        let is_cursor = row.slot == c;
+                        let want = if is_cursor {
+                            format!("> {label}")
+                        } else {
+                            format!("  {label}")
+                        };
+                        if **text != want {
+                            **text = want;
+                        }
+                        let want_color = if is_cursor { palette::ACCENT } else { palette::MUTED };
+                        if color.0 != want_color {
+                            color.0 = want_color;
+                        }
+                    }
+                    None => {
+                        // Slot is past the active screen's entry count —
+                        // hide so the panel doesn't reserve space for
+                        // empty rows beneath the last visible entry.
+                        if row_node.display != Display::None {
+                            row_node.display = Display::None;
+                        }
+                    }
                 }
             }
         }

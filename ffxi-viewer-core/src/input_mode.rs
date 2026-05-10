@@ -104,13 +104,18 @@ impl ChatBuffer {
     }
 }
 
-/// Identifies which screen of the menu tree we're currently on. The set is
-/// intentionally tiny right now — this stage scaffolds the input plumbing,
-/// not the full menu content. Submenu variants land alongside the data
-/// mirrors that populate them.
+/// Identifies which screen of the menu tree we're currently on. The set
+/// grows as submenus are wired; for now the only non-Root screen is
+/// `Config`, the keybind-preset switcher reachable from `Root → Config`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MenuKind {
     Root,
+    /// The keybind-config submenu: lists presets + a "show current
+    /// bindings" entry. Selecting a preset is equivalent to running
+    /// `/keybinds preset <name>`; selecting Reset is `/keybinds reset`;
+    /// selecting List is `/keybinds list`. In-game keypress-capture
+    /// rebinding is intentionally NOT here yet — slash-only for now.
+    Config,
 }
 
 /// One frame of the menu navigation stack. `cursor` is the row currently

@@ -33,8 +33,8 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 use ffxi_viewer_core::{
-    Action, Bindings, ChatBuffer, DialogCursor, InputMode, MenuStack, PassiveCursorState,
-    QuickActionState, SceneState, Target, DIALOG_MAX_CHOICE,
+    Action, Bindings, ChatBuffer, DialogCursor, InputMode, MenuKind, MenuStack, PassiveCursorState,
+    Preset, QuickActionState, SceneState, Target, DIALOG_MAX_CHOICE,
 };
 use tokio::sync::mpsc::Sender;
 
@@ -72,6 +72,23 @@ pub fn text_input_system(
         }
         match &mut *mode {
             InputMode::World => {
+                // Dead-state intercept: when our own party row reports
+                // 0% HP, the dead-state HUD prompt is up; route Enter
+                // straight to `ReturnToHomePoint` instead of opening
+                // the contextual action menu (which would be useless
+                // — you can't act while K.O.'d). Mirrors the retail
+                // "press Enter to release" muscle memory.
+                if ffxi_viewer_core::hud::death_prompt::is_dead(&scene_state)
+                    && bindings.matches_logical(Action::ConfirmAction, &ev.logical_key)
+                {
+                    if let Err(e) = cmd_tx.0.try_send(AgentCommand::ReturnToHomePoint) {
+                        push_system_chat_line(
+                            &mut scene_state,
+                            format!("/return dropped (channel issue): {e}"),
+                        );
+                    }
+                    continue;
+                }
                 if let Some(next) = handle_world_key(
                     &ev.logical_key,
                     &bindings,
@@ -103,10 +120,11 @@ pub fn text_input_system(
             InputMode::Menu(stack) => {
                 if let Some(next) = handle_menu_key(
                     &ev.logical_key,
-                    &bindings,
+                    &mut bindings,
                     stack,
                     &mut scene_state,
                     &cmd_tx.0,
+                    &mut keybinds_state,
                 ) {
                     *mode = next;
                 }
@@ -588,12 +606,10 @@ fn push_local_tell_echo(scene_state: &mut SceneState, to: String, text: String) 
     });
 }
 
-/// What pressing Enter on a given root-menu label should do. Pure
-/// decision surface, parallel to [`QuickActionDispatch`] — the caller
-/// performs the side effects (dispatch command, push toast, transition
-/// mode). Stub entries land in `NotImplemented`. As more entries get
-/// wired (and some need silent dispatch instead of a toast), add a
-/// `Command(AgentCommand)` variant alongside `CommandWithToast`.
+/// What pressing Enter on a given menu label should do. Pure decision
+/// surface, parallel to [`QuickActionDispatch`] — the caller performs the
+/// side effects (dispatch command, push toast, push/pop a menu frame,
+/// transition mode). Stub entries land in `NotImplemented`.
 #[derive(Debug, Clone, PartialEq)]
 enum MenuDispatch {
     /// Issue a wire command and exit the menu, plus surface this toast
@@ -606,13 +622,24 @@ enum MenuDispatch {
         cmd: AgentCommand,
         toast: String,
     },
+    /// Push a submenu frame onto the menu stack and stay in
+    /// `InputMode::Menu`. The cursor on the new frame starts at 0.
+    /// Caller (handle_menu_key) is responsible for the actual `push`.
+    OpenSubmenu(MenuKind),
+    /// Apply a keybind change (preset switch, reset, or list). Reuses
+    /// the same `apply_keybind_update` helper that powers `/keybinds`,
+    /// so the menu and slash-command paths stay in lockstep on
+    /// persistence + toast format. List stays in the menu (so the
+    /// operator can flip presets after reading it); Preset/Reset exit
+    /// to World once applied.
+    KeybindUpdate(KeybindUpdate),
     /// Entry isn't wired yet — emit `[menu] {label} — not implemented`
     /// and stay in the menu so the operator can pick something else.
     NotImplemented(String),
 }
 
-fn resolve_menu_entry(label: &str) -> MenuDispatch {
-    match label {
+fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
+    match (kind, label) {
         // Logout: toggle the in-world LeaveGame timer. Choose toggle
         // (rather than always-arm) so a second press of `-` → ↓ ↓ ... →
         // Enter cancels an accidentally-armed logout — same forgiveness
@@ -620,7 +647,7 @@ fn resolve_menu_entry(label: &str) -> MenuDispatch {
         // also cancels, which we mention in the toast. Timing reminder:
         // ≈30s for normal players, immediate for GMs / Mog House
         // (`scripts/effects/leavegame.lua::onEffectGain`).
-        "Logout" => MenuDispatch::CommandWithToast {
+        (MenuKind::Root, "Logout") => MenuDispatch::CommandWithToast {
             cmd: AgentCommand::ReqLogout {
                 kind: ReqLogoutKind::LogoutToggle,
             },
@@ -628,40 +655,75 @@ fn resolve_menu_entry(label: &str) -> MenuDispatch {
                     in Mog House). Toggle again or `/logout off` to cancel."
                 .into(),
         },
-        other => MenuDispatch::NotImplemented(other.to_string()),
+        // Config: open the keybind submenu. Real preset-switching is on
+        // the next level; this entry just navigates.
+        (MenuKind::Root, "Config") => MenuDispatch::OpenSubmenu(MenuKind::Config),
+        // Config submenu entries → keybind updates. Labels match
+        // `CONFIG_ENTRIES` in `hud/menu.rs`; keep them in sync.
+        (MenuKind::Config, "Standard") => {
+            MenuDispatch::KeybindUpdate(KeybindUpdate::Preset(Preset::Standard))
+        }
+        (MenuKind::Config, "Compact 1") => {
+            MenuDispatch::KeybindUpdate(KeybindUpdate::Preset(Preset::Compact1))
+        }
+        (MenuKind::Config, "Compact 2") => {
+            MenuDispatch::KeybindUpdate(KeybindUpdate::Preset(Preset::Compact2))
+        }
+        (MenuKind::Config, "Reset to defaults") => {
+            MenuDispatch::KeybindUpdate(KeybindUpdate::Reset)
+        }
+        (MenuKind::Config, "Show current bindings") => {
+            MenuDispatch::KeybindUpdate(KeybindUpdate::List)
+        }
+        (_, other) => MenuDispatch::NotImplemented(other.to_string()),
     }
 }
 
 /// Menu-mode keystroke handler. Returns `Some(new_mode)` to transition
 /// out of the menu (Esc on root → back to World, Enter on a wired entry
-/// → back to World); `None` to stay.
+/// → back to World); `None` to stay. The current frame's [`MenuKind`]
+/// drives both the cursor bounds and the per-entry dispatch — Root and
+/// Config submenu share this handler.
+///
+/// `bindings` is `&mut` (not `&`) because the Config submenu can swap it
+/// wholesale via `apply_keybind_update`. The `matches_logical` reads
+/// reborrow as `&Bindings` automatically.
 fn handle_menu_key(
     key: &Key,
-    bindings: &Bindings,
+    bindings: &mut Bindings,
     stack: &mut MenuStack,
     scene_state: &mut SceneState,
     cmd_tx: &Sender<AgentCommand>,
+    keybinds_state: &mut KeybindsStateRes,
 ) -> Option<InputMode> {
-    let level = stack.current_mut()?;
-    let entry_count = ffxi_viewer_core::hud::menu::root_entry_count();
+    // Capture the active screen + cursor up front. `entry_count` and
+    // `entry_label` both consult this — keeps the Root/Config branches
+    // out of the per-key paths below.
+    let (kind, cursor) = {
+        let level = stack.current()?;
+        (level.kind, level.cursor)
+    };
+    let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind);
     if bindings.matches_logical(Action::NavUp, key) {
         // Wrap: top → bottom (matches retail menu nav).
-        level.cursor = if level.cursor == 0 {
+        let level = stack.current_mut()?;
+        level.cursor = if cursor == 0 {
             entry_count.saturating_sub(1)
         } else {
-            level.cursor - 1
+            cursor - 1
         };
         return None;
     }
     if bindings.matches_logical(Action::NavDown, key) {
         // Wrap: bottom → top.
-        let next = level.cursor + 1;
+        let level = stack.current_mut()?;
+        let next = cursor + 1;
         level.cursor = if next >= entry_count { 0 } else { next };
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        let label = ffxi_viewer_core::hud::menu::root_entry_label(level.cursor);
-        return match resolve_menu_entry(label) {
+        let label = ffxi_viewer_core::hud::menu::entry_label(kind, cursor);
+        return match resolve_menu_entry(kind, label) {
             MenuDispatch::CommandWithToast { cmd, toast } => {
                 if let Err(e) = cmd_tx.try_send(cmd) {
                     push_system_chat_line(
@@ -672,6 +734,19 @@ fn handle_menu_key(
                     push_system_chat_line(scene_state, toast);
                 }
                 Some(InputMode::World)
+            }
+            MenuDispatch::OpenSubmenu(submenu) => {
+                stack.push(submenu);
+                None
+            }
+            MenuDispatch::KeybindUpdate(update) => {
+                // List stays in the menu so the operator can flip
+                // presets after reading the current map. Preset/Reset
+                // exit to World once applied — same shape as the slash
+                // path's "fire and forget" UX.
+                let stay = matches!(update, KeybindUpdate::List);
+                apply_keybind_update(update, bindings, keybinds_state, scene_state);
+                if stay { None } else { Some(InputMode::World) }
             }
             MenuDispatch::NotImplemented(label) => {
                 push_system_chat_line(
