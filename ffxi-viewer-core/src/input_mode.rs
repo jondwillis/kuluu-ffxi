@@ -20,6 +20,21 @@ use bevy::prelude::Resource;
 
 /// Top-level input focus. `World` is the default; the other variants own
 /// the UI state for their respective overlays.
+///
+/// # Per-mode behavior matrix
+///
+/// |              | Movement | Camera arrows | Click→target | Esc            |
+/// |--------------|----------|---------------|--------------|----------------|
+/// | World        | Yes      | Yes           | Yes          | Clear target   |
+/// | Chat         | Paused   | Paused        | No           | Clear/exit     |
+/// | Menu         | Walks    | Suppressed    | No           | Pop level/exit |
+/// | QuickAction  | Walks    | Suppressed    | No           | Exit to World  |
+/// | Dialog       | Paused   | Paused        | No           | Skip/exit      |
+/// | PassiveCursor| Walks    | Suppressed    | No           | Exit to World  |
+///
+/// PassiveCursor matches Menu/QuickAction's "stay walkable" shape on
+/// purpose: retail FFXI lets you autorun while scrolling chat, and
+/// pausing here would kill autorun on every chat scroll.
 #[derive(Resource, Debug, Clone, Default)]
 pub enum InputMode {
     /// Camera and movement keys drive the character. The chat / menu / QA
@@ -42,6 +57,12 @@ pub enum InputMode {
     /// router pushes this mode whenever `SceneState.snapshot.dialog` is
     /// `Some` and pops back to `World` when it clears.
     Dialog(DialogCursor),
+    /// FFXI-style passive cursor: a HUD panel (currently chat) has focus
+    /// and arrow keys scroll/navigate it instead of driving the camera.
+    /// Movement still works — operator can autorun while scrolling chat
+    /// log. Toggled in/out via `Action::TogglePassiveCursor` (default
+    /// Insert) or `NavCancel` (Esc).
+    PassiveCursor(PassiveCursorState),
 }
 
 /// Cap on the dialog choice cursor. FFXI events that take a numeric
@@ -162,5 +183,38 @@ impl QuickActionState {
     /// Open the picker with knowledge of whether a target is selected.
     pub fn for_target(has_target: bool) -> Self {
         Self { cursor: 0, has_target }
+    }
+}
+
+/// Which HUD panel currently has the passive cursor's focus. The first
+/// (and only) entry is Chat; future variants (Party, Inventory, …) can
+/// be added when the corresponding HUD grows arrow-key-navigable
+/// elements.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum PassiveCursorFocus {
+    #[default]
+    Chat,
+}
+
+/// Passive-cursor state. `chat_scroll` is in *row units* (one ChatLine
+/// per unit), not visual lines — once Stage 4's text wrapping lands, a
+/// long wrapped message still counts as one scroll tick. Keeping the
+/// math row-based avoids needing to inspect post-layout heights.
+///
+/// `0` means "newest message at the bottom of the panel" (default
+/// behavior, scrolled to the latest); higher values walk older
+/// messages into the visible window.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PassiveCursorState {
+    pub focus: PassiveCursorFocus,
+    pub chat_scroll: usize,
+}
+
+impl PassiveCursorState {
+    pub fn fresh_chat() -> Self {
+        Self {
+            focus: PassiveCursorFocus::Chat,
+            chat_scroll: 0,
+        }
     }
 }

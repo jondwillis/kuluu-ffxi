@@ -21,6 +21,7 @@ use bevy::prelude::*;
 use ffxi_viewer_wire::{ChatChannel, ChatLine};
 
 use crate::hud::palette;
+use crate::input_mode::{InputMode, PassiveCursorFocus};
 use crate::snapshot::{rendered_chat, SceneState};
 
 /// Number of chat rows visible at once. Matches what fits in the panel
@@ -92,6 +93,8 @@ pub fn spawn_chat_panel(mut commands: Commands) {
 
 pub fn update_chat_panel(
     state: Res<SceneState>,
+    mode: Res<InputMode>,
+    mut panel_q: Query<&mut BorderColor, With<ChatPanel>>,
     rows: Query<(&ChatRow, &Children)>,
     mut body_q: Query<(&mut Text, &mut TextColor), With<ChatRowBody>>,
 ) {
@@ -104,17 +107,54 @@ pub fn update_chat_panel(
     // body's per-row `if **text != want` change-detection guard keeps
     // the per-frame cost trivial when nothing actually changed.
     let chat = rendered_chat(&state);
+
+    // PassiveCursor with focus on Chat shifts the visible window back
+    // by `chat_scroll` rows. The handler clamps `chat_scroll` against
+    // the buffer length, so we can trust it here. World / other modes
+    // always render the latest tail of the buffer.
+    let scroll_offset = match &*mode {
+        InputMode::PassiveCursor(s) if matches!(s.focus, PassiveCursorFocus::Chat) => {
+            s.chat_scroll
+        }
+        _ => 0,
+    };
+    let chat_focused = scroll_offset != 0
+        || matches!(
+            &*mode,
+            InputMode::PassiveCursor(s) if matches!(s.focus, PassiveCursorFocus::Chat)
+        );
+
+    // Toggle the panel border between the muted default and the accent
+    // color when chat is focused. Same accent the chat-input bar uses
+    // when active, so the visual cue is consistent.
+    if let Ok(mut border) = panel_q.single_mut() {
+        let want = if chat_focused { palette::ACCENT } else { palette::BORDER };
+        if border.left != want {
+            *border = BorderColor::all(want);
+        }
+    }
+
     let visible: Vec<Option<&ChatLine>> = (0..VISIBLE_ROWS)
         .rev()
         .map(|i| {
-            // Oldest visible at top; newest at bottom. Slot N-1 is newest.
-            // `chat` is oldest-first (server lines, then local toasts), so
-            // the newest line is `chat.last()`.
+            // Oldest visible at top; newest at bottom. Slot N-1 is newest
+            // (or `n - 1 - scroll_offset` when scrolled back). `chat` is
+            // oldest-first (server lines, then local toasts).
             let n = chat.len();
-            if i < n {
-                Some(chat[n - 1 - i])
-            } else {
-                None
+            // The newest visible index from the user's viewpoint is
+            // `n - 1 - scroll_offset`; row i (0..VISIBLE_ROWS) reads
+            // `(n - 1 - scroll_offset) - i`. If that's negative we
+            // emit None for the slot.
+            let newest_visible = n.checked_sub(1 + scroll_offset);
+            match newest_visible {
+                Some(top) => {
+                    if i <= top {
+                        Some(chat[top - i])
+                    } else {
+                        None
+                    }
+                }
+                None => None,
             }
         })
         .collect();

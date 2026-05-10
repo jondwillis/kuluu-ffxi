@@ -38,8 +38,8 @@ pub use camera::{
 pub use components::{HpIndicator, IsSelf, Nameplate, WorldEntity};
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
-    ChatBuffer, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack, QuickActionState,
-    DIALOG_MAX_CHOICE,
+    ChatBuffer, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack, PassiveCursorFocus,
+    PassiveCursorState, QuickActionState, DIALOG_MAX_CHOICE,
 };
 pub use keybinds::{Action, Bindings, KeyBind, Modifiers, Preset};
 pub use lock_on::{LockOn, ToggleResult as LockOnToggle};

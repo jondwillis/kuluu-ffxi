@@ -50,7 +50,7 @@ use bevy::window::WindowCloseRequested;
 use ffxi_viewer_core::{
     heading_for_yaw, toggle_camera_mode, Action, Bindings, CameraMode, ChaseCamera,
     ChatBuffer, CursorLockRequest, InputMode, LockOn, LockOnToggle, MenuStack, OperatorCamera,
-    SceneState, Target,
+    PassiveCursorState, SceneState, Target,
 };
 use ffxi_viewer_wire::{Entity as WireEntity, Vec3 as WireVec3};
 use tokio::sync::mpsc;
@@ -136,6 +136,26 @@ pub fn handle_input_system(
     if keys.just_pressed(KeyCode::F8) {
         toggle_camera_mode(&mut camera_mode, &mut chase);
         cursor_lock.locked = matches!(*camera_mode, CameraMode::FirstPerson);
+    }
+
+    // PassiveCursor toggle. Runs in BOTH directions and only from
+    // World ↔ PassiveCursor — pressing the toggle key while in Chat /
+    // Menu / Dialog / QuickAction is a no-op (the active UI takes
+    // priority; user must Esc out first). The same key is the exit so
+    // a single muscle-memory keypress always lands you back in World
+    // from passive cursor.
+    if bindings.just_pressed(Action::TogglePassiveCursor, &keys) {
+        match *mode {
+            InputMode::World => {
+                *mode = InputMode::PassiveCursor(PassiveCursorState::fresh_chat());
+                return;
+            }
+            InputMode::PassiveCursor(_) => {
+                *mode = InputMode::World;
+                return;
+            }
+            _ => {}
+        }
     }
 
     // Anything below is a world-mode action — let the text-input router
@@ -251,7 +271,13 @@ pub fn dispatch_target_change_system(
     // resources. Sending a deselect on first frame would be a phantom
     // packet, and worse, would race with the lobby-handshake `InZone`
     // transition.
-    if !matches!(*mode, InputMode::World | InputMode::Menu(_) | InputMode::QuickAction(_)) {
+    if !matches!(
+        *mode,
+        InputMode::World
+            | InputMode::Menu(_)
+            | InputMode::QuickAction(_)
+            | InputMode::PassiveCursor(_)
+    ) {
         // Chat-mode target changes don't happen (the input router blocks
         // Tab/Esc), so this branch is mostly belt-and-suspenders.
         return;
@@ -302,9 +328,14 @@ pub fn dispatch_movement_system(
         autorun.strafe_held_since = None;
         return;
     }
-    // Suppress arrow-key camera pitch/yaw while a Menu or QuickAction is
-    // open so those keys steer the picker cursor instead of fighting it.
-    let in_picker = matches!(*mode, InputMode::Menu(_) | InputMode::QuickAction(_));
+    // Suppress arrow-key camera pitch/yaw while a Menu / QuickAction /
+    // PassiveCursor is open so those keys steer the picker cursor (or
+    // scroll the chat log, in PassiveCursor's case) instead of fighting
+    // for the camera.
+    let in_picker = matches!(
+        *mode,
+        InputMode::Menu(_) | InputMode::QuickAction(_) | InputMode::PassiveCursor(_)
+    );
 
     // --- camera pitch: ↑ raises camera (more overhead), ↓ lowers it. ---
     // FP gets a wider clamp so the operator can mouse-/keyboard-look up

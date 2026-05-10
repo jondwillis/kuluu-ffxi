@@ -33,8 +33,8 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 use ffxi_viewer_core::{
-    Action, Bindings, ChatBuffer, DialogCursor, InputMode, MenuStack, QuickActionState,
-    SceneState, Target, DIALOG_MAX_CHOICE,
+    Action, Bindings, ChatBuffer, DialogCursor, InputMode, MenuStack, PassiveCursorState,
+    QuickActionState, SceneState, Target, DIALOG_MAX_CHOICE,
 };
 use tokio::sync::mpsc::Sender;
 
@@ -132,6 +132,13 @@ pub fn text_input_system(
                     &mut scene_state,
                     &cmd_tx.0,
                 ) {
+                    *mode = next;
+                }
+            }
+            InputMode::PassiveCursor(state) => {
+                if let Some(next) =
+                    handle_passive_cursor_key(&ev.logical_key, &bindings, state, &scene_state)
+                {
                     *mode = next;
                 }
             }
@@ -856,6 +863,58 @@ fn handle_quick_action_key(
     if bindings.matches_logical(Action::NavCancel, key) {
         return Some(InputMode::World);
     }
+    None
+}
+
+/// Passive-cursor mode: arrow keys scroll the focused HUD panel; Esc or
+/// the toggle key returns to World. The scroll is in row units (one
+/// ChatLine per tick), so the math is independent of any wrapping
+/// done at render time.
+///
+/// `chat_buffer_len` is the number of rendered chat rows currently
+/// available — the handler clamps `chat_scroll` so we don't scroll past
+/// the oldest line into empty space.
+fn handle_passive_cursor_key(
+    key: &Key,
+    bindings: &Bindings,
+    state: &mut PassiveCursorState,
+    scene_state: &SceneState,
+) -> Option<InputMode> {
+    // Number of available rows we can scroll back through, clamped at
+    // the oldest line. Recomputed each keypress because new chat
+    // arrivals shift the available range.
+    let max_back =
+        ffxi_viewer_core::snapshot::rendered_chat(scene_state).len();
+
+    if bindings.matches_logical(Action::NavUp, key) {
+        // Scroll one older line into view (saturating at the oldest).
+        if state.chat_scroll + 1 < max_back {
+            state.chat_scroll += 1;
+        }
+        return None;
+    }
+    if bindings.matches_logical(Action::NavDown, key) {
+        // Scroll one newer line into view (saturating at the newest).
+        state.chat_scroll = state.chat_scroll.saturating_sub(1);
+        return None;
+    }
+    if bindings.matches_logical(Action::PageUp, key) {
+        // 8 = chat_panel::VISIBLE_ROWS; one full page back, clamped.
+        let next = state.chat_scroll.saturating_add(8);
+        state.chat_scroll = next.min(max_back.saturating_sub(1));
+        return None;
+    }
+    if bindings.matches_logical(Action::PageDown, key) {
+        state.chat_scroll = state.chat_scroll.saturating_sub(8);
+        return None;
+    }
+    if bindings.matches_logical(Action::NavCancel, key) {
+        return Some(InputMode::World);
+    }
+    // TogglePassiveCursor goes through the physical-key path in
+    // input.rs (since it can't be a Nav* shared action — it has its
+    // own Action variant). The toggle handler there detects mode ==
+    // PassiveCursor and pops back to World.
     None
 }
 
