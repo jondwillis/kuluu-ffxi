@@ -73,6 +73,15 @@ pub fn spawn_chat_panel(mut commands: Commands) {
                     ChatRow { slot },
                     Node {
                         flex_direction: FlexDirection::Row,
+                        // `width: 100%` + `min_width: 0` are the two
+                        // halves of "let me actually shrink to fit my
+                        // parent so wrapping has something to wrap
+                        // against." Without `width: 100%` the row would
+                        // size to its content; without `min_width: 0`
+                        // flex would honor an implicit min-content
+                        // width and the text could still overflow.
+                        width: Val::Percent(100.0),
+                        min_width: Val::Px(0.0),
                         ..default()
                     },
                 ))
@@ -80,6 +89,26 @@ pub fn spawn_chat_panel(mut commands: Commands) {
                     row.spawn((
                         ChatRowBody,
                         Text::new(""),
+                        // `WordOrCharacter`: wrap at word boundaries
+                        // when there are spaces, but break mid-token if
+                        // a single token (e.g. a long URL or hex
+                        // string) is wider than the line. Bevy 0.17's
+                        // default is `WordBoundary`, which leaves long
+                        // unbroken tokens to overflow off-screen.
+                        TextLayout {
+                            linebreak: LineBreak::WordOrCharacter,
+                            ..default()
+                        },
+                        // The Text node itself needs a `max_width`
+                        // constraint — Bevy UI does NOT propagate the
+                        // parent Node's width down to a Text child the
+                        // way HTML/CSS does. Without this, the Text
+                        // grows past the row's 100% bound and overflows
+                        // even with WordOrCharacter set.
+                        Node {
+                            max_width: Val::Percent(100.0),
+                            ..default()
+                        },
                         TextFont {
                             font_size: 13.0,
                             ..default()
