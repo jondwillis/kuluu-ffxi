@@ -20,6 +20,7 @@ pub mod camera;
 pub mod components;
 pub mod hud;
 pub mod input_mode;
+pub mod keybinds;
 pub mod lock_on;
 pub mod mouse;
 pub mod nameplate;
@@ -40,6 +41,7 @@ pub use input_mode::{
     ChatBuffer, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack, QuickActionState,
     DIALOG_MAX_CHOICE,
 };
+pub use keybinds::{Action, Bindings, KeyBind, Modifiers, Preset};
 pub use lock_on::{LockOn, ToggleResult as LockOnToggle};
 pub use mouse::{CursorLockRequest, MousePlugin, MousePointer};
 pub use picking::{click_to_target_system, resolve_click_target, ClickResolution, PickingPlugin};
