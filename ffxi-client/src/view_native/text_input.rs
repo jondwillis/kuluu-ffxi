@@ -33,8 +33,8 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 use ffxi_viewer_core::{
-    ChatBuffer, DialogCursor, InputMode, MenuStack, QuickActionState, SceneState, Target,
-    DIALOG_MAX_CHOICE,
+    Action, Bindings, ChatBuffer, DialogCursor, InputMode, MenuStack, QuickActionState,
+    SceneState, Target, DIALOG_MAX_CHOICE,
 };
 use tokio::sync::mpsc::Sender;
 
@@ -49,6 +49,7 @@ use crate::view_native::slash_commands::{parse_slash, system_chat_line, SlashOut
 pub fn text_input_system(
     mut events: MessageReader<KeyboardInput>,
     cmd_tx: Res<CommandTx>,
+    bindings: Res<Bindings>,
     mut mode: ResMut<InputMode>,
     mut target: ResMut<Target>,
     mut scene_state: ResMut<SceneState>,
@@ -71,6 +72,7 @@ pub fn text_input_system(
             InputMode::World => {
                 if let Some(next) = handle_world_key(
                     &ev.logical_key,
+                    &bindings,
                     current_target,
                     &entities,
                     self_pos,
@@ -80,7 +82,7 @@ pub fn text_input_system(
                 }
             }
             InputMode::Chat(buffer) => {
-                let action = handle_chat_key(&ev.logical_key, buffer);
+                let action = handle_chat_key(&ev.logical_key, &bindings, buffer);
                 apply_chat_action(
                     action,
                     &mut mode,
@@ -95,15 +97,20 @@ pub fn text_input_system(
                 );
             }
             InputMode::Menu(stack) => {
-                if let Some(next) =
-                    handle_menu_key(&ev.logical_key, stack, &mut scene_state, &cmd_tx.0)
-                {
+                if let Some(next) = handle_menu_key(
+                    &ev.logical_key,
+                    &bindings,
+                    stack,
+                    &mut scene_state,
+                    &cmd_tx.0,
+                ) {
                     *mode = next;
                 }
             }
             InputMode::QuickAction(qa) => {
                 if let Some(next) = handle_quick_action_key(
                     &ev.logical_key,
+                    &bindings,
                     qa,
                     &mut scene_state,
                     current_target,
@@ -116,6 +123,7 @@ pub fn text_input_system(
             InputMode::Dialog(cursor) => {
                 if let Some(next) = handle_dialog_key(
                     &ev.logical_key,
+                    &bindings,
                     cursor,
                     &mut scene_state,
                     &cmd_tx.0,
@@ -155,28 +163,32 @@ pub fn dialog_mode_sync_system(state: Res<SceneState>, mut mode: ResMut<InputMod
 /// no longer needs the command sender.
 fn handle_world_key(
     key: &Key,
+    bindings: &Bindings,
     current_target: Option<u32>,
     entities: &[ffxi_viewer_wire::Entity],
     self_pos: ffxi_viewer_wire::Vec3,
     target: &mut Target,
 ) -> Option<InputMode> {
-    match key {
-        // Space opens chat with an empty buffer. The space itself is
-        // consumed (don't seed the buffer — would just be a leading
-        // whitespace that's awkward to delete).
-        Key::Space => Some(InputMode::Chat(ChatBuffer::empty())),
-        // NOTE: `/` (OpenChatCommand) and `-` (OpenMenu) used to live
-        // here as logical-key matches against `Key::Character("/")` and
-        // `Key::Character("-")`. They moved to `input.rs`'s
-        // physical-key reader (`bindings.just_pressed(Action::OpenChat
-        // Command|OpenMenu)`) because matching on the *character* is
-        // keyboard-layout-fragile — on AZERTY, the physical key under
-        // `/` produces `:`, etc. The triggering KeyboardInput event
-        // still flows through this system after the mode change; for
-        // `/` it lands in handle_chat_key, which appends `/` to the
-        // (now Chat) buffer — same final state as the old
-        // `with_prefix("/")` shortcut.
-        // Enter:
+    // OpenChat (default Space) stays in this logical-key router rather
+    // than moving to input.rs's physical-key path: Space arrives as
+    // `Key::Space`, and if input.rs handled it, the same KeyboardInput
+    // event would still be routed to handle_chat_key on the same frame
+    // and push a leading space into the buffer. Matching here lets us
+    // *swallow* the Space event by transitioning out of World before the
+    // event is re-dispatched.
+    if bindings.matches_logical(Action::OpenChat, key) {
+        // Space (default OpenChat) is *swallowed* — we transition out of
+        // World here so the same KeyboardInput event isn't re-routed to
+        // handle_chat_key on this frame (which would push a leading
+        // space into the buffer). NOTE: `/` (OpenChatCommand) and `-`
+        // (OpenMenu) live in `input.rs`'s physical-key reader for the
+        // same reason but with the *opposite* desired effect — for `/`
+        // we want the slash to land in the buffer, so input.rs sets
+        // mode then text_input.rs's chat handler appends it naturally.
+        return Some(InputMode::Chat(ChatBuffer::empty()));
+    }
+    if bindings.matches_logical(Action::ConfirmAction, key) {
+        // Enter (default ConfirmAction):
         // - With a current target → open the contextual menu (FFXI-retail:
         //   Enter on a target brings up the action ring, not a direct
         //   Talk). The operator picks Attack/Check/Talk/etc from there.
@@ -185,7 +197,7 @@ fn handle_world_key(
         //   that target. This matches the retail "step up to NPC and
         //   press Enter" muscle-memory.
         // - With no target + no nearby NPC → open the menu directly.
-        Key::Enter => match current_target {
+        return match current_target {
             Some(_) => Some(InputMode::QuickAction(QuickActionState::for_target(true))),
             None => match nearest_npc(entities, self_pos, AUTO_TARGET_RADIUS) {
                 Some(ent) => {
@@ -194,9 +206,9 @@ fn handle_world_key(
                 }
                 None => Some(InputMode::QuickAction(QuickActionState::for_target(false))),
             },
-        },
-        _ => None,
+        };
     }
+    None
 }
 
 /// Yalms within which Enter-with-no-target auto-acquires the nearest
@@ -236,21 +248,26 @@ enum ChatAction {
     Exit,
 }
 
-fn handle_chat_key(key: &Key, buffer: &mut ChatBuffer) -> ChatAction {
-    match key {
-        Key::Enter => ChatAction::Submit,
-        Key::Escape => {
-            if buffer.text.is_empty() {
-                ChatAction::Exit
-            } else {
-                buffer.text.clear();
-                ChatAction::Stay
-            }
-        }
-        Key::Backspace => {
-            buffer.text.pop();
+fn handle_chat_key(key: &Key, bindings: &Bindings, buffer: &mut ChatBuffer) -> ChatAction {
+    // Submit/Exit/Backspace go through bindings so a future user can
+    // remap them; the printable-character branch and the literal Space
+    // branch stay raw because they're text input, not action triggers.
+    if bindings.matches_logical(Action::ChatSubmit, key) {
+        return ChatAction::Submit;
+    }
+    if bindings.matches_logical(Action::ChatExit, key) {
+        return if buffer.text.is_empty() {
+            ChatAction::Exit
+        } else {
+            buffer.text.clear();
             ChatAction::Stay
-        }
+        };
+    }
+    if bindings.matches_logical(Action::ChatBackspace, key) {
+        buffer.text.pop();
+        return ChatAction::Stay;
+    }
+    match key {
         Key::Space => {
             buffer.text.push(' ');
             ChatAction::Stay
@@ -516,60 +533,59 @@ fn resolve_menu_entry(label: &str) -> MenuDispatch {
 /// → back to World); `None` to stay.
 fn handle_menu_key(
     key: &Key,
+    bindings: &Bindings,
     stack: &mut MenuStack,
     scene_state: &mut SceneState,
     cmd_tx: &Sender<AgentCommand>,
 ) -> Option<InputMode> {
     let level = stack.current_mut()?;
     let entry_count = ffxi_viewer_core::hud::menu::root_entry_count();
-    match key {
-        Key::ArrowUp => {
-            // Wrap: top → bottom (matches retail menu nav).
-            level.cursor = if level.cursor == 0 {
-                entry_count.saturating_sub(1)
-            } else {
-                level.cursor - 1
-            };
-            None
-        }
-        Key::ArrowDown => {
-            // Wrap: bottom → top.
-            let next = level.cursor + 1;
-            level.cursor = if next >= entry_count { 0 } else { next };
-            None
-        }
-        Key::Enter => {
-            let label = ffxi_viewer_core::hud::menu::root_entry_label(level.cursor);
-            match resolve_menu_entry(label) {
-                MenuDispatch::CommandWithToast { cmd, toast } => {
-                    if let Err(e) = cmd_tx.try_send(cmd) {
-                        push_system_chat_line(
-                            scene_state,
-                            format!("[menu] dispatch dropped: {e}"),
-                        );
-                    } else {
-                        push_system_chat_line(scene_state, toast);
-                    }
-                    Some(InputMode::World)
-                }
-                MenuDispatch::NotImplemented(label) => {
+    if bindings.matches_logical(Action::NavUp, key) {
+        // Wrap: top → bottom (matches retail menu nav).
+        level.cursor = if level.cursor == 0 {
+            entry_count.saturating_sub(1)
+        } else {
+            level.cursor - 1
+        };
+        return None;
+    }
+    if bindings.matches_logical(Action::NavDown, key) {
+        // Wrap: bottom → top.
+        let next = level.cursor + 1;
+        level.cursor = if next >= entry_count { 0 } else { next };
+        return None;
+    }
+    if bindings.matches_logical(Action::NavConfirm, key) {
+        let label = ffxi_viewer_core::hud::menu::root_entry_label(level.cursor);
+        return match resolve_menu_entry(label) {
+            MenuDispatch::CommandWithToast { cmd, toast } => {
+                if let Err(e) = cmd_tx.try_send(cmd) {
                     push_system_chat_line(
                         scene_state,
-                        format!("[menu] {label} — not implemented"),
+                        format!("[menu] dispatch dropped: {e}"),
                     );
-                    None
+                } else {
+                    push_system_chat_line(scene_state, toast);
                 }
-            }
-        }
-        Key::Escape => {
-            if !stack.pop() {
                 Some(InputMode::World)
-            } else {
+            }
+            MenuDispatch::NotImplemented(label) => {
+                push_system_chat_line(
+                    scene_state,
+                    format!("[menu] {label} — not implemented"),
+                );
                 None
             }
-        }
-        _ => None,
+        };
     }
+    if bindings.matches_logical(Action::NavCancel, key) {
+        return if !stack.pop() {
+            Some(InputMode::World)
+        } else {
+            None
+        };
+    }
+    None
 }
 
 /// Dialog-mode keystroke handler. Up/Down moves the choice cursor;
@@ -580,53 +596,52 @@ fn handle_menu_key(
 /// dialog).
 fn handle_dialog_key(
     key: &Key,
+    bindings: &Bindings,
     cursor: &mut DialogCursor,
     scene_state: &mut SceneState,
     cmd_tx: &Sender<AgentCommand>,
 ) -> Option<InputMode> {
-    match key {
-        Key::ArrowUp => {
-            if cursor.cursor > 0 {
-                cursor.cursor -= 1;
-            }
-            None
+    if bindings.matches_logical(Action::NavUp, key) {
+        if cursor.cursor > 0 {
+            cursor.cursor -= 1;
         }
-        Key::ArrowDown => {
-            if cursor.cursor < DIALOG_MAX_CHOICE {
-                cursor.cursor += 1;
-            }
-            None
-        }
-        Key::Enter => {
-            if let Some(d) = scene_state.snapshot.dialog.as_ref() {
-                let _ = cmd_tx.try_send(AgentCommand::EndEventChoice {
-                    event_id: d.npc_id,
-                    act_index: d.act_index,
-                    event_num: d.event_num,
-                    choice: cursor.cursor,
-                });
-            }
-            None
-        }
-        Key::Escape => {
-            // Legacy "skip" form — same packet the keepalive auto-drain
-            // sends. Useful when an event has no meaningful choice and
-            // the operator just wants to dismiss it.
-            //
-            // Optimistically pop to World *and* clear the local dialog
-            // snapshot. Without the local clear, `dialog_mode_sync_system`
-            // (which runs first next frame) would see `snapshot.dialog =
-            // Some(_)` and yank us back into Dialog before the operator
-            // could press Enter to interact with their next target. The
-            // next ingest from the server replaces this snapshot
-            // wholesale, so the override only persists until the server
-            // confirms the EndEvent.
-            let _ = cmd_tx.try_send(AgentCommand::EndEvent);
-            scene_state.snapshot.dialog = None;
-            Some(InputMode::World)
-        }
-        _ => None,
+        return None;
     }
+    if bindings.matches_logical(Action::NavDown, key) {
+        if cursor.cursor < DIALOG_MAX_CHOICE {
+            cursor.cursor += 1;
+        }
+        return None;
+    }
+    if bindings.matches_logical(Action::NavConfirm, key) {
+        if let Some(d) = scene_state.snapshot.dialog.as_ref() {
+            let _ = cmd_tx.try_send(AgentCommand::EndEventChoice {
+                event_id: d.npc_id,
+                act_index: d.act_index,
+                event_num: d.event_num,
+                choice: cursor.cursor,
+            });
+        }
+        return None;
+    }
+    if bindings.matches_logical(Action::NavCancel, key) {
+        // Legacy "skip" form — same packet the keepalive auto-drain
+        // sends. Useful when an event has no meaningful choice and
+        // the operator just wants to dismiss it.
+        //
+        // Optimistically pop to World *and* clear the local dialog
+        // snapshot. Without the local clear, `dialog_mode_sync_system`
+        // (which runs first next frame) would see `snapshot.dialog =
+        // Some(_)` and yank us back into Dialog before the operator
+        // could press Enter to interact with their next target. The
+        // next ingest from the server replaces this snapshot
+        // wholesale, so the override only persists until the server
+        // confirms the EndEvent.
+        let _ = cmd_tx.try_send(AgentCommand::EndEvent);
+        scene_state.snapshot.dialog = None;
+        return Some(InputMode::World);
+    }
+    None
 }
 
 /// What pressing Enter on a given QuickAction label should do.
@@ -690,6 +705,7 @@ fn resolve_quick_action(
 
 fn handle_quick_action_key(
     key: &Key,
+    bindings: &Bindings,
     state: &mut QuickActionState,
     scene_state: &mut SceneState,
     target_id: Option<u32>,
@@ -697,53 +713,53 @@ fn handle_quick_action_key(
     cmd_tx: &Sender<AgentCommand>,
 ) -> Option<InputMode> {
     let entry_count = ffxi_viewer_core::hud::quick_action::entry_count(state.has_target);
-    match key {
-        Key::ArrowUp => {
-            // Wrap: top → bottom. Matches retail's action ring, where
-            // there's no "dead" stop at either end of a 3-entry list.
-            state.cursor = if state.cursor == 0 {
-                entry_count.saturating_sub(1)
-            } else {
-                state.cursor - 1
-            };
-            None
-        }
-        Key::ArrowDown => {
-            // Wrap: bottom → top.
-            let next = state.cursor + 1;
-            state.cursor = if next >= entry_count { 0 } else { next };
-            None
-        }
-        Key::Enter => {
-            let label = ffxi_viewer_core::hud::quick_action::entry_label(
-                state.has_target,
-                state.cursor,
-            );
-            let target_ent = target_id.and_then(|id| entities.iter().find(|e| e.id == id));
-            match resolve_quick_action(label, target_ent) {
-                QuickActionDispatch::Command(cmd) => {
-                    if let Err(e) = cmd_tx.try_send(cmd) {
-                        push_system_chat_line(
-                            scene_state,
-                            format!("[quick] dispatch dropped: {e}"),
-                        );
-                    }
-                }
-                QuickActionDispatch::SystemMessage(msg) => {
-                    push_system_chat_line(scene_state, msg);
-                }
-                QuickActionDispatch::NotImplemented(label) => {
+    if bindings.matches_logical(Action::NavUp, key) {
+        // Wrap: top → bottom. Matches retail's action ring, where
+        // there's no "dead" stop at either end of a 3-entry list.
+        state.cursor = if state.cursor == 0 {
+            entry_count.saturating_sub(1)
+        } else {
+            state.cursor - 1
+        };
+        return None;
+    }
+    if bindings.matches_logical(Action::NavDown, key) {
+        // Wrap: bottom → top.
+        let next = state.cursor + 1;
+        state.cursor = if next >= entry_count { 0 } else { next };
+        return None;
+    }
+    if bindings.matches_logical(Action::NavConfirm, key) {
+        let label = ffxi_viewer_core::hud::quick_action::entry_label(
+            state.has_target,
+            state.cursor,
+        );
+        let target_ent = target_id.and_then(|id| entities.iter().find(|e| e.id == id));
+        match resolve_quick_action(label, target_ent) {
+            QuickActionDispatch::Command(cmd) => {
+                if let Err(e) = cmd_tx.try_send(cmd) {
                     push_system_chat_line(
                         scene_state,
-                        format!("[quick] {label} — not implemented"),
+                        format!("[quick] dispatch dropped: {e}"),
                     );
                 }
             }
-            Some(InputMode::World)
+            QuickActionDispatch::SystemMessage(msg) => {
+                push_system_chat_line(scene_state, msg);
+            }
+            QuickActionDispatch::NotImplemented(label) => {
+                push_system_chat_line(
+                    scene_state,
+                    format!("[quick] {label} — not implemented"),
+                );
+            }
         }
-        Key::Escape => Some(InputMode::World),
-        _ => None,
+        return Some(InputMode::World);
     }
+    if bindings.matches_logical(Action::NavCancel, key) {
+        return Some(InputMode::World);
+    }
+    None
 }
 
 #[cfg(test)]

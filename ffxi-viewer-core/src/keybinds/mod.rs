@@ -292,14 +292,21 @@ impl Bindings {
 }
 
 /// Map a logical named [`Key`] event to the corresponding physical
-/// [`KeyCode`] for the navigation keys we route through the logical-key
-/// path. Returns `None` for printable characters and unsupported keys.
+/// [`KeyCode`] for the named, layout-stable keys we route through the
+/// logical-key path. Returns `None` for printable characters (those go
+/// through the physical-key path in `input.rs` via `bindings.pressed` /
+/// `just_pressed`).
+///
+/// `Key::Space` is included even though `Key::Character(" ")` would also
+/// match Space on most platforms — winit emits `Key::Space` for the
+/// physical Space key, and matching on the named variant is more honest.
 fn nav_keycode_for(key: &Key) -> Option<KeyCode> {
     match key {
         Key::Enter => Some(KeyCode::Enter),
         Key::Escape => Some(KeyCode::Escape),
         Key::Backspace => Some(KeyCode::Backspace),
         Key::Tab => Some(KeyCode::Tab),
+        Key::Space => Some(KeyCode::Space),
         Key::ArrowUp => Some(KeyCode::ArrowUp),
         Key::ArrowDown => Some(KeyCode::ArrowDown),
         Key::ArrowLeft => Some(KeyCode::ArrowLeft),
