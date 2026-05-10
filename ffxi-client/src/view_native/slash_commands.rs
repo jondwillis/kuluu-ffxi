@@ -23,9 +23,15 @@
 //! Returning a typed outcome keeps the parser side-effect-free and lets
 //! the caller compose the right side effects in one place.
 
+use ffxi_viewer_core::Preset;
 use ffxi_viewer_wire::{ChatChannel, ChatLine, Entity as WireEntity, Vec3 as WireVec3};
 
 use crate::state::{ActionKind, AgentCommand, CheckKind, ReqLogoutKind};
+
+/// Maximum zone-id value used for sanity-checking numeric `/zoneto`
+/// args. The LSB zone table goes well past 300 (Adoulin, Voidwatch,
+/// etc.) but never reaches 65535; this catches obvious typos.
+const MAX_ZONE_ID: u16 = 600;
 
 /// What the input router should do after parsing a `/`-prefixed buffer.
 #[derive(Debug, Clone)]
@@ -59,6 +65,25 @@ pub enum SlashOutcome {
     /// Mirrors the `SetTarget(Option<u32>)` shape — a client-side
     /// state mutation, no agent/wire side effect.
     ToggleNavmesh(Option<bool>),
+    /// `/keybinds preset|list|reset` — switch keybind preset, list the
+    /// active map, or drop overrides back to the active preset's
+    /// defaults. The dispatcher applies the change to the `Bindings`
+    /// resource and persists via `keybinds_store`.
+    ApplyKeybinds(KeybindUpdate),
+}
+
+/// `/keybinds` subcommand variants.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeybindUpdate {
+    /// `preset <name>` — replace the active bindings with the named
+    /// preset's defaults and persist.
+    Preset(Preset),
+    /// `reset` — drop overrides, return to the persisted preset's
+    /// defaults. (Equivalent to `Preset(currently_persisted_preset)`
+    /// from the operator's POV; the dispatcher resolves it.)
+    Reset,
+    /// `list` — print the current Action → key map as system chat lines.
+    List,
 }
 
 /// Parse a `/`-prefixed buffer. The leading `/` must be present.
@@ -67,11 +92,14 @@ pub enum SlashOutcome {
 /// player's position — used for name → id resolution and tie-breaking
 /// when several entities share a prefix. `current_target` falls in for
 /// commands that accept "use current target" when no name is given.
+/// `zone_id` is the current zone (used by `/zones` and `/zoneto`); pass
+/// `None` if not yet known.
 pub fn parse_slash(
     buffer: &str,
     entities: &[WireEntity],
     self_pos: WireVec3,
     current_target: Option<u32>,
+    zone_id: Option<u16>,
 ) -> SlashOutcome {
     let trimmed = buffer.trim_start();
     let body = trimmed.strip_prefix('/').unwrap_or(trimmed);
@@ -170,8 +198,27 @@ pub fn parse_slash(
         // `on`/`off` arguments arm or cancel explicitly.
         "logout" => parse_reqlogout(rest, /* shutdown = */ false),
         "navmesh" => parse_navmesh(rest),
+        "keybinds" | "keybind" | "binds" => parse_keybinds(rest),
         "pathto" => parse_pathto(rest, entities, current_target),
+        "zones" => parse_zones(zone_id),
+        "zoneto" => parse_zoneto(rest, zone_id),
+        "whereami" | "pos" => SlashOutcome::SystemMessage(format!(
+            "self_pos: x={:.2} y={:.2} z={:.2}  zone={}",
+            self_pos.x,
+            self_pos.y,
+            self_pos.z,
+            zone_id.map_or("?".to_string(), |z| z.to_string()),
+        )),
         "shutdown" => parse_reqlogout(rest, /* shutdown = */ true),
+        // Accept the homepoint warp menu — what the official FFXI client
+        // sends when the player picks "Return to home point" after dying.
+        // Phoenix sets `requestedWarp = true` and the zone-tick processes
+        // it via `charutils::HomePoint`. The warp fires regardless of
+        // death state — typing `/return` while alive will still HP-warp
+        // (with the dead-or-alive flavor passed by `PChar->isDead()`).
+        // We don't gate locally because the agent harness wants exactly
+        // the wire-protocol contract; gating would diverge from retail.
+        "return" | "homepoint" | "hp" => SlashOutcome::Command(AgentCommand::ReturnToHomePoint),
         "p" | "party" => chat_or_empty(rest, 4, "/p"),
         "sh" | "shout" => chat_or_empty(rest, 1, "/sh"),
         "l" | "linkshell" | "ls" => chat_or_empty(rest, 5, "/l"),
@@ -304,6 +351,84 @@ fn parse_pathto(
     }
 }
 
+/// `/zones` — list zone-line destinations from the current zone in
+/// the chat panel. Each line shows `→ Zone_Name (id)` and the FFXI
+/// trigger position the operator can `/pathto` to. Read-only;
+/// produces a single multi-line `SystemMessage`.
+fn parse_zones(zone_id: Option<u16>) -> SlashOutcome {
+    let Some(z) = zone_id else {
+        return SlashOutcome::SystemMessage("/zones: not in a zone yet".into());
+    };
+    let lines = ffxi_nav::zone_lines_for(z);
+    if lines.is_empty() {
+        return SlashOutcome::SystemMessage(format!(
+            "/zones: no zone-lines from zone {z} (instance / GM zone?)"
+        ));
+    }
+    let mut msg = format!(
+        "/zones from {} ({z}):",
+        ffxi_nav::zone_name(z).unwrap_or("?")
+    );
+    for line in lines {
+        let to_name = ffxi_nav::zone_name(line.to_zone).unwrap_or("?");
+        msg.push_str(&format!(
+            "\n  -> {} ({}) at ({:.0}, {:.0}, {:.0})",
+            to_name,
+            line.to_zone,
+            line.from_pos[0],
+            line.from_pos[1],
+            line.from_pos[2],
+        ));
+    }
+    SlashOutcome::SystemMessage(msg)
+}
+
+/// `/zoneto <name|id>` — pathfind to the zone-line in the current
+/// zone whose destination matches. Name match is case-insensitive
+/// prefix (so `/zoneto south` finds Southern San d'Oria). Numeric
+/// args match the destination zone-id directly.
+///
+/// Multiple matches: pick the first one (the operator can disambiguate
+/// by typing more of the name). Helpful but not exhaustive — for
+/// edge cases, `/zones` shows the full list and `/pathto x y z` is
+/// always available.
+fn parse_zoneto(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
+    let needle = rest.trim();
+    if needle.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/zoneto: usage `/zoneto <zone_name|id>`; try `/zones` to list".into(),
+        );
+    }
+    let Some(z) = zone_id else {
+        return SlashOutcome::SystemMessage("/zoneto: not in a zone yet".into());
+    };
+    let lines = ffxi_nav::zone_lines_for(z);
+    if lines.is_empty() {
+        return SlashOutcome::SystemMessage(format!("/zoneto: no zone-lines from zone {z}"));
+    }
+    // Numeric form: parse as u16 (rejects bogus values).
+    let by_id = needle.parse::<u16>().ok().filter(|n| *n <= MAX_ZONE_ID);
+    let needle_lower = needle.to_ascii_lowercase();
+    let chosen = lines.iter().find(|line| {
+        if Some(line.to_zone) == by_id {
+            return true;
+        }
+        ffxi_nav::zone_name(line.to_zone)
+            .map(|n| n.to_ascii_lowercase().starts_with(&needle_lower))
+            .unwrap_or(false)
+    });
+    match chosen {
+        Some(line) => SlashOutcome::Command(AgentCommand::PathTo {
+            x: line.from_pos[0],
+            y: line.from_pos[1],
+            z: line.from_pos[2],
+        }),
+        None => SlashOutcome::SystemMessage(format!(
+            "/zoneto: no zone-line matches `{needle}` (try `/zones` to list)"
+        )),
+    }
+}
+
 /// `/navmesh [on|off]` — empty arg toggles, `on` / `off` are explicit.
 /// Same shape as `/logout`. Unknown args show the usage line rather
 /// than silently flipping (operators sometimes typo "om" / "ofd").
@@ -314,6 +439,34 @@ fn parse_navmesh(rest: &str) -> SlashOutcome {
         "off" => SlashOutcome::ToggleNavmesh(Some(false)),
         other => SlashOutcome::SystemMessage(format!(
             "/navmesh: usage `/navmesh [on|off]` (got `{other}`)"
+        )),
+    }
+}
+
+/// `/keybinds [preset <name> | list | reset]` — switch preset, print the
+/// active map, or drop overrides. Empty arg shows the usage line. We
+/// invent this command (no retail equivalent — keybinding lives in the
+/// retail Config menu) but match retail's slash style: single root
+/// command with a subcommand verb, like `/equip head <item>`.
+fn parse_keybinds(rest: &str) -> SlashOutcome {
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let verb = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    let arg = parts.next().unwrap_or("").trim();
+    match verb.as_str() {
+        "" => SlashOutcome::SystemMessage(
+            "/keybinds: usage `/keybinds preset <compact1|compact2|standard> | list | reset`"
+                .into(),
+        ),
+        "preset" => match Preset::from_slug(arg) {
+            Some(preset) => SlashOutcome::ApplyKeybinds(KeybindUpdate::Preset(preset)),
+            None => SlashOutcome::SystemMessage(format!(
+                "/keybinds: unknown preset `{arg}` — try compact1, compact2, or standard"
+            )),
+        },
+        "list" => SlashOutcome::ApplyKeybinds(KeybindUpdate::List),
+        "reset" => SlashOutcome::ApplyKeybinds(KeybindUpdate::Reset),
+        other => SlashOutcome::SystemMessage(format!(
+            "/keybinds: unknown verb `{other}` — try preset, list, or reset"
         )),
     }
 }
@@ -429,13 +582,13 @@ mod tests {
 
     #[test]
     fn empty_command_is_system_message() {
-        let out = parse_slash("/", &empty_entities(), origin(), None);
+        let out = parse_slash("/", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::SystemMessage(_)));
     }
 
     #[test]
     fn unknown_command_is_system_message() {
-        let out = parse_slash("/blarg", &empty_entities(), origin(), None);
+        let out = parse_slash("/blarg", &empty_entities(), origin(), None, None);
         match out {
             SlashOutcome::SystemMessage(s) => assert!(s.contains("/blarg")),
             _ => panic!("expected SystemMessage"),
@@ -444,7 +597,7 @@ mod tests {
 
     #[test]
     fn party_chat_with_text() {
-        let out = parse_slash("/p hello world", &empty_entities(), origin(), None);
+        let out = parse_slash("/p hello world", &empty_entities(), origin(), None, None);
         match out {
             SlashOutcome::Command(AgentCommand::Chat { kind, text }) => {
                 assert_eq!(kind, 4);
@@ -456,13 +609,13 @@ mod tests {
 
     #[test]
     fn party_chat_empty_text_is_system_message() {
-        let out = parse_slash("/p", &empty_entities(), origin(), None);
+        let out = parse_slash("/p", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::SystemMessage(_)));
     }
 
     #[test]
     fn tell_requires_name_and_text() {
-        let out = parse_slash("/t Bob hi there", &empty_entities(), origin(), None);
+        let out = parse_slash("/t Bob hi there", &empty_entities(), origin(), None, None);
         match out {
             SlashOutcome::Command(AgentCommand::Tell { to, text }) => {
                 assert_eq!(to, "Bob");
@@ -471,7 +624,7 @@ mod tests {
             other => panic!("expected Tell, got {other:?}"),
         }
 
-        let out = parse_slash("/t Bob", &empty_entities(), origin(), None);
+        let out = parse_slash("/t Bob", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::SystemMessage(_)));
     }
 
@@ -481,7 +634,7 @@ mod tests {
             ent(101, "Bob", EntityKind::Pc, 0.0, 0.0),
             ent(102, "Bobble", EntityKind::Npc, 5.0, 5.0),
         ];
-        let out = parse_slash("/follow Bob", &entities, origin(), None);
+        let out = parse_slash("/follow Bob", &entities, origin(), None, None);
         match out {
             SlashOutcome::Command(AgentCommand::Follow { target_id, .. }) => {
                 assert_eq!(target_id, 101); // PC wins over NPC on prefix tie
@@ -492,7 +645,7 @@ mod tests {
 
     #[test]
     fn follow_no_name_uses_current_target() {
-        let out = parse_slash("/follow", &empty_entities(), origin(), Some(42));
+        let out = parse_slash("/follow", &empty_entities(), origin(), Some(42), None);
         match out {
             SlashOutcome::Command(AgentCommand::Follow { target_id, .. }) => {
                 assert_eq!(target_id, 42);
@@ -503,13 +656,13 @@ mod tests {
 
     #[test]
     fn follow_no_name_no_target_is_system_message() {
-        let out = parse_slash("/follow", &empty_entities(), origin(), None);
+        let out = parse_slash("/follow", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::SystemMessage(_)));
     }
 
     #[test]
     fn target_clears_with_no_arg() {
-        let out = parse_slash("/target", &empty_entities(), origin(), Some(7));
+        let out = parse_slash("/target", &empty_entities(), origin(), Some(7), None);
         assert!(matches!(out, SlashOutcome::SetTarget(None)));
     }
 
@@ -520,7 +673,7 @@ mod tests {
         // server's LeaveGame flow; see `logout_*` tests below.
         for s in ["/quit", "/disconnect"] {
             assert!(matches!(
-                parse_slash(s, &empty_entities(), origin(), None),
+                parse_slash(s, &empty_entities(), origin(), None, None),
                 SlashOutcome::Quit
             ));
         }
@@ -528,7 +681,7 @@ mod tests {
 
     #[test]
     fn logout_no_arg_toggles() {
-        match parse_slash("/logout", &empty_entities(), origin(), None) {
+        match parse_slash("/logout", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
                 assert_eq!(kind, ReqLogoutKind::LogoutToggle);
             }
@@ -538,13 +691,13 @@ mod tests {
 
     #[test]
     fn logout_on_and_off_select_explicit_modes() {
-        match parse_slash("/logout on", &empty_entities(), origin(), None) {
+        match parse_slash("/logout on", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
                 assert_eq!(kind, ReqLogoutKind::LogoutOn);
             }
             other => panic!("expected ReqLogout(LogoutOn), got {other:?}"),
         }
-        match parse_slash("/logout off", &empty_entities(), origin(), None) {
+        match parse_slash("/logout off", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
                 assert_eq!(kind, ReqLogoutKind::LogoutOff);
             }
@@ -554,7 +707,7 @@ mod tests {
 
     #[test]
     fn shutdown_no_arg_toggles() {
-        match parse_slash("/shutdown", &empty_entities(), origin(), None) {
+        match parse_slash("/shutdown", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
                 assert_eq!(kind, ReqLogoutKind::ShutdownToggle);
             }
@@ -564,13 +717,13 @@ mod tests {
 
     #[test]
     fn shutdown_on_and_off_select_explicit_modes() {
-        match parse_slash("/shutdown on", &empty_entities(), origin(), None) {
+        match parse_slash("/shutdown on", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
                 assert_eq!(kind, ReqLogoutKind::ShutdownOn);
             }
             other => panic!("expected ReqLogout(ShutdownOn), got {other:?}"),
         }
-        match parse_slash("/shutdown off", &empty_entities(), origin(), None) {
+        match parse_slash("/shutdown off", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
                 assert_eq!(kind, ReqLogoutKind::ShutdownOff);
             }
@@ -582,7 +735,7 @@ mod tests {
     fn exit_emits_quit_with_logout_on() {
         // /exit must arm with `LogoutOn` (not Toggle) so it can't
         // accidentally cancel an in-flight logout from a prior /logout.
-        match parse_slash("/exit", &empty_entities(), origin(), None) {
+        match parse_slash("/exit", &empty_entities(), origin(), None, None) {
             SlashOutcome::QuitWithLogout(kind) => {
                 assert_eq!(kind, ReqLogoutKind::LogoutOn);
             }
@@ -595,7 +748,7 @@ mod tests {
         for s in ["/logout please", "/logout 1", "/shutdown maybe"] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None),
+                    parse_slash(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}"
@@ -605,7 +758,7 @@ mod tests {
 
     #[test]
     fn navmesh_no_arg_toggles() {
-        match parse_slash("/navmesh", &empty_entities(), origin(), None) {
+        match parse_slash("/navmesh", &empty_entities(), origin(), None, None) {
             SlashOutcome::ToggleNavmesh(None) => {}
             other => panic!("expected ToggleNavmesh(None), got {other:?}"),
         }
@@ -614,7 +767,7 @@ mod tests {
     #[test]
     fn navmesh_on_and_off_select_explicit_modes() {
         for (cmd, expected) in [("/navmesh on", Some(true)), ("/navmesh off", Some(false))] {
-            match parse_slash(cmd, &empty_entities(), origin(), None) {
+            match parse_slash(cmd, &empty_entities(), origin(), None, None) {
                 SlashOutcome::ToggleNavmesh(setting) => assert_eq!(setting, expected),
                 other => panic!("expected ToggleNavmesh({expected:?}), got {other:?}"),
             }
@@ -626,7 +779,7 @@ mod tests {
         for s in ["/navmesh maybe", "/navmesh 1", "/navmesh ON!"] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None),
+                    parse_slash(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}"
@@ -636,7 +789,7 @@ mod tests {
 
     #[test]
     fn pathto_numeric_three_args_dispatches() {
-        match parse_slash("/pathto 1.5 2 -3.25", &empty_entities(), origin(), None) {
+        match parse_slash("/pathto 1.5 2 -3.25", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::PathTo { x, y, z }) => {
                 assert_eq!(x, 1.5);
                 assert_eq!(y, 2.0);
@@ -650,7 +803,7 @@ mod tests {
     fn pathto_target_uses_current_target_pos() {
         let mut entity = ent(42, "Bob", EntityKind::Pc, 7.0, 8.0);
         entity.pos.z = 9.0;
-        match parse_slash("/pathto target", &[entity], origin(), Some(42)) {
+        match parse_slash("/pathto target", &[entity], origin(), Some(42), None) {
             SlashOutcome::Command(AgentCommand::PathTo { x, y, z }) => {
                 assert_eq!((x, y, z), (7.0, 8.0, 9.0));
             }
@@ -664,7 +817,7 @@ mod tests {
         for s in ["/pathto", "/pathto 1 2", "/pathto 1 2 3 4", "/pathto x y z", "/pathto target"] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None),
+                    parse_slash(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}"
@@ -675,7 +828,7 @@ mod tests {
     #[test]
     fn cancel_emits_cancel_command() {
         assert!(matches!(
-            parse_slash("/cancel", &empty_entities(), origin(), None),
+            parse_slash("/cancel", &empty_entities(), origin(), None, None),
             SlashOutcome::Command(AgentCommand::Cancel)
         ));
     }
@@ -683,7 +836,7 @@ mod tests {
     #[test]
     fn attack_uses_current_target_and_attack_kind() {
         let entities = vec![ent(42, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        let out = parse_slash("/attack", &entities, origin(), Some(42));
+        let out = parse_slash("/attack", &entities, origin(), Some(42), None);
         match out {
             SlashOutcome::Command(AgentCommand::Action {
                 target_id,
@@ -701,7 +854,7 @@ mod tests {
     #[test]
     fn engage_alias_matches_attack() {
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        match parse_slash("/engage", &entities, origin(), Some(7)) {
+        match parse_slash("/engage", &entities, origin(), Some(7), None) {
             SlashOutcome::Command(AgentCommand::Action { kind, .. }) => {
                 assert!(matches!(kind, ActionKind::Attack));
             }
@@ -712,7 +865,7 @@ mod tests {
     #[test]
     fn attackoff_emits_attack_off_action() {
         let entities = vec![ent(9, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        match parse_slash("/attackoff", &entities, origin(), Some(9)) {
+        match parse_slash("/attackoff", &entities, origin(), Some(9), None) {
             SlashOutcome::Command(AgentCommand::Action {
                 target_id, kind, ..
             }) => {
@@ -726,7 +879,7 @@ mod tests {
     #[test]
     fn check_uses_current_target_with_kind_check() {
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        let out = parse_slash("/check", &entities, origin(), Some(7));
+        let out = parse_slash("/check", &entities, origin(), Some(7), None);
         match out {
             SlashOutcome::Command(AgentCommand::CheckTarget {
                 target_id,
@@ -744,13 +897,13 @@ mod tests {
     #[test]
     fn checkname_and_checkparam_select_correct_kind() {
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        match parse_slash("/checkname", &entities, origin(), Some(7)) {
+        match parse_slash("/checkname", &entities, origin(), Some(7), None) {
             SlashOutcome::Command(AgentCommand::CheckTarget { kind, .. }) => {
                 assert_eq!(kind, CheckKind::CheckName);
             }
             other => panic!("expected CheckTarget, got {other:?}"),
         }
-        match parse_slash("/checkparam", &entities, origin(), Some(7)) {
+        match parse_slash("/checkparam", &entities, origin(), Some(7), None) {
             SlashOutcome::Command(AgentCommand::CheckTarget { kind, .. }) => {
                 assert_eq!(kind, CheckKind::CheckParam);
             }
@@ -760,13 +913,13 @@ mod tests {
 
     #[test]
     fn check_no_target_is_system_message() {
-        let out = parse_slash("/check", &empty_entities(), origin(), None);
+        let out = parse_slash("/check", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::SystemMessage(_)));
     }
 
     #[test]
     fn buy_with_row_uses_qty_one_by_default() {
-        let out = parse_slash("/buy 3", &empty_entities(), origin(), None);
+        let out = parse_slash("/buy 3", &empty_entities(), origin(), None, None);
         match out {
             SlashOutcome::ShopBuyRow { shop_index, qty } => {
                 assert_eq!(shop_index, 3);
@@ -778,7 +931,7 @@ mod tests {
 
     #[test]
     fn buy_with_qty_passes_it_through() {
-        let out = parse_slash("/buy 0 12", &empty_entities(), origin(), None);
+        let out = parse_slash("/buy 0 12", &empty_entities(), origin(), None, None);
         match out {
             SlashOutcome::ShopBuyRow { shop_index, qty } => {
                 assert_eq!(shop_index, 0);
@@ -793,7 +946,7 @@ mod tests {
         for s in ["/buy", "/buy abc", "/buy 1 0", "/buy 1 xyz"] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None),
+                    parse_slash(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}"

@@ -18,7 +18,10 @@ use super::{Action, Bindings, KeyBind};
 /// Which retail-style layout the user has selected. `Custom` means the
 /// bindings on disk override the named preset — the file is the source of
 /// truth.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Default,
+    serde::Serialize, serde::Deserialize,
+)]
 pub enum Preset {
     /// WASD movement, no strafe, arrows for camera. Most common
     /// keyboard-only retail layout.

@@ -14,8 +14,13 @@ license.workspace = true
 # the workspace bevy (full default features) for the native build.
 
 [dependencies]
-bevy = { workspace = true }
+# `serialize` enables serde derives on `KeyCode`, `Modifiers` modifiers, and
+# the rest of `bevy_input` — needed by `keybinds::KeyBind` so the on-disk
+# `keybinds.json` can name keys (`"KeyW"`, `"Numpad8"`, etc.) without a
+# hand-rolled match table covering every variant.
+bevy = { workspace = true, features = ["serialize"] }
 ffxi-viewer-wire = { path = "../ffxi-viewer-wire" }
+serde = { workspace = true }
 
 # wasm32 has no syscall for wall-clock time; std::time::SystemTime::now()
 # panics there. The HUD's reconnect-age line needs millis-since-epoch, so

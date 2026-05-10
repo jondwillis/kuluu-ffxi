@@ -38,9 +38,10 @@ use ffxi_viewer_core::{
 };
 use tokio::sync::mpsc::Sender;
 
+use crate::keybinds_store::KeybindsStateRes;
 use crate::state::{ActionKind, AgentCommand, CheckKind, ReqLogoutKind};
 use crate::view_native::input::CommandTx;
-use crate::view_native::slash_commands::{parse_slash, system_chat_line, SlashOutcome};
+use crate::view_native::slash_commands::{parse_slash, system_chat_line, KeybindUpdate, SlashOutcome};
 
 /// Read `KeyboardInput` events and route per [`InputMode`]. Runs every
 /// `Update` tick. Cmd+Q / window-close are handled in `input.rs`'s
@@ -49,7 +50,8 @@ use crate::view_native::slash_commands::{parse_slash, system_chat_line, SlashOut
 pub fn text_input_system(
     mut events: MessageReader<KeyboardInput>,
     cmd_tx: Res<CommandTx>,
-    bindings: Res<Bindings>,
+    mut bindings: ResMut<Bindings>,
+    mut keybinds_state: ResMut<KeybindsStateRes>,
     mut mode: ResMut<InputMode>,
     mut target: ResMut<Target>,
     mut scene_state: ResMut<SceneState>,
@@ -94,6 +96,8 @@ pub fn text_input_system(
                     &mut scene_state,
                     &mut exit,
                     &mut navmesh_visible,
+                    &mut bindings,
+                    &mut keybinds_state,
                 );
             }
             InputMode::Menu(stack) => {
@@ -296,6 +300,8 @@ fn apply_chat_action(
     scene_state: &mut SceneState,
     exit: &mut MessageWriter<AppExit>,
     navmesh_visible: &mut super::navmesh_overlay::NavmeshOverlayVisible,
+    bindings: &mut Bindings,
+    keybinds_state: &mut KeybindsStateRes,
 ) {
     match action {
         ChatAction::Stay => {}
@@ -314,7 +320,13 @@ fn apply_chat_action(
                 return;
             }
             if trimmed.starts_with('/') {
-                let outcome = parse_slash(trimmed, entities, self_pos, current_target);
+                let outcome = parse_slash(
+                    trimmed,
+                    entities,
+                    self_pos,
+                    current_target,
+                    scene_state.snapshot.zone_id,
+                );
                 tracing::debug!(buffer = %trimmed, outcome = ?outcome, "chat submit: slash");
                 // Locally echo /say & friends so the operator sees their
                 // own line immediately, independent of server echo timing.
@@ -330,7 +342,16 @@ fn apply_chat_action(
                     }
                     _ => {}
                 }
-                apply_slash_outcome(outcome, target, cmd_tx, scene_state, exit, navmesh_visible);
+                apply_slash_outcome(
+                    outcome,
+                    target,
+                    cmd_tx,
+                    scene_state,
+                    exit,
+                    navmesh_visible,
+                    bindings,
+                    keybinds_state,
+                );
             } else {
                 // Default channel: Say. Tracing makes it visible whether the
                 // dispatch reached the session loop — the server's 0x017 echo
@@ -358,6 +379,7 @@ fn apply_chat_action(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_slash_outcome(
     outcome: SlashOutcome,
     target: &mut Target,
@@ -365,6 +387,8 @@ fn apply_slash_outcome(
     scene_state: &mut SceneState,
     exit: &mut MessageWriter<AppExit>,
     navmesh_visible: &mut super::navmesh_overlay::NavmeshOverlayVisible,
+    bindings: &mut Bindings,
+    keybinds_state: &mut KeybindsStateRes,
 ) {
     match outcome {
         SlashOutcome::Command(cmd) => {
@@ -423,6 +447,79 @@ fn apply_slash_outcome(
                 None => push_system_chat_line(scene_state, "/buy: no shop is open".into()),
             }
         }
+        SlashOutcome::ApplyKeybinds(update) => {
+            apply_keybind_update(update, bindings, keybinds_state, scene_state);
+        }
+    }
+}
+
+/// Apply a `/keybinds` subcommand: swap the [`Bindings`] resource,
+/// persist the new state, and surface a system-chat confirmation. List
+/// is a read-only print.
+fn apply_keybind_update(
+    update: KeybindUpdate,
+    bindings: &mut Bindings,
+    keybinds_state: &mut KeybindsStateRes,
+    scene_state: &mut SceneState,
+) {
+    match update {
+        KeybindUpdate::Preset(preset) => {
+            let (new_bindings, save_result) = keybinds_state.apply_preset(preset);
+            *bindings = new_bindings;
+            push_system_chat_line(
+                scene_state,
+                format!("/keybinds: preset → {}", preset.slug()),
+            );
+            if let Err(e) = save_result {
+                push_system_chat_line(
+                    scene_state,
+                    format!("/keybinds: save failed: {e}"),
+                );
+            }
+        }
+        KeybindUpdate::Reset => {
+            let preset = keybinds_state.persisted.preset;
+            let (new_bindings, save_result) = keybinds_state.apply_reset();
+            *bindings = new_bindings;
+            push_system_chat_line(
+                scene_state,
+                format!("/keybinds: reset to {} defaults", preset.slug()),
+            );
+            if let Err(e) = save_result {
+                push_system_chat_line(
+                    scene_state,
+                    format!("/keybinds: save failed: {e}"),
+                );
+            }
+        }
+        KeybindUpdate::List => {
+            push_system_chat_line(
+                scene_state,
+                format!("/keybinds: preset = {}", keybinds_state.persisted.preset.slug()),
+            );
+            // One line per (Action, KeyBind). BTreeMap iteration is
+            // already sorted, so the output order is stable.
+            for (action, bind) in bindings.iter() {
+                let mods = format_modifiers(bind.mods);
+                push_system_chat_line(
+                    scene_state,
+                    format!("  {action:?} → {mods}{:?}", bind.key),
+                );
+            }
+        }
+    }
+}
+
+fn format_modifiers(mods: ffxi_viewer_core::Modifiers) -> &'static str {
+    match (mods.ctrl, mods.alt, mods.shift, mods.super_) {
+        (false, false, false, false) => "",
+        (true, false, false, false) => "Ctrl+",
+        (false, true, false, false) => "Alt+",
+        (false, false, true, false) => "Shift+",
+        (false, false, false, true) => "Super+",
+        // Multi-modifier combos collapse to a generic prefix; rare
+        // enough that listing them all out doesn't earn its keep.
+        _ => "Mod+",
     }
 }
 

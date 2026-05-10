@@ -50,7 +50,10 @@ pub use presets::Preset;
 /// Every rebindable client verb. Universal hard-wired keys (Cmd+Q close,
 /// the OS WindowCloseRequested event) are NOT actions — they must work
 /// regardless of bindings, so they stay inline in the input handlers.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd,
+    serde::Serialize, serde::Deserialize,
+)]
 pub enum Action {
     // ----- Movement (World mode) -----
     MoveForward,
@@ -113,8 +116,11 @@ pub enum Action {
 }
 
 /// Modifier-key state encoded as a small struct rather than bitflags so
-/// it serializes cleanly to a JSON array of strings later (Stage 2c).
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+/// it serializes cleanly to JSON.
+#[derive(
+    Debug, Clone, Copy, Default, Eq, PartialEq, Hash, Ord, PartialOrd,
+    serde::Serialize, serde::Deserialize,
+)]
 pub struct Modifiers {
     pub ctrl: bool,
     pub alt: bool,
@@ -167,9 +173,10 @@ impl Modifiers {
 /// — every read call already centralizes through [`Bindings::pressed`] /
 /// [`Bindings::just_pressed`] / [`Bindings::matches_logical`], so the
 /// surface change would be small.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct KeyBind {
     pub key: KeyCode,
+    #[serde(default)]
     pub mods: Modifiers,
 }
 

@@ -5,6 +5,10 @@ pub mod agent_io;
 pub mod auth_client;
 pub mod chrome;
 pub mod goal_store;
+// Depends on ffxi-viewer-core (`Action`, `Bindings`, `Preset`), which is
+// only pulled in when the native-window feature is on.
+#[cfg(feature = "native-window")]
+pub mod keybinds_store;
 pub mod lobby_client;
 pub mod map_client;
 pub mod reactor;

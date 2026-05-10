@@ -185,6 +185,29 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
     add_hud_spawners(&mut app, OnEnter(AppPhase::InGame));
 
+    // Keybinds: load persisted preset+overrides from disk before plugins
+    // run. `ViewerCorePlugin::build` calls `init_resource::<Bindings>()`,
+    // which is a no-op when the resource is already present — so by
+    // inserting first we make the loaded bindings the source of truth.
+    // The `KeybindsStateRes` resource carries the on-disk path + the
+    // currently-loaded `PersistedKeybinds` for the `/keybinds` slash to
+    // mutate and re-persist.
+    let (loaded_bindings, persisted) = crate::keybinds_store::load_or_default();
+    let store = match crate::keybinds_store::KeybindsStore::default_path() {
+        Ok(p) => crate::keybinds_store::KeybindsStore::new(p),
+        // No XDG/HOME — write to a tmpdir-relative path so save() doesn't
+        // panic if the operator runs `/keybinds preset X`. They'll lose
+        // the file at next reboot but the in-memory swap still works.
+        Err(_) => crate::keybinds_store::KeybindsStore::new(
+            std::env::temp_dir().join("ffxi-keybinds.json"),
+        ),
+    };
+    app.insert_resource(loaded_bindings);
+    app.insert_resource(crate::keybinds_store::KeybindsStateRes {
+        store,
+        persisted,
+    });
+
     // Viewer plugins. `ViewerCorePlugin` registers ingest_system gated
     // on `resource_exists::<NativeSource>` (added by the bridge), so
     // its presence on the schedule from app build time is harmless.

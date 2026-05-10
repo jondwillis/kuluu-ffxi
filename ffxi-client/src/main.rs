@@ -12,6 +12,8 @@ use ffxi_client::state;
 // reached directly from main.rs's Play / native paths. Same re-import
 // trick `state` uses above.
 #[cfg(feature = "native-window")]
+use ffxi_client::keybinds_store;
+#[cfg(feature = "native-window")]
 use ffxi_client::wire_translate;
 #[cfg(feature = "relay")]
 use ffxi_client::relay;
