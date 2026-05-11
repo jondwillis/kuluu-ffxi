@@ -20,6 +20,7 @@ license.workspace = true
 # hand-rolled match table covering every variant.
 bevy = { workspace = true, features = ["serialize"] }
 ffxi-viewer-wire = { path = "../ffxi-viewer-wire" }
+ffxi-dat = { path = "../ffxi-dat" }
 serde = { workspace = true }
 
 # wasm32 has no syscall for wall-clock time; std::time::SystemTime::now()

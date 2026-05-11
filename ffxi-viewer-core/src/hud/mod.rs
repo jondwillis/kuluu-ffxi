@@ -19,6 +19,7 @@ pub mod agent_hud;
 pub mod chat_input;
 pub mod chat_panel;
 pub mod compass;
+pub mod death_prompt;
 pub mod diagnostics;
 pub mod dialog;
 pub mod llm_badge;
@@ -96,6 +97,7 @@ impl Plugin for HudPlugin {
                 zone_flash::update_zone_flash,
                 self_hud::update_self_hud,
                 status_ribbon::update_status_ribbon,
+                death_prompt::update_death_prompt_system,
             ),
         );
 
@@ -136,6 +138,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel>(
             zone_flash::spawn_zone_flash,
             self_hud::spawn_self_hud,
             status_ribbon::spawn_status_ribbon,
+            death_prompt::spawn_death_prompt,
         ),
     );
 }

@@ -27,6 +27,30 @@ pub fn ffxi_to_bevy(p: WireVec3) -> Vec3 {
     Vec3::new(p.x, p.z, -p.y)
 }
 
+/// Vertical distance from an entity's `transform.y` (the mesh center)
+/// down to the bottom of its visual mesh — i.e., its "feet."
+///
+/// Mirrors the meshes built by [`setup_world`]:
+///   - `Capsule3d::new(radius, half_length)` → bottom at center - (half_length + radius)
+///   - `Cuboid::new(_, side, _)` → bottom at center - side/2
+///
+/// Used by:
+///   - The navmesh gravity-snap (so feet sit on the navmesh, not the
+///     center sinks below it).
+///   - The target ring (so the ring sits at the entity's *ground*
+///     level, not at a hardcoded y=0).
+///
+/// If the mesh constructors in `setup_world` change, update here.
+#[inline]
+pub fn feet_offset(kind: EntityKind) -> f32 {
+    match kind {
+        EntityKind::Pc => 1.9 + 0.35, // pc capsule (radius=0.35, half_length=1.9)
+        EntityKind::Pet => 0.6 + 0.4, // pet capsule (radius=0.4, half_length=0.6)
+        EntityKind::Mob => 1.1 / 2.0, // mob cuboid (1.1 cube)
+        _ => 1.4 + 0.5,               // default capsule (radius=0.5, half_length=1.4)
+    }
+}
+
 /// Per-frame visual smoothing for *non-self* entity transforms.
 ///
 /// Self position is updated 60 Hz from `dispatch_movement_system`'s
@@ -169,12 +193,11 @@ pub fn setup_world(
         meshes.add(Cuboid::new(1.0, 0.12, 0.12)),
     ));
 
-    // Ground: a 200×200 plane at y=0 in muted dark slate.
-    commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(200.0, 200.0))),
-        MeshMaterial3d(materials.add(color_material(Color::srgb(0.08, 0.08, 0.10)))),
-        Transform::from_translation(Vec3::ZERO),
-    ));
+    // No placeholder ground plane: the navmesh wireframe overlay
+    // (`ffxi-client::view_native::navmesh_overlay`) provides terrain
+    // visualization, and the gravity-snap system anchors entities to
+    // navmesh height — both work better without the flat plane
+    // depth-fighting them.
 
     // A single directional light angled from above-right.
     commands.spawn((
@@ -214,7 +237,6 @@ pub fn sync_entities_system(
     }
 
     let snap = &state.snapshot;
-    let self_id: u32 = 0;
 
     // Set of entity ids that already own a nameplate. We mutate this as we
     // spawn new ones below so a single tick can't double-spawn for the
@@ -238,28 +260,45 @@ pub fn sync_entities_system(
         hp_by_id.insert(wire.id, wire.hp_pct);
         let world_pos = ffxi_to_bevy(wire.pos);
         let is_target = target.id == Some(wire.id);
-        // Mob coloring routes through `pick_mob_material` so claim status
-        // (white/red) overrides the default mob tint while keeping the
-        // existing target/aggro priority. The `is_aggro` arg is `false`
-        // here — `sync_aggro_system` runs after this system and rewrites
-        // the material for entities that should glow red.
-        let mat = match wire.kind {
-            EntityKind::Mob => pick_mob_material(
-                &mats,
-                wire.claim_id,
-                self_char_id,
-                is_target,
-                false,
-            )
-            .clone(),
-            _ if is_target => mats.target.clone(),
-            _ => pick_material(&mats, wire.kind, false),
+        let is_self = self_char_id != 0 && wire.id == self_char_id;
+        // Material selection:
+        //   - Self: dedicated `self_pc` material (camera-anchored capsule).
+        //   - Mobs: claim-aware (white = self-claim, red = other-claim) so
+        //     ownership is visible regardless of target state.
+        //   - Other PCs/NPCs/pets: target overrides everything else.
+        // `sync_aggro_system` runs after this and rewrites materials for
+        // entities that should glow red — that's why `is_aggro = false`
+        // here.
+        let mat = if is_self {
+            mats.self_pc.clone()
+        } else {
+            match wire.kind {
+                EntityKind::Mob => pick_mob_material(
+                    &mats,
+                    wire.claim_id,
+                    self_char_id,
+                    is_target,
+                    false,
+                )
+                .clone(),
+                _ if is_target => mats.target.clone(),
+                _ => pick_material(&mats, wire.kind, false),
+            }
         };
 
         match tracked.by_id.get(&wire.id).copied() {
             Some(existing) => {
                 if let Ok(mut t) = q_xform.get_mut(existing) {
-                    t.translation = apply_visual_smoothing(t.translation, world_pos);
+                    // Self snaps directly to the wire position because the
+                    // 60 Hz `dispatch_movement_system` already does its own
+                    // integration — extra smoothing here only adds input
+                    // lag. Other entities arrive at server tick rate, so
+                    // visual smoothing fills the gaps.
+                    t.translation = if is_self {
+                        world_pos
+                    } else {
+                        apply_visual_smoothing(t.translation, world_pos)
+                    };
                     t.rotation = heading_to_quat(wire.heading);
                 }
                 if let Ok(mut m) = q_mat.get_mut(existing) {
@@ -267,31 +306,42 @@ pub fn sync_entities_system(
                 }
             }
             None => {
-                let bevy_e = commands
-                    .spawn((
-                        WorldEntity {
-                            id: wire.id,
-                            act_index: wire.act_index,
-                            kind: wire.kind,
-                        },
-                        // Click-to-target (C4): wire entities are pickable
-                        // by the mesh raycast backend. `Pickable::default()`
-                        // = blocks lower entities + emits hover/click
-                        // events. The default is fine here.
-                        Pickable::default(),
-                        Mesh3d(pick_mesh(&mesh, wire.kind)),
-                        MeshMaterial3d(mat),
-                        Transform {
-                            translation: world_pos,
-                            rotation: heading_to_quat(wire.heading),
-                            ..default()
-                        },
-                    ))
-                    .id();
+                // Self capsule uses `Pickable::IGNORE` because it sits under
+                // the chase camera and would intercept every click aimed
+                // past it; click-to-target (C4) on self is intentionally
+                // unreachable.
+                let pickable = if is_self {
+                    Pickable::IGNORE
+                } else {
+                    Pickable::default()
+                };
+                let mut spawn = commands.spawn((
+                    WorldEntity {
+                        id: wire.id,
+                        act_index: wire.act_index,
+                        kind: wire.kind,
+                    },
+                    pickable,
+                    Mesh3d(pick_mesh(&mesh, wire.kind)),
+                    MeshMaterial3d(mat),
+                    Transform {
+                        translation: world_pos,
+                        rotation: heading_to_quat(wire.heading),
+                        ..default()
+                    },
+                ));
+                if is_self {
+                    spawn.insert(IsSelf);
+                }
+                let bevy_e = spawn.id();
                 tracked.by_id.insert(wire.id, bevy_e);
 
-                // Spawn HP bar for kinds that have HP.
-                if matches!(wire.kind, EntityKind::Mob | EntityKind::Pc | EntityKind::Pet) {
+                // HP bar for kinds that have HP — but not for self (the
+                // operator HUD already shows self HP/MP, and a floating
+                // bar under the chase camera is visual noise).
+                if !is_self
+                    && matches!(wire.kind, EntityKind::Mob | EntityKind::Pc | EntityKind::Pet)
+                {
                     let bar_color = hp_color(wire.hp_pct);
                     commands.spawn((
                         HpBar { owner_id: wire.id },
@@ -316,9 +366,14 @@ pub fn sync_entities_system(
         // Reconcile nameplate independently of the spawn-vs-update branch:
         // a PC that first appeared with `name = None` (common — names
         // resolve a frame after the entity does) must still get a label
-        // once the name fills in. Skip empty/missing names (untargetable
-        // scenery NPCs come through this way).
-        if let Some(name) = wire.name.as_deref().filter(|s| !s.is_empty()) {
+        // once the name fills in. For self, fall back to `snap.char_name`
+        // when the LOGIN-seed Entity has `name = None` (CHAR_PC hasn't
+        // arrived yet) so the nameplate doesn't briefly disappear after
+        // zone-in.
+        let name = wire.name.as_deref().or_else(|| {
+            if is_self { snap.char_name.as_deref() } else { None }
+        });
+        if let Some(name) = name.filter(|s| !s.is_empty()) {
             if !nameplated.contains(&wire.id) {
                 crate::nameplate::spawn_nameplate(
                     &mut commands,
@@ -332,66 +387,14 @@ pub fn sync_entities_system(
         }
     }
 
-    // Synthetic self at id=0.
-    seen.insert(self_id);
-    let self_pos = ffxi_to_bevy(snap.self_pos.pos);
-    let self_rot = heading_to_quat(snap.self_pos.heading);
-    match tracked.by_id.get(&self_id).copied() {
-        Some(existing) => {
-            if let Ok(mut t) = q_xform.get_mut(existing) {
-                // Self is dispatched at 60 Hz already (see
-                // `view_native::dispatch_movement_system`), so snap rather
-                // than lerp — extra smoothing here only adds input lag.
-                t.translation = self_pos;
-                t.rotation = self_rot;
-            }
-        }
-        None => {
-            let bevy_e = commands
-                .spawn((
-                    WorldEntity {
-                        id: self_id,
-                        act_index: 0,
-                        kind: EntityKind::Pc,
-                    },
-                    IsSelf,
-                    // Click-to-target (C4): the self capsule sits under the
-                    // chase camera and would otherwise reliably intercept
-                    // every click aimed past it. `IGNORE` removes it from
-                    // the picking pipeline entirely — the operator can
-                    // never click-target themselves, which matches the
-                    // resolve-time guard in `picking::resolve_click_target`
-                    // (id == 0 → Clear) but saves a raycast hit-test.
-                    Pickable::IGNORE,
-                    Mesh3d(mesh.pc.clone()),
-                    MeshMaterial3d(mats.self_pc.clone()),
-                    Transform {
-                        translation: self_pos,
-                        rotation: self_rot,
-                        ..default()
-                    },
-                ))
-                .id();
-            tracked.by_id.insert(self_id, bevy_e);
-        }
-    }
-
-    // Self nameplate reconciliation: same pattern as wire entities.
-    // `char_name` is `None` on the very first frame (before the lobby
-    // reply lands), so the first-spawn-only path used to permanently
-    // miss it.
-    if let Some(name) = snap.char_name.as_deref().filter(|s| !s.is_empty()) {
-        if !nameplated.contains(&self_id) {
-            crate::nameplate::spawn_nameplate(
-                &mut commands,
-                self_id,
-                EntityKind::Pc,
-                name,
-                nameplate_color(EntityKind::Pc),
-            );
-            nameplated.insert(self_id);
-        }
-    }
+    // Self is no longer a synthetic id=0 entity — it now flows through
+    // the main loop above as the entity with `wire.id == self_char_id`
+    // (seeded from `0x00A LOGIN`'s `PosHead` in `session.rs` before any
+    // CHAR_PC arrives). Before this refactor, the synthetic id=0 self
+    // capsule lagged the real server-authoritative position on every
+    // zone-in because `state.self_pos` updated only from `Move`
+    // commands, not from CHAR_PC for self — landing the camera "in the
+    // sky / strange place" on zone transition.
 
     // Despawn entities no longer in the snapshot.
     let stale: Vec<u32> = tracked
@@ -435,7 +438,13 @@ pub fn sync_aggro_system(
     state: Res<SceneState>,
     target: Res<Target>,
     mats: Res<EntityMaterials>,
-    self_q: Query<&Transform, (With<IsSelf>, Without<WorldEntity>)>,
+    // Drop the `Without<WorldEntity>` filter that used to live here: the
+    // synthetic-id=0 self capsule has been removed, and the real self
+    // entity (spawned by `sync_entities_system` from the `id ==
+    // self_char_id` wire entry) carries *both* `IsSelf` and `WorldEntity`.
+    // The disjoint mutable borrow in `q` is still safe — that query is
+    // `Without<IsSelf>`, so the two queries never overlap.
+    self_q: Query<&Transform, With<IsSelf>>,
     mut q: Query<
         (
             Entity,

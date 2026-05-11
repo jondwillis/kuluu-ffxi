@@ -11,6 +11,21 @@
 //! - `server/src/map/packets/entity_update.cpp::GP_SERV_CHAR_NPC`
 //! - `server/src/map/packets/s2c/0x00b_logout.h`
 
+/// Animation byte values for [`PosHead::server_status`] (which despite the
+/// field name carries `PChar->animation`, see field doc). Constants mirror
+/// `vendor/server/src/map/entities/baseentity.h::ANIMATIONTYPE`.
+pub mod animation {
+    /// Default — no special animation.
+    pub const NONE: u8 = 0;
+    /// Auto-attack swing animation.
+    pub const ATTACK: u8 = 1;
+    /// `/heal` resting pose. Set/cleared by `EFFECT_HEALING`'s Lua
+    /// `onEffectGain`/`onEffectLose` (`vendor/server/scripts/effects/healing.lua`).
+    pub const HEALING: u8 = 33;
+    /// `/sit` (cross-legged ground sit).
+    pub const SIT: u8 = 47;
+}
+
 use crate::framing::SubPacket;
 
 /// Position-and-status head shared by `GP_SERV_CHAR_PC` (0x00D) and
@@ -40,7 +55,17 @@ pub struct PosHead {
     pub speed_base: u8,
     /// HP percentage 0..=100.
     pub hpp: u8,
-    /// Server-side status enum.
+    /// **Animation byte** at packet offset 0x1F (= body[27]). LSB's struct
+    /// field at this offset is named `server_status` (see
+    /// `vendor/server/src/map/packets/char_update.cpp:183`,
+    /// `entity_update.cpp:209`), but the actual write at
+    /// `char_update.cpp:284` assigns `PChar->animation` to this slot —
+    /// `packet->server_status = PChar->animation`. The status-type enum
+    /// goes a byte later, in the `flags1` slot we read at body[28..32].
+    /// Naming kept as `server_status` for historical compatibility, but
+    /// semantic is animation (e.g. `ANIMATION_HEALING = 33` for /heal,
+    /// `ANIMATION_NONE = 0` otherwise). Only authoritative when
+    /// `body[6] & UPDATE_HP (0x04)` is set.
     pub server_status: u8,
     pub flags1: u32,
     pub flags2: u32,
@@ -134,42 +159,81 @@ impl PosHead {
 
     /// Extract the NUL-terminated ASCII name from a CHAR_PC or CHAR_NPC body.
     ///
-    /// `CHAR_PC` (0x00D): name lives at `body[body.len() - 16..]`. LSB's
-    /// `GP_SERV_CHAR_PC` ends with `uint8_t name[16]`
-    /// (server `char_update.cpp:203`), so the trailing-16 trick is correct
-    /// regardless of which optional fields preceded it.
+    /// Both opcodes share the `GP_SERV_POS_HEAD` prefix and reuse byte
+    /// `body[6]` (packet offset 0x0A) as a bit-mask: `SendFlg` for CHAR_PC
+    /// and the cumulative `updatemask` for CHAR_NPC. LSB defines
+    /// `SendFlg.Name : 1` at bit 3 (= 0x08), and `entity_update.cpp:278`
+    /// ORs the same byte with `updatemask`, so the *same bit* (0x08)
+    /// signals "name present" for both packets.
     ///
-    /// `CHAR_NPC` (0x00E): name lives at fixed body offset 48 (LSB writes
-    /// at packet absolute 0x34 minus the 4-byte sub-packet header — see
-    /// `entity_update.cpp:371`). Only present when the packet was emitted
-    /// with `UPDATE_NAME` set; we infer presence by body length ≥ 64.
+    /// Layout when the Name bit is set (server references):
+    /// - `CHAR_PC` (`char_update.cpp:202-208, 412-421`): name lives at
+    ///   struct offset `0x5A` — body offset `0x56` after stripping the
+    ///   4-byte sub-packet header (`id+size+sync`). LSB writes
+    ///   `std::memcpy(packet->name, ..., min(16, len))` and recomputes
+    ///   `packet->size` to fit the actual name. The slot runs from
+    ///   body offset `0x56` to the end of the body.
+    /// - `CHAR_NPC` (`entity_update.cpp:361-435`): name at body offset
+    ///   `0x30` (packet `0x34`), max 16 bytes. Renamed entities with
+    ///   `targid < 1024` write a `0x01` marker at `0x30` and shift the
+    ///   name to `0x31` (`entity_update.cpp:575-578`), so callers must
+    ///   detect that case.
     ///
-    /// Returns None for any other opcode, missing-name layouts, or non-ASCII
-    /// content.
+    /// Returns `None` for any other opcode, when the Name bit is clear,
+    /// or when the slot fails ASCII validation.
     pub fn try_extract_name(opcode: u16, body: &[u8]) -> Option<String> {
         use crate::map::s2c;
-        let candidate: &[u8] = if opcode == s2c::CHAR_PC {
-            if body.len() < Self::SIZE + 16 {
+        // SendFlg / updatemask byte. Both packets reuse body[6]; the Name
+        // bit lives at 0x08 in either context.
+        const NAME_FLAG: u8 = 0x08;
+        if body.len() < 7 || body[6] & NAME_FLAG == 0 {
+            return None;
+        }
+        let slot: &[u8] = if opcode == s2c::CHAR_PC {
+            // `GP_SERV_CHAR_PC.name` lives at struct offset 0x5A — that's
+            // `4 (id+size+sync) + 44 (PosHead w/ BtTargetID) + 46 (PC tail
+            // through GrapIDTbl[9])`. Body offset = struct - 4 = 0x56.
+            // Verified empirically via debug://name_misses on a live
+            // session: a CHAR_PC for "Cleric" placed `43 6c 65 72 69 63`
+            // at body[0x56..0x5C]. An earlier off-by-4 analysis read at
+            // 0x5A and only saw the last two characters, which fell
+            // below the 3-char floor.
+            const NAME_START: usize = 0x56;
+            if body.len() <= NAME_START {
                 return None;
             }
-            &body[body.len() - 16..]
+            &body[NAME_START..]
         } else if opcode == s2c::CHAR_NPC {
-            if body.len() < 64 {
+            // Standard offset is 0x30; the renamed-mob low-targid variant
+            // uses `0x01` as a marker at 0x30 and shifts the name by one
+            // byte. Real NPC names start at 0x20 or higher, so a `0x01`
+            // first byte is unambiguously the marker.
+            const STANDARD_START: usize = 0x30;
+            const RENAMED_START: usize = 0x31;
+            if body.len() <= STANDARD_START {
                 return None;
             }
-            &body[48..64]
+            let start = if body[STANDARD_START] == 0x01 {
+                RENAMED_START
+            } else {
+                STANDARD_START
+            };
+            if body.len() <= start {
+                return None;
+            }
+            let end = body.len().min(start + 16);
+            &body[start..end]
         } else {
             return None;
         };
-        let n = candidate.iter().position(|&b| b == 0).unwrap_or(candidate.len());
-        // 3-char floor: filters false positives where the body[48..64] window
-        // catches a single non-NUL byte (e.g., a flag value of 0x6B = 'k')
-        // followed by NUL when UPDATE_NAME is *not* set. Real FFXI NPC names
-        // are 3+ chars; a 2-char tradeoff loses essentially nothing.
+        let n = slot.iter().position(|&b| b == 0).unwrap_or(slot.len());
+        // 3-char floor: filters false positives — real names are 3+ chars
+        // and the slot can sometimes start with a stray flag byte if a
+        // future LSB version reshapes the layout.
         if n < 3 {
             return None;
         }
-        let name_bytes = &candidate[..n];
+        let name_bytes = &slot[..n];
         if !name_bytes.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
             return None;
         }
@@ -198,6 +262,14 @@ pub struct ServerLogin {
     pub unique_no: u32,
     pub act_index: u16,
     pub zone_no: u16,
+    /// Full `GP_SERV_POS_HEAD` carried in body[0..44]. The position
+    /// fields here are the server-authoritative spawn coordinates on
+    /// every zone-in (LSB sets `packet.PosHead = { .x = loc.p.x,
+    /// .z = loc.p.y, .y = loc.p.z, ... }` — see
+    /// `server/src/map/packets/s2c/0x00a_login.cpp`). Surface them so
+    /// the client can seed its self-entity from the very first packet
+    /// of zone-in without waiting for a CHAR_PC echo.
+    pub pos_head: PosHead,
 }
 
 impl ServerLogin {
@@ -215,10 +287,12 @@ impl ServerLogin {
         // 44-byte head plus ZoneNo — Phoenix sends `sizeof(PacketData)`
         // every time. So we read at the fixed offset.
         let zone_u32 = u32::from_le_bytes(body[44..48].try_into().unwrap());
+        let pos_head = PosHead::decode(&body[..PosHead::SIZE_WITH_BT_TARGET])?;
         Ok(Self {
-            unique_no: u32::from_le_bytes(body[0..4].try_into().unwrap()),
-            act_index: u16::from_le_bytes(body[4..6].try_into().unwrap()),
+            unique_no: pos_head.unique_no,
+            act_index: pos_head.act_index,
             zone_no: zone_u32 as u16,
+            pos_head,
         })
     }
 }
@@ -415,6 +489,187 @@ pub fn decode_logout(sub: &SubPacket<'_>) -> Result<ServerLogout, DecodeError> {
 
 pub fn decode_login(sub: &SubPacket<'_>) -> Result<ServerLogin, DecodeError> {
     ServerLogin::decode(sub.data)
+}
+
+/// Read a NUL-terminated ASCII name from a packet slot. Mirrors the
+/// validation in `PosHead::try_extract_name`: at least 3 printable bytes
+/// (0x20..=0x7E) before the first NUL. Returns `None` for empty, truncated,
+/// or non-ASCII content.
+fn read_name_slot(slot: &[u8]) -> Option<String> {
+    let n = slot.iter().position(|&b| b == 0).unwrap_or(slot.len());
+    if n < 3 {
+        return None;
+    }
+    let bytes = &slot[..n];
+    if !bytes.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+        return None;
+    }
+    Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// `CCharSyncPacket` — one of two packet variants that share opcode 0x067.
+/// Carries PC status sync (level-sync icon, mount data, main-job slot);
+/// **no position and no name**.
+///
+/// Identified by the sub-type byte at body[0] = 0x02. Server reference:
+/// `vendor/server/src/map/packets/char_sync.cpp:28-62`.
+///
+/// Wire layout (body offsets = LSB packet offsets minus the 4-byte
+/// sub-packet header that `SubPacket::data` already strips):
+/// ```text
+///   [0]      SubType (0x02)
+///   [1]      0x09
+///   [2..4]   PChar->targid (act_index)
+///   [4..8]   PChar->id
+///   [8..]    Status / mount fields — not surfaced by this decoder
+/// ```
+///
+/// We decode the identifying fields for completeness; the rest is
+/// status-sync data the client doesn't currently track.
+#[derive(Debug, Clone, Copy)]
+pub struct CharSync {
+    pub targid: u16,
+    pub id: u32,
+}
+
+impl CharSync {
+    /// Sub-type byte value at body[0] that identifies this packet variant
+    /// within opcode 0x067.
+    pub const SUB_TYPE: u8 = 0x02;
+    pub const SIZE: usize = 8;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        Ok(Self {
+            targid: u16::from_le_bytes(body[2..4].try_into().unwrap()),
+            id: u32::from_le_bytes(body[4..8].try_into().unwrap()),
+        })
+    }
+}
+
+/// `CEntitySetNamePacket` — the other 0x067 variant. LSB sends this to
+/// name **trusts** (on spawn), fellows, and pankration entities. The
+/// distinguishing feature: the entity may not have a corresponding name
+/// in CHAR_NPC, so this packet is the only authoritative name source for
+/// those entity types.
+///
+/// Identified by sub-type byte body[0] = 0x03. Server reference:
+/// `vendor/server/src/map/packets/entity_set_name.cpp:30-54`.
+///
+/// Wire layout:
+/// ```text
+///   [0]       SubType (0x03)
+///   [1]       0x05
+///   [2..4]    PEntity->targid
+///   [4..8]    PEntity->id
+///   [8..10]   PMaster->targid (zero for non-trust entities)
+///   [0xC]     0x04 — opaque flag
+///   [0x14..]  Entity name (NUL-terminated, ASCII, capped by sub.size)
+/// ```
+#[derive(Debug, Clone)]
+pub struct EntitySetName {
+    pub targid: u16,
+    pub id: u32,
+    pub master_targid: u16,
+    pub name: Option<String>,
+}
+
+impl EntitySetName {
+    pub const SUB_TYPE: u8 = 0x03;
+    /// Minimum body length to safely read the name slot (offset 0x14).
+    pub const SIZE: usize = 0x14;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        let name = read_name_slot(&body[0x14..]);
+        Ok(Self {
+            targid: u16::from_le_bytes(body[2..4].try_into().unwrap()),
+            id: u32::from_le_bytes(body[4..8].try_into().unwrap()),
+            master_targid: u16::from_le_bytes(body[8..10].try_into().unwrap()),
+            name,
+        })
+    }
+}
+
+/// `CPetSyncPacket` — opcode 0x068. The server emits this for the
+/// **owner** of a pet/avatar/automaton/wyvern to sync the pet's
+/// HP%/MP%/TP/target/name. The pet itself separately has a CHAR_NPC
+/// stream for position; this packet enriches that record.
+///
+/// Server reference: `vendor/server/src/map/packets/pet_sync.cpp:34-59`.
+///
+/// Wire layout:
+/// ```text
+///   [0]       Bitfield, `0x04` set
+///   [2..4]    Owner targid (PChar->targid)
+///   [4..8]    Owner id (PChar->id)
+///   [8..10]   Pet targid (PChar->PPet->targid)  — absent on despawn
+///   [0xA]     Pet HP%
+///   [0xB]     Pet MP%
+///   [0xC..0xE] Pet TP
+///   [0x10..0x14] Pet's battle-target id (only set during ANIMATION_ATTACK)
+///   [0x14..]  Pet name (NUL-terminated)
+/// ```
+///
+/// **Despawn variant**: when the owner's pet is gone, LSB sends just the
+/// header (sub.size = 0x1C → body length 0x18). All pet fields after
+/// `owner_id` are absent. The decoder returns the owner fields and
+/// `pet_targid = 0`, name = None — the caller treats that as "owner has
+/// no active pet right now".
+#[derive(Debug, Clone)]
+pub struct PetSync {
+    pub owner_targid: u16,
+    pub owner_id: u32,
+    pub pet_targid: u16,
+    pub hp_pct: u8,
+    pub mp_pct: u8,
+    pub tp: u16,
+    pub bt_target_id: u32,
+    pub name: Option<String>,
+}
+
+impl PetSync {
+    /// Body length when the despawn variant is on the wire — only the
+    /// owner header is present. Anything below this is truncation.
+    pub const DESPAWN_SIZE: usize = 8;
+    /// Body length once the full pet header is present (still no name).
+    pub const FULL_HEADER_SIZE: usize = 0x14;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::DESPAWN_SIZE {
+            return Err(DecodeError::Truncated(Self::DESPAWN_SIZE, body.len()));
+        }
+        let owner_targid = u16::from_le_bytes(body[2..4].try_into().unwrap());
+        let owner_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        if body.len() < Self::FULL_HEADER_SIZE {
+            // Despawn variant — no pet fields present.
+            return Ok(Self {
+                owner_targid,
+                owner_id,
+                pet_targid: 0,
+                hp_pct: 0,
+                mp_pct: 0,
+                tp: 0,
+                bt_target_id: 0,
+                name: None,
+            });
+        }
+        let name = read_name_slot(&body[0x14..]);
+        Ok(Self {
+            owner_targid,
+            owner_id,
+            pet_targid: u16::from_le_bytes(body[8..10].try_into().unwrap()),
+            hp_pct: body[0x0A],
+            mp_pct: body[0x0B],
+            tp: u16::from_le_bytes(body[0x0C..0x0E].try_into().unwrap()),
+            bt_target_id: u32::from_le_bytes(body[0x10..0x14].try_into().unwrap()),
+            name,
+        })
+    }
 }
 
 /// `GP_SERV_COMMAND_ITEM_MAX` (0x01C) — container size table. Phoenix
@@ -625,6 +880,8 @@ mod tests {
         assert_eq!(h.x, 123.5);
         assert_eq!(h.z, -12.0);
         assert_eq!(h.y, 7.25);
+        assert_eq!(h.speed, 25);
+        assert_eq!(h.speed_base, 25);
         assert_eq!(h.hpp, 100);
     }
 
@@ -651,6 +908,27 @@ mod tests {
             ServerLogin::decode(&buf),
             Err(DecodeError::Truncated(48, _))
         ));
+    }
+
+    #[test]
+    fn server_login_carries_pos_head_for_spawn_seed() {
+        let mut buf = vec![0u8; ServerLogin::SIZE];
+        buf[0..4].copy_from_slice(&0x0123_4567u32.to_le_bytes()); // UniqueNo
+        buf[4..6].copy_from_slice(&0x00FFu16.to_le_bytes()); // ActIndex
+        buf[7] = 96; // dir
+        buf[8..12].copy_from_slice(&(-115.5f32).to_le_bytes()); // x
+        buf[12..16].copy_from_slice(&(7.25f32).to_le_bytes()); // z (height)
+        buf[16..20].copy_from_slice(&(280.0f32).to_le_bytes()); // y (north)
+        buf[24] = 40; // speed
+        buf[25] = 40; // speed_base
+        buf[44..48].copy_from_slice(&230u32.to_le_bytes()); // ZoneNo
+        let l = ServerLogin::decode(&buf).unwrap();
+        assert_eq!(l.pos_head.x, -115.5);
+        assert_eq!(l.pos_head.z, 7.25);
+        assert_eq!(l.pos_head.y, 280.0);
+        assert_eq!(l.pos_head.dir, 96);
+        assert_eq!(l.pos_head.speed, 40);
+        assert_eq!(l.pos_head.speed_base, 40);
     }
 
     #[test]
@@ -936,5 +1214,171 @@ mod tests {
             ItemAttr::decode(&buf),
             Err(DecodeError::Truncated(37, _))
         ));
+    }
+
+    #[test]
+    fn try_extract_name_recovers_char_npc_with_update_name() {
+        use crate::map::s2c;
+        // CHAR_NPC body with UPDATE_NAME set (body[6] & 0x08) and the
+        // name slot at fixed offset 0x30.
+        let mut buf = vec![0u8; 64];
+        buf[6] = 0x08; // updatemask: UPDATE_NAME
+        buf[0x30..0x30 + 9].copy_from_slice(b"Sigli-Sea");
+        let name = PosHead::try_extract_name(s2c::CHAR_NPC, &buf);
+        assert_eq!(name.as_deref(), Some("Sigli-Sea"));
+    }
+
+    #[test]
+    fn try_extract_name_returns_none_without_update_name() {
+        use crate::map::s2c;
+        // body[6] = 0 → Name bit clear → no name even if name bytes
+        // happen to sit in the slot.
+        let mut buf = vec![0u8; 64];
+        buf[0x30..0x30 + 5].copy_from_slice(b"Junk!");
+        assert!(PosHead::try_extract_name(s2c::CHAR_NPC, &buf).is_none());
+    }
+
+    #[test]
+    fn try_extract_name_char_npc_renamed_low_targid_shift() {
+        use crate::map::s2c;
+        // Renamed entity with targid < 1024: server writes a 0x01 marker
+        // at body[0x30] and shifts the name to body[0x31].
+        // Server reference: entity_update.cpp:575-578.
+        let mut buf = vec![0u8; 68];
+        buf[6] = 0x08; // UPDATE_NAME
+        buf[0x30] = 0x01; // marker
+        buf[0x31..0x31 + 12].copy_from_slice(b"Big Bad Bee\0");
+        let name = PosHead::try_extract_name(s2c::CHAR_NPC, &buf);
+        assert_eq!(name.as_deref(), Some("Big Bad Bee"));
+    }
+
+    #[test]
+    fn try_extract_name_char_pc_uses_fixed_offset_with_send_flag() {
+        use crate::map::s2c;
+        // CHAR_PC: SendFlg.Name bit set, name at body offset 0x56.
+        // Offset verified empirically against a live LSB packet where the
+        // PC was named "Cleric" — see `debug://name_misses` capture.
+        let mut buf = vec![0u8; 0x60];
+        buf[6] = 0x08; // SendFlg.Name
+        buf[0x56..0x56 + 6].copy_from_slice(b"Cleric");
+        let name = PosHead::try_extract_name(s2c::CHAR_PC, &buf);
+        assert_eq!(name.as_deref(), Some("Cleric"));
+    }
+
+    #[test]
+    fn try_extract_name_char_pc_rejects_when_send_flag_clear() {
+        use crate::map::s2c;
+        // Bogus byte at body offset 0x56 would have been read by the old
+        // trailing-16 trick; with SendFlg.Name clear, we now return None.
+        let mut buf = vec![0u8; 0x60];
+        buf[6] = 0x01; // Position only — Name not set
+        buf[0x56..0x56 + 6].copy_from_slice(b"Junked");
+        assert!(PosHead::try_extract_name(s2c::CHAR_PC, &buf).is_none());
+    }
+
+    #[test]
+    fn entity_set_name_decodes_trust_name() {
+        // Fabricate the LSB layout for CEntitySetNamePacket (0x067 sub-type
+        // 0x03). Body offsets = LSB offsets minus the 4-byte sub-packet
+        // header.
+        let mut buf = vec![0u8; 0x28];
+        buf[0] = 0x03; // sub-type
+        buf[1] = 0x05;
+        buf[2..4].copy_from_slice(&0x07F2u16.to_le_bytes()); // targid
+        buf[4..8].copy_from_slice(&0x0123_45F2u32.to_le_bytes()); // id
+        buf[8..10].copy_from_slice(&0x0042u16.to_le_bytes()); // master targid
+        buf[0x14..0x14 + 13].copy_from_slice(b"Mihli Aliapoh");
+
+        let ent = EntitySetName::decode(&buf).unwrap();
+        assert_eq!(ent.targid, 0x07F2);
+        assert_eq!(ent.id, 0x0123_45F2);
+        assert_eq!(ent.master_targid, 0x0042);
+        assert_eq!(ent.name.as_deref(), Some("Mihli Aliapoh"));
+    }
+
+    #[test]
+    fn entity_set_name_short_name_rejected() {
+        // body[0x14..] = "Mi\0" — only 2 chars before NUL; below the
+        // 3-char floor we use to filter false positives.
+        let mut buf = vec![0u8; 0x28];
+        buf[0] = 0x03;
+        buf[4..8].copy_from_slice(&0x42u32.to_le_bytes());
+        buf[0x14..0x14 + 2].copy_from_slice(b"Mi");
+
+        let ent = EntitySetName::decode(&buf).unwrap();
+        assert!(ent.name.is_none());
+    }
+
+    #[test]
+    fn entity_set_name_truncated_errors() {
+        let buf = vec![0u8; EntitySetName::SIZE - 1];
+        assert!(matches!(
+            EntitySetName::decode(&buf),
+            Err(DecodeError::Truncated(_, _))
+        ));
+    }
+
+    #[test]
+    fn pet_sync_decodes_full_pet_record() {
+        // Active-pet variant: full pet header + name.
+        let mut buf = vec![0u8; 0x28];
+        buf[0] = 0x04; // message-type bit
+        buf[2..4].copy_from_slice(&0x0001u16.to_le_bytes()); // owner targid
+        buf[4..8].copy_from_slice(&0x0010_0001u32.to_le_bytes()); // owner id
+        buf[8..10].copy_from_slice(&0x07A5u16.to_le_bytes()); // pet targid
+        buf[0x0A] = 87; // HP%
+        buf[0x0B] = 60; // MP%
+        buf[0x0C..0x0E].copy_from_slice(&1234u16.to_le_bytes()); // TP
+        buf[0x10..0x14].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // bt target
+        buf[0x14..0x14 + 11].copy_from_slice(b"Crab Family");
+
+        let pet = PetSync::decode(&buf).unwrap();
+        assert_eq!(pet.owner_targid, 0x0001);
+        assert_eq!(pet.owner_id, 0x0010_0001);
+        assert_eq!(pet.pet_targid, 0x07A5);
+        assert_eq!(pet.hp_pct, 87);
+        assert_eq!(pet.mp_pct, 60);
+        assert_eq!(pet.tp, 1234);
+        assert_eq!(pet.bt_target_id, 0xDEAD_BEEF);
+        assert_eq!(pet.name.as_deref(), Some("Crab Family"));
+    }
+
+    #[test]
+    fn pet_sync_despawn_variant_skips_pet_fields() {
+        // Despawn: only the owner header is present (sub.size 0x1C → body
+        // 0x18). All pet fields should read as zeros / None — no panic.
+        let mut buf = vec![0u8; 0x18];
+        buf[0] = 0x04;
+        buf[2..4].copy_from_slice(&0x0001u16.to_le_bytes());
+        buf[4..8].copy_from_slice(&0x0010_0001u32.to_le_bytes());
+
+        let pet = PetSync::decode(&buf).unwrap();
+        assert_eq!(pet.owner_targid, 0x0001);
+        assert_eq!(pet.owner_id, 0x0010_0001);
+        assert_eq!(pet.pet_targid, 0);
+        assert_eq!(pet.hp_pct, 0);
+        assert!(pet.name.is_none());
+    }
+
+    #[test]
+    fn pet_sync_truncated_below_owner_header_errors() {
+        let buf = vec![0u8; PetSync::DESPAWN_SIZE - 1];
+        assert!(matches!(
+            PetSync::decode(&buf),
+            Err(DecodeError::Truncated(_, _))
+        ));
+    }
+
+    #[test]
+    fn char_sync_decodes_ids() {
+        let mut buf = vec![0u8; CharSync::SIZE];
+        buf[0] = 0x02;
+        buf[1] = 0x09;
+        buf[2..4].copy_from_slice(&0x07F0u16.to_le_bytes());
+        buf[4..8].copy_from_slice(&0x0123_4567u32.to_le_bytes());
+
+        let sync = CharSync::decode(&buf).unwrap();
+        assert_eq!(sync.targid, 0x07F0);
+        assert_eq!(sync.id, 0x0123_4567);
     }
 }

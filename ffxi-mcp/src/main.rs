@@ -22,6 +22,8 @@
 //! Diagnostics. Adding more is additive: a tool is a method; a
 //! resource is a `match` arm in `read_resource`. No protocol churn.
 
+mod attach;
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -702,6 +704,12 @@ impl ServerHandler for FfxiServer {
                 "application/json",
                 "Structured nearest-N entities (id, act_index, kind, name, distance, hp_pct, claimed_by, pos) plus self pos+heading+zone. Use this when scene://current's prose lacks the IDs/coords you need to engage/follow/path_to.",
             ),
+            mk(
+                "debug://name_misses",
+                "name_misses",
+                "application/json",
+                "Diagnostic ring buffer (cap 64) of CHAR_PC/CHAR_NPC packets where `PosHead::try_extract_name` returned None. Each entry has opcode, unique_no, act_index, the SendFlg byte (body[6]), body length, hex dump of the leading 96 bytes, and a classification of the failure reason. Use this to audit why specific entities show as `?` in scene://entities.",
+            ),
         ];
         Ok(result)
     }
@@ -777,17 +785,44 @@ async fn read_resource(
         }
         "scene://entities" => serde_json::to_string_pretty(&entities_view(state))
             .map_err(|e| format!("serialize entities: {e}")),
+        "debug://name_misses" => serde_json::to_string_pretty(&name_misses_view(state))
+            .map_err(|e| format!("serialize name_misses: {e}")),
         "goal://current" => {
-            let store = goal_store.lock().await;
-            match store.load() {
-                Ok(Some(g)) => serde_json::to_string_pretty(&serde_json::json!({
+            // Prefer the in-memory live mirror over the disk-backed
+            // `goal_store`. In attach mode no producer is writing
+            // `goal_store` (the running native client has its own
+            // session/reactor — no MCP-side supervisor). The disk file
+            // can be stale by days from a previous headless session,
+            // while `state.current_goal` is folded live from
+            // `AgentEvent::ReactorGoalChanged` (see state.rs apply_event).
+            //
+            // Fall back to disk only when the live mirror is empty,
+            // which is the headless cross-process-restart case the
+            // disk file was actually designed for.
+            use ffxi_client::state::ReactorGoalSnapshot;
+            match &state.current_goal {
+                Some(ReactorGoalSnapshot::Idle) | None => {
+                    // Live mirror says idle (or has no signal yet). Fall
+                    // back to disk for the headless-restart case.
+                    let store = goal_store.lock().await;
+                    match store.load() {
+                        Ok(Some(g)) => serde_json::to_string_pretty(&serde_json::json!({
+                            "goal": "active",
+                            "command": g.command,
+                            "set_at_unix": g.set_at_unix,
+                            "source": "disk",
+                        }))
+                        .map_err(|e| format!("serialize goal: {e}")),
+                        Ok(None) => Ok("{\n  \"goal\": \"idle\"\n}".to_string()),
+                        Err(e) => Err(format!("read goal store: {e}")),
+                    }
+                }
+                Some(snap) => serde_json::to_string_pretty(&serde_json::json!({
                     "goal": "active",
-                    "command": g.command,
-                    "set_at_unix": g.set_at_unix,
+                    "snapshot": snap,
+                    "source": "live",
                 }))
                 .map_err(|e| format!("serialize goal: {e}")),
-                Ok(None) => Ok("{\n  \"goal\": \"idle\"\n}".to_string()),
-                Err(e) => Err(format!("read goal store: {e}")),
             }
         }
         other => Err(format!("unknown resource: {other}")),
@@ -804,11 +839,22 @@ const SCENE_ENTITIES_CAP: usize = 30;
 /// matches `next_target_by_distance` so the agent's "what's nearest"
 /// is consistent with the renderers' Tab cycle.
 fn entities_view(state: &SessionState) -> serde_json::Value {
-    use ffxi_client::state::Vec3;
-    let from: Vec3 = state.self_pos.pos;
+    // Self position is now derived from the entity list — `self_position()`
+    // reads the entry whose `id == state.char_id`. Returns origin before
+    // LOGIN seeds the self entity; the distances-from-origin in that
+    // brief window are still valid for nearest-N sorting.
+    let self_pos_p = state.self_position().unwrap_or_default();
+    let from = self_pos_p.pos;
+    // Exclude self from the nearby-entities list — the agent already
+    // gets `self.pos` via the dedicated `self` field, and "nearest to me"
+    // by definition doesn't include me. Pre-Stage-5 the self entity
+    // simply wasn't in `state.entities` (it lived on `state.self_pos`),
+    // so callers expect this view to be other-entities-only.
+    let self_id = state.char_id;
     let mut scored: Vec<(&ffxi_client::state::Entity, f32)> = state
         .entities
         .iter()
+        .filter(|e| Some(e.id) != self_id)
         .map(|e| {
             let dx = e.pos.x - from.x;
             let dy = e.pos.y - from.y;
@@ -836,13 +882,56 @@ fn entities_view(state: &SessionState) -> serde_json::Value {
     serde_json::json!({
         "self": {
             "pos": { "x": from.x, "y": from.y, "z": from.z },
-            "heading": state.self_pos.heading,
+            "heading": self_pos_p.heading,
             "zone_id": state.zone_id,
             "char_id": state.char_id,
         },
         "entities": entities,
-        "total_known": state.entities.len(),
+        "total_known": state.entities.iter().filter(|e| Some(e.id) != self_id).count(),
         "cap": SCENE_ENTITIES_CAP,
+    })
+}
+
+/// Build the `debug://name_misses` payload — surfaces the per-entity raw
+/// packet samples captured when `PosHead::try_extract_name` returned
+/// `None`. Used for forensic debugging of "?" entities without rebuilding
+/// the client. Returns an empty `entries` array when the ring buffer
+/// is empty.
+///
+/// Each entry carries enough context to audit the packet byte-by-byte:
+/// the SendFlg byte (`body[6]`), the body length, a hex dump of the
+/// leading 96 bytes (covers the CHAR_PC name slot at `body[0x5A]` and
+/// the CHAR_NPC slot at `body[0x30]`), and a classification of *why*
+/// the extraction failed.
+fn name_misses_view(state: &SessionState) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = state
+        .name_misses
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "opcode": format!("0x{:03x}", m.opcode),
+                "unique_no": format!("0x{:08x}", m.unique_no),
+                "act_index": format!("0x{:04x}", m.act_index),
+                "send_flag": format!("0x{:02x}", m.send_flag),
+                "name_bit_set": m.send_flag & 0x08 != 0,
+                "body_len": m.body_len,
+                "body_hex": m.body_hex,
+                "miss_kind": m.miss_kind,
+                "at_unix_ms": m.at_unix_ms,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "entries": entries,
+        "count": state.name_misses.len(),
+        "notes": "Ring buffer of the most recent name-extraction misses. \
+                  `miss_kind: name_bit_clear` means LSB did not include the name \
+                  this packet (expected when the spawn was missed); \
+                  `name_bit_set_extraction_failed` means LSB sent UPDATE_NAME \
+                  but the decoder rejected the slot — that's the signature of \
+                  a remaining offset or validation bug. \
+                  Body slot offsets: CHAR_PC = body[0x5A..], CHAR_NPC = body[0x30..] \
+                  (or body[0x31..] if body[0x30] == 0x01, the renamed-low-targid marker).",
     })
 }
 
@@ -857,6 +946,8 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::PositionChanged { .. } => "position_changed",
         AgentEvent::EntityUpserted { .. } => "entity_upserted",
         AgentEvent::EntityRemoved { .. } => "entity_removed",
+        AgentEvent::EntityPatched { .. } => "entity_patched",
+        AgentEvent::NameExtractionMiss { .. } => "name_extraction_miss",
         AgentEvent::ChatLine { .. } => "chat_line",
         AgentEvent::EventStart { .. } => "event_start",
         AgentEvent::EventDialog { .. } => "event_dialog",
@@ -878,6 +969,8 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::InventoryReady => "inventory_ready",
         AgentEvent::ReactorGoalChanged { .. } => "reactor_goal_changed",
         AgentEvent::LlmDecision { .. } => "llm_decision",
+        AgentEvent::HumanInControl { .. } => "human_in_control",
+        AgentEvent::HumanReleased => "human_released",
     }
 }
 
@@ -905,6 +998,9 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         BankWhenFull { .. } => "bank_when_full",
         CheckTarget { .. } => "check_target",
         ShopBuy { .. } => "shop_buy",
+        ReqLogout { .. } => "req_logout",
+        ReturnToHomePoint => "return_to_home_point",
+        Heal { .. } => "heal",
     }
 }
 
@@ -1117,30 +1213,59 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let char_id_env = std::env::var("FFXI_CHAR_ID").ok();
-    let char_name_env = std::env::var("FFXI_CHAR").ok();
-    let char_selection = match (char_id_env, char_name_env) {
-        (Some(id_str), _) => {
-            let id = id_str.parse::<u32>().context("FFXI_CHAR_ID must be a u32")?;
-            session::CharSelection::Id(id)
-        }
-        (None, Some(name)) => session::CharSelection::Name(name),
-        (None, None) => anyhow::bail!("set either FFXI_CHAR_ID or FFXI_CHAR in .env"),
-    };
-
-    let cfg = session::Config {
-        server: read_env("FFXI_SERVER").unwrap_or_else(|_| "127.0.0.1".into()),
-        map_host_override: std::env::var("FFXI_MAP_HOST_OVERRIDE").ok(),
-        auth_port: parse_port("FFXI_AUTH_PORT", 54231)?,
-        data_port: parse_port("FFXI_DATA_PORT", 54230)?,
-        view_port: parse_port("FFXI_VIEW_PORT", 54001)?,
-        user: read_env("FFXI_USER")?,
-        password: read_env("FFXI_PASS")?,
-        char_selection,
-        initial_state: None,
-        // MCP is the headless agent path — auto-dismiss events so an
-        // unattended LLM session doesn't get stuck if an NPC trigger fires.
-        user_driven_events: false,
+    // Attach mode means the credentials/character live in the running
+    // `ffxi-client native` peer, not here — skip FFXI_USER/PASS/CHAR
+    // reads so attach works with a clean MCP environment.
+    let attach_arg = std::env::var("FFXI_ATTACH").ok();
+    let cfg = if attach_arg.is_some() {
+        None
+    } else {
+        let char_id_env = std::env::var("FFXI_CHAR_ID").ok();
+        let char_name_env = std::env::var("FFXI_CHAR").ok();
+        let char_selection = match (char_id_env, char_name_env) {
+            (Some(id_str), _) => {
+                let id = id_str.parse::<u32>().context("FFXI_CHAR_ID must be a u32")?;
+                session::CharSelection::Id(id)
+            }
+            (None, Some(name)) => session::CharSelection::Name(name),
+            (None, None) => anyhow::bail!("set either FFXI_CHAR_ID or FFXI_CHAR in .env"),
+        };
+        // Soft-degrade: when no FFXI install is reachable, static NPC
+        // names render as "?" but the session still runs. MCP doesn't
+        // expose a `--require-dat` switch — headless agent harnesses
+        // run in containers that often lack the install, and a hard
+        // failure would block the autonomous-agent path entirely.
+        let dat_root = match ffxi_dat::DatRoot::from_env_or_default() {
+            Ok(root) => {
+                tracing::info!(
+                    source = %root.root().display(),
+                    "loaded FFXI DAT install for NPC name lookup"
+                );
+                Some(std::sync::Arc::new(root))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "no FFXI DAT install reachable; static NPC names will render as '?'"
+                );
+                None
+            }
+        };
+        Some(session::Config {
+            server: read_env("FFXI_SERVER").unwrap_or_else(|_| "127.0.0.1".into()),
+            map_host_override: std::env::var("FFXI_MAP_HOST_OVERRIDE").ok(),
+            auth_port: parse_port("FFXI_AUTH_PORT", 54231)?,
+            data_port: parse_port("FFXI_DATA_PORT", 54230)?,
+            view_port: parse_port("FFXI_VIEW_PORT", 54001)?,
+            user: read_env("FFXI_USER")?,
+            password: read_env("FFXI_PASS")?,
+            char_selection,
+            initial_state: None,
+            // MCP is the headless agent path — auto-dismiss events so an
+            // unattended LLM session doesn't get stuck if an NPC trigger fires.
+            user_driven_events: false,
+            dat_root,
+        })
     };
 
     let goal_path = match std::env::var("FFXI_MCP_GOAL_PATH") {
@@ -1180,18 +1305,43 @@ async fn main() -> Result<()> {
     let (event_tx, event_rx) = broadcast::channel::<AgentEvent>(256);
     let state = Arc::new(RwLock::new(SessionState::default()));
 
-    // Spawn the supervisor (which spawns reactor → session inside).
-    let sup_cfg = SupervisorConfig {
-        goal_store: Some(goal_store.clone()),
-        ..SupervisorConfig::default()
+    // Producer task: either the in-process supervisor (default headless
+    // mode) or an attach-mode bridge to a long-lived `ffxi-client native
+    // --agent-listen` peer. `FFXI_ATTACH=<path|auto>` (read earlier into
+    // `attach_arg`) selects the latter.
+    let event_tx_for_producer = event_tx.clone();
+    let supervisor_handle = if let Some(arg) = attach_arg {
+        let sock = match attach::resolve_attach(&arg) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("error: FFXI_ATTACH={arg:?}: {err:#}");
+                std::process::exit(2);
+            }
+        };
+        // In attach mode the running client owns the session, supervisor,
+        // and goal_store on disk — `cfg` is None here by construction.
+        tokio::spawn(async move {
+            if let Err(e) = attach::run(sock, cmd_rx, event_tx_for_producer).await {
+                tracing::error!(error = %e, "attach bridge exited with error");
+            }
+        })
+    } else {
+        // Headless mode: spawn the supervisor (which spawns reactor →
+        // session inside).
+        let cfg = cfg.expect("non-attach mode constructs cfg above");
+        let sup_cfg = SupervisorConfig {
+            goal_store: Some(goal_store.clone()),
+            ..SupervisorConfig::default()
+        };
+        let reactor_cfg = ReactorConfig::default();
+        tokio::spawn(async move {
+            if let Err(e) =
+                supervisor::run(cfg, cmd_rx, event_tx_for_producer, sup_cfg, reactor_cfg).await
+            {
+                tracing::error!(error = %e, "supervisor exited with error");
+            }
+        })
     };
-    let reactor_cfg = ReactorConfig::default();
-    let event_tx_for_sup = event_tx.clone();
-    let supervisor_handle = tokio::spawn(async move {
-        if let Err(e) = supervisor::run(cfg, cmd_rx, event_tx_for_sup, sup_cfg, reactor_cfg).await {
-            tracing::error!(error = %e, "supervisor exited with error");
-        }
-    });
 
     // Mirror task — folds events into `state` for resource reads.
     let mirror_handle = tokio::spawn(run_state_mirror(state.clone(), event_rx));
@@ -1465,12 +1615,22 @@ mod tests {
         let mut s = SessionState::default();
         s.zone_id = Some(230);
         s.char_id = Some(7);
-        s.self_pos = Position {
+        // Self position now lives on the self entity in the entity list
+        // (looked up by `id == char_id`). Seed it at the origin so the
+        // distance ordering below is identical to the original test.
+        s.entities.push(Entity {
+            id: 7,
+            act_index: 0,
+            kind: EntityKind::Pc,
+            name: Some("Self".into()),
             pos: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
             heading: 64,
+            hp_pct: Some(100),
+            bt_target_id: 0,
+            claim_id: 0,
             speed: 25,
             speed_base: 25,
-        };
+        });
         // Seed 35 entities at increasing distances; only nearest 30 should
         // appear, sorted ascending.
         for i in 0..35u32 {
@@ -1484,6 +1644,8 @@ mod tests {
                 hp_pct: Some(100),
                 bt_target_id: 0,
                 claim_id: 0,
+                speed: 0,
+                speed_base: 0,
             });
         }
         let v = entities_view(&s);
@@ -1509,6 +1671,8 @@ mod tests {
             hp_pct: Some(60),
             bt_target_id: 4242,
             claim_id: 0,
+            speed: 0,
+            speed_base: 0,
         });
         s.entities.push(Entity {
             id: 100,
@@ -1520,6 +1684,8 @@ mod tests {
             hp_pct: Some(100),
             bt_target_id: 0,
             claim_id: 0,
+            speed: 0,
+            speed_base: 0,
         });
         let v = entities_view(&s);
         assert_eq!(v["entities"][0]["claimed_by"], 4242);
@@ -1646,5 +1812,81 @@ mod tests {
         }
         // Channel should be empty now — exactly one decision per dispatch.
         assert!(decision_rx.try_recv().is_err());
+    }
+
+    /// Regression for the attach-mode "stale `goal://current`" bug.
+    ///
+    /// In attach mode no MCP-side supervisor writes the disk-backed
+    /// `goal_store` — only the running native client's reactor knows
+    /// about goal mutations, and it broadcasts them as
+    /// `AgentEvent::ReactorGoalChanged`. The MCP's state mirror folds
+    /// those events into `state.current_goal` (state.rs apply_event),
+    /// but the original `read_resource` implementation read from disk
+    /// instead, so a 12-day-old `path_to (5,5,0)` from a previous
+    /// headless run kept showing as "active" even after the agent
+    /// successfully sent `cancel`.
+    ///
+    /// Property pinned here: when `state.current_goal` is `Some(non-Idle)`,
+    /// the live mirror wins. When it's `None`/`Idle`, the disk falls
+    /// back into play (preserving the headless cross-restart use case).
+    #[tokio::test]
+    async fn goal_resource_prefers_in_memory_over_stale_disk() {
+        use ffxi_client::state::ReactorGoalSnapshot;
+
+        let goal_path = std::env::temp_dir().join(format!(
+            "ffxi-mcp-test-goal-prefers-live-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&goal_path);
+        let store = GoalStore::new(goal_path.clone());
+
+        // Write a stale "active" goal to disk (simulates a previous
+        // headless session's persisted PathTo).
+        store
+            .save(&AgentCommand::PathTo {
+                x: 5.0,
+                y: 5.0,
+                z: 0.0,
+            })
+            .expect("save stale disk goal");
+
+        let mutex = tokio::sync::Mutex::new(store);
+
+        // Case 1: live mirror is in `Following`. The live goal wins
+        // over the stale disk PathTo.
+        let mut state = SessionState::default();
+        state.current_goal = Some(ReactorGoalSnapshot::Following {
+            target_id: 42,
+            distance: 3.0,
+        });
+        let body = read_resource(&state, &mutex, "goal://current")
+            .await
+            .expect("read live goal");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["goal"], "active");
+        assert_eq!(v["source"], "live");
+        assert_eq!(v["snapshot"]["kind"], "following");
+        assert_eq!(v["snapshot"]["target_id"], 42);
+
+        // Case 2: live mirror says Idle. Disk falls back into play —
+        // this preserves the headless-restart use case where the
+        // persisted file is the only source.
+        let mut state = SessionState::default();
+        state.current_goal = Some(ReactorGoalSnapshot::Idle);
+        let body = read_resource(&state, &mutex, "goal://current")
+            .await
+            .expect("read disk fallback");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["goal"], "active");
+        assert_eq!(v["source"], "disk");
+
+        // Case 3: live mirror is None and disk is empty → idle.
+        let _ = std::fs::remove_file(&goal_path);
+        let state = SessionState::default(); // current_goal: None
+        let body = read_resource(&state, &mutex, "goal://current")
+            .await
+            .expect("read empty");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["goal"], "idle");
     }
 }

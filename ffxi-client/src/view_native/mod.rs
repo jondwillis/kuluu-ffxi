@@ -97,6 +97,29 @@ pub(crate) struct RelayListen(
     pub Option<std::net::SocketAddr>,
 );
 
+/// Optional `--agent-listen` value (raw path or `auto`). Read by
+/// [`bridge_connecting`] which spawns the agent socket task alongside
+/// the session.
+#[cfg(unix)]
+#[derive(Resource, Default, Clone)]
+pub(crate) struct AgentListen(pub Option<String>);
+
+/// Shared FFXI client DAT root used for static-NPC name resolution.
+/// `None` when no install was reachable at boot and `--require-dat`
+/// wasn't set; static NPC names will render as "?".
+#[derive(Resource, Default, Clone)]
+pub(crate) struct DatRootRes(pub Option<std::sync::Arc<ffxi_dat::DatRoot>>);
+
+/// Shared "human in control" flag. The agent socket reads it (drops
+/// agent commands while set); the `/agent pause|resume` slash commands
+/// flip it and emit the matching `AgentEvent::HumanInControl` /
+/// `HumanReleased` transition events. Only inserted when an
+/// `--agent-listen` value is configured (otherwise the resource is
+/// absent and the slash commands report "no agent attached").
+#[cfg(unix)]
+#[derive(Resource, Clone)]
+pub(crate) struct AgentPaused(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
+
 /// Inputs for [`run`]. Bundled to keep `run_native_main_thread`
 /// readable now that the App owns more state.
 pub struct NativeRunArgs {
@@ -108,6 +131,15 @@ pub struct NativeRunArgs {
     pub direct_mode_autostart: bool,
     pub runtime: RtHandle,
     pub relay_listen: Option<std::net::SocketAddr>,
+    /// `--agent-listen <path>` value: raw path or `auto`. When set,
+    /// the connecting bridge spawns [`ffxi_client::agent_socket::serve`]
+    /// alongside the session so external harnesses (notably
+    /// `ffxi-mcp` in attach mode) can drive the running client.
+    #[cfg(unix)]
+    pub agent_listen: Option<String>,
+    /// Resolved FFXI client DAT install (or `None` when not reachable).
+    /// Shared across reconnects via the inner `Arc`.
+    pub dat_root: Option<std::sync::Arc<ffxi_dat::DatRoot>>,
 }
 
 pub fn run(args: NativeRunArgs) -> Result<()> {
@@ -120,6 +152,9 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         direct_mode_autostart,
         runtime,
         relay_listen,
+        #[cfg(unix)]
+        agent_listen,
+        dat_root,
     } = args;
 
     let mut app = App::new();
@@ -161,7 +196,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<AutoRun>()
         .insert_resource(ports)
-        .insert_resource(RelayListen(relay_listen));
+        .insert_resource(RelayListen(relay_listen))
+        .insert_resource(DatRootRes(dat_root));
+    #[cfg(unix)]
+    app.insert_resource(AgentListen(agent_listen));
 
     if direct_mode_autostart {
         app.insert_resource(launcher_ui::DirectModeAutostart);
@@ -330,6 +368,8 @@ fn bridge_connecting(
     server: Res<launcher_ui::ServerInfo>,
     ports: Res<SessionPorts>,
     relay: Res<RelayListen>,
+    #[cfg(unix)] agent: Res<AgentListen>,
+    dat_root_res: Res<DatRootRes>,
     mut next_phase: ResMut<NextState<AppPhase>>,
     mut err: ResMut<LoginErrorMsg>,
 ) {
@@ -353,6 +393,7 @@ fn bridge_connecting(
         // event to stay alive long enough to read; the operator (or the
         // C5 phase 2 dialog input handler) will issue `EndEvent` to advance.
         user_driven_events: true,
+        dat_root: dat_root_res.0.clone(),
     };
 
     // spawn_session_with_reactor calls tokio::spawn internally — we
@@ -393,6 +434,36 @@ fn bridge_connecting(
     }
     #[cfg(not(feature = "relay"))]
     let _ = relay;
+
+    // Optional agent socket — drives a long-lived native client from
+    // `ffxi-mcp` in attach mode (`FFXI_ATTACH=…`). Parallel transport
+    // to the relay: relay is wire-narrow + browser-friendly, agent
+    // socket is full-fat AgentCommand/AgentEvent JSON. Both share the
+    // same `cmd_tx` / `event_tx` so commands from either path merge
+    // into the single session inbox.
+    #[cfg(unix)]
+    if let Some(arg) = agent.0.clone() {
+        let listen = ffxi_client::agent_socket::resolve_listen(&arg);
+        let cmd_tx_agent = cmd_tx.clone();
+        let event_tx_agent = event_tx.clone();
+        let pause = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Expose the same flag to the slash-command dispatcher so
+        // `/agent pause|resume` can flip it.
+        commands.insert_resource(crate::view_native::AgentPaused(pause.clone()));
+        let pause_for_socket = pause;
+        runtime.0.spawn(async move {
+            if let Err(err) = ffxi_client::agent_socket::serve(
+                listen,
+                cmd_tx_agent,
+                event_tx_agent,
+                Some(pause_for_socket),
+            )
+            .await
+            {
+                tracing::warn!(error = %err, "agent socket listener exited");
+            }
+        });
+    }
 
     commands.insert_resource(NativeSource::new(state_rx, event_rx));
     commands.insert_resource(CommandTx(cmd_tx));

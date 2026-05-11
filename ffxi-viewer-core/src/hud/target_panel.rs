@@ -266,6 +266,8 @@ mod tests {
             hp_pct: hp,
             bt_target_id: 0,
             claim_id: 0,
+            speed: 0,
+            speed_base: 0,
         }
     }
 

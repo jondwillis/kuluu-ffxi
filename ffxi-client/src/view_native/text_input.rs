@@ -36,10 +36,12 @@ use ffxi_viewer_core::{
     Action, Bindings, ChatBuffer, DialogCursor, InputMode, MenuKind, MenuStack, PassiveCursorState,
     Preset, QuickActionState, SceneState, Target, DIALOG_MAX_CHOICE,
 };
+use ffxi_viewer_core::dat_mmb::LoadMmbRequest;
+use ffxi_viewer_core::dat_mzb::LoadMzbRequest;
 use tokio::sync::mpsc::Sender;
 
 use crate::keybinds_store::KeybindsStateRes;
-use crate::state::{ActionKind, AgentCommand, CheckKind, ReqLogoutKind};
+use crate::state::{ActionKind, AgentCommand, AgentEvent, CheckKind, ReqLogoutKind};
 use crate::view_native::input::CommandTx;
 use crate::view_native::slash_commands::{parse_slash, system_chat_line, KeybindUpdate, SlashOutcome};
 
@@ -57,6 +59,18 @@ pub fn text_input_system(
     mut scene_state: ResMut<SceneState>,
     mut exit: MessageWriter<AppExit>,
     mut navmesh_visible: ResMut<super::navmesh_overlay::NavmeshOverlayVisible>,
+    navmesh_state: Res<super::navmesh_overlay::NavmeshState>,
+    // `/agent` control surface. Resources are optional: `AgentPaused`
+    // only exists when `--agent-listen` is configured, and
+    // `SessionEventTx` only after the connecting bridge runs.
+    #[cfg(unix)] agent_paused: Option<Res<super::AgentPaused>>,
+    session_event_tx: Option<Res<super::SessionEventTx>>,
+    // `/load_mmb <file_id> <chunk_idx>` writes one of these per
+    // submission; `ffxi_viewer_core::dat_mmb::process_load_mmb_requests`
+    // is the consumer.
+    mut load_mmb_tx: MessageWriter<LoadMmbRequest>,
+    // Same shape for `/load_mzb` — zone mesh-library overlay.
+    mut load_mzb_tx: MessageWriter<LoadMzbRequest>,
 ) {
     // Snapshot the inputs we need from the scene before mutating it
     // below (clones are cheap relative to the per-keystroke event
@@ -113,8 +127,14 @@ pub fn text_input_system(
                     &mut scene_state,
                     &mut exit,
                     &mut navmesh_visible,
+                    &navmesh_state,
                     &mut bindings,
                     &mut keybinds_state,
+                    #[cfg(unix)]
+                    agent_paused.as_deref(),
+                    session_event_tx.as_deref(),
+                    &mut load_mmb_tx,
+                    &mut load_mzb_tx,
                 );
             }
             InputMode::Menu(stack) => {
@@ -314,6 +334,7 @@ fn handle_chat_key(key: &Key, bindings: &Bindings, buffer: &mut ChatBuffer) -> C
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn apply_chat_action(
     action: ChatAction,
     mode: &mut InputMode,
@@ -325,8 +346,13 @@ fn apply_chat_action(
     scene_state: &mut SceneState,
     exit: &mut MessageWriter<AppExit>,
     navmesh_visible: &mut super::navmesh_overlay::NavmeshOverlayVisible,
+    navmesh_state: &super::navmesh_overlay::NavmeshState,
     bindings: &mut Bindings,
     keybinds_state: &mut KeybindsStateRes,
+    #[cfg(unix)] agent_paused: Option<&super::AgentPaused>,
+    session_event_tx: Option<&super::SessionEventTx>,
+    load_mmb_tx: &mut MessageWriter<LoadMmbRequest>,
+    load_mzb_tx: &mut MessageWriter<LoadMzbRequest>,
 ) {
     match action {
         ChatAction::Stay => {}
@@ -374,8 +400,15 @@ fn apply_chat_action(
                     scene_state,
                     exit,
                     navmesh_visible,
+                    navmesh_state,
+                    self_pos,
                     bindings,
                     keybinds_state,
+                    #[cfg(unix)]
+                    agent_paused,
+                    session_event_tx,
+                    load_mmb_tx,
+                    load_mzb_tx,
                 );
             } else {
                 // Default channel: Say. Tracing makes it visible whether the
@@ -412,8 +445,14 @@ fn apply_slash_outcome(
     scene_state: &mut SceneState,
     exit: &mut MessageWriter<AppExit>,
     navmesh_visible: &mut super::navmesh_overlay::NavmeshOverlayVisible,
+    navmesh_state: &super::navmesh_overlay::NavmeshState,
+    self_pos: ffxi_viewer_wire::Vec3,
     bindings: &mut Bindings,
     keybinds_state: &mut KeybindsStateRes,
+    #[cfg(unix)] agent_paused: Option<&super::AgentPaused>,
+    session_event_tx: Option<&super::SessionEventTx>,
+    load_mmb_tx: &mut MessageWriter<LoadMmbRequest>,
+    load_mzb_tx: &mut MessageWriter<LoadMzbRequest>,
 ) {
     match outcome {
         SlashOutcome::Command(cmd) => {
@@ -457,6 +496,50 @@ fn apply_slash_outcome(
             let label = if next { "ON" } else { "OFF" };
             push_system_chat_line(scene_state, format!("navmesh overlay: {label}"));
         }
+        SlashOutcome::LoadMmb {
+            file_id,
+            chunk_idx,
+            world_pos,
+        } => {
+            // Cross the FFXI→Bevy axis flip here, in the dispatcher, so
+            // `LoadMmbRequest::world_pos` is already a Bevy `Vec3` by
+            // the time the consumer system sees it. Matches the
+            // convention used by `sync_entities_system` (`scene.rs`).
+            let bevy_pos = ffxi_viewer_core::ffxi_to_bevy(world_pos);
+            load_mmb_tx.write(LoadMmbRequest {
+                file_id,
+                chunk_idx,
+                world_pos: bevy_pos,
+            });
+            push_system_chat_line(
+                scene_state,
+                format!("/load_mmb {file_id} {chunk_idx}: spawning…"),
+            );
+        }
+        SlashOutcome::LoadMzb {
+            file_id,
+            chunk_idx,
+            world_pos,
+        } => {
+            let bevy_pos = ffxi_viewer_core::ffxi_to_bevy(world_pos);
+            load_mzb_tx.write(LoadMzbRequest {
+                file_id,
+                chunk_idx,
+                world_pos: bevy_pos,
+                // Manual /load_mzb is *not* auto-load — survives zone
+                // changes so the operator can compare zone-A debris with
+                // zone-B's geometry side-by-side.
+                auto_loaded: false,
+            });
+            let idx_desc = match chunk_idx {
+                Some(i) => format!("chunk {i}"),
+                None => "first MZB chunk".to_string(),
+            };
+            push_system_chat_line(
+                scene_state,
+                format!("/load_mzb {file_id} ({idx_desc}): spawning…"),
+            );
+        }
         SlashOutcome::ShopBuyRow { shop_index, qty } => {
             // Resolve the `shop_no` from the live shop's offset_index.
             // Without an open shop, the buy is a no-op with a system
@@ -474,6 +557,171 @@ fn apply_slash_outcome(
         }
         SlashOutcome::ApplyKeybinds(update) => {
             apply_keybind_update(update, bindings, keybinds_state, scene_state);
+        }
+        SlashOutcome::NavInfo => {
+            report_nav_info(navmesh_state, self_pos, scene_state);
+        }
+        SlashOutcome::AgentControl(op) => {
+            #[cfg(unix)]
+            apply_agent_control(op, agent_paused, session_event_tx, scene_state);
+            #[cfg(not(unix))]
+            {
+                let _ = op;
+                push_system_chat_line(
+                    scene_state,
+                    "/agent: requires Unix-domain-socket build (non-Unix target)".into(),
+                );
+            }
+        }
+    }
+}
+
+/// Dispatcher for `/agent pause|resume|status`. Reads/writes the
+/// `AgentPaused` atomic and fires `AgentEvent::HumanInControl` /
+/// `HumanReleased` on transitions. Idempotent — re-pausing while
+/// paused (or re-resuming while running) is a no-op and just prints
+/// the current state.
+#[cfg(unix)]
+fn apply_agent_control(
+    op: super::slash_commands::AgentControlOp,
+    agent_paused: Option<&super::AgentPaused>,
+    session_event_tx: Option<&super::SessionEventTx>,
+    scene_state: &mut SceneState,
+) {
+    use super::slash_commands::AgentControlOp;
+    use std::sync::atomic::Ordering;
+    let Some(paused) = agent_paused else {
+        push_system_chat_line(
+            scene_state,
+            "/agent: no agent attached (set --agent-listen to enable)".into(),
+        );
+        return;
+    };
+    match op {
+        AgentControlOp::Pause => {
+            let was_paused = paused.0.swap(true, Ordering::AcqRel);
+            if was_paused {
+                push_system_chat_line(scene_state, "/agent: already paused".into());
+            } else {
+                push_system_chat_line(
+                    scene_state,
+                    "/agent: paused (human in control)".into(),
+                );
+                if let Some(tx) = session_event_tx {
+                    let _ = tx.0.send(AgentEvent::HumanInControl {
+                        reason: "operator /agent pause".into(),
+                    });
+                }
+            }
+        }
+        AgentControlOp::Resume => {
+            let was_paused = paused.0.swap(false, Ordering::AcqRel);
+            if !was_paused {
+                push_system_chat_line(scene_state, "/agent: not currently paused".into());
+            } else {
+                push_system_chat_line(scene_state, "/agent: resumed".into());
+                if let Some(tx) = session_event_tx {
+                    let _ = tx.0.send(AgentEvent::HumanReleased);
+                }
+            }
+        }
+        AgentControlOp::Status => {
+            let state = if paused.0.load(Ordering::Acquire) {
+                "PAUSED (human in control)"
+            } else {
+                "RUNNING (agent in control)"
+            };
+            push_system_chat_line(scene_state, format!("/agent: {state}"));
+        }
+    }
+}
+
+/// `/navinfo` dispatcher: diagnostic snapshot of where the player is
+/// relative to the navmesh and the zone-line list. Pushes one or more
+/// `[system]` chat lines so the operator can see, without log
+/// scraping, whether (a) the navmesh thinks they're on it, (b) their
+/// height matches a real polygon, and (c) the zone lines they expect
+/// to walk into are actually findable from here.
+fn report_nav_info(
+    navmesh_state: &super::navmesh_overlay::NavmeshState,
+    self_pos: ffxi_viewer_wire::Vec3,
+    scene_state: &mut SceneState,
+) {
+    let zone_id = scene_state.snapshot.zone_id;
+    push_system_chat_line(
+        scene_state,
+        format!(
+            "navinfo: self=(x={:.2} y={:.2} z={:.2}) zone={}",
+            self_pos.x,
+            self_pos.y,
+            self_pos.z,
+            zone_id.map_or("?".into(), |z| z.to_string()),
+        ),
+    );
+    let Some(nav_arc) = navmesh_state.nav.as_ref() else {
+        push_system_chat_line(
+            scene_state,
+            "navinfo: no navmesh loaded for current zone".into(),
+        );
+        return;
+    };
+    // `std::sync::Mutex::lock` returns `Result<_, PoisonError>`; treat
+    // a poisoned mutex as a hard failure for this read-only diagnostic
+    // (no need to recover the poisoned data — we'd just report stale).
+    let nav = match nav_arc.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            push_system_chat_line(
+                scene_state,
+                "navinfo: navmesh mutex poisoned — bailing".into(),
+            );
+            return;
+        }
+    };
+    let snap = nav.nearest_height_at(self_pos.x, self_pos.y, self_pos.z);
+    match snap {
+        Some(snapped_z) => {
+            let delta_z = snapped_z - self_pos.z;
+            push_system_chat_line(
+                scene_state,
+                format!(
+                    "navinfo: nearest-poly z={:.2} (delta z={:+.2} yalms)",
+                    snapped_z, delta_z
+                ),
+            );
+        }
+        None => push_system_chat_line(
+            scene_state,
+            "navinfo: NO walkable polygon within 100-yalm vertical search — self_pos appears off-mesh".into(),
+        ),
+    }
+    // Distance to each zone line in this zone, plus whether path()
+    // succeeds from here to the line. Caps at 6 lines to avoid spamming.
+    if let Some(z) = zone_id {
+        let lines = ffxi_nav::zone_lines_for(z);
+        if lines.is_empty() {
+            push_system_chat_line(scene_state, format!("navinfo: zone {z} has no zone-lines"));
+            return;
+        }
+        let from = ffxi_nav::glam::Vec3::new(self_pos.x, self_pos.y, self_pos.z);
+        for line in lines.iter().take(6) {
+            let dx = line.from_pos[0] - self_pos.x;
+            let dy = line.from_pos[1] - self_pos.y;
+            let dz = line.from_pos[2] - self_pos.z;
+            let dist_2d = (dx * dx + dy * dy).sqrt();
+            let to = ffxi_nav::glam::Vec3::new(line.from_pos[0], line.from_pos[1], line.from_pos[2]);
+            let path_status = match ffxi_nav::NavMesh::path(&*nav, from, to) {
+                Some(p) => format!("path={}wp", p.len()),
+                None => "path=NONE".into(),
+            };
+            let name = ffxi_nav::zone_name(line.to_zone).unwrap_or("?");
+            push_system_chat_line(
+                scene_state,
+                format!(
+                    "navinfo: →zone{:3} {:<20} dist={:.1}y dz={:+.1} {}",
+                    line.to_zone, name, dist_2d, dz, path_status
+                ),
+            );
         }
     }
 }
@@ -1009,6 +1257,8 @@ mod quick_action_tests {
             hp_pct: None,
             bt_target_id: 0,
             claim_id: 0,
+            speed: 0,
+            speed_base: 0,
         }
     }
 
@@ -1054,7 +1304,7 @@ mod menu_dispatch_tests {
 
     #[test]
     fn logout_dispatches_reqlogout_with_toast() {
-        match resolve_menu_entry("Logout") {
+        match resolve_menu_entry(MenuKind::Root, "Logout") {
             MenuDispatch::CommandWithToast { cmd, toast } => {
                 assert_eq!(
                     cmd,
@@ -1073,10 +1323,13 @@ mod menu_dispatch_tests {
 
     #[test]
     fn unwired_root_entries_stay_not_implemented() {
+        // `Config` was wired up as a submenu in commit c4a9321 (preset
+        // switcher + `/keybinds list`); the test was not updated at
+        // the time. The remaining root entries below are still stubs.
         for label in ["Magic", "Abilities", "Items", "Status", "Party",
-                      "Search", "Macros", "Config"] {
+                      "Search", "Macros"] {
             assert_eq!(
-                resolve_menu_entry(label),
+                resolve_menu_entry(MenuKind::Root, label),
                 MenuDispatch::NotImplemented(label.into()),
                 "{label} should still be a stub"
             );

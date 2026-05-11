@@ -264,7 +264,7 @@ mod tests {
                 id: 42, act_index: 1, kind: EntityKind::Pc,
                 name: Some("Vanari".into()),
                 pos: Vec3::default(), heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0,
+                claim_id: 0, speed: 0, speed_base: 0,
             },
         });
         // Other PC.
@@ -273,7 +273,7 @@ mod tests {
                 id: 100, act_index: 2, kind: EntityKind::Pc,
                 name: Some("Stranger".into()),
                 pos: Vec3 { x: 5.0, y: 0.0, z: 0.0 }, heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0,
+                claim_id: 0, speed: 0, speed_base: 0,
             },
         });
         // NPC.
@@ -282,7 +282,7 @@ mod tests {
                 id: 200, act_index: 3, kind: EntityKind::Npc,
                 name: Some("Innkeeper".into()),
                 pos: Vec3::default(), heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0,
+                claim_id: 0, speed: 0, speed_base: 0,
             },
         });
         // Mob.
@@ -291,7 +291,7 @@ mod tests {
                 id: 300, act_index: 4, kind: EntityKind::Mob,
                 name: None,
                 pos: Vec3::default(), heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0,
+                claim_id: 0, speed: 0, speed_base: 0,
             },
         });
 
@@ -383,5 +383,59 @@ mod tests {
         }
         let scene = SceneSummary::from_state(&s);
         assert_eq!(scene.party_size, 3);
+    }
+
+    /// Regression for the attach-mode "Session not started" bug.
+    ///
+    /// `SceneSummary::from_state` keys off `state.stage`, which is only
+    /// folded by `AgentEvent::StageChanged` (and `Disconnected`). A
+    /// late-attaching MCP that subscribes after the session is already
+    /// in-zone receives only periodic `Diagnostics` events, which
+    /// update `state.diagnostics.stage` but NOT `state.stage` — so
+    /// `from_state` stays in the `Stage::Idle` arm and reports
+    /// "Session not started." indefinitely.
+    ///
+    /// The fix lives in `session::keepalive_loop`'s `Snapshot` handler:
+    /// it now emits a full resync burst (`Connected` + `StageChanged` +
+    /// `PositionChanged` + `Diagnostics`) instead of just `Diagnostics`.
+    /// This test pins the consumer-side property the fix relies on.
+    #[test]
+    fn diagnostics_alone_does_not_resync_stage_for_scene() {
+        // Bug shape: only Diagnostics arrives → stage stays Idle →
+        // scene reports "Session not started" even though diagnostics
+        // says we're in-zone.
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::Diagnostics {
+            diagnostics: crate::state::Diagnostics {
+                stage: Some(Stage::InZone),
+                ..Default::default()
+            },
+        });
+        let scene = SceneSummary::from_state(&s);
+        assert_eq!(
+            scene.text, "Session not started.",
+            "Diagnostics alone cannot resync state.stage — \
+             this is the precondition the Snapshot burst exists to fix"
+        );
+
+        // Fix shape: the resync burst includes StageChanged + Connected,
+        // so a fresh attach now sees stage=InZone and renders the
+        // in-zone prose.
+        s.apply_event(&AgentEvent::Connected {
+            account_id: 0,
+            char_id: 42,
+            character: "Vanari".into(),
+            zone_id: 230,
+        });
+        s.apply_event(&AgentEvent::StageChanged {
+            stage: Stage::InZone,
+        });
+        let scene = SceneSummary::from_state(&s);
+        assert_ne!(scene.text, "Session not started.");
+        assert!(
+            scene.text.contains("Vanari") && scene.text.contains("230"),
+            "expected in-zone prose with name and zone, got: {}",
+            scene.text
+        );
     }
 }

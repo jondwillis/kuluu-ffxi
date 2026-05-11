@@ -431,8 +431,14 @@ pub fn dispatch_movement_system(
             if dx.abs() <= 0.001 && dy.abs() <= 0.001 {
                 None
             } else {
-                let angle = dx.atan2(dy);
-                Some((angle * 256.0 / std::f32::consts::TAU).rem_euclid(256.0) as u8)
+                // LSB convention — mirror `heading_toward` in `reactor.rs`
+                // so lock-on and reactor-driven facing produce the same
+                // byte for the same geometry. `dy.atan2(dx)` matches LSB's
+                // `worldAngle(A, B) = atan2(B.z-A.z, B.x-A.x)`; the
+                // negative scale flips CCW to FFXI's CW.
+                let radians = dy.atan2(dx);
+                let raw = radians * -(128.0 / std::f32::consts::PI);
+                Some((raw.round() as i32).rem_euclid(256) as u8)
             }
         })
     });
@@ -544,10 +550,15 @@ pub fn dispatch_movement_system(
     });
 }
 
-/// FFXI heading 0..=255 → (forward.x, forward.y) unit vector.
+/// FFXI heading 0..=255 → (forward.x, forward.y) unit vector in our
+/// horizontal plane. LSB convention (matches `heading_toward` in
+/// `reactor.rs`): heading 0 = +x (east), 64 = south, 128 = west, 192 =
+/// north, CW from above. With `angle = h·τ/256`, the +x component is
+/// `cos(angle)` and the +y component is `-sin(angle)` because FFXI
+/// rotates clockwise while math `atan2` is CCW positive.
 fn heading_to_forward(heading: u8) -> (f32, f32) {
     let angle = (heading as f32) * std::f32::consts::TAU / 256.0;
-    (angle.sin(), angle.cos())
+    (angle.cos(), -angle.sin())
 }
 
 /// Pure helper: viewport-aware Tab cycle.
@@ -635,6 +646,8 @@ mod tests {
             hp_pct: None,
             bt_target_id: 0,
             claim_id: 0,
+            speed: 0,
+            speed_base: 0,
         }
     }
 

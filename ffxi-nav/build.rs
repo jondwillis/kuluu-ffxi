@@ -8,6 +8,22 @@
 //!   to_zone   u16,
 //!   to_pos_x   f32, to_pos_y   f32, to_pos_z   f32,
 //!   to_scale_x f32, to_scale_z f32, to_rotation f32
+//!
+//! ## Coord-system swap (y/z)
+//!
+//! The SQL source is in **FFXI-native y-up** (`from_pos_y` is the
+//! height axis, the second wire byte). The codebase's runtime
+//! representation is **z-up** (`Position::z` is height — see the
+//! field names in `ffxi-proto::decode::PosHead`, which renames the
+//! middle wire float to `z`). To make the table consumable by code
+//! that already speaks the codebase's convention, the scraper emits
+//! `from_pos: [x, z, y]` (height in slot 2) — i.e., it swaps the y
+//! and z values from the SQL row when writing the runtime table.
+//!
+//! Without this swap, `parse_zoneto` and `sync_zone_lines_system`
+//! see height in slot 1 (where the rest of the codebase expects a
+//! ground axis), so columns spawn in the wrong place and the agent
+//! pathfinds through nothing.
 
 use std::{fs, path::PathBuf};
 
@@ -45,13 +61,15 @@ fn main() -> Result<()> {
     out.push_str("// Do not edit by hand.\n\n");
     out.push_str("pub const ZONE_LINES: &[ZoneLine] = &[\n");
     for z in &entries {
+        // Swap SQL `(x, y_height, z_north)` → runtime `(x, y_north, z_height)`
+        // so the table matches `Position`'s z-up convention.
         out.push_str(&format!(
             "    ZoneLine {{ line_id: {}, from_zone: {}, from_pos: [{:.3}f32, {:.3}f32, {:.3}f32], to_zone: {}, to_pos: [{:.3}f32, {:.3}f32, {:.3}f32], scale_x: {:.3}f32, scale_z: {:.3}f32, rotation: {:.6}f32 }},\n",
             z.line_id,
             z.from_zone,
-            z.from_pos[0], z.from_pos[1], z.from_pos[2],
+            z.from_pos[0], z.from_pos[2], z.from_pos[1],
             z.to_zone,
-            z.to_pos[0], z.to_pos[1], z.to_pos[2],
+            z.to_pos[0], z.to_pos[2], z.to_pos[1],
             z.scale_x, z.scale_z, z.rotation,
         ));
     }

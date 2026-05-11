@@ -1,0 +1,16 @@
+[package]
+name = "ffxi-dat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Rust parser for FFXI client DAT files (VTABLE/FTABLE, MZB, MMB, ANI, textures)."
+build = "build.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[build-dependencies]
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

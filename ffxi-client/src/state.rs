@@ -85,14 +85,18 @@ impl Default for Position {
     }
 }
 
-/// Compute (dx, dy) for "1 unit forward at heading h". FFXI heading is u8
-/// where 0 = +y axis (north), increasing clockwise viewed from above,
-/// wrapping at 256 = 360°. Lives on `state` so both the 2D minimap TUI and
-/// the 3D view share one wire-convention truth.
+/// Compute (dx, dy) for "1 unit forward at heading h" in our horizontal
+/// plane. FFXI heading is u8 where, matching LSB's `worldAngle`
+/// (vendor/server/src/common/utils.cpp:130-140) and our `heading_toward`,
+/// heading 0 = +x (east), 64 = south, 128 = west, 192 = north — CW
+/// viewed from above, wrapping at 256 = 360°. The byte's semantic is what
+/// the server stores in `loc.p.rotation`; mirroring that convention here
+/// keeps the 2D minimap, the 3D view, and the wire packets all reading
+/// the same byte the same way.
 #[inline]
 pub fn heading_to_forward(heading: u8) -> (f32, f32) {
     let angle = (heading as f32) * std::f32::consts::TAU / 256.0;
-    (angle.sin(), angle.cos())
+    (angle.cos(), -angle.sin())
 }
 
 /// Cycle to the next nearby entity by 2D (xy-plane) distance from `from`.
@@ -131,6 +135,18 @@ pub enum EntityKind {
     Other,
 }
 
+/// Merge two observations of an entity's kind. `Other` is the "unknown"
+/// bucket — once a specialized classification (`Pc`/`Npc`/`Mob`/`Pet`) has
+/// been established for an entity, a follow-up `Other` should not demote it.
+/// Among specialized kinds the newer observation wins.
+fn merge_kind(existing: EntityKind, incoming: EntityKind) -> EntityKind {
+    use EntityKind::*;
+    match (existing, incoming) {
+        (Pc | Npc | Mob | Pet, Other) => existing,
+        _ => incoming,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entity {
     pub id: u32,
@@ -155,6 +171,16 @@ pub struct Entity {
     /// viewer.
     #[serde(default)]
     pub claim_id: u32,
+    /// Current movement speed (`PosHead::speed`). 0 when standing still.
+    /// Used by the local WASD integrator to compute step size per tick,
+    /// and by Option C (smooth wire-side movement) to set `MoveFlame`.
+    #[serde(default)]
+    pub speed: u8,
+    /// Base movement speed (`PosHead::speed_base`) — animation speed,
+    /// unaffected by movement-status effects. Kept alongside `speed` so
+    /// renderers can pick the right animation play rate.
+    #[serde(default)]
+    pub speed_base: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,7 +257,6 @@ pub struct SessionState {
     pub char_id: Option<u32>,
     pub character: Option<String>,
     pub zone_id: Option<u16>,
-    pub self_pos: Position,
     pub entities: Vec<Entity>,
     pub party: Vec<PartyMember>,
     pub chat: Vec<ChatLine>,
@@ -254,6 +279,14 @@ pub struct SessionState {
     /// LLM-decision badge in the operator dashboard.
     #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
     pub recent_decisions: VecDeque<LlmDecision>,
+    /// Bounded ring of recent name-extraction misses — diagnostic surface
+    /// for "?" entities. Each entry captures the raw packet body so the
+    /// MCP-side AI can audit the SendFlg byte and name-slot offset
+    /// without rebuilding ffxi-client with extra logging. Capped at
+    /// `NAME_MISSES_CAP`. Exposed as the `debug://name_misses` MCP
+    /// resource.
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub name_misses: VecDeque<NameExtractionMiss>,
     /// Active NPC event dialog metadata. `Some(...)` from `EventDialog`
     /// arrival until `EventEnded` clears it. Mirrored to the wire in
     /// `wire_translate::dialog_to_wire`. The fields are the wire ground
@@ -451,6 +484,49 @@ pub enum LlmDecisionKind {
 /// 32; 64 leaves headroom for histograms without unbounded growth.
 const RECENT_DECISIONS_CAP: usize = 64;
 
+/// Classification of *why* `PosHead::try_extract_name` returned `None`
+/// for a CHAR_PC / CHAR_NPC packet. Reported alongside the raw body so
+/// downstream auditors can tell "server didn't send the name this tick"
+/// (expected) from "we mishandled the name slot" (bug).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameMissKind {
+    /// `body[6] & 0x08 == 0` — LSB did not include the name in this
+    /// packet. Expected for position-only follow-ups; means the client
+    /// must fall back on a prior spawn packet (or the LOGIN seed) for
+    /// the name. If you see this on *every* packet for a given entity
+    /// across a minute or so, the spawn packet was missed.
+    NameBitClear,
+    /// Name bit is set but the extractor returned `None` — either the
+    /// body is shorter than the name offset, or the slot failed ASCII
+    /// validation. This is the signature of a remaining offset bug.
+    NameBitSetExtractionFailed,
+}
+
+/// One captured name-extraction miss, with enough context to audit the
+/// packet byte-by-byte. `body_hex` is truncated to the first 96 bytes
+/// — name slots live well within that window (CHAR_PC slot starts at
+/// 0x5A; CHAR_NPC at 0x30).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NameExtractionMiss {
+    pub opcode: u16,
+    pub unique_no: u32,
+    pub act_index: u16,
+    /// `body[6]` — SendFlg byte for CHAR_PC, updatemask byte for CHAR_NPC.
+    pub send_flag: u8,
+    pub body_len: usize,
+    /// Lowercase hex of the first `min(body_len, 96)` bytes of the body.
+    pub body_hex: String,
+    pub miss_kind: NameMissKind,
+    /// `SystemTime::now()` epoch-ms when the miss was captured. Lets
+    /// the auditor pair the miss against the entity's last `EntityUpserted`.
+    pub at_unix_ms: u64,
+}
+
+/// Cap on retained name-extraction misses. 64 covers ~a minute of
+/// distinct misses at the rate-limited emit cadence.
+const NAME_MISSES_CAP: usize = 64;
+
 /// One row in the agent's view of the party. Populated from
 /// `0x0DD GROUP_LIST` (other members; provides name + leader flags) and
 /// `0x0DF GROUP_ATTR` (self + Trusts; HP/MP/TP refreshes only). Apply
@@ -481,6 +557,30 @@ pub struct PartyMember {
 const CHAT_HISTORY_CAP: usize = 256;
 
 impl SessionState {
+    /// Player's position derived from the self entity in the entity list
+    /// (the one whose `id == self.char_id`). Returns `None` if `char_id`
+    /// isn't known yet, or if no matching entity has been upserted —
+    /// callers handling that case decide whether to substitute
+    /// `Position::default()` or wait for the first `EntityUpserted` for
+    /// self.
+    ///
+    /// This is the *only* source of self position. `WireSnapshot.self_pos`
+    /// is populated from it. The previous duplicate `state.self_pos`
+    /// field has been removed (Stage 5 of the
+    /// `collapse-self-position-to-single-source-of-truth` refactor).
+    pub fn self_position(&self) -> Option<Position> {
+        let char_id = self.char_id?;
+        self.entities
+            .iter()
+            .find(|e| e.id == char_id)
+            .map(|e| Position {
+                pos: e.pos,
+                heading: e.heading,
+                speed: e.speed,
+                speed_base: e.speed_base,
+            })
+    }
+
     /// Pure fold: apply an `AgentEvent` to derive the new state. Kept free of
     /// I/O so it's trivially testable and so a watch-based renderer never
     /// blocks the event-broadcast task.
@@ -504,21 +604,100 @@ impl SessionState {
             AgentEvent::ZoneChanged { to, .. } => {
                 self.zone_id = Some(*to);
                 // Entities from the old zone are stale on zone change; the
-                // new zone's flood will repopulate.
+                // new zone's flood will repopulate. Same goes for the
+                // party roster: HP/MP percent values get a fresh
+                // `party-attr` packet on the other side, and stale zero
+                // HP would (a) misrender self_hud bars and (b) trigger
+                // the death-prompt HUD spuriously when the player dies
+                // → Returns-to-Home (Phoenix `HomePoint` restores HP,
+                // but the new zone's party-attr arrives after the LOGIN
+                // packet, so `is_dead` would briefly stay `true`).
                 self.entities.clear();
+                self.party.clear();
             }
             AgentEvent::PositionChanged { pos } => {
-                self.self_pos = *pos;
+                // Single source of truth: the self entity in the entity list.
+                // Find the entry whose `id == self.char_id` and update its
+                // position fields in place. If it doesn't exist yet (we
+                // received `PositionChanged` before LOGIN/CHAR_PC seeded
+                // the entity), no-op — the next CHAR_PC or LOGIN-seed
+                // event will land with the real server-authoritative
+                // value anyway.
+                if let Some(char_id) = self.char_id {
+                    if let Some(ent) = self.entities.iter_mut().find(|e| e.id == char_id) {
+                        ent.pos = pos.pos;
+                        ent.heading = pos.heading;
+                        ent.speed = pos.speed;
+                        ent.speed_base = pos.speed_base;
+                    }
+                }
             }
             AgentEvent::EntityUpserted { entity } => {
                 if let Some(existing) = self.entities.iter_mut().find(|e| e.id == entity.id) {
-                    *existing = entity.clone();
+                    // CHAR_NPC (0x0E) only includes the name on packets where
+                    // the server set UPDATE_NAME — typically ENTITY_SPAWN and
+                    // renamed-mob ticks (see vendor/server/.../entity_update.cpp).
+                    // Position-only follow-ups arrive with body length < 64,
+                    // making try_extract_name return None. Preserve the prior
+                    // name on those so the target panel doesn't drop to "?".
+                    let preserved_name = entity
+                        .name
+                        .clone()
+                        .or_else(|| existing.name.clone());
+                    let merged_kind = merge_kind(existing.kind, entity.kind);
+                    // Same field-gating logic as `name`: the producer
+                    // (session.rs CHAR_PC/CHAR_NPC handler) only fills
+                    // `hp_pct` when the server set UPDATE_HP (0x04) in the
+                    // updatemask. Position-only ticks arrive with
+                    // `hp_pct: None`; preserve the prior value so the target
+                    // panel doesn't oscillate against an uninitialized zero
+                    // byte from the LSB packet buffer.
+                    let preserved_hp_pct = entity.hp_pct.or(existing.hp_pct);
+                    *existing = Entity {
+                        name: preserved_name,
+                        kind: merged_kind,
+                        hp_pct: preserved_hp_pct,
+                        ..entity.clone()
+                    };
                 } else {
                     self.entities.push(entity.clone());
                 }
             }
             AgentEvent::EntityRemoved { id } => {
                 self.entities.retain(|e| e.id != *id);
+            }
+            AgentEvent::NameExtractionMiss { miss } => {
+                self.name_misses.push_back(miss.clone());
+                while self.name_misses.len() > NAME_MISSES_CAP {
+                    self.name_misses.pop_front();
+                }
+            }
+            AgentEvent::EntityPatched {
+                id,
+                act_index,
+                name,
+                kind,
+                hp_pct,
+            } => {
+                // Resolve target entity by id (preferred) or act_index. Drop
+                // the patch if neither matches a known entity — pets and
+                // trusts get a CHAR_NPC stream that creates the entry; this
+                // patch is enrichment, not creation.
+                let existing = self.entities.iter_mut().find(|e| {
+                    id.is_some_and(|target| e.id == target)
+                        || act_index.is_some_and(|target| e.act_index == target)
+                });
+                if let Some(existing) = existing {
+                    if let Some(n) = name {
+                        existing.name = Some(n.clone());
+                    }
+                    if let Some(k) = kind {
+                        existing.kind = merge_kind(existing.kind, *k);
+                    }
+                    if let Some(hp) = hp_pct {
+                        existing.hp_pct = Some(*hp);
+                    }
+                }
             }
             AgentEvent::ChatLine { line } => {
                 self.chat.push(line.clone());
@@ -608,7 +787,9 @@ impl SessionState {
             | AgentEvent::PartyMemberLowHp { .. }
             | AgentEvent::EngagedBy { .. }
             | AgentEvent::TellReceived { .. }
-            | AgentEvent::SceneSummary { .. } => {}
+            | AgentEvent::SceneSummary { .. }
+            | AgentEvent::HumanInControl { .. }
+            | AgentEvent::HumanReleased => {}
             AgentEvent::InventoryUpdated { container, update } => {
                 let entry = self
                     .inventory
@@ -719,6 +900,34 @@ pub enum AgentEvent {
     EntityRemoved {
         id: u32,
     },
+    /// Diagnostic event fired when `PosHead::try_extract_name` returns
+    /// `None` for a CHAR_PC or CHAR_NPC packet. Captures the raw body
+    /// so the MCP-side `debug://name_misses` resource can surface the
+    /// bytes to an auditor without re-running the client with extra
+    /// logging. Rate-limited at the emitter (one per `(id, kind)` per
+    /// 30s) so it never floods the attach socket.
+    NameExtractionMiss {
+        miss: NameExtractionMiss,
+    },
+    /// Partial update for an existing entity — used by name-only packets
+    /// (`0x067 CEntitySetNamePacket`, trust/fellow/pankration names) and
+    /// pet enrichment (`0x068 CPetSyncPacket`). Either `id` or `act_index`
+    /// must be set; the state handler resolves the entity, then applies
+    /// only the `Some(_)` fields. If the entity is unknown (no prior
+    /// CHAR_NPC), the patch is dropped — the next CHAR_NPC will spawn
+    /// the entity and a subsequent patch can re-enrich it.
+    EntityPatched {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        act_index: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<EntityKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hp_pct: Option<u8>,
+    },
     ChatLine {
         line: ChatLine,
     },
@@ -827,6 +1036,24 @@ pub enum AgentEvent {
     LlmDecision {
         decision: LlmDecision,
     },
+    /// The native operator has paused agent control via `/agent pause`.
+    /// Subsequent agent-originated commands (from `agent_codec` /
+    /// `agent_socket`) will be silently dropped until the matching
+    /// [`HumanReleased`](Self::HumanReleased) fires. GUI slash commands
+    /// continue to flow through unchanged — the operator is taking the
+    /// stick. Well-behaved agents see this event and stop initiating
+    /// actions; the wire-level gate is the agent_codec drop, but the
+    /// event lets the harness log the takeover and the LLM stand down
+    /// cooperatively rather than having its tool calls disappear into
+    /// the void.
+    HumanInControl {
+        /// Free-form context, e.g. why the operator took over. May be
+        /// empty.
+        reason: String,
+    },
+    /// `/agent resume` — the operator released control back to the
+    /// agent. Pair with [`HumanInControl`](Self::HumanInControl).
+    HumanReleased,
 }
 
 /// Strictly enumerated commands an agent can issue. **Do not** add a generic
@@ -904,6 +1131,16 @@ pub enum AgentCommand {
         target_index: u16,
         kind: ActionKind,
     },
+    /// Accept the home-point warp menu (sent automatically by the official
+    /// FFXI client after death, when the player picks "Return to home
+    /// point"). Wraps `ActionKind::HomepointMenu { status_id: 0 }` (Accept)
+    /// but doesn't require the caller to know the player's own
+    /// `(UniqueNo, ActIndex)` — the session loop fills those from the
+    /// session-tracked self identity. Phoenix's handler ignores the wire
+    /// `(UniqueNo, ActIndex)` for this `ActionID` (acts on `PChar`
+    /// directly, see `0x01a_action.cpp::HomepointMenu`), so a stale
+    /// `self_act_index` still yields the same outcome.
+    ReturnToHomePoint,
     /// Reactor goal: keep stepping toward `target_id`, holding `distance`
     /// yalms once close. Works for follow-leader (party PC) and chase-mob.
     /// Handled by `crate::reactor`; if it reaches the session loop the
@@ -966,6 +1203,17 @@ pub enum AgentCommand {
         target_index: u16,
         kind: CheckKind,
     },
+    /// `GP_CLI_COMMAND_CAMP` (0x0E8) — `/heal`. Toggles the resting
+    /// (`EFFECT_HEALING`) state. Server validation rejects this packet
+    /// when the player is engaged, in event, crafting, or under an
+    /// abnormal status (see `vendor/server/src/map/packets/c2s/0x0e8_camp.cpp`).
+    /// Cancelling heal *also* cancels an in-progress `EFFECT_LEAVEGAME`
+    /// via the heal effect's Lua `onEffectLose` — so `/heal off` while
+    /// /logout-armed effectively cancels the logout. The session loop
+    /// also intercepts position-changing keepalives while healing and
+    /// prepends a `Mode::Off` packet so movement implicitly cancels
+    /// rest, matching retail-client behavior.
+    Heal { mode: HealMode },
 }
 
 /// Sub-kind for [`AgentCommand::CheckTarget`]. Mirrors
@@ -989,6 +1237,34 @@ impl CheckKind {
             CheckKind::Check => 0,
             CheckKind::CheckName => 1,
             CheckKind::CheckParam => 2,
+        }
+    }
+}
+
+/// Sub-kind for [`AgentCommand::Heal`]. Mirrors `GP_CLI_COMMAND_CAMP_MODE`
+/// in `vendor/server/src/map/packets/c2s/0x0e8_camp.h`. `Toggle` is the
+/// always-safe form — server picks the direction based on current
+/// animation. `On`/`Off` are explicit and the server rejects mismatches
+/// ("Requested healing when already healing" / "Requested stop healing
+/// when not healing").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealMode {
+    /// `/heal` (no arg) — toggle resting on/off; server decides direction.
+    Toggle,
+    /// `/heal on` — explicitly start resting. Rejected if already healing.
+    On,
+    /// `/heal off` — explicitly stop resting. Rejected if not healing.
+    Off,
+}
+
+impl HealMode {
+    /// Server `Mode` u32. Matches `GP_CLI_COMMAND_CAMP_MODE`.
+    pub fn as_u32(self) -> u32 {
+        match self {
+            HealMode::Toggle => 0,
+            HealMode::On => 1,
+            HealMode::Off => 2,
         }
     }
 }
@@ -1346,6 +1622,7 @@ mod tests {
                 pos: Vec3 { x: 1.0, y: 0.0, z: 2.0 },
                 heading: 64,
                 hp_pct: Some(80), bt_target_id: 0, claim_id: 0,
+                speed: 0, speed_base: 0,
             },
         });
         assert_eq!(s.entities.len(), 1);
@@ -1360,19 +1637,238 @@ mod tests {
                 pos: Vec3 { x: 5.0, y: 0.0, z: 6.0 },
                 heading: 32,
                 hp_pct: Some(50), bt_target_id: 0, claim_id: 0,
+                speed: 0, speed_base: 0,
             },
         });
         assert_eq!(s.entities.len(), 1, "upsert must not duplicate by id");
         assert_eq!(s.entities[0].pos.x, 5.0, "upsert must overwrite");
 
-        // ZoneChanged clears entities (stale zone state) and updates zone_id.
+        // ZoneChanged clears entities AND party (both are stale across
+        // zone boundaries) and updates zone_id. The party clear is
+        // load-bearing for the death-prompt HUD: post-Return-to-Home,
+        // Phoenix restores HP server-side, but our snapshot's party
+        // row carries the old zero-HP value until the new zone's
+        // `party-attr` arrives. Without the clear, `is_dead` returns
+        // true for ~100ms after zone-in, the prompt re-appears, and
+        // an Enter press would re-dispatch HomepointMenu.
+        s.party.push(PartyMember {
+            id: 1, act_index: 1, name: None,
+            hp: 0, mp: 0, tp: 0, hp_pct: 0, mp_pct: 100,
+            zone_no: 100, main_job: 0, main_job_lv: 0,
+            sub_job: 0, sub_job_lv: 0,
+            is_party_leader: true, is_alliance_leader: false,
+        });
         s.apply_event(&AgentEvent::ZoneChanged { from: Some(100), to: 230 });
         assert_eq!(s.zone_id, Some(230));
         assert!(s.entities.is_empty(), "zone change must clear stale entities");
+        assert!(s.party.is_empty(), "zone change must clear stale party (avoids stale dead-state on home-point warp)");
 
         // Disconnected lands the terminal stage.
         s.apply_event(&AgentEvent::Disconnected { reason: "test".into() });
         assert_eq!(s.stage, Stage::Disconnected);
+    }
+
+    #[test]
+    fn merge_kind_specialized_wins_over_other() {
+        use EntityKind::*;
+        // Other never demotes a specialized kind.
+        assert_eq!(merge_kind(Pc, Other), Pc);
+        assert_eq!(merge_kind(Npc, Other), Npc);
+        assert_eq!(merge_kind(Mob, Other), Mob);
+        assert_eq!(merge_kind(Pet, Other), Pet);
+        // Other → specialized upgrades.
+        assert_eq!(merge_kind(Other, Pet), Pet);
+        assert_eq!(merge_kind(Other, Npc), Npc);
+        // Specialized → specialized: newer wins.
+        assert_eq!(merge_kind(Npc, Pet), Pet);
+        assert_eq!(merge_kind(Pet, Npc), Npc);
+        // Other → Other: no change.
+        assert_eq!(merge_kind(Other, Other), Other);
+    }
+
+    fn make_test_entity(id: u32, name: Option<&str>, kind: EntityKind) -> Entity {
+        Entity {
+            id,
+            act_index: id as u16,
+            kind,
+            name: name.map(str::to_string),
+            pos: Vec3 { x: 1.0, y: 2.0, z: 3.0 },
+            heading: 0,
+            hp_pct: Some(100),
+            bt_target_id: 0,
+            claim_id: 0,
+            speed: 0,
+            speed_base: 0,
+        }
+    }
+
+    #[test]
+    fn entity_upserted_preserves_name_across_attr_only_update() {
+        // Spawn with a name (UPDATE_NAME path), then a position-only
+        // follow-up arrives with name = None. The cached name must not
+        // be lost — this is the bug behind the "? [npc]" target panel.
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: make_test_entity(42, Some("Sigli-Sea"), EntityKind::Npc),
+        });
+        assert_eq!(s.entities[0].name.as_deref(), Some("Sigli-Sea"));
+
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: make_test_entity(42, None, EntityKind::Npc),
+        });
+        assert_eq!(s.entities[0].name.as_deref(), Some("Sigli-Sea"), "name must persist across attr-only update");
+    }
+
+    #[test]
+    fn entity_upserted_preserves_hp_pct_across_position_only_update() {
+        // Mirror of the name-preservation test for HP%. The CHAR_NPC
+        // producer only fills `hp_pct: Some(_)` when LSB sets UPDATE_HP
+        // (0x04) in the updatemask. Position-only ticks arrive with
+        // `hp_pct: None`; the reducer must keep the prior value rather
+        // than overwriting it with a stale zero byte from the LSB
+        // packet buffer.
+        let mut s = SessionState::default();
+        let mut ent = make_test_entity(42, Some("Worker Bee"), EntityKind::Npc);
+        ent.hp_pct = Some(50);
+        s.apply_event(&AgentEvent::EntityUpserted { entity: ent });
+        assert_eq!(s.entities[0].hp_pct, Some(50));
+
+        let mut pos_only = make_test_entity(42, None, EntityKind::Npc);
+        pos_only.hp_pct = None;
+        s.apply_event(&AgentEvent::EntityUpserted { entity: pos_only });
+        assert_eq!(
+            s.entities[0].hp_pct,
+            Some(50),
+            "hp_pct must persist across UPDATE_POS-only follow-up (no UPDATE_HP bit set)"
+        );
+
+        // A genuine UPDATE_HP tick (`Some(0)` = mob just died) must
+        // still win — preservation is keyed on the new value being
+        // `None`, not on the new value being zero.
+        let mut died = make_test_entity(42, None, EntityKind::Npc);
+        died.hp_pct = Some(0);
+        s.apply_event(&AgentEvent::EntityUpserted { entity: died });
+        assert_eq!(
+            s.entities[0].hp_pct,
+            Some(0),
+            "Some(0) (mob died) must overwrite, not get preserved as Some(50)"
+        );
+    }
+
+    #[test]
+    fn entity_upserted_specialized_kind_resists_demotion_to_other() {
+        // CHAR_NPC tags entity as Npc; a stray Other update must not
+        // demote it. (The 0x067/0x068 phantom-entity bug was the
+        // source of Other updates clobbering specialized kinds.)
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: make_test_entity(7, Some("Stout Servitor"), EntityKind::Npc),
+        });
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: make_test_entity(7, Some("Stout Servitor"), EntityKind::Other),
+        });
+        assert_eq!(s.entities[0].kind, EntityKind::Npc);
+    }
+
+    #[test]
+    fn entity_patched_by_id_sets_name_on_existing_entity() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: make_test_entity(99, None, EntityKind::Other),
+        });
+        s.apply_event(&AgentEvent::EntityPatched {
+            id: Some(99),
+            act_index: None,
+            name: Some("Mihli Aliapoh".into()),
+            kind: Some(EntityKind::Pet),
+            hp_pct: None,
+        });
+        assert_eq!(s.entities[0].name.as_deref(), Some("Mihli Aliapoh"));
+        assert_eq!(s.entities[0].kind, EntityKind::Pet);
+    }
+
+    #[test]
+    fn entity_patched_by_act_index_resolves_when_id_unknown() {
+        // PetSync delivers `pet_targid` (act_index) but never the pet's
+        // full id — the patch must resolve via act_index.
+        let mut s = SessionState::default();
+        let mut ent = make_test_entity(0xABCD, None, EntityKind::Other);
+        ent.act_index = 0x07A5;
+        s.apply_event(&AgentEvent::EntityUpserted { entity: ent });
+        s.apply_event(&AgentEvent::EntityPatched {
+            id: None,
+            act_index: Some(0x07A5),
+            name: Some("Crab Familiar".into()),
+            kind: Some(EntityKind::Pet),
+            hp_pct: Some(75),
+        });
+        assert_eq!(s.entities[0].name.as_deref(), Some("Crab Familiar"));
+        assert_eq!(s.entities[0].kind, EntityKind::Pet);
+        assert_eq!(s.entities[0].hp_pct, Some(75));
+    }
+
+    #[test]
+    fn name_extraction_miss_appends_to_ring_buffer_with_cap() {
+        let mut s = SessionState::default();
+        // Push more than the cap and verify FIFO eviction.
+        for i in 0..(NAME_MISSES_CAP as u32 + 5) {
+            s.apply_event(&AgentEvent::NameExtractionMiss {
+                miss: NameExtractionMiss {
+                    opcode: 0x00E,
+                    unique_no: i,
+                    act_index: i as u16,
+                    send_flag: 0,
+                    body_len: 64,
+                    body_hex: format!("{:02x}", i & 0xFF),
+                    miss_kind: NameMissKind::NameBitClear,
+                    at_unix_ms: 1000 + u64::from(i),
+                },
+            });
+        }
+        assert_eq!(s.name_misses.len(), NAME_MISSES_CAP);
+        // The first 5 entries should have been evicted; oldest now is i=5.
+        assert_eq!(s.name_misses.front().unwrap().unique_no, 5);
+        // Newest at the back.
+        assert_eq!(
+            s.name_misses.back().unwrap().unique_no,
+            NAME_MISSES_CAP as u32 + 4
+        );
+    }
+
+    #[test]
+    fn name_extraction_miss_round_trips_serde() {
+        let miss = NameExtractionMiss {
+            opcode: 0x00D,
+            unique_no: 0x0102_0304,
+            act_index: 0x07A5,
+            send_flag: 0x09,
+            body_len: 72,
+            body_hex: "deadbeef".into(),
+            miss_kind: NameMissKind::NameBitSetExtractionFailed,
+            at_unix_ms: 1_700_000_000_123,
+        };
+        let s = serde_json::to_string(&miss).unwrap();
+        let back: NameExtractionMiss = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.unique_no, 0x0102_0304);
+        assert_eq!(back.miss_kind, NameMissKind::NameBitSetExtractionFailed);
+        // miss_kind serialises in snake_case to match the AgentEvent tag style.
+        assert!(s.contains("name_bit_set_extraction_failed"));
+    }
+
+    #[test]
+    fn entity_patched_for_unknown_entity_is_dropped() {
+        // Without a prior CHAR_NPC spawn there's nothing to patch.
+        // Dropping is safe — the next CHAR_NPC will create the entry
+        // and a subsequent patch can re-enrich.
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::EntityPatched {
+            id: Some(1234),
+            act_index: None,
+            name: Some("Ghost".into()),
+            kind: Some(EntityKind::Pet),
+            hp_pct: None,
+        });
+        assert!(s.entities.is_empty());
     }
 
     #[test]
@@ -1440,6 +1936,46 @@ mod tests {
         let info = s.last_reconnect.expect("set");
         assert_eq!(info.downtime_ms, 1234);
         assert!(info.at_unix_ms > 0, "wall-clock stamped");
+    }
+
+    #[test]
+    fn self_position_returns_self_entity_pos() {
+        let mut s = SessionState::default();
+        // No char_id yet → no self position.
+        assert!(s.self_position().is_none());
+
+        s.apply_event(&AgentEvent::Connected {
+            account_id: 1, char_id: 99, character: "Self".into(), zone_id: 230,
+        });
+        // char_id known, but no entity yet.
+        assert!(s.self_position().is_none());
+
+        // Upsert a self entity; self_position() now returns its fields.
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: Entity {
+                id: 99, act_index: 5, kind: EntityKind::Pc,
+                name: Some("Self".into()),
+                pos: Vec3 { x: 10.0, y: 20.0, z: 30.0 },
+                heading: 64, hp_pct: Some(100), bt_target_id: 0,
+                claim_id: 0, speed: 40, speed_base: 40,
+            },
+        });
+        let p = s.self_position().expect("self entity present");
+        assert_eq!(p.pos, Vec3 { x: 10.0, y: 20.0, z: 30.0 });
+        assert_eq!(p.heading, 64);
+        assert_eq!(p.speed, 40);
+        assert_eq!(p.speed_base, 40);
+
+        // PositionChanged now also mutates the self entity.
+        s.apply_event(&AgentEvent::PositionChanged {
+            pos: Position {
+                pos: Vec3 { x: 1.0, y: 2.0, z: 3.0 },
+                heading: 32, speed: 25, speed_base: 25,
+            },
+        });
+        let p = s.self_position().expect("self entity present");
+        assert_eq!(p.pos, Vec3 { x: 1.0, y: 2.0, z: 3.0 });
+        assert_eq!(p.heading, 32);
     }
 
     #[test]

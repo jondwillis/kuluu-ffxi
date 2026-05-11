@@ -15,14 +15,17 @@ use std::f32::consts::PI;
 use bevy::prelude::*;
 
 use crate::components::WorldEntity;
-use crate::scene::Target;
+use crate::scene::{feet_offset, Target};
 
 /// Bevy world units. Tuned so the ring reads clearly around the default
 /// PC capsule footprint without overlapping neighbours in tight clusters.
 const RING_RADIUS: f32 = 1.5;
 
-/// Lift above the ground plane to avoid z-fighting with the y=0 floor.
-const RING_Y_OFFSET: f32 = 0.05;
+/// Lift above the entity's ground level to avoid z-fighting with
+/// the navmesh / floor. Applied to the per-entity foot position, not
+/// to a hardcoded y=0 — entities now sit at navmesh-height (variable)
+/// rather than on a flat plane.
+const RING_Y_LIFT: f32 = 0.05;
 
 /// Bright yellow matching `EntityMaterials::target` so the ring colour
 /// reads as "the same kind of attention" as the body emissive.
@@ -43,7 +46,11 @@ pub fn draw_target_ring_system(
 
     for (t, w) in &world_q {
         if w.id == target_id {
-            let pos = Vec3::new(t.translation.x, RING_Y_OFFSET, t.translation.z);
+            // Entity's center is at navmesh_h + feet_offset; subtract
+            // feet_offset to land back at the navmesh-ground level
+            // for this entity, then lift slightly to avoid z-fight.
+            let ground_y = t.translation.y - feet_offset(w.kind) + RING_Y_LIFT;
+            let pos = Vec3::new(t.translation.x, ground_y, t.translation.z);
             // Default circle is in the xy plane; rotate -90° around X so it
             // lies flat on xz.
             gizmos.circle(

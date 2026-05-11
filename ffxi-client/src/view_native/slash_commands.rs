@@ -70,6 +70,54 @@ pub enum SlashOutcome {
     /// defaults. The dispatcher applies the change to the `Bindings`
     /// resource and persists via `keybinds_store`.
     ApplyKeybinds(KeybindUpdate),
+    /// `/navinfo` — diagnostic: report whether the current self_pos
+    /// snaps cleanly to a walkable navmesh polygon, and how far away
+    /// the nearest zone-line origin is. Dispatcher resolves this by
+    /// querying the live `NavmeshState` resource. Operator-facing
+    /// chat output, no agent/wire side effect.
+    NavInfo,
+    /// `/agent pause|resume|status` — toggle the human-in-control
+    /// flag. Dispatcher reads/writes the `AgentPaused` resource and
+    /// emits the corresponding `AgentEvent::HumanInControl` /
+    /// `HumanReleased` event on transitions. Parser is pure; the
+    /// dispatcher does the I/O.
+    AgentControl(AgentControlOp),
+    /// `/load_mmb <file_id> <chunk_idx>` — debug-overlay: load and
+    /// spawn an FFXI MMB entity model at `world_pos` (the parser
+    /// pre-applies `ffxi_to_bevy` to self_pos so the dispatcher and
+    /// downstream system stay axis-agnostic). The actual file I/O
+    /// happens inside the `dat_mmb` system that consumes the
+    /// resulting `LoadMmbRequest` event — keeping it out of the
+    /// pure parser and out of `text_input_system`'s param list.
+    LoadMmb {
+        file_id: u32,
+        chunk_idx: usize,
+        world_pos: WireVec3,
+    },
+    /// `/load_mzb <file_id> [chunk_idx]` — debug-overlay: load a zone
+    /// mesh-library. Optional chunk_idx because zone-bundle DATs
+    /// usually have exactly one MZB; omitting it scans for the first
+    /// kind=0x1C chunk (matches `dat-mzb-probe` behavior).
+    LoadMzb {
+        file_id: u32,
+        chunk_idx: Option<usize>,
+        world_pos: WireVec3,
+    },
+}
+
+/// `/agent` subcommand variants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentControlOp {
+    /// `/agent pause` — set the human-in-control flag. Subsequent
+    /// agent-originated commands are dropped at the codec; the
+    /// transition event `AgentEvent::HumanInControl` fires once.
+    Pause,
+    /// `/agent resume` — clear the flag and fire
+    /// `AgentEvent::HumanReleased`.
+    Resume,
+    /// `/agent status` — operator-facing chat line reporting the
+    /// current paused state. No event fired.
+    Status,
 }
 
 /// `/keybinds` subcommand variants.
@@ -119,22 +167,25 @@ pub fn parse_slash(
             None => SlashOutcome::SystemMessage("/follow: no target".into()),
         },
         "attack" | "engage" => {
-            // Wire-level Action with `ActionKind::Attack` (action_id 0x02) —
-            // not the goal-level `AgentCommand::Engage`. The native viewer
-            // doesn't put a reactor in front of `cmd_rx` (see session.rs:704
-            // "reactor goal command reached session loop"), so goal-level
-            // commands silently fail. The /attack slash needs a packet to
-            // go out, so we issue the action directly.
+            // Reactor goal — matches the MCP `engage` tool's wire shape.
+            // `spawn_session_with_reactor` (`lib.rs:92`) wires the reactor
+            // in front of `cmd_rx` for the native viewer, so goal commands
+            // are absorbed by the per-tick state machine. For the legacy
+            // one-shot `ActionKind::Attack` semantics, see `/raw attack`.
             match resolve_action_target(rest, entities, self_pos, current_target) {
-                Some((id, idx)) => SlashOutcome::Command(AgentCommand::Action {
-                    target_id: id,
-                    target_index: idx,
-                    kind: ActionKind::Attack,
-                }),
+                Some((id, _idx)) => {
+                    SlashOutcome::Command(AgentCommand::Engage { target_id: id })
+                }
                 None => SlashOutcome::SystemMessage(format!("/{cmd}: no target")),
             }
         }
-        "attackoff" | "disengage" => match current_target {
+        // `/disengage` clears the active reactor goal (matching the lack
+        // of a dedicated `disengage` MCP tool — the agent uses `cancel`
+        // to stop attacking). The low-level wire `Action::AttackOff` is
+        // available as `/raw attackoff` when the operator specifically
+        // wants the one-shot packet.
+        "disengage" => SlashOutcome::Command(AgentCommand::Cancel),
+        "attackoff" => match current_target {
             Some(id) => match entities.iter().find(|e| e.id == id) {
                 Some(ent) => SlashOutcome::Command(AgentCommand::Action {
                     target_id: ent.id,
@@ -145,6 +196,13 @@ pub fn parse_slash(
             },
             None => SlashOutcome::SystemMessage(format!("/{cmd}: no target")),
         },
+        // Low-level escape hatch: `/raw <action>` sends the underlying
+        // one-shot `Action` packet, bypassing the reactor. Use for
+        // wire-level debugging when the operator specifically wants the
+        // pre-Stage-4 behavior. Currently supports `attack` and
+        // `attackoff`; `move` would also belong here but `/move` is
+        // already keybind-driven so there's no slash-form pressure yet.
+        "raw" => parse_raw(rest, entities, self_pos, current_target),
         "target" => {
             if rest.is_empty() {
                 SlashOutcome::SetTarget(None)
@@ -181,6 +239,21 @@ pub fn parse_slash(
         "sit" => SlashOutcome::SystemMessage("/sit: not yet wired".into()),
         "stand" => SlashOutcome::SystemMessage("/stand: not yet wired".into()),
         "cancel" => SlashOutcome::Command(AgentCommand::Cancel),
+        // ---- Stage 4 lockstep: every MCP tool has a slash twin -----------
+        // The MCP `cast` / `weaponskill` / `job_ability` tools wrap the same
+        // `Action { ActionKind::* }` shape — slash twins dispatch the
+        // identical AgentCommand. `slash_mcp_lockstep.rs` pins this.
+        "cast" => parse_cast(rest, entities, self_pos, current_target),
+        "ws" | "weaponskill" => parse_weaponskill(rest, entities, self_pos, current_target),
+        "ja" | "jobability" => parse_job_ability(rest, entities, self_pos, current_target),
+        "useitem" | "use" => parse_use_item(rest, entities, self_pos, current_target),
+        "raisemenu" => parse_raise_menu(rest),
+        "tractormenu" => parse_tractor_menu(rest),
+        "homepointmenu" => parse_homepoint_menu(rest),
+        "snapshot" => SlashOutcome::Command(AgentCommand::Snapshot),
+        "bank" => parse_bank(rest),
+        "zonechange" | "rzc" => parse_zone_change(rest),
+        "agent" => parse_agent(rest),
         // `/disconnect` and `/quit` skip the in-world LeaveGame timer
         // and just drop the TCP/UDP sockets. Distinct from `/logout` —
         // the operator chose to abandon the session, not to politely
@@ -198,10 +271,13 @@ pub fn parse_slash(
         // `on`/`off` arguments arm or cancel explicitly.
         "logout" => parse_reqlogout(rest, /* shutdown = */ false),
         "navmesh" => parse_navmesh(rest),
+        "load_mmb" | "loadmmb" => parse_load_mmb(rest, self_pos),
+        "load_mzb" | "loadmzb" => parse_load_mzb(rest, self_pos),
         "keybinds" | "keybind" | "binds" => parse_keybinds(rest),
         "pathto" => parse_pathto(rest, entities, current_target),
         "zones" => parse_zones(zone_id),
         "zoneto" => parse_zoneto(rest, zone_id),
+        "navinfo" => SlashOutcome::NavInfo,
         "whereami" | "pos" => SlashOutcome::SystemMessage(format!(
             "self_pos: x={:.2} y={:.2} z={:.2}  zone={}",
             self_pos.x,
@@ -351,6 +427,399 @@ fn parse_pathto(
     }
 }
 
+// ----- Stage 4 lockstep parsers ---------------------------------------------
+//
+// Each function dispatches the exact `AgentCommand` variant the matching
+// MCP tool would emit. The lockstep test in
+// `ffxi-client/tests/slash_mcp_lockstep.rs` pins this correspondence.
+
+/// `/raw <subcommand>` — escape hatch for the wire-level one-shot
+/// `Action` packets that the goal-level reactor swallows. Currently
+/// supports `attack` and `attackoff`.
+fn parse_raw(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+) -> SlashOutcome {
+    let mut parts = rest.trim().splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+    let arg = parts.next().unwrap_or("").trim();
+    match sub.as_str() {
+        "attack" => match resolve_action_target(arg, entities, self_pos, current_target) {
+            Some((id, idx)) => SlashOutcome::Command(AgentCommand::Action {
+                target_id: id,
+                target_index: idx,
+                kind: ActionKind::Attack,
+            }),
+            None => SlashOutcome::SystemMessage("/raw attack: no target".into()),
+        },
+        "attackoff" => match current_target {
+            Some(id) => match entities.iter().find(|e| e.id == id) {
+                Some(ent) => SlashOutcome::Command(AgentCommand::Action {
+                    target_id: ent.id,
+                    target_index: ent.act_index,
+                    kind: ActionKind::AttackOff,
+                }),
+                None => SlashOutcome::SystemMessage("/raw attackoff: target not in zone".into()),
+            },
+            None => SlashOutcome::SystemMessage("/raw attackoff: no target".into()),
+        },
+        "" => SlashOutcome::SystemMessage(
+            "/raw: usage `/raw attack|attackoff [target]`".into(),
+        ),
+        other => SlashOutcome::SystemMessage(format!("/raw: unknown subcommand `{other}`")),
+    }
+}
+
+/// `/cast <spell_id> [target_id] [target_index] [x y z]`
+///
+/// Wraps `Action { ActionKind::CastMagic { spell_id, pos_* } }`.
+/// `target_id`/`target_index` default to the current target;
+/// `pos_x/y/z` default to (0, 0, 0) for single-target casts. The
+/// ground-target coords matter for AoE spells like Tractor — pass
+/// all three.
+fn parse_cast(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+) -> SlashOutcome {
+    let parts: Vec<&str> = rest.split_ascii_whitespace().collect();
+    if parts.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/cast: usage `/cast <spell_id> [target_id] [target_index] [x y z]`".into(),
+        );
+    }
+    let spell_id: u32 = match parts[0].parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return SlashOutcome::SystemMessage(format!(
+                "/cast: bad spell_id `{}`",
+                parts[0]
+            ));
+        }
+    };
+    let (target_id, target_index) = match parts.get(1) {
+        Some(s) => {
+            let id: u32 = match s.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    return SlashOutcome::SystemMessage(format!("/cast: bad target_id `{s}`"));
+                }
+            };
+            let idx: u16 = match parts.get(2) {
+                Some(t) => match t.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return SlashOutcome::SystemMessage(format!(
+                            "/cast: bad target_index `{t}`"
+                        ));
+                    }
+                },
+                None => entities
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.act_index)
+                    .unwrap_or(0),
+            };
+            (id, idx)
+        }
+        None => match resolve_action_target("", entities, self_pos, current_target) {
+            Some((id, idx)) => (id, idx),
+            None => return SlashOutcome::SystemMessage("/cast: no target".into()),
+        },
+    };
+    let coords: [f32; 3] = match parts.len() {
+        n if n >= 6 => {
+            let xyz: Result<Vec<f32>, _> = parts[3..6].iter().map(|p| p.parse()).collect();
+            match xyz {
+                Ok(v) => [v[0], v[1], v[2]],
+                Err(_) => {
+                    return SlashOutcome::SystemMessage(
+                        "/cast: bad ground-target coords (expected three floats)".into(),
+                    );
+                }
+            }
+        }
+        _ => [0.0, 0.0, 0.0],
+    };
+    SlashOutcome::Command(AgentCommand::Action {
+        target_id,
+        target_index,
+        kind: ActionKind::CastMagic {
+            spell_id,
+            pos_x: coords[0],
+            pos_y: coords[1],
+            pos_z: coords[2],
+        },
+    })
+}
+
+/// `/ws <skill_id> [target_id] [target_index]`
+fn parse_weaponskill(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+) -> SlashOutcome {
+    let parts: Vec<&str> = rest.split_ascii_whitespace().collect();
+    if parts.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/ws: usage `/ws <skill_id> [target_id] [target_index]`".into(),
+        );
+    }
+    let skill_id: u32 = match parts[0].parse() {
+        Ok(n) => n,
+        Err(_) => return SlashOutcome::SystemMessage(format!("/ws: bad skill_id `{}`", parts[0])),
+    };
+    let (target_id, target_index) =
+        match resolve_target_args(&parts[1..], entities, self_pos, current_target) {
+            Ok(pair) => pair,
+            Err(msg) => return SlashOutcome::SystemMessage(format!("/ws: {msg}")),
+        };
+    SlashOutcome::Command(AgentCommand::Action {
+        target_id,
+        target_index,
+        kind: ActionKind::Weaponskill { skill_id },
+    })
+}
+
+/// `/ja <ability_id> [target_id] [target_index]` — self-target by default.
+fn parse_job_ability(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+) -> SlashOutcome {
+    let parts: Vec<&str> = rest.split_ascii_whitespace().collect();
+    if parts.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/ja: usage `/ja <ability_id> [target_id] [target_index]`".into(),
+        );
+    }
+    let ability_id: u32 = match parts[0].parse() {
+        Ok(n) => n,
+        Err(_) => return SlashOutcome::SystemMessage(format!("/ja: bad ability_id `{}`", parts[0])),
+    };
+    // JAs default to self-target when no explicit target — but
+    // self_id isn't in scope here. Caller passes 0/0 which the
+    // server interprets as self for self-target abilities.
+    let (target_id, target_index) =
+        match resolve_target_args(&parts[1..], entities, self_pos, current_target) {
+            Ok(pair) => pair,
+            Err(_) => (0, 0),
+        };
+    SlashOutcome::Command(AgentCommand::Action {
+        target_id,
+        target_index,
+        kind: ActionKind::JobAbility { ability_id },
+    })
+}
+
+/// `/useitem <container> <slot> [item_no] [target_id] [target_index]`
+///
+/// Container ids match Phoenix's storage codes (0=Inventory, 1=Safe, 8=Wardrobe).
+/// `item_no` is the LLM's bookkeeping hint; the wire packet sends 0
+/// per `0x037_item_use.cpp::validate`'s `mustEqual(ItemNum, 0)`.
+fn parse_use_item(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+) -> SlashOutcome {
+    let parts: Vec<&str> = rest.split_ascii_whitespace().collect();
+    if parts.len() < 2 {
+        return SlashOutcome::SystemMessage(
+            "/useitem: usage `/useitem <container> <slot> [item_no] [target_id] [target_index]`"
+                .into(),
+        );
+    }
+    let container: u8 = match parts[0].parse() {
+        Ok(n) => n,
+        Err(_) => return SlashOutcome::SystemMessage(format!("/useitem: bad container `{}`", parts[0])),
+    };
+    let slot: u8 = match parts[1].parse() {
+        Ok(n) => n,
+        Err(_) => return SlashOutcome::SystemMessage(format!("/useitem: bad slot `{}`", parts[1])),
+    };
+    let item_no: u32 = match parts.get(2) {
+        Some(s) => match s.parse() {
+            Ok(n) => n,
+            Err(_) => return SlashOutcome::SystemMessage(format!("/useitem: bad item_no `{s}`")),
+        },
+        None => 0,
+    };
+    let tail: &[&str] = parts.get(3..).unwrap_or(&[]);
+    let (target_id, target_index) =
+        match resolve_target_args(tail, entities, self_pos, current_target) {
+            Ok(pair) => pair,
+            Err(_) => (0, 0),
+        };
+    SlashOutcome::Command(AgentCommand::UseItem {
+        container,
+        slot,
+        item_no,
+        target_id,
+        target_index,
+    })
+}
+
+/// `/raisemenu accept|decline` — respond to the in-game raise prompt.
+fn parse_raise_menu(rest: &str) -> SlashOutcome {
+    match rest.trim().to_ascii_lowercase().as_str() {
+        "accept" | "yes" | "y" => SlashOutcome::Command(AgentCommand::Action {
+            target_id: 0,
+            target_index: 0,
+            kind: ActionKind::RaiseMenu { accept: true },
+        }),
+        "decline" | "no" | "n" => SlashOutcome::Command(AgentCommand::Action {
+            target_id: 0,
+            target_index: 0,
+            kind: ActionKind::RaiseMenu { accept: false },
+        }),
+        "" => SlashOutcome::SystemMessage("/raisemenu: usage `/raisemenu accept|decline`".into()),
+        other => SlashOutcome::SystemMessage(format!("/raisemenu: bad choice `{other}`")),
+    }
+}
+
+/// `/tractormenu accept|decline` — respond to the in-game tractor prompt.
+fn parse_tractor_menu(rest: &str) -> SlashOutcome {
+    match rest.trim().to_ascii_lowercase().as_str() {
+        "accept" | "yes" | "y" => SlashOutcome::Command(AgentCommand::Action {
+            target_id: 0,
+            target_index: 0,
+            kind: ActionKind::TractorMenu { accept: true },
+        }),
+        "decline" | "no" | "n" => SlashOutcome::Command(AgentCommand::Action {
+            target_id: 0,
+            target_index: 0,
+            kind: ActionKind::TractorMenu { accept: false },
+        }),
+        "" => SlashOutcome::SystemMessage(
+            "/tractormenu: usage `/tractormenu accept|decline`".into(),
+        ),
+        other => SlashOutcome::SystemMessage(format!("/tractormenu: bad choice `{other}`")),
+    }
+}
+
+/// `/homepointmenu <status_id>` — respond to the homepoint warp prompt.
+/// `status_id` is the server's `WarpStatus` (0=accept, 1=cancel monstrosity,
+/// 2=retry). Mirrors the MCP `homepoint_menu` tool argument.
+fn parse_homepoint_menu(rest: &str) -> SlashOutcome {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/homepointmenu: usage `/homepointmenu <status_id>` (0=accept,1=cancel,2=retry)".into(),
+        );
+    }
+    match trimmed.parse::<u32>() {
+        Ok(status_id) => SlashOutcome::Command(AgentCommand::Action {
+            target_id: 0,
+            target_index: 0,
+            kind: ActionKind::HomepointMenu { status_id },
+        }),
+        Err(_) => {
+            SlashOutcome::SystemMessage(format!("/homepointmenu: bad status_id `{trimmed}`"))
+        }
+    }
+}
+
+/// `/bank <threshold> <mog_house_zoneline>` — start the BankWhenFull
+/// reactor goal.
+fn parse_bank(rest: &str) -> SlashOutcome {
+    let parts: Vec<&str> = rest.split_ascii_whitespace().collect();
+    if parts.len() != 2 {
+        return SlashOutcome::SystemMessage(
+            "/bank: usage `/bank <threshold> <mog_house_zoneline>`".into(),
+        );
+    }
+    let threshold: u8 = match parts[0].parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return SlashOutcome::SystemMessage(format!(
+                "/bank: bad threshold `{}`",
+                parts[0]
+            ));
+        }
+    };
+    let mog_house_zoneline: u32 = match parts[1].parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return SlashOutcome::SystemMessage(format!(
+                "/bank: bad mog_house_zoneline `{}`",
+                parts[1]
+            ));
+        }
+    };
+    SlashOutcome::Command(AgentCommand::BankWhenFull {
+        threshold,
+        mog_house_zoneline,
+    })
+}
+
+/// `/agent <pause|resume|status>` — toggle the human-in-control
+/// pause flag and emit the matching transition event. The dispatcher
+/// resolves the parsed `AgentControlOp` against the `AgentPaused`
+/// Bevy resource — when the resource is absent (no `--agent-listen`
+/// configured) the dispatcher emits a system chat line instead of
+/// flipping anything.
+fn parse_agent(rest: &str) -> SlashOutcome {
+    let trimmed = rest.trim().to_ascii_lowercase();
+    match trimmed.as_str() {
+        "pause" => SlashOutcome::AgentControl(AgentControlOp::Pause),
+        "resume" | "unpause" => SlashOutcome::AgentControl(AgentControlOp::Resume),
+        "status" | "" => SlashOutcome::AgentControl(AgentControlOp::Status),
+        other => SlashOutcome::SystemMessage(format!(
+            "/agent: unknown subcommand `{other}` (use pause|resume|status)"
+        )),
+    }
+}
+
+/// `/zonechange <line_id>` — fire a `RequestZoneChange` (the MCP
+/// `request_zone_change` tool's wire shape). The character must already
+/// be standing in the zoneline rect for the server to honor it.
+fn parse_zone_change(rest: &str) -> SlashOutcome {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/zonechange: usage `/zonechange <line_id>`".into(),
+        );
+    }
+    match trimmed.parse::<u32>() {
+        Ok(line_id) => SlashOutcome::Command(AgentCommand::RequestZoneChange { line_id }),
+        Err(_) => SlashOutcome::SystemMessage(format!("/zonechange: bad line_id `{trimmed}`")),
+    }
+}
+
+/// Helper: resolve `[target_id] [target_index]` from raw parts, falling
+/// back to the current target's entity lookup. Returns `(id, idx)` or a
+/// short error message suitable for embedding in a `/<cmd>: …` reply.
+fn resolve_target_args(
+    parts: &[&str],
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+) -> Result<(u32, u16), String> {
+    if let Some(s) = parts.first() {
+        let id: u32 = s.parse().map_err(|_| format!("bad target_id `{s}`"))?;
+        let idx: u16 = match parts.get(1) {
+            Some(t) => t
+                .parse()
+                .map_err(|_| format!("bad target_index `{t}`"))?,
+            None => entities
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.act_index)
+                .unwrap_or(0),
+        };
+        Ok((id, idx))
+    } else {
+        resolve_action_target("", entities, self_pos, current_target)
+            .ok_or_else(|| "no target".to_string())
+    }
+}
+
 /// `/zones` — list zone-line destinations from the current zone in
 /// the chat panel. Each line shows `→ Zone_Name (id)` and the FFXI
 /// trigger position the operator can `/pathto` to. Read-only;
@@ -426,6 +895,78 @@ fn parse_zoneto(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
         None => SlashOutcome::SystemMessage(format!(
             "/zoneto: no zone-line matches `{needle}` (try `/zones` to list)"
         )),
+    }
+}
+
+/// `/load_mmb <file_id> <chunk_idx>` — debug-overlay command for the
+/// Phase 10a DAT pipeline. Spawns the MMB at the player's current
+/// world position. Both args are decimal integers; bad parses get a
+/// usage line in chat rather than a silent no-op.
+///
+/// The parser captures `self_pos` *at command time* (it's the snapshot
+/// passed into `parse_slash`). The overlay does NOT track the player —
+/// it stays where the operator stood when they typed the command, so
+/// they can walk around the spawned model. `ffxi_to_bevy` is applied
+/// here at the parser boundary, matching the convention used by every
+/// other place we cross the FFXI→Bevy axis flip.
+fn parse_load_mmb(rest: &str, self_pos: WireVec3) -> SlashOutcome {
+    let mut parts = rest.split_whitespace();
+    let file_str = parts.next().unwrap_or("");
+    let chunk_str = parts.next().unwrap_or("");
+    if file_str.is_empty() || chunk_str.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/load_mmb: usage `/load_mmb <file_id> <chunk_idx>`".into(),
+        );
+    }
+    let file_id: u32 = match file_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return SlashOutcome::SystemMessage(format!("/load_mmb: bad file_id `{file_str}`"))
+        }
+    };
+    let chunk_idx: usize = match chunk_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return SlashOutcome::SystemMessage(format!("/load_mmb: bad chunk_idx `{chunk_str}`"))
+        }
+    };
+    SlashOutcome::LoadMmb {
+        file_id,
+        chunk_idx,
+        world_pos: self_pos,
+    }
+}
+
+/// `/load_mzb <file_id> [chunk_idx]` — Phase 11a debug-overlay
+/// companion to `/load_mmb`. Optional chunk_idx — zone DATs usually
+/// only have one MZB so we auto-scan when it's omitted.
+fn parse_load_mzb(rest: &str, self_pos: WireVec3) -> SlashOutcome {
+    let mut parts = rest.split_whitespace();
+    let file_str = parts.next().unwrap_or("");
+    if file_str.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/load_mzb: usage `/load_mzb <file_id> [chunk_idx]`".into(),
+        );
+    }
+    let file_id: u32 = match file_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return SlashOutcome::SystemMessage(format!("/load_mzb: bad file_id `{file_str}`"))
+        }
+    };
+    let chunk_idx = match parts.next() {
+        None => None,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                return SlashOutcome::SystemMessage(format!("/load_mzb: bad chunk_idx `{s}`"))
+            }
+        },
+    };
+    SlashOutcome::LoadMzb {
+        file_id,
+        chunk_idx,
+        world_pos: self_pos,
     }
 }
 
@@ -569,6 +1110,8 @@ mod tests {
             hp_pct: None,
             bt_target_id: 0,
             claim_id: 0,
+            speed: 0,
+            speed_base: 0,
         }
     }
 
@@ -756,6 +1299,81 @@ mod tests {
         }
     }
 
+    /// `/load_mmb` requires both args (file_id + chunk_idx). Verify
+    /// happy path captures `self_pos` as the parser's snapshot — the
+    /// model spawns where the operator stood, not where they later
+    /// walk to.
+    #[test]
+    fn load_mmb_parses_file_id_chunk_idx_and_captures_self_pos() {
+        let pos = WireVec3 { x: 12.5, y: -7.0, z: 3.25 };
+        match parse_slash("/load_mmb 115 18", &empty_entities(), pos, None, None) {
+            SlashOutcome::LoadMmb { file_id, chunk_idx, world_pos } => {
+                assert_eq!(file_id, 115);
+                assert_eq!(chunk_idx, 18);
+                assert_eq!(world_pos, pos);
+            }
+            other => panic!("expected LoadMmb, got {other:?}"),
+        }
+    }
+
+    /// Both aliases (`load_mmb` and `loadmmb`) and bad args fall to
+    /// `SystemMessage` so the operator sees a usage line instead of a
+    /// silent no-op.
+    #[test]
+    fn load_mmb_alias_and_bad_args() {
+        // Alias `/loadmmb` (no underscore) still routes.
+        assert!(matches!(
+            parse_slash("/loadmmb 115 18", &empty_entities(), origin(), None, None),
+            SlashOutcome::LoadMmb { file_id: 115, chunk_idx: 18, .. }
+        ));
+        // Missing chunk_idx, non-numeric file_id, non-numeric chunk_idx.
+        for s in ["/load_mmb", "/load_mmb 115", "/load_mmb foo 18", "/load_mmb 115 bar"] {
+            assert!(
+                matches!(
+                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    SlashOutcome::SystemMessage(_)
+                ),
+                "expected SystemMessage for {s}",
+            );
+        }
+    }
+
+    /// `/load_mzb` allows omitting chunk_idx (the consumer scans for
+    /// the first kind=0x1C). Captures `self_pos` like `/load_mmb`.
+    #[test]
+    fn load_mzb_parses_optional_chunk_idx() {
+        let pos = WireVec3 { x: 1.0, y: 2.0, z: 3.0 };
+        // No chunk_idx: `None`.
+        match parse_slash("/load_mzb 7368", &empty_entities(), pos, None, None) {
+            SlashOutcome::LoadMzb { file_id, chunk_idx, world_pos } => {
+                assert_eq!(file_id, 7368);
+                assert_eq!(chunk_idx, None);
+                assert_eq!(world_pos, pos);
+            }
+            other => panic!("expected LoadMzb, got {other:?}"),
+        }
+        // Explicit chunk_idx.
+        match parse_slash("/load_mzb 7368 2", &empty_entities(), pos, None, None) {
+            SlashOutcome::LoadMzb { chunk_idx: Some(2), .. } => {}
+            other => panic!("expected LoadMzb chunk_idx=Some(2), got {other:?}"),
+        }
+        // Alias `/loadmzb`.
+        assert!(matches!(
+            parse_slash("/loadmzb 7368", &empty_entities(), pos, None, None),
+            SlashOutcome::LoadMzb { chunk_idx: None, .. }
+        ));
+        // Bad args fall to SystemMessage.
+        for s in ["/load_mzb", "/load_mzb foo", "/load_mzb 7368 bar"] {
+            assert!(
+                matches!(
+                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    SlashOutcome::SystemMessage(_)
+                ),
+                "expected SystemMessage for {s}",
+            );
+        }
+    }
+
     #[test]
     fn navmesh_no_arg_toggles() {
         match parse_slash("/navmesh", &empty_entities(), origin(), None, None) {
@@ -834,20 +1452,18 @@ mod tests {
     }
 
     #[test]
-    fn attack_uses_current_target_and_attack_kind() {
+    fn attack_uses_current_target_and_engage_goal() {
+        // Stage 4a normalized `/attack` from `Action::Attack` (one-shot
+        // wire packet) to `AgentCommand::Engage` (reactor goal). The
+        // pre-normalization semantics live under `/raw attack` (see
+        // `raw_attack_preserves_direct_action`).
         let entities = vec![ent(42, "Mob", EntityKind::Mob, 0.0, 0.0)];
         let out = parse_slash("/attack", &entities, origin(), Some(42), None);
         match out {
-            SlashOutcome::Command(AgentCommand::Action {
-                target_id,
-                target_index,
-                kind,
-            }) => {
+            SlashOutcome::Command(AgentCommand::Engage { target_id }) => {
                 assert_eq!(target_id, 42);
-                assert_eq!(target_index, 42);
-                assert!(matches!(kind, ActionKind::Attack));
             }
-            other => panic!("expected Action(Attack), got {other:?}"),
+            other => panic!("expected Engage, got {other:?}"),
         }
     }
 
@@ -855,10 +1471,10 @@ mod tests {
     fn engage_alias_matches_attack() {
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
         match parse_slash("/engage", &entities, origin(), Some(7), None) {
-            SlashOutcome::Command(AgentCommand::Action { kind, .. }) => {
-                assert!(matches!(kind, ActionKind::Attack));
+            SlashOutcome::Command(AgentCommand::Engage { target_id }) => {
+                assert_eq!(target_id, 7);
             }
-            other => panic!("expected Action(Attack), got {other:?}"),
+            other => panic!("expected Engage, got {other:?}"),
         }
     }
 
@@ -951,6 +1567,337 @@ mod tests {
                 ),
                 "expected SystemMessage for {s}"
             );
+        }
+    }
+
+    // ---- Stage 4 lockstep tests --------------------------------------------
+    //
+    // For each MCP tool, verify the matching slash command dispatches the
+    // same `AgentCommand` variant. The MCP tool surface is enumerated in
+    // `ffxi-mcp/src/main.rs`; if a new tool ships there, add a slash twin
+    // here and a corresponding assertion in `tests/slash_mcp_lockstep.rs`.
+
+    #[test]
+    fn engage_dispatches_reactor_goal() {
+        // Bug fix for the pre-Stage-4 drift: `/engage` used to send a
+        // direct `Action { Attack }` action. The MCP `engage` tool sends
+        // `AgentCommand::Engage` (reactor goal). They now match.
+        let entities = vec![ent(99, "Bee", EntityKind::Mob, 1.0, 0.0)];
+        match parse_slash("/engage", &entities, origin(), Some(99), None) {
+            SlashOutcome::Command(AgentCommand::Engage { target_id }) => {
+                assert_eq!(target_id, 99);
+            }
+            other => panic!("expected Engage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attack_is_alias_for_engage() {
+        let entities = vec![ent(99, "Bee", EntityKind::Mob, 1.0, 0.0)];
+        assert!(matches!(
+            parse_slash("/attack", &entities, origin(), Some(99), None),
+            SlashOutcome::Command(AgentCommand::Engage { target_id: 99 })
+        ));
+    }
+
+    #[test]
+    fn disengage_dispatches_cancel() {
+        // MCP has no `disengage` tool — agents call `cancel` to stop the
+        // engage goal. The slash command matches.
+        assert!(matches!(
+            parse_slash("/disengage", &empty_entities(), origin(), None, None),
+            SlashOutcome::Command(AgentCommand::Cancel)
+        ));
+    }
+
+    #[test]
+    fn raw_attack_preserves_direct_action() {
+        // Escape hatch for one-shot wire-level Attack.
+        let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
+        match parse_slash("/raw attack", &entities, origin(), Some(7), None) {
+            SlashOutcome::Command(AgentCommand::Action { kind, target_id, .. }) => {
+                assert_eq!(target_id, 7);
+                assert!(matches!(kind, ActionKind::Attack));
+            }
+            other => panic!("expected Action{{Attack}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_attackoff_preserves_direct_action() {
+        let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
+        match parse_slash("/raw attackoff", &entities, origin(), Some(7), None) {
+            SlashOutcome::Command(AgentCommand::Action { kind, .. }) => {
+                assert!(matches!(kind, ActionKind::AttackOff));
+            }
+            other => panic!("expected Action{{AttackOff}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_with_explicit_target_and_ground_coords() {
+        // `/cast 257 99 7 1.0 0.0 2.0` → Tractor (id=257) ground-targeted at (1,0,2).
+        match parse_slash(
+            "/cast 257 99 7 1.0 0.0 2.0",
+            &empty_entities(),
+            origin(),
+            None,
+            None,
+        ) {
+            SlashOutcome::Command(AgentCommand::Action {
+                target_id,
+                target_index,
+                kind:
+                    ActionKind::CastMagic {
+                        spell_id,
+                        pos_x,
+                        pos_y,
+                        pos_z,
+                    },
+            }) => {
+                assert_eq!(spell_id, 257);
+                assert_eq!(target_id, 99);
+                assert_eq!(target_index, 7);
+                assert_eq!(pos_x, 1.0);
+                assert_eq!(pos_y, 0.0);
+                assert_eq!(pos_z, 2.0);
+            }
+            other => panic!("expected CastMagic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_defaults_target_to_current() {
+        let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
+        match parse_slash("/cast 1", &entities, origin(), Some(7), None) {
+            SlashOutcome::Command(AgentCommand::Action {
+                target_id,
+                kind: ActionKind::CastMagic { spell_id, .. },
+                ..
+            }) => {
+                assert_eq!(spell_id, 1);
+                assert_eq!(target_id, 7);
+            }
+            other => panic!("expected CastMagic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn weaponskill_basic() {
+        let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
+        match parse_slash("/ws 16 7", &entities, origin(), Some(7), None) {
+            SlashOutcome::Command(AgentCommand::Action {
+                kind: ActionKind::Weaponskill { skill_id },
+                target_id,
+                ..
+            }) => {
+                assert_eq!(skill_id, 16);
+                assert_eq!(target_id, 7);
+            }
+            other => panic!("expected Weaponskill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn job_ability_defaults_to_zero_target() {
+        match parse_slash("/ja 88", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::Action {
+                target_id,
+                kind: ActionKind::JobAbility { ability_id },
+                ..
+            }) => {
+                assert_eq!(ability_id, 88);
+                assert_eq!(target_id, 0);
+            }
+            other => panic!("expected JobAbility, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn useitem_basic() {
+        match parse_slash("/useitem 0 4 4112", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::UseItem {
+                container,
+                slot,
+                item_no,
+                ..
+            }) => {
+                assert_eq!(container, 0);
+                assert_eq!(slot, 4);
+                assert_eq!(item_no, 4112);
+            }
+            other => panic!("expected UseItem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raisemenu_accept_and_decline() {
+        for (input, expected) in &[("/raisemenu accept", true), ("/raisemenu decline", false)] {
+            match parse_slash(input, &empty_entities(), origin(), None, None) {
+                SlashOutcome::Command(AgentCommand::Action {
+                    kind: ActionKind::RaiseMenu { accept },
+                    ..
+                }) => assert_eq!(accept, *expected, "input: {input}"),
+                other => panic!("expected RaiseMenu, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn tractormenu_accept_and_decline() {
+        for (input, expected) in &[("/tractormenu y", true), ("/tractormenu n", false)] {
+            match parse_slash(input, &empty_entities(), origin(), None, None) {
+                SlashOutcome::Command(AgentCommand::Action {
+                    kind: ActionKind::TractorMenu { accept },
+                    ..
+                }) => assert_eq!(accept, *expected, "input: {input}"),
+                other => panic!("expected TractorMenu, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn homepointmenu_parses_status_id() {
+        match parse_slash("/homepointmenu 0", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::Action {
+                kind: ActionKind::HomepointMenu { status_id },
+                ..
+            }) => assert_eq!(status_id, 0),
+            other => panic!("expected HomepointMenu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_is_direct() {
+        assert!(matches!(
+            parse_slash("/snapshot", &empty_entities(), origin(), None, None),
+            SlashOutcome::Command(AgentCommand::Snapshot)
+        ));
+    }
+
+    #[test]
+    fn bank_parses_threshold_and_zoneline() {
+        match parse_slash("/bank 60 0xDEADBEEF", &empty_entities(), origin(), None, None) {
+            SlashOutcome::SystemMessage(_) => {
+                // 0xDEADBEEF doesn't parse as plain u32; decimal works.
+            }
+            _ => {}
+        }
+        match parse_slash("/bank 60 12345", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::BankWhenFull {
+                threshold,
+                mog_house_zoneline,
+            }) => {
+                assert_eq!(threshold, 60);
+                assert_eq!(mog_house_zoneline, 12345);
+            }
+            other => panic!("expected BankWhenFull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zonechange_parses_line_id() {
+        match parse_slash("/zonechange 42", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::RequestZoneChange { line_id }) => {
+                assert_eq!(line_id, 42);
+            }
+            other => panic!("expected RequestZoneChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_pause_resume_status_parse() {
+        for (input, expected) in &[
+            ("/agent pause", AgentControlOp::Pause),
+            ("/agent resume", AgentControlOp::Resume),
+            ("/agent unpause", AgentControlOp::Resume),
+            ("/agent status", AgentControlOp::Status),
+            ("/agent", AgentControlOp::Status),
+        ] {
+            match parse_slash(input, &empty_entities(), origin(), None, None) {
+                SlashOutcome::AgentControl(op) => assert_eq!(&op, expected, "input: {input}"),
+                other => panic!("expected AgentControl for `{input}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn agent_unknown_subcommand_is_system_message() {
+        match parse_slash("/agent wat", &empty_entities(), origin(), None, None) {
+            SlashOutcome::SystemMessage(s) => assert!(s.contains("wat")),
+            other => panic!("expected SystemMessage, got {other:?}"),
+        }
+    }
+
+    /// Consolidated lockstep verifier: for every MCP tool exposed by
+    /// `ffxi-mcp/src/main.rs`, assert there is a slash twin that
+    /// dispatches the right `AgentCommand` variant. When you add a new
+    /// MCP tool, add a row here. If this test fails because of an
+    /// extraneous row, remove the row. If a variant assertion fails,
+    /// the slash parser drifted from the MCP tool.
+    #[test]
+    fn every_mcp_tool_has_a_slash_twin() {
+        let entities = vec![ent(42, "Mob", EntityKind::Mob, 0.0, 0.0)];
+        let pos = origin();
+        let cur = Some(42);
+        // (slash invocation, predicate that the dispatched command
+        // matches the MCP tool's wire shape).
+        let cases: Vec<(&str, fn(&AgentCommand) -> bool)> = vec![
+            // follow {target_id, distance} — slash resolves names (or
+            // current target); the entity at id=42 named "Mob" matches.
+            ("/follow Mob", |c| matches!(c, AgentCommand::Follow { target_id: 42, .. })),
+            // engage {target_id}
+            ("/engage", |c| matches!(c, AgentCommand::Engage { target_id: 42 })),
+            // path_to {x, y, z}
+            ("/pathto 1 2 3", |c| matches!(c, AgentCommand::PathTo { .. })),
+            // cancel
+            ("/cancel", |c| matches!(c, AgentCommand::Cancel)),
+            // bank_when_full {threshold, mog_house_zoneline}
+            ("/bank 60 12345", |c| matches!(c, AgentCommand::BankWhenFull { threshold: 60, mog_house_zoneline: 12345 })),
+            // chat {kind, text} — covered by per-channel slashes (/s /p etc.)
+            ("/s hello", |c| matches!(c, AgentCommand::Chat { kind: 0, .. })),
+            ("/p hello", |c| matches!(c, AgentCommand::Chat { kind: 4, .. })),
+            // tell {to, text}
+            ("/tell Bob hi", |c| matches!(c, AgentCommand::Tell { .. })),
+            // request_zone_change {line_id}
+            ("/zonechange 42", |c| matches!(c, AgentCommand::RequestZoneChange { line_id: 42 })),
+            // snapshot
+            ("/snapshot", |c| matches!(c, AgentCommand::Snapshot)),
+            // cast (Action::CastMagic)
+            ("/cast 1", |c| matches!(c,
+                AgentCommand::Action { kind: ActionKind::CastMagic { .. }, .. })),
+            // weaponskill (Action::Weaponskill)
+            ("/ws 1", |c| matches!(c,
+                AgentCommand::Action { kind: ActionKind::Weaponskill { .. }, .. })),
+            // job_ability (Action::JobAbility)
+            ("/ja 1", |c| matches!(c,
+                AgentCommand::Action { kind: ActionKind::JobAbility { .. }, .. })),
+            // use_item
+            ("/useitem 0 4", |c| matches!(c, AgentCommand::UseItem { .. })),
+            // raise_menu (Action::RaiseMenu)
+            ("/raisemenu accept", |c| matches!(c,
+                AgentCommand::Action { kind: ActionKind::RaiseMenu { .. }, .. })),
+            // tractor_menu (Action::TractorMenu)
+            ("/tractormenu accept", |c| matches!(c,
+                AgentCommand::Action { kind: ActionKind::TractorMenu { .. }, .. })),
+            // homepoint_menu (Action::HomepointMenu)
+            ("/homepointmenu 0", |c| matches!(c,
+                AgentCommand::Action { kind: ActionKind::HomepointMenu { .. }, .. })),
+            // disconnect — slash form fires Quit (drops sockets); the
+            // MCP tool dispatches AgentCommand::Disconnect through the
+            // session loop. Both reach the same exit; the slash carries
+            // the GUI side effect of closing the window.
+        ];
+        for (slash, pred) in &cases {
+            let out = parse_slash(slash, &entities, pos, cur, None);
+            match out {
+                SlashOutcome::Command(ref cmd) => assert!(
+                    pred(cmd),
+                    "slash `{slash}` dispatched the wrong variant: {cmd:?}"
+                ),
+                SlashOutcome::Quit => {} // /disconnect path; intentional
+                other => panic!("slash `{slash}` did not yield Command: {other:?}"),
+            }
         }
     }
 }

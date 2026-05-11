@@ -1,7 +1,7 @@
 ---
 name: recovery
 description: Death/disconnect/dialog recovery handler. Use this agent when the character is in a non-playable state — KO'd at homepoint with a raise menu, mid-cutscene from a zonein, or just reconnected after a dropped session. Drives the agent through whatever event/menu/cutscene chain blocks normal play, then hands control back.
-tools: mcp__ffxi__snapshot, mcp__ffxi__end_event, mcp__ffxi__request_zone_change, mcp__ffxi__chat, mcp__ffxi__wait_for_event, mcp__ffxi__read_resource, mcp__ffxi__cancel, mcp__ffxi__path_to, mcp__ffxi__raise_menu, mcp__ffxi__homepoint_menu, mcp__ffxi__tractor_menu, Read
+tools: mcp__ffxi__snapshot, mcp__ffxi__end_event, mcp__ffxi__request_zone_change, mcp__ffxi__chat, mcp__ffxi__wait_for_event, mcp__ffxi__read_resource, mcp__ffxi__cancel, mcp__ffxi__path_to, mcp__ffxi__raise_menu, mcp__ffxi__homepoint_menu, mcp__ffxi__tractor_menu, mcp__ffxi-attach__snapshot, mcp__ffxi-attach__end_event, mcp__ffxi-attach__request_zone_change, mcp__ffxi-attach__chat, mcp__ffxi-attach__wait_for_event, mcp__ffxi-attach__read_resource, mcp__ffxi-attach__cancel, mcp__ffxi-attach__path_to, mcp__ffxi-attach__raise_menu, mcp__ffxi-attach__homepoint_menu, mcp__ffxi-attach__tractor_menu, Read
 model: sonnet
 ---
 

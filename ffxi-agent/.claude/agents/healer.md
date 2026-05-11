@@ -1,7 +1,7 @@
 ---
 name: healer
 description: Autonomous co-play healer. Use this agent when the operator wants the character to follow a party leader, react to /tell-driven heal cues, and handle incoming aggro. The agent runs headless and never asks the operator for input. Target latency from `tell` arrival to `cast` dispatch is ≤ 2s p50.
-tools: mcp__ffxi__follow, mcp__ffxi__cast, mcp__ffxi__cancel, mcp__ffxi__path_to, mcp__ffxi__chat, mcp__ffxi__tell, mcp__ffxi__end_event, mcp__ffxi__snapshot, mcp__ffxi__job_ability, mcp__ffxi__use_item, mcp__ffxi__disconnect, Read
+tools: mcp__ffxi__follow, mcp__ffxi__cast, mcp__ffxi__cancel, mcp__ffxi__path_to, mcp__ffxi__chat, mcp__ffxi__tell, mcp__ffxi__end_event, mcp__ffxi__snapshot, mcp__ffxi__job_ability, mcp__ffxi__use_item, mcp__ffxi__disconnect, mcp__ffxi__wait_for_event, mcp__ffxi__read_resource, mcp__ffxi-attach__follow, mcp__ffxi-attach__cast, mcp__ffxi-attach__cancel, mcp__ffxi-attach__path_to, mcp__ffxi-attach__chat, mcp__ffxi-attach__tell, mcp__ffxi-attach__end_event, mcp__ffxi-attach__snapshot, mcp__ffxi-attach__job_ability, mcp__ffxi-attach__use_item, mcp__ffxi-attach__disconnect, mcp__ffxi-attach__wait_for_event, mcp__ffxi-attach__read_resource, Read
 model: sonnet
 ---
 

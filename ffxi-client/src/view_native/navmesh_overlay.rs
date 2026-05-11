@@ -42,10 +42,11 @@
 //! coords. Bevy is also y-up; the two differ only in z-handedness,
 //! so the transform is just `bevy = (d.x, d.y, -d.z)`.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
-use ffxi_viewer_core::{IsSelf, InputMode, SceneState};
+use ffxi_viewer_core::{feet_offset, InputMode, SceneState, WorldEntity};
 
 use super::AppPhase;
 
@@ -56,23 +57,43 @@ impl Plugin for NavmeshOverlayPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<NavmeshOverlayVisible>()
             .init_resource::<NavmeshState>()
+            .init_resource::<SnapHeightCache>()
             .add_systems(
                 Update,
                 (
                     swap_navmesh_on_zone_change,
                     toggle_navmesh_overlay,
                     draw_navmesh_overlay.run_if(overlay_visible),
-                    // Gravity snap runs *after* sync_entities (which is
-                    // ordered with .chain() inside ViewerCorePlugin's
-                    // Update tuple). Putting it in the same Update lets
-                    // Bevy schedule it after the entity transforms are
-                    // populated this frame.
-                    snap_self_to_navmesh_system,
                 )
+                    .run_if(in_state(AppPhase::InGame)),
+            )
+            // Explicit ordering bracket:
+            //   sync_entities → snap → chase_camera
+            // Without `.before(chase_camera_system)`, Bevy's scheduler
+            // is free to parallelize and may run the camera *before*
+            // our snap on some frames and *after* on others. Different
+            // y values reach the camera each frame → visible vertical
+            // jitter (the symptom triggers on any input because input
+            // events perturb the schedule order). With both
+            // `.after(sync_entities)` and `.before(chase_camera)`, the
+            // snap runs in a deterministic window every frame.
+            .add_systems(
+                Update,
+                snap_entities_to_navmesh_system
+                    .after(ffxi_viewer_core::sync_entities_system)
+                    .before(ffxi_viewer_core::chase_camera_system)
                     .run_if(in_state(AppPhase::InGame)),
             );
     }
 }
+
+/// Per-entity cache of the last navmesh height we resolved. Used as
+/// `z_hint` next frame instead of `t.translation.y`, which would
+/// otherwise oscillate between local-predicted and server-echoed z
+/// at high render fps and cause `find_nearest_poly_1` to flip between
+/// adjacent polys (visible as tick-tock vertical jitter).
+#[derive(Resource, Default)]
+struct SnapHeightCache(HashMap<u32, f32>);
 
 /// Toggle state. Default `false`: overlay is hidden until the first
 /// F9 press.
@@ -198,54 +219,75 @@ fn draw_navmesh_overlay(mut gizmos: Gizmos, state: Res<NavmeshState>) {
 }
 
 /// Visual gravity: each frame, query the navmesh for the height at
-/// the self-entity's 2D position and snap the rendered Y to it. This
-/// runs **after** `sync_entities_system` populates the transform from
-/// the wire snapshot, so we override the wire's height with the
-/// navmesh's height — handy when the server's reported `z` lags
-/// terrain (e.g. it never updates `z` for routine moves) or when our
-/// own `slide_along`'s slid `z` doesn't make it back into the snapshot.
+/// each entity's 2D position and snap the rendered Y to it. Runs
+/// **after** `sync_entities_system` populates transforms from the
+/// wire snapshot, so we override server-reported height with navmesh
+/// height — necessary when the server's `z` doesn't track terrain
+/// (often the case for static NPCs which sit at a fixed `z` regardless
+/// of where the placement engine put them on the actual ground).
 ///
-/// Only touches the self entity. Other entities (mobs, NPCs, PCs)
-/// keep their server-reported height; their packets generally include
-/// the right value, and overriding them would be both more expensive
-/// (N entities × 60 Hz) and more wrong (their actual server-side
-/// position is what matters for combat range etc).
-fn snap_self_to_navmesh_system(
+/// ## Stable z_hint
+///
+/// `find_nearest_poly_1` searches a vertical box around `z_hint`. If
+/// `z_hint` oscillates between two values (e.g., local-predicted vs
+/// server-echoed self z, which interleave at high render fps), the
+/// query can pick different adjacent polys whose heights differ
+/// slightly — visible as tick-tock jitter. We avoid this by feeding
+/// the *previous* snapped height back as the hint, cached per
+/// entity. The first frame for an entity falls back to its current
+/// rendered y; subsequent frames are stable.
+///
+/// ## Capsule feet offset
+///
+/// Server doesn't encode entity heights — capsules are client-side
+/// placeholders. With the snap setting `bevy.y = navmesh_h`, the
+/// capsule center sits *on* the navmesh and its feet are 1.9 yalms
+/// below it (capsule radius + half-height). We add a per-kind feet
+/// offset so the **feet** rest on the navmesh instead.
+fn snap_entities_to_navmesh_system(
     state: Res<NavmeshState>,
-    mut self_q: Query<&mut Transform, With<IsSelf>>,
+    mut cache: ResMut<SnapHeightCache>,
+    mut q: Query<(&WorldEntity, &mut Transform)>,
 ) {
     let Some(nav) = &state.nav else { return };
-    let Ok(mut t) = self_q.single_mut() else { return };
+    let Ok(guard) = nav.lock() else { return };
 
-    // Bevy → FFXI ground-plane: bevy.x = ffxi.x, bevy.z = -ffxi.y.
-    // Bevy.y is the current rendered height (= ffxi.z); use that as
-    // the z-hint so multi-level zones disambiguate to the right layer.
-    let ffxi_x = t.translation.x;
-    let ffxi_y = -t.translation.z;
-    let z_hint = t.translation.y;
+    for (entity, mut t) in q.iter_mut() {
+        // Bevy → FFXI ground-plane: bevy.x = ffxi.x, bevy.z = -ffxi.y.
+        let ffxi_x = t.translation.x;
+        let ffxi_y = -t.translation.z;
+        // Use the cached previous snap as z_hint so the search box is
+        // stable across frames. Falls back to the current rendered
+        // y on the very first frame for this entity.
+        let z_hint = cache
+            .0
+            .get(&entity.id)
+            .copied()
+            .unwrap_or(t.translation.y);
 
-    let height = match nav.lock() {
-        Ok(guard) => guard.nearest_height_at(ffxi_x, ffxi_y, z_hint),
-        Err(_) => return,
-    };
-
-    if let Some(h) = height {
-        // ffxi_to_bevy puts FFXI.z into Bevy.y, so the override is
-        // direct — no transform composition needed.
-        t.translation.y = h;
+        if let Some(h) = guard.nearest_height_at(ffxi_x, ffxi_y, z_hint) {
+            cache.0.insert(entity.id, h);
+            t.translation.y = h + feet_offset(entity.kind);
+        }
     }
 }
 
-/// Detour-space → Bevy world. xiNavmeshes are stored in Detour-
-/// standard y-up coords; Bevy is also y-up. They differ only in
-/// z-handedness (Bevy is right-handed with -Z forward; Detour's
-/// reference samples are left-handed). Negating z is the standard
-/// fix for that single-handedness flip.
+
+/// Detour-space → Bevy world. xiNavmeshes use the LSB
+/// `(x, -y_height, -z_north)` convention (see
+/// `vendor/server/src/map/navmesh.cpp::ToDetourPos`). To project
+/// into our Bevy world (y-up, with `ffxi_to_bevy(p) = (p.x, p.z,
+/// -p.y)`), this must equal `ffxi_to_bevy ∘ detour_to_ffxi(d)`:
 ///
-/// If the overlay still misaligns with the floor texture / entity
-/// positions after this fix, the *next* most-likely tweak is whether
-/// to also negate x. Try `Vec3::new(-d[0], d[1], -d[2])` if so.
+///   detour_to_ffxi(d) = (d.x, -d.z, -d.y)         // codebase z-up
+///   ffxi_to_bevy(p)   = (p.x, p.z, -p.y)           // Bevy y-up
+///   composition       = (d.x, -d.y, d.z)
+///
+/// Negate Bevy.y so Detour's "below-ground" (which is positive after
+/// LSB's height-negate) renders below the player, and pass d.z
+/// straight through so Detour's "south" (positive after north-negate)
+/// renders as positive Bevy.z (south in Bevy with -Z forward).
 #[inline]
 fn detour_to_bevy(d: [f32; 3]) -> Vec3 {
-    Vec3::new(d[0], d[1], -d[2])
+    Vec3::new(d[0], -d[1], d[2])
 }

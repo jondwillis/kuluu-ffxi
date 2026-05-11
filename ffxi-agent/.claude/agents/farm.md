@@ -1,7 +1,7 @@
 ---
 name: farm
 description: Autonomous 60-minute solo farming loop. Use this agent when the operator wants the character to grind a single zone with periodic banking and disconnect recovery. The agent runs headless, picks targets from the prose summary, and never asks the operator for input.
-tools: mcp__ffxi__follow, mcp__ffxi__engage, mcp__ffxi__path_to, mcp__ffxi__cancel, mcp__ffxi__chat, mcp__ffxi__request_zone_change, mcp__ffxi__end_event, mcp__ffxi__snapshot, mcp__ffxi__cast, mcp__ffxi__weaponskill, mcp__ffxi__job_ability, mcp__ffxi__use_item, mcp__ffxi__bank_when_full, mcp__ffxi__disconnect, Read
+tools: mcp__ffxi__follow, mcp__ffxi__engage, mcp__ffxi__path_to, mcp__ffxi__cancel, mcp__ffxi__chat, mcp__ffxi__request_zone_change, mcp__ffxi__end_event, mcp__ffxi__snapshot, mcp__ffxi__cast, mcp__ffxi__weaponskill, mcp__ffxi__job_ability, mcp__ffxi__use_item, mcp__ffxi__bank_when_full, mcp__ffxi__disconnect, mcp__ffxi__wait_for_event, mcp__ffxi__read_resource, mcp__ffxi-attach__follow, mcp__ffxi-attach__engage, mcp__ffxi-attach__path_to, mcp__ffxi-attach__cancel, mcp__ffxi-attach__chat, mcp__ffxi-attach__request_zone_change, mcp__ffxi-attach__end_event, mcp__ffxi-attach__snapshot, mcp__ffxi-attach__cast, mcp__ffxi-attach__weaponskill, mcp__ffxi-attach__job_ability, mcp__ffxi-attach__use_item, mcp__ffxi-attach__bank_when_full, mcp__ffxi-attach__disconnect, mcp__ffxi-attach__wait_for_event, mcp__ffxi-attach__read_resource, Read
 model: sonnet
 ---
 

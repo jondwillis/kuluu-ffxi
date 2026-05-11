@@ -18,6 +18,10 @@
 
 pub mod camera;
 pub mod components;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dat_mmb;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dat_mzb;
 pub mod hud;
 pub mod input_mode;
 pub mod keybinds;
@@ -46,7 +50,7 @@ pub use lock_on::{LockOn, ToggleResult as LockOnToggle};
 pub use mouse::{CursorLockRequest, MousePlugin, MousePointer};
 pub use picking::{click_to_target_system, resolve_click_target, ClickResolution, PickingPlugin};
 pub use scene::{
-    ffxi_to_bevy, setup_world, sync_entities_system, sync_aggro_system,
+    feet_offset, ffxi_to_bevy, setup_world, sync_entities_system, sync_aggro_system,
     Aggroing, EntityMaterials, EntityMesh, HpBar, HpBarMesh, Target, TrackedEntities,
 };
 pub use snapshot::{apply_delta, ingest_system, EventLog, SceneState, CHAT_HISTORY_CAP};
@@ -82,6 +86,10 @@ impl<S> Default for ViewerCorePlugin<S> {
 
 impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
     fn build(&self, app: &mut App) {
+        // Native-only: `/load_mmb` reads the user's local DAT install
+        // via `fs::read`. wasm can't yet — see `dat_mmb.rs` for the gate.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins(dat_mmb::DatOverlayPlugin);
         app.init_resource::<SceneState>()
             .init_resource::<EventLog>()
             .init_resource::<TrackedEntities>()

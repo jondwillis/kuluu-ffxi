@@ -61,23 +61,33 @@ use crate::state::{
 /// Reactor parameters. Defaults match the plan's "tactical loop" target.
 #[derive(Debug, Clone, Copy)]
 pub struct ReactorConfig {
-    /// Tick interval. The plan specifies 200 ms; less frequent risks
-    /// missing sub-second combat windows.
+    /// Tick interval. At 30 Hz the reactor acts as a frame-rate movement
+    /// integrator (matching how the OG FFXI client advances local
+    /// position) — each tick emits a sub-yalm step rather than a coarse
+    /// 1-yalm jump. Combat decisions (attack, trigger checks) also run
+    /// at this rate; all of them are per-tick constant-time so the cost
+    /// is negligible.
     pub tick: Duration,
     /// HP percent below which `LowHp` / `PartyMemberLowHp` fires.
     pub low_hp_threshold: u8,
     /// Per-tick movement step in yalms when chasing a follow/path target.
-    /// Capped so the reactor never warps the player faster than legitimate
-    /// movement speed (FFXI base is ~5 yalms/sec).
+    /// Sized to keep velocity at FFXI's base run speed (~5 yalms/sec)
+    /// regardless of tick rate: `tick_seconds * 5.0`. Going above this
+    /// trips server-side speedhack checks and makes `/pathto` look
+    /// teleport-y to the operator.
     pub max_step_per_tick: f32,
 }
 
 impl Default for ReactorConfig {
     fn default() -> Self {
         Self {
-            tick: Duration::from_millis(200),
+            // 30 Hz: matches the OG client's local-integration cadence
+            // and is fine-grained enough that 1-frame jumps at 60 Hz
+            // render look continuous.
+            tick: Duration::from_millis(33),
             low_hp_threshold: 25,
-            max_step_per_tick: 5.0,
+            // 5 yalms/sec base × 33 ms tick ≈ 0.165 yalm/tick.
+            max_step_per_tick: 0.165,
         }
     }
 }
@@ -227,6 +237,13 @@ pub struct Reactor {
     /// (Stage 10b ships the wiring; per-zone PNG acquisition is a
     /// later operator task).
     nav_cache: Option<(u16, LoadedNav)>,
+    /// `line_id` of the zone-line trigger box the player is currently
+    /// inside. Used for edge-triggered `RequestZoneChange` emission:
+    /// each tick we recompute "am I inside a trigger?", and only fire
+    /// the 0x05E packet when the answer flips from `None` to `Some(L)`.
+    /// Without the latch we'd spam the server 5×/sec while the player
+    /// stands on the trigger.
+    zoneline_trigger_latched: Option<u32>,
 }
 
 impl Reactor {
@@ -238,6 +255,7 @@ impl Reactor {
             self_low_hp_latched: false,
             party_low_hp_latched: HashMap::new(),
             nav_cache: None,
+            zoneline_trigger_latched: None,
         }
     }
 
@@ -289,6 +307,22 @@ impl Reactor {
                 }) {
                     waypoints.remove(0);
                 }
+                // Off-mesh last-mile: Detour's `find_straight_path`
+                // ends at the *snapped* destination poly, not the
+                // requested point. Zone-line origins (and many operator
+                // path targets) sit a few yalms off the walkable mesh
+                // — at the doorframe threshold, at the edge of a
+                // platform, etc. If we stop at the snapped end, the
+                // agent never enters the trigger box. Append the real
+                // target as a final straight-line waypoint when the
+                // gap is more than two step-sizes (small overshoots
+                // are already inside the path's tolerance).
+                let snapped_end_is_target = waypoints.last().is_some_and(|w| {
+                    horizontal_distance(*w, target) <= self.cfg.max_step_per_tick * 2.0
+                });
+                if !snapped_end_is_target {
+                    waypoints.push(target);
+                }
                 if waypoints.is_empty() {
                     waypoints.push(target);
                 }
@@ -309,6 +343,13 @@ impl Reactor {
         // the old `bt_target_id` to detect a transition into us.
         let mut out = self.detect_aggro_edge(ev);
         self.state.apply_event(ev);
+        // Zone-change invalidates any in-flight `Goal::Pathing` — the
+        // waypoints were computed in the old zone's coord frame and
+        // would cause `Move` spam toward nonsense locations in the new
+        // zone (lands the player "in the sky" or off-map). Drop them.
+        if matches!(ev, AgentEvent::ZoneChanged { .. }) {
+            self.goal = Goal::Idle;
+        }
         out.extend(self.detect_threshold_events(ev));
         out
     }
@@ -326,12 +367,12 @@ impl Reactor {
         if entity.id == self_id {
             return Vec::new();
         }
-        // We can't reliably distinguish mobs from trusts/pets via our
-        // current `EntityKind` (both come through 0x067/0x068 as Other).
-        // We DO want to skip Pcs and Npcs — friendly entities targeting
-        // us aren't aggro. False positives for trusts/pets are the
-        // tolerable tradeoff for catching real mob aggro.
-        if matches!(entity.kind, EntityKind::Pc | EntityKind::Npc) {
+        // Pets are now reliably classified (via `0x068 CPetSyncPacket`
+        // enrichment in `session::handle_sub_packet`), so we can drop
+        // them from aggro detection alongside friendly PCs/NPCs. Mobs
+        // (and trusts mid-spawn, before their EntitySetName arrives)
+        // remain `Other` here — those are the kinds we want to flag.
+        if matches!(entity.kind, EntityKind::Pc | EntityKind::Npc | EntityKind::Pet) {
             return Vec::new();
         }
         let now_targeting_self = entity.bt_target_id == self_id;
@@ -457,6 +498,76 @@ impl Reactor {
     /// (e.g. `ReactorGoalChanged` when `Pathing` self-clears to `Idle`).
     /// Most ticks: zero or one command, zero events.
     pub fn tick(&mut self) -> TickOutput {
+        // Goal-driven output first; the zone-line auto-trigger runs
+        // after so we can append a `RequestZoneChange` command if the
+        // player just walked onto a trigger box this tick.
+        let mut out = self.tick_goal();
+        if let Some(req) = self.check_zoneline_trigger() {
+            out.commands.push(req);
+        }
+        out
+    }
+
+    /// Edge-triggered zone-line detection. If the player's current
+    /// position falls inside a trigger box for this zone *and* it's
+    /// a different trigger than the one we last latched, emit a
+    /// `RequestZoneChange` so the session sends `0x05E MAPRECT` and
+    /// the server fires the transition.
+    ///
+    /// FFXI's zone-change protocol is **client-initiated**: standing
+    /// on a trigger does nothing if we never ask. The retail client
+    /// computes this same check tick-by-tick; we mirror that here.
+    fn check_zoneline_trigger(&mut self) -> Option<AgentCommand> {
+        let zone_id = self.state.zone_id?;
+        let player = self.self_pos();
+        let lines = ffxi_nav::zone_lines_for(zone_id);
+        // Diagnostic: log any trigger we're within 5y of so we can tell
+        // "client never entered the box" from "client entered, server
+        // rejected" without instrumenting the network path. Logs at most
+        // a handful of lines per second while loitering at a marker;
+        // silent otherwise.
+        for line in lines {
+            let dx = player.x - line.from_pos[0];
+            let dy = player.y - line.from_pos[1];
+            let ground_dist = (dx * dx + dy * dy).sqrt();
+            if ground_dist <= 5.0 {
+                tracing::info!(
+                    line_id = line.line_id,
+                    to_zone = line.to_zone,
+                    player_xy = format!("({:.2},{:.2})", player.x, player.y),
+                    trigger_xy = format!("({:.2},{:.2})", line.from_pos[0], line.from_pos[1]),
+                    scale_x = line.scale_x,
+                    scale_z = line.scale_z,
+                    rotation = format!("{:.3}", line.rotation),
+                    ground_dist = format!("{:.2}", ground_dist),
+                    inside = is_inside_trigger_box(player, line),
+                    "near zoneline trigger",
+                );
+            }
+        }
+        let inside = lines
+            .iter()
+            .find(|line| is_inside_trigger_box(player, line))
+            .map(|line| line.line_id);
+        let was = self.zoneline_trigger_latched;
+        self.zoneline_trigger_latched = inside;
+        match (was, inside) {
+            // Just entered a trigger (edge: outside → inside).
+            (None, Some(line_id)) => {
+                Some(AgentCommand::RequestZoneChange { line_id })
+            }
+            // Crossed directly from one trigger box to another (rare
+            // but possible at a junction). Fire for the new one.
+            (Some(prev), Some(line_id)) if prev != line_id => {
+                Some(AgentCommand::RequestZoneChange { line_id })
+            }
+            // Inside the same trigger as last tick, or outside both
+            // ticks. No edge — say nothing.
+            _ => None,
+        }
+    }
+
+    fn tick_goal(&mut self) -> TickOutput {
         match self.goal.clone() {
             Goal::Idle => TickOutput::default(),
             Goal::Following { target_id, distance } => TickOutput {
@@ -575,15 +686,16 @@ impl Reactor {
     }
 
     fn self_pos(&self) -> Vec3 {
-        // Prefer the server's authoritative entity position when known
-        // (came in via CHAR_PC for self during the zone-in flood); fall
-        // back to whatever Move set self_pos to.
-        if let Some(id) = self.state.char_id {
-            if let Some(e) = self.state.entities.iter().find(|e| e.id == id) {
-                return e.pos;
-            }
-        }
-        self.state.self_pos.pos
+        // Single source of truth: the self entity in the entity list,
+        // seeded from `0x00A LOGIN`'s `PosHead` on zone-in and updated
+        // by CHAR_PC + `AgentCommand::Move`. Returns origin only during
+        // the brief pre-LOGIN window — agents that rely on `self_pos()`
+        // for path-finding accept this as "we don't know yet" (idle
+        // ticks no-op when no waypoint computation is in flight).
+        self.state
+            .self_position()
+            .map(|p| p.pos)
+            .unwrap_or_default()
     }
 
     fn entity_target_info(&self, target_id: u32) -> Option<(u16, Vec3)> {
@@ -613,50 +725,90 @@ impl Reactor {
     }
 }
 
-fn horizontal_distance(a: Vec3, b: Vec3) -> f32 {
-    let dx = b.x - a.x;
-    let dz = b.z - a.z;
-    (dx * dx + dz * dz).sqrt()
+/// True if `player` (z-up: `.x` east, `.y` north, `.z` height) is
+/// inside the zone-line's 2D ground trigger box. Box is centered at
+/// `from_pos`, sized `scale_x` × `scale_z`, rotated by `rotation`
+/// radians around its center in the (x, y) ground plane.
+///
+/// Height isn't bounded here — the server's `0x05E MAPRECT` handler
+/// does its own ~40-yalm distance check (per session.rs:891), which
+/// covers the vertical axis. Adding our own height bound would just
+/// false-negative when the navmesh and trigger sit at slightly
+/// different heights.
+fn is_inside_trigger_box(player: Vec3, line: &ffxi_nav::ZoneLine) -> bool {
+    let dx = player.x - line.from_pos[0];
+    let dy = player.y - line.from_pos[1];
+    let cos_r = line.rotation.cos();
+    let sin_r = line.rotation.sin();
+    // Inverse-rotate (dx, dy) into box-local axes.
+    let local_x = dx * cos_r + dy * sin_r;
+    let local_y = -dx * sin_r + dy * cos_r;
+    local_x.abs() <= line.scale_x / 2.0 && local_y.abs() <= line.scale_z / 2.0
 }
 
-/// Step from `from` toward `to` by `step_size` yalms (in the x/z plane;
-/// y is preserved). If `step_size` >= the actual distance, returns `to`.
+fn horizontal_distance(a: Vec3, b: Vec3) -> f32 {
+    // FFXI wire convention (per `ffxi-proto::decode::PosHead` byte-order
+    // remap and `session::build_subpacket_pos` symmetry): codebase
+    // `Position` is z-up — `pos.y` is north, `pos.z` is height. Ground
+    // distance is therefore measured in the (x, y) plane.
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Step from `from` toward `to` by `step_size` yalms (in the x/y
+/// ground plane; z = height is preserved). Codebase `Position` is
+/// z-up; height in `.z` and the ground plane is `(x, y)`. If
+/// `step_size` >= the actual distance, returns `to`.
 fn step_point(from: Vec3, to: Vec3, step_size: f32) -> Vec3 {
     let dx = to.x - from.x;
-    let dz = to.z - from.z;
-    let dist = (dx * dx + dz * dz).sqrt();
+    let dy = to.y - from.y;
+    let dist = (dx * dx + dy * dy).sqrt();
     if dist <= 1e-3 || step_size >= dist {
         return to;
     }
     let f = step_size / dist;
     Vec3 {
         x: from.x + dx * f,
-        y: from.y,
-        z: from.z + dz * f,
+        y: from.y + dy * f,
+        z: from.z,
     }
 }
 
 /// FFXI heading: u8 spans 0..256 ↔ 0..2π. Mapping pinned by tests:
-/// north (+z) = 0, east (+x) = 64, south (-z) = 128, west (-x) = 192.
-/// Live-server calibration is a Stage 7 task — this formula is the
-/// *internally consistent* shape; if the server disagrees we'll rotate
-/// by a constant offset here.
+/// north (+y) = 0, east (+x) = 64, south (-y) = 128, west (-x) = 192.
+/// Heading byte (0..=255) the server will read as "A is facing toward B."
+///
+/// Matches LSB's `worldAngle` in `vendor/server/src/common/utils.cpp:130-140`:
+///
+/// ```text
+/// radians  = atan2f(B.z - A.z, B.x - A.x);
+/// rawAngle = radians * -(128.0 / PI);
+/// return   = (rawAngle mod 256 + 256) mod 256;
+/// ```
+///
+/// LSB convention: heading 0 = +x (east), 64 = south, 128 = west, 192 = north,
+/// clockwise viewed from above. The negation flips standard math-CCW into
+/// FFXI's CW rotation. Our wire-side `Position` swaps the y/z axes
+/// relative to LSB (our.y = LSB.z = north-south, our.z = LSB.y = vertical),
+/// so the `atan2` arguments are `(our.y, our.x)` — same horizontal pair LSB
+/// uses, just labelled differently. The vertical (`.z` in our coords) does
+/// not influence facing.
+///
+/// Live-server `MsgBasic::UnableToSeeTarget` (`charentity.cpp::CanAttack`)
+/// fires when the player's stored heading is outside a ±32-unit cone of
+/// `worldAngle(player, target)` — so the byte we send here has to match
+/// LSB's formula exactly.
 fn heading_toward(from: Vec3, to: Vec3) -> u8 {
     let dx = to.x - from.x;
-    let dz = to.z - from.z;
-    if dx.abs() < 1e-3 && dz.abs() < 1e-3 {
+    let dy = to.y - from.y;
+    if dx.abs() < 1e-3 && dy.abs() < 1e-3 {
         return 0;
     }
-    let theta = dx.atan2(dz);
-    let normalized = if theta < 0.0 {
-        theta + 2.0 * std::f32::consts::PI
-    } else {
-        theta
-    };
-    let heading = normalized * 256.0 / (2.0 * std::f32::consts::PI);
-    // round() handles the case where `normalized` lands a tick below the
-    // intended quarter mark (atan2's exact π returns 127.999… not 128).
-    (heading.round() as i32).rem_euclid(256) as u8
+    let radians = dy.atan2(dx);
+    let raw = radians * -(128.0 / std::f32::consts::PI);
+    // round() handles atan2's quarter-mark rounding (exact π → 127.999…).
+    (raw.round() as i32).rem_euclid(256) as u8
 }
 
 fn mk_move(pos: Vec3, heading: u8) -> AgentCommand {
@@ -923,6 +1075,17 @@ mod tests {
     use super::*;
     use crate::state::{Entity, EntityKind, PartyMember};
 
+    /// Config pinned to a 1.0-yalm step so the per-tick movement
+    /// assertions in this module stay readable. The production default
+    /// is a much smaller per-tick step (frame-rate integration) — these
+    /// tests verify the *logic* of stepping, not the tuning constant.
+    fn step_test_cfg() -> ReactorConfig {
+        ReactorConfig {
+            max_step_per_tick: 1.0,
+            ..ReactorConfig::default()
+        }
+    }
+
     fn upsert(id: u32, pos: Vec3, hp_pct: u8, kind: EntityKind, act_index: u16) -> AgentEvent {
         upsert_with_bt(id, pos, hp_pct, kind, act_index, 0)
     }
@@ -946,6 +1109,8 @@ mod tests {
                 hp_pct: Some(hp_pct),
                 bt_target_id,
                 claim_id: 0,
+                speed: 0,
+                speed_base: 0,
             },
         }
     }
@@ -991,7 +1156,7 @@ mod tests {
 
     #[test]
     fn follow_steps_toward_target_then_holds() {
-        let mut r = Reactor::new(ReactorConfig::default());
+        let mut r = Reactor::new(step_test_cfg());
         r.observe_event(&connected(1));
         r.observe_event(&upsert(1, Vec3::default(), 100, EntityKind::Pc, 1));
         r.observe_event(&upsert(2, Vec3 { x: 20.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 2));
@@ -1001,8 +1166,8 @@ mod tests {
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             AgentCommand::Move { x, .. } => {
-                // step capped at max_step_per_tick=5.0 → land at x=5.
-                assert!((x - 5.0).abs() < 1e-3, "step toward target capped at max_step: got {x}");
+                // step capped at step_test_cfg's max_step_per_tick (=1.0) → land at x=1.
+                assert!((x - 1.0).abs() < 1e-3, "step toward target capped at max_step: got {x}");
             }
             other => panic!("expected Move, got {other:?}"),
         }
@@ -1309,16 +1474,17 @@ mod tests {
 
     #[test]
     fn pathing_walks_to_target_and_returns_to_idle() {
-        let mut r = Reactor::new(ReactorConfig::default());
+        let mut r = Reactor::new(step_test_cfg());
         r.observe_event(&connected(1));
         r.observe_event(&upsert(1, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 1));
-        // Target 3 yalms away — within max_step (5.0); reaches in one tick.
-        r.handle_command(AgentCommand::PathTo { x: 3.0, y: 0.0, z: 0.0 });
+        // Target 0.5 yalms away — within step_test_cfg's max_step (1.0); reaches
+        // in one tick.
+        r.handle_command(AgentCommand::PathTo { x: 0.5, y: 0.0, z: 0.0 });
         let out = r.tick();
         assert_eq!(out.commands.len(), 1);
         match &out.commands[0] {
             AgentCommand::Move { x, z, .. } => {
-                assert!((x - 3.0).abs() < 1e-3);
+                assert!((x - 0.5).abs() < 1e-3);
                 assert!(z.abs() < 1e-3);
             }
             other => panic!("expected Move, got {other:?}"),
@@ -1331,10 +1497,11 @@ mod tests {
         // Tick-side emission: a pathing tick that completes the segment
         // must surface ReactorGoalChanged(Idle) so the operator HUD sees
         // the transition without needing the agent to issue Cancel.
-        let mut r = Reactor::new(ReactorConfig::default());
+        let mut r = Reactor::new(step_test_cfg());
         r.observe_event(&connected(1));
         r.observe_event(&upsert(1, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 1));
-        r.handle_command(AgentCommand::PathTo { x: 3.0, y: 0.0, z: 0.0 });
+        // Same single-tick distance as above.
+        r.handle_command(AgentCommand::PathTo { x: 0.5, y: 0.0, z: 0.0 });
         let out = r.tick();
         assert!(matches!(r.current_goal(), Goal::Idle));
         assert!(matches!(
@@ -1347,14 +1514,14 @@ mod tests {
 
     #[test]
     fn pathing_takes_multiple_ticks_for_distant_target() {
-        let mut r = Reactor::new(ReactorConfig::default());
+        let mut r = Reactor::new(step_test_cfg());
         r.observe_event(&connected(1));
         r.observe_event(&upsert(1, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 1));
         r.handle_command(AgentCommand::PathTo { x: 12.0, y: 0.0, z: 0.0 });
-        // Tick 1: step 5 yalms, still pathing.
+        // Tick 1: step max_step_per_tick (=1.0 from step_test_cfg) yalms, still pathing.
         let out = r.tick();
         match &out.commands[0] {
-            AgentCommand::Move { x, .. } => assert!((x - 5.0).abs() < 1e-3),
+            AgentCommand::Move { x, .. } => assert!((x - 1.0).abs() < 1e-3),
             other => panic!("got {other:?}"),
         }
         assert!(matches!(r.current_goal(), Goal::Pathing { .. }));
@@ -1366,15 +1533,21 @@ mod tests {
 
     #[test]
     fn heading_toward_pins_cardinal_quarters() {
+        // LSB convention (server authoritative, see
+        // vendor/server/src/common/utils.cpp:130-140 `worldAngle`): heading
+        // 0 = +x (east), 64 = south, 128 = west, 192 = north — clockwise
+        // viewed from above. Our `Position` swaps y/z relative to LSB so
+        // cardinal directions live in the (x, y) horizontal plane, with
+        // `+y` = north (LSB.z) and `+x` = east (LSB.x).
         let origin = Vec3::default();
-        // North (+z): atan2(0, +) = 0 → heading 0.
-        assert_eq!(heading_toward(origin, Vec3 { x: 0.0, y: 0.0, z: 10.0 }), 0);
-        // East (+x): atan2(+, 0) = π/2 → heading 64.
-        assert_eq!(heading_toward(origin, Vec3 { x: 10.0, y: 0.0, z: 0.0 }), 64);
-        // South (-z): atan2(0, -) = π → heading 128.
-        assert_eq!(heading_toward(origin, Vec3 { x: 0.0, y: 0.0, z: -10.0 }), 128);
-        // West (-x): atan2(-, 0) = -π/2 → 3π/2 normalized → heading 192.
-        assert_eq!(heading_toward(origin, Vec3 { x: -10.0, y: 0.0, z: 0.0 }), 192);
+        // East (+x): dy.atan2(dx) = atan2(0, +) = 0 → raw 0 → heading 0.
+        assert_eq!(heading_toward(origin, Vec3 { x: 10.0, y: 0.0, z: 0.0 }), 0);
+        // South (-y): atan2(-, 0) = -π/2 → raw +64 → heading 64.
+        assert_eq!(heading_toward(origin, Vec3 { x: 0.0, y: -10.0, z: 0.0 }), 64);
+        // West (-x): atan2(0, -) = π → raw -128 → heading 128.
+        assert_eq!(heading_toward(origin, Vec3 { x: -10.0, y: 0.0, z: 0.0 }), 128);
+        // North (+y): atan2(+, 0) = π/2 → raw -64 → heading 192.
+        assert_eq!(heading_toward(origin, Vec3 { x: 0.0, y: 10.0, z: 0.0 }), 192);
     }
 
     #[test]
@@ -1422,6 +1595,103 @@ mod tests {
         r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 0));
         let d3 = r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 1));
         assert_eq!(d3.len(), 1, "re-engage after release fires again");
+    }
+
+    #[test]
+    fn zoneline_trigger_fires_once_on_entry_and_latches() {
+        // Northern San d'Oria's west exit (line 845493882, → zone 100).
+        // Post-swap from_pos: (-113.372, -57.418, -4.075) in z-up.
+        // 3 yalm scale_x × 10 yalm scale_z, rotation 2.356 rad (135°).
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        r.state.zone_id = Some(230);
+
+        // 1) Place self OUTSIDE all triggers — no fire.
+        r.observe_event(&upsert(
+            1,
+            Vec3 { x: 0.0, y: 0.0, z: -5.0 },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        let out1 = r.tick();
+        assert!(
+            !out1
+                .commands
+                .iter()
+                .any(|c| matches!(c, AgentCommand::RequestZoneChange { .. })),
+            "must not fire while outside any trigger"
+        );
+
+        // 2) Snap self ONTO the west-exit trigger center — should fire once.
+        r.observe_event(&upsert(
+            1,
+            Vec3 { x: -113.372, y: -57.418, z: -4.075 },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        let out2 = r.tick();
+        let req = out2
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                AgentCommand::RequestZoneChange { line_id } => Some(*line_id),
+                _ => None,
+            })
+            .expect("expected RequestZoneChange on entry");
+        assert_eq!(req, 845493882, "should match the west-exit line_id");
+
+        // 3) Tick again with self still on the trigger — must NOT re-fire
+        //    (latched). Same upsert keeps position stable.
+        r.observe_event(&upsert(
+            1,
+            Vec3 { x: -113.372, y: -57.418, z: -4.075 },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        let out3 = r.tick();
+        assert!(
+            !out3
+                .commands
+                .iter()
+                .any(|c| matches!(c, AgentCommand::RequestZoneChange { .. })),
+            "must not re-fire while still inside same trigger"
+        );
+
+        // 4) Walk OFF the trigger — no fire (still latched as None now).
+        r.observe_event(&upsert(
+            1,
+            Vec3 { x: 0.0, y: 0.0, z: -5.0 },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        let out4 = r.tick();
+        assert!(
+            !out4
+                .commands
+                .iter()
+                .any(|c| matches!(c, AgentCommand::RequestZoneChange { .. })),
+            "must not fire on leave"
+        );
+
+        // 5) Walk back ON — must fire again (re-entry).
+        r.observe_event(&upsert(
+            1,
+            Vec3 { x: -113.372, y: -57.418, z: -4.075 },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        let out5 = r.tick();
+        assert!(
+            out5.commands
+                .iter()
+                .any(|c| matches!(c, AgentCommand::RequestZoneChange { .. })),
+            "re-entry must fire fresh RequestZoneChange"
+        );
     }
 
     #[test]

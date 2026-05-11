@@ -39,6 +39,7 @@ relay = [
 ffxi-proto = { path = "../ffxi-proto" }
 ffxi-nav = { path = "../ffxi-nav" }
 ffxi-nav-recast = { path = "../ffxi-nav-recast" }
+ffxi-dat = { path = "../ffxi-dat" }
 
 anyhow.workspace = true
 bytes.workspace = true

@@ -63,6 +63,29 @@ struct Args {
     #[arg(long, value_parser = ffxi_client::relay::parse_relay_listen)]
     relay_listen: Option<std::net::SocketAddr>,
 
+    /// Bind a Unix-domain socket at `<path>` that speaks the same
+    /// JSON-line `AgentCommand` / `AgentEvent` protocol as `play`'s
+    /// stdio. Used by `ffxi-mcp` in attach mode (`FFXI_ATTACH=…`) to
+    /// drive a long-lived `native`-window client without spawning its
+    /// own headless subprocess. Accepts an absolute path or `auto`
+    /// (writes `${TMPDIR}/ffxi-agent-{pid}.sock` plus a discovery
+    /// pidfile at `${TMPDIR}/ffxi-agent.pid`). If unset, falls back
+    /// to the `FFXI_AGENT_LISTEN` env var.
+    #[cfg(unix)]
+    #[arg(long)]
+    agent_listen: Option<String>,
+
+    /// Hard-fail at startup if no FFXI client DAT install is reachable
+    /// (env var `FFXI_DAT_PATH` unset *and* the workspace-relative
+    /// fallback `./vendor/Game/SquareEnix/FINAL FANTASY XI` doesn't
+    /// exist). Default behavior is soft-degrade: log a warning, run
+    /// without static-NPC name resolution. Agents that depend on
+    /// non-`?` NPC names (the farming / scout playbooks) should set
+    /// this so misconfiguration surfaces at boot rather than as
+    /// degraded mid-session output.
+    #[arg(long)]
+    require_dat: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -202,6 +225,37 @@ fn main() -> Result<()> {
     }
 
     rt.block_on(async move { run_command_async(args, auth).await })
+}
+
+/// Resolve the FFXI client DAT install once per process. The same
+/// `Arc<DatRoot>` is then cloned into every `session::Config` so the
+/// 10× VTABLE/FTABLE files only get read once. When no install is
+/// reachable, returns `Ok(None)` and the session falls back to "?"
+/// for static NPC names (dynamic entities still resolve via wire
+/// packets). `require_dat` flips the soft-degrade into a hard error.
+fn resolve_dat_root(
+    require_dat: bool,
+) -> Result<Option<std::sync::Arc<ffxi_dat::DatRoot>>> {
+    match ffxi_dat::DatRoot::from_env_or_default() {
+        Ok(root) => {
+            tracing::info!(
+                source = %root.root().display(),
+                "loaded FFXI DAT install for NPC name lookup"
+            );
+            Ok(Some(std::sync::Arc::new(root)))
+        }
+        Err(err) if require_dat => Err(anyhow::anyhow!(
+            "--require-dat is set but no DAT install was found: {err}"
+        )),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "no FFXI DAT install reachable; static NPC names will render as '?'. \
+                 Set FFXI_DAT_PATH or pass --require-dat to fail fast."
+            );
+            Ok(None)
+        }
+    }
 }
 
 async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<()> {
@@ -445,6 +499,7 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             password,
             char_name,
         } => {
+            let dat_root = resolve_dat_root(args.require_dat)?;
             let lobby = lobby_client::LobbyClient::new(
                 args.server.clone(),
                 args.data_port,
@@ -524,11 +579,41 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                 // Headless agent path: keep auto-dismiss on so unattended
                 // sessions don't stall when an event packet arrives.
                 user_driven_events: false,
+                dat_root: dat_root.clone(),
             };
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
-            let (event_tx, event_rx) = tokio::sync::broadcast::channel(256);
+            let (event_tx, event_rx) = tokio::sync::broadcast::channel(1024);
             let session_task = tokio::spawn(session::run(cfg, cmd_rx, event_tx.clone()));
             let agent_task = tokio::spawn(agent_io::run(cmd_tx.clone(), event_rx));
+
+            // Optional agent socket — parallel to the stdio agent_io
+            // above, for harness configurations that prefer connecting
+            // over a Unix socket (e.g. `ffxi-mcp` attach mode). The
+            // socket and stdio paths share the same `cmd_tx` /
+            // `event_tx`, so commands from either source merge into the
+            // single session inbox.
+            #[cfg(unix)]
+            if let Some(arg) = args
+                .agent_listen
+                .clone()
+                .or_else(|| std::env::var("FFXI_AGENT_LISTEN").ok())
+            {
+                let listen = ffxi_client::agent_socket::resolve_listen(&arg);
+                let sock_cmd_tx = cmd_tx.clone();
+                let sock_event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = ffxi_client::agent_socket::serve(
+                        listen,
+                        sock_cmd_tx,
+                        sock_event_tx,
+                        None, // headless `play` has no GUI pause toggle
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %err, "agent socket listener exited");
+                    }
+                });
+            }
 
             // Optional WebSocket relay. Needs a `watch::Receiver<SessionState>`,
             // so we run a folder task that converts the broadcast event stream
@@ -582,6 +667,7 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             password,
             char_name,
         } => {
+            let dat_root = resolve_dat_root(args.require_dat)?;
             let lobby = lobby_client::LobbyClient::new(
                 args.server.clone(),
                 args.data_port,
@@ -670,6 +756,7 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                 // operator can issue `EndEvent` themselves, so don't
                 // auto-flush.
                 user_driven_events: true,
+                dat_root: dat_root.clone(),
             };
             let SessionHandle {
                 state_rx,
@@ -823,6 +910,11 @@ fn run_native_main_thread(
     let relay_listen = args.relay_listen;
     #[cfg(not(feature = "relay"))]
     let relay_listen: Option<std::net::SocketAddr> = None;
+    #[cfg(unix)]
+    let agent_listen = args
+        .agent_listen
+        .clone()
+        .or_else(|| std::env::var("FFXI_AGENT_LISTEN").ok());
     // Fail fast on EADDRINUSE before we open the launcher window. A
     // post-bind error from the relay task would only emit a buried
     // `tracing::warn!` and the user would silently end up with no
@@ -836,6 +928,7 @@ fn run_native_main_thread(
             std::process::exit(2);
         }
     }
+    let args_require_dat = args.require_dat;
     let Args {
         server,
         auth_port,
@@ -871,6 +964,8 @@ fn run_native_main_thread(
 
     let lobby = lobby_client::LobbyClient::new(server.clone(), data_port, view_port);
 
+    let dat_root = resolve_dat_root(args_require_dat)?;
+
     view_native::run(view_native::NativeRunArgs {
         server,
         ports: view_native::SessionPorts {
@@ -885,6 +980,9 @@ fn run_native_main_thread(
         direct_mode_autostart,
         runtime: rt.handle().clone(),
         relay_listen,
+        #[cfg(unix)]
+        agent_listen,
+        dat_root,
     })
     .context("native viewer")
 }

@@ -119,6 +119,13 @@ pub struct Entity {
     /// other-claim, default = unclaimed).
     #[serde(default)]
     pub claim_id: u32,
+    /// Current movement speed (`PosHead::speed`). 0 when standing still.
+    #[serde(default)]
+    pub speed: u8,
+    /// Base movement speed (`PosHead::speed_base`) — animation speed,
+    /// unaffected by movement-status effects.
+    #[serde(default)]
+    pub speed_base: u8,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -493,6 +500,8 @@ mod tests {
                 hp_pct: Some(80),
                 bt_target_id: 0,
                 claim_id: 0,
+                speed: 0,
+                speed_base: 0,
             }],
             party: vec![],
             chat: vec![ChatLine {

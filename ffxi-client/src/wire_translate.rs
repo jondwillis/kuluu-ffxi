@@ -27,11 +27,16 @@ use crate::state::{
 /// watch channel and cloning into the wire struct is cheaper than
 /// cloning the entire state and then translating.
 pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
+    // Derive self position from the entity list — `self_position()` reads
+    // the entry whose `id == self.char_id`. Falls back to
+    // `Position::default()` for the brief pre-LOGIN window where neither
+    // `char_id` nor the self entity has been seeded yet.
+    let self_pos = position_to_wire(s.self_position().unwrap_or_default());
     wire::SceneSnapshot {
         stage: stage_to_wire(s.stage),
         char_name: s.character.clone(),
         zone_id: s.zone_id,
-        self_pos: position_to_wire(s.self_pos),
+        self_pos,
         entities: s.entities.iter().map(entity_to_wire).collect(),
         party: s.party.iter().map(party_to_wire).collect(),
         chat: s.chat.iter().map(chat_to_wire).collect(),
@@ -158,6 +163,8 @@ pub fn entity_to_wire(e: &Entity) -> wire::Entity {
         hp_pct: e.hp_pct,
         bt_target_id: e.bt_target_id,
         claim_id: e.claim_id,
+        speed: e.speed,
+        speed_base: e.speed_base,
     }
 }
 

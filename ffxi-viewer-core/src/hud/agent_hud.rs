@@ -1,16 +1,22 @@
 //! Left-anchored agent HUD card mirroring the chrome `draw_agent_hud`
-//! layout from `ffxi-client/src/chrome.rs` (the TUI side). Three lines:
+//! layout from `ffxi-client/src/chrome.rs` (the TUI side). Four lines:
 //!
 //! ```text
 //!   goal: follow #4242 d=3.5y
 //!  state: [FOLLOWING]
 //!  recon: 1.2s ago (520ms down)
+//!  tools: engage → follow → snapshot
 //! ```
 //!
 //! - `goal` — reflects `SceneSnapshot::current_goal`, falls back to `—`.
 //! - `state` — color-coded pill mirroring goal kind (cyan/green/yellow/red).
 //! - `recon` — wall-clock age of the most recent supervisor `Reconnected`
 //!   event, plus how long the downtime was. `—` when no reconnect yet.
+//! - `tools` — most-recent-first list of the last 3 tool dispatches the
+//!   agent made (from `SceneSnapshot::recent_decisions`, filtered to
+//!   `LlmDecisionKind::ToolDispatched`). Complements `llm_badge.rs`'s
+//!   numeric view (sparkline + percentiles) with a human-readable trail
+//!   of *what* the agent actually did.
 //!
 //! Sits below the stage bar at the top-left; doesn't capture pointer
 //! events. `update_agent_hud_system` runs every frame because the recon
@@ -20,7 +26,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
-use ffxi_viewer_wire::ReactorGoal;
+use ffxi_viewer_wire::{LlmDecision, LlmDecisionKind, ReactorGoal};
 
 use crate::hud::palette;
 use crate::snapshot::SceneState;
@@ -36,6 +42,9 @@ pub struct StatePill;
 
 #[derive(Component)]
 pub struct ReconnectText;
+
+#[derive(Component)]
+pub struct RecentToolsText;
 
 /// Spawn the card at top-left, just below the 28px stage bar.
 pub fn spawn_agent_hud(mut commands: Commands) {
@@ -81,6 +90,14 @@ pub fn spawn_agent_hud(mut commands: Commands) {
                     TextColor(palette::MUTED),
                 ));
             });
+            p.spawn(line_row("tools:")).with_children(|row| {
+                row.spawn((
+                    RecentToolsText,
+                    Text::new("—".to_string()),
+                    TextFont { font_size: 13.0, ..default() },
+                    TextColor(palette::TEXT),
+                ));
+            });
         });
 }
 
@@ -99,16 +116,46 @@ fn line_row(label: &str) -> impl Bundle {
     )
 }
 
-/// Refresh goal/pill/recon. Runs every frame because recon decays
-/// continuously even when no fresh snapshot lands.
+/// Refresh goal/pill/recon/tools. Runs every frame because recon
+/// decays continuously even when no fresh snapshot lands.
 pub fn update_agent_hud_system(
     state: Res<SceneState>,
-    mut q_goal: Query<&mut Text, (With<GoalText>, Without<StatePill>, Without<ReconnectText>)>,
+    mut q_goal: Query<
+        &mut Text,
+        (
+            With<GoalText>,
+            Without<StatePill>,
+            Without<ReconnectText>,
+            Without<RecentToolsText>,
+        ),
+    >,
     mut q_pill: Query<
         (&mut Text, &mut TextColor),
-        (With<StatePill>, Without<GoalText>, Without<ReconnectText>),
+        (
+            With<StatePill>,
+            Without<GoalText>,
+            Without<ReconnectText>,
+            Without<RecentToolsText>,
+        ),
     >,
-    mut q_recon: Query<&mut Text, (With<ReconnectText>, Without<GoalText>, Without<StatePill>)>,
+    mut q_recon: Query<
+        &mut Text,
+        (
+            With<ReconnectText>,
+            Without<GoalText>,
+            Without<StatePill>,
+            Without<RecentToolsText>,
+        ),
+    >,
+    mut q_tools: Query<
+        &mut Text,
+        (
+            With<RecentToolsText>,
+            Without<GoalText>,
+            Without<StatePill>,
+            Without<ReconnectText>,
+        ),
+    >,
 ) {
     if let Ok(mut text) = q_goal.single_mut() {
         **text = goal_label(state.snapshot.current_goal.as_ref());
@@ -120,6 +167,9 @@ pub fn update_agent_hud_system(
     }
     if let Ok(mut text) = q_recon.single_mut() {
         **text = format_reconnect(state.snapshot.last_reconnect.as_ref(), now_unix_ms());
+    }
+    if let Ok(mut text) = q_tools.single_mut() {
+        **text = format_recent_tools(&state.snapshot.recent_decisions);
     }
 }
 
@@ -194,6 +244,31 @@ fn format_duration_ms(ms: u64) -> String {
     }
 }
 
+/// Render the last 3 `ToolDispatched` entries from
+/// `recent_decisions`, most-recent first, as `t1 → t2 → t3`. Skips
+/// `NotificationFired` entries (those are observability churn — the
+/// HUD already shows notification activity via the `llm_badge` pulse).
+/// Returns `"—"` when no dispatches have happened yet.
+///
+/// The producer caps `recent_decisions` at 64 entries, so this walk
+/// is bounded and cheap.
+fn format_recent_tools(decisions: &[LlmDecision]) -> String {
+    let mut tools: Vec<&str> = Vec::with_capacity(3);
+    for d in decisions.iter().rev() {
+        if let LlmDecisionKind::ToolDispatched { tool } = &d.kind {
+            tools.push(tool.as_str());
+            if tools.len() == 3 {
+                break;
+            }
+        }
+    }
+    if tools.is_empty() {
+        "—".to_string()
+    } else {
+        tools.join(" → ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +316,47 @@ mod tests {
     #[test]
     fn format_reconnect_dash_when_none() {
         assert_eq!(format_reconnect(None, 0), "—");
+    }
+
+    fn td(tool: &str, at: u64) -> LlmDecision {
+        LlmDecision {
+            kind: LlmDecisionKind::ToolDispatched { tool: tool.into() },
+            latency_us: 0,
+            at_monotonic_ms: at,
+        }
+    }
+
+    fn nf(uri: &str, at: u64) -> LlmDecision {
+        LlmDecision {
+            kind: LlmDecisionKind::NotificationFired { uri: uri.into() },
+            latency_us: 0,
+            at_monotonic_ms: at,
+        }
+    }
+
+    #[test]
+    fn recent_tools_dash_when_empty() {
+        assert_eq!(format_recent_tools(&[]), "—");
+    }
+
+    #[test]
+    fn recent_tools_dash_when_only_notifications() {
+        let decisions = vec![nf("scene://current", 1), nf("party://members", 2)];
+        assert_eq!(format_recent_tools(&decisions), "—");
+    }
+
+    #[test]
+    fn recent_tools_most_recent_first_capped_at_three() {
+        // Stored oldest-first (per `state::RECENT_DECISIONS_CAP` semantics);
+        // we render newest-first.
+        let decisions = vec![
+            td("follow", 1),
+            nf("scene://current", 2),
+            td("engage", 3),
+            td("snapshot", 4),
+            td("cancel", 5),
+        ];
+        // Most recent: cancel → snapshot → engage. follow drops (4th match).
+        assert_eq!(format_recent_tools(&decisions), "cancel → snapshot → engage");
     }
 }

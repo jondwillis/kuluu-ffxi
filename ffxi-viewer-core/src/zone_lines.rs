@@ -73,10 +73,11 @@ pub fn setup_zone_line_assets(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // 4-yalm-radius disc, 0.1 yalm thick. Big enough to read at a
-    // glance from chase-camera distance, thin enough to look like a
-    // floor decal rather than a column.
-    let mesh = meshes.add(Cylinder::new(4.0, 0.1));
+    // 1.5-yalm-radius column, 12 yalms tall. Taller than any entity so
+    // it's visible from across a zone (the previous flat disc was only
+    // legible from yalms away). Columns extend upward from the zone-
+    // line's ground position — the trigger itself is at the bottom.
+    let mesh = meshes.add(Cylinder::new(1.5, 12.0));
     // Warm amber, mildly emissive — reads as "interactable trigger"
     // without competing with the brighter target/aggro materials.
     let material = materials.add(StandardMaterial {
@@ -123,11 +124,16 @@ pub fn sync_zone_lines_system(
 
     let descriptors = (resolver.0)(zone_id);
     for desc in descriptors {
-        let world_pos = ffxi_to_bevy(WireVec3 {
+        // The trigger position is at ground; the column extends 12
+        // yalms upward, so we lift the *center* by 6 to put the
+        // bottom at the trigger. A small +0.05 floor-clearance is
+        // baked in for safety against any future ground plane.
+        let ground_pos = ffxi_to_bevy(WireVec3 {
             x: desc.from_pos[0],
             y: desc.from_pos[1],
             z: desc.from_pos[2],
-        }) + Vec3::new(0.0, 0.05, 0.0);
+        });
+        let column_center = ground_pos + Vec3::new(0.0, 6.05, 0.0);
 
         commands.spawn((
             ZoneLineMarker {
@@ -137,7 +143,7 @@ pub fn sync_zone_lines_system(
             Pickable::IGNORE,
             Mesh3d(assets.mesh.clone()),
             MeshMaterial3d(assets.material.clone()),
-            Transform::from_translation(world_pos),
+            Transform::from_translation(column_center),
         ));
     }
 }

@@ -1,7 +1,7 @@
 ---
 name: scout
 description: Short-lived perception probe. Use this agent when the main agent is starved of actionable targets — e.g. scene://current reports "N NPCs nearby" but no entity IDs, or you've just zoned in and don't know what's around. The scout walks a small bounded pattern, samples scene://entities, and reports back the first engageable target with id/coords. Returns a compact summary; does not engage.
-tools: mcp__ffxi__snapshot, mcp__ffxi__path_to, mcp__ffxi__cancel, mcp__ffxi__wait_for_event, mcp__ffxi__read_resource, Read
+tools: mcp__ffxi__snapshot, mcp__ffxi__path_to, mcp__ffxi__cancel, mcp__ffxi__wait_for_event, mcp__ffxi__read_resource, mcp__ffxi-attach__snapshot, mcp__ffxi-attach__path_to, mcp__ffxi-attach__cancel, mcp__ffxi-attach__wait_for_event, mcp__ffxi-attach__read_resource, Read
 model: haiku
 ---
 

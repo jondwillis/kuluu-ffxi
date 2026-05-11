@@ -1,7 +1,10 @@
 //! Library entry point exposing the modules that the integration tests
 //! (and any future external embedders) need to drive a session.
 
+pub mod agent_codec;
 pub mod agent_io;
+#[cfg(unix)]
+pub mod agent_socket;
 pub mod auth_client;
 pub mod chrome;
 pub mod goal_store;
@@ -52,12 +55,13 @@ pub struct SessionHandle {
 }
 
 /// Spawn the session actor + event folder and return their channels.
-/// Channel sizes match what `Tui` has used since day one (cmd=64, event=256);
-/// ratatui drops intermediate state under load via watch's "latest" semantics
-/// and Bevy will do the same.
+/// Channel sizes: cmd=64; event=1024 (4x the original 256, sized for the
+/// frame-rate reactor's higher `PositionChanged` volume — up to ~30/sec
+/// per active mover during pathing). Watch's "latest" semantics still
+/// drops intermediate state under load.
 pub fn spawn_session(cfg: session::Config) -> SessionHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (event_tx, _) = broadcast::channel(256);
+    let (event_tx, _) = broadcast::channel(1024);
     let (state_tx, state_rx) = watch::channel(state::SessionState::default());
 
     let event_rx_for_folder = event_tx.subscribe();
@@ -91,7 +95,7 @@ pub fn spawn_session_with_reactor(
     reactor_cfg: reactor::ReactorConfig,
 ) -> SessionHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (event_tx, _) = broadcast::channel(256);
+    let (event_tx, _) = broadcast::channel(1024);
     let (state_tx, state_rx) = watch::channel(state::SessionState::default());
 
     let event_rx_for_folder = event_tx.subscribe();

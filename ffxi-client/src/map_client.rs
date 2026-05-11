@@ -215,6 +215,30 @@ impl MapClient {
     pub fn server_addr(&self) -> SocketAddr {
         self.server
     }
+
+    /// Retarget the *same* UDP socket at a new map-server address with a
+    /// new (rotated) Blowfish seed. The local socket — including the
+    /// kernel-assigned ephemeral source port — is preserved.
+    ///
+    /// This matters on a single-process LSB dev stack: LSB's
+    /// `map_networking.cpp::handle_incoming_packet` looks sessions up by
+    /// **client `(ip, port)` tuple** (`getSessionByIPP`). Its fallback —
+    /// match-by-charid via "pending session" — only fires if the IPC
+    /// `ipc::CharZone` handler created one, which it *only* does when no
+    /// session for that charid already exists. In single-process dev,
+    /// the source zone's session is still alive when the IPC arrives,
+    /// so no pending session gets made. If we rebind the socket here,
+    /// the new ephemeral port doesn't match the old session and LSB
+    /// silently drops every bootstrap. Reusing the socket means LSB
+    /// matches the old session (still alive at `BLOWFISH_PENDING_ZONE`),
+    /// `recv_parse:277-282` clears the old PChar, reloads `session_key`
+    /// from the DB row Phoenix-cleared-and-rotated, and processes the
+    /// bootstrap on the rotated key.
+    pub fn retarget(&mut self, new_server: SocketAddr, new_seed: [u8; 20]) {
+        self.server = new_server;
+        self.seed = new_seed;
+        self.blowfish = derive_blowfish(&new_seed);
+    }
 }
 
 /// Apply the same key rotation the server runs in
@@ -367,5 +391,29 @@ mod tests {
         rotate_session_key_seed(&mut seed);
         // u32::MAX + 2 wraps to 1.
         assert_eq!(&seed[16..20], &1u32.to_le_bytes());
+    }
+
+    #[tokio::test]
+    async fn retarget_preserves_local_socket_port() {
+        // The whole point of `retarget` is to keep the same kernel-
+        // assigned source port across reconnects so LSB's
+        // session-by-(ip,port) lookup matches the old session at
+        // `BLOWFISH_PENDING_ZONE`. If a future refactor accidentally
+        // rebinds the socket, that property silently regresses and
+        // single-process LSB reconnects break.
+        let server_a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let server_b: SocketAddr = "127.0.0.2:2".parse().unwrap();
+        let seed_a = [1u8; 20];
+        let seed_b = [2u8; 20];
+        let mut client = MapClient::connect(server_a, seed_a).await.unwrap();
+        let local_before = client.socket.local_addr().unwrap();
+        client.retarget(server_b, seed_b);
+        let local_after = client.socket.local_addr().unwrap();
+        assert_eq!(
+            local_before, local_after,
+            "retarget must keep the same local (ip, port)"
+        );
+        assert_eq!(client.server, server_b, "retarget updates server");
+        assert_eq!(client.seed, seed_b, "retarget updates seed");
     }
 }

@@ -17,11 +17,61 @@ use crate::lobby_client::LobbyClient;
 use crate::map_client::{self, BootstrapArgs, MapClient};
 use crate::state::{
     AgentCommand, AgentEvent, BlowfishStatus, ChatChannel, ChatLine, Diagnostics, Entity,
-    EntityKind, InventoryUpdate, ItemSlot, Position, ShopItem, ShopState, Stage, Vec3,
+    EntityKind, HealMode, InventoryUpdate, ItemSlot, Position, ShopItem, ShopState, Stage, Vec3,
 };
 
 #[allow(dead_code)]
 const _UNUSED: Option<crate::state::SessionState> = None;
+
+/// Resolves static-NPC names from a per-zone DAT file, lazily loading
+/// the table on first miss and swapping it out when the entity's
+/// zone bits differ from the current cached table.
+///
+/// Holds at most one zone's table at a time (~30 KB). The wire path
+/// only sees CHAR_NPC for the player's current zone, so a single-slot
+/// cache covers the common case without growing across long sessions.
+/// Returns `None` when no DAT install is configured (soft-degrade) or
+/// when the id doesn't belong to any reachable zone DAT.
+struct NpcNameResolver {
+    root: Option<std::sync::Arc<ffxi_dat::DatRoot>>,
+    current: Option<ffxi_dat::NpcNameTable>,
+}
+
+impl NpcNameResolver {
+    fn new(root: Option<std::sync::Arc<ffxi_dat::DatRoot>>) -> Self {
+        Self {
+            root,
+            current: None,
+        }
+    }
+
+    /// Look up the display name for a static NPC by its wire id.
+    /// Returns `None` for dynamic-entity ids (trusts/pets/fellows —
+    /// their `targid + 0x100` puts their slot above the DAT range) and
+    /// for unconfigured DAT roots.
+    fn lookup(&mut self, npc_id: u32) -> Option<&str> {
+        let root = self.root.as_ref()?;
+        let (zone, _slot) = ffxi_dat::split_id(npc_id)?;
+        // Swap the active table when the entity's zone changes.
+        let zone_matches = self
+            .current
+            .as_ref()
+            .is_some_and(|t| t.zone_id() == zone);
+        if !zone_matches {
+            self.current = match ffxi_dat::NpcNameTable::open(root, zone) {
+                Ok(table) => Some(table),
+                Err(err) => {
+                    // Common — many zone ids have no NPC list DAT (battlefields,
+                    // unfinished zones). Log at debug so a populated zone with
+                    // a real install doesn't get spammed at info.
+                    tracing::debug!(zone, error = %err, "no NPC-name DAT for zone");
+                    None
+                }
+            };
+        }
+        self.current.as_ref()?.lookup_by_id(npc_id)
+    }
+}
 
 /// Which method to use for character selection.
 /// Exactly one of `char_id` or `char_name` is allowed — the type system enforces it.
@@ -70,6 +120,12 @@ pub struct Config {
     /// to read; headless MCP/agent callers leave it at `false` so
     /// unattended sessions don't get stuck in events.
     pub user_driven_events: bool,
+    /// Optional FFXI client DAT root. When `Some`, CHAR_NPC name
+    /// resolution falls back to the per-zone NPC-name DAT
+    /// (`file_id = 6720 + zone`) when the wire packet didn't carry a
+    /// name. `Arc` because the same `DatRoot` is shared across all
+    /// reconnects within a `run()` invocation and across cloned Configs.
+    pub dat_root: Option<std::sync::Arc<ffxi_dat::DatRoot>>,
 }
 
 /// Caller-supplied lobby completion. All three fields are required
@@ -143,7 +199,7 @@ pub async fn run(
         (handoff.server_ip >> 16) & 0xFF,
         (handoff.server_ip >> 24) & 0xFF,
     );
-    let mut server_addr: std::net::SocketAddr = match cfg.map_host_override.as_deref() {
+    let server_addr: std::net::SocketAddr = match cfg.map_host_override.as_deref() {
         Some(host) => tokio::net::lookup_host((host, handoff.server_port))
             .await
             .context("resolving map_host_override")?
@@ -169,16 +225,21 @@ pub async fn run(
     };
 
     // Phase 2 — map session, with reconnect-on-zone-change as the outer loop.
+    // The MapClient (and its UDP socket) is constructed *once* and lives
+    // across all zone-change reconnects. See `MapClient::retarget` for why
+    // the socket must persist on a single-process LSB dev stack.
     let mut current_seed = key3;
     let mut iteration: u32 = 0;
+    emit_stage(&event_tx, Stage::MapBootstrap);
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let mut map = MapClient::connect(server_addr, current_seed).await?;
     loop {
         iteration += 1;
         let outcome = run_map_session(
             &cfg,
             &auth_session,
             &bootstrap,
-            server_addr,
-            current_seed,
+            &mut map,
             cert_sha256.clone(),
             iteration,
             &mut cmd_rx,
@@ -194,7 +255,34 @@ pub async fn run(
                 let _ = event_tx.send(AgentEvent::KeyRotated {
                     previous_status: prev_status,
                 });
-                server_addr = new_addr;
+                // Re-apply `map_host_override` on reconnect. LSB's
+                // `0x00B Iwasaki` field reports the new map server's
+                // *internal* address — for a containerized dev stack
+                // (Docker / Colima) that's the container-network IP,
+                // unreachable from the host. The override translates
+                // this on the initial connect at line 146; the same
+                // translation must apply per-zone-change. Only the port
+                // varies between zones in dev (single map process per
+                // container), so we keep the override host and adopt
+                // LSB's reported port.
+                let target = match cfg.map_host_override.as_deref() {
+                    Some(host) => tokio::net::lookup_host((host, new_addr.port()))
+                        .await
+                        .context("resolving map_host_override on reconnect")?
+                        .next()
+                        .ok_or_else(|| anyhow!("no addresses for {host} on reconnect"))?,
+                    None => new_addr,
+                };
+                tracing::info!(
+                    reconnect_addr = %target,
+                    server_reported = %new_addr,
+                    "reconnecting to new map server after zone change"
+                );
+                // Retarget the existing socket — do NOT rebind. See
+                // `MapClient::retarget` for the LSB session-lookup
+                // rationale (match-by-(ip,port) requires source-port
+                // continuity).
+                map.retarget(target, current_seed);
                 emit_stage(&event_tx, Stage::Zoning);
                 // The new map session expects the rotated key in
                 // `accounts_sessions.session_key`. The server writes that
@@ -213,19 +301,16 @@ async fn run_map_session(
     cfg: &Config,
     _auth_session: &crate::auth_client::AuthSession,
     bootstrap: &BootstrapArgs<'_>,
-    server_addr: std::net::SocketAddr,
-    seed: [u8; 20],
+    map: &mut MapClient,
     cert_sha256: Option<String>,
     iteration: u32,
     cmd_rx: &mut mpsc::Receiver<AgentCommand>,
     event_tx: &broadcast::Sender<AgentEvent>,
 ) -> Result<MapOutcome> {
-    if iteration == 1 {
-        emit_stage(event_tx, Stage::MapBootstrap);
-        // Same connect→map ZMQ pacing the original bootstrap needed.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    }
-    let map = MapClient::connect(server_addr, seed).await?;
+    // MapClient lifetime (including its UDP socket) is owned by the
+    // outer `run` so it spans reconnects; the initial Stage::MapBootstrap
+    // emit + 1500ms ZMQ pacing happen there too. This function just
+    // sends bootstraps and runs one map session.
 
     // First bootstrap creates server-side session; second triggers parse +
     // send_parse (the recv_parse pass-by-value PSession trick).
@@ -249,6 +334,24 @@ async fn run_map_session(
     let mut pending_event_end: Vec<(u32, u16, u16)> = Vec::new();
     let mut self_act_index: Option<u16> = None;
     let mut name_cache: std::collections::HashMap<u32, String> = Default::default();
+    // Static-NPC name resolver backed by the FFXI client install DATs.
+    // Lazy-loads one zone's name table on first lookup miss; swaps it
+    // out when the next CHAR_NPC's zone bits differ. `cfg.dat_root`
+    // is `None` when the install couldn't be found at boot.
+    let mut npc_name_resolver = NpcNameResolver::new(cfg.dat_root.clone());
+    // Rate-limit map for `NameExtractionMiss` emission. Keyed by
+    // `(entity_id, miss_kind)` so a single entity can emit multiple kinds
+    // of miss (e.g., NameBitClear during regular ticks plus a one-off
+    // NameBitSetExtractionFailed) without one stomping the other.
+    let mut name_miss_dedup: std::collections::HashMap<
+        (u32, crate::state::NameMissKind),
+        std::time::Instant,
+    > = Default::default();
+    let mut current_zone_id: u16 = 0;
+    // Synced from CHAR_PC for self during the flood-drain — needed
+    // so the first keepalive after Stage::InZone sends server-authoritative
+    // coords rather than `Position::default()`.
+    let mut self_pos = Position::default();
     while std::time::Instant::now() < flood_deadline {
         match tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -266,8 +369,13 @@ async fn run_map_session(
                         event_tx,
                         &mut pending_event_end,
                         bootstrap.char_id,
+                        bootstrap.char_name,
                         &mut self_act_index,
                         &mut name_cache,
+                        &mut name_miss_dedup,
+                        &mut current_zone_id,
+                        &mut self_pos,
+                        &mut npc_name_resolver,
                     );
                 }
             }
@@ -301,7 +409,7 @@ async fn run_map_session(
             sync_out: Some(bundle_seq),
             last_server_packet_age_ms: Some(0),
             cert_sha256,
-            map_server_addr: Some(server_addr.to_string()),
+            map_server_addr: Some(map.server_addr().to_string()),
         },
     });
 
@@ -312,11 +420,16 @@ async fn run_map_session(
         server_last_seq,
         pending_event_end,
         bootstrap.char_id,
+        bootstrap.char_name.to_string(),
+        current_zone_id,
         self_act_index,
         cmd_rx,
         event_tx.clone(),
         cfg.user_driven_events,
         name_cache,
+        name_miss_dedup,
+        self_pos,
+        npc_name_resolver,
     )
     .await
 }
@@ -340,24 +453,108 @@ fn handle_sub_packet(
     event_tx: &broadcast::Sender<AgentEvent>,
     pending_event_end: &mut Vec<(u32, u16, u16)>,
     self_char_id: u32,
+    // The locally-authenticated character name from the lobby handshake.
+    // LSB only sends the user's PC name in CHAR_PC packets when
+    // `SendFlg.Name` is set (typically once per spawn), and zoning-in
+    // floods don't always include it — so we seed the self-entity from
+    // this known-good value on `0x00A LOGIN` instead of waiting for an
+    // optional later CHAR_PC.
+    self_char_name: &str,
     self_act_index: &mut Option<u16>,
     name_cache: &mut std::collections::HashMap<u32, String>,
+    // Per-(entity, miss-kind) timestamps used to rate-limit
+    // `NameExtractionMiss` events. Without this, a populated zone where
+    // most entities never sent UPDATE_NAME would emit hundreds of
+    // identical misses per second across the attach socket.
+    name_miss_dedup: &mut std::collections::HashMap<(u32, crate::state::NameMissKind), std::time::Instant>,
+    // Captures the current zone id as it's decoded from the 0x00A LOGIN
+    // sub-packet. The caller's mirror of this value is used by the
+    // `Snapshot` handler to re-emit a fresh `Connected{zone_id}` for
+    // attach-mode resync — without it, a late-attaching MCP can't tell
+    // what zone the running session is in.
+    current_zone_id: &mut u16,
+    // Synced from inbound `CHAR_PC` for self so the keepalive's
+    // `0x015 POS` carries the server's authoritative spawn coords on
+    // zone-in. Without this sync, the loop's local `self_pos` stays at
+    // the previous-zone value (or `Position::default()`) and the next
+    // keepalive overrides the server's `loc.p` with garbage — lands
+    // the player at the origin or wherever Move last walked us.
+    self_pos: &mut Position,
+    // Static-NPC name resolver backed by the FFXI client install
+    // DATs. Used as a fallback for CHAR_NPC packets that arrive
+    // without `UPDATE_NAME` set — LSB's `entity_update.cpp:293-295`
+    // strips that bit for equipped-model spawns, which is most
+    // ambient NPCs. Dynamic entities (trusts/pets/fellows) keep
+    // arriving with names via 0x67/0x68 and don't use this path.
+    npc_name_resolver: &mut NpcNameResolver,
 ) {
     use ffxi_proto::map::s2c;
     match sub.opcode {
         op if op == s2c::LOGIN => {
-            // 0x00A carries the zone-in payload — `ZoneNo` lives at body
-            // [44..48]. Without this handler the agent's `zone_id` stays
-            // pinned at the placeholder `0` set in `run_map_session`,
-            // breaking nav lookups, floor-tile loading, and any tool that
-            // keys on the current zone. Re-emit on every LOGIN so the
-            // post-zone-change reconnect's stale `ZoneChanged{to:0}` from
-            // the LOGOUT path is overwritten with the real new zone.
+            // 0x00A carries the zone-in payload — `ZoneNo` at body[44..48]
+            // and the server's authoritative spawn `GP_SERV_POS_HEAD` at
+            // body[0..44]. Without decoding the PosHead, `self_pos` (and
+            // the renderer's anchor) defaults to `Position::default()`
+            // until a CHAR_PC for self happens to arrive — which is why
+            // the first keepalive after zone-in used to send (0, 0, 0)
+            // and the camera landed in the wrong place. Seed both the
+            // session-loop's local `self_pos` AND the entity list (via
+            // `EntityUpserted`) so the snapshot's derived `self_pos`
+            // reflects truth from the very first packet of zone-in.
             if let Ok(login) = decode::ServerLogin::decode(sub.data) {
+                *current_zone_id = login.zone_no;
+                let head = login.pos_head;
+                // ZoneChanged first — its `apply_event` clears the entity
+                // list (entities from the old zone are stale). Emitting the
+                // self-seed upsert *before* this would just get wiped.
                 let _ = event_tx.send(AgentEvent::ZoneChanged {
                     from: None,
                     to: login.zone_no,
                 });
+                if login.unique_no == self_char_id {
+                    *self_act_index = Some(login.act_index);
+                    *self_pos = Position {
+                        pos: Vec3 { x: head.x, y: head.y, z: head.z },
+                        heading: head.dir,
+                        speed: head.speed,
+                        speed_base: head.speed_base,
+                    };
+                    // Seed the self entity from LOGIN's `PosHead` so the
+                    // entity list (and therefore the wire snapshot's
+                    // `self_pos`, which is now derived from it) reflects
+                    // server-authoritative spawn coords from the very
+                    // first packet of zone-in. Without this, callers fall
+                    // back to `Position::default()` (origin) until a
+                    // CHAR_PC for self happens to arrive.
+                    let _ = event_tx.send(AgentEvent::EntityUpserted {
+                        entity: Entity {
+                            id: head.unique_no,
+                            act_index: head.act_index,
+                            kind: EntityKind::Pc,
+                            // Seed the self-entity name from the lobby
+                            // handshake. CHAR_PC for self only carries the
+                            // name when SendFlg.Name is set, and that's
+                            // not guaranteed on every zone-in flood — so
+                            // without this seed the tab-target list shows
+                            // the player as "?" until/unless a name-bearing
+                            // CHAR_PC happens to arrive.
+                            name: Some(self_char_name.to_string()),
+                            pos: Vec3 { x: head.x, y: head.y, z: head.z },
+                            heading: head.dir,
+                            hp_pct: Some(head.hpp),
+                            bt_target_id: head.bt_target_id,
+                            claim_id: 0,
+                            speed: head.speed,
+                            speed_base: head.speed_base,
+                        },
+                    });
+                    // Mirror to legacy `state.self_pos` so the fallback
+                    // path in `state_to_snapshot` (used pre-`char_id`
+                    // resolution) also has the right value.
+                    let _ = event_tx.send(AgentEvent::PositionChanged {
+                        pos: *self_pos,
+                    });
+                }
             }
         }
         op if op == s2c::CHAR_PC || op == s2c::CHAR_NPC => {
@@ -369,8 +566,52 @@ fn handle_sub_packet(
                 };
                 if op == s2c::CHAR_PC && head.unique_no == self_char_id {
                     *self_act_index = Some(head.act_index);
+                    *self_pos = Position {
+                        pos: Vec3 { x: head.x, y: head.y, z: head.z },
+                        heading: head.dir,
+                        ..*self_pos
+                    };
                 }
-                let name = decode::PosHead::try_extract_name(op, sub.data);
+                let wire_name = decode::PosHead::try_extract_name(op, sub.data);
+                if wire_name.is_none() {
+                    // Surface the miss for forensics regardless of whether
+                    // the SQL-table fallback resolves below — the wire
+                    // genuinely didn't carry a name this tick.
+                    record_name_miss(
+                        op,
+                        head.unique_no,
+                        head.act_index,
+                        sub.data,
+                        name_miss_dedup,
+                        event_tx,
+                    );
+                }
+                // Fallback: when CHAR_NPC didn't carry a name (LSB
+                // overrides updatemask to 0x57 for equipped-model
+                // entity spawns — entity_update.cpp:293-295 — which
+                // strips UPDATE_NAME), resolve it from the FFXI client
+                // DAT install. The per-zone NPC name list at
+                // `file_id = 6720 + zone_id` stores the same display
+                // names retail clients render; without this fallback,
+                // ambient NPCs show as "?" in the target panel.
+                //
+                // PC names don't get this fallback — the DAT only
+                // covers static (database-resident) NPCs, and the
+                // self-PC name is already seeded from `self_char_name`
+                // on LOGIN. Dynamic entities (trusts/pets/fellows)
+                // have ids with `targid + 0x100` low bits per
+                // `zone_entities.cpp:629`, putting their slot above the
+                // DAT range, so the resolver naturally returns `None`
+                // for them and they keep their wire-supplied name.
+                let name = wire_name.or_else(|| {
+                    if op == s2c::CHAR_NPC {
+                        npc_name_resolver
+                            .lookup(head.unique_no)
+                            .map(str::to_string)
+                    } else {
+                        None
+                    }
+                });
                 if let Some(n) = name.as_ref() {
                     if !n.is_empty() {
                         name_cache.insert(head.unique_no, n.clone());
@@ -386,6 +627,16 @@ fn handle_sub_packet(
                 } else {
                     0
                 };
+                // Gate `hp_pct` on the UPDATE_HP bit (0x04) in the updatemask
+                // byte at body[6]. LSB only writes `Hpp` at packet offset 0x1E
+                // (body[26]) when UPDATE_HP is set; on position-only ticks the
+                // byte is zero from the freshly-constructed packet buffer
+                // (`entity_update.cpp:381-385` for mobs, `:344` for NPCs which
+                // hard-code 0x64=100 under UPDATE_HP). Reporting head.hpp
+                // unconditionally clobbers prior HP% with 0 / 100 noise; the
+                // reducer treats `None` as "leave existing untouched."
+                let send_flag = sub.data.get(6).copied().unwrap_or(0);
+                let hp_pct = (send_flag & 0x04 != 0).then_some(head.hpp);
                 let _ = event_tx.send(AgentEvent::EntityUpserted {
                     entity: Entity {
                         id: head.unique_no,
@@ -398,32 +649,61 @@ fn handle_sub_packet(
                             z: head.z,
                         },
                         heading: head.dir,
-                        hp_pct: Some(head.hpp),
+                        hp_pct,
                         bt_target_id: head.bt_target_id,
                         claim_id,
+                        speed: head.speed,
+                        speed_base: head.speed_base,
                     },
                 });
             }
         }
-        op if op == s2c::ENTITY_UPDATE1 || op == s2c::ENTITY_UPDATE2 => {
-            if let Ok(head) = decode::PosHead::decode(sub.data) {
-                let _ = event_tx.send(AgentEvent::EntityUpserted {
-                    entity: Entity {
-                        id: head.unique_no,
-                        act_index: head.act_index,
-                        kind: EntityKind::Other,
-                        name: None,
-                        pos: Vec3 {
-                            x: head.x,
-                            y: head.y,
-                            z: head.z,
-                        },
-                        heading: head.dir,
-                        hp_pct: Some(head.hpp),
-                        bt_target_id: head.bt_target_id,
-                        claim_id: 0,
-                    },
-                });
+        op if op == s2c::ENTITY_UPDATE1 => {
+            // 0x067 is a multiplexed opcode: the sub-type byte at body[0]
+            // selects which packet variant is on the wire. None of them
+            // are position updates — the previous PosHead-based decode
+            // produced phantom entities at (0, 0, 0).
+            match sub.data.first().copied() {
+                Some(decode::EntitySetName::SUB_TYPE) => {
+                    if let Ok(ent) = decode::EntitySetName::decode(sub.data) {
+                        if let Some(name) = ent.name {
+                            let _ = event_tx.send(AgentEvent::EntityPatched {
+                                id: Some(ent.id),
+                                act_index: Some(ent.targid),
+                                name: Some(name),
+                                // LSB uses this packet for trusts, fellows
+                                // and pankration entities — we can't tell
+                                // them apart from this packet alone, so we
+                                // leave `kind` to whatever the CHAR_NPC
+                                // stream already established.
+                                kind: None,
+                                hp_pct: None,
+                            });
+                        }
+                    }
+                }
+                Some(decode::CharSync::SUB_TYPE) => {
+                    // PC status sync (level-sync icon, mount data, …) — not
+                    // consumed by the client today. Decode for future use.
+                    let _ = decode::CharSync::decode(sub.data);
+                }
+                _ => {}
+            }
+        }
+        op if op == s2c::ENTITY_UPDATE2 => {
+            if let Ok(pet) = decode::PetSync::decode(sub.data) {
+                // Despawn variant: owner has no active pet. Nothing to
+                // upsert — the pet's CHAR_NPC removal stream will clean
+                // up the entity record on its own.
+                if pet.pet_targid != 0 {
+                    let _ = event_tx.send(AgentEvent::EntityPatched {
+                        id: None,
+                        act_index: Some(pet.pet_targid),
+                        name: pet.name,
+                        kind: Some(EntityKind::Pet),
+                        hp_pct: Some(pet.hp_pct),
+                    });
+                }
             }
         }
         op if op == s2c::BATTLE_MESSAGE => {
@@ -524,13 +804,25 @@ fn handle_sub_packet(
             // line so we never silently drop a packet.
             if let Ok(m) = decode::SystemMessage::decode(sub.data) {
                 let line = build_system_message_line(m);
-                tracing::trace!(
-                    msg_id = m.message_id,
-                    para = m.para,
-                    para2 = m.para2,
-                    text = %line.text,
-                    "0x053 SYSTEMMES",
-                );
+                // CouldNotEnter (id=2; ids 0,1,3,4 share text per
+                // vendor/server/src/map/enums/msg_std.h:30) is the
+                // server's signal that a MAPRECT was rejected. Elevate
+                // to info! so denials are visible without --trace.
+                if m.message_id <= 4 {
+                    tracing::info!(
+                        msg_id = m.message_id,
+                        text = %line.text,
+                        "0x053 SYSTEMMES: server denied zone change",
+                    );
+                } else {
+                    tracing::trace!(
+                        msg_id = m.message_id,
+                        para = m.para,
+                        para2 = m.para2,
+                        text = %line.text,
+                        "0x053 SYSTEMMES",
+                    );
+                }
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
         }
@@ -624,26 +916,131 @@ fn handle_sub_packet(
     }
 }
 
+/// Window during which a repeat miss for the same `(entity_id, miss_kind)`
+/// pair is suppressed. 30s is long enough that a re-enrolled spawn or
+/// rename emits a fresh miss event for the same entity, but short enough
+/// that genuine stuck-state retries still surface inside a debugging
+/// session.
+const NAME_MISS_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cap on hex bytes captured per miss. CHAR_PC slot starts at 0x5A and
+/// CHAR_NPC at 0x30; 96 bytes covers both with room for the trailing
+/// 16-byte name slot.
+const NAME_MISS_BODY_HEX_CAP: usize = 96;
+
+/// Emit a `NameExtractionMiss` event (rate-limited per `(id, kind)`) when
+/// `PosHead::try_extract_name` returned `None`. The event carries enough
+/// raw context — the SendFlg byte and a hex dump of the leading body
+/// bytes — that an attach-mode auditor can inspect the packet via the
+/// `debug://name_misses` MCP resource without rebuilding the client.
+fn record_name_miss(
+    opcode: u16,
+    unique_no: u32,
+    act_index: u16,
+    body: &[u8],
+    name_miss_dedup: &mut std::collections::HashMap<
+        (u32, crate::state::NameMissKind),
+        std::time::Instant,
+    >,
+    event_tx: &broadcast::Sender<AgentEvent>,
+) {
+    use crate::state::NameMissKind;
+    let send_flag = body.get(6).copied().unwrap_or(0);
+    let miss_kind = if send_flag & 0x08 == 0 {
+        NameMissKind::NameBitClear
+    } else {
+        NameMissKind::NameBitSetExtractionFailed
+    };
+    let now = std::time::Instant::now();
+    if let Some(prev) = name_miss_dedup.get(&(unique_no, miss_kind)) {
+        if now.duration_since(*prev) < NAME_MISS_DEDUP_WINDOW {
+            return;
+        }
+    }
+    name_miss_dedup.insert((unique_no, miss_kind), now);
+
+    let n = body.len().min(NAME_MISS_BODY_HEX_CAP);
+    let mut body_hex = String::with_capacity(n * 2);
+    for b in &body[..n] {
+        use std::fmt::Write;
+        let _ = write!(body_hex, "{:02x}", b);
+    }
+    let at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let miss = crate::state::NameExtractionMiss {
+        opcode,
+        unique_no,
+        act_index,
+        send_flag,
+        body_len: body.len(),
+        body_hex,
+        miss_kind,
+        at_unix_ms,
+    };
+    // Operator-side stderr log mirrors what the MCP resource will show,
+    // so a local-only run (no MCP attached) still gets debug info via
+    // `RUST_LOG=ffxi_client=debug`.
+    if miss_kind == NameMissKind::NameBitSetExtractionFailed {
+        tracing::debug!(
+            opcode = format!("0x{:03x}", opcode),
+            unique_no = format!("0x{:08x}", unique_no),
+            act_index = format!("0x{:04x}", act_index),
+            send_flag = format!("0x{:02x}", send_flag),
+            body_len = body.len(),
+            "name extraction failed with Name bit SET — investigate offset/validation",
+        );
+    }
+    let _ = event_tx.send(AgentEvent::NameExtractionMiss { miss });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn keepalive_loop(
-    map: MapClient,
+    map: &mut MapClient,
     mut bundle_seq: u16,
     mut sub_seq: u16,
     mut server_last_seq: u16,
     mut pending_event_end: Vec<(u32, u16, u16)>,
     self_char_id: u32,
+    character_name: String,
+    mut current_zone_id: u16,
     mut self_act_index: Option<u16>,
     cmd_rx: &mut mpsc::Receiver<AgentCommand>,
     event_tx: broadcast::Sender<AgentEvent>,
     user_driven_events: bool,
     mut name_cache: std::collections::HashMap<u32, String>,
+    mut name_miss_dedup: std::collections::HashMap<
+        (u32, crate::state::NameMissKind),
+        std::time::Instant,
+    >,
+    mut self_pos: Position,
+    mut npc_name_resolver: NpcNameResolver,
 ) -> Result<MapOutcome> {
-    let mut self_pos = Position::default();
     let mut last_recv = std::time::Instant::now();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     tick.tick().await;
     let mut reconnect_addr: Option<std::net::SocketAddr> = None;
     let mut terminal_disconnect = false;
+    // Watchdog for `0x05E MAPRECT`. LSB's `validate().blockedBy(InEvent)`
+    // path drops the packet without sending `0x053 SYSTEMMES`, so a stuck
+    // server-side event flag would otherwise be invisible. We surface it
+    // as a chat-banner warning after 3s of no zone change.
+    let mut pending_maprect: Option<(std::time::Instant, u32)> = None;
+    // `/heal` mirror. Sources of truth:
+    // 1. Optimistic write on outbound `AgentCommand::Heal`.
+    // 2. Authoritative sync from CHAR_PC for self when UPDATE_HP gate set —
+    //    `animation == ffxi_proto::decode::animation::HEALING (33)`.
+    // 3. Implicit cancel: any keepalive tick that would advertise a new
+    //    position prepends `0x0E8 Mode::Off` and clears this flag, so
+    //    movement intent (WASD, /pathto, reactor goals) ends the rest
+    //    without an explicit `/heal off`. Matches retail behavior.
+    let mut is_healing = false;
+    // Tracks the last position we keepalived so the heal-cancel
+    // interceptor can detect "this tick advertises new coords." Seeded
+    // with the spawn coords so the very first keepalive doesn't
+    // false-trigger.
+    let mut last_keepalive_pos: Vec3 = self_pos.pos;
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
@@ -734,6 +1131,29 @@ async fn keepalive_loop(
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::Snapshot) => {
+                        // Snapshot is the "resync hammer" — emit a burst
+                        // covering every transitional event that an
+                        // attach-mode consumer might have missed before
+                        // subscribing. Periodic events (Diagnostics,
+                        // entity upserts) come through naturally; only
+                        // the one-shot transitions need this kick.
+                        //
+                        // Without this burst, a late-attaching MCP sees
+                        // `state.stage == Stage::Idle` forever, and
+                        // `scene://current` reports "Session not started."
+                        // even though packets are flowing — because
+                        // `state.stage` is only updated by `StageChanged`,
+                        // not by `Diagnostics`.
+                        let _ = event_tx.send(AgentEvent::Connected {
+                            account_id: 0,
+                            char_id: self_char_id,
+                            character: character_name.clone(),
+                            zone_id: current_zone_id,
+                        });
+                        let _ = event_tx.send(AgentEvent::StageChanged {
+                            stage: Stage::InZone,
+                        });
+                        let _ = event_tx.send(AgentEvent::PositionChanged { pos: self_pos });
                         let _ = event_tx.send(AgentEvent::Diagnostics {
                             diagnostics: Diagnostics {
                                 stage: Some(Stage::InZone),
@@ -798,6 +1218,31 @@ async fn keepalive_loop(
                         }
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
+                    Some(AgentCommand::ReturnToHomePoint) => {
+                        // The 0x01A action's `UniqueNo`/`ActIndex` are
+                        // ignored by Phoenix for this action_id, but we
+                        // still need a non-zero `ActIndex` for the
+                        // packet to look well-formed. Fall back to 0 if
+                        // we haven't seen our own CHAR_PC yet — the
+                        // server-side handler doesn't read it.
+                        let payload = build_subpacket_action(
+                            sub_seq,
+                            self_char_id,
+                            self_act_index.unwrap_or(0),
+                            &crate::state::ActionKind::HomepointMenu { status_id: 0 },
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "homepoint_return send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("homepoint_return send: {e}"),
+                            });
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
+                    }
                     Some(AgentCommand::Follow { .. })
                     | Some(AgentCommand::Engage { .. })
                     | Some(AgentCommand::PathTo { .. })
@@ -854,6 +1299,34 @@ async fn keepalive_loop(
                         }
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
+                    Some(AgentCommand::Heal { mode }) => {
+                        let payload = build_subpacket_camp(sub_seq, mode);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, mode = ?mode, "camp send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("heal send: {e}"),
+                            });
+                        } else {
+                            // Optimistic local mirror. The authoritative
+                            // source is the next CHAR_PC for self with
+                            // `animation` byte under the UPDATE_HP gate —
+                            // server validation may reject our request
+                            // (engaged / in-event / etc.) and CHAR_PC
+                            // will reconcile within a tick or two. For
+                            // Toggle, we flip; for On/Off, we set.
+                            is_healing = match mode {
+                                HealMode::On => true,
+                                HealMode::Off => false,
+                                HealMode::Toggle => !is_healing,
+                            };
+                            tracing::info!(?mode, is_healing, "camp send (0x0E8)");
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
+                    }
                     Some(AgentCommand::UseItem {
                         container,
                         slot,
@@ -901,6 +1374,14 @@ async fn keepalive_loop(
                             });
                             continue;
                         };
+                        tracing::info!(
+                            line_id,
+                            pos = format!(
+                                "({:.2},{:.2},{:.2})",
+                                self_pos.pos.x, self_pos.pos.y, self_pos.pos.z,
+                            ),
+                            "sending 0x05E MAPRECT",
+                        );
                         let payload = build_subpacket_maprect(
                             sub_seq,
                             line_id,
@@ -918,12 +1399,42 @@ async fn keepalive_loop(
                             let _ = event_tx.send(AgentEvent::Error {
                                 message: format!("MAPRECT send: {e}"),
                             });
+                        } else {
+                            pending_maprect = Some((std::time::Instant::now(), line_id));
                         }
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
                 }
             }
             _ = tick.tick() => {
+                // MAPRECT watchdog: if a zone change was requested >3s ago
+                // and we're still in the same zone, surface a chat-visible
+                // warning so the operator knows the server silently dropped
+                // the packet. See `vendor/server/src/map/packets/c2s/validation.cpp:46`
+                // — `BlockedState::InEvent` rejects MAPRECT without emitting
+                // `0x053 SYSTEMMES`, leaving the failure otherwise invisible.
+                if let Some((sent_at, line_id)) = pending_maprect {
+                    if sent_at.elapsed() > std::time::Duration::from_secs(3) {
+                        tracing::warn!(
+                            line_id,
+                            elapsed_ms = sent_at.elapsed().as_millis() as u64,
+                            "MAPRECT watchdog: server silently dropped zone change",
+                        );
+                        let _ = event_tx.send(AgentEvent::ChatLine {
+                            line: ChatLine {
+                                channel: ChatChannel::System,
+                                sender: "<client>".into(),
+                                text: format!(
+                                    "Zone change for line {line_id} silently dropped \
+                                     (no server response in 3s). Server-side state \
+                                     (likely InEvent flag) is blocking it — try relog."
+                                ),
+                                server_ts: 0,
+                            },
+                        });
+                        pending_maprect = None;
+                    }
+                }
                 // Build a bundle: any auto-event-ends drained, then a POS keepalive.
                 // `user_driven_events` suppresses the auto-drain so the dialog HUD
                 // gets a chance to display the event; the operator (or HUD-side
@@ -938,6 +1449,23 @@ async fn keepalive_loop(
                         let _ = event_tx.send(AgentEvent::EventEnded);
                     }
                 }
+                // Heal-cancel interceptor: if we're healing and this tick
+                // would advertise a new position, prepend 0x0E8 Mode::Off
+                // so the server clears `EFFECT_HEALING` *before* it sees
+                // the position change. Without this, server-side cancel
+                // would be racy/animation-dependent. Comparing on `.pos`
+                // (not heading) — turning in place while healing is
+                // visually allowed in retail; only translation cancels.
+                if is_healing && last_keepalive_pos != self_pos.pos {
+                    payload.extend(build_subpacket_camp(sub_seq, HealMode::Off));
+                    sub_seq = sub_seq.wrapping_add(1);
+                    is_healing = false;
+                    tracing::info!(
+                        from = format!("({:.1},{:.1},{:.1})", last_keepalive_pos.x, last_keepalive_pos.y, last_keepalive_pos.z),
+                        to = format!("({:.1},{:.1},{:.1})", self_pos.pos.x, self_pos.pos.y, self_pos.pos.z),
+                        "camp auto-cancel (movement detected during heal)"
+                    );
+                }
                 payload.extend(build_subpacket_pos(
                     sub_seq,
                     self_pos.pos.x,
@@ -946,6 +1474,7 @@ async fn keepalive_loop(
                     self_pos.heading,
                 ));
                 sub_seq = sub_seq.wrapping_add(1);
+                last_keepalive_pos = self_pos.pos;
                 if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
                     tracing::warn!(error = %e, "keepalive send failed");
                     let _ = event_tx.send(AgentEvent::Error { message: format!("keepalive send: {e}") });
@@ -989,9 +1518,41 @@ async fn keepalive_loop(
                                 &event_tx,
                                 &mut pending_event_end,
                                 self_char_id,
+                                &character_name,
                                 &mut self_act_index,
                                 &mut name_cache,
+                                &mut name_miss_dedup,
+                                &mut current_zone_id,
+                                &mut self_pos,
+                                &mut npc_name_resolver,
                             );
+                            // Heal-mirror sync from CHAR_PC for self. Same
+                            // UPDATE_HP gate (`body[6] & 0x04`) that
+                            // authorizes `hpp` also authorizes the
+                            // animation byte at body[27] — without the
+                            // gate, position-only ticks would clobber
+                            // our local mirror with stale zero. Done
+                            // here (not inside `handle_sub_packet`) so
+                            // the handler's signature doesn't have to
+                            // know about session-loop-local state.
+                            if sub.opcode == ffxi_proto::map::s2c::CHAR_PC {
+                                if let Ok(head) = decode::PosHead::decode(sub.data) {
+                                    let send_flag = sub.data.get(6).copied().unwrap_or(0);
+                                    if head.unique_no == self_char_id && (send_flag & 0x04) != 0 {
+                                        let server_healing =
+                                            head.server_status == decode::animation::HEALING;
+                                        if is_healing != server_healing {
+                                            tracing::info!(
+                                                was = is_healing,
+                                                now = server_healing,
+                                                animation = head.server_status,
+                                                "heal state synced from CHAR_PC"
+                                            );
+                                            is_healing = server_healing;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1010,9 +1571,9 @@ async fn keepalive_loop(
         }
     }
 
-    // Drop `map` here so the UDP socket closes before the outer loop
-    // potentially binds a new socket to the same kernel port.
-    drop(map);
+    // We do NOT drop `map` here — the outer `run` reuses the same
+    // socket across zone-change reconnects via `MapClient::retarget`.
+    // See `MapClient::retarget` for the LSB single-process rationale.
 
     if let Some(addr) = reconnect_addr {
         Ok(MapOutcome::Reconnect { new_addr: addr })
@@ -1179,15 +1740,41 @@ fn decode_battle_message(
     let raw = ffxi_proto::msg_basic::lookup(message_num)?;
     let cas_name = name_for_id(cas_id, name_cache);
     let tar_name = name_for_id(tar_id, name_cache);
-    let text = substitute_battle_placeholders(raw, &cas_name, &tar_name, data1, data2);
+    let text = substitute_battle_placeholders(raw, &cas_name, &tar_name, data1, data2, message_num);
     Some(ChatLine {
         channel: ChatChannel::Battle,
         // Use the actor's name as the sender so the chat row reads
         // "Cas: hits Tar for X damage." — same shape as social channels.
-        sender: cas_name,
+        // For messages where the grammatical subject is the wire `tar`
+        // (e.g. PlayerDefeatedBy), prefer that name so the chat row
+        // header still names the right entity.
+        sender: if subject_is_tar(message_num) {
+            tar_name
+        } else {
+            cas_name
+        },
         text,
         server_ts: 0,
     })
+}
+
+/// True when the wire-protocol's `Tar` slot holds the *grammatical subject*
+/// of the message (the entity the message is "about") rather than the
+/// `Cas` slot. Phoenix's `GP_SERV_COMMAND_BATTLE_MESSAGE` constructor
+/// always packs `(PSender, PTarget) = (Cas, Tar)`, but for some message
+/// ids the comment template's lead placeholder (`<player>`) refers to
+/// `PTarget`, not `PSender` — e.g. `PlayerDefeatedBy = 97`,
+/// `<player> was defeated by the <target>.`, where `PSender` is the
+/// killer and `PTarget` is the victim.
+///
+/// New entries here should be backed by a Phoenix call site (grep for
+/// `MsgBasic::<name>` in `vendor/Phoenix/src/`) — the call's argument
+/// order tells you which slot is which.
+fn subject_is_tar(message_num: u16) -> bool {
+    matches!(
+        message_num,
+        97 // PlayerDefeatedBy: <player>=victim (Tar), <target>=killer (Cas)
+    )
 }
 
 /// Resolve a `UniqueNo` to a display name via the session-local cache;
@@ -1209,20 +1796,30 @@ fn name_for_id(id: u32, name_cache: &std::collections::HashMap<u32, String>) -> 
 /// `<item>`, `<job>`, …) require lookup tables we don't ship yet and are
 /// left as-is so the operator at least sees the literal token rather
 /// than a hidden gap.
+///
+/// `<player>` is special: in most templates it's the actor (slot Cas),
+/// but for messages like `PlayerDefeatedBy` (97) it's the recipient
+/// (slot Tar). `subject_is_tar(message_num)` flips the binding for
+/// those exceptions.
 fn substitute_battle_placeholders(
     raw: &str,
     cas_name: &str,
     tar_name: &str,
     data1: u32,
     data2: u32,
+    message_num: u16,
 ) -> String {
     let mut s = raw.to_string();
-    for tag in ["<user>", "<attacker>", "<caster>", "<player>"] {
+    for tag in ["<user>", "<attacker>", "<caster>"] {
         s = s.replace(tag, cas_name);
     }
-    for tag in ["<target>"] {
-        s = s.replace(tag, tar_name);
-    }
+    let (player_name, target_name) = if subject_is_tar(message_num) {
+        (tar_name, cas_name)
+    } else {
+        (cas_name, tar_name)
+    };
+    s = s.replace("<player>", player_name);
+    s = s.replace("<target>", target_name);
     let amount = data1.to_string();
     for tag in ["<amount>", "<number>"] {
         s = s.replace(tag, &amount);
@@ -1665,6 +2262,22 @@ pub fn build_subpacket_reqlogout(sync: u16, mode: u16, kind: u16) -> Vec<u8> {
     buf
 }
 
+/// `GP_CLI_COMMAND_CAMP` (0x0E8) — `/heal`. 4-byte sub-packet header +
+/// 4-byte Mode (u32) = 8 bytes total (size_words=2). Layout:
+/// `vendor/server/src/map/packets/c2s/0x0e8_camp.h`.
+///
+/// `mode` is a `u32` per the wire spec even though only three values
+/// are valid (Toggle/On/Off); `HealMode::as_u32` provides them. Server
+/// validation rejects the packet when engaged, in event, crafting,
+/// abnormal status, or prevent-action — failures are silent on the wire
+/// (no error message returned to the client).
+pub fn build_subpacket_camp(sync: u16, mode: HealMode) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(0x0E8, 2, sync));
+    buf[4..8].copy_from_slice(&mode.as_u32().to_le_bytes());
+    buf
+}
+
 pub fn build_subpacket_item_use(
     sync: u16,
     unique_no: u32,
@@ -1992,6 +2605,46 @@ mod tests {
         let line = decode_battle_message(&data, &HashMap::new(), true).expect("decoded");
         assert_eq!(line.sender, "#DEADBEEF");
         assert!(line.text.contains("<no one>") || line.text.contains("#DEADBEEF"));
+    }
+
+    #[test]
+    fn battle_message_97_routes_player_to_tar_and_target_to_cas() {
+        // PlayerDefeatedBy = 97, template "<player> was defeated by the
+        // <target>." Phoenix calls the constructor with `(PSender=killer,
+        // PTarget=victim)` (charentity.cpp:2651), so on the wire:
+        //   cas = killer (the orc)
+        //   tar = victim (the player)
+        // The template's `<player>` is the *victim* and `<target>` is the
+        // *killer*, so the placeholder→slot binding is inverted vs. the
+        // canonical "<user> hits <target>" pattern. Regression: prior to
+        // the fix, `<player>` always pulled from `cas`, producing
+        // "Orc was defeated by the player" — the swapped subject we saw
+        // in production.
+        use std::collections::HashMap;
+
+        let killer_id = 0xAAAA_AAAAu32;
+        let victim_id = 0xBBBB_BBBBu32;
+
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&killer_id.to_le_bytes()); // cas = killer
+        data[4..8].copy_from_slice(&victim_id.to_le_bytes()); // tar = victim
+        data[20..22].copy_from_slice(&97u16.to_le_bytes());
+
+        let mut cache = HashMap::new();
+        cache.insert(killer_id, "Orcish_Fodder".to_string());
+        cache.insert(victim_id, "Vanari".to_string());
+
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        // Subject (sender) of the chat row should be the victim.
+        assert_eq!(line.sender, "Vanari");
+        // Body should read "Vanari was defeated by the Orcish_Fodder."
+        let v_pos = line.text.find("Vanari").expect("victim in text");
+        let o_pos = line.text.find("Orcish_Fodder").expect("killer in text");
+        assert!(
+            v_pos < o_pos,
+            "victim must precede killer in the rendered template, got: {}",
+            line.text
+        );
     }
 
     #[test]

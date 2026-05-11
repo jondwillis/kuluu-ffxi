@@ -26,7 +26,6 @@ use recastnavigation_rs::detour::{
     DtNavMesh, DtNavMeshQuery, DtPolyRef, DtQueryFilter, DtStraightPathOptions,
 };
 use thiserror::Error;
-use tracing::warn;
 
 pub use fetch::{cache_dir, fetch, FetchError};
 
@@ -87,6 +86,28 @@ impl RecastNavMesh {
         })?;
         let query = DtNavMeshQuery::with_mesh(&mesh, MAX_NAV_POLYS)
             .map_err(|e| LoadError::Query(format!("{e:?}")))?;
+        // Log Detour-space bbox + tile count so coverage gaps are
+        // visible in the operator log without running /navinfo. The
+        // bbox is in **Detour y-up frame** (`y` = height). To compare
+        // against an FFXI codebase position `(x, y_north, z_height)`,
+        // remember `detour.y` ↔ codebase.z and `detour.z` ↔ codebase.y.
+        let mut tile_count = 0usize;
+        let mut bmin = [f32::INFINITY; 3];
+        let mut bmax = [f32::NEG_INFINITY; 3];
+        for tile_idx in 0..mesh.max_tiles() {
+            let Some(tile) = mesh.get_tile(tile_idx) else { continue };
+            let Some(header) = tile.header() else { continue };
+            tile_count += 1;
+            for axis in 0..3 {
+                bmin[axis] = bmin[axis].min(header.bmin[axis]);
+                bmax[axis] = bmax[axis].max(header.bmax[axis]);
+            }
+        }
+        tracing::info!(
+            path = %path_str, tile_count,
+            detour_bmin = ?bmin, detour_bmax = ?bmax,
+            "RecastNavMesh loaded"
+        );
         Ok(Self {
             _mesh: mesh,
             query,
@@ -222,18 +243,72 @@ impl NavMesh for RecastNavMesh {
         let start = ffxi_to_detour(from);
         let end = ffxi_to_detour(to);
 
-        let (start_ref, start_pt) = self
+        // Vertical tolerance for endpoint lookup is 100 yalms (same as
+        // `nearest_height_at`). The default 4-yalm `POLY_PICK_EXT.y` is
+        // too tight for **operator-supplied destinations** like zoneline
+        // origins from `zonelines.sql` — those positions are entry
+        // markers, not navmesh-aligned, and can sit several yalms off
+        // the walkable floor. Without this, `/zoneto` on a real zone
+        // line returns None and we fall back to a straight-line
+        // teleport to an unreachable point. Ground tolerance stays at
+        // `POLY_PICK_EXT.{x,z}` so we don't accidentally snap to a
+        // different platform.
+        let endpoint_ext = [POLY_PICK_EXT[0], 100.0, POLY_PICK_EXT[2]];
+
+        let (start_ref, start_pt) = match self
             .query
-            .find_nearest_poly_1(&start, &POLY_PICK_EXT, &filter)
-            .ok()?;
-        let (end_ref, end_pt) = self
+            .find_nearest_poly_1(&start, &endpoint_ext, &filter)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(
+                    from_ffxi = ?from, start_detour = ?start, err = ?e,
+                    "RecastNavMesh::path — find_nearest_poly failed for START"
+                );
+                return None;
+            }
+        };
+        let (end_ref, end_pt) = match self
             .query
-            .find_nearest_poly_1(&end, &POLY_PICK_EXT, &filter)
-            .ok()?;
+            .find_nearest_poly_1(&end, &endpoint_ext, &filter)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(
+                    to_ffxi = ?to, end_detour = ?end, err = ?e,
+                    "RecastNavMesh::path — find_nearest_poly failed for END"
+                );
+                return None;
+            }
+        };
         if start_ref.is_null() || end_ref.is_null() {
-            warn!("findNearestPoly returned null for start or end");
+            tracing::info!(
+                from_ffxi = ?from, to_ffxi = ?to,
+                start_detour = ?start, start_snapped = ?start_pt,
+                end_detour = ?end, end_snapped = ?end_pt,
+                start_ref_null = start_ref.is_null(),
+                end_ref_null = end_ref.is_null(),
+                "RecastNavMesh::path — null poly ref (start or end off-mesh even with 100-yalm vertical tolerance)"
+            );
             return None;
         }
+        // Log the snap deltas so the operator can see whether endpoints
+        // landed near (good) or far (coord-system mismatch) from the
+        // requested points. Distances are in Detour-space (y is height),
+        // which is the same scale as FFXI yalms.
+        let d_start = ((start[0] - start_pt[0]).powi(2)
+            + (start[1] - start_pt[1]).powi(2)
+            + (start[2] - start_pt[2]).powi(2))
+        .sqrt();
+        let d_end = ((end[0] - end_pt[0]).powi(2)
+            + (end[1] - end_pt[1]).powi(2)
+            + (end[2] - end_pt[2]).powi(2))
+        .sqrt();
+        tracing::debug!(
+            from_ffxi = ?from, to_ffxi = ?to,
+            start_snap_dist_yalms = d_start, end_snap_dist_yalms = d_end,
+            "RecastNavMesh::path — endpoints snapped"
+        );
 
         let mut polys = vec![DtPolyRef::default(); MAX_NAV_POLYS];
         let n_polys = self
@@ -241,6 +316,10 @@ impl NavMesh for RecastNavMesh {
             .find_path(start_ref, end_ref, &start_pt, &end_pt, &filter, &mut polys)
             .ok()?;
         if n_polys == 0 {
+            tracing::info!(
+                from_ffxi = ?from, to_ffxi = ?to,
+                "RecastNavMesh::path — find_path returned 0 polys (endpoints in disconnected components — no walkable route)"
+            );
             return None;
         }
 
@@ -258,8 +337,16 @@ impl NavMesh for RecastNavMesh {
             )
             .ok()?;
         if n_straight == 0 {
+            tracing::info!(
+                from_ffxi = ?from, to_ffxi = ?to, n_polys,
+                "RecastNavMesh::path — find_straight_path returned 0 (polys connected but string-pull failed)"
+            );
             return None;
         }
+        tracing::debug!(
+            from_ffxi = ?from, to_ffxi = ?to, n_polys, n_straight,
+            "RecastNavMesh::path — path computed"
+        );
 
         Some(
             straight[..n_straight]
@@ -289,14 +376,31 @@ impl NavMesh for RecastNavMesh {
 /// queries work.
 #[inline]
 pub fn ffxi_to_detour(v: Vec3) -> [f32; 3] {
-    [v.x, v.z, v.y]
+    // Match LSB's `CNavMesh::ToDetourPos` exactly:
+    //   out[0] = pos->x;
+    //   out[1] = pos->y * -1;   // NEGATE FFXI-native height
+    //   out[2] = pos->z * -1;   // NEGATE FFXI-native north
+    //
+    // In our codebase z-up convention, FFXI-native `pos->y` (height)
+    // is stored in `v.z`, and FFXI-native `pos->z` (north) is in
+    // `v.y`. So our equivalent is `[v.x, -v.z, -v.y]`.
+    //
+    // History: an earlier `(x, -y, -z)` attempt (same physical
+    // axes negated, different operand naming) was reverted because
+    // it "produced bogus heights." That predated the build.rs y/z
+    // swap that put FFXI-native coords into our z-up frame in the
+    // first place — so the prior test was operating on misaligned
+    // inputs. With the swap in place, LSB's exact involution is the
+    // canonical mapping and xiNavmeshes' .nav data is in this frame.
+    [v.x, -v.z, -v.y]
 }
 
-/// Inverse of [`ffxi_to_detour`]. Y/z swap (Detour `d.y` height →
-/// FFXI `z`, Detour `d.z` ground → FFXI `y`). Not an involution.
+/// Inverse of [`ffxi_to_detour`]. The same `(x, -y, -z)` involution
+/// applied twice is the identity, so this is symmetric:
+/// `detour_to_ffxi(ffxi_to_detour(v)) == v`.
 #[inline]
 pub fn detour_to_ffxi(d: [f32; 3]) -> Vec3 {
-    Vec3::new(d[0], d[2], d[1])
+    Vec3::new(d[0], -d[2], -d[1])
 }
 
 #[cfg(test)]
@@ -318,14 +422,25 @@ mod tests {
         assert_eq!(round_trip, v);
     }
 
-    /// The height axis (FFXI `z`) lands at Detour `d[1]` after the
+    /// The height axis (codebase `z`) lands at Detour `d[1]` after the
     /// forward transform — that's what makes `move_along_surface`
     /// queries actually find polys, since xiNavmeshes stores them in
-    /// y-up Detour-standard convention.
+    /// LSB's `(x, -height, -north)` Detour convention (see server-side
+    /// `CNavMesh::ToDetourPos` in `vendor/server/src/map/navmesh.cpp`).
+    /// LSB negates height; we mirror that.
     #[test]
     fn height_axis_lands_at_detour_y() {
         let v = Vec3::new(0.0, 0.0, 42.0); // pure-height vector
         let d = ffxi_to_detour(v);
-        assert_eq!(d, [0.0, 42.0, 0.0]);
+        assert_eq!(d, [0.0, -42.0, 0.0]);
+    }
+
+    /// LSB's involution also negates the north axis. Pin that so a
+    /// future revert to a one-sided flip wouldn't silently pass.
+    #[test]
+    fn north_axis_negated_into_detour_z() {
+        let v = Vec3::new(0.0, 33.0, 0.0); // pure-north vector (codebase y = north)
+        let d = ffxi_to_detour(v);
+        assert_eq!(d, [0.0, 0.0, -33.0]);
     }
 }
