@@ -27,3 +27,9 @@ log/
 
 # jacq build output — regenerate via `jacq build` in ffxi-agent/.
 ffxi-agent/dist/
+
+# FFXI client DATs — SE-copyrighted, NEVER commit. Local copy of the user's
+# HorizonXI install lives here (see ffxi-dat/README or the async-watching-waffle
+# plan for layout). Point FFXI_DAT_PATH at vendor/Game/FINAL FANTASY XI/ to use.
+vendor/Game/
+.functional-emotions
