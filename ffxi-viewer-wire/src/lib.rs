@@ -102,6 +102,28 @@ pub enum EntityKind {
     Other,
 }
 
+/// Wire-side mirror of `ffxi_proto::decode::LookData`. Drives the MMB
+/// resolver in the viewer. Variants match LSB's `MODELTYPE` enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EntityLook {
+    Standard { modelid: u16 },
+    Equipped {
+        face: u8,
+        race: u8,
+        head: u16,
+        body: u16,
+        hands: u16,
+        legs: u16,
+        feet: u16,
+        main: u16,
+        sub: u16,
+        ranged: u16,
+    },
+    Door { size: u16 },
+    Transport { size: u16 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entity {
     pub id: u32,
@@ -126,6 +148,11 @@ pub struct Entity {
     /// unaffected by movement-status effects.
     #[serde(default)]
     pub speed_base: u8,
+    /// Decoded model-selector from CHAR_NPC / CHAR_PC. `None` until a
+    /// look-bearing packet for this entity arrives, or when the
+    /// packet's MODELTYPE sentinel is unrecognized.
+    #[serde(default)]
+    pub look: Option<EntityLook>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]

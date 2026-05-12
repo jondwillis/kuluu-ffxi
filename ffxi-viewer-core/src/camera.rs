@@ -103,7 +103,8 @@ pub fn spawn_camera(mut commands: Commands) {
 ///
 /// Geometry: camera_offset = (sin(yaw)·cos(pitch), sin(pitch), cos(yaw)·cos(pitch)) · distance.
 /// At yaw=0, pitch=0, the camera sits at player + (0, 0, distance) — straight
-/// behind a player that faces -Z (= FFXI heading 0 / north).
+/// behind a player that faces -Z. Under LSB heading convention this is
+/// `heading = heading_for_yaw(0) = 192` (FFXI +y), *not* heading 0.
 ///
 /// Early-returns when [`CameraMode`] is `FirstPerson` — that mode is owned
 /// by [`firstperson_camera_system`].
@@ -148,8 +149,8 @@ pub fn chase_camera_system(
 /// camera (behind), while FP looks *forward* from the player.
 ///
 /// Geometry: look_dir = (-sin(yaw)·cos(pitch), sin(pitch), -cos(yaw)·cos(pitch)).
-/// Symmetry check: at chase.yaw = `yaw_for_heading(0) = 0`, `look_dir =
-/// (0, 0, -1)` — exactly Bevy-forward for a player heading FFXI-north.
+/// Symmetry check: at yaw=0, pitch=0, `look_dir = (0, 0, -1)` — Bevy -z,
+/// which under LSB heading is heading 192 (FFXI +y).
 ///
 /// Early-returns when [`CameraMode`] is `Chase` — that mode is owned by
 /// [`chase_camera_system`].
@@ -202,14 +203,17 @@ pub fn toggle_camera_mode(mode: &mut CameraMode, chase: &mut ChaseCamera) {
 
 /// FFXI heading u8 → camera yaw radians (camera-behind-player).
 ///
-/// The relationship is `yaw = -heading_angle (mod τ)`. Derivation: a player
-/// facing FFXI heading `h` has Bevy forward = (sin(α), 0, -cos(α)) where
-/// α = h·τ/256. Camera should sit on the opposite side; the player→camera
-/// direction is therefore (-sin(α), 0, cos(α)). With our parameterization
-/// `(sin(yaw), 0, cos(yaw))`, that means `yaw = -α`.
+/// LSB convention (matches `reactor::heading_toward` and
+/// `view_native::input::heading_to_forward`): a player at heading `h` faces
+/// Bevy forward = (cos(α), 0, sin(α)) where α = h·τ/256, so h=0 → +Bevy.x
+/// (FFXI +x / "east"), h=64 → +Bevy.z (FFXI -y), h=128 → -Bevy.x, h=192
+/// → -Bevy.z. Camera sits opposite, so player→camera = (-cos(α), 0, -sin(α));
+/// with our parameterization `(sin(yaw), 0, cos(yaw))`, that gives
+/// `yaw = -α - π/2`.
 #[inline]
 pub fn yaw_for_heading(heading: u8) -> f32 {
-    -(heading as f32) * std::f32::consts::TAU / 256.0
+    let tau = std::f32::consts::TAU;
+    -(heading as f32) * tau / 256.0 - std::f32::consts::FRAC_PI_2
 }
 
 /// Camera yaw radians → FFXI heading u8 (player facing away from camera).
@@ -219,7 +223,7 @@ pub fn yaw_for_heading(heading: u8) -> f32 {
 #[inline]
 pub fn heading_for_yaw(yaw: f32) -> u8 {
     let tau = std::f32::consts::TAU;
-    let normalized = (-yaw).rem_euclid(tau);
+    let normalized = (-yaw - std::f32::consts::FRAC_PI_2).rem_euclid(tau);
     (normalized * 256.0 / tau).round() as u32 as u8
 }
 
@@ -277,7 +281,9 @@ mod tests {
         let pitch = 0.0_f32;
         let cos_p = pitch.cos();
         let look = Vec3::new(-yaw.sin() * cos_p, pitch.sin(), -yaw.cos() * cos_p);
-        // Forward for heading=0 (FFXI north) is Bevy -Z.
+        // At yaw=0 the FP look formula evaluates to Bevy -Z by construction.
+        // (Under LSB heading convention this corresponds to heading 192,
+        // not heading 0 — see `yaw_for_heading`.)
         let expected = Vec3::new(0.0, 0.0, -1.0);
         assert!(
             (look - expected).length() < 1e-6,

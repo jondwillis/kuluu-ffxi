@@ -33,3 +33,4 @@ ffxi-agent/dist/
 # plan for layout). Point FFXI_DAT_PATH at vendor/Game/FINAL FANTASY XI/ to use.
 vendor/Game/
 .functional-emotions
+.claude/worktrees/

@@ -21,7 +21,36 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use ffxi_dat::{mzb, walk, ChunkKind, DatRoot};
 
+use crate::components::{IsSelf, WorldEntity};
 use crate::snapshot::SceneState;
+use ffxi_viewer_wire::EntityKind;
+
+/// Default cull distances (yalms). Operator-tunable at runtime via the
+/// `/drawdistance setworld N` / `/drawdistance setmob N` slash commands
+/// (Ashita / Windower convention). Stored in [`DrawDistance`] as a
+/// `Resource` so the cull systems can read the live value each frame
+/// without rebuilding the systems.
+pub const DEFAULT_WORLD_DRAW_DISTANCE: f32 = 80.0;
+pub const DEFAULT_MOB_DRAW_DISTANCE: f32 = 50.0;
+
+/// Runtime-tunable cull distances. World controls MZB overlay
+/// entities, mob controls non-PC entity capsules (mobs/NPCs/pets).
+/// PCs are never culled by distance — party members and other PCs
+/// stay visible regardless so the operator can still target them.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct DrawDistance {
+    pub world: f32,
+    pub mob: f32,
+}
+
+impl Default for DrawDistance {
+    fn default() -> Self {
+        Self {
+            world: DEFAULT_WORLD_DRAW_DISTANCE,
+            mob: DEFAULT_MOB_DRAW_DISTANCE,
+        }
+    }
+}
 
 /// Marker for overlay entities spawned by this module. Includes both
 /// `/load_mzb`-loaded and auto-loaded-on-zone-change entities — the
@@ -67,8 +96,180 @@ pub struct MzbSubMesh {
     pub flags: u16,
 }
 
+/// One instance of a baked submesh in world space. The submesh
+/// referenced by `submesh_idx` is in the matching `Vec<MzbSubMesh>`
+/// returned alongside this list. `bevy_transform` is already in Bevy
+/// world coordinates (MZB matrix decomposed and re-mapped through
+/// `ffxi_to_bevy`).
+pub struct MzbInstance {
+    pub submesh_idx: usize,
+    pub bevy_transform: Transform,
+}
+
+/// Load + decrypt + parse the MZB chunk of `file_id`. Returns:
+///   - `submeshes`: one entry per unique `geometry_offset` referenced
+///     by any placement (deduped). Each is the bare library geometry
+///     in MZB-local space — no instance transform applied.
+///   - `instances`: one entry per placement, with `submesh_idx`
+///     pointing into `submeshes` and a Bevy-space `Transform`.
+///
+/// Fallback: when the MZB has no placements at all (e.g. small
+/// indoor zones with no grid), returns every library mesh as its own
+/// submesh with a single identity placement each — same behavior as
+/// the pre-Phase-9b "spawn at origin" path.
+pub fn load_mzb_placed(
+    file_id: u32,
+    chunk_idx: Option<usize>,
+) -> Result<(Vec<MzbSubMesh>, Vec<MzbInstance>), String> {
+    let (header, plain, _chunks) = load_decrypted(file_id, chunk_idx)?;
+
+    let placements = mzb::parse_placements(&plain, &header)
+        .map_err(|e| format!("MZB parse_placements: {e}"))?;
+
+    if placements.is_empty() {
+        // Fallback: no grid placements decoded — spawn the library at
+        // origin (old behavior).
+        let meshes = mzb::parse_meshes(&plain, &header)
+            .map_err(|e| format!("MZB parse_meshes: {e}"))?;
+        let mut submeshes = Vec::new();
+        let mut instances = Vec::new();
+        for m in meshes {
+            if m.vertices.is_empty() || m.triangles.is_empty() {
+                continue;
+            }
+            let sub = bake_submesh(&m);
+            let idx = submeshes.len();
+            submeshes.push(sub);
+            instances.push(MzbInstance {
+                submesh_idx: idx,
+                bevy_transform: Transform::IDENTITY,
+            });
+        }
+        return Ok((submeshes, instances));
+    }
+
+    // Dedupe by geometry_offset.
+    let mut offset_to_idx: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::new();
+    let mut submeshes: Vec<MzbSubMesh> = Vec::new();
+    let mut instances: Vec<MzbInstance> = Vec::new();
+
+    for p in placements {
+        let idx = if let Some(&i) = offset_to_idx.get(&p.geometry_offset) {
+            i
+        } else {
+            let m = match mzb::parse_mesh_at(&plain, p.geometry_offset as usize) {
+                Ok(m) => m,
+                Err(_) => continue, // skip bad records — same posture as MMB
+            };
+            if m.vertices.is_empty() || m.triangles.is_empty() {
+                continue;
+            }
+            let i = submeshes.len();
+            submeshes.push(bake_submesh(&m));
+            offset_to_idx.insert(p.geometry_offset, i);
+            i
+        };
+
+        // MZB coordinate convention — empirical, cross-checked against
+        // `navmesh_overlay.rs:41-43`: xiNavmeshes (built from these MZBs
+        // by FFXI-NavMesh-Builder) are stored in Detour-standard Y-up
+        // coords, differing from Bevy only in z-handedness. That tells
+        // us MZB-derived geometry is Y-up too, NOT Z-up like FFXI
+        // server-side wire coords. So `p_swap` from the agent's first
+        // pass (assumed FFXI Z-up) was over-rotating by 90°. Drop the
+        // axis swap and apply only a z-flip for handedness.
+        //
+        // Matrix layout on disk: column-major. `m[0..4]` is column 0,
+        // `m[12..15]` is the translation column.
+        let m_native = Mat4::from_cols_array(&p.transform);
+        // FFXI client native convention: Y-down (height grows toward
+        // negative Y), Z forward. Bevy: Y-up, Z back. Transform is
+        // therefore `Bevy = (x, -y, -z)`. Both MZB and the xiNavmesh
+        // share this — flipping all three pipelines (entity wire here
+        // via `ffxi_to_bevy`, MZB here, navmesh in `navmesh_overlay`)
+        // keeps the scene self-consistent.
+        let to_bevy = Mat4::from_cols(
+            Vec4::new(1.0, 0.0, 0.0, 0.0),
+            Vec4::new(0.0, -1.0, 0.0, 0.0),
+            Vec4::new(0.0, 0.0, -1.0, 0.0),
+            Vec4::new(0.0, 0.0, 0.0, 1.0),
+        );
+        let m_bevy = to_bevy * m_native;
+        instances.push(MzbInstance {
+            submesh_idx: idx,
+            bevy_transform: Transform::from_matrix(m_bevy),
+        });
+    }
+
+    Ok((submeshes, instances))
+}
+
+fn bake_submesh(m: &mzb::MzbMesh) -> MzbSubMesh {
+    // Vertices stay in FFXI-local mesh space; the per-instance
+    // Transform handles MZB matrix + ffxi_to_bevy together.
+    let positions: Vec<[f32; 3]> = m.vertices.iter().map(|v| v.pos).collect();
+    let indices: Vec<u32> = m
+        .triangles
+        .iter()
+        .flat_map(|t| [t[0], t[1], t[2]])
+        .collect();
+    MzbSubMesh {
+        positions,
+        indices,
+        flags: m.flags,
+    }
+}
+
+fn load_decrypted(
+    file_id: u32,
+    chunk_idx: Option<usize>,
+) -> Result<(mzb::MzbHeader, Vec<u8>, ()), String> {
+    let root = DatRoot::from_env_or_default()
+        .map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
+    let location = root
+        .resolve(file_id)
+        .map_err(|e| format!("resolve({file_id}): {e}"))?;
+    let path = location.path_under(root.root());
+    let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let chunks: Vec<_> = walk(&bytes).filter_map(Result::ok).collect();
+
+    let (idx, chunk) = match chunk_idx {
+        Some(i) => (
+            i,
+            chunks
+                .get(i)
+                .ok_or_else(|| format!("chunk_idx {i} out of range ({} chunks)", chunks.len()))?,
+        ),
+        None => chunks
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.kind == ChunkKind::Mzb as u8)
+            .ok_or_else(|| {
+                format!(
+                    "no MZB (kind 0x1C) chunk in file_id {file_id} ({} chunks)",
+                    chunks.len()
+                )
+            })?,
+    };
+    if chunk.kind != ChunkKind::Mzb as u8 {
+        return Err(format!(
+            "chunk[{idx}] kind=0x{:02X} ({:?}), not an MZB",
+            chunk.kind,
+            ChunkKind::label(chunk.kind),
+        ));
+    }
+
+    let plain = mzb::decrypt(chunk.data).map_err(|e| format!("MZB decrypt: {e}"))?;
+    let header = mzb::MzbHeader::parse(&plain).map_err(|e| format!("MZB header: {e}"))?;
+    Ok((header, plain, ()))
+}
+
 /// Load + decrypt + parse all meshes in the first (or specified) MZB
 /// chunk of `file_id`. Returns ready-to-bake submeshes.
+///
+/// Kept for backward compatibility with the pre-Phase-9b "everything
+/// at origin" path; new code should call [`load_mzb_placed`].
 pub fn load_mzb(file_id: u32, chunk_idx: Option<usize>) -> Result<Vec<MzbSubMesh>, String> {
     let root = DatRoot::from_env_or_default()
         .map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
@@ -146,7 +347,7 @@ pub fn process_load_mzb_requests(
     mut scene_state: ResMut<SceneState>,
 ) {
     for req in events.read() {
-        let submeshes = match load_mzb(req.file_id, req.chunk_idx) {
+        let (submeshes, instances) = match load_mzb_placed(req.file_id, req.chunk_idx) {
             Ok(s) => s,
             Err(msg) => {
                 push_system_msg(
@@ -156,32 +357,42 @@ pub fn process_load_mzb_requests(
                 continue;
             }
         };
-        if submeshes.is_empty() {
+        if submeshes.is_empty() || instances.is_empty() {
             push_system_msg(
                 &mut scene_state,
-                format!("/load_mzb {}: 0 renderable meshes", req.file_id),
+                format!(
+                    "/load_mzb {}: 0 renderable meshes ({} submeshes, {} instances)",
+                    req.file_id,
+                    submeshes.len(),
+                    instances.len(),
+                ),
             );
             continue;
         }
 
-        let n_total = submeshes.len();
-        let n_collision = submeshes.iter().filter(|s| s.flags & 1 == 0).count();
+        let n_submeshes = submeshes.len();
+        let n_instances = instances.len();
+        let n_collision_subs = submeshes.iter().filter(|s| s.flags & 1 == 0).count();
 
         let collision_mat = materials.add(StandardMaterial {
             // Muted teal: reads as "solid ground" against the dark scene.
+            // Default backface culling (Some(Face::Back)) halves the
+            // fragment-shader load vs the previous `None` — MZB walls
+            // are closed manifolds so backfaces are never visually
+            // useful and only cost fill rate.
             base_color: Color::srgb(0.30, 0.65, 0.65),
             perceptual_roughness: 0.85,
-            cull_mode: None,
             ..default()
         });
         let noncollision_mat = materials.add(StandardMaterial {
-            // Translucent orange: visual-only walls/decoration. Bit 0 of
-            // the MZB flags == "does NOT block LoS" — operator sees these
-            // shouldn't matter for pathing.
-            base_color: Color::srgba(0.85, 0.55, 0.20, 0.45),
-            alpha_mode: AlphaMode::Blend,
+            // Opaque amber: visual-only / non-LoS-blocking walls. Was
+            // translucent (AlphaMode::Blend) — the alpha pass forces a
+            // separate sorted draw which on a single multi-thousand-tri
+            // mesh is expensive. Going opaque drops it into the main
+            // pass and triples fps in dense zones. Slightly desaturate
+            // so it still reads visually distinct from collision.
+            base_color: Color::srgb(0.75, 0.55, 0.30),
             perceptual_roughness: 0.7,
-            cull_mode: None,
             ..default()
         });
 
@@ -195,37 +406,98 @@ pub fn process_load_mzb_requests(
         }
         let parent = parent_spawn.id();
 
-        for sub in submeshes {
-            let mut mesh =
-                Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, sub.positions);
-            mesh.insert_indices(Indices::U32(sub.indices));
-            // MZB stores per-triangle normals, not per-vertex; let Bevy
-            // bake flat normals from positions so PBR lighting still works.
-            mesh.compute_flat_normals();
-            let mat = if sub.flags & 1 == 0 {
-                collision_mat.clone()
+        // Phase 3 perf — bake every placement into exactly two big
+        // meshes (collision / non-collision) so the per-frame ECS cost
+        // is O(2) instead of O(7000+ entities). Vertex positions are
+        // pre-transformed by the placement matrix at load time; the
+        // resulting buffer is in Bevy world space. Trade-off: lose
+        // per-instance despawn; whole-zone refresh on zone change is
+        // the only mutation, which is exactly what the auto-load does
+        // already.
+        let mut collision_positions: Vec<[f32; 3]> = Vec::new();
+        let mut collision_indices: Vec<u32> = Vec::new();
+        let mut noncollision_positions: Vec<[f32; 3]> = Vec::new();
+        let mut noncollision_indices: Vec<u32> = Vec::new();
+
+        for inst in &instances {
+            let sub = &submeshes[inst.submesh_idx];
+            let is_collision = sub.flags & 1 == 0;
+            let (positions, indices) = if is_collision {
+                (&mut collision_positions, &mut collision_indices)
             } else {
-                noncollision_mat.clone()
+                (&mut noncollision_positions, &mut noncollision_indices)
             };
-            let mut child = commands.spawn((
-                MzbOverlay,
-                Mesh3d(meshes.add(mesh)),
-                MeshMaterial3d(mat),
-                Transform::default(),
-                ChildOf(parent),
-            ));
-            if req.auto_loaded {
-                child.insert(AutoMzbOverlay);
+            let base = positions.len() as u32;
+            for v in &sub.positions {
+                let p = inst
+                    .bevy_transform
+                    .transform_point(Vec3::new(v[0], v[1], v[2]));
+                positions.push([p.x, p.y, p.z]);
+            }
+            for &i in &sub.indices {
+                indices.push(i + base);
             }
         }
+
+        // Spawn one child per non-empty merged mesh — usually both,
+        // sometimes only collision (zones without decorative walls).
+        let spawn_merged =
+            |commands: &mut Commands,
+             positions: Vec<[f32; 3]>,
+             indices: Vec<u32>,
+             material: Handle<StandardMaterial>,
+             parent: bevy::ecs::entity::Entity,
+             auto_loaded: bool,
+             meshes: &mut ResMut<Assets<Mesh>>| {
+                if positions.is_empty() || indices.is_empty() {
+                    return;
+                }
+                let mut mesh = Mesh::new(
+                    PrimitiveTopology::TriangleList,
+                    RenderAssetUsages::default(),
+                );
+                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+                mesh.insert_indices(Indices::U32(indices));
+                // Smooth normals: indexed meshes share vertices and
+                // can't host per-face normals; smooth shading reads
+                // fine on the coarse MZB walls.
+                mesh.compute_smooth_normals();
+                let mut child = commands.spawn((
+                    MzbOverlay,
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(material),
+                    Transform::IDENTITY,
+                    ChildOf(parent),
+                ));
+                if auto_loaded {
+                    child.insert(AutoMzbOverlay);
+                }
+            };
+        spawn_merged(
+            &mut commands,
+            collision_positions,
+            collision_indices,
+            collision_mat,
+            parent,
+            req.auto_loaded,
+            &mut meshes,
+        );
+        spawn_merged(
+            &mut commands,
+            noncollision_positions,
+            noncollision_indices,
+            noncollision_mat,
+            parent,
+            req.auto_loaded,
+            &mut meshes,
+        );
 
         push_system_msg(
             &mut scene_state,
             format!(
-                "/load_mzb {}: {n_total} meshes ({n_collision} collision, {} non-collision) at ({:.1}, {:.1}, {:.1})",
+                "/load_mzb {}: {n_submeshes} submeshes ({n_collision_subs} collision, {} non-collision), {n_instances} placements at parent ({:.1}, {:.1}, {:.1})",
                 req.file_id,
-                n_total - n_collision,
+                n_submeshes - n_collision_subs,
                 req.world_pos.x,
                 req.world_pos.y,
                 req.world_pos.z,
@@ -288,15 +560,111 @@ pub fn auto_load_zone_geometry_system(
                 world_pos: Vec3::ZERO,
                 auto_loaded: true,
             });
-            // Don't push a chat line here — `process_load_mzb_requests`
-            // already pushes one when the actual spawn lands. Doubling
-            // the message just to say "we asked to load it" is noise.
+            // Distinguish auto-load from manual `/load_mzb` in chat.
+            push_system_msg(
+                &mut scene_state,
+                format!("auto-load: zone {zone_id} -> DAT file {file_id}"),
+            );
         }
         None => {
             push_system_msg(
                 &mut scene_state,
                 format!("auto-load: no DAT mapping for zone {zone_id} (Phase 11b table pending)"),
             );
+        }
+    }
+}
+
+/// Distance-LOD culling for MZB overlay entities (Phase #1 of the
+/// three-pass MZB perf plan). Hides any `MzbOverlay` entity whose
+/// translation is more than [`MZB_CULL_DISTANCE`] yalms (squared
+/// distance for cheap comparison) from the player's world transform.
+///
+/// Falls through quietly if no `IsSelf` entity is present (e.g. before
+/// the first `EntityUpserted` for self).  We use horizontal distance
+/// only — vertical offsets in multi-story zones shouldn't make a
+/// building "disappear" because it's a few yalms above the camera.
+pub fn cull_mzb_by_distance(
+    draw: Res<DrawDistance>,
+    self_q: Query<&GlobalTransform, With<IsSelf>>,
+    // Filter on `Mesh3d` so we only touch the *child* placement
+    // entities, not the zone-wide parent. The parent lives at the
+    // FFXI world origin (often hundreds of yalms from the player),
+    // so without this filter the parent ends up Hidden and every
+    // child inherits the same — entire zone disappears.
+    mut mzb_q: Query<
+        (&GlobalTransform, &mut Visibility),
+        (With<MzbOverlay>, With<Mesh3d>),
+    >,
+) {
+    let Ok(self_t) = self_q.single() else {
+        return;
+    };
+    let self_pos = self_t.translation();
+    let cull_sq = draw.world * draw.world;
+
+    for (mzb_t, mut vis) in mzb_q.iter_mut() {
+        let mzb_pos = mzb_t.translation();
+        // Horizontal-only distance — multi-story zones shouldn't drop
+        // a building because the player is climbing stairs above it.
+        let dx = mzb_pos.x - self_pos.x;
+        let dz = mzb_pos.z - self_pos.z;
+        let d_sq = dx * dx + dz * dz;
+        let want = if d_sq > cull_sq {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
+        // Skip the write if visibility already matches — Bevy's change
+        // detection is per-field, and a no-op write would still tick
+        // mutation flags and force the renderer to re-extract.
+        if *vis != want {
+            *vis = want;
+        }
+    }
+}
+
+/// Distance-cull non-PC entities (mobs, NPCs, pets, other) beyond
+/// `DrawDistance.mob` yalms from the player. PCs are never culled —
+/// party members, raid mates, and other PCs in the zone stay visible
+/// so the operator can target them regardless of camera distance.
+///
+/// Horizontal-only distance (same rationale as the now-removed Phase 1
+/// MZB cull): multi-story zones shouldn't drop a mob because the
+/// camera is on a different floor.
+pub fn cull_entities_by_distance(
+    draw: Res<DrawDistance>,
+    self_q: Query<&GlobalTransform, With<IsSelf>>,
+    mut ent_q: Query<
+        (&WorldEntity, &GlobalTransform, &mut Visibility),
+        Without<IsSelf>,
+    >,
+) {
+    let Ok(self_t) = self_q.single() else {
+        return;
+    };
+    let self_pos = self_t.translation();
+    let cull_sq = draw.mob * draw.mob;
+
+    for (ent, ent_t, mut vis) in ent_q.iter_mut() {
+        // Always-visible PCs — covers party members, alliance, random
+        // bystanders. Same convention as Ashita's drawdistance addon.
+        if matches!(ent.kind, EntityKind::Pc) {
+            if *vis != Visibility::Inherited {
+                *vis = Visibility::Inherited;
+            }
+            continue;
+        }
+        let p = ent_t.translation();
+        let dx = p.x - self_pos.x;
+        let dz = p.z - self_pos.z;
+        let want = if dx * dx + dz * dz > cull_sq {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
+        if *vis != want {
+            *vis = want;
         }
     }
 }

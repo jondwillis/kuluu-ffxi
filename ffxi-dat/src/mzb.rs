@@ -97,11 +97,46 @@
 //! library — every chunk of geometry the zone uses, sitting at the
 //! origin. Useful for sanity-checking geometry; not yet a placed scene.
 //!
-//! Stage B (TODO, deferred): grid + quadtree + per-cell placements.
-//! That's where each mesh actually gets instanced into world space with
-//! a 4×3 transform. Skipped here because the MVP renderer can show the
-//! mesh-library geometry first and get a "yes there's a zone" signal
-//! without it.
+//! Stage B (this file): grid + per-cell placements. Each non-zero
+//! cell in the `(grid_width*10) × (grid_height*10)` grid points at a
+//! null-terminated list of u32 entries. Entry 0 is a packed
+//! cell-metadata word (bit-packed xx/yy/flags — irrelevant for placement
+//! decode). Subsequent entries come in pairs `(matrix_offset,
+//! geometry_offset)`:
+//!   - `matrix_offset` → 16 consecutive f32s, a 4×4 row-major affine
+//!     where column 3 is translation:
+//!       p_world.x = m[0]*x + m[4]*y + m[8]*z  + m[12]
+//!       p_world.y = m[1]*x + m[5]*y + m[9]*z  + m[13]
+//!       p_world.z = m[2]*x + m[6]*y + m[10]*z + m[14]
+//!     (i.e. m[0..4]=column 0, m[12..16]=column 3 = translation).
+//!   - `geometry_offset` → an MzbMesh record (same on-disk layout as
+//!     the mesh-library entries). Many grid cells can reuse the same
+//!     geometry_offset — that's how FFXI shares one stair template
+//!     across dozens of stairwells. Dedupe by offset when baking GPU
+//!     meshes.
+//!
+//! Quadtree decode (visibility BVH at `quadtree_offset`) is *not*
+//! placement-related — it's a render-culling structure that points back
+//! at grid cells by index. Skipped.
+//!
+//! ## Coord-system note
+//!
+//! Both the mesh vertices and the placement matrix are in raw MZB
+//! coordinates (FFXI client space). The viewer converts to Bevy via
+//! `ffxi_to_bevy(p) = Vec3(p.x, p.z, -p.y)`. Apply that mapping at the
+//! placement-output boundary: transform the vertex by the matrix in
+//! MZB-space first, then map the world-space result with
+//! `ffxi_to_bevy`. Doing it the other way around (mapping vertices to
+//! Bevy and then multiplying by the MZB-space matrix) would compose
+//! axes incorrectly.
+//!
+//! ## Winding
+//!
+//! Per the reference: if the 3×3 rotation part of the matrix has a
+//! negative determinant, triangle winding is reversed at instantiation.
+//! We surface the determinant sign as `flip_winding` so the renderer
+//! can swap v0/v2 (or rely on Bevy's two-sided material — which is
+//! cheaper and what `dat_mzb.rs` already does via `cull_mode: None`).
 
 use crate::{DatError, Result};
 
@@ -433,6 +468,210 @@ pub fn parse_all(encrypted_body: &[u8]) -> Result<(MzbHeader, Vec<MzbMesh>)> {
     Ok((header, meshes))
 }
 
+/// One placement: instance the mesh at `geometry_offset` with `transform`.
+///
+/// Several placements can share a `geometry_offset` — that's how the
+/// format reuses one stair/wall template across many world locations.
+/// Bake one Bevy `Mesh` per unique offset and instance it per
+/// placement.
+///
+/// `transform` is a 4×4 row-major affine in raw MZB (FFXI client)
+/// coordinates. To apply to a vertex `(x, y, z)`:
+///   p.x = t[0]*x + t[4]*y + t[8]*z  + t[12]
+///   p.y = t[1]*x + t[5]*y + t[9]*z  + t[13]
+///   p.z = t[2]*x + t[6]*y + t[10]*z + t[14]
+/// i.e. matrix is stored column-major in the f32 stream (m[0..4] is
+/// column 0). `transform[12..15]` is the world translation in MZB
+/// space; convert to Bevy via `ffxi_to_bevy(Vec3(.x, .y, .z))` *after*
+/// applying the matrix, not before.
+#[derive(Debug, Clone, Copy)]
+pub struct MzbPlacement {
+    /// Absolute offset into the chunk body where this placement's mesh
+    /// record lives. Use [`parse_mesh_at`] to materialize the
+    /// `MzbMesh`. Multiple placements can share the same offset; cache
+    /// the parsed mesh by offset to avoid duplicate work.
+    pub geometry_offset: u32,
+    /// 16 f32s as written on disk. See struct-level docs for the
+    /// matrix-multiply convention.
+    pub transform: [f32; 16],
+    /// True iff this geometry has bit 0 of its mesh flags set
+    /// (decoded from the mesh record header). Cached here so the
+    /// caller can pick a material without re-parsing the mesh.
+    pub doesnt_block_los: bool,
+    /// True iff the matrix's 3×3 linear part has negative determinant
+    /// (i.e. the instance is mirrored — winding must flip to keep
+    /// triangle facing consistent). Renderers using a two-sided
+    /// material can ignore this.
+    pub flip_winding: bool,
+    /// Grid cell coords this placement was discovered in. Useful for
+    /// debugging / culling; not semantically meaningful for rendering.
+    pub grid_x: u16,
+    pub grid_y: u16,
+}
+
+/// Parse one mesh record at an absolute body offset. Used by the
+/// placement-decode path: grid entries point directly at mesh records
+/// (the same record format as the mesh-library) by absolute offset.
+///
+/// Performs the same offset-sanity checks as [`parse_meshes`]; returns
+/// an `MzbError` if the record's verts/normals/tris offsets are
+/// inverted or out of range.
+pub fn parse_mesh_at(body: &[u8], offset: usize) -> Result<MzbMesh> {
+    parse_one_mesh(body, offset)
+}
+
+/// Decode all grid-cell placements in the MZB body.
+///
+/// Returns `Ok(vec![])` (not an error) when:
+///   - `grid_width == 0` or `grid_height == 0` (zone has no grid —
+///     e.g. some ship/cutscene MZBs), or
+///   - the mesh table's `grid_offset` field is zero.
+///
+/// Each non-zero grid cell may emit zero or more placements. The
+/// emitted vector is in cell-major order (y outer, x inner, list
+/// order inside the cell) — i.e. deterministic.
+///
+/// Grid stride: per the reference, the grid is
+/// `(grid_width * 10) × (grid_height * 10)` cells, each one a 4-byte
+/// pointer. Each non-zero pointer addresses a null-terminated list of
+/// u32 entries inside the chunk body. Entry 0 is packed cell metadata
+/// (ignored). Subsequent entries come in (matrix_offset,
+/// geometry_offset) pairs.
+pub fn parse_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbPlacement>> {
+    let mt = header.mesh_table_offset as usize;
+    if mt + 0x14 > body.len() {
+        return Err(MzbError::MeshTableOutOfRange { offset: mt, len: body.len() }.into());
+    }
+    let grid_offset =
+        u32::from_le_bytes([body[mt + 0x10], body[mt + 0x11], body[mt + 0x12], body[mt + 0x13]])
+            as usize;
+    if grid_offset == 0 || grid_offset >= body.len() {
+        return Ok(Vec::new());
+    }
+
+    // Grid dimensions: per the reference, both grid_width and
+    // grid_height are multiplied by 10 to get cell counts along each
+    // axis. The reference's outer loop runs `gridheight * 10` from
+    // `(block[0x0d] * 10) * 10` — yes that's an extra ×10 — but the
+    // *cell-count* the pointer table actually contains is
+    // `(grid_width * 10) × (grid_height * 10)` and the reference's
+    // `offsets = (y * gridwidth*10 + x) * 4` indexing only fills the
+    // first row of that nominally-larger range. Replicating exactly:
+    let gw = (header.grid_width as usize).saturating_mul(10);
+    let gh = (header.grid_height as usize).saturating_mul(10);
+    if gw == 0 || gh == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut out: Vec<MzbPlacement> = Vec::new();
+
+    for y in 0..gh {
+        for x in 0..gw {
+            let cell_ptr_off = grid_offset.saturating_add((y * gw + x) * 4);
+            if cell_ptr_off + 4 > body.len() {
+                continue;
+            }
+            let entry_off = u32::from_le_bytes([
+                body[cell_ptr_off],
+                body[cell_ptr_off + 1],
+                body[cell_ptr_off + 2],
+                body[cell_ptr_off + 3],
+            ]) as usize;
+            if entry_off == 0 || entry_off >= body.len() {
+                continue;
+            }
+
+            // Read a null-terminated u32 list at entry_off.
+            let mut entries: Vec<u32> = Vec::new();
+            let mut cur = entry_off;
+            // Hard cap to defend against runaway lists in corrupt data.
+            // Real grid cells have a handful of meshes — 4096 is far
+            // beyond any plausible per-cell count.
+            for _ in 0..4096 {
+                if cur + 4 > body.len() {
+                    break;
+                }
+                let v = u32::from_le_bytes([body[cur], body[cur + 1], body[cur + 2], body[cur + 3]]);
+                if v == 0 {
+                    break;
+                }
+                entries.push(v);
+                cur += 4;
+            }
+            if entries.is_empty() {
+                continue;
+            }
+
+            // Entries[0] is packed cell metadata (xx/yy/flags); skip.
+            // Pairs follow: (matrix_offset, geometry_offset).
+            let mut i = 1usize;
+            while i + 1 < entries.len() {
+                let mat_off = entries[i] as usize;
+                let geo_off = entries[i + 1] as usize;
+                i += 2;
+
+                if mat_off == 0 || geo_off == 0 {
+                    continue;
+                }
+                if mat_off + 16 * 4 > body.len() || geo_off + 0x10 > body.len() {
+                    continue;
+                }
+
+                // 16 f32s, on-disk order.
+                let mut m = [0.0f32; 16];
+                for k in 0..16 {
+                    let o = mat_off + k * 4;
+                    m[k] = f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+                }
+
+                // Determinant of the 3×3 linear part. Per the
+                // reference, the matrix is stored column-major in the
+                // f32 stream (m[0..4] = column 0, etc.), so the linear
+                // 3×3 has columns m[0..3], m[4..7], m[8..11]:
+                //   | m0 m4 m8  |
+                //   | m1 m5 m9  |
+                //   | m2 m6 m10 |
+                let det = m[0] * (m[5] * m[10] - m[9] * m[6])
+                    - m[4] * (m[1] * m[10] - m[9] * m[2])
+                    + m[8] * (m[1] * m[6] - m[5] * m[2]);
+
+                // Read the geometry record's flags field
+                // (low half of u32 @ +0x0C, then high half at +0x0E is
+                // flags i16 — bit 0 = doesn't block LoS).
+                let flags = u16::from_le_bytes([body[geo_off + 14], body[geo_off + 15]]);
+
+                out.push(MzbPlacement {
+                    geometry_offset: geo_off as u32,
+                    transform: m,
+                    doesnt_block_los: (flags & 1) != 0,
+                    flip_winding: det < 0.0,
+                    grid_x: x as u16,
+                    grid_y: y as u16,
+                });
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Apply an `MzbPlacement` transform to a vertex in MZB-space.
+/// Returns a point in MZB-space (the caller is responsible for
+/// converting to Bevy with `ffxi_to_bevy`).
+///
+/// Matrix-stream convention matches the reference: column-major in the
+/// f32 stream, so `m[0..4]` is column 0 and `m[12..15]` is the
+/// translation column.
+#[inline]
+pub fn apply_placement(m: &[f32; 16], v: [f32; 3]) -> [f32; 3] {
+    let (x, y, z) = (v[0], v[1], v[2]);
+    [
+        m[0] * x + m[4] * y + m[8] * z + m[12],
+        m[1] * x + m[5] * y + m[9] * z + m[13],
+        m[2] * x + m[6] * y + m[10] * z + m[14],
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,6 +851,135 @@ mod tests {
             }
         }
         assert!(any_change, "at least one key_index should produce a pass-1 XOR change");
+    }
+
+    /// Build a synthetic body with one mesh-library mesh, a 1x1 grid
+    /// (grid_width=1, grid_height=1 → 10×10 cells), and a single
+    /// non-zero grid cell at (0,0) referencing one (matrix, geometry)
+    /// pair. The matrix is a pure translation of (100, 200, 300) so
+    /// `apply_placement` to the origin should give exactly that.
+    #[allow(clippy::identity_op)]
+    fn synth_mzb_with_placement() -> Vec<u8> {
+        // Layout:
+        //  0x00..0x20  header
+        //   - mesh_table_offset @ 0x08 = 0x20
+        //   - grid_width = 1 @ 0x0C
+        //   - grid_height = 1 @ 0x0D
+        //  0x20..0x34  mesh table:
+        //   - mesh_count = 1   @ 0x20
+        //   - mesh_data_off    = 0x40  @ 0x24
+        //   - (skip 0x28..0x30, irrelevant)
+        //   - grid_off         = 0x80  @ 0x30 (mesh_table + 0x10)
+        //  0x40..0x50  mesh record header (verts=0x50, norms=0x70, tris=0x7C, tri_count=2)
+        //  0x50..0x80  vertices + normals + tris (same as synth_mzb), then pad
+        //  0x80..0x80+10*10*4 = 0x80..0x210  grid pointer table (only [0]=0x210 nonzero)
+        //  0x210..0x220  grid entry list: [meta, mat_off, geo_off, 0_term]
+        //  0x220..0x260  matrix (16 f32 = 64 bytes)
+        //
+        // Geometry is at 0x40 (same as mesh-library mesh).
+        let mut buf = vec![0u8; 0x260];
+
+        // Preamble: version 0x10 (no XOR), node_count=0
+        let decode_len = (buf.len() as u32) | (0x10u32 << 24);
+        buf[0..4].copy_from_slice(&decode_len.to_le_bytes());
+        buf[4..8].copy_from_slice(&0u32.to_le_bytes());
+
+        // mesh_table_offset
+        buf[8..12].copy_from_slice(&0x20u32.to_le_bytes());
+        buf[0x0C] = 1; // grid_width
+        buf[0x0D] = 1; // grid_height
+
+        // Mesh table @ 0x20
+        buf[0x20..0x24].copy_from_slice(&1u32.to_le_bytes()); // mesh_count
+        buf[0x24..0x28].copy_from_slice(&0x40u32.to_le_bytes()); // mesh_data_off
+        buf[0x30..0x34].copy_from_slice(&0x80u32.to_le_bytes()); // grid_offset @ mt+0x10
+
+        // Mesh record @ 0x40
+        buf[0x40..0x44].copy_from_slice(&0x50u32.to_le_bytes()); // verts
+        buf[0x44..0x48].copy_from_slice(&0x70u32.to_le_bytes()); // norms (need verts<=norms)
+        buf[0x48..0x4C].copy_from_slice(&0x7Cu32.to_le_bytes()); // tris
+        buf[0x4C..0x50].copy_from_slice(&2u32.to_le_bytes()); // tri_count=2, flags=0
+
+        // Vertices @ 0x50: room for (0x70-0x50)/12 ≈ 2.67 → 2 verts; we
+        // only write one but parser computes count from offsets.
+        // Triangles @ 0x7C: 2 × 8 = 16 bytes → ends at 0x8C, which
+        // overlaps grid_offset (0x80)! Fine for the test — we only
+        // exercise placement decode, not mesh decode of this record.
+
+        // Grid pointer table @ 0x80 (100 entries × 4 = 400 bytes = 0x190 → ends 0x210).
+        // Only cell (0,0) → 0x210.
+        buf[0x80..0x84].copy_from_slice(&0x210u32.to_le_bytes());
+
+        // Grid entry list @ 0x210: [meta=0xDEAD, mat_off=0x220, geo_off=0x40, 0]
+        buf[0x210..0x214].copy_from_slice(&0xDEADu32.to_le_bytes());
+        buf[0x214..0x218].copy_from_slice(&0x220u32.to_le_bytes());
+        buf[0x218..0x21C].copy_from_slice(&0x40u32.to_le_bytes());
+        buf[0x21C..0x220].copy_from_slice(&0u32.to_le_bytes()); // terminator
+
+        // Matrix @ 0x220: identity rotation + translation (100,200,300).
+        // Column-major: m[0]=1, m[5]=1, m[10]=1, m[12..15]=trans.
+        let mut m = [0.0f32; 16];
+        m[0] = 1.0;
+        m[5] = 1.0;
+        m[10] = 1.0;
+        m[15] = 1.0;
+        m[12] = 100.0;
+        m[13] = 200.0;
+        m[14] = 300.0;
+        for (k, v) in m.iter().enumerate() {
+            buf[0x220 + k * 4..0x220 + k * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+
+        buf
+    }
+
+    #[test]
+    fn placements_decode_one_cell() {
+        let body = synth_mzb_with_placement();
+        let h = MzbHeader::parse(&body).unwrap();
+        assert_eq!(h.grid_width, 1);
+        assert_eq!(h.grid_height, 1);
+
+        let placements = parse_placements(&body, &h).unwrap();
+        assert_eq!(placements.len(), 1, "exactly one (mat,geo) pair in cell (0,0)");
+        let p = placements[0];
+        assert_eq!(p.geometry_offset, 0x40);
+        assert_eq!(p.grid_x, 0);
+        assert_eq!(p.grid_y, 0);
+        assert!(!p.flip_winding, "identity rotation has positive determinant");
+        // Translation column.
+        assert_eq!(p.transform[12], 100.0);
+        assert_eq!(p.transform[13], 200.0);
+        assert_eq!(p.transform[14], 300.0);
+
+        // apply_placement to origin yields the translation.
+        let world = apply_placement(&p.transform, [0.0, 0.0, 0.0]);
+        assert_eq!(world, [100.0, 200.0, 300.0]);
+        // apply_placement to (1,0,0) yields (101, 200, 300) under identity rotation.
+        let world = apply_placement(&p.transform, [1.0, 0.0, 0.0]);
+        assert_eq!(world, [101.0, 200.0, 300.0]);
+    }
+
+    #[test]
+    fn placements_empty_when_no_grid() {
+        // Reuse the no-grid synth_mzb (grid_width=0, grid_height=0).
+        let body = synth_mzb();
+        let h = MzbHeader::parse(&body).unwrap();
+        let placements = parse_placements(&body, &h).unwrap();
+        assert!(placements.is_empty(), "grid_width=0 → no placements");
+    }
+
+    #[test]
+    fn placement_flip_winding_on_negative_det() {
+        // Build a placement matrix with x-axis mirror: m[0] = -1.
+        // Determinant of diag(-1, 1, 1) = -1 < 0 → flip_winding true.
+        let mut body = synth_mzb_with_placement();
+        // Matrix is at 0x220. m[0] is the first float.
+        body[0x220..0x224].copy_from_slice(&(-1.0f32).to_le_bytes());
+        let h = MzbHeader::parse(&body).unwrap();
+        let placements = parse_placements(&body, &h).unwrap();
+        assert_eq!(placements.len(), 1);
+        assert!(placements[0].flip_winding, "negative determinant should set flip_winding");
     }
 
     #[test]

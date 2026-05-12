@@ -21,6 +21,7 @@
 //! (sub-state of `Launcher`).
 
 pub mod bridge;
+pub mod camera_collision;
 pub mod input;
 pub mod launcher_ui;
 pub mod navmesh_overlay;
@@ -299,6 +300,17 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.add_systems(
         FixedUpdate,
         input::dispatch_movement_system.run_if(in_state(AppPhase::InGame)),
+    );
+
+    // Camera-wall collision: clamp the chase camera so it stops at the
+    // navmesh boundary instead of tunneling through walls. Scheduled
+    // in `PostUpdate` so it runs *after* the viewer-core chase camera
+    // system has computed and lerped to its desired position; we then
+    // pull the camera back along the player→camera line if needed.
+    app.add_systems(
+        PostUpdate,
+        camera_collision::clamp_chase_camera_to_collision
+            .run_if(in_state(AppPhase::InGame)),
     );
 
     // Disconnect → return-to-launcher. Runs every frame in InGame and

@@ -62,6 +62,7 @@ impl Plugin for DatOverlayPlugin {
         app.add_message::<LoadMmbRequest>()
             .add_message::<crate::dat_mzb::LoadMzbRequest>()
             .init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
+            .init_resource::<crate::dat_mzb::DrawDistance>()
             .add_systems(
                 Update,
                 (
@@ -75,7 +76,16 @@ impl Plugin for DatOverlayPlugin {
                     crate::dat_mzb::process_load_mzb_requests,
                 )
                     .chain(),
-            );
+            )
+            // `/drawdistance setmob` consumer — culls non-PC entities
+            // outside the configured radius. Stays decoupled from the
+            // MZB load chain so it runs every frame independent of the
+            // (rare) zone-change events.
+            .add_systems(Update, crate::dat_mzb::cull_entities_by_distance);
+            // Phase 1 `cull_mzb_by_distance` was removed: Phase 3 merged
+            // everything into two entities anchored at world origin, so
+            // the per-entity distance check would hide the whole zone
+            // once the player walks >80 yalms from origin.
     }
 }
 

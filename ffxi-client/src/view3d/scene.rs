@@ -207,9 +207,14 @@ pub fn sync_entities_system(
     //    heading on the transform (not as a side resource) is what makes
     //    `chase_camera_system` follow turns by reading `forward()`.
     if let Ok(mut t) = self_q.single_mut() {
-        let p = ffxi_to_bevy(state.self_pos.pos);
-        t.translation = p + Vec3::Y * 0.7;
-        t.rotation = ffxi_heading_to_bevy_rotation(state.self_pos.heading);
+        // `self_pos` is now derived from `state.entities` via
+        // `self_position()` (Stage 5 refactor). Skip when the self entity
+        // hasn't been seeded yet — the next snapshot tick will retry.
+        if let Some(sp) = state.self_position() {
+            let p = ffxi_to_bevy(sp.pos);
+            t.translation = p + Vec3::Y * 0.7;
+            t.rotation = ffxi_heading_to_bevy_rotation(sp.heading);
+        }
     }
 
     // 2) Index existing ECS entities by FFXI id for the diff. The

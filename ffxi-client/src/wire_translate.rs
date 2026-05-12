@@ -144,6 +144,22 @@ pub fn position_to_wire(p: Position) -> wire::Position {
     }
 }
 
+/// Convert the proto-layer `LookData` (no serde) into the wire-layer
+/// `EntityLook` (serde-bearing). Pure mapping; variants are 1:1.
+pub fn look_to_wire(l: ffxi_proto::decode::LookData) -> wire::EntityLook {
+    use ffxi_proto::decode::LookData;
+    match l {
+        LookData::Standard { modelid } => wire::EntityLook::Standard { modelid },
+        LookData::Equipped {
+            face, race, head, body, hands, legs, feet, main, sub, ranged,
+        } => wire::EntityLook::Equipped {
+            face, race, head, body, hands, legs, feet, main, sub, ranged,
+        },
+        LookData::Door { size } => wire::EntityLook::Door { size },
+        LookData::Transport { size } => wire::EntityLook::Transport { size },
+    }
+}
+
 pub fn vec3_to_wire(v: Vec3) -> wire::Vec3 {
     wire::Vec3 {
         x: v.x,
@@ -165,6 +181,7 @@ pub fn entity_to_wire(e: &Entity) -> wire::Entity {
         claim_id: e.claim_id,
         speed: e.speed,
         speed_base: e.speed_base,
+        look: e.look.map(look_to_wire),
     }
 }
 

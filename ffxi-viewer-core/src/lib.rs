@@ -99,6 +99,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<CameraMode>()
             .init_resource::<LockOn>()
             .init_resource::<ZoneLineState>()
+            .init_resource::<hud::chat_panel::ChatScroll>()
             // PickingPlugin owns the mesh raycast backend + the click→target
             // reader. `DefaultPickingPlugins` (input/hover/interaction) is
             // already added by `DefaultPlugins` on both front-ends.

@@ -258,36 +258,41 @@ fn snap_entities_to_navmesh_system(
         let ffxi_y = -t.translation.z;
         // Use the cached previous snap as z_hint so the search box is
         // stable across frames. Falls back to the current rendered
-        // y on the very first frame for this entity.
+        // y on the very first frame for this entity. `z_hint` is in
+        // FFXI-native height (Y-down) because `nearest_height_at`
+        // feeds it through `ffxi_to_detour` internally; the cached
+        // `h` is already in that frame, but the Bevy fallback needs
+        // a sign flip (Bevy = -FFXI height after the May 2026
+        // Y-orientation fix).
         let z_hint = cache
             .0
             .get(&entity.id)
             .copied()
-            .unwrap_or(t.translation.y);
+            .unwrap_or(-t.translation.y);
 
         if let Some(h) = guard.nearest_height_at(ffxi_x, ffxi_y, z_hint) {
             cache.0.insert(entity.id, h);
-            t.translation.y = h + feet_offset(entity.kind);
+            // `nearest_height_at` returns FFXI native height (Y-down,
+            // so a real ground at +10 yalms comes back as -10). Negate
+            // to land in Bevy Y-up, matching `ffxi_to_bevy(p).y = -p.z`
+            // and the MZB/overlay flips. `feet_offset` then lifts the
+            // capsule center so feet sit *on* the navmesh instead of
+            // the capsule sinking through it.
+            t.translation.y = -h + feet_offset(entity.kind);
         }
     }
 }
 
 
-/// Detour-space → Bevy world. xiNavmeshes use the LSB
-/// `(x, -y_height, -z_north)` convention (see
-/// `vendor/server/src/map/navmesh.cpp::ToDetourPos`). To project
-/// into our Bevy world (y-up, with `ffxi_to_bevy(p) = (p.x, p.z,
-/// -p.y)`), this must equal `ffxi_to_bevy ∘ detour_to_ffxi(d)`:
+/// Detour-space → Bevy world.
 ///
-///   detour_to_ffxi(d) = (d.x, -d.z, -d.y)         // codebase z-up
-///   ffxi_to_bevy(p)   = (p.x, p.z, -p.y)           // Bevy y-up
-///   composition       = (d.x, -d.y, d.z)
-///
-/// Negate Bevy.y so Detour's "below-ground" (which is positive after
-/// LSB's height-negate) renders below the player, and pass d.z
-/// straight through so Detour's "south" (positive after north-negate)
-/// renders as positive Bevy.z (south in Bevy with -Z forward).
+/// FFXI / MZB / xiNavmesh all use Y-down (height grows toward negative);
+/// Bevy is Y-up. LSB's `ToDetourPos` stores Detour `y = -ffxi_native_y`,
+/// and FFXI native y is itself `-real_height`, so detour.y = +real_height.
+/// To land at +real_height in Bevy (Y-up), pass through: `bevy.y = +d[1]`.
+/// X stays as-is; Z passes through because it shares the horizontal
+/// frame the snap uses (`ffxi_y = -bevy.z`).
 #[inline]
 fn detour_to_bevy(d: [f32; 3]) -> Vec3 {
-    Vec3::new(d[0], -d[1], d[2])
+    Vec3::new(d[0], d[1], d[2])
 }

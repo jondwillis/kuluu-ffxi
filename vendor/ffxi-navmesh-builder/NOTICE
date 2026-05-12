@@ -1,0 +1,38 @@
+FFXI-NavMesh-Builder vendor snapshot
+====================================
+
+This directory contains a snapshot of selected source file(s) from:
+
+  Repository: LandSandBoat/FFXI-NavMesh-Builder
+  URL:        https://github.com/LandSandBoat/FFXI-NavMesh-Builder
+  License:    GNU General Public License v3.0 (see LICENSE in upstream repo)
+  Authors:    Xenonsmurf and FFXI-NavMesh-Builder contributors
+
+Pinned commit
+-------------
+
+  e3936d249ef1b38397b5a8e56f7c51493ae04497  (last-touched commit for d_ms.cs
+  as of the snapshot; repo HEAD at scrape time was
+  ec953cec46500b20486cf0e49613d0b90d1ed1e7)
+
+Files vendored
+--------------
+
+  d_ms.cs   src/FFXI Navmesh Builder/Common/dat/Types/d_ms.cs
+            Contains the zone-id -> ROM DAT file-id formula used by
+            `ParseD_MSG` to wire each zone's collision DAT into the
+            navmesh builder. The relevant line is
+
+                var fileId = x < 256 ? x + 100 : x + 83635;
+
+            where `x` is the zone-id. This formula is what `ffxi-dat`'s
+            `build.rs` parses out at compile time to generate the
+            static zone-id -> file-id lookup table.
+
+License compatibility
+---------------------
+
+This Rust workspace is GPL-3-or-later, which is compatible with
+GPL-3-only sources (downstream consumers must take GPL-3 terms). No
+binary or runtime linkage occurs against FFXI-NavMesh-Builder; this is
+build-time scraping of a source-of-truth formula only.

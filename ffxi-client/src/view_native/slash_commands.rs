@@ -26,18 +26,148 @@
 use ffxi_viewer_core::Preset;
 use ffxi_viewer_wire::{ChatChannel, ChatLine, Entity as WireEntity, Vec3 as WireVec3};
 
-use crate::state::{ActionKind, AgentCommand, CheckKind, ReqLogoutKind};
+use crate::state::{ActionKind, AgentCommand, CheckKind, HealMode, ReqLogoutKind};
 
 /// Maximum zone-id value used for sanity-checking numeric `/zoneto`
 /// args. The LSB zone table goes well past 300 (Adoulin, Voidwatch,
 /// etc.) but never reaches 65535; this catches obvious typos.
 const MAX_ZONE_ID: u16 = 600;
 
+/// One row in the `/help` listing. `aliases[0]` is the canonical name;
+/// the rest are accepted spellings (mirroring the `match` arms in
+/// `parse_slash`). `usage` is the brief arg shape; `summary` is the
+/// one-line description rendered in chat.
+struct HelpEntry {
+    aliases: &'static [&'static str],
+    usage: &'static str,
+    summary: &'static str,
+}
+
+/// Categorized listing rendered by `/help` and `/?`. Single source of
+/// truth for the help screen — the `help_entries_dispatch_known`
+/// test below pins each canonical alias against `parse_slash` so a
+/// new command added to the match without a help entry (or vice
+/// versa) trips a test failure.
+const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
+    (
+        "Movement & Navigation",
+        &[
+            HelpEntry { aliases: &["follow"], usage: "[name]", summary: "follow target or current selection" },
+            HelpEntry { aliases: &["pathto"], usage: "<x> <y> <z>", summary: "pathfind to world coordinates" },
+            HelpEntry { aliases: &["zones"], usage: "", summary: "list zone-line destinations from current zone" },
+            HelpEntry { aliases: &["zoneto"], usage: "<name|id>", summary: "pathfind to a zone-line by destination" },
+            HelpEntry { aliases: &["navmesh"], usage: "[on|off]", summary: "toggle the navmesh debug overlay" },
+            HelpEntry { aliases: &["navinfo"], usage: "", summary: "report navmesh snap status at current position" },
+            HelpEntry { aliases: &["whereami", "pos"], usage: "", summary: "print self position and zone id" },
+            HelpEntry { aliases: &["return", "homepoint", "hp"], usage: "", summary: "warp to home point (alive or dead)" },
+        ],
+    ),
+    (
+        "Combat & Targeting",
+        &[
+            HelpEntry { aliases: &["attack", "engage"], usage: "[name]", summary: "engage target (reactor goal)" },
+            HelpEntry { aliases: &["disengage"], usage: "", summary: "clear active reactor goal" },
+            HelpEntry { aliases: &["attackoff"], usage: "", summary: "one-shot attack-off packet on current target" },
+            HelpEntry { aliases: &["assist"], usage: "[name]", summary: "assist target (inherit their target)" },
+            HelpEntry { aliases: &["target"], usage: "[name]", summary: "set or clear current target" },
+            HelpEntry { aliases: &["check", "checkname", "checkparam"], usage: "[name]", summary: "check target — strength / name / parameters" },
+            HelpEntry { aliases: &["cast"], usage: "<spell> [target]", summary: "cast a spell" },
+            HelpEntry { aliases: &["ws", "weaponskill"], usage: "<name> [target]", summary: "weapon skill" },
+            HelpEntry { aliases: &["ja", "jobability"], usage: "<name> [target]", summary: "job ability" },
+            HelpEntry { aliases: &["useitem", "use"], usage: "<name> [target]", summary: "use an item" },
+            HelpEntry { aliases: &["cancel"], usage: "", summary: "cancel current reactor goal / action" },
+            HelpEntry { aliases: &["raw"], usage: "<attack|attackoff> [name]", summary: "low-level Action packet (bypasses reactor)" },
+        ],
+    ),
+    (
+        "Chat",
+        &[
+            HelpEntry { aliases: &["s", "say"], usage: "<text>", summary: "say (local chat)" },
+            HelpEntry { aliases: &["p", "party"], usage: "<text>", summary: "party chat" },
+            HelpEntry { aliases: &["sh", "shout"], usage: "<text>", summary: "shout chat" },
+            HelpEntry { aliases: &["l", "ls", "linkshell"], usage: "<text>", summary: "linkshell chat" },
+            HelpEntry { aliases: &["t", "tell"], usage: "<name> <text>", summary: "tell another player" },
+        ],
+    ),
+    (
+        "Status & Menus",
+        &[
+            HelpEntry { aliases: &["sit"], usage: "", summary: "sit (not yet wired)" },
+            HelpEntry { aliases: &["stand"], usage: "", summary: "stand (not yet wired)" },
+            HelpEntry { aliases: &["heal"], usage: "[on|off]", summary: "toggle resting (CAMP)" },
+            HelpEntry { aliases: &["raisemenu"], usage: "<option>", summary: "respond to raise dialog" },
+            HelpEntry { aliases: &["tractormenu"], usage: "<option>", summary: "respond to tractor dialog" },
+            HelpEntry { aliases: &["homepointmenu"], usage: "<option>", summary: "respond to homepoint dialog" },
+            HelpEntry { aliases: &["buy"], usage: "<row> [qty]", summary: "buy from open shop by row index" },
+            HelpEntry { aliases: &["bank"], usage: "<subcommand>", summary: "gil-bank operations" },
+        ],
+    ),
+    (
+        "Session",
+        &[
+            HelpEntry { aliases: &["logout"], usage: "[on|off]", summary: "request logout (30s LeaveGame timer)" },
+            HelpEntry { aliases: &["shutdown"], usage: "[on|off]", summary: "request shutdown (LeaveGame, then close)" },
+            HelpEntry { aliases: &["exit"], usage: "", summary: "polite logout + close window" },
+            HelpEntry { aliases: &["disconnect", "quit"], usage: "", summary: "drop the connection immediately" },
+        ],
+    ),
+    (
+        "Debug & Tooling",
+        &[
+            HelpEntry { aliases: &["snapshot"], usage: "", summary: "emit a one-shot scene snapshot" },
+            HelpEntry { aliases: &["zonechange", "rzc"], usage: "<id>", summary: "request zone change (debug)" },
+            HelpEntry { aliases: &["agent"], usage: "<pause|resume|status>", summary: "human-in-control flag for agent commands" },
+            HelpEntry { aliases: &["keybinds", "keybind", "binds"], usage: "<preset|list|reset>", summary: "manage keybind presets" },
+            HelpEntry { aliases: &["load_mmb", "loadmmb"], usage: "<file_id> <chunk_idx>", summary: "spawn MMB model at self_pos (debug overlay)" },
+            HelpEntry { aliases: &["load_mzb", "loadmzb"], usage: "<file_id> [chunk_idx]", summary: "load MZB mesh-library at self_pos (debug overlay)" },
+            HelpEntry { aliases: &["help", "?"], usage: "", summary: "show this listing" },
+        ],
+    ),
+];
+
+/// Render the categorized `/help` text as a single multi-line string,
+/// suitable for `SlashOutcome::SystemMessage`. The chat panel wraps
+/// long lines at render time so no column-padding is needed.
+fn render_help() -> String {
+    let mut out = String::from("=== Slash command reference ===");
+    for (category, entries) in HELP_CATEGORIES {
+        out.push_str("\n[");
+        out.push_str(category);
+        out.push(']');
+        for entry in *entries {
+            // Format: `/alias1 | /alias2 <usage> -- summary`
+            out.push_str("\n  ");
+            for (i, name) in entry.aliases.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(" | ");
+                }
+                out.push('/');
+                out.push_str(name);
+            }
+            if !entry.usage.is_empty() {
+                out.push(' ');
+                out.push_str(entry.usage);
+            }
+            out.push_str(" -- ");
+            out.push_str(entry.summary);
+        }
+    }
+    out
+}
+
 /// What the input router should do after parsing a `/`-prefixed buffer.
 #[derive(Debug, Clone)]
 pub enum SlashOutcome {
     /// Dispatch this command on the agent channel.
     Command(AgentCommand),
+    /// Dispatch a sequence of commands in order. Used when one slash maps
+    /// to multiple wire packets — `/logout` is the canonical example
+    /// (REQLOGOUT + CAMP-On so the player both arms the logout timer
+    /// and starts resting during it). Each command is `try_send` in
+    /// list order; failure of one doesn't short-circuit the rest, so
+    /// the user still gets the logout if heal silently drops. Empty
+    /// list is a no-op.
+    Commands(Vec<AgentCommand>),
     /// Mutate the `Target` resource. `None` clears the target.
     SetTarget(Option<u32>),
     /// Same as [`Command(Disconnect)`](AgentCommand::Disconnect) but the
@@ -103,6 +233,21 @@ pub enum SlashOutcome {
         chunk_idx: Option<usize>,
         world_pos: WireVec3,
     },
+    /// `/drawdistance setworld N` / `/drawdistance setmob N` — mirrors
+    /// the Ashita/Windower addon. `World` controls MZB overlay cull;
+    /// `Mob` controls non-PC entity capsule cull. Naked `/drawdistance`
+    /// shows the current values (caller dispatches a SystemMessage).
+    SetDrawDistance(DrawDistanceOp),
+}
+
+/// `/drawdistance` subcommand variants. `Show` is a no-arg query for
+/// the current values; `SetWorld(n)` and `SetMob(n)` set the cull
+/// radii to `n` yalms.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DrawDistanceOp {
+    Show,
+    SetWorld(f32),
+    SetMob(f32),
 }
 
 /// `/agent` subcommand variants.
@@ -270,9 +415,20 @@ pub fn parse_slash(
         // immediate for GMs and inside Mog Houses). Toggles by default;
         // `on`/`off` arguments arm or cancel explicitly.
         "logout" => parse_reqlogout(rest, /* shutdown = */ false),
+        // `/heal` — toggle resting (`EFFECT_HEALING`). Default arg is
+        // Toggle, the always-safe form; explicit `on`/`off` give the
+        // operator deterministic control but the server rejects the
+        // packet when the mode mismatches the current state ("Requested
+        // healing when already healing" / "Requested stop healing when
+        // not healing"). Movement implicitly cancels — the session-loop
+        // keepalive interceptor prepends `0x0E8 Mode::Off` when the
+        // next tick's `self_pos` differs from the last keepalived one.
+        "heal" => parse_heal(rest),
         "navmesh" => parse_navmesh(rest),
         "load_mmb" | "loadmmb" => parse_load_mmb(rest, self_pos),
         "load_mzb" | "loadmzb" => parse_load_mzb(rest, self_pos),
+        "look" => parse_look(rest, entities, self_pos, current_target),
+        "drawdistance" | "dd" => parse_drawdistance(rest),
         "keybinds" | "keybind" | "binds" => parse_keybinds(rest),
         "pathto" => parse_pathto(rest, entities, current_target),
         "zones" => parse_zones(zone_id),
@@ -300,6 +456,7 @@ pub fn parse_slash(
         "l" | "linkshell" | "ls" => chat_or_empty(rest, 5, "/l"),
         "s" | "say" => chat_or_empty(rest, 0, "/s"),
         "t" | "tell" => parse_tell(rest),
+        "help" | "?" => SlashOutcome::SystemMessage(render_help()),
         "" => SlashOutcome::SystemMessage("empty command".into()),
         unknown => SlashOutcome::SystemMessage(format!("unknown command: /{unknown}")),
     }
@@ -355,6 +512,16 @@ fn parse_buy(rest: &str) -> SlashOutcome {
 /// Empty arg toggles. Anything other than `on`/`off` is rejected with a
 /// system chat line (matching how retail clients display "Unable to do
 /// that" rather than silently sending the toggle).
+///
+/// **Heal coupling**: when the logout *arms* (Toggle without context, or
+/// On), we also dispatch `Heal { Mode::On }` so the player sits during
+/// the 30-second countdown — matching retail behavior. The server's
+/// `healing.lua::onEffectLose` also calls `delStatusEffectSilent(LEAVEGAME)`,
+/// so cancelling heal during the countdown *also* cancels the logout
+/// — symmetric. `Off` variants don't chain Heal: cancelling logout
+/// shouldn't separately try to start resting. The dispatcher sends
+/// `ReqLogout` first so the wire flushes it even if the channel is
+/// near-capacity.
 fn parse_reqlogout(rest: &str, shutdown: bool) -> SlashOutcome {
     let label = if shutdown { "/shutdown" } else { "/logout" };
     let arg = rest.trim().to_ascii_lowercase();
@@ -371,7 +538,39 @@ fn parse_reqlogout(rest: &str, shutdown: bool) -> SlashOutcome {
             ));
         }
     };
-    SlashOutcome::Command(AgentCommand::ReqLogout { kind })
+    let arms = matches!(
+        kind,
+        ReqLogoutKind::LogoutToggle
+            | ReqLogoutKind::LogoutOn
+            | ReqLogoutKind::ShutdownToggle
+            | ReqLogoutKind::ShutdownOn,
+    );
+    if arms {
+        SlashOutcome::Commands(vec![
+            AgentCommand::ReqLogout { kind },
+            AgentCommand::Heal { mode: HealMode::On },
+        ])
+    } else {
+        SlashOutcome::Command(AgentCommand::ReqLogout { kind })
+    }
+}
+
+/// `/heal [on|off]` — toggle/arm/cancel resting (0x0E8 CAMP). Empty arg
+/// is the always-safe Toggle form. Unknown arg → system message,
+/// mirroring `parse_reqlogout`'s usage-line shape.
+fn parse_heal(rest: &str) -> SlashOutcome {
+    let arg = rest.trim().to_ascii_lowercase();
+    let mode = match arg.as_str() {
+        "" | "toggle" => HealMode::Toggle,
+        "on" => HealMode::On,
+        "off" => HealMode::Off,
+        other => {
+            return SlashOutcome::SystemMessage(format!(
+                "/heal: usage `/heal [on|off]` (got `{other}`)"
+            ));
+        }
+    };
+    SlashOutcome::Command(AgentCommand::Heal { mode })
 }
 
 /// `/pathto <x> <y> <z>` or `/pathto target` — issue a navmesh-aware
@@ -909,6 +1108,81 @@ fn parse_zoneto(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
 /// they can walk around the spawned model. `ffxi_to_bevy` is applied
 /// here at the parser boundary, matching the convention used by every
 /// other place we cross the FFXI→Bevy axis flip.
+/// `/drawdistance` family. Matches Ashita/Windower conventions:
+///   - `/drawdistance` or `/dd` — show current
+///   - `/drawdistance setworld N` — MZB overlay cull distance
+///   - `/drawdistance setmob N` — entity capsule cull distance
+fn parse_drawdistance(rest: &str) -> SlashOutcome {
+    let mut parts = rest.split_whitespace();
+    let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+    if sub.is_empty() {
+        return SlashOutcome::SetDrawDistance(DrawDistanceOp::Show);
+    }
+    let value_str = parts.next().unwrap_or("");
+    let value: f32 = match value_str.parse() {
+        Ok(v) if v > 0.0 => v,
+        _ => {
+            return SlashOutcome::SystemMessage(format!(
+                "/drawdistance: bad value `{value_str}` (expected positive number)"
+            ))
+        }
+    };
+    match sub.as_str() {
+        "setworld" | "world" => SlashOutcome::SetDrawDistance(DrawDistanceOp::SetWorld(value)),
+        "setmob" | "mob" => SlashOutcome::SetDrawDistance(DrawDistanceOp::SetMob(value)),
+        other => SlashOutcome::SystemMessage(format!(
+            "/drawdistance: unknown sub `{other}` (use setworld | setmob)"
+        )),
+    }
+}
+
+/// `/look [name|act_index]` — print the decoded LookData for an entity.
+/// Default: the current target. Diagnostic for hand-bootstrapping a
+/// `modelid → MMB file_id` mapping by observation. Format is one line
+/// keyed on the entity's display name + decoded look variant.
+fn parse_look(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+) -> SlashOutcome {
+    use ffxi_viewer_wire::EntityLook;
+
+    let ent: Option<&WireEntity> = if rest.is_empty() {
+        current_target.and_then(|id| entities.iter().find(|e| e.id == id))
+    } else if let Ok(idx) = rest.parse::<u16>() {
+        entities.iter().find(|e| e.act_index == idx)
+    } else {
+        resolve_name(rest, entities, self_pos)
+    };
+
+    let Some(ent) = ent else {
+        return SlashOutcome::SystemMessage(if rest.is_empty() {
+            "/look: no target".into()
+        } else {
+            format!("/look: no entity '{rest}'")
+        });
+    };
+
+    let name = ent.name.as_deref().unwrap_or("?");
+    let body = match &ent.look {
+        None => "look: none decoded yet (entity hasn't sent a CHAR_NPC look-bearing tick)".to_string(),
+        Some(EntityLook::Standard { modelid }) => {
+            format!("look: STANDARD modelid={modelid} (0x{modelid:04X})")
+        }
+        Some(EntityLook::Equipped {
+            face, race, head, body, hands, legs, feet, main, sub, ranged,
+        }) => format!(
+            "look: EQUIPPED race={race} face={face} head=0x{head:04X} body=0x{body:04X} \
+             hands=0x{hands:04X} legs=0x{legs:04X} feet=0x{feet:04X} \
+             main=0x{main:04X} sub=0x{sub:04X} ranged=0x{ranged:04X}"
+        ),
+        Some(EntityLook::Door { size }) => format!("look: DOOR (size={size})"),
+        Some(EntityLook::Transport { size }) => format!("look: TRANSPORT (size={size})"),
+    };
+    SlashOutcome::SystemMessage(format!("/look [{name}] {body}"))
+}
+
 fn parse_load_mmb(rest: &str, self_pos: WireVec3) -> SlashOutcome {
     let mut parts = rest.split_whitespace();
     let file_str = parts.next().unwrap_or("");
@@ -1223,54 +1497,89 @@ mod tests {
     }
 
     #[test]
-    fn logout_no_arg_toggles() {
+    fn logout_no_arg_toggles_and_chains_heal_on() {
+        // `/logout` toggles the LeaveGame effect and, because it arms,
+        // also enqueues Heal::On so the player sits during the 30s
+        // countdown (matches retail). Order matters: ReqLogout must be
+        // first so the wire flush of 0x0E7 lands before 0x0E8.
         match parse_slash("/logout", &empty_entities(), origin(), None, None) {
-            SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
-                assert_eq!(kind, ReqLogoutKind::LogoutToggle);
+            SlashOutcome::Commands(cmds) => {
+                assert_eq!(cmds.len(), 2, "expected [ReqLogout, Heal], got {cmds:?}");
+                assert!(
+                    matches!(
+                        cmds[0],
+                        AgentCommand::ReqLogout { kind: ReqLogoutKind::LogoutToggle }
+                    ),
+                    "first cmd must be ReqLogout(LogoutToggle), got {:?}",
+                    cmds[0]
+                );
+                assert!(
+                    matches!(cmds[1], AgentCommand::Heal { mode: HealMode::On }),
+                    "second cmd must be Heal(On), got {:?}",
+                    cmds[1]
+                );
             }
-            other => panic!("expected ReqLogout(LogoutToggle), got {other:?}"),
+            other => panic!("expected Commands([ReqLogout, Heal]), got {other:?}"),
         }
     }
 
     #[test]
-    fn logout_on_and_off_select_explicit_modes() {
+    fn logout_on_chains_heal_logout_off_does_not() {
+        // Arming via explicit `on` chains Heal::On.
         match parse_slash("/logout on", &empty_entities(), origin(), None, None) {
-            SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
-                assert_eq!(kind, ReqLogoutKind::LogoutOn);
+            SlashOutcome::Commands(cmds) => {
+                assert_eq!(cmds.len(), 2);
+                assert!(matches!(
+                    cmds[0],
+                    AgentCommand::ReqLogout { kind: ReqLogoutKind::LogoutOn }
+                ));
+                assert!(matches!(cmds[1], AgentCommand::Heal { mode: HealMode::On }));
             }
-            other => panic!("expected ReqLogout(LogoutOn), got {other:?}"),
+            other => panic!("expected Commands([ReqLogout(On), Heal]), got {other:?}"),
         }
+        // Cancelling via `off` is single-command — cancelling the
+        // logout shouldn't separately try to start resting.
         match parse_slash("/logout off", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
                 assert_eq!(kind, ReqLogoutKind::LogoutOff);
             }
-            other => panic!("expected ReqLogout(LogoutOff), got {other:?}"),
+            other => panic!("expected single Command(ReqLogout(Off)), got {other:?}"),
         }
     }
 
     #[test]
-    fn shutdown_no_arg_toggles() {
+    fn shutdown_no_arg_toggles_and_chains_heal_on() {
         match parse_slash("/shutdown", &empty_entities(), origin(), None, None) {
-            SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
-                assert_eq!(kind, ReqLogoutKind::ShutdownToggle);
+            SlashOutcome::Commands(cmds) => {
+                assert_eq!(cmds.len(), 2);
+                assert!(matches!(
+                    cmds[0],
+                    AgentCommand::ReqLogout { kind: ReqLogoutKind::ShutdownToggle }
+                ));
+                assert!(matches!(cmds[1], AgentCommand::Heal { mode: HealMode::On }));
             }
-            other => panic!("expected ReqLogout(ShutdownToggle), got {other:?}"),
+            other => panic!("expected Commands, got {other:?}"),
         }
     }
 
     #[test]
-    fn shutdown_on_and_off_select_explicit_modes() {
+    fn shutdown_on_chains_heal_shutdown_off_does_not() {
         match parse_slash("/shutdown on", &empty_entities(), origin(), None, None) {
-            SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
-                assert_eq!(kind, ReqLogoutKind::ShutdownOn);
+            SlashOutcome::Commands(cmds) => {
+                assert_eq!(cmds.len(), 2);
+                assert!(matches!(
+                    cmds[0],
+                    AgentCommand::ReqLogout { kind: ReqLogoutKind::ShutdownOn }
+                ));
+                assert!(matches!(cmds[1], AgentCommand::Heal { mode: HealMode::On }));
             }
-            other => panic!("expected ReqLogout(ShutdownOn), got {other:?}"),
+            other => panic!("expected Commands, got {other:?}"),
         }
         match parse_slash("/shutdown off", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
                 assert_eq!(kind, ReqLogoutKind::ShutdownOff);
             }
-            other => panic!("expected ReqLogout(ShutdownOff), got {other:?}"),
+            other => panic!("expected single Command(ReqLogout(ShutdownOff)), got {other:?}"),
         }
     }
 
@@ -1289,6 +1598,54 @@ mod tests {
     #[test]
     fn logout_rejects_unknown_arg() {
         for s in ["/logout please", "/logout 1", "/shutdown maybe"] {
+            assert!(
+                matches!(
+                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    SlashOutcome::SystemMessage(_)
+                ),
+                "expected SystemMessage for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn heal_no_arg_toggles() {
+        match parse_slash("/heal", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::Heal { mode }) => {
+                assert_eq!(mode, HealMode::Toggle);
+            }
+            other => panic!("expected Command(Heal(Toggle)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn heal_on_and_off_select_explicit_modes() {
+        match parse_slash("/heal on", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::Heal { mode }) => {
+                assert_eq!(mode, HealMode::On);
+            }
+            other => panic!("expected Command(Heal(On)), got {other:?}"),
+        }
+        match parse_slash("/heal off", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::Heal { mode }) => {
+                assert_eq!(mode, HealMode::Off);
+            }
+            other => panic!("expected Command(Heal(Off)), got {other:?}"),
+        }
+        // `/heal toggle` is an alias for the no-arg form. Tested
+        // separately so a future reader doesn't assume "toggle" was
+        // never a valid arg literal.
+        match parse_slash("/heal toggle", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::Heal { mode }) => {
+                assert_eq!(mode, HealMode::Toggle);
+            }
+            other => panic!("expected Command(Heal(Toggle)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn heal_rejects_unknown_arg() {
+        for s in ["/heal please", "/heal 1", "/heal nope"] {
             assert!(
                 matches!(
                     parse_slash(s, &empty_entities(), origin(), None, None),
@@ -1897,6 +2254,54 @@ mod tests {
                 ),
                 SlashOutcome::Quit => {} // /disconnect path; intentional
                 other => panic!("slash `{slash}` did not yield Command: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn help_command_returns_multiline_listing() {
+        for slash in ["/help", "/?"] {
+            let out = parse_slash(slash, &empty_entities(), origin(), None, None);
+            match out {
+                SlashOutcome::SystemMessage(s) => {
+                    assert!(s.contains("Slash command reference"), "{slash} missing header");
+                    // Each category header should be present.
+                    for (category, _) in HELP_CATEGORIES {
+                        assert!(
+                            s.contains(category),
+                            "{slash} output missing category `{category}`"
+                        );
+                    }
+                    // Spot-check a couple of canonical commands.
+                    assert!(s.contains("/follow"), "{slash} missing /follow");
+                    assert!(s.contains("/help"), "{slash} missing /help self-reference");
+                }
+                other => panic!("expected SystemMessage from {slash}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Drift guard: every alias listed in HELP_CATEGORIES must be a
+    /// command the parser actually accepts. If someone removes a
+    /// command from the match without updating the help table (or
+    /// adds an entry with a typo), this fails. We check by asserting
+    /// the parser does NOT return the "unknown command" SystemMessage
+    /// — any other outcome (Command, Commands, SystemMessage with a
+    /// usage line, ToggleNavmesh, etc.) counts as "known".
+    #[test]
+    fn help_entries_dispatch_known() {
+        for (_, entries) in HELP_CATEGORIES {
+            for entry in *entries {
+                for alias in entry.aliases {
+                    let slash = format!("/{alias}");
+                    let out = parse_slash(&slash, &empty_entities(), origin(), None, None);
+                    if let SlashOutcome::SystemMessage(ref s) = out {
+                        assert!(
+                            !s.starts_with("unknown command:"),
+                            "help entry `/{alias}` is not accepted by parse_slash (drift)"
+                        );
+                    }
+                }
             }
         }
     }

@@ -241,6 +241,108 @@ impl PosHead {
     }
 }
 
+/// Per-entity model selector decoded from a CHAR_NPC / CHAR_PC body. The
+/// variant matches LSB's `MODELTYPE` enum
+/// (`vendor/server/src/map/packets/entity_update.h:29-39`) and the wire
+/// layout matches the switch at `entity_update.cpp:451-484`.
+///
+/// Wire layout (body offsets — packet offset minus the 4-byte sub-packet
+/// header, so body[44] corresponds to packet offset 0x30):
+/// ```text
+///   body[44..46]  = look.size  (the MODELTYPE sentinel)
+///   body[46..48]  = look.modelid (STANDARD/UNK_5/AUTOMATON only)
+///   body[44..64]  = full 20-byte look_t (EQUIPPED/CHOCOBO)
+///   body[44..46]  + body[48..60] = size + 12-byte name (DOOR/SHIP/ELEVATOR)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookData {
+    /// `MODEL_STANDARD = 0`, `MODEL_UNK_5 = 5`, `MODEL_AUTOMATON = 6`.
+    /// Modelid is the FFXI model identifier; resolution to an MMB
+    /// file_id happens in a separate (POLUtils-derived) lookup.
+    Standard { modelid: u16 },
+    /// `MODEL_EQUIPPED = 1`, `MODEL_CHOCOBO = 7`. Full 20-byte `look_t`
+    /// with race + face packed into the modelid slot and 8 equipment
+    /// slot model ids. PC equipment-layering not yet wired client-side.
+    Equipped {
+        /// `look.modelid` low byte. For monstrosity mobs this is
+        /// `m_Costume2`; for regular PCs this is `look_t.face` per
+        /// the `look_t` union in `vendor/server/src/common/mmo.h:157-169`.
+        face: u8,
+        /// `look.modelid` high byte. Race id (1..=8) for PCs;
+        /// `look.race` for monstrosities (`char_update.cpp:388`).
+        race: u8,
+        head: u16,
+        body: u16,
+        hands: u16,
+        legs: u16,
+        feet: u16,
+        main: u16,
+        sub: u16,
+        ranged: u16,
+    },
+    /// `MODEL_DOOR = 2`. Used for static doors / scenery NPCs. The
+    /// `size` byte itself is the MODELTYPE tag; the actual visual is
+    /// inferred from the NPC name and zone (per LSB convention).
+    Door { size: u16 },
+    /// `MODEL_SHIP = 4`, `MODEL_ELEVATOR = 3`. Transport NPCs — only
+    /// the type tag is carried; the actual model selection happens in
+    /// the client via `getTransportNPCName` (server side) and a
+    /// hard-coded client mapping. We don't render these as MMBs yet.
+    Transport { size: u16 },
+}
+
+impl LookData {
+    /// Body offset of the start of the look block — packet-absolute
+    /// `0x30` minus the 4-byte sub-packet header.
+    pub const LOOK_BODY_OFFSET: usize = 0x2C;
+
+    /// Decode the look block from a `CHAR_NPC` (0x00E) body. Returns
+    /// `None` when the body is truncated before the size+modelid pair
+    /// or the size sentinel is unrecognized.
+    ///
+    /// Reference: `vendor/server/src/map/packets/entity_update.cpp:451-484`.
+    pub fn decode_char_npc(body: &[u8]) -> Option<Self> {
+        let off = Self::LOOK_BODY_OFFSET;
+        if body.len() < off + 4 {
+            return None;
+        }
+        let size = u16::from_le_bytes([body[off], body[off + 1]]);
+        // MODELTYPE enum from `entity_update.h:29-39`.
+        match size {
+            0 | 5 | 6 => {
+                // MODEL_STANDARD / MODEL_UNK_5 / MODEL_AUTOMATON. The
+                // `look_t` union puts `modelid` at offset 2; the server
+                // writes 4 bytes of look_t to body[off..off+4] for these
+                // types (`entity_update.cpp:458`).
+                let modelid = u16::from_le_bytes([body[off + 2], body[off + 3]]);
+                Some(LookData::Standard { modelid })
+            }
+            1 | 7 => {
+                // MODEL_EQUIPPED / MODEL_CHOCOBO. Full 20-byte look_t at
+                // body[off..off+20] (`entity_update.cpp:465`).
+                if body.len() < off + 20 {
+                    return None;
+                }
+                Some(LookData::Equipped {
+                    face: body[off + 2],
+                    race: body[off + 3],
+                    head: u16::from_le_bytes([body[off + 4], body[off + 5]]),
+                    body: u16::from_le_bytes([body[off + 6], body[off + 7]]),
+                    hands: u16::from_le_bytes([body[off + 8], body[off + 9]]),
+                    legs: u16::from_le_bytes([body[off + 10], body[off + 11]]),
+                    feet: u16::from_le_bytes([body[off + 12], body[off + 13]]),
+                    main: u16::from_le_bytes([body[off + 14], body[off + 15]]),
+                    sub: u16::from_le_bytes([body[off + 16], body[off + 17]]),
+                    ranged: u16::from_le_bytes([body[off + 18], body[off + 19]]),
+                })
+            }
+            2 => Some(LookData::Door { size }),
+            3 | 4 => Some(LookData::Transport { size }),
+            _ => None,
+        }
+    }
+}
+
 /// Server's `GP_SERV_COMMAND_LOGIN` (0x00A) — sent on zone-in (both initial
 /// connect and after every zone transition). Reference:
 /// `vendor/Phoenix/src/map/packets/s2c/0x00a_login.h::GP_SERV_COMMAND_LOGIN`.
@@ -855,6 +957,65 @@ impl ItemAttr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `MODEL_STANDARD = 0` (most mobs/NPCs): body[0x2C..0x30] is
+    /// `(size=0, modelid)`. Decoder must surface `modelid`.
+    #[test]
+    fn look_data_decodes_standard_modelid() {
+        let mut buf = vec![0u8; 0x40];
+        buf[0x2C..0x2E].copy_from_slice(&0u16.to_le_bytes()); // size = MODEL_STANDARD
+        buf[0x2E..0x30].copy_from_slice(&0x1234u16.to_le_bytes()); // modelid
+        assert_eq!(
+            LookData::decode_char_npc(&buf),
+            Some(LookData::Standard { modelid: 0x1234 })
+        );
+    }
+
+    /// `MODEL_EQUIPPED = 1`: full 20-byte look_t. Verify race+face split
+    /// and equipment-slot ordering match the `look_t` union layout in
+    /// `vendor/server/src/common/mmo.h:157-169`.
+    #[test]
+    fn look_data_decodes_equipped_look_t() {
+        let mut buf = vec![0u8; 0x50];
+        buf[0x2C..0x2E].copy_from_slice(&1u16.to_le_bytes()); // size = MODEL_EQUIPPED
+        buf[0x2E] = 0x07; // face
+        buf[0x2F] = 0x03; // race
+        for (i, v) in [0xA001u16, 0xA002, 0xA003, 0xA004, 0xA005, 0xA006, 0xA007, 0xA008].iter().enumerate() {
+            buf[0x30 + 2 * i..0x32 + 2 * i].copy_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(
+            LookData::decode_char_npc(&buf),
+            Some(LookData::Equipped {
+                face: 0x07,
+                race: 0x03,
+                head: 0xA001,
+                body: 0xA002,
+                hands: 0xA003,
+                legs: 0xA004,
+                feet: 0xA005,
+                main: 0xA006,
+                sub: 0xA007,
+                ranged: 0xA008,
+            })
+        );
+    }
+
+    /// Truncated body (no room for the size sentinel) returns None
+    /// instead of panicking.
+    #[test]
+    fn look_data_truncated_returns_none() {
+        let buf = vec![0u8; 0x20];
+        assert_eq!(LookData::decode_char_npc(&buf), None);
+    }
+
+    /// Unknown MODELTYPE sentinel returns None so the caller leaves
+    /// look = None rather than fabricating a model.
+    #[test]
+    fn look_data_unknown_sentinel_returns_none() {
+        let mut buf = vec![0u8; 0x40];
+        buf[0x2C..0x2E].copy_from_slice(&0x00FFu16.to_le_bytes());
+        assert_eq!(LookData::decode_char_npc(&buf), None);
+    }
 
     #[test]
     fn pos_head_minimal_decode() {

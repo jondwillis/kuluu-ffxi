@@ -201,25 +201,19 @@ pub enum PassiveCursorFocus {
     Chat,
 }
 
-/// Passive-cursor state. `chat_scroll` is in *row units* (one ChatLine
-/// per unit), not visual lines — once Stage 4's text wrapping lands, a
-/// long wrapped message still counts as one scroll tick. Keeping the
-/// math row-based avoids needing to inspect post-layout heights.
-///
-/// `0` means "newest message at the bottom of the panel" (default
-/// behavior, scrolled to the latest); higher values walk older
-/// messages into the visible window.
+/// Passive-cursor state. The chat-scroll offset itself lives in the
+/// stand-alone [`crate::hud::chat_panel::ChatScroll`] resource so that
+/// mouse-wheel scrolling can drive it from any mode — not just while
+/// PassiveCursor is active. This struct is now just a focus marker.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PassiveCursorState {
     pub focus: PassiveCursorFocus,
-    pub chat_scroll: usize,
 }
 
 impl PassiveCursorState {
     pub fn fresh_chat() -> Self {
         Self {
             focus: PassiveCursorFocus::Chat,
-            chat_scroll: 0,
         }
     }
 }

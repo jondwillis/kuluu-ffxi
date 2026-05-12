@@ -38,6 +38,7 @@ use ffxi_viewer_core::{
 };
 use ffxi_viewer_core::dat_mmb::LoadMmbRequest;
 use ffxi_viewer_core::dat_mzb::LoadMzbRequest;
+use ffxi_viewer_core::hud::chat_panel::ChatScroll;
 use tokio::sync::mpsc::Sender;
 
 use crate::keybinds_store::KeybindsStateRes;
@@ -71,6 +72,13 @@ pub fn text_input_system(
     mut load_mmb_tx: MessageWriter<LoadMmbRequest>,
     // Same shape for `/load_mzb` — zone mesh-library overlay.
     mut load_mzb_tx: MessageWriter<LoadMzbRequest>,
+    // Operator-tunable cull distances. `/drawdistance` mutates these
+    // and the dat_mzb cull / entity cull systems read them next frame.
+    mut draw_distance: ResMut<ffxi_viewer_core::dat_mzb::DrawDistance>,
+    // Chat-panel scroll offset, mutated by PassiveCursor arrow/PageUp
+    // keys here and by the wheel system in `hud::chat_panel`. Single
+    // source of truth so both inputs stay in sync.
+    mut chat_scroll: ResMut<ChatScroll>,
 ) {
     // Snapshot the inputs we need from the scene before mutating it
     // below (clones are cheap relative to the per-keystroke event
@@ -135,6 +143,7 @@ pub fn text_input_system(
                     session_event_tx.as_deref(),
                     &mut load_mmb_tx,
                     &mut load_mzb_tx,
+                    &mut draw_distance,
                 );
             }
             InputMode::Menu(stack) => {
@@ -173,10 +182,13 @@ pub fn text_input_system(
                     *mode = next;
                 }
             }
-            InputMode::PassiveCursor(state) => {
-                if let Some(next) =
-                    handle_passive_cursor_key(&ev.logical_key, &bindings, state, &scene_state)
-                {
+            InputMode::PassiveCursor(_state) => {
+                if let Some(next) = handle_passive_cursor_key(
+                    &ev.logical_key,
+                    &bindings,
+                    &mut chat_scroll,
+                    &scene_state,
+                ) {
                     *mode = next;
                 }
             }
@@ -353,6 +365,7 @@ fn apply_chat_action(
     session_event_tx: Option<&super::SessionEventTx>,
     load_mmb_tx: &mut MessageWriter<LoadMmbRequest>,
     load_mzb_tx: &mut MessageWriter<LoadMzbRequest>,
+    draw_distance: &mut ffxi_viewer_core::dat_mzb::DrawDistance,
 ) {
     match action {
         ChatAction::Stay => {}
@@ -409,6 +422,7 @@ fn apply_chat_action(
                     session_event_tx,
                     load_mmb_tx,
                     load_mzb_tx,
+                    draw_distance,
                 );
             } else {
                 // Default channel: Say. Tracing makes it visible whether the
@@ -453,6 +467,7 @@ fn apply_slash_outcome(
     session_event_tx: Option<&super::SessionEventTx>,
     load_mmb_tx: &mut MessageWriter<LoadMmbRequest>,
     load_mzb_tx: &mut MessageWriter<LoadMzbRequest>,
+    draw_distance: &mut ffxi_viewer_core::dat_mzb::DrawDistance,
 ) {
     match outcome {
         SlashOutcome::Command(cmd) => {
@@ -465,6 +480,21 @@ fn apply_slash_outcome(
                     scene_state,
                     format!("command dropped (channel issue): {e}"),
                 );
+            }
+        }
+        SlashOutcome::Commands(cmds) => {
+            // Order-sensitive: e.g. `/logout` → [ReqLogout, Heal On], and
+            // we want the wire flush of ReqLogout to land first so the
+            // 30s server timer arms even if the channel back-pressures
+            // and Heal silently drops. Each drop is reported
+            // individually with the same toast Command uses.
+            for cmd in cmds {
+                if let Err(e) = cmd_tx.try_send(cmd) {
+                    push_system_chat_line(
+                        scene_state,
+                        format!("command dropped (channel issue): {e}"),
+                    );
+                }
             }
         }
         SlashOutcome::SetTarget(id) => {
@@ -515,6 +545,34 @@ fn apply_slash_outcome(
                 scene_state,
                 format!("/load_mmb {file_id} {chunk_idx}: spawning…"),
             );
+        }
+        SlashOutcome::SetDrawDistance(op) => {
+            use super::slash_commands::DrawDistanceOp;
+            match op {
+                DrawDistanceOp::Show => {
+                    push_system_chat_line(
+                        scene_state,
+                        format!(
+                            "/drawdistance world={:.0} mob={:.0} (yalms)",
+                            draw_distance.world, draw_distance.mob
+                        ),
+                    );
+                }
+                DrawDistanceOp::SetWorld(v) => {
+                    draw_distance.world = v;
+                    push_system_chat_line(
+                        scene_state,
+                        format!("/drawdistance: setworld {v:.0} yalms"),
+                    );
+                }
+                DrawDistanceOp::SetMob(v) => {
+                    draw_distance.mob = v;
+                    push_system_chat_line(
+                        scene_state,
+                        format!("/drawdistance: setmob {v:.0} yalms"),
+                    );
+                }
+            }
         }
         SlashOutcome::LoadMzb {
             file_id,
@@ -1194,13 +1252,12 @@ fn handle_quick_action_key(
 /// ChatLine per tick), so the math is independent of any wrapping
 /// done at render time.
 ///
-/// `chat_buffer_len` is the number of rendered chat rows currently
-/// available — the handler clamps `chat_scroll` so we don't scroll past
-/// the oldest line into empty space.
+/// `chat_scroll` is the shared resource — also driven by the mouse-wheel
+/// system in `hud::chat_panel`, so keyboard and wheel never disagree.
 fn handle_passive_cursor_key(
     key: &Key,
     bindings: &Bindings,
-    state: &mut PassiveCursorState,
+    chat_scroll: &mut ChatScroll,
     scene_state: &SceneState,
 ) -> Option<InputMode> {
     // Number of available rows we can scroll back through, clamped at
@@ -1211,24 +1268,24 @@ fn handle_passive_cursor_key(
 
     if bindings.matches_logical(Action::NavUp, key) {
         // Scroll one older line into view (saturating at the oldest).
-        if state.chat_scroll + 1 < max_back {
-            state.chat_scroll += 1;
+        if chat_scroll.rows + 1 < max_back {
+            chat_scroll.rows += 1;
         }
         return None;
     }
     if bindings.matches_logical(Action::NavDown, key) {
         // Scroll one newer line into view (saturating at the newest).
-        state.chat_scroll = state.chat_scroll.saturating_sub(1);
+        chat_scroll.rows = chat_scroll.rows.saturating_sub(1);
         return None;
     }
     if bindings.matches_logical(Action::PageUp, key) {
         // 8 = chat_panel::VISIBLE_ROWS; one full page back, clamped.
-        let next = state.chat_scroll.saturating_add(8);
-        state.chat_scroll = next.min(max_back.saturating_sub(1));
+        let next = chat_scroll.rows.saturating_add(8);
+        chat_scroll.rows = next.min(max_back.saturating_sub(1));
         return None;
     }
     if bindings.matches_logical(Action::PageDown, key) {
-        state.chat_scroll = state.chat_scroll.saturating_sub(8);
+        chat_scroll.rows = chat_scroll.rows.saturating_sub(8);
         return None;
     }
     if bindings.matches_logical(Action::NavCancel, key) {

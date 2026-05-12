@@ -75,6 +75,14 @@ impl Plugin for HudPlugin {
         // sidesteps the `Commands` queue lag — without this, the first
         // Update tick after `OnEnter(InGame)` panics on missing resource.
         app.init_resource::<zone_flash::ZoneFlashState>();
+        // Mouse-wheel scroll for the chat panel. Runs in `PreUpdate`
+        // after `collect_mouse_system` so it can zero `MousePointer.wheel`
+        // on consume — that's how camera-zoom is kept from double-firing
+        // on the same physical wheel notch.
+        app.add_systems(
+            bevy::app::PreUpdate,
+            chat_panel::chat_wheel_scroll_system.after(crate::mouse::collect_mouse_system),
+        );
         app.add_systems(
             Update,
             (

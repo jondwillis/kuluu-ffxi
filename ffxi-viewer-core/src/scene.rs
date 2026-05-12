@@ -22,9 +22,18 @@ use crate::components::{IsSelf, Nameplate, WorldEntity};
 use crate::snapshot::SceneState;
 
 /// Map a wire-side FFXI position to a Bevy world position.
+///
+/// FFXI is Y-down (height grows toward negative Z when laid out in
+/// the client's native frame). Bevy is Y-up. The transform is
+/// therefore `Bevy = (x, -z, -y)`: negate Z for the up-axis sign,
+/// negate Y for Z-handedness. Empirically the previous `(x, z, -y)`
+/// rendered the whole world upside-down — buildings, navmesh and
+/// entities all share this convention so the fix applies in lockstep
+/// at all three coordinate-conversion sites (here, `dat_mzb.rs`,
+/// `navmesh_overlay.rs::detour_to_bevy`).
 #[inline]
 pub fn ffxi_to_bevy(p: WireVec3) -> Vec3 {
-    Vec3::new(p.x, p.z, -p.y)
+    Vec3::new(p.x, -p.z, -p.y)
 }
 
 /// Vertical distance from an entity's `transform.y` (the mesh center)

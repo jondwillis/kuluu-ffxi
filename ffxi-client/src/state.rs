@@ -181,6 +181,14 @@ pub struct Entity {
     /// renderers can pick the right animation play rate.
     #[serde(default)]
     pub speed_base: u8,
+    /// Decoded model selector from CHAR_NPC / CHAR_PC (LSB's
+    /// `MODELTYPE`). Drives MMB lookup in the viewer; `None` until a
+    /// look-bearing packet for this entity has been received. Carried
+    /// as `ffxi_proto::decode::LookData` (no serde) — the wire-side
+    /// `EntityLook` mirror gets built in `wire_translate` so this
+    /// crate doesn't need a feature-gated viewer-wire dep here.
+    #[serde(skip)]
+    pub look: Option<ffxi_proto::decode::LookData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1869,6 +1877,23 @@ mod tests {
             hp_pct: None,
         });
         assert!(s.entities.is_empty());
+    }
+
+    #[test]
+    fn heal_command_roundtrip() {
+        // MCP / agent harness sends Heal commands as JSON lines, so the
+        // snake_case-tagged enum needs to deserialize each mode cleanly.
+        for (line, expect) in [
+            (r#"{"cmd":"heal","mode":"toggle"}"#, HealMode::Toggle),
+            (r#"{"cmd":"heal","mode":"on"}"#, HealMode::On),
+            (r#"{"cmd":"heal","mode":"off"}"#, HealMode::Off),
+        ] {
+            let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+            match cmd {
+                AgentCommand::Heal { mode } => assert_eq!(mode, expect, "for line {line}"),
+                _ => panic!("wrong variant for {line}: {cmd:?}"),
+            }
+        }
     }
 
     #[test]

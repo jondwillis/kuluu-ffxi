@@ -153,11 +153,16 @@ pub fn handle_input_system(
                 request_quit(&cmd_tx, &log_tx, &mut exit);
             }
             KeyCode::Tab => {
-                target.id = next_target_by_distance(
-                    &snapshot.0.entities,
-                    snapshot.0.self_pos.pos,
-                    target.id,
-                );
+                // `self_pos` was collapsed into the entity list — derive
+                // self position from `self_position()` (Stage 5 refactor).
+                // Default to origin if char_id isn't resolved yet; Tab on
+                // a not-yet-seeded self entity is rare and harmless.
+                let from = snapshot
+                    .0
+                    .self_position()
+                    .map(|p| p.pos)
+                    .unwrap_or_default();
+                target.id = next_target_by_distance(&snapshot.0.entities, from, target.id);
             }
             KeyCode::Char('l') | KeyCode::Char('L') => {
                 // Flip the shared filter flag the tokio feeder reads
@@ -286,12 +291,18 @@ fn send_movement(
     if forward == 0 && rotate == 0 {
         return;
     }
-    let mut heading = state.self_pos.heading;
+    // `self_pos` is now derived from the self-entity in `state.entities`
+    // (`SessionState::self_position`). Bail if we haven't seen our own
+    // entity yet — sending Move with a stale origin would teleport.
+    let Some(self_pos) = state.self_position() else {
+        return;
+    };
+    let mut heading = self_pos.heading;
     if rotate != 0 {
         let delta = (rotate_step as i32 * rotate).rem_euclid(256) as u8;
-        heading = state.self_pos.heading.wrapping_add(delta);
+        heading = self_pos.heading.wrapping_add(delta);
     }
-    let (mut x, mut y) = (state.self_pos.pos.x, state.self_pos.pos.y);
+    let (mut x, mut y) = (self_pos.pos.x, self_pos.pos.y);
     if forward != 0 {
         let (fx, fy) = heading_to_forward(heading);
         let dist = move_step * forward as f32;
@@ -301,7 +312,7 @@ fn send_movement(
     let cmd = AgentCommand::Move {
         x,
         y,
-        z: state.self_pos.pos.z,
+        z: self_pos.pos.z,
         heading,
     };
     let _ = cmd_tx.0.try_send(cmd.clone());

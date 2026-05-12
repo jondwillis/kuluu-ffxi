@@ -17,16 +17,37 @@
 //! visible rows with the most recent N chat lines (newest at the bottom).
 //! Avoids spawn-despawn churn at 60 Hz.
 
+use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 use ffxi_viewer_wire::{ChatChannel, ChatLine};
 
 use crate::hud::palette;
 use crate::input_mode::{InputMode, PassiveCursorFocus};
+use crate::mouse::MousePointer;
 use crate::snapshot::{rendered_chat, SceneState};
 
 /// Number of chat rows visible at once. Matches what fits in the panel
 /// height at the default font size.
 pub const VISIBLE_ROWS: usize = 8;
+
+/// Number of rows to advance per mouse-wheel notch. Three rows feels
+/// close to a typical browser/Discord wheel tick; PageUp/PageDown still
+/// jumps `VISIBLE_ROWS` so the keyboard path is unchanged.
+const WHEEL_ROWS_PER_NOTCH: usize = 3;
+
+/// Chat-panel scroll offset in row units (one [`ChatLine`] per unit).
+/// `0` = newest message pinned to the bottom (default tailing behavior);
+/// higher values walk older messages into the visible window.
+///
+/// Lives as a free-standing resource (not inside `PassiveCursorState`)
+/// so mouse-wheel can drive it in any [`InputMode`]. Keyboard
+/// PassiveCursor handlers and the wheel system both mutate it; the
+/// chat panel render reads it unconditionally.
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct ChatScroll {
+    pub rows: usize,
+}
 
 /// Marker on the panel root.
 #[derive(Component)]
@@ -123,6 +144,7 @@ pub fn spawn_chat_panel(mut commands: Commands) {
 pub fn update_chat_panel(
     state: Res<SceneState>,
     mode: Res<InputMode>,
+    scroll: Res<ChatScroll>,
     mut panel_q: Query<&mut BorderColor, With<ChatPanel>>,
     rows: Query<(&ChatRow, &Children)>,
     mut body_q: Query<(&mut Text, &mut TextColor), With<ChatRowBody>>,
@@ -137,16 +159,11 @@ pub fn update_chat_panel(
     // the per-frame cost trivial when nothing actually changed.
     let chat = rendered_chat(&state);
 
-    // PassiveCursor with focus on Chat shifts the visible window back
-    // by `chat_scroll` rows. The handler clamps `chat_scroll` against
-    // the buffer length, so we can trust it here. World / other modes
-    // always render the latest tail of the buffer.
-    let scroll_offset = match &*mode {
-        InputMode::PassiveCursor(s) if matches!(s.focus, PassiveCursorFocus::Chat) => {
-            s.chat_scroll
-        }
-        _ => 0,
-    };
+    // Scroll offset lives in the `ChatScroll` resource so mouse-wheel
+    // (any mode) and PassiveCursor keys both drive the same value.
+    // Writers clamp against `rendered_chat(state).len()`, so we trust
+    // the value here.
+    let scroll_offset = scroll.rows;
     let chat_focused = scroll_offset != 0
         || matches!(
             &*mode,
@@ -261,6 +278,75 @@ pub fn channel_color(c: ChatChannel) -> Color {
     }
 }
 
+/// Compute new `ChatScroll.rows` given a wheel delta and the current
+/// buffer length. Pure logic, no Bevy types — extracted so the
+/// clamping math can be unit-tested without spinning up a `World`.
+///
+/// `delta` is summed `MouseWheel.y` for the frame; positive = scroll
+/// up (older content), negative = scroll down (newer). The clamp
+/// keeps the offset within `0..buffer_len-1` so we never scroll past
+/// the oldest line into empty space.
+pub fn apply_wheel_delta(current: usize, delta: f32, buffer_len: usize) -> usize {
+    if delta == 0.0 || buffer_len == 0 {
+        return current;
+    }
+    let steps = (delta.abs().ceil() as usize).saturating_mul(WHEEL_ROWS_PER_NOTCH);
+    if delta > 0.0 {
+        current
+            .saturating_add(steps)
+            .min(buffer_len.saturating_sub(1))
+    } else {
+        current.saturating_sub(steps)
+    }
+}
+
+/// Mouse-wheel-over-chat-panel → scroll the chat log. Runs in
+/// `PreUpdate` after `collect_mouse_system` so we can zero
+/// `MousePointer.wheel` when we consume a notch, suppressing the
+/// camera-zoom double-fire that would otherwise happen on the same
+/// physical wheel event.
+///
+/// Hit test: cursor must be inside the chat-panel rect (computed from
+/// `ComputedNode.size` + `GlobalTransform.translation()`). Outside the
+/// rect the wheel passes through to camera zoom unchanged.
+pub fn chat_wheel_scroll_system(
+    mut wheel: MessageReader<MouseWheel>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    panel_q: Query<(&ComputedNode, &GlobalTransform), With<ChatPanel>>,
+    state: Res<SceneState>,
+    mut scroll: ResMut<ChatScroll>,
+    mut pointer: ResMut<MousePointer>,
+) {
+    let mut delta: f32 = 0.0;
+    for ev in wheel.read() {
+        delta += ev.y;
+    }
+    if delta == 0.0 {
+        return;
+    }
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let Ok((node, gt)) = panel_q.single() else {
+        return;
+    };
+    let size = node.size();
+    let center = gt.translation().truncate();
+    let half = size * 0.5;
+    let min = center - half;
+    let max = center + half;
+    if cursor.x < min.x || cursor.x > max.x || cursor.y < min.y || cursor.y > max.y {
+        return;
+    }
+    let buffer_len = rendered_chat(&state).len();
+    scroll.rows = apply_wheel_delta(scroll.rows, delta, buffer_len);
+    // Suppress camera zoom on the same wheel event.
+    pointer.wheel = 0.0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +415,41 @@ mod tests {
     #[test]
     fn empty_text_still_renders_sender_layout() {
         assert_eq!(format_chat_line(ChatChannel::Say, "Daisy", ""), "Daisy : ");
+    }
+
+    // --- chat-scroll wheel math --------------------------------------
+
+    #[test]
+    fn wheel_up_advances_by_three_per_notch() {
+        // One notch up from rest with a large buffer: cursor moves up
+        // WHEEL_ROWS_PER_NOTCH rows.
+        assert_eq!(apply_wheel_delta(0, 1.0, 100), 3);
+    }
+
+    #[test]
+    fn wheel_down_at_bottom_stays_at_bottom() {
+        // Already at newest (rows = 0); a down-notch saturates.
+        assert_eq!(apply_wheel_delta(0, -1.0, 100), 0);
+    }
+
+    #[test]
+    fn wheel_up_clamps_at_oldest() {
+        // Buffer of 5 lines → max meaningful offset is 4 (oldest line at
+        // the top of the visible window).
+        assert_eq!(apply_wheel_delta(3, 1.0, 5), 4);
+    }
+
+    #[test]
+    fn empty_buffer_is_noop() {
+        // No lines yet → wheel does nothing regardless of direction.
+        assert_eq!(apply_wheel_delta(0, 1.0, 0), 0);
+        assert_eq!(apply_wheel_delta(0, -1.0, 0), 0);
+    }
+
+    #[test]
+    fn fractional_notch_rounds_up() {
+        // Trackpads emit fractional wheel deltas (e.g. 0.4); a single
+        // gentle scroll should still register one notch worth.
+        assert_eq!(apply_wheel_delta(0, 0.4, 100), 3);
     }
 }

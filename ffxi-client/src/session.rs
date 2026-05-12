@@ -546,6 +546,10 @@ fn handle_sub_packet(
                             claim_id: 0,
                             speed: head.speed,
                             speed_base: head.speed_base,
+                            // LOGIN packet doesn't carry a look block for
+                            // self — CHAR_PC fills this in later when
+                            // SendFlg.Name happens to be set.
+                            look: None,
                         },
                     });
                     // Mirror to legacy `state.self_pos` so the fallback
@@ -637,6 +641,15 @@ fn handle_sub_packet(
                 // reducer treats `None` as "leave existing untouched."
                 let send_flag = sub.data.get(6).copied().unwrap_or(0);
                 let hp_pct = (send_flag & 0x04 != 0).then_some(head.hpp);
+                // Look data — CHAR_NPC carries it at body[0x2C..]. CHAR_PC's
+                // GrapIDTbl layout is different (race-packed modelid + 8 gear
+                // slots XOR'd with 0xN000 masks) and not yet decoded; PCs
+                // stay as capsules until that lands.
+                let look = if op == s2c::CHAR_NPC {
+                    decode::LookData::decode_char_npc(sub.data)
+                } else {
+                    None
+                };
                 let _ = event_tx.send(AgentEvent::EntityUpserted {
                     entity: Entity {
                         id: head.unique_no,
@@ -654,6 +667,7 @@ fn handle_sub_packet(
                         claim_id,
                         speed: head.speed,
                         speed_base: head.speed_base,
+                        look,
                     },
                 });
             }
@@ -2742,6 +2756,34 @@ mod tests {
         assert!(decode_event_0x032(&[0u8; 15]).is_none());
         assert!(decode_event_0x033(&[0u8; 107]).is_none());
         assert!(decode_event_0x034(&[0u8; 47]).is_none());
+    }
+
+    #[test]
+    fn camp_packet_layout_matches_server_struct() {
+        // Layout per vendor/server/src/map/packets/c2s/0x0e8_camp.h:
+        //   uint32_t Mode    // 0=Toggle, 1=On, 2=Off
+        // Sub-packet header (4 bytes) is 0x0E8 opcode + size_words=2 + sync.
+        for (mode, want) in [
+            (HealMode::Toggle, 0u32),
+            (HealMode::On, 1),
+            (HealMode::Off, 2),
+        ] {
+            let buf = build_subpacket_camp(0xBEEF, mode);
+            assert_eq!(buf.len(), 8, "header (4) + body (4)");
+            let hdr_word = u16::from_le_bytes([buf[0], buf[1]]);
+            assert_eq!(hdr_word & 0x01FF, 0x0E8, "opcode in low 9 bits");
+            assert_eq!((hdr_word >> 9) & 0x7F, 2, "size_words=2");
+            assert_eq!(
+                u16::from_le_bytes([buf[2], buf[3]]),
+                0xBEEF,
+                "sync echoed in header"
+            );
+            assert_eq!(
+                u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+                want,
+                "Mode LE for {mode:?}"
+            );
+        }
     }
 
     #[test]
