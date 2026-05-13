@@ -1,7 +1,7 @@
-//! Heads-up display: thin Bevy UI tree mirroring the chrome aesthetic of
-//! `ffxi-client/src/chrome.rs`. We re-implement the look in Bevy UI rather
-//! than importing chrome.rs because chrome.rs is owned by the parallel
-//! session and is in the no-touch list.
+//! Heads-up display: thin Bevy UI tree carrying the visual language the
+//! Bevy native viewer uses for session state. (Historical: the layout was
+//! first prototyped in `ffxi-client/src/chrome.rs` for the now-removed
+//! ratatui TUI subcommand; this is the canonical implementation now.)
 //!
 //! Layout (Stage 0c — only `stage_bar` is wired today; rest land in 0d):
 //!

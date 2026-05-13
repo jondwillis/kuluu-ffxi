@@ -6,7 +6,6 @@ pub mod agent_io;
 #[cfg(unix)]
 pub mod agent_socket;
 pub mod auth_client;
-pub mod chrome;
 pub mod goal_store;
 // Depends on ffxi-viewer-core (`Action`, `Bindings`, `Preset`), which is
 // only pulled in when the native-window feature is on.
@@ -38,9 +37,9 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 /// Bundled handles for a running session, with the broadcast→watch event
-/// folder already wired. Both the ratatui TUI and the Bevy 3D view consume
-/// this — the only difference between them is which renderer subscribes to
-/// `state_rx`.
+/// folder already wired. The Bevy native viewer and headless agent paths
+/// both consume this — the only difference between them is which consumer
+/// subscribes to `state_rx`.
 ///
 /// Drop semantics: dropping `cmd_tx` and the original `state_rx` will let
 /// the session actor finish naturally on its next channel-closed check.

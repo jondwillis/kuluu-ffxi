@@ -608,14 +608,6 @@ fn heading_to_quat(heading: u8) -> Quat {
     Quat::from_rotation_y(angle)
 }
 
-fn color_material(color: Color) -> StandardMaterial {
-    StandardMaterial {
-        base_color: color,
-        perceptual_roughness: 0.85,
-        ..default()
-    }
-}
-
 /// HP bar color: green at 100%, yellow at 50%, red at 0%.
 fn hp_color(pct: Option<u8>) -> Color {
     let frac = pct.unwrap_or(100) as f32 / 100.0;

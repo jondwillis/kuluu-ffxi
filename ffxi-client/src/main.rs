@@ -1,9 +1,7 @@
-//! FFXI CLI/TUI client — entry point.
+//! FFXI agent-driven client — entry point.
 
 use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session};
-#[cfg(feature = "tui")]
-use ffxi_client::{spawn_session, SessionHandle};
-#[cfg(any(feature = "tui", feature = "native-window", feature = "relay"))]
+#[cfg(any(feature = "native-window", feature = "relay"))]
 use ffxi_client::state;
 // Re-import the lib-level relay/wire_translate at the binary crate root
 // so that submodules under main.rs can keep referring to them via
@@ -18,8 +16,6 @@ use ffxi_client::wire_translate;
 #[cfg(feature = "relay")]
 use ffxi_client::relay;
 mod launcher;
-#[cfg(feature = "tui")]
-mod view3d;
 #[cfg(feature = "native-window")]
 mod view_native;
 
@@ -138,22 +134,6 @@ enum Command {
         password: Option<String>,
         char_name: Option<String>,
     },
-    /// Same session as `Play`, but renders a Bevy-driven 3D operator
-    /// dashboard into the terminal via `bevy_ratatui_camera`. Press `q`,
-    /// `Esc`, or `Ctrl+C` to disconnect cleanly.
-    ///
-    /// All three positional args are optional; when any are missing, the
-    /// command drops into an interactive launcher (see `launcher.rs`)
-    /// that prompts for credentials, lists characters on the account,
-    /// and lets you pick one before entering the TUI's alt-screen mode.
-    /// The numeric charid is resolved by name against the lobby's
-    /// character list — agents and humans don't need to know it.
-    #[cfg(feature = "tui")]
-    Tui {
-        user: Option<String>,
-        password: Option<String>,
-        char_name: Option<String>,
-    },
     /// Same session as `Play`, but renders into a real native OS window
     /// via `bevy_winit` (no terminal involved). Esc to disconnect.
     ///
@@ -179,33 +159,14 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Logs go to stderr by default (so stdout stays clean for `play`'s
-    // JSON-line event stream). `tui` enters alt-screen mode (Bevy +
-    // RatatuiPlugins own the terminal) so its logs route to a file
-    // instead. `native` opens its own OS window and leaves the launching
-    // terminal alone, so stderr is fine.
+    // JSON-line event stream). `native` opens its own OS window and
+    // leaves the launching terminal alone, so stderr is fine there too.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    #[cfg(feature = "tui")]
-    let is_tui = matches!(args.command, Command::Tui { .. });
-    #[cfg(not(feature = "tui"))]
-    let is_tui = false;
-    if is_tui {
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/ffxi-client.log")
-            .context("opening /tmp/ffxi-client.log for tui logs")?;
-        tracing_subscriber::fmt()
-            .with_writer(std::sync::Mutex::new(log_file))
-            .with_ansi(false)
-            .with_env_filter(env_filter)
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(env_filter)
-            .init();
-    }
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(env_filter)
+        .init();
 
     let auth = auth_client::AuthClient::new(args.server.clone(), args.auth_port);
 
@@ -660,194 +621,6 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                 r = session_task => r??,
                 r = agent_task => r??,
             }
-        }
-        #[cfg(feature = "tui")]
-        Command::Tui {
-            user,
-            password,
-            char_name,
-        } => {
-            let dat_root = resolve_dat_root(args.require_dat)?;
-            let lobby = lobby_client::LobbyClient::new(
-                args.server.clone(),
-                args.data_port,
-                args.view_port,
-            );
-
-            // Direct mode: all three CLI args present → log in, open the
-            // lobby (which fetches the char list), resolve name → charid,
-            // run the lobby select on the same handle. Else hand off to
-            // the interactive launcher with whatever we *do* have as
-            // defaults. Both paths complete the lobby flow *before*
-            // entering alt-screen so errors surface cleanly to stderr,
-            // and both pass the resulting `InitialState` through to
-            // `session::run` so it skips auth + lobby entirely.
-            let (user, password, char_id, _char_name, initial_state) =
-                match (user, password, char_name) {
-                    (Some(u), Some(p), Some(name)) => {
-                        let session = auth
-                            .login(&u, &p)
-                            .await
-                            .context("auth precheck (tui direct mode)")?;
-                        let handle = lobby
-                            .open(&session)
-                            .await
-                            .context("opening lobby (tui direct mode)")?;
-                        let slot = handle
-                            .chars()
-                            .iter()
-                            .find(|c| c.name == name)
-                            .cloned()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "no character named '{name}' on account '{u}' (have: {:?})",
-                                    handle
-                                        .chars()
-                                        .iter()
-                                        .map(|c| c.name.as_str())
-                                        .collect::<Vec<_>>()
-                                )
-                            })?;
-                        let mut key3 = [0u8; 20];
-                        for (i, b) in key3.iter_mut().enumerate() {
-                            *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
-                        }
-                        let handoff = handle
-                            .select(slot.char_id, &slot.name, key3)
-                            .await
-                            .context("lobby select (tui direct mode)")?;
-                        let initial_state = session::InitialState {
-                            auth: session,
-                            handoff,
-                            key3,
-                        };
-                        (u, p, slot.char_id, slot.name, initial_state)
-                    }
-                    (u, p, n) => {
-                        let defaults = launcher::Defaults {
-                            user: u,
-                            password: p,
-                            char_name: n,
-                        };
-                        let sel = launcher::run(&args.server, &auth, &lobby, defaults)
-                            .await
-                            .context("interactive launcher")?;
-                        (
-                            sel.user,
-                            sel.password,
-                            sel.char_id,
-                            sel.char_name,
-                            sel.initial_state,
-                        )
-                    }
-                };
-
-            let cfg = session::Config {
-                server: args.server.clone(),
-                map_host_override: args.map_host_override.clone(),
-                auth_port: args.auth_port,
-                data_port: args.data_port,
-                view_port: args.view_port,
-                user,
-                password,
-                char_selection: session::CharSelection::Id(char_id),
-                initial_state: Some(initial_state),
-                // The TUI / `play` paths run an attended session; the
-                // operator can issue `EndEvent` themselves, so don't
-                // auto-flush.
-                user_driven_events: true,
-                dat_root: dat_root.clone(),
-            };
-            let SessionHandle {
-                state_rx,
-                cmd_tx,
-                event_tx,
-                session_task,
-                folder_task,
-            } = spawn_session(cfg);
-
-            // JSON event/command log: tokio task subscribes to the broadcast
-            // and feeds an unbounded mpsc; Bevy drains it each frame. The
-            // shared `show_all` flag is flipped by the `L` key in the input
-            // handler — the feeder reads it before pushing each event so the
-            // ring buffer doesn't fill with Position spam unless asked.
-            let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
-            let show_all = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let log_feeder = tokio::spawn({
-                let mut event_rx = event_tx.subscribe();
-                let log_tx = log_tx.clone();
-                let show_all = show_all.clone();
-                async move {
-                    while let Ok(ev) = event_rx.recv().await {
-                        let suppress = !show_all.load(std::sync::atomic::Ordering::Relaxed)
-                            && matches!(
-                                &ev,
-                                state::AgentEvent::PositionChanged { .. }
-                                    | state::AgentEvent::Diagnostics { .. }
-                            );
-                        if suppress {
-                            continue;
-                        }
-                        if let Ok(json) = serde_json::to_string(&ev) {
-                            if log_tx.send(format!("→ {json}")).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-
-            // Bevy owns its loop; park it on the blocking pool so the
-            // tokio runtime keeps draining session/folder tasks.
-            let mut view_task = tokio::task::spawn_blocking({
-                let state_rx = state_rx.clone();
-                let cmd_tx = cmd_tx.clone();
-                let log_tx = log_tx.clone();
-                let show_all = show_all.clone();
-                move || view3d::run(state_rx, cmd_tx, log_rx, log_tx, show_all)
-            });
-            let mut session_task = session_task;
-
-            // Whichever side finishes first triggers shutdown of the other.
-            // - View exits first (q/Esc/Ctrl+C) → input handler already sent
-            //   `AgentCommand::Disconnect`; give the session 2s to drain its
-            //   shutdown sequence then force-abort if it's stuck.
-            // - Session exits first (server disconnect) → no clean way to
-            //   tell the Bevy app; abort the view task.
-            let outcome: Result<()> = tokio::select! {
-                r = &mut session_task => {
-                    view_task.abort();
-                    let _ = (&mut view_task).await;
-                    r?.context("session task")
-                }
-                r = &mut view_task => {
-                    let view_result = r?.context("view task");
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        &mut session_task,
-                    ).await {
-                        Ok(_) => {}
-                        Err(_) => session_task.abort(),
-                    }
-                    view_result
-                }
-            };
-
-            // Folder + log_feeder are blocked on `event_rx.recv()`, which
-            // only returns `Closed` when *every* broadcast sender drops.
-            // session::run's clone is gone by now, but `event_tx` here in
-            // main outlives the select! above — drop it explicitly so the
-            // receivers wake up. Without this, `q` hangs the process.
-            drop(event_tx);
-            let _ = folder_task.await;
-            let _ = log_feeder.await;
-
-            // Best-effort terminal restore — RatatuiPlugins owns teardown
-            // but a panic mid-render could leave us in raw-mode hell.
-            let _ = crossterm::terminal::disable_raw_mode();
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-
-            outcome?;
         }
         #[cfg(feature = "native-window")]
         Command::Native { .. } => {

@@ -14,15 +14,10 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Enable the Bevy-driven 3D terminal dashboard (`tui` subcommand).
-# Without this feature, only the `play` subcommand (JSON-line agent mode)
-# is compiled — significantly faster compile times.
-tui = ["dep:crossterm", "dep:bevy", "dep:bevy_ratatui", "dep:bevy_ratatui_camera"]
-# Enable the native windowed viewer (`native` subcommand). Distinct from
-# `tui`: opens a real OS window via bevy_winit; consumes the same in-process
-# state stream. Bevy's winit event loop must run on the OS main thread on
-# macOS, so main.rs handles the dispatch specially when this feature
-# is active.
+# Enable the native windowed viewer (`native` subcommand). Opens a real
+# OS window via bevy_winit. Bevy's winit event loop must run on the OS
+# main thread on macOS, so main.rs handles the dispatch specially when
+# this feature is active.
 native-window = ["dep:bevy", "dep:ffxi-viewer-core", "dep:ffxi-viewer-wire"]
 # Enable the WebSocket relay listener (`--relay-listen <addr>` global flag).
 # Publishes the same `ffxi-viewer-wire` frames the in-process bridge produces,
@@ -43,8 +38,6 @@ ffxi-dat = { path = "../ffxi-dat" }
 
 anyhow.workspace = true
 clap.workspace = true
-crossterm = { workspace = true, optional = true }
-ratatui.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true
@@ -56,8 +49,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 bevy = { workspace = true, optional = true }
-bevy_ratatui = { workspace = true, optional = true }
-bevy_ratatui_camera = { workspace = true, optional = true }
 
 ffxi-viewer-wire = { path = "../ffxi-viewer-wire", optional = true }
 ffxi-viewer-core = { path = "../ffxi-viewer-core", optional = true }
