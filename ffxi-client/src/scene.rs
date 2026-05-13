@@ -264,7 +264,7 @@ mod tests {
                 id: 42, act_index: 1, kind: EntityKind::Pc,
                 name: Some("Vanari".into()),
                 pos: Vec3::default(), heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0, speed: 0, speed_base: 0,
+                claim_id: 0, speed: 0, speed_base: 0, look: None,
             },
         });
         // Other PC.
@@ -273,7 +273,7 @@ mod tests {
                 id: 100, act_index: 2, kind: EntityKind::Pc,
                 name: Some("Stranger".into()),
                 pos: Vec3 { x: 5.0, y: 0.0, z: 0.0 }, heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0, speed: 0, speed_base: 0,
+                claim_id: 0, speed: 0, speed_base: 0, look: None,
             },
         });
         // NPC.
@@ -282,7 +282,7 @@ mod tests {
                 id: 200, act_index: 3, kind: EntityKind::Npc,
                 name: Some("Innkeeper".into()),
                 pos: Vec3::default(), heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0, speed: 0, speed_base: 0,
+                claim_id: 0, speed: 0, speed_base: 0, look: None,
             },
         });
         // Mob.
@@ -291,7 +291,7 @@ mod tests {
                 id: 300, act_index: 4, kind: EntityKind::Mob,
                 name: None,
                 pos: Vec3::default(), heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0, speed: 0, speed_base: 0,
+                claim_id: 0, speed: 0, speed_base: 0, look: None,
             },
         });
 

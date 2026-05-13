@@ -30,7 +30,15 @@ const MOUSE_YAW_SENS: f32 = 0.005;
 /// same angular rate.
 const MOUSE_PITCH_SENS: f32 = 0.005;
 /// One wheel notch shrinks/grows distance by this many Bevy units.
-const WHEEL_ZOOM_STEP: f32 = 1.0;
+/// macOS trackpads / Magic Mice fire many wheel events per gesture
+/// (often 30+ per swipe), so a step that feels right on a desktop
+/// scroll wheel (1.0 — once per click) saturates instantly on trackpad
+/// (single swipe → traverses the full DIST_MIN..DIST_MAX range,
+/// producing the binary in/out behavior the user reported). 0.25
+/// keeps the desktop feel acceptable (4 notches = 1 yalm of zoom)
+/// while spreading a trackpad swipe across a few yalms instead of
+/// the entire range.
+const WHEEL_ZOOM_STEP: f32 = 0.25;
 /// Closest the chase camera can pull in. Below ~3.0 the player capsule
 /// clips through the near plane; for closer-than-3 use FirstPerson.
 const DIST_MIN: f32 = 3.0;

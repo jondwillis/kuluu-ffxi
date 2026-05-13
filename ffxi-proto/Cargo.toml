@@ -7,8 +7,6 @@ description = "Protocol layer for the LSB/Phoenix FFXI private-server emulators.
 build = "build.rs"
 
 [dependencies]
-bytes.workspace = true
-flate2.workspace = true
 md-5.workspace = true
 thiserror.workspace = true
 

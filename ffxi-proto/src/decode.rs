@@ -341,6 +341,61 @@ impl LookData {
             _ => None,
         }
     }
+
+    /// Body offset of `GP_SERV_CHAR_PC.GrapIDTbl[0]` — packet-absolute
+    /// `0x48` minus the 4-byte sub-packet header. Derived from the same
+    /// struct layout that places `name` at body[0x56]: 0x56 - 18 bytes
+    /// of `GrapIDTbl[9]` = 0x44. See `try_extract_name`'s `CHAR_PC`
+    /// branch for the matching offset derivation.
+    pub const CHAR_PC_GRAP_OFFSET: usize = 0x44;
+
+    /// Decode the look block from a `CHAR_PC` (0x00D) body. PCs ship
+    /// their look in `GrapIDTbl[9]` rather than the `look_t` union —
+    /// slot 0 carries (face, race) and slots 1..=8 carry equipment
+    /// model ids XOR'd with a per-slot `0xN000` mask.
+    ///
+    /// Returns `None` when:
+    ///   - body is truncated before GrapIDTbl ends (body.len() < 0x44 + 18), or
+    ///   - GrapIDTbl[0] is 0 (server hasn't populated look yet — happens
+    ///     on initial CHAR_PC bursts before `SendFlg.Model` is set).
+    ///
+    /// Reference: `vendor/server/src/map/packets/char_update.cpp:374-401`
+    /// and `vendor/server/src/common/mmo.h:157-169`.
+    ///
+    /// Note: monstrosity / costume PCs reuse the `Equipped` variant on
+    /// the wire — slot 0 becomes `(race << 8 | costume_or_monstrosity_id)`
+    /// and slot 8 becomes 0xFFFF. We surface that identically to a
+    /// regular PC; downstream consumers can treat `ranged == 0x0FFF`
+    /// (post-mask `0xFFFF & 0x0FFF`) as a hint if needed.
+    pub fn decode_char_pc(body: &[u8]) -> Option<Self> {
+        let off = Self::CHAR_PC_GRAP_OFFSET;
+        if body.len() < off + 18 {
+            return None;
+        }
+        let slot0 = u16::from_le_bytes([body[off], body[off + 1]]);
+        if slot0 == 0 {
+            return None;
+        }
+        let face = (slot0 & 0x00FF) as u8;
+        let race = ((slot0 >> 8) & 0x00FF) as u8;
+        // Strip the per-slot `0xN000` mask added at char_update.cpp:377-384.
+        let read_slot = |i: usize| -> u16 {
+            let p = off + 2 * i;
+            u16::from_le_bytes([body[p], body[p + 1]]) & 0x0FFF
+        };
+        Some(LookData::Equipped {
+            face,
+            race,
+            head: read_slot(1),
+            body: read_slot(2),
+            hands: read_slot(3),
+            legs: read_slot(4),
+            feet: read_slot(5),
+            main: read_slot(6),
+            sub: read_slot(7),
+            ranged: read_slot(8),
+        })
+    }
 }
 
 /// Server's `GP_SERV_COMMAND_LOGIN` (0x00A) — sent on zone-in (both initial
@@ -1015,6 +1070,67 @@ mod tests {
         let mut buf = vec![0u8; 0x40];
         buf[0x2C..0x2E].copy_from_slice(&0x00FFu16.to_le_bytes());
         assert_eq!(LookData::decode_char_npc(&buf), None);
+    }
+
+    /// CHAR_PC `GrapIDTbl[9]` at body[0x44..0x56]: slot 0 packs
+    /// `(race<<8 | face)` and slots 1..=8 are gear ids OR'd with a
+    /// per-slot `0xN000` mask. Decoder must strip the mask and surface
+    /// the raw 12-bit model id.
+    #[test]
+    fn look_data_decodes_pc_grapidtbl() {
+        // Body length must extend through GrapIDTbl: 0x44 + 18 = 0x56.
+        let mut buf = vec![0u8; 0x60];
+        let off = LookData::CHAR_PC_GRAP_OFFSET;
+        // slot 0: face = 0x07 (low), race = 0x01 (high; Hume Male)
+        buf[off..off + 2].copy_from_slice(&0x0107u16.to_le_bytes());
+        // Build each gear slot exactly the way the server does:
+        //   GrapIDTbl[i] = look->slot + 0xi000
+        // with a model id that has nonzero high nibble to prove
+        // mask-stripping (e.g. 0xABC + mask must come back as 0xABC).
+        let gear: [u16; 8] = [0x111, 0x222, 0x333, 0x444, 0x555, 0x666, 0x777, 0x888];
+        for (i, raw) in gear.iter().enumerate() {
+            let slot_idx = i + 1;
+            let masked = *raw | ((slot_idx as u16) << 12);
+            let p = off + 2 * slot_idx;
+            buf[p..p + 2].copy_from_slice(&masked.to_le_bytes());
+        }
+        assert_eq!(
+            LookData::decode_char_pc(&buf),
+            Some(LookData::Equipped {
+                face: 0x07,
+                race: 0x01,
+                head: 0x111,
+                body: 0x222,
+                hands: 0x333,
+                legs: 0x444,
+                feet: 0x555,
+                main: 0x666,
+                sub: 0x777,
+                ranged: 0x888,
+            })
+        );
+    }
+
+    /// `GrapIDTbl[0] == 0` means the server hasn't populated look yet
+    /// (SendFlg.Model clear). Decoder returns None so the caller leaves
+    /// the existing look untouched rather than overwriting with a
+    /// nonsense (face=0, race=0) entry.
+    #[test]
+    fn look_data_pc_zero_modelid_returns_none() {
+        let buf = vec![0u8; 0x60];
+        assert_eq!(LookData::decode_char_pc(&buf), None);
+    }
+
+    /// Truncated body (less than 0x44 + 18 = 0x56 bytes) returns None
+    /// without panicking on the GrapIDTbl read.
+    #[test]
+    fn look_data_pc_truncated_returns_none() {
+        // 0x55 bytes — one byte short of slot 8's tail.
+        let mut buf = vec![0u8; 0x55];
+        // Even with a valid slot 0, truncation must dominate.
+        buf[LookData::CHAR_PC_GRAP_OFFSET..LookData::CHAR_PC_GRAP_OFFSET + 2]
+            .copy_from_slice(&0x0107u16.to_le_bytes());
+        assert_eq!(LookData::decode_char_pc(&buf), None);
     }
 
     #[test]

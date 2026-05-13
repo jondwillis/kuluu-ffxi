@@ -41,6 +41,9 @@ pub const DEFAULT_MOB_DRAW_DISTANCE: f32 = 50.0;
 pub struct DrawDistance {
     pub world: f32,
     pub mob: f32,
+    /// `/zonegeom on|off` switch — bundled into this resource so the
+    /// text-input dispatcher stays under Bevy's 16 `SystemParam` limit.
+    pub zone_geom_visible: bool,
 }
 
 impl Default for DrawDistance {
@@ -48,6 +51,29 @@ impl Default for DrawDistance {
         Self {
             world: DEFAULT_WORLD_DRAW_DISTANCE,
             mob: DEFAULT_MOB_DRAW_DISTANCE,
+            zone_geom_visible: true,
+        }
+    }
+}
+
+/// Propagate `DrawDistance.zone_geom_visible` onto the MZB overlay tree.
+/// Only writes when the resource has changed — skips per-frame iteration
+/// cost when the operator hasn't touched the toggle.
+pub fn apply_zone_geom_visibility(
+    draw: Res<DrawDistance>,
+    mut q: Query<&mut Visibility, With<MzbOverlay>>,
+) {
+    if !draw.is_changed() {
+        return;
+    }
+    let want = if draw.zone_geom_visible {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut v in q.iter_mut() {
+        if *v != want {
+            *v = want;
         }
     }
 }
@@ -374,25 +400,29 @@ pub fn process_load_mzb_requests(
         let n_instances = instances.len();
         let n_collision_subs = submeshes.iter().filter(|s| s.flags & 1 == 0).count();
 
+        // Unlit + two-sided. MZB walls are mostly single-sided polygons
+        // (the FFXI client originally lit them per-face from outside
+        // only), so backface culling makes interior surfaces invisible
+        // and produces visible "missing geometry" gaps. `cull_mode: None`
+        // doubles fragment cost but at the post-unlit perf baseline that
+        // tradeoff is comfortably affordable.
         let collision_mat = materials.add(StandardMaterial {
-            // Muted teal: reads as "solid ground" against the dark scene.
-            // Default backface culling (Some(Face::Back)) halves the
-            // fragment-shader load vs the previous `None` — MZB walls
-            // are closed manifolds so backfaces are never visually
-            // useful and only cost fill rate.
             base_color: Color::srgb(0.30, 0.65, 0.65),
-            perceptual_roughness: 0.85,
+            unlit: true,
+            cull_mode: None,
             ..default()
         });
         let noncollision_mat = materials.add(StandardMaterial {
-            // Opaque amber: visual-only / non-LoS-blocking walls. Was
-            // translucent (AlphaMode::Blend) — the alpha pass forces a
-            // separate sorted draw which on a single multi-thousand-tri
-            // mesh is expensive. Going opaque drops it into the main
-            // pass and triples fps in dense zones. Slightly desaturate
-            // so it still reads visually distinct from collision.
-            base_color: Color::srgb(0.75, 0.55, 0.30),
-            perceptual_roughness: 0.7,
+            // Translucent amber: visual-only walls (LoS does NOT block).
+            // The earlier opaque switch was a perf experiment from when
+            // we were CPU-bound; now that we're GPU-comfortable at ~100
+            // FPS, the see-through alpha is worth its sorted-pass cost
+            // because it lets the operator see *through* visual walls
+            // when the camera ends up inside a building.
+            base_color: Color::srgba(0.75, 0.55, 0.30, 0.45),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            cull_mode: None,
             ..default()
         });
 
@@ -456,12 +486,36 @@ pub fn process_load_mzb_requests(
                     PrimitiveTopology::TriangleList,
                     RenderAssetUsages::default(),
                 );
+                let n_positions = positions.len();
                 mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
                 mesh.insert_indices(Indices::U32(indices));
                 // Smooth normals: indexed meshes share vertices and
                 // can't host per-face normals; smooth shading reads
                 // fine on the coarse MZB walls.
                 mesh.compute_smooth_normals();
+                // Bake fake "sun lighting" into vertex colors using the
+                // computed normal's y component: faces pointing up =
+                // bright, faces pointing down = dim. The unlit material
+                // multiplies vertex color × base_color, so this gives us
+                // free shading at zero per-pixel cost. Cheap proxy for
+                // PBR lighting that runs at vertex-shader scale (`O(N)`
+                // baked-once, not `O(fragments)` per frame).
+                if let Some(normals) = mesh
+                    .attribute(Mesh::ATTRIBUTE_NORMAL)
+                    .and_then(|a| a.as_float3())
+                {
+                    let colors: Vec<[f32; 4]> = normals
+                        .iter()
+                        .map(|n| {
+                            // n.y in [-1, +1]. Up-facing → shade=1.0,
+                            // down-facing → shade=0.4. Linear lerp.
+                            let shade = 0.4 + 0.6 * (n[1] * 0.5 + 0.5);
+                            [shade, shade, shade, 1.0]
+                        })
+                        .collect();
+                    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+                }
+                let _ = n_positions;
                 let mut child = commands.spawn((
                     MzbOverlay,
                     Mesh3d(meshes.add(mesh)),
@@ -473,6 +527,11 @@ pub fn process_load_mzb_requests(
                     child.insert(AutoMzbOverlay);
                 }
             };
+        // Capture merge stats before we move the buffers into spawn_merged.
+        let collision_verts = collision_positions.len();
+        let collision_tris = collision_indices.len() / 3;
+        let noncollision_verts = noncollision_positions.len();
+        let noncollision_tris = noncollision_indices.len() / 3;
         spawn_merged(
             &mut commands,
             collision_positions,
@@ -492,15 +551,13 @@ pub fn process_load_mzb_requests(
             &mut meshes,
         );
 
+        let total_verts = collision_verts + noncollision_verts;
+        let total_tris = collision_tris + noncollision_tris;
         push_system_msg(
             &mut scene_state,
             format!(
-                "/load_mzb {}: {n_submeshes} submeshes ({n_collision_subs} collision, {} non-collision), {n_instances} placements at parent ({:.1}, {:.1}, {:.1})",
+                "/load_mzb {}: {n_submeshes} submeshes, {n_instances} placements → merged {total_verts} verts / {total_tris} tris ({collision_verts}v {collision_tris}t collision, {noncollision_verts}v {noncollision_tris}t non-collision)",
                 req.file_id,
-                n_submeshes - n_collision_subs,
-                req.world_pos.x,
-                req.world_pos.y,
-                req.world_pos.z,
             ),
         );
     }

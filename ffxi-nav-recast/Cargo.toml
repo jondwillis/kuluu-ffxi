@@ -9,11 +9,8 @@ description = "Recast/Detour-backed NavMesh for FFXI zones, sourced from LandSan
 ffxi-nav = { path = "../ffxi-nav" }
 recastnavigation-rs = "0.1"
 glam = "0.30"
-anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 dirs = "5"
 

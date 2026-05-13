@@ -244,6 +244,12 @@ pub struct Reactor {
     /// Without the latch we'd spam the server 5×/sec while the player
     /// stands on the trigger.
     zoneline_trigger_latched: Option<u32>,
+    /// Set on `ZoneChanged`; the next `check_zoneline_trigger` adopts
+    /// whatever trigger the player spawns inside as the baseline latch
+    /// without firing. Prevents an immediate zone-back when the server
+    /// drops us on top of the return zoneline (the destination side of
+    /// the doorway sits inside its own AABB).
+    needs_zone_seed: bool,
 }
 
 impl Reactor {
@@ -256,6 +262,7 @@ impl Reactor {
             party_low_hp_latched: HashMap::new(),
             nav_cache: None,
             zoneline_trigger_latched: None,
+            needs_zone_seed: false,
         }
     }
 
@@ -349,6 +356,7 @@ impl Reactor {
         // zone (lands the player "in the sky" or off-map). Drop them.
         if matches!(ev, AgentEvent::ZoneChanged { .. }) {
             self.goal = Goal::Idle;
+            self.needs_zone_seed = true;
         }
         out.extend(self.detect_threshold_events(ev));
         out
@@ -549,6 +557,11 @@ impl Reactor {
             .iter()
             .find(|line| is_inside_trigger_box(player, line))
             .map(|line| line.line_id);
+        if self.needs_zone_seed {
+            self.zoneline_trigger_latched = inside;
+            self.needs_zone_seed = false;
+            return None;
+        }
         let was = self.zoneline_trigger_latched;
         self.zoneline_trigger_latched = inside;
         match (was, inside) {
@@ -1111,6 +1124,7 @@ mod tests {
                 claim_id: 0,
                 speed: 0,
                 speed_base: 0,
+                look: None,
             },
         }
     }
@@ -1691,6 +1705,84 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, AgentCommand::RequestZoneChange { .. })),
             "re-entry must fire fresh RequestZoneChange"
+        );
+    }
+
+    #[test]
+    fn zoneline_trigger_seeds_on_zone_change_no_immediate_refire() {
+        // Regression: after zoning into Southern San d'Oria (zone 230),
+        // the server drops the player on top of the *return* zoneline
+        // back to West Ronfaure (line 845493882). Without seeding, the
+        // latch left over from the prior zone's exit trigger doesn't
+        // match this new line_id, so check_zoneline_trigger fires a
+        // RequestZoneChange on the very first tick in the new zone —
+        // bouncing the player straight back out.
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+
+        // Simulate having just fired an exit trigger in the prior zone:
+        // pre-load the latch with a stale line_id from "the old zone".
+        r.zoneline_trigger_latched = Some(812855930);
+
+        // Now zone in to 230, and have the server's first position
+        // upsert place us inside the return trigger.
+        r.observe_event(&AgentEvent::ZoneChanged { from: Some(100), to: 230 });
+        r.state.zone_id = Some(230);
+        r.observe_event(&upsert(
+            1,
+            Vec3 { x: -113.372, y: -57.418, z: -4.075 },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+
+        // First post-zone tick: must NOT fire, even though we're inside
+        // a trigger and the stale latch doesn't match it.
+        let out1 = r.tick();
+        assert!(
+            !out1
+                .commands
+                .iter()
+                .any(|c| matches!(c, AgentCommand::RequestZoneChange { .. })),
+            "must not fire on first tick after ZoneChanged (spawn-inside grace)"
+        );
+        assert_eq!(
+            r.zoneline_trigger_latched,
+            Some(845493882),
+            "seed should adopt the spawn-inside trigger as the baseline latch"
+        );
+
+        // Walk OFF the trigger — no fire.
+        r.observe_event(&upsert(
+            1,
+            Vec3 { x: 0.0, y: 0.0, z: -5.0 },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        let out2 = r.tick();
+        assert!(
+            !out2
+                .commands
+                .iter()
+                .any(|c| matches!(c, AgentCommand::RequestZoneChange { .. })),
+            "walking off the seeded trigger must not fire"
+        );
+
+        // Walk back ON — this is a real edge, must fire.
+        r.observe_event(&upsert(
+            1,
+            Vec3 { x: -113.372, y: -57.418, z: -4.075 },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        let out3 = r.tick();
+        assert!(
+            out3.commands
+                .iter()
+                .any(|c| matches!(c, AgentCommand::RequestZoneChange { .. })),
+            "deliberate re-entry after seeding must fire"
         );
     }
 

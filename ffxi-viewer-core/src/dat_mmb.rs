@@ -81,7 +81,13 @@ impl Plugin for DatOverlayPlugin {
             // outside the configured radius. Stays decoupled from the
             // MZB load chain so it runs every frame independent of the
             // (rare) zone-change events.
-            .add_systems(Update, crate::dat_mzb::cull_entities_by_distance);
+            .add_systems(
+                Update,
+                (
+                    crate::dat_mzb::cull_entities_by_distance,
+                    crate::dat_mzb::apply_zone_geom_visibility,
+                ),
+            );
             // Phase 1 `cull_mzb_by_distance` was removed: Phase 3 merged
             // everything into two entities anchored at world origin, so
             // the per-entity distance check would hide the whole zone

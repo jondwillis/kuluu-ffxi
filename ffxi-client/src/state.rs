@@ -1630,7 +1630,7 @@ mod tests {
                 pos: Vec3 { x: 1.0, y: 0.0, z: 2.0 },
                 heading: 64,
                 hp_pct: Some(80), bt_target_id: 0, claim_id: 0,
-                speed: 0, speed_base: 0,
+                speed: 0, speed_base: 0, look: None,
             },
         });
         assert_eq!(s.entities.len(), 1);
@@ -1645,7 +1645,7 @@ mod tests {
                 pos: Vec3 { x: 5.0, y: 0.0, z: 6.0 },
                 heading: 32,
                 hp_pct: Some(50), bt_target_id: 0, claim_id: 0,
-                speed: 0, speed_base: 0,
+                speed: 0, speed_base: 0, look: None,
             },
         });
         assert_eq!(s.entities.len(), 1, "upsert must not duplicate by id");
@@ -1707,6 +1707,7 @@ mod tests {
             claim_id: 0,
             speed: 0,
             speed_base: 0,
+            look: None,
         }
     }
 
@@ -1982,7 +1983,7 @@ mod tests {
                 name: Some("Self".into()),
                 pos: Vec3 { x: 10.0, y: 20.0, z: 30.0 },
                 heading: 64, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0, speed: 40, speed_base: 40,
+                claim_id: 0, speed: 40, speed_base: 40, look: None,
             },
         });
         let p = s.self_position().expect("self entity present");

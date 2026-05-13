@@ -238,6 +238,10 @@ pub enum SlashOutcome {
     /// `Mob` controls non-PC entity capsule cull. Naked `/drawdistance`
     /// shows the current values (caller dispatches a SystemMessage).
     SetDrawDistance(DrawDistanceOp),
+    /// `/zonegeom on|off` — flip MZB overlay visibility. Diagnostic
+    /// tool for perf — toggle off to verify whether the MZB merged
+    /// mesh is the bottleneck.
+    ToggleZoneGeom(Option<bool>),
 }
 
 /// `/drawdistance` subcommand variants. `Show` is a no-arg query for
@@ -429,6 +433,7 @@ pub fn parse_slash(
         "load_mzb" | "loadmzb" => parse_load_mzb(rest, self_pos),
         "look" => parse_look(rest, entities, self_pos, current_target),
         "drawdistance" | "dd" => parse_drawdistance(rest),
+        "zonegeom" => parse_zonegeom(rest),
         "keybinds" | "keybind" | "binds" => parse_keybinds(rest),
         "pathto" => parse_pathto(rest, entities, current_target),
         "zones" => parse_zones(zone_id),
@@ -1108,6 +1113,22 @@ fn parse_zoneto(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
 /// they can walk around the spawned model. `ffxi_to_bevy` is applied
 /// here at the parser boundary, matching the convention used by every
 /// other place we cross the FFXI→Bevy axis flip.
+/// `/zonegeom on|off|toggle` — flip MZB overlay visibility.
+fn parse_zonegeom(rest: &str) -> SlashOutcome {
+    let arg = rest.trim().to_ascii_lowercase();
+    let setting = match arg.as_str() {
+        "" | "toggle" => None,
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        other => {
+            return SlashOutcome::SystemMessage(format!(
+                "/zonegeom: bad arg `{other}` (use on|off|toggle)"
+            ));
+        }
+    };
+    SlashOutcome::ToggleZoneGeom(setting)
+}
+
 /// `/drawdistance` family. Matches Ashita/Windower conventions:
 ///   - `/drawdistance` or `/dd` — show current
 ///   - `/drawdistance setworld N` — MZB overlay cull distance

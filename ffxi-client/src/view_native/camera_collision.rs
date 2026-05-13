@@ -35,16 +35,22 @@ pub fn clamp_chase_camera_to_collision(
     self_q: Query<&Transform, (With<IsSelf>, Without<OperatorCamera>)>,
     mut cam_q: Query<&mut Transform, (With<OperatorCamera>, Without<IsSelf>)>,
 ) {
+    // Run every frame — earlier `Changed<Transform>` throttle skipped
+    // ticks where the camera was steady but the *player* had just
+    // walked toward a wall, leaving the camera embedded inside it
+    // until the next yaw/zoom event nudged the camera transform.
+    // The navmesh lock + slide_along cost is small compared to the
+    // alternative of clipping through walls.
     let Some(nav_lock) = nav.nav.as_ref() else {
-        return;
-    };
-    let Ok(guard) = nav_lock.lock() else {
         return;
     };
     let Ok(self_t) = self_q.single() else {
         return;
     };
     let Ok(mut cam_t) = cam_q.single_mut() else {
+        return;
+    };
+    let Ok(guard) = nav_lock.lock() else {
         return;
     };
 

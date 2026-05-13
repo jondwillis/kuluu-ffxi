@@ -641,12 +641,13 @@ fn handle_sub_packet(
                 // reducer treats `None` as "leave existing untouched."
                 let send_flag = sub.data.get(6).copied().unwrap_or(0);
                 let hp_pct = (send_flag & 0x04 != 0).then_some(head.hpp);
-                // Look data — CHAR_NPC carries it at body[0x2C..]. CHAR_PC's
-                // GrapIDTbl layout is different (race-packed modelid + 8 gear
-                // slots XOR'd with 0xN000 masks) and not yet decoded; PCs
-                // stay as capsules until that lands.
+                // Look data — CHAR_NPC carries `look_t` at body[0x2C..];
+                // CHAR_PC carries `GrapIDTbl[9]` at body[0x44..0x56] (race-
+                // packed modelid + 8 gear slots OR'd with 0xN000 masks).
                 let look = if op == s2c::CHAR_NPC {
                     decode::LookData::decode_char_npc(sub.data)
+                } else if op == s2c::CHAR_PC {
+                    decode::LookData::decode_char_pc(sub.data)
                 } else {
                     None
                 };

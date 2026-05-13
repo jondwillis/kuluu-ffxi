@@ -72,8 +72,10 @@ pub fn text_input_system(
     mut load_mmb_tx: MessageWriter<LoadMmbRequest>,
     // Same shape for `/load_mzb` — zone mesh-library overlay.
     mut load_mzb_tx: MessageWriter<LoadMzbRequest>,
-    // Operator-tunable cull distances. `/drawdistance` mutates these
-    // and the dat_mzb cull / entity cull systems read them next frame.
+    // Operator-tunable cull distances + zonegeom visibility flag.
+    // `/drawdistance` mutates the radii; `/zonegeom` flips the bool.
+    // Bundled into one resource to stay under Bevy's 16-SystemParam
+    // limit at this dispatcher site.
     mut draw_distance: ResMut<ffxi_viewer_core::dat_mzb::DrawDistance>,
     // Chat-panel scroll offset, mutated by PassiveCursor arrow/PageUp
     // keys here and by the wheel system in `hud::chat_panel`. Single
@@ -544,6 +546,14 @@ fn apply_slash_outcome(
             push_system_chat_line(
                 scene_state,
                 format!("/load_mmb {file_id} {chunk_idx}: spawning…"),
+            );
+        }
+        SlashOutcome::ToggleZoneGeom(setting) => {
+            let next = setting.unwrap_or(!draw_distance.zone_geom_visible);
+            draw_distance.zone_geom_visible = next;
+            push_system_chat_line(
+                scene_state,
+                format!("/zonegeom: {}", if next { "on" } else { "off" }),
             );
         }
         SlashOutcome::SetDrawDistance(op) => {
