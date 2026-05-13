@@ -37,13 +37,47 @@ pub const DEFAULT_MOB_DRAW_DISTANCE: f32 = 50.0;
 /// entities, mob controls non-PC entity capsules (mobs/NPCs/pets).
 /// PCs are never culled by distance — party members and other PCs
 /// stay visible regardless so the operator can still target them.
+/// `/zonegeom` tri-state. `Collision` is the default on zone-in — the
+/// non-collision (decorative) meshes are visually noisy and operators
+/// rarely need them. They're surfaced as a deliberate `All` opt-in.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneGeomMode {
+    /// Hide all MZB geometry.
+    Off,
+    /// Show only LoS-blocking (collision) meshes — flag bit 0 == 0.
+    #[default]
+    Collision,
+    /// Show both collision and non-collision (decorative) meshes.
+    All,
+}
+
+impl ZoneGeomMode {
+    /// `toggle`-cycle order: Collision → All → Off → Collision.
+    /// Skips no states; lets a single keybind walk the full tri-state.
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Collision => Self::All,
+            Self::All => Self::Off,
+            Self::Off => Self::Collision,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Collision => "collision",
+            Self::All => "all",
+        }
+    }
+}
+
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct DrawDistance {
     pub world: f32,
     pub mob: f32,
-    /// `/zonegeom on|off` switch — bundled into this resource so the
+    /// `/zonegeom` setting — bundled into this resource so the
     /// text-input dispatcher stays under Bevy's 16 `SystemParam` limit.
-    pub zone_geom_visible: bool,
+    pub zone_geom_mode: ZoneGeomMode,
 }
 
 impl Default for DrawDistance {
@@ -51,29 +85,124 @@ impl Default for DrawDistance {
         Self {
             world: DEFAULT_WORLD_DRAW_DISTANCE,
             mob: DEFAULT_MOB_DRAW_DISTANCE,
-            zone_geom_visible: true,
+            zone_geom_mode: ZoneGeomMode::default(),
         }
     }
 }
 
-/// Propagate `DrawDistance.zone_geom_visible` onto the MZB overlay tree.
+/// Sub-marker for the merged collision mesh (flag bit 0 == 0). Lets
+/// `apply_zone_geom_visibility` toggle collision vs non-collision
+/// independently.
+#[derive(Component)]
+pub struct MzbCollisionMesh;
+
+/// CPU-side copy of the merged MZB **collision** triangle soup (already
+/// transformed into Bevy world coordinates). Owned as a `Resource` so
+/// the client-side ground-snap and `/debug heights` paths can do
+/// per-tick raycasts without walking the Bevy `Assets<Mesh>` storage.
+///
+/// Dropped + replaced each `LoadMzbRequest` consumption, so zone
+/// transitions stay correct.
+#[derive(Resource, Default)]
+pub struct MzbCollisionGeometry {
+    pub positions: Vec<Vec3>,
+    /// Flat triangle indices: `tri_i` = `(indices[i*3], indices[i*3+1], indices[i*3+2])`.
+    pub indices: Vec<u32>,
+}
+
+impl MzbCollisionGeometry {
+    /// Number of triangles backing this geometry.
+    pub fn tri_count(&self) -> usize {
+        self.indices.len() / 3
+    }
+
+    /// Cast a ray straight down (Bevy −Y) at (`xz.x`, `xz.y`) from a
+    /// y high above any plausible zone height, and return the **highest**
+    /// Y of any triangle the ray hits. `None` if the column at `xz` has
+    /// no triangle below.
+    ///
+    /// "Highest hit" picks the ceiling-of-floor: when the player is in
+    /// a multi-level building, we want the floor they're standing on,
+    /// not the basement.
+    pub fn ground_raycast(&self, xz: Vec2) -> Option<f32> {
+        const RAY_ORIGIN_Y: f32 = 1000.0;
+        let orig = Vec3::new(xz.x, RAY_ORIGIN_Y, xz.y);
+        let dir = Vec3::new(0.0, -1.0, 0.0);
+        let mut best_y: Option<f32> = None;
+        for tri in self.indices.chunks_exact(3) {
+            let v0 = self.positions[tri[0] as usize];
+            let v1 = self.positions[tri[1] as usize];
+            let v2 = self.positions[tri[2] as usize];
+            if let Some(t) = ray_tri_intersect(orig, dir, v0, v1, v2) {
+                let hit_y = orig.y + t * dir.y;
+                best_y = Some(match best_y {
+                    Some(prev) if prev > hit_y => prev,
+                    _ => hit_y,
+                });
+            }
+        }
+        best_y
+    }
+}
+
+/// Möller–Trumbore ray-triangle intersection. Returns `t` (≥ ε), or
+/// `None` if the ray misses.
+fn ray_tri_intersect(orig: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<f32> {
+    const EPS: f32 = 1e-7;
+    let e1 = v1 - v0;
+    let e2 = v2 - v0;
+    let h = dir.cross(e2);
+    let a = e1.dot(h);
+    if a.abs() < EPS {
+        return None;
+    }
+    let f = 1.0 / a;
+    let s = orig - v0;
+    let u = f * s.dot(h);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(e1);
+    let v = f * dir.dot(q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = f * e2.dot(q);
+    if t > EPS {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+/// Sub-marker for the merged non-collision (decorative) mesh.
+#[derive(Component)]
+pub struct MzbNonCollisionMesh;
+
+/// Propagate `DrawDistance.zone_geom_mode` onto the MZB overlay tree.
 /// Only writes when the resource has changed — skips per-frame iteration
 /// cost when the operator hasn't touched the toggle.
 pub fn apply_zone_geom_visibility(
     draw: Res<DrawDistance>,
-    mut q: Query<&mut Visibility, With<MzbOverlay>>,
+    mut q_collision: Query<&mut Visibility, (With<MzbCollisionMesh>, Without<MzbNonCollisionMesh>)>,
+    mut q_noncollision: Query<&mut Visibility, (With<MzbNonCollisionMesh>, Without<MzbCollisionMesh>)>,
 ) {
     if !draw.is_changed() {
         return;
     }
-    let want = if draw.zone_geom_visible {
-        Visibility::Inherited
-    } else {
-        Visibility::Hidden
+    let (want_collision, want_noncollision) = match draw.zone_geom_mode {
+        ZoneGeomMode::Off => (Visibility::Hidden, Visibility::Hidden),
+        ZoneGeomMode::Collision => (Visibility::Inherited, Visibility::Hidden),
+        ZoneGeomMode::All => (Visibility::Inherited, Visibility::Inherited),
     };
-    for mut v in q.iter_mut() {
-        if *v != want {
-            *v = want;
+    for mut v in q_collision.iter_mut() {
+        if *v != want_collision {
+            *v = want_collision;
+        }
+    }
+    for mut v in q_noncollision.iter_mut() {
+        if *v != want_noncollision {
+            *v = want_noncollision;
         }
     }
 }
@@ -371,7 +500,19 @@ pub fn process_load_mzb_requests(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scene_state: ResMut<SceneState>,
+    draw: Res<DrawDistance>,
+    mut collision_geometry: ResMut<MzbCollisionGeometry>,
 ) {
+    // Capture current zonegeom mode so freshly-spawned merged meshes
+    // start at the correct visibility. `apply_zone_geom_visibility`
+    // only fires on `draw.is_changed()`, so a zone-in with the mode
+    // untouched would otherwise leave non-collision meshes visible
+    // even when the mode is `Collision`.
+    let (init_collision_vis, init_noncollision_vis) = match draw.zone_geom_mode {
+        ZoneGeomMode::Off => (Visibility::Hidden, Visibility::Hidden),
+        ZoneGeomMode::Collision => (Visibility::Inherited, Visibility::Hidden),
+        ZoneGeomMode::All => (Visibility::Inherited, Visibility::Inherited),
+    };
     for req in events.read() {
         let (submeshes, instances) = match load_mzb_placed(req.file_id, req.chunk_idx) {
             Ok(s) => s,
@@ -398,7 +539,6 @@ pub fn process_load_mzb_requests(
 
         let n_submeshes = submeshes.len();
         let n_instances = instances.len();
-        let n_collision_subs = submeshes.iter().filter(|s| s.flags & 1 == 0).count();
 
         // Unlit + two-sided. MZB walls are mostly single-sided polygons
         // (the FFXI client originally lit them per-face from outside
@@ -471,6 +611,8 @@ pub fn process_load_mzb_requests(
 
         // Spawn one child per non-empty merged mesh — usually both,
         // sometimes only collision (zones without decorative walls).
+        // `is_collision` controls which sub-marker is attached so
+        // `/zonegeom` can toggle the two channels independently.
         let spawn_merged =
             |commands: &mut Commands,
              positions: Vec<[f32; 3]>,
@@ -478,6 +620,8 @@ pub fn process_load_mzb_requests(
              material: Handle<StandardMaterial>,
              parent: bevy::ecs::entity::Entity,
              auto_loaded: bool,
+             is_collision: bool,
+             init_vis: Visibility,
              meshes: &mut ResMut<Assets<Mesh>>| {
                 if positions.is_empty() || indices.is_empty() {
                     return;
@@ -521,8 +665,14 @@ pub fn process_load_mzb_requests(
                     Mesh3d(meshes.add(mesh)),
                     MeshMaterial3d(material),
                     Transform::IDENTITY,
+                    init_vis,
                     ChildOf(parent),
                 ));
+                if is_collision {
+                    child.insert(MzbCollisionMesh);
+                } else {
+                    child.insert(MzbNonCollisionMesh);
+                }
                 if auto_loaded {
                     child.insert(AutoMzbOverlay);
                 }
@@ -532,6 +682,18 @@ pub fn process_load_mzb_requests(
         let collision_tris = collision_indices.len() / 3;
         let noncollision_verts = noncollision_positions.len();
         let noncollision_tris = noncollision_indices.len() / 3;
+
+        // Stash the collision geometry in a CPU-side resource so the
+        // ground-snap and `/debug heights` paths can do per-tick
+        // raycasts without walking the Bevy `Assets<Mesh>` storage.
+        // This replaces zone-N's geometry wholesale — on a zone change
+        // the new `LoadMzbRequest` lands here and overwrites.
+        collision_geometry.positions = collision_positions
+            .iter()
+            .map(|p| Vec3::new(p[0], p[1], p[2]))
+            .collect();
+        collision_geometry.indices = collision_indices.clone();
+
         spawn_merged(
             &mut commands,
             collision_positions,
@@ -539,6 +701,8 @@ pub fn process_load_mzb_requests(
             collision_mat,
             parent,
             req.auto_loaded,
+            true,
+            init_collision_vis,
             &mut meshes,
         );
         spawn_merged(
@@ -548,6 +712,8 @@ pub fn process_load_mzb_requests(
             noncollision_mat,
             parent,
             req.auto_loaded,
+            false,
+            init_noncollision_vis,
             &mut meshes,
         );
 

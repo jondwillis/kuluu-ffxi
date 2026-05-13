@@ -22,8 +22,11 @@
 
 pub mod bridge;
 pub mod camera_collision;
+pub mod collision_bvh;
+pub mod debug_heights;
 pub mod input;
 pub mod launcher_ui;
+pub mod nameplate_occlude;
 pub mod navmesh_overlay;
 pub mod slash_commands;
 pub mod text_input;
@@ -307,11 +310,37 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // in `PostUpdate` so it runs *after* the viewer-core chase camera
     // system has computed and lerped to its desired position; we then
     // pull the camera back along the player→camera line if needed.
+    // Build a BVH per collision-mesh entity once its asset is loaded.
+    // The system is a no-op once every entity has its `CollisionBvh`,
+    // so we can leave it in `Update` cheaply.
+    app.add_systems(
+        Update,
+        collision_bvh::build_collision_bvh_system.run_if(in_state(AppPhase::InGame)),
+    );
     app.add_systems(
         PostUpdate,
         camera_collision::clamp_chase_camera_to_collision
             .run_if(in_state(AppPhase::InGame)),
     );
+
+    // Nameplate occlusion against zone geometry — hide name labels of
+    // entities the camera can't actually see. Scheduled in PostUpdate
+    // after the camera clamp so we test against the clamped camera
+    // position (and therefore agree with what the operator sees).
+    app.add_systems(
+        PostUpdate,
+        nameplate_occlude::occlude_nameplates_system
+            .after(camera_collision::clamp_chase_camera_to_collision)
+            .run_if(in_state(AppPhase::InGame)),
+    );
+
+    // `/debug heights` — diagnostic for navmesh-vs-MZB vertical offset.
+    // Registers the request message and its consumer system.
+    app.add_message::<debug_heights::DebugHeightsRequest>()
+        .add_systems(
+            Update,
+            debug_heights::process_debug_heights.run_if(in_state(AppPhase::InGame)),
+        );
 
     // Disconnect → return-to-launcher. Runs every frame in InGame and
     // bounces the phase back to Launcher when the session ends (clean

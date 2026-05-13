@@ -29,16 +29,29 @@
 //! per-keystroke, so the user can see and edit their command before
 //! sending it.
 
+use bevy::ecs::system::SystemParam;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 use ffxi_viewer_core::{
-    Action, Bindings, ChatBuffer, DialogCursor, InputMode, MenuKind, MenuStack, PassiveCursorState,
-    Preset, QuickActionState, SceneState, Target, DIALOG_MAX_CHOICE,
+    Action, Bindings, ChatBuffer, DialogCursor, InputMode, MenuKind, MenuStack, Preset,
+    QuickActionState, SceneState, Target, DIALOG_MAX_CHOICE,
 };
 use ffxi_viewer_core::dat_mmb::LoadMmbRequest;
 use ffxi_viewer_core::dat_mzb::LoadMzbRequest;
 use ffxi_viewer_core::hud::chat_panel::ChatScroll;
+
+use super::debug_heights::DebugHeightsRequest;
+
+/// Bundle of `MessageWriter`s used by the slash-command dispatcher.
+/// Grouped into one `SystemParam` so `text_input_system` stays under
+/// Bevy's 16-param cap as we add more event-driven slash commands.
+#[derive(SystemParam)]
+pub struct SlashWriters<'w> {
+    pub load_mmb: MessageWriter<'w, LoadMmbRequest>,
+    pub load_mzb: MessageWriter<'w, LoadMzbRequest>,
+    pub debug_heights: MessageWriter<'w, DebugHeightsRequest>,
+}
 use tokio::sync::mpsc::Sender;
 
 use crate::keybinds_store::KeybindsStateRes;
@@ -66,12 +79,10 @@ pub fn text_input_system(
     // `SessionEventTx` only after the connecting bridge runs.
     #[cfg(unix)] agent_paused: Option<Res<super::AgentPaused>>,
     session_event_tx: Option<Res<super::SessionEventTx>>,
-    // `/load_mmb <file_id> <chunk_idx>` writes one of these per
-    // submission; `ffxi_viewer_core::dat_mmb::process_load_mmb_requests`
-    // is the consumer.
-    mut load_mmb_tx: MessageWriter<LoadMmbRequest>,
-    // Same shape for `/load_mzb` — zone mesh-library overlay.
-    mut load_mzb_tx: MessageWriter<LoadMzbRequest>,
+    // Bundle of slash-command event writers (load_mmb / load_mzb /
+    // debug_heights). Bundled into one SystemParam so this system stays
+    // under Bevy's 16-param cap as the slash-command surface grows.
+    mut slash_writers: SlashWriters,
     // Operator-tunable cull distances + zonegeom visibility flag.
     // `/drawdistance` mutates the radii; `/zonegeom` flips the bool.
     // Bundled into one resource to stay under Bevy's 16-SystemParam
@@ -143,8 +154,7 @@ pub fn text_input_system(
                     #[cfg(unix)]
                     agent_paused.as_deref(),
                     session_event_tx.as_deref(),
-                    &mut load_mmb_tx,
-                    &mut load_mzb_tx,
+                    &mut slash_writers,
                     &mut draw_distance,
                 );
             }
@@ -365,8 +375,7 @@ fn apply_chat_action(
     keybinds_state: &mut KeybindsStateRes,
     #[cfg(unix)] agent_paused: Option<&super::AgentPaused>,
     session_event_tx: Option<&super::SessionEventTx>,
-    load_mmb_tx: &mut MessageWriter<LoadMmbRequest>,
-    load_mzb_tx: &mut MessageWriter<LoadMzbRequest>,
+    slash_writers: &mut SlashWriters,
     draw_distance: &mut ffxi_viewer_core::dat_mzb::DrawDistance,
 ) {
     match action {
@@ -422,8 +431,7 @@ fn apply_chat_action(
                     #[cfg(unix)]
                     agent_paused,
                     session_event_tx,
-                    load_mmb_tx,
-                    load_mzb_tx,
+                    slash_writers,
                     draw_distance,
                 );
             } else {
@@ -467,8 +475,7 @@ fn apply_slash_outcome(
     keybinds_state: &mut KeybindsStateRes,
     #[cfg(unix)] agent_paused: Option<&super::AgentPaused>,
     session_event_tx: Option<&super::SessionEventTx>,
-    load_mmb_tx: &mut MessageWriter<LoadMmbRequest>,
-    load_mzb_tx: &mut MessageWriter<LoadMzbRequest>,
+    slash_writers: &mut SlashWriters,
     draw_distance: &mut ffxi_viewer_core::dat_mzb::DrawDistance,
 ) {
     match outcome {
@@ -520,7 +527,13 @@ fn apply_slash_outcome(
             exit.write_default();
         }
         SlashOutcome::SystemMessage(text) => {
-            push_system_chat_line(scene_state, text);
+            // Split on '\n' so multi-line outputs (`/help`, `/zones`)
+            // become separate ChatLines instead of one giant wrapping
+            // row. Single-line messages still go through unchanged
+            // because `split('\n')` yields exactly one item then.
+            for line in text.split('\n') {
+                push_system_chat_line(scene_state, line.to_string());
+            }
         }
         SlashOutcome::ToggleNavmesh(setting) => {
             let next = setting.unwrap_or(!navmesh_visible.0);
@@ -532,28 +545,37 @@ fn apply_slash_outcome(
             file_id,
             chunk_idx,
             world_pos,
+            entity_id,
         } => {
             // Cross the FFXI→Bevy axis flip here, in the dispatcher, so
             // `LoadMmbRequest::world_pos` is already a Bevy `Vec3` by
             // the time the consumer system sees it. Matches the
             // convention used by `sync_entities_system` (`scene.rs`).
+            // When `entity_id` is `Some`, `world_pos` is ignored
+            // downstream — the consumer hangs the mesh under the
+            // tracked entity instead.
             let bevy_pos = ffxi_viewer_core::ffxi_to_bevy(world_pos);
-            load_mmb_tx.write(LoadMmbRequest {
+            slash_writers.load_mmb.write(LoadMmbRequest {
                 file_id,
                 chunk_idx,
                 world_pos: bevy_pos,
+                entity_id,
             });
-            push_system_chat_line(
-                scene_state,
-                format!("/load_mmb {file_id} {chunk_idx}: spawning…"),
-            );
+            let label = match entity_id {
+                Some(id) => format!("/load_mmb_on {id} {file_id} {chunk_idx}: spawning…"),
+                None => format!("/load_mmb {file_id} {chunk_idx}: spawning…"),
+            };
+            push_system_chat_line(scene_state, label);
         }
-        SlashOutcome::ToggleZoneGeom(setting) => {
-            let next = setting.unwrap_or(!draw_distance.zone_geom_visible);
-            draw_distance.zone_geom_visible = next;
+        SlashOutcome::DebugHeights => {
+            slash_writers.debug_heights.write(DebugHeightsRequest);
+        }
+        SlashOutcome::SetZoneGeom(setting) => {
+            let next = setting.unwrap_or_else(|| draw_distance.zone_geom_mode.cycle());
+            draw_distance.zone_geom_mode = next;
             push_system_chat_line(
                 scene_state,
-                format!("/zonegeom: {}", if next { "on" } else { "off" }),
+                format!("/zonegeom: {}", next.label()),
             );
         }
         SlashOutcome::SetDrawDistance(op) => {
@@ -590,7 +612,7 @@ fn apply_slash_outcome(
             world_pos,
         } => {
             let bevy_pos = ffxi_viewer_core::ffxi_to_bevy(world_pos);
-            load_mzb_tx.write(LoadMzbRequest {
+            slash_writers.load_mzb.write(LoadMzbRequest {
                 file_id,
                 chunk_idx,
                 world_pos: bevy_pos,
@@ -1326,6 +1348,7 @@ mod quick_action_tests {
             claim_id: 0,
             speed: 0,
             speed_base: 0,
+            look: None,
         }
     }
 

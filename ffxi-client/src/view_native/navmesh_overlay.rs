@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
-use ffxi_viewer_core::{feet_offset, InputMode, SceneState, WorldEntity};
+use ffxi_viewer_core::{feet_offset, InputMode, IsSelf, SceneState, WorldEntity};
 
 use super::AppPhase;
 
@@ -205,12 +205,14 @@ fn swap_navmesh_on_zone_change(scene: Res<SceneState>, mut state: ResMut<Navmesh
 /// how the lines look.
 fn draw_navmesh_overlay(mut gizmos: Gizmos, state: Res<NavmeshState>) {
     let color = Color::srgb(0.2, 1.0, 0.4);
-    // 1.0 yalm above the floor plane so the overlay isn't depth-fought
-    // into invisibility by the placeholder ground. With a real terrain
-    // mesh this would shrink back to ~0.05 (or be replaced by gizmo
-    // depth-bias config), but for the floor-plane-only viewer it needs
-    // visible separation.
-    let lift_bevy_y = 1.0;
+    // 0.05 yalm above the navmesh-height so the gizmo isn't depth-fought
+    // against the MZB collision mesh at the same Y. The previous 1.0
+    // lift dated from the floor-plane-only era — operators saw the
+    // wireframe "floating" several yalms above the rendered MZB walls
+    // even though the navmesh data sat ~0.4 below the MZB (per
+    // `/debug heights`). Drop the lift to a hairline so the two
+    // surfaces visually agree.
+    let lift_bevy_y = 0.05;
     for (a, b) in &state.edges {
         let pa = detour_to_bevy(*a) + Vec3::Y * lift_bevy_y;
         let pb = detour_to_bevy(*b) + Vec3::Y * lift_bevy_y;
@@ -246,41 +248,69 @@ fn draw_navmesh_overlay(mut gizmos: Gizmos, state: Res<NavmeshState>) {
 /// offset so the **feet** rest on the navmesh instead.
 fn snap_entities_to_navmesh_system(
     state: Res<NavmeshState>,
+    collision_geom: Res<ffxi_viewer_core::dat_mzb::MzbCollisionGeometry>,
     mut cache: ResMut<SnapHeightCache>,
-    mut q: Query<(&WorldEntity, &mut Transform)>,
+    mut q: Query<(&WorldEntity, &mut Transform, Has<IsSelf>)>,
 ) {
-    let Some(nav) = &state.nav else { return };
-    let Ok(guard) = nav.lock() else { return };
+    // Two-tier ground snap:
+    //
+    // - **Self entity** uses the MZB collision-mesh raycast. This is
+    //   what the operator's eye is locked on — they notice if the
+    //   player floats off the rendered floor by even 0.4 yalms.
+    // - **All other entities** use the cheap Detour `nearest_height_at`
+    //   query. The two surfaces differ by ~0.4 yalms (per `/debug heights`
+    //   in Bastok); invisible at third-person NPC distance.
+    //
+    // Rationale: the linear MZB raycast scans ~5k tris per query
+    // (sufficient for one entity per frame at 1.5% CPU budget), but
+    // running it for every entity in a populated zone scales to
+    // tens-of-millions of intersections per frame — the cause of the
+    // FPS tank observed after the initial C3.1 rollout.
+    let nav_guard = state.nav.as_ref().and_then(|n| n.lock().ok());
+    let mzb_loaded = collision_geom.tri_count() > 0;
+    if !mzb_loaded && nav_guard.is_none() {
+        return;
+    }
 
-    for (entity, mut t) in q.iter_mut() {
-        // Bevy → FFXI ground-plane: bevy.x = ffxi.x, bevy.z = -ffxi.y.
-        let ffxi_x = t.translation.x;
-        let ffxi_y = -t.translation.z;
-        // Use the cached previous snap as z_hint so the search box is
-        // stable across frames. Falls back to the current rendered
-        // y on the very first frame for this entity. `z_hint` is in
-        // FFXI-native height (Y-down) because `nearest_height_at`
-        // feeds it through `ffxi_to_detour` internally; the cached
-        // `h` is already in that frame, but the Bevy fallback needs
-        // a sign flip (Bevy = -FFXI height after the May 2026
-        // Y-orientation fix).
-        let z_hint = cache
-            .0
-            .get(&entity.id)
-            .copied()
-            .unwrap_or(-t.translation.y);
+    for (entity, mut t, is_self) in q.iter_mut() {
+        let ground_y: Option<f32> = if is_self && mzb_loaded {
+            // Player: MZB raycast. Fall back to navmesh if the
+            // column at the player's XZ has no triangle below
+            // (e.g., off the edge of the loaded zone bounds).
+            let mzb = collision_geom
+                .ground_raycast(Vec2::new(t.translation.x, t.translation.z));
+            mzb.or_else(|| nav_y_bevy(&nav_guard, &mut cache, entity.id, &t))
+        } else {
+            // NPCs / mobs / other PCs: cheap navmesh query.
+            nav_y_bevy(&nav_guard, &mut cache, entity.id, &t)
+        };
 
-        if let Some(h) = guard.nearest_height_at(ffxi_x, ffxi_y, z_hint) {
-            cache.0.insert(entity.id, h);
-            // `nearest_height_at` returns FFXI native height (Y-down,
-            // so a real ground at +10 yalms comes back as -10). Negate
-            // to land in Bevy Y-up, matching `ffxi_to_bevy(p).y = -p.z`
-            // and the MZB/overlay flips. `feet_offset` then lifts the
-            // capsule center so feet sit *on* the navmesh instead of
-            // the capsule sinking through it.
-            t.translation.y = -h + feet_offset(entity.kind);
+        if let Some(ground) = ground_y {
+            t.translation.y = ground + feet_offset(entity.kind);
         }
     }
+}
+
+/// Navmesh `nearest_height_at` lookup, converted to Bevy Y-up. Returns
+/// `None` when no navmesh is loaded or the query fails. Mirrors the
+/// pre-C3.1 snap path verbatim so NPCs render identically to before.
+fn nav_y_bevy(
+    nav_guard: &Option<std::sync::MutexGuard<'_, ffxi_nav_recast::RecastNavMesh>>,
+    cache: &mut SnapHeightCache,
+    entity_id: u32,
+    t: &Transform,
+) -> Option<f32> {
+    let g = nav_guard.as_ref()?;
+    let ffxi_x = t.translation.x;
+    let ffxi_y = -t.translation.z;
+    let z_hint = cache
+        .0
+        .get(&entity_id)
+        .copied()
+        .unwrap_or(-t.translation.y);
+    let h = g.nearest_height_at(ffxi_x, ffxi_y, z_hint)?;
+    cache.0.insert(entity_id, h);
+    Some(-h)
 }
 
 

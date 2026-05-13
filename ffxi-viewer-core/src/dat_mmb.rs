@@ -30,6 +30,8 @@ use bevy::prelude::*;
 use ffxi_dat::mmb::{MmbHeader, MmbSubRecord};
 use ffxi_dat::{mmb, walk, ChunkKind, DatRoot};
 
+use crate::look_resolver::dispatch_look_driven_models;
+use crate::scene::TrackedEntities;
 use crate::snapshot::SceneState;
 
 /// Marker for overlay entities spawned by this module — lets the
@@ -37,17 +39,23 @@ use crate::snapshot::SceneState;
 #[derive(Component)]
 pub struct MmbOverlay;
 
-/// Spawn-an-MMB-at-position request. Fired by the slash-command
-/// dispatcher; consumed by [`process_load_mmb_requests`].
+/// Spawn-an-MMB request. Fired by the slash-command dispatcher;
+/// consumed by [`process_load_mmb_requests`].
+///
+/// When `entity_id` is `Some`, the spawned mesh is parented under the
+/// `WorldEntity` with that wire id (looked up via `TrackedEntities`) —
+/// the model then moves with the entity. When `None`, the mesh spawns
+/// as a free overlay at `world_pos` (original `/load_mmb` behaviour).
 ///
 /// `world_pos` is already in Bevy coordinates — the parser pre-applies
 /// `ffxi_to_bevy` so this system stays unaware of the FFXI/Bevy axis
-/// convention.
+/// convention. When `entity_id` is `Some`, `world_pos` is ignored.
 #[derive(Message, Debug, Clone, Copy)]
 pub struct LoadMmbRequest {
     pub file_id: u32,
     pub chunk_idx: usize,
     pub world_pos: Vec3,
+    pub entity_id: Option<u32>,
 }
 
 /// Plugin: registers the MMB and MZB debug-overlay events and their
@@ -63,6 +71,7 @@ impl Plugin for DatOverlayPlugin {
             .add_message::<crate::dat_mzb::LoadMzbRequest>()
             .init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
             .init_resource::<crate::dat_mzb::DrawDistance>()
+            .init_resource::<crate::dat_mzb::MzbCollisionGeometry>()
             .add_systems(
                 Update,
                 (
@@ -70,8 +79,14 @@ impl Plugin for DatOverlayPlugin {
                     // `LoadMzbRequest` that the consumer system reads
                     // *the same frame* — chaining the pair removes the
                     // one-frame delay that an unchained order would
-                    // introduce on every zone transition.
+                    // introduce on every zone transition. The look
+                    // dispatcher must run *before* `process_load_mmb_requests`
+                    // so the events it emits get consumed the same
+                    // frame the look change was detected — otherwise
+                    // an entity's model appears one tick after its
+                    // look update arrives.
                     crate::dat_mzb::auto_load_zone_geometry_system,
+                    dispatch_look_driven_models,
                     process_load_mmb_requests,
                     crate::dat_mzb::process_load_mzb_requests,
                 )
@@ -206,6 +221,7 @@ pub fn process_load_mmb_requests(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scene_state: ResMut<SceneState>,
+    tracked: Res<TrackedEntities>,
 ) {
     for req in events.read() {
         let submeshes = match load_mmb(req.file_id, req.chunk_idx) {
@@ -229,16 +245,43 @@ pub fn process_load_mmb_requests(
             continue;
         }
 
-        // Parent entity owns the world transform; sub-record meshes are
-        // children at local-zero. Lets us despawn the whole model
-        // recursively later (or animate it as one).
-        let parent = commands
-            .spawn((
-                MmbOverlay,
-                Transform::from_translation(req.world_pos),
-                Visibility::default(),
-            ))
-            .id();
+        // Two parenting modes:
+        //
+        // - `entity_id = Some(id)` (look-driven or `/load_mmb_on`): hang
+        //   the meshes under the existing `WorldEntity` so they inherit
+        //   its world transform, and strip the entity's debug capsule
+        //   `Mesh3d` so the real model replaces the placeholder.
+        // - `entity_id = None` (free overlay, original `/load_mmb`):
+        //   spawn a new parent at `world_pos`.
+        let parent = match req.entity_id.and_then(|id| tracked.by_id.get(&id)) {
+            Some(&bevy_e) => {
+                // Hide the debug capsule by removing its mesh handle.
+                // We don't despawn the WorldEntity itself — it carries
+                // the wire id, transform, picking, nameplate, and HP bar
+                // child, all of which we still want.
+                commands.entity(bevy_e).remove::<Mesh3d>();
+                bevy_e
+            }
+            None => {
+                if let Some(missing) = req.entity_id {
+                    push_system_msg(
+                        &mut scene_state,
+                        format!(
+                            "/load_mmb_on {missing} {} {}: no tracked entity for id {missing} \
+                             — spawning at world_pos instead",
+                            req.file_id, req.chunk_idx,
+                        ),
+                    );
+                }
+                commands
+                    .spawn((
+                        MmbOverlay,
+                        Transform::from_translation(req.world_pos),
+                        Visibility::default(),
+                    ))
+                    .id()
+            }
+        };
 
         let n_subs = submeshes.len();
         for (i, sub) in submeshes.into_iter().enumerate() {
@@ -270,16 +313,20 @@ pub fn process_load_mmb_requests(
             let _ = sub.variant_name;
         }
 
+        let where_ = match req.entity_id {
+            Some(id) => format!("on entity {id}"),
+            None => format!(
+                "at ({:.1}, {:.1}, {:.1})",
+                req.world_pos.x, req.world_pos.y, req.world_pos.z,
+            ),
+        };
         push_system_msg(
             &mut scene_state,
             format!(
-                "/load_mmb {} {}: spawned {n_subs} sub-mesh{} at ({:.1}, {:.1}, {:.1})",
+                "/load_mmb {} {}: spawned {n_subs} sub-mesh{} {where_}",
                 req.file_id,
                 req.chunk_idx,
                 if n_subs == 1 { "" } else { "es" },
-                req.world_pos.x,
-                req.world_pos.y,
-                req.world_pos.z,
             ),
         );
     }

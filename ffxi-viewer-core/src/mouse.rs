@@ -39,12 +39,10 @@ const MOUSE_PITCH_SENS: f32 = 0.005;
 /// while spreading a trackpad swipe across a few yalms instead of
 /// the entire range.
 const WHEEL_ZOOM_STEP: f32 = 0.25;
-/// Closest the chase camera can pull in. Below ~3.0 the player capsule
-/// clips through the near plane; for closer-than-3 use FirstPerson.
-const DIST_MIN: f32 = 3.0;
-/// Furthest the chase camera can pull out. Beyond 30 the avatar is too
-/// small to read on the operator's screen and HUD becomes the main signal.
-const DIST_MAX: f32 = 30.0;
+// Distance clamps live on `ChaseCamera` (`DIST_MIN`/`DIST_MAX`) so the
+// keyboard zoom path in `view_native::input` shares them with the wheel.
+const DIST_MIN: f32 = ChaseCamera::DIST_MIN;
+const DIST_MAX: f32 = ChaseCamera::DIST_MAX;
 
 /// Per-frame snapshot of the mouse. Replaces `MessageReader<...>` for any
 /// consumer that just needs "what is the cursor doing right now" — the

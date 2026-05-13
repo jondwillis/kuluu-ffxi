@@ -116,9 +116,11 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
         &[
             HelpEntry { aliases: &["snapshot"], usage: "", summary: "emit a one-shot scene snapshot" },
             HelpEntry { aliases: &["zonechange", "rzc"], usage: "<id>", summary: "request zone change (debug)" },
+            HelpEntry { aliases: &["mhexit"], usage: "[home|1f|2f|garden|<region> [slot]]", summary: "leave the current Mog House (sends 0x05E zmrq)" },
             HelpEntry { aliases: &["agent"], usage: "<pause|resume|status>", summary: "human-in-control flag for agent commands" },
             HelpEntry { aliases: &["keybinds", "keybind", "binds"], usage: "<preset|list|reset>", summary: "manage keybind presets" },
             HelpEntry { aliases: &["load_mmb", "loadmmb"], usage: "<file_id> <chunk_idx>", summary: "spawn MMB model at self_pos (debug overlay)" },
+            HelpEntry { aliases: &["load_mmb_on", "loadmmbon"], usage: "<entity_id> <file_id> <chunk_idx>", summary: "attach MMB model under a tracked entity (debug)" },
             HelpEntry { aliases: &["load_mzb", "loadmzb"], usage: "<file_id> [chunk_idx]", summary: "load MZB mesh-library at self_pos (debug overlay)" },
             HelpEntry { aliases: &["help", "?"], usage: "", summary: "show this listing" },
         ],
@@ -223,6 +225,10 @@ pub enum SlashOutcome {
         file_id: u32,
         chunk_idx: usize,
         world_pos: WireVec3,
+        /// When `Some`, parent the spawned mesh under the wire entity
+        /// with this id rather than at `world_pos`. Set by
+        /// `/load_mmb_on <entity_id> <file_id> <chunk_idx>`.
+        entity_id: Option<u32>,
     },
     /// `/load_mzb <file_id> [chunk_idx]` — debug-overlay: load a zone
     /// mesh-library. Optional chunk_idx because zone-bundle DATs
@@ -238,10 +244,17 @@ pub enum SlashOutcome {
     /// `Mob` controls non-PC entity capsule cull. Naked `/drawdistance`
     /// shows the current values (caller dispatches a SystemMessage).
     SetDrawDistance(DrawDistanceOp),
-    /// `/zonegeom on|off` — flip MZB overlay visibility. Diagnostic
-    /// tool for perf — toggle off to verify whether the MZB merged
-    /// mesh is the bottleneck.
-    ToggleZoneGeom(Option<bool>),
+    /// `/zonegeom off|collision|all|toggle` — set MZB overlay visibility.
+    /// `None` means cycle (toggle). The three render states are split so
+    /// operators can hide the visually-noisy non-collision (decorative)
+    /// meshes while keeping the LoS-blocking collision mesh visible.
+    SetZoneGeom(Option<ffxi_viewer_core::dat_mzb::ZoneGeomMode>),
+    /// `/debug heights` — diagnostic. Dumps player Bevy y, navmesh
+    /// height, MZB-collision-mesh height (downward raycast), and the
+    /// server-snapshot self pos. Dispatcher writes a `DebugHeightsRequest`
+    /// event; the consumer system reads the navmesh + collision mesh
+    /// resources and pushes a multi-line system toast.
+    DebugHeights,
 }
 
 /// `/drawdistance` subcommand variants. `Show` is a no-arg query for
@@ -402,6 +415,7 @@ pub fn parse_slash(
         "snapshot" => SlashOutcome::Command(AgentCommand::Snapshot),
         "bank" => parse_bank(rest),
         "zonechange" | "rzc" => parse_zone_change(rest),
+        "mhexit" => parse_mhexit(rest, zone_id),
         "agent" => parse_agent(rest),
         // `/disconnect` and `/quit` skip the in-world LeaveGame timer
         // and just drop the TCP/UDP sockets. Distinct from `/logout` —
@@ -430,10 +444,12 @@ pub fn parse_slash(
         "heal" => parse_heal(rest),
         "navmesh" => parse_navmesh(rest),
         "load_mmb" | "loadmmb" => parse_load_mmb(rest, self_pos),
+        "load_mmb_on" | "loadmmbon" => parse_load_mmb_on(rest),
         "load_mzb" | "loadmzb" => parse_load_mzb(rest, self_pos),
         "look" => parse_look(rest, entities, self_pos, current_target),
         "drawdistance" | "dd" => parse_drawdistance(rest),
         "zonegeom" => parse_zonegeom(rest),
+        "debug" => parse_debug(rest),
         "keybinds" | "keybind" | "binds" => parse_keybinds(rest),
         "pathto" => parse_pathto(rest, entities, current_target),
         "zones" => parse_zones(zone_id),
@@ -996,6 +1012,115 @@ fn parse_zone_change(rest: &str) -> SlashOutcome {
     }
 }
 
+/// `/mhexit [home|1f|2f|garden|<region> [slot]]` — send the universal
+/// Mog House exit packet (`0x05E MAPRECT` with `RectID="zmrq"`).
+///
+/// No-arg defaults to `MogHouseExit::Home`, which is the safe "step back
+/// out the door" exit (matches `MyRoomExitMode::AreaEnteredFrom` on the
+/// server; bit is ignored). Other forms:
+///   - `home` — same as no-arg
+///   - `1f` / `2f` — relocate inside the Mog House
+///   - `garden` — zone to Mog Garden
+///   - `<region> [slot]` — alternate-city exit (requires the matching
+///     quest flag). Regions: `sandoria`, `bastok`, `windurst`, `jeuno`,
+///     `whitegate`, `adoulin`. `slot` defaults to 1 (the home zone in
+///     that region).
+fn parse_mhexit(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
+    let trimmed = rest.trim().to_ascii_lowercase();
+    let mut parts = trimmed.split_whitespace();
+    let first = parts.next();
+    let slot: u8 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let kind = match first {
+        None | Some("home") | Some("") => crate::state::MogHouseExit::Home,
+        Some("1f") | Some("mog1f") => crate::state::MogHouseExit::Mog1F,
+        Some("2f") | Some("mog2f") => crate::state::MogHouseExit::Mog2F,
+        Some("garden") | Some("moggarden") => crate::state::MogHouseExit::MogGarden,
+        Some("sandoria") | Some("sandy") => crate::state::MogHouseExit::Sandoria { slot },
+        Some("bastok") => crate::state::MogHouseExit::Bastok { slot },
+        Some("windurst") | Some("windy") => crate::state::MogHouseExit::Windurst { slot },
+        Some("jeuno") => crate::state::MogHouseExit::Jeuno { slot },
+        Some("whitegate") | Some("aht_urhgan") => {
+            crate::state::MogHouseExit::Whitegate { slot }
+        }
+        Some("adoulin") => crate::state::MogHouseExit::Adoulin { slot },
+        Some("auto") => {
+            // `/mhexit auto` — look up which region's Mog House we're in
+            // from `zone_id` and dispatch the matching `Option1` slot
+            // (= the city we entered the mog house from). Useful as a
+            // default when the operator doesn't remember the region
+            // name; falls back to `home` if the zone isn't in the table.
+            match zone_id.and_then(home_region_bit_for_zone) {
+                Some(bit) => bit_and_slot_to_exit(bit, 1),
+                None => {
+                    return SlashOutcome::SystemMessage(format!(
+                        "/mhexit auto: zone {} isn't in the home-region table — \
+                         use `/mhexit home` or pass a region name explicitly",
+                        zone_id.map_or("unknown".into(), |z| z.to_string()),
+                    ));
+                }
+            }
+        }
+        Some(other) => {
+            return SlashOutcome::SystemMessage(format!(
+                "/mhexit: unknown form `{other}` — try home|1f|2f|garden|\
+                 sandoria|bastok|windurst|jeuno|whitegate|adoulin|auto"
+            ));
+        }
+    };
+    SlashOutcome::Command(AgentCommand::MogHouseExit { kind })
+}
+
+/// Map a `MyRoomExitBit` value (1=Sandoria, 2=Bastok, …, 9=Adoulin) +
+/// `slot` (1..4) to the corresponding [`MogHouseExit`] variant. Kept
+/// separate from `home_region_bit_for_zone` so the auto-detect can stay
+/// tiny — the heavy lifting (which zones are in which region) lives in
+/// that single table.
+fn bit_and_slot_to_exit(bit: u8, slot: u8) -> crate::state::MogHouseExit {
+    use crate::state::MogHouseExit;
+    match bit {
+        1 => MogHouseExit::Sandoria { slot },
+        2 => MogHouseExit::Bastok { slot },
+        3 => MogHouseExit::Windurst { slot },
+        4 => MogHouseExit::Jeuno { slot },
+        5 => MogHouseExit::Whitegate { slot },
+        9 => MogHouseExit::Adoulin { slot },
+        _ => MogHouseExit::Home,
+    }
+}
+
+/// Map a current `zone_id` to the `MyRoomExitBit` whose region contains it.
+///
+/// Numeric ids come from `vendor/server/src/map/zone.h` (the LSB `ZONETYPE`
+/// enum); the region partition mirrors
+/// `vendor/server/src/map/utils/zoneutils.cpp::GetCurrentRegion`; the
+/// `MyRoomExitBit` codes are
+/// `vendor/server/src/map/packets/c2s/0x05e_maprect.h::GP_CLI_COMMAND_MAPRECT_MYROOMEXITBIT`.
+///
+/// Only the six regions that have Mog Houses appear here; everything else
+/// returns `None` (so `/mhexit auto` errors out cleanly). `Home` (no-arg
+/// `/mhexit`) works from any Mog House without consulting this table —
+/// the server treats `MyRoomExitMode::AreaEnteredFrom` as "walk back out
+/// the way I came in," which doesn't need a region.
+///
+/// Note the Whitegate row: vendor `zone.h:48,50` gives Al Zahbi=48 and
+/// Aht Urhgan Whitegate=50 (id 49 is `ZONE_HALL_OF_BINDING`, which is
+/// *not* in the West-Aht-Urhgan region).
+fn home_region_bit_for_zone(zone_id: u16) -> Option<u8> {
+    match zone_id {
+        230..=233 => Some(1), // Sandoria: S.Sandy/N.Sandy/Port/Chateau
+        234..=237 => Some(2), // Bastok: Mines/Markets/Port/Metalworks
+        238..=242 => Some(3), // Windurst: Waters/Walls/Port/Woods/Heavens Tower
+        243..=246 => Some(4), // Jeuno: Ru'Lude/Upper/Lower/Port
+        48 | 50 => Some(5),   // West Aht Urhgan: Al Zahbi, Whitegate
+        256 | 257 => Some(9), // Adoulin: Western, Eastern
+        _ => None,
+    }
+}
+
 /// Helper: resolve `[target_id] [target_index]` from raw parts, falling
 /// back to the current target's entity lookup. Returns `(id, idx)` or a
 /// short error message suitable for embedding in a `/<cmd>: …` reply.
@@ -1113,20 +1238,40 @@ fn parse_zoneto(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
 /// they can walk around the spawned model. `ffxi_to_bevy` is applied
 /// here at the parser boundary, matching the convention used by every
 /// other place we cross the FFXI→Bevy axis flip.
-/// `/zonegeom on|off|toggle` — flip MZB overlay visibility.
+/// `/debug <subcommand>` — namespaced diagnostics. Currently:
+///   - `heights` — dump player/navmesh/MZB collision heights at the
+///     player's XZ. Used to diagnose the navmesh-vs-MZB vertical gap.
+fn parse_debug(rest: &str) -> SlashOutcome {
+    let arg = rest.trim().to_ascii_lowercase();
+    match arg.as_str() {
+        "heights" | "h" => SlashOutcome::DebugHeights,
+        "" => SlashOutcome::SystemMessage(
+            "/debug: subcommands — `heights`".to_string(),
+        ),
+        other => SlashOutcome::SystemMessage(format!(
+            "/debug: unknown subcommand `{other}` (try `heights`)"
+        )),
+    }
+}
+
+/// `/zonegeom off|collision|all|toggle` — set MZB overlay visibility.
+/// `on` is an alias for `all` (back-compat with the old bool toggle).
+/// `toggle`/empty cycles Collision → All → Off → Collision.
 fn parse_zonegeom(rest: &str) -> SlashOutcome {
+    use ffxi_viewer_core::dat_mzb::ZoneGeomMode;
     let arg = rest.trim().to_ascii_lowercase();
     let setting = match arg.as_str() {
         "" | "toggle" => None,
-        "on" | "true" | "1" => Some(true),
-        "off" | "false" | "0" => Some(false),
+        "off" | "false" | "0" => Some(ZoneGeomMode::Off),
+        "collision" | "coll" => Some(ZoneGeomMode::Collision),
+        "all" | "on" | "true" | "1" => Some(ZoneGeomMode::All),
         other => {
             return SlashOutcome::SystemMessage(format!(
-                "/zonegeom: bad arg `{other}` (use on|off|toggle)"
+                "/zonegeom: bad arg `{other}` (use off|collision|all|toggle)"
             ));
         }
     };
-    SlashOutcome::ToggleZoneGeom(setting)
+    SlashOutcome::SetZoneGeom(setting)
 }
 
 /// `/drawdistance` family. Matches Ashita/Windower conventions:
@@ -1229,6 +1374,54 @@ fn parse_load_mmb(rest: &str, self_pos: WireVec3) -> SlashOutcome {
         file_id,
         chunk_idx,
         world_pos: self_pos,
+        entity_id: None,
+    }
+}
+
+/// `/load_mmb_on <entity_id> <file_id> <chunk_idx>` — debug variant of
+/// `/load_mmb` that parents the spawned mesh under a tracked wire
+/// entity instead of placing it at the operator's position. Lets
+/// operators dry-run the look-driven spawn pipeline (Stages 2+) with
+/// a manually chosen MMB before the resolver knows how to pick one.
+fn parse_load_mmb_on(rest: &str) -> SlashOutcome {
+    let mut parts = rest.split_whitespace();
+    let entity_str = parts.next().unwrap_or("");
+    let file_str = parts.next().unwrap_or("");
+    let chunk_str = parts.next().unwrap_or("");
+    if entity_str.is_empty() || file_str.is_empty() || chunk_str.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/load_mmb_on: usage `/load_mmb_on <entity_id> <file_id> <chunk_idx>`".into(),
+        );
+    }
+    let entity_id: u32 = match entity_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return SlashOutcome::SystemMessage(format!(
+                "/load_mmb_on: bad entity_id `{entity_str}`"
+            ))
+        }
+    };
+    let file_id: u32 = match file_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return SlashOutcome::SystemMessage(format!("/load_mmb_on: bad file_id `{file_str}`"))
+        }
+    };
+    let chunk_idx: usize = match chunk_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return SlashOutcome::SystemMessage(format!(
+                "/load_mmb_on: bad chunk_idx `{chunk_str}`"
+            ))
+        }
+    };
+    SlashOutcome::LoadMmb {
+        file_id,
+        chunk_idx,
+        // `world_pos` is unused when `entity_id` is `Some`, but the
+        // outcome shape is shared with `/load_mmb`. Pass a sentinel.
+        world_pos: WireVec3 { x: 0.0, y: 0.0, z: 0.0 },
+        entity_id: Some(entity_id),
     }
 }
 
@@ -1407,6 +1600,7 @@ mod tests {
             claim_id: 0,
             speed: 0,
             speed_base: 0,
+            look: None,
         }
     }
 
@@ -1685,12 +1879,47 @@ mod tests {
     fn load_mmb_parses_file_id_chunk_idx_and_captures_self_pos() {
         let pos = WireVec3 { x: 12.5, y: -7.0, z: 3.25 };
         match parse_slash("/load_mmb 115 18", &empty_entities(), pos, None, None) {
-            SlashOutcome::LoadMmb { file_id, chunk_idx, world_pos } => {
+            SlashOutcome::LoadMmb { file_id, chunk_idx, world_pos, entity_id } => {
                 assert_eq!(file_id, 115);
                 assert_eq!(chunk_idx, 18);
                 assert_eq!(world_pos, pos);
+                assert_eq!(entity_id, None);
             }
             other => panic!("expected LoadMmb, got {other:?}"),
+        }
+    }
+
+    /// `/load_mmb_on` carries the entity_id through unchanged. The
+    /// world_pos is sentinel — the consumer ignores it when entity_id
+    /// is `Some` — but we still verify the field is populated.
+    #[test]
+    fn load_mmb_on_parses_entity_id() {
+        match parse_slash("/load_mmb_on 1234 115 18", &empty_entities(), origin(), None, None) {
+            SlashOutcome::LoadMmb { file_id, chunk_idx, entity_id, .. } => {
+                assert_eq!(file_id, 115);
+                assert_eq!(chunk_idx, 18);
+                assert_eq!(entity_id, Some(1234));
+            }
+            other => panic!("expected LoadMmb with entity_id, got {other:?}"),
+        }
+        // Alias and bad-args paths surface as SystemMessage.
+        assert!(matches!(
+            parse_slash("/loadmmbon 99 7 0", &empty_entities(), origin(), None, None),
+            SlashOutcome::LoadMmb { entity_id: Some(99), .. }
+        ));
+        for s in [
+            "/load_mmb_on",
+            "/load_mmb_on 1234",
+            "/load_mmb_on 1234 115",
+            "/load_mmb_on foo 115 18",
+        ] {
+            assert!(
+                matches!(
+                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    SlashOutcome::SystemMessage(_)
+                ),
+                "expected SystemMessage for {s}",
+            );
         }
     }
 
@@ -1702,7 +1931,7 @@ mod tests {
         // Alias `/loadmmb` (no underscore) still routes.
         assert!(matches!(
             parse_slash("/loadmmb 115 18", &empty_entities(), origin(), None, None),
-            SlashOutcome::LoadMmb { file_id: 115, chunk_idx: 18, .. }
+            SlashOutcome::LoadMmb { file_id: 115, chunk_idx: 18, entity_id: None, .. }
         ));
         // Missing chunk_idx, non-numeric file_id, non-numeric chunk_idx.
         for s in ["/load_mmb", "/load_mmb 115", "/load_mmb foo 18", "/load_mmb 115 bar"] {
@@ -2180,6 +2409,76 @@ mod tests {
                 assert_eq!(line_id, 42);
             }
             other => panic!("expected RequestZoneChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mhexit_defaults_to_home() {
+        match parse_slash("/mhexit", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
+                assert!(matches!(kind, crate::state::MogHouseExit::Home));
+                assert_eq!(kind.wire_pair(), (1, 0));
+            }
+            other => panic!("expected MogHouseExit::Home, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mhexit_region_with_slot() {
+        match parse_slash("/mhexit bastok 2", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
+                assert!(matches!(
+                    kind,
+                    crate::state::MogHouseExit::Bastok { slot: 2 }
+                ));
+                assert_eq!(kind.wire_pair(), (2, 2));
+            }
+            other => panic!("expected MogHouseExit::Bastok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mhexit_special_modes() {
+        for (input, expected_mode) in &[
+            ("/mhexit 1f", 126u8),
+            ("/mhexit 2f", 125),
+            ("/mhexit garden", 127),
+        ] {
+            match parse_slash(input, &empty_entities(), origin(), None, None) {
+                SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
+                    let (_, mode) = kind.wire_pair();
+                    assert_eq!(mode, *expected_mode, "input={input}");
+                }
+                other => panic!("expected MogHouseExit, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mhexit_auto_resolves_known_zone() {
+        // S. San d'Oria (zone 230) is in the Sandoria region (bit 1); auto
+        // picks Option1 = S.Sandy. wire_pair → (1, 1).
+        match parse_slash("/mhexit auto", &empty_entities(), origin(), None, Some(230)) {
+            SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
+                assert!(matches!(
+                    kind,
+                    crate::state::MogHouseExit::Sandoria { slot: 1 }
+                ));
+                assert_eq!(kind.wire_pair(), (1, 1));
+            }
+            other => panic!("expected MogHouseExit::Sandoria, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mhexit_auto_errors_for_unknown_zone() {
+        // Open-world zone (e.g. Ronfaure = 100) isn't in a Mog House region,
+        // so `auto` returns a usage error rather than guessing.
+        match parse_slash("/mhexit auto", &empty_entities(), origin(), None, Some(100)) {
+            SlashOutcome::SystemMessage(msg) => {
+                assert!(msg.contains("auto"), "got: {msg}");
+            }
+            other => panic!("expected error SystemMessage, got {other:?}"),
         }
     }
 
