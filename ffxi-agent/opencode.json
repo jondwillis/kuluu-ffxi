@@ -3,11 +3,11 @@
   "agent": {
     "farm": {
       "model": "llama.cpp/qwen-3.6-35b-a3b",
-      "prompt": "Headless mode, no giving up or asking the user for anything. Use `ffxi-mcp` to drive @playbooks/farming.md"
+      "prompt": "{file:./.claude/agents/farm_logic.md}"
     }
   },
   "mcp": {
-    "ffxi-mcp": {
+    "ffxi": {
       "type": "local",
       "command": [
         "cargo",
@@ -27,6 +27,26 @@
         "FFXI_PASS": "testpass123",
         "FFXI_CHAR": "Cleric",
         "FFXI-RELAY_LISTEN": "auto",
+        "RUST_LOG": "info"
+      }
+    },
+    "ffxi-attach": {
+      "type": "local",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "--manifest-path",
+        "../Cargo.toml",
+        "-p",
+        "ffxi-mcp"
+      ],
+      "environment": {
+        "FFXI_ATTACH": "auto",
+        "FFXI_SERVER": "127.0.0.1",
+        "FFXI_AUTH_PORT": "54231",
+        "FFXI_DATA_PORT": "54230",
+        "FFXI_VIEW_PORT": "54001",
         "RUST_LOG": "info"
       }
     }
