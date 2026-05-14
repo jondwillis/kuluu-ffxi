@@ -235,6 +235,7 @@ pub fn party_to_wire(m: &PartyMember) -> wire::PartyMember {
         sub_job_lv: m.sub_job_lv,
         is_party_leader: m.is_party_leader,
         is_alliance_leader: m.is_alliance_leader,
+        in_mog_house: m.in_mog_house,
     }
 }
 

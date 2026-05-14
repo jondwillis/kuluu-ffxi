@@ -19,7 +19,7 @@
 
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
+use bevy::ui::RelativeCursorPosition;
 use ffxi_viewer_wire::{ChatChannel, ChatLine};
 
 use crate::hud::palette;
@@ -31,10 +31,12 @@ use crate::snapshot::{rendered_chat, SceneState};
 /// height at the default font size.
 pub const VISIBLE_ROWS: usize = 8;
 
-/// Number of rows to advance per mouse-wheel notch. Three rows feels
-/// close to a typical browser/Discord wheel tick; PageUp/PageDown still
-/// jumps `VISIBLE_ROWS` so the keyboard path is unchanged.
-const WHEEL_ROWS_PER_NOTCH: usize = 3;
+/// Rows per unit of `MouseWheel.y`. Tuned so a normal trackpad two-finger
+/// swipe scrolls at a comfortable rate — values much above ~0.4 feel
+/// "skippy" on macOS. Independent of frame rate: the accumulator in
+/// [`ChatScrollAccum`] / [`BattleScrollAccum`] sums sub-row fractions
+/// across frames and only spends integer rows when |accum| ≥ 1.0.
+const WHEEL_ROWS_PER_UNIT: f32 = 0.25;
 
 /// Chat-panel scroll offset in row units (one [`ChatLine`] per unit).
 /// `0` = newest message pinned to the bottom (default tailing behavior);
@@ -44,14 +46,70 @@ const WHEEL_ROWS_PER_NOTCH: usize = 3;
 /// so mouse-wheel can drive it in any [`InputMode`]. Keyboard
 /// PassiveCursor handlers and the wheel system both mutate it; the
 /// chat panel render reads it unconditionally.
+///
+/// Drives the *social* panel (Chat 1). Keyboard PassiveCursor scroll keys
+/// target this one — that's the panel the user types into. The battle
+/// panel (Chat 2) has its own [`BattleScroll`] driven by the mouse wheel
+/// only.
 #[derive(Resource, Debug, Default, Clone, Copy)]
 pub struct ChatScroll {
     pub rows: usize,
 }
 
-/// Marker on the panel root.
+/// Per-panel scroll offset for the combat/system panel (Chat 2). Wheel
+/// over Chat 2 drives this; wheel over Chat 1 drives [`ChatScroll`].
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct BattleScroll {
+    pub rows: usize,
+}
+
+/// Fractional-row accumulator for the social panel's wheel scroll. The
+/// wheel system adds `delta * WHEEL_ROWS_PER_UNIT` here every frame; when
+/// `|frac| >= 1.0` it spends whole rows into [`ChatScroll`]. Frame-rate
+/// independent: total scroll distance depends only on total wheel delta,
+/// not on how many frames it spans.
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct ChatScrollAccum {
+    pub frac: f32,
+}
+
+/// Fractional-row accumulator for the battle panel. See [`ChatScrollAccum`].
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct BattleScrollAccum {
+    pub frac: f32,
+}
+
+/// Which side of the FFXI-style split a chat panel renders.
+///
+/// `Social` (Chat 1): Say/Shout/Tell/Party/Linkshell/Yell/Other +
+/// local toasts. The panel the operator types into.
+///
+/// `Battle` (Chat 2): combat log + server System messages — the
+/// noisy stream we want isolated from typed conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatKind {
+    Social,
+    Battle,
+}
+
+impl ChatKind {
+    /// Does a given channel render in this panel? See [`ChatKind`] docs
+    /// for the split rules.
+    pub fn accepts(self, c: ChatChannel) -> bool {
+        match self {
+            ChatKind::Battle => matches!(c, ChatChannel::Battle | ChatChannel::System),
+            ChatKind::Social => !matches!(c, ChatChannel::Battle | ChatChannel::System),
+        }
+    }
+}
+
+/// Marker on the panel root. Carries which side of the split this panel
+/// is rendering so the update systems can filter chat lines and pick the
+/// correct scroll resource.
 #[derive(Component)]
-pub struct ChatPanel;
+pub struct ChatPanel {
+    pub kind: ChatKind,
+}
 
 /// Marker on each row container; `slot` is its position 0..VISIBLE_ROWS-1.
 #[derive(Component)]
@@ -64,9 +122,27 @@ pub struct ChatRow {
 pub struct ChatRowBody;
 
 pub fn spawn_chat_panel(mut commands: Commands) {
+    // Social panel: bottom-left, 50% width.
+    spawn_panel(&mut commands, ChatKind::Social, Val::Px(0.0), None);
+    // Battle panel: bottom-right, 48% width with a 2% gap.
+    spawn_panel(&mut commands, ChatKind::Battle, Val::Percent(52.0), Some(Val::Px(0.0)));
+}
+
+fn spawn_panel(
+    commands: &mut Commands,
+    kind: ChatKind,
+    left: Val,
+    right: Option<Val>,
+) {
+    let width = if right.is_some() { Val::Percent(48.0) } else { Val::Percent(50.0) };
     commands
         .spawn((
-            ChatPanel,
+            ChatPanel { kind },
+            // `RelativeCursorPosition::cursor_over` is what
+            // `chat_wheel_scroll_system` reads to decide whether to
+            // consume the wheel. No `Pickable` needed — Bevy UI
+            // updates the field automatically each frame.
+            RelativeCursorPosition::default(),
             Node {
                 position_type: PositionType::Absolute,
                 // Stack: 28px diagnostics bar + 24px chat-input slot + 2px
@@ -75,14 +151,21 @@ pub fn spawn_chat_panel(mut commands: Commands) {
                 // its bottommost row. When the input is hidden the gap is
                 // just empty breathing room above the diagnostics strip.
                 bottom: Val::Px(54.0),
-                left: Val::Px(0.0),
-                width: Val::Percent(60.0),
+                left,
+                right: right.unwrap_or(Val::Auto),
+                width,
                 height: Val::Px(160.0),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
                 border: UiRect::all(Val::Px(1.0)),
                 flex_direction: FlexDirection::Column,
                 justify_content: JustifyContent::FlexEnd,
                 row_gap: Val::Px(2.0),
+                // Clip anything that overflows the panel rect. Without
+                // this, a chat row that wraps to taller than the
+                // remaining panel space spills upward over the 3D
+                // viewport (visible bug: `/help`'s multi-line output
+                // overflowed the panel before this was set).
+                overflow: Overflow::clip(),
                 ..default()
             },
             BackgroundColor(palette::BACKGROUND),
@@ -145,8 +228,9 @@ pub fn update_chat_panel(
     state: Res<SceneState>,
     mode: Res<InputMode>,
     scroll: Res<ChatScroll>,
-    mut panel_q: Query<&mut BorderColor, With<ChatPanel>>,
-    rows: Query<(&ChatRow, &Children)>,
+    battle_scroll: Res<BattleScroll>,
+    mut panel_q: Query<(&ChatPanel, &mut BorderColor, &Children)>,
+    rows: Query<(&ChatRow, &Children), Without<ChatPanel>>,
     mut body_q: Query<(&mut Text, &mut TextColor), With<ChatRowBody>>,
 ) {
     // Intentionally NOT gated on `state.dirty` — the dirty flag is reset
@@ -157,72 +241,83 @@ pub fn update_chat_panel(
     // resets dirty next frame before this gets a second chance). The
     // body's per-row `if **text != want` change-detection guard keeps
     // the per-frame cost trivial when nothing actually changed.
-    let chat = rendered_chat(&state);
+    let all = rendered_chat(&state);
 
-    // Scroll offset lives in the `ChatScroll` resource so mouse-wheel
-    // (any mode) and PassiveCursor keys both drive the same value.
-    // Writers clamp against `rendered_chat(state).len()`, so we trust
-    // the value here.
-    let scroll_offset = scroll.rows;
-    let chat_focused = scroll_offset != 0
-        || matches!(
-            &*mode,
-            InputMode::PassiveCursor(s) if matches!(s.focus, PassiveCursorFocus::Chat)
-        );
+    // Per-panel: filter the full stream by channel, then render the
+    // tail with that panel's own scroll offset. Both panels read the
+    // same source-of-truth `rendered_chat` so a new line lands in
+    // exactly one panel (the one whose `accepts()` is true).
+    for (panel, mut border, panel_children) in &mut panel_q {
+        let filtered: Vec<&ChatLine> = all
+            .iter()
+            .copied()
+            .filter(|l| panel.kind.accepts(l.channel))
+            .collect();
 
-    // Toggle the panel border between the muted default and the accent
-    // color when chat is focused. Same accent the chat-input bar uses
-    // when active, so the visual cue is consistent.
-    if let Ok(mut border) = panel_q.single_mut() {
-        let want = if chat_focused { palette::ACCENT } else { palette::BORDER };
-        if border.left != want {
-            *border = BorderColor::all(want);
-        }
-    }
+        let scroll_offset = match panel.kind {
+            ChatKind::Social => scroll.rows,
+            ChatKind::Battle => battle_scroll.rows,
+        };
 
-    let visible: Vec<Option<&ChatLine>> = (0..VISIBLE_ROWS)
-        .rev()
-        .map(|i| {
-            // Oldest visible at top; newest at bottom. Slot N-1 is newest
-            // (or `n - 1 - scroll_offset` when scrolled back). `chat` is
-            // oldest-first (server lines, then local toasts).
-            let n = chat.len();
-            // The newest visible index from the user's viewpoint is
-            // `n - 1 - scroll_offset`; row i (0..VISIBLE_ROWS) reads
-            // `(n - 1 - scroll_offset) - i`. If that's negative we
-            // emit None for the slot.
-            let newest_visible = n.checked_sub(1 + scroll_offset);
-            match newest_visible {
-                Some(top) => {
-                    if i <= top {
-                        Some(chat[top - i])
-                    } else {
-                        None
-                    }
-                }
-                None => None,
+        // The accent border is only meaningful for the social panel —
+        // that's the one keyboard PassiveCursor focuses on. The battle
+        // panel still highlights when *its own* scroll is non-zero so
+        // the operator can see they're not pinned to newest.
+        let focused = match panel.kind {
+            ChatKind::Social => {
+                scroll_offset != 0
+                    || matches!(
+                        &*mode,
+                        InputMode::PassiveCursor(s) if matches!(s.focus, PassiveCursorFocus::Chat)
+                    )
             }
-        })
-        .collect();
+            ChatKind::Battle => scroll_offset != 0,
+        };
+        let want_border = if focused { palette::ACCENT } else { palette::BORDER };
+        if border.left != want_border {
+            *border = BorderColor::all(want_border);
+        }
 
-    for (row, children) in &rows {
-        let line = visible.get(row.slot).copied().flatten();
-        for child in children.iter() {
-            if let Ok((mut text, mut tc)) = body_q.get_mut(child) {
-                match line {
-                    Some(l) => {
-                        let want = format_chat_line(l.channel, &l.sender, &l.text);
-                        if **text != want {
-                            **text = want;
-                        }
-                        let want_color = channel_color(l.channel);
-                        if tc.0 != want_color {
-                            tc.0 = want_color;
+        let visible: Vec<Option<&ChatLine>> = (0..VISIBLE_ROWS)
+            .rev()
+            .map(|i| {
+                let n = filtered.len();
+                let newest_visible = n.checked_sub(1 + scroll_offset);
+                match newest_visible {
+                    Some(top) => {
+                        if i <= top {
+                            Some(filtered[top - i])
+                        } else {
+                            None
                         }
                     }
-                    None => {
-                        if !text.is_empty() {
-                            **text = String::new();
+                    None => None,
+                }
+            })
+            .collect();
+
+        for child in panel_children.iter() {
+            let Ok((row, row_children)) = rows.get(child) else {
+                continue;
+            };
+            let line = visible.get(row.slot).copied().flatten();
+            for body_child in row_children.iter() {
+                if let Ok((mut text, mut tc)) = body_q.get_mut(body_child) {
+                    match line {
+                        Some(l) => {
+                            let want = format_chat_line(l.channel, &l.sender, &l.text);
+                            if **text != want {
+                                **text = want;
+                            }
+                            let want_color = channel_color(l.channel);
+                            if tc.0 != want_color {
+                                tc.0 = want_color;
+                            }
+                        }
+                        None => {
+                            if !text.is_empty() {
+                                **text = String::new();
+                            }
                         }
                     }
                 }
@@ -278,26 +373,44 @@ pub fn channel_color(c: ChatChannel) -> Color {
     }
 }
 
-/// Compute new `ChatScroll.rows` given a wheel delta and the current
-/// buffer length. Pure logic, no Bevy types — extracted so the
-/// clamping math can be unit-tested without spinning up a `World`.
+/// Apply a wheel delta and return the new (rows, fractional-accum) pair.
+/// Pure — no Bevy types — so the math is unit-testable.
 ///
-/// `delta` is summed `MouseWheel.y` for the frame; positive = scroll
-/// up (older content), negative = scroll down (newer). The clamp
-/// keeps the offset within `0..buffer_len-1` so we never scroll past
-/// the oldest line into empty space.
-pub fn apply_wheel_delta(current: usize, delta: f32, buffer_len: usize) -> usize {
-    if delta == 0.0 || buffer_len == 0 {
-        return current;
+/// `delta` is summed `MouseWheel.y` for the frame; positive = scroll up
+/// (older content), negative = scroll down (newer). The accumulator
+/// soaks up sub-row movement so total scroll distance is independent of
+/// frame rate: at 30 Hz vs 144 Hz, the same total `delta` produces the
+/// same total row movement.
+///
+/// Clamps the result to `0..buffer_len-1` and resets the accumulator
+/// when clamped — otherwise a long swipe past the oldest line would
+/// "bank" rows the user has to swipe back through.
+pub fn apply_wheel_delta(
+    current: usize,
+    accum: f32,
+    delta: f32,
+    buffer_len: usize,
+) -> (usize, f32) {
+    if buffer_len == 0 {
+        return (current, 0.0);
     }
-    let steps = (delta.abs().ceil() as usize).saturating_mul(WHEEL_ROWS_PER_NOTCH);
-    if delta > 0.0 {
-        current
-            .saturating_add(steps)
-            .min(buffer_len.saturating_sub(1))
+    let mut frac = accum + delta * WHEEL_ROWS_PER_UNIT;
+    // Take integer rows out of the accumulator; trunc handles both
+    // signs (positive trunc → floor, negative trunc → ceil toward 0).
+    let whole = frac.trunc() as i32;
+    frac -= whole as f32;
+    let max_rows = buffer_len.saturating_sub(1) as i32;
+    let next = (current as i32 + whole).clamp(0, max_rows);
+    // Reset the accumulator at the bounds — otherwise the user has to
+    // "spend" all the over-scroll before motion resumes the other way.
+    let frac = if next == 0 && whole < 0 {
+        0.0
+    } else if next == max_rows && whole > 0 {
+        0.0
     } else {
-        current.saturating_sub(steps)
-    }
+        frac
+    };
+    (next as usize, frac)
 }
 
 /// Mouse-wheel-over-chat-panel → scroll the chat log. Runs in
@@ -306,15 +419,18 @@ pub fn apply_wheel_delta(current: usize, delta: f32, buffer_len: usize) -> usize
 /// camera-zoom double-fire that would otherwise happen on the same
 /// physical wheel event.
 ///
-/// Hit test: cursor must be inside the chat-panel rect (computed from
-/// `ComputedNode.size` + `GlobalTransform.translation()`). Outside the
-/// rect the wheel passes through to camera zoom unchanged.
+/// Hover detection uses [`RelativeCursorPosition::cursor_over`], the
+/// Bevy 0.17 idiom for "is the mouse inside this UI node right now?".
+/// Bevy populates the field every frame; outside the panel the wheel
+/// passes through to camera zoom unchanged.
 pub fn chat_wheel_scroll_system(
     mut wheel: MessageReader<MouseWheel>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    panel_q: Query<(&ComputedNode, &GlobalTransform), With<ChatPanel>>,
+    panel_q: Query<(&ChatPanel, &RelativeCursorPosition)>,
     state: Res<SceneState>,
     mut scroll: ResMut<ChatScroll>,
+    mut battle_scroll: ResMut<BattleScroll>,
+    mut accum: ResMut<ChatScrollAccum>,
+    mut battle_accum: ResMut<BattleScrollAccum>,
     mut pointer: ResMut<MousePointer>,
 ) {
     let mut delta: f32 = 0.0;
@@ -324,25 +440,35 @@ pub fn chat_wheel_scroll_system(
     if delta == 0.0 {
         return;
     }
-    let Ok(window) = windows.single() else {
-        return;
-    };
-    let Some(cursor) = window.cursor_position() else {
-        return;
-    };
-    let Ok((node, gt)) = panel_q.single() else {
-        return;
-    };
-    let size = node.size();
-    let center = gt.translation().truncate();
-    let half = size * 0.5;
-    let min = center - half;
-    let max = center + half;
-    if cursor.x < min.x || cursor.x > max.x || cursor.y < min.y || cursor.y > max.y {
-        return;
+    // Find which panel the cursor is over. If neither, the wheel falls
+    // through to camera zoom unchanged.
+    let mut hovered: Option<ChatKind> = None;
+    for (panel, rel) in &panel_q {
+        if rel.cursor_over() {
+            hovered = Some(panel.kind);
+            break;
+        }
     }
-    let buffer_len = rendered_chat(&state).len();
-    scroll.rows = apply_wheel_delta(scroll.rows, delta, buffer_len);
+    let Some(kind) = hovered else {
+        return;
+    };
+    // Per-panel buffer length so the clamp matches what we actually
+    // render in that panel.
+    let all = rendered_chat(&state);
+    let buffer_len = all.iter().filter(|l| kind.accepts(l.channel)).count();
+    match kind {
+        ChatKind::Social => {
+            let (rows, frac) = apply_wheel_delta(scroll.rows, accum.frac, delta, buffer_len);
+            scroll.rows = rows;
+            accum.frac = frac;
+        }
+        ChatKind::Battle => {
+            let (rows, frac) =
+                apply_wheel_delta(battle_scroll.rows, battle_accum.frac, delta, buffer_len);
+            battle_scroll.rows = rows;
+            battle_accum.frac = frac;
+        }
+    }
     // Suppress camera zoom on the same wheel event.
     pointer.wheel = 0.0;
 }
@@ -420,36 +546,70 @@ mod tests {
     // --- chat-scroll wheel math --------------------------------------
 
     #[test]
-    fn wheel_up_advances_by_three_per_notch() {
-        // One notch up from rest with a large buffer: cursor moves up
-        // WHEEL_ROWS_PER_NOTCH rows.
-        assert_eq!(apply_wheel_delta(0, 1.0, 100), 3);
+    fn small_delta_accumulates_before_stepping() {
+        // A single small delta below the sensitivity threshold should
+        // not move the cursor yet — it banks into the accumulator. The
+        // very next equivalent delta crosses 1.0 and steps.
+        // WHEEL_ROWS_PER_UNIT = 0.25, so a delta of 1.0 banks 0.25
+        // rows, well under 1.
+        let (rows, accum) = apply_wheel_delta(0, 0.0, 1.0, 100);
+        assert_eq!(rows, 0);
+        assert!(accum > 0.0 && accum < 1.0);
+    }
+
+    #[test]
+    fn accumulator_eventually_spends_a_row() {
+        // Repeated small deltas accumulate to a whole row.
+        // With WHEEL_ROWS_PER_UNIT = 0.25, 4 ticks of delta=1.0 sum
+        // to a full row.
+        let (rows, accum) = apply_wheel_delta(0, 0.0, 1.0, 100);
+        let (rows, accum) = apply_wheel_delta(rows, accum, 1.0, 100);
+        let (rows, accum) = apply_wheel_delta(rows, accum, 1.0, 100);
+        let (rows, _accum) = apply_wheel_delta(rows, accum, 1.0, 100);
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn equal_total_delta_produces_equal_rows_regardless_of_frame_count() {
+        // The whole point of the accumulator: same total wheel delta,
+        // any partition across frames, gives the same row count.
+        // High-frame-rate path: 12 frames of delta=1.0 (total 12).
+        let mut rows = 0usize;
+        let mut accum = 0.0f32;
+        for _ in 0..12 {
+            let (r, a) = apply_wheel_delta(rows, accum, 1.0, 1000);
+            rows = r;
+            accum = a;
+        }
+        let high_fps_rows = rows;
+        // Low-frame-rate path: 1 frame of delta=12.0.
+        let (low_fps_rows, _) = apply_wheel_delta(0, 0.0, 12.0, 1000);
+        assert_eq!(high_fps_rows, low_fps_rows);
     }
 
     #[test]
     fn wheel_down_at_bottom_stays_at_bottom() {
-        // Already at newest (rows = 0); a down-notch saturates.
-        assert_eq!(apply_wheel_delta(0, -1.0, 100), 0);
+        // Already at newest (rows = 0); a down-direction delta saturates.
+        let (rows, accum) = apply_wheel_delta(0, 0.0, -100.0, 100);
+        assert_eq!(rows, 0);
+        // Accumulator resets at the clamp boundary so the user doesn't
+        // have to "spend" the over-scroll before motion resumes.
+        assert_eq!(accum, 0.0);
     }
 
     #[test]
     fn wheel_up_clamps_at_oldest() {
-        // Buffer of 5 lines → max meaningful offset is 4 (oldest line at
-        // the top of the visible window).
-        assert_eq!(apply_wheel_delta(3, 1.0, 5), 4);
+        // Buffer of 5 lines → max meaningful offset is 4. A huge delta
+        // should pin at 4 and zero the accumulator.
+        let (rows, accum) = apply_wheel_delta(4, 0.0, 100.0, 5);
+        assert_eq!(rows, 4);
+        assert_eq!(accum, 0.0);
     }
 
     #[test]
     fn empty_buffer_is_noop() {
         // No lines yet → wheel does nothing regardless of direction.
-        assert_eq!(apply_wheel_delta(0, 1.0, 0), 0);
-        assert_eq!(apply_wheel_delta(0, -1.0, 0), 0);
-    }
-
-    #[test]
-    fn fractional_notch_rounds_up() {
-        // Trackpads emit fractional wheel deltas (e.g. 0.4); a single
-        // gentle scroll should still register one notch worth.
-        assert_eq!(apply_wheel_delta(0, 0.4, 100), 3);
+        assert_eq!(apply_wheel_delta(0, 0.0, 1.0, 0), (0, 0.0));
+        assert_eq!(apply_wheel_delta(0, 0.0, -1.0, 0), (0, 0.0));
     }
 }

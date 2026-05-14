@@ -994,6 +994,7 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         PathTo { .. } => "path_to",
         Cancel => "cancel",
         RequestZoneChange { .. } => "request_zone_change",
+        MogHouseExit { .. } => "mog_house_exit",
         UseItem { .. } => "use_item",
         BankWhenFull { .. } => "bank_when_full",
         CheckTarget { .. } => "check_target",
@@ -1534,6 +1535,7 @@ mod tests {
                 sub_job_lv: 37,
                 is_party_leader: false,
                 is_alliance_leader: false,
+                in_mog_house: false,
             },
         };
         assert_eq!(uris_for_event(&ev), &["party://members", "scene://current"]);

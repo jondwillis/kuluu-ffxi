@@ -209,6 +209,12 @@ pub struct MmbSubRecord<'a> {
     /// Absolute offset of the tag in the *payload* slice this was
     /// found in.
     pub offset: usize,
+    /// 8-byte tag immediately preceding `variant_name`. `b"model   "`
+    /// for the standard 36-byte-stride vertex/index sub-record format;
+    /// other tags (e.g. `b"clod    "`, asset-name prefixes) indicate
+    /// alternate body layouts that [`parse_vertices`] cannot decode —
+    /// filter those out at the caller.
+    pub tag: &'a [u8],
     pub variant_name: &'a [u8],
     pub count: u32,
     /// Bytes immediately after the count word and before the next
@@ -275,6 +281,7 @@ impl<'a> MmbSubRecord<'a> {
                 ]);
                 MmbSubRecord {
                     offset: start,
+                    tag: &payload[start..start + 8],
                     variant_name: &payload[start + 8..start + 16],
                     count,
                     body: &payload[start + 20..end],

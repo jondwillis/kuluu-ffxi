@@ -75,6 +75,7 @@ impl Plugin for HudPlugin {
         // sidesteps the `Commands` queue lag — without this, the first
         // Update tick after `OnEnter(InGame)` panics on missing resource.
         app.init_resource::<zone_flash::ZoneFlashState>();
+        app.init_resource::<self_hud::SelfHealTracker>();
         // Mouse-wheel scroll for the chat panel. Runs in `PreUpdate`
         // after `collect_mouse_system` so it can zero `MousePointer.wheel`
         // on consume — that's how camera-zoom is kept from double-firing
@@ -103,7 +104,7 @@ impl Plugin for HudPlugin {
                 compass::update_compass,
                 vana_clock::update_vana_clock,
                 zone_flash::update_zone_flash,
-                self_hud::update_self_hud,
+                (self_hud::update_self_hud, self_hud::update_self_status),
                 status_ribbon::update_status_ribbon,
                 death_prompt::update_death_prompt_system,
             ),

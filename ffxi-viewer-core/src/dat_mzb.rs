@@ -19,7 +19,8 @@ use std::fs;
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use ffxi_dat::{mzb, walk, ChunkKind, DatRoot};
+use ffxi_dat::mmb::MmbHeader;
+use ffxi_dat::{mmb, mzb, walk, ChunkKind, DatRoot};
 
 use crate::components::{IsSelf, WorldEntity};
 use crate::snapshot::SceneState;
@@ -37,15 +38,17 @@ pub const DEFAULT_MOB_DRAW_DISTANCE: f32 = 50.0;
 /// entities, mob controls non-PC entity capsules (mobs/NPCs/pets).
 /// PCs are never culled by distance — party members and other PCs
 /// stay visible regardless so the operator can still target them.
-/// `/zonegeom` tri-state. `Collision` is the default on zone-in — the
-/// non-collision (decorative) meshes are visually noisy and operators
-/// rarely need them. They're surfaced as a deliberate `All` opt-in.
+/// `/zonegeom` tri-state. `Off` is the default once MMB placements
+/// render the textured visual world — the MZB collision mesh overlaps
+/// MMB walls geometrically and z-fights, so we hide it. Operators can
+/// `/zonegeom collision` to see the LoS-blocking proxy when debugging
+/// nav/path issues, or `/zonegeom all` for both layers.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneGeomMode {
-    /// Hide all MZB geometry.
+    /// Hide all MZB geometry. Default — MMBs supply the visual layer.
+    #[default]
     Off,
     /// Show only LoS-blocking (collision) meshes — flag bit 0 == 0.
-    #[default]
     Collision,
     /// Show both collision and non-collision (decorative) meshes.
     All,
@@ -118,13 +121,23 @@ impl MzbCollisionGeometry {
 
     /// Cast a ray straight down (Bevy −Y) at (`xz.x`, `xz.y`) from a
     /// y high above any plausible zone height, and return the **highest**
-    /// Y of any triangle the ray hits. `None` if the column at `xz` has
-    /// no triangle below.
+    /// Y of any triangle the ray hits **at or below `ceiling_y`**.
+    /// `None` if the column at `xz` has no qualifying triangle.
     ///
-    /// "Highest hit" picks the ceiling-of-floor: when the player is in
-    /// a multi-level building, we want the floor they're standing on,
-    /// not the basement.
-    pub fn ground_raycast(&self, xz: Vec2) -> Option<f32> {
+    /// `ceiling_y` filters out overhead geometry — arches, gate tops,
+    /// eaves, bridges the player is walking *under*. Without it, "highest
+    /// hit" warps the player onto the gate roof in South San d'Oria
+    /// every time they pass through the entrance.
+    ///
+    /// Of the surfaces below the ceiling, we still pick the highest:
+    /// that's the multi-level-building case (player on 2nd floor — snap
+    /// to the 2nd floor, not the basement).
+    ///
+    /// Caller policy: pass `player.y + step_tolerance` as the ceiling
+    /// so small step-ups (curbs, ramps) still work. The
+    /// `snap_entities_to_navmesh_system` caller uses 2 yalms — bigger
+    /// than any real step, smaller than any real arch.
+    pub fn ground_raycast(&self, xz: Vec2, ceiling_y: f32) -> Option<f32> {
         const RAY_ORIGIN_Y: f32 = 1000.0;
         let orig = Vec3::new(xz.x, RAY_ORIGIN_Y, xz.y);
         let dir = Vec3::new(0.0, -1.0, 0.0);
@@ -135,6 +148,11 @@ impl MzbCollisionGeometry {
             let v2 = self.positions[tri[2] as usize];
             if let Some(t) = ray_tri_intersect(orig, dir, v0, v1, v2) {
                 let hit_y = orig.y + t * dir.y;
+                if hit_y > ceiling_y {
+                    // Overhead geometry (gate top, arch, eave). Don't
+                    // let it pull the player onto its roof.
+                    continue;
+                }
                 best_y = Some(match best_y {
                     Some(prev) if prev > hit_y => prev,
                     _ => hit_y,
@@ -420,6 +438,121 @@ fn load_decrypted(
     Ok((header, plain, ()))
 }
 
+/// One resolved zone-MMB placement: which MMB chunk to instance, and
+/// a 4×4 Bevy-space transform. The transform is `to_bevy * M_ffxi`
+/// where `M_ffxi` is built from the placement record's
+/// trans/rot/scale (FFXI native, Y-down) — see
+/// [`build_zone_mmb_spawns`] for the math. MMB local-space vertices
+/// stay in FFXI-native coords; the entity transform alone does the
+/// axis flip.
+#[derive(Debug, Clone, Copy)]
+pub struct ZoneMmbSpawn {
+    pub chunk_idx: usize,
+    pub bevy_transform: Mat4,
+}
+
+/// Resolve the zone's MMB-placement table (inside the MZB chunk body)
+/// to concrete `(chunk_idx, transform)` entries ready to dispatch as
+/// `LoadMmbRequest`s. Skips placements whose name doesn't resolve to an
+/// MMB asset_name in the same DAT (zone "ground tile" MZB-internal
+/// names like `d_x04z16` resolve via the zone-prefix rule).
+pub fn build_zone_mmb_spawns(
+    file_id: u32,
+    chunk_idx: Option<usize>,
+) -> Result<Vec<ZoneMmbSpawn>, String> {
+    let root = DatRoot::from_env_or_default()
+        .map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
+    let location = root
+        .resolve(file_id)
+        .map_err(|e| format!("resolve({file_id}): {e}"))?;
+    let path = location.path_under(root.root());
+    let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let chunks: Vec<_> = walk(&bytes).filter_map(Result::ok).collect();
+
+    // Index every MMB chunk's asset_name → chunk_idx. Skip MMBs whose
+    // header fails to parse (we already log this elsewhere).
+    let mut mmb_names: Vec<String> = Vec::new();
+    let mut mmb_indices: Vec<usize> = Vec::new();
+    for (idx, c) in chunks.iter().enumerate() {
+        if c.kind != ChunkKind::Mmb as u8 {
+            continue;
+        }
+        let dec = match mmb::decrypt(c.data) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let hdr = match MmbHeader::parse(&dec) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        mmb_names.push(hdr.asset_name_str().trim_end().to_string());
+        mmb_indices.push(idx);
+    }
+    let zone_prefix = mzb::infer_zone_prefix(&mmb_names);
+
+    // Locate MZB chunk and parse the placement table.
+    let (_, mzb_chunk) = match chunk_idx {
+        Some(i) => (
+            i,
+            chunks
+                .get(i)
+                .ok_or_else(|| format!("chunk_idx {i} out of range ({} chunks)", chunks.len()))?,
+        ),
+        None => chunks
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.kind == ChunkKind::Mzb as u8)
+            .ok_or_else(|| {
+                format!("no MZB chunk in file_id {file_id} ({} chunks)", chunks.len())
+            })?,
+    };
+    let plain = mzb::decrypt(mzb_chunk.data).map_err(|e| format!("MZB decrypt: {e}"))?;
+    let header = mzb::MzbHeader::parse(&plain).map_err(|e| format!("MZB header: {e}"))?;
+    let placements = mzb::parse_mmb_placements(&plain, &header)
+        .map_err(|e| format!("MZB parse_mmb_placements: {e}"))?;
+
+    let mut out = Vec::with_capacity(placements.len());
+    for p in &placements {
+        let name = p.id_str().trim_end_matches('\0');
+        let trimmed = name.trim_end();
+        let Some(local_idx) = mzb::resolve_mmb_index(trimmed, &zone_prefix, &mmb_names) else {
+            continue;
+        };
+        let chunk_idx = mmb_indices[local_idx];
+        // Build the FFXI-native placement matrix `M_ffxi` from the
+        // record's trans/rot/scale. Conventions per the reference: rot
+        // is XYZ Euler radians in FFXI's Y-down frame. Apply scale
+        // first, then rotate, then translate (S-R-T composition).
+        // Euler order: XYZ (rotate-X, then Y, then Z). This matched
+        // the runtime "Image #5" pass where bridge/walls rendered
+        // correctly. YXZ was tried and made it worse, so we're sticking
+        // with XYZ. Some MMBs remain visually wrong; the suspected
+        // cause is not Euler order but per-MMB issues (clod-style
+        // sub-records being mis-parsed as vertex data — task #18).
+        let m_ffxi = Mat4::from_scale_rotation_translation(
+            Vec3::new(p.scale[0], p.scale[1], p.scale[2]),
+            Quat::from_euler(EulerRot::XYZ, p.rot[0], p.rot[1], p.rot[2]),
+            Vec3::new(p.trans[0], p.trans[1], p.trans[2]),
+        );
+        // Same axis-flip we use for MZB merged instancing (Y-down →
+        // Y-up with z-handedness flip). Vertex data inside the MMB
+        // stays in FFXI-local coords; this matrix carries the entire
+        // placement-then-flip so meshes render correctly oriented.
+        let to_bevy = Mat4::from_cols(
+            Vec4::new(1.0, 0.0, 0.0, 0.0),
+            Vec4::new(0.0, -1.0, 0.0, 0.0),
+            Vec4::new(0.0, 0.0, -1.0, 0.0),
+            Vec4::new(0.0, 0.0, 0.0, 1.0),
+        );
+        let bevy_transform = to_bevy * m_ffxi;
+        out.push(ZoneMmbSpawn {
+            chunk_idx,
+            bevy_transform,
+        });
+    }
+    Ok(out)
+}
+
 /// Load + decrypt + parse all meshes in the first (or specified) MZB
 /// chunk of `file_id`. Returns ready-to-bake submeshes.
 ///
@@ -502,6 +635,7 @@ pub fn process_load_mzb_requests(
     mut scene_state: ResMut<SceneState>,
     draw: Res<DrawDistance>,
     mut collision_geometry: ResMut<MzbCollisionGeometry>,
+    mut load_mmb_tx: MessageWriter<crate::dat_mmb::LoadMmbRequest>,
 ) {
     // Capture current zonegeom mode so freshly-spawned merged meshes
     // start at the correct visibility. `apply_zone_geom_visibility`
@@ -726,6 +860,36 @@ pub fn process_load_mzb_requests(
                 req.file_id,
             ),
         );
+
+        // Also instance the zone's visual MMBs at their MZB-placement
+        // transforms. This is the "textured visual world" half of the
+        // zone — MZB merged meshes above are collision-only, MMBs are
+        // the per-prop textured walls/buildings/floor tiles.
+        match build_zone_mmb_spawns(req.file_id, req.chunk_idx) {
+            Ok(spawns) => {
+                let n = spawns.len();
+                let offset = Mat4::from_translation(req.world_pos);
+                for s in &spawns {
+                    load_mmb_tx.write(crate::dat_mmb::LoadMmbRequest {
+                        file_id: req.file_id,
+                        chunk_idx: s.chunk_idx,
+                        world_pos: Vec3::ZERO,
+                        entity_id: None,
+                        world_transform: Some(offset * s.bevy_transform),
+                    });
+                }
+                push_system_msg(
+                    &mut scene_state,
+                    format!("/load_mzb {}: queued {n} visual MMB placements", req.file_id),
+                );
+            }
+            Err(msg) => {
+                push_system_msg(
+                    &mut scene_state,
+                    format!("/load_mzb {}: zone-MMB spawn: {msg}", req.file_id),
+                );
+            }
+        }
     }
 }
 

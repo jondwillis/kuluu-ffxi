@@ -277,8 +277,17 @@ fn snap_entities_to_navmesh_system(
             // Player: MZB raycast. Fall back to navmesh if the
             // column at the player's XZ has no triangle below
             // (e.g., off the edge of the loaded zone bounds).
-            let mzb = collision_geom
-                .ground_raycast(Vec2::new(t.translation.x, t.translation.z));
+            //
+            // `ceiling_y = current_y + STEP_TOLERANCE` so the snap
+            // ignores overhead geometry the player is walking
+            // *under* (gate tops, arches, eaves) but still allows
+            // small step-ups onto curbs and ramps.
+            const STEP_TOLERANCE: f32 = 2.0;
+            let ceiling_y = t.translation.y + STEP_TOLERANCE;
+            let mzb = collision_geom.ground_raycast(
+                Vec2::new(t.translation.x, t.translation.z),
+                ceiling_y,
+            );
             mzb.or_else(|| nav_y_bevy(&nav_guard, &mut cache, entity.id, &t))
         } else {
             // NPCs / mobs / other PCs: cheap navmesh query.

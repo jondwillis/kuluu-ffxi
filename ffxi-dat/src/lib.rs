@@ -23,6 +23,7 @@ pub mod mmb;
 pub mod mzb;
 pub mod npc_names;
 pub mod texture;
+pub mod vos2;
 pub mod vtable;
 pub mod zone_dat;
 

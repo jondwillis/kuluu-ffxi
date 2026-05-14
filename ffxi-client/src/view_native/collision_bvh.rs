@@ -37,6 +37,20 @@ pub struct CollisionBvh {
     triangles: Vec<[Vec3; 3]>,
 }
 
+impl CollisionBvh {
+    /// Diagnostic: world-space AABB of the whole BVH (the root node's
+    /// bounds). Used by the camera-collision probe so we can see which
+    /// BVHs actually live where the geometry is.
+    pub fn root_aabb(&self) -> Option<(Vec3, Vec3)> {
+        self.nodes.first().map(|n| (n.aabb_min, n.aabb_max))
+    }
+
+    /// Diagnostic: total triangle count.
+    pub fn tri_count(&self) -> usize {
+        self.triangles.len()
+    }
+}
+
 struct BvhNode {
     aabb_min: Vec3,
     aabb_max: Vec3,

@@ -672,6 +672,153 @@ pub fn apply_placement(m: &[f32; 16], v: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// One MMB-instance placement record. The MZB chunk carries
+/// `node_count` of these starting at body offset 0x20, stride 100
+/// (`SMZBBlock100`). The 16-byte `id` field names an MMB asset (see
+/// matching rules at [`resolve_mmb_index`]).
+///
+/// Source: TeoTwawki/ffxi-dat-hacking `TDWAnalysis.h::SMZBBlock100` and
+/// the LandSandBoat FFXI-NavMesh-Builder `MZB.cs::DecodeMzb` reference
+/// implementations. The body-level `decrypt_in_place` pass already
+/// renders the `id` bytes in plaintext for the FFXI install we target;
+/// no extra per-record XOR is applied (some older references describe a
+/// `^= 0x55` step that is *already folded into* our body-level decrypt).
+#[derive(Debug, Clone, Copy)]
+pub struct MmbPlacement {
+    /// 16-byte name. ASCII, null-padded. Matches an MMB `asset_name` in
+    /// the same zone DAT either directly or after prefixing with the
+    /// zone's 8-char tag and truncating to 16 bytes (see
+    /// [`resolve_mmb_index`]).
+    pub id: [u8; 16],
+    pub trans: [f32; 3],
+    /// Euler radians (x, y, z) per the reference.
+    pub rot: [f32; 3],
+    pub scale: [f32; 3],
+}
+
+impl MmbPlacement {
+    pub fn id_str(&self) -> &str {
+        let end = self.id.iter().position(|&b| b == 0).unwrap_or(self.id.len());
+        std::str::from_utf8(&self.id[..end]).unwrap_or("")
+    }
+}
+
+/// Decode MMB-instance placements from the MZB body. Returns
+/// `Ok(vec![])` when `header.node_count == 0` or the table region is
+/// out of range — i.e. this never errors on "no placements," only on
+/// malformed body bytes.
+pub fn parse_mmb_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MmbPlacement>> {
+    let count = header.node_count as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let table_end = 0x20usize.saturating_add(count.saturating_mul(100));
+    if table_end > body.len() {
+        return Err(MzbError::MeshTableOutOfRange { offset: table_end, len: body.len() }.into());
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 0x20 + i * 100;
+        let rec = &body[off..off + 100];
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&rec[..16]);
+        let f = |o: usize| f32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
+        out.push(MmbPlacement {
+            id,
+            trans: [f(16), f(20), f(24)],
+            rot: [f(28), f(32), f(36)],
+            scale: [f(40), f(44), f(48)],
+        });
+    }
+    Ok(out)
+}
+
+/// Resolve a placement `id` to the index in `mmb_asset_names` that owns
+/// it, by trying (in order):
+/// 1. Exact match against `placement.id` (most direct).
+/// 2. Match against `<zone_prefix><placement.id>` truncated to 16
+///    bytes. Works for single-vendor zones where `infer_zone_prefix`
+///    yields a meaningful 8-byte tag.
+/// 3. Suffix match: any MMB asset name that ends with `placement.id`
+///    after both have been space-trimmed. Handles multi-vendor zones
+///    where MMBs ship with prefixes like `tshimono`, `ooiwa...`,
+///    `mariko..` simultaneously, so no single zone_prefix exists.
+///
+/// Returns `None` if no MMB asset_name matches. Suffix match is
+/// last-resort because it can collide when multiple MMBs share the
+/// same suffix string — for placement-correctness most zones use IDs
+/// long enough that collisions are rare in practice.
+pub fn resolve_mmb_index(
+    placement_id: &str,
+    zone_prefix: &str,
+    mmb_asset_names: &[String],
+) -> Option<usize> {
+    if let Some(i) = mmb_asset_names.iter().position(|n| n.trim_end() == placement_id) {
+        return Some(i);
+    }
+    let mut prefixed = String::with_capacity(zone_prefix.len() + placement_id.len());
+    prefixed.push_str(zone_prefix);
+    prefixed.push_str(placement_id);
+    if prefixed.len() > 16 {
+        prefixed.truncate(16);
+    }
+    if let Some(i) = mmb_asset_names.iter().position(|n| n.trim_end() == prefixed) {
+        return Some(i);
+    }
+    // Vendor-prefix tier. MMB asset_name is a 16-byte field structured
+    // as `<8-byte vendor/artist tag><8-byte asset-id prefix>` — e.g.
+    // `tshimonolat_moas` for placement `lat_moasta_st1_m`. The vendor
+    // tag varies per asset (`tshimono`, `hatamura`, `sandori`, …), so
+    // no single zone_prefix tier can recover it. Match the first 8
+    // bytes of the placement_id against the last 8 bytes of each MMB
+    // asset_name. Confirmed against zones 102/200/230 at 100% local.
+    let id_bytes = placement_id.as_bytes();
+    if id_bytes.len() >= 8 {
+        let needle = &id_bytes[..8];
+        if let Some(i) = mmb_asset_names.iter().position(|n| {
+            let t = n.trim_end().as_bytes();
+            t.len() >= 8 && &t[t.len() - 8..] == needle
+        }) {
+            return Some(i);
+        }
+    }
+    // Suffix match. Tiny IDs (< 3 chars) get skipped to avoid wild
+    // collisions like `"a"` matching half the zone.
+    if placement_id.len() < 3 {
+        return None;
+    }
+    mmb_asset_names
+        .iter()
+        .position(|n| n.trim_end().ends_with(placement_id))
+}
+
+/// Infer the 8-char zone prefix shared by all MMB asset_names in a
+/// zone DAT. Picks the longest common prefix (up to 8 bytes) of the
+/// supplied names; falls back to an empty string if the names disagree.
+pub fn infer_zone_prefix(mmb_asset_names: &[String]) -> String {
+    let mut iter = mmb_asset_names.iter();
+    let first = match iter.next() {
+        Some(s) => s.as_str(),
+        None => return String::new(),
+    };
+    let mut prefix_len = first.len().min(8);
+    for name in iter {
+        let cap = name.len().min(prefix_len);
+        let common = first
+            .as_bytes()
+            .iter()
+            .zip(name.as_bytes())
+            .take(cap)
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix_len = prefix_len.min(common);
+        if prefix_len == 0 {
+            break;
+        }
+    }
+    first[..prefix_len].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

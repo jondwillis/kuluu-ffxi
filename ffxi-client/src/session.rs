@@ -352,6 +352,10 @@ async fn run_map_session(
     // so the first keepalive after Stage::InZone sends server-authoritative
     // coords rather than `Position::default()`.
     let mut self_pos = Position::default();
+    // False until a `0x0DF GROUP_ATTR` for self lands with `MoghouseFlg!=0`.
+    // Tracked across the flood drain *and* re-used after the wait-loop hands
+    // off to the per-tick reactor (see the outer `flood_in_mog_house`).
+    let mut flood_in_mog_house = false;
     while std::time::Instant::now() < flood_deadline {
         match tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -376,6 +380,7 @@ async fn run_map_session(
                         &mut current_zone_id,
                         &mut self_pos,
                         &mut npc_name_resolver,
+                        &mut flood_in_mog_house,
                     );
                 }
             }
@@ -487,6 +492,12 @@ fn handle_sub_packet(
     // ambient NPCs. Dynamic entities (trusts/pets/fellows) keep
     // arriving with names via 0x67/0x68 and don't use this path.
     npc_name_resolver: &mut NpcNameResolver,
+    // Tracks whether the most recent self `MoghouseFlg` was set. The session
+    // loop uses this to emit a single chat-system hint on the false→true
+    // edge so the operator knows why their entity list went empty (LSB
+    // keeps zone id equal to the surrounding city while in a Mog House —
+    // there's no other wire signal).
+    was_in_mog_house: &mut bool,
 ) {
     use ffxi_proto::map::s2c;
     match sub.opcode {
@@ -843,6 +854,13 @@ fn handle_sub_packet(
         }
         op if op == s2c::GROUP_LIST => {
             if let Ok((attrs, extra)) = decode::PartyAttrs::decode_group_list(sub.data) {
+                if attrs.unique_no == self_char_id {
+                    note_mog_transition(
+                        attrs.moghouse_flg != 0,
+                        was_in_mog_house,
+                        event_tx,
+                    );
+                }
                 let _ = event_tx.send(AgentEvent::PartyMemberUpdated {
                     member: party_member_from_attrs(&attrs, Some(&extra)),
                 });
@@ -850,6 +868,13 @@ fn handle_sub_packet(
         }
         op if op == s2c::GROUP_ATTR => {
             if let Ok(attrs) = decode::PartyAttrs::decode_group_attr(sub.data) {
+                if attrs.unique_no == self_char_id {
+                    note_mog_transition(
+                        attrs.moghouse_flg != 0,
+                        was_in_mog_house,
+                        event_tx,
+                    );
+                }
                 let _ = event_tx.send(AgentEvent::PartyMemberUpdated {
                     member: party_member_from_attrs(&attrs, None),
                 });
@@ -1056,6 +1081,14 @@ async fn keepalive_loop(
     // with the spawn coords so the very first keepalive doesn't
     // false-trigger.
     let mut last_keepalive_pos: Vec3 = self_pos.pos;
+    // Edge-detected self `MoghouseFlg`. Seeded to `false`; the first self
+    // GROUP_ATTR / GROUP_LIST tick after entry inverts it and `note_mog_transition`
+    // emits the explanatory chat line. Persists across the loop's many
+    // iterations — across a normal zone change the value carries forward,
+    // and the *next* self party tick (which will arrive shortly after the
+    // new zone's LOGIN flood) will either re-affirm `true` (rezone into a
+    // mog house) or flip it back to `false`.
+    let mut self_in_mog_house = false;
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
@@ -1419,6 +1452,65 @@ async fn keepalive_loop(
                         }
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
+                    Some(AgentCommand::MogHouseExit { kind }) => {
+                        // `RectID="zmrq"` MAPRECT. Server gates this on the
+                        // player actually being inside a Mog House
+                        // (`PChar->inMogHouse()` at `0x05e_maprect.cpp:134`);
+                        // calling it outside is harmless (the server logs
+                        // "Moghouse zoneline abuse" and ignores it) but
+                        // still costs a watchdog timeout. We *don't* gate
+                        // client-side because `MoghouseFlg` may not have
+                        // arrived yet during a reconnect — the operator
+                        // who types `/mhexit` knows what they want.
+                        let Some(act_index) = self_act_index else {
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: "MogHouseExit before self ActIndex known".into(),
+                            });
+                            continue;
+                        };
+                        let (exit_bit, exit_mode) = kind.wire_pair();
+                        tracing::info!(
+                            ?kind,
+                            exit_bit,
+                            exit_mode,
+                            pos = format!(
+                                "({:.2},{:.2},{:.2})",
+                                self_pos.pos.x, self_pos.pos.y, self_pos.pos.z,
+                            ),
+                            "sending 0x05E MAPRECT (zmrq mog-house exit)",
+                        );
+                        let payload = build_subpacket_maprect_mh_exit(
+                            sub_seq,
+                            exit_bit,
+                            exit_mode,
+                            self_pos.pos.x,
+                            self_pos.pos.y,
+                            self_pos.pos.z,
+                            act_index,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "mog-house exit MAPRECT send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("MogHouseExit send: {e}"),
+                            });
+                        } else {
+                            // Reuse the same watchdog — a sentinel line_id
+                            // makes the timeout chat-line still useful (the
+                            // chat line literally calls out "Zone change for
+                            // line 0x7A6D7271 silently dropped" — the operator
+                            // sees the `zmrq` bytes echoed back, confirming
+                            // which packet was lost).
+                            const ZMRQ_LE: u32 =
+                                u32::from_le_bytes([b'z', b'm', b'r', b'q']);
+                            pending_maprect =
+                                Some((std::time::Instant::now(), ZMRQ_LE));
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
+                    }
                 }
             }
             _ = tick.tick() => {
@@ -1540,6 +1632,7 @@ async fn keepalive_loop(
                                 &mut current_zone_id,
                                 &mut self_pos,
                                 &mut npc_name_resolver,
+                                &mut self_in_mog_house,
                             );
                             // Heal-mirror sync from CHAR_PC for self. Same
                             // UPDATE_HP gate (`body[6] & 0x04`) that
@@ -2311,6 +2404,41 @@ pub fn build_subpacket_item_use(
     buf
 }
 
+/// Emit a one-shot chat-system line on a false→true `MoghouseFlg`
+/// transition for self. The opposite edge (true→false, mog-house exit) is
+/// already obvious because entities reappear; the entry edge is the one
+/// the operator misses, because the symptom is "no entities" with no other
+/// chat signal. Idempotent: only fires on the rising edge.
+fn note_mog_transition(
+    now_in_mog: bool,
+    was: &mut bool,
+    event_tx: &broadcast::Sender<AgentEvent>,
+) {
+    if now_in_mog && !*was {
+        let _ = event_tx.send(AgentEvent::ChatLine {
+            line: crate::state::ChatLine {
+                channel: crate::state::ChatChannel::System,
+                sender: "<client>".into(),
+                text: "You're inside a Mog House (LSB keeps the zone id equal \
+                       to the surrounding city). Entity stream is filtered \
+                       server-side — use /mhexit to leave."
+                    .into(),
+                server_ts: 0,
+            },
+        });
+    } else if !now_in_mog && *was {
+        let _ = event_tx.send(AgentEvent::ChatLine {
+            line: crate::state::ChatLine {
+                channel: crate::state::ChatChannel::System,
+                sender: "<client>".into(),
+                text: "Left the Mog House (server-side `m_moghouseID` cleared).".into(),
+                server_ts: 0,
+            },
+        });
+    }
+    *was = now_in_mog;
+}
+
 /// Convert a `decode::PartyAttrs` (+ optional list-only extras) into the
 /// state-layer `PartyMember` the agent sees. When `extra` is `None` (we're
 /// processing a `0x0DF GROUP_ATTR` for self / Trust), `name` and the
@@ -2336,6 +2464,7 @@ fn party_member_from_attrs(
         sub_job_lv: attrs.sjob_lv,
         is_party_leader: extra.map(|e| e.is_party_leader).unwrap_or(false),
         is_alliance_leader: extra.map(|e| e.is_alliance_leader).unwrap_or(false),
+        in_mog_house: attrs.moghouse_flg != 0,
     }
 }
 
@@ -2364,6 +2493,44 @@ fn build_subpacket_maprect(
     buf[20..22].copy_from_slice(&act_index.to_le_bytes());
     // buf[22] = MyRoomExitBit, buf[23] = MyRoomExitMode — zero for
     // non-Mog-House zonelines.
+    buf
+}
+
+/// `GP_CLI_COMMAND_MAPRECT` (0x05E) built with `RectID="zmrq"` — the
+/// universal "exit my Mog House" tag. Layout is identical to
+/// [`build_subpacket_maprect`] but `RectID` is the four-byte ASCII tag and
+/// the trailing `(MyRoomExitBit, MyRoomExitMode)` bytes carry the exit
+/// selection (`MogHouseExit::wire_pair`). The server only honours these
+/// trailing bytes when `RectID` matches the universal exit tag, so this
+/// helper bakes that pairing in to make the precondition unforgeable at
+/// the call site.
+///
+/// We sit on the existing pending-MAPRECT watchdog (`pending_maprect`) the
+/// same way [`AgentCommand::RequestZoneChange`] does: if the server
+/// silently rejects the exit (e.g. `mhflag` says the requested quest
+/// zoneline isn't unlocked), the operator gets a chat-system line within
+/// 3s explaining the most likely cause.
+fn build_subpacket_maprect_mh_exit(
+    sync: u16,
+    exit_bit: u8,
+    exit_mode: u8,
+    x: f32,
+    y: f32,
+    z: f32,
+    act_index: u16,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 24];
+    buf[0..4].copy_from_slice(&build_subpacket_header(0x05E, 6, sync));
+    // RectID = b"zmrq" as a little-endian u32. ASCII bytes are written in
+    // file order so the four `char`s on the wire spell `z m r q`. The
+    // server reads this as a `std::string_view` over the same bytes.
+    buf[4..8].copy_from_slice(b"zmrq");
+    buf[8..12].copy_from_slice(&x.to_le_bytes());
+    buf[12..16].copy_from_slice(&y.to_le_bytes());
+    buf[16..20].copy_from_slice(&z.to_le_bytes());
+    buf[20..22].copy_from_slice(&act_index.to_le_bytes());
+    buf[22] = exit_bit;
+    buf[23] = exit_mode;
     buf
 }
 

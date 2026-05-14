@@ -41,9 +41,9 @@ use ffxi_client::lobby_client::LobbyClient;
 use ffxi_client::reactor::ReactorConfig;
 use ffxi_client::{spawn_session_with_reactor, SessionHandle};
 use ffxi_viewer_core::{
-    add_hud_spawners, setup_world, setup_zone_line_assets, spawn_camera,
-    hud::zone_flash::ZoneNameResolver, HudPlugin, MousePlugin, SceneState, ViewerCorePlugin,
-    ZoneLineDescriptor, ZoneLineResolver,
+    add_hud_spawners, hud::zone_flash::ZoneNameResolver, setup_world, setup_zone_line_assets,
+    spawn_camera, HudPlugin, MousePlugin, SceneState, ViewerCorePlugin, ZoneLineDescriptor,
+    ZoneLineResolver,
 };
 use ffxi_viewer_wire::Stage as WireStage;
 use tokio::runtime::Handle as RtHandle;
@@ -98,7 +98,7 @@ pub(crate) struct SessionPorts {
 #[derive(Resource, Default, Clone)]
 pub(crate) struct RelayListen(
     #[allow(dead_code, reason = "read only when feature = \"relay\"")]
-    pub Option<std::net::SocketAddr>,
+    pub  Option<std::net::SocketAddr>,
 );
 
 /// Optional `--agent-listen` value (raw path or `auto`). Read by
@@ -245,10 +245,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         ),
     };
     app.insert_resource(loaded_bindings);
-    app.insert_resource(crate::keybinds_store::KeybindsStateRes {
-        store,
-        persisted,
-    });
+    app.insert_resource(crate::keybinds_store::KeybindsStateRes { store, persisted });
 
     // Viewer plugins. `ViewerCorePlugin` registers ingest_system gated
     // on `resource_exists::<NativeSource>` (added by the bridge), so
@@ -311,15 +308,35 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // system has computed and lerped to its desired position; we then
     // pull the camera back along the player→camera line if needed.
     // Build a BVH per collision-mesh entity once its asset is loaded.
+    // Must run AFTER `TransformSystems::TransformPropagate` so the
+    // `GlobalTransform` we bake triangles against is the propagated
+    // value, not the previous-frame stale (or default Identity) one.
+    // `MzbCollisionMesh` entities are children of an `MzbOverlay`
+    // parent that holds the zone-world translation — without this
+    // ordering the BVH is built at the wrong world position and the
+    // camera ray cast hits walls that aren't where they look.
+    //
     // The system is a no-op once every entity has its `CollisionBvh`,
-    // so we can leave it in `Update` cheaply.
-    app.add_systems(
-        Update,
-        collision_bvh::build_collision_bvh_system.run_if(in_state(AppPhase::InGame)),
-    );
+    // so the PostUpdate cost is only paid on the load frame.
     app.add_systems(
         PostUpdate,
+        collision_bvh::build_collision_bvh_system
+            .after(bevy::transform::TransformSystems::Propagate)
+            .run_if(in_state(AppPhase::InGame)),
+    );
+    // Camera collision clamp runs in `Update` **after** the viewer-core
+    // chase camera system writes its lerped position, so we overwrite
+    // the camera Transform *before* `PostUpdate`'s TransformPropagate
+    // computes the GlobalTransform that renders. Earlier this ran in
+    // PostUpdate after Propagate — that left the rendered camera at
+    // the chase-system's unclamped lerp intermediate, with our clamp
+    // only affecting next frame's input. The amplified yaw-rotation
+    // jitter (camera, text, nameplate apparent motion) was the
+    // visible symptom of that frame lag.
+    app.add_systems(
+        Update,
         camera_collision::clamp_chase_camera_to_collision
+            .after(ffxi_viewer_core::chase_camera_system)
             .run_if(in_state(AppPhase::InGame)),
     );
 

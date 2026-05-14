@@ -540,6 +540,14 @@ pub struct PartyAttrs {
     pub hpp: u8,
     pub mpp: u8,
     pub kind: u8,
+    /// `MoghouseFlg` — non-zero when the server considers this member to be
+    /// inside a Mog House (`PChar->m_moghouseID != 0`). In LSB the zone id
+    /// stays equal to the surrounding city (e.g. S. San d'Oria = 230) even
+    /// inside the Mog House — this flag is the only wire signal of mog-house
+    /// occupancy. See `zone_entities.cpp:1167-1208` for how the server uses
+    /// it to filter the entity stream; without checking it client-side, a
+    /// rezone-into-mog looks indistinguishable from a normal rezone.
+    pub moghouse_flg: u8,
     pub zone_no: u16,
     pub mjob_no: u8,
     pub mjob_lv: u8,
@@ -577,6 +585,7 @@ impl PartyAttrs {
             hpp: body[18],
             mpp: body[19],
             kind: body[20],
+            moghouse_flg: body[21],
             zone_no: u16::from_le_bytes(body[22..24].try_into().unwrap()),
             mjob_no: body[28],
             mjob_lv: body[29],
@@ -605,6 +614,7 @@ impl PartyAttrs {
             kind: body[24],
             hpp: body[25],
             mpp: body[26],
+            moghouse_flg: body[23],
             zone_no: u16::from_le_bytes(body[28..30].try_into().unwrap()),
             mjob_no: body[30],
             mjob_lv: body[31],
@@ -1307,6 +1317,7 @@ mod tests {
         buf[18] = 75; // Hpp
         buf[19] = 50; // Mpp
         buf[20] = 0; // Kind = PC
+        buf[21] = 1; // MoghouseFlg = inside mog house
         buf[22..24].copy_from_slice(&234u16.to_le_bytes()); // ZoneNo
         buf[28] = 6; // mjob_no = WHM
         buf[29] = 75; // mjob_lv
@@ -1321,6 +1332,7 @@ mod tests {
         assert_eq!(p.act_index, 0x42);
         assert_eq!(p.hpp, 75);
         assert_eq!(p.mpp, 50);
+        assert_eq!(p.moghouse_flg, 1);
         assert_eq!(p.zone_no, 234);
         assert_eq!(p.mjob_no, 6);
         assert_eq!(p.mjob_lv, 75);
@@ -1340,6 +1352,7 @@ mod tests {
         buf[16..20].copy_from_slice(&0x0000_0005u32.to_le_bytes());
         buf[20..22].copy_from_slice(&0x0007u16.to_le_bytes()); // ActIndex
         buf[22] = 1; // MemberNumber
+        buf[23] = 1; // MoghouseFlg = inside mog house
         buf[24] = 0; // Kind
         buf[25] = 100; // Hpp
         buf[26] = 100; // Mpp
@@ -1353,6 +1366,7 @@ mod tests {
         assert_eq!(attrs.hp, 2000);
         assert_eq!(attrs.act_index, 7);
         assert_eq!(attrs.zone_no, 230);
+        assert_eq!(attrs.moghouse_flg, 1);
         assert_eq!(extra.member_number, 1);
         assert!(extra.is_party_leader);
         assert!(!extra.is_alliance_leader);

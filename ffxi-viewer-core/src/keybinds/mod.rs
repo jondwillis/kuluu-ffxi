@@ -68,6 +68,12 @@ pub enum Action {
     CameraYawRight,
     CameraPitchUp,
     CameraPitchDown,
+    /// Pull the chase camera in. Retail Compact 1 binds this to `.`.
+    /// No-op in [`crate::camera::CameraMode::FirstPerson`].
+    CameraZoomIn,
+    /// Push the chase camera out. Retail Compact 1 binds this to `,`.
+    /// No-op in [`crate::camera::CameraMode::FirstPerson`].
+    CameraZoomOut,
 
     // ----- Mode toggles (always-edge, World mode) -----
     ToggleAutorun,

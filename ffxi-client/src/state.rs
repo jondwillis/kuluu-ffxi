@@ -557,6 +557,13 @@ pub struct PartyMember {
     pub sub_job_lv: u8,
     pub is_party_leader: bool,
     pub is_alliance_leader: bool,
+    /// `MoghouseFlg` from the wire (0x0DF body[21] / 0x0DD body[23]).
+    /// Non-zero when the server treats this member as inside a Mog House
+    /// (`PChar->m_moghouseID != 0`). For self this is the *only* wire signal
+    /// of mog-house occupancy — `zone_id` stays equal to the surrounding
+    /// city. See `SessionState::self_in_mog_house`.
+    #[serde(default)]
+    pub in_mog_house: bool,
 }
 
 /// Cap on retained chat history. The TUI only ever shows the last N visible
@@ -576,6 +583,22 @@ impl SessionState {
     /// is populated from it. The previous duplicate `state.self_pos`
     /// field has been removed (Stage 5 of the
     /// `collapse-self-position-to-single-source-of-truth` refactor).
+    /// `true` when the most recent `0x0DF GROUP_ATTR` for self (the row whose
+    /// `id == char_id`) had `MoghouseFlg` set. Use this — not `zone_id` — to
+    /// decide whether we're inside a Mog House: LSB keeps the zone id equal
+    /// to the surrounding city while in a mog room. Returns `false` if we
+    /// haven't seen a self-party row yet (during a reconnect the wire flag
+    /// arrives a tick or two after LOGIN, so callers should treat the
+    /// initial `false` as "unknown / probably normal").
+    pub fn self_in_mog_house(&self) -> bool {
+        let Some(char_id) = self.char_id else { return false };
+        self.party
+            .iter()
+            .find(|m| m.id == char_id)
+            .map(|m| m.in_mog_house)
+            .unwrap_or(false)
+    }
+
     pub fn self_position(&self) -> Option<Position> {
         let char_id = self.char_id?;
         self.entities
@@ -1081,6 +1104,17 @@ pub enum AgentCommand {
     StopMove,
     /// Request a zone change at a known zoneline. Server still has to honor it.
     RequestZoneChange { line_id: u32 },
+    /// `GP_CLI_COMMAND_MAPRECT` (0x05E) with `RectID="zmrq"` — the universal
+    /// "leave my Mog House" packet. LSB's `m_moghouseID != 0` state is only
+    /// cleared by this packet (see `0x05e_maprect.cpp:134-164`); neither
+    /// `/logout` nor crossing a normal zoneline does the trick, and the
+    /// zone id stays equal to the surrounding city the whole time. `kind`
+    /// chooses which exit the server emulates: `Home` is "step back to the
+    /// area I entered from" (1F/regular Mog House exit), the per-city kinds
+    /// (`Sandoria`, `Bastok`, …) use the "exit to alternate city zoneline"
+    /// quest reward, and `Mog2F` / `Mog1F` flip between floors of the same
+    /// Mog House without leaving. `MogGarden` zones out to the Mog Garden.
+    MogHouseExit { kind: MogHouseExit },
     /// Auto-end any in-progress event/cutscene. Sends `EndPara=0` for the
     /// queued event id — appropriate for informational dialogs that need
     /// a single "advance" press.
@@ -1317,6 +1351,76 @@ impl ReqLogoutKind {
             ReqLogoutKind::ShutdownToggle => (mode::TOGGLE, kind::SHUTDOWN),
             ReqLogoutKind::ShutdownOn => (mode::SHUTDOWN_ON, kind::SHUTDOWN),
             ReqLogoutKind::ShutdownOff => (mode::OFF, kind::SHUTDOWN),
+        }
+    }
+}
+
+/// Sub-kind for [`AgentCommand::MogHouseExit`]. Each variant pins down one
+/// server-validated `(MyRoomExitBit, MyRoomExitMode)` pair on the 0x05E
+/// `MAPRECT` wire packet sent with `RectID="zmrq"` (the universal Mog House
+/// exit tag, `Phoenix/src/map/packets/c2s/0x05e_maprect.cpp:72`). Variants
+/// fall into three groups:
+///
+/// 1. **`Home`** — `(SandOria, AreaEnteredFrom)`. Equivalent to the player
+///    walking out of their Mog House the way they came in. Always succeeds
+///    when `inMogHouse()`; ignores `MyRoomExitBit`. **Preferred default**
+///    because it never needs a quest flag.
+/// 2. **`Sandoria` / `Bastok` / `Windurst` / `Jeuno` / `Whitegate` /
+///    `Adoulin`** — "exit to a city in a region you have the Mog House
+///    quest flag for" (the four `Option1..Option4` slots get encoded into
+///    each region's specific zone via `0x05e_maprect.cpp:96-123`). The
+///    caller passes `slot` to pick which sub-zone (e.g. for SandOria:
+///    1=S.Sandy, 2=N.Sandy, 3=Port, 4=Chateau). Rejected if the player
+///    hasn't unlocked the corresponding `mhflag` bit; you'll see a
+///    `ShowWarning("Moghouse zoneline abuse")` on the server side.
+/// 3. **`Mog1F` / `Mog2F` / `MogGarden`** — special exit-modes that don't
+///    *leave* the Mog House so much as relocate inside it (or zone to the
+///    Mog Garden). `Mog2F` requires `mhflag & 0x20` (2F unlocked); the
+///    server warns and rejects otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MogHouseExit {
+    /// Walk back out the door you came in through. The safe default.
+    Home,
+    /// Sandoria-region exit to one of S.Sandy/N.Sandy/Port/Chateau.
+    /// `slot` ∈ {1,2,3,4}.
+    Sandoria { slot: u8 },
+    /// Bastok-region exit to one of Mines/Markets/Port/Metalworks.
+    Bastok { slot: u8 },
+    /// Windurst-region exit to one of Waters/Walls/Port/Woods.
+    Windurst { slot: u8 },
+    /// Jeuno-region exit to one of Ru'Lude/Upper/Lower/Port.
+    Jeuno { slot: u8 },
+    /// West-Aht-Urhgan exit (Al Zahbi / Whitegate).
+    Whitegate { slot: u8 },
+    /// Adoulin exit (`slot=1` West, `slot=2` East).
+    Adoulin { slot: u8 },
+    /// Move to Mog House 1F (no-op if already on 1F).
+    Mog1F,
+    /// Move to Mog House 2F. Requires the 2F unlock flag server-side.
+    Mog2F,
+    /// Exit to Mog Garden zone.
+    MogGarden,
+}
+
+impl MogHouseExit {
+    /// Resolve to the wire `(MyRoomExitBit, MyRoomExitMode)` pair for the
+    /// 0x05E body. Bit values from
+    /// `0x05e_maprect.h::GP_CLI_COMMAND_MAPRECT_MYROOMEXITBIT`; mode values
+    /// from `MYROOMEXITMODE` (`AreaEnteredFrom=0`, `Option1..4=1..4`,
+    /// `Mog2F=125`, `Mog1F=126`, `MogGarden=127`).
+    pub fn wire_pair(self) -> (u8, u8) {
+        match self {
+            MogHouseExit::Home => (1, 0), // SandOria bit + AreaEnteredFrom; bit ignored
+            MogHouseExit::Sandoria { slot } => (1, slot),
+            MogHouseExit::Bastok { slot } => (2, slot),
+            MogHouseExit::Windurst { slot } => (3, slot),
+            MogHouseExit::Jeuno { slot } => (4, slot),
+            MogHouseExit::Whitegate { slot } => (5, slot),
+            MogHouseExit::Adoulin { slot } => (9, slot),
+            MogHouseExit::Mog1F => (0, 126),
+            MogHouseExit::Mog2F => (0, 125),
+            MogHouseExit::MogGarden => (0, 127),
         }
     }
 }
@@ -1559,6 +1663,7 @@ mod tests {
             sub_job_lv: 37,
             is_party_leader: true,
             is_alliance_leader: false,
+            in_mog_house: false,
         };
         s.apply_event(&AgentEvent::PartyMemberUpdated { member: from_list });
         assert_eq!(s.party.len(), 1);
@@ -1583,6 +1688,7 @@ mod tests {
             sub_job_lv: 37,
             is_party_leader: false,
             is_alliance_leader: false,
+            in_mog_house: false,
         };
         s.apply_event(&AgentEvent::PartyMemberUpdated { member: from_attr });
         assert_eq!(s.party.len(), 1, "upsert by id");
@@ -1665,6 +1771,7 @@ mod tests {
             zone_no: 100, main_job: 0, main_job_lv: 0,
             sub_job: 0, sub_job_lv: 0,
             is_party_leader: true, is_alliance_leader: false,
+            in_mog_house: false,
         });
         s.apply_event(&AgentEvent::ZoneChanged { from: Some(100), to: 230 });
         assert_eq!(s.zone_id, Some(230));

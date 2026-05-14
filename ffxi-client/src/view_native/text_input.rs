@@ -560,6 +560,7 @@ fn apply_slash_outcome(
                 chunk_idx,
                 world_pos: bevy_pos,
                 entity_id,
+                world_transform: None,
             });
             let label = match entity_id {
                 Some(id) => format!("/load_mmb_on {id} {file_id} {chunk_idx}: spawning…"),

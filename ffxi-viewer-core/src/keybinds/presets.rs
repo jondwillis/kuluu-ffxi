@@ -97,7 +97,16 @@ fn shared() -> Vec<(Action, KeyBind)> {
         // ----- Mode toggles -----
         (Action::ToggleAutorun, KeyBind::new(KeyCode::KeyR)),
         (Action::ToggleLockOn, KeyBind::new(KeyCode::KeyH)),
-        (Action::ToggleFirstPerson, KeyBind::new(KeyCode::F8)),
+        // Retail FFXI binds first-person toggle to `V` in the Compact
+        // layouts. We use the same default across every preset so
+        // muscle memory carries between layouts.
+        (Action::ToggleFirstPerson, KeyBind::new(KeyCode::KeyV)),
+        // Retail Compact 1 zoom: `.` in, `,` out. Suppressed by the
+        // dispatcher when the camera is in FirstPerson (no chase
+        // distance to step). `Comma`/`Period` are the unshifted
+        // KeyCodes for `,`/`.`.
+        (Action::CameraZoomIn, KeyBind::new(KeyCode::Period)),
+        (Action::CameraZoomOut, KeyBind::new(KeyCode::Comma)),
         // Stage 3 introduces the PassiveCursor handler. Insert is unbound
         // in retail (Scroll Lock is hide-HUD per research, not the focus
         // toggle) and unbound in our prior set, so it's collision-free.

@@ -154,6 +154,9 @@ fn upsert_entities(list: &mut Vec<Entity>, ups: &[Entity]) {
 
 /// Party upsert preserves `name` and `is_party_leader` across attr-only
 /// refreshes (where `name == None` indicates a `0x0DF GROUP_ATTR` payload).
+/// `in_mog_house` is *not* preserved — both 0x0DD and 0x0DF carry it, and
+/// the moghouse-entry rezone delivers a fresh `0x0DF GROUP_ATTR` whose
+/// flag value is the new truth.
 fn upsert_party(list: &mut Vec<PartyMember>, ups: &[PartyMember]) {
     for m in ups {
         if let Some(existing) = list.iter_mut().find(|x| x.id == m.id) {
@@ -202,6 +205,7 @@ mod tests {
             claim_id: 0,
             speed: 0,
             speed_base: 0,
+            look: None,
         }
     }
 
@@ -263,6 +267,7 @@ mod tests {
             sub_job_lv: 37,
             is_party_leader: true,
             is_alliance_leader: false,
+            in_mog_house: false,
         };
         apply_delta(
             &mut snap,
@@ -291,6 +296,7 @@ mod tests {
             sub_job_lv: 37,
             is_party_leader: false,
             is_alliance_leader: false,
+            in_mog_house: false,
         };
         apply_delta(
             &mut snap,

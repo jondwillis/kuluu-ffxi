@@ -40,6 +40,12 @@ pub struct NameplateLabel {
     pub base_name: String,
 }
 
+/// Marker on the secondary coord line under a nameplate. Drawn one line
+/// below the name in a smaller, dimmer style — `123.4 / 45.1 / -67.2`.
+/// Per-frame system writes the owning entity's world translation here.
+#[derive(Component)]
+pub struct NameplateCoord;
+
 /// Spawn a UI nameplate for a wire entity. Returns the spawned UI entity so
 /// callers can keep a handle if they want; ignoring the return is fine —
 /// `update_nameplates_system` reconciles via `entity_id`.
@@ -58,6 +64,11 @@ pub fn spawn_nameplate(
                 position_type: PositionType::Absolute,
                 top: Val::Px(-1000.0),
                 left: Val::Px(-1000.0),
+                // Stack the name and the coord line vertically. Bevy UI
+                // defaults to `Row`, which would put the coords on the
+                // right of the name and break the centering math.
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
                 ..default()
             },
         ))
@@ -74,6 +85,18 @@ pub fn spawn_nameplate(
                 },
                 TextColor(color),
             ));
+            // Coord line — dimmer, smaller. Filled per-frame by
+            // `update_nameplates_system`. Starts empty so a freshly spawned
+            // label without a world position doesn't flash placeholder text.
+            p.spawn((
+                NameplateCoord,
+                Text::new(""),
+                TextFont {
+                    font_size: 10.0,
+                    ..default()
+                },
+                TextColor(Color::srgba(0.78, 0.78, 0.82, 0.85)),
+            ));
         })
         .id()
 }
@@ -89,6 +112,13 @@ pub fn format_label(base_name: &str, hp_pct: Option<u8>, kind: EntityKind) -> St
         (true, Some(pct)) => format!("{base_name} {pct}%"),
         _ => base_name.to_string(),
     }
+}
+
+/// Format a world position as the second-line coord string on a nameplate.
+/// One decimal of precision keeps the line short while still being useful
+/// for sub-meter navigation. Order is FFXI-conventional X / Y / Z.
+pub fn format_coord(pos: Vec3) -> String {
+    format!("{:.1} / {:.1} / {:.1}", pos.x, pos.y, pos.z)
 }
 
 /// Per-frame: project each nameplate owner's world position to viewport
@@ -113,7 +143,8 @@ pub fn update_nameplates_system(
     cam_q: Query<(&Camera, &Transform), (With<OperatorCamera>, Without<WorldEntity>)>,
     world_q: Query<(&Transform, &WorldEntity), Without<Nameplate>>,
     mut nameplate_q: Query<(Entity, &Nameplate, &mut Node, &Children)>,
-    mut label_q: Query<(&NameplateLabel, &mut Text)>,
+    mut label_q: Query<(&NameplateLabel, &mut Text), Without<NameplateCoord>>,
+    mut coord_q: Query<&mut Text, (With<NameplateCoord>, Without<NameplateLabel>)>,
     mut commands: Commands,
 ) {
     let Ok((camera, cam_t)) = cam_q.single() else {
@@ -156,11 +187,16 @@ pub fn update_nameplates_system(
                 // composed string hasn't changed so we don't trigger
                 // Bevy's change-detection on every nameplate every frame.
                 let hp_pct = hp_by_id.get(&np.entity_id).copied().flatten();
+                let coord_str = format_coord(world_pos);
                 for child in children.iter() {
                     if let Ok((label, mut text)) = label_q.get_mut(child) {
                         let want = format_label(&label.base_name, hp_pct, np.kind);
                         if **text != want {
                             **text = want;
+                        }
+                    } else if let Ok(mut text) = coord_q.get_mut(child) {
+                        if **text != coord_str {
+                            **text = coord_str.clone();
                         }
                     }
                 }

@@ -1156,6 +1156,7 @@ mod tests {
                 sub_job_lv: 37,
                 is_party_leader: false,
                 is_alliance_leader: false,
+                in_mog_house: false,
             },
         }
     }

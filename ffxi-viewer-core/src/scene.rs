@@ -14,11 +14,12 @@
 
 use std::collections::HashMap;
 
+use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder, FogVolume};
 use bevy::picking::Pickable;
 use bevy::prelude::*;
 use ffxi_viewer_wire::{EntityKind, Vec3 as WireVec3};
 
-use crate::components::{IsSelf, Nameplate, WorldEntity};
+use crate::components::{IsSelf, LookComp, Nameplate, WorldEntity};
 use crate::snapshot::SceneState;
 
 /// Map a wire-side FFXI position to a Bevy world position.
@@ -145,6 +146,20 @@ pub struct TrackedEntities {
     pub by_id: HashMap<u32, Entity>,
 }
 
+/// 4-cascade shadow map used by the sun light. First cascade tight
+/// (~12m around the player) for sharp character self-shadowing; last
+/// cascade ~500m so distant terrain still receives shadows.
+pub fn cascade_config_for_sun() -> CascadeShadowConfig {
+    CascadeShadowConfigBuilder {
+        num_cascades: 4,
+        minimum_distance: 0.1,
+        maximum_distance: 500.0,
+        first_cascade_far_bound: 12.0,
+        overlap_proportion: 0.2,
+    }
+    .build()
+}
+
 /// Startup system: ground plane, key light, and the cached materials.
 pub fn setup_world(
     mut commands: Commands,
@@ -208,15 +223,44 @@ pub fn setup_world(
     // navmesh height — both work better without the flat plane
     // depth-fighting them.
 
-    // A single directional light angled from above-right.
+    // Sun + moon directional lights + visible emissive discs. Both
+    // are tagged and updated each frame by `sun_moon::sun_moon_system`
+    // from Vana'diel time (sun arcs east→west across the V-day; moon
+    // is anti-phase; moon brightness follows the 84-day phase cycle).
+    crate::sun_moon::spawn_sun_and_moon(&mut commands, &mut meshes, &mut materials);
+
+    // Zone-scale fog volume. `FogVolume`'s bounds come from its
+    // Transform scale (default 1m³); we make it a ~2km cube so the
+    // entire FFXI zone sits inside. Density tuned for "heavy
+    // atmosphere": air itself visibly scatters but mid-ground stays
+    // readable. Pair with the camera's `VolumetricFog` and the
+    // directional light's `VolumetricLight` marker above.
     commands.spawn((
-        DirectionalLight {
-            illuminance: 12_000.0,
-            shadows_enabled: false,
+        FogVolume {
+            fog_color: Color::srgb(0.65, 0.72, 0.82),
+            density_factor: 0.06,
+            absorption: 0.25,
+            scattering: 0.35,
+            // High asymmetry: light shafts pop only when looking
+            // toward the sun. Looking away the air is just hazy.
+            scattering_asymmetry: 0.7,
+            light_tint: Color::srgb(1.0, 0.96, 0.88),
+            light_intensity: 1.0,
             ..default()
         },
-        Transform::from_xyz(50.0, 100.0, 50.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(0.0, 200.0, 0.0).with_scale(Vec3::splat(2000.0)),
     ));
+    // Ambient fill. With cascaded shadows enabled the shaded side of
+    // walls gets only ambient light, so 120 lux (the original lower
+    // bound chosen for shadow contrast) ends up rendering interior
+    // floors near-black. 500 lux is a compromise: shadows still read
+    // as shadows (~20:1 contrast vs 10k-lux sun) but the texture on
+    // back-facing walls stays visible.
+    commands.insert_resource(AmbientLight {
+        color: Color::srgb(0.85, 0.88, 1.0),
+        brightness: 500.0,
+        ..default()
+    });
 }
 
 /// Sync wire-side entities with the Bevy world. Spawns new entities,
@@ -606,6 +650,64 @@ pub fn pick_mob_material<'a>(
 fn heading_to_quat(heading: u8) -> Quat {
     let angle = (heading as f32) * std::f32::consts::TAU / 256.0;
     Quat::from_rotation_y(angle)
+}
+
+/// Copy each wire entity's `look` field onto its Bevy `WorldEntity` as
+/// a [`LookComp`], but only when the value actually changed. The
+/// inserted/removed `LookComp` is what downstream look-driven systems
+/// (model spawning in Stage 3+) hang off via `Changed<LookComp>`
+/// queries.
+///
+/// Why "only when changed": `commands.entity(e).insert(...)` is cheap,
+/// but each insert *touches* the component and a downstream
+/// `Changed<LookComp>` filter would then fire every snapshot tick —
+/// many times per second per entity — even when the value is
+/// byte-identical to last tick. The explicit compare-then-insert here
+/// is what makes Bevy's change-detection meaningful for this surface.
+pub fn sync_entity_looks_system(
+    state: Res<SceneState>,
+    tracked: Res<TrackedEntities>,
+    q_look: Query<&LookComp>,
+    mut commands: Commands,
+) {
+    if !state.dirty {
+        return;
+    }
+    for wire in &state.snapshot.entities {
+        let Some(&bevy_e) = tracked.by_id.get(&wire.id) else { continue };
+        let current = q_look.get(bevy_e).ok();
+        match (&wire.look, current) {
+            (Some(new), Some(LookComp(old))) if new == old => {}
+            (Some(new), _) => {
+                commands.entity(bevy_e).insert(LookComp(new.clone()));
+            }
+            (None, Some(_)) => {
+                commands.entity(bevy_e).remove::<LookComp>();
+            }
+            (None, None) => {}
+        }
+    }
+}
+
+/// React to look changes for spawned entities — Stage 3+ fills this in
+/// with `LoadMmbRequest` dispatch. Today it's a hook that just logs the
+/// transition via `info!`, so we can confirm Stage 2's change-detect
+/// plumbing is firing when (and only when) wire data actually changes.
+///
+/// Uses Bevy's `Changed<LookComp>` rather than re-comparing snapshot
+/// state because [`sync_entity_looks_system`] already absorbed the
+/// "snapshot says X, world says Y" reconciliation upstream.
+pub fn process_entity_look_changes(
+    q_changed: Query<(&WorldEntity, &LookComp), Changed<LookComp>>,
+) {
+    for (we, look) in q_changed.iter() {
+        // Tag the log with both the wire id and entity kind so
+        // operators can correlate it against `/entities` output.
+        info!(
+            "look changed for entity {} ({:?}): {:?}",
+            we.id, we.kind, look.0
+        );
+    }
 }
 
 /// HP bar color: green at 100%, yellow at 50%, red at 0%.

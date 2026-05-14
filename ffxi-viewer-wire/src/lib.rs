@@ -197,6 +197,12 @@ pub struct PartyMember {
     pub sub_job_lv: u8,
     pub is_party_leader: bool,
     pub is_alliance_leader: bool,
+    /// Wire-side mirror of the server's `MoghouseFlg`. The HUD treats a `true`
+    /// here for the self row (`id == SceneSnapshot.self_char_id`) as "you are
+    /// in a Mog House" — `zone_no` alone can't disambiguate because LSB keeps
+    /// it equal to the surrounding city.
+    #[serde(default)]
+    pub in_mog_house: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

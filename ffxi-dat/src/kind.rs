@@ -24,6 +24,16 @@ pub enum ChunkKind {
     AnimMo2 = 0x2B,    // animation keyframes (Mo2)
     Mmb = 0x2E,        // composite entity model (decryption + inline vertex/bone)
     Rid = 0x36,        // resource id (file metadata)
+    // TODO(atmosphere): identify and add variants for FFXI's
+    // per-zone visual data. The viewer's `ZoneAtmosphereProvider`
+    // (ffxi-viewer-core::atmosphere) is ready to consume:
+    //   * Sky-dome / skybox cubemap (separate sky DATs keyed on zone id)
+    //   * Per-zone ambient color & fog parameters
+    //   * Indoor light emitters (likely an MZB placement subtype, not
+    //     a top-level chunk — see `parse_placements`)
+    // None of these chunk types are confirmed in this parser yet;
+    // they need reverse-engineering against POLUtils / Windower notes
+    // or empirical inspection of the DAT chunk streams.
 }
 
 impl ChunkKind {

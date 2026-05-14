@@ -16,13 +16,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod atmosphere;
 pub mod camera;
 pub mod components;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_mmb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_mzb;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dat_vos2;
 pub mod hud;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod look_resolver;
 pub mod input_mode;
 pub mod keybinds;
 pub mod lock_on;
@@ -32,6 +37,7 @@ pub mod picking;
 pub mod scene;
 pub mod snapshot;
 pub mod source;
+pub mod sun_moon;
 pub mod target_ring;
 pub mod zone_lines;
 
@@ -39,7 +45,7 @@ pub use camera::{
     chase_camera_system, firstperson_camera_system, heading_for_yaw, spawn_camera,
     toggle_camera_mode, yaw_for_heading, CameraMode, ChaseCamera, OperatorCamera,
 };
-pub use components::{HpIndicator, IsSelf, Nameplate, WorldEntity};
+pub use components::{EntityModel, HpIndicator, IsSelf, LookComp, Nameplate, WorldEntity};
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
     ChatBuffer, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack, PassiveCursorFocus,
@@ -50,7 +56,8 @@ pub use lock_on::{LockOn, ToggleResult as LockOnToggle};
 pub use mouse::{CursorLockRequest, MousePlugin, MousePointer};
 pub use picking::{click_to_target_system, resolve_click_target, ClickResolution, PickingPlugin};
 pub use scene::{
-    feet_offset, ffxi_to_bevy, setup_world, sync_entities_system, sync_aggro_system,
+    feet_offset, ffxi_to_bevy, process_entity_look_changes, setup_world,
+    sync_aggro_system, sync_entities_system, sync_entity_looks_system,
     Aggroing, EntityMaterials, EntityMesh, HpBar, HpBarMesh, Target, TrackedEntities,
 };
 pub use snapshot::{apply_delta, ingest_system, EventLog, SceneState, CHAT_HISTORY_CAP};
@@ -99,7 +106,13 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<CameraMode>()
             .init_resource::<LockOn>()
             .init_resource::<ZoneLineState>()
+            .init_resource::<atmosphere::ZoneAtmosphereProvider>()
+            .init_resource::<atmosphere::LastAtmosphereZone>()
+            .init_resource::<sun_moon::VanaSky>()
             .init_resource::<hud::chat_panel::ChatScroll>()
+            .init_resource::<hud::chat_panel::BattleScroll>()
+            .init_resource::<hud::chat_panel::ChatScrollAccum>()
+            .init_resource::<hud::chat_panel::BattleScrollAccum>()
             // PickingPlugin owns the mesh raycast backend + the click→target
             // reader. `DefaultPickingPlugins` (input/hover/interaction) is
             // already added by `DefaultPlugins` on both front-ends.
@@ -122,12 +135,23 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                 Update,
                 (
                     sync_entities_system,
+                    // Stage 2 of look→MMB pipeline: copy each wire
+                    // entity's `look` onto its Bevy entity (when
+                    // changed) and emit a hook system that Stage 3+
+                    // will hang `LoadMmbRequest` dispatch off. Order
+                    // matters: must run after the spawn pass so the
+                    // `TrackedEntities` map is current.
+                    sync_entity_looks_system,
+                    process_entity_look_changes,
                     chase_camera_system,
                     firstperson_camera_system,
                     sync_aggro_system,
                     nameplate::update_nameplates_system,
                     target_ring::draw_target_ring_system,
+                    target_ring::draw_engaged_ring_system,
                     sync_zone_lines_system,
+                    atmosphere::apply_zone_atmosphere_system,
+                    sun_moon::sun_moon_system,
                 )
                     .chain()
                     .run_if(resource_exists::<EntityMesh>),

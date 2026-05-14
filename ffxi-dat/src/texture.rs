@@ -86,6 +86,24 @@ pub struct DecodedTexture {
     pub rgba: Vec<u8>,
 }
 
+/// Extract the 8-byte internal texture name from an `flg=0xA1` IMG body.
+/// The `id[16]` field holds `"model   <name>"` (8-char type tag + 8-char
+/// name); we return just the name portion (last 8 bytes, space-trimmed).
+/// Returns `None` if the body is too short or `flg != 0xA1`.
+pub fn extract_texture_name(body: &[u8]) -> Option<String> {
+    if body.len() < 0x11 || body[0] != 0xA1 {
+        return None;
+    }
+    // id[16] sits at body[1..0x11]. The last 8 bytes are the asset name.
+    let raw = &body[9..0x11];
+    let s: String = raw
+        .iter()
+        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '\0' })
+        .take_while(|&c| c != '\0')
+        .collect();
+    Some(s.trim().to_string())
+}
+
 /// Errors raised by the texture pixel-decode path.
 #[derive(Debug, thiserror::Error)]
 pub enum TextureError {
@@ -116,33 +134,66 @@ pub fn find_texture_format(body: &[u8]) -> Result<Option<(usize, TexFormat)>> {
 
 /// Decode an FFXI IMG chunk body into top-mip RGBA8 pixels.
 ///
-/// This is the high-level entry point. It:
-///   1. Scans for the FourCC magic via [`find_texture_format`].
-///   2. Reads `width` / `height` as two u32 LEs immediately following.
-///   3. Dispatches to the per-format block decoder.
+/// Body layout for `flg=0xA1` (DXT-compressed, the variant used by zone
+/// IMG chunks in MZB/MMB-bearing DATs):
+///   - 0x00:        flg byte (0xA1 here)
+///   - 0x01..0x11:  id[16] — ASCII texture name (e.g. `"model   s_bas_h"`)
+///   - 0x11..0x15:  dwnazo1 DWORD (purpose unknown)
+///   - 0x15..0x19:  imgx (width) i32 LE
+///   - 0x19..0x1D:  imgy (height) i32 LE
+///   - 0x1D..0x35:  dwnazo2[6] (24 bytes, purpose unknown)
+///   - 0x35..0x39:  widthbyte DWORD
+///   - 0x39..0x3D:  ddsType FourCC: `"3TXD"`/`"1TXD"`/`"5TXD"` reversed
+///   - 0x3D..0x41:  size DWORD — pixel-data byte count
+///   - 0x41..0x45:  noBlock DWORD
+///   - 0x45..:      pixel data (`size` bytes, then padding to chunk end)
 ///
-/// **FFXI framing caveat**: the width/height offset is not fully
-/// verified against real DATs in this commit. If you have width/height
-/// from another source (e.g. an MMB sub-record), prefer the per-format
-/// decoders directly.
+/// `sizeof(IMGINFOA1) = 69` (0x45). DXT3 sample verifies: a 128×256
+/// chunk has body 32848 = 69 header + 32768 pixels (= 128*256 bytes for
+/// DXT3) + 11 trailing padding bytes.
+///
+/// Reference: TeoTwawki/ffxi-dat-hacking `TDWAnalysis.h::IMGINFOA1` +
+/// `DatLoader.cpp::extractImage` (flg dispatch).
 pub fn decode_texture(body: &[u8]) -> std::result::Result<DecodedTexture, TextureError> {
-    let (magic_off, fmt) = match find_texture_format(body) {
-        Ok(Some(v)) => v,
-        _ => return Err(TextureError::NoMagic),
-    };
+    if body.is_empty() {
+        return Err(TextureError::NoMagic);
+    }
+    match body[0] {
+        0xA1 => decode_imginfo_a1(body),
+        0x01 | 0x81 | 0x91 => decode_palettized(body, 0x39, 0x439),
+        0xB1 => decode_palettized(body, 0x3D, 0x43D),
+        // 0x05 (IMGINFO05, no embedded palette) and unknown flg values
+        // — not yet decoded. Reference (TeoTwawki) records header
+        // size but doesn't pin down the pixel interpretation; POLUtils
+        // would, but is C# and not Rust-portable.
+        _ => Err(TextureError::NoMagic),
+    }
+}
 
-    let dims_off = magic_off + 4;
-    let pixel_off = dims_off + 8;
-    if body.len() < pixel_off {
+/// DXT-compressed IMGINFOA1 layout. See [`decode_texture`] for the
+/// per-field offset table; this branch handles `flg = 0xA1`.
+fn decode_imginfo_a1(body: &[u8]) -> std::result::Result<DecodedTexture, TextureError> {
+    if body.len() < 0x45 {
         return Err(TextureError::Truncated {
-            offset: dims_off,
-            needed: 8,
-            available: body.len().saturating_sub(dims_off),
+            offset: 0,
+            needed: 0x45,
+            available: body.len(),
         });
     }
-    let width = u32::from_le_bytes(body[dims_off..dims_off + 4].try_into().unwrap());
-    let height = u32::from_le_bytes(body[dims_off + 4..dims_off + 8].try_into().unwrap());
+    let width = i32::from_le_bytes(body[0x15..0x19].try_into().unwrap());
+    let height = i32::from_le_bytes(body[0x19..0x1D].try_into().unwrap());
+    if width <= 0 || height <= 0 {
+        return Err(TextureError::BadDimensions {
+            width: width as u32,
+            height: height as u32,
+        });
+    }
+    let width = width as u32;
+    let height = height as u32;
 
+    let magic = &body[0x39..0x3D];
+    let fmt = TexFormat::from_magic(magic).ok_or(TextureError::NoMagic)?;
+    let pixel_off = 0x45usize;
     let pixels = &body[pixel_off..];
     let rgba = match fmt {
         TexFormat::Dxt1 => decode_dxt1_blocks(pixels, width, height)?,
@@ -150,10 +201,73 @@ pub fn decode_texture(body: &[u8]) -> std::result::Result<DecodedTexture, Textur
         TexFormat::Bgra32 => decode_bgra_raw(pixels, width, height)?,
         TexFormat::Argb32 => decode_argb_raw(pixels, width, height)?,
     };
+    Ok(DecodedTexture { width, height, format_tag: fmt, rgba })
+}
+
+/// Palette-based IMG (flg=0x01/0x81/0x91 with header_size=0x439,
+/// palette@0x39; flg=0xB1 with header_size=0x43D, palette@0x3D). 256
+/// BGRA palette entries followed by `width*height` 8-bit indices.
+///
+/// Reports as `TexFormat::Bgra32` in the result tag since the decoded
+/// surface is 32-bit RGBA — the upstream `format_tag` only drives
+/// per-format pre-decode dispatch, which is no-op here.
+fn decode_palettized(
+    body: &[u8],
+    palette_off: usize,
+    pixel_off: usize,
+) -> std::result::Result<DecodedTexture, TextureError> {
+    let needed_header = pixel_off;
+    if body.len() < needed_header {
+        return Err(TextureError::Truncated {
+            offset: 0,
+            needed: needed_header,
+            available: body.len(),
+        });
+    }
+    let width = i32::from_le_bytes(body[0x15..0x19].try_into().unwrap());
+    let height = i32::from_le_bytes(body[0x19..0x1D].try_into().unwrap());
+    if width <= 0 || height <= 0 {
+        return Err(TextureError::BadDimensions {
+            width: width as u32,
+            height: height as u32,
+        });
+    }
+    let width = width as u32;
+    let height = height as u32;
+
+    // 256 × BGRA8 palette. Each on-disk DWORD is little-endian
+    // (B, G, R, A). FFXI stores alpha as 7-bit (0..0x80); scale to 8-bit.
+    let palette_bytes = &body[palette_off..palette_off + 256 * 4];
+    let mut palette: [[u8; 4]; 256] = [[0; 4]; 256];
+    for (i, entry) in palette.iter_mut().enumerate() {
+        let o = i * 4;
+        let b = palette_bytes[o];
+        let g = palette_bytes[o + 1];
+        let r = palette_bytes[o + 2];
+        let a_raw = palette_bytes[o + 3];
+        let a = ((a_raw as u16).saturating_mul(2)).min(255) as u8;
+        *entry = [r, g, b, a];
+    }
+
+    let n_pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(TextureError::SizeOverflow { width, height })?;
+    if body.len() < pixel_off + n_pixels {
+        return Err(TextureError::Truncated {
+            offset: pixel_off,
+            needed: n_pixels,
+            available: body.len().saturating_sub(pixel_off),
+        });
+    }
+    let indices = &body[pixel_off..pixel_off + n_pixels];
+    let mut rgba: Vec<u8> = Vec::with_capacity(n_pixels * 4);
+    for &idx in indices {
+        rgba.extend_from_slice(&palette[idx as usize]);
+    }
     Ok(DecodedTexture {
         width,
         height,
-        format_tag: fmt,
+        format_tag: TexFormat::Bgra32,
         rgba,
     })
 }

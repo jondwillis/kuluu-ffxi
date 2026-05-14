@@ -6,7 +6,11 @@
 //! [`heading_for_yaw`] so the player walks in the direction the camera looks
 //! — FFXI's "third-person walk-toward-camera-forward" behavior.
 
+use bevy::post_process::bloom::Bloom;
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::light::{ShadowFilteringMethod, VolumetricFog};
 use bevy::prelude::*;
+use bevy::render::view::Hdr;
 
 use crate::components::IsSelf;
 use crate::snapshot::SceneState;
@@ -74,6 +78,19 @@ impl ChaseCamera {
     /// `height = 1.9` per `scene::EntityMesh`; eye sits below the top so
     /// the cap doesn't intersect the near-clip.
     pub const FP_EYE_HEIGHT: f32 = 1.6;
+    /// Closest the chase camera can pull in. Below ~3.0 the player capsule
+    /// clips through the near plane; for closer-than-3 use FirstPerson.
+    pub const DIST_MIN: f32 = 3.0;
+    /// Furthest the chase camera can pull out. Beyond 30 the avatar is too
+    /// small to read on the operator's screen and HUD becomes the main signal.
+    pub const DIST_MAX: f32 = 30.0;
+    /// Keyboard zoom rate, **yalms per second of held key**. Used by
+    /// the `.` / `,` bindings (`Action::CameraZoomIn`/`Out`). Time-based
+    /// rather than per-press so holding the key produces smooth,
+    /// framerate-independent zoom motion. 10 yalm/s traverses the full
+    /// 3..30 range in ~2.7 seconds — fast enough to feel responsive,
+    /// slow enough that an operator can stop on a chosen distance.
+    pub const KEYBOARD_ZOOM_RATE: f32 = 10.0;
 }
 
 impl Default for ChaseCamera {
@@ -93,6 +110,54 @@ pub fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         OperatorCamera,
         Camera3d::default(),
+        // HDR is a marker component in Bevy 0.17 (was `camera.hdr`
+        // in older versions). Required for bloom and for TonyMcMapface
+        // tonemapping to operate on its native HDR input.
+        Hdr,
+        // TonyMcMapface preserves saturated highlights better than the
+        // default Reinhard — emissive target/aggro materials read as
+        // glowing rather than blown-out white.
+        Tonemapping::TonyMcMapface,
+        // Soft PCF shadow filter. Without it the directional-light
+        // shadows are jagged single-sample hard edges.
+        ShadowFilteringMethod::Gaussian,
+        Msaa::Sample4,
+        // PS2-era bloom. Bevy 0.17 ships an `OLD_SCHOOL` preset that
+        // matches the era FFXI launched in — soft additive halo on
+        // bright pixels, low threshold so even non-emissive whites
+        // bloom slightly. Intensity bumped a hair above the preset's
+        // 0.05 so the target/aggro emissives read as "glowing"
+        // without smearing the whole frame.
+        Bloom {
+            intensity: 0.12,
+            ..Bloom::OLD_SCHOOL
+        },
+        // Raymarched volumetric fog. Pairs with the `VolumetricLight`
+        // marker on the directional light (`scene.rs::setup_world`)
+        // and a world-spanning `FogVolume` entity. `step_count` is
+        // perf vs banding — 32 is fast and slightly banded; 96 is the
+        // cinematic setting. 64 is the Bevy default and a sane middle.
+        VolumetricFog {
+            step_count: 64,
+            ambient_intensity: 0.1,
+            ambient_color: Color::srgb(0.85, 0.88, 1.0),
+            jitter: 0.0,
+        },
+        // Distance fog disabled for now. The `ZoneAtmosphere` seam
+        // can still attach one per-zone later via
+        // `apply_zone_atmosphere_system`; the helper
+        // `crate::atmosphere::ffxi_distance_fog` remains as a
+        // ready-to-use preset.
+        //
+        // Extend the far-clip past the celestial-disc sky radius
+        // (`crate::sun_moon::SKY_RADIUS` = 4000m). Bevy's default
+        // perspective far-clip is 1000m, which culled the sun/moon
+        // discs entirely. 6000m gives headroom and is still well
+        // within float-depth precision.
+        Projection::Perspective(PerspectiveProjection {
+            far: 6000.0,
+            ..default()
+        }),
         Transform::from_xyz(0.0, 12.0, 18.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.insert_resource(ChaseCamera::default());

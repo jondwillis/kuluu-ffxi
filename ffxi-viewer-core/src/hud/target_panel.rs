@@ -268,6 +268,7 @@ mod tests {
             claim_id: 0,
             speed: 0,
             speed_base: 0,
+            look: None,
         }
     }
 

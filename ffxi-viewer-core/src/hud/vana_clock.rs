@@ -20,11 +20,11 @@ use crate::hud::palette;
 
 /// Earth epoch corresponding to Vana'diel 8866-01-01 00:00, in
 /// `(SystemTime - UNIX_EPOCH).as_secs()` form. 2002-06-23 15:00 UTC.
-const EARTH_EPOCH_UNIX: u64 = 1_024_844_400;
+pub const EARTH_EPOCH_UNIX: u64 = 1_024_844_400;
 /// Vana'diel epoch year offset.
 const VANA_EPOCH_YEAR: u32 = 886;
 /// Earth seconds per Vana'diel day. 1 V-hour = 25 Earth seconds, day = 24.
-const EARTH_SECS_PER_VANA_DAY: u64 = 25 * 24;
+pub const EARTH_SECS_PER_VANA_DAY: u64 = 25 * 24;
 /// V-days per V-month and V-months per V-year. FFXI uses 30 / 12.
 const VANA_DAYS_PER_MONTH: u32 = 30;
 const VANA_MONTHS_PER_YEAR: u32 = 12;

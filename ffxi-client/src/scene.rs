@@ -315,6 +315,7 @@ mod tests {
                 zone_no: 230, main_job: 1, main_job_lv: 75,
                 sub_job: 6, sub_job_lv: 37,
                 is_party_leader: false, is_alliance_leader: false,
+                in_mog_house: false,
             },
         });
         let scene = SceneSummary::from_state(&s);
@@ -378,6 +379,7 @@ mod tests {
                     zone_no: 230, main_job: 1, main_job_lv: 75,
                     sub_job: 6, sub_job_lv: 37,
                     is_party_leader: id == 42, is_alliance_leader: false,
+                    in_mog_house: false,
                 },
             });
         }

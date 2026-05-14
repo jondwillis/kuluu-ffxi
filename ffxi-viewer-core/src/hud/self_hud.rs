@@ -34,6 +34,26 @@ pub struct SelfMpRow;
 #[derive(Component)]
 pub struct SelfTpRow;
 
+/// Combined combat-status / healing badge row beneath HP/MP/TP. Renders
+/// "ENGAGED" while the player has a non-zero `bt_target_id`, and overlays
+/// a brief "+N HP" pulse whenever the player's HP increases between
+/// snapshots. Both signals live in one row so the panel doesn't grow
+/// vertically when neither condition holds.
+#[derive(Component)]
+pub struct SelfStatusRow;
+
+/// Tracks the most recently observed self HP and how long the heal pulse
+/// has been visible. Reset by `update_self_status` each tick; the badge
+/// shows "+N HP" for `HEAL_PULSE_SECS` after an increase, then fades.
+#[derive(Resource, Default)]
+pub struct SelfHealTracker {
+    pub last_hp: Option<u32>,
+    pub pulse_amount: u32,
+    pub pulse_remaining_s: f32,
+}
+
+const HEAL_PULSE_SECS: f32 = 1.5;
+
 const PANEL_WIDTH_PX: f32 = 220.0;
 
 pub fn spawn_self_hud(mut commands: Commands) {
@@ -63,6 +83,7 @@ pub fn spawn_self_hud(mut commands: Commands) {
             spawn_row(p, SelfHpRow, "HP", "—");
             spawn_row(p, SelfMpRow, "MP", "—");
             spawn_row(p, SelfTpRow, "TP", "—");
+            spawn_row(p, SelfStatusRow, "", "");
         });
 }
 
@@ -159,6 +180,82 @@ pub fn update_self_hud(
     }
 }
 
+/// Per-frame: detect HP gain on self, drive the engaged + heal badge.
+///
+/// Two signals share one text row:
+///   - Engaged: self entity has `bt_target_id != 0`. Renders "ENGAGED"
+///     in red. Read from the snapshot directly each tick so the badge
+///     clears the moment the server disengages us.
+///   - Heal: party-row HP increased between snapshots. The delta is
+///     latched into the tracker, shown as "+N HP" in green for
+///     `HEAL_PULSE_SECS` then cleared. A simultaneous engage + heal
+///     concatenates both in the row ("ENGAGED  +50 HP").
+///
+/// Tracker initialisation: first observation seeds `last_hp` without
+/// firing a pulse — otherwise the pulse would mis-fire on zone-in when
+/// the prior `last_hp` is `None`.
+pub fn update_self_status(
+    state: Res<SceneState>,
+    time: Res<Time>,
+    mut tracker: ResMut<SelfHealTracker>,
+    mut row_q: Query<(&mut Text, &mut TextColor), With<SelfStatusRow>>,
+) {
+    let snap = &state.snapshot;
+    let me = resolve_self(&snap.party, snap.self_char_id);
+
+    // HP-delta tracking. Only fire a pulse on a strict increase; equal
+    // HP (e.g. attr-only update with no change) is a no-op.
+    if let Some(m) = me {
+        match tracker.last_hp {
+            Some(prev) if m.hp > prev => {
+                tracker.pulse_amount = m.hp - prev;
+                tracker.pulse_remaining_s = HEAL_PULSE_SECS;
+            }
+            _ => {}
+        }
+        tracker.last_hp = Some(m.hp);
+    }
+    if tracker.pulse_remaining_s > 0.0 {
+        tracker.pulse_remaining_s =
+            (tracker.pulse_remaining_s - time.delta_secs()).max(0.0);
+    }
+
+    // Engaged check: self entity in the entity list (party-row data
+    // doesn't carry `bt_target_id`).
+    let engaged = match snap.self_char_id {
+        Some(id) => snap
+            .entities
+            .iter()
+            .any(|e| e.id == id && e.bt_target_id != 0),
+        None => false,
+    };
+
+    let Ok((mut text, mut tc)) = row_q.single_mut() else {
+        return;
+    };
+
+    let pulse_active = tracker.pulse_remaining_s > 0.0;
+    let want_text = match (engaged, pulse_active) {
+        (true, true) => format!("ENGAGED  +{} HP", tracker.pulse_amount),
+        (true, false) => "ENGAGED".to_string(),
+        (false, true) => format!("+{} HP", tracker.pulse_amount),
+        (false, false) => String::new(),
+    };
+    if **text != want_text {
+        **text = want_text;
+    }
+    let want_color = if engaged && !pulse_active {
+        Color::srgb(1.00, 0.25, 0.30)
+    } else if pulse_active {
+        Color::srgb(0.30, 1.00, 0.45)
+    } else {
+        palette::MUTED
+    };
+    if tc.0 != want_color {
+        tc.0 = want_color;
+    }
+}
+
 /// Resolve the operator's own party row. Prefer `self_char_id` lookup
 /// for correctness; fall back to the first member when the id hasn't
 /// been resolved yet so the HUD shows *something* during the post-zone
@@ -208,6 +305,7 @@ mod tests {
             sub_job_lv: 0,
             is_party_leader: false,
             is_alliance_leader: false,
+            in_mog_house: false,
         }
     }
 

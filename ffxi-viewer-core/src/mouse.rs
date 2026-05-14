@@ -19,8 +19,9 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::window::{CursorOptions, PrimaryWindow};
 
-use crate::camera::{CameraMode, ChaseCamera};
+use crate::camera::{yaw_for_heading, CameraMode, ChaseCamera};
 use crate::input_mode::InputMode;
+use crate::snapshot::SceneState;
 
 /// Yaw-sensitivity for RMB-drag (Chase) and free-look (FP), in radians per
 /// raw pixel of mouse delta. Picked to feel like a low-DPI mouse on a 1080p
@@ -38,7 +39,14 @@ const MOUSE_PITCH_SENS: f32 = 0.005;
 /// keeps the desktop feel acceptable (4 notches = 1 yalm of zoom)
 /// while spreading a trackpad swipe across a few yalms instead of
 /// the entire range.
-const WHEEL_ZOOM_STEP: f32 = 0.25;
+// macOS trackpad / Magic Mouse inertial swipes can fire 30+ wheel
+// events per gesture. 0.25/event made a single swipe traverse ~1/4
+// of the DIST_MIN..DIST_MAX range — way too aggressive. 0.05 puts a
+// full inertial swipe at ~1.5 yalms, more like a discrete-notch
+// desktop wheel. Discrete-wheel desktop users get a slower per-click
+// step in exchange, which feels fine because individual clicks are
+// the intentional unit there.
+const WHEEL_ZOOM_STEP: f32 = 0.05;
 // Distance clamps live on `ChaseCamera` (`DIST_MIN`/`DIST_MAX`) so the
 // keyboard zoom path in `view_native::input` shares them with the wheel.
 const DIST_MIN: f32 = ChaseCamera::DIST_MIN;
@@ -154,22 +162,26 @@ pub fn collect_mouse_system(
 ///
 /// - `Chase`: RMB-drag rotates the camera; wheel zooms within
 ///   `[DIST_MIN, DIST_MAX]`.
-/// - `FirstPerson`: cursor is locked, so any motion is intentional — drives
-///   yaw/pitch without requiring a button. Wheel is ignored (no distance
-///   in FP).
+/// - `FirstPerson`: RMB-drag rotates the look direction; **on release**
+///   yaw/pitch snap back to "straight ahead" (aligned with the player's
+///   heading, level pitch). Matches retail FFXI's "peek with the mouse,
+///   release to recenter" feel. Wheel is ignored (no distance in FP).
 ///
 /// Pitch is clamped to the mode-specific range so chase doesn't dive
 /// underground and FP doesn't roll past vertical.
 pub fn mouse_camera_system(
     pointer: Res<MousePointer>,
     camera_mode: Res<CameraMode>,
+    state: Res<SceneState>,
     mut chase: ResMut<ChaseCamera>,
+    // Tracks the previous frame's RMB state so we can detect the
+    // pressed→released edge that triggers FP snap-back.
+    mut prev_right: Local<bool>,
 ) {
     let mode = *camera_mode;
-    let drag_active = match mode {
-        CameraMode::Chase => pointer.right,
-        CameraMode::FirstPerson => true,
-    };
+    // Both modes now drive the look from RMB-drag — FP no longer
+    // mouse-looks freely (the OG client never did that).
+    let drag_active = pointer.right;
     if drag_active && pointer.delta != Vec2::ZERO {
         chase.yaw -= pointer.delta.x * MOUSE_YAW_SENS;
         // Bevy delivers MouseMotion with `delta.y > 0` for downward cursor
@@ -181,6 +193,16 @@ pub fn mouse_camera_system(
         };
         chase.pitch = (chase.pitch + pitch_d).clamp(lo, hi);
     }
+
+    // FP snap-back: pressed→released edge re-centers the look on the
+    // player's facing direction. Chase mode keeps the operator's last
+    // orbit angle on release (long-standing behavior).
+    if matches!(mode, CameraMode::FirstPerson) && *prev_right && !pointer.right {
+        chase.yaw = yaw_for_heading(state.snapshot.self_pos.heading);
+        chase.pitch = 0.0;
+    }
+    *prev_right = pointer.right;
+
     // Wheel zoom — chase only. Positive wheel = scroll up = zoom in =
     // distance shrinks.
     if pointer.wheel != 0.0 && matches!(mode, CameraMode::Chase) {
@@ -375,7 +397,7 @@ mod tests {
         let d = app.world().resource::<ChaseCamera>().distance;
         assert!(
             (d - (18.0 - 3.0 * WHEEL_ZOOM_STEP)).abs() < 1e-6,
-            "distance {d} should equal 15.0"
+            "distance {d} should equal 18.0 - 3*WHEEL_ZOOM_STEP"
         );
 
         // Negative wheel and clamping at DIST_MAX.

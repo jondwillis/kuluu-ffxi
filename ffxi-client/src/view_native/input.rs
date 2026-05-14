@@ -128,14 +128,18 @@ pub fn handle_input_system(
         return;
     }
 
-    // F8 toggles first-person mode. Hard-wired and runs unconditionally:
-    // the operator must always be able to escape FP even while a UI is
-    // focused, and the browser/macOS pointer-lock requires a real user
-    // gesture (`ToggleFirstPerson` is in the bindings table for the
-    // `/keybinds list` display, but the toggle itself stays inline).
-    if keys.just_pressed(KeyCode::F8) {
+    // First-person toggle. Default `V` (retail Compact 1), rebindable
+    // via `Action::ToggleFirstPerson`. Runs unconditionally — the
+    // operator must always be able to escape FP even while a UI is
+    // focused.
+    //
+    // Cursor stays unlocked in FP: the OG client's FP didn't capture
+    // the mouse, and our `mouse_camera_system` now gates FP look on
+    // RMB-drag (with snap-back on release), so there's no need to
+    // hide the cursor either.
+    if bindings.just_pressed(Action::ToggleFirstPerson, &keys) {
         toggle_camera_mode(&mut camera_mode, &mut chase);
-        cursor_lock.locked = matches!(*camera_mode, CameraMode::FirstPerson);
+        cursor_lock.locked = false;
     }
 
     // PassiveCursor toggle. Runs in BOTH directions and only from
@@ -367,6 +371,27 @@ pub fn dispatch_movement_system(
         chase.yaw += yaw_d;
     }
 
+    // --- camera zoom: `.` in, `,` out (defaults). Chase mode only —
+    //     in FirstPerson there's no `distance` to step, and retail
+    //     blocks the same keys. Held (`pressed`) and time-scaled so
+    //     the rate is framerate-independent (`KEYBOARD_ZOOM_RATE`
+    //     yalms/sec). Holding a key produces continuous smooth zoom;
+    //     a quick tap produces ~1 fixed-tick step at 60 Hz.
+    if matches!(*camera_mode, CameraMode::Chase) && !in_picker {
+        let mut zoom_d = 0.0;
+        let step = ChaseCamera::KEYBOARD_ZOOM_RATE * time.delta_secs();
+        if bindings.pressed(Action::CameraZoomIn, &keys) {
+            zoom_d -= step;
+        }
+        if bindings.pressed(Action::CameraZoomOut, &keys) {
+            zoom_d += step;
+        }
+        if zoom_d != 0.0 {
+            chase.distance =
+                (chase.distance + zoom_d).clamp(ChaseCamera::DIST_MIN, ChaseCamera::DIST_MAX);
+        }
+    }
+
     // --- forward / back ---
     let mut forward: i32 = 0;
     if bindings.pressed(Action::MoveForward, &keys) {
@@ -534,6 +559,35 @@ pub fn dispatch_movement_system(
             .lock()
             .ok()
             .and_then(|guard| guard.slide_along(from, to));
+        // TEMP: stuck-on-geometry probe. Log when WASD proposed a real
+        // step (≥0.1 yalm) but the slide produced near-zero progress
+        // (<0.1 yalm) — that's the "stuck" symptom. Cases distinguished:
+        //   slide=None       → start off-mesh (would pass through, not stick)
+        //   slide=Some(p≈from) → clamped to a single-poly cell (real stuck)
+        // Remove once the wall-slide regression is diagnosed.
+        let proposed = ((x - self_pos.pos.x).powi(2) + (y - self_pos.pos.y).powi(2)).sqrt();
+        if proposed > 0.1 {
+            let (resulting, branch) = match &slid {
+                Some(p) => {
+                    let r = ((p.x - self_pos.pos.x).powi(2)
+                        + (p.y - self_pos.pos.y).powi(2))
+                    .sqrt();
+                    (r, "slide_some")
+                }
+                None => (proposed, "slide_none_passthrough"),
+            };
+            if resulting < 0.1 {
+                tracing::warn!(
+                    branch,
+                    from_xy = format!("({:.2},{:.2},{:.2})", from.x, from.y, from.z),
+                    to_xy = format!("({:.2},{:.2})", to.x, to.y),
+                    slid_xy = ?slid.as_ref().map(|p| (p.x, p.y, p.z)),
+                    proposed_step = proposed,
+                    resulting_step = resulting,
+                    "wall-slide probe: proposed move but stuck (resulting <0.1)"
+                );
+            }
+        }
         match slid {
             Some(p) => (p.x, p.y, p.z),
             None => (x, y, self_pos.pos.z),
@@ -648,6 +702,7 @@ mod tests {
             claim_id: 0,
             speed: 0,
             speed_base: 0,
+            look: None,
         }
     }
 
