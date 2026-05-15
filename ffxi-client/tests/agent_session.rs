@@ -24,12 +24,12 @@ mod common;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
-use serde_json::{Value, json};
+use anyhow::{anyhow, Context, Result};
+use serde_json::{json, Value};
 use tokio::{process::Command, time::timeout};
 
+use common::mcp_client::{ffxi_mcp_bin, is_reachable, read_text, McpClient};
 use common::EphemeralChar;
-use common::mcp_client::{McpClient, ffxi_mcp_bin, is_reachable, read_text};
 
 #[tokio::test]
 async fn agent_session_drives_mcp_end_to_end() {
@@ -71,10 +71,7 @@ async fn agent_session_drives_mcp_end_to_end() {
     );
 
     // Isolate goal-store writes from the operator's `~/.config/ffxi-mcp`.
-    let goal_path = std::env::temp_dir().join(format!(
-        "ffxi-mcp-it-goal-{}.json",
-        fixture.charid
-    ));
+    let goal_path = std::env::temp_dir().join(format!("ffxi-mcp-it-goal-{}.json", fixture.charid));
     let _ = std::fs::remove_file(&goal_path);
 
     let mut child = Command::new(&bin)
@@ -121,10 +118,15 @@ async fn agent_session_drives_mcp_end_to_end() {
 async fn run_protocol(client: &mut McpClient, charname: &str) -> Result<()> {
     // Invariant from EphemeralChar::create. Asserting it here so the
     // scene-name assertion below is never silently skipped.
-    assert!(!charname.is_empty(), "fixture must supply a non-empty charname");
+    assert!(
+        !charname.is_empty(),
+        "fixture must supply a non-empty charname"
+    );
 
     let init = client.handshake().await?;
-    let server_info = init.get("serverInfo").ok_or_else(|| anyhow!("no serverInfo"))?;
+    let server_info = init
+        .get("serverInfo")
+        .ok_or_else(|| anyhow!("no serverInfo"))?;
     eprintln!("server: {server_info}");
 
     let tools = client.request("tools/list", json!({})).await?;

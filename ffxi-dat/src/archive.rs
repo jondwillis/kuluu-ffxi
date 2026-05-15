@@ -241,7 +241,13 @@ mod tests {
 
         let loc4 = root.resolve(4).unwrap();
         assert_eq!(loc4.rom_dir, "ROM3");
-        assert_eq!(loc4.sub_path, SubPath { dir: 511, file: 127 });
+        assert_eq!(
+            loc4.sub_path,
+            SubPath {
+                dir: 511,
+                file: 127
+            }
+        );
     }
 
     #[test]

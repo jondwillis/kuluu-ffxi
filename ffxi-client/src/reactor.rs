@@ -97,17 +97,26 @@ impl Default for ReactorConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Goal {
     Idle,
-    Following { target_id: u32, distance: f32 },
+    Following {
+        target_id: u32,
+        distance: f32,
+    },
     /// `attack_issued` flips true once the reactor has emitted the
     /// initial `Action::Attack` packet on transition; subsequent ticks
     /// only re-face the target.
-    Engaged { target_id: u32, attack_issued: bool },
+    Engaged {
+        target_id: u32,
+        attack_issued: bool,
+    },
     /// Pathing toward a destination, possibly via intermediate
     /// waypoints from `ffxi-nav`. `idx` indexes into `waypoints`; the
     /// final element is the requested destination. A straight-line
     /// path (no navmesh available) holds a single-element `waypoints`.
     /// Each tick steps toward `waypoints[idx]`; arrival advances idx.
-    Pathing { waypoints: Vec<Vec3>, idx: usize },
+    Pathing {
+        waypoints: Vec<Vec3>,
+        idx: usize,
+    },
     /// Stage-9 banking goal: monitor inventory; when any field bag
     /// (Inventory / Mog Satchel / Mog Sack / Mog Case) reaches
     /// `threshold` slots filled, emit a `RequestZoneChange` to the
@@ -133,11 +142,17 @@ impl Default for Goal {
 fn snapshot_goal(goal: &Goal) -> ReactorGoalSnapshot {
     match goal {
         Goal::Idle => ReactorGoalSnapshot::Idle,
-        Goal::Following { target_id, distance } => ReactorGoalSnapshot::Following {
+        Goal::Following {
+            target_id,
+            distance,
+        } => ReactorGoalSnapshot::Following {
             target_id: *target_id,
             distance: *distance,
         },
-        Goal::Engaged { target_id, attack_issued } => ReactorGoalSnapshot::Engaged {
+        Goal::Engaged {
+            target_id,
+            attack_issued,
+        } => ReactorGoalSnapshot::Engaged {
             target_id: *target_id,
             attack_issued: *attack_issued,
         },
@@ -201,7 +216,10 @@ impl CommandRouting {
         }
     }
     fn forward(cmd: AgentCommand) -> Self {
-        Self { forward: Some(cmd), derived_events: Vec::new() }
+        Self {
+            forward: Some(cmd),
+            derived_events: Vec::new(),
+        }
     }
     fn forward_with_goal(cmd: AgentCommand, goal: ReactorGoalSnapshot) -> Self {
         Self {
@@ -305,7 +323,11 @@ impl Reactor {
             if let Some(path) = nav.path(from, to) {
                 let mut waypoints: Vec<Vec3> = path
                     .into_iter()
-                    .map(|v| Vec3 { x: v.x, y: v.y, z: v.z })
+                    .map(|v| Vec3 {
+                        x: v.x,
+                        y: v.y,
+                        z: v.z,
+                    })
                     .collect();
                 // The first waypoint coincides with `from`; skip it so
                 // the agent starts moving toward the next corner.
@@ -380,7 +402,10 @@ impl Reactor {
         // them from aggro detection alongside friendly PCs/NPCs. Mobs
         // (and trusts mid-spawn, before their EntitySetName arrives)
         // remain `Other` here — those are the kinds we want to flag.
-        if matches!(entity.kind, EntityKind::Pc | EntityKind::Npc | EntityKind::Pet) {
+        if matches!(
+            entity.kind,
+            EntityKind::Pc | EntityKind::Npc | EntityKind::Pet
+        ) {
             return Vec::new();
         }
         let now_targeting_self = entity.bt_target_id == self_id;
@@ -448,8 +473,14 @@ impl Reactor {
     /// the one place the SessionState mirror surfaces to clients.
     pub fn handle_command(&mut self, cmd: AgentCommand) -> CommandRouting {
         match cmd {
-            AgentCommand::Follow { target_id, distance } => {
-                self.goal = Goal::Following { target_id, distance };
+            AgentCommand::Follow {
+                target_id,
+                distance,
+            } => {
+                self.goal = Goal::Following {
+                    target_id,
+                    distance,
+                };
                 CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
             AgentCommand::Engage { target_id } => {
@@ -566,9 +597,7 @@ impl Reactor {
         self.zoneline_trigger_latched = inside;
         match (was, inside) {
             // Just entered a trigger (edge: outside → inside).
-            (None, Some(line_id)) => {
-                Some(AgentCommand::RequestZoneChange { line_id })
-            }
+            (None, Some(line_id)) => Some(AgentCommand::RequestZoneChange { line_id }),
             // Crossed directly from one trigger box to another (rare
             // but possible at a junction). Fire for the new one.
             (Some(prev), Some(line_id)) if prev != line_id => {
@@ -583,14 +612,20 @@ impl Reactor {
     fn tick_goal(&mut self) -> TickOutput {
         match self.goal.clone() {
             Goal::Idle => TickOutput::default(),
-            Goal::Following { target_id, distance } => TickOutput {
+            Goal::Following {
+                target_id,
+                distance,
+            } => TickOutput {
                 commands: self
                     .step_toward_entity(target_id, distance)
                     .map(|m| vec![m])
                     .unwrap_or_default(),
                 derived_events: Vec::new(),
             },
-            Goal::Engaged { target_id, attack_issued } => {
+            Goal::Engaged {
+                target_id,
+                attack_issued,
+            } => {
                 let mut commands = Vec::new();
                 if !attack_issued {
                     if let Some((act_index, _)) = self.entity_target_info(target_id) {
@@ -1007,9 +1042,10 @@ pub async fn run(
     let (internal_cmd_tx, internal_cmd_rx) = mpsc::channel(64);
     let mut event_rx = event_tx.subscribe();
     let session_event_tx = event_tx.clone();
-    let mut session_handle = tokio::spawn(async move {
-        crate::session::run(cfg, internal_cmd_rx, session_event_tx).await
-    });
+    let mut session_handle =
+        tokio::spawn(
+            async move { crate::session::run(cfg, internal_cmd_rx, session_event_tx).await },
+        );
 
     let mut reactor = Reactor::new(reactor_cfg);
     let mut tick = tokio::time::interval(reactor_cfg.tick);
@@ -1174,21 +1210,47 @@ mod tests {
         let mut r = Reactor::new(step_test_cfg());
         r.observe_event(&connected(1));
         r.observe_event(&upsert(1, Vec3::default(), 100, EntityKind::Pc, 1));
-        r.observe_event(&upsert(2, Vec3 { x: 20.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 2));
-        r.handle_command(AgentCommand::Follow { target_id: 2, distance: 5.0 });
+        r.observe_event(&upsert(
+            2,
+            Vec3 {
+                x: 20.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            2,
+        ));
+        r.handle_command(AgentCommand::Follow {
+            target_id: 2,
+            distance: 5.0,
+        });
 
         let cmds = r.tick().commands;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             AgentCommand::Move { x, .. } => {
                 // step capped at step_test_cfg's max_step_per_tick (=1.0) → land at x=1.
-                assert!((x - 1.0).abs() < 1e-3, "step toward target capped at max_step: got {x}");
+                assert!(
+                    (x - 1.0).abs() < 1e-3,
+                    "step toward target capped at max_step: got {x}"
+                );
             }
             other => panic!("expected Move, got {other:?}"),
         }
 
         // Self moves into the hold distance — reactor stops.
-        r.observe_event(&upsert(1, Vec3 { x: 17.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 1));
+        r.observe_event(&upsert(
+            1,
+            Vec3 {
+                x: 17.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
         assert!(r.tick().commands.is_empty(), "within distance: hold");
     }
 
@@ -1197,7 +1259,10 @@ mod tests {
         let mut r = Reactor::new(ReactorConfig::default());
         r.observe_event(&connected(1));
         r.observe_event(&upsert(1, Vec3::default(), 100, EntityKind::Pc, 1));
-        r.handle_command(AgentCommand::Follow { target_id: 999, distance: 5.0 });
+        r.handle_command(AgentCommand::Follow {
+            target_id: 999,
+            distance: 5.0,
+        });
         assert!(r.tick().commands.is_empty(), "no entity → no movement");
     }
 
@@ -1206,20 +1271,46 @@ mod tests {
         let mut r = Reactor::new(ReactorConfig::default());
         r.observe_event(&connected(1));
         r.observe_event(&upsert(1, Vec3::default(), 100, EntityKind::Pc, 1));
-        r.observe_event(&upsert(99, Vec3 { x: 5.0, y: 0.0, z: 0.0 }, 100, EntityKind::Mob, 7));
+        r.observe_event(&upsert(
+            99,
+            Vec3 {
+                x: 5.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Mob,
+            7,
+        ));
         r.handle_command(AgentCommand::Engage { target_id: 99 });
 
         let t1 = r.tick().commands;
         let attacks_t1 = t1
             .iter()
-            .filter(|c| matches!(c, AgentCommand::Action { kind: ActionKind::Attack, .. }))
+            .filter(|c| {
+                matches!(
+                    c,
+                    AgentCommand::Action {
+                        kind: ActionKind::Attack,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(attacks_t1, 1, "tick 1 emits exactly one Attack");
 
         let t2 = r.tick().commands;
         let attacks_t2 = t2
             .iter()
-            .filter(|c| matches!(c, AgentCommand::Action { kind: ActionKind::Attack, .. }))
+            .filter(|c| {
+                matches!(
+                    c,
+                    AgentCommand::Action {
+                        kind: ActionKind::Attack,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(attacks_t2, 0, "tick 2 does not re-issue Attack");
         // Still face the target (Move with same pos, heading toward target).
@@ -1239,16 +1330,29 @@ mod tests {
     #[test]
     fn explicit_move_clears_goal_and_passes_through() {
         let mut r = Reactor::new(ReactorConfig::default());
-        r.handle_command(AgentCommand::Follow { target_id: 2, distance: 5.0 });
+        r.handle_command(AgentCommand::Follow {
+            target_id: 2,
+            distance: 5.0,
+        });
         assert!(matches!(r.current_goal(), Goal::Following { .. }));
-        let m = AgentCommand::Move { x: 1.0, y: 2.0, z: 3.0, heading: 64 };
+        let m = AgentCommand::Move {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            heading: 64,
+        };
         let routing = r.handle_command(m);
-        assert!(matches!(routing.forward, Some(AgentCommand::Move { .. })), "Move passes through");
+        assert!(
+            matches!(routing.forward, Some(AgentCommand::Move { .. })),
+            "Move passes through"
+        );
         // Move-with-active-goal transitions to Idle; renderers learn via the
         // goal-changed event.
         assert!(matches!(
             routing.derived_events.as_slice(),
-            [AgentEvent::ReactorGoalChanged { goal: ReactorGoalSnapshot::Idle }]
+            [AgentEvent::ReactorGoalChanged {
+                goal: ReactorGoalSnapshot::Idle
+            }]
         ));
         assert!(matches!(r.current_goal(), Goal::Idle));
     }
@@ -1256,7 +1360,12 @@ mod tests {
     #[test]
     fn explicit_move_while_idle_emits_no_goal_event() {
         let mut r = Reactor::new(ReactorConfig::default());
-        let m = AgentCommand::Move { x: 0.0, y: 0.0, z: 0.0, heading: 0 };
+        let m = AgentCommand::Move {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            heading: 0,
+        };
         let routing = r.handle_command(m);
         assert!(matches!(routing.forward, Some(AgentCommand::Move { .. })));
         assert!(
@@ -1268,7 +1377,10 @@ mod tests {
     #[test]
     fn passthrough_chat_unchanged() {
         let mut r = Reactor::new(ReactorConfig::default());
-        let chat = AgentCommand::Chat { kind: 0, text: "hello".into() };
+        let chat = AgentCommand::Chat {
+            kind: 0,
+            text: "hello".into(),
+        };
         let routing = r.handle_command(chat);
         assert!(matches!(routing.forward, Some(AgentCommand::Chat { .. })));
         assert!(routing.derived_events.is_empty());
@@ -1279,10 +1391,15 @@ mod tests {
         let mut r = Reactor::new(ReactorConfig::default());
         r.observe_event(&connected(1));
         let routing = r.handle_command(AgentCommand::Snapshot);
-        assert!(matches!(routing.forward, Some(AgentCommand::Snapshot)),
-                "Snapshot still forwards to session for Diagnostics");
+        assert!(
+            matches!(routing.forward, Some(AgentCommand::Snapshot)),
+            "Snapshot still forwards to session for Diagnostics"
+        );
         assert_eq!(routing.derived_events.len(), 1);
-        assert!(matches!(&routing.derived_events[0], AgentEvent::SceneSummary { .. }));
+        assert!(matches!(
+            &routing.derived_events[0],
+            AgentEvent::SceneSummary { .. }
+        ));
     }
 
     #[test]
@@ -1292,9 +1409,16 @@ mod tests {
         // they now emit ReactorGoalChanged so renderers see live intent.
         let mut r = Reactor::new(ReactorConfig::default());
         for cmd in [
-            AgentCommand::Follow { target_id: 1, distance: 5.0 },
+            AgentCommand::Follow {
+                target_id: 1,
+                distance: 5.0,
+            },
             AgentCommand::Engage { target_id: 1 },
-            AgentCommand::PathTo { x: 1.0, y: 0.0, z: 0.0 },
+            AgentCommand::PathTo {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
             AgentCommand::Cancel,
         ] {
             let routing = r.handle_command(cmd);
@@ -1312,7 +1436,11 @@ mod tests {
         assert!(routing.forward.is_none());
         match routing.derived_events.as_slice() {
             [AgentEvent::ReactorGoalChanged {
-                goal: ReactorGoalSnapshot::Following { target_id, distance },
+                goal:
+                    ReactorGoalSnapshot::Following {
+                        target_id,
+                        distance,
+                    },
             }] => {
                 assert_eq!(*target_id, 42);
                 assert!((*distance - 3.0).abs() < 1e-3);
@@ -1382,13 +1510,8 @@ mod tests {
         for row in 0..7u32 {
             walkable[(row * 10 + 5) as usize] = false;
         }
-        let nav = ffxi_nav::GridNav::from_walkable(
-            10,
-            10,
-            walkable,
-            ffxi_nav::glam::Vec2::ZERO,
-            1.0,
-        );
+        let nav =
+            ffxi_nav::GridNav::from_walkable(10, 10, walkable, ffxi_nav::glam::Vec2::ZERO, 1.0);
 
         let mut r = Reactor::new(ReactorConfig::default());
         // Establish a zone so ensure_nav_loaded considers the cache key.
@@ -1447,7 +1570,10 @@ mod tests {
 
         // Cross down — emits.
         let derived = r.observe_event(&upsert(1, Vec3::default(), 20, EntityKind::Pc, 1));
-        assert!(matches!(derived.as_slice(), [AgentEvent::LowHp { pct: 20 }]));
+        assert!(matches!(
+            derived.as_slice(),
+            [AgentEvent::LowHp { pct: 20 }]
+        ));
 
         // Stay below — latched, no repeat.
         let derived = r.observe_event(&upsert(1, Vec3::default(), 15, EntityKind::Pc, 1));
@@ -1459,7 +1585,10 @@ mod tests {
 
         // Cross down again — re-emits.
         let derived = r.observe_event(&upsert(1, Vec3::default(), 10, EntityKind::Pc, 1));
-        assert!(matches!(derived.as_slice(), [AgentEvent::LowHp { pct: 10 }]));
+        assert!(matches!(
+            derived.as_slice(),
+            [AgentEvent::LowHp { pct: 10 }]
+        ));
     }
 
     #[test]
@@ -1491,10 +1620,24 @@ mod tests {
     fn pathing_walks_to_target_and_returns_to_idle() {
         let mut r = Reactor::new(step_test_cfg());
         r.observe_event(&connected(1));
-        r.observe_event(&upsert(1, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 1));
+        r.observe_event(&upsert(
+            1,
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
         // Target 0.5 yalms away — within step_test_cfg's max_step (1.0); reaches
         // in one tick.
-        r.handle_command(AgentCommand::PathTo { x: 0.5, y: 0.0, z: 0.0 });
+        r.handle_command(AgentCommand::PathTo {
+            x: 0.5,
+            y: 0.0,
+            z: 0.0,
+        });
         let out = r.tick();
         assert_eq!(out.commands.len(), 1);
         match &out.commands[0] {
@@ -1514,9 +1657,23 @@ mod tests {
         // the transition without needing the agent to issue Cancel.
         let mut r = Reactor::new(step_test_cfg());
         r.observe_event(&connected(1));
-        r.observe_event(&upsert(1, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 1));
+        r.observe_event(&upsert(
+            1,
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
         // Same single-tick distance as above.
-        r.handle_command(AgentCommand::PathTo { x: 0.5, y: 0.0, z: 0.0 });
+        r.handle_command(AgentCommand::PathTo {
+            x: 0.5,
+            y: 0.0,
+            z: 0.0,
+        });
         let out = r.tick();
         assert!(matches!(r.current_goal(), Goal::Idle));
         assert!(matches!(
@@ -1531,8 +1688,22 @@ mod tests {
     fn pathing_takes_multiple_ticks_for_distant_target() {
         let mut r = Reactor::new(step_test_cfg());
         r.observe_event(&connected(1));
-        r.observe_event(&upsert(1, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 100, EntityKind::Pc, 1));
-        r.handle_command(AgentCommand::PathTo { x: 12.0, y: 0.0, z: 0.0 });
+        r.observe_event(&upsert(
+            1,
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        r.handle_command(AgentCommand::PathTo {
+            x: 12.0,
+            y: 0.0,
+            z: 0.0,
+        });
         // Tick 1: step max_step_per_tick (=1.0 from step_test_cfg) yalms, still pathing.
         let out = r.tick();
         match &out.commands[0] {
@@ -1556,19 +1727,63 @@ mod tests {
         // `+y` = north (LSB.z) and `+x` = east (LSB.x).
         let origin = Vec3::default();
         // East (+x): dy.atan2(dx) = atan2(0, +) = 0 → raw 0 → heading 0.
-        assert_eq!(heading_toward(origin, Vec3 { x: 10.0, y: 0.0, z: 0.0 }), 0);
+        assert_eq!(
+            heading_toward(
+                origin,
+                Vec3 {
+                    x: 10.0,
+                    y: 0.0,
+                    z: 0.0
+                }
+            ),
+            0
+        );
         // South (-y): atan2(-, 0) = -π/2 → raw +64 → heading 64.
-        assert_eq!(heading_toward(origin, Vec3 { x: 0.0, y: -10.0, z: 0.0 }), 64);
+        assert_eq!(
+            heading_toward(
+                origin,
+                Vec3 {
+                    x: 0.0,
+                    y: -10.0,
+                    z: 0.0
+                }
+            ),
+            64
+        );
         // West (-x): atan2(0, -) = π → raw -128 → heading 128.
-        assert_eq!(heading_toward(origin, Vec3 { x: -10.0, y: 0.0, z: 0.0 }), 128);
+        assert_eq!(
+            heading_toward(
+                origin,
+                Vec3 {
+                    x: -10.0,
+                    y: 0.0,
+                    z: 0.0
+                }
+            ),
+            128
+        );
         // North (+y): atan2(+, 0) = π/2 → raw -64 → heading 192.
-        assert_eq!(heading_toward(origin, Vec3 { x: 0.0, y: 10.0, z: 0.0 }), 192);
+        assert_eq!(
+            heading_toward(
+                origin,
+                Vec3 {
+                    x: 0.0,
+                    y: 10.0,
+                    z: 0.0
+                }
+            ),
+            192
+        );
     }
 
     #[test]
     fn step_point_caps_at_target() {
         let from = Vec3::default();
-        let to = Vec3 { x: 1.0, y: 0.0, z: 0.0 };
+        let to = Vec3 {
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+        };
         // step_size > distance: clamp at target.
         let p = step_point(from, to, 100.0);
         assert!((p.x - 1.0).abs() < 1e-3);
@@ -1580,13 +1795,23 @@ mod tests {
         r.observe_event(&connected(1));
         // First sighting: mob isn't targeting us.
         let derived = r.observe_event(&upsert_with_bt(
-            99, Vec3::default(), 100, EntityKind::Other, 7, 0,
+            99,
+            Vec3::default(),
+            100,
+            EntityKind::Other,
+            7,
+            0,
         ));
         assert!(derived.is_empty(), "no aggro on initial sighting");
 
         // Mob now targets self → emit EngagedBy.
         let derived = r.observe_event(&upsert_with_bt(
-            99, Vec3::default(), 100, EntityKind::Other, 7, 1,
+            99,
+            Vec3::default(),
+            100,
+            EntityKind::Other,
+            7,
+            1,
         ));
         assert!(matches!(
             derived.as_slice(),
@@ -1599,16 +1824,51 @@ mod tests {
         let mut r = Reactor::new(ReactorConfig::default());
         r.observe_event(&connected(1));
         // Initial state: not targeting.
-        r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 0));
+        r.observe_event(&upsert_with_bt(
+            99,
+            Vec3::default(),
+            100,
+            EntityKind::Other,
+            7,
+            0,
+        ));
         // Aggro!
-        let d1 = r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 1));
+        let d1 = r.observe_event(&upsert_with_bt(
+            99,
+            Vec3::default(),
+            100,
+            EntityKind::Other,
+            7,
+            1,
+        ));
         assert_eq!(d1.len(), 1);
         // Same target across the next tick — not a new edge.
-        let d2 = r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 1));
+        let d2 = r.observe_event(&upsert_with_bt(
+            99,
+            Vec3::default(),
+            100,
+            EntityKind::Other,
+            7,
+            1,
+        ));
         assert!(d2.is_empty(), "no repeat while target unchanged");
         // Mob disengages and re-engages → emits again.
-        r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 0));
-        let d3 = r.observe_event(&upsert_with_bt(99, Vec3::default(), 100, EntityKind::Other, 7, 1));
+        r.observe_event(&upsert_with_bt(
+            99,
+            Vec3::default(),
+            100,
+            EntityKind::Other,
+            7,
+            0,
+        ));
+        let d3 = r.observe_event(&upsert_with_bt(
+            99,
+            Vec3::default(),
+            100,
+            EntityKind::Other,
+            7,
+            1,
+        ));
         assert_eq!(d3.len(), 1, "re-engage after release fires again");
     }
 
@@ -1624,7 +1884,11 @@ mod tests {
         // 1) Place self OUTSIDE all triggers — no fire.
         r.observe_event(&upsert(
             1,
-            Vec3 { x: 0.0, y: 0.0, z: -5.0 },
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: -5.0,
+            },
             100,
             EntityKind::Pc,
             1,
@@ -1641,7 +1905,11 @@ mod tests {
         // 2) Snap self ONTO the west-exit trigger center — should fire once.
         r.observe_event(&upsert(
             1,
-            Vec3 { x: -113.372, y: -57.418, z: -4.075 },
+            Vec3 {
+                x: -113.372,
+                y: -57.418,
+                z: -4.075,
+            },
             100,
             EntityKind::Pc,
             1,
@@ -1661,7 +1929,11 @@ mod tests {
         //    (latched). Same upsert keeps position stable.
         r.observe_event(&upsert(
             1,
-            Vec3 { x: -113.372, y: -57.418, z: -4.075 },
+            Vec3 {
+                x: -113.372,
+                y: -57.418,
+                z: -4.075,
+            },
             100,
             EntityKind::Pc,
             1,
@@ -1678,7 +1950,11 @@ mod tests {
         // 4) Walk OFF the trigger — no fire (still latched as None now).
         r.observe_event(&upsert(
             1,
-            Vec3 { x: 0.0, y: 0.0, z: -5.0 },
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: -5.0,
+            },
             100,
             EntityKind::Pc,
             1,
@@ -1695,7 +1971,11 @@ mod tests {
         // 5) Walk back ON — must fire again (re-entry).
         r.observe_event(&upsert(
             1,
-            Vec3 { x: -113.372, y: -57.418, z: -4.075 },
+            Vec3 {
+                x: -113.372,
+                y: -57.418,
+                z: -4.075,
+            },
             100,
             EntityKind::Pc,
             1,
@@ -1727,11 +2007,18 @@ mod tests {
 
         // Now zone in to 230, and have the server's first position
         // upsert place us inside the return trigger.
-        r.observe_event(&AgentEvent::ZoneChanged { from: Some(100), to: 230 });
+        r.observe_event(&AgentEvent::ZoneChanged {
+            from: Some(100),
+            to: 230,
+        });
         r.state.zone_id = Some(230);
         r.observe_event(&upsert(
             1,
-            Vec3 { x: -113.372, y: -57.418, z: -4.075 },
+            Vec3 {
+                x: -113.372,
+                y: -57.418,
+                z: -4.075,
+            },
             100,
             EntityKind::Pc,
             1,
@@ -1756,7 +2043,11 @@ mod tests {
         // Walk OFF the trigger — no fire.
         r.observe_event(&upsert(
             1,
-            Vec3 { x: 0.0, y: 0.0, z: -5.0 },
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: -5.0,
+            },
             100,
             EntityKind::Pc,
             1,
@@ -1773,7 +2064,11 @@ mod tests {
         // Walk back ON — this is a real edge, must fire.
         r.observe_event(&upsert(
             1,
-            Vec3 { x: -113.372, y: -57.418, z: -4.075 },
+            Vec3 {
+                x: -113.372,
+                y: -57.418,
+                z: -4.075,
+            },
             100,
             EntityKind::Pc,
             1,
@@ -1792,13 +2087,34 @@ mod tests {
         let mut r = Reactor::new(ReactorConfig::default());
         r.observe_event(&connected(1));
         // PC targeting us — skipped.
-        let d = r.observe_event(&upsert_with_bt(50, Vec3::default(), 100, EntityKind::Pc, 2, 1));
+        let d = r.observe_event(&upsert_with_bt(
+            50,
+            Vec3::default(),
+            100,
+            EntityKind::Pc,
+            2,
+            1,
+        ));
         assert!(d.is_empty(), "PCs aren't aggro");
         // NPC targeting us — skipped.
-        let d = r.observe_event(&upsert_with_bt(60, Vec3::default(), 100, EntityKind::Npc, 3, 1));
+        let d = r.observe_event(&upsert_with_bt(
+            60,
+            Vec3::default(),
+            100,
+            EntityKind::Npc,
+            3,
+            1,
+        ));
         assert!(d.is_empty(), "NPCs aren't aggro");
         // Self entity (id == char_id) — skipped.
-        let d = r.observe_event(&upsert_with_bt(1, Vec3::default(), 100, EntityKind::Pc, 1, 1));
+        let d = r.observe_event(&upsert_with_bt(
+            1,
+            Vec3::default(),
+            100,
+            EntityKind::Pc,
+            1,
+            1,
+        ));
         assert!(d.is_empty(), "self isn't aggroing self");
     }
 
@@ -1947,7 +2263,10 @@ mod tests {
             mog_house_zoneline: 12345,
         });
         let out = r.tick();
-        assert!(out.commands.is_empty(), "safe/storage are bank dest, not field bag");
+        assert!(
+            out.commands.is_empty(),
+            "safe/storage are bank dest, not field bag"
+        );
     }
 
     #[test]

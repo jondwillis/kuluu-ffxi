@@ -239,8 +239,22 @@ fn build_recursive(
     let right_node_idx = nodes.len();
     nodes.push(placeholder_node());
 
-    build_recursive(left_node_idx, nodes, left_indices, triangles, centroids, depth + 1);
-    build_recursive(right_node_idx, nodes, right_indices, triangles, centroids, depth + 1);
+    build_recursive(
+        left_node_idx,
+        nodes,
+        left_indices,
+        triangles,
+        centroids,
+        depth + 1,
+    );
+    build_recursive(
+        right_node_idx,
+        nodes,
+        right_indices,
+        triangles,
+        centroids,
+        depth + 1,
+    );
 
     nodes[node_idx] = BvhNode {
         aabb_min,

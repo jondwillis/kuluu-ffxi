@@ -53,7 +53,10 @@ pub fn process_debug_heights(
         let player_t = match self_q.single() {
             Ok(t) => *t,
             Err(_) => {
-                push(&mut scene_state, "/debug heights: no IsSelf entity yet".into());
+                push(
+                    &mut scene_state,
+                    "/debug heights: no IsSelf entity yet".into(),
+                );
                 continue;
             }
         };
@@ -72,11 +75,7 @@ pub fn process_debug_heights(
             Some(-h)
         });
 
-        let mzb_h_bevy = downward_raycast_against_collision(
-            &player_t.translation,
-            &mzb_q,
-            &meshes,
-        );
+        let mzb_h_bevy = downward_raycast_against_collision(&player_t.translation, &mzb_q, &meshes);
 
         let server_line = format!(
             "/debug heights — server pos: x={:.2} y={:.2} z={:.2}",
@@ -87,13 +86,19 @@ pub fn process_debug_heights(
             player_t.translation.x, player_t.translation.y, player_t.translation.z,
         );
         let nav_line = match nav_h_bevy {
-            Some(h) => format!("  navmesh bevy y = {:.2}  (delta_to_player = {:+.2})",
-                h, player_t.translation.y - h),
+            Some(h) => format!(
+                "  navmesh bevy y = {:.2}  (delta_to_player = {:+.2})",
+                h,
+                player_t.translation.y - h
+            ),
             None => "  navmesh bevy y = <off-mesh / no nav>".to_string(),
         };
         let mzb_line = match mzb_h_bevy {
-            Some(h) => format!("  mzb_collision bevy y = {:.2}  (delta_to_player = {:+.2})",
-                h, player_t.translation.y - h),
+            Some(h) => format!(
+                "  mzb_collision bevy y = {:.2}  (delta_to_player = {:+.2})",
+                h,
+                player_t.translation.y - h
+            ),
             None => "  mzb_collision bevy y = <no triangle below>".to_string(),
         };
         let nav_mzb_line = match (nav_h_bevy, mzb_h_bevy) {

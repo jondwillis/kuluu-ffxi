@@ -70,7 +70,10 @@ pub fn spawn_agent_hud(mut commands: Commands) {
                 row.spawn((
                     GoalText,
                     Text::new("—".to_string()),
-                    TextFont { font_size: 13.0, ..default() },
+                    TextFont {
+                        font_size: 13.0,
+                        ..default()
+                    },
                     TextColor(palette::TEXT),
                 ));
             });
@@ -78,7 +81,10 @@ pub fn spawn_agent_hud(mut commands: Commands) {
                 row.spawn((
                     StatePill,
                     Text::new("[IDLE]".to_string()),
-                    TextFont { font_size: 13.0, ..default() },
+                    TextFont {
+                        font_size: 13.0,
+                        ..default()
+                    },
                     TextColor(palette::MUTED),
                 ));
             });
@@ -86,7 +92,10 @@ pub fn spawn_agent_hud(mut commands: Commands) {
                 row.spawn((
                     ReconnectText,
                     Text::new("—".to_string()),
-                    TextFont { font_size: 13.0, ..default() },
+                    TextFont {
+                        font_size: 13.0,
+                        ..default()
+                    },
                     TextColor(palette::MUTED),
                 ));
             });
@@ -94,7 +103,10 @@ pub fn spawn_agent_hud(mut commands: Commands) {
                 row.spawn((
                     RecentToolsText,
                     Text::new("—".to_string()),
-                    TextFont { font_size: 13.0, ..default() },
+                    TextFont {
+                        font_size: 13.0,
+                        ..default()
+                    },
                     TextColor(palette::TEXT),
                 ));
             });
@@ -110,7 +122,10 @@ fn line_row(label: &str) -> impl Bundle {
         },
         children![(
             Text::new(label.to_string()),
-            TextFont { font_size: 13.0, ..default() },
+            TextFont {
+                font_size: 13.0,
+                ..default()
+            },
             TextColor(palette::MUTED),
         )],
     )
@@ -176,17 +191,31 @@ pub fn update_agent_hud_system(
 fn goal_label(g: Option<&ReactorGoal>) -> String {
     match g {
         None | Some(ReactorGoal::Idle) => "—".to_string(),
-        Some(ReactorGoal::Following { target_id, distance }) => {
+        Some(ReactorGoal::Following {
+            target_id,
+            distance,
+        }) => {
             format!("follow #{target_id:x} d={distance:.1}y")
         }
-        Some(ReactorGoal::Engaged { target_id, attack_issued }) => {
+        Some(ReactorGoal::Engaged {
+            target_id,
+            attack_issued,
+        }) => {
             let suffix = if *attack_issued { " (atk sent)" } else { "" };
             format!("engage #{target_id:x}{suffix}")
         }
-        Some(ReactorGoal::Pathing { x, y, z, waypoints_remaining }) => {
+        Some(ReactorGoal::Pathing {
+            x,
+            y,
+            z,
+            waypoints_remaining,
+        }) => {
             format!("path → ({x:.1}, {y:.1}, {z:.1}) [{waypoints_remaining} wp]")
         }
-        Some(ReactorGoal::Banking { threshold, mog_house_zoneline }) => {
+        Some(ReactorGoal::Banking {
+            threshold,
+            mog_house_zoneline,
+        }) => {
             format!("bank ≥{threshold} → zoneline {mog_house_zoneline}")
         }
     }
@@ -197,15 +226,23 @@ fn state_pill(g: Option<&ReactorGoal>) -> (String, Color) {
         None | Some(ReactorGoal::Idle) => ("[IDLE]".to_string(), palette::MUTED),
         Some(ReactorGoal::Following { .. }) => ("[FOLLOWING]".to_string(), palette::ACCENT),
         Some(ReactorGoal::Engaged { .. }) => ("[ENGAGED]".to_string(), palette::STAGE_BAD),
-        Some(ReactorGoal::Pathing { .. }) => ("[PATHING]".to_string(), palette::STAGE_TRANSITIONING),
+        Some(ReactorGoal::Pathing { .. }) => {
+            ("[PATHING]".to_string(), palette::STAGE_TRANSITIONING)
+        }
         Some(ReactorGoal::Banking { .. }) => ("[BANKING]".to_string(), palette::STAGE_GOOD),
     }
 }
 
 fn format_reconnect(rc: Option<&ffxi_viewer_wire::ReconnectInfo>, now_ms: u64) -> String {
-    let Some(rc) = rc else { return "—".to_string() };
+    let Some(rc) = rc else {
+        return "—".to_string();
+    };
     let age_ms = now_ms.saturating_sub(rc.at_unix_ms);
-    format!("{} ago ({})", format_age_short(age_ms), format_duration_ms(rc.downtime_ms))
+    format!(
+        "{} ago ({})",
+        format_age_short(age_ms),
+        format_duration_ms(rc.downtime_ms)
+    )
 }
 
 fn now_unix_ms() -> u64 {
@@ -275,13 +312,21 @@ mod tests {
 
     #[test]
     fn goal_label_engaged_includes_attack_issued() {
-        let g = ReactorGoal::Engaged { target_id: 0x99, attack_issued: true };
+        let g = ReactorGoal::Engaged {
+            target_id: 0x99,
+            attack_issued: true,
+        };
         assert_eq!(goal_label(Some(&g)), "engage #99 (atk sent)");
     }
 
     #[test]
     fn goal_label_pathing_shows_waypoint_count() {
-        let g = ReactorGoal::Pathing { x: 12.3, y: 0.0, z: -45.6, waypoints_remaining: 3 };
+        let g = ReactorGoal::Pathing {
+            x: 12.3,
+            y: 0.0,
+            z: -45.6,
+            waypoints_remaining: 3,
+        };
         assert_eq!(goal_label(Some(&g)), "path → (12.3, 0.0, -45.6) [3 wp]");
     }
 
@@ -294,7 +339,8 @@ mod tests {
     #[test]
     fn state_pill_color_coded() {
         let (label, _) = state_pill(Some(&ReactorGoal::Engaged {
-            target_id: 1, attack_issued: false,
+            target_id: 1,
+            attack_issued: false,
         }));
         assert_eq!(label, "[ENGAGED]");
 
@@ -357,6 +403,9 @@ mod tests {
             td("cancel", 5),
         ];
         // Most recent: cancel → snapshot → engage. follow drops (4th match).
-        assert_eq!(format_recent_tools(&decisions), "cancel → snapshot → engage");
+        assert_eq!(
+            format_recent_tools(&decisions),
+            "cancel → snapshot → engage"
+        );
     }
 }

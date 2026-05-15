@@ -75,8 +75,14 @@ mod tests {
             "Carpenters Landing should have ≥3 zone-lines, got {}",
             lines.len()
         );
-        assert!(lines.iter().any(|z| z.to_zone == 104), "expected to_zone=104 (Jugner Forest)");
-        assert!(lines.iter().any(|z| z.to_zone == 231), "expected to_zone=231 (Northern San d'Oria)");
+        assert!(
+            lines.iter().any(|z| z.to_zone == 104),
+            "expected to_zone=104 (Jugner Forest)"
+        );
+        assert!(
+            lines.iter().any(|z| z.to_zone == 231),
+            "expected to_zone=231 (Northern San d'Oria)"
+        );
     }
 
     #[test]

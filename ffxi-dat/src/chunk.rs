@@ -217,7 +217,7 @@ mod tests {
         // FFXI uses size_units=0 as an implicit "end of records"
         // sentinel in some DATs. Treat it as graceful EOF, not an error.
         let mut buf = synth_chunk(b"selp", 1, &[0u8; 16]); // 32-byte chunk
-        // Full 16-byte sentinel header: name="end.", value=0 (kind=0, size_units=0).
+                                                           // Full 16-byte sentinel header: name="end.", value=0 (kind=0, size_units=0).
         buf.extend_from_slice(b"end\0\0\0\0\0\0\0\0\0\0\0\0\0");
 
         let results: Vec<Result<Chunk>> = walk(&buf).collect();

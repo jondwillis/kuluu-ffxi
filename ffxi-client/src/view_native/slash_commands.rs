@@ -52,77 +52,266 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
     (
         "Movement & Navigation",
         &[
-            HelpEntry { aliases: &["follow"], usage: "[name]", summary: "follow target or current selection" },
-            HelpEntry { aliases: &["pathto"], usage: "<x> <y> <z>", summary: "pathfind to world coordinates" },
-            HelpEntry { aliases: &["zones"], usage: "", summary: "list zone-line destinations from current zone" },
-            HelpEntry { aliases: &["zoneto"], usage: "<name|id>", summary: "pathfind to a zone-line by destination" },
-            HelpEntry { aliases: &["navmesh"], usage: "[on|off]", summary: "toggle the navmesh debug overlay" },
-            HelpEntry { aliases: &["navinfo"], usage: "", summary: "report navmesh snap status at current position" },
-            HelpEntry { aliases: &["whereami", "pos"], usage: "", summary: "print self position and zone id" },
-            HelpEntry { aliases: &["return", "homepoint", "hp"], usage: "", summary: "warp to home point (alive or dead)" },
+            HelpEntry {
+                aliases: &["follow"],
+                usage: "[name]",
+                summary: "follow target or current selection",
+            },
+            HelpEntry {
+                aliases: &["pathto"],
+                usage: "<x> <y> <z>",
+                summary: "pathfind to world coordinates",
+            },
+            HelpEntry {
+                aliases: &["zones"],
+                usage: "",
+                summary: "list zone-line destinations from current zone",
+            },
+            HelpEntry {
+                aliases: &["zoneto"],
+                usage: "<name|id>",
+                summary: "pathfind to a zone-line by destination",
+            },
+            HelpEntry {
+                aliases: &["navmesh"],
+                usage: "[on|off]",
+                summary: "toggle the navmesh debug overlay",
+            },
+            HelpEntry {
+                aliases: &["navinfo"],
+                usage: "",
+                summary: "report navmesh snap status at current position",
+            },
+            HelpEntry {
+                aliases: &["whereami", "pos"],
+                usage: "",
+                summary: "print self position and zone id",
+            },
+            HelpEntry {
+                aliases: &["return", "homepoint", "hp"],
+                usage: "",
+                summary: "warp to home point (alive or dead)",
+            },
         ],
     ),
     (
         "Combat & Targeting",
         &[
-            HelpEntry { aliases: &["attack", "engage"], usage: "[name]", summary: "engage target (reactor goal)" },
-            HelpEntry { aliases: &["disengage"], usage: "", summary: "clear active reactor goal" },
-            HelpEntry { aliases: &["attackoff"], usage: "", summary: "one-shot attack-off packet on current target" },
-            HelpEntry { aliases: &["assist"], usage: "[name]", summary: "assist target (inherit their target)" },
-            HelpEntry { aliases: &["target"], usage: "[name]", summary: "set or clear current target" },
-            HelpEntry { aliases: &["check", "checkname", "checkparam"], usage: "[name]", summary: "check target — strength / name / parameters" },
-            HelpEntry { aliases: &["cast"], usage: "<spell> [target]", summary: "cast a spell" },
-            HelpEntry { aliases: &["ws", "weaponskill"], usage: "<name> [target]", summary: "weapon skill" },
-            HelpEntry { aliases: &["ja", "jobability"], usage: "<name> [target]", summary: "job ability" },
-            HelpEntry { aliases: &["useitem", "use"], usage: "<name> [target]", summary: "use an item" },
-            HelpEntry { aliases: &["cancel"], usage: "", summary: "cancel current reactor goal / action" },
-            HelpEntry { aliases: &["raw"], usage: "<attack|attackoff> [name]", summary: "low-level Action packet (bypasses reactor)" },
+            HelpEntry {
+                aliases: &["attack", "engage"],
+                usage: "[name]",
+                summary: "engage target (reactor goal)",
+            },
+            HelpEntry {
+                aliases: &["disengage"],
+                usage: "",
+                summary: "clear active reactor goal",
+            },
+            HelpEntry {
+                aliases: &["attackoff"],
+                usage: "",
+                summary: "one-shot attack-off packet on current target",
+            },
+            HelpEntry {
+                aliases: &["assist"],
+                usage: "[name]",
+                summary: "assist target (inherit their target)",
+            },
+            HelpEntry {
+                aliases: &["target"],
+                usage: "[name]",
+                summary: "set or clear current target",
+            },
+            HelpEntry {
+                aliases: &["check", "checkname", "checkparam"],
+                usage: "[name]",
+                summary: "check target — strength / name / parameters",
+            },
+            HelpEntry {
+                aliases: &["cast"],
+                usage: "<spell> [target]",
+                summary: "cast a spell",
+            },
+            HelpEntry {
+                aliases: &["ws", "weaponskill"],
+                usage: "<name> [target]",
+                summary: "weapon skill",
+            },
+            HelpEntry {
+                aliases: &["ja", "jobability"],
+                usage: "<name> [target]",
+                summary: "job ability",
+            },
+            HelpEntry {
+                aliases: &["useitem", "use"],
+                usage: "<name> [target]",
+                summary: "use an item",
+            },
+            HelpEntry {
+                aliases: &["cancel"],
+                usage: "",
+                summary: "cancel current reactor goal / action",
+            },
+            HelpEntry {
+                aliases: &["raw"],
+                usage: "<attack|attackoff> [name]",
+                summary: "low-level Action packet (bypasses reactor)",
+            },
         ],
     ),
     (
         "Chat",
         &[
-            HelpEntry { aliases: &["s", "say"], usage: "<text>", summary: "say (local chat)" },
-            HelpEntry { aliases: &["p", "party"], usage: "<text>", summary: "party chat" },
-            HelpEntry { aliases: &["sh", "shout"], usage: "<text>", summary: "shout chat" },
-            HelpEntry { aliases: &["l", "ls", "linkshell"], usage: "<text>", summary: "linkshell chat" },
-            HelpEntry { aliases: &["t", "tell"], usage: "<name> <text>", summary: "tell another player" },
+            HelpEntry {
+                aliases: &["s", "say"],
+                usage: "<text>",
+                summary: "say (local chat)",
+            },
+            HelpEntry {
+                aliases: &["p", "party"],
+                usage: "<text>",
+                summary: "party chat",
+            },
+            HelpEntry {
+                aliases: &["sh", "shout"],
+                usage: "<text>",
+                summary: "shout chat",
+            },
+            HelpEntry {
+                aliases: &["l", "ls", "linkshell"],
+                usage: "<text>",
+                summary: "linkshell chat",
+            },
+            HelpEntry {
+                aliases: &["t", "tell"],
+                usage: "<name> <text>",
+                summary: "tell another player",
+            },
         ],
     ),
     (
         "Status & Menus",
         &[
-            HelpEntry { aliases: &["sit"], usage: "", summary: "sit (not yet wired)" },
-            HelpEntry { aliases: &["stand"], usage: "", summary: "stand (not yet wired)" },
-            HelpEntry { aliases: &["heal"], usage: "[on|off]", summary: "toggle resting (CAMP)" },
-            HelpEntry { aliases: &["raisemenu"], usage: "<option>", summary: "respond to raise dialog" },
-            HelpEntry { aliases: &["tractormenu"], usage: "<option>", summary: "respond to tractor dialog" },
-            HelpEntry { aliases: &["homepointmenu"], usage: "<option>", summary: "respond to homepoint dialog" },
-            HelpEntry { aliases: &["buy"], usage: "<row> [qty]", summary: "buy from open shop by row index" },
-            HelpEntry { aliases: &["bank"], usage: "<subcommand>", summary: "gil-bank operations" },
+            HelpEntry {
+                aliases: &["sit"],
+                usage: "",
+                summary: "sit (not yet wired)",
+            },
+            HelpEntry {
+                aliases: &["stand"],
+                usage: "",
+                summary: "stand (not yet wired)",
+            },
+            HelpEntry {
+                aliases: &["heal"],
+                usage: "[on|off]",
+                summary: "toggle resting (CAMP)",
+            },
+            HelpEntry {
+                aliases: &["raisemenu"],
+                usage: "<option>",
+                summary: "respond to raise dialog",
+            },
+            HelpEntry {
+                aliases: &["tractormenu"],
+                usage: "<option>",
+                summary: "respond to tractor dialog",
+            },
+            HelpEntry {
+                aliases: &["homepointmenu"],
+                usage: "<option>",
+                summary: "respond to homepoint dialog",
+            },
+            HelpEntry {
+                aliases: &["buy"],
+                usage: "<row> [qty]",
+                summary: "buy from open shop by row index",
+            },
+            HelpEntry {
+                aliases: &["bank"],
+                usage: "<subcommand>",
+                summary: "gil-bank operations",
+            },
         ],
     ),
     (
         "Session",
         &[
-            HelpEntry { aliases: &["logout"], usage: "[on|off]", summary: "request logout (30s LeaveGame timer)" },
-            HelpEntry { aliases: &["shutdown"], usage: "[on|off]", summary: "request shutdown (LeaveGame, then close)" },
-            HelpEntry { aliases: &["exit"], usage: "", summary: "polite logout + close window" },
-            HelpEntry { aliases: &["disconnect", "quit"], usage: "", summary: "drop the connection immediately" },
+            HelpEntry {
+                aliases: &["logout"],
+                usage: "[on|off]",
+                summary: "request logout (30s LeaveGame timer)",
+            },
+            HelpEntry {
+                aliases: &["shutdown"],
+                usage: "[on|off]",
+                summary: "request shutdown (LeaveGame, then close)",
+            },
+            HelpEntry {
+                aliases: &["exit"],
+                usage: "",
+                summary: "polite logout + close window",
+            },
+            HelpEntry {
+                aliases: &["disconnect", "quit"],
+                usage: "",
+                summary: "drop the connection immediately",
+            },
         ],
     ),
     (
         "Debug & Tooling",
         &[
-            HelpEntry { aliases: &["snapshot"], usage: "", summary: "emit a one-shot scene snapshot" },
-            HelpEntry { aliases: &["zonechange", "rzc"], usage: "<id>", summary: "request zone change (debug)" },
-            HelpEntry { aliases: &["mhexit"], usage: "[home|1f|2f|garden|<region> [slot]]", summary: "leave the current Mog House (sends 0x05E zmrq)" },
-            HelpEntry { aliases: &["agent"], usage: "<pause|resume|status>", summary: "human-in-control flag for agent commands" },
-            HelpEntry { aliases: &["keybinds", "keybind", "binds"], usage: "<preset|list|reset>", summary: "manage keybind presets" },
-            HelpEntry { aliases: &["load_mmb", "loadmmb"], usage: "<file_id> <chunk_idx>", summary: "spawn MMB model at self_pos (debug overlay)" },
-            HelpEntry { aliases: &["load_mmb_on", "loadmmbon"], usage: "<entity_id> <file_id> <chunk_idx>", summary: "attach MMB model under a tracked entity (debug)" },
-            HelpEntry { aliases: &["load_mzb", "loadmzb"], usage: "<file_id> [chunk_idx]", summary: "load MZB mesh-library at self_pos (debug overlay)" },
-            HelpEntry { aliases: &["help", "?"], usage: "", summary: "show this listing" },
+            HelpEntry {
+                aliases: &["snapshot"],
+                usage: "",
+                summary: "emit a one-shot scene snapshot",
+            },
+            HelpEntry {
+                aliases: &["zonechange", "rzc"],
+                usage: "<id>",
+                summary: "request zone change (debug)",
+            },
+            HelpEntry {
+                aliases: &["mhexit"],
+                usage: "[home|1f|2f|garden|<region> [slot]]",
+                summary: "leave the current Mog House (sends 0x05E zmrq)",
+            },
+            HelpEntry {
+                aliases: &["agent"],
+                usage: "<pause|resume|status>",
+                summary: "human-in-control flag for agent commands",
+            },
+            HelpEntry {
+                aliases: &["keybinds", "keybind", "binds"],
+                usage: "<preset|list|reset>",
+                summary: "manage keybind presets",
+            },
+            HelpEntry {
+                aliases: &["load_mmb", "loadmmb"],
+                usage: "<file_id> <chunk_idx>",
+                summary: "spawn MMB model at self_pos (debug overlay)",
+            },
+            HelpEntry {
+                aliases: &["load_mmb_on", "loadmmbon"],
+                usage: "<entity_id> <file_id> <chunk_idx>",
+                summary: "attach MMB model under a tracked entity (debug)",
+            },
+            HelpEntry {
+                aliases: &["load_mzb", "loadmzb"],
+                usage: "<file_id> [chunk_idx]",
+                summary: "load MZB mesh-library at self_pos (debug overlay)",
+            },
+            HelpEntry {
+                aliases: &["fps"],
+                usage: "<max>",
+                summary: "set target frame rate",
+            },
+            HelpEntry {
+                aliases: &["drawdistance", "dd"],
+                usage: "[setworld|setmob] [N]",
+                summary: "set draw distance",
+            },
         ],
     ),
 ];
@@ -335,9 +524,7 @@ pub fn parse_slash(
             // are absorbed by the per-tick state machine. For the legacy
             // one-shot `ActionKind::Attack` semantics, see `/raw attack`.
             match resolve_action_target(rest, entities, self_pos, current_target) {
-                Some((id, _idx)) => {
-                    SlashOutcome::Command(AgentCommand::Engage { target_id: id })
-                }
+                Some((id, _idx)) => SlashOutcome::Command(AgentCommand::Engage { target_id: id }),
                 None => SlashOutcome::SystemMessage(format!("/{cmd}: no target")),
             }
         }
@@ -447,6 +634,7 @@ pub fn parse_slash(
         "load_mmb_on" | "loadmmbon" => parse_load_mmb_on(rest),
         "load_mzb" | "loadmzb" => parse_load_mzb(rest, self_pos),
         "look" => parse_look(rest, entities, self_pos, current_target),
+        "fps" => parse_fps(rest),
         "drawdistance" | "dd" => parse_drawdistance(rest),
         "zonegeom" => parse_zonegeom(rest),
         "debug" => parse_debug(rest),
@@ -603,11 +791,7 @@ fn parse_heal(rest: &str) -> SlashOutcome {
 /// already does (with a continuous re-issue rather than a single
 /// path). Two commands with the same surface would just confuse the
 /// operator.
-fn parse_pathto(
-    rest: &str,
-    entities: &[WireEntity],
-    current_target: Option<u32>,
-) -> SlashOutcome {
+fn parse_pathto(rest: &str, entities: &[WireEntity], current_target: Option<u32>) -> SlashOutcome {
     let trimmed = rest.trim();
     if trimmed.is_empty() {
         return SlashOutcome::SystemMessage(
@@ -685,9 +869,7 @@ fn parse_raw(
             },
             None => SlashOutcome::SystemMessage("/raw attackoff: no target".into()),
         },
-        "" => SlashOutcome::SystemMessage(
-            "/raw: usage `/raw attack|attackoff [target]`".into(),
-        ),
+        "" => SlashOutcome::SystemMessage("/raw: usage `/raw attack|attackoff [target]`".into()),
         other => SlashOutcome::SystemMessage(format!("/raw: unknown subcommand `{other}`")),
     }
 }
@@ -714,10 +896,7 @@ fn parse_cast(
     let spell_id: u32 = match parts[0].parse() {
         Ok(n) => n,
         Err(_) => {
-            return SlashOutcome::SystemMessage(format!(
-                "/cast: bad spell_id `{}`",
-                parts[0]
-            ));
+            return SlashOutcome::SystemMessage(format!("/cast: bad spell_id `{}`", parts[0]));
         }
     };
     let (target_id, target_index) = match parts.get(1) {
@@ -820,7 +999,9 @@ fn parse_job_ability(
     }
     let ability_id: u32 = match parts[0].parse() {
         Ok(n) => n,
-        Err(_) => return SlashOutcome::SystemMessage(format!("/ja: bad ability_id `{}`", parts[0])),
+        Err(_) => {
+            return SlashOutcome::SystemMessage(format!("/ja: bad ability_id `{}`", parts[0]))
+        }
     };
     // JAs default to self-target when no explicit target — but
     // self_id isn't in scope here. Caller passes 0/0 which the
@@ -857,7 +1038,9 @@ fn parse_use_item(
     }
     let container: u8 = match parts[0].parse() {
         Ok(n) => n,
-        Err(_) => return SlashOutcome::SystemMessage(format!("/useitem: bad container `{}`", parts[0])),
+        Err(_) => {
+            return SlashOutcome::SystemMessage(format!("/useitem: bad container `{}`", parts[0]))
+        }
     };
     let slot: u8 = match parts[1].parse() {
         Ok(n) => n,
@@ -916,9 +1099,9 @@ fn parse_tractor_menu(rest: &str) -> SlashOutcome {
             target_index: 0,
             kind: ActionKind::TractorMenu { accept: false },
         }),
-        "" => SlashOutcome::SystemMessage(
-            "/tractormenu: usage `/tractormenu accept|decline`".into(),
-        ),
+        "" => {
+            SlashOutcome::SystemMessage("/tractormenu: usage `/tractormenu accept|decline`".into())
+        }
         other => SlashOutcome::SystemMessage(format!("/tractormenu: bad choice `{other}`")),
     }
 }
@@ -939,9 +1122,7 @@ fn parse_homepoint_menu(rest: &str) -> SlashOutcome {
             target_index: 0,
             kind: ActionKind::HomepointMenu { status_id },
         }),
-        Err(_) => {
-            SlashOutcome::SystemMessage(format!("/homepointmenu: bad status_id `{trimmed}`"))
-        }
+        Err(_) => SlashOutcome::SystemMessage(format!("/homepointmenu: bad status_id `{trimmed}`")),
     }
 }
 
@@ -957,10 +1138,7 @@ fn parse_bank(rest: &str) -> SlashOutcome {
     let threshold: u8 = match parts[0].parse() {
         Ok(n) => n,
         Err(_) => {
-            return SlashOutcome::SystemMessage(format!(
-                "/bank: bad threshold `{}`",
-                parts[0]
-            ));
+            return SlashOutcome::SystemMessage(format!("/bank: bad threshold `{}`", parts[0]));
         }
     };
     let mog_house_zoneline: u32 = match parts[1].parse() {
@@ -1002,9 +1180,7 @@ fn parse_agent(rest: &str) -> SlashOutcome {
 fn parse_zone_change(rest: &str) -> SlashOutcome {
     let trimmed = rest.trim();
     if trimmed.is_empty() {
-        return SlashOutcome::SystemMessage(
-            "/zonechange: usage `/zonechange <line_id>`".into(),
-        );
+        return SlashOutcome::SystemMessage("/zonechange: usage `/zonechange <line_id>`".into());
     }
     match trimmed.parse::<u32>() {
         Ok(line_id) => SlashOutcome::Command(AgentCommand::RequestZoneChange { line_id }),
@@ -1029,10 +1205,7 @@ fn parse_mhexit(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
     let trimmed = rest.trim().to_ascii_lowercase();
     let mut parts = trimmed.split_whitespace();
     let first = parts.next();
-    let slot: u8 = parts
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+    let slot: u8 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
 
     let kind = match first {
         None | Some("home") | Some("") => crate::state::MogHouseExit::Home,
@@ -1043,9 +1216,7 @@ fn parse_mhexit(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
         Some("bastok") => crate::state::MogHouseExit::Bastok { slot },
         Some("windurst") | Some("windy") => crate::state::MogHouseExit::Windurst { slot },
         Some("jeuno") => crate::state::MogHouseExit::Jeuno { slot },
-        Some("whitegate") | Some("aht_urhgan") => {
-            crate::state::MogHouseExit::Whitegate { slot }
-        }
+        Some("whitegate") | Some("aht_urhgan") => crate::state::MogHouseExit::Whitegate { slot },
         Some("adoulin") => crate::state::MogHouseExit::Adoulin { slot },
         Some("auto") => {
             // `/mhexit auto` — look up which region's Mog House we're in
@@ -1133,9 +1304,7 @@ fn resolve_target_args(
     if let Some(s) = parts.first() {
         let id: u32 = s.parse().map_err(|_| format!("bad target_id `{s}`"))?;
         let idx: u16 = match parts.get(1) {
-            Some(t) => t
-                .parse()
-                .map_err(|_| format!("bad target_index `{t}`"))?,
+            Some(t) => t.parse().map_err(|_| format!("bad target_index `{t}`"))?,
             None => entities
                 .iter()
                 .find(|e| e.id == id)
@@ -1171,11 +1340,7 @@ fn parse_zones(zone_id: Option<u16>) -> SlashOutcome {
         let to_name = ffxi_nav::zone_name(line.to_zone).unwrap_or("?");
         msg.push_str(&format!(
             "\n  -> {} ({}) at ({:.0}, {:.0}, {:.0})",
-            to_name,
-            line.to_zone,
-            line.from_pos[0],
-            line.from_pos[1],
-            line.from_pos[2],
+            to_name, line.to_zone, line.from_pos[0], line.from_pos[1], line.from_pos[2],
         ));
     }
     SlashOutcome::SystemMessage(msg)
@@ -1245,9 +1410,7 @@ fn parse_debug(rest: &str) -> SlashOutcome {
     let arg = rest.trim().to_ascii_lowercase();
     match arg.as_str() {
         "heights" | "h" => SlashOutcome::DebugHeights,
-        "" => SlashOutcome::SystemMessage(
-            "/debug: subcommands — `heights`".to_string(),
-        ),
+        "" => SlashOutcome::SystemMessage("/debug: subcommands — `heights`".to_string()),
         other => SlashOutcome::SystemMessage(format!(
             "/debug: unknown subcommand `{other}` (try `heights`)"
         )),
@@ -1302,6 +1465,14 @@ fn parse_drawdistance(rest: &str) -> SlashOutcome {
     }
 }
 
+fn parse_fps(rest: &str) -> SlashOutcome {
+    let mut parts = rest.split_whitespace();
+    match parts.next().and_then(|s| s.parse::<u32>().ok()) {
+        Some(max) => SlashOutcome::Command(AgentCommand::SetFps { max }),
+        None => SlashOutcome::SystemMessage("/fps: usage `/fps <max>`".into()),
+    }
+}
+
 /// `/look [name|act_index]` — print the decoded LookData for an entity.
 /// Default: the current target. Diagnostic for hand-bootstrapping a
 /// `modelid → MMB file_id` mapping by observation. Format is one line
@@ -1332,12 +1503,23 @@ fn parse_look(
 
     let name = ent.name.as_deref().unwrap_or("?");
     let body = match &ent.look {
-        None => "look: none decoded yet (entity hasn't sent a CHAR_NPC look-bearing tick)".to_string(),
+        None => {
+            "look: none decoded yet (entity hasn't sent a CHAR_NPC look-bearing tick)".to_string()
+        }
         Some(EntityLook::Standard { modelid }) => {
             format!("look: STANDARD modelid={modelid} (0x{modelid:04X})")
         }
         Some(EntityLook::Equipped {
-            face, race, head, body, hands, legs, feet, main, sub, ranged,
+            face,
+            race,
+            head,
+            body,
+            hands,
+            legs,
+            feet,
+            main,
+            sub,
+            ranged,
         }) => format!(
             "look: EQUIPPED race={race} face={face} head=0x{head:04X} body=0x{body:04X} \
              hands=0x{hands:04X} legs=0x{legs:04X} feet=0x{feet:04X} \
@@ -1420,7 +1602,11 @@ fn parse_load_mmb_on(rest: &str) -> SlashOutcome {
         chunk_idx,
         // `world_pos` is unused when `entity_id` is `Some`, but the
         // outcome shape is shared with `/load_mmb`. Pass a sentinel.
-        world_pos: WireVec3 { x: 0.0, y: 0.0, z: 0.0 },
+        world_pos: WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
         entity_id: Some(entity_id),
     }
 }
@@ -1535,9 +1721,7 @@ fn resolve_name<'a>(
         return None;
     }
     matches.sort_by(|a, b| {
-        let pc_rank = |e: &WireEntity| {
-            matches!(e.kind, ffxi_viewer_wire::EntityKind::Pc) as u8
-        };
+        let pc_rank = |e: &WireEntity| matches!(e.kind, ffxi_viewer_wire::EntityKind::Pc) as u8;
         // Higher pc_rank first → reverse compare.
         pc_rank(b).cmp(&pc_rank(a)).then_with(|| {
             let da = sq_dist(a.pos, self_pos);
@@ -1609,7 +1793,11 @@ mod tests {
     }
 
     fn origin() -> WireVec3 {
-        WireVec3 { x: 0.0, y: 0.0, z: 0.0 }
+        WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        }
     }
 
     #[test]
@@ -1723,7 +1911,9 @@ mod tests {
                 assert!(
                     matches!(
                         cmds[0],
-                        AgentCommand::ReqLogout { kind: ReqLogoutKind::LogoutToggle }
+                        AgentCommand::ReqLogout {
+                            kind: ReqLogoutKind::LogoutToggle
+                        }
                     ),
                     "first cmd must be ReqLogout(LogoutToggle), got {:?}",
                     cmds[0]
@@ -1746,7 +1936,9 @@ mod tests {
                 assert_eq!(cmds.len(), 2);
                 assert!(matches!(
                     cmds[0],
-                    AgentCommand::ReqLogout { kind: ReqLogoutKind::LogoutOn }
+                    AgentCommand::ReqLogout {
+                        kind: ReqLogoutKind::LogoutOn
+                    }
                 ));
                 assert!(matches!(cmds[1], AgentCommand::Heal { mode: HealMode::On }));
             }
@@ -1769,7 +1961,9 @@ mod tests {
                 assert_eq!(cmds.len(), 2);
                 assert!(matches!(
                     cmds[0],
-                    AgentCommand::ReqLogout { kind: ReqLogoutKind::ShutdownToggle }
+                    AgentCommand::ReqLogout {
+                        kind: ReqLogoutKind::ShutdownToggle
+                    }
                 ));
                 assert!(matches!(cmds[1], AgentCommand::Heal { mode: HealMode::On }));
             }
@@ -1784,7 +1978,9 @@ mod tests {
                 assert_eq!(cmds.len(), 2);
                 assert!(matches!(
                     cmds[0],
-                    AgentCommand::ReqLogout { kind: ReqLogoutKind::ShutdownOn }
+                    AgentCommand::ReqLogout {
+                        kind: ReqLogoutKind::ShutdownOn
+                    }
                 ));
                 assert!(matches!(cmds[1], AgentCommand::Heal { mode: HealMode::On }));
             }
@@ -1877,9 +2073,18 @@ mod tests {
     /// walk to.
     #[test]
     fn load_mmb_parses_file_id_chunk_idx_and_captures_self_pos() {
-        let pos = WireVec3 { x: 12.5, y: -7.0, z: 3.25 };
+        let pos = WireVec3 {
+            x: 12.5,
+            y: -7.0,
+            z: 3.25,
+        };
         match parse_slash("/load_mmb 115 18", &empty_entities(), pos, None, None) {
-            SlashOutcome::LoadMmb { file_id, chunk_idx, world_pos, entity_id } => {
+            SlashOutcome::LoadMmb {
+                file_id,
+                chunk_idx,
+                world_pos,
+                entity_id,
+            } => {
                 assert_eq!(file_id, 115);
                 assert_eq!(chunk_idx, 18);
                 assert_eq!(world_pos, pos);
@@ -1894,8 +2099,19 @@ mod tests {
     /// is `Some` — but we still verify the field is populated.
     #[test]
     fn load_mmb_on_parses_entity_id() {
-        match parse_slash("/load_mmb_on 1234 115 18", &empty_entities(), origin(), None, None) {
-            SlashOutcome::LoadMmb { file_id, chunk_idx, entity_id, .. } => {
+        match parse_slash(
+            "/load_mmb_on 1234 115 18",
+            &empty_entities(),
+            origin(),
+            None,
+            None,
+        ) {
+            SlashOutcome::LoadMmb {
+                file_id,
+                chunk_idx,
+                entity_id,
+                ..
+            } => {
                 assert_eq!(file_id, 115);
                 assert_eq!(chunk_idx, 18);
                 assert_eq!(entity_id, Some(1234));
@@ -1905,7 +2121,10 @@ mod tests {
         // Alias and bad-args paths surface as SystemMessage.
         assert!(matches!(
             parse_slash("/loadmmbon 99 7 0", &empty_entities(), origin(), None, None),
-            SlashOutcome::LoadMmb { entity_id: Some(99), .. }
+            SlashOutcome::LoadMmb {
+                entity_id: Some(99),
+                ..
+            }
         ));
         for s in [
             "/load_mmb_on",
@@ -1931,10 +2150,20 @@ mod tests {
         // Alias `/loadmmb` (no underscore) still routes.
         assert!(matches!(
             parse_slash("/loadmmb 115 18", &empty_entities(), origin(), None, None),
-            SlashOutcome::LoadMmb { file_id: 115, chunk_idx: 18, entity_id: None, .. }
+            SlashOutcome::LoadMmb {
+                file_id: 115,
+                chunk_idx: 18,
+                entity_id: None,
+                ..
+            }
         ));
         // Missing chunk_idx, non-numeric file_id, non-numeric chunk_idx.
-        for s in ["/load_mmb", "/load_mmb 115", "/load_mmb foo 18", "/load_mmb 115 bar"] {
+        for s in [
+            "/load_mmb",
+            "/load_mmb 115",
+            "/load_mmb foo 18",
+            "/load_mmb 115 bar",
+        ] {
             assert!(
                 matches!(
                     parse_slash(s, &empty_entities(), origin(), None, None),
@@ -1949,10 +2178,18 @@ mod tests {
     /// the first kind=0x1C). Captures `self_pos` like `/load_mmb`.
     #[test]
     fn load_mzb_parses_optional_chunk_idx() {
-        let pos = WireVec3 { x: 1.0, y: 2.0, z: 3.0 };
+        let pos = WireVec3 {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        };
         // No chunk_idx: `None`.
         match parse_slash("/load_mzb 7368", &empty_entities(), pos, None, None) {
-            SlashOutcome::LoadMzb { file_id, chunk_idx, world_pos } => {
+            SlashOutcome::LoadMzb {
+                file_id,
+                chunk_idx,
+                world_pos,
+            } => {
                 assert_eq!(file_id, 7368);
                 assert_eq!(chunk_idx, None);
                 assert_eq!(world_pos, pos);
@@ -1961,13 +2198,18 @@ mod tests {
         }
         // Explicit chunk_idx.
         match parse_slash("/load_mzb 7368 2", &empty_entities(), pos, None, None) {
-            SlashOutcome::LoadMzb { chunk_idx: Some(2), .. } => {}
+            SlashOutcome::LoadMzb {
+                chunk_idx: Some(2), ..
+            } => {}
             other => panic!("expected LoadMzb chunk_idx=Some(2), got {other:?}"),
         }
         // Alias `/loadmzb`.
         assert!(matches!(
             parse_slash("/loadmzb 7368", &empty_entities(), pos, None, None),
-            SlashOutcome::LoadMzb { chunk_idx: None, .. }
+            SlashOutcome::LoadMzb {
+                chunk_idx: None,
+                ..
+            }
         ));
         // Bad args fall to SystemMessage.
         for s in ["/load_mzb", "/load_mzb foo", "/load_mzb 7368 bar"] {
@@ -2014,7 +2256,13 @@ mod tests {
 
     #[test]
     fn pathto_numeric_three_args_dispatches() {
-        match parse_slash("/pathto 1.5 2 -3.25", &empty_entities(), origin(), None, None) {
+        match parse_slash(
+            "/pathto 1.5 2 -3.25",
+            &empty_entities(),
+            origin(),
+            None,
+            None,
+        ) {
             SlashOutcome::Command(AgentCommand::PathTo { x, y, z }) => {
                 assert_eq!(x, 1.5);
                 assert_eq!(y, 2.0);
@@ -2039,7 +2287,13 @@ mod tests {
     #[test]
     fn pathto_rejects_bad_input() {
         // "/pathto target" with no current target also rejects.
-        for s in ["/pathto", "/pathto 1 2", "/pathto 1 2 3 4", "/pathto x y z", "/pathto target"] {
+        for s in [
+            "/pathto",
+            "/pathto 1 2",
+            "/pathto 1 2 3 4",
+            "/pathto x y z",
+            "/pathto target",
+        ] {
             assert!(
                 matches!(
                     parse_slash(s, &empty_entities(), origin(), None, None),
@@ -2222,7 +2476,9 @@ mod tests {
         // Escape hatch for one-shot wire-level Attack.
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
         match parse_slash("/raw attack", &entities, origin(), Some(7), None) {
-            SlashOutcome::Command(AgentCommand::Action { kind, target_id, .. }) => {
+            SlashOutcome::Command(AgentCommand::Action {
+                kind, target_id, ..
+            }) => {
                 assert_eq!(target_id, 7);
                 assert!(matches!(kind, ActionKind::Attack));
             }
@@ -2384,7 +2640,13 @@ mod tests {
 
     #[test]
     fn bank_parses_threshold_and_zoneline() {
-        match parse_slash("/bank 60 0xDEADBEEF", &empty_entities(), origin(), None, None) {
+        match parse_slash(
+            "/bank 60 0xDEADBEEF",
+            &empty_entities(),
+            origin(),
+            None,
+            None,
+        ) {
             SlashOutcome::SystemMessage(_) => {
                 // 0xDEADBEEF doesn't parse as plain u32; decimal works.
             }
@@ -2522,44 +2784,108 @@ mod tests {
         let cases: Vec<(&str, fn(&AgentCommand) -> bool)> = vec![
             // follow {target_id, distance} — slash resolves names (or
             // current target); the entity at id=42 named "Mob" matches.
-            ("/follow Mob", |c| matches!(c, AgentCommand::Follow { target_id: 42, .. })),
+            ("/follow Mob", |c| {
+                matches!(c, AgentCommand::Follow { target_id: 42, .. })
+            }),
             // engage {target_id}
-            ("/engage", |c| matches!(c, AgentCommand::Engage { target_id: 42 })),
+            ("/engage", |c| {
+                matches!(c, AgentCommand::Engage { target_id: 42 })
+            }),
             // path_to {x, y, z}
-            ("/pathto 1 2 3", |c| matches!(c, AgentCommand::PathTo { .. })),
+            ("/pathto 1 2 3", |c| {
+                matches!(c, AgentCommand::PathTo { .. })
+            }),
             // cancel
             ("/cancel", |c| matches!(c, AgentCommand::Cancel)),
             // bank_when_full {threshold, mog_house_zoneline}
-            ("/bank 60 12345", |c| matches!(c, AgentCommand::BankWhenFull { threshold: 60, mog_house_zoneline: 12345 })),
+            ("/bank 60 12345", |c| {
+                matches!(
+                    c,
+                    AgentCommand::BankWhenFull {
+                        threshold: 60,
+                        mog_house_zoneline: 12345
+                    }
+                )
+            }),
             // chat {kind, text} — covered by per-channel slashes (/s /p etc.)
-            ("/s hello", |c| matches!(c, AgentCommand::Chat { kind: 0, .. })),
-            ("/p hello", |c| matches!(c, AgentCommand::Chat { kind: 4, .. })),
+            ("/s hello", |c| {
+                matches!(c, AgentCommand::Chat { kind: 0, .. })
+            }),
+            ("/p hello", |c| {
+                matches!(c, AgentCommand::Chat { kind: 4, .. })
+            }),
             // tell {to, text}
             ("/tell Bob hi", |c| matches!(c, AgentCommand::Tell { .. })),
             // request_zone_change {line_id}
-            ("/zonechange 42", |c| matches!(c, AgentCommand::RequestZoneChange { line_id: 42 })),
+            ("/zonechange 42", |c| {
+                matches!(c, AgentCommand::RequestZoneChange { line_id: 42 })
+            }),
             // snapshot
             ("/snapshot", |c| matches!(c, AgentCommand::Snapshot)),
             // cast (Action::CastMagic)
-            ("/cast 1", |c| matches!(c,
-                AgentCommand::Action { kind: ActionKind::CastMagic { .. }, .. })),
+            ("/cast 1", |c| {
+                matches!(
+                    c,
+                    AgentCommand::Action {
+                        kind: ActionKind::CastMagic { .. },
+                        ..
+                    }
+                )
+            }),
             // weaponskill (Action::Weaponskill)
-            ("/ws 1", |c| matches!(c,
-                AgentCommand::Action { kind: ActionKind::Weaponskill { .. }, .. })),
+            ("/ws 1", |c| {
+                matches!(
+                    c,
+                    AgentCommand::Action {
+                        kind: ActionKind::Weaponskill { .. },
+                        ..
+                    }
+                )
+            }),
             // job_ability (Action::JobAbility)
-            ("/ja 1", |c| matches!(c,
-                AgentCommand::Action { kind: ActionKind::JobAbility { .. }, .. })),
+            ("/ja 1", |c| {
+                matches!(
+                    c,
+                    AgentCommand::Action {
+                        kind: ActionKind::JobAbility { .. },
+                        ..
+                    }
+                )
+            }),
             // use_item
-            ("/useitem 0 4", |c| matches!(c, AgentCommand::UseItem { .. })),
+            ("/useitem 0 4", |c| {
+                matches!(c, AgentCommand::UseItem { .. })
+            }),
             // raise_menu (Action::RaiseMenu)
-            ("/raisemenu accept", |c| matches!(c,
-                AgentCommand::Action { kind: ActionKind::RaiseMenu { .. }, .. })),
+            ("/raisemenu accept", |c| {
+                matches!(
+                    c,
+                    AgentCommand::Action {
+                        kind: ActionKind::RaiseMenu { .. },
+                        ..
+                    }
+                )
+            }),
             // tractor_menu (Action::TractorMenu)
-            ("/tractormenu accept", |c| matches!(c,
-                AgentCommand::Action { kind: ActionKind::TractorMenu { .. }, .. })),
+            ("/tractormenu accept", |c| {
+                matches!(
+                    c,
+                    AgentCommand::Action {
+                        kind: ActionKind::TractorMenu { .. },
+                        ..
+                    }
+                )
+            }),
             // homepoint_menu (Action::HomepointMenu)
-            ("/homepointmenu 0", |c| matches!(c,
-                AgentCommand::Action { kind: ActionKind::HomepointMenu { .. }, .. })),
+            ("/homepointmenu 0", |c| {
+                matches!(
+                    c,
+                    AgentCommand::Action {
+                        kind: ActionKind::HomepointMenu { .. },
+                        ..
+                    }
+                )
+            }),
             // disconnect — slash form fires Quit (drops sockets); the
             // MCP tool dispatches AgentCommand::Disconnect through the
             // session loop. Both reach the same exit; the slash carries
@@ -2584,7 +2910,10 @@ mod tests {
             let out = parse_slash(slash, &empty_entities(), origin(), None, None);
             match out {
                 SlashOutcome::SystemMessage(s) => {
-                    assert!(s.contains("Slash command reference"), "{slash} missing header");
+                    assert!(
+                        s.contains("Slash command reference"),
+                        "{slash} missing header"
+                    );
                     // Each category header should be present.
                     for (category, _) in HELP_CATEGORIES {
                         assert!(

@@ -9,9 +9,9 @@
 use std::sync::{Arc, Mutex};
 
 use rustls::{
-    DigitallySignedStruct, RootCertStore, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
+    DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
 use sha2::{Digest, Sha256};
 

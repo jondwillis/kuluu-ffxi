@@ -26,11 +26,11 @@ pub mod dat_mzb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_vos2;
 pub mod hud;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod look_resolver;
 pub mod input_mode;
 pub mod keybinds;
 pub mod lock_on;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod look_resolver;
 pub mod mouse;
 pub mod nameplate;
 pub mod picking;
@@ -56,9 +56,9 @@ pub use lock_on::{LockOn, ToggleResult as LockOnToggle};
 pub use mouse::{CursorLockRequest, MousePlugin, MousePointer};
 pub use picking::{click_to_target_system, resolve_click_target, ClickResolution, PickingPlugin};
 pub use scene::{
-    feet_offset, ffxi_to_bevy, process_entity_look_changes, setup_world,
-    sync_aggro_system, sync_entities_system, sync_entity_looks_system,
-    Aggroing, EntityMaterials, EntityMesh, HpBar, HpBarMesh, Target, TrackedEntities,
+    feet_offset, ffxi_to_bevy, process_entity_look_changes, setup_world, sync_aggro_system,
+    sync_entities_system, sync_entity_looks_system, Aggroing, EntityMaterials, EntityMesh, HpBar,
+    HpBarMesh, Target, TrackedEntities,
 };
 pub use snapshot::{apply_delta, ingest_system, EventLog, SceneState, CHAT_HISTORY_CAP};
 pub use source::SceneSource;
@@ -117,10 +117,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             // reader. `DefaultPickingPlugins` (input/hover/interaction) is
             // already added by `DefaultPlugins` on both front-ends.
             .add_plugins(PickingPlugin)
-            .add_systems(
-                PreUpdate,
-                ingest_system::<S>.run_if(resource_exists::<S>),
-            )
+            .add_systems(PreUpdate, ingest_system::<S>.run_if(resource_exists::<S>))
             // The Update tuple needs the world resources `setup_world`
             // inserts (EntityMesh/EntityMaterials/HpBarMesh) — those
             // are `Res<>` params, which Bevy treats as hard requirements

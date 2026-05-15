@@ -6,10 +6,10 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use rustls_pki_types::ServerName;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -107,10 +107,10 @@ impl AuthClient {
             bail!("LOGIN_ATTEMPT failed with result {result:#x}: {resp}");
         }
 
-        let account_id = resp
-            .get("account_id")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow!("missing account_id in {resp}"))? as u32;
+        let account_id =
+            resp.get("account_id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow!("missing account_id in {resp}"))? as u32;
 
         let hash_arr = resp
             .get("session_hash")
@@ -124,10 +124,9 @@ impl AuthClient {
         }
         let mut session_hash = [0u8; 16];
         for (i, v) in hash_arr.iter().enumerate() {
-            session_hash[i] = v
-                .as_u64()
-                .ok_or_else(|| anyhow!("session_hash[{i}] not u8: {v}"))?
-                as u8;
+            session_hash[i] =
+                v.as_u64()
+                    .ok_or_else(|| anyhow!("session_hash[{i}] not u8: {v}"))? as u8;
         }
 
         Ok(AuthSession {

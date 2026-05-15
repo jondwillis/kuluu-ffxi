@@ -101,7 +101,9 @@ use crate::{DatError, Result};
 pub enum Vos2Error {
     #[error("VertexOs2 chunk too small for header: need {needed}, got {got}")]
     HeaderTooSmall { needed: usize, got: usize },
-    #[error("VertexOs2 section offset {section} = {byte_offset:#x} out of bounds (body len {body_len})")]
+    #[error(
+        "VertexOs2 section offset {section} = {byte_offset:#x} out of bounds (body len {body_len})"
+    )]
     SectionOob {
         section: &'static str,
         byte_offset: usize,
@@ -143,9 +145,8 @@ impl Vos2Header {
             .into());
         }
         let u16_at = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
-        let u32_at = |o: usize| {
-            u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]])
-        };
+        let u32_at =
+            |o: usize| u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
         Ok(Self {
             version: body[0],
             kind_type: u16_at(0x02),
@@ -258,9 +259,7 @@ pub fn parse_vos2(body: &[u8]) -> Result<Vos2Mesh> {
         // hx[0], hx[1], hy[0], hy[1], hz[0], hz[1]. We take the
         // weight-0 component as the bind-pose position.
         let off = vstart + v1_bytes + i * STRIDE2;
-        let read = |k: usize| {
-            f32::from_le_bytes(body[off + k..off + k + 4].try_into().unwrap())
-        };
+        let read = |k: usize| f32::from_le_bytes(body[off + k..off + k + 4].try_into().unwrap());
         let pos = [read(0), read(8), read(16)];
         let normal = [read(32), read(40), read(48)];
         vertices.push(Vos2Vertex { pos, normal });
@@ -458,7 +457,7 @@ mod tests {
     fn header_decodes_known_chunk_offsets() {
         let mut buf = vec![0u8; 0x40];
         buf[0] = 0x01; // ver
-        // type @ 0x02 = 0x1100
+                       // type @ 0x02 = 0x1100
         buf[2..4].copy_from_slice(&0x1100u16.to_le_bytes());
         // flip @ 0x04 = 0x0001
         buf[4..6].copy_from_slice(&0x0001u16.to_le_bytes());

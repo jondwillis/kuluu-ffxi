@@ -29,8 +29,8 @@ use tokio::sync::oneshot;
 use crate::launcher::Selection;
 
 use super::{
-    CharListData, Credentials, LauncherClients, LauncherState, LoginErrorMsg,
-    LoginForm, OpenedLobby, PendingConnect, RuntimeHandle, SelectedChar,
+    CharListData, Credentials, LauncherClients, LauncherState, LoginErrorMsg, LoginForm,
+    OpenedLobby, PendingConnect, RuntimeHandle, SelectedChar,
 };
 
 /// Auth + lobby-open in one task: succeeds when both auth and the lobby
@@ -94,7 +94,10 @@ async fn run_auth_then_open(
     // shipped to `session::run` must be the same one the lobby was
     // opened against (re-logging in produces a new `session_hash` that
     // doesn't match the lobby's view of the world).
-    tracing::info!(char_count = handle.chars().len(), "auth task: lobby opened, sending result");
+    tracing::info!(
+        char_count = handle.chars().len(),
+        "auth task: lobby opened, sending result"
+    );
     Ok(AuthOk {
         handle,
         auth: session,
@@ -183,10 +186,7 @@ pub(super) fn spawn_auth_ui(mut commands: Commands) {
         });
 }
 
-pub(super) fn despawn_auth_ui(
-    mut commands: Commands,
-    q: Query<Entity, With<AuthUiRoot>>,
-) {
+pub(super) fn despawn_auth_ui(mut commands: Commands, q: Query<Entity, With<AuthUiRoot>>) {
     for e in q.iter() {
         commands.entity(e).despawn();
     }
@@ -359,11 +359,7 @@ pub(super) fn poll_connect_system(
 }
 
 pub(super) fn spawn_connect_ui(mut commands: Commands, sel: Res<SelectedChar>) {
-    let name = sel
-        .0
-        .as_ref()
-        .map(|s| s.name.as_str())
-        .unwrap_or("...");
+    let name = sel.0.as_ref().map(|s| s.name.as_str()).unwrap_or("...");
     commands
         .spawn((
             ConnectUiRoot,
@@ -398,12 +394,8 @@ pub(super) fn spawn_connect_ui(mut commands: Commands, sel: Res<SelectedChar>) {
         });
 }
 
-pub(super) fn despawn_connect_ui(
-    mut commands: Commands,
-    q: Query<Entity, With<ConnectUiRoot>>,
-) {
+pub(super) fn despawn_connect_ui(mut commands: Commands, q: Query<Entity, With<ConnectUiRoot>>) {
     for e in q.iter() {
         commands.entity(e).despawn();
     }
 }
-

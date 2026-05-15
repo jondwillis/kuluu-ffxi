@@ -4,7 +4,7 @@
 
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use tokio::net::UdpSocket;
 
 use ffxi_proto::{blowfish, framing, md5, zlib};
@@ -61,10 +61,10 @@ impl MapClient {
             .with_context(|| format!("UDP bind {local}"))?;
         tracing::info!(local_addr = %socket.local_addr()?, "UDP socket bound");
         let blowfish = derive_blowfish(&seed);
-        let decompress_table = zlib::DecompressTable::new()
-            .map_err(|e| anyhow!("decompress table init: {e}"))?;
-        let compress_table = zlib::CompressTable::new()
-            .map_err(|e| anyhow!("compress table init: {e}"))?;
+        let decompress_table =
+            zlib::DecompressTable::new().map_err(|e| anyhow!("decompress table init: {e}"))?;
+        let compress_table =
+            zlib::CompressTable::new().map_err(|e| anyhow!("compress table init: {e}"))?;
         Ok(Self {
             socket,
             server,

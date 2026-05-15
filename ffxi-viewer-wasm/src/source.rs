@@ -18,10 +18,10 @@
 //! risk dropping frames during burst delivery on connect.
 
 use bevy::prelude::*;
+use ffxi_viewer_core::SceneSource;
 use ffxi_viewer_wire::{
     ClientFrame, Frame, SceneDelta, SceneSnapshot, ViewerEvent, PROTOCOL_VERSION,
 };
-use ffxi_viewer_core::SceneSource;
 use flume::{Receiver, Sender};
 use futures_util::{SinkExt, StreamExt};
 use gloo_net::websocket::{futures::WebSocket, Message};
@@ -129,9 +129,7 @@ async fn run_socket(
                                  continuing optimistically"
                             );
                         } else {
-                            info!(
-                                "ffxi-viewer-wasm: hello, protocol_version={protocol_version}"
-                            );
+                            info!("ffxi-viewer-wasm: hello, protocol_version={protocol_version}");
                         }
                     }
                     Ok(Frame::Snapshot(snap)) => {
@@ -156,7 +154,10 @@ async fn run_socket(
             Ok(Message::Text(t)) => {
                 // The relay defaults to binary; text arrives only via the
                 // `?format=json` debug query param, which we don't request.
-                warn!("ffxi-viewer-wasm: unexpected text frame ({} bytes), ignoring", t.len());
+                warn!(
+                    "ffxi-viewer-wasm: unexpected text frame ({} bytes), ignoring",
+                    t.len()
+                );
             }
             Err(e) => {
                 warn!("ffxi-viewer-wasm: websocket recv error: {e:?}");

@@ -34,7 +34,12 @@ fn main() -> ExitCode {
     let chunk = &chunks[chunk_idx];
     println!("file_id     {file_id}");
     println!("path        {}", path.display());
-    println!("chunk[{chunk_idx}]   name={:?} kind={} body_len={}", chunk.name_str(), chunk.kind, chunk.data.len());
+    println!(
+        "chunk[{chunk_idx}]   name={:?} kind={} body_len={}",
+        chunk.name_str(),
+        chunk.kind,
+        chunk.data.len()
+    );
     println!();
 
     let body = chunk.data;

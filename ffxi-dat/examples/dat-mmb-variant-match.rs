@@ -44,8 +44,12 @@ fn main() -> ExitCode {
         if c.kind != 0x2E {
             continue;
         }
-        let Ok(d) = mmb::decrypt(c.data) else { continue };
-        let Ok(h) = MmbHeader::parse(&d) else { continue };
+        let Ok(d) = mmb::decrypt(c.data) else {
+            continue;
+        };
+        let Ok(h) = MmbHeader::parse(&d) else {
+            continue;
+        };
         for sub in MmbSubRecord::find_all(h.payload) {
             if !sub.tag.starts_with(b"model") {
                 continue;

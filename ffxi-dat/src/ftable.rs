@@ -60,10 +60,10 @@ impl FTable {
     pub fn sub_path(&self, file_id: u32) -> Result<SubPath> {
         let table_len = self.len();
         let off = (file_id as usize) * 2;
-        let raw = self.bytes.get(off..off + 2).ok_or(DatError::FileIdOutOfRange {
-            file_id,
-            table_len,
-        })?;
+        let raw = self
+            .bytes
+            .get(off..off + 2)
+            .ok_or(DatError::FileIdOutOfRange { file_id, table_len })?;
         let file_dir = u16::from_le_bytes([raw[0], raw[1]]);
         Ok(SubPath {
             dir: file_dir >> 7,

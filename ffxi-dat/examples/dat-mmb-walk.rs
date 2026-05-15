@@ -6,8 +6,8 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use ffxi_dat::{mmb, walk, DatRoot};
 use ffxi_dat::mmb::{MmbHeader, MmbSubRecord};
+use ffxi_dat::{mmb, walk, DatRoot};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -29,7 +29,12 @@ fn main() -> ExitCode {
     let header = MmbHeader::parse(&decrypted).unwrap();
 
     println!("file_id        {file_id}");
-    println!("chunk          name={:?} kind={} body_len={}", chunk.name_str(), chunk.kind, chunk.data.len());
+    println!(
+        "chunk          name={:?} kind={} body_len={}",
+        chunk.name_str(),
+        chunk.kind,
+        chunk.data.len()
+    );
     println!("MMB version    {}", header.version);
     println!("MMB key_index  {:#x}", header.key_index);
     println!("MMB asset_name {:?}", header.asset_name_str());
@@ -38,8 +43,13 @@ fn main() -> ExitCode {
     let records = MmbSubRecord::find_all(header.payload);
     println!("found {} sub-records:", records.len());
     for r in &records {
-        println!("  offset=0x{:04x}  variant={:?}  count={}  body_len={}",
-            r.offset, r.variant_name_str(), r.count, r.body.len());
+        println!(
+            "  offset=0x{:04x}  variant={:?}  count={}  body_len={}",
+            r.offset,
+            r.variant_name_str(),
+            r.count,
+            r.body.len()
+        );
     }
 
     ExitCode::SUCCESS

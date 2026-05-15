@@ -152,11 +152,7 @@ pub fn clamp_chase_camera_to_collision(
 
     let cos_p = chase.pitch.cos();
     let sin_p = chase.pitch.sin();
-    let dir = Vec3::new(
-        chase.yaw.sin() * cos_p,
-        sin_p,
-        chase.yaw.cos() * cos_p,
-    );
+    let dir = Vec3::new(chase.yaw.sin() * cos_p, sin_p, chase.yaw.cos() * cos_p);
 
     let wanted = chase.distance;
 

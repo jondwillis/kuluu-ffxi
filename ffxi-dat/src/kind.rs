@@ -14,26 +14,26 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkKind {
     Terminate = 0x00,
-    Rmp = 0x01,        // file-header marker (mot_, 0hm_, npc_, ...)
-    Scheduler = 0x07,  // event/scheduler records (sdam, sp00, ...)
-    Tim = 0x09,        // texture (legacy TIM)
-    Mzb = 0x1C,        // zone static mesh (collision)
-    Img = 0x20,        // image / texture container (D3S in some refs)
-    Bone = 0x29,       // skeleton bones (Sk2)
-    VertexOs2 = 0x2A,  // vertex data (OS2)
-    AnimMo2 = 0x2B,    // animation keyframes (Mo2)
-    Mmb = 0x2E,        // composite entity model (decryption + inline vertex/bone)
-    Rid = 0x36,        // resource id (file metadata)
-    // TODO(atmosphere): identify and add variants for FFXI's
-    // per-zone visual data. The viewer's `ZoneAtmosphereProvider`
-    // (ffxi-viewer-core::atmosphere) is ready to consume:
-    //   * Sky-dome / skybox cubemap (separate sky DATs keyed on zone id)
-    //   * Per-zone ambient color & fog parameters
-    //   * Indoor light emitters (likely an MZB placement subtype, not
-    //     a top-level chunk — see `parse_placements`)
-    // None of these chunk types are confirmed in this parser yet;
-    // they need reverse-engineering against POLUtils / Windower notes
-    // or empirical inspection of the DAT chunk streams.
+    Rmp = 0x01,       // file-header marker (mot_, 0hm_, npc_, ...)
+    Scheduler = 0x07, // event/scheduler records (sdam, sp00, ...)
+    Tim = 0x09,       // texture (legacy TIM)
+    Mzb = 0x1C,       // zone static mesh (collision)
+    Img = 0x20,       // image / texture container (D3S in some refs)
+    Bone = 0x29,      // skeleton bones (Sk2)
+    VertexOs2 = 0x2A, // vertex data (OS2)
+    AnimMo2 = 0x2B,   // animation keyframes (Mo2)
+    Mmb = 0x2E,       // composite entity model (decryption + inline vertex/bone)
+    Rid = 0x36,       // resource id (file metadata)
+                      // TODO(atmosphere): identify and add variants for FFXI's
+                      // per-zone visual data. The viewer's `ZoneAtmosphereProvider`
+                      // (ffxi-viewer-core::atmosphere) is ready to consume:
+                      //   * Sky-dome / skybox cubemap (separate sky DATs keyed on zone id)
+                      //   * Per-zone ambient color & fog parameters
+                      //   * Indoor light emitters (likely an MZB placement subtype, not
+                      //     a top-level chunk — see `parse_placements`)
+                      // None of these chunk types are confirmed in this parser yet;
+                      // they need reverse-engineering against POLUtils / Windower notes
+                      // or empirical inspection of the DAT chunk streams.
 }
 
 impl ChunkKind {

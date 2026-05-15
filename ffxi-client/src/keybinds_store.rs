@@ -78,9 +78,10 @@ impl KeybindsStateRes {
     pub fn apply_preset(&mut self, preset: Preset) -> (Bindings, std::io::Result<()>) {
         self.persisted = PersistedKeybinds::from_preset(preset);
         let new_bindings = self.persisted.clone().into_bindings();
-        let save_result = self.store.save(&self.persisted).map_err(|e| {
-            std::io::Error::other(format!("save keybinds: {e}"))
-        });
+        let save_result = self
+            .store
+            .save(&self.persisted)
+            .map_err(|e| std::io::Error::other(format!("save keybinds: {e}")));
         (new_bindings, save_result)
     }
 
@@ -105,7 +106,11 @@ impl KeybindsStore {
         let base = std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".config"))
+            })
             .ok_or_else(|| anyhow!("neither $XDG_CONFIG_HOME nor $HOME set"))?;
         Ok(base.join("ffxi-mcp").join("keybinds.json"))
     }
@@ -196,7 +201,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        p.push(format!("ffxi-keybinds-store-{}-{stamp}.json", std::process::id()));
+        p.push(format!(
+            "ffxi-keybinds-store-{}-{stamp}.json",
+            std::process::id()
+        ));
         p
     }
 

@@ -71,10 +71,7 @@ pub fn spawn_compass(mut commands: Commands) {
         });
 }
 
-pub fn update_compass(
-    chase: Res<ChaseCamera>,
-    mut label_q: Query<&mut Text, With<CompassLabel>>,
-) {
+pub fn update_compass(chase: Res<ChaseCamera>, mut label_q: Query<&mut Text, With<CompassLabel>>) {
     let Ok(mut text) = label_q.single_mut() else {
         return;
     };

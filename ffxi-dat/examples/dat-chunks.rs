@@ -57,7 +57,10 @@ fn main() -> ExitCode {
     println!("path           {}", path.display());
     println!("file size      {} bytes", bytes.len());
     println!();
-    println!("{:>5}  {:>8}  {:6}  {:>4}  {:>10}  {}", "idx", "offset", "name", "kind", "body_len", "preview");
+    println!(
+        "{:>5}  {:>8}  {:6}  {:>4}  {:>10}  {}",
+        "idx", "offset", "name", "kind", "body_len", "preview"
+    );
 
     let mut idx = 0;
     let mut errs = 0;

@@ -201,10 +201,7 @@ pub fn update_diagnostics(
     }
 
     if let Ok(mut text) = map_q.single_mut() {
-        **text = d
-            .map_server_addr
-            .clone()
-            .unwrap_or_else(|| "—".into());
+        **text = d.map_server_addr.clone().unwrap_or_else(|| "—".into());
     }
 }
 

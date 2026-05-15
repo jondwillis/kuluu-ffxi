@@ -26,14 +26,8 @@ struct LoadRequest {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let file_id: u32 = args
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(115);
-    let chunk_idx: usize = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(18);
+    let file_id: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(115);
+    let chunk_idx: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(18);
 
     // Dry-run parse before launching Bevy. Confirms the pipeline works
     // without needing a display server, and gives the user concrete
@@ -85,8 +79,13 @@ fn dry_run_parse(file_id: u32, chunk_idx: usize) -> Result<(), Box<dyn std::erro
     for (i, sub) in subs.iter().enumerate() {
         let verts = sub.parse_vertices().map(|v| v.len()).unwrap_or(0);
         let tris = sub.parse_triangle_list().len();
-        eprintln!("  [{i}] variant={:?} count={} verts={} tris={}",
-                  sub.variant_name_str(), sub.count, verts, tris);
+        eprintln!(
+            "  [{i}] variant={:?} count={} verts={} tris={}",
+            sub.variant_name_str(),
+            sub.count,
+            verts,
+            tris
+        );
     }
     Ok(())
 }
@@ -133,7 +132,11 @@ fn orbit_camera(time: Res<Time>, mut q: Query<(&mut Transform, &mut OrbitCam)>) 
         cam.yaw += time.delta_secs() * 0.3;
         let (sy, cy) = cam.yaw.sin_cos();
         let (sp, cp) = cam.pitch.sin_cos();
-        t.translation = Vec3::new(cam.distance * cp * sy, cam.distance * sp + 30.0, cam.distance * cp * cy);
+        t.translation = Vec3::new(
+            cam.distance * cp * sy,
+            cam.distance * sp + 30.0,
+            cam.distance * cp * cy,
+        );
         t.look_at(Vec3::new(0.0, 0.0, 0.0), Vec3::Y);
     }
 }
@@ -171,13 +174,19 @@ fn load_and_spawn_mmb(
 
     let chunks: Vec<_> = walk(&bytes).filter_map(Result::ok).collect();
     let Some(chunk) = chunks.get(req.chunk_idx) else {
-        eprintln!("file has {} chunks, idx {} out of range", chunks.len(), req.chunk_idx);
+        eprintln!(
+            "file has {} chunks, idx {} out of range",
+            chunks.len(),
+            req.chunk_idx
+        );
         return;
     };
     if ChunkKind::from_u8(chunk.kind) != Some(ChunkKind::Mmb) {
         eprintln!(
             "chunk {} is kind {:#x} ({:?}), not an MMB",
-            req.chunk_idx, chunk.kind, ChunkKind::label(chunk.kind),
+            req.chunk_idx,
+            chunk.kind,
+            ChunkKind::label(chunk.kind),
         );
         return;
     }
@@ -213,17 +222,27 @@ fn load_and_spawn_mmb(
 
     for (i, sub) in sub_records.iter().enumerate() {
         let Some(vertices) = sub.parse_vertices() else {
-            println!("  sub[{i}] {:?} count={}: skipped (vertices won't fit body)", sub.variant_name_str(), sub.count);
+            println!(
+                "  sub[{i}] {:?} count={}: skipped (vertices won't fit body)",
+                sub.variant_name_str(),
+                sub.count
+            );
             continue;
         };
         let triangles = sub.parse_triangle_list();
         if triangles.is_empty() {
-            println!("  sub[{i}] {:?} count={}: 0 triangles after strip decode", sub.variant_name_str(), sub.count);
+            println!(
+                "  sub[{i}] {:?} count={}: 0 triangles after strip decode",
+                sub.variant_name_str(),
+                sub.count
+            );
             continue;
         }
         println!(
             "  sub[{i}] {:?}: {} verts, {} tris",
-            sub.variant_name_str(), vertices.len(), triangles.len()
+            sub.variant_name_str(),
+            vertices.len(),
+            triangles.len()
         );
 
         // Build Bevy mesh: positions, normals, UVs, color attribute,
@@ -233,16 +252,24 @@ fn load_and_spawn_mmb(
         let uvs: Vec<[f32; 2]> = vertices.iter().map(|v| v.uv).collect();
         let colors: Vec<[f32; 4]> = vertices
             .iter()
-            .map(|v| [
-                v.rgba[0] as f32 / 255.0,
-                v.rgba[1] as f32 / 255.0,
-                v.rgba[2] as f32 / 255.0,
-                v.rgba[3] as f32 / 255.0,
-            ])
+            .map(|v| {
+                [
+                    v.rgba[0] as f32 / 255.0,
+                    v.rgba[1] as f32 / 255.0,
+                    v.rgba[2] as f32 / 255.0,
+                    v.rgba[3] as f32 / 255.0,
+                ]
+            })
             .collect();
-        let indices: Vec<u32> = triangles.iter().flat_map(|t| [t[0] as u32, t[1] as u32, t[2] as u32]).collect();
+        let indices: Vec<u32> = triangles
+            .iter()
+            .flat_map(|t| [t[0] as u32, t[1] as u32, t[2] as u32])
+            .collect();
 
-        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);

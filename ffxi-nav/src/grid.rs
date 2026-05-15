@@ -285,8 +285,7 @@ mod tests {
         // Monotonic progress: every step should strictly decrease the
         // remaining distance to the goal. We compare squared distance
         // in the (x, z) plane to dodge the floating-point sqrt.
-        let dist2 =
-            |p: Vec3| (p.x - goal.x).powi(2) + (p.z - goal.z).powi(2);
+        let dist2 = |p: Vec3| (p.x - goal.x).powi(2) + (p.z - goal.z).powi(2);
         let mut prev = dist2(path[0]);
         for w in &path[1..] {
             let d = dist2(*w);

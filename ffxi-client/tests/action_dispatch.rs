@@ -105,12 +105,7 @@ fn weaponskill_action_writes_skill_id_only() {
 /// JobAbility action: ActionID = 0x09, body[0..4] = ability_id.
 #[test]
 fn job_ability_action_writes_ability_id_only() {
-    let buf = build_subpacket_action(
-        0,
-        0,
-        0,
-        &ActionKind::JobAbility { ability_id: 42 },
-    );
+    let buf = build_subpacket_action(0, 0, 0, &ActionKind::JobAbility { ability_id: 42 });
     assert_eq!(
         u16::from_le_bytes(buf[10..12].try_into().unwrap()),
         0x09,
@@ -130,11 +125,11 @@ fn job_ability_action_writes_ability_id_only() {
 #[test]
 fn item_use_packet_layout_matches_phoenix_struct() {
     let buf = build_subpacket_item_use(
-        0xABCD,        // sync
-        0xC0FFEE00,    // recipient UniqueNo
-        0x0007,        // recipient ActIndex
-        0x00,          // category = LOC_INVENTORY
-        12,            // slot
+        0xABCD,     // sync
+        0xC0FFEE00, // recipient UniqueNo
+        0x0007,     // recipient ActIndex
+        0x00,       // category = LOC_INVENTORY
+        12,         // slot
     );
     assert_eq!(buf.len(), 20, "4 hdr + 16 body");
 

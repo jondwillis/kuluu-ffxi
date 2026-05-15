@@ -4,7 +4,9 @@
 include!(concat!(env!("OUT_DIR"), "/msg_channel_table.rs"));
 
 pub fn lookup(id: u16) -> Option<&'static str> {
-    MSG_CHANNEL.iter().find_map(|&(k, v)| (k == id).then_some(v))
+    MSG_CHANNEL
+        .iter()
+        .find_map(|&(k, v)| (k == id).then_some(v))
 }
 
 pub fn count() -> usize {

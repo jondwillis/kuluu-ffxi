@@ -51,8 +51,7 @@ pub use presets::Preset;
 /// the OS WindowCloseRequested event) are NOT actions — they must work
 /// regardless of bindings, so they stay inline in the input handlers.
 #[derive(
-    Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd,
-    serde::Serialize, serde::Deserialize,
+    Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
 )]
 pub enum Action {
     // ----- Movement (World mode) -----
@@ -124,8 +123,17 @@ pub enum Action {
 /// Modifier-key state encoded as a small struct rather than bitflags so
 /// it serializes cleanly to JSON.
 #[derive(
-    Debug, Clone, Copy, Default, Eq, PartialEq, Hash, Ord, PartialOrd,
-    serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    Eq,
+    PartialEq,
+    Hash,
+    Ord,
+    PartialOrd,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub struct Modifiers {
     pub ctrl: bool,

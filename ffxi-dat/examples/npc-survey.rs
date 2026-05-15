@@ -165,11 +165,7 @@ fn parse_row(line: &str) -> Option<NpcRow> {
     }
     let look_bytes = hex_decode_20(look_hex)?;
     let look = decode_look(&look_bytes)?;
-    Some(NpcRow {
-        npc_id,
-        name,
-        look,
-    })
+    Some(NpcRow { npc_id, name, look })
 }
 
 /// Decode 40 hex chars to a 20-byte array. Returns None on any
@@ -192,13 +188,18 @@ fn hex_decode_20(s: &str) -> Option<[u8; 20]> {
 /// header is the stop sentinel.
 fn rows_for_zone(sql: &str, zone_id: u16) -> Vec<NpcRow> {
     let marker = format!("(Zone {zone_id})");
-    let Some(start) = sql.find(&marker) else { return Vec::new() };
+    let Some(start) = sql.find(&marker) else {
+        return Vec::new();
+    };
     let rest = &sql[start..];
     // End of block: next `-- ------` / `-- (Zone N)` header. We look
     // for the SECOND occurrence of "(Zone " after start — the first
     // is our own header.
     let after_self = &rest["(Zone ".len()..];
-    let end = after_self.find("(Zone ").map(|i| i + "(Zone ".len()).unwrap_or(rest.len());
+    let end = after_self
+        .find("(Zone ")
+        .map(|i| i + "(Zone ".len())
+        .unwrap_or(rest.len());
     let block = &rest[..end.min(rest.len())];
 
     block
@@ -309,7 +310,13 @@ fn main() -> ExitCode {
         println!("--- Equipped-look NPCs (race/face/head/body sample) ---");
         println!("npc_id      │ name                  │ race face  head    body");
         for r in equipped.iter().take(8) {
-            if let Look::Equipped { race, face, head, body } = r.look {
+            if let Look::Equipped {
+                race,
+                face,
+                head,
+                body,
+            } = r.look
+            {
                 println!(
                     "  {:>11} │ {:<22} │ {:>4} {:>4}  {:#06x}  {:#06x}",
                     r.npc_id, r.name, race, face, head, body,
@@ -350,9 +357,7 @@ fn main() -> ExitCode {
     };
 
     println!();
-    println!(
-        "--- DAT probe: file_ids {lo}..{hi}, min-chunks {min_chunks} ---"
-    );
+    println!("--- DAT probe: file_ids {lo}..{hi}, min-chunks {min_chunks} ---");
     println!("(streaming; progress printed every 5000 file_ids on stderr)");
     println!("file_id │ mmb_chunks │ asset(s) of first MMB sub-record");
     let mut stdout = io::BufWriter::new(io::stdout().lock());
@@ -376,7 +381,9 @@ fn main() -> ExitCode {
         // but `fs::read` is unavoidable for the chunk walk. We do
         // skip files smaller than 4 KiB — too small to plausibly
         // hold `min_chunks` MMBs with their headers + payload.
-        let Ok(meta) = fs::metadata(&path) else { continue };
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
         if meta.len() < 4096 {
             continue;
         }
@@ -400,15 +407,16 @@ fn main() -> ExitCode {
         }
         let asset = first_mmb_data
             .and_then(|d| mmb::decrypt(d).ok())
-            .and_then(|d| MmbHeader::parse(&d).ok().map(|h| h.asset_name_str().to_string()))
+            .and_then(|d| {
+                MmbHeader::parse(&d)
+                    .ok()
+                    .map(|h| h.asset_name_str().to_string())
+            })
             .unwrap_or_default();
         let asset_short = asset.trim_end_matches('\0').trim().to_string();
         // Stream the row immediately so the operator sees progress
         // and can Ctrl-C once they have enough data.
-        let _ = writeln!(
-            stdout,
-            "  {file_id:>7} │ {mmb_count:>10} │ {asset_short}"
-        );
+        let _ = writeln!(stdout, "  {file_id:>7} │ {mmb_count:>10} │ {asset_short}");
         let _ = stdout.flush();
         files_with_mmb.insert(file_id, (mmb_count, asset_short));
     }

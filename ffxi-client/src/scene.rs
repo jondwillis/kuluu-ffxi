@@ -189,7 +189,11 @@ fn format_entity_counts(pcs: u32, npcs: u32, mobs: u32) -> String {
 }
 
 fn plural(n: u32) -> &'static str {
-    if n == 1 { "" } else { "s" }
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 fn chat_channel_label(c: ChatChannel) -> &'static str {
@@ -232,7 +236,9 @@ mod tests {
             character: "Vanari".into(),
             zone_id: 230,
         });
-        s.apply_event(&AgentEvent::StageChanged { stage: Stage::InZone });
+        s.apply_event(&AgentEvent::StageChanged {
+            stage: Stage::InZone,
+        });
         s
     }
 
@@ -261,37 +267,73 @@ mod tests {
         // Self entity at id=42.
         s.apply_event(&AgentEvent::EntityUpserted {
             entity: Entity {
-                id: 42, act_index: 1, kind: EntityKind::Pc,
+                id: 42,
+                act_index: 1,
+                kind: EntityKind::Pc,
                 name: Some("Vanari".into()),
-                pos: Vec3::default(), heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0, speed: 0, speed_base: 0, look: None,
+                pos: Vec3::default(),
+                heading: 0,
+                hp_pct: Some(100),
+                bt_target_id: 0,
+                claim_id: 0,
+                speed: 0,
+                speed_base: 0,
+                look: None,
             },
         });
         // Other PC.
         s.apply_event(&AgentEvent::EntityUpserted {
             entity: Entity {
-                id: 100, act_index: 2, kind: EntityKind::Pc,
+                id: 100,
+                act_index: 2,
+                kind: EntityKind::Pc,
                 name: Some("Stranger".into()),
-                pos: Vec3 { x: 5.0, y: 0.0, z: 0.0 }, heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0, speed: 0, speed_base: 0, look: None,
+                pos: Vec3 {
+                    x: 5.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                heading: 0,
+                hp_pct: Some(100),
+                bt_target_id: 0,
+                claim_id: 0,
+                speed: 0,
+                speed_base: 0,
+                look: None,
             },
         });
         // NPC.
         s.apply_event(&AgentEvent::EntityUpserted {
             entity: Entity {
-                id: 200, act_index: 3, kind: EntityKind::Npc,
+                id: 200,
+                act_index: 3,
+                kind: EntityKind::Npc,
                 name: Some("Innkeeper".into()),
-                pos: Vec3::default(), heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0, speed: 0, speed_base: 0, look: None,
+                pos: Vec3::default(),
+                heading: 0,
+                hp_pct: Some(100),
+                bt_target_id: 0,
+                claim_id: 0,
+                speed: 0,
+                speed_base: 0,
+                look: None,
             },
         });
         // Mob.
         s.apply_event(&AgentEvent::EntityUpserted {
             entity: Entity {
-                id: 300, act_index: 4, kind: EntityKind::Mob,
+                id: 300,
+                act_index: 4,
+                kind: EntityKind::Mob,
                 name: None,
-                pos: Vec3::default(), heading: 0, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0, speed: 0, speed_base: 0, look: None,
+                pos: Vec3::default(),
+                heading: 0,
+                hp_pct: Some(100),
+                bt_target_id: 0,
+                claim_id: 0,
+                speed: 0,
+                speed_base: 0,
+                look: None,
             },
         });
 
@@ -309,12 +351,21 @@ mod tests {
         let mut s = base_state();
         s.apply_event(&AgentEvent::PartyMemberUpdated {
             member: PartyMember {
-                id: 42, act_index: 1, name: None,
-                hp: 1500, mp: 200, tp: 1750,
-                hp_pct: 75, mp_pct: 50,
-                zone_no: 230, main_job: 1, main_job_lv: 75,
-                sub_job: 6, sub_job_lv: 37,
-                is_party_leader: false, is_alliance_leader: false,
+                id: 42,
+                act_index: 1,
+                name: None,
+                hp: 1500,
+                mp: 200,
+                tp: 1750,
+                hp_pct: 75,
+                mp_pct: 50,
+                zone_no: 230,
+                main_job: 1,
+                main_job_lv: 75,
+                sub_job: 6,
+                sub_job_lv: 37,
+                is_party_leader: false,
+                is_alliance_leader: false,
                 in_mog_house: false,
             },
         });
@@ -339,7 +390,11 @@ mod tests {
             },
         });
         let scene = SceneSummary::from_state(&s);
-        assert!(scene.text.contains("Last say: Foo: hello world"), "got: {}", scene.text);
+        assert!(
+            scene.text.contains("Last say: Foo: hello world"),
+            "got: {}",
+            scene.text
+        );
         assert_eq!(scene.last_chat_count, 1);
     }
 
@@ -356,13 +411,19 @@ mod tests {
             },
         });
         let scene = SceneSummary::from_state(&s);
-        assert!(scene.text.contains('…'), "long chat should be truncated: {}", scene.text);
+        assert!(
+            scene.text.contains('…'),
+            "long chat should be truncated: {}",
+            scene.text
+        );
     }
 
     #[test]
     fn disconnected_state_short_circuits() {
         let mut s = base_state();
-        s.apply_event(&AgentEvent::Disconnected { reason: "test".into() });
+        s.apply_event(&AgentEvent::Disconnected {
+            reason: "test".into(),
+        });
         let scene = SceneSummary::from_state(&s);
         assert_eq!(scene.stage, Stage::Disconnected);
         assert!(scene.text.contains("Disconnected"));
@@ -374,11 +435,21 @@ mod tests {
         for id in [42u32, 43, 44] {
             s.apply_event(&AgentEvent::PartyMemberUpdated {
                 member: PartyMember {
-                    id, act_index: 1, name: Some("M".into()),
-                    hp: 100, mp: 100, tp: 0, hp_pct: 100, mp_pct: 100,
-                    zone_no: 230, main_job: 1, main_job_lv: 75,
-                    sub_job: 6, sub_job_lv: 37,
-                    is_party_leader: id == 42, is_alliance_leader: false,
+                    id,
+                    act_index: 1,
+                    name: Some("M".into()),
+                    hp: 100,
+                    mp: 100,
+                    tp: 0,
+                    hp_pct: 100,
+                    mp_pct: 100,
+                    zone_no: 230,
+                    main_job: 1,
+                    main_job_lv: 75,
+                    sub_job: 6,
+                    sub_job_lv: 37,
+                    is_party_leader: id == 42,
+                    is_alliance_leader: false,
                     in_mog_house: false,
                 },
             });

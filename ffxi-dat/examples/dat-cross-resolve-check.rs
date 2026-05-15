@@ -67,13 +67,21 @@ fn load_index(path: &str) -> HashMap<String, Vec<(u32, u32)>> {
             while i < bytes.len() && bytes[i] != b',' {
                 i += 1;
             }
-            let n1: u32 = std::str::from_utf8(&bytes[n1s..i]).unwrap().trim().parse().unwrap();
+            let n1: u32 = std::str::from_utf8(&bytes[n1s..i])
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
             i += 1;
             let n2s = i;
             while i < bytes.len() && bytes[i] != b']' {
                 i += 1;
             }
-            let n2: u32 = std::str::from_utf8(&bytes[n2s..i]).unwrap().trim().parse().unwrap();
+            let n2: u32 = std::str::from_utf8(&bytes[n2s..i])
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
             i += 1;
             pairs.push((n1, n2));
         }
@@ -82,7 +90,10 @@ fn load_index(path: &str) -> HashMap<String, Vec<(u32, u32)>> {
     out
 }
 
-fn collect_zone(root: &DatRoot, file_id: u32) -> Option<(String, Vec<String>, Vec<mzb::MmbPlacement>)> {
+fn collect_zone(
+    root: &DatRoot,
+    file_id: u32,
+) -> Option<(String, Vec<String>, Vec<mzb::MmbPlacement>)> {
     let loc = root.resolve(file_id).ok()?;
     let bytes = fs::read(loc.path_under(root.root())).ok()?;
     let chunks: Vec<_> = walk(&bytes).filter_map(Result::ok).collect();
@@ -218,7 +229,10 @@ fn main() {
         println!("  miss        = {miss}");
         let mut dist: Vec<_> = cross_dist.into_iter().collect();
         dist.sort_by(|a, b| b.1.cmp(&a.1));
-        println!("  cross_top10 = {:?}", &dist.iter().take(10).collect::<Vec<_>>());
+        println!(
+            "  cross_top10 = {:?}",
+            &dist.iter().take(10).collect::<Vec<_>>()
+        );
         println!("  cross_files = {}", dist.len());
         println!("  miss_sample = {:?}", miss_samples);
         println!();

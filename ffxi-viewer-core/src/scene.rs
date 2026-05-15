@@ -213,9 +213,7 @@ pub fn setup_world(
         // Pets: small capsule, hugs the ground.
         pet: meshes.add(Capsule3d::new(0.4, 0.6)),
     });
-    commands.insert_resource(HpBarMesh(
-        meshes.add(Cuboid::new(1.0, 0.12, 0.12)),
-    ));
+    commands.insert_resource(HpBarMesh(meshes.add(Cuboid::new(1.0, 0.12, 0.12))));
 
     // No placeholder ground plane: the navmesh wireframe overlay
     // (`ffxi-client::view_native::navmesh_overlay`) provides terrain
@@ -282,7 +280,14 @@ pub fn sync_entities_system(
     mut commands: Commands,
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     mut q_mat: Query<&mut MeshMaterial3d<StandardMaterial>, With<WorldEntity>>,
-    mut q_hp: Query<(&HpBar, &mut Transform, &mut MeshMaterial3d<StandardMaterial>), Without<WorldEntity>>,
+    mut q_hp: Query<
+        (
+            &HpBar,
+            &mut Transform,
+            &mut MeshMaterial3d<StandardMaterial>,
+        ),
+        Without<WorldEntity>,
+    >,
     q_nameplates: Query<&Nameplate>,
 ) {
     if !state.dirty && !target.is_changed() {
@@ -326,14 +331,9 @@ pub fn sync_entities_system(
             mats.self_pc.clone()
         } else {
             match wire.kind {
-                EntityKind::Mob => pick_mob_material(
-                    &mats,
-                    wire.claim_id,
-                    self_char_id,
-                    is_target,
-                    false,
-                )
-                .clone(),
+                EntityKind::Mob => {
+                    pick_mob_material(&mats, wire.claim_id, self_char_id, is_target, false).clone()
+                }
                 _ if is_target => mats.target.clone(),
                 _ => pick_material(&mats, wire.kind, false),
             }
@@ -393,7 +393,10 @@ pub fn sync_entities_system(
                 // operator HUD already shows self HP/MP, and a floating
                 // bar under the chase camera is visual noise).
                 if !is_self
-                    && matches!(wire.kind, EntityKind::Mob | EntityKind::Pc | EntityKind::Pet)
+                    && matches!(
+                        wire.kind,
+                        EntityKind::Mob | EntityKind::Pc | EntityKind::Pet
+                    )
                 {
                     let bar_color = hp_color(wire.hp_pct);
                     commands.spawn((
@@ -424,7 +427,11 @@ pub fn sync_entities_system(
         // arrived yet) so the nameplate doesn't briefly disappear after
         // zone-in.
         let name = wire.name.as_deref().or_else(|| {
-            if is_self { snap.char_name.as_deref() } else { None }
+            if is_self {
+                snap.char_name.as_deref()
+            } else {
+                None
+            }
         });
         if let Some(name) = name.filter(|s| !s.is_empty()) {
             if !nameplated.contains(&wire.id) {
@@ -674,7 +681,9 @@ pub fn sync_entity_looks_system(
         return;
     }
     for wire in &state.snapshot.entities {
-        let Some(&bevy_e) = tracked.by_id.get(&wire.id) else { continue };
+        let Some(&bevy_e) = tracked.by_id.get(&wire.id) else {
+            continue;
+        };
         let current = q_look.get(bevy_e).ok();
         match (&wire.look, current) {
             (Some(new), Some(LookComp(old))) if new == old => {}
@@ -697,9 +706,7 @@ pub fn sync_entity_looks_system(
 /// Uses Bevy's `Changed<LookComp>` rather than re-comparing snapshot
 /// state because [`sync_entity_looks_system`] already absorbed the
 /// "snapshot says X, world says Y" reconciliation upstream.
-pub fn process_entity_look_changes(
-    q_changed: Query<(&WorldEntity, &LookComp), Changed<LookComp>>,
-) {
+pub fn process_entity_look_changes(q_changed: Query<(&WorldEntity, &LookComp), Changed<LookComp>>) {
     for (we, look) in q_changed.iter() {
         // Tag the log with both the wire id and entity kind so
         // operators can correlate it against `/entities` output.
@@ -786,7 +793,10 @@ mod tests {
     fn pick_mob_material_other_claim_uses_muted_red() {
         let mats = dummy_materials();
         let h = pick_mob_material(&mats, 0x4242, 0xCAFE, false, false);
-        assert!(std::ptr::eq(h, &mats.mob_claimed_other), "other player's claim");
+        assert!(
+            std::ptr::eq(h, &mats.mob_claimed_other),
+            "other player's claim"
+        );
         let h_unknown_self = pick_mob_material(&mats, 0x4242, 0, false, false);
         assert!(
             std::ptr::eq(h_unknown_self, &mats.mob_claimed_other),

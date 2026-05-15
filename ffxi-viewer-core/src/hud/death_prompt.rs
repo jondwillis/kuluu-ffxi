@@ -87,11 +87,7 @@ pub fn update_death_prompt_system(
     let dead = resolve_self(&snap.party, snap.self_char_id)
         .map(|m| m.hp_pct == 0)
         .unwrap_or(false);
-    let want = if dead {
-        Display::Flex
-    } else {
-        Display::None
-    };
+    let want = if dead { Display::Flex } else { Display::None };
     if panel_node.display != want {
         panel_node.display = want;
     }

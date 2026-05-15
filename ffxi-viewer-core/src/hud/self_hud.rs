@@ -216,8 +216,7 @@ pub fn update_self_status(
         tracker.last_hp = Some(m.hp);
     }
     if tracker.pulse_remaining_s > 0.0 {
-        tracker.pulse_remaining_s =
-            (tracker.pulse_remaining_s - time.delta_secs()).max(0.0);
+        tracker.pulse_remaining_s = (tracker.pulse_remaining_s - time.delta_secs()).max(0.0);
     }
 
     // Engaged check: self entity in the entity list (party-row data

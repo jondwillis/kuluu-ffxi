@@ -49,7 +49,10 @@ pub fn entry_count(has_target: bool) -> usize {
 }
 
 pub fn entry_label(has_target: bool, idx: usize) -> &'static str {
-    entries_for(has_target).get(idx).copied().unwrap_or("<unknown>")
+    entries_for(has_target)
+        .get(idx)
+        .copied()
+        .unwrap_or("<unknown>")
 }
 
 #[derive(Component)]
@@ -137,7 +140,11 @@ pub fn update_quick_action(
                         if **text != want {
                             **text = want;
                         }
-                        let want_color = if is_cursor { palette::ACCENT } else { palette::MUTED };
+                        let want_color = if is_cursor {
+                            palette::ACCENT
+                        } else {
+                            palette::MUTED
+                        };
                         if color.0 != want_color {
                             color.0 = want_color;
                         }

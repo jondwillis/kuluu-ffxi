@@ -253,11 +253,7 @@ impl<'a> MmbSubRecord<'a> {
                 payload[i + 18],
                 payload[i + 19],
             ]);
-            if is_ascii_tag(tag_word)
-                && is_ascii_variant(variant)
-                && count > 0
-                && count <= 0xFFFF
-            {
+            if is_ascii_tag(tag_word) && is_ascii_variant(variant) && count > 0 && count <= 0xFFFF {
                 starts.push(i);
                 i += 20;
                 continue;
@@ -403,7 +399,12 @@ impl<'a> MmbSubRecord<'a> {
                 f32::from_le_bytes(self.body[off + 28..off + 32].try_into().ok()?),
                 f32::from_le_bytes(self.body[off + 32..off + 36].try_into().ok()?),
             ];
-            out.push(MmbVertex { pos, normal, rgba, uv });
+            out.push(MmbVertex {
+                pos,
+                normal,
+                rgba,
+                uv,
+            });
         }
         Some(out)
     }
@@ -432,7 +433,8 @@ fn is_ascii_tag(b: &[u8]) -> bool {
     if b.len() != 8 || b[0] == b' ' {
         return false;
     }
-    b.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b' ')
+    b.iter()
+        .all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b' ')
 }
 
 /// True if all 8 bytes are valid for a variant name (alphanumeric,
@@ -469,7 +471,9 @@ mod tests {
     fn round_trip_is_identity_when_version_below_5() {
         // Decrypt is a noop on version<5 + flag!=0xFFFF, so re-running
         // gives the same bytes back.
-        let original = vec![b'M', b'M', b'B', 4, 0x12, 0x34, 0x00, 0x00, 1, 2, 3, 4, 5, 6, 7, 8];
+        let original = vec![
+            b'M', b'M', b'B', 4, 0x12, 0x34, 0x00, 0x00, 1, 2, 3, 4, 5, 6, 7, 8,
+        ];
         let once = decrypt(&original).unwrap();
         let twice = decrypt(&once).unwrap();
         assert_eq!(once, twice);
@@ -497,11 +501,10 @@ mod tests {
     /// against drive-by changes. No copyrighted assets baked in — just
     /// 64 bytes of header structure (asset name + bbox floats).
     const KABU_DECRYPTED_HEAD: [u8; 64] = [
-        0xe4, 0x72, 0x00, 0x05, 0x01, 0xb7, 0x47, 0x9f, 0x74, 0x65, 0x6e, 0x73,
-        0x61, 0x6b, 0x61, 0x00, 0x6b, 0x61, 0x62, 0x75, 0x73, 0x65, 0x5f, 0x6d,
-        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x01, 0x00, 0x00, 0x00,
-        0xe6, 0xee, 0x3a, 0xc2, 0x34, 0x22, 0xca, 0x41, 0xb3, 0xaa, 0x76, 0xc2,
-        0x99, 0xaa, 0xf6, 0xc1, 0xcd, 0xcc, 0x50, 0xc2, 0x00, 0x00, 0xd4, 0x41,
+        0xe4, 0x72, 0x00, 0x05, 0x01, 0xb7, 0x47, 0x9f, 0x74, 0x65, 0x6e, 0x73, 0x61, 0x6b, 0x61,
+        0x00, 0x6b, 0x61, 0x62, 0x75, 0x73, 0x65, 0x5f, 0x6d, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x01, 0x00, 0x00, 0x00, 0xe6, 0xee, 0x3a, 0xc2, 0x34, 0x22, 0xca, 0x41, 0xb3,
+        0xaa, 0x76, 0xc2, 0x99, 0xaa, 0xf6, 0xc1, 0xcd, 0xcc, 0x50, 0xc2, 0x00, 0x00, 0xd4, 0x41,
         0x40, 0x00, 0x00, 0x00,
     ];
 
@@ -518,7 +521,7 @@ mod tests {
         buf.extend_from_slice(&348u32.to_le_bytes()); // count
         buf.extend(std::iter::repeat_n(0xFFu8, 28)); // sub-mesh header (non-ASCII)
         buf.extend(std::iter::repeat_n(0xFEu8, 192)); // vertex data (non-ASCII, 16-aligned region)
-        // Sub-record 2: clod-style variant naming
+                                                      // Sub-record 2: clod-style variant naming
         buf.extend_from_slice(b"clod    ");
         buf.extend_from_slice(b"clod_a01");
         buf.extend_from_slice(&71u32.to_le_bytes()); // count
@@ -531,7 +534,11 @@ mod tests {
     fn sub_record_walker_finds_mixed_tag_kinds() {
         let payload = synth_payload();
         let records = MmbSubRecord::find_all(&payload);
-        assert_eq!(records.len(), 2, "should find both 'model   ' and 'clod    ' headers");
+        assert_eq!(
+            records.len(),
+            2,
+            "should find both 'model   ' and 'clod    ' headers"
+        );
         assert_eq!(records[0].variant_name_str(), "con_wi1");
         assert_eq!(records[0].count, 348);
         assert_eq!(&records[0].tag(&payload), b"model   ");

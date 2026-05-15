@@ -16,7 +16,9 @@ fn main() -> ExitCode {
     if args.len() < 2 {
         eprintln!(
             "usage: FFXI_DAT_PATH=... {} <file_id> [chunk_idx]",
-            args.first().map(String::as_str).unwrap_or("dat-mzb-placements")
+            args.first()
+                .map(String::as_str)
+                .unwrap_or("dat-mzb-placements")
         );
         return ExitCode::from(2);
     }
@@ -58,7 +60,11 @@ fn main() -> ExitCode {
             eprintln!("chunk_idx {i} out of range ({} chunks)", chunks.len());
             return ExitCode::from(1);
         }
-        None => match chunks.iter().enumerate().find(|(_, c)| c.kind == ChunkKind::Mzb as u8) {
+        None => match chunks
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.kind == ChunkKind::Mzb as u8)
+        {
             Some((i, c)) => (i, c),
             None => {
                 eprintln!("no MZB chunk in file_id {file_id}");
@@ -69,7 +75,11 @@ fn main() -> ExitCode {
 
     println!("file_id     {file_id}");
     println!("path        {}", path.display());
-    println!("chunk[{idx}]   kind=0x{:02X} body_len={}", chunk.kind, chunk.data.len());
+    println!(
+        "chunk[{idx}]   kind=0x{:02X} body_len={}",
+        chunk.kind,
+        chunk.data.len()
+    );
     println!();
 
     let plain = match mzb::decrypt(chunk.data) {

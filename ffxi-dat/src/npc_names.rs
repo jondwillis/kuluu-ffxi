@@ -170,9 +170,19 @@ mod tests {
         // Slot 0: "none"
         write_record(&mut buf, 0, b"none", 0);
         // Slot 1: Ceraule, id = 0x010E6001 for zone 230
-        write_record(&mut buf, 1, b"Ceraule", 0x0100_0000 | (u32::from(zone_id) << 12) | 1);
+        write_record(
+            &mut buf,
+            1,
+            b"Ceraule",
+            0x0100_0000 | (u32::from(zone_id) << 12) | 1,
+        );
         // Slot 10: Apairemant, id = 0x010E600A for zone 230
-        write_record(&mut buf, 10, b"Apairemant", 0x0100_0000 | (u32::from(zone_id) << 12) | 10);
+        write_record(
+            &mut buf,
+            10,
+            b"Apairemant",
+            0x0100_0000 | (u32::from(zone_id) << 12) | 10,
+        );
         NpcNameTable::from_bytes(zone_id, buf)
     }
 

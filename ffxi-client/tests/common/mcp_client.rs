@@ -10,8 +10,8 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
-use serde_json::{Value, json};
+use anyhow::{anyhow, Context, Result};
+use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -26,7 +26,11 @@ pub fn ffxi_mcp_bin() -> PathBuf {
     let mut p = std::env::current_exe().expect("test current_exe");
     p.pop(); // deps/
     p.pop(); // {debug,release}/
-    p.push(if cfg!(windows) { "ffxi-mcp.exe" } else { "ffxi-mcp" });
+    p.push(if cfg!(windows) {
+        "ffxi-mcp.exe"
+    } else {
+        "ffxi-mcp"
+    });
     p
 }
 
@@ -74,8 +78,7 @@ impl McpClient {
         if n == 0 {
             return Err(anyhow!("ffxi-mcp closed stdout"));
         }
-        serde_json::from_str(buf.trim())
-            .with_context(|| format!("parse JSON-RPC frame: {buf:?}"))
+        serde_json::from_str(buf.trim()).with_context(|| format!("parse JSON-RPC frame: {buf:?}"))
     }
 
     /// Send a request and read messages until the matching response

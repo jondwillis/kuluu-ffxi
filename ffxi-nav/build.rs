@@ -27,7 +27,7 @@
 
 use std::{fs, path::PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 const ZONELINES_SQL: &str = "../vendor/server/sql/zonelines.sql";
 
@@ -37,8 +37,8 @@ fn main() -> Result<()> {
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR not set")?);
 
-    let src = fs::read_to_string(ZONELINES_SQL)
-        .with_context(|| format!("reading {ZONELINES_SQL}"))?;
+    let src =
+        fs::read_to_string(ZONELINES_SQL).with_context(|| format!("reading {ZONELINES_SQL}"))?;
     let mut entries = parse_zonelines(&src)?;
     // Sort by from_zone so we can compute (start, end) offsets for slicing.
     entries.sort_by_key(|z| z.from_zone);
@@ -129,10 +129,18 @@ fn parse_zonelines(src: &str) -> Result<Vec<ParsedLine>> {
             );
         }
         let line_id: u32 = fields[0].parse().with_context(|| {
-            format!("zonelines.sql line {}: bad zonelineid `{}`", lineno + 1, fields[0])
+            format!(
+                "zonelines.sql line {}: bad zonelineid `{}`",
+                lineno + 1,
+                fields[0]
+            )
         })?;
         let from_zone: u16 = fields[1].parse().with_context(|| {
-            format!("zonelines.sql line {}: bad from_zone `{}`", lineno + 1, fields[1])
+            format!(
+                "zonelines.sql line {}: bad from_zone `{}`",
+                lineno + 1,
+                fields[1]
+            )
         })?;
         let from_x: f32 = fields[2].parse()?;
         let from_y: f32 = fields[3].parse()?;

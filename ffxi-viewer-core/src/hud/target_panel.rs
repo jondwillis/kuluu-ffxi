@@ -147,16 +147,34 @@ pub fn update_target_panel_system(
     target: Res<Target>,
     state: Res<SceneState>,
     mut panel_q: Query<&mut Node, (With<TargetPanel>, Without<TargetHpFill>)>,
-    mut header_q: Query<&mut Text, (With<TargetHeader>, Without<TargetHpText>, Without<TargetDistText>)>,
+    mut header_q: Query<
+        &mut Text,
+        (
+            With<TargetHeader>,
+            Without<TargetHpText>,
+            Without<TargetDistText>,
+        ),
+    >,
     mut hp_fill_q: Query<
         (&mut Node, &mut BackgroundColor),
         (With<TargetHpFill>, Without<TargetPanel>),
     >,
     mut hp_text_q: Query<
         (&mut Text, &mut TextColor),
-        (With<TargetHpText>, Without<TargetHeader>, Without<TargetDistText>),
+        (
+            With<TargetHpText>,
+            Without<TargetHeader>,
+            Without<TargetDistText>,
+        ),
     >,
-    mut dist_q: Query<&mut Text, (With<TargetDistText>, Without<TargetHeader>, Without<TargetHpText>)>,
+    mut dist_q: Query<
+        &mut Text,
+        (
+            With<TargetDistText>,
+            Without<TargetHeader>,
+            Without<TargetHpText>,
+        ),
+    >,
 ) {
     if !state.is_changed() && !target.is_changed() {
         return;
@@ -274,8 +292,14 @@ mod tests {
 
     #[test]
     fn header_format_includes_kind() {
-        assert_eq!(format_header(&ent("Mandy", EntityKind::Mob, Some(50), 0.0)), "Mandy    [mob]");
-        assert_eq!(format_header(&ent("Selh", EntityKind::Npc, None, 0.0)), "Selh    [npc]");
+        assert_eq!(
+            format_header(&ent("Mandy", EntityKind::Mob, Some(50), 0.0)),
+            "Mandy    [mob]"
+        );
+        assert_eq!(
+            format_header(&ent("Selh", EntityKind::Npc, None, 0.0)),
+            "Selh    [npc]"
+        );
     }
 
     #[test]

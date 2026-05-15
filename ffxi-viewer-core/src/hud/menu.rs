@@ -56,7 +56,11 @@ const CONFIG_ENTRIES: &[&str] = &[
 const MAX_ENTRY_COUNT: usize = {
     let r = ROOT_ENTRIES.len();
     let c = CONFIG_ENTRIES.len();
-    if r >= c { r } else { c }
+    if r >= c {
+        r
+    } else {
+        c
+    }
 };
 
 /// Number of entries on the named menu screen. Used by the input router
@@ -168,7 +172,11 @@ pub fn update_main_menu(
                         if **text != want {
                             **text = want;
                         }
-                        let want_color = if is_cursor { palette::ACCENT } else { palette::MUTED };
+                        let want_color = if is_cursor {
+                            palette::ACCENT
+                        } else {
+                            palette::MUTED
+                        };
                         if color.0 != want_color {
                             color.0 = want_color;
                         }

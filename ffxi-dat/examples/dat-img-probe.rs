@@ -36,7 +36,13 @@ fn main() -> ExitCode {
                     let name_at_4: String = c.data[4..]
                         .iter()
                         .take(16)
-                        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                        .map(|&b| {
+                            if (0x20..0x7f).contains(&b) {
+                                b as char
+                            } else {
+                                '.'
+                            }
+                        })
                         .collect();
                     println!(
                         "[{idx:>4}] chunk_name={:?}  body_len={:>6}  decoded={:?} {}x{}  hdr@4={:?}",

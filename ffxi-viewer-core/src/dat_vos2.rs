@@ -62,8 +62,7 @@ pub struct LoadedVos2 {
 /// Load + parse a VertexOs2 chunk at `(file_id, chunk_idx)`. Errors
 /// surface as `Err(String)` so the caller can push a chat-HUD toast.
 pub fn load_vos2(file_id: u32, chunk_idx: usize) -> Result<LoadedVos2, String> {
-    let root = DatRoot::from_env_or_default()
-        .map_err(|e| format!("DatRoot: {e}"))?;
+    let root = DatRoot::from_env_or_default().map_err(|e| format!("DatRoot: {e}"))?;
     let location = root
         .resolve(file_id)
         .map_err(|e| format!("resolve({file_id}): {e}"))?;
@@ -76,9 +75,9 @@ pub fn load_vos2(file_id: u32, chunk_idx: usize) -> Result<LoadedVos2, String> {
     // when it actually IS a VertexOs2 chunk. Otherwise fall back to
     // "largest VertexOs2 in the file" — empirically the high-LOD body
     // mesh, which is what we want to render.
-    let chunk_at_hint = chunks.get(chunk_idx).filter(|c| {
-        ChunkKind::from_u8(c.kind) == Some(ChunkKind::VertexOs2)
-    });
+    let chunk_at_hint = chunks
+        .get(chunk_idx)
+        .filter(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::VertexOs2));
     let chunk = match chunk_at_hint {
         Some(c) => c,
         None => chunks
@@ -143,7 +142,10 @@ pub fn process_load_vos2_requests(
         std::collections::HashMap::new();
     let mut tex_pools: std::collections::HashMap<
         u32,
-        (std::collections::HashMap<String, Handle<Image>>, Option<Handle<Image>>),
+        (
+            std::collections::HashMap<String, Handle<Image>>,
+            Option<Handle<Image>>,
+        ),
     > = std::collections::HashMap::new();
 
     for req in queued {
@@ -219,8 +221,7 @@ pub fn process_load_vos2_requests(
             // avoids splitting the vertex buffer — a Phase-N
             // refactor can do proper per-corner expansion if seam
             // artifacts become an issue.
-            let mut uvs: Vec<[f32; 2]> =
-                vec![[0.0, 0.0]; loaded.mesh.vertices.len()];
+            let mut uvs: Vec<[f32; 2]> = vec![[0.0, 0.0]; loaded.mesh.vertices.len()];
             let mut uv_set: Vec<bool> = vec![false; loaded.mesh.vertices.len()];
             let mut indices: Vec<u32> = Vec::with_capacity(group.triangles.len() * 3);
             for t in &group.triangles {
@@ -234,7 +235,10 @@ pub fn process_load_vos2_requests(
                 }
             }
 
-            let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+            let mut mesh = Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::default(),
+            );
             mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone());
             mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals.clone());
             mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);

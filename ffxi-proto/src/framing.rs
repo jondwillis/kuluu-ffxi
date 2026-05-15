@@ -270,7 +270,9 @@ mod tests {
         // Sub-packet #2: opcode=0x00A, size=8 bytes, seq=0x0043, data 4 bytes.
         payload.extend_from_slice(&[0x0A, 0x04, 0x43, 0x00, 0x11, 0x22, 0x33, 0x44]);
 
-        let subs: Vec<_> = walk_sub_packets(&payload).collect::<Result<_, _>>().unwrap();
+        let subs: Vec<_> = walk_sub_packets(&payload)
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(subs.len(), 2);
         assert_eq!(subs[0].opcode, 0x015);
         assert_eq!(subs[0].sequence, 0x0042);

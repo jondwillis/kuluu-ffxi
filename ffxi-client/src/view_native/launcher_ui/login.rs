@@ -15,9 +15,7 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 
-use super::{
-    Credentials, LauncherState, LoginErrorMsg, LoginField, LoginForm, ServerInfo,
-};
+use super::{Credentials, LauncherState, LoginErrorMsg, LoginField, LoginForm, ServerInfo};
 
 /// Marker for the root login UI node so we can despawn the whole tree on
 /// state exit.
@@ -31,7 +29,6 @@ pub(super) struct UserText;
 /// Marker for the password text node (rendered as `*`s).
 #[derive(Component)]
 pub(super) struct PassText;
-
 
 pub(super) fn spawn_login_ui(
     mut commands: Commands,
@@ -101,10 +98,7 @@ pub(super) fn spawn_login_ui(
         });
 }
 
-pub(super) fn despawn_login_ui(
-    mut commands: Commands,
-    q: Query<Entity, With<LoginUiRoot>>,
-) {
+pub(super) fn despawn_login_ui(mut commands: Commands, q: Query<Entity, With<LoginUiRoot>>) {
     for e in q.iter() {
         commands.entity(e).despawn();
     }
@@ -243,10 +237,7 @@ pub(super) fn spawn_error_ui(mut commands: Commands, msg: Res<LoginErrorMsg>) {
         });
 }
 
-pub(super) fn despawn_error_ui(
-    mut commands: Commands,
-    q: Query<Entity, With<ErrorUiRoot>>,
-) {
+pub(super) fn despawn_error_ui(mut commands: Commands, q: Query<Entity, With<ErrorUiRoot>>) {
     for e in q.iter() {
         commands.entity(e).despawn();
     }

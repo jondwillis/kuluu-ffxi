@@ -165,8 +165,14 @@ pub fn dispatch_look_driven_models(
         // through the MMB pipeline below.
         if let EntityLook::Equipped {
             race,
-            head, body, hands, legs, feet,
-            main, sub, ranged,
+            head,
+            body,
+            hands,
+            legs,
+            feet,
+            main,
+            sub,
+            ranged,
             ..
         } = look.0
         {
@@ -216,7 +222,9 @@ pub fn dispatch_look_driven_models(
             // lookup keyed on size + zone goes here when sampled.
             EntityLook::Door { .. } | EntityLook::Transport { .. } => None,
         };
-        let Some((file_id, chunk_idx)) = resolved else { continue };
+        let Some((file_id, chunk_idx)) = resolved else {
+            continue;
+        };
 
         // Need a confirmed Bevy entity so `LoadMmbRequest` consumer
         // can parent under it. The query already gave us
@@ -262,7 +270,10 @@ mod tests {
     #[test]
     fn modelid_table_is_sorted() {
         for w in MODELID_TABLE.windows(2) {
-            assert!(w[0].0 < w[1].0, "MODELID_TABLE must be sorted ascending by (zone, modelid)");
+            assert!(
+                w[0].0 < w[1].0,
+                "MODELID_TABLE must be sorted ascending by (zone, modelid)"
+            );
         }
     }
 

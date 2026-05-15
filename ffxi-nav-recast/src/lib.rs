@@ -95,8 +95,12 @@ impl RecastNavMesh {
         let mut bmin = [f32::INFINITY; 3];
         let mut bmax = [f32::NEG_INFINITY; 3];
         for tile_idx in 0..mesh.max_tiles() {
-            let Some(tile) = mesh.get_tile(tile_idx) else { continue };
-            let Some(header) = tile.header() else { continue };
+            let Some(tile) = mesh.get_tile(tile_idx) else {
+                continue;
+            };
+            let Some(header) = tile.header() else {
+                continue;
+            };
             tile_count += 1;
             for axis in 0..3 {
                 bmin[axis] = bmin[axis].min(header.bmin[axis]);
@@ -108,10 +112,7 @@ impl RecastNavMesh {
             detour_bmin = ?bmin, detour_bmax = ?bmax,
             "RecastNavMesh loaded"
         );
-        Ok(Self {
-            _mesh: mesh,
-            query,
-        })
+        Ok(Self { _mesh: mesh, query })
     }
 
     /// Convenience: fetch (download-and-cache) + load in one call.
@@ -139,7 +140,9 @@ impl RecastNavMesh {
             let Some(tile) = self._mesh.get_tile(tile_idx) else {
                 continue;
             };
-            let Some(header) = tile.header() else { continue };
+            let Some(header) = tile.header() else {
+                continue;
+            };
             let verts = tile.verts();
             let polys = tile.polys();
             let poly_count = header.poly_count as usize;
@@ -255,23 +258,21 @@ impl NavMesh for RecastNavMesh {
         // different platform.
         let endpoint_ext = [POLY_PICK_EXT[0], 100.0, POLY_PICK_EXT[2]];
 
-        let (start_ref, start_pt) = match self
-            .query
-            .find_nearest_poly_1(&start, &endpoint_ext, &filter)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::info!(
-                    from_ffxi = ?from, start_detour = ?start, err = ?e,
-                    "RecastNavMesh::path — find_nearest_poly failed for START"
-                );
-                return None;
-            }
-        };
-        let (end_ref, end_pt) = match self
-            .query
-            .find_nearest_poly_1(&end, &endpoint_ext, &filter)
-        {
+        let (start_ref, start_pt) =
+            match self
+                .query
+                .find_nearest_poly_1(&start, &endpoint_ext, &filter)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::info!(
+                        from_ffxi = ?from, start_detour = ?start, err = ?e,
+                        "RecastNavMesh::path — find_nearest_poly failed for START"
+                    );
+                    return None;
+                }
+            };
+        let (end_ref, end_pt) = match self.query.find_nearest_poly_1(&end, &endpoint_ext, &filter) {
             Ok(r) => r,
             Err(e) => {
                 tracing::info!(

@@ -284,10 +284,8 @@ fn snap_entities_to_navmesh_system(
             // small step-ups onto curbs and ramps.
             const STEP_TOLERANCE: f32 = 2.0;
             let ceiling_y = t.translation.y + STEP_TOLERANCE;
-            let mzb = collision_geom.ground_raycast(
-                Vec2::new(t.translation.x, t.translation.z),
-                ceiling_y,
-            );
+            let mzb = collision_geom
+                .ground_raycast(Vec2::new(t.translation.x, t.translation.z), ceiling_y);
             mzb.or_else(|| nav_y_bevy(&nav_guard, &mut cache, entity.id, &t))
         } else {
             // NPCs / mobs / other PCs: cheap navmesh query.
@@ -312,16 +310,11 @@ fn nav_y_bevy(
     let g = nav_guard.as_ref()?;
     let ffxi_x = t.translation.x;
     let ffxi_y = -t.translation.z;
-    let z_hint = cache
-        .0
-        .get(&entity_id)
-        .copied()
-        .unwrap_or(-t.translation.y);
+    let z_hint = cache.0.get(&entity_id).copied().unwrap_or(-t.translation.y);
     let h = g.nearest_height_at(ffxi_x, ffxi_y, z_hint)?;
     cache.0.insert(entity_id, h);
     Some(-h)
 }
-
 
 /// Detour-space → Bevy world.
 ///

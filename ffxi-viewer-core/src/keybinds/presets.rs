@@ -18,10 +18,7 @@ use super::{Action, Bindings, KeyBind};
 /// Which retail-style layout the user has selected. `Custom` means the
 /// bindings on disk override the named preset — the file is the source of
 /// truth.
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, Default,
-    serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Preset {
     /// WASD movement, no strafe, arrows for camera. Most common
     /// keyboard-only retail layout.
@@ -217,7 +214,10 @@ mod tests {
     #[test]
     fn compact2_movement_uses_wasd_qe() {
         let b = compact2();
-        assert_eq!(b.get(Action::MoveForward), Some(KeyBind::new(KeyCode::KeyW)));
+        assert_eq!(
+            b.get(Action::MoveForward),
+            Some(KeyBind::new(KeyCode::KeyW))
+        );
         assert_eq!(
             b.get(Action::MoveBackward),
             Some(KeyBind::new(KeyCode::KeyS))
@@ -237,7 +237,10 @@ mod tests {
     #[test]
     fn compact1_omits_strafe() {
         let b = compact1();
-        assert_eq!(b.get(Action::MoveForward), Some(KeyBind::new(KeyCode::KeyW)));
+        assert_eq!(
+            b.get(Action::MoveForward),
+            Some(KeyBind::new(KeyCode::KeyW))
+        );
         assert_eq!(b.get(Action::StrafeLeft), None);
         assert_eq!(b.get(Action::StrafeRight), None);
     }
@@ -289,8 +292,14 @@ mod tests {
         for preset in [Preset::Compact1, Preset::Compact2, Preset::Standard] {
             let b = preset.bindings();
             assert_eq!(b.get(Action::NavUp), Some(KeyBind::new(KeyCode::ArrowUp)));
-            assert_eq!(b.get(Action::NavConfirm), Some(KeyBind::new(KeyCode::Enter)));
-            assert_eq!(b.get(Action::NavCancel), Some(KeyBind::new(KeyCode::Escape)));
+            assert_eq!(
+                b.get(Action::NavConfirm),
+                Some(KeyBind::new(KeyCode::Enter))
+            );
+            assert_eq!(
+                b.get(Action::NavCancel),
+                Some(KeyBind::new(KeyCode::Escape))
+            );
         }
     }
 

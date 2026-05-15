@@ -131,7 +131,10 @@ pub fn update_roster_panel_system(
             existing_rows.sort_by_key(|(_, id)| *id);
             let mut want: Vec<u32> = party.iter().map(|m| m.id).collect();
             want.sort();
-            existing_rows.iter().zip(want.iter()).any(|((_, a), b)| a != b)
+            existing_rows
+                .iter()
+                .zip(want.iter())
+                .any(|((_, a), b)| a != b)
         }
     };
 
@@ -184,7 +187,9 @@ pub fn update_roster_panel_system(
 fn spawn_member_row(parent: &mut ChildSpawnerCommands, member: &PartyMember) {
     parent
         .spawn((
-            RosterRow { member_id: member.id },
+            RosterRow {
+                member_id: member.id,
+            },
             Node {
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(2.0),
@@ -196,7 +201,10 @@ fn spawn_member_row(parent: &mut ChildSpawnerCommands, member: &PartyMember) {
             row.spawn((
                 RosterRowHeader,
                 Text::new(format_header(member)),
-                TextFont { font_size: 13.0, ..default() },
+                TextFont {
+                    font_size: 13.0,
+                    ..default()
+                },
                 TextColor(palette::TEXT),
             ));
 

@@ -100,31 +100,46 @@ pub fn spawn_llm_badge(mut commands: Commands) {
                 row.spawn((
                     PulseDot,
                     Text::new("●".to_string()),
-                    TextFont { font_size: 14.0, ..default() },
+                    TextFont {
+                        font_size: 14.0,
+                        ..default()
+                    },
                     TextColor(palette::DARK),
                 ));
                 row.spawn((
                     Text::new("LLM".to_string()),
-                    TextFont { font_size: 13.0, ..default() },
+                    TextFont {
+                        font_size: 13.0,
+                        ..default()
+                    },
                     TextColor(palette::TEXT),
                 ));
             });
             p.spawn((
                 Sparkline,
                 Text::new("".to_string()),
-                TextFont { font_size: 14.0, ..default() },
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
                 TextColor(palette::ACCENT),
             ));
             p.spawn((
                 PercentileText,
                 Text::new("p50  —     p99  —".to_string()),
-                TextFont { font_size: 12.0, ..default() },
+                TextFont {
+                    font_size: 12.0,
+                    ..default()
+                },
                 TextColor(palette::MUTED),
             ));
             p.spawn((
                 PairingText,
                 Text::new("—".to_string()),
-                TextFont { font_size: 12.0, ..default() },
+                TextFont {
+                    font_size: 12.0,
+                    ..default()
+                },
                 TextColor(palette::MUTED),
             ));
         });
@@ -428,8 +443,7 @@ mod tests {
 
     #[test]
     fn sparkline_window_max_scaling() {
-        let v: VecDeque<LlmDecision> =
-            vec![td("a", 1, 1), td("b", 2, 1_000_000)].into();
+        let v: VecDeque<LlmDecision> = vec![td("a", 1, 1), td("b", 2, 1_000_000)].into();
         let s = sparkline_for_latencies(&v, 32);
         let chars: Vec<char> = s.chars().collect();
         assert_eq!(chars.len(), 2);

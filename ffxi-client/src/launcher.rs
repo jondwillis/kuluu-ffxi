@@ -13,7 +13,7 @@
 
 use std::io::{self, BufRead, Write};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 
 use ffxi_client::auth_client::{AuthClient, AuthSession};
 use ffxi_client::lobby_client::{CharSlot, LobbyClient};
@@ -84,7 +84,10 @@ pub async fn run(
             s
         }
         Some(want) => {
-            println!("No character named '{}' on this account; pick from the list:", want);
+            println!(
+                "No character named '{}' on this account; pick from the list:",
+                want
+            );
             character_menu(handle.chars())?
         }
         None => character_menu(handle.chars())?,

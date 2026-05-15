@@ -59,7 +59,10 @@ fn main() -> ExitCode {
     let (idx, chunk) = match forced_idx {
         Some(i) if i < chunks.len() => (i, &chunks[i]),
         Some(i) => {
-            eprintln!("chunk_idx {i} out of range (file has {} chunks)", chunks.len());
+            eprintln!(
+                "chunk_idx {i} out of range (file has {} chunks)",
+                chunks.len()
+            );
             return ExitCode::from(1);
         }
         None => {
@@ -136,7 +139,10 @@ fn main() -> ExitCode {
             );
         }
         for (j, t) in m.triangles.iter().take(4).enumerate() {
-            println!("    t[{j}]   [{}, {}, {}]  n={}", t[0], t[1], t[2], m.triangle_normals[j]);
+            println!(
+                "    t[{j}]   [{}, {}, {}]  n={}",
+                t[0], t[1], t[2], m.triangle_normals[j]
+            );
         }
     }
     if meshes.len() > 4 {

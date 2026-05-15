@@ -50,7 +50,9 @@ fn main() {
             for needle in needles {
                 if cbytes.starts_with(needle) {
                     let key = entry.to_string_lossy().to_string();
-                    hits.entry(key).or_default().push((c.kind, cname.clone(), c.data.len()));
+                    hits.entry(key)
+                        .or_default()
+                        .push((c.kind, cname.clone(), c.data.len()));
                     break;
                 }
             }

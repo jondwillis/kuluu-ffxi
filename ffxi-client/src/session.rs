@@ -8,7 +8,7 @@
 //! sequence desync). Tracking `server_last_seq` from incoming bundles and
 //! using it as the ack on outgoing bundles keeps us walking forward.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use ffxi_proto::{decode, framing};
 use tokio::sync::{broadcast, mpsc};
 
@@ -53,10 +53,7 @@ impl NpcNameResolver {
         let root = self.root.as_ref()?;
         let (zone, _slot) = ffxi_dat::split_id(npc_id)?;
         // Swap the active table when the entity's zone changes.
-        let zone_matches = self
-            .current
-            .as_ref()
-            .is_some_and(|t| t.zone_id() == zone);
+        let zone_matches = self.current.as_ref().is_some_and(|t| t.zone_id() == zone);
         if !zone_matches {
             self.current = match ffxi_dat::NpcNameTable::open(root, zone) {
                 Ok(table) => Some(table),
@@ -357,11 +354,8 @@ async fn run_map_session(
     // off to the per-tick reactor (see the outer `flood_in_mog_house`).
     let mut flood_in_mog_house = false;
     while std::time::Instant::now() < flood_deadline {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            map.recv_decrypted(),
-        )
-        .await
+        match tokio::time::timeout(std::time::Duration::from_millis(500), map.recv_decrypted())
+            .await
         {
             Ok(Ok(buf)) => {
                 let header = framing::Header::read(&buf[..framing::FFXI_HEADER_SIZE]);
@@ -471,7 +465,10 @@ fn handle_sub_packet(
     // `NameExtractionMiss` events. Without this, a populated zone where
     // most entities never sent UPDATE_NAME would emit hundreds of
     // identical misses per second across the attach socket.
-    name_miss_dedup: &mut std::collections::HashMap<(u32, crate::state::NameMissKind), std::time::Instant>,
+    name_miss_dedup: &mut std::collections::HashMap<
+        (u32, crate::state::NameMissKind),
+        std::time::Instant,
+    >,
     // Captures the current zone id as it's decoded from the 0x00A LOGIN
     // sub-packet. The caller's mirror of this value is used by the
     // `Snapshot` handler to re-emit a fresh `Connected{zone_id}` for
@@ -525,7 +522,11 @@ fn handle_sub_packet(
                 if login.unique_no == self_char_id {
                     *self_act_index = Some(login.act_index);
                     *self_pos = Position {
-                        pos: Vec3 { x: head.x, y: head.y, z: head.z },
+                        pos: Vec3 {
+                            x: head.x,
+                            y: head.y,
+                            z: head.z,
+                        },
                         heading: head.dir,
                         speed: head.speed,
                         speed_base: head.speed_base,
@@ -550,7 +551,11 @@ fn handle_sub_packet(
                             // the player as "?" until/unless a name-bearing
                             // CHAR_PC happens to arrive.
                             name: Some(self_char_name.to_string()),
-                            pos: Vec3 { x: head.x, y: head.y, z: head.z },
+                            pos: Vec3 {
+                                x: head.x,
+                                y: head.y,
+                                z: head.z,
+                            },
                             heading: head.dir,
                             hp_pct: Some(head.hpp),
                             bt_target_id: head.bt_target_id,
@@ -566,9 +571,7 @@ fn handle_sub_packet(
                     // Mirror to legacy `state.self_pos` so the fallback
                     // path in `state_to_snapshot` (used pre-`char_id`
                     // resolution) also has the right value.
-                    let _ = event_tx.send(AgentEvent::PositionChanged {
-                        pos: *self_pos,
-                    });
+                    let _ = event_tx.send(AgentEvent::PositionChanged { pos: *self_pos });
                 }
             }
         }
@@ -582,7 +585,11 @@ fn handle_sub_packet(
                 if op == s2c::CHAR_PC && head.unique_no == self_char_id {
                     *self_act_index = Some(head.act_index);
                     *self_pos = Position {
-                        pos: Vec3 { x: head.x, y: head.y, z: head.z },
+                        pos: Vec3 {
+                            x: head.x,
+                            y: head.y,
+                            z: head.z,
+                        },
                         heading: head.dir,
                         ..*self_pos
                     };
@@ -620,9 +627,7 @@ fn handle_sub_packet(
                 // for them and they keep their wire-supplied name.
                 let name = wire_name.or_else(|| {
                     if op == s2c::CHAR_NPC {
-                        npc_name_resolver
-                            .lookup(head.unique_no)
-                            .map(str::to_string)
+                        npc_name_resolver.lookup(head.unique_no).map(str::to_string)
                     } else {
                         None
                     }
@@ -855,11 +860,7 @@ fn handle_sub_packet(
         op if op == s2c::GROUP_LIST => {
             if let Ok((attrs, extra)) = decode::PartyAttrs::decode_group_list(sub.data) {
                 if attrs.unique_no == self_char_id {
-                    note_mog_transition(
-                        attrs.moghouse_flg != 0,
-                        was_in_mog_house,
-                        event_tx,
-                    );
+                    note_mog_transition(attrs.moghouse_flg != 0, was_in_mog_house, event_tx);
                 }
                 let _ = event_tx.send(AgentEvent::PartyMemberUpdated {
                     member: party_member_from_attrs(&attrs, Some(&extra)),
@@ -869,11 +870,7 @@ fn handle_sub_packet(
         op if op == s2c::GROUP_ATTR => {
             if let Ok(attrs) = decode::PartyAttrs::decode_group_attr(sub.data) {
                 if attrs.unique_no == self_char_id {
-                    note_mog_transition(
-                        attrs.moghouse_flg != 0,
-                        was_in_mog_house,
-                        event_tx,
-                    );
+                    note_mog_transition(attrs.moghouse_flg != 0, was_in_mog_house, event_tx);
                 }
                 let _ = event_tx.send(AgentEvent::PartyMemberUpdated {
                     member: party_member_from_attrs(&attrs, None),
@@ -951,7 +948,11 @@ fn handle_sub_packet(
         }
         _ => {
             // Surface unknown opcodes at debug level; not an error.
-            tracing::trace!(opcode = format!("0x{:03x}", sub.opcode), len = sub.data.len(), "unhandled sub-packet");
+            tracing::trace!(
+                opcode = format!("0x{:03x}", sub.opcode),
+                len = sub.data.len(),
+                "unhandled sub-packet"
+            );
         }
     }
 }
@@ -1101,8 +1102,13 @@ async fn keepalive_loop(
                         self_pos = Position { pos: Vec3 { x, y, z }, heading, ..self_pos };
                         let _ = event_tx.send(AgentEvent::PositionChanged { pos: self_pos });
                     }
-                    Some(AgentCommand::StopMove) => { /* keepalive resends current pos */ }
-                    Some(AgentCommand::EndEvent) => {
+                     Some(AgentCommand::StopMove) => { /* keepalive resends current pos */ }
+                     Some(AgentCommand::SetFps { max }) => {
+                         let _ = event_tx.send(AgentEvent::SetFps { max });
+                     }
+                     Some(AgentCommand::EndEvent) => {
+
+
                         // Flush all pending event-ends now (in addition to the next keepalive bundle).
                         if !pending_event_end.is_empty() {
                             let mut payload = Vec::new();
@@ -1778,10 +1784,7 @@ fn build_subpacket_zone_transition(sync: u16) -> Vec<u8> {
 fn build_system_message_line(m: decode::SystemMessage) -> ChatLine {
     let text = match ffxi_proto::msg_system::lookup(m.message_id) {
         Some(raw) => substitute_system_placeholders(raw, m.para, m.para2),
-        None => format!(
-            "[system] msg #{} para={},{}",
-            m.message_id, m.para, m.para2
-        ),
+        None => format!("[system] msg #{} para={},{}", m.message_id, m.para, m.para2),
     };
     ChatLine {
         channel: ChatChannel::System,
@@ -1799,7 +1802,15 @@ fn build_system_message_line(m: decode::SystemMessage) -> ChatLine {
 fn substitute_system_placeholders(raw: &str, para: u32, para2: u32) -> String {
     let p = para.to_string();
     let mut s = raw.to_string();
-    for tag in ["<seconds>", "<number>", "<param>", "<value>", "<amount>", "<n>", "<gil>"] {
+    for tag in [
+        "<seconds>",
+        "<number>",
+        "<param>",
+        "<value>",
+        "<amount>",
+        "<n>",
+        "<gil>",
+    ] {
         s = s.replace(tag, &p);
     }
     if s.contains("<number2>") {
@@ -2251,7 +2262,7 @@ fn build_subpacket_tell(sync: u16, recipient: &str, text: &str) -> Vec<u8> {
     let r_len = r_bytes.len().min(14); // leave 1 byte NUL in sName[15]
     let t_bytes = text.as_bytes();
     let t_len = t_bytes.len().min(127); // leave 1 byte NUL in Mes[128]
-    // body = 1 unknown00 + 1 unknown01 + 15 sName + variable Mes + 1 NUL
+                                        // body = 1 unknown00 + 1 unknown01 + 15 sName + variable Mes + 1 NUL
     let body_unpadded = 1 + 1 + 15 + t_len + 1;
     let body_padded = (body_unpadded + 3) & !3;
     let total = 4 + body_padded;
@@ -2409,11 +2420,7 @@ pub fn build_subpacket_item_use(
 /// already obvious because entities reappear; the entry edge is the one
 /// the operator misses, because the symptom is "no entities" with no other
 /// chat signal. Idempotent: only fires on the rising edge.
-fn note_mog_transition(
-    now_in_mog: bool,
-    was: &mut bool,
-    event_tx: &broadcast::Sender<AgentEvent>,
-) {
+fn note_mog_transition(now_in_mog: bool, was: &mut bool, event_tx: &broadcast::Sender<AgentEvent>) {
     if now_in_mog && !*was {
         let _ = event_tx.send(AgentEvent::ChatLine {
             line: crate::state::ChatLine {
@@ -2607,11 +2614,11 @@ mod tests {
         //   padding00:u8 Category:u32  → 16 body + 4 hdr = 20 total,
         // size_words = 5.
         let buf = build_subpacket_item_use(
-            0xBEEF,        // sync
-            0x12345678,    // recipient UniqueNo (self)
-            0x0042,        // recipient ActIndex
-            0x00,          // category = LOC_INVENTORY
-            7,             // slot
+            0xBEEF,     // sync
+            0x12345678, // recipient UniqueNo (self)
+            0x0042,     // recipient ActIndex
+            0x00,       // category = LOC_INVENTORY
+            7,          // slot
         );
         assert_eq!(buf.len(), 20);
 
@@ -2845,7 +2852,7 @@ mod tests {
         // Body layout: u16 type, u16 unknown06, 32×u16 icons, 32×u32 timestamps.
         let mut data = vec![0u8; 4 + 64 + 128];
         data[0..2].copy_from_slice(&0x0009u16.to_le_bytes()); // type=StatusIcons
-        // Slot 0: real icon 33
+                                                              // Slot 0: real icon 33
         data[4..6].copy_from_slice(&33u16.to_le_bytes());
         // Slot 1: placeholder 0x00FF — must be dropped.
         data[6..8].copy_from_slice(&0x00FFu16.to_le_bytes());
@@ -2860,7 +2867,7 @@ mod tests {
     fn miscdata_status_icons_rejects_wrong_type() {
         let mut data = vec![0u8; 4 + 64 + 128];
         data[0..2].copy_from_slice(&0x0005u16.to_le_bytes()); // JobPoints, not StatusIcons
-        // Even with valid icon bytes, the type guard should bail.
+                                                              // Even with valid icon bytes, the type guard should bail.
         data[4..6].copy_from_slice(&33u16.to_le_bytes());
         assert!(decode_miscdata_status_icons(&data).is_none());
     }
@@ -2882,11 +2889,11 @@ mod tests {
         data[4..8].copy_from_slice(&100u32.to_le_bytes());
         data[8..10].copy_from_slice(&4096u16.to_le_bytes());
         data[10] = 0; // shop_index
-        // Row 1 at offset 16: price=99999, item=256, idx=1
+                      // Row 1 at offset 16: price=99999, item=256, idx=1
         data[16..20].copy_from_slice(&99999u32.to_le_bytes());
         data[20..22].copy_from_slice(&256u16.to_le_bytes());
         data[22] = 1; // shop_index
-        // Row 2 at offset 28: zeroed (item_no = 0) → must be skipped.
+                      // Row 2 at offset 28: zeroed (item_no = 0) → must be skipped.
 
         let shop = decode_shop_list(&data).expect("decoded");
         assert_eq!(shop.offset_index, 5);
@@ -2909,7 +2916,11 @@ mod tests {
         assert_eq!(hdr & 0x01FF, 0x083);
         assert_eq!((hdr >> 9) & 0x7F, 4);
         assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 5, "qty");
-        assert_eq!(u16::from_le_bytes(buf[8..10].try_into().unwrap()), 12, "shop_no");
+        assert_eq!(
+            u16::from_le_bytes(buf[8..10].try_into().unwrap()),
+            12,
+            "shop_no"
+        );
         assert_eq!(
             u16::from_le_bytes(buf[10..12].try_into().unwrap()),
             3,
@@ -3080,7 +3091,11 @@ mod tests {
             para2: 0,
             message_id: 7,
         });
-        assert!(line.text.starts_with("Executing logout in 25 seconds."), "{}", line.text);
+        assert!(
+            line.text.starts_with("Executing logout in 25 seconds."),
+            "{}",
+            line.text
+        );
         assert!(matches!(line.channel, ChatChannel::System));
     }
 }

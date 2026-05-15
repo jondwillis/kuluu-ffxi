@@ -22,7 +22,7 @@
 
 pub mod mcp_client;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Pool};
 
@@ -66,8 +66,7 @@ pub struct EphemeralChar {
 
 impl EphemeralChar {
     pub async fn create(server_host: &str, auth_port: u16) -> Result<Self> {
-        let db_url =
-            std::env::var("TEST_DB_URL").unwrap_or_else(|_| DEFAULT_DB_URL.to_string());
+        let db_url = std::env::var("TEST_DB_URL").unwrap_or_else(|_| DEFAULT_DB_URL.to_string());
 
         // 24-bit suffix from nanoseconds-since-epoch — collision space is
         // 16M, real-world collisions require sub-nanosecond test scheduling
@@ -160,9 +159,11 @@ impl EphemeralChar {
         // login_helpers.cpp:248).
         const MJOB: u8 = 1;
 
-        run_inserts(&mut conn, accid, charid, &charname, POS_ZONE, NATION, GMLEVEL, FACE, RACE, SIZE, MJOB)
-            .await
-            .context("running LSB char-creation INSERT chain")?;
+        run_inserts(
+            &mut conn, accid, charid, &charname, POS_ZONE, NATION, GMLEVEL, FACE, RACE, SIZE, MJOB,
+        )
+        .await
+        .context("running LSB char-creation INSERT chain")?;
 
         drop(conn);
 
@@ -251,8 +252,15 @@ async fn run_inserts(
 
     // The remaining tables only need `charid` — defaults handle everything
     // else. ON DUPLICATE KEY makes them safe against a partial earlier run.
-    for table in ["char_exp", "char_flags", "char_jobs", "char_points",
-                  "char_unlocks", "char_profile", "char_storage"] {
+    for table in [
+        "char_exp",
+        "char_flags",
+        "char_jobs",
+        "char_points",
+        "char_unlocks",
+        "char_profile",
+        "char_storage",
+    ] {
         let stmt = format!(
             "INSERT INTO {table}(charid) VALUES (?) ON DUPLICATE KEY UPDATE charid = charid"
         );

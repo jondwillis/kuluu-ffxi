@@ -1,8 +1,8 @@
 //! FFXI agent-driven client — entry point.
 
-use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session};
 #[cfg(any(feature = "native-window", feature = "relay"))]
 use ffxi_client::state;
+use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session};
 // Re-import the lib-level relay/wire_translate at the binary crate root
 // so that submodules under main.rs can keep referring to them via
 // `crate::wire_translate` / `crate::relay`. `wire_translate` is only
@@ -11,19 +11,22 @@ use ffxi_client::state;
 // trick `state` uses above.
 #[cfg(feature = "native-window")]
 use ffxi_client::keybinds_store;
-#[cfg(feature = "native-window")]
-use ffxi_client::wire_translate;
 #[cfg(feature = "relay")]
 use ffxi_client::relay;
+#[cfg(feature = "native-window")]
+use ffxi_client::wire_translate;
 mod launcher;
 #[cfg(feature = "native-window")]
 mod view_native;
 
-use anyhow::{self, Context, Result, bail};
+use anyhow::{self, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "ffxi-client", about = "Agent-drivable FFXI client (LSB/Phoenix).")]
+#[command(
+    name = "ffxi-client",
+    about = "Agent-drivable FFXI client (LSB/Phoenix)."
+)]
 struct Args {
     /// Server hostname or IP.
     #[arg(long, default_value = "127.0.0.1")]
@@ -194,9 +197,7 @@ fn main() -> Result<()> {
 /// reachable, returns `Ok(None)` and the session falls back to "?"
 /// for static NPC names (dynamic entities still resolve via wire
 /// packets). `require_dat` flips the soft-degrade into a hard error.
-fn resolve_dat_root(
-    require_dat: bool,
-) -> Result<Option<std::sync::Arc<ffxi_dat::DatRoot>>> {
+fn resolve_dat_root(require_dat: bool) -> Result<Option<std::sync::Arc<ffxi_dat::DatRoot>>> {
     match ffxi_dat::DatRoot::from_env_or_default() {
         Ok(root) => {
             tracing::info!(
@@ -243,11 +244,8 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
         } => {
             auth.ensure_account(&user, &password).await.ok();
             let session = auth.login(&user, &password).await.context("login")?;
-            let lobby = lobby_client::LobbyClient::new(
-                args.server.clone(),
-                args.data_port,
-                args.view_port,
-            );
+            let lobby =
+                lobby_client::LobbyClient::new(args.server.clone(), args.data_port, args.view_port);
             lobby
                 .create_character(&session, &name, race, job, body_type, gender, face, tail)
                 .await
@@ -274,11 +272,8 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
         } => {
             auth.ensure_account(&user, &password).await.ok();
             let session = auth.login(&user, &password).await.context("login")?;
-            let lobby = lobby_client::LobbyClient::new(
-                args.server.clone(),
-                args.data_port,
-                args.view_port,
-            );
+            let lobby =
+                lobby_client::LobbyClient::new(args.server.clone(), args.data_port, args.view_port);
             let mut key3 = [0u8; 20];
             for (i, b) in key3.iter_mut().enumerate() {
                 *b = ((i as u8).wrapping_mul(0x37)) ^ 0x42;
@@ -461,11 +456,8 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             char_name,
         } => {
             let dat_root = resolve_dat_root(args.require_dat)?;
-            let lobby = lobby_client::LobbyClient::new(
-                args.server.clone(),
-                args.data_port,
-                args.view_port,
-            );
+            let lobby =
+                lobby_client::LobbyClient::new(args.server.clone(), args.data_port, args.view_port);
 
             let (user, password, char_id, _char_name, initial_state) =
                 match (user, password, char_name) {
@@ -588,9 +580,7 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             if let Some(addr) = args.relay_listen {
                 if let Err(err) = relay::preflight_bind(addr) {
                     eprintln!("error: {err:#}");
-                    eprintln!(
-                        "hint: pass `--relay-listen auto` to let the OS assign a free port,",
-                    );
+                    eprintln!("hint: pass `--relay-listen auto` to let the OS assign a free port,",);
                     eprintln!("      or pick a different `host:port`.");
                     std::process::exit(2);
                 }
@@ -637,11 +627,8 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
         } => {
             auth.ensure_account(&user, &password).await.ok(); // best-effort
             let session = auth.login(&user, &password).await.context("login")?;
-            let lobby = lobby_client::LobbyClient::new(
-                args.server.clone(),
-                args.data_port,
-                args.view_port,
-            );
+            let lobby =
+                lobby_client::LobbyClient::new(args.server.clone(), args.data_port, args.view_port);
             // Random key3 per session — server uses it as the Blowfish seed.
             let mut key3 = [0u8; 20];
             for (i, b) in key3.iter_mut().enumerate() {
@@ -726,8 +713,7 @@ fn run_native_main_thread(
     // direct_mode_login_autostart / direct_mode_charlist_autoselect).
     // No more synchronous block_on preflight — the launcher's async
     // tasks handle both modes uniformly.
-    let direct_mode_autostart =
-        user.is_some() && password.is_some() && char_name.is_some();
+    let direct_mode_autostart = user.is_some() && password.is_some() && char_name.is_some();
 
     let defaults = launcher::Defaults {
         user,

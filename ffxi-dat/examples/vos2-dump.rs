@@ -46,8 +46,7 @@ fn main() -> ExitCode {
                 println!("  PARSE FAILED: {e}");
             }
             Ok(mesh) => {
-                let total_tris: usize =
-                    mesh.groups.iter().map(|g| g.triangles.len()).sum();
+                let total_tris: usize = mesh.groups.iter().map(|g| g.triangles.len()).sum();
                 println!(
                     "  header: ver={:#x} type={:#x} flip={} off_vertex={:#x} off_poly={:#x} lod2={}",
                     mesh.header.version,
@@ -68,9 +67,10 @@ fn main() -> ExitCode {
                 let mut unit_count = 0;
                 let mut off_count = 0;
                 for v in &mesh.vertices {
-                    let m =
-                        (v.normal[0] * v.normal[0] + v.normal[1] * v.normal[1] + v.normal[2] * v.normal[2])
-                            .sqrt();
+                    let m = (v.normal[0] * v.normal[0]
+                        + v.normal[1] * v.normal[1]
+                        + v.normal[2] * v.normal[2])
+                        .sqrt();
                     if (m - 1.0).abs() < 0.05 {
                         unit_count += 1;
                     } else {

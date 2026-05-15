@@ -107,7 +107,9 @@ pub enum EntityKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EntityLook {
-    Standard { modelid: u16 },
+    Standard {
+        modelid: u16,
+    },
     Equipped {
         face: u8,
         race: u8,
@@ -120,8 +122,12 @@ pub enum EntityLook {
         sub: u16,
         ranged: u16,
     },
-    Door { size: u16 },
-    Transport { size: u16 },
+    Door {
+        size: u16,
+    },
+    Transport {
+        size: u16,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,15 +227,24 @@ pub struct Diagnostics {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReactorGoal {
     Idle,
-    Following { target_id: u32, distance: f32 },
-    Engaged { target_id: u32, attack_issued: bool },
+    Following {
+        target_id: u32,
+        distance: f32,
+    },
+    Engaged {
+        target_id: u32,
+        attack_issued: bool,
+    },
     Pathing {
         x: f32,
         y: f32,
         z: f32,
         waypoints_remaining: u32,
     },
-    Banking { threshold: u8, mog_house_zoneline: u32 },
+    Banking {
+        threshold: u8,
+        mog_house_zoneline: u32,
+    },
 }
 
 /// Last supervisor reconnect. `at_unix_ms` is wall-clock, since it crosses
@@ -448,15 +463,35 @@ pub enum Frame {
 /// only know the original 10 variants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ViewerCommand {
-    Move { x: f32, y: f32, z: f32, heading: u8 },
+    Move {
+        x: f32,
+        y: f32,
+        z: f32,
+        heading: u8,
+    },
     StopMove,
     EndEvent,
     Snapshot,
-    Chat { kind: u8, text: String },
-    Tell { to: String, text: String },
-    Follow { target_id: u32, distance: f32 },
-    Engage { target_id: u32 },
-    PathTo { x: f32, y: f32, z: f32 },
+    Chat {
+        kind: u8,
+        text: String,
+    },
+    Tell {
+        to: String,
+        text: String,
+    },
+    Follow {
+        target_id: u32,
+        distance: f32,
+    },
+    Engage {
+        target_id: u32,
+    },
+    PathTo {
+        x: f32,
+        y: f32,
+        z: f32,
+    },
     Cancel,
     /// 0x01A action 0x03 — magic. `pos_*` are the ground-target position
     /// for AoE-target spells (Tractor, certain BLU); zero for self/single-
@@ -518,7 +553,11 @@ mod tests {
             char_name: Some("Sylvie".into()),
             zone_id: Some(230),
             self_pos: Position {
-                pos: Vec3 { x: -10.5, y: 0.0, z: 42.25 },
+                pos: Vec3 {
+                    x: -10.5,
+                    y: 0.0,
+                    z: 42.25,
+                },
                 heading: 64,
                 speed: 25,
                 speed_base: 25,
@@ -528,7 +567,11 @@ mod tests {
                 act_index: 7,
                 kind: EntityKind::Pc,
                 name: Some("Other".into()),
-                pos: Vec3 { x: 1.0, y: 2.0, z: 3.0 },
+                pos: Vec3 {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                },
                 heading: 32,
                 hp_pct: Some(80),
                 bt_target_id: 0,
@@ -568,7 +611,9 @@ mod tests {
                     at_monotonic_ms: 1000,
                 },
                 LlmDecision {
-                    kind: LlmDecisionKind::ToolDispatched { tool: "engage".into() },
+                    kind: LlmDecisionKind::ToolDispatched {
+                        tool: "engage".into(),
+                    },
                     latency_us: 25_000,
                     at_monotonic_ms: 1100,
                 },
@@ -595,7 +640,10 @@ mod tests {
                 assert_eq!(s.chat[0].text, "hi");
                 // v2 fields survive roundtrip.
                 match s.current_goal {
-                    Some(ReactorGoal::Engaged { target_id, attack_issued }) => {
+                    Some(ReactorGoal::Engaged {
+                        target_id,
+                        attack_issued,
+                    }) => {
                         assert_eq!(target_id, 0x99);
                         assert!(attack_issued);
                     }
@@ -640,7 +688,10 @@ mod tests {
         let bytes = postcard::to_allocvec(&cf).expect("encode");
         let back: ClientFrame = postcard::from_bytes(&bytes).expect("decode");
         match back {
-            ClientFrame::Command(ViewerCommand::Follow { target_id, distance }) => {
+            ClientFrame::Command(ViewerCommand::Follow {
+                target_id,
+                distance,
+            }) => {
                 assert_eq!(target_id, 0x42);
                 assert!((distance - 3.0).abs() < f32::EPSILON);
             }

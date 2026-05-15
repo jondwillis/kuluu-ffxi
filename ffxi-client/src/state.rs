@@ -74,6 +74,10 @@ fn default_speed() -> u8 {
     25
 }
 
+fn default_fps() -> u32 {
+    60
+}
+
 impl Default for Position {
     fn default() -> Self {
         Self {
@@ -105,7 +109,11 @@ pub fn heading_to_forward(heading: u8) -> (f32, f32) {
 /// would cycle to the wrong entity (or panic) on the next.
 ///
 /// Both renderers use this so Tab semantics stay identical.
-pub fn next_target_by_distance(entities: &[Entity], from: Vec3, current: Option<u32>) -> Option<u32> {
+pub fn next_target_by_distance(
+    entities: &[Entity],
+    from: Vec3,
+    current: Option<u32>,
+) -> Option<u32> {
     if entities.is_empty() {
         return None;
     }
@@ -287,6 +295,9 @@ pub struct SessionState {
     /// LLM-decision badge in the operator dashboard.
     #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
     pub recent_decisions: VecDeque<LlmDecision>,
+    #[serde(default = "default_fps")]
+    pub target_fps: u32,
+    /// Bounded ring of recent LLM decisions...
     /// Bounded ring of recent name-extraction misses — diagnostic surface
     /// for "?" entities. Each entry captures the raw packet body so the
     /// MCP-side AI can audit the SendFlg byte and name-slot offset
@@ -422,8 +433,14 @@ pub enum InventoryUpdate {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReactorGoalSnapshot {
     Idle,
-    Following { target_id: u32, distance: f32 },
-    Engaged { target_id: u32, attack_issued: bool },
+    Following {
+        target_id: u32,
+        distance: f32,
+    },
+    Engaged {
+        target_id: u32,
+        attack_issued: bool,
+    },
     /// Pathing toward `(x, y, z)`. Stage 10b added multi-waypoint
     /// pathing via `ffxi-nav`; `waypoints_remaining` is the count of
     /// waypoints still ahead of the agent (including the destination
@@ -439,7 +456,10 @@ pub enum ReactorGoalSnapshot {
     },
     /// Stage-9 reactor goal: monitor inventory and zone to mog house when
     /// any non-mog container reaches `threshold` slots filled.
-    Banking { threshold: u8, mog_house_zoneline: u32 },
+    Banking {
+        threshold: u8,
+        mog_house_zoneline: u32,
+    },
 }
 
 impl Default for ReactorGoalSnapshot {
@@ -591,7 +611,9 @@ impl SessionState {
     /// arrives a tick or two after LOGIN, so callers should treat the
     /// initial `false` as "unknown / probably normal").
     pub fn self_in_mog_house(&self) -> bool {
-        let Some(char_id) = self.char_id else { return false };
+        let Some(char_id) = self.char_id else {
+            return false;
+        };
         self.party
             .iter()
             .find(|m| m.id == char_id)
@@ -671,10 +693,7 @@ impl SessionState {
                     // Position-only follow-ups arrive with body length < 64,
                     // making try_extract_name return None. Preserve the prior
                     // name on those so the target panel doesn't drop to "?".
-                    let preserved_name = entity
-                        .name
-                        .clone()
-                        .or_else(|| existing.name.clone());
+                    let preserved_name = entity.name.clone().or_else(|| existing.name.clone());
                     let merged_kind = merge_kind(existing.kind, entity.kind);
                     // Same field-gating logic as `name`: the producer
                     // (session.rs CHAR_PC/CHAR_NPC handler) only fills
@@ -739,6 +758,9 @@ impl SessionState {
             }
             AgentEvent::Diagnostics { diagnostics } => {
                 self.diagnostics = diagnostics.clone();
+            }
+            AgentEvent::SetFps { max } => {
+                self.target_fps = *max;
             }
             AgentEvent::Disconnected { .. } => {
                 self.stage = Stage::Disconnected;
@@ -822,11 +844,7 @@ impl SessionState {
             | AgentEvent::HumanInControl { .. }
             | AgentEvent::HumanReleased => {}
             AgentEvent::InventoryUpdated { container, update } => {
-                let entry = self
-                    .inventory
-                    .containers
-                    .entry(*container)
-                    .or_default();
+                let entry = self.inventory.containers.entry(*container).or_default();
                 match update {
                     InventoryUpdate::Capacities { capacities } => {
                         // Capacities are container-indexed; the
@@ -1022,6 +1040,10 @@ pub enum AgentEvent {
     EngagedBy {
         entity_id: u32,
     },
+    /// Set the target frame rate.
+    SetFps {
+        max: u32,
+    },
     /// Received a /tell from another player. The most user-directed
     /// channel; nearly always worth waking the LLM for.
     TellReceived {
@@ -1094,12 +1116,7 @@ pub enum AgentEvent {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum AgentCommand {
     /// Set the next position the keepalive will report.
-    Move {
-        x: f32,
-        y: f32,
-        z: f32,
-        heading: u8,
-    },
+    Move { x: f32, y: f32, z: f32, heading: u8 },
     /// Stop sending position updates (revert keepalive to last-known position).
     StopMove,
     /// Request a zone change at a known zoneline. Server still has to honor it.
@@ -1183,6 +1200,8 @@ pub enum AgentCommand {
     /// directly, see `0x01a_action.cpp::HomepointMenu`), so a stale
     /// `self_act_index` still yields the same outcome.
     ReturnToHomePoint,
+    /// Set the target frame rate.
+    SetFps { max: u32 },
     /// Reactor goal: keep stepping toward `target_id`, holding `distance`
     /// yalms once close. Works for follow-leader (party PC) and chase-mob.
     /// Handled by `crate::reactor`; if it reaches the session loop the
@@ -1543,19 +1562,16 @@ impl ActionKind {
                 buf[8..12].copy_from_slice(&pos_z.to_le_bytes());
                 buf[12..16].copy_from_slice(&pos_y.to_le_bytes());
             }
-            ActionKind::Weaponskill { skill_id }
-            | ActionKind::MonsterSkill { skill_id } => {
+            ActionKind::Weaponskill { skill_id } | ActionKind::MonsterSkill { skill_id } => {
                 buf[0..4].copy_from_slice(&skill_id.to_le_bytes());
             }
             ActionKind::JobAbility { ability_id } => {
                 buf[0..4].copy_from_slice(&ability_id.to_le_bytes());
             }
-            ActionKind::HomepointMenu { status_id }
-            | ActionKind::Blockaid { status_id } => {
+            ActionKind::HomepointMenu { status_id } | ActionKind::Blockaid { status_id } => {
                 buf[0..4].copy_from_slice(&status_id.to_le_bytes());
             }
-            ActionKind::RaiseMenu { accept }
-            | ActionKind::TractorMenu { accept } => {
+            ActionKind::RaiseMenu { accept } | ActionKind::TractorMenu { accept } => {
                 let id: u32 = if *accept { 0 } else { 1 };
                 buf[0..4].copy_from_slice(&id.to_le_bytes());
             }
@@ -1578,7 +1594,11 @@ mod tests {
     fn agent_event_roundtrip() {
         let ev = AgentEvent::PositionChanged {
             pos: Position {
-                pos: Vec3 { x: 1.0, y: 2.0, z: 3.0 },
+                pos: Vec3 {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                },
                 heading: 64,
                 ..Position::default()
             },
@@ -1611,7 +1631,11 @@ mod tests {
         let line = r#"{"cmd":"action","target_id":42,"target_index":7,"kind":{"kind":"talk"}}"#;
         let cmd: AgentCommand = serde_json::from_str(line).unwrap();
         match cmd {
-            AgentCommand::Action { target_id, target_index, kind } => {
+            AgentCommand::Action {
+                target_id,
+                target_index,
+                kind,
+            } => {
                 assert_eq!((target_id, target_index), (42, 7));
                 assert!(matches!(kind, ActionKind::Talk));
                 assert_eq!(kind.action_id(), 0x00);
@@ -1622,7 +1646,12 @@ mod tests {
 
     #[test]
     fn action_kind_castmagic_fills_buf() {
-        let kind = ActionKind::CastMagic { spell_id: 0x101, pos_x: 1.5, pos_y: 0.0, pos_z: -2.5 };
+        let kind = ActionKind::CastMagic {
+            spell_id: 0x101,
+            pos_x: 1.5,
+            pos_y: 0.0,
+            pos_z: -2.5,
+        };
         assert_eq!(kind.action_id(), 0x03);
         let mut buf = [0u8; 16];
         kind.fill_action_buf(&mut buf);
@@ -1712,7 +1741,9 @@ mod tests {
         let mut s = SessionState::default();
         assert_eq!(s.stage, Stage::Idle);
 
-        s.apply_event(&AgentEvent::StageChanged { stage: Stage::Authenticating });
+        s.apply_event(&AgentEvent::StageChanged {
+            stage: Stage::Authenticating,
+        });
         assert_eq!(s.stage, Stage::Authenticating);
         assert_eq!(s.diagnostics.stage, Some(Stage::Authenticating));
 
@@ -1733,10 +1764,18 @@ mod tests {
                 act_index: 1,
                 kind: EntityKind::Pc,
                 name: Some("Other".into()),
-                pos: Vec3 { x: 1.0, y: 0.0, z: 2.0 },
+                pos: Vec3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 2.0,
+                },
                 heading: 64,
-                hp_pct: Some(80), bt_target_id: 0, claim_id: 0,
-                speed: 0, speed_base: 0, look: None,
+                hp_pct: Some(80),
+                bt_target_id: 0,
+                claim_id: 0,
+                speed: 0,
+                speed_base: 0,
+                look: None,
             },
         });
         assert_eq!(s.entities.len(), 1);
@@ -1748,10 +1787,18 @@ mod tests {
                 act_index: 1,
                 kind: EntityKind::Pc,
                 name: Some("Other".into()),
-                pos: Vec3 { x: 5.0, y: 0.0, z: 6.0 },
+                pos: Vec3 {
+                    x: 5.0,
+                    y: 0.0,
+                    z: 6.0,
+                },
                 heading: 32,
-                hp_pct: Some(50), bt_target_id: 0, claim_id: 0,
-                speed: 0, speed_base: 0, look: None,
+                hp_pct: Some(50),
+                bt_target_id: 0,
+                claim_id: 0,
+                speed: 0,
+                speed_base: 0,
+                look: None,
             },
         });
         assert_eq!(s.entities.len(), 1, "upsert must not duplicate by id");
@@ -1766,20 +1813,41 @@ mod tests {
         // true for ~100ms after zone-in, the prompt re-appears, and
         // an Enter press would re-dispatch HomepointMenu.
         s.party.push(PartyMember {
-            id: 1, act_index: 1, name: None,
-            hp: 0, mp: 0, tp: 0, hp_pct: 0, mp_pct: 100,
-            zone_no: 100, main_job: 0, main_job_lv: 0,
-            sub_job: 0, sub_job_lv: 0,
-            is_party_leader: true, is_alliance_leader: false,
+            id: 1,
+            act_index: 1,
+            name: None,
+            hp: 0,
+            mp: 0,
+            tp: 0,
+            hp_pct: 0,
+            mp_pct: 100,
+            zone_no: 100,
+            main_job: 0,
+            main_job_lv: 0,
+            sub_job: 0,
+            sub_job_lv: 0,
+            is_party_leader: true,
+            is_alliance_leader: false,
             in_mog_house: false,
         });
-        s.apply_event(&AgentEvent::ZoneChanged { from: Some(100), to: 230 });
+        s.apply_event(&AgentEvent::ZoneChanged {
+            from: Some(100),
+            to: 230,
+        });
         assert_eq!(s.zone_id, Some(230));
-        assert!(s.entities.is_empty(), "zone change must clear stale entities");
-        assert!(s.party.is_empty(), "zone change must clear stale party (avoids stale dead-state on home-point warp)");
+        assert!(
+            s.entities.is_empty(),
+            "zone change must clear stale entities"
+        );
+        assert!(
+            s.party.is_empty(),
+            "zone change must clear stale party (avoids stale dead-state on home-point warp)"
+        );
 
         // Disconnected lands the terminal stage.
-        s.apply_event(&AgentEvent::Disconnected { reason: "test".into() });
+        s.apply_event(&AgentEvent::Disconnected {
+            reason: "test".into(),
+        });
         assert_eq!(s.stage, Stage::Disconnected);
     }
 
@@ -1807,7 +1875,11 @@ mod tests {
             act_index: id as u16,
             kind,
             name: name.map(str::to_string),
-            pos: Vec3 { x: 1.0, y: 2.0, z: 3.0 },
+            pos: Vec3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
             heading: 0,
             hp_pct: Some(100),
             bt_target_id: 0,
@@ -1832,7 +1904,11 @@ mod tests {
         s.apply_event(&AgentEvent::EntityUpserted {
             entity: make_test_entity(42, None, EntityKind::Npc),
         });
-        assert_eq!(s.entities[0].name.as_deref(), Some("Sigli-Sea"), "name must persist across attr-only update");
+        assert_eq!(
+            s.entities[0].name.as_deref(),
+            Some("Sigli-Sea"),
+            "name must persist across attr-only update"
+        );
     }
 
     #[test]
@@ -2052,7 +2128,11 @@ mod tests {
         let back: AgentEvent = serde_json::from_str(&s).unwrap();
         match back {
             AgentEvent::ReactorGoalChanged {
-                goal: ReactorGoalSnapshot::Engaged { target_id, attack_issued },
+                goal:
+                    ReactorGoalSnapshot::Engaged {
+                        target_id,
+                        attack_issued,
+                    },
             } => {
                 assert_eq!(target_id, 99);
                 assert!(attack_issued);
@@ -2078,7 +2158,10 @@ mod tests {
         assert!(s.self_position().is_none());
 
         s.apply_event(&AgentEvent::Connected {
-            account_id: 1, char_id: 99, character: "Self".into(), zone_id: 230,
+            account_id: 1,
+            char_id: 99,
+            character: "Self".into(),
+            zone_id: 230,
         });
         // char_id known, but no entity yet.
         assert!(s.self_position().is_none());
@@ -2086,15 +2169,33 @@ mod tests {
         // Upsert a self entity; self_position() now returns its fields.
         s.apply_event(&AgentEvent::EntityUpserted {
             entity: Entity {
-                id: 99, act_index: 5, kind: EntityKind::Pc,
+                id: 99,
+                act_index: 5,
+                kind: EntityKind::Pc,
                 name: Some("Self".into()),
-                pos: Vec3 { x: 10.0, y: 20.0, z: 30.0 },
-                heading: 64, hp_pct: Some(100), bt_target_id: 0,
-                claim_id: 0, speed: 40, speed_base: 40, look: None,
+                pos: Vec3 {
+                    x: 10.0,
+                    y: 20.0,
+                    z: 30.0,
+                },
+                heading: 64,
+                hp_pct: Some(100),
+                bt_target_id: 0,
+                claim_id: 0,
+                speed: 40,
+                speed_base: 40,
+                look: None,
             },
         });
         let p = s.self_position().expect("self entity present");
-        assert_eq!(p.pos, Vec3 { x: 10.0, y: 20.0, z: 30.0 });
+        assert_eq!(
+            p.pos,
+            Vec3 {
+                x: 10.0,
+                y: 20.0,
+                z: 30.0
+            }
+        );
         assert_eq!(p.heading, 64);
         assert_eq!(p.speed, 40);
         assert_eq!(p.speed_base, 40);
@@ -2102,12 +2203,25 @@ mod tests {
         // PositionChanged now also mutates the self entity.
         s.apply_event(&AgentEvent::PositionChanged {
             pos: Position {
-                pos: Vec3 { x: 1.0, y: 2.0, z: 3.0 },
-                heading: 32, speed: 25, speed_base: 25,
+                pos: Vec3 {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                },
+                heading: 32,
+                speed: 25,
+                speed_base: 25,
             },
         });
         let p = s.self_position().expect("self entity present");
-        assert_eq!(p.pos, Vec3 { x: 1.0, y: 2.0, z: 3.0 });
+        assert_eq!(
+            p.pos,
+            Vec3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0
+            }
+        );
         assert_eq!(p.heading, 32);
     }
 
@@ -2121,7 +2235,10 @@ mod tests {
             },
         });
         match s.current_goal {
-            Some(ReactorGoalSnapshot::Following { target_id, distance }) => {
+            Some(ReactorGoalSnapshot::Following {
+                target_id,
+                distance,
+            }) => {
                 assert_eq!(target_id, 42);
                 assert!((distance - 3.0).abs() < 1e-3);
             }
@@ -2231,7 +2348,11 @@ mod tests {
         });
         // Should have been silently dropped — no slot to update.
         assert!(
-            s.inventory.containers.get(&0).map(|c| c.slots.is_empty()).unwrap_or(true),
+            s.inventory
+                .containers
+                .get(&0)
+                .map(|c| c.slots.is_empty())
+                .unwrap_or(true),
             "ITEM_NUM without prior ITEM_LIST drops"
         );
 

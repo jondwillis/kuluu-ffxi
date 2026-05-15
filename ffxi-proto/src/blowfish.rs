@@ -143,7 +143,10 @@ mod tests {
             b"\x00",
             b"hello",
             b"abcdefghijklmnopqrstuvwxyz",
-            &[0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0],
+            &[
+                0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+                0xde, 0xf0,
+            ],
         ];
         for k in keys {
             let st = State::new(k);
@@ -157,7 +160,11 @@ mod tests {
                 encipher(&mut a, &mut b, &st.p, &st.s);
                 let (cl, cr) = (a, b);
                 decipher(&mut a, &mut b, &st.p, &st.s);
-                assert_eq!((a, b), (l, r), "roundtrip key={k:?} pt=({l:08x},{r:08x}) ct=({cl:08x},{cr:08x})");
+                assert_eq!(
+                    (a, b),
+                    (l, r),
+                    "roundtrip key={k:?} pt=({l:08x},{r:08x}) ct=({cl:08x},{cr:08x})"
+                );
             }
         }
     }

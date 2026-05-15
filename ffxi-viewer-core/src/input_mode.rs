@@ -187,7 +187,10 @@ pub struct QuickActionState {
 impl QuickActionState {
     /// Open the picker with knowledge of whether a target is selected.
     pub fn for_target(has_target: bool) -> Self {
-        Self { cursor: 0, has_target }
+        Self {
+            cursor: 0,
+            has_target,
+        }
     }
 }
 

@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AgentCommand;
@@ -45,7 +45,11 @@ impl GoalStore {
         let base = std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".config"))
+            })
             .ok_or_else(|| anyhow!("neither $XDG_CONFIG_HOME nor $HOME set"))?;
         Ok(base.join("ffxi-mcp").join("goal.json"))
     }
@@ -125,7 +129,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        p.push(format!("ffxi-goal-store-{}-{stamp}.json", std::process::id()));
+        p.push(format!(
+            "ffxi-goal-store-{}-{stamp}.json",
+            std::process::id()
+        ));
         p
     }
 
@@ -138,11 +145,17 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let store = GoalStore::new(tmp_path());
-        let cmd = AgentCommand::Follow { target_id: 42, distance: 5.0 };
+        let cmd = AgentCommand::Follow {
+            target_id: 42,
+            distance: 5.0,
+        };
         store.save(&cmd).unwrap();
 
         let loaded = store.load().unwrap().expect("goal present after save");
-        assert!(matches!(loaded.command, AgentCommand::Follow { target_id: 42, .. }));
+        assert!(matches!(
+            loaded.command,
+            AgentCommand::Follow { target_id: 42, .. }
+        ));
         assert!(loaded.set_at_unix > 0);
 
         store.clear().unwrap();
@@ -169,21 +182,41 @@ mod tests {
     fn save_overwrites_previous() {
         let path = tmp_path();
         let store = GoalStore::new(&path);
-        store.save(&AgentCommand::Follow { target_id: 1, distance: 5.0 }).unwrap();
+        store
+            .save(&AgentCommand::Follow {
+                target_id: 1,
+                distance: 5.0,
+            })
+            .unwrap();
         store.save(&AgentCommand::Engage { target_id: 99 }).unwrap();
         let loaded = store.load().unwrap().unwrap();
-        assert!(matches!(loaded.command, AgentCommand::Engage { target_id: 99 }));
+        assert!(matches!(
+            loaded.command,
+            AgentCommand::Engage { target_id: 99 }
+        ));
         store.clear().unwrap();
     }
 
     #[test]
     fn is_persistable_goal_classifies_correctly() {
-        assert!(is_persistable_goal(&AgentCommand::Follow { target_id: 1, distance: 1.0 }));
+        assert!(is_persistable_goal(&AgentCommand::Follow {
+            target_id: 1,
+            distance: 1.0
+        }));
         assert!(is_persistable_goal(&AgentCommand::Engage { target_id: 1 }));
-        assert!(is_persistable_goal(&AgentCommand::PathTo { x: 0.0, y: 0.0, z: 0.0 }));
+        assert!(is_persistable_goal(&AgentCommand::PathTo {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0
+        }));
         assert!(!is_persistable_goal(&AgentCommand::Cancel));
         assert!(!is_persistable_goal(&AgentCommand::Snapshot));
         assert!(!is_persistable_goal(&AgentCommand::Disconnect));
-        assert!(!is_persistable_goal(&AgentCommand::Move { x: 0.0, y: 0.0, z: 0.0, heading: 0 }));
+        assert!(!is_persistable_goal(&AgentCommand::Move {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            heading: 0
+        }));
     }
 }

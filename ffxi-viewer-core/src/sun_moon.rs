@@ -95,8 +95,7 @@ fn vana_sky_from_unix(earth_unix: u64) -> VanaSky {
     let hour = secs_into_day / 25.0; // 25 earth seconds per V-hour.
 
     let total_v_days = since / EARTH_SECS_PER_VANA_DAY;
-    let moon_phase = (total_v_days % MOON_CYCLE_VANA_DAYS) as f32
-        / MOON_CYCLE_VANA_DAYS as f32;
+    let moon_phase = (total_v_days % MOON_CYCLE_VANA_DAYS) as f32 / MOON_CYCLE_VANA_DAYS as f32;
 
     // Sun is above horizon from hour 6 → 18 (noon at 12). Use a half
     // sine so altitude is 0 at sunrise/sunset and peaks at noon.
@@ -231,18 +230,10 @@ pub fn sun_color_for_hour(hour: f32, sun_altitude: f32) -> (Color, f32) {
     let near_dusk = hour > 12.0; // bias to red sunset, not gold dawn
     let (r, g, b) = if near_dusk {
         // Dusk: ramps toward deep red/orange.
-        (
-            1.0,
-            1.0 - 0.55 * warm,
-            1.0 - 0.85 * warm,
-        )
+        (1.0, 1.0 - 0.55 * warm, 1.0 - 0.85 * warm)
     } else {
         // Dawn: gentler, more gold than red.
-        (
-            1.0,
-            1.0 - 0.35 * warm,
-            1.0 - 0.65 * warm,
-        )
+        (1.0, 1.0 - 0.35 * warm, 1.0 - 0.65 * warm)
     };
     // Illuminance peaks at noon (~10k lux), drops to ~1.5k at horizon.
     let lux = 1500.0 + 8500.0 * elev;
@@ -270,19 +261,43 @@ pub fn sun_moon_system(
     mut sky: ResMut<VanaSky>,
     mut q_sun: Query<
         (&mut DirectionalLight, &mut Transform),
-        (With<IsSun>, Without<IsMoon>, Without<SunDisc>, Without<MoonDisc>, Without<crate::camera::OperatorCamera>),
+        (
+            With<IsSun>,
+            Without<IsMoon>,
+            Without<SunDisc>,
+            Without<MoonDisc>,
+            Without<crate::camera::OperatorCamera>,
+        ),
     >,
     mut q_moon: Query<
         (&mut DirectionalLight, &mut Transform),
-        (With<IsMoon>, Without<IsSun>, Without<SunDisc>, Without<MoonDisc>, Without<crate::camera::OperatorCamera>),
+        (
+            With<IsMoon>,
+            Without<IsSun>,
+            Without<SunDisc>,
+            Without<MoonDisc>,
+            Without<crate::camera::OperatorCamera>,
+        ),
     >,
     mut q_sun_disc: Query<
         &mut Transform,
-        (With<SunDisc>, Without<MoonDisc>, Without<IsSun>, Without<IsMoon>, Without<crate::camera::OperatorCamera>),
+        (
+            With<SunDisc>,
+            Without<MoonDisc>,
+            Without<IsSun>,
+            Without<IsMoon>,
+            Without<crate::camera::OperatorCamera>,
+        ),
     >,
     mut q_moon_disc: Query<
         &mut Transform,
-        (With<MoonDisc>, Without<SunDisc>, Without<IsSun>, Without<IsMoon>, Without<crate::camera::OperatorCamera>),
+        (
+            With<MoonDisc>,
+            Without<SunDisc>,
+            Without<IsSun>,
+            Without<IsMoon>,
+            Without<crate::camera::OperatorCamera>,
+        ),
     >,
     q_cam: Query<&Transform, With<crate::camera::OperatorCamera>>,
     materials_handle: Option<Res<CelestialMaterials>>,
@@ -361,12 +376,8 @@ pub fn sun_moon_system(
             } else {
                 0.0
             };
-            moon_mat.emissive = LinearRgba::new(
-                0.65 * intensity,
-                0.80 * intensity,
-                1.20 * intensity,
-                1.0,
-            );
+            moon_mat.emissive =
+                LinearRgba::new(0.65 * intensity, 0.80 * intensity, 1.20 * intensity, 1.0);
         }
     }
 }

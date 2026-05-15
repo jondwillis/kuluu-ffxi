@@ -203,7 +203,10 @@ pub struct MzbNonCollisionMesh;
 pub fn apply_zone_geom_visibility(
     draw: Res<DrawDistance>,
     mut q_collision: Query<&mut Visibility, (With<MzbCollisionMesh>, Without<MzbNonCollisionMesh>)>,
-    mut q_noncollision: Query<&mut Visibility, (With<MzbNonCollisionMesh>, Without<MzbCollisionMesh>)>,
+    mut q_noncollision: Query<
+        &mut Visibility,
+        (With<MzbNonCollisionMesh>, Without<MzbCollisionMesh>),
+    >,
 ) {
     if !draw.is_changed() {
         return;
@@ -296,14 +299,14 @@ pub fn load_mzb_placed(
 ) -> Result<(Vec<MzbSubMesh>, Vec<MzbInstance>), String> {
     let (header, plain, _chunks) = load_decrypted(file_id, chunk_idx)?;
 
-    let placements = mzb::parse_placements(&plain, &header)
-        .map_err(|e| format!("MZB parse_placements: {e}"))?;
+    let placements =
+        mzb::parse_placements(&plain, &header).map_err(|e| format!("MZB parse_placements: {e}"))?;
 
     if placements.is_empty() {
         // Fallback: no grid placements decoded — spawn the library at
         // origin (old behavior).
-        let meshes = mzb::parse_meshes(&plain, &header)
-            .map_err(|e| format!("MZB parse_meshes: {e}"))?;
+        let meshes =
+            mzb::parse_meshes(&plain, &header).map_err(|e| format!("MZB parse_meshes: {e}"))?;
         let mut submeshes = Vec::new();
         let mut instances = Vec::new();
         for m in meshes {
@@ -322,8 +325,7 @@ pub fn load_mzb_placed(
     }
 
     // Dedupe by geometry_offset.
-    let mut offset_to_idx: std::collections::HashMap<u32, usize> =
-        std::collections::HashMap::new();
+    let mut offset_to_idx: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     let mut submeshes: Vec<MzbSubMesh> = Vec::new();
     let mut instances: Vec<MzbInstance> = Vec::new();
 
@@ -398,8 +400,8 @@ fn load_decrypted(
     file_id: u32,
     chunk_idx: Option<usize>,
 ) -> Result<(mzb::MzbHeader, Vec<u8>, ()), String> {
-    let root = DatRoot::from_env_or_default()
-        .map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
+    let root =
+        DatRoot::from_env_or_default().map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
     let location = root
         .resolve(file_id)
         .map_err(|e| format!("resolve({file_id}): {e}"))?;
@@ -460,8 +462,8 @@ pub fn build_zone_mmb_spawns(
     file_id: u32,
     chunk_idx: Option<usize>,
 ) -> Result<Vec<ZoneMmbSpawn>, String> {
-    let root = DatRoot::from_env_or_default()
-        .map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
+    let root =
+        DatRoot::from_env_or_default().map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
     let location = root
         .resolve(file_id)
         .map_err(|e| format!("resolve({file_id}): {e}"))?;
@@ -503,7 +505,10 @@ pub fn build_zone_mmb_spawns(
             .enumerate()
             .find(|(_, c)| c.kind == ChunkKind::Mzb as u8)
             .ok_or_else(|| {
-                format!("no MZB chunk in file_id {file_id} ({} chunks)", chunks.len())
+                format!(
+                    "no MZB chunk in file_id {file_id} ({} chunks)",
+                    chunks.len()
+                )
             })?,
     };
     let plain = mzb::decrypt(mzb_chunk.data).map_err(|e| format!("MZB decrypt: {e}"))?;
@@ -559,8 +564,8 @@ pub fn build_zone_mmb_spawns(
 /// Kept for backward compatibility with the pre-Phase-9b "everything
 /// at origin" path; new code should call [`load_mzb_placed`].
 pub fn load_mzb(file_id: u32, chunk_idx: Option<usize>) -> Result<Vec<MzbSubMesh>, String> {
-    let root = DatRoot::from_env_or_default()
-        .map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
+    let root =
+        DatRoot::from_env_or_default().map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
     let location = root
         .resolve(file_id)
         .map_err(|e| format!("resolve({file_id}): {e}"))?;
@@ -747,70 +752,69 @@ pub fn process_load_mzb_requests(
         // sometimes only collision (zones without decorative walls).
         // `is_collision` controls which sub-marker is attached so
         // `/zonegeom` can toggle the two channels independently.
-        let spawn_merged =
-            |commands: &mut Commands,
-             positions: Vec<[f32; 3]>,
-             indices: Vec<u32>,
-             material: Handle<StandardMaterial>,
-             parent: bevy::ecs::entity::Entity,
-             auto_loaded: bool,
-             is_collision: bool,
-             init_vis: Visibility,
-             meshes: &mut ResMut<Assets<Mesh>>| {
-                if positions.is_empty() || indices.is_empty() {
-                    return;
-                }
-                let mut mesh = Mesh::new(
-                    PrimitiveTopology::TriangleList,
-                    RenderAssetUsages::default(),
-                );
-                let n_positions = positions.len();
-                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-                mesh.insert_indices(Indices::U32(indices));
-                // Smooth normals: indexed meshes share vertices and
-                // can't host per-face normals; smooth shading reads
-                // fine on the coarse MZB walls.
-                mesh.compute_smooth_normals();
-                // Bake fake "sun lighting" into vertex colors using the
-                // computed normal's y component: faces pointing up =
-                // bright, faces pointing down = dim. The unlit material
-                // multiplies vertex color × base_color, so this gives us
-                // free shading at zero per-pixel cost. Cheap proxy for
-                // PBR lighting that runs at vertex-shader scale (`O(N)`
-                // baked-once, not `O(fragments)` per frame).
-                if let Some(normals) = mesh
-                    .attribute(Mesh::ATTRIBUTE_NORMAL)
-                    .and_then(|a| a.as_float3())
-                {
-                    let colors: Vec<[f32; 4]> = normals
-                        .iter()
-                        .map(|n| {
-                            // n.y in [-1, +1]. Up-facing → shade=1.0,
-                            // down-facing → shade=0.4. Linear lerp.
-                            let shade = 0.4 + 0.6 * (n[1] * 0.5 + 0.5);
-                            [shade, shade, shade, 1.0]
-                        })
-                        .collect();
-                    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-                }
-                let _ = n_positions;
-                let mut child = commands.spawn((
-                    MzbOverlay,
-                    Mesh3d(meshes.add(mesh)),
-                    MeshMaterial3d(material),
-                    Transform::IDENTITY,
-                    init_vis,
-                    ChildOf(parent),
-                ));
-                if is_collision {
-                    child.insert(MzbCollisionMesh);
-                } else {
-                    child.insert(MzbNonCollisionMesh);
-                }
-                if auto_loaded {
-                    child.insert(AutoMzbOverlay);
-                }
-            };
+        let spawn_merged = |commands: &mut Commands,
+                            positions: Vec<[f32; 3]>,
+                            indices: Vec<u32>,
+                            material: Handle<StandardMaterial>,
+                            parent: bevy::ecs::entity::Entity,
+                            auto_loaded: bool,
+                            is_collision: bool,
+                            init_vis: Visibility,
+                            meshes: &mut ResMut<Assets<Mesh>>| {
+            if positions.is_empty() || indices.is_empty() {
+                return;
+            }
+            let mut mesh = Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::default(),
+            );
+            let n_positions = positions.len();
+            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+            mesh.insert_indices(Indices::U32(indices));
+            // Smooth normals: indexed meshes share vertices and
+            // can't host per-face normals; smooth shading reads
+            // fine on the coarse MZB walls.
+            mesh.compute_smooth_normals();
+            // Bake fake "sun lighting" into vertex colors using the
+            // computed normal's y component: faces pointing up =
+            // bright, faces pointing down = dim. The unlit material
+            // multiplies vertex color × base_color, so this gives us
+            // free shading at zero per-pixel cost. Cheap proxy for
+            // PBR lighting that runs at vertex-shader scale (`O(N)`
+            // baked-once, not `O(fragments)` per frame).
+            if let Some(normals) = mesh
+                .attribute(Mesh::ATTRIBUTE_NORMAL)
+                .and_then(|a| a.as_float3())
+            {
+                let colors: Vec<[f32; 4]> = normals
+                    .iter()
+                    .map(|n| {
+                        // n.y in [-1, +1]. Up-facing → shade=1.0,
+                        // down-facing → shade=0.4. Linear lerp.
+                        let shade = 0.4 + 0.6 * (n[1] * 0.5 + 0.5);
+                        [shade, shade, shade, 1.0]
+                    })
+                    .collect();
+                mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+            }
+            let _ = n_positions;
+            let mut child = commands.spawn((
+                MzbOverlay,
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(material),
+                Transform::IDENTITY,
+                init_vis,
+                ChildOf(parent),
+            ));
+            if is_collision {
+                child.insert(MzbCollisionMesh);
+            } else {
+                child.insert(MzbNonCollisionMesh);
+            }
+            if auto_loaded {
+                child.insert(AutoMzbOverlay);
+            }
+        };
         // Capture merge stats before we move the buffers into spawn_merged.
         let collision_verts = collision_positions.len();
         let collision_tris = collision_indices.len() / 3;
@@ -880,7 +884,10 @@ pub fn process_load_mzb_requests(
                 }
                 push_system_msg(
                     &mut scene_state,
-                    format!("/load_mzb {}: queued {n} visual MMB placements", req.file_id),
+                    format!(
+                        "/load_mzb {}: queued {n} visual MMB placements",
+                        req.file_id
+                    ),
                 );
             }
             Err(msg) => {
@@ -979,10 +986,7 @@ pub fn cull_mzb_by_distance(
     // FFXI world origin (often hundreds of yalms from the player),
     // so without this filter the parent ends up Hidden and every
     // child inherits the same — entire zone disappears.
-    mut mzb_q: Query<
-        (&GlobalTransform, &mut Visibility),
-        (With<MzbOverlay>, With<Mesh3d>),
-    >,
+    mut mzb_q: Query<(&GlobalTransform, &mut Visibility), (With<MzbOverlay>, With<Mesh3d>)>,
 ) {
     let Ok(self_t) = self_q.single() else {
         return;
@@ -1022,10 +1026,7 @@ pub fn cull_mzb_by_distance(
 pub fn cull_entities_by_distance(
     draw: Res<DrawDistance>,
     self_q: Query<&GlobalTransform, With<IsSelf>>,
-    mut ent_q: Query<
-        (&WorldEntity, &GlobalTransform, &mut Visibility),
-        Without<IsSelf>,
-    >,
+    mut ent_q: Query<(&WorldEntity, &GlobalTransform, &mut Visibility), Without<IsSelf>>,
 ) {
     let Ok(self_t) = self_q.single() else {
         return;

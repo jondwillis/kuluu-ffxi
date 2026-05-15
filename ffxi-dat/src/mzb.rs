@@ -155,7 +155,12 @@ pub enum MzbError {
     #[error("MZB no mesh table found (all zero offsets in the first 64 bytes)")]
     NoMeshTable,
     #[error("MZB mesh record at {pos} has crossed offsets (verts={verts}, normals={normals}, tris={tris})")]
-    CrossedOffsets { pos: usize, verts: usize, normals: usize, tris: usize },
+    CrossedOffsets {
+        pos: usize,
+        verts: usize,
+        normals: usize,
+        tris: usize,
+    },
 }
 
 impl From<MzbError> for DatError {
@@ -176,13 +181,17 @@ impl From<MzbError> for DatError {
 /// on-disk encrypted blob.
 pub fn decrypt_in_place(data: &mut [u8]) -> Result<()> {
     if data.len() < 8 {
-        return Err(MzbError::TooSmall { needed: 8, actual: data.len() }.into());
+        return Err(MzbError::TooSmall {
+            needed: 8,
+            actual: data.len(),
+        }
+        .into());
     }
 
-    let decode_length = (u32::from_le_bytes([data[0], data[1], data[2], data[3]])
-        & 0x00FF_FFFF) as usize;
-    let node_count = (u32::from_le_bytes([data[4], data[5], data[6], data[7]])
-        & 0x00FF_FFFF) as usize;
+    let decode_length =
+        (u32::from_le_bytes([data[0], data[1], data[2], data[3]]) & 0x00FF_FFFF) as usize;
+    let node_count =
+        (u32::from_le_bytes([data[4], data[5], data[6], data[7]]) & 0x00FF_FFFF) as usize;
 
     // Pass 1: stride XOR
     if data[3] >= 0x1B {
@@ -254,13 +263,15 @@ impl MzbHeader {
     /// `data[3] < 0x1B`, which is plaintext on disk).
     pub fn parse(body: &[u8]) -> Result<Self> {
         if body.len() < 0x1C {
-            return Err(MzbError::TooSmall { needed: 0x1C, actual: body.len() }.into());
+            return Err(MzbError::TooSmall {
+                needed: 0x1C,
+                actual: body.len(),
+            }
+            .into());
         }
 
-        let decode_length =
-            u32::from_le_bytes([body[0], body[1], body[2], body[3]]) & 0x00FF_FFFF;
-        let node_count =
-            u32::from_le_bytes([body[4], body[5], body[6], body[7]]) & 0x00FF_FFFF;
+        let decode_length = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) & 0x00FF_FFFF;
+        let node_count = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) & 0x00FF_FFFF;
         let version = body[3];
         let key_index = body[7];
 
@@ -273,7 +284,10 @@ impl MzbHeader {
                 return Err(MzbError::NoMeshTable.into());
             }
             let v = u32::from_le_bytes([
-                body[probe], body[probe + 1], body[probe + 2], body[probe + 3],
+                body[probe],
+                body[probe + 1],
+                body[probe + 2],
+                body[probe + 3],
             ]);
             if v != 0 {
                 break v;
@@ -283,12 +297,9 @@ impl MzbHeader {
 
         let grid_width = body[0x0C];
         let grid_height = body[0x0D];
-        let quadtree_offset =
-            u32::from_le_bytes([body[0x10], body[0x11], body[0x12], body[0x13]]);
-        let maplist_offset =
-            u32::from_le_bytes([body[0x14], body[0x15], body[0x16], body[0x17]]);
-        let maplist_count =
-            u32::from_le_bytes([body[0x18], body[0x19], body[0x1A], body[0x1B]]);
+        let quadtree_offset = u32::from_le_bytes([body[0x10], body[0x11], body[0x12], body[0x13]]);
+        let maplist_offset = u32::from_le_bytes([body[0x14], body[0x15], body[0x16], body[0x17]]);
+        let maplist_count = u32::from_le_bytes([body[0x18], body[0x19], body[0x1A], body[0x1B]]);
 
         Ok(Self {
             decode_length,
@@ -346,16 +357,24 @@ pub struct MzbMesh {
 pub fn parse_meshes(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbMesh>> {
     let mt = header.mesh_table_offset as usize;
     if mt + 0x14 > body.len() {
-        return Err(MzbError::MeshTableOutOfRange { offset: mt, len: body.len() }.into());
+        return Err(MzbError::MeshTableOutOfRange {
+            offset: mt,
+            len: body.len(),
+        }
+        .into());
     }
 
-    let mesh_count = u32::from_le_bytes([body[mt], body[mt + 1], body[mt + 2], body[mt + 3]]) as usize;
-    let mesh_data_offset = u32::from_le_bytes([
-        body[mt + 4], body[mt + 5], body[mt + 6], body[mt + 7],
-    ]) as usize;
+    let mesh_count =
+        u32::from_le_bytes([body[mt], body[mt + 1], body[mt + 2], body[mt + 3]]) as usize;
+    let mesh_data_offset =
+        u32::from_le_bytes([body[mt + 4], body[mt + 5], body[mt + 6], body[mt + 7]]) as usize;
 
     if mesh_data_offset >= body.len() {
-        return Err(MzbError::MeshDataOutOfRange { offset: mesh_data_offset, len: body.len() }.into());
+        return Err(MzbError::MeshDataOutOfRange {
+            offset: mesh_data_offset,
+            len: body.len(),
+        }
+        .into());
     }
 
     // Each mesh record is 16 bytes of fixed fields. Stride between
@@ -375,7 +394,9 @@ pub fn parse_meshes(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbMesh>> {
         }
         let mesh = parse_one_mesh(body, pos)?;
         // Advance past this mesh's record header + its triangle block.
-        let tri_off = u32::from_le_bytes([body[pos + 8], body[pos + 9], body[pos + 10], body[pos + 11]]) as usize;
+        let tri_off =
+            u32::from_le_bytes([body[pos + 8], body[pos + 9], body[pos + 10], body[pos + 11]])
+                as usize;
         // See parse_one_mesh — tri_count is the low u16 of the i32 at +0x0c, flags is the high u16.
         let tri_count = u16::from_le_bytes([body[pos + 12], body[pos + 13]]) as usize;
         out.push(mesh);
@@ -390,12 +411,19 @@ pub fn parse_meshes(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbMesh>> {
 
 fn parse_one_mesh(body: &[u8], pos: usize) -> Result<MzbMesh> {
     if pos + 0x10 > body.len() {
-        return Err(MzbError::MeshDataOutOfRange { offset: pos, len: body.len() }.into());
+        return Err(MzbError::MeshDataOutOfRange {
+            offset: pos,
+            len: body.len(),
+        }
+        .into());
     }
 
-    let verts_off = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
-    let norms_off = u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]]) as usize;
-    let tris_off = u32::from_le_bytes([body[pos + 8], body[pos + 9], body[pos + 10], body[pos + 11]]) as usize;
+    let verts_off =
+        u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
+    let norms_off =
+        u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]]) as usize;
+    let tris_off =
+        u32::from_le_bytes([body[pos + 8], body[pos + 9], body[pos + 10], body[pos + 11]]) as usize;
     // The reference reads triangleCount as i32 at +0x0c and flags as i16 at +0x0e —
     // those fields overlap. Real triangle counts fit easily in a u16, so we treat
     // the low half as `tri_count` and the high half as `flags`.
@@ -403,10 +431,20 @@ fn parse_one_mesh(body: &[u8], pos: usize) -> Result<MzbMesh> {
     let flags = u16::from_le_bytes([body[pos + 14], body[pos + 15]]);
 
     if verts_off >= body.len() || norms_off >= body.len() || tris_off >= body.len() {
-        return Err(MzbError::MeshDataOutOfRange { offset: verts_off.max(norms_off).max(tris_off), len: body.len() }.into());
+        return Err(MzbError::MeshDataOutOfRange {
+            offset: verts_off.max(norms_off).max(tris_off),
+            len: body.len(),
+        }
+        .into());
     }
     if !(verts_off <= norms_off && norms_off <= tris_off) {
-        return Err(MzbError::CrossedOffsets { pos, verts: verts_off, normals: norms_off, tris: tris_off }.into());
+        return Err(MzbError::CrossedOffsets {
+            pos,
+            verts: verts_off,
+            normals: norms_off,
+            tris: tris_off,
+        }
+        .into());
     }
 
     let vert_count = (norms_off - verts_off) / 12;
@@ -457,7 +495,13 @@ fn parse_one_mesh(body: &[u8], pos: usize) -> Result<MzbMesh> {
         triangle_normals.push(n0 as u32);
     }
 
-    Ok(MzbMesh { vertices, normals, triangles, triangle_normals, flags })
+    Ok(MzbMesh {
+        vertices,
+        normals,
+        triangles,
+        triangle_normals,
+        flags,
+    })
 }
 
 /// Convenience: decrypt + parse header + parse all meshes.
@@ -540,11 +584,18 @@ pub fn parse_mesh_at(body: &[u8], offset: usize) -> Result<MzbMesh> {
 pub fn parse_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbPlacement>> {
     let mt = header.mesh_table_offset as usize;
     if mt + 0x14 > body.len() {
-        return Err(MzbError::MeshTableOutOfRange { offset: mt, len: body.len() }.into());
+        return Err(MzbError::MeshTableOutOfRange {
+            offset: mt,
+            len: body.len(),
+        }
+        .into());
     }
-    let grid_offset =
-        u32::from_le_bytes([body[mt + 0x10], body[mt + 0x11], body[mt + 0x12], body[mt + 0x13]])
-            as usize;
+    let grid_offset = u32::from_le_bytes([
+        body[mt + 0x10],
+        body[mt + 0x11],
+        body[mt + 0x12],
+        body[mt + 0x13],
+    ]) as usize;
     if grid_offset == 0 || grid_offset >= body.len() {
         return Ok(Vec::new());
     }
@@ -591,7 +642,8 @@ pub fn parse_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbPlacem
                 if cur + 4 > body.len() {
                     break;
                 }
-                let v = u32::from_le_bytes([body[cur], body[cur + 1], body[cur + 2], body[cur + 3]]);
+                let v =
+                    u32::from_le_bytes([body[cur], body[cur + 1], body[cur + 2], body[cur + 3]]);
                 if v == 0 {
                     break;
                 }
@@ -631,8 +683,7 @@ pub fn parse_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbPlacem
                 //   | m0 m4 m8  |
                 //   | m1 m5 m9  |
                 //   | m2 m6 m10 |
-                let det = m[0] * (m[5] * m[10] - m[9] * m[6])
-                    - m[4] * (m[1] * m[10] - m[9] * m[2])
+                let det = m[0] * (m[5] * m[10] - m[9] * m[6]) - m[4] * (m[1] * m[10] - m[9] * m[2])
                     + m[8] * (m[1] * m[6] - m[5] * m[2]);
 
                 // Read the geometry record's flags field
@@ -698,7 +749,11 @@ pub struct MmbPlacement {
 
 impl MmbPlacement {
     pub fn id_str(&self) -> &str {
-        let end = self.id.iter().position(|&b| b == 0).unwrap_or(self.id.len());
+        let end = self
+            .id
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.id.len());
         std::str::from_utf8(&self.id[..end]).unwrap_or("")
     }
 }
@@ -714,7 +769,11 @@ pub fn parse_mmb_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MmbPl
     }
     let table_end = 0x20usize.saturating_add(count.saturating_mul(100));
     if table_end > body.len() {
-        return Err(MzbError::MeshTableOutOfRange { offset: table_end, len: body.len() }.into());
+        return Err(MzbError::MeshTableOutOfRange {
+            offset: table_end,
+            len: body.len(),
+        }
+        .into());
     }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
@@ -753,7 +812,10 @@ pub fn resolve_mmb_index(
     zone_prefix: &str,
     mmb_asset_names: &[String],
 ) -> Option<usize> {
-    if let Some(i) = mmb_asset_names.iter().position(|n| n.trim_end() == placement_id) {
+    if let Some(i) = mmb_asset_names
+        .iter()
+        .position(|n| n.trim_end() == placement_id)
+    {
         return Some(i);
     }
     let mut prefixed = String::with_capacity(zone_prefix.len() + placement_id.len());
@@ -762,7 +824,10 @@ pub fn resolve_mmb_index(
     if prefixed.len() > 16 {
         prefixed.truncate(16);
     }
-    if let Some(i) = mmb_asset_names.iter().position(|n| n.trim_end() == prefixed) {
+    if let Some(i) = mmb_asset_names
+        .iter()
+        .position(|n| n.trim_end() == prefixed)
+    {
         return Some(i);
     }
     // Vendor-prefix tier. MMB asset_name is a 16-byte field structured
@@ -867,9 +932,9 @@ mod tests {
         buf[0x30..0x34].copy_from_slice(&0x40u32.to_le_bytes()); // verts_off
         buf[0x34..0x38].copy_from_slice(&0x70u32.to_le_bytes()); // norms_off
         buf[0x38..0x3C].copy_from_slice(&0x7Cu32.to_le_bytes()); // tris_off
-        // Note: the reference reads tri_count as i32 at +0x0C and flags as i16 at +0x0E,
-        // which overlap. To produce both `tri_count=2` (low 16 bits) and `flags=0` (high 16),
-        // we just write a u32=2 and the high half is 0.
+                                                                 // Note: the reference reads tri_count as i32 at +0x0C and flags as i16 at +0x0E,
+                                                                 // which overlap. To produce both `tri_count=2` (low 16 bits) and `flags=0` (high 16),
+                                                                 // we just write a u32=2 and the high half is 0.
         buf[0x3C..0x40].copy_from_slice(&2u32.to_le_bytes()); // tri_count=2, flags=0
 
         // Vertices @ 0x40: (0,0,0), (1,0,0), (0,1,0), (0,0,1)
@@ -893,10 +958,7 @@ mod tests {
 
         // Triangles @ 0x7C: [0,1,2,0] and [0,2,3,0]
         // Set the top bits to exercise the 0x3FFF mask: encode `0|0x4000` and ensure mask trims it.
-        let tris: [[u16; 4]; 2] = [
-            [0 | 0x4000, 1, 2, 0],
-            [0, 2, 3 | 0x8000, 0],
-        ];
+        let tris: [[u16; 4]; 2] = [[0 | 0x4000, 1, 2, 0], [0, 2, 3 | 0x8000, 0]];
         for (i, t) in tris.iter().enumerate() {
             let o = 0x7C + i * 8;
             for (j, &val) in t.iter().enumerate() {
@@ -942,11 +1004,19 @@ mod tests {
         assert_eq!(m.vertices[1].pos, [1.0, 0.0, 0.0]);
 
         // Triangle 0: [0 | 0x4000, 1, 2, 0] — top bit must be masked away.
-        assert_eq!(m.triangles[0], [0, 1, 2], "v0 high bit must be masked with 0x3FFF");
+        assert_eq!(
+            m.triangles[0],
+            [0, 1, 2],
+            "v0 high bit must be masked with 0x3FFF"
+        );
         assert_eq!(m.triangle_normals[0], 0);
 
         // Triangle 1: [0, 2, 3 | 0x8000, 0] — top bit must be masked away.
-        assert_eq!(m.triangles[1], [0, 2, 3], "v2 high bit must be masked with 0x3FFF");
+        assert_eq!(
+            m.triangles[1],
+            [0, 2, 3],
+            "v2 high bit must be masked with 0x3FFF"
+        );
     }
 
     #[test]
@@ -957,15 +1027,19 @@ mod tests {
         let mut buf = vec![0u8; 0x20 + 0x64];
         buf[0..4].copy_from_slice(&((0x10u32 << 24) | 0x20).to_le_bytes());
         buf[4..8].copy_from_slice(&1u32.to_le_bytes()); // node_count = 1
-        // mesh_table_offset = anything-but-zero so header parse later wouldn't choke
-        // (we won't call parse_meshes here, just verify the XOR mask landed).
+                                                        // mesh_table_offset = anything-but-zero so header parse later wouldn't choke
+                                                        // (we won't call parse_meshes here, just verify the XOR mask landed).
         buf[8..12].copy_from_slice(&0x20u32.to_le_bytes());
         for b in &mut buf[0x20..0x30] {
             *b = 0xAA;
         }
         decrypt_in_place(&mut buf).unwrap();
         for b in &buf[0x20..0x30] {
-            assert_eq!(*b, 0xAA ^ 0x55, "pass 2 should XOR first 16 bytes of each node with 0x55");
+            assert_eq!(
+                *b,
+                0xAA ^ 0x55,
+                "pass 2 should XOR first 16 bytes of each node with 0x55"
+            );
         }
         // Beyond the 16-byte head must be untouched.
         for b in &buf[0x30..0x20 + 0x64] {
@@ -997,7 +1071,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_change, "at least one key_index should produce a pass-1 XOR change");
+        assert!(
+            any_change,
+            "at least one key_index should produce a pass-1 XOR change"
+        );
     }
 
     /// Build a synthetic body with one mesh-library mesh, a 1x1 grid
@@ -1088,12 +1165,19 @@ mod tests {
         assert_eq!(h.grid_height, 1);
 
         let placements = parse_placements(&body, &h).unwrap();
-        assert_eq!(placements.len(), 1, "exactly one (mat,geo) pair in cell (0,0)");
+        assert_eq!(
+            placements.len(),
+            1,
+            "exactly one (mat,geo) pair in cell (0,0)"
+        );
         let p = placements[0];
         assert_eq!(p.geometry_offset, 0x40);
         assert_eq!(p.grid_x, 0);
         assert_eq!(p.grid_y, 0);
-        assert!(!p.flip_winding, "identity rotation has positive determinant");
+        assert!(
+            !p.flip_winding,
+            "identity rotation has positive determinant"
+        );
         // Translation column.
         assert_eq!(p.transform[12], 100.0);
         assert_eq!(p.transform[13], 200.0);
@@ -1126,7 +1210,10 @@ mod tests {
         let h = MzbHeader::parse(&body).unwrap();
         let placements = parse_placements(&body, &h).unwrap();
         assert_eq!(placements.len(), 1);
-        assert!(placements[0].flip_winding, "negative determinant should set flip_winding");
+        assert!(
+            placements[0].flip_winding,
+            "negative determinant should set flip_winding"
+        );
     }
 
     #[test]

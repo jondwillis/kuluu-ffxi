@@ -55,7 +55,10 @@ fn main() -> ExitCode {
     println!();
     println!("file_id        {file_id}");
     println!("rom_dir        {}", location.rom_dir);
-    println!("sub_path       dir={}  file={}", location.sub_path.dir, location.sub_path.file);
+    println!(
+        "sub_path       dir={}  file={}",
+        location.sub_path.dir, location.sub_path.file
+    );
     println!("resolved path  {}", path.display());
 
     match File::open(&path) {

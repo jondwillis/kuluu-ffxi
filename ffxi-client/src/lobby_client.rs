@@ -5,7 +5,7 @@
 //! Wire protocol mostly inferred from `server/src/login/data_session.cpp` and
 //! `view_session.cpp`. v1 covers the happy path only (no char create/delete).
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -144,7 +144,10 @@ impl LobbyHandle {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let handoff = read_lpkt_next_login(&mut self.view, char_id, &key3).await?;
-        tracing::debug!(server_port = handoff.server_port, "lobby: lpkt_next_login received");
+        tracing::debug!(
+            server_port = handoff.server_port,
+            "lobby: lpkt_next_login received"
+        );
         Ok(handoff)
     }
 }
@@ -173,7 +176,11 @@ impl LobbyClient {
         let mut data = self.connect(self.data_port).await?;
         tracing::debug!("lobby: data socket connected");
 
-        let register = ixff_header(IXFF_HEADER_SIZE as u32, VIEW_CMD_REGISTER, &auth.session_hash);
+        let register = ixff_header(
+            IXFF_HEADER_SIZE as u32,
+            VIEW_CMD_REGISTER,
+            &auth.session_hash,
+        );
         view.write_all(&register).await?;
         view.flush().await?;
         tracing::debug!("lobby: VIEW_CMD_REGISTER sent");
@@ -193,10 +200,16 @@ impl LobbyClient {
         let req_a1 = build_data_a1(auth.account_id, 0, &auth.session_hash);
         data.write_all(&req_a1).await?;
         data.flush().await?;
-        tracing::debug!(account_id = auth.account_id, "lobby: 0xA1 char-list request sent");
+        tracing::debug!(
+            account_id = auth.account_id,
+            "lobby: 0xA1 char-list request sent"
+        );
 
         let charlist = read_data_charlist(&mut data).await?;
-        tracing::debug!(count = charlist.characters.len(), "lobby: 0xA1 char-list received");
+        tracing::debug!(
+            count = charlist.characters.len(),
+            "lobby: 0xA1 char-list received"
+        );
         let slots = parse_view_chr_info2(&mut view).await?;
         // Drop empty slots (server marks them with status=0x01 and a leading
         // space byte in `character_name`, see view_session.cpp:222).
@@ -277,21 +290,35 @@ impl LobbyClient {
         tail_type: u8,
     ) -> Result<()> {
         let mut view = self.connect(self.view_port).await?;
-        let register = ixff_header(IXFF_HEADER_SIZE as u32, VIEW_CMD_REGISTER, &auth.session_hash);
+        let register = ixff_header(
+            IXFF_HEADER_SIZE as u32,
+            VIEW_CMD_REGISTER,
+            &auth.session_hash,
+        );
         view.write_all(&register).await?;
         view.flush().await?;
 
         // Drain the initial lpkt_chr_info2 push from the register
         drain_view_chr_info2(&mut view).await?;
 
-        let create = build_view_create(name, race, job, body_type, gender, face_type, tail_type, &auth.session_hash);
+        let create = build_view_create(
+            name,
+            race,
+            job,
+            body_type,
+            gender,
+            face_type,
+            tail_type,
+            &auth.session_hash,
+        );
         tracing::debug!(payload_size = create.len(), "sending create packet");
         view.write_all(&create).await?;
         view.flush().await?;
 
         // Server responds with a size-prefixed packet
         let mut size_bytes = [0u8; 4];
-        view.read_exact(&mut size_bytes).await
+        view.read_exact(&mut size_bytes)
+            .await
             .context("reading create response size")?;
         let size = u32::from_le_bytes(size_bytes) as usize;
         tracing::debug!(response_size = size, "received create response size");
@@ -299,7 +326,8 @@ impl LobbyClient {
             bail!("implausible create response size {size}");
         }
         let mut body = vec![0u8; size - 4];
-        view.read_exact(&mut body).await
+        view.read_exact(&mut body)
+            .await
             .context("reading create response body")?;
         tracing::debug!(response_len = body.len(), "received create response");
         Ok(())
@@ -502,8 +530,7 @@ async fn parse_view_chr_info2(stream: &mut TcpStream) -> Result<Vec<CharSlot>> {
             .enumerate()
             .map(|(i, chunk)| {
                 let off = i * 16;
-                let bytes: String =
-                    chunk.iter().map(|b| format!("{b:02x} ")).collect();
+                let bytes: String = chunk.iter().map(|b| format!("{b:02x} ")).collect();
                 format!("  {off:04x}: {bytes}")
             })
             .collect::<Vec<_>>()
@@ -557,9 +584,7 @@ async fn read_lpkt_next_login(
 
     let resp_char_id = u32::from_le_bytes(buf[28..32].try_into().unwrap());
     if resp_char_id != char_id {
-        bail!(
-            "lpkt_next_login char_id {resp_char_id:#x} != requested {char_id:#x}"
-        );
+        bail!("lpkt_next_login char_id {resp_char_id:#x} != requested {char_id:#x}");
     }
 
     let name_bytes = &buf[36..52];

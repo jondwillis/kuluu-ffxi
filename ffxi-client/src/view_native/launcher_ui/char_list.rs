@@ -129,10 +129,7 @@ pub(super) fn spawn_char_list_ui(
         });
 }
 
-pub(super) fn despawn_char_list_ui(
-    mut commands: Commands,
-    q: Query<Entity, With<CharListRoot>>,
-) {
+pub(super) fn despawn_char_list_ui(mut commands: Commands, q: Query<Entity, With<CharListRoot>>) {
     for e in q.iter() {
         commands.entity(e).despawn();
     }

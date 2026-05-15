@@ -31,7 +31,11 @@ fn fetch_east_ronfaure() {
     let path = ffxi_nav_recast::fetch(102)
         .expect("fetch returned Err")
         .expect("expected a navmesh for zone 102");
-    assert!(path.file_name().unwrap().to_string_lossy().ends_with(".nav"));
+    assert!(path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .ends_with(".nav"));
     let meta = fs::metadata(&path).unwrap();
     assert!(meta.len() > 1024);
 }

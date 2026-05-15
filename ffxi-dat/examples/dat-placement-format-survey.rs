@@ -24,8 +24,12 @@ fn main() {
     let root = DatRoot::from_env().unwrap();
 
     for file_id in start..=end {
-        let Ok(loc) = root.resolve(file_id) else { continue };
-        let Ok(bytes) = fs::read(loc.path_under(root.root())) else { continue };
+        let Ok(loc) = root.resolve(file_id) else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(loc.path_under(root.root())) else {
+            continue;
+        };
         let chunks: Vec<_> = walk(&bytes).filter_map(Result::ok).collect();
         if chunks.is_empty() {
             continue;
@@ -55,9 +59,15 @@ fn main() {
         }
         let prefix = mzb::infer_zone_prefix(&mmb_names);
 
-        let Ok(plain) = mzb::decrypt(mzb_chunk.data) else { continue };
-        let Ok(header) = mzb::MzbHeader::parse(&plain) else { continue };
-        let Ok(placements) = mzb::parse_mmb_placements(&plain, &header) else { continue };
+        let Ok(plain) = mzb::decrypt(mzb_chunk.data) else {
+            continue;
+        };
+        let Ok(header) = mzb::MzbHeader::parse(&plain) else {
+            continue;
+        };
+        let Ok(placements) = mzb::parse_mmb_placements(&plain, &header) else {
+            continue;
+        };
 
         let mut hits = 0;
         for p in &placements {

@@ -151,9 +151,27 @@ pub fn look_to_wire(l: ffxi_proto::decode::LookData) -> wire::EntityLook {
     match l {
         LookData::Standard { modelid } => wire::EntityLook::Standard { modelid },
         LookData::Equipped {
-            face, race, head, body, hands, legs, feet, main, sub, ranged,
+            face,
+            race,
+            head,
+            body,
+            hands,
+            legs,
+            feet,
+            main,
+            sub,
+            ranged,
         } => wire::EntityLook::Equipped {
-            face, race, head, body, hands, legs, feet, main, sub, ranged,
+            face,
+            race,
+            head,
+            body,
+            hands,
+            legs,
+            feet,
+            main,
+            sub,
+            ranged,
         },
         LookData::Door { size } => wire::EntityLook::Door { size },
         LookData::Transport { size } => wire::EntityLook::Transport { size },
@@ -262,18 +280,38 @@ pub fn blowfish_to_wire(b: BlowfishStatus) -> wire::BlowfishStatus {
 pub fn goal_to_wire(g: &ReactorGoalSnapshot) -> wire::ReactorGoal {
     match *g {
         ReactorGoalSnapshot::Idle => wire::ReactorGoal::Idle,
-        ReactorGoalSnapshot::Following { target_id, distance } => {
-            wire::ReactorGoal::Following { target_id, distance }
-        }
-        ReactorGoalSnapshot::Engaged { target_id, attack_issued } => {
-            wire::ReactorGoal::Engaged { target_id, attack_issued }
-        }
-        ReactorGoalSnapshot::Pathing { x, y, z, waypoints_remaining } => {
-            wire::ReactorGoal::Pathing { x, y, z, waypoints_remaining }
-        }
-        ReactorGoalSnapshot::Banking { threshold, mog_house_zoneline } => {
-            wire::ReactorGoal::Banking { threshold, mog_house_zoneline }
-        }
+        ReactorGoalSnapshot::Following {
+            target_id,
+            distance,
+        } => wire::ReactorGoal::Following {
+            target_id,
+            distance,
+        },
+        ReactorGoalSnapshot::Engaged {
+            target_id,
+            attack_issued,
+        } => wire::ReactorGoal::Engaged {
+            target_id,
+            attack_issued,
+        },
+        ReactorGoalSnapshot::Pathing {
+            x,
+            y,
+            z,
+            waypoints_remaining,
+        } => wire::ReactorGoal::Pathing {
+            x,
+            y,
+            z,
+            waypoints_remaining,
+        },
+        ReactorGoalSnapshot::Banking {
+            threshold,
+            mog_house_zoneline,
+        } => wire::ReactorGoal::Banking {
+            threshold,
+            mog_house_zoneline,
+        },
     }
 }
 
@@ -317,11 +355,17 @@ mod tests {
                 matches_idle as fn(&wire::ReactorGoal) -> bool,
             ),
             (
-                ReactorGoalSnapshot::Following { target_id: 0x42, distance: 3.0 },
+                ReactorGoalSnapshot::Following {
+                    target_id: 0x42,
+                    distance: 3.0,
+                },
                 matches_following,
             ),
             (
-                ReactorGoalSnapshot::Engaged { target_id: 0x99, attack_issued: true },
+                ReactorGoalSnapshot::Engaged {
+                    target_id: 0x99,
+                    attack_issued: true,
+                },
                 matches_engaged,
             ),
             (
@@ -356,12 +400,20 @@ mod tests {
     fn matches_engaged(w: &wire::ReactorGoal) -> bool {
         matches!(
             w,
-            wire::ReactorGoal::Engaged { target_id: 0x99, attack_issued: true }
+            wire::ReactorGoal::Engaged {
+                target_id: 0x99,
+                attack_issued: true
+            }
         )
     }
     fn matches_pathing(w: &wire::ReactorGoal) -> bool {
         match w {
-            wire::ReactorGoal::Pathing { x, y, z, waypoints_remaining } => {
+            wire::ReactorGoal::Pathing {
+                x,
+                y,
+                z,
+                waypoints_remaining,
+            } => {
                 (*x - 1.0).abs() < f32::EPSILON
                     && (*y - 2.0).abs() < f32::EPSILON
                     && (*z - 3.0).abs() < f32::EPSILON
@@ -373,13 +425,19 @@ mod tests {
     fn matches_banking(w: &wire::ReactorGoal) -> bool {
         matches!(
             w,
-            wire::ReactorGoal::Banking { threshold: 60, mog_house_zoneline: 0xDEAD }
+            wire::ReactorGoal::Banking {
+                threshold: 60,
+                mog_house_zoneline: 0xDEAD
+            }
         )
     }
 
     #[test]
     fn reconnect_to_wire_passes_through() {
-        let r = ReconnectInfo { downtime_ms: 1234, at_unix_ms: 1_700_000_001_000 };
+        let r = ReconnectInfo {
+            downtime_ms: 1234,
+            at_unix_ms: 1_700_000_001_000,
+        };
         let w = reconnect_to_wire(&r);
         assert_eq!(w.downtime_ms, 1234);
         assert_eq!(w.at_unix_ms, 1_700_000_001_000);
@@ -388,7 +446,9 @@ mod tests {
     #[test]
     fn decision_to_wire_covers_both_kinds() {
         let nf = LlmDecision {
-            kind: LlmDecisionKind::NotificationFired { uri: "scene://current".into() },
+            kind: LlmDecisionKind::NotificationFired {
+                uri: "scene://current".into(),
+            },
             latency_us: 412,
             at_monotonic_ms: 1000,
         };
@@ -403,7 +463,9 @@ mod tests {
         }
 
         let td = LlmDecision {
-            kind: LlmDecisionKind::ToolDispatched { tool: "engage".into() },
+            kind: LlmDecisionKind::ToolDispatched {
+                tool: "engage".into(),
+            },
             latency_us: 25_000,
             at_monotonic_ms: 1_100,
         };
@@ -430,12 +492,16 @@ mod tests {
         });
         s.recent_decisions = VecDeque::from(vec![
             LlmDecision {
-                kind: LlmDecisionKind::NotificationFired { uri: "scene://current".into() },
+                kind: LlmDecisionKind::NotificationFired {
+                    uri: "scene://current".into(),
+                },
                 latency_us: 200,
                 at_monotonic_ms: 100,
             },
             LlmDecision {
-                kind: LlmDecisionKind::ToolDispatched { tool: "engage".into() },
+                kind: LlmDecisionKind::ToolDispatched {
+                    tool: "engage".into(),
+                },
                 latency_us: 25_000,
                 at_monotonic_ms: 200,
             },
@@ -447,7 +513,10 @@ mod tests {
 
         // Goal mirror.
         match snap.current_goal {
-            Some(wire::ReactorGoal::Engaged { target_id, attack_issued }) => {
+            Some(wire::ReactorGoal::Engaged {
+                target_id,
+                attack_issued,
+            }) => {
                 assert_eq!(target_id, 0xCAFE);
                 assert!(attack_issued);
             }

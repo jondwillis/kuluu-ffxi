@@ -184,10 +184,9 @@ fn stage_label(stage: Stage) -> &'static str {
 fn stage_color(stage: Stage) -> Color {
     match stage {
         Stage::Idle => palette::STAGE_IDLE,
-        Stage::Authenticating
-        | Stage::LobbyHandshake
-        | Stage::MapBootstrap
-        | Stage::Zoning => palette::STAGE_TRANSITIONING,
+        Stage::Authenticating | Stage::LobbyHandshake | Stage::MapBootstrap | Stage::Zoning => {
+            palette::STAGE_TRANSITIONING
+        }
         Stage::InZone => palette::STAGE_GOOD,
         Stage::Disconnected => palette::STAGE_BAD,
     }

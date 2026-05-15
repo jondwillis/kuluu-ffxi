@@ -46,7 +46,11 @@ use tokio::time::timeout;
 fn ffxi_mcp_bin() -> PathBuf {
     let mut p = std::env::current_exe().expect("current_exe");
     p.pop();
-    p.push(if cfg!(windows) { "ffxi-mcp.exe" } else { "ffxi-mcp" });
+    p.push(if cfg!(windows) {
+        "ffxi-mcp.exe"
+    } else {
+        "ffxi-mcp"
+    });
     p
 }
 
@@ -79,8 +83,7 @@ impl Mcp {
         if n == 0 {
             return Err(anyhow!("ffxi-mcp closed stdout"));
         }
-        serde_json::from_str(buf.trim())
-            .with_context(|| format!("parse JSON-RPC frame: {buf:?}"))
+        serde_json::from_str(buf.trim()).with_context(|| format!("parse JSON-RPC frame: {buf:?}"))
     }
 
     /// Send a request and read frames until we see the matching id.
@@ -248,13 +251,14 @@ async fn main() -> Result<()> {
             Ok(Parsed::Help) => print_help(),
             Ok(Parsed::List) => match mcp.request("tools/list", json!({})).await {
                 Ok(v) => {
-                    let arr = v.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+                    let arr = v
+                        .get("tools")
+                        .and_then(|t| t.as_array())
+                        .cloned()
+                        .unwrap_or_default();
                     for t in arr {
                         let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-                        let desc = t
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("");
+                        let desc = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
                         println!("{name}\t{desc}");
                     }
                 }
@@ -334,4 +338,3 @@ mod tests {
         assert!(parse_line("follow target_id").is_err());
     }
 }
-

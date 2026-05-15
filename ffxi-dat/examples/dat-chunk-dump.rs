@@ -40,7 +40,13 @@ fn main() -> ExitCode {
         let hex: Vec<String> = line.iter().map(|b| format!("{:02x}", b)).collect();
         let ascii: String = line
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         println!("  {:06x}  {:<48}  {}", off, hex.join(" "), ascii);
     }

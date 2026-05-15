@@ -110,7 +110,11 @@ pub fn update_shop_panel_system(
     }
 
     if let Ok(mut text) = header_q.single_mut() {
-        let want = format!("Shop  ({} items)  offset={}", shop.items.len(), shop.offset_index);
+        let want = format!(
+            "Shop  ({} items)  offset={}",
+            shop.items.len(),
+            shop.offset_index
+        );
         if **text != want {
             **text = want;
         }
@@ -179,7 +183,9 @@ mod tests {
 
     #[test]
     fn long_lists_get_tail_elision() {
-        let items: Vec<ShopItem> = (0..20).map(|i| item(i as u8, 1000 + i as u16, 100)).collect();
+        let items: Vec<ShopItem> = (0..20)
+            .map(|i| item(i as u8, 1000 + i as u16, 100))
+            .collect();
         let rows = format_rows(&items);
         assert!(rows.contains("+4 more"));
     }

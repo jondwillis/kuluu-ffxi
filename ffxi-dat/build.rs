@@ -25,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 const D_MS_CS: &str = "../vendor/ffxi-navmesh-builder/d_ms.cs";
 const ZONE_SETTINGS_SQL: &str = "../vendor/server/sql/zone_settings.sql";
@@ -168,10 +168,13 @@ fn parse_zone_ids(path: &Path) -> Result<Vec<u16>> {
         let Some(first_comma) = rest.find(',') else {
             bail!("zone_settings.sql line {}: no comma after id", lineno + 1);
         };
-        let zid: u16 = rest[..first_comma]
-            .trim()
-            .parse()
-            .with_context(|| format!("zone_settings.sql line {}: bad id `{}`", lineno + 1, &rest[..first_comma]))?;
+        let zid: u16 = rest[..first_comma].trim().parse().with_context(|| {
+            format!(
+                "zone_settings.sql line {}: bad id `{}`",
+                lineno + 1,
+                &rest[..first_comma]
+            )
+        })?;
         if zid == 0 {
             // Demo / unknown zone has no client-side mesh.
             continue;
@@ -179,7 +182,10 @@ fn parse_zone_ids(path: &Path) -> Result<Vec<u16>> {
         out.push(zid);
     }
     if out.is_empty() {
-        bail!("parsed zero rows from {} — schema may have changed", path.display());
+        bail!(
+            "parsed zero rows from {} — schema may have changed",
+            path.display()
+        );
     }
     Ok(out)
 }

@@ -50,8 +50,14 @@ fn main() {
     };
 
     let out_path = match mode.as_str() {
-        "fs" => args.get(2).cloned().unwrap_or_else(|| "/tmp/mmb_index.json".to_string()),
-        _ => args.get(4).cloned().unwrap_or_else(|| "/tmp/mmb_index.json".to_string()),
+        "fs" => args
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| "/tmp/mmb_index.json".to_string()),
+        _ => args
+            .get(4)
+            .cloned()
+            .unwrap_or_else(|| "/tmp/mmb_index.json".to_string()),
     };
 
     let unique_names = index.len();
@@ -152,8 +158,12 @@ fn scan_ids(root: &DatRoot, start: u32, end: u32, t0: &Instant) -> (IndexMap, u6
                 t0.elapsed().as_secs_f32()
             );
         }
-        let Ok(loc) = root.resolve(file_id) else { continue };
-        let Ok(bytes) = fs::read(loc.path_under(root.root())) else { continue };
+        let Ok(loc) = root.resolve(file_id) else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(loc.path_under(root.root())) else {
+            continue;
+        };
         files_scanned += 1;
         let (had_mmb, added) = process_file(&bytes, file_id, &mut index);
         if had_mmb {
@@ -197,7 +207,9 @@ fn scan_fs(root: &DatRoot, t0: &Instant) -> (IndexMap, u64, u64, u64) {
         } else {
             rom_dir.trim_start_matches("ROM").parse().unwrap_or(0)
         };
-        let Ok(dirs) = fs::read_dir(&rom_path) else { continue };
+        let Ok(dirs) = fs::read_dir(&rom_path) else {
+            continue;
+        };
         for entry in dirs.flatten() {
             let dir_path = entry.path();
             if !dir_path.is_dir() {
@@ -210,7 +222,9 @@ fn scan_fs(root: &DatRoot, t0: &Instant) -> (IndexMap, u64, u64, u64) {
             else {
                 continue;
             };
-            let Ok(files) = fs::read_dir(&dir_path) else { continue };
+            let Ok(files) = fs::read_dir(&dir_path) else {
+                continue;
+            };
             for fe in files.flatten() {
                 let fp = fe.path();
                 if fp.extension().and_then(|e| e.to_str()) != Some("DAT") {
@@ -226,8 +240,7 @@ fn scan_fs(root: &DatRoot, t0: &Instant) -> (IndexMap, u64, u64, u64) {
                 // Pack (rom_idx << 24) | (dir_num << 12) | file_num as a
                 // synthetic 32-bit identifier. dir_num<512 fits in 9 bits;
                 // file_num<128 fits in 7 bits; rom_idx<32 fits in 5 bits.
-                let synth_id =
-                    (rom_idx << 24) | ((dir_num & 0xFFF) << 12) | (file_num & 0xFFF);
+                let synth_id = (rom_idx << 24) | ((dir_num & 0xFFF) << 12) | (file_num & 0xFFF);
                 let Ok(bytes) = fs::read(&fp) else { continue };
                 files_scanned += 1;
                 let (had_mmb, added) = process_file(&bytes, synth_id, &mut index);

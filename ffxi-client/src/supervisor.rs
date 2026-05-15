@@ -26,10 +26,10 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::goal_store::{GoalStore, is_persistable_goal};
+use crate::goal_store::{is_persistable_goal, GoalStore};
 use crate::reactor::{self, ReactorConfig};
 use crate::session;
 use crate::state::{AgentCommand, AgentEvent};

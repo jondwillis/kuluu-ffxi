@@ -99,7 +99,10 @@ fn main() -> ExitCode {
     println!();
     println!("sample unmatched placements:");
     for (n, t) in &sample_unmatched {
-        println!("  name={:?}  trans=({:>8.2},{:>8.2},{:>8.2})", n, t[0], t[1], t[2]);
+        println!(
+            "  name={:?}  trans=({:>8.2},{:>8.2},{:>8.2})",
+            n, t[0], t[1], t[2]
+        );
     }
 
     println!();

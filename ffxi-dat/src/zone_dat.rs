@@ -86,7 +86,10 @@ mod tests {
         let any_high = ZONE_DAT_TABLE
             .iter()
             .any(|(z, f)| *z >= 256 && *f as u32 == *z as u32 + 83635);
-        assert!(any_high, "no zone_id >= 256 found applying the high-branch formula");
+        assert!(
+            any_high,
+            "no zone_id >= 256 found applying the high-branch formula"
+        );
     }
 
     /// Sanity: table is sorted (binary_search relies on this).

@@ -182,10 +182,13 @@ mod tests {
             .unwrap();
         let mut reader = BufReader::new(peer_reader);
         let mut buf = String::new();
-        tokio::time::timeout(std::time::Duration::from_secs(1), reader.read_line(&mut buf))
-            .await
-            .expect("read_line timed out")
-            .expect("read_line io");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_line(&mut buf),
+        )
+        .await
+        .expect("read_line timed out")
+        .expect("read_line io");
         let ev: AgentEvent = serde_json::from_str(buf.trim()).expect("decode event");
         match ev {
             AgentEvent::Error { message } => assert_eq!(message, "smoke"),
@@ -266,10 +269,13 @@ mod tests {
 
         let mut reader = BufReader::new(peer_reader);
         let mut buf = String::new();
-        tokio::time::timeout(std::time::Duration::from_secs(1), reader.read_line(&mut buf))
-            .await
-            .expect("read_line timed out")
-            .expect("read_line io");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_line(&mut buf),
+        )
+        .await
+        .expect("read_line timed out")
+        .expect("read_line io");
         let ev: AgentEvent = serde_json::from_str(buf.trim()).expect("decode event");
         match ev {
             AgentEvent::Error { message } => {

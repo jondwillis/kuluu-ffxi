@@ -124,10 +124,10 @@ impl Plugin for DatOverlayPlugin {
                     crate::dat_mzb::apply_zone_geom_visibility,
                 ),
             );
-            // Phase 1 `cull_mzb_by_distance` was removed: Phase 3 merged
-            // everything into two entities anchored at world origin, so
-            // the per-entity distance check would hide the whole zone
-            // once the player walks >80 yalms from origin.
+        // Phase 1 `cull_mzb_by_distance` was removed: Phase 3 merged
+        // everything into two entities anchored at world origin, so
+        // the per-entity distance check would hide the whole zone
+        // once the player walks >80 yalms from origin.
     }
 }
 
@@ -172,8 +172,8 @@ pub struct LoadedMmb {
 /// them. The underlying `ffxi_dat::DatError` already implements
 /// `Display`, so the formatter does the work.
 pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
-    let root = DatRoot::from_env_or_default()
-        .map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
+    let root =
+        DatRoot::from_env_or_default().map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
     let location = root
         .resolve(file_id)
         .map_err(|e| format!("resolve({file_id}): {e}"))?;
@@ -181,9 +181,12 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
     let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
 
     let chunks: Vec<_> = walk(&bytes).filter_map(Result::ok).collect();
-    let chunk = chunks
-        .get(chunk_idx)
-        .ok_or_else(|| format!("file has {} chunks, idx {chunk_idx} out of range", chunks.len()))?;
+    let chunk = chunks.get(chunk_idx).ok_or_else(|| {
+        format!(
+            "file has {} chunks, idx {chunk_idx} out of range",
+            chunks.len()
+        )
+    })?;
     if ChunkKind::from_u8(chunk.kind) != Some(ChunkKind::Mmb) {
         return Err(format!(
             "chunk {chunk_idx} kind={:#x} ({:?}), not an MMB",
@@ -225,7 +228,9 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
         // Skip sub-records whose body can't fit a 36-byte vertex stride
         // for the declared count, or whose strip yields no triangles
         // after restart/winding decode.
-        let Some(verts) = sub.parse_vertices() else { continue };
+        let Some(verts) = sub.parse_vertices() else {
+            continue;
+        };
         let tris = sub.parse_triangle_list();
         if tris.is_empty() {
             continue;
@@ -335,7 +340,10 @@ pub fn process_load_mmb_requests(
     // shared across all MMBs from that file).
     let mut tex_pools: std::collections::HashMap<
         u32,
-        (std::collections::HashMap<String, Handle<Image>>, Option<Handle<Image>>),
+        (
+            std::collections::HashMap<String, Handle<Image>>,
+            Option<Handle<Image>>,
+        ),
     > = std::collections::HashMap::new();
 
     for req in queued {
@@ -433,7 +441,10 @@ pub fn process_load_mmb_requests(
 
         let n_subs = loaded.submeshes.len();
         for sub in loaded.submeshes.iter() {
-            let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+            let mut mesh = Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::default(),
+            );
             mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, sub.positions.clone());
             mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, sub.normals.clone());
             mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, sub.uvs.clone());

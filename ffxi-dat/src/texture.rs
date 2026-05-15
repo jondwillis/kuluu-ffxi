@@ -98,7 +98,13 @@ pub fn extract_texture_name(body: &[u8]) -> Option<String> {
     let raw = &body[9..0x11];
     let s: String = raw
         .iter()
-        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '\0' })
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '\0'
+            }
+        })
         .take_while(|&c| c != '\0')
         .collect();
     Some(s.trim().to_string())
@@ -201,7 +207,12 @@ fn decode_imginfo_a1(body: &[u8]) -> std::result::Result<DecodedTexture, Texture
         TexFormat::Bgra32 => decode_bgra_raw(pixels, width, height)?,
         TexFormat::Argb32 => decode_argb_raw(pixels, width, height)?,
     };
-    Ok(DecodedTexture { width, height, format_tag: fmt, rgba })
+    Ok(DecodedTexture {
+        width,
+        height,
+        format_tag: fmt,
+        rgba,
+    })
 }
 
 /// Palette-based IMG (flg=0x01/0x81/0x91 with header_size=0x439,
@@ -545,8 +556,8 @@ mod tests {
     fn dxt1_red_blue_block() -> [u8; 8] {
         let c0: u16 = 0xF800; // pure red
         let c1: u16 = 0x001F; // pure blue
-        // Indices: 16 × 2 bits. Pixel 0 (top-left) = 0 (=c0). Pixel 1
-        // (top-left + 1 col) = 1 (=c1). Rest = 0.
+                              // Indices: 16 × 2 bits. Pixel 0 (top-left) = 0 (=c0). Pixel 1
+                              // (top-left + 1 col) = 1 (=c1). Rest = 0.
         let indices: u32 = 0b01 << 2; // pixel 0 = 00, pixel 1 = 01
         let mut block = [0u8; 8];
         block[0..2].copy_from_slice(&c0.to_le_bytes());
@@ -594,9 +605,9 @@ mod tests {
         // Both expand by replication: 0x00 and 0xFF.
         let mut block = [0u8; 16];
         block[0] = 0xF0; // pixel 0 alpha = 0, pixel 1 alpha = 15
-                        // Bytes 1..8 = zero → pixels 2..15 alpha = 0.
-                        // Color block (bytes 8..16): c0 = pure red, c1 = pure blue,
-                        // all indices = 0 → every pixel is red.
+                         // Bytes 1..8 = zero → pixels 2..15 alpha = 0.
+                         // Color block (bytes 8..16): c0 = pure red, c1 = pure blue,
+                         // all indices = 0 → every pixel is red.
         let c0: u16 = 0xF800;
         let c1: u16 = 0x001F;
         block[8..10].copy_from_slice(&c0.to_le_bytes());

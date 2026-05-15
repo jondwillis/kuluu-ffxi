@@ -125,16 +125,20 @@ pub fn spawn_chat_panel(mut commands: Commands) {
     // Social panel: bottom-left, 50% width.
     spawn_panel(&mut commands, ChatKind::Social, Val::Px(0.0), None);
     // Battle panel: bottom-right, 48% width with a 2% gap.
-    spawn_panel(&mut commands, ChatKind::Battle, Val::Percent(52.0), Some(Val::Px(0.0)));
+    spawn_panel(
+        &mut commands,
+        ChatKind::Battle,
+        Val::Percent(52.0),
+        Some(Val::Px(0.0)),
+    );
 }
 
-fn spawn_panel(
-    commands: &mut Commands,
-    kind: ChatKind,
-    left: Val,
-    right: Option<Val>,
-) {
-    let width = if right.is_some() { Val::Percent(48.0) } else { Val::Percent(50.0) };
+fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, right: Option<Val>) {
+    let width = if right.is_some() {
+        Val::Percent(48.0)
+    } else {
+        Val::Percent(50.0)
+    };
     commands
         .spawn((
             ChatPanel { kind },
@@ -273,7 +277,11 @@ pub fn update_chat_panel(
             }
             ChatKind::Battle => scroll_offset != 0,
         };
-        let want_border = if focused { palette::ACCENT } else { palette::BORDER };
+        let want_border = if focused {
+            palette::ACCENT
+        } else {
+            palette::BORDER
+        };
         if border.left != want_border {
             *border = BorderColor::all(want_border);
         }
@@ -533,7 +541,11 @@ mod tests {
             "Welcome to Vana'diel."
         );
         assert_eq!(
-            format_chat_line(ChatChannel::Battle, "ignored", "Daisy hits the Mandragora for 12 points of damage."),
+            format_chat_line(
+                ChatChannel::Battle,
+                "ignored",
+                "Daisy hits the Mandragora for 12 points of damage."
+            ),
             "Daisy hits the Mandragora for 12 points of damage."
         );
     }

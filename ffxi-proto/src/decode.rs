@@ -1045,7 +1045,12 @@ mod tests {
         buf[0x2C..0x2E].copy_from_slice(&1u16.to_le_bytes()); // size = MODEL_EQUIPPED
         buf[0x2E] = 0x07; // face
         buf[0x2F] = 0x03; // race
-        for (i, v) in [0xA001u16, 0xA002, 0xA003, 0xA004, 0xA005, 0xA006, 0xA007, 0xA008].iter().enumerate() {
+        for (i, v) in [
+            0xA001u16, 0xA002, 0xA003, 0xA004, 0xA005, 0xA006, 0xA007, 0xA008,
+        ]
+        .iter()
+        .enumerate()
+        {
             buf[0x30 + 2 * i..0x32 + 2 * i].copy_from_slice(&v.to_le_bytes());
         }
         assert_eq!(
@@ -1347,8 +1352,8 @@ mod tests {
         buf[4..8].copy_from_slice(&2000u32.to_le_bytes()); // Hp
         buf[8..12].copy_from_slice(&100u32.to_le_bytes()); // Mp
         buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // Tp
-        // GAttr bitfield: PartyNo:2 (=1), PartyLeaderFlg:1 (=1), AllianceLeaderFlg:1 (=0)
-        // → low 4 bits = 0b0101 = 5
+                                                          // GAttr bitfield: PartyNo:2 (=1), PartyLeaderFlg:1 (=1), AllianceLeaderFlg:1 (=0)
+                                                          // → low 4 bits = 0b0101 = 5
         buf[16..20].copy_from_slice(&0x0000_0005u32.to_le_bytes());
         buf[20..22].copy_from_slice(&0x0007u16.to_le_bytes()); // ActIndex
         buf[22] = 1; // MemberNumber
@@ -1399,10 +1404,19 @@ mod tests {
         buf[wide_off..wide_off + 2].copy_from_slice(&81u16.to_le_bytes());
 
         let m = ItemMax::decode(&buf).unwrap();
-        assert_eq!(m.capacities[0], 80, "Inventory: legacy fallback, +1 inverted");
-        assert_eq!(m.capacities[1], 200, "Mog Safe: wide takes precedence, +1 inverted");
+        assert_eq!(
+            m.capacities[0], 80,
+            "Inventory: legacy fallback, +1 inverted"
+        );
+        assert_eq!(
+            m.capacities[1], 200,
+            "Mog Safe: wide takes precedence, +1 inverted"
+        );
         assert_eq!(m.capacities[10], 80, "Wardrobe2: wide-only, +1 inverted");
-        assert_eq!(m.capacities[17], 0, "Recycle Bin: zeroed (disabled sentinel)");
+        assert_eq!(
+            m.capacities[17], 0,
+            "Recycle Bin: zeroed (disabled sentinel)"
+        );
     }
 
     #[test]
@@ -1419,7 +1433,10 @@ mod tests {
         // underflow.)
         let m = ItemMax::decode(&buf).unwrap();
         assert_eq!(m.capacities[4], 20, "moglocker: legacy decoded with -1");
-        assert_eq!(m.capacities[1], 0, "fully-disabled stays at 0, no underflow");
+        assert_eq!(
+            m.capacities[1], 0,
+            "fully-disabled stays at 0, no underflow"
+        );
     }
 
     #[test]

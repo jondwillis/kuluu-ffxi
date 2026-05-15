@@ -6,9 +6,9 @@
 //! [`heading_for_yaw`] so the player walks in the direction the camera looks
 //! — FFXI's "third-person walk-toward-camera-forward" behavior.
 
-use bevy::post_process::bloom::Bloom;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{ShadowFilteringMethod, VolumetricFog};
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 
@@ -260,7 +260,9 @@ pub fn toggle_camera_mode(mode: &mut CameraMode, chase: &mut ChaseCamera) {
     *mode = match *mode {
         CameraMode::Chase => CameraMode::FirstPerson,
         CameraMode::FirstPerson => {
-            chase.pitch = chase.pitch.clamp(ChaseCamera::PITCH_MIN, ChaseCamera::PITCH_MAX);
+            chase.pitch = chase
+                .pitch
+                .clamp(ChaseCamera::PITCH_MIN, ChaseCamera::PITCH_MAX);
             CameraMode::Chase
         }
     };
@@ -356,4 +358,3 @@ mod tests {
         );
     }
 }
-

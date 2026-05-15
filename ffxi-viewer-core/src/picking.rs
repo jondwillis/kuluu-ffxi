@@ -122,7 +122,8 @@ pub fn click_to_target_system(
             ClickResolution::Set(id) => target.id = Some(id),
             ClickResolution::Clear => target.id = None,
             ClickResolution::OpenContextMenu => {
-                *input_mode = InputMode::QuickAction(QuickActionState::for_target(target.id.is_some()));
+                *input_mode =
+                    InputMode::QuickAction(QuickActionState::for_target(target.id.is_some()));
             }
         }
     }
@@ -134,7 +135,11 @@ mod tests {
     use ffxi_viewer_wire::EntityKind;
 
     fn mob(id: u32) -> WorldEntity {
-        WorldEntity { id, act_index: 0, kind: EntityKind::Mob }
+        WorldEntity {
+            id,
+            act_index: 0,
+            kind: EntityKind::Mob,
+        }
     }
 
     /// Click on a different entity → retarget.
@@ -167,7 +172,11 @@ mod tests {
     /// Click on the self-capsule with a target → clear (act as deselect).
     #[test]
     fn click_on_self_capsule_with_target_clears() {
-        let w = WorldEntity { id: 0, act_index: 0, kind: EntityKind::Pc };
+        let w = WorldEntity {
+            id: 0,
+            act_index: 0,
+            kind: EntityKind::Pc,
+        };
         assert_eq!(
             resolve_click_target(Some(&w), Some(17)),
             ClickResolution::Clear,
@@ -177,7 +186,11 @@ mod tests {
     /// Click on the self-capsule with no target → context menu.
     #[test]
     fn click_on_self_capsule_without_target_opens_menu() {
-        let w = WorldEntity { id: 0, act_index: 0, kind: EntityKind::Pc };
+        let w = WorldEntity {
+            id: 0,
+            act_index: 0,
+            kind: EntityKind::Pc,
+        };
         assert_eq!(
             resolve_click_target(Some(&w), None),
             ClickResolution::OpenContextMenu,
@@ -187,10 +200,7 @@ mod tests {
     /// Click on empty ground with a target → clear (deselect).
     #[test]
     fn click_on_empty_with_target_clears() {
-        assert_eq!(
-            resolve_click_target(None, Some(17)),
-            ClickResolution::Clear,
-        );
+        assert_eq!(resolve_click_target(None, Some(17)), ClickResolution::Clear,);
     }
 
     /// Click on empty ground with no target → context menu.

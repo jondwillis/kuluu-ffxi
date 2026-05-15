@@ -539,7 +539,9 @@ impl FfxiServer {
         self.send(AgentCommand::Action {
             target_id: p.target_id,
             target_index: p.target_index,
-            kind: ActionKind::HomepointMenu { status_id: p.status_id },
+            kind: ActionKind::HomepointMenu {
+                status_id: p.status_id,
+            },
         })
         .await
     }
@@ -594,7 +596,9 @@ impl FfxiServer {
                 "waited_ms": waited_ms,
             }),
         };
-        Ok(CallToolResult::success(vec![Content::text(body.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
     }
 
     /// Fallback for MCP clients that do not support the `resources`
@@ -615,11 +619,7 @@ impl FfxiServer {
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
         let elapsed_us = started.elapsed().as_micros() as u64;
-        tracing::debug!(
-            uri,
-            elapsed_us,
-            "mcp.tool_read_resource"
-        );
+        tracing::debug!(uri, elapsed_us, "mcp.tool_read_resource");
         Ok(CallToolResult::success(vec![Content::text(content)]))
     }
 }
@@ -640,7 +640,7 @@ impl ServerHandler for FfxiServer {
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::V_2025_11_25;
         info.capabilities = caps;
-       info.instructions = Some(
+        info.instructions = Some(
             "FFXI agent harness. Use tools (follow, engage, path_to, …) for \
               actions. Read resources for state: `scene://current` (compact prose \
               summary), `party://members`, `diagnostics://session`, `goal://current`, \
@@ -737,7 +737,7 @@ impl ServerHandler for FfxiServer {
         Ok(())
     }
 
-   async fn read_resource(
+    async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
@@ -749,12 +749,10 @@ impl ServerHandler for FfxiServer {
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
         let elapsed_us = started.elapsed().as_micros() as u64;
-        tracing::debug!(
-            uri,
-            elapsed_us,
-            "mcp.resource_read"
-        );
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(body, uri)]))
+        tracing::debug!(uri, elapsed_us, "mcp.resource_read");
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            body, uri,
+        )]))
     }
 }
 
@@ -775,14 +773,10 @@ async fn read_resource(
         "party://members" => {
             serde_json::to_string_pretty(&state.party).map_err(|e| format!("serialize party: {e}"))
         }
-        "diagnostics://session" => {
-            serde_json::to_string_pretty(&state.diagnostics)
-                .map_err(|e| format!("serialize diagnostics: {e}"))
-        }
-        "inventory://current" => {
-            serde_json::to_string_pretty(&state.inventory)
-                .map_err(|e| format!("serialize inventory: {e}"))
-        }
+        "diagnostics://session" => serde_json::to_string_pretty(&state.diagnostics)
+            .map_err(|e| format!("serialize diagnostics: {e}")),
+        "inventory://current" => serde_json::to_string_pretty(&state.inventory)
+            .map_err(|e| format!("serialize inventory: {e}")),
         "scene://entities" => serde_json::to_string_pretty(&entities_view(state))
             .map_err(|e| format!("serialize entities: {e}")),
         "debug://name_misses" => serde_json::to_string_pretty(&name_misses_view(state))
@@ -1147,9 +1141,9 @@ fn is_high_signal(ev: &AgentEvent) -> bool {
 /// Default sidecar location: same parent dir as `goal.json`. Honored by
 /// the FFXI_MCP_EVENT_PATH override so tests can redirect.
 fn default_event_sidecar_path() -> Option<std::path::PathBuf> {
-    GoalStore::default_path().ok().and_then(|p| {
-        p.parent().map(|d| d.join("last-event.json"))
-    })
+    GoalStore::default_path()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("last-event.json")))
 }
 
 /// Map an `AgentEvent` to the set of resource URIs whose content the
@@ -1225,7 +1219,9 @@ async fn main() -> Result<()> {
         let char_name_env = std::env::var("FFXI_CHAR").ok();
         let char_selection = match (char_id_env, char_name_env) {
             (Some(id_str), _) => {
-                let id = id_str.parse::<u32>().context("FFXI_CHAR_ID must be a u32")?;
+                let id = id_str
+                    .parse::<u32>()
+                    .context("FFXI_CHAR_ID must be a u32")?;
                 session::CharSelection::Id(id)
             }
             (None, Some(name)) => session::CharSelection::Name(name),
@@ -1286,9 +1282,7 @@ async fn main() -> Result<()> {
             Ok(addr) => {
                 if let Err(err) = relay::preflight_bind(addr) {
                     eprintln!("error: {err:#}");
-                    eprintln!(
-                        "hint: set FFXI_RELAY_LISTEN=auto to let the OS assign a free port,",
-                    );
+                    eprintln!("hint: set FFXI_RELAY_LISTEN=auto to let the OS assign a free port,",);
                     eprintln!("      or pick a different host:port.");
                     std::process::exit(2);
                 }
@@ -1361,9 +1355,7 @@ async fn main() -> Result<()> {
         let relay_event_tx = event_tx.clone();
         let relay_cmd_tx = cmd_tx.clone();
         let serve_h = tokio::spawn(async move {
-            if let Err(err) =
-                relay::serve(addr, state_rx, relay_event_tx, relay_cmd_tx).await
-            {
+            if let Err(err) = relay::serve(addr, state_rx, relay_event_tx, relay_cmd_tx).await {
                 tracing::warn!(error = %err, "relay listener exited");
             }
         });
@@ -1625,7 +1617,11 @@ mod tests {
             act_index: 0,
             kind: EntityKind::Pc,
             name: Some("Self".into()),
-            pos: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            pos: Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
             heading: 64,
             hp_pct: Some(100),
             bt_target_id: 0,
@@ -1641,7 +1637,11 @@ mod tests {
                 act_index: i as u16,
                 kind: EntityKind::Mob,
                 name: Some(format!("Mob{i}")),
-                pos: Vec3 { x: i as f32, y: 0.0, z: 0.0 },
+                pos: Vec3 {
+                    x: i as f32,
+                    y: 0.0,
+                    z: 0.0,
+                },
                 heading: 0,
                 hp_pct: Some(100),
                 bt_target_id: 0,
@@ -1681,7 +1681,11 @@ mod tests {
             act_index: 2,
             kind: EntityKind::Mob,
             name: Some("Worm".into()),
-            pos: Vec3 { x: 1.0, y: 0.0, z: 0.0 },
+            pos: Vec3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
             heading: 0,
             hp_pct: Some(100),
             bt_target_id: 0,
@@ -1698,10 +1702,7 @@ mod tests {
     fn event_kind_label_round_trips_to_serde_tag() {
         // Sanity: a few labels match the serde tag downstream consumers
         // (the sidecar JSON, wait_for_event filter strings) rely on.
-        assert_eq!(
-            event_kind_label(&AgentEvent::LowHp { pct: 25 }),
-            "low_hp"
-        );
+        assert_eq!(event_kind_label(&AgentEvent::LowHp { pct: 25 }), "low_hp");
         assert_eq!(
             event_kind_label(&AgentEvent::EngagedBy { entity_id: 1 }),
             "engaged_by"
@@ -1713,7 +1714,10 @@ mod tests {
             }),
             "tell_received"
         );
-        assert_eq!(event_kind_label(&AgentEvent::InventoryReady), "inventory_ready");
+        assert_eq!(
+            event_kind_label(&AgentEvent::InventoryReady),
+            "inventory_ready"
+        );
     }
 
     #[tokio::test]
@@ -1757,7 +1761,8 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::channel::<AgentCommand>(8);
         let (event_tx, _) = broadcast::channel::<AgentEvent>(8);
         let state = Arc::new(RwLock::new(SessionState::default()));
-        let goal_store = GoalStore::new(std::env::temp_dir().join("ffxi-mcp-test-wait-timeout-goal.json"));
+        let goal_store =
+            GoalStore::new(std::env::temp_dir().join("ffxi-mcp-test-wait-timeout-goal.json"));
         let server = FfxiServer::new(cmd_tx, state, goal_store).with_event_tx(event_tx);
         let result = server
             .wait_for_event(Parameters(WaitForEventParams {

@@ -48,8 +48,8 @@ use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use bevy::window::WindowCloseRequested;
 use ffxi_viewer_core::{
-    heading_for_yaw, toggle_camera_mode, Action, Bindings, CameraMode, ChaseCamera,
-    ChatBuffer, CursorLockRequest, InputMode, LockOn, LockOnToggle, MenuStack, OperatorCamera,
+    heading_for_yaw, toggle_camera_mode, Action, Bindings, CameraMode, ChaseCamera, ChatBuffer,
+    CursorLockRequest, InputMode, LockOn, LockOnToggle, MenuStack, OperatorCamera,
     PassiveCursorState, SceneState, Target,
 };
 use ffxi_viewer_wire::{Entity as WireEntity, Vec3 as WireVec3};
@@ -450,22 +450,27 @@ pub fn dispatch_movement_system(
     // is in the snapshot, else `None`.
     let self_pos = state.snapshot.self_pos;
     let locked_heading: Option<u8> = lock_on.target_id.and_then(|id| {
-        state.snapshot.entities.iter().find(|e| e.id == id).and_then(|ent| {
-            let dx = ent.pos.x - self_pos.pos.x;
-            let dy = ent.pos.y - self_pos.pos.y;
-            if dx.abs() <= 0.001 && dy.abs() <= 0.001 {
-                None
-            } else {
-                // LSB convention — mirror `heading_toward` in `reactor.rs`
-                // so lock-on and reactor-driven facing produce the same
-                // byte for the same geometry. `dy.atan2(dx)` matches LSB's
-                // `worldAngle(A, B) = atan2(B.z-A.z, B.x-A.x)`; the
-                // negative scale flips CCW to FFXI's CW.
-                let radians = dy.atan2(dx);
-                let raw = radians * -(128.0 / std::f32::consts::PI);
-                Some((raw.round() as i32).rem_euclid(256) as u8)
-            }
-        })
+        state
+            .snapshot
+            .entities
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|ent| {
+                let dx = ent.pos.x - self_pos.pos.x;
+                let dy = ent.pos.y - self_pos.pos.y;
+                if dx.abs() <= 0.001 && dy.abs() <= 0.001 {
+                    None
+                } else {
+                    // LSB convention — mirror `heading_toward` in `reactor.rs`
+                    // so lock-on and reactor-driven facing produce the same
+                    // byte for the same geometry. `dy.atan2(dx)` matches LSB's
+                    // `worldAngle(A, B) = atan2(B.z-A.z, B.x-A.x)`; the
+                    // negative scale flips CCW to FFXI's CW.
+                    let radians = dy.atan2(dx);
+                    let raw = radians * -(128.0 / std::f32::consts::PI);
+                    Some((raw.round() as i32).rem_euclid(256) as u8)
+                }
+            })
     });
 
     // Nothing to send? Bail UNLESS lock-on wants to rotate us. In that
@@ -509,10 +514,7 @@ pub fn dispatch_movement_system(
         heading = heading.wrapping_add(delta);
         // Lock-step camera rotation: yaw = -heading_angle, so a +Δh in
         // heading u8 → -Δh·τ/256 in yaw radians.
-        chase.yaw -= player_rotate as f32
-            * ROTATE_STEP_HELD as f32
-            * std::f32::consts::TAU
-            / 256.0;
+        chase.yaw -= player_rotate as f32 * ROTATE_STEP_HELD as f32 * std::f32::consts::TAU / 256.0;
     }
 
     // Lock-on: heading already computed at the top of this function
@@ -569,9 +571,8 @@ pub fn dispatch_movement_system(
         if proposed > 0.1 {
             let (resulting, branch) = match &slid {
                 Some(p) => {
-                    let r = ((p.x - self_pos.pos.x).powi(2)
-                        + (p.y - self_pos.pos.y).powi(2))
-                    .sqrt();
+                    let r =
+                        ((p.x - self_pos.pos.x).powi(2) + (p.y - self_pos.pos.y).powi(2)).sqrt();
                     (r, "slide_some")
                 }
                 None => (proposed, "slide_none_passthrough"),
@@ -667,7 +668,8 @@ where
         return None;
     }
 
-    let current_visible = current.and_then(|id| visible.iter().any(|&(i, _, _)| i == id).then_some(id));
+    let current_visible =
+        current.and_then(|id| visible.iter().any(|&(i, _, _)| i == id).then_some(id));
 
     match current_visible {
         Some(curr) => {
@@ -724,7 +726,11 @@ mod tests {
 
     #[test]
     fn first_press_picks_nearest_visible() {
-        let from = WireVec3 { x: 0.0, y: 0.0, z: 0.0 };
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
         let entities = vec![ent(1, 30.0, 0.0), ent(2, 10.0, 0.0), ent(3, 20.0, 0.0)];
         let next = cycle_target_viewport(&entities, from, None, fake_proj);
         assert_eq!(next, Some(2)); // closest to origin
@@ -732,20 +738,37 @@ mod tests {
 
     #[test]
     fn subsequent_presses_cycle_left_to_right() {
-        let from = WireVec3 { x: 0.0, y: 0.0, z: 0.0 };
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
         // ndc.x = pos.x / 100 → entity 1 leftmost, then 2, then 3.
         let entities = vec![ent(1, -50.0, 0.0), ent(2, 0.0, 0.0), ent(3, 50.0, 0.0)];
         // Starting from 1 (leftmost) → next is 2.
-        assert_eq!(cycle_target_viewport(&entities, from, Some(1), fake_proj), Some(2));
+        assert_eq!(
+            cycle_target_viewport(&entities, from, Some(1), fake_proj),
+            Some(2)
+        );
         // From 2 → next is 3.
-        assert_eq!(cycle_target_viewport(&entities, from, Some(2), fake_proj), Some(3));
+        assert_eq!(
+            cycle_target_viewport(&entities, from, Some(2), fake_proj),
+            Some(3)
+        );
         // From 3 → wraps to 1.
-        assert_eq!(cycle_target_viewport(&entities, from, Some(3), fake_proj), Some(1));
+        assert_eq!(
+            cycle_target_viewport(&entities, from, Some(3), fake_proj),
+            Some(1)
+        );
     }
 
     #[test]
     fn off_screen_entities_are_skipped() {
-        let from = WireVec3 { x: 0.0, y: 0.0, z: 0.0 };
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
         // entity 4 at x=100 will be culled by `culled_proj`.
         let entities = vec![ent(1, 0.0, 0.0), ent(4, 100.0, 0.0)];
         let next = cycle_target_viewport(&entities, from, None, culled_proj);
@@ -757,17 +780,31 @@ mod tests {
 
     #[test]
     fn empty_or_all_off_screen_returns_none() {
-        let from = WireVec3 { x: 0.0, y: 0.0, z: 0.0 };
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
         let entities: Vec<WireEntity> = vec![];
-        assert_eq!(cycle_target_viewport(&entities, from, None, fake_proj), None);
+        assert_eq!(
+            cycle_target_viewport(&entities, from, None, fake_proj),
+            None
+        );
         // All off-screen.
         let entities = vec![ent(1, 100.0, 0.0), ent(2, 200.0, 0.0)];
-        assert_eq!(cycle_target_viewport(&entities, from, None, culled_proj), None);
+        assert_eq!(
+            cycle_target_viewport(&entities, from, None, culled_proj),
+            None
+        );
     }
 
     #[test]
     fn current_offscreen_falls_back_to_nearest() {
-        let from = WireVec3 { x: 0.0, y: 0.0, z: 0.0 };
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
         let entities = vec![ent(1, 30.0, 0.0), ent(99, 1000.0, 0.0)];
         // 99 not visible — should pick nearest visible (1).
         let next = cycle_target_viewport(&entities, from, Some(99), culled_proj);

@@ -38,7 +38,10 @@ fn main() -> ExitCode {
         "maplist_offset=0x{:X} ({})  maplist_count={} (0x{:X})",
         header.maplist_offset, header.maplist_offset, header.maplist_count, header.maplist_count
     );
-    println!("quadtree_offset=0x{:X}  mesh_table_offset=0x{:X}", header.quadtree_offset, header.mesh_table_offset);
+    println!(
+        "quadtree_offset=0x{:X}  mesh_table_offset=0x{:X}",
+        header.quadtree_offset, header.mesh_table_offset
+    );
     println!();
 
     // Dump first 32 bytes of body so we can sanity-check field positions.
@@ -80,7 +83,13 @@ fn main() -> ExitCode {
             .collect();
         let name_plain: String = rec[..16]
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .take_while(|&c| c != '\0')
             .collect();
         let name = format!("plain={:?} xor={:?}", name_plain, name_xor);
@@ -170,7 +179,13 @@ fn hexdump(data: &[u8], base: usize) {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{:02x}", b)).collect();
         let ascii: String = chunk
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         println!("  {:08x}  {:<48}  {}", off, hex.join(" "), ascii);
     }

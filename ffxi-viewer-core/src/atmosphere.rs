@@ -56,11 +56,7 @@ pub fn ffxi_distance_fog() -> DistanceFog {
         // Higher exponent = much tighter halo around the sun (was 30,
         // which made a 60°-ish warm cone).
         directional_light_exponent: 80.0,
-        falloff: FogFalloff::from_visibility_colors(
-            visibility,
-            fog_color,
-            sun_inscatter,
-        ),
+        falloff: FogFalloff::from_visibility_colors(visibility, fog_color, sun_inscatter),
     }
 }
 
@@ -193,10 +189,7 @@ pub fn apply_zone_atmosphere_system(
     provider: Res<ZoneAtmosphereProvider>,
     mut last: ResMut<LastAtmosphereZone>,
     mut ambient: ResMut<AmbientLight>,
-    mut q_cam: Query<
-        (Entity, Option<&mut DistanceFog>, Option<&Skybox>),
-        With<OperatorCamera>,
-    >,
+    mut q_cam: Query<(Entity, Option<&mut DistanceFog>, Option<&Skybox>), With<OperatorCamera>>,
     mut commands: Commands,
 ) {
     let current = state.snapshot.zone_id;

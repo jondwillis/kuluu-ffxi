@@ -33,13 +33,13 @@ use bevy::ecs::system::SystemParam;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
+use ffxi_viewer_core::dat_mmb::LoadMmbRequest;
+use ffxi_viewer_core::dat_mzb::LoadMzbRequest;
+use ffxi_viewer_core::hud::chat_panel::ChatScroll;
 use ffxi_viewer_core::{
     Action, Bindings, ChatBuffer, DialogCursor, InputMode, MenuKind, MenuStack, Preset,
     QuickActionState, SceneState, Target, DIALOG_MAX_CHOICE,
 };
-use ffxi_viewer_core::dat_mmb::LoadMmbRequest;
-use ffxi_viewer_core::dat_mzb::LoadMzbRequest;
-use ffxi_viewer_core::hud::chat_panel::ChatScroll;
 
 use super::debug_heights::DebugHeightsRequest;
 
@@ -57,7 +57,9 @@ use tokio::sync::mpsc::Sender;
 use crate::keybinds_store::KeybindsStateRes;
 use crate::state::{ActionKind, AgentCommand, AgentEvent, CheckKind, ReqLogoutKind};
 use crate::view_native::input::CommandTx;
-use crate::view_native::slash_commands::{parse_slash, system_chat_line, KeybindUpdate, SlashOutcome};
+use crate::view_native::slash_commands::{
+    parse_slash, system_chat_line, KeybindUpdate, SlashOutcome,
+};
 
 /// Read `KeyboardInput` events and route per [`InputMode`]. Runs every
 /// `Update` tick. Cmd+Q / window-close are handled in `input.rs`'s
@@ -485,10 +487,7 @@ fn apply_slash_outcome(
                 // Channel full or closed — operator should see this; silent
                 // drops are how slash bugs hide. The text goes straight to
                 // the chat panel via the same path /say already uses.
-                push_system_chat_line(
-                    scene_state,
-                    format!("command dropped (channel issue): {e}"),
-                );
+                push_system_chat_line(scene_state, format!("command dropped (channel issue): {e}"));
             }
         }
         SlashOutcome::Commands(cmds) => {
@@ -574,10 +573,7 @@ fn apply_slash_outcome(
         SlashOutcome::SetZoneGeom(setting) => {
             let next = setting.unwrap_or_else(|| draw_distance.zone_geom_mode.cycle());
             draw_distance.zone_geom_mode = next;
-            push_system_chat_line(
-                scene_state,
-                format!("/zonegeom: {}", next.label()),
-            );
+            push_system_chat_line(scene_state, format!("/zonegeom: {}", next.label()));
         }
         SlashOutcome::SetDrawDistance(op) => {
             use super::slash_commands::DrawDistanceOp;
@@ -694,10 +690,7 @@ fn apply_agent_control(
             if was_paused {
                 push_system_chat_line(scene_state, "/agent: already paused".into());
             } else {
-                push_system_chat_line(
-                    scene_state,
-                    "/agent: paused (human in control)".into(),
-                );
+                push_system_chat_line(scene_state, "/agent: paused (human in control)".into());
                 if let Some(tx) = session_event_tx {
                     let _ = tx.0.send(AgentEvent::HumanInControl {
                         reason: "operator /agent pause".into(),
@@ -800,7 +793,8 @@ fn report_nav_info(
             let dy = line.from_pos[1] - self_pos.y;
             let dz = line.from_pos[2] - self_pos.z;
             let dist_2d = (dx * dx + dy * dy).sqrt();
-            let to = ffxi_nav::glam::Vec3::new(line.from_pos[0], line.from_pos[1], line.from_pos[2]);
+            let to =
+                ffxi_nav::glam::Vec3::new(line.from_pos[0], line.from_pos[1], line.from_pos[2]);
             let path_status = match ffxi_nav::NavMesh::path(&*nav, from, to) {
                 Some(p) => format!("path={}wp", p.len()),
                 None => "path=NONE".into(),
@@ -835,10 +829,7 @@ fn apply_keybind_update(
                 format!("/keybinds: preset → {}", preset.slug()),
             );
             if let Err(e) = save_result {
-                push_system_chat_line(
-                    scene_state,
-                    format!("/keybinds: save failed: {e}"),
-                );
+                push_system_chat_line(scene_state, format!("/keybinds: save failed: {e}"));
             }
         }
         KeybindUpdate::Reset => {
@@ -850,25 +841,22 @@ fn apply_keybind_update(
                 format!("/keybinds: reset to {} defaults", preset.slug()),
             );
             if let Err(e) = save_result {
-                push_system_chat_line(
-                    scene_state,
-                    format!("/keybinds: save failed: {e}"),
-                );
+                push_system_chat_line(scene_state, format!("/keybinds: save failed: {e}"));
             }
         }
         KeybindUpdate::List => {
             push_system_chat_line(
                 scene_state,
-                format!("/keybinds: preset = {}", keybinds_state.persisted.preset.slug()),
+                format!(
+                    "/keybinds: preset = {}",
+                    keybinds_state.persisted.preset.slug()
+                ),
             );
             // One line per (Action, KeyBind). BTreeMap iteration is
             // already sorted, so the output order is stable.
             for (action, bind) in bindings.iter() {
                 let mods = format_modifiers(bind.mods);
-                push_system_chat_line(
-                    scene_state,
-                    format!("  {action:?} → {mods}{:?}", bind.key),
-                );
+                push_system_chat_line(scene_state, format!("  {action:?} → {mods}{:?}", bind.key));
             }
         }
     }
@@ -957,10 +945,7 @@ enum MenuDispatch {
     /// visible feedback we currently have for that window, since we
     /// don't decode the server's countdown messages on opcode 0x053
     /// `SYSTEMMES` yet).
-    CommandWithToast {
-        cmd: AgentCommand,
-        toast: String,
-    },
+    CommandWithToast { cmd: AgentCommand, toast: String },
     /// Push a submenu frame onto the menu stack and stay in
     /// `InputMode::Menu`. The cursor on the new frame starts at 0.
     /// Caller (handle_menu_key) is responsible for the actual `push`.
@@ -1065,10 +1050,7 @@ fn handle_menu_key(
         return match resolve_menu_entry(kind, label) {
             MenuDispatch::CommandWithToast { cmd, toast } => {
                 if let Err(e) = cmd_tx.try_send(cmd) {
-                    push_system_chat_line(
-                        scene_state,
-                        format!("[menu] dispatch dropped: {e}"),
-                    );
+                    push_system_chat_line(scene_state, format!("[menu] dispatch dropped: {e}"));
                 } else {
                     push_system_chat_line(scene_state, toast);
                 }
@@ -1085,13 +1067,14 @@ fn handle_menu_key(
                 // path's "fire and forget" UX.
                 let stay = matches!(update, KeybindUpdate::List);
                 apply_keybind_update(update, bindings, keybinds_state, scene_state);
-                if stay { None } else { Some(InputMode::World) }
+                if stay {
+                    None
+                } else {
+                    Some(InputMode::World)
+                }
             }
             MenuDispatch::NotImplemented(label) => {
-                push_system_chat_line(
-                    scene_state,
-                    format!("[menu] {label} — not implemented"),
-                );
+                push_system_chat_line(scene_state, format!("[menu] {label} — not implemented"));
                 None
             }
         };
@@ -1248,28 +1231,20 @@ fn handle_quick_action_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        let label = ffxi_viewer_core::hud::quick_action::entry_label(
-            state.has_target,
-            state.cursor,
-        );
+        let label =
+            ffxi_viewer_core::hud::quick_action::entry_label(state.has_target, state.cursor);
         let target_ent = target_id.and_then(|id| entities.iter().find(|e| e.id == id));
         match resolve_quick_action(label, target_ent) {
             QuickActionDispatch::Command(cmd) => {
                 if let Err(e) = cmd_tx.try_send(cmd) {
-                    push_system_chat_line(
-                        scene_state,
-                        format!("[quick] dispatch dropped: {e}"),
-                    );
+                    push_system_chat_line(scene_state, format!("[quick] dispatch dropped: {e}"));
                 }
             }
             QuickActionDispatch::SystemMessage(msg) => {
                 push_system_chat_line(scene_state, msg);
             }
             QuickActionDispatch::NotImplemented(label) => {
-                push_system_chat_line(
-                    scene_state,
-                    format!("[quick] {label} — not implemented"),
-                );
+                push_system_chat_line(scene_state, format!("[quick] {label} — not implemented"));
             }
         }
         return Some(InputMode::World);
@@ -1296,8 +1271,7 @@ fn handle_passive_cursor_key(
     // Number of available rows we can scroll back through, clamped at
     // the oldest line. Recomputed each keypress because new chat
     // arrivals shift the available range.
-    let max_back =
-        ffxi_viewer_core::snapshot::rendered_chat(scene_state).len();
+    let max_back = ffxi_viewer_core::snapshot::rendered_chat(scene_state).len();
 
     if bindings.matches_logical(Action::NavUp, key) {
         // Scroll one older line into view (saturating at the oldest).
@@ -1342,7 +1316,11 @@ mod quick_action_tests {
             act_index,
             kind: EntityKind::Mob,
             name: None,
-            pos: WireVec3 { x: 0.0, y: 0.0, z: 0.0 },
+            pos: WireVec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
             heading: 0,
             hp_pct: None,
             bt_target_id: 0,
@@ -1358,7 +1336,11 @@ mod quick_action_tests {
         let ent = target_ent(0x1234, 7);
         let result = resolve_quick_action("Check", Some(&ent));
         match result {
-            QuickActionDispatch::Command(AgentCommand::CheckTarget { target_id, target_index, kind }) => {
+            QuickActionDispatch::Command(AgentCommand::CheckTarget {
+                target_id,
+                target_index,
+                kind,
+            }) => {
                 assert_eq!(target_id, 0x1234);
                 assert_eq!(target_index, 7);
                 assert_eq!(kind, CheckKind::Check);
@@ -1382,10 +1364,7 @@ mod quick_action_tests {
     fn unwired_entry_stays_not_implemented() {
         let ent = target_ent(1, 1);
         let result = resolve_quick_action("Magic", Some(&ent));
-        assert_eq!(
-            result,
-            QuickActionDispatch::NotImplemented("Magic".into()),
-        );
+        assert_eq!(result, QuickActionDispatch::NotImplemented("Magic".into()),);
     }
 }
 
@@ -1417,8 +1396,15 @@ mod menu_dispatch_tests {
         // `Config` was wired up as a submenu in commit c4a9321 (preset
         // switcher + `/keybinds list`); the test was not updated at
         // the time. The remaining root entries below are still stubs.
-        for label in ["Magic", "Abilities", "Items", "Status", "Party",
-                      "Search", "Macros"] {
+        for label in [
+            "Magic",
+            "Abilities",
+            "Items",
+            "Status",
+            "Party",
+            "Search",
+            "Macros",
+        ] {
             assert_eq!(
                 resolve_menu_entry(MenuKind::Root, label),
                 MenuDispatch::NotImplemented(label.into()),

@@ -225,8 +225,14 @@ mod tests {
         assert_eq!(snap.entities.len(), 2);
         let e1 = snap.entities.iter().find(|e| e.id == 1).unwrap();
         assert_eq!(e1.pos.x, 99.0, "id=1 must be updated, not duplicated");
-        assert!(snap.entities.iter().any(|e| e.id == 3), "id=3 must be inserted");
-        assert!(!snap.entities.iter().any(|e| e.id == 2), "id=2 must be removed");
+        assert!(
+            snap.entities.iter().any(|e| e.id == 3),
+            "id=3 must be inserted"
+        );
+        assert!(
+            !snap.entities.iter().any(|e| e.id == 2),
+            "id=2 must be removed"
+        );
     }
 
     #[test]
@@ -235,7 +241,11 @@ mod tests {
         let delta = SceneDelta {
             stage: Some(Stage::InZone),
             self_pos: Some(Position {
-                pos: Vec3 { x: 1.0, y: 2.0, z: 3.0 },
+                pos: Vec3 {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                },
                 heading: 64,
                 speed: 25,
                 speed_base: 25,
@@ -399,11 +409,12 @@ mod tests {
         // Hand the source a snapshot, run one update, verify it lands.
         let mut s = SceneSnapshot::default();
         s.stage = Stage::InZone;
-        app.world_mut()
-            .resource_mut::<TestSource>()
-            .next_snapshot = Some(Box::new(s));
+        app.world_mut().resource_mut::<TestSource>().next_snapshot = Some(Box::new(s));
         app.update();
-        assert_eq!(app.world().resource::<SceneState>().snapshot.stage, Stage::InZone);
+        assert_eq!(
+            app.world().resource::<SceneState>().snapshot.stage,
+            Stage::InZone
+        );
         assert!(app.world().resource::<SceneState>().dirty);
 
         // Next frame with no new snapshot — dirty must clear.

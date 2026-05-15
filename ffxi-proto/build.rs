@@ -6,7 +6,7 @@
 
 use std::{fs, path::PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 const LSB_BLOWFISH_CPP: &str = "../vendor/server/src/common/blowfish.cpp";
 const LSB_COMPRESS_DAT: &str = "../vendor/server/res/compress.dat";
@@ -46,8 +46,8 @@ fn main() -> Result<()> {
     for tok in body.split([',', ' ', '\n', '\r', '\t']) {
         let t = tok.trim();
         if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-            let b = u8::from_str_radix(hex, 16)
-                .with_context(|| format!("parsing hex byte `{t}`"))?;
+            let b =
+                u8::from_str_radix(hex, 16).with_context(|| format!("parsing hex byte `{t}`"))?;
             bytes.push(b);
         } else if !t.is_empty() {
             bail!("unexpected token in subkey table: {t:?}");
@@ -62,10 +62,10 @@ fn main() -> Result<()> {
     fs::write(out_dir.join("blowfish_subkey.bin"), &bytes)?;
 
     // FFXI custom-zlib tables: copy verbatim.
-    let compress = fs::read(LSB_COMPRESS_DAT)
-        .with_context(|| format!("reading {LSB_COMPRESS_DAT}"))?;
-    let decompress = fs::read(LSB_DECOMPRESS_DAT)
-        .with_context(|| format!("reading {LSB_DECOMPRESS_DAT}"))?;
+    let compress =
+        fs::read(LSB_COMPRESS_DAT).with_context(|| format!("reading {LSB_COMPRESS_DAT}"))?;
+    let decompress =
+        fs::read(LSB_DECOMPRESS_DAT).with_context(|| format!("reading {LSB_DECOMPRESS_DAT}"))?;
     if compress.len() % 4 != 0 || decompress.len() % 4 != 0 {
         bail!(
             "compress.dat ({}) / decompress.dat ({}) byte counts must be multiples of 4",
@@ -92,7 +92,10 @@ fn main() -> Result<()> {
     }
     out.push_str("];\n");
     fs::write(out_dir.join("msg_basic_table.rs"), &out)?;
-    println!("cargo:warning=ffxi-proto: scraped {} msg_basic entries", entries.len());
+    println!(
+        "cargo:warning=ffxi-proto: scraped {} msg_basic entries",
+        entries.len()
+    );
 
     // msg.lua → one (u16, &str) table per `xi.msg.<table>`. Each line in
     // a table body is `IDENT = NUM, -- text`. Same skip rules as the
@@ -100,12 +103,16 @@ fn main() -> Result<()> {
     // canonical source for combat text is `msg_basic.h` (already scraped
     // above); the lua mirror is a partial subset and would only confuse
     // lookups by overlapping ids.
-    let lua_src = fs::read_to_string(LSB_MSG_LUA)
-        .with_context(|| format!("reading {LSB_MSG_LUA}"))?;
+    let lua_src =
+        fs::read_to_string(LSB_MSG_LUA).with_context(|| format!("reading {LSB_MSG_LUA}"))?;
     for (lua_table, out_const, out_file) in [
         ("channel", "MSG_CHANNEL", "msg_channel_table.rs"),
         ("area", "MSG_AREA", "msg_area_table.rs"),
-        ("actionModifier", "MSG_ACTION_MODIFIER", "msg_action_modifier_table.rs"),
+        (
+            "actionModifier",
+            "MSG_ACTION_MODIFIER",
+            "msg_action_modifier_table.rs",
+        ),
         ("system", "MSG_SYSTEM", "msg_system_table.rs"),
     ] {
         let entries = parse_lua_table(&lua_src, lua_table)?;
@@ -167,7 +174,10 @@ fn parse_lua_table(src: &str, table: &str) -> Result<Vec<(u16, String)>> {
         let Some(eq) = line.find('=') else { continue };
         let ident = line[..eq].trim();
         if ident.is_empty()
-            || !ident.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            || !ident
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         {
             continue;
         }
@@ -176,14 +186,18 @@ fn parse_lua_table(src: &str, table: &str) -> Result<Vec<(u16, String)>> {
         }
         // After `=`: `<num>,` then optional `-- comment`.
         let tail = &line[eq + 1..];
-        let Some(comma) = tail.find(',') else { continue };
+        let Some(comma) = tail.find(',') else {
+            continue;
+        };
         let num_str = tail[..comma].trim();
         let id: u16 = parse_int_lit(num_str).unwrap_or(continue_marker());
         if id == continue_marker() {
             continue;
         }
         let after_comma = &tail[comma + 1..];
-        let Some(slash) = after_comma.find("--") else { continue };
+        let Some(slash) = after_comma.find("--") else {
+            continue;
+        };
         let comment = after_comma[slash + 2..].trim().to_string();
         if comment.is_empty() || is_non_message_annotation(&comment) {
             continue;
@@ -226,11 +240,18 @@ fn parse_msg_basic(src: &str) -> Result<Vec<(u16, String)>> {
         // Quickly reject lines that aren't `Ident = N, // ...`.
         let Some(eq) = line.find('=') else { continue };
         // Must be inside the enum body — every entry has a trailing comma.
-        let Some(comma) = line[eq..].find(',') else { continue };
+        let Some(comma) = line[eq..].find(',') else {
+            continue;
+        };
         let comma = eq + comma;
         // Identifier ::= [A-Za-z_][A-Za-z0-9_]*
         let ident = line[..eq].trim();
-        if ident.is_empty() || !ident.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
+        if ident.is_empty()
+            || !ident
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
             continue;
         }
         if !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -244,7 +265,9 @@ fn parse_msg_basic(src: &str) -> Result<Vec<(u16, String)>> {
         };
         // Comment, if any, lives after the first ` // ` past the comma.
         let tail = &line[comma + 1..];
-        let Some(slash) = tail.find("//") else { continue };
+        let Some(slash) = tail.find("//") else {
+            continue;
+        };
         let mut comment = tail[slash + 2..].trim().to_string();
         // Strip the stray `*/` typo on a few entries.
         if let Some(stripped) = comment.strip_suffix("*/") {

@@ -294,17 +294,19 @@ where
 fn viewer_command_to_agent(cmd: wire::ViewerCommand) -> Option<AgentCommand> {
     use crate::state::ActionKind;
     Some(match cmd {
-        wire::ViewerCommand::Move { x, y, z, heading } => {
-            AgentCommand::Move { x, y, z, heading }
-        }
+        wire::ViewerCommand::Move { x, y, z, heading } => AgentCommand::Move { x, y, z, heading },
         wire::ViewerCommand::StopMove => AgentCommand::StopMove,
         wire::ViewerCommand::EndEvent => AgentCommand::EndEvent,
         wire::ViewerCommand::Snapshot => AgentCommand::Snapshot,
         wire::ViewerCommand::Chat { kind, text } => AgentCommand::Chat { kind, text },
         wire::ViewerCommand::Tell { to, text } => AgentCommand::Tell { to, text },
-        wire::ViewerCommand::Follow { target_id, distance } => {
-            AgentCommand::Follow { target_id, distance }
-        }
+        wire::ViewerCommand::Follow {
+            target_id,
+            distance,
+        } => AgentCommand::Follow {
+            target_id,
+            distance,
+        },
         wire::ViewerCommand::Engage { target_id } => AgentCommand::Engage { target_id },
         wire::ViewerCommand::PathTo { x, y, z } => AgentCommand::PathTo { x, y, z },
         wire::ViewerCommand::Cancel => AgentCommand::Cancel,
@@ -318,22 +320,31 @@ fn viewer_command_to_agent(cmd: wire::ViewerCommand) -> Option<AgentCommand> {
         } => AgentCommand::Action {
             target_id,
             target_index,
-            kind: ActionKind::CastMagic { spell_id, pos_x, pos_y, pos_z },
+            kind: ActionKind::CastMagic {
+                spell_id,
+                pos_x,
+                pos_y,
+                pos_z,
+            },
         },
-        wire::ViewerCommand::Weaponskill { skill_id, target_id, target_index } => {
-            AgentCommand::Action {
-                target_id,
-                target_index,
-                kind: ActionKind::Weaponskill { skill_id },
-            }
-        }
-        wire::ViewerCommand::JobAbility { ability_id, target_id, target_index } => {
-            AgentCommand::Action {
-                target_id,
-                target_index,
-                kind: ActionKind::JobAbility { ability_id },
-            }
-        }
+        wire::ViewerCommand::Weaponskill {
+            skill_id,
+            target_id,
+            target_index,
+        } => AgentCommand::Action {
+            target_id,
+            target_index,
+            kind: ActionKind::Weaponskill { skill_id },
+        },
+        wire::ViewerCommand::JobAbility {
+            ability_id,
+            target_id,
+            target_index,
+        } => AgentCommand::Action {
+            target_id,
+            target_index,
+            kind: ActionKind::JobAbility { ability_id },
+        },
         wire::ViewerCommand::UseItem {
             container,
             slot,
@@ -347,9 +358,13 @@ fn viewer_command_to_agent(cmd: wire::ViewerCommand) -> Option<AgentCommand> {
             target_id,
             target_index,
         },
-        wire::ViewerCommand::BankWhenFull { threshold, mog_house_zoneline } => {
-            AgentCommand::BankWhenFull { threshold, mog_house_zoneline }
-        }
+        wire::ViewerCommand::BankWhenFull {
+            threshold,
+            mog_house_zoneline,
+        } => AgentCommand::BankWhenFull {
+            threshold,
+            mog_house_zoneline,
+        },
     })
 }
 

@@ -79,9 +79,7 @@ fn main() -> ExitCode {
             };
             let subs = MmbSubRecord::find_all(header.payload);
             // Strip control bytes from names for TSV safety.
-            let asset = header
-                .asset_name_str()
-                .replace(['\t', '\n', '\r'], " ");
+            let asset = header.asset_name_str().replace(['\t', '\n', '\r'], " ");
             let chunk_name = chunk.name_str().replace(['\t', '\n', '\r'], " ");
             println!(
                 "{file_id}\t{chunk_idx}\t{asset}\t{}\t{chunk_name}",

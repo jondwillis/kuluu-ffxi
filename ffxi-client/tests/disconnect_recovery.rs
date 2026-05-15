@@ -19,12 +19,12 @@ mod common;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 use tokio::{process::Command, time::timeout};
 
+use common::mcp_client::{ffxi_mcp_bin, is_reachable, read_text, McpClient};
 use common::EphemeralChar;
-use common::mcp_client::{McpClient, ffxi_mcp_bin, is_reachable, read_text};
 
 /// Override with `MAP_SERVER_CONTAINER` if your stack uses a different name.
 fn map_server_container() -> String {
@@ -84,10 +84,7 @@ async fn disconnect_recovery_reconnects_after_map_restart() {
         fixture.username, fixture.accid, fixture.charid, fixture.charname,
     );
 
-    let goal_path = std::env::temp_dir().join(format!(
-        "ffxi-mcp-recover-{}.json",
-        fixture.charid
-    ));
+    let goal_path = std::env::temp_dir().join(format!("ffxi-mcp-recover-{}.json", fixture.charid));
     let _ = std::fs::remove_file(&goal_path);
 
     let mut child = Command::new(&bin)

@@ -97,10 +97,7 @@ impl Plugin for MousePlugin {
             .init_resource::<CursorLockRequest>()
             .init_resource::<CameraMode>()
             .init_resource::<ChaseCamera>()
-            .add_systems(
-                PreUpdate,
-                (collect_mouse_system, apply_cursor_lock_system),
-            )
+            .add_systems(PreUpdate, (collect_mouse_system, apply_cursor_lock_system))
             // mouse_camera_system runs in Update so it sees the pointer
             // state already collected this frame (PreUpdate) and the
             // camera systems pick up the result on the same Update tick.

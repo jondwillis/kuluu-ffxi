@@ -251,24 +251,33 @@ pub(crate) fn register(
         OnEnter(LauncherState::AuthInFlight),
         (async_work::spawn_auth_task, async_work::spawn_auth_ui),
     )
-    .add_systems(OnExit(LauncherState::AuthInFlight), async_work::despawn_auth_ui)
+    .add_systems(
+        OnExit(LauncherState::AuthInFlight),
+        async_work::despawn_auth_ui,
+    )
     .add_systems(
         Update,
         async_work::poll_auth_system.run_if(in_state(LauncherState::AuthInFlight)),
     );
 
     // Char list: spawn UI from the snapshot, dispatch on click.
-    app.add_systems(OnEnter(LauncherState::CharList), char_list::spawn_char_list_ui)
-        .add_systems(OnExit(LauncherState::CharList), char_list::despawn_char_list_ui)
-        .add_systems(
-            Update,
-            (
-                direct_mode_charlist_autoselect,
-                char_list::handle_click_system,
-                char_list::handle_keyboard_system,
-            )
-                .run_if(in_state(LauncherState::CharList)),
-        );
+    app.add_systems(
+        OnEnter(LauncherState::CharList),
+        char_list::spawn_char_list_ui,
+    )
+    .add_systems(
+        OnExit(LauncherState::CharList),
+        char_list::despawn_char_list_ui,
+    )
+    .add_systems(
+        Update,
+        (
+            direct_mode_charlist_autoselect,
+            char_list::handle_click_system,
+            char_list::handle_keyboard_system,
+        )
+            .run_if(in_state(LauncherState::CharList)),
+    );
 
     // Connect in flight: spawn task, poll oneshot.
     app.add_systems(
@@ -306,10 +315,7 @@ fn spawn_launcher_camera(mut commands: Commands) {
     commands.spawn((Camera2d, LauncherCamera));
 }
 
-fn despawn_launcher_camera(
-    mut commands: Commands,
-    q: Query<Entity, With<LauncherCamera>>,
-) {
+fn despawn_launcher_camera(mut commands: Commands, q: Query<Entity, With<LauncherCamera>>) {
     for e in q.iter() {
         commands.entity(e).despawn();
     }
