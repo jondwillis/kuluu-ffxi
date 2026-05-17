@@ -39,6 +39,7 @@ pub mod snapshot;
 pub mod source;
 pub mod sun_moon;
 pub mod target_ring;
+pub mod weather_fx;
 pub mod zone_lines;
 
 pub use camera::{
@@ -109,6 +110,10 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<atmosphere::ZoneAtmosphereProvider>()
             .init_resource::<atmosphere::LastAtmosphereZone>()
             .init_resource::<sun_moon::VanaSky>()
+            .init_resource::<weather_fx::ActiveWeatherModifier>()
+            .init_resource::<weather_fx::ParticleAssets>()
+            .init_resource::<weather_fx::LightningState>()
+            .init_resource::<weather_fx::CurrentWeather>()
             .init_resource::<hud::chat_panel::ChatScroll>()
             .init_resource::<hud::chat_panel::BattleScroll>()
             .init_resource::<hud::chat_panel::ChatScrollAccum>()
@@ -148,7 +153,21 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                     target_ring::draw_engaged_ring_system,
                     sync_zone_lines_system,
                     atmosphere::apply_zone_atmosphere_system,
+                    // Order matters: update_weather_modifier_system runs
+                    // *after* the zone atmosphere has written fresh base
+                    // ambient values. apply_weather_to_ambient_and_fog
+                    // then multiplies the modifier onto that base. The
+                    // sun system writes time-of-day illuminance, and
+                    // apply_weather_to_sun multiplies the modifier
+                    // onto that — see `weather_fx` module docs for the
+                    // scheduling rationale.
+                    weather_fx::sync_current_weather_from_snapshot,
+                    weather_fx::update_weather_modifier_system,
+                    weather_fx::apply_weather_to_ambient_and_fog_system,
                     sun_moon::sun_moon_system,
+                    weather_fx::apply_weather_to_sun_system,
+                    weather_fx::manage_weather_particles_system,
+                    weather_fx::update_weather_particles_system,
                 )
                     .chain()
                     .run_if(resource_exists::<EntityMesh>),

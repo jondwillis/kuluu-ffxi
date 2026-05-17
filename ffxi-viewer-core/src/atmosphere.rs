@@ -189,6 +189,7 @@ pub fn apply_zone_atmosphere_system(
     provider: Res<ZoneAtmosphereProvider>,
     mut last: ResMut<LastAtmosphereZone>,
     mut ambient: ResMut<AmbientLight>,
+    mut active_weather: ResMut<crate::weather_fx::ActiveWeatherModifier>,
     mut q_cam: Query<(Entity, Option<&mut DistanceFog>, Option<&Skybox>), With<OperatorCamera>>,
     mut commands: Commands,
 ) {
@@ -203,6 +204,11 @@ pub fn apply_zone_atmosphere_system(
 
     ambient.color = atmo.ambient_color;
     ambient.brightness = atmo.ambient_brightness;
+    // Refresh the captured "base" so the weather modifier multiplies
+    // against the new zone's ambient instead of the old one. Without
+    // this, zoning during rain would scale yesterday's brightness.
+    active_weather.base_ambient_color = atmo.ambient_color;
+    active_weather.base_ambient_brightness = atmo.ambient_brightness;
 
     // NOTE: sun light is owned by `crate::sun_moon::sun_moon_system`
     // (Vana'diel time-driven). Per-zone sun fields on `ZoneAtmosphere`
