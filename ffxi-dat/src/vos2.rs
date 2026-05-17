@@ -128,8 +128,17 @@ pub struct Vos2Header {
     pub flip: u16,
     pub off_poly_bytes: usize,
     pub off_bone_table_bytes: usize,
+    /// `BoneTblSuu` — number of `u16` entries in the bone palette at
+    /// `off_bone_table_bytes`. Each entry is a skeleton-bone index that
+    /// the per-vertex `bone_index` field can address.
+    pub bone_table_count: u16,
     pub off_weight_bytes: usize,
     pub off_bone_bytes: usize,
+    /// `BoneSuu` — number of `BoneIndices` records (each 16-bit packed)
+    /// in the stream at `off_bone_bytes`. This is the *parallel*
+    /// per-vertex bone-id stream; vertex positions stay 24 bytes and
+    /// the bone id lives here.
+    pub bone_indices_count: u16,
     pub off_vertex_bytes: usize,
     pub off_poly_load_bytes: usize,
     pub poly_lod2_count: u16,
@@ -153,12 +162,58 @@ impl Vos2Header {
             flip: u16_at(0x04),
             off_poly_bytes: u32_at(0x06) as usize * 2,
             off_bone_table_bytes: u32_at(0x0C) as usize * 2,
+            bone_table_count: u16_at(0x10),
             off_weight_bytes: u32_at(0x12) as usize * 2,
             off_bone_bytes: u32_at(0x18) as usize * 2,
+            bone_indices_count: u16_at(0x1C),
             off_vertex_bytes: u32_at(0x1E) as usize * 2,
             off_poly_load_bytes: u32_at(0x24) as usize * 2,
             poly_lod2_count: u16_at(0x32),
         })
+    }
+
+    /// Whether the per-vertex `bone_index` (7-bit) is an index into
+    /// the [`Vos2Mesh::bone_table`] palette (`true`) or a direct
+    /// skeleton-bone index (`false`).
+    ///
+    /// Source: lotus-ffxi `os2.cppm`, `mVertAndBoneRefFlag & 0x80`
+    /// (the field this crate reads as `kind_type`).
+    pub fn use_bone_table(&self) -> bool {
+        (self.kind_type & 0x80) != 0
+    }
+}
+
+/// One 16-bit packed bone-assignment record. Each vertex pulls bone
+/// indices from a *parallel* stream at `off_bone_bytes` — they are
+/// **not** stored inline in the 24-byte vertex record.
+///
+/// Bit layout (LSB first, matching lotus-ffxi's bitfield order on
+/// little-endian targets):
+///
+/// ```text
+///   bits  0..7   bone_index1   (primary bone — used for 1-weight verts)
+///   bits  7..14  bone_index2   (secondary bone — used for 2-weight verts)
+///   bits 14..16  mirror_axis
+/// ```
+///
+/// For 1-weight (rigid) vertices the renderer uses `bone_index1`
+/// directly. For 2-weight (skinned) vertices it blends bone1/bone2
+/// per the weight pair in the vertex record.
+#[derive(Debug, Clone, Copy)]
+pub struct Vos2BoneIndices {
+    pub bone_index1: u8,
+    pub bone_index2: u8,
+    pub mirror_axis: u8,
+}
+
+impl Vos2BoneIndices {
+    /// Unpack one packed 16-bit record from raw little-endian bytes.
+    pub fn from_u16(w: u16) -> Self {
+        Self {
+            bone_index1: (w & 0x7F) as u8,
+            bone_index2: ((w >> 7) & 0x7F) as u8,
+            mirror_axis: ((w >> 14) & 0x03) as u8,
+        }
     }
 }
 
@@ -192,11 +247,65 @@ pub struct Vos2Group {
 /// of triangles. Equivalent to one MMB sub-record from the caller's
 /// perspective — but a VertexOs2 chunk may have many groups, each
 /// with its own texture.
+///
+/// `bone_table` and `bone_indices` are surfaced for the skinned-mesh
+/// pipeline (Sk2 + bind-pose bake). They are populated when the
+/// corresponding header offsets/counts are non-zero; meshes that
+/// don't carry skin data leave both empty.
 #[derive(Debug, Clone)]
 pub struct Vos2Mesh {
     pub header: Vos2Header,
     pub vertices: Vec<Vos2Vertex>,
     pub groups: Vec<Vos2Group>,
+    /// Bone palette: `Vec<skeleton_bone_index>` of length
+    /// `header.bone_table_count`. The per-vertex `bone_index` field
+    /// indexes this palette when `header.use_bone_table()` is true;
+    /// otherwise it indexes the skeleton directly.
+    pub bone_table: Vec<u16>,
+    /// Parallel per-vertex bone-assignment stream. Each entry is the
+    /// 16-bit packed `(bone1:7, bone2:7, mirror:2)` record. The
+    /// vertex→entry mapping is layout-dependent (1-weight verts and
+    /// 2-weight verts consume different numbers of entries — see
+    /// [`Vos2Mesh::skeleton_bone_for`]).
+    pub bone_indices: Vec<Vos2BoneIndices>,
+}
+
+impl Vos2Mesh {
+    /// Resolve the **skeleton-bone index** for vertex `vertex_idx`,
+    /// honoring [`Vos2Header::use_bone_table`]. Returns `None` if the
+    /// vertex has no recoverable bone assignment (e.g., a mesh that
+    /// shipped without a `bone_indices` stream, or an out-of-range
+    /// vertex index).
+    ///
+    /// Per lotus-ffxi's reader, 1-weight (rigid) vertices each
+    /// consume *two* `BoneIndices` records (primary + mirror pair)
+    /// from the parallel stream; 2-weight (skinned) vertices each
+    /// consume *one* record per sub-vertex. We follow that cadence:
+    /// the first `weight1 * 2` entries cover the rigid pool (each
+    /// rigid vertex at index `i` reads from `bone_indices[i * 2]`),
+    /// and the remaining `weight2 * 2` entries cover the skinned
+    /// pool's interleaved pairs.
+    ///
+    /// For 2-weight verts we return the *primary* bone
+    /// (`bone_index1`); a full skinning bake would also need
+    /// `bone_index2` and the weight pair from the vertex record.
+    pub fn skeleton_bone_for(&self, vertex_idx: usize) -> Option<u16> {
+        let raw = self.raw_bone_index_for(vertex_idx)?;
+        let raw = raw as u16;
+        if self.header.use_bone_table() {
+            self.bone_table.get(raw as usize).copied()
+        } else {
+            Some(raw)
+        }
+    }
+
+    /// Return `bone_index1` for `vertex_idx` *before* the
+    /// [`Vos2Header::use_bone_table`] indirection. Exposed for
+    /// callers that want to inspect the raw stream (debug/tests).
+    pub fn raw_bone_index_for(&self, vertex_idx: usize) -> Option<u8> {
+        let bi_idx = vertex_idx.checked_mul(2)?;
+        self.bone_indices.get(bi_idx).map(|b| b.bone_index1)
+    }
 }
 
 /// Parse a VertexOs2 chunk body into a bind-pose mesh.
@@ -269,10 +378,57 @@ pub fn parse_vos2(body: &[u8]) -> Result<Vos2Mesh> {
     // unknown opcode terminates the walk.
     let groups = parse_poly_block(body, header.off_poly_bytes)?;
 
+    // Bone palette: `bone_table_count` × u16 starting at
+    // `off_bone_table_bytes`. Tolerate count=0 by yielding an empty
+    // table — many meshes ship without one (the per-vertex bone_id
+    // is then a direct skeleton index, gated by use_bone_table).
+    let mut bone_table = Vec::with_capacity(header.bone_table_count as usize);
+    if header.bone_table_count > 0 {
+        let bt_end = header
+            .off_bone_table_bytes
+            .saturating_add(header.bone_table_count as usize * 2);
+        if bt_end > body.len() {
+            return Err(Vos2Error::SectionOob {
+                section: "bone_table",
+                byte_offset: header.off_bone_table_bytes,
+                body_len: body.len(),
+            }
+            .into());
+        }
+        for i in 0..header.bone_table_count as usize {
+            let o = header.off_bone_table_bytes + i * 2;
+            bone_table.push(u16::from_le_bytes([body[o], body[o + 1]]));
+        }
+    }
+
+    // Parallel bone-id stream: `bone_indices_count` × packed u16
+    // records at `off_bone_bytes`. Same tolerance: count=0 → empty.
+    let mut bone_indices = Vec::with_capacity(header.bone_indices_count as usize);
+    if header.bone_indices_count > 0 {
+        let bi_end = header
+            .off_bone_bytes
+            .saturating_add(header.bone_indices_count as usize * 2);
+        if bi_end > body.len() {
+            return Err(Vos2Error::SectionOob {
+                section: "bone_indices",
+                byte_offset: header.off_bone_bytes,
+                body_len: body.len(),
+            }
+            .into());
+        }
+        for i in 0..header.bone_indices_count as usize {
+            let o = header.off_bone_bytes + i * 2;
+            let w = u16::from_le_bytes([body[o], body[o + 1]]);
+            bone_indices.push(Vos2BoneIndices::from_u16(w));
+        }
+    }
+
     Ok(Vos2Mesh {
         header,
         vertices,
         groups,
+        bone_table,
+        bone_indices,
     })
 }
 
@@ -589,5 +745,147 @@ mod tests {
         // convention so a future PR doesn't silently flip it.
         assert_eq!(tris[1].indices, [1, 2, 3]);
         assert_eq!(tris[2].indices, [3, 2, 4]);
+    }
+
+    /// Bit-unpack the packed bone-indices word. The layout is
+    /// lifted from lotus-ffxi `os2.cppm` and the test pins all three
+    /// fields against a hand-rolled word so a future "simplify" PR
+    /// can't quietly reshape it.
+    #[test]
+    fn bone_indices_unpacks_bitfields() {
+        // bone1=0x03, bone2=0x05, mirror=0x02
+        //   = (0x02 << 14) | (0x05 << 7) | 0x03
+        //   = 0x8000 | 0x0280 | 0x0003 = 0x8283
+        let bi = Vos2BoneIndices::from_u16(0x8283);
+        assert_eq!(bi.bone_index1, 0x03);
+        assert_eq!(bi.bone_index2, 0x05);
+        assert_eq!(bi.mirror_axis, 0x02);
+    }
+
+    #[test]
+    fn use_bone_table_reads_bit7_of_kind_type() {
+        let mut h = Vos2Header::parse(&{
+            let mut buf = vec![0u8; 0x40];
+            buf[2..4].copy_from_slice(&0x0080u16.to_le_bytes()); // bit 7 set
+            buf
+        })
+        .unwrap();
+        assert!(h.use_bone_table(), "bit 7 set must report true");
+        h.kind_type = 0x007F;
+        assert!(!h.use_bone_table(), "bit 7 clear must report false");
+    }
+
+    /// End-to-end: a synthetic chunk with a 2-entry bone palette
+    /// and one bone-indices record. `skeleton_bone_for(0)` must
+    /// indirect through `bone_table` when the use_bone_table flag is
+    /// set, and return the raw index when it isn't.
+    #[test]
+    fn skeleton_bone_for_honors_use_bone_table_flag() {
+        // Hand-build a minimal Vos2Mesh; bypass parse_vos2 since we
+        // just want to exercise the resolver logic.
+        let mut mesh = Vos2Mesh {
+            header: Vos2Header::parse(&vec![0u8; 0x40]).unwrap(),
+            vertices: vec![Vos2Vertex {
+                pos: [0.0; 3],
+                normal: [0.0; 3],
+            }],
+            groups: vec![],
+            // palette: [0]=bone 17, [1]=bone 42
+            bone_table: vec![17, 42],
+            // vertex 0 → bone_indices[0]: bone_index1 = 1 (palette[1])
+            bone_indices: vec![
+                Vos2BoneIndices {
+                    bone_index1: 1,
+                    bone_index2: 0,
+                    mirror_axis: 0,
+                },
+                // second slot for vertex 0 (rigid verts consume 2)
+                Vos2BoneIndices {
+                    bone_index1: 0,
+                    bone_index2: 0,
+                    mirror_axis: 0,
+                },
+            ],
+        };
+
+        // use_bone_table = true → resolver goes through palette.
+        mesh.header.kind_type = 0x0080;
+        assert_eq!(mesh.skeleton_bone_for(0), Some(42));
+
+        // use_bone_table = false → raw value is the skeleton index.
+        mesh.header.kind_type = 0x0000;
+        assert_eq!(mesh.skeleton_bone_for(0), Some(1));
+
+        // Out-of-range vertex → None, never panics.
+        assert_eq!(mesh.skeleton_bone_for(100), None);
+    }
+
+    /// Parser populates bone_table and bone_indices from a real
+    /// (synthetic) layout, with both sections inside the body. This
+    /// is the integration-shaped test — anything that breaks the
+    /// header offsets or the bounds-check will trip it.
+    #[test]
+    fn parse_populates_bone_table_and_indices() {
+        const VSTART: usize = 0x80;
+        const POLYSTART: usize = 0x40;
+        const WSTART: usize = 0x70;
+        const BTSTART: usize = 0x100;
+        const BISTART: usize = 0x110;
+        const VERTEX_COUNT: usize = 2;
+        let mut buf = vec![0u8; 0x200];
+
+        // Header — word units for all offsets (*2 for bytes).
+        buf[0] = 0x01;
+        // type: bit 7 set → use_bone_table = true
+        buf[2..4].copy_from_slice(&0x0080u16.to_le_bytes());
+        // offsetPoly @ 0x06
+        buf[6..10].copy_from_slice(&((POLYSTART as u32) / 2).to_le_bytes());
+        // offsetBoneTbl @ 0x0C, BoneTblSuu @ 0x10 = 3
+        buf[0x0C..0x10].copy_from_slice(&((BTSTART as u32) / 2).to_le_bytes());
+        buf[0x10..0x12].copy_from_slice(&3u16.to_le_bytes());
+        // offsetWeight @ 0x12
+        buf[0x12..0x16].copy_from_slice(&((WSTART as u32) / 2).to_le_bytes());
+        // offsetBone @ 0x18, BoneSuu @ 0x1C = 4
+        buf[0x18..0x1C].copy_from_slice(&((BISTART as u32) / 2).to_le_bytes());
+        buf[0x1C..0x1E].copy_from_slice(&4u16.to_le_bytes());
+        // offsetVertex @ 0x1E
+        buf[0x1E..0x22].copy_from_slice(&((VSTART as u32) / 2).to_le_bytes());
+
+        // weight1=2, weight2=0
+        buf[WSTART..WSTART + 2].copy_from_slice(&(VERTEX_COUNT as i16).to_le_bytes());
+        buf[WSTART + 2..WSTART + 4].copy_from_slice(&0i16.to_le_bytes());
+
+        // 2 vertices, identity positions
+        for i in 0..VERTEX_COUNT {
+            let off = VSTART + i * 24;
+            buf[off..off + 4].copy_from_slice(&(i as f32).to_le_bytes());
+        }
+
+        // Bone table: [10, 20, 30]
+        for (i, &v) in [10u16, 20, 30].iter().enumerate() {
+            buf[BTSTART + i * 2..BTSTART + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        }
+
+        // Bone indices stream: vertex 0 → palette[1]=20; vertex 1 → palette[2]=30
+        // (rigid verts consume 2 records each; only the first matters).
+        let bi0 = (0u16 << 14) | (0u16 << 7) | 1u16; // bone1=1
+        let bi1 = 0u16; // pad slot
+        let bi2 = (0u16 << 14) | (0u16 << 7) | 2u16; // bone1=2
+        let bi3 = 0u16;
+        for (i, &w) in [bi0, bi1, bi2, bi3].iter().enumerate() {
+            buf[BISTART + i * 2..BISTART + i * 2 + 2].copy_from_slice(&w.to_le_bytes());
+        }
+
+        // Empty poly block — terminator at POLYSTART (already zero).
+
+        let mesh = parse_vos2(&buf).unwrap();
+        assert_eq!(mesh.bone_table, vec![10, 20, 30]);
+        assert_eq!(mesh.bone_indices.len(), 4);
+        assert_eq!(mesh.bone_indices[0].bone_index1, 1);
+        assert_eq!(mesh.bone_indices[2].bone_index1, 2);
+
+        // Resolver: vertex 0 → palette[1] = 20; vertex 1 → palette[2] = 30.
+        assert_eq!(mesh.skeleton_bone_for(0), Some(20));
+        assert_eq!(mesh.skeleton_bone_for(1), Some(30));
     }
 }
