@@ -171,19 +171,19 @@ pub fn spawn_sun_and_moon(
         Transform::from_xyz(0.0, -LIGHT_DISTANCE, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // Visible discs. Emissive `StandardMaterial` with high HDR
-    // emissive intensity so the OLD_SCHOOL bloom halos them. Real
-    // emissive values are written each frame by `sun_moon_system`.
+    // Visible discs. Bevy 0.17's `pbr.wgsl` unlit branch (line 82-86)
+    // returns `base_color` directly and never reads `emissive` — so HDR
+    // colors must live in `base_color` for the bloom halo to fire.
+    // `unlit: true` keeps the disc self-luminous (no shading on top).
+    // Real per-frame colors are written by `sun_moon_system`.
     let sphere = meshes.add(Sphere::new(1.0).mesh().ico(3).unwrap());
     let sun_mat = materials.add(StandardMaterial {
-        base_color: Color::BLACK,
-        emissive: LinearRgba::new(20.0, 18.0, 10.0, 1.0),
+        base_color: Color::linear_rgb(20.0, 18.0, 10.0),
         unlit: true,
         ..default()
     });
     let moon_mat = materials.add(StandardMaterial {
-        base_color: Color::BLACK,
-        emissive: LinearRgba::new(2.0, 2.4, 4.0, 1.0),
+        base_color: Color::linear_rgb(2.0, 2.4, 4.0),
         unlit: true,
         ..default()
     });
@@ -363,10 +363,11 @@ pub fn sun_moon_system(
         *vis = if moon_visible { Visibility::Inherited } else { Visibility::Hidden };
     }
 
-    // Recolor emissives. Sun emissive scales with daylight (so dawn /
-    // dusk sun reads as deep red, noon as blinding white). Moon
-    // emissive scales by phase visibility — new moon fades to nearly
-    // invisible.
+    // Recolor base_color (NOT emissive — unlit ignores emissive). Sun
+    // brightness scales with daylight (dawn/dusk red, noon blinding
+    // white). Moon brightness scales by phase visibility — new moon
+    // fades to nearly invisible (also gated by Visibility::Hidden
+    // above for the hard cutoff).
     if let Some(handles) = materials_handle.as_deref() {
         if let Some(sun_mat) = materials.get_mut(&handles.sun) {
             let visible = sky.sun_altitude.max(-0.2);
@@ -379,11 +380,10 @@ pub fn sun_moon_system(
                 (1.0 + 5.0 * (visible + 0.2) / 0.2).max(0.0)
             };
             let c = sun_color.to_linear();
-            sun_mat.emissive = LinearRgba::new(
+            sun_mat.base_color = Color::linear_rgb(
                 c.red * intensity,
                 c.green * intensity * 0.95,
                 c.blue * intensity * 0.75,
-                1.0,
             );
         }
         if let Some(moon_mat) = materials.get_mut(&handles.moon) {
@@ -394,8 +394,8 @@ pub fn sun_moon_system(
             } else {
                 0.0
             };
-            moon_mat.emissive =
-                LinearRgba::new(0.65 * intensity, 0.80 * intensity, 1.20 * intensity, 1.0);
+            moon_mat.base_color =
+                Color::linear_rgb(0.65 * intensity, 0.80 * intensity, 1.20 * intensity);
         }
     }
 }

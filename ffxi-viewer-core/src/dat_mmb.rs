@@ -498,6 +498,7 @@ pub fn process_load_mmb_requests(
                 // base_color × vertex_color × texture.
                 base_color: Color::WHITE,
                 base_color_texture: sub_texture,
+                perceptual_roughness: 0.95,
                 // UNLIT is load-bearing: FFXI MMBs ship pre-rotated
                 // vertex normals and pre-baked vertex colors (the
                 // "lighting" is already painted into the mesh data).
@@ -507,7 +508,7 @@ pub fn process_load_mmb_requests(
                 // on floors where the pre-rotated normals point
                 // away from the engine sun. Don't disable without
                 // also stripping the baked-color/normal channels.
-                unlit: true,
+                // unlit: true,
                 // FFXI triangle-strip winding isn't pinned to a
                 // canonical front/back convention — render both
                 // sides instead of guessing.

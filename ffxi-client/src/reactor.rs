@@ -570,7 +570,7 @@ impl Reactor {
             let dy = player.y - line.from_pos[1];
             let ground_dist = (dx * dx + dy * dy).sqrt();
             if ground_dist <= 5.0 {
-                tracing::info!(
+                tracing::debug!(
                     line_id = line.line_id,
                     to_zone = line.to_zone,
                     player_xy = format!("({:.2},{:.2})", player.x, player.y),
