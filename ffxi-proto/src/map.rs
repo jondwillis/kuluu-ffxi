@@ -185,6 +185,13 @@ pub mod s2c {
     /// countdown ticker (id 7) hits this opcode every 5s. See
     /// `vendor/server/src/map/packets/s2c/0x053_systemmes.h`.
     pub const SYSTEMMES: u16 = 0x053;
+    /// `GP_SERV_COMMAND_WEATHER` — current zone weather. Body:
+    /// `u32 StartTime, u16 WeatherNumber, u16 WeatherOffsetTime` = 8 bytes.
+    /// `WeatherNumber` indexes LSB's `Weather` enum (values 0x00..=0x13;
+    /// 0x14..=0x27 wrap via mod-20 — see `Weather::from_lsb`). See
+    /// `vendor/server/src/map/packets/s2c/0x057_weather.h` and
+    /// `vendor/server/src/map/enums/weather.h`.
+    pub const WEATHER: u16 = 0x057;
     pub const EQUIP_CLEAR: u16 = 0x04F;
     pub const EQUIP_LIST: u16 = 0x050;
     pub const GRAP_LIST: u16 = 0x051;

@@ -324,6 +324,18 @@ pub struct SessionState {
     /// before insertion so the list represents only real effects.
     #[serde(default)]
     pub status_icons: Vec<u16>,
+    /// Most recent `WeatherNumber` from 0x057 WEATHER. `None` until the
+    /// first weather packet for the current zone arrives, and cleared
+    /// on zone change since the new zone always re-sends weather.
+    /// Stored as the raw LSB index (per `vendor/server/src/map/enums/weather.h`)
+    /// to keep `state.rs` decoupled from the optional `ffxi-viewer-wire`
+    /// crate — same rationale as `DialogState` / `ShopState` mirroring.
+    /// Mapped to `ffxi_viewer_wire::Weather` via `Weather::from_lsb` at
+    /// snapshot time in `wire_translate::state_to_snapshot` (pending the
+    /// wire-side `SceneSnapshot.weather` field landing — currently absent
+    /// from `ffxi-viewer-wire`).
+    #[serde(default)]
+    pub current_weather: Option<u16>,
 }
 
 /// Mirror of `ffxi_viewer_wire::DialogState` defined locally so `state.rs`
@@ -667,6 +679,11 @@ impl SessionState {
                 // packet, so `is_dead` would briefly stay `true`).
                 self.entities.clear();
                 self.party.clear();
+                // Weather is per-zone; the new zone will send a fresh
+                // 0x057. Clearing here means consumers see `None` during
+                // the brief zoning window rather than stale conditions
+                // from the previous zone.
+                self.current_weather = None;
             }
             AgentEvent::PositionChanged { pos } => {
                 // Single source of truth: the self entity in the entity list.
@@ -903,6 +920,9 @@ impl SessionState {
             AgentEvent::StatusIconsUpdated { icons } => {
                 self.status_icons = icons.clone();
             }
+            AgentEvent::WeatherUpdated { weather_number } => {
+                self.current_weather = Some(*weather_number);
+            }
             AgentEvent::EventEnded => {
                 self.dialog = None;
                 // Shops live inside an event in vanilla; clearing on
@@ -1003,6 +1023,13 @@ pub enum AgentEvent {
     /// time an effect lands or expires.
     StatusIconsUpdated {
         icons: Vec<u16>,
+    },
+    /// 0x057 WEATHER — current zone weather. Carries the raw LSB
+    /// `WeatherNumber`; consumers should map via
+    /// `ffxi_viewer_wire::Weather::from_lsb`. The server re-sends one of
+    /// these on every zone-in plus whenever weather changes mid-zone.
+    WeatherUpdated {
+        weather_number: u16,
     },
     EventEnded,
     KeyRotated {
@@ -1589,6 +1616,22 @@ impl ActionKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `WeatherUpdated` folds onto `SessionState.current_weather`, and
+    /// `ZoneChanged` clears it — verifying both halves of the per-zone
+    /// lifecycle covered in the field's doc comment.
+    #[test]
+    fn weather_fold_sets_and_zone_change_clears() {
+        let mut s = SessionState::default();
+        assert_eq!(s.current_weather, None);
+        s.apply_event(&AgentEvent::WeatherUpdated { weather_number: 6 });
+        assert_eq!(s.current_weather, Some(6));
+        s.apply_event(&AgentEvent::ZoneChanged {
+            from: Some(230),
+            to: 231,
+        });
+        assert_eq!(s.current_weather, None);
+    }
 
     #[test]
     fn agent_event_roundtrip() {

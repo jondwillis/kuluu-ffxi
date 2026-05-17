@@ -59,6 +59,10 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         shop: s.shop.as_ref().map(shop_to_wire),
         // Plain `Vec<u16>` clone — no per-element translation needed.
         status_icons: s.status_icons.clone(),
+        // Translate raw LSB weather id (kept as u16 in SessionState to
+        // keep state.rs feature-decoupled from `ffxi-viewer-wire`) into
+        // the typed enum at the wire boundary.
+        weather: s.current_weather.map(wire::Weather::from_lsb),
     }
 }
 

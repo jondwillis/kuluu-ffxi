@@ -527,6 +527,38 @@ pub fn decode_system_message(sub: &SubPacket<'_>) -> Result<SystemMessage, Decod
     SystemMessage::decode(sub.data)
 }
 
+/// `GP_SERV_COMMAND_WEATHER` (0x057) — current zone weather. Body layout
+/// per `vendor/server/src/map/packets/s2c/0x057_weather.h`:
+/// `u32 StartTime, u16 WeatherNumber, u16 WeatherOffsetTime` = 8 bytes.
+/// `weather_number` is an index into LSB's `Weather` enum
+/// (`vendor/server/src/map/enums/weather.h`); map to a typed variant via
+/// `ffxi_viewer_wire::Weather::from_lsb`.
+#[derive(Debug, Clone, Copy)]
+pub struct WeatherPacket {
+    pub start_time: u32,
+    pub weather_number: u16,
+    pub offset_time: u16,
+}
+
+impl WeatherPacket {
+    pub const SIZE: usize = 8;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        Ok(Self {
+            start_time: u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            weather_number: u16::from_le_bytes(body[4..6].try_into().unwrap()),
+            offset_time: u16::from_le_bytes(body[6..8].try_into().unwrap()),
+        })
+    }
+}
+
+pub fn decode_weather(sub: &SubPacket<'_>) -> Result<WeatherPacket, DecodeError> {
+    WeatherPacket::decode(sub.data)
+}
+
 /// Common party-member fields shared by `0x0DD GROUP_LIST` (other members)
 /// and `0x0DF GROUP_ATTR` (self + Trust). Field offsets / types mirror
 /// `Phoenix/src/map/packets/s2c/0x0d{d,f}_group_*.h`.
@@ -1688,5 +1720,30 @@ mod tests {
         let sync = CharSync::decode(&buf).unwrap();
         assert_eq!(sync.targid, 0x07F0);
         assert_eq!(sync.id, 0x0123_4567);
+    }
+
+    /// `0x057 WEATHER` body is `u32 StartTime, u16 WeatherNumber,
+    /// u16 WeatherOffsetTime`. Confirm little-endian decode of each field.
+    #[test]
+    fn weather_packet_decodes_fields() {
+        let mut buf = [0u8; WeatherPacket::SIZE];
+        buf[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // StartTime
+        buf[4..6].copy_from_slice(&6u16.to_le_bytes()); // WeatherNumber = Rain
+        buf[6..8].copy_from_slice(&0x0123u16.to_le_bytes()); // WeatherOffsetTime
+        let w = WeatherPacket::decode(&buf).unwrap();
+        assert_eq!(w.start_time, 0xDEAD_BEEF);
+        assert_eq!(w.weather_number, 6);
+        assert_eq!(w.offset_time, 0x0123);
+    }
+
+    /// Truncated body (one byte short of the 8-byte fixed layout) returns
+    /// `DecodeError::Truncated` instead of panicking.
+    #[test]
+    fn weather_packet_truncated_returns_err() {
+        let buf = [0u8; WeatherPacket::SIZE - 1];
+        assert!(matches!(
+            WeatherPacket::decode(&buf),
+            Err(DecodeError::Truncated(WeatherPacket::SIZE, n)) if n == WeatherPacket::SIZE - 1
+        ));
     }
 }

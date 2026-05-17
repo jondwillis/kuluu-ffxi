@@ -775,6 +775,18 @@ fn handle_sub_packet(
             // it as "unknown opcode" once per action frame; intentionally
             // a no-op until we ship a bitstream decoder.
         }
+        op if op == s2c::WEATHER => {
+            // 0x057 — current zone weather. 8-byte fixed body:
+            // `u32 StartTime, u16 WeatherNumber, u16 OffsetTime`. We only
+            // surface `WeatherNumber` today; StartTime/OffsetTime would
+            // let a future HUD render a "time until next change" hint
+            // but no consumer needs them yet.
+            if let Ok(w) = decode::WeatherPacket::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::WeatherUpdated {
+                    weather_number: w.weather_number,
+                });
+            }
+        }
         op if op == s2c::MISCDATA => {
             // 0x063 multiplexes by `type:u16`. Today we only consume
             // type=0x09 STATUS_ICONS — other types (Merits, JobPoints,
