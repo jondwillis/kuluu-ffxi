@@ -92,6 +92,51 @@ pub enum BlowfishStatus {
     PendingZone,
 }
 
+/// Vana'diel weather state. Variant order mirrors LSB's
+/// `vendor/server/src/map/enums/weather.h` 1-to-1 (values 0x00..=0x13);
+/// LSB occasionally sends 0x14..=0x27 as "repeated/intense" variants —
+/// `Weather::from_lsb` collapses unknown bytes via mod-20.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Weather {
+    #[default]
+    None,
+    Sunshine,
+    Clouds,
+    Fog,
+    HotSpell,
+    HeatWave,
+    Rain,
+    Squall,
+    DustStorm,
+    SandStorm,
+    Wind,
+    Gales,
+    Snow,
+    Blizzards,
+    Thunder,
+    Thunderstorms,
+    Auroras,
+    StellarGlare,
+    Gloom,
+    Darkness,
+}
+
+impl Weather {
+    /// Map an LSB `WeatherNumber` byte (from packet 0x057) into a variant.
+    /// Unknown values (including 0x14..=0x27 "repeated" range — see enum
+    /// doc) collapse to the nearest known type via mod-20.
+    pub fn from_lsb(n: u16) -> Self {
+        use Weather::*;
+        const TABLE: [Weather; 20] = [
+            None, Sunshine, Clouds, Fog, HotSpell, HeatWave, Rain, Squall,
+            DustStorm, SandStorm, Wind, Gales, Snow, Blizzards, Thunder,
+            Thunderstorms, Auroras, StellarGlare, Gloom, Darkness,
+        ];
+        TABLE[(n as usize) % TABLE.len()]
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
@@ -331,6 +376,10 @@ pub struct SceneSnapshot {
     /// table — translation to text/sprite lives in the front-end.
     #[serde(default)]
     pub status_icons: Vec<u16>,
+    /// Last weather state received from the server (opcode 0x057). `None`
+    /// until the first weather packet for the current zone arrives.
+    #[serde(default)]
+    pub weather: Option<Weather>,
 }
 
 /// Active NPC event/dialog metadata. Built from 0x032 (event), 0x033
