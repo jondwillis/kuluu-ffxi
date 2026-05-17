@@ -1612,6 +1612,12 @@ fn render_debug_nearby(
     current_target: Option<u32>,
 ) -> String {
     let mut out = String::new();
+
+    // Target line.
+    match current_target.and_then(|id| entities.iter().find(|e| e.id == id)) {
+        Some(t) => {
+            let name = t.name.as_deref().unwrap_or("?");
+            let d = sq_dist(t.pos, self_pos).sqrt();
             let hp = t
                 .hp_pct
                 .map(|p| format!("{p}%"))
@@ -1630,6 +1636,17 @@ fn render_debug_nearby(
         None => out.push_str("target: none"),
     }
     out.push('\n');
+
+    // Header + nearby rows.
+    out.push_str("nearby (top 10 by dist):");
+    let nearby = nearby_entities(entities, self_pos, 10);
+    if nearby.is_empty() {
+        out.push_str(" (none)");
+        return out;
+    }
+    for (e, sq) in nearby {
+        let d = sq.sqrt();
+        let name = e.name.as_deref().unwrap_or("?");
         let hp = e
             .hp_pct
             .map(|p| format!("{p}%"))
