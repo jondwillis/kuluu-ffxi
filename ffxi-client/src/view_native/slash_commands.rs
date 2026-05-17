@@ -1597,6 +1597,29 @@ fn parse_debug(
     }
 }
 
+/// One-letter summary of an `EntityLook` for the wide nearby table.
+fn look_tag(look: Option<&ffxi_viewer_wire::EntityLook>) -> &'static str {
+    use ffxi_viewer_wire::EntityLook;
+    match look {
+        None => "--",
+        Some(EntityLook::Standard { .. }) => "std",
+        Some(EntityLook::Equipped { .. }) => "eq",
+        Some(EntityLook::Door { .. }) => "door",
+        Some(EntityLook::Transport { .. }) => "tx",
+    }
+}
+
+fn kind_tag(kind: ffxi_viewer_wire::EntityKind) -> &'static str {
+    use ffxi_viewer_wire::EntityKind;
+    match kind {
+        EntityKind::Pc => "pc",
+        EntityKind::Npc => "npc",
+        EntityKind::Mob => "mob",
+        EntityKind::Pet => "pet",
+        EntityKind::Other => "?",
+    }
+}
+
 /// Render the `/debug` (no args) report: one line for the current
 /// target, then a header + 10 nearest entities sorted by 2D distance.
 ///
