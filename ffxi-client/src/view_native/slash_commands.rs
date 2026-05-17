@@ -123,6 +123,11 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 summary: "set or clear current target",
             },
             HelpEntry {
+                aliases: &["debug", "dbg", "nearby", "entities"],
+                usage: "[name|id|heights]",
+                summary: "dump current target + nearby entities (or one entity in detail)",
+            },
+            HelpEntry {
                 aliases: &["check", "checkname", "checkparam"],
                 usage: "[name]",
                 summary: "check target — strength / name / parameters",
@@ -707,7 +712,9 @@ pub fn parse_slash(
         "fps" => parse_fps(rest),
         "drawdistance" | "dd" => parse_drawdistance(rest),
         "zonegeom" => parse_zonegeom(rest),
-        "debug" => parse_debug(rest),
+        "debug" | "dbg" | "nearby" | "entities" => {
+            parse_debug(rest, entities, self_pos, current_target)
+        }
         "keybinds" | "keybind" | "binds" => parse_keybinds(rest),
         "pathto" => parse_pathto(rest, entities, current_target),
         "zones" => parse_zones(zone_id),
@@ -1520,15 +1527,158 @@ fn parse_zoneto(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
 /// `/debug <subcommand>` — namespaced diagnostics. Currently:
 ///   - `heights` — dump player/navmesh/MZB collision heights at the
 ///     player's XZ. Used to diagnose the navmesh-vs-MZB vertical gap.
-fn parse_debug(rest: &str) -> SlashOutcome {
-    let arg = rest.trim().to_ascii_lowercase();
-    match arg.as_str() {
+/// `/debug` family — diagnostic dumps for the entity/target/look
+/// surface.
+///
+/// Subcommands:
+///   - `/debug heights` (alias `h`) — height-stack overlay.
+///   - `/debug` (no args) — current target + 10 nearest entities.
+///   - `/debug <name|id|act_idx>` — single-entity detail dump.
+fn parse_debug(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+) -> SlashOutcome {
+    let trimmed = rest.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
         "heights" | "h" => SlashOutcome::DebugHeights,
-        "" => SlashOutcome::SystemMessage("/debug: subcommands — `heights`".to_string()),
-        other => SlashOutcome::SystemMessage(format!(
-            "/debug: unknown subcommand `{other}` (try `heights`)"
+        "" => SlashOutcome::SystemMessage(render_debug_nearby(
+            entities,
+            self_pos,
+            current_target,
+        )),
+        _ => SlashOutcome::SystemMessage(render_debug_entity(
+            trimmed, entities, self_pos,
         )),
     }
+}
+
+fn look_tag(look: Option<&ffxi_viewer_wire::EntityLook>) -> &'static str {
+    use ffxi_viewer_wire::EntityLook;
+    match look {
+        None => "--",
+        Some(EntityLook::Standard { .. }) => "std",
+        Some(EntityLook::Equipped { .. }) => "eq",
+        Some(EntityLook::Door { .. }) => "door",
+        Some(EntityLook::Transport { .. }) => "tx",
+    }
+}
+
+fn kind_tag(kind: ffxi_viewer_wire::EntityKind) -> &'static str {
+    use ffxi_viewer_wire::EntityKind;
+    match kind {
+        EntityKind::Pc => "pc",
+        EntityKind::Npc => "npc",
+        EntityKind::Mob => "mob",
+        EntityKind::Pet => "pet",
+        EntityKind::Other => "?",
+    }
+}
+
+/// One-line target summary + table of 10 nearest entities. The self
+/// entity is tagged via exact `pos == self_pos` match — `self_pos` is
+/// derived from the self entity in the snapshot (see
+/// `state.rs::self_position`), so equality is exact when self is
+/// present in the entity list.
+fn render_debug_nearby(
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+) -> String {
+    let mut out = String::new();
+    match current_target.and_then(|id| entities.iter().find(|e| e.id == id)) {
+        Some(t) => {
+            let name = t.name.as_deref().unwrap_or("?");
+            let d = sq_dist(t.pos, self_pos).sqrt();
+            let hp = t.hp_pct.map(|p| format!("{p}%")).unwrap_or_else(|| "?".into());
+            out.push_str(&format!(
+                "target: id={} idx={} {} {} dist={:.1}y hp={} look={}",
+                t.id, t.act_index, kind_tag(t.kind), name, d, hp, look_tag(t.look.as_ref()),
+            ));
+        }
+        None => out.push_str("target: none"),
+    }
+    out.push('\n');
+    out.push_str("nearby (top 10 by dist):");
+    let nearby = nearby_entities(entities, self_pos, 10);
+    if nearby.is_empty() {
+        out.push_str(" (none)");
+        return out;
+    }
+    for (e, sq) in nearby {
+        let d = sq.sqrt();
+        let name = e.name.as_deref().unwrap_or("?");
+        let hp = e.hp_pct.map(|p| format!("{p}%")).unwrap_or_else(|| "?".into());
+        let self_tag = if e.pos == self_pos { " (self)" } else { "" };
+        out.push('\n');
+        out.push_str(&format!(
+            "  id={} idx={} {} dist={:.1}y hp={} look={} {}{}",
+            e.id, e.act_index, kind_tag(e.kind), d, hp,
+            look_tag(e.look.as_ref()), name, self_tag,
+        ));
+    }
+    out
+}
+
+fn render_debug_entity(arg: &str, entities: &[WireEntity], self_pos: WireVec3) -> String {
+    let ent: Option<&WireEntity> = if let Ok(id) = arg.parse::<u32>() {
+        entities.iter().find(|e| e.id == id).or_else(|| {
+            u16::try_from(id)
+                .ok()
+                .and_then(|idx| entities.iter().find(|e| e.act_index == idx))
+        })
+    } else {
+        resolve_name(arg, entities, self_pos)
+    };
+    let Some(e) = ent else {
+        return format!("/debug: no entity `{arg}`");
+    };
+    let d = sq_dist(e.pos, self_pos).sqrt();
+    let name = e.name.as_deref().unwrap_or("?");
+    let hp = e.hp_pct.map(|p| format!("{p}%")).unwrap_or_else(|| "?".into());
+    let mut s = format!("/debug [{name}] id={} idx={}\n", e.id, e.act_index);
+    s.push_str(&format!(
+        "  kind={} hp={} dist={:.2}y heading={} speed={}/{}\n",
+        kind_tag(e.kind), hp, d, e.heading, e.speed, e.speed_base,
+    ));
+    s.push_str(&format!(
+        "  pos=({:.2}, {:.2}, {:.2})\n", e.pos.x, e.pos.y, e.pos.z,
+    ));
+    s.push_str(&format!("  bt_target={} claim={}\n", e.bt_target_id, e.claim_id));
+    s.push_str(&format!("  look_tag={}", look_tag(e.look.as_ref())));
+    use ffxi_viewer_wire::EntityLook;
+    match &e.look {
+        None => s.push_str(" (none decoded yet)"),
+        Some(EntityLook::Standard { modelid }) => {
+            s.push_str(&format!(" modelid={modelid} (0x{modelid:04X})"));
+        }
+        Some(EntityLook::Equipped { face, race, head, body, hands, legs, feet, main, sub, ranged }) => {
+            s.push('\n');
+            s.push_str(&format!(
+                "  race={race} face={face} head=0x{head:04X} body=0x{body:04X} hands=0x{hands:04X}\n  legs=0x{legs:04X} feet=0x{feet:04X} main=0x{main:04X} sub=0x{sub:04X} ranged=0x{ranged:04X}",
+            ));
+        }
+        Some(EntityLook::Door { size }) => s.push_str(&format!(" door size={size}")),
+        Some(EntityLook::Transport { size }) => s.push_str(&format!(" transport size={size}")),
+    }
+    s
+}
+
+/// Top-`limit` entities by squared 2D distance from `from`. Includes
+/// self (the entity with `pos == from`) so `/debug` callers see it
+/// tagged explicitly.
+fn nearby_entities<'a>(
+    entities: &'a [WireEntity],
+    from: WireVec3,
+    limit: usize,
+) -> Vec<(&'a WireEntity, f32)> {
+    let mut scored: Vec<(&WireEntity, f32)> = entities
+        .iter().map(|e| (e, sq_dist(e.pos, from))).collect();
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    scored
 }
 
 /// `/zonegeom off|collision|all|toggle` — set MZB overlay visibility.

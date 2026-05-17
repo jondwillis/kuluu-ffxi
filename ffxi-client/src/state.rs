@@ -720,10 +720,18 @@ impl SessionState {
                     // panel doesn't oscillate against an uninitialized zero
                     // byte from the LSB packet buffer.
                     let preserved_hp_pct = entity.hp_pct.or(existing.hp_pct);
+                    // Same gating rationale as `name` / `hp_pct`: only some
+                    // CHAR_PC / CHAR_NPC ticks carry a look block (LSB sets
+                    // it on spawn + appearance-change ticks, not on
+                    // position-only refreshes). A `None` here means "this
+                    // packet didn't carry look data," not "entity lost its
+                    // appearance," so fall back to the prior value.
+                    let preserved_look = entity.look.clone().or_else(|| existing.look.clone());
                     *existing = Entity {
                         name: preserved_name,
                         kind: merged_kind,
                         hp_pct: preserved_hp_pct,
+                        look: preserved_look,
                         ..entity.clone()
                     };
                 } else {
@@ -1987,6 +1995,44 @@ mod tests {
             s.entities[0].hp_pct,
             Some(0),
             "Some(0) (mob died) must overwrite, not get preserved as Some(50)"
+        );
+    }
+
+    #[test]
+    fn entity_upserted_preserves_look_across_position_only_update() {
+        use ffxi_proto::decode::LookData;
+        let mut s = SessionState::default();
+        let mut ent = make_test_entity(42, Some("Jonisbarius"), EntityKind::Pc);
+        let look = LookData::Equipped {
+            face: 3,
+            race: 3,
+            head: 0x1000,
+            body: 0x2004,
+            hands: 0x3000,
+            legs: 0x4000,
+            feet: 0x5000,
+            main: 0x6000,
+            sub: 0x7000,
+            ranged: 0x8000,
+        };
+        ent.look = Some(look.clone());
+        s.apply_event(&AgentEvent::EntityUpserted { entity: ent });
+        assert!(matches!(s.entities[0].look, Some(LookData::Equipped { race: 3, .. })));
+
+        let mut pos_only = make_test_entity(42, None, EntityKind::Pc);
+        pos_only.look = None;
+        s.apply_event(&AgentEvent::EntityUpserted { entity: pos_only });
+        assert!(
+            matches!(s.entities[0].look, Some(LookData::Equipped { race: 3, .. })),
+            "look must persist across position-only refresh"
+        );
+
+        let mut changed = make_test_entity(42, None, EntityKind::Pc);
+        changed.look = Some(LookData::Standard { modelid: 99 });
+        s.apply_event(&AgentEvent::EntityUpserted { entity: changed });
+        assert!(
+            matches!(s.entities[0].look, Some(LookData::Standard { modelid: 99 })),
+            "Some(new_look) must overwrite, not get preserved"
         );
     }
 

@@ -667,6 +667,31 @@ fn handle_sub_packet(
                 } else {
                     None
                 };
+                // Self-CHAR_PC look-decode diagnostic: when our own
+                // CHAR_PC arrives but `decode_char_pc` returns None,
+                // dump the bytes around the GrapIDTbl slot. Tells us
+                // whether LSB is sending a populated look block for
+                // self (retail clients reconstruct appearance from
+                // local equipment state, so LSB may zero the slot
+                // intentionally) or whether the body is shorter than
+                // the GrapIDTbl offset.
+                if op == s2c::CHAR_PC && head.unique_no == self_char_id && look.is_none() {
+                    let start = decode::LookData::CHAR_PC_GRAP_OFFSET;
+                    let end = (start + 18).min(sub.data.len());
+                    let slice = sub.data.get(start..end).unwrap_or(&[]);
+                    let hex: String = slice
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    tracing::info!(
+                        target: "self_look_probe",
+                        body_len = sub.data.len(),
+                        send_flag = sub.data.get(6).copied().unwrap_or(0),
+                        grap_hex = %hex,
+                        "CHAR_PC for self: look decoded None (body[0x44..0x56] dumped)"
+                    );
+                }
                 let _ = event_tx.send(AgentEvent::EntityUpserted {
                     entity: Entity {
                         id: head.unique_no,
