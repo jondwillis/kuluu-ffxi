@@ -84,17 +84,20 @@ pub struct VanaSky {
 pub fn vana_sky_now() -> VanaSky {
     let earth_now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(EARTH_EPOCH_UNIX);
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(EARTH_EPOCH_UNIX as f64);
     vana_sky_from_unix(earth_now)
 }
 
-fn vana_sky_from_unix(earth_unix: u64) -> VanaSky {
-    let since = earth_unix.saturating_sub(EARTH_EPOCH_UNIX);
-    let secs_into_day = (since % EARTH_SECS_PER_VANA_DAY) as f32;
-    let hour = secs_into_day / 25.0; // 25 earth seconds per V-hour.
+fn vana_sky_from_unix(earth_unix: f64) -> VanaSky {
+    // Continuous (sub-second) seconds since the Vana epoch. `max(0.0)`
+    // mirrors the old `saturating_sub` for pre-epoch inputs.
+    let since = (earth_unix - EARTH_EPOCH_UNIX as f64).max(0.0);
+    let day_secs = EARTH_SECS_PER_VANA_DAY as f64;
+    let secs_into_day = since.rem_euclid(day_secs);
+    let hour = (secs_into_day / 25.0) as f32; // 25 earth seconds per V-hour.
 
-    let total_v_days = since / EARTH_SECS_PER_VANA_DAY;
+    let total_v_days = (since / day_secs).floor() as u64;
     let moon_phase = (total_v_days % MOON_CYCLE_VANA_DAYS) as f32 / MOON_CYCLE_VANA_DAYS as f32;
 
     // Sun is above horizon from hour 6 → 18 (noon at 12). Use a half
@@ -195,6 +198,10 @@ pub fn spawn_sun_and_moon(
         Mesh3d(sphere.clone()),
         MeshMaterial3d(sun_mat.clone()),
         Transform::from_scale(Vec3::splat(SUN_DISC_RADIUS)),
+        // Hidden by default; `sun_moon_system` reveals when above horizon.
+        // Without this, a zero-emissive unlit black sphere reads as a
+        // black hole in the sky during night/new-moon.
+        Visibility::Hidden,
         NotShadowCaster,
         NotShadowReceiver,
     ));
@@ -203,6 +210,7 @@ pub fn spawn_sun_and_moon(
         Mesh3d(sphere),
         MeshMaterial3d(moon_mat.clone()),
         Transform::from_scale(Vec3::splat(MOON_DISC_RADIUS)),
+        Visibility::Hidden,
         NotShadowCaster,
         NotShadowReceiver,
     ));
@@ -280,7 +288,7 @@ pub fn sun_moon_system(
         ),
     >,
     mut q_sun_disc: Query<
-        &mut Transform,
+        (&mut Transform, &mut Visibility),
         (
             With<SunDisc>,
             Without<MoonDisc>,
@@ -290,7 +298,7 @@ pub fn sun_moon_system(
         ),
     >,
     mut q_moon_disc: Query<
-        &mut Transform,
+        (&mut Transform, &mut Visibility),
         (
             With<MoonDisc>,
             Without<SunDisc>,
@@ -336,13 +344,23 @@ pub fn sun_moon_system(
     // Visible discs ride the camera so they read as "infinitely far".
     let cam_pos = q_cam.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
 
-    if let Ok(mut disc) = q_sun_disc.single_mut() {
+    // A small below-horizon margin so the sun fades through the horizon
+    // line instead of popping. The emissive curve already dims it down
+    // to -0.2 rad below.
+    let sun_visible = sky.sun_altitude > -0.05;
+    if let Ok((mut disc, mut vis)) = q_sun_disc.single_mut() {
         disc.translation = cam_pos + sun_dir * SKY_RADIUS;
         disc.scale = Vec3::splat(SUN_DISC_RADIUS);
+        *vis = if sun_visible { Visibility::Inherited } else { Visibility::Hidden };
     }
-    if let Ok(mut disc) = q_moon_disc.single_mut() {
+    // Moon: hide when below horizon *or* when phase visibility is ~0
+    // (new moon is invisible by definition).
+    let moon_phase_vis = 1.0 - (sky.moon_phase - 0.5).abs() * 2.0;
+    let moon_visible = sky.moon_altitude > 0.0 && moon_phase_vis > 0.02;
+    if let Ok((mut disc, mut vis)) = q_moon_disc.single_mut() {
         disc.translation = cam_pos + moon_dir * SKY_RADIUS;
         disc.scale = Vec3::splat(MOON_DISC_RADIUS);
+        *vis = if moon_visible { Visibility::Inherited } else { Visibility::Hidden };
     }
 
     // Recolor emissives. Sun emissive scales with daylight (so dawn /
@@ -388,14 +406,14 @@ mod tests {
 
     #[test]
     fn noon_sun_is_overhead() {
-        let sky = vana_sky_from_unix(EARTH_EPOCH_UNIX + 12 * 25);
+        let sky = vana_sky_from_unix((EARTH_EPOCH_UNIX + 12 * 25) as f64);
         assert!((sky.hour - 12.0).abs() < 0.01);
         assert!(sky.sun_altitude > 1.5); // ≈ π/2 = 1.5708
     }
 
     #[test]
     fn midnight_sun_is_below() {
-        let sky = vana_sky_from_unix(EARTH_EPOCH_UNIX); // hour 0
+        let sky = vana_sky_from_unix(EARTH_EPOCH_UNIX as f64); // hour 0
         assert!(sky.sun_altitude < 0.0);
         // And moon is up.
         assert!(sky.moon_altitude > 0.0);
@@ -404,8 +422,19 @@ mod tests {
     #[test]
     fn moon_phase_cycles_every_84_v_days() {
         let one_v_day = EARTH_SECS_PER_VANA_DAY;
-        let s0 = vana_sky_from_unix(EARTH_EPOCH_UNIX);
-        let s84 = vana_sky_from_unix(EARTH_EPOCH_UNIX + 84 * one_v_day);
+        let s0 = vana_sky_from_unix(EARTH_EPOCH_UNIX as f64);
+        let s84 = vana_sky_from_unix((EARTH_EPOCH_UNIX + 84 * one_v_day) as f64);
         assert!((s0.moon_phase - s84.moon_phase).abs() < 1e-4);
+    }
+
+    #[test]
+    fn hour_advances_smoothly_within_a_second() {
+        // Two samples 100ms apart must produce *different* hours —
+        // regression for the old `as_secs()` quantization where the
+        // hour ticked once per real second.
+        let base = EARTH_EPOCH_UNIX as f64 + 6.0; // mid-morning, sun up.
+        let a = vana_sky_from_unix(base);
+        let b = vana_sky_from_unix(base + 0.1);
+        assert!(a.hour != b.hour, "hour did not advance sub-second");
     }
 }
