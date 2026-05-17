@@ -71,19 +71,16 @@ fn main() -> ExitCode {
                 Ok(Some((off, fmt))) => println!("texture magic={fmt:?} at off=0x{off:x}"),
                 _ => println!("no texture magic found"),
             },
-            Some(ChunkKind::Bone) => {
-                if let Some(h) = bone::BoneHeader::parse(chunk.data) {
-                    let bones = bone::find_bone_transform_offsets(chunk.data).unwrap();
-                    println!(
-                        "bones: header_count={} flags={:#x} unit-rot windows={}",
-                        h.count,
-                        h.flags,
-                        bones.len()
-                    );
-                } else {
-                    println!("bone header parse failed");
-                }
-            }
+            Some(ChunkKind::Bone) => match bone::Skeleton::parse(chunk.data) {
+                Ok(skel) => println!(
+                    "bones: count={} pad=0x{:04x} (first bone parent={} flags={})",
+                    skel.header.count,
+                    skel.header.pad,
+                    skel.bones.first().map(|b| b.parent).unwrap_or(0),
+                    skel.bones.first().map(|b| b.flags).unwrap_or(0),
+                ),
+                Err(e) => println!("Sk2 parse failed: {e}"),
+            },
             Some(ChunkKind::AnimMo2) => {
                 let quats = anim::find_quaternion_records(chunk.data).unwrap();
                 let keyframes: Vec<_> = (0..chunk.data.len().saturating_sub(14))
