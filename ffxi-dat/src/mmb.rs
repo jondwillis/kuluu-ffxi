@@ -128,10 +128,19 @@ pub fn decrypt(data: &[u8]) -> Result<Vec<u8>> {
 ///   offset 3      `version` (u8) — controls decryption mode
 ///   offset 5      `key_index` (u8) — XOR'd with 0xF0 to index KEY_TABLE
 ///   offset 6..8   `feature_flags` (u16 LE) — 0xFFFF triggers block-swap pass
-///   offset 8..24  16-byte ASCII `asset_name`, space-padded
-///                 (may contain a NUL splitting it into two 8-char halves;
-///                 e.g. "tensaka\0kabuse_m" for the "tensa kabuto" helmet)
-///   offset 24..32 8-byte padding (observed as `20 20 ...` spaces)
+///   offset 8..32  24-byte ASCII `asset_name`, space-padded. Logical
+///                 layout is 8-byte zone_prefix + up to 16-byte
+///                 base/variant name (e.g. `tshimono` + `wall_id01`,
+///                 `tshimono` + `house_p4_m`). Some assets use a NUL
+///                 separator inside the prefix region (e.g.
+///                 `tensaka\0kabuse_m`).
+///                 NOTE: an earlier revision read only [8..24] under
+///                 the belief that bytes 24..32 were padding. They are
+///                 not — that read silently truncated 17+ char names
+///                 like `tshimonowall_id01` to `tshimonowall_id0`,
+///                 collapsing every numbered/LOD variant in a zone
+///                 onto a single asset_name and breaking placement
+///                 → chunk resolution. Trust the full 24 bytes.
 ///
 /// Beyond offset 32 the format is sub-record-based: u32 counts, vec3/vec4
 /// floats for bounding boxes, and 16-byte typed sub-record names like
@@ -155,7 +164,7 @@ impl<'a> MmbHeader<'a> {
             version: decrypted[3],
             key_index: decrypted[5],
             feature_flags: u16::from_le_bytes([decrypted[6], decrypted[7]]),
-            asset_name: &decrypted[8..24],
+            asset_name: &decrypted[8..32],
             payload: &decrypted[32..],
         })
     }

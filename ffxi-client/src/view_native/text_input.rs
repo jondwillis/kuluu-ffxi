@@ -570,6 +570,54 @@ fn apply_slash_outcome(
         SlashOutcome::DebugHeights => {
             slash_writers.debug_heights.write(DebugHeightsRequest);
         }
+        SlashOutcome::EndCutscene { event_num } => {
+            // Resolve player's own UniqueNo + ActIndex. For a forced
+            // cutscene fired by `player:startEvent(csid, ...)` the server
+            // built the EVENTSTART with the player as the initiator, so
+            // 0x05B EVENT_END targeting `(self_char_id, self_act_index,
+            // csid)` reaches LSB's `onEventFinish[csid]` handler — which
+            // is what clears `New_Character_Cutscenes.lua`'s `notSeen`
+            // var and (more importantly) `PChar->m_event`.
+            let self_char_id = scene_state.snapshot.self_char_id;
+            let self_act_index = self_char_id.and_then(|id| {
+                scene_state
+                    .snapshot
+                    .entities
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.act_index)
+            });
+            match (self_char_id, self_act_index) {
+                (Some(event_id), Some(act_index)) => {
+                    push_system_chat_line(
+                        scene_state,
+                        format!(
+                            "/endcutscene: sending EVENT_END (csid={event_num}, \
+                             unique_no=0x{event_id:08X}, act_index={act_index})"
+                        ),
+                    );
+                    if let Err(e) = cmd_tx.try_send(AgentCommand::EndEventChoice {
+                        event_id,
+                        act_index,
+                        event_num,
+                        choice: 0,
+                    }) {
+                        push_system_chat_line(
+                            scene_state,
+                            format!("/endcutscene: dropped (channel issue): {e}"),
+                        );
+                    }
+                }
+                _ => {
+                    push_system_chat_line(
+                        scene_state,
+                        "/endcutscene: self entity not in snapshot yet — wait for \
+                         zone-in to complete and retry"
+                            .into(),
+                    );
+                }
+            }
+        }
         SlashOutcome::SetZoneGeom(setting) => {
             let next = setting.unwrap_or_else(|| draw_distance.zone_geom_mode.cycle());
             draw_distance.zone_geom_mode = next;

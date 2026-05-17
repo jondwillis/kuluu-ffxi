@@ -818,12 +818,15 @@ pub fn resolve_mmb_index(
     {
         return Some(i);
     }
+    // Build `<zone_prefix><placement_id>` and match it against the full
+    // 24-byte asset_name (trim_end strips space padding). NO truncation:
+    // the MMB asset_name field is 24 bytes wide (see MmbHeader::parse).
+    // Truncating to 16 here would collapse `wall_id01`/`wall_id09`/...
+    // and `house_p1_h`/`house_p1_m` onto a single chunk, silently
+    // dropping the rest — that was a real bug that hid buildings.
     let mut prefixed = String::with_capacity(zone_prefix.len() + placement_id.len());
     prefixed.push_str(zone_prefix);
     prefixed.push_str(placement_id);
-    if prefixed.len() > 16 {
-        prefixed.truncate(16);
-    }
     if let Some(i) = mmb_asset_names
         .iter()
         .position(|n| n.trim_end() == prefixed)
