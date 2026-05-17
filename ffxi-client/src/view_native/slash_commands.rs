@@ -223,6 +223,16 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 summary: "respond to homepoint dialog",
             },
             HelpEntry {
+                aliases: &["endevent", "endevt", "clearevent", "clearevt"],
+                usage: "",
+                summary: "flush pending NPC events (unblock /logout)",
+            },
+            HelpEntry {
+                aliases: &["endcutscene", "endcs", "skipcutscene", "skipcs"],
+                usage: "[csid]",
+                summary: "end a forced cutscene (new-char intro, etc.)",
+            },
+            HelpEntry {
                 aliases: &["buy"],
                 usage: "<row> [qty]",
                 summary: "buy from open shop by row index",
@@ -444,6 +454,50 @@ pub enum SlashOutcome {
     /// event; the consumer system reads the navmesh + collision mesh
     /// resources and pushes a multi-line system toast.
     DebugHeights,
+    /// `/endcutscene [csid]` — send a 0x05B `EVENT_END` for a *forced*
+    /// cutscene (the kind `player:startEvent` fires from `onZoneIn` —
+    /// new-character openings, area-entry cinematics) that bypassed the
+    /// normal client-side dialog flow and so isn't in
+    /// `pending_event_end`. The dispatcher fills `unique_no`/`act_index`
+    /// from the player's own `self_char_id` and `act_index`, since
+    /// `player:startEvent` builds the EVENTSTART with those as the
+    /// initiator.
+    ///
+    /// `event_num` is the cutscene id (CSID). Without an explicit arg
+    /// the parser looks it up from `zone_id` via [`START_ZONE_CUTSCENE`];
+    /// callers in zones not in the table must pass an explicit id.
+    EndCutscene {
+        event_num: u16,
+    },
+}
+
+/// New-character forced-cutscene CSIDs, keyed by start-zone id. Scraped
+/// from `vendor/server/scripts/quests/hiddenQuests/New_Character_Cutscenes.lua`.
+/// `xi.zone.*` ids match `ffxi_proto::zone_id`. Bastok Markets fires two
+/// chained cutscenes (CSID 0 → 7); the operator picks one with the
+/// explicit-arg form when the first end leaves the second wedged.
+const START_ZONE_CUTSCENE: &[(u16, u16)] = &[
+    // Bastok Markets — chain: 0 then 7. Default to 0; if still stuck,
+    // `/endcutscene 7` clears the second.
+    (235, 0),
+    // Bastok Mines, Port Bastok
+    (234, 1),
+    (236, 1),
+    // San d'Oria: Northern / Southern / Port
+    (231, 535),
+    (230, 503),
+    (232, 500),
+    // Windurst Waters / Woods / Port
+    (238, 531),
+    (241, 367),
+    (240, 305),
+];
+
+/// Resolve a starting zone's forced-cutscene CSID, if known.
+pub(crate) fn start_zone_cutscene(zone_id: u16) -> Option<u16> {
+    START_ZONE_CUTSCENE
+        .iter()
+        .find_map(|&(z, csid)| (z == zone_id).then_some(csid))
 }
 
 /// `/drawdistance` subcommand variants. `Show` is a no-arg query for
@@ -600,6 +654,22 @@ pub fn parse_slash(
         "tractormenu" => parse_tractor_menu(rest),
         "homepointmenu" => parse_homepoint_menu(rest),
         "snapshot" => SlashOutcome::Command(AgentCommand::Snapshot),
+        // `/endevent` — flush every `pending_event_end` entry as a 0x05B
+        // EVENT_END subpacket. Session loop drains the list
+        // (`session.rs::AgentCommand::EndEvent`); we just provide a slash
+        // surface. Primary use: clear `BlockedState::InEvent` so /logout
+        // can succeed. No-op when nothing is pending.
+        "endevent" | "endevt" | "clearevent" | "clearevt" => {
+            SlashOutcome::Command(AgentCommand::EndEvent)
+        }
+        // `/endcutscene [csid]` — escape a forced cutscene the client
+        // never registered in `pending_event_end` (new-character
+        // openings, `onZoneIn` cinematics). Without an arg the parser
+        // tries to look up the CSID from the current zone; with one it
+        // trusts the operator's value.
+        "endcutscene" | "endcs" | "skipcutscene" | "skipcs" => {
+            parse_endcutscene(rest, zone_id)
+        }
         "bank" => parse_bank(rest),
         "zonechange" | "rzc" => parse_zone_change(rest),
         "mhexit" => parse_mhexit(rest, zone_id),
@@ -1177,6 +1247,50 @@ fn parse_agent(rest: &str) -> SlashOutcome {
 /// `/zonechange <line_id>` — fire a `RequestZoneChange` (the MCP
 /// `request_zone_change` tool's wire shape). The character must already
 /// be standing in the zoneline rect for the server to honor it.
+/// `/endcutscene [csid]` — resolve the CSID and produce a
+/// `SlashOutcome::EndCutscene`. The dispatcher in `text_input.rs` fills
+/// in the player's own `unique_no`/`act_index` since those aren't in
+/// the parser's args.
+///
+/// - With no arg: look up the CSID from `zone_id` via
+///   [`START_ZONE_CUTSCENE`]. Returns a system message if the current
+///   zone isn't in the table (i.e. not a starting zone — the operator
+///   should pass an explicit CSID for any other forced event).
+/// - With an arg: parse it as `u16` and trust the operator. Useful for
+///   the Bastok Markets chain (CSID 0 → 7; default clears 0, then
+///   `/endcutscene 7` clears the second one).
+fn parse_endcutscene(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
+    let trimmed = rest.trim();
+    let event_num = if trimmed.is_empty() {
+        let Some(z) = zone_id else {
+            return SlashOutcome::SystemMessage(
+                "/endcutscene: no current zone; pass an explicit CSID \
+                 (`/endcutscene <csid>`)"
+                    .into(),
+            );
+        };
+        match start_zone_cutscene(z) {
+            Some(csid) => csid,
+            None => {
+                return SlashOutcome::SystemMessage(format!(
+                    "/endcutscene: zone {z} isn't a starting nation; pass \
+                     an explicit CSID (`/endcutscene <csid>`)"
+                ));
+            }
+        }
+    } else {
+        match trimmed.parse::<u16>() {
+            Ok(n) => n,
+            Err(_) => {
+                return SlashOutcome::SystemMessage(format!(
+                    "/endcutscene: bad CSID `{trimmed}` (expected u16)"
+                ));
+            }
+        }
+    };
+    SlashOutcome::EndCutscene { event_num }
+}
+
 fn parse_zone_change(rest: &str) -> SlashOutcome {
     let trimmed = rest.trim();
     if trimmed.is_empty() {
@@ -2590,6 +2704,105 @@ mod tests {
                 assert_eq!(item_no, 4112);
             }
             other => panic!("expected UseItem, got {other:?}"),
+        }
+    }
+
+    /// `/endevent` aliases all dispatch the same `EndEvent` — the
+    /// session loop drains `pending_event_end` for it. Pins the parser
+    /// surface so a rename can't silently break the help entry.
+    #[test]
+    fn endevent_aliases_dispatch_end_event() {
+        for input in ["/endevent", "/endevt", "/clearevent", "/clearevt"] {
+            match parse_slash(input, &empty_entities(), origin(), None, None) {
+                SlashOutcome::Command(AgentCommand::EndEvent) => {}
+                other => panic!("input {input:?}: expected EndEvent, got {other:?}"),
+            }
+        }
+    }
+
+    /// `/endcutscene` with no arg resolves the CSID from the current
+    /// zone. Northern San d'Oria (zone 231) is the canonical test case
+    /// from `New_Character_Cutscenes.lua` (CSID 535).
+    #[test]
+    fn endcutscene_resolves_zone_to_csid() {
+        match parse_slash(
+            "/endcutscene",
+            &empty_entities(),
+            origin(),
+            None,
+            Some(231),
+        ) {
+            SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, 535),
+            other => panic!("expected EndCutscene{{ 535 }}, got {other:?}"),
+        }
+    }
+
+    /// `/endcutscene <csid>` trusts the operator's value — for Bastok
+    /// Markets' 0→7 chain the second cutscene needs an explicit
+    /// `/endcutscene 7`.
+    #[test]
+    fn endcutscene_with_explicit_csid_overrides_zone_lookup() {
+        match parse_slash(
+            "/endcutscene 7",
+            &empty_entities(),
+            origin(),
+            None,
+            Some(235), // Bastok Markets — zone lookup would return 0
+        ) {
+            SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, 7),
+            other => panic!("expected EndCutscene{{ 7 }}, got {other:?}"),
+        }
+    }
+
+    /// Non-starting-zone with no explicit CSID is an error: no
+    /// guesswork, no silent dispatch.
+    #[test]
+    fn endcutscene_unknown_zone_no_arg_errors() {
+        match parse_slash(
+            "/endcutscene",
+            &empty_entities(),
+            origin(),
+            None,
+            Some(0xABCD), // not in the table
+        ) {
+            SlashOutcome::SystemMessage(msg) => {
+                assert!(
+                    msg.contains("starting nation") || msg.contains("CSID"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected SystemMessage, got {other:?}"),
+        }
+    }
+
+    /// Bad numeric arg → operator-facing error, not silent.
+    #[test]
+    fn endcutscene_bad_csid_errors() {
+        match parse_slash(
+            "/endcutscene abc",
+            &empty_entities(),
+            origin(),
+            None,
+            Some(231),
+        ) {
+            SlashOutcome::SystemMessage(msg) => assert!(msg.to_lowercase().contains("bad csid")),
+            other => panic!("expected SystemMessage, got {other:?}"),
+        }
+    }
+
+    /// Alias coverage: every documented spelling produces the same outcome.
+    #[test]
+    fn endcutscene_aliases_all_work() {
+        for input in [
+            "/endcutscene",
+            "/endcs",
+            "/skipcutscene",
+            "/skipcs",
+        ] {
+            match parse_slash(input, &empty_entities(), origin(), None, Some(231)) {
+                SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, 535),
+                other => panic!("input {input:?}: expected EndCutscene, got {other:?}"),
+            }
         }
     }
 

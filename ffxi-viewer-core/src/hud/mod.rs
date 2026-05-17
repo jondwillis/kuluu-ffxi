@@ -32,6 +32,7 @@ pub mod stage_bar;
 pub mod status_ribbon;
 pub mod target_panel;
 pub mod vana_clock;
+pub mod weather_icon;
 pub mod zone_flash;
 
 use bevy::prelude::*;
@@ -106,7 +107,10 @@ impl Plugin for HudPlugin {
                 zone_flash::update_zone_flash,
                 (self_hud::update_self_hud, self_hud::update_self_status),
                 status_ribbon::update_status_ribbon,
-                death_prompt::update_death_prompt_system,
+                (
+                    death_prompt::update_death_prompt_system,
+                    weather_icon::update_weather_icon,
+                ),
             ),
         );
 
@@ -145,6 +149,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel>(app: &mut App, sc
             self_hud::spawn_self_hud,
             status_ribbon::spawn_status_ribbon,
             death_prompt::spawn_death_prompt,
+            weather_icon::spawn_weather_icon,
         ),
     );
 }
