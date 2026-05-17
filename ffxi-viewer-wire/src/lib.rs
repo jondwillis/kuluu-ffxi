@@ -627,6 +627,7 @@ mod tests {
                 claim_id: 0,
                 speed: 0,
                 speed_base: 0,
+                look: None,
             }],
             party: vec![],
             chat: vec![ChatLine {
@@ -672,6 +673,7 @@ mod tests {
             dialog: None,
             shop: None,
             status_icons: Vec::new(),
+            weather: None,
         }
     }
 
