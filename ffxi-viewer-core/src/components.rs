@@ -62,3 +62,23 @@ pub struct LookComp(pub EntityLook);
 /// model for this entity?" without scanning children.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntityModel(pub EntityLook);
+
+/// Marks a renderable mesh that the third-person camera should clamp
+/// against. Attached at spawn to every MZB submesh (both collision and
+/// non-collision channels) and every MMB placement — the camera doesn't
+/// care which channel a wall came from, only whether it's between the
+/// player and the wanted camera position.
+///
+/// `ffxi-client/src/view_native/collision_bvh.rs::build_collision_bvh_system`
+/// keys off this marker (not the narrower `MzbCollisionMesh`) when
+/// deciding which entities need a per-mesh BVH built.
+///
+/// Why not reuse `MzbCollisionMesh`: that marker carries channel
+/// semantics — `/zonegeom` toggles MZB collision vs. non-collision
+/// visibility on it, and player-movement / ground-snap raycasts read
+/// the collision channel specifically. Repurposing it for camera
+/// occlusion would conflate three distinct consumers. A dedicated
+/// camera marker keeps each downstream system pointed at the data it
+/// actually wants.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct CameraOccluder;

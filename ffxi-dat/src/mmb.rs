@@ -332,12 +332,22 @@ impl<'a> MmbSubRecord<'a> {
     /// winding doesn't always match the OpenGL CCW front-face
     /// convention.
     pub fn parse_triangle_list(&self) -> Vec<[u16; 3]> {
-        let strip = self.parse_triangle_strip();
-        if strip.len() < 4 {
+        let strip_all = self.parse_triangle_strip();
+        if strip_all.len() < 4 {
             return Vec::new();
         }
-        // Skip the first u16 (strip-length header).
-        let strip = &strip[1..];
+        // First u16 is the declared strip length (count of subsequent
+        // index u16s that are real strip data). Any u16s past the
+        // declared length are trailing padding inside the sub-record
+        // body and MUST NOT be parsed as indices — doing so emits
+        // garbage triangles that connect vertex 0 to wherever the
+        // strip ended, producing the "stretched triangle across the
+        // mesh" artifact (verified on tshimonopa_backbord01/kabe in
+        // DAT 330).
+        let declared = strip_all[0] as usize;
+        let avail = strip_all.len() - 1;
+        let n = declared.min(avail);
+        let strip = &strip_all[1..1 + n];
 
         let mut out = Vec::with_capacity(strip.len().saturating_sub(2));
         let mut i = 0;

@@ -812,52 +812,81 @@ pub fn resolve_mmb_index(
     zone_prefix: &str,
     mmb_asset_names: &[String],
 ) -> Option<usize> {
-    if let Some(i) = mmb_asset_names
+    resolve_mmb_indices(placement_id, zone_prefix, mmb_asset_names)
+        .into_iter()
+        .next()
+}
+
+/// Like [`resolve_mmb_index`] but returns ALL matching chunk indices in
+/// DAT order. Necessary for disambiguating duplicate-name placements:
+/// FFXI variant MMBs (wall_id01, wall_id02, …, house_p1_m) end up with
+/// the SAME 16-byte truncated asset_name in their MMB header
+/// (`tshimonowall_id01` → truncated to `tshimonowall_id0`, identical to
+/// the base variant). The caller pairs placements with chunks by
+/// round-robin: the Nth placement referencing a name consumes the Nth
+/// chunk with that name. Without this, the first-match resolver maps
+/// every variant placement to chunk #1 and silently drops the rest —
+/// visible in-game as missing walls / houses / stair pieces.
+pub fn resolve_mmb_indices(
+    placement_id: &str,
+    zone_prefix: &str,
+    mmb_asset_names: &[String],
+) -> Vec<usize> {
+    // Tier 1: exact match. Collect all positions, not just the first.
+    let exact: Vec<usize> = mmb_asset_names
         .iter()
-        .position(|n| n.trim_end() == placement_id)
-    {
-        return Some(i);
+        .enumerate()
+        .filter_map(|(i, n)| (n.trim_end() == placement_id).then_some(i))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
     }
-    // Build `<zone_prefix><placement_id>` and match it against the full
-    // 24-byte asset_name (trim_end strips space padding). NO truncation:
-    // the MMB asset_name field is 24 bytes wide (see MmbHeader::parse).
-    // Truncating to 16 here would collapse `wall_id01`/`wall_id09`/...
-    // and `house_p1_h`/`house_p1_m` onto a single chunk, silently
-    // dropping the rest — that was a real bug that hid buildings.
+    // Tier 2: prefix+exact. Build `<zone_prefix><placement_id>` and match
+    // it against the full 24-byte asset_name (trim_end strips space
+    // padding). NO truncation: the MMB asset_name field is 24 bytes wide
+    // (see MmbHeader::parse). Truncating to 16 here would collapse
+    // `wall_id01`/`wall_id09`/... and `house_p1_h`/`house_p1_m` onto a
+    // single chunk, silently dropping the rest — that was a real bug
+    // that hid buildings.
     let mut prefixed = String::with_capacity(zone_prefix.len() + placement_id.len());
     prefixed.push_str(zone_prefix);
     prefixed.push_str(placement_id);
-    if let Some(i) = mmb_asset_names
+    let pre: Vec<usize> = mmb_asset_names
         .iter()
-        .position(|n| n.trim_end() == prefixed)
-    {
-        return Some(i);
+        .enumerate()
+        .filter_map(|(i, n)| (n.trim_end() == prefixed).then_some(i))
+        .collect();
+    if !pre.is_empty() {
+        return pre;
     }
-    // Vendor-prefix tier. MMB asset_name is a 16-byte field structured
-    // as `<8-byte vendor/artist tag><8-byte asset-id prefix>` — e.g.
-    // `tshimonolat_moas` for placement `lat_moasta_st1_m`. The vendor
-    // tag varies per asset (`tshimono`, `hatamura`, `sandori`, …), so
-    // no single zone_prefix tier can recover it. Match the first 8
-    // bytes of the placement_id against the last 8 bytes of each MMB
-    // asset_name. Confirmed against zones 102/200/230 at 100% local.
+    // Tier 3: vendor-prefix. Match first 8 bytes of placement_id against
+    // last 8 bytes of asset_name — works when zone_prefix is empty
+    // (multi-vendor zone) but placement_id starts with a known 8-byte
+    // asset-id pattern.
     let id_bytes = placement_id.as_bytes();
     if id_bytes.len() >= 8 {
         let needle = &id_bytes[..8];
-        if let Some(i) = mmb_asset_names.iter().position(|n| {
-            let t = n.trim_end().as_bytes();
-            t.len() >= 8 && &t[t.len() - 8..] == needle
-        }) {
-            return Some(i);
+        let v: Vec<usize> = mmb_asset_names
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| {
+                let t = n.trim_end().as_bytes();
+                (t.len() >= 8 && &t[t.len() - 8..] == needle).then_some(i)
+            })
+            .collect();
+        if !v.is_empty() {
+            return v;
         }
     }
-    // Suffix match. Tiny IDs (< 3 chars) get skipped to avoid wild
-    // collisions like `"a"` matching half the zone.
+    // Tier 4: full-string suffix. Tiny IDs (<3 chars) are too wild.
     if placement_id.len() < 3 {
-        return None;
+        return Vec::new();
     }
     mmb_asset_names
         .iter()
-        .position(|n| n.trim_end().ends_with(placement_id))
+        .enumerate()
+        .filter_map(|(i, n)| n.trim_end().ends_with(placement_id).then_some(i))
+        .collect()
 }
 
 /// Infer the 8-char zone prefix shared by all MMB asset_names in a

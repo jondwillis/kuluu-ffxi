@@ -180,6 +180,12 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             .disable::<LogPlugin>(),
     );
 
+    // Frame-rate limiter for `/fps <max>`. Default `Limiter::Auto` matches
+    // the monitor refresh; `/fps N` swaps in `Limiter::from_framerate(N)`,
+    // `/fps off` (or `0`) sets `Limiter::Off`. The dispatcher mutates the
+    // `FramepaceSettings` resource directly (see `apply_slash_outcome`).
+    app.add_plugins(bevy_framepace::FramepacePlugin);
+
     // Top-level phase. Launcher is the default starting phase regardless
     // of direct mode — direct-mode auto-advance happens via the
     // `DirectModeAutostart` marker resource, see launcher_ui::register.

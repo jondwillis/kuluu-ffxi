@@ -376,10 +376,26 @@ pub struct SceneSnapshot {
     /// table — translation to text/sprite lives in the front-end.
     #[serde(default)]
     pub status_icons: Vec<u16>,
+    /// Active `/logout` or `/shutdown` countdown — `Some(_)` between the
+    /// first 0x053 SYSTEMMES id=7/35 tick and either disconnect or zone
+    /// change. The HUD interpolates locally between server anchor points
+    /// (which arrive every 5s) so the on-screen number ticks every
+    /// frame instead of jumping by 5.
+    #[serde(default)]
+    pub logout_countdown: Option<LogoutCountdown>,
     /// Last weather state received from the server (opcode 0x057). `None`
     /// until the first weather packet for the current zone arrives.
     #[serde(default)]
     pub weather: Option<Weather>,
+}
+
+/// Mirror of `ffxi-client::state::LogoutCountdown`. Carries just enough
+/// state for the HUD to render a smooth countdown — the seconds value
+/// the server last sent, and whether this was `/logout` or `/shutdown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LogoutCountdown {
+    pub seconds_remaining: u16,
+    pub shutdown: bool,
 }
 
 /// Active NPC event/dialog metadata. Built from 0x032 (event), 0x033

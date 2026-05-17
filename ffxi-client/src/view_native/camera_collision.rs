@@ -65,21 +65,29 @@ const INWARD_LERP: f32 = 1.0;
 pub fn clamp_chase_camera_to_collision(
     mode: Res<CameraMode>,
     chase: Res<ChaseCamera>,
+    time: Res<Time>,
     self_q: Query<&Transform, (With<IsSelf>, Without<OperatorCamera>)>,
     mut cam_q: Query<&mut Transform, (With<OperatorCamera>, Without<IsSelf>)>,
     bvh_q: Query<&CollisionBvh>,
-    // TEMP probe: count entities that are MzbCollisionMesh-marked but
+    // TEMP probe: count entities that are CameraOccluder-marked but
     // haven't yet received a CollisionBvh. If this stays > 0 across
     // frames, the build system is silently skipping some meshes — that
     // matches the user's "only some meshes" symptom.
     pending_q: Query<
         Entity,
         (
-            With<ffxi_viewer_core::dat_mzb::MzbCollisionMesh>,
+            With<ffxi_viewer_core::components::CameraOccluder>,
             Without<CollisionBvh>,
         ),
     >,
     mut last_summary: Local<Option<(usize, usize)>>,
+    // TEMP probe (port-sandoria ceiling/floor bug): per-cast outcome,
+    // throttled to ~1 Hz. Logs hit-or-miss, hit_t, and whether the
+    // wanted endpoint lands inside any BVH AABB — if it does and the
+    // ray still misses, that's a geometry/BVH bug; if it doesn't, the
+    // ceiling/floor lives in an entity that has no CollisionBvh
+    // (likely an MMB placement).
+    mut last_probe_log: Local<f32>,
     // Smoothed effective distance — low-pass filter on the noisy
     // BVH hit_t. Survives across frames as a `Local`, no extra
     // resource plumbing needed. `None` means "no prior frame" (first
@@ -160,12 +168,52 @@ pub fn clamp_chase_camera_to_collision(
     // ray_cast is roughly O(log N) plus a small leaf scan, so total
     // cost is bounded even in triangle-dense zones.
     let mut hit_t = wanted;
+    let mut hit_any = false;
     for bvh in bvh_q.iter() {
         if let Some(t) = bvh.ray_cast(player, dir, hit_t) {
             if t < hit_t {
                 hit_t = t;
+                hit_any = true;
             }
         }
+    }
+
+    // TEMP probe: throttle to ~1 Hz. Compare BVH ray cast vs brute-force
+    // ray cast over every triangle. Three outcomes carry different
+    // diagnostic weight:
+    //   BVH hit  & brute hit  -> working; the camera should clamp.
+    //   BVH miss & brute miss -> no collision triangle along this ray.
+    //                            The ceiling/floor isn't in this BVH at
+    //                            all (channel coverage gap).
+    //   BVH miss & brute hit  -> BVH traversal or structure is buggy.
+    //                            Brute force is the ground truth.
+    let now = time.elapsed_secs();
+    if now - *last_probe_log >= 1.0 {
+        *last_probe_log = now;
+        let mut brute_hit_t = wanted;
+        let mut brute_hit_any = false;
+        let mut total_tris: usize = 0;
+        for bvh in bvh_q.iter() {
+            total_tris += bvh.tri_count();
+            if let Some(t) = bvh.ray_cast_brute_force(player, dir, brute_hit_t) {
+                if t < brute_hit_t {
+                    brute_hit_t = t;
+                    brute_hit_any = true;
+                }
+            }
+        }
+        tracing::debug!(
+            player = ?(player.x, player.y, player.z),
+            dir = ?(dir.x, dir.y, dir.z),
+            wanted,
+            bvh_hit = hit_any,
+            bvh_hit_t = if hit_any { hit_t } else { f32::NAN },
+            brute_hit = brute_hit_any,
+            brute_hit_t = if brute_hit_any { brute_hit_t } else { f32::NAN },
+            bvhs = bvh_q.iter().count(),
+            total_tris,
+            "camera_collision probe: per-cast outcome"
+        );
     }
 
     // Target distance before smoothing. Invariant maintained: target ≤

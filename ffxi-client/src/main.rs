@@ -94,16 +94,17 @@ enum Command {
     /// Provision an account (or no-op if it already exists).
     Provision { user: String, password: String },
     /// Create a new character (requires account to exist first).
+    /// Create a new character.
+    /// Args: user pass name race(1..=8) job(1..=6) nation(0..=2) size(0..=2) face(0..=15)
     CreateChar {
         user: String,
         password: String,
         name: String,
         race: u8,
         job: u8,
-        body_type: u8,
-        gender: u8,
+        nation: u8,
+        size: u8,
         face: u8,
-        tail: u8,
     },
     /// Authenticate and print the resulting session metadata.
     Login { user: String, password: String },
@@ -237,20 +238,27 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             name,
             race,
             job,
-            body_type,
-            gender,
+            nation,
+            size,
             face,
-            tail,
         } => {
             auth.ensure_account(&user, &password).await.ok();
             let session = auth.login(&user, &password).await.context("login")?;
             let lobby =
                 lobby_client::LobbyClient::new(args.server.clone(), args.data_port, args.view_port);
+            let spec = lobby_client::CharCreateSpec {
+                name: name.clone(),
+                race,
+                job,
+                nation,
+                size,
+                face,
+            };
             lobby
-                .create_character(&session, &name, race, job, body_type, gender, face, tail)
+                .create_character(&session, &spec)
                 .await
                 .context("character creation")?;
-            tracing::info!(char_name = %name, race, job, "character created");
+            tracing::info!(char_name = %name, race, job, nation, "character created");
         }
         Command::Login { user, password } => {
             let session = auth

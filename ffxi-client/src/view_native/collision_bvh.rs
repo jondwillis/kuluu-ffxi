@@ -1,4 +1,4 @@
-//! Bounding-volume hierarchy over a single [`MzbCollisionMesh`] entity's
+//! Bounding-volume hierarchy over a single [`CameraOccluder`] entity's
 //! triangles. Built once (lazily, when the mesh asset is ready) and
 //! attached to the entity as a [`CollisionBvh`] component. The camera
 //! collision system queries this BVH instead of brute-forcing every
@@ -20,7 +20,7 @@
 //! lifetime of the zone.
 
 use bevy::prelude::*;
-use ffxi_viewer_core::dat_mzb::MzbCollisionMesh;
+use ffxi_viewer_core::components::CameraOccluder;
 
 /// Maximum triangles per leaf. Below this we stop subdividing — the
 /// per-leaf scan is faster than the AABB tests on smaller groups.
@@ -48,6 +48,24 @@ impl CollisionBvh {
     /// Diagnostic: total triangle count.
     pub fn tri_count(&self) -> usize {
         self.triangles.len()
+    }
+
+    /// Diagnostic: brute-force ray cast over every triangle, ignoring
+    /// the BVH structure. Slow (O(N)) — for probe / correctness-check
+    /// use only. If the BVH `ray_cast` and this disagree, the BVH
+    /// structure or traversal has a bug.
+    pub fn ray_cast_brute_force(&self, origin: Vec3, dir: Vec3, max_t: f32) -> Option<f32> {
+        let mut hit_t = max_t;
+        let mut hit_any = false;
+        for tri in &self.triangles {
+            if let Some(t) = ray_tri_intersect(origin, dir, tri[0], tri[1], tri[2]) {
+                if t < hit_t {
+                    hit_t = t;
+                    hit_any = true;
+                }
+            }
+        }
+        hit_any.then_some(hit_t)
     }
 }
 
@@ -333,7 +351,7 @@ fn ray_tri_intersect(orig: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> Opt
     }
 }
 
-/// Build BVHs for any [`MzbCollisionMesh`] entity that has a loaded
+/// Build BVHs for any [`CameraOccluder`] entity that has a loaded
 /// mesh and a [`GlobalTransform`] but no [`CollisionBvh`] yet. Runs
 /// every frame; cheap when there's nothing to do (the `Without` filter
 /// makes it a no-op once every entity is processed).
@@ -341,7 +359,7 @@ pub fn build_collision_bvh_system(
     mut commands: Commands,
     query: Query<
         (Entity, &Mesh3d, &GlobalTransform),
-        (With<MzbCollisionMesh>, Without<CollisionBvh>),
+        (With<CameraOccluder>, Without<CollisionBvh>),
     >,
     meshes: Res<Assets<Mesh>>,
 ) {
@@ -376,7 +394,7 @@ pub fn build_collision_bvh_system(
             entity = ?entity,
             triangles = tri_count,
             nodes = bvh.nodes.len(),
-            "built collision BVH for MzbCollisionMesh"
+            "built collision BVH for CameraOccluder"
         );
         commands.entity(entity).insert(bvh);
     }

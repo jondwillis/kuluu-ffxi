@@ -29,14 +29,39 @@ use crate::snapshot::{rendered_chat, SceneState};
 
 /// Number of chat rows visible at once. Matches what fits in the panel
 /// height at the default font size.
-pub const VISIBLE_ROWS: usize = 8;
+pub const VISIBLE_ROWS: usize = 12;
+
+/// Auto-shrink geometry — mirrors retail FFXI's chat-pane fade. The
+/// panel sits at MAX while there's recent activity (new message,
+/// hover, scroll, or PassiveCursor focus); after `FULL_HOLD_SECS` of
+/// idle it linearly shrinks over `FADE_SECS` toward `MIN`. `Overflow::clip`
+/// keeps the row pool from spilling above the panel rect when it shrinks.
+pub const PANEL_MAX_HEIGHT_PX: f32 = 220.0;
+pub const PANEL_MIN_HEIGHT_PX: f32 = 60.0;
+pub const FULL_HOLD_SECS: f32 = 4.0;
+pub const FADE_SECS: f32 = 1.5;
+
+/// Per-panel decay state: when the panel last saw "activity" (any of:
+/// a new chat line in its filter, cursor hover, scroll != 0, passive
+/// cursor focus). Read each frame by `update_chat_panel` to interpolate
+/// panel height between MAX and MIN.
+#[derive(Component, Debug, Default, Clone, Copy)]
+pub struct ChatPanelDecay {
+    /// `Time::elapsed_secs()` value at the most recent activity. Stored
+    /// as `f32` so the initial-zero state reads as "infinitely idle" —
+    /// the panel starts collapsed and grows when the first message lands.
+    pub last_active_secs: f32,
+    /// Most recently observed filtered-chat length for this panel. A
+    /// growth in this count is the "new message arrived" signal.
+    pub prev_filtered_len: usize,
+}
 
 /// Rows per unit of `MouseWheel.y`. Tuned so a normal trackpad two-finger
 /// swipe scrolls at a comfortable rate — values much above ~0.4 feel
 /// "skippy" on macOS. Independent of frame rate: the accumulator in
 /// [`ChatScrollAccum`] / [`BattleScrollAccum`] sums sub-row fractions
 /// across frames and only spends integer rows when |accum| ≥ 1.0.
-const WHEEL_ROWS_PER_UNIT: f32 = 0.25;
+const WHEEL_ROWS_PER_UNIT: f32 = 0.12;
 
 /// Chat-panel scroll offset in row units (one [`ChatLine`] per unit).
 /// `0` = newest message pinned to the bottom (default tailing behavior);
@@ -142,6 +167,7 @@ fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, right: Option
     commands
         .spawn((
             ChatPanel { kind },
+            ChatPanelDecay::default(),
             // `RelativeCursorPosition::cursor_over` is what
             // `chat_wheel_scroll_system` reads to decide whether to
             // consume the wheel. No `Pickable` needed — Bevy UI
@@ -158,7 +184,7 @@ fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, right: Option
                 left,
                 right: right.unwrap_or(Val::Auto),
                 width,
-                height: Val::Px(160.0),
+                height: Val::Px(PANEL_MIN_HEIGHT_PX),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
                 border: UiRect::all(Val::Px(1.0)),
                 flex_direction: FlexDirection::Column,
@@ -229,14 +255,23 @@ fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, right: Option
 }
 
 pub fn update_chat_panel(
+    time: Res<Time>,
     state: Res<SceneState>,
     mode: Res<InputMode>,
     scroll: Res<ChatScroll>,
     battle_scroll: Res<BattleScroll>,
-    mut panel_q: Query<(&ChatPanel, &mut BorderColor, &Children)>,
+    mut panel_q: Query<(
+        &ChatPanel,
+        &mut BorderColor,
+        &mut Node,
+        &mut ChatPanelDecay,
+        &RelativeCursorPosition,
+        &Children,
+    )>,
     rows: Query<(&ChatRow, &Children), Without<ChatPanel>>,
     mut body_q: Query<(&mut Text, &mut TextColor), With<ChatRowBody>>,
 ) {
+    let now = time.elapsed_secs();
     // Intentionally NOT gated on `state.dirty` — the dirty flag is reset
     // by `ingest_system` in `PreUpdate`, but `text_input_system` /
     // `dialog_mode_sync_system` push local toasts mid-`Update` and there
@@ -251,7 +286,7 @@ pub fn update_chat_panel(
     // tail with that panel's own scroll offset. Both panels read the
     // same source-of-truth `rendered_chat` so a new line lands in
     // exactly one panel (the one whose `accepts()` is true).
-    for (panel, mut border, panel_children) in &mut panel_q {
+    for (panel, mut border, mut node, mut decay, rel_cursor, panel_children) in &mut panel_q {
         let filtered: Vec<&ChatLine> = all
             .iter()
             .copied()
@@ -284,6 +319,28 @@ pub fn update_chat_panel(
         };
         if border.left != want_border {
             *border = BorderColor::all(want_border);
+        }
+
+        // Auto-shrink decay. Any of these counts as activity and resets
+        // the idle timer to "now": (1) filtered length grew (new chat
+        // line landed in this panel), (2) cursor is over the panel, (3)
+        // user has scrolled away from newest, (4) (Social only)
+        // PassiveCursor is focused on Chat. While active, panel height
+        // sits at MAX; after FULL_HOLD_SECS of idle it linearly fades to
+        // MIN over FADE_SECS.
+        let new_msg = filtered.len() > decay.prev_filtered_len;
+        decay.prev_filtered_len = filtered.len();
+        let interacted = rel_cursor.cursor_over() || scroll_offset != 0 || focused;
+        if new_msg || interacted {
+            decay.last_active_secs = now;
+        }
+        let idle = (now - decay.last_active_secs).max(0.0);
+        let t = ((idle - FULL_HOLD_SECS) / FADE_SECS).clamp(0.0, 1.0);
+        let target_h =
+            PANEL_MAX_HEIGHT_PX + (PANEL_MIN_HEIGHT_PX - PANEL_MAX_HEIGHT_PX) * t;
+        let want_h = Val::Px(target_h);
+        if node.height != want_h {
+            node.height = want_h;
         }
 
         let visible: Vec<Option<&ChatLine>> = (0..VISIBLE_ROWS)

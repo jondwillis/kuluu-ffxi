@@ -324,6 +324,14 @@ pub struct SessionState {
     /// before insertion so the list represents only real effects.
     #[serde(default)]
     pub status_icons: Vec<u16>,
+    /// Active `/logout` or `/shutdown` countdown — `Some(_)` between the
+    /// first SYSTEMMES id=7/35 tick and either a disconnect, a zone
+    /// change, or the cancellation grace window expiring on the HUD
+    /// side. The server doesn't tell us when a logout was cancelled
+    /// (the LEAVEGAME effect's `onEffectLose` is silent), so the HUD's
+    /// stale-clear is the source of truth for "no longer counting."
+    #[serde(default)]
+    pub logout_countdown: Option<LogoutCountdown>,
     /// Most recent `WeatherNumber` from 0x057 WEATHER. `None` until the
     /// first weather packet for the current zone arrives, and cleared
     /// on zone change since the new zone always re-sends weather.
@@ -331,11 +339,22 @@ pub struct SessionState {
     /// to keep `state.rs` decoupled from the optional `ffxi-viewer-wire`
     /// crate — same rationale as `DialogState` / `ShopState` mirroring.
     /// Mapped to `ffxi_viewer_wire::Weather` via `Weather::from_lsb` at
-    /// snapshot time in `wire_translate::state_to_snapshot` (pending the
-    /// wire-side `SceneSnapshot.weather` field landing — currently absent
-    /// from `ffxi-viewer-wire`).
+    /// snapshot time in `wire_translate::state_to_snapshot`.
     #[serde(default)]
     pub current_weather: Option<u16>,
+}
+
+/// Snapshot of an in-flight `/logout` or `/shutdown` countdown. Updated
+/// once every ~5s while the server's `EFFECT_LEAVEGAME` ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LogoutCountdown {
+    /// Most recent server-reported `<seconds>` value. Sent as 30 on
+    /// effect-gain, then 25/20/15/10/5 on each tick. The HUD
+    /// interpolates between these anchors using its own wall clock.
+    pub seconds_remaining: u16,
+    /// `true` if this is a `/shutdown` (msg id=35); `false` for
+    /// `/logout` (id=7). Drives the widget's label only.
+    pub shutdown: bool,
 }
 
 /// Mirror of `ffxi_viewer_wire::DialogState` defined locally so `state.rs`
@@ -668,6 +687,10 @@ impl SessionState {
             }
             AgentEvent::ZoneChanged { to, .. } => {
                 self.zone_id = Some(*to);
+                // A zoneline cancels any pending LeaveGame on the server
+                // (the effect doesn't survive zone). Mirror that locally so
+                // the HUD widget hides immediately.
+                self.logout_countdown = None;
                 // Entities from the old zone are stale on zone change; the
                 // new zone's flood will repopulate. Same goes for the
                 // party roster: HP/MP percent values get a fresh
@@ -725,7 +748,11 @@ impl SessionState {
                     // it on spawn + appearance-change ticks, not on
                     // position-only refreshes). A `None` here means "this
                     // packet didn't carry look data," not "entity lost its
-                    // appearance," so fall back to the prior value.
+                    // appearance," so fall back to the prior value. Without
+                    // this preservation, a self CHAR_PC with look followed
+                    // by a position-only CHAR_PC blanks `look` and the
+                    // model-spawn dispatcher's `Changed<LookComp>` query
+                    // sees a remove instead of a stable signature.
                     let preserved_look = entity.look.clone().or_else(|| existing.look.clone());
                     *existing = Entity {
                         name: preserved_name,
@@ -781,6 +808,15 @@ impl SessionState {
                     self.chat.drain(0..drop);
                 }
             }
+            AgentEvent::LogoutCountdown {
+                seconds_remaining,
+                shutdown,
+            } => {
+                self.logout_countdown = Some(LogoutCountdown {
+                    seconds_remaining: *seconds_remaining,
+                    shutdown: *shutdown,
+                });
+            }
             AgentEvent::Diagnostics { diagnostics } => {
                 self.diagnostics = diagnostics.clone();
             }
@@ -790,6 +826,10 @@ impl SessionState {
             AgentEvent::Disconnected { .. } => {
                 self.stage = Stage::Disconnected;
                 self.diagnostics.stage = Some(Stage::Disconnected);
+                // Logout completed (or session dropped for any other reason)
+                // — the countdown is no longer meaningful and the HUD widget
+                // should hide.
+                self.logout_countdown = None;
             }
             // Surface errors as system chat so the user sees them in the TUI
             // without needing a separate pane. The stage doesn't change —
@@ -1038,6 +1078,20 @@ pub enum AgentEvent {
     /// these on every zone-in plus whenever weather changes mid-zone.
     WeatherUpdated {
         weather_number: u16,
+    },
+    /// 0x053 SYSTEMMES id=7 (EXECUTING_LOGOUT) or id=35 (EXECUTING_SHUTDOWN)
+    /// — server-driven countdown tick. The `EFFECT_LEAVEGAME` effect
+    /// (vendor/server/scripts/effects/leavegame.lua:34-48) emits one on
+    /// gain (`para=30`) and one every 5s tick (`para=25, 20, 15, 10, 5`)
+    /// until `target:leaveGame()` fires. Folded into
+    /// `SessionState.logout_countdown` so the HUD can render an at-a-glance
+    /// countdown widget alongside the chat line.
+    LogoutCountdown {
+        seconds_remaining: u16,
+        /// `true` for `EXECUTING_SHUTDOWN` (id=35), `false` for
+        /// `EXECUTING_LOGOUT` (id=7). The two flows are identical wire-
+        /// wise; the distinction only affects the HUD label.
+        shutdown: bool,
     },
     EventEnded,
     KeyRotated {
@@ -2000,6 +2054,12 @@ mod tests {
 
     #[test]
     fn entity_upserted_preserves_look_across_position_only_update() {
+        // Mirror of the hp_pct preservation test, for `look`. CHAR_PC and
+        // CHAR_NPC only carry the look block on appearance-bearing ticks;
+        // position-only follow-ups arrive with `look: None`. Before the
+        // fix this clobbered self's appearance every server tick and the
+        // model-spawn dispatcher's `Changed<LookComp>` query saw a
+        // remove-then-reinsert pattern instead of a stable signature.
         use ffxi_proto::decode::LookData;
         let mut s = SessionState::default();
         let mut ent = make_test_entity(42, Some("Jonisbarius"), EntityKind::Pc);
@@ -2019,20 +2079,22 @@ mod tests {
         s.apply_event(&AgentEvent::EntityUpserted { entity: ent });
         assert!(matches!(s.entities[0].look, Some(LookData::Equipped { race: 3, .. })));
 
+        // Position-only refresh: look = None. Must keep the prior value.
         let mut pos_only = make_test_entity(42, None, EntityKind::Pc);
         pos_only.look = None;
         s.apply_event(&AgentEvent::EntityUpserted { entity: pos_only });
         assert!(
             matches!(s.entities[0].look, Some(LookData::Equipped { race: 3, .. })),
-            "look must persist across position-only refresh"
+            "look must persist across position-only refresh (no look bits set)"
         );
 
+        // A genuine appearance change (different `look`) must still win.
         let mut changed = make_test_entity(42, None, EntityKind::Pc);
         changed.look = Some(LookData::Standard { modelid: 99 });
         s.apply_event(&AgentEvent::EntityUpserted { entity: changed });
         assert!(
             matches!(s.entities[0].look, Some(LookData::Standard { modelid: 99 })),
-            "Some(new_look) must overwrite, not get preserved"
+            "Some(new_look) must overwrite, not get preserved as the prior Equipped value"
         );
     }
 

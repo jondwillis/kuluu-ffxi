@@ -882,6 +882,26 @@ fn handle_sub_packet(
                         text = %line.text,
                         "0x053 SYSTEMMES: server denied zone change",
                     );
+                } else if m.message_id == 7 || m.message_id == 35 {
+                    // EXECUTING_LOGOUT (id=7) / EXECUTING_SHUTDOWN (id=35) —
+                    // the only positive ack the server sends for an accepted
+                    // 0x0E7 ReqLogout. Elevate to info! so its presence or
+                    // absence (validator rejected; GM/Mog-House immediate
+                    // disconnect) is visible without RUST_LOG=trace.
+                    tracing::info!(
+                        msg_id = m.message_id,
+                        seconds = m.para,
+                        text = %line.text,
+                        "0x053 SYSTEMMES: leavegame countdown tick",
+                    );
+                    // Drive the HUD countdown widget. We clamp `para` into
+                    // u16 because the server's wire field is u32 but real
+                    // values are always ≤30 — clamp keeps `as` cast lints
+                    // honest and matches the LSB effect's domain.
+                    let _ = event_tx.send(AgentEvent::LogoutCountdown {
+                        seconds_remaining: m.para.min(u16::MAX as u32) as u16,
+                        shutdown: m.message_id == 35,
+                    });
                 } else {
                     tracing::trace!(
                         msg_id = m.message_id,
@@ -1131,7 +1151,7 @@ async fn keepalive_loop(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 if let Some(c) = cmd.as_ref() {
-                    tracing::info!(variant = ?std::mem::discriminant(c), "cmd_rx recv");
+                    tracing::debug!(variant = ?std::mem::discriminant(c), "cmd_rx recv");
                 }
                 match cmd {
                     None => break,

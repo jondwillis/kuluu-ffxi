@@ -34,8 +34,16 @@ const DATA_CMD_CHAR_LIST: u8 = 0xA1;
 const DATA_CMD_HANDOFF: u8 = 0xA2;
 
 const VIEW_CMD_REGISTER: u32 = 0x00;
-const VIEW_CMD_CREATE: u32 = 0x01;
 const VIEW_CMD_SELECT: u32 = 0x07;
+/// Real "register character" command — see view_session.cpp:160. The
+/// previous `VIEW_CMD_CREATE = 0x01` value was wrong; the server has no
+/// case 0x01 in its dispatch switch, which is why creation hung forever.
+const VIEW_CMD_REGISTER_CHAR: u32 = 0x21;
+/// "Name check + Gold World Pass" — view_session.cpp:197. Must precede
+/// the 0x21 because the server reads the character name from
+/// `session.requestedNewCharacterName`, which is *only* populated by the
+/// 0x22 success path (login_helpers.cpp:220).
+const VIEW_CMD_NAME_CHECK: u32 = 0x22;
 // Server response: lpkt_next_login command on view socket.
 const VIEW_RESP_NEXT_LOGIN: u32 = 0x0B;
 
@@ -103,6 +111,88 @@ pub struct LobbyHandle {
 impl LobbyHandle {
     pub fn chars(&self) -> &[CharSlot] {
         &self.chars
+    }
+
+    /// Create a new character on this account, then refresh the lobby's
+    /// char list — all on the live sockets. Use this instead of
+    /// [`LobbyClient::create_character`] when you already hold a live
+    /// `LobbyHandle`: opening a second lobby session with the same
+    /// `session_hash` races server-side `session_t` ownership of the
+    /// view/data slots and the new open()'s 0xA1 reply ends up either
+    /// silently dropped or routed to the old socket (surfaces as
+    /// "reading 0xA1 char list" failure). LSB keys `session_t` by
+    /// `session_hash`, not by socket — one hash, one live pair.
+    ///
+    /// On success returns `self` with `chars` updated to include the
+    /// newly-created character. On failure the handle is consumed and
+    /// the caller should `LobbyClient::open` afresh to recover.
+    pub async fn create_character(
+        mut self,
+        auth: &AuthSession,
+        spec: &CharCreateSpec,
+    ) -> Result<Self> {
+        // ---- 0x22 name check ----
+        let name_check = build_view_name_check(&spec.name, &self.session_hash);
+        self.view.write_all(&name_check).await?;
+        self.view.flush().await?;
+        tracing::debug!(name = %spec.name, "lobby handle: 0x22 name check sent");
+        read_create_reply(&mut self.view, "name check")
+            .await
+            .context("0x22 name check response")?;
+
+        // ---- 0x21 register character ----
+        let register_char = build_view_register_char(
+            spec.race,
+            spec.job,
+            spec.nation,
+            spec.size,
+            spec.face,
+            &self.session_hash,
+        );
+        self.view.write_all(&register_char).await?;
+        self.view.flush().await?;
+        tracing::debug!(
+            race = spec.race,
+            job = spec.job,
+            nation = spec.nation,
+            size = spec.size,
+            face = spec.face,
+            "lobby handle: 0x21 register sent"
+        );
+        read_create_reply(&mut self.view, "register character")
+            .await
+            .context("0x21 register character response")?;
+
+        // ---- refresh char list via another 0xA1 on the existing data
+        // socket. The server's `data->addCharIntoCharInfo(charInfo)` call
+        // inside 0x21 (view_session.cpp:172) updates the data_session's
+        // cached characterInfoResponse, so this 0xA1 round-trip returns
+        // the list *with* the new character.
+        // account_id must match `session.accountID` server-side
+        // (data_session.cpp:83). 0 silently fails the comparison and the
+        // server never replies — the 100ms-then-read-EOF that we saw
+        // before this fix.
+        let req_a1 = build_data_a1(auth.account_id, 0, &self.session_hash);
+        self.data.write_all(&req_a1).await?;
+        self.data.flush().await?;
+        // Same race-mitigation rationale as `open()` before its 0xA1.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = read_data_charlist(&mut self.data)
+            .await
+            .context("reading 0xA1 char-list refresh after create")?;
+        let slots = parse_view_chr_info2(&mut self.view)
+            .await
+            .context("reading chr_info2 refresh after create")?;
+        self.chars = slots
+            .into_iter()
+            .filter(|s| s.char_id != 0 && !s.name.starts_with(' '))
+            .collect();
+        tracing::info!(
+            new_name = %spec.name,
+            total = self.chars.len(),
+            "lobby handle: char list refreshed after create"
+        );
+        Ok(self)
     }
 
     /// Run the second half of the lobby flow: view 0x07 select → wait for
@@ -278,58 +368,63 @@ impl LobbyClient {
         Ok((slot.char_id, handoff))
     }
 
+    /// Run the LSB character-creation flow on an already-open lobby view
+    /// socket. Two packets, in order:
+    ///   1. 0x22 (name check) — server validates name, stashes it in
+    ///      `session.requestedNewCharacterName`. Reply is 0x20 bytes on
+    ///      success (result byte = 0x03 at buf[8]) or 0x24 bytes on
+    ///      failure (result = 0x04, errorCode u16 at buf[32]).
+    ///   2. 0x21 (register character) — server reads race/job/nation/
+    ///      size/face at fixed packet offsets (see login_helpers.cpp:216
+    ///      and view_session.cpp:160). Reply is again 0x20 / closed
+    ///      socket on failure.
     pub async fn create_character(
         &self,
         auth: &AuthSession,
-        name: &str,
-        race: u8,
-        job: u8,
-        body_type: u8,
-        gender: u8,
-        face_type: u8,
-        tail_type: u8,
+        spec: &CharCreateSpec,
     ) -> Result<()> {
-        let mut view = self.connect(self.view_port).await?;
-        let register = ixff_header(
-            IXFF_HEADER_SIZE as u32,
-            VIEW_CMD_REGISTER,
+        // The chr_info2 view push is triggered by the *data* port's 0xA1
+        // handler, not by VIEW_CMD_REGISTER alone — see data_session.cpp
+        // around line 281 where it writes into `viewSession->buffer_`.
+        // So we run the full open() flow (which connects both sockets,
+        // registers the view, fires 0xA1, drains chr_info2), then keep
+        // only the view socket for the 0x22/0x21 exchange.
+        let handle = self.open(auth).await?;
+        let mut view = handle.view;
+        tracing::debug!("create_character: lobby open complete");
+
+        // ---- 0x22 name check ----
+        let name_check = build_view_name_check(&spec.name, &auth.session_hash);
+        view.write_all(&name_check).await?;
+        view.flush().await?;
+        tracing::debug!(name = %spec.name, "create_character: 0x22 name check sent");
+        read_create_reply(&mut view, "name check")
+            .await
+            .context("0x22 name check response")?;
+
+        // ---- 0x21 register character ----
+        let register_char = build_view_register_char(
+            spec.race,
+            spec.job,
+            spec.nation,
+            spec.size,
+            spec.face,
             &auth.session_hash,
         );
-        view.write_all(&register).await?;
+        view.write_all(&register_char).await?;
         view.flush().await?;
-
-        // Drain the initial lpkt_chr_info2 push from the register
-        drain_view_chr_info2(&mut view).await?;
-
-        let create = build_view_create(
-            name,
-            race,
-            job,
-            body_type,
-            gender,
-            face_type,
-            tail_type,
-            &auth.session_hash,
+        tracing::debug!(
+            race = spec.race,
+            job = spec.job,
+            nation = spec.nation,
+            size = spec.size,
+            face = spec.face,
+            "create_character: 0x21 register sent"
         );
-        tracing::debug!(payload_size = create.len(), "sending create packet");
-        view.write_all(&create).await?;
-        view.flush().await?;
+        read_create_reply(&mut view, "register character")
+            .await
+            .context("0x21 register character response")?;
 
-        // Server responds with a size-prefixed packet
-        let mut size_bytes = [0u8; 4];
-        view.read_exact(&mut size_bytes)
-            .await
-            .context("reading create response size")?;
-        let size = u32::from_le_bytes(size_bytes) as usize;
-        tracing::debug!(response_size = size, "received create response size");
-        if size < IXFF_HEADER_SIZE || size > 64 * 1024 {
-            bail!("implausible create response size {size}");
-        }
-        let mut body = vec![0u8; size - 4];
-        view.read_exact(&mut body)
-            .await
-            .context("reading create response body")?;
-        tracing::debug!(response_len = body.len(), "received create response");
         Ok(())
     }
 
@@ -400,46 +495,139 @@ fn build_view_select(char_id: u32, char_name: &str, session_hash: &[u8; 16]) -> 
     buf
 }
 
-fn build_view_create(
-    name: &str,
-    race: u8,
-    job: u8,
-    body_type: u8,
-    gender: u8,
-    face_type: u8,
-    tail_type: u8,
-    session_hash: &[u8; 16],
-) -> Vec<u8> {
-    // Layout matches lpkt_chr_create from login_packets.h:
-    // header(28) + name(16) + race(1) + job(1) + body_type(1) + gender(1) + face(1) + tail(1) = 50 bytes
-    // packet_size = 50
-    let payload_size = 22u32; // name(16) + race + job + body_type + gender + face + tail
-    let mut payload = vec![0u8; payload_size as usize];
-    // [0..16] character_name (NUL-padded)
+/// Spec for `LobbyClient::create_character`. Only the fields the server
+/// actually reads in `loginHelpers::createCharacter` (login_helpers.cpp:216)
+/// are exposed: gender, tail, and body are derived server-side from
+/// race+size, not taken from the wire.
+#[derive(Debug, Clone)]
+pub struct CharCreateSpec {
+    pub name: String,
+    /// 1..=8 — 1 HumeM, 2 HumeF, 3 ElvaanM, 4 ElvaanF, 5 TaruM, 6 TaruF,
+    /// 7 Mithra, 8 Galka. (login_helpers.cpp:228.)
+    pub race: u8,
+    /// Starting main job; server clamps to 1..=6 (WAR/MNK/WHM/BLM/RDM/THF).
+    /// login_helpers.cpp:247.
+    pub job: u8,
+    /// 0 San d'Oria, 1 Bastok, 2 Windurst. login_helpers.cpp:259.
+    pub nation: u8,
+    /// 0..=2 (Small/Medium/Large). login_helpers.cpp:234.
+    pub size: u8,
+    /// 0..=15. login_helpers.cpp:240.
+    pub face: u8,
+}
+
+/// Build a 0x22 name-check view packet. Server reads the name at packet
+/// offset 32 (= payload offset 4) for up to 15 bytes, NUL-terminated.
+/// See view_session.cpp:212.
+fn build_view_name_check(name: &str, session_hash: &[u8; 16]) -> Vec<u8> {
+    // Pick a comfortable round-up that covers offsets through 32+16=48.
+    // 0x40 (64) is what LSB's own buffers tend to round to and what the
+    // server's do_write contracts handle without complaint.
+    let packet_size = 0x40u32;
+    let mut buf = vec![0u8; packet_size as usize];
+    buf[0..4].copy_from_slice(&packet_size.to_le_bytes());
+    buf[4..8].copy_from_slice(&IXFF_TERMINATOR.to_le_bytes());
+    buf[8..12].copy_from_slice(&VIEW_CMD_NAME_CHECK.to_le_bytes());
+    buf[12..28].copy_from_slice(session_hash);
+    // Name at packet offset 32 (payload offset 4) — view_session.cpp:212
+    // `std::memcpy(CharName, buffer_.data() + 32, PacketNameLength - 1);`
     let name_bytes = name.as_bytes();
     let n = name_bytes.len().min(15);
-    payload[0..n].copy_from_slice(&name_bytes[..n]);
-    // [16] race
-    payload[16] = race;
-    // [17] job
-    payload[17] = job;
-    // [18] body_type
-    payload[18] = body_type;
-    // [19] gender
-    payload[19] = gender;
-    // [20] face_type
-    payload[20] = face_type;
-    // [21] tail_type
-    payload[21] = tail_type;
+    buf[32..32 + n].copy_from_slice(&name_bytes[..n]);
+    buf
+}
 
-    let packet_size = payload_size + IXFF_HEADER_SIZE as u32;
-    let mut out = vec![0u8; packet_size as usize];
-    out[0..4].copy_from_slice(&packet_size.to_le_bytes());
-    out[4..8].copy_from_slice(&IXFF_TERMINATOR.to_le_bytes());
-    out[8..12].copy_from_slice(&VIEW_CMD_CREATE.to_le_bytes());
-    out[12..28].copy_from_slice(session_hash);
-    out[28..].copy_from_slice(&payload);
-    out
+/// Build a 0x21 register-character view packet. Field offsets are
+/// load-bearing — the server reads them as fixed positions in the
+/// buffer (login_helpers.cpp:216–266), not as a packed struct:
+///   race   @ packet offset 48  (login_helpers.cpp:224)
+///   mjob   @ packet offset 50  (login_helpers.cpp:247)
+///   nation @ packet offset 54  (login_helpers.cpp:259)
+///   size   @ packet offset 57  (login_helpers.cpp:225)
+///   face   @ packet offset 60  (login_helpers.cpp:226)
+/// Name is taken from `session.requestedNewCharacterName`, set by the
+/// preceding 0x22 — NOT from this packet's body.
+fn build_view_register_char(
+    race: u8,
+    job: u8,
+    nation: u8,
+    size: u8,
+    face: u8,
+    session_hash: &[u8; 16],
+) -> Vec<u8> {
+    let packet_size = 0x40u32; // covers through offset 60+1=61
+    let mut buf = vec![0u8; packet_size as usize];
+    buf[0..4].copy_from_slice(&packet_size.to_le_bytes());
+    buf[4..8].copy_from_slice(&IXFF_TERMINATOR.to_le_bytes());
+    buf[8..12].copy_from_slice(&VIEW_CMD_REGISTER_CHAR.to_le_bytes());
+    buf[12..28].copy_from_slice(session_hash);
+    buf[48] = race;
+    buf[50] = job;
+    buf[54] = nation;
+    buf[57] = size;
+    buf[60] = face;
+    buf
+}
+
+/// Read and validate a 0x22 / 0x21 reply. Server writes a size byte at
+/// `buf[0]` (the rest of the size u32 is zero-padded by memset, so the
+/// LE u32 we read is the same value): 0x20 on success with result=0x03
+/// at buf[8], 0x24 on failure with result=0x04 and `loginErrors::errorCode`
+/// at buf[32] (login_helpers.cpp:59). On 0x21 failure the server just
+/// closes the socket (view_session.cpp:166) — we surface that as EOF.
+async fn read_create_reply(stream: &mut TcpStream, stage: &str) -> Result<()> {
+    let mut size_bytes = [0u8; 4];
+    stream
+        .read_exact(&mut size_bytes)
+        .await
+        .with_context(|| format!("reading {stage} reply size (server may have closed socket)"))?;
+    let size = u32::from_le_bytes(size_bytes) as usize;
+    if size != 0x20 && size != 0x24 {
+        bail!("{stage}: implausible reply size {size:#x} (want 0x20 or 0x24)");
+    }
+    let mut rest = vec![0u8; size - 4];
+    stream
+        .read_exact(&mut rest)
+        .await
+        .with_context(|| format!("reading {stage} reply body"))?;
+    // After the 4-byte size we just consumed:
+    //   rest[0..4] = "IXFF" terminator
+    //   rest[4..8] = result byte at index 4 (= original buf[8])
+    let term = u32::from_le_bytes(rest[0..4].try_into().unwrap());
+    if term != IXFF_TERMINATOR {
+        bail!("{stage}: bad terminator {term:#x}");
+    }
+    let result = rest[4]; // buf[8]
+    match (size, result) {
+        (0x20, 0x03) => Ok(()),
+        (0x24, 0x04) => {
+            // errorCode is at packet offset 32 (= rest[28..30]) per
+            // login_helpers.cpp:74 `ref<uint16>(packet, 32) = errorCode;`.
+            let err = u16::from_le_bytes(rest[28..30].try_into().unwrap());
+            bail!(
+                "{stage}: server rejected with loginErrors code {err} ({})",
+                login_error_name(err)
+            );
+        }
+        _ => bail!(
+            "{stage}: unexpected reply size={size:#x} result={result:#x}"
+        ),
+    }
+}
+
+/// Decode a `loginErrors::errorCode` (login_errors.h). Returned alongside
+/// the numeric code so logs are self-explanatory.
+fn login_error_name(code: u16) -> &'static str {
+    match code {
+        305 => "UNABLE_TO_CONNECT_TO_WORLD_SERVER",
+        313 => "CHARACTER_NAME_UNAVAILABLE",
+        201 => "CHARACTER_ALREADY_LOGGED_IN",
+        314 => "FAILED_TO_REGISTER_WITH_THE_NAME_SERVER",
+        321 => "CHARACTERS_PARAMETERS_ARE_INCORRECT",
+        331 => "GAMES_DATA_HAS_BEEN_UPDATED",
+        332 => "COULD_NOT_CONNECT_TO_LOBBY_SERVER",
+        _ => "unknown",
+    }
 }
 
 async fn read_data_charlist(stream: &mut TcpStream) -> Result<CharList> {
@@ -466,9 +654,6 @@ async fn read_data_charlist(stream: &mut TcpStream) -> Result<CharList> {
     Ok(CharList { characters: chars })
 }
 
-async fn drain_view_chr_info2(stream: &mut TcpStream) -> Result<()> {
-    parse_view_chr_info2(stream).await.map(|_| ())
-}
 
 /// Parse the size-prefixed `lpkt_chr_info2` push that the server emits to
 /// the view socket immediately after handling a data-port 0xA1. Each slot

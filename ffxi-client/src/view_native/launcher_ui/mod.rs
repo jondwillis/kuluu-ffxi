@@ -46,7 +46,9 @@
 //!                       └────────────────┘
 //! ```
 
+mod account_create;
 mod async_work;
+mod char_create;
 mod char_list;
 mod login;
 
@@ -70,8 +72,32 @@ use super::AppPhase;
 pub(crate) enum LauncherState {
     #[default]
     Login,
+    /// Account creation form. Reached from `Login` via the C key.
+    /// Submit transitions to `CreateAccountInFlight`; Esc returns to
+    /// `Login`.
+    CreateAccount,
+    /// Sending the `ensure_account` request. Success bounces back to
+    /// `Login` with the new credentials prefilled (the user can then
+    /// press Enter to authenticate). Failure routes to
+    /// `CreateAccountError`.
+    CreateAccountInFlight,
+    /// Surface for unexpected ensure_account errors (network failures,
+    /// server maintenance mode, etc.). Enter retries; Esc returns to
+    /// the form.
+    CreateAccountError,
     AuthInFlight,
     CharList,
+    /// Character creation form. Reached from `CharList` via the "+ New
+    /// character" entry. Submit transitions to `CharCreateInFlight`; Esc
+    /// returns to `CharList`.
+    CharCreate,
+    /// Sending the two-packet name-check + register-char sequence to the
+    /// view server. On success: reopen lobby, refresh char list, return
+    /// to `CharList`. On failure: show error in `CharCreateError`.
+    CharCreateInFlight,
+    /// Server rejected the create (name in use, banned word, etc.). Esc
+    /// returns to the form; Enter retries.
+    CharCreateError,
     ConnectInFlight,
     LoginError,
     /// Terminal for the launcher: triggers transition to
@@ -79,6 +105,120 @@ pub(crate) enum LauncherState {
     /// `PendingConnect` and continues the flow.
     Done,
 }
+
+/// Which field on the char-create form has keyboard focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum CharCreateField {
+    #[default]
+    Name,
+    Race,
+    Job,
+    Nation,
+    Face,
+    Size,
+}
+
+impl CharCreateField {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Race,
+            Self::Race => Self::Job,
+            Self::Job => Self::Nation,
+            Self::Nation => Self::Face,
+            Self::Face => Self::Size,
+            Self::Size => Self::Name,
+        }
+    }
+    pub(crate) fn prev(self) -> Self {
+        match self {
+            Self::Name => Self::Size,
+            Self::Race => Self::Name,
+            Self::Job => Self::Race,
+            Self::Nation => Self::Job,
+            Self::Face => Self::Nation,
+            Self::Size => Self::Face,
+        }
+    }
+}
+
+/// Char-creation form state. Race/job/nation/size are stored as the raw
+/// LSB byte values; rendering looks them up against the tables in
+/// `char_create.rs`.
+#[derive(Resource)]
+pub(crate) struct CharCreateForm {
+    pub name: String,
+    pub race: u8,
+    pub job: u8,
+    pub nation: u8,
+    pub face: u8,
+    pub size: u8,
+    pub focus: CharCreateField,
+}
+
+impl Default for CharCreateForm {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            race: 1,   // Hume M
+            job: 1,    // Warrior
+            nation: 0, // San d'Oria
+            face: 0,
+            size: 1, // Medium
+            focus: CharCreateField::default(),
+        }
+    }
+}
+
+impl CharCreateForm {
+    /// Returns `None` if the form would be accepted by LSB's
+    /// `createCharacter`; `Some(msg)` otherwise. Client-side mirror of
+    /// the server validation in `login_helpers.cpp:216-244`.
+    pub fn validation_msg(&self) -> Option<String> {
+        if self.name.is_empty() {
+            return Some("Enter a name (3–15 letters, A–Z only).".into());
+        }
+        if self.name.len() < 3 {
+            return Some("Name is too short (minimum 3 letters).".into());
+        }
+        if self.name.len() > 15 {
+            return Some("Name is too long (maximum 15 letters).".into());
+        }
+        if !self.name.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Some("Letters only — server rejects digits and punctuation.".into());
+        }
+        None
+    }
+
+    /// Step the focused enum field. `delta` is +1 or -1.
+    pub fn cycle_focused(&mut self, delta: i32) {
+        match self.focus {
+            CharCreateField::Name => {}
+            CharCreateField::Race => self.race = cycle_table(&char_create::RACES, self.race, delta),
+            CharCreateField::Job => self.job = cycle_table(&char_create::JOBS, self.job, delta),
+            CharCreateField::Nation => {
+                self.nation = cycle_table(&char_create::NATIONS, self.nation, delta)
+            }
+            CharCreateField::Face => {
+                let next = (self.face as i32 + delta).rem_euclid(char_create::FACE_MAX as i32 + 1);
+                self.face = next as u8;
+            }
+            CharCreateField::Size => self.size = cycle_table(&char_create::SIZES, self.size, delta),
+        }
+    }
+}
+
+fn cycle_table(table: &[(u8, &str)], current: u8, delta: i32) -> u8 {
+    let idx = table.iter().position(|(v, _)| *v == current).unwrap_or(0) as i32;
+    let n = table.len() as i32;
+    let next = (idx + delta).rem_euclid(n) as usize;
+    table[next].0
+}
+
+/// Error message displayed on `CharCreateError`. Populated by the
+/// in-flight task when the server (or local validation) rejects the
+/// create. Cleared on entry to `CharList`.
+#[derive(Resource, Default)]
+pub(crate) struct CharCreateError(pub String);
 
 /// Where the focus lives in the login form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -96,6 +236,70 @@ pub(crate) struct LoginForm {
     pub pass: String,
     pub focus: LoginField,
 }
+
+/// Which field on the create-account form has keyboard focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum CreateAccountField {
+    #[default]
+    User,
+    Password,
+    PasswordConfirm,
+}
+
+impl CreateAccountField {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::User => Self::Password,
+            Self::Password => Self::PasswordConfirm,
+            Self::PasswordConfirm => Self::User,
+        }
+    }
+    pub(crate) fn prev(self) -> Self {
+        match self {
+            Self::User => Self::PasswordConfirm,
+            Self::Password => Self::User,
+            Self::PasswordConfirm => Self::Password,
+        }
+    }
+}
+
+/// Account-creation form contents. Mirrors `LoginForm` but with a
+/// password-confirm field that the UI compares against `pass` before
+/// allowing submit. Cleared on `OnExit(LauncherState::CreateAccount)`
+/// to avoid leaking credentials across sessions if the user backs out.
+#[derive(Resource, Default)]
+pub(crate) struct CreateAccountForm {
+    pub user: String,
+    pub pass: String,
+    pub pass_confirm: String,
+    pub focus: CreateAccountField,
+}
+
+impl CreateAccountForm {
+    /// `None` if the form would be accepted; `Some(msg)` if it
+    /// shouldn't submit yet. Drives the live validation hint AND gates
+    /// the submit action (Enter does nothing while this returns Some).
+    pub fn validation_msg(&self) -> Option<String> {
+        if self.user.is_empty() {
+            return Some("Enter a username.".into());
+        }
+        if self.pass.is_empty() {
+            return Some("Enter a password.".into());
+        }
+        if self.pass_confirm.is_empty() {
+            return Some("Re-enter the password to confirm.".into());
+        }
+        if self.pass != self.pass_confirm {
+            return Some("Passwords don't match.".into());
+        }
+        None
+    }
+}
+
+/// Error displayed on `CreateAccountError` — populated by the in-flight
+/// task when `auth.ensure_account` fails with a non-validation error.
+#[derive(Resource, Default)]
+pub(crate) struct CreateAccountErrorMsg(pub String);
 
 /// Carries the failure message displayed by the `LoginError` state.
 /// Survives across `AppPhase` transitions: when `Connecting` fails it's
@@ -220,6 +424,10 @@ pub(crate) fn register(
         .insert_resource(CharListData::default())
         .insert_resource(SelectedChar::default())
         .insert_resource(PendingConnect::default())
+        .insert_resource(CharCreateForm::default())
+        .insert_resource(CharCreateError::default())
+        .insert_resource(CreateAccountForm::default())
+        .insert_resource(CreateAccountErrorMsg::default())
         .insert_resource(DefaultCharName(defaults.char_name));
 
     // Launcher's 2D camera tracks the launcher phase exactly. The
@@ -304,6 +512,106 @@ pub(crate) fn register(
     .add_systems(
         Update,
         login::error_keyboard_system.run_if(in_state(LauncherState::LoginError)),
+    );
+
+    // Character creation: form UI on enter, eats keys, redraws on each
+    // frame, submits to CharCreateInFlight.
+    app.add_systems(OnEnter(LauncherState::CharCreate), char_create::spawn_ui)
+        .add_systems(OnExit(LauncherState::CharCreate), char_create::despawn_ui)
+        .add_systems(
+            Update,
+            (
+                char_create::keyboard_input_system,
+                char_create::redraw_form_system,
+            )
+                .run_if(in_state(LauncherState::CharCreate)),
+        );
+
+    // Char-create in flight: spawn task on enter, poll its oneshot every
+    // frame. Success refreshes char list and bounces back to CharList;
+    // failure routes to CharCreateError.
+    app.add_systems(
+        OnEnter(LauncherState::CharCreateInFlight),
+        (
+            async_work::spawn_char_create_task,
+            async_work::spawn_char_create_ui,
+        ),
+    )
+    .add_systems(
+        OnExit(LauncherState::CharCreateInFlight),
+        async_work::despawn_char_create_ui,
+    )
+    .add_systems(
+        Update,
+        async_work::poll_char_create_system.run_if(in_state(LauncherState::CharCreateInFlight)),
+    );
+
+    // Char-create error: simple message; Esc back to form, Enter retry.
+    app.add_systems(
+        OnEnter(LauncherState::CharCreateError),
+        char_create::spawn_error_ui,
+    )
+    .add_systems(
+        OnExit(LauncherState::CharCreateError),
+        char_create::despawn_error_ui,
+    )
+    .add_systems(
+        Update,
+        char_create::error_keyboard_system.run_if(in_state(LauncherState::CharCreateError)),
+    );
+
+    // Account creation: form UI on enter, eats keys, redraws on each
+    // frame, submits to CreateAccountInFlight.
+    app.add_systems(
+        OnEnter(LauncherState::CreateAccount),
+        account_create::spawn_ui,
+    )
+    .add_systems(
+        OnExit(LauncherState::CreateAccount),
+        account_create::despawn_ui,
+    )
+    .add_systems(
+        Update,
+        (
+            account_create::keyboard_input_system,
+            account_create::redraw_form_system,
+        )
+            .run_if(in_state(LauncherState::CreateAccount)),
+    );
+
+    // Account-create in flight: spawn task on enter, poll its oneshot
+    // every frame. Success returns to Login with creds prefilled (user
+    // hits Enter to authenticate); failure routes to CreateAccountError.
+    app.add_systems(
+        OnEnter(LauncherState::CreateAccountInFlight),
+        (
+            async_work::spawn_account_create_task,
+            async_work::spawn_account_create_ui,
+        ),
+    )
+    .add_systems(
+        OnExit(LauncherState::CreateAccountInFlight),
+        async_work::despawn_account_create_ui,
+    )
+    .add_systems(
+        Update,
+        async_work::poll_account_create_system
+            .run_if(in_state(LauncherState::CreateAccountInFlight)),
+    );
+
+    // Account-create error: simple message; Esc back to form, Enter retry.
+    app.add_systems(
+        OnEnter(LauncherState::CreateAccountError),
+        account_create::spawn_error_ui,
+    )
+    .add_systems(
+        OnExit(LauncherState::CreateAccountError),
+        account_create::despawn_error_ui,
+    )
+    .add_systems(
+        Update,
+        account_create::error_keyboard_system
+            .run_if(in_state(LauncherState::CreateAccountError)),
     );
 
     // Done: hand off to AppPhase::Connecting. The launcher's camera

@@ -23,7 +23,9 @@ pub mod death_prompt;
 pub mod diagnostics;
 pub mod dialog;
 pub mod llm_badge;
+pub mod logout_countdown;
 pub mod menu;
+pub mod mesh_debug;
 pub mod quick_action;
 pub mod roster;
 pub mod self_hud;
@@ -71,12 +73,16 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<llm_badge::BadgeClock>();
+        app.init_resource::<mesh_debug::MeshHoverDebug>();
         // ZoneFlashState must exist before `update_zone_flash` runs the
         // first time. Registering at plugin build (not in the spawner)
         // sidesteps the `Commands` queue lag — without this, the first
         // Update tick after `OnEnter(InGame)` panics on missing resource.
         app.init_resource::<zone_flash::ZoneFlashState>();
         app.init_resource::<self_hud::SelfHealTracker>();
+        app.init_resource::<logout_countdown::LogoutCountdownAnchor>();
+        app.init_resource::<logout_countdown::OptimisticLogoutCountdown>();
+        app.add_message::<logout_countdown::LogoutRequested>();
         // Mouse-wheel scroll for the chat panel. Runs in `PreUpdate`
         // after `collect_mouse_system` so it can zero `MousePointer.wheel`
         // on consume — that's how camera-zoom is kept from double-firing
@@ -113,6 +119,19 @@ impl Plugin for HudPlugin {
                 ),
             ),
         );
+        // Second `add_systems` call: Bevy's `IntoScheduleConfigs` tuple
+        // impls cap out at 20 entries, and the block above hit that
+        // ceiling — adding a 21st entry trips the trait-bound error.
+        app.add_systems(Update, logout_countdown::update_logout_countdown);
+        app.add_systems(Update, weather_icon::update_weather_icon);
+        app.add_systems(
+            Update,
+            (
+                mesh_debug::update_hover_state,
+                mesh_debug::update_mesh_debug_hud,
+            )
+                .chain(),
+        );
 
         // FrameTimeDiagnosticsPlugin powers the `fps=` field in the
         // diagnostics strip. `add_plugins` is not idempotent, so guard
@@ -127,9 +146,12 @@ impl Plugin for HudPlugin {
 /// Register the HUD's spawn-once systems on `schedule`. Pass `Startup`
 /// for the wasm front-end (HUD lives for the whole app), or
 /// `OnEnter(your_in_game_state)` for state-driven front-ends.
-pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel>(app: &mut App, schedule: L) {
+pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(
+    app: &mut App,
+    schedule: L,
+) {
     app.add_systems(
-        schedule,
+        schedule.clone(),
         (
             stage_bar::spawn_stage_bar,
             chat_panel::spawn_chat_panel,
@@ -149,7 +171,12 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel>(app: &mut App, sc
             self_hud::spawn_self_hud,
             status_ribbon::spawn_status_ribbon,
             death_prompt::spawn_death_prompt,
-            weather_icon::spawn_weather_icon,
+            logout_countdown::spawn_logout_countdown,
+            mesh_debug::spawn_mesh_debug_hud,
         ),
     );
+    // Second `add_systems` call — see the matching split in `Update`
+    // registration above: Bevy's `IntoScheduleConfigs` tuple impls cap
+    // at 20 entries.
+    app.add_systems(schedule, weather_icon::spawn_weather_icon);
 }

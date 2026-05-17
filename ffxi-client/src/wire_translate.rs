@@ -59,9 +59,18 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         shop: s.shop.as_ref().map(shop_to_wire),
         // Plain `Vec<u16>` clone — no per-element translation needed.
         status_icons: s.status_icons.clone(),
-        // Translate raw LSB weather id (kept as u16 in SessionState to
-        // keep state.rs feature-decoupled from `ffxi-viewer-wire`) into
-        // the typed enum at the wire boundary.
+        // Direct field copy — `state::LogoutCountdown` and
+        // `wire::LogoutCountdown` are structurally identical (two
+        // primitive fields). Kept as separate types per the same
+        // wire/state decoupling that DialogState and ShopState use.
+        logout_countdown: s.logout_countdown.map(|c| wire::LogoutCountdown {
+            seconds_remaining: c.seconds_remaining,
+            shutdown: c.shutdown,
+        }),
+        // Map raw LSB `WeatherNumber` to the typed wire enum. The fold
+        // stores u16 to keep state.rs decoupled from `ffxi-viewer-wire`;
+        // `Weather::from_lsb` is the authoritative table (handles the
+        // 0x14..=0x27 repeat range via mod-20).
         weather: s.current_weather.map(wire::Weather::from_lsb),
     }
 }

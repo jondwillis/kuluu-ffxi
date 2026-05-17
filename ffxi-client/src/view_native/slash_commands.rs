@@ -327,6 +327,11 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 usage: "[setworld|setmob] [N]",
                 summary: "set draw distance",
             },
+            HelpEntry {
+                aliases: &["copy"],
+                usage: "[n]",
+                summary: "copy the last n system-toast lines to the clipboard (default 1)",
+            },
         ],
     ),
 ];
@@ -453,6 +458,13 @@ pub enum SlashOutcome {
     /// operators can hide the visually-noisy non-collision (decorative)
     /// meshes while keeping the LoS-blocking collision mesh visible.
     SetZoneGeom(Option<ffxi_viewer_core::dat_mzb::ZoneGeomMode>),
+    /// `/fps <max>` — cap the render-loop framerate via `bevy_framepace`.
+    /// `Some(n)` sets a target FPS (clamped >0); `None` (`/fps 0` or
+    /// `/fps off`) disables the limiter. Pure client-side knob — no
+    /// network side-effect — so the dispatcher mutates
+    /// `bevy_framepace::FramepaceSettings` directly rather than
+    /// routing through `cmd_tx`.
+    SetTargetFps(Option<u32>),
     /// `/debug heights` — diagnostic. Dumps player Bevy y, navmesh
     /// height, MZB-collision-mesh height (downward raycast), and the
     /// server-snapshot self pos. Dispatcher writes a `DebugHeightsRequest`
@@ -474,6 +486,14 @@ pub enum SlashOutcome {
     EndCutscene {
         event_num: u16,
     },
+    /// `/copy [n]` — copy the last `n` `[system]` chat toasts (i.e.
+    /// responses to slash commands) to the OS clipboard, newline-joined.
+    /// `n` defaults to 1 so a bare `/copy` grabs just the most recent
+    /// response (the common case: read a result, copy it). Clamped at
+    /// dispatch time to the number of toasts that actually exist —
+    /// asking for more than we have isn't an error, it just copies what
+    /// we've got.
+    CopyToasts { n: usize },
 }
 
 /// New-character forced-cutscene CSIDs, keyed by start-zone id. Scraped
@@ -742,6 +762,21 @@ pub fn parse_slash(
         "l" | "linkshell" | "ls" => chat_or_empty(rest, 5, "/l"),
         "s" | "say" => chat_or_empty(rest, 0, "/s"),
         "t" | "tell" => parse_tell(rest),
+        "copy" => {
+            // `/copy` => n=1; `/copy N` => n=N (positive integer).
+            // Anything else falls through to a parse-error toast rather
+            // than silently copying the wrong amount.
+            if rest.is_empty() {
+                SlashOutcome::CopyToasts { n: 1 }
+            } else {
+                match rest.parse::<usize>() {
+                    Ok(n) if n > 0 => SlashOutcome::CopyToasts { n },
+                    _ => SlashOutcome::SystemMessage(format!(
+                        "/copy: expected a positive integer, got `{rest}`"
+                    )),
+                }
+            }
+        }
         "help" | "?" => SlashOutcome::SystemMessage(render_help()),
         "" => SlashOutcome::SystemMessage("empty command".into()),
         unknown => SlashOutcome::SystemMessage(format!("unknown command: /{unknown}")),
@@ -1527,13 +1562,16 @@ fn parse_zoneto(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
 /// `/debug <subcommand>` — namespaced diagnostics. Currently:
 ///   - `heights` — dump player/navmesh/MZB collision heights at the
 ///     player's XZ. Used to diagnose the navmesh-vs-MZB vertical gap.
-/// `/debug` family — diagnostic dumps for the entity/target/look
-/// surface.
+/// `/debug` family — diagnostic dumps for the entity/target/look surface.
 ///
 /// Subcommands:
-///   - `/debug heights` (alias `h`) — height-stack overlay.
-///   - `/debug` (no args) — current target + 10 nearest entities.
-///   - `/debug <name|id|act_idx>` — single-entity detail dump.
+///   - `/debug heights` (alias `h`) — height-stack overlay (Bevy y vs
+///     navmesh vs MZB ground); existing zonegeom-adjacent debug.
+///   - `/debug` (no args) — dump the current target plus the 10 nearest
+///     entities. Use to diagnose target/look/model issues without
+///     leaving the world view.
+///   - `/debug <name|id|act_idx>` — single-entity detail dump. Same
+///     resolution rules as `/look` / `/target`.
 fn parse_debug(
     rest: &str,
     entities: &[WireEntity],
@@ -1549,86 +1587,88 @@ fn parse_debug(
             self_pos,
             current_target,
         )),
+        // Argument that isn't a known subcommand → treat as entity lookup
+        // (name prefix, decimal id, or act_index). Detail dump.
         _ => SlashOutcome::SystemMessage(render_debug_entity(
-            trimmed, entities, self_pos,
+            trimmed,
+            entities,
+            self_pos,
         )),
     }
 }
 
-fn look_tag(look: Option<&ffxi_viewer_wire::EntityLook>) -> &'static str {
-    use ffxi_viewer_wire::EntityLook;
-    match look {
-        None => "--",
-        Some(EntityLook::Standard { .. }) => "std",
-        Some(EntityLook::Equipped { .. }) => "eq",
-        Some(EntityLook::Door { .. }) => "door",
-        Some(EntityLook::Transport { .. }) => "tx",
-    }
-}
-
-fn kind_tag(kind: ffxi_viewer_wire::EntityKind) -> &'static str {
-    use ffxi_viewer_wire::EntityKind;
-    match kind {
-        EntityKind::Pc => "pc",
-        EntityKind::Npc => "npc",
-        EntityKind::Mob => "mob",
-        EntityKind::Pet => "pet",
-        EntityKind::Other => "?",
-    }
-}
-
-/// One-line target summary + table of 10 nearest entities. The self
-/// entity is tagged via exact `pos == self_pos` match — `self_pos` is
-/// derived from the self entity in the snapshot (see
-/// `state.rs::self_position`), so equality is exact when self is
-/// present in the entity list.
+/// Render the `/debug` (no args) report: one line for the current
+/// target, then a header + 10 nearest entities sorted by 2D distance.
+///
+/// The self entity is flagged with `(self)` by matching `pos == self_pos`
+/// — `state.rs::self_position` derives `self_pos` from the self entity in
+/// the snapshot, so the equality is exact (no epsilon needed) when self
+/// is present in the entity list. Pre-CHAR_PC ticks where self isn't in
+/// the list yet just show no `(self)` marker, which is the honest
+/// answer.
 fn render_debug_nearby(
     entities: &[WireEntity],
     self_pos: WireVec3,
     current_target: Option<u32>,
 ) -> String {
     let mut out = String::new();
-    match current_target.and_then(|id| entities.iter().find(|e| e.id == id)) {
-        Some(t) => {
-            let name = t.name.as_deref().unwrap_or("?");
-            let d = sq_dist(t.pos, self_pos).sqrt();
-            let hp = t.hp_pct.map(|p| format!("{p}%")).unwrap_or_else(|| "?".into());
+            let hp = t
+                .hp_pct
+                .map(|p| format!("{p}%"))
+                .unwrap_or_else(|| "?".into());
             out.push_str(&format!(
                 "target: id={} idx={} {} {} dist={:.1}y hp={} look={}",
-                t.id, t.act_index, kind_tag(t.kind), name, d, hp, look_tag(t.look.as_ref()),
+                t.id,
+                t.act_index,
+                kind_tag(t.kind),
+                name,
+                d,
+                hp,
+                look_tag(t.look.as_ref()),
             ));
         }
         None => out.push_str("target: none"),
     }
     out.push('\n');
-    out.push_str("nearby (top 10 by dist):");
-    let nearby = nearby_entities(entities, self_pos, 10);
-    if nearby.is_empty() {
-        out.push_str(" (none)");
-        return out;
-    }
-    for (e, sq) in nearby {
-        let d = sq.sqrt();
-        let name = e.name.as_deref().unwrap_or("?");
-        let hp = e.hp_pct.map(|p| format!("{p}%")).unwrap_or_else(|| "?".into());
+        let hp = e
+            .hp_pct
+            .map(|p| format!("{p}%"))
+            .unwrap_or_else(|| "?".into());
         let self_tag = if e.pos == self_pos { " (self)" } else { "" };
         out.push('\n');
         out.push_str(&format!(
             "  id={} idx={} {} dist={:.1}y hp={} look={} {}{}",
-            e.id, e.act_index, kind_tag(e.kind), d, hp,
-            look_tag(e.look.as_ref()), name, self_tag,
+            e.id,
+            e.act_index,
+            kind_tag(e.kind),
+            d,
+            hp,
+            look_tag(e.look.as_ref()),
+            name,
+            self_tag,
         ));
     }
     out
 }
 
-fn render_debug_entity(arg: &str, entities: &[WireEntity], self_pos: WireVec3) -> String {
+/// Resolve a single entity (name prefix, decimal id, or act_index) and
+/// render its full detail block.
+fn render_debug_entity(
+    arg: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+) -> String {
+    // Resolution order: numeric id → numeric act_index → name prefix.
+    // u32 first because ids easily exceed u16.
     let ent: Option<&WireEntity> = if let Ok(id) = arg.parse::<u32>() {
-        entities.iter().find(|e| e.id == id).or_else(|| {
-            u16::try_from(id)
-                .ok()
-                .and_then(|idx| entities.iter().find(|e| e.act_index == idx))
-        })
+        entities
+            .iter()
+            .find(|e| e.id == id)
+            .or_else(|| {
+                u16::try_from(id)
+                    .ok()
+                    .and_then(|idx| entities.iter().find(|e| e.act_index == idx))
+            })
     } else {
         resolve_name(arg, entities, self_pos)
     };
@@ -1637,27 +1677,59 @@ fn render_debug_entity(arg: &str, entities: &[WireEntity], self_pos: WireVec3) -
     };
     let d = sq_dist(e.pos, self_pos).sqrt();
     let name = e.name.as_deref().unwrap_or("?");
-    let hp = e.hp_pct.map(|p| format!("{p}%")).unwrap_or_else(|| "?".into());
-    let mut s = format!("/debug [{name}] id={} idx={}\n", e.id, e.act_index);
+    let hp = e
+        .hp_pct
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| "?".into());
+    let mut s = String::new();
+    s.push_str(&format!("/debug [{name}] id={} idx={}", e.id, e.act_index));
+    s.push('\n');
     s.push_str(&format!(
-        "  kind={} hp={} dist={:.2}y heading={} speed={}/{}\n",
-        kind_tag(e.kind), hp, d, e.heading, e.speed, e.speed_base,
+        "  kind={} hp={} dist={:.2}y heading={} speed={}/{}",
+        kind_tag(e.kind),
+        hp,
+        d,
+        e.heading,
+        e.speed,
+        e.speed_base,
     ));
+    s.push('\n');
     s.push_str(&format!(
-        "  pos=({:.2}, {:.2}, {:.2})\n", e.pos.x, e.pos.y, e.pos.z,
+        "  pos=({:.2}, {:.2}, {:.2})",
+        e.pos.x, e.pos.y, e.pos.z
     ));
-    s.push_str(&format!("  bt_target={} claim={}\n", e.bt_target_id, e.claim_id));
+    s.push('\n');
+    s.push_str(&format!(
+        "  bt_target={} claim={}",
+        e.bt_target_id, e.claim_id
+    ));
+    s.push('\n');
     s.push_str(&format!("  look_tag={}", look_tag(e.look.as_ref())));
     use ffxi_viewer_wire::EntityLook;
     match &e.look {
-        None => s.push_str(" (none decoded yet)"),
+        None => s.push_str(" (none decoded — no look-bearing tick yet)"),
         Some(EntityLook::Standard { modelid }) => {
             s.push_str(&format!(" modelid={modelid} (0x{modelid:04X})"));
         }
-        Some(EntityLook::Equipped { face, race, head, body, hands, legs, feet, main, sub, ranged }) => {
+        Some(EntityLook::Equipped {
+            face,
+            race,
+            head,
+            body,
+            hands,
+            legs,
+            feet,
+            main,
+            sub,
+            ranged,
+        }) => {
             s.push('\n');
             s.push_str(&format!(
-                "  race={race} face={face} head=0x{head:04X} body=0x{body:04X} hands=0x{hands:04X}\n  legs=0x{legs:04X} feet=0x{feet:04X} main=0x{main:04X} sub=0x{sub:04X} ranged=0x{ranged:04X}",
+                "  race={race} face={face} head=0x{head:04X} body=0x{body:04X} hands=0x{hands:04X}"
+            ));
+            s.push('\n');
+            s.push_str(&format!(
+                "  legs=0x{legs:04X} feet=0x{feet:04X} main=0x{main:04X} sub=0x{sub:04X} ranged=0x{ranged:04X}"
             ));
         }
         Some(EntityLook::Door { size }) => s.push_str(&format!(" door size={size}")),
@@ -1666,16 +1738,20 @@ fn render_debug_entity(arg: &str, entities: &[WireEntity], self_pos: WireVec3) -
     s
 }
 
-/// Top-`limit` entities by squared 2D distance from `from`. Includes
-/// self (the entity with `pos == from`) so `/debug` callers see it
-/// tagged explicitly.
+/// Top-`limit` entities by squared 2D distance from `from`. Self entity
+/// (the one whose `pos == from`) is *included* — `/debug` callers want to
+/// see it explicitly tagged. Returns `(entity, sq_dist)` pairs so callers
+/// can reuse the squared distance for sorting/rendering without redoing
+/// the math.
 fn nearby_entities<'a>(
     entities: &'a [WireEntity],
     from: WireVec3,
     limit: usize,
 ) -> Vec<(&'a WireEntity, f32)> {
     let mut scored: Vec<(&WireEntity, f32)> = entities
-        .iter().map(|e| (e, sq_dist(e.pos, from))).collect();
+        .iter()
+        .map(|e| (e, sq_dist(e.pos, from)))
+        .collect();
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
     scored
@@ -1731,9 +1807,20 @@ fn parse_drawdistance(rest: &str) -> SlashOutcome {
 
 fn parse_fps(rest: &str) -> SlashOutcome {
     let mut parts = rest.split_whitespace();
-    match parts.next().and_then(|s| s.parse::<u32>().ok()) {
-        Some(max) => SlashOutcome::Command(AgentCommand::SetFps { max }),
-        None => SlashOutcome::SystemMessage("/fps: usage `/fps <max>`".into()),
+    let Some(arg) = parts.next() else {
+        return SlashOutcome::SystemMessage(
+            "/fps: usage `/fps <max>` (0 or `off` disables the cap)".into(),
+        );
+    };
+    if arg.eq_ignore_ascii_case("off") {
+        return SlashOutcome::SetTargetFps(None);
+    }
+    match arg.parse::<u32>() {
+        Ok(0) => SlashOutcome::SetTargetFps(None),
+        Ok(n) => SlashOutcome::SetTargetFps(Some(n)),
+        Err(_) => SlashOutcome::SystemMessage(format!(
+            "/fps: `{arg}` is not a number (use `/fps <max>` or `/fps off`)"
+        )),
     }
 }
 
@@ -2125,6 +2212,54 @@ mod tests {
             }
             other => panic!("expected Follow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn debug_no_args_dumps_target_and_nearby() {
+        let entities = vec![
+            ent(101, "Self", EntityKind::Pc, 0.0, 0.0),
+            ent(202, "NearMob", EntityKind::Mob, 2.0, 0.0),
+            ent(303, "FarNpc", EntityKind::Npc, 50.0, 50.0),
+        ];
+        let out = parse_slash("/debug", &entities, origin(), Some(202), None);
+        match out {
+            SlashOutcome::SystemMessage(s) => {
+                assert!(s.contains("target:"), "no target line: {s}");
+                assert!(s.contains("NearMob"), "target name not in output: {s}");
+                assert!(s.contains("nearby"), "nearby header missing: {s}");
+                // Self is at origin and so is `self_pos` — must be tagged.
+                assert!(s.contains("(self)"), "self marker missing: {s}");
+                // Both other entities should appear in the nearby list.
+                assert!(s.contains("FarNpc"), "far entity missing: {s}");
+            }
+            other => panic!("expected SystemMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn debug_with_name_dumps_single_entity_detail() {
+        let mut e = ent(202, "Goblin", EntityKind::Mob, 3.0, 4.0);
+        e.hp_pct = Some(42);
+        let entities = vec![e];
+        let out = parse_slash("/debug Goblin", &entities, origin(), None, None);
+        match out {
+            SlashOutcome::SystemMessage(s) => {
+                assert!(s.contains("Goblin"), "name missing: {s}");
+                assert!(s.contains("id=202"), "id missing: {s}");
+                assert!(s.contains("42%"), "hp missing: {s}");
+                // 2D distance from (0,0) to (3,4) = 5.
+                assert!(s.contains("dist=5.00y"), "distance wrong: {s}");
+            }
+            other => panic!("expected SystemMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn debug_heights_subcommand_still_works() {
+        let out = parse_slash("/debug heights", &empty_entities(), origin(), None, None);
+        assert!(matches!(out, SlashOutcome::DebugHeights));
+        let out = parse_slash("/dbg h", &empty_entities(), origin(), None, None);
+        assert!(matches!(out, SlashOutcome::DebugHeights));
     }
 
     #[test]

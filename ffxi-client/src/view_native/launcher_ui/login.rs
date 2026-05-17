@@ -88,7 +88,9 @@ pub(super) fn spawn_login_ui(
                 TextColor(Color::srgb(0.95, 0.95, 0.95)),
             ));
             parent.spawn((
-                Text::new("Tab: switch field   Enter: login   Esc: clear field"),
+                Text::new(
+                    "Tab: switch field   Enter: login   Ctrl-N: new account   Esc: clear field",
+                ),
                 TextFont {
                     font_size: 12.0,
                     ..default()
@@ -110,10 +112,26 @@ pub(super) fn keyboard_input_system(
     mut events: MessageReader<KeyboardInput>,
     mut form: ResMut<LoginForm>,
     mut next_state: ResMut<NextState<LauncherState>>,
+    keys: Res<ButtonInput<KeyCode>>,
 ) {
+    let ctrl = keys.pressed(KeyCode::ControlLeft)
+        || keys.pressed(KeyCode::ControlRight)
+        || keys.pressed(KeyCode::SuperLeft)
+        || keys.pressed(KeyCode::SuperRight);
     for ev in events.read() {
         if ev.state != ButtonState::Pressed {
             continue;
+        }
+        // Ctrl-N (or Cmd-N on macOS) → jump to account-creation screen.
+        // We check the modifier before the Character match so the 'n'
+        // doesn't end up typed into the focused field.
+        if ctrl {
+            if let Key::Character(s) = &ev.logical_key {
+                if s.eq_ignore_ascii_case("n") {
+                    next_state.set(LauncherState::CreateAccount);
+                    return;
+                }
+            }
         }
         match &ev.logical_key {
             Key::Enter => {

@@ -18,7 +18,13 @@ default = []
 # OS window via bevy_winit. Bevy's winit event loop must run on the OS
 # main thread on macOS, so main.rs handles the dispatch specially when
 # this feature is active.
-native-window = ["dep:bevy", "dep:ffxi-viewer-core", "dep:ffxi-viewer-wire"]
+native-window = [
+    "dep:bevy",
+    "dep:bevy_framepace",
+    "dep:arboard",
+    "dep:ffxi-viewer-core",
+    "dep:ffxi-viewer-wire",
+]
 # Enable the WebSocket relay listener (`--relay-listen <addr>` global flag).
 # Publishes the same `ffxi-viewer-wire` frames the in-process bridge produces,
 # so external tools (and the future wasm browser viewer) can consume the
@@ -49,6 +55,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 bevy = { workspace = true, optional = true }
+# Frame-rate limiter for the native window. Pinned to 0.20.x because that's
+# the line tracking Bevy 0.17 — 0.21 jumps to Bevy 0.18 and would clash.
+# `default-features = false` strips the debug overlay we don't need.
+bevy_framepace = { version = "0.20.1", optional = true, default-features = false }
+# System clipboard. Used by `/copy` to push recent system-toast lines to
+# the OS clipboard. Optional + gated on `native-window` because the
+# headless/relay binary has no GUI session and no clipboard to write to.
+arboard = { version = "3", optional = true, default-features = false }
 
 ffxi-viewer-wire = { path = "../ffxi-viewer-wire", optional = true }
 ffxi-viewer-core = { path = "../ffxi-viewer-core", optional = true }

@@ -51,6 +51,16 @@ pub struct SlashWriters<'w> {
     pub load_mmb: MessageWriter<'w, LoadMmbRequest>,
     pub load_mzb: MessageWriter<'w, LoadMzbRequest>,
     pub debug_heights: MessageWriter<'w, DebugHeightsRequest>,
+    /// `/logout` / `/shutdown` arming variants emit this so the HUD can
+    /// start an optimistic countdown the instant the operator presses
+    /// Enter, rather than waiting for the server's first 0x053 SYSTEMMES
+    /// (which may never come if the validator silently rejects).
+    pub logout_requested:
+        MessageWriter<'w, ffxi_viewer_core::hud::logout_countdown::LogoutRequested>,
+    // `/fps` mutates this directly. Bundled here (rather than a top-level
+    // `ResMut` on `text_input_system`) to stay under Bevy's 16-SystemParam
+    // cap. `Mut` access is fine — only the chat submit path writes it.
+    pub framepace: ResMut<'w, bevy_framepace::FramepaceSettings>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -482,6 +492,14 @@ fn apply_slash_outcome(
 ) {
     match outcome {
         SlashOutcome::Command(cmd) => {
+            if let Some(toast) = reqlogout_ack_text(&cmd) {
+                push_system_chat_line(scene_state, toast.into());
+            }
+            if let Some(shutdown) = reqlogout_starts_countdown(&cmd) {
+                slash_writers.logout_requested.write(
+                    ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown },
+                );
+            }
             let send_result = cmd_tx.try_send(cmd);
             if let Err(e) = send_result {
                 // Channel full or closed — operator should see this; silent
@@ -497,6 +515,14 @@ fn apply_slash_outcome(
             // and Heal silently drops. Each drop is reported
             // individually with the same toast Command uses.
             for cmd in cmds {
+                if let Some(toast) = reqlogout_ack_text(&cmd) {
+                    push_system_chat_line(scene_state, toast.into());
+                }
+                if let Some(shutdown) = reqlogout_starts_countdown(&cmd) {
+                    slash_writers.logout_requested.write(
+                        ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown },
+                    );
+                }
                 if let Err(e) = cmd_tx.try_send(cmd) {
                     push_system_chat_line(
                         scene_state,
@@ -521,7 +547,16 @@ fn apply_slash_outcome(
             // either way — even if the channel is full and one of these
             // gets dropped, the user still gets the local exit they
             // asked for.
-            let _ = cmd_tx.try_send(AgentCommand::ReqLogout { kind });
+            let req = AgentCommand::ReqLogout { kind };
+            if let Some(toast) = reqlogout_ack_text(&req) {
+                push_system_chat_line(scene_state, toast.into());
+            }
+            if let Some(shutdown) = reqlogout_starts_countdown(&req) {
+                slash_writers.logout_requested.write(
+                    ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown },
+                );
+            }
+            let _ = cmd_tx.try_send(req);
             let _ = cmd_tx.try_send(AgentCommand::Disconnect);
             exit.write_default();
         }
@@ -618,6 +653,19 @@ fn apply_slash_outcome(
                 }
             }
         }
+        SlashOutcome::SetTargetFps(target) => {
+            use bevy_framepace::Limiter;
+            match target {
+                Some(n) => {
+                    slash_writers.framepace.limiter = Limiter::from_framerate(n as f64);
+                    push_system_chat_line(scene_state, format!("/fps: capped at {n}"));
+                }
+                None => {
+                    slash_writers.framepace.limiter = Limiter::Off;
+                    push_system_chat_line(scene_state, "/fps: cap disabled".into());
+                }
+            }
+        }
         SlashOutcome::SetZoneGeom(setting) => {
             let next = setting.unwrap_or_else(|| draw_distance.zone_geom_mode.cycle());
             draw_distance.zone_geom_mode = next;
@@ -707,6 +755,54 @@ fn apply_slash_outcome(
                     "/agent: requires Unix-domain-socket build (non-Unix target)".into(),
                 );
             }
+        }
+        SlashOutcome::CopyToasts { n } => {
+            apply_copy_toasts(n, scene_state);
+        }
+    }
+}
+
+/// Copy the last `n` UI-local toasts (slash-command responses) to the OS
+/// clipboard, newline-joined. `n` is clamped to the number of toasts that
+/// actually exist — asking for more isn't an error.
+///
+/// The clipboard handle is constructed per call rather than cached: on
+/// macOS `arboard` opens an `NSPasteboard` reference which is cheap,
+/// and not keeping it alive avoids cross-thread `Send` headaches with
+/// Bevy's system params. A failed open or write surfaces as a `[system]`
+/// toast — the operator should know the copy didn't land rather than
+/// silently believing the clipboard has stale content.
+fn apply_copy_toasts(n: usize, scene_state: &mut SceneState) {
+    let toasts = &scene_state.local_toasts;
+    if toasts.is_empty() {
+        push_system_chat_line(scene_state, "/copy: no toasts to copy".into());
+        return;
+    }
+    let take = n.min(toasts.len());
+    let start = toasts.len() - take;
+    // Join with '\n'; the rendered chat panel already shows each toast
+    // on its own row, so reproducing that line-break shape is what the
+    // operator expects to land on their clipboard.
+    let payload: String = toasts[start..]
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => match cb.set_text(payload) {
+            Ok(()) => {
+                push_system_chat_line(
+                    scene_state,
+                    format!("/copy: {take} toast(s) on clipboard"),
+                );
+            }
+            Err(e) => {
+                push_system_chat_line(scene_state, format!("/copy: clipboard write failed: {e}"));
+            }
+        },
+        Err(e) => {
+            push_system_chat_line(scene_state, format!("/copy: clipboard unavailable: {e}"));
         }
     }
 }
@@ -930,6 +1026,51 @@ fn format_modifiers(mods: ffxi_viewer_core::Modifiers) -> &'static str {
 /// than vanishing on the very next ingest tick.
 fn push_system_chat_line(scene_state: &mut SceneState, text: String) {
     scene_state.push_local_toast(system_chat_line(text));
+}
+
+/// If `cmd` is an `AgentCommand::ReqLogout`, return the local-toast text
+/// the user should see immediately when the slash is dispatched.
+///
+/// Why: `/logout` and `/shutdown` are slow round-trips — the server's
+/// `EXECUTING_LOGOUT` (msg id=7) / `EXECUTING_SHUTDOWN` (id=35) system
+/// message only appears after `EFFECT_LEAVEGAME::onEffectGain` fires
+/// (see `vendor/server/scripts/effects/leavegame.lua:35`), and never at
+/// all when the request is silently rejected by the 0x0E7 validator
+/// (`InEvent | AbnormalStatus | Crafting | PreventAction`) or when a
+/// GM / Mog-House grant skips the countdown and disconnects directly.
+/// Without a local echo the operator gets zero feedback that their slash
+/// was even parsed, which is the bug this addresses.
+/// If `cmd` is an *arming* `ReqLogout` variant, return `Some(shutdown)`
+/// — the boolean that distinguishes `/logout` from `/shutdown` for the
+/// HUD label. `Off` variants and non-`ReqLogout` commands return `None`
+/// so the dispatcher doesn't fire a spurious optimistic countdown when
+/// the user is *cancelling* a logout (which the existing widget should
+/// hide, not show).
+fn reqlogout_starts_countdown(cmd: &AgentCommand) -> Option<bool> {
+    let AgentCommand::ReqLogout { kind } = cmd else {
+        return None;
+    };
+    match kind {
+        ReqLogoutKind::LogoutToggle | ReqLogoutKind::LogoutOn => Some(false),
+        ReqLogoutKind::ShutdownToggle | ReqLogoutKind::ShutdownOn => Some(true),
+        ReqLogoutKind::LogoutOff | ReqLogoutKind::ShutdownOff => None,
+    }
+}
+
+fn reqlogout_ack_text(cmd: &AgentCommand) -> Option<&'static str> {
+    let AgentCommand::ReqLogout { kind } = cmd else {
+        return None;
+    };
+    Some(match kind {
+        ReqLogoutKind::LogoutToggle | ReqLogoutKind::LogoutOn => {
+            "/logout: requested (30s LeaveGame timer; movement or `/logout off` cancels)"
+        }
+        ReqLogoutKind::LogoutOff => "/logout: cancel requested",
+        ReqLogoutKind::ShutdownToggle | ReqLogoutKind::ShutdownOn => {
+            "/shutdown: requested (30s LeaveGame timer; movement or `/shutdown off` cancels)"
+        }
+        ReqLogoutKind::ShutdownOff => "/shutdown: cancel requested",
+    })
 }
 
 /// Local chat-line echo for `/say`, `/sh`, `/p`, `/l`, `/y` etc. The
@@ -1351,6 +1492,57 @@ fn handle_passive_cursor_key(
     // own Action variant). The toggle handler there detects mode ==
     // PassiveCursor and pops back to World.
     None
+}
+
+#[cfg(test)]
+mod reqlogout_ack_tests {
+    use super::*;
+
+    /// Every `ReqLogout` variant must produce a toast. If a future
+    /// variant lands without one, the user is back to the
+    /// "typed `/logout` and saw nothing" failure mode.
+    #[test]
+    fn every_reqlogout_kind_has_ack_text() {
+        for kind in [
+            ReqLogoutKind::LogoutToggle,
+            ReqLogoutKind::LogoutOn,
+            ReqLogoutKind::LogoutOff,
+            ReqLogoutKind::ShutdownToggle,
+            ReqLogoutKind::ShutdownOn,
+            ReqLogoutKind::ShutdownOff,
+        ] {
+            let text = reqlogout_ack_text(&AgentCommand::ReqLogout { kind })
+                .unwrap_or_else(|| panic!("no toast for {kind:?}"));
+            assert!(!text.is_empty(), "empty toast for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn arming_variants_mention_cancellation() {
+        for kind in [
+            ReqLogoutKind::LogoutToggle,
+            ReqLogoutKind::LogoutOn,
+            ReqLogoutKind::ShutdownToggle,
+            ReqLogoutKind::ShutdownOn,
+        ] {
+            let text = reqlogout_ack_text(&AgentCommand::ReqLogout { kind })
+                .expect("arming variant has ack")
+                .to_lowercase();
+            assert!(
+                text.contains("cancel") || text.contains("off"),
+                "{kind:?} toast {text:?} should hint at cancellation",
+            );
+        }
+    }
+
+    #[test]
+    fn non_reqlogout_command_returns_none() {
+        let other = AgentCommand::Chat {
+            kind: 0,
+            text: "hi".into(),
+        };
+        assert!(reqlogout_ack_text(&other).is_none());
+    }
 }
 
 #[cfg(test)]

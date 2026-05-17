@@ -158,6 +158,10 @@ pub struct NamedTexture {
 pub struct LoadedMmb {
     pub submeshes: Vec<MmbSubMesh>,
     pub textures: Vec<NamedTexture>,
+    /// MMB header's `asset_name` field — the 16-byte ASCII name the
+    /// MZB placement table looks up. Useful for mouse-over debug HUDs
+    /// that identify which placement-table entry a mesh came from.
+    pub asset_name: String,
 }
 
 /// Load + decrypt + parse an MMB at the given file_id / chunk_idx.
@@ -272,9 +276,11 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
         });
     }
 
+    let asset_name = header.asset_name_str().trim().to_string();
     Ok(LoadedMmb {
         submeshes: out,
         textures,
+        asset_name,
     })
 }
 
@@ -282,7 +288,7 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
 /// texture decoder produces top-mip RGBA8 already; we just wrap it in
 /// the asset type Bevy expects for `base_color_texture`.
 fn decoded_texture_to_image(t: &DecodedTexture) -> Image {
-    Image::new(
+    let mut img = Image::new(
         Extent3d {
             width: t.width,
             height: t.height,
@@ -295,7 +301,24 @@ fn decoded_texture_to_image(t: &DecodedTexture) -> Image {
         // for PBR lighting.
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::default(),
-    )
+    );
+    // FFXI textures are authored for tiling: walls/floors carry UVs that
+    // run 0..N over a multi-tile surface. The Bevy default `ClampToEdge`
+    // stretches the last texel across the rest of the surface — that's
+    // the vertical-stripe banding visible on tall columns. `Repeat`
+    // wraps correctly. Nearest mag-filter keeps the retail "crisp pixel"
+    // look on close-up textures while linear min/mipmap stays anti-
+    // aliased at distance.
+    img.sampler = bevy::image::ImageSampler::Descriptor(bevy::image::ImageSamplerDescriptor {
+        address_mode_u: bevy::image::ImageAddressMode::Repeat,
+        address_mode_v: bevy::image::ImageAddressMode::Repeat,
+        address_mode_w: bevy::image::ImageAddressMode::Repeat,
+        mag_filter: bevy::image::ImageFilterMode::Nearest,
+        min_filter: bevy::image::ImageFilterMode::Linear,
+        mipmap_filter: bevy::image::ImageFilterMode::Linear,
+        ..Default::default()
+    });
+    img
 }
 
 // Stage 5a removed the 6-color debug palette here. Submeshes now
@@ -406,6 +429,16 @@ pub fn process_load_mmb_requests(
         //   `Mesh3d` so the real model replaces the placeholder.
         // - `entity_id = None` (free overlay, original `/load_mmb`):
         //   spawn a new parent at `world_pos`.
+        // `true` when the spawn produces a new static parent (zone
+        // placement or free `/load_mmb` overlay) rather than attaching
+        // meshes under a moving `WorldEntity`. Static placements should
+        // participate in camera occlusion; entity-attached models
+        // (NPCs, PCs, pets) should not — they're small, move every
+        // frame, and would force a BVH rebuild storm.
+        let is_static_placement = req
+            .entity_id
+            .and_then(|id| tracked.by_id.get(&id))
+            .is_none();
         let parent = match req.entity_id.and_then(|id| tracked.by_id.get(&id)) {
             Some(&bevy_e) => {
                 // Hide the debug capsule by removing its mesh handle.
@@ -440,7 +473,7 @@ pub fn process_load_mmb_requests(
         };
 
         let n_subs = loaded.submeshes.len();
-        for sub in loaded.submeshes.iter() {
+        for (sub_index, sub) in loaded.submeshes.iter().enumerate() {
             let mut mesh = Mesh::new(
                 PrimitiveTopology::TriangleList,
                 RenderAssetUsages::default(),
@@ -482,13 +515,37 @@ pub fn process_load_mmb_requests(
                 ..default()
             });
 
-            commands.spawn((
+            let mut child = commands.spawn((
                 MmbOverlay,
                 Mesh3d(meshes.add(mesh)),
                 MeshMaterial3d(mat),
                 Transform::default(),
                 ChildOf(parent),
             ));
+            // Static placements (zone-spawn buildings, free `/load_mmb`
+            // overlays) participate in camera occlusion. Entity-attached
+            // MMBs (NPCs, PCs, pets) deliberately skip the marker — they
+            // move every frame and would force a BVH-build storm.
+            if is_static_placement {
+                child.insert(crate::components::CameraOccluder);
+            }
+            // Hover-to-inspect debug HUD. Only meaningful for the
+            // static zone-spawn case where the operator wants to chase
+            // misplaced wall slabs / unplaced MMBs; entity-attached
+            // mounts are already targetable via the entity capsule's
+            // own Pickable so adding a second one would confuse the
+            // click-to-target system.
+            if is_static_placement {
+                child.insert(crate::hud::mesh_debug::mesh_debug_bundle(
+                    crate::hud::mesh_debug::MmbDebugInfo {
+                        file_id: req.file_id,
+                        chunk_idx: req.chunk_idx,
+                        sub_index,
+                        asset_name: loaded.asset_name.clone(),
+                        variant_name: sub.variant_name.trim().to_string(),
+                    },
+                ));
+            }
         }
 
         // Per-event spawn confirmation: only emit for manual `/load_mmb`
