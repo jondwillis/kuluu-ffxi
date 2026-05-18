@@ -29,7 +29,7 @@ use bevy::image::Image;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use ffxi_dat::mmb::{MmbHeader, MmbSubRecord};
+use ffxi_dat::mmb::{parse_models, MmbHeader};
 use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::{mmb, walk, ChunkKind, DatRoot};
 
@@ -207,13 +207,18 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
 
     let decrypted = mmb::decrypt(chunk.data).map_err(|e| format!("decrypt: {e}"))?;
     let header = MmbHeader::parse(&decrypted).map_err(|e| format!("header parse: {e}"))?;
-    let subs = MmbSubRecord::find_all(header.payload);
+    // Structural walk (lotus-parity). The previous heuristic scanner
+    // (`MmbSubRecord::find_all`) found ASCII-looking 16-byte windows
+    // and missed real per-submesh records embedded in city assets —
+    // verified live against tshimonorig_06: scanner returned 2 of
+    // many submeshes, the structural walker returns all of them.
+    let models = parse_models(&decrypted);
 
     // Scrape IMG chunks from the same DAT. Many files have dozens of
-    // IMGs (file 200 = 53; file 133 = 47). Each submesh's 16-byte
-    // textureName (see `MmbSubRecord::texture_name_str`) is matched
-    // against `NamedTexture.name` at spawn time; non-matching submeshes
-    // fall back to the first decodable IMG.
+    // IMGs (file 200 = 53; file 133 = 47). Each model's 8-byte texture
+    // name (from the last half of `SMMBModelHeader.textureName`) is
+    // paired against `NamedTexture.name` at spawn time; unmatched
+    // submeshes fall back to the first decodable IMG.
     let textures: Vec<NamedTexture> = chunks
         .iter()
         .filter(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::Img))
@@ -224,56 +229,28 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
         })
         .collect();
 
-    let mut out = Vec::with_capacity(subs.len());
-    for sub in &subs {
-        // Only accept records whose 8-byte type-tag is `"model   "`.
-        // Real per-submesh textureName fields are laid out as
-        // `<"model   "><8-char name>` — verified live against city-zone
-        // DAT 330 chunk 252 (tshimonorig_06), which has records with
-        // textureNames `"model   jimeni_0"` and `"model   kabe_3"`.
-        // The name half is what IMG's `extract_texture_name` returns,
-        // so `MmbSubRecord::texture_name_str` reads bytes 8..16 and
-        // pairs directly against the IMG pool below.
-        //
-        // Other tag values come from clod-style cloth meshes (which
-        // use a different vertex layout `parse_vertices` can't decode)
-        // or from coincidental ASCII windows inside vertex/index data
-        // that the heuristic scanner accidentally matched. Without
-        // this filter those records either render at runaway scale
-        // ("enormous shards") or land downstream as zero-triangle
-        // meshes that crashed `build_collision_bvh_system`.
-        if !sub.tag.starts_with(b"model") {
+    let mut out = Vec::with_capacity(models.len());
+    for m in &models {
+        if m.vertices.is_empty() || m.indices.is_empty() {
             continue;
         }
-        // Skip sub-records whose body can't fit a 36-byte vertex stride
-        // for the declared count, or whose strip yields no triangles
-        // after restart/winding decode.
-        let Some(verts) = sub.parse_vertices() else {
-            continue;
-        };
         // Sanity check: real FFXI zone props are well within ±10000
-        // yards of origin. If any vertex blows past that we're almost
-        // certainly mis-parsing a non-36-byte-stride record (e.g.
-        // lotus's `SMMBBlockVertex2` 48-byte layout in d3==2 files)
-        // and the result will show as the historical "enormous shards
-        // radiating from each placement." Drop these submeshes rather
-        // than letting them render at runaway scale.
+        // yards of origin. The structural walker already chooses the
+        // right vertex stride (36 vs 48), so this should almost never
+        // fire — kept as a defense against malformed/truncated DATs.
         const COORD_SANE_LIMIT: f32 = 10_000.0;
-        if verts.iter().any(|v| {
+        if m.vertices.iter().any(|v| {
             v.pos
                 .iter()
                 .any(|c| !c.is_finite() || c.abs() > COORD_SANE_LIMIT)
         }) {
             continue;
         }
-        let tris = sub.parse_triangle_list();
-        if tris.is_empty() {
-            continue;
-        }
-        let positions: Vec<[f32; 3]> = verts.iter().map(|v| v.pos).collect();
-        let normals: Vec<[f32; 3]> = verts.iter().map(|v| v.normal).collect();
-        let uvs: Vec<[f32; 2]> = verts.iter().map(|v| v.uv).collect();
-        let colors: Vec<[f32; 4]> = verts
+        let positions: Vec<[f32; 3]> = m.vertices.iter().map(|v| v.pos).collect();
+        let normals: Vec<[f32; 3]> = m.vertices.iter().map(|v| v.normal).collect();
+        let uvs: Vec<[f32; 2]> = m.vertices.iter().map(|v| v.uv).collect();
+        let colors: Vec<[f32; 4]> = m
+            .vertices
             .iter()
             .map(|v| {
                 [
@@ -284,36 +261,21 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
                 ]
             })
             .collect();
-        // Drop triangles whose indices reference past the actual
-        // vertex array. The strip-length header at the head of the
-        // index buffer and stray strip-restart sentinels can encode
-        // u16 values well above the vertex count; rendering them
-        // samples adjacent-buffer garbage and produces enormous
-        // shards that stretch out from the placement point. Bounds-
-        // check here keeps the visible geometry tight.
-        let vert_count = verts.len() as u16;
-        let indices: Vec<u32> = tris
-            .iter()
+        // Defense-in-depth bounds-check against the vertex array.
+        // `parse_models` produces well-formed indices, but a truncated
+        // DAT could still feed us bad bytes.
+        let vert_count = m.vertices.len() as u16;
+        let indices: Vec<u32> = m
+            .indices
+            .chunks_exact(3)
             .filter(|t| t[0] < vert_count && t[1] < vert_count && t[2] < vert_count)
             .flat_map(|t| [t[0] as u32, t[1] as u32, t[2] as u32])
             .collect();
-        // Drop submeshes where every triangle was bounds-rejected. They
-        // bake into a Bevy mesh with zero indices, which the downstream
-        // `CameraOccluder` BVH builder panics on (it indexes nodes[0]
-        // unconditionally — see ffxi-client::view_native::collision_bvh
-        // ::patch_leaf_offsets). The historical `b"model"` filter
-        // suppressed these records before this point; removing it
-        // exposed the path.
         if indices.is_empty() {
             continue;
         }
         out.push(MmbSubMesh {
-            // Full 16-byte textureName, NUL-terminated and trimmed.
-            // Matches `extract_texture_name`'s output on the IMG side.
-            // Previously this stored `variant_name_str()` which mapped
-            // NUL to '.', producing names like `s_kabe2.` that could
-            // never match `s_kabe2` from the IMG side.
-            variant_name: sub.texture_name_str(),
+            variant_name: m.texture_name.clone(),
             positions,
             normals,
             uvs,
@@ -474,12 +436,19 @@ pub fn process_load_mmb_requests(
         // Helps diagnose "missing textures" symptoms — set
         // RUST_LOG=ffxi_viewer_core::dat_mmb=info to see it.
         if pool_is_new {
-            let img_names: Vec<&str> = tex_by_name
-                .keys()
-                .map(|s| s.as_str())
+            // `SMMBHeader.pieces` (lotus mmb.cppm:98) sits at the first
+            // 4 bytes of the payload — i.e. decrypted bytes 32..36 from
+            // the file. We don't yet decode the block headers, so we
+            // just probe `pieces` to compare against what our heuristic
+            // scanner actually returned. A mismatch (pieces > 0 but
+            // we see far fewer than `numModel * pieces` submeshes)
+            // tells us the scanner is missing structural records.
+            let img_names: Vec<&str> = tex_by_name.keys().map(|s| s.as_str()).collect();
+            let mut requested: Vec<&str> = loaded
+                .submeshes
+                .iter()
+                .map(|s| s.variant_name.as_str())
                 .collect();
-            let mut requested: Vec<&str> =
-                loaded.submeshes.iter().map(|s| s.variant_name.as_str()).collect();
             requested.sort_unstable();
             requested.dedup();
             let (matched, unmatched): (Vec<&str>, Vec<&str>) = requested
@@ -490,6 +459,7 @@ pub fn process_load_mmb_requests(
                 file_id = req.file_id,
                 chunk_idx = req.chunk_idx,
                 asset = %loaded.asset_name,
+                submesh_count = loaded.submeshes.len(),
                 img_count = tex_by_name.len(),
                 imgs = ?img_names,
                 matched = ?matched,

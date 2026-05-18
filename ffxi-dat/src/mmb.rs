@@ -536,6 +536,333 @@ fn is_ascii_variant(b: &[u8]) -> bool {
         .all(|&c| c == 0 || c.is_ascii_alphanumeric() || c == b'_' || c == b' ')
 }
 
+/// One mesh produced by the structural [`parse_models`] walk —
+/// equivalent to `lotus-ffxi::FFXI::MMB::Mesh`. Carries everything the
+/// renderer needs without any of the heuristic-scanner uncertainty.
+#[derive(Debug, Clone)]
+pub struct MmbModel {
+    /// Last 8 bytes of the 16-byte textureName field (the bare name
+    /// portion; the first 8 bytes are always the `"model   "` type
+    /// tag for this record kind). Matches IMG's
+    /// [`crate::texture::extract_texture_name`] output exactly.
+    pub texture_name: String,
+    pub blending: u16,
+    pub vertices: Vec<MmbVertex>,
+    /// Already a triangle list (strip decoding is done internally
+    /// when the source topology was a strip).
+    pub indices: Vec<u16>,
+}
+
+/// Structurally walk an MMB chunk and return every per-model record
+/// — the way lotus-ffxi's `MMB(buffer)` constructor does it.
+///
+/// Why this exists alongside [`MmbSubRecord::find_all`]: the heuristic
+/// scanner walks the payload looking for 16-byte windows of ASCII text
+/// that *look* like textureNames. It silently misses real records when
+/// adjacent vertex data doesn't produce a clean ASCII boundary, when
+/// a false-positive match shadows the next real record, or when an
+/// MMB uses the 48-byte `SMMBBlockVertex2` stride (d3==2 files). For
+/// city buildings the scanner can find just 1–2 of 5–10 actual models.
+///
+/// The structural walk follows the documented layout (lotus mmb.cppm
+/// lines 235-413):
+///   - SMMBHEAD (16 B) at decrypted[0..16] — `head->id == "MMB"`
+///     selects type-1 (16-bit strip topology) vs type-2 (uses head2).
+///   - SMMBHEAD2 also at decrypted[0..16] — type-2 layout. The `d3`
+///     byte (decrypted[8] after the packed MMBSize:24+d1:8 prefix)
+///     selects 48-byte SMMBBlockVertex2 if == 2, else 36-byte
+///     SMMBBlockVertex.
+///   - SMMBHeader at decrypted[16..64]: imgID(16) + pieces(4) +
+///     6×f32 bbox(24) + offsetBlockHeader(4).
+///   - Block-offset list at decrypted[64..]:
+///     * if `offsetBlockHeader == 0 && pieces != 0`: 8×u32 pointers,
+///       NULs filtered out.
+///     * if `offsetBlockHeader == 0 && pieces == 0`: implicit, one
+///       block lives directly at offset 64.
+///     * if `offsetBlockHeader != 0`: that's the first block; any
+///       additional pointers come from the 4..N words between offset
+///       64 and offsetBlockHeader.
+///   - For each piece: SMMBBlockHeader(32 B) = numModel(4) +
+///     6×f32(24) + numFace(4). Followed by `numModel` inline
+///     SMMBModelHeader records (20 B each), each immediately
+///     followed by `vertexsize × Vertex` and then a u16 num_indices
+///     + 2 B pad + indices (u16 × num_indices), plus an odd-pad u16
+///     if num_indices is odd.
+pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
+    const SMMB_HEAD_SIZE: usize = 16;
+    const SMMB_HEADER_SIZE: usize = 48; // imgID(16)+pieces(4)+bbox(24)+offset(4)
+
+    if decrypted.len() < SMMB_HEAD_SIZE + SMMB_HEADER_SIZE {
+        return Vec::new();
+    }
+
+    // SMMBHEAD: ASCII id at bytes 0..3 distinguishes the two file
+    // shapes. Type-1 files start with "MMB"; type-2 (more common in
+    // zone DATs) don't.
+    let is_v1 = &decrypted[0..3] == b"MMB";
+
+    // For type-2 (SMMBHEAD2), the layout is:
+    //   MMBSize: u24, d1: u8, d3: u8, d4: u8, d5: u8, d6: u8, name[8]
+    // packed. `d3` sits at decrypted[4]. d3 == 2 means the file uses
+    // the wide 48-byte SMMBBlockVertex2 layout (cloth/dressable
+    // assets); otherwise the standard 36-byte SMMBBlockVertex.
+    let d3 = if is_v1 { 0 } else { decrypted[4] };
+    let vertex_stride: usize = if d3 == 2 { 48 } else { 36 };
+
+    // SMMBHeader starts at offset 16.
+    let header_off = SMMB_HEAD_SIZE;
+    let pieces = u32::from_le_bytes([
+        decrypted[header_off + 16],
+        decrypted[header_off + 17],
+        decrypted[header_off + 18],
+        decrypted[header_off + 19],
+    ]) as usize;
+    let offset_block_header = u32::from_le_bytes([
+        decrypted[header_off + 44],
+        decrypted[header_off + 45],
+        decrypted[header_off + 46],
+        decrypted[header_off + 47],
+    ]) as usize;
+
+    // Block-offset list — see function docs for the three shapes.
+    let mut offset_list: Vec<usize> = Vec::new();
+    let mut cursor = header_off + SMMB_HEADER_SIZE; // 64
+    if offset_block_header == 0 {
+        if pieces != 0 {
+            // 8 candidate u32 offsets follow the SMMBHeader; non-zero
+            // ones are real block offsets.
+            for _ in 0..8 {
+                if cursor + 4 > decrypted.len() {
+                    break;
+                }
+                let po = u32::from_le_bytes([
+                    decrypted[cursor],
+                    decrypted[cursor + 1],
+                    decrypted[cursor + 2],
+                    decrypted[cursor + 3],
+                ]) as usize;
+                if po != 0 {
+                    offset_list.push(po);
+                }
+                cursor += 4;
+            }
+        } else {
+            // Implicit single block directly after the header.
+            offset_list.push(cursor);
+        }
+    } else {
+        offset_list.push(offset_block_header);
+        if offset_block_header > cursor {
+            let pad = offset_block_header - cursor;
+            for _ in (0..pad).step_by(4) {
+                if cursor + 4 > decrypted.len() {
+                    break;
+                }
+                let po = u32::from_le_bytes([
+                    decrypted[cursor],
+                    decrypted[cursor + 1],
+                    decrypted[cursor + 2],
+                    decrypted[cursor + 3],
+                ]) as usize;
+                if po != 0 {
+                    offset_list.push(po);
+                }
+                cursor += 4;
+            }
+        }
+    }
+
+    let mut models: Vec<MmbModel> = Vec::new();
+    for piece_idx in 0..pieces {
+        let piece_off = match offset_list.get(piece_idx).copied() {
+            Some(o) => o,
+            None => break,
+        };
+        if piece_off + 32 > decrypted.len() {
+            break;
+        }
+        let num_model = u32::from_le_bytes([
+            decrypted[piece_off],
+            decrypted[piece_off + 1],
+            decrypted[piece_off + 2],
+            decrypted[piece_off + 3],
+        ]) as usize;
+        // lotus debug-breaks on numModel > 50; we accept up to 100 as
+        // a sanity bound (real assets max out around 30-40).
+        if num_model > 100 {
+            break;
+        }
+        let mut off = piece_off + 32; // skip SMMBBlockHeader
+
+        for _ in 0..num_model {
+            if off + 20 > decrypted.len() {
+                break;
+            }
+            // SMMBModelHeader: textureName[16] + vertexsize:u16 + blending:u16
+            let texture_name = {
+                // Last 8 bytes of textureName (matches IMG's
+                // extract_texture_name output).
+                let name_bytes = &decrypted[off + 8..off + 16];
+                let s: String = name_bytes
+                    .iter()
+                    .map(|&b| {
+                        if (0x20..0x7f).contains(&b) {
+                            b as char
+                        } else {
+                            '\0'
+                        }
+                    })
+                    .take_while(|&c| c != '\0')
+                    .collect();
+                s.trim_end().to_string()
+            };
+            let vertexsize = u16::from_le_bytes([decrypted[off + 16], decrypted[off + 17]]) as usize;
+            let blending = u16::from_le_bytes([decrypted[off + 18], decrypted[off + 19]]);
+            off += 20;
+
+            // Parse vertices at the file's stride.
+            let vert_bytes = vertexsize * vertex_stride;
+            if off + vert_bytes > decrypted.len() {
+                break;
+            }
+            let mut vertices = Vec::with_capacity(vertexsize);
+            for vi in 0..vertexsize {
+                let vo = off + vi * vertex_stride;
+                let pos = [
+                    f32::from_le_bytes([
+                        decrypted[vo],
+                        decrypted[vo + 1],
+                        decrypted[vo + 2],
+                        decrypted[vo + 3],
+                    ]),
+                    f32::from_le_bytes([
+                        decrypted[vo + 4],
+                        decrypted[vo + 5],
+                        decrypted[vo + 6],
+                        decrypted[vo + 7],
+                    ]),
+                    f32::from_le_bytes([
+                        decrypted[vo + 8],
+                        decrypted[vo + 9],
+                        decrypted[vo + 10],
+                        decrypted[vo + 11],
+                    ]),
+                ];
+                // d3==2 inserts a 12-byte displacement field before
+                // the normal; advance past it. Layout (lotus mmb.cppm
+                // SMMBBlockVertex2):
+                //   x,y,z (12) + dx,dy,dz (12) + hx,hy,hz (12) +
+                //   color (4) + u,v (8) = 48
+                let normal_base = if d3 == 2 { vo + 24 } else { vo + 12 };
+                let normal = [
+                    f32::from_le_bytes([
+                        decrypted[normal_base],
+                        decrypted[normal_base + 1],
+                        decrypted[normal_base + 2],
+                        decrypted[normal_base + 3],
+                    ]),
+                    f32::from_le_bytes([
+                        decrypted[normal_base + 4],
+                        decrypted[normal_base + 5],
+                        decrypted[normal_base + 6],
+                        decrypted[normal_base + 7],
+                    ]),
+                    f32::from_le_bytes([
+                        decrypted[normal_base + 8],
+                        decrypted[normal_base + 9],
+                        decrypted[normal_base + 10],
+                        decrypted[normal_base + 11],
+                    ]),
+                ];
+                let color_base = normal_base + 12;
+                let rgba = [
+                    decrypted[color_base],
+                    decrypted[color_base + 1],
+                    decrypted[color_base + 2],
+                    decrypted[color_base + 3],
+                ];
+                let uv_base = color_base + 4;
+                let uv = [
+                    f32::from_le_bytes([
+                        decrypted[uv_base],
+                        decrypted[uv_base + 1],
+                        decrypted[uv_base + 2],
+                        decrypted[uv_base + 3],
+                    ]),
+                    f32::from_le_bytes([
+                        decrypted[uv_base + 4],
+                        decrypted[uv_base + 5],
+                        decrypted[uv_base + 6],
+                        decrypted[uv_base + 7],
+                    ]),
+                ];
+                vertices.push(MmbVertex {
+                    pos,
+                    normal,
+                    rgba,
+                    uv,
+                });
+            }
+            off += vert_bytes;
+
+            // u16 num_indices, then 2 bytes pad (offset += 4 in lotus).
+            if off + 4 > decrypted.len() {
+                break;
+            }
+            let num_indices = u16::from_le_bytes([decrypted[off], decrypted[off + 1]]) as usize;
+            off += 4;
+
+            // Topology: triangle-list when type-1 or (type-2 with
+            // d3==2); otherwise triangle-strip. Convert strip → list
+            // inline so the downstream renderer doesn't need to know.
+            let mut indices: Vec<u16> = Vec::new();
+            let is_list = is_v1 || (!is_v1 && d3 == 2);
+            if off + num_indices * 2 > decrypted.len() {
+                break;
+            }
+            if is_list {
+                for i in 0..num_indices {
+                    let p = off + i * 2;
+                    indices.push(u16::from_le_bytes([decrypted[p], decrypted[p + 1]]));
+                }
+            } else if num_indices >= 3 {
+                // Strip with parity-based winding flip (lotus mmb.cppm:381-403).
+                // Drop triangles where i1==i2 or i2==i3 (degenerate);
+                // keep i1==i3 (legitimate pinch).
+                for i in 0..(num_indices - 2) {
+                    let p = off + i * 2;
+                    let i1 = u16::from_le_bytes([decrypted[p], decrypted[p + 1]]);
+                    let i2 = u16::from_le_bytes([decrypted[p + 2], decrypted[p + 3]]);
+                    let i3 = u16::from_le_bytes([decrypted[p + 4], decrypted[p + 5]]);
+                    if i1 == i2 || i2 == i3 {
+                        continue;
+                    }
+                    if i % 2 == 1 {
+                        indices.extend_from_slice(&[i2, i1, i3]);
+                    } else {
+                        indices.extend_from_slice(&[i1, i2, i3]);
+                    }
+                }
+            }
+            off += num_indices * 2;
+            if num_indices % 2 != 0 {
+                off += 2; // odd-pad align
+            }
+
+            if !indices.is_empty() && !vertices.is_empty() {
+                models.push(MmbModel {
+                    texture_name,
+                    blending,
+                    vertices,
+                    indices,
+                });
+            }
+        }
+    }
+
+    models
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
