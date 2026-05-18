@@ -498,7 +498,8 @@ pub fn process_load_mmb_requests(
                 // base_color × vertex_color × texture.
                 base_color: Color::WHITE,
                 base_color_texture: sub_texture,
-                perceptual_roughness: 0.95,
+                perceptual_roughness: 1.0,
+                reflectance: 0.1,
                 // UNLIT is load-bearing: FFXI MMBs ship pre-rotated
                 // vertex normals and pre-baked vertex colors (the
                 // "lighting" is already painted into the mesh data).

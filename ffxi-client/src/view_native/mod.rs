@@ -42,8 +42,8 @@ use ffxi_client::reactor::ReactorConfig;
 use ffxi_client::{spawn_session_with_reactor, SessionHandle};
 use ffxi_viewer_core::{
     add_hud_spawners, hud::zone_flash::ZoneNameResolver, setup_world, setup_zone_line_assets,
-    spawn_camera, HudPlugin, MousePlugin, SceneState, ViewerCorePlugin, ZoneLineDescriptor,
-    ZoneLineResolver,
+    spawn_camera, HudPlugin, MousePlugin, OperatorCamera, SceneState, ViewerCorePlugin,
+    ZoneLineDescriptor, ZoneLineResolver,
 };
 use ffxi_viewer_wire::Stage as WireStage;
 use tokio::runtime::Handle as RtHandle;
@@ -233,6 +233,16 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
     add_hud_spawners(&mut app, OnEnter(AppPhase::InGame));
 
+    // Despawn the in-game 3D camera when the InGame phase ends (clean
+    // /logout, kick, drop). Without this, the OperatorCamera persists
+    // into Launcher, and `OnEnter(AppPhase::Launcher)` then spawns a
+    // 2D launcher camera — two cameras with the same render target and
+    // both at priority 0 produces the "Camera order ambiguities"
+    // warning spam and a grey screen until the user kills the process.
+    // Mirrors the symmetric `OnExit(AppPhase::Launcher)` despawn for
+    // the 2D launcher camera in `launcher_ui/mod.rs:437`.
+    app.add_systems(OnExit(AppPhase::InGame), despawn_world_camera);
+
     // Keybinds: load persisted preset+overrides from disk before plugins
     // run. `ViewerCorePlugin::build` calls `init_resource::<Bindings>()`,
     // which is a no-op when the resource is already present — so by
@@ -392,6 +402,24 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 /// so reaching CharList requires a fresh `AuthInFlight`. For now the
 /// operator hits Esc → Enter to re-handshake; an auto-advance using
 /// the stored `Credentials` is a worthwhile follow-up.
+/// `OnExit(AppPhase::InGame)` cleanup: despawn the 3D
+/// [`OperatorCamera`]. The launcher's 2D camera is about to spawn (via
+/// `OnEnter(AppPhase::Launcher)::spawn_launcher_camera`), and Bevy will
+/// log "Camera order ambiguities" + render a grey screen if both
+/// cameras exist with the same `RenderTarget` and `order=0`.
+///
+/// We deliberately only touch the camera here — full world-entity
+/// teardown (zone mesh, lights, sky, HUD widgets) is a larger cleanup
+/// the launcher mostly tolerates because the launcher UI draws on top.
+/// The camera ambiguity is the one issue that produces user-visible
+/// breakage.
+fn despawn_world_camera(mut commands: Commands, q: Query<Entity, With<OperatorCamera>>) {
+    for entity in q.iter() {
+        tracing::info!(?entity, "OnExit(InGame): despawning OperatorCamera");
+        commands.entity(entity).despawn();
+    }
+}
+
 fn return_to_launcher_on_disconnect(
     scene: Option<Res<SceneState>>,
     mut err: ResMut<LoginErrorMsg>,

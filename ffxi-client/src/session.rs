@@ -2256,7 +2256,14 @@ fn emit_event_dialog(
     let _ = event_tx.send(AgentEvent::EventDialog {
         dialog: dialog.clone(),
     });
-    pending_event_end.push((dialog.npc_id, dialog.act_index, dialog.event_num));
+    // Use `event_para`, NOT `event_num`: per `0x032_event.cpp:42-43` the LSB
+    // server writes `EventNum = PChar->getZone()` (zone id) and
+    // `EventPara = eventInfo->eventId` (the real CSID). Our decoder labels
+    // the offset-6-8 field `event_num` to match the protocol struct name,
+    // but the value there is the zone, not the event id we need to echo
+    // back in 0x05B EVENT_END. See the long comment on
+    // `build_subpacket_event_end` for the field-label gotcha.
+    pending_event_end.push((dialog.npc_id, dialog.act_index, dialog.event_para));
 }
 
 /// `GP_SERV_COMMAND_CHAT_STD` (0x017) decoder. Body layout per
@@ -2340,6 +2347,25 @@ fn build_subpacket_tell(sync: u16, recipient: &str, text: &str) -> Vec<u8> {
 /// (size_words=5). `Mode=0`, `EndPara=choice` — choice 0 is the canonical
 /// "skip whatever the NPC was trying to say" form; nonzero values pick a
 /// branch in the event's lua-side `onEventFinish(choice)` handler.
+///
+/// **Field-label gotcha (load-bearing):** LSB's protocol struct names
+/// `EventNum` and `EventPara` are reversed from how the values are used:
+///
+/// - `0x032 event.cpp:42-43` (server → client EVENTSTART) sets
+///   `EventNum = zone_id` and `EventPara = eventInfo->eventId` (the real CSID).
+/// - `0x05b_eventend.cpp:33,39` (client → server EVENT_END) reads
+///   `this->EventPara` to validate against `PChar->currentEvent->eventId`
+///   and to drive `OnEventFinish(eventId, result)`.
+///
+/// So **the cutscene/event id has to land in `EventPara` (offset 18)**, not
+/// in `EventNum` (offset 16) where the misleading name suggests. We write
+/// it into both — `EventPara` is what LSB reads; `EventNum` mirrors the
+/// zone id we got back in the EVENTSTART so the wire looks symmetric with
+/// the inbound packet (the real client sends both filled, per atom0s
+/// reference linked in the LSB header). Prior to this fix every EVENT_END
+/// we sent was silently rejected with "Event ID mismatch 535 != 0" because
+/// `EventPara` stayed zero — the symptom is `/logout` continuing to fail
+/// after `/endcutscene` "succeeds" client-side.
 fn build_subpacket_event_end(
     sync: u16,
     unique_no: u32,
@@ -2352,9 +2378,9 @@ fn build_subpacket_event_end(
     buf[4..8].copy_from_slice(&unique_no.to_le_bytes());
     buf[8..12].copy_from_slice(&choice.to_le_bytes());
     buf[12..14].copy_from_slice(&act_index.to_le_bytes());
-    // Mode u16 stays 0
+    // Mode u16 stays 0 (= End, per GP_CLI_COMMAND_EVENTEND_MODE::End)
     buf[16..18].copy_from_slice(&event_num.to_le_bytes());
-    // EventPara u16 stays 0
+    buf[18..20].copy_from_slice(&event_num.to_le_bytes());
     buf
 }
 
@@ -2621,6 +2647,48 @@ fn _hint() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin the load-bearing wire layout for 0x05B EVENT_END. The CSID
+    /// (`event_num` arg) must land in **both** EventNum (offset 16) and
+    /// EventPara (offset 18) — LSB validates against `EventPara`, and
+    /// putting the value only in `EventNum` causes every EVENT_END to
+    /// silently fail validation. See the long comment on
+    /// `build_subpacket_event_end` for the field-label gotcha.
+    #[test]
+    fn event_end_writes_csid_to_event_para_field() {
+        // Northern San d'Oria new-character cutscene: CSID=535, sent to
+        // the player's own unique_no/act_index (forced cutscene). All
+        // fields are little-endian.
+        let buf = build_subpacket_event_end(
+            0x1234,        // sync
+            0xDEADBEEF,    // unique_no
+            0x4242,        // act_index
+            535,           // event_num (the CSID per the arg semantics)
+            0,             // choice
+        );
+        assert_eq!(buf.len(), 20, "header(4) + body(16)");
+
+        // Body fields.
+        assert_eq!(&buf[4..8], &0xDEADBEEFu32.to_le_bytes(), "UniqueNo");
+        assert_eq!(&buf[8..12], &0u32.to_le_bytes(), "EndPara (choice=0)");
+        assert_eq!(&buf[12..14], &0x4242u16.to_le_bytes(), "ActIndex");
+        assert_eq!(&buf[14..16], &0u16.to_le_bytes(), "Mode (End=0)");
+
+        // The fix: CSID must appear in EventPara (offset 18). LSB reads
+        // *only* this field for validation.
+        assert_eq!(
+            &buf[18..20],
+            &535u16.to_le_bytes(),
+            "EventPara MUST carry the CSID — LSB validator reads from here",
+        );
+        // And mirrored in EventNum (offset 16) for symmetry with the
+        // EVENTSTART the server sent.
+        assert_eq!(
+            &buf[16..18],
+            &535u16.to_le_bytes(),
+            "EventNum mirrors the CSID for atom0s wire symmetry",
+        );
+    }
 
     #[test]
     fn tell_packet_layout_matches_phoenix_struct() {

@@ -129,15 +129,22 @@ pub fn handle_input_system(
     }
 
     // First-person toggle. Default `V` (retail Compact 1), rebindable
-    // via `Action::ToggleFirstPerson`. Runs unconditionally — the
-    // operator must always be able to escape FP even while a UI is
-    // focused.
+    // via `Action::ToggleFirstPerson`. Runs in every InputMode *except*
+    // `Chat` — the prior version was "unconditional" so the operator
+    // could escape FP from any UI, but that meant typing `v` in chat
+    // (e.g. inside `/endevent`, `/clearevt`, any word with a V) silently
+    // toggled the camera mid-keystroke. Chat is the one mode where
+    // keystrokes are text, not commands; every other UI (Menu, Dialog,
+    // QuickAction, PassiveCursor) still passes V through to here, which
+    // preserves the original "always escape FP" intent for non-text UIs.
     //
     // Cursor stays unlocked in FP: the OG client's FP didn't capture
     // the mouse, and our `mouse_camera_system` now gates FP look on
     // RMB-drag (with snap-back on release), so there's no need to
     // hide the cursor either.
-    if bindings.just_pressed(Action::ToggleFirstPerson, &keys) {
+    if !matches!(*mode, InputMode::Chat(_))
+        && bindings.just_pressed(Action::ToggleFirstPerson, &keys)
+    {
         toggle_camera_mode(&mut camera_mode, &mut chase);
         cursor_lock.locked = false;
     }

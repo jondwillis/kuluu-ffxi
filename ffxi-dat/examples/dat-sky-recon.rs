@@ -20,8 +20,14 @@
 //! Usage:
 //!   cargo run -p ffxi-dat --release --example dat-sky-recon
 //!   cargo run -p ffxi-dat --release --example dat-sky-recon -- --zone 100
+//!   cargo run -p ffxi-dat --release --example dat-sky-recon -- --file 55657
+//!   cargo run -p ffxi-dat --release --example dat-sky-recon -- --scan 55000 57000
 //!
 //! With `--zone N`, dumps every chunk in that zone's DAT verbosely.
+//! With `--file N`, dumps a raw file id (not via the zone table).
+//! With `--scan LO HI`, sweeps `[LO..=HI]` non-zone file ids reporting
+//! any chunk that smells sky-shaped: body divisible by 6, DXT1 FOURCC,
+//! or unknown-to-us kinds with notable bodies.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -194,6 +200,62 @@ fn run_survey(root: &DatRoot) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn scan_range(root: &DatRoot, lo: u32, hi: u32) {
+    let zone_set: std::collections::BTreeSet<u32> =
+        ZONE_DAT_TABLE.iter().map(|(_, fid)| *fid).collect();
+    let mut hits = 0;
+    let mut scanned = 0;
+    let mut readable = 0;
+    println!("# scan_range [{lo}..={hi}] (excluding ZONE_DAT_TABLE file_ids)");
+    for fid in lo..=hi {
+        if zone_set.contains(&fid) {
+            continue;
+        }
+        scanned += 1;
+        let Ok(loc) = root.resolve(fid) else { continue };
+        let bytes = match fs::read(loc.path_under(root.root())) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        readable += 1;
+        for (i, c) in walk(&bytes).filter_map(Result::ok).enumerate() {
+            // Sky candidacy heuristics (any one triggers a report):
+            //   - DXT1 FOURCC in the first 64 bytes
+            //   - body large enough to plausibly be a texture (>4 KiB)
+            //     AND divisible by 6 (cubemap = 6 equal faces)
+            //   - kind we've never seen in zone DATs at all (signaled
+            //     here by being outside the known-from-zones set; this
+            //     is a *soft* signal — we don't enforce it)
+            let body = c.data;
+            let dxt = looks_like_dxt1(body);
+            let cube = divisible_by_six(body.len()) && body.len() >= 4096;
+            if dxt || cube {
+                hits += 1;
+                let name = ChunkKind::from_u8(c.kind)
+                    .map(|k| format!("{k:?}"))
+                    .unwrap_or_else(|| "?".into());
+                let mut flags = String::new();
+                if dxt {
+                    flags.push_str(" [DXT1]");
+                }
+                if cube {
+                    flags.push_str(" [body%6=0]");
+                }
+                println!(
+                    "  file {fid:>6} chunk[{i:>3}] kind=0x{:02x} ({name:<10}) body={:>8}{}  {}",
+                    c.kind,
+                    body.len(),
+                    flags,
+                    hex_preview(body, 24)
+                );
+            }
+        }
+    }
+    println!(
+        "# scan_range done: scanned={scanned} readable={readable} hits={hits}"
+    );
+}
+
 fn main() -> ExitCode {
     let root = match DatRoot::from_env_or_default() {
         Ok(r) => r,
@@ -217,6 +279,23 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         };
         dump_one_zone(&root, zone_id, file_id);
+        return ExitCode::SUCCESS;
+    }
+    if args.len() >= 3 && args[1] == "--file" {
+        let fid: u32 = match args[2].parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("invalid file id: {}", args[2]);
+                return ExitCode::from(2);
+            }
+        };
+        dump_one_zone(&root, 0, fid);
+        return ExitCode::SUCCESS;
+    }
+    if args.len() >= 4 && args[1] == "--scan" {
+        let lo: u32 = args[2].parse().unwrap_or(0);
+        let hi: u32 = args[3].parse().unwrap_or(lo);
+        scan_range(&root, lo, hi);
         return ExitCode::SUCCESS;
     }
 

@@ -31,6 +31,35 @@ use ffxi_dat::{walk, ChunkKind, DatRoot};
 use crate::scene::TrackedEntities;
 use crate::snapshot::SceneState;
 
+/// Parent-side animation state for an NPC actor. Inserted at spawn
+/// time alongside the existing `EntityModel` marker; the per-frame
+/// tick system reads it to compute the current MO2 frame.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct ActorAnim {
+    /// Actor DAT id — keys into `BAKED_SKELETONS` + `IDLE_ANIMS`.
+    pub dat_id: u32,
+    /// Spawn time in `Time::elapsed_secs`. `frame_idx = ((now - start)
+    /// / anim.speed) % anim.frames`.
+    pub start_time_secs: f32,
+}
+
+/// Per-child-mesh data the tick system needs to recompute positions
+/// each frame. Stored on every entity spawned by
+/// `spawn_vos2_meshes_with_skeleton` for an animated actor.
+#[derive(Component)]
+pub struct ActorMeshBinding {
+    /// Shared per-actor parsed mesh. `Arc` because each polygon group
+    /// + each mirror copy gets its own child entity but they all read
+    /// from the same vertex pool.
+    pub vos2: std::sync::Arc<Vos2Mesh>,
+    /// The Bevy mesh handle this child renders. Mutated in place each
+    /// frame to update ATTRIBUTE_POSITION (and optionally NORMAL).
+    pub mesh_handle: Handle<Mesh>,
+    /// True if this is the X-mirrored copy (skinning is the same
+    /// math, just flip x on the final result).
+    pub mirror: bool,
+}
+
 /// Marker component for VertexOs2-spawned meshes — parallel to
 /// `MmbOverlay`, used by debug-clear paths to find these specifically.
 #[derive(Component)]
@@ -544,6 +573,15 @@ fn spawn_vos2_meshes_with_skeleton(
     // frame-0 pose validated, the next step swaps this one-shot bake
     // for a system that mutates Mesh::ATTRIBUTE_POSITION each frame
     // using a time-driven `frame_idx`.
+    // Animation-state plumbing for the per-frame tick system.
+    // `anim_dat_id` is `Some` exactly when this actor has an idle MO2
+    // we can drive — the tick system uses it as the key into the
+    // skeleton + animation caches.
+    let anim_dat_id: Option<u32> = baked_owned.and_then(|b| {
+        let _ = b.raw.as_ref()?;
+        idle_anim_for_file(b.file_id)?;
+        Some(b.file_id)
+    });
     let posed_owned: Option<BakedSkeleton> = baked_owned.and_then(|b| {
         let raw = b.raw.as_ref()?;
         let anim = idle_anim_for_file(b.file_id)?;

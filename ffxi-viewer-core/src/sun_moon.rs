@@ -165,6 +165,8 @@ pub fn spawn_sun_and_moon(
             // Moon shadows are subtle and expensive; off by default.
             // Flip to true if you want shadow-casting moonlight.
             shadows_enabled: false,
+            shadow_depth_bias: 0.2,
+            shadow_normal_bias: 1.0,
             ..default()
         },
         bevy::light::VolumetricLight,
@@ -351,7 +353,11 @@ pub fn sun_moon_system(
     if let Ok((mut disc, mut vis)) = q_sun_disc.single_mut() {
         disc.translation = cam_pos + sun_dir * SKY_RADIUS;
         disc.scale = Vec3::splat(SUN_DISC_RADIUS);
-        *vis = if sun_visible { Visibility::Inherited } else { Visibility::Hidden };
+        *vis = if sun_visible {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     }
     // Moon: hide when below horizon *or* when phase visibility is ~0
     // (new moon is invisible by definition).
@@ -360,7 +366,11 @@ pub fn sun_moon_system(
     if let Ok((mut disc, mut vis)) = q_moon_disc.single_mut() {
         disc.translation = cam_pos + moon_dir * SKY_RADIUS;
         disc.scale = Vec3::splat(MOON_DISC_RADIUS);
-        *vis = if moon_visible { Visibility::Inherited } else { Visibility::Hidden };
+        *vis = if moon_visible {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     }
 
     // Recolor base_color (NOT emissive — unlit ignores emissive). Sun

@@ -151,7 +151,7 @@ pub struct TrackedEntities {
 /// cascade ~500m so distant terrain still receives shadows.
 pub fn cascade_config_for_sun() -> CascadeShadowConfig {
     CascadeShadowConfigBuilder {
-        num_cascades: 4,
+        num_cascades: 6,
         minimum_distance: 0.1,
         maximum_distance: 500.0,
         first_cascade_far_bound: 12.0,
@@ -169,7 +169,7 @@ pub fn setup_world(
     let mk = |c: Color, m: &mut Assets<StandardMaterial>| {
         m.add(StandardMaterial {
             base_color: c,
-            perceptual_roughness: 0.7,
+            perceptual_roughness: 1.0,
             metallic: 0.0,
             ..default()
         })
