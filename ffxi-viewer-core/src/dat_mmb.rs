@@ -255,15 +255,28 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
         let positions: Vec<[f32; 3]> = m.vertices.iter().map(|v| v.pos).collect();
         let normals: Vec<[f32; 3]> = m.vertices.iter().map(|v| v.normal).collect();
         let uvs: Vec<[f32; 2]> = m.vertices.iter().map(|v| v.uv).collect();
+        // FFXI vertex colors use the "0x80 = 1.0" working range
+        // convention (lotus mmb.cppm:342-343 divides by 128 for all
+        // channels). Byte 128 = fully lit, byte 255 = "overbright"
+        // up to 2x. We previously divided by 255, halving FFXI's
+        // intended brightness on every MMB — visible as the dim/dark
+        // feel in earlier zone renders. It also pushed vertex alpha
+        // into the 0..0.5 range, which multiplied with our
+        // remapped-to-binary texture alpha (1.0) put `Mask(0.5)`
+        // right at its threshold and discarded most leaf pixels.
+        //
+        // Switch all channels to /128 to match lotus. HDR + TonyMcMapface
+        // tonemapping handles the >1.0 values gracefully (gives nice
+        // highlights instead of clipping).
         let colors: Vec<[f32; 4]> = m
             .vertices
             .iter()
             .map(|v| {
                 [
-                    v.rgba[0] as f32 / 255.0,
-                    v.rgba[1] as f32 / 255.0,
-                    v.rgba[2] as f32 / 255.0,
-                    v.rgba[3] as f32 / 255.0,
+                    v.rgba[0] as f32 / 128.0,
+                    v.rgba[1] as f32 / 128.0,
+                    v.rgba[2] as f32 / 128.0,
+                    v.rgba[3] as f32 / 128.0,
                 ]
             })
             .collect();

@@ -656,9 +656,14 @@ pub fn pick_mob_material<'a>(
 
 /// FFXI heading 0..=255 maps to 0..2π. Heading 0 = +y in FFXI = -z in Bevy
 /// = "camera-forward in default pose". Rotation axis is Bevy's Y-up.
+///
+/// Sign: FFXI heading increases clockwise from above (0=N, 64=E, 128=S,
+/// 192=W). Bevy `Quat::from_rotation_y(+θ)` rotates counterclockwise from
+/// above. So heading→yaw needs a sign flip; matches the convention in
+/// `camera::yaw_for_heading`.
 fn heading_to_quat(heading: u8) -> Quat {
     let angle = (heading as f32) * std::f32::consts::TAU / 256.0;
-    Quat::from_rotation_y(angle)
+    Quat::from_rotation_y(-angle)
 }
 
 /// Copy each wire entity's `look` field onto its Bevy `WorldEntity` as
@@ -743,17 +748,19 @@ pub fn sync_entity_looks_system(
 
 /// React to look changes for spawned entities — Stage 3+ fills this in
 /// with `LoadMmbRequest` dispatch. Today it's a hook that just logs the
-/// transition via `info!`, so we can confirm Stage 2's change-detect
-/// plumbing is firing when (and only when) wire data actually changes.
+/// transition (at debug level) so we can verify change-detect plumbing.
 ///
 /// Uses Bevy's `Changed<LookComp>` rather than re-comparing snapshot
 /// state because [`sync_entity_looks_system`] already absorbed the
 /// "snapshot says X, world says Y" reconciliation upstream.
+///
+/// Note: empirically `Changed<LookComp>` fires every frame on the local
+/// PC during movement, even when the look bytes don't actually change.
+/// Demoted from `info!` to `debug!` so it stays opt-in via RUST_LOG;
+/// the underlying false-positive is a separate fix.
 pub fn process_entity_look_changes(q_changed: Query<(&WorldEntity, &LookComp), Changed<LookComp>>) {
     for (we, look) in q_changed.iter() {
-        // Tag the log with both the wire id and entity kind so
-        // operators can correlate it against `/entities` output.
-        info!(
+        debug!(
             "look changed for entity {} ({:?}): {:?}",
             we.id, we.kind, look.0
         );
