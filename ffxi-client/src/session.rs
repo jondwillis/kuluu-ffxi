@@ -2012,7 +2012,11 @@ fn substitute_battle_placeholders(
     message_num: u16,
 ) -> String {
     let mut s = raw.to_string();
-    for tag in ["<user>", "<attacker>", "<caster>"] {
+    // `<entity>` is the grammatical subject — same wire slot as `<user>`
+    // (e.g., ReadiesWeaponskill 43: "<entity> readies <skill>." packs
+    // the actor into Cas). Grouped with the actor placeholders so any
+    // template using these reads as the actor's action.
+    for tag in ["<user>", "<attacker>", "<caster>", "<entity>"] {
         s = s.replace(tag, cas_name);
     }
     let (player_name, target_name) = if subject_is_tar(message_num) {
@@ -2034,6 +2038,25 @@ fn substitute_battle_placeholders(
             .map(str::to_string)
             .unwrap_or_else(|| format!("skill #{}", data1));
         s = s.replace("<skill>", &skill);
+    }
+    // Raw-id fallbacks for placeholders whose lookup tables we don't
+    // ship yet. Without these, magic-damage and ability-damage lines
+    // render with literal `<spell>` / `<ability>` in the chat panel,
+    // which is the more confusing failure mode — a numeric id at
+    // least tells the operator *which* spell or ability the message
+    // refers to. Source ids are typically packed into `data1` (per
+    // Phoenix call sites; e.g. `MsgBasic::MagicDamage` passes
+    // `SpellID` as the first 32-bit data slot).
+    for (tag, label) in [
+        ("<spell>", "spell"),
+        ("<ability>", "ability"),
+        ("<status>", "status"),
+        ("<item>", "item"),
+        ("<job>", "job"),
+    ] {
+        if s.contains(tag) {
+            s = s.replace(tag, &format!("{label} #{}", data1));
+        }
     }
     // Bare `X` / `#` are msg_basic.h's shorthand for inline numbers
     // (e.g., "skill rises X points.", "gains # experience points."). Use
@@ -3183,6 +3206,55 @@ mod tests {
         );
         assert!(s.contains("rises 7 points"), "got: {s}");
         assert!(s.contains("BoXing"), "within-word X must survive, got: {s}");
+    }
+
+    #[test]
+    fn battle_message_2_magic_damage_renders_spell_fallback() {
+        // MagicDamage = 2, "<caster> casts <spell>. <target> takes <amount>
+        // points of damage." Without a spell lookup table we fall back to
+        // "spell #N" so the message stays readable.
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes()); // cas (caster)
+        data[4..8].copy_from_slice(&0xBEEFu32.to_le_bytes()); // tar
+        data[8..12].copy_from_slice(&144u32.to_le_bytes()); // Data = SpellID
+        data[12..16].copy_from_slice(&0u32.to_le_bytes()); // Data2 (amount? — for MagicDamage retail packs amount differently; this test just asserts substitution)
+        data[20..22].copy_from_slice(&2u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        cache.insert(0xBEEFu32, "Mandragora".to_string());
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert!(
+            line.text.contains("Daisy")
+                && line.text.contains("Mandragora")
+                && line.text.contains("spell #144")
+                && !line.text.contains("<spell>"),
+            "expected spell fallback in: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn battle_message_43_readies_weaponskill_substitutes_entity() {
+        // ReadiesWeaponskill = 43, "<entity> readies <skill>." The actor
+        // ships in slot Cas; before this change `<entity>` wasn't in our
+        // substitution list and rendered literally.
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes());
+        data[4..8].copy_from_slice(&0u32.to_le_bytes());
+        data[8..12].copy_from_slice(&1u32.to_le_bytes()); // SkillID = Hand-to-Hand
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        data[20..22].copy_from_slice(&43u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert!(
+            line.text.contains("Daisy readies Hand-to-Hand")
+                && !line.text.contains("<entity>"),
+            "expected '<entity>' → Daisy, got: {}",
+            line.text
+        );
     }
 
     #[test]
