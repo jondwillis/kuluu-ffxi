@@ -44,6 +44,11 @@ pub struct LoadVos2Request {
     pub file_id: u32,
     pub chunk_idx: usize,
     pub entity_id: u32,
+    /// Race byte from the entity's `EntityLook::Equipped` block.
+    /// Used by the bind-pose bake to pick the matching skeleton
+    /// (race → skeleton file_id via lotus-ffxi's PCSkeletonIDs
+    /// table). `0` means "no race info" and disables the bake.
+    pub race: u8,
 }
 
 /// One named texture decoded from an IMG chunk colocated with the
@@ -106,23 +111,43 @@ pub fn load_vos2(file_id: u32, chunk_idx: usize) -> Result<LoadedVos2, String> {
     Ok(LoadedVos2 { mesh, textures })
 }
 
-/// Hardcoded humanoid skeleton for the bind-pose bake. File 7072
-/// chunk[70] is the 94-bone "hum_" skeleton confirmed in
-/// [[sk2-format]]; using it for every race is a known wrong-but-
-/// useful first cut — Tarutaru / Galka / Mithra are anatomically
-/// different and will distort until we have a real race → skeleton
-/// mapping. The distortion is informative: it tells us whether the
-/// bake math is correct (recognizable bipedal silhouette = yes) or
-/// not (still crumpled = no).
-const HARDCODED_SKELETON_FILE_ID: u32 = 7072;
-const HARDCODED_SKELETON_CHUNK_IDX: usize = 70;
+/// `PCSkeletonIDs` from lotus-ffxi `actor_data.cppm` — the eight PC
+/// race slots' skeleton file_ids. Index = `race - 1`.
+///
+/// | race | name      | file_id |
+/// |------|-----------|---------|
+/// |  1   | Hume M    |  7072   |
+/// |  2   | Hume F    | 10248   |
+/// |  3   | Elvaan M  | 13424   |
+/// |  4   | Elvaan F  | 16600   |
+/// |  5   | Taru M    | 19776   |
+/// |  6   | Taru F    | 19776 *(shared with Taru M)* |
+/// |  7   | Mithra    | 23176   |
+/// |  8   | Galka     | 26352   |
+///
+/// Monstrosity/beastman races (race > 8, e.g. 29 = Kuu Mohzolhil)
+/// are not in this table — lotus-ffxi keeps no race→skeleton table
+/// for them, and the right `file_id` lives in LSB's
+/// `models.h`/`CMobEntity::look` rather than the client. Those will
+/// fall through to "no bake" until that lookup lands.
+const PC_SKELETON_FILE_IDS: [u32; 8] = [7072, 10248, 13424, 16600, 19776, 19776, 23176, 26352];
 
-/// Lazily-loaded skeleton + pre-composed bind-pose world matrices.
-/// `None` if the load failed (file missing, parse error, etc.) —
-/// callers then fall back to bone-local positions (the pre-bake
-/// behavior). One read for the entire session.
-static BAKED_SKELETON: OnceLock<Option<BakedSkeleton>> = OnceLock::new();
+/// Resolve `race` byte to a skeleton file_id, or `None` for an
+/// unsupported race (0 = uninitialized; >8 = monstrosity / beastman).
+fn skeleton_file_id_for_race(race: u8) -> Option<u32> {
+    let idx = race.checked_sub(1)? as usize;
+    PC_SKELETON_FILE_IDS.get(idx).copied()
+}
 
+/// Per-file skeleton cache. Keyed by `file_id` (not race) because
+/// Taru M and Taru F share file 19776 — we'd otherwise parse it
+/// twice. Outer `OnceLock` because we initialize the map lazily;
+/// inner `Mutex<HashMap>` because `OnceLock::get_or_init` only
+/// helps for a *single* value, not an open-ended set.
+static BAKED_SKELETONS: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, Option<BakedSkeleton>>>> =
+    OnceLock::new();
+
+#[derive(Clone)]
 struct BakedSkeleton {
     /// `bind_pose_world()` result cached so we don't recompose the
     /// matrix chain on every VOS2 load. Indexed by skeleton bone id.
@@ -132,28 +157,46 @@ struct BakedSkeleton {
     world: Vec<[[f32; 4]; 4]>,
 }
 
-fn baked_skeleton() -> Option<&'static BakedSkeleton> {
-    BAKED_SKELETON
-        .get_or_init(|| {
-            let root = DatRoot::from_env_or_default().ok()?;
-            let loc = root.resolve(HARDCODED_SKELETON_FILE_ID).ok()?;
-            let bytes = fs::read(loc.path_under(root.root())).ok()?;
-            let chunks: Vec<_> = walk(&bytes).filter_map(Result::ok).collect();
-            let chunk = chunks.get(HARDCODED_SKELETON_CHUNK_IDX)?;
-            if ChunkKind::from_u8(chunk.kind) != Some(ChunkKind::Bone) {
-                return None;
-            }
-            let skeleton = Skeleton::parse(chunk.data).ok()?;
-            let world = skeleton.bind_pose_world();
-            info!(
-                "vos2 bake: loaded skeleton file={} chunk={} bones={}",
-                HARDCODED_SKELETON_FILE_ID,
-                HARDCODED_SKELETON_CHUNK_IDX,
-                world.len(),
-            );
-            Some(BakedSkeleton { world })
-        })
-        .as_ref()
+/// Load the skeleton for a given DAT `file_id`. Scans the file for
+/// the first `0x29` (Bone) chunk — lotus-ffxi does the same
+/// (`actor_skeleton_static.cpp` walks `dat.root->children` and
+/// dynamic_casts) because the chunk index within a skeleton DAT is
+/// not stable across files. Cached forever once resolved.
+fn baked_skeleton_for_file(file_id: u32) -> Option<BakedSkeleton> {
+    let map = BAKED_SKELETONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().ok()?;
+    if let Some(entry) = guard.get(&file_id) {
+        return entry.clone();
+    }
+    let loaded = load_skeleton(file_id);
+    guard.insert(file_id, loaded.clone());
+    loaded
+}
+
+fn load_skeleton(file_id: u32) -> Option<BakedSkeleton> {
+    let root = DatRoot::from_env_or_default().ok()?;
+    let loc = root.resolve(file_id).ok()?;
+    let bytes = fs::read(loc.path_under(root.root())).ok()?;
+    let chunks = walk(&bytes).filter_map(Result::ok);
+    let chunk = chunks
+        .into_iter()
+        .find(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::Bone))?;
+    let skeleton = Skeleton::parse(chunk.data).ok()?;
+    let world = skeleton.bind_pose_world();
+    info!(
+        "vos2 bake: loaded skeleton file={} bones={}",
+        file_id,
+        world.len(),
+    );
+    Some(BakedSkeleton { world })
+}
+
+/// Resolve `race` → BakedSkeleton, or `None` when the race has no
+/// known skeleton or the load failed. Cached by file_id so Taru M/F
+/// share one entry.
+fn baked_skeleton(race: u8) -> Option<BakedSkeleton> {
+    let file_id = skeleton_file_id_for_race(race)?;
+    baked_skeleton_for_file(file_id)
 }
 
 /// Decide whether the loaded skeleton is a plausible match for this
@@ -324,16 +367,13 @@ pub fn process_load_vos2_requests(
         // legs, etc.) all pile up at the entity origin — the
         // "crumpled" rendering we saw earlier. See [[sk2-format]].
         //
-        // Skeleton is hardcoded today (file 7072 chunk[70], hum_)
-        // because race→skeleton_file_id mapping is unsolved.
-        // `baked_for_mesh` returns None when the mesh references
-        // bones outside the hardcoded skeleton (= race mismatch),
-        // which makes the per-vertex helpers fall through to the
-        // local position — a small bone-local "crumpled" rendering
-        // is much less wrong than partially-baking against the
-        // wrong skeleton (which produced the giant-spike artifact
-        // on Tarutaru and other non-humanoid races).
-        let baked = baked_for_mesh(&loaded.mesh, baked_skeleton());
+        // Skeleton is now race-keyed via lotus-ffxi's PCSkeletonIDs
+        // table. `baked_for_mesh` still guards against bone-id
+        // overruns (e.g., monstrosity races where we have no
+        // skeleton entry — race=29 Kuu Mohzolhil falls through to
+        // bone-local fallback).
+        let baked_owned = baked_skeleton(req.race);
+        let baked = baked_for_mesh(&loaded.mesh, baked_owned.as_ref());
         // FFXI vertices are in left-handed (X-right, Y-forward,
         // Z-up). Bevy is right-handed Y-up. Mirror the
         // `scene::ffxi_to_bevy` transform: (x, y, z) → (x, -z, -y)

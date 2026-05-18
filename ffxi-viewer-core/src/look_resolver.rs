@@ -198,6 +198,7 @@ pub fn dispatch_look_driven_models(
                     file_id,
                     chunk_idx: 4,
                     entity_id: we.id,
+                    race,
                 });
                 dispatched += 1;
             }
