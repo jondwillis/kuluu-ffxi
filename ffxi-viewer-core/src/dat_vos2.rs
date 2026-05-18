@@ -182,12 +182,15 @@ static BAKED_SKELETONS: OnceLock<std::sync::Mutex<std::collections::HashMap<u32,
 
 #[derive(Clone)]
 struct BakedSkeleton {
+    /// DAT file id this skeleton came from. Used by the animation
+    /// path to look up the matching idle MO2 (same file).
+    file_id: u32,
     /// `bind_pose_world()` result cached so we don't recompose the
     /// matrix chain on every VOS2 load. Indexed by skeleton bone id.
-    /// The raw `Skeleton` is dropped after composition — bind-pose
-    /// is the only thing the bake needs, and animation (which would
-    /// require the original local transforms) is out of scope.
     world: Vec<[[f32; 4]; 4]>,
+    /// Raw skeleton kept for animation: lets us recompose `pose_world`
+    /// with per-bone local overrides from MO2 keyframes.
+    raw: Option<std::sync::Arc<ffxi_dat::bone::Skeleton>>,
 }
 
 /// Load the skeleton for a given DAT `file_id`. Scans the file for
@@ -221,7 +224,77 @@ fn load_skeleton(file_id: u32) -> Option<BakedSkeleton> {
         file_id,
         world.len(),
     );
-    Some(BakedSkeleton { world })
+    Some(BakedSkeleton {
+        file_id,
+        world,
+        raw: Some(std::sync::Arc::new(skeleton)),
+    })
+}
+
+/// Walk a DAT file for an `AnimMo2` (kind 0x2B) chunk whose 3-char
+/// name matches `wanted` (e.g. `"idl"`). Returns `None` when the DAT
+/// has no matching animation. Mirrors lotus-ffxi's
+/// `playAnimation("idl")` lookup pattern.
+fn load_idle_animation_for_file(file_id: u32) -> Option<ffxi_dat::anim::Mo2Animation> {
+    let root = DatRoot::from_env_or_default().ok()?;
+    let loc = root.resolve(file_id).ok()?;
+    let bytes = fs::read(loc.path_under(root.root())).ok()?;
+    for chunk in walk(&bytes).filter_map(Result::ok) {
+        if ChunkKind::from_u8(chunk.kind) != Some(ChunkKind::AnimMo2) {
+            continue;
+        }
+        // Take the first chunk whose name starts with "idl". DATs
+        // often ship multiple LOD rigs (24-bone vs 71-bone idle),
+        // both named "idl" — the first one in DAT order is what
+        // lotus's actor `playAnimation("idl")` would also pick.
+        let prefix = &chunk.name[..3];
+        if prefix.eq_ignore_ascii_case(b"idl") {
+            if let Ok(anim) = ffxi_dat::anim::parse_mo2(chunk.data, &chunk.name) {
+                return Some(anim);
+            }
+        }
+    }
+    None
+}
+
+/// Per-DAT idle-animation cache. Same shape as [`BAKED_SKELETONS`].
+static IDLE_ANIMS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u32, Option<std::sync::Arc<ffxi_dat::anim::Mo2Animation>>>>,
+> = OnceLock::new();
+
+fn idle_anim_for_file(file_id: u32) -> Option<std::sync::Arc<ffxi_dat::anim::Mo2Animation>> {
+    let map = IDLE_ANIMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().ok()?;
+    if let Some(entry) = guard.get(&file_id) {
+        return entry.clone();
+    }
+    let loaded = load_idle_animation_for_file(file_id).map(std::sync::Arc::new);
+    guard.insert(file_id, loaded.clone());
+    loaded
+}
+
+/// Sample frame `frame_idx` of an animation: build per-bone local
+/// overrides keyed by skeleton bone id. Bones the animation doesn't
+/// touch get `None` (the bake falls back to bind-pose local).
+fn anim_frame_overrides(
+    anim: &ffxi_dat::anim::Mo2Animation,
+    frame_idx: usize,
+    bone_count: usize,
+) -> Vec<Option<ffxi_dat::bone::BoneLocal>> {
+    let mut out: Vec<Option<ffxi_dat::bone::BoneLocal>> = vec![None; bone_count];
+    for (&bone, frames) in &anim.per_bone {
+        let bi = bone as usize;
+        if bi >= bone_count {
+            continue;
+        }
+        let Some(f) = frames.get(frame_idx) else { continue };
+        out[bi] = Some(ffxi_dat::bone::BoneLocal {
+            rotation: f.rotation,
+            translation: f.translation,
+            scale: f.scale,
+        });
+    }
+    out
 }
 
 /// Resolve `race` → BakedSkeleton, or `None` when the race has no
@@ -460,13 +533,36 @@ fn spawn_vos2_meshes_with_skeleton(
         }
     }
 
-    // Bind-pose bake: lift bone-local vertices to model space via
-    // `bone_world[bone_id] * local_pos` before the FFXI→Bevy axis
-    // flip. `baked_for_mesh` returns None when the skeleton doesn't
-    // fit (bone-index out of range), in which case the helpers fall
+    // Pose-bake: if the actor's DAT has an idle MO2 animation, sample
+    // its first frame and use the resulting per-bone world transforms
+    // instead of the bind pose. This puts NPCs in their natural ready
+    // stance (arms relaxed, slight stance offset) rather than the
+    // bind-time T-pose. PCs without an idle anim in their equipment
+    // DAT fall back to bind pose automatically.
+    //
+    // Per-frame keyframe ticking is a follow-up: with the static
+    // frame-0 pose validated, the next step swaps this one-shot bake
+    // for a system that mutates Mesh::ATTRIBUTE_POSITION each frame
+    // using a time-driven `frame_idx`.
+    let posed_owned: Option<BakedSkeleton> = baked_owned.and_then(|b| {
+        let raw = b.raw.as_ref()?;
+        let anim = idle_anim_for_file(b.file_id)?;
+        if anim.frames == 0 {
+            return None;
+        }
+        let overrides = anim_frame_overrides(&anim, 0, raw.bones.len());
+        Some(BakedSkeleton {
+            file_id: b.file_id,
+            world: raw.pose_world(&overrides),
+            raw: b.raw.clone(),
+        })
+    });
+    let effective = posed_owned.as_ref().or(baked_owned);
+    // `baked_for_mesh` returns None when the skeleton doesn't fit
+    // (bone-index out of range), in which case the helpers fall
     // back to local-space rendering — the pre-bake behavior, small
     // and contained at the entity origin.
-    let baked = baked_for_mesh(&loaded.mesh, baked_owned);
+    let baked = baked_for_mesh(&loaded.mesh, effective);
     let positions: Vec<[f32; 3]> = loaded
         .mesh
         .vertices

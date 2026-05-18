@@ -157,6 +157,29 @@ impl Skeleton {
     /// We deliberately avoid pulling glam into ffxi-dat — the matrix
     /// is built and composed in plain f32 here; convert to glam in
     /// the consumer crate if convenient.
+    /// Per-bone local-transform override for [`Self::pose_world`].
+    /// `Some` replaces the bone's bind-time local; `None` keeps bind.
+    /// Indexed by bone id (matches the skeleton's `bones` array).
+    pub fn pose_world(&self, overrides: &[Option<BoneLocal>]) -> Vec<[[f32; 4]; 4]> {
+        let n = self.bones.len();
+        let mut out = vec![identity4(); n];
+        for i in 0..n {
+            let local = if let Some(ov) = overrides.get(i).and_then(|o| o.as_ref()) {
+                mat4_from_quat_trans_scale(ov.rotation, ov.translation, ov.scale)
+            } else {
+                mat4_from_quat_trans(self.bones[i].rot, self.bones[i].trans)
+            };
+            let p = self.bones[i].parent as usize;
+            let is_root = self.bones[i].parent == PARENT_ROOT || p == i || p >= n;
+            out[i] = if is_root {
+                local
+            } else {
+                mat4_mul(out[p], local)
+            };
+        }
+        out
+    }
+
     pub fn bind_pose_world(&self) -> Vec<[[f32; 4]; 4]> {
         let n = self.bones.len();
         let mut out = vec![identity4(); n];
@@ -182,6 +205,30 @@ pub fn identity4() -> [[f32; 4]; 4] {
     m[1][1] = 1.0;
     m[2][2] = 1.0;
     m[3][3] = 1.0;
+    m
+}
+
+/// One animated bone's local transform (rot + trans + scale).
+/// Used by [`Skeleton::pose_world`] to override the bind-time local
+/// for bones that an MO2 animation drives.
+#[derive(Debug, Clone, Copy)]
+pub struct BoneLocal {
+    /// Quaternion in xyzw order.
+    pub rotation: [f32; 4],
+    pub translation: [f32; 3],
+    pub scale: [f32; 3],
+}
+
+/// Like [`mat4_from_quat_trans`] but multiplies each row by the
+/// corresponding scale component. Scale is applied first (in bone-
+/// local space) before the rotation/translation lift.
+fn mat4_from_quat_trans_scale(q: [f32; 4], t: [f32; 3], s: [f32; 3]) -> [[f32; 4]; 4] {
+    let mut m = mat4_from_quat_trans(q, t);
+    for r in 0..3 {
+        m[r][0] *= s[0];
+        m[r][1] *= s[1];
+        m[r][2] *= s[2];
+    }
     m
 }
 
