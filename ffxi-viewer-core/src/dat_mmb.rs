@@ -330,9 +330,12 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
 ///   raw 128..255→ 255 (clamped)
 #[inline]
 fn ffxi_alpha_remap(raw: u8) -> u8 {
-    let bc2 = (raw >> 4) as u32; // 0..15
-    let scaled = (bc2 * 255) / 8; // 0..(15*255/8 = 478)
-    scaled.min(255) as u8
+    // Float math (not integer) so we match lotus's `bc2_alpha / 8.0`
+    // exactly — integer division of `(1 * 255) / 8` yields 31, but
+    // lotus's float math `1/8 * 255 = 31.875` rounds to 32.
+    let bc2 = (raw >> 4) as f32; // 0..15
+    let scaled = bc2 * 255.0 / 8.0;
+    scaled.min(255.0).round() as u8
 }
 
 /// Convert a [`DecodedTexture`] into a Bevy [`Image`] asset. The
@@ -636,21 +639,35 @@ pub fn process_load_mmb_requests(
                 .cloned()
                 .or_else(|| first_texture.clone());
 
-            // Alpha mode (lotus parity, mmb.cppm:501):
-            //   blending & 0x8000 → AlphaMode::Blend (true sorted
-            //     transparency — glass/water/effects)
-            //   otherwise         → AlphaMode::Opaque (default)
+            // Alpha mode is driven by `SMMBModelHeader.blending`:
+            //   bit 0x8000 set → AlphaMode::Mask(0.5)  (cutout)
+            //   else           → AlphaMode::Opaque
             //
-            // We previously also tried texture-alpha probes to enable
-            // alpha-cutout for tree leaves. Two iterations both
-            // produced dithered-checkerboard rendering on terrain;
-            // FFXI textures appear to store ~128 alpha values as a
-            // brightness modulation, not as opacity, so the Mask
-            // pipeline misinterprets them. Lotus does no probing and
-            // accepts opaque-rectangle trees as a result; we mirror
-            // that until we understand FFXI's actual alpha encoding.
+            // We use *Mask*, not Blend, for two reasons:
+            //
+            // 1. FFXI leaf/foliage textures author the "transparent"
+            //    regions with dark RGB and low alpha. Bevy's Blend
+            //    mode multiplies src.rgb * src.alpha + dst * (1-α);
+            //    at α=0.5 the dark src contributes 50% of its color,
+            //    producing visible black outlines around leaf
+            //    silhouettes (the "rectangular with dark cutouts"
+            //    bug). Mask discards the pixel entirely below the
+            //    threshold so those dark pixels never reach the
+            //    framebuffer.
+            //
+            // 2. We've already remapped alpha at texture-decode time
+            //    via `ffxi_alpha_remap` to match lotus's
+            //    FragmentBlend formula (raw>>4 / 8.0). For tree-style
+            //    cutout textures with raw α[0..136] this produces a
+            //    near-binary distribution (0 or 255), so threshold
+            //    0.5 cleanly separates leaf from hole.
+            //
+            // True translucent geometry (glass, smoke, water effects)
+            // would want Blend, but FFXI puts that on D3M/D3A chunks
+            // — `0x8000` on MMBs is empirically cutout-mode foliage
+            // and the like.
             let alpha_mode = if (sub.blending & 0x8000) != 0 {
-                AlphaMode::Blend
+                AlphaMode::Mask(0.5)
             } else {
                 AlphaMode::Opaque
             };
@@ -768,4 +785,53 @@ fn push_system_msg(scene_state: &mut SceneState, text: String) {
         text,
         server_ts: 0,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The remap implements lotus's `bc2_alpha / 8.0 * 255` formula
+    /// (see `mmb.slang:107-110`). What we verify here are the three
+    /// behavioural properties that matter for the renderer — exact
+    /// step values are a consequence of the formula, not a separate
+    /// spec, so we don't pin them:
+    ///
+    /// 1. The discard band (raw 0..15) maps to 0 — gives transparent
+    ///    pixels at Mask(0.5).
+    /// 2. FFXI's "0x80 = 1.0" opaque threshold (raw 128) maps to 255
+    ///    — gives fully opaque leaf bodies.
+    /// 3. Raw values empirically seen as opaque (e.g. 136 from
+    ///    `ron_wf`'s peak) also saturate to 255.
+    /// 4. Monotonicity — the remap is non-decreasing in `raw`.
+    #[test]
+    fn ffxi_alpha_remap_obeys_lotus_spec() {
+        // Discard band.
+        assert_eq!(ffxi_alpha_remap(0), 0);
+        assert_eq!(ffxi_alpha_remap(15), 0);
+        // FFXI's "0x80 = 1.0" threshold should saturate.
+        assert_eq!(ffxi_alpha_remap(128), 255);
+        assert_eq!(ffxi_alpha_remap(136), 255); // empirical leaf peak
+        assert_eq!(ffxi_alpha_remap(255), 255);
+
+        // Monotonic: raw_i <= raw_j ⇒ remap(raw_i) <= remap(raw_j).
+        let mut prev = 0u8;
+        for raw in 0u16..=255 {
+            let cur = ffxi_alpha_remap(raw as u8);
+            assert!(
+                cur >= prev,
+                "remap not monotonic at raw={raw}: prev={prev}, cur={cur}"
+            );
+            prev = cur;
+        }
+
+        // Above-threshold band always saturated.
+        for raw in 128u16..=255 {
+            assert_eq!(
+                ffxi_alpha_remap(raw as u8),
+                255,
+                "raw {raw} should saturate to 255"
+            );
+        }
+    }
 }
