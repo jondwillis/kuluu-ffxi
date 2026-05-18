@@ -867,36 +867,22 @@ fn spawn_vos2_meshes_with_skeleton(
         }
     }
 
-    // Pose-bake: if the actor's DAT has an idle MO2 animation, sample
-    // its first frame and use the resulting per-bone world transforms
-    // instead of the bind pose. This puts NPCs in their natural ready
-    // stance (arms relaxed, slight stance offset) rather than the
-    // bind-time T-pose. PCs without an idle anim in their equipment
-    // DAT fall back to bind pose automatically.
+    // CPU bind-pose bake. NPCs are dispatched through the GPU
+    // `spawn_skinned_actor` path instead — this function now serves
+    // only the PC equipment pipeline (launcher preview + in-game PC
+    // bodies via `spawn_equipped`). PCs were already correct at the
+    // bind pose; an earlier attempt to also pose-bake them against
+    // their skeleton DAT's idle MO2 (frame 0) misaligned slot meshes
+    // because each slot's mesh was baked against a pose its
+    // bone-index palette didn't actually account for. Reverted to
+    // pure bind pose here; NPC animation lives entirely on the
+    // SkinnedMesh path.
     //
-    // NPCs are dispatched through `spawn_skinned_actor` (GPU skin)
-    // instead — this CPU-bake path now only runs for PCs (equipment
-    // DATs typically have no idle MO2, so `posed_owned` ends up
-    // `None` and the existing bind-pose fallback applies).
-    let posed_owned: Option<BakedSkeleton> = baked_owned.and_then(|b| {
-        let raw = b.raw.as_ref()?;
-        let anim = idle_anim_for_file(b.file_id)?;
-        if anim.frames == 0 {
-            return None;
-        }
-        let overrides = anim_frame_overrides(&anim, 0, raw.bones.len());
-        Some(BakedSkeleton {
-            file_id: b.file_id,
-            world: raw.pose_world(&overrides),
-            raw: b.raw.clone(),
-        })
-    });
-    let effective = posed_owned.as_ref().or(baked_owned);
     // `baked_for_mesh` returns None when the skeleton doesn't fit
     // (bone-index out of range), in which case the helpers fall
     // back to local-space rendering — the pre-bake behavior, small
     // and contained at the entity origin.
-    let baked = baked_for_mesh(&loaded.mesh, effective);
+    let baked = baked_for_mesh(&loaded.mesh, baked_owned);
     let positions: Vec<[f32; 3]> = loaded
         .mesh
         .vertices

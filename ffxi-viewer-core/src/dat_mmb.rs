@@ -389,11 +389,16 @@ pub fn process_load_mmb_requests(
         std::collections::HashMap::new();
     // Cache image handles per file_id (each IMG chunk in a DAT is
     // shared across all MMBs from that file).
+    // Per-DAT pool: name → (image handle, has_alpha bit). The
+    // has_alpha bit is set by `texture_has_transparent_pixels` at
+    // decode time and drives the AlphaMode picker at material build
+    // (opaque vs cutout). Both halves of the tuple are cloned by
+    // value at lookup; `Handle<Image>` is a cheap arc-rc.
     let mut tex_pools: std::collections::HashMap<
         u32,
         (
-            std::collections::HashMap<String, Handle<Image>>,
-            Option<Handle<Image>>,
+            std::collections::HashMap<String, (Handle<Image>, bool)>,
+            Option<(Handle<Image>, bool)>,
         ),
     > = std::collections::HashMap::new();
 
