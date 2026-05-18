@@ -203,12 +203,11 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
     let header = MmbHeader::parse(&decrypted).map_err(|e| format!("header parse: {e}"))?;
     let subs = MmbSubRecord::find_all(header.payload);
 
-    // Stage 5b: scrape IMG chunks from the same DAT. Many files have
-    // dozens of IMGs (file 200 = 53; file 133 = 47); a *correct*
-    // submesh→texture pairing would route through MMB tex0/test00
-    // sub-records, but those aren't decoded yet. The first decodable
-    // IMG is what we'll bind to all submeshes for now — adequate for
-    // single-material props (Wells, HomePoints, MogHouse furniture).
+    // Scrape IMG chunks from the same DAT. Many files have dozens of
+    // IMGs (file 200 = 53; file 133 = 47). Each submesh's 16-byte
+    // textureName (see `MmbSubRecord::texture_name_str`) is matched
+    // against `NamedTexture.name` at spawn time; non-matching submeshes
+    // fall back to the first decodable IMG.
     let textures: Vec<NamedTexture> = chunks
         .iter()
         .filter(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::Img))
@@ -221,20 +220,37 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
 
     let mut out = Vec::with_capacity(subs.len());
     for sub in &subs {
-        // Skip sub-records that aren't the standard `"model   "` tag —
-        // clod-style and other tags use a different body layout that
-        // `parse_vertices` cannot decode as 36-byte-stride. Without
-        // this filter, mis-parsed vertices appear as enormous shards
-        // radiating from each placement (Phase 8 / task #18).
-        if !sub.tag.starts_with(b"model") {
-            continue;
-        }
+        // Historical note: a `!sub.tag.starts_with(b"model")` filter
+        // used to live here. That filter assumed every per-submesh
+        // record carried a `"model   "` type tag, but lotus-ffxi
+        // (`mmb.cppm::SMMBModelHeader`) shows the field is the raw
+        // 16-byte textureName with NO type prefix. The filter silently
+        // dropped every per-submesh record, leaving only the top-level
+        // `SMMBHeader.imgID` (which DOES have the prefix) — producing
+        // one-texture-fits-all rendering and missing floors/walls
+        // whose names didn't happen to begin with "model". Removed.
+        //
         // Skip sub-records whose body can't fit a 36-byte vertex stride
         // for the declared count, or whose strip yields no triangles
         // after restart/winding decode.
         let Some(verts) = sub.parse_vertices() else {
             continue;
         };
+        // Sanity check: real FFXI zone props are well within ±10000
+        // yards of origin. If any vertex blows past that we're almost
+        // certainly mis-parsing a non-36-byte-stride record (e.g.
+        // lotus's `SMMBBlockVertex2` 48-byte layout in d3==2 files)
+        // and the result will show as the historical "enormous shards
+        // radiating from each placement." Drop these submeshes rather
+        // than letting them render at runaway scale.
+        const COORD_SANE_LIMIT: f32 = 10_000.0;
+        if verts.iter().any(|v| {
+            v.pos
+                .iter()
+                .any(|c| !c.is_finite() || c.abs() > COORD_SANE_LIMIT)
+        }) {
+            continue;
+        }
         let tris = sub.parse_triangle_list();
         if tris.is_empty() {
             continue;
@@ -267,7 +283,12 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
             .flat_map(|t| [t[0] as u32, t[1] as u32, t[2] as u32])
             .collect();
         out.push(MmbSubMesh {
-            variant_name: sub.variant_name_str(),
+            // Full 16-byte textureName, NUL-terminated and trimmed.
+            // Matches `extract_texture_name`'s output on the IMG side.
+            // Previously this stored `variant_name_str()` which mapped
+            // NUL to '.', producing names like `s_kabe2.` that could
+            // never match `s_kabe2` from the IMG side.
+            variant_name: sub.texture_name_str(),
             positions,
             normals,
             uvs,

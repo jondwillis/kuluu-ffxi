@@ -199,33 +199,51 @@ pub struct MmbVertex {
     pub uv: [f32; 2],
 }
 
-/// A `"model   "` sub-record inside an MMB payload. Each sub-record is a
-/// named mesh group; a single MMB often has 1-4 of them (one per
-/// material or LOD).
+/// One mesh sub-record inside an MMB payload. Cross-referenced against
+/// lotus-ffxi `mmb.cppm::SMMBModelHeader`, the layout is:
 ///
-/// Layout discovered empirically:
-///   offset 0..8     b"model   " tag
-///   offset 8..16    8-byte ASCII variant name (e.g. "con_wi1 ")
-///   offset 16..20   u32 LE — *probably* vertex count
-///   offset 20..48   28 bytes of metadata (sub-mesh header: bbox center+extent + flags?)
-///   offset 48..     payload (vertex/triangle data — format TBD)
+///   offset 0..16    `textureName[16]` (ASCII, NUL- or space-padded)
+///   offset 16..18   `vertexsize: u16` — vertex count for this submesh
+///   offset 18..20   `blending: u16`   — alpha/blend mode flags
+///   offset 20..     `vertexsize × Vertex` then `u16 num_indices`,
+///                   2 bytes pad, then indices.
 ///
-/// The walker uses a string search for the `b"model   "` tag rather than
-/// stride arithmetic, since the exact stride between sub-records is not
-/// yet fully decoded.
+/// The walker is a heuristic scanner (string search for ASCII-looking
+/// 16-byte textureName windows) rather than a structural walk —
+/// adequate for now because every plausible texture-name window is also
+/// followed by a small vertexsize. The top 16 bits of the u32 at
+/// offset 16 are `blending`, not part of `count`; mask with `0xFFFF`
+/// when validating.
+///
+/// Naming: our internal `tag` is the FIRST 8 bytes of textureName, and
+/// `variant_name` is the NEXT 8 bytes. They form one logical name —
+/// use [`MmbSubRecord::texture_name_str`] to get the cleaned full name.
+/// The historical filter `tag.starts_with(b"model")` only matched the
+/// top-level `SMMBHeader.imgID` (which has a `"model   "` prefix); it
+/// silently dropped every per-submesh textureName (which has no prefix)
+/// and caused all submeshes to fall back to the first IMG, regardless
+/// of material. Don't reintroduce that filter.
 #[derive(Debug, Clone, Copy)]
 pub struct MmbSubRecord<'a> {
     /// Absolute offset of the tag in the *payload* slice this was
     /// found in.
     pub offset: usize,
-    /// 8-byte tag immediately preceding `variant_name`. `b"model   "`
-    /// for the standard 36-byte-stride vertex/index sub-record format;
-    /// other tags (e.g. `b"clod    "`, asset-name prefixes) indicate
-    /// alternate body layouts that [`parse_vertices`] cannot decode —
-    /// filter those out at the caller.
+    /// First 8 bytes of the 16-byte `textureName` field. Despite the
+    /// historical name, this is NOT a sub-record-type tag — it's the
+    /// first half of a texture name. Combine with `variant_name` for
+    /// the full 16 bytes (or call [`texture_name_str`]).
     pub tag: &'a [u8],
+    /// Bytes 8..16 of the 16-byte `textureName` field. Combine with
+    /// `tag` for the full name.
     pub variant_name: &'a [u8],
+    /// Vertex count for this submesh. Low 16 bits of the u32 at
+    /// offset 16 of the textureName record; the high 16 bits are
+    /// `blending` and stored separately. Always `<= 0xFFFF`.
     pub count: u32,
+    /// Blending/alpha-mode bits — top 16 bits of the same u32 that
+    /// carries `count`. `& 0x8000` flags transparent geometry per
+    /// lotus's `mesh->has_transparency = mmb_mesh.blending & 0x8000`.
+    pub blending: u16,
     /// Bytes immediately after the count word and before the next
     /// sub-record (or end of payload). Includes the 28-byte sub-mesh
     /// header followed by vertex/triangle data we haven't decoded yet.
@@ -253,16 +271,17 @@ impl<'a> MmbSubRecord<'a> {
             // space + NUL acceptable), and the variant must be too.
             // Tag's first 4 bytes are typically alphanumeric (no spaces
             // up front), variants can have NULs.
-            // Sanity-check the count u32 — real MMB element counts fit
-            // in a u16; >65535 is a strong "this is a coincidental ASCII
-            // window, not a real record" signal.
-            let count = u32::from_le_bytes([
-                payload[i + 16],
-                payload[i + 17],
-                payload[i + 18],
-                payload[i + 19],
-            ]);
-            if is_ascii_tag(tag_word) && is_ascii_variant(variant) && count > 0 && count <= 0xFFFF {
+            //
+            // The u32 at offset 16 is actually `{vertexsize: u16,
+            // blending: u16}`. Only the LOW 16 bits are the count;
+            // the high 16 bits are alpha-blend flags (often 0x8000
+            // for transparent geometry). Validate just the low half.
+            let vertexsize = u16::from_le_bytes([payload[i + 16], payload[i + 17]]) as u32;
+            if is_ascii_tag(tag_word)
+                && is_ascii_variant(variant)
+                && vertexsize > 0
+                && vertexsize <= 0xFFFF
+            {
                 starts.push(i);
                 i += 20;
                 continue;
@@ -278,17 +297,14 @@ impl<'a> MmbSubRecord<'a> {
             .enumerate()
             .map(|(idx, &start)| {
                 let end = starts.get(idx + 1).copied().unwrap_or(payload.len());
-                let count = u32::from_le_bytes([
-                    payload[start + 16],
-                    payload[start + 17],
-                    payload[start + 18],
-                    payload[start + 19],
-                ]);
+                let vertexsize = u16::from_le_bytes([payload[start + 16], payload[start + 17]]);
+                let blending = u16::from_le_bytes([payload[start + 18], payload[start + 19]]);
                 MmbSubRecord {
                     offset: start,
                     tag: &payload[start..start + 8],
                     variant_name: &payload[start + 8..start + 16],
-                    count,
+                    count: vertexsize as u32,
+                    blending,
                     body: &payload[start + 20..end],
                 }
             })
@@ -452,6 +468,31 @@ impl<'a> MmbSubRecord<'a> {
             .to_string()
     }
 
+    /// Full 16-byte textureName as a clean ASCII string. NUL bytes
+    /// terminate (NOT mapped to `.` like `variant_name_str`). Trailing
+    /// spaces are trimmed.
+    ///
+    /// Use this — not `variant_name_str` — to pair against the IMG
+    /// name returned by `ffxi_dat::texture::extract_texture_name`.
+    /// `variant_name_str` predates this method, treats NUL as `.`, and
+    /// produces names like `s_kabe2.` that never match `s_kabe2` from
+    /// the IMG side.
+    pub fn texture_name_str(&self) -> String {
+        let bytes: [u8; 16] = {
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(self.tag);
+            b[8..].copy_from_slice(self.variant_name);
+            b
+        };
+        let s: String = bytes
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '\0' })
+            .take_while(|&c| c != '\0')
+            .collect();
+        s.trim_end().to_string()
+    }
+
     /// Tag bytes (8 bytes; e.g. `b"model   "` or `b"clod    "`).
     pub fn tag<'b>(&'b self, payload: &'a [u8]) -> &'a [u8]
     where
@@ -461,20 +502,27 @@ impl<'a> MmbSubRecord<'a> {
     }
 }
 
-/// True if all 8 bytes are ASCII alphanumeric, underscore, or space.
-/// First byte must NOT be space (filters out padding-only regions).
+/// True if all 8 bytes are valid for the first half of a textureName
+/// (alphanumeric, underscore, space, or NUL padding). First byte must
+/// NOT be space or NUL — those would mean the textureName starts blank
+/// (padding-only region). NULs are allowed in trailing positions to
+/// support short names like `s_kabe2\0`.
 fn is_ascii_tag(b: &[u8]) -> bool {
-    if b.len() != 8 || b[0] == b' ' {
+    if b.len() != 8 || b[0] == b' ' || b[0] == 0 {
         return false;
     }
     b.iter()
-        .all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b' ')
+        .all(|&c| c == 0 || c.is_ascii_alphanumeric() || c == b'_' || c == b' ')
 }
 
-/// True if all 8 bytes are valid for a variant name (alphanumeric,
-/// underscore, space, or NUL padding). Empty (all-NUL) is rejected.
+/// True if all 8 bytes are valid for the second half of a textureName
+/// (alphanumeric, underscore, space, or NUL padding). All-NUL is
+/// ALLOWED here — short texture names (≤ 8 chars) legitimately leave
+/// bytes 8..16 as NUL padding. The previous rejection of all-NUL
+/// silently dropped every short-named texture (e.g. `s_kabe2\0\0…`),
+/// which was a major source of missing/mistextured zone props.
 fn is_ascii_variant(b: &[u8]) -> bool {
-    if b.len() != 8 || b.iter().all(|&c| c == 0) {
+    if b.len() != 8 {
         return false;
     }
     b.iter()
@@ -579,6 +627,39 @@ mod tests {
         assert_eq!(records[1].variant_name_str(), "clod_a01");
         assert_eq!(records[1].count, 71);
         assert_eq!(&records[1].tag(&payload), b"clod    ");
+    }
+
+    #[test]
+    fn texture_name_str_stops_at_nul() {
+        // textureName "s_kabe2\0...." — short name, NUL-padded. The
+        // historical `variant_name_str` maps NUL -> '.' producing
+        // "s_kabe2." which never matches the IMG side. The new
+        // `texture_name_str` must stop at NUL and return "s_kabe2".
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"s_kabe2\0\0\0\0\0\0\0\0\0"); // textureName[16]
+        buf.extend_from_slice(&8u16.to_le_bytes()); // vertexsize
+        buf.extend_from_slice(&0u16.to_le_bytes()); // blending
+        buf.extend(std::iter::repeat_n(0xFFu8, 64)); // payload (non-ASCII)
+        let recs = MmbSubRecord::find_all(&buf);
+        assert_eq!(recs.len(), 1, "scanner should accept short NUL-padded names");
+        assert_eq!(recs[0].texture_name_str(), "s_kabe2");
+    }
+
+    #[test]
+    fn scanner_accepts_records_with_nonzero_blending() {
+        // Regression: the previous count check rejected any record
+        // where `blending != 0` because it read the u32 high bits as
+        // part of count and required count <= 0xFFFF. A transparent-
+        // glass wall with blending=0x8000 would silently disappear.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"glass01\0\0\0\0\0\0\0\0\0"); // textureName[16]
+        buf.extend_from_slice(&42u16.to_le_bytes()); // vertexsize
+        buf.extend_from_slice(&0x8000u16.to_le_bytes()); // blending = transparent
+        buf.extend(std::iter::repeat_n(0xFFu8, 64));
+        let recs = MmbSubRecord::find_all(&buf);
+        assert_eq!(recs.len(), 1, "non-zero blending must not reject the record");
+        assert_eq!(recs[0].count, 42);
+        assert_eq!(recs[0].blending, 0x8000);
     }
 
     #[test]
