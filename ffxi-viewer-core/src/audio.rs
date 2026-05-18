@@ -394,21 +394,72 @@ pub fn play_sfx_system(
     }
 }
 
-/// Bridge from `ViewerEvent::ZoneChanged` to a hardcoded zone-in
-/// SFX. The id `1097` is the "menu open / zone-line confirm" chime
-/// our DAT scan found in `ROM/0/58.DAT` under Sep `0000`. Verified
-/// to resolve to `sound/win/se/se001/se001097.spw` (file exists on
-/// disk). Other system SFX (level-up, KO, item-gain) will hook into
-/// their respective wire events as those decoders land.
-pub fn fire_zone_in_sfx_system(events: Res<EventLog>, mut writer: MessageWriter<SfxEvent>) {
-    // We scan the latest few events each frame, but EventLog is the
-    // shared ring buffer — we don't want to re-fire on every entry.
-    // Look only at the most-recently-pushed event; if it's
-    // ZoneChanged, fire once. (Multiple ZoneChanged within a single
-    // frame is exceedingly rare.)
-    if let Some(ViewerEvent::ZoneChanged { .. }) = events.recent.back() {
-        writer.write(SfxEvent::new(1097));
+/// Hardcoded system-SFX mapping. Each entry is a `ViewerEvent`
+/// shape + a stage-1 SE id; the ids are best-guesses pulled from
+/// the DAT scan of `ROM/0/58.DAT` and verified to exist on disk.
+/// The user can override any of these at runtime by mutating
+/// [`SystemSfxTable`].
+#[derive(Resource, Debug, Clone)]
+pub struct SystemSfxTable {
+    /// `ViewerEvent::ZoneChanged` → zone-line confirm chime.
+    pub zone_changed: Option<u32>,
+    /// `ViewerEvent::LowHp` → critical-HP beep (the "low-life" UI
+    /// pulse retail plays under 25% HP).
+    pub low_hp: Option<u32>,
+    /// `ViewerEvent::EngagedBy` → aggro stinger.
+    pub engaged_by: Option<u32>,
+    /// `ViewerEvent::TellReceived` → tell-ding.
+    pub tell_received: Option<u32>,
+}
+
+impl Default for SystemSfxTable {
+    fn default() -> Self {
+        // Conservative defaults — every id below has a corresponding
+        // .spw file on disk in our reference install. The mapping
+        // (which sound for which event) is the user's to refine; we
+        // pick plausible candidates so something audible fires.
+        Self {
+            zone_changed: Some(1097),
+            low_hp: Some(1077),
+            engaged_by: Some(1064),
+            tell_received: Some(1053),
+        }
     }
+}
+
+/// Wire-event → SFX bridge for the events our session reactor
+/// already decodes. Walks `EventLog.recent` since the last cursor
+/// position (separate from `BgmSlots::event_cursor` — each consumer
+/// keeps its own).
+#[derive(Resource, Default)]
+pub struct SystemSfxCursor {
+    pos: usize,
+}
+
+pub fn fire_system_sfx_events(
+    events: Res<EventLog>,
+    table: Res<SystemSfxTable>,
+    mut cursor: ResMut<SystemSfxCursor>,
+    mut writer: MessageWriter<SfxEvent>,
+) {
+    let len = events.recent.len();
+    if cursor.pos > len {
+        cursor.pos = 0;
+    }
+    for i in cursor.pos..len {
+        let ev = &events.recent[i];
+        let id = match ev {
+            ViewerEvent::ZoneChanged { .. } => table.zone_changed,
+            ViewerEvent::LowHp { .. } => table.low_hp,
+            ViewerEvent::EngagedBy { .. } => table.engaged_by,
+            ViewerEvent::TellReceived { .. } => table.tell_received,
+            _ => None,
+        };
+        if let Some(se_id) = id {
+            writer.write(SfxEvent::new(se_id));
+        }
+    }
+    cursor.pos = len;
 }
 
 /// Plugin entry point. Registered from `lib.rs`.
@@ -419,13 +470,15 @@ impl Plugin for AudioPlugin {
         app.init_resource::<BgmSlots>()
             .init_resource::<SeRegistry>()
             .init_resource::<SfxCache>()
+            .init_resource::<SystemSfxTable>()
+            .init_resource::<SystemSfxCursor>()
             .add_message::<SfxEvent>()
             .add_systems(
                 Update,
                 (
                     drain_music_events_system,
                     apply_bgm_system,
-                    fire_zone_in_sfx_system,
+                    fire_system_sfx_events,
                     play_sfx_system,
                 )
                     .chain(),
@@ -494,5 +547,95 @@ mod tests {
         }
         assert_eq!(slots.tracks[2], Some(99));
         assert!((slots.slot_gain[2] - 64.0 / 127.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn system_sfx_fires_only_for_mapped_events() {
+        // Build a fresh event log with a mix of mapped and unmapped
+        // events and verify the bridge fires SfxEvents only for the
+        // ones in `SystemSfxTable`. Uses a minimal Bevy App so the
+        // MessageWriter/Reader plumbing matches production.
+        let mut app = App::new();
+        app.add_message::<SfxEvent>()
+            .init_resource::<EventLog>()
+            .init_resource::<SystemSfxTable>()
+            .init_resource::<SystemSfxCursor>()
+            .add_systems(Update, fire_system_sfx_events);
+
+        let mut events = app.world_mut().resource_mut::<EventLog>();
+        events.recent.push_back(ViewerEvent::ZoneChanged { from: None, to: 100 });
+        events.recent.push_back(ViewerEvent::LowHp { pct: 15 });
+        // Unmapped event — should NOT fire SfxEvent.
+        events
+            .recent
+            .push_back(ViewerEvent::Reconnected { downtime_ms: 500 });
+        events.recent.push_back(ViewerEvent::EngagedBy { entity_id: 42 });
+
+        app.update();
+
+        // Drain the messages and check ids.
+        let mut sfx_messages: Vec<u32> = Vec::new();
+        let world = app.world_mut();
+        let mut reg = bevy::ecs::system::SystemState::<MessageReader<SfxEvent>>::new(world);
+        let mut reader = reg.get_mut(world);
+        for ev in reader.read() {
+            sfx_messages.push(ev.se_id);
+        }
+        assert_eq!(sfx_messages.len(), 3, "expected 3 mapped events");
+        assert_eq!(sfx_messages[0], 1097); // ZoneChanged
+        assert_eq!(sfx_messages[1], 1077); // LowHp
+        assert_eq!(sfx_messages[2], 1064); // EngagedBy
+    }
+
+    /// End-to-end pipeline test, gated on `FFXI_DAT_PATH` because the
+    /// final stage (decode → spawn AudioPlayer) needs a real .bgw on
+    /// disk. Replaces the manual "log in and hear it" listening test
+    /// for the BGM path with something CI-runnable.
+    #[test]
+    fn bgm_pipeline_end_to_end_with_real_install() {
+        let Ok(install) = std::env::var("FFXI_DAT_PATH") else {
+            eprintln!("skipping: FFXI_DAT_PATH not set");
+            return;
+        };
+
+        let mut app = App::new();
+        // Minimum plugin stack to get `Assets<AudioSource>` and the
+        // AudioPlayer component. `MinimalPlugins` plus the asset
+        // and audio sub-plugins is what bevy_audio itself uses in
+        // its own examples.
+        app.add_plugins(bevy::MinimalPlugins);
+        app.add_plugins(bevy::asset::AssetPlugin::default());
+        app.init_asset::<AudioSource>();
+        // Override the resolved install root so the test uses the
+        // env-supplied path even if the default resolver missed.
+        let mut slots = BgmSlots::default();
+        slots.install_root = Some(std::path::PathBuf::from(install));
+        app.insert_resource(slots)
+            .init_resource::<EventLog>()
+            .add_systems(Update, (drain_music_events_system, apply_bgm_system).chain());
+
+        // Push the same shape of event the wire reactor emits when
+        // LSB sends 0x05F music change.
+        let mut events = app.world_mut().resource_mut::<EventLog>();
+        events.recent.push_back(ViewerEvent::MusicChanged {
+            slot: 0, // ZoneDay
+            track_id: 101, // music101.bgw — known to exist
+        });
+        // Tick the schedule once: drain_music → apply_bgm.
+        app.update();
+
+        // After one tick, BgmSlots should have decided on (slot 0,
+        // track 101) and spawned an AudioPlayer entity.
+        let slots_after = app.world().resource::<BgmSlots>();
+        assert_eq!(slots_after.active, Some((0, 101)));
+        assert!(
+            slots_after.active_entity.is_some(),
+            "apply_bgm_system should have spawned an AudioPlayer entity"
+        );
+        let entity = slots_after.active_entity.unwrap();
+        assert!(
+            app.world().get::<AudioPlayer>(entity).is_some(),
+            "the spawned entity should carry an AudioPlayer component"
+        );
     }
 }
