@@ -6,3 +6,6 @@
 	path = vendor/server
 	url = git@github.com:LandSandBoat/server.git
 	branch = base
+[submodule "vendor/POLUtils"]
+	path = vendor/POLUtils
+	url = https://github.com/Windower/POLUtils.git

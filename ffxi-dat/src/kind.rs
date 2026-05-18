@@ -15,6 +15,7 @@
 pub enum ChunkKind {
     Terminate = 0x00,
     Rmp = 0x01,       // file-header marker (mot_, 0hm_, npc_, ...)
+    Generator = 0x05, // particle/sound/model spawner (lotus `Generator`)
     Scheduler = 0x07, // event/scheduler records (sdam, sp00, ...)
     Tim = 0x09,       // texture (legacy TIM)
     Mzb = 0x1C,       // zone static mesh (collision)
@@ -25,6 +26,7 @@ pub enum ChunkKind {
     Mmb = 0x2E,       // composite entity model (decryption + inline vertex/bone)
     Weather = 0x2F,   // per-zone TOD light/fog/skybox keyframes (FFXI::Weather)
     Rid = 0x36,       // resource id (file metadata)
+    Sep = 0x3D,       // sound effect pointer (body[8..12] = u32 SE id)
 }
 
 impl ChunkKind {
@@ -34,6 +36,7 @@ impl ChunkKind {
         Some(match k {
             0x00 => Self::Terminate,
             0x01 => Self::Rmp,
+            0x05 => Self::Generator,
             0x07 => Self::Scheduler,
             0x09 => Self::Tim,
             0x1C => Self::Mzb,
@@ -44,6 +47,7 @@ impl ChunkKind {
             0x2E => Self::Mmb,
             0x2F => Self::Weather,
             0x36 => Self::Rid,
+            0x3D => Self::Sep,
             _ => return None,
         })
     }
@@ -54,6 +58,7 @@ impl ChunkKind {
         match k {
             0x00 => "Terminate",
             0x01 => "Rmp",
+            0x05 => "Generator",
             0x07 => "Scheduler",
             0x09 => "Tim",
             0x1C => "Mzb",
@@ -64,6 +69,7 @@ impl ChunkKind {
             0x2E => "Mmb",
             0x2F => "Weather",
             0x36 => "Rid",
+            0x3D => "Sep",
             _ => "unknown",
         }
     }

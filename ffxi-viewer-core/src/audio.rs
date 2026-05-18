@@ -1,4 +1,5 @@
-//! BGM playback wired to LSB's 0x05F `GP_SERV_COMMAND_MUSIC` packet.
+//! BGM + system-SFX playback wired to LSB packets and existing
+//! wire events.
 //!
 //! Flow:
 //!
@@ -281,13 +282,154 @@ fn wrap_decoded_as_wav(d: &ffxi_audio::DecodedAudio) -> Result<Vec<u8>, &'static
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+//  SFX side
+// ---------------------------------------------------------------------------
+
+/// Fire-and-forget sound-effect trigger. Any system can write one;
+/// `play_sfx_system` decodes the .spw and spawns a one-shot
+/// `AudioPlayer`. Use [`crate::audio::SeRegistry`] to look up an SE
+/// id by 4-char name (the same `id` field used in Scheduler stage
+/// records).
+#[derive(Message, Debug, Clone, Copy)]
+pub struct SfxEvent {
+    pub se_id: u32,
+    /// 0.0..=1.0 gain. Stage 1 ignores per-slot volume — a follow-up
+    /// can multiply this by `BgmSlots::slot_gain[…]` for a dedicated
+    /// SFX slot once we wire that in.
+    pub volume: f32,
+}
+
+impl SfxEvent {
+    pub fn new(se_id: u32) -> Self {
+        Self {
+            se_id,
+            volume: 1.0,
+        }
+    }
+}
+
+/// In-memory mapping built from DAT scans: `4-char Sep name → SE id`.
+/// The action-DAT for a given spell/ability is what populates this;
+/// at runtime, a Scheduler stage of type `SoundOnCaster` /
+/// `SoundOnTarget` cites a 4-char id, and this map resolves it to
+/// the numeric SE id that `ffxi_audio::find_audio` can turn into a
+/// `.spw` path.
+///
+/// Populated lazily — empty by default; the user-side hook (an
+/// "/audio_index <dat>" slash command or startup-time scan) will be
+/// the loader. We don't load all DATs at startup because there are
+/// thousands and each scan is ~ms.
+#[derive(Resource, Default, Debug)]
+pub struct SeRegistry {
+    pub by_name: std::collections::HashMap<[u8; 4], u32>,
+}
+
+impl SeRegistry {
+    /// Look up the numeric SE id for a 4-char generator name as it
+    /// appears in Scheduler stage records.
+    pub fn lookup(&self, name: [u8; 4]) -> Option<u32> {
+        self.by_name.get(&name).copied()
+    }
+}
+
+/// Reusable cache of decoded SPWs so the same SE doesn't decode on
+/// every trigger. Map key = se_id; value = bytes-wrapped WAV
+/// (re-handed to Bevy's AudioSource on each play, since AudioSource
+/// is consumed by the AudioPlayer entity).
+#[derive(Resource, Default)]
+pub struct SfxCache {
+    cached: std::collections::HashMap<u32, Vec<u8>>,
+}
+
+/// Consume `SfxEvent`s and spawn one-shot `AudioPlayer`s. Cached
+/// .spw decode bytes live in `SfxCache` so repeated triggers (a
+/// machine gun, a chained mob skill, …) re-spawn cheaply.
+pub fn play_sfx_system(
+    mut events: MessageReader<SfxEvent>,
+    slots: Res<BgmSlots>,
+    mut cache: ResMut<SfxCache>,
+    mut audio_sources: ResMut<Assets<AudioSource>>,
+    mut commands: Commands,
+) {
+    if events.is_empty() {
+        return;
+    }
+    let Some(install) = slots.install_root.clone() else {
+        return;
+    };
+    for ev in events.read() {
+        let bytes = if let Some(b) = cache.cached.get(&ev.se_id) {
+            b.clone()
+        } else {
+            let Some(path) = find_audio(&install, AudioKind::Sfx, ev.se_id) else {
+                warn!("audio: sfx {} not found under {}", ev.se_id, install.display());
+                continue;
+            };
+            let decoded = match decode_file(&path) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("audio: sfx {} decode failed: {e}", ev.se_id);
+                    continue;
+                }
+            };
+            let wav = match wrap_decoded_as_wav(&decoded) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("audio: sfx {} wav-wrap failed: {e}", ev.se_id);
+                    continue;
+                }
+            };
+            cache.cached.insert(ev.se_id, wav.clone());
+            wav
+        };
+        let handle = audio_sources.add(AudioSource {
+            bytes: bytes.into(),
+        });
+        commands.spawn((
+            AudioPlayer(handle),
+            PlaybackSettings::DESPAWN
+                .with_volume(bevy::audio::Volume::Linear(ev.volume.clamp(0.0, 1.0))),
+        ));
+    }
+}
+
+/// Bridge from `ViewerEvent::ZoneChanged` to a hardcoded zone-in
+/// SFX. The id `1097` is the "menu open / zone-line confirm" chime
+/// our DAT scan found in `ROM/0/58.DAT` under Sep `0000`. Verified
+/// to resolve to `sound/win/se/se001/se001097.spw` (file exists on
+/// disk). Other system SFX (level-up, KO, item-gain) will hook into
+/// their respective wire events as those decoders land.
+pub fn fire_zone_in_sfx_system(events: Res<EventLog>, mut writer: MessageWriter<SfxEvent>) {
+    // We scan the latest few events each frame, but EventLog is the
+    // shared ring buffer — we don't want to re-fire on every entry.
+    // Look only at the most-recently-pushed event; if it's
+    // ZoneChanged, fire once. (Multiple ZoneChanged within a single
+    // frame is exceedingly rare.)
+    if let Some(ViewerEvent::ZoneChanged { .. }) = events.recent.back() {
+        writer.write(SfxEvent::new(1097));
+    }
+}
+
 /// Plugin entry point. Registered from `lib.rs`.
 pub struct AudioPlugin;
 
 impl Plugin for AudioPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BgmSlots>()
-            .add_systems(Update, (drain_music_events_system, apply_bgm_system).chain());
+            .init_resource::<SeRegistry>()
+            .init_resource::<SfxCache>()
+            .add_message::<SfxEvent>()
+            .add_systems(
+                Update,
+                (
+                    drain_music_events_system,
+                    apply_bgm_system,
+                    fire_zone_in_sfx_system,
+                    play_sfx_system,
+                )
+                    .chain(),
+            );
     }
 }
 
