@@ -176,9 +176,29 @@ pub(super) fn handle_click_system(
     mut interactions: Query<(&Interaction, &RowAction), Changed<Interaction>>,
     chars: Res<CharListData>,
     mut sel: ResMut<SelectedChar>,
+    mut cursor: ResMut<CharCursor>,
     mut next_state: ResMut<NextState<LauncherState>>,
+    mut q_rows: Query<(&CharRowText, &mut Text)>,
 ) {
+    let new_char_index = chars.0.len();
+    let mut moved = false;
     for (interaction, action) in interactions.iter_mut() {
+        // Hover-to-preview: any time the pointer enters a row, move
+        // the cursor onto it. The `refresh_preview_on_cursor_change`
+        // system then despawns the old 3D preview and respawns the
+        // hovered character. Doesn't commit selection — that still
+        // requires a click.
+        if *interaction == Interaction::Hovered {
+            let target_idx = match *action {
+                RowAction::Char(idx) => idx,
+                RowAction::NewChar => new_char_index,
+            };
+            if cursor.0 != target_idx {
+                cursor.0 = target_idx;
+                moved = true;
+            }
+            continue;
+        }
         if *interaction != Interaction::Pressed {
             continue;
         }
@@ -191,6 +211,19 @@ pub(super) fn handle_click_system(
             }
             RowAction::NewChar => {
                 next_state.set(LauncherState::CharCreate);
+            }
+        }
+    }
+    if moved {
+        // Repaint the row labels' `>` indicator to follow the hover.
+        // Mirrors the same loop in `handle_keyboard_system` after an
+        // arrow-key move; factored inline rather than into a helper
+        // because passing `&mut Query` around in Bevy is fiddly.
+        for (row, mut text) in q_rows.iter_mut() {
+            if row.index == new_char_index {
+                **text = format_new_char_row(row.index == cursor.0);
+            } else if let Some(slot) = chars.0.get(row.index) {
+                **text = format_char_row(row.index, slot, row.index == cursor.0);
             }
         }
     }

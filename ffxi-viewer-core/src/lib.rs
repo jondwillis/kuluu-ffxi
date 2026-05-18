@@ -46,7 +46,9 @@ pub use camera::{
     chase_camera_system, firstperson_camera_system, heading_for_yaw, spawn_camera,
     toggle_camera_mode, yaw_for_heading, CameraMode, ChaseCamera, OperatorCamera,
 };
-pub use components::{EntityModel, HpIndicator, IsSelf, LookComp, Nameplate, WorldEntity};
+pub use components::{
+    EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
+};
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
     ChatBuffer, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack, PassiveCursorFocus,
@@ -118,6 +120,14 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<hud::chat_panel::BattleScroll>()
             .init_resource::<hud::chat_panel::ChatScrollAccum>()
             .init_resource::<hud::chat_panel::BattleScrollAccum>()
+            // Launcher-supplied appearance for the local PC. LSB zeros
+            // the self GrapIDTbl in CHAR_PC packets; without this
+            // override the local player would never get a LookComp
+            // and `dispatch_look_driven_models` would never fire,
+            // leaving the self capsule un-replaced. Populated by the
+            // launcher pre-connect (`ConnectInFlight`) and consumed
+            // by `ensure_self_lookcomp_system`.
+            .init_resource::<scene::SelfAppearance>()
             // PickingPlugin owns the mesh raycast backend + the click→target
             // reader. `DefaultPickingPlugins` (input/hover/interaction) is
             // already added by `DefaultPlugins` on both front-ends.
@@ -144,6 +154,12 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                     // matters: must run after the spawn pass so the
                     // `TrackedEntities` map is current.
                     sync_entity_looks_system,
+                    // Inject the launcher-supplied self look when
+                    // the wire snapshot leaves it empty (the LSB
+                    // self-CHAR_PC case). Must run *after*
+                    // sync_entity_looks_system so wire-side data
+                    // wins when present.
+                    scene::ensure_self_lookcomp_system,
                     process_entity_look_changes,
                     chase_camera_system,
                     firstperson_camera_system,

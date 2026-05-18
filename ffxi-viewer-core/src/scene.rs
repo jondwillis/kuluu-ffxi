@@ -234,6 +234,7 @@ pub fn setup_world(
     // readable. Pair with the camera's `VolumetricFog` and the
     // directional light's `VolumetricLight` marker above.
     commands.spawn((
+        crate::components::InGameEntity,
         FogVolume {
             fog_color: Color::srgb(0.65, 0.72, 0.82),
             density_factor: 0.06,
@@ -369,6 +370,7 @@ pub fn sync_entities_system(
                     Pickable::default()
                 };
                 let mut spawn = commands.spawn((
+                    crate::components::InGameEntity,
                     WorldEntity {
                         id: wire.id,
                         act_index: wire.act_index,
@@ -671,6 +673,47 @@ fn heading_to_quat(heading: u8) -> Quat {
 /// many times per second per entity — even when the value is
 /// byte-identical to last tick. The explicit compare-then-insert here
 /// is what makes Bevy's change-detection meaningful for this surface.
+/// Launcher → game look bridge. The retail FFXI server zeros the
+/// self GrapIDTbl in CHAR_PC because the retail client rebuilds
+/// appearance from local equipment state — but we don't have that
+/// state on the wire (`session.rs:678` documents the empty slot).
+/// The launcher knows the player's appearance (`CharSlot`); it
+/// writes it into this resource before connecting, and
+/// [`ensure_self_lookcomp_system`] applies it to the self
+/// `WorldEntity` whenever the wire's `look` is empty.
+///
+/// `None` (the default) means no self override — entities use their
+/// wire look as-is. This is the launcher pre-login state, the wasm
+/// browser flow, and headless / MCP sessions.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct SelfAppearance {
+    pub look: Option<ffxi_viewer_wire::EntityLook>,
+}
+
+/// Ensure the self entity has a `LookComp` whenever a
+/// [`SelfAppearance`] override is set. Runs *after*
+/// `sync_entity_looks_system` so a real wire look (if it ever
+/// arrives) takes precedence — we only fill in when wire-side is
+/// absent.
+pub fn ensure_self_lookcomp_system(
+    appearance: Res<SelfAppearance>,
+    q_self: Query<(Entity, Option<&LookComp>), With<IsSelf>>,
+    mut commands: Commands,
+) {
+    let Some(look) = appearance.look.as_ref() else {
+        return;
+    };
+    for (e, current) in q_self.iter() {
+        let needs = match current {
+            None => true,
+            Some(LookComp(existing)) => existing != look,
+        };
+        if needs {
+            commands.entity(e).insert(LookComp(look.clone()));
+        }
+    }
+}
+
 pub fn sync_entity_looks_system(
     state: Res<SceneState>,
     tracked: Res<TrackedEntities>,
