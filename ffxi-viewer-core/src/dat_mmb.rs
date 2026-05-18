@@ -226,16 +226,25 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
 
     let mut out = Vec::with_capacity(subs.len());
     for sub in &subs {
-        // Historical note: a `!sub.tag.starts_with(b"model")` filter
-        // used to live here. That filter assumed every per-submesh
-        // record carried a `"model   "` type tag, but lotus-ffxi
-        // (`mmb.cppm::SMMBModelHeader`) shows the field is the raw
-        // 16-byte textureName with NO type prefix. The filter silently
-        // dropped every per-submesh record, leaving only the top-level
-        // `SMMBHeader.imgID` (which DOES have the prefix) — producing
-        // one-texture-fits-all rendering and missing floors/walls
-        // whose names didn't happen to begin with "model". Removed.
+        // Only accept records whose 8-byte type-tag is `"model   "`.
+        // Real per-submesh textureName fields are laid out as
+        // `<"model   "><8-char name>` — verified live against city-zone
+        // DAT 330 chunk 252 (tshimonorig_06), which has records with
+        // textureNames `"model   jimeni_0"` and `"model   kabe_3"`.
+        // The name half is what IMG's `extract_texture_name` returns,
+        // so `MmbSubRecord::texture_name_str` reads bytes 8..16 and
+        // pairs directly against the IMG pool below.
         //
+        // Other tag values come from clod-style cloth meshes (which
+        // use a different vertex layout `parse_vertices` can't decode)
+        // or from coincidental ASCII windows inside vertex/index data
+        // that the heuristic scanner accidentally matched. Without
+        // this filter those records either render at runaway scale
+        // ("enormous shards") or land downstream as zero-triangle
+        // meshes that crashed `build_collision_bvh_system`.
+        if !sub.tag.starts_with(b"model") {
+            continue;
+        }
         // Skip sub-records whose body can't fit a 36-byte vertex stride
         // for the declared count, or whose strip yields no triangles
         // after restart/winding decode.
@@ -440,6 +449,7 @@ pub fn process_load_mmb_requests(
         // body's internal name (`extract_texture_name`). Submeshes that
         // don't match fall back to the first IMG or no texture.
         let texture_count = loaded.textures.len();
+        let pool_is_new = !tex_pools.contains_key(&req.file_id);
         let pool = tex_pools.entry(req.file_id).or_insert_with(|| {
             let mut by_name: std::collections::HashMap<String, Handle<Image>> =
                 std::collections::HashMap::with_capacity(texture_count);
@@ -457,6 +467,37 @@ pub fn process_load_mmb_requests(
         });
         let tex_by_name = &pool.0;
         let first_texture = pool.1.clone();
+
+        // One-shot per-DAT diagnostic: when the texture pool is freshly
+        // built, log the texture-name pool plus the unique submesh
+        // texture names this MMB asked for and which ones resolved.
+        // Helps diagnose "missing textures" symptoms — set
+        // RUST_LOG=ffxi_viewer_core::dat_mmb=info to see it.
+        if pool_is_new {
+            let img_names: Vec<&str> = tex_by_name
+                .keys()
+                .map(|s| s.as_str())
+                .collect();
+            let mut requested: Vec<&str> =
+                loaded.submeshes.iter().map(|s| s.variant_name.as_str()).collect();
+            requested.sort_unstable();
+            requested.dedup();
+            let (matched, unmatched): (Vec<&str>, Vec<&str>) = requested
+                .iter()
+                .partition(|n| tex_by_name.contains_key(**n));
+            info!(
+                target: "ffxi_viewer_core::dat_mmb",
+                file_id = req.file_id,
+                chunk_idx = req.chunk_idx,
+                asset = %loaded.asset_name,
+                img_count = tex_by_name.len(),
+                imgs = ?img_names,
+                matched = ?matched,
+                unmatched = ?unmatched,
+                first_fallback = first_texture.is_some(),
+                "MMB texture pool",
+            );
+        }
 
         // Two parenting modes:
         //

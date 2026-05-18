@@ -468,26 +468,33 @@ impl<'a> MmbSubRecord<'a> {
             .to_string()
     }
 
-    /// Full 16-byte textureName as a clean ASCII string. NUL bytes
-    /// terminate (NOT mapped to `.` like `variant_name_str`). Trailing
-    /// spaces are trimmed.
+    /// Texture name for IMG pairing — bytes 8..16 of the 16-byte
+    /// textureName field, NUL-terminated and space-trimmed.
     ///
-    /// Use this — not `variant_name_str` — to pair against the IMG
-    /// name returned by `ffxi_dat::texture::extract_texture_name`.
-    /// `variant_name_str` predates this method, treats NUL as `.`, and
-    /// produces names like `s_kabe2.` that never match `s_kabe2` from
-    /// the IMG side.
+    /// The 16-byte textureName field is laid out as
+    /// `<8-byte type-tag><8-byte name>`. The type-tag is `"model   "`
+    /// for standard meshes (`tag` field; what callers filter on).
+    /// The 8-byte `name` half is the texture identifier and matches
+    /// IMG's `extract_texture_name` output. Verified against real
+    /// city-zone data (DAT 330 chunk 252 in tshimonorig_06): MMB
+    /// records contain `"model   jimeni_0"` and the matching IMG
+    /// chunks register names like `"jimeni_0"`.
+    ///
+    /// Use this — not `variant_name_str` — to pair against IMG names.
+    /// `variant_name_str` maps NUL to `.`, producing strings like
+    /// `kabe_3..` that fail to match `kabe_3` from the IMG side
+    /// (short names <8 chars are NUL-padded).
     pub fn texture_name_str(&self) -> String {
-        let bytes: [u8; 16] = {
-            let mut b = [0u8; 16];
-            b[..8].copy_from_slice(self.tag);
-            b[8..].copy_from_slice(self.variant_name);
-            b
-        };
-        let s: String = bytes
+        let s: String = self
+            .variant_name
             .iter()
-            .take_while(|&&b| b != 0)
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '\0' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '\0'
+                }
+            })
             .take_while(|&c| c != '\0')
             .collect();
         s.trim_end().to_string()
@@ -630,19 +637,35 @@ mod tests {
     }
 
     #[test]
-    fn texture_name_str_stops_at_nul() {
-        // textureName "s_kabe2\0...." — short name, NUL-padded. The
-        // historical `variant_name_str` maps NUL -> '.' producing
-        // "s_kabe2." which never matches the IMG side. The new
-        // `texture_name_str` must stop at NUL and return "s_kabe2".
+    fn texture_name_str_returns_name_half_only() {
+        // Real per-submesh textureName layout is
+        // `<"model   "><8-char name>`. The IMG side registers the bare
+        // name ("kabe_3"), so `texture_name_str` must return only the
+        // second half — with NUL termination (the historical
+        // `variant_name_str` mapped NUL -> '.' giving "kabe_3.." which
+        // never matched).
         let mut buf = Vec::new();
-        buf.extend_from_slice(b"s_kabe2\0\0\0\0\0\0\0\0\0"); // textureName[16]
+        buf.extend_from_slice(b"model   "); // tag
+        buf.extend_from_slice(b"kabe_3\0\0"); // name (6 chars + 2 NUL)
         buf.extend_from_slice(&8u16.to_le_bytes()); // vertexsize
         buf.extend_from_slice(&0u16.to_le_bytes()); // blending
-        buf.extend(std::iter::repeat_n(0xFFu8, 64)); // payload (non-ASCII)
+        buf.extend(std::iter::repeat_n(0xFFu8, 64));
         let recs = MmbSubRecord::find_all(&buf);
-        assert_eq!(recs.len(), 1, "scanner should accept short NUL-padded names");
-        assert_eq!(recs[0].texture_name_str(), "s_kabe2");
+        assert_eq!(recs.len(), 1, "scanner should accept the model record");
+        assert_eq!(
+            recs[0].texture_name_str(),
+            "kabe_3",
+            "NUL-padded short name should compare equal to IMG-side bare name"
+        );
+        // And an exact 8-char name should round-trip without truncation.
+        let mut buf2 = Vec::new();
+        buf2.extend_from_slice(b"model   ");
+        buf2.extend_from_slice(b"jimeni_0"); // exact 8 chars, no NUL
+        buf2.extend_from_slice(&8u16.to_le_bytes());
+        buf2.extend_from_slice(&0u16.to_le_bytes());
+        buf2.extend(std::iter::repeat_n(0xFFu8, 64));
+        let recs2 = MmbSubRecord::find_all(&buf2);
+        assert_eq!(recs2[0].texture_name_str(), "jimeni_0");
     }
 
     #[test]
