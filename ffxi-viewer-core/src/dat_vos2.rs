@@ -16,12 +16,14 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
+use std::sync::OnceLock;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::Image;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use ffxi_dat::bone::{self, Skeleton};
 use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::vos2::{parse_vos2, Vos2Mesh};
 use ffxi_dat::{walk, ChunkKind, DatRoot};
@@ -102,6 +104,95 @@ pub fn load_vos2(file_id: u32, chunk_idx: usize) -> Result<LoadedVos2, String> {
         .collect();
 
     Ok(LoadedVos2 { mesh, textures })
+}
+
+/// Hardcoded humanoid skeleton for the bind-pose bake. File 7072
+/// chunk[70] is the 94-bone "hum_" skeleton confirmed in
+/// [[sk2-format]]; using it for every race is a known wrong-but-
+/// useful first cut — Tarutaru / Galka / Mithra are anatomically
+/// different and will distort until we have a real race → skeleton
+/// mapping. The distortion is informative: it tells us whether the
+/// bake math is correct (recognizable bipedal silhouette = yes) or
+/// not (still crumpled = no).
+const HARDCODED_SKELETON_FILE_ID: u32 = 7072;
+const HARDCODED_SKELETON_CHUNK_IDX: usize = 70;
+
+/// Lazily-loaded skeleton + pre-composed bind-pose world matrices.
+/// `None` if the load failed (file missing, parse error, etc.) —
+/// callers then fall back to bone-local positions (the pre-bake
+/// behavior). One read for the entire session.
+static BAKED_SKELETON: OnceLock<Option<BakedSkeleton>> = OnceLock::new();
+
+struct BakedSkeleton {
+    /// `bind_pose_world()` result cached so we don't recompose the
+    /// matrix chain on every VOS2 load. Indexed by skeleton bone id.
+    /// The raw `Skeleton` is dropped after composition — bind-pose
+    /// is the only thing the bake needs, and animation (which would
+    /// require the original local transforms) is out of scope.
+    world: Vec<[[f32; 4]; 4]>,
+}
+
+fn baked_skeleton() -> Option<&'static BakedSkeleton> {
+    BAKED_SKELETON
+        .get_or_init(|| {
+            let root = DatRoot::from_env_or_default().ok()?;
+            let loc = root.resolve(HARDCODED_SKELETON_FILE_ID).ok()?;
+            let bytes = fs::read(loc.path_under(root.root())).ok()?;
+            let chunks: Vec<_> = walk(&bytes).filter_map(Result::ok).collect();
+            let chunk = chunks.get(HARDCODED_SKELETON_CHUNK_IDX)?;
+            if ChunkKind::from_u8(chunk.kind) != Some(ChunkKind::Bone) {
+                return None;
+            }
+            let skeleton = Skeleton::parse(chunk.data).ok()?;
+            let world = skeleton.bind_pose_world();
+            info!(
+                "vos2 bake: loaded skeleton file={} chunk={} bones={}",
+                HARDCODED_SKELETON_FILE_ID,
+                HARDCODED_SKELETON_CHUNK_IDX,
+                world.len(),
+            );
+            Some(BakedSkeleton { world })
+        })
+        .as_ref()
+}
+
+/// Apply the skeleton's bind-pose `bone_world` matrix to one local
+/// vertex position, returning the model-space position. Falls back
+/// to the local position when no skeleton is loaded or the vertex's
+/// resolved bone id is out of range — equivalent to the pre-bake
+/// behavior of treating the vertex pool as already in model space.
+fn bake_position(
+    mesh: &Vos2Mesh,
+    vertex_idx: usize,
+    local: [f32; 3],
+    baked: Option<&BakedSkeleton>,
+) -> [f32; 3] {
+    let Some(baked) = baked else { return local };
+    let Some(bone_id) = mesh.skeleton_bone_for(vertex_idx) else {
+        return local;
+    };
+    match baked.world.get(bone_id as usize) {
+        Some(m) => bone::mat4_transform_point(*m, local),
+        None => local,
+    }
+}
+
+/// Same as [`bake_position`] but for normals — rotation-only
+/// (translation column discarded by [`bone::mat4_transform_dir`]).
+fn bake_normal(
+    mesh: &Vos2Mesh,
+    vertex_idx: usize,
+    local: [f32; 3],
+    baked: Option<&BakedSkeleton>,
+) -> [f32; 3] {
+    let Some(baked) = baked else { return local };
+    let Some(bone_id) = mesh.skeleton_bone_for(vertex_idx) else {
+        return local;
+    };
+    match baked.world.get(bone_id as usize) {
+        Some(m) => bone::mat4_transform_dir(*m, local),
+        None => local,
+    }
 }
 
 fn decoded_texture_to_image(t: &DecodedTexture) -> Image {
@@ -191,22 +282,45 @@ pub fn process_load_vos2_requests(
             (by_name, first)
         });
 
-        // FFXI vertices are in left-handed (X-right, Y-forward, Z-up).
-        // Bevy is right-handed Y-up. Mirror the `scene::ffxi_to_bevy`
-        // transform: (x, y, z) → (x, -z, -y) for positions; the same
-        // axis flip applies to normals so lighting stays consistent
-        // with the surface orientation.
+        // Bind-pose bake: VOS2 vertices are authored in **bone-local
+        // space** (each vertex relative to its assigned skeleton
+        // bone), so they must be lifted to model space by
+        // `bone_world[bone_id] * local_pos` before the FFXI→Bevy
+        // axis flip. Without this step the slot meshes (head, body,
+        // legs, etc.) all pile up at the entity origin — the
+        // "crumpled" rendering we saw earlier. See [[sk2-format]].
+        //
+        // Skeleton is hardcoded today (file 7072 chunk[70], hum_)
+        // because race→skeleton_file_id mapping is unsolved.
+        // Non-humanoid races will distort; that's a known follow-up.
+        // When the skeleton load fails (missing DAT, parse error)
+        // the helpers fall back to local positions, restoring the
+        // pre-bake behavior so the renderer keeps working.
+        let baked = baked_skeleton();
+        // FFXI vertices are in left-handed (X-right, Y-forward,
+        // Z-up). Bevy is right-handed Y-up. Mirror the
+        // `scene::ffxi_to_bevy` transform: (x, y, z) → (x, -z, -y)
+        // for both positions and normals so lighting stays
+        // consistent with the surface orientation.
         let positions: Vec<[f32; 3]> = loaded
             .mesh
             .vertices
             .iter()
-            .map(|v| [v.pos[0], -v.pos[2], -v.pos[1]])
+            .enumerate()
+            .map(|(i, v)| {
+                let p = bake_position(&loaded.mesh, i, v.pos, baked);
+                [p[0], -p[2], -p[1]]
+            })
             .collect();
         let normals: Vec<[f32; 3]> = loaded
             .mesh
             .vertices
             .iter()
-            .map(|v| [v.normal[0], -v.normal[2], -v.normal[1]])
+            .enumerate()
+            .map(|(i, v)| {
+                let n = bake_normal(&loaded.mesh, i, v.normal, baked);
+                [n[0], -n[2], -n[1]]
+            })
             .collect();
 
         for group in &loaded.mesh.groups {
