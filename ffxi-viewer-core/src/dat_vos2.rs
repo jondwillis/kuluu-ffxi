@@ -233,6 +233,20 @@ fn baked_for_mesh<'a>(
     baked.filter(|b| skeleton_fits_mesh(b, mesh))
 }
 
+/// Bone[0] of every PC skeleton ships with rotation quat
+/// `(0, 0.7071, 0, -0.7071)` — a 270° (= −90°) roll around FFXI's
+/// Y axis (forward). That rotation propagates down the parent
+/// chain into every bone_world matrix, tipping the rendered
+/// character sideways. lotus-ffxi gets away with this because
+/// their skin compute shader runs after a separate model-space
+/// transform applies on the GPU; for our CPU bake we have to undo
+/// it explicitly. Mapping (x, y, z) → (z, y, −x) inverts a 90°
+/// rotation around +Y, standing the model upright before the
+/// FFXI→Bevy axis flip.
+fn unroll_root_rotation(v: [f32; 3]) -> [f32; 3] {
+    [v[2], v[1], -v[0]]
+}
+
 /// Apply the skeleton's bind-pose `bone_world` matrix to one local
 /// vertex position, returning the model-space position. Caller is
 /// expected to pass `baked = None` when the skeleton doesn't fit
@@ -249,7 +263,7 @@ fn bake_position(
         return local;
     };
     match baked.world.get(bone_id as usize) {
-        Some(m) => bone::mat4_transform_point(*m, local),
+        Some(m) => unroll_root_rotation(bone::mat4_transform_point(*m, local)),
         None => local,
     }
 }
@@ -267,7 +281,7 @@ fn bake_normal(
         return local;
     };
     match baked.world.get(bone_id as usize) {
-        Some(m) => bone::mat4_transform_dir(*m, local),
+        Some(m) => unroll_root_rotation(bone::mat4_transform_dir(*m, local)),
         None => local,
     }
 }
