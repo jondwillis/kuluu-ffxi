@@ -15,4 +15,5 @@ pub mod msg_area;
 pub mod msg_basic;
 pub mod msg_channel;
 pub mod msg_system;
+pub mod skill_names;
 pub mod zlib;

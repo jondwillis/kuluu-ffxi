@@ -763,12 +763,15 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::BATTLE_MESSAGE => {
-            if let Some(line) = decode_battle_message(sub.data, name_cache, false) {
+            // is_029 = true: Data/Data2 sit at offsets 8/12 (before ActIndex
+            // pair). See `decode_battle_message` doc for the two layouts.
+            if let Some(line) = decode_battle_message(sub.data, name_cache, true) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
         }
         op if op == s2c::BATTLE_MESSAGE2 => {
-            if let Some(line) = decode_battle_message(sub.data, name_cache, true) {
+            // 0x02D moves Data/Data2 to offsets 12/16, after the ActIndex pair.
+            if let Some(line) = decode_battle_message(sub.data, name_cache, false) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
         }
@@ -2003,7 +2006,78 @@ fn substitute_battle_placeholders(
     if s.contains("<number2>") {
         s = s.replace("<number2>", &data2.to_string());
     }
+    if s.contains("<skill>") {
+        let skill = ffxi_proto::skill_names::lookup(data1 as u8)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("skill #{}", data1));
+        s = s.replace("<skill>", &skill);
+    }
+    // Bare `X` / `#` are msg_basic.h's shorthand for inline numbers
+    // (e.g., "skill rises X points.", "gains # experience points."). Use
+    // token-boundary matching so words like "BoX" / hashtags don't get
+    // mangled. `X` always reads `data2`. `#` reads `data1` for everything
+    // except `ExpChain` (id 253), whose template carries two `#` markers
+    // — `chain #!` is `data2` (chain number) and `gains # experience` is
+    // `data1` (exp earned).
+    if message_num == 253 {
+        s = replace_marker_nth(&s, '#', 0, &data2.to_string());
+        s = replace_marker_nth(&s, '#', 0, &data1.to_string());
+    } else {
+        s = replace_marker_all(&s, '#', &data1.to_string());
+    }
+    s = replace_marker_all(&s, 'X', &data2.to_string());
     s
+}
+
+/// Replace every token-boundary occurrence of `marker` with `value`.
+/// A "token boundary" means the marker is not adjacent to an alphanumeric
+/// or `_` on either side — so `X` in "BoX" or `#` in a hex literal is
+/// left alone, but `X` in "rises X points" or `#` in "gains #" is swapped.
+fn replace_marker_all(src: &str, marker: char, value: &str) -> String {
+    let mut out = String::with_capacity(src.len() + value.len());
+    let chars: Vec<char> = src.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == marker && is_token_boundary(&chars, i) {
+            out.push_str(value);
+        } else {
+            out.push(chars[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Replace only the `n`-th (0-indexed) token-boundary occurrence of `marker`.
+/// Returns the original string unchanged if there are fewer than `n+1`
+/// matches. Used for `ExpChain` where the template carries two `#` markers
+/// that map to different data slots.
+fn replace_marker_nth(src: &str, marker: char, n: usize, value: &str) -> String {
+    let mut out = String::with_capacity(src.len() + value.len());
+    let chars: Vec<char> = src.chars().collect();
+    let mut seen = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == marker && is_token_boundary(&chars, i) {
+            if seen == n {
+                out.push_str(value);
+                out.extend(chars[i + 1..].iter());
+                return out;
+            }
+            seen += 1;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn is_token_boundary(chars: &[char], i: usize) -> bool {
+    let left_ok = i == 0
+        || !chars[i - 1].is_alphanumeric() && chars[i - 1] != '_';
+    let right_ok = i + 1 == chars.len()
+        || !chars[i + 1].is_alphanumeric() && chars[i + 1] != '_';
+    left_ok && right_ok
 }
 
 /// `GP_SERV_COMMAND_EVENT` (0x032) decoder. Body layout per
@@ -2959,6 +3033,93 @@ mod tests {
             "victim must precede killer in the rendered template, got: {}",
             line.text
         );
+    }
+
+    #[test]
+    fn battle_message_8_exp_gain_substitutes_hash_marker() {
+        // ExperiencePointsGained = 8, "<player> gains # experience points."
+        // Emitted via BATTLE_MESSAGE2 (0x02D), so Data sits at offsets 12/16.
+        // Regression: the dispatcher previously inverted is_029, pulling the
+        // amount from the ActIndex slot and leaving `#` literal.
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes()); // cas
+        data[4..8].copy_from_slice(&0xCAFEu32.to_le_bytes()); // tar (same — self)
+        data[12..16].copy_from_slice(&420u32.to_le_bytes()); // Data = exp
+        data[16..20].copy_from_slice(&0u32.to_le_bytes()); // Data2
+        data[20..22].copy_from_slice(&8u16.to_le_bytes()); // MessageNum
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "hello".to_string());
+        // is_029=false matches the 0x02D layout.
+        let line = decode_battle_message(&data, &cache, false).expect("decoded");
+        assert!(
+            line.text.contains("420") && !line.text.contains('#'),
+            "expected '#' to be replaced with 420, got: {}",
+            line.text
+        );
+        assert!(line.text.contains("hello"));
+    }
+
+    #[test]
+    fn battle_message_38_skill_gain_substitutes_skill_and_x() {
+        // SkillGain = 38, "<target>'s <skill> skill rises X points."
+        // Data = SkillID, Data2 = points. Emitted via 0x029 (is_029=true).
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes()); // cas
+        data[4..8].copy_from_slice(&0xCAFEu32.to_le_bytes()); // tar
+        data[8..12].copy_from_slice(&48u32.to_le_bytes()); // Data = SKILL_FISHING
+        data[12..16].copy_from_slice(&3u32.to_le_bytes()); // Data2 = 3 points
+        data[20..22].copy_from_slice(&38u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "hello".to_string());
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert!(
+            line.text.contains("Fishing") && line.text.contains("rises 3 points"),
+            "expected '<skill>'→Fishing and 'X'→3, got: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn battle_message_253_exp_chain_substitutes_two_hashes_in_order() {
+        // ExpChain = 253, "EXP chain #! <player> gains # experience points."
+        // Data = exp, Data2 = chainNumber. First `#` is data2 (chain),
+        // second `#` is data1 (exp). Via BATTLE_MESSAGE2 (is_029=false).
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes());
+        data[4..8].copy_from_slice(&0xCAFEu32.to_le_bytes());
+        data[12..16].copy_from_slice(&320u32.to_le_bytes()); // Data = exp
+        data[16..20].copy_from_slice(&5u32.to_le_bytes()); // Data2 = chain #5
+        data[20..22].copy_from_slice(&253u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "hello".to_string());
+        let line = decode_battle_message(&data, &cache, false).expect("decoded");
+        assert!(
+            line.text.contains("chain 5!") && line.text.contains("gains 320"),
+            "expected 'chain 5!' and 'gains 320', got: {}",
+            line.text
+        );
+        assert!(!line.text.contains('#'), "stray '#' remained: {}", line.text);
+    }
+
+    #[test]
+    fn substitute_battle_x_marker_respects_token_boundary() {
+        // A bare `X` in a real msg_basic template ("rises X points")
+        // should be swapped; but a within-word X (like the 'X' in
+        // "BoXing" — unlikely in real templates but worth pinning the
+        // rule) must NOT be swapped.
+        let s = substitute_battle_placeholders(
+            "rises X points. BoXing.",
+            "cas",
+            "tar",
+            0,
+            7,
+            38,
+        );
+        assert!(s.contains("rises 7 points"), "got: {s}");
+        assert!(s.contains("BoXing"), "within-word X must survive, got: {s}");
     }
 
     #[test]
