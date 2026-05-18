@@ -299,17 +299,46 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
     })
 }
 
-/// True if any pixel in the decoded RGBA buffer has α < 255. Used
-/// at texture-load time to decide whether the material should render
-/// as opaque or as alpha-cutout — most FFXI ground/wall textures
-/// have α=255 everywhere (DXT3 with all-opaque alpha channel) and
-/// should render fully opaque; tree leaves and similar carry real
-/// transparency in their alpha bytes.
+/// True if the texture has authored cutout holes — i.e. at least 1%
+/// of pixels are near-zero alpha. Picks `AlphaMode::Mask(0.5)` for
+/// these; leaves DXT3 textures with the typical "all 255s plus a
+/// few compression-noise dips to 240-something" as opaque.
 ///
-/// Aborts on first hit so the typical opaque texture costs O(WxH)
-/// scan but transparent textures cost only a handful of byte reads.
+/// Why both thresholds:
+/// * Per-pixel α < 16 catches *intent* — the artist authored a
+///   hole. DXT3 compression artifacts usually keep α in the
+///   200–254 range, so they fail this check.
+/// * The 1% count threshold catches *frequency* — even if a single
+///   stray 0-alpha pixel exists (decoder quirk, salt-and-pepper
+///   noise), one pixel out of 65k shouldn't switch the entire
+///   surface to cutout. Real cutout textures (tree leaves, fence
+///   slats) have large transparent regions, easily >1% of pixels.
+///
+/// Without the per-pixel threshold, ground/wall textures whose
+/// alpha channel decodes to a noisy 240-254 range get classified
+/// as cutout, then `Mask(0.5)` discards every texel because the
+/// 0..255 → 0..1 mapping puts most alphas just under 0.5. Visible
+/// symptom: terrain disappears, leaving holes through to the
+/// clear color (the "ground is gone, only trees visible" bug).
 fn texture_has_transparent_pixels(tex: &DecodedTexture) -> bool {
-    tex.rgba.chunks_exact(4).any(|px| px[3] < 255)
+    const HOLE_ALPHA: u8 = 16; // pixel α below this counts as a hole
+    const HOLE_FRACTION: f32 = 0.01; // 1% of pixels must be holes
+
+    let total = tex.rgba.len() / 4;
+    if total == 0 {
+        return false;
+    }
+    let needed = ((total as f32) * HOLE_FRACTION).ceil() as usize;
+    let mut hole_count = 0usize;
+    for px in tex.rgba.chunks_exact(4) {
+        if px[3] < HOLE_ALPHA {
+            hole_count += 1;
+            if hole_count >= needed {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Convert a [`DecodedTexture`] into a Bevy [`Image`] asset. The
