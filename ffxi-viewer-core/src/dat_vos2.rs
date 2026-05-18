@@ -304,168 +304,48 @@ pub fn process_load_vos2_requests(
     if queued.is_empty() {
         return;
     }
-    // Cache loads per (file_id, chunk_idx) — equipping a new helm on
-    // 8 nearby PCs of the same race fires 8 identical requests.
-    let mut cache: std::collections::HashMap<(u32, usize), Option<LoadedVos2>> =
+    // Per-batch caches still help: 8 nearby PCs in the same gear
+    // fire identical (file_id, chunk_idx) requests within a frame,
+    // and we don't want to re-parse the DAT or re-upload textures.
+    let mut load_cache: std::collections::HashMap<(u32, usize), Option<LoadedVos2>> =
         std::collections::HashMap::new();
-    let mut tex_pools: std::collections::HashMap<
-        u32,
-        (
-            std::collections::HashMap<String, Handle<Image>>,
-            Option<Handle<Image>>,
-        ),
-    > = std::collections::HashMap::new();
+    let mut despawned: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     for req in queued {
-        let entry = cache
-            .entry((req.file_id, req.chunk_idx))
-            .or_insert_with(|| load_vos2(req.file_id, req.chunk_idx).ok());
-        let Some(loaded) = entry.as_ref() else {
-            // Silent on per-equip-slot load failures: an Equipped look
-            // fires up to 8 requests, many slots may not have a real
-            // file (sentinel ids, beastman race extrapolation, etc.).
-            // Per-failure chat toasts drown the HUD with noise.
-            continue;
-        };
-        // Reference the unused `scene_state` to satisfy the borrow
-        // checker now that the toast path is gone.
-        let _ = &scene_state;
-        if loaded.mesh.groups.is_empty() || loaded.mesh.vertices.is_empty() {
-            // No renderable geometry — silently skip.
-            continue;
-        }
-
         let Some(&bevy_e) = tracked.by_id.get(&req.entity_id) else {
             // Wire entity gone (zoned out before the load resolved).
             continue;
         };
-        // Hide the debug capsule — same approach as MMB pipeline.
-        commands.entity(bevy_e).remove::<Mesh3d>();
-
-        // Build per-file texture pool once.
-        let pool = tex_pools.entry(req.file_id).or_insert_with(|| {
-            let mut by_name: std::collections::HashMap<String, Handle<Image>> =
-                std::collections::HashMap::with_capacity(loaded.textures.len());
-            let mut first: Option<Handle<Image>> = None;
-            for nt in &loaded.textures {
-                let handle = images.add(decoded_texture_to_image(&nt.texture));
-                if first.is_none() {
-                    first = Some(handle.clone());
-                }
-                if !nt.name.is_empty() {
-                    by_name.insert(nt.name.clone(), handle);
-                }
-            }
-            (by_name, first)
-        });
-
-        // Bind-pose bake: VOS2 vertices are authored in **bone-local
-        // space** (each vertex relative to its assigned skeleton
-        // bone), so they must be lifted to model space by
-        // `bone_world[bone_id] * local_pos` before the FFXI→Bevy
-        // axis flip. Without this step the slot meshes (head, body,
-        // legs, etc.) all pile up at the entity origin — the
-        // "crumpled" rendering we saw earlier. See [[sk2-format]].
-        //
-        // Skeleton is now race-keyed via lotus-ffxi's PCSkeletonIDs
-        // table. `baked_for_mesh` still guards against bone-id
-        // overruns (e.g., monstrosity races where we have no
-        // skeleton entry — race=29 Kuu Mohzolhil falls through to
-        // bone-local fallback).
-        let baked_owned = baked_skeleton(req.race);
-        let baked = baked_for_mesh(&loaded.mesh, baked_owned.as_ref());
-        // FFXI vertices are in left-handed (X-right, Y-forward,
-        // Z-up). Bevy is right-handed Y-up. Mirror the
-        // `scene::ffxi_to_bevy` transform: (x, y, z) → (x, -z, -y)
-        // for both positions and normals so lighting stays
-        // consistent with the surface orientation.
-        let positions: Vec<[f32; 3]> = loaded
-            .mesh
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let p = bake_position(&loaded.mesh, i, v.pos, baked);
-                [p[0], -p[2], -p[1]]
-            })
-            .collect();
-        let normals: Vec<[f32; 3]> = loaded
-            .mesh
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let n = bake_normal(&loaded.mesh, i, v.normal, baked);
-                [n[0], -n[2], -n[1]]
-            })
-            .collect();
-
-        for group in &loaded.mesh.groups {
-            if group.triangles.is_empty() {
-                continue;
-            }
-            // VertexOs2 stores UVs per-corner (per-triangle), so a
-            // single vertex may appear with multiple UVs across
-            // different groups. We approximate by taking each
-            // vertex's *first* UV-as-seen and using that for the
-            // whole vertex. Visually-imperfect on UV seams, but
-            // avoids splitting the vertex buffer — a Phase-N
-            // refactor can do proper per-corner expansion if seam
-            // artifacts become an issue.
-            let mut uvs: Vec<[f32; 2]> = vec![[0.0, 0.0]; loaded.mesh.vertices.len()];
-            let mut uv_set: Vec<bool> = vec![false; loaded.mesh.vertices.len()];
-            let mut indices: Vec<u32> = Vec::with_capacity(group.triangles.len() * 3);
-            for t in &group.triangles {
-                for c in 0..3 {
-                    let i = t.indices[c] as usize;
-                    if i < uvs.len() && !uv_set[i] {
-                        uvs[i] = t.uvs[c];
-                        uv_set[i] = true;
-                    }
-                    indices.push(t.indices[c] as u32);
-                }
-            }
-
-            let mut mesh = Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::default(),
-            );
-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone());
-            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals.clone());
-            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-            mesh.insert_indices(Indices::U32(indices));
-
-            // Texture binding: VertexOs2 group names typically look
-            // like `"tim     em_b61_3"` — the leading `"tim     "`
-            // is a fixed tag with the asset name following. Try the
-            // full name first, then fall back to the first texture.
-            let tex_handle = pool
-                .0
-                .get(&group.texture_name)
-                .cloned()
-                .or_else(|| {
-                    // Drop the `tim     ` prefix and try the rest.
-                    let trimmed = group.texture_name.trim_start_matches("tim").trim();
-                    pool.0.get(trimmed).cloned()
-                })
-                .or_else(|| pool.1.clone());
-
-            let mat = materials.add(StandardMaterial {
-                base_color: Color::WHITE,
-                base_color_texture: tex_handle,
-                perceptual_roughness: 1.0,
-                cull_mode: None,
-                ..default()
-            });
-
-            commands.spawn((
-                Vos2Overlay,
-                Mesh3d(meshes.add(mesh)),
-                MeshMaterial3d(mat),
-                Transform::default(),
-                ChildOf(bevy_e),
-            ));
+        let entry = load_cache
+            .entry((req.file_id, req.chunk_idx))
+            .or_insert_with(|| load_vos2(req.file_id, req.chunk_idx).ok());
+        let Some(loaded) = entry.as_ref() else {
+            // Silent on per-equip-slot load failures: an Equipped
+            // look fires up to 8 requests, many slots may not have a
+            // real file (sentinel ids, beastman race extrapolation,
+            // etc.). Per-failure chat toasts drown the HUD.
+            continue;
+        };
+        // `scene_state` is reserved for future per-spawn diagnostic
+        // toasts; reference it so the borrow checker is content.
+        let _ = &scene_state;
+        if loaded.mesh.groups.is_empty() || loaded.mesh.vertices.is_empty() {
+            continue;
         }
+        // Hide the debug capsule once per entity (subsequent slot
+        // requests for the same entity find it already gone).
+        if despawned.insert(req.entity_id) {
+            commands.entity(bevy_e).remove::<Mesh3d>();
+        }
+        spawn_vos2_meshes(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut images,
+            bevy_e,
+            loaded,
+            req.race,
+        );
         info!(
             "vos2 spawn: file_id={} entity_id={} verts={} groups={}",
             req.file_id,
@@ -473,10 +353,169 @@ pub fn process_load_vos2_requests(
             loaded.mesh.vertices.len(),
             loaded.mesh.groups.len(),
         );
-
-        // No per-request toast spam — Equipped looks fire 8 of these
-        // per PC, and a busy zone would drown the chat HUD.
     }
+}
+
+/// Spawn one polygon-group's worth of Bevy meshes per group, each
+/// parented to `parent`, transforming vertices through the race's
+/// bind-pose skeleton along the way. Pure data → Bevy commands; no
+/// dependency on wire events, so the launcher preview can call it
+/// directly with a hand-built `LoadedVos2`.
+///
+/// Texture handles are uploaded inline (one per `Vos2NamedTexture`).
+/// The caller carries the asset writers because they're per-Bevy-
+/// `App` and can't be globals.
+pub fn spawn_vos2_meshes(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    parent: Entity,
+    loaded: &LoadedVos2,
+    race: u8,
+) {
+    // Build per-file texture pool. Reuses the lotus-ffxi VOS2
+    // convention that group names like `"tim     em_b61_3"` use the
+    // `tim ` prefix to flag a texture-name slot.
+    let mut by_name: std::collections::HashMap<String, Handle<Image>> =
+        std::collections::HashMap::with_capacity(loaded.textures.len());
+    let mut first: Option<Handle<Image>> = None;
+    for nt in &loaded.textures {
+        let handle = images.add(decoded_texture_to_image(&nt.texture));
+        if first.is_none() {
+            first = Some(handle.clone());
+        }
+        if !nt.name.is_empty() {
+            by_name.insert(nt.name.clone(), handle);
+        }
+    }
+
+    // Bind-pose bake: lift bone-local vertices to model space via
+    // `bone_world[bone_id] * local_pos` before the FFXI→Bevy axis
+    // flip. `baked_for_mesh` returns None when the skeleton doesn't
+    // fit (race mismatch or monstrosity race), in which case the
+    // helpers fall back to local-space rendering — the pre-bake
+    // behavior, small and contained at the entity origin.
+    let baked_owned = baked_skeleton(race);
+    let baked = baked_for_mesh(&loaded.mesh, baked_owned.as_ref());
+    let positions: Vec<[f32; 3]> = loaded
+        .mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let p = bake_position(&loaded.mesh, i, v.pos, baked);
+            [p[0], -p[2], -p[1]]
+        })
+        .collect();
+    let normals: Vec<[f32; 3]> = loaded
+        .mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let n = bake_normal(&loaded.mesh, i, v.normal, baked);
+            [n[0], -n[2], -n[1]]
+        })
+        .collect();
+
+    for group in &loaded.mesh.groups {
+        if group.triangles.is_empty() {
+            continue;
+        }
+        // VertexOs2 stores UVs per-corner; a single vertex may
+        // appear with multiple UVs across groups. We approximate by
+        // taking each vertex's *first* UV-as-seen — visually
+        // imperfect on seams but avoids splitting the vertex buffer.
+        let mut uvs: Vec<[f32; 2]> = vec![[0.0, 0.0]; loaded.mesh.vertices.len()];
+        let mut uv_set: Vec<bool> = vec![false; loaded.mesh.vertices.len()];
+        let mut indices: Vec<u32> = Vec::with_capacity(group.triangles.len() * 3);
+        for t in &group.triangles {
+            for c in 0..3 {
+                let i = t.indices[c] as usize;
+                if i < uvs.len() && !uv_set[i] {
+                    uvs[i] = t.uvs[c];
+                    uv_set[i] = true;
+                }
+                indices.push(t.indices[c] as u32);
+            }
+        }
+
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals.clone());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+        mesh.insert_indices(Indices::U32(indices));
+
+        let tex_handle = by_name
+            .get(&group.texture_name)
+            .cloned()
+            .or_else(|| {
+                let trimmed = group.texture_name.trim_start_matches("tim").trim();
+                by_name.get(trimmed).cloned()
+            })
+            .or_else(|| first.clone());
+
+        let mat = materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            base_color_texture: tex_handle,
+            perceptual_roughness: 1.0,
+            cull_mode: None,
+            ..default()
+        });
+
+        commands.spawn((
+            Vos2Overlay,
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(mat),
+            Transform::default(),
+            ChildOf(parent),
+        ));
+    }
+}
+
+/// Compose: resolve each of the 8 equipment slots to a DAT file via
+/// the equipment formula, load each VOS2 chunk, and spawn it under
+/// `parent` with the race's bind-pose skeleton applied. Slots set
+/// to `0`-id sentinels are silently skipped (no item equipped).
+///
+/// Returns the number of slots that actually produced geometry —
+/// the launcher can use this to decide whether to fall back to a
+/// placeholder when the spawn was a total miss.
+pub fn spawn_equipped(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    parent: Entity,
+    race: u8,
+    head: u16,
+    body: u16,
+    hands: u16,
+    legs: u16,
+    feet: u16,
+    main: u16,
+    sub: u16,
+    ranged: u16,
+) -> usize {
+    use crate::look_resolver::resolve_equipment_slot;
+    let slots = [head, body, hands, legs, feet, main, sub, ranged];
+    let mut spawned = 0usize;
+    for slot_id in slots {
+        let Some(file_id) = resolve_equipment_slot(slot_id, race) else {
+            continue;
+        };
+        let Ok(loaded) = load_vos2(file_id, 4) else { continue };
+        if loaded.mesh.groups.is_empty() || loaded.mesh.vertices.is_empty() {
+            continue;
+        }
+        spawn_vos2_meshes(commands, meshes, materials, images, parent, &loaded, race);
+        spawned += 1;
+    }
+    spawned
 }
 
 fn push_system_msg(scene_state: &mut SceneState, text: String) {
