@@ -1013,25 +1013,30 @@ fn spawn_vos2_meshes_with_skeleton(
                 ..default()
             });
 
-            // Rotate -90° around X so the bake's Bevy +Z (which the
-            // extent log shows is the character's head-to-feet
-            // dimension, ranging 0..1.59 yalms) becomes Bevy +Y
-            // (Bevy's up axis). The bake's output is consistent
-            // across all OS2 slots — they all stack along +Z — so
-            // applying this on each child mesh stands the whole rig
-            // upright with bone-relative spacing preserved.
+            // Two-axis correction from FFXI bind to Bevy convention:
+            //   1. Rotate -90° around X so the bake's Bevy +Z
+            //      (head-to-feet, per the extent-log diagnostic)
+            //      becomes Bevy +Y (Bevy's up axis).
+            //   2. Then rotate 180° around Y so the character's
+            //      forward direction (which ends up at Bevy +Z
+            //      after the X rotation) flips to Bevy -Z, matching
+            //      Bevy's right-handed forward convention.
             //
-            // We keep it on the child Transform (not the parent)
-            // because the parent (WorldEntity) carries the wire's
-            // heading rotation around Y, and composing
-            // child(R_x(-π/2)) → parent(R_y(heading)) → world keeps
-            // the character upright while still letting heading
-            // spin them around the vertical axis.
+            // Composed in Quat multiplication order: outermost (Y)
+            // applies last. So `Q_y(π) * Q_x(-π/2)` means "first
+            // stand the character up, then yaw 180°."
+            //
+            // Heading rotation on the parent (around Y) composes on
+            // top of this; the character can still face any compass
+            // direction the wire heading dictates, with this fixed
+            // pair as the at-rest baseline.
+            let bind_to_bevy = Quat::from_rotation_y(std::f32::consts::PI)
+                * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
             commands.spawn((
                 Vos2Overlay,
                 Mesh3d(meshes.add(mesh)),
                 MeshMaterial3d(mat),
-                Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+                Transform::from_rotation(bind_to_bevy),
                 ChildOf(parent),
             ));
         };
