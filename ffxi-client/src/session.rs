@@ -798,10 +798,13 @@ fn handle_sub_packet(
             // an extra hint; a follow-up can plumb it in if needed.
         }
         op if op == s2c::BATTLE2 => {
-            // Heavily bitpacked combat-action stream — see header note.
-            // Listed explicitly so the diagnostic dispatcher doesn't log
-            // it as "unknown opcode" once per action frame; intentionally
-            // a no-op until we ship a bitstream decoder.
+            // Bitpacked combat-action stream. One packet can carry
+            // multiple targets and multiple results per target — fan
+            // them out into individual chat lines so each hit/miss/
+            // damage event lands separately in Chat 2.
+            for line in decode_battle2_action(sub.data, name_cache) {
+                let _ = event_tx.send(AgentEvent::ChatLine { line });
+            }
         }
         op if op == s2c::MUSIC => {
             // 0x05F `GP_SERV_COMMAND_MUSIC` — 4-byte body:
@@ -1942,7 +1945,8 @@ fn decode_battle_message(
     let raw = ffxi_proto::msg_basic::lookup(message_num)?;
     let cas_name = name_for_id(cas_id, name_cache);
     let tar_name = name_for_id(tar_id, name_cache);
-    let text = substitute_battle_placeholders(raw, &cas_name, &tar_name, data1, data2, message_num);
+    let text =
+        substitute_battle_placeholders(raw, &cas_name, &tar_name, data1, data2, message_num, None);
     Some(ChatLine {
         channel: ChatChannel::Battle,
         // Use the actor's name as the sender so the chat row reads
@@ -1954,6 +1958,200 @@ fn decode_battle_message(
             tar_name
         } else {
             cas_name
+        },
+        text,
+        server_ts: 0,
+    })
+}
+
+/// Minimal big-endian bit reader over a `&[u8]`. The 0x028 action
+/// stream packs every field at arbitrary bit widths (3/4/5/6/10/12/
+/// 14/17/31/32), and the high bit of each field lands in the most
+/// significant unread bit of the current byte. `read(n)` returns up
+/// to 32 bits at a time; the cursor is byte-and-bit at all times so
+/// we can stay aligned across the conditional sub-blocks.
+///
+/// Transliterated from `vendor/server/src/map/packets/s2c/0x028_battle2.cpp::
+/// unpack`. Errors surface as `None` when the underlying buffer
+/// would underflow — the caller drops the rest of the action rather
+/// than fabricate a partial chat line.
+struct BattleBitReader<'a> {
+    data: &'a [u8],
+    pos: usize, // bit position
+}
+
+impl<'a> BattleBitReader<'a> {
+    fn new(data: &'a [u8], start_bit: usize) -> Self {
+        Self { data, pos: start_bit }
+    }
+
+    fn read(&mut self, bits: u32) -> Option<u64> {
+        debug_assert!(bits <= 32);
+        let mut value: u64 = 0;
+        for i in 0..bits {
+            let bit_pos = self.pos;
+            let byte_idx = bit_pos / 8;
+            let bit_in_byte = 7 - (bit_pos % 8); // big-endian
+            let byte = *self.data.get(byte_idx)?;
+            let bit = ((byte >> bit_in_byte) & 1) as u64;
+            value |= bit << (bits - 1 - i);
+            self.pos += 1;
+        }
+        Some(value)
+    }
+}
+
+/// Decode a `GP_SERV_COMMAND_BATTLE2` (0x028) body into a stream of
+/// chat lines — one per `result` carried by the action. The wire
+/// format is bitpacked BE; the header is at bits 40.. (after a 5-byte
+/// LSB header field). Variable structure: up to 15 targets × 8
+/// results each, plus per-result optional `proc` and `react`
+/// sub-blocks that have to be skipped (not just ignored) to keep the
+/// bit cursor aligned for the next target.
+///
+/// Returns an empty Vec if the body is too short or the bit cursor
+/// underflows mid-decode. Returns a partial list if mid-stream
+/// truncation hits after some results were already emitted — the
+/// partial ones are valid.
+fn decode_battle2_action(
+    data: &[u8],
+    name_cache: &std::collections::HashMap<u32, String>,
+) -> Vec<ChatLine> {
+    let mut out: Vec<ChatLine> = Vec::new();
+    // unpack() skips 5 bytes (header + workSize) before the bit stream.
+    let mut br = BattleBitReader::new(data, 40);
+
+    let actor_id = match br.read(32) {
+        Some(v) => v as u32,
+        None => return out,
+    };
+    let trg_sum = br.read(6).unwrap_or(0) as usize;
+    let _res_sum = br.read(4); // unused by client (always 0)
+    let _cmd_no = br.read(4); // command type (4 = spell, 6 = ability, etc.)
+    let cmd_arg = match br.read(32) {
+        Some(v) => v as u32,
+        None => return out,
+    };
+    let _info = br.read(32); // recast etc.
+
+    let cas_name = name_for_id(actor_id, name_cache);
+
+    for _t in 0..trg_sum.min(15) {
+        let Some(target_id) = br.read(32) else { return out };
+        let result_sum = br.read(4).unwrap_or(0) as usize;
+        let tar_name = name_for_id(target_id as u32, name_cache);
+
+        for _r in 0..result_sum.min(8) {
+            // Core result fields. Layout from `unpack`:
+            //   miss/resolution: 3 bits
+            //   kind: 2
+            //   sub_kind (animation): 12
+            //   info: 5
+            //   scale: 5  (hitDistortion 2 + knockback 3)
+            //   value (damage/heal amount): 17
+            //   message: 10
+            //   bit (modifier): 31
+            let _miss = br.read(3);
+            let _kind = br.read(2);
+            let _sub_kind = br.read(12);
+            let _info = br.read(5);
+            let _scale = br.read(5);
+            let value = br.read(17).unwrap_or(0) as u32;
+            let message_num = br.read(10).unwrap_or(0) as u16;
+            let _modifier = br.read(31);
+
+            let has_proc = br.read(1).unwrap_or(0) != 0;
+            let mut proc_message: u16 = 0;
+            let mut proc_value: u32 = 0;
+            if has_proc {
+                let _proc_kind = br.read(6);
+                let _proc_info = br.read(4);
+                proc_value = br.read(17).unwrap_or(0) as u32;
+                proc_message = br.read(10).unwrap_or(0) as u16;
+            }
+
+            let has_react = br.read(1).unwrap_or(0) != 0;
+            let mut react_message: u16 = 0;
+            let mut react_value: u32 = 0;
+            if has_react {
+                let _react_kind = br.read(6);
+                let _react_info = br.read(4);
+                react_value = br.read(14).unwrap_or(0) as u32;
+                react_message = br.read(10).unwrap_or(0) as u16;
+            }
+
+            // Headline result. message_num=0 means "no message" — common
+            // for purely-cosmetic animation results (e.g., the cast-
+            // animation half of a spell that also carries a damage
+            // result in a sibling slot). Drop those.
+            if message_num != 0 {
+                if let Some(line) = build_battle2_line(
+                    message_num,
+                    &cas_name,
+                    &tar_name,
+                    value,
+                    cmd_arg,
+                ) {
+                    out.push(line);
+                }
+            }
+            // Additional-effect line (proc): "Additional effect: ..."
+            // Usually packed with its own messageID like 163.
+            if has_proc && proc_message != 0 {
+                if let Some(line) = build_battle2_line(
+                    proc_message,
+                    &cas_name,
+                    &tar_name,
+                    proc_value,
+                    cmd_arg,
+                ) {
+                    out.push(line);
+                }
+            }
+            // Reaction line (spikes/parry/etc.).
+            if has_react && react_message != 0 {
+                if let Some(line) = build_battle2_line(
+                    react_message,
+                    &cas_name,
+                    &tar_name,
+                    react_value,
+                    cmd_arg,
+                ) {
+                    out.push(line);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Build a single `ChatLine` from a 0x028 result triple. Returns
+/// `None` if the message id isn't in `msg_basic` (rare ids live in
+/// tables we don't ship yet — same fallback as `decode_battle_message`).
+fn build_battle2_line(
+    message_num: u16,
+    cas_name: &str,
+    tar_name: &str,
+    amount: u32,
+    action_id: u32,
+) -> Option<ChatLine> {
+    let raw = ffxi_proto::msg_basic::lookup(message_num)?;
+    let text = substitute_battle_placeholders(
+        raw,
+        cas_name,
+        tar_name,
+        amount,
+        0,
+        message_num,
+        Some(action_id),
+    );
+    Some(ChatLine {
+        channel: ChatChannel::Battle,
+        sender: if subject_is_tar(message_num) {
+            tar_name.to_string()
+        } else {
+            cas_name.to_string()
         },
         text,
         server_ts: 0,
@@ -2010,6 +2208,7 @@ fn substitute_battle_placeholders(
     data1: u32,
     data2: u32,
     message_num: u16,
+    action_id: Option<u32>,
 ) -> String {
     let mut s = raw.to_string();
     // `<entity>` is the grammatical subject — same wire slot as `<user>`
@@ -2044,9 +2243,12 @@ fn substitute_battle_placeholders(
     // render with literal `<spell>` / `<ability>` in the chat panel,
     // which is the more confusing failure mode — a numeric id at
     // least tells the operator *which* spell or ability the message
-    // refers to. Source ids are typically packed into `data1` (per
-    // Phoenix call sites; e.g. `MsgBasic::MagicDamage` passes
-    // `SpellID` as the first 32-bit data slot).
+    // refers to. The 0x028 action stream supplies the spell/ability
+    // id via `action_id` (cmd_arg) at the action level — that's the
+    // canonical source. Without `action_id` (the 0x029 path) we fall
+    // back to `data1`, which is what Phoenix call sites traditionally
+    // pack the spell/ability id into for `BATTLE_MESSAGE`.
+    let resolved_action_id = action_id.unwrap_or(data1);
     for (tag, label) in [
         ("<spell>", "spell"),
         ("<ability>", "ability"),
@@ -2055,7 +2257,7 @@ fn substitute_battle_placeholders(
         ("<job>", "job"),
     ] {
         if s.contains(tag) {
-            s = s.replace(tag, &format!("{label} #{}", data1));
+            s = s.replace(tag, &format!("{label} #{resolved_action_id}"));
         }
     }
     // Bare `X` / `#` are msg_basic.h's shorthand for inline numbers
@@ -3203,6 +3405,7 @@ mod tests {
             0,
             7,
             38,
+            None,
         );
         assert!(s.contains("rises 7 points"), "got: {s}");
         assert!(s.contains("BoXing"), "within-word X must survive, got: {s}");
@@ -3255,6 +3458,155 @@ mod tests {
             "expected '<entity>' → Daisy, got: {}",
             line.text
         );
+    }
+
+    /// Test helper: BE bit writer mirroring LSB's `packBitsBE`. Starts
+    /// writing at bit offset `start_bit` so a caller can build a real
+    /// 0x028 body (5 byte header + bit stream) by passing `40`.
+    struct BattleBitWriter {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl BattleBitWriter {
+        fn new(start_bit: usize) -> Self {
+            // 1 KB is plenty for a few targets × few results.
+            Self { data: vec![0u8; 1024], pos: start_bit }
+        }
+        fn write(&mut self, value: u64, bits: u32) {
+            for i in 0..bits {
+                let bit = (value >> (bits - 1 - i)) & 1;
+                let byte_idx = self.pos / 8;
+                let bit_in_byte = 7 - (self.pos % 8);
+                self.data[byte_idx] |= (bit as u8) << bit_in_byte;
+                self.pos += 1;
+            }
+        }
+        fn into_bytes(self) -> Vec<u8> {
+            let used = (self.pos + 7) / 8;
+            self.data[..used].to_vec()
+        }
+    }
+
+    #[test]
+    fn battle2_single_hit_emits_damage_line() {
+        // One target, one result: AttackHits (msg id 1), 42 damage.
+        // The decoder must emit one ChatLine reading
+        //   "Daisy hits Mandragora for 42 points of damage."
+        use std::collections::HashMap;
+        let mut w = BattleBitWriter::new(40);
+        w.write(0xCAFEu64, 32); // actor_id (caster)
+        w.write(1, 6); // trg_sum = 1
+        w.write(0, 4); // res_sum (unused)
+        w.write(0, 4); // cmd_no
+        w.write(0, 32); // cmd_arg
+        w.write(0, 32); // info
+        // Target 0:
+        w.write(0xBEEFu64, 32); // target_id
+        w.write(1, 4); // result_sum = 1
+        // Result 0:
+        w.write(0, 3); // miss/resolution
+        w.write(0, 2); // kind
+        w.write(0, 12); // sub_kind (animation)
+        w.write(0, 5); // info
+        w.write(0, 5); // scale
+        w.write(42, 17); // value (damage)
+        w.write(1, 10); // message = AttackHits
+        w.write(0, 31); // modifier
+        w.write(0, 1); // has_proc = false
+        w.write(0, 1); // has_react = false
+
+        let data = w.into_bytes();
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        cache.insert(0xBEEFu32, "Mandragora".to_string());
+
+        let lines = decode_battle2_action(&data, &cache);
+        assert_eq!(lines.len(), 1, "expected one line, got: {:?}", lines);
+        let l = &lines[0];
+        assert_eq!(l.channel, ChatChannel::Battle);
+        assert!(
+            l.text.contains("Daisy")
+                && l.text.contains("Mandragora")
+                && l.text.contains("42"),
+            "expected damage line, got: {}",
+            l.text
+        );
+    }
+
+    #[test]
+    fn battle2_magic_damage_substitutes_spell_from_cmd_arg() {
+        // MagicDamage (msg 2): "<caster> casts <spell>. <target> takes
+        // <amount> points of damage." cmd_arg = SpellID = 144 (Fire),
+        // result.value = 87 damage. The decoder must thread cmd_arg
+        // through `substitute_battle_placeholders` as the action_id
+        // so `<spell>` renders as "spell #144".
+        use std::collections::HashMap;
+        let mut w = BattleBitWriter::new(40);
+        w.write(0xCAFE, 32);
+        w.write(1, 6); // trg_sum
+        w.write(0, 4); // res_sum
+        w.write(4, 4); // cmd_no = spell
+        w.write(144, 32); // cmd_arg = SpellID
+        w.write(0, 32);
+        w.write(0xBEEF, 32);
+        w.write(1, 4);
+        w.write(0, 3);
+        w.write(0, 2);
+        w.write(0, 12);
+        w.write(0, 5);
+        w.write(0, 5);
+        w.write(87, 17); // damage
+        w.write(2, 10); // message = MagicDamage
+        w.write(0, 31);
+        w.write(0, 1);
+        w.write(0, 1);
+
+        let data = w.into_bytes();
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        cache.insert(0xBEEFu32, "Mandragora".to_string());
+
+        let lines = decode_battle2_action(&data, &cache);
+        assert_eq!(lines.len(), 1);
+        let l = &lines[0];
+        assert!(
+            l.text.contains("Daisy")
+                && l.text.contains("spell #144")
+                && l.text.contains("87"),
+            "expected casts/spell/amount, got: {}",
+            l.text
+        );
+    }
+
+    #[test]
+    fn battle2_drops_results_with_zero_message_id() {
+        // A result with message_num=0 means "no message" (animation-
+        // only frame). Must NOT emit a chat line — would render as a
+        // blank or wrong-template row otherwise.
+        use std::collections::HashMap;
+        let mut w = BattleBitWriter::new(40);
+        w.write(0xCAFE, 32);
+        w.write(1, 6);
+        w.write(0, 4);
+        w.write(0, 4);
+        w.write(0, 32);
+        w.write(0, 32);
+        w.write(0xBEEF, 32);
+        w.write(1, 4);
+        w.write(0, 3);
+        w.write(0, 2);
+        w.write(0, 12);
+        w.write(0, 5);
+        w.write(0, 5);
+        w.write(0, 17);
+        w.write(0, 10); // message = 0 (none)
+        w.write(0, 31);
+        w.write(0, 1);
+        w.write(0, 1);
+        let data = w.into_bytes();
+        let lines = decode_battle2_action(&data, &HashMap::new());
+        assert!(lines.is_empty(), "expected drop, got: {:?}", lines);
     }
 
     #[test]
