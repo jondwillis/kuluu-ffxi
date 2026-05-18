@@ -299,47 +299,18 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
     })
 }
 
-/// True if the texture has authored cutout holes — i.e. at least 1%
-/// of pixels are near-zero alpha. Picks `AlphaMode::Mask(0.5)` for
-/// these; leaves DXT3 textures with the typical "all 255s plus a
-/// few compression-noise dips to 240-something" as opaque.
-///
-/// Why both thresholds:
-/// * Per-pixel α < 16 catches *intent* — the artist authored a
-///   hole. DXT3 compression artifacts usually keep α in the
-///   200–254 range, so they fail this check.
-/// * The 1% count threshold catches *frequency* — even if a single
-///   stray 0-alpha pixel exists (decoder quirk, salt-and-pepper
-///   noise), one pixel out of 65k shouldn't switch the entire
-///   surface to cutout. Real cutout textures (tree leaves, fence
-///   slats) have large transparent regions, easily >1% of pixels.
-///
-/// Without the per-pixel threshold, ground/wall textures whose
-/// alpha channel decodes to a noisy 240-254 range get classified
-/// as cutout, then `Mask(0.5)` discards every texel because the
-/// 0..255 → 0..1 mapping puts most alphas just under 0.5. Visible
-/// symptom: terrain disappears, leaving holes through to the
-/// clear color (the "ground is gone, only trees visible" bug).
-fn texture_has_transparent_pixels(tex: &DecodedTexture) -> bool {
-    const HOLE_ALPHA: u8 = 16; // pixel α below this counts as a hole
-    const HOLE_FRACTION: f32 = 0.01; // 1% of pixels must be holes
-
-    let total = tex.rgba.len() / 4;
-    if total == 0 {
-        return false;
-    }
-    let needed = ((total as f32) * HOLE_FRACTION).ceil() as usize;
-    let mut hole_count = 0usize;
-    for px in tex.rgba.chunks_exact(4) {
-        if px[3] < HOLE_ALPHA {
-            hole_count += 1;
-            if hole_count >= needed {
-                return true;
-            }
-        }
-    }
-    false
-}
+// Texture-alpha probing was tried (two iterations: `any α<255`, then
+// `≥1% pixels with α<16`) but produced visible dithered-checkerboard
+// rendering on FFXI ground and tree textures. The likely reason:
+// FFXI's DXT3/palette8 alpha channel doesn't always encode opacity.
+// Some textures appear to store ~128 ("half-bright") alpha values as
+// a brightness/lighting modulation factor, which the AlphaMode::Mask
+// pipeline then thresholds into a checkerboard pattern. Lotus
+// (mmb.cppm:501) makes no per-texture probe and gates transparency
+// strictly on `blending & 0x8000`; we now do the same for parity.
+// Trees may render with rectangular leaf billboards as a result —
+// that's the correct lotus-parity baseline; revisit if/when we
+// understand FFXI's actual texture-alpha convention.
 
 /// Convert a [`DecodedTexture`] into a Bevy [`Image`] asset. The
 /// texture decoder produces top-mip RGBA8 already; we just wrap it in
@@ -418,16 +389,13 @@ pub fn process_load_mmb_requests(
         std::collections::HashMap::new();
     // Cache image handles per file_id (each IMG chunk in a DAT is
     // shared across all MMBs from that file).
-    // Per-DAT pool: name → (image handle, has_alpha bit). The
-    // has_alpha bit is set by `texture_has_transparent_pixels` at
-    // decode time and drives the AlphaMode picker at material build
-    // (opaque vs cutout). Both halves of the tuple are cloned by
-    // value at lookup; `Handle<Image>` is a cheap arc-rc.
+    // Per-DAT pool: name → image handle, plus a first-IMG fallback
+    // for submeshes whose texture name doesn't appear in the pool.
     let mut tex_pools: std::collections::HashMap<
         u32,
         (
-            std::collections::HashMap<String, (Handle<Image>, bool)>,
-            Option<(Handle<Image>, bool)>,
+            std::collections::HashMap<String, Handle<Image>>,
+            Option<Handle<Image>>,
         ),
     > = std::collections::HashMap::new();
 
@@ -467,27 +435,16 @@ pub fn process_load_mmb_requests(
         let texture_count = loaded.textures.len();
         let pool_is_new = !tex_pools.contains_key(&req.file_id);
         let pool = tex_pools.entry(req.file_id).or_insert_with(|| {
-            // Per-handle map of `name → (handle, has_alpha)`. The
-            // has_alpha bit is computed once at texture-decode time —
-            // scan the RGBA buffer for any A < 255. Cheap (linear,
-            // aborts on first hit) and lets the material picker
-            // choose `AlphaMode::Mask(0.5)` only for textures that
-            // actually carry cutout, leaving the rest fully opaque.
-            // Without this, ground/walls render see-through because
-            // their fully-opaque DXT3/A1 textures still go through
-            // the alpha-test pipeline.
-            let mut by_name: std::collections::HashMap<String, (Handle<Image>, bool)> =
+            let mut by_name: std::collections::HashMap<String, Handle<Image>> =
                 std::collections::HashMap::with_capacity(texture_count);
-            let mut first: Option<(Handle<Image>, bool)> = None;
+            let mut first: Option<Handle<Image>> = None;
             for nt in &loaded.textures {
-                let has_alpha = texture_has_transparent_pixels(&nt.texture);
                 let handle = images.add(decoded_texture_to_image(&nt.texture));
-                let entry = (handle.clone(), has_alpha);
                 if first.is_none() {
-                    first = Some(entry.clone());
+                    first = Some(handle.clone());
                 }
                 if !nt.name.is_empty() {
-                    by_name.insert(nt.name.clone(), entry);
+                    by_name.insert(nt.name.clone(), handle);
                 }
             }
             (by_name, first)
@@ -598,35 +555,26 @@ pub fn process_load_mmb_requests(
             mesh.insert_indices(Indices::U32(sub.indices.clone()));
 
             let variant_trimmed = sub.variant_name.trim();
-            let resolved = tex_by_name
+            let sub_texture = tex_by_name
                 .get(variant_trimmed)
                 .cloned()
                 .or_else(|| first_texture.clone());
-            let (sub_texture, tex_has_alpha) = match resolved {
-                Some((h, a)) => (Some(h), a),
-                None => (None, false),
-            };
 
-            // Alpha mode picks one of three rendering paths:
+            // Alpha mode (lotus parity, mmb.cppm:501):
+            //   blending & 0x8000 → AlphaMode::Blend (true sorted
+            //     transparency — glass/water/effects)
+            //   otherwise         → AlphaMode::Opaque (default)
             //
-            // 1. `blending & 0x8000` → `AlphaMode::Blend` (lotus parity,
-            //    mmb.cppm:501 — sorted transparency for glass/water).
-            // 2. Texture has any α<255 → `AlphaMode::Mask(0.5)` (alpha
-            //    cutout for tree leaves, fence slats, anything with
-            //    RGBA holes baked in).
-            // 3. Otherwise → `AlphaMode::Opaque` (the default — most
-            //    walls/floors/terrain).
-            //
-            // The texture-alpha probe is the discriminator that
-            // distinguishes opaque-but-RGBA textures (have an alpha
-            // channel but all values 255) from real cutout textures.
-            // Lotus picks the same blend pipeline for both because it
-            // only has two pipelines; we can do strictly better by
-            // looking at the actual data.
+            // We previously also tried texture-alpha probes to enable
+            // alpha-cutout for tree leaves. Two iterations both
+            // produced dithered-checkerboard rendering on terrain;
+            // FFXI textures appear to store ~128 alpha values as a
+            // brightness modulation, not as opacity, so the Mask
+            // pipeline misinterprets them. Lotus does no probing and
+            // accepts opaque-rectangle trees as a result; we mirror
+            // that until we understand FFXI's actual alpha encoding.
             let alpha_mode = if (sub.blending & 0x8000) != 0 {
                 AlphaMode::Blend
-            } else if tex_has_alpha {
-                AlphaMode::Mask(0.5)
             } else {
                 AlphaMode::Opaque
             };
