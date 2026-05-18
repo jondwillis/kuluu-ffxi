@@ -1013,11 +1013,25 @@ fn spawn_vos2_meshes_with_skeleton(
                 ..default()
             });
 
+            // Rotate -90° around X so the bake's Bevy +Z (which the
+            // extent log shows is the character's head-to-feet
+            // dimension, ranging 0..1.59 yalms) becomes Bevy +Y
+            // (Bevy's up axis). The bake's output is consistent
+            // across all OS2 slots — they all stack along +Z — so
+            // applying this on each child mesh stands the whole rig
+            // upright with bone-relative spacing preserved.
+            //
+            // We keep it on the child Transform (not the parent)
+            // because the parent (WorldEntity) carries the wire's
+            // heading rotation around Y, and composing
+            // child(R_x(-π/2)) → parent(R_y(heading)) → world keeps
+            // the character upright while still letting heading
+            // spin them around the vertical axis.
             commands.spawn((
                 Vos2Overlay,
                 Mesh3d(meshes.add(mesh)),
                 MeshMaterial3d(mat),
-                Transform::default(),
+                Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
                 ChildOf(parent),
             ));
         };
