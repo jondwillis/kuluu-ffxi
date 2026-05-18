@@ -183,9 +183,12 @@ pub(super) fn refresh_preview_on_cursor_change(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    if !cursor.is_changed() {
-        return;
-    }
+    // No `cursor.is_changed()` gate here. Hover-driven cursor updates
+    // (from the click/hover handler) should also force a refresh; the
+    // `new_id == previewed.char_id` check below is the actual
+    // de-duplicator so the work is bounded to one rebuild per
+    // distinct selection regardless of how many frames the cursor
+    // sits on a given row.
     let active = active_slot(&chars, &cursor);
     let new_id = active.map(|s| s.char_id);
     if new_id == previewed.char_id {

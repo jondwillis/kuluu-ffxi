@@ -883,6 +883,19 @@ fn spawn_vos2_meshes_with_skeleton(
     // back to local-space rendering — the pre-bake behavior, small
     // and contained at the entity origin.
     let baked = baked_for_mesh(&loaded.mesh, baked_owned);
+    // FFXI → Bevy axis convention is `(x, y, z) → (x, z, -y)` — same as
+    // the documented `ffxi_to_bevy(p) = Vec3(p.x, p.z, -p.y)` used for
+    // wire positions everywhere else. After `unroll_root_rotation` the
+    // post-bake vertex is in FFXI Z-up space, so:
+    //   bevy_x = p[0]   (right matches right)
+    //   bevy_y = p[2]   (FFXI Z up → Bevy Y up)
+    //   bevy_z = -p[1]  (FFXI Y forward → Bevy Z back)
+    //
+    // An earlier revision used `-p[2]` for Bevy Y, which planted
+    // characters head-down. Launcher previews happened to read as
+    // "weirdly stretched but plausibly upright" because the preview
+    // camera looks nearly horizontally; the chase-cam in-zone exposes
+    // the inversion the moment the player moves.
     let positions: Vec<[f32; 3]> = loaded
         .mesh
         .vertices
@@ -890,7 +903,7 @@ fn spawn_vos2_meshes_with_skeleton(
         .enumerate()
         .map(|(i, v)| {
             let p = bake_position(&loaded.mesh, i, v.pos, baked);
-            [p[0], -p[2], -p[1]]
+            [p[0], p[2], -p[1]]
         })
         .collect();
     let normals: Vec<[f32; 3]> = loaded
@@ -900,7 +913,7 @@ fn spawn_vos2_meshes_with_skeleton(
         .enumerate()
         .map(|(i, v)| {
             let n = bake_normal(&loaded.mesh, i, v.normal, baked);
-            [n[0], -n[2], -n[1]]
+            [n[0], n[2], -n[1]]
         })
         .collect();
 
