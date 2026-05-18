@@ -122,6 +122,12 @@ impl Plugin for DatOverlayPlugin {
                 (
                     crate::dat_mzb::cull_entities_by_distance,
                     crate::dat_mzb::apply_zone_geom_visibility,
+                    // GPU-skinned NPC actor tick: writes each bone
+                    // entity's Transform from the current MO2 frame.
+                    // Bevy's skinning shader reads the resulting
+                    // GlobalTransforms and deforms vertices on the
+                    // GPU; no per-frame mesh-attribute mutation.
+                    crate::dat_vos2::tick_skinned_actors,
                 ),
             );
         // Phase 1 `cull_mzb_by_distance` was removed: Phase 3 merged

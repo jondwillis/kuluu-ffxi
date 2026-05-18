@@ -22,6 +22,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::Image;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use ffxi_dat::bone::{self, Skeleton};
 use ffxi_dat::texture::{decode_texture, DecodedTexture};
@@ -31,33 +32,27 @@ use ffxi_dat::{walk, ChunkKind, DatRoot};
 use crate::scene::TrackedEntities;
 use crate::snapshot::SceneState;
 
-/// Parent-side animation state for an NPC actor. Inserted at spawn
-/// time alongside the existing `EntityModel` marker; the per-frame
-/// tick system reads it to compute the current MO2 frame.
-#[derive(Component, Debug, Clone, Copy)]
-pub struct ActorAnim {
-    /// Actor DAT id — keys into `BAKED_SKELETONS` + `IDLE_ANIMS`.
+/// Parent-side actor state for an NPC rendered via Bevy `SkinnedMesh`.
+/// One bone-entity is created per skeleton bone; each holds a `Transform`
+/// that the tick system mutates every frame from the current MO2
+/// keyframe. Bevy walks the bone-entity hierarchy to compose
+/// `GlobalTransform`s; the skinning shader reads those + the per-mesh
+/// `SkinnedMeshInverseBindposes` to deform vertices on the GPU.
+///
+/// One `SkinnedActor` per visible NPC. The actor's multiple OS2 chunks
+/// (body parts) all share the same `bone_entities` — only one bone tree
+/// is built per entity, regardless of how many `LoadVos2Request`s the
+/// dispatcher fires for it.
+#[derive(Component, Debug)]
+pub struct SkinnedActor {
+    /// Actor DAT id. Keys the per-frame tick into `BAKED_SKELETONS` +
+    /// `IDLE_ANIMS` so we can recompose the bone transforms from the
+    /// current MO2 frame.
     pub dat_id: u32,
-    /// Spawn time in `Time::elapsed_secs`. `frame_idx = ((now - start)
-    /// / anim.speed) % anim.frames`.
-    pub start_time_secs: f32,
-}
-
-/// Per-child-mesh data the tick system needs to recompute positions
-/// each frame. Stored on every entity spawned by
-/// `spawn_vos2_meshes_with_skeleton` for an animated actor.
-#[derive(Component)]
-pub struct ActorMeshBinding {
-    /// Shared per-actor parsed mesh. `Arc` because each polygon group
-    /// + each mirror copy gets its own child entity but they all read
-    /// from the same vertex pool.
-    pub vos2: std::sync::Arc<Vos2Mesh>,
-    /// The Bevy mesh handle this child renders. Mutated in place each
-    /// frame to update ATTRIBUTE_POSITION (and optionally NORMAL).
-    pub mesh_handle: Handle<Mesh>,
-    /// True if this is the X-mirrored copy (skinning is the same
-    /// math, just flip x on the final result).
-    pub mirror: bool,
+    /// One Bevy entity per skeleton bone. Length = skeleton.bones.len().
+    /// Each bone entity carries a `Transform`; the tick system writes
+    /// the animated local transform every frame.
+    pub bone_entities: Vec<Entity>,
 }
 
 /// Marker component for VertexOs2-spawned meshes — parallel to
@@ -446,6 +441,7 @@ pub fn process_load_vos2_requests(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut inverse_bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut scene_state: ResMut<SceneState>,
     tracked: Res<TrackedEntities>,
 ) {
@@ -459,6 +455,12 @@ pub fn process_load_vos2_requests(
     let mut load_cache: std::collections::HashMap<(u32, usize), Option<LoadedVos2>> =
         std::collections::HashMap::new();
     let mut despawned: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // Bone-entity reuse: an NPC actor fires multiple LoadVos2Requests
+    // (one per OS2 chunk), all for the same wire entity. The first
+    // request builds the skeleton bone tree; subsequent requests for
+    // the same entity re-use it so all body parts deform together.
+    let mut bone_trees: std::collections::HashMap<u32, Vec<Entity>> =
+        std::collections::HashMap::new();
 
     for req in queued {
         let Some(&bevy_e) = tracked.by_id.get(&req.entity_id) else {
@@ -493,6 +495,36 @@ pub fn process_load_vos2_requests(
             Some(id) => baked_skeleton_for_file(id),
             None => baked_skeleton(req.race),
         };
+        // NPCs (skeleton_file_id set) go through the GPU SkinnedMesh
+        // path so animations tick on the GPU and don't re-upload mesh
+        // attributes every frame. PCs stay on the CPU bake path until
+        // the SkinnedMesh refactor extends to handle the mirror copy
+        // + the multi-DAT slot composition that PC equipment requires.
+        if let (Some(_dat_id), Some(baked)) = (req.skeleton_file_id, baked_owned.as_ref()) {
+            if let Some(raw) = baked.raw.as_ref() {
+                let existing = bone_trees.get(&req.entity_id).cloned();
+                let bone_entities = spawn_skinned_actor(
+                    &mut commands,
+                    &mut meshes,
+                    &mut materials,
+                    &mut images,
+                    &mut inverse_bindposes,
+                    bevy_e,
+                    loaded,
+                    raw,
+                    existing,
+                );
+                bone_trees.insert(req.entity_id, bone_entities);
+                info!(
+                    "skinned actor spawn: file_id={} entity_id={} verts={} groups={}",
+                    req.file_id,
+                    req.entity_id,
+                    loaded.mesh.vertices.len(),
+                    loaded.mesh.groups.len(),
+                );
+                continue;
+            }
+        }
         spawn_vos2_meshes_with_skeleton(
             &mut commands,
             &mut meshes,
@@ -509,6 +541,255 @@ pub fn process_load_vos2_requests(
             loaded.mesh.vertices.len(),
             loaded.mesh.groups.len(),
         );
+    }
+}
+
+/// GPU-skinned-mesh spawn path for NPC actors. Builds (or reuses) the
+/// per-bone Bevy entity tree under `parent`, then spawns one Bevy mesh
+/// per polygon group with `JOINT_INDEX` / `JOINT_WEIGHT` attributes and
+/// a `SkinnedMesh` component pointing at the bone entities.
+///
+/// `inverse_bindposes` are set to identity matrices because OS2
+/// vertices are stored in **bone-local** space (matches lotus-ffxi's
+/// compute-shader convention). With identity inv-bind, Bevy's skinning
+/// formula becomes `bone_global_transform * vertex_pos` — exactly what
+/// you want for already-bone-local vertices.
+///
+/// The first call for an entity returns the freshly-spawned bone-entity
+/// vector; subsequent calls (for additional body-part chunks) reuse it
+/// via the `existing_bone_entities` arg so multi-OS2 actors deform as
+/// one rig.
+fn spawn_skinned_actor(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    inverse_bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
+    parent: Entity,
+    loaded: &LoadedVos2,
+    raw: &std::sync::Arc<Skeleton>,
+    existing_bone_entities: Option<Vec<Entity>>,
+) -> Vec<Entity> {
+    use ffxi_dat::bone::PARENT_ROOT;
+
+    let bone_entities = match existing_bone_entities {
+        Some(existing) => existing,
+        None => {
+            // Two-pass spawn: create all bone entities first so the
+            // parent ChildOf can reference them by index, then wire up
+            // the parent links. Bones declared as PARENT_ROOT (or
+            // self-parenting) get parented to the actor's wire entity.
+            let mut ents: Vec<Entity> = Vec::with_capacity(raw.bones.len());
+            for bone in &raw.bones {
+                let q = bone.rot;
+                let tf = Transform {
+                    translation: Vec3::from_array(bone.trans),
+                    rotation: Quat::from_xyzw(q[0], q[1], q[2], q[3]),
+                    scale: Vec3::ONE,
+                };
+                let id = commands
+                    .spawn((tf, GlobalTransform::default(), Visibility::default()))
+                    .id();
+                ents.push(id);
+            }
+            for (i, bone) in raw.bones.iter().enumerate() {
+                let p = bone.parent as usize;
+                let parent_e = if bone.parent == PARENT_ROOT || p == i || p >= ents.len() {
+                    parent
+                } else {
+                    ents[p]
+                };
+                commands.entity(ents[i]).insert(ChildOf(parent_e));
+            }
+            // Insert the parent-side `SkinnedActor` once (only on the
+            // first chunk's spawn — the existing-vec branch above
+            // skips this).
+            commands.entity(parent).insert(SkinnedActor {
+                dat_id: raw_dat_id_for_skeleton(raw),
+                bone_entities: ents.clone(),
+            });
+            ents
+        }
+    };
+
+    let inv_bindposes_handle = inverse_bindposes.add(SkinnedMeshInverseBindposes::from(
+        vec![Mat4::IDENTITY; raw.bones.len()],
+    ));
+
+    let mut by_name: std::collections::HashMap<String, Handle<Image>> =
+        std::collections::HashMap::with_capacity(loaded.textures.len());
+    let mut first: Option<Handle<Image>> = None;
+    for nt in &loaded.textures {
+        let handle = images.add(decoded_texture_to_image(&nt.texture));
+        if first.is_none() {
+            first = Some(handle.clone());
+        }
+        if !nt.name.is_empty() {
+            by_name.insert(nt.name.clone(), handle);
+        }
+    }
+
+    // Per-vertex joint attributes. OS2 ships up to 2 bone indices per
+    // vertex (`Vos2BoneIndices::bone_index1` / `bone_index2`). We
+    // populate slots [0]/[1] with these and leave [2]/[3] as zeros
+    // (weight 0). Weight is currently 1.0 on bone_index1 — multi-bone
+    // weight blending is a follow-up that needs the `Vos2Vertex`
+    // weight field to be exposed (only `bone_index1` per vertex
+    // surfaces today via `skeleton_bone_for`).
+    let n = loaded.mesh.vertices.len();
+    let mut joint_indices: Vec<[u16; 4]> = vec![[0u16; 4]; n];
+    let mut joint_weights: Vec<[f32; 4]> = vec![[1.0, 0.0, 0.0, 0.0]; n];
+    for i in 0..n {
+        let bone = loaded.mesh.skeleton_bone_for(i).unwrap_or(0);
+        joint_indices[i][0] = bone;
+        // Clamp to skeleton bone count — Bevy crashes (or silently
+        // skins to zero) on out-of-range joint indices. The
+        // `skeleton_fits_mesh` check in the CPU path guards this for
+        // bake-path meshes; replicate the guard here.
+        if (bone as usize) >= raw.bones.len() {
+            joint_indices[i][0] = 0;
+            joint_weights[i] = [0.0; 4];
+        }
+    }
+
+    let positions: Vec<[f32; 3]> = loaded.mesh.vertices.iter().map(|v| v.pos).collect();
+    let normals: Vec<[f32; 3]> = loaded.mesh.vertices.iter().map(|v| v.normal).collect();
+
+    for group in &loaded.mesh.groups {
+        if group.triangles.is_empty() {
+            continue;
+        }
+        let mut uvs: Vec<[f32; 2]> = vec![[0.0, 0.0]; n];
+        let mut uv_set: Vec<bool> = vec![false; n];
+        let mut indices: Vec<u32> = Vec::with_capacity(group.triangles.len() * 3);
+        for t in &group.triangles {
+            for c in 0..3 {
+                let i = t.indices[c] as usize;
+                if i < uvs.len() && !uv_set[i] {
+                    uvs[i] = t.uvs[c];
+                    uv_set[i] = true;
+                }
+                indices.push(t.indices[c] as u32);
+            }
+        }
+        let tex_handle = by_name
+            .get(&group.texture_name)
+            .cloned()
+            .or_else(|| {
+                let trimmed = group.texture_name.trim_start_matches("tim").trim();
+                by_name.get(trimmed).cloned()
+            })
+            .or_else(|| first.clone());
+
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals.clone());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+        // Vec<[u16; 4]> isn't auto-converted to VertexAttributeValues
+        // (no `From` impl); spell out the Uint16x4 variant explicitly.
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_JOINT_INDEX,
+            bevy::mesh::VertexAttributeValues::Uint16x4(joint_indices.clone()),
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, joint_weights.clone());
+        mesh.insert_indices(Indices::U32(indices));
+
+        let mat = materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            base_color_texture: tex_handle.clone(),
+            perceptual_roughness: 1.0,
+            cull_mode: None,
+            ..default()
+        });
+
+        commands.spawn((
+            Vos2Overlay,
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(mat),
+            Transform::default(),
+            ChildOf(parent),
+            SkinnedMesh {
+                inverse_bindposes: inv_bindposes_handle.clone(),
+                joints: bone_entities.clone(),
+            },
+        ));
+    }
+
+    bone_entities
+}
+
+/// `SkinnedActor.dat_id` recovery: we have `&Arc<Skeleton>` but no
+/// back-pointer to the file_id. Look it up via the `BAKED_SKELETONS`
+/// cache by scanning entries — there are only a handful per session
+/// (one per visible actor model), so a linear scan is fine.
+fn raw_dat_id_for_skeleton(raw: &std::sync::Arc<Skeleton>) -> u32 {
+    if let Some(map) = BAKED_SKELETONS.get() {
+        if let Ok(g) = map.lock() {
+            for (k, v) in g.iter() {
+                if let Some(b) = v {
+                    if let Some(rr) = &b.raw {
+                        if std::sync::Arc::ptr_eq(rr, raw) {
+                            return *k;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Falling back to 0 means the tick system can't find the
+    // animation for this actor; the NPC will freeze at bind pose.
+    // Shouldn't happen for entries that came through the cache.
+    0
+}
+
+/// Per-frame animation tick. For each `SkinnedActor`, advance the
+/// current MO2 frame and write the per-bone local transform onto
+/// each `bone_entities[i]`'s `Transform`. Bevy auto-composes
+/// `GlobalTransform`s along the hierarchy; the skinning shader then
+/// deforms vertices on the GPU.
+pub fn tick_skinned_actors(
+    time: Res<Time>,
+    q_actors: Query<&SkinnedActor>,
+    mut q_bones: Query<&mut Transform>,
+) {
+    let elapsed = time.elapsed_secs();
+    for actor in &q_actors {
+        let Some(baked) = baked_skeleton_for_file(actor.dat_id) else {
+            continue;
+        };
+        let Some(raw) = baked.raw else { continue };
+        let Some(anim) = idle_anim_for_file(actor.dat_id) else {
+            continue;
+        };
+        if anim.frames == 0 {
+            continue;
+        }
+        let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
+        let frame_idx = ((elapsed / safe_speed).floor() as usize) % anim.frames as usize;
+
+        for (i, bone) in raw.bones.iter().enumerate() {
+            let Some(&bone_e) = actor.bone_entities.get(i) else {
+                continue;
+            };
+            // Sample the animated local for this bone if MO2 drives it;
+            // fall back to the bone's bind-time local otherwise.
+            let (rot, trans, scale) = match anim
+                .per_bone
+                .get(&(i as u32))
+                .and_then(|frames| frames.get(frame_idx))
+            {
+                Some(f) => (f.rotation, f.translation, f.scale),
+                None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
+            };
+            if let Ok(mut tf) = q_bones.get_mut(bone_e) {
+                tf.rotation = Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]);
+                tf.translation = Vec3::from_array(trans);
+                tf.scale = Vec3::from_array(scale);
+            }
+        }
     }
 }
 
@@ -569,19 +850,10 @@ fn spawn_vos2_meshes_with_skeleton(
     // bind-time T-pose. PCs without an idle anim in their equipment
     // DAT fall back to bind pose automatically.
     //
-    // Per-frame keyframe ticking is a follow-up: with the static
-    // frame-0 pose validated, the next step swaps this one-shot bake
-    // for a system that mutates Mesh::ATTRIBUTE_POSITION each frame
-    // using a time-driven `frame_idx`.
-    // Animation-state plumbing for the per-frame tick system.
-    // `anim_dat_id` is `Some` exactly when this actor has an idle MO2
-    // we can drive — the tick system uses it as the key into the
-    // skeleton + animation caches.
-    let anim_dat_id: Option<u32> = baked_owned.and_then(|b| {
-        let _ = b.raw.as_ref()?;
-        idle_anim_for_file(b.file_id)?;
-        Some(b.file_id)
-    });
+    // NPCs are dispatched through `spawn_skinned_actor` (GPU skin)
+    // instead — this CPU-bake path now only runs for PCs (equipment
+    // DATs typically have no idle MO2, so `posed_owned` ends up
+    // `None` and the existing bind-pose fallback applies).
     let posed_owned: Option<BakedSkeleton> = baked_owned.and_then(|b| {
         let raw = b.raw.as_ref()?;
         let anim = idle_anim_for_file(b.file_id)?;
