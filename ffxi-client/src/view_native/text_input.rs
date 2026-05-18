@@ -33,6 +33,7 @@ use bevy::ecs::system::SystemParam;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
+use bevy::window::{PresentMode, PrimaryWindow};
 use ffxi_viewer_core::dat_mmb::LoadMmbRequest;
 use ffxi_viewer_core::dat_mzb::LoadMzbRequest;
 use ffxi_viewer_core::hud::chat_panel::ChatScroll;
@@ -43,11 +44,29 @@ use ffxi_viewer_core::{
 
 use super::debug_heights::DebugHeightsRequest;
 
+/// Tracks `/capture` toggle state and snapshots the framepace limiter
+/// that was active *before* capture-mode was enabled, so `/capture off`
+/// can restore it (otherwise an operator who had `/fps 30` active loses
+/// that setting when toggling capture-mode).
+///
+/// Why this exists at all: on macOS, QuickTime's legacy screen-capture
+/// pipeline can deadlock a Bevy/wgpu Metal surface while
+/// `bevy_framepace` is parking the render thread against monitor
+/// refresh. Capture-mode disables the limiter and pins
+/// `PresentMode::Fifo` for the recording window.
+#[derive(Resource, Default)]
+pub struct CaptureMode {
+    pub active: bool,
+    /// `Some` while `active == true`; `None` otherwise. Stores the
+    /// limiter that was in effect at the moment capture was enabled.
+    pub restore_limiter: Option<bevy_framepace::Limiter>,
+}
+
 /// Bundle of `MessageWriter`s used by the slash-command dispatcher.
 /// Grouped into one `SystemParam` so `text_input_system` stays under
 /// Bevy's 16-param cap as we add more event-driven slash commands.
 #[derive(SystemParam)]
-pub struct SlashWriters<'w> {
+pub struct SlashWriters<'w, 's> {
     pub load_mmb: MessageWriter<'w, LoadMmbRequest>,
     pub load_mzb: MessageWriter<'w, LoadMzbRequest>,
     pub debug_heights: MessageWriter<'w, DebugHeightsRequest>,
@@ -61,6 +80,12 @@ pub struct SlashWriters<'w> {
     // `ResMut` on `text_input_system`) to stay under Bevy's 16-SystemParam
     // cap. `Mut` access is fine — only the chat submit path writes it.
     pub framepace: ResMut<'w, bevy_framepace::FramepaceSettings>,
+    /// `/capture` reconfigures the primary window's `present_mode` at
+    /// runtime — Bevy's wgpu backend reconfigures the surface on the
+    /// next frame when this field changes.
+    pub primary_window: Query<'w, 's, &'static mut Window, With<PrimaryWindow>>,
+    /// Persisted capture-toggle state — see [`CaptureMode`].
+    pub capture_mode: ResMut<'w, CaptureMode>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -666,6 +691,46 @@ fn apply_slash_outcome(
                 }
             }
         }
+        SlashOutcome::SetCaptureMode(arg) => {
+            use bevy_framepace::Limiter;
+            let want_on = arg.unwrap_or(!slash_writers.capture_mode.active);
+            if want_on == slash_writers.capture_mode.active {
+                let label = if want_on { "on" } else { "off" };
+                push_system_chat_line(
+                    scene_state,
+                    format!("/capture: already {label} (no change)"),
+                );
+            } else if want_on {
+                // Snapshot the framepace limiter so `/capture off` can
+                // restore the operator's `/fps` choice. Then disable
+                // framepace and pin Fifo on the primary window.
+                slash_writers.capture_mode.restore_limiter =
+                    Some(slash_writers.framepace.limiter.clone());
+                slash_writers.framepace.limiter = Limiter::Off;
+                if let Ok(mut window) = slash_writers.primary_window.single_mut() {
+                    window.present_mode = PresentMode::Fifo;
+                }
+                slash_writers.capture_mode.active = true;
+                push_system_chat_line(
+                    scene_state,
+                    "/capture: on (framepace off, present_mode=Fifo) — \
+                     prefer OBS/Cmd+Shift+5 over QuickTime if recording still stalls"
+                        .into(),
+                );
+            } else {
+                let restored = slash_writers
+                    .capture_mode
+                    .restore_limiter
+                    .take()
+                    .unwrap_or(Limiter::Auto);
+                slash_writers.framepace.limiter = restored;
+                if let Ok(mut window) = slash_writers.primary_window.single_mut() {
+                    window.present_mode = PresentMode::AutoVsync;
+                }
+                slash_writers.capture_mode.active = false;
+                push_system_chat_line(scene_state, "/capture: off (settings restored)".into());
+            }
+        }
         SlashOutcome::SetZoneGeom(setting) => {
             let next = setting.unwrap_or_else(|| draw_distance.zone_geom_mode.cycle());
             draw_distance.zone_geom_mode = next;
@@ -1104,6 +1169,7 @@ fn push_local_chat_line(scene_state: &mut SceneState, kind: u8, text: String) {
         sender,
         text,
         server_ts: 0,
+        local_seq: 0,
     });
 }
 
@@ -1119,6 +1185,7 @@ fn push_local_tell_echo(scene_state: &mut SceneState, to: String, text: String) 
         sender: to,
         text,
         server_ts: 0,
+        local_seq: 0,
     });
 }
 

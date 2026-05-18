@@ -223,6 +223,9 @@ pub enum ChatChannel {
     /// driven by 0x029 / 0x02D battle messages. Translated to
     /// `wire::ChatChannel::Battle` and rendered in orange.
     Battle,
+    /// Client-internal debug toast. Mirrors `wire::ChatChannel::Debug`;
+    /// routed to the dedicated Chat 3 panel by the viewer.
+    Debug,
 }
 
 impl ChatChannel {

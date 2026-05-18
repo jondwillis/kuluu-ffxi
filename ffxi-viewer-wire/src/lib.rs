@@ -673,6 +673,7 @@ mod tests {
                 sender: "Other".into(),
                 text: "hi".into(),
                 server_ts: 1_700_000_000,
+                local_seq: 0,
             }],
             diagnostics: Diagnostics {
                 stage: Some(Stage::InZone),

@@ -323,6 +323,11 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 summary: "set target frame rate",
             },
             HelpEntry {
+                aliases: &["capture"],
+                usage: "[on|off|toggle]",
+                summary: "screen-capture-friendly mode (disables framepace; avoids QuickTime lockup)",
+            },
+            HelpEntry {
                 aliases: &["drawdistance", "dd"],
                 usage: "[setworld|setmob] [N]",
                 summary: "set draw distance",
@@ -465,6 +470,15 @@ pub enum SlashOutcome {
     /// `bevy_framepace::FramepaceSettings` directly rather than
     /// routing through `cmd_tx`.
     SetTargetFps(Option<u32>),
+    /// `/capture on|off|toggle` — opt into a screen-capture-friendly
+    /// presentation profile. On macOS, QuickTime's legacy capture
+    /// pipeline (and to a lesser extent other recorders) can deadlock a
+    /// Bevy/wgpu Metal surface when the app's render loop is parked by
+    /// `bevy_framepace` while the window server holds the surface for
+    /// capture. Capture-on disables the framepace limiter and pins the
+    /// primary window to `PresentMode::Fifo`; capture-off restores the
+    /// prior limiter. `None` means toggle.
+    SetCaptureMode(Option<bool>),
     /// `/debug heights` — diagnostic. Dumps player Bevy y, navmesh
     /// height, MZB-collision-mesh height (downward raycast), and the
     /// server-snapshot self pos. Dispatcher writes a `DebugHeightsRequest`
@@ -730,6 +744,7 @@ pub fn parse_slash(
         "load_mzb" | "loadmzb" => parse_load_mzb(rest, self_pos),
         "look" => parse_look(rest, entities, self_pos, current_target),
         "fps" => parse_fps(rest),
+        "capture" => parse_capture(rest),
         "drawdistance" | "dd" => parse_drawdistance(rest),
         "zonegeom" => parse_zonegeom(rest),
         "debug" | "dbg" | "nearby" | "entities" => {
@@ -783,14 +798,18 @@ pub fn parse_slash(
     }
 }
 
-/// Build a `[system]` chat line from a system message. Lets the caller
-/// append this directly into the snapshot's chat buffer for display.
+/// Build a debug chat line for slash-command output. Routes to
+/// `ChatChannel::Debug` (Chat 3 panel) so client-internal feedback
+/// doesn't mix with server-pushed System messages on Chat 2.
+/// Name preserved for call-site stability — the body now produces a
+/// Debug-channel line.
 pub fn system_chat_line(text: String) -> ChatLine {
     ChatLine {
-        channel: ChatChannel::System,
+        channel: ChatChannel::Debug,
         sender: "client".into(),
         text,
         server_ts: 0,
+        local_seq: 0,
     }
 }
 
@@ -1841,6 +1860,18 @@ fn parse_drawdistance(rest: &str) -> SlashOutcome {
         "setmob" | "mob" => SlashOutcome::SetDrawDistance(DrawDistanceOp::SetMob(value)),
         other => SlashOutcome::SystemMessage(format!(
             "/drawdistance: unknown sub `{other}` (use setworld | setmob)"
+        )),
+    }
+}
+
+fn parse_capture(rest: &str) -> SlashOutcome {
+    let arg = rest.split_whitespace().next();
+    match arg.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("toggle") => SlashOutcome::SetCaptureMode(None),
+        Some("on") | Some("1") | Some("true") => SlashOutcome::SetCaptureMode(Some(true)),
+        Some("off") | Some("0") | Some("false") => SlashOutcome::SetCaptureMode(Some(false)),
+        Some(other) => SlashOutcome::SystemMessage(format!(
+            "/capture: unknown arg `{other}` (use `on`, `off`, or `toggle`)"
         )),
     }
 }

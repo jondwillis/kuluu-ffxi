@@ -46,7 +46,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
-use ffxi_viewer_core::{feet_offset, InputMode, IsSelf, SceneState, WorldEntity};
+use ffxi_viewer_core::{
+    scene::{visual_root_offset, BakedActor},
+    InputMode, IsSelf, SceneState, WorldEntity,
+};
 
 use super::AppPhase;
 
@@ -153,10 +156,11 @@ fn toggle_navmesh_overlay(
         "navmesh overlay: OFF".to_string()
     };
     state.push_local_toast(ffxi_viewer_wire::ChatLine {
-        channel: ffxi_viewer_wire::ChatChannel::System,
+        channel: ffxi_viewer_wire::ChatChannel::Debug,
         sender: "client".into(),
         text: msg,
         server_ts: 0,
+        local_seq: 0,
     });
 }
 
@@ -250,7 +254,7 @@ fn snap_entities_to_navmesh_system(
     state: Res<NavmeshState>,
     collision_geom: Res<ffxi_viewer_core::dat_mzb::MzbCollisionGeometry>,
     mut cache: ResMut<SnapHeightCache>,
-    mut q: Query<(&WorldEntity, &mut Transform, Has<IsSelf>)>,
+    mut q: Query<(&WorldEntity, &mut Transform, Has<IsSelf>, Has<BakedActor>)>,
 ) {
     // Two-tier ground snap:
     //
@@ -272,7 +276,7 @@ fn snap_entities_to_navmesh_system(
         return;
     }
 
-    for (entity, mut t, is_self) in q.iter_mut() {
+    for (entity, mut t, is_self, has_baked_mesh) in q.iter_mut() {
         let ground_y: Option<f32> = if is_self && mzb_loaded {
             // Player: MZB raycast. Fall back to navmesh if the
             // column at the player's XZ has no triangle below
@@ -293,7 +297,7 @@ fn snap_entities_to_navmesh_system(
         };
 
         if let Some(ground) = ground_y {
-            t.translation.y = ground + feet_offset(entity.kind);
+            t.translation.y = ground + visual_root_offset(entity.kind, has_baked_mesh);
         }
     }
 }

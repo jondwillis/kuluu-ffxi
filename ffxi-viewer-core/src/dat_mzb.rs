@@ -706,6 +706,7 @@ pub fn process_load_mzb_requests(
         });
 
         let mut parent_spawn = commands.spawn((
+            crate::components::InGameEntity,
             MzbOverlay,
             Transform::from_translation(req.world_pos),
             Visibility::default(),
@@ -1060,9 +1061,10 @@ pub fn cull_entities_by_distance(
 fn push_system_msg(scene_state: &mut SceneState, text: String) {
     use ffxi_viewer_wire::{ChatChannel, ChatLine};
     scene_state.push_local_toast(ChatLine {
-        channel: ChatChannel::System,
+        channel: ChatChannel::Debug,
         sender: "client".into(),
         text,
         server_ts: 0,
+        local_seq: 0,
     });
 }

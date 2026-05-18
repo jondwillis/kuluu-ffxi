@@ -114,10 +114,11 @@ pub fn process_debug_heights(
 
 fn push(scene_state: &mut SceneState, text: String) {
     scene_state.push_local_toast(ChatLine {
-        channel: ChatChannel::System,
+        channel: ChatChannel::Debug,
         sender: "client".into(),
         text,
         server_ts: 0,
+        local_seq: 0,
     });
 }
 

@@ -88,6 +88,12 @@ pub struct BattleScroll {
     pub rows: usize,
 }
 
+/// Per-panel scroll offset for the client-internal debug panel (Chat 3).
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct DebugScroll {
+    pub rows: usize,
+}
+
 /// Fractional-row accumulator for the social panel's wheel scroll. The
 /// wheel system adds `delta * WHEEL_ROWS_PER_UNIT` here every frame; when
 /// `|frac| >= 1.0` it spends whole rows into [`ChatScroll`]. Frame-rate
@@ -104,17 +110,28 @@ pub struct BattleScrollAccum {
     pub frac: f32,
 }
 
+/// Fractional-row accumulator for the debug panel. See [`ChatScrollAccum`].
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct DebugScrollAccum {
+    pub frac: f32,
+}
+
 /// Which side of the FFXI-style split a chat panel renders.
 ///
-/// `Social` (Chat 1): Say/Shout/Tell/Party/Linkshell/Yell/Other +
-/// local toasts. The panel the operator types into.
+/// `Social` (Chat 1): Say/Shout/Tell/Party/Linkshell/Yell/Other.
+/// The panel the operator types into.
 ///
 /// `Battle` (Chat 2): combat log + server System messages — the
 /// noisy stream we want isolated from typed conversation.
+///
+/// `Debug` (Chat 3): client-internal toasts (auto-load, zone-change
+/// drops, slash-command errors). Kept out of Battle so the operator
+/// can read combat without our diagnostic chatter mixing in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatKind {
     Social,
     Battle,
+    Debug,
 }
 
 impl ChatKind {
@@ -123,7 +140,11 @@ impl ChatKind {
     pub fn accepts(self, c: ChatChannel) -> bool {
         match self {
             ChatKind::Battle => matches!(c, ChatChannel::Battle | ChatChannel::System),
-            ChatKind::Social => !matches!(c, ChatChannel::Battle | ChatChannel::System),
+            ChatKind::Debug => matches!(c, ChatChannel::Debug),
+            ChatKind::Social => !matches!(
+                c,
+                ChatChannel::Battle | ChatChannel::System | ChatChannel::Debug
+            ),
         }
     }
 }
@@ -147,25 +168,33 @@ pub struct ChatRow {
 pub struct ChatRowBody;
 
 pub fn spawn_chat_panel(mut commands: Commands) {
-    // Social panel: bottom-left, 50% width.
-    spawn_panel(&mut commands, ChatKind::Social, Val::Px(0.0), None);
-    // Battle panel: bottom-right, 48% width with a 2% gap.
+    // Three panes across the bottom. Widths: 34% / 33% / 33% (Social
+    // gets the slightly wider slot because the operator types into it).
+    // Two 0.5% gaps absorb rounding.
+    spawn_panel(
+        &mut commands,
+        ChatKind::Social,
+        Val::Percent(0.0),
+        Val::Percent(34.0),
+    );
     spawn_panel(
         &mut commands,
         ChatKind::Battle,
-        Val::Percent(52.0),
-        Some(Val::Px(0.0)),
+        Val::Percent(34.5),
+        Val::Percent(33.0),
+    );
+    spawn_panel(
+        &mut commands,
+        ChatKind::Debug,
+        Val::Percent(68.0),
+        Val::Percent(32.0),
     );
 }
 
-fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, right: Option<Val>) {
-    let width = if right.is_some() {
-        Val::Percent(48.0)
-    } else {
-        Val::Percent(50.0)
-    };
+fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, width: Val) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             ChatPanel { kind },
             ChatPanelDecay::default(),
             // `RelativeCursorPosition::cursor_over` is what
@@ -182,7 +211,7 @@ fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, right: Option
                 // just empty breathing room above the diagnostics strip.
                 bottom: Val::Px(54.0),
                 left,
-                right: right.unwrap_or(Val::Auto),
+                right: Val::Auto,
                 width,
                 height: Val::Px(PANEL_MIN_HEIGHT_PX),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
@@ -260,6 +289,7 @@ pub fn update_chat_panel(
     mode: Res<InputMode>,
     scroll: Res<ChatScroll>,
     battle_scroll: Res<BattleScroll>,
+    debug_scroll: Res<DebugScroll>,
     mut panel_q: Query<(
         &ChatPanel,
         &mut BorderColor,
@@ -296,6 +326,7 @@ pub fn update_chat_panel(
         let scroll_offset = match panel.kind {
             ChatKind::Social => scroll.rows,
             ChatKind::Battle => battle_scroll.rows,
+            ChatKind::Debug => debug_scroll.rows,
         };
 
         // The accent border is only meaningful for the social panel —
@@ -310,7 +341,7 @@ pub fn update_chat_panel(
                         InputMode::PassiveCursor(s) if matches!(s.focus, PassiveCursorFocus::Chat)
                     )
             }
-            ChatKind::Battle => scroll_offset != 0,
+            ChatKind::Battle | ChatKind::Debug => scroll_offset != 0,
         };
         let want_border = if focused {
             palette::ACCENT
@@ -417,6 +448,10 @@ pub fn format_chat_line(channel: ChatChannel, sender: &str, text: &str) -> Strin
         // System and Battle: server already formatted these. Print the
         // text bare — no sender prefix, no decoration.
         ChatChannel::System | ChatChannel::Battle => text.to_string(),
+        // Debug: client-internal toasts. Prefix with a faint marker so
+        // the operator can tell a debug line from a server System line
+        // if they ever bleed across panels (e.g., in a postcard log).
+        ChatChannel::Debug => format!("[dbg] {text}"),
     }
 }
 
@@ -435,6 +470,8 @@ pub fn channel_color(c: ChatChannel) -> Color {
         // operator's at-a-glance read picks up battle lines apart from
         // social channels.
         ChatChannel::Battle => Color::srgb(1.00, 0.55, 0.10),
+        // Debug toasts: dim teal — clearly client-internal, not server.
+        ChatChannel::Debug => Color::srgb(0.55, 0.75, 0.80),
     }
 }
 
@@ -494,8 +531,10 @@ pub fn chat_wheel_scroll_system(
     state: Res<SceneState>,
     mut scroll: ResMut<ChatScroll>,
     mut battle_scroll: ResMut<BattleScroll>,
+    mut debug_scroll: ResMut<DebugScroll>,
     mut accum: ResMut<ChatScrollAccum>,
     mut battle_accum: ResMut<BattleScrollAccum>,
+    mut debug_accum: ResMut<DebugScrollAccum>,
     mut pointer: ResMut<MousePointer>,
 ) {
     let mut delta: f32 = 0.0;
@@ -532,6 +571,12 @@ pub fn chat_wheel_scroll_system(
                 apply_wheel_delta(battle_scroll.rows, battle_accum.frac, delta, buffer_len);
             battle_scroll.rows = rows;
             battle_accum.frac = frac;
+        }
+        ChatKind::Debug => {
+            let (rows, frac) =
+                apply_wheel_delta(debug_scroll.rows, debug_accum.frac, delta, buffer_len);
+            debug_scroll.rows = rows;
+            debug_accum.frac = frac;
         }
     }
     // Suppress camera zoom on the same wheel event.

@@ -236,10 +236,11 @@ pub fn handle_input_system(
             LockOnToggle::NoTarget => "lock-on: no target".into(),
         };
         state.push_local_toast(ffxi_viewer_wire::ChatLine {
-            channel: ffxi_viewer_wire::ChatChannel::System,
+            channel: ffxi_viewer_wire::ChatChannel::Debug,
             sender: "client".into(),
             text: toast,
             server_ts: 0,
+            local_seq: 0,
         });
     }
 

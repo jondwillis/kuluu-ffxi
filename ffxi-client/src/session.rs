@@ -2048,8 +2048,25 @@ fn substitute_battle_placeholders(
     } else {
         s = replace_marker_all(&s, '#', &data1.to_string());
     }
-    s = replace_marker_all(&s, 'X', &data2.to_string());
+    // SkillGain (38) and SkillDrop (310) carry the raw skill amount —
+    // retail displays it as `raw/10` with one decimal ("rises 0.1
+    // points" for amount 1). SkillLevelUp (53), LevelSync (540), and
+    // ROETimed (705) all carry pre-divided integers, so default to
+    // integer formatting for everything else.
+    let x_value = if matches!(message_num, 38 | 310) {
+        format_decimal_tenths(data2)
+    } else {
+        data2.to_string()
+    };
+    s = replace_marker_all(&s, 'X', &x_value);
     s
+}
+
+/// Render an integer count of tenths as `whole.tenth` (e.g., 1 → "0.1",
+/// 23 → "2.3"). Matches retail FFXI's skill-display formatting where
+/// the server emits raw amounts and the client divides by 10.
+fn format_decimal_tenths(tenths: u32) -> String {
+    format!("{}.{}", tenths / 10, tenths % 10)
 }
 
 /// Replace every token-boundary occurrence of `marker` with `value`.
@@ -3097,9 +3114,32 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(0xCAFEu32, "hello".to_string());
         let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        // Retail divides the raw amount by 10 for display: 3 → "0.3".
         assert!(
-            line.text.contains("Fishing") && line.text.contains("rises 3 points"),
-            "expected '<skill>'→Fishing and 'X'→3, got: {}",
+            line.text.contains("Fishing") && line.text.contains("rises 0.3 points"),
+            "expected '<skill>'→Fishing and 'X'→0.3 (decimal), got: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn battle_message_53_skill_level_up_renders_x_as_integer() {
+        // SkillLevelUp = 53. Server already divides by 10 (charutils.cpp:4161
+        // sends `(CurSkill + SkillAmount) / 10`), so X must NOT be re-divided
+        // here. Template: "<target>'s <skill> skill reaches level X."
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes());
+        data[4..8].copy_from_slice(&0xCAFEu32.to_le_bytes());
+        data[8..12].copy_from_slice(&1u32.to_le_bytes()); // SKILL_HAND_TO_HAND
+        data[12..16].copy_from_slice(&12u32.to_le_bytes()); // level = 12
+        data[20..22].copy_from_slice(&53u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "hello".to_string());
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert!(
+            line.text.contains("level 12") && !line.text.contains("1.2"),
+            "expected integer level, got: {}",
             line.text
         );
     }

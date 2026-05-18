@@ -802,10 +802,11 @@ fn push_system_msg(scene_state: &mut SceneState, text: String) {
     // buffer is server-owned and the next ingest tick overwrites it.
     // `local_toasts` persists across ticks until the cap evicts it.
     scene_state.push_local_toast(ChatLine {
-        channel: ChatChannel::System,
+        channel: ChatChannel::Debug,
         sender: "client".into(),
         text,
         server_ts: 0,
+        local_seq: 0,
     });
 }
 

@@ -191,7 +191,7 @@ const PC_SKELETON_FILE_IDS: [u32; 8] = [7072, 10248, 13424, 16600, 19776, 19776,
 
 /// Resolve `race` byte to a skeleton file_id, or `None` for an
 /// unsupported race (0 = uninitialized; >8 = monstrosity / beastman).
-fn skeleton_file_id_for_race(race: u8) -> Option<u32> {
+pub fn skeleton_file_id_for_race(race: u8) -> Option<u32> {
     let idx = race.checked_sub(1)? as usize;
     PC_SKELETON_FILE_IDS.get(idx).copied()
 }
@@ -243,10 +243,37 @@ fn load_skeleton(file_id: u32) -> Option<BakedSkeleton> {
         .find(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::Bone))?;
     let skeleton = Skeleton::parse(chunk.data).ok()?;
     let world = skeleton.bind_pose_world();
+    // Per-race bake-extent diagnostic. The PC skeleton bind pose
+    // determines character height; logging min/max y across all
+    // bones surfaces any race with anomalous proportions (Taru
+    // should be shorter, Galka taller). Bake-y here is in FFXI bake
+    // space (pre-axis-flip); post-flip y range = pre-flip z range.
+    let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut min_z, mut max_z) = (f32::INFINITY, f32::NEG_INFINITY);
+    for bone in &world {
+        // World matrix is row-major (per `ffxi-dat/src/bone.rs:235`):
+        // translation lives at `m[0][3], m[1][3], m[2][3]`.
+        let x = bone[0][3];
+        let y = bone[1][3];
+        let z = bone[2][3];
+        if x < min_x { min_x = x; }
+        if x > max_x { max_x = x; }
+        if y < min_y { min_y = y; }
+        if y > max_y { max_y = y; }
+        if z < min_z { min_z = z; }
+        if z > max_z { max_z = z; }
+    }
     info!(
-        "vos2 bake: loaded skeleton file={} bones={}",
+        "vos2 bake: loaded skeleton file={} bones={} \
+         bake_x=[{:.2}..{:.2}] dx={:.2} \
+         bake_y=[{:.2}..{:.2}] dy={:.2} \
+         bake_z=[{:.2}..{:.2}] dz={:.2}",
         file_id,
         world.len(),
+        min_x, max_x, max_x - min_x,
+        min_y, max_y, max_y - min_y,
+        min_z, max_z, max_z - min_z,
     );
     Some(BakedSkeleton {
         file_id,
@@ -591,13 +618,15 @@ fn spawn_skinned_actor(
             // the parent links. Bones declared as PARENT_ROOT (or
             // self-parenting) get parented to the actor's wire entity.
             //
-            // Bone[0] gets identity rotation, not SK2's bind rotation.
-            // SK2 stores a 270°-Y "engine-axis" roll on the root bone
-            // that the CPU path counters via `unroll_root_rotation`
-            // after baking. The SkinnedMesh path can't post-process,
-            // so we drop the roll at the source and let everything
-            // downstream live in upright bone space. The actor's
-            // parent Transform then handles the FFXI→Bevy axis flip.
+            // Bone[0] gets identity rotation (drops SK2's 270°-Y
+            // engine-axis roll). The earlier experiment of putting
+            // the bind_to_bevy axis flip here regressed PC rendering
+            // when PCs were temporarily routed through this path;
+            // we backed that out by sending PCs to the CPU bake
+            // path instead (`look_resolver.rs` PC dispatch sets
+            // `skeleton_file_id: None`). NPCs continue to use this
+            // path with identity-on-root; their orientation is
+            // untested in the current setup.
             let mut ents: Vec<Entity> = Vec::with_capacity(raw.bones.len());
             for (i, bone) in raw.bones.iter().enumerate() {
                 let q = bone.rot;
@@ -654,25 +683,48 @@ fn spawn_skinned_actor(
     }
 
     // Per-vertex joint attributes. OS2 ships up to 2 bone indices per
-    // vertex (`Vos2BoneIndices::bone_index1` / `bone_index2`). We
-    // populate slots [0]/[1] with these and leave [2]/[3] as zeros
-    // (weight 0). Weight is currently 1.0 on bone_index1 — multi-bone
-    // weight blending is a follow-up that needs the `Vos2Vertex`
-    // weight field to be exposed (only `bone_index1` per vertex
-    // surfaces today via `skeleton_bone_for`).
+    // vertex via the 2-weight (`weight2`) record format. We populate
+    // slot [0] with the primary bone (rigid + skinned share this) and
+    // slot [1] with the secondary bone for skinned verts. Weights
+    // come from `bone_weights[v - weight1]` for skinned verts; rigid
+    // verts get weight = 1.0 on slot [0].
+    //
+    // Caveat: FFXI's 2-weight format stores **separate positions** for
+    // each bone (`pos1` vs `pos2` in `Vos2BoneWeight`). Bevy's
+    // `SkinnedMesh` expects one shared position blended by N bones —
+    // so we feed `pos1` (already in `vertices[i].pos`) and accept the
+    // approximation. The error is invisible for typical body meshes
+    // where pos1/pos2 differ only at the joint crease by < 1 mm.
     let n = loaded.mesh.vertices.len();
+    let weight2_count = loaded.mesh.bone_weights.len();
+    let weight1_count = n.saturating_sub(weight2_count);
     let mut joint_indices: Vec<[u16; 4]> = vec![[0u16; 4]; n];
     let mut joint_weights: Vec<[f32; 4]> = vec![[1.0, 0.0, 0.0, 0.0]; n];
     for i in 0..n {
-        let bone = loaded.mesh.skeleton_bone_for(i).unwrap_or(0);
-        joint_indices[i][0] = bone;
-        // Clamp to skeleton bone count — Bevy crashes (or silently
-        // skins to zero) on out-of-range joint indices. The
-        // `skeleton_fits_mesh` check in the CPU path guards this for
-        // bake-path meshes; replicate the guard here.
-        if (bone as usize) >= raw.bones.len() {
+        let bone1 = loaded.mesh.skeleton_bone_for(i).unwrap_or(0);
+        joint_indices[i][0] = bone1;
+        if (bone1 as usize) >= raw.bones.len() {
             joint_indices[i][0] = 0;
             joint_weights[i] = [0.0; 4];
+            continue;
+        }
+        // 2-weight verts: read bone2 + weight pair, populate slot [1].
+        if i >= weight1_count {
+            let k = i - weight1_count;
+            let bw = &loaded.mesh.bone_weights[k];
+            let bone2 = loaded.mesh.skeleton_bone2_for(i).unwrap_or(0);
+            let bone2_valid = (bone2 as usize) < raw.bones.len();
+            let (w1, w2) = if bone2_valid {
+                joint_indices[i][1] = bone2;
+                (bw.weight1, bw.weight2)
+            } else {
+                // Secondary bone out of range — degrade to rigid on bone1.
+                (1.0, 0.0)
+            };
+            let sum = w1 + w2;
+            if sum > 0.0 {
+                joint_weights[i] = [w1 / sum, w2 / sum, 0.0, 0.0];
+            }
         }
     }
 
@@ -721,10 +773,25 @@ fn spawn_skinned_actor(
         mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, joint_weights.clone());
         mesh.insert_indices(Indices::U32(indices));
 
+        // FFXI specular params from the OS2 DrawState opcode (0x8010)
+        // → Bevy PBR. The two formats don't line up 1-to-1:
+        //   - `specular_intensity` is roughly a 0..1 'how shiny' knob;
+        //     map it onto Bevy's `metallic` so the highlight reads.
+        //   - `specular_exponent` is the Phong exponent (higher = tighter
+        //     highlight); invert and clamp into Bevy's `perceptual_roughness`
+        //     (lower = sharper highlight). Default (exp=0) → matte (1.0).
+        // Both are heuristics — lotus stores the raw values without
+        // translating to a PBR pipeline, so there's no reference
+        // mapping to be exact against.
+        let (roughness, metallic) = pbr_from_specular(
+            group.specular_exponent,
+            group.specular_intensity,
+        );
         let mat = materials.add(StandardMaterial {
             base_color: Color::WHITE,
             base_color_texture: tex_handle.clone(),
-            perceptual_roughness: 1.0,
+            perceptual_roughness: roughness,
+            metallic,
             cull_mode: None,
             ..default()
         });
@@ -795,6 +862,16 @@ pub fn tick_skinned_actors(
         let frame_idx = ((elapsed / safe_speed).floor() as usize) % anim.frames as usize;
 
         for (i, bone) in raw.bones.iter().enumerate() {
+            // Bone[0] carries the `bind_to_bevy` axis flip set up in
+            // `spawn_skinned_actor`. Animating it from the MO2 frame
+            // would overwrite that flip and rotate the whole skeleton
+            // back into FFXI-engine axes — character lays on its side.
+            // Skip it; idle anim's root-bone motion is small enough
+            // (slight sway/breathing translate) that losing it is
+            // invisible vs. the cost of axis corruption.
+            if i == 0 {
+                continue;
+            }
             let Some(&bone_e) = actor.bone_entities.get(i) else {
                 continue;
             };
@@ -989,6 +1066,10 @@ fn spawn_vos2_meshes_with_skeleton(
         // `Handle<StandardMaterial>` (Bevy doesn't mutably share
         // materials between meshes anyway, so this is the natural
         // shape).
+        let (group_roughness, group_metallic) = pbr_from_specular(
+            group.specular_exponent,
+            group.specular_intensity,
+        );
         let spawn_one = |commands: &mut Commands,
                          meshes: &mut Assets<Mesh>,
                          materials: &mut Assets<StandardMaterial>,
@@ -1008,7 +1089,8 @@ fn spawn_vos2_meshes_with_skeleton(
             let mat = materials.add(StandardMaterial {
                 base_color: Color::WHITE,
                 base_color_texture: tex_handle.clone(),
-                perceptual_roughness: 1.0,
+                perceptual_roughness: group_roughness,
+                metallic: group_metallic,
                 cull_mode: None,
                 ..default()
             });
@@ -1017,20 +1099,23 @@ fn spawn_vos2_meshes_with_skeleton(
             //   1. Rotate -90° around X so the bake's Bevy +Z
             //      (head-to-feet, per the extent-log diagnostic)
             //      becomes Bevy +Y (Bevy's up axis).
-            //   2. Then rotate 180° around Y so the character's
-            //      forward direction (which ends up at Bevy +Z
-            //      after the X rotation) flips to Bevy -Z, matching
-            //      Bevy's right-handed forward convention.
+            //   2. Then rotate +90° around Y so the character's
+            //      forward direction lands on Bevy -Z (forward),
+            //      not -X (camera-left). The π/2 (not π) here is
+            //      paired with the `-angle` in
+            //      `scene::heading_to_quat`; together they keep the
+            //      character facing the same compass direction as
+            //      camera/server heading conventions.
             //
             // Composed in Quat multiplication order: outermost (Y)
-            // applies last. So `Q_y(π) * Q_x(-π/2)` means "first
-            // stand the character up, then yaw 180°."
+            // applies last. So `Q_y(π/2) * Q_x(-π/2)` means "first
+            // stand the character up, then yaw 90°."
             //
-            // Heading rotation on the parent (around Y) composes on
-            // top of this; the character can still face any compass
-            // direction the wire heading dictates, with this fixed
-            // pair as the at-rest baseline.
-            let bind_to_bevy = Quat::from_rotation_y(std::f32::consts::PI)
+            // Mesh-y=0 corresponds to the skeleton root (hip).
+            // Parent entity is placed at hip height — see
+            // `visual_root_offset` in scene.rs which the snap path
+            // consults via the `BakedActor` marker we attach below.
+            let bind_to_bevy = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)
                 * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
             commands.spawn((
                 Vos2Overlay,
@@ -1086,6 +1171,7 @@ pub fn spawn_equipped(
     images: &mut Assets<Image>,
     parent: Entity,
     race: u8,
+    face: u8,
     head: u16,
     body: u16,
     hands: u16,
@@ -1095,29 +1181,82 @@ pub fn spawn_equipped(
     sub: u16,
     ranged: u16,
 ) -> usize {
-    use crate::look_resolver::resolve_equipment_slot;
+    use crate::look_resolver::{resolve_equipment_slot, resolve_face};
+    use crate::scene::BakedActor;
+    let slot_names = ["head", "body", "hands", "legs", "feet", "main", "sub", "ranged"];
     let slots = [head, body, hands, legs, feet, main, sub, ranged];
     let mut spawned = 0usize;
-    for slot_id in slots {
-        let Some(file_id) = resolve_equipment_slot(slot_id, race) else {
+    // Face mesh first — lotus loads it as a separate DAT alongside the
+    // 8 equipment slots. Naked-but-faced characters still need the
+    // face here, so this runs before the slot loop.
+    if let Some(file_id) = resolve_face(face, race) {
+        match load_vos2(file_id, 4) {
+            Ok(loaded) if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() => {
+                spawn_vos2_meshes(commands, meshes, materials, images, parent, &loaded, race);
+                spawned += 1;
+            }
+            Ok(_) => info!("spawn_equipped: face file={} loaded but empty (race={})", file_id, race),
+            Err(e) => info!("spawn_equipped: face file={} load failed: {} (race={})", file_id, e, race),
+        }
+    }
+    for (slot_id, slot_name) in slots.iter().zip(slot_names.iter()) {
+        let Some(file_id) = resolve_equipment_slot(*slot_id, race) else {
+            if *slot_id != 0 {
+                info!("spawn_equipped: slot {}={:#06X} unresolved (race={})", slot_name, slot_id, race);
+            }
             continue;
         };
-        let Ok(loaded) = load_vos2(file_id, 4) else { continue };
-        if loaded.mesh.groups.is_empty() || loaded.mesh.vertices.is_empty() {
-            continue;
+        match load_vos2(file_id, 4) {
+            Ok(loaded) if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() => {
+                spawn_vos2_meshes(commands, meshes, materials, images, parent, &loaded, race);
+                spawned += 1;
+            }
+            Ok(_) => info!(
+                "spawn_equipped: slot {} file={} loaded but empty (slot_id={:#06X} race={})",
+                slot_name, file_id, slot_id, race
+            ),
+            Err(e) => info!(
+                "spawn_equipped: slot {} file={} load failed: {} (slot_id={:#06X} race={})",
+                slot_name, file_id, e, slot_id, race
+            ),
         }
-        spawn_vos2_meshes(commands, meshes, materials, images, parent, &loaded, race);
-        spawned += 1;
+    }
+    if spawned > 0 {
+        commands.entity(parent).insert(BakedActor);
     }
     spawned
+}
+
+/// Translate FFXI Phong specular params to Bevy PBR `(roughness,
+/// metallic)`. No reference mapping exists — lotus stores the raw
+/// f32s and lets its Vulkan pipeline interpret them.
+///
+/// Intentionally does *not* map `specular_intensity` to `metallic`:
+/// the FFXI intensity field is a Phong-scalar, not a "this material
+/// is metal" flag. Feeding it into Bevy's `metallic` made ordinary
+/// cloth gear render as polished steel ("shiny/reflective
+/// characters seems wrong" — user feedback). Until a proper
+/// metal-flag pipeline lands we only modulate roughness from
+/// exponent and leave metallic at 0.
+fn pbr_from_specular(exponent: f32, _intensity: f32) -> (f32, f32) {
+    let roughness = if exponent <= 0.0 {
+        1.0
+    } else {
+        // Higher exponent → tighter highlight → less rough. Floor
+        // at 0.3 (vs prior 0.1) so the sharpest highlights still
+        // read as "cloth with sheen" rather than "wet plastic."
+        (1.0 - (exponent.ln_1p() / 5.0)).clamp(0.3, 1.0)
+    };
+    (roughness, 0.0)
 }
 
 fn push_system_msg(scene_state: &mut SceneState, text: String) {
     use ffxi_viewer_wire::{ChatChannel, ChatLine};
     scene_state.push_local_toast(ChatLine {
-        channel: ChatChannel::System,
+        channel: ChatChannel::Debug,
         sender: "client".into(),
         text,
         server_ts: 0,
+        local_seq: 0,
     });
 }

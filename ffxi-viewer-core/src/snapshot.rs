@@ -36,6 +36,14 @@ pub struct SceneState {
     /// and survive until either evicted by the cap or the user explicitly
     /// clears them.
     pub local_toasts: Vec<ChatLine>,
+    /// Monotonically-increasing counter stamped on every chat line as it
+    /// enters viewer state. Drives the merge in [`rendered_chat`] so a
+    /// debug toast pushed between two server-pushed battle lines lands
+    /// between them in render order, not at the tail of the toast bucket.
+    /// Field rather than `AtomicU64` because every mutation is from
+    /// `ingest_system` / `push_local_toast`, which run on the Bevy main
+    /// thread and hold `&mut SceneState`.
+    pub next_chat_seq: u64,
 }
 
 /// Cap on retained local toasts. Smaller than `CHAT_HISTORY_CAP` because
@@ -47,13 +55,28 @@ impl SceneState {
     /// Push a UI-local chat line that survives snapshot replacement.
     /// Trims to `LOCAL_TOAST_CAP` and marks the state dirty so the chat
     /// panel re-renders this frame.
-    pub fn push_local_toast(&mut self, line: ChatLine) {
+    pub fn push_local_toast(&mut self, mut line: ChatLine) {
+        line.local_seq = self.next_chat_seq;
+        self.next_chat_seq += 1;
         self.local_toasts.push(line);
         if self.local_toasts.len() > LOCAL_TOAST_CAP {
             let drop_n = self.local_toasts.len() - LOCAL_TOAST_CAP;
             self.local_toasts.drain(0..drop_n);
         }
         self.dirty = true;
+    }
+
+    /// Stamp `local_seq` on each newly-arrived server chat line. Called by
+    /// `ingest_system` after a poll/delta merges into `snapshot.chat`.
+    /// Walks the tail of `chat` and assigns seqs to entries that still
+    /// carry the default 0 — server-pushed lines arrive with seq=0 and
+    /// get a fresh number here in arrival order.
+    fn stamp_new_server_chat(&mut self, prev_len: usize) {
+        let n = self.snapshot.chat.len();
+        for i in prev_len..n {
+            self.snapshot.chat[i].local_seq = self.next_chat_seq;
+            self.next_chat_seq += 1;
+        }
     }
 }
 
@@ -78,11 +101,23 @@ pub fn ingest_system<S: SceneSource + Resource>(
 
     if let Some(snap) = source.poll_snapshot() {
         state.snapshot = *snap;
+        // A full snapshot replaces the entire chat history. Re-stamp
+        // every line with a fresh monotonic seq starting from
+        // `next_chat_seq` so the merge in `rendered_chat` orders the
+        // freshly-baselined batch consistently against any toasts that
+        // arrived afterward.
+        let chat_n = state.snapshot.chat.len();
+        for i in 0..chat_n {
+            state.snapshot.chat[i].local_seq = state.next_chat_seq;
+            state.next_chat_seq += 1;
+        }
         state.dirty = true;
     }
 
     for delta in source.drain_deltas() {
+        let prev_len = state.snapshot.chat.len();
         apply_delta(&mut state.snapshot, &delta);
+        state.stamp_new_server_chat(prev_len);
         state.dirty = true;
     }
 
@@ -99,12 +134,27 @@ pub fn ingest_system<S: SceneSource + Resource>(
 /// rendering order matches the user's mental model — server messages
 /// arrive in the past, the toasts they triggered show below them.
 pub fn rendered_chat<'a>(state: &'a SceneState) -> Vec<&'a ChatLine> {
-    state
-        .snapshot
-        .chat
-        .iter()
-        .chain(state.local_toasts.iter())
-        .collect()
+    // Merge the two stamped streams by `local_seq` so a debug toast
+    // pushed at seq=42 lands between server lines stamped 41 and 43,
+    // not at the tail of the toast bucket. Both inputs are already
+    // sorted ascending by seq (ingest stamps in insertion order), so
+    // a linear two-way merge is sufficient and avoids an alloc-sort.
+    let s = &state.snapshot.chat;
+    let t = &state.local_toasts;
+    let mut out: Vec<&ChatLine> = Vec::with_capacity(s.len() + t.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < s.len() && j < t.len() {
+        if s[i].local_seq <= t[j].local_seq {
+            out.push(&s[i]);
+            i += 1;
+        } else {
+            out.push(&t[j]);
+            j += 1;
+        }
+    }
+    out.extend(s[i..].iter());
+    out.extend(t[j..].iter());
+    out
 }
 
 /// Pure fold: merge a delta into a snapshot. Mirrors the apply rules from
@@ -333,17 +383,57 @@ mod tests {
             sender: "Server".into(),
             text: "echo".into(),
             server_ts: 0,
+            local_seq: 0,
         });
         state.push_local_toast(ChatLine {
             channel: ChatChannel::System,
             sender: "client".into(),
             text: "/blarg".into(),
             server_ts: 0,
+            local_seq: 0,
         });
         let lines = rendered_chat(&state);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].sender, "Server");
         assert_eq!(lines[1].sender, "client");
+    }
+
+    #[test]
+    fn rendered_chat_interleaves_by_arrival_seq() {
+        // Stamp two server lines and one toast in arrival order
+        //   server seq=0, toast seq=1, server seq=2
+        // The merge must preserve that order even though the toast
+        // physically sits in `local_toasts` and the server lines in
+        // `snapshot.chat`.
+        let mut state = SceneState::default();
+        state.snapshot.chat.push(ChatLine {
+            channel: ChatChannel::Battle,
+            sender: "mob".into(),
+            text: "first".into(),
+            server_ts: 0,
+            local_seq: 0,
+        });
+        state.next_chat_seq = 1;
+        state.push_local_toast(ChatLine {
+            channel: ChatChannel::System,
+            sender: "client".into(),
+            text: "middle".into(),
+            server_ts: 0,
+            local_seq: 0,
+        });
+        // push_local_toast bumped next_chat_seq to 2.
+        state.snapshot.chat.push(ChatLine {
+            channel: ChatChannel::Battle,
+            sender: "mob".into(),
+            text: "last".into(),
+            server_ts: 0,
+            local_seq: state.next_chat_seq,
+        });
+        let lines = rendered_chat(&state);
+        assert_eq!(
+            lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["first", "middle", "last"]
+        );
     }
 
     #[test]
@@ -355,6 +445,7 @@ mod tests {
                 sender: "client".into(),
                 text: format!("toast {i}"),
                 server_ts: 0,
+                local_seq: 0,
             });
         }
         assert_eq!(state.local_toasts.len(), LOCAL_TOAST_CAP);
@@ -372,6 +463,7 @@ mod tests {
             sender: "x".into(),
             text: "hi".into(),
             server_ts: 0,
+            local_seq: 0,
         };
         let delta = SceneDelta {
             chat_appended: vec![line; CHAT_HISTORY_CAP + 5],
