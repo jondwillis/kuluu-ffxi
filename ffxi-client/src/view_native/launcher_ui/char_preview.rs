@@ -129,19 +129,15 @@ pub(super) fn spawn_preview(
     // Survives cursor-change refreshes; only its children get
     // despawned + respawned.
     //
-    // 180° flip around X compensates for the bake's axis-flip
-    // convention: `spawn_vos2_meshes` maps FFXI Z (up) to Bevy −Y,
-    // which makes the character's head point at −Y in raw Bevy
-    // space. The in-game scene also uses this inverted Y so an
-    // upright character renders correctly in the world view, but
-    // the launcher's camera uses standard +Y-up convention.
-    // Rotating the parent 180° around X flips the character's
-    // head to +Y in launcher space so it renders right-side-up.
+    // Identity rotation: the bake (`spawn_vos2_meshes`) already
+    // produces upright characters in raw Bevy space — what looked
+    // like an inversion earlier was actually just the camera being
+    // too close to fit the head in frame. Now that the camera is
+    // pulled back, no parent rotation is needed.
     let parent = commands
         .spawn((
             CharPreviewParent,
-            Transform::from_translation(PREVIEW_PARENT_POS)
-                .with_rotation(Quat::from_rotation_x(std::f32::consts::PI)),
+            Transform::from_translation(PREVIEW_PARENT_POS),
             Visibility::default(),
             ChildOf(root),
         ))
