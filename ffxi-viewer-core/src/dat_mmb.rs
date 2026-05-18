@@ -299,23 +299,55 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
     })
 }
 
-// Texture-alpha probing was tried (two iterations: `any α<255`, then
-// `≥1% pixels with α<16`) but produced visible dithered-checkerboard
-// rendering on FFXI ground and tree textures. The likely reason:
-// FFXI's DXT3/palette8 alpha channel doesn't always encode opacity.
-// Some textures appear to store ~128 ("half-bright") alpha values as
-// a brightness/lighting modulation factor, which the AlphaMode::Mask
-// pipeline then thresholds into a checkerboard pattern. Lotus
-// (mmb.cppm:501) makes no per-texture probe and gates transparency
-// strictly on `blending & 0x8000`; we now do the same for parity.
-// Trees may render with rectangular leaf billboards as a result —
-// that's the correct lotus-parity baseline; revisit if/when we
-// understand FFXI's actual texture-alpha convention.
+// Earlier alpha-probing attempts (any α<255; ≥1% pixels with α<16)
+// produced dithered-checkerboard rendering on FFXI textures because
+// FFXI authors alpha in a 0..128 working range ("0x80 = 1.0"
+// convention, same as its vertex-color decode). Empirical data from
+// Ronfaure (DAT 200 chunk 1165, `ron_wf`) shows alpha ranges like
+// [0..136] — not [0..255]. Lotus's MMB shader (mmb.slang::FragmentBlend)
+// remaps this on the fly: `bc2_alpha = raw >> 4`,
+// `output.alpha = bc2_alpha / 8.0` (clamped to 1.0). We bake the
+// equivalent remap into the texture at decode time below.
+
+/// Lotus-parity alpha remap. Input is the raw FFXI alpha byte;
+/// output is the value Bevy's `AlphaMode::Blend` should use as the
+/// blend factor.
+///
+/// Formula (lotus mmb.slang:107-110):
+///   `bc2_alpha = raw >> 4`       (extract 4-bit value, 0..15)
+///   `out_float = bc2_alpha / 8.0` (range 0..1.875, clamped to 1.0)
+///   `out_byte  = round(out_float * 255)`
+///
+/// Producing the table:
+///   raw 0..15   → 0   (lotus: discard; we'll let Blend handle it)
+///   raw 16..31  → 32
+///   raw 32..47  → 64
+///   raw 48..63  → 96
+///   raw 64..79  → 128
+///   raw 80..95  → 160
+///   raw 96..111 → 191
+///   raw 112..127→ 223
+///   raw 128..255→ 255 (clamped)
+#[inline]
+fn ffxi_alpha_remap(raw: u8) -> u8 {
+    let bc2 = (raw >> 4) as u32; // 0..15
+    let scaled = (bc2 * 255) / 8; // 0..(15*255/8 = 478)
+    scaled.min(255) as u8
+}
 
 /// Convert a [`DecodedTexture`] into a Bevy [`Image`] asset. The
 /// texture decoder produces top-mip RGBA8 already; we just wrap it in
-/// the asset type Bevy expects for `base_color_texture`.
+/// the asset type Bevy expects for `base_color_texture` after
+/// remapping alpha bytes per [`ffxi_alpha_remap`].
 fn decoded_texture_to_image(t: &DecodedTexture) -> Image {
+    // Apply lotus's alpha remap. Opaque-mode submeshes ignore alpha
+    // entirely, so for them this is harmless. Blend-mode submeshes
+    // get correctly-scaled opacity (raw 128+ → fully opaque leaf
+    // body, raw 0 → fully transparent hole).
+    let mut rgba = t.rgba.clone();
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = ffxi_alpha_remap(px[3]);
+    }
     let mut img = Image::new(
         Extent3d {
             width: t.width,
@@ -323,7 +355,7 @@ fn decoded_texture_to_image(t: &DecodedTexture) -> Image {
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        t.rgba.clone(),
+        rgba,
         // sRGB — FFXI textures are authored for the gamma-encoded color
         // pipeline; using `Rgba8UnormSrgb` lets Bevy linearize correctly
         // for PBR lighting.
