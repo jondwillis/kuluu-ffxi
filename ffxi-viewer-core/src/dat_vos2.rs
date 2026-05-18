@@ -311,6 +311,17 @@ fn anim_frame_overrides(
         if bi >= bone_count {
             continue;
         }
+        // Skip the root bone (id 0). MO2 keyframes are absolute (full
+        // local transform per frame, per lotus mo2.cppm); for idle
+        // animations the root frame is typically identity, which
+        // would OVERWRITE the SK2-baked 270°-Y engine-axis rotation
+        // and break `unroll_root_rotation` on the CPU bake path /
+        // produce sideways rigs on the GPU SkinnedMesh path. The
+        // root never moves during idle anyway, so preserving SK2's
+        // bind value is both correct and safe.
+        if bi == 0 {
+            continue;
+        }
         let Some(f) = frames.get(frame_idx) else { continue };
         out[bi] = Some(ffxi_dat::bone::BoneLocal {
             rotation: f.rotation,
@@ -579,12 +590,25 @@ fn spawn_skinned_actor(
             // parent ChildOf can reference them by index, then wire up
             // the parent links. Bones declared as PARENT_ROOT (or
             // self-parenting) get parented to the actor's wire entity.
+            //
+            // Bone[0] gets identity rotation, not SK2's bind rotation.
+            // SK2 stores a 270°-Y "engine-axis" roll on the root bone
+            // that the CPU path counters via `unroll_root_rotation`
+            // after baking. The SkinnedMesh path can't post-process,
+            // so we drop the roll at the source and let everything
+            // downstream live in upright bone space. The actor's
+            // parent Transform then handles the FFXI→Bevy axis flip.
             let mut ents: Vec<Entity> = Vec::with_capacity(raw.bones.len());
-            for bone in &raw.bones {
+            for (i, bone) in raw.bones.iter().enumerate() {
                 let q = bone.rot;
+                let rotation = if i == 0 {
+                    Quat::IDENTITY
+                } else {
+                    Quat::from_xyzw(q[0], q[1], q[2], q[3])
+                };
                 let tf = Transform {
                     translation: Vec3::from_array(bone.trans),
-                    rotation: Quat::from_xyzw(q[0], q[1], q[2], q[3]),
+                    rotation,
                     scale: Vec3::ONE,
                 };
                 let id = commands
