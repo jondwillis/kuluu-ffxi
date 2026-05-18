@@ -85,11 +85,205 @@ pub fn decode_keyframe(bytes: &[u8]) -> Option<AnimKeyframe> {
     })
 }
 
+/// Decoded MO2 (`mot_` animation library) chunk. One MO2 chunk holds
+/// one named animation clip (e.g. "idl", "wlk") with per-bone keyframe
+/// curves over `frames` frames at `speed` units of time per frame.
+///
+/// Format (lotus-ffxi `mo2.cppm`, `#pragma pack(2)`):
+///
+/// ```text
+///   Animation header (10 bytes):
+///     u16 _pad
+///     u16 elements
+///     u16 frames
+///     f32 speed
+///
+///   Element[elements]  (84 bytes each, pack-2):
+///     u32 bone
+///     i32[4]  quat_idx     // 0 = use base; >0 = index into float pool
+///     f32[4]  quat_base    // fallback quaternion (xyzw)
+///     i32[3]  trans_idx
+///     f32[3]  trans_base
+///     i32[3]  scale_idx
+///     f32[3]  scale_base
+///
+///   Float pool: the same byte stream re-interpreted as f32[].
+///     `data[idx + frame]` reads frame `frame` of an animated component.
+/// ```
+///
+/// Per-frame semantics (lotus): if any quat/trans/scale index is
+/// negative, the whole element is skipped and bones default to identity.
+/// Otherwise each component reads from `data[idx + frame]` when idx > 0,
+/// or from `*_base` when idx == 0. Frame 0 is discarded ("animations
+/// don't use frame 0 (FFXI thing?)" per lotus).
+#[derive(Debug, Clone)]
+pub struct Mo2Animation {
+    /// Animation name — first 3 bytes of the chunk's `name` field.
+    /// Common names: `"idl"` (idle), `"wlk"` (walk), `"run"`, `"atk"`.
+    pub name: String,
+    /// Number of usable frames (= header.frames - 1, since frame 0 is
+    /// dropped).
+    pub frames: u32,
+    /// Frames per second (= header.speed inverted? lotus stores raw
+    /// `header.speed`; in FFXI conventions this is "duration per frame
+    /// in seconds" — but the renderer can treat it as a tuning knob and
+    /// document the empirical observation).
+    pub speed: f32,
+    /// Per-bone keyframe array. Key = skeleton bone id (matches what
+    /// `Vos2Mesh::skeleton_bone_for` returns); value = `frames`
+    /// keyframes for that bone.
+    pub per_bone: std::collections::BTreeMap<u32, Vec<Mo2Frame>>,
+}
+
+/// One keyframe for one bone: a local rotation + translation + scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Mo2Frame {
+    /// Quaternion in xyzw order (matches `glm::quat` layout).
+    pub rotation: [f32; 4],
+    pub translation: [f32; 3],
+    pub scale: [f32; 3],
+}
+
+impl Mo2Frame {
+    pub const IDENTITY: Self = Self {
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        translation: [0.0; 3],
+        scale: [1.0; 3],
+    };
+}
+
+/// Animation header constants.
+const ANIM_HEADER_BYTES: usize = 10;
+const ELEMENT_BYTES: usize = 84;
+
+/// Parse an MO2 chunk body (the data portion after the 16-byte DAT
+/// chunk header — i.e. what `walk()` yields). `chunk_name` is the
+/// chunk's 4-byte name field; we keep only the first 3 chars for the
+/// animation identifier (matches lotus's `string(_name, 3)`).
+pub fn parse_mo2(body: &[u8], chunk_name: &[u8; 4]) -> Result<Mo2Animation> {
+    if body.len() < ANIM_HEADER_BYTES {
+        return Err(crate::DatError::Mmb(format!(
+            "MO2 body too small for header: {} < {ANIM_HEADER_BYTES}",
+            body.len()
+        )));
+    }
+    let elements_count = u16::from_le_bytes([body[2], body[3]]) as usize;
+    let header_frames = u16::from_le_bytes([body[4], body[5]]) as u32;
+    let speed = f32::from_le_bytes([body[6], body[7], body[8], body[9]]);
+
+    // Float pool: same bytes as the Elements region, reinterpreted.
+    // Indices in elements are word-stride (4-byte) offsets into this
+    // pool starting at byte 0 of the post-header region.
+    let pool_off = ANIM_HEADER_BYTES;
+    let read_f32 = |word_idx: usize| -> Option<f32> {
+        let o = pool_off + word_idx.checked_mul(4)?;
+        if o + 4 > body.len() {
+            return None;
+        }
+        Some(f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]))
+    };
+
+    let mut per_bone: std::collections::BTreeMap<u32, Vec<Mo2Frame>> =
+        std::collections::BTreeMap::new();
+    let mut name_buf = String::with_capacity(3);
+    for &b in &chunk_name[..3.min(chunk_name.len())] {
+        if b == 0 {
+            break;
+        }
+        name_buf.push(b as char);
+    }
+
+    for e in 0..elements_count {
+        let off = pool_off + e * ELEMENT_BYTES;
+        if off + ELEMENT_BYTES > body.len() {
+            break;
+        }
+        let read_u32 = |o: usize| u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+        let read_i32 = |o: usize| i32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+        let read_f = |o: usize| f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+
+        let bone = read_u32(off);
+        let q_idx = [
+            read_i32(off + 4),
+            read_i32(off + 8),
+            read_i32(off + 12),
+            read_i32(off + 16),
+        ];
+        let q_base = [
+            read_f(off + 20),
+            read_f(off + 24),
+            read_f(off + 28),
+            read_f(off + 32),
+        ];
+        let t_idx = [
+            read_i32(off + 36),
+            read_i32(off + 40),
+            read_i32(off + 44),
+        ];
+        let t_base = [read_f(off + 48), read_f(off + 52), read_f(off + 56)];
+        let s_idx = [
+            read_i32(off + 60),
+            read_i32(off + 64),
+            read_i32(off + 68),
+        ];
+        let s_base = [read_f(off + 72), read_f(off + 76), read_f(off + 80)];
+
+        // lotus: if ANY component index is negative, this element is
+        // entirely identity (bone stays at its bind pose).
+        let any_negative = q_idx.iter().chain(t_idx.iter()).chain(s_idx.iter()).any(|&i| i < 0);
+        let mut frames = Vec::with_capacity(header_frames as usize);
+        for f in 0..header_frames {
+            if any_negative {
+                frames.push(Mo2Frame::IDENTITY);
+                continue;
+            }
+            let sample = |idx: i32, base: f32| -> f32 {
+                if idx > 0 {
+                    read_f32(idx as usize + f as usize).unwrap_or(base)
+                } else {
+                    base
+                }
+            };
+            frames.push(Mo2Frame {
+                rotation: [
+                    sample(q_idx[0], q_base[0]),
+                    sample(q_idx[1], q_base[1]),
+                    sample(q_idx[2], q_base[2]),
+                    sample(q_idx[3], q_base[3]),
+                ],
+                translation: [
+                    sample(t_idx[0], t_base[0]),
+                    sample(t_idx[1], t_base[1]),
+                    sample(t_idx[2], t_base[2]),
+                ],
+                scale: [
+                    sample(s_idx[0], s_base[0]),
+                    sample(s_idx[1], s_base[1]),
+                    sample(s_idx[2], s_base[2]),
+                ],
+            });
+        }
+        // Drop frame 0 (lotus convention).
+        if !frames.is_empty() {
+            frames.remove(0);
+        }
+        per_bone.insert(bone, frames);
+    }
+
+    let frames = header_frames.saturating_sub(1);
+    Ok(Mo2Animation {
+        name: name_buf,
+        frames,
+        speed,
+        per_bone,
+    })
+}
+
 /// Sliding-window scan for plausible unit-quaternion records (4 i16 LE
 /// scaled to [-1,1]). Returns offsets + decoded quaternions whose
 /// squared magnitude is within ±0.05 of 1.0. *Not* a structural parser —
-/// a reconnaissance tool to map where rotation data lives in a chunk
-/// before we crack the full per-record stride.
+/// kept as a diagnostic / reconnaissance tool now that the real
+/// structural parser ([`parse_mo2`]) is available.
 pub fn find_quaternion_records(body: &[u8]) -> Result<Vec<(usize, [f32; 4])>> {
     let mut out = Vec::new();
     let mut i = 0;
