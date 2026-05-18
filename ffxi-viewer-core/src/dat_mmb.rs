@@ -465,7 +465,31 @@ pub fn process_load_mmb_requests(
             // scanner actually returned. A mismatch (pieces > 0 but
             // we see far fewer than `numModel * pieces` submeshes)
             // tells us the scanner is missing structural records.
-            let img_names: Vec<&str> = tex_by_name.keys().map(|s| s.as_str()).collect();
+            // Alpha range per IMG texture: lets us see whether a
+            // transparency-flagged submesh's texture actually carries
+            // varying alpha (real cutout art) or is flat all-255
+            // (the architectural limit case — even lotus's FragmentBlend
+            // would render this opaque).
+            //
+            // Format: ["texname α[min..max]", …] sorted by name.
+            let mut img_stats: Vec<(String, u8, u8)> = loaded
+                .textures
+                .iter()
+                .filter(|nt| !nt.name.is_empty())
+                .map(|nt| {
+                    let (mut amin, mut amax) = (255u8, 0u8);
+                    for px in nt.texture.rgba.chunks_exact(4) {
+                        amin = amin.min(px[3]);
+                        amax = amax.max(px[3]);
+                    }
+                    (nt.name.clone(), amin, amax)
+                })
+                .collect();
+            img_stats.sort_by(|a, b| a.0.cmp(&b.0));
+            let img_names: Vec<String> = img_stats
+                .into_iter()
+                .map(|(n, amin, amax)| format!("{n} α[{amin}..{amax}]"))
+                .collect();
             let mut requested: Vec<&str> = loaded
                 .submeshes
                 .iter()
@@ -476,6 +500,25 @@ pub fn process_load_mmb_requests(
             let (matched, unmatched): (Vec<&str>, Vec<&str>) = requested
                 .iter()
                 .partition(|n| tex_by_name.contains_key(**n));
+            // Per-submesh blending dump — used to verify whether tree-
+            // leaf and similar foliage submeshes have `0x8000` set
+            // (which would trigger our AlphaMode::Blend path) or not
+            // (in which case lotus also renders them as opaque
+            // rectangles and we'd need to replicate its
+            // mmb.slang::FragmentBlend logic in a custom material).
+            //
+            // Format: ["texname:0xBLEND", ...] — sorted by texname so
+            // grep-friendly across runs.
+            let mut blending_view: Vec<(String, u16)> = loaded
+                .submeshes
+                .iter()
+                .map(|s| (s.variant_name.clone(), s.blending))
+                .collect();
+            blending_view.sort_by(|a, b| a.0.cmp(&b.0));
+            let blending_strs: Vec<String> = blending_view
+                .into_iter()
+                .map(|(name, b)| format!("{name}:0x{b:04X}"))
+                .collect();
             info!(
                 target: "ffxi_viewer_core::dat_mmb",
                 file_id = req.file_id,
@@ -486,6 +529,7 @@ pub fn process_load_mmb_requests(
                 imgs = ?img_names,
                 matched = ?matched,
                 unmatched = ?unmatched,
+                blending = ?blending_strs,
                 first_fallback = first_texture.is_some(),
                 "MMB texture pool",
             );
@@ -608,7 +652,7 @@ pub fn process_load_mmb_requests(
                 // because PBR re-lighting against FFXI's pre-baked
                 // normals leaves whole surfaces nearly black even
                 // when the textures are correctly paired.
-                unlit: true,
+                // unlit: true,
                 // FFXI triangle-strip winding isn't pinned to a
                 // canonical front/back convention — render both
                 // sides instead of guessing.
