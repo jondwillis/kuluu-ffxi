@@ -53,6 +53,14 @@ pub(super) struct PreviewedSlot {
 }
 
 const PREVIEW_PARENT_POS: Vec3 = Vec3::new(-1.4, 0.0, 0.0);
+/// Camera position relative to the preview parent. Pulled back +Z
+/// far enough to fit a ~2 yalm character in frame with default
+/// 45° FOV, and raised +Y so the camera looks at the model's
+/// mid-section (chest) rather than its feet.
+const PREVIEW_CAMERA_OFFSET: Vec3 = Vec3::new(0.0, 1.2, 4.5);
+/// Where the camera is aimed — center of the character, roughly
+/// torso height.
+const PREVIEW_LOOK_AT_OFFSET: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 
 pub(super) fn spawn_preview(
     mut commands: Commands,
@@ -85,8 +93,8 @@ pub(super) fn spawn_preview(
             order: -1, // behind UI (UI defaults to 0/+1)
             ..default()
         },
-        Transform::from_xyz(PREVIEW_PARENT_POS.x, 1.0, 3.0)
-            .looking_at(PREVIEW_PARENT_POS + Vec3::Y * 1.0, Vec3::Y),
+        Transform::from_translation(PREVIEW_PARENT_POS + PREVIEW_CAMERA_OFFSET)
+            .looking_at(PREVIEW_PARENT_POS + PREVIEW_LOOK_AT_OFFSET, Vec3::Y),
         ChildOf(root),
     ));
 
