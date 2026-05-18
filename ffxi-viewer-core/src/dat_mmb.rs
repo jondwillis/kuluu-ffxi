@@ -288,6 +288,16 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
             .filter(|t| t[0] < vert_count && t[1] < vert_count && t[2] < vert_count)
             .flat_map(|t| [t[0] as u32, t[1] as u32, t[2] as u32])
             .collect();
+        // Drop submeshes where every triangle was bounds-rejected. They
+        // bake into a Bevy mesh with zero indices, which the downstream
+        // `CameraOccluder` BVH builder panics on (it indexes nodes[0]
+        // unconditionally — see ffxi-client::view_native::collision_bvh
+        // ::patch_leaf_offsets). The historical `b"model"` filter
+        // suppressed these records before this point; removing it
+        // exposed the path.
+        if indices.is_empty() {
+            continue;
+        }
         out.push(MmbSubMesh {
             // Full 16-byte textureName, NUL-terminated and trimmed.
             // Matches `extract_texture_name`'s output on the IMG side.

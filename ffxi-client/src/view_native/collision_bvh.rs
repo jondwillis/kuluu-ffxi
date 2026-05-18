@@ -389,6 +389,14 @@ pub fn build_collision_bvh_system(
         }
 
         let tri_count = tris.len();
+        if tri_count == 0 {
+            // Mesh has no triangles — skip BVH construction. Without
+            // this guard, `build_bvh_with_leaf_offsets` would index
+            // `nodes[0]` on an empty node list and panic. An empty
+            // occluder mesh can't occlude anything anyway, so a
+            // missing BVH component is the correct outcome.
+            continue;
+        }
         let bvh = build_bvh_with_leaf_offsets(tris);
         info!(
             entity = ?entity,
