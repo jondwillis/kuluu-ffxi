@@ -299,6 +299,19 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
     })
 }
 
+/// True if any pixel in the decoded RGBA buffer has α < 255. Used
+/// at texture-load time to decide whether the material should render
+/// as opaque or as alpha-cutout — most FFXI ground/wall textures
+/// have α=255 everywhere (DXT3 with all-opaque alpha channel) and
+/// should render fully opaque; tree leaves and similar carry real
+/// transparency in their alpha bytes.
+///
+/// Aborts on first hit so the typical opaque texture costs O(WxH)
+/// scan but transparent textures cost only a handful of byte reads.
+fn texture_has_transparent_pixels(tex: &DecodedTexture) -> bool {
+    tex.rgba.chunks_exact(4).any(|px| px[3] < 255)
+}
+
 /// Convert a [`DecodedTexture`] into a Bevy [`Image`] asset. The
 /// texture decoder produces top-mip RGBA8 already; we just wrap it in
 /// the asset type Bevy expects for `base_color_texture`.
@@ -420,16 +433,27 @@ pub fn process_load_mmb_requests(
         let texture_count = loaded.textures.len();
         let pool_is_new = !tex_pools.contains_key(&req.file_id);
         let pool = tex_pools.entry(req.file_id).or_insert_with(|| {
-            let mut by_name: std::collections::HashMap<String, Handle<Image>> =
+            // Per-handle map of `name → (handle, has_alpha)`. The
+            // has_alpha bit is computed once at texture-decode time —
+            // scan the RGBA buffer for any A < 255. Cheap (linear,
+            // aborts on first hit) and lets the material picker
+            // choose `AlphaMode::Mask(0.5)` only for textures that
+            // actually carry cutout, leaving the rest fully opaque.
+            // Without this, ground/walls render see-through because
+            // their fully-opaque DXT3/A1 textures still go through
+            // the alpha-test pipeline.
+            let mut by_name: std::collections::HashMap<String, (Handle<Image>, bool)> =
                 std::collections::HashMap::with_capacity(texture_count);
-            let mut first: Option<Handle<Image>> = None;
+            let mut first: Option<(Handle<Image>, bool)> = None;
             for nt in &loaded.textures {
+                let has_alpha = texture_has_transparent_pixels(&nt.texture);
                 let handle = images.add(decoded_texture_to_image(&nt.texture));
+                let entry = (handle.clone(), has_alpha);
                 if first.is_none() {
-                    first = Some(handle.clone());
+                    first = Some(entry.clone());
                 }
                 if !nt.name.is_empty() {
-                    by_name.insert(nt.name.clone(), handle);
+                    by_name.insert(nt.name.clone(), entry);
                 }
             }
             (by_name, first)
@@ -540,29 +564,37 @@ pub fn process_load_mmb_requests(
             mesh.insert_indices(Indices::U32(sub.indices.clone()));
 
             let variant_trimmed = sub.variant_name.trim();
-            let sub_texture = tex_by_name
+            let resolved = tex_by_name
                 .get(variant_trimmed)
                 .cloned()
                 .or_else(|| first_texture.clone());
+            let (sub_texture, tex_has_alpha) = match resolved {
+                Some((h, a)) => (Some(h), a),
+                None => (None, false),
+            };
 
-            // Alpha mode (lotus parity, mmb.cppm:501 + pipeline
-            // selection at 577-580):
-            //   blending & 0x8000 → `AlphaMode::Blend` (true sorted
-            //     transparency — glass, water effects, etc.)
-            //   otherwise → `AlphaMode::Mask(0.5)` (alpha cutout —
-            //     tree leaves, fence slats, anything authored with
-            //     RGBA where the alpha channel cuts a silhouette).
-            //     Pixels with alpha ≥ 0.5 stay fully opaque, so this
-            //     is safe for fully-opaque textures too.
+            // Alpha mode picks one of three rendering paths:
             //
-            // Before this, MMBs used the default `AlphaMode::Opaque`,
-            // which renders tree-leaf textures as opaque rectangles —
-            // the visible "trees look like blocks" / "Ronfaure is
-            // shady" symptom.
+            // 1. `blending & 0x8000` → `AlphaMode::Blend` (lotus parity,
+            //    mmb.cppm:501 — sorted transparency for glass/water).
+            // 2. Texture has any α<255 → `AlphaMode::Mask(0.5)` (alpha
+            //    cutout for tree leaves, fence slats, anything with
+            //    RGBA holes baked in).
+            // 3. Otherwise → `AlphaMode::Opaque` (the default — most
+            //    walls/floors/terrain).
+            //
+            // The texture-alpha probe is the discriminator that
+            // distinguishes opaque-but-RGBA textures (have an alpha
+            // channel but all values 255) from real cutout textures.
+            // Lotus picks the same blend pipeline for both because it
+            // only has two pipelines; we can do strictly better by
+            // looking at the actual data.
             let alpha_mode = if (sub.blending & 0x8000) != 0 {
                 AlphaMode::Blend
-            } else {
+            } else if tex_has_alpha {
                 AlphaMode::Mask(0.5)
+            } else {
+                AlphaMode::Opaque
             };
             let mat = materials.add(StandardMaterial {
                 // WHITE so the mesh's per-vertex `ATTRIBUTE_COLOR`
