@@ -967,6 +967,9 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::HumanReleased => "human_released",
         AgentEvent::MusicChanged { .. } => "music_changed",
         AgentEvent::MusicVolumeChanged { .. } => "music_volume_changed",
+        AgentEvent::WeatherUpdated { .. } => "weather_updated",
+        AgentEvent::LogoutCountdown { .. } => "logout_countdown",
+        AgentEvent::SetFps { .. } => "set_fps",
     }
 }
 
@@ -998,6 +1001,7 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         ReqLogout { .. } => "req_logout",
         ReturnToHomePoint => "return_to_home_point",
         Heal { .. } => "heal",
+        SetFps { .. } => "set_fps",
     }
 }
 

@@ -238,6 +238,13 @@ pub fn chat_to_wire(c: &ChatLine) -> wire::ChatLine {
         sender: c.sender.clone(),
         text: c.text.clone(),
         server_ts: c.server_ts,
+        // `local_seq` is the client-side monotonic arrival counter used
+        // to interleave server chat with `push_local_toast` entries in
+        // strict arrival order. Server-sourced lines (everything that
+        // flows through this bridge) carry 0 — the same sentinel the
+        // wire struct documents as "synthetic / test / pre-traffic".
+        // Local-toast emitters stamp their own non-zero values.
+        local_seq: 0,
     }
 }
 
@@ -252,6 +259,7 @@ pub fn channel_to_wire(c: ChatChannel) -> wire::ChatChannel {
         ChatChannel::System => wire::ChatChannel::System,
         ChatChannel::Other => wire::ChatChannel::Other,
         ChatChannel::Battle => wire::ChatChannel::Battle,
+        ChatChannel::Debug => wire::ChatChannel::Debug,
     }
 }
 

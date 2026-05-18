@@ -17,6 +17,8 @@
 #![forbid(unsafe_code)]
 
 pub mod atmosphere;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod audio;
 pub mod camera;
 pub mod components;
 #[cfg(not(target_arch = "wasm32"))]
@@ -102,6 +104,12 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // via `fs::read`. wasm can't yet — see `dat_mmb.rs` for the gate.
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(dat_mmb::DatOverlayPlugin);
+        // Native-only: BGM playback driven by LSB 0x05F music
+        // events. Reads `FFXI_DAT_PATH` for the install root. No-ops
+        // gracefully when the env var is unset or the sound trees
+        // are missing — see `audio::apply_bgm_system`.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins(audio::AudioPlugin);
         // Per-zone TOD-driven fog + ambient from the DAT's Weather
         // chunks (kind 0x2F). Runs every frame after the zone-change
         // atmosphere applier so the live lerp overrides the heuristic
@@ -127,8 +135,10 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<weather_fx::CurrentWeather>()
             .init_resource::<hud::chat_panel::ChatScroll>()
             .init_resource::<hud::chat_panel::BattleScroll>()
+            .init_resource::<hud::chat_panel::DebugScroll>()
             .init_resource::<hud::chat_panel::ChatScrollAccum>()
             .init_resource::<hud::chat_panel::BattleScrollAccum>()
+            .init_resource::<hud::chat_panel::DebugScrollAccum>()
             // Launcher-supplied appearance for the local PC. LSB zeros
             // the self GrapIDTbl in CHAR_PC packets; without this
             // override the local player would never get a LookComp
@@ -197,5 +207,13 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                     .chain()
                     .run_if(resource_exists::<EntityMesh>),
             );
+
+        // Skinned-actor idle-animation tick. Runs on every `SkinnedActor`
+        // (currently NPCs; PC migration tracked separately). Independent
+        // of the main chained tuple above — it operates on a different
+        // entity set and has no ordering constraints with the
+        // sync/dispatch/camera pipeline.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(Update, dat_vos2::tick_skinned_actors);
     }
 }
