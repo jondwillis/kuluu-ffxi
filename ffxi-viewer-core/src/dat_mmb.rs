@@ -419,6 +419,13 @@ pub fn process_load_mmb_requests(
         return;
     }
 
+    // Tracks which (file_id, chunk_idx) MMBs we've already emitted a
+    // "MMB texture pool" diagnostic for in this frame. Without this
+    // the log fires once per zone-load placement (thousands of times
+    // for a city); with it, exactly once per unique asset per frame.
+    let mut mmb_logged: std::collections::HashSet<(u32, usize)> =
+        std::collections::HashSet::new();
+
     // Cache one LoadedMmb per (file_id, chunk_idx).
     let mut mmb_cache: std::collections::HashMap<(u32, usize), Option<LoadedMmb>> =
         std::collections::HashMap::new();
@@ -468,7 +475,6 @@ pub fn process_load_mmb_requests(
         // body's internal name (`extract_texture_name`). Submeshes that
         // don't match fall back to the first IMG or no texture.
         let texture_count = loaded.textures.len();
-        let pool_is_new = !tex_pools.contains_key(&req.file_id);
         let pool = tex_pools.entry(req.file_id).or_insert_with(|| {
             let mut by_name: std::collections::HashMap<String, Handle<Image>> =
                 std::collections::HashMap::with_capacity(texture_count);
@@ -487,12 +493,13 @@ pub fn process_load_mmb_requests(
         let tex_by_name = &pool.0;
         let first_texture = pool.1.clone();
 
-        // One-shot per-DAT diagnostic: when the texture pool is freshly
-        // built, log the texture-name pool plus the unique submesh
-        // texture names this MMB asked for and which ones resolved.
-        // Helps diagnose "missing textures" symptoms — set
-        // RUST_LOG=ffxi_viewer_core::dat_mmb=info to see it.
-        if pool_is_new {
+        // Per-MMB diagnostic: log once per (file_id, chunk_idx) per
+        // frame so we can see blending values + texture alpha ranges
+        // for every distinct asset. Most zone loads only fire the
+        // first time the player zones in; the per-frame retry is a
+        // wash because mmb_cache deduplicates loads.
+        // Enable with `RUST_LOG=ffxi_viewer_core::dat_mmb=info`.
+        if mmb_logged.insert((req.file_id, req.chunk_idx)) {
             // `SMMBHeader.pieces` (lotus mmb.cppm:98) sits at the first
             // 4 bytes of the payload — i.e. decrypted bytes 32..36 from
             // the file. We don't yet decode the block headers, so we
@@ -640,33 +647,35 @@ pub fn process_load_mmb_requests(
                 .or_else(|| first_texture.clone());
 
             // Alpha mode is driven by `SMMBModelHeader.blending`:
-            //   bit 0x8000 set → AlphaMode::Mask(0.5)  (cutout)
-            //   else           → AlphaMode::Opaque
+            //   any non-zero blending bit → AlphaMode::Mask(0.5)
+            //   blending == 0             → AlphaMode::Opaque
             //
-            // We use *Mask*, not Blend, for two reasons:
+            // Why "any non-zero" and not "& 0x8000" (which is lotus's
+            // check at mmb.cppm:501): empirically, FFXI uses multiple
+            // bits in this field. Ronfaure trees (asset
+            // `tshimonoyama_1_m`) flag leaves as `0x8000`, but San
+            // d'Oria plants (asset `tshimono_plant_03`) flag leaves
+            // as `0x2000`. Both are foliage textures with cutout
+            // intent. Lotus's narrow check means it would render the
+            // plant opaque too — we can do better by recognising any
+            // non-zero blending as a transparency signal.
             //
-            // 1. FFXI leaf/foliage textures author the "transparent"
-            //    regions with dark RGB and low alpha. Bevy's Blend
-            //    mode multiplies src.rgb * src.alpha + dst * (1-α);
-            //    at α=0.5 the dark src contributes 50% of its color,
-            //    producing visible black outlines around leaf
-            //    silhouettes (the "rectangular with dark cutouts"
-            //    bug). Mask discards the pixel entirely below the
-            //    threshold so those dark pixels never reach the
-            //    framebuffer.
+            // We use *Mask*, not Blend, because FFXI authors the
+            // "transparent" regions of leaf/foliage textures with
+            // dark RGB. Bevy's Blend mode multiplies `src.rgb *
+            // src.alpha + dst * (1-α)`; at α≈0 the dark src still
+            // contributes ~0 (correct), but mipmap-blended edge
+            // pixels with α≈0.5 contribute ~50% of their dark RGB,
+            // producing visible black outlines around leaf
+            // silhouettes. Mask discards below-threshold pixels
+            // entirely so those dark pixels never reach the
+            // framebuffer.
             //
-            // 2. We've already remapped alpha at texture-decode time
-            //    via `ffxi_alpha_remap` to match lotus's
-            //    FragmentBlend formula (raw>>4 / 8.0). For tree-style
-            //    cutout textures with raw α[0..136] this produces a
-            //    near-binary distribution (0 or 255), so threshold
-            //    0.5 cleanly separates leaf from hole.
-            //
-            // True translucent geometry (glass, smoke, water effects)
-            // would want Blend, but FFXI puts that on D3M/D3A chunks
-            // — `0x8000` on MMBs is empirically cutout-mode foliage
-            // and the like.
-            let alpha_mode = if (sub.blending & 0x8000) != 0 {
+            // The remap from `ffxi_alpha_remap` (lotus's bc2 / 8.0
+            // formula) pushes typical foliage textures with raw
+            // α[0..136] into a near-binary 0/255 distribution, so
+            // threshold 0.5 cleanly separates leaf from hole.
+            let alpha_mode = if sub.blending != 0 {
                 AlphaMode::Mask(0.5)
             } else {
                 AlphaMode::Opaque
