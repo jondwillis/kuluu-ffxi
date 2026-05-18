@@ -47,33 +47,36 @@ use crate::snapshot::SceneState;
 /// We dispatch a `LoadVos2Request` for each non-empty slot.
 const EQUIP_SLOT_ORDER_LEN: usize = 8;
 
-/// Empirically-derived `(zone_id, modelid) -> (file_id, chunk_idx)`
-/// mappings for `EntityLook::Standard`. Sorted by `(zone, modelid)`
-/// for binary search; currently empty.
+/// Resolve a fixed-NPC `Standard` look to its actor DAT file_id.
 ///
-/// Why not a `HashMap`: at the expected scale (a few hundred entries
-/// once populated), a sorted slice + `binary_search_by_key` is faster
-/// than the hash + lookup overhead, and `const`-friendly so we pay
-/// zero startup cost. Mirrors `zone_dat.rs`'s approach.
+/// FFXI's retail client uses a 4-bucket piecewise-linear formula to
+/// map an NPC modelid to a ROM DAT file id. Reverse-engineered from
+/// lotus-ffxi (`actor.cpp:24-35`); each bucket is a contiguous block
+/// of file ids the retail install ships at the listed offsets.
 ///
-/// Why empirical instead of formula-driven: the background research
-/// in `/private/tmp/.../a3e85bcf11a013ce5.output` confirmed that NPC
-/// `Standard` modelids have no `BASE + modelid` formula — community
-/// tools (AltanaViewer, DressUp, Stylist) all rely on hand-curated
-/// per-NPC tables. The `npc-survey` example in `ffxi-dat/examples/`
-/// is the workflow for filling this in.
-const MODELID_TABLE: &[((u16, u16), (u32, usize))] = &[
-    // ((zone_id, modelid), (file_id, chunk_idx))
-    // — empty pending empirical survey; see module docs.
-];
-
-/// Resolve a fixed-NPC `Standard` look to its DAT location. Returns
-/// `None` when the table has no entry for `(zone_id, modelid)`.
-pub fn resolve_npc_standard(zone_id: u16, modelid: u16) -> Option<(u32, usize)> {
-    MODELID_TABLE
-        .binary_search_by_key(&(zone_id, modelid), |&(key, _)| key)
-        .ok()
-        .map(|i| MODELID_TABLE[i].1)
+/// | modelid       | dat_id formula                  |
+/// |---------------|---------------------------------|
+/// | < 1500        | `modelid + 1300`                |
+/// | 1500..=2999   | `modelid - 1500 + 51795`        |
+/// | 3000..=3499   | `modelid - 3000 + 99907`        |
+/// | >= 3500       | `modelid - 3500 + 101739`       |
+///
+/// An earlier revision believed this required an empirical
+/// (zone, modelid) lookup table (sourced from POLUtils-style
+/// hand-curated dumps); cross-checking lotus-ffxi against the retail
+/// client showed the table is just the formula's output. Use the
+/// formula directly — no per-zone disambiguation needed.
+pub fn npc_dat_id(modelid: u16) -> u32 {
+    let m = modelid as u32;
+    if m >= 3500 {
+        m - 3500 + 101739
+    } else if m >= 3000 {
+        m - 3000 + 99907
+    } else if m >= 1500 {
+        m - 1500 + 51795
+    } else {
+        m + 1300
+    }
 }
 
 /// Resolve one slot of an `EntityLook::Equipped` look to its DAT
@@ -199,6 +202,7 @@ pub fn dispatch_look_driven_models(
                     chunk_idx: 4,
                     entity_id: we.id,
                     race,
+                    skeleton_file_id: None,
                 });
                 dispatched += 1;
             }
@@ -214,40 +218,58 @@ pub fn dispatch_look_driven_models(
             continue;
         }
 
-        let resolved = match look.0 {
-            EntityLook::Standard { modelid } => resolve_npc_standard(zone_id, modelid),
+        let modelid = match look.0 {
+            EntityLook::Standard { modelid } => modelid,
             // Equipped handled above.
             EntityLook::Equipped { .. } => unreachable!(),
-            // Doors / transports have their own resolvers (TODO):
-            // they encode 'size' rather than 'modelid', so a separate
-            // lookup keyed on size + zone goes here when sampled.
-            EntityLook::Door { .. } | EntityLook::Transport { .. } => None,
+            // Doors / transports encode 'size' rather than 'modelid';
+            // they need their own resolver path (TODO).
+            EntityLook::Door { .. } | EntityLook::Transport { .. } => continue,
         };
-        let Some((file_id, chunk_idx)) = resolved else {
+        // Sentinel modelid 0 = "no model" — common for newly-spawned
+        // entities awaiting a server-side look broadcast.
+        if modelid == 0 {
             continue;
-        };
-
-        // Need a confirmed Bevy entity so `LoadMmbRequest` consumer
-        // can parent under it. The query already gave us
-        // `WorldEntity`, but `LoadMmbRequest` carries the *wire* id —
-        // the consumer does the `tracked.by_id` lookup itself, so we
-        // just need to know the entity is present. (It is: the query
-        // ran, which means the Bevy entity exists.)
+        }
+        // NPC actor DAT (lotus-ffxi formula). The skeleton (SK2),
+        // animation library (MO2), and one-or-more body-part OS2s
+        // all live inside this one DAT.
+        let dat_id = npc_dat_id(modelid);
+        let chunk_indices = crate::dat_vos2::enumerate_vos2_chunks(dat_id);
+        if chunk_indices.is_empty() {
+            // Formula picked a DAT with no OS2 — either the modelid
+            // is out-of-range for the bucket boundaries, or this
+            // entity uses a wrap container we don't yet support
+            // (DOOR/TRANSPORT). Silent skip — `_zone_id` is reserved
+            // for a future per-zone diagnostic toast.
+            let _ = zone_id;
+            continue;
+        }
         debug_assert!(tracked.by_id.contains_key(&we.id));
-        load_mmb_tx.write(LoadMmbRequest {
-            file_id,
-            chunk_idx,
-            world_pos: Vec3::ZERO,
-            entity_id: Some(we.id),
-            world_transform: None,
-        });
-        // Find the Bevy entity again to attach the signature marker.
-        // The query iterator gives us &components, not the Bevy
-        // Entity handle; we look it up via TrackedEntities (the same
-        // path the consumer system uses).
+        // Fire one VOS2 request per body-part chunk. The consumer
+        // dedupes the per-frame skeleton load via the BAKED_SKELETONS
+        // cache (`baked_skeleton_for_file`) so an N-chunk actor only
+        // pays the SK2 parse cost once.
+        for chunk_idx in &chunk_indices {
+            load_vos2_tx.write(LoadVos2Request {
+                file_id: dat_id,
+                chunk_idx: *chunk_idx,
+                entity_id: we.id,
+                race: 0,
+                skeleton_file_id: Some(dat_id),
+            });
+        }
+        info!(
+            "npc dispatch: entity_id={} modelid={} dat_id={} chunks={}",
+            we.id, modelid, dat_id, chunk_indices.len()
+        );
         if let Some(&bevy_e) = tracked.by_id.get(&we.id) {
             commands.entity(bevy_e).insert(EntityModel(look.0));
         }
+        // `load_mmb_tx` is still useful for door / transport models
+        // once those resolvers exist — keep the param to avoid
+        // re-plumbing later.
+        let _ = &load_mmb_tx;
     }
 }
 
@@ -255,27 +277,24 @@ pub fn dispatch_look_driven_models(
 mod tests {
     use super::*;
 
+    /// Each bucket's lower edge maps to the documented base file_id.
+    /// Source: lotus-ffxi `actor.cpp:24-35`.
     #[test]
-    fn resolve_npc_standard_returns_none_when_table_empty() {
-        // No empirical mappings yet — every lookup should miss.
-        assert_eq!(resolve_npc_standard(100, 1), None);
-        assert_eq!(resolve_npc_standard(230, 42), None);
-        assert_eq!(resolve_npc_standard(0, 0), None);
+    fn npc_dat_id_bucket_lower_edges() {
+        assert_eq!(npc_dat_id(0), 1300);
+        assert_eq!(npc_dat_id(1500), 51795);
+        assert_eq!(npc_dat_id(3000), 99907);
+        assert_eq!(npc_dat_id(3500), 101739);
     }
 
-    /// Once mappings start landing, this test guards the sort order
-    /// that `binary_search_by_key` depends on. Empty table is
-    /// trivially sorted; the assertion lives here so a future PR
-    /// adding rows out-of-order trips this rather than silently
-    /// returning wrong results.
+    /// Bucket-boundary off-by-one guard: the formula is `>=` in each
+    /// arm, so modelid=1499 stays in the first bucket and 1500 jumps.
     #[test]
-    fn modelid_table_is_sorted() {
-        for w in MODELID_TABLE.windows(2) {
-            assert!(
-                w[0].0 < w[1].0,
-                "MODELID_TABLE must be sorted ascending by (zone, modelid)"
-            );
-        }
+    fn npc_dat_id_bucket_boundary_off_by_one() {
+        assert_eq!(npc_dat_id(1499), 1499 + 1300);
+        assert_eq!(npc_dat_id(1500), 51795);
+        assert_eq!(npc_dat_id(2999), 2999 - 1500 + 51795);
+        assert_eq!(npc_dat_id(3000), 99907);
     }
 
     /// Equipment slot extraction: high nibble = slot, low 12 bits =

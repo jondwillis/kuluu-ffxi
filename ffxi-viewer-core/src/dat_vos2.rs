@@ -49,6 +49,13 @@ pub struct LoadVos2Request {
     /// (race → skeleton file_id via lotus-ffxi's PCSkeletonIDs
     /// table). `0` means "no race info" and disables the bake.
     pub race: u8,
+    /// Optional explicit skeleton DAT file_id. When `Some(id)`, the
+    /// bake uses `baked_skeleton_for_file(id)` instead of the
+    /// race → file_id lookup. Used by the NPC actor dispatcher,
+    /// where the skeleton lives in the same DAT as the OS2 mesh
+    /// (lotus-ffxi `actor.cpp:36` — `ActorSkeletonStatic::getSkeleton(engine, dat_index)`).
+    /// PCs leave this `None`; the race-based path remains.
+    pub skeleton_file_id: Option<u32>,
 }
 
 /// One named texture decoded from an IMG chunk colocated with the
@@ -64,6 +71,32 @@ pub struct Vos2NamedTexture {
 pub struct LoadedVos2 {
     pub mesh: Vos2Mesh,
     pub textures: Vec<Vos2NamedTexture>,
+}
+
+/// Enumerate every VertexOs2 chunk index in a DAT file. The NPC
+/// actor dispatcher uses this to expand one `Standard` look into N
+/// per-chunk `LoadVos2Request`s — one per body-part / mesh segment.
+/// Returns an empty vec if the DAT is unreadable or contains no OS2
+/// chunks (the latter often means the modelid formula picked a DAT
+/// that isn't an actor; the dispatcher logs and moves on).
+pub fn enumerate_vos2_chunks(file_id: u32) -> Vec<usize> {
+    let Ok(root) = DatRoot::from_env_or_default() else {
+        return Vec::new();
+    };
+    let Ok(loc) = root.resolve(file_id) else {
+        return Vec::new();
+    };
+    let Ok(bytes) = fs::read(loc.path_under(root.root())) else {
+        return Vec::new();
+    };
+    walk(&bytes)
+        .enumerate()
+        .filter_map(|(i, c)| {
+            c.ok()
+                .filter(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::VertexOs2))
+                .map(|_| i)
+        })
+        .collect()
 }
 
 /// Load + parse a VertexOs2 chunk at `(file_id, chunk_idx)`. Errors
@@ -351,14 +384,21 @@ pub fn process_load_vos2_requests(
         if despawned.insert(req.entity_id) {
             commands.entity(bevy_e).remove::<Mesh3d>();
         }
-        spawn_vos2_meshes(
+        // Skeleton resolution: explicit override wins (NPC dispatch
+        // case where the skeleton ships in the same DAT as the OS2),
+        // otherwise race-keyed lookup (PC equipment dispatch).
+        let baked_owned = match req.skeleton_file_id {
+            Some(id) => baked_skeleton_for_file(id),
+            None => baked_skeleton(req.race),
+        };
+        spawn_vos2_meshes_with_skeleton(
             &mut commands,
             &mut meshes,
             &mut materials,
             &mut images,
             bevy_e,
             loaded,
-            req.race,
+            baked_owned.as_ref(),
         );
         info!(
             "vos2 spawn: file_id={} entity_id={} verts={} groups={}",
@@ -388,6 +428,22 @@ pub fn spawn_vos2_meshes(
     loaded: &LoadedVos2,
     race: u8,
 ) {
+    let baked = baked_skeleton(race);
+    spawn_vos2_meshes_with_skeleton(commands, meshes, materials, images, parent, loaded, baked.as_ref());
+}
+
+/// Same as [`spawn_vos2_meshes`] but takes the resolved skeleton
+/// directly — used by the NPC actor dispatcher which resolves the
+/// skeleton from the actor's own DAT file_id, not from a race byte.
+fn spawn_vos2_meshes_with_skeleton(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    parent: Entity,
+    loaded: &LoadedVos2,
+    baked_owned: Option<&BakedSkeleton>,
+) {
     // Build per-file texture pool. Reuses the lotus-ffxi VOS2
     // convention that group names like `"tim     em_b61_3"` use the
     // `tim ` prefix to flag a texture-name slot.
@@ -407,11 +463,10 @@ pub fn spawn_vos2_meshes(
     // Bind-pose bake: lift bone-local vertices to model space via
     // `bone_world[bone_id] * local_pos` before the FFXI→Bevy axis
     // flip. `baked_for_mesh` returns None when the skeleton doesn't
-    // fit (race mismatch or monstrosity race), in which case the
-    // helpers fall back to local-space rendering — the pre-bake
-    // behavior, small and contained at the entity origin.
-    let baked_owned = baked_skeleton(race);
-    let baked = baked_for_mesh(&loaded.mesh, baked_owned.as_ref());
+    // fit (bone-index out of range), in which case the helpers fall
+    // back to local-space rendering — the pre-bake behavior, small
+    // and contained at the entity origin.
+    let baked = baked_for_mesh(&loaded.mesh, baked_owned);
     let positions: Vec<[f32; 3]> = loaded
         .mesh
         .vertices

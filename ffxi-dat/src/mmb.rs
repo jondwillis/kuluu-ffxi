@@ -332,50 +332,65 @@ impl<'a> MmbSubRecord<'a> {
     /// winding doesn't always match the OpenGL CCW front-face
     /// convention.
     pub fn parse_triangle_list(&self) -> Vec<[u16; 3]> {
-        let strip_all = self.parse_triangle_strip();
-        if strip_all.len() < 4 {
+        // Layout (cross-checked against lotus-ffxi `mmb.cppm` parseModel):
+        //
+        //   [vertex block: count*36 bytes]
+        //   [u16 num_indices]           strip-length header
+        //   [u16 pad]                   skipped — advance is 4 bytes after count
+        //   [num_indices × u16]         the strip indices
+        //   [u16, u16 trailing align]   2 u16s past the last sliding window
+        //   [optional u16 odd-pad]      if num_indices is odd
+        //
+        // Walk `num_indices - 2` sliding 3-index windows; emit one tri
+        // per window using iteration-parity for winding. Skip when
+        // `i1 == i2 || i2 == i3` (degenerate). DO NOT treat `i1 == i3`
+        // as degenerate — that's a legitimate bowtie pinch in a strip.
+        //
+        // Fixes vs the previous Rust implementation:
+        //   1. 4-byte header skip (was 2) — pad u16 is no longer
+        //      consumed as the strip's first index.
+        //   2. Strip bounded by `num_indices` — trailing alignment
+        //      padding no longer leaks in as fake indices (the source
+        //      of "stretched tris across the mesh" on bulletin-board
+        //      and wall assets in zones 230 / 232).
+        //   3. Degenerate test no longer rejects `i1 == i3` — restores
+        //      legitimate pinch tris that were silently dropped
+        //      (the source of small triangular holes).
+        //   4. Winding parity comes from the iteration index, not a
+        //      toggle state — degenerates no longer flip downstream
+        //      winding (the source of mixed inside-out faces near
+        //      pinches and seams).
+        //   5. Removed the `(a, a, a)` "triple terminator" rule — not
+        //      part of the actual strip protocol per lotus/LSB.
+        const HEADER_BYTES: usize = 4;
+        let vert_bytes = self.count as usize * 36;
+        if vert_bytes + HEADER_BYTES > self.body.len() {
             return Vec::new();
         }
-        // First u16 is the declared strip length (count of subsequent
-        // index u16s that are real strip data). Any u16s past the
-        // declared length are trailing padding inside the sub-record
-        // body and MUST NOT be parsed as indices — doing so emits
-        // garbage triangles that connect vertex 0 to wherever the
-        // strip ended, producing the "stretched triangle across the
-        // mesh" artifact (verified on tshimonopa_backbord01/kabe in
-        // DAT 330).
-        let declared = strip_all[0] as usize;
-        let avail = strip_all.len() - 1;
-        let n = declared.min(avail);
-        let strip = &strip_all[1..1 + n];
-
-        let mut out = Vec::with_capacity(strip.len().saturating_sub(2));
-        let mut i = 0;
-        let mut flip = false;
-        while i + 2 < strip.len() {
-            let a = strip[i];
-            let b = strip[i + 1];
-            let c = strip[i + 2];
-
-            // Triple-repeat = strip terminator → reset winding, advance
-            // past the marker so the next iteration starts fresh.
-            if a == b && b == c {
-                flip = false;
-                i += 1;
+        let count_off = vert_bytes;
+        let num = u16::from_le_bytes([self.body[count_off], self.body[count_off + 1]]) as usize;
+        if num < 3 {
+            return Vec::new();
+        }
+        let strip_off = count_off + HEADER_BYTES;
+        let bytes_needed = num * 2;
+        if strip_off + bytes_needed > self.body.len() {
+            return Vec::new();
+        }
+        let read = |i: usize| -> u16 {
+            let p = strip_off + i * 2;
+            u16::from_le_bytes([self.body[p], self.body[p + 1]])
+        };
+        let mut out = Vec::with_capacity(num.saturating_sub(2));
+        for i in 0..num - 2 {
+            let i1 = read(i);
+            let i2 = read(i + 1);
+            let i3 = read(i + 2);
+            if i1 == i2 || i2 == i3 {
                 continue;
             }
-            // Strict degenerate check (any two equal): emit nothing,
-            // advance by 1, but DO flip winding (treats degenerate
-            // pairs as winding-flip restarts within an open strip).
-            if a == b || b == c || a == c {
-                flip = !flip;
-                i += 1;
-                continue;
-            }
-            let tri = if flip { [a, c, b] } else { [a, b, c] };
+            let tri = if i % 2 == 1 { [i2, i1, i3] } else { [i1, i2, i3] };
             out.push(tri);
-            flip = !flip;
-            i += 1;
         }
         out
     }
