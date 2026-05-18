@@ -39,6 +39,8 @@ pub mod snapshot;
 pub mod source;
 pub mod sun_moon;
 pub mod target_ring;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod weather;
 pub mod weather_fx;
 pub mod zone_lines;
 
@@ -100,6 +102,13 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // via `fs::read`. wasm can't yet — see `dat_mmb.rs` for the gate.
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(dat_mmb::DatOverlayPlugin);
+        // Per-zone TOD-driven fog + ambient from the DAT's Weather
+        // chunks (kind 0x2F). Runs every frame after the zone-change
+        // atmosphere applier so the live lerp overrides the heuristic
+        // baseline. Native-only (synchronous fs reads to load DAT
+        // bytes; same constraint as `dat_mmb::DatOverlayPlugin`).
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins(weather::WeatherPlugin);
         app.init_resource::<SceneState>()
             .init_resource::<EventLog>()
             .init_resource::<TrackedEntities>()
