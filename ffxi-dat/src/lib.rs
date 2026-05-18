@@ -18,6 +18,7 @@ pub mod archive;
 pub mod bone;
 pub mod chunk;
 pub mod ftable;
+pub mod generator;
 pub mod kind;
 pub mod mmb;
 pub mod mzb;
