@@ -907,7 +907,13 @@ impl SessionState {
             | AgentEvent::TellReceived { .. }
             | AgentEvent::SceneSummary { .. }
             | AgentEvent::HumanInControl { .. }
-            | AgentEvent::HumanReleased => {}
+            | AgentEvent::HumanReleased
+            // Music events are pure pass-through to the viewer-core
+            // BGM system; SessionState carries no music fields, the
+            // active slot/track lives in viewer-core's BgmSlots
+            // resource.
+            | AgentEvent::MusicChanged { .. }
+            | AgentEvent::MusicVolumeChanged { .. } => {}
             AgentEvent::InventoryUpdated { container, update } => {
                 let entry = self.inventory.containers.entry(*container).or_default();
                 match update {
@@ -1196,6 +1202,21 @@ pub enum AgentEvent {
     /// `/agent resume` — the operator released control back to the
     /// agent. Pair with [`HumanInControl`](Self::HumanInControl).
     HumanReleased,
+    /// 0x05F `GP_SERV_COMMAND_MUSIC` — server-pushed BGM slot
+    /// assignment. `slot` matches LSB's `MusicSlot` enum (0=ZoneDay,
+    /// 1=ZoneNight, 2=CombatSolo, 3=CombatParty, 4=Mount, 5=Dead,
+    /// 6=MogHouse, 7=Fishing); `track_id` is the numeric music id
+    /// resolved to `sound/win/music/data/musicNNN.bgw` by ffxi-audio.
+    MusicChanged {
+        slot: u8,
+        track_id: u16,
+    },
+    /// 0x060 `GP_SERV_COMMAND_MUSICVOLUME` — per-slot volume gain
+    /// (0..=127 in LSB; consumers should normalize before applying).
+    MusicVolumeChanged {
+        slot: u8,
+        volume: u8,
+    },
 }
 
 /// Strictly enumerated commands an agent can issue. **Do not** add a generic

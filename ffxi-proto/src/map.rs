@@ -192,6 +192,19 @@ pub mod s2c {
     /// `vendor/server/src/map/packets/s2c/0x057_weather.h` and
     /// `vendor/server/src/map/enums/weather.h`.
     pub const WEATHER: u16 = 0x057;
+    /// `GP_SERV_COMMAND_MUSIC` — server-pushed BGM slot assignment.
+    /// Body: `u16 Slot, u16 MusicNum` = 4 bytes. `Slot` indexes the
+    /// LSB `MusicSlot` enum (0=ZoneDay, 1=ZoneNight, 2=CombatSolo,
+    /// 3=CombatParty, 4=Mount, 5=Dead, 6=MogHouse, 7=Fishing); the
+    /// client picks which slot is currently audible based on its
+    /// own state machine. See
+    /// `vendor/server/src/map/packets/s2c/0x05f_music.{h,cpp}` and
+    /// `vendor/server/src/map/enums/music_slot.h`.
+    pub const MUSIC: u16 = 0x05F;
+    /// `GP_SERV_COMMAND_MUSICVOLUME` — per-slot music volume tweak.
+    /// Body shape mirrors `MUSIC` (u16 slot, u16 volume). See
+    /// `vendor/server/src/map/packets/s2c/0x060_musicvolume.h`.
+    pub const MUSIC_VOLUME: u16 = 0x060;
     pub const EQUIP_CLEAR: u16 = 0x04F;
     pub const EQUIP_LIST: u16 = 0x050;
     pub const GRAP_LIST: u16 = 0x051;

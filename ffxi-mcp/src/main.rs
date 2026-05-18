@@ -965,6 +965,8 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::LlmDecision { .. } => "llm_decision",
         AgentEvent::HumanInControl { .. } => "human_in_control",
         AgentEvent::HumanReleased => "human_released",
+        AgentEvent::MusicChanged { .. } => "music_changed",
+        AgentEvent::MusicVolumeChanged { .. } => "music_volume_changed",
     }
 }
 

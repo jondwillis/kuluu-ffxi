@@ -126,6 +126,12 @@ pub fn event_to_viewer_event(ev: AgentEvent) -> Option<wire::ViewerEvent> {
         AgentEvent::Reconnected { downtime_ms } => {
             Some(wire::ViewerEvent::Reconnected { downtime_ms })
         }
+        AgentEvent::MusicChanged { slot, track_id } => {
+            Some(wire::ViewerEvent::MusicChanged { slot, track_id })
+        }
+        AgentEvent::MusicVolumeChanged { slot, volume } => {
+            Some(wire::ViewerEvent::MusicVolumeChanged { slot, volume })
+        }
         // Snapshot-folded signals (Connected, StageChanged, PositionChanged,
         // EntityUpserted, ChatLine, PartyMemberUpdated, Diagnostics) are
         // already visible through the state watch — no need to push them as

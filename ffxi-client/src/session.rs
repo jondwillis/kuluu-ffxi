@@ -803,6 +803,29 @@ fn handle_sub_packet(
             // it as "unknown opcode" once per action frame; intentionally
             // a no-op until we ship a bitstream decoder.
         }
+        op if op == s2c::MUSIC => {
+            // 0x05F `GP_SERV_COMMAND_MUSIC` — 4-byte body:
+            // `u16 Slot, u16 MusicNum`. Slot indexes LSB's
+            // `MusicSlot` enum; the viewer-core BGM system decides
+            // which slot is currently audible. See
+            // `vendor/server/src/map/packets/s2c/0x05f_music.{h,cpp}`.
+            if sub.data.len() >= 4 {
+                let slot = u16::from_le_bytes([sub.data[0], sub.data[1]]) as u8;
+                let track_id = u16::from_le_bytes([sub.data[2], sub.data[3]]);
+                let _ = event_tx.send(AgentEvent::MusicChanged { slot, track_id });
+            }
+        }
+        op if op == s2c::MUSIC_VOLUME => {
+            // 0x060 `GP_SERV_COMMAND_MUSICVOLUME` — same 4-byte
+            // layout as 0x05F but the second field is a volume
+            // value. We pass it through as u8 (LSB sends u16, but
+            // the actual range is 0..=127 — viewer normalises).
+            if sub.data.len() >= 4 {
+                let slot = u16::from_le_bytes([sub.data[0], sub.data[1]]) as u8;
+                let volume = u16::from_le_bytes([sub.data[2], sub.data[3]]) as u8;
+                let _ = event_tx.send(AgentEvent::MusicVolumeChanged { slot, volume });
+            }
+        }
         op if op == s2c::WEATHER => {
             // 0x057 — current zone weather. 8-byte fixed body:
             // `u32 StartTime, u16 WeatherNumber, u16 OffsetTime`. We only

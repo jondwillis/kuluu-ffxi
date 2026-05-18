@@ -221,6 +221,11 @@ pub enum ChatChannel {
     /// 0x029 / 0x02D battle messages. Drawn in orange in the chat panel
     /// to mirror classic FFXI's combat-log color.
     Battle,
+    /// Client-internal toast: slash-command output, auto-load notes,
+    /// zone-change diagnostics, etc. Distinct from `System` (which is
+    /// reserved for server-pushed `0x053 SYSTEMMES` text) so the chat
+    /// panel can route operator-visible debug into its own pane.
+    Debug,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +234,14 @@ pub struct ChatLine {
     pub sender: String,
     pub text: String,
     pub server_ts: u32,
+    /// Monotonic arrival-order sequence stamped at chat-line creation
+    /// (either at server-ingest or at `push_local_toast`). The panel
+    /// renderer merges server chat and local toasts by this key so
+    /// strict-arrival order survives the dual-buffer split.
+    /// `0` is the default for synthetic / test lines and predates any
+    /// real session traffic.
+    #[serde(default)]
+    pub local_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -507,6 +520,15 @@ pub enum ViewerEvent {
     EngagedBy { entity_id: u32 },
     TellReceived { from: String, text: String },
     Reconnected { downtime_ms: u64 },
+    /// 0x05F `GP_SERV_COMMAND_MUSIC` — server selected a new track
+    /// for one of the 8 LSB `MusicSlot`s (0=ZoneDay…7=Fishing). The
+    /// viewer's BGM system decides which slot is audible based on
+    /// its own state machine (combat, mount, mog-house, etc.).
+    MusicChanged { slot: u8, track_id: u16 },
+    /// 0x060 `GP_SERV_COMMAND_MUSICVOLUME` — per-slot volume tweak.
+    /// `volume` is the raw LSB byte (0..=127 typically); consumers
+    /// normalize before applying.
+    MusicVolumeChanged { slot: u8, volume: u8 },
 }
 
 /// Server→viewer frame on the WebSocket. `Snapshot` and `Delta` are boxed
