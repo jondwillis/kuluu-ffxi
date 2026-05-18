@@ -52,6 +52,11 @@ pub(super) fn spawn_char_list_ui(
         .unwrap_or_else(|| if chars.0.is_empty() { new_char_index } else { 0 });
     commands.insert_resource(CharCursor(initial_cursor));
 
+    // No opaque BackgroundColor — the 3D character preview scene
+    // (spawned in `char_preview::spawn_preview`) renders behind the
+    // launcher UI and would be hidden by a solid fill. The buttons
+    // and labels keep their own backgrounds so they remain
+    // readable.
     commands
         .spawn((
             CharListRoot,
@@ -60,11 +65,14 @@ pub(super) fn spawn_char_list_ui(
                 height: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
                 justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
+                // Right-align so the centered 3D character preview
+                // (anchored at world (0, 0, 0)) doesn't get hidden
+                // by the button column on its left.
+                align_items: AlignItems::FlexEnd,
                 row_gap: Val::Px(8.0),
+                padding: UiRect::right(Val::Px(40.0)),
                 ..default()
             },
-            BackgroundColor(Color::srgb(0.04, 0.04, 0.05)),
         ))
         .with_children(|parent| {
             parent.spawn((

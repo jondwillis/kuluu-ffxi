@@ -50,6 +50,7 @@ mod account_create;
 mod async_work;
 mod char_create;
 mod char_list;
+mod char_preview;
 mod login;
 
 use std::sync::{Arc, Mutex};
@@ -469,13 +470,18 @@ pub(crate) fn register(
     );
 
     // Char list: spawn UI from the snapshot, dispatch on click.
+    // `char_preview::spawn_preview` runs *after* `spawn_char_list_ui`
+    // so the `CharCursor` resource it depends on already exists.
     app.add_systems(
         OnEnter(LauncherState::CharList),
-        char_list::spawn_char_list_ui,
+        (char_list::spawn_char_list_ui, char_preview::spawn_preview).chain(),
     )
     .add_systems(
         OnExit(LauncherState::CharList),
-        char_list::despawn_char_list_ui,
+        (
+            char_list::despawn_char_list_ui,
+            char_preview::despawn_preview,
+        ),
     )
     .add_systems(
         Update,
@@ -483,6 +489,7 @@ pub(crate) fn register(
             direct_mode_charlist_autoselect,
             char_list::handle_click_system,
             char_list::handle_keyboard_system,
+            char_preview::refresh_preview_on_cursor_change,
         )
             .run_if(in_state(LauncherState::CharList)),
     );
