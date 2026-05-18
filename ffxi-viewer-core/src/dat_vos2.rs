@@ -156,11 +156,45 @@ fn baked_skeleton() -> Option<&'static BakedSkeleton> {
         .as_ref()
 }
 
+/// Decide whether the loaded skeleton is a plausible match for this
+/// mesh. Returns `false` when *any* bone the mesh would reference
+/// falls outside the skeleton's bone count — the signature of a
+/// race mismatch (e.g., a Tarutaru body whose palette indexes bone
+/// 98 against our hardcoded 94-bone hum_ skeleton).
+///
+/// When the skeleton doesn't fit, we'd rather render the mesh in
+/// bone-local space (the pre-bake crumpled blob — small and
+/// contained at the entity origin) than do a mixed bake where SOME
+/// verts go to wrong bone positions in our skeleton, which
+/// produces the giant-spike silhouette seen on race=4 Tarutaru in
+/// the first bake screenshots.
+fn skeleton_fits_mesh(baked: &BakedSkeleton, mesh: &Vos2Mesh) -> bool {
+    let n = baked.world.len();
+    if mesh.header.use_bone_table() {
+        mesh.bone_table.iter().all(|&b| (b as usize) < n)
+    } else {
+        mesh.bone_indices
+            .iter()
+            .all(|bi| (bi.bone_index1 as usize) < n)
+    }
+}
+
+/// Effective skeleton for a single mesh: `Some(baked)` when the
+/// hardcoded skeleton's bone count covers every bone the mesh would
+/// reference, `None` otherwise. Computed once per VOS2 spawn so the
+/// per-vertex helpers stay branch-light.
+fn baked_for_mesh<'a>(
+    mesh: &Vos2Mesh,
+    baked: Option<&'a BakedSkeleton>,
+) -> Option<&'a BakedSkeleton> {
+    baked.filter(|b| skeleton_fits_mesh(b, mesh))
+}
+
 /// Apply the skeleton's bind-pose `bone_world` matrix to one local
-/// vertex position, returning the model-space position. Falls back
-/// to the local position when no skeleton is loaded or the vertex's
-/// resolved bone id is out of range — equivalent to the pre-bake
-/// behavior of treating the vertex pool as already in model space.
+/// vertex position, returning the model-space position. Caller is
+/// expected to pass `baked = None` when the skeleton doesn't fit
+/// this mesh (race mismatch); the helper then returns `local`
+/// untouched, which mirrors the pre-bake behavior.
 fn bake_position(
     mesh: &Vos2Mesh,
     vertex_idx: usize,
@@ -292,11 +326,14 @@ pub fn process_load_vos2_requests(
         //
         // Skeleton is hardcoded today (file 7072 chunk[70], hum_)
         // because race→skeleton_file_id mapping is unsolved.
-        // Non-humanoid races will distort; that's a known follow-up.
-        // When the skeleton load fails (missing DAT, parse error)
-        // the helpers fall back to local positions, restoring the
-        // pre-bake behavior so the renderer keeps working.
-        let baked = baked_skeleton();
+        // `baked_for_mesh` returns None when the mesh references
+        // bones outside the hardcoded skeleton (= race mismatch),
+        // which makes the per-vertex helpers fall through to the
+        // local position — a small bone-local "crumpled" rendering
+        // is much less wrong than partially-baking against the
+        // wrong skeleton (which produced the giant-spike artifact
+        // on Tarutaru and other non-humanoid races).
+        let baked = baked_for_mesh(&loaded.mesh, baked_skeleton());
         // FFXI vertices are in left-handed (X-right, Y-forward,
         // Z-up). Bevy is right-handed Y-up. Mirror the
         // `scene::ffxi_to_bevy` transform: (x, y, z) → (x, -z, -y)
@@ -376,7 +413,7 @@ pub fn process_load_vos2_requests(
             let mat = materials.add(StandardMaterial {
                 base_color: Color::WHITE,
                 base_color_texture: tex_handle,
-                perceptual_roughness: 0.7,
+                perceptual_roughness: 1.0,
                 cull_mode: None,
                 ..default()
             });
