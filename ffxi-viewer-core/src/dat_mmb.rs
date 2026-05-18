@@ -147,6 +147,12 @@ pub struct MmbSubMesh {
     pub uvs: Vec<[f32; 2]>,
     pub colors: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
+    /// Raw blending field from `SMMBModelHeader.blending`. Bit 0x8000
+    /// marks alpha-blended (translucent) geometry in lotus's pipeline
+    /// (`mesh->has_transparency = mmb_mesh.blending & 0x8000`). We
+    /// only check that bit at material-build time; the rest of the
+    /// field's bit-meaning is undocumented.
+    pub blending: u16,
 }
 
 /// One named IMG chunk decoded into RGBA. The `name` is the 8-byte
@@ -281,6 +287,7 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
             uvs,
             colors,
             indices,
+            blending: m.blending,
         });
     }
 
@@ -538,6 +545,25 @@ pub fn process_load_mmb_requests(
                 .cloned()
                 .or_else(|| first_texture.clone());
 
+            // Alpha mode (lotus parity, mmb.cppm:501 + pipeline
+            // selection at 577-580):
+            //   blending & 0x8000 → `AlphaMode::Blend` (true sorted
+            //     transparency — glass, water effects, etc.)
+            //   otherwise → `AlphaMode::Mask(0.5)` (alpha cutout —
+            //     tree leaves, fence slats, anything authored with
+            //     RGBA where the alpha channel cuts a silhouette).
+            //     Pixels with alpha ≥ 0.5 stay fully opaque, so this
+            //     is safe for fully-opaque textures too.
+            //
+            // Before this, MMBs used the default `AlphaMode::Opaque`,
+            // which renders tree-leaf textures as opaque rectangles —
+            // the visible "trees look like blocks" / "Ronfaure is
+            // shady" symptom.
+            let alpha_mode = if (sub.blending & 0x8000) != 0 {
+                AlphaMode::Blend
+            } else {
+                AlphaMode::Mask(0.5)
+            };
             let mat = materials.add(StandardMaterial {
                 // WHITE so the mesh's per-vertex `ATTRIBUTE_COLOR`
                 // (FFXI's baked vertex lighting) and the bound
@@ -546,6 +572,7 @@ pub fn process_load_mmb_requests(
                 // base_color × vertex_color × texture.
                 base_color: Color::WHITE,
                 base_color_texture: sub_texture,
+                alpha_mode,
                 perceptual_roughness: 1.0,
                 reflectance: 0.1,
                 // UNLIT is load-bearing: FFXI MMBs ship pre-rotated
