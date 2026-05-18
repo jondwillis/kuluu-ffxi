@@ -128,10 +128,20 @@ pub(super) fn spawn_preview(
     // The parent entity the equipment meshes will attach under.
     // Survives cursor-change refreshes; only its children get
     // despawned + respawned.
+    //
+    // 180° flip around X compensates for the bake's axis-flip
+    // convention: `spawn_vos2_meshes` maps FFXI Z (up) to Bevy −Y,
+    // which makes the character's head point at −Y in raw Bevy
+    // space. The in-game scene also uses this inverted Y so an
+    // upright character renders correctly in the world view, but
+    // the launcher's camera uses standard +Y-up convention.
+    // Rotating the parent 180° around X flips the character's
+    // head to +Y in launcher space so it renders right-side-up.
     let parent = commands
         .spawn((
             CharPreviewParent,
-            Transform::from_translation(PREVIEW_PARENT_POS),
+            Transform::from_translation(PREVIEW_PARENT_POS)
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::PI)),
             Visibility::default(),
             ChildOf(root),
         ))
