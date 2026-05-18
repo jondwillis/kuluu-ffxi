@@ -764,11 +764,25 @@ async fn parse_view_chr_info2(stream: &mut TcpStream) -> Result<Vec<CharSlot>> {
         //   off+ 2..4  uint8 mjob_no, sjob_no
         //   off+ 4..6  uint16 face_no
         //   off+ 6..12 town, gen_flag, hair, size, world_no
-        //   off+12..28 uint16 GrapIDTbl[8]   (head..ranged)
-        // Empty/dummy slots arrive with all-zero TC_OPERATION_MAKE
-        // — the appearance fields then read as zero and the model
-        // won't render (resolve_equipment_slot returns None for id
-        // 0); the launcher should treat zero `race` as "no preview".
+        //   off+12..28 uint16 GrapIDTbl[8]
+        //
+        // GrapIDTbl ordering for chr_info2 is **shifted by one** vs
+        // the in-game `EntityLook::Equipped` block — LSB writes
+        // [0]=face, [1]=head, [2]=body, [3]=hands, [4]=legs,
+        // [5]=feet, [6]=main, [7]=sub (no ranged).
+        // See `vendor/server/src/login/data_session.cpp:191-197`.
+        //
+        // Values stored in chr_info2 are **raw database item-model
+        // ids** (12-bit), NOT the slot-tagged form CHAR_PC uses
+        // (high nibble = slot tag). `dat_vos2::spawn_equipped`
+        // calls `resolve_equipment_slot` which needs the slot tag,
+        // so we OR it in here per canonical slot order (head=1,
+        // body=2, … sub=7).
+        //
+        // Empty / dummy slots arrive with zero TC_OPERATION_MAKE
+        // — appearance fields then read as zero and the model
+        // won't render; the launcher should treat zero `race` as
+        // "no preview".
         let tc = off + 44;
         let mon_no = u16::from_le_bytes(rest[tc..tc + 2].try_into().unwrap());
         let race = (mon_no & 0xFF) as u8;
@@ -778,14 +792,26 @@ async fn parse_view_chr_info2(stream: &mut TcpStream) -> Result<Vec<CharSlot>> {
             let o = tc + 12 + i * 2;
             u16::from_le_bytes(rest[o..o + 2].try_into().unwrap())
         };
-        let head = grap(0);
-        let body = grap(1);
-        let hands = grap(2);
-        let legs = grap(3);
-        let feet = grap(4);
-        let main = grap(5);
-        let sub = grap(6);
-        let ranged = grap(7);
+        // Slot-tag the raw item-model id with its canonical slot
+        // index (1=head, 2=body, ... 7=sub) so
+        // `resolve_equipment_slot` can route to the right tier
+        // formula. We mask the low 12 bits in case LSB ever
+        // started shipping pre-tagged ids — keeps the OR
+        // idempotent.
+        let tag = |slot_idx: u16, raw: u16| -> u16 { (slot_idx << 12) | (raw & 0x0FFF) };
+        // GrapIDTbl[0] is `face` (also redundantly stored in
+        // face_no above) — skip it; we want index 1 onward.
+        let head = tag(1, grap(1));
+        let body = tag(2, grap(2));
+        let hands = tag(3, grap(3));
+        let legs = tag(4, grap(4));
+        let feet = tag(5, grap(5));
+        let main = tag(6, grap(6));
+        let sub = tag(7, grap(7));
+        // chr_info2 doesn't carry ranged — leave it empty. Items
+        // with id 0 get sentinel-rejected by
+        // resolve_equipment_slot so this is safe.
+        let ranged = 0u16;
 
         slots.push(CharSlot {
             char_id,

@@ -65,7 +65,15 @@ pub(super) fn spawn_preview(
     commands.insert_resource(PreviewedSlot::default());
 
     // Root entity owns the whole subgraph — camera, light, parent.
-    let root = commands.spawn(CharPreviewRoot).id();
+    // Needs Transform + Visibility so children inherit GlobalTransform
+    // and InheritedVisibility (Bevy hierarchy warning B0004 otherwise).
+    let root = commands
+        .spawn((
+            CharPreviewRoot,
+            Transform::default(),
+            Visibility::default(),
+        ))
+        .id();
 
     // 3D camera. Default order=0 puts it behind UI which renders at
     // a higher order. Camera looks at the parent's world position
@@ -220,7 +228,21 @@ fn spawn_for_slot(
         slot.legs, slot.feet, slot.main, slot.sub, slot.ranged,
     );
     info!(
-        "char preview: char_id={} race={} face={} equipment_slots_spawned={}",
-        slot.char_id, slot.race, slot.face, spawned
+        "char preview: char_id={} race={} face={} \
+         head=0x{:04X} body=0x{:04X} hands=0x{:04X} legs=0x{:04X} \
+         feet=0x{:04X} main=0x{:04X} sub=0x{:04X} ranged=0x{:04X} \
+         equipment_slots_spawned={}",
+        slot.char_id,
+        slot.race,
+        slot.face,
+        slot.head,
+        slot.body,
+        slot.hands,
+        slot.legs,
+        slot.feet,
+        slot.main,
+        slot.sub,
+        slot.ranged,
+        spawned,
     );
 }
