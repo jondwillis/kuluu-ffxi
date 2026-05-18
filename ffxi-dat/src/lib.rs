@@ -25,6 +25,7 @@ pub mod npc_names;
 pub mod texture;
 pub mod vos2;
 pub mod vtable;
+pub mod weather;
 pub mod zone_dat;
 
 pub use archive::{DatLocation, DatRoot};
@@ -71,6 +72,9 @@ pub enum DatError {
 
     #[error("MZB error: {0}")]
     Mzb(String),
+
+    #[error("Weather error: {0}")]
+    Weather(String),
 }
 
 pub type Result<T> = std::result::Result<T, DatError>;
