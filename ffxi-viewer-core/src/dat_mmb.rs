@@ -557,7 +557,17 @@ pub fn process_load_mmb_requests(
                 // on floors where the pre-rotated normals point
                 // away from the engine sun. Don't disable without
                 // also stripping the baked-color/normal channels.
-                // unlit: true,
+                //
+                // Regression note: commit b31a17e ("sun_moon: fix
+                // black-disc bug") collateral-damaged this line —
+                // the commit's stated scope was sun/moon disc HDR,
+                // but its diff also commented out the MMB unlit.
+                // The visible symptom was "missing textures" on
+                // floors/walls/stairs in dim zones (Bastok Mines),
+                // because PBR re-lighting against FFXI's pre-baked
+                // normals leaves whole surfaces nearly black even
+                // when the textures are correctly paired.
+                unlit: true,
                 // FFXI triangle-strip winding isn't pinned to a
                 // canonical front/back convention — render both
                 // sides instead of guessing.
