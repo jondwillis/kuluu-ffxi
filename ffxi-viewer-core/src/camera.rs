@@ -123,15 +123,9 @@ pub fn spawn_camera(mut commands: Commands) {
         // shadows are jagged single-sample hard edges.
         ShadowFilteringMethod::Gaussian,
         Msaa::Sample4,
-        // PS2-era bloom. Bevy 0.17 ships an `OLD_SCHOOL` preset that
-        // matches the era FFXI launched in — soft additive halo on
-        // bright pixels, low threshold so even non-emissive whites
-        // bloom slightly. Intensity bumped a hair above the preset's
-        // 0.05 so the target/aggro emissives read as "glowing"
-        // without smearing the whole frame.
         Bloom {
-            intensity: 0.12,
-            ..Bloom::OLD_SCHOOL
+            intensity: 0.08,
+            ..Bloom::NATURAL
         },
         // Raymarched volumetric fog. Pairs with the `VolumetricLight`
         // marker on the directional light (`scene.rs::setup_world`)
