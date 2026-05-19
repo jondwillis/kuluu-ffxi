@@ -706,20 +706,19 @@ pub fn process_load_vos2_requests(
         // re-upload mesh attributes every frame.
         //
         // NPC dispatch sets `race: 0`; PC dispatch sets `race: <1..=8>`
-        // and a race-keyed skeleton file_id. Per-slot fit-gating: a
-        // slot whose `bone_table` indices fall within the race
-        // skeleton's bone count goes GPU; one that doesn't falls back
-        // to the CPU bake so it still renders (static bind-pose
-        // half-body) instead of vanishing to weight=0.
+        // and a race-keyed skeleton file_id. We always take the GPU
+        // path when the race skeleton is available — per-vertex
+        // fallback in `spawn_skinned_actor` rigidly binds any
+        // out-of-range bone to bone[0] (the hip) so individual
+        // verts that miss don't vanish. The slot-level fit check
+        // is now informational only: it surfaces "how bad is the
+        // mismatch" in logs without dropping the whole slot to a
+        // CPU bake (which had its own problems — bind-pose meshes
+        // overlaid on the GPU body at the wrong origin).
         if let (Some(_dat_id), Some(baked)) = (req.skeleton_file_id, baked_owned.as_ref()) {
             if let Some(raw) = baked.raw.as_ref() {
                 let fits = skeleton_fits_mesh(baked, &loaded.mesh);
                 let is_pc = req.race != 0;
-                // Per-slot bone-mapping diagnostic: surface the values
-                // that decide GPU-vs-CPU dispatch so a regression mode
-                // ("missing legs", "lying on face") is observable in
-                // logs without re-running the bake. Cheap — once per
-                // load request, not per frame.
                 {
                     let skel_n = baked.world.len();
                     let max_table = loaded
@@ -740,7 +739,7 @@ pub fn process_load_vos2_requests(
                     info!(
                         "vos2 dispatch: file_id={} entity_id={} race={} is_pc={} \
                          skel_bones={} use_bone_table={} bone_table_max={} max_bone1={} \
-                         fits={} path={}",
+                         fits={} path=GPU",
                         req.file_id,
                         req.entity_id,
                         req.race,
@@ -750,44 +749,36 @@ pub fn process_load_vos2_requests(
                         max_table,
                         max_bone1,
                         fits,
-                        if fits { "GPU" } else { "CPU-fallback" },
                     );
                 }
-                if fits {
-                    let existing = bone_trees.get(&req.entity_id).cloned();
-                    let bone_entities = spawn_skinned_actor(
-                        &mut commands,
-                        &mut meshes,
-                        &mut materials,
-                        &mut images,
-                        &mut inverse_bindposes,
-                        bevy_e,
-                        loaded,
-                        raw,
-                        existing,
-                        is_pc,
-                    );
-                    bone_trees.insert(req.entity_id, bone_entities);
-                    // BakedActor marker tells the target ring + snap
-                    // systems to switch from feet_offset to hip
-                    // offset (~0.9 yalms). Without it a GPU-skinned
-                    // entity sits at server_y + feet_offset, putting
-                    // the hip ~1.35 yalms too high. CPU path attaches
-                    // this in `spawn_equipped` (~line 1474).
-                    commands.entity(bevy_e).insert(crate::scene::BakedActor);
-                    info!(
-                        "skinned actor spawn: file_id={} entity_id={} verts={} groups={}",
-                        req.file_id,
-                        req.entity_id,
-                        loaded.mesh.vertices.len(),
-                        loaded.mesh.groups.len(),
-                    );
-                    continue;
-                }
-                // Fall through to CPU bake — slot's bone_table overflows
-                // the race skeleton (common for cross-race monstrosity
-                // gear). The CPU bake renders rigidly in bind pose,
-                // visible at the entity origin.
+                let existing = bone_trees.get(&req.entity_id).cloned();
+                let bone_entities = spawn_skinned_actor(
+                    &mut commands,
+                    &mut meshes,
+                    &mut materials,
+                    &mut images,
+                    &mut inverse_bindposes,
+                    bevy_e,
+                    loaded,
+                    raw,
+                    existing,
+                    is_pc,
+                );
+                bone_trees.insert(req.entity_id, bone_entities);
+                // BakedActor marker tells the target ring + snap
+                // systems to switch from feet_offset to hip
+                // offset (~0.9 yalms). Without it a GPU-skinned
+                // entity sits at server_y + feet_offset, putting
+                // the hip ~1.35 yalms too high.
+                commands.entity(bevy_e).insert(crate::scene::BakedActor);
+                info!(
+                    "skinned actor spawn: file_id={} entity_id={} verts={} groups={}",
+                    req.file_id,
+                    req.entity_id,
+                    loaded.mesh.vertices.len(),
+                    loaded.mesh.groups.len(),
+                );
+                continue;
             }
         }
         spawn_vos2_meshes_with_skeleton(
@@ -863,11 +854,26 @@ fn spawn_skinned_actor(
             // parented directly to `parent`). NPC orientation has been
             // observed working in the current rig.
             let root_parent = if is_pc {
-                let bind_to_bevy = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)
-                    * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+                // FFXI engine axis → Bevy. The bone chain produces
+                // vertices in raw FFXI engine axes (x right, y down,
+                // z forward — matches the MZB native convention at
+                // `dat_mzb.rs:412-417`). The MZB renderer applies
+                // `(x, -y, -z)` to convert; that's a rotation around
+                // X by 180°, expressible as a pure quaternion since
+                // it doesn't change handedness (both axes get
+                // negated → det = +1).
+                //
+                // An earlier attempt here used the CPU bake's
+                // `Q_y(π/2) * Q_x(-π/2)` — but that matrix is for the
+                // post-bake frame where the per-vertex bake swap
+                // `[p[0], p[2], -p[1]]` has already happened. GPU
+                // skinning skips that swap (vertices come straight
+                // from joint world transforms), so the same rotation
+                // would face the character down.
+                let engine_to_bevy = Quat::from_rotation_x(std::f32::consts::PI);
                 let pivot = commands
                     .spawn((
-                        Transform::from_rotation(bind_to_bevy),
+                        Transform::from_rotation(engine_to_bevy),
                         GlobalTransform::default(),
                         Visibility::default(),
                         ChildOf(parent),
@@ -955,14 +961,23 @@ fn spawn_skinned_actor(
     let weight1_count = n.saturating_sub(weight2_count);
     let mut joint_indices: Vec<[u16; 4]> = vec![[0u16; 4]; n];
     let mut joint_weights: Vec<[f32; 4]> = vec![[1.0, 0.0, 0.0, 0.0]; n];
+    let mut out_of_range_count = 0usize;
     for i in 0..n {
         let bone1 = loaded.mesh.skeleton_bone_for(i).unwrap_or(0);
-        joint_indices[i][0] = bone1;
         if (bone1 as usize) >= raw.bones.len() {
+            // Permissive fallback: rigidly bind to bone[0] (the hip)
+            // so the vertex still translates with the actor instead
+            // of disappearing to weight=0. Looks rigid (won't follow
+            // the limb it was meant for) but visible-and-static beats
+            // invisible — and for slots with only a few stray bones
+            // out of range (most slots), the rest of the mesh still
+            // skins normally.
             joint_indices[i][0] = 0;
-            joint_weights[i] = [0.0; 4];
+            joint_weights[i] = [1.0, 0.0, 0.0, 0.0];
+            out_of_range_count += 1;
             continue;
         }
+        joint_indices[i][0] = bone1;
         // 2-weight verts: read bone2 + weight pair, populate slot [1].
         if i >= weight1_count {
             let k = i - weight1_count;
@@ -981,6 +996,12 @@ fn spawn_skinned_actor(
                 joint_weights[i] = [w1 / sum, w2 / sum, 0.0, 0.0];
             }
         }
+    }
+    if out_of_range_count > 0 {
+        info!(
+            "vos2 skin: bone_table_max overflowed race skeleton on {}/{} verts (rigidly bound to hip)",
+            out_of_range_count, n,
+        );
     }
 
     let positions: Vec<[f32; 3]> = loaded.mesh.vertices.iter().map(|v| v.pos).collect();
