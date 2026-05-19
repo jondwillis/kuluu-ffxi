@@ -196,22 +196,66 @@ fn resolve_install_root() -> Option<PathBuf> {
 /// `tracks[slot] == Some(0)` means "the server explicitly told us
 /// to play *nothing* in this slot" — we treat it as silence
 /// (don't fall through to the next slot).
-fn resolve_audible_slot(slots: &BgmSlots, is_night: bool) -> Option<(u8, u16)> {
-    // The order is hand-picked, not just slot order.
-    let priority: [u8; SLOT_COUNT] = if is_night {
-        [5, 4, 6, 3, 2, 7, 1, 0] // night: prefer ZoneNight (1) over ZoneDay (0)
-    } else {
-        [5, 4, 6, 3, 2, 7, 0, 1] // day:   prefer ZoneDay (0)
-    };
-    for s in priority {
-        if let Some(track) = slots.tracks[s as usize] {
+///
+/// LSB pushes ALL relevant tracks on zone-in (ZoneDay + ZoneNight
+/// + CombatSolo + CombatParty + …) — they're cached for later. The
+/// client must NOT play CombatSolo just because it's filled; it
+/// must check whether the player is actually engaged. Same for
+/// Mount, MogHouse, Dead, Fishing. The earlier naive
+/// "highest-priority filled slot wins" picked battle music on
+/// every zone-in because the server had pre-filled slot 2.
+///
+/// `state` filters which slots are eligible. With a fresh
+/// [`BgmPlaybackState`] (no engaged / no mount / not in mog-house
+/// / not dead / not fishing), only Zone slots are eligible and the
+/// player hears zone ambient — which is the right default.
+fn resolve_audible_slot(
+    slots: &BgmSlots,
+    state: &BgmPlaybackState,
+) -> Option<(u8, u16)> {
+    // Priority order, highest-first. Each entry is a slot index.
+    // Same priority retail uses internally:
+    //   Dead > Mount > MogHouse > CombatParty > CombatSolo >
+    //   Fishing > ZoneNight/Day.
+    // BUT each non-Zone slot is gated by a state flag so that
+    // pre-filled slots stay silent until the player is in the
+    // matching state.
+    let zone_pref: [u8; 2] = if state.is_night { [1, 0] } else { [0, 1] };
+    let candidates: [(u8, bool); SLOT_COUNT] = [
+        (5, state.dead),         // Dead
+        (4, state.mounted),      // Mount
+        (6, state.in_mog_house), // MogHouse
+        (3, state.engaged_party), // CombatParty
+        (2, state.engaged_solo), // CombatSolo
+        (7, state.fishing),      // Fishing
+        (zone_pref[0], true),    // ZoneDay/Night per clock
+        (zone_pref[1], true),    // the other zone variant as fallback
+    ];
+    for (slot, eligible) in candidates {
+        if !eligible {
+            continue;
+        }
+        if let Some(track) = slots.tracks[slot as usize] {
             if track == 0 {
                 return None; // explicit server silence
             }
-            return Some((s, track));
+            return Some((slot, track));
         }
     }
     None
+}
+
+/// Game-state flags that gate non-Zone music slots. Default = "in
+/// zone, not doing anything special" — only Zone slots play.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct BgmPlaybackState {
+    pub engaged_solo: bool,
+    pub engaged_party: bool,
+    pub mounted: bool,
+    pub in_mog_house: bool,
+    pub dead: bool,
+    pub fishing: bool,
+    pub is_night: bool,
 }
 
 /// Scan `EventLog.recent` for music events since the last frame
@@ -258,6 +302,7 @@ pub fn drain_music_events_system(events: Res<EventLog>, mut slots: ResMut<BgmSlo
 /// `AsyncComputeTaskPool` task.
 pub fn apply_bgm_system(
     mut slots: ResMut<BgmSlots>,
+    state: Res<BgmPlaybackState>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut pcm_assets: ResMut<Assets<PcmAudio>>,
@@ -277,10 +322,7 @@ pub fn apply_bgm_system(
         }
         return;
     };
-    // TODO(audio): wire `is_night` to `sun_moon::VanaSky` once we
-    // expose a `is_night()` helper from there; for now bias toward
-    // day so day-only music plays in default conditions.
-    let resolved = resolve_audible_slot(&slots, false);
+    let resolved = resolve_audible_slot(&slots, &state);
 
     if resolved == slots.active {
         return;
@@ -519,6 +561,7 @@ impl Plugin for AudioPlugin {
         // are picked up.
         app.add_audio_source::<PcmAudio>();
         app.init_resource::<BgmSlots>()
+            .init_resource::<BgmPlaybackState>()
             .init_resource::<SeRegistry>()
             .init_resource::<SfxCache>()
             .init_resource::<SystemSfxTable>()
@@ -542,22 +585,57 @@ mod tests {
     use super::*;
     use ffxi_viewer_wire::ViewerEvent;
 
+    /// Regression: in real LSB zone-in traffic the server pre-fills
+    /// EVERY slot (Zone + Combat + Mount + …) ahead of time. The
+    /// earlier resolver picked highest-priority-filled, which made
+    /// the client play battle music on zone-in to Bastok Mines
+    /// because slot 2 (CombatSolo) was filled even though the player
+    /// wasn't engaged. Default state must yield Zone music only.
     #[test]
-    fn slot_resolution_picks_combat_over_zone() {
+    fn default_state_picks_zone_not_combat_when_both_filled() {
         let mut slots = BgmSlots::default();
         slots.tracks[0] = Some(101); // ZoneDay
-        slots.tracks[2] = Some(99); // CombatSolo
-        let r = resolve_audible_slot(&slots, false);
-        assert_eq!(r, Some((2, 99)));
+        slots.tracks[2] = Some(99); // CombatSolo (pre-filled by server)
+        let state = BgmPlaybackState::default(); // engaged_solo: false
+        assert_eq!(resolve_audible_slot(&slots, &state), Some((0, 101)));
     }
 
     #[test]
-    fn slot_zero_track_means_silence_not_fallthrough() {
+    fn combat_overrides_zone_only_when_engaged() {
         let mut slots = BgmSlots::default();
-        slots.tracks[0] = Some(101); // ZoneDay
+        slots.tracks[0] = Some(101);
+        slots.tracks[2] = Some(99);
+        let engaged = BgmPlaybackState {
+            engaged_solo: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_audible_slot(&slots, &engaged), Some((2, 99)));
+    }
+
+    #[test]
+    fn dead_state_picks_dead_slot_above_all_else() {
+        let mut slots = BgmSlots::default();
+        slots.tracks[0] = Some(101);
+        slots.tracks[2] = Some(99);
+        slots.tracks[5] = Some(70); // Dead track
+        let state = BgmPlaybackState {
+            engaged_solo: true, // even mid-combat, Dead wins
+            dead: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_audible_slot(&slots, &state), Some((5, 70)));
+    }
+
+    #[test]
+    fn dead_track_zero_means_silence_not_fallthrough() {
+        let mut slots = BgmSlots::default();
+        slots.tracks[0] = Some(101);
         slots.tracks[5] = Some(0); // Dead → explicit silence
-        let r = resolve_audible_slot(&slots, false);
-        assert_eq!(r, None);
+        let state = BgmPlaybackState {
+            dead: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_audible_slot(&slots, &state), None);
     }
 
     #[test]
@@ -565,8 +643,13 @@ mod tests {
         let mut slots = BgmSlots::default();
         slots.tracks[0] = Some(101); // day track
         slots.tracks[1] = Some(102); // night track
-        assert_eq!(resolve_audible_slot(&slots, false), Some((0, 101)));
-        assert_eq!(resolve_audible_slot(&slots, true), Some((1, 102)));
+        let day = BgmPlaybackState::default();
+        let night = BgmPlaybackState {
+            is_night: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_audible_slot(&slots, &day), Some((0, 101)));
+        assert_eq!(resolve_audible_slot(&slots, &night), Some((1, 102)));
     }
 
     #[test]
@@ -663,6 +746,7 @@ mod tests {
         slots.install_root = Some(std::path::PathBuf::from(install));
         app.insert_resource(slots)
             .init_resource::<EventLog>()
+            .init_resource::<BgmPlaybackState>()
             .add_systems(Update, (drain_music_events_system, apply_bgm_system).chain());
 
         // Push the same shape of event the wire reactor emits when
