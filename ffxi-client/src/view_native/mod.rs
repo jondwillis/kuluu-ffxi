@@ -42,11 +42,13 @@ use ffxi_client::lobby_client::LobbyClient;
 use ffxi_client::reactor::ReactorConfig;
 use ffxi_client::{spawn_session_with_reactor, SessionHandle};
 use ffxi_viewer_core::{
-    add_hud_spawners, hud::zone_flash::ZoneNameResolver, setup_world, setup_zone_line_assets,
-    spawn_camera, HudPlugin, InGameEntity, MousePlugin, SceneState, ViewerCorePlugin,
-    ZoneLineDescriptor, ZoneLineResolver,
+    add_hud_spawners, atmosphere::LastAtmosphereZone, audio::BgmSlots,
+    dat_mzb::{LastAutoLoadedZone, MzbCollisionGeometry}, hud::zone_flash::ZoneNameResolver,
+    scene::TrackedEntities, setup_world, setup_zone_line_assets, spawn_camera, EventLog,
+    HudPlugin, InGameEntity, MousePlugin, SceneState, ViewerCorePlugin, ZoneLineDescriptor,
+    ZoneLineResolver,
 };
-use ffxi_viewer_wire::Stage as WireStage;
+use ffxi_viewer_wire::{Stage as WireStage, ViewerEvent};
 use tokio::runtime::Handle as RtHandle;
 
 use crate::launcher::Defaults;
@@ -417,41 +419,108 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     Ok(())
 }
 
-/// One-shot disconnect-watcher: when `SceneState.snapshot.stage` flips to
-/// `Disconnected` while we're `InGame`, populate `LoginErrorMsg` with a
-/// post-mortem and transition `AppPhase` back to `Launcher`. The
-/// launcher's existing `restore_login_error_on_reentry` then routes us
-/// to `LauncherState::LoginError` so the operator sees what happened
-/// (and can press Esc to fall back to the Login screen with creds
-/// remembered by `LoginForm`).
-///
-/// Why not auto-advance straight to `CharList`? The lobby's
-/// `LobbyHandle` was consumed by `select` (see `OpenedLobbyInner` doc),
-/// so reaching CharList requires a fresh `AuthInFlight`. For now the
-/// operator hits Esc → Enter to re-handshake; an auto-advance using
-/// the stored `Credentials` is a worthwhile follow-up.
+/// Classification of the most recent disconnect, set by the watcher and
+/// read by the launcher to route between "clean /logout returns to
+/// Login with creds intact" vs "forced disconnect shows LoginError".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisconnectKind {
+    /// Operator-initiated `/logout` — server responded with the LOGOUT
+    /// packet (`session.rs` emits `AgentEvent::Disconnected` with
+    /// `reason = "server logout state=..."`). Treat as "switch
+    /// character": return to Launcher quietly with form/creds intact.
+    Clean,
+    /// Anything else: kick, timeout, agent-requested abort, crash.
+    /// Surface the post-mortem in `LoginErrorMsg`.
+    Forced,
+}
+
+/// Classify a `ViewerEvent::Disconnected.reason` string. Today only the
+/// `server logout state=...` prefix counts as clean; every other reason
+/// (timeout, agent abort, decode errors) is forced. Centralized so the
+/// rules stay testable and obvious.
+fn classify_disconnect_reason(reason: &str) -> DisconnectKind {
+    if reason.starts_with("server logout state=") {
+        DisconnectKind::Clean
+    } else {
+        DisconnectKind::Forced
+    }
+}
+
 /// `OnExit(AppPhase::InGame)` cleanup: despawn every entity carrying the
-/// [`InGameEntity`] marker. This covers the 3D camera, world scene
-/// (lights, sky, zone-line markers), HUD UI nodes, and every
-/// PC/NPC/nameplate spawned by the entity-sync system.
+/// [`InGameEntity`] marker AND drain stale resources so a fresh
+/// `OnEnter(InGame)` starts from a clean baseline.
 ///
-/// `despawn` in Bevy 0.17 is recursive — children come along — so each
-/// HUD spawner only needs to attach the marker to its top-level node,
-/// not to every nested child. Same for `WorldEntity` mirrors and their
-/// nameplate/HP-bar children.
-fn despawn_ingame_entities(mut commands: Commands, q: Query<Entity, With<InGameEntity>>) {
+/// **Entity layer**: `despawn` in Bevy 0.17 is recursive — children
+/// come along — so each HUD spawner only needs to attach the marker
+/// to its top-level node, not to every nested child. Same for
+/// `WorldEntity` mirrors and their nameplate/HP-bar children, and for
+/// the MMB visual-prop parents spawned by `dat_mmb`.
+///
+/// **Resource layer**: caches keyed by zone (collision triangles,
+/// last-zone trackers, atmosphere, music-slot Entity handles) need
+/// explicit drains — their entries are not Components, so the
+/// recursive despawn never reaches them. Without this, returning to a
+/// zone you just left would short-circuit the auto-load watcher
+/// (`LastAutoLoadedZone` still matches), `TrackedEntities` would hand
+/// out stale-Entity handles, and `BgmSlots.active_entity` would point
+/// at a freed slot the next audio system tries to despawn.
+fn despawn_ingame_entities(
+    mut commands: Commands,
+    q: Query<Entity, With<InGameEntity>>,
+    mut scene: ResMut<SceneState>,
+    mut events: ResMut<EventLog>,
+    mut tracked: ResMut<TrackedEntities>,
+    mut collision: ResMut<MzbCollisionGeometry>,
+    mut last_zone: ResMut<LastAutoLoadedZone>,
+    mut last_atmo: ResMut<LastAtmosphereZone>,
+    mut bgm: ResMut<BgmSlots>,
+) {
     let mut count = 0usize;
     for entity in q.iter() {
         commands.entity(entity).despawn();
         count += 1;
     }
-    if count > 0 {
-        tracing::info!(count, "OnExit(InGame): despawned scoped entities");
-    }
+
+    tracked.by_id.clear();
+    collision.positions.clear();
+    collision.indices.clear();
+    last_zone.zone_id = None;
+    last_atmo.zone_id = None;
+    // `active_entity` is a now-freed `Entity` if the BGM sink was
+    // tagged InGameEntity, or a dangling reference if not. Either way
+    // the audio resolver next session must start fresh.
+    bgm.active_entity = None;
+    bgm.active = None;
+    bgm.tracks = [None; ffxi_viewer_core::audio::SLOT_COUNT];
+    bgm.event_cursor = 0;
+    // SceneState carries the disconnected snapshot (stage, zone_id,
+    // entities). Reset it so systems gated on stage/zone don't see
+    // stale state in the launcher → InGame transition before the new
+    // session's first snapshot lands.
+    *scene = SceneState::default();
+    events.recent.clear();
+
+    tracing::info!(count, "OnExit(InGame): despawned scoped entities");
 }
 
+/// Disconnect-watcher: when `SceneState.snapshot.stage` flips to
+/// `Disconnected` while we're `InGame`, classify the disconnect from
+/// the most-recent `ViewerEvent::Disconnected` reason and route the
+/// phase transition.
+///
+/// Clean operator-initiated `/logout`: don't populate `LoginErrorMsg`
+/// — the launcher's `restore_login_error_on_reentry` only routes to
+/// `LauncherState::LoginError` when that string is non-empty, so the
+/// user lands at the `Login` screen with their form/creds untouched.
+///
+/// Forced disconnect (kick, timeout, agent abort): populate
+/// `LoginErrorMsg` so the launcher surfaces the "Disconnected from
+/// server" banner; the operator presses Esc to fall back to Login,
+/// where `login::error_keyboard_system` clears the password
+/// (intentional — treat untrusted disconnects as a session boundary).
 fn return_to_launcher_on_disconnect(
     scene: Option<Res<SceneState>>,
+    events: Option<Res<EventLog>>,
     mut err: ResMut<LoginErrorMsg>,
     mut next_phase: ResMut<NextState<AppPhase>>,
 ) {
@@ -462,15 +531,57 @@ fn return_to_launcher_on_disconnect(
     if scene.snapshot.stage != WireStage::Disconnected {
         return;
     }
-    // Idempotent: don't overwrite an already-populated reason on
-    // repeat ticks (the watcher fires every Update until phase
-    // actually switches; the launcher reads `err.0` on
-    // OnEnter(Launcher), so we only need to populate it once).
-    if err.0.is_empty() {
+    // Walk the event ring backwards for the most-recent Disconnected.
+    // Falls back to Forced if the ring rolled past it — safer default
+    // since "we don't know" is closer to "kicked" than "/logout".
+    let kind = events
+        .as_ref()
+        .and_then(|log| {
+            log.recent.iter().rev().find_map(|e| match e {
+                ViewerEvent::Disconnected { reason } => Some(classify_disconnect_reason(reason)),
+                _ => None,
+            })
+        })
+        .unwrap_or(DisconnectKind::Forced);
+
+    if matches!(kind, DisconnectKind::Forced) && err.0.is_empty() {
         err.0 = "Disconnected from server. Press Esc to return to login.".into();
     }
-    tracing::info!("disconnect-watcher: returning AppPhase to Launcher");
+    tracing::info!(
+        ?kind,
+        "disconnect-watcher: returning AppPhase to Launcher"
+    );
     next_phase.set(AppPhase::Launcher);
+}
+
+#[cfg(test)]
+mod disconnect_tests {
+    use super::{classify_disconnect_reason, DisconnectKind};
+
+    #[test]
+    fn server_logout_classified_clean() {
+        assert_eq!(
+            classify_disconnect_reason("server logout state=1"),
+            DisconnectKind::Clean
+        );
+        assert_eq!(
+            classify_disconnect_reason("server logout state=2"),
+            DisconnectKind::Clean
+        );
+    }
+
+    #[test]
+    fn timeout_kick_agent_classified_forced() {
+        assert_eq!(
+            classify_disconnect_reason("no server packets for 60s"),
+            DisconnectKind::Forced
+        );
+        assert_eq!(
+            classify_disconnect_reason("agent requested disconnect"),
+            DisconnectKind::Forced
+        );
+        assert_eq!(classify_disconnect_reason(""), DisconnectKind::Forced);
+    }
 }
 
 /// `OnEnter(AppPhase::Connecting)` bridge. Pulls the `Selection` the

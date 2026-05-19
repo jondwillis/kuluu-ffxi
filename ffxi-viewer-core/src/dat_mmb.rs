@@ -674,7 +674,19 @@ pub fn process_load_mmb_requests(
                     None => Transform::from_translation(req.world_pos),
                 };
                 let is_zone_spawn = req.entity_id.is_none() && req.world_transform.is_some();
-                let mut e = commands.spawn((MmbOverlay, parent_transform, Visibility::default()));
+                // Tag with `InGameEntity` so `OnExit(AppPhase::InGame)`
+                // recursively despawns this parent and every submesh
+                // child below it. Without the marker, zone-spawned
+                // props (textured buildings, walls, foliage — the bulk
+                // of what you see in a city zone) and free `/load_mmb`
+                // overlays survived /logout and stayed rendered behind
+                // the launcher.
+                let mut e = commands.spawn((
+                    MmbOverlay,
+                    crate::components::InGameEntity,
+                    parent_transform,
+                    Visibility::default(),
+                ));
                 if is_zone_spawn {
                     e.insert(crate::dat_mzb::AutoMzbOverlay);
                 }
