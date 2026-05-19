@@ -13,6 +13,7 @@
 //!     file = file_dir & 0x7F (lower 7 bits)
 //!   path = {install}/FINAL FANTASY XI/{rom_dir}/{dir}/{file}.DAT
 
+pub mod action;
 pub mod anim;
 pub mod archive;
 pub mod bone;

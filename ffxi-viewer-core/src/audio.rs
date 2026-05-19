@@ -26,9 +26,96 @@
 
 use std::path::PathBuf;
 
+use bevy::audio::{AddAudioSource, Decodable, Source as RodioSource};
+use bevy::asset::Asset;
 use bevy::prelude::*;
-use ffxi_audio::{decode_file, find_audio, AudioKind};
+use bevy::reflect::TypePath;
+use ffxi_audio::{decode_file, find_audio, AudioKind, DecodedAudio};
 use ffxi_viewer_wire::ViewerEvent;
+
+// ---------------------------------------------------------------------------
+//  Custom Decodable wrapping pre-decoded f32 samples.
+//
+//  Bevy 0.17 builds `rodio` with `default-features = false, features = ["std"]`
+//  — i.e. without any audio-format decoders (wav/flac/mp3 are all opt-in
+//  features on Bevy itself). Feeding it WAV-wrapped bytes panics with
+//  `UnrecognizedFormat`. Implementing `Decodable` for our own type
+//  sidesteps the format-detection path entirely; rodio sees a
+//  `rodio::Source` of f32 samples and plays them directly.
+// ---------------------------------------------------------------------------
+
+/// Pre-decoded f32 PCM audio. `samples` is interleaved
+/// (`L0,R0,L1,R1,...` for stereo). Cheap to clone via `Arc`.
+#[derive(Asset, Debug, Clone, TypePath)]
+pub struct PcmAudio {
+    pub samples: std::sync::Arc<[f32]>,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+impl PcmAudio {
+    pub fn from_decoded(d: DecodedAudio) -> Self {
+        Self {
+            samples: d.samples.into(),
+            sample_rate: d.sample_rate as u32,
+            channels: d.channels as u16,
+        }
+    }
+}
+
+/// Iterator end of the [`PcmAudio`] → rodio bridge. Implements both
+/// `Iterator<Item = f32>` and `rodio::Source` — what rodio needs to
+/// pipe samples to the audio output device.
+pub struct PcmSource {
+    samples: std::sync::Arc<[f32]>,
+    sample_rate: u32,
+    channels: u16,
+    pos: usize,
+}
+
+impl Iterator for PcmSource {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        let s = self.samples.get(self.pos).copied();
+        self.pos += 1;
+        s
+    }
+}
+
+impl RodioSource for PcmSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        // Per-frame len is informational; report remaining samples.
+        Some(self.samples.len().saturating_sub(self.pos))
+    }
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        if self.channels == 0 || self.sample_rate == 0 {
+            return None;
+        }
+        let frames = self.samples.len() / self.channels as usize;
+        Some(std::time::Duration::from_secs_f32(
+            frames as f32 / self.sample_rate as f32,
+        ))
+    }
+}
+
+impl Decodable for PcmAudio {
+    type DecoderItem = f32;
+    type Decoder = PcmSource;
+    fn decoder(&self) -> Self::Decoder {
+        PcmSource {
+            samples: self.samples.clone(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            pos: 0,
+        }
+    }
+}
 
 use crate::snapshot::EventLog;
 
@@ -173,7 +260,7 @@ pub fn apply_bgm_system(
     mut slots: ResMut<BgmSlots>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut audio_sources: ResMut<Assets<AudioSource>>,
+    mut pcm_assets: ResMut<Assets<PcmAudio>>,
     mut warned: Local<bool>,
 ) {
     // Without an install root we have nothing to play. Warn once so
@@ -223,26 +310,12 @@ pub fn apply_bgm_system(
         }
     };
 
-    // Bevy 0.17's `AudioSource` wraps a raw byte buffer that rodio
-    // decodes via its format detector. We've already decoded the
-    // ADPCM ourselves, so we re-wrap as a 16-bit PCM WAV in memory
-    // and hand that to AudioSource — rodio can handle WAV directly.
-    let bytes = match wrap_decoded_as_wav(&decoded) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("audio: bgm {track_id} wav-wrap failed: {e}");
-            return;
-        }
-    };
-    let handle = audio_sources.add(AudioSource {
-        bytes: bytes.into(),
-    });
+    let frames = decoded.frames();
+    let sr = decoded.sample_rate;
+    let ch = decoded.channels;
+    let pcm = PcmAudio::from_decoded(decoded);
+    let handle = pcm_assets.add(pcm);
 
-    // PlaybackSettings::LOOP keeps the track running; LSB will
-    // push a fresh 0x05F when it wants us to switch. (We honour
-    // `decoded.loop_start_sample` later — Bevy 0.17 doesn't expose
-    // a custom loop point on AudioPlayer; rodio would need a
-    // wrapper. Stub a TODO.)
     let entity = commands
         .spawn((
             AudioPlayer(handle),
@@ -252,43 +325,9 @@ pub fn apply_bgm_system(
     slots.active_entity = Some(entity);
     info!(
         "audio: bgm {track_id} started ({} frames @ {:.0}Hz {}ch)",
-        decoded.frames(),
-        decoded.sample_rate,
-        decoded.channels
+        frames, sr, ch
     );
-    // Suppress unused warning until we use the asset server for
-    // streaming SFX in stage 2.
     let _ = asset_server;
-}
-
-/// Pack the decoded f32 PCM into a 16-bit-PCM WAV byte buffer.
-/// Uses hound to produce a RIFF header rodio accepts — an earlier
-/// hand-rolled version was rejected as `UnrecognizedFormat` by
-/// rodio's WAV decoder, despite looking byte-correct against the
-/// spec. The differences are in optional chunk extensions and
-/// padding that hound gets right; not worth re-deriving here.
-fn wrap_decoded_as_wav(d: &ffxi_audio::DecodedAudio) -> Result<Vec<u8>, &'static str> {
-    if d.channels == 0 || d.channels > 2 {
-        return Err("only mono/stereo supported");
-    }
-    let spec = hound::WavSpec {
-        channels: d.channels as u16,
-        sample_rate: d.sample_rate as u32,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    // Hound writes to a `Seek`-capable sink; `Cursor<Vec<u8>>` is
-    // the standard in-memory choice.
-    let mut buf = std::io::Cursor::new(Vec::<u8>::with_capacity(44 + d.samples.len() * 2));
-    {
-        let mut writer = hound::WavWriter::new(&mut buf, spec).map_err(|_| "wav header")?;
-        for s in &d.samples {
-            let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-            writer.write_sample(v).map_err(|_| "wav sample")?;
-        }
-        writer.finalize().map_err(|_| "wav finalize")?;
-    }
-    Ok(buf.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -343,22 +382,20 @@ impl SeRegistry {
 }
 
 /// Reusable cache of decoded SPWs so the same SE doesn't decode on
-/// every trigger. Map key = se_id; value = bytes-wrapped WAV
-/// (re-handed to Bevy's AudioSource on each play, since AudioSource
-/// is consumed by the AudioPlayer entity).
+/// every trigger. Caches the `PcmAudio` handle so repeated plays
+/// don't re-decode the .spw — the handle itself is cheap to clone
+/// and Bevy's asset system refcounts the underlying samples.
 #[derive(Resource, Default)]
 pub struct SfxCache {
-    cached: std::collections::HashMap<u32, Vec<u8>>,
+    cached: std::collections::HashMap<u32, Handle<PcmAudio>>,
 }
 
-/// Consume `SfxEvent`s and spawn one-shot `AudioPlayer`s. Cached
-/// .spw decode bytes live in `SfxCache` so repeated triggers (a
-/// machine gun, a chained mob skill, …) re-spawn cheaply.
+/// Consume `SfxEvent`s and spawn one-shot `AudioPlayer`s.
 pub fn play_sfx_system(
     mut events: MessageReader<SfxEvent>,
     slots: Res<BgmSlots>,
     mut cache: ResMut<SfxCache>,
-    mut audio_sources: ResMut<Assets<AudioSource>>,
+    mut pcm_assets: ResMut<Assets<PcmAudio>>,
     mut commands: Commands,
     mut warned: Local<bool>,
 ) {
@@ -376,8 +413,8 @@ pub fn play_sfx_system(
         return;
     };
     for ev in events.read() {
-        let bytes = if let Some(b) = cache.cached.get(&ev.se_id) {
-            b.clone()
+        let handle = if let Some(h) = cache.cached.get(&ev.se_id) {
+            h.clone()
         } else {
             let Some(path) = find_audio(&install, AudioKind::Sfx, ev.se_id) else {
                 warn!("audio: sfx {} not found under {}", ev.se_id, install.display());
@@ -390,19 +427,10 @@ pub fn play_sfx_system(
                     continue;
                 }
             };
-            let wav = match wrap_decoded_as_wav(&decoded) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("audio: sfx {} wav-wrap failed: {e}", ev.se_id);
-                    continue;
-                }
-            };
-            cache.cached.insert(ev.se_id, wav.clone());
-            wav
+            let h = pcm_assets.add(PcmAudio::from_decoded(decoded));
+            cache.cached.insert(ev.se_id, h.clone());
+            h
         };
-        let handle = audio_sources.add(AudioSource {
-            bytes: bytes.into(),
-        });
         commands.spawn((
             AudioPlayer(handle),
             PlaybackSettings::DESPAWN
@@ -484,6 +512,12 @@ pub struct AudioPlugin;
 
 impl Plugin for AudioPlugin {
     fn build(&self, app: &mut App) {
+        // Register `PcmAudio` as a custom audio source so rodio
+        // never tries to format-detect our pre-decoded samples. The
+        // call also adds the right `PlayAudio<PcmAudio>` system to
+        // the schedule, so `AudioPlayer(Handle<PcmAudio>)` entities
+        // are picked up.
+        app.add_audio_source::<PcmAudio>();
         app.init_resource::<BgmSlots>()
             .init_resource::<SeRegistry>()
             .init_resource::<SfxCache>()
@@ -622,7 +656,7 @@ mod tests {
         // its own examples.
         app.add_plugins(bevy::MinimalPlugins);
         app.add_plugins(bevy::asset::AssetPlugin::default());
-        app.init_asset::<AudioSource>();
+        app.init_asset::<PcmAudio>();
         // Override the resolved install root so the test uses the
         // env-supplied path even if the default resolver missed.
         let mut slots = BgmSlots::default();
@@ -651,8 +685,8 @@ mod tests {
         );
         let entity = slots_after.active_entity.unwrap();
         assert!(
-            app.world().get::<AudioPlayer>(entity).is_some(),
-            "the spawned entity should carry an AudioPlayer component"
+            app.world().get::<AudioPlayer<PcmAudio>>(entity).is_some(),
+            "the spawned entity should carry an AudioPlayer<PcmAudio> component"
         );
     }
 }
