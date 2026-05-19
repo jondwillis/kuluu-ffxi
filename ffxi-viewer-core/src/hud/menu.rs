@@ -17,6 +17,7 @@
 
 use bevy::prelude::*;
 
+use crate::graphics_settings::{GraphicsSettings, GRAPHICS_FIELDS};
 use crate::hud::palette;
 use crate::input_mode::{InputMode, MenuKind};
 
@@ -32,6 +33,7 @@ const ROOT_ENTRIES: &[&str] = &[
     "Party",
     "Search",
     "Macros",
+    "Graphics",
     "Config",
     "Logout",
 ];
@@ -49,6 +51,33 @@ const CONFIG_ENTRIES: &[&str] = &[
     "Show current bindings",
 ];
 
+/// Graphics submenu entries. The first N rows correspond 1:1 to
+/// [`GRAPHICS_FIELDS`] — index `i` → cycle [`GRAPHICS_FIELDS[i]`]. The
+/// final row is the "Reset to High" meta action.
+///
+/// Labels must mirror [`crate::graphics_settings::GraphicsField::label`];
+/// a unit test in this module enforces parity.
+const GRAPHICS_ENTRIES: &[&str] = &[
+    "Preset",
+    "Shadow Quality",
+    "Shadow Cascades",
+    "Shadow Distance",
+    "Anti-Aliasing",
+    "Bloom",
+    "Volumetric Fog",
+    "Fog Quality",
+    "View Distance",
+    "VSync",
+    "FOV",
+    "Reset to High",
+];
+
+/// Sentinel index into [`GRAPHICS_ENTRIES`] for the meta "Reset to High"
+/// row. The dispatcher in `text_input::resolve_menu_entry` matches by
+/// label, but the renderer uses this index to know when to skip the
+/// `Field: [Value]` formatting and just print the action name.
+pub const GRAPHICS_RESET_SLOT: usize = GRAPHICS_FIELDS.len();
+
 /// Largest entry count across all menu kinds. Drives the spawn-time row
 /// pool — we spawn this many rows once and toggle their visibility per
 /// frame depending on the active menu kind, instead of spawning/despawning
@@ -56,10 +85,12 @@ const CONFIG_ENTRIES: &[&str] = &[
 const MAX_ENTRY_COUNT: usize = {
     let r = ROOT_ENTRIES.len();
     let c = CONFIG_ENTRIES.len();
-    if r >= c {
-        r
+    let g = GRAPHICS_ENTRIES.len();
+    let rc = if r >= c { r } else { c };
+    if rc >= g {
+        rc
     } else {
-        c
+        g
     }
 };
 
@@ -80,6 +111,7 @@ fn entries(kind: MenuKind) -> &'static [&'static str] {
     match kind {
         MenuKind::Root => ROOT_ENTRIES,
         MenuKind::Config => CONFIG_ENTRIES,
+        MenuKind::Graphics => GRAPHICS_ENTRIES,
     }
 }
 
@@ -136,6 +168,7 @@ pub fn spawn_main_menu(mut commands: Commands) {
 /// labels when the active `MenuKind` changes (e.g. Root → Config).
 pub fn update_main_menu(
     mode: Res<InputMode>,
+    settings: Res<GraphicsSettings>,
     mut menu_q: Query<&mut Node, (With<MainMenu>, Without<MainMenuRow>)>,
     mut row_q: Query<(&MainMenuRow, &mut Node, &mut Text, &mut TextColor)>,
 ) {
@@ -165,10 +198,15 @@ pub fn update_main_menu(
                             row_node.display = Display::Flex;
                         }
                         let is_cursor = row.slot == c;
+                        // Graphics rows are `Field: [Value]` (with the
+                        // value pulled from the live settings resource).
+                        // Reset and other screens use the plain static
+                        // label.
+                        let body = format_row_body(kind, row.slot, label, &settings);
                         let want = if is_cursor {
-                            format!("> {label}")
+                            format!("> {body}")
                         } else {
-                            format!("  {label}")
+                            format!("  {body}")
                         };
                         if **text != want {
                             **text = want;
@@ -198,5 +236,59 @@ pub fn update_main_menu(
                 node.display = Display::None;
             }
         }
+    }
+}
+
+/// Format the body of a menu row (everything after the cursor prefix).
+/// Graphics field rows render `Field: [Value]`; the trailing "Reset to
+/// High" row and every non-Graphics row render the bare label.
+fn format_row_body(
+    kind: MenuKind,
+    slot: usize,
+    label: &str,
+    settings: &GraphicsSettings,
+) -> String {
+    if !matches!(kind, MenuKind::Graphics) {
+        return label.to_string();
+    }
+    match GRAPHICS_FIELDS.get(slot).copied() {
+        Some(field) => format!(
+            "{:<16}[{}]",
+            format!("{}:", field.label()),
+            settings.value_label(field)
+        ),
+        // Reset row (and any future trailing actions).
+        None => label.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GRAPHICS_ENTRIES is the dispatcher's source of truth for routing
+    /// (text_input matches on these labels), and GraphicsField::label()
+    /// is the renderer's source of truth for the visible "Field:" text
+    /// — they must agree for every row.
+    #[test]
+    fn graphics_entries_match_field_labels() {
+        assert_eq!(
+            GRAPHICS_ENTRIES.len(),
+            GRAPHICS_FIELDS.len() + 1,
+            "expected one row per field + a trailing Reset row"
+        );
+        for (i, field) in GRAPHICS_FIELDS.iter().enumerate() {
+            assert_eq!(
+                GRAPHICS_ENTRIES[i],
+                field.label(),
+                "row {i} label drift: entry={:?}, field.label()={:?}",
+                GRAPHICS_ENTRIES[i],
+                field.label()
+            );
+        }
+        assert_eq!(
+            GRAPHICS_ENTRIES[GRAPHICS_RESET_SLOT], "Reset to High",
+            "the slot past the last field must be the Reset action"
+        );
     }
 }

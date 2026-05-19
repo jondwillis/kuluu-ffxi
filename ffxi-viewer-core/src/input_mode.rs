@@ -105,8 +105,8 @@ impl ChatBuffer {
 }
 
 /// Identifies which screen of the menu tree we're currently on. The set
-/// grows as submenus are wired; for now the only non-Root screen is
-/// `Config`, the keybind-preset switcher reachable from `Root → Config`.
+/// grows as submenus are wired; today's submenus are `Config` (keybind
+/// presets) and `Graphics` (quality knobs).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MenuKind {
     Root,
@@ -116,6 +116,12 @@ pub enum MenuKind {
     /// selecting List is `/keybinds list`. In-game keypress-capture
     /// rebinding is intentionally NOT here yet — slash-only for now.
     Config,
+    /// Graphics quality knobs. Rows are individual fields (shadow size,
+    /// AA mode, etc.); Up/Down moves the cursor, Left/Right cycles the
+    /// highlighted row's value. The mapping from row index → field +
+    /// the cycle dispatcher both live in `text_input::handle_menu_key`
+    /// / `resolve_menu_entry`.
+    Graphics,
 }
 
 /// One frame of the menu navigation stack. `cursor` is the row currently
