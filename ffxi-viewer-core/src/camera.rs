@@ -266,6 +266,37 @@ pub fn firstperson_camera_system(
     cam_t.look_at(eye + look_dir, Vec3::Y);
 }
 
+/// Hide the player's own avatar in first-person, restore it in chase. Retail
+/// FFXI does the same — without it the camera sits just behind the eyes and
+/// renders the inside of the skull/equipment.
+///
+/// Writes `Visibility::Hidden` on the `IsSelf` entity for FP and
+/// `Visibility::Inherited` for any other mode. Bevy propagates inherited
+/// visibility, so every descendant (capsule, MMB submeshes, baked/skinned
+/// actor meshes, equipment children) follows automatically — no per-child
+/// query. Skips the write when the value is already correct so the
+/// `Changed<Visibility>` filter on the propagation pass doesn't churn each
+/// frame.
+///
+/// The self nameplate billboard is spawned standalone (no `ChildOf`), so it
+/// stays visible regardless. That matches retail: there's no nameplate above
+/// your own head in either mode, but in our viewer we render one anyway and
+/// hiding it would be a separate change.
+pub fn self_visibility_for_camera_mode_system(
+    mode: Res<CameraMode>,
+    mut q_self: Query<&mut Visibility, With<IsSelf>>,
+) {
+    let want = match *mode {
+        CameraMode::FirstPerson => Visibility::Hidden,
+        CameraMode::Chase => Visibility::Inherited,
+    };
+    for mut vis in q_self.iter_mut() {
+        if *vis != want {
+            *vis = want;
+        }
+    }
+}
+
 /// Toggle the camera between Chase and FirstPerson, applying mode-specific
 /// invariants:
 /// - Entering FP: leaves yaw/pitch alone (the FP system can use the wider
