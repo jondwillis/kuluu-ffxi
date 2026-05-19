@@ -601,6 +601,19 @@ pub struct MzbPlacement {
     /// debugging / culling; not semantically meaningful for rendering.
     pub grid_x: u16,
     pub grid_y: u16,
+    /// MZB-Y of the water surface at this grid cell, when the vis-entry
+    /// records one. `None` for dry cells. Format (per lotus-ffxi
+    /// `parseGridMesh`): signed 26-bit fixed-point at `vis_entry+164`,
+    /// scaled by 1/1024. Y is in MZB-local space — convert with the
+    /// same axis-flip the renderer applies to mesh vertices.
+    ///
+    /// When this is `Some`, the renderer should spawn a flat alpha
+    /// quad at `(placement.translation.x, water_height, placement.translation.z)`
+    /// sized to the placement's geometry XZ extent. Multiple cells
+    /// often share the same water height (e.g. one lake spanning a
+    /// region); grouping by height lets the renderer batch them into
+    /// a single mesh.
+    pub water_height: Option<f32>,
 }
 
 /// Parse one mesh record at an absolute body offset. Used by the
@@ -741,6 +754,30 @@ pub fn parse_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbPlacem
                 // flags i16 — bit 0 = doesn't block LoS).
                 let flags = u16::from_le_bytes([body[geo_off + 14], body[geo_off + 15]]);
 
+                // Water surface height: lotus-ffxi reads a signed
+                // 26-bit fixed-point value at `vis_entry + 164` and
+                // scales by 1/1024 (`((v << 6) >> 10) / 1024.f`).
+                // The shift pair sign-extends the low 26 bits before
+                // the divide. Cells without water store 0; we surface
+                // that as `None` so the renderer can early-out.
+                let water_off = mat_off + 164;
+                let water_height = if water_off + 4 <= body.len() {
+                    let raw = i32::from_le_bytes([
+                        body[water_off],
+                        body[water_off + 1],
+                        body[water_off + 2],
+                        body[water_off + 3],
+                    ]);
+                    let signed_26 = (raw.wrapping_shl(6)) >> 10;
+                    if signed_26 == 0 {
+                        None
+                    } else {
+                        Some(signed_26 as f32 / 1024.0)
+                    }
+                } else {
+                    None
+                };
+
                 out.push(MzbPlacement {
                     geometry_offset: geo_off as u32,
                     transform: m,
@@ -748,6 +785,7 @@ pub fn parse_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbPlacem
                     flip_winding: det < 0.0,
                     grid_x: x as u16,
                     grid_y: y as u16,
+                    water_height,
                 });
             }
         }

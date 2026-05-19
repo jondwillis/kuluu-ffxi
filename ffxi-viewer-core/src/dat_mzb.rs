@@ -1,13 +1,27 @@
-//! MZB debug overlay: load a real FFXI zone mesh-library from a DAT
-//! file and spawn every mesh in the library at a chosen world position.
+//! MZB zone overlay: load a real FFXI zone mesh-library from a DAT
+//! file, decode the grid-cell placement table, and spawn the resulting
+//! instanced geometry as two merged meshes (collision + non-collision).
 //!
 //! Pattern mirrors [`crate::dat_mmb`] — slash-command dispatcher fires
-//! [`LoadMzbRequest`], [`process_load_mzb_requests`] consumes it. The
-//! mesh-library geometry sits near the origin in MZB's own coordinate
-//! frame; spatial-index decode (grid/quadtree/placement transforms)
-//! lives in Phase 9b. Without those, the overlay shows mesh data as
-//! though every mesh is at the library origin — useful for visual
-//! validation of the parser even before placement is wired.
+//! [`LoadMzbRequest`], [`process_load_mzb_requests`] consumes it.
+//! Placement transforms are decoded from the MZB header and applied
+//! per-instance inside [`load_mzb_placed`]; the resulting submeshes
+//! land at correct world coordinates relative to the zone origin.
+//! Small indoor zones with no grid records fall back to "spawn the
+//! library at origin" (see the placements-empty branch of
+//! `load_mzb_placed`).
+//!
+//! Known gaps:
+//!   - Material textures: MZB stores 4-bit `material_id` per triangle
+//!     but the `material_id → TIM texture name` lookup table lives in
+//!     FFXI's runtime material engine which we don't decode. We render
+//!     a 16-color muted palette tint instead (see `MZB_MATERIAL_PALETTE`).
+//!   - Water planes: lotus extracts `water_height` per grid cell in
+//!     `parseGridMesh` and spawns flat alpha quads. Not yet decoded
+//!     on our side.
+//!   - Generator chunks (kind 0x05) referenced from MZB: ambient VFX
+//!     spawners (fountain spray, torch glow). Requires baseline
+//!     particle renderer.
 //!
 //! Native-only for the same reason as `dat_mmb.rs`: `ffxi-dat::DatRoot`
 //! does sync `fs::read` of the user's local install.
@@ -72,26 +86,23 @@ const MZB_MATERIAL_PALETTE: [[f32; 3]; 16] = [
 /// entities, mob controls non-PC entity capsules (mobs/NPCs/pets).
 /// PCs are never culled by distance — party members and other PCs
 /// stay visible regardless so the operator can still target them.
-/// `/zonegeom` tri-state. **Default is `Collision`** because in
-/// dungeon-style zones (Bastok Mines, mining tunnels, etc.) the
-/// MMB-side placement table references *stub* MMBs (`kabe-atariyou` and
-/// similar) with `pieces=0` — the actual wall/floor geometry lives
-/// exclusively in the MZB collision mesh. With `Off` the player sees
-/// nothing in those zones; with `Collision` the per-material-colored
-/// MZB mesh fills the void. In city zones MMBs still supply the
-/// textured layer; the collision overlay sits behind them (mostly
-/// coincident depth). Operators who want a clean MMB-only view can
-/// still `/zonegeom off`; `/zonegeom all` adds the non-collision (visual-
-/// only) overlay on top.
+/// `/zonegeom` tri-state. **Default is `All`** because the MZB grid-cell
+/// placement layer is the *primary visible-geometry source* for all
+/// zones — collision and decoration both. Dungeon zones (Bastok Mines,
+/// tunnels) reference *stub* MMBs (`kabe-atariyou`-family) with
+/// `pieces=0`, so without grid-cell content their walls/floors would
+/// be invisible. Cities have both layers populated. `Collision` shows
+/// only LoS-blockers; `Off` hides MZB entirely for a clean MMB-only
+/// view.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneGeomMode {
     /// Hide all MZB geometry. Operator opt-out for clean MMB-only view.
     Off,
     /// Show only LoS-blocking (collision) meshes — flag bit 0 == 0.
-    /// Default. Required to see geometry in dungeon-style zones.
-    #[default]
     Collision,
     /// Show both collision and non-collision (decorative) meshes.
+    /// Default — the full visible-geometry layer.
+    #[default]
     All,
 }
 
@@ -328,6 +339,12 @@ pub struct MzbSubMesh {
 pub struct MzbInstance {
     pub submesh_idx: usize,
     pub bevy_transform: Transform,
+    /// MZB-Y of the water surface at this placement's grid cell, when
+    /// the vis-entry records one. Bevy-space (axis-flipped from the
+    /// MZB native value). The renderer spawns a flat alpha quad at
+    /// this Y, sized to the geometry's XZ extent. `None` for dry
+    /// placements.
+    pub water_height_bevy: Option<f32>,
 }
 
 /// Load + decrypt + parse the MZB chunk of `file_id`. Returns:
@@ -367,6 +384,7 @@ pub fn load_mzb_placed(
             instances.push(MzbInstance {
                 submesh_idx: idx,
                 bevy_transform: Transform::IDENTITY,
+                water_height_bevy: None,
             });
         }
         return Ok((submeshes, instances));
@@ -419,9 +437,14 @@ pub fn load_mzb_placed(
             Vec4::new(0.0, 0.0, 0.0, 1.0),
         );
         let m_bevy = to_bevy * m_native;
+        // Apply the same Y-flip the matrix gets to the water height —
+        // both live in MZB-native (Y-down) coords and need to land in
+        // Bevy (Y-up) frame before rendering.
+        let water_height_bevy = p.water_height.map(|h| -h);
         instances.push(MzbInstance {
             submesh_idx: idx,
             bevy_transform: Transform::from_matrix(m_bevy),
+            water_height_bevy,
         });
     }
 
@@ -1142,6 +1165,109 @@ pub fn process_load_mzb_requests(
                 req.file_id,
             ),
         );
+
+        // Water planes: group placements with `water_height_bevy` set
+        // by height (rounded to the nearest mm so float-noise duplicates
+        // don't fragment a single lake into N near-identical groups),
+        // then spawn one flat alpha quad per group sized to the union
+        // of the placements' geometry XZ extents.
+        //
+        // Lotus's pipeline animates a 30-frame water texture; we ship a
+        // static teal-blue alpha quad instead — the per-placement extent
+        // is what fixes "lakes render as collision boxes underwater."
+        // Texture animation lands when the particle/animated-texture
+        // pipeline does.
+        let mut water_groups: std::collections::HashMap<i32, (Vec3, Vec3)> =
+            std::collections::HashMap::new();
+        for inst in &instances {
+            let Some(h_bevy) = inst.water_height_bevy else {
+                continue;
+            };
+            let sub = &submeshes[inst.submesh_idx];
+            if sub.positions.is_empty() {
+                continue;
+            }
+            // World-space XZ bbox for this placement's geometry.
+            let mut min = Vec3::splat(f32::INFINITY);
+            let mut max = Vec3::splat(f32::NEG_INFINITY);
+            for v in &sub.positions {
+                let p = inst
+                    .bevy_transform
+                    .transform_point(Vec3::new(v[0], v[1], v[2]));
+                min = min.min(p);
+                max = max.max(p);
+            }
+            // Key by mm-rounded height — float noise on the parser
+            // side would otherwise split one lake into 10 near-equal
+            // groups.
+            let key = (h_bevy * 1000.0).round() as i32;
+            water_groups
+                .entry(key)
+                .and_modify(|(mn, mx)| {
+                    *mn = mn.min(min);
+                    *mx = mx.max(max);
+                })
+                .or_insert((min, max));
+        }
+        let water_count = water_groups.len();
+        if water_count > 0 {
+            let water_mat = materials.add(StandardMaterial {
+                base_color: Color::srgba(0.20, 0.45, 0.70, 0.55),
+                unlit: true,
+                cull_mode: None,
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            });
+            for (height_key, (min, max)) in water_groups {
+                let h = height_key as f32 / 1000.0;
+                let dx = (max.x - min.x).max(0.01);
+                let dz = (max.z - min.z).max(0.01);
+                let cx = 0.5 * (min.x + max.x);
+                let cz = 0.5 * (min.z + max.z);
+                let mut mesh = Mesh::new(
+                    PrimitiveTopology::TriangleList,
+                    RenderAssetUsages::default(),
+                );
+                // Flat quad in the XZ plane, centered on (cx, h, cz).
+                let hx = dx * 0.5;
+                let hz = dz * 0.5;
+                let positions: Vec<[f32; 3]> = vec![
+                    [cx - hx, h, cz - hz],
+                    [cx + hx, h, cz - hz],
+                    [cx + hx, h, cz + hz],
+                    [cx - hx, h, cz + hz],
+                ];
+                let normals: Vec<[f32; 3]> = vec![[0.0, 1.0, 0.0]; 4];
+                let uvs: Vec<[f32; 2]> =
+                    vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
+                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+                mesh.insert_indices(Indices::U32(indices));
+                let mut child = commands.spawn((
+                    MzbOverlay,
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(water_mat.clone()),
+                    Transform::IDENTITY,
+                    init_noncollision_vis,
+                    ChildOf(parent),
+                    MzbNonCollisionMesh,
+                ));
+                if req.auto_loaded {
+                    child.insert(AutoMzbOverlay);
+                }
+            }
+            push_system_msg(
+                &mut scene_state,
+                format!(
+                    "/load_mzb {}: {} water plane{} spawned",
+                    req.file_id,
+                    water_count,
+                    if water_count == 1 { "" } else { "s" },
+                ),
+            );
+        }
 
         // Also instance the zone's visual MMBs at their MZB-placement
         // transforms. This is the "textured visual world" half of the
