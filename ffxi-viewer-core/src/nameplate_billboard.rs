@@ -99,6 +99,23 @@ const OUTLINE_RADIUS_PX: i32 = 3;
 /// reads as a soft shadow rather than a hard inked stroke.
 const OUTLINE_COLOR: [u8; 4] = [0, 0, 0, 220];
 
+/// Pixel-height of the HP bar rendered below the name on Mob/Pet
+/// labels. Relative to `NAME_PX = 64`, this is ~16% of glyph height —
+/// large enough to read at distance, small enough not to dominate the
+/// label silhouette.
+const HP_BAR_HEIGHT_PX: u32 = 10;
+
+/// Vertical gap between the name baseline padding and the top of the
+/// HP bar. A few pixels of breathing room so the bar doesn't look
+/// glued to the descenders of `g`/`p`/`y`.
+const HP_BAR_TOP_GAP_PX: u32 = 4;
+
+/// Horizontal fraction of the texture width the HP bar occupies. The
+/// bar is centered, so the remaining `1.0 - HP_BAR_WIDTH_FRACTION` is
+/// split equally as left/right margin. 0.85 gives a noticeable margin
+/// without making the bar look truncated next to a long name.
+const HP_BAR_WIDTH_FRACTION: f32 = 0.85;
+
 /// Shared `ab_glyph` font loaded from Bevy's embedded default
 /// (`bevy_text::DEFAULT_FONT_DATA` — same FiraMono-subset every Bevy
 /// app ships with). Lazy-init via `FromWorld`; one allocation for the
@@ -122,19 +139,22 @@ impl FromWorld for BillboardFont {
 pub struct NameplateBillboard {
     pub entity_id: u32,
     pub kind: EntityKind,
-    /// Original `name` from the wire. We re-derive the rendered string
-    /// (with optional `" 73%"` HP suffix) from this each frame, so a
-    /// label that doesn't move in space doesn't trigger redundant
-    /// re-rasterizations.
+    /// Original `name` from the wire — the bare name with no HP
+    /// suffix. The texture is rebuilt from this whenever the rendered
+    /// string OR the cached HP percentage OR the color changes.
     pub base_name: String,
     /// Last text we actually rasterized into the material's texture.
     /// Drives a cheap string-equality check before we burn another
     /// allocation on a glyph atlas.
     pub last_rendered: String,
     /// RGBA color used when we rasterized `last_rendered`. Re-rasterize
-    /// if it ever changes (currently constant per entity, but kept here
-    /// so future palette swaps don't desync the cache).
+    /// if it ever changes.
     pub last_color: [u8; 4],
+    /// HP percentage embedded in the most recent rasterization
+    /// (`None` when the kind doesn't get an HP bar). Comparing this
+    /// against the current snapshot HP gates the re-rasterization so
+    /// a stable mob doesn't burn allocations per frame.
+    pub last_hp: Option<u8>,
 }
 
 /// `(width_px, height_px)` of the most recently rasterized image, so
@@ -166,7 +186,11 @@ pub fn spawn_nameplate_billboard(
     color: Color,
 ) -> Entity {
     let rgba = color_to_rgba8(color);
-    let raster = rasterize_text_to_image(font, name, NAME_PX, rgba).clone();
+    // Spawn-time rasterization has no HP knowledge yet (combat state
+    // is reconciled by the update system on the next tick), so the
+    // initial texture is text-only. The first HP-bearing snapshot
+    // triggers a re-rasterization that adds the bar.
+    let raster = rasterize_text_to_image(font, name, NAME_PX, rgba, None).clone();
     let aspect = (raster.width(), raster.height());
     let image_handle = images.add(raster);
 
@@ -204,6 +228,7 @@ pub fn spawn_nameplate_billboard(
                 base_name: name.to_string(),
                 last_rendered: name.to_string(),
                 last_color: rgba,
+                last_hp: None,
             },
             BillboardAspect {
                 width: aspect.0,
@@ -252,17 +277,17 @@ pub fn nameplate_color(kind: EntityKind, is_engaged_with: bool, is_aggroing: boo
     }
 }
 
-/// Build the rendered label string for a billboard. Mobs and pets get
-/// the `"Name 73%"` HP suffix; PCs and NPCs get the bare name. Mirrors
-/// the previous UI `format_label` — kept here (not shared from
-/// `nameplate.rs`) so the billboard module is the single owner of all
-/// label-formatting choices going forward.
-pub fn format_billboard_label(base_name: &str, hp_pct: Option<u8>, kind: EntityKind) -> String {
-    let show_hp = matches!(kind, EntityKind::Mob | EntityKind::Pet);
-    match (show_hp, hp_pct) {
-        (true, Some(pct)) => format!("{base_name} {pct}%"),
-        _ => base_name.to_string(),
-    }
+/// Build the rendered label string for a billboard. Always the bare
+/// name now: the HP percentage is drawn as a filled-rectangle bar
+/// below the text inside the same rasterized texture (see the
+/// `hp_pct` parameter on [`rasterize_text_to_image`]), so duplicating
+/// it as a "73%" string suffix would be visual noise.
+///
+/// Kept as a function (rather than inlining `base_name.to_string()`)
+/// so a future label tweak — pet-owner suffix, level prefix, claim
+/// indicator — has one obvious place to land.
+pub fn format_billboard_label(base_name: &str, _hp_pct: Option<u8>, _kind: EntityKind) -> String {
+    base_name.to_string()
 }
 
 /// Per-frame update: position, orient, scale, and refresh the texture
@@ -381,15 +406,25 @@ pub fn update_nameplate_billboards_system(
         };
         let want_color = color_to_rgba8(nameplate_color(np.kind, is_engaged_with, is_aggroing));
 
-        // Refresh the rasterized text if either the displayed string
-        // OR the rendered color changed. String + 4-byte equality is
-        // cheap and avoids re-rasterizing for stable labels.
-        let hp = hp_by_id.get(&np.entity_id).copied().flatten();
-        let want = format_billboard_label(&np.base_name, hp, np.kind);
-        if want != np.last_rendered || want_color != np.last_color {
+        // HP bar is only rendered for kinds whose snapshot carries
+        // an HP percentage (Mob/Pet). NPCs/PCs/Others stay bar-less
+        // even when the wire happens to surface an `hp_pct` value.
+        let snapshot_hp = hp_by_id.get(&np.entity_id).copied().flatten();
+        let want_hp = if matches!(np.kind, EntityKind::Mob | EntityKind::Pet) {
+            snapshot_hp
+        } else {
+            None
+        };
+
+        // Refresh the rasterized texture if any of (text, color, HP)
+        // changed. Three cheap equality checks save a glyph-atlas
+        // allocation per frame for the common case (stable label).
+        let want = format_billboard_label(&np.base_name, snapshot_hp, np.kind);
+        if want != np.last_rendered || want_color != np.last_color || want_hp != np.last_hp {
             if let Some(mat) = materials.get(&mat.0) {
                 if let Some(handle) = mat.base_color_texture.clone() {
-                    let new_img = rasterize_text_to_image(&font.0, &want, NAME_PX, want_color);
+                    let new_img =
+                        rasterize_text_to_image(&font.0, &want, NAME_PX, want_color, want_hp);
                     aspect.width = new_img.width();
                     aspect.height = new_img.height();
                     // `insert` returns a `Result` indicating whether
@@ -398,6 +433,7 @@ pub fn update_nameplate_billboards_system(
                     let _ = images.insert(&handle, new_img);
                     np.last_rendered = want;
                     np.last_color = want_color;
+                    np.last_hp = want_hp;
                 }
             }
         }
@@ -470,7 +506,13 @@ pub fn distance_to_scale(distance_yalms: f32) -> f32 {
 /// gamma-aware sampler reproduces the requested `color` accurately —
 /// using `Rgba8Unorm` here instead would darken the text noticeably on
 /// any modern desktop preset.
-fn rasterize_text_to_image(font: &FontArc, text: &str, px: f32, color: [u8; 4]) -> Image {
+fn rasterize_text_to_image(
+    font: &FontArc,
+    text: &str,
+    px: f32,
+    color: [u8; 4],
+    hp_pct: Option<u8>,
+) -> Image {
     let scale = PxScale::from(px);
     let scaled = font.as_scaled(scale);
     let ascent = scaled.ascent();
@@ -506,9 +548,24 @@ fn rasterize_text_to_image(font: &FontArc, text: &str, px: f32, color: [u8; 4]) 
     // at the texture edge.
     let pad = (OUTLINE_RADIUS_PX + 1) as u32;
     let width = (max_x.ceil() as u32).max(1) + 2 * pad;
-    let height = line_h + 2 * pad;
+    let text_height = line_h + 2 * pad;
+    // Extra vertical strip beneath the text when this label carries an
+    // HP percentage. The bar is drawn directly into the RGBA buffer
+    // (not through the glyph rasterizer), so it doesn't participate in
+    // the outline-halo pass.
+    let hp_strip = if hp_pct.is_some() {
+        HP_BAR_TOP_GAP_PX + HP_BAR_HEIGHT_PX
+    } else {
+        0
+    };
+    let height = text_height + hp_strip;
 
     // Pass 1: glyph coverage into a single-channel scratch buffer.
+    // The scratch buffer is the SAME size as the final texture (text
+    // strip + optional HP-bar strip) so the row indices match the
+    // composite-pass loop below. The HP strip rows stay at coverage=0,
+    // which the composite treats as transparent — the bar is painted
+    // directly into the RGBA buffer afterward.
     let mut coverage = vec![0u8; (width * height) as usize];
     for glyph in glyphs {
         if let Some(outline_glyph) = scaled.outline_glyph(glyph) {
@@ -516,7 +573,11 @@ fn rasterize_text_to_image(font: &FontArc, text: &str, px: f32, color: [u8; 4]) 
             outline_glyph.draw(|gx, gy, c| {
                 let px_x = bb.min.x as i32 + gx as i32 + pad as i32;
                 let px_y = bb.min.y as i32 + gy as i32 + pad as i32;
-                if px_x < 0 || px_y < 0 || px_x >= width as i32 || px_y >= height as i32 {
+                if px_x < 0
+                    || px_y < 0
+                    || px_x >= width as i32
+                    || px_y >= text_height as i32
+                {
                     return;
                 }
                 let i = (px_y as u32 * width + px_x as u32) as usize;
@@ -527,19 +588,24 @@ fn rasterize_text_to_image(font: &FontArc, text: &str, px: f32, color: [u8; 4]) 
     }
 
     // Pass 2: composite text-over-outline into the final RGBA texture.
+    // Only the text strip needs the disk-dilation halo math; the HP
+    // strip below it is left at zero alpha and painted next.
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     let r = OUTLINE_RADIUS_PX;
     let r2 = r * r;
     let w_i = width as i32;
-    let h_i = height as i32;
-    for y in 0..h_i {
+    let text_h_i = text_height as i32;
+    for y in 0..text_h_i {
         for x in 0..w_i {
             let text_alpha = coverage[(y * w_i + x) as usize];
 
             // Max coverage inside a disk of radius R around this pixel.
+            // The dilation reads from `coverage`, which only has glyph
+            // marks in the text strip — clamping `y1` to `text_h_i - 1`
+            // keeps the halo from "leaking" into the HP-bar rows below.
             let mut outline_alpha: u8 = 0;
             let y0 = (y - r).max(0);
-            let y1 = (y + r).min(h_i - 1);
+            let y1 = (y + r).min(text_h_i - 1);
             let x0 = (x - r).max(0);
             let x1 = (x + r).min(w_i - 1);
             for ny in y0..=y1 {
@@ -579,6 +645,42 @@ fn rasterize_text_to_image(font: &FontArc, text: &str, px: f32, color: [u8; 4]) 
         }
     }
 
+    // Pass 3 (HP-bar entities only): draw the bar directly into the
+    // RGBA buffer. Outline = 1px of `OUTLINE_COLOR` (matches the text
+    // halo); interior fills left-to-right with the HP-color lerp.
+    if let Some(pct) = hp_pct {
+        let bar_pixel_w = (width as f32 * HP_BAR_WIDTH_FRACTION) as u32;
+        let bar_x = (width.saturating_sub(bar_pixel_w)) / 2;
+        let bar_y = text_height + HP_BAR_TOP_GAP_PX;
+        let bar_h = HP_BAR_HEIGHT_PX;
+        let fill_color = hp_color_rgba(pct);
+
+        // 1px outline.
+        for x in 0..bar_pixel_w {
+            paint_pixel(&mut pixels, width, bar_x + x, bar_y, OUTLINE_COLOR);
+            paint_pixel(&mut pixels, width, bar_x + x, bar_y + bar_h - 1, OUTLINE_COLOR);
+        }
+        for y in 0..bar_h {
+            paint_pixel(&mut pixels, width, bar_x, bar_y + y, OUTLINE_COLOR);
+            paint_pixel(
+                &mut pixels,
+                width,
+                bar_x + bar_pixel_w - 1,
+                bar_y + y,
+                OUTLINE_COLOR,
+            );
+        }
+
+        // Filled interior (1px inside the outline). Width scales by HP%.
+        let interior_w = bar_pixel_w.saturating_sub(2);
+        let fill_w = (interior_w as f32 * pct.min(100) as f32 / 100.0).round() as u32;
+        for y in 1..(bar_h - 1) {
+            for x in 0..fill_w {
+                paint_pixel(&mut pixels, width, bar_x + 1 + x, bar_y + y, fill_color);
+            }
+        }
+    }
+
     let mut image = Image::new(
         Extent3d {
             width,
@@ -601,5 +703,46 @@ fn color_to_rgba8(c: Color) -> [u8; 4] {
         (s.green.clamp(0.0, 1.0) * 255.0).round() as u8,
         (s.blue.clamp(0.0, 1.0) * 255.0).round() as u8,
         (s.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
+}
+
+/// Write `color` at `(x, y)` in an RGBA8 buffer of stride `width * 4`.
+/// Out-of-bounds coordinates are silently ignored — callers compute
+/// bar geometry from texture width and the saturating-sub guards in
+/// the layout code can produce zero-width rectangles for very narrow
+/// textures, in which case painting just no-ops.
+#[inline]
+fn paint_pixel(pixels: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 4]) {
+    let pi = ((y * width + x) * 4) as usize;
+    if pi + 4 > pixels.len() {
+        return;
+    }
+    pixels[pi] = color[0];
+    pixels[pi + 1] = color[1];
+    pixels[pi + 2] = color[2];
+    pixels[pi + 3] = color[3];
+}
+
+/// HP-percentage → bar fill color. Green at 100%, yellow at 50%, red
+/// at 0% — the canonical "vitals" lerp every MMO HUD uses. Returns
+/// fully-opaque sRGB so the bar reads as a solid color against the
+/// outlined glyphs above it (the bar's *alpha* is the OUTLINE_COLOR
+/// border, not the fill).
+fn hp_color_rgba(pct: u8) -> [u8; 4] {
+    let f = (pct.min(100) as f32) / 100.0;
+    let (r, g) = if f >= 0.5 {
+        // green → yellow as HP drops from 100% to 50%
+        let t = (1.0 - f) * 2.0;
+        (t, 1.0)
+    } else {
+        // yellow → red as HP drops from 50% to 0%
+        let t = f * 2.0;
+        (1.0, t)
+    };
+    [
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        0,
+        255,
     ]
 }
