@@ -46,39 +46,87 @@ use ffxi_viewer_wire::ViewerEvent;
 
 /// Pre-decoded f32 PCM audio. `samples` is interleaved
 /// (`L0,R0,L1,R1,...` for stereo). Cheap to clone via `Arc`.
+///
+/// `loop_start_sample` is the interleaved-sample index where the
+/// loop body begins (NOT the frame index — this is `frame *
+/// channels` so `PcmSource::next()` can compare directly against
+/// `pos`). `None` for one-shots (SFX); `Some(n)` for BGW music with
+/// an intro lead-in that should play once before looping `[n..end]`
+/// forever. When `Some`, the source returns infinite samples and the
+/// caller must use `PlaybackSettings::ONCE` (otherwise rodio's outer
+/// LOOP would race ours and restart from 0).
 #[derive(Asset, Debug, Clone, TypePath)]
 pub struct PcmAudio {
     pub samples: std::sync::Arc<[f32]>,
     pub sample_rate: u32,
     pub channels: u16,
+    pub loop_start_sample: Option<usize>,
 }
 
 impl PcmAudio {
     pub fn from_decoded(d: DecodedAudio) -> Self {
+        let channels = d.channels as usize;
+        // `DecodedAudio::loop_start_sample` is per-channel frames;
+        // expand to the interleaved sample index `PcmSource::pos`
+        // operates on.
+        let loop_start_sample = d
+            .loop_start_sample
+            .map(|frame| frame as usize * channels);
         Self {
             samples: d.samples.into(),
             sample_rate: d.sample_rate as u32,
             channels: d.channels as u16,
+            loop_start_sample,
         }
+    }
+
+    /// Override looping behavior. Use `None` to play once (for SFX
+    /// where any loop point in the source file is irrelevant), or
+    /// `Some(n)` to force-loop at sample `n` regardless of what the
+    /// file said. Builder-style for use at the spawn site.
+    pub fn with_loop(mut self, loop_start_sample: Option<usize>) -> Self {
+        self.loop_start_sample = loop_start_sample;
+        self
     }
 }
 
 /// Iterator end of the [`PcmAudio`] → rodio bridge. Implements both
 /// `Iterator<Item = f32>` and `rodio::Source` — what rodio needs to
 /// pipe samples to the audio output device.
+///
+/// When `loop_start_sample` is `Some`, hitting the end of the buffer
+/// rewinds `pos` to that point instead of returning `None` — so the
+/// source produces samples indefinitely. SFX leaves `loop_start_sample`
+/// at `None` and the iterator terminates normally.
 pub struct PcmSource {
     samples: std::sync::Arc<[f32]>,
     sample_rate: u32,
     channels: u16,
     pos: usize,
+    loop_start_sample: Option<usize>,
 }
 
 impl Iterator for PcmSource {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
-        let s = self.samples.get(self.pos).copied();
+        if self.pos >= self.samples.len() {
+            // End-of-buffer. Two cases:
+            //  * `loop_start_sample = Some(n)` → BGM with FFXI's
+            //    intro-then-loop semantics: rewind to `n`, never end.
+            //  * `loop_start_sample = None` → one-shot (SFX): return
+            //    None so rodio drops the sink.
+            let loop_to = self.loop_start_sample?;
+            // Defensive: a malformed loop point past EOF would spin
+            // forever yielding nothing. Clamp + bail to terminate
+            // cleanly instead.
+            if loop_to >= self.samples.len() {
+                return None;
+            }
+            self.pos = loop_to;
+        }
+        let s = self.samples[self.pos];
         self.pos += 1;
-        s
+        Some(s)
     }
 }
 
@@ -94,6 +142,11 @@ impl RodioSource for PcmSource {
         self.sample_rate
     }
     fn total_duration(&self) -> Option<std::time::Duration> {
+        // Looping sources have no total duration — the iterator
+        // never ends. SFX (no loop) reports its natural length.
+        if self.loop_start_sample.is_some() {
+            return None;
+        }
         if self.channels == 0 || self.sample_rate == 0 {
             return None;
         }
@@ -113,6 +166,7 @@ impl Decodable for PcmAudio {
             sample_rate: self.sample_rate,
             channels: self.channels,
             pos: 0,
+            loop_start_sample: self.loop_start_sample,
         }
     }
 }
@@ -448,19 +502,32 @@ pub fn apply_bgm_system(
     let frames = decoded.frames();
     let sr = decoded.sample_rate;
     let ch = decoded.channels;
-    let pcm = PcmAudio::from_decoded(decoded);
+    let file_loop_frame = decoded.loop_start_sample;
+    let mut pcm = PcmAudio::from_decoded(decoded);
+    // BGM must loop. If the BGW file declared no loop point we still
+    // want the track to loop (FFXI zone music plays forever) — fall
+    // back to "loop the whole track from sample 0" so we never go
+    // silent after one play-through. Tracks that DO declare a
+    // loop_start (battle themes with intro fanfares) get the
+    // intro-once / body-looped behavior the file specifies.
+    if pcm.loop_start_sample.is_none() {
+        pcm = pcm.with_loop(Some(0));
+    }
     let handle = pcm_assets.add(pcm);
 
     let entity = commands
         .spawn((
             AudioPlayer(handle),
-            PlaybackSettings::LOOP,
+            // `PlaybackSettings::ONCE` because looping is handled
+            // inside `PcmSource::next()` — rodio's outer LOOP would
+            // restart at sample 0 and ignore the BGW's loop_start.
+            PlaybackSettings::ONCE,
         ))
         .id();
     slots.active_entity = Some(entity);
     info!(
-        "audio: bgm {track_id} started ({} frames @ {:.0}Hz {}ch)",
-        frames, sr, ch
+        "audio: bgm {track_id} started ({} frames @ {:.0}Hz {}ch, loop_frame={:?})",
+        frames, sr, ch, file_loop_frame
     );
     let _ = asset_server;
 }
@@ -562,7 +629,11 @@ pub fn play_sfx_system(
                     continue;
                 }
             };
-            let h = pcm_assets.add(PcmAudio::from_decoded(decoded));
+            // SFX are one-shots — even if the SPW file carries a
+            // loop_start (rare, but happens for ambient loops the
+            // retail client uses elsewhere), force it off so the
+            // sink despawns when the clip ends.
+            let h = pcm_assets.add(PcmAudio::from_decoded(decoded).with_loop(None));
             cache.cached.insert(ev.se_id, h.clone());
             h
         };
