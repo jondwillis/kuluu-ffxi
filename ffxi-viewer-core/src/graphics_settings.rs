@@ -1,0 +1,722 @@
+//! User-tunable graphics quality — resource, presets, cycle helpers,
+//! hot-apply reactor systems.
+//!
+//! Loaded by the native client from
+//! `$XDG_CONFIG_HOME/ffxi-mcp/graphics.json` (see
+//! `ffxi-client::graphics_store`), or defaults to [`QualityPreset::High`]
+//! on fresh install / wasm.
+//!
+//! # Ergonomics
+//!
+//! Every field is a fixed slot list — no sliders. Left/Right on the
+//! in-game menu calls [`GraphicsSettings::cycle`], which advances the
+//! highlighted field to the next/previous slot and flips
+//! [`GraphicsSettings::preset`] to [`QualityPreset::Custom`] when any
+//! non-preset field is touched. Cycling the `Preset` row itself
+//! overwrites every field to that preset's table value.
+//!
+//! # Hot apply
+//!
+//! Each reactor system in this module reads the resource and writes
+//! one piece of rendering state (shadow map size, MSAA/TAA on the
+//! camera, etc.). All reactors are gated by `resource_changed::<GraphicsSettings>`
+//! so they only fire on the frame the user touches a setting.
+
+use bevy::light::{
+    CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLightShadowMap, VolumetricFog,
+};
+use bevy::post_process::bloom::Bloom;
+use bevy::prelude::*;
+use bevy::window::{PresentMode, PrimaryWindow};
+use serde::{Deserialize, Serialize};
+
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::anti_alias::taa::TemporalAntiAliasing;
+
+use crate::camera::OperatorCamera;
+use crate::sun_moon::IsSun;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// User-facing graphics tier. Default = `High` — a fresh install ships
+/// visibly sharper shadows than the pre-settings hard-coded baseline.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QualityPreset {
+    Low,
+    Medium,
+    #[default]
+    High,
+    Ultra,
+    /// The user has hand-tuned at least one field. Subsequent loads
+    /// preserve the exact stored values rather than snapping back to
+    /// any preset table.
+    Custom,
+}
+
+impl QualityPreset {
+    pub const fn label(self) -> &'static str {
+        match self {
+            QualityPreset::Low => "Low",
+            QualityPreset::Medium => "Medium",
+            QualityPreset::High => "High",
+            QualityPreset::Ultra => "Ultra",
+            QualityPreset::Custom => "Custom",
+        }
+    }
+}
+
+/// Anti-aliasing mode. Mutually exclusive (TAA forces MSAA off; see
+/// `bevy_anti_alias/src/taa/mod.rs:164` for the runtime check).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AaMode {
+    Off,
+    Msaa2,
+    #[default]
+    Msaa4,
+    Msaa8,
+    /// Temporal anti-aliasing. Forces `Msaa::Off`. WASM clamps this to
+    /// `Msaa4` in [`GraphicsSettings::cycle`] because the motion-vector
+    /// prepass is heavy on WebGPU today — revisit when wgpu's
+    /// motion-vector path matures.
+    Taa,
+}
+
+impl AaMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            AaMode::Off => "Off",
+            AaMode::Msaa2 => "MSAA 2x",
+            AaMode::Msaa4 => "MSAA 4x",
+            AaMode::Msaa8 => "MSAA 8x",
+            AaMode::Taa => "TAA",
+        }
+    }
+}
+
+/// Selector used by the menu row → cycle dispatch. One variant per
+/// row on the Graphics tab; the row layout in `hud::menu` follows this
+/// order top-down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphicsField {
+    Preset,
+    ShadowMapSize,
+    ShadowCascadeCount,
+    ShadowMaxDistance,
+    AntiAliasing,
+    BloomIntensity,
+    VolumetricFog,
+    FogStepCount,
+    ViewDistance,
+    VSync,
+    Fov,
+}
+
+impl GraphicsField {
+    /// Display label as it appears left of the bracketed value.
+    pub const fn label(self) -> &'static str {
+        match self {
+            GraphicsField::Preset => "Preset",
+            GraphicsField::ShadowMapSize => "Shadow Quality",
+            GraphicsField::ShadowCascadeCount => "Shadow Cascades",
+            GraphicsField::ShadowMaxDistance => "Shadow Distance",
+            GraphicsField::AntiAliasing => "Anti-Aliasing",
+            GraphicsField::BloomIntensity => "Bloom",
+            GraphicsField::VolumetricFog => "Volumetric Fog",
+            GraphicsField::FogStepCount => "Fog Quality",
+            GraphicsField::ViewDistance => "View Distance",
+            GraphicsField::VSync => "VSync",
+            GraphicsField::Fov => "FOV",
+        }
+    }
+}
+
+/// Persistent graphics state. Held as a Bevy `Resource`; mutated by the
+/// menu cycle handlers and by `apply_preset`; consumed by the reactor
+/// systems at the bottom of this file.
+#[derive(Resource, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct GraphicsSettings {
+    pub preset: QualityPreset,
+    pub shadow_map_size: u32,
+    pub shadow_cascade_count: u32,
+    pub shadow_max_distance: f32,
+    pub anti_aliasing: AaMode,
+    pub bloom_intensity: f32,
+    pub volumetric_fog: bool,
+    pub fog_step_count: u32,
+    pub view_distance: f32,
+    pub vsync: bool,
+    pub fov_deg: f32,
+}
+
+impl Default for GraphicsSettings {
+    fn default() -> Self {
+        Self::for_preset(QualityPreset::High)
+    }
+}
+
+// Slot tables — single source of truth for cycle ergonomics. Each
+// preset's value must appear in its field's slot list, otherwise
+// cycling from a preset value behaves as "snap to nearest, then move".
+const SHADOW_MAP_SIZE_SLOTS: &[u32] = &[1024, 2048, 4096, 8192];
+const SHADOW_CASCADE_COUNT_SLOTS: &[u32] = &[2, 3, 4];
+const SHADOW_MAX_DISTANCE_SLOTS: &[f32] = &[200.0, 400.0, 600.0, 800.0, 1000.0];
+const BLOOM_SLOTS: &[f32] = &[0.0, 0.04, 0.08, 0.12, 0.16];
+const FOG_STEP_SLOTS: &[u32] = &[32, 64, 96, 128];
+// Includes the exact values used by each preset (2000, 4000, 6000) so
+// cycling from a preset starts on a real slot. SKY_RADIUS=4000 (see
+// `sun_moon.rs:53`) — at view_distance ≤ 4000 the sun/moon discs are
+// outside the far plane and disappear; that's an intentional trade for
+// the Low/Medium tiers.
+const VIEW_DISTANCE_SLOTS: &[f32] = &[1500.0, 2000.0, 3000.0, 4000.0, 4500.0, 6000.0];
+const FOV_SLOTS: &[f32] = &[50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0];
+
+#[cfg(not(target_arch = "wasm32"))]
+const AA_SLOTS: &[AaMode] = &[
+    AaMode::Off,
+    AaMode::Msaa2,
+    AaMode::Msaa4,
+    AaMode::Msaa8,
+    AaMode::Taa,
+];
+
+// WASM: TAA's motion-vector prepass is heavy on WebGPU and not
+// production-ready in 0.17. Drop the TAA slot so cycling can't land
+// there.
+#[cfg(target_arch = "wasm32")]
+const AA_SLOTS: &[AaMode] = &[AaMode::Off, AaMode::Msaa2, AaMode::Msaa4, AaMode::Msaa8];
+
+const PRESET_CYCLE: &[QualityPreset] = &[
+    QualityPreset::Low,
+    QualityPreset::Medium,
+    QualityPreset::High,
+    QualityPreset::Ultra,
+];
+
+impl GraphicsSettings {
+    /// Concrete values for each preset tier. Touching this table changes
+    /// what "fresh install" feels like.
+    pub fn for_preset(preset: QualityPreset) -> Self {
+        let aa_default = AaMode::Msaa4;
+        match preset {
+            QualityPreset::Low => Self {
+                preset,
+                shadow_map_size: 1024,
+                shadow_cascade_count: 2,
+                shadow_max_distance: 200.0,
+                anti_aliasing: AaMode::Off,
+                bloom_intensity: 0.0,
+                volumetric_fog: false,
+                fog_step_count: 32,
+                view_distance: 2000.0,
+                vsync: true,
+                fov_deg: 75.0,
+            },
+            QualityPreset::Medium => Self {
+                preset,
+                shadow_map_size: 2048,
+                shadow_cascade_count: 3,
+                shadow_max_distance: 400.0,
+                anti_aliasing: aa_default,
+                bloom_intensity: 0.08,
+                volumetric_fog: true,
+                fog_step_count: 64,
+                view_distance: 4000.0,
+                vsync: true,
+                fov_deg: 75.0,
+            },
+            QualityPreset::High => Self {
+                preset,
+                shadow_map_size: 4096,
+                shadow_cascade_count: 4,
+                shadow_max_distance: 600.0,
+                anti_aliasing: aa_default,
+                bloom_intensity: 0.08,
+                volumetric_fog: true,
+                fog_step_count: 64,
+                view_distance: 6000.0,
+                vsync: true,
+                fov_deg: 75.0,
+            },
+            QualityPreset::Ultra => Self {
+                preset,
+                shadow_map_size: 8192,
+                shadow_cascade_count: 4,
+                shadow_max_distance: 800.0,
+                #[cfg(not(target_arch = "wasm32"))]
+                anti_aliasing: AaMode::Taa,
+                #[cfg(target_arch = "wasm32")]
+                anti_aliasing: AaMode::Msaa4,
+                bloom_intensity: 0.12,
+                volumetric_fog: true,
+                fog_step_count: 96,
+                view_distance: 6000.0,
+                vsync: true,
+                fov_deg: 75.0,
+            },
+            // Custom: identical to High at construction; the caller
+            // mutates fields after. Used by the on-disk loader when
+            // the file's `preset = Custom`.
+            QualityPreset::Custom => Self {
+                preset,
+                ..Self::for_preset(QualityPreset::High)
+            },
+        }
+    }
+
+    /// Field renderer for the menu — returns the bracket text shown
+    /// next to the label. Pure function of state.
+    pub fn value_label(&self, field: GraphicsField) -> String {
+        match field {
+            GraphicsField::Preset => self.preset.label().to_string(),
+            GraphicsField::ShadowMapSize => format!("{}px", self.shadow_map_size),
+            GraphicsField::ShadowCascadeCount => format!("{}", self.shadow_cascade_count),
+            GraphicsField::ShadowMaxDistance => format!("{:.0}m", self.shadow_max_distance),
+            GraphicsField::AntiAliasing => self.anti_aliasing.label().to_string(),
+            GraphicsField::BloomIntensity => {
+                if self.bloom_intensity <= 1e-3 {
+                    "Off".into()
+                } else {
+                    format!("{:.2}", self.bloom_intensity)
+                }
+            }
+            GraphicsField::VolumetricFog => bool_label(self.volumetric_fog).into(),
+            GraphicsField::FogStepCount => format!("{}", self.fog_step_count),
+            GraphicsField::ViewDistance => format!("{:.0}m", self.view_distance),
+            GraphicsField::VSync => bool_label(self.vsync).into(),
+            GraphicsField::Fov => format!("{:.0}°", self.fov_deg),
+        }
+    }
+
+    /// Cycle the named field by `delta` (typically ±1) through its slot
+    /// list. Touching any field other than `Preset` flips
+    /// `self.preset = Custom` so persistence preserves the hand-tuned
+    /// combination across restarts.
+    pub fn cycle(&mut self, field: GraphicsField, delta: i32) {
+        match field {
+            GraphicsField::Preset => {
+                let next = cycle_slot(self.preset, PRESET_CYCLE, delta)
+                    .unwrap_or(QualityPreset::High);
+                *self = Self::for_preset(next);
+            }
+            GraphicsField::ShadowMapSize => {
+                self.shadow_map_size =
+                    cycle_slot_u32(self.shadow_map_size, SHADOW_MAP_SIZE_SLOTS, delta);
+                self.preset = QualityPreset::Custom;
+            }
+            GraphicsField::ShadowCascadeCount => {
+                self.shadow_cascade_count = cycle_slot_u32(
+                    self.shadow_cascade_count,
+                    SHADOW_CASCADE_COUNT_SLOTS,
+                    delta,
+                );
+                self.preset = QualityPreset::Custom;
+            }
+            GraphicsField::ShadowMaxDistance => {
+                self.shadow_max_distance = cycle_slot_f32(
+                    self.shadow_max_distance,
+                    SHADOW_MAX_DISTANCE_SLOTS,
+                    delta,
+                );
+                self.preset = QualityPreset::Custom;
+            }
+            GraphicsField::AntiAliasing => {
+                self.anti_aliasing = cycle_slot(self.anti_aliasing, AA_SLOTS, delta)
+                    .unwrap_or(AaMode::Msaa4);
+                self.preset = QualityPreset::Custom;
+            }
+            GraphicsField::BloomIntensity => {
+                self.bloom_intensity = cycle_slot_f32(self.bloom_intensity, BLOOM_SLOTS, delta);
+                self.preset = QualityPreset::Custom;
+            }
+            GraphicsField::VolumetricFog => {
+                self.volumetric_fog = !self.volumetric_fog;
+                self.preset = QualityPreset::Custom;
+            }
+            GraphicsField::FogStepCount => {
+                self.fog_step_count =
+                    cycle_slot_u32(self.fog_step_count, FOG_STEP_SLOTS, delta);
+                self.preset = QualityPreset::Custom;
+            }
+            GraphicsField::ViewDistance => {
+                self.view_distance =
+                    cycle_slot_f32(self.view_distance, VIEW_DISTANCE_SLOTS, delta);
+                self.preset = QualityPreset::Custom;
+            }
+            GraphicsField::VSync => {
+                self.vsync = !self.vsync;
+                self.preset = QualityPreset::Custom;
+            }
+            GraphicsField::Fov => {
+                self.fov_deg = cycle_slot_f32(self.fov_deg, FOV_SLOTS, delta);
+                self.preset = QualityPreset::Custom;
+            }
+        }
+    }
+
+    /// Drop all overrides and snap back to High.
+    pub fn reset_to_default(&mut self) {
+        *self = Self::for_preset(QualityPreset::High);
+    }
+
+    /// Map `AaMode` → Bevy `Msaa` component value. TAA forces MSAA off
+    /// regardless of the user's prior MSAA slot.
+    pub fn msaa(&self) -> Msaa {
+        match self.anti_aliasing {
+            AaMode::Off | AaMode::Taa => Msaa::Off,
+            AaMode::Msaa2 => Msaa::Sample2,
+            AaMode::Msaa4 => Msaa::Sample4,
+            AaMode::Msaa8 => Msaa::Sample8,
+        }
+    }
+
+    /// True when TAA should be present on the camera as a component.
+    pub fn wants_taa(&self) -> bool {
+        matches!(self.anti_aliasing, AaMode::Taa)
+    }
+}
+
+/// 11 fields × 2 sections — used by `hud::menu` to size the row pool.
+pub const GRAPHICS_FIELDS: &[GraphicsField] = &[
+    GraphicsField::Preset,
+    GraphicsField::ShadowMapSize,
+    GraphicsField::ShadowCascadeCount,
+    GraphicsField::ShadowMaxDistance,
+    GraphicsField::AntiAliasing,
+    GraphicsField::BloomIntensity,
+    GraphicsField::VolumetricFog,
+    GraphicsField::FogStepCount,
+    GraphicsField::ViewDistance,
+    GraphicsField::VSync,
+    GraphicsField::Fov,
+];
+
+// ---------------------------------------------------------------------------
+// Cycle slot helpers
+// ---------------------------------------------------------------------------
+
+fn cycle_slot<T: PartialEq + Copy>(current: T, slots: &[T], delta: i32) -> Option<T> {
+    if slots.is_empty() {
+        return None;
+    }
+    let n = slots.len() as i32;
+    let i = slots.iter().position(|x| *x == current).unwrap_or(0) as i32;
+    let next = (i + delta).rem_euclid(n);
+    Some(slots[next as usize])
+}
+
+fn cycle_slot_u32(current: u32, slots: &[u32], delta: i32) -> u32 {
+    cycle_slot(current, slots, delta).unwrap_or(current)
+}
+
+fn cycle_slot_f32(current: f32, slots: &[f32], delta: i32) -> f32 {
+    if slots.is_empty() {
+        return current;
+    }
+    let n = slots.len() as i32;
+    let i = slots
+        .iter()
+        .position(|x| (x - current).abs() < 1e-3)
+        .unwrap_or(0) as i32;
+    let next = (i + delta).rem_euclid(n);
+    slots[next as usize]
+}
+
+fn bool_label(b: bool) -> &'static str {
+    if b {
+        "On"
+    } else {
+        "Off"
+    }
+}
+
+/// Build the cascade config from settings. Used at spawn (in
+/// `sun_moon::spawn_sun_and_moon`) and by `apply_cascade_config_system`
+/// on hot apply. First cascade stays tight at 12m for sharp character
+/// self-shadowing; the rest stretch out to `shadow_max_distance`.
+pub fn cascade_config_from_settings(s: &GraphicsSettings) -> CascadeShadowConfig {
+    CascadeShadowConfigBuilder {
+        num_cascades: s.shadow_cascade_count as usize,
+        minimum_distance: 0.1,
+        maximum_distance: s.shadow_max_distance,
+        first_cascade_far_bound: 12.0,
+        overlap_proportion: 0.2,
+    }
+    .build()
+}
+
+// ---------------------------------------------------------------------------
+// Reactor systems — all gated by `resource_changed::<GraphicsSettings>`.
+// ---------------------------------------------------------------------------
+
+/// Resize the directional-light shadow map. Bevy validates pow2 and
+/// hot-resizes the GPU texture on the next prepare-lights pass — no
+/// entity respawn required.
+pub fn apply_shadow_map_size_system(
+    settings: Res<GraphicsSettings>,
+    mut commands: Commands,
+) {
+    commands.insert_resource(DirectionalLightShadowMap {
+        size: settings.shadow_map_size as usize,
+    });
+}
+
+/// Rebuild the sun's cascade config. `CascadeShadowConfig` is read every
+/// prepare-lights frame, so overwriting it triggers a one-frame
+/// resnapping flicker — acceptable for user-initiated changes.
+pub fn apply_cascade_config_system(
+    settings: Res<GraphicsSettings>,
+    mut q_sun: Query<&mut CascadeShadowConfig, With<IsSun>>,
+) {
+    for mut cfg in q_sun.iter_mut() {
+        *cfg = cascade_config_from_settings(&settings);
+    }
+}
+
+/// Set MSAA + insert/remove TAA. Done in one system so the MSAA-off
+/// requirement for TAA is satisfied in the same Commands flush as the
+/// TAA insertion (`bevy_anti_alias/src/taa/mod.rs:164` no-ops + warns
+/// if MSAA is anything other than Off when TAA's render node runs).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn apply_anti_aliasing_system(
+    settings: Res<GraphicsSettings>,
+    mut commands: Commands,
+    q_cam: Query<(Entity, Option<&Msaa>), With<OperatorCamera>>,
+) {
+    let target_msaa = settings.msaa();
+    let want_taa = settings.wants_taa();
+    for (entity, msaa) in q_cam.iter() {
+        // Always write Msaa as a component to ensure TAA's MSAA::Off
+        // requirement is in the same command queue flush as the
+        // (insert|remove) TemporalAntiAliasing below.
+        if msaa.copied() != Some(target_msaa) {
+            commands.entity(entity).insert(target_msaa);
+        }
+        if want_taa {
+            commands
+                .entity(entity)
+                .insert(TemporalAntiAliasing::default());
+        } else {
+            commands.entity(entity).remove::<TemporalAntiAliasing>();
+        }
+    }
+}
+
+/// WASM stub — same shape but without TAA, which isn't viable on WebGPU
+/// in 0.17 (motion-vector prepass too heavy). MSAA still cycles.
+#[cfg(target_arch = "wasm32")]
+pub fn apply_anti_aliasing_system(
+    settings: Res<GraphicsSettings>,
+    mut commands: Commands,
+    q_cam: Query<(Entity, Option<&Msaa>), With<OperatorCamera>>,
+) {
+    let target_msaa = settings.msaa();
+    for (entity, msaa) in q_cam.iter() {
+        if msaa.copied() != Some(target_msaa) {
+            commands.entity(entity).insert(target_msaa);
+        }
+    }
+}
+
+/// Mutate Bloom in place — never insert/remove (the camera always has
+/// Bloom; we just dial the intensity, including to ~0 for "off").
+pub fn apply_bloom_system(
+    settings: Res<GraphicsSettings>,
+    mut q_cam: Query<&mut Bloom, With<OperatorCamera>>,
+) {
+    for mut bloom in q_cam.iter_mut() {
+        bloom.intensity = settings.bloom_intensity;
+    }
+}
+
+/// Insert/remove `VolumetricFog` and mutate `step_count`. The
+/// `FogVolume` itself is a separate entity in `scene::setup_world` —
+/// the camera-side `VolumetricFog` component is what gates the
+/// raymarch pass.
+pub fn apply_volumetric_fog_system(
+    settings: Res<GraphicsSettings>,
+    mut commands: Commands,
+    q_cam: Query<(Entity, Option<&VolumetricFog>), With<OperatorCamera>>,
+) {
+    for (entity, fog) in q_cam.iter() {
+        match (settings.volumetric_fog, fog) {
+            (true, Some(_)) | (true, None) => {
+                commands.entity(entity).insert(VolumetricFog {
+                    step_count: settings.fog_step_count,
+                    ambient_intensity: 0.1,
+                    ambient_color: Color::srgb(0.85, 0.88, 1.0),
+                    jitter: 0.0,
+                });
+            }
+            (false, Some(_)) => {
+                commands.entity(entity).remove::<VolumetricFog>();
+            }
+            (false, None) => {}
+        }
+    }
+}
+
+/// Mutate the perspective projection's far plane + FOV.
+pub fn apply_projection_system(
+    settings: Res<GraphicsSettings>,
+    mut q_cam: Query<&mut Projection, With<OperatorCamera>>,
+) {
+    for mut proj in q_cam.iter_mut() {
+        if let Projection::Perspective(p) = proj.as_mut() {
+            p.far = settings.view_distance;
+            p.fov = settings.fov_deg.to_radians();
+        }
+    }
+}
+
+/// Mutate the primary window's `PresentMode`. Mirrors the pattern at
+/// `ffxi-client/src/view_native/text_input.rs:743/760` — `Fifo` is
+/// vsync-on, `AutoVsync` is vsync-off (auto-pick AutoNoVsync when the
+/// driver supports it; falls back to Mailbox otherwise).
+pub fn apply_vsync_system(
+    settings: Res<GraphicsSettings>,
+    mut q_window: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    for mut window in q_window.iter_mut() {
+        let target = if settings.vsync {
+            PresentMode::Fifo
+        } else {
+            PresentMode::AutoNoVsync
+        };
+        if window.present_mode != target {
+            window.present_mode = target;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_high_preset() {
+        let s = GraphicsSettings::default();
+        assert_eq!(s.preset, QualityPreset::High);
+        assert_eq!(s.shadow_map_size, 4096);
+        assert_eq!(s.shadow_cascade_count, 4);
+        assert!((s.shadow_max_distance - 600.0).abs() < 1e-6);
+    }
+
+    /// Every preset value must appear in its field's slot list so
+    /// cycling from a preset doesn't first need to snap.
+    #[test]
+    fn preset_values_are_slot_aligned() {
+        for &preset in PRESET_CYCLE {
+            let s = GraphicsSettings::for_preset(preset);
+            assert!(
+                SHADOW_MAP_SIZE_SLOTS.contains(&s.shadow_map_size),
+                "preset {:?} shadow_map_size {} not in slot list",
+                preset,
+                s.shadow_map_size
+            );
+            assert!(SHADOW_CASCADE_COUNT_SLOTS.contains(&s.shadow_cascade_count));
+            assert!(SHADOW_MAX_DISTANCE_SLOTS
+                .iter()
+                .any(|x| (x - s.shadow_max_distance).abs() < 1e-3));
+            assert!(BLOOM_SLOTS.iter().any(|x| (x - s.bloom_intensity).abs() < 1e-3));
+            assert!(FOG_STEP_SLOTS.contains(&s.fog_step_count));
+            assert!(VIEW_DISTANCE_SLOTS
+                .iter()
+                .any(|x| (x - s.view_distance).abs() < 1e-3));
+            assert!(FOV_SLOTS.iter().any(|x| (x - s.fov_deg).abs() < 1e-3));
+            assert!(AA_SLOTS.contains(&s.anti_aliasing));
+        }
+    }
+
+    /// JSON round-trip preserves every field, including the preset tag.
+    #[test]
+    fn json_roundtrip_preserves_all_fields() {
+        let s = GraphicsSettings::for_preset(QualityPreset::Ultra);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: GraphicsSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    /// Cycling any non-preset field once flips the preset tag to Custom.
+    #[test]
+    fn cycling_a_lever_marks_preset_custom() {
+        let mut s = GraphicsSettings::default();
+        assert_eq!(s.preset, QualityPreset::High);
+        s.cycle(GraphicsField::ShadowMapSize, 1);
+        assert_eq!(s.preset, QualityPreset::Custom);
+
+        // Same for a binary field.
+        let mut s = GraphicsSettings::default();
+        s.cycle(GraphicsField::VolumetricFog, 1);
+        assert_eq!(s.preset, QualityPreset::Custom);
+        assert!(!s.volumetric_fog, "toggled off");
+    }
+
+    /// Cycling the Preset row overwrites every field to that preset's
+    /// values — it does NOT flip to Custom (that's the whole point).
+    #[test]
+    fn cycling_preset_overwrites_all_fields() {
+        let mut s = GraphicsSettings::for_preset(QualityPreset::High);
+        s.shadow_map_size = 1024;
+        s.preset = QualityPreset::Custom;
+
+        // Snap to Low via Preset cycle: Custom isn't in PRESET_CYCLE,
+        // so the position lookup falls back to index 0 (Low), then
+        // delta=+1 → Medium.
+        s.cycle(GraphicsField::Preset, 1);
+        let medium = GraphicsSettings::for_preset(QualityPreset::Medium);
+        assert_eq!(s, medium);
+    }
+
+    /// Cycle wraps with rem_euclid — last slot + 1 → first slot, and
+    /// vice versa.
+    #[test]
+    fn cycle_wraps_in_both_directions() {
+        let mut s = GraphicsSettings::default();
+        // shadow_map_size starts at 4096 = slot index 2 of [1024, 2048, 4096, 8192].
+        s.cycle(GraphicsField::ShadowMapSize, 1);
+        assert_eq!(s.shadow_map_size, 8192);
+        s.cycle(GraphicsField::ShadowMapSize, 1);
+        assert_eq!(s.shadow_map_size, 1024, "wrapped past 8192");
+        s.cycle(GraphicsField::ShadowMapSize, -1);
+        assert_eq!(s.shadow_map_size, 8192, "wrapped back");
+    }
+
+    /// `msaa()` resolves Taa to MSAA::Off (the TAA render node requires
+    /// it; see comment on `apply_anti_aliasing_system`).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn taa_implies_msaa_off() {
+        let mut s = GraphicsSettings::default();
+        s.anti_aliasing = AaMode::Taa;
+        assert_eq!(s.msaa(), Msaa::Off);
+        assert!(s.wants_taa());
+    }
+
+    /// Value labels are human-readable — used by the menu row renderer.
+    #[test]
+    fn value_label_smoke() {
+        let s = GraphicsSettings::default();
+        assert_eq!(s.value_label(GraphicsField::Preset), "High");
+        assert_eq!(s.value_label(GraphicsField::ShadowMapSize), "4096px");
+        assert_eq!(s.value_label(GraphicsField::ShadowCascadeCount), "4");
+        assert_eq!(s.value_label(GraphicsField::ShadowMaxDistance), "600m");
+        assert_eq!(s.value_label(GraphicsField::VolumetricFog), "On");
+        assert_eq!(s.value_label(GraphicsField::Fov), "75°");
+    }
+
+    /// reset_to_default snaps any custom state back to the High preset.
+    #[test]
+    fn reset_returns_to_high() {
+        let mut s = GraphicsSettings::for_preset(QualityPreset::Low);
+        s.bloom_intensity = 0.16;
+        s.preset = QualityPreset::Custom;
+        s.reset_to_default();
+        assert_eq!(s, GraphicsSettings::for_preset(QualityPreset::High));
+    }
+}

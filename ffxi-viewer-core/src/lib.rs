@@ -23,6 +23,7 @@ pub mod camera;
 pub mod components;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_mmb;
+pub mod graphics_settings;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_mzb;
 #[cfg(not(target_arch = "wasm32"))]
@@ -54,6 +55,7 @@ pub use camera::{
 pub use components::{
     EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
 };
+pub use graphics_settings::{AaMode, GraphicsField, GraphicsSettings, QualityPreset};
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
     ChatBuffer, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack, PassiveCursorFocus,
@@ -127,6 +129,11 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<CameraMode>()
             .init_resource::<LockOn>()
             .init_resource::<ZoneLineState>()
+            // Front-ends that load a `graphics.json` from disk (native
+            // client) call `insert_resource` *before* adding this plugin;
+            // `init_resource` here is a no-op in that case. WASM and
+            // headless tests fall back to the default (High preset).
+            .init_resource::<GraphicsSettings>()
             .init_resource::<atmosphere::ZoneAtmosphereProvider>()
             .init_resource::<atmosphere::LastAtmosphereZone>()
             .init_resource::<sun_moon::VanaSky>()
@@ -222,5 +229,23 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // sync/dispatch/camera pipeline.
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(Update, dat_vos2::tick_skinned_actors);
+
+        // Graphics-settings reactors: each fires on the frame the user
+        // touches a knob, applies its slice of state, then sleeps until
+        // the next change. Independent of each other and of the chained
+        // scene pipeline above; no ordering constraints.
+        app.add_systems(
+            Update,
+            (
+                graphics_settings::apply_shadow_map_size_system,
+                graphics_settings::apply_cascade_config_system,
+                graphics_settings::apply_anti_aliasing_system,
+                graphics_settings::apply_bloom_system,
+                graphics_settings::apply_volumetric_fog_system,
+                graphics_settings::apply_projection_system,
+                graphics_settings::apply_vsync_system,
+            )
+                .run_if(resource_changed::<GraphicsSettings>),
+        );
     }
 }

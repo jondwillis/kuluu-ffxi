@@ -49,3 +49,7 @@ ffxi-audio = { path = "../ffxi-audio" }
 js-sys = "0.3"
 
 [dev-dependencies]
+# JSON round-trip test for `GraphicsSettings`. Not in the runtime deps:
+# the resource itself only needs `serde` derives; serialization is the
+# `ffxi-client::graphics_store` layer's concern.
+serde_json = { workspace = true }
