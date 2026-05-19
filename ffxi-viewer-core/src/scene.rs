@@ -142,13 +142,6 @@ pub struct EntityMaterials {
 #[derive(Component)]
 pub struct Aggroing;
 
-/// HP bar quad parented to a `WorldEntity`. Width rescaled per tick from
-/// entity hp_pct; color lerps red↔green by HP fraction.
-#[derive(Component)]
-pub struct HpBar {
-    pub owner_id: u32,
-}
-
 /// Cached per-kind entity meshes. Distinct silhouettes give the operator a
 /// cheap visual differentiator before nameplates load. PC = tall slim
 /// capsule (humanoid); Mob = boxy cuboid; Pet = short capsule; everything
@@ -160,10 +153,6 @@ pub struct EntityMesh {
     pub mob: Handle<Mesh>,
     pub pet: Handle<Mesh>,
 }
-
-/// HP bar mesh — a horizontal cuboid used for all HP indicators.
-#[derive(Resource)]
-pub struct HpBarMesh(pub Handle<Mesh>);
 
 /// Currently-targeted FFXI entity id. `None` when no target is selected.
 #[derive(Resource, Default)]
@@ -238,7 +227,6 @@ pub fn setup_world(
         // Pets: small capsule, hugs the ground.
         pet: meshes.add(Capsule3d::new(0.4, 0.6)),
     });
-    commands.insert_resource(HpBarMesh(meshes.add(Cuboid::new(1.0, 0.12, 0.12))));
 
     // No placeholder ground plane: the navmesh wireframe overlay
     // (`ffxi-client::view_native::navmesh_overlay`) provides terrain
@@ -299,7 +287,6 @@ pub fn sync_entities_system(
     state: Res<SceneState>,
     target: Res<Target>,
     mesh: Res<EntityMesh>,
-    hp_bar_mesh: Res<HpBarMesh>,
     mats: Res<EntityMaterials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -309,14 +296,6 @@ pub fn sync_entities_system(
     mut commands: Commands,
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     mut q_mat: Query<&mut MeshMaterial3d<StandardMaterial>, With<WorldEntity>>,
-    mut q_hp: Query<
-        (
-            &HpBar,
-            &mut Transform,
-            &mut MeshMaterial3d<StandardMaterial>,
-        ),
-        Without<WorldEntity>,
-    >,
     q_nameplates: Query<&Nameplate>,
 ) {
     if !state.dirty && !target.is_changed() {
@@ -428,23 +407,18 @@ pub fn sync_entities_system(
                         EntityKind::Mob | EntityKind::Pc | EntityKind::Pet
                     )
                 {
-                    let bar_color = hp_color(wire.hp_pct);
-                    commands.spawn((
-                        HpBar { owner_id: wire.id },
-                        // HP bars hover above an entity; without `IGNORE`
-                        // they would intercept clicks aimed at the capsule
-                        // beneath them and the click-to-target system
-                        // would think the operator clicked a non-entity.
-                        Pickable::IGNORE,
-                        Mesh3d(hp_bar_mesh.0.clone()),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: bar_color,
-                            perceptual_roughness: 0.5,
-                            ..default()
-                        })),
-                        Transform::from_xyz(0.0, 1.5, 0.0),
-                        ChildOf(bevy_e),
-                    ));
+                    // HP indicator is rendered as filled rectangles
+                    // inside the nameplate texture (see
+                    // `nameplate_billboard.rs`). No separate 3D entity:
+                    // the prior `HpBar` quad parented to the WorldEntity
+                    // followed the entity's heading rotation, so it
+                    // appeared horizontally-across-the-chest at any
+                    // camera angle that wasn't dead-aligned with the
+                    // entity's facing direction. Folding the bar into
+                    // the nameplate texture lets it inherit the same
+                    // Y-locked billboard rotation and stay perpendicular
+                    // to the camera for free.
+                    let _ = bevy_e;
                 }
             }
         }
@@ -507,21 +481,11 @@ pub fn sync_entities_system(
         }
     }
 
-    // Update HP bars.
-    for (bar, mut t, mut hm) in q_hp.iter_mut() {
-        if let Some(Some(pct)) = hp_by_id.get(&bar.owner_id).copied() {
-            let frac = (pct as f32 / 100.0).clamp(0.0, 1.0);
-            t.scale.x = frac;
-            t.translation.x = -(1.0 - frac) * 0.5;
-            hm.0 = materials.add(StandardMaterial {
-                base_color: hp_color(Some(pct)),
-                perceptual_roughness: 0.5,
-                ..default()
-            });
-        } else {
-            t.scale.x = 0.0;
-        }
-    }
+    // HP update path moved into `nameplate_billboard.rs`: the per-
+    // frame `update_nameplate_billboards_system` re-rasterizes the
+    // nameplate texture (which embeds the HP bar) only when the
+    // integer percentage actually changes, gated on a new `last_hp`
+    // field on `NameplateBillboard`.
 }
 
 /// Per-tick: reconcile the `Aggroing` marker on each ECS entity and
@@ -789,14 +753,6 @@ pub fn process_entity_look_changes(q_changed: Query<(&WorldEntity, &LookComp), C
             we.id, we.kind, look.0
         );
     }
-}
-
-/// HP bar color: green at 100%, yellow at 50%, red at 0%.
-fn hp_color(pct: Option<u8>) -> Color {
-    let frac = pct.unwrap_or(100) as f32 / 100.0;
-    let r = frac.min(1.0);
-    let g = (1.0 - frac).min(1.0);
-    Color::srgb(r, g, 0.0)
 }
 
 #[cfg(test)]

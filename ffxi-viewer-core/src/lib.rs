@@ -49,8 +49,9 @@ pub mod weather_fx;
 pub mod zone_lines;
 
 pub use camera::{
-    chase_camera_system, firstperson_camera_system, heading_for_yaw, spawn_camera,
-    toggle_camera_mode, yaw_for_heading, CameraMode, ChaseCamera, OperatorCamera,
+    chase_camera_system, firstperson_camera_system, heading_for_yaw,
+    self_visibility_for_camera_mode_system, spawn_camera, toggle_camera_mode, yaw_for_heading,
+    CameraMode, ChaseCamera, OperatorCamera,
 };
 pub use components::{
     EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
@@ -67,8 +68,8 @@ pub use mouse::{CursorLockRequest, MousePlugin, MousePointer};
 pub use picking::{click_to_target_system, resolve_click_target, ClickResolution, PickingPlugin};
 pub use scene::{
     feet_offset, ffxi_to_bevy, process_entity_look_changes, setup_world, sync_aggro_system,
-    sync_entities_system, sync_entity_looks_system, Aggroing, EntityMaterials, EntityMesh, HpBar,
-    HpBarMesh, Target, TrackedEntities,
+    sync_entities_system, sync_entity_looks_system, Aggroing, EntityMaterials, EntityMesh,
+    Target, TrackedEntities,
 };
 pub use snapshot::{apply_delta, ingest_system, EventLog, SceneState, CHAT_HISTORY_CAP};
 pub use source::SceneSource;
@@ -229,6 +230,15 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // sync/dispatch/camera pipeline.
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(Update, dat_vos2::tick_skinned_actors);
+
+        // Camera-mode reactor: hide the player's own avatar in first-person
+        // so the camera doesn't render the inside of the skull/equipment.
+        // Standalone (not part of the chained scene tuple above) because it
+        // has no ordering relationship with anything in that pipeline — it
+        // only reads `CameraMode` and writes `Visibility` on the `IsSelf`
+        // entity, and Bevy's visibility propagation pass picks up the
+        // change downstream.
+        app.add_systems(Update, self_visibility_for_camera_mode_system);
 
         // Graphics-settings reactors: each fires on the frame the user
         // touches a knob, applies its slice of state, then sleeps until
