@@ -139,12 +139,18 @@ pub struct CelestialMaterials {
 
 /// Spawn the sun and moon directional lights *and* their visible
 /// discs. Call from `setup_world`.
+///
+/// The cascade config is derived from the current
+/// [`GraphicsSettings`](crate::graphics_settings::GraphicsSettings) so
+/// users with a persisted non-default preset don't see a one-frame
+/// flicker as the reactor systems re-snap the cascades.
 pub fn spawn_sun_and_moon(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    settings: &crate::graphics_settings::GraphicsSettings,
 ) {
-    use crate::scene::cascade_config_for_sun;
+    use crate::graphics_settings::cascade_config_from_settings;
     commands.spawn((
         crate::components::InGameEntity,
         IsSun,
@@ -155,7 +161,7 @@ pub fn spawn_sun_and_moon(
             shadow_normal_bias: 1.0,
             ..default()
         },
-        cascade_config_for_sun(),
+        cascade_config_from_settings(settings),
         bevy::light::VolumetricLight,
         Transform::from_xyz(0.0, LIGHT_DISTANCE, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));

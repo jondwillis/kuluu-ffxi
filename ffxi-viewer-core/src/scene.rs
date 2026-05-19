@@ -14,12 +14,13 @@
 
 use std::collections::HashMap;
 
-use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder, FogVolume};
+use bevy::light::FogVolume;
 use bevy::picking::Pickable;
 use bevy::prelude::*;
 use ffxi_viewer_wire::{EntityKind, Vec3 as WireVec3};
 
 use crate::components::{IsSelf, LookComp, Nameplate, WorldEntity};
+use crate::graphics_settings::GraphicsSettings;
 use crate::snapshot::SceneState;
 
 /// Map a wire-side FFXI position to a Bevy world position.
@@ -177,25 +178,18 @@ pub struct TrackedEntities {
     pub by_id: HashMap<u32, Entity>,
 }
 
-/// 4-cascade shadow map used by the sun light. First cascade tight
-/// (~12m around the player) for sharp character self-shadowing; last
-/// cascade ~500m so distant terrain still receives shadows.
-pub fn cascade_config_for_sun() -> CascadeShadowConfig {
-    CascadeShadowConfigBuilder {
-        num_cascades: 4,
-        minimum_distance: 0.1,
-        maximum_distance: 500.0,
-        first_cascade_far_bound: 12.0,
-        overlap_proportion: 0.2,
-    }
-    .build()
-}
-
 /// Startup system: ground plane, key light, and the cached materials.
+///
+/// Reads `GraphicsSettings` for the initial cascade config so a player
+/// with a persisted non-default preset doesn't see a one-frame pop on
+/// zone-in (the reactor systems in
+/// `crate::graphics_settings` re-apply on the next change, but spawning
+/// straight to the right config avoids that initial mismatch).
 pub fn setup_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    settings: Res<GraphicsSettings>,
 ) {
     let mk = |c: Color, m: &mut Assets<StandardMaterial>| {
         m.add(StandardMaterial {
@@ -256,7 +250,7 @@ pub fn setup_world(
     // are tagged and updated each frame by `sun_moon::sun_moon_system`
     // from Vana'diel time (sun arcs east→west across the V-day; moon
     // is anti-phase; moon brightness follows the 84-day phase cycle).
-    crate::sun_moon::spawn_sun_and_moon(&mut commands, &mut meshes, &mut materials);
+    crate::sun_moon::spawn_sun_and_moon(&mut commands, &mut meshes, &mut materials, &settings);
 
     // Zone-scale fog volume. `FogVolume`'s bounds come from its
     // Transform scale (default 1m³); we make it a ~2km cube so the

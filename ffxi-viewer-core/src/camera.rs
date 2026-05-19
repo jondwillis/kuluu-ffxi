@@ -12,7 +12,13 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::anti_alias::taa::TemporalAntiAliasing;
+
 use crate::components::IsSelf;
+use crate::graphics_settings::GraphicsSettings;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::graphics_settings::AaMode;
 use crate::snapshot::SceneState;
 
 /// Marker on the operator camera entity.
@@ -106,8 +112,13 @@ impl Default for ChaseCamera {
     }
 }
 
-pub fn spawn_camera(mut commands: Commands) {
-    commands.spawn((
+pub fn spawn_camera(mut commands: Commands, settings: Res<GraphicsSettings>) {
+    // Read AA, bloom, fog, view distance, and FOV from the user's
+    // persisted settings (defaults to High preset) so the first frame
+    // matches the loaded config — the reactor systems in
+    // `graphics_settings` re-apply on every change, but spawning at the
+    // right initial values avoids a one-frame visual pop.
+    let mut camera = commands.spawn((
         crate::components::InGameEntity,
         OperatorCamera,
         Camera3d::default(),
@@ -122,21 +133,10 @@ pub fn spawn_camera(mut commands: Commands) {
         // Soft PCF shadow filter. Without it the directional-light
         // shadows are jagged single-sample hard edges.
         ShadowFilteringMethod::Gaussian,
-        Msaa::Sample4,
+        settings.msaa(),
         Bloom {
-            intensity: 0.08,
+            intensity: settings.bloom_intensity,
             ..Bloom::NATURAL
-        },
-        // Raymarched volumetric fog. Pairs with the `VolumetricLight`
-        // marker on the directional light (`scene.rs::setup_world`)
-        // and a world-spanning `FogVolume` entity. `step_count` is
-        // perf vs banding — 32 is fast and slightly banded; 96 is the
-        // cinematic setting. 64 is the Bevy default and a sane middle.
-        VolumetricFog {
-            step_count: 64,
-            ambient_intensity: 0.1,
-            ambient_color: Color::srgb(0.85, 0.88, 1.0),
-            jitter: 0.0,
         },
         // Distance fog disabled for now. The `ZoneAtmosphere` seam
         // can still attach one per-zone later via
@@ -147,14 +147,39 @@ pub fn spawn_camera(mut commands: Commands) {
         // Extend the far-clip past the celestial-disc sky radius
         // (`crate::sun_moon::SKY_RADIUS` = 4000m). Bevy's default
         // perspective far-clip is 1000m, which culled the sun/moon
-        // discs entirely. 6000m gives headroom and is still well
-        // within float-depth precision.
+        // discs entirely. The settings default (High = 6000m) gives
+        // headroom and is still well within float-depth precision.
         Projection::Perspective(PerspectiveProjection {
-            far: 6000.0,
+            far: settings.view_distance,
+            fov: settings.fov_deg.to_radians(),
             ..default()
         }),
         Transform::from_xyz(0.0, 12.0, 18.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
+
+    // Raymarched volumetric fog is opt-in per the user's setting; pairs
+    // with the `VolumetricLight` marker on the directional light
+    // (`scene.rs::setup_world`) and a world-spanning `FogVolume`
+    // entity. `step_count` is perf vs banding — 32 is fast and slightly
+    // banded; 96 is the cinematic setting. 64 is the Bevy default.
+    if settings.volumetric_fog {
+        camera.insert(VolumetricFog {
+            step_count: settings.fog_step_count,
+            ambient_intensity: 0.1,
+            ambient_color: Color::srgb(0.85, 0.88, 1.0),
+            jitter: 0.0,
+        });
+    }
+
+    // TAA on Ultra and any user-cycled Taa setting. WASM build doesn't
+    // ship TAA (motion-vector prepass is heavy on WebGPU; `AaMode::Taa`
+    // is clamped out of `AA_SLOTS` on wasm32), so the cfg-gate keeps
+    // both the import + insert tidy.
+    #[cfg(not(target_arch = "wasm32"))]
+    if matches!(settings.anti_aliasing, AaMode::Taa) {
+        camera.insert(TemporalAntiAliasing::default());
+    }
+
     commands.insert_resource(ChaseCamera::default());
 }
 
