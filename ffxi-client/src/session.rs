@@ -815,6 +815,7 @@ fn handle_sub_packet(
             if sub.data.len() >= 4 {
                 let slot = u16::from_le_bytes([sub.data[0], sub.data[1]]) as u8;
                 let track_id = u16::from_le_bytes([sub.data[2], sub.data[3]]);
+                tracing::info!(slot, track_id, "0x05F MUSIC packet");
                 let _ = event_tx.send(AgentEvent::MusicChanged { slot, track_id });
             }
         }
@@ -826,6 +827,7 @@ fn handle_sub_packet(
             if sub.data.len() >= 4 {
                 let slot = u16::from_le_bytes([sub.data[0], sub.data[1]]) as u8;
                 let volume = u16::from_le_bytes([sub.data[2], sub.data[3]]) as u8;
+                tracing::info!(slot, volume, "0x060 MUSIC_VOLUME packet");
                 let _ = event_tx.send(AgentEvent::MusicVolumeChanged { slot, volume });
             }
         }

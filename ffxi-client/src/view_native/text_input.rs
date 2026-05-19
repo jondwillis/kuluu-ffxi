@@ -86,6 +86,17 @@ pub struct SlashWriters<'w, 's> {
     pub primary_window: Query<'w, 's, &'static mut Window, With<PrimaryWindow>>,
     /// Persisted capture-toggle state — see [`CaptureMode`].
     pub capture_mode: ResMut<'w, CaptureMode>,
+    /// `/bgm <id>` synthesizes a `ViewerEvent::MusicChanged` into
+    /// the EventLog so the audio plugin's existing drain → resolve
+    /// → decode pipeline plays the requested track. The EventLog
+    /// resource is the same buffer `ingest_system` populates from
+    /// real wire events; pushing here is indistinguishable
+    /// downstream.
+    pub event_log: ResMut<'w, ffxi_viewer_core::EventLog>,
+    /// `/sfx <id>` writes directly into the audio plugin's SFX
+    /// message queue. `SfxEvent::new(id)` plays once at full
+    /// volume; `play_sfx_system` handles the decode + spawn.
+    pub sfx_event: MessageWriter<'w, ffxi_viewer_core::audio::SfxEvent>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -629,6 +640,27 @@ fn apply_slash_outcome(
         }
         SlashOutcome::DebugHeights => {
             slash_writers.debug_heights.write(DebugHeightsRequest);
+        }
+        SlashOutcome::PlayBgm { track_id } => {
+            // Synthesize the same wire event a 0x05F packet would
+            // produce — slot 0 (ZoneDay) is the default audible slot
+            // when nothing else is set. The audio plugin's
+            // drain_music_events_system folds this into BgmSlots
+            // and apply_bgm_system decodes + plays.
+            slash_writers
+                .event_log
+                .recent
+                .push_back(ffxi_viewer_wire::ViewerEvent::MusicChanged {
+                    slot: 0,
+                    track_id,
+                });
+            push_system_chat_line(scene_state, format!("/bgm {track_id}: queued"));
+        }
+        SlashOutcome::PlaySfx { se_id } => {
+            slash_writers
+                .sfx_event
+                .write(ffxi_viewer_core::audio::SfxEvent::new(se_id));
+            push_system_chat_line(scene_state, format!("/sfx {se_id}: fired"));
         }
         SlashOutcome::EndCutscene { event_num } => {
             // Resolve player's own UniqueNo + ActIndex. For a forced

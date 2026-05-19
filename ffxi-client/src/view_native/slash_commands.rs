@@ -406,6 +406,16 @@ pub enum SlashOutcome {
     /// state without taking on more context). The dispatcher fills in
     /// `shop_no` from the snapshot's `offset_index`.
     ShopBuyRow { shop_index: u8, qty: u32 },
+    /// `/bgm <track_id>` — manually trigger BGM playback (useful for
+    /// testing without a server-pushed 0x05F). Slot defaults to
+    /// `ZoneDay` (0), which the priority ladder will play unless
+    /// the user has already engaged combat.
+    PlayBgm { track_id: u16 },
+    /// `/sfx <se_id>` — fire a one-shot sound effect by numeric id.
+    /// IDs come from the `dat-scan-sounds` example or the LSB
+    /// SE-table research; values must resolve to a `.spw` under
+    /// `sound{,2..15}/win/se/seNNN/seNNNNNN.spw`.
+    PlaySfx { se_id: u32 },
     /// `/navmesh [on|off]` — flip the debug navmesh overlay. `None`
     /// means toggle (no arg given); `Some(b)` is an explicit set.
     /// Mirrors the `SetTarget(Option<u32>)` shape — a client-side
@@ -680,6 +690,14 @@ pub fn parse_slash(
         "buy" => parse_buy(rest),
         "sit" => SlashOutcome::SystemMessage("/sit: not yet wired".into()),
         "stand" => SlashOutcome::SystemMessage("/stand: not yet wired".into()),
+        "bgm" => match rest.parse::<u16>() {
+            Ok(id) => SlashOutcome::PlayBgm { track_id: id },
+            Err(_) => SlashOutcome::SystemMessage("/bgm <track_id>".into()),
+        },
+        "sfx" => match rest.parse::<u32>() {
+            Ok(id) => SlashOutcome::PlaySfx { se_id: id },
+            Err(_) => SlashOutcome::SystemMessage("/sfx <se_id>".into()),
+        },
         "cancel" => SlashOutcome::Command(AgentCommand::Cancel),
         // ---- Stage 4 lockstep: every MCP tool has a slash twin -----------
         // The MCP `cast` / `weaponskill` / `job_ability` tools wrap the same

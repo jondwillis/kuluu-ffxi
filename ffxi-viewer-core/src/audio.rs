@@ -84,11 +84,19 @@ impl Default for BgmSlots {
 }
 
 fn resolve_install_root() -> Option<PathBuf> {
-    // `FFXI_DAT_PATH` points at the install root (the parent dir
-    // that contains `ROM/`, `sound/`, etc.) — same env var
-    // `ffxi-dat::DatRoot::from_env` uses. Reusing it keeps the
-    // viewer's audio + dat configs in lockstep.
-    std::env::var_os("FFXI_DAT_PATH").map(PathBuf::from)
+    // Mirror `ffxi-dat::DatRoot::from_env_or_default`: env var first,
+    // workspace-relative vendor fallback second. Verified by
+    // checking for `sound/win/` (the audio entry point) rather than
+    // `VTABLE.DAT` (the DAT entry point) since this code only cares
+    // about the audio trees.
+    if let Some(root) = std::env::var_os("FFXI_DAT_PATH") {
+        return Some(PathBuf::from(root));
+    }
+    let fallback = PathBuf::from("vendor/Game/SquareEnix/FINAL FANTASY XI");
+    if fallback.join("sound/win").is_dir() {
+        return Some(fallback);
+    }
+    None
 }
 
 /// Slot resolution priority. Lowest index wins. Mirrors retail
@@ -166,11 +174,20 @@ pub fn apply_bgm_system(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut audio_sources: ResMut<Assets<AudioSource>>,
+    mut warned: Local<bool>,
 ) {
-    // Without an install root we have nothing to play — silently
-    // no-op so the rest of the viewer remains usable on installs
-    // that don't ship the sound trees.
+    // Without an install root we have nothing to play. Warn once so
+    // the silence is at least visible in the log — every subsequent
+    // frame stays silent.
     let Some(install) = slots.install_root.clone() else {
+        if !*warned {
+            warn!(
+                "audio: BGM disabled — neither FFXI_DAT_PATH is set \
+                 nor does ./vendor/Game/SquareEnix/FINAL FANTASY XI/sound/win exist. \
+                 Set FFXI_DAT_PATH to the install root to enable BGM."
+            );
+            *warned = true;
+        }
         return;
     };
     // TODO(audio): wire `is_night` to `sun_moon::VanaSky` once we
@@ -351,11 +368,19 @@ pub fn play_sfx_system(
     mut cache: ResMut<SfxCache>,
     mut audio_sources: ResMut<Assets<AudioSource>>,
     mut commands: Commands,
+    mut warned: Local<bool>,
 ) {
     if events.is_empty() {
         return;
     }
     let Some(install) = slots.install_root.clone() else {
+        if !*warned {
+            warn!(
+                "audio: SFX events are firing but install_root is unset; \
+                 set FFXI_DAT_PATH to hear them."
+            );
+            *warned = true;
+        }
         return;
     };
     for ev in events.read() {
