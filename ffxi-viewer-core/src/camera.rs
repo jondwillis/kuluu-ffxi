@@ -108,6 +108,7 @@ impl Default for ChaseCamera {
 
 pub fn spawn_camera(mut commands: Commands) {
     commands.spawn((
+        crate::components::InGameEntity,
         OperatorCamera,
         Camera3d::default(),
         // HDR is a marker component in Bevy 0.17 (was `camera.hdr`

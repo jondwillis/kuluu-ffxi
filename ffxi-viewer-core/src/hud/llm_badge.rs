@@ -72,6 +72,7 @@ pub struct BadgeClock {
 pub fn spawn_llm_badge(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             LlmBadge,
             Node {
                 position_type: PositionType::Absolute,

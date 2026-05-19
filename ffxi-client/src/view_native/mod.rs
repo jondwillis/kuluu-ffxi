@@ -42,7 +42,7 @@ use ffxi_client::reactor::ReactorConfig;
 use ffxi_client::{spawn_session_with_reactor, SessionHandle};
 use ffxi_viewer_core::{
     add_hud_spawners, hud::zone_flash::ZoneNameResolver, setup_world, setup_zone_line_assets,
-    spawn_camera, HudPlugin, MousePlugin, OperatorCamera, SceneState, ViewerCorePlugin,
+    spawn_camera, HudPlugin, InGameEntity, MousePlugin, SceneState, ViewerCorePlugin,
     ZoneLineDescriptor, ZoneLineResolver,
 };
 use ffxi_viewer_wire::Stage as WireStage;
@@ -205,6 +205,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // for highlight materials, breaking Tab targeting visuals.
     app.insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<AutoRun>()
+        .init_resource::<text_input::CaptureMode>()
         .insert_resource(ports)
         .insert_resource(RelayListen(relay_listen))
         .insert_resource(DatRootRes(dat_root));
@@ -233,15 +234,21 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
     add_hud_spawners(&mut app, OnEnter(AppPhase::InGame));
 
-    // Despawn the in-game 3D camera when the InGame phase ends (clean
-    // /logout, kick, drop). Without this, the OperatorCamera persists
-    // into Launcher, and `OnEnter(AppPhase::Launcher)` then spawns a
-    // 2D launcher camera — two cameras with the same render target and
-    // both at priority 0 produces the "Camera order ambiguities"
-    // warning spam and a grey screen until the user kills the process.
-    // Mirrors the symmetric `OnExit(AppPhase::Launcher)` despawn for
-    // the 2D launcher camera in `launcher_ui/mod.rs:437`.
-    app.add_systems(OnExit(AppPhase::InGame), despawn_world_camera);
+    // Despawn every InGame-scoped entity on phase exit — camera, HUD
+    // widgets, world scene, dynamically-spawned PC/NPC mirrors,
+    // nameplates, etc. Every viewer-core spawner attaches the
+    // `InGameEntity` marker; this system flushes them all in one pass.
+    //
+    // Why a marker instead of Bevy's built-in `DespawnOnExit<AppPhase>`:
+    // viewer-core can't reference `AppPhase` without a circular
+    // dependency on the front-end crate. The marker lives at the
+    // viewer-core layer and the front-end registers the despawn against
+    // its own state type — same semantics, no layering violation. See
+    // `ffxi_viewer_core::components::InGameEntity`.
+    //
+    // Mirrors the symmetric `OnExit(AppPhase::Launcher)` 2D-camera
+    // despawn in `launcher_ui/mod.rs:437`.
+    app.add_systems(OnExit(AppPhase::InGame), despawn_ingame_entities);
 
     // Keybinds: load persisted preset+overrides from disk before plugins
     // run. `ViewerCorePlugin::build` calls `init_resource::<Bindings>()`,
@@ -402,21 +409,23 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 /// so reaching CharList requires a fresh `AuthInFlight`. For now the
 /// operator hits Esc → Enter to re-handshake; an auto-advance using
 /// the stored `Credentials` is a worthwhile follow-up.
-/// `OnExit(AppPhase::InGame)` cleanup: despawn the 3D
-/// [`OperatorCamera`]. The launcher's 2D camera is about to spawn (via
-/// `OnEnter(AppPhase::Launcher)::spawn_launcher_camera`), and Bevy will
-/// log "Camera order ambiguities" + render a grey screen if both
-/// cameras exist with the same `RenderTarget` and `order=0`.
+/// `OnExit(AppPhase::InGame)` cleanup: despawn every entity carrying the
+/// [`InGameEntity`] marker. This covers the 3D camera, world scene
+/// (lights, sky, zone-line markers), HUD UI nodes, and every
+/// PC/NPC/nameplate spawned by the entity-sync system.
 ///
-/// We deliberately only touch the camera here — full world-entity
-/// teardown (zone mesh, lights, sky, HUD widgets) is a larger cleanup
-/// the launcher mostly tolerates because the launcher UI draws on top.
-/// The camera ambiguity is the one issue that produces user-visible
-/// breakage.
-fn despawn_world_camera(mut commands: Commands, q: Query<Entity, With<OperatorCamera>>) {
+/// `despawn` in Bevy 0.17 is recursive — children come along — so each
+/// HUD spawner only needs to attach the marker to its top-level node,
+/// not to every nested child. Same for `WorldEntity` mirrors and their
+/// nameplate/HP-bar children.
+fn despawn_ingame_entities(mut commands: Commands, q: Query<Entity, With<InGameEntity>>) {
+    let mut count = 0usize;
     for entity in q.iter() {
-        tracing::info!(?entity, "OnExit(InGame): despawning OperatorCamera");
         commands.entity(entity).despawn();
+        count += 1;
+    }
+    if count > 0 {
+        tracing::info!(count, "OnExit(InGame): despawned scoped entities");
     }
 }
 

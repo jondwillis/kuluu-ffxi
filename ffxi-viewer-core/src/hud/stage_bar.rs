@@ -44,6 +44,7 @@ pub struct ZoneLabel;
 pub fn spawn_stage_bar(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             StageBar,
             Node {
                 position_type: PositionType::Absolute,

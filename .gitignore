@@ -32,6 +32,10 @@ ffxi-agent/dist/
 # HorizonXI install lives here (see ffxi-dat/README or the async-watching-waffle
 # plan for layout). Point FFXI_DAT_PATH at vendor/Game/FINAL FANTASY XI/ to use.
 vendor/Game/
+
+# xi-tinkerer — vendored as AGPL-3 reference only (read-only, never linked).
+# See vendor/xi-tinkerer/CLAIM.md and memory note `xi_tinkerer_agpl_reference`.
+vendor/xi-tinkerer/
 .functional-emotions
 .claude/worktrees/
 

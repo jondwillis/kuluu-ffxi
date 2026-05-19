@@ -53,13 +53,16 @@ pub(super) struct PreviewedSlot {
 }
 
 const PREVIEW_PARENT_POS: Vec3 = Vec3::new(-1.4, 0.0, 0.0);
-/// Camera position relative to the preview parent. Pulled back +Z
-/// far enough to fit a ~2 yalm character in frame with default
-/// 45° FOV, and raised +Y so the camera looks at the model's
-/// mid-section (chest) rather than its feet.
-const PREVIEW_CAMERA_OFFSET: Vec3 = Vec3::new(0.0, 1.2, 4.5);
-/// Where the camera is aimed — center of the character, roughly
-/// torso height.
+/// Camera position relative to the preview parent.
+///
+/// Geometry: the baked PC mesh's mesh-y=0 is **feet** (verified
+/// against the head-slot bake-extent diagnostic which showed head
+/// at y≈[0.84..1.59]). With the parent at y=0, the character
+/// spans roughly y ∈ [0, +1.7]. Aim at chest height (~1.0 yalm)
+/// and camera slightly higher for a gentle downward look.
+const PREVIEW_CAMERA_OFFSET: Vec3 = Vec3::new(0.0, 1.3, 3.5);
+/// Aim at chest height — head ends up in the upper third per the
+/// rule-of-thirds composition.
 const PREVIEW_LOOK_AT_OFFSET: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 
 pub(super) fn spawn_preview(
@@ -129,15 +132,23 @@ pub(super) fn spawn_preview(
     // Survives cursor-change refreshes; only its children get
     // despawned + respawned.
     //
-    // Identity rotation: the bake (`spawn_vos2_meshes`) already
-    // produces upright characters in raw Bevy space — what looked
-    // like an inversion earlier was actually just the camera being
-    // too close to fit the head in frame. Now that the camera is
-    // pulled back, no parent rotation is needed.
+    // Parent rotation: the shared `bind_to_bevy` in `dat_vos2`
+    // orients the character to face Bevy -Z (away from camera),
+    // which is correct for in-world third-person where the chase
+    // camera sits behind the player. In the launcher we want the
+    // *face* toward the camera so the user can see what their
+    // character looks like — apply an extra Q_y(-π/2) here so
+    // composed world rotation flips bake-front from -Z to +Z
+    // (toward camera). The -π/2 (not π) accounts for the fact that
+    // the shared bind already contains a Q_y(π/2) component.
     let parent = commands
         .spawn((
             CharPreviewParent,
-            Transform::from_translation(PREVIEW_PARENT_POS),
+            Transform {
+                translation: PREVIEW_PARENT_POS,
+                rotation: Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2),
+                scale: Vec3::ONE,
+            },
             Visibility::default(),
             ChildOf(root),
         ))
@@ -241,8 +252,8 @@ fn spawn_for_slot(
         return;
     }
     let spawned = spawn_equipped(
-        commands, meshes, materials, images, parent, slot.race, slot.head, slot.body, slot.hands,
-        slot.legs, slot.feet, slot.main, slot.sub, slot.ranged,
+        commands, meshes, materials, images, parent, slot.race, slot.face, slot.head, slot.body,
+        slot.hands, slot.legs, slot.feet, slot.main, slot.sub, slot.ranged,
     );
     info!(
         "char preview: char_id={} race={} face={} \

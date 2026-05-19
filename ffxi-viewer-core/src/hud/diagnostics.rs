@@ -41,6 +41,7 @@ pub struct DiagFpsValue;
 pub fn spawn_diagnostics(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             DiagnosticsBar,
             Node {
                 position_type: PositionType::Absolute,

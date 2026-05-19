@@ -74,6 +74,7 @@ fn bar_color(stat: BarStat) -> Color {
 /// when the first snapshot with party data arrives.
 pub fn spawn_roster_panel(mut commands: Commands) {
     commands.spawn((
+        crate::components::InGameEntity,
         RosterPanel,
         Node {
             position_type: PositionType::Absolute,

@@ -109,7 +109,7 @@ pub fn clamp_chase_camera_to_collision(
         *last_summary = Some(summary);
         for (i, bvh) in bvh_q.iter().enumerate() {
             let (mn, mx) = bvh.root_aabb().unwrap_or((Vec3::ZERO, Vec3::ZERO));
-            tracing::info!(
+            tracing::debug!(
                 bvh_index = i,
                 tri_count = bvh.tri_count(),
                 aabb_min = ?(mn.x, mn.y, mn.z),
@@ -117,7 +117,7 @@ pub fn clamp_chase_camera_to_collision(
                 "camera_collision probe: BVH summary"
             );
         }
-        tracing::info!(
+        tracing::debug!(
             bvhs = bvh_count,
             pending_meshes = pending_count,
             "camera_collision probe: coverage summary"

@@ -19,6 +19,24 @@ pub struct WorldEntity {
 #[derive(Component, Debug, Clone, Copy)]
 pub struct IsSelf;
 
+/// Marks any entity that belongs to the in-game session (world entities,
+/// camera, HUD nodes, PC/NPC mirrors, nameplates). The front-end binary
+/// despawns every entity carrying this marker on session teardown
+/// (`OnExit(AppPhase::InGame)` in the native viewer), so the UI/scene
+/// reset cleanly when the player logs out or gets dropped.
+///
+/// Why a viewer-core-side marker rather than Bevy's built-in
+/// `DespawnOnExit<S>(state)`: the state type (`AppPhase`) lives in the
+/// front-end crate; viewer-core can't reference it without a circular
+/// dependency. This marker is the cross-crate-clean equivalent — every
+/// viewer-core spawner attaches it, and each front-end registers the
+/// despawn system against its own state type.
+///
+/// Despawn is recursive in Bevy (children come along), so this only
+/// needs to land on top-level spawn entities — not every nested child.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct InGameEntity;
+
 /// Marks a UI nameplate node that displays the name of a `WorldEntity`.
 /// Updated each frame by `nameplate::update_nameplates_system` to track the
 /// owning entity's screen-projected position. `kind` lets the label

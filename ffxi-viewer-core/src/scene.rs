@@ -61,6 +61,37 @@ pub fn feet_offset(kind: EntityKind) -> f32 {
     }
 }
 
+/// Marker inserted on an entity once its baked PC/NPC mesh has been
+/// spawned (see `dat_vos2::spawn_equipped`). The snap and target-ring
+/// systems consult this to switch their visual offset model: a baked
+/// mesh's origin is the **skeleton root (hip)**, not the mesh center
+/// the legacy capsule assumed.
+#[derive(Component)]
+pub struct BakedActor;
+
+/// Distance from the entity transform's y down to the "ground"
+/// reference plane the snap should land on.
+///
+/// - Legacy capsule visual: returns [`feet_offset`] (capsule center →
+///   capsule bottom).
+/// - Baked-mesh visual: returns ~hip-to-foot distance. The bake's
+///   mesh-y=0 is the **skeleton root (hip)**, not feet: the head-slot
+///   bake extent (y=[0.84..1.59] post-rotation) is *neck-to-top-of-
+///   head*, and feet are at negative y (legs/feet slot extends below
+///   the hip). To put the mesh's feet at ground, the entity transform
+///   needs to be at `ground + hip_height`.
+#[inline]
+pub fn visual_root_offset(kind: EntityKind, has_baked_mesh: bool) -> f32 {
+    if has_baked_mesh {
+        // ~0.9 yalm — typical PC hip-to-foot distance derived from
+        // the bake-extent analysis. Per-race tuning (Taru shorter,
+        // Galka taller) is a follow-up; this constant is acceptable
+        // until a character of the wrong race shows visible float/sink.
+        return 0.9;
+    }
+    feet_offset(kind)
+}
+
 /// Per-frame visual smoothing for *non-self* entity transforms.
 ///
 /// Self position is updated 60 Hz from `dispatch_movement_system`'s
@@ -151,7 +182,7 @@ pub struct TrackedEntities {
 /// cascade ~500m so distant terrain still receives shadows.
 pub fn cascade_config_for_sun() -> CascadeShadowConfig {
     CascadeShadowConfigBuilder {
-        num_cascades: 6,
+        num_cascades: 4,
         minimum_distance: 0.1,
         maximum_distance: 500.0,
         first_cascade_far_bound: 12.0,

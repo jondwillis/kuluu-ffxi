@@ -35,6 +35,7 @@ const PANEL_SIZE_PX: f32 = 32.0;
 pub fn spawn_compass(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             CompassPanel,
             Node {
                 position_type: PositionType::Absolute,

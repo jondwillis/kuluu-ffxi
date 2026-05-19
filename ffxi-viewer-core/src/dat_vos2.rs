@@ -153,6 +153,31 @@ pub fn load_vos2(file_id: u32, chunk_idx: usize) -> Result<LoadedVos2, String> {
 
     let mesh = parse_vos2(chunk.data).map_err(|e| format!("vos2 parse: {e}"))?;
 
+    // Diagnostic: when the parsed mesh is empty, dump *all* chunk
+    // kinds in this file. Used to chase down cases like the head
+    // slot DAT (file 23216 for Mithra) which has an OS2 chunk that
+    // parses to zero verts — strong hint the actual scalp/skull
+    // geometry lives in a different chunk kind (e.g. MMB, or a
+    // distinct OS2 variant we don't yet handle).
+    if mesh.groups.is_empty() || mesh.vertices.is_empty() {
+        let kinds: Vec<String> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let k = ChunkKind::from_u8(c.kind)
+                    .map(|x| format!("{:?}", x))
+                    .unwrap_or_else(|| format!("0x{:02x}", c.kind));
+                let name = std::str::from_utf8(&c.name).unwrap_or("?");
+                format!("[{}]{}({},{}B)", i, k, name.trim(), c.data.len())
+            })
+            .collect();
+        info!(
+            "vos2 empty-mesh dump file={} all_chunks: {}",
+            file_id,
+            kinds.join(" ")
+        );
+    }
+
     // Scrape IMG chunks for textures the same way MMB does. Equipment
     // DATs typically have one IMG per body part.
     let textures: Vec<Vos2NamedTexture> = chunks
@@ -382,8 +407,14 @@ fn baked_skeleton(race: u8) -> Option<BakedSkeleton> {
 fn skeleton_fits_mesh(baked: &BakedSkeleton, mesh: &Vos2Mesh) -> bool {
     let n = baked.world.len();
     if mesh.header.use_bone_table() {
+        // bone_table is the palette; per-vertex bone_index reads from it.
+        // If the palette fits, every weight1 and weight2 reference fits.
         mesh.bone_table.iter().all(|&b| (b as usize) < n)
     } else {
+        // Direct indices — `bone_indices` interleaves bone1/bone2 records
+        // (2 entries per FFXI vertex per lotus's reader). Both must fit
+        // or the bake will silently fall back to local-space for some
+        // verts, scattering the resulting mesh.
         mesh.bone_indices
             .iter()
             .all(|bi| (bi.bone_index1 as usize) < n)
@@ -420,13 +451,63 @@ fn unroll_root_rotation(v: [f32; 3]) -> [f32; 3] {
 /// expected to pass `baked = None` when the skeleton doesn't fit
 /// this mesh (race mismatch); the helper then returns `local`
 /// untouched, which mirrors the pre-bake behavior.
+///
+/// 2-weight vertices: when the vertex has an entry in
+/// `mesh.bone_weights` (i.e. its index falls in the `weight2`
+/// region), this blends the two bones' contributions per the FFXI
+/// formula `w1*bone1*pos1 + w2*bone2*pos2`. For rigid (`weight1`)
+/// verts the path collapses to the single-bone case.
+///
+/// Why this matters: races whose body meshes carry many 2-weight
+/// verts (Mithra has tail bones, Galka has sash bones) baked
+/// with the old single-bone approximation produced vertices spread
+/// 1+ yalms along the forward axis, making the body appear missing
+/// from typical camera angles.
 fn bake_position(
     mesh: &Vos2Mesh,
     vertex_idx: usize,
-    local: [f32; 3],
+    _local: [f32; 3],
     baked: Option<&BakedSkeleton>,
 ) -> [f32; 3] {
-    let Some(baked) = baked else { return local };
+    let Some(baked) = baked else { return _local };
+    let weight1_count = mesh.vertices.len().saturating_sub(mesh.bone_weights.len());
+    if vertex_idx >= weight1_count && vertex_idx < mesh.vertices.len() {
+        let bw = &mesh.bone_weights[vertex_idx - weight1_count];
+        let b1 = mesh.skeleton_bone_for(vertex_idx).map(|b| b as usize);
+        let b2 = mesh.skeleton_bone2_for(vertex_idx).map(|b| b as usize);
+        let m1 = b1.and_then(|i| baked.world.get(i));
+        let m2 = b2.and_then(|i| baked.world.get(i));
+        // Only do the 2-bone blend if *both* bones resolve. With one
+        // bone unresolved, the fallback (untransformed pos) is in a
+        // different frame than the other bone's world-transformed
+        // result; mixing them produces vertices in nonsense
+        // locations — visible as the "mouth blown apart" / "body
+        // stretched 1y forward" failures we saw on Mithra and
+        // Galka. Single-bone bake on bone1 is a safer degradation.
+        if let (Some(m1), Some(m2)) = (m1, m2) {
+            let p1 = bone::mat4_transform_point(*m1, bw.pos1);
+            let p2 = bone::mat4_transform_point(*m2, bw.pos2);
+            let sum = bw.weight1 + bw.weight2;
+            let (w1, w2) = if sum > 0.0 {
+                (bw.weight1 / sum, bw.weight2 / sum)
+            } else {
+                (1.0, 0.0)
+            };
+            let blended = [
+                p1[0] * w1 + p2[0] * w2,
+                p1[1] * w1 + p2[1] * w2,
+                p1[2] * w1 + p2[2] * w2,
+            ];
+            return unroll_root_rotation(blended);
+        }
+        // Fallback: rigid single-bone on bone1 using pos1.
+        if let Some(m1) = m1 {
+            return unroll_root_rotation(bone::mat4_transform_point(*m1, bw.pos1));
+        }
+        return bw.pos1;
+    }
+    // Rigid (1-weight) vertex: single-bone transform of mesh.vertices[i].pos.
+    let local = mesh.vertices.get(vertex_idx).map(|v| v.pos).unwrap_or(_local);
     let Some(bone_id) = mesh.skeleton_bone_for(vertex_idx) else {
         return local;
     };
@@ -438,13 +519,46 @@ fn bake_position(
 
 /// Same as [`bake_position`] but for normals — rotation-only
 /// (translation column discarded by [`bone::mat4_transform_dir`]).
+/// 2-weight verts blend normals from both bones per the same w1/w2
+/// weighting; result is *not* renormalized (matches lotus's CPU
+/// path; the shader doesn't care about exact unit length for
+/// directional lighting at typical model scales).
 fn bake_normal(
     mesh: &Vos2Mesh,
     vertex_idx: usize,
-    local: [f32; 3],
+    _local: [f32; 3],
     baked: Option<&BakedSkeleton>,
 ) -> [f32; 3] {
-    let Some(baked) = baked else { return local };
+    let Some(baked) = baked else { return _local };
+    let weight1_count = mesh.vertices.len().saturating_sub(mesh.bone_weights.len());
+    if vertex_idx >= weight1_count && vertex_idx < mesh.vertices.len() {
+        let bw = &mesh.bone_weights[vertex_idx - weight1_count];
+        let b1 = mesh.skeleton_bone_for(vertex_idx).map(|b| b as usize);
+        let b2 = mesh.skeleton_bone2_for(vertex_idx).map(|b| b as usize);
+        let m1 = b1.and_then(|i| baked.world.get(i));
+        let m2 = b2.and_then(|i| baked.world.get(i));
+        if let (Some(m1), Some(m2)) = (m1, m2) {
+            let n1 = bone::mat4_transform_dir(*m1, bw.normal1);
+            let n2 = bone::mat4_transform_dir(*m2, bw.normal2);
+            let sum = bw.weight1 + bw.weight2;
+            let (w1, w2) = if sum > 0.0 {
+                (bw.weight1 / sum, bw.weight2 / sum)
+            } else {
+                (1.0, 0.0)
+            };
+            let blended = [
+                n1[0] * w1 + n2[0] * w2,
+                n1[1] * w1 + n2[1] * w2,
+                n1[2] * w1 + n2[2] * w2,
+            ];
+            return unroll_root_rotation(blended);
+        }
+        if let Some(m1) = m1 {
+            return unroll_root_rotation(bone::mat4_transform_dir(*m1, bw.normal1));
+        }
+        return bw.normal1;
+    }
+    let local = mesh.vertices.get(vertex_idx).map(|v| v.normal).unwrap_or(_local);
     let Some(bone_id) = mesh.skeleton_bone_for(vertex_idx) else {
         return local;
     };
@@ -960,6 +1074,48 @@ fn spawn_vos2_meshes_with_skeleton(
     // back to local-space rendering — the pre-bake behavior, small
     // and contained at the entity origin.
     let baked = baked_for_mesh(&loaded.mesh, baked_owned);
+    // Skeleton-fit diagnostic: knowing whether `baked` is Some vs None
+    // explains the "body slot missing" symptom — when fit fails, every
+    // vert renders in raw local-space at near-origin coords (invisible
+    // inside the parent transform).
+    {
+        let total_verts = loaded.mesh.vertices.len();
+        let weight2 = loaded.mesh.bone_weights.len();
+        let weight1 = total_verts.saturating_sub(weight2);
+        let skel_n = baked_owned.map(|b| b.world.len()).unwrap_or(0);
+        let max_bone1 = loaded
+            .mesh
+            .bone_indices
+            .iter()
+            .step_by(2)
+            .map(|bi| bi.bone_index1 as usize)
+            .max()
+            .unwrap_or(0);
+        let max_bone2 = loaded
+            .mesh
+            .bone_indices
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|bi| bi.bone_index1 as usize)
+            .max()
+            .unwrap_or(0);
+        let max_table = loaded.mesh.bone_table.iter().copied().max().unwrap_or(0) as usize;
+        info!(
+            "vos2 fit: skel_bones={} use_bone_table={} bone_table_max={} max_bone1={} max_bone2={} \
+             verts={}(rigid={}, w2={}) groups={} baked_skel={}",
+            skel_n,
+            loaded.mesh.header.use_bone_table(),
+            max_table,
+            max_bone1,
+            max_bone2,
+            total_verts,
+            weight1,
+            weight2,
+            loaded.mesh.groups.len(),
+            baked.is_some(),
+        );
+    }
     let positions: Vec<[f32; 3]> = loaded
         .mesh
         .vertices
@@ -1186,17 +1342,44 @@ pub fn spawn_equipped(
     let slot_names = ["head", "body", "hands", "legs", "feet", "main", "sub", "ranged"];
     let slots = [head, body, hands, legs, feet, main, sub, ranged];
     let mut spawned = 0usize;
+    // Helper: spawn every VOS2 chunk in a DAT as its own mesh.
+    // lotus-ffxi (actor.cpp:84-110) collects every OS2 chunk in the
+    // DAT and treats them collectively as one actor model. Previously
+    // we returned only the largest, which for body slots drops
+    // shoulder/torso/arm sub-meshes and renders an apparently
+    // "missing" chest.
+    let mut spawn_all_chunks = |chunk_indices: Vec<usize>,
+                                file_id: u32,
+                                label: &str|
+     -> usize {
+        let mut count = 0usize;
+        for idx in chunk_indices {
+            match load_vos2(file_id, idx) {
+                Ok(loaded) if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() => {
+                    spawn_vos2_meshes(commands, meshes, materials, images, parent, &loaded, race);
+                    count += 1;
+                }
+                Ok(_) => info!(
+                    "spawn_equipped: {} file={} chunk={} loaded but empty (race={})",
+                    label, file_id, idx, race
+                ),
+                Err(e) => info!(
+                    "spawn_equipped: {} file={} chunk={} load failed: {} (race={})",
+                    label, file_id, idx, e, race
+                ),
+            }
+        }
+        count
+    };
     // Face mesh first — lotus loads it as a separate DAT alongside the
     // 8 equipment slots. Naked-but-faced characters still need the
     // face here, so this runs before the slot loop.
     if let Some(file_id) = resolve_face(face, race) {
-        match load_vos2(file_id, 4) {
-            Ok(loaded) if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() => {
-                spawn_vos2_meshes(commands, meshes, materials, images, parent, &loaded, race);
-                spawned += 1;
-            }
-            Ok(_) => info!("spawn_equipped: face file={} loaded but empty (race={})", file_id, race),
-            Err(e) => info!("spawn_equipped: face file={} load failed: {} (race={})", file_id, e, race),
+        let chunks = enumerate_vos2_chunks(file_id);
+        if chunks.is_empty() {
+            info!("spawn_equipped: face file={} has no VOS2 chunks (race={})", file_id, race);
+        } else {
+            spawned += spawn_all_chunks(chunks, file_id, "face");
         }
     }
     for (slot_id, slot_name) in slots.iter().zip(slot_names.iter()) {
@@ -1206,20 +1389,16 @@ pub fn spawn_equipped(
             }
             continue;
         };
-        match load_vos2(file_id, 4) {
-            Ok(loaded) if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() => {
-                spawn_vos2_meshes(commands, meshes, materials, images, parent, &loaded, race);
-                spawned += 1;
-            }
-            Ok(_) => info!(
-                "spawn_equipped: slot {} file={} loaded but empty (slot_id={:#06X} race={})",
+        let chunks = enumerate_vos2_chunks(file_id);
+        if chunks.is_empty() {
+            info!(
+                "spawn_equipped: slot {} file={} no VOS2 chunks (slot_id={:#06X} race={})",
                 slot_name, file_id, slot_id, race
-            ),
-            Err(e) => info!(
-                "spawn_equipped: slot {} file={} load failed: {} (slot_id={:#06X} race={})",
-                slot_name, file_id, e, slot_id, race
-            ),
+            );
+            continue;
         }
+        let label = format!("slot {}", slot_name);
+        spawned += spawn_all_chunks(chunks, file_id, &label);
     }
     if spawned > 0 {
         commands.entity(parent).insert(BakedActor);

@@ -39,6 +39,7 @@ pub struct VanaClockLabel;
 pub fn spawn_vana_clock(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             VanaClockPanel,
             Node {
                 position_type: PositionType::Absolute,

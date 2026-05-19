@@ -398,7 +398,7 @@ pub fn build_collision_bvh_system(
             continue;
         }
         let bvh = build_bvh_with_leaf_offsets(tris);
-        info!(
+        debug!(
             entity = ?entity,
             triangles = tri_count,
             nodes = bvh.nodes.len(),

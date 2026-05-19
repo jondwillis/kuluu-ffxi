@@ -58,6 +58,7 @@ pub struct MeshDebugHudText;
 pub fn spawn_mesh_debug_hud(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             MeshDebugHud,
             Node {
                 position_type: PositionType::Absolute,

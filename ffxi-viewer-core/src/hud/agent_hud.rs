@@ -50,6 +50,7 @@ pub struct RecentToolsText;
 pub fn spawn_agent_hud(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             AgentHud,
             Node {
                 position_type: PositionType::Absolute,

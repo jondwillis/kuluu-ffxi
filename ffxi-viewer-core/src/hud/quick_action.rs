@@ -66,6 +66,7 @@ pub struct QuickActionRow {
 pub fn spawn_quick_action(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             QuickActionPanel,
             Node {
                 position_type: PositionType::Absolute,

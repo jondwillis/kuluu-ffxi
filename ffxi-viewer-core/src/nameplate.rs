@@ -59,6 +59,7 @@ pub fn spawn_nameplate(
     let owned = name.to_string();
     commands
         .spawn((
+            crate::components::InGameEntity,
             Nameplate { entity_id, kind },
             Node {
                 position_type: PositionType::Absolute,

@@ -15,7 +15,7 @@ use std::f32::consts::PI;
 use bevy::prelude::*;
 
 use crate::components::WorldEntity;
-use crate::scene::{feet_offset, Target};
+use crate::scene::{visual_root_offset, BakedActor, Target};
 use crate::snapshot::SceneState;
 
 /// Bevy world units. Tuned so the ring reads clearly around the default
@@ -48,19 +48,20 @@ const ENGAGED_RING_RADIUS: f32 = 1.7;
 /// and any newly-spawned `WorldEntity` transforms have been reconciled.
 pub fn draw_target_ring_system(
     target: Res<Target>,
-    world_q: Query<(&Transform, &WorldEntity)>,
+    world_q: Query<(&Transform, &WorldEntity, Has<BakedActor>)>,
     mut gizmos: Gizmos,
 ) {
     let Some(target_id) = target.id else {
         return;
     };
 
-    for (t, w) in &world_q {
+    for (t, w, has_baked_mesh) in &world_q {
         if w.id == target_id {
-            // Entity's center is at navmesh_h + feet_offset; subtract
-            // feet_offset to land back at the navmesh-ground level
-            // for this entity, then lift slightly to avoid z-fight.
-            let ground_y = t.translation.y - feet_offset(w.kind) + RING_Y_LIFT;
+            // Entity transform is at `navmesh_h + visual_root_offset`;
+            // subtract that offset to land at the entity's ground
+            // level, then lift slightly to avoid z-fight.
+            let ground_y =
+                t.translation.y - visual_root_offset(w.kind, has_baked_mesh) + RING_Y_LIFT;
             let pos = Vec3::new(t.translation.x, ground_y, t.translation.z);
             // Default circle is in the xy plane; rotate -90° around X so it
             // lies flat on xz.
@@ -83,7 +84,7 @@ pub fn draw_target_ring_system(
 /// yet (early in the post-zone-in window) the system no-ops.
 pub fn draw_engaged_ring_system(
     state: Res<SceneState>,
-    world_q: Query<(&Transform, &WorldEntity)>,
+    world_q: Query<(&Transform, &WorldEntity, Has<BakedActor>)>,
     mut gizmos: Gizmos,
 ) {
     let Some(self_id) = state.snapshot.self_char_id else {
@@ -99,9 +100,10 @@ pub fn draw_engaged_ring_system(
     if !engaged {
         return;
     }
-    for (t, w) in &world_q {
+    for (t, w, has_baked_mesh) in &world_q {
         if w.id == self_id {
-            let ground_y = t.translation.y - feet_offset(w.kind) + RING_Y_LIFT;
+            let ground_y =
+                t.translation.y - visual_root_offset(w.kind, has_baked_mesh) + RING_Y_LIFT;
             let pos = Vec3::new(t.translation.x, ground_y, t.translation.z);
             gizmos.circle(
                 Isometry3d::new(pos, Quat::from_rotation_x(-PI / 2.0)),

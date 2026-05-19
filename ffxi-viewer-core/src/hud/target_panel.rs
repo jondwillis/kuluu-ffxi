@@ -57,6 +57,7 @@ const HP_BAR_HEIGHT_PX: f32 = 6.0;
 pub fn spawn_target_panel(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             TargetPanel,
             Node {
                 position_type: PositionType::Absolute,

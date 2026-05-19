@@ -226,6 +226,32 @@ pub struct Vos2Vertex {
     pub normal: [f32; 3],
 }
 
+/// Per-vertex multi-bone weight pair, populated only for the
+/// 2-bone (`weight2`) records in the OS2 vertex section. Indexed
+/// by the vertex index *minus* `weight1` (since the first `weight1`
+/// vertices are rigid).
+///
+/// FFXI's 2-bone format isn't standard linear-blend skinning: each
+/// 2-bone vertex carries **separate positions** for each bone's
+/// local space (`pos1` and `pos2` below), and the final world
+/// position is `w1 * bone1_world * pos1 + w2 * bone2_world * pos2`.
+/// Bevy's `SkinnedMesh` expects one position blended by N weighted
+/// bone transforms — so feeding `pos1` plus weights `(w1, w2)`
+/// produces an approximation, not exact reproduction. The
+/// approximation is acceptable because pos1 and pos2 are nearly
+/// identical at the joint surface (the format's whole reason to
+/// exist is to control how the position diverges *just* at the
+/// joint crease).
+#[derive(Debug, Clone, Copy)]
+pub struct Vos2BoneWeight {
+    pub weight1: f32,
+    pub weight2: f32,
+    pub pos1: [f32; 3],
+    pub pos2: [f32; 3],
+    pub normal1: [f32; 3],
+    pub normal2: [f32; 3],
+}
+
 /// One indexed triangle with per-corner UVs. The triangle-list and
 /// triangle-strip walkers both produce this shape.
 #[derive(Debug, Clone, Copy)]
@@ -241,6 +267,16 @@ pub struct Vos2Triangle {
 pub struct Vos2Group {
     pub texture_name: String,
     pub triangles: Vec<Vos2Triangle>,
+    /// Specular exponent from the most-recent `0x8010` DrawState
+    /// opcode preceding this group. 0.0 = no specular contribution.
+    /// Mirrors lotus's `DrawStateHeader::specular_exponent`
+    /// (`vendor/lotus-ffxi/ffxi/dat/os2.cppm:106`).
+    pub specular_exponent: f32,
+    /// Specular intensity multiplier from the same DrawState.
+    /// 0.0 = matte. Combined with the exponent, this drives the
+    /// Bevy `StandardMaterial`'s metallic + roughness translation
+    /// in the spawn path.
+    pub specular_intensity: f32,
 }
 
 /// Top-level parsed VertexOs2 chunk: bind-pose vertex pool + groups
@@ -268,6 +304,11 @@ pub struct Vos2Mesh {
     /// 2-weight verts consume different numbers of entries — see
     /// [`Vos2Mesh::skeleton_bone_for`]).
     pub bone_indices: Vec<Vos2BoneIndices>,
+    /// 2-bone weight pairs for the `weight2`-region vertices (those
+    /// indexed `[header.weight1 .. vertices.len()]`). Empty for
+    /// meshes that ship only rigid (`weight1`) verts. See
+    /// [`Vos2BoneWeight`] for the format / skinning trade-off.
+    pub bone_weights: Vec<Vos2BoneWeight>,
 }
 
 impl Vos2Mesh {
@@ -305,6 +346,30 @@ impl Vos2Mesh {
     pub fn raw_bone_index_for(&self, vertex_idx: usize) -> Option<u8> {
         let bi_idx = vertex_idx.checked_mul(2)?;
         self.bone_indices.get(bi_idx).map(|b| b.bone_index1)
+    }
+
+    /// Resolve the **secondary** skeleton-bone for a 2-weight vertex
+    /// (vertices at index `[weight1.. ]`). Returns `None` for rigid
+    /// vertices (which have no second deformer).
+    ///
+    /// Per lotus's reader (`os2.cppm:322-329`), for a 2-weight FFXI
+    /// vertex `v` the secondary bone is `bone_indices[v*2 + 1]
+    /// .bone_index1` (not `[v*2].bone_index2` — the cadence is two
+    /// BoneIndices records per FFXI vertex, one per sub-vertex).
+    pub fn skeleton_bone2_for(&self, vertex_idx: usize) -> Option<u16> {
+        // Only weight2 verts have a meaningful second bone. We can't
+        // tell the boundary from inside this impl without storing
+        // the weight1 count — instead, callers should already know
+        // which range they're in (`bone_weights.is_empty()` or
+        // index comparison). Here we just return whatever the
+        // off-by-one stream says, and the caller decides how to use it.
+        let bi_idx = vertex_idx.checked_mul(2)?.checked_add(1)?;
+        let raw = self.bone_indices.get(bi_idx)?.bone_index1 as u16;
+        if self.header.use_bone_table() {
+            self.bone_table.get(raw as usize).copied()
+        } else {
+            Some(raw)
+        }
     }
 }
 
@@ -363,15 +428,30 @@ pub fn parse_vos2(body: &[u8]) -> Result<Vos2Mesh> {
         ];
         vertices.push(Vos2Vertex { pos, normal });
     }
+    let mut bone_weights: Vec<Vos2BoneWeight> = Vec::with_capacity(weight2);
     for i in 0..weight2 {
         // SoA layout: x[0], x[1], y[0], y[1], z[0], z[1], w[0], w[1],
         // hx[0], hx[1], hy[0], hy[1], hz[0], hz[1]. We take the
-        // weight-0 component as the bind-pose position.
+        // weight-0 component as the bind-pose position; the full
+        // weight pair + both positions/normals are surfaced via
+        // `bone_weights` for the skinning path that wants them.
         let off = vstart + v1_bytes + i * STRIDE2;
         let read = |k: usize| f32::from_le_bytes(body[off + k..off + k + 4].try_into().unwrap());
-        let pos = [read(0), read(8), read(16)];
-        let normal = [read(32), read(40), read(48)];
-        vertices.push(Vos2Vertex { pos, normal });
+        let pos1 = [read(0), read(8), read(16)];
+        let pos2 = [read(4), read(12), read(20)];
+        let weight1_val = read(24);
+        let weight2_val = read(28);
+        let normal1 = [read(32), read(40), read(48)];
+        let normal2 = [read(36), read(44), read(52)];
+        vertices.push(Vos2Vertex { pos: pos1, normal: normal1 });
+        bone_weights.push(Vos2BoneWeight {
+            weight1: weight1_val,
+            weight2: weight2_val,
+            pos1,
+            pos2,
+            normal1,
+            normal2,
+        });
     }
 
     // Poly walker. Cursor `p` advances through the body until an
@@ -429,6 +509,7 @@ pub fn parse_vos2(body: &[u8]) -> Result<Vos2Mesh> {
         groups,
         bone_table,
         bone_indices,
+        bone_weights,
     })
 }
 
@@ -436,6 +517,14 @@ fn parse_poly_block(body: &[u8], start: usize) -> Result<Vec<Vos2Group>> {
     let mut p = start;
     let mut groups: Vec<Vos2Group> = Vec::new();
     let mut tex_name = String::new();
+    // Material state carried forward from the most-recent 0x8010
+    // DrawState opcode. The opcode appears *before* the triangle
+    // groups it applies to (lotus os2.cppm:151 — `meshes.push_back`
+    // happens at DrawState, but in our parser groups push at the
+    // triangle opcodes, so we cache the state and stamp it on each
+    // group as it's emitted).
+    let mut specular_exponent: f32 = 0.0;
+    let mut specular_intensity: f32 = 0.0;
 
     while p + 4 <= body.len() {
         let wf = u16::from_le_bytes([body[p], body[p + 1]]);
@@ -449,6 +538,20 @@ fn parse_poly_block(body: &[u8], start: usize) -> Result<Vec<Vos2Group>> {
             if p + 0x2E > body.len() {
                 return Err(Vos2Error::PolyOob.into());
             }
+            // DrawStateHeader layout (44 bytes after opcode):
+            //   +0:  a[4]              (unknown)
+            //   +4:  b[2]              (two floats, unknown)
+            //   +12: c                 (uint32, unknown)
+            //   +16: d[4]              (four floats, unknown)
+            //   +32: e                 (uint32, unknown)
+            //   +36: specular_exponent (f32)
+            //   +40: specular_intensity(f32)
+            let exp_off = p + 2 + 36;
+            let int_off = p + 2 + 40;
+            specular_exponent =
+                f32::from_le_bytes(body[exp_off..exp_off + 4].try_into().unwrap_or([0; 4]));
+            specular_intensity =
+                f32::from_le_bytes(body[int_off..int_off + 4].try_into().unwrap_or([0; 4]));
             p += 0x2E;
             continue;
         }
@@ -481,6 +584,8 @@ fn parse_poly_block(body: &[u8], start: usize) -> Result<Vec<Vos2Group>> {
                 groups.push(Vos2Group {
                     texture_name: tex_name.clone(),
                     triangles,
+                    specular_exponent,
+                    specular_intensity,
                 });
                 p += header_size + strip_bytes;
             }
@@ -495,6 +600,8 @@ fn parse_poly_block(body: &[u8], start: usize) -> Result<Vec<Vos2Group>> {
                 groups.push(Vos2Group {
                     texture_name: tex_name.clone(),
                     triangles,
+                    specular_exponent,
+                    specular_intensity,
                 });
                 p += header_size + body_bytes;
             }
@@ -806,6 +913,7 @@ mod tests {
                     mirror_axis: 0,
                 },
             ],
+            bone_weights: vec![],
         };
 
         // use_bone_table = true → resolver goes through palette.

@@ -38,6 +38,7 @@ const PANEL_WIDTH_PX: f32 = 420.0;
 pub fn spawn_dialog_panel(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             DialogPanel,
             Node {
                 position_type: PositionType::Absolute,

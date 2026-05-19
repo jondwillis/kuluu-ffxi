@@ -81,6 +81,7 @@ pub fn spawn_weather_icon(mut commands: Commands) {
     // string), so we offset by 132 to clear it without overlap.
     commands
         .spawn((
+            crate::components::InGameEntity,
             WeatherIconPanel,
             Node {
                 position_type: PositionType::Absolute,

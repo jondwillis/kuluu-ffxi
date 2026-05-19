@@ -96,6 +96,7 @@ pub struct MainMenuRow {
 pub fn spawn_main_menu(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             MainMenu,
             Node {
                 position_type: PositionType::Absolute,

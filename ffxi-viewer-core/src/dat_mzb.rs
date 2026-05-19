@@ -34,21 +34,62 @@ use ffxi_viewer_wire::EntityKind;
 pub const DEFAULT_WORLD_DRAW_DISTANCE: f32 = 80.0;
 pub const DEFAULT_MOB_DRAW_DISTANCE: f32 = 50.0;
 
+/// 16-color palette for the 4-bit `material` id decoded from MZB
+/// triangle index high bits (see [`ffxi_dat::mzb::MzbTriangleInfo`] and
+/// `vendor/xi-tinkerer/crates/dats/src/formats/zone_data/mesh_block.rs:51-77`).
+///
+/// Without ground-truth `material_id → texture name` mapping (FFXI's
+/// runtime maps these to TIMs via the engine's material table, which
+/// we don't yet decode), each material gets a distinct muted RGB tint
+/// instead of a real texture. Walls/floors/stairs/sand each render in
+/// their own subdued hue — operator-readable without going rainbow.
+///
+/// Values are linear sRGB scalars in `[0, 1]`. They're multiplied
+/// per-vertex with a `shade` factor (`0.4..1.0` from the upward normal
+/// component) inside [`process_load_mzb_requests`] before being baked
+/// into `ATTRIBUTE_COLOR`. The unlit material's WHITE base color lets
+/// the vertex color drive the final pixel.
+const MZB_MATERIAL_PALETTE: [[f32; 3]; 16] = [
+    [0.85, 0.55, 0.40], // 0
+    [0.75, 0.65, 0.45], // 1
+    [0.50, 0.65, 0.55], // 2
+    [0.55, 0.70, 0.75], // 3
+    [0.65, 0.55, 0.75], // 4
+    [0.80, 0.65, 0.55], // 5
+    [0.65, 0.60, 0.50], // 6
+    [0.55, 0.55, 0.60], // 7
+    [0.70, 0.50, 0.45], // 8
+    [0.45, 0.55, 0.50], // 9
+    [0.60, 0.70, 0.40], // 10
+    [0.50, 0.45, 0.40], // 11
+    [0.75, 0.70, 0.50], // 12
+    [0.55, 0.60, 0.65], // 13
+    [0.45, 0.50, 0.55], // 14
+    [0.65, 0.65, 0.55], // 15
+];
+
 /// Runtime-tunable cull distances. World controls MZB overlay
 /// entities, mob controls non-PC entity capsules (mobs/NPCs/pets).
 /// PCs are never culled by distance — party members and other PCs
 /// stay visible regardless so the operator can still target them.
-/// `/zonegeom` tri-state. `Off` is the default once MMB placements
-/// render the textured visual world — the MZB collision mesh overlaps
-/// MMB walls geometrically and z-fights, so we hide it. Operators can
-/// `/zonegeom collision` to see the LoS-blocking proxy when debugging
-/// nav/path issues, or `/zonegeom all` for both layers.
+/// `/zonegeom` tri-state. **Default is `Collision`** because in
+/// dungeon-style zones (Bastok Mines, mining tunnels, etc.) the
+/// MMB-side placement table references *stub* MMBs (`kabe-atariyou` and
+/// similar) with `pieces=0` — the actual wall/floor geometry lives
+/// exclusively in the MZB collision mesh. With `Off` the player sees
+/// nothing in those zones; with `Collision` the per-material-colored
+/// MZB mesh fills the void. In city zones MMBs still supply the
+/// textured layer; the collision overlay sits behind them (mostly
+/// coincident depth). Operators who want a clean MMB-only view can
+/// still `/zonegeom off`; `/zonegeom all` adds the non-collision (visual-
+/// only) overlay on top.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneGeomMode {
-    /// Hide all MZB geometry. Default — MMBs supply the visual layer.
-    #[default]
+    /// Hide all MZB geometry. Operator opt-out for clean MMB-only view.
     Off,
     /// Show only LoS-blocking (collision) meshes — flag bit 0 == 0.
+    /// Default. Required to see geometry in dungeon-style zones.
+    #[default]
     Collision,
     /// Show both collision and non-collision (decorative) meshes.
     All,
@@ -266,6 +307,13 @@ pub struct LoadMzbRequest {
 pub struct MzbSubMesh {
     pub positions: Vec<[f32; 3]>,
     pub indices: Vec<u32>,
+    /// One per triangle (`indices.len() / 3` entries). Carries the 4-bit
+    /// `material` id (0..15) decoded from the index high bits in
+    /// `ffxi_dat::mzb::parse_one_mesh`. Used by the renderer to
+    /// partition the merged geometry into one sub-mesh per material so
+    /// each can carry its own color/texture. Cross-ref:
+    /// `vendor/xi-tinkerer/crates/dats/src/formats/zone_data/mesh_block.rs:51-77`.
+    pub tri_material: Vec<u8>,
     /// Per-mesh flag from the MZB record header. Bit 0 = does NOT
     /// block LoS (visual-only / non-collision). Surface so the caller
     /// can colorize collision vs non-collision geometry distinctly.
@@ -389,9 +437,11 @@ fn bake_submesh(m: &mzb::MzbMesh) -> MzbSubMesh {
         .iter()
         .flat_map(|t| [t[0], t[1], t[2]])
         .collect();
+    let tri_material: Vec<u8> = m.tri_info.iter().map(|t| t.material).collect();
     MzbSubMesh {
         positions,
         indices,
+        tri_material,
         flags: m.flags,
     }
 }
@@ -516,13 +566,40 @@ pub fn build_zone_mmb_spawns(
     let placements = mzb::parse_mmb_placements(&plain, &header)
         .map_err(|e| format!("MZB parse_mmb_placements: {e}"))?;
 
+    // Round-robin pairing for placement_id → chunk_idx (replaces the
+    // historical singular `resolve_mmb_index` call that collapsed
+    // every variant onto the first match).
+    //
+    // Some placement ids resolve to *multiple* MMB chunks — typically
+    // because the placement name (e.g. `cube`, `water`, `saku`) matches
+    // a family of variants in the chunk stream. Bastok Mines has
+    // `cube` × 75 placements pointing at 2 distinct `cube` MMBs and
+    // `water` × 24 pointing at 2 `water` MMBs. With the singular
+    // resolver, all 75 cube placements bound to the first match and
+    // the second variant never rendered (visible in-game as a missing
+    // family of stair / pillar / fence pieces). The plural resolver
+    // returns every match; we pair them round-robin by maintaining a
+    // per-id counter that advances each time we consume a placement.
+    // Policy: wrap modulo the match count when N placements exceed N
+    // matches (FFXI authoring assumes "place N copies of variant"
+    // wraps cleanly when N exceeds the variant set).
+    //
+    // Cited bug location for the singular collapse:
+    // `ffxi-dat/src/mzb.rs:820-829` documents the pairing requirement;
+    // this call site is what actually consumes the indices vec.
+    use std::collections::HashMap;
+    let mut rr_cursor: HashMap<String, usize> = HashMap::new();
     let mut out = Vec::with_capacity(placements.len());
     for p in &placements {
         let name = p.id_str().trim_end_matches('\0');
         let trimmed = name.trim_end();
-        let Some(local_idx) = mzb::resolve_mmb_index(trimmed, &zone_prefix, &mmb_names) else {
+        let matches = mzb::resolve_mmb_indices(trimmed, &zone_prefix, &mmb_names);
+        if matches.is_empty() {
             continue;
-        };
+        }
+        let cursor = rr_cursor.entry(trimmed.to_string()).or_insert(0);
+        let local_idx = matches[*cursor % matches.len()];
+        *cursor += 1;
         let chunk_idx = mmb_indices[local_idx];
         // Build the FFXI-native placement matrix `M_ffxi` from the
         // record's trans/rot/scale. Conventions per the reference: rot
@@ -555,6 +632,170 @@ pub fn build_zone_mmb_spawns(
             bevy_transform,
         });
     }
+
+    // DIAG-zonegeom: remove after fix. Diagnostic gated on
+    // `FFXI_DIAG_ZONE_GEOM=<file_id>` (e.g. `334` for Bastok Mines) or
+    // `=all` / `=*` to dump every zone load. Surfaces enough state to
+    // discriminate the three plausible causes of "MMBs in this zone
+    // don't all spawn" from the plan
+    // (~/.claude/plans/some-zones-still-have-composed-wind.md):
+    //   (A) round-robin pairing — placement_count_per_id > 1 AND
+    //       available_matches > 1 → singular resolver collapses siblings.
+    //   (B) parser drops MMBs at decode — placements match 1:1 here but
+    //       process_load_mmb_requests reports 0-submesh MMBs.
+    //   (C) grid-cell MeshPlacement list — many placements report 0
+    //       matches AND mmb_names is rich (placement ids live in a
+    //       different table we don't iterate).
+    let diag_enabled = match std::env::var("FFXI_DIAG_ZONE_GEOM") {
+        Ok(s) if s == "*" || s == "all" || s.eq_ignore_ascii_case("any") => true,
+        Ok(s) => s.parse::<u32>().ok() == Some(file_id),
+        _ => false,
+    };
+    if diag_enabled {
+        use std::collections::HashMap;
+
+        // Duplicate analysis over the MMB chunk-stream asset names.
+        let mut name_counts: HashMap<&str, u32> = HashMap::new();
+        for n in &mmb_names {
+            *name_counts.entry(n.trim_end()).or_insert(0) += 1;
+        }
+        let mut dup_names: Vec<(&str, u32)> = name_counts
+            .iter()
+            .filter(|(_, &c)| c > 1)
+            .map(|(&n, &c)| (n, c))
+            .collect();
+        dup_names.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Per-placement match-count buckets.
+        let mut placement_id_counts: HashMap<String, u32> = HashMap::new();
+        let mut bucket0: Vec<String> = Vec::new();
+        let mut bucket1: u32 = 0;
+        let mut bucket_many: Vec<(String, usize)> = Vec::new();
+        for p in &placements {
+            let id = p
+                .id_str()
+                .trim_end_matches('\0')
+                .trim_end()
+                .to_string();
+            *placement_id_counts.entry(id.clone()).or_insert(0) += 1;
+            let matches = mzb::resolve_mmb_indices(&id, &zone_prefix, &mmb_names);
+            match matches.len() {
+                0 => bucket0.push(id),
+                1 => bucket1 += 1,
+                n => bucket_many.push((id, n)),
+            }
+        }
+
+        // Round-robin smoke: ids with placement_count>1 AND available
+        // matches>1. If non-empty, the singular resolver is leaving
+        // siblings on the table.
+        let mut roundrobin_smoke: Vec<(String, u32, usize)> = Vec::new();
+        for (id, count) in &placement_id_counts {
+            if *count < 2 {
+                continue;
+            }
+            let m = mzb::resolve_mmb_indices(id, &zone_prefix, &mmb_names).len();
+            if m > 1 {
+                roundrobin_smoke.push((id.clone(), *count, m));
+            }
+        }
+        roundrobin_smoke.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Compact unmatched / ambiguous lists (dedup by id).
+        let mut unmatched_unique: HashMap<String, u32> = HashMap::new();
+        for id in &bucket0 {
+            *unmatched_unique.entry(id.clone()).or_insert(0) += 1;
+        }
+        let mut um_list: Vec<(String, u32)> = unmatched_unique.into_iter().collect();
+        um_list.sort_by(|a, b| b.1.cmp(&a.1));
+
+        info!(
+            target: "ffxi_viewer_core::dat_mzb::diag",
+            file_id,
+            placements = placements.len(),
+            spawned = out.len(),
+            mmb_names = mmb_names.len(),
+            zone_prefix = %zone_prefix,
+            dup_asset_names = dup_names.len(),
+            match0 = bucket0.len(),
+            match1 = bucket1,
+            match_many = bucket_many.len(),
+            roundrobin_smoke = roundrobin_smoke.len(),
+            "DIAG-zonegeom summary",
+        );
+        if !dup_names.is_empty() {
+            let head: Vec<&(&str, u32)> = dup_names.iter().take(20).collect();
+            info!(
+                target: "ffxi_viewer_core::dat_mzb::diag",
+                "DIAG-zonegeom duplicate mmb asset_names (top 20): {head:?}",
+            );
+        }
+        if !um_list.is_empty() {
+            let head: Vec<&(String, u32)> = um_list.iter().take(20).collect();
+            info!(
+                target: "ffxi_viewer_core::dat_mzb::diag",
+                "DIAG-zonegeom unmatched placement ids (id × count, top 20): {head:?}",
+            );
+        }
+        if !roundrobin_smoke.is_empty() {
+            let head: Vec<&(String, u32, usize)> = roundrobin_smoke.iter().take(20).collect();
+            info!(
+                target: "ffxi_viewer_core::dat_mzb::diag",
+                "DIAG-zonegeom round-robin smoke (id, placement_count, matches, top 20): {head:?}",
+            );
+        }
+
+        // Transform extents. If MMBs look "missing" while parse + texture
+        // are healthy, the bug is almost always positional: scale shrinks
+        // toward zero, or translations land far outside the navmesh AABB.
+        // Decompose each `bevy_transform` via `to_scale_rotation_translation`.
+        if !out.is_empty() {
+            let mut tx_min = Vec3::splat(f32::INFINITY);
+            let mut tx_max = Vec3::splat(f32::NEG_INFINITY);
+            let mut sc_min = Vec3::splat(f32::INFINITY);
+            let mut sc_max = Vec3::splat(f32::NEG_INFINITY);
+            let mut tiny_scale: Vec<(usize, [f32; 3])> = Vec::new();
+            let mut sample: Vec<(usize, [f32; 3], [f32; 3])> = Vec::new();
+            for sp in out.iter() {
+                let (scale, _rot, trans) = sp.bevy_transform.to_scale_rotation_translation();
+                tx_min = tx_min.min(trans);
+                tx_max = tx_max.max(trans);
+                sc_min = sc_min.min(scale);
+                sc_max = sc_max.max(scale);
+                if scale.length() < 1e-3 {
+                    tiny_scale.push((sp.chunk_idx, [scale.x, scale.y, scale.z]));
+                }
+                if sample.len() < 5 {
+                    sample.push((
+                        sp.chunk_idx,
+                        [trans.x, trans.y, trans.z],
+                        [scale.x, scale.y, scale.z],
+                    ));
+                }
+            }
+            info!(
+                target: "ffxi_viewer_core::dat_mzb::diag",
+                tx_min = ?[tx_min.x, tx_min.y, tx_min.z],
+                tx_max = ?[tx_max.x, tx_max.y, tx_max.z],
+                sc_min = ?[sc_min.x, sc_min.y, sc_min.z],
+                sc_max = ?[sc_max.x, sc_max.y, sc_max.z],
+                tiny_scale_n = tiny_scale.len(),
+                "DIAG-zonegeom transform extents (Bevy frame)",
+            );
+            if !tiny_scale.is_empty() {
+                let head: Vec<&(usize, [f32; 3])> = tiny_scale.iter().take(10).collect();
+                info!(
+                    target: "ffxi_viewer_core::dat_mzb::diag",
+                    "DIAG-zonegeom tiny-scale spawns (chunk_idx, scale.xyz, top 10): {head:?}",
+                );
+            }
+            info!(
+                target: "ffxi_viewer_core::dat_mzb::diag",
+                "DIAG-zonegeom sample spawns (chunk_idx, trans.xyz, scale.xyz, first 5): {sample:?}",
+            );
+        }
+    }
+
     Ok(out)
 }
 
@@ -613,9 +854,11 @@ pub fn load_mzb(file_id: u32, chunk_idx: Option<usize>) -> Result<Vec<MzbSubMesh
             .iter()
             .flat_map(|t| [t[0], t[1], t[2]])
             .collect();
+        let tri_material: Vec<u8> = m.tri_info.iter().map(|t| t.material).collect();
         out.push(MzbSubMesh {
             positions,
             indices,
+            tri_material,
             flags: m.flags,
         });
     }
@@ -685,21 +928,22 @@ pub fn process_load_mzb_requests(
         // and produces visible "missing geometry" gaps. `cull_mode: None`
         // doubles fragment cost but at the post-unlit perf baseline that
         // tradeoff is comfortably affordable.
+        //
+        // `base_color: WHITE` so the per-vertex `ATTRIBUTE_COLOR`
+        // (material_palette × normal-shade, baked above) carries the
+        // visible tint. This replaces the old single-color teal /
+        // translucent-amber appearance with material-distinguishable
+        // walls (stone, sand, wood, water etc. each gets its own hue
+        // from the 4-bit material_id decoded from the MZB triangle
+        // index high bits).
         let collision_mat = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.30, 0.65, 0.65),
+            base_color: Color::WHITE,
             unlit: true,
             cull_mode: None,
             ..default()
         });
         let noncollision_mat = materials.add(StandardMaterial {
-            // Translucent amber: visual-only walls (LoS does NOT block).
-            // The earlier opaque switch was a perf experiment from when
-            // we were CPU-bound; now that we're GPU-comfortable at ~100
-            // FPS, the see-through alpha is worth its sorted-pass cost
-            // because it lets the operator see *through* visual walls
-            // when the camera ends up inside a building.
-            base_color: Color::srgba(0.75, 0.55, 0.30, 0.45),
-            alpha_mode: AlphaMode::Blend,
+            base_color: Color::WHITE,
             unlit: true,
             cull_mode: None,
             ..default()
@@ -726,16 +970,26 @@ pub fn process_load_mzb_requests(
         // already.
         let mut collision_positions: Vec<[f32; 3]> = Vec::new();
         let mut collision_indices: Vec<u32> = Vec::new();
+        let mut collision_tri_mat: Vec<u8> = Vec::new();
         let mut noncollision_positions: Vec<[f32; 3]> = Vec::new();
         let mut noncollision_indices: Vec<u32> = Vec::new();
+        let mut noncollision_tri_mat: Vec<u8> = Vec::new();
 
         for inst in &instances {
             let sub = &submeshes[inst.submesh_idx];
             let is_collision = sub.flags & 1 == 0;
-            let (positions, indices) = if is_collision {
-                (&mut collision_positions, &mut collision_indices)
+            let (positions, indices, tri_mat) = if is_collision {
+                (
+                    &mut collision_positions,
+                    &mut collision_indices,
+                    &mut collision_tri_mat,
+                )
             } else {
-                (&mut noncollision_positions, &mut noncollision_indices)
+                (
+                    &mut noncollision_positions,
+                    &mut noncollision_indices,
+                    &mut noncollision_tri_mat,
+                )
             };
             let base = positions.len() as u32;
             for v in &sub.positions {
@@ -747,15 +1001,30 @@ pub fn process_load_mzb_requests(
             for &i in &sub.indices {
                 indices.push(i + base);
             }
+            tri_mat.extend_from_slice(&sub.tri_material);
         }
 
         // Spawn one child per non-empty merged mesh — usually both,
         // sometimes only collision (zones without decorative walls).
         // `is_collision` controls which sub-marker is attached so
         // `/zonegeom` can toggle the two channels independently.
+        //
+        // Per-vertex material tint: each vertex carries the 4-bit
+        // `material` id (0..15) from the MZB triangle index high bits
+        // (decoded in `ffxi_dat::mzb::parse_one_mesh`). We bake one of
+        // 16 palette colors into the vertex color × `shade` from the
+        // computed normal. Shared vertices that span material
+        // boundaries get the LAST triangle's material — minor seam
+        // bleed but acceptable for a coarse-mesh proxy.
+        //
+        // The 16-color palette is HSV-distributed with a fixed
+        // saturation/value: distinct enough that operator-readable
+        // walls, floors, stairs, sand etc. don't all blur together,
+        // muted enough that the scene reads as solid (not rainbow).
         let spawn_merged = |commands: &mut Commands,
                             positions: Vec<[f32; 3]>,
                             indices: Vec<u32>,
+                            tri_mat: Vec<u8>,
                             material: Handle<StandardMaterial>,
                             parent: bevy::ecs::entity::Entity,
                             auto_loaded: bool,
@@ -765,40 +1034,46 @@ pub fn process_load_mzb_requests(
             if positions.is_empty() || indices.is_empty() {
                 return;
             }
+            // Project per-triangle material id onto per-vertex slots.
+            // Last-write-wins at shared vertices.
+            let mut vert_mat: Vec<u8> = vec![0u8; positions.len()];
+            for (tri_idx, tri) in indices.chunks_exact(3).enumerate() {
+                let m = tri_mat.get(tri_idx).copied().unwrap_or(0);
+                vert_mat[tri[0] as usize] = m;
+                vert_mat[tri[1] as usize] = m;
+                vert_mat[tri[2] as usize] = m;
+            }
             let mut mesh = Mesh::new(
                 PrimitiveTopology::TriangleList,
                 RenderAssetUsages::default(),
             );
-            let n_positions = positions.len();
             mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
             mesh.insert_indices(Indices::U32(indices));
             // Smooth normals: indexed meshes share vertices and
             // can't host per-face normals; smooth shading reads
             // fine on the coarse MZB walls.
             mesh.compute_smooth_normals();
-            // Bake fake "sun lighting" into vertex colors using the
-            // computed normal's y component: faces pointing up =
-            // bright, faces pointing down = dim. The unlit material
-            // multiplies vertex color × base_color, so this gives us
-            // free shading at zero per-pixel cost. Cheap proxy for
-            // PBR lighting that runs at vertex-shader scale (`O(N)`
-            // baked-once, not `O(fragments)` per frame).
+            // Vertex color = material_palette[mat] × shade(n.y).
+            // The unlit material multiplies vertex color × base_color,
+            // so this gives us free per-vertex shading + material tint
+            // at zero per-pixel cost.
             if let Some(normals) = mesh
                 .attribute(Mesh::ATTRIBUTE_NORMAL)
                 .and_then(|a| a.as_float3())
             {
                 let colors: Vec<[f32; 4]> = normals
                     .iter()
-                    .map(|n| {
+                    .zip(vert_mat.iter())
+                    .map(|(n, &m)| {
                         // n.y in [-1, +1]. Up-facing → shade=1.0,
                         // down-facing → shade=0.4. Linear lerp.
                         let shade = 0.4 + 0.6 * (n[1] * 0.5 + 0.5);
-                        [shade, shade, shade, 1.0]
+                        let pal = MZB_MATERIAL_PALETTE[(m & 0x0F) as usize];
+                        [pal[0] * shade, pal[1] * shade, pal[2] * shade, 1.0]
                     })
                     .collect();
                 mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
             }
-            let _ = n_positions;
             let mut child = commands.spawn((
                 MzbOverlay,
                 Mesh3d(meshes.add(mesh)),
@@ -837,6 +1112,7 @@ pub fn process_load_mzb_requests(
             &mut commands,
             collision_positions,
             collision_indices,
+            collision_tri_mat,
             collision_mat,
             parent,
             req.auto_loaded,
@@ -848,6 +1124,7 @@ pub fn process_load_mzb_requests(
             &mut commands,
             noncollision_positions,
             noncollision_indices,
+            noncollision_tri_mat,
             noncollision_mat,
             parent,
             req.auto_loaded,

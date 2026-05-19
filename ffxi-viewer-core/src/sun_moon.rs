@@ -146,6 +146,7 @@ pub fn spawn_sun_and_moon(
 ) {
     use crate::scene::cascade_config_for_sun;
     commands.spawn((
+        crate::components::InGameEntity,
         IsSun,
         DirectionalLight {
             illuminance: 0.0, // Real value set on first tick by sun_moon_system.
@@ -159,6 +160,7 @@ pub fn spawn_sun_and_moon(
         Transform::from_xyz(0.0, LIGHT_DISTANCE, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
+        crate::components::InGameEntity,
         IsMoon,
         DirectionalLight {
             illuminance: 0.0,
@@ -196,6 +198,7 @@ pub fn spawn_sun_and_moon(
     // anyway; skip the shadow sampling work.
     use bevy::light::{NotShadowCaster, NotShadowReceiver};
     commands.spawn((
+        crate::components::InGameEntity,
         SunDisc,
         Mesh3d(sphere.clone()),
         MeshMaterial3d(sun_mat.clone()),
@@ -208,6 +211,7 @@ pub fn spawn_sun_and_moon(
         NotShadowReceiver,
     ));
     commands.spawn((
+        crate::components::InGameEntity,
         MoonDisc,
         Mesh3d(sphere),
         MeshMaterial3d(moon_mat.clone()),

@@ -442,6 +442,30 @@ pub fn process_load_mmb_requests(
     // Cache one LoadedMmb per (file_id, chunk_idx).
     let mut mmb_cache: std::collections::HashMap<(u32, usize), Option<LoadedMmb>> =
         std::collections::HashMap::new();
+
+    // DIAG-zonegeom: remove after fix. Aggregator for the sibling
+    // diagnostic in build_zone_mmb_spawns — counts and exemplars of
+    // zero-submesh MMBs per file_id (cause (B) candidates: clod-style
+    // sub-records mis-parsed). Gated on `FFXI_DIAG_ZONE_GEOM` exactly
+    // like the MZB-side diag (file_id direct, or `=all`/`=*`/`=any`).
+    let diag_file_id: Option<u32> = match std::env::var("FFXI_DIAG_ZONE_GEOM") {
+        Ok(s) if s == "*" || s == "all" || s.eq_ignore_ascii_case("any") => Some(u32::MAX),
+        Ok(s) => s.parse::<u32>().ok(),
+        _ => None,
+    };
+    let mut diag_zero_submesh: std::collections::HashMap<u32, Vec<(usize, String)>> =
+        std::collections::HashMap::new();
+    let mut diag_loaded: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    let mut diag_load_failed: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    let diag_matches = |fid: u32| -> bool {
+        match diag_file_id {
+            Some(u32::MAX) => true,
+            Some(want) => want == fid,
+            None => false,
+        }
+    };
     // Cache image handles per file_id (each IMG chunk in a DAT is
     // shared across all MMBs from that file).
     // Per-DAT pool: name → image handle, plus a first-IMG fallback
@@ -463,10 +487,29 @@ pub fn process_load_mmb_requests(
                 &mut scene_state,
                 format!("/load_mmb {} {}: load failed", req.file_id, req.chunk_idx),
             );
+            // DIAG-zonegeom: remove after fix.
+            if diag_matches(req.file_id) {
+                *diag_load_failed.entry(req.file_id).or_insert(0) += 1;
+            }
             continue;
         };
 
+        // DIAG-zonegeom: remove after fix.
+        if diag_matches(req.file_id) {
+            *diag_loaded.entry(req.file_id).or_insert(0) += 1;
+        }
+
         if loaded.submeshes.is_empty() {
+            // DIAG-zonegeom: remove after fix. Capture cause (B)
+            // candidates: zone-spawn MMBs (world_transform is Some)
+            // that produce zero sub-records get silently skipped in
+            // the chat HUD path below — log them here so we see them.
+            if diag_matches(req.file_id) {
+                diag_zero_submesh
+                    .entry(req.file_id)
+                    .or_default()
+                    .push((req.chunk_idx, loaded.asset_name.clone()));
+            }
             // Suppress for zone-spawn events (req.world_transform is
             // Some). Hundreds of MMBs in a city zone are clod-style
             // sub-records we don't decode yet (task #18); spamming
@@ -714,15 +757,16 @@ pub fn process_load_mmb_requests(
                 // away from the engine sun. Don't disable without
                 // also stripping the baked-color/normal channels.
                 //
-                // Regression note: commit b31a17e ("sun_moon: fix
-                // black-disc bug") collateral-damaged this line —
-                // the commit's stated scope was sun/moon disc HDR,
-                // but its diff also commented out the MMB unlit.
-                // The visible symptom was "missing textures" on
-                // floors/walls/stairs in dim zones (Bastok Mines),
-                // because PBR re-lighting against FFXI's pre-baked
-                // normals leaves whole surfaces nearly black even
-                // when the textures are correctly paired.
+                // Regression-history note (kept for context, not as a
+                // rule): b31a17e commented out `unlit: true`, 290b33c
+                // restored it on the theory that PBR re-lighting was
+                // the source of dim-zone darkness, then 5aae6b6
+                // commented it out again. Empirically the user has
+                // NEVER seen the "all-black surfaces" PBR-darken
+                // symptom in actual play — the observed failure mode
+                // is *missing / transparent* textures, which is an
+                // alpha/blending issue and orthogonal to `unlit`.
+                // Leaving unlit off until we have a real test case.
                 // unlit: true,
                 // FFXI triangle-strip winding isn't pinned to a
                 // canonical front/back convention — render both
@@ -791,6 +835,48 @@ pub fn process_load_mmb_requests(
                     req.chunk_idx,
                     if n_subs == 1 { "" } else { "es" },
                 ),
+            );
+        }
+    }
+
+    // DIAG-zonegeom: remove after fix. Per-file_id summary of the
+    // current event burst (zone-in fires hundreds-to-thousands of
+    // LoadMmbRequests in one frame; subsequent frames are quiet).
+    if diag_file_id.is_some() {
+        for (fid, examples) in &diag_zero_submesh {
+            if examples.is_empty() {
+                continue;
+            }
+            let loaded = diag_loaded.get(fid).copied().unwrap_or(0);
+            let load_failed = diag_load_failed.get(fid).copied().unwrap_or(0);
+            let head: Vec<&(usize, String)> = examples.iter().take(20).collect();
+            info!(
+                target: "ffxi_viewer_core::dat_mmb::diag",
+                file_id = *fid,
+                loaded,
+                load_failed,
+                zero_submesh = examples.len(),
+                "DIAG-zonegeom zero-submesh MMBs (chunk_idx, asset_name, top 20): {head:?}",
+            );
+        }
+        // Even when zero_submesh is empty, surface the counts so we
+        // know the system saw events for the target zone.
+        for (fid, loaded) in &diag_loaded {
+            if diag_zero_submesh
+                .get(fid)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let load_failed = diag_load_failed.get(fid).copied().unwrap_or(0);
+            info!(
+                target: "ffxi_viewer_core::dat_mmb::diag",
+                file_id = *fid,
+                loaded = *loaded,
+                load_failed,
+                zero_submesh = 0,
+                "DIAG-zonegeom MMB pass: all submeshes non-empty",
             );
         }
     }

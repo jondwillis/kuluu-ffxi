@@ -93,45 +93,191 @@ pub fn npc_dat_id(modelid: u16) -> u32 {
 /// bits — this function extracts both.
 ///
 /// `race` is the FFXI race byte from `EntityLook::Equipped::race`.
-/// Documented PC range is 1..=8; the formula extrapolates beyond
-/// that and produces plausible file_ids for monstrosity / beastman
-/// race codes seen in zone packets (e.g. `Kuu Mohzolhil` has
-/// `race=29`). Whether those high-race lookups are *correct* is
-/// empirical and not yet verified.
+/// Documented PC range is 1..=8. For races outside that range the
+/// function returns `None`.
 ///
-/// # Formula
+/// # Lookup
 ///
-/// Four tiers keyed on the low-12-bit id:
+/// Uses lotus-ffxi's [`PCModelIDs`] piecewise-linear-band table
+/// (one map per `(race, slot)`). For id `i` we find the largest
+/// threshold `t ≤ i` in the breakpoint list, then return
+/// `base + (i - t)` — or `None` when the chosen base is the
+/// `0` sentinel (indicates "no DAT for this range").
 ///
-/// ```text
-/// id   0..=255: file_id = 3680  + 256*slot + 3176*race + id
-/// id 256..=319: file_id = 62555 +  64*slot +  448*race + id
-/// id 320..=575: file_id = 69135 + 256*slot + 1536*race + id
-/// id 576..=607: file_id = 98019 +  32*slot +  160*race + id
-/// ```
-///
-/// # Returns
-///
-/// `None` when:
-///   - slot or id is zero — the FFXI sentinel for "no item equipped"
-///     in that slot
-///   - race is zero — no PC ever has race 0
-///   - id is > 607 — outside the formula's documented range
+/// The earlier closed-form formula (`3680 + 256*slot + 3176*race + id`)
+/// produced correct file_ids only for race=1; other races
+/// silently drifted by ~3000 IDs, loading the *wrong* DAT files
+/// and rendering scrambled/missing geometry. See
+/// `vendor/lotus-ffxi/ffxi/entity/actor_data.cppm:32-96` for the
+/// authoritative source.
 pub fn resolve_equipment_slot(slot_id: u16, race: u8) -> Option<u32> {
     let slot = u32::from((slot_id >> 12) & 0xF);
     let id = u32::from(slot_id & 0x0FFF);
-    if slot == 0 || id == 0 || race == 0 {
+    // id == 0 is NOT an early reject. In lotus's actor loader,
+    // `GetPCModelDatID(modelid, race)` always looks up `upper_bound(0)`
+    // and walks back one — which lands on `{0, base_dat}`, i.e. the
+    // "naked" (no-equipment) model for that slot/race. Skipping id=0
+    // here used to drop the head/scalp DAT when the user had no
+    // helmet equipped (look.head = 0x1000 → slot=1, id=0), producing
+    // a floating face mask with a visible gap to the body collar.
+    // Weapon slots (main/sub/ranged) *do* legitimately render nothing
+    // when unequipped, but the base-mesh table entries naturally
+    // sentinel out (e.g. ranged slot id=0 maps to a placeholder DAT
+    // we'll attempt to load and that may be empty — handled
+    // downstream).
+    if slot == 0 || slot > 8 || race == 0 || race > 8 {
         return None;
     }
-    let race = u32::from(race);
-    let file_id = match id {
-        1..=255 => 3680 + 256 * slot + 3176 * race + id,
-        256..=319 => 62555 + 64 * slot + 448 * race + id,
-        320..=575 => 69135 + 256 * slot + 1536 * race + id,
-        576..=607 => 98019 + 32 * slot + 160 * race + id,
-        _ => return None,
-    };
-    Some(file_id)
+    let bps = PC_MODEL_IDS.get((race - 1) as usize)?.get(slot as usize)?;
+    // Linear scan — breakpoint lists are tiny (≤ 6 entries); a
+    // binary search would be slower in practice. Find the largest
+    // threshold ≤ id.
+    let mut chosen: Option<(u16, u32)> = None;
+    for &(thr, base) in *bps {
+        if u32::from(thr) <= id {
+            chosen = Some((thr, base));
+        } else {
+            break;
+        }
+    }
+    let (thr, base) = chosen?;
+    if base == 0 {
+        return None;
+    }
+    Some(base + id - u32::from(thr))
+}
+
+/// Transcribed from lotus's `PCModelIDs` table
+/// (`vendor/lotus-ffxi/ffxi/entity/actor_data.cppm:32-96`).
+/// Indexed `[race-1][slot]` where slot 0 = face (handled by
+/// [`resolve_face`]), 1 = head, …, 8 = ranged. Each cell is a
+/// sorted list of `(id_threshold, dat_base)` pairs; `dat_base=0`
+/// marks the upper-bound sentinel.
+///
+/// Note that race 6 (Taru-F) shares slots 1..=8 with race 5
+/// (Taru-M) per lotus — only the face slot differs.
+type Breakpoints = &'static [(u16, u32)];
+const PC_MODEL_IDS: [[Breakpoints; 9]; 8] = [
+    // race 1 — Hume M
+    [
+        &[(0, 7080), (32, 0)],
+        &[(0, 7112), (256, 63323), (320, 71247), (576, 98787), (608, 102961), (672, 0)],
+        &[(0, 7368), (256, 63387), (320, 71503), (576, 98819), (608, 103025), (672, 0)],
+        &[(0, 7624), (256, 63451), (320, 71759), (576, 98851), (608, 103089), (672, 0)],
+        &[(0, 7880), (256, 63515), (320, 72015), (576, 98883), (608, 103153), (672, 0)],
+        &[(0, 8136), (256, 63579), (320, 72271), (576, 98915), (608, 103217), (672, 0)],
+        &[(0, 8392), (512, 63643), (640, 72527), (896, 107301), (928, 0)],
+        &[(0, 41199), (512, 66459), (640, 81999), (896, 105201), (928, 0)],
+        &[(0, 9416), (256, 0)],
+    ],
+    // race 2 — Hume F
+    [
+        &[(0, 10256), (32, 0)],
+        &[(0, 10288), (256, 63771), (320, 72783), (576, 98947), (608, 103281), (672, 0)],
+        &[(0, 10544), (256, 63835), (320, 73039), (576, 98979), (608, 103345), (672, 0)],
+        &[(0, 10800), (256, 63899), (320, 73295), (576, 99011), (608, 103409), (672, 0)],
+        &[(0, 11056), (256, 63963), (320, 73551), (576, 99043), (608, 103473), (672, 0)],
+        &[(0, 11312), (256, 64027), (320, 73807), (576, 99075), (608, 103537), (672, 0)],
+        &[(0, 11568), (512, 64091), (640, 74063), (896, 107601), (928, 0)],
+        &[(0, 42479), (512, 66587), (640, 82255), (896, 105501), (928, 0)],
+        &[(0, 12592), (256, 0)],
+    ],
+    // race 3 — Elvaan M
+    [
+        &[(0, 13432), (32, 0)],
+        &[(0, 13464), (256, 64219), (320, 74319), (576, 99107), (608, 103601), (672, 0)],
+        &[(0, 13720), (256, 64283), (320, 74575), (576, 99139), (608, 103665), (672, 0)],
+        &[(0, 13976), (256, 64347), (320, 74831), (576, 99171), (608, 103729), (672, 0)],
+        &[(0, 14232), (256, 64411), (320, 75087), (576, 99203), (608, 103793), (672, 0)],
+        &[(0, 14488), (256, 64475), (320, 75343), (576, 99235), (608, 103857), (672, 0)],
+        &[(0, 14744), (512, 64539), (640, 75599), (896, 107901), (928, 0)],
+        &[(0, 43759), (512, 66715), (640, 82511), (896, 105801), (928, 0)],
+        &[(0, 15768), (256, 0)],
+    ],
+    // race 4 — Elvaan F
+    [
+        &[(0, 16608), (32, 0)],
+        &[(0, 16640), (256, 64667), (320, 75855), (576, 99267), (608, 103921), (672, 0)],
+        &[(0, 16896), (256, 64731), (320, 76111), (576, 99299), (608, 103985), (672, 0)],
+        &[(0, 17152), (256, 64795), (320, 76367), (576, 99331), (608, 104049), (672, 0)],
+        &[(0, 17408), (256, 64859), (320, 76623), (576, 99363), (608, 104113), (672, 0)],
+        &[(0, 17664), (256, 64923), (320, 76879), (576, 99395), (608, 104177), (672, 0)],
+        &[(0, 17920), (512, 64987), (640, 77135), (896, 108201), (928, 0)],
+        &[(0, 45039), (512, 66843), (640, 82767), (896, 106101), (928, 0)],
+        &[(0, 18944), (256, 0)],
+    ],
+    // race 5 — Taru-M
+    [
+        &[(0, 19784), (32, 0)],
+        &[(0, 19816), (256, 65115), (320, 77391), (576, 99427), (608, 104241), (672, 0)],
+        &[(0, 20072), (256, 65179), (320, 77647), (576, 99459), (608, 104305), (672, 0)],
+        &[(0, 20328), (256, 65243), (320, 77903), (576, 99491), (608, 104369), (672, 0)],
+        &[(0, 20584), (256, 65307), (320, 78159), (576, 99523), (608, 104433), (672, 0)],
+        &[(0, 20840), (256, 65371), (320, 78415), (576, 99555), (608, 104497), (672, 0)],
+        &[(0, 21096), (512, 65435), (640, 78671), (896, 108501), (928, 0)],
+        &[(0, 46319), (512, 66971), (640, 83023), (896, 106401), (928, 0)],
+        &[(0, 22120), (256, 0)],
+    ],
+    // race 6 — Taru-F (shares slots 1..=8 with race 5; face differs)
+    [
+        &[(0, 22960), (32, 0)],
+        &[(0, 19816), (256, 65115), (320, 77391), (576, 99427), (608, 104241), (672, 0)],
+        &[(0, 20072), (256, 65179), (320, 77647), (576, 99459), (608, 104305), (672, 0)],
+        &[(0, 20328), (256, 65243), (320, 77903), (576, 99491), (608, 104369), (672, 0)],
+        &[(0, 20584), (256, 65307), (320, 78159), (576, 99523), (608, 104433), (672, 0)],
+        &[(0, 20840), (256, 65371), (320, 78415), (576, 99555), (608, 104497), (672, 0)],
+        &[(0, 21096), (512, 65435), (640, 78671), (896, 108501), (928, 0)],
+        &[(0, 46319), (512, 66971), (640, 83023), (896, 106401), (928, 0)],
+        &[(0, 22120), (256, 0)],
+    ],
+    // race 7 — Mithra
+    [
+        &[(0, 23184), (32, 0)],
+        &[(0, 23216), (256, 65563), (320, 78927), (576, 99587), (608, 104561), (672, 0)],
+        &[(0, 23472), (256, 65627), (320, 79183), (576, 99619), (608, 104625), (672, 0)],
+        &[(0, 23728), (256, 65691), (320, 79439), (576, 99651), (608, 104689), (672, 0)],
+        &[(0, 23984), (256, 65755), (320, 79695), (576, 99683), (608, 104753), (672, 0)],
+        &[(0, 24240), (256, 65819), (320, 79951), (576, 99715), (608, 104817), (672, 0)],
+        &[(0, 24496), (512, 65883), (640, 80207), (896, 108801), (928, 0)],
+        &[(0, 47599), (512, 67099), (640, 83279), (896, 106701), (928, 0)],
+        &[(0, 25520), (256, 0)],
+    ],
+    // race 8 — Galka
+    [
+        &[(0, 26360), (32, 0)],
+        &[(0, 26392), (256, 66011), (320, 80463), (576, 99747), (608, 104881), (672, 0)],
+        &[(0, 26648), (256, 66075), (320, 80719), (576, 99779), (608, 104945), (672, 0)],
+        &[(0, 26904), (256, 66139), (320, 80975), (576, 99811), (608, 105009), (672, 0)],
+        &[(0, 27160), (256, 66203), (320, 81231), (576, 99843), (608, 105073), (672, 0)],
+        &[(0, 27416), (256, 66267), (320, 81487), (576, 99875), (608, 105137), (672, 0)],
+        &[(0, 27672), (512, 66331), (640, 81743), (896, 109101), (928, 0)],
+        &[(0, 48879), (512, 67227), (640, 83535), (896, 107001), (928, 0)],
+        &[(0, 28696), (256, 0)],
+    ],
+];
+
+/// Resolve a face DAT id from the wire `(face, race)` pair.
+///
+/// Mirrors lotus's `Actor::GetPCModelDatID(face-1, race)`, which
+/// uses slot 0 of the `PCModelIDs` table. For each race the face
+/// table has a single contiguous range `face∈[1..32] → base+(face-1)`,
+/// where the per-race bases come from
+/// `vendor/lotus-ffxi/ffxi/entity/actor_data.cppm:32-96`.
+///
+/// Note: races 5 and 6 (Taru-M and Taru-F) share the *skeleton* DAT
+/// (19776) but have **different** face bases (19784 vs 22960) — they
+/// share the rig but each has its own facial geometry.
+pub fn resolve_face(face: u8, race: u8) -> Option<u32> {
+    if race == 0 || race > 8 || face > 32 {
+        return None;
+    }
+    // LSB defaults `char_look.face` to 0 when a character is created
+    // without explicit face data (`vendor/server/sql/char_look.sql:15`).
+    // Lotus treats face=0 as invalid; we fall back to face=1 so PCs
+    // still render a face rather than an empty hood.
+    let face = if face == 0 { 1 } else { face };
+    const FACE_BASE: [u32; 8] = [7080, 10256, 13432, 16608, 19784, 22960, 23184, 26360];
+    Some(FACE_BASE[(race - 1) as usize] + u32::from(face) - 1)
 }
 
 /// Look-driven MMB spawn dispatcher. Replaces the Stage 2 stub in
@@ -167,6 +313,7 @@ pub fn dispatch_look_driven_models(
         // one per non-empty slot. Standard / Door / Transport flow
         // through the MMB pipeline below.
         if let EntityLook::Equipped {
+            face,
             race,
             head,
             body,
@@ -176,27 +323,55 @@ pub fn dispatch_look_driven_models(
             main,
             sub,
             ranged,
-            ..
         } = look.0
         {
+            // Face mesh: lotus loads this as a 9th DAT alongside the
+            // 8 equipment slots. Its file id is resolved separately
+            // (see `resolve_face`) because face isn't a slot-encoded
+            // u16 like equipment — it's a raw face index 1..=32.
+            let face_file_id = resolve_face(face, race);
+
             // Iterate slots in canonical order so a slot-by-slot
             // multi-mesh layout (Stage 4b) stays predictable.
             let slot_ids = [head, body, hands, legs, feet, main, sub, ranged];
             debug_assert_eq!(slot_ids.len(), EQUIP_SLOT_ORDER_LEN);
             let mut dispatched = 0;
+            // PCs stay on the CPU bake path (`skeleton_file_id: None`).
+            //
+            // Background: an earlier attempt set `skeleton_file_id`
+            // to the race-keyed skeleton to enable idle animation +
+            // multi-bone weight smoothing for PCs. That worked
+            // structurally but introduced visible regressions:
+            //   - Face-down orientation: bone[0]'s axis flip composed
+            //     incorrectly with the per-bone bind data, leaving
+            //     characters lying on their face.
+            //   - Half geometry: GPU path doesn't yet emit the mirror
+            //     copy that `spawn_vos2_meshes` does for the CPU path.
+            //   - Missing legs/lower body: slot DATs ship their own
+            //     `bone_table` that maps to a per-slot skeleton, not
+            //     the race skeleton — vertices whose bones fall out
+            //     of range collapse to weight=0 and render at the
+            //     mesh's bake-space origin, visually disappearing.
+            //
+            // PCs are visibly correct on the CPU path. NPCs (set
+            // their `skeleton_file_id` from the look resolver's NPC
+            // branch) continue to use the GPU path and still animate.
+            // PC animation will land when the three issues above are
+            // addressed properly — tracked as a follow-up.
+            if let Some(file_id) = face_file_id {
+                load_vos2_tx.write(LoadVos2Request {
+                    file_id,
+                    chunk_idx: 4,
+                    entity_id: we.id,
+                    race,
+                    skeleton_file_id: None,
+                });
+                dispatched += 1;
+            }
             for slot in slot_ids {
                 let Some(file_id) = resolve_equipment_slot(slot, race) else {
                     continue;
                 };
-                // VertexOs2 equipment files use chunk index 4 as the
-                // primary skinned mesh — chunk[0] is the Rmp header,
-                // chunk[1] is bone (Sk2), chunk[2] is the animation
-                // (Mo2), chunk[3] is the low-LOD VertexOs2, chunk[4]
-                // is the high-LOD VertexOs2, and chunks beyond hold
-                // textures and additional LODs. This is empirically
-                // consistent across the sample we have (file 13746,
-                // Kuu Mohzolhil body) — a future fix may need to scan
-                // chunks instead of indexing them statically.
                 load_vos2_tx.write(LoadVos2Request {
                     file_id,
                     chunk_idx: 4,
@@ -301,50 +476,70 @@ mod tests {
     /// id. Documented FFXI packet layout.
     #[test]
     fn equipment_slot_extraction() {
-        // head=0x1000 → slot=1, id=0 → empty (id 0 = unequipped sentinel)
-        assert_eq!(resolve_equipment_slot(0x1000, 3), None);
+        // head=0x1000 → slot=1, id=0 → race-3 head base DAT (Elvaan M
+        // scalp/skull). Previously rejected as "unequipped"; lotus
+        // treats id=0 as the *naked* (no helmet) mesh so the head
+        // still renders under the face.
+        assert_eq!(resolve_equipment_slot(0x1000, 3), Some(13464));
         // body=0x2004 → slot=2, id=4, race 3 (Elvaan M) → tier 1
-        // 3680 + 256*2 + 3176*3 + 4 = 13724
+        // base 13720 + (4 - 0) = 13724
         assert_eq!(resolve_equipment_slot(0x2004, 3), Some(13724));
     }
 
-    /// Race=0 and id=0 are both sentinels — the formula must reject
-    /// them. Mirrors FFXI's "this slot has nothing in it" handling.
+    /// Slot=0 and race=0 are hard sentinels — face slot is handled
+    /// by [`resolve_face`], not this function, and race=0 is invalid.
     #[test]
     fn equipment_sentinels_return_none() {
-        assert_eq!(resolve_equipment_slot(0x0000, 3), None); // empty slot
-        assert_eq!(resolve_equipment_slot(0x2000, 3), None); // slot set, id 0
+        assert_eq!(resolve_equipment_slot(0x0000, 3), None); // slot 0 = face, handled separately
         assert_eq!(resolve_equipment_slot(0x2004, 0), None); // race 0
+        assert_eq!(resolve_equipment_slot(0x2000, 3), Some(13720)); // slot 2 id 0 = naked body
     }
 
     /// Four-tier boundaries from the BlueGartr formula. Each tier
     /// has its own (base, slot-coeff, race-coeff) constants; this
-    /// test pins exactly one sample per tier so a future "simplify"
-    /// PR can't accidentally collapse them into one expression.
+    /// Pin one value per breakpoint band of lotus's PCModelIDs
+    /// (race 1, slot 1 = head). Catches any future regression in
+    /// the table or the lookup logic.
     #[test]
-    fn equipment_formula_tier_boundaries() {
-        // Tier 1: id 1..=255. Use slot=1, race=1, id=1 → 3680+256+3176+1 = 7113
+    fn equipment_table_band_samples_race1_head() {
+        // Band [0..256): base 7112 → id=1 returns 7113.
         assert_eq!(resolve_equipment_slot(0x1001, 1), Some(7113));
-        // Tier 2: id 256..=319. slot=1, race=1, id=256 → 62555+64+448+256 = 63323
+        // Band [256..320): base 63323 → id=256 returns 63323.
         assert_eq!(resolve_equipment_slot(0x1100, 1), Some(63323));
-        // Tier 3: id 320..=575. slot=1, race=1, id=320 → 69135+256+1536+320 = 71247
+        // Band [320..576): base 71247 → id=320 returns 71247.
         assert_eq!(resolve_equipment_slot(0x1140, 1), Some(71247));
-        // Tier 4: id 576..=607. slot=1, race=1, id=576 → 98019+32+160+576 = 98787
+        // Band [576..608): base 98787 → id=576 returns 98787.
         assert_eq!(resolve_equipment_slot(0x1240, 1), Some(98787));
-        // id 608 — outside formula's documented range.
-        assert_eq!(resolve_equipment_slot(0x1260, 1), None);
+        // Band [608..672): base 102961 → id=608 returns 102961.
+        // Lotus's table extends here; the prior closed-form formula
+        // rejected id ≥ 608.
+        assert_eq!(resolve_equipment_slot(0x1260, 1), Some(102961));
+        // Band [672..): sentinel 0 → None.
+        assert_eq!(resolve_equipment_slot(0x12A0, 1), None);
     }
 
-    /// Live look from a user `/look Kuu Mohzolhil` capture:
-    /// race=29, body=0x2004. race 29 is outside the documented PC
-    /// range (1..=8) — formula extrapolates and produces a plausible
-    /// file_id, but visual correctness is unverified. This test pins
-    /// the *output value* so we can spot any future formula
-    /// refactor that drops support for high-race extrapolation.
+    /// Non-Hume races used to silently misroute through the old
+    /// linear formula. Pin two known-good values from lotus's table
+    /// to lock the per-race correctness.
     #[test]
-    fn equipment_kuu_mohzolhil_body() {
-        // body=0x2004, race=29 → tier 1: 3680 + 256*2 + 3176*29 + 4
-        //   = 3680 + 512 + 92104 + 4 = 96300
-        assert_eq!(resolve_equipment_slot(0x2004, 29), Some(96300));
+    fn equipment_per_race_correctness() {
+        // Race 8 (Galka), slot 2 (body), id=8. Lotus table:
+        // breakpoint (0, 26648) → 26648 + 8 = 26656. The old formula
+        // returned 29608 (off by 2952), causing Galka to render
+        // wrong/missing geometry.
+        assert_eq!(resolve_equipment_slot(0x2008, 8), Some(26656));
+        // Race 7 (Mithra), slot 4 (legs), id=4. Lotus table:
+        // (0, 23984) → 23984 + 4 = 23988.
+        assert_eq!(resolve_equipment_slot(0x4004, 7), Some(23988));
+    }
+
+    /// Out-of-range race byte (e.g. monstrosity / beastman) now
+    /// returns None rather than extrapolating garbage. The earlier
+    /// formula generated arbitrary file_ids for race≥9 that didn't
+    /// correspond to real DATs. Beastman-NPC rendering should go
+    /// through the NPC modelid path (`npc_dat_id`), not this one.
+    #[test]
+    fn equipment_rejects_high_race_codes() {
+        assert_eq!(resolve_equipment_slot(0x2004, 29), None);
     }
 }
