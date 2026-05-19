@@ -150,10 +150,12 @@ fn main() -> ExitCode {
             );
         }
         for sched in &report.schedulers {
-            if let Some(want) = &filter {
-                if std::str::from_utf8(&sched.name).ok() != Some(want.as_str()) {
-                    continue;
-                }
+            let filtered = filter
+                .as_ref()
+                .map(|want| std::str::from_utf8(&sched.name).ok() == Some(want.as_str()))
+                .unwrap_or(false);
+            if filter.is_some() && !filtered {
+                continue;
             }
             let sound_count = sched
                 .stages
@@ -180,6 +182,23 @@ fn main() -> ExitCode {
                     if ev.on_caster { "caster" } else { "target" },
                     std::str::from_utf8(&ev.id).unwrap_or("????")
                 );
+            }
+            // When a filter is active, also dump every stage of the
+            // matching scheduler — the user is probably hunting for
+            // a non-sound stage (Generator, Motion) that references
+            // a sibling chunk. Without this, `--filter main` was
+            // showing only counts, which hid the real timeline.
+            if filtered {
+                for t in &sched.stages {
+                    let _ = writeln!(
+                        out,
+                        "    frame {:>4} type=0x{:02x} dur={:>4} id={:?}",
+                        t.frame,
+                        t.stage.raw_type,
+                        t.stage.duration_frames,
+                        std::str::from_utf8(&t.stage.id).unwrap_or("????")
+                    );
+                }
             }
         }
     }
