@@ -336,35 +336,27 @@ pub fn dispatch_look_driven_models(
             let slot_ids = [head, body, hands, legs, feet, main, sub, ranged];
             debug_assert_eq!(slot_ids.len(), EQUIP_SLOT_ORDER_LEN);
             let mut dispatched = 0;
-            // PCs stay on the CPU bake path (`skeleton_file_id: None`).
+            // PCs now go through the GPU skinned path with per-slot
+            // fit-gating. The race skeleton id is sent alongside so
+            // each slot can attach to a shared bone tree and animate
+            // off the race's idle MO2.
             //
-            // Background: an earlier attempt set `skeleton_file_id`
-            // to the race-keyed skeleton to enable idle animation +
-            // multi-bone weight smoothing for PCs. That worked
-            // structurally but introduced visible regressions:
-            //   - Face-down orientation: bone[0]'s axis flip composed
-            //     incorrectly with the per-bone bind data, leaving
-            //     characters lying on their face.
-            //   - Half geometry: GPU path doesn't yet emit the mirror
-            //     copy that `spawn_vos2_meshes` does for the CPU path.
-            //   - Missing legs/lower body: slot DATs ship their own
-            //     `bone_table` that maps to a per-slot skeleton, not
-            //     the race skeleton — vertices whose bones fall out
-            //     of range collapse to weight=0 and render at the
-            //     mesh's bake-space origin, visually disappearing.
-            //
-            // PCs are visibly correct on the CPU path. NPCs (set
-            // their `skeleton_file_id` from the look resolver's NPC
-            // branch) continue to use the GPU path and still animate.
-            // PC animation will land when the three issues above are
-            // addressed properly — tracked as a follow-up.
+            // Slot fit is decided downstream in `process_load_vos2_requests`
+            // via `skeleton_fits_mesh`: slots whose bone_table indices
+            // fall within the race skeleton's bone count go GPU;
+            // slots that don't fall back to the CPU bake path so they
+            // still render (as a static bind-pose half-body) instead
+            // of vanishing to weight=0. Mirror copy is currently
+            // CPU-only — GPU slots render as left-half until per-vertex
+            // `mirror_axis` decoding lands.
+            let race_skel_id = crate::dat_vos2::skeleton_file_id_for_race(race);
             if let Some(file_id) = face_file_id {
                 load_vos2_tx.write(LoadVos2Request {
                     file_id,
                     chunk_idx: 4,
                     entity_id: we.id,
                     race,
-                    skeleton_file_id: None,
+                    skeleton_file_id: race_skel_id,
                 });
                 dispatched += 1;
             }
@@ -377,7 +369,7 @@ pub fn dispatch_look_driven_models(
                     chunk_idx: 4,
                     entity_id: we.id,
                     race,
-                    skeleton_file_id: None,
+                    skeleton_file_id: race_skel_id,
                 });
                 dispatched += 1;
             }

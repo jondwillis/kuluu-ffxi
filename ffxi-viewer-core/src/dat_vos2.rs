@@ -20,14 +20,14 @@ use std::sync::OnceLock;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::Image;
+use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use ffxi_dat::bone::{self, Skeleton};
 use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::vos2::{parse_vos2, Vos2Mesh};
-use ffxi_dat::{walk, ChunkKind, DatRoot};
+use ffxi_dat::{walk, walk_tree, ChunkKind, ChunkNode, DatRoot};
 
 use crate::scene::TrackedEntities;
 use crate::snapshot::SceneState;
@@ -113,14 +113,28 @@ pub fn enumerate_vos2_chunks(file_id: u32) -> Vec<usize> {
     let Ok(bytes) = fs::read(loc.path_under(root.root())) else {
         return Vec::new();
     };
-    walk(&bytes)
+    // Tree-scoped: only top-level OS2 children of the outermost Rmp
+    // container. Mirrors lotus's `dat.root->children` iteration —
+    // nested Rmps' OS2 children (LODs, mirror copies) are NOT
+    // included. The flat walker over-collects and produces
+    // duplicate-geometry artifacts.
+    let tree = walk_tree(&bytes);
+    let container = top_container(&tree);
+    container
+        .children
+        .iter()
         .enumerate()
-        .filter_map(|(i, c)| {
-            c.ok()
-                .filter(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::VertexOs2))
-                .map(|_| i)
-        })
+        .filter(|(_, n)| ChunkKind::from_u8(n.chunk.kind) == Some(ChunkKind::VertexOs2))
+        .map(|(i, _)| i)
         .collect()
+}
+
+/// Return the conceptual "root container" of a DAT — the first Rmp
+/// child of the synthetic root, or the synthetic root itself if the
+/// file is flat (no Rmp wrapper). lotus calls this `dat.root` and
+/// iterates `root->children` for top-level content.
+fn top_container<'r, 'a>(tree: &'r ChunkNode<'a>) -> &'r ChunkNode<'a> {
+    tree.children.first().unwrap_or(tree)
 }
 
 /// Load + parse a VertexOs2 chunk at `(file_id, chunk_idx)`. Errors
@@ -133,59 +147,68 @@ pub fn load_vos2(file_id: u32, chunk_idx: usize) -> Result<LoadedVos2, String> {
     let path = location.path_under(root.root());
     let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
 
-    let chunks: Vec<_> = walk(&bytes).filter_map(Result::ok).collect();
-    // Equipment DATs typically have multiple VertexOs2 chunks at
-    // different LODs. `chunk_idx` is the caller's hint, but only used
-    // when it actually IS a VertexOs2 chunk. Otherwise fall back to
-    // "largest VertexOs2 in the file" — empirically the high-LOD body
-    // mesh, which is what we want to render.
-    let chunk_at_hint = chunks
-        .get(chunk_idx)
-        .filter(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::VertexOs2));
-    let chunk = match chunk_at_hint {
-        Some(c) => c,
-        None => chunks
+    // Tree-scoped chunk lookup. Per lotus's actor loader
+    // (`actor_skeleton.cpp:89` iterates `dat.root->children`), only
+    // direct children of the outermost Rmp container are part of
+    // "this asset" — chunks nested inside child Rmps are LOD/mirror
+    // variants the renderer skips. Our previous flat walk
+    // over-collected those and overlaid duplicate geometry on the
+    // baseline mesh (visible as "tube arms" / doubled meshes).
+    let tree = walk_tree(&bytes);
+    let container = top_container(&tree);
+    let os2_children: Vec<&ChunkNode<'_>> = container
+        .children
+        .iter()
+        .filter(|n| ChunkKind::from_u8(n.chunk.kind) == Some(ChunkKind::VertexOs2))
+        .collect();
+
+    // `chunk_idx` is now an index into the filtered OS2-children
+    // list (matching `enumerate_vos2_chunks`). When the caller's hint
+    // is out of range, fall back to "largest OS2 child" — empirically
+    // the high-LOD mesh for that asset.
+    let node = match os2_children.get(chunk_idx) {
+        Some(n) => *n,
+        None => os2_children
             .iter()
-            .filter(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::VertexOs2))
-            .max_by_key(|c| c.data.len())
-            .ok_or_else(|| format!("no VertexOs2 chunk in file {file_id}"))?,
+            .copied()
+            .max_by_key(|n| n.chunk.data.len())
+            .ok_or_else(|| format!("no VertexOs2 child of root Rmp in file {file_id}"))?,
     };
+    let mesh = parse_vos2(node.chunk.data).map_err(|e| format!("vos2 parse: {e}"))?;
 
-    let mesh = parse_vos2(chunk.data).map_err(|e| format!("vos2 parse: {e}"))?;
-
-    // Diagnostic: when the parsed mesh is empty, dump *all* chunk
-    // kinds in this file. Used to chase down cases like the head
-    // slot DAT (file 23216 for Mithra) which has an OS2 chunk that
-    // parses to zero verts — strong hint the actual scalp/skull
-    // geometry lives in a different chunk kind (e.g. MMB, or a
-    // distinct OS2 variant we don't yet handle).
+    // Diagnostic for empty meshes — dump the top container's
+    // immediate children with their kinds so we can spot files
+    // whose geometry actually lives in a non-OS2 chunk type.
     if mesh.groups.is_empty() || mesh.vertices.is_empty() {
-        let kinds: Vec<String> = chunks
+        let kinds: Vec<String> = container
+            .children
             .iter()
             .enumerate()
-            .map(|(i, c)| {
-                let k = ChunkKind::from_u8(c.kind)
+            .map(|(i, n)| {
+                let k = ChunkKind::from_u8(n.chunk.kind)
                     .map(|x| format!("{:?}", x))
-                    .unwrap_or_else(|| format!("0x{:02x}", c.kind));
-                let name = std::str::from_utf8(&c.name).unwrap_or("?");
-                format!("[{}]{}({},{}B)", i, k, name.trim(), c.data.len())
+                    .unwrap_or_else(|| format!("0x{:02x}", n.chunk.kind));
+                let name = std::str::from_utf8(&n.chunk.name).unwrap_or("?");
+                format!("[{}]{}({},{}B)", i, k, name.trim(), n.chunk.data.len())
             })
             .collect();
         info!(
-            "vos2 empty-mesh dump file={} all_chunks: {}",
+            "vos2 empty-mesh dump file={} top_children: {}",
             file_id,
             kinds.join(" ")
         );
     }
 
-    // Scrape IMG chunks for textures the same way MMB does. Equipment
-    // DATs typically have one IMG per body part.
-    let textures: Vec<Vos2NamedTexture> = chunks
+    // Textures: scoped to the same top container. Both legacy `Img`
+    // and `Dxt3` chunks are surfaced — lotus's actor loader handles
+    // both, and equipment DATs often use Dxt3.
+    let textures: Vec<Vos2NamedTexture> = container
+        .children
         .iter()
-        .filter(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::Img))
-        .filter_map(|c| {
-            let texture = decode_texture(c.data).ok()?;
-            let name = ffxi_dat::texture::extract_texture_name(c.data).unwrap_or_default();
+        .filter(|n| ChunkKind::from_u8(n.chunk.kind) == Some(ChunkKind::Img))
+        .filter_map(|n| {
+            let texture = decode_texture(n.chunk.data).ok()?;
+            let name = ffxi_dat::texture::extract_texture_name(n.chunk.data).unwrap_or_default();
             Some(Vos2NamedTexture { name, texture })
         })
         .collect();
@@ -226,8 +249,9 @@ pub fn skeleton_file_id_for_race(race: u8) -> Option<u32> {
 /// twice. Outer `OnceLock` because we initialize the map lazily;
 /// inner `Mutex<HashMap>` because `OnceLock::get_or_init` only
 /// helps for a *single* value, not an open-ended set.
-static BAKED_SKELETONS: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, Option<BakedSkeleton>>>> =
-    OnceLock::new();
+static BAKED_SKELETONS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u32, Option<BakedSkeleton>>>,
+> = OnceLock::new();
 
 #[derive(Clone)]
 struct BakedSkeleton {
@@ -248,7 +272,8 @@ struct BakedSkeleton {
 /// dynamic_casts) because the chunk index within a skeleton DAT is
 /// not stable across files. Cached forever once resolved.
 fn baked_skeleton_for_file(file_id: u32) -> Option<BakedSkeleton> {
-    let map = BAKED_SKELETONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let map =
+        BAKED_SKELETONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut guard = map.lock().ok()?;
     if let Some(entry) = guard.get(&file_id) {
         return entry.clone();
@@ -282,12 +307,24 @@ fn load_skeleton(file_id: u32) -> Option<BakedSkeleton> {
         let x = bone[0][3];
         let y = bone[1][3];
         let z = bone[2][3];
-        if x < min_x { min_x = x; }
-        if x > max_x { max_x = x; }
-        if y < min_y { min_y = y; }
-        if y > max_y { max_y = y; }
-        if z < min_z { min_z = z; }
-        if z > max_z { max_z = z; }
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+        if z < min_z {
+            min_z = z;
+        }
+        if z > max_z {
+            max_z = z;
+        }
     }
     info!(
         "vos2 bake: loaded skeleton file={} bones={} \
@@ -296,9 +333,15 @@ fn load_skeleton(file_id: u32) -> Option<BakedSkeleton> {
          bake_z=[{:.2}..{:.2}] dz={:.2}",
         file_id,
         world.len(),
-        min_x, max_x, max_x - min_x,
-        min_y, max_y, max_y - min_y,
-        min_z, max_z, max_z - min_z,
+        min_x,
+        max_x,
+        max_x - min_x,
+        min_y,
+        max_y,
+        max_y - min_y,
+        min_z,
+        max_z,
+        max_z - min_z,
     );
     Some(BakedSkeleton {
         file_id,
@@ -335,7 +378,9 @@ fn load_idle_animation_for_file(file_id: u32) -> Option<ffxi_dat::anim::Mo2Anima
 
 /// Per-DAT idle-animation cache. Same shape as [`BAKED_SKELETONS`].
 static IDLE_ANIMS: OnceLock<
-    std::sync::Mutex<std::collections::HashMap<u32, Option<std::sync::Arc<ffxi_dat::anim::Mo2Animation>>>>,
+    std::sync::Mutex<
+        std::collections::HashMap<u32, Option<std::sync::Arc<ffxi_dat::anim::Mo2Animation>>>,
+    >,
 > = OnceLock::new();
 
 fn idle_anim_for_file(file_id: u32) -> Option<std::sync::Arc<ffxi_dat::anim::Mo2Animation>> {
@@ -374,7 +419,9 @@ fn anim_frame_overrides(
         if bi == 0 {
             continue;
         }
-        let Some(f) = frames.get(frame_idx) else { continue };
+        let Some(f) = frames.get(frame_idx) else {
+            continue;
+        };
         out[bi] = Some(ffxi_dat::bone::BoneLocal {
             rotation: f.rotation,
             translation: f.translation,
@@ -507,7 +554,11 @@ fn bake_position(
         return bw.pos1;
     }
     // Rigid (1-weight) vertex: single-bone transform of mesh.vertices[i].pos.
-    let local = mesh.vertices.get(vertex_idx).map(|v| v.pos).unwrap_or(_local);
+    let local = mesh
+        .vertices
+        .get(vertex_idx)
+        .map(|v| v.pos)
+        .unwrap_or(_local);
     let Some(bone_id) = mesh.skeleton_bone_for(vertex_idx) else {
         return local;
     };
@@ -558,7 +609,11 @@ fn bake_normal(
         }
         return bw.normal1;
     }
-    let local = mesh.vertices.get(vertex_idx).map(|v| v.normal).unwrap_or(_local);
+    let local = mesh
+        .vertices
+        .get(vertex_idx)
+        .map(|v| v.normal)
+        .unwrap_or(_local);
     let Some(bone_id) = mesh.skeleton_bone_for(vertex_idx) else {
         return local;
     };
@@ -647,34 +702,92 @@ pub fn process_load_vos2_requests(
             Some(id) => baked_skeleton_for_file(id),
             None => baked_skeleton(req.race),
         };
-        // NPCs (skeleton_file_id set) go through the GPU SkinnedMesh
-        // path so animations tick on the GPU and don't re-upload mesh
-        // attributes every frame. PCs stay on the CPU bake path until
-        // the SkinnedMesh refactor extends to handle the mirror copy
-        // + the multi-DAT slot composition that PC equipment requires.
+        // GPU SkinnedMesh path: animates on the GPU and doesn't
+        // re-upload mesh attributes every frame.
+        //
+        // NPC dispatch sets `race: 0`; PC dispatch sets `race: <1..=8>`
+        // and a race-keyed skeleton file_id. Per-slot fit-gating: a
+        // slot whose `bone_table` indices fall within the race
+        // skeleton's bone count goes GPU; one that doesn't falls back
+        // to the CPU bake so it still renders (static bind-pose
+        // half-body) instead of vanishing to weight=0.
         if let (Some(_dat_id), Some(baked)) = (req.skeleton_file_id, baked_owned.as_ref()) {
             if let Some(raw) = baked.raw.as_ref() {
-                let existing = bone_trees.get(&req.entity_id).cloned();
-                let bone_entities = spawn_skinned_actor(
-                    &mut commands,
-                    &mut meshes,
-                    &mut materials,
-                    &mut images,
-                    &mut inverse_bindposes,
-                    bevy_e,
-                    loaded,
-                    raw,
-                    existing,
-                );
-                bone_trees.insert(req.entity_id, bone_entities);
-                info!(
-                    "skinned actor spawn: file_id={} entity_id={} verts={} groups={}",
-                    req.file_id,
-                    req.entity_id,
-                    loaded.mesh.vertices.len(),
-                    loaded.mesh.groups.len(),
-                );
-                continue;
+                let fits = skeleton_fits_mesh(baked, &loaded.mesh);
+                let is_pc = req.race != 0;
+                // Per-slot bone-mapping diagnostic: surface the values
+                // that decide GPU-vs-CPU dispatch so a regression mode
+                // ("missing legs", "lying on face") is observable in
+                // logs without re-running the bake. Cheap — once per
+                // load request, not per frame.
+                {
+                    let skel_n = baked.world.len();
+                    let max_table = loaded
+                        .mesh
+                        .bone_table
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(0) as usize;
+                    let max_bone1 = loaded
+                        .mesh
+                        .bone_indices
+                        .iter()
+                        .step_by(2)
+                        .map(|bi| bi.bone_index1 as usize)
+                        .max()
+                        .unwrap_or(0);
+                    info!(
+                        "vos2 dispatch: file_id={} entity_id={} race={} is_pc={} \
+                         skel_bones={} use_bone_table={} bone_table_max={} max_bone1={} \
+                         fits={} path={}",
+                        req.file_id,
+                        req.entity_id,
+                        req.race,
+                        is_pc,
+                        skel_n,
+                        loaded.mesh.header.use_bone_table(),
+                        max_table,
+                        max_bone1,
+                        fits,
+                        if fits { "GPU" } else { "CPU-fallback" },
+                    );
+                }
+                if fits {
+                    let existing = bone_trees.get(&req.entity_id).cloned();
+                    let bone_entities = spawn_skinned_actor(
+                        &mut commands,
+                        &mut meshes,
+                        &mut materials,
+                        &mut images,
+                        &mut inverse_bindposes,
+                        bevy_e,
+                        loaded,
+                        raw,
+                        existing,
+                        is_pc,
+                    );
+                    bone_trees.insert(req.entity_id, bone_entities);
+                    // BakedActor marker tells the target ring + snap
+                    // systems to switch from feet_offset to hip
+                    // offset (~0.9 yalms). Without it a GPU-skinned
+                    // entity sits at server_y + feet_offset, putting
+                    // the hip ~1.35 yalms too high. CPU path attaches
+                    // this in `spawn_equipped` (~line 1474).
+                    commands.entity(bevy_e).insert(crate::scene::BakedActor);
+                    info!(
+                        "skinned actor spawn: file_id={} entity_id={} verts={} groups={}",
+                        req.file_id,
+                        req.entity_id,
+                        loaded.mesh.vertices.len(),
+                        loaded.mesh.groups.len(),
+                    );
+                    continue;
+                }
+                // Fall through to CPU bake — slot's bone_table overflows
+                // the race skeleton (common for cross-race monstrosity
+                // gear). The CPU bake renders rigidly in bind pose,
+                // visible at the entity origin.
             }
         }
         spawn_vos2_meshes_with_skeleton(
@@ -721,6 +834,7 @@ fn spawn_skinned_actor(
     loaded: &LoadedVos2,
     raw: &std::sync::Arc<Skeleton>,
     existing_bone_entities: Option<Vec<Entity>>,
+    is_pc: bool,
 ) -> Vec<Entity> {
     use ffxi_dat::bone::PARENT_ROOT;
 
@@ -729,18 +843,44 @@ fn spawn_skinned_actor(
         None => {
             // Two-pass spawn: create all bone entities first so the
             // parent ChildOf can reference them by index, then wire up
-            // the parent links. Bones declared as PARENT_ROOT (or
-            // self-parenting) get parented to the actor's wire entity.
+            // the parent links.
             //
+            // For PCs, insert an axis-flip pivot entity between
+            // `parent` and the bone tree. The pivot holds the FFXI→Bevy
+            // bind orientation that the CPU bake path applies on the
+            // mesh entity (see `spawn_vos2_meshes_with_skeleton`'s
+            // `bind_to_bevy = Q_y(π/2) * Q_x(-π/2)` near the bottom).
+            // Skinned mesh skinning ignores the mesh entity's
+            // transform — it uses joint world transforms directly —
+            // so the rotation has to enter through the bone-tree
+            // hierarchy instead. Bone[0] is the wrong place for it
+            // (the animation tick would have to special-case writing
+            // back the flip every frame). A pivot above bone[0]
+            // composes cleanly: parent → pivot(bind_to_bevy) → bone[0]
+            // (identity) → bone[1..].
+            //
+            // For NPCs, keep the prior behavior (no pivot, root bones
+            // parented directly to `parent`). NPC orientation has been
+            // observed working in the current rig.
+            let root_parent = if is_pc {
+                let bind_to_bevy = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)
+                    * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+                let pivot = commands
+                    .spawn((
+                        Transform::from_rotation(bind_to_bevy),
+                        GlobalTransform::default(),
+                        Visibility::default(),
+                        ChildOf(parent),
+                    ))
+                    .id();
+                pivot
+            } else {
+                parent
+            };
             // Bone[0] gets identity rotation (drops SK2's 270°-Y
-            // engine-axis roll). The earlier experiment of putting
-            // the bind_to_bevy axis flip here regressed PC rendering
-            // when PCs were temporarily routed through this path;
-            // we backed that out by sending PCs to the CPU bake
-            // path instead (`look_resolver.rs` PC dispatch sets
-            // `skeleton_file_id: None`). NPCs continue to use this
-            // path with identity-on-root; their orientation is
-            // untested in the current setup.
+            // engine-axis roll). For PCs the pivot carries the
+            // bind_to_bevy flip; for NPCs the identity-on-root
+            // matches the current rig.
             let mut ents: Vec<Entity> = Vec::with_capacity(raw.bones.len());
             for (i, bone) in raw.bones.iter().enumerate() {
                 let q = bone.rot;
@@ -762,7 +902,7 @@ fn spawn_skinned_actor(
             for (i, bone) in raw.bones.iter().enumerate() {
                 let p = bone.parent as usize;
                 let parent_e = if bone.parent == PARENT_ROOT || p == i || p >= ents.len() {
-                    parent
+                    root_parent
                 } else {
                     ents[p]
                 };
@@ -779,9 +919,10 @@ fn spawn_skinned_actor(
         }
     };
 
-    let inv_bindposes_handle = inverse_bindposes.add(SkinnedMeshInverseBindposes::from(
-        vec![Mat4::IDENTITY; raw.bones.len()],
-    ));
+    let inv_bindposes_handle = inverse_bindposes.add(SkinnedMeshInverseBindposes::from(vec![
+            Mat4::IDENTITY;
+            raw.bones.len()
+        ]));
 
     let mut by_name: std::collections::HashMap<String, Handle<Image>> =
         std::collections::HashMap::with_capacity(loaded.textures.len());
@@ -897,15 +1038,16 @@ fn spawn_skinned_actor(
         // Both are heuristics — lotus stores the raw values without
         // translating to a PBR pipeline, so there's no reference
         // mapping to be exact against.
-        let (roughness, metallic) = pbr_from_specular(
-            group.specular_exponent,
-            group.specular_intensity,
-        );
+        // let (roughness, metallic) = pbr_from_specular(
+        //     group.specular_exponent,
+        //     group.specular_intensity,
+        // );
         let mat = materials.add(StandardMaterial {
             base_color: Color::WHITE,
             base_color_texture: tex_handle.clone(),
-            perceptual_roughness: roughness,
-            metallic,
+            perceptual_roughness: 1.0,
+            metallic: 0.0,
+            unlit: true,
             cull_mode: None,
             ..default()
         });
@@ -1027,7 +1169,15 @@ pub fn spawn_vos2_meshes(
     race: u8,
 ) {
     let baked = baked_skeleton(race);
-    spawn_vos2_meshes_with_skeleton(commands, meshes, materials, images, parent, loaded, baked.as_ref());
+    spawn_vos2_meshes_with_skeleton(
+        commands,
+        meshes,
+        materials,
+        images,
+        parent,
+        loaded,
+        baked.as_ref(),
+    );
 }
 
 /// Same as [`spawn_vos2_meshes`] but takes the resolved skeleton
@@ -1222,10 +1372,8 @@ fn spawn_vos2_meshes_with_skeleton(
         // `Handle<StandardMaterial>` (Bevy doesn't mutably share
         // materials between meshes anyway, so this is the natural
         // shape).
-        let (group_roughness, group_metallic) = pbr_from_specular(
-            group.specular_exponent,
-            group.specular_intensity,
-        );
+        let (group_roughness, group_metallic) =
+            pbr_from_specular(group.specular_exponent, group.specular_intensity);
         let spawn_one = |commands: &mut Commands,
                          meshes: &mut Assets<Mesh>,
                          materials: &mut Assets<StandardMaterial>,
@@ -1339,7 +1487,9 @@ pub fn spawn_equipped(
 ) -> usize {
     use crate::look_resolver::{resolve_equipment_slot, resolve_face};
     use crate::scene::BakedActor;
-    let slot_names = ["head", "body", "hands", "legs", "feet", "main", "sub", "ranged"];
+    let slot_names = [
+        "head", "body", "hands", "legs", "feet", "main", "sub", "ranged",
+    ];
     let slots = [head, body, hands, legs, feet, main, sub, ranged];
     let mut spawned = 0usize;
     // Helper: spawn every VOS2 chunk in a DAT as its own mesh.
@@ -1348,14 +1498,13 @@ pub fn spawn_equipped(
     // we returned only the largest, which for body slots drops
     // shoulder/torso/arm sub-meshes and renders an apparently
     // "missing" chest.
-    let mut spawn_all_chunks = |chunk_indices: Vec<usize>,
-                                file_id: u32,
-                                label: &str|
-     -> usize {
+    let mut spawn_all_chunks = |chunk_indices: Vec<usize>, file_id: u32, label: &str| -> usize {
         let mut count = 0usize;
         for idx in chunk_indices {
             match load_vos2(file_id, idx) {
-                Ok(loaded) if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() => {
+                Ok(loaded)
+                    if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() =>
+                {
                     spawn_vos2_meshes(commands, meshes, materials, images, parent, &loaded, race);
                     count += 1;
                 }
@@ -1377,7 +1526,10 @@ pub fn spawn_equipped(
     if let Some(file_id) = resolve_face(face, race) {
         let chunks = enumerate_vos2_chunks(file_id);
         if chunks.is_empty() {
-            info!("spawn_equipped: face file={} has no VOS2 chunks (race={})", file_id, race);
+            info!(
+                "spawn_equipped: face file={} has no VOS2 chunks (race={})",
+                file_id, race
+            );
         } else {
             spawned += spawn_all_chunks(chunks, file_id, "face");
         }
@@ -1385,7 +1537,10 @@ pub fn spawn_equipped(
     for (slot_id, slot_name) in slots.iter().zip(slot_names.iter()) {
         let Some(file_id) = resolve_equipment_slot(*slot_id, race) else {
             if *slot_id != 0 {
-                info!("spawn_equipped: slot {}={:#06X} unresolved (race={})", slot_name, slot_id, race);
+                info!(
+                    "spawn_equipped: slot {}={:#06X} unresolved (race={})",
+                    slot_name, slot_id, race
+                );
             }
             continue;
         };
