@@ -59,8 +59,13 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
             },
             HelpEntry {
                 aliases: &["pathto"],
-                usage: "<x> <y> <z>",
-                summary: "pathfind to world coordinates",
+                usage: "<x> <y> [z] | <name> | target",
+                summary: "pathfind: coords (z optional), fuzzy zone-line/entity, or current target",
+            },
+            HelpEntry {
+                aliases: &["warp"],
+                usage: "<x> <y> [z] | <name> | target",
+                summary: "debug teleport (Move): coords (z optional), fuzzy zone-line/entity, or target",
             },
             HelpEntry {
                 aliases: &["zones"],
@@ -70,7 +75,7 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
             HelpEntry {
                 aliases: &["zoneto"],
                 usage: "<name|id>",
-                summary: "pathfind to a zone-line by destination",
+                summary: "pathfind to a zone-line (alias of `/pathto <name>`)",
             },
             HelpEntry {
                 aliases: &["navmesh"],
@@ -802,7 +807,8 @@ pub fn parse_slash(
             parse_debug(rest, entities, self_pos, current_target)
         }
         "keybinds" | "keybind" | "binds" => parse_keybinds(rest),
-        "pathto" => parse_pathto(rest, entities, current_target),
+        "pathto" => parse_pathto(rest, entities, self_pos, current_target, zone_id),
+        "warp" => parse_warp(rest, entities, self_pos, current_target, zone_id),
         "zones" => parse_zones(zone_id),
         "zoneto" => parse_zoneto(rest, zone_id),
         "navinfo" => SlashOutcome::NavInfo,
@@ -964,53 +970,187 @@ fn parse_heal(rest: &str) -> SlashOutcome {
     SlashOutcome::Command(AgentCommand::Heal { mode })
 }
 
-/// `/pathto <x> <y> <z>` or `/pathto target` — issue a navmesh-aware
-/// `AgentCommand::PathTo`. The numeric form takes three FFXI-world
-/// floats; the `target` form pulls the current target's position so
-/// you can chase without copying coords.
-///
-/// We don't add a `/pathto <name>` form because that's what `/follow`
-/// already does (with a continuous re-issue rather than a single
-/// path). Two commands with the same surface would just confuse the
-/// operator.
-fn parse_pathto(rest: &str, entities: &[WireEntity], current_target: Option<u32>) -> SlashOutcome {
+/// `/pathto` — navmesh-aware `AgentCommand::PathTo`. Accepts:
+///   - `/pathto <x> <y> [z]` — explicit coords. `z` is the FFXI-native
+///     vertical axis and defaults to the player's current `self_pos.z`
+///     when omitted (operator typically wants to stay on the same
+///     vertical plane and let the pathfinder snap as it walks).
+///   - `/pathto target` — pull coords from the current target.
+///   - `/pathto <name>` — fuzzy match against zone-line destinations
+///     in the current zone, then entity names. Subsumes the old
+///     `/zoneto`, which is kept as an alias.
+fn parse_pathto(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+    zone_id: Option<u16>,
+) -> SlashOutcome {
     let trimmed = rest.trim();
     if trimmed.is_empty() {
         return SlashOutcome::SystemMessage(
-            "/pathto: usage `/pathto <x> <y> <z>` or `/pathto target`".into(),
+            "/pathto: usage `/pathto <x> <y> [z]` | `/pathto <name>` | `/pathto target`"
+                .into(),
         );
     }
+    match parse_goto_target(trimmed, entities, self_pos, current_target, zone_id, "/pathto") {
+        Ok(pos) => SlashOutcome::Command(AgentCommand::PathTo {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+        }),
+        Err(msg) => SlashOutcome::SystemMessage(msg),
+    }
+}
+
+/// `/warp` — debug teleport. Emits `AgentCommand::Move`, which rewrites
+/// the next keepalive's reported position (and heading) directly.
+/// Bypasses navmesh and pathing entirely: useful for poking at edge
+/// cases like out-of-mesh spots, scripted positions, or stuck-recovery.
+///
+/// The server's anti-speedhack guard will reject or cap obvious jumps
+/// (see `[[reactor_speed_safety]]` — outbound Move suppressed at
+/// speed=0, scaled by speed ratio); that's the operator-visible
+/// signal that a warp didn't take.
+///
+/// Accepts the same surface as [`parse_pathto`]: coords (z optional),
+/// `target`, or a fuzzy `<name>` matched against zone-lines + entities.
+/// Heading is carried over from the player's current entity row so
+/// the warp doesn't spin the camera north.
+fn parse_warp(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+    zone_id: Option<u16>,
+) -> SlashOutcome {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/warp: usage `/warp <x> <y> [z]` | `/warp <name>` | `/warp target`".into(),
+        );
+    }
+    match parse_goto_target(trimmed, entities, self_pos, current_target, zone_id, "/warp") {
+        Ok(pos) => SlashOutcome::Command(AgentCommand::Move {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+            heading: self_heading(entities, self_pos),
+        }),
+        Err(msg) => SlashOutcome::SystemMessage(msg),
+    }
+}
+
+/// Shared parser for the `/pathto` / `/warp` argument surface. Returns
+/// the resolved FFXI-world position, or a usage/error string keyed to
+/// the caller's command name (so the toast says `/warp: …` vs
+/// `/pathto: …`).
+///
+/// Resolution order:
+///   1. `target` — current target's pos (fails if no target).
+///   2. 2-or-3 numeric tokens — explicit coords. 2 args means
+///      `<x> <y>` with `z` defaulting to `self_pos.z`.
+///   3. Anything else — fuzzy name. See [`resolve_position_needle`].
+fn parse_goto_target(
+    trimmed: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+    zone_id: Option<u16>,
+    cmd_label: &str,
+) -> Result<WireVec3, String> {
     if trimmed.eq_ignore_ascii_case("target") {
-        let Some(id) = current_target else {
-            return SlashOutcome::SystemMessage("/pathto: no target".into());
-        };
-        let Some(ent) = entities.iter().find(|e| e.id == id) else {
-            return SlashOutcome::SystemMessage("/pathto: target despawned".into());
-        };
-        return SlashOutcome::Command(AgentCommand::PathTo {
-            x: ent.pos.x,
-            y: ent.pos.y,
-            z: ent.pos.z,
-        });
+        let id = current_target.ok_or_else(|| format!("{cmd_label}: no target"))?;
+        let ent = entities
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| format!("{cmd_label}: target despawned"))?;
+        return Ok(ent.pos);
     }
     let parts: Vec<&str> = trimmed.split_ascii_whitespace().collect();
-    if parts.len() != 3 {
-        return SlashOutcome::SystemMessage(format!(
-            "/pathto: expected 3 coords (got {}); usage `/pathto <x> <y> <z>`",
-            parts.len()
-        ));
+    // Numeric form: 2 or 3 floats. We only treat it as numeric if every
+    // token parses cleanly — otherwise fall through to fuzzy match.
+    // (Zone / entity names are single tokens, so a token-count guard
+    // would mis-trigger here on multi-word names — parse-everything
+    // is the cleaner pivot.)
+    if (parts.len() == 2 || parts.len() == 3)
+        && parts.iter().all(|p| p.parse::<f32>().is_ok())
+    {
+        let v: Vec<f32> = parts.iter().map(|p| p.parse::<f32>().unwrap()).collect();
+        let z = if v.len() == 3 { v[2] } else { self_pos.z };
+        return Ok(WireVec3 { x: v[0], y: v[1], z });
     }
-    let coords: Result<Vec<f32>, _> = parts.iter().map(|p| p.parse::<f32>()).collect();
-    match coords {
-        Ok(v) => SlashOutcome::Command(AgentCommand::PathTo {
-            x: v[0],
-            y: v[1],
-            z: v[2],
-        }),
-        Err(_) => SlashOutcome::SystemMessage(format!(
-            "/pathto: bad coord in `{trimmed}` (expected three floats)"
-        )),
+    // Fuzzy name resolution (zone-line + entity).
+    resolve_position_needle(trimmed, entities, self_pos, zone_id)
+        .map(|(pos, _label)| pos)
+        .ok_or_else(|| {
+            format!(
+                "{cmd_label}: no match for `{trimmed}` (try `/zones` or `/debug`)"
+            )
+        })
+}
+
+/// Player's current heading, looked up from the self entity. Used by
+/// [`parse_warp`] to avoid forcing a heading-reset on teleport. We
+/// identify "self" by `pos == self_pos` (the same convention as
+/// `render_debug_nearby` — see `state.rs::self_position`). Falls back
+/// to `0` if the self entity isn't yet in the snapshot (very early
+/// boot only).
+fn self_heading(entities: &[WireEntity], self_pos: WireVec3) -> u8 {
+    entities
+        .iter()
+        .find(|e| e.pos == self_pos)
+        .map(|e| e.heading)
+        .unwrap_or(0)
+}
+
+/// Fuzzy-match a needle against zone-line destinations (current zone)
+/// AND entity names, in that priority order. Returns `(pos, label)`
+/// where `label` describes what matched — currently unused by callers
+/// (toast support is deferred) but kept so logging and future
+/// toasting have a stable hook.
+///
+/// Priority: zone-line first. Rationale: `/zoneto` is the established
+/// "by destination" command and we want a strict superset of its
+/// behavior. Entity match is the additive surface this resolver
+/// introduces. Operators can target a specific entity with the
+/// `target` form when they want to skip the zone-line path.
+fn resolve_position_needle(
+    needle: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    zone_id: Option<u16>,
+) -> Option<(WireVec3, String)> {
+    if let Some(z) = zone_id {
+        let lines = ffxi_nav::zone_lines_for(z);
+        if !lines.is_empty() {
+            let by_id = needle.parse::<u16>().ok().filter(|n| *n <= MAX_ZONE_ID);
+            let needle_lower = needle.to_ascii_lowercase();
+            let hit = lines.iter().find(|line| {
+                if Some(line.to_zone) == by_id {
+                    return true;
+                }
+                ffxi_nav::zone_name(line.to_zone)
+                    .map(|n| n.to_ascii_lowercase().starts_with(&needle_lower))
+                    .unwrap_or(false)
+            });
+            if let Some(line) = hit {
+                let pos = WireVec3 {
+                    x: line.from_pos[0],
+                    y: line.from_pos[1],
+                    z: line.from_pos[2],
+                };
+                let label = ffxi_nav::zone_name(line.to_zone)
+                    .map(|n| format!("zone-line → {n} ({})", line.to_zone))
+                    .unwrap_or_else(|| format!("zone-line → zone {}", line.to_zone));
+                return Some((pos, label));
+            }
+        }
     }
+    let ent = resolve_name(needle, entities, self_pos)?;
+    let kind = kind_tag(ent.kind);
+    let name = ent.name.as_deref().unwrap_or("?");
+    Some((ent.pos, format!("{kind} {name}")))
 }
 
 // ----- Stage 4 lockstep parsers ---------------------------------------------
@@ -2805,14 +2945,128 @@ mod tests {
 
     #[test]
     fn pathto_rejects_bad_input() {
-        // "/pathto target" with no current target also rejects.
+        // `/pathto target` with no current target rejects. `/pathto x y z`
+        // is a fuzzy lookup with no entities to match → rejects. `/pathto`
+        // bare rejects with the usage line. `/pathto 1 2 3 4` (too many
+        // numeric args) falls into fuzzy and finds no name → rejects.
+        //
+        // Note `/pathto 1 2` is NOT in this list — it is now valid as
+        // the 2-arg coord form (z defaults to self_pos.z).
         for s in [
             "/pathto",
-            "/pathto 1 2",
             "/pathto 1 2 3 4",
             "/pathto x y z",
             "/pathto target",
         ] {
+            assert!(
+                matches!(
+                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    SlashOutcome::SystemMessage(_)
+                ),
+                "expected SystemMessage for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn pathto_two_arg_form_uses_self_z() {
+        // `/pathto x y` — z defaults to current self_pos.z. Operator
+        // is on the same vertical plane and just wants to walk
+        // somewhere on this floor.
+        let mut self_pos = origin();
+        self_pos.z = 17.5;
+        match parse_slash("/pathto 10 20", &empty_entities(), self_pos, None, None) {
+            SlashOutcome::Command(AgentCommand::PathTo { x, y, z }) => {
+                assert_eq!((x, y, z), (10.0, 20.0, 17.5));
+            }
+            other => panic!("expected PathTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pathto_fuzzy_name_picks_entity() {
+        // `/pathto Bob` — no zone_id (so zone-lines skipped); falls
+        // through to entity prefix match.
+        let entity = ent(42, "Bob", EntityKind::Pc, 7.0, 8.0);
+        match parse_slash("/pathto bob", &[entity], origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::PathTo { x, y, .. }) => {
+                assert_eq!((x, y), (7.0, 8.0));
+            }
+            other => panic!("expected PathTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_numeric_three_args_emits_move() {
+        match parse_slash(
+            "/warp 1.5 2 -3.25",
+            &empty_entities(),
+            origin(),
+            None,
+            None,
+        ) {
+            SlashOutcome::Command(AgentCommand::Move { x, y, z, heading }) => {
+                assert_eq!((x, y, z), (1.5, 2.0, -3.25));
+                // No self entity in the snapshot → heading defaults to 0.
+                assert_eq!(heading, 0);
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_two_arg_form_uses_self_z() {
+        let mut self_pos = origin();
+        self_pos.z = -42.0;
+        match parse_slash("/warp 1 2", &empty_entities(), self_pos, None, None) {
+            SlashOutcome::Command(AgentCommand::Move { x, y, z, .. }) => {
+                assert_eq!((x, y, z), (1.0, 2.0, -42.0));
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_preserves_self_heading() {
+        // Self entity carries heading=64. Warp must not zero it out
+        // (which would force the player to face north on every /warp).
+        let self_pos = origin();
+        let mut me = ent(1, "Me", EntityKind::Pc, self_pos.x, self_pos.y);
+        me.pos.z = self_pos.z;
+        me.heading = 64;
+        match parse_slash("/warp 100 200 5", &[me], self_pos, None, None) {
+            SlashOutcome::Command(AgentCommand::Move { heading, .. }) => {
+                assert_eq!(heading, 64);
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_target_form_emits_move_to_target() {
+        let entity = ent(42, "Mob", EntityKind::Mob, 11.0, 22.0);
+        match parse_slash("/warp target", &[entity], origin(), Some(42), None) {
+            SlashOutcome::Command(AgentCommand::Move { x, y, .. }) => {
+                assert_eq!((x, y), (11.0, 22.0));
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_fuzzy_entity_match() {
+        let entity = ent(42, "Bob", EntityKind::Pc, 7.0, 8.0);
+        match parse_slash("/warp bo", &[entity], origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::Move { x, y, .. }) => {
+                assert_eq!((x, y), (7.0, 8.0));
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_rejects_empty_and_unmatched() {
+        for s in ["/warp", "/warp nosuchname"] {
             assert!(
                 matches!(
                     parse_slash(s, &empty_entities(), origin(), None, None),
