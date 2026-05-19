@@ -2616,13 +2616,23 @@ fn decode_chat_std(data: &[u8]) -> Option<ChatLine> {
     }
     let kind = data[0];
     let sender = trim_nul_string(&data[4..PREFIX]);
-    let text = trim_nul_string(&data[PREFIX..]);
+    let text = decode_chat_text(&data[PREFIX..]);
     Some(ChatLine {
         channel: ChatChannel::from_chat_kind(kind),
         sender,
         text,
         server_ts: 0,
     })
+}
+
+/// Decode the variable-length `Mes` field of a chat packet: walks the
+/// NUL-terminated body and substitutes any inline auto-translate blocks
+/// (`0xFD ty lang cat idx 0xFD`) with their resolved phrase. Falls back
+/// to lossy UTF-8 for everything outside AT blocks. See
+/// `ffxi_proto::autotranslate` for the lookup details.
+fn decode_chat_text(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    ffxi_proto::autotranslate::decode(&bytes[..end])
 }
 
 /// Decode a NUL-terminated, possibly NUL-padded byte slice as UTF-8 with

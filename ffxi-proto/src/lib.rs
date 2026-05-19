@@ -3,6 +3,7 @@
 //! Pure data layer — no networking, no async, no globals. The `ffxi-client`
 //! crate is responsible for socket I/O and session orchestration.
 
+pub mod autotranslate;
 pub mod blowfish;
 pub mod checksum;
 pub mod decode;
