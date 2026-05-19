@@ -480,7 +480,11 @@ pub fn sync_entities_system(
                     wire.id,
                     wire.kind,
                     name,
-                    nameplate_color(wire.kind),
+                    // Spawn-time color is the kind-only default with no
+                    // combat context. The update system re-derives the
+                    // engagement-aware color next tick (mob: aggro vs.
+                    // wandering, etc.) and re-rasterizes if needed.
+                    crate::nameplate_billboard::nameplate_color(wire.kind, false, false),
                 );
                 nameplated.insert(wire.id);
             }
@@ -626,18 +630,6 @@ fn pick_mesh(m: &EntityMesh, kind: EntityKind) -> Handle<Mesh> {
         EntityKind::Mob => m.mob.clone(),
         EntityKind::Pet => m.pet.clone(),
         EntityKind::Npc | EntityKind::Other => m.default.clone(),
-    }
-}
-
-/// Nameplate text color per entity kind. Matches the body-material palette
-/// roughly, brightened so the label is legible against the dark scene.
-fn nameplate_color(kind: EntityKind) -> Color {
-    match kind {
-        EntityKind::Pc => Color::srgb(0.55, 0.95, 1.0),
-        EntityKind::Npc => Color::srgb(1.0, 0.92, 0.55),
-        EntityKind::Mob => Color::srgb(1.0, 0.55, 0.55),
-        EntityKind::Pet => Color::srgb(0.55, 0.95, 0.65),
-        EntityKind::Other => Color::srgb(0.85, 0.85, 0.85),
     }
 }
 

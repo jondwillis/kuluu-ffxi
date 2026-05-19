@@ -596,7 +596,65 @@ fn handle_sub_packet(
                 let kind = if op == s2c::CHAR_PC {
                     EntityKind::Pc
                 } else {
-                    EntityKind::Npc
+                    // CHAR_NPC (0x00E) is LSB's catch-all for every
+                    // non-PC entity class — friendly NPCs, mobs, pets,
+                    // charmed monsters, trusts. The opcode alone
+                    // doesn't tell us which.
+                    //
+                    // We discriminate using two single-byte writes
+                    // **only the mob/pet packet path emits**
+                    // (`entity_update.cpp:388, 389-392`, gated on
+                    // `case TYPE_MOB | TYPE_PET | TYPE_TRUST`):
+                    //
+                    //   * `ref<uint8>(0x25) = health.hp > 0 ? 0x08 : 0`
+                    //     — body[33]. Set to `0x08` for any live
+                    //     mob/pet/trust; LSB's NPC packet path doesn't
+                    //     touch this byte, so it stays `0` after the
+                    //     packet buffer is zero-initialized.
+                    //
+                    //   * `ref<uint8>(0x27) |= 0x08` when `PMaster` is
+                    //     a PC — body[35] bit 0x08. Distinguishes
+                    //     player-owned pets/trusts/charmed mobs from
+                    //     genuinely hostile mobs.
+                    //
+                    // We deliberately do *not* use the allegiance byte
+                    // at 0x29 — `CNpcEntity` initializes
+                    // `allegiance = ALLEGIANCE_TYPE::MOB` by default
+                    // (vendor/server/src/map/entities/npcentity.cpp:44),
+                    // so most friendly NPCs come through with
+                    // allegiance == 0 just like real mobs. Visible
+                    // symptom before this fix: Matildie + Anilla in
+                    // Selbina rendered as yellow "mob" nameplates with
+                    // HP suffixes and HP bars across their chests.
+                    //
+                    // Gate on UPDATE_HP because LSB only writes these
+                    // bytes when that bit is set (position-only ticks
+                    // leave the buffer untouched). Emit `Other` on the
+                    // no-HP path so `state::merge_kind` preserves the
+                    // prior specialized classification — kind only ever
+                    // upgrades from `Other`, never downgrades.
+                    //
+                    // Dead mobs (`hp == 0`) also have byte 0x25 == 0
+                    // and so classify as `Npc`. Acceptable: dead-state
+                    // entities despawn promptly, and the wrong color
+                    // for the one or two frames they're visible is far
+                    // less noticeable than the wrong color for every
+                    // NPC in town.
+                    if head.send_flag & 0x04 != 0 {
+                        let live_mob_marker = sub.data.get(33).copied().unwrap_or(0);
+                        let name_prefix = sub.data.get(35).copied().unwrap_or(0);
+                        let is_live_mob_like = live_mob_marker == 0x08;
+                        let owned_by_pc = name_prefix & 0x08 != 0;
+                        if is_live_mob_like && owned_by_pc {
+                            EntityKind::Pet
+                        } else if is_live_mob_like {
+                            EntityKind::Mob
+                        } else {
+                            EntityKind::Npc
+                        }
+                    } else {
+                        EntityKind::Other
+                    }
                 };
                 if op == s2c::CHAR_PC && head.unique_no == self_char_id {
                     *self_act_index = Some(head.act_index);

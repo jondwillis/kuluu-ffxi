@@ -49,22 +49,55 @@ use crate::camera::OperatorCamera;
 use crate::components::{InGameEntity, Nameplate, WorldEntity};
 use crate::snapshot::SceneState;
 
-/// Pixel-height of the rasterized name glyph. Bigger = sharper but
-/// pricier per re-rasterization. 32px is a comfortable read at 1× quad
-/// scale and re-rasterizes in <100 µs even with mojibake'd names.
-const NAME_PX: f32 = 32.0;
+/// Pixel-height of the rasterized name glyph. Bigger = sharper at the
+/// close-up end of the distance range (the quad gets bilinearly
+/// upsampled to whatever screen pixels it covers, so a low base px
+/// looks blurry within melee range). 64px gives ~256 pixels of glyph
+/// width for a typical 8-char name — enough headroom that even a 1.4
+/// yalm quad 2 yalms from the camera samples close to 1:1 instead of
+/// 8:1. Re-rasterization is still <0.3 ms per name on a 2024 laptop;
+/// the path only fires on name/state change, not per-frame.
+const NAME_PX: f32 = 64.0;
 
 /// Base world-space width of the quad in yalms before the
-/// distance-curve scaling kicks in. ~1.6 yalms ≈ chest-to-shoulder
-/// width on the default capsule, so a one-word name lands about
-/// chin-height when the camera is at melee range.
-const QUAD_BASE_WIDTH_YALMS: f32 = 1.6;
+/// distance-curve scaling kicks in. Tuned down from the original 1.6
+/// because the previous value visibly overshot the model silhouette at
+/// melee range — the label dominated the screen and clipped through
+/// hats/heads on close orbits.
+const QUAD_BASE_WIDTH_YALMS: f32 = 1.1;
+
+/// Hard caps on per-frame world-space width of a billboard quad. The
+/// distance curve runs from `~1.0` at d=0 to `~0` as d→∞, multiplied by
+/// `QUAD_BASE_WIDTH_YALMS`. Without these clamps, close-up labels
+/// would clip through hats and far-distance labels would shrink to
+/// unreadable specks — the natural 1/d shrink overshoots the human
+/// "I want to read names across a Jeuno plaza" range pretty fast.
+///
+/// `MAX` fires at near distances. `MIN` fires past ~mid-range (~9
+/// yalms with the current curve) and pins the quad at this width for
+/// the rest of the distance range. That's deliberate: past mid-range
+/// we trade "perceptually 3D-anchored shrink" for "still readable"
+/// because the alternative is unreadable text.
+const MAX_QUAD_WIDTH_YALMS: f32 = 1.4;
+const MIN_QUAD_WIDTH_YALMS: f32 = 0.8;
 
 /// Vertical offset above the owning entity's translation where the
 /// label sits. Matches the prior UI nameplate (`Vec3::Y * 2.4`) so the
 /// label parks at roughly head-of-capsule height regardless of which
 /// rendering path the operator is on.
 const HEAD_Y_OFFSET: f32 = 2.4;
+
+/// Pixel radius of the dark halo drawn behind the glyphs. The halo is
+/// what makes a yellow name readable against a sand-colored Western
+/// Sarutabaruta floor and a green name readable against tree canopy —
+/// without it the label dissolves into matching backgrounds. At
+/// `NAME_PX = 64` a 3-pixel radius is roughly 5% of glyph height,
+/// which matches the contrast halo conventional MMO nameplates use.
+const OUTLINE_RADIUS_PX: i32 = 3;
+
+/// Color of the outline halo. Slightly transparent black so the halo
+/// reads as a soft shadow rather than a hard inked stroke.
+const OUTLINE_COLOR: [u8; 4] = [0, 0, 0, 220];
 
 /// Shared `ab_glyph` font loaded from Bevy's embedded default
 /// (`bevy_text::DEFAULT_FONT_DATA` — same FiraMono-subset every Bevy
@@ -186,6 +219,39 @@ pub fn spawn_nameplate_billboard(
         .id()
 }
 
+/// Resolve the rendered text color for a billboard from entity kind
+/// and live combat state.
+///
+/// - **PC**: warm cyan.
+/// - **NPC**: green. Vanilla FFXI uses yellow for friendly NPCs, but
+///   yellow collides too easily with the unengaged-mob cue below;
+///   green reads unambiguously as "talk to me, not fight me."
+/// - **Mob**: depends on combat state, evaluated per-frame:
+///     * **reddish-orange** when *either* the player is engaged with
+///       this mob (`self.bt_target_id == mob.id`) or the mob is
+///       aggroing the player (`mob.bt_target_id == self.uniqueNo`).
+///       Mirrors the same two signals the chase ring and the body
+///       material use, so the cues stay in lockstep across the HUD.
+///     * **whitish-yellow** otherwise — the "wandering, not yet a
+///       threat" baseline.
+/// - **Pet**: pale green.
+/// - **Other**: neutral gray.
+pub fn nameplate_color(kind: EntityKind, is_engaged_with: bool, is_aggroing: bool) -> Color {
+    match kind {
+        EntityKind::Pc => Color::srgb(0.55, 0.95, 1.0),
+        EntityKind::Npc => Color::srgb(0.55, 1.0, 0.55),
+        EntityKind::Mob => {
+            if is_engaged_with || is_aggroing {
+                Color::srgb(1.0, 0.55, 0.25)
+            } else {
+                Color::srgb(1.0, 0.95, 0.7)
+            }
+        }
+        EntityKind::Pet => Color::srgb(0.55, 0.95, 0.65),
+        EntityKind::Other => Color::srgb(0.85, 0.85, 0.85),
+    }
+}
+
 /// Build the rendered label string for a billboard. Mobs and pets get
 /// the `"Name 73%"` HP suffix; PCs and NPCs get the bare name. Mirrors
 /// the previous UI `format_label` — kept here (not shared from
@@ -238,9 +304,24 @@ pub fn update_nameplate_billboards_system(
 
     // HP lookup keyed by wire id — only the entities the snapshot says
     // have a known HP appear here; missing means "no suffix this frame."
+    //
+    // While we're walking `snapshot.entities`, also pull the player's
+    // `uniqueNo` and current `bt_target_id` so we can decide aggro vs.
+    // engaged state per billboard below. `sync_in` is the same low-16
+    // unique-id the server uses in `bt_target_id`, mirroring the exact
+    // comparison `sync_aggro_system` does (scene.rs).
+    let self_uid: Option<u16> = state.snapshot.diagnostics.sync_in;
+    let self_char_id: Option<u32> = state.snapshot.self_char_id;
     let mut hp_by_id: std::collections::HashMap<u32, Option<u8>> = std::collections::HashMap::new();
+    let mut bt_target_by_id: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    let mut self_bt_target: u32 = 0;
     for ent in &state.snapshot.entities {
         hp_by_id.insert(ent.id, ent.hp_pct);
+        bt_target_by_id.insert(ent.id, ent.bt_target_id);
+        if Some(ent.id) == self_char_id {
+            self_bt_target = ent.bt_target_id;
+        }
     }
 
     for (ui_entity, mut np, mut aspect, mut transform, mut vis, mat) in &mut billboards {
@@ -275,7 +356,8 @@ pub fn update_nameplate_billboards_system(
         // don't get squashed into a square.
         let aspect_ratio = aspect.width.max(1) as f32 / aspect.height.max(1) as f32;
         let scale = distance_to_scale(distance);
-        let world_width = (QUAD_BASE_WIDTH_YALMS * scale).clamp(0.4, 2.75);
+        let world_width =
+            (QUAD_BASE_WIDTH_YALMS * scale).clamp(MIN_QUAD_WIDTH_YALMS, MAX_QUAD_WIDTH_YALMS);
         let world_height = world_width / aspect_ratio.max(0.01);
 
         transform.translation = head_pos;
@@ -283,19 +365,39 @@ pub fn update_nameplate_billboards_system(
         transform.scale = Vec3::new(world_width, world_height, 1.0);
         *vis = Visibility::Visible;
 
-        // Refresh the rasterized text if the displayed string changed.
-        // String equality is cheap and avoids re-allocating a full
-        // glyph atlas on every frame for stable labels.
+        // Combat-state-derived color. Recomputed every frame so a mob
+        // turning hostile / breaking aggro flips the label color even
+        // for an otherwise unchanged name.
+        let is_engaged_with = self_bt_target != 0 && self_bt_target == np.entity_id;
+        let is_aggroing = match (self_uid, bt_target_by_id.get(&np.entity_id).copied()) {
+            // Match `sync_aggro_system`'s comparison exactly: cast the
+            // entity-side u32 down to u16 and compare against the
+            // player's UniqueNo. Limit to Mob/Pet kinds so a PC that
+            // happens to bt_target the player isn't painted red.
+            (Some(uid), Some(bt)) if matches!(np.kind, EntityKind::Mob | EntityKind::Pet) => {
+                bt as u16 == uid && bt != 0
+            }
+            _ => false,
+        };
+        let want_color = color_to_rgba8(nameplate_color(np.kind, is_engaged_with, is_aggroing));
+
+        // Refresh the rasterized text if either the displayed string
+        // OR the rendered color changed. String + 4-byte equality is
+        // cheap and avoids re-rasterizing for stable labels.
         let hp = hp_by_id.get(&np.entity_id).copied().flatten();
         let want = format_billboard_label(&np.base_name, hp, np.kind);
-        if want != np.last_rendered {
+        if want != np.last_rendered || want_color != np.last_color {
             if let Some(mat) = materials.get(&mat.0) {
                 if let Some(handle) = mat.base_color_texture.clone() {
-                    let new_img = rasterize_text_to_image(&font.0, &want, NAME_PX, np.last_color);
+                    let new_img = rasterize_text_to_image(&font.0, &want, NAME_PX, want_color);
                     aspect.width = new_img.width();
                     aspect.height = new_img.height();
-                    images.insert(&handle, new_img);
+                    // `insert` returns a `Result` indicating whether
+                    // we replaced an existing asset; we always do, so
+                    // the signal is uninteresting.
+                    let _ = images.insert(&handle, new_img);
                     np.last_rendered = want;
+                    np.last_color = want_color;
                 }
             }
         }
@@ -348,9 +450,21 @@ pub fn distance_to_scale(distance_yalms: f32) -> f32 {
     1.0 / (1.0 + distance_yalms * 0.03)
 }
 
-/// Rasterize `text` into a tightly-cropped RGBA8 image using `ab_glyph`.
-/// One image per nameplate — kept small (typically <128×40 px) so the
-/// allocation cost is dominated by the glyph atlas, not the texture.
+/// Rasterize `text` into an RGBA8 image with a dark contrast halo.
+///
+/// Two-pass:
+///   1. Lay out glyphs and write per-pixel glyph coverage (alpha only)
+///      into a single-channel scratch buffer, padded by
+///      `OUTLINE_RADIUS_PX + 1` on each side so the halo has room.
+///   2. For each output pixel, take `text_alpha` from the coverage
+///      buffer and derive `outline_alpha` as the max coverage inside
+///      a disk of radius `OUTLINE_RADIUS_PX` around that pixel. Then
+///      composite **text over outline** with straight-alpha blending.
+///
+/// Disk-shaped dilation (vs. a square neighborhood) keeps the corners
+/// of the halo rounded, which reads as "soft shadow" rather than as a
+/// blocky stroke. Per-pixel cost is `O(R²)`, but the pass only fires
+/// on name/state change.
 ///
 /// The result uses **sRGB** color encoding so a `StandardMaterial`'s
 /// gamma-aware sampler reproduces the requested `color` accurately —
@@ -388,31 +502,80 @@ fn rasterize_text_to_image(font: &FontArc, text: &str, px: f32, color: [u8; 4]) 
         glyphs.push(positioned);
     }
 
-    // +2 padding on each axis to give anti-aliased edges room without
-    // bleeding into the texture wrap.
-    let width = (max_x.ceil() as u32).max(1) + 2;
-    let height = line_h + 2;
-    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    // Pad by R+1 on every side so the halo has room without clipping
+    // at the texture edge.
+    let pad = (OUTLINE_RADIUS_PX + 1) as u32;
+    let width = (max_x.ceil() as u32).max(1) + 2 * pad;
+    let height = line_h + 2 * pad;
 
+    // Pass 1: glyph coverage into a single-channel scratch buffer.
+    let mut coverage = vec![0u8; (width * height) as usize];
     for glyph in glyphs {
-        if let Some(outline) = scaled.outline_glyph(glyph) {
-            let bb = outline.px_bounds();
-            outline.draw(|gx, gy, coverage| {
-                let px_x = bb.min.x as i32 + gx as i32 + 1;
-                let px_y = bb.min.y as i32 + gy as i32 + 1;
+        if let Some(outline_glyph) = scaled.outline_glyph(glyph) {
+            let bb = outline_glyph.px_bounds();
+            outline_glyph.draw(|gx, gy, c| {
+                let px_x = bb.min.x as i32 + gx as i32 + pad as i32;
+                let px_y = bb.min.y as i32 + gy as i32 + pad as i32;
                 if px_x < 0 || px_y < 0 || px_x >= width as i32 || px_y >= height as i32 {
                     return;
                 }
-                let i = ((px_y as u32 * width + px_x as u32) * 4) as usize;
-                let alpha = (coverage * color[3] as f32).round() as u8;
-                // Straight (non-premultiplied) RGBA. `AlphaMode::Blend`
-                // on `StandardMaterial` expects this; switching to
-                // premult would require `AlphaMode::Premultiplied`.
-                pixels[i] = color[0];
-                pixels[i + 1] = color[1];
-                pixels[i + 2] = color[2];
-                pixels[i + 3] = pixels[i + 3].saturating_add(alpha);
+                let i = (px_y as u32 * width + px_x as u32) as usize;
+                let added = (c * 255.0).round().clamp(0.0, 255.0) as u8;
+                coverage[i] = coverage[i].saturating_add(added);
             });
+        }
+    }
+
+    // Pass 2: composite text-over-outline into the final RGBA texture.
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    let r = OUTLINE_RADIUS_PX;
+    let r2 = r * r;
+    let w_i = width as i32;
+    let h_i = height as i32;
+    for y in 0..h_i {
+        for x in 0..w_i {
+            let text_alpha = coverage[(y * w_i + x) as usize];
+
+            // Max coverage inside a disk of radius R around this pixel.
+            let mut outline_alpha: u8 = 0;
+            let y0 = (y - r).max(0);
+            let y1 = (y + r).min(h_i - 1);
+            let x0 = (x - r).max(0);
+            let x1 = (x + r).min(w_i - 1);
+            for ny in y0..=y1 {
+                let dy = ny - y;
+                let dy2 = dy * dy;
+                for nx in x0..=x1 {
+                    let dx = nx - x;
+                    if dx * dx + dy2 > r2 {
+                        continue;
+                    }
+                    let na = coverage[(ny * w_i + nx) as usize];
+                    if na > outline_alpha {
+                        outline_alpha = na;
+                    }
+                }
+            }
+
+            // Combine text and outline alphas through their declared
+            // RGBA color alphas. Straight-alpha "text over outline":
+            // out_a = ta + (1 - ta) * oa
+            // out_rgb = (text * ta + outline * (1 - ta) * oa) / out_a
+            let ta = (text_alpha as f32 / 255.0) * (color[3] as f32 / 255.0);
+            let oa = (outline_alpha as f32 / 255.0) * (OUTLINE_COLOR[3] as f32 / 255.0);
+            let out_a = ta + (1.0 - ta) * oa;
+            if out_a <= 0.0 {
+                continue;
+            }
+            let inv = 1.0 / out_a;
+            let or = color[0] as f32 * ta + OUTLINE_COLOR[0] as f32 * (1.0 - ta) * oa;
+            let og = color[1] as f32 * ta + OUTLINE_COLOR[1] as f32 * (1.0 - ta) * oa;
+            let ob = color[2] as f32 * ta + OUTLINE_COLOR[2] as f32 * (1.0 - ta) * oa;
+            let pi = ((y * w_i + x) * 4) as usize;
+            pixels[pi] = (or * inv).round().clamp(0.0, 255.0) as u8;
+            pixels[pi + 1] = (og * inv).round().clamp(0.0, 255.0) as u8;
+            pixels[pi + 2] = (ob * inv).round().clamp(0.0, 255.0) as u8;
+            pixels[pi + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
         }
     }
 
