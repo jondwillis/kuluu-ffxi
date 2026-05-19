@@ -519,6 +519,22 @@ fn handle_sub_packet(
                     from: None,
                     to: login.zone_no,
                 });
+                // LSB embeds `MusicNum[5]` directly in the LOGIN body
+                // for the zone's pre-set slots (Day/Night/CombatSolo/
+                // CombatParty/Mount). Out-of-band 0x05F arrives only
+                // for runtime `changeMusic()` calls. Without
+                // surfacing these here, the viewer hears silence
+                // until something in a Lua script touches the music
+                // — which never happens in most zones.
+                if let Some(music) = login.music_num {
+                    for (slot, track_id) in music.iter().enumerate() {
+                        tracing::info!(slot, track_id, "LOGIN MusicNum");
+                        let _ = event_tx.send(AgentEvent::MusicChanged {
+                            slot: slot as u8,
+                            track_id: *track_id,
+                        });
+                    }
+                }
                 if login.unique_no == self_char_id {
                     *self_act_index = Some(login.act_index);
                     *self_pos = Position {

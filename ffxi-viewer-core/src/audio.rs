@@ -336,6 +336,12 @@ pub fn drain_music_events_system(events: Res<EventLog>, mut slots: ResMut<BgmSlo
             ViewerEvent::MusicChanged { slot, track_id } => {
                 let s = *slot as usize;
                 if s < SLOT_COUNT {
+                    info!(
+                        "audio: 0x05F slot={} ({}) track={}",
+                        slot,
+                        slot_name(*slot),
+                        track_id
+                    );
                     slots.tracks[s] = Some(*track_id);
                 }
             }
@@ -351,6 +357,21 @@ pub fn drain_music_events_system(events: Res<EventLog>, mut slots: ResMut<BgmSlo
         }
     }
     slots.event_cursor = len;
+}
+
+/// Short label for the 8 LSB `MusicSlot` values. Diagnostic only.
+fn slot_name(slot: u8) -> &'static str {
+    match slot {
+        0 => "ZoneDay",
+        1 => "ZoneNight",
+        2 => "CombatSolo",
+        3 => "CombatParty",
+        4 => "Mount",
+        5 => "Dead",
+        6 => "MogHouse",
+        7 => "Fishing",
+        _ => "?",
+    }
 }
 
 /// React to the resolved slot. If the (slot, track) pair changed
@@ -388,15 +409,27 @@ pub fn apply_bgm_system(
         return;
     }
 
+    // One-line summary of every BGM transition. Crucial diagnostic
+    // for "I'm not hearing anything" — surfaces whether (a) the
+    // server filled the slots we'd play, (b) the state flags
+    // gated those slots out, or (c) the audible slot is correct
+    // but the file's missing.
+    info!(
+        target: "audio::bgm",
+        "transition: {:?} → {:?} | slots={:?} state={:?}",
+        slots.active, resolved, slots.tracks, *state
+    );
+
     // Despawn the previous sink.
     if let Some(e) = slots.active_entity.take() {
         commands.entity(e).despawn();
     }
     slots.active = resolved;
 
-    let Some((_slot, track_id)) = resolved else {
+    let Some((slot, track_id)) = resolved else {
         return;
     };
+    let _ = slot;
     let Some(path) = find_audio(&install, AudioKind::Bgm, track_id as u32) else {
         warn!(
             "audio: bgm {track_id} not found under {}",

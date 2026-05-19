@@ -427,6 +427,17 @@ pub struct ServerLogin {
     /// the client can seed its self-entity from the very first packet
     /// of zone-in without waiting for a CHAR_PC echo.
     pub pos_head: PosHead,
+    /// `MusicNum[5]` at body[82..92]. Pre-fills the BGM slots
+    /// 0..=4 on zone-in (LSB pushes these inline rather than via
+    /// 0x05F):
+    ///   [0] = ZoneDay     (music_day column)
+    ///   [1] = ZoneNight   (music_night column)
+    ///   [2] = CombatSolo  (battlesolo column)
+    ///   [3] = CombatParty (battlemulti column)
+    ///   [4] = Mount       (0x54 if mounted at zone-in, else 0xD4)
+    /// `None` only if the LOGIN body is too short to reach this
+    /// offset (extremely unusual — real LSB bodies are ~180+B).
+    pub music_num: Option<[u16; 5]>,
 }
 
 impl ServerLogin {
@@ -434,6 +445,18 @@ impl ServerLogin {
     /// `ZoneNo` (4B) = 48 bytes. Phoenix's full LOGIN body is much larger
     /// (~180+ bytes) but we only need the prefix.
     pub const SIZE: usize = 48;
+    /// Body offset of `MusicNum[0]`. Layout from LSB's `0x00a_login.h`:
+    ///   0x00 PosHead (44B)
+    ///   0x2C ZoneNo (4B)
+    ///   0x30 ntTime (4B)
+    ///   0x34 ntTimeSec (4B)
+    ///   0x38 GameTime (4B)
+    ///   0x3C EventNo (2B)
+    ///   0x3E MapNumber (2B)
+    ///   0x40 GrapIDTbl[9] (18B)
+    ///   0x52 MusicNum[5] (10B) ← we read here
+    pub const MUSIC_NUM_OFFSET: usize = 0x52;
+    pub const MUSIC_NUM_SIZE: usize = 5 * 2;
 
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
         if body.len() < Self::SIZE {
@@ -445,11 +468,26 @@ impl ServerLogin {
         // every time. So we read at the fixed offset.
         let zone_u32 = u32::from_le_bytes(body[44..48].try_into().unwrap());
         let pos_head = PosHead::decode(&body[..PosHead::SIZE_WITH_BT_TARGET])?;
+        // MusicNum is optional: short bodies (in synthetic tests, or
+        // hypothetical legacy clients) simply don't carry it.
+        let music_num = if body.len() >= Self::MUSIC_NUM_OFFSET + Self::MUSIC_NUM_SIZE {
+            let base = Self::MUSIC_NUM_OFFSET;
+            Some([
+                u16::from_le_bytes([body[base], body[base + 1]]),
+                u16::from_le_bytes([body[base + 2], body[base + 3]]),
+                u16::from_le_bytes([body[base + 4], body[base + 5]]),
+                u16::from_le_bytes([body[base + 6], body[base + 7]]),
+                u16::from_le_bytes([body[base + 8], body[base + 9]]),
+            ])
+        } else {
+            None
+        };
         Ok(Self {
             unique_no: pos_head.unique_no,
             act_index: pos_head.act_index,
             zone_no: zone_u32 as u16,
             pos_head,
+            music_num,
         })
     }
 }
