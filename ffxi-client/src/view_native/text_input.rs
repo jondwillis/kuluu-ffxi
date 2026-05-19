@@ -97,6 +97,17 @@ pub struct SlashWriters<'w, 's> {
     /// message queue. `SfxEvent::new(id)` plays once at full
     /// volume; `play_sfx_system` handles the decode + spawn.
     pub sfx_event: MessageWriter<'w, ffxi_viewer_core::audio::SfxEvent>,
+    /// `/screenshot [path]` — capture primary window to PNG. Consumer
+    /// in `view_native::screenshot::process_screenshot_requests`
+    /// spawns the Bevy `Screenshot` entity and observes save-to-disk.
+    pub screenshot: MessageWriter<'w, super::screenshot::ScreenshotRequest>,
+    /// Graphics-quality settings — mutated by the in-game Graphics
+    /// menu (Left/Right on a row cycles the highlighted field, Enter
+    /// cycles forward / fires the Reset action). The reactor systems
+    /// in `ffxi_viewer_core::graphics_settings` hot-apply on change,
+    /// and the persist system in `crate::graphics_store` writes the
+    /// new JSON. Bundled here to stay under Bevy's 16-SystemParam cap.
+    pub graphics: ResMut<'w, ffxi_viewer_core::GraphicsSettings>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -214,6 +225,7 @@ pub fn text_input_system(
                     &mut scene_state,
                     &cmd_tx.0,
                     &mut keybinds_state,
+                    &mut slash_writers.graphics,
                 ) {
                     *mode = next;
                 }
@@ -640,6 +652,25 @@ fn apply_slash_outcome(
         }
         SlashOutcome::DebugHeights => {
             slash_writers.debug_heights.write(DebugHeightsRequest);
+        }
+        SlashOutcome::Screenshot { path } => {
+            // Auto-numbered default keeps the workflow scriptable: no
+            // arg → screenshot-0.png, screenshot-1.png, … per session.
+            // Counter is a `Local` on this system so it survives across
+            // calls.
+            static COUNTER: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let resolved = path.unwrap_or_else(|| {
+                let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("screenshot-{n}.png")
+            });
+            slash_writers
+                .screenshot
+                .write(super::screenshot::ScreenshotRequest {
+                    path: std::path::PathBuf::from(&resolved),
+                });
+            // Consumer pushes its own toast on capture; this branch
+            // only routes the event.
         }
         SlashOutcome::PlayBgm { track_id } => {
             // Synthesize the same wire event a 0x05F packet would
@@ -1250,6 +1281,21 @@ enum MenuDispatch {
     NotImplemented(String),
 }
 
+/// Apply one Left/Right (or NavConfirm) cycle step to the field on
+/// row `cursor` of the Graphics submenu. Rows past the last field
+/// (the Reset action row) are no-ops here — Reset only fires on
+/// NavConfirm and is handled inline by the caller.
+fn apply_graphics_cycle(
+    cursor: usize,
+    delta: i32,
+    graphics: &mut ffxi_viewer_core::GraphicsSettings,
+) {
+    use ffxi_viewer_core::graphics_settings::GRAPHICS_FIELDS;
+    if let Some(&field) = GRAPHICS_FIELDS.get(cursor) {
+        graphics.cycle(field, delta);
+    }
+}
+
 fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
     match (kind, label) {
         // Logout: toggle the in-world LeaveGame timer. Choose toggle
@@ -1270,6 +1316,11 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
         // Config: open the keybind submenu. Real preset-switching is on
         // the next level; this entry just navigates.
         (MenuKind::Root, "Config") => MenuDispatch::OpenSubmenu(MenuKind::Config),
+        // Graphics: open the quality-settings submenu. The Graphics
+        // submenu itself doesn't go through `resolve_menu_entry` — its
+        // rows are index-driven (the cursor row maps 1:1 to
+        // GRAPHICS_FIELDS), handled directly in `handle_menu_key`.
+        (MenuKind::Root, "Graphics") => MenuDispatch::OpenSubmenu(MenuKind::Graphics),
         // Config submenu entries → keybind updates. Labels match
         // `CONFIG_ENTRIES` in `hud/menu.rs`; keep them in sync.
         (MenuKind::Config, "Standard") => {
@@ -1307,6 +1358,7 @@ fn handle_menu_key(
     scene_state: &mut SceneState,
     cmd_tx: &Sender<AgentCommand>,
     keybinds_state: &mut KeybindsStateRes,
+    graphics: &mut ffxi_viewer_core::GraphicsSettings,
 ) -> Option<InputMode> {
     // Capture the active screen + cursor up front. `entry_count` and
     // `entry_label` both consult this — keeps the Root/Config branches
@@ -1316,6 +1368,20 @@ fn handle_menu_key(
         (level.kind, level.cursor)
     };
     let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind);
+
+    // Graphics-only Left/Right cycle. Up/Down still moves the cursor
+    // row; Left/Right adjusts the value on the highlighted row.
+    if matches!(kind, MenuKind::Graphics) {
+        if bindings.matches_logical(Action::NavLeft, key) {
+            apply_graphics_cycle(cursor, -1, graphics);
+            return None;
+        }
+        if bindings.matches_logical(Action::NavRight, key) {
+            apply_graphics_cycle(cursor, 1, graphics);
+            return None;
+        }
+    }
+
     if bindings.matches_logical(Action::NavUp, key) {
         // Wrap: top → bottom (matches retail menu nav).
         let level = stack.current_mut()?;
@@ -1334,6 +1400,18 @@ fn handle_menu_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
+        // Graphics submenu has its own confirm flow: field rows cycle
+        // forward (same as Right), the Reset row resets to High. No
+        // submenu transitions; stay in Menu mode.
+        if matches!(kind, MenuKind::Graphics) {
+            if cursor == ffxi_viewer_core::hud::menu::GRAPHICS_RESET_SLOT {
+                graphics.reset_to_default();
+                push_system_chat_line(scene_state, "[menu] Graphics reset to High".into());
+            } else {
+                apply_graphics_cycle(cursor, 1, graphics);
+            }
+            return None;
+        }
         let label = ffxi_viewer_core::hud::menu::entry_label(kind, cursor);
         return match resolve_menu_entry(kind, label) {
             MenuDispatch::CommandWithToast { cmd, toast } => {

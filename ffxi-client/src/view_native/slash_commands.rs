@@ -328,6 +328,11 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 summary: "screen-capture-friendly mode (disables framepace; avoids QuickTime lockup)",
             },
             HelpEntry {
+                aliases: &["screenshot", "ss"],
+                usage: "[path.png]",
+                summary: "capture primary window to PNG (default: screenshot-N.png in CWD)",
+            },
+            HelpEntry {
                 aliases: &["drawdistance", "dd"],
                 usage: "[setworld|setmob] [N]",
                 summary: "set draw distance",
@@ -495,6 +500,14 @@ pub enum SlashOutcome {
     /// event; the consumer system reads the navmesh + collision mesh
     /// resources and pushes a multi-line system toast.
     DebugHeights,
+    /// `/screenshot [path]` — capture the primary window to a PNG.
+    /// `None` selects an auto-numbered default (`screenshot-N.png` in
+    /// CWD). Dispatcher writes a `ScreenshotRequest`; consumer system
+    /// spawns Bevy's `Screenshot::primary_window()` with a `save_to_disk`
+    /// observer.
+    Screenshot {
+        path: Option<String>,
+    },
     /// `/endcutscene [csid]` — send a 0x05B `EVENT_END` for a *forced*
     /// cutscene (the kind `player:startEvent` fires from `onZoneIn` —
     /// new-character openings, area-entry cinematics) that bypassed the
@@ -763,6 +776,7 @@ pub fn parse_slash(
         "look" => parse_look(rest, entities, self_pos, current_target),
         "fps" => parse_fps(rest),
         "capture" => parse_capture(rest),
+        "screenshot" | "ss" => parse_screenshot(rest),
         "drawdistance" | "dd" => parse_drawdistance(rest),
         "zonegeom" => parse_zonegeom(rest),
         "debug" | "dbg" | "nearby" | "entities" => {
@@ -1891,6 +1905,17 @@ fn parse_capture(rest: &str) -> SlashOutcome {
         Some(other) => SlashOutcome::SystemMessage(format!(
             "/capture: unknown arg `{other}` (use `on`, `off`, or `toggle`)"
         )),
+    }
+}
+
+fn parse_screenshot(rest: &str) -> SlashOutcome {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        SlashOutcome::Screenshot { path: None }
+    } else {
+        SlashOutcome::Screenshot {
+            path: Some(trimmed.to_string()),
+        }
     }
 }
 
