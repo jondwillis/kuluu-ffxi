@@ -597,63 +597,64 @@ fn handle_sub_packet(
                     EntityKind::Pc
                 } else {
                     // CHAR_NPC (0x00E) is LSB's catch-all for every
-                    // non-PC entity class — friendly NPCs, mobs, pets,
-                    // charmed monsters, trusts. The opcode alone
-                    // doesn't tell us which.
+                    // non-PC entity class. We discriminate via the
+                    // `look.size` field LSB writes at packet offset
+                    // 0x30 (= body[0x2C..0x2C+2]) — the MODELID_TYPE
+                    // enum from `vendor/server/.../entity_update.h:30`:
                     //
-                    // We discriminate using two single-byte writes
-                    // **only the mob/pet packet path emits**
-                    // (`entity_update.cpp:388, 389-392`, gated on
-                    // `case TYPE_MOB | TYPE_PET | TYPE_TRUST`):
+                    //   0 STANDARD / 5 UNK_5 / 6 AUTOMATON
+                    //       — raw monster meshes (mobs, PUP pets,
+                    //         charmed beasts).
+                    //   1 EQUIPPED / 7 CHOCOBO
+                    //       — equipped character (every friendly NPC
+                    //         in town, mounts, fellows).
+                    //   2 DOOR / 3 ELEVATOR / 4 SHIP
+                    //       — static furniture / transport.
                     //
-                    //   * `ref<uint8>(0x25) = health.hp > 0 ? 0x08 : 0`
-                    //     — body[33]. Set to `0x08` for any live
-                    //     mob/pet/trust; LSB's NPC packet path doesn't
-                    //     touch this byte, so it stays `0` after the
-                    //     packet buffer is zero-initialized.
+                    // `look.size` is written on *every* CHAR_NPC packet
+                    // (`entity_update.cpp:451-484`, outside the
+                    // UPDATE_HP gate), so we don't have to wait for an
+                    // HP-bearing tick to classify.
                     //
-                    //   * `ref<uint8>(0x27) |= 0x08` when `PMaster` is
-                    //     a PC — body[35] bit 0x08. Distinguishes
-                    //     player-owned pets/trusts/charmed mobs from
-                    //     genuinely hostile mobs.
+                    // Why not the alternatives we tried first:
+                    //   * Allegiance byte at packet 0x29 — `CNpcEntity`
+                    //     defaults `allegiance = ALLEGIANCE_TYPE::MOB`
+                    //     (`npcentity.cpp:44`), so most friendly NPCs
+                    //     come through indistinguishable from mobs.
+                    //   * Live-mob marker at packet 0x25 — only written
+                    //     under UPDATE_HP and didn't produce the
+                    //     expected 0x08 byte for Tunnel_Worm packets in
+                    //     Ronfaure (empirical observation).
                     //
-                    // We deliberately do *not* use the allegiance byte
-                    // at 0x29 — `CNpcEntity` initializes
-                    // `allegiance = ALLEGIANCE_TYPE::MOB` by default
-                    // (vendor/server/src/map/entities/npcentity.cpp:44),
-                    // so most friendly NPCs come through with
-                    // allegiance == 0 just like real mobs. Visible
-                    // symptom before this fix: Matildie + Anilla in
-                    // Selbina rendered as yellow "mob" nameplates with
-                    // HP suffixes and HP bars across their chests.
-                    //
-                    // Gate on UPDATE_HP because LSB only writes these
-                    // bytes when that bit is set (position-only ticks
-                    // leave the buffer untouched). Emit `Other` on the
-                    // no-HP path so `state::merge_kind` preserves the
-                    // prior specialized classification — kind only ever
-                    // upgrades from `Other`, never downgrades.
-                    //
-                    // Dead mobs (`hp == 0`) also have byte 0x25 == 0
-                    // and so classify as `Npc`. Acceptable: dead-state
-                    // entities despawn promptly, and the wrong color
-                    // for the one or two frames they're visible is far
-                    // less noticeable than the wrong color for every
-                    // NPC in town.
-                    if head.send_flag & 0x04 != 0 {
-                        let live_mob_marker = sub.data.get(33).copied().unwrap_or(0);
-                        let name_prefix = sub.data.get(35).copied().unwrap_or(0);
-                        let is_live_mob_like = live_mob_marker == 0x08;
-                        let owned_by_pc = name_prefix & 0x08 != 0;
-                        if is_live_mob_like && owned_by_pc {
-                            EntityKind::Pet
-                        } else if is_live_mob_like {
-                            EntityKind::Mob
-                        } else {
-                            EntityKind::Npc
+                    // Pet split: byte 0x27 bit 0x08 = "PMaster is a PC"
+                    // (`entity_update.cpp:390-392`), gated on UPDATE_HP.
+                    // Promotes a creature-shaped model with a PC owner
+                    // (jug pet, BST jug, charmed mob, fellow) to Pet so
+                    // the nameplate module picks the friendly palette.
+                    // When UPDATE_HP isn't set we can't read it; that
+                    // misclassifies fresh pets as Mob for a tick, then
+                    // merge_kind upgrades on the next HP packet.
+                    const LOOK_SIZE_OFFSET: usize = 0x2C;
+                    let look_size = sub
+                        .data
+                        .get(LOOK_SIZE_OFFSET..LOOK_SIZE_OFFSET + 2)
+                        .map(|s| u16::from_le_bytes([s[0], s[1]]));
+                    let owned_by_pc = head.send_flag & 0x04 != 0
+                        && (sub.data.get(35).copied().unwrap_or(0) & 0x08) != 0;
+                    match look_size {
+                        Some(0) | Some(5) | Some(6) => {
+                            if owned_by_pc {
+                                EntityKind::Pet
+                            } else {
+                                EntityKind::Mob
+                            }
                         }
-                    } else {
-                        EntityKind::Other
+                        Some(1) | Some(7) => EntityKind::Npc,
+                        Some(2) | Some(3) | Some(4) => EntityKind::Other,
+                        // Truncated body or unknown look size — emit
+                        // `Other` so `state::merge_kind` preserves any
+                        // prior specialized classification.
+                        _ => EntityKind::Other,
                     }
                 };
                 if op == s2c::CHAR_PC && head.unique_no == self_char_id {
@@ -706,6 +707,15 @@ fn handle_sub_packet(
                         None
                     }
                 });
+                // FFXI DAT files store NPC + mob names with underscores
+                // standing in for spaces (`Tunnel_Worm`, `Magic_Pot`).
+                // Retail clients render them with spaces; do the same
+                // normalization at the wire boundary so every
+                // downstream consumer (nameplate, target panel, chat
+                // log, name_cache) sees `"Tunnel Worm"`. PC names
+                // can't contain underscores at character-creation
+                // time, so this is safe for CHAR_PC too.
+                let name = name.map(|n| n.replace('_', " "));
                 if let Some(n) = name.as_ref() {
                     if !n.is_empty() {
                         name_cache.insert(head.unique_no, n.clone());
