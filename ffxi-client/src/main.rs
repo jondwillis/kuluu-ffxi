@@ -10,6 +10,8 @@ use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session};
 // reached directly from main.rs's Play / native paths. Same re-import
 // trick `state` uses above.
 #[cfg(feature = "native-window")]
+use ffxi_client::graphics_store;
+#[cfg(feature = "native-window")]
 use ffxi_client::keybinds_store;
 #[cfg(feature = "relay")]
 use ffxi_client::relay;

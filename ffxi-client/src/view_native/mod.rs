@@ -24,6 +24,7 @@ pub mod bridge;
 pub mod camera_collision;
 pub mod collision_bvh;
 pub mod debug_heights;
+pub mod screenshot;
 pub mod input;
 pub mod launcher_ui;
 pub mod nameplate_occlude;
@@ -270,6 +271,16 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.insert_resource(loaded_bindings);
     app.insert_resource(crate::keybinds_store::KeybindsStateRes { store, persisted });
 
+    // Graphics settings: same load-before-plugin pattern as keybinds,
+    // for the same reason — `ViewerCorePlugin::build`'s
+    // `init_resource::<GraphicsSettings>()` no-ops when the resource
+    // already exists, so the loaded settings become authoritative.
+    let (loaded_graphics, graphics_store_obj) = crate::graphics_store::load_or_default();
+    app.insert_resource(loaded_graphics);
+    app.insert_resource(crate::graphics_store::GraphicsStateRes {
+        store: graphics_store_obj,
+    });
+
     // Viewer plugins. `ViewerCorePlugin` registers ingest_system gated
     // on `resource_exists::<NativeSource>` (added by the bridge), so
     // its presence on the schedule from app build time is harmless.
@@ -324,6 +335,12 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         FixedUpdate,
         input::dispatch_movement_system.run_if(in_state(AppPhase::InGame)),
     );
+
+    // Persist graphics settings whenever they change. Best-effort —
+    // a disk write failure logs but does not block the in-memory
+    // mutation, so a transient I/O hiccup can't lock the operator
+    // out of changing settings.
+    app.add_systems(Update, crate::graphics_store::persist_graphics_on_change);
 
     // Camera-wall collision: clamp the chase camera so it stops at the
     // navmesh boundary instead of tunneling through walls. Scheduled
@@ -381,6 +398,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             Update,
             debug_heights::process_debug_heights.run_if(in_state(AppPhase::InGame)),
         );
+
+    // `/screenshot [path]` — capture primary window to PNG.
+    app.add_message::<screenshot::ScreenshotRequest>()
+        .add_systems(Update, screenshot::process_screenshot_requests);
 
     // Disconnect → return-to-launcher. Runs every frame in InGame and
     // bounces the phase back to Launcher when the session ends (clean
