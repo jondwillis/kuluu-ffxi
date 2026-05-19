@@ -2,6 +2,14 @@
 resolver = "2"
 members = ["ffxi-proto", "ffxi-client", "ffxi-mcp", "ffxi-nav", "ffxi-nav-recast", "ffxi-viewer-wire", "ffxi-viewer-core", "ffxi-viewer-wasm", "ffxi-dat", "ffxi-audio"]
 
+# Vendored fork of recastnavigation-rs 0.1.0 with a one-line `#include
+# <cstddef>` in Deterministic.h. Without it, `cargo test` fails with
+# "unknown type name 'size_t'" because cxx-bridge-generated TUs don't
+# transitively include stdlib. See vendor/recastnavigation-rs/recastnavigation/
+# Deterministic/Include/Deterministic.h for the patch comment.
+[patch.crates-io]
+recastnavigation-rs = { path = "vendor/recastnavigation-rs" }
+
 # Bevy's recommended dev profile: build our own crates at opt-level=1
 # (still fast to compile, still debuggable) but compile every dependency
 # at opt-level=3. Without this, `cargo run` of the native-window client

@@ -36,6 +36,20 @@ struct Args {
     #[arg(long, default_value_t = ffxi_proto::login::LOGIN_AUTH_PORT)]
     auth_port: u16,
 
+    /// Auth wire encoding: `json` for LSB's post-rewrite JSON handshake
+    /// (default — works against the local docker stack), or `binary`
+    /// for hxiloader-style 102-byte payload + MAC + ASCII version
+    /// (HorizonXI's `play.horizonxi.com` runs this).
+    #[arg(long, default_value = "json")]
+    auth_flavor: auth_client::AuthFlavor,
+
+    /// Xiloader version triple sent in JSON auth (`major.minor.patch`).
+    /// Beats the `FFXI_XILOADER_VERSION` env var. Default `2.1.0` matches
+    /// LSB upstream; HorizonXI requires `2.0.0` (their server is one minor
+    /// behind). Server compares major+minor only — patch is free.
+    #[arg(long)]
+    xiloader_version: Option<String>,
+
     /// Login data port (TLS-TCP).
     #[arg(long, default_value_t = ffxi_proto::login::LOGIN_DATA_PORT)]
     data_port: u16,
@@ -172,7 +186,12 @@ fn main() -> Result<()> {
         .with_env_filter(env_filter)
         .init();
 
-    let auth = auth_client::AuthClient::new(args.server.clone(), args.auth_port);
+    let auth = auth_client::AuthClient::with_flavor_and_version(
+        args.server.clone(),
+        args.auth_port,
+        args.auth_flavor,
+        args.xiloader_version.as_deref(),
+    );
 
     // Bevy/winit on macOS strictly requires its event loop on the OS main
     // thread (Cocoa restriction). Build the tokio runtime explicitly so the

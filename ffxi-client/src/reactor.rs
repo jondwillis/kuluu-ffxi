@@ -659,8 +659,19 @@ impl Reactor {
                         }],
                     };
                 };
+                let step = self.effective_step_per_tick();
+                if step <= 0.0 {
+                    // Server-set speed is zero (Bind / Stun / Sleep /
+                    // zoning) — emit no Move and don't claim arrival.
+                    // We'll resume pathing once the server restores
+                    // speed and the next tick sees step > 0.
+                    return TickOutput {
+                        commands: Vec::new(),
+                        derived_events: Vec::new(),
+                    };
+                }
                 let dist = horizontal_distance(cur, wp);
-                if dist <= self.cfg.max_step_per_tick {
+                if dist <= step {
                     // Reached this waypoint. If it's the last, complete
                     // the path and notify renderers; otherwise advance
                     // and keep moving (no Idle transition yet).
@@ -689,7 +700,7 @@ impl Reactor {
                         }
                     }
                 } else {
-                    let stepped = step_point(cur, wp, self.cfg.max_step_per_tick);
+                    let stepped = step_point(cur, wp, step);
                     TickOutput {
                         commands: vec![mk_move(stepped, heading_toward(cur, wp))],
                         derived_events: Vec::new(),
@@ -761,9 +772,49 @@ impl Reactor {
         if dist <= hold_distance {
             return None;
         }
-        let step_size = (dist - hold_distance).min(self.cfg.max_step_per_tick);
+        let step = self.effective_step_per_tick();
+        if step <= 0.0 {
+            // Server speed=0 — let the keepalive hold position rather
+            // than emit a Move that would advance our local self_pos
+            // and then get broadcast as a speedhack-shaped delta.
+            return None;
+        }
+        let step_size = (dist - hold_distance).min(step);
         let stepped = step_point(cur, target_pos, step_size);
         Some(mk_move(stepped, heading_toward(cur, target_pos)))
+    }
+
+    /// Effective per-tick step size in yalms, honoring server-set speed.
+    ///
+    /// FFXI is authoritative on movement speed: the server publishes
+    /// the current effective speed in every `0x00D` packet (PosHead).
+    /// Modifiers — Bind / Stun / Sleep / Slow / encumbrance / mounts /
+    /// movement-buff gear — all land here as `PosHead::speed`. Sending
+    /// position deltas that exceed `expected_speed * elapsed` triggers
+    /// the server-side speedhack heuristic (`MAX_DISTANCE_WARP` /
+    /// per-tick velocity check in LSB's `data_session.cpp`), which is
+    /// what gets accounts auto-flagged on private servers.
+    ///
+    /// Policy:
+    /// - **speed == 0** (bound/stunned/zoning): return 0 so callers
+    ///   suppress Move emission entirely. The keepalive still
+    ///   re-broadcasts our last position, which is what the server
+    ///   expects for an immobilized character.
+    /// - **speed > 0**: scale `max_step_per_tick` by `speed/speed_base`,
+    ///   capped at 2× as a paranoia bound (real values stay close to 1,
+    ///   ~2 for mounts; anything wilder is likely a decoder bug).
+    /// - **no PosHead yet** (pre-LOGIN): return base unmodified — the
+    ///   reactor doesn't emit movement before `Stage::InZone` anyway.
+    fn effective_step_per_tick(&self) -> f32 {
+        let Some(pos) = self.state.self_position() else {
+            return self.cfg.max_step_per_tick;
+        };
+        if pos.speed == 0 {
+            return 0.0;
+        }
+        let base = pos.speed_base.max(1) as f32;
+        let ratio = (pos.speed as f32 / base).min(2.0);
+        self.cfg.max_step_per_tick * ratio
     }
 
     fn face_entity(&self, target_id: u32) -> Option<AgentCommand> {
@@ -1147,6 +1198,22 @@ mod tests {
         act_index: u16,
         bt_target_id: u32,
     ) -> AgentEvent {
+        upsert_with_speed(id, pos, hp_pct, kind, act_index, bt_target_id, 40, 40)
+    }
+
+    /// Variant for tests that need to exercise the server-speed safety
+    /// branches (`Bind`/`Slow`/`Stun`). Defaults to `40/40` (normal PC
+    /// walking) which matches what LSB sends in `PosHead`.
+    fn upsert_with_speed(
+        id: u32,
+        pos: Vec3,
+        hp_pct: u8,
+        kind: EntityKind,
+        act_index: u16,
+        bt_target_id: u32,
+        speed: u8,
+        speed_base: u8,
+    ) -> AgentEvent {
         AgentEvent::EntityUpserted {
             entity: Entity {
                 id,
@@ -1158,8 +1225,8 @@ mod tests {
                 hp_pct: Some(hp_pct),
                 bt_target_id,
                 claim_id: 0,
-                speed: 0,
-                speed_base: 0,
+                speed,
+                speed_base,
                 look: None,
             },
         }
@@ -2282,5 +2349,159 @@ mod tests {
         assert!(d.is_empty(), "exactly threshold should not fire");
         let d = r.observe_event(&upsert(1, Vec3::default(), 24, EntityKind::Pc, 1));
         assert!(matches!(d.as_slice(), [AgentEvent::LowHp { pct: 24 }]));
+    }
+
+    // -- Server-set speed safety ------------------------------------------
+    //
+    // Anti-speedhack protection: outbound Move emissions must scale with
+    // the server's authoritative `PosHead::speed`, and must STOP entirely
+    // when speed==0 (Bind / Stun / Sleep / zoning). The reactor reads the
+    // self-entity's speed/speed_base from the state mirror, which is
+    // populated from inbound 0x00D PosHead by session.rs.
+
+    #[test]
+    fn pathing_suppresses_move_when_server_speed_is_zero() {
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        // Self: bound — server says speed=0 but speed_base=40 (normal).
+        r.observe_event(&upsert_with_speed(
+            1,
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            1,
+            0,
+            0,
+            40,
+        ));
+        r.handle_command(AgentCommand::PathTo {
+            x: 10.0,
+            y: 0.0,
+            z: 0.0,
+        });
+        let out = r.tick();
+        assert!(
+            out.commands.is_empty(),
+            "speed=0 must suppress Move emission, got {:?}",
+            out.commands
+        );
+        // Goal should NOT have flipped to Idle — we resume once speed > 0.
+        assert!(matches!(r.goal, Goal::Pathing { .. }));
+    }
+
+    #[test]
+    fn pathing_scales_step_by_server_speed_ratio() {
+        let mut r = Reactor::new(step_test_cfg()); // max_step_per_tick = 1.0
+        r.observe_event(&connected(1));
+        // Slowed: speed = half of base → step should be 0.5 yalm.
+        r.observe_event(&upsert_with_speed(
+            1,
+            Vec3::default(),
+            100,
+            EntityKind::Pc,
+            1,
+            0,
+            20,
+            40,
+        ));
+        r.handle_command(AgentCommand::PathTo {
+            x: 10.0,
+            y: 0.0,
+            z: 0.0,
+        });
+        let out = r.tick();
+        match out.commands.as_slice() {
+            [AgentCommand::Move { x, .. }] => {
+                assert!(
+                    (x - 0.5).abs() < 1e-4,
+                    "expected step x=0.5 (half of base 1.0), got {x}"
+                );
+            }
+            other => panic!("expected single scaled Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pathing_step_caps_at_2x_base_against_weird_server_values() {
+        // If the decoder ever feeds us speed >> speed_base (a bug or a
+        // weird server custom), the cap keeps us from speedhacking by
+        // accident. Cap is 2× per the doc-comment policy.
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        r.observe_event(&upsert_with_speed(
+            1,
+            Vec3::default(),
+            100,
+            EntityKind::Pc,
+            1,
+            0,
+            200, // wildly elevated
+            40,
+        ));
+        r.handle_command(AgentCommand::PathTo {
+            x: 10.0,
+            y: 0.0,
+            z: 0.0,
+        });
+        let out = r.tick();
+        match out.commands.as_slice() {
+            [AgentCommand::Move { x, .. }] => {
+                assert!(
+                    *x <= 2.0 + 1e-4,
+                    "step must be capped at 2× base (=2.0), got {x}"
+                );
+            }
+            other => panic!("expected capped Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follow_suppresses_step_when_server_speed_is_zero() {
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        // Self: bound.
+        r.observe_event(&upsert_with_speed(
+            1,
+            Vec3::default(),
+            100,
+            EntityKind::Pc,
+            1,
+            0,
+            0,
+            40,
+        ));
+        // Follow target somewhere far away.
+        r.observe_event(&upsert(
+            2,
+            Vec3 {
+                x: 20.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            2,
+        ));
+        r.handle_command(AgentCommand::Follow {
+            target_id: 2,
+            distance: 3.0,
+        });
+        let out = r.tick();
+        // Reactor's `face_entity` (heading-only) is still allowed during
+        // following — we suppress the *step*, not the face. Check that
+        // no Move with non-self-position came back.
+        let cur = Vec3::default();
+        for cmd in &out.commands {
+            if let AgentCommand::Move { x, y, z, .. } = cmd {
+                assert!(
+                    (*x - cur.x).abs() < 1e-3 && (*y - cur.y).abs() < 1e-3 && (*z - cur.z).abs() < 1e-3,
+                    "speed=0 follow must not step (only face); got Move to ({x},{y},{z})"
+                );
+            }
+        }
     }
 }
