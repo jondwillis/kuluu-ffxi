@@ -17,7 +17,10 @@
 //!             unchanged until W/S press, which snaps it to camera-forward.
 //!   ↑/↓       camera pitch (↑ raises camera/more overhead, ↓ lowers it).
 //!   R         toggle autorun while forward is currently held.
-//!   Tab       cycle target by 2D distance from self.
+//!   Tab       sweep targets left-to-right across the screen. First press
+//!             picks the entity nearest the camera-frustum center; further
+//!             presses step rightward through visible (plus slightly-out-
+//!             of-view) entities. Mirrors FFXI retail.
 //!   Esc       clear target selection (does NOT close the window).
 //!   F8        toggle first-person camera. In FP, the cursor is locked
 //!             (pointer-lock on web) and mouse-look (C3) drives heading 1:1.
@@ -624,7 +627,7 @@ fn heading_to_forward(heading: u8) -> (f32, f32) {
     (angle.cos(), -angle.sin())
 }
 
-/// Pure helper: viewport-aware Tab cycle.
+/// Pure helper: viewport-aware Tab cycle, FFXI-retail style.
 ///
 /// `project` maps an FFXI world position to NDC (`[-1, 1]` x/y; z `[0, 1]`
 /// for in-front-of-camera, outside that range = behind / clipped).
@@ -633,10 +636,18 @@ fn heading_to_forward(heading: u8) -> (f32, f32) {
 ///
 /// Cycle behavior:
 /// - First press (no current target, or current target is off-screen):
-///   pick the *nearest visible* entity by 2D world distance — that's
-///   what feels natural when starting from nothing.
-/// - Subsequent presses: order visible entities left-to-right by NDC.x
-///   and step to the entry after the current target. Wraps at the end.
+///   pick the entity **nearest the screen center** (smallest NDC magnitude)
+///   among those *strictly* inside the camera frustum. World distance is
+///   only used to break ties when two entities share the same angular
+///   position. Falls back to the relaxed-frustum set if nothing is
+///   strictly in-view.
+/// - Subsequent presses: order candidates left-to-right by NDC.x and
+///   step to the entry after the current target. Wraps at the end.
+///
+/// Frustum inclusion is **relaxed** past the strict `[-1, 1]` box (see
+/// [`CYCLE_NDC_LIMIT`]) so that entities sitting just off the screen
+/// edge — the common chase-cam "mob over my shoulder" case — stay in
+/// the cycle. Retail FFXI exhibits the same forgiving behavior.
 ///
 /// The synthetic self entity (id == 0) doesn't appear in the wire
 /// snapshot's entity list, so no explicit self-filter is needed here.
@@ -649,7 +660,15 @@ pub fn cycle_target_viewport<F>(
 where
     F: Fn(Vec3) -> Option<Vec3>,
 {
-    let mut visible: Vec<(u32, f32, f32)> = entities
+    struct Cand {
+        id: u32,
+        ndc_x: f32,
+        ndc_mag_sq: f32,
+        dist_sq: f32,
+        in_frustum: bool,
+    }
+
+    let mut candidates: Vec<Cand> = entities
         .iter()
         .filter_map(|e| {
             // FFXI position → Bevy world: same mapping as `ffxi_to_bevy`.
@@ -657,42 +676,81 @@ where
             // unit tests; the conversion is one-line.
             let world_pos = Vec3::new(e.pos.x, e.pos.z, -e.pos.y);
             let ndc = project(world_pos)?;
-            if ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 {
-                return None;
-            }
             // `world_to_ndc` returns z>1 for points behind the camera in
             // Bevy's reverse-Z projection, and z<0 past the far plane.
-            // Treat both as off-screen.
+            // Either way → not a valid cycle candidate.
             if ndc.z < 0.0 || ndc.z > 1.0 {
+                return None;
+            }
+            // Relaxed lateral / vertical cull. Entities well past the
+            // screen edge (more than ~30% beyond the frustum) are out;
+            // anything closer than that may still be in the cycle.
+            if ndc.x.abs() > CYCLE_NDC_LIMIT || ndc.y.abs() > CYCLE_NDC_LIMIT {
                 return None;
             }
             let dx = e.pos.x - from.x;
             let dy = e.pos.y - from.y;
-            Some((e.id, ndc.x, dx * dx + dy * dy))
+            let in_frustum = ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0;
+            Some(Cand {
+                id: e.id,
+                ndc_x: ndc.x,
+                ndc_mag_sq: ndc.x * ndc.x + ndc.y * ndc.y,
+                dist_sq: dx * dx + dy * dy,
+                in_frustum,
+            })
         })
         .collect();
 
-    if visible.is_empty() {
+    if candidates.is_empty() {
         return None;
     }
 
-    let current_visible =
-        current.and_then(|id| visible.iter().any(|&(i, _, _)| i == id).then_some(id));
+    let current_in_cycle =
+        current.and_then(|id| candidates.iter().any(|c| c.id == id).then_some(id));
 
-    match current_visible {
+    match current_in_cycle {
         Some(curr) => {
-            // Order by NDC.x ascending = left-to-right on screen.
-            visible.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            let pos = visible.iter().position(|&(id, _, _)| id == curr)?;
-            Some(visible[(pos + 1) % visible.len()].0)
+            // Sweep left-to-right by NDC.x across the (relaxed) screen
+            // band. Includes slightly-out-of-view entities so the cycle
+            // matches FFXI retail's forgiving target list.
+            candidates.sort_by(|a, b| {
+                a.ndc_x
+                    .partial_cmp(&b.ndc_x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let pos = candidates.iter().position(|c| c.id == curr)?;
+            Some(candidates[(pos + 1) % candidates.len()].id)
         }
         None => {
-            // No current target (or current is off-screen) → nearest.
-            visible.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-            Some(visible[0].0)
+            // First press: prefer strictly-in-frustum entities; only fall
+            // back to the relaxed set if nothing in-view qualifies. Among
+            // the preferred pool, pick the one nearest screen center
+            // (smallest NDC magnitude), breaking ties by world distance.
+            let any_strict = candidates.iter().any(|c| c.in_frustum);
+            candidates
+                .iter()
+                .filter(|c| !any_strict || c.in_frustum)
+                .min_by(|a, b| {
+                    a.ndc_mag_sq
+                        .partial_cmp(&b.ndc_mag_sq)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            a.dist_sq
+                                .partial_cmp(&b.dist_sq)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                })
+                .map(|c| c.id)
         }
     }
 }
+
+/// How far past the strict `[-1, 1]` NDC frustum an entity may sit and
+/// still appear in the Tab cycle. 1.3 ≈ 15% past each edge — enough to
+/// pick up the "mob just barely off-screen behind your shoulder" case
+/// that FFXI retail tabs to, without inviting entities that are clearly
+/// behind the camera or far peripheral.
+const CYCLE_NDC_LIMIT: f32 = 1.3;
 
 #[cfg(test)]
 mod tests {
@@ -700,12 +758,16 @@ mod tests {
     use ffxi_viewer_wire::{Entity as WireEntity, EntityKind, Vec3 as WireVec3};
 
     fn ent(id: u32, x: f32, y: f32) -> WireEntity {
+        ent_xyz(id, x, y, 0.0)
+    }
+
+    fn ent_xyz(id: u32, x: f32, y: f32, z: f32) -> WireEntity {
         WireEntity {
             id,
             act_index: 0,
             kind: EntityKind::Mob,
             name: None,
-            pos: WireVec3 { x, y, z: 0.0 },
+            pos: WireVec3 { x, y, z },
             heading: 0,
             hp_pct: None,
             bt_target_id: 0,
@@ -732,16 +794,82 @@ mod tests {
         }
     }
 
+    /// Project that maps FFXI x → NDC at a *wider* scale: ndc.x = pos.x / 50.
+    /// Lets us place entities at NDC > 1.0 without using `None` to cull,
+    /// so we can exercise the relaxed-frustum cycle inclusion.
+    fn wide_proj(p: Vec3) -> Option<Vec3> {
+        Some(Vec3::new(p.x / 50.0, 0.0, 0.5))
+    }
+
+    /// Project that also varies NDC.y. Lets us test "nearest to screen
+    /// center" picks based on combined NDC magnitude, not just horizontal.
+    fn xy_proj(p: Vec3) -> Option<Vec3> {
+        Some(Vec3::new(p.x / 100.0, p.y / 100.0, 0.5))
+    }
+
     #[test]
-    fn first_press_picks_nearest_visible() {
+    fn first_press_picks_nearest_to_screen_center() {
         let from = WireVec3 {
             x: 0.0,
             y: 0.0,
             z: 0.0,
         };
+        // ndc.x = pos.x/100: entity 2 sits at 0.1, entity 3 at 0.2,
+        // entity 1 at 0.3 — entity 2 is most centered.
         let entities = vec![ent(1, 30.0, 0.0), ent(2, 10.0, 0.0), ent(3, 20.0, 0.0)];
         let next = cycle_target_viewport(&entities, from, None, fake_proj);
-        assert_eq!(next, Some(2)); // closest to origin
+        assert_eq!(next, Some(2));
+    }
+
+    #[test]
+    fn first_press_prefers_screen_center_over_world_distance() {
+        // FFXI retail rule: Tab picks the most-centered visible entity,
+        // even when a less-centered one is closer in world space. With
+        // `fake_proj` (ndc.y forced to 0), an entity far along world-y
+        // still reads as on-axis on screen, which is what lets the two
+        // metrics genuinely disagree below.
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        // fake_proj: ndc.x = pos.x/100, ndc.y = 0.
+        //   Entity 1 at (5, 30): ndc.x=0.05 (near-center on screen),
+        //                         world dist² = 925.
+        //   Entity 2 at (20, 5): ndc.x=0.20 (off-center on screen),
+        //                         world dist² = 425.
+        // Old behavior (world-distance): pick entity 2 (closer).
+        // New behavior (screen-center):  pick entity 1 (more centered).
+        let entities = vec![ent(1, 5.0, 30.0), ent(2, 20.0, 5.0)];
+        assert_eq!(
+            cycle_target_viewport(&entities, from, None, fake_proj),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn first_press_uses_combined_ndc_magnitude() {
+        // Entity high on the screen but horizontally centered should
+        // lose to a slightly-off-center entity that's near the screen
+        // origin overall. The vertical-on-screen axis (bevy-y) comes
+        // from FFXI pos.z via the (x, z, -y) conversion inside the
+        // cycle fn — so we vary z to control on-screen height.
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        // xy_proj reads bevy.x, bevy.y → after conversion that's
+        // (FFXI.x, FFXI.z).
+        //   Entity 1: FFXI (0, 0, 80)  → ndc=(0.00, 0.80), |ndc|²=0.64.
+        //   Entity 2: FFXI (15, 0, 15) → ndc=(0.15, 0.15), |ndc|²=0.045.
+        // Entity 2 wins on |ndc| even though its horizontal is farther
+        // off-center than entity 1's.
+        let entities = vec![ent_xyz(1, 0.0, 0.0, 80.0), ent_xyz(2, 15.0, 0.0, 15.0)];
+        assert_eq!(
+            cycle_target_viewport(&entities, from, None, xy_proj),
+            Some(2)
+        );
     }
 
     #[test]
@@ -767,6 +895,77 @@ mod tests {
         assert_eq!(
             cycle_target_viewport(&entities, from, Some(3), fake_proj),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn cycle_includes_slightly_out_of_view_entities() {
+        // FFXI-retail parity: an entity sitting just past the strict
+        // frustum edge (chase-cam "mob over my shoulder") is still part
+        // of the cycle. With CYCLE_NDC_LIMIT=1.3, NDC.x up to ±1.3 is
+        // eligible.
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        // wide_proj: ndc.x = pos.x / 50.
+        //   Entity 1: x=-25 → ndc.x=-0.5 (strictly in frustum).
+        //   Entity 2: x=60  → ndc.x=1.2  (slightly out — relaxed bound).
+        //   Entity 3: x=80  → ndc.x=1.6  (well past — excluded).
+        let entities = vec![ent(1, -25.0, 0.0), ent(2, 60.0, 0.0), ent(3, 80.0, 0.0)];
+        // Currently targeting entity 1; pressing Tab cycles to entity 2
+        // (the slightly-out one) and skips entity 3 entirely.
+        assert_eq!(
+            cycle_target_viewport(&entities, from, Some(1), wide_proj),
+            Some(2)
+        );
+        // From entity 2, wrap back to entity 1 (entity 3 stays excluded).
+        assert_eq!(
+            cycle_target_viewport(&entities, from, Some(2), wide_proj),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn first_press_prefers_strictly_in_frustum() {
+        // When entities exist both strictly in-frustum and in the
+        // relaxed band, the initial Tab pick comes from the in-frustum
+        // pool even if a relaxed-band entity is closer to screen center.
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        // wide_proj: ndc.x = pos.x / 50.
+        //   Entity 1: x=45 → ndc.x=0.90 (in frustum, off-center).
+        //   Entity 2: x=60 → ndc.x=1.20 (slightly out — would be more
+        //                                 centered if wrapped, but isn't).
+        // Entity 1 wins because it's the only strict-in-frustum candidate.
+        let entities = vec![ent(1, 45.0, 0.0), ent(2, 60.0, 0.0)];
+        assert_eq!(
+            cycle_target_viewport(&entities, from, None, wide_proj),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn first_press_falls_back_to_relaxed_when_none_in_frustum() {
+        // If literally nothing is strictly in-view, first-press still
+        // picks the most-centered relaxed-band entity rather than
+        // returning None.
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        // wide_proj: ndc.x = pos.x / 50.
+        //   Entity 1: x=60 → ndc.x=1.20 (relaxed, slightly less centered).
+        //   Entity 2: x=55 → ndc.x=1.10 (relaxed, more centered).
+        let entities = vec![ent(1, 60.0, 0.0), ent(2, 55.0, 0.0)];
+        assert_eq!(
+            cycle_target_viewport(&entities, from, None, wide_proj),
+            Some(2)
         );
     }
 
