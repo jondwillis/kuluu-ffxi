@@ -262,41 +262,33 @@ pub fn apply_bgm_system(
 }
 
 /// Pack the decoded f32 PCM into a 16-bit-PCM WAV byte buffer.
-/// Reuses the `hound`-shaped writer logic from the dump_wav example
-/// but avoids a hard hound dep on viewer-core by hand-rolling the
-/// 44-byte RIFF header. Mono and stereo only (FFXI doesn't use
-/// >2 channels in BGM).
+/// Uses hound to produce a RIFF header rodio accepts — an earlier
+/// hand-rolled version was rejected as `UnrecognizedFormat` by
+/// rodio's WAV decoder, despite looking byte-correct against the
+/// spec. The differences are in optional chunk extensions and
+/// padding that hound gets right; not worth re-deriving here.
 fn wrap_decoded_as_wav(d: &ffxi_audio::DecodedAudio) -> Result<Vec<u8>, &'static str> {
     if d.channels == 0 || d.channels > 2 {
         return Err("only mono/stereo supported");
     }
-    let sample_rate = d.sample_rate as u32;
-    let channels = d.channels as u16;
-    let bits = 16u16;
-    let byte_rate = sample_rate * channels as u32 * (bits / 8) as u32;
-    let block_align = channels * (bits / 8);
-    let data_len = (d.samples.len() * 2) as u32;
-    let riff_size = 36 + data_len;
-
-    let mut out = Vec::with_capacity(44 + data_len as usize);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&riff_size.to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    out.extend_from_slice(&channels.to_le_bytes());
-    out.extend_from_slice(&sample_rate.to_le_bytes());
-    out.extend_from_slice(&byte_rate.to_le_bytes());
-    out.extend_from_slice(&block_align.to_le_bytes());
-    out.extend_from_slice(&bits.to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_len.to_le_bytes());
-    for s in &d.samples {
-        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-        out.extend_from_slice(&v.to_le_bytes());
+    let spec = hound::WavSpec {
+        channels: d.channels as u16,
+        sample_rate: d.sample_rate as u32,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    // Hound writes to a `Seek`-capable sink; `Cursor<Vec<u8>>` is
+    // the standard in-memory choice.
+    let mut buf = std::io::Cursor::new(Vec::<u8>::with_capacity(44 + d.samples.len() * 2));
+    {
+        let mut writer = hound::WavWriter::new(&mut buf, spec).map_err(|_| "wav header")?;
+        for s in &d.samples {
+            let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+            writer.write_sample(v).map_err(|_| "wav sample")?;
+        }
+        writer.finalize().map_err(|_| "wav finalize")?;
     }
-    Ok(out)
+    Ok(buf.into_inner())
 }
 
 // ---------------------------------------------------------------------------

@@ -30,6 +30,11 @@ serde = { workspace = true }
 # over the websocket if/when that's wanted.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ffxi-audio = { path = "../ffxi-audio" }
+# Verified WAV writer for the in-memory `DecodedAudio → AudioSource`
+# bridge. Hand-rolling the RIFF header looked right but rodio
+# (Bevy 0.17 audio backend) rejected the bytes as
+# `UnrecognizedFormat`; hound produces output rodio accepts.
+hound = "3"
 
 # wasm32 has no syscall for wall-clock time; std::time::SystemTime::now()
 # panics there. The HUD's reconnect-age line needs millis-since-epoch, so
