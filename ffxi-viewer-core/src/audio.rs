@@ -575,10 +575,11 @@ pub fn play_sfx_system(
 }
 
 /// Hardcoded system-SFX mapping. Each entry is a `ViewerEvent`
-/// shape + a stage-1 SE id; the ids are best-guesses pulled from
-/// the DAT scan of `ROM/0/58.DAT` and verified to exist on disk.
-/// The user can override any of these at runtime by mutating
-/// [`SystemSfxTable`].
+/// shape or a local UI event + a placeholder SE id; the ids are
+/// best-guesses pulled from the DAT scan of `ROM/0/58.DAT` and
+/// verified to exist on disk. Use [`SystemSfxTable::bind`] from the
+/// `/sfx_bind` slash command to rebind any entry at runtime once
+/// you've identified the canonical id via `/sfx N`.
 #[derive(Resource, Debug, Clone)]
 pub struct SystemSfxTable {
     /// `ViewerEvent::ZoneChanged` → zone-line confirm chime.
@@ -590,19 +591,136 @@ pub struct SystemSfxTable {
     pub engaged_by: Option<u32>,
     /// `ViewerEvent::TellReceived` → tell-ding.
     pub tell_received: Option<u32>,
+    /// `ViewerEvent::LevelUp` (from 0x02D msg id 9) → level-up jingle.
+    pub level_up: Option<u32>,
+    /// `ViewerEvent::SkillLevelUp` (from 0x02D msg id 53) → skill-up
+    /// blip. Fires often at low skill — gate this off (set None) if
+    /// it's noisy.
+    pub skill_level_up: Option<u32>,
+    /// UI: chat input prompt opened (`/` pressed in World mode).
+    pub ui_chat_open: Option<u32>,
+    /// UI: chat input submitted (Enter pressed in Chat mode).
+    pub ui_chat_send: Option<u32>,
+    /// UI: chat input dismissed via Escape.
+    pub ui_chat_cancel: Option<u32>,
+    /// UI: action menu opened (Enter in World).
+    pub ui_menu_open: Option<u32>,
+    /// UI: menu cursor moved (Up/Down within a menu).
+    pub ui_menu_move: Option<u32>,
+    /// UI: menu confirmed (Enter on a menu entry — pushes submenu or
+    /// fires the action).
+    pub ui_menu_confirm: Option<u32>,
+    /// UI: menu dismissed (Escape — pops the stack or closes the menu).
+    pub ui_menu_cancel: Option<u32>,
+    /// UI: slash command dispatched (any recognised `/foo`).
+    pub ui_command_ok: Option<u32>,
+    /// UI: slash command parse failed / unknown command.
+    pub ui_command_err: Option<u32>,
 }
 
 impl Default for SystemSfxTable {
     fn default() -> Self {
         // Conservative defaults — every id below has a corresponding
         // .spw file on disk in our reference install. The mapping
-        // (which sound for which event) is the user's to refine; we
-        // pick plausible candidates so something audible fires.
+        // (which sound for which event) is the user's to refine; rebind
+        // via `/sfx_bind <name> <id>` after listening to candidates
+        // through `/sfx <id>`. These are placeholders, not verified
+        // retail sounds.
         Self {
             zone_changed: Some(1097),
             low_hp: Some(1077),
             engaged_by: Some(1064),
             tell_received: Some(1053),
+            // Gameplay placeholders — FFXI retail level-up is in the
+            // 188xxx range historically; without a verified table we
+            // pick high-bank ids that exist on disk in the reference
+            // install.
+            level_up: Some(188000),
+            skill_level_up: Some(188002),
+            // UI placeholders — common menu blips in retail are
+            // bank 0 ids. These are guesses; rebind via /sfx_bind.
+            ui_chat_open: Some(1),
+            ui_chat_send: Some(2),
+            ui_chat_cancel: Some(3),
+            ui_menu_open: Some(1),
+            ui_menu_move: Some(4),
+            ui_menu_confirm: Some(2),
+            ui_menu_cancel: Some(3),
+            ui_command_ok: Some(2),
+            ui_command_err: Some(5),
+        }
+    }
+}
+
+/// String-keyed accessor used by the `/sfx_bind` slash command. Keep
+/// the key set in sync with the field names above so users have a
+/// stable, discoverable vocabulary.
+impl SystemSfxTable {
+    pub const SLOT_NAMES: &'static [&'static str] = &[
+        "zone_changed",
+        "low_hp",
+        "engaged_by",
+        "tell_received",
+        "level_up",
+        "skill_level_up",
+        "ui_chat_open",
+        "ui_chat_send",
+        "ui_chat_cancel",
+        "ui_menu_open",
+        "ui_menu_move",
+        "ui_menu_confirm",
+        "ui_menu_cancel",
+        "ui_command_ok",
+        "ui_command_err",
+    ];
+
+    /// Update one slot by name. Pass `id = 0` to mute (sets `None`).
+    /// Returns `false` for an unknown slot name; caller should report
+    /// `SLOT_NAMES` to the user in that case.
+    pub fn bind(&mut self, slot: &str, id: u32) -> bool {
+        let v = if id == 0 { None } else { Some(id) };
+        match slot {
+            "zone_changed" => self.zone_changed = v,
+            "low_hp" => self.low_hp = v,
+            "engaged_by" => self.engaged_by = v,
+            "tell_received" => self.tell_received = v,
+            "level_up" => self.level_up = v,
+            "skill_level_up" => self.skill_level_up = v,
+            "ui_chat_open" => self.ui_chat_open = v,
+            "ui_chat_send" => self.ui_chat_send = v,
+            "ui_chat_cancel" => self.ui_chat_cancel = v,
+            "ui_menu_open" => self.ui_menu_open = v,
+            "ui_menu_move" => self.ui_menu_move = v,
+            "ui_menu_confirm" => self.ui_menu_confirm = v,
+            "ui_menu_cancel" => self.ui_menu_cancel = v,
+            "ui_command_ok" => self.ui_command_ok = v,
+            "ui_command_err" => self.ui_command_err = v,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Mirror of [`bind`] used by `text_input_system` and other UI
+    /// code that wants to fire a named sfx without coupling to the
+    /// field set. Returns `None` if the slot is unmapped or unknown.
+    pub fn get(&self, slot: &str) -> Option<u32> {
+        match slot {
+            "zone_changed" => self.zone_changed,
+            "low_hp" => self.low_hp,
+            "engaged_by" => self.engaged_by,
+            "tell_received" => self.tell_received,
+            "level_up" => self.level_up,
+            "skill_level_up" => self.skill_level_up,
+            "ui_chat_open" => self.ui_chat_open,
+            "ui_chat_send" => self.ui_chat_send,
+            "ui_chat_cancel" => self.ui_chat_cancel,
+            "ui_menu_open" => self.ui_menu_open,
+            "ui_menu_move" => self.ui_menu_move,
+            "ui_menu_confirm" => self.ui_menu_confirm,
+            "ui_menu_cancel" => self.ui_menu_cancel,
+            "ui_command_ok" => self.ui_command_ok,
+            "ui_command_err" => self.ui_command_err,
+            _ => None,
         }
     }
 }
@@ -633,6 +751,8 @@ pub fn fire_system_sfx_events(
             ViewerEvent::LowHp { .. } => table.low_hp,
             ViewerEvent::EngagedBy { .. } => table.engaged_by,
             ViewerEvent::TellReceived { .. } => table.tell_received,
+            ViewerEvent::LevelUp { .. } => table.level_up,
+            ViewerEvent::SkillLevelUp { .. } => table.skill_level_up,
             _ => None,
         };
         if let Some(se_id) = id {
@@ -640,6 +760,94 @@ pub fn fire_system_sfx_events(
         }
     }
     cursor.pos = len;
+}
+
+/// Discriminant of [`crate::InputMode`] — just the kind, no payload.
+/// Used by [`observe_ui_mode_transitions`] to detect cross-kind
+/// transitions (World↔Chat etc.) without false-firing on internal
+/// payload updates (e.g. each keystroke that mutates `ChatBuffer`).
+#[derive(Default, PartialEq, Eq, Clone, Copy, Debug)]
+enum InputModeKind {
+    #[default]
+    World,
+    Chat,
+    Menu,
+    QuickAction,
+    Dialog,
+    PassiveCursor,
+}
+
+impl InputModeKind {
+    fn of(mode: &crate::InputMode) -> Self {
+        match mode {
+            crate::InputMode::World => Self::World,
+            crate::InputMode::Chat(_) => Self::Chat,
+            crate::InputMode::Menu(_) => Self::Menu,
+            crate::InputMode::QuickAction(_) => Self::QuickAction,
+            crate::InputMode::Dialog(_) => Self::Dialog,
+            crate::InputMode::PassiveCursor(_) => Self::PassiveCursor,
+        }
+    }
+}
+
+/// Compares the `InputMode` discriminant + menu-stack depth across
+/// frames and emits `SfxEvent`s on transitions. Menu stack depth is
+/// folded in so menu push/pop (Talk→Talk Submenu) plays the open/
+/// cancel blip too — pure kind comparison would miss it.
+///
+/// Per-keystroke internal mutations (typing into ChatBuffer, cursor
+/// moves inside a menu *level*) don't trigger this — that would be
+/// the wrong granularity. Cursor-move SFX (`ui_menu_move`) is left
+/// for an inline emit point in `text_input.rs` when we wire it; this
+/// system covers the larger mode lifecycle.
+pub fn observe_ui_mode_transitions(
+    mode: Res<crate::InputMode>,
+    table: Res<SystemSfxTable>,
+    mut writer: MessageWriter<SfxEvent>,
+    mut prev_kind: Local<InputModeKind>,
+    mut prev_menu_depth: Local<usize>,
+) {
+    let new_kind = InputModeKind::of(&mode);
+    let new_menu_depth = match &*mode {
+        crate::InputMode::Menu(stack) => stack.levels.len(),
+        _ => 0,
+    };
+
+    if new_kind != *prev_kind {
+        let id = match (*prev_kind, new_kind) {
+            // Enter chat input from world / passive cursor.
+            (_, InputModeKind::Chat) => table.ui_chat_open,
+            // Leave chat (Enter submit OR Esc cancel — we can't
+            // disambiguate from outside; both end on World). The
+            // `ui_chat_send` SFX is fired from the slash-command
+            // dispatcher itself (`SlashOutcome` path) where we
+            // *know* it was a submit; this branch only catches the
+            // Esc-cancel path.
+            (InputModeKind::Chat, _) => table.ui_chat_cancel,
+            // Enter menu / quick-action.
+            (_, InputModeKind::Menu) | (_, InputModeKind::QuickAction) => table.ui_menu_open,
+            // Leave menu / quick-action back to world.
+            (InputModeKind::Menu, _) | (InputModeKind::QuickAction, _) => {
+                table.ui_menu_cancel
+            }
+            _ => None,
+        };
+        if let Some(se_id) = id {
+            writer.write(SfxEvent::new(se_id));
+        }
+        *prev_kind = new_kind;
+    } else if new_kind == InputModeKind::Menu && new_menu_depth != *prev_menu_depth {
+        // Same kind, but menu stack depth changed → push or pop.
+        let id = if new_menu_depth > *prev_menu_depth {
+            table.ui_menu_confirm
+        } else {
+            table.ui_menu_cancel
+        };
+        if let Some(se_id) = id {
+            writer.write(SfxEvent::new(se_id));
+        }
+    }
+    *prev_menu_depth = new_menu_depth;
 }
 
 /// Plugin entry point. Registered from `lib.rs`.
@@ -667,6 +875,10 @@ impl Plugin for AudioPlugin {
                     derive_bgm_playback_state,
                     apply_bgm_system,
                     fire_system_sfx_events,
+                    // UI mode-change SFX observer. Runs before
+                    // `play_sfx_system` so any SfxEvent it writes is
+                    // consumed this frame rather than next.
+                    observe_ui_mode_transitions,
                     play_sfx_system,
                 )
                     .chain(),
