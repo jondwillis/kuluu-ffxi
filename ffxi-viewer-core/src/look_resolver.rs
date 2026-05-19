@@ -336,27 +336,43 @@ pub fn dispatch_look_driven_models(
             let slot_ids = [head, body, hands, legs, feet, main, sub, ranged];
             debug_assert_eq!(slot_ids.len(), EQUIP_SLOT_ORDER_LEN);
             let mut dispatched = 0;
-            // PCs now go through the GPU skinned path with per-slot
-            // fit-gating. The race skeleton id is sent alongside so
-            // each slot can attach to a shared bone tree and animate
-            // off the race's idle MO2.
+            // PCs stay on the CPU bake path (`skeleton_file_id: None`).
             //
-            // Slot fit is decided downstream in `process_load_vos2_requests`
-            // via `skeleton_fits_mesh`: slots whose bone_table indices
-            // fall within the race skeleton's bone count go GPU;
-            // slots that don't fall back to the CPU bake path so they
-            // still render (as a static bind-pose half-body) instead
-            // of vanishing to weight=0. Mirror copy is currently
-            // CPU-only — GPU slots render as left-half until per-vertex
-            // `mirror_axis` decoding lands.
-            let race_skel_id = crate::dat_vos2::skeleton_file_id_for_race(race);
+            // We attempted GPU skinning for PCs (commits 4ccdcd7,
+            // 2f37bfb) but the result regressed visibly: face-up/face-
+            // left orientation, missing legs/feet, half-body — while
+            // the launcher visualizer (which calls `spawn_vos2_meshes`
+            // directly, also CPU-bake) renders the same DAT correctly.
+            // Three runtime iterations on the orientation pivot
+            // (`Q_y(π/2)*Q_x(-π/2)`, then `Q_x(π)`) didn't converge.
+            //
+            // Three intertwined blockers remain unsolved:
+            //   1. Orientation: bone-chain output frame doesn't
+            //      cleanly map to either `bind_to_bevy` or `Q_x(π)`.
+            //      The CPU bake hides this by pre-rotating per-vertex
+            //      via `[p[0], p[2], -p[1]]` after the bake.
+            //   2. Mirror copy: VOS2 ships one symmetric half; CPU
+            //      mirrors by X-flipping post-bake world positions.
+            //      GPU equivalent needs per-vertex `mirror_axis`
+            //      decoding so the flipped vertex re-skins to the
+            //      OTHER-side bone, not the same bone in inverted
+            //      local space.
+            //   3. Bone-table mapping: slot DATs ship `bone_table`
+            //      entries that exceed the race skeleton's bone count
+            //      for some slots (legs/feet). Permissive fallback to
+            //      bone[0] still didn't surface the missing geometry —
+            //      suggests the slot itself isn't even loading.
+            //
+            // The GPU-path code in `dat_vos2::spawn_skinned_actor` is
+            // kept intact for the NPC path (which works) and for
+            // future PC re-enable once #1–#3 are addressed.
             if let Some(file_id) = face_file_id {
                 load_vos2_tx.write(LoadVos2Request {
                     file_id,
                     chunk_idx: 4,
                     entity_id: we.id,
                     race,
-                    skeleton_file_id: race_skel_id,
+                    skeleton_file_id: None,
                 });
                 dispatched += 1;
             }
@@ -369,7 +385,7 @@ pub fn dispatch_look_driven_models(
                     chunk_idx: 4,
                     entity_id: we.id,
                     race,
-                    skeleton_file_id: race_skel_id,
+                    skeleton_file_id: None,
                 });
                 dispatched += 1;
             }
