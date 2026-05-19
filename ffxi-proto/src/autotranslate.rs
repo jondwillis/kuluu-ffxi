@@ -73,8 +73,15 @@ pub fn decode(bytes: &[u8]) -> String {
 
 /// Resolve a single AT block to a display string. Returns the looked-up
 /// phrase, or `AT:type/cat/idx` for keys missing from the table.
-fn resolve(ty: u8, lang: u8, cat: u8, idx: u8) -> String {
-    let key = (ty as u32) | ((lang as u32) << 8) | ((cat as u32) << 16) | ((idx as u32) << 24);
+///
+/// The `lang` byte is intentionally dropped from the lookup: LSB's
+/// shipped table is keyed at `lang=2` for all 28k entries with zero
+/// cross-lang collisions, but in the wild clients send AT phrases with
+/// `lang=0` too (Japanese-locale clients chatting to English players,
+/// for instance). Per LSB's own header comment on `replaceBytes()`,
+/// "YY is a language code and can be safely ignored."
+fn resolve(ty: u8, _lang: u8, cat: u8, idx: u8) -> String {
+    let key = (ty as u32) | ((cat as u32) << 16) | ((idx as u32) << 24);
     if let Some(s) = table().get(&key) {
         return (*s).to_string();
     }
@@ -94,7 +101,10 @@ fn table() -> &'static HashMap<u32, &'static str> {
             let Some(key_str) = parts.next() else { continue };
             let Some(text) = parts.next() else { continue };
             let Ok(key) = key_str.parse::<u32>() else { continue };
-            map.insert(key, text);
+            // Drop the lang byte (bits 8..16) so wire-side lang variants
+            // all collide on the same slot. See `resolve` for why.
+            let stripped = key & 0xFFFF_00FF;
+            map.insert(stripped, text);
         }
         map
     })
@@ -139,9 +149,18 @@ mod tests {
     }
 
     #[test]
+    fn resolves_regardless_of_lang_byte() {
+        // Real wire sample observed in /shout: lang=0x00 instead of the
+        // table's native 0x02. Must still resolve.
+        let bytes = [0xFD, 0x02, 0x00, 0x0F, 0x02, 0xFD];
+        assert_eq!(decode(&bytes), "{Party}");
+    }
+
+    #[test]
     fn table_is_populated() {
-        // Smoke test: a few well-known keys from the dump.
-        assert_eq!(table().get(&66050), Some(&"Greetings"));
+        // Smoke test: query via the stripped (lang-less) key form that
+        // `resolve` uses. 66050 = 0x00010202 -> stripped 0x00010002.
+        assert_eq!(table().get(&0x0001_0002), Some(&"Greetings"));
         assert!(table().len() > 28_000);
     }
 }
