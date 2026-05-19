@@ -35,6 +35,7 @@ pub mod lock_on;
 pub mod look_resolver;
 pub mod mouse;
 pub mod nameplate;
+pub mod nameplate_billboard;
 pub mod picking;
 pub mod scene;
 pub mod snapshot;
@@ -147,6 +148,11 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             // launcher pre-connect (`ConnectInFlight`) and consumed
             // by `ensure_self_lookcomp_system`.
             .init_resource::<scene::SelfAppearance>()
+            // 3D-billboard nameplates need a shared ab_glyph font for
+            // text rasterization. Initialized lazily from the embedded
+            // Bevy default font (FiraMono-subset) — see
+            // `nameplate_billboard::BillboardFont::from_world`.
+            .init_resource::<nameplate_billboard::BillboardFont>()
             // PickingPlugin owns the mesh raycast backend + the click→target
             // reader. `DefaultPickingPlugins` (input/hover/interaction) is
             // already added by `DefaultPlugins` on both front-ends.
@@ -184,6 +190,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                     firstperson_camera_system,
                     sync_aggro_system,
                     nameplate::update_nameplates_system,
+                    nameplate_billboard::update_nameplate_billboards_system,
                     target_ring::draw_target_ring_system,
                     target_ring::draw_engaged_ring_system,
                     sync_zone_lines_system,

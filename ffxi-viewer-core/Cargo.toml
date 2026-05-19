@@ -22,6 +22,13 @@ bevy = { workspace = true, features = ["serialize"] }
 ffxi-viewer-wire = { path = "../ffxi-viewer-wire" }
 ffxi-dat = { path = "../ffxi-dat" }
 serde = { workspace = true }
+# Glyph rasterizer for the 3D nameplate billboards. Bevy's text path is
+# locked to the 2D pipeline (UI / Text2d), which doesn't depth-test
+# against 3D meshes — so for true world-space occluded labels we
+# rasterize text → Image ourselves and stamp it onto a 3D quad. ab_glyph
+# is already a transitive dep (bevy_text pulls it in); declaring it
+# directly keeps that path stable across future Bevy version bumps.
+ab_glyph = "0.2"
 
 # Native-only: ADPCM/PCM decoders for `.bgw` / `.spw`. The audio plugin
 # (see `audio.rs`) reads BGM tracks from the local install in response

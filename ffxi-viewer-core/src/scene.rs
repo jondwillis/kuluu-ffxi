@@ -308,6 +308,9 @@ pub fn sync_entities_system(
     hp_bar_mesh: Res<HpBarMesh>,
     mats: Res<EntityMaterials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    billboard_font: Res<crate::nameplate_billboard::BillboardFont>,
     mut tracked: ResMut<TrackedEntities>,
     mut commands: Commands,
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
@@ -468,8 +471,12 @@ pub fn sync_entities_system(
         });
         if let Some(name) = name.filter(|s| !s.is_empty()) {
             if !nameplated.contains(&wire.id) {
-                crate::nameplate::spawn_nameplate(
+                crate::nameplate_billboard::spawn_nameplate_billboard(
                     &mut commands,
+                    &mut meshes,
+                    &mut materials,
+                    &mut images,
+                    &billboard_font.0,
                     wire.id,
                     wire.kind,
                     name,
