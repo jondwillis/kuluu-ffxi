@@ -694,6 +694,36 @@ fn apply_slash_outcome(
             push_system_chat_line(scene_state, format!("/sfx {se_id}: fired"));
         }
         SlashOutcome::EndCutscene { event_num } => {
+            // Resolve CSID: operator-explicit > live DialogState >
+            // start-zone fallback. The DialogState branch is the load-
+            // bearing fix for the EventPara=0 mismatch class — when the
+            // server is holding an event the client *did* see (so the
+            // CSID is in `snapshot.dialog.event_para`), the old
+            // zone-table guess could send the wrong number and the
+            // wedge stuck. See server-log line for 5/11:
+            // `Invalid GP_CLI_COMMAND_EVENTEND ... Event ID mismatch
+            // 11002 != 0`. Start-zone fallback only kicks in for
+            // event-blind callers who happen to be in a starting
+            // nation but never saw the EVENTSTART (e.g. the client
+            // attached mid-cutscene).
+            let resolved_csid = event_num
+                .or_else(|| scene_state.snapshot.dialog.as_ref().map(|d| d.event_para))
+                .or_else(|| {
+                    scene_state
+                        .snapshot
+                        .zone_id
+                        .and_then(crate::view_native::slash_commands::start_zone_cutscene)
+                });
+            let Some(csid) = resolved_csid else {
+                push_system_chat_line(
+                    scene_state,
+                    "/endcutscene: no active event and current zone isn't a \
+                     starting nation; pass an explicit CSID \
+                     (`/endcutscene <csid>`) or use `/release`"
+                        .into(),
+                );
+                return;
+            };
             // Resolve player's own UniqueNo + ActIndex. For a forced
             // cutscene fired by `player:startEvent(csid, ...)` the server
             // built the EVENTSTART with the player as the initiator, so
@@ -715,14 +745,14 @@ fn apply_slash_outcome(
                     push_system_chat_line(
                         scene_state,
                         format!(
-                            "/endcutscene: sending EVENT_END (csid={event_num}, \
+                            "/endcutscene: sending EVENT_END (csid={csid}, \
                              unique_no=0x{event_id:08X}, act_index={act_index})"
                         ),
                     );
                     if let Err(e) = cmd_tx.try_send(AgentCommand::EndEventChoice {
                         event_id,
                         act_index,
-                        event_num,
+                        event_num: csid,
                         choice: 0,
                     }) {
                         push_system_chat_line(

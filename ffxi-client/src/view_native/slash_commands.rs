@@ -238,6 +238,11 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 summary: "end a forced cutscene (new-char intro, etc.)",
             },
             HelpEntry {
+                aliases: &["release", "unwedge"],
+                usage: "",
+                summary: "server-side !release: forcibly end any pinned event (gmlevel>=1)",
+            },
+            HelpEntry {
                 aliases: &["buy"],
                 usage: "<row> [qty]",
                 summary: "buy from open shop by row index",
@@ -517,11 +522,14 @@ pub enum SlashOutcome {
     /// `player:startEvent` builds the EVENTSTART with those as the
     /// initiator.
     ///
-    /// `event_num` is the cutscene id (CSID). Without an explicit arg
-    /// the parser looks it up from `zone_id` via [`START_ZONE_CUTSCENE`];
-    /// callers in zones not in the table must pass an explicit id.
+    /// `event_num` is the cutscene id (CSID). `Some(n)` is an
+    /// operator-supplied explicit CSID; `None` tells the dispatcher to
+    /// resolve from session state (preferring the live `DialogState`,
+    /// falling back to [`start_zone_cutscene`] for the start-nation
+    /// forced cinematics). Punting CSID resolution to the dispatcher
+    /// means the parser doesn't need access to `SceneState`.
     EndCutscene {
-        event_num: u16,
+        event_num: Option<u16>,
     },
     /// `/copy [n]` — copy the last `n` `[system]` chat toasts (i.e.
     /// responses to slash commands) to the OS clipboard, newline-joined.
@@ -737,9 +745,20 @@ pub fn parse_slash(
         // openings, `onZoneIn` cinematics). Without an arg the parser
         // tries to look up the CSID from the current zone; with one it
         // trusts the operator's value.
-        "endcutscene" | "endcs" | "skipcutscene" | "skipcs" => {
-            parse_endcutscene(rest, zone_id)
-        }
+        "endcutscene" | "endcs" | "skipcutscene" | "skipcs" => parse_endcutscene(rest),
+        // `/release` (alias `/unwedge`) — emit the LSB GM command
+        // `!release` as chat. Server-side `release.lua` calls
+        // `player:release()` which runs `endCurrentEvent()` and clears
+        // `currentEvent`, unblocking `BlockedState::InEvent`. Requires
+        // `gmlevel >= 1`. Use as the heavy hammer when `/endcutscene`
+        // can't resolve the right CSID (e.g. in-session events the
+        // client never saw because of a packet drop). The server
+        // intercepts `!`-prefixed chat *before* it routes to Say, so
+        // this doesn't leak the command into the chat channel.
+        "release" | "unwedge" => SlashOutcome::Command(AgentCommand::Chat {
+            kind: 0,
+            text: "!release".into(),
+        }),
         "bank" => parse_bank(rest),
         "zonechange" | "rzc" => parse_zone_change(rest),
         "mhexit" => parse_mhexit(rest, zone_id),
@@ -1343,45 +1362,32 @@ fn parse_agent(rest: &str) -> SlashOutcome {
 /// `/endcutscene [csid]` — resolve the CSID and produce a
 /// `SlashOutcome::EndCutscene`. The dispatcher in `text_input.rs` fills
 /// in the player's own `unique_no`/`act_index` since those aren't in
-/// the parser's args.
+/// the parser's args, and resolves a `None` `event_num` against the
+/// live `DialogState` / start-zone fallback before sending.
 ///
-/// - With no arg: look up the CSID from `zone_id` via
-///   [`START_ZONE_CUTSCENE`]. Returns a system message if the current
-///   zone isn't in the table (i.e. not a starting zone — the operator
-///   should pass an explicit CSID for any other forced event).
+/// - With no arg: emits `event_num = None`. The dispatcher prefers the
+///   live `DialogState.event_para` (the CSID the server is currently
+///   pinning) and falls back to [`start_zone_cutscene`] for the
+///   forced new-character cinematics. This avoids the EventPara=0
+///   mismatch class the parser used to produce when the zone-table
+///   guess didn't match the actual pinned event (e.g. CSID 11002
+///   Synergy Engineer on top of a start zone).
 /// - With an arg: parse it as `u16` and trust the operator. Useful for
 ///   the Bastok Markets chain (CSID 0 → 7; default clears 0, then
 ///   `/endcutscene 7` clears the second one).
-fn parse_endcutscene(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
+fn parse_endcutscene(rest: &str) -> SlashOutcome {
     let trimmed = rest.trim();
-    let event_num = if trimmed.is_empty() {
-        let Some(z) = zone_id else {
-            return SlashOutcome::SystemMessage(
-                "/endcutscene: no current zone; pass an explicit CSID \
-                 (`/endcutscene <csid>`)"
-                    .into(),
-            );
-        };
-        match start_zone_cutscene(z) {
-            Some(csid) => csid,
-            None => {
-                return SlashOutcome::SystemMessage(format!(
-                    "/endcutscene: zone {z} isn't a starting nation; pass \
-                     an explicit CSID (`/endcutscene <csid>`)"
-                ));
-            }
-        }
-    } else {
-        match trimmed.parse::<u16>() {
-            Ok(n) => n,
-            Err(_) => {
-                return SlashOutcome::SystemMessage(format!(
-                    "/endcutscene: bad CSID `{trimmed}` (expected u16)"
-                ));
-            }
-        }
-    };
-    SlashOutcome::EndCutscene { event_num }
+    if trimmed.is_empty() {
+        return SlashOutcome::EndCutscene { event_num: None };
+    }
+    match trimmed.parse::<u16>() {
+        Ok(n) => SlashOutcome::EndCutscene {
+            event_num: Some(n),
+        },
+        Err(_) => SlashOutcome::SystemMessage(format!(
+            "/endcutscene: bad CSID `{trimmed}` (expected u16)"
+        )),
+    }
 }
 
 fn parse_zone_change(rest: &str) -> SlashOutcome {
@@ -3119,11 +3125,11 @@ mod tests {
         }
     }
 
-    /// `/endcutscene` with no arg resolves the CSID from the current
-    /// zone. Northern San d'Oria (zone 231) is the canonical test case
-    /// from `New_Character_Cutscenes.lua` (CSID 535).
+    /// `/endcutscene` with no arg emits `event_num = None`. The
+    /// dispatcher resolves it against the live `DialogState` /
+    /// start-zone fallback at send time, not at parse time.
     #[test]
-    fn endcutscene_resolves_zone_to_csid() {
+    fn endcutscene_no_arg_returns_none() {
         match parse_slash(
             "/endcutscene",
             &empty_entities(),
@@ -3131,8 +3137,8 @@ mod tests {
             None,
             Some(231),
         ) {
-            SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, 535),
-            other => panic!("expected EndCutscene{{ 535 }}, got {other:?}"),
+            SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, None),
+            other => panic!("expected EndCutscene{{ None }}, got {other:?}"),
         }
     }
 
@@ -3148,29 +3154,8 @@ mod tests {
             None,
             Some(235), // Bastok Markets — zone lookup would return 0
         ) {
-            SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, 7),
-            other => panic!("expected EndCutscene{{ 7 }}, got {other:?}"),
-        }
-    }
-
-    /// Non-starting-zone with no explicit CSID is an error: no
-    /// guesswork, no silent dispatch.
-    #[test]
-    fn endcutscene_unknown_zone_no_arg_errors() {
-        match parse_slash(
-            "/endcutscene",
-            &empty_entities(),
-            origin(),
-            None,
-            Some(0xABCD), // not in the table
-        ) {
-            SlashOutcome::SystemMessage(msg) => {
-                assert!(
-                    msg.contains("starting nation") || msg.contains("CSID"),
-                    "unexpected message: {msg}"
-                );
-            }
-            other => panic!("expected SystemMessage, got {other:?}"),
+            SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, Some(7)),
+            other => panic!("expected EndCutscene{{ Some(7) }}, got {other:?}"),
         }
     }
 
@@ -3189,6 +3174,22 @@ mod tests {
         }
     }
 
+    /// `/release` and `/unwedge` both emit a chat-routed `!release` so
+    /// LSB's `release.lua` runs `player:release()` →
+    /// `endCurrentEvent()`. Pins the wire shape and the alias list.
+    #[test]
+    fn release_aliases_emit_bang_release_chat() {
+        for input in ["/release", "/unwedge"] {
+            match parse_slash(input, &empty_entities(), origin(), None, None) {
+                SlashOutcome::Command(AgentCommand::Chat { kind, text }) => {
+                    assert_eq!(kind, 0, "input {input:?}: expected Say (kind=0)");
+                    assert_eq!(text, "!release", "input {input:?}: unexpected text");
+                }
+                other => panic!("input {input:?}: expected Chat(!release), got {other:?}"),
+            }
+        }
+    }
+
     /// Alias coverage: every documented spelling produces the same outcome.
     #[test]
     fn endcutscene_aliases_all_work() {
@@ -3199,7 +3200,7 @@ mod tests {
             "/skipcs",
         ] {
             match parse_slash(input, &empty_entities(), origin(), None, Some(231)) {
-                SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, 535),
+                SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, None),
                 other => panic!("input {input:?}: expected EndCutscene, got {other:?}"),
             }
         }
