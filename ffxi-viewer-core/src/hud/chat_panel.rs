@@ -167,6 +167,24 @@ pub struct ChatRow {
 #[derive(Component)]
 pub struct ChatRowBody;
 
+/// Marker on each `TextSpan` child of [`ChatRowBody`]. The pool of these
+/// gives us inline-mixed-color rendering (FFXI auto-translate phrases
+/// painted in sky-blue against the channel-color background text).
+#[derive(Component)]
+pub struct ChatRowSpan;
+
+/// Pre-allocated span slots per row. Sized for the worst real-world
+/// shout we've observed (Hishiamazon: 7 auto-translate blocks → 15
+/// alternating text/AT segments). One extra for safety.
+const SPANS_PER_ROW: usize = 16;
+
+/// Classic FFXI sky-blue used by SE's client for auto-translate phrases.
+/// Brighter than any of the social-channel colors so AT blocks always
+/// pop visually against their containing line, regardless of the
+/// channel's base color.
+const AUTOTRANSLATE_COLOR: Color = Color::srgb(0.50, 0.78, 1.00);
+
+
 pub fn spawn_chat_panel(mut commands: Commands) {
     // Three panes across the bottom. Widths: 34% / 33% / 33% (Social
     // gets the slightly wider slot because the operator types into it).
@@ -277,7 +295,27 @@ fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, width: Val) {
                             ..default()
                         },
                         TextColor(palette::TEXT),
-                    ));
+                    ))
+                    .with_children(|body| {
+                        // Pre-spawn a fixed pool of `TextSpan` children
+                        // for inline-colored runs (e.g. auto-translate
+                        // phrases). The parent `Text` stays empty; each
+                        // span carries one (text, color) segment. Pool
+                        // size is overhead-cheap and avoids per-frame
+                        // spawn/despawn churn — `update_chat_panel`
+                        // refills the spans in place via change-detect.
+                        for _ in 0..SPANS_PER_ROW {
+                            body.spawn((
+                                ChatRowSpan,
+                                TextSpan::new(""),
+                                TextFont {
+                                    font_size: 13.0,
+                                    ..default()
+                                },
+                                TextColor(palette::TEXT),
+                            ));
+                        }
+                    });
                 });
             }
         });
@@ -299,7 +337,8 @@ pub fn update_chat_panel(
         &Children,
     )>,
     rows: Query<(&ChatRow, &Children), Without<ChatPanel>>,
-    mut body_q: Query<(&mut Text, &mut TextColor), With<ChatRowBody>>,
+    body_q: Query<&Children, With<ChatRowBody>>,
+    mut span_q: Query<(&mut TextSpan, &mut TextColor), With<ChatRowSpan>>,
 ) {
     let now = time.elapsed_secs();
     // Intentionally NOT gated on `state.dirty` — the dirty flag is reset
@@ -397,24 +436,40 @@ pub fn update_chat_panel(
                 continue;
             };
             let line = visible.get(row.slot).copied().flatten();
+            // The row has one ChatRowBody child; that body has a pool of
+            // SPANS_PER_ROW TextSpan children. Walk panel → row → body →
+            // spans, filling segments in order.
             for body_child in row_children.iter() {
-                if let Ok((mut text, mut tc)) = body_q.get_mut(body_child) {
-                    match line {
-                        Some(l) => {
-                            let want = format_chat_line(l.channel, &l.sender, &l.text);
-                            if **text != want {
-                                **text = want;
-                            }
-                            let want_color = channel_color(l.channel);
-                            if tc.0 != want_color {
-                                tc.0 = want_color;
-                            }
-                        }
-                        None => {
-                            if !text.is_empty() {
-                                **text = String::new();
-                            }
-                        }
+                let Ok(span_children) = body_q.get(body_child) else {
+                    continue;
+                };
+                // Build the segment list once for this row (or an empty
+                // marker for the no-line case), then fill spans in order
+                // and clear the tail.
+                let segments: Vec<(String, Color)> = match line {
+                    Some(l) => {
+                        let base = channel_color(l.channel);
+                        let formatted =
+                            format_chat_line(l.channel, &l.sender, &l.text);
+                        segment_chat_line(&formatted, base)
+                    }
+                    None => Vec::new(),
+                };
+                for (i, span_child) in span_children.iter().enumerate() {
+                    let Ok((mut span_text, mut span_color)) =
+                        span_q.get_mut(span_child)
+                    else {
+                        continue;
+                    };
+                    let (want_text, want_color): (&str, Color) = segments
+                        .get(i)
+                        .map(|(t, c)| (t.as_str(), *c))
+                        .unwrap_or(("", palette::TEXT));
+                    if span_text.as_str() != want_text {
+                        **span_text = want_text.to_string();
+                    }
+                    if span_color.0 != want_color {
+                        span_color.0 = want_color;
                     }
                 }
             }
@@ -453,6 +508,58 @@ pub fn format_chat_line(channel: ChatChannel, sender: &str, text: &str) -> Strin
         // if they ever bleed across panels (e.g., in a postcard log).
         ChatChannel::Debug => format!("[dbg] {text}"),
     }
+}
+
+/// Segment a fully-formatted chat line into colored runs for inline
+/// rendering. Splits at every `{...}` block, painting the contents in
+/// [`AUTOTRANSLATE_COLOR`] and the surrounding braces in
+/// [`AUTOTRANSLATE_BRACE_COLOR`]; everything else picks up `base`. The
+/// result is always non-empty (an empty input yields a single empty
+/// segment) — callers can rely on indexing into it.
+///
+/// This is intentionally lossy with respect to escaped braces: a literal
+/// `{` in chat text is exceedingly rare on the wire (FFXI's input UI
+/// doesn't even let you type one), and the upstream auto-translate
+/// decoder is the only producer of brace pairs. If someone genuinely
+/// types `{`, it falls into the AT-styled bucket — acceptable.
+pub fn segment_chat_line(line: &str, base: Color) -> Vec<(String, Color)> {
+    let mut out: Vec<(String, Color)> = Vec::new();
+    let mut buf = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            // Flush the base-color run before this AT block.
+            if !buf.is_empty() {
+                out.push((std::mem::take(&mut buf), base));
+            }
+            // Collect `{...}` inclusive of braces into one span.
+            let mut at = String::from('{');
+            let mut closed = false;
+            for ic in chars.by_ref() {
+                at.push(ic);
+                if ic == '}' {
+                    closed = true;
+                    break;
+                }
+            }
+            if closed {
+                out.push((at, AUTOTRANSLATE_COLOR));
+            } else {
+                // Unterminated — emit defensively as AT so the bug is
+                // visible upstream instead of silently lost.
+                out.push((at, AUTOTRANSLATE_COLOR));
+            }
+        } else {
+            buf.push(c);
+        }
+    }
+    if !buf.is_empty() {
+        out.push((buf, base));
+    }
+    if out.is_empty() {
+        out.push((String::new(), base));
+    }
+    out
 }
 
 /// Per-channel line color — the whole row picks this up.
@@ -586,6 +693,75 @@ pub fn chat_wheel_scroll_system(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_plain_text_is_single_base_span() {
+        let segs = segment_chat_line("hello world", palette::TEXT);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].0, "hello world");
+        assert_eq!(segs[0].1, palette::TEXT);
+    }
+
+    #[test]
+    fn segment_splits_braces_and_colors_them() {
+        let segs = segment_chat_line(
+            "[Skaine] : {Looking for Party} {Experience points} : THF 59",
+            palette::TEXT,
+        );
+        let texts: Vec<&str> = segs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "[Skaine] : ",
+                "{Looking for Party}",
+                " ",
+                "{Experience points}",
+                " : THF 59",
+            ]
+        );
+        // AT spans (1 and 3) pick up the sky-blue; surrounding text stays base.
+        assert_eq!(segs[1].1, AUTOTRANSLATE_COLOR);
+        assert_eq!(segs[3].1, AUTOTRANSLATE_COLOR);
+        assert_eq!(segs[0].1, palette::TEXT);
+        assert_eq!(segs[2].1, palette::TEXT);
+        assert_eq!(segs[4].1, palette::TEXT);
+    }
+
+    #[test]
+    fn segment_empty_input_yields_single_empty_segment() {
+        // Render path indexes into segments[..]; an empty result would
+        // skip clearing trailing spans. Guarantee non-empty.
+        let segs = segment_chat_line("", palette::TEXT);
+        assert_eq!(segs.len(), 1);
+        assert!(segs[0].0.is_empty());
+    }
+
+    #[test]
+    fn segment_unclosed_brace_does_not_lose_tail() {
+        // Pathological input — the autotranslate decoder shouldn't ever
+        // emit this, but be defensive: the tail must still surface so a
+        // bug upstream is visible to the operator instead of silently
+        // eaten.
+        let segs = segment_chat_line("foo {open and never close", palette::TEXT);
+        let joined: String = segs.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(joined.contains("open and never close"));
+        assert!(joined.contains('{'));
+    }
+
+    #[test]
+    fn segment_count_stays_under_pool_for_worst_case_shout() {
+        // Hishiamazon's screenshot — 7 AT blocks interleaved with text.
+        // Each block contributes 3 spans (open brace, phrase, close
+        // brace). Plus the gaps. The pool must comfortably absorb this.
+        let line = "{a}{b}{c}{d}{e}{f}{g}";
+        let segs = segment_chat_line(line, palette::TEXT);
+        assert!(
+            segs.len() <= SPANS_PER_ROW,
+            "{} segments overflows pool of {}",
+            segs.len(),
+            SPANS_PER_ROW
+        );
+    }
 
     #[test]
     fn say_format_is_name_colon_text() {
