@@ -1138,6 +1138,14 @@ fn handle_sub_packet(
 /// session.
 const NAME_MISS_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Grace period for the `pending_event_end` watchdog under
+/// `user_driven_events = true`. After this much wall time with the
+/// queue non-empty (i.e. the operator hasn't issued `/endcutscene` or
+/// `/release`), the keepalive auto-flushes the queue. 10s is long
+/// enough to read most dialog HUD strings, short enough that an
+/// unattended session doesn't sit in `BlockedState::InEvent` long.
+const PENDING_EVENT_END_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Cap on hex bytes captured per miss. CHAR_PC slot starts at 0x5A and
 /// CHAR_NPC at 0x30; 96 bytes covers both with room for the trailing
 /// 16-byte name slot.
@@ -1242,6 +1250,16 @@ async fn keepalive_loop(
     // server-side event flag would otherwise be invisible. We surface it
     // as a chat-banner warning after 3s of no zone change.
     let mut pending_maprect: Option<(std::time::Instant, u32)> = None;
+    // Watchdog for `pending_event_end` under `user_driven_events=true`
+    // (native viewer). The dialog HUD wants events to stay alive long
+    // enough to read; the operator dismisses with `/endcutscene` /
+    // `/release`. But if neither fires within the grace period, the
+    // server stays in `BlockedState::InEvent` and `/logout` + zone-change
+    // get silently rejected (see `0x0e7_reqlogout.cpp::validate` and
+    // `0x05e_maprect.cpp::validate`). The watchdog auto-drains the queue
+    // so unattended sessions don't get permanently wedged. `None` while
+    // the queue is empty; `Some(t)` from the first non-empty tick.
+    let mut pending_event_end_since: Option<std::time::Instant> = None;
     // `/heal` mirror. Sources of truth:
     // 1. Optimistic write on outbound `AgentCommand::Heal`.
     // 2. Authoritative sync from CHAR_PC for self when UPDATE_HP gate set —
@@ -1722,12 +1740,32 @@ async fn keepalive_loop(
                         pending_maprect = None;
                     }
                 }
+                // Sync the watchdog timer from the queue's current
+                // shape. Empty queue → no pending timer; non-empty
+                // queue with no timer → start the clock now. 1Hz sync
+                // adds at most one second of error to the grace
+                // window, which is fine.
+                match (pending_event_end.is_empty(), pending_event_end_since.is_some()) {
+                    (false, false) => {
+                        pending_event_end_since = Some(std::time::Instant::now());
+                    }
+                    (true, true) => {
+                        pending_event_end_since = None;
+                    }
+                    _ => {}
+                }
+                let watchdog_fires = pending_event_end_since
+                    .map(|t| t.elapsed() > PENDING_EVENT_END_GRACE)
+                    .unwrap_or(false);
                 // Build a bundle: any auto-event-ends drained, then a POS keepalive.
                 // `user_driven_events` suppresses the auto-drain so the dialog HUD
                 // gets a chance to display the event; the operator (or HUD-side
-                // input handler) sends `EndEvent` explicitly to advance.
+                // input handler) sends `EndEvent` explicitly to advance — unless
+                // the watchdog grace expires, in which case we drain anyway so
+                // the server's `BlockedState::InEvent` doesn't permanently wedge
+                // /logout + zone-change.
                 let mut payload = Vec::new();
-                if !user_driven_events {
+                if (!user_driven_events || watchdog_fires) && !pending_event_end.is_empty() {
                     for (unique_no, act_index, event_num) in pending_event_end.drain(..) {
                         payload.extend(build_subpacket_event_end(
                             sub_seq, unique_no, act_index, event_num, 0,
@@ -1735,6 +1773,20 @@ async fn keepalive_loop(
                         sub_seq = sub_seq.wrapping_add(1);
                         let _ = event_tx.send(AgentEvent::EventEnded);
                     }
+                    if watchdog_fires {
+                        tracing::warn!(
+                            grace_secs = PENDING_EVENT_END_GRACE.as_secs(),
+                            "auto-flushed pending EVENT_END (watchdog grace expired)"
+                        );
+                        let _ = event_tx.send(AgentEvent::Error {
+                            message: format!(
+                                "auto-released pinned event after {}s grace \
+                                 (operator didn't /endcutscene or /release)",
+                                PENDING_EVENT_END_GRACE.as_secs()
+                            ),
+                        });
+                    }
+                    pending_event_end_since = None;
                 }
                 // Heal-cancel interceptor: if we're healing and this tick
                 // would advertise a new position, prepend 0x0E8 Mode::Off
