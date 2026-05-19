@@ -33,7 +33,7 @@ pub mod weather;
 pub mod zone_dat;
 
 pub use archive::{DatLocation, DatRoot};
-pub use chunk::{walk, Chunk, ChunkWalker};
+pub use chunk::{walk, walk_tree, Chunk, ChunkNode, ChunkWalker};
 pub use kind::ChunkKind;
 pub use npc_names::{split_id, NpcNameTable, NPC_LIST_FILE_ID_BASE};
 
