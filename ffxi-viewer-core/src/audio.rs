@@ -921,6 +921,279 @@ pub fn observe_ui_mode_transitions(
     *prev_menu_depth = new_menu_depth;
 }
 
+// ---------------------------------------------------------------------------
+//  Weather SFX
+//
+//  Two layers, both driven by `SceneState.snapshot.weather` changes:
+//
+//    1. **Stinger** — one-shot SfxEvent on transition (rain-start
+//       splat, thunder clap, sand-storm whoosh). Same path as system
+//       SFX; just resolves through `WeatherSfxTable`.
+//
+//    2. **Ambient** — a dedicated looping AudioPlayer entity carrying
+//       the sustained weather sound (rain hiss, wind howl). On
+//       weather change, the previous ambient fades out over
+//       `WEATHER_FADE_SECS` while the new ambient fades in from 0 to
+//       full volume in parallel, then the old sink despawns.
+//
+//  None of the per-weather SE ids are populated by default. The
+//  `from_lsb` `Weather` enum has 20 variants (None..Darkness) and
+//  retail's UI/system SE assignments aren't in any vendored table —
+//  populating safe defaults would just mean playing arbitrary SEs.
+//  Operators set the ids by mutating `WeatherSfxTable` at runtime
+//  (or wire a `/weather_bind` slash command in a follow-up).
+// ---------------------------------------------------------------------------
+
+/// Per-weather SE id pair. `stinger` plays once on transition,
+/// `ambient` is the sustained loop swapped in (then crossfaded
+/// against the previous weather's ambient). Either may be `None`
+/// — e.g. clear weather (None/Sunshine/Clouds) typically has no
+/// associated SE on either side.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WeatherSfxEntry {
+    pub stinger: Option<u32>,
+    pub ambient: Option<u32>,
+}
+
+/// Crossfade duration applied to both the outgoing and incoming
+/// ambient sinks. 1.0s matches retail's perceived weather-change
+/// transition pacing; tunable here for taste.
+pub const WEATHER_FADE_SECS: f32 = 1.0;
+
+/// Mapping from LSB `Weather` variants to SE ids. Default = every
+/// entry is `(None, None)` (silent) — operators set ids after
+/// listening through `/sfx <id>`. Indexed by `Weather as usize`.
+#[derive(Resource, Debug, Clone)]
+pub struct WeatherSfxTable {
+    pub entries: [WeatherSfxEntry; 20],
+}
+
+impl Default for WeatherSfxTable {
+    fn default() -> Self {
+        // All `None` — see module docs for why we don't ship guessed
+        // ids for weather. Bind via mutating this resource at
+        // runtime (or a future /weather_bind slash command).
+        Self {
+            entries: [WeatherSfxEntry::default(); 20],
+        }
+    }
+}
+
+impl WeatherSfxTable {
+    pub fn get(&self, weather: ffxi_viewer_wire::Weather) -> WeatherSfxEntry {
+        self.entries[weather as usize]
+    }
+
+    /// Mutator used by future runtime-bind slash commands. Returns
+    /// the previous entry so the caller can log "before → after".
+    pub fn set(
+        &mut self,
+        weather: ffxi_viewer_wire::Weather,
+        entry: WeatherSfxEntry,
+    ) -> WeatherSfxEntry {
+        let prev = self.entries[weather as usize];
+        self.entries[weather as usize] = entry;
+        prev
+    }
+}
+
+/// Active ambient-loop sink (if any) and the weather it's voicing.
+/// `prev_weather` tracks the last observed `SceneState.weather` so
+/// the observer system can detect change-of-state on a single
+/// `Local`-style cursor.
+#[derive(Resource, Debug, Default)]
+pub struct WeatherAmbient {
+    pub active_entity: Option<Entity>,
+    pub active_weather: Option<ffxi_viewer_wire::Weather>,
+    pub prev_weather: Option<ffxi_viewer_wire::Weather>,
+}
+
+/// Component attached to an AudioPlayer entity to drive a linear
+/// volume tween over `duration` seconds. `t` advances each frame;
+/// when `t >= duration` the system writes the final volume and
+/// removes the component (or despawns the entity if `despawn_on_end`).
+#[derive(Component, Debug, Clone, Copy)]
+pub struct WeatherFade {
+    pub from: f32,
+    pub to: f32,
+    pub t: f32,
+    pub duration: f32,
+    pub despawn_on_end: bool,
+}
+
+impl WeatherFade {
+    fn fade_in(duration: f32) -> Self {
+        Self { from: 0.0, to: 1.0, t: 0.0, duration, despawn_on_end: false }
+    }
+    fn fade_out(duration: f32) -> Self {
+        Self { from: 1.0, to: 0.0, t: 0.0, duration, despawn_on_end: true }
+    }
+}
+
+/// Observe `SceneState.snapshot.weather` each frame; on change, fire
+/// the stinger (if mapped) and swap the ambient sink with a
+/// crossfade. The state-flag derivation system runs every frame too,
+/// so reading `SceneState` here is consistent with the rest of the
+/// audio module.
+pub fn observe_weather_changes(
+    scene: Res<crate::snapshot::SceneState>,
+    table: Res<WeatherSfxTable>,
+    slots: Res<BgmSlots>,
+    mut cache: ResMut<SfxCache>,
+    mut pcm_assets: ResMut<Assets<PcmAudio>>,
+    mut ambient: ResMut<WeatherAmbient>,
+    mut sfx_writer: MessageWriter<SfxEvent>,
+    fade_q: Query<Entity, With<WeatherFade>>,
+    mut commands: Commands,
+) {
+    let current = scene.snapshot.weather;
+    if current == ambient.prev_weather {
+        return;
+    }
+    let prev = ambient.prev_weather;
+    ambient.prev_weather = current;
+
+    let Some(weather) = current else {
+        // We've moved into "no weather state" (zone wipe). Fade out
+        // anything still playing.
+        if let Some(e) = ambient.active_entity.take() {
+            if let Ok(mut ent) = commands.get_entity(e) {
+                ent.insert(WeatherFade::fade_out(WEATHER_FADE_SECS));
+            }
+            ambient.active_weather = None;
+        }
+        return;
+    };
+
+    let entry = table.get(weather);
+
+    // Stinger — fire-and-forget through the same SfxEvent path as
+    // system SFX, so cache + decode is shared.
+    if let Some(se_id) = entry.stinger {
+        sfx_writer.write(SfxEvent::new(se_id));
+    }
+
+    // Ambient — only act if the *ambient* changed (some weather
+    // transitions like Rain↔Squall share an ambient — we don't want
+    // to restart the loop). Compare the new ambient id against the
+    // currently-active weather's ambient id; if they match, keep
+    // the existing sink.
+    let new_ambient_id = entry.ambient;
+    let prev_ambient_id = prev
+        .map(|w| table.get(w).ambient)
+        .unwrap_or(None);
+
+    if new_ambient_id == prev_ambient_id && ambient.active_entity.is_some() {
+        ambient.active_weather = Some(weather);
+        return;
+    }
+
+    // Mark any in-flight fades for despawn so the channel doesn't
+    // accumulate sinks if weather flips quickly.
+    if let Some(e) = ambient.active_entity.take() {
+        if let Ok(mut ent) = commands.get_entity(e) {
+            ent.insert(WeatherFade::fade_out(WEATHER_FADE_SECS));
+        }
+    }
+    // Also catch orphaned faders if scene cleared without us
+    // observing it (defensive — shouldn't happen, but cheap).
+    for e in fade_q.iter() {
+        if Some(e) != ambient.active_entity {
+            // Already fading — let them finish.
+        }
+    }
+
+    ambient.active_weather = Some(weather);
+
+    let Some(se_id) = new_ambient_id else {
+        return; // weather has no ambient layer
+    };
+    let Some(install) = slots.install_root.clone() else {
+        return; // no install path; play_sfx warns about this already
+    };
+
+    // Reuse the SfxCache for ambient decode too — the same .spw can
+    // serve both as a one-shot and a looped layer; differentiation
+    // is per-spawn via `with_loop(Some(0))`.
+    let handle = if let Some(h) = cache.cached.get(&se_id) {
+        h.clone()
+    } else {
+        let Some(path) = find_audio(&install, AudioKind::Sfx, se_id) else {
+            warn!(
+                "audio: weather ambient {se_id} not found under {}",
+                install.display()
+            );
+            return;
+        };
+        let decoded = match decode_file(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("audio: weather ambient {se_id} decode failed: {e}");
+                return;
+            }
+        };
+        // Cache the bare decoded asset (no loop) — the spawn site
+        // wraps a fresh handle with `with_loop(Some(0))` so the same
+        // cached PcmAudio works for both SFX one-shots and ambient
+        // loops. To keep the cache pure (one handle per id) we
+        // build a *separate* handle here for the looped flavor.
+        let h = pcm_assets.add(PcmAudio::from_decoded(decoded).with_loop(None));
+        cache.cached.insert(se_id, h.clone());
+        h
+    };
+
+    // Build the looped flavor by reading the cached asset back out
+    // and inserting a new handle with the loop point forced on.
+    // The asset lookup can technically fail if the handle was
+    // dropped, but we just-inserted-or-found it above so this is
+    // safe in practice.
+    let looped_handle = pcm_assets
+        .get(&handle)
+        .cloned()
+        .map(|p| pcm_assets.add(p.with_loop(Some(0))))
+        .unwrap_or(handle);
+
+    let entity = commands
+        .spawn((
+            AudioPlayer(looped_handle),
+            PlaybackSettings::ONCE
+                .with_volume(bevy::audio::Volume::Linear(0.0)),
+            WeatherFade::fade_in(WEATHER_FADE_SECS),
+        ))
+        .id();
+    ambient.active_entity = Some(entity);
+    info!(
+        "audio: weather ambient se={se_id} weather={:?} (fade-in {}s)",
+        weather, WEATHER_FADE_SECS
+    );
+}
+
+/// Advance every `WeatherFade` component each frame, applying the
+/// interpolated volume to the entity's `AudioSink` and despawning
+/// the entity if `despawn_on_end` and the tween completes.
+pub fn tick_weather_fades(
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut WeatherFade, Option<&mut bevy::audio::AudioSink>)>,
+    mut commands: Commands,
+) {
+    let dt = time.delta_secs();
+    for (entity, mut fade, sink) in q.iter_mut() {
+        fade.t += dt;
+        let t = (fade.t / fade.duration).clamp(0.0, 1.0);
+        let vol = fade.from + (fade.to - fade.from) * t;
+        if let Some(mut s) = sink {
+            s.set_volume(bevy::audio::Volume::Linear(vol));
+        }
+        if fade.t >= fade.duration {
+            if fade.despawn_on_end {
+                commands.entity(entity).despawn();
+            } else {
+                commands.entity(entity).remove::<WeatherFade>();
+            }
+        }
+    }
+}
+
 /// Plugin entry point. Registered from `lib.rs`.
 pub struct AudioPlugin;
 
@@ -938,6 +1211,8 @@ impl Plugin for AudioPlugin {
             .init_resource::<SfxCache>()
             .init_resource::<SystemSfxTable>()
             .init_resource::<SystemSfxCursor>()
+            .init_resource::<WeatherSfxTable>()
+            .init_resource::<WeatherAmbient>()
             .add_message::<SfxEvent>()
             .add_systems(
                 Update,
@@ -950,7 +1225,12 @@ impl Plugin for AudioPlugin {
                     // `play_sfx_system` so any SfxEvent it writes is
                     // consumed this frame rather than next.
                     observe_ui_mode_transitions,
+                    // Weather observer writes stingers as SfxEvents
+                    // AND spawns its own ambient sink — both must
+                    // precede `play_sfx_system`.
+                    observe_weather_changes,
                     play_sfx_system,
+                    tick_weather_fades,
                 )
                     .chain(),
             );
