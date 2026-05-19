@@ -132,6 +132,10 @@ pub fn event_to_viewer_event(ev: AgentEvent) -> Option<wire::ViewerEvent> {
         AgentEvent::MusicVolumeChanged { slot, volume } => {
             Some(wire::ViewerEvent::MusicVolumeChanged { slot, volume })
         }
+        AgentEvent::LevelUp { player_id } => Some(wire::ViewerEvent::LevelUp { player_id }),
+        AgentEvent::SkillLevelUp { skill_id, level } => {
+            Some(wire::ViewerEvent::SkillLevelUp { skill_id, level })
+        }
         // Snapshot-folded signals (Connected, StageChanged, PositionChanged,
         // EntityUpserted, ChatLine, PartyMemberUpdated, Diagnostics) are
         // already visible through the state watch — no need to push them as

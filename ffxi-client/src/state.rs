@@ -916,7 +916,9 @@ impl SessionState {
             // active slot/track lives in viewer-core's BgmSlots
             // resource.
             | AgentEvent::MusicChanged { .. }
-            | AgentEvent::MusicVolumeChanged { .. } => {}
+            | AgentEvent::MusicVolumeChanged { .. }
+            | AgentEvent::LevelUp { .. }
+            | AgentEvent::SkillLevelUp { .. } => {}
             AgentEvent::InventoryUpdated { container, update } => {
                 let entry = self.inventory.containers.entry(*container).or_default();
                 match update {
@@ -1219,6 +1221,21 @@ pub enum AgentEvent {
     MusicVolumeChanged {
         slot: u8,
         volume: u8,
+    },
+    /// 0x02D BATTLE_MESSAGE2 with `MsgBasic::LevelUp` (id 9). The
+    /// actor id is the player; the level reached is implicit (LSB
+    /// doesn't put it in the chat-line payload — `data1` is the job
+    /// id, `data2 = 0`). The audio side only needs the trigger.
+    LevelUp {
+        player_id: u32,
+    },
+    /// 0x029 / 0x02D with `MsgBasic::SkillLevelUp` (id 53). Server
+    /// sends `(skill_id, level/10)` in `data1, data2`. Emitted from
+    /// the same site that produces the chat line — both consumers
+    /// run; chat shows the message, audio fires a stinger.
+    SkillLevelUp {
+        skill_id: u16,
+        level: u32,
     },
 }
 

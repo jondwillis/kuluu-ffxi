@@ -970,6 +970,8 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::WeatherUpdated { .. } => "weather_updated",
         AgentEvent::LogoutCountdown { .. } => "logout_countdown",
         AgentEvent::SetFps { .. } => "set_fps",
+        AgentEvent::LevelUp { .. } => "level_up",
+        AgentEvent::SkillLevelUp { .. } => "skill_level_up",
     }
 }
 

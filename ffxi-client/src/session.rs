@@ -784,12 +784,14 @@ fn handle_sub_packet(
             if let Some(line) = decode_battle_message(sub.data, name_cache, true) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
+            emit_battle_message_audio_event(sub.data, true, event_tx);
         }
         op if op == s2c::BATTLE_MESSAGE2 => {
             // 0x02D moves Data/Data2 to offsets 12/16, after the ActIndex pair.
             if let Some(line) = decode_battle_message(sub.data, name_cache, false) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
+            emit_battle_message_audio_event(sub.data, false, event_tx);
         }
         op if op == s2c::SHOP_LIST => {
             // 0x03C body = 4 header + 10*N item rows. Reassembly across
@@ -1937,6 +1939,53 @@ fn substitute_system_placeholders(raw: &str, para: u32, para2: u32) -> String {
 /// and the `Data`/`Data2` fields. Returns `None` if the body is too short
 /// or the message id has no entry in `msg_basic` (rare ids live in
 /// `msg_combat` / `msg_status` tables we don't ship yet).
+/// Sibling to [`decode_battle_message`] — peeks at the same packet
+/// body and emits audio-trigger `AgentEvent`s for the message ids
+/// that the SFX bridge cares about. Today: LevelUp (9), SkillLevelUp
+/// (53). The chat-line decoder handles rendering; this fires the
+/// stinger.
+///
+/// Source-of-truth for ids: `vendor/server/src/map/enums/msg_basic.h`
+/// (LevelUp=9, SkillLevelUp=53). Source-of-truth for `data1`/`data2`
+/// offsets: `decode_battle_message`'s `is_029` switch.
+fn emit_battle_message_audio_event(
+    data: &[u8],
+    is_029: bool,
+    event_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
+) {
+    if data.len() < 24 {
+        return;
+    }
+    let cas_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let (data1, data2) = if is_029 {
+        (
+            u32::from_le_bytes(data[8..12].try_into().unwrap()),
+            u32::from_le_bytes(data[12..16].try_into().unwrap()),
+        )
+    } else {
+        (
+            u32::from_le_bytes(data[12..16].try_into().unwrap()),
+            u32::from_le_bytes(data[16..20].try_into().unwrap()),
+        )
+    };
+    let message_num = u16::from_le_bytes(data[20..22].try_into().unwrap());
+    match message_num {
+        9 => {
+            let _ = event_tx.send(AgentEvent::LevelUp { player_id: cas_id });
+        }
+        53 => {
+            // charutils.cpp:4161 sends (skillID, (skill+amount)/10) —
+            // data1 = skill_id, data2 = current level (server already
+            // divided by 10).
+            let _ = event_tx.send(AgentEvent::SkillLevelUp {
+                skill_id: data1 as u16,
+                level: data2,
+            });
+        }
+        _ => {}
+    }
+}
+
 fn decode_battle_message(
     data: &[u8],
     name_cache: &std::collections::HashMap<u32, String>,

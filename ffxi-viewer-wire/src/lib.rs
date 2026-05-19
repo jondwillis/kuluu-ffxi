@@ -529,6 +529,18 @@ pub enum ViewerEvent {
     /// `volume` is the raw LSB byte (0..=127 typically); consumers
     /// normalize before applying.
     MusicVolumeChanged { slot: u8, volume: u8 },
+    /// 0x02D BATTLE_MESSAGE2 with `MsgBasic::LevelUp` (id 9). The
+    /// player named by `player_id` reached the level encoded in the
+    /// server's chat-line payload; we surface only the actor id here
+    /// since the audio side only needs the trigger.
+    /// See `vendor/server/src/map/utils/charutils.cpp:5736`.
+    LevelUp { player_id: u32 },
+    /// 0x02D / 0x029 with `MsgBasic::SkillLevelUp` (id 53). Fires
+    /// every time a weapon/magic skill rank goes up — frequent at
+    /// low skill. `level` is the new skill level (server divides by
+    /// 10 before sending; consumers can render as integer).
+    /// See `vendor/server/src/map/utils/charutils.cpp:4161`.
+    SkillLevelUp { skill_id: u16, level: u32 },
 }
 
 /// Server→viewer frame on the WebSocket. `Snapshot` and `Delta` are boxed
