@@ -436,8 +436,7 @@ pub fn process_load_mmb_requests(
     // "MMB texture pool" diagnostic for in this frame. Without this
     // the log fires once per zone-load placement (thousands of times
     // for a city); with it, exactly once per unique asset per frame.
-    let mut mmb_logged: std::collections::HashSet<(u32, usize)> =
-        std::collections::HashSet::new();
+    let mut mmb_logged: std::collections::HashSet<(u32, usize)> = std::collections::HashSet::new();
 
     // Cache one LoadedMmb per (file_id, chunk_idx).
     let mut mmb_cache: std::collections::HashMap<(u32, usize), Option<LoadedMmb>> =
@@ -455,8 +454,7 @@ pub fn process_load_mmb_requests(
     };
     let mut diag_zero_submesh: std::collections::HashMap<u32, Vec<(usize, String)>> =
         std::collections::HashMap::new();
-    let mut diag_loaded: std::collections::HashMap<u32, u32> =
-        std::collections::HashMap::new();
+    let mut diag_loaded: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut diag_load_failed: std::collections::HashMap<u32, u32> =
         std::collections::HashMap::new();
     let diag_matches = |fid: u32| -> bool {
@@ -747,30 +745,6 @@ pub fn process_load_mmb_requests(
                 alpha_mode,
                 perceptual_roughness: 1.0,
                 reflectance: 0.1,
-                // UNLIT is load-bearing: FFXI MMBs ship pre-rotated
-                // vertex normals and pre-baked vertex colors (the
-                // "lighting" is already painted into the mesh data).
-                // Letting PBR re-light produces (a) visible specular
-                // → "shiny stone walls", (b) sun bleed through wall
-                // cracks at dawn/dusk, (c) dark triangular patches
-                // on floors where the pre-rotated normals point
-                // away from the engine sun. Don't disable without
-                // also stripping the baked-color/normal channels.
-                //
-                // Regression-history note (kept for context, not as a
-                // rule): b31a17e commented out `unlit: true`, 290b33c
-                // restored it on the theory that PBR re-lighting was
-                // the source of dim-zone darkness, then 5aae6b6
-                // commented it out again. Empirically the user has
-                // NEVER seen the "all-black surfaces" PBR-darken
-                // symptom in actual play — the observed failure mode
-                // is *missing / transparent* textures, which is an
-                // alpha/blending issue and orthogonal to `unlit`.
-                // Leaving unlit off until we have a real test case.
-                // unlit: true,
-                // FFXI triangle-strip winding isn't pinned to a
-                // canonical front/back convention — render both
-                // sides instead of guessing.
                 cull_mode: None,
                 ..default()
             });
