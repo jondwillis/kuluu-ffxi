@@ -258,6 +258,66 @@ pub struct BgmPlaybackState {
     pub is_night: bool,
 }
 
+/// Derive `BgmPlaybackState` from existing scene/clock resources
+/// every frame. Mapping (from LSB `status_effect.h` + party state):
+///
+///   engaged_*    self entity has non-zero `bt_target_id`. Solo if
+///                party.len() ≤ 1, else Party.
+///   mounted      `status_icons` contains EFFECT_MOUNTED (252).
+///   in_mog_house self party member's `in_mog_house` flag (set by
+///                LSB GROUP_LIST/ATTR packets — the server is the
+///                authority here since zone_id doesn't change
+///                when entering a mog house in the same city).
+///   dead         `status_icons` contains EFFECT_KO (0).
+///   fishing      `status_icons` contains EFFECT_FISHING_IMAGERY
+///                (235) — the cast-rod-out effect, set while
+///                fishing minigame is active.
+///   is_night     `VanaSky::sun_altitude < 0` (sun below horizon).
+///                Switches at V-hours 6 and 18, which is ~ every
+///                5 real minutes.
+///
+/// Source ids come from `vendor/server/src/map/status_effect.h`:
+///   EFFECT_KO              = 0
+///   EFFECT_FISHING_IMAGERY = 235
+///   EFFECT_MOUNTED         = 252
+pub fn derive_bgm_playback_state(
+    scene: Res<crate::snapshot::SceneState>,
+    sky: Res<crate::sun_moon::VanaSky>,
+    mut state: ResMut<BgmPlaybackState>,
+) {
+    const EFFECT_KO: u16 = 0;
+    const EFFECT_FISHING_IMAGERY: u16 = 235;
+    const EFFECT_MOUNTED: u16 = 252;
+
+    let snap = &scene.snapshot;
+    let self_id = snap.self_char_id;
+    let self_entity = self_id.and_then(|id| snap.entities.iter().find(|e| e.id == id));
+    let engaged = self_entity.map(|e| e.bt_target_id != 0).unwrap_or(false);
+    let in_party = snap.party.len() > 1;
+
+    let in_mog_house = self_id
+        .and_then(|id| snap.party.iter().find(|p| p.id == id))
+        .map(|p| p.in_mog_house)
+        .unwrap_or(false);
+
+    let icons = &snap.status_icons;
+    let dead = icons.contains(&EFFECT_KO);
+    let mounted = icons.contains(&EFFECT_MOUNTED);
+    let fishing = icons.contains(&EFFECT_FISHING_IMAGERY);
+
+    let is_night = sky.sun_altitude < 0.0;
+
+    *state = BgmPlaybackState {
+        engaged_solo: engaged && !in_party,
+        engaged_party: engaged && in_party,
+        mounted,
+        in_mog_house,
+        dead,
+        fishing,
+        is_night,
+    };
+}
+
 /// Scan `EventLog.recent` for music events since the last frame
 /// and fold them into `BgmSlots`. Runs every `Update`.
 pub fn drain_music_events_system(events: Res<EventLog>, mut slots: ResMut<BgmSlots>) {
@@ -571,6 +631,7 @@ impl Plugin for AudioPlugin {
                 Update,
                 (
                     drain_music_events_system,
+                    derive_bgm_playback_state,
                     apply_bgm_system,
                     fire_system_sfx_events,
                     play_sfx_system,
