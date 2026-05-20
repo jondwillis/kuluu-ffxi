@@ -238,17 +238,27 @@ pub fn spawn_minimap(mut commands: Commands, mut images: ResMut<Assets<Image>>) 
             MinimapRoot,
             Node {
                 position_type: PositionType::Absolute,
-                // Top-right corner. Vana-clock occupies the top-right
-                // most slot today (top: 8, right: 8), so the minimap
-                // sits beneath it. 56px gap below clears the clock's
-                // ~44px height plus a small margin.
-                top: Val::Px(56.0),
-                right: Val::Px(8.0),
+                // Bottom-left corner — retail FFXI's compass-minimap
+                // slot. Overlays the chat panel rather than sitting in
+                // the empty top-right column, because retail puts both
+                // the compass and the proximity-radar functionality
+                // here and the operator scans this quadrant for
+                // orientation. The chat panel sits at bottom: 54,
+                // height ~160; minimap-bottom: 220 stacks just above
+                // the chat-input strip (bottom 28..52) with a small
+                // breathing gap.
+                bottom: Val::Px(220.0),
+                left: Val::Px(8.0),
                 width: Val::Px(MINIMAP_UI_SIZE_PX),
                 height: Val::Px(MINIMAP_UI_SIZE_PX),
                 border: UiRect::all(Val::Px(1.0)),
                 ..default()
             },
+            // Pull the minimap above the chat panel in z-order so the
+            // panel's body never visually clips the minimap rim. UI z
+            // defaults to insertion order, which is fragile when other
+            // overlays land later; an explicit ZIndex pins it.
+            ZIndex(10),
             BackgroundColor(palette::BACKGROUND),
             BorderColor::all(palette::BORDER),
         ))
