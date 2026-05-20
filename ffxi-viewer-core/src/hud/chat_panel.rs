@@ -137,9 +137,19 @@ pub enum ChatKind {
 impl ChatKind {
     /// Does a given channel render in this panel? See [`ChatKind`] docs
     /// for the split rules.
+    ///
+    /// `Debug` channel folds into `Battle` panel: retail FFXI mixes
+    /// system messages into the battle/system log, and the user
+    /// preference is to surface client-internal toasts there too rather
+    /// than reserving a separate pane. The `ChatKind::Debug` variant
+    /// is retained for tooling/test code that still wants to assert
+    /// debug-only routing but no pane is spawned for it any more.
     pub fn accepts(self, c: ChatChannel) -> bool {
         match self {
-            ChatKind::Battle => matches!(c, ChatChannel::Battle | ChatChannel::System),
+            ChatKind::Battle => matches!(
+                c,
+                ChatChannel::Battle | ChatChannel::System | ChatChannel::Debug
+            ),
             ChatKind::Debug => matches!(c, ChatChannel::Debug),
             ChatKind::Social => !matches!(
                 c,
@@ -186,16 +196,15 @@ const AUTOTRANSLATE_COLOR: Color = Color::srgb(0.50, 0.78, 1.00);
 
 
 pub fn spawn_chat_panel(mut commands: Commands) {
-    // Production layout (dev-hud off): Social + Battle stacked
-    // bottom-LEFT, each 50% wide and side-by-side within that left
-    // half. Leaves the bottom-right corner clear for self_hud (HP/MP/
-    // TP) — matches retail's bottom-left-chat / bottom-right-self
-    // quadrant split.
+    // Two panes, bottom-LEFT quadrant, each 25% wide and side-by-side.
+    // Social = retail's Chat 1 (say/shout/tell/party/linkshell/yell);
+    // Battle = retail's Chat 2 (combat log + system messages + folded-
+    // in client toasts). The bottom-right quadrant is reserved for
+    // self_hud — matches retail's chat-left / player-frame-right
+    // layout.
     //
-    // Debug pane (dev-only) lives in the right half when `/devhud on`,
-    // hidden via [`crate::hud::DevHud`] when off. Three-pane dev
-    // layout is reapplied at runtime by
-    // [`apply_chat_layout_for_devhud`].
+    // The third `ChatKind::Debug` pane has been retired; debug-channel
+    // messages now route into Battle via [`ChatKind::accepts`].
     spawn_panel(
         &mut commands,
         ChatKind::Social,
@@ -208,50 +217,6 @@ pub fn spawn_chat_panel(mut commands: Commands) {
         Val::Percent(25.0),
         Val::Percent(25.0),
     );
-    spawn_panel(
-        &mut commands,
-        ChatKind::Debug,
-        Val::Percent(68.0),
-        Val::Percent(32.0),
-    );
-}
-
-/// React when [`crate::hud::HudVerbosity::dev_hud`] flips: rewrite
-/// Social + Battle widths and Battle's `left` offset so the production
-/// layout (bottom-LEFT-half, 25%+25%) becomes the three-pane dev
-/// layout (34/33/32 across full width) and back. The Debug pane's
-/// visibility is driven by the generic [`crate::hud::DevHud`] system;
-/// this one only resizes.
-pub fn apply_chat_layout_for_devhud(
-    verbosity: Res<crate::hud::HudVerbosity>,
-    mut q: Query<(&ChatPanel, &mut Node)>,
-) {
-    if !verbosity.is_changed() {
-        return;
-    }
-    for (panel, mut node) in q.iter_mut() {
-        match (panel.kind, verbosity.dev_hud) {
-            (ChatKind::Social, false) => {
-                node.left = Val::Percent(0.0);
-                node.width = Val::Percent(25.0);
-            }
-            (ChatKind::Social, true) => {
-                node.left = Val::Percent(0.0);
-                node.width = Val::Percent(34.0);
-            }
-            (ChatKind::Battle, false) => {
-                node.left = Val::Percent(25.0);
-                node.width = Val::Percent(25.0);
-            }
-            (ChatKind::Battle, true) => {
-                node.left = Val::Percent(34.5);
-                node.width = Val::Percent(33.0);
-            }
-            // Debug pane keeps its fixed slot; visibility (and thus
-            // whether the operator sees it) is owned by DevHud.
-            (ChatKind::Debug, _) => {}
-        }
-    }
 }
 
 fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, width: Val) {

@@ -170,7 +170,6 @@ impl Plugin for HudPlugin {
         // ceiling — adding a 21st entry trips the trait-bound error.
         app.add_systems(Update, logout_countdown::update_logout_countdown);
         app.add_systems(Update, apply_dev_hud_visibility);
-        app.add_systems(Update, chat_panel::apply_chat_layout_for_devhud);
         app.add_systems(Update, weather_icon::update_weather_icon);
         // Combat pulse: detect-then-modulate, chained so the color
         // update sees the latched timestamp from the same frame. Both
