@@ -549,15 +549,17 @@ fn rasterize_text_to_image(
     let pad = (OUTLINE_RADIUS_PX + 1) as u32;
     let width = (max_x.ceil() as u32).max(1) + 2 * pad;
     let text_height = line_h + 2 * pad;
-    // Extra vertical strip beneath the text when this label carries an
-    // HP percentage. The bar is drawn directly into the RGBA buffer
-    // (not through the glyph rasterizer), so it doesn't participate in
-    // the outline-halo pass.
-    let hp_strip = if hp_pct.is_some() {
-        HP_BAR_TOP_GAP_PX + HP_BAR_HEIGHT_PX
-    } else {
-        0
-    };
+    // Always reserve the HP-bar strip in the texture, even when
+    // `hp_pct` is None (e.g., spawn-time before the first HP-bearing
+    // CHAR_NPC, or NPCs/PCs which never get a bar). Keeping texture
+    // dimensions stable across re-rasterizations avoids the bug where
+    // the GPU's allocated texture stays at the spawn-time size while
+    // `Assets::insert` writes a larger RGBA buffer — the bar pixels
+    // get written into the buffer but rendered into a region the GPU
+    // texture doesn't cover, so the bar is invisible. The strip is
+    // transparent (all zeros) when `hp_pct.is_none()`, so the label
+    // looks identical to the old text-only behavior in that case.
+    let hp_strip = HP_BAR_TOP_GAP_PX + HP_BAR_HEIGHT_PX;
     let height = text_height + hp_strip;
 
     // Pass 1: glyph coverage into a single-channel scratch buffer.
