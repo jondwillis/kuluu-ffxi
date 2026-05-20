@@ -658,8 +658,17 @@ pub struct SystemSfxTable {
     /// `ViewerEvent::LowHp` → critical-HP beep (the "low-life" UI
     /// pulse retail plays under 25% HP).
     pub low_hp: Option<u32>,
-    /// `ViewerEvent::EngagedBy` → aggro stinger.
+    /// `ViewerEvent::EngagedBy` → aggro stinger (mob attacks us).
     pub engaged_by: Option<u32>,
+    /// Local engage transition (self.bt_target_id 0 → nonzero) → the
+    /// "draw weapon" stinger. Distinct from `engaged_by` because the
+    /// situation is different — *we* initiated combat, not the mob.
+    pub engage_self: Option<u32>,
+    /// Per-swing combat blip — fires on every growth of the Battle
+    /// chat-line count. Each hit/miss/proc/reaction produces one
+    /// audible tick so combat has rhythm. Set `None` (or rebind to
+    /// 0) to silence if it gets noisy at fast-attack tempo.
+    pub swing_tick: Option<u32>,
     /// `ViewerEvent::TellReceived` → tell-ding.
     pub tell_received: Option<u32>,
     /// `ViewerEvent::LevelUp` (from 0x02D msg id 9) → level-up jingle.
@@ -701,6 +710,16 @@ impl Default for SystemSfxTable {
             zone_changed: Some(1097),
             low_hp: Some(1077),
             engaged_by: Some(1064),
+            // Distinct from engaged_by — pick a different bank-1
+            // candidate so the "we engaged" cue doesn't sound
+            // identical to "we got aggroed." Both are placeholders
+            // until the user listens through /sfx <id> and rebinds.
+            engage_self: Some(1062),
+            // Bank-1 candidate; combat swings happen at ~3s tempo at
+            // base, so this needs to be a SHORT clip — a longer one
+            // would overlap into the next swing. Rebind via
+            // /sfx_bind swing_tick <id> if too noisy.
+            swing_tick: Some(1060),
             tell_received: Some(1053),
             // Gameplay placeholders — FFXI retail level-up is in the
             // 188xxx range historically; without a verified table we
@@ -731,6 +750,8 @@ impl SystemSfxTable {
         "zone_changed",
         "low_hp",
         "engaged_by",
+        "engage_self",
+        "swing_tick",
         "tell_received",
         "level_up",
         "skill_level_up",
@@ -754,6 +775,8 @@ impl SystemSfxTable {
             "zone_changed" => self.zone_changed = v,
             "low_hp" => self.low_hp = v,
             "engaged_by" => self.engaged_by = v,
+            "engage_self" => self.engage_self = v,
+            "swing_tick" => self.swing_tick = v,
             "tell_received" => self.tell_received = v,
             "level_up" => self.level_up = v,
             "skill_level_up" => self.skill_level_up = v,
@@ -779,6 +802,8 @@ impl SystemSfxTable {
             "zone_changed" => self.zone_changed,
             "low_hp" => self.low_hp,
             "engaged_by" => self.engaged_by,
+            "engage_self" => self.engage_self,
+            "swing_tick" => self.swing_tick,
             "tell_received" => self.tell_received,
             "level_up" => self.level_up,
             "skill_level_up" => self.skill_level_up,
@@ -803,6 +828,62 @@ impl SystemSfxTable {
 #[derive(Resource, Default)]
 pub struct SystemSfxCursor {
     pos: usize,
+}
+
+/// Tracks the local player's prior engagement state + Battle chat line
+/// count so transitions can be detected each frame. The two signals
+/// drive [`fire_combat_sfx_events`]:
+///   - `prev_engaged`: latches on 0→nonzero `bt_target_id` to fire
+///     [`SystemSfxTable::engage_self`] exactly once per engage.
+///   - `prev_battle_count`: counts `ChatChannel::Battle` lines and
+///     fires [`SystemSfxTable::swing_tick`] on every growth (same
+///     signal the engaged-badge pulse rides — keeps the audible cue
+///     in lockstep with the visual one).
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct CombatSfxState {
+    pub prev_engaged: bool,
+    pub prev_battle_count: usize,
+}
+
+/// Combat-event → SFX bridge for signals not covered by the
+/// `ViewerEvent`-level [`fire_system_sfx_events`]: the local player's
+/// own engage transition (no wire event for this — derived from
+/// `bt_target_id`) and per-swing ticks (driven by Battle chat-line
+/// arrivals). Mirrors the badge-pulse latch in
+/// `hud::target_panel::detect_swing_pulse_system` so the visual
+/// flash and the audible tick come from the same source.
+pub fn fire_combat_sfx_events(
+    scene: Res<crate::snapshot::SceneState>,
+    table: Res<SystemSfxTable>,
+    mut state: ResMut<CombatSfxState>,
+    mut writer: MessageWriter<SfxEvent>,
+) {
+    let snap = &scene.snapshot;
+
+    // Self-engage transition.
+    let engaged_now = snap
+        .self_char_id
+        .and_then(|sid| snap.entities.iter().find(|e| e.id == sid))
+        .map(|self_pc| self_pc.bt_target_id != 0)
+        .unwrap_or(false);
+    if engaged_now && !state.prev_engaged {
+        if let Some(se_id) = table.engage_self {
+            writer.write(SfxEvent::new(se_id));
+        }
+    }
+    state.prev_engaged = engaged_now;
+
+    // Per-swing tick. Count Battle channel lines; growth → fire.
+    let battle_count = crate::snapshot::rendered_chat(&scene)
+        .iter()
+        .filter(|l| l.channel == ffxi_viewer_wire::ChatChannel::Battle)
+        .count();
+    if battle_count > state.prev_battle_count {
+        if let Some(se_id) = table.swing_tick {
+            writer.write(SfxEvent::new(se_id));
+        }
+    }
+    state.prev_battle_count = battle_count;
 }
 
 pub fn fire_system_sfx_events(
@@ -1211,6 +1292,7 @@ impl Plugin for AudioPlugin {
             .init_resource::<SfxCache>()
             .init_resource::<SystemSfxTable>()
             .init_resource::<SystemSfxCursor>()
+            .init_resource::<CombatSfxState>()
             .init_resource::<WeatherSfxTable>()
             .init_resource::<WeatherAmbient>()
             .add_message::<SfxEvent>()
@@ -1221,6 +1303,7 @@ impl Plugin for AudioPlugin {
                     derive_bgm_playback_state,
                     apply_bgm_system,
                     fire_system_sfx_events,
+                    fire_combat_sfx_events,
                     // UI mode-change SFX observer. Runs before
                     // `play_sfx_system` so any SfxEvent it writes is
                     // consumed this frame rather than next.
@@ -1382,6 +1465,53 @@ mod tests {
     /// final stage (decode → spawn AudioPlayer) needs a real .bgw on
     /// disk. Replaces the manual "log in and hear it" listening test
     /// for the BGM path with something CI-runnable.
+    /// Extract the latch math from `fire_combat_sfx_events` so we can
+    /// drive it with synthetic inputs. The system itself reads from
+    /// Bevy resources we don't want to mock here; the latch logic is
+    /// the part that holds the invariants.
+    fn step_combat_latches(
+        state: &mut CombatSfxState,
+        engaged_now: bool,
+        battle_count: usize,
+    ) -> (bool, bool) {
+        let fire_engage = engaged_now && !state.prev_engaged;
+        state.prev_engaged = engaged_now;
+        let fire_swing = battle_count > state.prev_battle_count;
+        state.prev_battle_count = battle_count;
+        (fire_engage, fire_swing)
+    }
+
+    #[test]
+    fn combat_sfx_engage_latches_once_per_zero_to_engaged_transition() {
+        let mut s = CombatSfxState::default();
+        // Idle, no chat → nothing fires.
+        assert_eq!(step_combat_latches(&mut s, false, 0), (false, false));
+        // Engage (bt_target_id 0 → nonzero) → engage stinger.
+        assert_eq!(step_combat_latches(&mut s, true, 0), (true, false));
+        // Still engaged on subsequent ticks → no re-fire.
+        assert_eq!(step_combat_latches(&mut s, true, 0), (false, false));
+        // Disengage → no fire (the stinger is for transitions into
+        // combat, not out of it).
+        assert_eq!(step_combat_latches(&mut s, false, 0), (false, false));
+        // Re-engage → fires again.
+        assert_eq!(step_combat_latches(&mut s, true, 0), (true, false));
+    }
+
+    #[test]
+    fn combat_sfx_swing_tick_fires_only_on_battle_chat_growth() {
+        let mut s = CombatSfxState::default();
+        // No chat → no swing tick.
+        assert_eq!(step_combat_latches(&mut s, false, 0), (false, false));
+        // First battle line → tick.
+        assert_eq!(step_combat_latches(&mut s, false, 1), (false, true));
+        // Same count → no tick.
+        assert_eq!(step_combat_latches(&mut s, false, 1), (false, false));
+        // Multi-line burst (proc + react + headline) → one tick.
+        assert_eq!(step_combat_latches(&mut s, false, 4), (false, true));
+        // Chat history cap evicts lines → count shrinks → no tick.
+        assert_eq!(step_combat_latches(&mut s, false, 2), (false, false));
+    }
+
     #[test]
     fn bgm_pipeline_end_to_end_with_real_install() {
         let Ok(install) = std::env::var("FFXI_DAT_PATH") else {
