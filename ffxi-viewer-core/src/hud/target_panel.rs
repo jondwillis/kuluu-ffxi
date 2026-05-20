@@ -446,4 +446,52 @@ mod tests {
         assert_eq!(hp_color(50), Color::srgb(0.95, 0.75, 0.20));
         assert_eq!(hp_color(10), Color::srgb(0.95, 0.20, 0.20));
     }
+
+    #[test]
+    fn swing_pulse_default_starts_at_zero() {
+        let p = SwingPulse::default();
+        assert_eq!(p.last_swing_secs, 0.0);
+        assert_eq!(p.prev_battle_count, 0);
+    }
+
+    /// The latch logic outside the Bevy system — extracted so we can
+    /// drive it with known inputs. Mirrors what `detect_swing_pulse_system`
+    /// does each frame: compare count, latch on growth, update prev.
+    fn step_pulse(pulse: &mut SwingPulse, count: usize, now: f32) {
+        if count > pulse.prev_battle_count {
+            pulse.last_swing_secs = now;
+        }
+        pulse.prev_battle_count = count;
+    }
+
+    #[test]
+    fn swing_pulse_latches_on_battle_line_growth() {
+        let mut p = SwingPulse::default();
+        // Zone-in with no battle: no latch.
+        step_pulse(&mut p, 0, 1.0);
+        assert_eq!(p.last_swing_secs, 0.0);
+        // First swing arrives — latch.
+        step_pulse(&mut p, 1, 2.0);
+        assert_eq!(p.last_swing_secs, 2.0);
+        // Same count next frame — no re-latch.
+        step_pulse(&mut p, 1, 2.5);
+        assert_eq!(p.last_swing_secs, 2.0);
+        // Another swing — latch updates.
+        step_pulse(&mut p, 3, 3.0); // proc + headline = 2 new lines
+        assert_eq!(p.last_swing_secs, 3.0);
+    }
+
+    #[test]
+    fn swing_pulse_does_not_latch_on_count_shrink() {
+        // ChatChannel::Battle line count can shrink if the chat history
+        // cap evicts old lines — that's not a swing event, must not
+        // latch.
+        let mut p = SwingPulse {
+            last_swing_secs: 5.0,
+            prev_battle_count: 256,
+        };
+        step_pulse(&mut p, 200, 10.0); // 56 lines aged out
+        assert_eq!(p.last_swing_secs, 5.0, "shrink must not latch");
+        assert_eq!(p.prev_battle_count, 200);
+    }
 }
