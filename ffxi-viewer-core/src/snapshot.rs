@@ -101,16 +101,24 @@ pub fn ingest_system<S: SceneSource + Resource>(
 
     if let Some(snap) = source.poll_snapshot() {
         state.snapshot = *snap;
-        // A full snapshot replaces the entire chat history. Re-stamp
-        // every line with a fresh monotonic seq starting from
-        // `next_chat_seq` so the merge in `rendered_chat` orders the
-        // freshly-baselined batch consistently against any toasts that
-        // arrived afterward.
+        // A full snapshot is a fresh baseline. Re-stamp every chat
+        // line with monotonic seqs starting from 0, and drop the
+        // existing local toasts so they don't visually "prepend" the
+        // newly-baselined chat. Pre-snapshot toasts were transient
+        // operator feedback (e.g. "/zonegeom: off") that had already
+        // been displayed for the user; keeping them around would
+        // anchor them BEFORE all the new server-pushed chat in
+        // `rendered_chat`'s seq merge, which reads as wrong-order at
+        // a glance ("why is my slash command showing up before the
+        // last hour of battle log?"). Fresh next_chat_seq starts past
+        // the snapshot so future toasts and deltas continue ordering
+        // correctly relative to the new baseline.
         let chat_n = state.snapshot.chat.len();
         for i in 0..chat_n {
-            state.snapshot.chat[i].local_seq = state.next_chat_seq;
-            state.next_chat_seq += 1;
+            state.snapshot.chat[i].local_seq = i as u64;
         }
+        state.next_chat_seq = chat_n as u64;
+        state.local_toasts.clear();
         state.dirty = true;
     }
 
