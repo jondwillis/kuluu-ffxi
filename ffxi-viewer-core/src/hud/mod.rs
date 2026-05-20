@@ -178,5 +178,11 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(
     // Second `add_systems` call — see the matching split in `Update`
     // registration above: Bevy's `IntoScheduleConfigs` tuple impls cap
     // at 20 entries.
-    app.add_systems(schedule, weather_icon::spawn_weather_icon);
+    app.add_systems(schedule.clone(), weather_icon::spawn_weather_icon);
+    // Minimap spawner. Native-only — the minimap module itself is
+    // gated on `cfg(not(target_arch = "wasm32"))` because its
+    // top-down backend reads MZB geometry. WASM front-ends skip this
+    // entry without losing the rest of the HUD.
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(schedule, crate::minimap::spawn_minimap);
 }

@@ -34,6 +34,8 @@ pub mod keybinds;
 pub mod lock_on;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod look_resolver;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod minimap;
 pub mod mouse;
 pub mod nameplate;
 pub mod nameplate_billboard;
@@ -121,6 +123,15 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // bytes; same constraint as `dat_mmb::DatOverlayPlugin`).
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(weather::WeatherPlugin);
+        // Minimap HUD plugin. Owns `MinimapMode` / `MinimapVisible` /
+        // `MinimapState` and registers the swap + visibility reactors.
+        // The spawn-once UI node is registered separately via
+        // `add_hud_spawners` (same pattern as the rest of the HUD), so
+        // a front-end that wants the resources without the UI tree can
+        // still add this plugin alone. Native-only because the
+        // top-down backend reads `dat_mzb::MzbCollisionGeometry`.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins(minimap::MinimapPlugin);
         app.init_resource::<SceneState>()
             .init_resource::<EventLog>()
             .init_resource::<TrackedEntities>()
