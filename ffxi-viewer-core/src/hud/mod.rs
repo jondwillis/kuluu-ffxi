@@ -39,6 +39,50 @@ pub mod zone_flash;
 
 use bevy::prelude::*;
 
+/// Whether the dev-only HUD widgets (stage bar, agent goal panel, MMB
+/// hover info, LLM badge, diagnostics strip, third `ChatKind::Debug`
+/// chat pane) are visible. Default `false` — those panels are operator
+/// telemetry that doesn't exist in vanilla FFXI / Ashita / Windower, so
+/// the production view hides them. `/devhud on|off|toggle` flips this
+/// at runtime; [`apply_dev_hud_visibility`] reacts on change and walks
+/// every entity tagged [`DevHud`] to swap `Visibility::Hidden` and
+/// `Visibility::Inherited`.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct HudVerbosity {
+    pub dev_hud: bool,
+}
+
+/// Marker on every dev-only HUD root entity. [`apply_dev_hud_visibility`]
+/// toggles `Visibility` on these in lockstep with [`HudVerbosity`].
+#[derive(Component)]
+pub struct DevHud;
+
+/// Run when [`HudVerbosity`] flips: set every [`DevHud`]-tagged entity's
+/// `Visibility` to match. Bevy UI propagates `Hidden` to descendants, so
+/// only the root nodes need the marker.
+///
+/// `mesh_debug` has its own hover-driven visibility update; when
+/// `dev_hud == false` we force it `Hidden` here and the hover system
+/// short-circuits (see `mesh_debug::update_mesh_debug_hud`).
+pub fn apply_dev_hud_visibility(
+    verbosity: Res<HudVerbosity>,
+    mut q: Query<&mut Visibility, With<DevHud>>,
+) {
+    if !verbosity.is_changed() {
+        return;
+    }
+    let want = if verbosity.dev_hud {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut v in q.iter_mut() {
+        if *v != want {
+            *v = want;
+        }
+    }
+}
+
 /// Color palette mirroring chrome.rs `Color::DarkGray` / `Color::Cyan` /
 /// `Color::Green` / `Color::Yellow` / `Color::Red`. Defined once here so
 /// every HUD module reads from the same constants.
@@ -72,6 +116,7 @@ pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<HudVerbosity>();
         app.init_resource::<llm_badge::BadgeClock>();
         app.init_resource::<mesh_debug::MeshHoverDebug>();
         // ZoneFlashState must exist before `update_zone_flash` runs the
@@ -123,6 +168,8 @@ impl Plugin for HudPlugin {
         // impls cap out at 20 entries, and the block above hit that
         // ceiling — adding a 21st entry trips the trait-bound error.
         app.add_systems(Update, logout_countdown::update_logout_countdown);
+        app.add_systems(Update, apply_dev_hud_visibility);
+        app.add_systems(Update, chat_panel::apply_chat_layout_for_devhud);
         app.add_systems(Update, weather_icon::update_weather_icon);
         app.add_systems(
             Update,
