@@ -17,21 +17,23 @@ use bevy::prelude::*;
 use crate::hud::palette;
 use crate::input_mode::InputMode;
 
-/// Action verbs shown when the player has a target. Order is rough
-/// retail-action-ring priority: combat verb → information verb →
-/// social verb. Trade is intentionally absent — it goes through 0x036
-/// TRADE_REQUEST, not the Action surface, and isn't wired yet.
+/// Action verbs shown when the player has a target. Order matches
+/// retail's right-click contextual menu (combat verb first, then
+/// information, then social). Trade is intentionally absent — it goes
+/// through 0x036 TRADE_REQUEST, not the Action surface.
 const ENTRIES_TARGETED: &[&str] = &["Attack", "Check", "Talk"];
 
-/// Stub entries shown with no target — the player still needs *some*
-/// context to land on, but these are placeholders for spell/item
-/// submenus that aren't built yet.
-const ENTRIES_UNTARGETED: &[&str] = &["Macros", "Magic", "Items"];
+/// No-target contextual entries — retail's order is Magic / Abilities /
+/// Items / Macros (top-down). Each entry is a placeholder for a
+/// submenu that lands later; the list shape itself matches retail so
+/// the muscle-memory of Enter→Down→Down→Enter to reach Macros works
+/// the way an FFXI player expects.
+const ENTRIES_UNTARGETED: &[&str] = &["Magic", "Abilities", "Items", "Macros"];
 
 /// Maximum row count across both lists. The panel spawns this many row
 /// slots once and the renderer hides any extras (`Display::None`) when
 /// the active list is shorter.
-const MAX_ROWS: usize = 3;
+const MAX_ROWS: usize = 4;
 
 /// Pick the entries list to display based on whether a target is
 /// selected. Public so callers (the input router, tests) can keep
@@ -70,13 +72,18 @@ pub fn spawn_quick_action(mut commands: Commands) {
             QuickActionPanel,
             Node {
                 position_type: PositionType::Absolute,
-                // Anchored bottom-left, sitting just above the chat
-                // panel. Chat occupies bottom 0..214 (54 + 160). 220 px
-                // leaves a small breathing gap; the operator's eye
-                // tracks both panels in the same screen quadrant
-                // without crossing the world view.
-                bottom: Val::Px(220.0),
-                left: Val::Px(0.0),
+                // Center-bottom, above the chat panel. The bottom-left
+                // quadrant is now reserved for the minimap (bottom:
+                // 220, left: 8, 192px square), so anchoring here would
+                // collide. Centering avoids the minimap AND the
+                // bottom-right self_hud — the operator's eye lands on
+                // the picker without crossing the world view.
+                bottom: Val::Px(250.0),
+                left: Val::Percent(50.0),
+                margin: UiRect {
+                    left: Val::Px(-80.0),
+                    ..default()
+                },
                 width: Val::Px(160.0),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
                 border: UiRect::all(Val::Px(1.0)),
@@ -85,6 +92,10 @@ pub fn spawn_quick_action(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
+            // Sit above the chat panel + minimap in z-order; otherwise
+            // the picker would render *behind* both since UI z falls
+            // back to insertion order.
+            ZIndex(20),
             BackgroundColor(palette::BACKGROUND),
             BorderColor::all(palette::ACCENT),
         ))
