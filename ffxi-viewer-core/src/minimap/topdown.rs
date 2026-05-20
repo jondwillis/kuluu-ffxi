@@ -35,7 +35,7 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::ScalingMode;
 use bevy::prelude::*;
-use bevy::render::camera::{ClearColorConfig, RenderTarget};
+use bevy::camera::{ClearColorConfig, RenderTarget};
 use bevy::render::render_resource::{
     Extent3d, TextureDimension, TextureFormat, TextureUsages,
 };
