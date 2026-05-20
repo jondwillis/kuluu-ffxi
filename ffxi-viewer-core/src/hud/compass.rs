@@ -54,6 +54,13 @@ pub fn spawn_compass(mut commands: Commands) {
                 border: UiRect::all(Val::Px(1.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
+                // Hidden by default: the minimap (also bottom-left)
+                // includes a compass N indicator in retail, and our
+                // minimap module now occupies this slot. Kept here
+                // (rather than deleted) so a future "minimap off"
+                // mode can re-show the text compass without
+                // re-introducing spawn logic.
+                display: Display::None,
                 ..default()
             },
             BackgroundColor(palette::BACKGROUND),
