@@ -186,22 +186,27 @@ const AUTOTRANSLATE_COLOR: Color = Color::srgb(0.50, 0.78, 1.00);
 
 
 pub fn spawn_chat_panel(mut commands: Commands) {
-    // Production layout (dev-hud off): Social + Battle split 50/50,
-    // Debug pane spawned but hidden via [`crate::hud::DevHud`]. Three-
-    // pane dev layout (34/33/32) is reapplied at runtime by
-    // [`apply_chat_layout_for_devhud`] when `/devhud on` flips
-    // [`crate::hud::HudVerbosity::dev_hud`].
+    // Production layout (dev-hud off): Social + Battle stacked
+    // bottom-LEFT, each 50% wide and side-by-side within that left
+    // half. Leaves the bottom-right corner clear for self_hud (HP/MP/
+    // TP) — matches retail's bottom-left-chat / bottom-right-self
+    // quadrant split.
+    //
+    // Debug pane (dev-only) lives in the right half when `/devhud on`,
+    // hidden via [`crate::hud::DevHud`] when off. Three-pane dev
+    // layout is reapplied at runtime by
+    // [`apply_chat_layout_for_devhud`].
     spawn_panel(
         &mut commands,
         ChatKind::Social,
         Val::Percent(0.0),
-        Val::Percent(50.0),
+        Val::Percent(25.0),
     );
     spawn_panel(
         &mut commands,
         ChatKind::Battle,
-        Val::Percent(50.0),
-        Val::Percent(50.0),
+        Val::Percent(25.0),
+        Val::Percent(25.0),
     );
     spawn_panel(
         &mut commands,
@@ -212,10 +217,11 @@ pub fn spawn_chat_panel(mut commands: Commands) {
 }
 
 /// React when [`crate::hud::HudVerbosity::dev_hud`] flips: rewrite
-/// Social + Battle widths and Battle's `left` offset so the two-pane
-/// production layout (50/50) becomes the three-pane dev layout
-/// (34/33/32) and back. The Debug pane's visibility is driven by the
-/// generic [`crate::hud::DevHud`] system; this one only resizes.
+/// Social + Battle widths and Battle's `left` offset so the production
+/// layout (bottom-LEFT-half, 25%+25%) becomes the three-pane dev
+/// layout (34/33/32 across full width) and back. The Debug pane's
+/// visibility is driven by the generic [`crate::hud::DevHud`] system;
+/// this one only resizes.
 pub fn apply_chat_layout_for_devhud(
     verbosity: Res<crate::hud::HudVerbosity>,
     mut q: Query<(&ChatPanel, &mut Node)>,
@@ -227,15 +233,15 @@ pub fn apply_chat_layout_for_devhud(
         match (panel.kind, verbosity.dev_hud) {
             (ChatKind::Social, false) => {
                 node.left = Val::Percent(0.0);
-                node.width = Val::Percent(50.0);
+                node.width = Val::Percent(25.0);
             }
             (ChatKind::Social, true) => {
                 node.left = Val::Percent(0.0);
                 node.width = Val::Percent(34.0);
             }
             (ChatKind::Battle, false) => {
-                node.left = Val::Percent(50.0);
-                node.width = Val::Percent(50.0);
+                node.left = Val::Percent(25.0);
+                node.width = Val::Percent(25.0);
             }
             (ChatKind::Battle, true) => {
                 node.left = Val::Percent(34.5);
