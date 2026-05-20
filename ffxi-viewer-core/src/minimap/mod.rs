@@ -209,6 +209,7 @@ impl Plugin for MinimapPlugin {
         app.init_resource::<MinimapMode>()
             .init_resource::<MinimapVisible>()
             .init_resource::<MinimapState>()
+            .init_resource::<overlay::MinimapDots>()
             .add_plugins((topdown::TopdownBackendPlugin, retail::RetailBackendPlugin))
             .add_systems(
                 Update,
