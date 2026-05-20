@@ -21,6 +21,7 @@ pub mod chunk;
 pub mod ftable;
 pub mod generator;
 pub mod kind;
+pub mod map_image;
 pub mod mmb;
 pub mod mzb;
 pub mod npc_names;
