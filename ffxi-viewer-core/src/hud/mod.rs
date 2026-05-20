@@ -117,6 +117,7 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HudVerbosity>();
+        app.init_resource::<chat_panel::ActiveChatTab>();
         app.init_resource::<llm_badge::BadgeClock>();
         app.init_resource::<mesh_debug::MeshHoverDebug>();
         // ZoneFlashState must exist before `update_zone_flash` runs the
@@ -170,6 +171,8 @@ impl Plugin for HudPlugin {
         // ceiling — adding a 21st entry trips the trait-bound error.
         app.add_systems(Update, logout_countdown::update_logout_countdown);
         app.add_systems(Update, apply_dev_hud_visibility);
+        app.add_systems(Update, chat_panel::chat_tab_click_system);
+        app.add_systems(Update, chat_panel::update_chat_tab_visuals_system);
         app.add_systems(Update, weather_icon::update_weather_icon);
         // Combat pulse: detect-then-modulate, chained so the color
         // update sees the latched timestamp from the same frame. Both

@@ -127,12 +127,36 @@ pub struct DebugScrollAccum {
 /// `Debug` (Chat 3): client-internal toasts (auto-load, zone-change
 /// drops, slash-command errors). Kept out of Battle so the operator
 /// can read combat without our diagnostic chatter mixing in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatKind {
+    #[default]
     Social,
     Battle,
     Debug,
 }
+
+/// Which chat tab is currently active. Drives `Display` toggles on the
+/// stacked `ChatPanel` entities and the tab-bar button styling.
+/// Default: `Social` (`Chat 1`), matching retail's "chat-window-1
+/// pre-selected on connect" behavior.
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveChatTab(pub ChatKind);
+
+/// Marker on the tab-bar root.
+#[derive(Component)]
+pub struct ChatTabBar;
+
+/// Per-tab button. Click → mutate [`ActiveChatTab`].
+#[derive(Component, Debug, Clone, Copy)]
+pub struct ChatTabButton {
+    pub kind: ChatKind,
+}
+
+/// Marker on the text-label child of a [`ChatTabButton`]. Lets the
+/// visuals-update system find the label without re-querying the
+/// button's `Children`.
+#[derive(Component)]
+pub struct ChatTabButtonLabel;
 
 impl ChatKind {
     /// Does a given channel render in this panel? See [`ChatKind`] docs
@@ -196,30 +220,109 @@ const AUTOTRANSLATE_COLOR: Color = Color::srgb(0.50, 0.78, 1.00);
 
 
 pub fn spawn_chat_panel(mut commands: Commands) {
-    // Two panes, bottom-LEFT quadrant, each 25% wide and side-by-side.
-    // Social = retail's Chat 1 (say/shout/tell/party/linkshell/yell);
-    // Battle = retail's Chat 2 (combat log + system messages + folded-
-    // in client toasts). The bottom-right quadrant is reserved for
-    // self_hud — matches retail's chat-left / player-frame-right
-    // layout.
+    // Tabbed layout: two panel entities stacked at the SAME bottom-left
+    // slot (0..50% width), only one visible at a time. The tab bar
+    // sitting just above them switches `ActiveChatTab`, which a system
+    // reacts to by toggling `Display` on the panels.
+    //
+    // - Social = retail's Chat 1 (say/shout/tell/party/linkshell/yell)
+    // - Battle = retail's Chat 2 (combat log + system + folded-in
+    //   client debug toasts via `ChatKind::accepts`)
     //
     // The third `ChatKind::Debug` pane has been retired; debug-channel
-    // messages now route into Battle via [`ChatKind::accepts`].
+    // messages render in Battle.
     spawn_panel(
         &mut commands,
         ChatKind::Social,
         Val::Percent(0.0),
-        Val::Percent(25.0),
+        Val::Percent(50.0),
+        Display::Flex,
     );
     spawn_panel(
         &mut commands,
         ChatKind::Battle,
-        Val::Percent(25.0),
-        Val::Percent(25.0),
+        Val::Percent(0.0),
+        Val::Percent(50.0),
+        // Battle starts hidden — Social is the default ActiveChatTab.
+        Display::None,
     );
+    spawn_chat_tab_bar(&mut commands);
 }
 
-fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, width: Val) {
+/// Spawn the tab bar that sits above the chat panels. Two buttons —
+/// "Chat 1" / "Chat 2" — each carrying a [`ChatTabButton`] marker so
+/// [`chat_tab_click_system`] knows which tab to switch to.
+fn spawn_chat_tab_bar(commands: &mut Commands) {
+    commands
+        .spawn((
+            crate::components::InGameEntity,
+            ChatTabBar,
+            Node {
+                position_type: PositionType::Absolute,
+                // Just above the chat-panel top edge. The panel itself
+                // spans bottom 54..214 (54 + PANEL_MAX_HEIGHT_PX=160),
+                // so anchoring the tab bar at bottom: 218 leaves a 4px
+                // breathing gap. When the chat panel shrinks via
+                // auto-decay this gap grows, which is acceptable —
+                // retail's chat-1/chat-2 buttons also live in fixed
+                // screen space, not attached to the pane's top.
+                bottom: Val::Px(218.0),
+                left: Val::Px(0.0),
+                height: Val::Px(20.0),
+                padding: UiRect::axes(Val::Px(2.0), Val::Px(0.0)),
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(2.0),
+                ..default()
+            },
+        ))
+        .with_children(|p| {
+            spawn_tab_button(p, ChatKind::Social, "Chat 1", true);
+            spawn_tab_button(p, ChatKind::Battle, "Chat 2", false);
+        });
+}
+
+fn spawn_tab_button(
+    p: &mut ChildSpawnerCommands,
+    kind: ChatKind,
+    label: &str,
+    is_active: bool,
+) {
+    let (bg, fg, border) = if is_active {
+        (palette::BACKGROUND, palette::ACCENT, palette::ACCENT)
+    } else {
+        (palette::BACKGROUND, palette::MUTED, palette::BORDER)
+    };
+    p.spawn((
+        Button,
+        ChatTabButton { kind },
+        Node {
+            padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BackgroundColor(bg),
+        BorderColor::all(border),
+    ))
+    .with_children(|btn| {
+        btn.spawn((
+            ChatTabButtonLabel,
+            Text::new(label.to_string()),
+            TextFont {
+                font_size: 12.0,
+                ..default()
+            },
+            TextColor(fg),
+        ));
+    });
+}
+
+fn spawn_panel(
+    commands: &mut Commands,
+    kind: ChatKind,
+    left: Val,
+    width: Val,
+    initial_display: Display,
+) {
     // Debug pane is dev-only — tag with DevHud so the verbosity
     // system can park it `Hidden`, and pre-hide here so the first
     // frame doesn't flash it.
@@ -250,6 +353,7 @@ fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, width: Val) {
             flex_direction: FlexDirection::Column,
             justify_content: JustifyContent::FlexEnd,
             row_gap: Val::Px(2.0),
+            display: initial_display,
             // Clip anything that overflows the panel rect. Without
             // this, a chat row that wraps to taller than the
             // remaining panel space spills upward over the 3D
@@ -704,6 +808,65 @@ pub fn chat_wheel_scroll_system(
     }
     // Suppress camera zoom on the same wheel event.
     pointer.wheel = 0.0;
+}
+
+/// React to clicks on a [`ChatTabButton`] — set [`ActiveChatTab`] to
+/// that tab's kind. `Changed<Interaction>` keeps the system cost
+/// per-frame O(buttons-that-just-changed), not O(all buttons).
+pub fn chat_tab_click_system(
+    interactions: Query<(&Interaction, &ChatTabButton), Changed<Interaction>>,
+    mut active: ResMut<ActiveChatTab>,
+) {
+    for (interaction, button) in &interactions {
+        if *interaction == Interaction::Pressed && active.0 != button.kind {
+            active.0 = button.kind;
+        }
+    }
+}
+
+/// Apply [`ActiveChatTab`] to the UI: toggle `Display` on the stacked
+/// [`ChatPanel`]s and recolor the [`ChatTabButton`] labels + borders
+/// so the active tab pops in `palette::ACCENT`.
+pub fn update_chat_tab_visuals_system(
+    active: Res<ActiveChatTab>,
+    mut panel_q: Query<(&ChatPanel, &mut Node), Without<ChatTabButton>>,
+    mut tab_q: Query<
+        (&ChatTabButton, &mut BorderColor, &Children),
+        (Without<ChatPanel>, Without<ChatTabButtonLabel>),
+    >,
+    mut label_q: Query<&mut TextColor, With<ChatTabButtonLabel>>,
+) {
+    if !active.is_changed() {
+        return;
+    }
+    for (panel, mut node) in &mut panel_q {
+        let want = if panel.kind == active.0 {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != want {
+            node.display = want;
+        }
+    }
+    for (button, mut border, children) in &mut tab_q {
+        let is_active = button.kind == active.0;
+        let (border_c, label_c) = if is_active {
+            (palette::ACCENT, palette::ACCENT)
+        } else {
+            (palette::BORDER, palette::MUTED)
+        };
+        if border.left != border_c {
+            *border = BorderColor::all(border_c);
+        }
+        for child in children.iter() {
+            if let Ok(mut tc) = label_q.get_mut(child) {
+                if tc.0 != label_c {
+                    tc.0 = label_c;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
