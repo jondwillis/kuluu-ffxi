@@ -222,6 +222,56 @@ pub fn handle_input_system(
             autorun.phantom_forward = !autorun.phantom_forward;
         }
     }
+    if bindings.just_pressed(Action::ToggleEngage, &keys) {
+        // Toggle: if engaged, cancel the reactor goal (server clears
+        // combat via auto-attack-off semantics); otherwise engage the
+        // current target. The reactor's first tick after Engage emits
+        // ActionKind::Attack (0x01A subkind 0x02), then the server
+        // drives auto-attack swings via 0x028 BATTLE2.
+        let currently_engaged = matches!(
+            state.snapshot.current_goal,
+            Some(ffxi_viewer_wire::ReactorGoal::Engaged { .. })
+        );
+        if currently_engaged {
+            let _ = cmd_tx.0.try_send(AgentCommand::Cancel);
+            state.push_local_toast(ffxi_viewer_wire::ChatLine {
+                channel: ffxi_viewer_wire::ChatChannel::Debug,
+                sender: "client".into(),
+                text: "disengage".into(),
+                server_ts: 0,
+                local_seq: 0,
+            });
+        } else {
+            match target.id {
+                Some(id) => {
+                    let name = state
+                        .snapshot
+                        .entities
+                        .iter()
+                        .find(|e| e.id == id)
+                        .and_then(|e| e.name.clone())
+                        .unwrap_or_else(|| format!("#{id:08X}"));
+                    let _ = cmd_tx.0.try_send(AgentCommand::Engage { target_id: id });
+                    state.push_local_toast(ffxi_viewer_wire::ChatLine {
+                        channel: ffxi_viewer_wire::ChatChannel::Debug,
+                        sender: "client".into(),
+                        text: format!("engaging {name}"),
+                        server_ts: 0,
+                        local_seq: 0,
+                    });
+                }
+                None => {
+                    state.push_local_toast(ffxi_viewer_wire::ChatLine {
+                        channel: ffxi_viewer_wire::ChatChannel::Debug,
+                        sender: "client".into(),
+                        text: "engage: no target (Tab to cycle)".into(),
+                        server_ts: 0,
+                        local_seq: 0,
+                    });
+                }
+            }
+        }
+    }
     if bindings.just_pressed(Action::ToggleLockOn, &keys) {
         let result = lock_on.toggle(target.id);
         let toast = match result {

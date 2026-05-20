@@ -73,6 +73,7 @@ pub fn spawn_llm_badge(mut commands: Commands) {
     commands
         .spawn((
             crate::components::InGameEntity,
+            crate::hud::DevHud,
             LlmBadge,
             Node {
                 position_type: PositionType::Absolute,
@@ -89,6 +90,7 @@ pub fn spawn_llm_badge(mut commands: Commands) {
             },
             BackgroundColor(palette::BACKGROUND),
             BorderColor::all(palette::BORDER),
+            Visibility::Hidden,
         ))
         .with_children(|p| {
             // Dot + label row.

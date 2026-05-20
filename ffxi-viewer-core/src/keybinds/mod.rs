@@ -92,6 +92,15 @@ pub enum Action {
     TargetParty5,
     TargetParty6,
 
+    // ----- Combat (World mode) -----
+    /// Toggle engagement on the current target. If `Target` is set and we
+    /// are not currently engaged, dispatches `AgentCommand::Engage` (the
+    /// reactor's first tick emits `ActionKind::Attack`/0x01A subkind 0x02).
+    /// If already engaged, dispatches `AgentCommand::Cancel` which clears
+    /// the reactor goal. The server's auto-attack timer drives subsequent
+    /// 0x028 BATTLE2 packets while engaged.
+    ToggleEngage,
+
     // ----- UI activation (World mode) -----
     /// Open chat with empty buffer (default Space).
     OpenChat,

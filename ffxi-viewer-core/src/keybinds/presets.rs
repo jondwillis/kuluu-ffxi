@@ -111,6 +111,9 @@ fn shared() -> Vec<(Action, KeyBind)> {
         // ----- Targeting -----
         (Action::CycleTarget, KeyBind::new(KeyCode::Tab)),
         (Action::ClearTarget, KeyBind::new(KeyCode::Escape)),
+        // F for Fight. Single key (no modifier) for low friction during
+        // combat testing; rebindable via /keybinds set.
+        (Action::ToggleEngage, KeyBind::new(KeyCode::KeyF)),
         (Action::TargetSelf, KeyBind::new(KeyCode::F1)),
         (Action::TargetParty2, KeyBind::new(KeyCode::F2)),
         (Action::TargetParty3, KeyBind::new(KeyCode::F3)),

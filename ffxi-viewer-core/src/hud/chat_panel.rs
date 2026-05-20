@@ -186,20 +186,22 @@ const AUTOTRANSLATE_COLOR: Color = Color::srgb(0.50, 0.78, 1.00);
 
 
 pub fn spawn_chat_panel(mut commands: Commands) {
-    // Three panes across the bottom. Widths: 34% / 33% / 33% (Social
-    // gets the slightly wider slot because the operator types into it).
-    // Two 0.5% gaps absorb rounding.
+    // Production layout (dev-hud off): Social + Battle split 50/50,
+    // Debug pane spawned but hidden via [`crate::hud::DevHud`]. Three-
+    // pane dev layout (34/33/32) is reapplied at runtime by
+    // [`apply_chat_layout_for_devhud`] when `/devhud on` flips
+    // [`crate::hud::HudVerbosity::dev_hud`].
     spawn_panel(
         &mut commands,
         ChatKind::Social,
         Val::Percent(0.0),
-        Val::Percent(34.0),
+        Val::Percent(50.0),
     );
     spawn_panel(
         &mut commands,
         ChatKind::Battle,
-        Val::Percent(34.5),
-        Val::Percent(33.0),
+        Val::Percent(50.0),
+        Val::Percent(50.0),
     );
     spawn_panel(
         &mut commands,
@@ -209,46 +211,89 @@ pub fn spawn_chat_panel(mut commands: Commands) {
     );
 }
 
+/// React when [`crate::hud::HudVerbosity::dev_hud`] flips: rewrite
+/// Social + Battle widths and Battle's `left` offset so the two-pane
+/// production layout (50/50) becomes the three-pane dev layout
+/// (34/33/32) and back. The Debug pane's visibility is driven by the
+/// generic [`crate::hud::DevHud`] system; this one only resizes.
+pub fn apply_chat_layout_for_devhud(
+    verbosity: Res<crate::hud::HudVerbosity>,
+    mut q: Query<(&ChatPanel, &mut Node)>,
+) {
+    if !verbosity.is_changed() {
+        return;
+    }
+    for (panel, mut node) in q.iter_mut() {
+        match (panel.kind, verbosity.dev_hud) {
+            (ChatKind::Social, false) => {
+                node.left = Val::Percent(0.0);
+                node.width = Val::Percent(50.0);
+            }
+            (ChatKind::Social, true) => {
+                node.left = Val::Percent(0.0);
+                node.width = Val::Percent(34.0);
+            }
+            (ChatKind::Battle, false) => {
+                node.left = Val::Percent(50.0);
+                node.width = Val::Percent(50.0);
+            }
+            (ChatKind::Battle, true) => {
+                node.left = Val::Percent(34.5);
+                node.width = Val::Percent(33.0);
+            }
+            // Debug pane keeps its fixed slot; visibility (and thus
+            // whether the operator sees it) is owned by DevHud.
+            (ChatKind::Debug, _) => {}
+        }
+    }
+}
+
 fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, width: Val) {
-    commands
-        .spawn((
-            crate::components::InGameEntity,
-            ChatPanel { kind },
-            ChatPanelDecay::default(),
-            // `RelativeCursorPosition::cursor_over` is what
-            // `chat_wheel_scroll_system` reads to decide whether to
-            // consume the wheel. No `Pickable` needed — Bevy UI
-            // updates the field automatically each frame.
-            RelativeCursorPosition::default(),
-            Node {
-                position_type: PositionType::Absolute,
-                // Stack: 28px diagnostics bar + 24px chat-input slot + 2px
-                // gap = 54. The chat input bar at `bottom: 28` (height 24)
-                // slots into the gap below this panel rather than overlaying
-                // its bottommost row. When the input is hidden the gap is
-                // just empty breathing room above the diagnostics strip.
-                bottom: Val::Px(54.0),
-                left,
-                right: Val::Auto,
-                width,
-                height: Val::Px(PANEL_MIN_HEIGHT_PX),
-                padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
-                border: UiRect::all(Val::Px(1.0)),
-                flex_direction: FlexDirection::Column,
-                justify_content: JustifyContent::FlexEnd,
-                row_gap: Val::Px(2.0),
-                // Clip anything that overflows the panel rect. Without
-                // this, a chat row that wraps to taller than the
-                // remaining panel space spills upward over the 3D
-                // viewport (visible bug: `/help`'s multi-line output
-                // overflowed the panel before this was set).
-                overflow: Overflow::clip(),
-                ..default()
-            },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
-        ))
-        .with_children(|p| {
+    // Debug pane is dev-only — tag with DevHud so the verbosity
+    // system can park it `Hidden`, and pre-hide here so the first
+    // frame doesn't flash it.
+    let is_dev = matches!(kind, ChatKind::Debug);
+    let mut e = commands.spawn((
+        crate::components::InGameEntity,
+        ChatPanel { kind },
+        ChatPanelDecay::default(),
+        // `RelativeCursorPosition::cursor_over` is what
+        // `chat_wheel_scroll_system` reads to decide whether to
+        // consume the wheel. No `Pickable` needed — Bevy UI
+        // updates the field automatically each frame.
+        RelativeCursorPosition::default(),
+        Node {
+            position_type: PositionType::Absolute,
+            // Stack: 28px diagnostics bar + 24px chat-input slot + 2px
+            // gap = 54. The chat input bar at `bottom: 28` (height 24)
+            // slots into the gap below this panel rather than overlaying
+            // its bottommost row. When the input is hidden the gap is
+            // just empty breathing room above the diagnostics strip.
+            bottom: Val::Px(54.0),
+            left,
+            right: Val::Auto,
+            width,
+            height: Val::Px(PANEL_MIN_HEIGHT_PX),
+            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::FlexEnd,
+            row_gap: Val::Px(2.0),
+            // Clip anything that overflows the panel rect. Without
+            // this, a chat row that wraps to taller than the
+            // remaining panel space spills upward over the 3D
+            // viewport (visible bug: `/help`'s multi-line output
+            // overflowed the panel before this was set).
+            overflow: Overflow::clip(),
+            ..default()
+        },
+        BackgroundColor(palette::BACKGROUND),
+        BorderColor::all(palette::BORDER),
+    ));
+    if is_dev {
+        e.insert((crate::hud::DevHud, Visibility::Hidden));
+    }
+    e.with_children(|p| {
             for slot in 0..VISIBLE_ROWS {
                 p.spawn((
                     ChatRow { slot },

@@ -488,6 +488,13 @@ pub enum SlashOutcome {
     /// operators can hide the visually-noisy non-collision (decorative)
     /// meshes while keeping the LoS-blocking collision mesh visible.
     SetZoneGeom(Option<ffxi_viewer_core::dat_mzb::ZoneGeomMode>),
+    /// `/devhud on|off|toggle` — show/hide the dev-only HUD widgets
+    /// (stage bar, agent goal panel, MMB hover info, LLM badge,
+    /// bf/sync/last/map/fps strip, [dbg] chat pane). Default off so the
+    /// idle UI matches vanilla FFXI / Ashita / Windower-addon style;
+    /// `on` reveals the operator telemetry for debugging.
+    /// `None` means toggle.
+    SetDevHud(Option<bool>),
     /// `/fps <max>` — cap the render-loop framerate via `bevy_framepace`.
     /// `Some(n)` sets a target FPS (clamped >0); `None` (`/fps 0` or
     /// `/fps off`) disables the limiter. Pure client-side knob — no
@@ -803,6 +810,7 @@ pub fn parse_slash(
         "screenshot" | "ss" => parse_screenshot(rest),
         "drawdistance" | "dd" => parse_drawdistance(rest),
         "zonegeom" => parse_zonegeom(rest),
+        "devhud" => parse_devhud(rest),
         "debug" | "dbg" | "nearby" | "entities" => {
             parse_debug(rest, entities, self_pos, current_target)
         }
@@ -1992,6 +2000,25 @@ fn nearby_entities<'a>(
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
     scored
+}
+
+/// `/devhud on|off|toggle` — show/hide developer telemetry overlays.
+/// Empty argument toggles, matching the convention of `/zonegeom` /
+/// `/heal` / `/capture`. Off by default (vanilla FFXI / Ashita /
+/// Windower-addon style).
+fn parse_devhud(rest: &str) -> SlashOutcome {
+    let arg = rest.trim().to_ascii_lowercase();
+    let setting = match arg.as_str() {
+        "" | "toggle" => None,
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        other => {
+            return SlashOutcome::SystemMessage(format!(
+                "/devhud: bad arg `{other}` (use on|off|toggle)"
+            ));
+        }
+    };
+    SlashOutcome::SetDevHud(setting)
 }
 
 /// `/zonegeom off|collision|all|toggle` — set MZB overlay visibility.

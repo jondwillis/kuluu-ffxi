@@ -45,6 +45,7 @@ pub fn spawn_stage_bar(mut commands: Commands) {
     commands
         .spawn((
             crate::components::InGameEntity,
+            crate::hud::DevHud,
             StageBar,
             Node {
                 position_type: PositionType::Absolute,
@@ -61,6 +62,7 @@ pub fn spawn_stage_bar(mut commands: Commands) {
             },
             BackgroundColor(palette::BACKGROUND),
             BorderColor::all(palette::BORDER),
+            Visibility::Hidden,
         ))
         .with_children(|p| {
             // "▌ ffxi-client " — bold cyan brand.

@@ -59,6 +59,7 @@ pub fn spawn_mesh_debug_hud(mut commands: Commands) {
     commands
         .spawn((
             crate::components::InGameEntity,
+            crate::hud::DevHud,
             MeshDebugHud,
             Node {
                 position_type: PositionType::Absolute,
@@ -149,6 +150,7 @@ pub fn update_hover_state(
 /// nothing is hovered.
 pub fn update_mesh_debug_hud(
     hover: Res<MeshHoverDebug>,
+    verbosity: Res<crate::hud::HudVerbosity>,
     mut hud_q: Query<&mut Visibility, With<MeshDebugHud>>,
     mut text_q: Query<&mut Text, With<MeshDebugHudText>>,
 ) {
@@ -158,6 +160,15 @@ pub fn update_mesh_debug_hud(
     let Ok(mut text) = text_q.single_mut() else {
         return;
     };
+    // Dev-HUD gate. When the operator has /devhud off, never reveal
+    // the hover panel — the DevHud visibility system parks it Hidden,
+    // and this short-circuit keeps us from racing to set Inherited.
+    if !verbosity.dev_hud {
+        if *vis != Visibility::Hidden {
+            *vis = Visibility::Hidden;
+        }
+        return;
+    }
     match &hover.current {
         Some(info) => {
             let pos = match hover.hit_position {

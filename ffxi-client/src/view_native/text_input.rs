@@ -108,6 +108,11 @@ pub struct SlashWriters<'w, 's> {
     /// and the persist system in `crate::graphics_store` writes the
     /// new JSON. Bundled here to stay under Bevy's 16-SystemParam cap.
     pub graphics: ResMut<'w, ffxi_viewer_core::GraphicsSettings>,
+    /// `/devhud on|off|toggle` — show/hide developer telemetry
+    /// overlays. The visibility-driving system in
+    /// `ffxi_viewer_core::hud::apply_dev_hud_visibility` reacts on
+    /// change, walking every `DevHud`-tagged entity.
+    pub hud_verbosity: ResMut<'w, ffxi_viewer_core::hud::HudVerbosity>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -828,6 +833,15 @@ fn apply_slash_outcome(
             let next = setting.unwrap_or_else(|| draw_distance.zone_geom_mode.cycle());
             draw_distance.zone_geom_mode = next;
             push_system_chat_line(scene_state, format!("/zonegeom: {}", next.label()));
+        }
+        SlashOutcome::SetDevHud(setting) => {
+            // `None` means toggle; explicit `on`/`off` overrides.
+            let next = setting.unwrap_or(!slash_writers.hud_verbosity.dev_hud);
+            slash_writers.hud_verbosity.dev_hud = next;
+            push_system_chat_line(
+                scene_state,
+                format!("/devhud: {}", if next { "on" } else { "off" }),
+            );
         }
         SlashOutcome::SetDrawDistance(op) => {
             use super::slash_commands::DrawDistanceOp;
