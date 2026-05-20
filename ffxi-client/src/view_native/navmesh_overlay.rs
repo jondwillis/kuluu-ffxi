@@ -256,45 +256,43 @@ fn snap_entities_to_navmesh_system(
     mut cache: ResMut<SnapHeightCache>,
     mut q: Query<(&WorldEntity, &mut Transform, Has<IsSelf>, Has<BakedActor>)>,
 ) {
-    // Two-tier ground snap:
+    // Single-tier ground snap, MZB-first:
     //
-    // - **Self entity** uses the MZB collision-mesh raycast. This is
-    //   what the operator's eye is locked on — they notice if the
-    //   player floats off the rendered floor by even 0.4 yalms.
-    // - **All other entities** use the cheap Detour `nearest_height_at`
-    //   query. The two surfaces differ by ~0.4 yalms (per `/debug heights`
-    //   in Bastok); invisible at third-person NPC distance.
+    // Every entity runs the MZB raycast (now O(grid_cell) instead of
+    // O(zone_tris) — see `MzbCollisionGeometry::cell_index`), and
+    // Detour `nearest_height_at` is the fallback when the entity sits
+    // outside the loaded MZB footprint. The historical "self uses MZB,
+    // others use Detour" split is gone: the ~0.4-yalm MZB↔Detour gap
+    // it created was already visible in `/debug heights` in Bastok,
+    // and the floor-normal filter the MZB raycast applies catches
+    // elevated-tri lock-in (rooftops, eaves) that Detour can't.
     //
-    // Rationale: the linear MZB raycast scans ~5k tris per query
-    // (sufficient for one entity per frame at 1.5% CPU budget), but
-    // running it for every entity in a populated zone scales to
-    // tens-of-millions of intersections per frame — the cause of the
-    // FPS tank observed after the initial C3.1 rollout.
+    // Performance: the grid cell typically holds tens of tris for an
+    // outdoor zone, so per-entity raycast cost is < 1 µs even with
+    // hundreds of entities visible.
     let nav_guard = state.nav.as_ref().and_then(|n| n.lock().ok());
     let mzb_loaded = collision_geom.tri_count() > 0;
     if !mzb_loaded && nav_guard.is_none() {
         return;
     }
 
-    for (entity, mut t, is_self, has_baked_mesh) in q.iter_mut() {
-        let ground_y: Option<f32> = if is_self && mzb_loaded {
-            // Player: MZB raycast. Fall back to navmesh if the
-            // column at the player's XZ has no triangle below
-            // (e.g., off the edge of the loaded zone bounds).
-            //
-            // `ceiling_y = current_y + STEP_TOLERANCE` so the snap
-            // ignores overhead geometry the player is walking
-            // *under* (gate tops, arches, eaves) but still allows
-            // small step-ups onto curbs and ramps.
-            const STEP_TOLERANCE: f32 = 2.0;
-            let ceiling_y = t.translation.y + STEP_TOLERANCE;
-            let mzb = collision_geom
-                .ground_raycast(Vec2::new(t.translation.x, t.translation.z), ceiling_y);
-            mzb.or_else(|| nav_y_bevy(&nav_guard, &mut cache, entity.id, &t))
+    for (entity, mut t, _is_self, has_baked_mesh) in q.iter_mut() {
+        // `ceiling_y = current_y + STEP_TOLERANCE` so the snap ignores
+        // overhead geometry the entity is walking *under* (gate tops,
+        // arches, eaves) but still allows small step-ups onto curbs
+        // and ramps. The MZB raycast's `FLOOR_NORMAL_MIN` filter
+        // additionally rejects downward-facing surfaces, so an entity
+        // who briefly clips into a low ceiling won't lock onto it.
+        const STEP_TOLERANCE: f32 = 2.0;
+        let ceiling_y = t.translation.y + STEP_TOLERANCE;
+        let mzb = if mzb_loaded {
+            collision_geom
+                .ground_raycast(Vec2::new(t.translation.x, t.translation.z), ceiling_y)
         } else {
-            // NPCs / mobs / other PCs: cheap navmesh query.
-            nav_y_bevy(&nav_guard, &mut cache, entity.id, &t)
+            None
         };
+        let ground_y: Option<f32> =
+            mzb.or_else(|| nav_y_bevy(&nav_guard, &mut cache, entity.id, &t));
 
         if let Some(ground) = ground_y {
             t.translation.y = ground + visual_root_offset(entity.kind, has_baked_mesh);

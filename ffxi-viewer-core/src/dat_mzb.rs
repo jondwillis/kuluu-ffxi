@@ -163,7 +163,29 @@ pub struct MzbCollisionGeometry {
     pub positions: Vec<Vec3>,
     /// Flat triangle indices: `tri_i` = `(indices[i*3], indices[i*3+1], indices[i*3+2])`.
     pub indices: Vec<u32>,
+    /// XZ uniform-grid index: `(cell_x, cell_z) → tri_index` (where
+    /// `tri_index * 3 ..= tri_index * 3 + 2` slices [`indices`]). A
+    /// triangle is inserted into every cell its 2D AABB overlaps so a
+    /// downward raycast at the entity's XZ only scans the local cell
+    /// rather than the whole zone. Empty when no MZB is loaded.
+    pub cell_index: std::collections::HashMap<(i32, i32), Vec<u32>>,
 }
+
+/// Width (yalms) of one XZ cell in [`MzbCollisionGeometry::cell_index`].
+/// 8 yalms is large enough that typical wall/floor tris (1–4 yalms
+/// across) drop into one or two cells, small enough that a populated
+/// outdoor zone keeps each cell's tri list to tens of entries.
+pub const MZB_GRID_CELL: f32 = 8.0;
+
+/// Minimum `normal.y` (in Bevy world frame) for a triangle to count as
+/// a walkable floor in [`MzbCollisionGeometry::ground_raycast`]. `0.5`
+/// corresponds to a 60° max slope, which matches the legacy FFXI
+/// stair-gradient cap and keeps everything from gentle ramps through
+/// steep dungeon stairs eligible, while excluding vertical walls,
+/// downward-facing eaves, and ceilings (which previously caused the
+/// snap to lock onto rooftop or arch tris and float the player a few
+/// yalms above the real floor).
+pub const FLOOR_NORMAL_MIN: f32 = 0.5;
 
 impl MzbCollisionGeometry {
     /// Number of triangles backing this geometry.
@@ -171,48 +193,119 @@ impl MzbCollisionGeometry {
         self.indices.len() / 3
     }
 
-    /// Cast a ray straight down (Bevy −Y) at (`xz.x`, `xz.y`) from a
-    /// y high above any plausible zone height, and return the **highest**
-    /// Y of any triangle the ray hits **at or below `ceiling_y`**.
-    /// `None` if the column at `xz` has no qualifying triangle.
+    /// Cast a ray straight down (Bevy −Y) at (`xz.x`, `xz.y`) and
+    /// return the **highest** Y of any **upward-facing** triangle hit
+    /// at or below `ceiling_y`. `None` when no qualifying triangle
+    /// sits in the column.
     ///
-    /// `ceiling_y` filters out overhead geometry — arches, gate tops,
-    /// eaves, bridges the player is walking *under*. Without it, "highest
-    /// hit" warps the player onto the gate roof in South San d'Oria
-    /// every time they pass through the entrance.
+    /// "Upward-facing" is `normal.y ≥ FLOOR_NORMAL_MIN` — without that
+    /// filter the raycast would happily snap the entity onto an
+    /// overhanging eave, a vertical wall edge, or an inverted ceiling,
+    /// because those tris can still satisfy `hit_y ≤ ceiling_y` if the
+    /// entity is already elevated.
     ///
-    /// Of the surfaces below the ceiling, we still pick the highest:
-    /// that's the multi-level-building case (player on 2nd floor — snap
-    /// to the 2nd floor, not the basement).
-    ///
-    /// Caller policy: pass `player.y + step_tolerance` as the ceiling
-    /// so small step-ups (curbs, ramps) still work. The
-    /// `snap_entities_to_navmesh_system` caller uses 2 yalms — bigger
-    /// than any real step, smaller than any real arch.
+    /// `ceiling_y` continues to filter overhead floor-like geometry —
+    /// arches, gate roofs, second-floor surfaces the player is walking
+    /// *under*. Of the remaining candidates, we still pick the highest
+    /// (multi-level-building case: player on 2nd floor → snap to the
+    /// 2nd floor, not the basement).
     pub fn ground_raycast(&self, xz: Vec2, ceiling_y: f32) -> Option<f32> {
+        let mut best_y: Option<f32> = None;
+        self.for_each_hit_in_column(xz, |hit_y, normal| {
+            if normal.y < FLOOR_NORMAL_MIN || hit_y > ceiling_y {
+                return;
+            }
+            best_y = Some(match best_y {
+                Some(prev) if prev > hit_y => prev,
+                _ => hit_y,
+            });
+        });
+        best_y
+    }
+
+    /// Return every triangle the downward raycast hits at (`xz`),
+    /// sorted by `hit_y` descending. Unfiltered — both upward- and
+    /// downward-facing tris are included so the diagnostic
+    /// (`/debug heights`) can show *why* a tri was rejected by
+    /// [`ground_raycast`] (normal too low, above ceiling, etc.).
+    pub fn ground_raycast_all(&self, xz: Vec2) -> Vec<(f32, Vec3)> {
+        let mut hits: Vec<(f32, Vec3)> = Vec::new();
+        self.for_each_hit_in_column(xz, |hit_y, normal| hits.push((hit_y, normal)));
+        hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        hits
+    }
+
+    /// Common driver: scan only the cell at (`xz`) (or every tri when
+    /// the cell index is empty, i.e. legacy callers before the grid
+    /// was built), and invoke `visit(hit_y, normal)` for each tri the
+    /// ray intersects. Normal is in Bevy world frame, normalized.
+    fn for_each_hit_in_column(&self, xz: Vec2, mut visit: impl FnMut(f32, Vec3)) {
         const RAY_ORIGIN_Y: f32 = 1000.0;
         let orig = Vec3::new(xz.x, RAY_ORIGIN_Y, xz.y);
         let dir = Vec3::new(0.0, -1.0, 0.0);
-        let mut best_y: Option<f32> = None;
-        for tri in self.indices.chunks_exact(3) {
-            let v0 = self.positions[tri[0] as usize];
-            let v1 = self.positions[tri[1] as usize];
-            let v2 = self.positions[tri[2] as usize];
-            if let Some(t) = ray_tri_intersect(orig, dir, v0, v1, v2) {
-                let hit_y = orig.y + t * dir.y;
-                if hit_y > ceiling_y {
-                    // Overhead geometry (gate top, arch, eave). Don't
-                    // let it pull the player onto its roof.
-                    continue;
+
+        // Pull the candidate tri-index list from the spatial grid when
+        // available. Falls back to a full scan if the resource was
+        // populated without the index (defensive — every code path
+        // that fills `positions/indices` now also fills `cell_index`,
+        // but we don't want a partial-load to crash the raycast).
+        if !self.cell_index.is_empty() {
+            let cell = ((xz.x / MZB_GRID_CELL).floor() as i32, (xz.y / MZB_GRID_CELL).floor() as i32);
+            if let Some(tri_ids) = self.cell_index.get(&cell) {
+                for &tri_id in tri_ids {
+                    self.visit_tri(orig, dir, tri_id as usize, &mut visit);
                 }
-                best_y = Some(match best_y {
-                    Some(prev) if prev > hit_y => prev,
-                    _ => hit_y,
-                });
+            }
+            return;
+        }
+
+        for tri_id in 0..(self.indices.len() / 3) {
+            self.visit_tri(orig, dir, tri_id, &mut visit);
+        }
+    }
+
+    fn visit_tri(&self, orig: Vec3, dir: Vec3, tri_id: usize, visit: &mut impl FnMut(f32, Vec3)) {
+        let base = tri_id * 3;
+        let v0 = self.positions[self.indices[base] as usize];
+        let v1 = self.positions[self.indices[base + 1] as usize];
+        let v2 = self.positions[self.indices[base + 2] as usize];
+        if let Some(t) = ray_tri_intersect(orig, dir, v0, v1, v2) {
+            let hit_y = orig.y + t * dir.y;
+            let normal = (v1 - v0).cross(v2 - v0).normalize_or_zero();
+            visit(hit_y, normal);
+        }
+    }
+}
+
+/// Build the XZ cell index from the merged collision positions +
+/// indices. Each triangle is inserted into every grid cell its 2D AABB
+/// (XZ projection) overlaps. Cheap to call once at zone load; the
+/// `HashMap` allocation stays around as long as the zone is loaded.
+fn build_cell_index(
+    positions: &[Vec3],
+    indices: &[u32],
+) -> std::collections::HashMap<(i32, i32), Vec<u32>> {
+    let mut idx: std::collections::HashMap<(i32, i32), Vec<u32>> =
+        std::collections::HashMap::new();
+    for (tri_id, tri) in indices.chunks_exact(3).enumerate() {
+        let v0 = positions[tri[0] as usize];
+        let v1 = positions[tri[1] as usize];
+        let v2 = positions[tri[2] as usize];
+        let min_x = v0.x.min(v1.x).min(v2.x);
+        let max_x = v0.x.max(v1.x).max(v2.x);
+        let min_z = v0.z.min(v1.z).min(v2.z);
+        let max_z = v0.z.max(v1.z).max(v2.z);
+        let cx0 = (min_x / MZB_GRID_CELL).floor() as i32;
+        let cx1 = (max_x / MZB_GRID_CELL).floor() as i32;
+        let cz0 = (min_z / MZB_GRID_CELL).floor() as i32;
+        let cz1 = (max_z / MZB_GRID_CELL).floor() as i32;
+        for cz in cz0..=cz1 {
+            for cx in cx0..=cx1 {
+                idx.entry((cx, cz)).or_default().push(tri_id as u32);
             }
         }
-        best_y
     }
+    idx
 }
 
 /// Möller–Trumbore ray-triangle intersection. Returns `t` (≥ ε), or
@@ -1130,6 +1223,14 @@ pub fn process_load_mzb_requests(
             .map(|p| Vec3::new(p[0], p[1], p[2]))
             .collect();
         collision_geometry.indices = collision_indices.clone();
+        // XZ grid index for O(cell) raycasts. The snap fires per-frame
+        // for every entity in the zone, so the prior O(tris) linear
+        // scan tanked FPS in populated outdoor zones — see the
+        // historical comment in `snap_entities_to_navmesh_system`.
+        collision_geometry.cell_index = build_cell_index(
+            &collision_geometry.positions,
+            &collision_geometry.indices,
+        );
 
         spawn_merged(
             &mut commands,

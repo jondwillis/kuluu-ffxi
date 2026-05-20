@@ -67,8 +67,18 @@ pub fn feet_offset(kind: EntityKind) -> f32 {
 /// systems consult this to switch their visual offset model: a baked
 /// mesh's origin is the **skeleton root (hip)**, not the mesh center
 /// the legacy capsule assumed.
-#[derive(Component)]
-pub struct BakedActor;
+///
+/// `min_mesh_y` is the **lowest** Y of any baked vertex in Bevy frame —
+/// i.e., the actual hip-to-foot distance for this specific actor.
+/// Populated by the bake-extent walk in
+/// [`crate::dat_vos2::spawn_skinned_actor`] /
+/// `spawn_vos2_meshes_with_skeleton` and surfaced by `/debug heights`,
+/// so the operator can spot when [`visual_root_offset`]'s default `0.9`
+/// disagrees with reality (Taru shorter, Galka taller).
+#[derive(Component, Clone, Copy, Debug)]
+pub struct BakedActor {
+    pub min_mesh_y: f32,
+}
 
 /// Distance from the entity transform's y down to the "ground"
 /// reference plane the snap should land on.
