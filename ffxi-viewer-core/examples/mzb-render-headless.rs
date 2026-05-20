@@ -198,7 +198,7 @@ fn setup_camera(
 ) {
     // Empirical workflow wants every visible surface, both collision
     // and decoration, so we override the production default (`Off`).
-    draw.zone_geom_mode = ZoneGeomMode::All;
+    draw.zone_geom_mode = ZoneGeomMode::Off;
     // Bump the cull distance well past any plausible zone extent so
     // distance culling doesn't hide the surfaces we're trying to capture.
     draw.world = 10_000.0;
