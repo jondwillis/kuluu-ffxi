@@ -2129,6 +2129,16 @@ fn decode_battle_message(
     };
     let message_num = u16::from_le_bytes(data[20..22].try_into().unwrap());
 
+    // TODO(msg_basic.dat): /check responses (ids 170-178) and the
+    // Checkparam* block (712-733) are declared in LSB's enum but the
+    // English text lives in the FFXI client's localized
+    // `msg_basic.dat` — we don't ship a DMSG parser, so these drop
+    // silently here. xi-tinkerer's DMSG impl is AGPL (cite-only per
+    // memory), so unblocking /check requires writing our own DMSG
+    // decoder + a build.rs step in ffxi-proto/. Until then, /check
+    // appears silent to the operator. The decoder's strict
+    // "unknown id → None" contract is documented + tested at
+    // `battle_message_unknown_id_returns_none`.
     let raw = ffxi_proto::msg_basic::lookup(message_num)?;
     let cas_name = name_for_id(cas_id, name_cache);
     let tar_name = name_for_id(tar_id, name_cache);
