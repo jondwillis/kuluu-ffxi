@@ -24,7 +24,7 @@
 //! muscle memory.
 
 use bevy::prelude::*;
-use ffxi_viewer_wire::{Entity as WireEntity, EntityKind};
+use ffxi_viewer_wire::{Entity as WireEntity, EntityKind, ReactorGoal};
 
 use crate::hud::palette;
 use crate::scene::Target;
@@ -49,6 +49,12 @@ pub struct TargetHpText;
 /// Marker on the distance-readout text node.
 #[derive(Component)]
 pub struct TargetDistText;
+
+/// Marker on the small "⚔ Engaged" badge that surfaces when the reactor's
+/// current goal is `Engaged{target_id}` AND that target_id matches the
+/// panel's selected target. Empty string when not engaged.
+#[derive(Component)]
+pub struct TargetEngagedBadge;
 
 const PANEL_WIDTH_PX: f32 = 280.0;
 const HP_BAR_WIDTH_PX: f32 = 200.0;
@@ -91,6 +97,20 @@ pub fn spawn_target_panel(mut commands: Commands) {
                     ..default()
                 },
                 TextColor(palette::TEXT),
+            ));
+
+            // Engaged badge — empty when idle, "⚔ Engaged" in red when
+            // the reactor is currently auto-attacking this target. Color
+            // matches the panel border swap so the operator's eye picks
+            // up the change in either spot.
+            p.spawn((
+                TargetEngagedBadge,
+                Text::new(""),
+                TextFont {
+                    font_size: 12.0,
+                    ..default()
+                },
+                TextColor(palette::STAGE_BAD),
             ));
 
             // HP bar row: track + fill + percent + distance.
@@ -147,13 +167,17 @@ pub fn spawn_target_panel(mut commands: Commands) {
 pub fn update_target_panel_system(
     target: Res<Target>,
     state: Res<SceneState>,
-    mut panel_q: Query<&mut Node, (With<TargetPanel>, Without<TargetHpFill>)>,
+    mut panel_q: Query<
+        (&mut Node, &mut BorderColor),
+        (With<TargetPanel>, Without<TargetHpFill>),
+    >,
     mut header_q: Query<
         &mut Text,
         (
             With<TargetHeader>,
             Without<TargetHpText>,
             Without<TargetDistText>,
+            Without<TargetEngagedBadge>,
         ),
     >,
     mut hp_fill_q: Query<
@@ -166,6 +190,7 @@ pub fn update_target_panel_system(
             With<TargetHpText>,
             Without<TargetHeader>,
             Without<TargetDistText>,
+            Without<TargetEngagedBadge>,
         ),
     >,
     mut dist_q: Query<
@@ -174,6 +199,16 @@ pub fn update_target_panel_system(
             With<TargetDistText>,
             Without<TargetHeader>,
             Without<TargetHpText>,
+            Without<TargetEngagedBadge>,
+        ),
+    >,
+    mut engaged_q: Query<
+        &mut Text,
+        (
+            With<TargetEngagedBadge>,
+            Without<TargetHeader>,
+            Without<TargetHpText>,
+            Without<TargetDistText>,
         ),
     >,
 ) {
@@ -181,7 +216,7 @@ pub fn update_target_panel_system(
         return;
     }
 
-    let Ok(mut panel_node) = panel_q.single_mut() else {
+    let Ok((mut panel_node, mut panel_border)) = panel_q.single_mut() else {
         return;
     };
 
@@ -203,6 +238,30 @@ pub fn update_target_panel_system(
 
     if panel_node.display == Display::None {
         panel_node.display = Display::Flex;
+    }
+
+    // Engagement state. "Engaged on THIS target" requires both the
+    // reactor goal == Engaged AND the engaged target_id matches the
+    // panel's current target. Engaging mob A while targeting mob B is
+    // a normal mid-fight state ("targeting next mob to assist on") and
+    // should NOT light up the panel as engaged.
+    let engaged_on_this = matches!(
+        snap.current_goal,
+        Some(ReactorGoal::Engaged { target_id: g, .. }) if g == target_id
+    );
+    let want_border = if engaged_on_this {
+        palette::STAGE_BAD // red — engaged
+    } else {
+        palette::ACCENT // cyan — targeted but not engaged
+    };
+    if panel_border.left != want_border {
+        *panel_border = BorderColor::all(want_border);
+    }
+    if let Ok(mut text) = engaged_q.single_mut() {
+        let want = if engaged_on_this { "⚔ Engaged" } else { "" };
+        if text.as_str() != want {
+            **text = want.to_string();
+        }
     }
 
     if let Ok(mut text) = header_q.single_mut() {
