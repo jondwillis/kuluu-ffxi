@@ -113,6 +113,18 @@ pub struct SlashWriters<'w, 's> {
     /// `ffxi_viewer_core::hud::apply_dev_hud_visibility` reacts on
     /// change, walking every `DevHud`-tagged entity.
     pub hud_verbosity: ResMut<'w, ffxi_viewer_core::hud::HudVerbosity>,
+    /// `/minimap mode top|retail|auto` — image-source backend
+    /// selector. The reactor in
+    /// `ffxi_viewer_core::minimap::update_minimap_image_source`
+    /// repoints the `ImageNode` on change.
+    pub minimap_mode: ResMut<'w, ffxi_viewer_core::minimap::MinimapMode>,
+    /// `/minimap show|hide|toggle` — visibility flag mirrored onto
+    /// the UI root's `Display` by `update_minimap_visibility`.
+    pub minimap_visible: ResMut<'w, ffxi_viewer_core::minimap::MinimapVisible>,
+    /// `/minimap cull <N>` — ceiling-cull height in yalms for the
+    /// top-down bake. Change-detected by the top-down backend to
+    /// trigger a re-bake on the next zone-enter scan.
+    pub topdown_cull: ResMut<'w, ffxi_viewer_core::minimap::topdown::TopdownCullPolicy>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -842,6 +854,48 @@ fn apply_slash_outcome(
                 scene_state,
                 format!("/devhud: {}", if next { "on" } else { "off" }),
             );
+        }
+        SlashOutcome::SetMinimap(op) => {
+            use ffxi_viewer_core::minimap::MinimapMode;
+            use super::slash_commands::MinimapOp;
+            let chat = match op {
+                MinimapOp::Status => format!(
+                    "/minimap: mode={:?} visible={} cull={:.1}",
+                    *slash_writers.minimap_mode,
+                    slash_writers.minimap_visible.0,
+                    slash_writers.topdown_cull.top_cull_yalms,
+                ),
+                MinimapOp::Show => {
+                    slash_writers.minimap_visible.0 = true;
+                    "/minimap: shown".into()
+                }
+                MinimapOp::Hide => {
+                    slash_writers.minimap_visible.0 = false;
+                    "/minimap: hidden".into()
+                }
+                MinimapOp::Toggle => {
+                    let next = !slash_writers.minimap_visible.0;
+                    slash_writers.minimap_visible.0 = next;
+                    format!("/minimap: {}", if next { "shown" } else { "hidden" })
+                }
+                MinimapOp::ModeTopDown => {
+                    *slash_writers.minimap_mode = MinimapMode::TopDown;
+                    "/minimap: mode=top-down".into()
+                }
+                MinimapOp::ModeRetail => {
+                    *slash_writers.minimap_mode = MinimapMode::Retail;
+                    "/minimap: mode=retail (no retail texture loaded yet for this zone)".into()
+                }
+                MinimapOp::ModeAuto => {
+                    *slash_writers.minimap_mode = MinimapMode::Auto;
+                    "/minimap: mode=auto".into()
+                }
+                MinimapOp::SetCull(v) => {
+                    slash_writers.topdown_cull.top_cull_yalms = v;
+                    format!("/minimap: cull={v:.1} yalms (re-baking next frame)")
+                }
+            };
+            push_system_chat_line(scene_state, chat);
         }
         SlashOutcome::SetDrawDistance(op) => {
             use super::slash_commands::DrawDistanceOp;

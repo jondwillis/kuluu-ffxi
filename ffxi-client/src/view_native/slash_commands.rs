@@ -495,6 +495,10 @@ pub enum SlashOutcome {
     /// `on` reveals the operator telemetry for debugging.
     /// `None` means toggle.
     SetDevHud(Option<bool>),
+    /// `/minimap [show|hide|toggle|mode <top|retail|auto>|cull <N>]`
+    /// — drive the minimap HUD's visibility, image-source backend,
+    /// and ceiling-cull height. See [`MinimapOp`].
+    SetMinimap(MinimapOp),
     /// `/fps <max>` — cap the render-loop framerate via `bevy_framepace`.
     /// `Some(n)` sets a target FPS (clamped >0); `None` (`/fps 0` or
     /// `/fps off`) disables the limiter. Pure client-side knob — no
@@ -590,6 +594,33 @@ pub enum DrawDistanceOp {
     Show,
     SetWorld(f32),
     SetMob(f32),
+}
+
+/// `/minimap` subcommand variants. Drives the minimap HUD —
+/// visibility, background-image backend, and the top-down ceiling-cull
+/// height. See `ffxi_viewer_core::minimap` for what each field maps to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MinimapOp {
+    /// `/minimap` (no arg) — print current mode + visibility + cull.
+    Status,
+    /// `/minimap show` — force visible.
+    Show,
+    /// `/minimap hide` — force hidden.
+    Hide,
+    /// `/minimap toggle` — flip visibility.
+    Toggle,
+    /// `/minimap mode top` — pin the TopDown bake as the background.
+    ModeTopDown,
+    /// `/minimap mode retail` — pin the retail stylized image (no-op
+    /// until the parser lands; the dispatcher emits a system message
+    /// when no retail image is loaded for the current zone).
+    ModeRetail,
+    /// `/minimap mode auto` — let the resolved-mode picker choose
+    /// (retail when available, else top-down).
+    ModeAuto,
+    /// `/minimap cull <N>` — set TopdownCullPolicy.top_cull_yalms.
+    /// Triggers an immediate re-bake.
+    SetCull(f32),
 }
 
 /// `/agent` subcommand variants.
@@ -811,6 +842,7 @@ pub fn parse_slash(
         "drawdistance" | "dd" => parse_drawdistance(rest),
         "zonegeom" => parse_zonegeom(rest),
         "devhud" => parse_devhud(rest),
+        "minimap" | "mm" => parse_minimap(rest),
         "debug" | "dbg" | "nearby" | "entities" => {
             parse_debug(rest, entities, self_pos, current_target)
         }
@@ -2019,6 +2051,47 @@ fn parse_devhud(rest: &str) -> SlashOutcome {
         }
     };
     SlashOutcome::SetDevHud(setting)
+}
+
+/// `/minimap [show|hide|toggle|mode <top|retail|auto>|cull <N>]`
+///
+/// Bare `/minimap` reports the current mode + visibility + cull height
+/// as a system chat line (the dispatcher reads the live resources to
+/// format it). `mode` and `cull` take a sub-argument.
+fn parse_minimap(rest: &str) -> SlashOutcome {
+    let mut parts = rest.trim().splitn(2, char::is_whitespace);
+    let verb = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    let arg = parts.next().unwrap_or("").trim();
+    let op = match verb.as_str() {
+        "" => MinimapOp::Status,
+        "show" | "on" => MinimapOp::Show,
+        "hide" | "off" => MinimapOp::Hide,
+        "toggle" => MinimapOp::Toggle,
+        "mode" => match arg.to_ascii_lowercase().as_str() {
+            "top" | "topdown" => MinimapOp::ModeTopDown,
+            "retail" => MinimapOp::ModeRetail,
+            "auto" | "" => MinimapOp::ModeAuto,
+            other => {
+                return SlashOutcome::SystemMessage(format!(
+                    "/minimap mode: bad arg `{other}` (use top|retail|auto)"
+                ));
+            }
+        },
+        "cull" => match arg.parse::<f32>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => MinimapOp::SetCull(v),
+            _ => {
+                return SlashOutcome::SystemMessage(format!(
+                    "/minimap cull: bad value `{arg}` (expected non-negative number)"
+                ));
+            }
+        },
+        other => {
+            return SlashOutcome::SystemMessage(format!(
+                "/minimap: unknown sub `{other}` (use show|hide|toggle|mode|cull)"
+            ));
+        }
+    };
+    SlashOutcome::SetMinimap(op)
 }
 
 /// `/zonegeom off|collision|all|toggle` — set MZB overlay visibility.
