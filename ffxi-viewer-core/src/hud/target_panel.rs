@@ -260,15 +260,27 @@ pub fn update_target_panel_system(
         panel_node.display = Display::Flex;
     }
 
-    // Engagement state. "Engaged on THIS target" requires both the
-    // reactor goal == Engaged AND the engaged target_id matches the
-    // panel's current target. Engaging mob A while targeting mob B is
-    // a normal mid-fight state ("targeting next mob to assist on") and
-    // should NOT light up the panel as engaged.
-    let engaged_on_this = matches!(
+    // Engagement state. Server-authoritative: the local PC entity's
+    // `bt_target_id` is the server's notion of "what am I auto-attacking"
+    // and is set by 0x00D updates regardless of how engagement started
+    // (F-keybind, /attack typed, mob aggro pulling us into combat, MCP
+    // reactor goal, …). If `bt_target_id == panel's selected target_id`,
+    // the player is currently swinging at this target — flag engaged.
+    //
+    // Fallback to `current_goal == Engaged{target}` for the brief window
+    // after pressing F before the first 0x00D update reflects the new
+    // bt_target_id server-side. That keeps the badge from flickering
+    // off in the gap.
+    let self_engaged_on_target = snap
+        .self_char_id
+        .and_then(|sid| snap.entities.iter().find(|e| e.id == sid))
+        .map(|self_pc| self_pc.bt_target_id == target_id)
+        .unwrap_or(false);
+    let goal_engaged_on_target = matches!(
         snap.current_goal,
         Some(ReactorGoal::Engaged { target_id: g, .. }) if g == target_id
     );
+    let engaged_on_this = self_engaged_on_target || goal_engaged_on_target;
     let want_border = if engaged_on_this {
         palette::STAGE_BAD // red — engaged
     } else {
