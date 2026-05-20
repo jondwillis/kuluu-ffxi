@@ -125,6 +125,7 @@ impl Plugin for HudPlugin {
         // Update tick after `OnEnter(InGame)` panics on missing resource.
         app.init_resource::<zone_flash::ZoneFlashState>();
         app.init_resource::<self_hud::SelfHealTracker>();
+        app.init_resource::<target_panel::SwingPulse>();
         app.init_resource::<logout_countdown::LogoutCountdownAnchor>();
         app.init_resource::<logout_countdown::OptimisticLogoutCountdown>();
         app.add_message::<logout_countdown::LogoutRequested>();
@@ -171,6 +172,18 @@ impl Plugin for HudPlugin {
         app.add_systems(Update, apply_dev_hud_visibility);
         app.add_systems(Update, chat_panel::apply_chat_layout_for_devhud);
         app.add_systems(Update, weather_icon::update_weather_icon);
+        // Combat pulse: detect-then-modulate, chained so the color
+        // update sees the latched timestamp from the same frame. Both
+        // must run every tick (no `is_changed` gate) — the flash decay
+        // animates between server snapshots.
+        app.add_systems(
+            Update,
+            (
+                target_panel::detect_swing_pulse_system,
+                target_panel::pulse_engaged_badge_color_system,
+            )
+                .chain(),
+        );
         app.add_systems(
             Update,
             (

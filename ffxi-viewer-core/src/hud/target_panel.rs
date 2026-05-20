@@ -56,6 +56,26 @@ pub struct TargetDistText;
 #[derive(Component)]
 pub struct TargetEngagedBadge;
 
+/// Pulse latch: whenever the count of `ChatChannel::Battle` lines grows
+/// (server confirmed a hit/miss/proc/etc.), `last_swing_secs` is set to
+/// the current `Time::elapsed_secs()`. The badge color modulates from
+/// bright-white back to base red over `PULSE_DECAY_SECS` after each
+/// pulse — every server-side swing is visible as a flash.
+///
+/// Frame-rate independent: an inbound 0x028 → ChatLine → snapshot fold
+/// happens at server tick rate; the badge flash decays at render rate.
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct SwingPulse {
+    pub last_swing_secs: f32,
+    pub prev_battle_count: usize,
+}
+
+/// Time for the swing flash to fade back to base color. 0.25 s is short
+/// enough that successive swings (auto-attack is ~3 s/swing at base, but
+/// procs/additional effects can stack within a single 0x028) read as
+/// distinct pulses, not a continuous glow.
+const PULSE_DECAY_SECS: f32 = 0.25;
+
 const PANEL_WIDTH_PX: f32 = 280.0;
 const HP_BAR_WIDTH_PX: f32 = 200.0;
 const HP_BAR_HEIGHT_PX: f32 = 6.0;
@@ -302,6 +322,64 @@ pub fn update_target_panel_system(
         if **text != want {
             **text = want;
         }
+    }
+}
+
+/// Latch [`SwingPulse::last_swing_secs`] whenever the count of
+/// `ChatChannel::Battle` lines in the rendered chat grows. Each grow
+/// corresponds to a server-confirmed combat event (hit / miss / proc /
+/// additional effect / reaction) — every one of those should pulse the
+/// engaged badge so the operator sees the rhythm of combat.
+///
+/// Uses the same `prev_*_len` idiom as
+/// [`crate::hud::chat_panel::ChatPanelDecay`]: snapshot the prior count,
+/// compare against the live one, latch on growth. Frame-rate independent
+/// — the latch sets a timestamp, decay happens in
+/// [`pulse_engaged_badge_color_system`].
+pub fn detect_swing_pulse_system(
+    time: Res<Time>,
+    state: Res<crate::snapshot::SceneState>,
+    mut pulse: ResMut<SwingPulse>,
+) {
+    let count = crate::snapshot::rendered_chat(&state)
+        .iter()
+        .filter(|l| l.channel == ffxi_viewer_wire::ChatChannel::Battle)
+        .count();
+    if count > pulse.prev_battle_count {
+        pulse.last_swing_secs = time.elapsed_secs();
+    }
+    pulse.prev_battle_count = count;
+}
+
+/// Per-frame: modulate the engaged badge's text color from bright-white
+/// (just-pulsed) back to base red over [`PULSE_DECAY_SECS`]. Outside the
+/// decay window the color sits at base red.
+///
+/// Lives in its own system so it can tick every frame without piggybacking
+/// on `update_target_panel_system`'s `is_changed` early-return — a pulse
+/// fired by a server tick must keep decaying visually even when nothing
+/// else about the snapshot has changed.
+pub fn pulse_engaged_badge_color_system(
+    time: Res<Time>,
+    pulse: Res<SwingPulse>,
+    mut q: Query<&mut TextColor, With<TargetEngagedBadge>>,
+) {
+    let Ok(mut tc) = q.single_mut() else {
+        return;
+    };
+    let elapsed = (time.elapsed_secs() - pulse.last_swing_secs).max(0.0);
+    let t = (elapsed / PULSE_DECAY_SECS).clamp(0.0, 1.0);
+    // Linear blend from white (flash) → STAGE_BAD red (base). Bevy's
+    // `Color::srgb` channels need component math here; the engaged badge
+    // is text, so background blend doesn't apply.
+    let base = palette::STAGE_BAD.to_srgba();
+    let flash = bevy::prelude::Color::WHITE.to_srgba();
+    let r = flash.red + (base.red - flash.red) * t;
+    let g = flash.green + (base.green - flash.green) * t;
+    let b = flash.blue + (base.blue - flash.blue) * t;
+    let want = bevy::prelude::Color::srgb(r, g, b);
+    if tc.0 != want {
+        tc.0 = want;
     }
 }
 
