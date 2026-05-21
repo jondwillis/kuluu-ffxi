@@ -273,8 +273,8 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
             },
             HelpEntry {
                 aliases: &["sound", "audio", "mute"],
-                usage: "[on|off|toggle] [bgm|sfx]",
-                summary: "mute/unmute BGM, SFX, or both — survives logout",
+                usage: "[on|off|toggle|status] [bgm|sfx]",
+                summary: "bare /sound toggles all audio; survives logout",
             },
         ],
     ),
@@ -686,8 +686,9 @@ pub enum MinimapOp {
 /// audio mute state — both BGM and SFX, or one independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoundOp {
-    /// `/sound` (no arg) — report current mute state for both
-    /// categories. No mutation.
+    /// `/sound status` (or `/sound ?`) — report current mute state
+    /// for both categories. No mutation. Bare `/sound` is the toggle
+    /// shortcut and dispatches `SetBoth(None)`, not this variant.
     Status,
     /// `/sound on` / `/sound off` / `/sound toggle` — apply to both
     /// BGM and SFX. The boolean is the target value (`true` =
@@ -2107,26 +2108,23 @@ fn nearby_entities<'a>(
 
 /// `/sound [on|off|toggle] [bgm|sfx]` — set or toggle audio mute.
 /// Argument order is flexible: `/sound bgm off`, `/sound off bgm`,
-/// `/sound off` (both), `/sound toggle bgm`, `/sound` (status).
+/// `/sound off` (both), `/sound toggle bgm`, `/sound` (toggle both).
 ///
-/// Returns [`SoundOp::Status`] for bare `/sound`, otherwise one of
-/// `SetBoth` / `SetBgm` / `SetSfx`. The dispatcher in `text_input`
-/// applies the op to the `AudioMuteState` resource and emits a
-/// status toast.
+/// Returns one of `SetBoth` / `SetBgm` / `SetSfx`. The dispatcher in
+/// `text_input` applies the op to the `AudioMuteState` resource and
+/// emits a status toast.
 ///
-/// Empty / unrecognized verb defaults to toggle so users can
-/// muscle-memory `/sound` itself to flip — same convention as
-/// `/devhud` / `/heal` / `/capture` (no arg = toggle), with the
-/// twist that `/sound` *alone* is the status query rather than the
-/// toggle; the status read is more common than a same-everything
-/// flip, and `/sound toggle` is the explicit form.
+/// Bare `/sound` toggles both categories — same convention as
+/// `/devhud` / `/heal` / `/capture` (no arg = toggle). The status
+/// query is accessible via the explicit `/sound status` or
+/// `/sound ?` form.
 fn parse_sound(rest: &str) -> SlashOutcome {
     let tokens: Vec<String> = rest
         .split_whitespace()
         .map(|t| t.to_ascii_lowercase())
         .collect();
     if tokens.is_empty() {
-        return SlashOutcome::SetSound(SoundOp::Status);
+        return SlashOutcome::SetSound(SoundOp::SetBoth(None));
     }
     // Split tokens into verb (on/off/toggle) + category (bgm/sfx).
     // Either order is accepted; missing category defaults to "both".
