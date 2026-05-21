@@ -12,3 +12,6 @@
 [submodule "vendor/AltanaViewer"]
 	path = vendor/AltanaViewer
 	url = https://github.com/voliathon/AltanaViewer.git
+[submodule "vendor/AltanaListener"]
+	path = vendor/AltanaListener
+	url = https://github.com/voliathon/AltanaListener.git

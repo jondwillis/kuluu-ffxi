@@ -17,6 +17,7 @@
 
 pub mod adpcm;
 pub mod header;
+pub mod music_catalog;
 pub mod path;
 pub mod pcm;
 pub mod stream;

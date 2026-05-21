@@ -390,11 +390,24 @@ pub fn drain_music_events_system(events: Res<EventLog>, mut slots: ResMut<BgmSlo
             ViewerEvent::MusicChanged { slot, track_id } => {
                 let s = *slot as usize;
                 if s < SLOT_COUNT {
+                    // Friendly name + composer credit when the
+                    // community catalog knows about this track id.
+                    // Fall back to `?` for unknown ids — most of the
+                    // playable music range is covered (~220 tracks
+                    // sourced from AltanaListener); a `?` here is a
+                    // signal that the catalog might be due for a
+                    // refresh against upstream.
+                    let (name, composer) =
+                        ffxi_audio::music_catalog::lookup(*track_id)
+                            .map(|(_, n, c)| (n, c))
+                            .unwrap_or(("?", "?"));
                     info!(
-                        "audio: 0x05F slot={} ({}) track={}",
+                        "audio: 0x05F slot={} ({}) track={} — \"{}\" by {}",
                         slot,
                         slot_name(*slot),
-                        track_id
+                        track_id,
+                        name,
+                        composer,
                     );
                     slots.tracks[s] = Some(*track_id);
                 }
