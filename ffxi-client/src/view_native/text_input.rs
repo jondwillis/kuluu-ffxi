@@ -125,6 +125,21 @@ pub struct SlashWriters<'w, 's> {
     /// top-down bake. Change-detected by the top-down backend to
     /// trigger a re-bake on the next zone-enter scan.
     pub topdown_cull: ResMut<'w, ffxi_viewer_core::minimap::topdown::TopdownCullPolicy>,
+    /// `/sound on|off|toggle [bgm|sfx]` — operator-controlled mute
+    /// flags applied by `apply_bgm_system` (BGM) and
+    /// `play_sfx_system` (SFX). Survives logout/login.
+    pub audio_mute: ResMut<'w, ffxi_viewer_core::audio::AudioMuteState>,
+    /// `/minimap zoom in|out|fit|reset|<N>` — write side of the
+    /// [`MinimapZoom`] resource. Read by
+    /// `update_minimap_view` to derive the visible AABB.
+    pub minimap_zoom: ResMut<'w, ffxi_viewer_core::minimap::MinimapZoom>,
+    /// `/minimap zoom reset` also clears pan offset on
+    /// [`MinimapView`].
+    pub minimap_view: ResMut<'w, ffxi_viewer_core::minimap::MinimapView>,
+    /// Read-only access to the zone AABB so `/minimap zoom in/out`
+    /// can clamp against the zone's half-span (same logic the
+    /// scroll-wheel handler uses).
+    pub minimap_state: Res<'w, ffxi_viewer_core::minimap::MinimapState>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -890,6 +905,85 @@ fn apply_slash_outcome(
                     slash_writers.topdown_cull.top_cull_yalms = v;
                     format!("/minimap: cull={v:.1} yalms (re-baking next frame)")
                 }
+                MinimapOp::ZoomIn => {
+                    let half = ffxi_viewer_core::minimap::zone_half_span(
+                        slash_writers
+                            .minimap_state
+                            .active_aabb(*slash_writers.minimap_mode),
+                    );
+                    slash_writers.minimap_zoom.zoom_by(
+                        1.0 / ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR,
+                        half,
+                    );
+                    slash_writers.minimap_view.idle_frames = 0;
+                    format_zoom_status(&slash_writers.minimap_zoom)
+                }
+                MinimapOp::ZoomOut => {
+                    let half = ffxi_viewer_core::minimap::zone_half_span(
+                        slash_writers
+                            .minimap_state
+                            .active_aabb(*slash_writers.minimap_mode),
+                    );
+                    slash_writers
+                        .minimap_zoom
+                        .zoom_by(ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR, half);
+                    slash_writers.minimap_view.idle_frames = 0;
+                    format_zoom_status(&slash_writers.minimap_zoom)
+                }
+                MinimapOp::ZoomFit => {
+                    slash_writers.minimap_zoom.radius_yalms = None;
+                    slash_writers.minimap_view.idle_frames = 0;
+                    "/minimap zoom: fit-to-zone".into()
+                }
+                MinimapOp::ZoomSet(r) => {
+                    let clamped = r.max(ffxi_viewer_core::minimap::ZOOM_MIN_RADIUS);
+                    slash_writers.minimap_zoom.radius_yalms = Some(clamped);
+                    slash_writers.minimap_view.idle_frames = 0;
+                    format!("/minimap zoom: radius={clamped:.0} yalms")
+                }
+                MinimapOp::ZoomReset => {
+                    *slash_writers.minimap_zoom =
+                        ffxi_viewer_core::minimap::MinimapZoom::default();
+                    slash_writers.minimap_view.pan_offset_xz = bevy::math::Vec2::ZERO;
+                    slash_writers.minimap_view.idle_frames = 0;
+                    "/minimap zoom: reset to defaults".into()
+                }
+            };
+            push_system_chat_line(scene_state, chat);
+        }
+        SlashOutcome::SetSound(op) => {
+            use super::slash_commands::SoundOp;
+            let mute = &mut *slash_writers.audio_mute;
+            // Resolve `Option<bool>` → concrete target boolean. `None`
+            // (toggle) flips current state; `Some(b)` sets directly.
+            // The slash-command's `bool` is "is muted?", so on=false,
+            // off=true.
+            let apply = |cur: &mut bool, target: Option<bool>| {
+                *cur = target.unwrap_or(!*cur);
+            };
+            let chat = match op {
+                SoundOp::Status => format!(
+                    "/sound: bgm={} sfx={}",
+                    if mute.bgm { "off" } else { "on" },
+                    if mute.sfx { "off" } else { "on" },
+                ),
+                SoundOp::SetBoth(target) => {
+                    apply(&mut mute.bgm, target);
+                    apply(&mut mute.sfx, target);
+                    format!(
+                        "/sound: bgm={} sfx={}",
+                        if mute.bgm { "off" } else { "on" },
+                        if mute.sfx { "off" } else { "on" },
+                    )
+                }
+                SoundOp::SetBgm(target) => {
+                    apply(&mut mute.bgm, target);
+                    format!("/sound bgm: {}", if mute.bgm { "off" } else { "on" })
+                }
+                SoundOp::SetSfx(target) => {
+                    apply(&mut mute.sfx, target);
+                    format!("/sound sfx: {}", if mute.sfx { "off" } else { "on" })
+                }
             };
             push_system_chat_line(scene_state, chat);
         }
@@ -1245,6 +1339,15 @@ fn format_modifiers(mods: ffxi_viewer_core::Modifiers) -> &'static str {
 /// than vanishing on the very next ingest tick.
 fn push_system_chat_line(scene_state: &mut SceneState, text: String) {
     scene_state.push_local_toast(system_chat_line(text));
+}
+
+/// Format the current minimap zoom for a `/minimap zoom in|out` echo
+/// so the operator sees what radius they landed on.
+fn format_zoom_status(zoom: &ffxi_viewer_core::minimap::MinimapZoom) -> String {
+    match zoom.radius_yalms {
+        Some(r) => format!("/minimap zoom: radius={r:.0} yalms"),
+        None => "/minimap zoom: fit-to-zone".into(),
+    }
 }
 
 /// If `cmd` is an `AgentCommand::ReqLogout`, return the local-toast text

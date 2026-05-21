@@ -501,6 +501,11 @@ pub enum SlashOutcome {
     /// — drive the minimap HUD's visibility, image-source backend,
     /// and ceiling-cull height. See [`MinimapOp`].
     SetMinimap(MinimapOp),
+    /// `/sound [on|off|toggle] [bgm|sfx]` — set or toggle audio
+    /// mute. With no category, applies to both BGM and SFX. With a
+    /// category, applies only to that side. Naked `/sound` reports
+    /// status. See [`SoundOp`] for the full parsed shape.
+    SetSound(SoundOp),
     /// `/fps <max>` — cap the render-loop framerate via `bevy_framepace`.
     /// `Some(n)` sets a target FPS (clamped >0); `None` (`/fps 0` or
     /// `/fps off`) disables the limiter. Pure client-side knob — no
@@ -619,6 +624,38 @@ pub enum MinimapOp {
     /// `/minimap cull <N>` — set TopdownCullPolicy.top_cull_yalms.
     /// Triggers an immediate re-bake.
     SetCull(f32),
+    /// `/minimap zoom in` — discrete zoom-in tick (same as `.` over
+    /// minimap).
+    ZoomIn,
+    /// `/minimap zoom out` — discrete zoom-out tick.
+    ZoomOut,
+    /// `/minimap zoom fit` — show the whole zone (max zoom-out).
+    ZoomFit,
+    /// `/minimap zoom <N>` — set radius to N yalms (clamped to the
+    /// allowed range).
+    ZoomSet(f32),
+    /// `/minimap zoom reset` — back to defaults (50 yalm radius,
+    /// pan cleared).
+    ZoomReset,
+}
+
+/// `/sound` subcommand variants. Operator-facing toggle for the
+/// audio mute state — both BGM and SFX, or one independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundOp {
+    /// `/sound` (no arg) — report current mute state for both
+    /// categories. No mutation.
+    Status,
+    /// `/sound on` / `/sound off` / `/sound toggle` — apply to both
+    /// BGM and SFX. The boolean is the target value (`true` =
+    /// muted, `false` = audible); `None` means flip whatever the
+    /// current state is.
+    SetBoth(Option<bool>),
+    /// `/sound bgm [on|off|toggle]` — apply only to BGM. Same
+    /// `Option<bool>` semantics as [`SetBoth`].
+    SetBgm(Option<bool>),
+    /// `/sound sfx [on|off|toggle]` — apply only to SFX.
+    SetSfx(Option<bool>),
 }
 
 /// `/agent` subcommand variants.
@@ -841,6 +878,7 @@ pub fn parse_slash(
         "zonegeom" => parse_zonegeom(rest),
         "devhud" => parse_devhud(rest),
         "minimap" | "mm" => parse_minimap(rest),
+        "sound" | "audio" | "mute" => parse_sound(rest),
         "debug" | "dbg" | "nearby" | "entities" => {
             parse_debug(rest, entities, self_pos, current_target)
         }
@@ -2024,6 +2062,74 @@ fn nearby_entities<'a>(
     scored
 }
 
+/// `/sound [on|off|toggle] [bgm|sfx]` — set or toggle audio mute.
+/// Argument order is flexible: `/sound bgm off`, `/sound off bgm`,
+/// `/sound off` (both), `/sound toggle bgm`, `/sound` (status).
+///
+/// Returns [`SoundOp::Status`] for bare `/sound`, otherwise one of
+/// `SetBoth` / `SetBgm` / `SetSfx`. The dispatcher in `text_input`
+/// applies the op to the `AudioMuteState` resource and emits a
+/// status toast.
+///
+/// Empty / unrecognized verb defaults to toggle so users can
+/// muscle-memory `/sound` itself to flip — same convention as
+/// `/devhud` / `/heal` / `/capture` (no arg = toggle), with the
+/// twist that `/sound` *alone* is the status query rather than the
+/// toggle; the status read is more common than a same-everything
+/// flip, and `/sound toggle` is the explicit form.
+fn parse_sound(rest: &str) -> SlashOutcome {
+    let tokens: Vec<String> = rest
+        .split_whitespace()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    if tokens.is_empty() {
+        return SlashOutcome::SetSound(SoundOp::Status);
+    }
+    // Split tokens into verb (on/off/toggle) + category (bgm/sfx).
+    // Either order is accepted; missing category defaults to "both".
+    let mut verb: Option<Option<bool>> = None;
+    let mut category: Option<&str> = None;
+    for tok in &tokens {
+        match tok.as_str() {
+            "on" | "unmute" | "true" | "1" => {
+                // `/sound on` reads naturally as "turn sound ON" =
+                // unmute. Flip so the underlying boolean is "muted".
+                verb = Some(Some(false));
+            }
+            "off" | "mute" | "false" | "0" => {
+                verb = Some(Some(true));
+            }
+            "toggle" | "flip" => {
+                verb = Some(None);
+            }
+            "bgm" | "music" => category = Some("bgm"),
+            "sfx" | "se" | "fx" | "effects" => category = Some("sfx"),
+            "status" | "?" => return SlashOutcome::SetSound(SoundOp::Status),
+            other => {
+                return SlashOutcome::SystemMessage(format!(
+                    "/sound: bad arg `{other}` \
+                     (use on|off|toggle and/or bgm|sfx)"
+                ));
+            }
+        }
+    }
+    let verb = match verb {
+        Some(v) => v,
+        None => {
+            // A bare category (`/sound bgm`) with no verb reads as
+            // toggle — same convention `/devhud` uses when called
+            // with no arg.
+            None
+        }
+    };
+    let op = match category {
+        Some("bgm") => SoundOp::SetBgm(verb),
+        Some("sfx") => SoundOp::SetSfx(verb),
+        _ => SoundOp::SetBoth(verb),
+    };
+    SlashOutcome::SetSound(op)
+}
+
 /// `/devhud on|off|toggle` — show/hide developer telemetry overlays.
 /// Empty argument toggles, matching the convention of `/zonegeom` /
 /// `/heal` / `/capture`. Off by default (vanilla FFXI / Ashita /
@@ -2075,9 +2181,28 @@ fn parse_minimap(rest: &str) -> SlashOutcome {
                 ));
             }
         },
+        "zoom" => match arg.to_ascii_lowercase().as_str() {
+            "in" => MinimapOp::ZoomIn,
+            "out" => MinimapOp::ZoomOut,
+            "fit" | "max" | "zone" => MinimapOp::ZoomFit,
+            "reset" | "default" => MinimapOp::ZoomReset,
+            "" => {
+                return SlashOutcome::SystemMessage(
+                    "/minimap zoom: missing arg (in|out|fit|reset|<radius>)".to_string(),
+                );
+            }
+            num => match num.parse::<f32>() {
+                Ok(v) if v.is_finite() && v > 0.0 => MinimapOp::ZoomSet(v),
+                _ => {
+                    return SlashOutcome::SystemMessage(format!(
+                        "/minimap zoom: bad arg `{num}` (expected in|out|fit|reset|<radius>)"
+                    ));
+                }
+            },
+        },
         other => {
             return SlashOutcome::SystemMessage(format!(
-                "/minimap: unknown sub `{other}` (use show|hide|toggle|mode|cull)"
+                "/minimap: unknown sub `{other}` (use show|hide|toggle|mode|cull|zoom)"
             ));
         }
     };
