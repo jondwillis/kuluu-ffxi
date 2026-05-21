@@ -72,9 +72,9 @@ pub use lock_on::{LockOn, ToggleResult as LockOnToggle};
 pub use mouse::{CursorLockRequest, MousePlugin, MousePointer};
 pub use picking::{click_to_target_system, resolve_click_target, ClickResolution, PickingPlugin};
 pub use scene::{
-    feet_offset, ffxi_to_bevy, process_entity_look_changes, setup_world, sync_aggro_system,
-    sync_entities_system, sync_entity_looks_system, Aggroing, EntityMaterials, EntityMesh, Target,
-    TrackedEntities,
+    entity_visual_height, ffxi_to_bevy, process_entity_look_changes, setup_world,
+    sync_aggro_system, sync_entities_system, sync_entity_looks_system, Aggroing, BakedActor,
+    EntityMaterials, EntityMesh, Target, TrackedEntities,
 };
 pub use snapshot::{apply_delta, ingest_system, EventLog, SceneState, CHAT_HISTORY_CAP};
 pub use source::SceneSource;

@@ -747,6 +747,14 @@ pub fn process_load_vos2_requests(
                     );
                 }
                 let existing = bone_trees.get(&req.entity_id).cloned();
+                // Measure the bake's vertical extent *before* spawning
+                // so the pivot can fold the feet-at-origin translation
+                // in: `pivot.translation = Vec3::Y * -min_local_y`
+                // pushes the lowest baked vertex onto y=0 in the
+                // entity's local frame, which is the invariant the
+                // snap relies on.
+                let (min_local_y, max_local_y) =
+                    compute_skinned_local_y_extent(loaded, is_pc).unwrap_or((-0.9, 1.6));
                 let bone_entities = spawn_skinned_actor(
                     &mut commands,
                     &mut meshes,
@@ -758,32 +766,33 @@ pub fn process_load_vos2_requests(
                     raw,
                     existing,
                     is_pc,
+                    min_local_y,
                 );
                 bone_trees.insert(req.entity_id, bone_entities);
-                // BakedActor marker tells the target ring + snap
-                // systems to switch from feet_offset to hip
-                // offset (~0.9 yalms). Without it a GPU-skinned
-                // entity sits at server_y + feet_offset, putting
-                // the hip ~1.35 yalms too high.
-                //
-                // `min_mesh_y` (parent-local frame): for PCs, the
-                // bone tree feeds the parent via the Q_x(π) pivot
-                // which negates y, so the lowest local-y is
-                // `-max(v.pos[1])`. For NPCs there is no pivot, so
-                // the lowest local-y is `min(v.pos[1])`. Falls back
-                // to the historical 0.9-yalm estimate when the mesh
-                // is somehow empty.
-                let min_mesh_y = compute_skinned_min_local_y(loaded, is_pc).unwrap_or(0.0);
-                commands
-                    .entity(bevy_e)
-                    .insert(crate::scene::BakedActor { min_mesh_y });
+                // BakedActor marker is purely informational after the
+                // feet-at-origin refactor — the snap doesn't read it,
+                // since the pivot's `Vec3::Y * -min_local_y`
+                // translation already puts the mesh's lowest vertex at
+                // the entity's local y=0. We still record
+                // `min_mesh_y` + `actor_height` so the nameplate /
+                // camera anchors can size to the actor and so
+                // `/debug heights` can surface the empirical bake
+                // extent.
+                let actor_height = (max_local_y - min_local_y).max(0.1);
+                commands.entity(bevy_e).insert(crate::scene::BakedActor {
+                    min_mesh_y: min_local_y,
+                    actor_height,
+                });
                 info!(
-                    "skinned actor spawn: file_id={} entity_id={} verts={} groups={} min_mesh_y={:.2}",
+                    "skinned actor spawn: file_id={} entity_id={} verts={} groups={} \
+                     min_local_y={:.2} max_local_y={:.2} actor_height={:.2}",
                     req.file_id,
                     req.entity_id,
                     loaded.mesh.vertices.len(),
                     loaded.mesh.groups.len(),
-                    min_mesh_y,
+                    min_local_y,
+                    max_local_y,
+                    actor_height,
                 );
                 continue;
             }
@@ -819,20 +828,29 @@ pub fn process_load_vos2_requests(
 /// minimum is `-max(v.pos[1])`. NPCs skip the pivot, leaving
 /// parent-local-y = `v.pos[1]` and the minimum at `min(v.pos[1])`.
 ///
-/// Returns `None` when the mesh carries no vertices (defensive).
-fn compute_skinned_min_local_y(loaded: &LoadedVos2, is_pc: bool) -> Option<f32> {
+/// Returns `(min_local_y, max_local_y)` — the vertical extent of all
+/// baked vertices in the **pivot's local frame** (i.e., after the
+/// pivot's rotation but before its feet-at-origin translation). The
+/// difference `max - min` is the actor's visual height in yalms.
+///
+/// `None` when the mesh carries no vertices (defensive).
+fn compute_skinned_local_y_extent(loaded: &LoadedVos2, is_pc: bool) -> Option<(f32, f32)> {
     if loaded.mesh.vertices.is_empty() {
         return None;
     }
     let mut min_local_y = f32::INFINITY;
+    let mut max_local_y = f32::NEG_INFINITY;
     for v in &loaded.mesh.vertices {
         let local_y = if is_pc { -v.pos[1] } else { v.pos[1] };
         if local_y < min_local_y {
             min_local_y = local_y;
         }
+        if local_y > max_local_y {
+            max_local_y = local_y;
+        }
     }
-    if min_local_y.is_finite() {
-        Some(min_local_y)
+    if min_local_y.is_finite() && max_local_y.is_finite() {
+        Some((min_local_y, max_local_y))
     } else {
         None
     }
@@ -864,6 +882,7 @@ fn spawn_skinned_actor(
     raw: &std::sync::Arc<Skeleton>,
     existing_bone_entities: Option<Vec<Entity>>,
     is_pc: bool,
+    min_local_y: f32,
 ) -> Vec<Entity> {
     use ffxi_dat::bone::PARENT_ROOT;
 
@@ -874,53 +893,41 @@ fn spawn_skinned_actor(
             // parent ChildOf can reference them by index, then wire up
             // the parent links.
             //
-            // For PCs, insert an axis-flip pivot entity between
-            // `parent` and the bone tree. The pivot holds the FFXI→Bevy
-            // bind orientation that the CPU bake path applies on the
-            // mesh entity (see `spawn_vos2_meshes_with_skeleton`'s
-            // `bind_to_bevy = Q_y(π/2) * Q_x(-π/2)` near the bottom).
-            // Skinned mesh skinning ignores the mesh entity's
-            // transform — it uses joint world transforms directly —
-            // so the rotation has to enter through the bone-tree
-            // hierarchy instead. Bone[0] is the wrong place for it
-            // (the animation tick would have to special-case writing
-            // back the flip every frame). A pivot above bone[0]
-            // composes cleanly: parent → pivot(bind_to_bevy) → bone[0]
-            // (identity) → bone[1..].
+            // **Always** insert a pivot entity between `parent` and the
+            // bone tree. The pivot carries two responsibilities:
             //
-            // For NPCs, keep the prior behavior (no pivot, root bones
-            // parented directly to `parent`). NPC orientation has been
-            // observed working in the current rig.
-            let root_parent = if is_pc {
-                // FFXI engine axis → Bevy. The bone chain produces
-                // vertices in raw FFXI engine axes (x right, y down,
-                // z forward — matches the MZB native convention at
-                // `dat_mzb.rs:412-417`). The MZB renderer applies
-                // `(x, -y, -z)` to convert; that's a rotation around
-                // X by 180°, expressible as a pure quaternion since
-                // it doesn't change handedness (both axes get
-                // negated → det = +1).
-                //
-                // An earlier attempt here used the CPU bake's
-                // `Q_y(π/2) * Q_x(-π/2)` — but that matrix is for the
-                // post-bake frame where the per-vertex bake swap
-                // `[p[0], p[2], -p[1]]` has already happened. GPU
-                // skinning skips that swap (vertices come straight
-                // from joint world transforms), so the same rotation
-                // would face the character down.
-                let engine_to_bevy = Quat::from_rotation_x(std::f32::consts::PI);
-                let pivot = commands
-                    .spawn((
-                        Transform::from_rotation(engine_to_bevy),
-                        GlobalTransform::default(),
-                        Visibility::default(),
-                        ChildOf(parent),
-                    ))
-                    .id();
-                pivot
+            //   1. Axis flip from FFXI engine native to Bevy. PCs get
+            //      `Q_x(π)` (negates Y and Z signs); NPC rigs need no
+            //      rotation here because their authoring already lines
+            //      up — confirmed by past empirical work, see the
+            //      `is_pc` branch below.
+            //   2. Feet-at-origin translation: `Vec3::Y * -min_local_y`
+            //      pushes the lowest baked vertex onto parent.y = 0,
+            //      which is the invariant the snap and target-ring
+            //      assume (transform.y *is* feet-on-ground).
+            //
+            // Composing in the pivot keeps both responsibilities out of
+            // bone[0] — the animation tick would otherwise have to
+            // special-case writing back the flip and translation every
+            // frame.
+            let pivot_rotation = if is_pc {
+                Quat::from_rotation_x(std::f32::consts::PI)
             } else {
-                parent
+                Quat::IDENTITY
             };
+            let pivot_translation = Vec3::Y * -min_local_y;
+            let root_parent = commands
+                .spawn((
+                    Transform {
+                        translation: pivot_translation,
+                        rotation: pivot_rotation,
+                        scale: Vec3::ONE,
+                    },
+                    GlobalTransform::default(),
+                    Visibility::default(),
+                    ChildOf(parent),
+                ))
+                .id();
             // Bone[0] gets identity rotation (drops SK2's 270°-Y
             // engine-axis roll). For PCs the pivot carries the
             // bind_to_bevy flip; for NPCs the identity-on-root
@@ -1222,6 +1229,11 @@ pub fn tick_skinned_actors(
 /// baked vertex after the mesh's `bind_to_bevy` rotation is folded in.
 /// `None` when the slot loaded but produced no renderable geometry.
 /// Callers aggregate this across slots to drive [`crate::scene::BakedActor::min_mesh_y`].
+/// Returns `Some((min_local_y, max_local_y))` — the vertical extent
+/// of the baked vertices in the mesh entity's *post-rotation* frame,
+/// **before** the feet-at-origin translation that's been folded into
+/// the mesh entity's spawn transform. Callers aggregate this across
+/// slots and use `(min, max)` to fill [`crate::scene::BakedActor`].
 pub fn spawn_vos2_meshes(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -1230,7 +1242,7 @@ pub fn spawn_vos2_meshes(
     parent: Entity,
     loaded: &LoadedVos2,
     race: u8,
-) -> Option<f32> {
+) -> Option<(f32, f32)> {
     let baked = baked_skeleton(race);
     spawn_vos2_meshes_with_skeleton(
         commands,
@@ -1254,7 +1266,7 @@ fn spawn_vos2_meshes_with_skeleton(
     parent: Entity,
     loaded: &LoadedVos2,
     baked_owned: Option<&BakedSkeleton>,
-) -> Option<f32> {
+) -> Option<(f32, f32)> {
     // Build per-file texture pool. Reuses the lotus-ffxi VOS2
     // convention that group names like `"tim     em_b61_3"` use the
     // `tim ` prefix to flag a texture-name slot.
@@ -1349,20 +1361,15 @@ fn spawn_vos2_meshes_with_skeleton(
             [n[0], n[2], -n[1]]
         })
         .collect();
-    // One-shot diagnostic: the bake produced visually wrong
-    // orientations across multiple flip variants. Log the actual
-    // per-axis min/max so we can stop guessing and see what
-    // coordinate ranges the bake is emitting. Logged once per spawn
-    // at `info!` so it shows up in stdout / chat-side toasts.
-    //
-    // `min_local_y` is the lowest Y any baked vertex reaches in the
-    // **parent's local frame** — i.e., after `bind_to_bevy` is folded
-    // in (see spawn_one below). bind_to_bevy = Q_y(π/2) * Q_x(-π/2)
-    // maps mesh-space `(a, b, c)` to `(-b, c, -a)`, so parent-local-y
-    // is `c` = `positions[i][2]`. Bubbled up to the caller so
-    // `BakedActor::min_mesh_y` records the actor's actual hip-to-foot
-    // distance for `/debug heights`.
+    // Diagnostic + bake-extent measurement. The `local_y` of a baked
+    // vertex in the mesh entity's *post-rotation* frame is
+    // `positions[i][2]` (because `bind_to_bevy = Q_y(π/2) * Q_x(-π/2)`
+    // maps mesh-space `(a, b, c)` to `(-b, c, -a)`). Capture both min
+    // and max so spawn_one can translate by `-min_local_y` (feet at
+    // entity y=0) and the caller can record `actor_height = max - min`
+    // for nameplate / camera anchoring.
     let mut min_local_y: Option<f32> = None;
+    let mut max_local_y: Option<f32> = None;
     if !positions.is_empty() {
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
@@ -1383,7 +1390,13 @@ fn spawn_vos2_meshes_with_skeleton(
             min[0], max[0], min[1], max[1], min[2], max[2], extent[0], extent[1], extent[2],
         );
         min_local_y = Some(min[2]);
+        max_local_y = Some(max[2]);
     }
+    // Feet-at-origin shift baked into the per-slot mesh entity's
+    // transform below: the lowest baked vertex lands at entity.y = 0.
+    // Default to 0 if the bake somehow produced no vertices (defensive
+    // — spawn_one early-exits on empty position lists upstream).
+    let feet_translation_y = -min_local_y.unwrap_or(0.0);
 
     // Mirror copy: VOS2 stores only one symmetric half of the body;
     // the other half is generated by mirroring across the body's
@@ -1488,17 +1501,22 @@ fn spawn_vos2_meshes_with_skeleton(
             // applies last. So `Q_y(π/2) * Q_x(-π/2)` means "first
             // stand the character up, then yaw 90°."
             //
-            // Mesh-y=0 corresponds to the skeleton root (hip).
-            // Parent entity is placed at hip height — see
-            // `visual_root_offset` in scene.rs which the snap path
-            // consults via the `BakedActor` marker we attach below.
+            // Translation `feet_translation_y` shifts the rotated
+            // mesh so its lowest vertex sits at the parent entity's
+            // local y=0 — that's the snap invariant (entity.y is
+            // feet-on-ground). The snap then becomes one line and
+            // doesn't need a per-actor offset lookup.
             let bind_to_bevy = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)
                 * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
             commands.spawn((
                 Vos2Overlay,
                 Mesh3d(meshes.add(mesh)),
                 MeshMaterial3d(mat),
-                Transform::from_rotation(bind_to_bevy),
+                Transform {
+                    translation: Vec3::Y * feet_translation_y,
+                    rotation: bind_to_bevy,
+                    scale: Vec3::ONE,
+                },
                 ChildOf(parent),
             ));
         };
@@ -1531,7 +1549,10 @@ fn spawn_vos2_meshes_with_skeleton(
             );
         }
     }
-    min_local_y
+    match (min_local_y, max_local_y) {
+        (Some(lo), Some(hi)) => Some((lo, hi)),
+        _ => None,
+    }
 }
 
 /// Compose: resolve each of the 8 equipment slots to a DAT file via
@@ -1566,44 +1587,51 @@ pub fn spawn_equipped(
     ];
     let slots = [head, body, hands, legs, feet, main, sub, ranged];
     let mut spawned = 0usize;
-    // Aggregate the lowest local-Y across all baked slots: the actor's
-    // feet are whichever slot reaches deepest below the hip (typically
-    // legs/feet). Powers `BakedActor::min_mesh_y` for `/debug heights`
-    // and per-actor offset diagnostics.
+    // Aggregate the vertical extent across all baked slots: the actor's
+    // feet are at the lowest local-Y any slot reaches (legs/feet); the
+    // head is at the highest (head/hair). Both feed `BakedActor` —
+    // `min_mesh_y` for diagnostic, `actor_height = max - min` for the
+    // nameplate / camera anchors.
     let mut actor_min_local_y: f32 = f32::INFINITY;
+    let mut actor_max_local_y: f32 = f32::NEG_INFINITY;
     // Helper: spawn every VOS2 chunk in a DAT as its own mesh.
     // lotus-ffxi (actor.cpp:84-110) collects every OS2 chunk in the
     // DAT and treats them collectively as one actor model. Previously
     // we returned only the largest, which for body slots drops
     // shoulder/torso/arm sub-meshes and renders an apparently
     // "missing" chest.
-    let mut spawn_all_chunks =
-        |chunk_indices: Vec<usize>, file_id: u32, label: &str, slot_min: &mut f32| -> usize {
-            let mut count = 0usize;
-            for idx in chunk_indices {
-                match load_vos2(file_id, idx) {
-                    Ok(loaded)
-                        if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() =>
-                    {
-                        if let Some(min_y) = spawn_vos2_meshes(
-                            commands, meshes, materials, images, parent, &loaded, race,
-                        ) {
-                            *slot_min = slot_min.min(min_y);
-                        }
-                        count += 1;
+    let mut spawn_all_chunks = |chunk_indices: Vec<usize>,
+                                file_id: u32,
+                                label: &str,
+                                slot_min: &mut f32,
+                                slot_max: &mut f32|
+     -> usize {
+        let mut count = 0usize;
+        for idx in chunk_indices {
+            match load_vos2(file_id, idx) {
+                Ok(loaded)
+                    if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() =>
+                {
+                    if let Some((min_y, max_y)) = spawn_vos2_meshes(
+                        commands, meshes, materials, images, parent, &loaded, race,
+                    ) {
+                        *slot_min = slot_min.min(min_y);
+                        *slot_max = slot_max.max(max_y);
                     }
-                    Ok(_) => info!(
-                        "spawn_equipped: {} file={} chunk={} loaded but empty (race={})",
-                        label, file_id, idx, race
-                    ),
-                    Err(e) => info!(
-                        "spawn_equipped: {} file={} chunk={} load failed: {} (race={})",
-                        label, file_id, idx, e, race
-                    ),
+                    count += 1;
                 }
+                Ok(_) => info!(
+                    "spawn_equipped: {} file={} chunk={} loaded but empty (race={})",
+                    label, file_id, idx, race
+                ),
+                Err(e) => info!(
+                    "spawn_equipped: {} file={} chunk={} load failed: {} (race={})",
+                    label, file_id, idx, e, race
+                ),
             }
-            count
-        };
+        }
+        count
+    };
     // Face mesh first — lotus loads it as a separate DAT alongside the
     // 8 equipment slots. Naked-but-faced characters still need the
     // face here, so this runs before the slot loop.
@@ -1615,7 +1643,13 @@ pub fn spawn_equipped(
                 file_id, race
             );
         } else {
-            spawned += spawn_all_chunks(chunks, file_id, "face", &mut actor_min_local_y);
+            spawned += spawn_all_chunks(
+                chunks,
+                file_id,
+                "face",
+                &mut actor_min_local_y,
+                &mut actor_max_local_y,
+            );
         }
     }
     for (slot_id, slot_name) in slots.iter().zip(slot_names.iter()) {
@@ -1637,19 +1671,30 @@ pub fn spawn_equipped(
             continue;
         }
         let label = format!("slot {}", slot_name);
-        spawned += spawn_all_chunks(chunks, file_id, &label, &mut actor_min_local_y);
+        spawned += spawn_all_chunks(
+            chunks,
+            file_id,
+            &label,
+            &mut actor_min_local_y,
+            &mut actor_max_local_y,
+        );
     }
     if spawned > 0 {
-        // Fall back to the historical 0.9 yalm hip-to-foot estimate if
-        // the actor produced geometry but somehow no slot exposed a
-        // numeric extent (defensive — every spawned slot does walk
-        // `positions[i][2]` and report `min_local_y`).
-        let min_mesh_y = if actor_min_local_y.is_finite() {
-            actor_min_local_y
-        } else {
-            0.0
-        };
-        commands.entity(parent).insert(BakedActor { min_mesh_y });
+        // Both should be finite by the time spawned>0 (every slot that
+        // contributed geometry also bumped one or both bounds). Fall
+        // back to a typical adult silhouette only as defensive padding
+        // if the bake somehow produced no measurable extent.
+        let (min_mesh_y, max_mesh_y) =
+            if actor_min_local_y.is_finite() && actor_max_local_y.is_finite() {
+                (actor_min_local_y, actor_max_local_y)
+            } else {
+                (-0.9, 1.6)
+            };
+        let actor_height = (max_mesh_y - min_mesh_y).max(0.1);
+        commands.entity(parent).insert(BakedActor {
+            min_mesh_y,
+            actor_height,
+        });
     }
     spawned
 }

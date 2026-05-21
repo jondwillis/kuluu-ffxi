@@ -1,34 +1,37 @@
-//! `/debug heights` slash command: diagnostic for the snap pipeline.
+//! `/debug heights` slash command: diagnostic for the MZB-floor snap.
 //! Prints, at the current player XZ:
 //!
 //! - **Server pos**: `snapshot.self_pos` from the wire (FFXI Y-down).
-//! - **Player Bevy y**: where the player entity transform actually sits.
-//! - **Player feet bevy y**: `player.y − visual_root_offset(...)` — the
-//!   point where the snap *should* be putting the feet.
-//! - **Navmesh height (Bevy)**: result of `nearest_height_at`, negated
-//!   into Bevy frame (matching `snap_entities_to_navmesh_system`).
+//! - **Player Bevy y**: where the player entity transform sits. After
+//!   the feet-at-origin refactor this *is* the feet position.
 //! - **MZB collision Bevy y**: floor-filtered raycast against
 //!   [`MzbCollisionGeometry`]. None when the player is off-mesh.
+//!   Equal to player.y when the snap is doing its job.
+//! - **Navmesh height (Bevy)**: result of `nearest_height_at`. The
+//!   snap doesn't use this anymore (navmesh is reactor-only), but
+//!   it's logged so we can see when the two surfaces disagree
+//!   without ambiguity about which one is authoritative.
 //! - **Top-5 MZB hits**: every triangle the downward raycast hits at
 //!   the player's XZ, sorted descending by `hit_y`, annotated with
 //!   each tri's normal.y (so a rejection by `FLOOR_NORMAL_MIN` is
-//!   visible). Reveals when the snap could lock onto a rooftop /
-//!   eave / vertical wall tri instead of the real floor.
-//! - **BakedActor min_mesh_y**: the lowest local-y any baked vertex
-//!   on the player reaches, derived during the VOS2 bake. Compare
-//!   against `visual_root_offset`'s `-0.9` constant to spot a race
-//!   for which the hip-to-foot estimate is wrong.
+//!   visible). Reveals when the snap could lock onto an above-ceiling
+//!   tri instead of the real floor.
+//! - **BakedActor min_mesh_y / actor_height**: the empirical bake
+//!   extent. The pivot/mesh spawn transform already absorbs
+//!   `-min_mesh_y` so the snap doesn't read these; they're surfaced
+//!   for debugging nameplate / camera anchor drift across races.
 //!
 //! Deltas:
-//! - `feet − mzb`: the literal "how many yalms am I floating above
-//!   the floor" number. Tight to zero = snap is working.
-//! - `nav − mzb`: how far the two surfaces disagree.
+//! - `player − mzb`: should be ~0 when the snap is working. The snap
+//!   sets `transform.y = ground` directly (no offset).
+//! - `nav − mzb`: gap between the pathing surface and the collision
+//!   surface. Pure diagnostic — neither side feeds the snap anymore.
 
 use bevy::prelude::*;
 
 use ffxi_viewer_core::components::{IsSelf, WorldEntity};
 use ffxi_viewer_core::dat_mzb::{MzbCollisionGeometry, FLOOR_NORMAL_MIN};
-use ffxi_viewer_core::scene::{visual_root_offset, BakedActor};
+use ffxi_viewer_core::scene::BakedActor;
 use ffxi_viewer_core::snapshot::SceneState;
 use ffxi_viewer_wire::{ChatChannel, ChatLine};
 
@@ -63,15 +66,11 @@ pub fn process_debug_heights(
                 continue;
             }
         };
+        let _ = player_w; // kind no longer drives the diagnostic
         let has_baked = baked.is_some();
-        let offset = visual_root_offset(player_w.kind, has_baked);
-        let feet_y = player_t.translation.y - offset;
 
         let nav_h_bevy: Option<f32> = nav.nav.as_ref().and_then(|lock| {
             let guard = lock.lock().ok()?;
-            // Match `snap_entities_to_navmesh_system`'s convention:
-            // ffxi_x = bevy.x, ffxi_y = -bevy.z; the cached/fallback
-            // z_hint is `-player.y` (FFXI native).
             let ffxi_x = player_t.translation.x;
             let ffxi_y = -player_t.translation.z;
             let z_hint = -player_t.translation.y;
@@ -83,8 +82,8 @@ pub fn process_debug_heights(
 
         let player_xz = Vec2::new(player_t.translation.x, player_t.translation.z);
         let ranked_hits = collision_geom.ground_raycast_all(player_xz);
-        // What the snap actually picks: floor-filtered + ceiling-bounded.
-        // Mirror the snap's `STEP_TOLERANCE = 2.0` so this row matches.
+        // Mirror the snap's `STEP_TOLERANCE = 2.0` so the picked hit
+        // matches what the snap would land on.
         const STEP_TOLERANCE: f32 = 2.0;
         let ceiling_y = player_t.translation.y + STEP_TOLERANCE;
         let mzb_h_bevy = collision_geom.ground_raycast(player_xz, ceiling_y);
@@ -94,29 +93,27 @@ pub fn process_debug_heights(
             server_pos.x, server_pos.y, server_pos.z,
         );
         let player_line = format!(
-            "  player bevy: x={:.2} y={:.2} z={:.2}  (offset={:.2}, baked={})",
+            "  player bevy (feet): x={:.2} y={:.2} z={:.2}  (baked={})",
             player_t.translation.x,
             player_t.translation.y,
             player_t.translation.z,
-            offset,
             has_baked,
         );
-        let feet_line = format!("  player feet bevy y = {:.2}", feet_y);
-        let nav_line = match nav_h_bevy {
-            Some(h) => format!(
-                "  navmesh bevy y = {:.2}  (delta_to_feet = {:+.2})",
-                h,
-                feet_y - h
-            ),
-            None => "  navmesh bevy y = <off-mesh / no nav>".to_string(),
-        };
         let mzb_line = match mzb_h_bevy {
             Some(h) => format!(
-                "  mzb_floor bevy y = {:.2}  (delta_to_feet = {:+.2})",
+                "  mzb_floor bevy y = {:.2}  (player − mzb = {:+.2})",
                 h,
-                feet_y - h
+                player_t.translation.y - h
             ),
             None => "  mzb_floor bevy y = <no walkable tri below ceiling>".to_string(),
+        };
+        let nav_line = match nav_h_bevy {
+            Some(h) => format!(
+                "  navmesh bevy y = {:.2}  (player − nav = {:+.2})  [pathing only]",
+                h,
+                player_t.translation.y - h
+            ),
+            None => "  navmesh bevy y = <off-mesh / no nav>".to_string(),
         };
         let nav_mzb_line = match (nav_h_bevy, mzb_h_bevy) {
             (Some(n), Some(m)) => format!("  >> nav − mzb_floor = {:+.2} yalms", n - m),
@@ -124,17 +121,16 @@ pub fn process_debug_heights(
         };
         let baked_line = match baked {
             Some(b) => format!(
-                "  baked actor min_mesh_y = {:.2}  (vs visual_root_offset = -{:.2})",
-                b.min_mesh_y, offset,
+                "  baked actor: min_mesh_y = {:.2}  actor_height = {:.2}",
+                b.min_mesh_y, b.actor_height,
             ),
-            None => "  baked actor min_mesh_y = <not baked yet>".to_string(),
+            None => "  baked actor: <not loaded yet — capsule placeholder>".to_string(),
         };
 
         push(&mut scene_state, server_line);
         push(&mut scene_state, player_line);
-        push(&mut scene_state, feet_line);
-        push(&mut scene_state, nav_line);
         push(&mut scene_state, mzb_line);
+        push(&mut scene_state, nav_line);
         push(&mut scene_state, nav_mzb_line);
         push(&mut scene_state, baked_line);
 

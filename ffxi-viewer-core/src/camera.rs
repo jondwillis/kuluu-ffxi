@@ -83,7 +83,13 @@ impl ChaseCamera {
     /// Bevy units from feet to eye for first-person. Capsule mesh has
     /// `height = 1.9` per `scene::EntityMesh`; eye sits below the top so
     /// the cap doesn't intersect the near-clip.
-    pub const FP_EYE_HEIGHT: f32 = 1.6;
+    /// First-person eye height **above the entity's feet** (i.e.
+    /// above `transform.y`, which is now feet-on-ground for every
+    /// entity after the feet-at-origin refactor in `setup_world` /
+    /// `dat_vos2`). Tuned for a typical adult silhouette (~4.5-yalm
+    /// total height); Galka/Taru drift is negligible at first-person
+    /// distance.
+    pub const FP_EYE_HEIGHT: f32 = 3.9;
     /// Closest the chase camera can pull in. Below ~3.0 the player capsule
     /// clips through the near plane; for closer-than-3 use FirstPerson.
     pub const DIST_MIN: f32 = 3.0;
@@ -105,7 +111,11 @@ impl Default for ChaseCamera {
             yaw: 0.0,
             pitch: 0.55,
             distance: 18.0,
-            height_target: 1.0,
+            // Look-at target ≈ chest height above feet. The feet-at-
+            // origin refactor moved `transform.y` from body-center to
+            // feet, so this constant absorbs the old capsule half-height
+            // (≈ 2.25 yalms for PC) plus a small chest lift on top.
+            height_target: 3.25,
             smoothing: 0.18,
             synced_initial: false,
         }

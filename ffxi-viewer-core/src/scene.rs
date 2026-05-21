@@ -38,69 +38,52 @@ pub fn ffxi_to_bevy(p: WireVec3) -> Vec3 {
     Vec3::new(p.x, -p.z, -p.y)
 }
 
-/// Vertical distance from an entity's `transform.y` (the mesh center)
-/// down to the bottom of its visual mesh — i.e., its "feet."
+/// Visual top of an entity's mesh in the **entity's local frame**, i.e.
+/// how far above `transform.y` (which is now feet-on-ground for every
+/// entity — see [`setup_world`] and the spawn paths in `dat_vos2`) the
+/// mesh extends. Used by nameplate / camera anchoring; **not** by the
+/// snap (the snap doesn't need a "where are the feet" answer anymore —
+/// transform.y *is* the feet).
 ///
-/// Mirrors the meshes built by [`setup_world`]:
-///   - `Capsule3d::new(radius, half_length)` → bottom at center - (half_length + radius)
-///   - `Cuboid::new(_, side, _)` → bottom at center - side/2
-///
-/// Used by:
-///   - The navmesh gravity-snap (so feet sit on the navmesh, not the
-///     center sinks below it).
-///   - The target ring (so the ring sits at the entity's *ground*
-///     level, not at a hardcoded y=0).
-///
-/// If the mesh constructors in `setup_world` change, update here.
+/// For baked actors, prefer [`BakedActor::actor_height`] over this
+/// helper — it's the empirical bake extent rather than an estimate.
 #[inline]
-pub fn feet_offset(kind: EntityKind) -> f32 {
+pub fn entity_visual_height(kind: EntityKind) -> f32 {
     match kind {
-        EntityKind::Pc => 1.9 + 0.35, // pc capsule (radius=0.35, half_length=1.9)
-        EntityKind::Pet => 0.6 + 0.4, // pet capsule (radius=0.4, half_length=0.6)
-        EntityKind::Mob => 1.1 / 2.0, // mob cuboid (1.1 cube)
-        _ => 1.4 + 0.5,               // default capsule (radius=0.5, half_length=1.4)
+        // Capsule: total height = 2 * (radius + half_length).
+        EntityKind::Pc => 2.0 * (0.35 + 1.9), // 4.5 yalms
+        EntityKind::Pet => 2.0 * (0.4 + 0.6), // 2.0
+        // Cuboid mob: total height = side length.
+        EntityKind::Mob => 1.1,
+        _ => 2.0 * (0.5 + 1.4), // 3.8 (default capsule)
     }
 }
 
 /// Marker inserted on an entity once its baked PC/NPC mesh has been
-/// spawned (see `dat_vos2::spawn_equipped`). The snap and target-ring
-/// systems consult this to switch their visual offset model: a baked
-/// mesh's origin is the **skeleton root (hip)**, not the mesh center
-/// the legacy capsule assumed.
+/// spawned (see `dat_vos2::spawn_equipped`). The mesh's spawn-time
+/// transform already includes a `Vec3::Y * -min_mesh_y` translation
+/// that pins the lowest baked vertex at the entity's local y=0, so
+/// downstream systems (snap, target ring, picking) can treat the
+/// entity's `Transform::translation.y` as the feet-on-ground position
+/// without any per-actor offset lookup.
 ///
-/// `min_mesh_y` is the **lowest** Y of any baked vertex in Bevy frame —
-/// i.e., the actual hip-to-foot distance for this specific actor.
-/// Populated by the bake-extent walk in
-/// [`crate::dat_vos2::spawn_skinned_actor`] /
-/// `spawn_vos2_meshes_with_skeleton` and surfaced by `/debug heights`,
-/// so the operator can spot when [`visual_root_offset`]'s default `0.9`
-/// disagrees with reality (Taru shorter, Galka taller).
+/// `min_mesh_y` / `actor_height` are retained for diagnostics
+/// (`/debug heights`) and for anchoring features that need the head
+/// position (nameplate, chase camera look-at, first-person eye). They
+/// are *not* used by the snap.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct BakedActor {
+    /// Lowest local-y the bake reaches, **before** the feet-at-origin
+    /// translation was folded into the mesh's spawn transform. Negative
+    /// for the conventional "mesh root at hip, feet below" authoring;
+    /// kept around so the diagnostic can show whether the value the
+    /// snap used to assume (`-0.9`) matched reality for the actor's
+    /// race.
     pub min_mesh_y: f32,
-}
-
-/// Distance from the entity transform's y down to the "ground"
-/// reference plane the snap should land on.
-///
-/// - Legacy capsule visual: returns [`feet_offset`] (capsule center →
-///   capsule bottom).
-/// - Baked-mesh visual: returns ~hip-to-foot distance. The bake's
-///   mesh-y=0 is the **skeleton root (hip)**, not feet: the head-slot
-///   bake extent (y=[0.84..1.59] post-rotation) is *neck-to-top-of-
-///   head*, and feet are at negative y (legs/feet slot extends below
-///   the hip). To put the mesh's feet at ground, the entity transform
-///   needs to be at `ground + hip_height`.
-#[inline]
-pub fn visual_root_offset(kind: EntityKind, has_baked_mesh: bool) -> f32 {
-    if has_baked_mesh {
-        // ~0.9 yalm — typical PC hip-to-foot distance derived from
-        // the bake-extent analysis. Per-race tuning (Taru shorter,
-        // Galka taller) is a follow-up; this constant is acceptable
-        // until a character of the wrong race shows visible float/sink.
-        return 0.9;
-    }
-    feet_offset(kind)
+    /// `max_mesh_y - min_mesh_y` — the actor's full visual height in
+    /// yalms. Use this for head anchoring (`transform.y + actor_height`
+    /// puts you at the top of the mesh).
+    pub actor_height: f32,
 }
 
 /// Per-frame visual smoothing for *non-self* entity transforms.
@@ -227,15 +210,25 @@ pub fn setup_world(
         // family, distinguishable side-by-side.
         mob_claimed_other: mk(Color::srgb(0.65, 0.10, 0.10), &mut materials),
     });
+    // Placeholder meshes anchored so that **mesh-y = 0 is the entity's
+    // feet**, not its geometric center. `Capsule3d::new(r, hl)` places
+    // its center at the origin; we translate the mesh up by `r + hl`
+    // so the bottom of the capsule lands at y=0. Same for the mob
+    // cuboid (translate up by half-side).
+    //
+    // This is the invariant the snap and target-ring rely on: every
+    // entity transform's Y is the actor's feet-on-ground position.
+    // No per-kind offset table at snap time, no per-actor estimate;
+    // the mesh literally extends from y=0 upward.
     commands.insert_resource(EntityMesh {
-        default: meshes.add(Capsule3d::new(0.5, 1.4)),
+        default: meshes.add(Capsule3d::new(0.5, 1.4).mesh().build().translated_by(Vec3::Y * (0.5 + 1.4))),
         // PCs: noticeably taller and thinner than NPCs so player characters
         // pop visually in the world.
-        pc: meshes.add(Capsule3d::new(0.35, 1.9)),
+        pc: meshes.add(Capsule3d::new(0.35, 1.9).mesh().build().translated_by(Vec3::Y * (0.35 + 1.9))),
         // Mobs: boxy. Distinct silhouette from anything humanoid.
-        mob: meshes.add(Cuboid::new(1.1, 1.1, 1.1)),
+        mob: meshes.add(Cuboid::new(1.1, 1.1, 1.1).mesh().build().translated_by(Vec3::Y * 0.55)),
         // Pets: small capsule, hugs the ground.
-        pet: meshes.add(Capsule3d::new(0.4, 0.6)),
+        pet: meshes.add(Capsule3d::new(0.4, 0.6).mesh().build().translated_by(Vec3::Y * (0.4 + 0.6))),
     });
 
     // No placeholder ground plane: the navmesh wireframe overlay

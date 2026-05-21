@@ -85,7 +85,11 @@ const MIN_QUAD_WIDTH_YALMS: f32 = 0.8;
 /// label sits. Matches the prior UI nameplate (`Vec3::Y * 2.4`) so the
 /// label parks at roughly head-of-capsule height regardless of which
 /// rendering path the operator is on.
-const HEAD_Y_OFFSET: f32 = 2.4;
+/// Vertical lift from the entity's transform (now its feet) to the
+/// nameplate anchor — just above the head of an adult silhouette.
+/// Tuned for ~4.5-yalm total character height; Galka/Taru drift is a
+/// few tenths of a yalm, which is invisible at nameplate distance.
+const HEAD_Y_OFFSET: f32 = 4.7;
 
 /// Pixel radius of the dark halo drawn behind the glyphs. The halo is
 /// what makes a yellow name readable against a sand-colored Western
