@@ -57,6 +57,75 @@ pub struct HudVerbosity {
 #[derive(Component)]
 pub struct DevHud;
 
+/// Marker on the bottom-left flex container that owns the chat panels,
+/// tab bar, and minimap. The container uses `FlexDirection::ColumnReverse`
+/// so the first child (the chat panel pool) sits at the bottom and
+/// subsequent children stack upward — when chat auto-decay shrinks the
+/// panel height, the tab bar + minimap slide down with it automatically
+/// (Taffy handles the math, no per-frame positioning system needed).
+///
+/// Native-only because the minimap child is native-only (`#[cfg]` gated
+/// in `crate::minimap`). The wasm front-end registers chat panels and
+/// tab bar via [`add_hud_spawners`] without the minimap.
+#[derive(Component)]
+pub struct BottomLeftStack;
+
+/// Spawn the [`BottomLeftStack`] flex container + its children: the
+/// three chat panels (Social / Battle / Debug), the tab bar, and (on
+/// native) the minimap. Children stack via Bevy UI's Taffy flex flow
+/// — no manual `position_bottom_left_stack_system` any more.
+///
+/// Order in the DOM (`with_children` insertion order) matters because
+/// `FlexDirection::ColumnReverse` places the first child at the bottom
+/// and subsequent children upward:
+///
+///   1. chat panels (bottom of stack — the active one is visible,
+///                   inactive Display::None and skipped by flex)
+///   2. tab bar     (above the active panel)
+///   3. minimap     (above the tab bar) — native only
+pub fn spawn_bottom_left_stack(
+    mut commands: Commands,
+    #[cfg(not(target_arch = "wasm32"))] mut images: ResMut<Assets<bevy::image::Image>>,
+) {
+    commands
+        .spawn((
+            crate::components::InGameEntity,
+            BottomLeftStack,
+            Node {
+                position_type: PositionType::Absolute,
+                // Sit above the chat-input strip (bottom 28..52) with
+                // a 2px gap. `bottom: 54` is the same anchor the
+                // freestanding chat panel used to use; the difference
+                // now is that everything above it flows up via flex.
+                bottom: Val::Px(54.0),
+                left: Val::Px(0.0),
+                width: Val::Percent(50.0),
+                // `height: Auto` so the container resizes to fit its
+                // children. As the chat panel auto-decays its height
+                // between PANEL_MIN_HEIGHT_PX and PANEL_MAX_HEIGHT_PX,
+                // the whole stack grows/shrinks while staying anchored
+                // to the viewport bottom.
+                height: Val::Auto,
+                flex_direction: FlexDirection::ColumnReverse,
+                // Left-align children of different widths (the minimap
+                // is 192px square, the tab bar is auto-sized to its
+                // buttons, the chat panel is 100% of the stack
+                // width). Without `FlexStart`, Bevy's default
+                // `Stretch` would force the minimap and tab bar to
+                // full stack width.
+                align_items: AlignItems::FlexStart,
+                row_gap: Val::Px(4.0),
+                ..default()
+            },
+        ))
+        .with_children(|p| {
+            chat_panel::spawn_chat_panels_as_children(p);
+            chat_panel::spawn_chat_tab_bar_as_child(p);
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::minimap::spawn_minimap_as_child(p, &mut images);
+        });
+}
+
 /// Run when [`HudVerbosity`] flips: set every [`DevHud`]-tagged entity's
 /// `Visibility` to match. Bevy UI propagates `Hidden` to descendants, so
 /// only the root nodes need the marker.
@@ -173,16 +242,11 @@ impl Plugin for HudPlugin {
         app.add_systems(Update, apply_dev_hud_visibility);
         app.add_systems(Update, chat_panel::chat_tab_click_system);
         app.add_systems(Update, chat_panel::update_chat_tab_visuals_system);
-        // Runs AFTER update_chat_panel (which mutates panel height
-        // each frame via auto-decay) so the tab bar + minimap see the
-        // current frame's chat height, not last frame's. Bevy's
-        // default Update ordering is parallel-when-possible; an
-        // explicit `.after()` pins the dependency.
-        app.add_systems(
-            Update,
-            chat_panel::position_bottom_left_stack_system
-                .after(chat_panel::update_chat_panel),
-        );
+        // The chat panel + tab bar + minimap auto-flow via the
+        // `BottomLeftStack` flex container (Taffy-driven). No
+        // per-frame positioning system needed — Bevy UI recomputes
+        // the layout whenever a child's size changes (e.g. chat
+        // auto-decay shrinks/grows `Node::height`).
         app.add_systems(Update, weather_icon::update_weather_icon);
         // Combat pulse: detect-then-modulate, chained so the color
         // update sees the latched timestamp from the same frame. Both
@@ -226,7 +290,11 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(
         schedule.clone(),
         (
             stage_bar::spawn_stage_bar,
-            chat_panel::spawn_chat_panel,
+            // Bottom-left flex container owns the chat panels, tab
+            // bar, and (on native) the minimap. Replaces the old
+            // freestanding chat_panel::spawn_chat_panel +
+            // minimap::spawn_minimap pair.
+            spawn_bottom_left_stack,
             diagnostics::spawn_diagnostics,
             agent_hud::spawn_agent_hud,
             llm_badge::spawn_llm_badge,
@@ -250,11 +318,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(
     // Second `add_systems` call — see the matching split in `Update`
     // registration above: Bevy's `IntoScheduleConfigs` tuple impls cap
     // at 20 entries.
-    app.add_systems(schedule.clone(), weather_icon::spawn_weather_icon);
-    // Minimap spawner. Native-only — the minimap module itself is
-    // gated on `cfg(not(target_arch = "wasm32"))` because its
-    // top-down backend reads MZB geometry. WASM front-ends skip this
-    // entry without losing the rest of the HUD.
-    #[cfg(not(target_arch = "wasm32"))]
-    app.add_systems(schedule, crate::minimap::spawn_minimap);
+    app.add_systems(schedule, weather_icon::spawn_weather_icon);
+    // Minimap is now a child of BottomLeftStack — spawned inside
+    // `spawn_bottom_left_stack` (native only via cfg-gating).
 }

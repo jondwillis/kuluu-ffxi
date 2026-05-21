@@ -221,72 +221,44 @@ const SPANS_PER_ROW: usize = 16;
 const AUTOTRANSLATE_COLOR: Color = Color::srgb(0.50, 0.78, 1.00);
 
 
-pub fn spawn_chat_panel(mut commands: Commands) {
-    // Tabbed layout: three panel entities stacked at the SAME bottom-
-    // left slot (0..50% width), only one visible at a time. The tab
-    // bar sitting just above them switches `ActiveChatTab`, which a
-    // system reacts to by toggling `Display` on the panels.
-    //
-    // - Social ("Chat"): say/shout/tell/party/linkshell/yell/other
-    // - Battle ("Battle"): combat log only
-    // - Debug  ("System"): server System messages + client toasts
-    spawn_panel(
-        &mut commands,
-        ChatKind::Social,
-        Val::Percent(0.0),
-        Val::Percent(50.0),
-        Display::Flex,
-    );
-    spawn_panel(
-        &mut commands,
-        ChatKind::Battle,
-        Val::Percent(0.0),
-        Val::Percent(50.0),
-        Display::None,
-    );
-    spawn_panel(
-        &mut commands,
-        ChatKind::Debug,
-        Val::Percent(0.0),
-        Val::Percent(50.0),
-        Display::None,
-    );
-    spawn_chat_tab_bar(&mut commands);
+/// Spawn the three chat panels as children of an existing parent (the
+/// `BottomLeftStack` flex container in `hud::mod`). Panels overlap
+/// visually but only the one matching `ActiveChatTab` is `Display::Flex`
+/// at any moment — the others are `Display::None` and skipped by the
+/// parent's flex flow entirely.
+///
+/// Tab routing (see [`ChatKind::accepts`]):
+/// - Social ("Chat"):   say/shout/tell/party/linkshell/yell/other
+/// - Battle ("Battle"): combat log only
+/// - Debug  ("System"): server System + client toasts
+pub fn spawn_chat_panels_as_children(p: &mut ChildSpawnerCommands) {
+    spawn_panel(p, ChatKind::Social, Display::Flex);
+    spawn_panel(p, ChatKind::Battle, Display::None);
+    spawn_panel(p, ChatKind::Debug, Display::None);
 }
 
-/// Spawn the tab bar that sits above the chat panels. Two buttons —
-/// "Chat 1" / "Chat 2" — each carrying a [`ChatTabButton`] marker so
-/// [`chat_tab_click_system`] knows which tab to switch to.
-fn spawn_chat_tab_bar(commands: &mut Commands) {
-    commands
-        .spawn((
-            crate::components::InGameEntity,
-            ChatTabBar,
-            Node {
-                position_type: PositionType::Absolute,
-                // `bottom` is rewritten every frame by
-                // [`position_bottom_left_stack_system`] to track the
-                // chat panel's current (auto-decaying) height. The
-                // initial value (matches chat MIN_HEIGHT + gap) is
-                // just to avoid a one-frame flash at the wrong
-                // location before the stack system first runs.
-                bottom: Val::Px(54.0 + PANEL_MIN_HEIGHT_PX + 4.0),
-                left: Val::Px(0.0),
-                height: Val::Px(20.0),
-                padding: UiRect::axes(Val::Px(2.0), Val::Px(0.0)),
-                flex_direction: FlexDirection::Row,
-                column_gap: Val::Px(2.0),
-                ..default()
-            },
-        ))
-        .with_children(|p| {
-            // Descriptive labels, retail-faithful where possible:
-            // "Chat" = Chat 1, "Battle" = Chat 2's combat half,
-            // "System" = server System + client Debug toasts.
-            spawn_tab_button(p, ChatKind::Social, "Chat", true);
-            spawn_tab_button(p, ChatKind::Battle, "Battle", false);
-            spawn_tab_button(p, ChatKind::Debug, "System", false);
-        });
+/// Spawn the tab bar as a child of the `BottomLeftStack`. Three
+/// descriptively-labeled buttons; click handler in
+/// [`chat_tab_click_system`] mutates [`ActiveChatTab`] on `Pressed`.
+pub fn spawn_chat_tab_bar_as_child(p: &mut ChildSpawnerCommands) {
+    p.spawn((
+        ChatTabBar,
+        Node {
+            // Auto-width: just enough for the three buttons. The
+            // parent stack is `align_items: FlexStart`, so the tab
+            // bar sits left-aligned without stretching to full width.
+            height: Val::Px(20.0),
+            flex_shrink: 0.0,
+            flex_direction: FlexDirection::Row,
+            column_gap: Val::Px(2.0),
+            ..default()
+        },
+    ))
+    .with_children(|p| {
+        spawn_tab_button(p, ChatKind::Social, "Chat", true);
+        spawn_tab_button(p, ChatKind::Battle, "Battle", false);
+        spawn_tab_button(p, ChatKind::Debug, "System", false);
+    });
 }
 
 fn spawn_tab_button(
@@ -324,33 +296,21 @@ fn spawn_tab_button(
     });
 }
 
-fn spawn_panel(
-    commands: &mut Commands,
-    kind: ChatKind,
-    left: Val,
-    width: Val,
-    initial_display: Display,
-) {
-    let mut e = commands.spawn((
-        crate::components::InGameEntity,
+fn spawn_panel(parent: &mut ChildSpawnerCommands, kind: ChatKind, initial_display: Display) {
+    parent.spawn((
         ChatPanel { kind },
         ChatPanelDecay::default(),
         // `RelativeCursorPosition::cursor_over` is what
         // `chat_wheel_scroll_system` reads to decide whether to
-        // consume the wheel. No `Pickable` needed — Bevy UI
-        // updates the field automatically each frame.
+        // consume the wheel. No `Pickable` needed — Bevy UI updates
+        // the field automatically each frame.
         RelativeCursorPosition::default(),
         Node {
-            position_type: PositionType::Absolute,
-            // Stack: 28px diagnostics bar + 24px chat-input slot + 2px
-            // gap = 54. The chat input bar at `bottom: 28` (height 24)
-            // slots into the gap below this panel rather than overlaying
-            // its bottommost row. When the input is hidden the gap is
-            // just empty breathing room above the diagnostics strip.
-            bottom: Val::Px(54.0),
-            left,
-            right: Val::Auto,
-            width,
+            // Width tracks the parent BottomLeftStack (which is 50%
+            // viewport-width). No bottom/left here — flex flow on
+            // the stack handles positioning, and the panel's
+            // auto-decay `height` drives the stack's overall height.
+            width: Val::Percent(100.0),
             height: Val::Px(PANEL_MIN_HEIGHT_PX),
             padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
             border: UiRect::all(Val::Px(1.0)),
@@ -368,8 +328,8 @@ fn spawn_panel(
         },
         BackgroundColor(palette::BACKGROUND),
         BorderColor::all(palette::BORDER),
-    ));
-    e.with_children(|p| {
+    ))
+    .with_children(|p| {
             for slot in 0..VISIBLE_ROWS {
                 p.spawn((
                     ChatRow { slot },
@@ -809,84 +769,6 @@ pub fn chat_wheel_scroll_system(
     }
     // Suppress camera zoom on the same wheel event.
     pointer.wheel = 0.0;
-}
-
-/// Responsive bottom-left stack. Reads the visible chat panel's
-/// current height (which auto-decays between [`PANEL_MIN_HEIGHT_PX`]
-/// and [`PANEL_MAX_HEIGHT_PX`]) and slides the chat tab bar + minimap
-/// up/down so they sit *above* the chat without ever overlapping it.
-///
-/// Stack (anchored bottom-left, growing up):
-/// ```text
-/// ┌─────────────┐
-/// │  minimap    │  ← bottom = chat_top + tab_h + 2 gaps
-/// ├─────────────┤
-/// │ [1] [2]     │  ← bottom = chat_top + 1 gap
-/// ├─────────────┤
-/// │   chat      │  bottom: 54  (chat-input strip below)
-/// │             │
-/// └─────────────┘
-/// ```
-///
-/// Without this system the tab bar (fixed `bottom: 218`) and the
-/// minimap (fixed `bottom: 220`) overlapped each other AND the
-/// chat panel at its full auto-decay height (`bottom: 274`).
-///
-/// Runs every frame because chat height interpolates continuously
-/// during auto-decay fade-out; the change-detection guard
-/// (`if node.bottom != want`) keeps the per-frame cost trivial.
-pub fn position_bottom_left_stack_system(
-    chat_q: Query<&Node, With<ChatPanel>>,
-    mut tab_bar_q: Query<
-        &mut Node,
-        (
-            With<ChatTabBar>,
-            Without<ChatPanel>,
-            Without<crate::minimap::MinimapRoot>,
-        ),
-    >,
-    mut minimap_q: Query<
-        &mut Node,
-        (
-            With<crate::minimap::MinimapRoot>,
-            Without<ChatPanel>,
-            Without<ChatTabBar>,
-        ),
-    >,
-) {
-    // Use the maximum visible-panel height so tab+minimap don't dip
-    // into a hidden panel's space when ActiveChatTab swaps. Each
-    // panel's height interpolates between MIN and MAX via auto-decay,
-    // so this captures the live size of whatever tab is showing.
-    let chat_h = chat_q
-        .iter()
-        .filter(|n| n.display != Display::None)
-        .filter_map(|n| match n.height {
-            Val::Px(h) => Some(h),
-            _ => None,
-        })
-        .fold(0.0_f32, f32::max);
-
-    const CHAT_BOTTOM_PX: f32 = 54.0;
-    const TAB_BAR_HEIGHT_PX: f32 = 20.0;
-    const GAP_PX: f32 = 4.0;
-
-    let chat_top = CHAT_BOTTOM_PX + chat_h;
-    let tab_bottom = chat_top + GAP_PX;
-    let minimap_bottom = tab_bottom + TAB_BAR_HEIGHT_PX + GAP_PX;
-
-    if let Ok(mut node) = tab_bar_q.single_mut() {
-        let want = Val::Px(tab_bottom);
-        if node.bottom != want {
-            node.bottom = want;
-        }
-    }
-    if let Ok(mut node) = minimap_q.single_mut() {
-        let want = Val::Px(minimap_bottom);
-        if node.bottom != want {
-            node.bottom = want;
-        }
-    }
 }
 
 /// React to clicks on a [`ChatTabButton`] — set [`ActiveChatTab`] to

@@ -222,77 +222,64 @@ impl Plugin for MinimapPlugin {
     }
 }
 
-/// Spawn the minimap UI root + children. Front-ends call this via
-/// `add_hud_spawners` so it lands on the same schedule as the rest of
-/// the HUD (today: `OnEnter(AppPhase::InGame)` for native, `Startup`
-/// for wasm — but wasm is gated out at the module level).
+/// Spawn the minimap UI root as a child of an existing parent (the
+/// `BottomLeftStack` flex container in `hud::mod`). The parent owns
+/// positioning + flex flow; this function only contributes the
+/// minimap's own size + background-and-overlay child structure.
 ///
-/// Image starts as a 1×1 transparent pixel; the swap system will point
+/// `Image` starts as a 1×1 transparent pixel; the swap system points
 /// it at the real render target / retail texture as soon as a backend
 /// produces one.
-pub fn spawn_minimap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+pub fn spawn_minimap_as_child(p: &mut ChildSpawnerCommands, images: &mut Assets<Image>) {
     let placeholder = images.add(transparent_placeholder_image());
-    commands
-        .spawn((
-            crate::components::InGameEntity,
-            MinimapRoot,
+    p.spawn((
+        // The parent flex container handles position/anchoring. We
+        // only declare size + chrome here.
+        MinimapRoot,
+        Node {
+            // `flex_shrink: 0` so when the chat panel grows to its
+            // PANEL_MAX_HEIGHT_PX the flex layout doesn't squeeze the
+            // minimap below its intended 192×192 footprint.
+            flex_shrink: 0.0,
+            width: Val::Px(MINIMAP_UI_SIZE_PX),
+            height: Val::Px(MINIMAP_UI_SIZE_PX),
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BackgroundColor(palette::BACKGROUND),
+        BorderColor::all(palette::BORDER),
+    ))
+    .with_children(|p| {
+        // Background image (top-down bake or retail texture). Fills
+        // the parent; `ImageNode`'s default mode stretches to fit.
+        p.spawn((
+            MinimapImage,
+            ImageNode::new(placeholder),
             Node {
                 position_type: PositionType::Absolute,
-                // Bottom-LEFT, stacked above the chat panel + tab bar.
-                // The actual `bottom` value is rewritten every frame by
-                // [`crate::hud::chat_panel::position_bottom_left_stack_system`]
-                // so the minimap stays just above the tab bar as the
-                // chat panel's auto-decay interpolates its height
-                // between `PANEL_MIN_HEIGHT_PX` and `PANEL_MAX_HEIGHT_PX`.
-                // The initial value (matches the stack system's idle
-                // computation) is just to avoid a one-frame flash at
-                // the wrong location before that system first runs.
-                bottom: Val::Px(54.0 + 60.0 + 4.0 + 20.0 + 4.0),
-                left: Val::Px(8.0),
-                width: Val::Px(MINIMAP_UI_SIZE_PX),
-                height: Val::Px(MINIMAP_UI_SIZE_PX),
-                border: UiRect::all(Val::Px(1.0)),
+                top: Val::Px(0.0),
+                left: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
                 ..default()
             },
-            // Pull the minimap above the chat panel in z-order so the
-            // panel's body never visually clips the minimap rim. UI z
-            // defaults to insertion order, which is fragile when other
-            // overlays land later; an explicit ZIndex pins it.
-            ZIndex(10),
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
-        ))
-        .with_children(|p| {
-            // Background image (top-down bake or retail texture). Fills
-            // the parent; `ImageNode`'s default mode stretches to fit.
-            p.spawn((
-                MinimapImage,
-                ImageNode::new(placeholder),
-                Node {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(0.0),
-                    left: Val::Px(0.0),
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    ..default()
-                },
-            ));
-            // Overlay layer for entity dots. Same bounds as the image,
-            // higher in the child list so dots render on top. The
-            // overlay system spawns/clears its dot nodes as children of
-            // this node every frame.
-            p.spawn((
-                MinimapOverlayLayer,
-                Node {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(0.0),
-                    left: Val::Px(0.0),
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    ..default()
-                },
-            ));
-        });
+        ));
+        // Overlay layer for entity dots. Same bounds as the image,
+        // higher in the child list so dots render on top. The
+        // overlay system spawns/clears its dot nodes as children of
+        // this node every frame.
+        p.spawn((
+            MinimapOverlayLayer,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(0.0),
+                left: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                ..default()
+            },
+        ));
+    });
 }
 
 /// 1×1 fully-transparent RGBA8 image. Used as the initial `ImageNode`
