@@ -19,6 +19,7 @@ pub enum ChunkKind {
     Scheduler = 0x07, // event/scheduler records (sdam, sp00, ...)
     Tim = 0x09,       // texture (legacy TIM)
     Mzb = 0x1C,       // zone static mesh (collision)
+    D3m = 0x1F,       // particle/effect triangle billboards (lotus FFXI::D3M)
     Img = 0x20,       // image / texture container (D3S in some refs)
     Bone = 0x29,      // skeleton bones (Sk2)
     VertexOs2 = 0x2A, // vertex data (OS2)
@@ -27,6 +28,7 @@ pub enum ChunkKind {
     Weather = 0x2F,   // per-zone TOD light/fog/skybox keyframes (FFXI::Weather)
     Rid = 0x36,       // resource id (file metadata)
     Sep = 0x3D,       // sound effect pointer (body[8..12] = u32 SE id)
+    Cib = 0x45,       // character-info (footstep mat/size, motion ranges)
 }
 
 impl ChunkKind {
@@ -40,6 +42,7 @@ impl ChunkKind {
             0x07 => Self::Scheduler,
             0x09 => Self::Tim,
             0x1C => Self::Mzb,
+            0x1F => Self::D3m,
             0x20 => Self::Img,
             0x29 => Self::Bone,
             0x2A => Self::VertexOs2,
@@ -48,6 +51,7 @@ impl ChunkKind {
             0x2F => Self::Weather,
             0x36 => Self::Rid,
             0x3D => Self::Sep,
+            0x45 => Self::Cib,
             _ => return None,
         })
     }
@@ -62,6 +66,7 @@ impl ChunkKind {
             0x07 => "Scheduler",
             0x09 => "Tim",
             0x1C => "Mzb",
+            0x1F => "D3m",
             0x20 => "Img",
             0x29 => "Bone",
             0x2A => "VertexOs2",
@@ -70,6 +75,7 @@ impl ChunkKind {
             0x2F => "Weather",
             0x36 => "Rid",
             0x3D => "Sep",
+            0x45 => "Cib",
             _ => "unknown",
         }
     }

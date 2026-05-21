@@ -90,6 +90,21 @@ pub fn update_vana_clock(time: Res<Time>, mut q: Query<&mut Text, With<VanaClock
     }
 }
 
+/// Monotonic Vana minutes since the V-epoch (8866-01-01 00:00).
+///
+/// Use this when you need a single increasing scalar across days —
+/// e.g. when a Scheduler-like timeline straddles a Vana-day rollover,
+/// or when comparing two Vana timestamps across an arbitrary span.
+/// For per-action timelines stay frame-based (see
+/// `ffxi_dat::scheduler::TimedStage::frame`); for in-day animations
+/// use [`crate::sun_moon::VanaSky::hour`].
+pub fn vana_minutes_since_epoch(earth_unix_secs: u64) -> u64 {
+    let earth_since_vana = earth_unix_secs.saturating_sub(EARTH_EPOCH_UNIX);
+    // 25 Earth seconds = 1 V-hour = 60 V-min, so 1 Earth-second = 60/25 = 2.4 V-min.
+    // Stay in integer math by scaling: vana-min = earth-sec * 60 / 25.
+    earth_since_vana.saturating_mul(60) / 25
+}
+
 /// Convert `earth_unix_secs` to a `V YYYY-MM-DD HH:MM` string.
 pub fn format_vana(earth_unix_secs: u64) -> String {
     let earth_since_vana = earth_unix_secs.saturating_sub(EARTH_EPOCH_UNIX);
@@ -153,5 +168,19 @@ mod tests {
         // at year 887.
         let s = format_vana(EARTH_EPOCH_UNIX + 360 * EARTH_SECS_PER_VANA_DAY);
         assert_eq!(s, "V 0887-01-01 00:00");
+    }
+
+    #[test]
+    fn vana_minutes_since_epoch_matches_formatter() {
+        // One V-hour = 60 V-min = 25 earth-sec.
+        assert_eq!(vana_minutes_since_epoch(EARTH_EPOCH_UNIX), 0);
+        assert_eq!(vana_minutes_since_epoch(EARTH_EPOCH_UNIX + 25), 60);
+        // A full V-day = 24 × 60 = 1440 V-min.
+        assert_eq!(
+            vana_minutes_since_epoch(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_DAY),
+            1440
+        );
+        // Pre-epoch clamps to 0 like the formatter.
+        assert_eq!(vana_minutes_since_epoch(0), 0);
     }
 }

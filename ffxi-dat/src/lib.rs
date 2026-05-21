@@ -18,6 +18,8 @@ pub mod anim;
 pub mod archive;
 pub mod bone;
 pub mod chunk;
+pub mod cib;
+pub mod d3m;
 pub mod ftable;
 pub mod generator;
 pub mod kind;
