@@ -2173,17 +2173,23 @@ fn decode_battle_message(
     })
 }
 
-/// Minimal big-endian bit reader over a `&[u8]`. The 0x028 action
-/// stream packs every field at arbitrary bit widths (3/4/5/6/10/12/
-/// 14/17/31/32), and the high bit of each field lands in the most
-/// significant unread bit of the current byte. `read(n)` returns up
-/// to 32 bits at a time; the cursor is byte-and-bit at all times so
-/// we can stay aligned across the conditional sub-blocks.
+/// Bit reader mirroring LSB's `unpackBitsBE`
+/// (`vendor/server/src/common/utils.cpp:336`). The misleading "BE" name
+/// refers to the field-packing convention, NOT byte endianness:
+/// - Multi-byte fields are stored in native **little-endian** byte order
+///   (LSB reinterprets the byte stream as `uint16*`/`uint32*`/`uint64*`).
+/// - Within a byte, the low bits hold the first-packed field; subsequent
+///   fields ride above them.
 ///
-/// Transliterated from `vendor/server/src/map/packets/s2c/0x028_battle2.cpp::
-/// unpack`. Errors surface as `None` when the underlying buffer
-/// would underflow — the caller drops the rest of the action rather
-/// than fabricate a partial chat line.
+/// Algorithm: read a u16/u32/u64 from the byte covering the cursor,
+/// shift right by the within-byte offset, mask off the field width.
+/// Cursor advances bit-by-bit so we stay aligned across the conditional
+/// proc/react sub-blocks in 0x028.
+///
+/// `read(n)` returns up to 32 bits at a time (matching what the 0x028
+/// format ever packs in a single field; max width = 32). Underflow on
+/// the underlying buffer returns `None` so the caller drops the rest
+/// of the action rather than fabricate a partial chat line.
 struct BattleBitReader<'a> {
     data: &'a [u8],
     pos: usize, // bit position
@@ -2199,17 +2205,35 @@ impl<'a> BattleBitReader<'a> {
 
     fn read(&mut self, bits: u32) -> Option<u64> {
         debug_assert!(bits <= 32);
-        let mut value: u64 = 0;
-        for i in 0..bits {
-            let bit_pos = self.pos;
-            let byte_idx = bit_pos / 8;
-            let bit_in_byte = 7 - (bit_pos % 8); // big-endian
-            let byte = *self.data.get(byte_idx)?;
-            let bit = ((byte >> bit_in_byte) & 1) as u64;
-            value |= bit << (bits - 1 - i);
-            self.pos += 1;
-        }
-        Some(value)
+        let byte_offset = self.pos / 8;
+        let bit_in_byte = self.pos % 8;
+        let total_bits = bits as usize + bit_in_byte;
+        let value: u64 = if total_bits <= 8 {
+            *self.data.get(byte_offset)? as u64
+        } else if total_bits <= 16 {
+            if byte_offset + 2 > self.data.len() {
+                return None;
+            }
+            u16::from_le_bytes(self.data[byte_offset..byte_offset + 2].try_into().ok()?) as u64
+        } else if total_bits <= 32 {
+            if byte_offset + 4 > self.data.len() {
+                return None;
+            }
+            u32::from_le_bytes(self.data[byte_offset..byte_offset + 4].try_into().ok()?) as u64
+        } else {
+            // total_bits up to 39 (32 width + 7 within-byte) needs a u64 read.
+            if byte_offset + 8 > self.data.len() {
+                return None;
+            }
+            u64::from_le_bytes(self.data[byte_offset..byte_offset + 8].try_into().ok()?)
+        };
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        self.pos += bits as usize;
+        Some((value >> bit_in_byte) & mask)
     }
 }
 
@@ -3794,12 +3818,14 @@ mod tests {
         );
     }
 
-    /// Test helper: BE bit writer mirroring LSB's `packBitsBE`. Starts
-    /// writing at bit offset `start_bit`. To synthesize a body shaped
-    /// like what `walk_sub_packets` hands to `decode_battle2_action`
-    /// (1-byte workSize + bitstream), pass `8`. Passing `40` would
-    /// match LSB's full-buffer convention (4-byte sub-packet header
-    /// + 1-byte workSize), but our decoder is fed body-only data.
+    /// Test helper: bit writer mirroring LSB's `packBitsBE`
+    /// (`vendor/server/src/common/utils.cpp:272`). Stores multi-byte
+    /// fields in native little-endian byte order; within a byte, the
+    /// low bits hold the first-packed field. See [`BattleBitReader`]'s
+    /// doc comment for the full convention.
+    ///
+    /// `start_bit = 8` matches the body shape `walk_sub_packets` hands
+    /// to `decode_battle2_action` (1-byte workSize + bitstream).
     struct BattleBitWriter {
         data: Vec<u8>,
         pos: usize,
@@ -3814,13 +3840,20 @@ mod tests {
             }
         }
         fn write(&mut self, value: u64, bits: u32) {
-            for i in 0..bits {
-                let bit = (value >> (bits - 1 - i)) & 1;
-                let byte_idx = self.pos / 8;
-                let bit_in_byte = 7 - (self.pos % 8);
-                self.data[byte_idx] |= (bit as u8) << bit_in_byte;
-                self.pos += 1;
+            let byte_offset = self.pos / 8;
+            let bit_in_byte = self.pos % 8;
+            let total_bits = bits as usize + bit_in_byte;
+            let mask = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let shifted = (value & mask) << bit_in_byte;
+            let cover = (total_bits + 7) / 8;
+            for i in 0..cover {
+                self.data[byte_offset + i] |= ((shifted >> (i * 8)) & 0xFF) as u8;
             }
+            self.pos += bits as usize;
         }
         fn into_bytes(self) -> Vec<u8> {
             let used = (self.pos + 7) / 8;
@@ -3943,6 +3976,32 @@ mod tests {
         let data = w.into_bytes();
         let lines = decode_battle2_action(&data, &HashMap::new());
         assert!(lines.is_empty(), "expected drop, got: {:?}", lines);
+    }
+
+    #[test]
+    fn battle2_bitwriter_matches_lsb_pack_byte_layout() {
+        // Pin LSB's packBitsBE convention with a known value at a known
+        // offset, asserting the *byte representation* directly. This is
+        // independent of BattleBitReader — if a future drive-by edit
+        // flips both reader and writer to MSB-first they'd still mirror
+        // each other but the live wire format would break silently.
+        // This test catches that by checking the bytes themselves.
+        //
+        // Layout per vendor/server/src/common/utils.cpp:272:
+        //   actor_id = 0xCAFE at bit 8 (byte 1, bit-in-byte 0)
+        //   → write 32-bit LE u32 to target[1..5]
+        //   → target[1] = 0xFE, target[2] = 0xCA, target[3..5] = 0
+        let mut w = BattleBitWriter::new(8);
+        w.write(0xCAFEu64, 32);
+        let bytes = w.into_bytes();
+        assert_eq!(bytes[0], 0x00, "workSize slot reserved at byte 0");
+        assert_eq!(
+            &bytes[1..5],
+            &[0xFE, 0xCA, 0x00, 0x00],
+            "actor_id LE-packed at byte 1..5 — if this fails, BitWriter \
+             no longer matches LSB packBitsBE; do NOT flip BitReader to \
+             compensate"
+        );
     }
 
     #[test]
