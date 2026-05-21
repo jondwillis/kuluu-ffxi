@@ -14,6 +14,16 @@
 // the uniform global must be a struct. `SkyboxUniform` mirrors the
 // Rust-side `SkyboxUniform` exactly so `AsBindGroup`'s std140 layout
 // is byte-compatible with this declaration.
+//
+// Bind-group index: Bevy 0.17 puts the mesh storage buffer at group 2
+// (`bevy_pbr::mesh_bindings::mesh: array<Mesh>`) and material bind
+// groups at `MATERIAL_BIND_GROUP_INDEX = 3` — see
+// `bevy_pbr/src/material.rs:66`. Using `@group(2)` here collides with
+// the mesh-bindings slot and produces a cryptic
+// `Storage class Storage doesn't match Uniform` pipeline-layout
+// mismatch. The `#{MATERIAL_BIND_GROUP}` placeholder is substituted
+// by Bevy's shader processor (`material.rs:473`) to the right group
+// even if Bevy reshuffles indices in a future version.
 
 #import bevy_pbr::mesh_view_bindings::view
 #import bevy_pbr::forward_io::VertexOutput
@@ -23,7 +33,7 @@ struct SkyboxUniform {
     altitudes_packed: array<vec4<f32>, 2>,
 };
 
-@group(2) @binding(0) var<uniform> data: SkyboxUniform;
+@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> data: SkyboxUniform;
 
 fn get_altitude(i: u32) -> f32 {
     let outer = i / 4u;
