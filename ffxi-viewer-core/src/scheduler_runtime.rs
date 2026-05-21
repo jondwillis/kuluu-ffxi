@@ -38,8 +38,14 @@
 //! diel-time keyframes. (Earlier plan revision incorrectly assumed
 //! Scheduler keys off VanaSky; it does not.)
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
-use ffxi_dat::scheduler::{Scheduler, TimedStage};
+use ffxi_dat::chunk::walk;
+use ffxi_dat::generator::Generator;
+use ffxi_dat::kind::ChunkKind;
+use ffxi_dat::scheduler::{Scheduler, StageKind, TimedStage};
+use ffxi_dat::sep::Sep;
 
 /// FFXI animation frame rate. All Scheduler `frame` fields are in
 /// units of 1/30 second from action start.
@@ -158,16 +164,175 @@ pub fn tick_active_schedulers(
     }
 }
 
+/// Resolved chunks for an in-flight action. Populated alongside
+/// [`ActiveScheduler`] when an action starts; the dispatch systems
+/// look up `stage.id` against these maps when a stage fires.
+///
+/// `generators`, `d3ms`, and `seps` are keyed by chunk name (the
+/// 4-char id from the enclosing DAT header). Names are unique per
+/// action DAT, so flat lookup is sufficient — see
+/// `ffxi_dat::action::extract_se_schedule` for the established pattern.
+#[derive(Component, Debug, Clone, Default)]
+pub struct ActionAssets {
+    pub generators: HashMap<[u8; 4], Generator>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub d3ms: HashMap<[u8; 4], ffxi_dat::d3m::D3m>,
+    pub seps: HashMap<[u8; 4], Sep>,
+}
+
+/// Walk an action DAT's bytes once and produce its Schedulers +
+/// asset bundle. Pure function — callers do their own fs::read /
+/// async fetch (native or browser) and pass the bytes here.
+///
+/// Returns every parseable Scheduler the DAT contains plus a single
+/// [`ActionAssets`] map of Generators / D3Ms / Seps. Real action
+/// DATs typically ship one Scheduler ("main") plus a small bundle
+/// of Generators and their referenced child chunks.
+pub fn parse_action_bytes(bytes: &[u8]) -> (Vec<Scheduler>, ActionAssets) {
+    let mut schedulers = Vec::new();
+    let mut assets = ActionAssets::default();
+    for c in walk(bytes).flatten() {
+        let Some(kind) = ChunkKind::from_u8(c.kind) else {
+            continue;
+        };
+        match kind {
+            ChunkKind::Scheduler => {
+                if let Ok(s) = Scheduler::parse(c.name, c.data) {
+                    schedulers.push(s);
+                }
+            }
+            ChunkKind::Generator => {
+                if let Ok(Some(g)) = Generator::parse(c.name, c.data) {
+                    assets.generators.insert(c.name, g);
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            ChunkKind::D3m => {
+                if let Ok(d) = ffxi_dat::d3m::D3m::parse(c.name, c.data) {
+                    assets.d3ms.insert(c.name, d);
+                }
+            }
+            ChunkKind::Sep => {
+                if let Ok(s) = Sep::parse(c.name, c.data) {
+                    assets.seps.insert(c.name, s);
+                }
+            }
+            _ => {}
+        }
+    }
+    (schedulers, assets)
+}
+
+/// Time-to-live (real seconds) before a particle entity despawns.
+/// Set from the source stage's `duration_frames`, clamped to a
+/// minimum of 0.5s so single-frame stages still register visually.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct ParticleTtl(pub f32);
+
+impl ParticleTtl {
+    pub fn secs(s: f32) -> Self {
+        Self(s.max(0.0))
+    }
+}
+
+/// Map a Generator's `effect_type` byte to a D3M blend mode. Lotus
+/// `generator.cppm` exposes many effect types; the type byte alone
+/// doesn't disambiguate additive vs blended vs subtractive (that
+/// lives in a flags byte we don't yet decode — see TODO below).
+/// Default to additive, which matches the most common particle look
+/// (flame, magic glyphs, casting motes).
+///
+/// TODO: once `ffxi_dat::generator::Generator` exposes the blend-mode
+/// flags from the creation-command payload (lotus `generator.cppm:139`),
+/// branch on it here instead of returning a fixed default.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn d3m_blend_from_generator(_gen: &Generator) -> crate::dat_d3m::D3mBlendMode {
+    crate::dat_d3m::D3mBlendMode::Additive
+}
+
+/// Spawn a D3M billboard for every `Particle`-kind stage event whose
+/// id resolves through the actor's [`ActionAssets`] map. Each spawn
+/// gets an `InGameEntity` marker (lifecycle drain per
+/// [[feedback_bevy_lifecycle_symmetry]]) and a [`ParticleTtl`] sized
+/// from the stage's `duration_frames`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn dispatch_particle_stages(
+    mut events: MessageReader<SchedulerStageEvent>,
+    q_actors: Query<(&Transform, &ActionAssets)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut mats: ResMut<Assets<StandardMaterial>>,
+    mut commands: Commands,
+) {
+    for ev in events.read() {
+        if ev.stage.stage.kind != StageKind::Particle {
+            continue;
+        }
+        let Ok((actor_xf, assets)) = q_actors.get(ev.actor) else {
+            continue;
+        };
+        // Stage.id names a Generator; the Generator's `id` names a
+        // sibling D3M. Skip silently if either link is missing —
+        // unknown stage ids are common in real DATs (some stages
+        // reference Generator effect_types we don't render yet).
+        let Some(gen) = assets.generators.get(&ev.stage.stage.id) else {
+            continue;
+        };
+        let Some(d3m) = assets.d3ms.get(&gen.id) else {
+            continue;
+        };
+        let blend = d3m_blend_from_generator(gen);
+        let mesh_h = meshes.add(crate::dat_d3m::d3m_to_mesh(d3m));
+        let mat_h = mats.add(crate::dat_d3m::d3m_material(blend, None));
+        let duration = ev.stage.stage.duration_frames as f32 / FFXI_FPS;
+        commands.spawn((
+            crate::components::InGameEntity,
+            ParticleTtl::secs(duration.max(0.5)),
+            Mesh3d(mesh_h),
+            MeshMaterial3d(mat_h),
+            Transform::from_translation(actor_xf.translation),
+            Visibility::default(),
+            bevy::light::NotShadowCaster,
+            bevy::light::NotShadowReceiver,
+        ));
+    }
+}
+
+/// Decay [`ParticleTtl`] each tick; despawn the entity when it hits
+/// zero. Pairs with [`dispatch_particle_stages`].
+pub fn tick_particle_ttl(
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut ParticleTtl)>,
+    mut commands: Commands,
+) {
+    let dt = time.delta_secs();
+    for (entity, mut ttl) in q.iter_mut() {
+        ttl.0 -= dt;
+        if ttl.0 <= 0.0 {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
 /// Bevy plugin: registers [`SchedulerStageEvent`] and the tick system.
 /// Front-ends add this once; per-action components are inserted by
 /// whichever subsystem decodes the action DAT and starts playback
-/// (Stage D2 / E3 wiring, not part of this plugin).
+/// (E3 sound-dispatch wiring will use the same pattern).
 pub struct SchedulerRuntimePlugin;
 
 impl Plugin for SchedulerRuntimePlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<SchedulerStageEvent>()
             .add_systems(Update, tick_active_schedulers);
+        // Particle dispatch + TTL decay only on native (D3M mesh
+        // build uses Assets<Mesh> + Assets<StandardMaterial>, which
+        // wasm doesn't currently load DAT bytes for; the wasm build
+        // gets the scheduler tick + event channel but no particle
+        // spawn until DAT-fetch lands for the browser viewer).
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(
+            Update,
+            (dispatch_particle_stages, tick_particle_ttl).chain(),
+        );
     }
 }
 
@@ -235,5 +400,21 @@ mod tests {
         let a = ActiveScheduler::from_scheduler(&sched);
         assert!(a.finished());
         assert_eq!(a.last_frame(), 0);
+    }
+
+    #[test]
+    fn parse_action_bytes_handles_empty_input() {
+        let (scheds, assets) = parse_action_bytes(&[]);
+        assert!(scheds.is_empty());
+        assert!(assets.generators.is_empty());
+        assert!(assets.seps.is_empty());
+        #[cfg(not(target_arch = "wasm32"))]
+        assert!(assets.d3ms.is_empty());
+    }
+
+    #[test]
+    fn particle_ttl_clamps_negative_to_zero() {
+        let t = ParticleTtl::secs(-1.0);
+        assert_eq!(t.0, 0.0);
     }
 }
