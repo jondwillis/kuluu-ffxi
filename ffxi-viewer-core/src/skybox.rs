@@ -27,7 +27,7 @@
 use bevy::asset::embedded_asset;
 use bevy::pbr::{Material, MaterialPlugin};
 use bevy::prelude::*;
-use bevy::render::render_resource::AsBindGroup;
+use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::shader::ShaderRef;
 
 use crate::components::InGameEntity;
@@ -38,19 +38,30 @@ use crate::weather::ZoneWeather;
 /// far plane (`spawn_camera` overrides `far` to 6000 elsewhere).
 const SKYBOX_RADIUS: f32 = 1500.0;
 
-/// 8 colors + 8 altitudes that drive the gradient.
+/// 8 colors + 8 altitudes that drive the gradient, packed into a
+/// single uniform block.
 ///
-/// Packing convention: WGSL `std140` (and even `std430` in many drivers)
-/// pads each array element of a scalar-or-vec3 to 16 bytes. Storing
-/// the 8 altitudes as `[Vec4; 2]` (two packed quads) is the simplest
-/// layout that survives the alignment rules across all backends —
-/// the fragment shader unpacks via `get_altitude(i)`.
+/// Why one block instead of two separate `#[uniform(N)]` fields:
+/// WGSL forbids top-level `var<uniform>` of bare array types —
+/// uniform globals must be structs. wgpu's validator surfaces the
+/// violation as a cryptic "Storage / Uniform" pipeline-layout
+/// mismatch. Wrapping both arrays inside one `ShaderType` struct
+/// satisfies the spec on both sides cleanly.
+///
+/// Packing convention: each `Vec4` is 16-byte aligned in `std140`
+/// uniform layout, so `colors: [Vec4; 8]` consumes 128 bytes and
+/// `altitudes_packed: [Vec4; 2]` consumes 32 bytes for a total of
+/// 160 bytes — well under wgpu's 64KB uniform limit.
+#[derive(Clone, Debug, ShaderType)]
+pub struct SkyboxUniform {
+    pub colors: [Vec4; 8],
+    pub altitudes_packed: [Vec4; 2],
+}
+
 #[derive(Asset, AsBindGroup, Clone, Debug, TypePath)]
 pub struct SkyboxGradientMaterial {
     #[uniform(0)]
-    pub colors: [Vec4; 8],
-    #[uniform(1)]
-    pub altitudes_packed: [Vec4; 2],
+    pub data: SkyboxUniform,
 }
 
 impl Default for SkyboxGradientMaterial {
@@ -62,16 +73,18 @@ impl Default for SkyboxGradientMaterial {
         let mid = Vec4::new(0.35, 0.55, 0.85, 1.0);
         let zenith = Vec4::new(0.55, 0.75, 0.95, 1.0);
         Self {
-            colors: [
-                horizon, horizon, mid, mid, mid, zenith, zenith, zenith,
-            ],
-            // Spread 8 altitudes evenly across [-1, 1]. Lotus does
-            // nonlinear spacing per zone — we'll overwrite this once
-            // a real WeatherRecord arrives.
-            altitudes_packed: [
-                Vec4::new(-1.0, -0.5, -0.2, 0.0),
-                Vec4::new(0.2, 0.4, 0.7, 1.0),
-            ],
+            data: SkyboxUniform {
+                colors: [
+                    horizon, horizon, mid, mid, mid, zenith, zenith, zenith,
+                ],
+                // Spread 8 altitudes evenly across [-1, 1]. Lotus does
+                // nonlinear spacing per zone — we'll overwrite this once
+                // a real WeatherRecord arrives.
+                altitudes_packed: [
+                    Vec4::new(-1.0, -0.5, -0.2, 0.0),
+                    Vec4::new(0.2, 0.4, 0.7, 1.0),
+                ],
+            },
         }
     }
 }
@@ -161,11 +174,11 @@ fn update_skybox(
     // Convert WeatherRecord's [[f32; 4]; 8] into [Vec4; 8].
     for i in 0..8 {
         let c = rec.skybox_colors[i];
-        mat.colors[i] = Vec4::new(c[0], c[1], c[2], c[3]);
+        mat.data.colors[i] = Vec4::new(c[0], c[1], c[2], c[3]);
     }
     // Pack 8 altitudes into 2 vec4s.
     let a = rec.skybox_altitudes;
-    mat.altitudes_packed = [
+    mat.data.altitudes_packed = [
         Vec4::new(a[0], a[1], a[2], a[3]),
         Vec4::new(a[4], a[5], a[6], a[7]),
     ];

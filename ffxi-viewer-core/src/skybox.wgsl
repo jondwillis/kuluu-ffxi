@@ -1,7 +1,7 @@
 // Screen-space sky gradient.
 //
 // 8 colors paired with 8 altitudes ([-1, 1] dot of ray direction
-// with -Y). For each fragment, find the two altitude bands bracketing
+// with +Y). For each fragment, find the two altitude bands bracketing
 // the ray, lerp between their colors. Matches lotus-ffxi's miss
 // shader algorithm (cite-only reference) but the math here is our
 // own.
@@ -9,17 +9,26 @@
 // The mesh is an inverted UVSphere centered on the camera; that
 // turns interior fragments into "sky pixels" whose world-space ray
 // direction is what we sample.
+//
+// Uniform layout: WGSL forbids `var<uniform>` of bare array types —
+// the uniform global must be a struct. `SkyboxUniform` mirrors the
+// Rust-side `SkyboxUniform` exactly so `AsBindGroup`'s std140 layout
+// is byte-compatible with this declaration.
 
 #import bevy_pbr::mesh_view_bindings::view
 #import bevy_pbr::forward_io::VertexOutput
 
-@group(2) @binding(0) var<uniform> colors_packed: array<vec4<f32>, 8>;
-@group(2) @binding(1) var<uniform> altitudes_packed: array<vec4<f32>, 2>;
+struct SkyboxUniform {
+    colors: array<vec4<f32>, 8>,
+    altitudes_packed: array<vec4<f32>, 2>,
+};
+
+@group(2) @binding(0) var<uniform> data: SkyboxUniform;
 
 fn get_altitude(i: u32) -> f32 {
     let outer = i / 4u;
     let inner = i % 4u;
-    let v = altitudes_packed[outer];
+    let v = data.altitudes_packed[outer];
     if (inner == 0u) { return v.x; }
     if (inner == 1u) { return v.y; }
     if (inner == 2u) { return v.z; }
@@ -55,8 +64,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let span = max(hi_alt - lo_alt, 0.0001);
     let t = clamp((altitude - lo_alt) / span, 0.0, 1.0);
 
-    let lo_col = colors_packed[lo_idx];
-    let hi_col = colors_packed[hi_idx];
+    let lo_col = data.colors[lo_idx];
+    let hi_col = data.colors[hi_idx];
     let col = mix(lo_col, hi_col, t);
     return vec4<f32>(col.rgb, 1.0);
 }
