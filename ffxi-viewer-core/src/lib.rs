@@ -44,6 +44,8 @@ pub mod nameplate_billboard;
 pub mod picking;
 pub mod scene;
 pub mod scheduler_runtime;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod skybox;
 pub mod snapshot;
 pub mod source;
 pub mod sun_moon;
@@ -140,6 +142,11 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // fans stages out as SchedulerStageEvent messages. D2 (particle
         // spawn) and E3 (sound dispatch) will subscribe.
         app.add_plugins(scheduler_runtime::SchedulerRuntimePlugin);
+        // Skybox dome: inverted sphere centered on the camera, fragment
+        // shader gradient driven by ZoneWeather. Native-only because
+        // it reads ZoneWeather which is itself native-only.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins(skybox::SkyboxPlugin);
         app.init_resource::<SceneState>()
             .init_resource::<EventLog>()
             .init_resource::<TrackedEntities>()
