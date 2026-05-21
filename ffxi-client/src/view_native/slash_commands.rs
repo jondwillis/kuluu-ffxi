@@ -50,6 +50,14 @@ struct HelpEntry {
 /// versa) trips a test failure.
 const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
     (
+        "Help",
+        &[HelpEntry {
+            aliases: &["help", "?"],
+            usage: "",
+            summary: "show this slash-command reference",
+        }],
+    ),
+    (
         "Movement & Navigation",
         &[
             HelpEntry {
@@ -258,6 +266,16 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 usage: "<subcommand>",
                 summary: "gil-bank operations",
             },
+            HelpEntry {
+                aliases: &["minimap", "mm"],
+                usage: "[show|hide|toggle|mode <top|retail|auto>|cull <N>|zoom ...]",
+                summary: "drive the minimap HUD (visibility, backend, cull, zoom)",
+            },
+            HelpEntry {
+                aliases: &["sound", "audio", "mute"],
+                usage: "[on|off|toggle] [bgm|sfx]",
+                summary: "mute/unmute BGM, SFX, or both — survives logout",
+            },
         ],
     ),
     (
@@ -353,6 +371,31 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 aliases: &["copy"],
                 usage: "[n]",
                 summary: "copy the last n system-toast lines to the clipboard (default 1)",
+            },
+            HelpEntry {
+                aliases: &["bgm"],
+                usage: "<track_id>",
+                summary: "audition a BGM track id (synthetic 0x05F slot 0)",
+            },
+            HelpEntry {
+                aliases: &["sfx"],
+                usage: "<se_id>",
+                summary: "fire a one-shot SE by numeric id",
+            },
+            HelpEntry {
+                aliases: &["look"],
+                usage: "[name|act_index]",
+                summary: "print decoded LookData (race/gear) for an entity",
+            },
+            HelpEntry {
+                aliases: &["zonegeom"],
+                usage: "[off|collision|all|toggle]",
+                summary: "MZB overlay visibility (collision-only vs decorative)",
+            },
+            HelpEntry {
+                aliases: &["devhud"],
+                usage: "[on|off|toggle]",
+                summary: "developer telemetry overlays (stage bar, agent goal, etc.)",
             },
         ],
     ),
