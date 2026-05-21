@@ -186,10 +186,6 @@ pub struct BgmSlots {
     pub tracks: [Option<u16>; SLOT_COUNT],
     /// Per-slot gain (0..=1.0), normalized from LSB's 0..=127 byte.
     pub slot_gain: [f32; SLOT_COUNT],
-    /// Master mute. Toggle from a slash command in a follow-up; for
-    /// now exposed so tests can verify the wire path without
-    /// actually spinning up rodio.
-    pub muted: bool,
     /// Install root (parent of `sound/`). Resolved from
     /// `FFXI_DAT_PATH` at plugin build time. `None` on installs
     /// without the env var — the systems below silently no-op so
@@ -214,7 +210,6 @@ impl Default for BgmSlots {
         Self {
             tracks: [None; SLOT_COUNT],
             slot_gain: [1.0; SLOT_COUNT],
-            muted: false,
             install_root: resolve_install_root(),
             event_cursor: 0,
             active: None,
@@ -293,6 +288,29 @@ fn resolve_audible_slot(slots: &BgmSlots, state: &BgmPlaybackState) -> Option<(u
         }
     }
     None
+}
+
+/// Operator-controlled mute flags for BGM and SFX. Independent of
+/// the server-side music-slot state (`BgmSlots`) so toggling mute
+/// doesn't lose the currently-playing track id — flipping `bgm`
+/// back to false re-plays the same slot the server most recently
+/// pushed.
+///
+/// Distinct from `BgmSlots.slot_gain[]`: gain is per-server-slot
+/// (0x05F-driven), mute is per-category and operator-driven. The
+/// two compose: `audible = !mute && slot_gain[slot] > 0`.
+///
+/// Survives logout/login by design — typical game UX is that a
+/// silenced session stays silenced through the next login. Not
+/// drained by `despawn_ingame_entities`.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct AudioMuteState {
+    /// `true` → no BGM sink. `apply_bgm_system` despawns any active
+    /// sink and refuses to spawn new ones until cleared.
+    pub bgm: bool,
+    /// `true` → `play_sfx_system` drops incoming `SfxEvent`s on the
+    /// floor without spawning sinks.
+    pub sfx: bool,
 }
 
 /// Game-state flags that gate non-Zone music slots. Default = "in
@@ -446,6 +464,7 @@ fn slot_name(slot: u8) -> &'static str {
 pub fn apply_bgm_system(
     mut slots: ResMut<BgmSlots>,
     state: Res<BgmPlaybackState>,
+    mute: Res<AudioMuteState>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut pcm_assets: ResMut<Assets<PcmAudio>>,
@@ -465,7 +484,16 @@ pub fn apply_bgm_system(
         }
         return;
     };
-    let resolved = resolve_audible_slot(&slots, &state);
+    // Operator-muted: resolve to silence regardless of which server
+    // slot would otherwise be audible. Same code path as
+    // "server pushed track=0" (explicit silence) — drop the sink,
+    // remember nothing is active, and short-circuit so a future
+    // unmute re-spawns the right slot.
+    let resolved = if mute.bgm {
+        None
+    } else {
+        resolve_audible_slot(&slots, &state)
+    };
 
     if resolved == slots.active {
         return;
@@ -610,12 +638,21 @@ pub struct SfxCache {
 pub fn play_sfx_system(
     mut events: MessageReader<SfxEvent>,
     slots: Res<BgmSlots>,
+    mute: Res<AudioMuteState>,
     mut cache: ResMut<SfxCache>,
     mut pcm_assets: ResMut<Assets<PcmAudio>>,
     mut commands: Commands,
     mut warned: Local<bool>,
 ) {
     if events.is_empty() {
+        return;
+    }
+    if mute.sfx {
+        // Drain the event queue so it doesn't back up while muted —
+        // `MessageReader` only sees unread messages, and without
+        // `read()` they pile up until the per-frame retention window
+        // wraps. Read-and-drop preserves the latency invariant.
+        for _ in events.read() {}
         return;
     }
     let Some(install) = slots.install_root.clone() else {
@@ -1245,6 +1282,7 @@ impl Plugin for AudioPlugin {
         app.add_audio_source::<PcmAudio>();
         app.init_resource::<BgmSlots>()
             .init_resource::<BgmPlaybackState>()
+            .init_resource::<AudioMuteState>()
             .init_resource::<SeRegistry>()
             .init_resource::<SfxCache>()
             .init_resource::<SystemSfxTable>()
@@ -1472,6 +1510,37 @@ mod tests {
         let fire_swing = battle_count > state.prev_battle_count;
         state.prev_battle_count = battle_count;
         (fire_engage, fire_swing)
+    }
+
+    #[test]
+    fn bgm_mute_resolves_to_silence_regardless_of_slot_state() {
+        // When mute.bgm is true, the resolver should be bypassed and
+        // resolved becomes None — matching the "server pushed
+        // track=0" silence path. Tests the gate logic in
+        // apply_bgm_system without spinning up an App: the gate is
+        // `if mute.bgm { None } else { resolve_audible_slot(...) }`.
+        let mut slots = BgmSlots::default();
+        slots.tracks[0] = Some(101); // ZoneDay filled
+        let state = BgmPlaybackState::default(); // engaged_solo=false → zone audible
+        // Unmuted: resolver picks slot 0.
+        let mute = AudioMuteState::default();
+        let resolved = if mute.bgm {
+            None
+        } else {
+            resolve_audible_slot(&slots, &state)
+        };
+        assert_eq!(resolved, Some((0, 101)));
+        // Muted: short-circuit to None even though slot 0 is filled.
+        let mute = AudioMuteState {
+            bgm: true,
+            sfx: false,
+        };
+        let resolved = if mute.bgm {
+            None
+        } else {
+            resolve_audible_slot(&slots, &state)
+        };
+        assert_eq!(resolved, None);
     }
 
     #[test]
