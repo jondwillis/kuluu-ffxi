@@ -16,9 +16,9 @@ use bevy::render::view::Hdr;
 use bevy::anti_alias::taa::TemporalAntiAliasing;
 
 use crate::components::IsSelf;
-use crate::graphics_settings::GraphicsSettings;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::graphics_settings::AaMode;
+use crate::graphics_settings::GraphicsSettings;
 use crate::snapshot::SceneState;
 
 /// Marker on the operator camera entity.

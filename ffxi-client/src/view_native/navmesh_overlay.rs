@@ -286,8 +286,7 @@ fn snap_entities_to_navmesh_system(
         const STEP_TOLERANCE: f32 = 2.0;
         let ceiling_y = t.translation.y + STEP_TOLERANCE;
         let mzb = if mzb_loaded {
-            collision_geom
-                .ground_raycast(Vec2::new(t.translation.x, t.translation.z), ceiling_y)
+            collision_geom.ground_raycast(Vec2::new(t.translation.x, t.translation.z), ceiling_y)
         } else {
             None
         };

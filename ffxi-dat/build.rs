@@ -341,7 +341,9 @@ fn parse_map_table(path: &Path) -> Result<Vec<MapEntry>> {
 /// content from `trim`).
 fn extract_category_area_name(line: &str) -> Option<u16> {
     let cat_marker = r#"<category><name><area-name id=""#;
-    let rest = line.find(cat_marker).map(|i| &line[i + cat_marker.len()..])?;
+    let rest = line
+        .find(cat_marker)
+        .map(|i| &line[i + cat_marker.len()..])?;
     let end = rest.find('"')?;
     rest[..end].parse().ok()
 }

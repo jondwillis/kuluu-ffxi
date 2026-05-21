@@ -170,7 +170,9 @@ const FOG_STEP_SLOTS: &[u32] = &[32, 64, 96, 128];
 // outside the far plane and disappear; that's an intentional trade for
 // the Low/Medium tiers.
 const VIEW_DISTANCE_SLOTS: &[f32] = &[1500.0, 2000.0, 3000.0, 4000.0, 4500.0, 6000.0];
-const FOV_SLOTS: &[f32] = &[50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0];
+const FOV_SLOTS: &[f32] = &[
+    50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0,
+];
 
 #[cfg(not(target_arch = "wasm32"))]
 const AA_SLOTS: &[AaMode] = &[
@@ -296,8 +298,8 @@ impl GraphicsSettings {
     pub fn cycle(&mut self, field: GraphicsField, delta: i32) {
         match field {
             GraphicsField::Preset => {
-                let next = cycle_slot(self.preset, PRESET_CYCLE, delta)
-                    .unwrap_or(QualityPreset::High);
+                let next =
+                    cycle_slot(self.preset, PRESET_CYCLE, delta).unwrap_or(QualityPreset::High);
                 *self = Self::for_preset(next);
             }
             GraphicsField::ShadowMapSize => {
@@ -306,24 +308,18 @@ impl GraphicsSettings {
                 self.preset = QualityPreset::Custom;
             }
             GraphicsField::ShadowCascadeCount => {
-                self.shadow_cascade_count = cycle_slot_u32(
-                    self.shadow_cascade_count,
-                    SHADOW_CASCADE_COUNT_SLOTS,
-                    delta,
-                );
+                self.shadow_cascade_count =
+                    cycle_slot_u32(self.shadow_cascade_count, SHADOW_CASCADE_COUNT_SLOTS, delta);
                 self.preset = QualityPreset::Custom;
             }
             GraphicsField::ShadowMaxDistance => {
-                self.shadow_max_distance = cycle_slot_f32(
-                    self.shadow_max_distance,
-                    SHADOW_MAX_DISTANCE_SLOTS,
-                    delta,
-                );
+                self.shadow_max_distance =
+                    cycle_slot_f32(self.shadow_max_distance, SHADOW_MAX_DISTANCE_SLOTS, delta);
                 self.preset = QualityPreset::Custom;
             }
             GraphicsField::AntiAliasing => {
-                self.anti_aliasing = cycle_slot(self.anti_aliasing, AA_SLOTS, delta)
-                    .unwrap_or(AaMode::Msaa4);
+                self.anti_aliasing =
+                    cycle_slot(self.anti_aliasing, AA_SLOTS, delta).unwrap_or(AaMode::Msaa4);
                 self.preset = QualityPreset::Custom;
             }
             GraphicsField::BloomIntensity => {
@@ -335,13 +331,11 @@ impl GraphicsSettings {
                 self.preset = QualityPreset::Custom;
             }
             GraphicsField::FogStepCount => {
-                self.fog_step_count =
-                    cycle_slot_u32(self.fog_step_count, FOG_STEP_SLOTS, delta);
+                self.fog_step_count = cycle_slot_u32(self.fog_step_count, FOG_STEP_SLOTS, delta);
                 self.preset = QualityPreset::Custom;
             }
             GraphicsField::ViewDistance => {
-                self.view_distance =
-                    cycle_slot_f32(self.view_distance, VIEW_DISTANCE_SLOTS, delta);
+                self.view_distance = cycle_slot_f32(self.view_distance, VIEW_DISTANCE_SLOTS, delta);
                 self.preset = QualityPreset::Custom;
             }
             GraphicsField::VSync => {
@@ -453,10 +447,7 @@ pub fn cascade_config_from_settings(s: &GraphicsSettings) -> CascadeShadowConfig
 /// Resize the directional-light shadow map. Bevy validates pow2 and
 /// hot-resizes the GPU texture on the next prepare-lights pass — no
 /// entity respawn required.
-pub fn apply_shadow_map_size_system(
-    settings: Res<GraphicsSettings>,
-    mut commands: Commands,
-) {
+pub fn apply_shadow_map_size_system(settings: Res<GraphicsSettings>, mut commands: Commands) {
     commands.insert_resource(DirectionalLightShadowMap {
         size: settings.shadow_map_size as usize,
     });
@@ -623,7 +614,9 @@ mod tests {
             assert!(SHADOW_MAX_DISTANCE_SLOTS
                 .iter()
                 .any(|x| (x - s.shadow_max_distance).abs() < 1e-3));
-            assert!(BLOOM_SLOTS.iter().any(|x| (x - s.bloom_intensity).abs() < 1e-3));
+            assert!(BLOOM_SLOTS
+                .iter()
+                .any(|x| (x - s.bloom_intensity).abs() < 1e-3));
             assert!(FOG_STEP_SLOTS.contains(&s.fog_step_count));
             assert!(VIEW_DISTANCE_SLOTS
                 .iter()

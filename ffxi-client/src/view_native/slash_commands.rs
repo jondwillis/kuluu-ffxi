@@ -65,7 +65,8 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
             HelpEntry {
                 aliases: &["warp"],
                 usage: "<x> <y> [z] | <name> | target",
-                summary: "debug teleport (Move): coords (z optional), fuzzy zone-line/entity, or target",
+                summary:
+                    "debug teleport (Move): coords (z optional), fuzzy zone-line/entity, or target",
             },
             HelpEntry {
                 aliases: &["zones"],
@@ -335,7 +336,8 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
             HelpEntry {
                 aliases: &["capture"],
                 usage: "[on|off|toggle]",
-                summary: "screen-capture-friendly mode (disables framepace; avoids QuickTime lockup)",
+                summary:
+                    "screen-capture-friendly mode (disables framepace; avoids QuickTime lockup)",
             },
             HelpEntry {
                 aliases: &["screenshot", "ss"],
@@ -526,9 +528,7 @@ pub enum SlashOutcome {
     /// CWD). Dispatcher writes a `ScreenshotRequest`; consumer system
     /// spawns Bevy's `Screenshot::primary_window()` with a `save_to_disk`
     /// observer.
-    Screenshot {
-        path: Option<String>,
-    },
+    Screenshot { path: Option<String> },
     /// `/endcutscene [csid]` — send a 0x05B `EVENT_END` for a *forced*
     /// cutscene (the kind `player:startEvent` fires from `onZoneIn` —
     /// new-character openings, area-entry cinematics) that bypassed the
@@ -544,9 +544,7 @@ pub enum SlashOutcome {
     /// falling back to [`start_zone_cutscene`] for the start-nation
     /// forced cinematics). Punting CSID resolution to the dispatcher
     /// means the parser doesn't need access to `SceneState`.
-    EndCutscene {
-        event_num: Option<u16>,
-    },
+    EndCutscene { event_num: Option<u16> },
     /// `/copy [n]` — copy the last `n` `[system]` chat toasts (i.e.
     /// responses to slash commands) to the OS clipboard, newline-joined.
     /// `n` defaults to 1 so a bare `/copy` grabs just the most recent
@@ -1029,11 +1027,17 @@ fn parse_pathto(
     let trimmed = rest.trim();
     if trimmed.is_empty() {
         return SlashOutcome::SystemMessage(
-            "/pathto: usage `/pathto <x> <y> [z]` | `/pathto <name>` | `/pathto target`"
-                .into(),
+            "/pathto: usage `/pathto <x> <y> [z]` | `/pathto <name>` | `/pathto target`".into(),
         );
     }
-    match parse_goto_target(trimmed, entities, self_pos, current_target, zone_id, "/pathto") {
+    match parse_goto_target(
+        trimmed,
+        entities,
+        self_pos,
+        current_target,
+        zone_id,
+        "/pathto",
+    ) {
         Ok(pos) => SlashOutcome::Command(AgentCommand::PathTo {
             x: pos.x,
             y: pos.y,
@@ -1070,7 +1074,14 @@ fn parse_warp(
             "/warp: usage `/warp <x> <y> [z]` | `/warp <name>` | `/warp target`".into(),
         );
     }
-    match parse_goto_target(trimmed, entities, self_pos, current_target, zone_id, "/warp") {
+    match parse_goto_target(
+        trimmed,
+        entities,
+        self_pos,
+        current_target,
+        zone_id,
+        "/warp",
+    ) {
         Ok(pos) => SlashOutcome::Command(AgentCommand::Move {
             x: pos.x,
             y: pos.y,
@@ -1113,21 +1124,19 @@ fn parse_goto_target(
     // (Zone / entity names are single tokens, so a token-count guard
     // would mis-trigger here on multi-word names — parse-everything
     // is the cleaner pivot.)
-    if (parts.len() == 2 || parts.len() == 3)
-        && parts.iter().all(|p| p.parse::<f32>().is_ok())
-    {
+    if (parts.len() == 2 || parts.len() == 3) && parts.iter().all(|p| p.parse::<f32>().is_ok()) {
         let v: Vec<f32> = parts.iter().map(|p| p.parse::<f32>().unwrap()).collect();
         let z = if v.len() == 3 { v[2] } else { self_pos.z };
-        return Ok(WireVec3 { x: v[0], y: v[1], z });
+        return Ok(WireVec3 {
+            x: v[0],
+            y: v[1],
+            z,
+        });
     }
     // Fuzzy name resolution (zone-line + entity).
     resolve_position_needle(trimmed, entities, self_pos, zone_id)
         .map(|(pos, _label)| pos)
-        .ok_or_else(|| {
-            format!(
-                "{cmd_label}: no match for `{trimmed}` (try `/zones` or `/debug`)"
-            )
-        })
+        .ok_or_else(|| format!("{cmd_label}: no match for `{trimmed}` (try `/zones` or `/debug`)"))
 }
 
 /// Player's current heading, looked up from the self entity. Used by
@@ -1561,9 +1570,7 @@ fn parse_endcutscene(rest: &str) -> SlashOutcome {
         return SlashOutcome::EndCutscene { event_num: None };
     }
     match trimmed.parse::<u16>() {
-        Ok(n) => SlashOutcome::EndCutscene {
-            event_num: Some(n),
-        },
+        Ok(n) => SlashOutcome::EndCutscene { event_num: Some(n) },
         Err(_) => SlashOutcome::SystemMessage(format!(
             "/endcutscene: bad CSID `{trimmed}` (expected u16)"
         )),
@@ -1819,18 +1826,10 @@ fn parse_debug(
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
         "heights" | "h" => SlashOutcome::DebugHeights,
-        "" => SlashOutcome::SystemMessage(render_debug_nearby(
-            entities,
-            self_pos,
-            current_target,
-        )),
+        "" => SlashOutcome::SystemMessage(render_debug_nearby(entities, self_pos, current_target)),
         // Argument that isn't a known subcommand → treat as entity lookup
         // (name prefix, decimal id, or act_index). Detail dump.
-        _ => SlashOutcome::SystemMessage(render_debug_entity(
-            trimmed,
-            entities,
-            self_pos,
-        )),
+        _ => SlashOutcome::SystemMessage(render_debug_entity(trimmed, entities, self_pos)),
     }
 }
 
@@ -1930,22 +1929,15 @@ fn render_debug_nearby(
 
 /// Resolve a single entity (name prefix, decimal id, or act_index) and
 /// render its full detail block.
-fn render_debug_entity(
-    arg: &str,
-    entities: &[WireEntity],
-    self_pos: WireVec3,
-) -> String {
+fn render_debug_entity(arg: &str, entities: &[WireEntity], self_pos: WireVec3) -> String {
     // Resolution order: numeric id → numeric act_index → name prefix.
     // u32 first because ids easily exceed u16.
     let ent: Option<&WireEntity> = if let Ok(id) = arg.parse::<u32>() {
-        entities
-            .iter()
-            .find(|e| e.id == id)
-            .or_else(|| {
-                u16::try_from(id)
-                    .ok()
-                    .and_then(|idx| entities.iter().find(|e| e.act_index == idx))
-            })
+        entities.iter().find(|e| e.id == id).or_else(|| {
+            u16::try_from(id)
+                .ok()
+                .and_then(|idx| entities.iter().find(|e| e.act_index == idx))
+        })
     } else {
         resolve_name(arg, entities, self_pos)
     };
@@ -2025,10 +2017,8 @@ fn nearby_entities<'a>(
     from: WireVec3,
     limit: usize,
 ) -> Vec<(&'a WireEntity, f32)> {
-    let mut scored: Vec<(&WireEntity, f32)> = entities
-        .iter()
-        .map(|e| (e, sq_dist(e.pos, from)))
-        .collect();
+    let mut scored: Vec<(&WireEntity, f32)> =
+        entities.iter().map(|e| (e, sq_dist(e.pos, from))).collect();
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
     scored
@@ -3098,13 +3088,7 @@ mod tests {
 
     #[test]
     fn warp_numeric_three_args_emits_move() {
-        match parse_slash(
-            "/warp 1.5 2 -3.25",
-            &empty_entities(),
-            origin(),
-            None,
-            None,
-        ) {
+        match parse_slash("/warp 1.5 2 -3.25", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::Move { x, y, z, heading }) => {
                 assert_eq!((x, y, z), (1.5, 2.0, -3.25));
                 // No self entity in the snapshot → heading defaults to 0.
@@ -3484,13 +3468,7 @@ mod tests {
     /// start-zone fallback at send time, not at parse time.
     #[test]
     fn endcutscene_no_arg_returns_none() {
-        match parse_slash(
-            "/endcutscene",
-            &empty_entities(),
-            origin(),
-            None,
-            Some(231),
-        ) {
+        match parse_slash("/endcutscene", &empty_entities(), origin(), None, Some(231)) {
             SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, None),
             other => panic!("expected EndCutscene{{ None }}, got {other:?}"),
         }
@@ -3547,12 +3525,7 @@ mod tests {
     /// Alias coverage: every documented spelling produces the same outcome.
     #[test]
     fn endcutscene_aliases_all_work() {
-        for input in [
-            "/endcutscene",
-            "/endcs",
-            "/skipcutscene",
-            "/skipcs",
-        ] {
+        for input in ["/endcutscene", "/endcs", "/skipcutscene", "/skipcs"] {
             match parse_slash(input, &empty_entities(), origin(), None, Some(231)) {
                 SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, None),
                 other => panic!("input {input:?}: expected EndCutscene, got {other:?}"),

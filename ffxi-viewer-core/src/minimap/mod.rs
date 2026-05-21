@@ -33,6 +33,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use crate::hud::palette;
 
+pub mod input;
 pub mod overlay;
 pub mod retail;
 pub mod topdown;
@@ -73,6 +74,113 @@ impl Default for MinimapVisible {
     }
 }
 
+/// Default zoom radius. Matches the server's ~50yd entity-update
+/// radius — the area we actually have live information about. Below
+/// this we mostly see ourselves; above it dots represent stale state.
+pub const ZOOM_DEFAULT_RADIUS: f32 = 50.0;
+/// Tightest zoom-in. Below this the background pixelates badly and
+/// dots start overlapping each other.
+pub const ZOOM_MIN_RADIUS: f32 = 25.0;
+/// Wheel/key step multiplier. 1.25× per tick — ~4 ticks to span
+/// 25 → 50 yalms.
+pub const ZOOM_STEP_FACTOR: f32 = 1.25;
+/// Frames of no pan input before the view auto-recenters on the
+/// player. ~3 s at 60 fps.
+pub const RECENTER_IDLE_FRAMES: u32 = 180;
+/// Frames over which auto-recenter lerps the pan offset back to zero
+/// once the idle threshold trips. Half a second.
+pub const RECENTER_LERP_FRAMES: u32 = 30;
+
+/// Visible window of the minimap.
+///
+/// * `radius_yalms = None` → fit the whole zone (the original
+///   behavior, useful for orienting yourself relative to landmarks).
+/// * `radius_yalms = Some(r)` → show a `2r × 2r` world-XZ window
+///   centered on the player (plus any operator pan offset).
+///
+/// Default is [`ZOOM_DEFAULT_RADIUS`] yalms so the minimap matches
+/// the area the server actually streams entity updates for.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct MinimapZoom {
+    pub radius_yalms: Option<f32>,
+}
+
+impl Default for MinimapZoom {
+    fn default() -> Self {
+        Self {
+            radius_yalms: Some(ZOOM_DEFAULT_RADIUS),
+        }
+    }
+}
+
+impl MinimapZoom {
+    /// True iff zoom is at the spawn-time default — gates the
+    /// reset-zoom button's visibility.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Multiply current radius by `factor`, clamped to
+    /// `[ZOOM_MIN_RADIUS, fit-zone]`. Fit-zone is represented as
+    /// `radius_yalms = None`; once a zoom-out push exceeds the
+    /// zone's half-span, we switch to `None` so the math doesn't
+    /// keep crossing larger and larger numbers.
+    pub fn zoom_by(&mut self, factor: f32, zone_half_span: Option<f32>) {
+        let current = match self.radius_yalms {
+            Some(r) => r,
+            None => {
+                // Already fit-to-zone; zooming in starts from the
+                // zone's half-span (so the first tick is meaningful)
+                // and zooming out is a no-op.
+                if factor < 1.0 {
+                    zone_half_span.unwrap_or(ZOOM_DEFAULT_RADIUS)
+                } else {
+                    return;
+                }
+            }
+        };
+        let next = current * factor;
+        if let Some(half) = zone_half_span {
+            if next >= half {
+                self.radius_yalms = None;
+                return;
+            }
+        }
+        self.radius_yalms = Some(next.max(ZOOM_MIN_RADIUS));
+    }
+}
+
+/// Per-frame view state. Pan offset is owned by the input layer
+/// (drag-pan, auto-recenter); `center_world_xz` and `visible_aabb`
+/// are derived by [`update_minimap_view`] so the image cropper and
+/// the entity overlay agree on what's visible.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct MinimapView {
+    /// Drag-induced world-XZ offset from the auto-center (player).
+    /// Yalms.
+    pub pan_offset_xz: Vec2,
+    /// Frames since the user last dragged the minimap. Reset to 0
+    /// on any pan input; counted up by the recenter system.
+    pub idle_frames: u32,
+    /// Center of the visible window in world XZ this frame. `None`
+    /// until the first frame after zone-enter.
+    pub center_world_xz: Option<Vec2>,
+    /// The actual visible AABB this frame. Both the image cropper
+    /// and the overlay read this — single source of truth.
+    pub visible_aabb: Option<MinimapAabb>,
+}
+
+impl MinimapView {
+    pub fn clear_for_logout(&mut self) {
+        *self = Self::default();
+    }
+    /// True iff there's no operator-applied pan offset — gates the
+    /// reset-zoom button alongside [`MinimapZoom::is_default`].
+    pub fn pan_is_zero(&self) -> bool {
+        self.pan_offset_xz == Vec2::ZERO
+    }
+}
+
 /// Axis-aligned bounding box in the Bevy **XZ** plane. The minimap
 /// flattens the world by ignoring Y; the AABB tells overlay + camera
 /// systems how to map world XZ into the [0, 1] UV space of the minimap
@@ -99,13 +207,38 @@ impl MinimapAabb {
     pub fn world_to_uv(&self, world: Vec3) -> Vec2 {
         let span = self.max - self.min;
         let safe = Vec2::new(
-            if span.x.abs() < f32::EPSILON { 1.0 } else { span.x },
-            if span.y.abs() < f32::EPSILON { 1.0 } else { span.y },
+            if span.x.abs() < f32::EPSILON {
+                1.0
+            } else {
+                span.x
+            },
+            if span.y.abs() < f32::EPSILON {
+                1.0
+            } else {
+                span.y
+            },
         );
         Vec2::new(
             ((world.x - self.min.x) / safe.x).clamp(0.0, 1.0),
             ((world.z - self.min.y) / safe.y).clamp(0.0, 1.0),
         )
+    }
+
+    /// Like [`Self::world_to_uv`] but returns `None` when the world
+    /// position lies outside the AABB. Used by the entity overlay so
+    /// dots can be *culled* when zoomed in (the clamp behavior would
+    /// pile every off-screen dot onto the minimap's edges).
+    pub fn world_to_uv_or_offscreen(&self, world: Vec3) -> Option<Vec2> {
+        let span = self.max - self.min;
+        if span.x.abs() < f32::EPSILON || span.y.abs() < f32::EPSILON {
+            return None;
+        }
+        let u = (world.x - self.min.x) / span.x;
+        let v = (world.z - self.min.y) / span.y;
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            return None;
+        }
+        Some(Vec2::new(u, v))
     }
 }
 
@@ -145,6 +278,11 @@ pub struct MinimapState {
     /// differ from `aabb` because retail maps crop / pad differently
     /// from the zone's geometric extent.
     pub retail_aabb: Option<MinimapAabb>,
+    /// Negative cache: zones whose retail-map DAT load failed (no
+    /// Graphic chunks, unresolved file_id, IO error). Without this,
+    /// the auto-loader would re-queue every frame because the success
+    /// gate only checks `retail_image.is_some()`. Cleared on logout.
+    pub retail_failed_zones: std::collections::HashSet<u16>,
 }
 
 impl MinimapState {
@@ -208,18 +346,93 @@ impl Plugin for MinimapPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MinimapMode>()
             .init_resource::<MinimapVisible>()
+            .init_resource::<MinimapZoom>()
+            .init_resource::<MinimapView>()
             .init_resource::<MinimapState>()
+            .init_resource::<input::MinimapHoverGate>()
             .init_resource::<overlay::MinimapDots>()
             .add_plugins((topdown::TopdownBackendPlugin, retail::RetailBackendPlugin))
             .add_systems(
                 Update,
                 (
-                    update_minimap_image_source,
-                    update_minimap_visibility,
-                    overlay::update_minimap_overlay,
-                ),
+                    // Hover gate must precede the zoom handler (and
+                    // the client's camera-zoom handler reads it too).
+                    input::update_minimap_hover_gate,
+                    // Zoom input runs before the view derives the
+                    // visible AABB so a key/wheel tick lands in the
+                    // same frame.
+                    input::handle_minimap_zoom_input,
+                    // View must update before the overlay + image
+                    // cropper read it, so they all agree on the
+                    // visible AABB for this frame.
+                    update_minimap_view,
+                    (
+                        update_minimap_image_source,
+                        update_minimap_crop_rect,
+                        update_minimap_visibility,
+                        overlay::update_minimap_overlay,
+                    ),
+                )
+                    .chain(),
             );
     }
+}
+
+/// Resolve [`MinimapZoom`] + [`MinimapView::pan_offset_xz`] + player
+/// position against the active backend's full AABB. Writes the
+/// resulting `center_world_xz` and `visible_aabb` to [`MinimapView`]
+/// so downstream image-crop and overlay systems read a consistent
+/// snapshot.
+///
+/// Behavior:
+///   * No AABB available (pre-zone-in) → clear `visible_aabb` to None.
+///   * `radius = None` (fit-to-zone) → visible = full AABB, ignore pan.
+///   * `radius = Some(r)` + player present → visible is a `2r × 2r`
+///     window centered on `player + pan_offset`.
+///   * `radius = Some(r)` + no player transform → keep the previous
+///     center if any, else fall back to the AABB center. (Brief
+///     pre-snapshot frames.)
+pub fn update_minimap_view(
+    state: Res<MinimapState>,
+    mode: Res<MinimapMode>,
+    zoom: Res<MinimapZoom>,
+    q_self: Query<&Transform, With<crate::components::IsSelf>>,
+    mut view: ResMut<MinimapView>,
+) {
+    let Some(full_aabb) = state.active_aabb(*mode) else {
+        if view.visible_aabb.is_some() || view.center_world_xz.is_some() {
+            view.visible_aabb = None;
+            view.center_world_xz = None;
+        }
+        return;
+    };
+    let player_xz = q_self
+        .single()
+        .ok()
+        .map(|t| Vec2::new(t.translation.x, t.translation.z));
+    let aabb_center = (full_aabb.min + full_aabb.max) * 0.5;
+    let center = match (zoom.radius_yalms, player_xz) {
+        (None, _) => aabb_center,
+        (Some(_), Some(p)) => p + view.pan_offset_xz,
+        (Some(_), None) => view.center_world_xz.unwrap_or(aabb_center),
+    };
+    let visible = match zoom.radius_yalms {
+        None => full_aabb,
+        Some(r) => MinimapAabb {
+            min: center - Vec2::splat(r),
+            max: center + Vec2::splat(r),
+        },
+    };
+    view.center_world_xz = Some(center);
+    view.visible_aabb = Some(visible);
+}
+
+/// Half the larger zone-axis extent, used as the zoom-out upper
+/// bound. Returns `None` when no AABB is loaded yet.
+pub fn zone_half_span(aabb: Option<MinimapAabb>) -> Option<f32> {
+    let aabb = aabb?;
+    let span = aabb.max - aabb.min;
+    Some(span.x.abs().max(span.y.abs()) * 0.5)
 }
 
 /// Spawn the minimap UI root as a child of an existing parent (the
@@ -248,6 +461,9 @@ pub fn spawn_minimap_as_child(p: &mut ChildSpawnerCommands, images: &mut Assets<
         },
         BackgroundColor(palette::BACKGROUND),
         BorderColor::all(palette::BORDER),
+        // Bevy populates `cursor_over()` every frame — the same
+        // mechanism `chat_wheel_scroll_system` uses to detect hover.
+        bevy::ui::RelativeCursorPosition::default(),
     ))
     .with_children(|p| {
         // Background image (top-down bake or retail texture). Fills
@@ -325,6 +541,78 @@ pub fn update_minimap_image_source(
     };
     if image_node.image != h {
         image_node.image = h;
+    }
+}
+
+/// Set [`ImageNode::rect`] to a sub-region of the source image so the
+/// background image shows only the zoomed-in window. Reads the
+/// resolved backend's full-zone AABB and computes the
+/// visible-AABB-in-full-AABB UV → source-pixel rect.
+///
+/// When zoom is `None` (fit-to-zone), clears `rect` to `None` so the
+/// whole image renders.
+///
+/// Runs every frame — the visible AABB shifts as the player moves,
+/// so the rect needs to follow without waiting on `Changed<...>`.
+pub fn update_minimap_crop_rect(
+    state: Res<MinimapState>,
+    mode: Res<MinimapMode>,
+    view: Res<MinimapView>,
+    zoom: Res<MinimapZoom>,
+    images: Res<Assets<Image>>,
+    mut q: Query<&mut ImageNode, With<MinimapImage>>,
+) {
+    let Ok(mut image_node) = q.single_mut() else {
+        return;
+    };
+    // Fit-to-zone: drop any prior crop so the full image renders.
+    if zoom.radius_yalms.is_none() {
+        if image_node.rect.is_some() {
+            image_node.rect = None;
+        }
+        return;
+    }
+    let Some(visible) = view.visible_aabb else {
+        return;
+    };
+    let resolved = state.resolved_mode(*mode);
+    let (handle, full_aabb) = match resolved {
+        MinimapMode::Retail => (state.retail_image.as_ref(), state.retail_aabb),
+        MinimapMode::TopDown => (state.topdown_image.as_ref(), state.aabb),
+        MinimapMode::Auto => return,
+    };
+    let (Some(handle), Some(full)) = (handle, full_aabb) else {
+        return;
+    };
+    let Some(image) = images.get(handle) else {
+        // Image hasn't loaded into Assets yet — try again next frame.
+        return;
+    };
+    let size = image.size_f32();
+    let full_span = full.max - full.min;
+    if full_span.x.abs() < f32::EPSILON || full_span.y.abs() < f32::EPSILON {
+        return;
+    }
+    let uv_min = Vec2::new(
+        (visible.min.x - full.min.x) / full_span.x,
+        (visible.min.y - full.min.y) / full_span.y,
+    );
+    let uv_max = Vec2::new(
+        (visible.max.x - full.min.x) / full_span.x,
+        (visible.max.y - full.min.y) / full_span.y,
+    );
+    // Clamp to image bounds so a partly-off-edge view (player near
+    // the zone boundary) still produces a valid rect — the clamped
+    // edge will just show that side of the map as the UI clamps the
+    // visible window's overshoot.
+    let pixel_rect = Rect {
+        min: (uv_min * size).max(Vec2::ZERO),
+        max: (uv_max * size).min(size),
+    };
+    // Skip the write when nothing changed so Bevy's change filters
+    // don't churn every frame for a stationary player.
+    if image_node.rect != Some(pixel_rect) {
+        image_node.rect = Some(pixel_rect);
     }
 }
 
@@ -407,7 +695,13 @@ mod tests {
     fn resolved_mode_explicit_passes_through() {
         let mut state = MinimapState::default();
         state.retail_image = Some(Handle::default());
-        assert_eq!(state.resolved_mode(MinimapMode::TopDown), MinimapMode::TopDown);
-        assert_eq!(state.resolved_mode(MinimapMode::Retail), MinimapMode::Retail);
+        assert_eq!(
+            state.resolved_mode(MinimapMode::TopDown),
+            MinimapMode::TopDown
+        );
+        assert_eq!(
+            state.resolved_mode(MinimapMode::Retail),
+            MinimapMode::Retail
+        );
     }
 }

@@ -50,9 +50,7 @@ impl<'a> AdpcmStream<'a> {
         // matching `ADPCMStream::getNextBlock` at adpcmstream.cppm:102.
         // `header.loop_start` is 1-indexed in the wire format (and
         // signed — see header.rs); `<= 0` means "no loop".
-        if self.header.loop_start > 0
-            && self.current_block == (self.header.loop_start - 1) as u32
-        {
+        if self.header.loop_start > 0 && self.current_block == (self.header.loop_start - 1) as u32 {
             self.loop_snapshot = Some(self.states.clone());
         }
         let channels = self.header.channels as usize;
@@ -66,7 +64,12 @@ impl<'a> AdpcmStream<'a> {
         for ch in 0..channels {
             let off = base + ch * self.block_bytes_per_channel;
             let slice = &self.data[off..off + self.block_bytes_per_channel];
-            decode_block_into(slice, self.header.block_size, &mut self.states[ch], &mut scratch[ch])?;
+            decode_block_into(
+                slice,
+                self.header.block_size,
+                &mut self.states[ch],
+                &mut scratch[ch],
+            )?;
         }
         let actual_frames = scratch.iter().map(|v| v.len()).min().unwrap_or(0);
         for i in 0..actual_frames {

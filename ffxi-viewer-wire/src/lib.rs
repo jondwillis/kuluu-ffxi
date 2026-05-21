@@ -129,9 +129,26 @@ impl Weather {
     pub fn from_lsb(n: u16) -> Self {
         use Weather::*;
         const TABLE: [Weather; 20] = [
-            None, Sunshine, Clouds, Fog, HotSpell, HeatWave, Rain, Squall,
-            DustStorm, SandStorm, Wind, Gales, Snow, Blizzards, Thunder,
-            Thunderstorms, Auroras, StellarGlare, Gloom, Darkness,
+            None,
+            Sunshine,
+            Clouds,
+            Fog,
+            HotSpell,
+            HeatWave,
+            Rain,
+            Squall,
+            DustStorm,
+            SandStorm,
+            Wind,
+            Gales,
+            Snow,
+            Blizzards,
+            Thunder,
+            Thunderstorms,
+            Auroras,
+            StellarGlare,
+            Gloom,
+            Darkness,
         ];
         TABLE[(n as usize) % TABLE.len()]
     }
@@ -513,34 +530,61 @@ pub struct SceneDelta {
 ///   `SceneSummary` / `PartyMemberLowHp` — internal signal
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ViewerEvent {
-    ZoneChanged { from: Option<u16>, to: u16 },
-    EntityRemoved { id: u32 },
-    Disconnected { reason: String },
-    LowHp { pct: u8 },
-    EngagedBy { entity_id: u32 },
-    TellReceived { from: String, text: String },
-    Reconnected { downtime_ms: u64 },
+    ZoneChanged {
+        from: Option<u16>,
+        to: u16,
+    },
+    EntityRemoved {
+        id: u32,
+    },
+    Disconnected {
+        reason: String,
+    },
+    LowHp {
+        pct: u8,
+    },
+    EngagedBy {
+        entity_id: u32,
+    },
+    TellReceived {
+        from: String,
+        text: String,
+    },
+    Reconnected {
+        downtime_ms: u64,
+    },
     /// 0x05F `GP_SERV_COMMAND_MUSIC` — server selected a new track
     /// for one of the 8 LSB `MusicSlot`s (0=ZoneDay…7=Fishing). The
     /// viewer's BGM system decides which slot is audible based on
     /// its own state machine (combat, mount, mog-house, etc.).
-    MusicChanged { slot: u8, track_id: u16 },
+    MusicChanged {
+        slot: u8,
+        track_id: u16,
+    },
     /// 0x060 `GP_SERV_COMMAND_MUSICVOLUME` — per-slot volume tweak.
     /// `volume` is the raw LSB byte (0..=127 typically); consumers
     /// normalize before applying.
-    MusicVolumeChanged { slot: u8, volume: u8 },
+    MusicVolumeChanged {
+        slot: u8,
+        volume: u8,
+    },
     /// 0x02D BATTLE_MESSAGE2 with `MsgBasic::LevelUp` (id 9). The
     /// player named by `player_id` reached the level encoded in the
     /// server's chat-line payload; we surface only the actor id here
     /// since the audio side only needs the trigger.
     /// See `vendor/server/src/map/utils/charutils.cpp:5736`.
-    LevelUp { player_id: u32 },
+    LevelUp {
+        player_id: u32,
+    },
     /// 0x02D / 0x029 with `MsgBasic::SkillLevelUp` (id 53). Fires
     /// every time a weapon/magic skill rank goes up — frequent at
     /// low skill. `level` is the new skill level (server divides by
     /// 10 before sending; consumers can render as integer).
     /// See `vendor/server/src/map/utils/charutils.cpp:4161`.
-    SkillLevelUp { skill_id: u16, level: u32 },
+    SkillLevelUp {
+        skill_id: u16,
+        level: u32,
+    },
 }
 
 /// Server→viewer frame on the WebSocket. `Snapshot` and `Delta` are boxed

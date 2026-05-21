@@ -13,7 +13,7 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 
-use super::{CharCreateForm, CharCreateField, CharCreateError, LauncherState};
+use super::{CharCreateError, CharCreateField, CharCreateForm, LauncherState};
 
 /// Race options. Indices map directly to LSB's race id 1..=8
 /// (see `vendor/server/src/login/login_helpers.cpp:228`).
@@ -41,18 +41,10 @@ pub(super) const JOBS: &[(u8, &str)] = &[
 
 /// Nation determines starting zone — 0..=2 valid
 /// (see `vendor/server/src/login/login_helpers.cpp:261`).
-pub(super) const NATIONS: &[(u8, &str)] = &[
-    (0, "San d'Oria"),
-    (1, "Bastok"),
-    (2, "Windurst"),
-];
+pub(super) const NATIONS: &[(u8, &str)] = &[(0, "San d'Oria"), (1, "Bastok"), (2, "Windurst")];
 
 /// Body size — 0..=2 (see `vendor/server/src/login/login_helpers.cpp:234`).
-pub(super) const SIZES: &[(u8, &str)] = &[
-    (0, "Small"),
-    (1, "Medium"),
-    (2, "Large"),
-];
+pub(super) const SIZES: &[(u8, &str)] = &[(0, "Small"), (1, "Medium"), (2, "Large")];
 
 /// 16 faces (0..=15) — server enforces upper bound at
 /// `vendor/server/src/login/login_helpers.cpp:240`.
@@ -237,10 +229,7 @@ fn format_row(form: &CharCreateForm, field: CharCreateField) -> String {
             format!("{marker}Nation:  ◀ {} ▶", lookup(NATIONS, form.nation))
         }
         CharCreateField::Face => {
-            format!(
-                "{marker}Face:    ◀ {:>2} / {} ▶",
-                form.face, FACE_MAX
-            )
+            format!("{marker}Face:    ◀ {:>2} / {} ▶", form.face, FACE_MAX)
         }
         CharCreateField::Size => {
             format!("{marker}Build:   ◀ {} ▶", lookup(SIZES, form.size))

@@ -10,7 +10,7 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use ffxi_dat::{walk, vos2, DatRoot};
+use ffxi_dat::{vos2, walk, DatRoot};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -29,7 +29,10 @@ fn main() -> ExitCode {
     let chunk = match chunks.get(want_idx) {
         Some(c) if c.kind == 0x2A => c,
         Some(c) => {
-            eprintln!("chunk[{want_idx}] is kind 0x{:02x}, not VertexOs2 (0x2A)", c.kind);
+            eprintln!(
+                "chunk[{want_idx}] is kind 0x{:02x}, not VertexOs2 (0x2A)",
+                c.kind
+            );
             return ExitCode::from(1);
         }
         None => {
@@ -52,19 +55,34 @@ fn main() -> ExitCode {
          off_bone=0x{:x} bone_indices_count={}\n\
          vertices={} groups={}",
         chunk.data.len(),
-        h.version, h.kind_type, h.use_bone_table(), h.flip,
-        h.off_bone_table_bytes, h.bone_table_count,
-        h.off_bone_bytes, h.bone_indices_count,
-        mesh.vertices.len(), mesh.groups.len(),
+        h.version,
+        h.kind_type,
+        h.use_bone_table(),
+        h.flip,
+        h.off_bone_table_bytes,
+        h.bone_table_count,
+        h.off_bone_bytes,
+        h.bone_indices_count,
+        mesh.vertices.len(),
+        mesh.groups.len(),
     );
 
     if !mesh.bone_table.is_empty() {
-        let head: Vec<String> = mesh.bone_table.iter().take(16).map(|b| b.to_string()).collect();
+        let head: Vec<String> = mesh
+            .bone_table
+            .iter()
+            .take(16)
+            .map(|b| b.to_string())
+            .collect();
         println!(
             "bone_table[{}] head: [{}{}]",
             mesh.bone_table.len(),
             head.join(", "),
-            if mesh.bone_table.len() > 16 { ", ..." } else { "" }
+            if mesh.bone_table.len() > 16 {
+                ", ..."
+            } else {
+                ""
+            }
         );
     } else {
         println!("bone_table: (empty)");

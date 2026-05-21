@@ -282,10 +282,7 @@ impl Plugin for HudPlugin {
 /// Register the HUD's spawn-once systems on `schedule`. Pass `Startup`
 /// for the wasm front-end (HUD lives for the whole app), or
 /// `OnEnter(your_in_game_state)` for state-driven front-ends.
-pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(
-    app: &mut App,
-    schedule: L,
-) {
+pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut App, schedule: L) {
     app.add_systems(
         schedule.clone(),
         (

@@ -2179,7 +2179,10 @@ struct BattleBitReader<'a> {
 
 impl<'a> BattleBitReader<'a> {
     fn new(data: &'a [u8], start_bit: usize) -> Self {
-        Self { data, pos: start_bit }
+        Self {
+            data,
+            pos: start_bit,
+        }
     }
 
     fn read(&mut self, bits: u32) -> Option<u64> {
@@ -2234,7 +2237,9 @@ fn decode_battle2_action(
     let cas_name = name_for_id(actor_id, name_cache);
 
     for _t in 0..trg_sum.min(15) {
-        let Some(target_id) = br.read(32) else { return out };
+        let Some(target_id) = br.read(32) else {
+            return out;
+        };
         let result_sum = br.read(4).unwrap_or(0) as usize;
         let tar_name = name_for_id(target_id as u32, name_cache);
 
@@ -2282,38 +2287,26 @@ fn decode_battle2_action(
             // animation half of a spell that also carries a damage
             // result in a sibling slot). Drop those.
             if message_num != 0 {
-                if let Some(line) = build_battle2_line(
-                    message_num,
-                    &cas_name,
-                    &tar_name,
-                    value,
-                    cmd_arg,
-                ) {
+                if let Some(line) =
+                    build_battle2_line(message_num, &cas_name, &tar_name, value, cmd_arg)
+                {
                     out.push(line);
                 }
             }
             // Additional-effect line (proc): "Additional effect: ..."
             // Usually packed with its own messageID like 163.
             if has_proc && proc_message != 0 {
-                if let Some(line) = build_battle2_line(
-                    proc_message,
-                    &cas_name,
-                    &tar_name,
-                    proc_value,
-                    cmd_arg,
-                ) {
+                if let Some(line) =
+                    build_battle2_line(proc_message, &cas_name, &tar_name, proc_value, cmd_arg)
+                {
                     out.push(line);
                 }
             }
             // Reaction line (spikes/parry/etc.).
             if has_react && react_message != 0 {
-                if let Some(line) = build_battle2_line(
-                    react_message,
-                    &cas_name,
-                    &tar_name,
-                    react_value,
-                    cmd_arg,
-                ) {
+                if let Some(line) =
+                    build_battle2_line(react_message, &cas_name, &tar_name, react_value, cmd_arg)
+                {
                     out.push(line);
                 }
             }
@@ -2535,10 +2528,8 @@ fn replace_marker_nth(src: &str, marker: char, n: usize, value: &str) -> String 
 }
 
 fn is_token_boundary(chars: &[char], i: usize) -> bool {
-    let left_ok = i == 0
-        || !chars[i - 1].is_alphanumeric() && chars[i - 1] != '_';
-    let right_ok = i + 1 == chars.len()
-        || !chars[i + 1].is_alphanumeric() && chars[i + 1] != '_';
+    let left_ok = i == 0 || !chars[i - 1].is_alphanumeric() && chars[i - 1] != '_';
+    let right_ok = i + 1 == chars.len() || !chars[i + 1].is_alphanumeric() && chars[i + 1] != '_';
     left_ok && right_ok
 }
 
@@ -3206,11 +3197,11 @@ mod tests {
         // the player's own unique_no/act_index (forced cutscene). All
         // fields are little-endian.
         let buf = build_subpacket_event_end(
-            0x1234,        // sync
-            0xDEADBEEF,    // unique_no
-            0x4242,        // act_index
-            535,           // event_num (the CSID per the arg semantics)
-            0,             // choice
+            0x1234,     // sync
+            0xDEADBEEF, // unique_no
+            0x4242,     // act_index
+            535,        // event_num (the CSID per the arg semantics)
+            0,          // choice
         );
         assert_eq!(buf.len(), 20, "header(4) + body(16)");
 
@@ -3596,7 +3587,11 @@ mod tests {
             "expected 'chain 5!' and 'gains 320', got: {}",
             line.text
         );
-        assert!(!line.text.contains('#'), "stray '#' remained: {}", line.text);
+        assert!(
+            !line.text.contains('#'),
+            "stray '#' remained: {}",
+            line.text
+        );
     }
 
     #[test]
@@ -3605,15 +3600,8 @@ mod tests {
         // should be swapped; but a within-word X (like the 'X' in
         // "BoXing" — unlikely in real templates but worth pinning the
         // rule) must NOT be swapped.
-        let s = substitute_battle_placeholders(
-            "rises X points. BoXing.",
-            "cas",
-            "tar",
-            0,
-            7,
-            38,
-            None,
-        );
+        let s =
+            substitute_battle_placeholders("rises X points. BoXing.", "cas", "tar", 0, 7, 38, None);
         assert!(s.contains("rises 7 points"), "got: {s}");
         assert!(s.contains("BoXing"), "within-word X must survive, got: {s}");
     }
@@ -3660,8 +3648,7 @@ mod tests {
         cache.insert(0xCAFEu32, "Daisy".to_string());
         let line = decode_battle_message(&data, &cache, true).expect("decoded");
         assert!(
-            line.text.contains("Daisy readies Hand-to-Hand")
-                && !line.text.contains("<entity>"),
+            line.text.contains("Daisy readies Hand-to-Hand") && !line.text.contains("<entity>"),
             "expected '<entity>' → Daisy, got: {}",
             line.text
         );
@@ -3678,7 +3665,10 @@ mod tests {
     impl BattleBitWriter {
         fn new(start_bit: usize) -> Self {
             // 1 KB is plenty for a few targets × few results.
-            Self { data: vec![0u8; 1024], pos: start_bit }
+            Self {
+                data: vec![0u8; 1024],
+                pos: start_bit,
+            }
         }
         fn write(&mut self, value: u64, bits: u32) {
             for i in 0..bits {
@@ -3708,10 +3698,10 @@ mod tests {
         w.write(0, 4); // cmd_no
         w.write(0, 32); // cmd_arg
         w.write(0, 32); // info
-        // Target 0:
+                        // Target 0:
         w.write(0xBEEFu64, 32); // target_id
         w.write(1, 4); // result_sum = 1
-        // Result 0:
+                       // Result 0:
         w.write(0, 3); // miss/resolution
         w.write(0, 2); // kind
         w.write(0, 12); // sub_kind (animation)
@@ -3733,9 +3723,7 @@ mod tests {
         let l = &lines[0];
         assert_eq!(l.channel, ChatChannel::Battle);
         assert!(
-            l.text.contains("Daisy")
-                && l.text.contains("Mandragora")
-                && l.text.contains("42"),
+            l.text.contains("Daisy") && l.text.contains("Mandragora") && l.text.contains("42"),
             "expected damage line, got: {}",
             l.text
         );
@@ -3778,9 +3766,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let l = &lines[0];
         assert!(
-            l.text.contains("Daisy")
-                && l.text.contains("spell #144")
-                && l.text.contains("87"),
+            l.text.contains("Daisy") && l.text.contains("spell #144") && l.text.contains("87"),
             "expected casts/spell/amount, got: {}",
             l.text
         );

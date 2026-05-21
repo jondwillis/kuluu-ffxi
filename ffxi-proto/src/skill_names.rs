@@ -57,7 +57,9 @@ const SKILL_NAMES: &[(u8, &str)] = &[
 ];
 
 pub fn lookup(id: u8) -> Option<&'static str> {
-    SKILL_NAMES.iter().find_map(|&(k, v)| (k == id).then_some(v))
+    SKILL_NAMES
+        .iter()
+        .find_map(|&(k, v)| (k == id).then_some(v))
 }
 
 #[cfg(test)]

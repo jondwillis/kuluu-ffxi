@@ -43,7 +43,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::{Image, ImageSampler};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use ffxi_viewer_wire::{EntityKind, Position};
+use ffxi_viewer_wire::EntityKind;
 
 use crate::camera::OperatorCamera;
 use crate::components::{InGameEntity, Nameplate, WorldEntity};
@@ -338,8 +338,7 @@ pub fn update_nameplate_billboards_system(
     let self_uid: Option<u16> = state.snapshot.diagnostics.sync_in;
     let self_char_id: Option<u32> = state.snapshot.self_char_id;
     let mut hp_by_id: std::collections::HashMap<u32, Option<u8>> = std::collections::HashMap::new();
-    let mut bt_target_by_id: std::collections::HashMap<u32, u32> =
-        std::collections::HashMap::new();
+    let mut bt_target_by_id: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut self_bt_target: u32 = 0;
     for ent in &state.snapshot.entities {
         hp_by_id.insert(ent.id, ent.hp_pct);
@@ -575,11 +574,7 @@ fn rasterize_text_to_image(
             outline_glyph.draw(|gx, gy, c| {
                 let px_x = bb.min.x as i32 + gx as i32 + pad as i32;
                 let px_y = bb.min.y as i32 + gy as i32 + pad as i32;
-                if px_x < 0
-                    || px_y < 0
-                    || px_x >= width as i32
-                    || px_y >= text_height as i32
-                {
+                if px_x < 0 || px_y < 0 || px_x >= width as i32 || px_y >= text_height as i32 {
                     return;
                 }
                 let i = (px_y as u32 * width + px_x as u32) as usize;
@@ -660,7 +655,13 @@ fn rasterize_text_to_image(
         // 1px outline.
         for x in 0..bar_pixel_w {
             paint_pixel(&mut pixels, width, bar_x + x, bar_y, OUTLINE_COLOR);
-            paint_pixel(&mut pixels, width, bar_x + x, bar_y + bar_h - 1, OUTLINE_COLOR);
+            paint_pixel(
+                &mut pixels,
+                width,
+                bar_x + x,
+                bar_y + bar_h - 1,
+                OUTLINE_COLOR,
+            );
         }
         for y in 0..bar_h {
             paint_pixel(&mut pixels, width, bar_x, bar_y + y, OUTLINE_COLOR);
@@ -741,10 +742,5 @@ fn hp_color_rgba(pct: u8) -> [u8; 4] {
         let t = f * 2.0;
         (1.0, t)
     };
-    [
-        (r * 255.0).round() as u8,
-        (g * 255.0).round() as u8,
-        0,
-        255,
-    ]
+    [(r * 255.0).round() as u8, (g * 255.0).round() as u8, 0, 255]
 }

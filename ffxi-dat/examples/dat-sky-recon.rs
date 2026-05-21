@@ -251,9 +251,7 @@ fn scan_range(root: &DatRoot, lo: u32, hi: u32) {
             }
         }
     }
-    println!(
-        "# scan_range done: scanned={scanned} readable={readable} hits={hits}"
-    );
+    println!("# scan_range done: scanned={scanned} readable={readable} hits={hits}");
 }
 
 fn main() -> ExitCode {

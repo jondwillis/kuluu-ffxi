@@ -381,6 +381,7 @@ pub fn dispatch_movement_system(
     mut autorun: ResMut<AutoRun>,
     mut chase: ResMut<ChaseCamera>,
     navmesh: Res<super::navmesh_overlay::NavmeshState>,
+    minimap_hover: Res<ffxi_viewer_core::minimap::input::MinimapHoverGate>,
 ) {
     // Pause walking only when the operator's actively typing (Chat) or
     // making an event choice (Dialog). Menu and QuickAction overlays
@@ -438,7 +439,13 @@ pub fn dispatch_movement_system(
     //     the rate is framerate-independent (`KEYBOARD_ZOOM_RATE`
     //     yalms/sec). Holding a key produces continuous smooth zoom;
     //     a quick tap produces ~1 fixed-tick step at 60 Hz.
-    if matches!(*camera_mode, CameraMode::Chase) && !in_picker {
+    //
+    //     Hover-gate: when the cursor is over the minimap, the same
+    //     keys zoom the minimap instead (see
+    //     `ffxi_viewer_core::minimap::input::handle_minimap_zoom_input`).
+    //     Mirror-image of how `chat_wheel_scroll_system` consumes
+    //     wheel events when hovering chat.
+    if matches!(*camera_mode, CameraMode::Chase) && !in_picker && !minimap_hover.hovered {
         let mut zoom_d = 0.0;
         let step = ChaseCamera::KEYBOARD_ZOOM_RATE * time.delta_secs();
         if bindings.pressed(Action::CameraZoomIn, &keys) {

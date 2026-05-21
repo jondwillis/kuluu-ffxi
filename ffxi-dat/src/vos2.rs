@@ -443,7 +443,10 @@ pub fn parse_vos2(body: &[u8]) -> Result<Vos2Mesh> {
         let weight2_val = read(28);
         let normal1 = [read(32), read(40), read(48)];
         let normal2 = [read(36), read(44), read(52)];
-        vertices.push(Vos2Vertex { pos: pos1, normal: normal1 });
+        vertices.push(Vos2Vertex {
+            pos: pos1,
+            normal: normal1,
+        });
         bone_weights.push(Vos2BoneWeight {
             weight1: weight1_val,
             weight2: weight2_val,

@@ -24,11 +24,11 @@ pub mod bridge;
 pub mod camera_collision;
 pub mod collision_bvh;
 pub mod debug_heights;
-pub mod screenshot;
 pub mod input;
 pub mod launcher_ui;
 pub mod nameplate_occlude;
 pub mod navmesh_overlay;
+pub mod screenshot;
 pub mod slash_commands;
 pub mod text_input;
 
@@ -42,11 +42,14 @@ use ffxi_client::lobby_client::LobbyClient;
 use ffxi_client::reactor::ReactorConfig;
 use ffxi_client::{spawn_session_with_reactor, SessionHandle};
 use ffxi_viewer_core::{
-    add_hud_spawners, atmosphere::LastAtmosphereZone, audio::BgmSlots,
-    dat_mzb::{LastAutoLoadedZone, MzbCollisionGeometry}, hud::zone_flash::ZoneNameResolver,
-    scene::TrackedEntities, setup_world, setup_zone_line_assets, spawn_camera, EventLog,
-    HudPlugin, InGameEntity, MousePlugin, SceneState, ViewerCorePlugin, ZoneLineDescriptor,
-    ZoneLineResolver,
+    add_hud_spawners,
+    atmosphere::LastAtmosphereZone,
+    audio::BgmSlots,
+    dat_mzb::{LastAutoLoadedZone, MzbCollisionGeometry},
+    hud::zone_flash::ZoneNameResolver,
+    scene::TrackedEntities,
+    setup_world, setup_zone_line_assets, spawn_camera, EventLog, HudPlugin, InGameEntity,
+    MousePlugin, SceneState, ViewerCorePlugin, ZoneLineDescriptor, ZoneLineResolver,
 };
 use ffxi_viewer_wire::{Stage as WireStage, ViewerEvent};
 use tokio::runtime::Handle as RtHandle;
@@ -555,10 +558,7 @@ fn return_to_launcher_on_disconnect(
     if matches!(kind, DisconnectKind::Forced) && err.0.is_empty() {
         err.0 = "Disconnected from server. Press Esc to return to login.".into();
     }
-    tracing::info!(
-        ?kind,
-        "disconnect-watcher: returning AppPhase to Launcher"
-    );
+    tracing::info!(?kind, "disconnect-watcher: returning AppPhase to Launcher");
     next_phase.set(AppPhase::Launcher);
 }
 

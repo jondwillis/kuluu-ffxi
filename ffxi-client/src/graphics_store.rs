@@ -125,10 +125,7 @@ pub fn load_or_default() -> (GraphicsSettings, GraphicsStore) {
 /// Best-effort — a disk failure logs a warning but the in-memory
 /// update succeeds anyway, so a transient I/O hiccup doesn't lock the
 /// operator out of changing settings.
-pub fn persist_graphics_on_change(
-    settings: Res<GraphicsSettings>,
-    state: Res<GraphicsStateRes>,
-) {
+pub fn persist_graphics_on_change(settings: Res<GraphicsSettings>, state: Res<GraphicsStateRes>) {
     if !settings.is_changed() {
         return;
     }

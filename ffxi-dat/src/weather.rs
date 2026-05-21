@@ -76,9 +76,7 @@ pub struct WeatherRecord {
 /// Errors specific to weather-chunk parsing.
 #[derive(Debug, thiserror::Error)]
 pub enum WeatherError {
-    #[error(
-        "Weather chunk too small: need at least {needed} bytes for WeatherData, got {actual}"
-    )]
+    #[error("Weather chunk too small: need at least {needed} bytes for WeatherData, got {actual}")]
     TooSmall { needed: usize, actual: usize },
     #[error("Weather chunk name {0:?} is not a valid HHMM time string")]
     BadTimeName([u8; 4]),
@@ -114,12 +112,10 @@ pub fn parse_weather_record(name: &[u8; 4], body: &[u8]) -> Result<WeatherRecord
     }
     let time_minutes = parse_time_name(name)?;
 
-    let u32_at = |off: usize| {
-        u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]])
-    };
-    let f32_at = |off: usize| {
-        f32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]])
-    };
+    let u32_at =
+        |off: usize| u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+    let f32_at =
+        |off: usize| f32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
 
     // Layout (mirrors lotus `WeatherData` struct exactly, byte-for-
     // byte; offsets in [] are pre-computed from the packed layout).
@@ -265,10 +261,7 @@ pub fn sample_weather(records: &[WeatherRecord], time_minutes: u32) -> Option<We
     let t = time_minutes % 1440;
     // Find the latest record whose time ≤ t — `lower` — and the
     // earliest record whose time > t — `upper`. Wrap if needed.
-    let upper_idx = records
-        .iter()
-        .position(|r| r.time_minutes > t)
-        .unwrap_or(0); // wrap: nothing greater → use the earliest as "tomorrow's first"
+    let upper_idx = records.iter().position(|r| r.time_minutes > t).unwrap_or(0); // wrap: nothing greater → use the earliest as "tomorrow's first"
     let lower_idx = if upper_idx == 0 {
         records.len() - 1
     } else {
@@ -297,7 +290,12 @@ pub fn sample_weather(records: &[WeatherRecord], time_minutes: u32) -> Option<We
 fn lerp_records(a: &WeatherRecord, b: &WeatherRecord, t: f32, time_minutes: u32) -> WeatherRecord {
     let lerp = |x: f32, y: f32| x + (y - x) * t;
     let lerp4 = |x: [f32; 4], y: [f32; 4]| {
-        [lerp(x[0], y[0]), lerp(x[1], y[1]), lerp(x[2], y[2]), lerp(x[3], y[3])]
+        [
+            lerp(x[0], y[0]),
+            lerp(x[1], y[1]),
+            lerp(x[2], y[2]),
+            lerp(x[3], y[3]),
+        ]
     };
     let mut sk_c = [[0.0; 4]; 8];
     let mut sk_a = [0.0; 8];
@@ -315,8 +313,14 @@ fn lerp_records(a: &WeatherRecord, b: &WeatherRecord, t: f32, time_minutes: u32)
         min_fog_dist_entity: lerp(a.min_fog_dist_entity, b.min_fog_dist_entity),
         brightness_entity: lerp(a.brightness_entity, b.brightness_entity),
 
-        sunlight_diffuse_landscape: lerp4(a.sunlight_diffuse_landscape, b.sunlight_diffuse_landscape),
-        moonlight_diffuse_landscape: lerp4(a.moonlight_diffuse_landscape, b.moonlight_diffuse_landscape),
+        sunlight_diffuse_landscape: lerp4(
+            a.sunlight_diffuse_landscape,
+            b.sunlight_diffuse_landscape,
+        ),
+        moonlight_diffuse_landscape: lerp4(
+            a.moonlight_diffuse_landscape,
+            b.moonlight_diffuse_landscape,
+        ),
         ambient_landscape: lerp4(a.ambient_landscape, b.ambient_landscape),
         fog_landscape: lerp4(a.fog_landscape, b.fog_landscape),
         max_fog_dist_landscape: lerp(a.max_fog_dist_landscape, b.max_fog_dist_landscape),
@@ -418,7 +422,7 @@ mod tests {
     #[test]
     fn sample_lerps_between_two_keyframes() {
         let records = vec![mk_rec(360, 0.0), mk_rec(720, 1.0)]; // 06:00 → 12:00
-        // Midpoint: 09:00 (540 min) should give brightness 0.5.
+                                                                // Midpoint: 09:00 (540 min) should give brightness 0.5.
         let r = sample_weather(&records, 540).unwrap();
         assert!((r.brightness_entity - 0.5).abs() < 1e-5);
     }

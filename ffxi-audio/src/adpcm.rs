@@ -86,10 +86,7 @@ pub fn decode_block_into(
 /// channel-major (matches lotus `ADPCM` class which stores
 /// `Vec<Vec<float>>`), so this function decodes per-channel first
 /// then interleaves. For mono files the interleave step is a no-op.
-pub fn decode_channel_major_then_interleave(
-    data: &[u8],
-    h: &AudioHeader,
-) -> Result<Vec<f32>> {
+pub fn decode_channel_major_then_interleave(data: &[u8], h: &AudioHeader) -> Result<Vec<f32>> {
     let channels = h.channels as usize;
     let block_size = h.block_size;
     let block_bytes_per_channel = 1 + (block_size / 2) as usize;

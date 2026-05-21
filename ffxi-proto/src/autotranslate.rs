@@ -98,9 +98,13 @@ fn table() -> &'static HashMap<u32, &'static str> {
         let mut map = HashMap::with_capacity(28_500);
         for line in TABLE_TSV.lines() {
             let mut parts = line.splitn(2, '\t');
-            let Some(key_str) = parts.next() else { continue };
+            let Some(key_str) = parts.next() else {
+                continue;
+            };
             let Some(text) = parts.next() else { continue };
-            let Ok(key) = key_str.parse::<u32>() else { continue };
+            let Ok(key) = key_str.parse::<u32>() else {
+                continue;
+            };
             // Drop the lang byte (bits 8..16) so wire-side lang variants
             // all collide on the same slot. See `resolve` for why.
             let stripped = key & 0xFFFF_00FF;

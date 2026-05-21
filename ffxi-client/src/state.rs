@@ -2118,7 +2118,10 @@ mod tests {
         };
         ent.look = Some(look.clone());
         s.apply_event(&AgentEvent::EntityUpserted { entity: ent });
-        assert!(matches!(s.entities[0].look, Some(LookData::Equipped { race: 3, .. })));
+        assert!(matches!(
+            s.entities[0].look,
+            Some(LookData::Equipped { race: 3, .. })
+        ));
 
         // Position-only refresh: look = None. Must keep the prior value.
         let mut pos_only = make_test_entity(42, None, EntityKind::Pc);

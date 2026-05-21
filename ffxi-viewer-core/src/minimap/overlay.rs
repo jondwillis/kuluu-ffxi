@@ -30,13 +30,13 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 use ffxi_viewer_wire::EntityKind;
 
-use crate::camera::{yaw_for_heading, ChaseCamera};
+use crate::camera::ChaseCamera;
 use crate::components::{InGameEntity, IsSelf, WorldEntity};
 use crate::lock_on::LockOn;
 use crate::scene::{Target, TrackedEntities};
 use crate::snapshot::SceneState;
 
-use super::{MinimapMode, MinimapOverlayLayer, MinimapState};
+use super::{MinimapOverlayLayer, MinimapView};
 
 /// Dot diameter in CSS pixels for other entities. Small enough that a
 /// crowd of entities reads as a cluster, big enough that a single mob
@@ -80,11 +80,15 @@ const SELF_MARKER_ID: u32 = u32::MAX;
 
 /// Per-frame: reconcile dots for every tracked entity.
 ///
-/// Skips when the AABB isn't set yet (zone not baked / no retail map
-/// loaded) — the empty overlay layer just stays bare.
+/// Reads [`MinimapView::visible_aabb`] (published by
+/// `update_minimap_view` earlier in the chain) so dots cull when
+/// zoomed in and align with whatever sub-window the image is
+/// currently cropped to.
+///
+/// Skips when no visible AABB is set yet (zone not baked / no retail
+/// map loaded) — the empty overlay layer just stays bare.
 pub fn update_minimap_overlay(
-    state: Res<MinimapState>,
-    mode: Res<MinimapMode>,
+    view: Res<MinimapView>,
     scene_state: Res<SceneState>,
     target: Res<Target>,
     lock_on: Res<LockOn>,
@@ -97,7 +101,7 @@ pub fn update_minimap_overlay(
     mut commands: Commands,
     mut q_dot_node: Query<(&mut Node, &mut BackgroundColor), With<MinimapDot>>,
 ) {
-    let Some(aabb) = state.active_aabb(*mode) else {
+    let Some(aabb) = view.visible_aabb else {
         return;
     };
     let Ok(overlay_layer) = q_overlay_layer.single() else {
@@ -108,7 +112,8 @@ pub fn update_minimap_overlay(
     let self_char_id = snap.self_char_id.unwrap_or(0);
 
     // Track which ids are present this frame so we can despawn stale
-    // dots at the end.
+    // dots at the end. At high zoom most entities cull off-screen
+    // and never make it into `seen` — they get despawned naturally.
     let mut seen: std::collections::HashSet<u32> =
         std::collections::HashSet::with_capacity(tracked.by_id.len() + 1);
 
@@ -124,7 +129,11 @@ pub fn update_minimap_overlay(
         if self_char_id != 0 && world_entity.id == self_char_id {
             continue;
         }
-        let uv = aabb.world_to_uv(transform.translation);
+        // Cull off-visible-window entities. They'll be despawned at
+        // the end of the loop because they never get added to `seen`.
+        let Some(uv) = aabb.world_to_uv_or_offscreen(transform.translation) else {
+            continue;
+        };
         let is_target = target.id == Some(world_entity.id);
         let is_locked = lock_on.target_id == Some(world_entity.id);
         let color = dot_color(world_entity.kind, is_target, is_locked);
@@ -143,8 +152,17 @@ pub fn update_minimap_overlay(
     }
 
     // ---- Self marker ---------------------------------------------
+    //
+    // Self should always be visible. With zoom centered on the
+    // player + zero pan, self lands exactly at UV (0.5, 0.5). With
+    // non-zero pan, it shifts but stays inside the window as long as
+    // the pan offset is within the half-radius — the clamped
+    // `world_to_uv` is the right fallback if the operator drags far
+    // enough that even self would go off-screen.
     if let Ok(self_t) = q_self.single() {
-        let uv = aabb.world_to_uv(self_t.translation);
+        let uv = aabb
+            .world_to_uv_or_offscreen(self_t.translation)
+            .unwrap_or_else(|| aabb.world_to_uv(self_t.translation));
         upsert_dot(
             &mut dots,
             &mut commands,

@@ -27,9 +27,7 @@ fn main() -> ExitCode {
     };
     let schedule = extract_se_schedule(&bytes);
     if schedule.is_empty() {
-        eprintln!(
-            "no SE schedule resolved — file has no Scheduler→Generator→Sep chain"
-        );
+        eprintln!("no SE schedule resolved — file has no Scheduler→Generator→Sep chain");
         return ExitCode::from(0);
     }
     println!("─── {} ───", path.display());

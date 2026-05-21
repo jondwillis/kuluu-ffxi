@@ -27,7 +27,7 @@ use bevy::prelude::*;
 use ffxi_client::lobby_client::CharSlot;
 use ffxi_viewer_core::dat_vos2::spawn_equipped;
 
-use super::{CharListData, char_list::CharCursor};
+use super::{char_list::CharCursor, CharListData};
 
 /// Root marker for everything spawned by the preview scene —
 /// camera, lighting, character parent. One despawn-tree under this
@@ -79,11 +79,7 @@ pub(super) fn spawn_preview(
     // Needs Transform + Visibility so children inherit GlobalTransform
     // and InheritedVisibility (Bevy hierarchy warning B0004 otherwise).
     let root = commands
-        .spawn((
-            CharPreviewRoot,
-            Transform::default(),
-            Visibility::default(),
-        ))
+        .spawn((CharPreviewRoot, Transform::default(), Visibility::default()))
         .id();
 
     // 3D camera. Default order=0 puts it behind UI which renders at
@@ -252,8 +248,21 @@ fn spawn_for_slot(
         return;
     }
     let spawned = spawn_equipped(
-        commands, meshes, materials, images, parent, slot.race, slot.face, slot.head, slot.body,
-        slot.hands, slot.legs, slot.feet, slot.main, slot.sub, slot.ranged,
+        commands,
+        meshes,
+        materials,
+        images,
+        parent,
+        slot.race,
+        slot.face,
+        slot.head,
+        slot.body,
+        slot.hands,
+        slot.legs,
+        slot.feet,
+        slot.main,
+        slot.sub,
+        slot.ranged,
     );
     info!(
         "char preview: char_id={} race={} face={} \

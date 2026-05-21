@@ -187,10 +187,7 @@ pub fn spawn_target_panel(mut commands: Commands) {
 pub fn update_target_panel_system(
     target: Res<Target>,
     state: Res<SceneState>,
-    mut panel_q: Query<
-        (&mut Node, &mut BorderColor),
-        (With<TargetPanel>, Without<TargetHpFill>),
-    >,
+    mut panel_q: Query<(&mut Node, &mut BorderColor), (With<TargetPanel>, Without<TargetHpFill>)>,
     mut header_q: Query<
         &mut Text,
         (

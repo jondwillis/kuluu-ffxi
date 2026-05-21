@@ -441,9 +441,9 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes()); // y_pels
         bytes.extend_from_slice(&0u32.to_le_bytes()); // used_colors = 0 (the trigger)
         bytes.extend_from_slice(&0u32.to_le_bytes()); // important_colors
-        // Pad out with enough trailing bytes that the header passes
-        // the "bytes.len() >= 61" gate and we reach the panic site
-        // pre-fix.
+                                                      // Pad out with enough trailing bytes that the header passes
+                                                      // the "bytes.len() >= 61" gate and we reach the panic site
+                                                      // pre-fix.
         bytes.extend_from_slice(&[0u8; 32]);
         assert!(parse_graphic(&bytes).is_err());
         // And the scanner must drain to completion without panicking
@@ -476,11 +476,11 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes()); // y_pels
         bytes.extend_from_slice(&2u32.to_le_bytes()); // used_colors
         bytes.extend_from_slice(&0u32.to_le_bytes()); // important_colors
-        // Palette: index 0 = black, index 1 = bright red.
-        // BGRA on disk: B, G, R, A.
+                                                      // Palette: index 0 = black, index 1 = bright red.
+                                                      // BGRA on disk: B, G, R, A.
         bytes.extend_from_slice(&[0, 0, 0, 0]); // black
         bytes.extend_from_slice(&[0, 0, 0xFF, 0]); // red (B=0, G=0, R=255, A=0)
-        // Pixel rows, top-down: row 0 = [0, 1, padding..], row 1 = [1, 0, padding..]
+                                                   // Pixel rows, top-down: row 0 = [0, 1, padding..], row 1 = [1, 0, padding..]
         bytes.extend_from_slice(&[0u8, 1, 0, 0]); // row 0 + 2 bytes pad to 4-byte stride
         bytes.extend_from_slice(&[1u8, 0, 0, 0]); // row 1 + 2 bytes pad
 

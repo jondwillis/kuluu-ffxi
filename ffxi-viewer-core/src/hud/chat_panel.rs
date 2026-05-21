@@ -220,7 +220,6 @@ const SPANS_PER_ROW: usize = 16;
 /// channel's base color.
 const AUTOTRANSLATE_COLOR: Color = Color::srgb(0.50, 0.78, 1.00);
 
-
 /// Spawn the three chat panels as children of an existing parent (the
 /// `BottomLeftStack` flex container in `hud::mod`). Panels overlap
 /// visually but only the one matching `ActiveChatTab` is `Display::Flex`
@@ -261,12 +260,7 @@ pub fn spawn_chat_tab_bar_as_child(p: &mut ChildSpawnerCommands) {
     });
 }
 
-fn spawn_tab_button(
-    p: &mut ChildSpawnerCommands,
-    kind: ChatKind,
-    label: &str,
-    is_active: bool,
-) {
+fn spawn_tab_button(p: &mut ChildSpawnerCommands, kind: ChatKind, label: &str, is_active: bool) {
     let (bg, fg, border) = if is_active {
         (palette::BACKGROUND, palette::ACCENT, palette::ACCENT)
     } else {
@@ -297,39 +291,40 @@ fn spawn_tab_button(
 }
 
 fn spawn_panel(parent: &mut ChildSpawnerCommands, kind: ChatKind, initial_display: Display) {
-    parent.spawn((
-        ChatPanel { kind },
-        ChatPanelDecay::default(),
-        // `RelativeCursorPosition::cursor_over` is what
-        // `chat_wheel_scroll_system` reads to decide whether to
-        // consume the wheel. No `Pickable` needed — Bevy UI updates
-        // the field automatically each frame.
-        RelativeCursorPosition::default(),
-        Node {
-            // Width tracks the parent BottomLeftStack (which is 50%
-            // viewport-width). No bottom/left here — flex flow on
-            // the stack handles positioning, and the panel's
-            // auto-decay `height` drives the stack's overall height.
-            width: Val::Percent(100.0),
-            height: Val::Px(PANEL_MIN_HEIGHT_PX),
-            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
-            border: UiRect::all(Val::Px(1.0)),
-            flex_direction: FlexDirection::Column,
-            justify_content: JustifyContent::FlexEnd,
-            row_gap: Val::Px(2.0),
-            display: initial_display,
-            // Clip anything that overflows the panel rect. Without
-            // this, a chat row that wraps to taller than the
-            // remaining panel space spills upward over the 3D
-            // viewport (visible bug: `/help`'s multi-line output
-            // overflowed the panel before this was set).
-            overflow: Overflow::clip(),
-            ..default()
-        },
-        BackgroundColor(palette::BACKGROUND),
-        BorderColor::all(palette::BORDER),
-    ))
-    .with_children(|p| {
+    parent
+        .spawn((
+            ChatPanel { kind },
+            ChatPanelDecay::default(),
+            // `RelativeCursorPosition::cursor_over` is what
+            // `chat_wheel_scroll_system` reads to decide whether to
+            // consume the wheel. No `Pickable` needed — Bevy UI updates
+            // the field automatically each frame.
+            RelativeCursorPosition::default(),
+            Node {
+                // Width tracks the parent BottomLeftStack (which is 50%
+                // viewport-width). No bottom/left here — flex flow on
+                // the stack handles positioning, and the panel's
+                // auto-decay `height` drives the stack's overall height.
+                width: Val::Percent(100.0),
+                height: Val::Px(PANEL_MIN_HEIGHT_PX),
+                padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::FlexEnd,
+                row_gap: Val::Px(2.0),
+                display: initial_display,
+                // Clip anything that overflows the panel rect. Without
+                // this, a chat row that wraps to taller than the
+                // remaining panel space spills upward over the 3D
+                // viewport (visible bug: `/help`'s multi-line output
+                // overflowed the panel before this was set).
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            BackgroundColor(palette::BACKGROUND),
+            BorderColor::all(palette::BORDER),
+        ))
+        .with_children(|p| {
             for slot in 0..VISIBLE_ROWS {
                 p.spawn((
                     ChatRow { slot },
@@ -487,8 +482,7 @@ pub fn update_chat_panel(
         }
         let idle = (now - decay.last_active_secs).max(0.0);
         let t = ((idle - FULL_HOLD_SECS) / FADE_SECS).clamp(0.0, 1.0);
-        let target_h =
-            PANEL_MAX_HEIGHT_PX + (PANEL_MIN_HEIGHT_PX - PANEL_MAX_HEIGHT_PX) * t;
+        let target_h = PANEL_MAX_HEIGHT_PX + (PANEL_MIN_HEIGHT_PX - PANEL_MAX_HEIGHT_PX) * t;
         let want_h = Val::Px(target_h);
         if node.height != want_h {
             node.height = want_h;
@@ -530,16 +524,13 @@ pub fn update_chat_panel(
                 let segments: Vec<(String, Color)> = match line {
                     Some(l) => {
                         let base = channel_color(l.channel);
-                        let formatted =
-                            format_chat_line(l.channel, &l.sender, &l.text);
+                        let formatted = format_chat_line(l.channel, &l.sender, &l.text);
                         segment_chat_line(&formatted, base)
                     }
                     None => Vec::new(),
                 };
                 for (i, span_child) in span_children.iter().enumerate() {
-                    let Ok((mut span_text, mut span_color)) =
-                        span_q.get_mut(span_child)
-                    else {
+                    let Ok((mut span_text, mut span_color)) = span_q.get_mut(span_child) else {
                         continue;
                     };
                     let (want_text, want_color): (&str, Color) = segments

@@ -667,8 +667,7 @@ pub(crate) fn register(
     )
     .add_systems(
         Update,
-        account_create::error_keyboard_system
-            .run_if(in_state(LauncherState::CreateAccountError)),
+        account_create::error_keyboard_system.run_if(in_state(LauncherState::CreateAccountError)),
     );
 
     // Done: hand off to AppPhase::Connecting. The launcher's camera

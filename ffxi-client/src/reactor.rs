@@ -2498,7 +2498,9 @@ mod tests {
         for cmd in &out.commands {
             if let AgentCommand::Move { x, y, z, .. } = cmd {
                 assert!(
-                    (*x - cur.x).abs() < 1e-3 && (*y - cur.y).abs() < 1e-3 && (*z - cur.z).abs() < 1e-3,
+                    (*x - cur.x).abs() < 1e-3
+                        && (*y - cur.y).abs() < 1e-3
+                        && (*z - cur.z).abs() < 1e-3,
                     "speed=0 follow must not step (only face); got Move to ({x},{y},{z})"
                 );
             }

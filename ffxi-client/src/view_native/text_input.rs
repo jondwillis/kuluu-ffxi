@@ -561,9 +561,9 @@ fn apply_slash_outcome(
                 push_system_chat_line(scene_state, toast.into());
             }
             if let Some(shutdown) = reqlogout_starts_countdown(&cmd) {
-                slash_writers.logout_requested.write(
-                    ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown },
-                );
+                slash_writers
+                    .logout_requested
+                    .write(ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown });
             }
             let send_result = cmd_tx.try_send(cmd);
             if let Err(e) = send_result {
@@ -617,9 +617,9 @@ fn apply_slash_outcome(
                 push_system_chat_line(scene_state, toast.into());
             }
             if let Some(shutdown) = reqlogout_starts_countdown(&req) {
-                slash_writers.logout_requested.write(
-                    ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown },
-                );
+                slash_writers
+                    .logout_requested
+                    .write(ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown });
             }
             let _ = cmd_tx.try_send(req);
             let _ = cmd_tx.try_send(AgentCommand::Disconnect);
@@ -675,8 +675,7 @@ fn apply_slash_outcome(
             // arg → screenshot-0.png, screenshot-1.png, … per session.
             // Counter is a `Local` on this system so it survives across
             // calls.
-            static COUNTER: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let resolved = path.unwrap_or_else(|| {
                 let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 format!("screenshot-{n}.png")
@@ -698,10 +697,7 @@ fn apply_slash_outcome(
             slash_writers
                 .event_log
                 .recent
-                .push_back(ffxi_viewer_wire::ViewerEvent::MusicChanged {
-                    slot: 0,
-                    track_id,
-                });
+                .push_back(ffxi_viewer_wire::ViewerEvent::MusicChanged { slot: 0, track_id });
             push_system_chat_line(scene_state, format!("/bgm {track_id}: queued"));
         }
         SlashOutcome::PlaySfx { se_id } => {
@@ -856,8 +852,8 @@ fn apply_slash_outcome(
             );
         }
         SlashOutcome::SetMinimap(op) => {
-            use ffxi_viewer_core::minimap::MinimapMode;
             use super::slash_commands::MinimapOp;
+            use ffxi_viewer_core::minimap::MinimapMode;
             let chat = match op {
                 MinimapOp::Status => format!(
                     "/minimap: mode={:?} visible={} cull={:.1}",
@@ -1018,10 +1014,7 @@ fn apply_copy_toasts(n: usize, scene_state: &mut SceneState) {
     match arboard::Clipboard::new() {
         Ok(mut cb) => match cb.set_text(payload) {
             Ok(()) => {
-                push_system_chat_line(
-                    scene_state,
-                    format!("/copy: {take} toast(s) on clipboard"),
-                );
+                push_system_chat_line(scene_state, format!("/copy: {take} toast(s) on clipboard"));
             }
             Err(e) => {
                 push_system_chat_line(scene_state, format!("/copy: clipboard write failed: {e}"));

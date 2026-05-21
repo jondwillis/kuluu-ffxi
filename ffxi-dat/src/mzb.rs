@@ -1151,8 +1151,7 @@ mod tests {
         // indices [0,2,3], material=0b1100=12, is_barrier=true.
         assert_eq!(m.triangles[1], [0, 2, 3]);
         assert_eq!(
-            m.tri_info[1].material,
-            0b1100,
+            m.tri_info[1].material, 0b1100,
             "material composed from v2 + n0 top bits"
         );
         assert!(!m.tri_info[1].is_invalid);

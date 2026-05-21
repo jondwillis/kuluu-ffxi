@@ -649,7 +649,7 @@ pub fn process_load_vos2_requests(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut inverse_bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
-    mut scene_state: ResMut<SceneState>,
+    scene_state: ResMut<SceneState>,
     tracked: Res<TrackedEntities>,
 ) {
     let queued: Vec<LoadVos2Request> = events.read().copied().collect();
@@ -721,13 +721,8 @@ pub fn process_load_vos2_requests(
                 let is_pc = req.race != 0;
                 {
                     let skel_n = baked.world.len();
-                    let max_table = loaded
-                        .mesh
-                        .bone_table
-                        .iter()
-                        .copied()
-                        .max()
-                        .unwrap_or(0) as usize;
+                    let max_table =
+                        loaded.mesh.bone_table.iter().copied().max().unwrap_or(0) as usize;
                     let max_bone1 = loaded
                         .mesh
                         .bone_indices
@@ -778,8 +773,7 @@ pub fn process_load_vos2_requests(
                 // the lowest local-y is `min(v.pos[1])`. Falls back
                 // to the historical 0.9-yalm estimate when the mesh
                 // is somehow empty.
-                let min_mesh_y =
-                    compute_skinned_min_local_y(loaded, is_pc).unwrap_or(-0.9);
+                let min_mesh_y = compute_skinned_min_local_y(loaded, is_pc).unwrap_or(0.0);
                 commands
                     .entity(bevy_e)
                     .insert(crate::scene::BakedActor { min_mesh_y });
@@ -1583,36 +1577,33 @@ pub fn spawn_equipped(
     // we returned only the largest, which for body slots drops
     // shoulder/torso/arm sub-meshes and renders an apparently
     // "missing" chest.
-    let mut spawn_all_chunks = |chunk_indices: Vec<usize>,
-                                file_id: u32,
-                                label: &str,
-                                slot_min: &mut f32|
-     -> usize {
-        let mut count = 0usize;
-        for idx in chunk_indices {
-            match load_vos2(file_id, idx) {
-                Ok(loaded)
-                    if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() =>
-                {
-                    if let Some(min_y) = spawn_vos2_meshes(
-                        commands, meshes, materials, images, parent, &loaded, race,
-                    ) {
-                        *slot_min = slot_min.min(min_y);
+    let mut spawn_all_chunks =
+        |chunk_indices: Vec<usize>, file_id: u32, label: &str, slot_min: &mut f32| -> usize {
+            let mut count = 0usize;
+            for idx in chunk_indices {
+                match load_vos2(file_id, idx) {
+                    Ok(loaded)
+                        if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() =>
+                    {
+                        if let Some(min_y) = spawn_vos2_meshes(
+                            commands, meshes, materials, images, parent, &loaded, race,
+                        ) {
+                            *slot_min = slot_min.min(min_y);
+                        }
+                        count += 1;
                     }
-                    count += 1;
+                    Ok(_) => info!(
+                        "spawn_equipped: {} file={} chunk={} loaded but empty (race={})",
+                        label, file_id, idx, race
+                    ),
+                    Err(e) => info!(
+                        "spawn_equipped: {} file={} chunk={} load failed: {} (race={})",
+                        label, file_id, idx, e, race
+                    ),
                 }
-                Ok(_) => info!(
-                    "spawn_equipped: {} file={} chunk={} loaded but empty (race={})",
-                    label, file_id, idx, race
-                ),
-                Err(e) => info!(
-                    "spawn_equipped: {} file={} chunk={} load failed: {} (race={})",
-                    label, file_id, idx, e, race
-                ),
             }
-        }
-        count
-    };
+            count
+        };
     // Face mesh first — lotus loads it as a separate DAT alongside the
     // 8 equipment slots. Naked-but-faced characters still need the
     // face here, so this runs before the slot loop.
@@ -1656,7 +1647,7 @@ pub fn spawn_equipped(
         let min_mesh_y = if actor_min_local_y.is_finite() {
             actor_min_local_y
         } else {
-            -0.9
+            0.0
         };
         commands.entity(parent).insert(BakedActor { min_mesh_y });
     }

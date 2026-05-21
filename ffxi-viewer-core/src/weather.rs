@@ -56,10 +56,7 @@ impl Plugin for WeatherPlugin {
 /// Watch zone transitions and reload the weather keyframes. Mirrors
 /// the trigger logic in `dat_mzb::auto_load_zone_geometry_system` —
 /// fires once per zone change.
-pub fn load_zone_weather(
-    scene_state: Res<SceneState>,
-    mut zone_weather: ResMut<ZoneWeather>,
-) {
+pub fn load_zone_weather(scene_state: Res<SceneState>, mut zone_weather: ResMut<ZoneWeather>) {
     let current = scene_state.snapshot.zone_id;
     if current == zone_weather.zone_id {
         return;

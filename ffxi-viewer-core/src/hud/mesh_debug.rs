@@ -114,11 +114,11 @@ pub fn update_hover_state(
         // have — otherwise we'd zero the panel when leaving an entity
         // we never recorded (e.g. an HP-bar capsule).
         if let Ok(info) = debug_info_q.get(ev.entity) {
-            if hover
-                .current
-                .as_ref()
-                .is_some_and(|cur| cur.file_id == info.file_id && cur.chunk_idx == info.chunk_idx && cur.sub_index == info.sub_index)
-            {
+            if hover.current.as_ref().is_some_and(|cur| {
+                cur.file_id == info.file_id
+                    && cur.chunk_idx == info.chunk_idx
+                    && cur.sub_index == info.sub_index
+            }) {
                 hover.current = None;
                 hover.hit_position = None;
             }
@@ -198,8 +198,6 @@ pub fn update_mesh_debug_hud(
 /// backend will raycast against it. Bundled with `Pickable::default()`
 /// at the call site rather than auto-inserted here so it remains
 /// explicit which meshes participate in picking.
-pub fn mesh_debug_bundle(
-    info: MmbDebugInfo,
-) -> (Pickable, MmbDebugInfo) {
+pub fn mesh_debug_bundle(info: MmbDebugInfo) -> (Pickable, MmbDebugInfo) {
     (Pickable::default(), info)
 }

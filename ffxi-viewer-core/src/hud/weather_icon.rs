@@ -32,18 +32,18 @@ pub struct WeatherIconGlyph;
 pub fn weather_glyph(w: Weather) -> &'static str {
     match w {
         Weather::None => "",
-        Weather::Sunshine => "\u{2600}",          // ☀
-        Weather::Clouds => "\u{2601}",            // ☁
-        Weather::Fog => "\u{1F32B}",              // 🌫
-        Weather::HotSpell | Weather::HeatWave => "\u{1F525}", // 🔥
-        Weather::Rain | Weather::Squall => "\u{1F327}",       // 🌧
-        Weather::DustStorm | Weather::SandStorm => "\u{1F32A}", // 🌪
-        Weather::Wind | Weather::Gales => "\u{1F4A8}",        // 💨
-        Weather::Snow | Weather::Blizzards => "\u{2744}",     // ❄
+        Weather::Sunshine => "\u{2600}",                         // ☀
+        Weather::Clouds => "\u{2601}",                           // ☁
+        Weather::Fog => "\u{1F32B}",                             // 🌫
+        Weather::HotSpell | Weather::HeatWave => "\u{1F525}",    // 🔥
+        Weather::Rain | Weather::Squall => "\u{1F327}",          // 🌧
+        Weather::DustStorm | Weather::SandStorm => "\u{1F32A}",  // 🌪
+        Weather::Wind | Weather::Gales => "\u{1F4A8}",           // 💨
+        Weather::Snow | Weather::Blizzards => "\u{2744}",        // ❄
         Weather::Thunder | Weather::Thunderstorms => "\u{26A1}", // ⚡
-        Weather::Auroras => "\u{1F30C}",          // 🌌
-        Weather::StellarGlare => "\u{2728}",      // ✨
-        Weather::Gloom | Weather::Darkness => "\u{25CF}",     // ●
+        Weather::Auroras => "\u{1F30C}",                         // 🌌
+        Weather::StellarGlare => "\u{2728}",                     // ✨
+        Weather::Gloom | Weather::Darkness => "\u{25CF}",        // ●
     }
 }
 
@@ -165,12 +165,24 @@ mod tests {
         // if we forget to extend the match, returning the empty string
         // and tripping this assertion.
         let all = [
-            Weather::Sunshine, Weather::Clouds, Weather::Fog,
-            Weather::HotSpell, Weather::HeatWave, Weather::Rain,
-            Weather::Squall, Weather::DustStorm, Weather::SandStorm,
-            Weather::Wind, Weather::Gales, Weather::Snow,
-            Weather::Blizzards, Weather::Thunder, Weather::Thunderstorms,
-            Weather::Auroras, Weather::StellarGlare, Weather::Gloom,
+            Weather::Sunshine,
+            Weather::Clouds,
+            Weather::Fog,
+            Weather::HotSpell,
+            Weather::HeatWave,
+            Weather::Rain,
+            Weather::Squall,
+            Weather::DustStorm,
+            Weather::SandStorm,
+            Weather::Wind,
+            Weather::Gales,
+            Weather::Snow,
+            Weather::Blizzards,
+            Weather::Thunder,
+            Weather::Thunderstorms,
+            Weather::Auroras,
+            Weather::StellarGlare,
+            Weather::Gloom,
             Weather::Darkness,
         ];
         for w in all {

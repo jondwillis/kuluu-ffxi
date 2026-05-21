@@ -26,8 +26,8 @@
 
 use std::path::PathBuf;
 
-use bevy::audio::{AddAudioSource, Decodable, Source as RodioSource};
 use bevy::asset::Asset;
+use bevy::audio::{AddAudioSource, Decodable, Source as RodioSource};
 use bevy::prelude::*;
 use bevy::reflect::TypePath;
 use ffxi_audio::{decode_file, find_audio, AudioKind, DecodedAudio};
@@ -69,9 +69,7 @@ impl PcmAudio {
         // `DecodedAudio::loop_start_sample` is per-channel frames;
         // expand to the interleaved sample index `PcmSource::pos`
         // operates on.
-        let loop_start_sample = d
-            .loop_start_sample
-            .map(|frame| frame as usize * channels);
+        let loop_start_sample = d.loop_start_sample.map(|frame| frame as usize * channels);
         Self {
             samples: d.samples.into(),
             sample_rate: d.sample_rate as u32,
@@ -263,10 +261,7 @@ fn resolve_install_root() -> Option<PathBuf> {
 /// [`BgmPlaybackState`] (no engaged / no mount / not in mog-house
 /// / not dead / not fishing), only Zone slots are eligible and the
 /// player hears zone ambient — which is the right default.
-fn resolve_audible_slot(
-    slots: &BgmSlots,
-    state: &BgmPlaybackState,
-) -> Option<(u8, u16)> {
+fn resolve_audible_slot(slots: &BgmSlots, state: &BgmPlaybackState) -> Option<(u8, u16)> {
     // Priority order, highest-first. Each entry is a slot index.
     // Same priority retail uses internally:
     //   Dead > Mount > MogHouse > CombatParty > CombatSolo >
@@ -276,14 +271,14 @@ fn resolve_audible_slot(
     // matching state.
     let zone_pref: [u8; 2] = if state.is_night { [1, 0] } else { [0, 1] };
     let candidates: [(u8, bool); SLOT_COUNT] = [
-        (5, state.dead),         // Dead
-        (4, state.mounted),      // Mount
-        (6, state.in_mog_house), // MogHouse
+        (5, state.dead),          // Dead
+        (4, state.mounted),       // Mount
+        (6, state.in_mog_house),  // MogHouse
         (3, state.engaged_party), // CombatParty
-        (2, state.engaged_solo), // CombatSolo
-        (7, state.fishing),      // Fishing
-        (zone_pref[0], true),    // ZoneDay/Night per clock
-        (zone_pref[1], true),    // the other zone variant as fallback
+        (2, state.engaged_solo),  // CombatSolo
+        (7, state.fishing),       // Fishing
+        (zone_pref[0], true),     // ZoneDay/Night per clock
+        (zone_pref[1], true),     // the other zone variant as fallback
     ];
     for (slot, eligible) in candidates {
         if !eligible {
@@ -397,10 +392,9 @@ pub fn drain_music_events_system(events: Res<EventLog>, mut slots: ResMut<BgmSlo
                     // sourced from AltanaListener); a `?` here is a
                     // signal that the catalog might be due for a
                     // refresh against upstream.
-                    let (name, composer) =
-                        ffxi_audio::music_catalog::lookup(*track_id)
-                            .map(|(_, n, c)| (n, c))
-                            .unwrap_or(("?", "?"));
+                    let (name, composer) = ffxi_audio::music_catalog::lookup(*track_id)
+                        .map(|(_, n, c)| (n, c))
+                        .unwrap_or(("?", "?"));
                     info!(
                         "audio: 0x05F slot={} ({}) track={} — \"{}\" by {}",
                         slot,
@@ -565,10 +559,7 @@ pub struct SfxEvent {
 
 impl SfxEvent {
     pub fn new(se_id: u32) -> Self {
-        Self {
-            se_id,
-            volume: 1.0,
-        }
+        Self { se_id, volume: 1.0 }
     }
 }
 
@@ -632,7 +623,11 @@ pub fn play_sfx_system(
             h.clone()
         } else {
             let Some(path) = find_audio(&install, AudioKind::Sfx, ev.se_id) else {
-                warn!("audio: sfx {} not found under {}", ev.se_id, install.display());
+                warn!(
+                    "audio: sfx {} not found under {}",
+                    ev.se_id,
+                    install.display()
+                );
                 continue;
             };
             let decoded = match decode_file(&path) {
@@ -911,9 +906,7 @@ pub fn observe_ui_mode_transitions(
             // Enter menu / quick-action.
             (_, InputModeKind::Menu) | (_, InputModeKind::QuickAction) => table.ui_menu_open,
             // Leave menu / quick-action back to world.
-            (InputModeKind::Menu, _) | (InputModeKind::QuickAction, _) => {
-                table.ui_menu_cancel
-            }
+            (InputModeKind::Menu, _) | (InputModeKind::QuickAction, _) => table.ui_menu_cancel,
             _ => None,
         };
         if let Some(se_id) = id {
@@ -1036,10 +1029,22 @@ pub struct WeatherFade {
 
 impl WeatherFade {
     fn fade_in(duration: f32) -> Self {
-        Self { from: 0.0, to: 1.0, t: 0.0, duration, despawn_on_end: false }
+        Self {
+            from: 0.0,
+            to: 1.0,
+            t: 0.0,
+            duration,
+            despawn_on_end: false,
+        }
     }
     fn fade_out(duration: f32) -> Self {
-        Self { from: 1.0, to: 0.0, t: 0.0, duration, despawn_on_end: true }
+        Self {
+            from: 1.0,
+            to: 0.0,
+            t: 0.0,
+            duration,
+            despawn_on_end: true,
+        }
     }
 }
 
@@ -1092,9 +1097,7 @@ pub fn observe_weather_changes(
     // currently-active weather's ambient id; if they match, keep
     // the existing sink.
     let new_ambient_id = entry.ambient;
-    let prev_ambient_id = prev
-        .map(|w| table.get(w).ambient)
-        .unwrap_or(None);
+    let prev_ambient_id = prev.map(|w| table.get(w).ambient).unwrap_or(None);
 
     if new_ambient_id == prev_ambient_id && ambient.active_entity.is_some() {
         ambient.active_weather = Some(weather);
@@ -1169,8 +1172,7 @@ pub fn observe_weather_changes(
     let entity = commands
         .spawn((
             AudioPlayer(looped_handle),
-            PlaybackSettings::ONCE
-                .with_volume(bevy::audio::Volume::Linear(0.0)),
+            PlaybackSettings::ONCE.with_volume(bevy::audio::Volume::Linear(0.0)),
             WeatherFade::fade_in(WEATHER_FADE_SECS),
         ))
         .id();
@@ -1186,7 +1188,11 @@ pub fn observe_weather_changes(
 /// the entity if `despawn_on_end` and the tween completes.
 pub fn tick_weather_fades(
     time: Res<Time>,
-    mut q: Query<(Entity, &mut WeatherFade, Option<&mut bevy::audio::AudioSink>)>,
+    mut q: Query<(
+        Entity,
+        &mut WeatherFade,
+        Option<&mut bevy::audio::AudioSink>,
+    )>,
     mut commands: Commands,
 ) {
     let dt = time.delta_secs();
@@ -1327,12 +1333,14 @@ mod tests {
     #[test]
     fn drain_folds_music_events_into_slots() {
         let mut events = EventLog::default();
-        events
-            .recent
-            .push_back(ViewerEvent::MusicChanged { slot: 2, track_id: 99 });
-        events
-            .recent
-            .push_back(ViewerEvent::MusicVolumeChanged { slot: 2, volume: 64 });
+        events.recent.push_back(ViewerEvent::MusicChanged {
+            slot: 2,
+            track_id: 99,
+        });
+        events.recent.push_back(ViewerEvent::MusicVolumeChanged {
+            slot: 2,
+            volume: 64,
+        });
 
         let mut slots = BgmSlots::default();
         // Hand-roll the system call without spinning up an App: the
@@ -1345,8 +1353,7 @@ mod tests {
                     slots.tracks[*slot as usize] = Some(*track_id);
                 }
                 ViewerEvent::MusicVolumeChanged { slot, volume } => {
-                    slots.slot_gain[*slot as usize] =
-                        (*volume as f32 / 127.0).clamp(0.0, 1.0);
+                    slots.slot_gain[*slot as usize] = (*volume as f32 / 127.0).clamp(0.0, 1.0);
                 }
                 _ => {}
             }
@@ -1378,13 +1385,18 @@ mod tests {
             .add_systems(Update, fire_system_sfx_events);
 
         let mut events = app.world_mut().resource_mut::<EventLog>();
-        events.recent.push_back(ViewerEvent::ZoneChanged { from: None, to: 100 });
+        events.recent.push_back(ViewerEvent::ZoneChanged {
+            from: None,
+            to: 100,
+        });
         events.recent.push_back(ViewerEvent::LowHp { pct: 15 });
         // Unmapped event — should NOT fire SfxEvent.
         events
             .recent
             .push_back(ViewerEvent::Reconnected { downtime_ms: 500 });
-        events.recent.push_back(ViewerEvent::EngagedBy { entity_id: 42 });
+        events
+            .recent
+            .push_back(ViewerEvent::EngagedBy { entity_id: 42 });
 
         app.update();
 
@@ -1496,13 +1508,16 @@ mod tests {
         app.insert_resource(slots)
             .init_resource::<EventLog>()
             .init_resource::<BgmPlaybackState>()
-            .add_systems(Update, (drain_music_events_system, apply_bgm_system).chain());
+            .add_systems(
+                Update,
+                (drain_music_events_system, apply_bgm_system).chain(),
+            );
 
         // Push the same shape of event the wire reactor emits when
         // LSB sends 0x05F music change.
         let mut events = app.world_mut().resource_mut::<EventLog>();
         events.recent.push_back(ViewerEvent::MusicChanged {
-            slot: 0, // ZoneDay
+            slot: 0,       // ZoneDay
             track_id: 101, // music101.bgw — known to exist
         });
         // Tick the schedule once: drain_music → apply_bgm.

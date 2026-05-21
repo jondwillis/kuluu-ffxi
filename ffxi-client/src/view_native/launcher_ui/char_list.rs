@@ -49,7 +49,13 @@ pub(super) fn spawn_char_list_ui(
         .0
         .as_deref()
         .and_then(|want| chars.0.iter().position(|c| c.name == want))
-        .unwrap_or_else(|| if chars.0.is_empty() { new_char_index } else { 0 });
+        .unwrap_or_else(|| {
+            if chars.0.is_empty() {
+                new_char_index
+            } else {
+                0
+            }
+        });
     commands.insert_resource(CharCursor(initial_cursor));
 
     // No opaque BackgroundColor — the 3D character preview scene

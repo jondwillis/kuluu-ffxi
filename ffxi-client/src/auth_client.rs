@@ -39,7 +39,9 @@ impl std::str::FromStr for AuthFlavor {
         match s.to_ascii_lowercase().as_str() {
             "json" | "lsb" => Ok(AuthFlavor::Json),
             "binary" | "hxi" | "horizon" => Ok(AuthFlavor::Binary),
-            other => Err(format!("unknown auth-flavor `{other}`; expected json|binary")),
+            other => Err(format!(
+                "unknown auth-flavor `{other}`; expected json|binary"
+            )),
         }
     }
 }
@@ -157,9 +159,7 @@ impl AuthClient {
     }
 
     fn binary_builder(&self) -> Result<&PayloadBuilder> {
-        let res = self
-            .binary_builder
-            .get_or_init(PayloadBuilder::new);
+        let res = self.binary_builder.get_or_init(PayloadBuilder::new);
         match res {
             Ok(b) => Ok(b),
             Err(e) => Err(anyhow!("binary auth builder unavailable: {e}")),
@@ -324,10 +324,7 @@ impl AuthClient {
         }
     }
 
-    async fn exchange_binary(
-        &self,
-        payload: &[u8; auth_binary::PAYLOAD_LEN],
-    ) -> Result<Vec<u8>> {
+    async fn exchange_binary(&self, payload: &[u8; auth_binary::PAYLOAD_LEN]) -> Result<Vec<u8>> {
         let connector = TlsConnector::from(self.config.clone());
         let server_name = ServerName::try_from(self.host.clone())
             .map_err(|_| anyhow!("invalid server name: {}", self.host))?;

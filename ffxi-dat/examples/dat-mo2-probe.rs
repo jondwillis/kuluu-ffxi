@@ -39,16 +39,14 @@ fn main() -> ExitCode {
             .values()
             .flat_map(|kfs| kfs.iter())
             .filter(|f| {
-                let m = f.rotation[0].powi(2) + f.rotation[1].powi(2)
-                    + f.rotation[2].powi(2) + f.rotation[3].powi(2);
+                let m = f.rotation[0].powi(2)
+                    + f.rotation[1].powi(2)
+                    + f.rotation[2].powi(2)
+                    + f.rotation[3].powi(2);
                 (m - 1.0).abs() < 0.05
             })
             .count();
-        let total_q = anim
-            .per_bone
-            .values()
-            .map(|kfs| kfs.len())
-            .sum::<usize>();
+        let total_q = anim.per_bone.values().map(|kfs| kfs.len()).sum::<usize>();
         println!(
             "[chunk {idx}] name={:?} bones={} frames={} speed={:.4}  unit-quats={}/{}",
             anim.name,

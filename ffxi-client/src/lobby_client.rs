@@ -401,11 +401,7 @@ impl LobbyClient {
     ///      size/face at fixed packet offsets (see login_helpers.cpp:216
     ///      and view_session.cpp:160). Reply is again 0x20 / closed
     ///      socket on failure.
-    pub async fn create_character(
-        &self,
-        auth: &AuthSession,
-        spec: &CharCreateSpec,
-    ) -> Result<()> {
+    pub async fn create_character(&self, auth: &AuthSession, spec: &CharCreateSpec) -> Result<()> {
         // The chr_info2 view push is triggered by the *data* port's 0xA1
         // handler, not by VIEW_CMD_REGISTER alone — see data_session.cpp
         // around line 281 where it writes into `viewSession->buffer_`.
@@ -632,9 +628,7 @@ async fn read_create_reply(stream: &mut TcpStream, stage: &str) -> Result<()> {
                 login_error_name(err)
             );
         }
-        _ => bail!(
-            "{stage}: unexpected reply size={size:#x} result={result:#x}"
-        ),
+        _ => bail!("{stage}: unexpected reply size={size:#x} result={result:#x}"),
     }
 }
 
@@ -676,7 +670,6 @@ async fn read_data_charlist(stream: &mut TcpStream) -> Result<CharList> {
     }
     Ok(CharList { characters: chars })
 }
-
 
 /// Parse the size-prefixed `lpkt_chr_info2` push that the server emits to
 /// the view socket immediately after handling a data-port 0xA1. Each slot

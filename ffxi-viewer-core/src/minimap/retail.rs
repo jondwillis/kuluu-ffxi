@@ -103,6 +103,13 @@ pub fn auto_load_retail_for_zone_system(
     if state.retail_image.is_some() && state.zone_id == Some(zone_id) {
         return;
     }
+    // Negative cache: a previous load attempt for this zone failed
+    // (no Graphic chunks, IO error, unresolved file_id). Skip so we
+    // don't spam warnings every frame. Cleared on zone change via
+    // top-down backend's MinimapState reset, and on logout.
+    if state.retail_failed_zones.contains(&zone_id) {
+        return;
+    }
     let Some(file_id) = map_dat_for_zone(zone_id) else {
         return;
     };
@@ -140,17 +147,15 @@ pub fn process_load_retail_map_requests(
                     "minimap/retail: zone {} file_id {} unresolved: {}",
                     req.zone_id, req.file_id, e
                 );
+                state.retail_failed_zones.insert(req.zone_id);
                 continue;
             }
         };
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
-                warn!(
-                    "minimap/retail: failed to read {}: {}",
-                    path.display(),
-                    e
-                );
+                warn!("minimap/retail: failed to read {}: {}", path.display(), e);
+                state.retail_failed_zones.insert(req.zone_id);
                 continue;
             }
         };
@@ -163,6 +168,7 @@ pub fn process_load_retail_map_requests(
                 "minimap/retail: zone {} file {} parsed cleanly but contained no Graphic chunks",
                 req.zone_id, req.file_id
             );
+            state.retail_failed_zones.insert(req.zone_id);
             continue;
         };
 
@@ -182,12 +188,7 @@ pub fn process_load_retail_map_requests(
 
         info!(
             "minimap/retail: loaded zone {} file {} ({}×{}, category=\"{}\" id=\"{}\")",
-            req.zone_id,
-            req.file_id,
-            graphic.width,
-            graphic.height,
-            graphic.category,
-            graphic.id,
+            req.zone_id, req.file_id, graphic.width, graphic.height, graphic.category, graphic.id,
         );
 
         state.retail_image = Some(handle);

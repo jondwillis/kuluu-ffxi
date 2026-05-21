@@ -40,17 +40,18 @@ struct FileReport {
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let summary_mode = args.iter().position(|a| a == "--summary").map(|i| {
-        args.remove(i);
-        true
-    }).unwrap_or(false);
-    let filter = args
+    let summary_mode = args
         .iter()
-        .position(|a| a == "--filter")
-        .and_then(|i| {
+        .position(|a| a == "--summary")
+        .map(|i| {
             args.remove(i);
-            (i < args.len()).then(|| args.remove(i))
-        });
+            true
+        })
+        .unwrap_or(false);
+    let filter = args.iter().position(|a| a == "--filter").and_then(|i| {
+        args.remove(i);
+        (i < args.len()).then(|| args.remove(i))
+    });
 
     if args.is_empty() {
         eprintln!("usage: dat-scan-sounds <file_or_dir> [--summary] [--filter <chunk_name>]");
@@ -214,7 +215,9 @@ fn main() -> ExitCode {
 }
 
 fn collect_dats(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let p = entry.path();
         if p.is_dir() {

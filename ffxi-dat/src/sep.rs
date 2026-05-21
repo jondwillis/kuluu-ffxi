@@ -78,7 +78,10 @@ mod tests {
         let s = Sep::parse(*b"snd0", &body).unwrap();
         assert_eq!(s.se_id, 12345);
         assert_eq!(s.name, *b"snd0");
-        assert_eq!(s.relative_path(), ("se012".to_string(), "se012345.spw".to_string()));
+        assert_eq!(
+            s.relative_path(),
+            ("se012".to_string(), "se012345.spw".to_string())
+        );
     }
 
     #[test]
@@ -99,6 +102,9 @@ mod tests {
         let mut body = vec![0u8; 12];
         body[8..12].copy_from_slice(&0u32.to_le_bytes());
         let s = Sep::parse(*b"zero", &body).unwrap();
-        assert_eq!(s.relative_path(), ("se000".to_string(), "se000000.spw".to_string()));
+        assert_eq!(
+            s.relative_path(),
+            ("se000".to_string(), "se000000.spw".to_string())
+        );
     }
 }

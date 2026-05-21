@@ -23,11 +23,11 @@ pub mod camera;
 pub mod components;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_mmb;
-pub mod graphics_settings;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_mzb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_vos2;
+pub mod graphics_settings;
 pub mod hud;
 pub mod input_mode;
 pub mod keybinds;
@@ -70,8 +70,8 @@ pub use mouse::{CursorLockRequest, MousePlugin, MousePointer};
 pub use picking::{click_to_target_system, resolve_click_target, ClickResolution, PickingPlugin};
 pub use scene::{
     feet_offset, ffxi_to_bevy, process_entity_look_changes, setup_world, sync_aggro_system,
-    sync_entities_system, sync_entity_looks_system, Aggroing, EntityMaterials, EntityMesh,
-    Target, TrackedEntities,
+    sync_entities_system, sync_entity_looks_system, Aggroing, EntityMaterials, EntityMesh, Target,
+    TrackedEntities,
 };
 pub use snapshot::{apply_delta, ingest_system, EventLog, SceneState, CHAT_HISTORY_CAP};
 pub use source::SceneSource;

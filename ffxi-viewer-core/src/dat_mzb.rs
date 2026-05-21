@@ -97,12 +97,12 @@ const MZB_MATERIAL_PALETTE: [[f32; 3]; 16] = [
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneGeomMode {
     /// Hide all MZB geometry. Operator opt-out for clean MMB-only view.
+    #[default]
     Off,
     /// Show only LoS-blocking (collision) meshes — flag bit 0 == 0.
     Collision,
     /// Show both collision and non-collision (decorative) meshes.
     /// Default — the full visible-geometry layer.
-    #[default]
     All,
 }
 
@@ -260,7 +260,10 @@ impl MzbCollisionGeometry {
         // that fills `positions/indices` now also fills `cell_index`,
         // but we don't want a partial-load to crash the raycast).
         if !self.cell_index.is_empty() {
-            let cell = ((xz.x / MZB_GRID_CELL).floor() as i32, (xz.y / MZB_GRID_CELL).floor() as i32);
+            let cell = (
+                (xz.x / MZB_GRID_CELL).floor() as i32,
+                (xz.y / MZB_GRID_CELL).floor() as i32,
+            );
             if let Some(tri_ids) = self.cell_index.get(&cell) {
                 for &tri_id in tri_ids {
                     self.visit_tri(orig, dir, tri_id as usize, &mut visit);
@@ -295,8 +298,7 @@ fn build_cell_index(
     positions: &[Vec3],
     indices: &[u32],
 ) -> std::collections::HashMap<(i32, i32), Vec<u32>> {
-    let mut idx: std::collections::HashMap<(i32, i32), Vec<u32>> =
-        std::collections::HashMap::new();
+    let mut idx: std::collections::HashMap<(i32, i32), Vec<u32>> = std::collections::HashMap::new();
     for (tri_id, tri) in indices.chunks_exact(3).enumerate() {
         let v0 = positions[tri[0] as usize];
         let v1 = positions[tri[1] as usize];
@@ -798,11 +800,7 @@ pub fn build_zone_mmb_spawns(
         let mut bucket1: u32 = 0;
         let mut bucket_many: Vec<(String, usize)> = Vec::new();
         for p in &placements {
-            let id = p
-                .id_str()
-                .trim_end_matches('\0')
-                .trim_end()
-                .to_string();
+            let id = p.id_str().trim_end_matches('\0').trim_end().to_string();
             *placement_id_counts.entry(id.clone()).or_insert(0) += 1;
             let matches = mzb::resolve_mmb_indices(&id, &zone_prefix, &mmb_names);
             match matches.len() {
@@ -1237,10 +1235,8 @@ pub fn process_load_mzb_requests(
         // for every entity in the zone, so the prior O(tris) linear
         // scan tanked FPS in populated outdoor zones — see the
         // historical comment in `snap_entities_to_navmesh_system`.
-        collision_geometry.cell_index = build_cell_index(
-            &collision_geometry.positions,
-            &collision_geometry.indices,
-        );
+        collision_geometry.cell_index =
+            build_cell_index(&collision_geometry.positions, &collision_geometry.indices);
 
         spawn_merged(
             &mut commands,
@@ -1349,8 +1345,7 @@ pub fn process_load_mzb_requests(
                     [cx - hx, h, cz + hz],
                 ];
                 let normals: Vec<[f32; 3]> = vec![[0.0, 1.0, 0.0]; 4];
-                let uvs: Vec<[f32; 2]> =
-                    vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                let uvs: Vec<[f32; 2]> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
                 let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
                 mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
                 mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);

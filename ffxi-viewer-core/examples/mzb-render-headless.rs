@@ -191,14 +191,10 @@ fn parse_args() -> RenderParams {
     p
 }
 
-fn setup_camera(
-    mut commands: Commands,
-    params: Res<RenderParams>,
-    mut draw: ResMut<DrawDistance>,
-) {
+fn setup_camera(mut commands: Commands, params: Res<RenderParams>, mut draw: ResMut<DrawDistance>) {
     // Empirical workflow wants every visible surface, both collision
     // and decoration, so we override the production default (`Off`).
-    draw.zone_geom_mode = ZoneGeomMode::Off;
+    draw.zone_geom_mode = ZoneGeomMode::All;
     // Bump the cull distance well past any plausible zone extent so
     // distance culling doesn't hide the surfaces we're trying to capture.
     draw.world = 10_000.0;
@@ -234,9 +230,7 @@ fn fire_load_request(mut tx: MessageWriter<LoadMzbRequest>, params: Res<RenderPa
             fid
         }
         None => {
-            eprintln!(
-                "  zone_id {zone_or_file_id} has no MZB mapping; using as file_id directly"
-            );
+            eprintln!("  zone_id {zone_or_file_id} has no MZB mapping; using as file_id directly");
             zone_or_file_id
         }
     };

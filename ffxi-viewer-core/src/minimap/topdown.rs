@@ -34,11 +34,9 @@
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::ScalingMode;
-use bevy::prelude::*;
 use bevy::camera::{ClearColorConfig, RenderTarget};
-use bevy::render::render_resource::{
-    Extent3d, TextureDimension, TextureFormat, TextureUsages,
-};
+use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 
 use crate::components::InGameEntity;
 use crate::dat_mzb::MzbCollisionGeometry;
@@ -61,7 +59,9 @@ pub struct TopdownCullPolicy {
 
 impl Default for TopdownCullPolicy {
     fn default() -> Self {
-        Self { top_cull_yalms: 6.0 }
+        Self {
+            top_cull_yalms: 6.0,
+        }
     }
 }
 
@@ -256,10 +256,8 @@ pub fn spawn_bake_camera(
             // image — we pick Bevy `-Z` (FFXI +y, "north") so the
             // resulting texture has north at the top, matching the
             // overlay's UV convention (V increases southward).
-            Transform::from_xyz(center_x, ceiling_y, center_z).looking_at(
-                Vec3::new(center_x, ceiling_y - 1.0, center_z),
-                Vec3::NEG_Z,
-            ),
+            Transform::from_xyz(center_x, ceiling_y, center_z)
+                .looking_at(Vec3::new(center_x, ceiling_y - 1.0, center_z), Vec3::NEG_Z),
         ))
         .id();
 
@@ -279,10 +277,7 @@ pub fn spawn_bake_camera(
 /// Update → Render cycle (see the [`BakeStage`] docs for why the
 /// chained spawn+despawn-same-frame path would otherwise destroy
 /// the entity before any render pass ran).
-pub fn despawn_bake_camera(
-    mut stage: ResMut<BakeStage>,
-    mut commands: Commands,
-) {
+pub fn despawn_bake_camera(mut stage: ResMut<BakeStage>, mut commands: Commands) {
     let BakeStage::Awaiting {
         entity,
         frames_remaining,
@@ -358,9 +353,8 @@ fn create_render_target_image(images: &mut Assets<Image>) -> Handle<Image> {
     // RENDER_ATTACHMENT is what makes the texture a valid render target;
     // TEXTURE_BINDING is what lets the UI sample it; COPY_DST is the
     // standard companion that Bevy's image plumbing assumes.
-    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
-        | TextureUsages::COPY_DST
-        | TextureUsages::RENDER_ATTACHMENT;
+    image.texture_descriptor.usage =
+        TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
     images.add(image)
 }
 

@@ -180,7 +180,12 @@ pub fn parse_mo2(body: &[u8], chunk_name: &[u8; 4]) -> Result<Mo2Animation> {
         if o + 4 > body.len() {
             return None;
         }
-        Some(f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]))
+        Some(f32::from_le_bytes([
+            body[o],
+            body[o + 1],
+            body[o + 2],
+            body[o + 3],
+        ]))
     };
 
     let mut per_bone: std::collections::BTreeMap<u32, Vec<Mo2Frame>> =
@@ -198,9 +203,12 @@ pub fn parse_mo2(body: &[u8], chunk_name: &[u8; 4]) -> Result<Mo2Animation> {
         if off + ELEMENT_BYTES > body.len() {
             break;
         }
-        let read_u32 = |o: usize| u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
-        let read_i32 = |o: usize| i32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
-        let read_f = |o: usize| f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+        let read_u32 =
+            |o: usize| u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+        let read_i32 =
+            |o: usize| i32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+        let read_f =
+            |o: usize| f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
 
         let bone = read_u32(off);
         let q_idx = [
@@ -215,22 +223,18 @@ pub fn parse_mo2(body: &[u8], chunk_name: &[u8; 4]) -> Result<Mo2Animation> {
             read_f(off + 28),
             read_f(off + 32),
         ];
-        let t_idx = [
-            read_i32(off + 36),
-            read_i32(off + 40),
-            read_i32(off + 44),
-        ];
+        let t_idx = [read_i32(off + 36), read_i32(off + 40), read_i32(off + 44)];
         let t_base = [read_f(off + 48), read_f(off + 52), read_f(off + 56)];
-        let s_idx = [
-            read_i32(off + 60),
-            read_i32(off + 64),
-            read_i32(off + 68),
-        ];
+        let s_idx = [read_i32(off + 60), read_i32(off + 64), read_i32(off + 68)];
         let s_base = [read_f(off + 72), read_f(off + 76), read_f(off + 80)];
 
         // lotus: if ANY component index is negative, this element is
         // entirely identity (bone stays at its bind pose).
-        let any_negative = q_idx.iter().chain(t_idx.iter()).chain(s_idx.iter()).any(|&i| i < 0);
+        let any_negative = q_idx
+            .iter()
+            .chain(t_idx.iter())
+            .chain(s_idx.iter())
+            .any(|&i| i < 0);
         let mut frames = Vec::with_capacity(header_frames as usize);
         for f in 0..header_frames {
             if any_negative {

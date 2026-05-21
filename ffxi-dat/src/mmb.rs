@@ -405,7 +405,11 @@ impl<'a> MmbSubRecord<'a> {
             if i1 == i2 || i2 == i3 {
                 continue;
             }
-            let tri = if i % 2 == 1 { [i2, i1, i3] } else { [i1, i2, i3] };
+            let tri = if i % 2 == 1 {
+                [i2, i1, i3]
+            } else {
+                [i1, i2, i3]
+            };
             out.push(tri);
         }
         out
@@ -716,7 +720,8 @@ pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
                     .collect();
                 s.trim_end().to_string()
             };
-            let vertexsize = u16::from_le_bytes([decrypted[off + 16], decrypted[off + 17]]) as usize;
+            let vertexsize =
+                u16::from_le_bytes([decrypted[off + 16], decrypted[off + 17]]) as usize;
             let blending = u16::from_le_bytes([decrypted[off + 18], decrypted[off + 19]]);
             off += 20;
 
@@ -1007,7 +1012,11 @@ mod tests {
         buf.extend_from_slice(&0x8000u16.to_le_bytes()); // blending = transparent
         buf.extend(std::iter::repeat_n(0xFFu8, 64));
         let recs = MmbSubRecord::find_all(&buf);
-        assert_eq!(recs.len(), 1, "non-zero blending must not reject the record");
+        assert_eq!(
+            recs.len(),
+            1,
+            "non-zero blending must not reject the record"
+        );
         assert_eq!(recs[0].count, 42);
         assert_eq!(recs[0].blending, 0x8000);
     }

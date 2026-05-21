@@ -175,7 +175,7 @@ mod tests {
         let mut cmd = vec![0u8; 36];
         cmd[0] = 0x01;
         cmd[1] = 0x09; // data_size_nibble
-        // Payload starts at cmd[4]; id at +8..+12, effect_type at +29
+                       // Payload starts at cmd[4]; id at +8..+12, effect_type at +29
         cmd[4 + 8..4 + 12].copy_from_slice(b"snd0");
         cmd[4 + 29] = 0x3D;
         body.extend_from_slice(&cmd);
