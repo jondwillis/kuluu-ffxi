@@ -365,11 +365,25 @@ pub fn sync_entities_system(
                     // integration — extra smoothing here only adds input
                     // lag. Other entities arrive at server tick rate, so
                     // visual smoothing fills the gaps.
-                    t.translation = if is_self {
-                        world_pos
+                    //
+                    // **Y is owned by `snap_entities_to_navmesh_system`**:
+                    // we write only X/Z here and preserve whatever Y the
+                    // snap last set. The wire's reported height is
+                    // unreliable for both self (server pings the player at
+                    // their last-known altitude, not the terrain the
+                    // client renders) and other entities (static NPC
+                    // records often carry the spawn-point Y, not the
+                    // ground at the renderer's MZB sample). Writing
+                    // `world_pos.y` here would override the snap on every
+                    // wire tick, leaving the player at server-spawn Y
+                    // rather than on the rendered floor.
+                    let new_translation = if is_self {
+                        Vec3::new(world_pos.x, t.translation.y, world_pos.z)
                     } else {
-                        apply_visual_smoothing(t.translation, world_pos)
+                        let smoothed = apply_visual_smoothing(t.translation, world_pos);
+                        Vec3::new(smoothed.x, t.translation.y, smoothed.z)
                     };
+                    t.translation = new_translation;
                     t.rotation = heading_to_quat(wire.heading);
                 }
                 if let Ok(mut m) = q_mat.get_mut(existing) {
