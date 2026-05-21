@@ -258,6 +258,19 @@ fn decode_paletted_bitmap(
              (24bpp / 32bpp packed bitmaps land when first encountered)",
         )));
     }
+    // `scan_graphics` walks the DAT byte-by-byte, so we'll routinely
+    // see random offsets that pass the BITMAPINFO sanity check by
+    // chance. `used_colors == 0` is the tell — POLUtils' Graphic.Read
+    // takes the count literally (it doesn't honor the BMP-standard
+    // "0 means 2^bit_count" convention), so real FFXI graphics never
+    // ship `used_colors == 0`. Refuse here so the scanner's
+    // advance-by-one fallback kicks in instead of panicking on an
+    // empty palette slice below.
+    if used_colors == 0 || used_colors > 256 {
+        return Err(DatError::Mmb(format!(
+            "paletted bitmap: implausible used_colors={used_colors} for 8bpp (expected 1..=256)"
+        )));
+    }
     let palette_len = (used_colors as usize) * 4;
     if bytes.len() < palette_len {
         return Err(DatError::Mmb(format!(
@@ -279,12 +292,22 @@ fn decode_paletted_bitmap(
     let pixels = &bytes[palette_len..palette_len + pixel_data_len];
 
     let mut rgba = vec![0u8; (width * height * 4) as usize];
+    let palette_entries = used_colors as usize;
     for y in 0..height as usize {
         // BMP rows are bottom-up unless height was negative (top_down).
         let src_y = if top_down { y } else { height as usize - 1 - y };
         let src_row = &pixels[src_y * row_stride..src_y * row_stride + width as usize];
         for x in 0..width as usize {
             let idx = src_row[x] as usize;
+            if idx >= palette_entries {
+                // Same scanner-resilience rationale as the
+                // `used_colors == 0` check above: an indexed byte
+                // pointing past the palette is a strong signal we're
+                // decoding a false-positive header, not a real chunk.
+                return Err(DatError::Mmb(format!(
+                    "paletted bitmap: pixel index {idx} out of palette range (used_colors={used_colors})"
+                )));
+            }
             let pal_off = idx * 4;
             // BGRA on disk → RGBA in output. Alpha is 0 for flag
             // 0x91 (interpret as opaque); use the byte directly for
@@ -393,6 +416,40 @@ mod tests {
     #[test]
     fn map_dat_for_unknown_zone_returns_none() {
         assert_eq!(map_dat_for_zone(9999), None);
+    }
+
+    /// `scan_graphics` must not panic when a random offset in the DAT
+    /// happens to satisfy every BITMAPINFO sanity check by chance but
+    /// has `used_colors == 0`. Prior to the guard in
+    /// [`decode_paletted_bitmap`], this triggered an index-out-of-bounds
+    /// against an empty palette slice and crashed the Bevy Main schedule
+    /// on zone-in. The scanner-resilience contract requires `Err`, not
+    /// panic, so the advance-by-one fallback can keep walking.
+    #[test]
+    fn parse_graphic_errors_cleanly_on_zero_used_colors() {
+        let mut bytes = vec![0x91u8];
+        bytes.extend_from_slice(b"cat\0\0\0\0\0");
+        bytes.extend_from_slice(b"img1\0\0\0\0");
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&2i32.to_le_bytes()); // width
+        bytes.extend_from_slice(&2i32.to_le_bytes()); // height
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // planes
+        bytes.extend_from_slice(&8u16.to_le_bytes()); // bit_count
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // compression
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // image_size
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // x_pels
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // y_pels
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // used_colors = 0 (the trigger)
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // important_colors
+        // Pad out with enough trailing bytes that the header passes
+        // the "bytes.len() >= 61" gate and we reach the panic site
+        // pre-fix.
+        bytes.extend_from_slice(&[0u8; 32]);
+        assert!(parse_graphic(&bytes).is_err());
+        // And the scanner must drain to completion without panicking
+        // — proves the Err is routed into the advance-by-one path.
+        let v: Vec<_> = scan_graphics(&bytes).collect();
+        assert!(v.is_empty());
     }
 
     /// Synthetic 2×2 paletted bitmap with a top-down row order
