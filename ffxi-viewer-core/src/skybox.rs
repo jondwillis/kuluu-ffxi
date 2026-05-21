@@ -33,10 +33,13 @@ use bevy::shader::ShaderRef;
 use crate::components::InGameEntity;
 use crate::weather::ZoneWeather;
 
-/// Radius of the inverted skybox sphere. Large enough that the sphere
-/// engulfs the camera + visible terrain without clipping into the
-/// far plane (`spawn_camera` overrides `far` to 6000 elsewhere).
-const SKYBOX_RADIUS: f32 = 1500.0;
+/// Radius of the inverted skybox sphere. Must be larger than the
+/// sun/moon discs (which orbit at `sun_moon::SKY_RADIUS = 4000`) so
+/// the celestial discs sit *inside* the sphere and win the depth
+/// test against the sky surface — otherwise the opaque sky fragments
+/// occlude the sun and moon. Stays under the camera's far-clip
+/// override of `6000` set in `spawn_camera`.
+const SKYBOX_RADIUS: f32 = 5500.0;
 
 /// 8 colors + 8 altitudes that drive the gradient, packed into a
 /// single uniform block.
@@ -155,32 +158,60 @@ fn update_skybox(
     // Re-center on the camera but keep the flipping scale.
     sky_xf.translation = cam_pos;
 
-    // Drive material from the current weather keyframe. The lerp
-    // logic — sampling at the current Vana minute and blending two
-    // bracketing records — already lives in `ZoneWeather` /
-    // `sample_weather`. We reuse the same access pattern as
-    // `apply_zone_weather` in `weather.rs`.
+    // Drive material from the current weather keyframe. We sub-V-minute
+    // interpolate so colors animate smoothly between integer V-minute
+    // ticks. `sample_weather` only accepts `u32 time_minutes`, which
+    // quantizes to ~0.42 s real-time steps (1 V-min = 25/60 real-sec).
+    // For 8 simultaneously visible colors that step is conspicuous.
+    // Sampling at floor + ceil and lerping by the fractional V-minute
+    // composes to the same straight-line lerp that `lerp_records`
+    // produces internally, with f32 precision instead of u32.
     if zone_weather.records.is_empty() {
         return;
     }
     let sky = crate::sun_moon::vana_sky_now();
-    let time_minutes = (sky.hour * 60.0).rem_euclid(1440.0) as u32;
-    let Some(rec) = ffxi_dat::weather::sample_weather(&zone_weather.records, time_minutes) else {
+    let v_minutes = (sky.hour * 60.0).rem_euclid(1440.0);
+    let m0 = v_minutes.floor() as u32 % 1440;
+    let m1 = (m0 + 1) % 1440;
+    let frac = v_minutes - v_minutes.floor();
+    let Some(r0) = ffxi_dat::weather::sample_weather(&zone_weather.records, m0) else {
+        return;
+    };
+    let Some(r1) = ffxi_dat::weather::sample_weather(&zone_weather.records, m1) else {
         return;
     };
     let Some(mat) = mats.get_mut(&sky_mat.0) else {
         return;
     };
-    // Convert WeatherRecord's [[f32; 4]; 8] into [Vec4; 8].
+    let lerp = |a: f32, b: f32| a + (b - a) * frac;
+    // Convert WeatherRecord's [[f32; 4]; 8] into [Vec4; 8], blending
+    // r0 → r1 by the sub-V-minute fraction.
     for i in 0..8 {
-        let c = rec.skybox_colors[i];
-        mat.data.colors[i] = Vec4::new(c[0], c[1], c[2], c[3]);
+        let c0 = r0.skybox_colors[i];
+        let c1 = r1.skybox_colors[i];
+        mat.data.colors[i] = Vec4::new(
+            lerp(c0[0], c1[0]),
+            lerp(c0[1], c1[1]),
+            lerp(c0[2], c1[2]),
+            lerp(c0[3], c1[3]),
+        );
     }
-    // Pack 8 altitudes into 2 vec4s.
-    let a = rec.skybox_altitudes;
+    // Pack 8 altitudes into 2 vec4s, also sub-V-minute lerped.
+    let a0 = r0.skybox_altitudes;
+    let a1 = r1.skybox_altitudes;
     mat.data.altitudes_packed = [
-        Vec4::new(a[0], a[1], a[2], a[3]),
-        Vec4::new(a[4], a[5], a[6], a[7]),
+        Vec4::new(
+            lerp(a0[0], a1[0]),
+            lerp(a0[1], a1[1]),
+            lerp(a0[2], a1[2]),
+            lerp(a0[3], a1[3]),
+        ),
+        Vec4::new(
+            lerp(a0[4], a1[4]),
+            lerp(a0[5], a1[5]),
+            lerp(a0[6], a1[6]),
+            lerp(a0[7], a1[7]),
+        ),
     ];
 }
 
