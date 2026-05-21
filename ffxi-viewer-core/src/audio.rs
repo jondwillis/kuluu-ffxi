@@ -646,11 +646,16 @@ pub fn play_sfx_system(
 }
 
 /// Hardcoded system-SFX mapping. Each entry is a `ViewerEvent`
-/// shape or a local UI event + a placeholder SE id; the ids are
-/// best-guesses pulled from the DAT scan of `ROM/0/58.DAT` and
-/// verified to exist on disk. Use [`SystemSfxTable::bind`] from the
-/// `/sfx_bind` slash command to rebind any entry at runtime once
-/// you've identified the canonical id via `/sfx N`.
+/// shape or a local UI event + an SE id. Ids are sourced from the
+/// DAT scan of `ROM/0/58.DAT` and the open-source FFXI catalogs in
+/// `vendor/` (AltanaViewer's CSVs, LSB script references); when no
+/// cited source exists yet the field is `None` and the event stays
+/// silent rather than playing a guess.
+///
+/// Read-only: edit the source defaults rather than mutating at
+/// runtime. The earlier `/sfx_bind` rebind affordance was scaffolding
+/// for unfounded defaults — removing it forces every value to come
+/// from a citable source or stay silent.
 #[derive(Resource, Debug, Clone)]
 pub struct SystemSfxTable {
     /// `ViewerEvent::ZoneChanged` → zone-line confirm chime.
@@ -666,8 +671,9 @@ pub struct SystemSfxTable {
     pub engage_self: Option<u32>,
     /// Per-swing combat blip — fires on every growth of the Battle
     /// chat-line count. Each hit/miss/proc/reaction produces one
-    /// audible tick so combat has rhythm. Set `None` (or rebind to
-    /// 0) to silence if it gets noisy at fast-attack tempo.
+    /// audible tick so combat has rhythm. Default `None` until a
+    /// short hit-or-miss clip is sourced — until then the engaged
+    /// badge pulse carries the rhythm visually.
     pub swing_tick: Option<u32>,
     /// `ViewerEvent::TellReceived` → tell-ding.
     pub tell_received: Option<u32>,
@@ -700,123 +706,36 @@ pub struct SystemSfxTable {
 
 impl Default for SystemSfxTable {
     fn default() -> Self {
-        // Conservative defaults — every id below has a corresponding
-        // .spw file on disk in our reference install. The mapping
-        // (which sound for which event) is the user's to refine; rebind
-        // via `/sfx_bind <name> <id>` after listening to candidates
-        // through `/sfx <id>`. These are placeholders, not verified
-        // retail sounds.
+        // Every value here needs a citable source — either a DAT-scan
+        // observation tied to retail behavior, or a known reference in
+        // an open-source vendor catalog. Unsourced placeholders should
+        // stay `None` so silence is the default rather than a guess.
+        //
+        // Today none of the SE→event mappings have been verified — the
+        // earlier defaults were guesses propped up by `/sfx_bind` for
+        // runtime correction. With `/sfx_bind` removed we'd rather
+        // ship silence than wrong sound. The companion task (build a
+        // sourced catalog in `ffxi-audio/sfx_catalog.csv` from vendor/
+        // references) populates real defaults; until then each event
+        // stays muted.
         Self {
-            zone_changed: Some(1097),
-            low_hp: Some(1077),
-            engaged_by: Some(1064),
-            // Distinct from engaged_by — pick a different bank-1
-            // candidate so the "we engaged" cue doesn't sound
-            // identical to "we got aggroed." Both are placeholders
-            // until the user listens through /sfx <id> and rebinds.
-            engage_self: Some(1062),
-            // Bank-1 candidate; combat swings happen at ~3s tempo at
-            // base, so this needs to be a SHORT clip — a longer one
-            // would overlap into the next swing. Rebind via
-            // /sfx_bind swing_tick <id> if too noisy.
-            swing_tick: Some(1060),
-            tell_received: Some(1053),
-            // Gameplay placeholders — FFXI retail level-up is in the
-            // 188xxx range historically; without a verified table we
-            // pick high-bank ids that exist on disk in the reference
-            // install.
-            level_up: Some(188000),
-            skill_level_up: Some(188002),
-            // UI placeholders — common menu blips in retail are
-            // bank 0 ids. These are guesses; rebind via /sfx_bind.
-            ui_chat_open: Some(1),
-            ui_chat_send: Some(2),
-            ui_chat_cancel: Some(3),
-            ui_menu_open: Some(1),
-            ui_menu_move: Some(4),
-            ui_menu_confirm: Some(2),
-            ui_menu_cancel: Some(3),
-            ui_command_ok: Some(2),
-            ui_command_err: Some(5),
-        }
-    }
-}
-
-/// String-keyed accessor used by the `/sfx_bind` slash command. Keep
-/// the key set in sync with the field names above so users have a
-/// stable, discoverable vocabulary.
-impl SystemSfxTable {
-    pub const SLOT_NAMES: &'static [&'static str] = &[
-        "zone_changed",
-        "low_hp",
-        "engaged_by",
-        "engage_self",
-        "swing_tick",
-        "tell_received",
-        "level_up",
-        "skill_level_up",
-        "ui_chat_open",
-        "ui_chat_send",
-        "ui_chat_cancel",
-        "ui_menu_open",
-        "ui_menu_move",
-        "ui_menu_confirm",
-        "ui_menu_cancel",
-        "ui_command_ok",
-        "ui_command_err",
-    ];
-
-    /// Update one slot by name. Pass `id = 0` to mute (sets `None`).
-    /// Returns `false` for an unknown slot name; caller should report
-    /// `SLOT_NAMES` to the user in that case.
-    pub fn bind(&mut self, slot: &str, id: u32) -> bool {
-        let v = if id == 0 { None } else { Some(id) };
-        match slot {
-            "zone_changed" => self.zone_changed = v,
-            "low_hp" => self.low_hp = v,
-            "engaged_by" => self.engaged_by = v,
-            "engage_self" => self.engage_self = v,
-            "swing_tick" => self.swing_tick = v,
-            "tell_received" => self.tell_received = v,
-            "level_up" => self.level_up = v,
-            "skill_level_up" => self.skill_level_up = v,
-            "ui_chat_open" => self.ui_chat_open = v,
-            "ui_chat_send" => self.ui_chat_send = v,
-            "ui_chat_cancel" => self.ui_chat_cancel = v,
-            "ui_menu_open" => self.ui_menu_open = v,
-            "ui_menu_move" => self.ui_menu_move = v,
-            "ui_menu_confirm" => self.ui_menu_confirm = v,
-            "ui_menu_cancel" => self.ui_menu_cancel = v,
-            "ui_command_ok" => self.ui_command_ok = v,
-            "ui_command_err" => self.ui_command_err = v,
-            _ => return false,
-        }
-        true
-    }
-
-    /// Mirror of [`bind`] used by `text_input_system` and other UI
-    /// code that wants to fire a named sfx without coupling to the
-    /// field set. Returns `None` if the slot is unmapped or unknown.
-    pub fn get(&self, slot: &str) -> Option<u32> {
-        match slot {
-            "zone_changed" => self.zone_changed,
-            "low_hp" => self.low_hp,
-            "engaged_by" => self.engaged_by,
-            "engage_self" => self.engage_self,
-            "swing_tick" => self.swing_tick,
-            "tell_received" => self.tell_received,
-            "level_up" => self.level_up,
-            "skill_level_up" => self.skill_level_up,
-            "ui_chat_open" => self.ui_chat_open,
-            "ui_chat_send" => self.ui_chat_send,
-            "ui_chat_cancel" => self.ui_chat_cancel,
-            "ui_menu_open" => self.ui_menu_open,
-            "ui_menu_move" => self.ui_menu_move,
-            "ui_menu_confirm" => self.ui_menu_confirm,
-            "ui_menu_cancel" => self.ui_menu_cancel,
-            "ui_command_ok" => self.ui_command_ok,
-            "ui_command_err" => self.ui_command_err,
-            _ => None,
+            zone_changed: None,
+            low_hp: None,
+            engaged_by: None,
+            engage_self: None,
+            swing_tick: None,
+            tell_received: None,
+            level_up: None,
+            skill_level_up: None,
+            ui_chat_open: None,
+            ui_chat_send: None,
+            ui_chat_cancel: None,
+            ui_menu_open: None,
+            ui_menu_move: None,
+            ui_menu_confirm: None,
+            ui_menu_cancel: None,
+            ui_command_ok: None,
+            ui_command_err: None,
         }
     }
 }
@@ -1425,14 +1344,23 @@ mod tests {
 
     #[test]
     fn system_sfx_fires_only_for_mapped_events() {
-        // Build a fresh event log with a mix of mapped and unmapped
-        // events and verify the bridge fires SfxEvents only for the
-        // ones in `SystemSfxTable`. Uses a minimal Bevy App so the
-        // MessageWriter/Reader plumbing matches production.
+        // Verify the dispatch logic in `fire_system_sfx_events`: events
+        // with a `Some` slot in `SystemSfxTable` fire an `SfxEvent`,
+        // others stay silent. Inject explicit fixture values rather
+        // than relying on production defaults — those defaults are
+        // currently all `None` (pending the sourced sfx catalog work)
+        // and the test is about dispatch behavior, not which slots
+        // happen to be populated.
         let mut app = App::new();
+        let mut table = SystemSfxTable::default();
+        table.zone_changed = Some(7001);
+        table.low_hp = Some(7002);
+        table.engaged_by = Some(7003);
+        // tell_received stays None — Reconnected stays None too —
+        // both should be silent below.
         app.add_message::<SfxEvent>()
             .init_resource::<EventLog>()
-            .init_resource::<SystemSfxTable>()
+            .insert_resource(table)
             .init_resource::<SystemSfxCursor>()
             .add_systems(Update, fire_system_sfx_events);
 
@@ -1455,10 +1383,31 @@ mod tests {
         for ev in reader.read() {
             sfx_messages.push(ev.se_id);
         }
-        assert_eq!(sfx_messages.len(), 3, "expected 3 mapped events");
-        assert_eq!(sfx_messages[0], 1097); // ZoneChanged
-        assert_eq!(sfx_messages[1], 1077); // LowHp
-        assert_eq!(sfx_messages[2], 1064); // EngagedBy
+        assert_eq!(
+            sfx_messages.len(),
+            3,
+            "expected 3 mapped events; Reconnected is unmapped and should stay silent"
+        );
+        assert_eq!(sfx_messages[0], 7001); // ZoneChanged
+        assert_eq!(sfx_messages[1], 7002); // LowHp
+        assert_eq!(sfx_messages[2], 7003); // EngagedBy
+    }
+
+    #[test]
+    fn system_sfx_default_table_is_all_silent() {
+        // Pin the all-None default: removing `/sfx_bind` made the
+        // production default `None` for every slot, since unsourced
+        // guesses are worse than silence. A future sourced catalog
+        // will fill these in; until then this test guards against
+        // accidental re-introduction of unfounded defaults.
+        let table = SystemSfxTable::default();
+        assert!(table.zone_changed.is_none());
+        assert!(table.low_hp.is_none());
+        assert!(table.engaged_by.is_none());
+        assert!(table.engage_self.is_none());
+        assert!(table.swing_tick.is_none());
+        assert!(table.level_up.is_none());
+        assert!(table.skill_level_up.is_none());
     }
 
     /// End-to-end pipeline test, gated on `FFXI_DAT_PATH` because the
