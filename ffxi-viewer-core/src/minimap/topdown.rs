@@ -66,6 +66,17 @@ impl Default for TopdownCullPolicy {
 }
 
 /// Lifecycle state for the bake. See module docs for the transitions.
+///
+/// `Awaiting { frames_remaining }` is a frame counter, not a flag:
+/// `spawn_bake_camera` and `despawn_bake_camera` both fire during the
+/// same `Update` schedule. Bevy flushes commands between chained
+/// systems, so a despawn queued right after a spawn would destroy the
+/// entity *before* the Render schedule ever runs — the camera would
+/// never get a frame to render into the texture.
+///
+/// To make sure the bake actually renders, the despawn waits for
+/// `frames_remaining` to count down to zero, giving the entity at
+/// least one full Update → Render cycle.
 #[derive(Resource, Debug, Default)]
 pub enum BakeStage {
     #[default]
@@ -73,10 +84,18 @@ pub enum BakeStage {
     /// Zone-change or cull-policy-change detected; spawn the bake
     /// camera on the next [`spawn_bake_camera`] tick.
     Requested,
-    /// Bake camera spawned; wait one frame for the render graph to
-    /// commit, then despawn.
-    Awaiting(Entity),
+    /// Bake camera spawned; wait `frames_remaining` ticks for the
+    /// render graph to commit, then despawn.
+    Awaiting {
+        entity: Entity,
+        frames_remaining: u8,
+    },
 }
+
+/// How many frames to keep the bake camera alive after spawn before
+/// despawning it. Minimum 1 so the camera survives the
+/// Update→PostUpdate→Render path of the same frame.
+const BAKE_FRAMES_TO_HOLD: u8 = 1;
 
 /// Marker on the secondary orthographic camera used for the bake. Lets
 /// [`despawn_bake_camera`] find and clean up the entity without
@@ -248,24 +267,36 @@ pub fn spawn_bake_camera(
     state.topdown_image = Some(render_target);
     state.aabb = Some(aabb);
 
-    *stage = BakeStage::Awaiting(camera_entity);
+    *stage = BakeStage::Awaiting {
+        entity: camera_entity,
+        frames_remaining: BAKE_FRAMES_TO_HOLD,
+    };
 }
 
-/// Stage 3 of the bake loop: one frame after `spawn_bake_camera` ran,
-/// despawn the camera entity. The render target lives on in
-/// `Assets<Image>` and continues to be sampled by the UI.
-///
-/// One-frame delay is enough because Bevy's `Render` schedule runs
-/// after `Update` within the same frame; by the time this system
-/// observes `BakeStage::Awaiting`, the render graph has committed the
-/// bake texture from the previous tick.
+/// Stage 3 of the bake loop: count down the per-frame budget on
+/// `BakeStage::Awaiting`. Despawn only when the counter hits zero
+/// — that guarantees the camera lived through at least one full
+/// Update → Render cycle (see the [`BakeStage`] docs for why the
+/// chained spawn+despawn-same-frame path would otherwise destroy
+/// the entity before any render pass ran).
 pub fn despawn_bake_camera(
     mut stage: ResMut<BakeStage>,
     mut commands: Commands,
 ) {
-    let BakeStage::Awaiting(entity) = *stage else {
+    let BakeStage::Awaiting {
+        entity,
+        frames_remaining,
+    } = *stage
+    else {
         return;
     };
+    if frames_remaining > 0 {
+        *stage = BakeStage::Awaiting {
+            entity,
+            frames_remaining: frames_remaining - 1,
+        };
+        return;
+    }
     if let Ok(mut ec) = commands.get_entity(entity) {
         ec.despawn();
     }
