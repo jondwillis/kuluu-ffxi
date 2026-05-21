@@ -2203,11 +2203,18 @@ impl<'a> BattleBitReader<'a> {
 
 /// Decode a `GP_SERV_COMMAND_BATTLE2` (0x028) body into a stream of
 /// chat lines — one per `result` carried by the action. The wire
-/// format is bitpacked BE; the header is at bits 40.. (after a 5-byte
-/// LSB header field). Variable structure: up to 15 targets × 8
+/// format is bitpacked BE. Variable structure: up to 15 targets × 8
 /// results each, plus per-result optional `proc` and `react`
 /// sub-blocks that have to be skipped (not just ignored) to keep the
 /// bit cursor aligned for the next target.
+///
+/// Bit-offset convention: LSB's `pack()`/`unpack()` operate on the
+/// full sub-packet buffer (4-byte SE header + 1-byte workSize +
+/// bitstream) and start at bit offset `8 * 5 = 40`. Our `SubPacket::data`
+/// (`ffxi-proto/src/framing.rs:157`) already strips the 4-byte
+/// sub-packet header, so the bitstream starts at bit `8` of `data`
+/// (skip only the `workSize` byte at `data[0]`). Reading from bit 40
+/// here would skip 4 extra bytes of payload and decode garbage.
 ///
 /// Returns an empty Vec if the body is too short or the bit cursor
 /// underflows mid-decode. Returns a partial list if mid-stream
@@ -2218,8 +2225,9 @@ fn decode_battle2_action(
     name_cache: &std::collections::HashMap<u32, String>,
 ) -> Vec<ChatLine> {
     let mut out: Vec<ChatLine> = Vec::new();
-    // unpack() skips 5 bytes (header + workSize) before the bit stream.
-    let mut br = BattleBitReader::new(data, 40);
+    // Skip the 1-byte workSize prefix; the bitstream proper starts at bit 8.
+    // See doc comment above for why this is 8 and not 40.
+    let mut br = BattleBitReader::new(data, 8);
 
     let actor_id = match br.read(32) {
         Some(v) => v as u32,
@@ -3655,8 +3663,11 @@ mod tests {
     }
 
     /// Test helper: BE bit writer mirroring LSB's `packBitsBE`. Starts
-    /// writing at bit offset `start_bit` so a caller can build a real
-    /// 0x028 body (5 byte header + bit stream) by passing `40`.
+    /// writing at bit offset `start_bit`. To synthesize a body shaped
+    /// like what `walk_sub_packets` hands to `decode_battle2_action`
+    /// (1-byte workSize + bitstream), pass `8`. Passing `40` would
+    /// match LSB's full-buffer convention (4-byte sub-packet header
+    /// + 1-byte workSize), but our decoder is fed body-only data.
     struct BattleBitWriter {
         data: Vec<u8>,
         pos: usize,
@@ -3691,7 +3702,7 @@ mod tests {
         // The decoder must emit one ChatLine reading
         //   "Daisy hits Mandragora for 42 points of damage."
         use std::collections::HashMap;
-        let mut w = BattleBitWriter::new(40);
+        let mut w = BattleBitWriter::new(8);
         w.write(0xCAFEu64, 32); // actor_id (caster)
         w.write(1, 6); // trg_sum = 1
         w.write(0, 4); // res_sum (unused)
@@ -3737,7 +3748,7 @@ mod tests {
         // through `substitute_battle_placeholders` as the action_id
         // so `<spell>` renders as "spell #144".
         use std::collections::HashMap;
-        let mut w = BattleBitWriter::new(40);
+        let mut w = BattleBitWriter::new(8);
         w.write(0xCAFE, 32);
         w.write(1, 6); // trg_sum
         w.write(0, 4); // res_sum
@@ -3778,7 +3789,7 @@ mod tests {
         // only frame). Must NOT emit a chat line — would render as a
         // blank or wrong-template row otherwise.
         use std::collections::HashMap;
-        let mut w = BattleBitWriter::new(40);
+        let mut w = BattleBitWriter::new(8);
         w.write(0xCAFE, 32);
         w.write(1, 6);
         w.write(0, 4);
@@ -3800,6 +3811,74 @@ mod tests {
         let data = w.into_bytes();
         let lines = decode_battle2_action(&data, &HashMap::new());
         assert!(lines.is_empty(), "expected drop, got: {:?}", lines);
+    }
+
+    #[test]
+    fn battle2_decoder_pins_worksize_prefix_convention() {
+        // Wire-shape regression. `walk_sub_packets` strips the 4-byte
+        // sub-packet header (see ffxi-proto/src/framing.rs:157
+        // `&self.rest[4..size_bytes]`), so what reaches
+        // `decode_battle2_action` is `[workSize:u8][bitstream...]` —
+        // bit offset 8, not 40.
+        //
+        // LSB's pack/unpack starts at `8 * 5 = 40` because it operates
+        // on the full buffer including the 4-byte header
+        // (vendor/server/src/map/packets/s2c/0x028_battle2.cpp:37,120).
+        // A drive-by edit that "syncs" our start-bit back to 40 would
+        // skip 4 extra bytes of real payload and silently drop every
+        // combat action.
+        //
+        // This test pins the convention: synthesize the exact shape
+        // `walk_sub_packets` produces and assert one well-formed line
+        // emerges. The workSize byte is computed the same way LSB does
+        // it (`(bitOffset >> 3) + (bitOffset % 8 != 0)`) so future
+        // diffs that take workSize semantics seriously also have a
+        // reference value.
+        use std::collections::HashMap;
+        let mut w = BattleBitWriter::new(8);
+        w.write(0xCAFE, 32);
+        w.write(1, 6); // trg_sum
+        w.write(0, 4); // res_sum
+        w.write(0, 4); // cmd_no
+        w.write(0, 32); // cmd_arg
+        w.write(0, 32); // info
+        w.write(0xBEEF, 32);
+        w.write(1, 4);
+        w.write(0, 3);
+        w.write(0, 2);
+        w.write(0, 12);
+        w.write(0, 5);
+        w.write(0, 5);
+        w.write(42, 17); // damage
+        w.write(1, 10); // message = AttackHits
+        w.write(0, 31);
+        w.write(0, 1);
+        w.write(0, 1);
+
+        let mut data = w.into_bytes();
+        // workSize = byte count of the bitstream portion (excludes the
+        // workSize byte itself). The bitstream begins at bit 8 and ends
+        // at the current writer position; round up to bytes.
+        let bitstream_bits = data.len() * 8 - 8;
+        data[0] = ((bitstream_bits + 7) / 8) as u8;
+
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        cache.insert(0xBEEFu32, "Mandragora".to_string());
+
+        let lines = decode_battle2_action(&data, &cache);
+        assert_eq!(
+            lines.len(),
+            1,
+            "wire-shape regression: expected 1 line from a body with 1-byte workSize prefix, got: {:?}",
+            lines
+        );
+        let l = &lines[0];
+        assert!(
+            l.text.contains("Daisy") && l.text.contains("Mandragora") && l.text.contains("42"),
+            "decoded line lost actor/target/damage — check that start-bit 8 is preserved at session.rs:decode_battle2_action; got: {}",
+            l.text
+        );
     }
 
     #[test]
