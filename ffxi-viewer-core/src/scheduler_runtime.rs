@@ -297,6 +297,60 @@ pub fn dispatch_particle_stages(
     }
 }
 
+/// Dispatch SoundOnCaster / SoundOnTarget stages from
+/// [`SchedulerStageEvent`]: resolve the stage's id through the actor's
+/// [`ActionAssets`] generator/sep tables and write a `SfxEvent` so
+/// the existing audio plugin plays the SE.
+///
+/// Resolution mirrors `ffxi_dat::action::resolve_stage_to_se` — direct
+/// Sep reference or indirect Generator→Sep. Stages that resolve to
+/// nothing (Generator type isn't Sound, or id is unknown) are skipped
+/// silently — action DATs commonly carry stages for other subsystems
+/// (motion, model swap) that aren't audio-relevant.
+///
+/// Why this lives next to the particle dispatcher: both consume the
+/// same `SchedulerStageEvent` stream and read the same `ActionAssets`
+/// component. Keeping them in one place documents that they're
+/// siblings under the same playback model — different stage kinds,
+/// same data path.
+pub fn dispatch_sound_stages(
+    mut events: MessageReader<SchedulerStageEvent>,
+    q_actors: Query<&ActionAssets>,
+    mut sfx_writer: MessageWriter<crate::audio::SfxEvent>,
+) {
+    for ev in events.read() {
+        // Only sound-kind stages have a Sep to resolve. Particle /
+        // Motion / Unknown ignored here (handled elsewhere).
+        let kind = ev.stage.stage.kind;
+        if !matches!(
+            kind,
+            StageKind::SoundOnCaster | StageKind::SoundOnTarget
+        ) {
+            continue;
+        }
+        let Ok(assets) = q_actors.get(ev.actor) else {
+            continue;
+        };
+        // Reuse the shared resolver from ffxi-dat so the indirect
+        // Generator→Sep path is identical to the offline schedule
+        // walk in `action::extract_se_schedule`.
+        let Some((se_id, _on_caster)) = ffxi_dat::action::resolve_stage_to_se(
+            &ev.stage.stage.id,
+            kind,
+            &assets.generators,
+            &assets.seps,
+        ) else {
+            continue;
+        };
+        // We pass the SE id through unconditionally — the
+        // on_caster/on_target distinction would let us 3D-position
+        // the sound at the caster's vs target's transform in the
+        // future, but `SfxEvent` is currently flat (no positional
+        // audio). Plain SE id keeps the dispatch one-line.
+        sfx_writer.write(crate::audio::SfxEvent::new(se_id));
+    }
+}
+
 /// Decay [`ParticleTtl`] each tick; despawn the entity when it hits
 /// zero. Pairs with [`dispatch_particle_stages`].
 pub fn tick_particle_ttl(
@@ -323,15 +377,20 @@ impl Plugin for SchedulerRuntimePlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<SchedulerStageEvent>()
             .add_systems(Update, tick_active_schedulers);
-        // Particle dispatch + TTL decay only on native (D3M mesh
-        // build uses Assets<Mesh> + Assets<StandardMaterial>, which
-        // wasm doesn't currently load DAT bytes for; the wasm build
-        // gets the scheduler tick + event channel but no particle
-        // spawn until DAT-fetch lands for the browser viewer).
+        // Particle dispatch + TTL decay + sound dispatch only on
+        // native: D3M mesh build uses Assets<Mesh>/Assets<StandardMaterial>
+        // and `audio::SfxEvent` itself is native-only. Wasm gets the
+        // scheduler tick + event channel but no particle/audio
+        // dispatch until DAT-fetch lands for the browser viewer.
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,
-            (dispatch_particle_stages, tick_particle_ttl).chain(),
+            (
+                dispatch_particle_stages,
+                dispatch_sound_stages,
+                tick_particle_ttl,
+            )
+                .chain(),
         );
     }
 }

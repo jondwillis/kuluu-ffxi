@@ -105,7 +105,11 @@ pub fn extract_se_schedule(bytes: &[u8]) -> Vec<TimedSe> {
 ///      `id` field references a Sep. This is the Fire/Cure pattern.
 ///   3. Stage names a Generator that's NOT Sound-type (Particle,
 ///      ModelRing, etc.) — these contribute no SE and return None.
-fn resolve_stage_to_se(
+///
+/// Public so the viewer's scheduler runtime can reuse the resolution
+/// path live (it carries the same `generators`/`seps` maps in an
+/// `ActionAssets` component).
+pub fn resolve_stage_to_se(
     stage_id: &[u8; 4],
     stage_kind: StageKind,
     generators: &HashMap<[u8; 4], Generator>,
