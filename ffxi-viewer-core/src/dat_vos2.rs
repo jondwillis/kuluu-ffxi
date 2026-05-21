@@ -799,9 +799,14 @@ pub fn process_load_vos2_requests(
         }
         // Degraded fallback when the GPU skinned path can't take
         // (missing skeleton, mismatched bone count): drop into the
-        // CPU bake. Return value is the slot's min local-y but no
-        // BakedActor is inserted here — that path is reserved for
-        // confirmed-shape actors only.
+        // CPU bake with a per-slot feet translation. No actor-wide
+        // aggregation here (this path handles a single slot per
+        // request); multi-slot fallback actors will misalign, but
+        // they're already in a degraded-render state.
+        let fallback_translation =
+            measure_post_bake_y_extent(loaded, baked_owned.as_ref())
+                .map(|(min, _max)| -min)
+                .unwrap_or(0.0);
         let _ = spawn_vos2_meshes_with_skeleton(
             &mut commands,
             &mut meshes,
@@ -810,6 +815,7 @@ pub fn process_load_vos2_requests(
             bevy_e,
             loaded,
             baked_owned.as_ref(),
+            fallback_translation,
         );
         info!(
             "vos2 spawn: file_id={} entity_id={} verts={} groups={}",
@@ -828,6 +834,47 @@ pub fn process_load_vos2_requests(
 /// minimum is `-max(v.pos[1])`. NPCs skip the pivot, leaving
 /// parent-local-y = `v.pos[1]` and the minimum at `min(v.pos[1])`.
 ///
+/// Measure the post-bake vertical extent of a VOS2 slot **without**
+/// spawning anything. Used by `spawn_equipped` to aggregate
+/// `min_local_y` across every slot before deciding the actor's
+/// feet-at-origin translation — every slot of one actor must share
+/// the same translation, otherwise legs/head/body slots shift
+/// independently and the assembled character collapses (each slot's
+/// `min_local_y` is the lowest vertex of *that slot only*, not the
+/// actor as a whole).
+///
+/// Mirrors the position-bake walk in
+/// [`spawn_vos2_meshes_with_skeleton`]: parent-local Y of a baked
+/// vertex equals `positions[i][2]` = `-bake_position(...)[1]` (the
+/// bind_to_bevy rotation maps mesh-space `(a, b, c)` to `(-b, c, -a)`,
+/// so parent-y is `c` = `-p[1]`).
+fn measure_post_bake_y_extent(
+    loaded: &LoadedVos2,
+    baked_owned: Option<&BakedSkeleton>,
+) -> Option<(f32, f32)> {
+    if loaded.mesh.vertices.is_empty() {
+        return None;
+    }
+    let baked = baked_for_mesh(&loaded.mesh, baked_owned);
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (i, v) in loaded.mesh.vertices.iter().enumerate() {
+        let p = bake_position(&loaded.mesh, i, v.pos, baked);
+        let local_y = -p[1];
+        if local_y < min_y {
+            min_y = local_y;
+        }
+        if local_y > max_y {
+            max_y = local_y;
+        }
+    }
+    if min_y.is_finite() && max_y.is_finite() {
+        Some((min_y, max_y))
+    } else {
+        None
+    }
+}
+
 /// Returns `(min_local_y, max_local_y)` — the vertical extent of all
 /// baked vertices in the **pivot's local frame** (i.e., after the
 /// pivot's rotation but before its feet-at-origin translation). The
@@ -1234,6 +1281,14 @@ pub fn tick_skinned_actors(
 /// **before** the feet-at-origin translation that's been folded into
 /// the mesh entity's spawn transform. Callers aggregate this across
 /// slots and use `(min, max)` to fill [`crate::scene::BakedActor`].
+/// `feet_translation_y` shifts every spawned mesh entity up by this
+/// many yalms in the parent's local frame. The caller is responsible
+/// for picking a value that holds **for every slot of the actor** —
+/// otherwise legs / head / body slots will shift independently and
+/// break inter-slot alignment. `spawn_equipped` aggregates
+/// `min_local_y` across all slots and passes the same negation here
+/// for every slot. Returns `(min, max)` of the slot's own post-bake
+/// y extent for diagnostic reporting / further aggregation.
 pub fn spawn_vos2_meshes(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -1242,6 +1297,7 @@ pub fn spawn_vos2_meshes(
     parent: Entity,
     loaded: &LoadedVos2,
     race: u8,
+    feet_translation_y: f32,
 ) -> Option<(f32, f32)> {
     let baked = baked_skeleton(race);
     spawn_vos2_meshes_with_skeleton(
@@ -1252,6 +1308,7 @@ pub fn spawn_vos2_meshes(
         parent,
         loaded,
         baked.as_ref(),
+        feet_translation_y,
     )
 }
 
@@ -1266,6 +1323,7 @@ fn spawn_vos2_meshes_with_skeleton(
     parent: Entity,
     loaded: &LoadedVos2,
     baked_owned: Option<&BakedSkeleton>,
+    feet_translation_y: f32,
 ) -> Option<(f32, f32)> {
     // Build per-file texture pool. Reuses the lotus-ffxi VOS2
     // convention that group names like `"tim     em_b61_3"` use the
@@ -1392,11 +1450,8 @@ fn spawn_vos2_meshes_with_skeleton(
         min_local_y = Some(min[2]);
         max_local_y = Some(max[2]);
     }
-    // Feet-at-origin shift baked into the per-slot mesh entity's
-    // transform below: the lowest baked vertex lands at entity.y = 0.
-    // Default to 0 if the bake somehow produced no vertices (defensive
-    // — spawn_one early-exits on empty position lists upstream).
-    let feet_translation_y = -min_local_y.unwrap_or(0.0);
+    // `feet_translation_y` is supplied by the caller (aggregated across
+    // every slot of the actor); see this function's doc-comment.
 
     // Mirror copy: VOS2 stores only one symmetric half of the body;
     // the other half is generated by mirroring across the body's
@@ -1586,39 +1641,42 @@ pub fn spawn_equipped(
         "head", "body", "hands", "legs", "feet", "main", "sub", "ranged",
     ];
     let slots = [head, body, hands, legs, feet, main, sub, ranged];
-    let mut spawned = 0usize;
-    // Aggregate the vertical extent across all baked slots: the actor's
-    // feet are at the lowest local-Y any slot reaches (legs/feet); the
-    // head is at the highest (head/hair). Both feed `BakedActor` —
-    // `min_mesh_y` for diagnostic, `actor_height = max - min` for the
-    // nameplate / camera anchors.
+
+    // ---- Pass 1: load + measure every slot's VOS2 chunks ----
+    //
+    // We can't decide the actor's feet-at-origin translation until
+    // we've seen the deepest min_local_y across **every** slot.
+    // Spawning per-slot with each slot's own min was the bug that
+    // disassembled characters — legs translated up by their own deep
+    // min, head translated up by its shallow min, the two ended up
+    // ~1 yalm apart, and the assembled rig collapsed.
+    //
+    // Each entry holds the loaded VOS2 + a label for diagnostics. We
+    // walk it again in pass 2 to actually spawn meshes.
+    struct LoadedSlot {
+        loaded: LoadedVos2,
+        label: String,
+    }
+    let baked_skel = baked_skeleton(race);
+    let mut loaded_slots: Vec<LoadedSlot> = Vec::new();
     let mut actor_min_local_y: f32 = f32::INFINITY;
     let mut actor_max_local_y: f32 = f32::NEG_INFINITY;
-    // Helper: spawn every VOS2 chunk in a DAT as its own mesh.
-    // lotus-ffxi (actor.cpp:84-110) collects every OS2 chunk in the
-    // DAT and treats them collectively as one actor model. Previously
-    // we returned only the largest, which for body slots drops
-    // shoulder/torso/arm sub-meshes and renders an apparently
-    // "missing" chest.
-    let mut spawn_all_chunks = |chunk_indices: Vec<usize>,
-                                file_id: u32,
-                                label: &str,
-                                slot_min: &mut f32,
-                                slot_max: &mut f32|
-     -> usize {
-        let mut count = 0usize;
-        for idx in chunk_indices {
+    let mut load_chunks = |file_id: u32, chunks: Vec<usize>, label: &str| {
+        for idx in chunks {
             match load_vos2(file_id, idx) {
                 Ok(loaded)
                     if !loaded.mesh.groups.is_empty() && !loaded.mesh.vertices.is_empty() =>
                 {
-                    if let Some((min_y, max_y)) = spawn_vos2_meshes(
-                        commands, meshes, materials, images, parent, &loaded, race,
-                    ) {
-                        *slot_min = slot_min.min(min_y);
-                        *slot_max = slot_max.max(max_y);
+                    if let Some((min_y, max_y)) =
+                        measure_post_bake_y_extent(&loaded, baked_skel.as_ref())
+                    {
+                        actor_min_local_y = actor_min_local_y.min(min_y);
+                        actor_max_local_y = actor_max_local_y.max(max_y);
                     }
-                    count += 1;
+                    loaded_slots.push(LoadedSlot {
+                        loaded,
+                        label: label.to_string(),
+                    });
                 }
                 Ok(_) => info!(
                     "spawn_equipped: {} file={} chunk={} loaded but empty (race={})",
@@ -1630,11 +1688,9 @@ pub fn spawn_equipped(
                 ),
             }
         }
-        count
     };
-    // Face mesh first — lotus loads it as a separate DAT alongside the
-    // 8 equipment slots. Naked-but-faced characters still need the
-    // face here, so this runs before the slot loop.
+
+    // Face DAT first (lotus loads it alongside the 8 equipment slots).
     if let Some(file_id) = resolve_face(face, race) {
         let chunks = enumerate_vos2_chunks(file_id);
         if chunks.is_empty() {
@@ -1643,13 +1699,7 @@ pub fn spawn_equipped(
                 file_id, race
             );
         } else {
-            spawned += spawn_all_chunks(
-                chunks,
-                file_id,
-                "face",
-                &mut actor_min_local_y,
-                &mut actor_max_local_y,
-            );
+            load_chunks(file_id, chunks, "face");
         }
     }
     for (slot_id, slot_name) in slots.iter().zip(slot_names.iter()) {
@@ -1671,25 +1721,47 @@ pub fn spawn_equipped(
             continue;
         }
         let label = format!("slot {}", slot_name);
-        spawned += spawn_all_chunks(
-            chunks,
-            file_id,
-            &label,
-            &mut actor_min_local_y,
-            &mut actor_max_local_y,
-        );
+        load_chunks(file_id, chunks, &label);
     }
+
+    if loaded_slots.is_empty() {
+        return 0;
+    }
+
+    // ---- Pass 2: spawn every slot with the actor-wide translation ----
+    //
+    // `feet_translation_y` lifts every slot's geometry so that the
+    // deepest baked vertex (across the whole actor) sits at the
+    // parent entity's local y=0 — the snap-invariant feet position.
+    // Every slot uses the same number; inter-slot relative positions
+    // are preserved.
+    let (min_mesh_y, max_mesh_y) =
+        if actor_min_local_y.is_finite() && actor_max_local_y.is_finite() {
+            (actor_min_local_y, actor_max_local_y)
+        } else {
+            (-0.9, 1.6)
+        };
+    let feet_translation_y = -min_mesh_y;
+    let mut spawned = 0usize;
+    for slot in &loaded_slots {
+        if spawn_vos2_meshes(
+            commands,
+            meshes,
+            materials,
+            images,
+            parent,
+            &slot.loaded,
+            race,
+            feet_translation_y,
+        )
+        .is_some()
+        {
+            spawned += 1;
+        }
+        let _ = &slot.label; // present for log/debug attachment
+    }
+
     if spawned > 0 {
-        // Both should be finite by the time spawned>0 (every slot that
-        // contributed geometry also bumped one or both bounds). Fall
-        // back to a typical adult silhouette only as defensive padding
-        // if the bake somehow produced no measurable extent.
-        let (min_mesh_y, max_mesh_y) =
-            if actor_min_local_y.is_finite() && actor_max_local_y.is_finite() {
-                (actor_min_local_y, actor_max_local_y)
-            } else {
-                (-0.9, 1.6)
-            };
         let actor_height = (max_mesh_y - min_mesh_y).max(0.1);
         commands.entity(parent).insert(BakedActor {
             min_mesh_y,
