@@ -485,6 +485,9 @@ fn despawn_ingame_entities(
     mut last_zone: ResMut<LastAutoLoadedZone>,
     mut last_atmo: ResMut<LastAtmosphereZone>,
     mut bgm: ResMut<BgmSlots>,
+    mut weather_ambient: ResMut<ffxi_viewer_core::audio::WeatherAmbient>,
+    mut combat_sfx: ResMut<ffxi_viewer_core::audio::CombatSfxState>,
+    mut system_sfx_cursor: ResMut<ffxi_viewer_core::audio::SystemSfxCursor>,
 ) {
     let mut count = 0usize;
     for entity in q.iter() {
@@ -497,13 +500,35 @@ fn despawn_ingame_entities(
     collision.indices.clear();
     last_zone.zone_id = None;
     last_atmo.zone_id = None;
-    // `active_entity` is a now-freed `Entity` if the BGM sink was
-    // tagged InGameEntity, or a dangling reference if not. Either way
-    // the audio resolver next session must start fresh.
+    // `active_entity` was just despawned by the `InGameEntity` pass
+    // above — the BGM sink carries the marker now. Clearing the
+    // Resource's reference + per-slot track table makes the next
+    // session start from a clean baseline rather than transitioning
+    // from a stale `Some((slot, track))` `active` field that would
+    // make `apply_bgm_system` think it should `despawn` an already-
+    // freed entity.
     bgm.active_entity = None;
     bgm.active = None;
     bgm.tracks = [None; ffxi_viewer_core::audio::SLOT_COUNT];
     bgm.event_cursor = 0;
+    // Weather ambient sink: same shape as BGM — `InGameEntity` on
+    // the entity handles despawn; here we clear the Resource's
+    // active_entity pointer + prev/active weather memo so the
+    // observer re-arms cleanly on next zone-in.
+    weather_ambient.active_entity = None;
+    weather_ambient.active_weather = None;
+    weather_ambient.prev_weather = None;
+    // Combat SFX latch state — without reset, prev_engaged carrying
+    // `true` from the previous session would suppress the
+    // engage-self stinger when the player engages for the first time
+    // in the next session (the latch sees engaged_now == prev_engaged
+    // and skips the fire).
+    *combat_sfx = ffxi_viewer_core::audio::CombatSfxState::default();
+    // System-SFX cursor walks `EventLog.recent`; the event log itself
+    // is cleared below, so the cursor must reset to 0 or the next
+    // session's first events get skipped (cursor > len triggers the
+    // clamp path but still advances past them).
+    *system_sfx_cursor = ffxi_viewer_core::audio::SystemSfxCursor::default();
     // SceneState carries the disconnected snapshot (stage, zone_id,
     // entities). Reset it so systems gated on stage/zone don't see
     // stale state in the launcher → InGame transition before the new

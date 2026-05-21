@@ -169,6 +169,7 @@ impl Decodable for PcmAudio {
     }
 }
 
+use crate::components::InGameEntity;
 use crate::snapshot::EventLog;
 
 /// Number of LSB `MusicSlot`s (0..=7). Mirrors
@@ -524,6 +525,15 @@ pub fn apply_bgm_system(
 
     let entity = commands
         .spawn((
+            // Session-scoped: `OnExit(AppPhase::InGame)` despawns
+            // every InGameEntity. Without this marker the BGM sink
+            // outlives logout — rodio keeps streaming the .bgw and
+            // the launcher screen plays zone music. Per memory
+            // [[feedback_bevy_lifecycle_symmetry]] every spawn at a
+            // session-state-bound site needs the marker. The BgmSlots
+            // resource drain in `despawn_ingame_entities` covers the
+            // cache layer; this covers the entity layer.
+            InGameEntity,
             AudioPlayer(handle),
             // `PlaybackSettings::ONCE` because looping is handled
             // inside `PcmSource::next()` — rodio's outer LOOP would
@@ -646,6 +656,11 @@ pub fn play_sfx_system(
             h
         };
         commands.spawn((
+            // Session-scoped so an in-flight SFX dies on logout —
+            // `PlaybackSettings::DESPAWN` only fires when the clip
+            // ends naturally, which can be seconds after logout for
+            // longer stingers.
+            InGameEntity,
             AudioPlayer(handle),
             PlaybackSettings::DESPAWN
                 .with_volume(bevy::audio::Volume::Linear(ev.volume.clamp(0.0, 1.0))),
@@ -1171,6 +1186,10 @@ pub fn observe_weather_changes(
 
     let entity = commands
         .spawn((
+            // Session-scoped: weather ambient is a looping sink
+            // (rain hiss, fog wind, etc.) that would otherwise
+            // outlive logout the same way the BGM sink did.
+            InGameEntity,
             AudioPlayer(looped_handle),
             PlaybackSettings::ONCE.with_volume(bevy::audio::Volume::Linear(0.0)),
             WeatherFade::fade_in(WEATHER_FADE_SECS),
