@@ -13,6 +13,11 @@ const LSB_COMPRESS_DAT: &str = "../vendor/server/res/compress.dat";
 const LSB_DECOMPRESS_DAT: &str = "../vendor/server/res/decompress.dat";
 const LSB_MSG_BASIC_H: &str = "../vendor/server/src/map/enums/msg_basic.h";
 const LSB_MSG_LUA: &str = "../vendor/server/scripts/enum/msg.lua";
+const LSB_EFFECT_LUA: &str = "../vendor/server/scripts/enum/effect.lua";
+const LSB_JOB_NAME_LUA: &str = "../vendor/server/scripts/enum/job_name.lua";
+const LSB_SPELL_LIST_SQL: &str = "../vendor/server/sql/spell_list.sql";
+const LSB_ABILITIES_SQL: &str = "../vendor/server/sql/abilities.sql";
+const LSB_ITEM_BASIC_SQL: &str = "../vendor/server/sql/item_basic.sql";
 const SUBKEY_LEN: usize = 4168;
 
 fn main() -> Result<()> {
@@ -22,6 +27,11 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed={LSB_DECOMPRESS_DAT}");
     println!("cargo:rerun-if-changed={LSB_MSG_BASIC_H}");
     println!("cargo:rerun-if-changed={LSB_MSG_LUA}");
+    println!("cargo:rerun-if-changed={LSB_EFFECT_LUA}");
+    println!("cargo:rerun-if-changed={LSB_JOB_NAME_LUA}");
+    println!("cargo:rerun-if-changed={LSB_SPELL_LIST_SQL}");
+    println!("cargo:rerun-if-changed={LSB_ABILITIES_SQL}");
+    println!("cargo:rerun-if-changed={LSB_ITEM_BASIC_SQL}");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR not set")?);
 
@@ -131,6 +141,86 @@ fn main() -> Result<()> {
             lua_table_warning_label(lua_table),
         );
     }
+
+    // effect.lua → status effect names. `xi.effect = { IDENT = N, … }`
+    // with UPPER_SNAKE identifiers. Same line-shape as `xi.msg.*` so the
+    // existing comment-rejection rules apply, but we want the identifier
+    // (e.g. PROTECT, BLAZE_SPIKES) rendered as the display name —
+    // there's no `-- text` to lean on. Prettify the identifier itself.
+    let effect_src = fs::read_to_string(LSB_EFFECT_LUA)
+        .with_context(|| format!("reading {LSB_EFFECT_LUA}"))?;
+    let effect_entries = parse_xi_ident_table(&effect_src, "xi.effect")?;
+    write_u16_table(
+        &out_dir.join("status_names_table.rs"),
+        "STATUS_NAMES",
+        LSB_EFFECT_LUA,
+        &effect_entries,
+    )?;
+    println!(
+        "cargo:warning=ffxi-proto: scraped {} status_effect entries",
+        effect_entries.len(),
+    );
+
+    // job_name.lua → job display names. `xi.jobName = { [N] = { 'ABBR', 'Full Name' }, … }`
+    let job_src = fs::read_to_string(LSB_JOB_NAME_LUA)
+        .with_context(|| format!("reading {LSB_JOB_NAME_LUA}"))?;
+    let job_entries = parse_lua_indexed_pair_table(&job_src, "xi.jobName")?;
+    write_u16_table(
+        &out_dir.join("job_names_table.rs"),
+        "JOB_NAMES",
+        LSB_JOB_NAME_LUA,
+        &job_entries,
+    )?;
+    println!(
+        "cargo:warning=ffxi-proto: scraped {} job_name entries",
+        job_entries.len(),
+    );
+
+    // SQL: spell_list, abilities, item_basic. INSERT INTO `<table>`
+    // VALUES (...); per row. Name field index varies by table.
+    let spell_src = fs::read_to_string(LSB_SPELL_LIST_SQL)
+        .with_context(|| format!("reading {LSB_SPELL_LIST_SQL}"))?;
+    let spell_entries = parse_sql_insert_rows(&spell_src, "spell_list", 0, 1)?;
+    write_u16_table(
+        &out_dir.join("spell_names_table.rs"),
+        "SPELL_NAMES",
+        LSB_SPELL_LIST_SQL,
+        &spell_entries,
+    )?;
+    println!(
+        "cargo:warning=ffxi-proto: scraped {} spell entries",
+        spell_entries.len(),
+    );
+
+    let abil_src = fs::read_to_string(LSB_ABILITIES_SQL)
+        .with_context(|| format!("reading {LSB_ABILITIES_SQL}"))?;
+    let abil_entries = parse_sql_insert_rows(&abil_src, "abilities", 0, 1)?;
+    write_u16_table(
+        &out_dir.join("ability_names_table.rs"),
+        "ABILITY_NAMES",
+        LSB_ABILITIES_SQL,
+        &abil_entries,
+    )?;
+    println!(
+        "cargo:warning=ffxi-proto: scraped {} ability entries",
+        abil_entries.len(),
+    );
+
+    // Item names: field 0 = itemId, field 2 = English snake_case name
+    // (field 1 = sub_id, field 3 = singular alt, field 4 = Japanese).
+    let item_src = fs::read_to_string(LSB_ITEM_BASIC_SQL)
+        .with_context(|| format!("reading {LSB_ITEM_BASIC_SQL}"))?;
+    let item_entries = parse_sql_insert_rows(&item_src, "item_basic", 0, 2)?;
+    write_u16_table(
+        &out_dir.join("item_names_table.rs"),
+        "ITEM_NAMES",
+        LSB_ITEM_BASIC_SQL,
+        &item_entries,
+    )?;
+    println!(
+        "cargo:warning=ffxi-proto: scraped {} item entries",
+        item_entries.len(),
+    );
 
     Ok(())
 }
@@ -318,5 +408,347 @@ fn rust_string_literal(s: &str) -> String {
         }
         esc.push('"');
         esc
+    }
+}
+
+/// Write a `pub const <NAME>: &[(u16, &str)] = &[ … ];` table to
+/// `out_path`, deduplicated and sorted-by-id so consumers can use
+/// `binary_search_by_key`. Cites the originating LSB source path in
+/// the file header for traceability.
+fn write_u16_table(
+    out_path: &std::path::Path,
+    const_name: &str,
+    source_path: &str,
+    entries: &[(u32, String)],
+) -> Result<()> {
+    let mut entries: Vec<(u32, String)> = entries.to_vec();
+    entries.sort_by_key(|(id, _)| *id);
+    entries.dedup_by_key(|(id, _)| *id);
+    // Reject ids that don't fit in u16 — every consumer takes u16 today.
+    // If a future LSB table ships u32 ids, switch the column type and
+    // mirror that on the consumer side.
+    for (id, name) in &entries {
+        if *id > u16::MAX as u32 {
+            bail!("entry id {id} ({name:?}) overflows u16 — table needs widening");
+        }
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "// AUTO-GENERATED by ffxi-proto/build.rs from {source_path}.\n"
+    ));
+    out.push_str("// Do not edit by hand.\n");
+    out.push_str(&format!(
+        "pub const {const_name}: &[(u16, &str)] = &[\n"
+    ));
+    for (id, text) in &entries {
+        out.push_str(&format!("    ({id}, {}),\n", rust_string_literal(text)));
+    }
+    out.push_str("];\n");
+    fs::write(out_path, &out)?;
+    Ok(())
+}
+
+/// Parse `xi.<table> = { IDENT = N, … }`. Mirrors `parse_lua_table` but
+/// uses the *identifier* itself (UPPER_SNAKE → "Pretty Case") as the
+/// display name — for tables like `xi.effect` whose lines have no
+/// trailing English `-- comment` to lean on.
+fn parse_xi_ident_table(src: &str, needle_prefix: &str) -> Result<Vec<(u32, String)>> {
+    let needle = format!("{needle_prefix} =");
+    let header = src
+        .find(&needle)
+        .with_context(|| format!("could not locate `{needle}` in source"))?;
+    let body_start = src[header..]
+        .find('{')
+        .with_context(|| format!("no opening `{{` after `{needle}`"))?
+        + header
+        + 1;
+    // Find matching `}` — for a flat table the next `}` is correct.
+    let body_end = src[body_start..]
+        .find('}')
+        .with_context(|| format!("no closing `}}` after `{needle}`"))?
+        + body_start;
+    let body = &src[body_start..body_end];
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in body.lines() {
+        let line = line.trim();
+        let Some(eq) = line.find('=') else { continue };
+        let ident = line[..eq].trim();
+        if ident.is_empty()
+            || !ident
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            continue;
+        }
+        if !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let tail = line[eq + 1..].trim_start();
+        let num_str: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '-')
+            .collect();
+        let Ok(id) = num_str.parse::<u32>() else {
+            continue;
+        };
+        let pretty = prettify_snake_case(ident);
+        if seen.insert(id) {
+            out.push((id, pretty));
+        }
+    }
+    if out.is_empty() {
+        bail!("parsed zero entries for `{needle_prefix}` — source format may have changed");
+    }
+    Ok(out)
+}
+
+/// Parse `xi.<table> = { [N] = { 'SHORT', 'Full Name' }, … }`. The
+/// second string in each pair is the display name; the first is an
+/// abbreviation we ignore. Used for job_name.lua.
+fn parse_lua_indexed_pair_table(src: &str, needle_prefix: &str) -> Result<Vec<(u32, String)>> {
+    let needle = format!("{needle_prefix} =");
+    let header = src
+        .find(&needle)
+        .with_context(|| format!("could not locate `{needle}` in source"))?;
+    let body_start = src[header..]
+        .find('{')
+        .with_context(|| format!("no opening `{{` after `{needle}`"))?
+        + header
+        + 1;
+    let body = &src[body_start..];
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in body.lines() {
+        let line = line.trim();
+        // `[N] = { 'ABBR', 'Full Name' },`
+        let Some(open) = line.find('[') else { continue };
+        let Some(close) = line[open + 1..].find(']') else {
+            continue;
+        };
+        let id_str = line[open + 1..open + 1 + close].trim();
+        let Ok(id) = id_str.parse::<u32>() else {
+            continue;
+        };
+        // Find the second single-quoted string.
+        let rest = &line[open + 1 + close..];
+        let parts: Vec<&str> = rest.split('\'').collect();
+        // Even-index parts are between quotes (1, 3, 5...) wait — split
+        // by `'` puts the *between* parts at odd indices. We want the
+        // 2nd quoted string → index 3.
+        if parts.len() < 4 {
+            continue;
+        }
+        let display = parts[3].trim();
+        if display.is_empty() {
+            continue;
+        }
+        if seen.insert(id) {
+            out.push((id, display.to_string()));
+        }
+    }
+    if out.is_empty() {
+        bail!("parsed zero entries for `{needle_prefix}` — source format may have changed");
+    }
+    Ok(out)
+}
+
+/// Parse `INSERT INTO \`<table>\` VALUES (id, …, 'name', …);` rows out
+/// of a SQL dump. `id_field` and `name_field` are zero-based column
+/// indices within the VALUES tuple. SQL string literals are handled —
+/// `''` escapes a single quote, commas inside strings are ignored when
+/// splitting fields. Rows whose name is empty or starts with a non-
+/// alpha character (placeholder rows like `'NULL'`, `'_'`) are dropped.
+fn parse_sql_insert_rows(
+    src: &str,
+    table: &str,
+    id_field: usize,
+    name_field: usize,
+) -> Result<Vec<(u32, String)>> {
+    let needle = format!("INSERT INTO `{table}` VALUES ");
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix(needle.as_str()) else {
+            continue;
+        };
+        // A single line may contain one tuple `(...);` or many `(...),(...);`
+        // — handle both. Scan tuple-by-tuple.
+        let mut cursor = rest;
+        while let Some(open) = cursor.find('(') {
+            cursor = &cursor[open + 1..];
+            let Some((tuple, after)) = split_sql_tuple(cursor) else {
+                break;
+            };
+            cursor = after;
+            let fields = split_sql_fields(tuple);
+            let id_str = fields.get(id_field).map(|s| s.trim()).unwrap_or("");
+            let name_raw = fields.get(name_field).map(|s| s.trim()).unwrap_or("");
+            let Ok(id) = id_str.parse::<u32>() else {
+                continue;
+            };
+            let Some(name) = strip_sql_string(name_raw) else {
+                continue;
+            };
+            // Drop obvious placeholders: empty, just underscores, or
+            // doesn't start with an ASCII letter.
+            if name.is_empty()
+                || name.chars().all(|c| c == '_')
+                || !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            {
+                continue;
+            }
+            out.push((id, prettify_snake_case(&name)));
+        }
+    }
+    if out.is_empty() {
+        bail!(
+            "parsed zero rows from `INSERT INTO {table}` — SQL format may have changed"
+        );
+    }
+    Ok(out)
+}
+
+/// Given a slice positioned just past the opening `(` of a SQL tuple,
+/// return the tuple body (up to but not including the matching `)`)
+/// and the remainder past the `)`. Handles string literals with `''`
+/// escapes; ignores parens inside strings. Returns None on EOF.
+fn split_sql_tuple(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\'' {
+                // `''` inside a string is an escaped single quote.
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            i += 1;
+        } else {
+            if c == b'\'' {
+                in_string = true;
+                i += 1;
+                continue;
+            }
+            if c == b')' {
+                return Some((&s[..i], &s[i + 1..]));
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Split a SQL VALUES tuple body by top-level commas. Commas inside
+/// string literals are ignored.
+fn split_sql_fields(tuple: &str) -> Vec<&str> {
+    let bytes = tuple.as_bytes();
+    let mut fields = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            i += 1;
+        } else if c == b'\'' {
+            in_string = true;
+            i += 1;
+        } else if c == b',' {
+            fields.push(&tuple[start..i]);
+            start = i + 1;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    fields.push(&tuple[start..]);
+    fields
+}
+
+/// Unwrap a single SQL string literal: `'foo'` → `Some("foo")`,
+/// `NULL` / unquoted → `None`. Handles `''` escapes.
+fn strip_sql_string(field: &str) -> Option<String> {
+    let f = field.trim();
+    let stripped = f.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))?;
+    Some(stripped.replace("''", "'"))
+}
+
+/// `cure_iv` → `Cure IV`, `pile_of_chocobo_bedding` → `Pile of Chocobo Bedding`,
+/// `BLAZE_SPIKES` → `Blaze Spikes`. Splits on `_`, then for each word:
+/// if it matches a roman numeral form (i, ii, iii, iv, v, vi, vii, viii,
+/// ix, x), uppercase it; if it's a small connector (of, the, a, an, in,
+/// on, and), lowercase it (unless it's the first word); otherwise
+/// capitalize the first letter and lowercase the rest. The first word
+/// is always capitalized.
+fn prettify_snake_case(s: &str) -> String {
+    const ROMAN: &[&str] = &[
+        "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii", "xiii", "xiv",
+        "xv",
+    ];
+    const CONNECTORS: &[&str] = &["of", "the", "a", "an", "in", "on", "and", "to"];
+    let words: Vec<&str> = s.split('_').filter(|w| !w.is_empty()).collect();
+    let mut out = String::with_capacity(s.len() + words.len());
+    for (idx, word) in words.iter().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        let lower = word.to_ascii_lowercase();
+        if ROMAN.iter().any(|r| *r == lower) {
+            out.push_str(&lower.to_ascii_uppercase());
+        } else if idx > 0 && CONNECTORS.iter().any(|c| *c == lower) {
+            out.push_str(&lower);
+        } else {
+            let mut chars = lower.chars();
+            if let Some(first) = chars.next() {
+                out.push(first.to_ascii_uppercase());
+                out.push_str(chars.as_str());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prettify_handles_roman_numerals_and_connectors() {
+        assert_eq!(prettify_snake_case("cure"), "Cure");
+        assert_eq!(prettify_snake_case("cure_iv"), "Cure IV");
+        assert_eq!(prettify_snake_case("cure_vi"), "Cure VI");
+        assert_eq!(
+            prettify_snake_case("pile_of_chocobo_bedding"),
+            "Pile of Chocobo Bedding"
+        );
+        assert_eq!(prettify_snake_case("BLAZE_SPIKES"), "Blaze Spikes");
+        assert_eq!(prettify_snake_case("mighty_strikes"), "Mighty Strikes");
+    }
+
+    #[test]
+    fn sql_tuple_handles_escaped_quotes() {
+        // SQL `'it''s'` → "it's"
+        let (body, after) = split_sql_tuple("1,'it''s',2);extra").unwrap();
+        assert_eq!(body, "1,'it''s',2");
+        assert_eq!(after, ";extra");
+        let fields = split_sql_fields(body);
+        assert_eq!(fields.len(), 3);
+        assert_eq!(strip_sql_string(fields[1]).unwrap(), "it's");
     }
 }
