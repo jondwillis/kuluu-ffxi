@@ -159,22 +159,24 @@ pub struct ChatTabButton {
 pub struct ChatTabButtonLabel;
 
 impl ChatKind {
-    /// Does a given channel render in this panel? See [`ChatKind`] docs
-    /// for the split rules.
+    /// Does a given channel render in this panel?
     ///
-    /// `Debug` channel folds into `Battle` panel: retail FFXI mixes
-    /// system messages into the battle/system log, and the user
-    /// preference is to surface client-internal toasts there too rather
-    /// than reserving a separate pane. The `ChatKind::Debug` variant
-    /// is retained for tooling/test code that still wants to assert
-    /// debug-only routing but no pane is spawned for it any more.
+    /// Three-tab routing:
+    /// - `Social` ("Chat"): everything that's neither combat nor system
+    ///   noise — Say/Shout/Tell/Party/Linkshell/Yell/Other.
+    /// - `Battle`: combat log only. Retail folds server System messages
+    ///   in here too, but the operator wants combat isolated from the
+    ///   chatter that goes with auto-load notices etc., so System now
+    ///   routes to the dedicated `Debug` tab instead.
+    /// - `Debug` ("System"): server System messages + client-internal
+    ///   toasts (slash-command feedback, auto-load notices, dev
+    ///   diagnostics). The "[dbg] " prefix on `ChatChannel::Debug`
+    ///   visually distinguishes client toasts from server System
+    ///   messages within this tab.
     pub fn accepts(self, c: ChatChannel) -> bool {
         match self {
-            ChatKind::Battle => matches!(
-                c,
-                ChatChannel::Battle | ChatChannel::System | ChatChannel::Debug
-            ),
-            ChatKind::Debug => matches!(c, ChatChannel::Debug),
+            ChatKind::Battle => matches!(c, ChatChannel::Battle),
+            ChatKind::Debug => matches!(c, ChatChannel::System | ChatChannel::Debug),
             ChatKind::Social => !matches!(
                 c,
                 ChatChannel::Battle | ChatChannel::System | ChatChannel::Debug
@@ -220,17 +222,14 @@ const AUTOTRANSLATE_COLOR: Color = Color::srgb(0.50, 0.78, 1.00);
 
 
 pub fn spawn_chat_panel(mut commands: Commands) {
-    // Tabbed layout: two panel entities stacked at the SAME bottom-left
-    // slot (0..50% width), only one visible at a time. The tab bar
-    // sitting just above them switches `ActiveChatTab`, which a system
-    // reacts to by toggling `Display` on the panels.
+    // Tabbed layout: three panel entities stacked at the SAME bottom-
+    // left slot (0..50% width), only one visible at a time. The tab
+    // bar sitting just above them switches `ActiveChatTab`, which a
+    // system reacts to by toggling `Display` on the panels.
     //
-    // - Social = retail's Chat 1 (say/shout/tell/party/linkshell/yell)
-    // - Battle = retail's Chat 2 (combat log + system + folded-in
-    //   client debug toasts via `ChatKind::accepts`)
-    //
-    // The third `ChatKind::Debug` pane has been retired; debug-channel
-    // messages render in Battle.
+    // - Social ("Chat"): say/shout/tell/party/linkshell/yell/other
+    // - Battle ("Battle"): combat log only
+    // - Debug  ("System"): server System messages + client toasts
     spawn_panel(
         &mut commands,
         ChatKind::Social,
@@ -243,7 +242,13 @@ pub fn spawn_chat_panel(mut commands: Commands) {
         ChatKind::Battle,
         Val::Percent(0.0),
         Val::Percent(50.0),
-        // Battle starts hidden — Social is the default ActiveChatTab.
+        Display::None,
+    );
+    spawn_panel(
+        &mut commands,
+        ChatKind::Debug,
+        Val::Percent(0.0),
+        Val::Percent(50.0),
         Display::None,
     );
     spawn_chat_tab_bar(&mut commands);
@@ -275,8 +280,12 @@ fn spawn_chat_tab_bar(commands: &mut Commands) {
             },
         ))
         .with_children(|p| {
-            spawn_tab_button(p, ChatKind::Social, "Chat 1", true);
-            spawn_tab_button(p, ChatKind::Battle, "Chat 2", false);
+            // Descriptive labels, retail-faithful where possible:
+            // "Chat" = Chat 1, "Battle" = Chat 2's combat half,
+            // "System" = server System + client Debug toasts.
+            spawn_tab_button(p, ChatKind::Social, "Chat", true);
+            spawn_tab_button(p, ChatKind::Battle, "Battle", false);
+            spawn_tab_button(p, ChatKind::Debug, "System", false);
         });
 }
 
@@ -322,10 +331,6 @@ fn spawn_panel(
     width: Val,
     initial_display: Display,
 ) {
-    // Debug pane is dev-only — tag with DevHud so the verbosity
-    // system can park it `Hidden`, and pre-hide here so the first
-    // frame doesn't flash it.
-    let is_dev = matches!(kind, ChatKind::Debug);
     let mut e = commands.spawn((
         crate::components::InGameEntity,
         ChatPanel { kind },
@@ -364,9 +369,6 @@ fn spawn_panel(
         BackgroundColor(palette::BACKGROUND),
         BorderColor::all(palette::BORDER),
     ));
-    if is_dev {
-        e.insert((crate::hud::DevHud, Visibility::Hidden));
-    }
     e.with_children(|p| {
             for slot in 0..VISIBLE_ROWS {
                 p.spawn((
