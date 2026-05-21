@@ -82,6 +82,28 @@ pub fn load_zone_weather(scene_state: Res<SceneState>, mut zone_weather: ResMut<
     let path = location.path_under(root.root());
     let Ok(bytes) = fs::read(&path) else { return };
     zone_weather.records = collect_weather_records(&bytes);
+
+    // One-shot diagnostic on zone load: list keyframe times so a
+    // "dusk too early" report can be cross-checked against the
+    // actual keyframe distribution for the zone. Sparse keyframes
+    // (e.g. only 0000/0600/1800/2400) produce long lerp segments
+    // that look like "darkness ramps from noon" if the 1800 entry
+    // is already dim. Logged only on records.is_empty() flipping to
+    // populated — same `current != zone_weather.zone_id` guard
+    // above ensures it doesn't repeat per frame.
+    if !zone_weather.records.is_empty() {
+        let times: Vec<String> = zone_weather
+            .records
+            .iter()
+            .map(|r| format!("{:02}:{:02}", r.time_minutes / 60, r.time_minutes % 60))
+            .collect();
+        info!(
+            zone_id,
+            count = zone_weather.records.len(),
+            "weather keyframes loaded at V-times: {}",
+            times.join(", ")
+        );
+    }
 }
 
 /// Sample the loaded weather keyframes at the current Vana'diel time

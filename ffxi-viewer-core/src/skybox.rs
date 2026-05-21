@@ -166,6 +166,17 @@ fn update_skybox(
     // Sampling at floor + ceil and lerping by the fractional V-minute
     // composes to the same straight-line lerp that `lerp_records`
     // produces internally, with f32 precision instead of u32.
+    //
+    // sRGB conversion: `WeatherRecord.skybox_colors` are stored
+    // sRGB-decoded (`/255.0`), not linear (see `ffxi_dat::weather`
+    // module docs lines 66-69). Bevy's render pipeline expects
+    // linear-space colors and tonemaps to sRGB on output, so passing
+    // raw f32s here would render every keyframe ~2.2-gamma darker
+    // than authored. `weather.rs::apply_zone_weather` correctly wraps
+    // its fog/ambient colors in `Color::srgb(..)`; we do the same
+    // here per channel before the lerp so blended values are
+    // interpolated in linear space (additive-light correct), not
+    // in sRGB space (which biases mid-tones toward "muddy").
     if zone_weather.records.is_empty() {
         return;
     }
@@ -184,11 +195,13 @@ fn update_skybox(
         return;
     };
     let lerp = |a: f32, b: f32| a + (b - a) * frac;
-    // Convert WeatherRecord's [[f32; 4]; 8] into [Vec4; 8], blending
-    // r0 → r1 by the sub-V-minute fraction.
+    let to_linear = |srgb: [f32; 4]| -> [f32; 4] {
+        let lin = Color::srgb(srgb[0], srgb[1], srgb[2]).to_linear();
+        [lin.red, lin.green, lin.blue, srgb[3]]
+    };
     for i in 0..8 {
-        let c0 = r0.skybox_colors[i];
-        let c1 = r1.skybox_colors[i];
+        let c0 = to_linear(r0.skybox_colors[i]);
+        let c1 = to_linear(r1.skybox_colors[i]);
         mat.data.colors[i] = Vec4::new(
             lerp(c0[0], c1[0]),
             lerp(c0[1], c1[1]),
@@ -196,7 +209,8 @@ fn update_skybox(
             lerp(c0[3], c1[3]),
         );
     }
-    // Pack 8 altitudes into 2 vec4s, also sub-V-minute lerped.
+    // Altitudes are scalar bin thresholds, not colors — no gamma
+    // conversion. Sub-V-minute lerped along with the colors.
     let a0 = r0.skybox_altitudes;
     let a1 = r1.skybox_altitudes;
     mat.data.altitudes_packed = [
