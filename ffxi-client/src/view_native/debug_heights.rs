@@ -156,13 +156,13 @@ pub fn process_debug_heights(
                 ),
             );
             for (i, (hit_y, normal)) in ranked_hits.iter().take(5).enumerate() {
-                let walkable = normal.y >= FLOOR_NORMAL_MIN;
+                let walkable = normal.y.abs() >= FLOOR_NORMAL_MIN;
                 let within_ceiling = *hit_y <= ceiling_y;
                 let tag = match (walkable, within_ceiling) {
                     (true, true) => "FLOOR",
-                    (true, false) => "above",
-                    (false, true) => "wall/ceiling",
-                    (false, false) => "above wall/ceiling",
+                    (true, false) => "above-ceiling",
+                    (false, true) => "wall",
+                    (false, false) => "above-wall",
                 };
                 push(
                     &mut scene_state,

@@ -177,14 +177,22 @@ pub struct MzbCollisionGeometry {
 /// outdoor zone keeps each cell's tri list to tens of entries.
 pub const MZB_GRID_CELL: f32 = 8.0;
 
-/// Minimum `normal.y` (in Bevy world frame) for a triangle to count as
-/// a walkable floor in [`MzbCollisionGeometry::ground_raycast`]. `0.5`
-/// corresponds to a 60° max slope, which matches the legacy FFXI
-/// stair-gradient cap and keeps everything from gentle ramps through
-/// steep dungeon stairs eligible, while excluding vertical walls,
-/// downward-facing eaves, and ceilings (which previously caused the
-/// snap to lock onto rooftop or arch tris and float the player a few
-/// yalms above the real floor).
+/// Minimum **|normal.y|** (in Bevy world frame) for a triangle to count
+/// as a walkable horizontal surface in
+/// [`MzbCollisionGeometry::ground_raycast`]. `0.5` corresponds to a
+/// 60° max slope, matching the legacy FFXI stair-gradient cap so
+/// ramps through steep dungeon stairs stay eligible, while vertical
+/// walls (`|n.y|` ≈ 0) are excluded.
+///
+/// The test is on the **absolute value** of `n.y` because FFXI's MZB
+/// winding convention emits floor triangles with `n.y ≈ -1` after the
+/// `(x, -y, -z)` axis flip in `load_mzb_placed` — the cross-product
+/// of the two edges as wound on disk points away from the visible
+/// top of the surface. Filtering by `n.y > 0` would reject every
+/// floor in the dataset; testing `|n.y|` keeps both authoring
+/// conventions (CCW and CW) eligible. Overhead geometry the entity
+/// shouldn't snap to is still excluded by the caller's `ceiling_y`
+/// bound — see [`MzbCollisionGeometry::ground_raycast`].
 pub const FLOOR_NORMAL_MIN: f32 = 0.5;
 
 impl MzbCollisionGeometry {
@@ -198,11 +206,13 @@ impl MzbCollisionGeometry {
     /// at or below `ceiling_y`. `None` when no qualifying triangle
     /// sits in the column.
     ///
-    /// "Upward-facing" is `normal.y ≥ FLOOR_NORMAL_MIN` — without that
-    /// filter the raycast would happily snap the entity onto an
-    /// overhanging eave, a vertical wall edge, or an inverted ceiling,
-    /// because those tris can still satisfy `hit_y ≤ ceiling_y` if the
-    /// entity is already elevated.
+    /// "Horizontal" is `|normal.y| ≥ FLOOR_NORMAL_MIN` — without that
+    /// filter the raycast would happily snap the entity onto a
+    /// vertical wall edge, because vertical-wall hits can still
+    /// satisfy `hit_y ≤ ceiling_y` if the entity is already elevated.
+    /// FFXI's MZB floor winding produces `n.y ≈ -1` in Bevy frame
+    /// (see [`FLOOR_NORMAL_MIN`]), so the test uses the absolute
+    /// value of `n.y`.
     ///
     /// `ceiling_y` continues to filter overhead floor-like geometry —
     /// arches, gate roofs, second-floor surfaces the player is walking
@@ -212,7 +222,7 @@ impl MzbCollisionGeometry {
     pub fn ground_raycast(&self, xz: Vec2, ceiling_y: f32) -> Option<f32> {
         let mut best_y: Option<f32> = None;
         self.for_each_hit_in_column(xz, |hit_y, normal| {
-            if normal.y < FLOOR_NORMAL_MIN || hit_y > ceiling_y {
+            if normal.y.abs() < FLOOR_NORMAL_MIN || hit_y > ceiling_y {
                 return;
             }
             best_y = Some(match best_y {
