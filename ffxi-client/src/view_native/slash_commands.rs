@@ -975,12 +975,31 @@ pub fn parse_slash(
     }
 }
 
-/// Build a debug chat line for slash-command output. Routes to
-/// `ChatChannel::Debug` (Chat 3 panel) so client-internal feedback
-/// doesn't mix with server-pushed System messages on Chat 2.
-/// Name preserved for call-site stability — the body now produces a
-/// Debug-channel line.
+/// Build a system chat line for slash-command output. Routes to
+/// `ChatChannel::System` so the response shows in the Battle pane
+/// (Chat 2) regardless of `/devhud` state. The earlier
+/// `ChatChannel::Debug` routing hid every slash-command response
+/// behind dev-hud-off — including `/help` itself, which left new
+/// operators with no visible feedback at all.
+///
+/// Anything that genuinely belongs on the Debug pane (noisy
+/// per-frame diagnostics, internal protocol traces) should use
+/// [`debug_chat_line`] explicitly; the default for slash output is
+/// "visible to the operator."
 pub fn system_chat_line(text: String) -> ChatLine {
+    ChatLine {
+        channel: ChatChannel::System,
+        sender: "client".into(),
+        text,
+        server_ts: 0,
+        local_seq: 0,
+    }
+}
+
+/// Build a debug-channel chat line for client-internal chatter that
+/// should stay hidden by default and only surface when `/devhud` is
+/// enabled. Counterpart to [`system_chat_line`].
+pub fn debug_chat_line(text: String) -> ChatLine {
     ChatLine {
         channel: ChatChannel::Debug,
         sender: "client".into(),
