@@ -2139,7 +2139,7 @@ fn decode_battle_message(
     // appears silent to the operator. The decoder's strict
     // "unknown id → None" contract is documented + tested at
     // `battle_message_unknown_id_returns_none`.
-    let raw = ffxi_proto::msg_basic::lookup(message_num)?;
+    let raw = template_for_id(message_num)?;
     let cas_name = name_for_id(cas_id, name_cache);
     let tar_name = name_for_id(tar_id, name_cache);
     let text =
@@ -2334,7 +2334,7 @@ fn build_battle2_line(
     amount: u32,
     action_id: u32,
 ) -> Option<ChatLine> {
-    let raw = ffxi_proto::msg_basic::lookup(message_num)?;
+    let raw = template_for_id(message_num)?;
     let text = substitute_battle_placeholders(
         raw,
         cas_name,
@@ -2355,6 +2355,38 @@ fn build_battle2_line(
         server_ts: 0,
     })
 }
+
+/// Resolve a battle-message id to its template text. Consults a small
+/// override table first for ids where LSB's `msg_basic.h` comment is
+/// known to be lossy versus the retail localized template, then falls
+/// back to the generated `msg_basic` table.
+///
+/// Each override entry must be backed by a citation: a call site where
+/// LSB sends this id with semantics that the generic enum comment
+/// doesn't capture. Without that citation, the override is a guess and
+/// will rot the day LSB widens the id's usage.
+fn template_for_id(message_num: u16) -> Option<&'static str> {
+    for &(id, template) in TEMPLATE_OVERRIDES {
+        if id == message_num {
+            return Some(template);
+        }
+    }
+    ffxi_proto::msg_basic::lookup(message_num)
+}
+
+/// Cited overrides for ids whose `msg_basic.h` comment is lossy
+/// relative to the retail template the client would render from its
+/// own `msg_basic.dat`. Until we ship a DMSG parser, this is the
+/// narrow workaround.
+const TEMPLATE_OVERRIDES: &[(u16, &str)] = &[
+    // MsgBasic::Obtains (565). LSB comment: "<target> obtains <amount>."
+    // The only LSB call sites are gil distribution
+    // (vendor/server/src/map/utils/charutils.cpp:4756, 4763) — both
+    // pushPacket<...>(PChar, PChar, gilAmount, 0, MsgBasic::Obtains).
+    // Retail's localized template carries the unit "gil", which the
+    // header comment drops.
+    (565, "<target> obtains <amount> gil."),
+];
 
 /// True when the wire-protocol's `Tar` slot holds the *grammatical subject*
 /// of the message (the entity the message is "about") rather than the
@@ -2436,27 +2468,49 @@ fn substitute_battle_placeholders(
             .unwrap_or_else(|| format!("skill #{}", data1));
         s = s.replace("<skill>", &skill);
     }
-    // Raw-id fallbacks for placeholders whose lookup tables we don't
-    // ship yet. Without these, magic-damage and ability-damage lines
-    // render with literal `<spell>` / `<ability>` in the chat panel,
-    // which is the more confusing failure mode — a numeric id at
-    // least tells the operator *which* spell or ability the message
-    // refers to. The 0x028 action stream supplies the spell/ability
-    // id via `action_id` (cmd_arg) at the action level — that's the
-    // canonical source. Without `action_id` (the 0x029 path) we fall
-    // back to `data1`, which is what Phoenix call sites traditionally
-    // pack the spell/ability id into for `BATTLE_MESSAGE`.
+    // Vendor-scraped name tables resolve `<spell>`, `<ability>`,
+    // `<item>`, `<job>` against `action_id` (the canonical source on
+    // 0x028 — cmd_arg at the action level) with a `data1` fallback
+    // (the slot Phoenix uses on 0x029 BATTLE_MESSAGE). `<status>`
+    // takes `data1` directly: GainsEffect-family templates pack the
+    // status id into `param` on 0x029. For 0x028 action results the
+    // status id lives in the result's `modifier`/`info` bits, which
+    // `build_battle2_line` does not yet thread through — once those
+    // surface, prefer them over data1.
+    //
+    // Unknown ids fall back to "spell #N" etc. so the operator at
+    // least sees *which* spell/item the message refers to, rather
+    // than a literal `<spell>` token that hides the gap.
     let resolved_action_id = action_id.unwrap_or(data1);
-    for (tag, label) in [
-        ("<spell>", "spell"),
-        ("<ability>", "ability"),
-        ("<status>", "status"),
-        ("<item>", "item"),
-        ("<job>", "job"),
-    ] {
-        if s.contains(tag) {
-            s = s.replace(tag, &format!("{label} #{resolved_action_id}"));
-        }
+    if s.contains("<spell>") {
+        let name = ffxi_proto::spell_names::lookup(resolved_action_id as u16)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("spell #{resolved_action_id}"));
+        s = s.replace("<spell>", &name);
+    }
+    if s.contains("<ability>") {
+        let name = ffxi_proto::ability_names::lookup(resolved_action_id as u16)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("ability #{resolved_action_id}"));
+        s = s.replace("<ability>", &name);
+    }
+    if s.contains("<item>") {
+        let name = ffxi_proto::item_names::lookup(resolved_action_id as u16)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("item #{resolved_action_id}"));
+        s = s.replace("<item>", &name);
+    }
+    if s.contains("<job>") {
+        let name = ffxi_proto::job_names::lookup(resolved_action_id as u16)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("job #{resolved_action_id}"));
+        s = s.replace("<job>", &name);
+    }
+    if s.contains("<status>") {
+        let name = ffxi_proto::status_names::lookup(data1 as u16)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("status #{data1}"));
+        s = s.replace("<status>", &name);
     }
     // Bare `X` / `#` are msg_basic.h's shorthand for inline numbers
     // (e.g., "skill rises X points.", "gains # experience points."). Use
@@ -3604,27 +3658,36 @@ mod tests {
 
     #[test]
     fn substitute_battle_x_marker_respects_token_boundary() {
-        // A bare `X` in a real msg_basic template ("rises X points")
-        // should be swapped; but a within-word X (like the 'X' in
-        // "BoXing" — unlikely in real templates but worth pinning the
-        // rule) must NOT be swapped.
-        let s =
-            substitute_battle_placeholders("rises X points. BoXing.", "cas", "tar", 0, 7, 38, None);
-        assert!(s.contains("rises 7 points"), "got: {s}");
+        // A bare `X` in a real msg_basic template should be swapped;
+        // a within-word X (like the 'X' in "BoXing" — unlikely in real
+        // templates but worth pinning the rule) must NOT be swapped.
+        // Use msg id 53 (SkillLevelUp, integer formatting) so the
+        // decimal-tenths special case for SkillGain (38) / SkillDrop
+        // (310) doesn't muddy the assertion.
+        let s = substitute_battle_placeholders(
+            "reaches level X. BoXing.",
+            "cas",
+            "tar",
+            0,
+            7,
+            53,
+            None,
+        );
+        assert!(s.contains("reaches level 7"), "got: {s}");
         assert!(s.contains("BoXing"), "within-word X must survive, got: {s}");
     }
 
     #[test]
-    fn battle_message_2_magic_damage_renders_spell_fallback() {
+    fn battle_message_2_magic_damage_resolves_spell_name() {
         // MagicDamage = 2, "<caster> casts <spell>. <target> takes <amount>
-        // points of damage." Without a spell lookup table we fall back to
-        // "spell #N" so the message stays readable.
+        // points of damage." With ffxi_proto::spell_names wired, spell 144
+        // resolves to "Fire" — not the legacy "spell #144" fallback.
         use std::collections::HashMap;
         let mut data = vec![0u8; 24];
         data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes()); // cas (caster)
         data[4..8].copy_from_slice(&0xBEEFu32.to_le_bytes()); // tar
-        data[8..12].copy_from_slice(&144u32.to_le_bytes()); // Data = SpellID
-        data[12..16].copy_from_slice(&0u32.to_le_bytes()); // Data2 (amount? — for MagicDamage retail packs amount differently; this test just asserts substitution)
+        data[8..12].copy_from_slice(&144u32.to_le_bytes()); // Data = SpellID = Fire
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
         data[20..22].copy_from_slice(&2u16.to_le_bytes());
         let mut cache = HashMap::new();
         cache.insert(0xCAFEu32, "Daisy".to_string());
@@ -3633,10 +3696,49 @@ mod tests {
         assert!(
             line.text.contains("Daisy")
                 && line.text.contains("Mandragora")
-                && line.text.contains("spell #144")
-                && !line.text.contains("<spell>"),
-            "expected spell fallback in: {}",
+                && line.text.contains("Fire")
+                && !line.text.contains("<spell>")
+                && !line.text.contains("spell #"),
+            "expected resolved spell name in: {}",
             line.text
+        );
+    }
+
+    #[test]
+    fn battle_message_565_obtains_gil_override_appends_unit() {
+        // MsgBasic::Obtains (565). LSB header comment is
+        // "<target> obtains <amount>." but every LSB call site sends
+        // this for gil distribution (charutils.cpp:4756, 4763), so the
+        // TEMPLATE_OVERRIDES table swaps in "<target> obtains <amount> gil."
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes()); // cas
+        data[4..8].copy_from_slice(&0xCAFEu32.to_le_bytes()); // tar (self)
+        data[8..12].copy_from_slice(&4u32.to_le_bytes()); // Data = gil amount
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        data[20..22].copy_from_slice(&565u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Mithy".to_string());
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert_eq!(line.text, "Mithy obtains 4 gil.", "got: {}", line.text);
+    }
+
+    #[test]
+    fn substitute_status_placeholder_resolves_effect_name() {
+        // Direct substitution test: <status> resolves via
+        // ffxi_proto::status_names::lookup(data1).
+        let s = substitute_battle_placeholders(
+            "gains the effect of <status>.",
+            "cas",
+            "tar",
+            40,
+            0,
+            186,
+            None,
+        );
+        assert!(
+            s.contains("Protect") && !s.contains("<status>") && !s.contains("status #"),
+            "expected resolved status name in: {s}"
         );
     }
 
@@ -3746,7 +3848,7 @@ mod tests {
         // <amount> points of damage." cmd_arg = SpellID = 144 (Fire),
         // result.value = 87 damage. The decoder must thread cmd_arg
         // through `substitute_battle_placeholders` as the action_id
-        // so `<spell>` renders as "spell #144".
+        // so `<spell>` resolves to "Fire" via ffxi_proto::spell_names.
         use std::collections::HashMap;
         let mut w = BattleBitWriter::new(8);
         w.write(0xCAFE, 32);
@@ -3777,8 +3879,8 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let l = &lines[0];
         assert!(
-            l.text.contains("Daisy") && l.text.contains("spell #144") && l.text.contains("87"),
-            "expected casts/spell/amount, got: {}",
+            l.text.contains("Daisy") && l.text.contains("Fire") && l.text.contains("87"),
+            "expected casts/Fire/87 in: {}",
             l.text
         );
     }
