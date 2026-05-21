@@ -53,6 +53,21 @@ pub struct SkinnedActor {
     /// Each bone entity carries a `Transform`; the tick system writes
     /// the animated local transform every frame.
     pub bone_entities: Vec<Entity>,
+    /// The pivot entity sitting between `parent` and `bone_entities[0]`,
+    /// carrying the FFXI-engine→Bevy axis flip (Q_x(π) for PCs,
+    /// IDENTITY for NPCs) and the feet-at-origin translation
+    /// (`Vec3::Y * -actor_min_local_y`). Subsequent slot loads update
+    /// its translation when a deeper min surfaces — all slots of one
+    /// actor must share the same translation, or per-slot shifts will
+    /// disassemble the rig.
+    pub pivot: Entity,
+    /// Running minimum local-Y observed across every slot loaded for
+    /// this actor so far. Used to decide whether a new slot's deeper
+    /// min requires updating the pivot translation.
+    pub min_local_y: f32,
+    /// Running maximum local-Y (head extent across slots). Surfaces in
+    /// `BakedActor.actor_height` for nameplate / camera anchors.
+    pub max_local_y: f32,
 }
 
 /// Marker component for VertexOs2-spawned meshes — parallel to
@@ -651,6 +666,15 @@ pub fn process_load_vos2_requests(
     mut inverse_bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     scene_state: ResMut<SceneState>,
     tracked: Res<TrackedEntities>,
+    // SkinnedActor is inserted on the *first* slot of an actor and
+    // carries the pivot entity + the running (min, max) local-y.
+    // Subsequent slots read it to find the pivot, update the running
+    // bounds, and re-set the pivot's translation if a deeper min just
+    // arrived. Without this, the GPU-skinned path would freeze the
+    // pivot at the first slot's bounds and later slots would render
+    // misaligned (legs floating off the rig, etc.).
+    mut q_skinned_actor: Query<&mut SkinnedActor>,
+    mut q_xform: Query<&mut Transform>,
 ) {
     let queued: Vec<LoadVos2Request> = events.read().copied().collect();
     if queued.is_empty() {
@@ -747,13 +771,17 @@ pub fn process_load_vos2_requests(
                     );
                 }
                 let existing = bone_trees.get(&req.entity_id).cloned();
-                // Measure the bake's vertical extent *before* spawning
-                // so the pivot can fold the feet-at-origin translation
-                // in: `pivot.translation = Vec3::Y * -min_local_y`
-                // pushes the lowest baked vertex onto y=0 in the
-                // entity's local frame, which is the invariant the
-                // snap relies on.
-                let (min_local_y, max_local_y) =
+                // Measure THIS slot's local-y extent. Each LoadVos2
+                // request brings one OS2 chunk (≈ one body part); a
+                // multi-part actor (PC equipment slots, or some
+                // multi-DAT NPCs) needs the **actor-wide** min to
+                // decide the pivot translation. Otherwise legs/head
+                // chunks would each shift by their own slot's min and
+                // disassemble the rig — same bug the launcher
+                // (`spawn_equipped`) was fixed for, but on the
+                // GPU-skinned path it lives across multiple
+                // `process_load_vos2_requests` invocations.
+                let (slot_min, slot_max) =
                     compute_skinned_local_y_extent(loaded, is_pc).unwrap_or((-0.9, 1.6));
                 let bone_entities = spawn_skinned_actor(
                     &mut commands,
@@ -766,32 +794,56 @@ pub fn process_load_vos2_requests(
                     raw,
                     existing,
                     is_pc,
-                    min_local_y,
+                    slot_min,
+                    slot_max,
                 );
                 bone_trees.insert(req.entity_id, bone_entities);
-                // BakedActor marker is purely informational after the
-                // feet-at-origin refactor — the snap doesn't read it,
-                // since the pivot's `Vec3::Y * -min_local_y`
-                // translation already puts the mesh's lowest vertex at
-                // the entity's local y=0. We still record
-                // `min_mesh_y` + `actor_height` so the nameplate /
-                // camera anchors can size to the actor and so
-                // `/debug heights` can surface the empirical bake
-                // extent.
-                let actor_height = (max_local_y - min_local_y).max(0.1);
+                // Aggregate this slot into the actor's running bounds
+                // and update the pivot translation if the actor just
+                // reached a deeper min. The pivot was inserted with
+                // `slot_min` as the (provisional) translation on the
+                // first call; for subsequent calls we merge bounds
+                // and adjust if needed. Reads/writes go through the
+                // persistent `SkinnedActor` component, so this works
+                // across multi-tick request queues.
+                let (actor_min_y, actor_max_y) = if let Ok(mut actor) =
+                    q_skinned_actor.get_mut(bevy_e)
+                {
+                    let new_min = actor.min_local_y.min(slot_min);
+                    let new_max = actor.max_local_y.max(slot_max);
+                    if new_min < actor.min_local_y {
+                        // A deeper slot just arrived — re-anchor the
+                        // pivot so the new low sits at parent.y = 0.
+                        if let Ok(mut piv) = q_xform.get_mut(actor.pivot) {
+                            piv.translation.y = -new_min;
+                        }
+                    }
+                    actor.min_local_y = new_min;
+                    actor.max_local_y = new_max;
+                    (new_min, new_max)
+                } else {
+                    // SkinnedActor not yet inserted by Commands (still
+                    // queued from this same request). Fall back to
+                    // this slot's bounds; subsequent slots will
+                    // overwrite via the `.get_mut` path above.
+                    (slot_min, slot_max)
+                };
+                let actor_height = (actor_max_y - actor_min_y).max(0.1);
                 commands.entity(bevy_e).insert(crate::scene::BakedActor {
-                    min_mesh_y: min_local_y,
+                    min_mesh_y: actor_min_y,
                     actor_height,
                 });
                 info!(
                     "skinned actor spawn: file_id={} entity_id={} verts={} groups={} \
-                     min_local_y={:.2} max_local_y={:.2} actor_height={:.2}",
+                     slot=[{:.2}..{:.2}] actor=[{:.2}..{:.2}] actor_height={:.2}",
                     req.file_id,
                     req.entity_id,
                     loaded.mesh.vertices.len(),
                     loaded.mesh.groups.len(),
-                    min_local_y,
-                    max_local_y,
+                    slot_min,
+                    slot_max,
+                    actor_min_y,
+                    actor_max_y,
                     actor_height,
                 );
                 continue;
@@ -929,7 +981,13 @@ fn spawn_skinned_actor(
     raw: &std::sync::Arc<Skeleton>,
     existing_bone_entities: Option<Vec<Entity>>,
     is_pc: bool,
+    // Initial per-slot bounds. The first slot of an actor seeds the
+    // pivot's translation (`-min_local_y`) and the `SkinnedActor`'s
+    // running `(min, max)`. Subsequent slots merge their bounds via
+    // the caller (`process_load_vos2_requests`), which also re-anchors
+    // the pivot if a deeper min surfaces.
     min_local_y: f32,
+    max_local_y: f32,
 ) -> Vec<Entity> {
     use ffxi_dat::bone::PARENT_ROOT;
 
@@ -1008,10 +1066,15 @@ fn spawn_skinned_actor(
             }
             // Insert the parent-side `SkinnedActor` once (only on the
             // first chunk's spawn — the existing-vec branch above
-            // skips this).
+            // skips this). Carries the pivot entity + the running
+            // (min, max) so subsequent slot loads can update the pivot
+            // translation if they reach deeper than the first slot.
             commands.entity(parent).insert(SkinnedActor {
                 dat_id: raw_dat_id_for_skeleton(raw),
                 bone_entities: ents.clone(),
+                pivot: root_parent,
+                min_local_y,
+                max_local_y,
             });
             ents
         }
