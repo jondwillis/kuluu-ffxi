@@ -123,6 +123,13 @@ pub fn spawn_bottom_left_stack(
             chat_panel::spawn_chat_tab_bar_as_child(p);
             #[cfg(not(target_arch = "wasm32"))]
             crate::minimap::spawn_minimap_as_child(p, &mut images);
+            // Cluster the Vana clock + weather chip immediately above
+            // the minimap, replacing retail's "minimap compass" slot.
+            // Column-reverse means later children stack visually
+            // higher, so these sit at the top of the bottom-left
+            // stack — closest to the camera viewport edge.
+            vana_clock::spawn_vana_clock_as_child(p);
+            weather_icon::spawn_weather_icon_as_child(p);
         });
 }
 
@@ -303,7 +310,6 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             dialog::spawn_dialog_panel,
             shop::spawn_shop_panel,
             compass::spawn_compass,
-            vana_clock::spawn_vana_clock,
             zone_flash::spawn_zone_flash,
             self_hud::spawn_self_hud,
             status_ribbon::spawn_status_ribbon,
@@ -312,10 +318,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             mesh_debug::spawn_mesh_debug_hud,
         ),
     );
-    // Second `add_systems` call — see the matching split in `Update`
-    // registration above: Bevy's `IntoScheduleConfigs` tuple impls cap
-    // at 20 entries.
-    app.add_systems(schedule, weather_icon::spawn_weather_icon);
-    // Minimap is now a child of BottomLeftStack — spawned inside
-    // `spawn_bottom_left_stack` (native only via cfg-gating).
+    // Minimap, Vana clock, and weather icon all spawn as children of
+    // `BottomLeftStack` (see `spawn_bottom_left_stack`); no separate
+    // top-level registration is needed for them any more.
 }

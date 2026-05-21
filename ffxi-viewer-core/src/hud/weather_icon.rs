@@ -75,43 +75,49 @@ pub fn weather_label(w: Weather) -> &'static str {
     }
 }
 
-pub fn spawn_weather_icon(mut commands: Commands) {
-    // Top-right column, sat one slot left of `vana_clock`. Vana clock
-    // anchors at `right: 8` with variable width (~120 px for the date
-    // string), so we offset by 132 to clear it without overlap.
-    commands
-        .spawn((
-            crate::components::InGameEntity,
-            WeatherIconPanel,
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(104.0),
-                right: Val::Px(132.0),
-                padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
-                border: UiRect::all(Val::Px(1.0)),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                display: Display::None,
+/// Spawn the weather icon as a child of the bottom-left flex stack
+/// (above the minimap), matching retail's layout where weather sits
+/// in the same corner as the compass-equivalent. Width is auto so
+/// the chip hugs its glyph + label.
+///
+/// Hidden by default via `Display::None`; `update_weather_icon`
+/// flips it to `Flex` whenever `SceneState.snapshot.weather` is a
+/// non-`None` variant. (In LSB dev environments the weather snapshot
+/// often stays `None` until a 0x057 packet arrives — that's why the
+/// chip can look "always hidden" without a server emitting weather.)
+pub fn spawn_weather_icon_as_child(p: &mut ChildSpawnerCommands) {
+    p.spawn((
+        WeatherIconPanel,
+        Node {
+            // `flex_shrink: 0` matches the minimap so the bottom-left
+            // stack doesn't compress this chip when the chat panel
+            // expands.
+            flex_shrink: 0.0,
+            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            display: Display::None,
+            ..default()
+        },
+        BackgroundColor(palette::BACKGROUND),
+        BorderColor::all(palette::BORDER),
+    ))
+    .with_children(|p| {
+        p.spawn((
+            WeatherIconGlyph,
+            // The tooltip label is folded into the same Text node
+            // as a trailing " name" suffix, matching the chip-style
+            // single-line layout used by `vana_clock`. A real
+            // tooltip-on-hover system is out of scope for this stub.
+            Text::new(""),
+            TextFont {
+                font_size: 14.0,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
-        ))
-        .with_children(|p| {
-            p.spawn((
-                WeatherIconGlyph,
-                // The tooltip label is folded into the same Text node
-                // as a trailing " name" suffix, matching the chip-style
-                // single-line layout used by `vana_clock`. A real
-                // tooltip-on-hover system is out of scope for this stub.
-                Text::new(""),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(palette::TEXT),
-            ));
-        });
+            TextColor(palette::TEXT),
+        ));
+    });
 }
 
 pub fn update_weather_icon(

@@ -36,40 +36,37 @@ pub struct VanaClockPanel;
 #[derive(Component)]
 pub struct VanaClockLabel;
 
-pub fn spawn_vana_clock(mut commands: Commands) {
-    commands
-        .spawn((
-            crate::components::InGameEntity,
-            VanaClockPanel,
-            Node {
-                position_type: PositionType::Absolute,
-                // Top-right column, slot 2: just below the compass.
-                // Compass: top 36..96 (60 px tall). Clock at 104 leaves
-                // an 8-px gap. The full top-right column stack is:
-                //   compass     top: 36   (60px)
-                //   vana_clock  top: 104  (~28px)
-                //   llm_badge   top: 140  (~32px)
-                //   roster      top: 200  (~variable, expands down)
-                top: Val::Px(104.0),
-                right: Val::Px(8.0),
-                padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
-                border: UiRect::all(Val::Px(1.0)),
+/// Spawn the Vana clock as a child of the bottom-left flex stack,
+/// docked above the minimap. Retail FFXI clusters its persistent
+/// indicators (minimap-compass + clock) in the same screen corner;
+/// this matches that layout rather than the previous top-right
+/// column.
+pub fn spawn_vana_clock_as_child(p: &mut ChildSpawnerCommands) {
+    p.spawn((
+        VanaClockPanel,
+        Node {
+            // `flex_shrink: 0` keeps the chip at its content width
+            // even when the chat panel expands and squeezes the
+            // bottom-left stack.
+            flex_shrink: 0.0,
+            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BackgroundColor(palette::BACKGROUND),
+        BorderColor::all(palette::BORDER),
+    ))
+    .with_children(|p| {
+        p.spawn((
+            VanaClockLabel,
+            Text::new("V—"),
+            TextFont {
+                font_size: 12.0,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
-        ))
-        .with_children(|p| {
-            p.spawn((
-                VanaClockLabel,
-                Text::new("V—"),
-                TextFont {
-                    font_size: 12.0,
-                    ..default()
-                },
-                TextColor(palette::TEXT),
-            ));
-        });
+            TextColor(palette::TEXT),
+        ));
+    });
 }
 
 pub fn update_vana_clock(time: Res<Time>, mut q: Query<&mut Text, With<VanaClockLabel>>) {
