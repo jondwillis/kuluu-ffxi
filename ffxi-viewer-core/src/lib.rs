@@ -24,6 +24,8 @@ pub mod components;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_mmb;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod dat_d3m;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod dat_mzb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_vos2;
@@ -41,6 +43,7 @@ pub mod nameplate;
 pub mod nameplate_billboard;
 pub mod picking;
 pub mod scene;
+pub mod scheduler_runtime;
 pub mod snapshot;
 pub mod source;
 pub mod sun_moon;
@@ -132,6 +135,11 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // top-down backend reads `dat_mzb::MzbCollisionGeometry`.
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(minimap::MinimapPlugin);
+        // Action-scheduler runtime: advances ActiveScheduler components
+        // (one per acting entity) by elapsed real time × 30 fps and
+        // fans stages out as SchedulerStageEvent messages. D2 (particle
+        // spawn) and E3 (sound dispatch) will subscribe.
+        app.add_plugins(scheduler_runtime::SchedulerRuntimePlugin);
         app.init_resource::<SceneState>()
             .init_resource::<EventLog>()
             .init_resource::<TrackedEntities>()
