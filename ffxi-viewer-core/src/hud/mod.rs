@@ -173,6 +173,16 @@ impl Plugin for HudPlugin {
         app.add_systems(Update, apply_dev_hud_visibility);
         app.add_systems(Update, chat_panel::chat_tab_click_system);
         app.add_systems(Update, chat_panel::update_chat_tab_visuals_system);
+        // Runs AFTER update_chat_panel (which mutates panel height
+        // each frame via auto-decay) so the tab bar + minimap see the
+        // current frame's chat height, not last frame's. Bevy's
+        // default Update ordering is parallel-when-possible; an
+        // explicit `.after()` pins the dependency.
+        app.add_systems(
+            Update,
+            chat_panel::position_bottom_left_stack_system
+                .after(chat_panel::update_chat_panel),
+        );
         app.add_systems(Update, weather_icon::update_weather_icon);
         // Combat pulse: detect-then-modulate, chained so the color
         // update sees the latched timestamp from the same frame. Both

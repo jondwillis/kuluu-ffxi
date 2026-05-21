@@ -259,14 +259,13 @@ fn spawn_chat_tab_bar(commands: &mut Commands) {
             ChatTabBar,
             Node {
                 position_type: PositionType::Absolute,
-                // Just above the chat-panel top edge. The panel itself
-                // spans bottom 54..214 (54 + PANEL_MAX_HEIGHT_PX=160),
-                // so anchoring the tab bar at bottom: 218 leaves a 4px
-                // breathing gap. When the chat panel shrinks via
-                // auto-decay this gap grows, which is acceptable —
-                // retail's chat-1/chat-2 buttons also live in fixed
-                // screen space, not attached to the pane's top.
-                bottom: Val::Px(218.0),
+                // `bottom` is rewritten every frame by
+                // [`position_bottom_left_stack_system`] to track the
+                // chat panel's current (auto-decaying) height. The
+                // initial value (matches chat MIN_HEIGHT + gap) is
+                // just to avoid a one-frame flash at the wrong
+                // location before the stack system first runs.
+                bottom: Val::Px(54.0 + PANEL_MIN_HEIGHT_PX + 4.0),
                 left: Val::Px(0.0),
                 height: Val::Px(20.0),
                 padding: UiRect::axes(Val::Px(2.0), Val::Px(0.0)),
@@ -808,6 +807,84 @@ pub fn chat_wheel_scroll_system(
     }
     // Suppress camera zoom on the same wheel event.
     pointer.wheel = 0.0;
+}
+
+/// Responsive bottom-left stack. Reads the visible chat panel's
+/// current height (which auto-decays between [`PANEL_MIN_HEIGHT_PX`]
+/// and [`PANEL_MAX_HEIGHT_PX`]) and slides the chat tab bar + minimap
+/// up/down so they sit *above* the chat without ever overlapping it.
+///
+/// Stack (anchored bottom-left, growing up):
+/// ```text
+/// ┌─────────────┐
+/// │  minimap    │  ← bottom = chat_top + tab_h + 2 gaps
+/// ├─────────────┤
+/// │ [1] [2]     │  ← bottom = chat_top + 1 gap
+/// ├─────────────┤
+/// │   chat      │  bottom: 54  (chat-input strip below)
+/// │             │
+/// └─────────────┘
+/// ```
+///
+/// Without this system the tab bar (fixed `bottom: 218`) and the
+/// minimap (fixed `bottom: 220`) overlapped each other AND the
+/// chat panel at its full auto-decay height (`bottom: 274`).
+///
+/// Runs every frame because chat height interpolates continuously
+/// during auto-decay fade-out; the change-detection guard
+/// (`if node.bottom != want`) keeps the per-frame cost trivial.
+pub fn position_bottom_left_stack_system(
+    chat_q: Query<&Node, With<ChatPanel>>,
+    mut tab_bar_q: Query<
+        &mut Node,
+        (
+            With<ChatTabBar>,
+            Without<ChatPanel>,
+            Without<crate::minimap::MinimapRoot>,
+        ),
+    >,
+    mut minimap_q: Query<
+        &mut Node,
+        (
+            With<crate::minimap::MinimapRoot>,
+            Without<ChatPanel>,
+            Without<ChatTabBar>,
+        ),
+    >,
+) {
+    // Use the maximum visible-panel height so tab+minimap don't dip
+    // into a hidden panel's space when ActiveChatTab swaps. Each
+    // panel's height interpolates between MIN and MAX via auto-decay,
+    // so this captures the live size of whatever tab is showing.
+    let chat_h = chat_q
+        .iter()
+        .filter(|n| n.display != Display::None)
+        .filter_map(|n| match n.height {
+            Val::Px(h) => Some(h),
+            _ => None,
+        })
+        .fold(0.0_f32, f32::max);
+
+    const CHAT_BOTTOM_PX: f32 = 54.0;
+    const TAB_BAR_HEIGHT_PX: f32 = 20.0;
+    const GAP_PX: f32 = 4.0;
+
+    let chat_top = CHAT_BOTTOM_PX + chat_h;
+    let tab_bottom = chat_top + GAP_PX;
+    let minimap_bottom = tab_bottom + TAB_BAR_HEIGHT_PX + GAP_PX;
+
+    if let Ok(mut node) = tab_bar_q.single_mut() {
+        let want = Val::Px(tab_bottom);
+        if node.bottom != want {
+            node.bottom = want;
+        }
+    }
+    if let Ok(mut node) = minimap_q.single_mut() {
+        let want = Val::Px(minimap_bottom);
+        if node.bottom != want {
+            node.bottom = want;
+        }
+    }
 }
 
 /// React to clicks on a [`ChatTabButton`] — set [`ActiveChatTab`] to

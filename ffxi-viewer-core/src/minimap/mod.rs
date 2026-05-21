@@ -238,16 +238,16 @@ pub fn spawn_minimap(mut commands: Commands, mut images: ResMut<Assets<Image>>) 
             MinimapRoot,
             Node {
                 position_type: PositionType::Absolute,
-                // Bottom-left corner — retail FFXI's compass-minimap
-                // slot. Overlays the chat panel rather than sitting in
-                // the empty top-right column, because retail puts both
-                // the compass and the proximity-radar functionality
-                // here and the operator scans this quadrant for
-                // orientation. The chat panel sits at bottom: 54,
-                // height ~160; minimap-bottom: 220 stacks just above
-                // the chat-input strip (bottom 28..52) with a small
-                // breathing gap.
-                bottom: Val::Px(220.0),
+                // Bottom-LEFT, stacked above the chat panel + tab bar.
+                // The actual `bottom` value is rewritten every frame by
+                // [`crate::hud::chat_panel::position_bottom_left_stack_system`]
+                // so the minimap stays just above the tab bar as the
+                // chat panel's auto-decay interpolates its height
+                // between `PANEL_MIN_HEIGHT_PX` and `PANEL_MAX_HEIGHT_PX`.
+                // The initial value (matches the stack system's idle
+                // computation) is just to avoid a one-frame flash at
+                // the wrong location before that system first runs.
+                bottom: Val::Px(54.0 + 60.0 + 4.0 + 20.0 + 4.0),
                 left: Val::Px(8.0),
                 width: Val::Px(MINIMAP_UI_SIZE_PX),
                 height: Val::Px(MINIMAP_UI_SIZE_PX),
