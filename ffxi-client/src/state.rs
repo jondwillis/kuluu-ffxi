@@ -909,6 +909,7 @@ impl SessionState {
             | AgentEvent::EngagedBy { .. }
             | AgentEvent::TellReceived { .. }
             | AgentEvent::SceneSummary { .. }
+            | AgentEvent::ActionStarted { .. }
             | AgentEvent::HumanInControl { .. }
             | AgentEvent::HumanReleased
             // Music events are pure pass-through to the viewer-core
@@ -1105,6 +1106,15 @@ pub enum AgentEvent {
         shutdown: bool,
     },
     EventEnded,
+    /// 0x028 BATTLE2 — action started. Surfaced to the viewer so it
+    /// can load the action's DAT and drive animation + particles +
+    /// audio playback. `action_kind` is the wire `cmd_no` byte
+    /// (`4` = Magic, `6` = Ability, …).
+    ActionStarted {
+        actor_id: u32,
+        action_id: u32,
+        action_kind: u8,
+    },
     KeyRotated {
         previous_status: BlowfishStatus,
     },

@@ -367,6 +367,97 @@ pub fn tick_particle_ttl(
     }
 }
 
+/// Resolve an action wire id + kind to the FFXI DAT file_id that
+/// carries its Scheduler / Generator / D3M / Sep chunks.
+///
+/// **Stub.** Returns `None` for every input until a real spell/
+/// ability/mob-skill table is wired in. The mapping is a POLUtils-
+/// style data table — needs to be sourced from `vendor/server/sql`
+/// or a build-time scrape similar to [[altanalistener_music_catalog]].
+/// Once that lands, branch on `action_kind` (4=Magic, 6=Ability, …)
+/// and look up the per-kind table.
+///
+/// Why this exists as a stub now: the wire-side `ActionStarted`
+/// event already fires every time a 0x028 BATTLE2 lands, so as soon
+/// as the table is populated the entire Action → Scheduler →
+/// Particle/SE chain will start working end-to-end with zero
+/// further plumbing.
+pub fn action_dat_file_id(_action_id: u32, _action_kind: u8) -> Option<u32> {
+    None
+}
+
+/// Consume `ViewerEvent::ActionStarted` events from [`EventLog`],
+/// load the action's DAT, parse it, and attach
+/// `(ActiveScheduler, ActionAssets)` to the casting actor's Bevy
+/// entity. From there the existing dispatch systems (particles,
+/// sound) run end-to-end without further wiring.
+///
+/// Silently no-ops when the actor entity isn't tracked yet (entity
+/// hasn't been spawned), when the DAT mapping returns `None`
+/// (stub), or when the DAT can't be read (no install path / file
+/// missing).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn dispatch_action_started(
+    events: Res<crate::snapshot::EventLog>,
+    tracked: Res<crate::scene::TrackedEntities>,
+    mut commands: Commands,
+    mut last_seen: Local<usize>,
+) {
+    // Walk only the *newly-arrived* tail of EventLog.recent — without
+    // this, the same event would re-fire every frame for as long as
+    // it stays in the ring buffer (capped at 64 entries).
+    let total = events.recent.len();
+    let new_count = total.saturating_sub(*last_seen);
+    *last_seen = total;
+    if new_count == 0 {
+        return;
+    }
+    for ev in events.recent.iter().rev().take(new_count).rev() {
+        let ffxi_viewer_wire::ViewerEvent::ActionStarted {
+            actor_id,
+            action_id,
+            action_kind,
+        } = *ev
+        else {
+            continue;
+        };
+        let Some(&actor_entity) = tracked.by_id.get(&actor_id) else {
+            continue;
+        };
+        let Some(file_id) = action_dat_file_id(action_id, action_kind) else {
+            // Table not populated yet — drop the event. Once the
+            // table lands the whole chain lights up. Don't log here:
+            // every action would spam until then.
+            continue;
+        };
+        // Resolve + read the DAT. All errors silently abort — a
+        // missing DAT or no install path shouldn't surface as a
+        // warning every action.
+        let Ok(root) = ffxi_dat::DatRoot::from_env_or_default() else {
+            continue;
+        };
+        let Ok(loc) = root.resolve(file_id) else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(loc.path_under(root.root())) else {
+            continue;
+        };
+        let (schedulers, assets) = parse_action_bytes(&bytes);
+        // Pick the "main" scheduler if present, else first. Real
+        // action DATs typically ship one or two; lotus's actor uses
+        // whichever was named "main" or the first parseable.
+        let scheduler = schedulers
+            .iter()
+            .find(|s| &s.name == b"main")
+            .or_else(|| schedulers.first());
+        let Some(scheduler) = scheduler else { continue };
+        commands
+            .entity(actor_entity)
+            .insert(ActiveScheduler::from_scheduler(scheduler))
+            .insert(assets);
+    }
+}
+
 /// Bevy plugin: registers [`SchedulerStageEvent`] and the tick system.
 /// Front-ends add this once; per-action components are inserted by
 /// whichever subsystem decodes the action DAT and starts playback
@@ -386,6 +477,10 @@ impl Plugin for SchedulerRuntimePlugin {
         app.add_systems(
             Update,
             (
+                // Action start: load DAT, build (Scheduler, Assets)
+                // for the casting actor. Runs first so the same-frame
+                // dispatchers see fresh ActiveSchedulers.
+                dispatch_action_started,
                 dispatch_particle_stages,
                 dispatch_sound_stages,
                 tick_particle_ttl,

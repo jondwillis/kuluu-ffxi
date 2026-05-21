@@ -888,6 +888,18 @@ fn handle_sub_packet(
             // multiple targets and multiple results per target — fan
             // them out into individual chat lines so each hit/miss/
             // damage event lands separately in Chat 2.
+            //
+            // Pre-pass: emit `ActionStarted` so the viewer can load
+            // the action's DAT and drive animation + particles + audio.
+            // The header is the first 109 bits of the bitstream; we
+            // peek just the actor + cmd_no + cmd_arg fields.
+            if let Some((actor_id, action_id, action_kind)) = decode_battle2_header(sub.data) {
+                let _ = event_tx.send(AgentEvent::ActionStarted {
+                    actor_id,
+                    action_id,
+                    action_kind,
+                });
+            }
             for line in decode_battle2_action(sub.data, name_cache) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
@@ -2220,6 +2232,24 @@ impl<'a> BattleBitReader<'a> {
 /// underflows mid-decode. Returns a partial list if mid-stream
 /// truncation hits after some results were already emitted — the
 /// partial ones are valid.
+/// Peek the action-start header of a `GP_SERV_COMMAND_BATTLE2` (0x028)
+/// sub-packet body: `(actor_id, action_id /* cmd_arg */, action_kind /* cmd_no */)`.
+///
+/// Layout (mirrors [`decode_battle2_action`] start; see that function for
+/// the full bitstream documentation). We deliberately stop after the
+/// header so this can run cheaply per packet without spinning up the
+/// full target/result iteration. Returns `None` on truncation —
+/// callers should fall through to chat-line decoding regardless.
+pub fn decode_battle2_header(data: &[u8]) -> Option<(u32, u32, u8)> {
+    let mut br = BattleBitReader::new(data, 8); // skip workSize byte
+    let actor_id = br.read(32)? as u32;
+    let _trg_sum = br.read(6)?;
+    let _res_sum = br.read(4)?;
+    let action_kind = br.read(4)? as u8;
+    let action_id = br.read(32)? as u32;
+    Some((actor_id, action_id, action_kind))
+}
+
 fn decode_battle2_action(
     data: &[u8],
     name_cache: &std::collections::HashMap<u32, String>,

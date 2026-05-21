@@ -585,6 +585,18 @@ pub enum ViewerEvent {
         skill_id: u16,
         level: u32,
     },
+    /// 0x028 BATTLE2 header — an action (spell, ability, mob-skill,
+    /// melee swing) started on `actor_id`. The viewer uses this to
+    /// load the action's DAT, parse its Scheduler/Generator/D3M/Sep
+    /// chunks, and drive animation + particle + audio playback on
+    /// the actor's Bevy entity. `action_kind` is the bit-4-wide
+    /// `cmd_no` field (e.g. `4` = Magic, `6` = Ability — see
+    /// `vendor/server/src/map/packets/s2c/0x028_battle2.cpp`).
+    ActionStarted {
+        actor_id: u32,
+        action_id: u32,
+        action_kind: u8,
+    },
 }
 
 /// Server→viewer frame on the WebSocket. `Snapshot` and `Delta` are boxed
