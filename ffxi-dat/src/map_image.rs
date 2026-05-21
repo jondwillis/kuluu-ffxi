@@ -43,6 +43,40 @@ use std::io::Read;
 
 use crate::{DatError, Result};
 
+// Compile-time generated table of `(zone_id, map_index, file_id)`
+// derived from POLUtils' ROMFileMappings.xml. See `ffxi-dat/build.rs`.
+include!(concat!(env!("OUT_DIR"), "/map_dat_table.rs"));
+
+/// Resolve the retail map-DAT file_id for a given zone, defaulting to
+/// the primary map (map_index 0). Returns `None` when the zone has
+/// no entry in POLUtils' catalog — that happens for zones added after
+/// POLUtils froze (post-WotG/SoA expansion content) and for system
+/// zones that have no in-game map.
+pub fn map_dat_for_zone(zone_id: u16) -> Option<u32> {
+    map_dat_for(zone_id, 0)
+}
+
+/// Resolve a specific floor / sub-map by `map_index`. Most overworld
+/// zones have only index 0. Multi-floor dungeons (Castle Zvahl, Pso'Xja,
+/// Garlaige Citadel, …) define indices 1, 2, …
+pub fn map_dat_for(zone_id: u16, map_index: u8) -> Option<u32> {
+    // Binary search on the (zone_id, map_index) key.
+    MAP_DAT_TABLE
+        .binary_search_by(|(z, m, _)| (*z, *m).cmp(&(zone_id, map_index)))
+        .ok()
+        .map(|i| MAP_DAT_TABLE[i].2)
+}
+
+/// Number of distinct maps for a zone, or 0 when the zone isn't in
+/// the table. Useful for cycling through floors with `/minimap floor`
+/// (future work).
+pub fn map_count_for_zone(zone_id: u16) -> usize {
+    MAP_DAT_TABLE
+        .iter()
+        .filter(|(z, _, _)| *z == zone_id)
+        .count()
+}
+
 /// Graphic chunk flag byte. Decides which pixel-data layout follows
 /// the BITMAPINFOHEADER.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +363,36 @@ mod tests {
     fn parse_graphic_errors_on_truncated_header() {
         let bytes = vec![0x91, 0x00, 0x00]; // flag + 2 bytes — way short
         assert!(parse_graphic(&bytes).is_err());
+    }
+
+    /// Konschtat Highlands is zone-id 108 and per POLUtils maps to
+    /// DAT file_id 5321 (verified against a fresh extraction of
+    /// `ROMFileMappings.xml` at the time this test was written).
+    /// If the build.rs scraper drifts or POLUtils' XML reshapes,
+    /// this test will catch it before the runtime loader hits the
+    /// wrong file.
+    #[test]
+    fn map_dat_for_zone_konschtat_is_5321() {
+        assert_eq!(map_dat_for_zone(108), Some(5321));
+    }
+
+    /// Pso'Xja (zone 167) is multi-floor — 3 maps. Confirms the
+    /// "category with nested rom-files" scraper path produced
+    /// distinct indices.
+    #[test]
+    fn map_count_for_psoxja_is_three() {
+        assert_eq!(map_count_for_zone(167), 3);
+        assert_eq!(map_dat_for(167, 0), Some(5401));
+        assert_eq!(map_dat_for(167, 1), Some(5402));
+        assert_eq!(map_dat_for(167, 2), Some(5403));
+        assert_eq!(map_dat_for(167, 3), None);
+    }
+
+    /// Zones outside POLUtils' catalog return None — the retail
+    /// backend then no-ops and Auto-mode falls back to top-down.
+    #[test]
+    fn map_dat_for_unknown_zone_returns_none() {
+        assert_eq!(map_dat_for_zone(9999), None);
     }
 
     /// Synthetic 2×2 paletted bitmap with a top-down row order

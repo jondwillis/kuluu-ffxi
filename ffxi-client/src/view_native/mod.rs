@@ -211,6 +211,14 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         .init_resource::<text_input::CaptureMode>()
         .insert_resource(ports)
         .insert_resource(RelayListen(relay_listen))
+        // Mirror the DAT-root Arc into the minimap's retail backend
+        // resource so its zone-change loader can resolve map-DAT
+        // file_ids to disk paths. Same Arc both places — no double
+        // table-load. Without this, the retail backend silently
+        // no-ops and the minimap falls back to the top-down bake.
+        .insert_resource(ffxi_viewer_core::minimap::retail::MinimapDatRoot(
+            dat_root.clone(),
+        ))
         .insert_resource(DatRootRes(dat_root));
     #[cfg(unix)]
     app.insert_resource(AgentListen(agent_listen));

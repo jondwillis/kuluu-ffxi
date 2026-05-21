@@ -29,16 +29,37 @@ use anyhow::{bail, Context, Result};
 
 const D_MS_CS: &str = "../vendor/ffxi-navmesh-builder/d_ms.cs";
 const ZONE_SETTINGS_SQL: &str = "../vendor/server/sql/zone_settings.sql";
+/// POLUtils' ROM-file catalog. The `Menu:Maps` category binds every
+/// retail map-DAT file_id to its zone (area) id. Apache 2.0 source.
+const ROM_FILE_MAPPINGS_XML: &str =
+    "../vendor/POLUtils/PlayOnline.FFXI.Utils.DataBrowser/ROMFileMappings.xml";
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={D_MS_CS}");
     println!("cargo:rerun-if-changed={ZONE_SETTINGS_SQL}");
+    println!("cargo:rerun-if-changed={ROM_FILE_MAPPINGS_XML}");
 
     let formula = parse_formula(Path::new(D_MS_CS))
         .with_context(|| format!("parsing formula from {D_MS_CS}"))?;
     let zones = parse_zone_ids(Path::new(ZONE_SETTINGS_SQL))
         .with_context(|| format!("parsing zone-ids from {ZONE_SETTINGS_SQL}"))?;
+    // POLUtils ships in `vendor/` for most devs but isn't strictly
+    // required — if it's missing, emit an empty table and log a
+    // warning so the retail-map backend just no-ops. Avoids
+    // wedging the workspace build for contributors without
+    // POLUtils checked out.
+    let map_entries = match parse_map_table(Path::new(ROM_FILE_MAPPINGS_XML)) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "cargo:warning=ffxi-dat: skipping map_dat_table.rs scrape ({e}); \
+                 retail minimap mode will have no zone lookups"
+            );
+            Vec::new()
+        }
+    };
+    emit_map_table(&map_entries)?;
 
     let mut rows: Vec<(u16, u32)> = zones
         .iter()
@@ -188,4 +209,195 @@ fn parse_zone_ids(path: &Path) -> Result<Vec<u16>> {
         );
     }
     Ok(out)
+}
+
+/// One entry in the zone-id → map-DAT lookup. `map_index = 0` is the
+/// primary map (overworld / first floor); higher indices are extra
+/// floors / sub-maps for multi-map zones (Castle Zvahl, Pso'Xja, etc.).
+#[derive(Debug, Clone, Copy)]
+struct MapEntry {
+    zone_id: u16,
+    map_index: u8,
+    file_id: u32,
+}
+
+/// Parse the `Menu:Maps` subtree of POLUtils' ROMFileMappings.xml.
+///
+/// The XML uses two shapes for each map:
+///   1. **Inline single-map**:
+///      `<rom-file id="NNNNN"><area-name id="ZID"/></rom-file>`
+///      → one map_index=0 entry.
+///   2. **Categorized multi-map** (for multi-floor zones):
+///      ```xml
+///      <category><name><area-name id="ZID"/></name>
+///        <rom-file id="FFFFF"><i18n-string id="Menu:MapN"/>1</rom-file>
+///        <rom-file id="GGGGG"><i18n-string id="Menu:MapN"/>2</rom-file>
+///      </category>
+///      ```
+///      → map_index=0 (first child), map_index=1 (second), ...
+///
+/// Skips `<rom-file>` entries that contain `Menu:Highlight` — those
+/// are the dimmed map-outline variants (FFXI's "before you've
+/// explored" overlay), which are interesting later but not for the
+/// initial loader.
+///
+/// Source license: Apache 2.0 (POLUtils, Windower Team). Derived
+/// data only — does not bring POLUtils' code into the binary.
+fn parse_map_table(path: &Path) -> Result<Vec<MapEntry>> {
+    let src = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let needle = r#"<category><name><i18n-string id="Menu:Maps"/></name>"#;
+    let Some(maps_start) = src.find(needle) else {
+        bail!(
+            "could not find `Menu:Maps` category in {} — XML format may have changed",
+            path.display()
+        );
+    };
+
+    // Scan forward from `maps_start`, tracking `<category>` nesting
+    // depth. Depth 0 means we've left the Maps subtree.
+    let mut entries: Vec<MapEntry> = Vec::new();
+    let mut cur_zone_for_block: Option<u16> = None;
+    let mut next_map_index: u8 = 0;
+    let mut depth: i32 = 0;
+
+    for (line_no, line) in src[maps_start..].lines().enumerate() {
+        // Bump depth on opens, drop on closes. A line may contain
+        // both (`<category>...</category>` self-closed-style) — count
+        // both.
+        let opens = line.matches("<category>").count() as i32;
+        let closes = line.matches("</category>").count() as i32;
+        depth += opens;
+        depth -= closes;
+        if depth <= 0 {
+            // Left the Maps subtree.
+            break;
+        }
+
+        let trim = line.trim();
+
+        // Detect a category-opening line that names a zone (the
+        // "multi-map" shape). After seeing this, subsequent
+        // `<rom-file>` lines belong to that zone with sequential
+        // map_index.
+        if let Some(zone) = extract_category_area_name(trim) {
+            cur_zone_for_block = Some(zone);
+            next_map_index = 0;
+            continue;
+        }
+
+        // A category-closing line clears the multi-map context.
+        if trim.starts_with("</category>") {
+            cur_zone_for_block = None;
+            continue;
+        }
+
+        // A rom-file line. Two shapes:
+        //   - inline single-map: has `<area-name id="ZID"/>`
+        //   - multi-map child:   has `<i18n-string id="Menu:MapN"/>N`
+        // Skip highlight variants.
+        let Some(file_id) = extract_rom_file_id(trim) else {
+            continue;
+        };
+        if trim.contains(r#"<i18n-string id="Menu:Highlight"/>"#) {
+            continue;
+        }
+
+        if let Some(zone) = extract_inline_area_name(trim) {
+            // Inline single-map.
+            entries.push(MapEntry {
+                zone_id: zone,
+                map_index: 0,
+                file_id,
+            });
+        } else if let Some(zone) = cur_zone_for_block {
+            // Multi-map child.
+            entries.push(MapEntry {
+                zone_id: zone,
+                map_index: next_map_index,
+                file_id,
+            });
+            next_map_index = next_map_index.saturating_add(1);
+        } else {
+            // rom-file with no zone hint we can extract. Likely the
+            // "Highlight" category shape with the area-name on a
+            // different element — already handled by the highlight
+            // skip above. Ignore.
+            let _ = line_no;
+        }
+    }
+
+    if entries.is_empty() {
+        bail!(
+            "extracted zero map entries from {} — XML structure may have changed",
+            path.display()
+        );
+    }
+    Ok(entries)
+}
+
+/// Extract a `<category><name><area-name id="NNN"/></name>` zone-id,
+/// or `None` if the line isn't that shape. Matches both
+/// `<category>` on the same line and on its own line (we get the
+/// content from `trim`).
+fn extract_category_area_name(line: &str) -> Option<u16> {
+    let cat_marker = r#"<category><name><area-name id=""#;
+    let rest = line.find(cat_marker).map(|i| &line[i + cat_marker.len()..])?;
+    let end = rest.find('"')?;
+    rest[..end].parse().ok()
+}
+
+/// Extract the `id="NNN"` from a `<rom-file id="NNN">…` line.
+fn extract_rom_file_id(line: &str) -> Option<u32> {
+    let marker = r#"<rom-file id=""#;
+    let rest = line.find(marker).map(|i| &line[i + marker.len()..])?;
+    let end = rest.find('"')?;
+    // POLUtils ids are 5-digit zero-padded strings; parse strips
+    // leading zeros naturally.
+    rest[..end].parse().ok()
+}
+
+/// Extract a `<area-name id="NNN"/>` *inline within* a `<rom-file>`
+/// line (the single-map shape).
+fn extract_inline_area_name(line: &str) -> Option<u16> {
+    let marker = r#"<area-name id=""#;
+    let rest = line.find(marker).map(|i| &line[i + marker.len()..])?;
+    let end = rest.find('"')?;
+    rest[..end].parse().ok()
+}
+
+fn emit_map_table(entries: &[MapEntry]) -> Result<()> {
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR not set")?);
+    let out_path = out_dir.join("map_dat_table.rs");
+
+    // Sort by (zone_id, map_index) for binary search.
+    let mut sorted: Vec<MapEntry> = entries.to_vec();
+    sorted.sort_by_key(|e| (e.zone_id, e.map_index));
+
+    let mut s = String::new();
+    s.push_str("// AUTO-GENERATED by ffxi-dat/build.rs — do not edit by hand.\n");
+    s.push_str("//\n");
+    s.push_str(&format!(
+        "// Source: vendored from {ROM_FILE_MAPPINGS_XML}\n"
+    ));
+    s.push_str(&format!("// Entries: {}\n", sorted.len()));
+    s.push_str("//\n");
+    s.push_str("// License: Apache-2.0 (POLUtils, Windower Team)\n\n");
+    s.push_str("/// `(zone_id, map_index, file_id)`. Sorted by `(zone_id, map_index)`\n");
+    s.push_str("/// so a binary search by zone_id + linear scan over its block\n");
+    s.push_str("/// resolves the per-floor map.\n");
+    s.push_str("pub const MAP_DAT_TABLE: &[(u16, u8, u32)] = &[\n");
+    for e in &sorted {
+        s.push_str(&format!(
+            "    ({}, {}, {}),\n",
+            e.zone_id, e.map_index, e.file_id
+        ));
+    }
+    s.push_str("];\n");
+
+    fs::write(&out_path, &s).with_context(|| format!("writing {}", out_path.display()))?;
+    println!(
+        "cargo:warning=ffxi-dat: generated map_dat_table.rs with {} map entries",
+        sorted.len()
+    );
+    Ok(())
 }
