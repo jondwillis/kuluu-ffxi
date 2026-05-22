@@ -1308,6 +1308,7 @@ fn raw_dat_id_for_skeleton(raw: &std::sync::Arc<Skeleton>) -> u32 {
 pub fn tick_skinned_actors(
     time: Res<Time>,
     state: Res<crate::snapshot::SceneState>,
+    motion: Res<crate::combat_stance::EntityMotion>,
     q_actors: Query<(&crate::components::WorldEntity, &SkinnedActor)>,
     mut q_bones: Query<&mut Transform>,
 ) {
@@ -1318,18 +1319,20 @@ pub fn tick_skinned_actors(
         };
         let Some(raw) = baked.raw else { continue };
 
-        // Pull engagement + locomotion state from the wire entity
-        // owning this actor. `world.id` is the FFXI UniqueNo — same
-        // key the snapshot indexes on. If the entity has since
-        // dropped out of the snapshot (rare race during a despawn
-        // frame) we treat it as still + not-engaged.
-        let (engaged, moving) = state
+        // Engagement comes from the snapshot's `bt_target_id` (the
+        // server's auto-attack target — authoritative). Motion is
+        // derived from per-frame Bevy Transform deltas by
+        // `track_entity_motion_system`. The wire `speed` field is
+        // movement *capability* (40 = base run, 0 = bound/stunned),
+        // NOT current motion — see [`EntityMotion`] docs.
+        let engaged = state
             .snapshot
             .entities
             .iter()
             .find(|e| e.id == world.id)
-            .map(|e| (e.bt_target_id != 0, e.speed > 0))
-            .unwrap_or((false, false));
+            .map(|e| e.bt_target_id != 0)
+            .unwrap_or(false);
+        let moving = motion.is_moving(world.id);
 
         // Pick the right anim per the (engaged, moving) matrix in
         // the doc comment above. Each `or_else` is a graceful

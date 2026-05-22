@@ -258,6 +258,20 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(Update, dat_vos2::tick_skinned_actors);
 
+        // Per-entity motion tracker for combat-stance / locomotion
+        // animation selection. Runs *before* `tick_skinned_actors`
+        // (which reads `EntityMotion`) so the locomotion decision
+        // sees same-frame movement. Wire `Entity.speed` is the
+        // player's *capability* to move (40 = base run, 0 = bound),
+        // NOT whether they're currently moving — see [`EntityMotion`]
+        // module docs.
+        app.init_resource::<combat_stance::EntityMotion>();
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(
+            Update,
+            combat_stance::track_entity_motion_system.before(dat_vos2::tick_skinned_actors),
+        );
+
         // Server doesn't send an explicit "clear your target" signal —
         // drop Target/LockOn refs to entities that fell out of the
         // snapshot or hit 0 HP. Runs *before* `sync_entities_system`

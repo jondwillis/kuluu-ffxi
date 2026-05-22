@@ -40,8 +40,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use bevy::prelude::*;
 use ffxi_dat::anim::Mo2Animation;
 use ffxi_dat::{walk, ChunkKind, DatRoot};
+
+use crate::components::WorldEntity;
 
 /// Reverse-map a PC skeleton DAT id to its motion DAT id (battle
 /// animation set #0 — unarmed).
@@ -180,6 +183,71 @@ fn load_anim_with_prefix(file_id: u32, prefix: &[u8; 3]) -> Option<Mo2Animation>
     None
 }
 
+/// Per-entity motion state: last seen Bevy translation and the
+/// computed velocity magnitude from the previous frame.
+///
+/// Why this exists: the wire `Entity.speed` field is the player's
+/// movement *capability* (40 = base run speed, 0 = bound/stunned —
+/// per `vendor/server/src/map/packets/char_update.cpp:262`), NOT
+/// whether they are currently moving. To pick the right
+/// locomotion animation we have to derive "is moving" ourselves
+/// from per-frame transform deltas.
+///
+/// Self in particular gets a `speed = 40` value on LOGIN and never
+/// updates (CHAR_PC for self only refreshes pos/heading after
+/// zone-in — `session.rs:660-671`). So a `speed > 0` check would
+/// have animated self as running the entire session — but in
+/// practice the wrong-sign bug went the *other* way: the engaged
+/// path was never reached because the snapshot doesn't echo
+/// post-LOGIN speed changes consistently.
+#[derive(Resource, Default)]
+pub struct EntityMotion {
+    /// `(last_translation, current_speed_yalms_per_sec)` per wire
+    /// entity id. Speed is the magnitude of last frame's xz delta
+    /// divided by `Time::delta_secs()`.
+    pub by_id: HashMap<u32, (Vec3, f32)>,
+}
+
+impl EntityMotion {
+    /// Pure decision: is this entity currently moving fast enough
+    /// to warrant a run animation? Threshold tuned to filter out
+    /// floor-snap jitter (`scene::apply_visual_smoothing`) without
+    /// missing actual locomotion. FFXI base run speed is ~5
+    /// yalms/sec, so 0.5 is well below the genuine-motion floor.
+    pub fn is_moving(&self, id: u32) -> bool {
+        self.by_id.get(&id).is_some_and(|(_, v)| *v > Self::MOVE_THRESHOLD)
+    }
+
+    /// Minimum xz speed in yalms/sec to count as "moving". Above
+    /// the smoothing noise floor (`SNAP_DIST_SQ.sqrt() * VISUAL_SMOOTH
+    /// / dt` for a 60 Hz tick is ~0.6 yalms/sec at the extreme; 0.5
+    /// catches everything but a stop-and-go jitter sequence).
+    const MOVE_THRESHOLD: f32 = 0.5;
+}
+
+/// Per-frame: write each `WorldEntity`'s current xz speed into
+/// [`EntityMotion`] from its Bevy `Transform` delta. Runs *before*
+/// `tick_skinned_actors` so the locomotion animation decision sees
+/// the same-frame motion state.
+pub fn track_entity_motion_system(
+    time: Res<Time>,
+    mut motion: ResMut<EntityMotion>,
+    q: Query<(&WorldEntity, &Transform)>,
+) {
+    let dt = time.delta_secs().max(1e-4);
+    for (world, transform) in &q {
+        let pos = transform.translation;
+        let entry = motion.by_id.entry(world.id).or_insert((pos, 0.0));
+        let dx = pos.x - entry.0.x;
+        let dz = pos.z - entry.0.z;
+        let xz_dist = (dx * dx + dz * dz).sqrt();
+        // Y is ignored deliberately: terrain/floor snap can shift
+        // y per-frame without the entity actually moving.
+        entry.0 = pos;
+        entry.1 = xz_dist / dt;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +340,25 @@ mod tests {
             let anim = run_anim_for_skel(skel).expect("casual run MO2 missing for skel");
             assert!(anim.frames > 0, "skel {skel}: run MO2 has zero frames");
         }
+    }
+
+    /// `is_moving` threshold: 0 → never moving; below threshold →
+    /// not moving (smoothing jitter); above → moving. Pin the
+    /// threshold value so a future tweak that bumps the constant
+    /// silently disabling run animation on slow movement gets
+    /// caught.
+    #[test]
+    fn is_moving_threshold_behaviour() {
+        let mut m = EntityMotion::default();
+        m.by_id.insert(1, (Vec3::ZERO, 0.0));
+        m.by_id.insert(2, (Vec3::ZERO, 0.49));
+        m.by_id.insert(3, (Vec3::ZERO, 0.51));
+        m.by_id.insert(4, (Vec3::ZERO, 6.0));
+        assert!(!m.is_moving(1), "0 speed should not animate");
+        assert!(!m.is_moving(2), "below 0.5 should not animate");
+        assert!(m.is_moving(3), "just above 0.5 should animate");
+        assert!(m.is_moving(4), "full run speed should animate");
+        assert!(!m.is_moving(99), "unknown id should not animate");
     }
 
     /// Combat run lives in the motion DAT as `run1` (68-bone LOD).
