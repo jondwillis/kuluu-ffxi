@@ -29,6 +29,7 @@ const ROOT_ENTRIES: &[&str] = &[
     "Magic",
     "Abilities",
     "Items",
+    "Equipment",
     "Status",
     "Party",
     "Search",
@@ -37,6 +38,18 @@ const ROOT_ENTRIES: &[&str] = &[
     "Config",
     "Logout",
 ];
+
+/// Placeholder rows shown for the four action submenus during Stage 0
+/// of the menu rollout. Each submenu replaces this slice with its real
+/// data source in a later stage (`hud/equipment_menu.rs` in Stage 1,
+/// etc.). One row keeps the cursor logic well-defined while the
+/// renderer is the existing `update_main_menu` (no scrollable list
+/// widget needed yet).
+const MAGIC_ENTRIES_STUB: &[&str] = &["(Magic — Stage 2: pending learned-spell decoder)"];
+const ABILITIES_ENTRIES_STUB: &[&str] =
+    &["(Abilities — Stage 2: pending s2c 0x119 abil_recast decoder)"];
+const ITEMS_ENTRIES_STUB: &[&str] = &["(Items — Stage 3: pending inventory submenu)"];
+const EQUIPMENT_ENTRIES_STUB: &[&str] = &["(Equipment — Stage 1: pending s2c 0x050 equip_list decoder)"];
 
 /// Config submenu entries. Order is "presets first, smallest delta from
 /// retail names first; meta-entries last." The labels pass through to
@@ -86,6 +99,9 @@ const MAX_ENTRY_COUNT: usize = {
     let r = ROOT_ENTRIES.len();
     let c = CONFIG_ENTRIES.len();
     let g = GRAPHICS_ENTRIES.len();
+    // Stage 0 stubs are 1 row each — they don't grow the pool. Later
+    // stages that need long scrollable lists will spawn their own
+    // panel (planned `hud/menu_list.rs`) rather than expand this pool.
     let rc = if r >= c { r } else { c };
     if rc >= g {
         rc
@@ -112,6 +128,10 @@ fn entries(kind: MenuKind) -> &'static [&'static str] {
         MenuKind::Root => ROOT_ENTRIES,
         MenuKind::Config => CONFIG_ENTRIES,
         MenuKind::Graphics => GRAPHICS_ENTRIES,
+        MenuKind::Magic => MAGIC_ENTRIES_STUB,
+        MenuKind::Abilities => ABILITIES_ENTRIES_STUB,
+        MenuKind::Items => ITEMS_ENTRIES_STUB,
+        MenuKind::Equipment => EQUIPMENT_ENTRIES_STUB,
     }
 }
 
@@ -122,6 +142,15 @@ pub struct MainMenu;
 /// Marker on each menu row. `slot` is the row index 0..entries.len().
 #[derive(Component)]
 pub struct MainMenuRow {
+    pub slot: usize,
+}
+
+/// Emitted when an operator clicks (LMB-press) a menu row. The dispatch
+/// consumer in `ffxi-client/src/view_native/text_input.rs` reads this
+/// alongside its keyboard handler so mouse and keyboard share the same
+/// activation path (`resolve_menu_entry` for the current `MenuKind`).
+#[derive(Message, Debug, Clone, Copy)]
+pub struct MenuRowActivated {
     pub slot: usize,
 }
 
@@ -153,6 +182,11 @@ pub fn spawn_main_menu(mut commands: Commands) {
             for slot in 0..MAX_ENTRY_COUNT {
                 p.spawn((
                     MainMenuRow { slot },
+                    // `Button` opts the row into Bevy UI's Interaction
+                    // tracking — the cursor module reads Hovered/Pressed
+                    // to swap to the Hand sprite, and the click + hover
+                    // systems below dispatch to the shared menu handler.
+                    Button,
                     Text::new(""),
                     TextFont {
                         font_size: 14.0,
@@ -235,6 +269,53 @@ pub fn update_main_menu(
             if node.display != Display::None {
                 node.display = Display::None;
             }
+        }
+    }
+}
+
+/// Move the menu cursor to follow mouse hover. Runs only while
+/// `InputMode::Menu` is active; outside that mode the rows are
+/// `Display::None` so their `Interaction` never updates anyway.
+pub fn menu_mouse_hover_system(
+    mut mode: ResMut<InputMode>,
+    rows: Query<(&Interaction, &MainMenuRow), Changed<Interaction>>,
+) {
+    let InputMode::Menu(stack) = &mut *mode else {
+        return;
+    };
+    let Some(level) = stack.current_mut() else {
+        return;
+    };
+    let limit = entry_count(level.kind);
+    for (interaction, row) in &rows {
+        if matches!(interaction, Interaction::Hovered | Interaction::Pressed)
+            && row.slot < limit
+            && level.cursor != row.slot
+        {
+            level.cursor = row.slot;
+        }
+    }
+}
+
+/// Emit [`MenuRowActivated`] when a row is pressed. Filtered to in-bounds
+/// slots so a click on a hidden trailing row (the spawn pool always has
+/// `MAX_ENTRY_COUNT` rows but smaller submenus hide the extras) doesn't
+/// dispatch a `<unknown>` label downstream.
+pub fn menu_mouse_click_system(
+    mode: Res<InputMode>,
+    rows: Query<(&Interaction, &MainMenuRow), Changed<Interaction>>,
+    mut out: MessageWriter<MenuRowActivated>,
+) {
+    let InputMode::Menu(stack) = &*mode else {
+        return;
+    };
+    let Some(level) = stack.current() else {
+        return;
+    };
+    let limit = entry_count(level.kind);
+    for (interaction, row) in &rows {
+        if *interaction == Interaction::Pressed && row.slot < limit {
+            out.write(MenuRowActivated { slot: row.slot });
         }
     }
 }

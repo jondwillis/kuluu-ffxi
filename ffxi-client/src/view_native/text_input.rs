@@ -221,6 +221,7 @@ pub fn text_input_system(
                     current_target,
                     &entities,
                     self_pos,
+                    scene_state.snapshot.self_char_id,
                     &mut target,
                 ) {
                     *mode = next;
@@ -332,6 +333,7 @@ fn handle_world_key(
     current_target: Option<u32>,
     entities: &[ffxi_viewer_wire::Entity],
     self_pos: ffxi_viewer_wire::Vec3,
+    self_id: Option<u32>,
     target: &mut Target,
 ) -> Option<InputMode> {
     // OpenChat (default Space) stays in this logical-key router rather
@@ -364,7 +366,7 @@ fn handle_world_key(
         // - With no target + no nearby NPC → open the menu directly.
         return match current_target {
             Some(_) => Some(InputMode::QuickAction(QuickActionState::for_target(true))),
-            None => match nearest_npc(entities, self_pos, AUTO_TARGET_RADIUS) {
+            None => match nearest_targetable(entities, self_pos, self_id, AUTO_TARGET_RADIUS) {
                 Some(ent) => {
                     target.id = Some(ent.id);
                     None
@@ -382,23 +384,30 @@ fn handle_world_key(
 /// "Enter near an NPC" works the same way it does in-game.
 const AUTO_TARGET_RADIUS: f32 = 8.0;
 
-/// Find the nearest NPC entity within `radius` yalms. Returns `None`
-/// if no NPC qualifies — the caller falls back to the quick-action
-/// picker in that case. Mobs/PCs are skipped since `Enter` for those
-/// shouldn't be silently auto-stolen by an in-range mob.
-fn nearest_npc<'a>(
+/// Find the nearest targetable entity within `radius` yalms. Returns
+/// `None` if nothing qualifies — the caller falls back to the
+/// quick-action picker. All non-self entity kinds participate (mobs,
+/// NPCs, other PCs, pets) so Enter-near-a-mob auto-targets it,
+/// matching the retail FFXI muscle memory of "step up, press Enter."
+/// Self is excluded via `self_id` so Enter doesn't silently target
+/// the player's own entity.
+fn nearest_targetable<'a>(
     entities: &'a [ffxi_viewer_wire::Entity],
     self_pos: ffxi_viewer_wire::Vec3,
+    self_id: Option<u32>,
     radius: f32,
 ) -> Option<&'a ffxi_viewer_wire::Entity> {
     let r2 = radius * radius;
     entities
         .iter()
-        .filter(|e| matches!(e.kind, ffxi_viewer_wire::EntityKind::Npc))
+        .filter(|e| Some(e.id) != self_id)
         .map(|e| {
+            // 3D distance — matches the server's range check and the
+            // nameplate readout. 2D undercounts altitude on slopes.
             let dx = e.pos.x - self_pos.x;
             let dy = e.pos.y - self_pos.y;
-            (e, dx * dx + dy * dy)
+            let dz = e.pos.z - self_pos.z;
+            (e, dx * dx + dy * dy + dz * dz)
         })
         .filter(|(_, d2)| *d2 <= r2)
         .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
@@ -493,6 +502,8 @@ fn apply_chat_action(
                     self_pos,
                     current_target,
                     scene_state.snapshot.zone_id,
+                    scene_state.snapshot.self_char_id,
+                    &scene_state.snapshot.party,
                 );
                 tracing::debug!(buffer = %trimmed, outcome = ?outcome, "chat submit: slash");
                 // Locally echo /say & friends so the operator sees their
@@ -509,6 +520,19 @@ fn apply_chat_action(
                     }
                     _ => {}
                 }
+                // Peek for OpenMenu before dispatch — `apply_slash_outcome`
+                // can't mutate `InputMode` (no &mut mode in its sig), so we
+                // capture the target submenu here and override the
+                // unconditional `*mode = InputMode::World;` at the bottom
+                // of this branch. Cloning is cheap (MenuKind is Copy).
+                let mode_override = match &outcome {
+                    SlashOutcome::OpenMenu(kind) => {
+                        let mut stack = MenuStack::root();
+                        stack.push(*kind);
+                        Some(InputMode::Menu(stack))
+                    }
+                    _ => None,
+                };
                 apply_slash_outcome(
                     outcome,
                     target,
@@ -526,6 +550,10 @@ fn apply_chat_action(
                     slash_writers,
                     draw_distance,
                 );
+                if let Some(next) = mode_override {
+                    *mode = next;
+                    return;
+                }
             } else {
                 // Default channel: Say. Tracing makes it visible whether the
                 // dispatch reached the session loop — the server's 0x017 echo
@@ -1515,6 +1543,31 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
         // rows are index-driven (the cursor row maps 1:1 to
         // GRAPHICS_FIELDS), handled directly in `handle_menu_key`.
         (MenuKind::Root, "Graphics") => MenuDispatch::OpenSubmenu(MenuKind::Graphics),
+        // Retail-style action menus. Stage 0 wires the navigation (push
+        // submenu / Esc pops) only; each submenu shows a one-row
+        // placeholder until its data source lands in later stages. The
+        // slash twins `/magic`, `/abilities`, `/items`, `/equipment`
+        // open the same submenus from the chat input.
+        (MenuKind::Root, "Magic") => MenuDispatch::OpenSubmenu(MenuKind::Magic),
+        (MenuKind::Root, "Abilities") => MenuDispatch::OpenSubmenu(MenuKind::Abilities),
+        (MenuKind::Root, "Items") => MenuDispatch::OpenSubmenu(MenuKind::Items),
+        (MenuKind::Root, "Equipment") => MenuDispatch::OpenSubmenu(MenuKind::Equipment),
+        // Stage 0: pressing Enter on the placeholder row in any of the
+        // four action submenus surfaces a chat hint pointing at the
+        // staging plan, so an operator who finds the menus before
+        // Stages 1–4 land knows what's still pending.
+        (MenuKind::Magic, _) => MenuDispatch::NotImplemented(
+            "Magic — pending Stage 2 (learned-spell decoder)".into(),
+        ),
+        (MenuKind::Abilities, _) => MenuDispatch::NotImplemented(
+            "Abilities — pending Stage 2 (s2c 0x119 abil_recast)".into(),
+        ),
+        (MenuKind::Items, _) => MenuDispatch::NotImplemented(
+            "Items — pending Stage 3 (inventory submenu)".into(),
+        ),
+        (MenuKind::Equipment, _) => MenuDispatch::NotImplemented(
+            "Equipment — pending Stage 1 (s2c 0x050 equip_list)".into(),
+        ),
         // Config submenu entries → keybind updates. Labels match
         // `CONFIG_ENTRIES` in `hud/menu.rs`; keep them in sync.
         (MenuKind::Config, "Standard") => {
@@ -1533,6 +1586,173 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
             MenuDispatch::KeybindUpdate(KeybindUpdate::List)
         }
         (_, other) => MenuDispatch::NotImplemented(other.to_string()),
+    }
+}
+
+/// Activate the menu row at `stack.current().cursor`. Shared between the
+/// keyboard NavConfirm path and the mouse-click path
+/// (`mouse_nav_dispatch_system`) so the two stay in lockstep on every
+/// menu kind (Graphics cycle, Config preset apply, root submenu open,
+/// stub toast).
+fn confirm_menu_at_cursor(
+    bindings: &mut Bindings,
+    stack: &mut MenuStack,
+    scene_state: &mut SceneState,
+    cmd_tx: &Sender<AgentCommand>,
+    keybinds_state: &mut KeybindsStateRes,
+    graphics: &mut ffxi_viewer_core::GraphicsSettings,
+) -> Option<InputMode> {
+    let (kind, cursor) = {
+        let level = stack.current()?;
+        (level.kind, level.cursor)
+    };
+    if matches!(kind, MenuKind::Graphics) {
+        if cursor == ffxi_viewer_core::hud::menu::GRAPHICS_RESET_SLOT {
+            graphics.reset_to_default();
+            push_system_chat_line(scene_state, "[menu] Graphics reset to High".into());
+        } else {
+            apply_graphics_cycle(cursor, 1, graphics);
+        }
+        return None;
+    }
+    let label = ffxi_viewer_core::hud::menu::entry_label(kind, cursor);
+    match resolve_menu_entry(kind, label) {
+        MenuDispatch::CommandWithToast { cmd, toast } => {
+            if let Err(e) = cmd_tx.try_send(cmd) {
+                push_system_chat_line(scene_state, format!("[menu] dispatch dropped: {e}"));
+            } else {
+                push_system_chat_line(scene_state, toast);
+            }
+            Some(InputMode::World)
+        }
+        MenuDispatch::OpenSubmenu(submenu) => {
+            stack.push(submenu);
+            None
+        }
+        MenuDispatch::KeybindUpdate(update) => {
+            let stay = matches!(update, KeybindUpdate::List);
+            apply_keybind_update(update, bindings, keybinds_state, scene_state);
+            if stay {
+                None
+            } else {
+                Some(InputMode::World)
+            }
+        }
+        MenuDispatch::NotImplemented(label) => {
+            push_system_chat_line(scene_state, format!("[menu] {label} — not implemented"));
+            None
+        }
+    }
+}
+
+/// Send `EndEventChoice` with the supplied choice index. Shared between
+/// the keyboard NavConfirm path and the mouse click on a numbered
+/// choice button.
+fn confirm_dialog_choice(
+    choice: u32,
+    scene_state: &mut SceneState,
+    cmd_tx: &Sender<AgentCommand>,
+) {
+    if let Some(d) = scene_state.snapshot.dialog.as_ref() {
+        let _ = cmd_tx.try_send(AgentCommand::EndEventChoice {
+            event_id: d.npc_id,
+            act_index: d.act_index,
+            event_num: d.event_num,
+            choice,
+        });
+    }
+}
+
+/// Activate the QA row at `state.cursor`. Shared between the keyboard
+/// NavConfirm path and the mouse-click path. Returns the new
+/// `InputMode` if the activation should exit the picker.
+fn confirm_quick_action_at_cursor(
+    state: &QuickActionState,
+    scene_state: &mut SceneState,
+    target_id: Option<u32>,
+    entities: &[ffxi_viewer_wire::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+) -> Option<InputMode> {
+    let label = ffxi_viewer_core::hud::quick_action::entry_label(state.has_target, state.cursor);
+    let target_ent = target_id.and_then(|id| entities.iter().find(|e| e.id == id));
+    match resolve_quick_action(label, target_ent) {
+        QuickActionDispatch::Command(cmd) => {
+            if let Err(e) = cmd_tx.try_send(cmd) {
+                push_system_chat_line(scene_state, format!("[quick] dispatch dropped: {e}"));
+            }
+        }
+        QuickActionDispatch::SystemMessage(msg) => {
+            push_system_chat_line(scene_state, msg);
+        }
+        QuickActionDispatch::NotImplemented(label) => {
+            push_system_chat_line(scene_state, format!("[quick] {label} — not implemented"));
+        }
+    }
+    Some(InputMode::World)
+}
+
+/// Read HUD-emitted activation messages (menu row click, dialog choice
+/// click, quick-action click) and dispatch via the same helpers the
+/// keyboard NavConfirm path uses. Runs alongside `text_input_system`,
+/// so a single click activates a row exactly once (no double-fire
+/// because each `MessageReader` is private to this system).
+pub fn mouse_nav_dispatch_system(
+    mut menu_events: MessageReader<ffxi_viewer_core::hud::menu::MenuRowActivated>,
+    mut dialog_events: MessageReader<ffxi_viewer_core::hud::dialog::DialogChoiceActivated>,
+    mut qa_events: MessageReader<ffxi_viewer_core::hud::quick_action::QuickActionActivated>,
+    cmd_tx: Res<CommandTx>,
+    mut bindings: ResMut<Bindings>,
+    mut keybinds_state: ResMut<KeybindsStateRes>,
+    mut mode: ResMut<InputMode>,
+    target: Res<Target>,
+    mut scene_state: ResMut<SceneState>,
+    mut graphics: ResMut<ffxi_viewer_core::GraphicsSettings>,
+) {
+    let entities = scene_state.snapshot.entities.clone();
+    let current_target = target.id;
+
+    for ev in menu_events.read() {
+        if let InputMode::Menu(stack) = &mut *mode {
+            if let Some(level) = stack.current_mut() {
+                level.cursor = ev.slot;
+            }
+            if let Some(next) = confirm_menu_at_cursor(
+                &mut bindings,
+                stack,
+                &mut scene_state,
+                &cmd_tx.0,
+                &mut keybinds_state,
+                &mut graphics,
+            ) {
+                *mode = next;
+            }
+        }
+    }
+
+    for ev in dialog_events.read() {
+        if let InputMode::Dialog(cursor) = &mut *mode {
+            cursor.cursor = ev.choice;
+            confirm_dialog_choice(ev.choice, &mut scene_state, &cmd_tx.0);
+        }
+    }
+
+    for ev in qa_events.read() {
+        if let InputMode::QuickAction(state) = &mut *mode {
+            state.cursor = ev.slot;
+            let snapshot = QuickActionState {
+                cursor: state.cursor,
+                has_target: state.has_target,
+            };
+            if let Some(next) = confirm_quick_action_at_cursor(
+                &snapshot,
+                &mut scene_state,
+                current_target,
+                &entities,
+                &cmd_tx.0,
+            ) {
+                *mode = next;
+            }
+        }
     }
 }
 
@@ -1594,50 +1814,14 @@ fn handle_menu_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        // Graphics submenu has its own confirm flow: field rows cycle
-        // forward (same as Right), the Reset row resets to High. No
-        // submenu transitions; stay in Menu mode.
-        if matches!(kind, MenuKind::Graphics) {
-            if cursor == ffxi_viewer_core::hud::menu::GRAPHICS_RESET_SLOT {
-                graphics.reset_to_default();
-                push_system_chat_line(scene_state, "[menu] Graphics reset to High".into());
-            } else {
-                apply_graphics_cycle(cursor, 1, graphics);
-            }
-            return None;
-        }
-        let label = ffxi_viewer_core::hud::menu::entry_label(kind, cursor);
-        return match resolve_menu_entry(kind, label) {
-            MenuDispatch::CommandWithToast { cmd, toast } => {
-                if let Err(e) = cmd_tx.try_send(cmd) {
-                    push_system_chat_line(scene_state, format!("[menu] dispatch dropped: {e}"));
-                } else {
-                    push_system_chat_line(scene_state, toast);
-                }
-                Some(InputMode::World)
-            }
-            MenuDispatch::OpenSubmenu(submenu) => {
-                stack.push(submenu);
-                None
-            }
-            MenuDispatch::KeybindUpdate(update) => {
-                // List stays in the menu so the operator can flip
-                // presets after reading the current map. Preset/Reset
-                // exit to World once applied — same shape as the slash
-                // path's "fire and forget" UX.
-                let stay = matches!(update, KeybindUpdate::List);
-                apply_keybind_update(update, bindings, keybinds_state, scene_state);
-                if stay {
-                    None
-                } else {
-                    Some(InputMode::World)
-                }
-            }
-            MenuDispatch::NotImplemented(label) => {
-                push_system_chat_line(scene_state, format!("[menu] {label} — not implemented"));
-                None
-            }
-        };
+        return confirm_menu_at_cursor(
+            bindings,
+            stack,
+            scene_state,
+            cmd_tx,
+            keybinds_state,
+            graphics,
+        );
     }
     if bindings.matches_logical(Action::NavCancel, key) {
         return if !stack.pop() {
@@ -1675,14 +1859,7 @@ fn handle_dialog_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        if let Some(d) = scene_state.snapshot.dialog.as_ref() {
-            let _ = cmd_tx.try_send(AgentCommand::EndEventChoice {
-                event_id: d.npc_id,
-                act_index: d.act_index,
-                event_num: d.event_num,
-                choice: cursor.cursor,
-            });
-        }
+        confirm_dialog_choice(cursor.cursor, scene_state, cmd_tx);
         return None;
     }
     if bindings.matches_logical(Action::NavCancel, key) {
@@ -1791,23 +1968,7 @@ fn handle_quick_action_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        let label =
-            ffxi_viewer_core::hud::quick_action::entry_label(state.has_target, state.cursor);
-        let target_ent = target_id.and_then(|id| entities.iter().find(|e| e.id == id));
-        match resolve_quick_action(label, target_ent) {
-            QuickActionDispatch::Command(cmd) => {
-                if let Err(e) = cmd_tx.try_send(cmd) {
-                    push_system_chat_line(scene_state, format!("[quick] dispatch dropped: {e}"));
-                }
-            }
-            QuickActionDispatch::SystemMessage(msg) => {
-                push_system_chat_line(scene_state, msg);
-            }
-            QuickActionDispatch::NotImplemented(label) => {
-                push_system_chat_line(scene_state, format!("[quick] {label} — not implemented"));
-            }
-        }
-        return Some(InputMode::World);
+        return confirm_quick_action_at_cursor(state, scene_state, target_id, entities, cmd_tx);
     }
     if bindings.matches_logical(Action::NavCancel, key) {
         return Some(InputMode::World);
