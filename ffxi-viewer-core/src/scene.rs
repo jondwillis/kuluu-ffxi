@@ -410,22 +410,34 @@ pub fn sync_entities_system(
                     // lag. Other entities arrive at server tick rate, so
                     // visual smoothing fills the gaps.
                     //
-                    // **Y is owned by `snap_entities_to_navmesh_system`**:
-                    // we write only X/Z here and preserve whatever Y the
-                    // snap last set. The wire's reported height is
-                    // unreliable for both self (server pings the player at
-                    // their last-known altitude, not the terrain the
-                    // client renders) and other entities (static NPC
-                    // records often carry the spawn-point Y, not the
-                    // ground at the renderer's MZB sample). Writing
-                    // `world_pos.y` here would override the snap on every
-                    // wire tick, leaving the player at server-spawn Y
-                    // rather than on the rendered floor.
+                    // **Y ownership splits by entity kind:**
+                    // - Self + static NPCs (`Npc`, `Other`): the MZB-floor
+                    //   snap (`snap_entities_to_mzb_floor_system`) owns Y.
+                    //   Self because the server pings the player's last-
+                    //   known altitude, not the terrain the client renders;
+                    //   static NPC records because the spawn-time Y often
+                    //   doesn't match the runtime MZB floor at the same XZ
+                    //   (vendor floats in the air without the snap).
+                    // - Active entities (`Mob`, `Pc`, `Pet`): the server
+                    //   simulates fresh XYZ each tick on its own navmesh
+                    //   and is authoritative. Preserving the snap-set Y
+                    //   here would lie about server position — visual
+                    //   "rabbit on the ground" while the server says
+                    //   "rabbit 13y up the hillside" makes the server's
+                    //   3D range check reject attacks the operator
+                    //   thinks should be in range. Trust wire Y instead.
                     let new_translation = if is_self {
                         Vec3::new(world_pos.x, t.translation.y, world_pos.z)
                     } else {
                         let smoothed = apply_visual_smoothing(t.translation, world_pos);
-                        Vec3::new(smoothed.x, t.translation.y, smoothed.z)
+                        match wire.kind {
+                            EntityKind::Mob | EntityKind::Pc | EntityKind::Pet => {
+                                Vec3::new(smoothed.x, world_pos.y, smoothed.z)
+                            }
+                            EntityKind::Npc | EntityKind::Other => {
+                                Vec3::new(smoothed.x, t.translation.y, smoothed.z)
+                            }
+                        }
                     };
                     t.translation = new_translation;
                     t.rotation = heading_to_quat(wire.heading);

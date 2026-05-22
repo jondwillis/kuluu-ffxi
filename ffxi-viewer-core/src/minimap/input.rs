@@ -34,7 +34,7 @@ use crate::mouse::MousePointer;
 
 use super::{
     zone_half_span, MinimapMode, MinimapRoot, MinimapState, MinimapView, MinimapZoom,
-    ZOOM_STEP_FACTOR,
+    MINIMAP_UI_SIZE_PX, RECENTER_IDLE_FRAMES, RECENTER_LERP_FRAMES, ZOOM_STEP_FACTOR,
 };
 
 /// Cross-system flag: true iff the cursor is currently over the
@@ -120,5 +120,95 @@ pub fn handle_minimap_zoom_input(
     if bindings.just_pressed(Action::CameraZoomOut, &keys) {
         zoom.zoom_by(ZOOM_STEP_FACTOR, half_span);
         view.idle_frames = 0;
+    }
+}
+
+/// Drag-state tracker for click-and-drag panning. Separate from
+/// `MousePointer::left` because we only count drags that *began*
+/// inside the minimap — if the cursor swept in mid-drag from another
+/// widget, we don't want it to pan retroactively.
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct MinimapDrag {
+    pub active: bool,
+}
+
+/// Handle click-and-drag panning of the minimap viewport.
+///
+/// Drag-pan is gated on `MinimapZoom::radius_yalms.is_some()` — at
+/// fit-zone there's nothing to pan to. Pixel delta is converted to
+/// world XZ via `yalms_per_pixel = 2r / MINIMAP_UI_SIZE_PX`, then
+/// *subtracted* from `pan_offset_xz` so dragging right scrolls the
+/// map right under the cursor (standard "grab and drag" UX).
+///
+/// Sets `idle_frames = 0` on every drag frame; the recenter system
+/// counts back up and lerps to zero once idle.
+pub fn handle_minimap_drag_input(
+    pointer: Res<MousePointer>,
+    hover_gate: Res<MinimapHoverGate>,
+    zoom: Res<MinimapZoom>,
+    mut drag: ResMut<MinimapDrag>,
+    mut view: ResMut<MinimapView>,
+) {
+    // Begin drag only when both the press AND the cursor hit the
+    // minimap. A drag that started elsewhere shouldn't get hijacked
+    // mid-stroke if the cursor sweeps over the minimap.
+    if pointer.left && hover_gate.hovered && !drag.active {
+        drag.active = true;
+    }
+    // Release drag on button up regardless of cursor position — a
+    // common pattern is to drag past the widget edge and release.
+    if !pointer.left {
+        drag.active = false;
+        return;
+    }
+    if !drag.active {
+        return;
+    }
+    let Some(radius) = zoom.radius_yalms else {
+        // Fit-to-zone: pan is meaningless (the whole zone is visible).
+        return;
+    };
+    if pointer.delta == Vec2::ZERO {
+        return;
+    }
+    let yalms_per_pixel = (2.0 * radius) / MINIMAP_UI_SIZE_PX;
+    // Subtract: dragging the cursor right pulls the world right under
+    // it, so the visible window's center moves left → pan_offset.x
+    // decreases.
+    view.pan_offset_xz -= pointer.delta * yalms_per_pixel;
+    view.idle_frames = 0;
+}
+
+/// Idle-counter + auto-recenter. When the user hasn't dragged for
+/// [`RECENTER_IDLE_FRAMES`] frames, lerp the pan offset back toward
+/// zero over [`RECENTER_LERP_FRAMES`] frames so the view re-locks on
+/// the player smoothly rather than snapping.
+///
+/// Does nothing while a drag is active or when zoom is fit-to-zone.
+pub fn recenter_minimap_view(
+    drag: Res<MinimapDrag>,
+    zoom: Res<MinimapZoom>,
+    mut view: ResMut<MinimapView>,
+) {
+    if drag.active || zoom.radius_yalms.is_none() {
+        return;
+    }
+    // Saturating add so we don't have to think about wraparound on
+    // long idle stretches.
+    view.idle_frames = view.idle_frames.saturating_add(1);
+    if view.idle_frames < RECENTER_IDLE_FRAMES {
+        return;
+    }
+    if view.pan_offset_xz == Vec2::ZERO {
+        return;
+    }
+    // Critically-damped lerp: each frame, move (1/REMAINING_FRAMES)
+    // of the remaining distance. After RECENTER_LERP_FRAMES the
+    // residual is negligible; snap to zero to stop the residual
+    // jitter that comes from accumulating tiny f32 multiplications.
+    let t = 1.0 / RECENTER_LERP_FRAMES as f32;
+    view.pan_offset_xz *= 1.0 - t;
+    if view.pan_offset_xz.length_squared() < 0.01 {
+        view.pan_offset_xz = Vec2::ZERO;
     }
 }

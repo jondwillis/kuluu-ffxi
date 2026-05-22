@@ -150,6 +150,8 @@ fn update_skybox(
     cam_q: Query<&Transform, (With<crate::camera::OperatorCamera>, Without<SkyboxSphere>)>,
     mut sky_q: Query<(&mut Transform, &MeshMaterial3d<SkyboxGradientMaterial>), With<SkyboxSphere>>,
     mut mats: ResMut<Assets<SkyboxGradientMaterial>>,
+    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut prev_keyframe_time: Local<Option<u32>>,
 ) {
     let cam_pos = cam_q.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let Ok((mut sky_xf, sky_mat)) = sky_q.single_mut() else {
@@ -191,6 +193,34 @@ fn update_skybox(
     let Some(r1) = ffxi_dat::weather::sample_weather(&zone_weather.records, m1) else {
         return;
     };
+    // Keyframe-segment edge — fires only when we cross from one
+    // authored weather record into the next. Zone DATs typically
+    // carry 4–7 keyframes (e.g. 0000/0500/0600/1200/1700/1800/2100),
+    // so this is ~7 lines per V-day (~10 Earth min). We resolve the
+    // active *authored* keyframe time directly from `records`
+    // because `sample_weather` overwrites the returned record's
+    // `time_minutes` with the queried V-minute — reading r0's field
+    // back would tell us nothing about the underlying segment and
+    // would fire every V-minute (the original bug).
+    let active_keyframe_time = zone_weather
+        .records
+        .iter()
+        .rev()
+        .find(|r| r.time_minutes <= m0)
+        .or_else(|| zone_weather.records.last())
+        .map(|r| r.time_minutes);
+    if active_keyframe_time.is_some() && *prev_keyframe_time != active_keyframe_time {
+        if let (Some(prev), Some(now)) = (*prev_keyframe_time, active_keyframe_time) {
+            scene_state.push_local_toast(crate::snapshot::debug_chat_line(format!(
+                "🌅 Skybox keyframe V{:02}:{:02} → V{:02}:{:02}",
+                prev / 60,
+                prev % 60,
+                now / 60,
+                now % 60,
+            )));
+        }
+        *prev_keyframe_time = active_keyframe_time;
+    }
     let Some(mat) = mats.get_mut(&sky_mat.0) else {
         return;
     };

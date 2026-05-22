@@ -277,6 +277,21 @@ pub fn moon_color_for_phase(phase: f32, moon_altitude: f32) -> (Color, f32) {
 
 /// Each-frame system: read Vana sky, update sun + moon transforms,
 /// colors, illuminance, and visible disc positions/emissives.
+/// 8-bucket moon-phase names. Indexed by `(phase * 8.0).floor() % 8`
+/// where `phase` is the `[0.0, 1.0)` value on `VanaSky` (0.0 = new,
+/// 0.5 = full). Standard astronomy 8-phase naming; FFXI's in-game moon
+/// percentage tracks illumination so we surface that alongside the name.
+const MOON_PHASE_NAMES: [&str; 8] = [
+    "New",
+    "Waxing Crescent",
+    "First Quarter",
+    "Waxing Gibbous",
+    "Full",
+    "Waning Gibbous",
+    "Last Quarter",
+    "Waning Crescent",
+];
+
 pub fn sun_moon_system(
     mut sky: ResMut<VanaSky>,
     mut q_sun: Query<
@@ -322,8 +337,63 @@ pub fn sun_moon_system(
     q_cam: Query<&Transform, With<crate::camera::OperatorCamera>>,
     materials_handle: Option<Res<CelestialMaterials>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut prev_sun_up: Local<Option<bool>>,
+    mut prev_moon_up: Local<Option<bool>>,
+    mut prev_phase_bucket: Local<Option<u8>>,
 ) {
     *sky = vana_sky_now();
+
+    // Sun/moon altitude zero-crossings → System chat. Edge-triggered
+    // so we get one line per rise/set, not one per frame while above
+    // the horizon. First frame (`prev_*_up = None`) seeds the state
+    // without firing, otherwise login at noon would fire a fake
+    // "sunrise" because we'd treat the absent prev as "below."
+    let sun_up_now = sky.sun_altitude > 0.0;
+    if let Some(prev) = *prev_sun_up {
+        if prev != sun_up_now {
+            scene_state.push_local_toast(crate::snapshot::system_chat_line(
+                if sun_up_now {
+                    "☀ Sunrise"
+                } else {
+                    "☀ Sunset"
+                }
+                .to_string(),
+            ));
+        }
+    }
+    *prev_sun_up = Some(sun_up_now);
+
+    let moon_up_now = sky.moon_altitude > 0.0;
+    if let Some(prev) = *prev_moon_up {
+        if prev != moon_up_now {
+            scene_state.push_local_toast(crate::snapshot::system_chat_line(
+                if moon_up_now {
+                    "☾ Moonrise"
+                } else {
+                    "☾ Moonset"
+                }
+                .to_string(),
+            ));
+        }
+    }
+    *prev_moon_up = Some(moon_up_now);
+
+    // Moon phase bucket — eight 12.5%-wide windows. Surfaces with the
+    // FFXI-style illumination percent (0% at new, 100% at full) so the
+    // line matches what retail's lunar HUD shows the player.
+    let phase_bucket = ((sky.moon_phase * 8.0).floor() as i32).rem_euclid(8) as u8;
+    if let Some(prev) = *prev_phase_bucket {
+        if prev != phase_bucket {
+            let illumination = (1.0 - (sky.moon_phase - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+            scene_state.push_local_toast(crate::snapshot::system_chat_line(format!(
+                "☾ Moon: {} ({:.0}% illuminated)",
+                MOON_PHASE_NAMES[phase_bucket as usize],
+                illumination * 100.0,
+            )));
+        }
+    }
+    *prev_phase_bucket = Some(phase_bucket);
 
     // Sun arcs east → up → west. We model the "world rotation" by
     // rotating the light source around the world Z axis (east-west)

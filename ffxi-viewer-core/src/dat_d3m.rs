@@ -14,9 +14,11 @@
 //!
 //! Render notes:
 //!
-//! * All three variants set `unlit: true`. Particles are emissive
-//!   sprites, not pbr surfaces; per [[load_bearing_render_fixes]] the
-//!   FFXI client convention is to bypass shading.
+//! * `unlit: true`. Particles are emissive sprites — additive/blended
+//!   contribution must survive low-light scenes where a PBR shading
+//!   term would drop their fragment color to near zero. The other DAT
+//!   formats (MMB / VOS2 / MZB) render fine through PBR; D3M is the
+//!   one that genuinely needs the unlit bypass.
 //! * `cull_mode: None`. Particle quads expand into both-faces tris and
 //!   FFXI does not author them with consistent winding.
 //! * `Mesh::ATTRIBUTE_COLOR` carries the per-vertex `D3mVertex::color`

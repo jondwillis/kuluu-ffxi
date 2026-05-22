@@ -57,7 +57,7 @@ use tokio::runtime::Handle as RtHandle;
 use crate::launcher::Defaults;
 
 use self::bridge::NativeSource;
-use self::input::{AutoRun, CommandTx};
+use self::input::{AutoRun, CommandTx, LocalPlayerPrediction};
 use self::launcher_ui::{LoginErrorMsg, PendingConnect};
 
 /// Top-level phase of the unified native `App`.
@@ -211,6 +211,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // for highlight materials, breaking Tab targeting visuals.
     app.insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<AutoRun>()
+        .init_resource::<LocalPlayerPrediction>()
         .init_resource::<text_input::CaptureMode>()
         .insert_resource(ports)
         .insert_resource(RelayListen(relay_listen))
@@ -335,6 +336,13 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             text_input::dialog_mode_sync_system,
             input::handle_input_system,
             text_input::text_input_system,
+            // Drains HUD-emitted activation messages (menu row click,
+            // dialog choice click, QA wedge click) through the same
+            // dispatch helpers `text_input_system` uses for keyboard
+            // NavConfirm. Chained after `text_input_system` so a same-
+            // frame keyboard+mouse race resolves keyboard-first; both
+            // call the same helper so the final state is consistent.
+            text_input::mouse_nav_dispatch_system,
             // Watches `Target` for changes and emits a `ChangeTarget`
             // action so the server learns about Tab/click/Esc/slash
             // target changes. Chained after the input handlers so the
@@ -390,6 +398,18 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         Update,
         camera_collision::clamp_chase_camera_to_collision
             .after(ffxi_viewer_core::chase_camera_system)
+            .run_if(in_state(AppPhase::InGame)),
+    );
+
+    // `/zonegeom camera` debug overlay — BVH AABBs + active ray gizmos.
+    // No-op when the mode isn't `Camera`, so the schedule cost is just
+    // a resource read. Scheduled after the clamp so the ray viz (when
+    // implemented) sees the same `effective` distance the camera was
+    // placed at.
+    app.add_systems(
+        Update,
+        camera_collision::draw_camera_collision_debug
+            .after(camera_collision::clamp_chase_camera_to_collision)
             .run_if(in_state(AppPhase::InGame)),
     );
 
@@ -488,6 +508,8 @@ fn despawn_ingame_entities(
     mut weather_ambient: ResMut<ffxi_viewer_core::audio::WeatherAmbient>,
     mut combat_sfx: ResMut<ffxi_viewer_core::audio::CombatSfxState>,
     mut system_sfx_cursor: ResMut<ffxi_viewer_core::audio::SystemSfxCursor>,
+    mut engagement_chat_cursor: ResMut<ffxi_viewer_core::debug_chat::EngagementChatCursor>,
+    mut speed_suppression_latch: ResMut<ffxi_viewer_core::debug_chat::SpeedSuppressionLatch>,
 ) {
     let mut count = 0usize;
     for entity in q.iter() {
@@ -511,6 +533,13 @@ fn despawn_ingame_entities(
     bgm.active = None;
     bgm.tracks = [None; ffxi_viewer_core::audio::SLOT_COUNT];
     bgm.event_cursor = 0;
+    // Loop-counter drain: the audio thread holds the other clone of
+    // the Arc and stops bumping it when the sink is dropped, but
+    // leaving the counter + reporter cursor populated would carry
+    // an inflated "loops seen" value into the next session and
+    // suppress the first real loop boundary of the next track.
+    bgm.bgm_loop_counter = None;
+    bgm.bgm_loops_reported = 0;
     // Weather ambient sink: same shape as BGM — `InGameEntity` on
     // the entity handles despawn; here we clear the Resource's
     // active_entity pointer + prev/active weather memo so the
@@ -529,6 +558,13 @@ fn despawn_ingame_entities(
     // session's first events get skipped (cursor > len triggers the
     // clamp path but still advances past them).
     *system_sfx_cursor = ffxi_viewer_core::audio::SystemSfxCursor::default();
+    // Engagement-event chat cursor and speed-suppression latch: same
+    // reset reasoning as the SFX cursor above — the EventLog gets
+    // cleared at the bottom of this function, so an unreset cursor
+    // would either re-fire stale "Engaged by" toasts on next login or
+    // (more likely) silently skip the first ZoneChanged on re-entry.
+    *engagement_chat_cursor = ffxi_viewer_core::debug_chat::EngagementChatCursor::default();
+    *speed_suppression_latch = ffxi_viewer_core::debug_chat::SpeedSuppressionLatch::default();
     // SceneState carries the disconnected snapshot (stage, zone_id,
     // entities). Reset it so systems gated on stage/zone don't see
     // stale state in the launcher → InGame transition before the new

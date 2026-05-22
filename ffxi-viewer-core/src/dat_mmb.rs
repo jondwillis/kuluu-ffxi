@@ -756,7 +756,7 @@ pub fn process_load_mmb_requests(
                 base_color_texture: sub_texture,
                 alpha_mode,
                 perceptual_roughness: 1.0,
-                reflectance: 0.1,
+                reflectance: 0.0,
                 cull_mode: None,
                 ..default()
             });
@@ -781,17 +781,17 @@ pub fn process_load_mmb_requests(
             // mounts are already targetable via the entity capsule's
             // own Pickable so adding a second one would confuse the
             // click-to-target system.
-            if is_static_placement {
-                child.insert(crate::hud::mesh_debug::mesh_debug_bundle(
-                    crate::hud::mesh_debug::MmbDebugInfo {
-                        file_id: req.file_id,
-                        chunk_idx: req.chunk_idx,
-                        sub_index,
-                        asset_name: loaded.asset_name.clone(),
-                        variant_name: sub.variant_name.trim().to_string(),
-                    },
-                ));
-            }
+            // if is_static_placement {
+            child.insert(crate::hud::mesh_debug::mesh_debug_bundle(
+                crate::hud::mesh_debug::MmbDebugInfo {
+                    file_id: req.file_id,
+                    chunk_idx: req.chunk_idx,
+                    sub_index,
+                    asset_name: loaded.asset_name.clone(),
+                    variant_name: sub.variant_name.trim().to_string(),
+                },
+            ));
+            // }
         }
 
         // Per-event spawn confirmation: only emit for manual `/load_mmb`

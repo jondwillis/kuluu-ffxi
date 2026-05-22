@@ -22,6 +22,8 @@ pub mod audio;
 pub mod camera;
 pub mod combat_stance;
 pub mod components;
+pub mod cursor;
+pub mod debug_chat;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_mmb;
 #[cfg(not(target_arch = "wasm32"))]
@@ -57,9 +59,10 @@ pub mod weather_fx;
 pub mod zone_lines;
 
 pub use camera::{
-    chase_camera_system, firstperson_camera_system, heading_for_yaw,
-    self_visibility_for_camera_mode_system, spawn_camera, toggle_camera_mode, yaw_for_heading,
-    CameraMode, ChaseCamera, OperatorCamera,
+    chase_camera_system, first_person_eye_y, firstperson_camera_system, heading_for_yaw,
+    nameplate_anchor_y, self_visibility_for_camera_mode_system, spawn_camera,
+    third_person_anchor_y, toggle_camera_mode, yaw_for_heading, CameraMode, ChaseCamera,
+    OperatorCamera,
 };
 pub use components::{
     EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
@@ -72,8 +75,11 @@ pub use input_mode::{
 };
 pub use keybinds::{Action, Bindings, KeyBind, Modifiers, Preset};
 pub use lock_on::{LockOn, ToggleResult as LockOnToggle};
+pub use cursor::{CursorAssets, CursorPlugin, CursorRequests, CursorStyle};
 pub use mouse::{CursorLockRequest, MousePlugin, MousePointer};
-pub use picking::{click_to_target_system, resolve_click_target, ClickResolution, PickingPlugin};
+pub use picking::{
+    click_to_target_system, resolve_click_target, ClickResolution, HoveredEntity, PickingPlugin,
+};
 pub use scene::{
     entity_visual_height, ffxi_to_bevy, process_entity_look_changes, setup_world,
     sync_aggro_system, sync_entities_system, sync_entity_looks_system, Aggroing, BakedActor,
@@ -148,6 +154,11 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // it reads ZoneWeather which is itself native-only.
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(skybox::SkyboxPlugin);
+        // Debug chat surfacing: routes engine + protocol events
+        // (zone change, aggro, low HP, speed suppression) to the
+        // System chat pane. Cross-platform: the drain reads the same
+        // EventLog the SFX systems do.
+        app.add_plugins(debug_chat::DebugChatPlugin);
         app.init_resource::<SceneState>()
             .init_resource::<EventLog>()
             .init_resource::<TrackedEntities>()
@@ -192,6 +203,12 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             // reader. `DefaultPickingPlugins` (input/hover/interaction) is
             // already added by `DefaultPlugins` on both front-ends.
             .add_plugins(PickingPlugin)
+            // Custom cursor sprite. Hides the OS cursor and renders a 24×24
+            // in-app sprite that swaps shape based on what's under the
+            // pointer (Arrow / Hand / Rotate). The OS cursor lock layer
+            // (`mouse::apply_cursor_lock_system`) no longer touches
+            // visibility — `CursorPlugin` is the sole owner.
+            .add_plugins(CursorPlugin)
             .add_systems(PreUpdate, ingest_system::<S>.run_if(resource_exists::<S>))
             // The Update tuple needs the world resources `setup_world`
             // inserts (EntityMesh/EntityMaterials/HpBarMesh) — those

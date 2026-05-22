@@ -16,6 +16,10 @@ Cargo.lock
 .claude/settings.local.json
 .claude/.*/
 
+# OpenCode / sibling-agent harness session state — ephemeral, per-user.
+.omo/
+.omc/
+
 # Environment / credentials
 .env
 .env.local

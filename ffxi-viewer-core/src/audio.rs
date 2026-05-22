@@ -25,6 +25,8 @@
 //! dependency in `Cargo.toml`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use bevy::asset::Asset;
 use bevy::audio::{AddAudioSource, Decodable, Source as RodioSource};
@@ -61,6 +63,14 @@ pub struct PcmAudio {
     pub sample_rate: u32,
     pub channels: u16,
     pub loop_start_sample: Option<usize>,
+    /// Per-sink loop counter incremented in `PcmSource::next` whenever
+    /// the iterator rewinds to `loop_start_sample`. `None` for sources
+    /// where the caller doesn't care (every SFX, plus BGM before the
+    /// loop-reporter wires its Arc in). When `Some`, the audio thread
+    /// bumps it on each rewind and the main-thread report system polls
+    /// for change. Optional rather than always-present so SFX paths
+    /// don't allocate an unused atomic for every one-shot.
+    pub loop_count: Option<Arc<AtomicU64>>,
 }
 
 impl PcmAudio {
@@ -75,6 +85,7 @@ impl PcmAudio {
             sample_rate: d.sample_rate as u32,
             channels: d.channels as u16,
             loop_start_sample,
+            loop_count: None,
         }
     }
 
@@ -84,6 +95,14 @@ impl PcmAudio {
     /// file said. Builder-style for use at the spawn site.
     pub fn with_loop(mut self, loop_start_sample: Option<usize>) -> Self {
         self.loop_start_sample = loop_start_sample;
+        self
+    }
+
+    /// Attach an external loop counter — the audio thread bumps it on
+    /// each loop boundary so a main-thread system can surface "Loop N"
+    /// chat lines without polling private iterator state. Builder.
+    pub fn with_loop_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.loop_count = Some(counter);
         self
     }
 }
@@ -102,6 +121,7 @@ pub struct PcmSource {
     channels: u16,
     pos: usize,
     loop_start_sample: Option<usize>,
+    loop_count: Option<Arc<AtomicU64>>,
 }
 
 impl Iterator for PcmSource {
@@ -121,6 +141,9 @@ impl Iterator for PcmSource {
                 return None;
             }
             self.pos = loop_to;
+            if let Some(c) = &self.loop_count {
+                c.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let s = self.samples[self.pos];
         self.pos += 1;
@@ -165,6 +188,7 @@ impl Decodable for PcmAudio {
             channels: self.channels,
             pos: 0,
             loop_start_sample: self.loop_start_sample,
+            loop_count: self.loop_count.clone(),
         }
     }
 }
@@ -203,6 +227,17 @@ pub struct BgmSlots {
     /// AudioBundle replacement). Despawned and replaced on slot
     /// resolve changes.
     pub active_entity: Option<Entity>,
+    /// Shared loop counter on the currently-playing `PcmSource`. The
+    /// audio thread bumps it on each rewind to `loop_start_sample`;
+    /// `report_bgm_loops_system` polls and surfaces a Debug chat line
+    /// on increment. Replaced (new `Arc`) every time `active` changes,
+    /// so the counter restarts at zero for the new track.
+    pub bgm_loop_counter: Option<Arc<AtomicU64>>,
+    /// Last `bgm_loop_counter` value the reporter pushed a chat line
+    /// for. Together with `bgm_loop_counter` this is a single-producer
+    /// single-consumer ring of width 1 — the reporter polls each frame
+    /// and emits one line per integer it falls behind.
+    pub bgm_loops_reported: u64,
 }
 
 impl Default for BgmSlots {
@@ -214,6 +249,8 @@ impl Default for BgmSlots {
             event_cursor: 0,
             active: None,
             active_entity: None,
+            bgm_loop_counter: None,
+            bgm_loops_reported: 0,
         }
     }
 }
@@ -468,6 +505,7 @@ pub fn apply_bgm_system(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut pcm_assets: ResMut<Assets<PcmAudio>>,
+    mut scene_state: ResMut<crate::snapshot::SceneState>,
     mut warned: Local<bool>,
 ) {
     // Without an install root we have nothing to play. Warn once so
@@ -515,11 +553,14 @@ pub fn apply_bgm_system(
         commands.entity(e).despawn();
     }
     slots.active = resolved;
+    // New sink coming (or silence) — reset loop tracking so the next
+    // track's first loop boundary fires as "Loop 1", not Loop N+1.
+    slots.bgm_loop_counter = None;
+    slots.bgm_loops_reported = 0;
 
     let Some((slot, track_id)) = resolved else {
         return;
     };
-    let _ = slot;
     let Some(path) = find_audio(&install, AudioKind::Bgm, track_id as u32) else {
         warn!(
             "audio: bgm {track_id} not found under {}",
@@ -549,6 +590,9 @@ pub fn apply_bgm_system(
     if pcm.loop_start_sample.is_none() {
         pcm = pcm.with_loop(Some(0));
     }
+    let loop_counter = Arc::new(AtomicU64::new(0));
+    pcm = pcm.with_loop_counter(loop_counter.clone());
+    slots.bgm_loop_counter = Some(loop_counter);
     let handle = pcm_assets.add(pcm);
 
     let entity = commands
@@ -574,7 +618,47 @@ pub fn apply_bgm_system(
         "audio: bgm {track_id} started ({} frames @ {:.0}Hz {}ch, loop_frame={:?})",
         frames, sr, ch, file_loop_frame
     );
+    // Surface in chat (System pane). Tracks without catalog entries
+    // still get a numeric "track #N" line so the operator knows
+    // *something* changed even when AltanaListener didn't have the id.
+    let (track_name, composer) = ffxi_audio::music_catalog::lookup(track_id)
+        .map(|(_, n, c)| (n, c))
+        .unwrap_or(("?", "?"));
+    scene_state.push_local_toast(crate::snapshot::system_chat_line(format!(
+        "♪ Now playing: \"{}\" by {} [track #{}, slot={}]",
+        track_name,
+        composer,
+        track_id,
+        slot_name(slot),
+    )));
     let _ = asset_server;
+}
+
+/// Poll the active BGM sink's loop counter. When the audio thread has
+/// bumped it past `bgm_loops_reported`, emit one Debug chat line per
+/// integer of lag and advance the cursor. Runs in `Update`.
+pub fn report_bgm_loops_system(
+    mut slots: ResMut<BgmSlots>,
+    mut scene_state: ResMut<crate::snapshot::SceneState>,
+) {
+    let Some(counter) = slots.bgm_loop_counter.as_ref() else {
+        return;
+    };
+    let now = counter.load(Ordering::Relaxed);
+    if now <= slots.bgm_loops_reported {
+        return;
+    }
+    let track_id = slots.active.map(|(_, t)| t).unwrap_or(0);
+    // Emit one line per missed loop. In normal play the gap is 1,
+    // but if the reporter is starved (e.g. paused frame loop) we still
+    // surface every boundary the audio thread observed.
+    for n in (slots.bgm_loops_reported + 1)..=now {
+        scene_state.push_local_toast(crate::snapshot::debug_chat_line(format!(
+            "♪ Loop: track #{} ({} loops since start)",
+            track_id, n,
+        )));
+    }
+    slots.bgm_loops_reported = now;
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +726,8 @@ pub fn play_sfx_system(
     mut cache: ResMut<SfxCache>,
     mut pcm_assets: ResMut<Assets<PcmAudio>>,
     mut commands: Commands,
+    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut last_chat: Local<Option<(u32, std::time::Instant)>>,
     mut warned: Local<bool>,
 ) {
     if events.is_empty() {
@@ -702,6 +788,25 @@ pub fn play_sfx_system(
             PlaybackSettings::DESPAWN
                 .with_volume(bevy::audio::Volume::Linear(ev.volume.clamp(0.0, 1.0))),
         ));
+        // Surface as Debug chat (gated by /devhud). Combat-tick SFX
+        // can fire several per second from the same id — drop the
+        // duplicate line if we just chatted about this id within
+        // 250ms, otherwise this would shove every other chat line
+        // off the screen during a busy fight. The clip still plays;
+        // only the chat line is suppressed.
+        let now = std::time::Instant::now();
+        let dup = matches!(
+            *last_chat,
+            Some((id, t)) if id == ev.se_id
+                && now.saturating_duration_since(t) < std::time::Duration::from_millis(250)
+        );
+        if !dup {
+            scene_state.push_local_toast(crate::snapshot::debug_chat_line(format!(
+                "✦ SFX #{}",
+                ev.se_id
+            )));
+            *last_chat = Some((ev.se_id, now));
+        }
     }
 }
 
@@ -1297,6 +1402,13 @@ impl Plugin for AudioPlugin {
                     drain_music_events_system,
                     derive_bgm_playback_state,
                     apply_bgm_system,
+                    // Polls the BGM sink's loop counter and surfaces
+                    // boundaries to the Debug chat pane. Must run
+                    // after `apply_bgm_system` so a fresh sink's
+                    // counter Arc is installed before we read it,
+                    // otherwise the first loop of a new track gets
+                    // missed.
+                    report_bgm_loops_system,
                     fire_system_sfx_events,
                     fire_combat_sfx_events,
                     // UI mode-change SFX observer. Runs before
@@ -1596,6 +1708,8 @@ mod tests {
         app.insert_resource(slots)
             .init_resource::<EventLog>()
             .init_resource::<BgmPlaybackState>()
+            .init_resource::<AudioMuteState>()
+            .init_resource::<crate::snapshot::SceneState>()
             .add_systems(
                 Update,
                 (drain_music_events_system, apply_bgm_system).chain(),

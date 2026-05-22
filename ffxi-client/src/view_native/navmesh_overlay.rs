@@ -195,7 +195,12 @@ fn swap_navmesh_on_zone_change(scene: Res<SceneState>, mut state: ResMut<Navmesh
 /// in 4-5 lines. Nothing else in the plugin assumes anything about
 /// how the lines look.
 fn draw_navmesh_overlay(mut gizmos: Gizmos, state: Res<NavmeshState>) {
-    let color = Color::srgb(0.2, 1.0, 0.4);
+    // Lime-green at 0.75 alpha. Translucent so dense navmesh tiles don't
+    // hide the underlying MZB collision color, and pinned to the green
+    // axis so the navmesh has a clear visual identity vs.
+    // `/zonegeom camera` (cyan AABBs) and the chase-ray viz
+    // (yellow/magenta segments).
+    let color = Color::srgba(0.25, 1.0, 0.40, 0.75);
     // 0.05 yalm above the navmesh-height so the gizmo isn't depth-fought
     // against the MZB collision mesh at the same Y. The previous 1.0
     // lift dated from the floor-plane-only era — operators saw the
@@ -212,11 +217,27 @@ fn draw_navmesh_overlay(mut gizmos: Gizmos, state: Res<NavmeshState>) {
 }
 
 /// Visual gravity: each frame, query the MZB collision mesh for the
-/// floor height under each entity's XZ and snap `transform.y` to it.
+/// floor height under self's XZ and snap `transform.y` to it.
 ///
-/// Runs **after** `sync_entities_system` (which now writes only X/Z
-/// for every entity) and **before** `chase_camera_system`. The snap
-/// is the sole writer of `transform.y`.
+/// **Applies to self only.** Every non-self entity — Mob, other Pc,
+/// Pet, static NPC, Other — is server-positioned; `sync_entities_system`
+/// writes their wire Y directly and we leave it alone. Overriding any
+/// of them to the local MZB floor would cause the rendered visual to
+/// disagree with the server's range check (a mob visually "on the
+/// ground" 5y away while the server sees it 15y up the hillside and
+/// rejects attacks as out of range). Even static NPCs: their server
+/// record is canonical, and silently rewriting their position to a
+/// raycast result would move them between visits.
+///
+/// Self snaps because the player input pipeline writes X/Z but not Y,
+/// so the snap is the sole writer of self's vertical position. On
+/// zone-in, when MZB hasn't loaded yet, the snap falls back to wire Y
+/// for self (see the `tri_count() == 0` branch below) — otherwise
+/// self would stay at the *previous* zone's snap result and appear to
+/// fall through the world.
+///
+/// Runs **after** `sync_entities_system` (which writes X/Z for self
+/// and full XYZ for active non-self) and **before** `chase_camera_system`.
 ///
 /// ## Why MZB only
 ///
@@ -232,10 +253,10 @@ fn draw_navmesh_overlay(mut gizmos: Gizmos, state: Res<NavmeshState>) {
 /// reactor-only (path queries from `dispatch_movement_system`); the
 /// snap touches only the collision surface.
 ///
-/// Out-of-MZB-footprint entities (off the loaded zone bounds) get no
-/// snap — their `transform.y` stays at whatever previous frame set,
-/// which for fresh spawns is the wire-derived `ffxi_to_bevy` value.
-/// No silent fallback to the pathing surface.
+/// Self off the loaded zone bounds gets no snap — `transform.y`
+/// stays at whatever the previous frame set, which for fresh spawns
+/// is the wire-derived `ffxi_to_bevy` value. No silent fallback to
+/// the pathing surface.
 ///
 /// ## Why no offset table
 ///
@@ -248,20 +269,54 @@ fn draw_navmesh_overlay(mut gizmos: Gizmos, state: Res<NavmeshState>) {
 /// per-actor `visual_root_offset` estimate.
 fn snap_entities_to_mzb_floor_system(
     collision_geom: Res<ffxi_viewer_core::dat_mzb::MzbCollisionGeometry>,
-    mut q: Query<&mut Transform, With<WorldEntity>>,
+    scene: Res<SceneState>,
+    mut q: Query<(
+        &WorldEntity,
+        &mut Transform,
+        Has<ffxi_viewer_core::components::IsSelf>,
+    )>,
 ) {
+    // Zone-change fallback: until the new zone's MZB collision finishes
+    // loading, the snap has no floor to anchor against. Without this
+    // branch the system early-returned, leaving self.y at the *previous*
+    // zone's snap result — visually "falling through the world" when
+    // the new zone's floor is at a different elevation at the same
+    // XZ. Trust wire Y for self in this window; the server's Y for the
+    // player is authoritative across zone transitions. Snap takes over
+    // again on the first frame `tri_count() > 0`.
     if collision_geom.tri_count() == 0 {
+        let wire_self_y = ffxi_viewer_core::ffxi_to_bevy(scene.snapshot.self_pos.pos).y;
+        for (_we, mut t, is_self) in q.iter_mut() {
+            if is_self {
+                t.translation.y = wire_self_y;
+            }
+        }
         return;
     }
-    for mut t in q.iter_mut() {
+    for (_we, mut t, is_self) in q.iter_mut() {
+        // Self only. Everything else — Mob, other Pc, Pet, static NPC,
+        // Other — is server-positioned; `sync_entities_system` writes
+        // their wire Y directly. Overriding any of them to the local
+        // MZB floor causes the rendered visual to disagree with the
+        // server's range check (a mob visually "on the ground" 5y away
+        // while the server sees it 15y up the hillside and rejects
+        // attacks as out of range). Even static NPCs: their server-
+        // recorded Y is the canonical position, and rewriting it to a
+        // raycast result silently moves them between visits.
+        //
+        // The player's input pipeline writes X/Z but not Y, so the
+        // snap remains the sole writer of self's vertical position.
+        if !is_self {
+            continue;
+        }
         // `ceiling_y` filters overhead floor-like geometry (arches,
-        // gate tops, second-floor surfaces the entity is walking
+        // gate tops, second-floor surfaces the player is walking
         // *under*). Of the candidates that pass `FLOOR_NORMAL_MIN`
         // and the ceiling bound, `ground_raycast` picks the highest —
         // multi-floor step-up support intact.
         //
         // STEP_TOLERANCE is generous (2 yalms) to absorb the case
-        // where an entity briefly clips above the floor between snap
+        // where the player briefly clips above the floor between snap
         // ticks; the floor-normal filter does the actual "is this a
         // walkable surface" work.
         const STEP_TOLERANCE: f32 = 2.0;

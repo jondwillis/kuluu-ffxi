@@ -65,6 +65,14 @@ pub struct QuickActionRow {
     pub slot: usize,
 }
 
+/// Emitted when an operator clicks (LMB-press) a quick-action row. The
+/// consumer in `ffxi-client/src/view_native/text_input.rs` dispatches
+/// via the same `resolve_quick_action` path the keyboard Enter uses.
+#[derive(Message, Debug, Clone, Copy)]
+pub struct QuickActionActivated {
+    pub slot: usize,
+}
+
 pub fn spawn_quick_action(mut commands: Commands) {
     commands
         .spawn((
@@ -103,6 +111,8 @@ pub fn spawn_quick_action(mut commands: Commands) {
             for slot in 0..MAX_ROWS {
                 p.spawn((
                     QuickActionRow { slot },
+                    // Bevy UI Interaction → cursor swap + click dispatch.
+                    Button,
                     Node::default(),
                     Text::new(""),
                     TextFont {
@@ -176,6 +186,46 @@ pub fn update_quick_action(
             if panel.display != Display::None {
                 panel.display = Display::None;
             }
+        }
+    }
+}
+
+/// Move the QA cursor to follow mouse hover so keyboard-Enter and
+/// mouse-click agree on which row will fire. Only runs while
+/// `InputMode::QuickAction` is active.
+pub fn quick_action_mouse_hover_system(
+    mut mode: ResMut<InputMode>,
+    rows: Query<(&Interaction, &QuickActionRow), Changed<Interaction>>,
+) {
+    let InputMode::QuickAction(state) = &mut *mode else {
+        return;
+    };
+    let limit = entry_count(state.has_target);
+    for (interaction, row) in &rows {
+        if matches!(interaction, Interaction::Hovered | Interaction::Pressed)
+            && row.slot < limit
+            && state.cursor != row.slot
+        {
+            state.cursor = row.slot;
+        }
+    }
+}
+
+/// Emit [`QuickActionActivated`] on row click. Filtered to in-bounds
+/// slots — the spawn pool is `MAX_ROWS`, but the active list may be
+/// shorter (3 with target, 4 without).
+pub fn quick_action_mouse_click_system(
+    mode: Res<InputMode>,
+    rows: Query<(&Interaction, &QuickActionRow), Changed<Interaction>>,
+    mut out: MessageWriter<QuickActionActivated>,
+) {
+    let InputMode::QuickAction(state) = &*mode else {
+        return;
+    };
+    let limit = entry_count(state.has_target);
+    for (interaction, row) in &rows {
+        if *interaction == Interaction::Pressed && row.slot < limit {
+            out.write(QuickActionActivated { slot: row.slot });
         }
     }
 }

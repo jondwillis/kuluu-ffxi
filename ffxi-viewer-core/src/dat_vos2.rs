@@ -697,10 +697,8 @@ pub fn process_load_vos2_requests(
     // For cross-tick requests (rare, but possible if the look pipeline
     // re-fires across frames), we fall back to the `SkinnedActor`
     // component for state recovery; see the lookup below.
-    let mut actor_state: std::collections::HashMap<
-        u32,
-        (Vec<Entity>, Entity, f32, f32),
-    > = std::collections::HashMap::new();
+    let mut actor_state: std::collections::HashMap<u32, (Vec<Entity>, Entity, f32, f32)> =
+        std::collections::HashMap::new();
 
     for req in queued {
         let Some(&bevy_e) = tracked.by_id.get(&req.entity_id) else {
@@ -785,8 +783,22 @@ pub fn process_load_vos2_requests(
                 // NPCs) needs the **actor-wide** min to anchor the
                 // pivot. Otherwise legs/head chunks each shift by
                 // their own slot's min and disassemble the rig.
-                let (slot_min, slot_max) =
-                    compute_skinned_local_y_extent(loaded, is_pc).unwrap_or((-0.9, 1.6));
+                //
+                // `compute_skinned_local_y_extent` reads `v.pos`
+                // directly, which is bone-local — useless for finding
+                // where the vertex actually lands. For PCs we go
+                // through `measure_post_bake_y_extent`, which applies
+                // the bone matrices to get a skeleton-world position
+                // and returns `-p[1]` (= post-pivot-rotation Y under
+                // the `Q_y(π/2) * Q_x(π)` pivot we install above).
+                // NPC pivots are identity and their rigs are Y-up at
+                // bone-local, so the raw `v.pos[1]` path still works
+                // for them.
+                let (slot_min, slot_max) = if is_pc {
+                    measure_post_bake_y_extent(loaded, baked_owned.as_ref()).unwrap_or((0.0, 1.9))
+                } else {
+                    compute_skinned_local_y_extent(loaded, is_pc).unwrap_or((-0.9, 1.6))
+                };
 
                 // Resolve prior actor state: in-tick first (visible
                 // immediately), then cross-tick component (visible
@@ -834,9 +846,33 @@ pub fn process_load_vos2_requests(
                 // (legs after head) can pull the whole actor up by
                 // updating the pivot, keeping every slot's geometry
                 // aligned at `parent.y + 0 = feet`.
+                let piv_y_before = q_xform
+                    .get(pivot)
+                    .map(|t| t.translation.y)
+                    .unwrap_or(f32::NAN);
                 if let Ok(mut piv) = q_xform.get_mut(pivot) {
                     piv.translation.y = -actor_min_y;
                 }
+                let piv_y_after = q_xform
+                    .get(pivot)
+                    .map(|t| t.translation.y)
+                    .unwrap_or(f32::NAN);
+                info!(
+                    "skin accumulate: ent={} file={} is_pc={} slot=[{:+.3}..{:+.3}] \
+                     current=[{:+.3}..{:+.3}] actor=[{:+.3}..{:+.3}] \
+                     piv.y {:+.3}->{:+.3}",
+                    req.entity_id,
+                    req.file_id,
+                    is_pc,
+                    slot_min,
+                    slot_max,
+                    current_min,
+                    current_max,
+                    actor_min_y,
+                    actor_max_y,
+                    piv_y_before,
+                    piv_y_after,
+                );
 
                 actor_state.insert(
                     req.entity_id,
@@ -871,16 +907,31 @@ pub fn process_load_vos2_requests(
                 continue;
             }
         }
-        // Degraded fallback when the GPU skinned path can't take
-        // (missing skeleton, mismatched bone count): drop into the
-        // CPU bake with a per-slot feet translation. No actor-wide
-        // aggregation here (this path handles a single slot per
-        // request); multi-slot fallback actors will misalign, but
-        // they're already in a degraded-render state.
-        let fallback_translation =
-            measure_post_bake_y_extent(loaded, baked_owned.as_ref())
-                .map(|(min, _max)| -min)
-                .unwrap_or(0.0);
+        // CPU bake path. This is the *primary* PC route — the
+        // look_resolver sets `skeleton_file_id: None` for PCs so they
+        // skip the GPU path entirely (see look_resolver.rs:715, and
+        // memory note `pc_gpu_skinning_blockers`). It's also the
+        // degraded path for NPCs whose skeleton doesn't fit.
+        //
+        // `feet_translation_y` must NOT be `-slot_min`. Each
+        // equipment slot's vertices already arrive in a frame where
+        // mesh-Z=0 is the actor's foot sole and mesh-Z=+1.9 is the
+        // head top (the `bind_to_bevy` rotation in
+        // `spawn_vos2_meshes_with_skeleton` puts mesh-Z onto Bevy-Y).
+        // Pre-subtracting the slot's *own* min shifts each part's
+        // bottom to Y=0 — i.e., head, body, hands, legs, feet all
+        // land stacked at the floor (the "pile of overlapping body
+        // parts rooted on the ground" symptom).
+        //
+        // The right value is 0: every slot sits at its natural
+        // post-`bind_to_bevy` Y, so body lands at Y=0.93..1.72,
+        // head at Y=1.94..2.29, feet at Y=0..0.60. The actor stands
+        // upright by construction. Edge case (heels extending below
+        // mesh-Z=0): a future per-actor min accumulation could lift
+        // by `-min` to keep heels above parent.y, but typical PC
+        // skeletons have feet sole exactly at mesh-Z=0, so 0 is
+        // correct for nearly all visible cases.
+        let fallback_translation = 0.0;
         let _ = spawn_vos2_meshes_with_skeleton(
             &mut commands,
             &mut meshes,
@@ -954,6 +1005,11 @@ fn measure_post_bake_y_extent(
 /// pivot's rotation but before its feet-at-origin translation). The
 /// difference `max - min` is the actor's visual height in yalms.
 ///
+/// For PCs, the pivot applies `bind_to_bevy = Q_y(π/2) * Q_x(-π/2)`,
+/// which maps mesh-local `(a, b, c)` to pivot-local `(-b, c, -a)` —
+/// so pivot-local Y of a vertex is `v.pos[2]` (mesh-Z). For NPCs the
+/// pivot is identity, so pivot-local Y is just `v.pos[1]`.
+///
 /// `None` when the mesh carries no vertices (defensive).
 fn compute_skinned_local_y_extent(loaded: &LoadedVos2, is_pc: bool) -> Option<(f32, f32)> {
     if loaded.mesh.vertices.is_empty() {
@@ -962,7 +1018,7 @@ fn compute_skinned_local_y_extent(loaded: &LoadedVos2, is_pc: bool) -> Option<(f
     let mut min_local_y = f32::INFINITY;
     let mut max_local_y = f32::NEG_INFINITY;
     for v in &loaded.mesh.vertices {
-        let local_y = if is_pc { -v.pos[1] } else { v.pos[1] };
+        let local_y = if is_pc { v.pos[2] } else { v.pos[1] };
         if local_y < min_local_y {
             min_local_y = local_y;
         }
@@ -974,6 +1030,270 @@ fn compute_skinned_local_y_extent(loaded: &LoadedVos2, is_pc: bool) -> Option<(f
         Some((min_local_y, max_local_y))
     } else {
         None
+    }
+}
+
+/// Offline probe: load `(skel_file_id)` + `(mesh_file_id, chunk_idx)`,
+/// replicate `spawn_skinned_actor`'s bone-tree composition (bone[0] forced
+/// to identity rotation, all other bones from raw SK2 data, parent-chain
+/// composed), then walk every vertex through `bone_world * v.pos` and
+/// print min/max world-position extents. Compares against
+/// `bake_position` (the CPU bake path) for the same vertices so a
+/// divergence between the two reveals whether the bug lives in the bone
+/// tree, the per-vertex transform, or downstream Bevy plumbing.
+///
+/// Public so `bin/ffxi-skin-probe.rs` can call it. Does no Bevy work —
+/// just `glam` math + `println!`.
+pub fn probe_skinned_actor(skel_file_id: u32, mesh_file_id: u32, chunk_idx: usize) {
+    let Some(baked) = baked_skeleton_for_file(skel_file_id) else {
+        println!("ERR: failed to load skeleton file_id={skel_file_id}");
+        return;
+    };
+    let Some(raw) = baked.raw.as_ref() else {
+        println!("ERR: skeleton file_id={skel_file_id} has no raw bone chunk");
+        return;
+    };
+    let loaded = match load_vos2(mesh_file_id, chunk_idx) {
+        Ok(l) => l,
+        Err(e) => {
+            println!("ERR: load_vos2({mesh_file_id},{chunk_idx}): {e}");
+            return;
+        }
+    };
+
+    let n_bones = raw.bones.len();
+    println!("== ffxi-skin-probe ==");
+    println!("skeleton file_id={skel_file_id} bones={n_bones}");
+    println!(
+        "mesh     file_id={mesh_file_id} chunk={chunk_idx} verts={} groups={}",
+        loaded.mesh.vertices.len(),
+        loaded.mesh.groups.len()
+    );
+
+    let local_t: Vec<Vec3> = raw
+        .bones
+        .iter()
+        .map(|b| Vec3::from_array(b.trans))
+        .collect();
+    let local_r_raw: Vec<Quat> = raw
+        .bones
+        .iter()
+        .map(|b| Quat::from_xyzw(b.rot[0], b.rot[1], b.rot[2], b.rot[3]))
+        .collect();
+    // NEW chain: bone[0] rotation overridden to identity, matching
+    // spawn_skinned_actor.
+    let mut local_r_new = local_r_raw.clone();
+    if !local_r_new.is_empty() {
+        local_r_new[0] = Quat::IDENTITY;
+    }
+
+    let compose = |local_r: &[Quat]| -> (Vec<Vec3>, Vec<Quat>) {
+        let mut wt = vec![Vec3::ZERO; n_bones];
+        let mut wr = vec![Quat::IDENTITY; n_bones];
+        if n_bones == 0 {
+            return (wt, wr);
+        }
+        wt[0] = local_t[0];
+        wr[0] = local_r[0];
+        for i in 1..n_bones {
+            let p = raw.bones[i].parent as usize;
+            if p < n_bones && p != i {
+                wt[i] = wt[p] + wr[p] * local_t[i];
+                wr[i] = wr[p] * local_r[i];
+            } else {
+                wt[i] = local_t[i];
+                wr[i] = local_r[i];
+            }
+        }
+        (wt, wr)
+    };
+
+    let (new_wt, new_wr) = compose(&local_r_new);
+    let (old_wt, _old_wr) = compose(&local_r_raw);
+
+    let axis_extent = |v: &[Vec3], axis: usize| -> (f32, f32) {
+        let mut mn = f32::INFINITY;
+        let mut mx = f32::NEG_INFINITY;
+        for p in v {
+            let a = p[axis];
+            if a < mn {
+                mn = a;
+            }
+            if a > mx {
+                mx = a;
+            }
+        }
+        (mn, mx)
+    };
+
+    let (nx0, nx1) = axis_extent(&new_wt, 0);
+    let (ny0, ny1) = axis_extent(&new_wt, 1);
+    let (nz0, nz1) = axis_extent(&new_wt, 2);
+    let (ox0, ox1) = axis_extent(&old_wt, 0);
+    let (oy0, oy1) = axis_extent(&old_wt, 1);
+    let (oz0, oz1) = axis_extent(&old_wt, 2);
+    println!();
+    println!("[BONE WORLD POSITIONS]");
+    println!(
+        "  OLD chain (bone[0]=raw rot): x=[{ox0:+.3}..{ox1:+.3}] y=[{oy0:+.3}..{oy1:+.3}] z=[{oz0:+.3}..{oz1:+.3}]"
+    );
+    println!(
+        "  NEW chain (bone[0]=identity): x=[{nx0:+.3}..{nx1:+.3}] y=[{ny0:+.3}..{ny1:+.3}] z=[{nz0:+.3}..{nz1:+.3}]"
+    );
+    println!("  OLD matches load_skeleton's bake_y log; NEW is what spawn_skinned_actor renders.");
+
+    // Per-vertex pass: NEW chain bone_world * v.pos, vs bake_position.
+    let mut new_verts: Vec<Vec3> = Vec::with_capacity(loaded.mesh.vertices.len());
+    let mut cpu_verts: Vec<Vec3> = Vec::with_capacity(loaded.mesh.vertices.len());
+    let mut clipped = 0usize;
+    for (i, v) in loaded.mesh.vertices.iter().enumerate() {
+        let bone1 = loaded.mesh.skeleton_bone_for(i).unwrap_or(0) as usize;
+        let bi = if bone1 < n_bones {
+            bone1
+        } else {
+            clipped += 1;
+            0
+        };
+        let v_pos = Vec3::from_array(v.pos);
+        new_verts.push(new_wt[bi] + new_wr[bi] * v_pos);
+        let p = bake_position(&loaded.mesh, i, v.pos, Some(&baked));
+        cpu_verts.push(Vec3::from_array(p));
+    }
+
+    let (nvx0, nvx1) = axis_extent(&new_verts, 0);
+    let (nvy0, nvy1) = axis_extent(&new_verts, 1);
+    let (nvz0, nvz1) = axis_extent(&new_verts, 2);
+    let (cvx0, cvx1) = axis_extent(&cpu_verts, 0);
+    let (cvy0, cvy1) = axis_extent(&cpu_verts, 1);
+    let (cvz0, cvz1) = axis_extent(&cpu_verts, 2);
+    println!();
+    println!("[VERTEX WORLD POSITIONS]");
+    println!(
+        "  NEW (bone_world * v.pos):        x=[{nvx0:+.3}..{nvx1:+.3}] y=[{nvy0:+.3}..{nvy1:+.3}] z=[{nvz0:+.3}..{nvz1:+.3}]"
+    );
+    println!(
+        "  CPU bake (bake_position output): x=[{cvx0:+.3}..{cvx1:+.3}] y=[{cvy0:+.3}..{cvy1:+.3}] z=[{cvz0:+.3}..{cvz1:+.3}]"
+    );
+    println!(
+        "  Clipped to bone[0] (out-of-range): {clipped}/{}",
+        new_verts.len()
+    );
+
+    // Sample first 5 vertices for inspection.
+    println!();
+    println!("[FIRST 5 VERTICES]");
+    println!("  idx bone v.pos                    NEW (runtime)              CPU bake");
+    for i in 0..loaded.mesh.vertices.len().min(5) {
+        let v = &loaded.mesh.vertices[i];
+        let bone1 = loaded.mesh.skeleton_bone_for(i).unwrap_or(0);
+        let nv = new_verts[i];
+        let cv = cpu_verts[i];
+        println!(
+            "  {i:>3} {bone1:>4} ({:+.3},{:+.3},{:+.3})  ({:+.3},{:+.3},{:+.3})  ({:+.3},{:+.3},{:+.3})",
+            v.pos[0], v.pos[1], v.pos[2], nv.x, nv.y, nv.z, cv.x, cv.y, cv.z
+        );
+    }
+
+    // ---- Simulate the *full* pipeline the GPU would see ----
+    //
+    // Bevy's `SkinnedMesh` formula:
+    //   vertex_world = joints[i].compute_matrix() * inv_bindposes[i] * v.pos
+    //
+    // Our `joints[i]` are bone entities under the pivot (child of
+    // bevy_e). With `inv_bindposes = IDENTITY` and bevy_e at the
+    // world origin, joints[i].compute_matrix() expands to:
+    //   pivot.transform * bone[i].chain_in_pivot
+    //
+    // So the rendered vertex is:
+    //   pivot.rotation * (bone_chain * v.pos) + pivot.translation
+    //
+    // That's what we simulate below for two candidate pivot rotations.
+
+    let actor_min_y = {
+        let mut mn = f32::INFINITY;
+        // Match what `measure_post_bake_y_extent` returns: -p[1] of CPU bake.
+        for p in &cpu_verts {
+            let y = -p.y;
+            if y < mn {
+                mn = y;
+            }
+        }
+        if mn.is_finite() {
+            mn
+        } else {
+            0.0
+        }
+    };
+    let pivot_translation = Vec3::new(0.0, -actor_min_y, 0.0);
+
+    let candidates: &[(&str, Quat)] = &[
+        (
+            "Q_y(π/2) * Q_x(π) [current]",
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)
+                * Quat::from_rotation_x(std::f32::consts::PI),
+        ),
+        (
+            "Q_x(π) [original]",
+            Quat::from_rotation_x(std::f32::consts::PI),
+        ),
+        (
+            "Q_y(π/2) * Q_x(-π/2) [first attempt]",
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)
+                * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+        ),
+        ("IDENTITY", Quat::IDENTITY),
+    ];
+    println!();
+    println!(
+        "[POST-PIVOT WORLD POSITIONS]  pivot.translation = (0, -actor_min_y, 0) = (0, {:+.3}, 0)",
+        pivot_translation.y
+    );
+    println!("  candidate                          x-extent         y-extent         z-extent");
+    for (name, rot) in candidates {
+        let xform = |p: Vec3| -> Vec3 { *rot * p + pivot_translation };
+        let mut mn = Vec3::splat(f32::INFINITY);
+        let mut mx = Vec3::splat(f32::NEG_INFINITY);
+        for p in &new_verts {
+            let w = xform(*p);
+            mn = mn.min(w);
+            mx = mx.max(w);
+        }
+        println!(
+            "  {:35}  [{:+.3}..{:+.3}]  [{:+.3}..{:+.3}]  [{:+.3}..{:+.3}]",
+            name, mn.x, mx.x, mn.y, mx.y, mn.z, mx.z
+        );
+    }
+
+    // ---- Sanity: is v.pos bone-local or mesh-space? ----
+    //
+    // If bone-local: |v.pos| ≪ |bone_world_t|, because v.pos is the
+    // offset *from* the bone's bind pose.
+    // If mesh-space: |v.pos| ≈ |bone_world_t * v.pos|, because the
+    // vertex's pre-skinned position is already in the skeleton's
+    // root frame.
+    let mut vpos_mag = 0f32;
+    let mut bone_mag = 0f32;
+    let mut bake_mag = 0f32;
+    for (i, v) in loaded.mesh.vertices.iter().enumerate() {
+        let bone1 = loaded.mesh.skeleton_bone_for(i).unwrap_or(0) as usize;
+        let bi = bone1.min(n_bones - 1);
+        let vp = Vec3::from_array(v.pos);
+        vpos_mag = vpos_mag.max(vp.length());
+        bone_mag = bone_mag.max(new_wt[bi].length());
+        bake_mag = bake_mag.max(cpu_verts[i].length());
+    }
+    println!();
+    println!("[FRAME OF v.pos]");
+    println!(
+        "  max |v.pos|          = {:.3}  (small = bone-local, big = mesh-space)",
+        vpos_mag
+    );
+    println!("  max |bone_world_t|   = {:.3}", bone_mag);
+    println!("  max |baked vertex|   = {:.3}", bake_mag);
+    if vpos_mag < bake_mag * 0.5 {
+        println!("  → v.pos appears bone-local. identity inv_bindposes is CORRECT.");
+    } else {
+        println!("  → v.pos appears mesh-space. identity inv_bindposes DOUBLES the transform.");
     }
 }
 
@@ -1026,11 +1346,21 @@ fn spawn_skinned_actor(
             // **Always** insert a pivot entity between `parent` and the
             // bone tree. The pivot carries two responsibilities:
             //
-            //   1. Axis flip from FFXI engine native to Bevy. PCs get
-            //      `Q_x(π)` (negates Y and Z signs); NPC rigs need no
-            //      rotation here because their authoring already lines
-            //      up — confirmed by past empirical work, see the
-            //      `is_pc` branch below.
+            //   1. Axis convention from FFXI skeleton-world to Bevy.
+            //      PC skeletons are authored Y-down (head bones at
+            //      negative Y, feet at Y=0; see `bake_y=[-1.90..0]`
+            //      in the load_skeleton diagnostic). The CPU bake's
+            //      effective rotation on skeleton-world positions is
+            //      `Q_y(π/2) * Q_x(-π/2) * Q_x(-π/2) = Q_y(π/2) *
+            //      Q_x(π)` (one Q_x(-π/2) is the pre-swap `[p[0],
+            //      p[2], -p[1]]` in the positions array; the other
+            //      lives in the entity's `bind_to_bevy` rotation).
+            //      The GPU path operates directly on skeleton-world
+            //      so the pivot needs to carry the *composed* rotation
+            //      — anything less leaves the character tipped on its
+            //      side and the height axis projecting through the
+            //      width/depth extent. NPC rigs land Y-up already, so
+            //      they keep identity.
             //   2. Feet-at-origin translation: `Vec3::Y * -min_local_y`
             //      pushes the lowest baked vertex onto parent.y = 0,
             //      which is the invariant the snap and target-ring
@@ -1041,7 +1371,8 @@ fn spawn_skinned_actor(
             // special-case writing back the flip and translation every
             // frame.
             let pivot_rotation = if is_pc {
-                Quat::from_rotation_x(std::f32::consts::PI)
+                Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)
+                    * Quat::from_rotation_x(std::f32::consts::PI)
             } else {
                 Quat::IDENTITY
             };
@@ -1240,7 +1571,6 @@ fn spawn_skinned_actor(
             base_color_texture: tex_handle.clone(),
             perceptual_roughness: 1.0,
             metallic: 0.0,
-            unlit: true,
             cull_mode: None,
             ..default()
         });
@@ -1864,12 +2194,12 @@ pub fn spawn_equipped(
     // parent entity's local y=0 — the snap-invariant feet position.
     // Every slot uses the same number; inter-slot relative positions
     // are preserved.
-    let (min_mesh_y, max_mesh_y) =
-        if actor_min_local_y.is_finite() && actor_max_local_y.is_finite() {
-            (actor_min_local_y, actor_max_local_y)
-        } else {
-            (-0.9, 1.6)
-        };
+    let (min_mesh_y, max_mesh_y) = if actor_min_local_y.is_finite() && actor_max_local_y.is_finite()
+    {
+        (actor_min_local_y, actor_max_local_y)
+    } else {
+        (-0.9, 1.6)
+    };
     let feet_translation_y = -min_mesh_y;
     let mut spawned = 0usize;
     for slot in &loaded_slots {

@@ -19,7 +19,67 @@ use crate::components::IsSelf;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::graphics_settings::AaMode;
 use crate::graphics_settings::GraphicsSettings;
+use crate::scene::BakedActor;
 use crate::snapshot::SceneState;
+
+/// Fraction of an entity's full visual height (= `BakedActor.actor_height`)
+/// to use as the chase-camera anchor / look-at point. 0.55 lands at
+/// mid-chest — what retail FFXI frames in third-person. Race-invariant
+/// in fractional terms: Galka chest is at ~55% of Galka height, Taru
+/// chest at ~55% of Taru height. Race-dependent in absolute yalms,
+/// which is what we want.
+const THIRD_PERSON_ANCHOR_FRAC: f32 = 0.55;
+
+/// Fraction of an entity's full visual height for the first-person eye.
+/// 0.92 puts the eye-line just below the crown — matches retail FFXI's
+/// first-person camera (look out from the head, not the brow).
+const FIRST_PERSON_EYE_FRAC: f32 = 0.92;
+
+/// Extra yalms above `actor_height` (≈ top-of-head) for the nameplate
+/// floating-label anchor. Small enough that the label sits just clear
+/// of the crown; large enough that it doesn't intersect tall hats.
+const NAMEPLATE_OFFSET_ABOVE_CROWN: f32 = 0.1;
+
+/// Fallback actor height (yalms) used when an entity lacks a
+/// [`BakedActor`] — capsule-only fallbacks, mobs without a skinned
+/// mesh, or the first frame or two before VOS2 dispatch attaches the
+/// component. 4.5 matches the default PC capsule (`2*(0.35 + 1.9)`,
+/// see `scene::entity_visual_height`), so a freshly-spawned PC reads
+/// roughly the same anchors before and after its skin loads.
+const FALLBACK_ACTOR_HEIGHT: f32 = 3.0;
+
+/// Third-person camera anchor Y above an entity's feet, derived from
+/// its [`BakedActor`] when present. The chase camera pivots both its
+/// ray-collision origin AND its world placement around this point — so
+/// race-tall actors get a higher anchor (and the camera is positioned
+/// higher to match), race-short actors a lower one.
+#[inline]
+pub fn third_person_anchor_y(baked: Option<&BakedActor>) -> f32 {
+    baked
+        .map(|b| b.actor_height)
+        .unwrap_or(FALLBACK_ACTOR_HEIGHT)
+        * THIRD_PERSON_ANCHOR_FRAC
+}
+
+/// First-person eye-height Y above feet. See [`FIRST_PERSON_EYE_FRAC`].
+#[inline]
+pub fn first_person_eye_y(baked: Option<&BakedActor>) -> f32 {
+    baked
+        .map(|b| b.actor_height)
+        .unwrap_or(FALLBACK_ACTOR_HEIGHT)
+        * FIRST_PERSON_EYE_FRAC
+}
+
+/// Y above feet for a nameplate's world anchor. Sits just above the
+/// top of the mesh; passed to `Camera::world_to_viewport` to compute
+/// screen position.
+#[inline]
+pub fn nameplate_anchor_y(baked: Option<&BakedActor>) -> f32 {
+    baked
+        .map(|b| b.actor_height)
+        .unwrap_or(FALLBACK_ACTOR_HEIGHT)
+        + NAMEPLATE_OFFSET_ABOVE_CROWN
+}
 
 /// Marker on the operator camera entity.
 #[derive(Component)]
@@ -58,9 +118,6 @@ pub struct ChaseCamera {
     pub pitch: f32,
     /// Total camera-to-player distance in Bevy units.
     pub distance: f32,
-    /// Raise the look-at point above char origin so the camera doesn't aim
-    /// at the ground (the capsule's center is ~1.0 above the floor).
-    pub height_target: f32,
     /// Per-frame lerp factor for translation smoothing. 1.0 = snap.
     pub smoothing: f32,
     /// Set to true once we've snapped yaw to the spawn heading. Until then,
@@ -69,8 +126,20 @@ pub struct ChaseCamera {
 }
 
 impl ChaseCamera {
-    /// Floor pitch ≈ 6° — keeps camera off the ground plane.
-    pub const PITCH_MIN: f32 = 0.10;
+    /// Floor pitch ≈ -17°. Negative because the chase camera pivots
+    /// around the chest anchor (`feet + height_target`), not the feet
+    /// (see `chase_camera_system`). pitch=0 puts the camera level with
+    /// chest looking horizontally at chest; pitch>0 lifts the camera
+    /// above chest looking down; pitch<0 drops the camera below chest
+    /// looking up at the avatar — the "from-below" / "below-horizon"
+    /// shot that retail FFXI supports. Going below this floor pushes
+    /// the camera underground at max zoom (cam.y = chest_y +
+    /// distance·sin(pitch); at distance=30, pitch=-0.30 → cam.y≈0.25
+    /// before the BVH ground-collision clamp catches it). The
+    /// collision system *will* clamp ground hits, so this floor is
+    /// primarily an aesthetic guard against the camera burrowing too
+    /// far when the operator drags the mouse hard.
+    pub const PITCH_MIN: f32 = -0.30;
     /// Ceiling pitch ≈ 80° — leaves a small angle so the camera doesn't go
     /// fully top-down (which would lose the chase aesthetic).
     pub const PITCH_MAX: f32 = 1.40;
@@ -80,16 +149,6 @@ impl ChaseCamera {
     pub const FP_PITCH_MIN: f32 = -std::f32::consts::FRAC_PI_2 + 0.05;
     /// First-person look-up ceiling. Symmetric with `FP_PITCH_MIN`.
     pub const FP_PITCH_MAX: f32 = std::f32::consts::FRAC_PI_2 - 0.05;
-    /// Bevy units from feet to eye for first-person. Capsule mesh has
-    /// `height = 1.9` per `scene::EntityMesh`; eye sits below the top so
-    /// the cap doesn't intersect the near-clip.
-    /// First-person eye height **above the entity's feet** (i.e.
-    /// above `transform.y`, which is now feet-on-ground for every
-    /// entity after the feet-at-origin refactor in `setup_world` /
-    /// `dat_vos2`). Tuned for a typical adult silhouette (~4.5-yalm
-    /// total height); Galka/Taru drift is negligible at first-person
-    /// distance.
-    pub const FP_EYE_HEIGHT: f32 = 3.9;
     /// Closest the chase camera can pull in. Below ~3.0 the player capsule
     /// clips through the near plane; for closer-than-3 use FirstPerson.
     pub const DIST_MIN: f32 = 3.0;
@@ -111,11 +170,6 @@ impl Default for ChaseCamera {
             yaw: 0.0,
             pitch: 0.55,
             distance: 18.0,
-            // Look-at target ≈ chest height above feet. The feet-at-
-            // origin refactor moved `transform.y` from body-center to
-            // feet, so this constant absorbs the old capsule half-height
-            // (≈ 2.25 yalms for PC) plus a small chest lift on top.
-            height_target: 3.25,
             smoothing: 0.18,
             synced_initial: false,
         }
@@ -207,14 +261,14 @@ pub fn chase_camera_system(
     mode: Res<CameraMode>,
     mut chase: ResMut<ChaseCamera>,
     state: Res<SceneState>,
-    q_self: Query<&Transform, (With<IsSelf>, Without<OperatorCamera>)>,
+    q_self: Query<(&Transform, Option<&BakedActor>), (With<IsSelf>, Without<OperatorCamera>)>,
     mut q_cam: Query<&mut Transform, (With<OperatorCamera>, Without<IsSelf>)>,
 ) {
     if !matches!(*mode, CameraMode::Chase) {
         return;
     }
 
-    let Ok(self_t) = q_self.single() else {
+    let Ok((self_t, baked)) = q_self.single() else {
         return;
     };
     let Ok(mut cam_t) = q_cam.single_mut() else {
@@ -230,12 +284,17 @@ pub fn chase_camera_system(
     let cos_p = chase.pitch.cos();
     let sin_p = chase.pitch.sin();
     let yaw_dir = Vec3::new(chase.yaw.sin(), 0.0, chase.yaw.cos());
-    let desired = self_t.translation
-        + yaw_dir * (chase.distance * cos_p)
-        + Vec3::Y * (chase.distance * sin_p);
+    // Per-actor torso anchor (fraction of `BakedActor.actor_height`) —
+    // Galka tall, Taru short, mob whatever the mesh measured. Both the
+    // ray and the camera placement pivot here. Fallback constant kicks
+    // in for capsule-only entities and the first frame before VOS2
+    // dispatch lands.
+    let anchor_y = third_person_anchor_y(baked);
+    let anchor = self_t.translation + Vec3::Y * anchor_y;
+    let desired = anchor + yaw_dir * (chase.distance * cos_p) + Vec3::Y * (chase.distance * sin_p);
 
     cam_t.translation = cam_t.translation.lerp(desired, chase.smoothing);
-    cam_t.look_at(self_t.translation + Vec3::Y * chase.height_target, Vec3::Y);
+    cam_t.look_at(anchor, Vec3::Y);
 }
 
 /// First-person camera. Snaps the camera origin to the player's eye and
@@ -252,20 +311,20 @@ pub fn chase_camera_system(
 pub fn firstperson_camera_system(
     mode: Res<CameraMode>,
     chase: Res<ChaseCamera>,
-    q_self: Query<&Transform, (With<IsSelf>, Without<OperatorCamera>)>,
+    q_self: Query<(&Transform, Option<&BakedActor>), (With<IsSelf>, Without<OperatorCamera>)>,
     mut q_cam: Query<&mut Transform, (With<OperatorCamera>, Without<IsSelf>)>,
 ) {
     if !matches!(*mode, CameraMode::FirstPerson) {
         return;
     }
-    let Ok(self_t) = q_self.single() else {
+    let Ok((self_t, baked)) = q_self.single() else {
         return;
     };
     let Ok(mut cam_t) = q_cam.single_mut() else {
         return;
     };
 
-    let eye = self_t.translation + Vec3::Y * ChaseCamera::FP_EYE_HEIGHT;
+    let eye = self_t.translation + Vec3::Y * first_person_eye_y(baked);
     let cos_p = chase.pitch.cos();
     let look_dir = Vec3::new(
         -chase.yaw.sin() * cos_p,
@@ -309,8 +368,13 @@ pub fn self_visibility_for_camera_mode_system(
 
 /// Toggle the camera between Chase and FirstPerson, applying mode-specific
 /// invariants:
-/// - Entering FP: leaves yaw/pitch alone (the FP system can use the wider
-///   range immediately).
+/// - Entering FP: **resets pitch to 0** (level look). Chase and FP share
+///   `chase.pitch` storage but interpret it differently — chase reads it as
+///   orbital elevation (default 0.55 rad ≈ 31° above horizontal so the
+///   camera looks down at the avatar), FP reads it as forward look angle.
+///   Carrying the orbital elevation directly into FP slammed the view 31°
+///   above horizontal on entry; resetting to 0 starts the operator looking
+///   straight ahead.
 /// - Returning to Chase: clamps pitch back into `[PITCH_MIN, PITCH_MAX]` so
 ///   the chase camera doesn't end up inside the ground or fully overhead.
 ///
@@ -319,7 +383,10 @@ pub fn self_visibility_for_camera_mode_system(
 /// and call this.
 pub fn toggle_camera_mode(mode: &mut CameraMode, chase: &mut ChaseCamera) {
     *mode = match *mode {
-        CameraMode::Chase => CameraMode::FirstPerson,
+        CameraMode::Chase => {
+            chase.pitch = 0.0;
+            CameraMode::FirstPerson
+        }
         CameraMode::FirstPerson => {
             chase.pitch = chase
                 .pitch
@@ -369,11 +436,13 @@ mod tests {
         }
     }
 
-    /// `toggle_camera_mode` flips the mode; pitch is preserved when going
-    /// into FP (FP allows the wider range) and clamped back into chase
-    /// range when leaving FP.
+    /// `toggle_camera_mode` flips the mode and mediates the shared `pitch`
+    /// storage: FP entry resets it to 0 (level look) so the orbital-pitch
+    /// default doesn't slam the FP view upward; Chase re-entry clamps it
+    /// back into `[PITCH_MIN, PITCH_MAX]` so the chase camera doesn't end
+    /// up inside the ground or fully overhead.
     #[test]
-    fn toggle_camera_mode_clamps_pitch_only_on_chase_entry() {
+    fn toggle_camera_mode_mediates_pitch_at_boundaries() {
         let mut mode = CameraMode::Chase;
         let mut chase = ChaseCamera {
             pitch: 0.55,
@@ -381,7 +450,7 @@ mod tests {
         };
         toggle_camera_mode(&mut mode, &mut chase);
         assert_eq!(mode, CameraMode::FirstPerson);
-        assert_eq!(chase.pitch, 0.55, "FP entry preserves pitch");
+        assert_eq!(chase.pitch, 0.0, "FP entry resets pitch to level");
 
         // Mouse-look down past the chase floor while in FP.
         chase.pitch = -0.7;
@@ -394,7 +463,8 @@ mod tests {
         );
 
         // Looking far up in FP also clamps on chase re-entry.
-        toggle_camera_mode(&mut mode, &mut chase); // -> FP
+        toggle_camera_mode(&mut mode, &mut chase); // -> FP (pitch reset to 0)
+        assert_eq!(chase.pitch, 0.0, "FP re-entry still resets pitch");
         chase.pitch = 1.5;
         toggle_camera_mode(&mut mode, &mut chase); // -> Chase
         assert_eq!(chase.pitch, ChaseCamera::PITCH_MAX);

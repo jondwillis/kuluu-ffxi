@@ -69,7 +69,26 @@ pub fn spawn_vana_clock_as_child(p: &mut ChildSpawnerCommands) {
     });
 }
 
-pub fn update_vana_clock(time: Res<Time>, mut q: Query<&mut Text, With<VanaClockLabel>>) {
+/// FFXI 8-day week. Indexed by `total_vana_days % 8`; epoch (886/1/1)
+/// is Firesday per `vendor/server/settings/default/map.lua:77` and the
+/// authoritative ordering is `vendor/server/scripts/commands/time.lua`.
+const VANA_WEEKDAYS: [&str; 8] = [
+    "Firesday",
+    "Earthsday",
+    "Watersday",
+    "Windsday",
+    "Iceday",
+    "Lightningday",
+    "Lightsday",
+    "Darksday",
+];
+
+pub fn update_vana_clock(
+    time: Res<Time>,
+    mut q: Query<&mut Text, With<VanaClockLabel>>,
+    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut prev_vana_day: Local<Option<u64>>,
+) {
     let Ok(mut text) = q.single_mut() else {
         return;
     };
@@ -85,6 +104,25 @@ pub fn update_vana_clock(time: Res<Time>, mut q: Query<&mut Text, With<VanaClock
     if **text != want {
         **text = want;
     }
+
+    // Vana day rollover → System chat. The format string in the HUD
+    // label changes once per V-minute; we want one toast per V-day
+    // (every ~10 Earth minutes), so track the day index separately
+    // rather than diffing strings. First call seeds without firing
+    // so logging in mid-day doesn't immediately announce the current
+    // day as if it were a rollover.
+    let earth_since_vana = earth_now.saturating_sub(EARTH_EPOCH_UNIX);
+    let total_vana_days = earth_since_vana / EARTH_SECS_PER_VANA_DAY;
+    if let Some(prev) = *prev_vana_day {
+        if prev != total_vana_days {
+            let weekday = VANA_WEEKDAYS[(total_vana_days % 8) as usize];
+            scene_state.push_local_toast(crate::snapshot::system_chat_line(format!(
+                "📅 Vana day {} — {}",
+                total_vana_days, weekday,
+            )));
+        }
+    }
+    *prev_vana_day = Some(total_vana_days);
 }
 
 /// Monotonic Vana minutes since the V-epoch (8866-01-01 00:00).

@@ -334,9 +334,16 @@ pub(crate) fn compute_world_aabb(positions: &[Vec3]) -> Option<WorldAabb3> {
 }
 
 /// Allocate a fresh blank RGBA8 render target sized for the minimap.
-/// `RenderAssetUsages::RENDER_WORLD` keeps the texture GPU-side only —
-/// no CPU read-back, which would otherwise force a per-frame stalling
-/// download.
+/// Uses `RenderAssetUsages::default()` (MAIN_WORLD | RENDER_WORLD)
+/// so the CPU side keeps the texture descriptor — the zoom-cropper
+/// (`update_minimap_crop_rect`) reads `Image::size_f32()` from main
+/// world to convert visible-AABB to pixel-space rect bounds. The
+/// RENDER_WORLD-only variant would free the CPU side after first
+/// prep, causing `images.get(handle)` to return `None` and the
+/// cropper to silently bail every frame — the symptom is the image
+/// not moving while entity dots do.
+///
+/// CPU-side memory cost is ~256 KB per loaded zone (256² RGBA8).
 fn create_render_target_image(images: &mut Assets<Image>) -> Handle<Image> {
     let size = Extent3d {
         width: MINIMAP_TEX_SIZE,
@@ -348,7 +355,7 @@ fn create_render_target_image(images: &mut Assets<Image>) -> Handle<Image> {
         TextureDimension::D2,
         &[0u8, 0, 0, 0],
         TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::RENDER_WORLD,
+        RenderAssetUsages::default(),
     );
     // RENDER_ATTACHMENT is what makes the texture a valid render target;
     // TEXTURE_BINDING is what lets the UI sample it; COPY_DST is the

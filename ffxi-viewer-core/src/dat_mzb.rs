@@ -61,8 +61,8 @@ pub const DEFAULT_MOB_DRAW_DISTANCE: f32 = 50.0;
 /// Values are linear sRGB scalars in `[0, 1]`. They're multiplied
 /// per-vertex with a `shade` factor (`0.4..1.0` from the upward normal
 /// component) inside [`process_load_mzb_requests`] before being baked
-/// into `ATTRIBUTE_COLOR`. The unlit material's WHITE base color lets
-/// the vertex color drive the final pixel.
+/// into `ATTRIBUTE_COLOR`. The material's WHITE base color lets the
+/// vertex color drive the final pixel.
 const MZB_MATERIAL_PALETTE: [[f32; 3]; 16] = [
     [0.85, 0.55, 0.40], // 0
     [0.75, 0.65, 0.45], // 1
@@ -104,15 +104,24 @@ pub enum ZoneGeomMode {
     /// Show both collision and non-collision (decorative) meshes.
     /// Default — the full visible-geometry layer.
     All,
+    /// Camera-collision debug overlay. MZB collision visible (same as
+    /// `Collision`), plus the client crate's `draw_camera_collision_debug`
+    /// system layers gizmos over the top: each `CollisionBvh`'s root AABB
+    /// as a green wirebox, and the live player→camera ray as a red line.
+    /// Lets the operator see exactly what the camera push-in raycast tests
+    /// against. Diagnostic only — has no effect on actual collision math.
+    Camera,
 }
 
 impl ZoneGeomMode {
-    /// `toggle`-cycle order: Collision → All → Off → Collision.
-    /// Skips no states; lets a single keybind walk the full tri-state.
+    /// `toggle`-cycle order: Collision → All → Camera → Off → Collision.
+    /// Skips no states; lets a single keybind walk the full tri-state +
+    /// debug overlay.
     pub fn cycle(self) -> Self {
         match self {
             Self::Collision => Self::All,
-            Self::All => Self::Off,
+            Self::All => Self::Camera,
+            Self::Camera => Self::Off,
             Self::Off => Self::Collision,
         }
     }
@@ -122,6 +131,7 @@ impl ZoneGeomMode {
             Self::Off => "off",
             Self::Collision => "collision",
             Self::All => "all",
+            Self::Camera => "camera",
         }
     }
 }
@@ -372,6 +382,11 @@ pub fn apply_zone_geom_visibility(
         ZoneGeomMode::Off => (Visibility::Hidden, Visibility::Hidden),
         ZoneGeomMode::Collision => (Visibility::Inherited, Visibility::Hidden),
         ZoneGeomMode::All => (Visibility::Inherited, Visibility::Inherited),
+        // Camera-debug mode shows the same MZB collision layer as
+        // `Collision`, then the client crate's gizmo system layers
+        // BVH AABBs + the active raycast on top. Non-collision (decor)
+        // stays hidden so the gizmos read clearly.
+        ZoneGeomMode::Camera => (Visibility::Inherited, Visibility::Hidden),
     };
     for mut v in q_collision.iter_mut() {
         if *v != want_collision {
@@ -1016,7 +1031,9 @@ pub fn process_load_mzb_requests(
     // even when the mode is `Collision`.
     let (init_collision_vis, init_noncollision_vis) = match draw.zone_geom_mode {
         ZoneGeomMode::Off => (Visibility::Hidden, Visibility::Hidden),
-        ZoneGeomMode::Collision => (Visibility::Inherited, Visibility::Hidden),
+        ZoneGeomMode::Collision | ZoneGeomMode::Camera => {
+            (Visibility::Inherited, Visibility::Hidden)
+        }
         ZoneGeomMode::All => (Visibility::Inherited, Visibility::Inherited),
     };
     for req in events.read() {
@@ -1046,12 +1063,12 @@ pub fn process_load_mzb_requests(
         let n_submeshes = submeshes.len();
         let n_instances = instances.len();
 
-        // Unlit + two-sided. MZB walls are mostly single-sided polygons
-        // (the FFXI client originally lit them per-face from outside
-        // only), so backface culling makes interior surfaces invisible
-        // and produces visible "missing geometry" gaps. `cull_mode: None`
-        // doubles fragment cost but at the post-unlit perf baseline that
-        // tradeoff is comfortably affordable.
+        // Two-sided. MZB walls are mostly single-sided polygons (the
+        // FFXI client lit them per-face from outside only), so backface
+        // culling makes interior surfaces invisible and produces
+        // "missing geometry" gaps. `cull_mode: None` doubles fragment
+        // cost but the per-zone draw count is two batched meshes, so
+        // the tradeoff is comfortably affordable.
         //
         // `base_color: WHITE` so the per-vertex `ATTRIBUTE_COLOR`
         // (material_palette × normal-shade, baked above) carries the
@@ -1059,16 +1076,16 @@ pub fn process_load_mzb_requests(
         // translucent-amber appearance with material-distinguishable
         // walls (stone, sand, wood, water etc. each gets its own hue
         // from the 4-bit material_id decoded from the MZB triangle
-        // index high bits).
+        // index high bits). Bevy's StandardMaterial multiplies the
+        // vertex color through unchanged, so the palette × shade bake
+        // survives PBR shading.
         let collision_mat = materials.add(StandardMaterial {
             base_color: Color::WHITE,
-            unlit: true,
             cull_mode: None,
             ..default()
         });
         let noncollision_mat = materials.add(StandardMaterial {
             base_color: Color::WHITE,
-            unlit: true,
             cull_mode: None,
             ..default()
         });
@@ -1178,9 +1195,9 @@ pub fn process_load_mzb_requests(
             // fine on the coarse MZB walls.
             mesh.compute_smooth_normals();
             // Vertex color = material_palette[mat] × shade(n.y).
-            // The unlit material multiplies vertex color × base_color,
-            // so this gives us free per-vertex shading + material tint
-            // at zero per-pixel cost.
+            // StandardMaterial multiplies vertex color × base_color,
+            // so this gives us a per-vertex shading + material tint
+            // bake on top of whatever PBR shading the scene lights add.
             if let Some(normals) = mesh
                 .attribute(Mesh::ATTRIBUTE_NORMAL)
                 .and_then(|a| a.as_float3())
@@ -1320,7 +1337,6 @@ pub fn process_load_mzb_requests(
         if water_count > 0 {
             let water_mat = materials.add(StandardMaterial {
                 base_color: Color::srgba(0.20, 0.45, 0.70, 0.55),
-                unlit: true,
                 cull_mode: None,
                 alpha_mode: AlphaMode::Blend,
                 ..default()

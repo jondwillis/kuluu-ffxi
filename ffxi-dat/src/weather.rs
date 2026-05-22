@@ -239,7 +239,35 @@ pub fn collect_weather_records(dat_bytes: &[u8]) -> Vec<WeatherRecord> {
             out.push(r);
         }
     }
+    // Drop records whose skybox is all zero. Two cases produce these:
+    //   1. Unused weather-variant slots — some DATs declare up to ~21
+    //      weather variants but only populate a handful; the rest
+    //      ship as zero-filled placeholders.
+    //   2. Indoor/cave weather variants — e.g. Bastok Mines ships
+    //      several V-time records where the skybox is intentionally
+    //      zeroed (no sky to render inside the mine) while
+    //      ambient/fog stay populated for cave lighting.
+    // Either way the renderer needs a real sky color at every V-time
+    // — without this filter, `sample_weather`'s stable-sort +
+    // position-of-greater-than lands on a zero record and noon
+    // renders as midnight. The outdoor regions of mixed zones get
+    // the outdoor sky; players standing in indoor regions see a sky
+    // that doesn't match (acceptable — the skybox sphere is always
+    // rendered and the indoor walls occlude it anyway).
+    out.retain(|r| {
+        !r.skybox_colors
+            .iter()
+            .all(|c| c[0] == 0.0 && c[1] == 0.0 && c[2] == 0.0)
+    });
     out.sort_by_key(|r| r.time_minutes);
+    // Dedup by V-time so the sampler doesn't lerp between two
+    // different weather curves' records (which would mix colors
+    // across unrelated curves). The module doc promises a single TOD
+    // curve for multi-weather zones; we keep the first record per
+    // V-time as the curve. The choice is arbitrary among the
+    // populated variants — a follow-up could prefer the "brightest"
+    // or filter by an explicit weather id.
+    out.dedup_by_key(|r| r.time_minutes);
     out
 }
 

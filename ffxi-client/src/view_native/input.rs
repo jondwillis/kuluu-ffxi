@@ -85,39 +85,39 @@ const SPEED_TO_YPS: f32 = 0.2;
 /// Turn (A/D in 3rd person) — heading lerp rate toward direction of
 /// motion, radians per real-time second.
 ///
-/// Geometric truth: in the strafe-camera-left motion model, you cannot
-/// simultaneously have (a) camera directly behind player AND (b) player
-/// facing direction of motion. The strafe direction is perpendicular to
-/// camera-forward, so player heading and camera position have an
-/// intrinsic 90° offset — try to make camera behind and the player
-/// moonwalks; let player face motion and the camera ends up at the
-/// flank.
-///
-/// The hybrid: split the 90° between two lazy lerps —
-///   - heading lerps toward direction of motion (lag here = moonwalk)
-///   - chase.yaw lerps toward "behind player heading" (lag here = flank)
-///
-/// Steady-state algebra (both lerps converge to a common angular
-/// velocity ω while maintaining their respective lags):
+/// Motion model: player strafes camera-perpendicular (A = camera-left,
+/// D = camera-right). Heading lazily lerps toward the direction of
+/// motion. Chase-camera yaw lazily lerps toward "behind player heading".
+/// The two lerps create the orbit dynamics:
 ///
 /// ```text
-///   ω         = π/2 / (1/HLR + 1/CTR)
-///   lag_head  = ω / HLR  (radians of moonwalk)
-///   lag_chase = ω / CTR  (radians of camera-flank)
+///   ω         = π/2 / (1/HLR + 1/CTR)   common angular velocity
+///   lag_head  = ω / HLR                 radians player faces "back toward camera"
+///   lag_chase = ω / CTR                 radians camera is off "directly behind"
 ///   orbit_r   = walk_speed / ω
 /// ```
 ///
-/// At HLR = CTR = 0.5 (the shipped default):
-/// `ω ≈ 0.393 rad/sec`, `orbit r ≈ 12.7 yalms`, `lag_head = lag_chase ≈ 45°`.
-/// Bias `CTR > HLR` to push camera more-behind (at the cost of more
-/// moonwalk); bias the other way for less moonwalk + camera further
-/// at flank.
-const HEADING_LERP_RATE_RAD_PER_SEC: f32 = 0.5;
+/// The two lags ALWAYS sum to π/2 (geometric constraint of the strafe
+/// model). The split between them is what you tune:
+///   - `HLR < CTR` (default): player faces partly back-toward-camera
+///     (visible moonwalk-style turn); camera mostly behind. Matches the
+///     "walk laterally, slowly rotating toward camera, camera chases
+///     behind" intuition.
+///   - `HLR > CTR`: player faces direction of motion (no moonwalk);
+///     camera lags at flank.
+///   - `HLR = CTR`: 50/50 split at 45° each.
+///
+/// At HLR=0.7, CTR=2.5 (shipped):
+///   ω ≈ 0.86 rad/sec (heading rotates ~49°/sec, visible turn)
+///   r ≈ 5.8 yalms
+///   lag_head ≈ 70° (player faces mostly back toward camera)
+///   lag_chase ≈ 20° (camera mostly behind, slightly off)
+const HEADING_LERP_RATE_RAD_PER_SEC: f32 = 0.7;
 
 /// Chase-camera yaw lerp rate toward "behind player heading", radians
 /// per real-time second. See [`HEADING_LERP_RATE_RAD_PER_SEC`] for the
 /// geometric trade-off and tuning notes.
-const CHASE_TRACK_RATE_RAD_PER_SEC: f32 = 0.5;
+const CHASE_TRACK_RATE_RAD_PER_SEC: f32 = 2.5;
 
 /// Horizontal-distance threshold (yalms) above which `dispatch_movement_system`
 /// abandons its local prediction and re-seeds from the snapshot. Sized for:
@@ -647,13 +647,11 @@ pub fn dispatch_movement_system(
     // check (turn must not trigger cancel) and AFTER the autorun
     // phantom_forward expansion (so W+A doesn't double-count forward).
     //
-    // 3rd person: `turn_in_chase = true`. The motion is computed below
-    //   in a dedicated handler — player strafes in camera-left/right
-    //   (perpendicular to camera-forward, NOT to player heading) while
-    //   chase.yaw auto-rotates at TURN_ORBIT_YAW_RATE_RAD_PER_SEC.
-    //   "Camera-left" therefore shifts gradually and the player's
-    //   straight strafe traces a circle. Heading is set to face the
-    //   direction of motion so the character isn't moonwalking.
+    // 3rd person: motion is computed below in a dedicated strafe+lerp
+    //   handler — player strafes camera-perpendicular (A=left, D=right)
+    //   while heading lerps toward direction-of-motion and chase.yaw
+    //   lerps toward "behind heading". The two lerps drive the orbit
+    //   dynamics; see HEADING_LERP_RATE_RAD_PER_SEC.
     //
     // 1st person: no orbit visual to chase. Fold turn into player_rotate
     //   so A still rotates the player at the snappy spin-to-face rate
@@ -714,16 +712,11 @@ pub fn dispatch_movement_system(
             })
     });
 
-    // Nothing to send? Bail UNLESS lock-on wants to rotate us. In that
-    // case dispatch a heading-only Move (same position, new heading) so
-    // the server sees the operator's facing track the target. Cheap —
-    // only fires when the operator is locked AND the heading actually
-    // moved by ≥1 u8 unit (~1.4°).
-    //
-    // `turn_in_chase` counts as input here — the strafe-camera-left
-    // handler below produces motion without setting `forward`/`strafe`,
-    // so the bail-check needs explicit awareness or A-held-alone falls
-    // through to the no-op return.
+    // Nothing to send? Bail UNLESS lock-on wants to rotate us OR turn
+    // is held in chase mode (the strafe handler below produces motion
+    // without setting `forward`/`strafe`, so we'd miss it). For the
+    // lock-on case, dispatch a heading-only Move (same position, new
+    // heading) so the server sees the operator's facing track the target.
     if forward == 0 && strafe == 0 && player_rotate == 0 && !turn_in_chase {
         if let Some(h) = locked_heading {
             if h != self_pos.heading {
@@ -766,40 +759,40 @@ pub fn dispatch_movement_system(
         chase.yaw -= player_rotate as f32 * ROTATE_STEP_HELD as f32 * std::f32::consts::TAU / 256.0;
     }
 
-    // Turn (3rd-person A/D) — strafe-camera-left motion model.
+    // Turn (3rd-person A/D) — strafe + heading-lerp + chase-lerp.
     //
-    // Each tick: player strafes in the camera-left/right direction
-    // (perpendicular to current camera-forward, computed from chase.yaw —
-    // NOT from player heading, since heading would then chase its own
-    // tail). Simultaneously chase.yaw rotates at TURN_ORBIT_YAW_RATE so
-    // "camera-left" gradually shifts; the straight strafe traces a
-    // circle of radius `walk_speed / yaw_rate`.
+    // Each tick:
+    //   1. Compute strafe motion in camera-perpendicular direction
+    //      (camera-left for A, camera-right for D). Composed with W/S
+    //      and normalized so diagonals aren't faster than cardinals.
+    //   2. Player heading lazily lerps toward direction-of-motion at
+    //      HEADING_LERP_RATE_RAD_PER_SEC (the "slowly rotating" turn).
+    //   3. chase.yaw lazily lerps toward "behind player heading" at
+    //      CHASE_TRACK_RATE_RAD_PER_SEC (the "chase to be behind").
     //
-    // W/S compose: their contribution adds along camera-forward, then
-    // the combined (camera-fwd, camera-lat) vector is normalized so
-    // diagonals don't move faster than cardinals. Heading is set to the
-    // composed direction so the character faces where it's going.
+    // The geometric constraint of the strafe model is `lag_h + lag_c = π/2`
+    // — you can't have player face direction of motion AND camera behind
+    // simultaneously. The default rates bias toward camera-behind, so the
+    // player visibly turns "back toward the camera" as the chase pulls
+    // around them. Motion stays lateral (camera-perpendicular) the
+    // entire time.
     //
-    // We stash the motion delta into `turn_dx`/`turn_dy` here and apply
-    // it below after `x`/`y` are initialized from `basis_pos`. The
-    // forward/strafe contributions are absorbed into the turn handler
-    // (then the standard step handlers are gated off), so the composite
-    // motion is the sole position update this tick.
+    // We stash the motion delta into `turn_dx`/`turn_dy` and apply it
+    // after `x`/`y` are initialized from `basis_pos`. forward/strafe
+    // are then gated off so the standard step handlers don't double-add.
     //
     // No-op in first-person: 1st-person folded turn into player_rotate
     // earlier; the standard rotate handler took care of it.
     let mut turn_dx: f32 = 0.0;
     let mut turn_dy: f32 = 0.0;
     if turn_in_chase {
-        // Step 1: motion direction from CURRENT chase.yaw (don't pre-rotate
-        // — the chase-track lerp below is the only thing that moves it).
         let camera_forward_h = heading_for_yaw(chase.yaw);
         let (cf_x, cf_y) = heading_to_forward(camera_forward_h);
         // LSB heading convention: +64 = +90° clockwise from above = "right".
         let (cr_x, cr_y) = heading_to_forward(camera_forward_h.wrapping_add(64));
 
         let fwd_signed = forward as f32;
-        let lat_signed = turn as f32; // -1 for A (left), +1 for D (right).
+        let lat_signed = turn as f32; // -1 = A (camera-left), +1 = D (camera-right).
         let mx = cf_x * fwd_signed + cr_x * lat_signed;
         let my = cf_y * fwd_signed + cr_y * lat_signed;
         let len = (mx * mx + my * my).sqrt();
@@ -810,11 +803,9 @@ pub fn dispatch_movement_system(
             turn_dx = mx * inv * step_magnitude;
             turn_dy = my * inv * step_magnitude;
 
-            // Step 2: heading lerps toward direction of motion (NOT
-            // snapped). The lerp lag is what creates room for chase.yaw
-            // to catch up to "behind heading" below. Same LSB worldAngle
-            // formula `reactor.rs::heading_toward` uses, so server-side
-            // facing math agrees.
+            // Heading lerp toward direction of motion (NOT snapped — lag
+            // is what lets chase.yaw catch up). atan2 → LSB worldAngle
+            // formula matches `reactor.rs::heading_toward`.
             let motion_radians = my.atan2(mx);
             let motion_raw = motion_radians * -(128.0 / std::f32::consts::PI);
             let motion_h = (motion_raw.round() as i32).rem_euclid(256) as u8;
@@ -827,10 +818,8 @@ pub fn dispatch_movement_system(
             heading = heading_for_yaw(h_current + h_step);
         }
 
-        // Step 3: chase-camera yaw lerps toward "behind player heading"
-        // (the lerped value from step 2). In steady state the chase lag
-        // is `ω / CHASE_TRACK_RATE`; see the doc-comment on the rate
-        // constants for the geometric trade-off.
+        // Chase-camera yaw lerps toward "behind player heading" (the
+        // lerped value above). In steady state `lag_c = ω/CTR`.
         let chase_target = yaw_for_heading(heading);
         let c_diff = wrap_signed_pi(chase_target - chase.yaw);
         let c_max_step = CHASE_TRACK_RATE_RAD_PER_SEC * time.delta_secs();
@@ -838,7 +827,7 @@ pub fn dispatch_movement_system(
         chase.yaw += c_step;
 
         // Suppress the standard forward/strafe step handlers — composite
-        // motion above already accounts for both W/S and turn.
+        // motion above is the sole position update this tick.
         forward = 0;
         strafe = 0;
     }
@@ -861,8 +850,8 @@ pub fn dispatch_movement_system(
     let step = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs();
     let mut x = basis_pos.x;
     let mut y = basis_pos.y;
-    // Apply turn-handler's composite motion. Zero unless `turn_in_chase`
-    // produced a step (W+turn or turn-alone in 3rd person).
+    // Apply the turn handler's composite motion. Zero unless `turn_in_chase`
+    // produced a step (forward/strafe were also gated off in that path).
     x += turn_dx;
     y += turn_dy;
     if forward != 0 && step > 0.0 {
@@ -950,9 +939,9 @@ fn heading_to_forward(heading: u8) -> (f32, f32) {
     (angle.cos(), -angle.sin())
 }
 
-/// Map an angle difference into `[-π, π]` so a lerp toward a target
-/// always takes the shortest arc. Used by the turn handler's heading
-/// and chase-yaw lerps where the target wraps modulo τ.
+/// Map an angle difference into `[-π, π]` so the turn handler's heading
+/// and chase-yaw lerps always take the shortest arc around the modular
+/// τ boundary.
 #[inline]
 fn wrap_signed_pi(x: f32) -> f32 {
     use std::f32::consts::{PI, TAU};

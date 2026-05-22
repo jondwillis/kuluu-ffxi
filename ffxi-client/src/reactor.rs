@@ -648,8 +648,7 @@ impl Reactor {
                 }
             }
             Goal::Pathing { waypoints, idx } => {
-                let cur = self.self_pos();
-                let Some(wp) = waypoints.get(idx).copied() else {
+                if waypoints.get(idx).is_none() {
                     // Empty or exhausted — clear to Idle defensively.
                     self.goal = Goal::Idle;
                     return TickOutput {
@@ -658,7 +657,7 @@ impl Reactor {
                             goal: snapshot_goal(&self.goal),
                         }],
                     };
-                };
+                }
                 let step = self.effective_step_per_tick();
                 if step <= 0.0 {
                     // Server-set speed is zero (Bind / Stun / Sleep /
@@ -670,41 +669,71 @@ impl Reactor {
                         derived_events: Vec::new(),
                     };
                 }
-                let dist = horizontal_distance(cur, wp);
-                if dist <= step {
-                    // Reached this waypoint. If it's the last, complete
-                    // the path and notify renderers; otherwise advance
-                    // and keep moving (no Idle transition yet).
-                    let is_last = idx + 1 >= waypoints.len();
-                    let mv = mk_move(wp, heading_toward(cur, wp));
-                    if is_last {
-                        self.goal = Goal::Idle;
-                        TickOutput {
-                            commands: vec![mv],
-                            derived_events: vec![AgentEvent::ReactorGoalChanged {
-                                goal: snapshot_goal(&self.goal),
-                            }],
+
+                // Consume `step` across as many waypoints as fit in one
+                // tick. Detour-produced navmesh paths frequently have
+                // sub-step waypoint spacing through tight corridors and
+                // around corners; the naive "snap to wp, advance idx,
+                // wait for next tick" pattern would advance only
+                // `dist_to_next_wp` per tick on those segments — easily
+                // a fraction of a full step — dropping /pathto's
+                // effective speed well below free-walk speed.
+                //
+                // We snap through every waypoint within the remaining
+                // budget, then step partway toward the next. Heading
+                // tracks whichever segment we're currently traversing
+                // so the player faces the right way as they round
+                // corners.
+                let mut cur = self.self_pos();
+                let mut budget = step;
+                let mut idx_local = idx;
+                // First iteration always sets `heading` (the pre-check
+                // above guarantees `waypoints.get(idx)` is Some).
+                let mut heading = 0u8;
+                let mut path_done = false;
+                loop {
+                    let Some(wp) = waypoints.get(idx_local).copied() else {
+                        path_done = true;
+                        break;
+                    };
+                    heading = heading_toward(cur, wp);
+                    let dist = horizontal_distance(cur, wp);
+                    if dist <= budget {
+                        cur = wp;
+                        budget -= dist;
+                        idx_local += 1;
+                        if budget <= 0.0 {
+                            break;
                         }
                     } else {
-                        if let Goal::Pathing { idx: ref mut i, .. } = self.goal {
-                            *i = idx + 1;
-                        }
-                        // Surface the waypoint advance as a
-                        // ReactorGoalChanged so the HUD's "[N wp]"
-                        // count decreases visibly per corner.
-                        TickOutput {
-                            commands: vec![mv],
-                            derived_events: vec![AgentEvent::ReactorGoalChanged {
-                                goal: snapshot_goal(&self.goal),
-                            }],
-                        }
+                        cur = step_point(cur, wp, budget);
+                        break;
                     }
-                } else {
-                    let stepped = step_point(cur, wp, step);
-                    TickOutput {
-                        commands: vec![mk_move(stepped, heading_toward(cur, wp))],
-                        derived_events: Vec::new(),
+                }
+
+                let mut derived_events = Vec::new();
+                if path_done {
+                    self.goal = Goal::Idle;
+                    derived_events.push(AgentEvent::ReactorGoalChanged {
+                        goal: snapshot_goal(&self.goal),
+                    });
+                } else if idx_local != idx {
+                    if let Goal::Pathing { idx: ref mut i, .. } = self.goal {
+                        *i = idx_local;
                     }
+                    // Surface the waypoint advance(s) so the HUD's
+                    // "[N wp]" count decreases visibly per corner —
+                    // one event per tick even if we snapped through
+                    // multiple waypoints, since the count reflects
+                    // post-tick state.
+                    derived_events.push(AgentEvent::ReactorGoalChanged {
+                        goal: snapshot_goal(&self.goal),
+                    });
+                }
+
+                TickOutput {
+                    commands: vec![mk_move(cur, heading)],
+                    derived_events,
                 }
             }
             Goal::Banking {
@@ -1782,6 +1811,129 @@ mod tests {
             out.derived_events.is_empty(),
             "mid-path tick should not emit goal-changed"
         );
+    }
+
+    #[test]
+    fn pathing_consumes_step_across_multiple_waypoints() {
+        // Regression: before the step-remainder loop, a tick that snapped
+        // to a sub-step waypoint would advance idx and stop, dropping
+        // effective speed proportional to waypoint density. With the loop,
+        // one tick should consume as many waypoints as fit in `step` and
+        // emit a single Move at the cumulative position.
+        //
+        // step_test_cfg.max_step_per_tick = 1.0. Construct a path with
+        // four waypoints 0.2 yalms apart (total 0.8 yalms) — comfortably
+        // inside one tick's budget.
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        r.observe_event(&upsert(
+            1,
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        r.goal = Goal::Pathing {
+            waypoints: vec![
+                Vec3 {
+                    x: 0.2,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                Vec3 {
+                    x: 0.4,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                Vec3 {
+                    x: 0.6,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                Vec3 {
+                    x: 0.8,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ],
+            idx: 0,
+        };
+
+        let out = r.tick();
+        assert_eq!(out.commands.len(), 1);
+        match &out.commands[0] {
+            AgentCommand::Move { x, y, .. } => {
+                assert!(
+                    (x - 0.8).abs() < 1e-3,
+                    "tick should consume all four 0.2-yalm waypoints in one budget of 1.0, got x={x}"
+                );
+                assert!(y.abs() < 1e-3);
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+        // Path complete → Idle + one event.
+        assert!(matches!(r.current_goal(), Goal::Idle));
+        assert!(matches!(
+            out.derived_events.as_slice(),
+            [AgentEvent::ReactorGoalChanged {
+                goal: ReactorGoalSnapshot::Idle,
+            }]
+        ));
+    }
+
+    #[test]
+    fn pathing_partial_consume_carries_remainder_into_next_segment() {
+        // Six waypoints 0.3 yalms apart (total 1.5 yalms). One tick at
+        // step=1.0 should snap through three waypoints (using 0.9 budget)
+        // and step 0.1 into the fourth — landing at x=1.0 exactly.
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        r.observe_event(&upsert(
+            1,
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        r.goal = Goal::Pathing {
+            waypoints: (1..=6)
+                .map(|i| Vec3 {
+                    x: 0.3 * i as f32,
+                    y: 0.0,
+                    z: 0.0,
+                })
+                .collect(),
+            idx: 0,
+        };
+
+        let out = r.tick();
+        match &out.commands[0] {
+            AgentCommand::Move { x, .. } => {
+                assert!(
+                    (x - 1.0).abs() < 1e-3,
+                    "expected x=1.0 (0.3+0.3+0.3+0.1), got {x}"
+                );
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+        // idx should have advanced past three full waypoints; still pathing.
+        let Goal::Pathing { idx, .. } = r.current_goal() else {
+            panic!("expected still Pathing");
+        };
+        assert_eq!(*idx, 3);
+        // Multiple waypoint advances surface as one ReactorGoalChanged.
+        assert!(matches!(
+            out.derived_events.as_slice(),
+            [AgentEvent::ReactorGoalChanged { .. }]
+        ));
     }
 
     #[test]

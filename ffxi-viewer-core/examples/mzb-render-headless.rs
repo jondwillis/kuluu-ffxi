@@ -205,9 +205,8 @@ fn setup_camera(mut commands: Commands, params: Res<RenderParams>, mut draw: Res
         Transform::from_translation(params.camera_pos).looking_at(params.camera_target, Vec3::Y),
     ));
 
-    // MZB materials are `unlit` so light doesn't strictly matter, but
-    // an ambient is cheap insurance if a future change adds PBR fall-
-    // through paths.
+    // MZB materials carry baked vertex lighting (palette × normal
+    // shade) so an ambient is enough; no directional light needed.
     commands.insert_resource(AmbientLight {
         color: Color::WHITE,
         brightness: 200.0,

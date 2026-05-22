@@ -87,15 +87,13 @@ pub fn spawn_target_panel(mut commands: Commands) {
             TargetPanel,
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(36.0), // below the stage bar
-                // Center horizontally: left = 50% then translate by half width.
-                // Bevy UI doesn't have a built-in "anchor center", so we
-                // split it into a percentage offset + a fixed pixel pull.
-                left: Val::Percent(50.0),
-                margin: UiRect {
-                    left: Val::Px(-PANEL_WIDTH_PX / 2.0),
-                    ..default()
-                },
+                // Dock immediately left of the player/party roster
+                // (`hud/roster.rs` spawns at top: 200, right: 8, width:
+                // 280). Mirror those numbers so the two panels read as
+                // a single horizontal band: roster on the right edge,
+                // target card to its left with an 8px gap.
+                top: Val::Px(200.0),
+                right: Val::Px(8.0 + 280.0 + 8.0),
                 width: Val::Px(PANEL_WIDTH_PX),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
                 border: UiRect::all(Val::Px(1.0)),

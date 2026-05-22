@@ -259,9 +259,10 @@ mod tests {
             bindings.get(Action::MoveForward),
             Some(KeyBind::new(KeyCode::ArrowUp))
         );
-        // Non-overridden actions still come from Compact 2:
+        // Non-overridden actions still come from Compact 2 — Q is
+        // pure RotateLeft after the A/D=turn / Q/E=rotate reshuffle.
         assert_eq!(
-            bindings.get(Action::StrafeLeft),
+            bindings.get(Action::RotateLeft),
             Some(KeyBind::new(KeyCode::KeyQ))
         );
     }

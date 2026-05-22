@@ -335,6 +335,12 @@ pub struct MinimapImage;
 #[derive(Component)]
 pub struct MinimapOverlayLayer;
 
+/// Marker on the reset-zoom button (corner of the minimap). Visible
+/// only when [`MinimapZoom`] differs from its default *or* the user
+/// has dragged the view away from the player.
+#[derive(Component)]
+pub struct MinimapResetButton;
+
 /// Plugin entry. Registers resources + the systems that swap the image
 /// source and toggle visibility. Backend bake/load systems live in
 /// [`topdown`] / [`retail`] and are added independently so a front-end
@@ -350,6 +356,7 @@ impl Plugin for MinimapPlugin {
             .init_resource::<MinimapView>()
             .init_resource::<MinimapState>()
             .init_resource::<input::MinimapHoverGate>()
+            .init_resource::<input::MinimapDrag>()
             .init_resource::<overlay::MinimapDots>()
             .add_plugins((topdown::TopdownBackendPlugin, retail::RetailBackendPlugin))
             .add_systems(
@@ -362,6 +369,10 @@ impl Plugin for MinimapPlugin {
                     // visible AABB so a key/wheel tick lands in the
                     // same frame.
                     input::handle_minimap_zoom_input,
+                    // Drag-pan + idle-recenter mutate pan_offset_xz,
+                    // which update_minimap_view consumes next.
+                    input::handle_minimap_drag_input,
+                    input::recenter_minimap_view,
                     // View must update before the overlay + image
                     // cropper read it, so they all agree on the
                     // visible AABB for this frame.
@@ -370,6 +381,8 @@ impl Plugin for MinimapPlugin {
                         update_minimap_image_source,
                         update_minimap_crop_rect,
                         update_minimap_visibility,
+                        update_reset_button_visibility,
+                        handle_reset_button_click,
                         overlay::update_minimap_overlay,
                     ),
                 )
@@ -495,7 +508,73 @@ pub fn spawn_minimap_as_child(p: &mut ChildSpawnerCommands, images: &mut Assets<
                 ..default()
             },
         ));
+        // Reset-zoom button in the top-right corner. Starts hidden;
+        // `update_reset_button_visibility` flips Display::Flex when
+        // the user has zoomed or panned away from defaults.
+        p.spawn((
+            Button,
+            MinimapResetButton,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(4.0),
+                right: Val::Px(4.0),
+                padding: UiRect::axes(Val::Px(5.0), Val::Px(1.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(palette::BACKGROUND),
+            BorderColor::all(palette::ACCENT),
+        ))
+        .with_children(|btn| {
+            btn.spawn((
+                Text::new("\u{2715}".to_string()), // ✕
+                TextFont {
+                    font_size: 11.0,
+                    ..default()
+                },
+                TextColor(palette::ACCENT),
+            ));
+        });
     });
+}
+
+/// Toggle the reset-button's `Display` based on whether zoom + pan
+/// have diverged from defaults. Hidden when at defaults — no point
+/// offering a "reset" affordance with nothing to reset.
+pub fn update_reset_button_visibility(
+    zoom: Res<MinimapZoom>,
+    view: Res<MinimapView>,
+    mut q: Query<&mut Node, With<MinimapResetButton>>,
+) {
+    let want_visible = !zoom.is_default() || !view.pan_is_zero();
+    let want = if want_visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    if let Ok(mut node) = q.single_mut() {
+        if node.display != want {
+            node.display = want;
+        }
+    }
+}
+
+/// React to clicks on [`MinimapResetButton`]: snap zoom + pan back
+/// to defaults. Same `Changed<Interaction>` pattern as the chat-tab
+/// buttons so the system stays O(buttons-that-just-changed).
+pub fn handle_reset_button_click(
+    interactions: Query<&Interaction, (With<MinimapResetButton>, Changed<Interaction>)>,
+    mut zoom: ResMut<MinimapZoom>,
+    mut view: ResMut<MinimapView>,
+) {
+    for interaction in &interactions {
+        if *interaction == Interaction::Pressed {
+            *zoom = MinimapZoom::default();
+            view.pan_offset_xz = Vec2::ZERO;
+            view.idle_frames = 0;
+        }
+    }
 }
 
 /// 1×1 fully-transparent RGBA8 image. Used as the initial `ImageNode`
@@ -703,5 +782,68 @@ mod tests {
             state.resolved_mode(MinimapMode::Retail),
             MinimapMode::Retail
         );
+    }
+
+    /// Out-of-bounds positions return `None` (used to cull dots at
+    /// high zoom). Compare against the clamping variant which
+    /// produces (1, 0) for the same input.
+    #[test]
+    fn world_to_uv_or_offscreen_returns_none_when_outside() {
+        let aabb = MinimapAabb {
+            min: Vec2::ZERO,
+            max: Vec2::new(10.0, 10.0),
+        };
+        assert_eq!(
+            aabb.world_to_uv_or_offscreen(Vec3::new(50.0, 0.0, -5.0)),
+            None
+        );
+        // Inside still returns Some.
+        let inside = aabb.world_to_uv_or_offscreen(Vec3::new(5.0, 0.0, 5.0));
+        assert_eq!(inside, Some(Vec2::new(0.5, 0.5)));
+    }
+
+    /// Zooming in repeatedly clamps to `ZOOM_MIN_RADIUS` — operators
+    /// can't scroll past the readable floor.
+    #[test]
+    fn zoom_by_clamps_to_min_radius() {
+        let mut z = MinimapZoom::default();
+        for _ in 0..50 {
+            z.zoom_by(1.0 / ZOOM_STEP_FACTOR, Some(1000.0));
+        }
+        assert_eq!(z.radius_yalms, Some(ZOOM_MIN_RADIUS));
+    }
+
+    /// Zooming out past the zone half-span switches to fit-to-zone
+    /// (`None`) rather than running away to infinity.
+    #[test]
+    fn zoom_by_switches_to_fit_when_passing_half_span() {
+        let mut z = MinimapZoom::default();
+        for _ in 0..20 {
+            z.zoom_by(ZOOM_STEP_FACTOR, Some(200.0));
+        }
+        assert_eq!(z.radius_yalms, None);
+    }
+
+    /// `is_default` flips false once the operator zooms — gates the
+    /// reset-button visibility predicate.
+    #[test]
+    fn zoom_is_default_flips_on_change() {
+        let mut z = MinimapZoom::default();
+        assert!(z.is_default());
+        z.zoom_by(1.0 / ZOOM_STEP_FACTOR, Some(1000.0));
+        assert!(!z.is_default());
+    }
+
+    /// `zone_half_span` returns the larger axis to avoid rectangular
+    /// zones flipping into fit-mode prematurely on the short axis.
+    #[test]
+    fn zone_half_span_uses_larger_axis() {
+        let aabb = MinimapAabb {
+            min: Vec2::new(-50.0, -200.0),
+            max: Vec2::new(50.0, 200.0),
+        };
+        // X span = 100 (half 50), Z span = 400 (half 200) → max is 200.
+        assert_eq!(zone_half_span(Some(aabb)), Some(200.0));
+        assert_eq!(zone_half_span(None), None);
     }
 }

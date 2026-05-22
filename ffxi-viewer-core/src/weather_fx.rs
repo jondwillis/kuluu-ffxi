@@ -575,7 +575,6 @@ pub fn manage_weather_particles_system(
                 let h = mats.add(StandardMaterial {
                     base_color: profile.color,
                     emissive: LinearRgba::new(0.6, 0.7, 0.9, 1.0),
-                    unlit: true,
                     alpha_mode: AlphaMode::Blend,
                     ..default()
                 });
@@ -594,7 +593,6 @@ pub fn manage_weather_particles_system(
                 let h = mats.add(StandardMaterial {
                     base_color: profile.color,
                     emissive: LinearRgba::new(1.2, 1.2, 1.4, 1.0),
-                    unlit: true,
                     alpha_mode: AlphaMode::Blend,
                     ..default()
                 });

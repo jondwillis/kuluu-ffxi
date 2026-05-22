@@ -42,11 +42,12 @@ use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{Image, ImageSampler};
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
 use ffxi_viewer_wire::EntityKind;
 
-use crate::camera::OperatorCamera;
+use crate::camera::{nameplate_anchor_y, OperatorCamera};
 use crate::components::{InGameEntity, Nameplate, WorldEntity};
+use crate::scene::BakedActor;
 use crate::snapshot::SceneState;
 
 /// Pixel-height of the rasterized name glyph. Bigger = sharper at the
@@ -81,15 +82,11 @@ const QUAD_BASE_WIDTH_YALMS: f32 = 1.1;
 const MAX_QUAD_WIDTH_YALMS: f32 = 1.4;
 const MIN_QUAD_WIDTH_YALMS: f32 = 0.8;
 
-/// Vertical offset above the owning entity's translation where the
-/// label sits. Matches the prior UI nameplate (`Vec3::Y * 2.4`) so the
-/// label parks at roughly head-of-capsule height regardless of which
-/// rendering path the operator is on.
-/// Vertical lift from the entity's transform (now its feet) to the
-/// nameplate anchor — just above the head of an adult silhouette.
-/// Tuned for ~4.5-yalm total character height; Galka/Taru drift is a
-/// few tenths of a yalm, which is invisible at nameplate distance.
-const HEAD_Y_OFFSET: f32 = 4.7;
+// Per-entity head anchor (= `actor_height + NAMEPLATE_OFFSET_ABOVE_CROWN`)
+// is computed via `camera::nameplate_anchor_y(baked)` so the label tracks
+// each actor's real crown — Galka tall, Taru short, mob whatever the bake
+// measured. Capsule-only / pre-skin-load entities fall back to a PC-sized
+// default inside that helper.
 
 /// Pixel radius of the dark halo drawn behind the glyphs. The halo is
 /// what makes a yellow name readable against a sand-colored Western
@@ -107,18 +104,18 @@ const OUTLINE_COLOR: [u8; 4] = [0, 0, 0, 220];
 /// labels. Relative to `NAME_PX = 64`, this is ~16% of glyph height —
 /// large enough to read at distance, small enough not to dominate the
 /// label silhouette.
-const HP_BAR_HEIGHT_PX: u32 = 10;
+const HP_BAR_HEIGHT_PX: u32 = 16;
 
 /// Vertical gap between the name baseline padding and the top of the
 /// HP bar. A few pixels of breathing room so the bar doesn't look
 /// glued to the descenders of `g`/`p`/`y`.
-const HP_BAR_TOP_GAP_PX: u32 = 4;
+const HP_BAR_TOP_GAP_PX: u32 = 8;
 
 /// Horizontal fraction of the texture width the HP bar occupies. The
 /// bar is centered, so the remaining `1.0 - HP_BAR_WIDTH_FRACTION` is
 /// split equally as left/right margin. 0.85 gives a noticeable margin
 /// without making the bar look truncated next to a long name.
-const HP_BAR_WIDTH_FRACTION: f32 = 0.85;
+const HP_BAR_WIDTH_FRACTION: f32 = 1.0;
 
 /// Shared `ab_glyph` font loaded from Bevy's embedded default
 /// (`bevy_text::DEFAULT_FONT_DATA` — same FiraMono-subset every Bevy
@@ -307,7 +304,7 @@ pub fn format_billboard_label(base_name: &str, _hp_pct: Option<u8>, _kind: Entit
 pub fn update_nameplate_billboards_system(
     state: Res<SceneState>,
     cam_q: Query<&Transform, (With<OperatorCamera>, Without<NameplateBillboard>)>,
-    world_q: Query<(&Transform, &WorldEntity), Without<NameplateBillboard>>,
+    world_q: Query<(&Transform, &WorldEntity, Option<&BakedActor>), Without<NameplateBillboard>>,
     mut billboards: Query<(
         Entity,
         &mut NameplateBillboard,
@@ -316,7 +313,7 @@ pub fn update_nameplate_billboards_system(
         &mut Visibility,
         &MeshMaterial3d<StandardMaterial>,
     )>,
-    materials: Res<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     font: Res<BillboardFont>,
     mut commands: Commands,
@@ -324,11 +321,14 @@ pub fn update_nameplate_billboards_system(
     let Ok(cam_t) = cam_q.single() else { return };
     let cam_pos = cam_t.translation;
 
-    // World-position lookup keyed by wire id, built once per frame.
-    let mut pos_by_id: std::collections::HashMap<u32, Vec3> =
+    // World-position + per-entity nameplate-Y lookup keyed by wire id.
+    // The Y offset comes from each entity's `BakedActor.actor_height`
+    // when present, so race-tall PCs (Galka) get a higher label and
+    // race-short ones (Taru) a lower label.
+    let mut pos_by_id: std::collections::HashMap<u32, (Vec3, f32)> =
         std::collections::HashMap::with_capacity(world_q.iter().len());
-    for (t, w) in &world_q {
-        pos_by_id.insert(w.id, t.translation);
+    for (t, w, baked) in &world_q {
+        pos_by_id.insert(w.id, (t.translation, nameplate_anchor_y(baked)));
     }
 
     // HP lookup keyed by wire id — only the entities the snapshot says
@@ -353,13 +353,13 @@ pub fn update_nameplate_billboards_system(
     }
 
     for (ui_entity, mut np, mut aspect, mut transform, mut vis, mat) in &mut billboards {
-        let Some(&entity_pos) = pos_by_id.get(&np.entity_id) else {
+        let Some(&(entity_pos, head_y_offset)) = pos_by_id.get(&np.entity_id) else {
             // Owner gone — same lifecycle the UI nameplates had.
             commands.entity(ui_entity).despawn();
             continue;
         };
 
-        let head_pos = entity_pos + Vec3::Y * HEAD_Y_OFFSET;
+        let head_pos = entity_pos + Vec3::Y * head_y_offset;
         let to_cam = cam_pos - head_pos;
         let distance = to_cam.length();
         if distance < 0.001 {
@@ -424,15 +424,24 @@ pub fn update_nameplate_billboards_system(
         // allocation per frame for the common case (stable label).
         let want = format_billboard_label(&np.base_name, snapshot_hp, np.kind);
         if want != np.last_rendered || want_color != np.last_color || want_hp != np.last_hp {
-            if let Some(mat) = materials.get(&mat.0) {
-                if let Some(handle) = mat.base_color_texture.clone() {
+            // `get_mut` (not `get`) on the material: Bevy caches each
+            // material's bind group keyed by the material's change tick.
+            // Replacing the image at the texture handle regenerates the
+            // GpuImage on the render side, but the StandardMaterial's
+            // bind group keeps its TextureView reference to the *prior*
+            // GPU texture (the old one stays alive through that Arc).
+            // Net effect: HP=100 from the first re-rasterization sticks
+            // because that bake matched the freshly-built bind group,
+            // but subsequent HP-decrement bakes never reach the screen.
+            // `get_mut` emits `AssetEvent::Modified` on the material,
+            // which forces the render world to re-extract it and rebuild
+            // the bind group against the new GPU texture.
+            if let Some(mat_data) = materials.get_mut(&mat.0) {
+                if let Some(handle) = mat_data.base_color_texture.clone() {
                     let new_img =
                         rasterize_text_to_image(&font.0, &want, NAME_PX, want_color, want_hp);
                     aspect.width = new_img.width();
                     aspect.height = new_img.height();
-                    // `insert` returns a `Result` indicating whether
-                    // we replaced an existing asset; we always do, so
-                    // the signal is uninteresting.
                     let _ = images.insert(&handle, new_img);
                     np.last_rendered = want;
                     np.last_color = want_color;
