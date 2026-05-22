@@ -74,6 +74,18 @@ pub fn motion_dat_for_skel(skel_file_id: u32) -> Option<u32> {
 static BATTLE_IDLE_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> =
     OnceLock::new();
 
+/// Cache for the casual run animation in the skeleton DAT (`run0`,
+/// 16-bone LOD). Keyed by skeleton DAT id; not all skeletons have a
+/// run anim (NPCs that never relocate) so we cache the `None` result
+/// too — the existence check is the load itself.
+static RUN_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = OnceLock::new();
+
+/// Cache for the combat run animation in the motion DAT (`run1`,
+/// 68-bone full rig). PC-only; keyed by motion DAT id like
+/// [`BATTLE_IDLE_ANIMS`].
+static COMBAT_RUN_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> =
+    OnceLock::new();
+
 /// 3-char MO2 name prefix for the battle-idle pose inside a motion
 /// DAT. Discovered by running `bin/dump-motion-dat 9672` against the
 /// Hume M retail archive — the motion DAT carries `btl0` (16-bone
@@ -107,15 +119,59 @@ pub fn battle_idle_anim_for_skel(skel_file_id: u32) -> Option<Arc<Mo2Animation>>
 /// but lives here so the combat-stance commit can be reverted
 /// independently.
 fn load_battle_idle(motion_dat_id: u32) -> Option<Mo2Animation> {
+    load_anim_with_prefix(motion_dat_id, BATTLE_IDLE_PREFIX)
+}
+
+/// Load the casual (non-combat) run animation from a *skeleton* DAT.
+/// Lotus's classic-input `playAnimationLoop("run", speed)` resolves
+/// against the skeleton DAT's animation map
+/// (`actor_skeleton_static.cpp:86-108`), which is where `run0` lives
+/// for PCs (16-bone LOD). NPC skeleton DATs also carry `run` when
+/// they're meant to relocate; non-relocating NPCs return `None` and
+/// the caller stays on idle.
+pub fn run_anim_for_skel(skel_file_id: u32) -> Option<Arc<Mo2Animation>> {
+    let map = RUN_ANIMS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().ok()?;
+    if let Some(entry) = guard.get(&skel_file_id) {
+        return entry.clone();
+    }
+    let loaded = load_anim_with_prefix(skel_file_id, b"run").map(Arc::new);
+    guard.insert(skel_file_id, loaded.clone());
+    loaded
+}
+
+/// Load the combat (battle-aware) run animation from the PC race's
+/// motion DAT. This is `run1` (68-bone full rig) — lotus picks it
+/// via `battle_animations[index]` in
+/// `actor_skeleton_static.cpp:205-208` when the actor is engaged.
+///
+/// Returns `None` for non-PC skeletons (NPCs etc.); caller should
+/// fall back to [`run_anim_for_skel`] or to idle.
+pub fn combat_run_anim_for_skel(skel_file_id: u32) -> Option<Arc<Mo2Animation>> {
+    let motion_dat = motion_dat_for_skel(skel_file_id)?;
+    let map = COMBAT_RUN_ANIMS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().ok()?;
+    if let Some(entry) = guard.get(&motion_dat) {
+        return entry.clone();
+    }
+    let loaded = load_anim_with_prefix(motion_dat, b"run").map(Arc::new);
+    guard.insert(motion_dat, loaded.clone());
+    loaded
+}
+
+/// Shared loader: open a DAT, walk its chunks, return the first MO2
+/// whose 3-char name prefix matches `prefix`. Used for `btl`, `run`,
+/// and any future prefix we wire up (`wlk`, `mvb`, …).
+fn load_anim_with_prefix(file_id: u32, prefix: &[u8; 3]) -> Option<Mo2Animation> {
     let root = DatRoot::from_env_or_default().ok()?;
-    let loc = root.resolve(motion_dat_id).ok()?;
+    let loc = root.resolve(file_id).ok()?;
     let bytes = fs::read(loc.path_under(root.root())).ok()?;
     for chunk in walk(&bytes).filter_map(Result::ok) {
         if ChunkKind::from_u8(chunk.kind) != Some(ChunkKind::AnimMo2) {
             continue;
         }
-        let prefix = &chunk.name[..3];
-        if prefix.eq_ignore_ascii_case(BATTLE_IDLE_PREFIX) {
+        let name_prefix = &chunk.name[..3];
+        if name_prefix.eq_ignore_ascii_case(prefix) {
             if let Ok(anim) = ffxi_dat::anim::parse_mo2(chunk.data, &chunk.name) {
                 return Some(anim);
             }
@@ -198,6 +254,44 @@ mod tests {
             assert!(
                 anim.frames > 0,
                 "skel {skel}: btl MO2 has zero frames — parse drift?"
+            );
+        }
+    }
+
+    /// Casual `run` lives in the skeleton DAT as `run0`. Same
+    /// availability check as the battle-idle test — confirms the
+    /// 3-char prefix matcher picks it up and the cache stays
+    /// `Some(anim)` for every PC race.
+    #[test]
+    fn run_anim_resolves_for_every_pc_race_when_dats_available() {
+        if DatRoot::from_env_or_default().is_err() {
+            eprintln!("skipping: no retail DAT root");
+            return;
+        }
+        for skel in [7072u32, 10248, 13424, 16600, 19776, 23176, 26352] {
+            let anim = run_anim_for_skel(skel).expect("casual run MO2 missing for skel");
+            assert!(anim.frames > 0, "skel {skel}: run MO2 has zero frames");
+        }
+    }
+
+    /// Combat run lives in the motion DAT as `run1` (68-bone LOD).
+    /// Distinct from casual `run0` — verify both load and that the
+    /// motion-DAT version has the higher bone count so a future
+    /// "wait, am I getting the right LOD" bug fails loudly.
+    #[test]
+    fn combat_run_resolves_with_higher_bone_count_than_casual() {
+        if DatRoot::from_env_or_default().is_err() {
+            eprintln!("skipping: no retail DAT root");
+            return;
+        }
+        for skel in [7072u32, 10248, 13424, 16600, 19776, 23176, 26352] {
+            let casual = run_anim_for_skel(skel).expect("casual run");
+            let combat = combat_run_anim_for_skel(skel).expect("combat run");
+            assert!(
+                combat.per_bone.len() >= casual.per_bone.len(),
+                "skel {skel}: combat run ({}) should have ≥ bones than casual ({})",
+                combat.per_bone.len(),
+                casual.per_bone.len()
             );
         }
     }
