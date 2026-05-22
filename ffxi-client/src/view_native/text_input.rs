@@ -1859,15 +1859,27 @@ fn confirm_quick_action_at_cursor(
             if let Err(e) = cmd_tx.try_send(cmd) {
                 push_system_chat_line(scene_state, format!("[quick] dispatch dropped: {e}"));
             }
+            Some(InputMode::World)
         }
         QuickActionDispatch::SystemMessage(msg) => {
             push_system_chat_line(scene_state, msg);
+            Some(InputMode::World)
         }
         QuickActionDispatch::NotImplemented(label) => {
             push_system_chat_line(scene_state, format!("[quick] {label} — not implemented"));
+            Some(InputMode::World)
+        }
+        QuickActionDispatch::OpenMenu(kind) => {
+            // Replace the QA picker with the main menu stack rooted at
+            // the requested submenu. The Root level is also pushed so
+            // Esc from the submenu lands on Root rather than exiting
+            // back to World — matches retail's "Esc backs out one
+            // level" muscle memory.
+            let mut stack = MenuStack::root();
+            stack.push(kind);
+            Some(InputMode::Menu(stack))
         }
     }
-    Some(InputMode::World)
 }
 
 /// Read HUD-emitted activation messages (menu row click, dialog choice
@@ -2084,6 +2096,13 @@ enum QuickActionDispatch {
     Command(AgentCommand),
     SystemMessage(String),
     NotImplemented(String),
+    /// Pop the quick-action picker and push the named submenu on the
+    /// main menu stack. Used by the contextual Magic / Abilities /
+    /// Items rows — selecting them in the picker is "open the
+    /// corresponding `-` menu submenu" rather than dispatching a
+    /// single action (the submenu lets the operator pick which
+    /// spell / ability / item to use).
+    OpenMenu(MenuKind),
 }
 
 fn resolve_quick_action(
@@ -2125,6 +2144,15 @@ fn resolve_quick_action(
             }),
             None => QuickActionDispatch::SystemMessage("[quick] Talk: no target".into()),
         },
+        // Contextual Magic / Abilities / Items: open the corresponding
+        // `-` menu submenu instead of dispatching directly. The user
+        // then picks the actual spell/ability/item to use from that
+        // submenu, which (Stages 2–3) dispatches the wire packet.
+        // Mirrors retail's "Enter from rest opens the action picker,
+        // pick Magic, then pick the spell" flow.
+        "Magic" => QuickActionDispatch::OpenMenu(MenuKind::Magic),
+        "Abilities" => QuickActionDispatch::OpenMenu(MenuKind::Abilities),
+        "Items" => QuickActionDispatch::OpenMenu(MenuKind::Items),
         // Everything else is still a stub. As more entries get wired,
         // add their label match arms above this fall-through.
         other => QuickActionDispatch::NotImplemented(other.to_string()),
@@ -2322,11 +2350,34 @@ mod quick_action_tests {
         }
     }
 
+    /// Macros isn't wired yet (no operator-side macro system) — keep
+    /// the NotImplemented fallback covered so the catch-all doesn't
+    /// accidentally start producing actions.
     #[test]
     fn unwired_entry_stays_not_implemented() {
         let ent = target_ent(1, 1);
-        let result = resolve_quick_action("Magic", Some(&ent));
-        assert_eq!(result, QuickActionDispatch::NotImplemented("Magic".into()),);
+        let result = resolve_quick_action("Macros", Some(&ent));
+        assert_eq!(result, QuickActionDispatch::NotImplemented("Macros".into()),);
+    }
+
+    /// Magic / Abilities / Items in the contextual picker should open
+    /// the matching submenu (not dispatch a single action — there's
+    /// nothing to dispatch without first picking which spell/etc).
+    /// Mirrors retail's quick-action flow.
+    #[test]
+    fn contextual_action_categories_open_their_menu() {
+        for (label, expected) in [
+            ("Magic", MenuKind::Magic),
+            ("Abilities", MenuKind::Abilities),
+            ("Items", MenuKind::Items),
+        ] {
+            let result = resolve_quick_action(label, None);
+            assert_eq!(
+                result,
+                QuickActionDispatch::OpenMenu(expected),
+                "{label} should open {expected:?}",
+            );
+        }
     }
 }
 
