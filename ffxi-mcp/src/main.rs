@@ -972,6 +972,7 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::SetFps { .. } => "set_fps",
         AgentEvent::LevelUp { .. } => "level_up",
         AgentEvent::SkillLevelUp { .. } => "skill_level_up",
+        AgentEvent::ActionStarted { .. } => "action_started",
     }
 }
 

@@ -2141,19 +2141,24 @@ fn decode_battle_message(
     };
     let message_num = u16::from_le_bytes(data[20..22].try_into().unwrap());
 
-    // TODO(msg_basic.dat): /check responses (ids 170-178) and the
-    // Checkparam* block (712-733) are declared in LSB's enum but the
-    // English text lives in the FFXI client's localized
-    // `msg_basic.dat` — we don't ship a DMSG parser, so these drop
-    // silently here. xi-tinkerer's DMSG impl is AGPL (cite-only per
-    // memory), so unblocking /check requires writing our own DMSG
-    // decoder + a build.rs step in ffxi-proto/. Until then, /check
-    // appears silent to the operator. The decoder's strict
-    // "unknown id → None" contract is documented + tested at
-    // `battle_message_unknown_id_returns_none`.
-    let raw = template_for_id(message_num)?;
+    // /check responses live in the client's `msg_basic.dat` (which we
+    // don't ship), but their semantic content is fully numeric on the
+    // wire — `synth_check_line` reconstructs the English locally from
+    // `data1`/`data2`/`message_num` rather than waiting on a DMSG
+    // decoder. Covers /check on mobs (170-178) and /checkparam
+    // (712-733); pass-throughs to the placeholder path for everything
+    // else.
     let cas_name = name_for_id(cas_id, name_cache);
     let tar_name = name_for_id(tar_id, name_cache);
+    if let Some(text) = synth_check_line(message_num, data1, data2, &cas_name, &tar_name) {
+        return Some(ChatLine {
+            channel: ChatChannel::Battle,
+            sender: cas_name,
+            text,
+            server_ts: 0,
+        });
+    }
+    let raw = template_for_id(message_num)?;
     let text =
         substitute_battle_placeholders(raw, &cas_name, &tar_name, data1, data2, message_num, None);
     Some(ChatLine {
@@ -2428,6 +2433,122 @@ fn template_for_id(message_num: u16) -> Option<&'static str> {
     ffxi_proto::msg_basic::lookup(message_num)
 }
 
+/// Synthesize a chat line for /check (170-178), /check-on-PC
+/// (CheckImpossibleToGauge=179 falls through to the normal table) and
+/// /checkparam (712-733). These ids carry their full meaning in the
+/// numeric `data1`/`data2`/`message_num` fields, so we render them
+/// directly without needing the FFXI client's localized
+/// `msg_basic.dat`.
+///
+/// Returns `None` for ids outside these ranges; callers should fall
+/// through to the placeholder-substitution path.
+///
+/// **Wire layout**
+/// - `/check` mob (LSB `0x0dd_equip_inspect.cpp:71-124`):
+///   - `cas`/`tar` = player/mob, `data1` = mob level (`mobLvl`),
+///     `data2` = `64 + EMobDifficulty`.
+///   - `message_num` ∈ 170..=178, offset from 174 decomposes into a
+///     defense and an evasion modifier per LSB's calc:
+///     `defOffset = -1 (high), 0, +1 (low)` and
+///     `evaOffset = -3 (high), 0, +3 (low)`. Sum unambiguously maps
+///     back to one (def, eva) pair because |def| < 3.
+/// - `/checkparam` (same file, `:155-181`):
+///   - `cas`/`tar` = player/player (or player/pet).
+///   - `data1` = ACC (or RACC, or EVA), `data2` = ATT (or RATT, or DEF)
+///     depending on which sub-id was pushed.
+///
+/// **EMobDifficulty** (`vendor/server/src/map/utils/charutils.h:45-56`):
+///   0 TooWeak, 1 IncrediblyEasyPrey, 2 EasyPrey, 3 DecentChallenge,
+///   4 EvenMatch, 5 Tough, 6 VeryTough, 7 IncrediblyTough.
+fn synth_check_line(
+    message_num: u16,
+    data1: u32,
+    data2: u32,
+    cas_name: &str,
+    tar_name: &str,
+) -> Option<String> {
+    match message_num {
+        170..=178 => Some(render_check_mob(message_num, data1, data2, tar_name)),
+
+        712 => Some(format!(
+            "Main weapon — Accuracy: {data1}, Attack: {data2}."
+        )),
+        713 => {
+            if data1 == 0 && data2 == 0 {
+                Some("Auxiliary weapon: none equipped.".to_string())
+            } else {
+                Some(format!(
+                    "Auxiliary weapon — Accuracy: {data1}, Attack: {data2}."
+                ))
+            }
+        }
+        714 => {
+            if data1 == 0 && data2 == 0 {
+                Some("Ranged weapon: none equipped.".to_string())
+            } else {
+                Some(format!(
+                    "Ranged weapon — Accuracy: {data1}, Attack: {data2}."
+                ))
+            }
+        }
+        715 => Some(format!("Evasion: {data1}, Defense: {data2}.")),
+        731 => Some(format!("Checking {tar_name}'s item level…")),
+        733 => Some(format!("Checking {cas_name}'s parameters on {tar_name}.")),
+
+        _ => None,
+    }
+}
+
+/// Render one of the 9 mob /check message ids (170..=178) into a
+/// human-readable line. The id encodes a (def, eva) modifier pair
+/// relative to 174 ("even/even"); `data1` carries the mob level;
+/// `data2 - 64` is the `EMobDifficulty` enum value.
+fn render_check_mob(message_num: u16, data1: u32, data2: u32, tar_name: &str) -> String {
+    let total: i32 = message_num as i32 - 174;
+    // Evasion is +/-3 (saturates the outer range); defense is +/-1.
+    // |def| < 3 so `eva = round_to_3(total)` and `def = total - eva`.
+    let eva_off = if total <= -2 {
+        -3
+    } else if total >= 2 {
+        3
+    } else {
+        0
+    };
+    let def_off = total - eva_off;
+
+    let difficulty = match data2.saturating_sub(64) {
+        0 => "Too Weak",
+        1 => "Incredibly Easy Prey",
+        2 => "Easy Prey",
+        3 => "Decent Challenge",
+        4 => "Even Match",
+        5 => "Tough",
+        6 => "Very Tough",
+        7 => "Incredibly Tough",
+        // Out-of-band difficulty; degrade gracefully rather than drop.
+        _ => "Unknown",
+    };
+
+    let mut line = format!("{tar_name} (Lv. {data1}) — {difficulty}.");
+    let def_str = match def_off {
+        -1 => Some("high defense"),
+        1 => Some("low defense"),
+        _ => None,
+    };
+    let eva_str = match eva_off {
+        -3 => Some("high evasion"),
+        3 => Some("low evasion"),
+        _ => None,
+    };
+    match (def_str, eva_str) {
+        (Some(d), Some(e)) => line.push_str(&format!(" It has {d} and {e}.")),
+        (Some(d), None) => line.push_str(&format!(" It has {d}.")),
+        (None, Some(e)) => line.push_str(&format!(" It has {e}.")),
+        (None, None) => {}
+    }
+    line
+}
+
 /// Cited overrides for ids whose `msg_basic.h` comment is lossy
 /// relative to the retail template the client would render from its
 /// own `msg_basic.dat`. Until we ship a DMSG parser, this is the
@@ -2509,6 +2630,11 @@ fn substitute_battle_placeholders(
     };
     s = s.replace("<player>", player_name);
     s = s.replace("<target>", target_name);
+    // `<mob>` appears in a handful of templates (e.g.
+    // `CheckImpossibleToGauge = 249`, "<mob> strength is impossible to
+    // gauge!") where the mob entity is in the wire's `Tar` slot —
+    // LSB's call sites for these ids pass `(PChar, PMobTarget, ...)`.
+    s = s.replace("<mob>", target_name);
     let amount = data1.to_string();
     for tag in ["<amount>", "<number>"] {
         s = s.replace(tag, &amount);
@@ -4081,6 +4207,198 @@ mod tests {
         let mut data = vec![0u8; 24];
         data[20..22].copy_from_slice(&0xFFFFu16.to_le_bytes());
         assert!(decode_battle_message(&data, &HashMap::new(), true).is_none());
+    }
+
+    /// Build a 0x029 BattleMessage body for a synth-decoded id (Check
+    /// or Checkparam family) so the helper paths can be exercised
+    /// end-to-end through `decode_battle_message`.
+    fn check_message(
+        message_num: u16,
+        data1: u32,
+        data2: u32,
+        cas: u32,
+        tar: u32,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&cas.to_le_bytes());
+        data[4..8].copy_from_slice(&tar.to_le_bytes());
+        data[8..12].copy_from_slice(&data1.to_le_bytes());
+        data[12..16].copy_from_slice(&data2.to_le_bytes());
+        data[20..22].copy_from_slice(&message_num.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn check_mob_even_even_renders_difficulty_and_level() {
+        // /check on a mob with even def/eva (message_num=174), data1=53
+        // (level), data2=64+4=68 (Even Match). No def/eva suffix on
+        // even/even.
+        use std::collections::HashMap;
+        let data = check_message(174, 53, 64 + 4, 1, 2);
+        let mut cache = HashMap::new();
+        cache.insert(1u32, "Daisy".to_string());
+        cache.insert(2u32, "Goblin".to_string());
+
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert_eq!(line.sender, "Daisy");
+        assert!(
+            line.text.contains("Goblin")
+                && line.text.contains("Lv. 53")
+                && line.text.contains("Even Match"),
+            "missing core check fields: {}",
+            line.text
+        );
+        assert!(
+            !line.text.to_ascii_lowercase().contains("defense")
+                && !line.text.to_ascii_lowercase().contains("evasion"),
+            "even/even should suppress def/eva phrase: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn check_mob_decomposes_def_and_eva_offsets() {
+        // 9 ids, each tied to one (def, eva) modifier pair via LSB's
+        // calc (`0x0dd_equip_inspect.cpp:99-121`): defense is +/-1,
+        // evasion is +/-3. Each id must produce the matching English
+        // phrase.
+        use std::collections::HashMap;
+        let cache: HashMap<u32, String> = [(2u32, "Mob".to_string())].into_iter().collect();
+        let cases: &[(u16, Option<&str>, Option<&str>)] = &[
+            // total = -4: high def + high eva
+            (170, Some("high defense"), Some("high evasion")),
+            // total = -3: even def + high eva
+            (171, None, Some("high evasion")),
+            // total = -2: low def + high eva
+            (172, Some("low defense"), Some("high evasion")),
+            // total = -1: high def + even eva
+            (173, Some("high defense"), None),
+            // total = 0: even/even
+            (174, None, None),
+            // total = +1: low def + even eva
+            (175, Some("low defense"), None),
+            // total = +2: high def + low eva
+            (176, Some("high defense"), Some("low evasion")),
+            // total = +3: even def + low eva
+            (177, None, Some("low evasion")),
+            // total = +4: low def + low eva
+            (178, Some("low defense"), Some("low evasion")),
+        ];
+        for &(msg, def_phrase, eva_phrase) in cases {
+            let data = check_message(msg, 25, 64 + 3, 1, 2); // Lv 25, Decent Challenge
+            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            for (label, phrase) in [("def", def_phrase), ("eva", eva_phrase)] {
+                if let Some(p) = phrase {
+                    assert!(
+                        line.text.contains(p),
+                        "msg {msg} missing {label} phrase {p:?}: {}",
+                        line.text
+                    );
+                } else {
+                    let unwanted = match label {
+                        "def" => "defense",
+                        _ => "evasion",
+                    };
+                    assert!(
+                        !line.text.to_ascii_lowercase().contains(unwanted),
+                        "msg {msg} should not mention {unwanted}: {}",
+                        line.text
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn check_mob_renders_all_difficulty_tiers() {
+        // `data2 - 64` is the EMobDifficulty enum. All 8 tiers must
+        // produce a distinct, non-fallback label.
+        use std::collections::HashMap;
+        let cache: HashMap<u32, String> = [(2u32, "Mob".to_string())].into_iter().collect();
+        let tiers = [
+            (0u32, "Too Weak"),
+            (1, "Incredibly Easy Prey"),
+            (2, "Easy Prey"),
+            (3, "Decent Challenge"),
+            (4, "Even Match"),
+            (5, "Tough"),
+            (6, "Very Tough"),
+            (7, "Incredibly Tough"),
+        ];
+        for (tier, expected) in tiers {
+            let data = check_message(174, 50, 64 + tier, 1, 2);
+            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            assert!(
+                line.text.contains(expected),
+                "tier {tier} expected {expected:?}: {}",
+                line.text
+            );
+        }
+    }
+
+    #[test]
+    fn checkparam_renders_acc_att_pairs() {
+        // /checkparam pushes 712/713/714/715 with (ACC, ATT)-ish
+        // numeric fields. Render must surface both numbers.
+        use std::collections::HashMap;
+        let cache: HashMap<u32, String> = [(1u32, "Daisy".to_string())].into_iter().collect();
+        for (msg, label) in [
+            (712u16, "Main weapon"),
+            (713, "Auxiliary weapon"),
+            (714, "Ranged weapon"),
+            (715, "Evasion"),
+        ] {
+            let data = check_message(msg, 321, 654, 1, 1);
+            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            assert!(
+                line.text.contains("321") && line.text.contains("654"),
+                "msg {msg}: missing numeric pair in {}",
+                line.text
+            );
+            assert!(
+                line.text.contains(label),
+                "msg {msg}: missing label {label:?} in {}",
+                line.text
+            );
+        }
+    }
+
+    #[test]
+    fn checkparam_aux_and_ranged_handle_unequipped_slot() {
+        // LSB sends (0, 0) for an unequipped sub/ranged slot. The
+        // operator-facing line must read as "none equipped" rather than
+        // "Accuracy: 0, Attack: 0".
+        use std::collections::HashMap;
+        let cache: HashMap<u32, String> = [(1u32, "Daisy".to_string())].into_iter().collect();
+        for msg in [713u16, 714] {
+            let data = check_message(msg, 0, 0, 1, 1);
+            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            assert!(
+                line.text.to_ascii_lowercase().contains("none equipped"),
+                "msg {msg} with (0,0) should read \"none equipped\", got: {}",
+                line.text
+            );
+        }
+    }
+
+    #[test]
+    fn check_impossible_to_gauge_uses_mob_placeholder() {
+        // Id 249 is `CheckImpossibleToGauge`; LSB sends it with the mob
+        // entity in the Tar slot. `<mob>` placeholder must resolve to
+        // the target name.
+        use std::collections::HashMap;
+        let data = check_message(249, 0, 0, 1, 2);
+        let mut cache = HashMap::new();
+        cache.insert(1u32, "Daisy".to_string());
+        cache.insert(2u32, "King Behemoth".to_string());
+
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert!(
+            line.text.contains("King Behemoth")
+                && line.text.to_ascii_lowercase().contains("impossible"),
+            "{}",
+            line.text
+        );
     }
 
     #[test]

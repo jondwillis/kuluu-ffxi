@@ -153,6 +153,57 @@ pub struct Target {
     pub id: Option<u32>,
 }
 
+/// Pure decision: should the current target/lock-on be cleared given
+/// the latest snapshot?
+///
+/// Server-side, LSB never sends an explicit "clear your target"
+/// instruction — `/check` is the only command that has a hard 50-yalm
+/// gate (`0x0dd_equip_inspect.cpp:56`). Everything else just stops
+/// including the entity in `CHAR_*` / `MAB_TIDS` floods once it dies
+/// (charutils sets `m_isDead`) or once it leaves spawn range. So the
+/// client decides target validity from the snapshot:
+///
+/// - `id` missing entirely → mob despawned, zoned out, walked beyond
+///   spawn range (~50 yalms for most mobs). Clear.
+/// - `id` present, `hp_pct == Some(0)` → entity is mid-death animation
+///   on the server (`isDead()` returns true). Clear so the operator
+///   doesn't keep swinging at a corpse and the camera's lock-on stops
+///   tracking a body that's about to despawn.
+///
+/// Returns `true` if `Target.id` (or `LockOn.target_id`) should be
+/// reset to `None`. `id` of `None` always returns `false` so the
+/// system below can be unconditionally cheap.
+pub fn should_clear_target(
+    id: Option<u32>,
+    entities: &[ffxi_viewer_wire::Entity],
+) -> bool {
+    let Some(id) = id else {
+        return false;
+    };
+    match entities.iter().find(|e| e.id == id) {
+        None => true,
+        Some(e) => matches!(e.hp_pct, Some(0)),
+    }
+}
+
+/// Auto-clear `Target` and `LockOn` when their referenced entity has
+/// vanished from the snapshot or hit 0 HP. Runs every frame; cheap
+/// because the entity scan short-circuits on the `id == target_id`
+/// hit. See [`should_clear_target`] for the policy.
+pub fn auto_clear_target_system(
+    state: Res<SceneState>,
+    mut target: ResMut<Target>,
+    mut lock_on: ResMut<crate::lock_on::LockOn>,
+) {
+    let entities = &state.snapshot.entities;
+    if should_clear_target(target.id, entities) {
+        target.id = None;
+    }
+    if should_clear_target(lock_on.target_id, entities) {
+        lock_on.target_id = None;
+    }
+}
+
 /// Tracks which Bevy entity represents each wire entity id, so we can
 /// move/despawn it across frames without scanning the world.
 #[derive(Resource, Default)]
@@ -897,5 +948,61 @@ mod tests {
         let at_threshold = SNAP_DIST_SQ.sqrt();
         let result = apply_visual_smoothing(Vec3::ZERO, Vec3::new(at_threshold, 0.0, 0.0));
         assert_eq!(result.x, at_threshold, "at threshold should snap");
+    }
+
+    /// `None` target → never clear. Keeps the auto-clear system from
+    /// fighting a freshly-set `Target` whose snapshot hasn't caught up.
+    #[test]
+    fn auto_clear_keeps_none() {
+        assert!(!should_clear_target(None, &[]));
+    }
+
+    /// Target present in the snapshot with healthy HP → keep.
+    #[test]
+    fn auto_clear_keeps_live_entity() {
+        let ents = vec![entity_with_hp(17, Some(75))];
+        assert!(!should_clear_target(Some(17), &ents));
+    }
+
+    /// Target id missing from the snapshot → clear. Covers both the
+    /// despawn case (mob died fully and was removed) and the
+    /// out-of-range case (mob walked past spawn range and the server
+    /// dropped it from our CHAR_* updates).
+    #[test]
+    fn auto_clear_drops_when_id_absent() {
+        let ents = vec![entity_with_hp(99, Some(50))];
+        assert!(should_clear_target(Some(17), &ents));
+    }
+
+    /// Target present but at 0 HP → clear (mid-death-anim corpse).
+    #[test]
+    fn auto_clear_drops_when_hp_zero() {
+        let ents = vec![entity_with_hp(17, Some(0))];
+        assert!(should_clear_target(Some(17), &ents));
+    }
+
+    /// `hp_pct == None` (server hasn't sent HP yet — common right at
+    /// spawn-in) is *not* death. Don't clear on missing data.
+    #[test]
+    fn auto_clear_keeps_when_hp_unknown() {
+        let ents = vec![entity_with_hp(17, None)];
+        assert!(!should_clear_target(Some(17), &ents));
+    }
+
+    fn entity_with_hp(id: u32, hp_pct: Option<u8>) -> ffxi_viewer_wire::Entity {
+        ffxi_viewer_wire::Entity {
+            id,
+            act_index: 0,
+            kind: EntityKind::Mob,
+            name: None,
+            pos: WireVec3 { x: 0.0, y: 0.0, z: 0.0 },
+            heading: 0,
+            hp_pct,
+            bt_target_id: 0,
+            claim_id: 0,
+            speed: 0,
+            speed_base: 0,
+            look: None,
+        }
     }
 }

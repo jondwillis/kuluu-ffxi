@@ -42,18 +42,46 @@ const ENGAGED_RING_COLOR: Color = Color::srgb(1.00, 0.18, 0.22);
 /// distinct when the operator targets themselves.
 const ENGAGED_RING_RADIUS: f32 = 1.7;
 
-/// Draw a flat ring at the targeted entity's xz, every frame.
+/// Pure decision: which color should the target ring be?
+///
+/// Yellow on a non-combat selection, red when the player is currently
+/// auto-attacking this exact target (`self.bt_target_id == target_id`,
+/// the same wire signal `target_panel` uses for the engagement
+/// badge). Lifting this into a pure function keeps the visual policy
+/// testable without needing a Bevy world.
+pub fn target_ring_color(engaged_on_target: bool) -> Color {
+    if engaged_on_target {
+        ENGAGED_RING_COLOR
+    } else {
+        RING_COLOR
+    }
+}
+
+/// Draw a flat ring at the targeted entity's xz, every frame. Red when
+/// engaged on this target, yellow otherwise (see [`target_ring_color`]).
 ///
 /// Runs in `Update` after `sync_entities_system` so the `Target` resource
 /// and any newly-spawned `WorldEntity` transforms have been reconciled.
 pub fn draw_target_ring_system(
     target: Res<Target>,
+    state: Res<SceneState>,
     world_q: Query<(&Transform, &WorldEntity)>,
     mut gizmos: Gizmos,
 ) {
     let Some(target_id) = target.id else {
         return;
     };
+
+    // Server-authoritative engagement check: self's `bt_target_id` is
+    // the server's notion of "what am I swinging at." Falls back to
+    // `false` when self isn't in the snapshot yet (early post-zone-in).
+    let engaged_on_target = state
+        .snapshot
+        .self_char_id
+        .and_then(|sid| state.snapshot.entities.iter().find(|e| e.id == sid))
+        .map(|self_pc| self_pc.bt_target_id == target_id)
+        .unwrap_or(false);
+    let color = target_ring_color(engaged_on_target);
 
     for (t, w) in &world_q {
         if w.id == target_id {
@@ -67,7 +95,7 @@ pub fn draw_target_ring_system(
             gizmos.circle(
                 Isometry3d::new(pos, Quat::from_rotation_x(-PI / 2.0)),
                 RING_RADIUS,
-                RING_COLOR,
+                color,
             );
             break;
         }
@@ -110,5 +138,33 @@ pub fn draw_engaged_ring_system(
             );
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Engagement on the *same* entity that's currently targeted →
+    /// red ring. Operator wants the ring to visually echo combat state
+    /// rather than stay yellow throughout a fight.
+    #[test]
+    fn engaged_target_uses_red() {
+        assert_eq!(target_ring_color(true), ENGAGED_RING_COLOR);
+    }
+
+    /// Targeting an entity we aren't fighting (e.g. an idle mob before
+    /// pressing F) keeps the yellow attention-getting ring.
+    #[test]
+    fn unengaged_target_uses_yellow() {
+        assert_eq!(target_ring_color(false), RING_COLOR);
+    }
+
+    /// Yellow and red must remain visually distinct — if a future
+    /// refactor accidentally points them at the same constant, the
+    /// "in combat" UI cue collapses silently.
+    #[test]
+    fn engaged_and_unengaged_colors_differ() {
+        assert_ne!(RING_COLOR, ENGAGED_RING_COLOR);
     }
 }

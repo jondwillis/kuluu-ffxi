@@ -257,6 +257,20 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(Update, dat_vos2::tick_skinned_actors);
 
+        // Server doesn't send an explicit "clear your target" signal —
+        // drop Target/LockOn refs to entities that fell out of the
+        // snapshot or hit 0 HP. Runs *before* `sync_entities_system`
+        // so the same-frame target panel + ring see the cleared state
+        // immediately rather than flashing a stale highlight on the
+        // dying-mob's last frame. Pulled out of the main chained
+        // tuple because it pushed us past Bevy's system-tuple
+        // `chain()` limit; explicit `.before()` preserves the
+        // ordering we need.
+        app.add_systems(
+            Update,
+            scene::auto_clear_target_system.before(sync_entities_system),
+        );
+
         // Camera-mode reactor: hide the player's own avatar in first-person
         // so the camera doesn't render the inside of the skull/equipment.
         // Standalone (not part of the chained scene tuple above) because it
