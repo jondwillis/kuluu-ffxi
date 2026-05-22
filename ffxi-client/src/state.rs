@@ -345,6 +345,40 @@ pub struct SessionState {
     /// snapshot time in `wire_translate::state_to_snapshot`.
     #[serde(default)]
     pub current_weather: Option<u16>,
+    /// Equipped gear, indexed by `SLOTTYPE` (0..16: Main, Sub, Ranged,
+    /// Ammo, Head, Body, Hands, Legs, Feet, Neck, Waist, LEar, REar,
+    /// LRing, RRing, Back). `None` means the slot is empty.
+    ///
+    /// Each entry is a *reference* into the inventory mirror — to
+    /// resolve to a real `item_no` for display, look up
+    /// `inventory.containers[r.container].slots`, find the slot whose
+    /// `index == r.container_index`, and read its `item_no`. Decoded
+    /// from `0x050 EQUIP_LIST` (per-slot updates) and reset by
+    /// `0x04F EQUIP_CLEAR`. Not zoned on zone change — equipment is
+    /// account-wide.
+    #[serde(default = "default_equipment")]
+    pub equipment: [Option<EquippedRef>; EQUIPMENT_SLOTS],
+}
+
+/// Number of distinct equipment slots in retail FFXI. Indexed by
+/// `SLOTTYPE` (`vendor/server/src/map/enums/slot.h`), with values
+/// 0..=15 for Main/Sub/.../Back.
+pub const EQUIPMENT_SLOTS: usize = 16;
+
+/// Reference into the inventory mirror pointing at one equipped item.
+/// Carries no `item_no` directly — the server's `EQUIP_LIST` packet
+/// (`0x050`) only sends container + slot index, so callers resolve
+/// against `Inventory` to fetch the actual id. Resolution can race
+/// the initial inventory flood; treat a missing item as "not yet
+/// loaded" rather than "unequipped".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EquippedRef {
+    pub container: u8,
+    pub container_index: u8,
+}
+
+fn default_equipment() -> [Option<EquippedRef>; EQUIPMENT_SLOTS] {
+    [None; EQUIPMENT_SLOTS]
 }
 
 /// Snapshot of an in-flight `/logout` or `/shutdown` countdown. Updated
@@ -967,6 +1001,26 @@ impl SessionState {
                     }
                 }
             }
+            AgentEvent::EquipUpdated {
+                slot,
+                container,
+                container_index,
+            } => {
+                // Defensive bounds check: SLOTTYPE is 0..16 in retail
+                // FFXI; out-of-range values would indicate a protocol
+                // drift, not legitimate data. Drop silently rather
+                // than panic so a server-side bug doesn't crash the
+                // client.
+                if let Some(cell) = self.equipment.get_mut(*slot as usize) {
+                    *cell = Some(EquippedRef {
+                        container: *container,
+                        container_index: *container_index,
+                    });
+                }
+            }
+            AgentEvent::EquipCleared => {
+                self.equipment = [None; EQUIPMENT_SLOTS];
+            }
             // EventStart is the lean signal (event_id only); EventDialog
             // is its richer companion that fills in the dialog HUD state.
             // EventEnded clears the dialog. KeyRotated is internal-only.
@@ -1186,6 +1240,20 @@ pub enum AgentEvent {
     /// on container capacities and slot counts being authoritative for
     /// `bank_when_full` checks.
     InventoryReady,
+    /// One equipment slot's source-of-truth (container + index) was
+    /// updated. Decoded from `0x050 EQUIP_LIST`. The receiver folds
+    /// this into `SessionState.equipment[slot]` and resolves the
+    /// actual `item_no` via the inventory mirror at display time.
+    EquipUpdated {
+        /// Equipment slot id (`SLOTTYPE`, 0..16). Larger values are
+        /// silently ignored by the fold.
+        slot: u8,
+        container: u8,
+        container_index: u8,
+    },
+    /// Reset all 16 equipment slots to empty. Decoded from
+    /// `0x04F EQUIP_CLEAR` (sent before the per-slot flood on login).
+    EquipCleared,
     /// Reactor goal transitioned. Mirrored into
     /// `SessionState.current_goal` so renderers can show the active
     /// intent. Fires on every `handle_command` mutation and on the

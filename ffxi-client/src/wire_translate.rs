@@ -72,7 +72,34 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         // `Weather::from_lsb` is the authoritative table (handles the
         // 0x14..=0x27 repeat range via mod-20).
         weather: s.current_weather.map(wire::Weather::from_lsb),
+        // Resolve each equipment slot's (container, index) reference
+        // against the inventory mirror into a flat per-slot
+        // `Option<item_no>`. The HUD never needs to know about
+        // containers — only the item id, which it pipes through
+        // `ffxi_proto::item_names`. A None either means the slot is
+        // unequipped or the inventory flood hasn't caught up yet;
+        // Stage 1 doesn't distinguish, so the render shows "—" in
+        // both cases.
+        equipped: resolve_equipment(s),
     }
+}
+
+/// Project `SessionState.equipment` (container-relative references)
+/// onto a flat `[Option<item_no>; 16]` by looking each ref up in the
+/// inventory mirror. Returns `None` for slots that are empty or that
+/// reference an inventory slot we haven't received yet.
+fn resolve_equipment(s: &SessionState) -> [Option<u16>; 16] {
+    let mut out = [None; 16];
+    for (i, slot) in s.equipment.iter().enumerate() {
+        let Some(r) = slot else { continue };
+        out[i] = s
+            .inventory
+            .containers
+            .get(&r.container)
+            .and_then(|c| c.slots.iter().find(|s| s.index == r.container_index))
+            .map(|s| s.item_no);
+    }
+    out
 }
 
 pub fn shop_to_wire(s: &ShopState) -> wire::ShopState {
@@ -624,5 +651,71 @@ mod tests {
             snap.producer_monotonic_ms,
             snap2.producer_monotonic_ms,
         );
+    }
+
+    /// `resolve_equipment` joins `SessionState.equipment[i]`
+    /// (container + index) against the inventory mirror to produce
+    /// the flat `[Option<item_no>; 16]` the HUD reads. Empty slots
+    /// and unresolved-reference slots both surface as `None`; only
+    /// references that both exist *and* point at a populated
+    /// inventory slot resolve to `Some(item_no)`.
+    #[test]
+    fn resolve_equipment_joins_equipment_against_inventory() {
+        use crate::state::{ContainerInfo, EquippedRef, ItemSlot};
+        let mut s = SessionState::default();
+
+        // Put a Bronze Sword (item_no=16448 — arbitrary, just needs
+        // to be distinguishable) at container=0 (Inventory), index=3.
+        let mut inv0 = ContainerInfo::default();
+        inv0.slots.push(ItemSlot {
+            index: 3,
+            item_no: 16448,
+            quantity: 1,
+            locked: false,
+            price: 0,
+        });
+        s.inventory.containers.insert(0, inv0);
+
+        // Slot 0 (Main) references inventory[3] — resolves.
+        s.equipment[0] = Some(EquippedRef {
+            container: 0,
+            container_index: 3,
+        });
+        // Slot 4 (Head) references inventory[99] — dangling, must
+        // surface as None rather than panicking or pointing somewhere
+        // wrong. Catches a future regression where resolve_equipment
+        // is rewritten to use array indexing.
+        s.equipment[4] = Some(EquippedRef {
+            container: 0,
+            container_index: 99,
+        });
+        // Slot 5 (Body) is empty.
+
+        let snap = state_to_snapshot(&s);
+        assert_eq!(snap.equipped[0], Some(16448), "main slot resolves");
+        assert_eq!(snap.equipped[4], None, "dangling ref → None");
+        assert_eq!(snap.equipped[5], None, "empty slot → None");
+        // Sanity: array length matches the wire schema width.
+        assert_eq!(snap.equipped.len(), 16);
+    }
+
+    /// `0x04F EQUIP_CLEAR` arrives in the form `AgentEvent::EquipCleared`.
+    /// Apply it and confirm every slot is reset to `None`, regardless
+    /// of prior state. The fold lives in `state::apply_event`; the
+    /// downstream `state_to_snapshot` must then return all-None.
+    #[test]
+    fn equip_cleared_resets_all_slots() {
+        use crate::state::EquippedRef;
+        let mut s = SessionState::default();
+        // Pre-populate every slot with a sentinel ref so the clear
+        // has something to wipe.
+        for cell in s.equipment.iter_mut() {
+            *cell = Some(EquippedRef {
+                container: 0,
+                container_index: 0,
+            });
+        }
+        s.apply_event(&AgentEvent::EquipCleared);
+        assert!(s.equipment.iter().all(|c| c.is_none()));
     }
 }

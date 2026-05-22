@@ -1089,6 +1089,43 @@ impl ItemAttr {
     }
 }
 
+/// `GP_SERV_COMMAND_EQUIP_LIST` (0x050) — one slot of equipped-gear
+/// state. The server emits these once per equipment slot on login
+/// (after a preceding `EQUIP_CLEAR`) and whenever the player equips
+/// or unequips. The payload carries only the *reference* into the
+/// inventory (container + slot index); resolving to the actual
+/// `item_no` requires reading the inventory mirror.
+///
+/// Body: `PropertyItemIndex:u8 EquipKind:u8 Category:u8 padding00:u8`
+/// → 4 bytes. See
+/// `vendor/server/src/map/packets/s2c/0x050_equip_list.h`.
+#[derive(Debug, Clone, Copy)]
+pub struct EquipList {
+    /// Slot index inside the source container.
+    pub container_index: u8,
+    /// Equipment slot id (SLOTTYPE: Main=0, Sub=1, Ranged=2, Ammo=3,
+    /// Head=4, Body=5, Hands=6, Legs=7, Feet=8, Neck=9, Waist=10,
+    /// LEar=11, REar=12, LRing=13, RRing=14, Back=15).
+    pub equip_slot: u8,
+    /// Source container id (CONTAINER_ID: Inventory=0, Wardrobe1=8,
+    /// etc.).
+    pub container: u8,
+}
+
+impl EquipList {
+    pub const SIZE: usize = 4;
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        Ok(Self {
+            container_index: body[0],
+            equip_slot: body[1],
+            container: body[2],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1782,6 +1819,29 @@ mod tests {
         assert!(matches!(
             WeatherPacket::decode(&buf),
             Err(DecodeError::Truncated(WeatherPacket::SIZE, n)) if n == WeatherPacket::SIZE - 1
+        ));
+    }
+
+    /// `EQUIP_LIST` is byte-laid as
+    /// `PropertyItemIndex EquipKind Category padding00`.
+    /// Pin the field order so a field swap in a future edit can't
+    /// silently mis-attribute container vs slot vs index.
+    #[test]
+    fn equip_list_decodes_field_order() {
+        // Slot index 5 in container 8 (Wardrobe1) for equip slot 4 (Head).
+        let buf = [0x05u8, 0x04, 0x08, 0x00];
+        let e = EquipList::decode(&buf).expect("decode");
+        assert_eq!(e.container_index, 5);
+        assert_eq!(e.equip_slot, 4);
+        assert_eq!(e.container, 8);
+    }
+
+    #[test]
+    fn equip_list_truncated_returns_err() {
+        let buf = [0u8; EquipList::SIZE - 1];
+        assert!(matches!(
+            EquipList::decode(&buf),
+            Err(DecodeError::Truncated(EquipList::SIZE, n)) if n == EquipList::SIZE - 1
         ));
     }
 }

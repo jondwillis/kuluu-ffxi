@@ -1065,6 +1065,24 @@ fn handle_sub_packet(
         }
         op if op == s2c::ITEM_MAX => {
             if let Ok(m) = decode::ItemMax::decode(sub.data) {
+                // System chat: rare (once per login + zone). Show only
+                // non-zero capacities so the line stays readable on
+                // characters with the default 30/30/0/0/... bag setup.
+                let summary: Vec<String> = m
+                    .capacities
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &c)| c != 0)
+                    .map(|(i, c)| format!("c{}={}", i, c))
+                    .collect();
+                let _ = event_tx.send(AgentEvent::ChatLine {
+                    line: ChatLine {
+                        channel: ChatChannel::System,
+                        sender: "client".into(),
+                        text: format!("📦 Bag capacities: {}", summary.join(", ")),
+                        server_ts: 0,
+                    },
+                });
                 let _ = event_tx.send(AgentEvent::InventoryUpdated {
                     container: 0,
                     update: InventoryUpdate::Capacities {
@@ -1082,6 +1100,20 @@ fn handle_sub_packet(
         }
         op if op == s2c::ITEM_NUM => {
             if let Ok(n) = decode::ItemNum::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::ChatLine {
+                    line: ChatLine {
+                        channel: ChatChannel::Debug,
+                        sender: "client".into(),
+                        text: format!(
+                            "📦 Qty: cat={} slot={} qty→{}{}",
+                            n.category,
+                            n.index,
+                            n.quantity,
+                            if n.lock_flg != 0 { " [locked]" } else { "" },
+                        ),
+                        server_ts: 0,
+                    },
+                });
                 let _ = event_tx.send(AgentEvent::InventoryUpdated {
                     container: n.category,
                     update: InventoryUpdate::QuantityChanged {
@@ -1094,6 +1126,17 @@ fn handle_sub_packet(
         }
         op if op == s2c::ITEM_LIST => {
             if let Ok(l) = decode::ItemList::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::ChatLine {
+                    line: ChatLine {
+                        channel: ChatChannel::Debug,
+                        sender: "client".into(),
+                        text: format!(
+                            "📦 Slot: cat={} slot={} item=#{} qty={}",
+                            l.category, l.index, l.item_no, l.quantity,
+                        ),
+                        server_ts: 0,
+                    },
+                });
                 let _ = event_tx.send(AgentEvent::InventoryUpdated {
                     container: l.category,
                     update: InventoryUpdate::SlotChanged {
@@ -1115,6 +1158,22 @@ fn handle_sub_packet(
         }
         op if op == s2c::ITEM_ATTR => {
             if let Ok(a) = decode::ItemAttr::decode(sub.data) {
+                let price_tag = if a.price != 0 {
+                    format!(" price={}", a.price)
+                } else {
+                    String::new()
+                };
+                let _ = event_tx.send(AgentEvent::ChatLine {
+                    line: ChatLine {
+                        channel: ChatChannel::Debug,
+                        sender: "client".into(),
+                        text: format!(
+                            "📦 Attr: cat={} slot={} item=#{} qty={}{}",
+                            a.category, a.index, a.item_no, a.quantity, price_tag,
+                        ),
+                        server_ts: 0,
+                    },
+                });
                 let _ = event_tx.send(AgentEvent::InventoryUpdated {
                     container: a.category,
                     update: InventoryUpdate::SlotChanged {
@@ -1130,6 +1189,26 @@ fn handle_sub_packet(
                 // The 24-byte extdata payload (`a.extdata`) is discarded
                 // here — it's item-type-specific (augments, charges, etc.)
                 // and not needed for v1 banking decisions.
+            }
+        }
+        op if op == s2c::EQUIP_CLEAR => {
+            // 0x04F: server-side reset of the entire equipped-slot
+            // table. Always sent before the per-slot 0x050 flood on
+            // login (see `vendor/server/src/map/packets/c2s/0x00a_login.cpp`),
+            // so the client never accumulates stale state from a
+            // prior session.
+            let _ = event_tx.send(AgentEvent::EquipCleared);
+        }
+        op if op == s2c::EQUIP_LIST => {
+            // 0x050: one equipped slot. Body is 4 bytes
+            // (container_index, equip_slot, container, padding) — see
+            // `ffxi_proto::decode::EquipList`.
+            if let Ok(e) = decode::EquipList::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::EquipUpdated {
+                    slot: e.equip_slot,
+                    container: e.container,
+                    container_index: e.container_index,
+                });
             }
         }
         _ => {

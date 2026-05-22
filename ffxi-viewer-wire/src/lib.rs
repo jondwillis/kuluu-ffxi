@@ -417,6 +417,25 @@ pub struct SceneSnapshot {
     /// until the first weather packet for the current zone arrives.
     #[serde(default)]
     pub weather: Option<Weather>,
+    /// Currently-equipped item per slot (FFXI `SLOTTYPE`: 0=Main,
+    /// 1=Sub, 2=Ranged, 3=Ammo, 4=Head, 5=Body, 6=Hands, 7=Legs,
+    /// 8=Feet, 9=Neck, 10=Waist, 11=LEar, 12=REar, 13=LRing,
+    /// 14=RRing, 15=Back). `None` means the slot is empty *or* that
+    /// the inventory mirror hasn't yet resolved the (container,
+    /// index) reference the server sent — Stage 1 doesn't distinguish
+    /// between those cases.
+    ///
+    /// Populated by `state_to_snapshot` by joining
+    /// `SessionState.equipment[i]` against
+    /// `SessionState.inventory.containers[…].slots`. The viewer-core
+    /// HUD looks the resolved `item_no` up via
+    /// `ffxi_proto::item_names::lookup` at render time.
+    #[serde(default = "default_equipped")]
+    pub equipped: [Option<u16>; 16],
+}
+
+fn default_equipped() -> [Option<u16>; 16] {
+    [None; 16]
 }
 
 /// Mirror of `ffxi-client::state::LogoutCountdown`. Carries just enough

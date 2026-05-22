@@ -49,7 +49,15 @@ const MAGIC_ENTRIES_STUB: &[&str] = &["(Magic — Stage 2: pending learned-spell
 const ABILITIES_ENTRIES_STUB: &[&str] =
     &["(Abilities — Stage 2: pending s2c 0x119 abil_recast decoder)"];
 const ITEMS_ENTRIES_STUB: &[&str] = &["(Items — Stage 3: pending inventory submenu)"];
-const EQUIPMENT_ENTRIES_STUB: &[&str] = &["(Equipment — Stage 1: pending s2c 0x050 equip_list decoder)"];
+
+/// Retail FFXI equipment slot names, ordered to match LSB's `SLOTTYPE`
+/// enum (`vendor/server/src/map/enums/slot.h`): 0=Main, 1=Sub, ...,
+/// 15=Back. Index parity is load-bearing — `update_main_menu` indexes
+/// `SceneSnapshot.equipped[row.slot]` against the same i.
+const EQUIPMENT_ENTRIES: &[&str] = &[
+    "Main", "Sub", "Ranged", "Ammo", "Head", "Body", "Hands", "Legs", "Feet", "Neck", "Waist",
+    "L.Ear", "R.Ear", "L.Ring", "R.Ring", "Back",
+];
 
 /// Config submenu entries. Order is "presets first, smallest delta from
 /// retail names first; meta-entries last." The labels pass through to
@@ -99,14 +107,17 @@ const MAX_ENTRY_COUNT: usize = {
     let r = ROOT_ENTRIES.len();
     let c = CONFIG_ENTRIES.len();
     let g = GRAPHICS_ENTRIES.len();
-    // Stage 0 stubs are 1 row each — they don't grow the pool. Later
-    // stages that need long scrollable lists will spawn their own
-    // panel (planned `hud/menu_list.rs`) rather than expand this pool.
+    let e = EQUIPMENT_ENTRIES.len();
+    // Equipment's 16 slots are the largest fixed submenu; Magic /
+    // Abilities / Items stubs are still 1 row each. Stages 2+ that
+    // need long scrollable lists will spawn their own panel (planned
+    // `hud/menu_list.rs`) rather than keep expanding this pool.
     let rc = if r >= c { r } else { c };
-    if rc >= g {
-        rc
+    let rcg = if rc >= g { rc } else { g };
+    if rcg >= e {
+        rcg
     } else {
-        g
+        e
     }
 };
 
@@ -131,7 +142,11 @@ fn entries(kind: MenuKind) -> &'static [&'static str] {
         MenuKind::Magic => MAGIC_ENTRIES_STUB,
         MenuKind::Abilities => ABILITIES_ENTRIES_STUB,
         MenuKind::Items => ITEMS_ENTRIES_STUB,
-        MenuKind::Equipment => EQUIPMENT_ENTRIES_STUB,
+        // Stage 1: 16 slot-name labels. Per-frame `update_main_menu`
+        // appends the equipped item name (or "—" if empty) from
+        // `SceneSnapshot.equipped[i]` — the slot-name slice gives the
+        // cursor + count, the snapshot gives the right column.
+        MenuKind::Equipment => EQUIPMENT_ENTRIES,
     }
 }
 
@@ -163,7 +178,12 @@ pub fn spawn_main_menu(mut commands: Commands) {
                 position_type: PositionType::Absolute,
                 top: Val::Px(48.0),
                 right: Val::Px(8.0),
-                width: Val::Px(160.0),
+                // 240px fits "Body  : Bronze Cuirass +1" without
+                // truncating the longer FFXI item names. Static
+                // submenus (Root/Config/Graphics) leave the right
+                // side empty padding — that's fine; the panel
+                // shrinks visually via Display::None on hidden rows.
+                width: Val::Px(240.0),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
                 border: UiRect::all(Val::Px(1.0)),
                 flex_direction: FlexDirection::Column,
@@ -203,6 +223,10 @@ pub fn spawn_main_menu(mut commands: Commands) {
 pub fn update_main_menu(
     mode: Res<InputMode>,
     settings: Res<GraphicsSettings>,
+    // Equipment rows pull the equipped item name from the snapshot at
+    // render time. Stage 0 menus don't need this; Stage 1 added it for
+    // the new `MenuKind::Equipment` branch in `format_row_body`.
+    scene: Res<crate::snapshot::SceneState>,
     mut menu_q: Query<&mut Node, (With<MainMenu>, Without<MainMenuRow>)>,
     mut row_q: Query<(&MainMenuRow, &mut Node, &mut Text, &mut TextColor)>,
 ) {
@@ -236,7 +260,8 @@ pub fn update_main_menu(
                         // value pulled from the live settings resource).
                         // Reset and other screens use the plain static
                         // label.
-                        let body = format_row_body(kind, row.slot, label, &settings);
+                        let body =
+                            format_row_body(kind, row.slot, label, &settings, &scene.snapshot);
                         let want = if is_cursor {
                             format!("> {body}")
                         } else {
@@ -321,25 +346,43 @@ pub fn menu_mouse_click_system(
 }
 
 /// Format the body of a menu row (everything after the cursor prefix).
-/// Graphics field rows render `Field: [Value]`; the trailing "Reset to
-/// High" row and every non-Graphics row render the bare label.
+/// Graphics field rows render `Field: [Value]`; Equipment slot rows
+/// render `Slot: item_name`; every other screen renders the bare label.
 fn format_row_body(
     kind: MenuKind,
     slot: usize,
     label: &str,
     settings: &GraphicsSettings,
+    snapshot: &ffxi_viewer_wire::SceneSnapshot,
 ) -> String {
-    if !matches!(kind, MenuKind::Graphics) {
-        return label.to_string();
-    }
-    match GRAPHICS_FIELDS.get(slot).copied() {
-        Some(field) => format!(
-            "{:<16}[{}]",
-            format!("{}:", field.label()),
-            settings.value_label(field)
-        ),
-        // Reset row (and any future trailing actions).
-        None => label.to_string(),
+    match kind {
+        MenuKind::Graphics => match GRAPHICS_FIELDS.get(slot).copied() {
+            Some(field) => format!(
+                "{:<16}[{}]",
+                format!("{}:", field.label()),
+                settings.value_label(field)
+            ),
+            // Reset row (and any future trailing actions).
+            None => label.to_string(),
+        },
+        MenuKind::Equipment => {
+            // Two failure modes both collapse to "—":
+            //   (1) slot is genuinely empty
+            //   (2) we received `EQUIP_LIST` (container,index) before
+            //       the inventory flood resolved that slot — wire_translate
+            //       writes None until inventory catches up
+            // Stage 1 doesn't disambiguate; a real "loading" indicator
+            // can come in a later stage if it proves confusing.
+            let item_name = snapshot
+                .equipped
+                .get(slot)
+                .copied()
+                .flatten()
+                .and_then(ffxi_proto::item_names::lookup)
+                .unwrap_or("—");
+            format!("{label:<7}: {item_name}")
+        }
+        _ => label.to_string(),
     }
 }
 
