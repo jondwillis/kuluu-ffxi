@@ -1116,14 +1116,23 @@ fn apply_slash_outcome(
             // above the dispatch call. This arm exists to keep the
             // outcome enum match exhaustive without giving
             // `apply_slash_outcome` an &mut InputMode parameter.
-            let label = match kind {
-                ffxi_viewer_core::MenuKind::Magic => "Magic",
-                ffxi_viewer_core::MenuKind::Abilities => "Abilities",
-                ffxi_viewer_core::MenuKind::Items => "Items",
-                ffxi_viewer_core::MenuKind::Equipment => "Equipment",
-                ffxi_viewer_core::MenuKind::Root => "Root",
-                ffxi_viewer_core::MenuKind::Config => "Config",
-                ffxi_viewer_core::MenuKind::Graphics => "Graphics",
+            let label: std::borrow::Cow<'static, str> = match kind {
+                ffxi_viewer_core::MenuKind::Magic => "Magic".into(),
+                ffxi_viewer_core::MenuKind::Abilities => "Abilities".into(),
+                ffxi_viewer_core::MenuKind::Items => "Items".into(),
+                ffxi_viewer_core::MenuKind::Equipment => "Equipment".into(),
+                ffxi_viewer_core::MenuKind::Root => "Root".into(),
+                ffxi_viewer_core::MenuKind::Config => "Config".into(),
+                ffxi_viewer_core::MenuKind::Graphics => "Graphics".into(),
+                // EquipSlot isn't reachable via a slash-OpenMenu today
+                // (no slash form opens a specific slot directly — the
+                // operator gets there by walking Equipment → row →
+                // Enter). Include for exhaustiveness; format the
+                // slot id so a future direct-open slash surfaces a
+                // useful chat toast instead of `<unknown>`.
+                ffxi_viewer_core::MenuKind::EquipSlot(slot) => {
+                    format!("EquipSlot({slot})").into()
+                }
             };
             push_system_chat_line(scene_state, format!("[menu] opened {label}"));
         }
