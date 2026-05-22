@@ -350,6 +350,16 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             input::dispatch_target_change_system,
         )
             .chain()
+            // Run AFTER `chase_camera_system` so Tab's NDC projection
+            // reads this frame's camera Transform, not last frame's.
+            // Without this ordering Bevy's scheduler may run input
+            // before the camera writes its updated position, and a
+            // mob that's actually in view projects as "behind the
+            // camera" (NDC.z out of range) and gets culled. The
+            // symptom was "near-and-in-view mobs often not tab-
+            // selectable" — flaky precisely because scheduler order
+            // varied frame-to-frame.
+            .after(ffxi_viewer_core::chase_camera_system)
             .run_if(in_state(AppPhase::InGame)),
     );
     app.add_systems(

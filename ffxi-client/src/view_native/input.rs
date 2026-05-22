@@ -962,8 +962,11 @@ fn wrap_signed_pi(x: f32) -> f32 {
 ///   only used to break ties when two entities share the same angular
 ///   position. Falls back to the relaxed-frustum set if nothing is
 ///   strictly in-view.
-/// - Subsequent presses: order candidates left-to-right by NDC.x and
-///   step to the entry after the current target. Wraps at the end.
+/// - Subsequent presses: order candidates by hybrid score (same scoring
+///   as first press — nearest in world with a small off-center penalty)
+///   and step to the entry after the current target. Wraps at the end.
+///   This matches FFXI retail's "Tab cycles nearest → next-nearest"
+///   model rather than a screen-x sweep.
 ///
 /// Frustum inclusion is **relaxed** past the strict `[-1, 1]` box (see
 /// [`CYCLE_NDC_LIMIT`]) so that entities sitting just off the screen
@@ -1039,13 +1042,15 @@ where
 
     match current_in_cycle {
         Some(curr) => {
-            // Sweep left-to-right by NDC.x across the (relaxed) screen
-            // band. Includes slightly-out-of-view entities so the cycle
-            // matches FFXI retail's forgiving target list.
+            // Cycle by hybrid score (nearest first, with the same
+            // off-center penalty used on first press). Retail FFXI's
+            // Tab cycles nearest → next-nearest, not by screen-x —
+            // walking through a mob crowd, the second Tab should land
+            // on the second-closest mob, not the next one to the right.
             candidates.sort_by(|a, b| {
-                a.ndc_x
-                    .partial_cmp(&b.ndc_x)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                let sa = a.dist_sq.sqrt() + NDC_PENALTY_YALMS * a.ndc_mag_sq.sqrt();
+                let sb = b.dist_sq.sqrt() + NDC_PENALTY_YALMS * b.ndc_mag_sq.sqrt();
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
             });
             let pos = candidates.iter().position(|c| c.id == curr)?;
             Some(candidates[(pos + 1) % candidates.len()].id)
@@ -1264,28 +1269,32 @@ mod tests {
     }
 
     #[test]
-    fn subsequent_presses_cycle_left_to_right() {
+    fn subsequent_presses_cycle_by_distance() {
         let from = WireVec3 {
             x: 0.0,
             y: 0.0,
             z: 0.0,
         };
-        // ndc.x = pos.x / 100 → entity 1 leftmost, then 2, then 3.
-        let entities = vec![ent(1, -50.0, 0.0), ent(2, 0.0, 0.0), ent(3, 50.0, 0.0)];
-        // Starting from 1 (leftmost) → next is 2.
-        assert_eq!(
-            cycle_target_viewport(&entities, from, Some(1), None, fake_proj),
-            Some(2)
-        );
-        // From 2 → next is 3.
+        // Three entities at clearly distinct distances. Hybrid scores:
+        //   id=2 at (5, 0)   → dist=5,  ndc=0.05 → score = 5.5
+        //   id=3 at (15, 0)  → dist=15, ndc=0.15 → score = 16.5
+        //   id=1 at (30, 0)  → dist=30, ndc=0.30 → score = 33.0
+        // Sorted order: [2, 3, 1].
+        let entities = vec![ent(1, 30.0, 0.0), ent(2, 5.0, 0.0), ent(3, 15.0, 0.0)];
+        // From id=2 (nearest) → id=3 (next-nearest).
         assert_eq!(
             cycle_target_viewport(&entities, from, Some(2), None, fake_proj),
             Some(3)
         );
-        // From 3 → wraps to 1.
+        // From id=3 → id=1 (third-nearest).
         assert_eq!(
             cycle_target_viewport(&entities, from, Some(3), None, fake_proj),
             Some(1)
+        );
+        // From id=1 → wraps back to id=2.
+        assert_eq!(
+            cycle_target_viewport(&entities, from, Some(1), None, fake_proj),
+            Some(2)
         );
     }
 
