@@ -6,13 +6,16 @@
 //!   W/S       walk forward/back IN CAMERA DIRECTION (player heading
 //!             snaps each tick to "away from camera" — ChaseCamera.yaw
 //!             determines the move direction, not the player's prior heading).
-//!   Q/E       strafe left/right perpendicular to current player heading.
-//!             No camera-snap — strafe respects whatever direction A/D
-//!             rotated the player to.
-//!   A/D       rotate player heading AND camera yaw lock-step. Camera
-//!             stays behind player when turning in place, AND A/D
-//!             actually steers the path during W-held movement (yaw
-//!             moves with heading, so snap is a no-op).
+//!   A/D       FFXI-classic "turn while walking" — rotates heading +
+//!             camera yaw lock-step AND adds an implicit forward step
+//!             in 3rd person, so holding either alone traces a circle
+//!             (heading sweeps each tick, the forward vector sweeps
+//!             with it). In first-person the walk implicit is dropped
+//!             and A/D degenerates to pure rotate.
+//!   Q/E       pure heading rotate (no walk contribution). Same camera
+//!             yaw lock-step as A/D — the camera trails behind the
+//!             rotated player. Useful for spinning in place to look
+//!             around without orbiting. Unbound by default in Standard.
 //!   ←/→       rotate camera yaw ONLY (free-look). Player heading
 //!             unchanged until W/S press, which snaps it to camera-forward.
 //!   ↑/↓       camera pitch (↑ raises camera/more overhead, ↓ lowers it).
@@ -51,9 +54,9 @@ use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use bevy::window::WindowCloseRequested;
 use ffxi_viewer_core::{
-    heading_for_yaw, toggle_camera_mode, Action, Bindings, CameraMode, ChaseCamera, ChatBuffer,
-    CursorLockRequest, InputMode, LockOn, LockOnToggle, MenuStack, OperatorCamera,
-    PassiveCursorState, SceneState, Target,
+    heading_for_yaw, toggle_camera_mode, yaw_for_heading, Action, Bindings, CameraMode,
+    ChaseCamera, ChatBuffer, CursorLockRequest, InputMode, LockOn, LockOnToggle, MenuStack,
+    OperatorCamera, PassiveCursorState, SceneState, Target,
 };
 use ffxi_viewer_wire::{Entity as WireEntity, Vec3 as WireVec3};
 use tokio::sync::mpsc;
@@ -79,6 +82,51 @@ const STRAFE_CANCEL_MS: u64 = 300;
 /// without retuning movement speed.
 const SPEED_TO_YPS: f32 = 0.2;
 
+/// Turn (A/D in 3rd person) — heading lerp rate toward direction of
+/// motion, radians per real-time second.
+///
+/// Geometric truth: in the strafe-camera-left motion model, you cannot
+/// simultaneously have (a) camera directly behind player AND (b) player
+/// facing direction of motion. The strafe direction is perpendicular to
+/// camera-forward, so player heading and camera position have an
+/// intrinsic 90° offset — try to make camera behind and the player
+/// moonwalks; let player face motion and the camera ends up at the
+/// flank.
+///
+/// The hybrid: split the 90° between two lazy lerps —
+///   - heading lerps toward direction of motion (lag here = moonwalk)
+///   - chase.yaw lerps toward "behind player heading" (lag here = flank)
+///
+/// Steady-state algebra (both lerps converge to a common angular
+/// velocity ω while maintaining their respective lags):
+///
+/// ```text
+///   ω         = π/2 / (1/HLR + 1/CTR)
+///   lag_head  = ω / HLR  (radians of moonwalk)
+///   lag_chase = ω / CTR  (radians of camera-flank)
+///   orbit_r   = walk_speed / ω
+/// ```
+///
+/// At HLR = CTR = 0.5 (the shipped default):
+/// `ω ≈ 0.393 rad/sec`, `orbit r ≈ 12.7 yalms`, `lag_head = lag_chase ≈ 45°`.
+/// Bias `CTR > HLR` to push camera more-behind (at the cost of more
+/// moonwalk); bias the other way for less moonwalk + camera further
+/// at flank.
+const HEADING_LERP_RATE_RAD_PER_SEC: f32 = 0.5;
+
+/// Chase-camera yaw lerp rate toward "behind player heading", radians
+/// per real-time second. See [`HEADING_LERP_RATE_RAD_PER_SEC`] for the
+/// geometric trade-off and tuning notes.
+const CHASE_TRACK_RATE_RAD_PER_SEC: f32 = 0.5;
+
+/// Horizontal-distance threshold (yalms) above which `dispatch_movement_system`
+/// abandons its local prediction and re-seeds from the snapshot. Sized for:
+///   * normal per-frame divergence (≤ 1 frame's worth of movement at base speed,
+///     so 0.083 yalm/frame at 60fps; even at 1fps that's 5 yalms — at the edge)
+///   * legitimate server corrections (zone change, /warp, rubber-band): always
+///     tens of yalms or more, so this catches them.
+const PREDICTION_RESYNC_YALMS: f32 = 5.0;
+
 #[derive(Resource, Clone)]
 pub struct CommandTx(pub mpsc::Sender<AgentCommand>);
 
@@ -89,6 +137,29 @@ pub struct CommandTx(pub mpsc::Sender<AgentCommand>);
 pub struct AutoRun {
     pub phantom_forward: bool,
     pub strafe_held_since: Option<Instant>,
+}
+
+/// Last position `dispatch_movement_system` emitted via `AgentCommand::Move`.
+///
+/// Why this exists: the system runs in `FixedUpdate` (60 Hz) but reads
+/// `self_pos` from `state.snapshot`, which is refreshed at most once per
+/// render frame (via `NativeSource::poll_snapshot` in `Update`). At /fps 30,
+/// Bevy runs FixedUpdate twice per frame; without local prediction, both
+/// runs would see the same stale `self_pos`, compute the same `pos + step`,
+/// and only the last write would land — effectively pinning movement to
+/// "one step per render frame" and halving walk speed at /fps 30.
+///
+/// We mirror the last emitted position here and use *it* as the basis for
+/// the next step. The snapshot still wins when it diverges by more than
+/// [`PREDICTION_RESYNC_YALMS`] (zone change, /warp, server snapback) so we
+/// don't ignore server authority.
+#[derive(Resource, Default)]
+pub struct LocalPlayerPrediction {
+    /// Last-emitted position. Meaningless until `initialized` is true.
+    pub pos: Vec3,
+    /// False until the first snapshot has seeded us — protects against
+    /// using a Vec3::ZERO basis before zone-in.
+    pub initialized: bool,
 }
 
 /// Edge-trigger handler: window-close shortcuts, target/autorun/lock-on
@@ -210,8 +281,44 @@ pub fn handle_input_system(
                 &state.snapshot.entities,
                 state.snapshot.self_pos.pos,
                 target.id,
+                state.snapshot.self_char_id,
                 |world_pos| camera.world_to_ndc(&cam_global, world_pos),
             );
+        }
+    }
+
+    // Retail F1–F6 party-slot targeting. Slot 1 = self (`self_char_id`);
+    // slots 2..=6 index `snapshot.party[1..=5]` in insertion order — the
+    // best the wire gives us, since the server's slot index isn't
+    // broadcast separately. Empty slots silently no-op. Mirrors the
+    // /targetparty<N> slash twins in `slash_commands.rs`.
+    let party_slot = if bindings.just_pressed(Action::TargetSelf, &keys) {
+        Some(1)
+    } else if bindings.just_pressed(Action::TargetParty2, &keys) {
+        Some(2)
+    } else if bindings.just_pressed(Action::TargetParty3, &keys) {
+        Some(3)
+    } else if bindings.just_pressed(Action::TargetParty4, &keys) {
+        Some(4)
+    } else if bindings.just_pressed(Action::TargetParty5, &keys) {
+        Some(5)
+    } else if bindings.just_pressed(Action::TargetParty6, &keys) {
+        Some(6)
+    } else {
+        None
+    };
+    if let Some(slot) = party_slot {
+        let id = if slot == 1 {
+            state.snapshot.self_char_id
+        } else {
+            state
+                .snapshot
+                .party
+                .get((slot - 1) as usize)
+                .map(|p| p.id)
+        };
+        if let Some(id) = id {
+            target.id = Some(id);
         }
     }
     if bindings.just_pressed(Action::ToggleAutorun, &keys) {
@@ -380,6 +487,7 @@ pub fn dispatch_movement_system(
     lock_on: Res<LockOn>,
     mut autorun: ResMut<AutoRun>,
     mut chase: ResMut<ChaseCamera>,
+    mut prediction: ResMut<LocalPlayerPrediction>,
     navmesh: Res<super::navmesh_overlay::NavmeshState>,
     minimap_hover: Res<ffxi_viewer_core::minimap::input::MinimapHoverGate>,
 ) {
@@ -473,7 +581,8 @@ pub fn dispatch_movement_system(
         autorun.phantom_forward = false;
     }
 
-    // --- rotate player only (no strafe, no camera). ---
+    // --- rotate player only (no walk contribution). Bound to Q/E in
+    //     Compact 1/2 (Numpad has no equivalent). ---
     let mut player_rotate: i32 = 0;
     if bindings.pressed(Action::RotateLeft, &keys) {
         player_rotate -= 1;
@@ -482,9 +591,12 @@ pub fn dispatch_movement_system(
         player_rotate += 1;
     }
 
-    // --- strafe perpendicular to current heading. Unbound under
-    //     Compact 1 / Standard — `pressed` returns false for unbound
-    //     actions, so the strafe contribution is naturally zero there. ---
+    // --- strafe perpendicular to current heading. Unbound in every
+    //     shipped preset after the A/D=turn / Q/E=rotate reshuffle —
+    //     `pressed` returns false for unbound actions, so the strafe
+    //     contribution is naturally zero. Kept as a rebindable verb so
+    //     operators who want classic strafe can re-add it via
+    //     `/keybinds set strafe-left ...`. ---
     let mut strafe: i32 = 0;
     if bindings.pressed(Action::StrafeLeft, &keys) {
         strafe -= 1;
@@ -493,7 +605,26 @@ pub fn dispatch_movement_system(
         strafe += 1;
     }
 
-    // Sustained A/D-or-Q/E hold cancels autorun. A brief tap won't.
+    // --- combined turn (rotate + walk). FFXI classic 3rd-person A/D:
+    //     each tick rotates heading lock-step with camera yaw AND adds
+    //     an implicit forward step, so holding A alone traces a circle
+    //     (heading sweeps each tick, forward direction sweeps with it).
+    //     The forward implicit is suppressed in first-person (rotating
+    //     the head while walking is fine, but the orbit visual loses
+    //     its meaning) and when W/S is already explicitly held (the
+    //     operator's direction intent wins). ---
+    let mut turn: i32 = 0;
+    if bindings.pressed(Action::TurnLeft, &keys) {
+        turn -= 1;
+    }
+    if bindings.pressed(Action::TurnRight, &keys) {
+        turn += 1;
+    }
+
+    // Sustained pure-rotate (Q/E) or strafe hold cancels autorun. A
+    // brief tap won't. Turn (A/D) is INTENTIONALLY excluded: orbit-
+    // while-autorun is the use case that motivated this whole
+    // reshuffle, so holding A with autorun on must keep autorun.
     let any_strafe_or_rotate = player_rotate != 0 || strafe != 0;
     if any_strafe_or_rotate {
         let now = Instant::now();
@@ -512,11 +643,53 @@ pub fn dispatch_movement_system(
         forward = forward.max(1);
     }
 
+    // Fold `turn` based on camera mode. Must run AFTER the autorun-cancel
+    // check (turn must not trigger cancel) and AFTER the autorun
+    // phantom_forward expansion (so W+A doesn't double-count forward).
+    //
+    // 3rd person: `turn_in_chase = true`. The motion is computed below
+    //   in a dedicated handler — player strafes in camera-left/right
+    //   (perpendicular to camera-forward, NOT to player heading) while
+    //   chase.yaw auto-rotates at TURN_ORBIT_YAW_RATE_RAD_PER_SEC.
+    //   "Camera-left" therefore shifts gradually and the player's
+    //   straight strafe traces a circle. Heading is set to face the
+    //   direction of motion so the character isn't moonwalking.
+    //
+    // 1st person: no orbit visual to chase. Fold turn into player_rotate
+    //   so A still rotates the player at the snappy spin-to-face rate
+    //   via the standard per-tick u8 handler.
+    let turn_in_chase = turn != 0 && matches!(*camera_mode, CameraMode::Chase);
+    if turn != 0 && !turn_in_chase {
+        player_rotate += turn;
+    }
+
     // Lock-on heading override — computed before the no-input bail-out
     // so the camera pivots to follow the target even when the player
     // is standing still. Returns the new heading u8 if a usable target
     // is in the snapshot, else `None`.
     let self_pos = state.snapshot.self_pos;
+
+    // Local prediction basis: when this system runs N times per render
+    // frame (Bevy FixedUpdate catch-up at low /fps), every run after the
+    // first must see the previously-emitted position — not the snapshot,
+    // which only refreshes once per Update tick. Without this, multiple
+    // FixedUpdate runs in one frame all compute from the same stale
+    // `self_pos` and walk speed is pinned to one step per render frame.
+    //
+    // Snapshot wins on big divergence (zone change / /warp / server
+    // snapback) — see [`PREDICTION_RESYNC_YALMS`]. Heading and speed are
+    // never predicted locally; they're always snapshot-authoritative.
+    let snap_pos = Vec3::new(self_pos.pos.x, self_pos.pos.y, self_pos.pos.z);
+    let basis_pos = if !prediction.initialized
+        || (snap_pos - prediction.pos).length() > PREDICTION_RESYNC_YALMS
+    {
+        prediction.pos = snap_pos;
+        prediction.initialized = true;
+        snap_pos
+    } else {
+        prediction.pos
+    };
+
     let locked_heading: Option<u8> = lock_on.target_id.and_then(|id| {
         state
             .snapshot
@@ -546,14 +719,22 @@ pub fn dispatch_movement_system(
     // the server sees the operator's facing track the target. Cheap —
     // only fires when the operator is locked AND the heading actually
     // moved by ≥1 u8 unit (~1.4°).
-    if forward == 0 && strafe == 0 && player_rotate == 0 {
+    //
+    // `turn_in_chase` counts as input here — the strafe-camera-left
+    // handler below produces motion without setting `forward`/`strafe`,
+    // so the bail-check needs explicit awareness or A-held-alone falls
+    // through to the no-op return.
+    if forward == 0 && strafe == 0 && player_rotate == 0 && !turn_in_chase {
         if let Some(h) = locked_heading {
             if h != self_pos.heading {
                 chase.yaw = ffxi_viewer_core::yaw_for_heading(h);
+                // Use basis_pos (prediction-authoritative) so a
+                // heading-only Move doesn't yank a fresher local
+                // position back to the lagging snapshot.
                 let _ = cmd_tx.0.try_send(AgentCommand::Move {
-                    x: self_pos.pos.x,
-                    y: self_pos.pos.y,
-                    z: self_pos.pos.z,
+                    x: basis_pos.x,
+                    y: basis_pos.y,
+                    z: basis_pos.z,
                     heading: h,
                 });
             }
@@ -585,6 +766,83 @@ pub fn dispatch_movement_system(
         chase.yaw -= player_rotate as f32 * ROTATE_STEP_HELD as f32 * std::f32::consts::TAU / 256.0;
     }
 
+    // Turn (3rd-person A/D) — strafe-camera-left motion model.
+    //
+    // Each tick: player strafes in the camera-left/right direction
+    // (perpendicular to current camera-forward, computed from chase.yaw —
+    // NOT from player heading, since heading would then chase its own
+    // tail). Simultaneously chase.yaw rotates at TURN_ORBIT_YAW_RATE so
+    // "camera-left" gradually shifts; the straight strafe traces a
+    // circle of radius `walk_speed / yaw_rate`.
+    //
+    // W/S compose: their contribution adds along camera-forward, then
+    // the combined (camera-fwd, camera-lat) vector is normalized so
+    // diagonals don't move faster than cardinals. Heading is set to the
+    // composed direction so the character faces where it's going.
+    //
+    // We stash the motion delta into `turn_dx`/`turn_dy` here and apply
+    // it below after `x`/`y` are initialized from `basis_pos`. The
+    // forward/strafe contributions are absorbed into the turn handler
+    // (then the standard step handlers are gated off), so the composite
+    // motion is the sole position update this tick.
+    //
+    // No-op in first-person: 1st-person folded turn into player_rotate
+    // earlier; the standard rotate handler took care of it.
+    let mut turn_dx: f32 = 0.0;
+    let mut turn_dy: f32 = 0.0;
+    if turn_in_chase {
+        // Step 1: motion direction from CURRENT chase.yaw (don't pre-rotate
+        // — the chase-track lerp below is the only thing that moves it).
+        let camera_forward_h = heading_for_yaw(chase.yaw);
+        let (cf_x, cf_y) = heading_to_forward(camera_forward_h);
+        // LSB heading convention: +64 = +90° clockwise from above = "right".
+        let (cr_x, cr_y) = heading_to_forward(camera_forward_h.wrapping_add(64));
+
+        let fwd_signed = forward as f32;
+        let lat_signed = turn as f32; // -1 for A (left), +1 for D (right).
+        let mx = cf_x * fwd_signed + cr_x * lat_signed;
+        let my = cf_y * fwd_signed + cr_y * lat_signed;
+        let len = (mx * mx + my * my).sqrt();
+
+        let step_magnitude = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs();
+        if len > 1e-3 && step_magnitude > 0.0 {
+            let inv = 1.0 / len;
+            turn_dx = mx * inv * step_magnitude;
+            turn_dy = my * inv * step_magnitude;
+
+            // Step 2: heading lerps toward direction of motion (NOT
+            // snapped). The lerp lag is what creates room for chase.yaw
+            // to catch up to "behind heading" below. Same LSB worldAngle
+            // formula `reactor.rs::heading_toward` uses, so server-side
+            // facing math agrees.
+            let motion_radians = my.atan2(mx);
+            let motion_raw = motion_radians * -(128.0 / std::f32::consts::PI);
+            let motion_h = (motion_raw.round() as i32).rem_euclid(256) as u8;
+
+            let h_target = yaw_for_heading(motion_h);
+            let h_current = yaw_for_heading(heading);
+            let h_diff = wrap_signed_pi(h_target - h_current);
+            let h_max_step = HEADING_LERP_RATE_RAD_PER_SEC * time.delta_secs();
+            let h_step = h_diff.signum() * h_max_step.min(h_diff.abs());
+            heading = heading_for_yaw(h_current + h_step);
+        }
+
+        // Step 3: chase-camera yaw lerps toward "behind player heading"
+        // (the lerped value from step 2). In steady state the chase lag
+        // is `ω / CHASE_TRACK_RATE`; see the doc-comment on the rate
+        // constants for the geometric trade-off.
+        let chase_target = yaw_for_heading(heading);
+        let c_diff = wrap_signed_pi(chase_target - chase.yaw);
+        let c_max_step = CHASE_TRACK_RATE_RAD_PER_SEC * time.delta_secs();
+        let c_step = c_diff.signum() * c_max_step.min(c_diff.abs());
+        chase.yaw += c_step;
+
+        // Suppress the standard forward/strafe step handlers — composite
+        // motion above already accounts for both W/S and turn.
+        forward = 0;
+        strafe = 0;
+    }
+
     // Lock-on: heading already computed at the top of this function
     // (see `locked_heading` shadowed above). Apply it after WASD's
     // camera-forward snap and A/D rotation so movement intent still
@@ -601,8 +859,12 @@ pub fn dispatch_movement_system(
     // silently skips movement instead of teleporting somewhere weird.
     // Speed_base is the unmodified value.
     let step = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs();
-    let mut x = self_pos.pos.x;
-    let mut y = self_pos.pos.y;
+    let mut x = basis_pos.x;
+    let mut y = basis_pos.y;
+    // Apply turn-handler's composite motion. Zero unless `turn_in_chase`
+    // produced a step (W+turn or turn-alone in 3rd person).
+    x += turn_dx;
+    y += turn_dy;
     if forward != 0 && step > 0.0 {
         let (fwd_x, fwd_y) = heading_to_forward(heading);
         x += fwd_x * step * forward as f32;
@@ -623,8 +885,8 @@ pub fn dispatch_movement_system(
     // off-mesh), and the move passes through. If anything fails the
     // raw target is used — wall-slide should never *break* movement.
     let (final_x, final_y, final_z) = if let Some(nav) = &navmesh.nav {
-        let from = ffxi_nav::glam::Vec3::new(self_pos.pos.x, self_pos.pos.y, self_pos.pos.z);
-        let to = ffxi_nav::glam::Vec3::new(x, y, self_pos.pos.z);
+        let from = ffxi_nav::glam::Vec3::new(basis_pos.x, basis_pos.y, basis_pos.z);
+        let to = ffxi_nav::glam::Vec3::new(x, y, basis_pos.z);
         let slid = nav
             .lock()
             .ok()
@@ -635,12 +897,11 @@ pub fn dispatch_movement_system(
         //   slide=None       → start off-mesh (would pass through, not stick)
         //   slide=Some(p≈from) → clamped to a single-poly cell (real stuck)
         // Remove once the wall-slide regression is diagnosed.
-        let proposed = ((x - self_pos.pos.x).powi(2) + (y - self_pos.pos.y).powi(2)).sqrt();
+        let proposed = ((x - basis_pos.x).powi(2) + (y - basis_pos.y).powi(2)).sqrt();
         if proposed > 0.1 {
             let (resulting, branch) = match &slid {
                 Some(p) => {
-                    let r =
-                        ((p.x - self_pos.pos.x).powi(2) + (p.y - self_pos.pos.y).powi(2)).sqrt();
+                    let r = ((p.x - basis_pos.x).powi(2) + (p.y - basis_pos.y).powi(2)).sqrt();
                     (r, "slide_some")
                 }
                 None => (proposed, "slide_none_passthrough"),
@@ -659,10 +920,10 @@ pub fn dispatch_movement_system(
         }
         match slid {
             Some(p) => (p.x, p.y, p.z),
-            None => (x, y, self_pos.pos.z),
+            None => (x, y, basis_pos.z),
         }
     } else {
-        (x, y, self_pos.pos.z)
+        (x, y, basis_pos.z)
     };
 
     let _ = cmd_tx.0.try_send(AgentCommand::Move {
@@ -671,6 +932,11 @@ pub fn dispatch_movement_system(
         z: final_z,
         heading,
     });
+
+    // Commit prediction so the next FixedUpdate run (possibly within
+    // this same render frame) reads our just-emitted position rather
+    // than the still-lagging snapshot.
+    prediction.pos = Vec3::new(final_x, final_y, final_z);
 }
 
 /// FFXI heading 0..=255 → (forward.x, forward.y) unit vector in our
@@ -682,6 +948,15 @@ pub fn dispatch_movement_system(
 fn heading_to_forward(heading: u8) -> (f32, f32) {
     let angle = (heading as f32) * std::f32::consts::TAU / 256.0;
     (angle.cos(), -angle.sin())
+}
+
+/// Map an angle difference into `[-π, π]` so a lerp toward a target
+/// always takes the shortest arc. Used by the turn handler's heading
+/// and chase-yaw lerps where the target wraps modulo τ.
+#[inline]
+fn wrap_signed_pi(x: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    (x + PI).rem_euclid(TAU) - PI
 }
 
 /// Pure helper: viewport-aware Tab cycle, FFXI-retail style.
@@ -706,12 +981,14 @@ fn heading_to_forward(heading: u8) -> (f32, f32) {
 /// edge — the common chase-cam "mob over my shoulder" case — stay in
 /// the cycle. Retail FFXI exhibits the same forgiving behavior.
 ///
-/// The synthetic self entity (id == 0) doesn't appear in the wire
-/// snapshot's entity list, so no explicit self-filter is needed here.
+/// Self is excluded explicitly via `self_id` — the wire entity list
+/// now includes the player's own entry (matched by `self_char_id`),
+/// so Tab would otherwise auto-select self on the first press.
 pub fn cycle_target_viewport<F>(
     entities: &[WireEntity],
     from: WireVec3,
     current: Option<u32>,
+    self_id: Option<u32>,
     project: F,
 ) -> Option<u32>
 where
@@ -727,6 +1004,7 @@ where
 
     let mut candidates: Vec<Cand> = entities
         .iter()
+        .filter(|e| Some(e.id) != self_id)
         .filter_map(|e| {
             // FFXI position → Bevy world: same mapping as `ffxi_to_bevy`.
             // Inlined here so we don't pull a Bevy dep into this fn for
@@ -745,14 +1023,19 @@ where
             if ndc.x.abs() > CYCLE_NDC_LIMIT || ndc.y.abs() > CYCLE_NDC_LIMIT {
                 return None;
             }
+            // 3D distance: server range checks use all three axes, so
+            // the cycle's "closeness" tiebreaker has to as well. On a
+            // slope, a 2D-closer mob can be several yalms farther in 3D
+            // and unreachable.
             let dx = e.pos.x - from.x;
             let dy = e.pos.y - from.y;
+            let dz = e.pos.z - from.z;
             let in_frustum = ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0;
             Some(Cand {
                 id: e.id,
                 ndc_x: ndc.x,
                 ndc_mag_sq: ndc.x * ndc.x + ndc.y * ndc.y,
-                dist_sq: dx * dx + dy * dy,
+                dist_sq: dx * dx + dy * dy + dz * dz,
                 in_frustum,
             })
         })
@@ -781,21 +1064,22 @@ where
         None => {
             // First press: prefer strictly-in-frustum entities; only fall
             // back to the relaxed set if nothing in-view qualifies. Among
-            // the preferred pool, pick the one nearest screen center
-            // (smallest NDC magnitude), breaking ties by world distance.
+            // the preferred pool, pick the lowest hybrid score —
+            // world distance (yalms) plus a screen-offset penalty. At
+            // NDC magnitude = 1 (entity at the frustum edge), the entity
+            // is treated as `NDC_PENALTY_YALMS` further than its true
+            // distance. This keeps Tab biased toward what's "in front
+            // of you" while still letting a close off-center mob beat
+            // a far centered one — the previous pure-NDC ranking would
+            // skip the near mob entirely.
             let any_strict = candidates.iter().any(|c| c.in_frustum);
             candidates
                 .iter()
                 .filter(|c| !any_strict || c.in_frustum)
                 .min_by(|a, b| {
-                    a.ndc_mag_sq
-                        .partial_cmp(&b.ndc_mag_sq)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| {
-                            a.dist_sq
-                                .partial_cmp(&b.dist_sq)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
+                    let sa = a.dist_sq.sqrt() + NDC_PENALTY_YALMS * a.ndc_mag_sq.sqrt();
+                    let sb = b.dist_sq.sqrt() + NDC_PENALTY_YALMS * b.ndc_mag_sq.sqrt();
+                    sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|c| c.id)
         }
@@ -808,6 +1092,14 @@ where
 /// that FFXI retail tabs to, without inviting entities that are clearly
 /// behind the camera or far peripheral.
 const CYCLE_NDC_LIMIT: f32 = 1.3;
+
+/// First-press off-center penalty (yalms). The Tab cycle's first-press
+/// score is `world_dist + NDC_PENALTY_YALMS * ndc_mag`; at the strict
+/// frustum edge (NDC magnitude = 1) an entity is treated as if it were
+/// 10 yalms further away than its true 3D distance. Picked to keep Tab
+/// biased toward what the player is looking at while still letting a
+/// close off-center mob beat a far centered one.
+const NDC_PENALTY_YALMS: f32 = 10.0;
 
 #[cfg(test)]
 mod tests {
@@ -874,43 +1166,94 @@ mod tests {
         // ndc.x = pos.x/100: entity 2 sits at 0.1, entity 3 at 0.2,
         // entity 1 at 0.3 — entity 2 is most centered.
         let entities = vec![ent(1, 30.0, 0.0), ent(2, 10.0, 0.0), ent(3, 20.0, 0.0)];
-        let next = cycle_target_viewport(&entities, from, None, fake_proj);
+        let next = cycle_target_viewport(&entities, from, None, None, fake_proj);
         assert_eq!(next, Some(2));
     }
 
     #[test]
-    fn first_press_prefers_screen_center_over_world_distance() {
-        // FFXI retail rule: Tab picks the most-centered visible entity,
-        // even when a less-centered one is closer in world space. With
-        // `fake_proj` (ndc.y forced to 0), an entity far along world-y
-        // still reads as on-axis on screen, which is what lets the two
-        // metrics genuinely disagree below.
+    fn cycle_excludes_self() {
+        // Self is in the wire entity list (matched by `self_char_id`).
+        // Tab must skip it on first press AND on subsequent cycle
+        // steps, otherwise the operator will land on their own model.
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        // Entity 99 is "self" at the player position; entities 1/2 are
+        // mobs slightly farther out.
+        let entities = vec![
+            ent(99, 0.0, 0.0),
+            ent(1, 10.0, 0.0),
+            ent(2, 20.0, 0.0),
+        ];
+        // First press: skips id=99 even though it's at ndc=0/dist=0;
+        // picks id=1 (next-closest in the filtered set).
+        assert_eq!(
+            cycle_target_viewport(&entities, from, None, Some(99), fake_proj),
+            Some(1)
+        );
+        // Cycling from id=1 wraps to id=2, never returning id=99.
+        assert_eq!(
+            cycle_target_viewport(&entities, from, Some(1), Some(99), fake_proj),
+            Some(2)
+        );
+        assert_eq!(
+            cycle_target_viewport(&entities, from, Some(2), Some(99), fake_proj),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn first_press_3d_distance_includes_altitude() {
+        // Two entities at identical (x, y) and identical NDC, distinguished
+        // only by FFXI z (altitude). The closer-in-3D one must win.
+        // Catches a 2D-distance regression in the first-press score.
+        let from = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        // Both project to the same NDC under `fake_proj` (z is ignored
+        // by that projector). Entity 1 is 5y above, entity 2 is 50y above.
+        let entities = vec![ent_xyz(1, 0.0, 0.0, 5.0), ent_xyz(2, 0.0, 0.0, 50.0)];
+        assert_eq!(
+            cycle_target_viewport(&entities, from, None, None, fake_proj),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn first_press_close_off_center_beats_far_centered() {
+        // Regression: the user-reported "Tab fails to select the closest
+        // mob" bug. Pure NDC-magnitude ranking would pick a far entity
+        // that happens to sit dead-center on screen over a much closer
+        // entity that's slightly off-axis. With the hybrid score
+        // (world_dist + NDC_PENALTY_YALMS * ndc_mag), the closer entity
+        // wins as long as the screen offset is reasonable.
         let from = WireVec3 {
             x: 0.0,
             y: 0.0,
             z: 0.0,
         };
         // fake_proj: ndc.x = pos.x/100, ndc.y = 0.
-        //   Entity 1 at (5, 30): ndc.x=0.05 (near-center on screen),
-        //                         world dist² = 925.
-        //   Entity 2 at (20, 5): ndc.x=0.20 (off-center on screen),
-        //                         world dist² = 425.
-        // Old behavior (world-distance): pick entity 2 (closer).
-        // New behavior (screen-center):  pick entity 1 (more centered).
+        //   Entity 1 at (5, 30): ndc=(0.05, 0), |ndc|=0.05.
+        //                         dist=√(25+900)=30.41, score=30.41+0.5=30.91
+        //   Entity 2 at (20, 5): ndc=(0.20, 0), |ndc|=0.20.
+        //                         dist=√(400+25)=20.62, score=20.62+2.0=22.62
+        // Hybrid: entity 2 wins (lower score). Closer in world reaches.
         let entities = vec![ent(1, 5.0, 30.0), ent(2, 20.0, 5.0)];
         assert_eq!(
-            cycle_target_viewport(&entities, from, None, fake_proj),
-            Some(1)
+            cycle_target_viewport(&entities, from, None, None, fake_proj),
+            Some(2)
         );
     }
 
     #[test]
-    fn first_press_uses_combined_ndc_magnitude() {
+    fn first_press_combined_ndc_and_world_distance() {
         // Entity high on the screen but horizontally centered should
-        // lose to a slightly-off-center entity that's near the screen
-        // origin overall. The vertical-on-screen axis (bevy-y) comes
-        // from FFXI pos.z via the (x, z, -y) conversion inside the
-        // cycle fn — so we vary z to control on-screen height.
+        // lose to a slightly-off-center entity that's much closer in
+        // world space (the hybrid score combines both signals).
         let from = WireVec3 {
             x: 0.0,
             y: 0.0,
@@ -918,13 +1261,15 @@ mod tests {
         };
         // xy_proj reads bevy.x, bevy.y → after conversion that's
         // (FFXI.x, FFXI.z).
-        //   Entity 1: FFXI (0, 0, 80)  → ndc=(0.00, 0.80), |ndc|²=0.64.
-        //   Entity 2: FFXI (15, 0, 15) → ndc=(0.15, 0.15), |ndc|²=0.045.
-        // Entity 2 wins on |ndc| even though its horizontal is farther
-        // off-center than entity 1's.
+        //   Entity 1: FFXI (0, 0, 80)  → ndc=(0.00, 0.80), |ndc|=0.80,
+        //                                 dist=80, score=80+8.0=88.
+        //   Entity 2: FFXI (15, 0, 15) → ndc=(0.15, 0.15), |ndc|=0.212,
+        //                                 dist=√(225+225)=21.2,
+        //                                 score=21.2+2.12=23.3.
+        // Entity 2 wins on combined score.
         let entities = vec![ent_xyz(1, 0.0, 0.0, 80.0), ent_xyz(2, 15.0, 0.0, 15.0)];
         assert_eq!(
-            cycle_target_viewport(&entities, from, None, xy_proj),
+            cycle_target_viewport(&entities, from, None, None, xy_proj),
             Some(2)
         );
     }
@@ -940,17 +1285,17 @@ mod tests {
         let entities = vec![ent(1, -50.0, 0.0), ent(2, 0.0, 0.0), ent(3, 50.0, 0.0)];
         // Starting from 1 (leftmost) → next is 2.
         assert_eq!(
-            cycle_target_viewport(&entities, from, Some(1), fake_proj),
+            cycle_target_viewport(&entities, from, Some(1), None, fake_proj),
             Some(2)
         );
         // From 2 → next is 3.
         assert_eq!(
-            cycle_target_viewport(&entities, from, Some(2), fake_proj),
+            cycle_target_viewport(&entities, from, Some(2), None, fake_proj),
             Some(3)
         );
         // From 3 → wraps to 1.
         assert_eq!(
-            cycle_target_viewport(&entities, from, Some(3), fake_proj),
+            cycle_target_viewport(&entities, from, Some(3), None, fake_proj),
             Some(1)
         );
     }
@@ -974,12 +1319,12 @@ mod tests {
         // Currently targeting entity 1; pressing Tab cycles to entity 2
         // (the slightly-out one) and skips entity 3 entirely.
         assert_eq!(
-            cycle_target_viewport(&entities, from, Some(1), wide_proj),
+            cycle_target_viewport(&entities, from, Some(1), None, wide_proj),
             Some(2)
         );
         // From entity 2, wrap back to entity 1 (entity 3 stays excluded).
         assert_eq!(
-            cycle_target_viewport(&entities, from, Some(2), wide_proj),
+            cycle_target_viewport(&entities, from, Some(2), None, wide_proj),
             Some(1)
         );
     }
@@ -1001,7 +1346,7 @@ mod tests {
         // Entity 1 wins because it's the only strict-in-frustum candidate.
         let entities = vec![ent(1, 45.0, 0.0), ent(2, 60.0, 0.0)];
         assert_eq!(
-            cycle_target_viewport(&entities, from, None, wide_proj),
+            cycle_target_viewport(&entities, from, None, None, wide_proj),
             Some(1)
         );
     }
@@ -1021,7 +1366,7 @@ mod tests {
         //   Entity 2: x=55 → ndc.x=1.10 (relaxed, more centered).
         let entities = vec![ent(1, 60.0, 0.0), ent(2, 55.0, 0.0)];
         assert_eq!(
-            cycle_target_viewport(&entities, from, None, wide_proj),
+            cycle_target_viewport(&entities, from, None, None, wide_proj),
             Some(2)
         );
     }
@@ -1035,10 +1380,10 @@ mod tests {
         };
         // entity 4 at x=100 will be culled by `culled_proj`.
         let entities = vec![ent(1, 0.0, 0.0), ent(4, 100.0, 0.0)];
-        let next = cycle_target_viewport(&entities, from, None, culled_proj);
+        let next = cycle_target_viewport(&entities, from, None, None, culled_proj);
         assert_eq!(next, Some(1));
         // From off-screen current → falls back to nearest visible.
-        let next = cycle_target_viewport(&entities, from, Some(4), culled_proj);
+        let next = cycle_target_viewport(&entities, from, Some(4), None, culled_proj);
         assert_eq!(next, Some(1));
     }
 
@@ -1051,13 +1396,13 @@ mod tests {
         };
         let entities: Vec<WireEntity> = vec![];
         assert_eq!(
-            cycle_target_viewport(&entities, from, None, fake_proj),
+            cycle_target_viewport(&entities, from, None, None, fake_proj),
             None
         );
         // All off-screen.
         let entities = vec![ent(1, 100.0, 0.0), ent(2, 200.0, 0.0)];
         assert_eq!(
-            cycle_target_viewport(&entities, from, None, culled_proj),
+            cycle_target_viewport(&entities, from, None, None, culled_proj),
             None
         );
     }
@@ -1071,7 +1416,7 @@ mod tests {
         };
         let entities = vec![ent(1, 30.0, 0.0), ent(99, 1000.0, 0.0)];
         // 99 not visible — should pick nearest visible (1).
-        let next = cycle_target_viewport(&entities, from, Some(99), culled_proj);
+        let next = cycle_target_viewport(&entities, from, Some(99), None, culled_proj);
         assert_eq!(next, Some(1));
     }
 }

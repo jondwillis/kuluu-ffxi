@@ -358,6 +358,27 @@ pub struct SessionState {
     /// account-wide.
     #[serde(default = "default_equipment")]
     pub equipment: [Option<EquippedRef>; EQUIPMENT_SLOTS],
+    /// Spell ids the character has learned, sorted ascending. Decoded
+    /// from `0x0AA MAGIC_DATA` (a 1024-bit packed bitset) at login
+    /// and on every spell-learned event. Empty until the first
+    /// `MAGIC_DATA` lands.
+    #[serde(default)]
+    pub spells_known: Vec<u16>,
+    /// Job-ability ids the character currently has, sorted ascending.
+    /// Decoded from the `JobAbilities[64]` sub-bitmap of
+    /// `0x0AC COMMAND_DATA`. Re-sent on job change.
+    #[serde(default)]
+    pub job_abilities_known: Vec<u16>,
+    /// Weapon-skill ids currently usable on the equipped weapon.
+    /// Decoded from the `WeaponSkills[64]` sub-bitmap of
+    /// `0x0AC COMMAND_DATA`.
+    #[serde(default)]
+    pub weaponskills_known: Vec<u16>,
+    /// Pet-ability / Blood-pact ids. Decoded from the
+    /// `PetAbilities[64]` sub-bitmap of `0x0AC COMMAND_DATA`. Only
+    /// non-empty for BST/SMN/PUP and similar jobs.
+    #[serde(default)]
+    pub pet_abilities_known: Vec<u16>,
 }
 
 /// Number of distinct equipment slots in retail FFXI. Indexed by
@@ -1021,6 +1042,18 @@ impl SessionState {
             AgentEvent::EquipCleared => {
                 self.equipment = [None; EQUIPMENT_SLOTS];
             }
+            AgentEvent::SpellsKnownUpdated { ids } => {
+                self.spells_known = ids.clone();
+            }
+            AgentEvent::CommandDataUpdated {
+                weapon_skills,
+                job_abilities,
+                pet_abilities,
+            } => {
+                self.weaponskills_known = weapon_skills.clone();
+                self.job_abilities_known = job_abilities.clone();
+                self.pet_abilities_known = pet_abilities.clone();
+            }
             // EventStart is the lean signal (event_id only); EventDialog
             // is its richer companion that fills in the dialog HUD state.
             // EventEnded clears the dialog. KeyRotated is internal-only.
@@ -1254,6 +1287,21 @@ pub enum AgentEvent {
     /// Reset all 16 equipment slots to empty. Decoded from
     /// `0x04F EQUIP_CLEAR` (sent before the per-slot flood on login).
     EquipCleared,
+    /// Decoded `0x0AA MAGIC_DATA` — character's full learned-spell
+    /// snapshot. The vec is pre-sorted ascending by spell id.
+    SpellsKnownUpdated {
+        ids: Vec<u16>,
+    },
+    /// Decoded `0x0AC COMMAND_DATA` — character's full
+    /// weapon-skill / job-ability / pet-ability snapshot. Each vec
+    /// is pre-sorted ascending. Traits are not surfaced (the HUD
+    /// doesn't render them; passive effects show up via 0x063
+    /// STATUS_ICONS).
+    CommandDataUpdated {
+        weapon_skills: Vec<u16>,
+        job_abilities: Vec<u16>,
+        pet_abilities: Vec<u16>,
+    },
     /// Reactor goal transitioned. Mirrored into
     /// `SessionState.current_goal` so renderers can show the active
     /// intent. Fires on every `handle_command` mutation and on the

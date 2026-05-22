@@ -1211,6 +1211,27 @@ fn handle_sub_packet(
                 });
             }
         }
+        op if op == s2c::MAGIC_DATA => {
+            // 0x0AA: 128-byte bitmap of learned spells. Collapse into
+            // a sorted `Vec<u16>` of ids the HUD can iterate.
+            if let Ok(m) = decode::MagicData::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::SpellsKnownUpdated {
+                    ids: m.known_ids(),
+                });
+            }
+        }
+        op if op == s2c::COMMAND_DATA => {
+            // 0x0AC: four bitmaps (WeaponSkills/JobAbilities/PetAbilities/Traits).
+            // Drop Traits — they're passive and surface via 0x063
+            // STATUS_ICONS instead of as menu rows.
+            if let Ok(c) = decode::CommandData::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::CommandDataUpdated {
+                    weapon_skills: decode::collect_set_bits(c.weapon_skills),
+                    job_abilities: decode::collect_set_bits(c.job_abilities),
+                    pet_abilities: decode::collect_set_bits(c.pet_abilities),
+                });
+            }
+        }
         _ => {
             // Surface unknown opcodes at debug level; not an error.
             tracing::trace!(

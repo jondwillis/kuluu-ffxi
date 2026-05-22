@@ -183,6 +183,10 @@ pub fn text_input_system(
     // keys here and by the wheel system in `hud::chat_panel`. Single
     // source of truth so both inputs stay in sync.
     mut chat_scroll: ResMut<ChatScroll>,
+    // Stage 2 Magic/Abilities menu rows. Snapshot-driven; rebuilt
+    // each frame by `hud::menu::refresh_dynamic_menu_rows`. Read-only
+    // here — handle_menu_key uses it for cursor bounds + Enter dispatch.
+    dynamic_menu: Res<ffxi_viewer_core::hud::menu::DynamicMenu>,
 ) {
     // Snapshot the inputs we need from the scene before mutating it
     // below (clones are cheap relative to the per-keystroke event
@@ -259,6 +263,9 @@ pub fn text_input_system(
                     &cmd_tx.0,
                     &mut keybinds_state,
                     &mut slash_writers.graphics,
+                    &dynamic_menu,
+                    current_target,
+                    self_pos,
                 ) {
                     *mode = next;
                 }
@@ -1103,6 +1110,23 @@ fn apply_slash_outcome(
         SlashOutcome::CopyToasts { n } => {
             apply_copy_toasts(n, scene_state);
         }
+        SlashOutcome::OpenMenu(kind) => {
+            // The actual InputMode mutation is performed by the caller
+            // (`apply_chat_action`) — see the `mode_override` peek
+            // above the dispatch call. This arm exists to keep the
+            // outcome enum match exhaustive without giving
+            // `apply_slash_outcome` an &mut InputMode parameter.
+            let label = match kind {
+                ffxi_viewer_core::MenuKind::Magic => "Magic",
+                ffxi_viewer_core::MenuKind::Abilities => "Abilities",
+                ffxi_viewer_core::MenuKind::Items => "Items",
+                ffxi_viewer_core::MenuKind::Equipment => "Equipment",
+                ffxi_viewer_core::MenuKind::Root => "Root",
+                ffxi_viewer_core::MenuKind::Config => "Config",
+                ffxi_viewer_core::MenuKind::Graphics => "Graphics",
+            };
+            push_system_chat_line(scene_state, format!("[menu] opened {label}"));
+        }
     }
 }
 
@@ -1601,6 +1625,9 @@ fn confirm_menu_at_cursor(
     cmd_tx: &Sender<AgentCommand>,
     keybinds_state: &mut KeybindsStateRes,
     graphics: &mut ffxi_viewer_core::GraphicsSettings,
+    dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
+    target_id: Option<u32>,
+    self_pos: ffxi_viewer_wire::Vec3,
 ) -> Option<InputMode> {
     let (kind, cursor) = {
         let level = stack.current()?;
@@ -1615,7 +1642,34 @@ fn confirm_menu_at_cursor(
         }
         return None;
     }
-    let label = ffxi_viewer_core::hud::menu::entry_label(kind, cursor);
+    // Dynamic submenus (Magic / Abilities): pull the row's pre-resolved
+    // DynamicMenuAction from the resource and dispatch directly. Same
+    // wire path as `/cast` / `/ja` / `/ws` — see slash_commands.rs
+    // `parse_cast` / `parse_job_ability` / `parse_weaponskill`.
+    if ffxi_viewer_core::hud::menu::is_dynamic(kind) {
+        if let Some(action) = ffxi_viewer_core::hud::menu::entry_action(kind, cursor, dynamic) {
+            // Clone the entities slice up front so the &mut scene_state
+            // borrow taken by the dispatcher doesn't overlap with the
+            // &snapshot.entities read.
+            let entities = scene_state.snapshot.entities.clone();
+            dispatch_dynamic_menu_action(
+                action,
+                target_id,
+                self_pos,
+                &entities,
+                cmd_tx,
+                scene_state,
+            );
+            return Some(InputMode::World);
+        }
+        // Empty list (no spells / no abilities) — just toast.
+        push_system_chat_line(
+            scene_state,
+            format!("[menu] {kind:?} list is empty"),
+        );
+        return None;
+    }
+    let label = ffxi_viewer_core::hud::menu::entry_label(kind, cursor, dynamic);
     match resolve_menu_entry(kind, label) {
         MenuDispatch::CommandWithToast { cmd, toast } => {
             if let Err(e) = cmd_tx.try_send(cmd) {
@@ -1642,6 +1696,110 @@ fn confirm_menu_at_cursor(
             push_system_chat_line(scene_state, format!("[menu] {label} — not implemented"));
             None
         }
+    }
+}
+
+/// Map a [`DynamicMenuAction`] onto the matching `ActionKind` and
+/// dispatch it on the agent channel. Mirrors the existing `/cast` /
+/// `/ja` / `/ws` slash-command flow so the menu path and the slash
+/// path stay in lockstep — both call into the same `Action` packet.
+///
+/// Target resolution:
+///   - Spells: current target if any, otherwise self (matches retail
+///     "Cure" → cast on self when no target is selected).
+///   - Job abilities: current target if any, else self.
+///   - Weapon skills: require a battle target — toast on miss rather
+///     than dispatching uselessly.
+///   - Pet abilities: routed via `JobAbility` (same packet path).
+fn dispatch_dynamic_menu_action(
+    action: ffxi_viewer_core::hud::menu::DynamicMenuAction,
+    target_id: Option<u32>,
+    self_pos: ffxi_viewer_wire::Vec3,
+    entities: &[ffxi_viewer_wire::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+    scene_state: &mut SceneState,
+) {
+    use ffxi_viewer_core::hud::menu::DynamicMenuAction as A;
+    let self_char_id = scene_state.snapshot.self_char_id;
+    let pick_target = |require: bool| -> Option<(u32, u16)> {
+        if let Some(id) = target_id {
+            if let Some(ent) = entities.iter().find(|e| e.id == id) {
+                return Some((ent.id, ent.act_index));
+            }
+        }
+        if require {
+            return None;
+        }
+        // Fallback to self for self-cast / self-buff abilities.
+        let me_id = self_char_id?;
+        let me = entities.iter().find(|e| e.id == me_id)?;
+        Some((me.id, me.act_index))
+    };
+
+    let (kind_name, cmd) = match action {
+        A::CastSpell { spell_id } => {
+            let Some((tid, tidx)) = pick_target(false) else {
+                push_system_chat_line(
+                    scene_state,
+                    "[menu] cast: no target and self not resolved yet".into(),
+                );
+                return;
+            };
+            (
+                "cast",
+                AgentCommand::Action {
+                    target_id: tid,
+                    target_index: tidx,
+                    kind: ActionKind::CastMagic {
+                        spell_id: spell_id as u32,
+                        pos_x: self_pos.x,
+                        pos_y: self_pos.y,
+                        pos_z: self_pos.z,
+                    },
+                },
+            )
+        }
+        A::JobAbility { ability_id } | A::PetAbility { ability_id } => {
+            let Some((tid, tidx)) = pick_target(false) else {
+                push_system_chat_line(scene_state, "[menu] ability: no target".into());
+                return;
+            };
+            (
+                "ability",
+                AgentCommand::Action {
+                    target_id: tid,
+                    target_index: tidx,
+                    kind: ActionKind::JobAbility {
+                        ability_id: ability_id as u32,
+                    },
+                },
+            )
+        }
+        A::Weaponskill { skill_id } => {
+            // Weapon skills only work on engaged enemies; require an
+            // explicit target rather than self-falling back (retail
+            // rejects /ws without a battle target too).
+            let Some((tid, tidx)) = pick_target(true) else {
+                push_system_chat_line(
+                    scene_state,
+                    "[menu] weaponskill: requires a battle target".into(),
+                );
+                return;
+            };
+            (
+                "weaponskill",
+                AgentCommand::Action {
+                    target_id: tid,
+                    target_index: tidx,
+                    kind: ActionKind::Weaponskill {
+                        skill_id: skill_id as u32,
+                    },
+                },
+            )
+        }
+    };
+    if let Err(e) = cmd_tx.try_send(cmd) {
+        push_system_chat_line(scene_state, format!("[menu] {kind_name} dropped: {e}"));
     }
 }
 
@@ -1707,9 +1865,11 @@ pub fn mouse_nav_dispatch_system(
     target: Res<Target>,
     mut scene_state: ResMut<SceneState>,
     mut graphics: ResMut<ffxi_viewer_core::GraphicsSettings>,
+    dynamic_menu: Res<ffxi_viewer_core::hud::menu::DynamicMenu>,
 ) {
     let entities = scene_state.snapshot.entities.clone();
     let current_target = target.id;
+    let self_pos = scene_state.snapshot.self_pos.pos;
 
     for ev in menu_events.read() {
         if let InputMode::Menu(stack) = &mut *mode {
@@ -1723,6 +1883,9 @@ pub fn mouse_nav_dispatch_system(
                 &cmd_tx.0,
                 &mut keybinds_state,
                 &mut graphics,
+                &dynamic_menu,
+                current_target,
+                self_pos,
             ) {
                 *mode = next;
             }
@@ -1773,6 +1936,9 @@ fn handle_menu_key(
     cmd_tx: &Sender<AgentCommand>,
     keybinds_state: &mut KeybindsStateRes,
     graphics: &mut ffxi_viewer_core::GraphicsSettings,
+    dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
+    target_id: Option<u32>,
+    self_pos: ffxi_viewer_wire::Vec3,
 ) -> Option<InputMode> {
     // Capture the active screen + cursor up front. `entry_count` and
     // `entry_label` both consult this — keeps the Root/Config branches
@@ -1781,7 +1947,7 @@ fn handle_menu_key(
         let level = stack.current()?;
         (level.kind, level.cursor)
     };
-    let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind);
+    let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind, dynamic);
 
     // Graphics-only Left/Right cycle. Up/Down still moves the cursor
     // row; Left/Right adjusts the value on the highlighted row.
@@ -1821,6 +1987,9 @@ fn handle_menu_key(
             cmd_tx,
             keybinds_state,
             graphics,
+            dynamic,
+            target_id,
+            self_pos,
         );
     }
     if bindings.matches_logical(Action::NavCancel, key) {

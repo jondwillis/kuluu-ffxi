@@ -208,6 +208,23 @@ pub mod s2c {
     pub const EQUIP_CLEAR: u16 = 0x04F;
     pub const EQUIP_LIST: u16 = 0x050;
     pub const GRAP_LIST: u16 = 0x051;
+    /// `GP_SERV_COMMAND_MAGIC_DATA` — 128-byte (1024-bit) bitmap of
+    /// learned spells, indexed by spell id. See
+    /// `vendor/server/src/map/packets/s2c/0x0aa_magic_data.h` and
+    /// `CCharEntity::m_SpellList` (`xi::bitset<1024>`). Sent once on
+    /// login and again on every spell-learned event.
+    pub const MAGIC_DATA: u16 = 0x0AA;
+    /// `GP_SERV_COMMAND_COMMAND_DATA` — 224 bytes: four bitmaps in
+    /// order (WeaponSkills[64], JobAbilities[64], PetAbilities[64],
+    /// Traits[32]). Each is a packed bitset where bit N indexes the
+    /// corresponding id-table. See
+    /// `vendor/server/src/map/packets/s2c/0x0ac_command_data.h`.
+    pub const COMMAND_DATA: u16 = 0x0AC;
+    /// `GP_SERV_COMMAND_ABIL_RECAST` — current cooldown snapshot for
+    /// up to 31 ability/recast groups + the mount recast. Used by
+    /// the HUD to grey out unavailable abilities and show
+    /// "X.Xs" overlays on Stage-2+ Abilities menu rows.
+    pub const ABIL_RECAST: u16 = 0x119;
     pub const ENTITY_UPDATE1: u16 = 0x067;
     pub const ENTITY_UPDATE2: u16 = 0x068;
     /// `GP_SERV_COMMAND_GROUP_LIST` — sent for OTHER party members

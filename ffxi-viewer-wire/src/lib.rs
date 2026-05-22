@@ -432,6 +432,26 @@ pub struct SceneSnapshot {
     /// `ffxi_proto::item_names::lookup` at render time.
     #[serde(default = "default_equipped")]
     pub equipped: [Option<u16>; 16],
+    /// Spell ids the character has learned, sorted ascending. The
+    /// HUD's Magic menu iterates this and looks each id up via
+    /// `ffxi_proto::spell_names::lookup`. Empty until the server
+    /// sends `0x0AA MAGIC_DATA` (once per login, again on every
+    /// spell-learned event). Stage 2.
+    #[serde(default)]
+    pub spells_known: Vec<u16>,
+    /// Job-ability ids the character currently has, sorted ascending.
+    /// Driven by the `JobAbilities` sub-bitmap of `0x0AC COMMAND_DATA`.
+    #[serde(default)]
+    pub job_abilities_known: Vec<u16>,
+    /// Weapon-skill ids currently usable. Driven by the
+    /// `WeaponSkills` sub-bitmap of `0x0AC COMMAND_DATA`.
+    #[serde(default)]
+    pub weaponskills_known: Vec<u16>,
+    /// Pet-ability / Blood-pact ids. Only non-empty for BST/SMN/PUP
+    /// and similar jobs. Driven by the `PetAbilities` sub-bitmap of
+    /// `0x0AC COMMAND_DATA`.
+    #[serde(default)]
+    pub pet_abilities_known: Vec<u16>,
 }
 
 fn default_equipped() -> [Option<u16>; 16] {

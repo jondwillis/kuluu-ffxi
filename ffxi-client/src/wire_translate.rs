@@ -81,6 +81,15 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         // Stage 1 doesn't distinguish, so the render shows "—" in
         // both cases.
         equipped: resolve_equipment(s),
+        // Stage 2: surface the learned-spell / known-ability /
+        // known-weaponskill / known-pet-ability mirrors directly.
+        // No translation needed — Vec<u16> on both sides — and the
+        // session-side fold (`apply_event`) already pre-sorts the
+        // vecs ascending by id.
+        spells_known: s.spells_known.clone(),
+        job_abilities_known: s.job_abilities_known.clone(),
+        weaponskills_known: s.weaponskills_known.clone(),
+        pet_abilities_known: s.pet_abilities_known.clone(),
     }
 }
 

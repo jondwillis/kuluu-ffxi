@@ -22,6 +22,7 @@ pub mod compass;
 pub mod death_prompt;
 pub mod diagnostics;
 pub mod dialog;
+pub mod entity_hover_card;
 pub mod llm_badge;
 pub mod logout_countdown;
 pub mod menu;
@@ -193,6 +194,10 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HudVerbosity>();
+        // Stage-2 Magic / Abilities menus pull from this resource;
+        // `refresh_dynamic_menu_rows` (registered below) rebuilds it
+        // every frame from the active SceneSnapshot mirrors.
+        app.init_resource::<menu::DynamicMenu>();
         app.init_resource::<chat_panel::ActiveChatTab>();
         app.init_resource::<llm_badge::BadgeClock>();
         app.init_resource::<mesh_debug::MeshHoverDebug>();
@@ -206,6 +211,13 @@ impl Plugin for HudPlugin {
         app.init_resource::<logout_countdown::LogoutCountdownAnchor>();
         app.init_resource::<logout_countdown::OptimisticLogoutCountdown>();
         app.add_message::<logout_countdown::LogoutRequested>();
+        // Mouse-driven menu/dialog/quick-action activation. The consumer
+        // (in `ffxi-client/src/view_native/text_input.rs`) reads these
+        // alongside the keyboard `KeyboardInput` stream so both paths
+        // share the same dispatch helpers.
+        app.add_message::<menu::MenuRowActivated>();
+        app.add_message::<dialog::DialogChoiceActivated>();
+        app.add_message::<quick_action::QuickActionActivated>();
         // Mouse-wheel scroll for the chat panel. Runs in `PreUpdate`
         // after `collect_mouse_system` so it can zero `MousePointer.wheel`
         // on consume — that's how camera-zoom is kept from double-firing
@@ -242,6 +254,15 @@ impl Plugin for HudPlugin {
                 ),
             ),
         );
+        // refresh_dynamic_menu_rows must run BEFORE update_main_menu
+        // so the renderer sees a fresh Magic / Abilities list instead
+        // of last frame's stale rows. The tuple above is at the
+        // 20-system cap so this hook goes in its own add_systems
+        // with an explicit .before() ordering.
+        app.add_systems(
+            Update,
+            menu::refresh_dynamic_menu_rows.before(menu::update_main_menu),
+        );
         // Second `add_systems` call: Bevy's `IntoScheduleConfigs` tuple
         // impls cap out at 20 entries, and the block above hit that
         // ceiling — adding a 21st entry trips the trait-bound error.
@@ -255,6 +276,22 @@ impl Plugin for HudPlugin {
         // the layout whenever a child's size changes (e.g. chat
         // auto-decay shrinks/grows `Node::height`).
         app.add_systems(Update, weather_icon::update_weather_icon);
+        app.add_systems(Update, entity_hover_card::update_entity_hover_card_system);
+        // Mouse-driven menu / dialog / quick-action systems. Each pair is
+        // (hover, click); hover follows mouse to sync cursor state with
+        // the visual highlight, click emits the activation message.
+        app.add_systems(
+            Update,
+            (
+                menu::menu_mouse_hover_system,
+                menu::menu_mouse_click_system,
+                dialog::update_dialog_choice_highlight_system,
+                dialog::dialog_mouse_hover_system,
+                dialog::dialog_mouse_click_system,
+                quick_action::quick_action_mouse_hover_system,
+                quick_action::quick_action_mouse_click_system,
+            ),
+        );
         // Combat pulse: detect-then-modulate, chained so the color
         // update sees the latched timestamp from the same frame. Both
         // must run every tick (no `is_changed` gate) — the flash decay
@@ -316,6 +353,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             death_prompt::spawn_death_prompt,
             logout_countdown::spawn_logout_countdown,
             mesh_debug::spawn_mesh_debug_hud,
+            entity_hover_card::spawn_entity_hover_card,
         ),
     );
     // Minimap, Vana clock, and weather icon all spawn as children of
