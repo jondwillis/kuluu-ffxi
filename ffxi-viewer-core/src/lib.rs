@@ -20,6 +20,7 @@ pub mod atmosphere;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod audio;
 pub mod camera;
+pub mod combat_stance;
 pub mod components;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_mmb;

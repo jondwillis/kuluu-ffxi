@@ -1290,18 +1290,54 @@ fn raw_dat_id_for_skeleton(raw: &std::sync::Arc<Skeleton>) -> u32 {
 /// each `bone_entities[i]`'s `Transform`. Bevy auto-composes
 /// `GlobalTransform`s along the hierarchy; the skinning shader then
 /// deforms vertices on the GPU.
+///
+/// Animation choice:
+/// - **Engaged** PCs (`wire_entity.bt_target_id != 0`) play the
+///   battle-idle MO2 from the race's motion DAT (see
+///   `crate::combat_stance`). Same signal `target_ring` uses for
+///   the red ring.
+/// - **Idle / NPCs** play the resting `idl` MO2 from their skeleton
+///   DAT.
+///
+/// Hard toggle, no crossfade yet — a one-frame snap into combat
+/// stance is acceptable on a turn-based MMO timing model. Crossfade
+/// is a future polish layer.
 pub fn tick_skinned_actors(
     time: Res<Time>,
-    q_actors: Query<&SkinnedActor>,
+    state: Res<crate::snapshot::SceneState>,
+    q_actors: Query<(&crate::components::WorldEntity, &SkinnedActor)>,
     mut q_bones: Query<&mut Transform>,
 ) {
     let elapsed = time.elapsed_secs();
-    for actor in &q_actors {
+    for (world, actor) in &q_actors {
         let Some(baked) = baked_skeleton_for_file(actor.dat_id) else {
             continue;
         };
         let Some(raw) = baked.raw else { continue };
-        let Some(anim) = idle_anim_for_file(actor.dat_id) else {
+
+        // Engaged when the wire entity owning this actor has a
+        // non-zero `bt_target_id`. `world.id` is the FFXI UniqueNo
+        // — same key the snapshot indexes on. If the entity has
+        // since dropped out of the snapshot (rare race during a
+        // despawn frame) we treat it as not-engaged.
+        let engaged = state
+            .snapshot
+            .entities
+            .iter()
+            .find(|e| e.id == world.id)
+            .map(|e| e.bt_target_id != 0)
+            .unwrap_or(false);
+
+        // Try battle-idle first when engaged; fall back to resting
+        // idle if the motion DAT lookup fails (NPCs, missing DAT,
+        // or `idl` chunk absent from the motion archive).
+        let anim = if engaged {
+            crate::combat_stance::battle_idle_anim_for_skel(actor.dat_id)
+                .or_else(|| idle_anim_for_file(actor.dat_id))
+        } else {
+            idle_anim_for_file(actor.dat_id)
+        };
+        let Some(anim) = anim else {
             continue;
         };
         if anim.frames == 0 {
