@@ -141,6 +141,14 @@ pub enum MenuKind {
     /// rows reflect actual equipped items; Stage 4 turns each slot row
     /// into a "pick from inventory" sub-submenu.
     Equipment,
+    /// Stage-4 sub-submenu pushed when an operator presses Enter on a
+    /// row in the Equipment menu. The contained byte is the SLOTTYPE
+    /// id (0=Main..15=Back) that's being filled — `refresh_dynamic_menu_rows`
+    /// filters the inventory bag by `equip_info::fits_slot` + job +
+    /// level so the rows only show items the operator can actually
+    /// equip there. Selecting a row dispatches `AgentCommand::Equip`;
+    /// Esc pops back to the Equipment menu.
+    EquipSlot(u8),
 }
 
 /// One frame of the menu navigation stack. `cursor` is the row currently

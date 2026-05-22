@@ -86,6 +86,16 @@ pub enum DynamicMenuAction {
         index: u8,
         item_no: u16,
     },
+    /// Equip an item from inventory into a specific equipment slot.
+    /// Dispatched as `AgentCommand::Equip` → c2s 0x050 EQUIP_SET.
+    /// `equip_slot` is the destination SLOTTYPE id (0..15); the
+    /// `container`/`index` pair points back at the source inventory
+    /// slot the server should pull from.
+    EquipItem {
+        container: u8,
+        container_index: u8,
+        equip_slot: u8,
+    },
 }
 
 /// Per-frame snapshot of the active dynamic submenu's rows + viewport
@@ -187,7 +197,10 @@ const MAX_ENTRY_COUNT: usize = {
 pub fn is_dynamic(kind: MenuKind) -> bool {
     matches!(
         kind,
-        MenuKind::Magic | MenuKind::Abilities | MenuKind::Items
+        MenuKind::Magic
+            | MenuKind::Abilities
+            | MenuKind::Items
+            | MenuKind::EquipSlot(_)
     )
 }
 
@@ -237,6 +250,7 @@ fn empty_dynamic_hint(kind: MenuKind) -> &'static str {
         MenuKind::Magic => "(no spells learned yet)",
         MenuKind::Abilities => "(no abilities available — wrong job?)",
         MenuKind::Items => "(inventory empty)",
+        MenuKind::EquipSlot(_) => "(no equippable items for this slot)",
         _ => "(empty)",
     }
 }
@@ -257,6 +271,10 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
         // `SceneSnapshot.equipped[i]` — the slot-name slice gives the
         // cursor + count, the snapshot gives the right column.
         MenuKind::Equipment => EQUIPMENT_ENTRIES,
+        // Stage 4 EquipSlot is dynamic; the static fallback only
+        // surfaces when the dynamic resource hasn't been populated,
+        // and serves as a "go back" hint.
+        MenuKind::EquipSlot(_) => &["(loading equippable items…)"],
     }
 }
 
@@ -417,6 +435,50 @@ pub fn refresh_dynamic_menu_rows(
                 })
             })
             .collect(),
+        MenuKind::EquipSlot(equip_slot) => {
+            // Resolve the operator's current job + level from the party
+            // mirror (self row matches `self_char_id`). Stage-4 filter:
+            // (slot fits) AND (job fits, when job is known) AND
+            // (item level ≤ char level, when level is known). When
+            // the job/level isn't resolved yet, fall back to the
+            // slot-fits-only filter so the menu still works pre-LOGIN.
+            let (main_job, main_lv) = snap
+                .self_char_id
+                .and_then(|id| snap.party.iter().find(|m| m.id == id))
+                .map(|m| (m.main_job, m.main_job_lv))
+                .unwrap_or((0, 0));
+            snap.inventory_main
+                .iter()
+                .filter_map(|slot| {
+                    let info = ffxi_proto::equip_info::lookup(slot.item_no)?;
+                    if !ffxi_proto::equip_info::fits_slot(&info, equip_slot) {
+                        return None;
+                    }
+                    if main_job != 0
+                        && !ffxi_proto::equip_info::fits_job(&info, main_job)
+                    {
+                        return None;
+                    }
+                    if main_lv != 0 && info.level > main_lv {
+                        return None;
+                    }
+                    let name = ffxi_proto::item_names::lookup(slot.item_no)?;
+                    let label = if info.level > 0 {
+                        format!("{name} (Lv{})", info.level)
+                    } else {
+                        name.to_string()
+                    };
+                    Some(DynamicMenuRow {
+                        label,
+                        action: DynamicMenuAction::EquipItem {
+                            container: slot.container,
+                            container_index: slot.index,
+                            equip_slot,
+                        },
+                    })
+                })
+                .collect()
+        }
         _ => Vec::new(),
     };
     // Sort alphabetically within a category by label — retail does

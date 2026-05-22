@@ -1002,6 +1002,7 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         RequestZoneChange { .. } => "request_zone_change",
         MogHouseExit { .. } => "mog_house_exit",
         UseItem { .. } => "use_item",
+        Equip { .. } => "equip",
         BankWhenFull { .. } => "bank_when_full",
         CheckTarget { .. } => "check_target",
         ShopBuy { .. } => "shop_buy",

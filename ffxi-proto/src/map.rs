@@ -27,6 +27,14 @@ pub mod c2s {
     /// Body: `u32 ItemNum (qty), u16 ShopNo, u16 ShopItemIndex, u8 PropertyItemIndex, u8 pad[3]`.
     /// See `vendor/server/src/map/packets/c2s/0x083_shop_buy.h`.
     pub const SHOP_BUY: u16 = 0x083;
+    /// `GP_CLI_COMMAND_EQUIP_SET` — equip a single item. Body:
+    /// `u8 PropertyItemIndex, u8 EquipKind, u8 Category` = 3 bytes
+    /// (size_words=2 with one padding byte). See
+    /// `vendor/server/src/map/packets/c2s/0x050_equip_set.h`.
+    /// PropertyItemIndex is the source-container slot index;
+    /// EquipKind is the SLOTTYPE id (0=Main..15=Back); Category is
+    /// the source container id (0=Inventory, 8..=Wardrobes…).
+    pub const EQUIP_SET: u16 = 0x050;
     /// `GP_CLI_COMMAND_REQLOGOUT` — request `/logout` (return to char-select)
     /// or `/shutdown` (exit game). Body: `u16 Mode, u16 Kind` = 4 bytes
     /// (size_words=2). The server applies `EFFECT_LEAVEGAME` (5s tick

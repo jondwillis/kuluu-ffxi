@@ -20,6 +20,7 @@ pub mod skill_names;
 pub mod spell_names;
 pub mod ability_names;
 pub mod item_names;
+pub mod equip_info;
 pub mod status_names;
 pub mod job_names;
 pub mod zlib;

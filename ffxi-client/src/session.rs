@@ -1685,6 +1685,32 @@ async fn keepalive_loop(
                         }
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
+                    Some(AgentCommand::Equip {
+                        container,
+                        container_index,
+                        equip_slot,
+                    }) => {
+                        // 0x050 GP_CLI_COMMAND_EQUIP_SET. Wire payload is
+                        // 3 bytes (PropertyItemIndex, EquipKind, Category)
+                        // — see `vendor/server/src/map/packets/c2s/0x050_equip_set.h`.
+                        let payload = build_subpacket_equip_set(
+                            sub_seq,
+                            container_index,
+                            equip_slot,
+                            container,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "equip_set send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("equip_set send: {e}"),
+                            });
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
+                    }
                     Some(AgentCommand::UseItem {
                         container,
                         slot,
@@ -3374,6 +3400,35 @@ pub fn build_subpacket_item_use(
     buf[14] = slot;
     // buf[15] = padding00 stays 0
     buf[16..20].copy_from_slice(&(category as u32).to_le_bytes());
+    buf
+}
+
+/// `GP_CLI_COMMAND_EQUIP_SET` (c2s 0x050) — equip one item from
+/// inventory to a specific equipment slot. 4-byte sub-packet header +
+/// 3 data bytes (PropertyItemIndex, EquipKind, Category) + 1 padding
+/// byte to word-align = 8 bytes (size_words=2). Mirror of
+/// `vendor/server/src/map/packets/c2s/0x050_equip_set.h`.
+///
+/// The s2c 0x050 EQUIP_LIST that comes back as confirmation has the
+/// same three-field shape; Stage 1's decoder folds it into
+/// `SessionState.equipment`, so a successful equip is visible in the
+/// HUD on the next snapshot tick.
+pub fn build_subpacket_equip_set(
+    sync: u16,
+    container_index: u8,
+    equip_slot: u8,
+    container: u8,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::EQUIP_SET,
+        2,
+        sync,
+    ));
+    buf[4] = container_index;
+    buf[5] = equip_slot;
+    buf[6] = container;
+    // buf[7] padding stays 0
     buf
 }
 

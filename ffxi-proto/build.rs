@@ -18,6 +18,7 @@ const LSB_JOB_NAME_LUA: &str = "../vendor/server/scripts/enum/job_name.lua";
 const LSB_SPELL_LIST_SQL: &str = "../vendor/server/sql/spell_list.sql";
 const LSB_ABILITIES_SQL: &str = "../vendor/server/sql/abilities.sql";
 const LSB_ITEM_BASIC_SQL: &str = "../vendor/server/sql/item_basic.sql";
+const LSB_ITEM_EQUIPMENT_SQL: &str = "../vendor/server/sql/item_equipment.sql";
 const SUBKEY_LEN: usize = 4168;
 
 fn main() -> Result<()> {
@@ -32,6 +33,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed={LSB_SPELL_LIST_SQL}");
     println!("cargo:rerun-if-changed={LSB_ABILITIES_SQL}");
     println!("cargo:rerun-if-changed={LSB_ITEM_BASIC_SQL}");
+    println!("cargo:rerun-if-changed={LSB_ITEM_EQUIPMENT_SQL}");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR not set")?);
 
@@ -222,6 +224,118 @@ fn main() -> Result<()> {
         item_entries.len(),
     );
 
+    // Equip-info: per-item filter metadata for the HUD's
+    // equip-from-inventory picker (Stage 4). Columns of interest from
+    // `item_equipment` (CREATE TABLE order: itemId, name, level, ilevel,
+    // jobs, MId, shieldSize, scriptType, slot, rslot, rslotlook,
+    // su_level):
+    //   0 itemId    u16
+    //   2 level     u8 (cap at 99)
+    //   4 jobs      u32 (1-bit-per-job bitmap; bit 0 = NONE-job sentinel,
+    //                    bits 1..22 = WAR..GEO)
+    //   8 slot      u16 (1-bit-per-equip-slot bitmap matching SLOTTYPE)
+    // We don't need rslot / rslotlook / scriptType / ilevel for the
+    // basic "what fits in this slot for this job at this level" check.
+    let equip_src = fs::read_to_string(LSB_ITEM_EQUIPMENT_SQL)
+        .with_context(|| format!("reading {LSB_ITEM_EQUIPMENT_SQL}"))?;
+    let equip_entries = parse_sql_equip_rows(&equip_src)?;
+    write_equip_info_table(&out_dir.join("equip_info_table.rs"), &equip_entries)?;
+    println!(
+        "cargo:warning=ffxi-proto: scraped {} equip_info entries",
+        equip_entries.len(),
+    );
+
+    Ok(())
+}
+
+/// One row from `item_equipment` — the four fields the HUD's
+/// equip-from-inventory picker reads.
+#[derive(Debug, Clone, Copy)]
+struct EquipRow {
+    item_id: u16,
+    level: u8,
+    jobs_mask: u32,
+    slot_mask: u16,
+}
+
+/// Specialized scrape for `item_equipment` rows. The existing
+/// `parse_sql_insert_rows` returns `(u32 id, String name)` pairs only;
+/// equip metadata is four fixed-position numeric columns so we walk
+/// the file with the same tuple/field splitters but emit `EquipRow`.
+fn parse_sql_equip_rows(src: &str) -> Result<Vec<EquipRow>> {
+    let needle = "INSERT INTO `item_equipment` VALUES ";
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix(needle) else {
+            continue;
+        };
+        let mut cursor = rest;
+        while let Some(open) = cursor.find('(') {
+            cursor = &cursor[open + 1..];
+            let Some((tuple, after)) = split_sql_tuple(cursor) else {
+                break;
+            };
+            cursor = after;
+            let fields = split_sql_fields(tuple);
+            let Some(row) = parse_equip_row(&fields) else {
+                continue;
+            };
+            out.push(row);
+        }
+    }
+    if out.is_empty() {
+        bail!(
+            "parsed zero rows from `INSERT INTO item_equipment` — \
+             SQL format may have changed"
+        );
+    }
+    // Sort + dedupe by item_id so the generated table is a binary-
+    // searchable strictly-increasing array. Duplicate item_ids would
+    // indicate a SQL ordering bug; keep the first.
+    out.sort_by_key(|e| e.item_id);
+    out.dedup_by_key(|e| e.item_id);
+    Ok(out)
+}
+
+fn parse_equip_row(fields: &[&str]) -> Option<EquipRow> {
+    let item_id: u16 = fields.first()?.trim().parse().ok()?;
+    // level column 2; clamp at u8::MAX so an exotic super-high level
+    // (capped at 99 in retail) round-trips to a sane byte.
+    let level: u8 = fields.get(2)?.trim().parse::<u16>().ok()?.min(255) as u8;
+    let jobs_mask: u32 = fields.get(4)?.trim().parse().ok()?;
+    let slot_mask: u16 = fields.get(8)?.trim().parse().ok()?;
+    Some(EquipRow {
+        item_id,
+        level,
+        jobs_mask,
+        slot_mask,
+    })
+}
+
+/// Emit a sorted `&[(u16 item_id, u8 level, u32 jobs_mask, u16 slot_mask)]`
+/// const, plus a `include!()`-able header so the consumer module can
+/// wrap it in an `EquipInfo` struct without redefining each field.
+fn write_equip_info_table(out_path: &PathBuf, entries: &[EquipRow]) -> Result<()> {
+    use std::io::Write;
+    let mut f = fs::File::create(out_path)
+        .with_context(|| format!("creating {}", out_path.display()))?;
+    writeln!(
+        f,
+        "// Auto-generated from {LSB_ITEM_EQUIPMENT_SQL} by build.rs — do not edit."
+    )?;
+    writeln!(
+        f,
+        "pub static EQUIP_INFO: &[(u16, u8, u32, u16)] = &["
+    )?;
+    for row in entries {
+        writeln!(
+            f,
+            "    ({}, {}, {}, {}),",
+            row.item_id, row.level, row.jobs_mask, row.slot_mask
+        )?;
+    }
+    writeln!(f, "];")?;
     Ok(())
 }
 

@@ -1491,6 +1491,19 @@ pub enum AgentCommand {
         target_id: u32,
         target_index: u16,
     },
+    /// `GP_CLI_COMMAND_EQUIP_SET` (c2s 0x050) — equip one item from
+    /// inventory into a specific equipment slot. The server validates
+    /// job/level/slot eligibility and pushes the resulting
+    /// `0x050 EQUIP_LIST` back to the client (which our Stage-1
+    /// decoder folds into `SessionState.equipment`).
+    Equip {
+        /// Source-container id (typically 0=Inventory; 8..=Wardrobes).
+        container: u8,
+        /// Slot index inside the source container.
+        container_index: u8,
+        /// `SLOTTYPE` destination (0=Main..15=Back).
+        equip_slot: u8,
+    },
     /// Reactor goal: monitor inventory; when any non-mog container reaches
     /// `threshold` slots filled, request a zone change to `mog_house_zoneline`.
     /// Survives reconnects via `goal_store`. One-shot per banking cycle —

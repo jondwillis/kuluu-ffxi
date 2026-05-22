@@ -1642,6 +1642,18 @@ fn confirm_menu_at_cursor(
         }
         return None;
     }
+    // Equipment-row Enter → push the EquipSlot sub-submenu that
+    // filters inventory to items valid for `cursor` slot. The
+    // dynamic-menu refresh system rebuilds the rows on the next
+    // tick; we don't dispatch any wire packet here.
+    if matches!(kind, MenuKind::Equipment) {
+        // SLOTTYPE values are bounded by 0..16 — EQUIPMENT_ENTRIES
+        // is exactly 16 rows so a cursor out of range can't reach
+        // here, but clamp defensively just in case.
+        let slot = (cursor as u8).min(15);
+        stack.push(MenuKind::EquipSlot(slot));
+        return None;
+    }
     // Dynamic submenus (Magic / Abilities): pull the row's pre-resolved
     // DynamicMenuAction from the resource and dispatch directly. Same
     // wire path as `/cast` / `/ja` / `/ws` — see slash_commands.rs
@@ -1815,6 +1827,26 @@ fn dispatch_dynamic_menu_action(
                     item_no: item_no as u32,
                     target_id: tid,
                     target_index: tidx,
+                },
+            )
+        }
+        A::EquipItem {
+            container,
+            container_index,
+            equip_slot,
+        } => {
+            // Equip is a 3-byte c2s 0x050 with no target — the source
+            // inventory slot + destination equipment slot are the only
+            // bindings. Server pushes back a matching s2c 0x050
+            // EQUIP_LIST that Stage 1's decoder folds into
+            // `SessionState.equipment`, so the Equipment menu's
+            // display refreshes on the next snapshot tick.
+            (
+                "equip",
+                AgentCommand::Equip {
+                    container,
+                    container_index,
+                    equip_slot,
                 },
             )
         }
