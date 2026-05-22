@@ -452,6 +452,26 @@ pub struct SceneSnapshot {
     /// `0x0AC COMMAND_DATA`.
     #[serde(default)]
     pub pet_abilities_known: Vec<u16>,
+    /// Flat view of the operator's main Inventory bag (container 0)
+    /// projected from `SessionState.inventory.containers[0]`. The
+    /// HUD's Items menu (Stage 3) iterates this directly; deeper
+    /// containers (Safe, Storage, Wardrobe, …) aren't surfaced
+    /// because the in-game "Items" menu is inventory-only too.
+    /// Empty until the first `ITEM_LIST` slot lands.
+    #[serde(default)]
+    pub inventory_main: Vec<InventoryItem>,
+}
+
+/// One slot of the main Inventory bag — the wire shape the HUD's
+/// Items menu reads. `container` is always 0 today (only the main
+/// bag is projected) but the field is kept explicit so a future
+/// expansion to multi-bag display doesn't change the wire schema.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InventoryItem {
+    pub container: u8,
+    pub index: u8,
+    pub item_no: u16,
+    pub quantity: u32,
 }
 
 fn default_equipped() -> [Option<u16>; 16] {

@@ -90,7 +90,31 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         job_abilities_known: s.job_abilities_known.clone(),
         weaponskills_known: s.weaponskills_known.clone(),
         pet_abilities_known: s.pet_abilities_known.clone(),
+        // Stage 3: flat projection of the main Inventory bag.
+        // Empty when the inventory mirror hasn't been initialised
+        // yet (zone-in flood hasn't started).
+        inventory_main: project_inventory_main(s),
     }
+}
+
+/// Pull container 0 (main Inventory bag) out of the session's
+/// inventory mirror as a flat `Vec<InventoryItem>` for the HUD.
+/// Other containers (Safe, Storage, Wardrobe, …) aren't projected
+/// because the in-game Items menu is inventory-only — the operator
+/// can't use items directly from a Mog House safe.
+fn project_inventory_main(s: &SessionState) -> Vec<wire::InventoryItem> {
+    let Some(bag) = s.inventory.containers.get(&0) else {
+        return Vec::new();
+    };
+    bag.slots
+        .iter()
+        .map(|slot| wire::InventoryItem {
+            container: 0,
+            index: slot.index,
+            item_no: slot.item_no,
+            quantity: slot.quantity,
+        })
+        .collect()
 }
 
 /// Project `SessionState.equipment` (container-relative references)

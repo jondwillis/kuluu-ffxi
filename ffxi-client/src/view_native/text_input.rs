@@ -1797,6 +1797,27 @@ fn dispatch_dynamic_menu_action(
                 },
             )
         }
+        A::UseItem {
+            container,
+            index,
+            item_no,
+        } => {
+            // Default target = self for consumables (potions, scrolls);
+            // current target wins if set. Future Stage 5 with the
+            // `<st>` picker can refine offensive items like Soultrappers
+            // to require a battle target.
+            let (tid, tidx) = pick_target(false).unwrap_or((0, 0));
+            (
+                "useitem",
+                AgentCommand::UseItem {
+                    container,
+                    slot: index,
+                    item_no: item_no as u32,
+                    target_id: tid,
+                    target_index: tidx,
+                },
+            )
+        }
     };
     if let Err(e) = cmd_tx.try_send(cmd) {
         push_system_chat_line(scene_state, format!("[menu] {kind_name} dropped: {e}"));

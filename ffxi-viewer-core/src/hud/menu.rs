@@ -77,6 +77,15 @@ pub enum DynamicMenuAction {
     /// 0x1A action packet with the pet's ability id); refine if a
     /// future split is needed.
     PetAbility { ability_id: u16 },
+    /// Use an inventory item. Dispatched as `AgentCommand::UseItem`
+    /// (not `Action`) — items use packet 0x37 ITEM_USE, not 0x1A.
+    /// Target defaults to self for consumables; the dispatcher
+    /// substitutes the current target when present.
+    UseItem {
+        container: u8,
+        index: u8,
+        item_no: u16,
+    },
 }
 
 /// Per-frame snapshot of the active dynamic submenu's rows + viewport
@@ -176,7 +185,10 @@ const MAX_ENTRY_COUNT: usize = {
 /// router uses this to decide whether to clamp against the
 /// resource-driven count or the static-slice count.
 pub fn is_dynamic(kind: MenuKind) -> bool {
-    matches!(kind, MenuKind::Magic | MenuKind::Abilities)
+    matches!(
+        kind,
+        MenuKind::Magic | MenuKind::Abilities | MenuKind::Items
+    )
 }
 
 /// Number of entries on the named menu screen. For static menus this
@@ -224,6 +236,7 @@ fn empty_dynamic_hint(kind: MenuKind) -> &'static str {
     match kind {
         MenuKind::Magic => "(no spells learned yet)",
         MenuKind::Abilities => "(no abilities available — wrong job?)",
+        MenuKind::Items => "(inventory empty)",
         _ => "(empty)",
     }
 }
@@ -380,6 +393,30 @@ pub fn refresh_dynamic_menu_rows(
             }));
             out
         }
+        MenuKind::Items => snap
+            .inventory_main
+            .iter()
+            .filter_map(|slot| {
+                let name = ffxi_proto::item_names::lookup(slot.item_no)?;
+                // Show quantity for stackable items (qty > 1) so the
+                // operator can see at-a-glance whether they have
+                // multiple Echo Drops to spare. Single-quantity items
+                // render bare to match retail's compact look.
+                let label = if slot.quantity > 1 {
+                    format!("{name} x{}", slot.quantity)
+                } else {
+                    name.to_string()
+                };
+                Some(DynamicMenuRow {
+                    label,
+                    action: DynamicMenuAction::UseItem {
+                        container: slot.container,
+                        index: slot.index,
+                        item_no: slot.item_no,
+                    },
+                })
+            })
+            .collect(),
         _ => Vec::new(),
     };
     // Sort alphabetically within a category by label — retail does
