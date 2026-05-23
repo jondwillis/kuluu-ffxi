@@ -32,13 +32,18 @@ map=(
   'ffxi-viewer-core/src/hud/dialog\.rs$=>NPC dialogue'
   'ffxi-viewer-core/src/hud/quick_action\.rs$=>Quick-action bar'
   'ffxi-viewer-core/src/audio\.rs$=>(Music playback|Sound effects)'
-  'ffxi-viewer-core/src/minimap/.*\.rs$=>Minimap'
+  'ffxi-viewer-core/src/minimap/.*\.rs$=>(minimap|compass)'
   'ffxi-viewer-core/src/nameplate.*\.rs$=>Nameplate billboards'
-  'ffxi-viewer-core/src/(sun_moon|skybox|weather|weather_fx)\.rs$=>Sky'
+  'ffxi-viewer-core/src/skybox\.rs$=>Skybox'
+  'ffxi-viewer-core/src/sun_moon\.rs$=>Sun \+ moon'
+  'ffxi-viewer-core/src/(weather|weather_fx)\.rs$=>Weather'
+  'ffxi-viewer-core/src/scene\.rs$=>Zone geometry'
+  'ffxi-viewer-core/src/dat_mzb\.rs$=>Zone geometry'
+  'ffxi-dat/src/dat_mzb\.rs$=>Zone geometry'
   'ffxi-client/src/view_native/camera_collision\.rs$=>Chase camera'
   'ffxi-client/src/launcher\.rs$=>Character (create|delete) flow'
   'ffxi-proto/src/.*\.rs$=>opcode'
-  'ffxi-client/src/reactor\.rs$=>action dispatch'
+  'ffxi-client/src/reactor\.rs$=>[Aa]ction dispatch'
 )
 
 feature=""
