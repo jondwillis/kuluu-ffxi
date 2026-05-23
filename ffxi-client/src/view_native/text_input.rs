@@ -692,6 +692,10 @@ fn apply_slash_outcome(
                 push_system_chat_line(scene_state, line.to_string());
             }
         }
+        SlashOutcome::SetWeatherClient(w) => {
+            scene_state.snapshot.weather = Some(w);
+            push_system_chat_line(scene_state, format!("weather override: {w:?}"));
+        }
         SlashOutcome::SetSitStance(toggle) => {
             use ffxi_viewer_core::combat_stance::RestKind;
             use crate::view_native::slash_commands::SitToggle;

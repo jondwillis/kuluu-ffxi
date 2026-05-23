@@ -158,6 +158,66 @@ pub struct ChatTabButton {
 #[derive(Component)]
 pub struct ChatTabButtonLabel;
 
+/// Auto-switch the active tab to whichever panel just received a new
+/// message. On by default — toggleable from the in-HUD button next to
+/// the tab bar. When off, the [`ChatUnread`] indicator still surfaces
+/// activity without yanking focus.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct ChatAutoSwitch(pub bool);
+
+impl Default for ChatAutoSwitch {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+/// Per-tab unread flag. Set when a new message lands on an inactive
+/// panel; cleared when that panel becomes active (regardless of how it
+/// became active — auto-switch or manual click).
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct ChatUnread {
+    pub social: bool,
+    pub battle: bool,
+    pub debug: bool,
+}
+
+impl ChatUnread {
+    pub fn get(&self, kind: ChatKind) -> bool {
+        match kind {
+            ChatKind::Social => self.social,
+            ChatKind::Battle => self.battle,
+            ChatKind::Debug => self.debug,
+        }
+    }
+    pub fn set(&mut self, kind: ChatKind, value: bool) {
+        match kind {
+            ChatKind::Social => self.social = value,
+            ChatKind::Battle => self.battle = value,
+            ChatKind::Debug => self.debug = value,
+        }
+    }
+}
+
+/// Per-kind filtered-line counts from the previous tick. Diffed against
+/// the current snapshot to detect "new message landed on tab X" without
+/// piggybacking on [`ChatPanelDecay`] (which is a per-panel `Component`
+/// and inconvenient to read from a tab-level system).
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct ChatActivityTracker {
+    pub social: usize,
+    pub battle: usize,
+    pub debug: usize,
+}
+
+/// Marker on the auto-switch toggle button next to the tab bar.
+#[derive(Component)]
+pub struct ChatAutoSwitchToggle;
+
+/// Marker on the toggle button's text label so the visuals system can
+/// retint/relabel it without re-querying children.
+#[derive(Component)]
+pub struct ChatAutoSwitchLabel;
+
 impl ChatKind {
     /// Does a given channel render in this panel?
     ///
@@ -257,6 +317,38 @@ pub fn spawn_chat_tab_bar_as_child(p: &mut ChildSpawnerCommands) {
         spawn_tab_button(p, ChatKind::Social, "Chat", true);
         spawn_tab_button(p, ChatKind::Battle, "Battle", false);
         spawn_tab_button(p, ChatKind::Debug, "System", false);
+        spawn_auto_switch_toggle(p);
+    });
+}
+
+/// Small toggle button rendered after the three tab buttons. Reads "auto
+/// ✓" when [`ChatAutoSwitch`] is on, "auto ✗" when off. Clicking flips
+/// the resource; the visuals system rewrites the label.
+fn spawn_auto_switch_toggle(p: &mut ChildSpawnerCommands) {
+    p.spawn((
+        Button,
+        ChatAutoSwitchToggle,
+        Node {
+            padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            // Slight gap so the toggle reads as a separate affordance
+            // from the tab triplet.
+            margin: UiRect::left(Val::Px(6.0)),
+            ..default()
+        },
+        BackgroundColor(palette::BACKGROUND),
+        BorderColor::all(palette::BORDER),
+    ))
+    .with_children(|btn| {
+        btn.spawn((
+            ChatAutoSwitchLabel,
+            Text::new("auto \u{2713}"),
+            TextFont {
+                font_size: 12.0,
+                ..default()
+            },
+            TextColor(palette::ACCENT),
+        ));
     });
 }
 
@@ -776,21 +868,110 @@ pub fn chat_tab_click_system(
     }
 }
 
+/// React to clicks on the [`ChatAutoSwitchToggle`] — flip
+/// [`ChatAutoSwitch`]. The visuals system rewrites the label/colors on
+/// the next frame; no need to mutate the label here.
+pub fn chat_auto_switch_click_system(
+    interactions: Query<&Interaction, (Changed<Interaction>, With<ChatAutoSwitchToggle>)>,
+    mut auto: ResMut<ChatAutoSwitch>,
+) {
+    for interaction in &interactions {
+        if *interaction == Interaction::Pressed {
+            auto.0 = !auto.0;
+        }
+    }
+}
+
+/// Detect new messages per panel and update [`ChatUnread`] / optionally
+/// flip [`ActiveChatTab`]. Diffs the current per-kind filtered count
+/// against [`ChatActivityTracker`]; growth on an inactive tab marks it
+/// unread, and (if [`ChatAutoSwitch`] is on) promotes that tab to
+/// active.
+///
+/// When multiple tabs grow on the same tick, auto-switch picks the
+/// last one in `Social → Battle → Debug` iteration order. That's
+/// arbitrary but deterministic; in practice the operator's intent is
+/// "show me whatever just made noise" and either of the simultaneous
+/// tabs satisfies that.
+///
+/// The active tab's unread flag is always cleared as a post-step — so
+/// a manual tab click (handled by [`chat_tab_click_system`] earlier in
+/// the schedule) gets its dot cleared the same frame.
+pub fn chat_auto_switch_and_unread_system(
+    state: Res<SceneState>,
+    auto: Res<ChatAutoSwitch>,
+    mut active: ResMut<ActiveChatTab>,
+    mut unread: ResMut<ChatUnread>,
+    mut tracker: ResMut<ChatActivityTracker>,
+) {
+    let all = rendered_chat(&state);
+    let count = |kind: ChatKind| all.iter().filter(|l| kind.accepts(l.channel)).count();
+    let kinds = [
+        (ChatKind::Social, count(ChatKind::Social), tracker.social),
+        (ChatKind::Battle, count(ChatKind::Battle), tracker.battle),
+        (ChatKind::Debug, count(ChatKind::Debug), tracker.debug),
+    ];
+    let mut to_switch: Option<ChatKind> = None;
+    for (kind, now_count, prev_count) in kinds {
+        if now_count > prev_count && kind != active.0 {
+            if !unread.get(kind) {
+                unread.set(kind, true);
+            }
+            to_switch = Some(kind);
+        }
+    }
+    tracker.social = kinds[0].1;
+    tracker.battle = kinds[1].1;
+    tracker.debug = kinds[2].1;
+    if auto.0 {
+        if let Some(kind) = to_switch {
+            if active.0 != kind {
+                active.0 = kind;
+            }
+        }
+    }
+    // The active tab is, by definition, read — clear after the
+    // auto-switch decision so the freshly-activated tab also clears.
+    if unread.get(active.0) {
+        unread.set(active.0, false);
+    }
+}
+
 /// Apply [`ActiveChatTab`] to the UI: toggle `Display` on the stacked
 /// [`ChatPanel`]s and recolor the [`ChatTabButton`] labels + borders
 /// so the active tab pops in `palette::ACCENT`.
 pub fn update_chat_tab_visuals_system(
     active: Res<ActiveChatTab>,
+    unread: Res<ChatUnread>,
+    auto: Res<ChatAutoSwitch>,
     mut panel_q: Query<(&ChatPanel, &mut Node), Without<ChatTabButton>>,
     mut tab_q: Query<
         (&ChatTabButton, &mut BorderColor, &Children),
-        (Without<ChatPanel>, Without<ChatTabButtonLabel>),
+        (
+            Without<ChatPanel>,
+            Without<ChatTabButtonLabel>,
+            Without<ChatAutoSwitchToggle>,
+        ),
     >,
-    mut label_q: Query<&mut TextColor, With<ChatTabButtonLabel>>,
+    mut tab_label_q: Query<
+        &mut TextColor,
+        (With<ChatTabButtonLabel>, Without<ChatAutoSwitchLabel>),
+    >,
+    mut toggle_label_q: Query<
+        (&mut Text, &mut TextColor),
+        (With<ChatAutoSwitchLabel>, Without<ChatTabButtonLabel>),
+    >,
+    mut toggle_q: Query<
+        (&mut BorderColor, &Children),
+        (
+            With<ChatAutoSwitchToggle>,
+            Without<ChatTabButton>,
+            Without<ChatPanel>,
+        ),
+    >,
 ) {
-    if !active.is_changed() {
-        return;
-    }
+    // Per-frame run: writes are guarded by equality checks below, so
+    // the cost is bounded by the handful of tab buttons regardless.
     for (panel, mut node) in &mut panel_q {
         let want = if panel.kind == active.0 {
             Display::Flex
@@ -801,10 +982,17 @@ pub fn update_chat_tab_visuals_system(
             node.display = want;
         }
     }
+    // Yellow that contrasts against both BORDER (dim) and ACCENT
+    // (active). Picked to match the FFXI-classic "alert" tint that
+    // status-effect icons use for caution states.
+    let unread_color = Color::srgb(1.00, 0.85, 0.20);
     for (button, mut border, children) in &mut tab_q {
         let is_active = button.kind == active.0;
+        let is_unread = !is_active && unread.get(button.kind);
         let (border_c, label_c) = if is_active {
             (palette::ACCENT, palette::ACCENT)
+        } else if is_unread {
+            (unread_color, unread_color)
         } else {
             (palette::BORDER, palette::MUTED)
         };
@@ -812,9 +1000,31 @@ pub fn update_chat_tab_visuals_system(
             *border = BorderColor::all(border_c);
         }
         for child in children.iter() {
-            if let Ok(mut tc) = label_q.get_mut(child) {
+            if let Ok(mut tc) = tab_label_q.get_mut(child) {
                 if tc.0 != label_c {
                     tc.0 = label_c;
+                }
+            }
+        }
+    }
+    // Toggle button: label is "auto ✓" (on) or "auto ✗" (off); border
+    // and label colors lean ACCENT when on, MUTED when off.
+    let (want_text, want_color, want_border) = if auto.0 {
+        ("auto \u{2713}", palette::ACCENT, palette::ACCENT)
+    } else {
+        ("auto \u{2717}", palette::MUTED, palette::BORDER)
+    };
+    for (mut border, children) in &mut toggle_q {
+        if border.left != want_border {
+            *border = BorderColor::all(want_border);
+        }
+        for child in children.iter() {
+            if let Ok((mut text, mut color)) = toggle_label_q.get_mut(child) {
+                if text.as_str() != want_text {
+                    **text = want_text.to_string();
+                }
+                if color.0 != want_color {
+                    color.0 = want_color;
                 }
             }
         }

@@ -199,6 +199,9 @@ impl Plugin for HudPlugin {
         // every frame from the active SceneSnapshot mirrors.
         app.init_resource::<menu::DynamicMenu>();
         app.init_resource::<chat_panel::ActiveChatTab>();
+        app.init_resource::<chat_panel::ChatAutoSwitch>();
+        app.init_resource::<chat_panel::ChatUnread>();
+        app.init_resource::<chat_panel::ChatActivityTracker>();
         app.init_resource::<llm_badge::BadgeClock>();
         app.init_resource::<mesh_debug::MeshHoverDebug>();
         // ZoneFlashState must exist before `update_zone_flash` runs the
@@ -269,6 +272,16 @@ impl Plugin for HudPlugin {
         app.add_systems(Update, logout_countdown::update_logout_countdown);
         app.add_systems(Update, apply_dev_hud_visibility);
         app.add_systems(Update, chat_panel::chat_tab_click_system);
+        app.add_systems(Update, chat_panel::chat_auto_switch_click_system);
+        // Run the auto-switch/unread bookkeeping AFTER tab clicks so a
+        // manual click in the same frame wins, and BEFORE the visuals
+        // system so the new active/unread state paints the same frame.
+        app.add_systems(
+            Update,
+            chat_panel::chat_auto_switch_and_unread_system
+                .after(chat_panel::chat_tab_click_system)
+                .before(chat_panel::update_chat_tab_visuals_system),
+        );
         app.add_systems(Update, chat_panel::update_chat_tab_visuals_system);
         // The chat panel + tab bar + minimap auto-flow via the
         // `BottomLeftStack` flex container (Taffy-driven). No

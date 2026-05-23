@@ -413,6 +413,12 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 summary: "MZB overlay visibility (collision-only vs decorative)",
             },
             HelpEntry {
+                aliases: &["weather"],
+                usage: "<id|name>",
+                summary:
+                    "client-side weather override (e.g. `rain`, `none`, `12`); lasts until the next server WEATHER packet",
+            },
+            HelpEntry {
                 aliases: &["devhud"],
                 usage: "[on|off|toggle]",
                 summary: "developer telemetry overlays (stage bar, agent goal, etc.)",
@@ -640,6 +646,12 @@ pub enum SlashOutcome {
     /// forced cinematics). Punting CSID resolution to the dispatcher
     /// means the parser doesn't need access to `SceneState`.
     EndCutscene { event_num: Option<u16> },
+    /// `/weather <id|name>` — client-side override. Dispatcher writes
+    /// `Some(w)` into `SceneState.snapshot.weather`; the existing
+    /// `sync_current_weather_from_snapshot` system propagates it to
+    /// `CurrentWeather` next frame and the FX/HUD update from there.
+    /// The next server-pushed WEATHER packet will overwrite it.
+    SetWeatherClient(ffxi_viewer_wire::Weather),
     /// `/copy [n]` — copy the last `n` `[system]` chat toasts (i.e.
     /// responses to slash commands) to the OS clipboard, newline-joined.
     /// `n` defaults to 1 so a bare `/copy` grabs just the most recent
@@ -1041,6 +1053,15 @@ pub fn parse_slash(
             kind: 0,
             text: "!release".into(),
         }),
+        // `/weather <id|name>` — client-side weather override. Writes
+        // directly to the local snapshot/`CurrentWeather` resource so
+        // the visual FX (particles, fog, sun modulation) flip
+        // immediately without a server round-trip. No GM requirement,
+        // and `none` actually clears (the LSB `!setweather` early-
+        // returns when the zone's already at the requested weather).
+        // Naturally reverts on the next server 0x057 WEATHER packet —
+        // same lifetime as the GM command had server-side.
+        "weather" => parse_weather(rest),
         "bank" => parse_bank(rest),
         "zonechange" | "rzc" => parse_zone_change(rest),
         "mhexit" => parse_mhexit(rest, zone_id),
@@ -2338,6 +2359,63 @@ fn parse_sound(rest: &str) -> SlashOutcome {
         _ => SoundOp::SetBoth(verb),
     };
     SlashOutcome::SetSound(op)
+}
+
+/// `/weather <id|name>` — resolve the arg into a [`Weather`] variant
+/// and emit [`SlashOutcome::SetWeatherClient`]. Names are matched
+/// case-insensitively after stripping `_`/`-`/spaces, so `rain`,
+/// `RAIN`, `hot_spell`, `HotSpell`, and `hot spell` all resolve. Ids
+/// are 0..=19; values outside the range get a usage toast.
+fn parse_weather(rest: &str) -> SlashOutcome {
+    use ffxi_viewer_wire::Weather;
+    let arg = rest.trim();
+    if arg.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/weather: usage `/weather <id|name>` — 0..=19, or names like \
+             none, sunshine, clouds, fog, rain, snow, thunderstorms, sand_storm, \
+             auroras, gloom, darkness (see vendor/server/scripts/enum/weather.lua)"
+                .into(),
+        );
+    }
+    if let Ok(n) = arg.parse::<u16>() {
+        if n > 19 {
+            return SlashOutcome::SystemMessage(format!("/weather: id {n} out of range (0..=19)"));
+        }
+        return SlashOutcome::SetWeatherClient(Weather::from_lsb(n));
+    }
+    let key: String = arg
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    let w = match key.as_str() {
+        "none" | "clear" | "off" => Weather::None,
+        "sunshine" | "sun" | "sunny" => Weather::Sunshine,
+        "clouds" | "cloudy" | "cloud" => Weather::Clouds,
+        "fog" | "foggy" => Weather::Fog,
+        "hotspell" => Weather::HotSpell,
+        "heatwave" => Weather::HeatWave,
+        "rain" | "rainy" => Weather::Rain,
+        "squall" => Weather::Squall,
+        "duststorm" | "dust" => Weather::DustStorm,
+        "sandstorm" | "sand" => Weather::SandStorm,
+        "wind" | "windy" => Weather::Wind,
+        "gales" | "gale" => Weather::Gales,
+        "snow" | "snowy" => Weather::Snow,
+        "blizzards" | "blizzard" => Weather::Blizzards,
+        "thunder" => Weather::Thunder,
+        "thunderstorms" | "thunderstorm" | "storm" => Weather::Thunderstorms,
+        "auroras" | "aurora" => Weather::Auroras,
+        "stellarglare" | "stellar" => Weather::StellarGlare,
+        "gloom" => Weather::Gloom,
+        "darkness" | "dark" => Weather::Darkness,
+        _ => {
+            return SlashOutcome::SystemMessage(format!(
+                "/weather: unknown weather `{arg}` (try a number 0..=19 or a name like `rain`)"
+            ));
+        }
+    };
+    SlashOutcome::SetWeatherClient(w)
 }
 
 /// `/devhud on|off|toggle` — show/hide developer telemetry overlays.
