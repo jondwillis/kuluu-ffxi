@@ -82,6 +82,14 @@ const STRAFE_CANCEL_MS: u64 = 300;
 /// without retuning movement speed.
 const SPEED_TO_YPS: f32 = 0.2;
 
+/// Retail movement-speed caps applied per direction (post reactor speed
+/// scaling). Backing up is half-speed; pure strafe is three-quarters;
+/// forward (with or without strafe) is full speed but the diagonal
+/// forward+strafe vector is normalised so total magnitude stays ≤ 1×.
+/// See https://ffxiclopedia.fandom.com/wiki/Category:Keyboard_Layout.
+const BACKPEDAL_SCALE: f32 = 0.5;
+const STRAFE_SCALE: f32 = 0.75;
+
 /// Turn (A/D in 3rd person) — heading lerp rate toward direction of
 /// motion, radians per real-time second.
 ///
@@ -847,7 +855,23 @@ pub fn dispatch_movement_system(
     // dt`. `speed=0` (entity hasn't been populated yet) → 0 step, which
     // silently skips movement instead of teleporting somewhere weird.
     // Speed_base is the unmodified value.
-    let step = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs();
+    let raw_step = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs();
+    // Retail direction caps (applied after reactor speed scaling):
+    //   * Backpedal (S only)            → 0.5×
+    //   * Pure strafe (A/D only, no W/S) → 0.75×
+    //   * Forward (W, with or without strafe) → 1.0×, but diagonal
+    //     forward+strafe is normalised by 1/√2 so the combined vector
+    //     magnitude doesn't exceed 1× forward speed.
+    let dir_scale = if forward > 0 && strafe != 0 {
+        std::f32::consts::FRAC_1_SQRT_2
+    } else if forward < 0 {
+        BACKPEDAL_SCALE
+    } else if forward == 0 && strafe != 0 {
+        STRAFE_SCALE
+    } else {
+        1.0
+    };
+    let step = raw_step * dir_scale;
     let mut x = basis_pos.x;
     let mut y = basis_pos.y;
     // Apply the turn handler's composite motion. Zero unless `turn_in_chase`
