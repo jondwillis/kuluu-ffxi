@@ -55,8 +55,8 @@ use bevy::prelude::*;
 use bevy::window::WindowCloseRequested;
 use ffxi_viewer_core::{
     heading_for_yaw, toggle_camera_mode, yaw_for_heading, Action, Bindings, CameraMode,
-    ChaseCamera, ChatBuffer, CursorLockRequest, InputMode, LockOn, LockOnToggle, MenuStack,
-    OperatorCamera, PassiveCursorState, SceneState, Target,
+    ChaseCamera, ChatBuffer, CursorLockRequest, InputMode, IsSelf, LockOn, LockOnToggle,
+    MenuStack, OperatorCamera, PassiveCursorState, SceneState, Target, WorldEntity,
 };
 use ffxi_viewer_wire::{Entity as WireEntity, Vec3 as WireVec3};
 use tokio::sync::mpsc;
@@ -1155,6 +1155,159 @@ where
                 .map(|c| c.id)
         }
     }
+}
+
+/// State for the auto-recenter behavior: how long forward has been
+/// continuously held with no operator yaw input. After
+/// [`AUTO_RECENTER_HOLD_S`] the chase camera lerps toward "behind the
+/// player at current heading" at [`AUTO_RECENTER_RATE`] rad/s. Any
+/// `CameraYawLeft`/`Right` press cancels and resets the timer.
+#[derive(Resource, Default)]
+pub struct CameraAutoRecenter {
+    /// `Some(instant)` while MoveForward has been held continuously with
+    /// no yaw input since `instant`; `None` otherwise. Active recenter
+    /// begins once `now - instant >= AUTO_RECENTER_HOLD_S`.
+    pub forward_held_since: Option<Instant>,
+}
+
+/// Forward must be held this long with no yaw input before auto-recenter
+/// engages. Matches retail's "walk a beat before the camera trails" feel
+/// (long enough that brief forward taps don't twitch the camera).
+const AUTO_RECENTER_HOLD_S: f32 = 0.5;
+/// Angular rate of the auto-recenter lerp, radians/sec. ~0.6 rad/s ≈ 34°/s
+/// — fast enough to obviously settle while walking, slow enough to read
+/// as a smooth follow rather than a snap.
+const AUTO_RECENTER_RATE: f32 = 0.6;
+/// First-person look-at-lock pitch tracking rate, radians/sec. ~3 rad/s
+/// is fast: when locked onto a tall mob the camera tips up to meet its
+/// head within ~½ second from a level start.
+const FP_LOCK_PITCH_RATE: f32 = 3.0;
+/// Vertical offset (Bevy units) from a target entity's transform origin
+/// to its head. Most NPC/PC capsules are ~1.9 yalms tall with origin at
+/// the feet (see `scene::EntityMesh`); 1.5 lands roughly between the
+/// neck and the crown, which is what the operator instinctively
+/// "looks at" in 1st-person.
+const TARGET_HEAD_OFFSET_Y: f32 = 1.5;
+
+/// Camera-polish system: auto-recenter behind player when walking
+/// forward with no yaw input, and (in first-person + lock-on) track the
+/// locked target's head height by driving `chase.pitch`.
+///
+/// Runs in `Update`. Reads input + transforms; mutates `ChaseCamera`
+/// only (no command dispatch). The two behaviors are independent and
+/// composable — both can run in the same frame (e.g. running forward in
+/// 1p with a lock-on: pitch tracks the target, yaw is not recentered
+/// because lock-on is already pinning it via `dispatch_movement_system`).
+pub fn camera_polish_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    bindings: Res<Bindings>,
+    time: Res<Time>,
+    mode: Res<InputMode>,
+    camera_mode: Res<CameraMode>,
+    state: Res<SceneState>,
+    lock_on: Res<LockOn>,
+    mut chase: ResMut<ChaseCamera>,
+    mut recenter: ResMut<CameraAutoRecenter>,
+    self_q: Query<&Transform, (With<IsSelf>, Without<OperatorCamera>)>,
+    target_q: Query<(&WorldEntity, &Transform), Without<OperatorCamera>>,
+) {
+    // Disabled outside World — recentering while typing in chat or
+    // navigating a menu would be confusing (and movement is paused
+    // anyway in those modes).
+    if !matches!(*mode, InputMode::World) {
+        recenter.forward_held_since = None;
+        return;
+    }
+
+    // --- (a) Auto-recenter ---------------------------------------------
+    // Track the "forward held with no yaw input" window. The yaw-input
+    // test uses Action::CameraYawLeft/Right specifically (per the unit
+    // spec) — A/D rotates the player AND the camera lock-step, so it's
+    // intentionally NOT considered a "free-look yaw input" that should
+    // cancel recenter.
+    //
+    // Chase-mode only: in first-person, "behind the player at current
+    // heading" is not a meaningful concept (FP yaw drives the look
+    // direction directly).
+    let forward_held = bindings.pressed(Action::MoveForward, &keys);
+    let yaw_input = bindings.pressed(Action::CameraYawLeft, &keys)
+        || bindings.pressed(Action::CameraYawRight, &keys);
+
+    if yaw_input || !forward_held || !matches!(*camera_mode, CameraMode::Chase) {
+        recenter.forward_held_since = None;
+    } else {
+        let now = Instant::now();
+        let started = *recenter.forward_held_since.get_or_insert(now);
+        let elapsed = now.duration_since(started).as_secs_f32();
+        if elapsed >= AUTO_RECENTER_HOLD_S {
+            // Target yaw: camera directly behind the player at the
+            // player's current heading. `yaw_for_heading` is the
+            // already-used "camera-behind-player" mapping (see the
+            // one-shot sync in `chase_camera_system`).
+            let target_yaw = yaw_for_heading(state.snapshot.self_pos.heading);
+            // Shortest-arc delta wrapped into [-π, π] so we don't take
+            // the long way around when current yaw is already close to
+            // target on the "wrong" side of ±π.
+            let tau = std::f32::consts::TAU;
+            let mut diff = (target_yaw - chase.yaw).rem_euclid(tau);
+            if diff > std::f32::consts::PI {
+                diff -= tau;
+            }
+            let max_step = AUTO_RECENTER_RATE * time.delta_secs();
+            let step = diff.clamp(-max_step, max_step);
+            chase.yaw += step;
+        }
+    }
+
+    // --- (c) 1p auto-lock pitch tracking -------------------------------
+    // Only when in first-person AND lock-on is active AND the locked
+    // entity is in the scene. Drive `chase.pitch` toward the angle to
+    // the target's head. Do NOT touch yaw — the existing lock-on path
+    // in `dispatch_movement_system` already pins heading + chase.yaw
+    // each tick.
+    if !matches!(*camera_mode, CameraMode::FirstPerson) {
+        return;
+    }
+    let Some(target_id) = lock_on.target_id else {
+        return;
+    };
+    let Ok(self_t) = self_q.single() else {
+        return;
+    };
+    let mut target_pos: Option<Vec3> = None;
+    for (we, t) in target_q.iter() {
+        if we.id == target_id {
+            target_pos = Some(t.translation);
+            break;
+        }
+    }
+    let Some(target_pos) = target_pos else {
+        return;
+    };
+
+    // Eye and head positions. Eye matches `firstperson_camera_system`'s
+    // origin so the pitch we compute is the one that actually frames
+    // the head on screen.
+    let eye = self_t.translation + Vec3::Y * ChaseCamera::FP_EYE_HEIGHT;
+    let head = target_pos + Vec3::Y * TARGET_HEAD_OFFSET_Y;
+    let to_head = head - eye;
+    // Degenerate (target on top of player) — leave pitch alone.
+    let horiz = (to_head.x * to_head.x + to_head.z * to_head.z).sqrt();
+    if horiz < 1e-4 && to_head.y.abs() < 1e-4 {
+        return;
+    }
+    // FP's look_dir is `(-yaw.sin()*cos_p, sin_p, -yaw.cos()*cos_p)`, so
+    // the +Y component is `sin(pitch)`. The pitch that points at `head`
+    // therefore satisfies `sin(p) = to_head.y / |to_head|`, equivalent
+    // to `atan2(to_head.y, horiz)`.
+    let desired_pitch = to_head.y.atan2(horiz).clamp(
+        ChaseCamera::FP_PITCH_MIN,
+        ChaseCamera::FP_PITCH_MAX,
+    );
+    let max_step = FP_LOCK_PITCH_RATE * time.delta_secs();
+    let diff = desired_pitch - chase.pitch;
+    let step = diff.clamp(-max_step, max_step);
+    chase.pitch += step;
 }
 
 /// How far past the strict `[-1, 1]` NDC frustum an entity may sit and

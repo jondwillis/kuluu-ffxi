@@ -168,7 +168,14 @@ impl Default for ChaseCamera {
     fn default() -> Self {
         Self {
             yaw: 0.0,
-            pitch: 0.55,
+            // Retail's chase camera sits near shoulder-height of the
+            // avatar with a faint downward tilt — eye-level, not
+            // overhead. 0.55 rad (≈31°) was a noticeably more overhead
+            // angle than retail; 0.15 rad (≈8.6°) puts the camera just
+            // above horizontal so the player's head sits centered, with
+            // the world framed past their shoulders. Stays above
+            // `PITCH_MIN` so the initial clamp is a no-op.
+            pitch: 0.15,
             distance: 18.0,
             smoothing: 0.18,
             synced_initial: false,
