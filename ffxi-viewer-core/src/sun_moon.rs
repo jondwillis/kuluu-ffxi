@@ -57,10 +57,16 @@ pub struct MoonDisc;
 const SKY_RADIUS: f32 = 4000.0;
 /// Visible radius of the sun/moon discs. Retail FFXI's moon is much
 /// larger than its sun — roughly a 5-10° apparent diameter, dominating
-/// the upper sky. The sun is closer to ~2° and read through bloom as a
-/// small bright disc.
-const SUN_DISC_RADIUS: f32 = 60.0;
-const MOON_DISC_RADIUS: f32 = 180.0;
+/// the upper sky. The sun is closer to ~2-3° and reads through bloom
+/// as a small bright disc.
+///
+/// `SUN_DISC_RADIUS` is a sphere radius (Sphere::new(1.0) → scale =
+/// radius). `MOON_DISC_RADIUS` is the on-screen radius the billboard
+/// quad should occupy; we double when applying scale because the
+/// `Rectangle::new(1.0, 1.0)` mesh is one unit *across* (so its half-
+/// width is 0.5, and to make the disc reach `RADIUS` we scale by 2×).
+const SUN_DISC_RADIUS: f32 = 120.0;
+const MOON_DISC_RADIUS: f32 = 350.0;
 
 /// FFXI's moon cycle is 84 V-days long. Each of the 12 named phases
 /// lasts 7 V-days. LSB's `vana_time.h::moon::get_phase` defines
@@ -254,7 +260,7 @@ pub fn spawn_sun_and_moon(
         MoonDisc,
         Mesh3d(moon_quad),
         MeshMaterial3d(moon_mat.clone()),
-        Transform::from_scale(Vec3::splat(MOON_DISC_RADIUS)),
+        Transform::from_scale(Vec3::splat(MOON_DISC_RADIUS * 2.0)),
         Visibility::Hidden,
         NotShadowCaster,
         NotShadowReceiver,
@@ -485,7 +491,9 @@ pub fn sun_moon_system(
     if let Ok((mut disc, mut vis)) = q_moon_disc.single_mut() {
         let moon_world = cam_pos + moon_dir * SKY_RADIUS;
         disc.translation = moon_world;
-        disc.scale = Vec3::splat(MOON_DISC_RADIUS);
+        // Rectangle mesh is 1m across; ×2 to make `RADIUS` mean the
+        // on-screen disc radius.
+        disc.scale = Vec3::splat(MOON_DISC_RADIUS * 2.0);
         // Billboard: face the camera. The Rectangle mesh lives in
         // its local XY plane with +Z as its normal — so aim +Z at
         // the camera. Using `Vec3::Y` as up keeps the disc upright;
