@@ -744,7 +744,14 @@ impl SessionState {
                 self.diagnostics.stage = Some(*stage);
             }
             AgentEvent::ZoneChanged { to, .. } => {
-                self.zone_id = Some(*to);
+                // `to == 0` is the session loop's "transitioning between map
+                // servers" sentinel (emitted on s2c 0x00B LOGOUT zone-change).
+                // Map it to `None` so downstream renderers (zone-mesh auto-
+                // loader, atmosphere, minimap, weather, navmesh) treat the
+                // gap as "no zone loaded" and despawn cleanly — they all
+                // already short-circuit on `None`. The next 0x00A LOGIN on
+                // the new map server sets a real `Some(zone_id)`.
+                self.zone_id = if *to == 0 { None } else { Some(*to) };
                 // A zoneline cancels any pending LeaveGame on the server
                 // (the effect doesn't survive zone). Mirror that locally so
                 // the HUD widget hides immediately.
@@ -985,7 +992,10 @@ impl SessionState {
             | AgentEvent::MusicChanged { .. }
             | AgentEvent::MusicVolumeChanged { .. }
             | AgentEvent::LevelUp { .. }
-            | AgentEvent::SkillLevelUp { .. } => {}
+            | AgentEvent::SkillLevelUp { .. }
+            // VanaTimeSynced is handled by viewer-core's VanaClock resource,
+            // not the session state; pass-through.
+            | AgentEvent::VanaTimeSynced { .. } => {}
             AgentEvent::InventoryUpdated { container, update } => {
                 let entry = self.inventory.containers.entry(*container).or_default();
                 match update {
@@ -1188,6 +1198,14 @@ pub enum AgentEvent {
     /// these on every zone-in plus whenever weather changes mid-zone.
     WeatherUpdated {
         weather_number: u16,
+    },
+    /// 0x00A LOGIN `GameTime` field — server's authoritative Vana clock
+    /// anchor. Earth seconds since LSB's `vanadiel_epoch`
+    /// (1009810800 = 2002-01-01 00:00 JST). Sent on every zone-in.
+    /// Viewer's `VanaClock` resource consumes this to stop deriving
+    /// Vana time from local `SystemTime::now()`.
+    VanaTimeSynced {
+        game_time: u32,
     },
     /// 0x053 SYSTEMMES id=7 (EXECUTING_LOGOUT) or id=35 (EXECUTING_SHUTDOWN)
     /// — server-driven countdown tick. The `EFFECT_LEAVEGAME` effect

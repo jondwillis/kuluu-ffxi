@@ -509,7 +509,15 @@ fn handle_sub_packet(
             // session-loop's local `self_pos` AND the entity list (via
             // `EntityUpserted`) so the snapshot's derived `self_pos`
             // reflects truth from the very first packet of zone-in.
-            if let Ok(login) = decode::ServerLogin::decode(sub.data) {
+            let decoded = decode::ServerLogin::decode(sub.data);
+            if let Err(ref e) = decoded {
+                tracing::warn!(
+                    error = %e,
+                    body_len = sub.data.len(),
+                    "0x00A LOGIN decode failed — self_pos will stay at default until CHAR_PC"
+                );
+            }
+            if let Ok(login) = decoded {
                 *current_zone_id = login.zone_no;
                 let head = login.pos_head;
                 // ZoneChanged first — its `apply_event` clears the entity
@@ -519,6 +527,13 @@ fn handle_sub_packet(
                     from: None,
                     to: login.zone_no,
                 });
+                // 0x00A `GameTime` is the server's Earth-seconds-since-
+                // vanadiel_epoch counter. Surface it so the viewer's
+                // VanaClock can anchor its sun/moon and HUD clock to
+                // server truth instead of `SystemTime::now()`.
+                if let Some(game_time) = login.game_time {
+                    let _ = event_tx.send(AgentEvent::VanaTimeSynced { game_time });
+                }
                 // LSB embeds `MusicNum[5]` directly in the LOGIN body
                 // for the zone's pre-set slots (Day/Night/CombatSolo/
                 // CombatParty/Mount). Out-of-band 0x05F arrives only
@@ -534,6 +549,15 @@ fn handle_sub_packet(
                             track_id: *track_id,
                         });
                     }
+                }
+                if login.unique_no != self_char_id {
+                    tracing::warn!(
+                        login_unique_no = login.unique_no,
+                        self_char_id,
+                        zone_no = login.zone_no,
+                        pos = format!("({:.1},{:.1},{:.1})", head.x, head.y, head.z),
+                        "0x00A LOGIN unique_no != self_char_id — self_pos seed skipped (will spawn at origin until CHAR_PC for self lands)"
+                    );
                 }
                 if login.unique_no == self_char_id {
                     *self_act_index = Some(login.act_index);

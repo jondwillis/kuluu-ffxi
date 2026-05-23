@@ -28,7 +28,6 @@ use ffxi_dat::weather::{collect_weather_records, sample_weather, WeatherRecord};
 use ffxi_dat::DatRoot;
 
 use crate::snapshot::SceneState;
-use crate::sun_moon::vana_sky_now;
 
 /// Loaded weather keyframes for the current zone. Empty when no zone
 /// is loaded, when the zone's DAT has no Weather chunks, or when the
@@ -136,11 +135,12 @@ pub fn apply_zone_weather(
     zone_weather: Res<ZoneWeather>,
     mut fog_q: Query<&mut FogVolume>,
     mut ambient: ResMut<AmbientLight>,
+    vana_clock: Res<crate::vana_time::VanaClock>,
 ) {
     if zone_weather.records.is_empty() {
         return;
     }
-    let sky = vana_sky_now();
+    let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
     let time_minutes = (sky.hour * 60.0).rem_euclid(1440.0) as u32;
     let Some(rec) = sample_weather(&zone_weather.records, time_minutes) else {
         return;

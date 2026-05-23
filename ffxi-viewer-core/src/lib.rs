@@ -51,8 +51,10 @@ pub mod scheduler_runtime;
 pub mod skybox;
 pub mod snapshot;
 pub mod source;
+pub mod moon_material;
 pub mod sun_moon;
 pub mod target_ring;
+pub mod vana_time;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod weather;
 pub mod weather_fx;
@@ -154,6 +156,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // it reads ZoneWeather which is itself native-only.
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(skybox::SkyboxPlugin);
+        app.add_plugins(moon_material::MoonMaterialPlugin);
         // Debug chat surfacing: routes engine + protocol events
         // (zone change, aggro, low HP, speed suppression) to the
         // System chat pane. Cross-platform: the drain reads the same
@@ -176,6 +179,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<atmosphere::ZoneAtmosphereProvider>()
             .init_resource::<atmosphere::LastAtmosphereZone>()
             .init_resource::<sun_moon::VanaSky>()
+            .init_resource::<vana_time::VanaClock>()
             .init_resource::<weather_fx::ActiveWeatherModifier>()
             .init_resource::<weather_fx::ParticleAssets>()
             .init_resource::<weather_fx::LightningState>()
@@ -210,6 +214,10 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             // visibility — `CursorPlugin` is the sole owner.
             .add_plugins(CursorPlugin)
             .add_systems(PreUpdate, ingest_system::<S>.run_if(resource_exists::<S>))
+            // Drain VanaTimeSynced events out of the EventLog into the
+            // VanaClock resource. Runs after ingest_system so the same
+            // frame's events are visible.
+            .add_systems(PreUpdate, vana_time::ingest_vana_time.after(ingest_system::<S>))
             // The Update tuple needs the world resources `setup_world`
             // inserts (EntityMesh/EntityMaterials/HpBarMesh) — those
             // are `Res<>` params, which Bevy treats as hard requirements

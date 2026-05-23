@@ -151,6 +151,7 @@ fn update_skybox(
     mut sky_q: Query<(&mut Transform, &MeshMaterial3d<SkyboxGradientMaterial>), With<SkyboxSphere>>,
     mut mats: ResMut<Assets<SkyboxGradientMaterial>>,
     mut scene_state: ResMut<crate::snapshot::SceneState>,
+    vana_clock: Res<crate::vana_time::VanaClock>,
     mut prev_keyframe_time: Local<Option<u32>>,
 ) {
     let cam_pos = cam_q.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
@@ -182,7 +183,7 @@ fn update_skybox(
     if zone_weather.records.is_empty() {
         return;
     }
-    let sky = crate::sun_moon::vana_sky_now();
+    let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
     let v_minutes = (sky.hour * 60.0).rem_euclid(1440.0);
     let m0 = v_minutes.floor() as u32 % 1440;
     let m1 = (m0 + 1) % 1440;

@@ -58,4 +58,7 @@ fi
 msg=$(printf 'This session touched %s file(s) not yet committed. Consider grouping uncontroversial changes into a commit:\n%s' \
   "$file_count" "$shown")
 
-jq -n --arg m "$msg" '{systemMessage: $m}'
+jq -n --arg m "$msg" '{
+  systemMessage: $m,
+  hookSpecificOutput: { hookEventName: "Stop", additionalContext: $m }
+}'

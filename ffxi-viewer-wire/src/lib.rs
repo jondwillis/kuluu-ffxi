@@ -656,6 +656,14 @@ pub enum ViewerEvent {
         action_id: u32,
         action_kind: u8,
     },
+    /// Server's `GameTime` field from the 0x00A LOGIN packet — Earth
+    /// seconds since LSB's `vanadiel_epoch` (Unix 1009810800,
+    /// 2002-01-01 00:00 JST). Fired on every zone-in. The viewer's
+    /// `VanaClock` resource consumes this so sun/moon/HUD clock reads
+    /// match LSB's authoritative time instead of local `SystemTime`.
+    VanaTimeSynced {
+        game_time: u32,
+    },
 }
 
 /// Server→viewer frame on the WebSocket. `Snapshot` and `Delta` are boxed

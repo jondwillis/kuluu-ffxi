@@ -222,6 +222,7 @@ pub fn setup_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut moon_materials: ResMut<Assets<crate::moon_material::MoonMaterial>>,
     settings: Res<GraphicsSettings>,
 ) {
     let mk = |c: Color, m: &mut Assets<StandardMaterial>| {
@@ -292,7 +293,13 @@ pub fn setup_world(
     // are tagged and updated each frame by `sun_moon::sun_moon_system`
     // from Vana'diel time (sun arcs east→west across the V-day; moon
     // is anti-phase; moon brightness follows the 84-day phase cycle).
-    crate::sun_moon::spawn_sun_and_moon(&mut commands, &mut meshes, &mut materials, &settings);
+    crate::sun_moon::spawn_sun_and_moon(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &mut moon_materials,
+        &settings,
+    );
 
     // Zone-scale fog volume. `FogVolume`'s bounds come from its
     // Transform scale (default 1m³); we make it a ~2km cube so the

@@ -978,6 +978,7 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::LevelUp { .. } => "level_up",
         AgentEvent::SkillLevelUp { .. } => "skill_level_up",
         AgentEvent::ActionStarted { .. } => "action_started",
+        AgentEvent::VanaTimeSynced { .. } => "vana_time_synced",
     }
 }
 

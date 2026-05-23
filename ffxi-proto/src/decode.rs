@@ -419,6 +419,14 @@ pub struct ServerLogin {
     pub unique_no: u32,
     pub act_index: u16,
     pub zone_no: u16,
+    /// `GameTime` at body offset 0x38 — `vanadiel_timestamp(currentTime)`
+    /// from LSB's `0x00a_login.cpp:162`, i.e. Earth seconds since the
+    /// canonical Vana'diel epoch (LSB `earth_time.h::vanadiel_epoch =
+    /// 1009810800`). Surfaced to the viewer so it can sync its
+    /// `VanaClock` resource and stop deriving Vana time from local
+    /// `SystemTime::now()`. `None` only if the body is too short
+    /// (synthetic tests / pre-LOGIN handshakes).
+    pub game_time: Option<u32>,
     /// Full `GP_SERV_POS_HEAD` carried in body[0..44]. The position
     /// fields here are the server-authoritative spawn coordinates on
     /// every zone-in (LSB sets `packet.PosHead = { .x = loc.p.x,
@@ -457,6 +465,8 @@ impl ServerLogin {
     ///   0x52 MusicNum[5] (10B) ← we read here
     pub const MUSIC_NUM_OFFSET: usize = 0x52;
     pub const MUSIC_NUM_SIZE: usize = 5 * 2;
+    /// Body offset of `GameTime`. See [`ServerLogin::game_time`].
+    pub const GAME_TIME_OFFSET: usize = 0x38;
 
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
         if body.len() < Self::SIZE {
@@ -468,6 +478,15 @@ impl ServerLogin {
         // every time. So we read at the fixed offset.
         let zone_u32 = u32::from_le_bytes(body[44..48].try_into().unwrap());
         let pos_head = PosHead::decode(&body[..PosHead::SIZE_WITH_BT_TARGET])?;
+        let game_time = if body.len() >= Self::GAME_TIME_OFFSET + 4 {
+            Some(u32::from_le_bytes(
+                body[Self::GAME_TIME_OFFSET..Self::GAME_TIME_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
+            ))
+        } else {
+            None
+        };
         // MusicNum is optional: short bodies (in synthetic tests, or
         // hypothetical legacy clients) simply don't carry it.
         let music_num = if body.len() >= Self::MUSIC_NUM_OFFSET + Self::MUSIC_NUM_SIZE {
@@ -486,6 +505,7 @@ impl ServerLogin {
             unique_no: pos_head.unique_no,
             act_index: pos_head.act_index,
             zone_no: zone_u32 as u16,
+            game_time,
             pos_head,
             music_num,
         })

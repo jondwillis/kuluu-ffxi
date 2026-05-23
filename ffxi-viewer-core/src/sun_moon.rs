@@ -14,12 +14,16 @@
 //!   * Disables sun illuminance entirely below the horizon and likewise
 //!     for the moon during day.
 //!
-//! All math is closed-form against system time — there is no server
-//! component. The clock module ([`crate::hud::vana_clock`]) is the
-//! shared source of truth for the epoch.
+//! Time matches LSB exactly: 1 Earth-sec = 25 Vana-sec, so 1 V-day ≈
+//! 57.6 real minutes. The clock module ([`crate::hud::vana_clock`])
+//! owns the epoch and ratio constants. Moon phase math mirrors
+//! `vendor/server/src/common/vana_time.h::moon::get_phase` so the
+//! client's displayed phase matches `/moon` and weather TOTD events.
 //!
-//! One Vana'diel day ≈ 10 real minutes (25 real seconds per V-hour ×
-//! 24), so the sun visibly traverses the sky during normal play.
+//! When a server `GameTime` packet has been received, the
+//! [`crate::vana_time::VanaClock`] resource shifts the local Earth
+//! clock by the server's offset; otherwise we read system time
+//! directly.
 
 use std::f32::consts::PI;
 use std::time::SystemTime;
@@ -51,15 +55,20 @@ pub struct MoonDisc;
 /// (`spawn_camera` overrides the projection's `far` to 6000m so this
 /// has room).
 const SKY_RADIUS: f32 = 4000.0;
-/// Visible radius of the sun/moon discs. Sized for ~1.5° apparent
-/// diameter at SKY_RADIUS=4000m, so a ~50m sphere reads as "real
-/// celestial body" with bloom halo. Scale up to make them larger.
+/// Visible radius of the sun/moon discs. Retail FFXI's moon is much
+/// larger than its sun — roughly a 5-10° apparent diameter, dominating
+/// the upper sky. The sun is closer to ~2° and read through bloom as a
+/// small bright disc.
 const SUN_DISC_RADIUS: f32 = 60.0;
-const MOON_DISC_RADIUS: f32 = 50.0;
+const MOON_DISC_RADIUS: f32 = 180.0;
 
-/// FFXI's moon cycle is 84 V-days long. Phase 0 (New) starts at the
-/// V-epoch (8866-01-01); each of the 12 named phases lasts 7 V-days.
+/// FFXI's moon cycle is 84 V-days long. Each of the 12 named phases
+/// lasts 7 V-days. LSB's `vana_time.h::moon::get_phase` defines
+/// `daysmod = (vana_days_since_epoch + 886*360 + 26) % 84`. The
+/// `886*360 + 26` offset bakes down to a constant 38 — the LSB epoch
+/// lands 38 days *after* a Full Moon, so `daysmod = (vana_days + 38) % 84`.
 const MOON_CYCLE_VANA_DAYS: u64 = 84;
+const MOON_PHASE_OFFSET: u64 = (886u64 * 360 + 26) % MOON_CYCLE_VANA_DAYS;
 
 /// Distance from origin at which the lights are positioned. The
 /// `DirectionalLight` shader uses only the transform's *forward* axis,
@@ -72,15 +81,23 @@ const LIGHT_DISTANCE: f32 = 200.0;
 pub struct VanaSky {
     /// Hour of the V-day as a continuous float in `[0.0, 24.0)`.
     pub hour: f32,
-    /// Lunar phase fraction in `[0.0, 1.0)`. 0 = New, 0.5 = Full.
+    /// Position in the 84-V-day moon cycle as a fraction in `[0.0, 1.0)`.
+    /// Matches LSB's `daysmod / 84`: 0.0 = Full, 0.5 = New, → 1.0 = Full.
     pub moon_phase: f32,
+    /// Illumination fraction in `[0.0, 1.0]` derived from `moon_phase`
+    /// to mirror LSB's `moon::get_phase`. 1.0 = Full, 0.0 = New.
+    pub moon_illumination: f32,
+    /// True if the moon is currently waxing (illumination increasing).
+    pub moon_waxing: bool,
     /// Sun altitude angle in radians. Negative = below horizon.
     pub sun_altitude: f32,
     /// Moon altitude angle in radians. Negative = below horizon.
     pub moon_altitude: f32,
 }
 
-/// Sample Vana'diel sky state from current system time.
+/// Sample Vana'diel sky state from system time (no server anchor).
+/// Prefer [`vana_sky_from_clock`] in systems where a [`crate::vana_time::VanaClock`]
+/// is available.
 pub fn vana_sky_now() -> VanaSky {
     let earth_now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -89,16 +106,30 @@ pub fn vana_sky_now() -> VanaSky {
     vana_sky_from_unix(earth_now)
 }
 
+/// Sample Vana'diel sky state from a server-anchored [`crate::vana_time::VanaClock`].
+pub fn vana_sky_from_clock(clock: &crate::vana_time::VanaClock) -> VanaSky {
+    vana_sky_from_unix(clock.earth_unix_now())
+}
+
 fn vana_sky_from_unix(earth_unix: f64) -> VanaSky {
     // Continuous (sub-second) seconds since the Vana epoch. `max(0.0)`
     // mirrors the old `saturating_sub` for pre-epoch inputs.
-    let since = (earth_unix - EARTH_EPOCH_UNIX as f64).max(0.0);
-    let day_secs = EARTH_SECS_PER_VANA_DAY as f64;
-    let secs_into_day = since.rem_euclid(day_secs);
-    let hour = (secs_into_day / 25.0) as f32; // 25 earth seconds per V-hour.
+    let earth_since = (earth_unix - EARTH_EPOCH_UNIX as f64).max(0.0);
+    // 1 Earth-sec = 25 Vana-sec.
+    let vana_secs = earth_since * 25.0;
+    let day_v_secs = 86400.0; // 24 * 3600 Vana-sec per V-day.
+    let secs_into_day = vana_secs.rem_euclid(day_v_secs);
+    let hour = (secs_into_day / 3600.0) as f32;
 
-    let total_v_days = (since / day_secs).floor() as u64;
-    let moon_phase = (total_v_days % MOON_CYCLE_VANA_DAYS) as f32 / MOON_CYCLE_VANA_DAYS as f32;
+    let total_v_days = (vana_secs / day_v_secs).floor() as u64;
+    let daysmod = (total_v_days + MOON_PHASE_OFFSET) % MOON_CYCLE_VANA_DAYS;
+    let moon_phase = daysmod as f32 / MOON_CYCLE_VANA_DAYS as f32;
+    // LSB formula: 0 = Full, 42 = New, 84 = Full again.
+    let (moon_illumination, moon_waxing) = if daysmod < 42 {
+        (1.0 - daysmod as f32 / 42.0, false) // waning Full→New
+    } else {
+        ((daysmod as f32 - 42.0) / 42.0, true) // waxing New→Full
+    };
 
     // Sun is above horizon from hour 6 → 18 (noon at 12). Use a half
     // sine so altitude is 0 at sunrise/sunset and peaks at noon.
@@ -124,6 +155,8 @@ fn vana_sky_from_unix(earth_unix: f64) -> VanaSky {
     VanaSky {
         hour,
         moon_phase,
+        moon_illumination,
+        moon_waxing,
         sun_altitude,
         moon_altitude,
     }
@@ -134,7 +167,7 @@ fn vana_sky_from_unix(earth_unix: f64) -> VanaSky {
 #[derive(Resource)]
 pub struct CelestialMaterials {
     pub sun: Handle<StandardMaterial>,
-    pub moon: Handle<StandardMaterial>,
+    pub moon: Handle<crate::moon_material::MoonMaterial>,
 }
 
 /// Spawn the sun and moon directional lights *and* their visible
@@ -148,6 +181,7 @@ pub fn spawn_sun_and_moon(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    moon_materials: &mut Assets<crate::moon_material::MoonMaterial>,
     settings: &crate::graphics_settings::GraphicsSettings,
 ) {
     use crate::graphics_settings::cascade_config_from_settings;
@@ -186,17 +220,19 @@ pub fn spawn_sun_and_moon(
     // colors must live in `base_color` for the bloom halo to fire.
     // `unlit: true` keeps the disc self-luminous (no shading on top).
     // Real per-frame colors are written by `sun_moon_system`.
+    // Sun: unlit emissive sphere (bloom halo carries the rest).
     let sphere = meshes.add(Sphere::new(1.0).mesh().ico(3).unwrap());
     let sun_mat = materials.add(StandardMaterial {
         base_color: Color::linear_rgb(20.0, 18.0, 10.0),
         unlit: true,
         ..default()
     });
-    let moon_mat = materials.add(StandardMaterial {
-        base_color: Color::linear_rgb(2.0, 2.4, 4.0),
-        unlit: true,
-        ..default()
-    });
+    // Moon: flat unit-quad billboard with our custom phase-shading
+    // material. `Rectangle::new(1.0, 1.0)` is centered at origin in
+    // its local XY plane; `sun_moon_system` rotates the quad to face
+    // the camera each frame.
+    let moon_quad = meshes.add(Rectangle::new(1.0, 1.0));
+    let moon_mat = moon_materials.add(crate::moon_material::MoonMaterial::default());
     // `NotShadowCaster`: critical — without it the sun disc, being a
     // huge sphere positioned between the directional light source and
     // the world, would cast a sky-spanning shadow on the entire
@@ -206,12 +242,9 @@ pub fn spawn_sun_and_moon(
     commands.spawn((
         crate::components::InGameEntity,
         SunDisc,
-        Mesh3d(sphere.clone()),
+        Mesh3d(sphere),
         MeshMaterial3d(sun_mat.clone()),
         Transform::from_scale(Vec3::splat(SUN_DISC_RADIUS)),
-        // Hidden by default; `sun_moon_system` reveals when above horizon.
-        // Without this, a zero-emissive unlit black sphere reads as a
-        // black hole in the sky during night/new-moon.
         Visibility::Hidden,
         NotShadowCaster,
         NotShadowReceiver,
@@ -219,7 +252,7 @@ pub fn spawn_sun_and_moon(
     commands.spawn((
         crate::components::InGameEntity,
         MoonDisc,
-        Mesh3d(sphere),
+        Mesh3d(moon_quad),
         MeshMaterial3d(moon_mat.clone()),
         Transform::from_scale(Vec3::splat(MOON_DISC_RADIUS)),
         Visibility::Hidden,
@@ -260,36 +293,41 @@ pub fn sun_color_for_hour(hour: f32, sun_altitude: f32) -> (Color, f32) {
     (Color::srgb(r, g, b), lux)
 }
 
-/// Map moon phase + altitude → moon color + illuminance.
+/// Map moon illumination + altitude → moon color + illuminance.
 ///
-/// Phase 0/1 = New (invisible), 0.5 = Full (brightest). Cool blue tint.
-pub fn moon_color_for_phase(phase: f32, moon_altitude: f32) -> (Color, f32) {
+/// `illumination` is the LSB-style fraction in `[0, 1]` — 1 = Full,
+/// 0 = New. Cool blue tint.
+pub fn moon_color_for_phase(illumination: f32, moon_altitude: f32) -> (Color, f32) {
     if moon_altitude <= 0.0 {
         return (Color::BLACK, 0.0);
     }
-    // Distance from full (phase 0.5). 0 at full, 1 at new.
-    let from_full = (phase - 0.5).abs() * 2.0;
-    let visibility = (1.0 - from_full).clamp(0.0, 1.0);
+    let visibility = illumination.clamp(0.0, 1.0);
     let elev = (moon_altitude / (PI / 2.0)).clamp(0.0, 1.0);
-    let lux = 200.0 * visibility * (0.3 + 0.7 * elev);
+    // Stylized brightness — real moonlight is < 1 lux, but the scene's
+    // ambient + tonemapping curves require a kick to read on screen.
+    // 200 lux barely registered; bump to 1500 lux at full + zenith so
+    // night scenes actually have a visible blue cast and PCs catch
+    // moon highlights.
+    let lux = 1500.0 * visibility * (0.3 + 0.7 * elev);
     (Color::srgb(0.62, 0.72, 1.00), lux)
 }
 
 /// Each-frame system: read Vana sky, update sun + moon transforms,
 /// colors, illuminance, and visible disc positions/emissives.
 /// 8-bucket moon-phase names. Indexed by `(phase * 8.0).floor() % 8`
-/// where `phase` is the `[0.0, 1.0)` value on `VanaSky` (0.0 = new,
-/// 0.5 = full). Standard astronomy 8-phase naming; FFXI's in-game moon
-/// percentage tracks illumination so we surface that alongside the name.
+/// where `phase` is the LSB-aligned `[0.0, 1.0)` cycle position on
+/// `VanaSky` (0.0 = Full, 0.5 = New, → 1.0 = Full). The cycle is
+/// Full → Waning → New → Waxing → Full to match LSB's
+/// `moon::get_direction` semantics.
 const MOON_PHASE_NAMES: [&str; 8] = [
-    "New",
-    "Waxing Crescent",
-    "First Quarter",
-    "Waxing Gibbous",
     "Full",
     "Waning Gibbous",
     "Last Quarter",
     "Waning Crescent",
+    "New",
+    "Waxing Crescent",
+    "First Quarter",
+    "Waxing Gibbous",
 ];
 
 pub fn sun_moon_system(
@@ -337,12 +375,14 @@ pub fn sun_moon_system(
     q_cam: Query<&Transform, With<crate::camera::OperatorCamera>>,
     materials_handle: Option<Res<CelestialMaterials>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut moon_materials: ResMut<Assets<crate::moon_material::MoonMaterial>>,
     mut scene_state: ResMut<crate::snapshot::SceneState>,
+    vana_clock: Res<crate::vana_time::VanaClock>,
     mut prev_sun_up: Local<Option<bool>>,
     mut prev_moon_up: Local<Option<bool>>,
     mut prev_phase_bucket: Local<Option<u8>>,
 ) {
-    *sky = vana_sky_now();
+    *sky = vana_sky_from_clock(&vana_clock);
 
     // Sun/moon altitude zero-crossings → System chat. Edge-triggered
     // so we get one line per rise/set, not one per frame while above
@@ -379,17 +419,16 @@ pub fn sun_moon_system(
     }
     *prev_moon_up = Some(moon_up_now);
 
-    // Moon phase bucket — eight 12.5%-wide windows. Surfaces with the
-    // FFXI-style illumination percent (0% at new, 100% at full) so the
-    // line matches what retail's lunar HUD shows the player.
+    // Moon phase bucket — eight 12.5%-wide windows. The illumination
+    // percent matches LSB's `moon::get_phase` so the line matches what
+    // retail's lunar HUD shows the player.
     let phase_bucket = ((sky.moon_phase * 8.0).floor() as i32).rem_euclid(8) as u8;
     if let Some(prev) = *prev_phase_bucket {
         if prev != phase_bucket {
-            let illumination = (1.0 - (sky.moon_phase - 0.5).abs() * 2.0).clamp(0.0, 1.0);
             scene_state.push_local_toast(crate::snapshot::system_chat_line(format!(
                 "☾ Moon: {} ({:.0}% illuminated)",
                 MOON_PHASE_NAMES[phase_bucket as usize],
-                illumination * 100.0,
+                sky.moon_illumination * 100.0,
             )));
         }
     }
@@ -416,7 +455,8 @@ pub fn sun_moon_system(
     let moon_angle = sun_angle + PI;
     let moon_dir = Vec3::new(moon_angle.cos(), moon_angle.sin(), 0.25).normalize();
     let moon_pos = moon_dir * LIGHT_DISTANCE;
-    let (moon_color, moon_lux) = moon_color_for_phase(sky.moon_phase, sky.moon_altitude);
+    let (moon_color, moon_lux) =
+        moon_color_for_phase(sky.moon_illumination, sky.moon_altitude);
     if let Ok((mut light, mut xf)) = q_moon.single_mut() {
         light.color = moon_color;
         light.illuminance = moon_lux;
@@ -439,13 +479,19 @@ pub fn sun_moon_system(
             Visibility::Hidden
         };
     }
-    // Moon: hide when below horizon *or* when phase visibility is ~0
+    // Moon: hide when below horizon *or* when illumination is ~0
     // (new moon is invisible by definition).
-    let moon_phase_vis = 1.0 - (sky.moon_phase - 0.5).abs() * 2.0;
-    let moon_visible = sky.moon_altitude > 0.0 && moon_phase_vis > 0.02;
+    let moon_visible = sky.moon_altitude > 0.0 && sky.moon_illumination > 0.02;
     if let Ok((mut disc, mut vis)) = q_moon_disc.single_mut() {
-        disc.translation = cam_pos + moon_dir * SKY_RADIUS;
+        let moon_world = cam_pos + moon_dir * SKY_RADIUS;
+        disc.translation = moon_world;
         disc.scale = Vec3::splat(MOON_DISC_RADIUS);
+        // Billboard: face the camera. The Rectangle mesh lives in
+        // its local XY plane with +Z as its normal — so aim +Z at
+        // the camera. Using `Vec3::Y` as up keeps the disc upright;
+        // the phase-mask shader's "horizontal terminator" then maps
+        // intuitively to waxing/waning.
+        disc.look_at(cam_pos, Vec3::Y);
         *vis = if moon_visible {
             Visibility::Inherited
         } else {
@@ -476,16 +522,22 @@ pub fn sun_moon_system(
                 c.blue * intensity * 0.75,
             );
         }
-        if let Some(moon_mat) = materials.get_mut(&handles.moon) {
-            let from_full = (sky.moon_phase - 0.5).abs() * 2.0;
-            let visibility = (1.0 - from_full).clamp(0.0, 1.0);
+        if let Some(moon_mat) = moon_materials.get_mut(&handles.moon) {
+            let visibility = sky.moon_illumination.clamp(0.0, 1.0);
+            // Slight floor so an above-horizon crescent still reads as
+            // a faint disc rather than going completely black between
+            // earthshine and the (small) lit fraction.
             let intensity = if sky.moon_altitude > 0.0 {
-                1.5 + 5.0 * visibility
+                0.6 + 1.4 * visibility
             } else {
                 0.0
             };
-            moon_mat.base_color =
-                Color::linear_rgb(0.65 * intensity, 0.80 * intensity, 1.20 * intensity);
+            moon_mat.data.params = Vec4::new(
+                sky.moon_illumination,
+                if sky.moon_waxing { 1.0 } else { -1.0 },
+                intensity,
+                0.0,
+            );
         }
     }
 }
@@ -496,9 +548,30 @@ mod tests {
 
     #[test]
     fn noon_sun_is_overhead() {
-        let sky = vana_sky_from_unix((EARTH_EPOCH_UNIX + 12 * 25) as f64);
+        // 12 V-hours = 12 * 144 = 1728 Earth-seconds after epoch.
+        let sky = vana_sky_from_unix((EARTH_EPOCH_UNIX + 12 * 144) as f64);
         assert!((sky.hour - 12.0).abs() < 0.01);
         assert!(sky.sun_altitude > 1.5); // ≈ π/2 = 1.5708
+    }
+
+    #[test]
+    fn moon_phase_matches_lsb_formula() {
+        // LSB: daysmod = (vana_days + 886*360 + 26) % 84
+        // At V-day 4 (after epoch), daysmod = (4 + 38) % 84 = 42 → New Moon (0%).
+        let v_day = EARTH_SECS_PER_VANA_DAY;
+        let sky = vana_sky_from_unix((EARTH_EPOCH_UNIX + 4 * v_day) as f64);
+        assert!(
+            sky.moon_illumination < 0.05,
+            "expected new moon at V-day 4, got illumination {}",
+            sky.moon_illumination
+        );
+        // V-day 46 = daysmod (46+38) % 84 = 0 → Full Moon (100%).
+        let sky = vana_sky_from_unix((EARTH_EPOCH_UNIX + 46 * v_day) as f64);
+        assert!(
+            sky.moon_illumination > 0.95,
+            "expected full moon at V-day 46, got illumination {}",
+            sky.moon_illumination
+        );
     }
 
     #[test]

@@ -205,6 +205,9 @@ pub fn event_to_viewer_event(ev: AgentEvent) -> Option<wire::ViewerEvent> {
             action_id,
             action_kind,
         }),
+        AgentEvent::VanaTimeSynced { game_time } => {
+            Some(wire::ViewerEvent::VanaTimeSynced { game_time })
+        }
         // Snapshot-folded signals (Connected, StageChanged, PositionChanged,
         // EntityUpserted, ChatLine, PartyMemberUpdated, Diagnostics) are
         // already visible through the state watch — no need to push them as

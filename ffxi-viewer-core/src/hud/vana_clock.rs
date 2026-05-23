@@ -1,30 +1,37 @@
 //! Vana'diel clock HUD.
 //!
-//! Vana'dielian time is a deterministic transform of Earth time. The
-//! widely-used reference (Wiki / `vana_time` formulas) is:
+//! Vana'dielian time is a deterministic transform of Earth time. We
+//! match LSB's authoritative ratio (`vendor/server/src/common/vanadiel_clock.h`):
 //!
-//! - 25 Earth seconds = 1 Vana'diel hour.
-//! - The Vana'dielian epoch is 8866-01-01 00:00 V.D., which corresponds
-//!   to Earth 2002-06-23 15:00 UTC.
+//! - 1 Earth second = 25 Vana'diel seconds.
+//! - 1 V-minute  = 2.4 Earth seconds.
+//! - 1 V-hour    = 144 Earth seconds (= 2.4 min).
+//! - 1 V-day     = 3456 Earth seconds (≈ 57.6 min).
+//! - Vana'diel epoch is Earth 2002-01-01 00:00 JST (Unix 1009810800);
+//!   see `vendor/server/src/common/earth_time.h:40`.
 //!
-//! Equivalently, Vana time advances 24 / (25 * 24) = 1/25 of a real
-//! second per real second times 24 V hours per day, etc. The standard
-//! approach is to measure seconds since the Earth epoch, multiply by
-//! the V-day-rate, and convert back.
+//! Time can come from one of two sources, in priority order:
+//!   1. The `VanaClock` resource (server-authoritative, seeded by the
+//!      `GameTime` field of the 0x00A LOGIN packet).
+//!   2. System time fallback before any server packet has arrived.
 //!
-//! No server data needed; this is pure formula.
+//! Always prefer reading via [`crate::vana_time::current_vana`] rather
+//! than `SystemTime::now()` directly — this module only owns the HUD
+//! widget and the pure formulas.
 
 use bevy::prelude::*;
 
 use crate::hud::palette;
 
-/// Earth epoch corresponding to Vana'diel 8866-01-01 00:00, in
-/// `(SystemTime - UNIX_EPOCH).as_secs()` form. 2002-06-23 15:00 UTC.
-pub const EARTH_EPOCH_UNIX: u64 = 1_024_844_400;
+/// Earth epoch of Vana'diel 0886-01-01 00:00 (LSB's `vanadiel_epoch`),
+/// in Unix seconds. 2002-01-01 00:00 JST.
+pub const EARTH_EPOCH_UNIX: u64 = 1_009_810_800;
 /// Vana'diel epoch year offset.
 const VANA_EPOCH_YEAR: u32 = 886;
-/// Earth seconds per Vana'diel day. 1 V-hour = 25 Earth seconds, day = 24.
-pub const EARTH_SECS_PER_VANA_DAY: u64 = 25 * 24;
+/// Earth seconds per Vana'diel hour. 1 Earth-sec = 25 Vana-sec ⇒ 1 V-hour = 144 Earth-sec.
+pub const EARTH_SECS_PER_VANA_HOUR: u64 = 144;
+/// Earth seconds per Vana'diel day.
+pub const EARTH_SECS_PER_VANA_DAY: u64 = EARTH_SECS_PER_VANA_HOUR * 24;
 /// V-days per V-month and V-months per V-year. FFXI uses 30 / 12.
 const VANA_DAYS_PER_MONTH: u32 = 30;
 const VANA_MONTHS_PER_YEAR: u32 = 12;
@@ -87,19 +94,15 @@ pub fn update_vana_clock(
     time: Res<Time>,
     mut q: Query<&mut Text, With<VanaClockLabel>>,
     mut scene_state: ResMut<crate::snapshot::SceneState>,
+    vana_clock: Res<crate::vana_time::VanaClock>,
     mut prev_vana_day: Local<Option<u64>>,
 ) {
     let Ok(mut text) = q.single_mut() else {
         return;
     };
-    // Refresh once per real second — V-time advances ~1.4 V-minutes per
-    // real second so once per second is plenty of resolution.
     let _ = time;
 
-    let earth_now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(EARTH_EPOCH_UNIX);
+    let earth_now = vana_clock.earth_unix_secs_now();
     let want = format_vana(earth_now);
     if **text != want {
         **text = want;
@@ -125,7 +128,7 @@ pub fn update_vana_clock(
     *prev_vana_day = Some(total_vana_days);
 }
 
-/// Monotonic Vana minutes since the V-epoch (8866-01-01 00:00).
+/// Monotonic Vana minutes since the V-epoch (0886-01-01 00:00).
 ///
 /// Use this when you need a single increasing scalar across days —
 /// e.g. when a Scheduler-like timeline straddles a Vana-day rollover,
@@ -135,25 +138,23 @@ pub fn update_vana_clock(
 /// use [`crate::sun_moon::VanaSky::hour`].
 pub fn vana_minutes_since_epoch(earth_unix_secs: u64) -> u64 {
     let earth_since_vana = earth_unix_secs.saturating_sub(EARTH_EPOCH_UNIX);
-    // 25 Earth seconds = 1 V-hour = 60 V-min, so 1 Earth-second = 60/25 = 2.4 V-min.
-    // Stay in integer math by scaling: vana-min = earth-sec * 60 / 25.
-    earth_since_vana.saturating_mul(60) / 25
+    // 1 Earth-sec = 25 Vana-sec ⇒ Vana-min = Earth-sec * 25 / 60.
+    earth_since_vana.saturating_mul(25) / 60
 }
 
 /// Convert `earth_unix_secs` to a `V YYYY-MM-DD HH:MM` string.
 pub fn format_vana(earth_unix_secs: u64) -> String {
     let earth_since_vana = earth_unix_secs.saturating_sub(EARTH_EPOCH_UNIX);
-    // Vana days that have elapsed since 8866-01-01.
-    let total_vana_days = earth_since_vana / EARTH_SECS_PER_VANA_DAY;
-    let secs_into_today = earth_since_vana % EARTH_SECS_PER_VANA_DAY;
+    // Express everything in total Vana minutes for clean integer math.
+    let total_v_min = earth_since_vana.saturating_mul(25) / 60;
+    let total_v_hour = total_v_min / 60;
+    let total_v_day = total_v_hour / 24;
 
-    // Hour: 25 Earth seconds = 1 V-hour. Minutes: 25/60 Earth seconds per V-min.
-    let v_hour = secs_into_today / 25; // 0..23
-    let v_minute_secs = secs_into_today % 25;
-    let v_minute = (v_minute_secs as f64 * 60.0 / 25.0) as u64; // 0..59
+    let v_minute = total_v_min % 60;
+    let v_hour = total_v_hour % 24;
 
-    let v_year = VANA_EPOCH_YEAR as u64 + total_vana_days / VANA_DAYS_PER_YEAR as u64;
-    let day_of_year = (total_vana_days % VANA_DAYS_PER_YEAR as u64) as u32;
+    let v_year = VANA_EPOCH_YEAR as u64 + total_v_day / VANA_DAYS_PER_YEAR as u64;
+    let day_of_year = (total_v_day % VANA_DAYS_PER_YEAR as u64) as u32;
     let v_month = day_of_year / VANA_DAYS_PER_MONTH + 1;
     let v_day = day_of_year % VANA_DAYS_PER_MONTH + 1;
 
@@ -172,7 +173,7 @@ mod tests {
 
     #[test]
     fn one_vana_hour_after_epoch_is_01_00() {
-        let s = format_vana(EARTH_EPOCH_UNIX + 25);
+        let s = format_vana(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_HOUR);
         assert_eq!(s, "V 0886-01-01 01:00");
     }
 
@@ -207,9 +208,12 @@ mod tests {
 
     #[test]
     fn vana_minutes_since_epoch_matches_formatter() {
-        // One V-hour = 60 V-min = 25 earth-sec.
+        // One V-hour = 60 V-min = 144 Earth-sec.
         assert_eq!(vana_minutes_since_epoch(EARTH_EPOCH_UNIX), 0);
-        assert_eq!(vana_minutes_since_epoch(EARTH_EPOCH_UNIX + 25), 60);
+        assert_eq!(
+            vana_minutes_since_epoch(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_HOUR),
+            60
+        );
         // A full V-day = 24 × 60 = 1440 V-min.
         assert_eq!(
             vana_minutes_since_epoch(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_DAY),
