@@ -36,6 +36,7 @@ const PANEL_WIDTH_PX: f32 = 360.0;
 pub fn spawn_shop_panel(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             ShopPanel,
             Node {
                 position_type: PositionType::Absolute,

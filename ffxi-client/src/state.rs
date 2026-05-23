@@ -223,6 +223,9 @@ pub enum ChatChannel {
     /// driven by 0x029 / 0x02D battle messages. Translated to
     /// `wire::ChatChannel::Battle` and rendered in orange.
     Battle,
+    /// Client-internal debug toast. Mirrors `wire::ChatChannel::Debug`;
+    /// routed to the dedicated Chat 3 panel by the viewer.
+    Debug,
 }
 
 impl ChatChannel {
@@ -342,6 +345,61 @@ pub struct SessionState {
     /// snapshot time in `wire_translate::state_to_snapshot`.
     #[serde(default)]
     pub current_weather: Option<u16>,
+    /// Equipped gear, indexed by `SLOTTYPE` (0..16: Main, Sub, Ranged,
+    /// Ammo, Head, Body, Hands, Legs, Feet, Neck, Waist, LEar, REar,
+    /// LRing, RRing, Back). `None` means the slot is empty.
+    ///
+    /// Each entry is a *reference* into the inventory mirror — to
+    /// resolve to a real `item_no` for display, look up
+    /// `inventory.containers[r.container].slots`, find the slot whose
+    /// `index == r.container_index`, and read its `item_no`. Decoded
+    /// from `0x050 EQUIP_LIST` (per-slot updates) and reset by
+    /// `0x04F EQUIP_CLEAR`. Not zoned on zone change — equipment is
+    /// account-wide.
+    #[serde(default = "default_equipment")]
+    pub equipment: [Option<EquippedRef>; EQUIPMENT_SLOTS],
+    /// Spell ids the character has learned, sorted ascending. Decoded
+    /// from `0x0AA MAGIC_DATA` (a 1024-bit packed bitset) at login
+    /// and on every spell-learned event. Empty until the first
+    /// `MAGIC_DATA` lands.
+    #[serde(default)]
+    pub spells_known: Vec<u16>,
+    /// Job-ability ids the character currently has, sorted ascending.
+    /// Decoded from the `JobAbilities[64]` sub-bitmap of
+    /// `0x0AC COMMAND_DATA`. Re-sent on job change.
+    #[serde(default)]
+    pub job_abilities_known: Vec<u16>,
+    /// Weapon-skill ids currently usable on the equipped weapon.
+    /// Decoded from the `WeaponSkills[64]` sub-bitmap of
+    /// `0x0AC COMMAND_DATA`.
+    #[serde(default)]
+    pub weaponskills_known: Vec<u16>,
+    /// Pet-ability / Blood-pact ids. Decoded from the
+    /// `PetAbilities[64]` sub-bitmap of `0x0AC COMMAND_DATA`. Only
+    /// non-empty for BST/SMN/PUP and similar jobs.
+    #[serde(default)]
+    pub pet_abilities_known: Vec<u16>,
+}
+
+/// Number of distinct equipment slots in retail FFXI. Indexed by
+/// `SLOTTYPE` (`vendor/server/src/map/enums/slot.h`), with values
+/// 0..=15 for Main/Sub/.../Back.
+pub const EQUIPMENT_SLOTS: usize = 16;
+
+/// Reference into the inventory mirror pointing at one equipped item.
+/// Carries no `item_no` directly — the server's `EQUIP_LIST` packet
+/// (`0x050`) only sends container + slot index, so callers resolve
+/// against `Inventory` to fetch the actual id. Resolution can race
+/// the initial inventory flood; treat a missing item as "not yet
+/// loaded" rather than "unequipped".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EquippedRef {
+    pub container: u8,
+    pub container_index: u8,
+}
+
+fn default_equipment() -> [Option<EquippedRef>; EQUIPMENT_SLOTS] {
+    [None; EQUIPMENT_SLOTS]
 }
 
 /// Snapshot of an in-flight `/logout` or `/shutdown` countdown. Updated
@@ -917,8 +975,17 @@ impl SessionState {
             | AgentEvent::EngagedBy { .. }
             | AgentEvent::TellReceived { .. }
             | AgentEvent::SceneSummary { .. }
+            | AgentEvent::ActionStarted { .. }
             | AgentEvent::HumanInControl { .. }
-            | AgentEvent::HumanReleased => {}
+            | AgentEvent::HumanReleased
+            // Music events are pure pass-through to the viewer-core
+            // BGM system; SessionState carries no music fields, the
+            // active slot/track lives in viewer-core's BgmSlots
+            // resource.
+            | AgentEvent::MusicChanged { .. }
+            | AgentEvent::MusicVolumeChanged { .. }
+            | AgentEvent::LevelUp { .. }
+            | AgentEvent::SkillLevelUp { .. } => {}
             AgentEvent::InventoryUpdated { container, update } => {
                 let entry = self.inventory.containers.entry(*container).or_default();
                 match update {
@@ -965,6 +1032,38 @@ impl SessionState {
                         // full-slot packet will arrive separately.
                     }
                 }
+            }
+            AgentEvent::EquipUpdated {
+                slot,
+                container,
+                container_index,
+            } => {
+                // Defensive bounds check: SLOTTYPE is 0..16 in retail
+                // FFXI; out-of-range values would indicate a protocol
+                // drift, not legitimate data. Drop silently rather
+                // than panic so a server-side bug doesn't crash the
+                // client.
+                if let Some(cell) = self.equipment.get_mut(*slot as usize) {
+                    *cell = Some(EquippedRef {
+                        container: *container,
+                        container_index: *container_index,
+                    });
+                }
+            }
+            AgentEvent::EquipCleared => {
+                self.equipment = [None; EQUIPMENT_SLOTS];
+            }
+            AgentEvent::SpellsKnownUpdated { ids } => {
+                self.spells_known = ids.clone();
+            }
+            AgentEvent::CommandDataUpdated {
+                weapon_skills,
+                job_abilities,
+                pet_abilities,
+            } => {
+                self.weaponskills_known = weapon_skills.clone();
+                self.job_abilities_known = job_abilities.clone();
+                self.pet_abilities_known = pet_abilities.clone();
             }
             // EventStart is the lean signal (event_id only); EventDialog
             // is its richer companion that fills in the dialog HUD state.
@@ -1105,6 +1204,15 @@ pub enum AgentEvent {
         shutdown: bool,
     },
     EventEnded,
+    /// 0x028 BATTLE2 — action started. Surfaced to the viewer so it
+    /// can load the action's DAT and drive animation + particles +
+    /// audio playback. `action_kind` is the wire `cmd_no` byte
+    /// (`4` = Magic, `6` = Ability, …).
+    ActionStarted {
+        actor_id: u32,
+        action_id: u32,
+        action_kind: u8,
+    },
     KeyRotated {
         previous_status: BlowfishStatus,
     },
@@ -1201,6 +1309,35 @@ pub enum AgentEvent {
     /// on container capacities and slot counts being authoritative for
     /// `bank_when_full` checks.
     InventoryReady,
+    /// One equipment slot's source-of-truth (container + index) was
+    /// updated. Decoded from `0x050 EQUIP_LIST`. The receiver folds
+    /// this into `SessionState.equipment[slot]` and resolves the
+    /// actual `item_no` via the inventory mirror at display time.
+    EquipUpdated {
+        /// Equipment slot id (`SLOTTYPE`, 0..16). Larger values are
+        /// silently ignored by the fold.
+        slot: u8,
+        container: u8,
+        container_index: u8,
+    },
+    /// Reset all 16 equipment slots to empty. Decoded from
+    /// `0x04F EQUIP_CLEAR` (sent before the per-slot flood on login).
+    EquipCleared,
+    /// Decoded `0x0AA MAGIC_DATA` — character's full learned-spell
+    /// snapshot. The vec is pre-sorted ascending by spell id.
+    SpellsKnownUpdated {
+        ids: Vec<u16>,
+    },
+    /// Decoded `0x0AC COMMAND_DATA` — character's full
+    /// weapon-skill / job-ability / pet-ability snapshot. Each vec
+    /// is pre-sorted ascending. Traits are not surfaced (the HUD
+    /// doesn't render them; passive effects show up via 0x063
+    /// STATUS_ICONS).
+    CommandDataUpdated {
+        weapon_skills: Vec<u16>,
+        job_abilities: Vec<u16>,
+        pet_abilities: Vec<u16>,
+    },
     /// Reactor goal transitioned. Mirrored into
     /// `SessionState.current_goal` so renderers can show the active
     /// intent. Fires on every `handle_command` mutation and on the
@@ -1232,6 +1369,36 @@ pub enum AgentEvent {
     /// `/agent resume` — the operator released control back to the
     /// agent. Pair with [`HumanInControl`](Self::HumanInControl).
     HumanReleased,
+    /// 0x05F `GP_SERV_COMMAND_MUSIC` — server-pushed BGM slot
+    /// assignment. `slot` matches LSB's `MusicSlot` enum (0=ZoneDay,
+    /// 1=ZoneNight, 2=CombatSolo, 3=CombatParty, 4=Mount, 5=Dead,
+    /// 6=MogHouse, 7=Fishing); `track_id` is the numeric music id
+    /// resolved to `sound/win/music/data/musicNNN.bgw` by ffxi-audio.
+    MusicChanged {
+        slot: u8,
+        track_id: u16,
+    },
+    /// 0x060 `GP_SERV_COMMAND_MUSICVOLUME` — per-slot volume gain
+    /// (0..=127 in LSB; consumers should normalize before applying).
+    MusicVolumeChanged {
+        slot: u8,
+        volume: u8,
+    },
+    /// 0x02D BATTLE_MESSAGE2 with `MsgBasic::LevelUp` (id 9). The
+    /// actor id is the player; the level reached is implicit (LSB
+    /// doesn't put it in the chat-line payload — `data1` is the job
+    /// id, `data2 = 0`). The audio side only needs the trigger.
+    LevelUp {
+        player_id: u32,
+    },
+    /// 0x029 / 0x02D with `MsgBasic::SkillLevelUp` (id 53). Server
+    /// sends `(skill_id, level/10)` in `data1, data2`. Emitted from
+    /// the same site that produces the chat line — both consumers
+    /// run; chat shows the message, audio fires a stinger.
+    SkillLevelUp {
+        skill_id: u16,
+        level: u32,
+    },
 }
 
 /// Strictly enumerated commands an agent can issue. **Do not** add a generic
@@ -1359,6 +1526,19 @@ pub enum AgentCommand {
         item_no: u32,
         target_id: u32,
         target_index: u16,
+    },
+    /// `GP_CLI_COMMAND_EQUIP_SET` (c2s 0x050) — equip one item from
+    /// inventory into a specific equipment slot. The server validates
+    /// job/level/slot eligibility and pushes the resulting
+    /// `0x050 EQUIP_LIST` back to the client (which our Stage-1
+    /// decoder folds into `SessionState.equipment`).
+    Equip {
+        /// Source-container id (typically 0=Inventory; 8..=Wardrobes).
+        container: u8,
+        /// Slot index inside the source container.
+        container_index: u8,
+        /// `SLOTTYPE` destination (0=Main..15=Back).
+        equip_slot: u8,
     },
     /// Reactor goal: monitor inventory; when any non-mog container reaches
     /// `threshold` slots filled, request a zone change to `mog_house_zoneline`.
@@ -2113,7 +2293,10 @@ mod tests {
         };
         ent.look = Some(look.clone());
         s.apply_event(&AgentEvent::EntityUpserted { entity: ent });
-        assert!(matches!(s.entities[0].look, Some(LookData::Equipped { race: 3, .. })));
+        assert!(matches!(
+            s.entities[0].look,
+            Some(LookData::Equipped { race: 3, .. })
+        ));
 
         // Position-only refresh: look = None. Must keep the prior value.
         let mut pos_only = make_test_entity(42, None, EntityKind::Pc);

@@ -111,6 +111,9 @@ fn shared() -> Vec<(Action, KeyBind)> {
         // ----- Targeting -----
         (Action::CycleTarget, KeyBind::new(KeyCode::Tab)),
         (Action::ClearTarget, KeyBind::new(KeyCode::Escape)),
+        // F for Fight. Single key (no modifier) for low friction during
+        // combat testing; rebindable via /keybinds set.
+        (Action::ToggleEngage, KeyBind::new(KeyCode::KeyF)),
         (Action::TargetSelf, KeyBind::new(KeyCode::F1)),
         (Action::TargetParty2, KeyBind::new(KeyCode::F2)),
         (Action::TargetParty3, KeyBind::new(KeyCode::F3)),
@@ -133,16 +136,24 @@ fn shared() -> Vec<(Action, KeyBind)> {
     ]
 }
 
-/// Compact 1: WASD + arrow-key camera. No Q/E strafe. Retail's original
-/// "compact" mapping — the most common keyboard-only retail layout.
+/// Compact 1: WASD + arrow-key camera. A/D drive the FFXI-classic
+/// "turn-while-walking" verb so holding either alone in 3rd person
+/// traces a circle; Q/E are pure in-place rotation (no walk).
 pub fn compact1() -> Bindings {
     let mut pairs = shared();
     pairs.extend([
-        // Movement (no strafe).
         (Action::MoveForward, KeyBind::new(KeyCode::KeyW)),
         (Action::MoveBackward, KeyBind::new(KeyCode::KeyS)),
-        (Action::RotateLeft, KeyBind::new(KeyCode::KeyA)),
-        (Action::RotateRight, KeyBind::new(KeyCode::KeyD)),
+        // A/D = combined turn (rotate + walk-forward). In 3rd person
+        // this is the orbit-when-held verb; in first-person the walk
+        // implicit is suppressed and it degenerates to pure rotate
+        // (see `view_native::input::dispatch_movement_system`).
+        (Action::TurnLeft, KeyBind::new(KeyCode::KeyA)),
+        (Action::TurnRight, KeyBind::new(KeyCode::KeyD)),
+        // Q/E = pure rotate in place. The verb that "A/D used to do"
+        // before the turn-orbit reshuffle.
+        (Action::RotateLeft, KeyBind::new(KeyCode::KeyQ)),
+        (Action::RotateRight, KeyBind::new(KeyCode::KeyE)),
         // Camera on real arrows.
         (Action::CameraPitchUp, KeyBind::new(KeyCode::ArrowUp)),
         (Action::CameraPitchDown, KeyBind::new(KeyCode::ArrowDown)),
@@ -152,18 +163,21 @@ pub fn compact1() -> Bindings {
     Bindings::from_pairs(pairs)
 }
 
-/// Compact 2: Compact 1 + Q/E strafe + (in retail) mouse-wheel zoom.
-/// Mouse-wheel zoom isn't wired in our viewer; the only delta from
-/// Compact 1 here is the strafe pair. Default preset.
+/// Compact 2: identical to Compact 1 after the turn-orbit reshuffle.
+/// Retail's Compact 2 used Q/E for strafe, but that's mutually
+/// exclusive with our Q/E=pure-rotate assignment; operators who want
+/// strafe can re-add it via `/keybinds set strafe-left ...`. Kept as
+/// a distinct preset to preserve the on-disk slug ("compact2") for
+/// existing user configs and the default-preset slot.
 pub fn compact2() -> Bindings {
     let mut pairs = shared();
     pairs.extend([
         (Action::MoveForward, KeyBind::new(KeyCode::KeyW)),
         (Action::MoveBackward, KeyBind::new(KeyCode::KeyS)),
-        (Action::RotateLeft, KeyBind::new(KeyCode::KeyA)),
-        (Action::RotateRight, KeyBind::new(KeyCode::KeyD)),
-        (Action::StrafeLeft, KeyBind::new(KeyCode::KeyQ)),
-        (Action::StrafeRight, KeyBind::new(KeyCode::KeyE)),
+        (Action::TurnLeft, KeyBind::new(KeyCode::KeyA)),
+        (Action::TurnRight, KeyBind::new(KeyCode::KeyD)),
+        (Action::RotateLeft, KeyBind::new(KeyCode::KeyQ)),
+        (Action::RotateRight, KeyBind::new(KeyCode::KeyE)),
         (Action::CameraPitchUp, KeyBind::new(KeyCode::ArrowUp)),
         (Action::CameraPitchDown, KeyBind::new(KeyCode::ArrowDown)),
         (Action::CameraYawLeft, KeyBind::new(KeyCode::ArrowLeft)),
@@ -186,11 +200,17 @@ pub fn standard() -> Bindings {
     pairs.extend([
         (Action::MoveForward, KeyBind::new(KeyCode::Numpad8)),
         (Action::MoveBackward, KeyBind::new(KeyCode::Numpad2)),
-        (Action::RotateLeft, KeyBind::new(KeyCode::Numpad4)),
-        (Action::RotateRight, KeyBind::new(KeyCode::Numpad6)),
-        // Standard has no strafe — Q/E unbound. Camera lives on the real
-        // arrow keys (NavUp/NavDown still bound via shared(), so menus
-        // navigate as expected).
+        // Numpad 4/6 are the FFXI-classic "turn while walking" verb —
+        // holding either alone in 3rd person orbits the player. Standard
+        // has no pure-rotate (RotateLeft/Right) binding; the numpad
+        // layout has no obvious adjacent slot and retail Standard didn't
+        // ship one either. Operators who want pure rotate can add it
+        // via `/keybinds set rotate-left ...`.
+        (Action::TurnLeft, KeyBind::new(KeyCode::Numpad4)),
+        (Action::TurnRight, KeyBind::new(KeyCode::Numpad6)),
+        // Standard has no strafe and no pure-rotate binding by default.
+        // Camera lives on the real arrow keys (NavUp/NavDown still
+        // bound via shared(), so menus navigate as expected).
         (Action::CameraPitchUp, KeyBind::new(KeyCode::ArrowUp)),
         (Action::CameraPitchDown, KeyBind::new(KeyCode::ArrowDown)),
         (Action::CameraYawLeft, KeyBind::new(KeyCode::ArrowLeft)),
@@ -222,16 +242,19 @@ mod tests {
             b.get(Action::MoveBackward),
             Some(KeyBind::new(KeyCode::KeyS))
         );
-        assert_eq!(b.get(Action::RotateLeft), Some(KeyBind::new(KeyCode::KeyA)));
+        // A/D = combined turn (FFXI-classic orbit-when-held).
+        assert_eq!(b.get(Action::TurnLeft), Some(KeyBind::new(KeyCode::KeyA)));
+        assert_eq!(b.get(Action::TurnRight), Some(KeyBind::new(KeyCode::KeyD)));
+        // Q/E = pure rotate (what A/D used to do before the reshuffle).
+        assert_eq!(b.get(Action::RotateLeft), Some(KeyBind::new(KeyCode::KeyQ)));
         assert_eq!(
             b.get(Action::RotateRight),
-            Some(KeyBind::new(KeyCode::KeyD))
-        );
-        assert_eq!(b.get(Action::StrafeLeft), Some(KeyBind::new(KeyCode::KeyQ)));
-        assert_eq!(
-            b.get(Action::StrafeRight),
             Some(KeyBind::new(KeyCode::KeyE))
         );
+        // Strafe is unbound by default in every shipped preset after the
+        // reshuffle. Operators who want strafe can re-add it.
+        assert_eq!(b.get(Action::StrafeLeft), None);
+        assert_eq!(b.get(Action::StrafeRight), None);
     }
 
     #[test]
@@ -240,6 +263,14 @@ mod tests {
         assert_eq!(
             b.get(Action::MoveForward),
             Some(KeyBind::new(KeyCode::KeyW))
+        );
+        // Same A/D=turn, Q/E=rotate shape as Compact 2 after the reshuffle.
+        assert_eq!(b.get(Action::TurnLeft), Some(KeyBind::new(KeyCode::KeyA)));
+        assert_eq!(b.get(Action::TurnRight), Some(KeyBind::new(KeyCode::KeyD)));
+        assert_eq!(b.get(Action::RotateLeft), Some(KeyBind::new(KeyCode::KeyQ)));
+        assert_eq!(
+            b.get(Action::RotateRight),
+            Some(KeyBind::new(KeyCode::KeyE))
         );
         assert_eq!(b.get(Action::StrafeLeft), None);
         assert_eq!(b.get(Action::StrafeRight), None);
@@ -256,14 +287,18 @@ mod tests {
             b.get(Action::MoveBackward),
             Some(KeyBind::new(KeyCode::Numpad2))
         );
+        // Numpad 4/6 = turn (orbit-when-held). No pure-rotate binding
+        // in Standard; the numpad layout has no obvious adjacent slot.
         assert_eq!(
-            b.get(Action::RotateLeft),
+            b.get(Action::TurnLeft),
             Some(KeyBind::new(KeyCode::Numpad4))
         );
         assert_eq!(
-            b.get(Action::RotateRight),
+            b.get(Action::TurnRight),
             Some(KeyBind::new(KeyCode::Numpad6))
         );
+        assert_eq!(b.get(Action::RotateLeft), None);
+        assert_eq!(b.get(Action::RotateRight), None);
         assert_eq!(b.get(Action::StrafeLeft), None);
         assert_eq!(b.get(Action::StrafeRight), None);
         // Numpad 7 overrides shared R for autorun.

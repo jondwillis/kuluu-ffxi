@@ -148,6 +148,7 @@ pub fn spawn_logout_countdown(mut commands: Commands) {
     // -----------------------------------------------------------------
     commands
         .spawn((
+            crate::components::InGameEntity,
             LogoutCountdownBanner,
             Node {
                 position_type: PositionType::Absolute,
@@ -310,13 +311,14 @@ pub fn update_logout_countdown(
             let diagnostic = blocker_diagnostic(&scene_state.snapshot);
             let label = if shutdown { "/shutdown" } else { "/logout" };
             scene_state.push_local_toast(ChatLine {
-                channel: ChatChannel::System,
+                channel: ChatChannel::Debug,
                 sender: "client".into(),
                 text: format!(
                     "{label}: server did not acknowledge (silent reject \
                      by 0x0e7_reqlogout.cpp validator). {diagnostic}"
                 ),
                 server_ts: 0,
+                local_seq: 0,
             });
         }
     }

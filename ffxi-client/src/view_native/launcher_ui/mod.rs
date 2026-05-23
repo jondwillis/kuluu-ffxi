@@ -50,6 +50,7 @@ mod account_create;
 mod async_work;
 mod char_create;
 mod char_list;
+mod char_preview;
 mod login;
 
 use std::sync::{Arc, Mutex};
@@ -368,6 +369,48 @@ pub(crate) struct SelectedChar(pub Option<ffxi_client::lobby_client::CharSlot>);
 #[derive(Resource, Default)]
 pub(crate) struct PendingConnect(pub Option<Selection>);
 
+/// Copy the launcher's `SelectedChar` data into the viewer-core
+/// `SelfAppearance` override resource. Runs `OnEnter(ConnectInFlight)`
+/// so the in-game look_resolver finds the self entity's outfit
+/// once the player WorldEntity is spawned. LSB sends an empty
+/// GrapIDTbl for the local PC's CHAR_PC packet (retail clients
+/// reconstruct from local equipment state), so this is the only
+/// path that gives our self entity a real `EntityLook::Equipped`.
+fn populate_self_appearance(
+    sel: Res<SelectedChar>,
+    mut appearance: ResMut<ffxi_viewer_core::scene::SelfAppearance>,
+) {
+    use ffxi_viewer_wire::EntityLook;
+    let Some(slot) = sel.0.as_ref() else {
+        appearance.look = None;
+        return;
+    };
+    if slot.race == 0 {
+        // Empty / synthetic slot — leave override unset so the in-
+        // game capsule remains until / unless the wire fills in.
+        appearance.look = None;
+        return;
+    }
+    appearance.look = Some(EntityLook::Equipped {
+        face: slot.face,
+        race: slot.race,
+        head: slot.head,
+        body: slot.body,
+        hands: slot.hands,
+        legs: slot.legs,
+        feet: slot.feet,
+        main: slot.main,
+        sub: slot.sub,
+        ranged: slot.ranged,
+    });
+    tracing::info!(
+        char_id = slot.char_id,
+        race = slot.race,
+        face = slot.face,
+        "self appearance: cached launcher slot for in-game look_resolver"
+    );
+}
+
 /// Optional default char name pulled from CLI args. Used by `char_list`
 /// to highlight a matching row, and by `direct_mode_charlist_autoselect`
 /// to auto-click that row when present.
@@ -469,13 +512,18 @@ pub(crate) fn register(
     );
 
     // Char list: spawn UI from the snapshot, dispatch on click.
+    // `char_preview::spawn_preview` runs *after* `spawn_char_list_ui`
+    // so the `CharCursor` resource it depends on already exists.
     app.add_systems(
         OnEnter(LauncherState::CharList),
-        char_list::spawn_char_list_ui,
+        (char_list::spawn_char_list_ui, char_preview::spawn_preview).chain(),
     )
     .add_systems(
         OnExit(LauncherState::CharList),
-        char_list::despawn_char_list_ui,
+        (
+            char_list::despawn_char_list_ui,
+            char_preview::despawn_preview,
+        ),
     )
     .add_systems(
         Update,
@@ -483,14 +531,23 @@ pub(crate) fn register(
             direct_mode_charlist_autoselect,
             char_list::handle_click_system,
             char_list::handle_keyboard_system,
+            char_preview::refresh_preview_on_cursor_change,
         )
             .run_if(in_state(LauncherState::CharList)),
     );
 
-    // Connect in flight: spawn task, poll oneshot.
+    // Connect in flight: spawn task, poll oneshot. Also: copy the
+    // selected character's appearance into `SelfAppearance` so the
+    // in-game look_resolver has something to render once the player
+    // entity arrives (LSB zeros self GrapIDTbl, so this is the only
+    // source of truth for the local PC's outfit).
     app.add_systems(
         OnEnter(LauncherState::ConnectInFlight),
-        (async_work::spawn_connect_task, async_work::spawn_connect_ui),
+        (
+            populate_self_appearance,
+            async_work::spawn_connect_task,
+            async_work::spawn_connect_ui,
+        ),
     )
     .add_systems(
         OnExit(LauncherState::ConnectInFlight),
@@ -610,8 +667,7 @@ pub(crate) fn register(
     )
     .add_systems(
         Update,
-        account_create::error_keyboard_system
-            .run_if(in_state(LauncherState::CreateAccountError)),
+        account_create::error_keyboard_system.run_if(in_state(LauncherState::CreateAccountError)),
     );
 
     // Done: hand off to AppPhase::Connecting. The launcher's camera

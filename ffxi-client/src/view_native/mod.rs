@@ -28,6 +28,7 @@ pub mod input;
 pub mod launcher_ui;
 pub mod nameplate_occlude;
 pub mod navmesh_overlay;
+pub mod screenshot;
 pub mod slash_commands;
 pub mod text_input;
 
@@ -41,17 +42,22 @@ use ffxi_client::lobby_client::LobbyClient;
 use ffxi_client::reactor::ReactorConfig;
 use ffxi_client::{spawn_session_with_reactor, SessionHandle};
 use ffxi_viewer_core::{
-    add_hud_spawners, hud::zone_flash::ZoneNameResolver, setup_world, setup_zone_line_assets,
-    spawn_camera, HudPlugin, MousePlugin, SceneState, ViewerCorePlugin, ZoneLineDescriptor,
-    ZoneLineResolver,
+    add_hud_spawners,
+    atmosphere::LastAtmosphereZone,
+    audio::BgmSlots,
+    dat_mzb::{LastAutoLoadedZone, MzbCollisionGeometry},
+    hud::zone_flash::ZoneNameResolver,
+    scene::TrackedEntities,
+    setup_world, setup_zone_line_assets, spawn_camera, EventLog, HudPlugin, InGameEntity,
+    MousePlugin, SceneState, ViewerCorePlugin, ZoneLineDescriptor, ZoneLineResolver,
 };
-use ffxi_viewer_wire::Stage as WireStage;
+use ffxi_viewer_wire::{Stage as WireStage, ViewerEvent};
 use tokio::runtime::Handle as RtHandle;
 
 use crate::launcher::Defaults;
 
 use self::bridge::NativeSource;
-use self::input::{AutoRun, CommandTx};
+use self::input::{AutoRun, CommandTx, LocalPlayerPrediction};
 use self::launcher_ui::{LoginErrorMsg, PendingConnect};
 
 /// Top-level phase of the unified native `App`.
@@ -205,8 +211,18 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // for highlight materials, breaking Tab targeting visuals.
     app.insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<AutoRun>()
+        .init_resource::<LocalPlayerPrediction>()
+        .init_resource::<text_input::CaptureMode>()
         .insert_resource(ports)
         .insert_resource(RelayListen(relay_listen))
+        // Mirror the DAT-root Arc into the minimap's retail backend
+        // resource so its zone-change loader can resolve map-DAT
+        // file_ids to disk paths. Same Arc both places — no double
+        // table-load. Without this, the retail backend silently
+        // no-ops and the minimap falls back to the top-down bake.
+        .insert_resource(ffxi_viewer_core::minimap::retail::MinimapDatRoot(
+            dat_root.clone(),
+        ))
         .insert_resource(DatRootRes(dat_root));
     #[cfg(unix)]
     app.insert_resource(AgentListen(agent_listen));
@@ -233,6 +249,22 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
     add_hud_spawners(&mut app, OnEnter(AppPhase::InGame));
 
+    // Despawn every InGame-scoped entity on phase exit — camera, HUD
+    // widgets, world scene, dynamically-spawned PC/NPC mirrors,
+    // nameplates, etc. Every viewer-core spawner attaches the
+    // `InGameEntity` marker; this system flushes them all in one pass.
+    //
+    // Why a marker instead of Bevy's built-in `DespawnOnExit<AppPhase>`:
+    // viewer-core can't reference `AppPhase` without a circular
+    // dependency on the front-end crate. The marker lives at the
+    // viewer-core layer and the front-end registers the despawn against
+    // its own state type — same semantics, no layering violation. See
+    // `ffxi_viewer_core::components::InGameEntity`.
+    //
+    // Mirrors the symmetric `OnExit(AppPhase::Launcher)` 2D-camera
+    // despawn in `launcher_ui/mod.rs:437`.
+    app.add_systems(OnExit(AppPhase::InGame), despawn_ingame_entities);
+
     // Keybinds: load persisted preset+overrides from disk before plugins
     // run. `ViewerCorePlugin::build` calls `init_resource::<Bindings>()`,
     // which is a no-op when the resource is already present — so by
@@ -252,6 +284,16 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     };
     app.insert_resource(loaded_bindings);
     app.insert_resource(crate::keybinds_store::KeybindsStateRes { store, persisted });
+
+    // Graphics settings: same load-before-plugin pattern as keybinds,
+    // for the same reason — `ViewerCorePlugin::build`'s
+    // `init_resource::<GraphicsSettings>()` no-ops when the resource
+    // already exists, so the loaded settings become authoritative.
+    let (loaded_graphics, graphics_store_obj) = crate::graphics_store::load_or_default();
+    app.insert_resource(loaded_graphics);
+    app.insert_resource(crate::graphics_store::GraphicsStateRes {
+        store: graphics_store_obj,
+    });
 
     // Viewer plugins. `ViewerCorePlugin` registers ingest_system gated
     // on `resource_exists::<NativeSource>` (added by the bridge), so
@@ -294,6 +336,13 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             text_input::dialog_mode_sync_system,
             input::handle_input_system,
             text_input::text_input_system,
+            // Drains HUD-emitted activation messages (menu row click,
+            // dialog choice click, QA wedge click) through the same
+            // dispatch helpers `text_input_system` uses for keyboard
+            // NavConfirm. Chained after `text_input_system` so a same-
+            // frame keyboard+mouse race resolves keyboard-first; both
+            // call the same helper so the final state is consistent.
+            text_input::mouse_nav_dispatch_system,
             // Watches `Target` for changes and emits a `ChangeTarget`
             // action so the server learns about Tab/click/Esc/slash
             // target changes. Chained after the input handlers so the
@@ -301,12 +350,28 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             input::dispatch_target_change_system,
         )
             .chain()
+            // Run AFTER `chase_camera_system` so Tab's NDC projection
+            // reads this frame's camera Transform, not last frame's.
+            // Without this ordering Bevy's scheduler may run input
+            // before the camera writes its updated position, and a
+            // mob that's actually in view projects as "behind the
+            // camera" (NDC.z out of range) and gets culled. The
+            // symptom was "near-and-in-view mobs often not tab-
+            // selectable" — flaky precisely because scheduler order
+            // varied frame-to-frame.
+            .after(ffxi_viewer_core::chase_camera_system)
             .run_if(in_state(AppPhase::InGame)),
     );
     app.add_systems(
         FixedUpdate,
         input::dispatch_movement_system.run_if(in_state(AppPhase::InGame)),
     );
+
+    // Persist graphics settings whenever they change. Best-effort —
+    // a disk write failure logs but does not block the in-memory
+    // mutation, so a transient I/O hiccup can't lock the operator
+    // out of changing settings.
+    app.add_systems(Update, crate::graphics_store::persist_graphics_on_change);
 
     // Camera-wall collision: clamp the chase camera so it stops at the
     // navmesh boundary instead of tunneling through walls. Scheduled
@@ -346,6 +411,18 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             .run_if(in_state(AppPhase::InGame)),
     );
 
+    // `/zonegeom camera` debug overlay — BVH AABBs + active ray gizmos.
+    // No-op when the mode isn't `Camera`, so the schedule cost is just
+    // a resource read. Scheduled after the clamp so the ray viz (when
+    // implemented) sees the same `effective` distance the camera was
+    // placed at.
+    app.add_systems(
+        Update,
+        camera_collision::draw_camera_collision_debug
+            .after(camera_collision::clamp_chase_camera_to_collision)
+            .run_if(in_state(AppPhase::InGame)),
+    );
+
     // Nameplate occlusion against zone geometry — hide name labels of
     // entities the camera can't actually see. Scheduled in PostUpdate
     // after the camera clamp so we test against the clamped camera
@@ -365,6 +442,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             debug_heights::process_debug_heights.run_if(in_state(AppPhase::InGame)),
         );
 
+    // `/screenshot [path]` — capture primary window to PNG.
+    app.add_message::<screenshot::ScreenshotRequest>()
+        .add_systems(Update, screenshot::process_screenshot_requests);
+
     // Disconnect → return-to-launcher. Runs every frame in InGame and
     // bounces the phase back to Launcher when the session ends (clean
     // /logout from the server, /quit, kick, connection drop, etc.).
@@ -379,21 +460,160 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     Ok(())
 }
 
-/// One-shot disconnect-watcher: when `SceneState.snapshot.stage` flips to
-/// `Disconnected` while we're `InGame`, populate `LoginErrorMsg` with a
-/// post-mortem and transition `AppPhase` back to `Launcher`. The
-/// launcher's existing `restore_login_error_on_reentry` then routes us
-/// to `LauncherState::LoginError` so the operator sees what happened
-/// (and can press Esc to fall back to the Login screen with creds
-/// remembered by `LoginForm`).
+/// Classification of the most recent disconnect, set by the watcher and
+/// read by the launcher to route between "clean /logout returns to
+/// Login with creds intact" vs "forced disconnect shows LoginError".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisconnectKind {
+    /// Operator-initiated `/logout` — server responded with the LOGOUT
+    /// packet (`session.rs` emits `AgentEvent::Disconnected` with
+    /// `reason = "server logout state=..."`). Treat as "switch
+    /// character": return to Launcher quietly with form/creds intact.
+    Clean,
+    /// Anything else: kick, timeout, agent-requested abort, crash.
+    /// Surface the post-mortem in `LoginErrorMsg`.
+    Forced,
+}
+
+/// Classify a `ViewerEvent::Disconnected.reason` string. Today only the
+/// `server logout state=...` prefix counts as clean; every other reason
+/// (timeout, agent abort, decode errors) is forced. Centralized so the
+/// rules stay testable and obvious.
+fn classify_disconnect_reason(reason: &str) -> DisconnectKind {
+    if reason.starts_with("server logout state=") {
+        DisconnectKind::Clean
+    } else {
+        DisconnectKind::Forced
+    }
+}
+
+/// `OnExit(AppPhase::InGame)` cleanup: despawn every entity carrying the
+/// [`InGameEntity`] marker AND drain stale resources so a fresh
+/// `OnEnter(InGame)` starts from a clean baseline.
 ///
-/// Why not auto-advance straight to `CharList`? The lobby's
-/// `LobbyHandle` was consumed by `select` (see `OpenedLobbyInner` doc),
-/// so reaching CharList requires a fresh `AuthInFlight`. For now the
-/// operator hits Esc → Enter to re-handshake; an auto-advance using
-/// the stored `Credentials` is a worthwhile follow-up.
+/// **Entity layer**: `despawn` in Bevy 0.17 is recursive — children
+/// come along — so each HUD spawner only needs to attach the marker
+/// to its top-level node, not to every nested child. Same for
+/// `WorldEntity` mirrors and their nameplate/HP-bar children, and for
+/// the MMB visual-prop parents spawned by `dat_mmb`.
+///
+/// **Resource layer**: caches keyed by zone (collision triangles,
+/// last-zone trackers, atmosphere, music-slot Entity handles) need
+/// explicit drains — their entries are not Components, so the
+/// recursive despawn never reaches them. Without this, returning to a
+/// zone you just left would short-circuit the auto-load watcher
+/// (`LastAutoLoadedZone` still matches), `TrackedEntities` would hand
+/// out stale-Entity handles, and `BgmSlots.active_entity` would point
+/// at a freed slot the next audio system tries to despawn.
+fn despawn_ingame_entities(
+    mut commands: Commands,
+    q: Query<Entity, With<InGameEntity>>,
+    mut scene: ResMut<SceneState>,
+    mut events: ResMut<EventLog>,
+    mut tracked: ResMut<TrackedEntities>,
+    mut collision: ResMut<MzbCollisionGeometry>,
+    mut last_zone: ResMut<LastAutoLoadedZone>,
+    mut last_atmo: ResMut<LastAtmosphereZone>,
+    mut bgm: ResMut<BgmSlots>,
+    mut weather_ambient: ResMut<ffxi_viewer_core::audio::WeatherAmbient>,
+    mut combat_sfx: ResMut<ffxi_viewer_core::audio::CombatSfxState>,
+    mut system_sfx_cursor: ResMut<ffxi_viewer_core::audio::SystemSfxCursor>,
+    mut engagement_chat_cursor: ResMut<ffxi_viewer_core::debug_chat::EngagementChatCursor>,
+    mut speed_suppression_latch: ResMut<ffxi_viewer_core::debug_chat::SpeedSuppressionLatch>,
+    mut entity_motion: ResMut<ffxi_viewer_core::combat_stance::EntityMotion>,
+    mut animation_blends: ResMut<ffxi_viewer_core::combat_stance::AnimationBlends>,
+) {
+    let mut count = 0usize;
+    for entity in q.iter() {
+        commands.entity(entity).despawn();
+        count += 1;
+    }
+
+    tracked.by_id.clear();
+    collision.positions.clear();
+    collision.indices.clear();
+    last_zone.zone_id = None;
+    last_atmo.zone_id = None;
+    // `active_entity` was just despawned by the `InGameEntity` pass
+    // above — the BGM sink carries the marker now. Clearing the
+    // Resource's reference + per-slot track table makes the next
+    // session start from a clean baseline rather than transitioning
+    // from a stale `Some((slot, track))` `active` field that would
+    // make `apply_bgm_system` think it should `despawn` an already-
+    // freed entity.
+    bgm.active_entity = None;
+    bgm.active = None;
+    bgm.tracks = [None; ffxi_viewer_core::audio::SLOT_COUNT];
+    bgm.event_cursor = 0;
+    // Loop-counter drain: the audio thread holds the other clone of
+    // the Arc and stops bumping it when the sink is dropped, but
+    // leaving the counter + reporter cursor populated would carry
+    // an inflated "loops seen" value into the next session and
+    // suppress the first real loop boundary of the next track.
+    bgm.bgm_loop_counter = None;
+    bgm.bgm_loops_reported = 0;
+    // Weather ambient sink: same shape as BGM — `InGameEntity` on
+    // the entity handles despawn; here we clear the Resource's
+    // active_entity pointer + prev/active weather memo so the
+    // observer re-arms cleanly on next zone-in.
+    weather_ambient.active_entity = None;
+    weather_ambient.active_weather = None;
+    weather_ambient.prev_weather = None;
+    // Combat SFX latch state — without reset, prev_engaged carrying
+    // `true` from the previous session would suppress the
+    // engage-self stinger when the player engages for the first time
+    // in the next session (the latch sees engaged_now == prev_engaged
+    // and skips the fire).
+    *combat_sfx = ffxi_viewer_core::audio::CombatSfxState::default();
+    // System-SFX cursor walks `EventLog.recent`; the event log itself
+    // is cleared below, so the cursor must reset to 0 or the next
+    // session's first events get skipped (cursor > len triggers the
+    // clamp path but still advances past them).
+    *system_sfx_cursor = ffxi_viewer_core::audio::SystemSfxCursor::default();
+    // Engagement-event chat cursor and speed-suppression latch: same
+    // reset reasoning as the SFX cursor above — the EventLog gets
+    // cleared at the bottom of this function, so an unreset cursor
+    // would either re-fire stale "Engaged by" toasts on next login or
+    // (more likely) silently skip the first ZoneChanged on re-entry.
+    *engagement_chat_cursor = ffxi_viewer_core::debug_chat::EngagementChatCursor::default();
+    *speed_suppression_latch = ffxi_viewer_core::debug_chat::SpeedSuppressionLatch::default();
+    // SceneState carries the disconnected snapshot (stage, zone_id,
+    // entities). Reset it so systems gated on stage/zone don't see
+    // stale state in the launcher → InGame transition before the new
+    // session's first snapshot lands.
+    *scene = SceneState::default();
+    events.recent.clear();
+    // Locomotion caches: both are keyed by wire entity id, and
+    // ids are session-scoped (the next session may reuse the same
+    // id for a totally different actor). Without draining, the new
+    // session's first frame would read a stale `last_pos` /
+    // `from_clip` and either emit a giant speed spike (snap) or
+    // cross-fade from an unrelated anim. Drain on InGame exit so
+    // each session starts with a clean per-actor history.
+    entity_motion.by_id.clear();
+    animation_blends.by_id.clear();
+
+    tracing::info!(count, "OnExit(InGame): despawned scoped entities");
+}
+
+/// Disconnect-watcher: when `SceneState.snapshot.stage` flips to
+/// `Disconnected` while we're `InGame`, classify the disconnect from
+/// the most-recent `ViewerEvent::Disconnected` reason and route the
+/// phase transition.
+///
+/// Clean operator-initiated `/logout`: don't populate `LoginErrorMsg`
+/// — the launcher's `restore_login_error_on_reentry` only routes to
+/// `LauncherState::LoginError` when that string is non-empty, so the
+/// user lands at the `Login` screen with their form/creds untouched.
+///
+/// Forced disconnect (kick, timeout, agent abort): populate
+/// `LoginErrorMsg` so the launcher surfaces the "Disconnected from
+/// server" banner; the operator presses Esc to fall back to Login,
+/// where `login::error_keyboard_system` clears the password
+/// (intentional — treat untrusted disconnects as a session boundary).
 fn return_to_launcher_on_disconnect(
     scene: Option<Res<SceneState>>,
+    events: Option<Res<EventLog>>,
     mut err: ResMut<LoginErrorMsg>,
     mut next_phase: ResMut<NextState<AppPhase>>,
 ) {
@@ -404,15 +624,54 @@ fn return_to_launcher_on_disconnect(
     if scene.snapshot.stage != WireStage::Disconnected {
         return;
     }
-    // Idempotent: don't overwrite an already-populated reason on
-    // repeat ticks (the watcher fires every Update until phase
-    // actually switches; the launcher reads `err.0` on
-    // OnEnter(Launcher), so we only need to populate it once).
-    if err.0.is_empty() {
+    // Walk the event ring backwards for the most-recent Disconnected.
+    // Falls back to Forced if the ring rolled past it — safer default
+    // since "we don't know" is closer to "kicked" than "/logout".
+    let kind = events
+        .as_ref()
+        .and_then(|log| {
+            log.recent.iter().rev().find_map(|e| match e {
+                ViewerEvent::Disconnected { reason } => Some(classify_disconnect_reason(reason)),
+                _ => None,
+            })
+        })
+        .unwrap_or(DisconnectKind::Forced);
+
+    if matches!(kind, DisconnectKind::Forced) && err.0.is_empty() {
         err.0 = "Disconnected from server. Press Esc to return to login.".into();
     }
-    tracing::info!("disconnect-watcher: returning AppPhase to Launcher");
+    tracing::info!(?kind, "disconnect-watcher: returning AppPhase to Launcher");
     next_phase.set(AppPhase::Launcher);
+}
+
+#[cfg(test)]
+mod disconnect_tests {
+    use super::{classify_disconnect_reason, DisconnectKind};
+
+    #[test]
+    fn server_logout_classified_clean() {
+        assert_eq!(
+            classify_disconnect_reason("server logout state=1"),
+            DisconnectKind::Clean
+        );
+        assert_eq!(
+            classify_disconnect_reason("server logout state=2"),
+            DisconnectKind::Clean
+        );
+    }
+
+    #[test]
+    fn timeout_kick_agent_classified_forced() {
+        assert_eq!(
+            classify_disconnect_reason("no server packets for 60s"),
+            DisconnectKind::Forced
+        );
+        assert_eq!(
+            classify_disconnect_reason("agent requested disconnect"),
+            DisconnectKind::Forced
+        );
+        assert_eq!(classify_disconnect_reason(""), DisconnectKind::Forced);
+    }
 }
 
 /// `OnEnter(AppPhase::Connecting)` bridge. Pulls the `Selection` the

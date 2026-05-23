@@ -519,6 +519,22 @@ fn handle_sub_packet(
                     from: None,
                     to: login.zone_no,
                 });
+                // LSB embeds `MusicNum[5]` directly in the LOGIN body
+                // for the zone's pre-set slots (Day/Night/CombatSolo/
+                // CombatParty/Mount). Out-of-band 0x05F arrives only
+                // for runtime `changeMusic()` calls. Without
+                // surfacing these here, the viewer hears silence
+                // until something in a Lua script touches the music
+                // — which never happens in most zones.
+                if let Some(music) = login.music_num {
+                    for (slot, track_id) in music.iter().enumerate() {
+                        tracing::info!(slot, track_id, "LOGIN MusicNum");
+                        let _ = event_tx.send(AgentEvent::MusicChanged {
+                            slot: slot as u8,
+                            track_id: *track_id,
+                        });
+                    }
+                }
                 if login.unique_no == self_char_id {
                     *self_act_index = Some(login.act_index);
                     *self_pos = Position {
@@ -580,7 +596,66 @@ fn handle_sub_packet(
                 let kind = if op == s2c::CHAR_PC {
                     EntityKind::Pc
                 } else {
-                    EntityKind::Npc
+                    // CHAR_NPC (0x00E) is LSB's catch-all for every
+                    // non-PC entity class. We discriminate via the
+                    // `look.size` field LSB writes at packet offset
+                    // 0x30 (= body[0x2C..0x2C+2]) — the MODELID_TYPE
+                    // enum from `vendor/server/.../entity_update.h:30`:
+                    //
+                    //   0 STANDARD / 5 UNK_5 / 6 AUTOMATON
+                    //       — raw monster meshes (mobs, PUP pets,
+                    //         charmed beasts).
+                    //   1 EQUIPPED / 7 CHOCOBO
+                    //       — equipped character (every friendly NPC
+                    //         in town, mounts, fellows).
+                    //   2 DOOR / 3 ELEVATOR / 4 SHIP
+                    //       — static furniture / transport.
+                    //
+                    // `look.size` is written on *every* CHAR_NPC packet
+                    // (`entity_update.cpp:451-484`, outside the
+                    // UPDATE_HP gate), so we don't have to wait for an
+                    // HP-bearing tick to classify.
+                    //
+                    // Why not the alternatives we tried first:
+                    //   * Allegiance byte at packet 0x29 — `CNpcEntity`
+                    //     defaults `allegiance = ALLEGIANCE_TYPE::MOB`
+                    //     (`npcentity.cpp:44`), so most friendly NPCs
+                    //     come through indistinguishable from mobs.
+                    //   * Live-mob marker at packet 0x25 — only written
+                    //     under UPDATE_HP and didn't produce the
+                    //     expected 0x08 byte for Tunnel_Worm packets in
+                    //     Ronfaure (empirical observation).
+                    //
+                    // Pet split: byte 0x27 bit 0x08 = "PMaster is a PC"
+                    // (`entity_update.cpp:390-392`), gated on UPDATE_HP.
+                    // Promotes a creature-shaped model with a PC owner
+                    // (jug pet, BST jug, charmed mob, fellow) to Pet so
+                    // the nameplate module picks the friendly palette.
+                    // When UPDATE_HP isn't set we can't read it; that
+                    // misclassifies fresh pets as Mob for a tick, then
+                    // merge_kind upgrades on the next HP packet.
+                    const LOOK_SIZE_OFFSET: usize = 0x2C;
+                    let look_size = sub
+                        .data
+                        .get(LOOK_SIZE_OFFSET..LOOK_SIZE_OFFSET + 2)
+                        .map(|s| u16::from_le_bytes([s[0], s[1]]));
+                    let owned_by_pc = head.send_flag & 0x04 != 0
+                        && (sub.data.get(35).copied().unwrap_or(0) & 0x08) != 0;
+                    match look_size {
+                        Some(0) | Some(5) | Some(6) => {
+                            if owned_by_pc {
+                                EntityKind::Pet
+                            } else {
+                                EntityKind::Mob
+                            }
+                        }
+                        Some(1) | Some(7) => EntityKind::Npc,
+                        Some(2) | Some(3) | Some(4) => EntityKind::Other,
+                        // Truncated body or unknown look size — emit
+                        // `Other` so `state::merge_kind` preserves any
+                        // prior specialized classification.
+                        _ => EntityKind::Other,
+                    }
                 };
                 if op == s2c::CHAR_PC && head.unique_no == self_char_id {
                     *self_act_index = Some(head.act_index);
@@ -632,6 +707,15 @@ fn handle_sub_packet(
                         None
                     }
                 });
+                // FFXI DAT files store NPC + mob names with underscores
+                // standing in for spaces (`Tunnel_Worm`, `Magic_Pot`).
+                // Retail clients render them with spaces; do the same
+                // normalization at the wire boundary so every
+                // downstream consumer (nameplate, target panel, chat
+                // log, name_cache) sees `"Tunnel Worm"`. PC names
+                // can't contain underscores at character-creation
+                // time, so this is safe for CHAR_PC too.
+                let name = name.map(|n| n.replace('_', " "));
                 if let Some(n) = name.as_ref() {
                     if !n.is_empty() {
                         name_cache.insert(head.unique_no, n.clone());
@@ -763,14 +847,19 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::BATTLE_MESSAGE => {
-            if let Some(line) = decode_battle_message(sub.data, name_cache, false) {
-                let _ = event_tx.send(AgentEvent::ChatLine { line });
-            }
-        }
-        op if op == s2c::BATTLE_MESSAGE2 => {
+            // is_029 = true: Data/Data2 sit at offsets 8/12 (before ActIndex
+            // pair). See `decode_battle_message` doc for the two layouts.
             if let Some(line) = decode_battle_message(sub.data, name_cache, true) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
+            emit_battle_message_audio_event(sub.data, true, event_tx);
+        }
+        op if op == s2c::BATTLE_MESSAGE2 => {
+            // 0x02D moves Data/Data2 to offsets 12/16, after the ActIndex pair.
+            if let Some(line) = decode_battle_message(sub.data, name_cache, false) {
+                let _ = event_tx.send(AgentEvent::ChatLine { line });
+            }
+            emit_battle_message_audio_event(sub.data, false, event_tx);
         }
         op if op == s2c::SHOP_LIST => {
             // 0x03C body = 4 header + 10*N item rows. Reassembly across
@@ -795,10 +884,50 @@ fn handle_sub_packet(
             // an extra hint; a follow-up can plumb it in if needed.
         }
         op if op == s2c::BATTLE2 => {
-            // Heavily bitpacked combat-action stream — see header note.
-            // Listed explicitly so the diagnostic dispatcher doesn't log
-            // it as "unknown opcode" once per action frame; intentionally
-            // a no-op until we ship a bitstream decoder.
+            // Bitpacked combat-action stream. One packet can carry
+            // multiple targets and multiple results per target — fan
+            // them out into individual chat lines so each hit/miss/
+            // damage event lands separately in Chat 2.
+            //
+            // Pre-pass: emit `ActionStarted` so the viewer can load
+            // the action's DAT and drive animation + particles + audio.
+            // The header is the first 109 bits of the bitstream; we
+            // peek just the actor + cmd_no + cmd_arg fields.
+            if let Some((actor_id, action_id, action_kind)) = decode_battle2_header(sub.data) {
+                let _ = event_tx.send(AgentEvent::ActionStarted {
+                    actor_id,
+                    action_id,
+                    action_kind,
+                });
+            }
+            for line in decode_battle2_action(sub.data, name_cache) {
+                let _ = event_tx.send(AgentEvent::ChatLine { line });
+            }
+        }
+        op if op == s2c::MUSIC => {
+            // 0x05F `GP_SERV_COMMAND_MUSIC` — 4-byte body:
+            // `u16 Slot, u16 MusicNum`. Slot indexes LSB's
+            // `MusicSlot` enum; the viewer-core BGM system decides
+            // which slot is currently audible. See
+            // `vendor/server/src/map/packets/s2c/0x05f_music.{h,cpp}`.
+            if sub.data.len() >= 4 {
+                let slot = u16::from_le_bytes([sub.data[0], sub.data[1]]) as u8;
+                let track_id = u16::from_le_bytes([sub.data[2], sub.data[3]]);
+                tracing::info!(slot, track_id, "0x05F MUSIC packet");
+                let _ = event_tx.send(AgentEvent::MusicChanged { slot, track_id });
+            }
+        }
+        op if op == s2c::MUSIC_VOLUME => {
+            // 0x060 `GP_SERV_COMMAND_MUSICVOLUME` — same 4-byte
+            // layout as 0x05F but the second field is a volume
+            // value. We pass it through as u8 (LSB sends u16, but
+            // the actual range is 0..=127 — viewer normalises).
+            if sub.data.len() >= 4 {
+                let slot = u16::from_le_bytes([sub.data[0], sub.data[1]]) as u8;
+                let volume = u16::from_le_bytes([sub.data[2], sub.data[3]]) as u8;
+                tracing::info!(slot, volume, "0x060 MUSIC_VOLUME packet");
+                let _ = event_tx.send(AgentEvent::MusicVolumeChanged { slot, volume });
+            }
         }
         op if op == s2c::WPOS || op == s2c::WPOS2 => {
             // Server-initiated forced position for the local player. LSB
@@ -974,6 +1103,24 @@ fn handle_sub_packet(
         }
         op if op == s2c::ITEM_MAX => {
             if let Ok(m) = decode::ItemMax::decode(sub.data) {
+                // System chat: rare (once per login + zone). Show only
+                // non-zero capacities so the line stays readable on
+                // characters with the default 30/30/0/0/... bag setup.
+                let summary: Vec<String> = m
+                    .capacities
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &c)| c != 0)
+                    .map(|(i, c)| format!("c{}={}", i, c))
+                    .collect();
+                let _ = event_tx.send(AgentEvent::ChatLine {
+                    line: ChatLine {
+                        channel: ChatChannel::System,
+                        sender: "client".into(),
+                        text: format!("📦 Bag capacities: {}", summary.join(", ")),
+                        server_ts: 0,
+                    },
+                });
                 let _ = event_tx.send(AgentEvent::InventoryUpdated {
                     container: 0,
                     update: InventoryUpdate::Capacities {
@@ -991,6 +1138,20 @@ fn handle_sub_packet(
         }
         op if op == s2c::ITEM_NUM => {
             if let Ok(n) = decode::ItemNum::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::ChatLine {
+                    line: ChatLine {
+                        channel: ChatChannel::Debug,
+                        sender: "client".into(),
+                        text: format!(
+                            "📦 Qty: cat={} slot={} qty→{}{}",
+                            n.category,
+                            n.index,
+                            n.quantity,
+                            if n.lock_flg != 0 { " [locked]" } else { "" },
+                        ),
+                        server_ts: 0,
+                    },
+                });
                 let _ = event_tx.send(AgentEvent::InventoryUpdated {
                     container: n.category,
                     update: InventoryUpdate::QuantityChanged {
@@ -1003,6 +1164,17 @@ fn handle_sub_packet(
         }
         op if op == s2c::ITEM_LIST => {
             if let Ok(l) = decode::ItemList::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::ChatLine {
+                    line: ChatLine {
+                        channel: ChatChannel::Debug,
+                        sender: "client".into(),
+                        text: format!(
+                            "📦 Slot: cat={} slot={} item=#{} qty={}",
+                            l.category, l.index, l.item_no, l.quantity,
+                        ),
+                        server_ts: 0,
+                    },
+                });
                 let _ = event_tx.send(AgentEvent::InventoryUpdated {
                     container: l.category,
                     update: InventoryUpdate::SlotChanged {
@@ -1024,6 +1196,22 @@ fn handle_sub_packet(
         }
         op if op == s2c::ITEM_ATTR => {
             if let Ok(a) = decode::ItemAttr::decode(sub.data) {
+                let price_tag = if a.price != 0 {
+                    format!(" price={}", a.price)
+                } else {
+                    String::new()
+                };
+                let _ = event_tx.send(AgentEvent::ChatLine {
+                    line: ChatLine {
+                        channel: ChatChannel::Debug,
+                        sender: "client".into(),
+                        text: format!(
+                            "📦 Attr: cat={} slot={} item=#{} qty={}{}",
+                            a.category, a.index, a.item_no, a.quantity, price_tag,
+                        ),
+                        server_ts: 0,
+                    },
+                });
                 let _ = event_tx.send(AgentEvent::InventoryUpdated {
                     container: a.category,
                     update: InventoryUpdate::SlotChanged {
@@ -1039,6 +1227,47 @@ fn handle_sub_packet(
                 // The 24-byte extdata payload (`a.extdata`) is discarded
                 // here — it's item-type-specific (augments, charges, etc.)
                 // and not needed for v1 banking decisions.
+            }
+        }
+        op if op == s2c::EQUIP_CLEAR => {
+            // 0x04F: server-side reset of the entire equipped-slot
+            // table. Always sent before the per-slot 0x050 flood on
+            // login (see `vendor/server/src/map/packets/c2s/0x00a_login.cpp`),
+            // so the client never accumulates stale state from a
+            // prior session.
+            let _ = event_tx.send(AgentEvent::EquipCleared);
+        }
+        op if op == s2c::EQUIP_LIST => {
+            // 0x050: one equipped slot. Body is 4 bytes
+            // (container_index, equip_slot, container, padding) — see
+            // `ffxi_proto::decode::EquipList`.
+            if let Ok(e) = decode::EquipList::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::EquipUpdated {
+                    slot: e.equip_slot,
+                    container: e.container,
+                    container_index: e.container_index,
+                });
+            }
+        }
+        op if op == s2c::MAGIC_DATA => {
+            // 0x0AA: 128-byte bitmap of learned spells. Collapse into
+            // a sorted `Vec<u16>` of ids the HUD can iterate.
+            if let Ok(m) = decode::MagicData::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::SpellsKnownUpdated {
+                    ids: m.known_ids(),
+                });
+            }
+        }
+        op if op == s2c::COMMAND_DATA => {
+            // 0x0AC: four bitmaps (WeaponSkills/JobAbilities/PetAbilities/Traits).
+            // Drop Traits — they're passive and surface via 0x063
+            // STATUS_ICONS instead of as menu rows.
+            if let Ok(c) = decode::CommandData::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::CommandDataUpdated {
+                    weapon_skills: decode::collect_set_bits(c.weapon_skills),
+                    job_abilities: decode::collect_set_bits(c.job_abilities),
+                    pet_abilities: decode::collect_set_bits(c.pet_abilities),
+                });
             }
         }
         _ => {
@@ -1058,6 +1287,14 @@ fn handle_sub_packet(
 /// that genuine stuck-state retries still surface inside a debugging
 /// session.
 const NAME_MISS_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Grace period for the `pending_event_end` watchdog under
+/// `user_driven_events = true`. After this much wall time with the
+/// queue non-empty (i.e. the operator hasn't issued `/endcutscene` or
+/// `/release`), the keepalive auto-flushes the queue. 10s is long
+/// enough to read most dialog HUD strings, short enough that an
+/// unattended session doesn't sit in `BlockedState::InEvent` long.
+const PENDING_EVENT_END_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Cap on hex bytes captured per miss. CHAR_PC slot starts at 0x5A and
 /// CHAR_NPC at 0x30; 96 bytes covers both with room for the trailing
@@ -1154,7 +1391,10 @@ async fn keepalive_loop(
     mut npc_name_resolver: NpcNameResolver,
 ) -> Result<MapOutcome> {
     let mut last_recv = std::time::Instant::now();
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    // 100 ms tick gives the spec's ~10 Hz Move cadence under sustained
+    // movement. POS subpacket inclusion is further gated by `should_emit_pos`
+    // so heading-only / big-jump events can still bypass the rate-limit.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     tick.tick().await;
     let mut reconnect_addr: Option<std::net::SocketAddr> = None;
     let mut terminal_disconnect = false;
@@ -1163,6 +1403,16 @@ async fn keepalive_loop(
     // server-side event flag would otherwise be invisible. We surface it
     // as a chat-banner warning after 3s of no zone change.
     let mut pending_maprect: Option<(std::time::Instant, u32)> = None;
+    // Watchdog for `pending_event_end` under `user_driven_events=true`
+    // (native viewer). The dialog HUD wants events to stay alive long
+    // enough to read; the operator dismisses with `/endcutscene` /
+    // `/release`. But if neither fires within the grace period, the
+    // server stays in `BlockedState::InEvent` and `/logout` + zone-change
+    // get silently rejected (see `0x0e7_reqlogout.cpp::validate` and
+    // `0x05e_maprect.cpp::validate`). The watchdog auto-drains the queue
+    // so unattended sessions don't get permanently wedged. `None` while
+    // the queue is empty; `Some(t)` from the first non-empty tick.
+    let mut pending_event_end_since: Option<std::time::Instant> = None;
     // `/heal` mirror. Sources of truth:
     // 1. Optimistic write on outbound `AgentCommand::Heal`.
     // 2. Authoritative sync from CHAR_PC for self when UPDATE_HP gate set —
@@ -1177,6 +1427,20 @@ async fn keepalive_loop(
     // with the spawn coords so the very first keepalive doesn't
     // false-trigger.
     let mut last_keepalive_pos: Vec3 = self_pos.pos;
+    // 10 Hz Move emission state. `last_move_emission` tracks the last
+    // outbound POS subpacket; `last_emitted_pos` / `last_emitted_heading`
+    // back the big-jump and heading-changed bypass gates in
+    // `should_emit_pos`. Initially `None` so the very first tick emits
+    // unconditionally (server expects an authoritative position handshake
+    // right after zone-in).
+    let mut last_move_emission: Option<std::time::Instant> = None;
+    let mut last_emitted_pos: Vec3 = self_pos.pos;
+    let mut last_emitted_heading: u8 = self_pos.heading;
+    // Active rubber-band target. Set by `reconcile_self_pos` when an
+    // inbound CHAR_PC for self lands in the (2, 10] yalm correction band;
+    // each tick lerps `self_pos.pos` toward it at 5 yalm/s until reached.
+    let mut rubber_band_target: Option<Vec3> = None;
+    let mut last_rubber_band_step: std::time::Instant = std::time::Instant::now();
     // Edge-detected self `MoghouseFlg`. Seeded to `false`; the first self
     // GROUP_ATTR / GROUP_LIST tick after entry inverts it and `note_mog_transition`
     // emits the explanatory chat line. Persists across the loop's many
@@ -1476,6 +1740,32 @@ async fn keepalive_loop(
                         }
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
+                    Some(AgentCommand::Equip {
+                        container,
+                        container_index,
+                        equip_slot,
+                    }) => {
+                        // 0x050 GP_CLI_COMMAND_EQUIP_SET. Wire payload is
+                        // 3 bytes (PropertyItemIndex, EquipKind, Category)
+                        // — see `vendor/server/src/map/packets/c2s/0x050_equip_set.h`.
+                        let payload = build_subpacket_equip_set(
+                            sub_seq,
+                            container_index,
+                            equip_slot,
+                            container,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "equip_set send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("equip_set send: {e}"),
+                            });
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
+                    }
                     Some(AgentCommand::UseItem {
                         container,
                         slot,
@@ -1643,12 +1933,32 @@ async fn keepalive_loop(
                         pending_maprect = None;
                     }
                 }
+                // Sync the watchdog timer from the queue's current
+                // shape. Empty queue → no pending timer; non-empty
+                // queue with no timer → start the clock now. 1Hz sync
+                // adds at most one second of error to the grace
+                // window, which is fine.
+                match (pending_event_end.is_empty(), pending_event_end_since.is_some()) {
+                    (false, false) => {
+                        pending_event_end_since = Some(std::time::Instant::now());
+                    }
+                    (true, true) => {
+                        pending_event_end_since = None;
+                    }
+                    _ => {}
+                }
+                let watchdog_fires = pending_event_end_since
+                    .map(|t| t.elapsed() > PENDING_EVENT_END_GRACE)
+                    .unwrap_or(false);
                 // Build a bundle: any auto-event-ends drained, then a POS keepalive.
                 // `user_driven_events` suppresses the auto-drain so the dialog HUD
                 // gets a chance to display the event; the operator (or HUD-side
-                // input handler) sends `EndEvent` explicitly to advance.
+                // input handler) sends `EndEvent` explicitly to advance — unless
+                // the watchdog grace expires, in which case we drain anyway so
+                // the server's `BlockedState::InEvent` doesn't permanently wedge
+                // /logout + zone-change.
                 let mut payload = Vec::new();
-                if !user_driven_events {
+                if (!user_driven_events || watchdog_fires) && !pending_event_end.is_empty() {
                     for (unique_no, act_index, event_num) in pending_event_end.drain(..) {
                         payload.extend(build_subpacket_event_end(
                             sub_seq, unique_no, act_index, event_num, 0,
@@ -1656,7 +1966,39 @@ async fn keepalive_loop(
                         sub_seq = sub_seq.wrapping_add(1);
                         let _ = event_tx.send(AgentEvent::EventEnded);
                     }
+                    if watchdog_fires {
+                        tracing::warn!(
+                            grace_secs = PENDING_EVENT_END_GRACE.as_secs(),
+                            "auto-flushed pending EVENT_END (watchdog grace expired)"
+                        );
+                        let _ = event_tx.send(AgentEvent::Error {
+                            message: format!(
+                                "auto-released pinned event after {}s grace \
+                                 (operator didn't /endcutscene or /release)",
+                                PENDING_EVENT_END_GRACE.as_secs()
+                            ),
+                        });
+                    }
+                    pending_event_end_since = None;
                 }
+                // Rubber-band advance: if an inbound CHAR_PC landed in the
+                // (2, 10] yalm correction band, walk `self_pos.pos` toward
+                // the stored target at 5 yalm/s. Done *before* the heal-
+                // cancel / POS-gating below so the emitted position
+                // already reflects the lerped value.
+                if let Some(target) = rubber_band_target {
+                    let dt = last_rubber_band_step.elapsed().as_secs_f32();
+                    last_rubber_band_step = std::time::Instant::now();
+                    let max_step = 5.0 * dt; // 5 yalm/s
+                    let (next, reached) = lerp_toward(self_pos.pos, target, max_step);
+                    self_pos.pos = next;
+                    if reached {
+                        rubber_band_target = None;
+                    }
+                } else {
+                    last_rubber_band_step = std::time::Instant::now();
+                }
+
                 // Heal-cancel interceptor: if we're healing and this tick
                 // would advertise a new position, prepend 0x0E8 Mode::Off
                 // so the server clears `EFFECT_HEALING` *before* it sees
@@ -1674,21 +2016,48 @@ async fn keepalive_loop(
                         "camp auto-cancel (movement detected during heal)"
                     );
                 }
-                payload.extend(build_subpacket_pos(
-                    sub_seq,
-                    self_pos.pos.x,
-                    self_pos.pos.y,
-                    self_pos.pos.z,
-                    self_pos.heading,
-                ));
-                sub_seq = sub_seq.wrapping_add(1);
-                last_keepalive_pos = self_pos.pos;
-                if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
-                    tracing::warn!(error = %e, "keepalive send failed");
-                    let _ = event_tx.send(AgentEvent::Error { message: format!("keepalive send: {e}") });
-                    break;
+                // 10 Hz Move cadence gate. POS is included when EITHER:
+                //   - `>= 100ms` since the last emission (sustained 10 Hz),
+                //   - position delta from last emission > 0.5 yalm (jump),
+                //   - heading byte changed (immediate flush).
+                // First tick (`last_move_emission == None`) always emits so
+                // the server's zone-in handshake has an authoritative pos.
+                let dx = self_pos.pos.x - last_emitted_pos.x;
+                let dy = self_pos.pos.y - last_emitted_pos.y;
+                let dz = self_pos.pos.z - last_emitted_pos.z;
+                let pos_delta = (dx * dx + dy * dy + dz * dz).sqrt();
+                let heading_changed = self_pos.heading != last_emitted_heading;
+                let include_pos = match last_move_emission {
+                    None => true,
+                    Some(t) => should_emit_pos(t.elapsed(), pos_delta, heading_changed),
+                };
+                if include_pos {
+                    payload.extend(build_subpacket_pos(
+                        sub_seq,
+                        self_pos.pos.x,
+                        self_pos.pos.y,
+                        self_pos.pos.z,
+                        self_pos.heading,
+                    ));
+                    sub_seq = sub_seq.wrapping_add(1);
+                    last_keepalive_pos = self_pos.pos;
+                    last_emitted_pos = self_pos.pos;
+                    last_emitted_heading = self_pos.heading;
+                    last_move_emission = Some(std::time::Instant::now());
                 }
-                bundle_seq = bundle_seq.wrapping_add(1);
+                // Skip the network send when there's nothing to put on the
+                // wire — at 100ms tick we'd otherwise pump empty UDP
+                // bundles 10× a second. The 100ms POS gate ensures a
+                // bundle goes out at least every 100ms under normal
+                // conditions; recv-side traffic keeps the connection live.
+                if !payload.is_empty() {
+                    if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
+                        tracing::warn!(error = %e, "keepalive send failed");
+                        let _ = event_tx.send(AgentEvent::Error { message: format!("keepalive send: {e}") });
+                        break;
+                    }
+                    bundle_seq = bundle_seq.wrapping_add(1);
+                }
             }
             res = tokio::time::timeout(std::time::Duration::from_millis(50), map.recv_decrypted()) => {
                 if let Ok(Ok(buf)) = res {
@@ -1721,6 +2090,15 @@ async fn keepalive_loop(
                                 terminal_disconnect = true;
                             }
                         } else {
+                            // Snapshot the local self-position *before*
+                            // dispatching to `handle_sub_packet` — that
+                            // handler unconditionally overwrites
+                            // `self_pos` with the server's value on a
+                            // CHAR_PC for self. We want to apply
+                            // rubber-band reconciliation against the
+                            // pre-overwrite local pos, so capture it
+                            // here.
+                            let prev_self_pos = self_pos.pos;
                             handle_sub_packet(
                                 &sub,
                                 &event_tx,
@@ -1735,6 +2113,70 @@ async fn keepalive_loop(
                                 &mut npc_name_resolver,
                                 &mut self_in_mog_house,
                             );
+                            // Self-reconciliation (rubber-band). The
+                            // handler just clobbered `self_pos` with the
+                            // server's PosHead for self; decide whether
+                            // to keep that, ignore it (trust local), or
+                            // gradually correct toward it.
+                            if sub.opcode == ffxi_proto::map::s2c::CHAR_PC {
+                                if let Ok(head) = decode::PosHead::decode(sub.data) {
+                                    if head.unique_no == self_char_id {
+                                        let server_pos = self_pos.pos;
+                                        match reconcile_self_pos(prev_self_pos, server_pos) {
+                                            SelfPosReconcile::KeepLocal => {
+                                                // Sub-yalm jitter — trust the
+                                                // local integrator and ignore
+                                                // the server's pos. Cancels
+                                                // any in-flight rubber-band
+                                                // since we're already inside
+                                                // the tolerance band.
+                                                self_pos.pos = prev_self_pos;
+                                                rubber_band_target = None;
+                                            }
+                                            SelfPosReconcile::Rubberband { target } => {
+                                                // Mid-band correction — keep
+                                                // the local pos visible now,
+                                                // close the gap at 5 yalm/s
+                                                // over subsequent ticks.
+                                                self_pos.pos = prev_self_pos;
+                                                rubber_band_target = Some(target);
+                                                last_rubber_band_step =
+                                                    std::time::Instant::now();
+                                                tracing::debug!(
+                                                    from = format!(
+                                                        "({:.1},{:.1},{:.1})",
+                                                        prev_self_pos.x,
+                                                        prev_self_pos.y,
+                                                        prev_self_pos.z,
+                                                    ),
+                                                    to = format!(
+                                                        "({:.1},{:.1},{:.1})",
+                                                        target.x, target.y, target.z,
+                                                    ),
+                                                    "rubber-band self pos toward server",
+                                                );
+                                            }
+                                            SelfPosReconcile::Snap => {
+                                                // Zone teleport / GM warp —
+                                                // server's pos already wrote;
+                                                // just clear any pending
+                                                // rubber-band that became
+                                                // irrelevant.
+                                                rubber_band_target = None;
+                                                tracing::info!(
+                                                    to = format!(
+                                                        "({:.1},{:.1},{:.1})",
+                                                        server_pos.x,
+                                                        server_pos.y,
+                                                        server_pos.z,
+                                                    ),
+                                                    "snap self pos to server (>10 yalm delta)",
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // Heal-mirror sync from CHAR_PC for self. Same
                             // UPDATE_HP gate (`body[6] & 0x04`) that
                             // authorizes `hpp` also authorizes the
@@ -1928,6 +2370,53 @@ fn substitute_system_placeholders(raw: &str, para: u32, para2: u32) -> String {
 /// and the `Data`/`Data2` fields. Returns `None` if the body is too short
 /// or the message id has no entry in `msg_basic` (rare ids live in
 /// `msg_combat` / `msg_status` tables we don't ship yet).
+/// Sibling to [`decode_battle_message`] — peeks at the same packet
+/// body and emits audio-trigger `AgentEvent`s for the message ids
+/// that the SFX bridge cares about. Today: LevelUp (9), SkillLevelUp
+/// (53). The chat-line decoder handles rendering; this fires the
+/// stinger.
+///
+/// Source-of-truth for ids: `vendor/server/src/map/enums/msg_basic.h`
+/// (LevelUp=9, SkillLevelUp=53). Source-of-truth for `data1`/`data2`
+/// offsets: `decode_battle_message`'s `is_029` switch.
+fn emit_battle_message_audio_event(
+    data: &[u8],
+    is_029: bool,
+    event_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
+) {
+    if data.len() < 24 {
+        return;
+    }
+    let cas_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let (data1, data2) = if is_029 {
+        (
+            u32::from_le_bytes(data[8..12].try_into().unwrap()),
+            u32::from_le_bytes(data[12..16].try_into().unwrap()),
+        )
+    } else {
+        (
+            u32::from_le_bytes(data[12..16].try_into().unwrap()),
+            u32::from_le_bytes(data[16..20].try_into().unwrap()),
+        )
+    };
+    let message_num = u16::from_le_bytes(data[20..22].try_into().unwrap());
+    match message_num {
+        9 => {
+            let _ = event_tx.send(AgentEvent::LevelUp { player_id: cas_id });
+        }
+        53 => {
+            // charutils.cpp:4161 sends (skillID, (skill+amount)/10) —
+            // data1 = skill_id, data2 = current level (server already
+            // divided by 10).
+            let _ = event_tx.send(AgentEvent::SkillLevelUp {
+                skill_id: data1 as u16,
+                level: data2,
+            });
+        }
+        _ => {}
+    }
+}
+
 fn decode_battle_message(
     data: &[u8],
     name_cache: &std::collections::HashMap<u32, String>,
@@ -1951,10 +2440,26 @@ fn decode_battle_message(
     };
     let message_num = u16::from_le_bytes(data[20..22].try_into().unwrap());
 
-    let raw = ffxi_proto::msg_basic::lookup(message_num)?;
+    // /check responses live in the client's `msg_basic.dat` (which we
+    // don't ship), but their semantic content is fully numeric on the
+    // wire — `synth_check_line` reconstructs the English locally from
+    // `data1`/`data2`/`message_num` rather than waiting on a DMSG
+    // decoder. Covers /check on mobs (170-178) and /checkparam
+    // (712-733); pass-throughs to the placeholder path for everything
+    // else.
     let cas_name = name_for_id(cas_id, name_cache);
     let tar_name = name_for_id(tar_id, name_cache);
-    let text = substitute_battle_placeholders(raw, &cas_name, &tar_name, data1, data2, message_num);
+    if let Some(text) = synth_check_line(message_num, data1, data2, &cas_name, &tar_name) {
+        return Some(ChatLine {
+            channel: ChatChannel::Battle,
+            sender: cas_name,
+            text,
+            server_ts: 0,
+        });
+    }
+    let raw = template_for_id(message_num)?;
+    let text =
+        substitute_battle_placeholders(raw, &cas_name, &tar_name, data1, data2, message_num, None);
     Some(ChatLine {
         channel: ChatChannel::Battle,
         // Use the actor's name as the sender so the chat row reads
@@ -1971,6 +2476,391 @@ fn decode_battle_message(
         server_ts: 0,
     })
 }
+
+/// Bit reader mirroring LSB's `unpackBitsBE`
+/// (`vendor/server/src/common/utils.cpp:336`). The misleading "BE" name
+/// refers to the field-packing convention, NOT byte endianness:
+/// - Multi-byte fields are stored in native **little-endian** byte order
+///   (LSB reinterprets the byte stream as `uint16*`/`uint32*`/`uint64*`).
+/// - Within a byte, the low bits hold the first-packed field; subsequent
+///   fields ride above them.
+///
+/// Algorithm: read a u16/u32/u64 from the byte covering the cursor,
+/// shift right by the within-byte offset, mask off the field width.
+/// Cursor advances bit-by-bit so we stay aligned across the conditional
+/// proc/react sub-blocks in 0x028.
+///
+/// `read(n)` returns up to 32 bits at a time (matching what the 0x028
+/// format ever packs in a single field; max width = 32). Underflow on
+/// the underlying buffer returns `None` so the caller drops the rest
+/// of the action rather than fabricate a partial chat line.
+struct BattleBitReader<'a> {
+    data: &'a [u8],
+    pos: usize, // bit position
+}
+
+impl<'a> BattleBitReader<'a> {
+    fn new(data: &'a [u8], start_bit: usize) -> Self {
+        Self {
+            data,
+            pos: start_bit,
+        }
+    }
+
+    fn read(&mut self, bits: u32) -> Option<u64> {
+        debug_assert!(bits <= 32);
+        let byte_offset = self.pos / 8;
+        let bit_in_byte = self.pos % 8;
+        let total_bits = bits as usize + bit_in_byte;
+        let value: u64 = if total_bits <= 8 {
+            *self.data.get(byte_offset)? as u64
+        } else if total_bits <= 16 {
+            if byte_offset + 2 > self.data.len() {
+                return None;
+            }
+            u16::from_le_bytes(self.data[byte_offset..byte_offset + 2].try_into().ok()?) as u64
+        } else if total_bits <= 32 {
+            if byte_offset + 4 > self.data.len() {
+                return None;
+            }
+            u32::from_le_bytes(self.data[byte_offset..byte_offset + 4].try_into().ok()?) as u64
+        } else {
+            // total_bits up to 39 (32 width + 7 within-byte) needs a u64 read.
+            if byte_offset + 8 > self.data.len() {
+                return None;
+            }
+            u64::from_le_bytes(self.data[byte_offset..byte_offset + 8].try_into().ok()?)
+        };
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        self.pos += bits as usize;
+        Some((value >> bit_in_byte) & mask)
+    }
+}
+
+/// Decode a `GP_SERV_COMMAND_BATTLE2` (0x028) body into a stream of
+/// chat lines — one per `result` carried by the action. The wire
+/// format is bitpacked BE. Variable structure: up to 15 targets × 8
+/// results each, plus per-result optional `proc` and `react`
+/// sub-blocks that have to be skipped (not just ignored) to keep the
+/// bit cursor aligned for the next target.
+///
+/// Bit-offset convention: LSB's `pack()`/`unpack()` operate on the
+/// full sub-packet buffer (4-byte SE header + 1-byte workSize +
+/// bitstream) and start at bit offset `8 * 5 = 40`. Our `SubPacket::data`
+/// (`ffxi-proto/src/framing.rs:157`) already strips the 4-byte
+/// sub-packet header, so the bitstream starts at bit `8` of `data`
+/// (skip only the `workSize` byte at `data[0]`). Reading from bit 40
+/// here would skip 4 extra bytes of payload and decode garbage.
+///
+/// Returns an empty Vec if the body is too short or the bit cursor
+/// underflows mid-decode. Returns a partial list if mid-stream
+/// truncation hits after some results were already emitted — the
+/// partial ones are valid.
+/// Peek the action-start header of a `GP_SERV_COMMAND_BATTLE2` (0x028)
+/// sub-packet body: `(actor_id, action_id /* cmd_arg */, action_kind /* cmd_no */)`.
+///
+/// Layout (mirrors [`decode_battle2_action`] start; see that function for
+/// the full bitstream documentation). We deliberately stop after the
+/// header so this can run cheaply per packet without spinning up the
+/// full target/result iteration. Returns `None` on truncation —
+/// callers should fall through to chat-line decoding regardless.
+pub fn decode_battle2_header(data: &[u8]) -> Option<(u32, u32, u8)> {
+    let mut br = BattleBitReader::new(data, 8); // skip workSize byte
+    let actor_id = br.read(32)? as u32;
+    let _trg_sum = br.read(6)?;
+    let _res_sum = br.read(4)?;
+    let action_kind = br.read(4)? as u8;
+    let action_id = br.read(32)? as u32;
+    Some((actor_id, action_id, action_kind))
+}
+
+fn decode_battle2_action(
+    data: &[u8],
+    name_cache: &std::collections::HashMap<u32, String>,
+) -> Vec<ChatLine> {
+    let mut out: Vec<ChatLine> = Vec::new();
+    // Skip the 1-byte workSize prefix; the bitstream proper starts at bit 8.
+    // See doc comment above for why this is 8 and not 40.
+    let mut br = BattleBitReader::new(data, 8);
+
+    let actor_id = match br.read(32) {
+        Some(v) => v as u32,
+        None => return out,
+    };
+    let trg_sum = br.read(6).unwrap_or(0) as usize;
+    let _res_sum = br.read(4); // unused by client (always 0)
+    let _cmd_no = br.read(4); // command type (4 = spell, 6 = ability, etc.)
+    let cmd_arg = match br.read(32) {
+        Some(v) => v as u32,
+        None => return out,
+    };
+    let _info = br.read(32); // recast etc.
+
+    let cas_name = name_for_id(actor_id, name_cache);
+
+    for _t in 0..trg_sum.min(15) {
+        let Some(target_id) = br.read(32) else {
+            return out;
+        };
+        let result_sum = br.read(4).unwrap_or(0) as usize;
+        let tar_name = name_for_id(target_id as u32, name_cache);
+
+        for _r in 0..result_sum.min(8) {
+            // Core result fields. Layout from `unpack`:
+            //   miss/resolution: 3 bits
+            //   kind: 2
+            //   sub_kind (animation): 12
+            //   info: 5
+            //   scale: 5  (hitDistortion 2 + knockback 3)
+            //   value (damage/heal amount): 17
+            //   message: 10
+            //   bit (modifier): 31
+            let _miss = br.read(3);
+            let _kind = br.read(2);
+            let _sub_kind = br.read(12);
+            let _info = br.read(5);
+            let _scale = br.read(5);
+            let value = br.read(17).unwrap_or(0) as u32;
+            let message_num = br.read(10).unwrap_or(0) as u16;
+            let _modifier = br.read(31);
+
+            let has_proc = br.read(1).unwrap_or(0) != 0;
+            let mut proc_message: u16 = 0;
+            let mut proc_value: u32 = 0;
+            if has_proc {
+                let _proc_kind = br.read(6);
+                let _proc_info = br.read(4);
+                proc_value = br.read(17).unwrap_or(0) as u32;
+                proc_message = br.read(10).unwrap_or(0) as u16;
+            }
+
+            let has_react = br.read(1).unwrap_or(0) != 0;
+            let mut react_message: u16 = 0;
+            let mut react_value: u32 = 0;
+            if has_react {
+                let _react_kind = br.read(6);
+                let _react_info = br.read(4);
+                react_value = br.read(14).unwrap_or(0) as u32;
+                react_message = br.read(10).unwrap_or(0) as u16;
+            }
+
+            // Headline result. message_num=0 means "no message" — common
+            // for purely-cosmetic animation results (e.g., the cast-
+            // animation half of a spell that also carries a damage
+            // result in a sibling slot). Drop those.
+            if message_num != 0 {
+                if let Some(line) =
+                    build_battle2_line(message_num, &cas_name, &tar_name, value, cmd_arg)
+                {
+                    out.push(line);
+                }
+            }
+            // Additional-effect line (proc): "Additional effect: ..."
+            // Usually packed with its own messageID like 163.
+            if has_proc && proc_message != 0 {
+                if let Some(line) =
+                    build_battle2_line(proc_message, &cas_name, &tar_name, proc_value, cmd_arg)
+                {
+                    out.push(line);
+                }
+            }
+            // Reaction line (spikes/parry/etc.).
+            if has_react && react_message != 0 {
+                if let Some(line) =
+                    build_battle2_line(react_message, &cas_name, &tar_name, react_value, cmd_arg)
+                {
+                    out.push(line);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Build a single `ChatLine` from a 0x028 result triple. Returns
+/// `None` if the message id isn't in `msg_basic` (rare ids live in
+/// tables we don't ship yet — same fallback as `decode_battle_message`).
+fn build_battle2_line(
+    message_num: u16,
+    cas_name: &str,
+    tar_name: &str,
+    amount: u32,
+    action_id: u32,
+) -> Option<ChatLine> {
+    let raw = template_for_id(message_num)?;
+    let text = substitute_battle_placeholders(
+        raw,
+        cas_name,
+        tar_name,
+        amount,
+        0,
+        message_num,
+        Some(action_id),
+    );
+    Some(ChatLine {
+        channel: ChatChannel::Battle,
+        sender: if subject_is_tar(message_num) {
+            tar_name.to_string()
+        } else {
+            cas_name.to_string()
+        },
+        text,
+        server_ts: 0,
+    })
+}
+
+/// Resolve a battle-message id to its template text. Consults a small
+/// override table first for ids where LSB's `msg_basic.h` comment is
+/// known to be lossy versus the retail localized template, then falls
+/// back to the generated `msg_basic` table.
+///
+/// Each override entry must be backed by a citation: a call site where
+/// LSB sends this id with semantics that the generic enum comment
+/// doesn't capture. Without that citation, the override is a guess and
+/// will rot the day LSB widens the id's usage.
+fn template_for_id(message_num: u16) -> Option<&'static str> {
+    for &(id, template) in TEMPLATE_OVERRIDES {
+        if id == message_num {
+            return Some(template);
+        }
+    }
+    ffxi_proto::msg_basic::lookup(message_num)
+}
+
+/// Synthesize a chat line for /check (170-178), /check-on-PC
+/// (CheckImpossibleToGauge=179 falls through to the normal table) and
+/// /checkparam (712-733). These ids carry their full meaning in the
+/// numeric `data1`/`data2`/`message_num` fields, so we render them
+/// directly without needing the FFXI client's localized
+/// `msg_basic.dat`.
+///
+/// Returns `None` for ids outside these ranges; callers should fall
+/// through to the placeholder-substitution path.
+///
+/// **Wire layout**
+/// - `/check` mob (LSB `0x0dd_equip_inspect.cpp:71-124`):
+///   - `cas`/`tar` = player/mob, `data1` = mob level (`mobLvl`),
+///     `data2` = `64 + EMobDifficulty`.
+///   - `message_num` ∈ 170..=178, offset from 174 decomposes into a
+///     defense and an evasion modifier per LSB's calc:
+///     `defOffset = -1 (high), 0, +1 (low)` and
+///     `evaOffset = -3 (high), 0, +3 (low)`. Sum unambiguously maps
+///     back to one (def, eva) pair because |def| < 3.
+/// - `/checkparam` (same file, `:155-181`):
+///   - `cas`/`tar` = player/player (or player/pet).
+///   - `data1` = ACC (or RACC, or EVA), `data2` = ATT (or RATT, or DEF)
+///     depending on which sub-id was pushed.
+///
+/// **EMobDifficulty** (`vendor/server/src/map/utils/charutils.h:45-56`):
+///   0 TooWeak, 1 IncrediblyEasyPrey, 2 EasyPrey, 3 DecentChallenge,
+///   4 EvenMatch, 5 Tough, 6 VeryTough, 7 IncrediblyTough.
+fn synth_check_line(
+    message_num: u16,
+    data1: u32,
+    data2: u32,
+    cas_name: &str,
+    tar_name: &str,
+) -> Option<String> {
+    match message_num {
+        170..=178 => Some(render_check_mob(message_num, data1, data2, tar_name)),
+
+        712 => Some(format!(
+            "Main weapon — Accuracy: {data1}, Attack: {data2}."
+        )),
+        713 => {
+            if data1 == 0 && data2 == 0 {
+                Some("Auxiliary weapon: none equipped.".to_string())
+            } else {
+                Some(format!(
+                    "Auxiliary weapon — Accuracy: {data1}, Attack: {data2}."
+                ))
+            }
+        }
+        714 => {
+            if data1 == 0 && data2 == 0 {
+                Some("Ranged weapon: none equipped.".to_string())
+            } else {
+                Some(format!(
+                    "Ranged weapon — Accuracy: {data1}, Attack: {data2}."
+                ))
+            }
+        }
+        715 => Some(format!("Evasion: {data1}, Defense: {data2}.")),
+        731 => Some(format!("Checking {tar_name}'s item level…")),
+        733 => Some(format!("Checking {cas_name}'s parameters on {tar_name}.")),
+
+        _ => None,
+    }
+}
+
+/// Render one of the 9 mob /check message ids (170..=178) into a
+/// human-readable line. The id encodes a (def, eva) modifier pair
+/// relative to 174 ("even/even"); `data1` carries the mob level;
+/// `data2 - 64` is the `EMobDifficulty` enum value.
+fn render_check_mob(message_num: u16, data1: u32, data2: u32, tar_name: &str) -> String {
+    let total: i32 = message_num as i32 - 174;
+    // Evasion is +/-3 (saturates the outer range); defense is +/-1.
+    // |def| < 3 so `eva = round_to_3(total)` and `def = total - eva`.
+    let eva_off = if total <= -2 {
+        -3
+    } else if total >= 2 {
+        3
+    } else {
+        0
+    };
+    let def_off = total - eva_off;
+
+    let difficulty = match data2.saturating_sub(64) {
+        0 => "Too Weak",
+        1 => "Incredibly Easy Prey",
+        2 => "Easy Prey",
+        3 => "Decent Challenge",
+        4 => "Even Match",
+        5 => "Tough",
+        6 => "Very Tough",
+        7 => "Incredibly Tough",
+        // Out-of-band difficulty; degrade gracefully rather than drop.
+        _ => "Unknown",
+    };
+
+    let mut line = format!("{tar_name} (Lv. {data1}) — {difficulty}.");
+    let def_str = match def_off {
+        -1 => Some("high defense"),
+        1 => Some("low defense"),
+        _ => None,
+    };
+    let eva_str = match eva_off {
+        -3 => Some("high evasion"),
+        3 => Some("low evasion"),
+        _ => None,
+    };
+    match (def_str, eva_str) {
+        (Some(d), Some(e)) => line.push_str(&format!(" It has {d} and {e}.")),
+        (Some(d), None) => line.push_str(&format!(" It has {d}.")),
+        (None, Some(e)) => line.push_str(&format!(" It has {e}.")),
+        (None, None) => {}
+    }
+    line
+}
+
+/// Cited overrides for ids whose `msg_basic.h` comment is lossy
+/// relative to the retail template the client would render from its
+/// own `msg_basic.dat`. Until we ship a DMSG parser, this is the
+/// narrow workaround.
+const TEMPLATE_OVERRIDES: &[(u16, &str)] = &[
+    // MsgBasic::Obtains (565). LSB comment: "<target> obtains <amount>."
+    // The only LSB call sites are gil distribution
+    // (vendor/server/src/map/utils/charutils.cpp:4756, 4763) — both
+    // pushPacket<...>(PChar, PChar, gilAmount, 0, MsgBasic::Obtains).
+    // Retail's localized template carries the unit "gil", which the
+    // header comment drops.
+    (565, "<target> obtains <amount> gil."),
+];
 
 /// True when the wire-protocol's `Tar` slot holds the *grammatical subject*
 /// of the message (the entity the message is "about") rather than the
@@ -2022,9 +2912,14 @@ fn substitute_battle_placeholders(
     data1: u32,
     data2: u32,
     message_num: u16,
+    action_id: Option<u32>,
 ) -> String {
     let mut s = raw.to_string();
-    for tag in ["<user>", "<attacker>", "<caster>"] {
+    // `<entity>` is the grammatical subject — same wire slot as `<user>`
+    // (e.g., ReadiesWeaponskill 43: "<entity> readies <skill>." packs
+    // the actor into Cas). Grouped with the actor placeholders so any
+    // template using these reads as the actor's action.
+    for tag in ["<user>", "<attacker>", "<caster>", "<entity>"] {
         s = s.replace(tag, cas_name);
     }
     let (player_name, target_name) = if subject_is_tar(message_num) {
@@ -2034,6 +2929,11 @@ fn substitute_battle_placeholders(
     };
     s = s.replace("<player>", player_name);
     s = s.replace("<target>", target_name);
+    // `<mob>` appears in a handful of templates (e.g.
+    // `CheckImpossibleToGauge = 249`, "<mob> strength is impossible to
+    // gauge!") where the mob entity is in the wire's `Tar` slot —
+    // LSB's call sites for these ids pass `(PChar, PMobTarget, ...)`.
+    s = s.replace("<mob>", target_name);
     let amount = data1.to_string();
     for tag in ["<amount>", "<number>"] {
         s = s.replace(tag, &amount);
@@ -2041,7 +2941,137 @@ fn substitute_battle_placeholders(
     if s.contains("<number2>") {
         s = s.replace("<number2>", &data2.to_string());
     }
+    if s.contains("<skill>") {
+        let skill = ffxi_proto::skill_names::lookup(data1 as u8)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("skill #{}", data1));
+        s = s.replace("<skill>", &skill);
+    }
+    // Vendor-scraped name tables resolve `<spell>`, `<ability>`,
+    // `<item>`, `<job>` against `action_id` (the canonical source on
+    // 0x028 — cmd_arg at the action level) with a `data1` fallback
+    // (the slot Phoenix uses on 0x029 BATTLE_MESSAGE). `<status>`
+    // takes `data1` directly: GainsEffect-family templates pack the
+    // status id into `param` on 0x029. For 0x028 action results the
+    // status id lives in the result's `modifier`/`info` bits, which
+    // `build_battle2_line` does not yet thread through — once those
+    // surface, prefer them over data1.
+    //
+    // Unknown ids fall back to "spell #N" etc. so the operator at
+    // least sees *which* spell/item the message refers to, rather
+    // than a literal `<spell>` token that hides the gap.
+    let resolved_action_id = action_id.unwrap_or(data1);
+    if s.contains("<spell>") {
+        let name = ffxi_proto::spell_names::lookup(resolved_action_id as u16)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("spell #{resolved_action_id}"));
+        s = s.replace("<spell>", &name);
+    }
+    if s.contains("<ability>") {
+        let name = ffxi_proto::ability_names::lookup(resolved_action_id as u16)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("ability #{resolved_action_id}"));
+        s = s.replace("<ability>", &name);
+    }
+    if s.contains("<item>") {
+        let name = ffxi_proto::item_names::lookup(resolved_action_id as u16)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("item #{resolved_action_id}"));
+        s = s.replace("<item>", &name);
+    }
+    if s.contains("<job>") {
+        let name = ffxi_proto::job_names::lookup(resolved_action_id as u16)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("job #{resolved_action_id}"));
+        s = s.replace("<job>", &name);
+    }
+    if s.contains("<status>") {
+        let name = ffxi_proto::status_names::lookup(data1 as u16)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("status #{data1}"));
+        s = s.replace("<status>", &name);
+    }
+    // Bare `X` / `#` are msg_basic.h's shorthand for inline numbers
+    // (e.g., "skill rises X points.", "gains # experience points."). Use
+    // token-boundary matching so words like "BoX" / hashtags don't get
+    // mangled. `X` always reads `data2`. `#` reads `data1` for everything
+    // except `ExpChain` (id 253), whose template carries two `#` markers
+    // — `chain #!` is `data2` (chain number) and `gains # experience` is
+    // `data1` (exp earned).
+    if message_num == 253 {
+        s = replace_marker_nth(&s, '#', 0, &data2.to_string());
+        s = replace_marker_nth(&s, '#', 0, &data1.to_string());
+    } else {
+        s = replace_marker_all(&s, '#', &data1.to_string());
+    }
+    // SkillGain (38) and SkillDrop (310) carry the raw skill amount —
+    // retail displays it as `raw/10` with one decimal ("rises 0.1
+    // points" for amount 1). SkillLevelUp (53), LevelSync (540), and
+    // ROETimed (705) all carry pre-divided integers, so default to
+    // integer formatting for everything else.
+    let x_value = if matches!(message_num, 38 | 310) {
+        format_decimal_tenths(data2)
+    } else {
+        data2.to_string()
+    };
+    s = replace_marker_all(&s, 'X', &x_value);
     s
+}
+
+/// Render an integer count of tenths as `whole.tenth` (e.g., 1 → "0.1",
+/// 23 → "2.3"). Matches retail FFXI's skill-display formatting where
+/// the server emits raw amounts and the client divides by 10.
+fn format_decimal_tenths(tenths: u32) -> String {
+    format!("{}.{}", tenths / 10, tenths % 10)
+}
+
+/// Replace every token-boundary occurrence of `marker` with `value`.
+/// A "token boundary" means the marker is not adjacent to an alphanumeric
+/// or `_` on either side — so `X` in "BoX" or `#` in a hex literal is
+/// left alone, but `X` in "rises X points" or `#` in "gains #" is swapped.
+fn replace_marker_all(src: &str, marker: char, value: &str) -> String {
+    let mut out = String::with_capacity(src.len() + value.len());
+    let chars: Vec<char> = src.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == marker && is_token_boundary(&chars, i) {
+            out.push_str(value);
+        } else {
+            out.push(chars[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Replace only the `n`-th (0-indexed) token-boundary occurrence of `marker`.
+/// Returns the original string unchanged if there are fewer than `n+1`
+/// matches. Used for `ExpChain` where the template carries two `#` markers
+/// that map to different data slots.
+fn replace_marker_nth(src: &str, marker: char, n: usize, value: &str) -> String {
+    let mut out = String::with_capacity(src.len() + value.len());
+    let chars: Vec<char> = src.chars().collect();
+    let mut seen = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == marker && is_token_boundary(&chars, i) {
+            if seen == n {
+                out.push_str(value);
+                out.extend(chars[i + 1..].iter());
+                return out;
+            }
+            seen += 1;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn is_token_boundary(chars: &[char], i: usize) -> bool {
+    let left_ok = i == 0 || !chars[i - 1].is_alphanumeric() && chars[i - 1] != '_';
+    let right_ok = i + 1 == chars.len() || !chars[i + 1].is_alphanumeric() && chars[i + 1] != '_';
+    left_ok && right_ok
 }
 
 /// `GP_SERV_COMMAND_EVENT` (0x032) decoder. Body layout per
@@ -2294,7 +3324,14 @@ fn emit_event_dialog(
     let _ = event_tx.send(AgentEvent::EventDialog {
         dialog: dialog.clone(),
     });
-    pending_event_end.push((dialog.npc_id, dialog.act_index, dialog.event_num));
+    // Use `event_para`, NOT `event_num`: per `0x032_event.cpp:42-43` the LSB
+    // server writes `EventNum = PChar->getZone()` (zone id) and
+    // `EventPara = eventInfo->eventId` (the real CSID). Our decoder labels
+    // the offset-6-8 field `event_num` to match the protocol struct name,
+    // but the value there is the zone, not the event id we need to echo
+    // back in 0x05B EVENT_END. See the long comment on
+    // `build_subpacket_event_end` for the field-label gotcha.
+    pending_event_end.push((dialog.npc_id, dialog.act_index, dialog.event_para));
 }
 
 /// `GP_SERV_COMMAND_CHAT_STD` (0x017) decoder. Body layout per
@@ -2308,13 +3345,23 @@ fn decode_chat_std(data: &[u8]) -> Option<ChatLine> {
     }
     let kind = data[0];
     let sender = trim_nul_string(&data[4..PREFIX]);
-    let text = trim_nul_string(&data[PREFIX..]);
+    let text = decode_chat_text(&data[PREFIX..]);
     Some(ChatLine {
         channel: ChatChannel::from_chat_kind(kind),
         sender,
         text,
         server_ts: 0,
     })
+}
+
+/// Decode the variable-length `Mes` field of a chat packet: walks the
+/// NUL-terminated body and substitutes any inline auto-translate blocks
+/// (`0xFD ty lang cat idx 0xFD`) with their resolved phrase. Falls back
+/// to lossy UTF-8 for everything outside AT blocks. See
+/// `ffxi_proto::autotranslate` for the lookup details.
+fn decode_chat_text(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    ffxi_proto::autotranslate::decode(&bytes[..end])
 }
 
 /// Decode a NUL-terminated, possibly NUL-padded byte slice as UTF-8 with
@@ -2378,6 +3425,25 @@ fn build_subpacket_tell(sync: u16, recipient: &str, text: &str) -> Vec<u8> {
 /// (size_words=5). `Mode=0`, `EndPara=choice` — choice 0 is the canonical
 /// "skip whatever the NPC was trying to say" form; nonzero values pick a
 /// branch in the event's lua-side `onEventFinish(choice)` handler.
+///
+/// **Field-label gotcha (load-bearing):** LSB's protocol struct names
+/// `EventNum` and `EventPara` are reversed from how the values are used:
+///
+/// - `0x032 event.cpp:42-43` (server → client EVENTSTART) sets
+///   `EventNum = zone_id` and `EventPara = eventInfo->eventId` (the real CSID).
+/// - `0x05b_eventend.cpp:33,39` (client → server EVENT_END) reads
+///   `this->EventPara` to validate against `PChar->currentEvent->eventId`
+///   and to drive `OnEventFinish(eventId, result)`.
+///
+/// So **the cutscene/event id has to land in `EventPara` (offset 18)**, not
+/// in `EventNum` (offset 16) where the misleading name suggests. We write
+/// it into both — `EventPara` is what LSB reads; `EventNum` mirrors the
+/// zone id we got back in the EVENTSTART so the wire looks symmetric with
+/// the inbound packet (the real client sends both filled, per atom0s
+/// reference linked in the LSB header). Prior to this fix every EVENT_END
+/// we sent was silently rejected with "Event ID mismatch 535 != 0" because
+/// `EventPara` stayed zero — the symptom is `/logout` continuing to fail
+/// after `/endcutscene` "succeeds" client-side.
 fn build_subpacket_event_end(
     sync: u16,
     unique_no: u32,
@@ -2390,9 +3456,9 @@ fn build_subpacket_event_end(
     buf[4..8].copy_from_slice(&unique_no.to_le_bytes());
     buf[8..12].copy_from_slice(&choice.to_le_bytes());
     buf[12..14].copy_from_slice(&act_index.to_le_bytes());
-    // Mode u16 stays 0
+    // Mode u16 stays 0 (= End, per GP_CLI_COMMAND_EVENTEND_MODE::End)
     buf[16..18].copy_from_slice(&event_num.to_le_bytes());
-    // EventPara u16 stays 0
+    buf[18..20].copy_from_slice(&event_num.to_le_bytes());
     buf
 }
 
@@ -2507,6 +3573,35 @@ pub fn build_subpacket_item_use(
     buf[14] = slot;
     // buf[15] = padding00 stays 0
     buf[16..20].copy_from_slice(&(category as u32).to_le_bytes());
+    buf
+}
+
+/// `GP_CLI_COMMAND_EQUIP_SET` (c2s 0x050) — equip one item from
+/// inventory to a specific equipment slot. 4-byte sub-packet header +
+/// 3 data bytes (PropertyItemIndex, EquipKind, Category) + 1 padding
+/// byte to word-align = 8 bytes (size_words=2). Mirror of
+/// `vendor/server/src/map/packets/c2s/0x050_equip_set.h`.
+///
+/// The s2c 0x050 EQUIP_LIST that comes back as confirmation has the
+/// same three-field shape; Stage 1's decoder folds it into
+/// `SessionState.equipment`, so a successful equip is visible in the
+/// HUD on the next snapshot tick.
+pub fn build_subpacket_equip_set(
+    sync: u16,
+    container_index: u8,
+    equip_slot: u8,
+    container: u8,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::EQUIP_SET,
+        2,
+        sync,
+    ));
+    buf[4] = container_index;
+    buf[5] = equip_slot;
+    buf[6] = container;
+    // buf[7] padding stays 0
     buf
 }
 
@@ -2656,9 +3751,289 @@ fn _hint() -> Result<()> {
     bail!("compile guard")
 }
 
+// =========================================================================
+// 10 Hz Move cadence + self-reconciliation (rubber-band)
+// =========================================================================
+
+/// Minimum time between outbound POS subpacket emissions under sustained
+/// motion. Matches retail's ~10 Hz Move cadence.
+const MOVE_EMISSION_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Position delta threshold that bypasses the 10 Hz rate-limit and forces
+/// an immediate POS emission on the next keepalive tick. Sized below the
+/// `effective_step_per_tick` (~0.165 yalm at base speed) × ~3 ticks so a
+/// long-running integrator burst flushes promptly without spamming.
+const MOVE_BIG_JUMP_YALMS: f32 = 0.5;
+
+/// Self-reconciliation outcome when an inbound CHAR_PC for self carries a
+/// position different from our local `self_pos`. The thresholds match
+/// retail's "rubber-band" behavior — small deltas are ignored (client is
+/// authoritative for sub-yalm jitter), medium deltas correct gradually,
+/// and large deltas snap (zone teleport, GM warp).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SelfPosReconcile {
+    /// `delta <= 2.0 yalm` — local is trusted, server pos is ignored.
+    KeepLocal,
+    /// `2.0 < delta <= 10.0 yalm` — keep local now, lerp toward server
+    /// at 5 yalm/s on subsequent ticks until the delta closes.
+    Rubberband { target: Vec3 },
+    /// `delta > 10.0 yalm` — snap to server pos immediately (zone change,
+    /// teleport, etc.).
+    Snap,
+}
+
+/// Decide what to do with an inbound server position for self.
+/// `local` is what we believe; `server` is what the server just sent.
+fn reconcile_self_pos(local: Vec3, server: Vec3) -> SelfPosReconcile {
+    let dx = server.x - local.x;
+    let dy = server.y - local.y;
+    let dz = server.z - local.z;
+    let dist_sq = dx * dx + dy * dy + dz * dz;
+    // Squared comparisons to avoid the sqrt.
+    if dist_sq <= 2.0 * 2.0 {
+        SelfPosReconcile::KeepLocal
+    } else if dist_sq <= 10.0 * 10.0 {
+        SelfPosReconcile::Rubberband { target: server }
+    } else {
+        SelfPosReconcile::Snap
+    }
+}
+
+/// Step `cur` toward `target` by at most `max_step` yalms in 3D.
+/// Returns `(new_pos, reached)` — `reached` is true when the remaining
+/// distance is consumed by this step (target reached this tick).
+fn lerp_toward(cur: Vec3, target: Vec3, max_step: f32) -> (Vec3, bool) {
+    let dx = target.x - cur.x;
+    let dy = target.y - cur.y;
+    let dz = target.z - cur.z;
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    if dist <= max_step || dist <= 1e-4 {
+        return (target, true);
+    }
+    let f = max_step / dist;
+    (
+        Vec3 {
+            x: cur.x + dx * f,
+            y: cur.y + dy * f,
+            z: cur.z + dz * f,
+        },
+        false,
+    )
+}
+
+/// Gate for including a POS subpacket in the current keepalive bundle.
+/// Returns true when ANY of the spec's three conditions hold:
+///   1. `elapsed >= 100ms` since the last emission (10 Hz rate-limit).
+///   2. `pos_delta > 0.5 yalm` (big jump — flush immediately).
+///   3. heading byte changed (heading-only updates flush immediately).
+fn should_emit_pos(
+    elapsed: std::time::Duration,
+    pos_delta_yalms: f32,
+    heading_changed: bool,
+) -> bool {
+    elapsed >= MOVE_EMISSION_PERIOD
+        || pos_delta_yalms > MOVE_BIG_JUMP_YALMS
+        || heading_changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 10 Hz Move cadence + rubber-band reconciliation ----
+
+    fn v(x: f32, y: f32, z: f32) -> Vec3 {
+        Vec3 { x, y, z }
+    }
+
+    #[test]
+    fn should_emit_pos_rate_limits_to_10hz() {
+        // Below 100ms with no jump / heading change → suppress.
+        assert!(!should_emit_pos(
+            std::time::Duration::from_millis(50),
+            0.1,
+            false,
+        ));
+        // At/above 100ms → emit (10 Hz cadence under sustained motion).
+        assert!(should_emit_pos(
+            std::time::Duration::from_millis(100),
+            0.0,
+            false,
+        ));
+        assert!(should_emit_pos(
+            std::time::Duration::from_millis(120),
+            0.0,
+            false,
+        ));
+    }
+
+    #[test]
+    fn should_emit_pos_bypasses_rate_limit_on_big_jump() {
+        // >0.5 yalm delta forces emission even if <100ms elapsed.
+        assert!(should_emit_pos(
+            std::time::Duration::from_millis(10),
+            0.6,
+            false,
+        ));
+        // <=0.5 yalm at <100ms still suppressed.
+        assert!(!should_emit_pos(
+            std::time::Duration::from_millis(10),
+            0.5,
+            false,
+        ));
+    }
+
+    #[test]
+    fn should_emit_pos_bypasses_rate_limit_on_heading_change() {
+        assert!(should_emit_pos(
+            std::time::Duration::from_millis(10),
+            0.0,
+            true,
+        ));
+    }
+
+    /// Cadence end-to-end: feed a synthetic 30 Hz integrator stream
+    /// (33 ms apart, sub-yalm steps) and verify only ~10 ticks/s would
+    /// emit a POS subpacket — i.e., the gate trips to ~3-tick spacing.
+    #[test]
+    fn cadence_drops_30hz_integrator_to_10hz_emission() {
+        // Simulate 1 second of integrator output at 33 ms cadence with
+        // ~0.165 yalm/tick (base run speed). The reactor never produces
+        // a >0.5 yalm jump per tick, and heading stays constant, so only
+        // the 100 ms rate-limit gates emission.
+        let mut last_emit: Option<std::time::Duration> = None;
+        let mut now = std::time::Duration::ZERO;
+        let mut emits = 0;
+        for _ in 0..30 {
+            now += std::time::Duration::from_millis(33);
+            let elapsed = match last_emit {
+                None => std::time::Duration::from_secs(10),
+                Some(t) => now - t,
+            };
+            if should_emit_pos(elapsed, 0.165, false) {
+                emits += 1;
+                last_emit = Some(now);
+            }
+        }
+        // 1s / 100ms ≈ 10 expected. At 33 ms ticks, 100 ms gates align to
+        // ~every 3rd tick → ~8-10 emissions/s in practice. The key
+        // invariant is the drop from 30 → ~10, not the exact integer.
+        assert!(
+            (7..=11).contains(&emits),
+            "expected ~10 emissions/s (10 Hz cadence vs 30 Hz integrator), got {emits}",
+        );
+    }
+
+    #[test]
+    fn reconcile_self_pos_keep_local_under_2_yalms() {
+        // 1.5 yalms apart — within tolerance, trust local.
+        let local = v(0.0, 0.0, 0.0);
+        let server = v(1.0, 1.0, 0.5);
+        assert_eq!(
+            reconcile_self_pos(local, server),
+            SelfPosReconcile::KeepLocal,
+        );
+    }
+
+    #[test]
+    fn reconcile_self_pos_rubberband_between_2_and_10() {
+        // ~5 yalms apart — rubber-band, target = server pos.
+        let local = v(0.0, 0.0, 0.0);
+        let server = v(3.0, 4.0, 0.0); // distance 5
+        match reconcile_self_pos(local, server) {
+            SelfPosReconcile::Rubberband { target } => {
+                assert_eq!(target, server);
+            }
+            other => panic!("expected Rubberband, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_self_pos_snap_above_10_yalms() {
+        // ~13 yalms apart — snap (zone teleport).
+        let local = v(0.0, 0.0, 0.0);
+        let server = v(12.0, 5.0, 0.0); // distance 13
+        assert_eq!(
+            reconcile_self_pos(local, server),
+            SelfPosReconcile::Snap,
+        );
+    }
+
+    #[test]
+    fn reconcile_self_pos_boundaries() {
+        // Exactly 2.0 yalms → KeepLocal (inclusive lower bound).
+        let local = v(0.0, 0.0, 0.0);
+        let just_inside = v(2.0, 0.0, 0.0);
+        assert_eq!(
+            reconcile_self_pos(local, just_inside),
+            SelfPosReconcile::KeepLocal,
+        );
+        // Exactly 10.0 yalms → Rubberband (inclusive upper bound).
+        let edge = v(10.0, 0.0, 0.0);
+        assert!(matches!(
+            reconcile_self_pos(local, edge),
+            SelfPosReconcile::Rubberband { .. },
+        ));
+    }
+
+    #[test]
+    fn lerp_toward_advances_at_capped_step() {
+        // 5 yalm step toward a 10-yalm-distant target should land
+        // halfway, not at the target.
+        let (next, reached) = lerp_toward(v(0.0, 0.0, 0.0), v(10.0, 0.0, 0.0), 5.0);
+        assert!(!reached);
+        assert!((next.x - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn lerp_toward_clamps_to_target_on_overshoot() {
+        // Step bigger than distance → snap to target.
+        let (next, reached) = lerp_toward(v(0.0, 0.0, 0.0), v(2.0, 0.0, 0.0), 5.0);
+        assert!(reached);
+        assert_eq!(next, v(2.0, 0.0, 0.0));
+    }
+
+    /// Pin the load-bearing wire layout for 0x05B EVENT_END. The CSID
+    /// (`event_num` arg) must land in **both** EventNum (offset 16) and
+    /// EventPara (offset 18) — LSB validates against `EventPara`, and
+    /// putting the value only in `EventNum` causes every EVENT_END to
+    /// silently fail validation. See the long comment on
+    /// `build_subpacket_event_end` for the field-label gotcha.
+    #[test]
+    fn event_end_writes_csid_to_event_para_field() {
+        // Northern San d'Oria new-character cutscene: CSID=535, sent to
+        // the player's own unique_no/act_index (forced cutscene). All
+        // fields are little-endian.
+        let buf = build_subpacket_event_end(
+            0x1234,     // sync
+            0xDEADBEEF, // unique_no
+            0x4242,     // act_index
+            535,        // event_num (the CSID per the arg semantics)
+            0,          // choice
+        );
+        assert_eq!(buf.len(), 20, "header(4) + body(16)");
+
+        // Body fields.
+        assert_eq!(&buf[4..8], &0xDEADBEEFu32.to_le_bytes(), "UniqueNo");
+        assert_eq!(&buf[8..12], &0u32.to_le_bytes(), "EndPara (choice=0)");
+        assert_eq!(&buf[12..14], &0x4242u16.to_le_bytes(), "ActIndex");
+        assert_eq!(&buf[14..16], &0u16.to_le_bytes(), "Mode (End=0)");
+
+        // The fix: CSID must appear in EventPara (offset 18). LSB reads
+        // *only* this field for validation.
+        assert_eq!(
+            &buf[18..20],
+            &535u16.to_le_bytes(),
+            "EventPara MUST carry the CSID — LSB validator reads from here",
+        );
+        // And mirrored in EventNum (offset 16) for symmetry with the
+        // EVENTSTART the server sent.
+        assert_eq!(
+            &buf[16..18],
+            &535u16.to_le_bytes(),
+            "EventNum mirrors the CSID for atom0s wire symmetry",
+        );
+    }
 
     #[test]
     fn tell_packet_layout_matches_phoenix_struct() {
@@ -2932,6 +4307,464 @@ mod tests {
     }
 
     #[test]
+    fn battle_message_8_exp_gain_substitutes_hash_marker() {
+        // ExperiencePointsGained = 8, "<player> gains # experience points."
+        // Emitted via BATTLE_MESSAGE2 (0x02D), so Data sits at offsets 12/16.
+        // Regression: the dispatcher previously inverted is_029, pulling the
+        // amount from the ActIndex slot and leaving `#` literal.
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes()); // cas
+        data[4..8].copy_from_slice(&0xCAFEu32.to_le_bytes()); // tar (same — self)
+        data[12..16].copy_from_slice(&420u32.to_le_bytes()); // Data = exp
+        data[16..20].copy_from_slice(&0u32.to_le_bytes()); // Data2
+        data[20..22].copy_from_slice(&8u16.to_le_bytes()); // MessageNum
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "hello".to_string());
+        // is_029=false matches the 0x02D layout.
+        let line = decode_battle_message(&data, &cache, false).expect("decoded");
+        assert!(
+            line.text.contains("420") && !line.text.contains('#'),
+            "expected '#' to be replaced with 420, got: {}",
+            line.text
+        );
+        assert!(line.text.contains("hello"));
+    }
+
+    #[test]
+    fn battle_message_38_skill_gain_substitutes_skill_and_x() {
+        // SkillGain = 38, "<target>'s <skill> skill rises X points."
+        // Data = SkillID, Data2 = points. Emitted via 0x029 (is_029=true).
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes()); // cas
+        data[4..8].copy_from_slice(&0xCAFEu32.to_le_bytes()); // tar
+        data[8..12].copy_from_slice(&48u32.to_le_bytes()); // Data = SKILL_FISHING
+        data[12..16].copy_from_slice(&3u32.to_le_bytes()); // Data2 = 3 points
+        data[20..22].copy_from_slice(&38u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "hello".to_string());
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        // Retail divides the raw amount by 10 for display: 3 → "0.3".
+        assert!(
+            line.text.contains("Fishing") && line.text.contains("rises 0.3 points"),
+            "expected '<skill>'→Fishing and 'X'→0.3 (decimal), got: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn battle_message_53_skill_level_up_renders_x_as_integer() {
+        // SkillLevelUp = 53. Server already divides by 10 (charutils.cpp:4161
+        // sends `(CurSkill + SkillAmount) / 10`), so X must NOT be re-divided
+        // here. Template: "<target>'s <skill> skill reaches level X."
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes());
+        data[4..8].copy_from_slice(&0xCAFEu32.to_le_bytes());
+        data[8..12].copy_from_slice(&1u32.to_le_bytes()); // SKILL_HAND_TO_HAND
+        data[12..16].copy_from_slice(&12u32.to_le_bytes()); // level = 12
+        data[20..22].copy_from_slice(&53u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "hello".to_string());
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert!(
+            line.text.contains("level 12") && !line.text.contains("1.2"),
+            "expected integer level, got: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn battle_message_253_exp_chain_substitutes_two_hashes_in_order() {
+        // ExpChain = 253, "EXP chain #! <player> gains # experience points."
+        // Data = exp, Data2 = chainNumber. First `#` is data2 (chain),
+        // second `#` is data1 (exp). Via BATTLE_MESSAGE2 (is_029=false).
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes());
+        data[4..8].copy_from_slice(&0xCAFEu32.to_le_bytes());
+        data[12..16].copy_from_slice(&320u32.to_le_bytes()); // Data = exp
+        data[16..20].copy_from_slice(&5u32.to_le_bytes()); // Data2 = chain #5
+        data[20..22].copy_from_slice(&253u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "hello".to_string());
+        let line = decode_battle_message(&data, &cache, false).expect("decoded");
+        assert!(
+            line.text.contains("chain 5!") && line.text.contains("gains 320"),
+            "expected 'chain 5!' and 'gains 320', got: {}",
+            line.text
+        );
+        assert!(
+            !line.text.contains('#'),
+            "stray '#' remained: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn substitute_battle_x_marker_respects_token_boundary() {
+        // A bare `X` in a real msg_basic template should be swapped;
+        // a within-word X (like the 'X' in "BoXing" — unlikely in real
+        // templates but worth pinning the rule) must NOT be swapped.
+        // Use msg id 53 (SkillLevelUp, integer formatting) so the
+        // decimal-tenths special case for SkillGain (38) / SkillDrop
+        // (310) doesn't muddy the assertion.
+        let s = substitute_battle_placeholders(
+            "reaches level X. BoXing.",
+            "cas",
+            "tar",
+            0,
+            7,
+            53,
+            None,
+        );
+        assert!(s.contains("reaches level 7"), "got: {s}");
+        assert!(s.contains("BoXing"), "within-word X must survive, got: {s}");
+    }
+
+    #[test]
+    fn battle_message_2_magic_damage_resolves_spell_name() {
+        // MagicDamage = 2, "<caster> casts <spell>. <target> takes <amount>
+        // points of damage." With ffxi_proto::spell_names wired, spell 144
+        // resolves to "Fire" — not the legacy "spell #144" fallback.
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes()); // cas (caster)
+        data[4..8].copy_from_slice(&0xBEEFu32.to_le_bytes()); // tar
+        data[8..12].copy_from_slice(&144u32.to_le_bytes()); // Data = SpellID = Fire
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        data[20..22].copy_from_slice(&2u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        cache.insert(0xBEEFu32, "Mandragora".to_string());
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert!(
+            line.text.contains("Daisy")
+                && line.text.contains("Mandragora")
+                && line.text.contains("Fire")
+                && !line.text.contains("<spell>")
+                && !line.text.contains("spell #"),
+            "expected resolved spell name in: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn battle_message_565_obtains_gil_override_appends_unit() {
+        // MsgBasic::Obtains (565). LSB header comment is
+        // "<target> obtains <amount>." but every LSB call site sends
+        // this for gil distribution (charutils.cpp:4756, 4763), so the
+        // TEMPLATE_OVERRIDES table swaps in "<target> obtains <amount> gil."
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes()); // cas
+        data[4..8].copy_from_slice(&0xCAFEu32.to_le_bytes()); // tar (self)
+        data[8..12].copy_from_slice(&4u32.to_le_bytes()); // Data = gil amount
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        data[20..22].copy_from_slice(&565u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Mithy".to_string());
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert_eq!(line.text, "Mithy obtains 4 gil.", "got: {}", line.text);
+    }
+
+    #[test]
+    fn substitute_status_placeholder_resolves_effect_name() {
+        // Direct substitution test: <status> resolves via
+        // ffxi_proto::status_names::lookup(data1).
+        let s = substitute_battle_placeholders(
+            "gains the effect of <status>.",
+            "cas",
+            "tar",
+            40,
+            0,
+            186,
+            None,
+        );
+        assert!(
+            s.contains("Protect") && !s.contains("<status>") && !s.contains("status #"),
+            "expected resolved status name in: {s}"
+        );
+    }
+
+    #[test]
+    fn battle_message_43_readies_weaponskill_substitutes_entity() {
+        // ReadiesWeaponskill = 43, "<entity> readies <skill>." The actor
+        // ships in slot Cas; before this change `<entity>` wasn't in our
+        // substitution list and rendered literally.
+        use std::collections::HashMap;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes());
+        data[4..8].copy_from_slice(&0u32.to_le_bytes());
+        data[8..12].copy_from_slice(&1u32.to_le_bytes()); // SkillID = Hand-to-Hand
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        data[20..22].copy_from_slice(&43u16.to_le_bytes());
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert!(
+            line.text.contains("Daisy readies Hand-to-Hand") && !line.text.contains("<entity>"),
+            "expected '<entity>' → Daisy, got: {}",
+            line.text
+        );
+    }
+
+    /// Test helper: bit writer mirroring LSB's `packBitsBE`
+    /// (`vendor/server/src/common/utils.cpp:272`). Stores multi-byte
+    /// fields in native little-endian byte order; within a byte, the
+    /// low bits hold the first-packed field. See [`BattleBitReader`]'s
+    /// doc comment for the full convention.
+    ///
+    /// `start_bit = 8` matches the body shape `walk_sub_packets` hands
+    /// to `decode_battle2_action` (1-byte workSize + bitstream).
+    struct BattleBitWriter {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl BattleBitWriter {
+        fn new(start_bit: usize) -> Self {
+            // 1 KB is plenty for a few targets × few results.
+            Self {
+                data: vec![0u8; 1024],
+                pos: start_bit,
+            }
+        }
+        fn write(&mut self, value: u64, bits: u32) {
+            let byte_offset = self.pos / 8;
+            let bit_in_byte = self.pos % 8;
+            let total_bits = bits as usize + bit_in_byte;
+            let mask = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let shifted = (value & mask) << bit_in_byte;
+            let cover = (total_bits + 7) / 8;
+            for i in 0..cover {
+                self.data[byte_offset + i] |= ((shifted >> (i * 8)) & 0xFF) as u8;
+            }
+            self.pos += bits as usize;
+        }
+        fn into_bytes(self) -> Vec<u8> {
+            let used = (self.pos + 7) / 8;
+            self.data[..used].to_vec()
+        }
+    }
+
+    #[test]
+    fn battle2_single_hit_emits_damage_line() {
+        // One target, one result: AttackHits (msg id 1), 42 damage.
+        // The decoder must emit one ChatLine reading
+        //   "Daisy hits Mandragora for 42 points of damage."
+        use std::collections::HashMap;
+        let mut w = BattleBitWriter::new(8);
+        w.write(0xCAFEu64, 32); // actor_id (caster)
+        w.write(1, 6); // trg_sum = 1
+        w.write(0, 4); // res_sum (unused)
+        w.write(0, 4); // cmd_no
+        w.write(0, 32); // cmd_arg
+        w.write(0, 32); // info
+                        // Target 0:
+        w.write(0xBEEFu64, 32); // target_id
+        w.write(1, 4); // result_sum = 1
+                       // Result 0:
+        w.write(0, 3); // miss/resolution
+        w.write(0, 2); // kind
+        w.write(0, 12); // sub_kind (animation)
+        w.write(0, 5); // info
+        w.write(0, 5); // scale
+        w.write(42, 17); // value (damage)
+        w.write(1, 10); // message = AttackHits
+        w.write(0, 31); // modifier
+        w.write(0, 1); // has_proc = false
+        w.write(0, 1); // has_react = false
+
+        let data = w.into_bytes();
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        cache.insert(0xBEEFu32, "Mandragora".to_string());
+
+        let lines = decode_battle2_action(&data, &cache);
+        assert_eq!(lines.len(), 1, "expected one line, got: {:?}", lines);
+        let l = &lines[0];
+        assert_eq!(l.channel, ChatChannel::Battle);
+        assert!(
+            l.text.contains("Daisy") && l.text.contains("Mandragora") && l.text.contains("42"),
+            "expected damage line, got: {}",
+            l.text
+        );
+    }
+
+    #[test]
+    fn battle2_magic_damage_substitutes_spell_from_cmd_arg() {
+        // MagicDamage (msg 2): "<caster> casts <spell>. <target> takes
+        // <amount> points of damage." cmd_arg = SpellID = 144 (Fire),
+        // result.value = 87 damage. The decoder must thread cmd_arg
+        // through `substitute_battle_placeholders` as the action_id
+        // so `<spell>` resolves to "Fire" via ffxi_proto::spell_names.
+        use std::collections::HashMap;
+        let mut w = BattleBitWriter::new(8);
+        w.write(0xCAFE, 32);
+        w.write(1, 6); // trg_sum
+        w.write(0, 4); // res_sum
+        w.write(4, 4); // cmd_no = spell
+        w.write(144, 32); // cmd_arg = SpellID
+        w.write(0, 32);
+        w.write(0xBEEF, 32);
+        w.write(1, 4);
+        w.write(0, 3);
+        w.write(0, 2);
+        w.write(0, 12);
+        w.write(0, 5);
+        w.write(0, 5);
+        w.write(87, 17); // damage
+        w.write(2, 10); // message = MagicDamage
+        w.write(0, 31);
+        w.write(0, 1);
+        w.write(0, 1);
+
+        let data = w.into_bytes();
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        cache.insert(0xBEEFu32, "Mandragora".to_string());
+
+        let lines = decode_battle2_action(&data, &cache);
+        assert_eq!(lines.len(), 1);
+        let l = &lines[0];
+        assert!(
+            l.text.contains("Daisy") && l.text.contains("Fire") && l.text.contains("87"),
+            "expected casts/Fire/87 in: {}",
+            l.text
+        );
+    }
+
+    #[test]
+    fn battle2_drops_results_with_zero_message_id() {
+        // A result with message_num=0 means "no message" (animation-
+        // only frame). Must NOT emit a chat line — would render as a
+        // blank or wrong-template row otherwise.
+        use std::collections::HashMap;
+        let mut w = BattleBitWriter::new(8);
+        w.write(0xCAFE, 32);
+        w.write(1, 6);
+        w.write(0, 4);
+        w.write(0, 4);
+        w.write(0, 32);
+        w.write(0, 32);
+        w.write(0xBEEF, 32);
+        w.write(1, 4);
+        w.write(0, 3);
+        w.write(0, 2);
+        w.write(0, 12);
+        w.write(0, 5);
+        w.write(0, 5);
+        w.write(0, 17);
+        w.write(0, 10); // message = 0 (none)
+        w.write(0, 31);
+        w.write(0, 1);
+        w.write(0, 1);
+        let data = w.into_bytes();
+        let lines = decode_battle2_action(&data, &HashMap::new());
+        assert!(lines.is_empty(), "expected drop, got: {:?}", lines);
+    }
+
+    #[test]
+    fn battle2_bitwriter_matches_lsb_pack_byte_layout() {
+        // Pin LSB's packBitsBE convention with a known value at a known
+        // offset, asserting the *byte representation* directly. This is
+        // independent of BattleBitReader — if a future drive-by edit
+        // flips both reader and writer to MSB-first they'd still mirror
+        // each other but the live wire format would break silently.
+        // This test catches that by checking the bytes themselves.
+        //
+        // Layout per vendor/server/src/common/utils.cpp:272:
+        //   actor_id = 0xCAFE at bit 8 (byte 1, bit-in-byte 0)
+        //   → write 32-bit LE u32 to target[1..5]
+        //   → target[1] = 0xFE, target[2] = 0xCA, target[3..5] = 0
+        let mut w = BattleBitWriter::new(8);
+        w.write(0xCAFEu64, 32);
+        let bytes = w.into_bytes();
+        assert_eq!(bytes[0], 0x00, "workSize slot reserved at byte 0");
+        assert_eq!(
+            &bytes[1..5],
+            &[0xFE, 0xCA, 0x00, 0x00],
+            "actor_id LE-packed at byte 1..5 — if this fails, BitWriter \
+             no longer matches LSB packBitsBE; do NOT flip BitReader to \
+             compensate"
+        );
+    }
+
+    #[test]
+    fn battle2_decoder_pins_worksize_prefix_convention() {
+        // Wire-shape regression. `walk_sub_packets` strips the 4-byte
+        // sub-packet header (see ffxi-proto/src/framing.rs:157
+        // `&self.rest[4..size_bytes]`), so what reaches
+        // `decode_battle2_action` is `[workSize:u8][bitstream...]` —
+        // bit offset 8, not 40.
+        //
+        // LSB's pack/unpack starts at `8 * 5 = 40` because it operates
+        // on the full buffer including the 4-byte header
+        // (vendor/server/src/map/packets/s2c/0x028_battle2.cpp:37,120).
+        // A drive-by edit that "syncs" our start-bit back to 40 would
+        // skip 4 extra bytes of real payload and silently drop every
+        // combat action.
+        //
+        // This test pins the convention: synthesize the exact shape
+        // `walk_sub_packets` produces and assert one well-formed line
+        // emerges. The workSize byte is computed the same way LSB does
+        // it (`(bitOffset >> 3) + (bitOffset % 8 != 0)`) so future
+        // diffs that take workSize semantics seriously also have a
+        // reference value.
+        use std::collections::HashMap;
+        let mut w = BattleBitWriter::new(8);
+        w.write(0xCAFE, 32);
+        w.write(1, 6); // trg_sum
+        w.write(0, 4); // res_sum
+        w.write(0, 4); // cmd_no
+        w.write(0, 32); // cmd_arg
+        w.write(0, 32); // info
+        w.write(0xBEEF, 32);
+        w.write(1, 4);
+        w.write(0, 3);
+        w.write(0, 2);
+        w.write(0, 12);
+        w.write(0, 5);
+        w.write(0, 5);
+        w.write(42, 17); // damage
+        w.write(1, 10); // message = AttackHits
+        w.write(0, 31);
+        w.write(0, 1);
+        w.write(0, 1);
+
+        let mut data = w.into_bytes();
+        // workSize = byte count of the bitstream portion (excludes the
+        // workSize byte itself). The bitstream begins at bit 8 and ends
+        // at the current writer position; round up to bytes.
+        let bitstream_bits = data.len() * 8 - 8;
+        data[0] = ((bitstream_bits + 7) / 8) as u8;
+
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        cache.insert(0xBEEFu32, "Mandragora".to_string());
+
+        let lines = decode_battle2_action(&data, &cache);
+        assert_eq!(
+            lines.len(),
+            1,
+            "wire-shape regression: expected 1 line from a body with 1-byte workSize prefix, got: {:?}",
+            lines
+        );
+        let l = &lines[0];
+        assert!(
+            l.text.contains("Daisy") && l.text.contains("Mandragora") && l.text.contains("42"),
+            "decoded line lost actor/target/damage — check that start-bit 8 is preserved at session.rs:decode_battle2_action; got: {}",
+            l.text
+        );
+    }
+
+    #[test]
     fn battle_message_unknown_id_returns_none() {
         // Message id 0xFFFF isn't in msg_basic (and won't be — it's a
         // sentinel). The decoder must return None so the dispatcher
@@ -2940,6 +4773,198 @@ mod tests {
         let mut data = vec![0u8; 24];
         data[20..22].copy_from_slice(&0xFFFFu16.to_le_bytes());
         assert!(decode_battle_message(&data, &HashMap::new(), true).is_none());
+    }
+
+    /// Build a 0x029 BattleMessage body for a synth-decoded id (Check
+    /// or Checkparam family) so the helper paths can be exercised
+    /// end-to-end through `decode_battle_message`.
+    fn check_message(
+        message_num: u16,
+        data1: u32,
+        data2: u32,
+        cas: u32,
+        tar: u32,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&cas.to_le_bytes());
+        data[4..8].copy_from_slice(&tar.to_le_bytes());
+        data[8..12].copy_from_slice(&data1.to_le_bytes());
+        data[12..16].copy_from_slice(&data2.to_le_bytes());
+        data[20..22].copy_from_slice(&message_num.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn check_mob_even_even_renders_difficulty_and_level() {
+        // /check on a mob with even def/eva (message_num=174), data1=53
+        // (level), data2=64+4=68 (Even Match). No def/eva suffix on
+        // even/even.
+        use std::collections::HashMap;
+        let data = check_message(174, 53, 64 + 4, 1, 2);
+        let mut cache = HashMap::new();
+        cache.insert(1u32, "Daisy".to_string());
+        cache.insert(2u32, "Goblin".to_string());
+
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert_eq!(line.sender, "Daisy");
+        assert!(
+            line.text.contains("Goblin")
+                && line.text.contains("Lv. 53")
+                && line.text.contains("Even Match"),
+            "missing core check fields: {}",
+            line.text
+        );
+        assert!(
+            !line.text.to_ascii_lowercase().contains("defense")
+                && !line.text.to_ascii_lowercase().contains("evasion"),
+            "even/even should suppress def/eva phrase: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn check_mob_decomposes_def_and_eva_offsets() {
+        // 9 ids, each tied to one (def, eva) modifier pair via LSB's
+        // calc (`0x0dd_equip_inspect.cpp:99-121`): defense is +/-1,
+        // evasion is +/-3. Each id must produce the matching English
+        // phrase.
+        use std::collections::HashMap;
+        let cache: HashMap<u32, String> = [(2u32, "Mob".to_string())].into_iter().collect();
+        let cases: &[(u16, Option<&str>, Option<&str>)] = &[
+            // total = -4: high def + high eva
+            (170, Some("high defense"), Some("high evasion")),
+            // total = -3: even def + high eva
+            (171, None, Some("high evasion")),
+            // total = -2: low def + high eva
+            (172, Some("low defense"), Some("high evasion")),
+            // total = -1: high def + even eva
+            (173, Some("high defense"), None),
+            // total = 0: even/even
+            (174, None, None),
+            // total = +1: low def + even eva
+            (175, Some("low defense"), None),
+            // total = +2: high def + low eva
+            (176, Some("high defense"), Some("low evasion")),
+            // total = +3: even def + low eva
+            (177, None, Some("low evasion")),
+            // total = +4: low def + low eva
+            (178, Some("low defense"), Some("low evasion")),
+        ];
+        for &(msg, def_phrase, eva_phrase) in cases {
+            let data = check_message(msg, 25, 64 + 3, 1, 2); // Lv 25, Decent Challenge
+            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            for (label, phrase) in [("def", def_phrase), ("eva", eva_phrase)] {
+                if let Some(p) = phrase {
+                    assert!(
+                        line.text.contains(p),
+                        "msg {msg} missing {label} phrase {p:?}: {}",
+                        line.text
+                    );
+                } else {
+                    let unwanted = match label {
+                        "def" => "defense",
+                        _ => "evasion",
+                    };
+                    assert!(
+                        !line.text.to_ascii_lowercase().contains(unwanted),
+                        "msg {msg} should not mention {unwanted}: {}",
+                        line.text
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn check_mob_renders_all_difficulty_tiers() {
+        // `data2 - 64` is the EMobDifficulty enum. All 8 tiers must
+        // produce a distinct, non-fallback label.
+        use std::collections::HashMap;
+        let cache: HashMap<u32, String> = [(2u32, "Mob".to_string())].into_iter().collect();
+        let tiers = [
+            (0u32, "Too Weak"),
+            (1, "Incredibly Easy Prey"),
+            (2, "Easy Prey"),
+            (3, "Decent Challenge"),
+            (4, "Even Match"),
+            (5, "Tough"),
+            (6, "Very Tough"),
+            (7, "Incredibly Tough"),
+        ];
+        for (tier, expected) in tiers {
+            let data = check_message(174, 50, 64 + tier, 1, 2);
+            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            assert!(
+                line.text.contains(expected),
+                "tier {tier} expected {expected:?}: {}",
+                line.text
+            );
+        }
+    }
+
+    #[test]
+    fn checkparam_renders_acc_att_pairs() {
+        // /checkparam pushes 712/713/714/715 with (ACC, ATT)-ish
+        // numeric fields. Render must surface both numbers.
+        use std::collections::HashMap;
+        let cache: HashMap<u32, String> = [(1u32, "Daisy".to_string())].into_iter().collect();
+        for (msg, label) in [
+            (712u16, "Main weapon"),
+            (713, "Auxiliary weapon"),
+            (714, "Ranged weapon"),
+            (715, "Evasion"),
+        ] {
+            let data = check_message(msg, 321, 654, 1, 1);
+            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            assert!(
+                line.text.contains("321") && line.text.contains("654"),
+                "msg {msg}: missing numeric pair in {}",
+                line.text
+            );
+            assert!(
+                line.text.contains(label),
+                "msg {msg}: missing label {label:?} in {}",
+                line.text
+            );
+        }
+    }
+
+    #[test]
+    fn checkparam_aux_and_ranged_handle_unequipped_slot() {
+        // LSB sends (0, 0) for an unequipped sub/ranged slot. The
+        // operator-facing line must read as "none equipped" rather than
+        // "Accuracy: 0, Attack: 0".
+        use std::collections::HashMap;
+        let cache: HashMap<u32, String> = [(1u32, "Daisy".to_string())].into_iter().collect();
+        for msg in [713u16, 714] {
+            let data = check_message(msg, 0, 0, 1, 1);
+            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            assert!(
+                line.text.to_ascii_lowercase().contains("none equipped"),
+                "msg {msg} with (0,0) should read \"none equipped\", got: {}",
+                line.text
+            );
+        }
+    }
+
+    #[test]
+    fn check_impossible_to_gauge_uses_mob_placeholder() {
+        // Id 249 is `CheckImpossibleToGauge`; LSB sends it with the mob
+        // entity in the Tar slot. `<mob>` placeholder must resolve to
+        // the target name.
+        use std::collections::HashMap;
+        let data = check_message(249, 0, 0, 1, 2);
+        let mut cache = HashMap::new();
+        cache.insert(1u32, "Daisy".to_string());
+        cache.insert(2u32, "King Behemoth".to_string());
+
+        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        assert!(
+            line.text.contains("King Behemoth")
+                && line.text.to_ascii_lowercase().contains("impossible"),
+            "{}",
+            line.text
+        );
     }
 
     #[test]

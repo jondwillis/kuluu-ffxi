@@ -15,7 +15,10 @@ use ffxi_dat::{mmb, walk, DatRoot};
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: FFXI_DAT_PATH=... {} <file_id> <chunk_idx> <sub_idx>", args[0]);
+        eprintln!(
+            "usage: FFXI_DAT_PATH=... {} <file_id> <chunk_idx> <sub_idx>",
+            args[0]
+        );
         return ExitCode::from(2);
     }
     let file_id: u32 = args[1].parse().unwrap();
@@ -33,9 +36,15 @@ fn main() -> ExitCode {
 
     let vc = r.count as usize;
     let vert_bytes = vc * 36;
-    println!("asset={:?} variant={:?} verts={} body_len={} vert_bytes={} leftover={}",
-        header.asset_name_str(), r.variant_name_str(), vc, r.body.len(), vert_bytes,
-        r.body.len().saturating_sub(vert_bytes));
+    println!(
+        "asset={:?} variant={:?} verts={} body_len={} vert_bytes={} leftover={}",
+        header.asset_name_str(),
+        r.variant_name_str(),
+        vc,
+        r.body.len(),
+        vert_bytes,
+        r.body.len().saturating_sub(vert_bytes)
+    );
 
     let strip = r.parse_triangle_strip();
     println!("u16 stream ({} u16s, first is header):", strip.len());

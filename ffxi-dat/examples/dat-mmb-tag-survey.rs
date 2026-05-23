@@ -14,7 +14,13 @@ use ffxi_dat::{mmb, walk, ChunkKind, DatRoot};
 
 fn ascii(b: &[u8]) -> String {
     b.iter()
-        .map(|&c| if c.is_ascii_graphic() || c == b' ' { c as char } else { '.' })
+        .map(|&c| {
+            if c.is_ascii_graphic() || c == b' ' {
+                c as char
+            } else {
+                '.'
+            }
+        })
         .collect()
 }
 

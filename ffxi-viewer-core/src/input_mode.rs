@@ -105,8 +105,10 @@ impl ChatBuffer {
 }
 
 /// Identifies which screen of the menu tree we're currently on. The set
-/// grows as submenus are wired; for now the only non-Root screen is
-/// `Config`, the keybind-preset switcher reachable from `Root → Config`.
+/// grows as submenus are wired; today's submenus are `Config` (keybind
+/// presets), `Graphics` (quality knobs), and the four retail-style
+/// action menus (Magic / Abilities / Items / Equipment) — see plan
+/// `let-s-work-on-hooking-dynamic-backus.md` for staging.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MenuKind {
     Root,
@@ -116,6 +118,37 @@ pub enum MenuKind {
     /// selecting List is `/keybinds list`. In-game keypress-capture
     /// rebinding is intentionally NOT here yet — slash-only for now.
     Config,
+    /// Graphics quality knobs. Rows are individual fields (shadow size,
+    /// AA mode, etc.); Up/Down moves the cursor, Left/Right cycles the
+    /// highlighted row's value. The mapping from row index → field +
+    /// the cycle dispatcher both live in `text_input::handle_menu_key`
+    /// / `resolve_menu_entry`.
+    Graphics,
+    /// Retail "Magic" submenu — lists spells the character has learned.
+    /// Stage 0: placeholder; Stage 2 populates from a decoded
+    /// `spells_learned` bitmap and Enter dispatches `ActionKind::CastMagic`.
+    Magic,
+    /// Retail "Abilities" submenu — lists job abilities currently
+    /// available (intersected with the s2c 0x119 recast snapshot).
+    /// Stage 0: placeholder; Stage 2 wires data + `ActionKind::JobAbility`.
+    Abilities,
+    /// Retail "Items" submenu — lists usable items from the main
+    /// Inventory bag. Stage 0: placeholder; Stage 3 populates from
+    /// `SessionState.inventory` and dispatches `ActionKind::UseItem`.
+    Items,
+    /// Retail "Equipment" submenu — shows the 16 equipped slots.
+    /// Stage 0: placeholder; Stage 1 wires a new s2c 0x050 decoder so
+    /// rows reflect actual equipped items; Stage 4 turns each slot row
+    /// into a "pick from inventory" sub-submenu.
+    Equipment,
+    /// Stage-4 sub-submenu pushed when an operator presses Enter on a
+    /// row in the Equipment menu. The contained byte is the SLOTTYPE
+    /// id (0=Main..15=Back) that's being filled — `refresh_dynamic_menu_rows`
+    /// filters the inventory bag by `equip_info::fits_slot` + job +
+    /// level so the rows only show items the operator can actually
+    /// equip there. Selecting a row dispatches `AgentCommand::Equip`;
+    /// Esc pops back to the Equipment menu.
+    EquipSlot(u8),
 }
 
 /// One frame of the menu navigation stack. `cursor` is the row currently

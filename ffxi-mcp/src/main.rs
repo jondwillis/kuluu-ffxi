@@ -961,11 +961,23 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::SceneSummary { .. } => "scene_summary",
         AgentEvent::InventoryUpdated { .. } => "inventory_updated",
         AgentEvent::InventoryReady => "inventory_ready",
+        AgentEvent::EquipUpdated { .. } => "equip_updated",
+        AgentEvent::EquipCleared => "equip_cleared",
+        AgentEvent::SpellsKnownUpdated { .. } => "spells_known_updated",
+        AgentEvent::CommandDataUpdated { .. } => "command_data_updated",
         AgentEvent::ReactorGoalChanged { .. } => "reactor_goal_changed",
         AgentEvent::LlmDecision { .. } => "llm_decision",
         AgentEvent::HumanInControl { .. } => "human_in_control",
         AgentEvent::HumanReleased => "human_released",
         AgentEvent::ForcedMove { .. } => "forced_move",
+        AgentEvent::MusicChanged { .. } => "music_changed",
+        AgentEvent::MusicVolumeChanged { .. } => "music_volume_changed",
+        AgentEvent::WeatherUpdated { .. } => "weather_updated",
+        AgentEvent::LogoutCountdown { .. } => "logout_countdown",
+        AgentEvent::SetFps { .. } => "set_fps",
+        AgentEvent::LevelUp { .. } => "level_up",
+        AgentEvent::SkillLevelUp { .. } => "skill_level_up",
+        AgentEvent::ActionStarted { .. } => "action_started",
     }
 }
 
@@ -991,12 +1003,14 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         RequestZoneChange { .. } => "request_zone_change",
         MogHouseExit { .. } => "mog_house_exit",
         UseItem { .. } => "use_item",
+        Equip { .. } => "equip",
         BankWhenFull { .. } => "bank_when_full",
         CheckTarget { .. } => "check_target",
         ShopBuy { .. } => "shop_buy",
         ReqLogout { .. } => "req_logout",
         ReturnToHomePoint => "return_to_home_point",
         Heal { .. } => "heal",
+        SetFps { .. } => "set_fps",
     }
 }
 

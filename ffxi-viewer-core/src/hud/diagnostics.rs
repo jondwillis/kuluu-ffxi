@@ -41,6 +41,8 @@ pub struct DiagFpsValue;
 pub fn spawn_diagnostics(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
+            crate::hud::DevHud,
             DiagnosticsBar,
             Node {
                 position_type: PositionType::Absolute,
@@ -57,6 +59,7 @@ pub fn spawn_diagnostics(mut commands: Commands) {
             },
             BackgroundColor(palette::BACKGROUND),
             BorderColor::all(palette::BORDER),
+            Visibility::Hidden,
         ))
         .with_children(|p| {
             spawn_label_value(p, "bf=", DiagBfValue, "—");
@@ -68,19 +71,14 @@ pub fn spawn_diagnostics(mut commands: Commands) {
             spawn_label_value(p, "map=", DiagMapValue, "—");
             spawn_separator(p);
             spawn_label_value(p, "fps=", DiagFpsValue, "—");
-            // Spacer + hint right-aligned.
+            // Right-side spacer keeps the metric strip left-aligned even
+            // after the key-hint legend was dropped (FFXI/Ashita never
+            // surface keybindings in the always-on UI; if the operator
+            // wants a reminder they can run `/keybinds`).
             p.spawn(Node {
                 flex_grow: 1.0,
                 ..default()
             });
-            p.spawn((
-                Text::new("[wasd] move  [tab] target  [esc] quit"),
-                TextFont {
-                    font_size: 13.0,
-                    ..default()
-                },
-                TextColor(palette::ACCENT),
-            ));
         });
 }
 

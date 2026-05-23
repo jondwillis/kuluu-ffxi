@@ -27,6 +27,14 @@ pub mod c2s {
     /// Body: `u32 ItemNum (qty), u16 ShopNo, u16 ShopItemIndex, u8 PropertyItemIndex, u8 pad[3]`.
     /// See `vendor/server/src/map/packets/c2s/0x083_shop_buy.h`.
     pub const SHOP_BUY: u16 = 0x083;
+    /// `GP_CLI_COMMAND_EQUIP_SET` — equip a single item. Body:
+    /// `u8 PropertyItemIndex, u8 EquipKind, u8 Category` = 3 bytes
+    /// (size_words=2 with one padding byte). See
+    /// `vendor/server/src/map/packets/c2s/0x050_equip_set.h`.
+    /// PropertyItemIndex is the source-container slot index;
+    /// EquipKind is the SLOTTYPE id (0=Main..15=Back); Category is
+    /// the source container id (0=Inventory, 8..=Wardrobes…).
+    pub const EQUIP_SET: u16 = 0x050;
     /// `GP_CLI_COMMAND_REQLOGOUT` — request `/logout` (return to char-select)
     /// or `/shutdown` (exit game). Body: `u16 Mode, u16 Kind` = 4 bytes
     /// (size_words=2). The server applies `EFFECT_LEAVEGAME` (5s tick
@@ -192,6 +200,19 @@ pub mod s2c {
     /// `vendor/server/src/map/packets/s2c/0x057_weather.h` and
     /// `vendor/server/src/map/enums/weather.h`.
     pub const WEATHER: u16 = 0x057;
+    /// `GP_SERV_COMMAND_MUSIC` — server-pushed BGM slot assignment.
+    /// Body: `u16 Slot, u16 MusicNum` = 4 bytes. `Slot` indexes the
+    /// LSB `MusicSlot` enum (0=ZoneDay, 1=ZoneNight, 2=CombatSolo,
+    /// 3=CombatParty, 4=Mount, 5=Dead, 6=MogHouse, 7=Fishing); the
+    /// client picks which slot is currently audible based on its
+    /// own state machine. See
+    /// `vendor/server/src/map/packets/s2c/0x05f_music.{h,cpp}` and
+    /// `vendor/server/src/map/enums/music_slot.h`.
+    pub const MUSIC: u16 = 0x05F;
+    /// `GP_SERV_COMMAND_MUSICVOLUME` — per-slot music volume tweak.
+    /// Body shape mirrors `MUSIC` (u16 slot, u16 volume). See
+    /// `vendor/server/src/map/packets/s2c/0x060_musicvolume.h`.
+    pub const MUSIC_VOLUME: u16 = 0x060;
     pub const EQUIP_CLEAR: u16 = 0x04F;
     pub const EQUIP_LIST: u16 = 0x050;
     pub const GRAP_LIST: u16 = 0x051;
@@ -220,6 +241,23 @@ pub mod s2c {
     /// and a couple of LOCK/UNLOCK flows. Treat identically.
     /// See `vendor/server/src/map/packets/s2c/0x065_wpos2.h`.
     pub const WPOS2: u16 = 0x065;
+    /// `GP_SERV_COMMAND_MAGIC_DATA` — 128-byte (1024-bit) bitmap of
+    /// learned spells, indexed by spell id. See
+    /// `vendor/server/src/map/packets/s2c/0x0aa_magic_data.h` and
+    /// `CCharEntity::m_SpellList` (`xi::bitset<1024>`). Sent once on
+    /// login and again on every spell-learned event.
+    pub const MAGIC_DATA: u16 = 0x0AA;
+    /// `GP_SERV_COMMAND_COMMAND_DATA` — 224 bytes: four bitmaps in
+    /// order (WeaponSkills[64], JobAbilities[64], PetAbilities[64],
+    /// Traits[32]). Each is a packed bitset where bit N indexes the
+    /// corresponding id-table. See
+    /// `vendor/server/src/map/packets/s2c/0x0ac_command_data.h`.
+    pub const COMMAND_DATA: u16 = 0x0AC;
+    /// `GP_SERV_COMMAND_ABIL_RECAST` — current cooldown snapshot for
+    /// up to 31 ability/recast groups + the mount recast. Used by
+    /// the HUD to grey out unavailable abilities and show
+    /// "X.Xs" overlays on Stage-2+ Abilities menu rows.
+    pub const ABIL_RECAST: u16 = 0x119;
     pub const ENTITY_UPDATE1: u16 = 0x067;
     pub const ENTITY_UPDATE2: u16 = 0x068;
     /// `GP_SERV_COMMAND_GROUP_LIST` — sent for OTHER party members

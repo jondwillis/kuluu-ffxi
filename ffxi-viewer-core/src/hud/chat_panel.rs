@@ -88,6 +88,12 @@ pub struct BattleScroll {
     pub rows: usize,
 }
 
+/// Per-panel scroll offset for the client-internal debug panel (Chat 3).
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct DebugScroll {
+    pub rows: usize,
+}
+
 /// Fractional-row accumulator for the social panel's wheel scroll. The
 /// wheel system adds `delta * WHEEL_ROWS_PER_UNIT` here every frame; when
 /// `|frac| >= 1.0` it spends whole rows into [`ChatScroll`]. Frame-rate
@@ -104,26 +110,77 @@ pub struct BattleScrollAccum {
     pub frac: f32,
 }
 
+/// Fractional-row accumulator for the debug panel. See [`ChatScrollAccum`].
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct DebugScrollAccum {
+    pub frac: f32,
+}
+
 /// Which side of the FFXI-style split a chat panel renders.
 ///
-/// `Social` (Chat 1): Say/Shout/Tell/Party/Linkshell/Yell/Other +
-/// local toasts. The panel the operator types into.
+/// `Social` (Chat 1): Say/Shout/Tell/Party/Linkshell/Yell/Other.
+/// The panel the operator types into.
 ///
 /// `Battle` (Chat 2): combat log + server System messages — the
 /// noisy stream we want isolated from typed conversation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Debug` (Chat 3): client-internal toasts (auto-load, zone-change
+/// drops, slash-command errors). Kept out of Battle so the operator
+/// can read combat without our diagnostic chatter mixing in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatKind {
+    #[default]
     Social,
     Battle,
+    Debug,
 }
 
+/// Which chat tab is currently active. Drives `Display` toggles on the
+/// stacked `ChatPanel` entities and the tab-bar button styling.
+/// Default: `Social` (`Chat 1`), matching retail's "chat-window-1
+/// pre-selected on connect" behavior.
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveChatTab(pub ChatKind);
+
+/// Marker on the tab-bar root.
+#[derive(Component)]
+pub struct ChatTabBar;
+
+/// Per-tab button. Click → mutate [`ActiveChatTab`].
+#[derive(Component, Debug, Clone, Copy)]
+pub struct ChatTabButton {
+    pub kind: ChatKind,
+}
+
+/// Marker on the text-label child of a [`ChatTabButton`]. Lets the
+/// visuals-update system find the label without re-querying the
+/// button's `Children`.
+#[derive(Component)]
+pub struct ChatTabButtonLabel;
+
 impl ChatKind {
-    /// Does a given channel render in this panel? See [`ChatKind`] docs
-    /// for the split rules.
+    /// Does a given channel render in this panel?
+    ///
+    /// Three-tab routing:
+    /// - `Social` ("Chat"): everything that's neither combat nor system
+    ///   noise — Say/Shout/Tell/Party/Linkshell/Yell/Other.
+    /// - `Battle`: combat log only. Retail folds server System messages
+    ///   in here too, but the operator wants combat isolated from the
+    ///   chatter that goes with auto-load notices etc., so System now
+    ///   routes to the dedicated `Debug` tab instead.
+    /// - `Debug` ("System"): server System messages + client-internal
+    ///   toasts (slash-command feedback, auto-load notices, dev
+    ///   diagnostics). The "[dbg] " prefix on `ChatChannel::Debug`
+    ///   visually distinguishes client toasts from server System
+    ///   messages within this tab.
     pub fn accepts(self, c: ChatChannel) -> bool {
         match self {
-            ChatKind::Battle => matches!(c, ChatChannel::Battle | ChatChannel::System),
-            ChatKind::Social => !matches!(c, ChatChannel::Battle | ChatChannel::System),
+            ChatKind::Battle => matches!(c, ChatChannel::Battle),
+            ChatKind::Debug => matches!(c, ChatChannel::System | ChatChannel::Debug),
+            ChatKind::Social => !matches!(
+                c,
+                ChatChannel::Battle | ChatChannel::System | ChatChannel::Debug
+            ),
         }
     }
 }
@@ -146,50 +203,116 @@ pub struct ChatRow {
 #[derive(Component)]
 pub struct ChatRowBody;
 
-pub fn spawn_chat_panel(mut commands: Commands) {
-    // Social panel: bottom-left, 50% width.
-    spawn_panel(&mut commands, ChatKind::Social, Val::Px(0.0), None);
-    // Battle panel: bottom-right, 48% width with a 2% gap.
-    spawn_panel(
-        &mut commands,
-        ChatKind::Battle,
-        Val::Percent(52.0),
-        Some(Val::Px(0.0)),
-    );
+/// Marker on each `TextSpan` child of [`ChatRowBody`]. The pool of these
+/// gives us inline-mixed-color rendering (FFXI auto-translate phrases
+/// painted in sky-blue against the channel-color background text).
+#[derive(Component)]
+pub struct ChatRowSpan;
+
+/// Pre-allocated span slots per row. Sized for the worst real-world
+/// shout we've observed (Hishiamazon: 7 auto-translate blocks → 15
+/// alternating text/AT segments). One extra for safety.
+const SPANS_PER_ROW: usize = 16;
+
+/// Classic FFXI sky-blue used by SE's client for auto-translate phrases.
+/// Brighter than any of the social-channel colors so AT blocks always
+/// pop visually against their containing line, regardless of the
+/// channel's base color.
+const AUTOTRANSLATE_COLOR: Color = Color::srgb(0.50, 0.78, 1.00);
+
+/// Spawn the three chat panels as children of an existing parent (the
+/// `BottomLeftStack` flex container in `hud::mod`). Panels overlap
+/// visually but only the one matching `ActiveChatTab` is `Display::Flex`
+/// at any moment — the others are `Display::None` and skipped by the
+/// parent's flex flow entirely.
+///
+/// Tab routing (see [`ChatKind::accepts`]):
+/// - Social ("Chat"):   say/shout/tell/party/linkshell/yell/other
+/// - Battle ("Battle"): combat log only
+/// - Debug  ("System"): server System + client toasts
+pub fn spawn_chat_panels_as_children(p: &mut ChildSpawnerCommands) {
+    spawn_panel(p, ChatKind::Social, Display::Flex);
+    spawn_panel(p, ChatKind::Battle, Display::None);
+    spawn_panel(p, ChatKind::Debug, Display::None);
 }
 
-fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, right: Option<Val>) {
-    let width = if right.is_some() {
-        Val::Percent(48.0)
+/// Spawn the tab bar as a child of the `BottomLeftStack`. Three
+/// descriptively-labeled buttons; click handler in
+/// [`chat_tab_click_system`] mutates [`ActiveChatTab`] on `Pressed`.
+pub fn spawn_chat_tab_bar_as_child(p: &mut ChildSpawnerCommands) {
+    p.spawn((
+        ChatTabBar,
+        Node {
+            // Auto-width: just enough for the three buttons. The
+            // parent stack is `align_items: FlexStart`, so the tab
+            // bar sits left-aligned without stretching to full width.
+            height: Val::Px(20.0),
+            flex_shrink: 0.0,
+            flex_direction: FlexDirection::Row,
+            column_gap: Val::Px(2.0),
+            ..default()
+        },
+    ))
+    .with_children(|p| {
+        spawn_tab_button(p, ChatKind::Social, "Chat", true);
+        spawn_tab_button(p, ChatKind::Battle, "Battle", false);
+        spawn_tab_button(p, ChatKind::Debug, "System", false);
+    });
+}
+
+fn spawn_tab_button(p: &mut ChildSpawnerCommands, kind: ChatKind, label: &str, is_active: bool) {
+    let (bg, fg, border) = if is_active {
+        (palette::BACKGROUND, palette::ACCENT, palette::ACCENT)
     } else {
-        Val::Percent(50.0)
+        (palette::BACKGROUND, palette::MUTED, palette::BORDER)
     };
-    commands
+    p.spawn((
+        Button,
+        ChatTabButton { kind },
+        Node {
+            padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BackgroundColor(bg),
+        BorderColor::all(border),
+    ))
+    .with_children(|btn| {
+        btn.spawn((
+            ChatTabButtonLabel,
+            Text::new(label.to_string()),
+            TextFont {
+                font_size: 12.0,
+                ..default()
+            },
+            TextColor(fg),
+        ));
+    });
+}
+
+fn spawn_panel(parent: &mut ChildSpawnerCommands, kind: ChatKind, initial_display: Display) {
+    parent
         .spawn((
             ChatPanel { kind },
             ChatPanelDecay::default(),
             // `RelativeCursorPosition::cursor_over` is what
             // `chat_wheel_scroll_system` reads to decide whether to
-            // consume the wheel. No `Pickable` needed — Bevy UI
-            // updates the field automatically each frame.
+            // consume the wheel. No `Pickable` needed — Bevy UI updates
+            // the field automatically each frame.
             RelativeCursorPosition::default(),
             Node {
-                position_type: PositionType::Absolute,
-                // Stack: 28px diagnostics bar + 24px chat-input slot + 2px
-                // gap = 54. The chat input bar at `bottom: 28` (height 24)
-                // slots into the gap below this panel rather than overlaying
-                // its bottommost row. When the input is hidden the gap is
-                // just empty breathing room above the diagnostics strip.
-                bottom: Val::Px(54.0),
-                left,
-                right: right.unwrap_or(Val::Auto),
-                width,
+                // Width tracks the parent BottomLeftStack (which is 50%
+                // viewport-width). No bottom/left here — flex flow on
+                // the stack handles positioning, and the panel's
+                // auto-decay `height` drives the stack's overall height.
+                width: Val::Percent(100.0),
                 height: Val::Px(PANEL_MIN_HEIGHT_PX),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
                 border: UiRect::all(Val::Px(1.0)),
                 flex_direction: FlexDirection::Column,
                 justify_content: JustifyContent::FlexEnd,
                 row_gap: Val::Px(2.0),
+                display: initial_display,
                 // Clip anything that overflows the panel rect. Without
                 // this, a chat row that wraps to taller than the
                 // remaining panel space spills upward over the 3D
@@ -248,7 +371,27 @@ fn spawn_panel(commands: &mut Commands, kind: ChatKind, left: Val, right: Option
                             ..default()
                         },
                         TextColor(palette::TEXT),
-                    ));
+                    ))
+                    .with_children(|body| {
+                        // Pre-spawn a fixed pool of `TextSpan` children
+                        // for inline-colored runs (e.g. auto-translate
+                        // phrases). The parent `Text` stays empty; each
+                        // span carries one (text, color) segment. Pool
+                        // size is overhead-cheap and avoids per-frame
+                        // spawn/despawn churn — `update_chat_panel`
+                        // refills the spans in place via change-detect.
+                        for _ in 0..SPANS_PER_ROW {
+                            body.spawn((
+                                ChatRowSpan,
+                                TextSpan::new(""),
+                                TextFont {
+                                    font_size: 13.0,
+                                    ..default()
+                                },
+                                TextColor(palette::TEXT),
+                            ));
+                        }
+                    });
                 });
             }
         });
@@ -260,6 +403,7 @@ pub fn update_chat_panel(
     mode: Res<InputMode>,
     scroll: Res<ChatScroll>,
     battle_scroll: Res<BattleScroll>,
+    debug_scroll: Res<DebugScroll>,
     mut panel_q: Query<(
         &ChatPanel,
         &mut BorderColor,
@@ -269,7 +413,8 @@ pub fn update_chat_panel(
         &Children,
     )>,
     rows: Query<(&ChatRow, &Children), Without<ChatPanel>>,
-    mut body_q: Query<(&mut Text, &mut TextColor), With<ChatRowBody>>,
+    body_q: Query<&Children, With<ChatRowBody>>,
+    mut span_q: Query<(&mut TextSpan, &mut TextColor), With<ChatRowSpan>>,
 ) {
     let now = time.elapsed_secs();
     // Intentionally NOT gated on `state.dirty` — the dirty flag is reset
@@ -296,6 +441,7 @@ pub fn update_chat_panel(
         let scroll_offset = match panel.kind {
             ChatKind::Social => scroll.rows,
             ChatKind::Battle => battle_scroll.rows,
+            ChatKind::Debug => debug_scroll.rows,
         };
 
         // The accent border is only meaningful for the social panel —
@@ -310,7 +456,7 @@ pub fn update_chat_panel(
                         InputMode::PassiveCursor(s) if matches!(s.focus, PassiveCursorFocus::Chat)
                     )
             }
-            ChatKind::Battle => scroll_offset != 0,
+            ChatKind::Battle | ChatKind::Debug => scroll_offset != 0,
         };
         let want_border = if focused {
             palette::ACCENT
@@ -336,8 +482,7 @@ pub fn update_chat_panel(
         }
         let idle = (now - decay.last_active_secs).max(0.0);
         let t = ((idle - FULL_HOLD_SECS) / FADE_SECS).clamp(0.0, 1.0);
-        let target_h =
-            PANEL_MAX_HEIGHT_PX + (PANEL_MIN_HEIGHT_PX - PANEL_MAX_HEIGHT_PX) * t;
+        let target_h = PANEL_MAX_HEIGHT_PX + (PANEL_MIN_HEIGHT_PX - PANEL_MAX_HEIGHT_PX) * t;
         let want_h = Val::Px(target_h);
         if node.height != want_h {
             node.height = want_h;
@@ -366,24 +511,37 @@ pub fn update_chat_panel(
                 continue;
             };
             let line = visible.get(row.slot).copied().flatten();
+            // The row has one ChatRowBody child; that body has a pool of
+            // SPANS_PER_ROW TextSpan children. Walk panel → row → body →
+            // spans, filling segments in order.
             for body_child in row_children.iter() {
-                if let Ok((mut text, mut tc)) = body_q.get_mut(body_child) {
-                    match line {
-                        Some(l) => {
-                            let want = format_chat_line(l.channel, &l.sender, &l.text);
-                            if **text != want {
-                                **text = want;
-                            }
-                            let want_color = channel_color(l.channel);
-                            if tc.0 != want_color {
-                                tc.0 = want_color;
-                            }
-                        }
-                        None => {
-                            if !text.is_empty() {
-                                **text = String::new();
-                            }
-                        }
+                let Ok(span_children) = body_q.get(body_child) else {
+                    continue;
+                };
+                // Build the segment list once for this row (or an empty
+                // marker for the no-line case), then fill spans in order
+                // and clear the tail.
+                let segments: Vec<(String, Color)> = match line {
+                    Some(l) => {
+                        let base = channel_color(l.channel);
+                        let formatted = format_chat_line(l.channel, &l.sender, &l.text);
+                        segment_chat_line(&formatted, base)
+                    }
+                    None => Vec::new(),
+                };
+                for (i, span_child) in span_children.iter().enumerate() {
+                    let Ok((mut span_text, mut span_color)) = span_q.get_mut(span_child) else {
+                        continue;
+                    };
+                    let (want_text, want_color): (&str, Color) = segments
+                        .get(i)
+                        .map(|(t, c)| (t.as_str(), *c))
+                        .unwrap_or(("", palette::TEXT));
+                    if span_text.as_str() != want_text {
+                        **span_text = want_text.to_string();
+                    }
+                    if span_color.0 != want_color {
+                        span_color.0 = want_color;
                     }
                 }
             }
@@ -417,7 +575,63 @@ pub fn format_chat_line(channel: ChatChannel, sender: &str, text: &str) -> Strin
         // System and Battle: server already formatted these. Print the
         // text bare — no sender prefix, no decoration.
         ChatChannel::System | ChatChannel::Battle => text.to_string(),
+        // Debug: client-internal toasts. Prefix with a faint marker so
+        // the operator can tell a debug line from a server System line
+        // if they ever bleed across panels (e.g., in a postcard log).
+        ChatChannel::Debug => format!("[dbg] {text}"),
     }
+}
+
+/// Segment a fully-formatted chat line into colored runs for inline
+/// rendering. Splits at every `{...}` block, painting the contents in
+/// [`AUTOTRANSLATE_COLOR`] and the surrounding braces in
+/// [`AUTOTRANSLATE_BRACE_COLOR`]; everything else picks up `base`. The
+/// result is always non-empty (an empty input yields a single empty
+/// segment) — callers can rely on indexing into it.
+///
+/// This is intentionally lossy with respect to escaped braces: a literal
+/// `{` in chat text is exceedingly rare on the wire (FFXI's input UI
+/// doesn't even let you type one), and the upstream auto-translate
+/// decoder is the only producer of brace pairs. If someone genuinely
+/// types `{`, it falls into the AT-styled bucket — acceptable.
+pub fn segment_chat_line(line: &str, base: Color) -> Vec<(String, Color)> {
+    let mut out: Vec<(String, Color)> = Vec::new();
+    let mut buf = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            // Flush the base-color run before this AT block.
+            if !buf.is_empty() {
+                out.push((std::mem::take(&mut buf), base));
+            }
+            // Collect `{...}` inclusive of braces into one span.
+            let mut at = String::from('{');
+            let mut closed = false;
+            for ic in chars.by_ref() {
+                at.push(ic);
+                if ic == '}' {
+                    closed = true;
+                    break;
+                }
+            }
+            if closed {
+                out.push((at, AUTOTRANSLATE_COLOR));
+            } else {
+                // Unterminated — emit defensively as AT so the bug is
+                // visible upstream instead of silently lost.
+                out.push((at, AUTOTRANSLATE_COLOR));
+            }
+        } else {
+            buf.push(c);
+        }
+    }
+    if !buf.is_empty() {
+        out.push((buf, base));
+    }
+    if out.is_empty() {
+        out.push((String::new(), base));
+    }
+    out
 }
 
 /// Per-channel line color — the whole row picks this up.
@@ -435,6 +649,8 @@ pub fn channel_color(c: ChatChannel) -> Color {
         // operator's at-a-glance read picks up battle lines apart from
         // social channels.
         ChatChannel::Battle => Color::srgb(1.00, 0.55, 0.10),
+        // Debug toasts: dim teal — clearly client-internal, not server.
+        ChatChannel::Debug => Color::srgb(0.55, 0.75, 0.80),
     }
 }
 
@@ -494,8 +710,10 @@ pub fn chat_wheel_scroll_system(
     state: Res<SceneState>,
     mut scroll: ResMut<ChatScroll>,
     mut battle_scroll: ResMut<BattleScroll>,
+    mut debug_scroll: ResMut<DebugScroll>,
     mut accum: ResMut<ChatScrollAccum>,
     mut battle_accum: ResMut<BattleScrollAccum>,
+    mut debug_accum: ResMut<DebugScrollAccum>,
     mut pointer: ResMut<MousePointer>,
 ) {
     let mut delta: f32 = 0.0;
@@ -533,14 +751,148 @@ pub fn chat_wheel_scroll_system(
             battle_scroll.rows = rows;
             battle_accum.frac = frac;
         }
+        ChatKind::Debug => {
+            let (rows, frac) =
+                apply_wheel_delta(debug_scroll.rows, debug_accum.frac, delta, buffer_len);
+            debug_scroll.rows = rows;
+            debug_accum.frac = frac;
+        }
     }
     // Suppress camera zoom on the same wheel event.
     pointer.wheel = 0.0;
 }
 
+/// React to clicks on a [`ChatTabButton`] — set [`ActiveChatTab`] to
+/// that tab's kind. `Changed<Interaction>` keeps the system cost
+/// per-frame O(buttons-that-just-changed), not O(all buttons).
+pub fn chat_tab_click_system(
+    interactions: Query<(&Interaction, &ChatTabButton), Changed<Interaction>>,
+    mut active: ResMut<ActiveChatTab>,
+) {
+    for (interaction, button) in &interactions {
+        if *interaction == Interaction::Pressed && active.0 != button.kind {
+            active.0 = button.kind;
+        }
+    }
+}
+
+/// Apply [`ActiveChatTab`] to the UI: toggle `Display` on the stacked
+/// [`ChatPanel`]s and recolor the [`ChatTabButton`] labels + borders
+/// so the active tab pops in `palette::ACCENT`.
+pub fn update_chat_tab_visuals_system(
+    active: Res<ActiveChatTab>,
+    mut panel_q: Query<(&ChatPanel, &mut Node), Without<ChatTabButton>>,
+    mut tab_q: Query<
+        (&ChatTabButton, &mut BorderColor, &Children),
+        (Without<ChatPanel>, Without<ChatTabButtonLabel>),
+    >,
+    mut label_q: Query<&mut TextColor, With<ChatTabButtonLabel>>,
+) {
+    if !active.is_changed() {
+        return;
+    }
+    for (panel, mut node) in &mut panel_q {
+        let want = if panel.kind == active.0 {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != want {
+            node.display = want;
+        }
+    }
+    for (button, mut border, children) in &mut tab_q {
+        let is_active = button.kind == active.0;
+        let (border_c, label_c) = if is_active {
+            (palette::ACCENT, palette::ACCENT)
+        } else {
+            (palette::BORDER, palette::MUTED)
+        };
+        if border.left != border_c {
+            *border = BorderColor::all(border_c);
+        }
+        for child in children.iter() {
+            if let Ok(mut tc) = label_q.get_mut(child) {
+                if tc.0 != label_c {
+                    tc.0 = label_c;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_plain_text_is_single_base_span() {
+        let segs = segment_chat_line("hello world", palette::TEXT);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].0, "hello world");
+        assert_eq!(segs[0].1, palette::TEXT);
+    }
+
+    #[test]
+    fn segment_splits_braces_and_colors_them() {
+        let segs = segment_chat_line(
+            "[Skaine] : {Looking for Party} {Experience points} : THF 59",
+            palette::TEXT,
+        );
+        let texts: Vec<&str> = segs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "[Skaine] : ",
+                "{Looking for Party}",
+                " ",
+                "{Experience points}",
+                " : THF 59",
+            ]
+        );
+        // AT spans (1 and 3) pick up the sky-blue; surrounding text stays base.
+        assert_eq!(segs[1].1, AUTOTRANSLATE_COLOR);
+        assert_eq!(segs[3].1, AUTOTRANSLATE_COLOR);
+        assert_eq!(segs[0].1, palette::TEXT);
+        assert_eq!(segs[2].1, palette::TEXT);
+        assert_eq!(segs[4].1, palette::TEXT);
+    }
+
+    #[test]
+    fn segment_empty_input_yields_single_empty_segment() {
+        // Render path indexes into segments[..]; an empty result would
+        // skip clearing trailing spans. Guarantee non-empty.
+        let segs = segment_chat_line("", palette::TEXT);
+        assert_eq!(segs.len(), 1);
+        assert!(segs[0].0.is_empty());
+    }
+
+    #[test]
+    fn segment_unclosed_brace_does_not_lose_tail() {
+        // Pathological input — the autotranslate decoder shouldn't ever
+        // emit this, but be defensive: the tail must still surface so a
+        // bug upstream is visible to the operator instead of silently
+        // eaten.
+        let segs = segment_chat_line("foo {open and never close", palette::TEXT);
+        let joined: String = segs.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(joined.contains("open and never close"));
+        assert!(joined.contains('{'));
+    }
+
+    #[test]
+    fn segment_count_stays_under_pool_for_worst_case_shout() {
+        // Hishiamazon's screenshot — 7 AT blocks interleaved with text.
+        // Each block contributes 3 spans (open brace, phrase, close
+        // brace). Plus the gaps. The pool must comfortably absorb this.
+        let line = "{a}{b}{c}{d}{e}{f}{g}";
+        let segs = segment_chat_line(line, palette::TEXT);
+        assert!(
+            segs.len() <= SPANS_PER_ROW,
+            "{} segments overflows pool of {}",
+            segs.len(),
+            SPANS_PER_ROW
+        );
+    }
 
     #[test]
     fn say_format_is_name_colon_text() {
