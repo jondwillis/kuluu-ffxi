@@ -133,6 +133,22 @@ pub struct Mo2Animation {
     /// `Vos2Mesh::skeleton_bone_for` returns); value = `frames`
     /// keyframes for that bone.
     pub per_bone: std::collections::BTreeMap<u32, Vec<Mo2Frame>>,
+    /// Dense, index-by-bone-id mirror of `per_bone` for hot-path
+    /// lookups (animation tick runs every frame for every visible
+    /// actor — the BTreeMap probe shows up in profiles). Length is
+    /// `max(bone_id) + 1`; entries for absent bones are `None`.
+    pub per_bone_dense: Vec<Option<Vec<Mo2Frame>>>,
+}
+
+impl Mo2Animation {
+    /// Hot-path bone keyframe lookup. Bones with no animated channel
+    /// return `None`; callers should fall back to bind pose.
+    #[inline]
+    pub fn frames_for_bone(&self, bone: usize) -> Option<&[Mo2Frame]> {
+        self.per_bone_dense
+            .get(bone)
+            .and_then(|o| o.as_deref())
+    }
 }
 
 /// One keyframe for one bone: a local rotation + translation + scale.
@@ -275,11 +291,20 @@ pub fn parse_mo2(body: &[u8], chunk_name: &[u8; 4]) -> Result<Mo2Animation> {
     }
 
     let frames = header_frames.saturating_sub(1);
+    let max_bone = per_bone.keys().copied().max().unwrap_or(0) as usize;
+    let mut per_bone_dense: Vec<Option<Vec<Mo2Frame>>> =
+        (0..=max_bone).map(|_| None).collect();
+    for (&bone, kfs) in &per_bone {
+        if (bone as usize) < per_bone_dense.len() {
+            per_bone_dense[bone as usize] = Some(kfs.clone());
+        }
+    }
     Ok(Mo2Animation {
         name: name_buf,
         frames,
         speed,
         per_bone,
+        per_bone_dense,
     })
 }
 

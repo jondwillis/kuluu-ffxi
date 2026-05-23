@@ -1714,8 +1714,7 @@ pub fn tick_skinned_actors(
                             continue;
                         };
                         let (rot, trans, scale) = match anim
-                            .per_bone
-                            .get(&(i as u32))
+                            .frames_for_bone(i)
                             .and_then(|frames| frames.get(frame_idx))
                         {
                             Some(f) => (f.rotation, f.translation, f.scale),
@@ -1877,8 +1876,7 @@ pub fn tick_skinned_actors(
             // Sample `to` first (always live). Then optionally sample
             // `from` and slerp / lerp by `blend_t`.
             let (to_rot, to_trans, to_scale_arr) = match to_anim
-                .per_bone
-                .get(&(i as u32))
+                .frames_for_bone(i)
                 .and_then(|frames| frames.get(to_frame))
             {
                 Some(f) => (f.rotation, f.translation, f.scale),
@@ -1888,8 +1886,7 @@ pub fn tick_skinned_actors(
             let (rot, trans, scale) = match from_resolved.as_ref() {
                 Some((from_anim, _)) => {
                     let (from_rot, from_trans, from_scale_arr) = match from_anim
-                        .per_bone
-                        .get(&(i as u32))
+                        .frames_for_bone(i)
                         .and_then(|frames| frames.get(from_frame))
                     {
                         Some(f) => (f.rotation, f.translation, f.scale),
