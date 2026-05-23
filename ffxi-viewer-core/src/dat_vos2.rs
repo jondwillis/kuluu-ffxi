@@ -1640,10 +1640,13 @@ pub fn tick_skinned_actors(
     state: Res<crate::snapshot::SceneState>,
     motion: Res<crate::combat_stance::EntityMotion>,
     rest: Res<crate::combat_stance::RestStance>,
+    mut blends: ResMut<crate::combat_stance::AnimationBlends>,
     q_actors: Query<(&crate::components::WorldEntity, &SkinnedActor)>,
     mut q_bones: Query<&mut Transform>,
 ) {
+    use crate::combat_stance::{ClipId, EntityMotion};
     let elapsed = time.elapsed_secs();
+    let dt = time.delta_secs();
     for (world, actor) in &q_actors {
         let Some(baked) = baked_skeleton_for_file(actor.dat_id) else {
             continue;
@@ -1663,7 +1666,10 @@ pub fn tick_skinned_actors(
             .find(|e| e.id == world.id)
             .map(|e| e.bt_target_id != 0)
             .unwrap_or(false);
-        let moving = motion.is_moving(world.id);
+        let sample = motion
+            .sample(world.id)
+            .unwrap_or(crate::combat_stance::MotionSample::default());
+        let moving = sample.speed > EntityMotion::MOVE_THRESHOLD;
 
         // Rest stance (self only): when `/sit` / `/heal` / `/kneel` is
         // active, self plays the sit / hea MO2 uninterruptibly until
@@ -1718,30 +1724,132 @@ pub fn tick_skinned_actors(
             }
         }
 
-        // Pick the right anim per the (engaged, moving) matrix in
-        // the doc comment above. Each `or_else` is a graceful
-        // degradation step — NPC skels lack motion DATs, some NPC
-        // skels lack `run` entirely, so the chain always ends with
-        // the universally-present `idl`.
-        let anim = match (engaged, moving) {
-            (true, true) => crate::combat_stance::combat_run_anim_for_skel(actor.dat_id)
-                .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
-                .or_else(|| crate::combat_stance::battle_idle_anim_for_skel(actor.dat_id))
-                .or_else(|| idle_anim_for_file(actor.dat_id)),
-            (true, false) => crate::combat_stance::battle_idle_anim_for_skel(actor.dat_id)
-                .or_else(|| idle_anim_for_file(actor.dat_id)),
-            (false, true) => crate::combat_stance::run_anim_for_skel(actor.dat_id)
-                .or_else(|| idle_anim_for_file(actor.dat_id)),
-            (false, false) => idle_anim_for_file(actor.dat_id),
+        // Pick a logical ClipId. The directional rule (strafe /
+        // backpedal / turn-in-place) only applies to the casual,
+        // non-engaged locomotion path; the engaged path keeps the
+        // simpler (engaged, moving) matrix because retail combat
+        // stance has no strafe variants — combat run with a yawed
+        // root looks the same in every horizontal direction.
+        //
+        // Magnitude threshold for the strafe-vs-forward decision is
+        // half the run threshold — both components must be non-trivial
+        // *and* the strafe component must dominate.
+        let dir_threshold = EntityMotion::MOVE_THRESHOLD * 0.5;
+        let clip_id = if engaged {
+            if moving { ClipId::CombatRun } else { ClipId::BattleIdle }
+        } else if moving {
+            let fwd = sample.forward_component;
+            let strafe = sample.strafe_component;
+            if strafe.abs() > fwd.abs()
+                && strafe.abs() > dir_threshold
+                && fwd.abs() > dir_threshold * 0.5
+            {
+                if strafe > 0.0 { ClipId::StrafeRight } else { ClipId::StrafeLeft }
+            } else if fwd < -dir_threshold {
+                ClipId::Backpedal
+            } else {
+                ClipId::Run
+            }
+        } else if sample.heading_rate.abs() > EntityMotion::TURN_THRESHOLD_RAD_PER_SEC {
+            ClipId::TurnInPlace
+        } else {
+            ClipId::Idle
         };
-        let Some(anim) = anim else {
+
+        // Resolve a ClipId to (anim, time_scale_signum). Each step is
+        // a graceful degradation — NPC skels lack motion DATs, no PC
+        // skel ships a `bck`/`stl`/`str`/`trn` clip (probed empty), so
+        // the chain always ends on something universally present.
+        //
+        // INLINE NOTE: empirically the following 3-char prefixes are
+        // ABSENT from every retail PC skeleton DAT and motion DAT we
+        // could probe:
+        //   - `bck` (backpedal)  — fall back to `run` at -1× time scale
+        //   - `stl` / `str` (strafe L/R) — fall back to `run` (no sign flip)
+        //   - `trn` (turn-in-place)      — fall back to `idl`
+        // Walk (`wlk`) IS present on most PC skel DATs. The probe is
+        // still in `directional_anim_for_skel` so that beastman / NPC
+        // skels carrying these clips (if any) light up automatically.
+        let resolve = |clip: ClipId| -> Option<(std::sync::Arc<ffxi_dat::anim::Mo2Animation>, f32)> {
+            match clip {
+                ClipId::CombatRun => crate::combat_stance::combat_run_anim_for_skel(actor.dat_id)
+                    .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
+                    .or_else(|| crate::combat_stance::battle_idle_anim_for_skel(actor.dat_id))
+                    .or_else(|| idle_anim_for_file(actor.dat_id))
+                    .map(|a| (a, 1.0)),
+                ClipId::BattleIdle => crate::combat_stance::battle_idle_anim_for_skel(actor.dat_id)
+                    .or_else(|| idle_anim_for_file(actor.dat_id))
+                    .map(|a| (a, 1.0)),
+                ClipId::Run => crate::combat_stance::run_anim_for_skel(actor.dat_id)
+                    .or_else(|| idle_anim_for_file(actor.dat_id))
+                    .map(|a| (a, 1.0)),
+                ClipId::Backpedal => crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"bck")
+                    .map(|a| (a, 1.0))
+                    .or_else(|| {
+                        // No dedicated bck clip on PC skels — play run
+                        // reversed in time to fake the backpedal cycle.
+                        crate::combat_stance::run_anim_for_skel(actor.dat_id).map(|a| (a, -1.0))
+                    })
+                    .or_else(|| idle_anim_for_file(actor.dat_id).map(|a| (a, 1.0))),
+                ClipId::StrafeLeft => crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"stl")
+                    .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
+                    .or_else(|| idle_anim_for_file(actor.dat_id))
+                    .map(|a| (a, 1.0)),
+                ClipId::StrafeRight => crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"str")
+                    .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
+                    .or_else(|| idle_anim_for_file(actor.dat_id))
+                    .map(|a| (a, 1.0)),
+                ClipId::TurnInPlace => crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"trn")
+                    .or_else(|| idle_anim_for_file(actor.dat_id))
+                    .map(|a| (a, 1.0)),
+                ClipId::Walk => crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"wlk")
+                    .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
+                    .or_else(|| idle_anim_for_file(actor.dat_id))
+                    .map(|a| (a, 1.0)),
+                ClipId::Idle => idle_anim_for_file(actor.dat_id).map(|a| (a, 1.0)),
+            }
+        };
+
+        // Advance / start the cross-fade. After this call the blend's
+        // `to_clip` is `clip_id`; on a fresh switch `t = 0`; on a
+        // stable selection `t` ticks toward 1.
+        blends.update(world.id, clip_id, dt);
+        let blend = blends.by_id.get(&world.id).copied().expect("just inserted");
+
+        let Some((to_anim, to_scale)) = resolve(blend.to_clip) else {
             continue;
         };
-        if anim.frames == 0 {
-            continue;
-        }
-        let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
-        let frame_idx = ((elapsed / safe_speed).floor() as usize) % anim.frames as usize;
+        // While the blend is still in flight, sample both `from` and
+        // `to` and lerp per-bone. Once `t >= 1`, skip the `from` sample
+        // entirely — saves a DAT lookup + map walk.
+        let from_resolved = if blend.t < 1.0 && blend.from_clip != blend.to_clip {
+            resolve(blend.from_clip)
+        } else {
+            None
+        };
+
+        // Convert (anim, time_scale_signum) → current frame index. A
+        // negative `time_scale` runs the clip backwards (used for the
+        // run-as-backpedal fallback).
+        let frame_of = |anim: &ffxi_dat::anim::Mo2Animation, scale: f32| -> usize {
+            if anim.frames == 0 {
+                return 0;
+            }
+            let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
+            let t_local = elapsed * scale / safe_speed;
+            // Rust % can be negative; wrap into [0, frames).
+            let frames = anim.frames as i64;
+            let raw = t_local.floor() as i64;
+            let idx = ((raw % frames) + frames) % frames;
+            idx as usize
+        };
+        let to_frame = frame_of(&to_anim, to_scale);
+        let from_frame = from_resolved
+            .as_ref()
+            .map(|(a, s)| frame_of(a, *s))
+            .unwrap_or(0);
+
+        let blend_t = blend.t.clamp(0.0, 1.0);
 
         for (i, bone) in raw.bones.iter().enumerate() {
             // Bone[0] carries the `bind_to_bevy` axis flip set up in
@@ -1757,16 +1865,46 @@ pub fn tick_skinned_actors(
             let Some(&bone_e) = actor.bone_entities.get(i) else {
                 continue;
             };
-            // Sample the animated local for this bone if MO2 drives it;
-            // fall back to the bone's bind-time local otherwise.
-            let (rot, trans, scale) = match anim
+
+            // Sample `to` first (always live). Then optionally sample
+            // `from` and slerp / lerp by `blend_t`.
+            let (to_rot, to_trans, to_scale_arr) = match to_anim
                 .per_bone
                 .get(&(i as u32))
-                .and_then(|frames| frames.get(frame_idx))
+                .and_then(|frames| frames.get(to_frame))
             {
                 Some(f) => (f.rotation, f.translation, f.scale),
                 None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
             };
+
+            let (rot, trans, scale) = match from_resolved.as_ref() {
+                Some((from_anim, _)) => {
+                    let (from_rot, from_trans, from_scale_arr) = match from_anim
+                        .per_bone
+                        .get(&(i as u32))
+                        .and_then(|frames| frames.get(from_frame))
+                    {
+                        Some(f) => (f.rotation, f.translation, f.scale),
+                        None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
+                    };
+                    let q_from = Quat::from_xyzw(from_rot[0], from_rot[1], from_rot[2], from_rot[3]);
+                    let q_to = Quat::from_xyzw(to_rot[0], to_rot[1], to_rot[2], to_rot[3]);
+                    let q = q_from.slerp(q_to, blend_t);
+                    let t_from = Vec3::from_array(from_trans);
+                    let t_to = Vec3::from_array(to_trans);
+                    let t = t_from.lerp(t_to, blend_t);
+                    let s_from = Vec3::from_array(from_scale_arr);
+                    let s_to = Vec3::from_array(to_scale_arr);
+                    let s = s_from.lerp(s_to, blend_t);
+                    (
+                        [q.x, q.y, q.z, q.w],
+                        [t.x, t.y, t.z],
+                        [s.x, s.y, s.z],
+                    )
+                }
+                None => (to_rot, to_trans, to_scale_arr),
+            };
+
             if let Ok(mut tf) = q_bones.get_mut(bone_e) {
                 tf.rotation = Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]);
                 tf.translation = Vec3::from_array(trans);

@@ -57,7 +57,7 @@ use tokio::runtime::Handle as RtHandle;
 use crate::launcher::Defaults;
 
 use self::bridge::NativeSource;
-use self::input::{AutoRun, CommandTx, LocalPlayerPrediction};
+use self::input::{AutoRun, CameraAutoRecenter, CommandTx, HeadingTurnAccum, LocalPlayerPrediction};
 use self::launcher_ui::{LoginErrorMsg, PendingConnect};
 
 /// Top-level phase of the unified native `App`.
@@ -211,6 +211,8 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // for highlight materials, breaking Tab targeting visuals.
     app.insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<AutoRun>()
+        .init_resource::<CameraAutoRecenter>()
+        .init_resource::<HeadingTurnAccum>()
         .init_resource::<LocalPlayerPrediction>()
         .init_resource::<text_input::CaptureMode>()
         .insert_resource(ports)
@@ -360,6 +362,18 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             // selectable" — flaky precisely because scheduler order
             // varied frame-to-frame.
             .after(ffxi_viewer_core::chase_camera_system)
+            .run_if(in_state(AppPhase::InGame)),
+    );
+    // Camera polish: auto-recenter behind player on sustained forward,
+    // and 1p pitch-track the lock-on target's head. Mutates
+    // `ChaseCamera` only; ordered *before* the camera positioning
+    // systems so the yaw/pitch they read this frame already reflects
+    // the polish (otherwise the polish lags one frame behind).
+    app.add_systems(
+        Update,
+        input::camera_polish_system
+            .before(ffxi_viewer_core::chase_camera_system)
+            .before(ffxi_viewer_core::firstperson_camera_system)
             .run_if(in_state(AppPhase::InGame)),
     );
     app.add_systems(
@@ -520,6 +534,8 @@ fn despawn_ingame_entities(
     mut system_sfx_cursor: ResMut<ffxi_viewer_core::audio::SystemSfxCursor>,
     mut engagement_chat_cursor: ResMut<ffxi_viewer_core::debug_chat::EngagementChatCursor>,
     mut speed_suppression_latch: ResMut<ffxi_viewer_core::debug_chat::SpeedSuppressionLatch>,
+    mut entity_motion: ResMut<ffxi_viewer_core::combat_stance::EntityMotion>,
+    mut animation_blends: ResMut<ffxi_viewer_core::combat_stance::AnimationBlends>,
 ) {
     let mut count = 0usize;
     for entity in q.iter() {
@@ -581,6 +597,15 @@ fn despawn_ingame_entities(
     // session's first snapshot lands.
     *scene = SceneState::default();
     events.recent.clear();
+    // Locomotion caches: both are keyed by wire entity id, and
+    // ids are session-scoped (the next session may reuse the same
+    // id for a totally different actor). Without draining, the new
+    // session's first frame would read a stale `last_pos` /
+    // `from_clip` and either emit a giant speed spike (snap) or
+    // cross-fade from an unrelated anim. Drain on InGame exit so
+    // each session starts with a clean per-actor history.
+    entity_motion.by_id.clear();
+    animation_blends.by_id.clear();
 
     tracing::info!(count, "OnExit(InGame): despawned scoped entities");
 }

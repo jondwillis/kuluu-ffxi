@@ -284,6 +284,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // module docs.
         app.init_resource::<combat_stance::EntityMotion>();
         app.init_resource::<combat_stance::RestStance>();
+        app.init_resource::<combat_stance::AnimationBlends>();
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,

@@ -929,6 +929,44 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::MusicVolumeChanged { slot, volume });
             }
         }
+        op if op == s2c::WPOS || op == s2c::WPOS2 => {
+            // Server-initiated forced position for the local player. LSB
+            // emits this on cutscene end (0x05c), zone-line re-anchor
+            // (0x05e), homepoint, GM warp. POSMODE selects what the
+            // client should do; only NORMAL/EVENT/POP/RESET/MATERIALIZE
+            // re-anchor the player. See ffxi_proto::decode::ForcedMove
+            // for the body layout and the LSB vendor source cites.
+            //
+            // Knockback (BATTLE2 0x028 result.knockback) is intentionally
+            // NOT routed here — it's an animation hint integrated
+            // client-side, not a wire forced-move. The synthetic test in
+            // reactor.rs exercises the same code path against this
+            // event so the override semantics are still covered.
+            if let Ok(fm) = decode::ForcedMove::decode(sub.data) {
+                if fm.unique_no == self_char_id && fm.mode.carries_position() {
+                    *self_pos = Position {
+                        pos: Vec3 {
+                            x: fm.x,
+                            y: fm.y,
+                            z: fm.z,
+                        },
+                        heading: fm.heading,
+                        ..*self_pos
+                    };
+                    // Default override window: 1 second. The retail
+                    // client's POP/MATERIALIZE animation lasts roughly
+                    // that long; for instant teleports (NORMAL/EVENT)
+                    // it's a no-op the lerp finishes in the first tick.
+                    // A future enhancement can vary this per mode.
+                    let duration_ms = 1000u32;
+                    let _ = event_tx.send(AgentEvent::ForcedMove {
+                        mode: fm.raw_mode,
+                        target: *self_pos,
+                        duration_ms,
+                    });
+                }
+            }
+        }
         op if op == s2c::WEATHER => {
             // 0x057 — current zone weather. 8-byte fixed body:
             // `u32 StartTime, u16 WeatherNumber, u16 OffsetTime`. We only
@@ -1353,7 +1391,10 @@ async fn keepalive_loop(
     mut npc_name_resolver: NpcNameResolver,
 ) -> Result<MapOutcome> {
     let mut last_recv = std::time::Instant::now();
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    // 100 ms tick gives the spec's ~10 Hz Move cadence under sustained
+    // movement. POS subpacket inclusion is further gated by `should_emit_pos`
+    // so heading-only / big-jump events can still bypass the rate-limit.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     tick.tick().await;
     let mut reconnect_addr: Option<std::net::SocketAddr> = None;
     let mut terminal_disconnect = false;
@@ -1386,6 +1427,20 @@ async fn keepalive_loop(
     // with the spawn coords so the very first keepalive doesn't
     // false-trigger.
     let mut last_keepalive_pos: Vec3 = self_pos.pos;
+    // 10 Hz Move emission state. `last_move_emission` tracks the last
+    // outbound POS subpacket; `last_emitted_pos` / `last_emitted_heading`
+    // back the big-jump and heading-changed bypass gates in
+    // `should_emit_pos`. Initially `None` so the very first tick emits
+    // unconditionally (server expects an authoritative position handshake
+    // right after zone-in).
+    let mut last_move_emission: Option<std::time::Instant> = None;
+    let mut last_emitted_pos: Vec3 = self_pos.pos;
+    let mut last_emitted_heading: u8 = self_pos.heading;
+    // Active rubber-band target. Set by `reconcile_self_pos` when an
+    // inbound CHAR_PC for self lands in the (2, 10] yalm correction band;
+    // each tick lerps `self_pos.pos` toward it at 5 yalm/s until reached.
+    let mut rubber_band_target: Option<Vec3> = None;
+    let mut last_rubber_band_step: std::time::Instant = std::time::Instant::now();
     // Edge-detected self `MoghouseFlg`. Seeded to `false`; the first self
     // GROUP_ATTR / GROUP_LIST tick after entry inverts it and `note_mog_transition`
     // emits the explanatory chat line. Persists across the loop's many
@@ -1926,6 +1981,24 @@ async fn keepalive_loop(
                     }
                     pending_event_end_since = None;
                 }
+                // Rubber-band advance: if an inbound CHAR_PC landed in the
+                // (2, 10] yalm correction band, walk `self_pos.pos` toward
+                // the stored target at 5 yalm/s. Done *before* the heal-
+                // cancel / POS-gating below so the emitted position
+                // already reflects the lerped value.
+                if let Some(target) = rubber_band_target {
+                    let dt = last_rubber_band_step.elapsed().as_secs_f32();
+                    last_rubber_band_step = std::time::Instant::now();
+                    let max_step = 5.0 * dt; // 5 yalm/s
+                    let (next, reached) = lerp_toward(self_pos.pos, target, max_step);
+                    self_pos.pos = next;
+                    if reached {
+                        rubber_band_target = None;
+                    }
+                } else {
+                    last_rubber_band_step = std::time::Instant::now();
+                }
+
                 // Heal-cancel interceptor: if we're healing and this tick
                 // would advertise a new position, prepend 0x0E8 Mode::Off
                 // so the server clears `EFFECT_HEALING` *before* it sees
@@ -1943,21 +2016,48 @@ async fn keepalive_loop(
                         "camp auto-cancel (movement detected during heal)"
                     );
                 }
-                payload.extend(build_subpacket_pos(
-                    sub_seq,
-                    self_pos.pos.x,
-                    self_pos.pos.y,
-                    self_pos.pos.z,
-                    self_pos.heading,
-                ));
-                sub_seq = sub_seq.wrapping_add(1);
-                last_keepalive_pos = self_pos.pos;
-                if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
-                    tracing::warn!(error = %e, "keepalive send failed");
-                    let _ = event_tx.send(AgentEvent::Error { message: format!("keepalive send: {e}") });
-                    break;
+                // 10 Hz Move cadence gate. POS is included when EITHER:
+                //   - `>= 100ms` since the last emission (sustained 10 Hz),
+                //   - position delta from last emission > 0.5 yalm (jump),
+                //   - heading byte changed (immediate flush).
+                // First tick (`last_move_emission == None`) always emits so
+                // the server's zone-in handshake has an authoritative pos.
+                let dx = self_pos.pos.x - last_emitted_pos.x;
+                let dy = self_pos.pos.y - last_emitted_pos.y;
+                let dz = self_pos.pos.z - last_emitted_pos.z;
+                let pos_delta = (dx * dx + dy * dy + dz * dz).sqrt();
+                let heading_changed = self_pos.heading != last_emitted_heading;
+                let include_pos = match last_move_emission {
+                    None => true,
+                    Some(t) => should_emit_pos(t.elapsed(), pos_delta, heading_changed),
+                };
+                if include_pos {
+                    payload.extend(build_subpacket_pos(
+                        sub_seq,
+                        self_pos.pos.x,
+                        self_pos.pos.y,
+                        self_pos.pos.z,
+                        self_pos.heading,
+                    ));
+                    sub_seq = sub_seq.wrapping_add(1);
+                    last_keepalive_pos = self_pos.pos;
+                    last_emitted_pos = self_pos.pos;
+                    last_emitted_heading = self_pos.heading;
+                    last_move_emission = Some(std::time::Instant::now());
                 }
-                bundle_seq = bundle_seq.wrapping_add(1);
+                // Skip the network send when there's nothing to put on the
+                // wire — at 100ms tick we'd otherwise pump empty UDP
+                // bundles 10× a second. The 100ms POS gate ensures a
+                // bundle goes out at least every 100ms under normal
+                // conditions; recv-side traffic keeps the connection live.
+                if !payload.is_empty() {
+                    if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
+                        tracing::warn!(error = %e, "keepalive send failed");
+                        let _ = event_tx.send(AgentEvent::Error { message: format!("keepalive send: {e}") });
+                        break;
+                    }
+                    bundle_seq = bundle_seq.wrapping_add(1);
+                }
             }
             res = tokio::time::timeout(std::time::Duration::from_millis(50), map.recv_decrypted()) => {
                 if let Ok(Ok(buf)) = res {
@@ -1990,6 +2090,15 @@ async fn keepalive_loop(
                                 terminal_disconnect = true;
                             }
                         } else {
+                            // Snapshot the local self-position *before*
+                            // dispatching to `handle_sub_packet` — that
+                            // handler unconditionally overwrites
+                            // `self_pos` with the server's value on a
+                            // CHAR_PC for self. We want to apply
+                            // rubber-band reconciliation against the
+                            // pre-overwrite local pos, so capture it
+                            // here.
+                            let prev_self_pos = self_pos.pos;
                             handle_sub_packet(
                                 &sub,
                                 &event_tx,
@@ -2004,6 +2113,70 @@ async fn keepalive_loop(
                                 &mut npc_name_resolver,
                                 &mut self_in_mog_house,
                             );
+                            // Self-reconciliation (rubber-band). The
+                            // handler just clobbered `self_pos` with the
+                            // server's PosHead for self; decide whether
+                            // to keep that, ignore it (trust local), or
+                            // gradually correct toward it.
+                            if sub.opcode == ffxi_proto::map::s2c::CHAR_PC {
+                                if let Ok(head) = decode::PosHead::decode(sub.data) {
+                                    if head.unique_no == self_char_id {
+                                        let server_pos = self_pos.pos;
+                                        match reconcile_self_pos(prev_self_pos, server_pos) {
+                                            SelfPosReconcile::KeepLocal => {
+                                                // Sub-yalm jitter — trust the
+                                                // local integrator and ignore
+                                                // the server's pos. Cancels
+                                                // any in-flight rubber-band
+                                                // since we're already inside
+                                                // the tolerance band.
+                                                self_pos.pos = prev_self_pos;
+                                                rubber_band_target = None;
+                                            }
+                                            SelfPosReconcile::Rubberband { target } => {
+                                                // Mid-band correction — keep
+                                                // the local pos visible now,
+                                                // close the gap at 5 yalm/s
+                                                // over subsequent ticks.
+                                                self_pos.pos = prev_self_pos;
+                                                rubber_band_target = Some(target);
+                                                last_rubber_band_step =
+                                                    std::time::Instant::now();
+                                                tracing::debug!(
+                                                    from = format!(
+                                                        "({:.1},{:.1},{:.1})",
+                                                        prev_self_pos.x,
+                                                        prev_self_pos.y,
+                                                        prev_self_pos.z,
+                                                    ),
+                                                    to = format!(
+                                                        "({:.1},{:.1},{:.1})",
+                                                        target.x, target.y, target.z,
+                                                    ),
+                                                    "rubber-band self pos toward server",
+                                                );
+                                            }
+                                            SelfPosReconcile::Snap => {
+                                                // Zone teleport / GM warp —
+                                                // server's pos already wrote;
+                                                // just clear any pending
+                                                // rubber-band that became
+                                                // irrelevant.
+                                                rubber_band_target = None;
+                                                tracing::info!(
+                                                    to = format!(
+                                                        "({:.1},{:.1},{:.1})",
+                                                        server_pos.x,
+                                                        server_pos.y,
+                                                        server_pos.z,
+                                                    ),
+                                                    "snap self pos to server (>10 yalm delta)",
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // Heal-mirror sync from CHAR_PC for self. Same
                             // UPDATE_HP gate (`body[6] & 0x04`) that
                             // authorizes `hpp` also authorizes the
@@ -3578,9 +3751,247 @@ fn _hint() -> Result<()> {
     bail!("compile guard")
 }
 
+// =========================================================================
+// 10 Hz Move cadence + self-reconciliation (rubber-band)
+// =========================================================================
+
+/// Minimum time between outbound POS subpacket emissions under sustained
+/// motion. Matches retail's ~10 Hz Move cadence.
+const MOVE_EMISSION_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Position delta threshold that bypasses the 10 Hz rate-limit and forces
+/// an immediate POS emission on the next keepalive tick. Sized below the
+/// `effective_step_per_tick` (~0.165 yalm at base speed) × ~3 ticks so a
+/// long-running integrator burst flushes promptly without spamming.
+const MOVE_BIG_JUMP_YALMS: f32 = 0.5;
+
+/// Self-reconciliation outcome when an inbound CHAR_PC for self carries a
+/// position different from our local `self_pos`. The thresholds match
+/// retail's "rubber-band" behavior — small deltas are ignored (client is
+/// authoritative for sub-yalm jitter), medium deltas correct gradually,
+/// and large deltas snap (zone teleport, GM warp).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SelfPosReconcile {
+    /// `delta <= 2.0 yalm` — local is trusted, server pos is ignored.
+    KeepLocal,
+    /// `2.0 < delta <= 10.0 yalm` — keep local now, lerp toward server
+    /// at 5 yalm/s on subsequent ticks until the delta closes.
+    Rubberband { target: Vec3 },
+    /// `delta > 10.0 yalm` — snap to server pos immediately (zone change,
+    /// teleport, etc.).
+    Snap,
+}
+
+/// Decide what to do with an inbound server position for self.
+/// `local` is what we believe; `server` is what the server just sent.
+fn reconcile_self_pos(local: Vec3, server: Vec3) -> SelfPosReconcile {
+    let dx = server.x - local.x;
+    let dy = server.y - local.y;
+    let dz = server.z - local.z;
+    let dist_sq = dx * dx + dy * dy + dz * dz;
+    // Squared comparisons to avoid the sqrt.
+    if dist_sq <= 2.0 * 2.0 {
+        SelfPosReconcile::KeepLocal
+    } else if dist_sq <= 10.0 * 10.0 {
+        SelfPosReconcile::Rubberband { target: server }
+    } else {
+        SelfPosReconcile::Snap
+    }
+}
+
+/// Step `cur` toward `target` by at most `max_step` yalms in 3D.
+/// Returns `(new_pos, reached)` — `reached` is true when the remaining
+/// distance is consumed by this step (target reached this tick).
+fn lerp_toward(cur: Vec3, target: Vec3, max_step: f32) -> (Vec3, bool) {
+    let dx = target.x - cur.x;
+    let dy = target.y - cur.y;
+    let dz = target.z - cur.z;
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    if dist <= max_step || dist <= 1e-4 {
+        return (target, true);
+    }
+    let f = max_step / dist;
+    (
+        Vec3 {
+            x: cur.x + dx * f,
+            y: cur.y + dy * f,
+            z: cur.z + dz * f,
+        },
+        false,
+    )
+}
+
+/// Gate for including a POS subpacket in the current keepalive bundle.
+/// Returns true when ANY of the spec's three conditions hold:
+///   1. `elapsed >= 100ms` since the last emission (10 Hz rate-limit).
+///   2. `pos_delta > 0.5 yalm` (big jump — flush immediately).
+///   3. heading byte changed (heading-only updates flush immediately).
+fn should_emit_pos(
+    elapsed: std::time::Duration,
+    pos_delta_yalms: f32,
+    heading_changed: bool,
+) -> bool {
+    elapsed >= MOVE_EMISSION_PERIOD
+        || pos_delta_yalms > MOVE_BIG_JUMP_YALMS
+        || heading_changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 10 Hz Move cadence + rubber-band reconciliation ----
+
+    fn v(x: f32, y: f32, z: f32) -> Vec3 {
+        Vec3 { x, y, z }
+    }
+
+    #[test]
+    fn should_emit_pos_rate_limits_to_10hz() {
+        // Below 100ms with no jump / heading change → suppress.
+        assert!(!should_emit_pos(
+            std::time::Duration::from_millis(50),
+            0.1,
+            false,
+        ));
+        // At/above 100ms → emit (10 Hz cadence under sustained motion).
+        assert!(should_emit_pos(
+            std::time::Duration::from_millis(100),
+            0.0,
+            false,
+        ));
+        assert!(should_emit_pos(
+            std::time::Duration::from_millis(120),
+            0.0,
+            false,
+        ));
+    }
+
+    #[test]
+    fn should_emit_pos_bypasses_rate_limit_on_big_jump() {
+        // >0.5 yalm delta forces emission even if <100ms elapsed.
+        assert!(should_emit_pos(
+            std::time::Duration::from_millis(10),
+            0.6,
+            false,
+        ));
+        // <=0.5 yalm at <100ms still suppressed.
+        assert!(!should_emit_pos(
+            std::time::Duration::from_millis(10),
+            0.5,
+            false,
+        ));
+    }
+
+    #[test]
+    fn should_emit_pos_bypasses_rate_limit_on_heading_change() {
+        assert!(should_emit_pos(
+            std::time::Duration::from_millis(10),
+            0.0,
+            true,
+        ));
+    }
+
+    /// Cadence end-to-end: feed a synthetic 30 Hz integrator stream
+    /// (33 ms apart, sub-yalm steps) and verify only ~10 ticks/s would
+    /// emit a POS subpacket — i.e., the gate trips to ~3-tick spacing.
+    #[test]
+    fn cadence_drops_30hz_integrator_to_10hz_emission() {
+        // Simulate 1 second of integrator output at 33 ms cadence with
+        // ~0.165 yalm/tick (base run speed). The reactor never produces
+        // a >0.5 yalm jump per tick, and heading stays constant, so only
+        // the 100 ms rate-limit gates emission.
+        let mut last_emit: Option<std::time::Duration> = None;
+        let mut now = std::time::Duration::ZERO;
+        let mut emits = 0;
+        for _ in 0..30 {
+            now += std::time::Duration::from_millis(33);
+            let elapsed = match last_emit {
+                None => std::time::Duration::from_secs(10),
+                Some(t) => now - t,
+            };
+            if should_emit_pos(elapsed, 0.165, false) {
+                emits += 1;
+                last_emit = Some(now);
+            }
+        }
+        // 1s / 100ms ≈ 10 expected. At 33 ms ticks, 100 ms gates align to
+        // ~every 3rd tick → ~8-10 emissions/s in practice. The key
+        // invariant is the drop from 30 → ~10, not the exact integer.
+        assert!(
+            (7..=11).contains(&emits),
+            "expected ~10 emissions/s (10 Hz cadence vs 30 Hz integrator), got {emits}",
+        );
+    }
+
+    #[test]
+    fn reconcile_self_pos_keep_local_under_2_yalms() {
+        // 1.5 yalms apart — within tolerance, trust local.
+        let local = v(0.0, 0.0, 0.0);
+        let server = v(1.0, 1.0, 0.5);
+        assert_eq!(
+            reconcile_self_pos(local, server),
+            SelfPosReconcile::KeepLocal,
+        );
+    }
+
+    #[test]
+    fn reconcile_self_pos_rubberband_between_2_and_10() {
+        // ~5 yalms apart — rubber-band, target = server pos.
+        let local = v(0.0, 0.0, 0.0);
+        let server = v(3.0, 4.0, 0.0); // distance 5
+        match reconcile_self_pos(local, server) {
+            SelfPosReconcile::Rubberband { target } => {
+                assert_eq!(target, server);
+            }
+            other => panic!("expected Rubberband, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_self_pos_snap_above_10_yalms() {
+        // ~13 yalms apart — snap (zone teleport).
+        let local = v(0.0, 0.0, 0.0);
+        let server = v(12.0, 5.0, 0.0); // distance 13
+        assert_eq!(
+            reconcile_self_pos(local, server),
+            SelfPosReconcile::Snap,
+        );
+    }
+
+    #[test]
+    fn reconcile_self_pos_boundaries() {
+        // Exactly 2.0 yalms → KeepLocal (inclusive lower bound).
+        let local = v(0.0, 0.0, 0.0);
+        let just_inside = v(2.0, 0.0, 0.0);
+        assert_eq!(
+            reconcile_self_pos(local, just_inside),
+            SelfPosReconcile::KeepLocal,
+        );
+        // Exactly 10.0 yalms → Rubberband (inclusive upper bound).
+        let edge = v(10.0, 0.0, 0.0);
+        assert!(matches!(
+            reconcile_self_pos(local, edge),
+            SelfPosReconcile::Rubberband { .. },
+        ));
+    }
+
+    #[test]
+    fn lerp_toward_advances_at_capped_step() {
+        // 5 yalm step toward a 10-yalm-distant target should land
+        // halfway, not at the target.
+        let (next, reached) = lerp_toward(v(0.0, 0.0, 0.0), v(10.0, 0.0, 0.0), 5.0);
+        assert!(!reached);
+        assert!((next.x - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn lerp_toward_clamps_to_target_on_overshoot() {
+        // Step bigger than distance → snap to target.
+        let (next, reached) = lerp_toward(v(0.0, 0.0, 0.0), v(2.0, 0.0, 0.0), 5.0);
+        assert!(reached);
+        assert_eq!(next, v(2.0, 0.0, 0.0));
+    }
 
     /// Pin the load-bearing wire layout for 0x05B EVENT_END. The CSID
     /// (`event_num` arg) must land in **both** EventNum (offset 16) and

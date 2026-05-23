@@ -55,19 +55,25 @@ use bevy::prelude::*;
 use bevy::window::WindowCloseRequested;
 use ffxi_viewer_core::{
     heading_for_yaw, toggle_camera_mode, yaw_for_heading, Action, Bindings, CameraMode,
-    ChaseCamera, ChatBuffer, CursorLockRequest, InputMode, LockOn, LockOnToggle, MenuStack,
-    OperatorCamera, PassiveCursorState, SceneState, Target,
+    ChaseCamera, ChatBuffer, CursorLockRequest, InputMode, IsSelf, LockOn, LockOnToggle,
+    MenuStack, OperatorCamera, PassiveCursorState, SceneState, Target, WorldEntity,
 };
 use ffxi_viewer_wire::{Entity as WireEntity, Vec3 as WireVec3};
 use tokio::sync::mpsc;
 
 use crate::state::{ActionKind, AgentCommand};
 
-/// 20 Hz rotation: heading delta per tick (~56 °/s — matches view3d).
-const ROTATE_STEP_HELD: u8 = 2;
-/// Camera yaw delta per tick when ←/→ held. Same angular rate as player
-/// rotation so the two feel comparable.
-const CAMERA_YAW_STEP: f32 = ROTATE_STEP_HELD as f32 * std::f32::consts::TAU / 256.0;
+/// Player A/D heading turn rate, **radians per second** of held key. Frame-
+/// rate-independent so the dispatch tick rate (currently 60 Hz; see
+/// `view_native::mod`) can change without retuning. 0.86 rad/s ≈ 49 °/s —
+/// matches the retail FFXI feel of a visible but unhurried pivot (full
+/// 180° in ~3.7 s) and keeps the older ROTATE_STEP_HELD=2-at-20-Hz target
+/// of ~56°/s within ±13%. Camera yaw turns lock-step at the same rate so
+/// the chase camera stays glued behind the player while turning in place.
+pub const HEADING_TURN_RATE: f32 = 0.86;
+/// Camera yaw delta per second when ←/→ held — same angular rate as
+/// player rotation so free-look and steered turns feel comparable.
+const CAMERA_YAW_RATE: f32 = HEADING_TURN_RATE;
 /// Camera pitch delta per tick when ↑/↓ held. ~17 °/s @ 20 Hz — slow on
 /// purpose so taps make small adjustments.
 const PITCH_STEP_HELD: f32 = 0.015;
@@ -81,6 +87,14 @@ const STRAFE_CANCEL_MS: u64 = 300;
 /// dispatch rate (currently 60 Hz; see `view_native::mod`) can change
 /// without retuning movement speed.
 const SPEED_TO_YPS: f32 = 0.2;
+
+/// Retail movement-speed caps applied per direction (post reactor speed
+/// scaling). Backing up is half-speed; pure strafe is three-quarters;
+/// forward (with or without strafe) is full speed but the diagonal
+/// forward+strafe vector is normalised so total magnitude stays ≤ 1×.
+/// See https://ffxiclopedia.fandom.com/wiki/Category:Keyboard_Layout.
+const BACKPEDAL_SCALE: f32 = 0.5;
+const STRAFE_SCALE: f32 = 0.75;
 
 /// Turn (A/D in 3rd person) — heading lerp rate toward direction of
 /// motion, radians per real-time second.
@@ -139,26 +153,47 @@ pub struct AutoRun {
     pub strafe_held_since: Option<Instant>,
 }
 
+/// Fractional carry for the time-based A/D heading turn. Heading is a
+/// u8 (256 units = 2π), but at 60 Hz dispatch the per-tick delta from a
+/// finite turn rate (≈0.58 u8/tick at 0.86 rad/s) rounds to zero —
+/// holding A/D would never accumulate enough to flip a unit. We keep a
+/// signed f32 accumulator across ticks and only emit whole-unit
+/// `wrapping_add` deltas when |accum| ≥ 1.0, draining the integer part
+/// each time. Reset to 0 when no turn key is held so a paused press
+/// doesn't replay leftover fraction.
+#[derive(Resource, Default)]
+pub struct HeadingTurnAccum {
+    pub units: f32,
+}
+
+/// Advance the A/D heading-turn accumulator by one tick. Returns
+/// `(integer_u8_delta_this_tick, float_u8_delta_this_tick)`.
+pub fn advance_heading_turn(
+    accum_units: &mut f32,
+    dir: i32,
+    dt_secs: f32,
+) -> (i32, f32) {
+    let turn_units_per_sec = HEADING_TURN_RATE * 256.0 / std::f32::consts::TAU;
+    let float_delta = dir as f32 * turn_units_per_sec * dt_secs;
+    if dir == 0 {
+        *accum_units = 0.0;
+        return (0, 0.0);
+    }
+    *accum_units += float_delta;
+    let whole = accum_units.trunc();
+    *accum_units -= whole;
+    (whole as i32, float_delta)
+}
+
 /// Last position `dispatch_movement_system` emitted via `AgentCommand::Move`.
 ///
 /// Why this exists: the system runs in `FixedUpdate` (60 Hz) but reads
 /// `self_pos` from `state.snapshot`, which is refreshed at most once per
-/// render frame (via `NativeSource::poll_snapshot` in `Update`). At /fps 30,
-/// Bevy runs FixedUpdate twice per frame; without local prediction, both
-/// runs would see the same stale `self_pos`, compute the same `pos + step`,
-/// and only the last write would land — effectively pinning movement to
-/// "one step per render frame" and halving walk speed at /fps 30.
-///
-/// We mirror the last emitted position here and use *it* as the basis for
-/// the next step. The snapshot still wins when it diverges by more than
-/// [`PREDICTION_RESYNC_YALMS`] (zone change, /warp, server snapback) so we
-/// don't ignore server authority.
+/// render frame. Without local prediction at /fps 30, both FixedUpdate
+/// runs would see the same stale `self_pos`, halving walk speed.
 #[derive(Resource, Default)]
 pub struct LocalPlayerPrediction {
-    /// Last-emitted position. Meaningless until `initialized` is true.
     pub pos: Vec3,
-    /// False until the first snapshot has seeded us — protects against
-    /// using a Vec3::ZERO basis before zone-in.
     pub initialized: bool,
 }
 
@@ -527,6 +562,7 @@ pub fn dispatch_movement_system(
     lock_on: Res<LockOn>,
     mut autorun: ResMut<AutoRun>,
     mut chase: ResMut<ChaseCamera>,
+    mut turn_accum: ResMut<HeadingTurnAccum>,
     mut prediction: ResMut<LocalPlayerPrediction>,
     navmesh: Res<super::navmesh_overlay::NavmeshState>,
     minimap_hover: Res<ffxi_viewer_core::minimap::input::MinimapHoverGate>,
@@ -572,11 +608,12 @@ pub fn dispatch_movement_system(
 
     // --- camera yaw: ←/→ orbit the camera (player unaffected). ---
     let mut yaw_d = 0.0;
+    let yaw_step = CAMERA_YAW_RATE * time.delta_secs();
     if !in_picker && bindings.pressed(Action::CameraYawLeft, &keys) {
-        yaw_d += CAMERA_YAW_STEP;
+        yaw_d += yaw_step;
     }
     if !in_picker && bindings.pressed(Action::CameraYawRight, &keys) {
-        yaw_d -= CAMERA_YAW_STEP;
+        yaw_d -= yaw_step;
     }
     if yaw_d != 0.0 {
         chase.yaw += yaw_d;
@@ -674,15 +711,31 @@ pub fn dispatch_movement_system(
         autorun.phantom_forward = false;
     }
 
-    // --- rotate player only (no walk contribution). Bound to Q/E in
-    //     Compact 1/2 (Numpad has no equivalent). ---
-    let mut player_rotate: i32 = 0;
+    // --- rotate player (and chase camera lock-step). Time-based so the
+    //     turn rate is framerate-independent: `HEADING_TURN_RATE` rad/s
+    //     mapped onto the 256-unit FFXI heading scale. Holding A/D or
+    //     Q/E sweeps the player heading at ~0.86 rad/s (~49°/s) — a
+    //     visible pivot, not a snap. The fractional carry
+    //     (`HeadingTurnAccum`) makes sub-unit per-tick deltas at 60 Hz
+    //     accumulate into u8 ticks instead of rounding to zero every
+    //     frame. Both `RotateLeft`/`Right` (Q/E) and `TurnLeft`/`Right`
+    //     (A/D classic) feed the same accumulator; the A/D-implicit
+    //     forward step is added separately below via `turn`. ---
+    let mut player_rotate_dir: i32 = 0;
     if bindings.pressed(Action::RotateLeft, &keys) {
-        player_rotate -= 1;
+        player_rotate_dir -= 1;
     }
     if bindings.pressed(Action::RotateRight, &keys) {
-        player_rotate += 1;
+        player_rotate_dir += 1;
     }
+    if bindings.pressed(Action::TurnLeft, &keys) {
+        player_rotate_dir -= 1;
+    }
+    if bindings.pressed(Action::TurnRight, &keys) {
+        player_rotate_dir += 1;
+    }
+    let (player_rotate_u8, heading_delta_units) =
+        advance_heading_turn(&mut turn_accum.units, player_rotate_dir, time.delta_secs());
 
     // --- strafe perpendicular to current heading. Unbound in every
     //     shipped preset after the A/D=turn / Q/E=rotate reshuffle —
@@ -698,14 +751,10 @@ pub fn dispatch_movement_system(
         strafe += 1;
     }
 
-    // --- combined turn (rotate + walk). FFXI classic 3rd-person A/D:
-    //     each tick rotates heading lock-step with camera yaw AND adds
-    //     an implicit forward step, so holding A alone traces a circle
-    //     (heading sweeps each tick, forward direction sweeps with it).
-    //     The forward implicit is suppressed in first-person (rotating
-    //     the head while walking is fine, but the orbit visual loses
-    //     its meaning) and when W/S is already explicitly held (the
-    //     operator's direction intent wins). ---
+    // --- A/D-implicit forward step (classic FFXI orbit-while-walking).
+    //     The heading rotation is already folded into `player_rotate_dir`
+    //     above; `turn` here only contributes to forward motion. Suppressed
+    //     when W/S already held or in first-person. ---
     let mut turn: i32 = 0;
     if bindings.pressed(Action::TurnLeft, &keys) {
         turn -= 1;
@@ -714,11 +763,12 @@ pub fn dispatch_movement_system(
         turn += 1;
     }
 
-    // Sustained pure-rotate (Q/E) or strafe hold cancels autorun. A
-    // brief tap won't. Turn (A/D) is INTENTIONALLY excluded: orbit-
-    // while-autorun is the use case that motivated this whole
-    // reshuffle, so holding A with autorun on must keep autorun.
-    let any_strafe_or_rotate = player_rotate != 0 || strafe != 0;
+    // Sustained pure-rotate (Q/E) or strafe hold cancels autorun. A/D
+    // turn is intentionally excluded — orbit-while-autorun must keep autorun.
+    let any_strafe_or_rotate =
+        bindings.pressed(Action::RotateLeft, &keys)
+            || bindings.pressed(Action::RotateRight, &keys)
+            || strafe != 0;
     if any_strafe_or_rotate {
         let now = Instant::now();
         let started = *autorun.strafe_held_since.get_or_insert(now);
@@ -805,12 +855,23 @@ pub fn dispatch_movement_system(
             })
     });
 
-    // Nothing to send? Bail UNLESS lock-on wants to rotate us OR turn
-    // is held in chase mode (the strafe handler below produces motion
-    // without setting `forward`/`strafe`, so we'd miss it). For the
-    // lock-on case, dispatch a heading-only Move (same position, new
-    // heading) so the server sees the operator's facing track the target.
-    if forward == 0 && strafe == 0 && player_rotate == 0 && !turn_in_chase {
+    // Update camera yaw smoothly every tick while a rotate-direction key is
+    // held (float domain — doesn't wait for the u8 heading-accumulator to
+    // tick). Keeps the chase camera visibly glued behind the player
+    // mid-pivot even on frames where the integer heading didn't advance.
+    if player_rotate_dir != 0 {
+        chase.yaw -= heading_delta_units * std::f32::consts::TAU / 256.0;
+    }
+
+    // Bail-out: nothing to send this tick. Fall through to the lock-on
+    // heading-only branch if locked, or to `turn_in_chase` if A/D turn is
+    // held in chase mode. Still emit when the u8 heading-accumulator
+    // advanced so the server hears pure-turn motion.
+    if forward == 0
+        && strafe == 0
+        && player_rotate_u8 == 0
+        && !turn_in_chase
+    {
         if let Some(h) = locked_heading {
             if h != self_pos.heading {
                 chase.yaw = ffxi_viewer_core::yaw_for_heading(h);
@@ -844,12 +905,12 @@ pub fn dispatch_movement_system(
     if forward != 0 {
         heading = heading_for_yaw(chase.yaw);
     }
-    if player_rotate != 0 {
-        let delta = (ROTATE_STEP_HELD as i32 * player_rotate).rem_euclid(256) as u8;
+    if player_rotate_u8 != 0 {
+        let delta = player_rotate_u8.rem_euclid(256) as u8;
         heading = heading.wrapping_add(delta);
-        // Lock-step camera rotation: yaw = -heading_angle, so a +Δh in
-        // heading u8 → -Δh·τ/256 in yaw radians.
-        chase.yaw -= player_rotate as f32 * ROTATE_STEP_HELD as f32 * std::f32::consts::TAU / 256.0;
+        // Note: camera yaw was already advanced smoothly above (float
+        // domain, every tick). No second yaw delta here, otherwise the
+        // camera would double-step on integer-tick frames and drift.
     }
 
     // Turn (3rd-person A/D) — strafe + heading-lerp + chase-lerp.
@@ -940,7 +1001,23 @@ pub fn dispatch_movement_system(
     // dt`. `speed=0` (entity hasn't been populated yet) → 0 step, which
     // silently skips movement instead of teleporting somewhere weird.
     // Speed_base is the unmodified value.
-    let step = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs();
+    let raw_step = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs();
+    // Retail direction caps (applied after reactor speed scaling):
+    //   * Backpedal (S only)            → 0.5×
+    //   * Pure strafe (A/D only, no W/S) → 0.75×
+    //   * Forward (W, with or without strafe) → 1.0×, but diagonal
+    //     forward+strafe is normalised by 1/√2 so the combined vector
+    //     magnitude doesn't exceed 1× forward speed.
+    let dir_scale = if forward > 0 && strafe != 0 {
+        std::f32::consts::FRAC_1_SQRT_2
+    } else if forward < 0 {
+        BACKPEDAL_SCALE
+    } else if forward == 0 && strafe != 0 {
+        STRAFE_SCALE
+    } else {
+        1.0
+    };
+    let step = raw_step * dir_scale;
     let mut x = basis_pos.x;
     let mut y = basis_pos.y;
     // Apply the turn handler's composite motion. Zero unless `turn_in_chase`
@@ -1173,6 +1250,159 @@ where
     }
 }
 
+/// State for the auto-recenter behavior: how long forward has been
+/// continuously held with no operator yaw input. After
+/// [`AUTO_RECENTER_HOLD_S`] the chase camera lerps toward "behind the
+/// player at current heading" at [`AUTO_RECENTER_RATE`] rad/s. Any
+/// `CameraYawLeft`/`Right` press cancels and resets the timer.
+#[derive(Resource, Default)]
+pub struct CameraAutoRecenter {
+    /// `Some(instant)` while MoveForward has been held continuously with
+    /// no yaw input since `instant`; `None` otherwise. Active recenter
+    /// begins once `now - instant >= AUTO_RECENTER_HOLD_S`.
+    pub forward_held_since: Option<Instant>,
+}
+
+/// Forward must be held this long with no yaw input before auto-recenter
+/// engages. Matches retail's "walk a beat before the camera trails" feel
+/// (long enough that brief forward taps don't twitch the camera).
+const AUTO_RECENTER_HOLD_S: f32 = 0.5;
+/// Angular rate of the auto-recenter lerp, radians/sec. ~0.6 rad/s ≈ 34°/s
+/// — fast enough to obviously settle while walking, slow enough to read
+/// as a smooth follow rather than a snap.
+const AUTO_RECENTER_RATE: f32 = 0.6;
+/// First-person look-at-lock pitch tracking rate, radians/sec. ~3 rad/s
+/// is fast: when locked onto a tall mob the camera tips up to meet its
+/// head within ~½ second from a level start.
+const FP_LOCK_PITCH_RATE: f32 = 3.0;
+/// Vertical offset (Bevy units) from a target entity's transform origin
+/// to its head. Most NPC/PC capsules are ~1.9 yalms tall with origin at
+/// the feet (see `scene::EntityMesh`); 1.5 lands roughly between the
+/// neck and the crown, which is what the operator instinctively
+/// "looks at" in 1st-person.
+const TARGET_HEAD_OFFSET_Y: f32 = 1.5;
+
+/// Camera-polish system: auto-recenter behind player when walking
+/// forward with no yaw input, and (in first-person + lock-on) track the
+/// locked target's head height by driving `chase.pitch`.
+///
+/// Runs in `Update`. Reads input + transforms; mutates `ChaseCamera`
+/// only (no command dispatch). The two behaviors are independent and
+/// composable — both can run in the same frame (e.g. running forward in
+/// 1p with a lock-on: pitch tracks the target, yaw is not recentered
+/// because lock-on is already pinning it via `dispatch_movement_system`).
+pub fn camera_polish_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    bindings: Res<Bindings>,
+    time: Res<Time>,
+    mode: Res<InputMode>,
+    camera_mode: Res<CameraMode>,
+    state: Res<SceneState>,
+    lock_on: Res<LockOn>,
+    mut chase: ResMut<ChaseCamera>,
+    mut recenter: ResMut<CameraAutoRecenter>,
+    self_q: Query<&Transform, (With<IsSelf>, Without<OperatorCamera>)>,
+    target_q: Query<(&WorldEntity, &Transform), Without<OperatorCamera>>,
+) {
+    // Disabled outside World — recentering while typing in chat or
+    // navigating a menu would be confusing (and movement is paused
+    // anyway in those modes).
+    if !matches!(*mode, InputMode::World) {
+        recenter.forward_held_since = None;
+        return;
+    }
+
+    // --- (a) Auto-recenter ---------------------------------------------
+    // Track the "forward held with no yaw input" window. The yaw-input
+    // test uses Action::CameraYawLeft/Right specifically (per the unit
+    // spec) — A/D rotates the player AND the camera lock-step, so it's
+    // intentionally NOT considered a "free-look yaw input" that should
+    // cancel recenter.
+    //
+    // Chase-mode only: in first-person, "behind the player at current
+    // heading" is not a meaningful concept (FP yaw drives the look
+    // direction directly).
+    let forward_held = bindings.pressed(Action::MoveForward, &keys);
+    let yaw_input = bindings.pressed(Action::CameraYawLeft, &keys)
+        || bindings.pressed(Action::CameraYawRight, &keys);
+
+    if yaw_input || !forward_held || !matches!(*camera_mode, CameraMode::Chase) {
+        recenter.forward_held_since = None;
+    } else {
+        let now = Instant::now();
+        let started = *recenter.forward_held_since.get_or_insert(now);
+        let elapsed = now.duration_since(started).as_secs_f32();
+        if elapsed >= AUTO_RECENTER_HOLD_S {
+            // Target yaw: camera directly behind the player at the
+            // player's current heading. `yaw_for_heading` is the
+            // already-used "camera-behind-player" mapping (see the
+            // one-shot sync in `chase_camera_system`).
+            let target_yaw = yaw_for_heading(state.snapshot.self_pos.heading);
+            // Shortest-arc delta wrapped into [-π, π] so we don't take
+            // the long way around when current yaw is already close to
+            // target on the "wrong" side of ±π.
+            let tau = std::f32::consts::TAU;
+            let mut diff = (target_yaw - chase.yaw).rem_euclid(tau);
+            if diff > std::f32::consts::PI {
+                diff -= tau;
+            }
+            let max_step = AUTO_RECENTER_RATE * time.delta_secs();
+            let step = diff.clamp(-max_step, max_step);
+            chase.yaw += step;
+        }
+    }
+
+    // --- (c) 1p auto-lock pitch tracking -------------------------------
+    // Only when in first-person AND lock-on is active AND the locked
+    // entity is in the scene. Drive `chase.pitch` toward the angle to
+    // the target's head. Do NOT touch yaw — the existing lock-on path
+    // in `dispatch_movement_system` already pins heading + chase.yaw
+    // each tick.
+    if !matches!(*camera_mode, CameraMode::FirstPerson) {
+        return;
+    }
+    let Some(target_id) = lock_on.target_id else {
+        return;
+    };
+    let Ok(self_t) = self_q.single() else {
+        return;
+    };
+    let mut target_pos: Option<Vec3> = None;
+    for (we, t) in target_q.iter() {
+        if we.id == target_id {
+            target_pos = Some(t.translation);
+            break;
+        }
+    }
+    let Some(target_pos) = target_pos else {
+        return;
+    };
+
+    // Eye and head positions. Eye matches `firstperson_camera_system`'s
+    // origin so the pitch we compute is the one that actually frames
+    // the head on screen.
+    let eye = self_t.translation + Vec3::Y * ChaseCamera::FP_EYE_HEIGHT;
+    let head = target_pos + Vec3::Y * TARGET_HEAD_OFFSET_Y;
+    let to_head = head - eye;
+    // Degenerate (target on top of player) — leave pitch alone.
+    let horiz = (to_head.x * to_head.x + to_head.z * to_head.z).sqrt();
+    if horiz < 1e-4 && to_head.y.abs() < 1e-4 {
+        return;
+    }
+    // FP's look_dir is `(-yaw.sin()*cos_p, sin_p, -yaw.cos()*cos_p)`, so
+    // the +Y component is `sin(pitch)`. The pitch that points at `head`
+    // therefore satisfies `sin(p) = to_head.y / |to_head|`, equivalent
+    // to `atan2(to_head.y, horiz)`.
+    let desired_pitch = to_head.y.atan2(horiz).clamp(
+        ChaseCamera::FP_PITCH_MIN,
+        ChaseCamera::FP_PITCH_MAX,
+    );
+    let max_step = FP_LOCK_PITCH_RATE * time.delta_secs();
+    let diff = desired_pitch - chase.pitch;
+    let step = diff.clamp(-max_step, max_step);
+    chase.pitch += step;
+}
+
 /// How far past the strict `[-1, 1]` NDC frustum an entity may sit and
 /// still appear in the Tab cycle. 1.3 ≈ 15% past each edge — enough to
 /// pick up the "mob just barely off-screen behind your shoulder" case
@@ -1230,15 +1460,97 @@ mod tests {
         }
     }
 
+    /// Holding A/D for one second at 60 Hz should accumulate close to
+    /// `HEADING_TURN_RATE * 256/τ` u8 units (~35 units = ~49°). This is
+    /// the "finite turn rate" contract: visible, framerate-independent
+    /// sweep at the documented rad/s.
+    #[test]
+    fn heading_turn_accumulates_to_finite_rate_over_one_second() {
+        let mut accum = 0.0_f32;
+        let dt = 1.0 / 60.0;
+        let mut total_u8: i32 = 0;
+        for _ in 0..60 {
+            let (whole, _f) = advance_heading_turn(&mut accum, 1, dt);
+            total_u8 += whole;
+        }
+        let expected = (HEADING_TURN_RATE * 256.0 / std::f32::consts::TAU).round() as i32;
+        // Should match expected within 1 u8 of accumulator slack.
+        assert!(
+            (total_u8 - expected).abs() <= 1,
+            "1s of held turn produced {total_u8} u8 (expected ~{expected})",
+        );
+        // Verify ≈ 49°/s — the finite, retail-feel rate.
+        let degrees = total_u8 as f32 * 360.0 / 256.0;
+        assert!(
+            (degrees - 49.0).abs() < 3.0,
+            "1s of held turn = {degrees:.1}°, expected ~49°",
+        );
+    }
+
+    /// At 60 Hz the per-tick float delta (≈0.58 u8/tick) is below 1.0 —
+    /// without an accumulator, every tick would round to zero and the
+    /// player would never turn. This regression-guards the fractional-
+    /// carry behavior.
+    #[test]
+    fn heading_turn_does_not_round_to_zero_per_tick() {
+        let mut accum = 0.0_f32;
+        let dt = 1.0 / 60.0;
+        // First tick: no whole unit yet (sub-1 delta).
+        let (whole_1, float_1) = advance_heading_turn(&mut accum, 1, dt);
+        assert_eq!(whole_1, 0, "first 60Hz tick must not yet flip a u8");
+        assert!(float_1 > 0.0 && float_1 < 1.0);
+        assert!(accum > 0.0, "fractional units must carry over");
+        // After enough ticks the carry must eventually flip.
+        let mut flipped = false;
+        for _ in 0..10 {
+            let (w, _) = advance_heading_turn(&mut accum, 1, dt);
+            if w != 0 {
+                flipped = true;
+                break;
+            }
+        }
+        assert!(flipped, "accumulator never produced a whole-unit step");
+    }
+
+    /// Releasing the turn key drops the fractional carry so a re-press
+    /// doesn't start with a phantom partial unit (which would feel like
+    /// a tiny snap on every tap).
+    #[test]
+    fn heading_turn_release_clears_fraction() {
+        let mut accum = 0.0_f32;
+        let dt = 1.0 / 60.0;
+        // Build up some fractional carry.
+        let _ = advance_heading_turn(&mut accum, 1, dt);
+        assert!(accum > 0.0);
+        // Release: accum must reset to exactly 0.
+        let (whole, fdelta) = advance_heading_turn(&mut accum, 0, dt);
+        assert_eq!(whole, 0);
+        assert_eq!(fdelta, 0.0);
+        assert_eq!(accum, 0.0);
+    }
+
+    /// Left and right turns are exact negatives of each other — holding
+    /// A then D for the same duration must net zero net heading change.
+    #[test]
+    fn heading_turn_is_symmetric() {
+        let dt = 1.0 / 60.0;
+        let mut accum_l = 0.0_f32;
+        let mut accum_r = 0.0_f32;
+        let mut total_l: i32 = 0;
+        let mut total_r: i32 = 0;
+        for _ in 0..30 {
+            total_l += advance_heading_turn(&mut accum_l, -1, dt).0;
+            total_r += advance_heading_turn(&mut accum_r, 1, dt).0;
+        }
+        assert_eq!(total_l, -total_r);
+    }
+
     /// Project that maps FFXI x → NDC at a *wider* scale: ndc.x = pos.x / 50.
-    /// Lets us place entities at NDC > 1.0 without using `None` to cull,
-    /// so we can exercise the relaxed-frustum cycle inclusion.
     fn wide_proj(p: Vec3) -> Option<Vec3> {
         Some(Vec3::new(p.x / 50.0, 0.0, 0.5))
     }
 
-    /// Project that also varies NDC.y. Lets us test "nearest to screen
-    /// center" picks based on combined NDC magnitude, not just horizontal.
+    /// Project that also varies NDC.y.
     fn xy_proj(p: Vec3) -> Option<Vec3> {
         Some(Vec3::new(p.x / 100.0, p.y / 100.0, 0.5))
     }
