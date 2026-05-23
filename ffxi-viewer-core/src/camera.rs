@@ -207,6 +207,19 @@ pub fn spawn_camera(mut commands: Commands, settings: Res<GraphicsSettings>) {
         settings.msaa(),
         Bloom {
             intensity: settings.bloom_intensity,
+            // Raise the prefilter threshold so only HDR highlights
+            // (sun glints, emissive targets, lit windows) bloom — not
+            // every textured pixel above zero. With the default
+            // threshold of 0.0 (`Bloom::NATURAL`'s default), diffuse
+            // zone and character textures wash whitish at close range
+            // as they fill more of the screen and bleed into adjacent
+            // dark pixels through the bloom passes. 1.0 is "only above
+            // LDR white"; softness gives a smooth rolloff so the
+            // transition isn't a hard knee.
+            prefilter: bevy::post_process::bloom::BloomPrefilter {
+                threshold: 1.0,
+                threshold_softness: 0.4,
+            },
             ..Bloom::NATURAL
         },
         // Distance fog disabled for now. The `ZoneAtmosphere` seam

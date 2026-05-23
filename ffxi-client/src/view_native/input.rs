@@ -790,16 +790,15 @@ pub fn dispatch_movement_system(
     // check (turn must not trigger cancel) and AFTER the autorun
     // phantom_forward expansion (so W+A doesn't double-count forward).
     //
-    // 3rd person: motion is computed below in a dedicated strafe+lerp
-    //   handler — player strafes camera-perpendicular (A=left, D=right)
-    //   while heading lerps toward direction-of-motion and chase.yaw
-    //   lerps toward "behind heading". The two lerps drive the orbit
-    //   dynamics; see HEADING_LERP_RATE_RAD_PER_SEC.
-    //
-    // 1st person: A/D already rotates heading via `player_rotate_dir`
-    //   (TurnLeft/Right are folded into the accumulator unconditionally
-    //   at the top of this fn), so no extra work is needed here.
-    let turn_in_chase = turn != 0 && matches!(*camera_mode, CameraMode::Chase);
+    // A/D (TurnLeft/Right) rotate heading via `player_rotate_dir` in
+    // both Chase and FirstPerson — folded into the accumulator at the
+    // top of this fn. The legacy "turn_in_chase" orbit-strafe path was
+    // removed because it overwrote the accumulator's heading with a
+    // lerp-toward-motion, defeating the rotate. The orbit/circle feel
+    // is now an emergent property of `Rotate + MoveForward` composing
+    // naturally (heading sweeps → forward direction sweeps), which
+    // matches retail FFXI.
+    let turn_in_chase = false;
 
     // Lock-on heading override — computed before the no-input bail-out
     // so the camera pivots to follow the target even when the player
