@@ -70,11 +70,34 @@ pub struct CharList {
 /// inadequate for accounts with millions-range ids) and the user-visible
 /// name. Empty slots arrive with status=0x01 and a space-prefixed name —
 /// `list_characters` filters those out before returning.
+///
+/// Appearance fields (`race` .. `ranged`) are sourced from the embedded
+/// `TC_OPERATION_MAKE` block (see `vendor/server/src/login/login_packets.h`).
+/// They power the launcher's 3D character preview — char-select can spawn
+/// each character's model without waiting for the map server.
 #[derive(Debug, Clone)]
 pub struct CharSlot {
     pub char_id: u32,
     pub name: String,
     pub status: u16,
+    /// FFXI race byte (1=Hume M, 2=Hume F, …, 8=Galka). Low byte of
+    /// `TC_OPERATION_MAKE::mon_no`; high byte is a separate enum we
+    /// don't currently consume.
+    pub race: u8,
+    /// `TC_OPERATION_MAKE::face_no` — face id, 0..=7 typically.
+    pub face: u8,
+    /// `GrapIDTbl[0..=7]` — the 8 equipment slots, in canonical
+    /// order. Each entry is a slot-tagged item-model id (e.g.,
+    /// `0x2065` = body slot, item-model 0x65). `0x*000` sentinels
+    /// mean the slot is empty.
+    pub head: u16,
+    pub body: u16,
+    pub hands: u16,
+    pub legs: u16,
+    pub feet: u16,
+    pub main: u16,
+    pub sub: u16,
+    pub ranged: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -378,11 +401,7 @@ impl LobbyClient {
     ///      size/face at fixed packet offsets (see login_helpers.cpp:216
     ///      and view_session.cpp:160). Reply is again 0x20 / closed
     ///      socket on failure.
-    pub async fn create_character(
-        &self,
-        auth: &AuthSession,
-        spec: &CharCreateSpec,
-    ) -> Result<()> {
+    pub async fn create_character(&self, auth: &AuthSession, spec: &CharCreateSpec) -> Result<()> {
         // The chr_info2 view push is triggered by the *data* port's 0xA1
         // handler, not by VIEW_CMD_REGISTER alone — see data_session.cpp
         // around line 281 where it writes into `viewSession->buffer_`.
@@ -609,9 +628,7 @@ async fn read_create_reply(stream: &mut TcpStream, stage: &str) -> Result<()> {
                 login_error_name(err)
             );
         }
-        _ => bail!(
-            "{stage}: unexpected reply size={size:#x} result={result:#x}"
-        ),
+        _ => bail!("{stage}: unexpected reply size={size:#x} result={result:#x}"),
     }
 }
 
@@ -653,7 +670,6 @@ async fn read_data_charlist(stream: &mut TcpStream) -> Result<CharList> {
     }
     Ok(CharList { characters: chars })
 }
-
 
 /// Parse the size-prefixed `lpkt_chr_info2` push that the server emits to
 /// the view socket immediately after handling a data-port 0xA1. Each slot
@@ -730,10 +746,80 @@ async fn parse_view_chr_info2(stream: &mut TcpStream) -> Result<Vec<CharSlot>> {
         let name_bytes = &rest[off + 12..off + 28];
         let nul = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
         let name = String::from_utf8_lossy(&name_bytes[..nul]).into_owned();
+
+        // TC_OPERATION_MAKE block: sub2 layout is
+        //   4 ffxi_id + 2 ffxi_id_world + 2 worldid + 2 status +
+        //   1 bitfield + 1 ffxi_id_world_tbl + 16 char_name +
+        //   16 world_name + 96 TC_OPERATION_MAKE
+        // → TC_OPERATION_MAKE starts at sub2 offset 44. Field
+        // layout via `vendor/server/src/login/login_packets.h:85`:
+        //   off+ 0..2  uint16 mon_no         (low byte = race)
+        //   off+ 2..4  uint8 mjob_no, sjob_no
+        //   off+ 4..6  uint16 face_no
+        //   off+ 6..12 town, gen_flag, hair, size, world_no
+        //   off+12..28 uint16 GrapIDTbl[8]
+        //
+        // GrapIDTbl ordering for chr_info2 is **shifted by one** vs
+        // the in-game `EntityLook::Equipped` block — LSB writes
+        // [0]=face, [1]=head, [2]=body, [3]=hands, [4]=legs,
+        // [5]=feet, [6]=main, [7]=sub (no ranged).
+        // See `vendor/server/src/login/data_session.cpp:191-197`.
+        //
+        // Values stored in chr_info2 are **raw database item-model
+        // ids** (12-bit), NOT the slot-tagged form CHAR_PC uses
+        // (high nibble = slot tag). `dat_vos2::spawn_equipped`
+        // calls `resolve_equipment_slot` which needs the slot tag,
+        // so we OR it in here per canonical slot order (head=1,
+        // body=2, … sub=7).
+        //
+        // Empty / dummy slots arrive with zero TC_OPERATION_MAKE
+        // — appearance fields then read as zero and the model
+        // won't render; the launcher should treat zero `race` as
+        // "no preview".
+        let tc = off + 44;
+        let mon_no = u16::from_le_bytes(rest[tc..tc + 2].try_into().unwrap());
+        let race = (mon_no & 0xFF) as u8;
+        let face_u16 = u16::from_le_bytes(rest[tc + 4..tc + 6].try_into().unwrap());
+        let face = (face_u16 & 0xFF) as u8;
+        let grap = |i: usize| -> u16 {
+            let o = tc + 12 + i * 2;
+            u16::from_le_bytes(rest[o..o + 2].try_into().unwrap())
+        };
+        // Slot-tag the raw item-model id with its canonical slot
+        // index (1=head, 2=body, ... 7=sub) so
+        // `resolve_equipment_slot` can route to the right tier
+        // formula. We mask the low 12 bits in case LSB ever
+        // started shipping pre-tagged ids — keeps the OR
+        // idempotent.
+        let tag = |slot_idx: u16, raw: u16| -> u16 { (slot_idx << 12) | (raw & 0x0FFF) };
+        // GrapIDTbl[0] is `face` (also redundantly stored in
+        // face_no above) — skip it; we want index 1 onward.
+        let head = tag(1, grap(1));
+        let body = tag(2, grap(2));
+        let hands = tag(3, grap(3));
+        let legs = tag(4, grap(4));
+        let feet = tag(5, grap(5));
+        let main = tag(6, grap(6));
+        let sub = tag(7, grap(7));
+        // chr_info2 doesn't carry ranged — leave it empty. Items
+        // with id 0 get sentinel-rejected by
+        // resolve_equipment_slot so this is safe.
+        let ranged = 0u16;
+
         slots.push(CharSlot {
             char_id,
             name,
             status,
+            race,
+            face,
+            head,
+            body,
+            hands,
+            legs,
+            feet,
+            main,
+            sub,
+            ranged,
         });
     }
     Ok(slots)

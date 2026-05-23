@@ -2,8 +2,15 @@
 //! doesn't tunnel through walls.
 //!
 //! Invariant: the camera is placed **at or closer than** the nearest
-//! ray-trace intersection between the look-at anchor and the wanted
-//! camera position. Wanted distance is tracked separately
+//! ray-trace intersection between the torso anchor (= look-at point,
+//! `feet + Y * third_person_anchor_y(baked)`, a race-aware fraction
+//! of the actor's full visual height) and the wanted camera position.
+//! Both the ray origin AND the final camera placement pivot around
+//! this anchor — mixing the two (e.g. ray from chest, camera placed
+//! from feet) lifted the whole camera in open air; using the foot
+//! position for both made stair risers behind the player clip the
+//! ray at ankle level, "shoving" the camera in on every step.
+//! Wanted distance is tracked separately
 //! ([`ChaseCamera::distance`], untouched by collision — that's what the
 //! mouse-wheel and `.`/`,` zoom controls). Effective distance is
 //! `min(wanted, hit_t - WALL_PAD)`, never floored above the hit.
@@ -28,7 +35,9 @@
 use bevy::prelude::*;
 
 use ffxi_viewer_core::components::IsSelf;
-use ffxi_viewer_core::{CameraMode, ChaseCamera, OperatorCamera};
+use ffxi_viewer_core::dat_mzb::{DrawDistance, ZoneGeomMode};
+use ffxi_viewer_core::scene::BakedActor;
+use ffxi_viewer_core::{third_person_anchor_y, CameraMode, ChaseCamera, OperatorCamera};
 
 use super::collision_bvh::CollisionBvh;
 
@@ -70,7 +79,7 @@ pub fn clamp_chase_camera_to_collision(
     mode: Res<CameraMode>,
     chase: Res<ChaseCamera>,
     time: Res<Time>,
-    self_q: Query<&Transform, (With<IsSelf>, Without<OperatorCamera>)>,
+    self_q: Query<(&Transform, Option<&BakedActor>), (With<IsSelf>, Without<OperatorCamera>)>,
     mut cam_q: Query<&mut Transform, (With<OperatorCamera>, Without<IsSelf>)>,
     bvh_q: Query<&CollisionBvh>,
     // TEMP probe: count entities that are CameraOccluder-marked but
@@ -113,7 +122,7 @@ pub fn clamp_chase_camera_to_collision(
         *last_summary = Some(summary);
         for (i, bvh) in bvh_q.iter().enumerate() {
             let (mn, mx) = bvh.root_aabb().unwrap_or((Vec3::ZERO, Vec3::ZERO));
-            tracing::info!(
+            tracing::debug!(
                 bvh_index = i,
                 tri_count = bvh.tri_count(),
                 aabb_min = ?(mn.x, mn.y, mn.z),
@@ -121,7 +130,7 @@ pub fn clamp_chase_camera_to_collision(
                 "camera_collision probe: BVH summary"
             );
         }
-        tracing::info!(
+        tracing::debug!(
             bvhs = bvh_count,
             pending_meshes = pending_count,
             "camera_collision probe: coverage summary"
@@ -134,7 +143,7 @@ pub fn clamp_chase_camera_to_collision(
         *smoothed_effective = None;
         return;
     }
-    let Ok(self_t) = self_q.single() else {
+    let Ok((self_t, baked)) = self_q.single() else {
         return;
     };
     let Ok(mut cam_t) = cam_q.single_mut() else {
@@ -143,24 +152,30 @@ pub fn clamp_chase_camera_to_collision(
 
     // Ray-cast geometry, matching `chase_camera_system` exactly:
     //
-    //   - Ray origin    = player root (self_t.translation). The user's
-    //                     goal phrases it as "from the player to where
-    //                     the camera would otherwise be."
+    //   - Ray origin    = torso anchor (`third_person_anchor_y(baked)`,
+    //                     a fraction of the actor's full visual height).
+    //                     This is the same point the camera frames via
+    //                     `look_at`, so the ray represents the actual
+    //                     line of sight from the framing point to the
+    //                     camera. Anchoring at feet (an earlier rev)
+    //                     made stair risers BEHIND the player clip the
+    //                     ray at ankle level even when the camera
+    //                     visually sat above them — the asymmetric
+    //                     INWARD_LERP then snapped the camera in each
+    //                     frame, producing the "shove in on stairs"
+    //                     symptom.
     //   - Ray direction = spherical (yaw, pitch) unit vector, same as
     //                     chase_camera_system's `yaw_dir * cos_p + Y *
     //                     sin_p`.
-    //   - Wanted endpoint = self_t + dir * chase.distance — the exact
+    //   - Wanted endpoint = anchor + dir * chase.distance — the exact
     //                       point chase_camera_system would have placed
     //                       the camera if nothing were in the way.
     //
-    // The look-at *target* lives at `self_t + Y * height_target`
-    // (separate from ray geometry — that's just where the camera
-    // frames, not where the camera sits). Using that as the ray
-    // origin (which an earlier rev did) lifted the whole camera by
-    // `height_target` even in open air, which read as "collision
-    // isn't kicking in" when really the camera was placed wrong.
-    let player = self_t.translation;
-    let look_at = self_t.translation + Vec3::Y * chase.height_target;
+    // An even-earlier rev mixed the two (ray from chest, camera placed
+    // from feet); that lifted the whole camera by the anchor in open
+    // air. The fix is to make BOTH the ray AND the camera placement use
+    // the same anchor — consistent geometry, no offset mismatch.
+    let anchor = self_t.translation + Vec3::Y * third_person_anchor_y(baked);
 
     let cos_p = chase.pitch.cos();
     let sin_p = chase.pitch.sin();
@@ -174,7 +189,7 @@ pub fn clamp_chase_camera_to_collision(
     let mut hit_t = wanted;
     let mut hit_any = false;
     for bvh in bvh_q.iter() {
-        if let Some(t) = bvh.ray_cast(player, dir, hit_t) {
+        if let Some(t) = bvh.ray_cast(anchor, dir, hit_t) {
             if t < hit_t {
                 hit_t = t;
                 hit_any = true;
@@ -199,7 +214,7 @@ pub fn clamp_chase_camera_to_collision(
         let mut total_tris: usize = 0;
         for bvh in bvh_q.iter() {
             total_tris += bvh.tri_count();
-            if let Some(t) = bvh.ray_cast_brute_force(player, dir, brute_hit_t) {
+            if let Some(t) = bvh.ray_cast_brute_force(anchor, dir, brute_hit_t) {
                 if t < brute_hit_t {
                     brute_hit_t = t;
                     brute_hit_any = true;
@@ -207,7 +222,7 @@ pub fn clamp_chase_camera_to_collision(
             }
         }
         tracing::debug!(
-            player = ?(player.x, player.y, player.z),
+            anchor = ?(anchor.x, anchor.y, anchor.z),
             dir = ?(dir.x, dir.y, dir.z),
             wanted,
             bvh_hit = hit_any,
@@ -251,6 +266,102 @@ pub fn clamp_chase_camera_to_collision(
     };
     *smoothed_effective = Some(effective);
 
-    cam_t.translation = player + dir * effective;
-    cam_t.look_at(look_at, Vec3::Y);
+    cam_t.translation = anchor + dir * effective;
+    cam_t.look_at(anchor, Vec3::Y);
+}
+
+/// Debug-overlay gizmos for `/zonegeom camera`. Runs every frame but
+/// is a no-op unless `DrawDistance.zone_geom_mode == ZoneGeomMode::Camera`,
+/// so it costs essentially nothing when not active.
+///
+/// What it draws:
+/// - Each [`CollisionBvh`]'s root AABB as a green wirebox — the bounds
+///   the camera raycast actually tests against. Useful for spotting
+///   coverage gaps ("this room's ceiling has no AABB, that's why the
+///   camera tunnels through it").
+/// - The active player→camera ray and clamp state — TODO below.
+///
+/// Lifecycle (per `bevy-lifecycle-symmetry`): gizmos are ephemeral —
+/// drawn into a per-frame retained buffer that Bevy clears each frame.
+/// **No despawn pair is required** for this system. If a future change
+/// adds a cached `Resource` here (e.g. memoized triangle list), it
+/// MUST get a paired drain on `OnExit(AppPhase::InGame)`.
+pub fn draw_camera_collision_debug(
+    draw: Res<DrawDistance>,
+    mode: Res<CameraMode>,
+    chase: Res<ChaseCamera>,
+    self_q: Query<(&Transform, Option<&BakedActor>), (With<IsSelf>, Without<OperatorCamera>)>,
+    cam_q: Query<&Transform, (With<OperatorCamera>, Without<IsSelf>)>,
+    bvh_q: Query<&CollisionBvh>,
+    mut gizmos: Gizmos,
+) {
+    if draw.zone_geom_mode != ZoneGeomMode::Camera {
+        return;
+    }
+
+    // BVH coverage — one wirebox per loaded CollisionBvh. **Cyan** so it
+    // doesn't blur into the navmesh overlay (bright green); slightly
+    // translucent (alpha 0.55) so the actual zone geometry behind it
+    // stays legible. Picked deliberately away from the green/yellow/red
+    // ramp the ray-state segments use below.
+    let aabb_color = Color::srgba(0.20, 0.80, 1.0, 0.55);
+    for bvh in bvh_q.iter() {
+        let Some((mn, mx)) = bvh.root_aabb() else {
+            continue;
+        };
+        let center = (mn + mx) * 0.5;
+        let extents = mx - mn;
+        gizmos.cuboid(
+            Transform::from_translation(center).with_scale(extents),
+            aabb_color,
+        );
+    }
+
+    let Ok((self_t, baked)) = self_q.single() else {
+        return;
+    };
+    let anchor = self_t.translation + Vec3::Y * third_person_anchor_y(baked);
+
+    // Anchor crosshair — small ±0.3 yalm axis cross at the chest anchor.
+    // White, mostly opaque (0.90) so it pops against any background and
+    // makes the chest-anchor height visually obvious (e.g. above stair
+    // risers, not at ankle level).
+    let cross = 0.3;
+    let cross_color = Color::srgba(1.0, 1.0, 1.0, 0.90);
+    gizmos.line(anchor - Vec3::X * cross, anchor + Vec3::X * cross, cross_color);
+    gizmos.line(anchor - Vec3::Y * cross, anchor + Vec3::Y * cross, cross_color);
+    gizmos.line(anchor - Vec3::Z * cross, anchor + Vec3::Z * cross, cross_color);
+
+    // Ray viz is only meaningful in Chase mode (FP doesn't ray-cast). In
+    // FP we already drew the anchor crosshair above; that's enough.
+    if !matches!(*mode, CameraMode::Chase) {
+        return;
+    }
+
+    let cos_p = chase.pitch.cos();
+    let sin_p = chase.pitch.sin();
+    let dir = Vec3::new(chase.yaw.sin() * cos_p, sin_p, chase.yaw.cos() * cos_p);
+    let wanted_end = anchor + dir * chase.distance;
+
+    // The operator camera's actual world position IS the post-clamp
+    // effective endpoint — no need to re-run the BVH cast or expose a
+    // Resource. `effective_end == anchor` is possible mid-NaN-guard but
+    // gizmo lines handle zero-length segments fine.
+    let effective_end = cam_q.single().map(|t| t.translation).unwrap_or(wanted_end);
+
+    // **Yellow** segment: anchor → actual camera position. The path the
+    // camera ACTUALLY occupies. Yellow (not green) so it doesn't conflict
+    // with the navmesh overlay; slightly translucent so it doesn't
+    // overpower the cyan AABBs.
+    gizmos.line(anchor, effective_end, Color::srgba(1.0, 0.85, 0.15, 0.85));
+
+    // **Magenta-red** segment: actual camera → wanted endpoint. The
+    // "missing" distance the collision clamp pulled in. Shifted toward
+    // magenta so it stays distinct from the warm yellow of the effective
+    // segment (red-vs-yellow can blur at gizmo line widths). Skipped when
+    // the gap is sub-perceptible (< 0.05 yalm) to reduce flicker.
+    let clip_amount = (wanted_end - effective_end).length();
+    if clip_amount > 0.05 {
+        gizmos.line(effective_end, wanted_end, Color::srgba(1.0, 0.25, 0.55, 0.85));
+    }
 }

@@ -23,8 +23,8 @@
 //! Returning a typed outcome keeps the parser side-effect-free and lets
 //! the caller compose the right side effects in one place.
 
-use ffxi_viewer_core::Preset;
-use ffxi_viewer_wire::{ChatChannel, ChatLine, Entity as WireEntity, Vec3 as WireVec3};
+use ffxi_viewer_core::{MenuKind, Preset};
+use ffxi_viewer_wire::{Entity as WireEntity, Vec3 as WireVec3};
 
 use crate::state::{ActionKind, AgentCommand, CheckKind, HealMode, ReqLogoutKind};
 
@@ -50,6 +50,14 @@ struct HelpEntry {
 /// versa) trips a test failure.
 const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
     (
+        "Help",
+        &[HelpEntry {
+            aliases: &["help", "?"],
+            usage: "",
+            summary: "show this slash-command reference",
+        }],
+    ),
+    (
         "Movement & Navigation",
         &[
             HelpEntry {
@@ -59,8 +67,14 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
             },
             HelpEntry {
                 aliases: &["pathto"],
-                usage: "<x> <y> <z>",
-                summary: "pathfind to world coordinates",
+                usage: "<x> <y> [z] | <name> | target",
+                summary: "pathfind: coords (z optional), fuzzy zone-line/entity, or current target",
+            },
+            HelpEntry {
+                aliases: &["warp"],
+                usage: "<x> <y> [z] | <name> | target",
+                summary:
+                    "debug teleport (Move): coords (z optional), fuzzy zone-line/entity, or target",
             },
             HelpEntry {
                 aliases: &["zones"],
@@ -70,7 +84,7 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
             HelpEntry {
                 aliases: &["zoneto"],
                 usage: "<name|id>",
-                summary: "pathfind to a zone-line by destination",
+                summary: "pathfind to a zone-line (alias of `/pathto <name>`)",
             },
             HelpEntry {
                 aliases: &["navmesh"],
@@ -151,6 +165,26 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 aliases: &["useitem", "use"],
                 usage: "<name> [target]",
                 summary: "use an item",
+            },
+            HelpEntry {
+                aliases: &["magic"],
+                usage: "",
+                summary: "open the Magic menu (no-arg form; with args use /ma)",
+            },
+            HelpEntry {
+                aliases: &["abilities", "abi"],
+                usage: "",
+                summary: "open the Abilities menu (no-arg form; with args use /ja)",
+            },
+            HelpEntry {
+                aliases: &["items"],
+                usage: "",
+                summary: "open the Items menu (no-arg form; with args use /useitem)",
+            },
+            HelpEntry {
+                aliases: &["equipment", "equip"],
+                usage: "[slot item]",
+                summary: "no-arg form opens Equipment menu; <slot> <item> equips directly (Stage 4)",
             },
             HelpEntry {
                 aliases: &["cancel"],
@@ -238,6 +272,11 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 summary: "end a forced cutscene (new-char intro, etc.)",
             },
             HelpEntry {
+                aliases: &["release", "unwedge"],
+                usage: "",
+                summary: "server-side !release: forcibly end any pinned event (gmlevel>=1)",
+            },
+            HelpEntry {
                 aliases: &["buy"],
                 usage: "<row> [qty]",
                 summary: "buy from open shop by row index",
@@ -246,6 +285,16 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 aliases: &["bank"],
                 usage: "<subcommand>",
                 summary: "gil-bank operations",
+            },
+            HelpEntry {
+                aliases: &["minimap", "mm"],
+                usage: "[show|hide|toggle|mode <top|retail|auto>|cull <N>|zoom ...]",
+                summary: "drive the minimap HUD (visibility, backend, cull, zoom)",
+            },
+            HelpEntry {
+                aliases: &["sound", "audio", "mute"],
+                usage: "[on|off|toggle|status] [bgm|sfx]",
+                summary: "bare /sound toggles all audio; survives logout",
             },
         ],
     ),
@@ -323,6 +372,17 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 summary: "set target frame rate",
             },
             HelpEntry {
+                aliases: &["capture"],
+                usage: "[on|off|toggle]",
+                summary:
+                    "screen-capture-friendly mode (disables framepace; avoids QuickTime lockup)",
+            },
+            HelpEntry {
+                aliases: &["screenshot", "ss"],
+                usage: "[path.png]",
+                summary: "capture primary window to PNG (default: screenshot-N.png in CWD)",
+            },
+            HelpEntry {
                 aliases: &["drawdistance", "dd"],
                 usage: "[setworld|setmob] [N]",
                 summary: "set draw distance",
@@ -331,6 +391,31 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 aliases: &["copy"],
                 usage: "[n]",
                 summary: "copy the last n system-toast lines to the clipboard (default 1)",
+            },
+            HelpEntry {
+                aliases: &["bgm"],
+                usage: "<track_id>",
+                summary: "audition a BGM track id (synthetic 0x05F slot 0)",
+            },
+            HelpEntry {
+                aliases: &["sfx"],
+                usage: "<se_id>",
+                summary: "fire a one-shot SE by numeric id",
+            },
+            HelpEntry {
+                aliases: &["look"],
+                usage: "[name|act_index]",
+                summary: "print decoded LookData (race/gear) for an entity",
+            },
+            HelpEntry {
+                aliases: &["zonegeom"],
+                usage: "[off|collision|all|toggle]",
+                summary: "MZB overlay visibility (collision-only vs decorative)",
+            },
+            HelpEntry {
+                aliases: &["devhud"],
+                usage: "[on|off|toggle]",
+                summary: "developer telemetry overlays (stage bar, agent goal, etc.)",
             },
         ],
     ),
@@ -401,6 +486,16 @@ pub enum SlashOutcome {
     /// state without taking on more context). The dispatcher fills in
     /// `shop_no` from the snapshot's `offset_index`.
     ShopBuyRow { shop_index: u8, qty: u32 },
+    /// `/bgm <track_id>` — manually trigger BGM playback (useful for
+    /// testing without a server-pushed 0x05F). Slot defaults to
+    /// `ZoneDay` (0), which the priority ladder will play unless
+    /// the user has already engaged combat.
+    PlayBgm { track_id: u16 },
+    /// `/sfx <se_id>` — fire a one-shot sound effect by numeric id.
+    /// IDs come from the `dat-scan-sounds` example or the LSB
+    /// SE-table research; values must resolve to a `.spw` under
+    /// `sound{,2..15}/win/se/seNNN/seNNNNNN.spw`.
+    PlaySfx { se_id: u32 },
     /// `/navmesh [on|off]` — flip the debug navmesh overlay. `None`
     /// means toggle (no arg given); `Some(b)` is an explicit set.
     /// Mirrors the `SetTarget(Option<u32>)` shape — a client-side
@@ -411,6 +506,17 @@ pub enum SlashOutcome {
     /// defaults. The dispatcher applies the change to the `Bindings`
     /// resource and persists via `keybinds_store`.
     ApplyKeybinds(KeybindUpdate),
+    /// `/magic`, `/abilities`, `/items`, `/equipment` (no-arg forms) —
+    /// open the corresponding retail-style action submenu. Mutates
+    /// `InputMode` to `Menu(stack)` with `kind` pushed; the dispatcher
+    /// in `apply_chat_action` overrides the default post-submit
+    /// "back to World" with this menu push.
+    ///
+    /// The action-dispatch slash commands `/ma`, `/ja`, `/useitem`,
+    /// `/equip <slot> <item>` (with args) are NOT this variant — they
+    /// stay on the existing `Command(AgentCommand::Action { ... })`
+    /// path so the agent / MCP twin behavior is unchanged.
+    OpenMenu(MenuKind),
     /// `/navinfo` — diagnostic: report whether the current self_pos
     /// snaps cleanly to a walkable navmesh polygon, and how far away
     /// the nearest zone-line origin is. Dispatcher resolves this by
@@ -458,6 +564,22 @@ pub enum SlashOutcome {
     /// operators can hide the visually-noisy non-collision (decorative)
     /// meshes while keeping the LoS-blocking collision mesh visible.
     SetZoneGeom(Option<ffxi_viewer_core::dat_mzb::ZoneGeomMode>),
+    /// `/devhud on|off|toggle` — show/hide the dev-only HUD widgets
+    /// (stage bar, agent goal panel, MMB hover info, LLM badge,
+    /// bf/sync/last/map/fps strip, [dbg] chat pane). Default off so the
+    /// idle UI matches vanilla FFXI / Ashita / Windower-addon style;
+    /// `on` reveals the operator telemetry for debugging.
+    /// `None` means toggle.
+    SetDevHud(Option<bool>),
+    /// `/minimap [show|hide|toggle|mode <top|retail|auto>|cull <N>]`
+    /// — drive the minimap HUD's visibility, image-source backend,
+    /// and ceiling-cull height. See [`MinimapOp`].
+    SetMinimap(MinimapOp),
+    /// `/sound [on|off|toggle] [bgm|sfx]` — set or toggle audio
+    /// mute. With no category, applies to both BGM and SFX. With a
+    /// category, applies only to that side. Naked `/sound` reports
+    /// status. See [`SoundOp`] for the full parsed shape.
+    SetSound(SoundOp),
     /// `/fps <max>` — cap the render-loop framerate via `bevy_framepace`.
     /// `Some(n)` sets a target FPS (clamped >0); `None` (`/fps 0` or
     /// `/fps off`) disables the limiter. Pure client-side knob — no
@@ -465,12 +587,27 @@ pub enum SlashOutcome {
     /// `bevy_framepace::FramepaceSettings` directly rather than
     /// routing through `cmd_tx`.
     SetTargetFps(Option<u32>),
+    /// `/capture on|off|toggle` — opt into a screen-capture-friendly
+    /// presentation profile. On macOS, QuickTime's legacy capture
+    /// pipeline (and to a lesser extent other recorders) can deadlock a
+    /// Bevy/wgpu Metal surface when the app's render loop is parked by
+    /// `bevy_framepace` while the window server holds the surface for
+    /// capture. Capture-on disables the framepace limiter and pins the
+    /// primary window to `PresentMode::Fifo`; capture-off restores the
+    /// prior limiter. `None` means toggle.
+    SetCaptureMode(Option<bool>),
     /// `/debug heights` — diagnostic. Dumps player Bevy y, navmesh
     /// height, MZB-collision-mesh height (downward raycast), and the
     /// server-snapshot self pos. Dispatcher writes a `DebugHeightsRequest`
     /// event; the consumer system reads the navmesh + collision mesh
     /// resources and pushes a multi-line system toast.
     DebugHeights,
+    /// `/screenshot [path]` — capture the primary window to a PNG.
+    /// `None` selects an auto-numbered default (`screenshot-N.png` in
+    /// CWD). Dispatcher writes a `ScreenshotRequest`; consumer system
+    /// spawns Bevy's `Screenshot::primary_window()` with a `save_to_disk`
+    /// observer.
+    Screenshot { path: Option<String> },
     /// `/endcutscene [csid]` — send a 0x05B `EVENT_END` for a *forced*
     /// cutscene (the kind `player:startEvent` fires from `onZoneIn` —
     /// new-character openings, area-entry cinematics) that bypassed the
@@ -480,12 +617,13 @@ pub enum SlashOutcome {
     /// `player:startEvent` builds the EVENTSTART with those as the
     /// initiator.
     ///
-    /// `event_num` is the cutscene id (CSID). Without an explicit arg
-    /// the parser looks it up from `zone_id` via [`START_ZONE_CUTSCENE`];
-    /// callers in zones not in the table must pass an explicit id.
-    EndCutscene {
-        event_num: u16,
-    },
+    /// `event_num` is the cutscene id (CSID). `Some(n)` is an
+    /// operator-supplied explicit CSID; `None` tells the dispatcher to
+    /// resolve from session state (preferring the live `DialogState`,
+    /// falling back to [`start_zone_cutscene`] for the start-nation
+    /// forced cinematics). Punting CSID resolution to the dispatcher
+    /// means the parser doesn't need access to `SceneState`.
+    EndCutscene { event_num: Option<u16> },
     /// `/copy [n]` — copy the last `n` `[system]` chat toasts (i.e.
     /// responses to slash commands) to the OS clipboard, newline-joined.
     /// `n` defaults to 1 so a bare `/copy` grabs just the most recent
@@ -535,6 +673,66 @@ pub enum DrawDistanceOp {
     SetMob(f32),
 }
 
+/// `/minimap` subcommand variants. Drives the minimap HUD —
+/// visibility, background-image backend, and the top-down ceiling-cull
+/// height. See `ffxi_viewer_core::minimap` for what each field maps to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MinimapOp {
+    /// `/minimap` (no arg) — print current mode + visibility + cull.
+    Status,
+    /// `/minimap show` — force visible.
+    Show,
+    /// `/minimap hide` — force hidden.
+    Hide,
+    /// `/minimap toggle` — flip visibility.
+    Toggle,
+    /// `/minimap mode top` — pin the TopDown bake as the background.
+    ModeTopDown,
+    /// `/minimap mode retail` — pin the retail stylized image (no-op
+    /// until the parser lands; the dispatcher emits a system message
+    /// when no retail image is loaded for the current zone).
+    ModeRetail,
+    /// `/minimap mode auto` — let the resolved-mode picker choose
+    /// (retail when available, else top-down).
+    ModeAuto,
+    /// `/minimap cull <N>` — set TopdownCullPolicy.top_cull_yalms.
+    /// Triggers an immediate re-bake.
+    SetCull(f32),
+    /// `/minimap zoom in` — discrete zoom-in tick (same as `.` over
+    /// minimap).
+    ZoomIn,
+    /// `/minimap zoom out` — discrete zoom-out tick.
+    ZoomOut,
+    /// `/minimap zoom fit` — show the whole zone (max zoom-out).
+    ZoomFit,
+    /// `/minimap zoom <N>` — set radius to N yalms (clamped to the
+    /// allowed range).
+    ZoomSet(f32),
+    /// `/minimap zoom reset` — back to defaults (50 yalm radius,
+    /// pan cleared).
+    ZoomReset,
+}
+
+/// `/sound` subcommand variants. Operator-facing toggle for the
+/// audio mute state — both BGM and SFX, or one independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundOp {
+    /// `/sound status` (or `/sound ?`) — report current mute state
+    /// for both categories. No mutation. Bare `/sound` is the toggle
+    /// shortcut and dispatches `SetBoth(None)`, not this variant.
+    Status,
+    /// `/sound on` / `/sound off` / `/sound toggle` — apply to both
+    /// BGM and SFX. The boolean is the target value (`true` =
+    /// muted, `false` = audible); `None` means flip whatever the
+    /// current state is.
+    SetBoth(Option<bool>),
+    /// `/sound bgm [on|off|toggle]` — apply only to BGM. Same
+    /// `Option<bool>` semantics as [`SetBoth`].
+    SetBgm(Option<bool>),
+    /// `/sound sfx [on|off|toggle]` — apply only to SFX.
+    SetSfx(Option<bool>),
+}
+
 /// `/agent` subcommand variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentControlOp {
@@ -578,6 +776,8 @@ pub fn parse_slash(
     self_pos: WireVec3,
     current_target: Option<u32>,
     zone_id: Option<u16>,
+    self_char_id: Option<u32>,
+    party: &[ffxi_viewer_wire::PartyMember],
 ) -> SlashOutcome {
     let trimmed = buffer.trim_start();
     let body = trimmed.strip_prefix('/').unwrap_or(trimmed);
@@ -641,6 +841,80 @@ pub fn parse_slash(
                 }
             }
         }
+        // Retail `/targetnpc`: cycle the nearest non-PC by 3D distance.
+        // Pet entities included (trusts/jugs/avatars are addressable as
+        // "NPCs" in the retail sense). `/targetnpc2` is the reverse-
+        // direction variant — same pool, walked backward.
+        "targetnpc" | "targetnpc2" => {
+            let reverse = cmd == "targetnpc2";
+            let kinds = [
+                ffxi_viewer_wire::EntityKind::Npc,
+                ffxi_viewer_wire::EntityKind::Mob,
+                ffxi_viewer_wire::EntityKind::Pet,
+            ];
+            match cycle_kind_filtered(entities, self_pos, current_target, &kinds, reverse) {
+                Some(id) => SlashOutcome::SetTarget(Some(id)),
+                None => SlashOutcome::SystemMessage(format!("/{cmd}: no NPC nearby")),
+            }
+        }
+        // Retail `/targetenemy`: mobs only. Skips friendly NPCs even if
+        // closer, so the operator can punch through a vendor crowd to
+        // grab the aggro target.
+        "targetenemy" => {
+            let kinds = [ffxi_viewer_wire::EntityKind::Mob];
+            match cycle_kind_filtered(entities, self_pos, current_target, &kinds, false) {
+                Some(id) => SlashOutcome::SetTarget(Some(id)),
+                None => SlashOutcome::SystemMessage("/targetenemy: no enemy nearby".into()),
+            }
+        }
+        // Retail `/targetnpcparty`: trusts/fellows the player owns.
+        // Best-effort filter — claim_id == self_char_id picks up pets
+        // and trusts the server attributes to the player. If LSB uses
+        // a different signal for fellow NPCs, this gets refined later.
+        "targetnpcparty" => {
+            let owner = self_char_id.unwrap_or(0);
+            let owned: Vec<&WireEntity> = entities
+                .iter()
+                .filter(|e| {
+                    matches!(e.kind, ffxi_viewer_wire::EntityKind::Pet) && e.claim_id == owner
+                })
+                .collect();
+            // Reuse the same nearest+cycle pattern, but on a pre-filtered list.
+            let ids: Vec<u32> = {
+                let mut sorted = owned.clone();
+                sorted.sort_by(|a, b| {
+                    let da = sq_dist(a.pos, self_pos);
+                    let db = sq_dist(b.pos, self_pos);
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                sorted.into_iter().map(|e| e.id).collect()
+            };
+            if ids.is_empty() {
+                SlashOutcome::SystemMessage("/targetnpcparty: no party NPCs".into())
+            } else {
+                let next = match current_target.and_then(|id| ids.iter().position(|x| *x == id)) {
+                    Some(i) => ids[(i + 1) % ids.len()],
+                    None => ids[0],
+                };
+                SlashOutcome::SetTarget(Some(next))
+            }
+        }
+        // Retail `/targetparty1..6`: slot 1 = self, slots 2..6 = party
+        // members in insertion order (the best the wire gives us — the
+        // server's actual slot index isn't broadcast separately, so a
+        // freshly-joined member may "shift" pre-existing ones until the
+        // next party refresh).
+        "targetparty1" | "targetparty2" | "targetparty3" | "targetparty4" | "targetparty5"
+        | "targetparty6" => {
+            let slot = cmd
+                .strip_prefix("targetparty")
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(0);
+            match resolve_party_slot(slot, self_char_id, party) {
+                Some(id) => SlashOutcome::SetTarget(Some(id)),
+                None => SlashOutcome::SystemMessage(format!("/{cmd}: slot empty")),
+            }
+        }
         "assist" => match resolve_action_target(rest, entities, self_pos, current_target) {
             Some((id, idx)) => SlashOutcome::Command(AgentCommand::Action {
                 target_id: id,
@@ -666,6 +940,14 @@ pub fn parse_slash(
         "buy" => parse_buy(rest),
         "sit" => SlashOutcome::SystemMessage("/sit: not yet wired".into()),
         "stand" => SlashOutcome::SystemMessage("/stand: not yet wired".into()),
+        "bgm" => match rest.parse::<u16>() {
+            Ok(id) => SlashOutcome::PlayBgm { track_id: id },
+            Err(_) => SlashOutcome::SystemMessage("/bgm <track_id>".into()),
+        },
+        "sfx" => match rest.parse::<u32>() {
+            Ok(id) => SlashOutcome::PlaySfx { se_id: id },
+            Err(_) => SlashOutcome::SystemMessage("/sfx <se_id>".into()),
+        },
         "cancel" => SlashOutcome::Command(AgentCommand::Cancel),
         // ---- Stage 4 lockstep: every MCP tool has a slash twin -----------
         // The MCP `cast` / `weaponskill` / `job_ability` tools wrap the same
@@ -675,6 +957,20 @@ pub fn parse_slash(
         "ws" | "weaponskill" => parse_weaponskill(rest, entities, self_pos, current_target),
         "ja" | "jobability" => parse_job_ability(rest, entities, self_pos, current_target),
         "useitem" | "use" => parse_use_item(rest, entities, self_pos, current_target),
+        // Retail-style "open the X menu" no-arg slashes. The action
+        // forms (cast / ja / useitem above) already cover the
+        // <name> [target] use case; these just push the visible menu.
+        "magic" if rest.is_empty() => SlashOutcome::OpenMenu(MenuKind::Magic),
+        "abilities" | "abi" if rest.is_empty() => SlashOutcome::OpenMenu(MenuKind::Abilities),
+        "items" if rest.is_empty() => SlashOutcome::OpenMenu(MenuKind::Items),
+        // `/equip` (no args) opens the Equipment menu. `/equip <slot> <item>`
+        // is reserved for the direct-equip action wired in Stage 4; until
+        // then, equip-with-args falls through to "not yet wired".
+        "equipment" if rest.is_empty() => SlashOutcome::OpenMenu(MenuKind::Equipment),
+        "equip" if rest.is_empty() => SlashOutcome::OpenMenu(MenuKind::Equipment),
+        "equip" => SlashOutcome::SystemMessage(
+            "/equip <slot> <item>: not yet wired (Stage 4); /equip with no args opens the Equipment menu".into(),
+        ),
         "raisemenu" => parse_raise_menu(rest),
         "tractormenu" => parse_tractor_menu(rest),
         "homepointmenu" => parse_homepoint_menu(rest),
@@ -692,9 +988,20 @@ pub fn parse_slash(
         // openings, `onZoneIn` cinematics). Without an arg the parser
         // tries to look up the CSID from the current zone; with one it
         // trusts the operator's value.
-        "endcutscene" | "endcs" | "skipcutscene" | "skipcs" => {
-            parse_endcutscene(rest, zone_id)
-        }
+        "endcutscene" | "endcs" | "skipcutscene" | "skipcs" => parse_endcutscene(rest),
+        // `/release` (alias `/unwedge`) — emit the LSB GM command
+        // `!release` as chat. Server-side `release.lua` calls
+        // `player:release()` which runs `endCurrentEvent()` and clears
+        // `currentEvent`, unblocking `BlockedState::InEvent`. Requires
+        // `gmlevel >= 1`. Use as the heavy hammer when `/endcutscene`
+        // can't resolve the right CSID (e.g. in-session events the
+        // client never saw because of a packet drop). The server
+        // intercepts `!`-prefixed chat *before* it routes to Say, so
+        // this doesn't leak the command into the chat channel.
+        "release" | "unwedge" => SlashOutcome::Command(AgentCommand::Chat {
+            kind: 0,
+            text: "!release".into(),
+        }),
         "bank" => parse_bank(rest),
         "zonechange" | "rzc" => parse_zone_change(rest),
         "mhexit" => parse_mhexit(rest, zone_id),
@@ -730,13 +1037,19 @@ pub fn parse_slash(
         "load_mzb" | "loadmzb" => parse_load_mzb(rest, self_pos),
         "look" => parse_look(rest, entities, self_pos, current_target),
         "fps" => parse_fps(rest),
+        "capture" => parse_capture(rest),
+        "screenshot" | "ss" => parse_screenshot(rest),
         "drawdistance" | "dd" => parse_drawdistance(rest),
         "zonegeom" => parse_zonegeom(rest),
+        "devhud" => parse_devhud(rest),
+        "minimap" | "mm" => parse_minimap(rest),
+        "sound" | "audio" | "mute" => parse_sound(rest),
         "debug" | "dbg" | "nearby" | "entities" => {
             parse_debug(rest, entities, self_pos, current_target)
         }
         "keybinds" | "keybind" | "binds" => parse_keybinds(rest),
-        "pathto" => parse_pathto(rest, entities, current_target),
+        "pathto" => parse_pathto(rest, entities, self_pos, current_target, zone_id),
+        "warp" => parse_warp(rest, entities, self_pos, current_target, zone_id),
         "zones" => parse_zones(zone_id),
         "zoneto" => parse_zoneto(rest, zone_id),
         "navinfo" => SlashOutcome::NavInfo,
@@ -783,16 +1096,11 @@ pub fn parse_slash(
     }
 }
 
-/// Build a `[system]` chat line from a system message. Lets the caller
-/// append this directly into the snapshot's chat buffer for display.
-pub fn system_chat_line(text: String) -> ChatLine {
-    ChatLine {
-        channel: ChatChannel::System,
-        sender: "client".into(),
-        text,
-        server_ts: 0,
-    }
-}
+// Chat-line constructors live in `ffxi-viewer-core` so both client-side
+// slash commands and viewer-core engine systems (audio, skybox, sun/moon,
+// weather, vana clock) can emit them. Re-exported here so existing callers
+// (`text_input.rs`, `screenshot.rs`) keep importing from this module.
+pub use ffxi_viewer_core::snapshot::{debug_chat_line, system_chat_line};
 
 fn chat_or_empty(rest: &str, kind: u8, label: &str) -> SlashOutcome {
     if rest.is_empty() {
@@ -894,53 +1202,198 @@ fn parse_heal(rest: &str) -> SlashOutcome {
     SlashOutcome::Command(AgentCommand::Heal { mode })
 }
 
-/// `/pathto <x> <y> <z>` or `/pathto target` — issue a navmesh-aware
-/// `AgentCommand::PathTo`. The numeric form takes three FFXI-world
-/// floats; the `target` form pulls the current target's position so
-/// you can chase without copying coords.
-///
-/// We don't add a `/pathto <name>` form because that's what `/follow`
-/// already does (with a continuous re-issue rather than a single
-/// path). Two commands with the same surface would just confuse the
-/// operator.
-fn parse_pathto(rest: &str, entities: &[WireEntity], current_target: Option<u32>) -> SlashOutcome {
+/// `/pathto` — navmesh-aware `AgentCommand::PathTo`. Accepts:
+///   - `/pathto <x> <y> [z]` — explicit coords. `z` is the FFXI-native
+///     vertical axis and defaults to the player's current `self_pos.z`
+///     when omitted (operator typically wants to stay on the same
+///     vertical plane and let the pathfinder snap as it walks).
+///   - `/pathto target` — pull coords from the current target.
+///   - `/pathto <name>` — fuzzy match against zone-line destinations
+///     in the current zone, then entity names. Subsumes the old
+///     `/zoneto`, which is kept as an alias.
+fn parse_pathto(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+    zone_id: Option<u16>,
+) -> SlashOutcome {
     let trimmed = rest.trim();
     if trimmed.is_empty() {
         return SlashOutcome::SystemMessage(
-            "/pathto: usage `/pathto <x> <y> <z>` or `/pathto target`".into(),
+            "/pathto: usage `/pathto <x> <y> [z]` | `/pathto <name>` | `/pathto target`".into(),
         );
     }
+    match parse_goto_target(
+        trimmed,
+        entities,
+        self_pos,
+        current_target,
+        zone_id,
+        "/pathto",
+    ) {
+        Ok(pos) => SlashOutcome::Command(AgentCommand::PathTo {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+        }),
+        Err(msg) => SlashOutcome::SystemMessage(msg),
+    }
+}
+
+/// `/warp` — debug teleport. Emits `AgentCommand::Move`, which rewrites
+/// the next keepalive's reported position (and heading) directly.
+/// Bypasses navmesh and pathing entirely: useful for poking at edge
+/// cases like out-of-mesh spots, scripted positions, or stuck-recovery.
+///
+/// The server's anti-speedhack guard will reject or cap obvious jumps
+/// (see `[[reactor_speed_safety]]` — outbound Move suppressed at
+/// speed=0, scaled by speed ratio); that's the operator-visible
+/// signal that a warp didn't take.
+///
+/// Accepts the same surface as [`parse_pathto`]: coords (z optional),
+/// `target`, or a fuzzy `<name>` matched against zone-lines + entities.
+/// Heading is carried over from the player's current entity row so
+/// the warp doesn't spin the camera north.
+fn parse_warp(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+    zone_id: Option<u16>,
+) -> SlashOutcome {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/warp: usage `/warp <x> <y> [z]` | `/warp <name>` | `/warp target`".into(),
+        );
+    }
+    match parse_goto_target(
+        trimmed,
+        entities,
+        self_pos,
+        current_target,
+        zone_id,
+        "/warp",
+    ) {
+        Ok(pos) => SlashOutcome::Command(AgentCommand::Move {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+            heading: self_heading(entities, self_pos),
+        }),
+        Err(msg) => SlashOutcome::SystemMessage(msg),
+    }
+}
+
+/// Shared parser for the `/pathto` / `/warp` argument surface. Returns
+/// the resolved FFXI-world position, or a usage/error string keyed to
+/// the caller's command name (so the toast says `/warp: …` vs
+/// `/pathto: …`).
+///
+/// Resolution order:
+///   1. `target` — current target's pos (fails if no target).
+///   2. 2-or-3 numeric tokens — explicit coords. 2 args means
+///      `<x> <y>` with `z` defaulting to `self_pos.z`.
+///   3. Anything else — fuzzy name. See [`resolve_position_needle`].
+fn parse_goto_target(
+    trimmed: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+    zone_id: Option<u16>,
+    cmd_label: &str,
+) -> Result<WireVec3, String> {
     if trimmed.eq_ignore_ascii_case("target") {
-        let Some(id) = current_target else {
-            return SlashOutcome::SystemMessage("/pathto: no target".into());
-        };
-        let Some(ent) = entities.iter().find(|e| e.id == id) else {
-            return SlashOutcome::SystemMessage("/pathto: target despawned".into());
-        };
-        return SlashOutcome::Command(AgentCommand::PathTo {
-            x: ent.pos.x,
-            y: ent.pos.y,
-            z: ent.pos.z,
-        });
+        let id = current_target.ok_or_else(|| format!("{cmd_label}: no target"))?;
+        let ent = entities
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| format!("{cmd_label}: target despawned"))?;
+        return Ok(ent.pos);
     }
     let parts: Vec<&str> = trimmed.split_ascii_whitespace().collect();
-    if parts.len() != 3 {
-        return SlashOutcome::SystemMessage(format!(
-            "/pathto: expected 3 coords (got {}); usage `/pathto <x> <y> <z>`",
-            parts.len()
-        ));
-    }
-    let coords: Result<Vec<f32>, _> = parts.iter().map(|p| p.parse::<f32>()).collect();
-    match coords {
-        Ok(v) => SlashOutcome::Command(AgentCommand::PathTo {
+    // Numeric form: 2 or 3 floats. We only treat it as numeric if every
+    // token parses cleanly — otherwise fall through to fuzzy match.
+    // (Zone / entity names are single tokens, so a token-count guard
+    // would mis-trigger here on multi-word names — parse-everything
+    // is the cleaner pivot.)
+    if (parts.len() == 2 || parts.len() == 3) && parts.iter().all(|p| p.parse::<f32>().is_ok()) {
+        let v: Vec<f32> = parts.iter().map(|p| p.parse::<f32>().unwrap()).collect();
+        let z = if v.len() == 3 { v[2] } else { self_pos.z };
+        return Ok(WireVec3 {
             x: v[0],
             y: v[1],
-            z: v[2],
-        }),
-        Err(_) => SlashOutcome::SystemMessage(format!(
-            "/pathto: bad coord in `{trimmed}` (expected three floats)"
-        )),
+            z,
+        });
     }
+    // Fuzzy name resolution (zone-line + entity).
+    resolve_position_needle(trimmed, entities, self_pos, zone_id)
+        .map(|(pos, _label)| pos)
+        .ok_or_else(|| format!("{cmd_label}: no match for `{trimmed}` (try `/zones` or `/debug`)"))
+}
+
+/// Player's current heading, looked up from the self entity. Used by
+/// [`parse_warp`] to avoid forcing a heading-reset on teleport. We
+/// identify "self" by `pos == self_pos` (the same convention as
+/// `render_debug_nearby` — see `state.rs::self_position`). Falls back
+/// to `0` if the self entity isn't yet in the snapshot (very early
+/// boot only).
+fn self_heading(entities: &[WireEntity], self_pos: WireVec3) -> u8 {
+    entities
+        .iter()
+        .find(|e| e.pos == self_pos)
+        .map(|e| e.heading)
+        .unwrap_or(0)
+}
+
+/// Fuzzy-match a needle against zone-line destinations (current zone)
+/// AND entity names, in that priority order. Returns `(pos, label)`
+/// where `label` describes what matched — currently unused by callers
+/// (toast support is deferred) but kept so logging and future
+/// toasting have a stable hook.
+///
+/// Priority: zone-line first. Rationale: `/zoneto` is the established
+/// "by destination" command and we want a strict superset of its
+/// behavior. Entity match is the additive surface this resolver
+/// introduces. Operators can target a specific entity with the
+/// `target` form when they want to skip the zone-line path.
+fn resolve_position_needle(
+    needle: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    zone_id: Option<u16>,
+) -> Option<(WireVec3, String)> {
+    if let Some(z) = zone_id {
+        let lines = ffxi_nav::zone_lines_for(z);
+        if !lines.is_empty() {
+            let by_id = needle.parse::<u16>().ok().filter(|n| *n <= MAX_ZONE_ID);
+            let needle_lower = needle.to_ascii_lowercase();
+            let hit = lines.iter().find(|line| {
+                if Some(line.to_zone) == by_id {
+                    return true;
+                }
+                ffxi_nav::zone_name(line.to_zone)
+                    .map(|n| n.to_ascii_lowercase().starts_with(&needle_lower))
+                    .unwrap_or(false)
+            });
+            if let Some(line) = hit {
+                let pos = WireVec3 {
+                    x: line.from_pos[0],
+                    y: line.from_pos[1],
+                    z: line.from_pos[2],
+                };
+                let label = ffxi_nav::zone_name(line.to_zone)
+                    .map(|n| format!("zone-line → {n} ({})", line.to_zone))
+                    .unwrap_or_else(|| format!("zone-line → zone {}", line.to_zone));
+                return Some((pos, label));
+            }
+        }
+    }
+    let ent = resolve_name(needle, entities, self_pos)?;
+    let kind = kind_tag(ent.kind);
+    let name = ent.name.as_deref().unwrap_or("?");
+    Some((ent.pos, format!("{kind} {name}")))
 }
 
 // ----- Stage 4 lockstep parsers ---------------------------------------------
@@ -1292,45 +1745,30 @@ fn parse_agent(rest: &str) -> SlashOutcome {
 /// `/endcutscene [csid]` — resolve the CSID and produce a
 /// `SlashOutcome::EndCutscene`. The dispatcher in `text_input.rs` fills
 /// in the player's own `unique_no`/`act_index` since those aren't in
-/// the parser's args.
+/// the parser's args, and resolves a `None` `event_num` against the
+/// live `DialogState` / start-zone fallback before sending.
 ///
-/// - With no arg: look up the CSID from `zone_id` via
-///   [`START_ZONE_CUTSCENE`]. Returns a system message if the current
-///   zone isn't in the table (i.e. not a starting zone — the operator
-///   should pass an explicit CSID for any other forced event).
+/// - With no arg: emits `event_num = None`. The dispatcher prefers the
+///   live `DialogState.event_para` (the CSID the server is currently
+///   pinning) and falls back to [`start_zone_cutscene`] for the
+///   forced new-character cinematics. This avoids the EventPara=0
+///   mismatch class the parser used to produce when the zone-table
+///   guess didn't match the actual pinned event (e.g. CSID 11002
+///   Synergy Engineer on top of a start zone).
 /// - With an arg: parse it as `u16` and trust the operator. Useful for
 ///   the Bastok Markets chain (CSID 0 → 7; default clears 0, then
 ///   `/endcutscene 7` clears the second one).
-fn parse_endcutscene(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
+fn parse_endcutscene(rest: &str) -> SlashOutcome {
     let trimmed = rest.trim();
-    let event_num = if trimmed.is_empty() {
-        let Some(z) = zone_id else {
-            return SlashOutcome::SystemMessage(
-                "/endcutscene: no current zone; pass an explicit CSID \
-                 (`/endcutscene <csid>`)"
-                    .into(),
-            );
-        };
-        match start_zone_cutscene(z) {
-            Some(csid) => csid,
-            None => {
-                return SlashOutcome::SystemMessage(format!(
-                    "/endcutscene: zone {z} isn't a starting nation; pass \
-                     an explicit CSID (`/endcutscene <csid>`)"
-                ));
-            }
-        }
-    } else {
-        match trimmed.parse::<u16>() {
-            Ok(n) => n,
-            Err(_) => {
-                return SlashOutcome::SystemMessage(format!(
-                    "/endcutscene: bad CSID `{trimmed}` (expected u16)"
-                ));
-            }
-        }
-    };
-    SlashOutcome::EndCutscene { event_num }
+    if trimmed.is_empty() {
+        return SlashOutcome::EndCutscene { event_num: None };
+    }
+    match trimmed.parse::<u16>() {
+        Ok(n) => SlashOutcome::EndCutscene { event_num: Some(n) },
+        Err(_) => SlashOutcome::SystemMessage(format!(
+            "/endcutscene: bad CSID `{trimmed}` (expected u16)"
+        )),
+    }
 }
 
 fn parse_zone_change(rest: &str) -> SlashOutcome {
@@ -1582,18 +2020,10 @@ fn parse_debug(
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
         "heights" | "h" => SlashOutcome::DebugHeights,
-        "" => SlashOutcome::SystemMessage(render_debug_nearby(
-            entities,
-            self_pos,
-            current_target,
-        )),
+        "" => SlashOutcome::SystemMessage(render_debug_nearby(entities, self_pos, current_target)),
         // Argument that isn't a known subcommand → treat as entity lookup
         // (name prefix, decimal id, or act_index). Detail dump.
-        _ => SlashOutcome::SystemMessage(render_debug_entity(
-            trimmed,
-            entities,
-            self_pos,
-        )),
+        _ => SlashOutcome::SystemMessage(render_debug_entity(trimmed, entities, self_pos)),
     }
 }
 
@@ -1693,22 +2123,15 @@ fn render_debug_nearby(
 
 /// Resolve a single entity (name prefix, decimal id, or act_index) and
 /// render its full detail block.
-fn render_debug_entity(
-    arg: &str,
-    entities: &[WireEntity],
-    self_pos: WireVec3,
-) -> String {
+fn render_debug_entity(arg: &str, entities: &[WireEntity], self_pos: WireVec3) -> String {
     // Resolution order: numeric id → numeric act_index → name prefix.
     // u32 first because ids easily exceed u16.
     let ent: Option<&WireEntity> = if let Ok(id) = arg.parse::<u32>() {
-        entities
-            .iter()
-            .find(|e| e.id == id)
-            .or_else(|| {
-                u16::try_from(id)
-                    .ok()
-                    .and_then(|idx| entities.iter().find(|e| e.act_index == idx))
-            })
+        entities.iter().find(|e| e.id == id).or_else(|| {
+            u16::try_from(id)
+                .ok()
+                .and_then(|idx| entities.iter().find(|e| e.act_index == idx))
+        })
     } else {
         resolve_name(arg, entities, self_pos)
     };
@@ -1788,18 +2211,162 @@ fn nearby_entities<'a>(
     from: WireVec3,
     limit: usize,
 ) -> Vec<(&'a WireEntity, f32)> {
-    let mut scored: Vec<(&WireEntity, f32)> = entities
-        .iter()
-        .map(|e| (e, sq_dist(e.pos, from)))
-        .collect();
+    let mut scored: Vec<(&WireEntity, f32)> =
+        entities.iter().map(|e| (e, sq_dist(e.pos, from))).collect();
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
     scored
 }
 
-/// `/zonegeom off|collision|all|toggle` — set MZB overlay visibility.
+/// `/sound [on|off|toggle] [bgm|sfx]` — set or toggle audio mute.
+/// Argument order is flexible: `/sound bgm off`, `/sound off bgm`,
+/// `/sound off` (both), `/sound toggle bgm`, `/sound` (toggle both).
+///
+/// Returns one of `SetBoth` / `SetBgm` / `SetSfx`. The dispatcher in
+/// `text_input` applies the op to the `AudioMuteState` resource and
+/// emits a status toast.
+///
+/// Bare `/sound` toggles both categories — same convention as
+/// `/devhud` / `/heal` / `/capture` (no arg = toggle). The status
+/// query is accessible via the explicit `/sound status` or
+/// `/sound ?` form.
+fn parse_sound(rest: &str) -> SlashOutcome {
+    let tokens: Vec<String> = rest
+        .split_whitespace()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    if tokens.is_empty() {
+        return SlashOutcome::SetSound(SoundOp::SetBoth(None));
+    }
+    // Split tokens into verb (on/off/toggle) + category (bgm/sfx).
+    // Either order is accepted; missing category defaults to "both".
+    let mut verb: Option<Option<bool>> = None;
+    let mut category: Option<&str> = None;
+    for tok in &tokens {
+        match tok.as_str() {
+            "on" | "unmute" | "true" | "1" => {
+                // `/sound on` reads naturally as "turn sound ON" =
+                // unmute. Flip so the underlying boolean is "muted".
+                verb = Some(Some(false));
+            }
+            "off" | "mute" | "false" | "0" => {
+                verb = Some(Some(true));
+            }
+            "toggle" | "flip" => {
+                verb = Some(None);
+            }
+            "bgm" | "music" => category = Some("bgm"),
+            "sfx" | "se" | "fx" | "effects" => category = Some("sfx"),
+            "status" | "?" => return SlashOutcome::SetSound(SoundOp::Status),
+            other => {
+                return SlashOutcome::SystemMessage(format!(
+                    "/sound: bad arg `{other}` \
+                     (use on|off|toggle and/or bgm|sfx)"
+                ));
+            }
+        }
+    }
+    let verb = match verb {
+        Some(v) => v,
+        None => {
+            // A bare category (`/sound bgm`) with no verb reads as
+            // toggle — same convention `/devhud` uses when called
+            // with no arg.
+            None
+        }
+    };
+    let op = match category {
+        Some("bgm") => SoundOp::SetBgm(verb),
+        Some("sfx") => SoundOp::SetSfx(verb),
+        _ => SoundOp::SetBoth(verb),
+    };
+    SlashOutcome::SetSound(op)
+}
+
+/// `/devhud on|off|toggle` — show/hide developer telemetry overlays.
+/// Empty argument toggles, matching the convention of `/zonegeom` /
+/// `/heal` / `/capture`. Off by default (vanilla FFXI / Ashita /
+/// Windower-addon style).
+fn parse_devhud(rest: &str) -> SlashOutcome {
+    let arg = rest.trim().to_ascii_lowercase();
+    let setting = match arg.as_str() {
+        "" | "toggle" => None,
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        other => {
+            return SlashOutcome::SystemMessage(format!(
+                "/devhud: bad arg `{other}` (use on|off|toggle)"
+            ));
+        }
+    };
+    SlashOutcome::SetDevHud(setting)
+}
+
+/// `/minimap [show|hide|toggle|mode <top|retail|auto>|cull <N>]`
+///
+/// Bare `/minimap` reports the current mode + visibility + cull height
+/// as a system chat line (the dispatcher reads the live resources to
+/// format it). `mode` and `cull` take a sub-argument.
+fn parse_minimap(rest: &str) -> SlashOutcome {
+    let mut parts = rest.trim().splitn(2, char::is_whitespace);
+    let verb = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    let arg = parts.next().unwrap_or("").trim();
+    let op = match verb.as_str() {
+        "" => MinimapOp::Status,
+        "show" | "on" => MinimapOp::Show,
+        "hide" | "off" => MinimapOp::Hide,
+        "toggle" => MinimapOp::Toggle,
+        "mode" => match arg.to_ascii_lowercase().as_str() {
+            "top" | "topdown" => MinimapOp::ModeTopDown,
+            "retail" => MinimapOp::ModeRetail,
+            "auto" | "" => MinimapOp::ModeAuto,
+            other => {
+                return SlashOutcome::SystemMessage(format!(
+                    "/minimap mode: bad arg `{other}` (use top|retail|auto)"
+                ));
+            }
+        },
+        "cull" => match arg.parse::<f32>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => MinimapOp::SetCull(v),
+            _ => {
+                return SlashOutcome::SystemMessage(format!(
+                    "/minimap cull: bad value `{arg}` (expected non-negative number)"
+                ));
+            }
+        },
+        "zoom" => match arg.to_ascii_lowercase().as_str() {
+            "in" => MinimapOp::ZoomIn,
+            "out" => MinimapOp::ZoomOut,
+            "fit" | "max" | "zone" => MinimapOp::ZoomFit,
+            "reset" | "default" => MinimapOp::ZoomReset,
+            "" => {
+                return SlashOutcome::SystemMessage(
+                    "/minimap zoom: missing arg (in|out|fit|reset|<radius>)".to_string(),
+                );
+            }
+            num => match num.parse::<f32>() {
+                Ok(v) if v.is_finite() && v > 0.0 => MinimapOp::ZoomSet(v),
+                _ => {
+                    return SlashOutcome::SystemMessage(format!(
+                        "/minimap zoom: bad arg `{num}` (expected in|out|fit|reset|<radius>)"
+                    ));
+                }
+            },
+        },
+        other => {
+            return SlashOutcome::SystemMessage(format!(
+                "/minimap: unknown sub `{other}` (use show|hide|toggle|mode|cull|zoom)"
+            ));
+        }
+    };
+    SlashOutcome::SetMinimap(op)
+}
+
+/// `/zonegeom off|collision|all|camera|toggle` — set MZB overlay visibility.
 /// `on` is an alias for `all` (back-compat with the old bool toggle).
-/// `toggle`/empty cycles Collision → All → Off → Collision.
+/// `camera`/`cam` activates the camera-collision debug overlay (MZB collision
+/// + BVH AABBs + active raycast gizmos). `toggle`/empty cycles
+/// Collision → All → Camera → Off → Collision.
 fn parse_zonegeom(rest: &str) -> SlashOutcome {
     use ffxi_viewer_core::dat_mzb::ZoneGeomMode;
     let arg = rest.trim().to_ascii_lowercase();
@@ -1808,9 +2375,10 @@ fn parse_zonegeom(rest: &str) -> SlashOutcome {
         "off" | "false" | "0" => Some(ZoneGeomMode::Off),
         "collision" | "coll" => Some(ZoneGeomMode::Collision),
         "all" | "on" | "true" | "1" => Some(ZoneGeomMode::All),
+        "camera" | "cam" => Some(ZoneGeomMode::Camera),
         other => {
             return SlashOutcome::SystemMessage(format!(
-                "/zonegeom: bad arg `{other}` (use off|collision|all|toggle)"
+                "/zonegeom: bad arg `{other}` (use off|collision|all|camera|toggle)"
             ));
         }
     };
@@ -1842,6 +2410,29 @@ fn parse_drawdistance(rest: &str) -> SlashOutcome {
         other => SlashOutcome::SystemMessage(format!(
             "/drawdistance: unknown sub `{other}` (use setworld | setmob)"
         )),
+    }
+}
+
+fn parse_capture(rest: &str) -> SlashOutcome {
+    let arg = rest.split_whitespace().next();
+    match arg.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("toggle") => SlashOutcome::SetCaptureMode(None),
+        Some("on") | Some("1") | Some("true") => SlashOutcome::SetCaptureMode(Some(true)),
+        Some("off") | Some("0") | Some("false") => SlashOutcome::SetCaptureMode(Some(false)),
+        Some(other) => SlashOutcome::SystemMessage(format!(
+            "/capture: unknown arg `{other}` (use `on`, `off`, or `toggle`)"
+        )),
+    }
+}
+
+fn parse_screenshot(rest: &str) -> SlashOutcome {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        SlashOutcome::Screenshot { path: None }
+    } else {
+        SlashOutcome::Screenshot {
+            path: Some(trimmed.to_string()),
+        }
     }
 }
 
@@ -2151,10 +2742,78 @@ fn resolve_action_target(
     }
 }
 
+/// Cycle through entities matching one of `kinds`, sorted by 3D
+/// distance from `self_pos`. If `current` is in the filtered set, step
+/// to the next entry (forward or reverse, with wrap); otherwise pick
+/// the nearest. Returns `None` when no entity matches the kind filter.
+///
+/// Used by `/targetnpc[2]`, `/targetenemy`, and `/targetnpcparty`.
+/// Not viewport-constrained — these commands intentionally bypass the
+/// Tab cycle's frustum filter so the operator can grab a target they
+/// know is nearby even when the camera is pointed elsewhere.
+fn cycle_kind_filtered(
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current: Option<u32>,
+    kinds: &[ffxi_viewer_wire::EntityKind],
+    reverse: bool,
+) -> Option<u32> {
+    let mut pool: Vec<&WireEntity> = entities
+        .iter()
+        .filter(|e| kinds.contains(&e.kind))
+        .collect();
+    pool.sort_by(|a, b| {
+        let da = sq_dist(a.pos, self_pos);
+        let db = sq_dist(b.pos, self_pos);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if pool.is_empty() {
+        return None;
+    }
+    match current.and_then(|id| pool.iter().position(|e| e.id == id)) {
+        Some(idx) => {
+            let n = pool.len();
+            let next = if reverse {
+                (idx + n - 1) % n
+            } else {
+                (idx + 1) % n
+            };
+            Some(pool[next].id)
+        }
+        None => Some(pool[0].id),
+    }
+}
+
+/// Resolve a 1-based party slot to an entity id. Slot 1 is self
+/// (`self_char_id`); slots 2..=6 index `party[1..=5]` in insertion
+/// order. Returns `None` if the slot is empty or `self_char_id` is
+/// unknown.
+fn resolve_party_slot(
+    slot_1based: u8,
+    self_char_id: Option<u32>,
+    party: &[ffxi_viewer_wire::PartyMember],
+) -> Option<u32> {
+    if slot_1based == 0 {
+        return None;
+    }
+    let idx = (slot_1based as usize).saturating_sub(1);
+    if idx == 0 {
+        self_char_id
+    } else {
+        party.get(idx).map(|p| p.id)
+    }
+}
+
 fn sq_dist(a: WireVec3, b: WireVec3) -> f32 {
+    // 3D Euclidean — the server's range checks are 3D, the overhead
+    // nameplate is 3D, so every callsite that sorts/filters "by distance
+    // for an action" must match. A 2D variant would silently undercount
+    // altitude differences on sloped terrain and let `/copy` / Tab / Enter
+    // pick a target the server then rejects as out of range.
     let dx = a.x - b.x;
     let dy = a.y - b.y;
-    dx * dx + dy * dy
+    let dz = a.z - b.z;
+    dx * dx + dy * dy + dz * dz
 }
 
 #[cfg(test)]
@@ -2191,15 +2850,181 @@ mod tests {
         }
     }
 
+    /// Test wrapper that defaults `self_char_id` and `party` to the
+    /// "unknown / empty" values most tests want. Tests that exercise
+    /// `/targetparty*` or `/targetnpcparty` should call `parse_slash`
+    /// directly with the full signature.
+    fn parse_slash_t(
+        buffer: &str,
+        entities: &[WireEntity],
+        self_pos: WireVec3,
+        current_target: Option<u32>,
+        zone_id: Option<u16>,
+    ) -> SlashOutcome {
+        parse_slash(
+            buffer,
+            entities,
+            self_pos,
+            current_target,
+            zone_id,
+            None,
+            &[],
+        )
+    }
+
+    fn party_member(id: u32, name: &str) -> ffxi_viewer_wire::PartyMember {
+        ffxi_viewer_wire::PartyMember {
+            id,
+            act_index: id as u16,
+            name: Some(name.into()),
+            hp: 0,
+            mp: 0,
+            tp: 0,
+            hp_pct: 100,
+            mp_pct: 100,
+            zone_no: 0,
+            main_job: 0,
+            main_job_lv: 0,
+            sub_job: 0,
+            sub_job_lv: 0,
+            is_party_leader: false,
+            is_alliance_leader: false,
+            in_mog_house: false,
+        }
+    }
+
+    #[test]
+    fn targetnpc_cycles_non_pc_forward() {
+        // Two mobs and an NPC; PC ignored. Without a current target, the
+        // nearest one wins. Subsequent press cycles to the next.
+        let entities = vec![
+            ent(1, "Goblin A", EntityKind::Mob, 3.0, 0.0),
+            ent(2, "Vendor", EntityKind::Npc, 5.0, 0.0),
+            ent(3, "Goblin B", EntityKind::Mob, 7.0, 0.0),
+            ent(4, "Bob", EntityKind::Pc, 1.0, 0.0), // closer but excluded
+        ];
+        assert!(matches!(
+            parse_slash_t("/targetnpc", &entities, origin(), None, None),
+            SlashOutcome::SetTarget(Some(1))
+        ));
+        // Cycle from id=1 → id=2 → id=3 → wrap to id=1.
+        assert!(matches!(
+            parse_slash_t("/targetnpc", &entities, origin(), Some(1), None),
+            SlashOutcome::SetTarget(Some(2))
+        ));
+        assert!(matches!(
+            parse_slash_t("/targetnpc", &entities, origin(), Some(3), None),
+            SlashOutcome::SetTarget(Some(1))
+        ));
+    }
+
+    #[test]
+    fn targetnpc2_cycles_reverse() {
+        // Same pool as above; "2" walks the cycle backward.
+        let entities = vec![
+            ent(1, "Goblin A", EntityKind::Mob, 3.0, 0.0),
+            ent(2, "Vendor", EntityKind::Npc, 5.0, 0.0),
+            ent(3, "Goblin B", EntityKind::Mob, 7.0, 0.0),
+        ];
+        // From id=2, reverse goes to id=1.
+        assert!(matches!(
+            parse_slash_t("/targetnpc2", &entities, origin(), Some(2), None),
+            SlashOutcome::SetTarget(Some(1))
+        ));
+        // From id=1, reverse wraps to id=3.
+        assert!(matches!(
+            parse_slash_t("/targetnpc2", &entities, origin(), Some(1), None),
+            SlashOutcome::SetTarget(Some(3))
+        ));
+    }
+
+    #[test]
+    fn targetenemy_skips_npcs() {
+        // A vendor sits closer than the mob; /targetenemy must skip it.
+        let entities = vec![
+            ent(1, "Vendor", EntityKind::Npc, 2.0, 0.0),
+            ent(2, "Goblin", EntityKind::Mob, 8.0, 0.0),
+        ];
+        assert!(matches!(
+            parse_slash_t("/targetenemy", &entities, origin(), None, None),
+            SlashOutcome::SetTarget(Some(2))
+        ));
+    }
+
+    #[test]
+    fn targetparty_resolves_self_and_slots() {
+        let party = vec![
+            party_member(100, "Self"),
+            party_member(200, "Member2"),
+            party_member(300, "Member3"),
+        ];
+        // /targetparty1 = self.
+        assert!(matches!(
+            parse_slash(
+                "/targetparty1",
+                &[],
+                origin(),
+                None,
+                None,
+                Some(100),
+                &party
+            ),
+            SlashOutcome::SetTarget(Some(100))
+        ));
+        // /targetparty3 = third slot.
+        assert!(matches!(
+            parse_slash(
+                "/targetparty3",
+                &[],
+                origin(),
+                None,
+                None,
+                Some(100),
+                &party
+            ),
+            SlashOutcome::SetTarget(Some(300))
+        ));
+        // Empty slot returns a system message, not a target change.
+        assert!(matches!(
+            parse_slash(
+                "/targetparty5",
+                &[],
+                origin(),
+                None,
+                None,
+                Some(100),
+                &party
+            ),
+            SlashOutcome::SystemMessage(_)
+        ));
+    }
+
+    #[test]
+    fn sq_dist_is_3d_euclidean() {
+        // 3-4-12 Pythagorean quadruple. A 2D implementation would
+        // return 25 (3² + 4²); 3D returns 169 (3² + 4² + 12²).
+        let a = WireVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let b = WireVec3 {
+            x: 3.0,
+            y: 4.0,
+            z: 12.0,
+        };
+        assert_eq!(sq_dist(a, b), 169.0);
+    }
+
     #[test]
     fn empty_command_is_system_message() {
-        let out = parse_slash("/", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::SystemMessage(_)));
     }
 
     #[test]
     fn unknown_command_is_system_message() {
-        let out = parse_slash("/blarg", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/blarg", &empty_entities(), origin(), None, None);
         match out {
             SlashOutcome::SystemMessage(s) => assert!(s.contains("/blarg")),
             _ => panic!("expected SystemMessage"),
@@ -2208,7 +3033,7 @@ mod tests {
 
     #[test]
     fn party_chat_with_text() {
-        let out = parse_slash("/p hello world", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/p hello world", &empty_entities(), origin(), None, None);
         match out {
             SlashOutcome::Command(AgentCommand::Chat { kind, text }) => {
                 assert_eq!(kind, 4);
@@ -2220,13 +3045,13 @@ mod tests {
 
     #[test]
     fn party_chat_empty_text_is_system_message() {
-        let out = parse_slash("/p", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/p", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::SystemMessage(_)));
     }
 
     #[test]
     fn tell_requires_name_and_text() {
-        let out = parse_slash("/t Bob hi there", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/t Bob hi there", &empty_entities(), origin(), None, None);
         match out {
             SlashOutcome::Command(AgentCommand::Tell { to, text }) => {
                 assert_eq!(to, "Bob");
@@ -2235,7 +3060,7 @@ mod tests {
             other => panic!("expected Tell, got {other:?}"),
         }
 
-        let out = parse_slash("/t Bob", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/t Bob", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::SystemMessage(_)));
     }
 
@@ -2245,7 +3070,7 @@ mod tests {
             ent(101, "Bob", EntityKind::Pc, 0.0, 0.0),
             ent(102, "Bobble", EntityKind::Npc, 5.0, 5.0),
         ];
-        let out = parse_slash("/follow Bob", &entities, origin(), None, None);
+        let out = parse_slash_t("/follow Bob", &entities, origin(), None, None);
         match out {
             SlashOutcome::Command(AgentCommand::Follow { target_id, .. }) => {
                 assert_eq!(target_id, 101); // PC wins over NPC on prefix tie
@@ -2261,7 +3086,7 @@ mod tests {
             ent(202, "NearMob", EntityKind::Mob, 2.0, 0.0),
             ent(303, "FarNpc", EntityKind::Npc, 50.0, 50.0),
         ];
-        let out = parse_slash("/debug", &entities, origin(), Some(202), None);
+        let out = parse_slash_t("/debug", &entities, origin(), Some(202), None);
         match out {
             SlashOutcome::SystemMessage(s) => {
                 assert!(s.contains("target:"), "no target line: {s}");
@@ -2281,7 +3106,7 @@ mod tests {
         let mut e = ent(202, "Goblin", EntityKind::Mob, 3.0, 4.0);
         e.hp_pct = Some(42);
         let entities = vec![e];
-        let out = parse_slash("/debug Goblin", &entities, origin(), None, None);
+        let out = parse_slash_t("/debug Goblin", &entities, origin(), None, None);
         match out {
             SlashOutcome::SystemMessage(s) => {
                 assert!(s.contains("Goblin"), "name missing: {s}");
@@ -2296,15 +3121,15 @@ mod tests {
 
     #[test]
     fn debug_heights_subcommand_still_works() {
-        let out = parse_slash("/debug heights", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/debug heights", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::DebugHeights));
-        let out = parse_slash("/dbg h", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/dbg h", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::DebugHeights));
     }
 
     #[test]
     fn follow_no_name_uses_current_target() {
-        let out = parse_slash("/follow", &empty_entities(), origin(), Some(42), None);
+        let out = parse_slash_t("/follow", &empty_entities(), origin(), Some(42), None);
         match out {
             SlashOutcome::Command(AgentCommand::Follow { target_id, .. }) => {
                 assert_eq!(target_id, 42);
@@ -2315,13 +3140,13 @@ mod tests {
 
     #[test]
     fn follow_no_name_no_target_is_system_message() {
-        let out = parse_slash("/follow", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/follow", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::SystemMessage(_)));
     }
 
     #[test]
     fn target_clears_with_no_arg() {
-        let out = parse_slash("/target", &empty_entities(), origin(), Some(7), None);
+        let out = parse_slash_t("/target", &empty_entities(), origin(), Some(7), None);
         assert!(matches!(out, SlashOutcome::SetTarget(None)));
     }
 
@@ -2332,7 +3157,7 @@ mod tests {
         // server's LeaveGame flow; see `logout_*` tests below.
         for s in ["/quit", "/disconnect"] {
             assert!(matches!(
-                parse_slash(s, &empty_entities(), origin(), None, None),
+                parse_slash_t(s, &empty_entities(), origin(), None, None),
                 SlashOutcome::Quit
             ));
         }
@@ -2344,7 +3169,7 @@ mod tests {
         // also enqueues Heal::On so the player sits during the 30s
         // countdown (matches retail). Order matters: ReqLogout must be
         // first so the wire flush of 0x0E7 lands before 0x0E8.
-        match parse_slash("/logout", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/logout", &empty_entities(), origin(), None, None) {
             SlashOutcome::Commands(cmds) => {
                 assert_eq!(cmds.len(), 2, "expected [ReqLogout, Heal], got {cmds:?}");
                 assert!(
@@ -2370,7 +3195,7 @@ mod tests {
     #[test]
     fn logout_on_chains_heal_logout_off_does_not() {
         // Arming via explicit `on` chains Heal::On.
-        match parse_slash("/logout on", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/logout on", &empty_entities(), origin(), None, None) {
             SlashOutcome::Commands(cmds) => {
                 assert_eq!(cmds.len(), 2);
                 assert!(matches!(
@@ -2385,7 +3210,7 @@ mod tests {
         }
         // Cancelling via `off` is single-command — cancelling the
         // logout shouldn't separately try to start resting.
-        match parse_slash("/logout off", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/logout off", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
                 assert_eq!(kind, ReqLogoutKind::LogoutOff);
             }
@@ -2395,7 +3220,7 @@ mod tests {
 
     #[test]
     fn shutdown_no_arg_toggles_and_chains_heal_on() {
-        match parse_slash("/shutdown", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/shutdown", &empty_entities(), origin(), None, None) {
             SlashOutcome::Commands(cmds) => {
                 assert_eq!(cmds.len(), 2);
                 assert!(matches!(
@@ -2412,7 +3237,7 @@ mod tests {
 
     #[test]
     fn shutdown_on_chains_heal_shutdown_off_does_not() {
-        match parse_slash("/shutdown on", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/shutdown on", &empty_entities(), origin(), None, None) {
             SlashOutcome::Commands(cmds) => {
                 assert_eq!(cmds.len(), 2);
                 assert!(matches!(
@@ -2425,7 +3250,7 @@ mod tests {
             }
             other => panic!("expected Commands, got {other:?}"),
         }
-        match parse_slash("/shutdown off", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/shutdown off", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::ReqLogout { kind }) => {
                 assert_eq!(kind, ReqLogoutKind::ShutdownOff);
             }
@@ -2437,7 +3262,7 @@ mod tests {
     fn exit_emits_quit_with_logout_on() {
         // /exit must arm with `LogoutOn` (not Toggle) so it can't
         // accidentally cancel an in-flight logout from a prior /logout.
-        match parse_slash("/exit", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/exit", &empty_entities(), origin(), None, None) {
             SlashOutcome::QuitWithLogout(kind) => {
                 assert_eq!(kind, ReqLogoutKind::LogoutOn);
             }
@@ -2450,7 +3275,7 @@ mod tests {
         for s in ["/logout please", "/logout 1", "/shutdown maybe"] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    parse_slash_t(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}"
@@ -2460,7 +3285,7 @@ mod tests {
 
     #[test]
     fn heal_no_arg_toggles() {
-        match parse_slash("/heal", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/heal", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::Heal { mode }) => {
                 assert_eq!(mode, HealMode::Toggle);
             }
@@ -2470,13 +3295,13 @@ mod tests {
 
     #[test]
     fn heal_on_and_off_select_explicit_modes() {
-        match parse_slash("/heal on", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/heal on", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::Heal { mode }) => {
                 assert_eq!(mode, HealMode::On);
             }
             other => panic!("expected Command(Heal(On)), got {other:?}"),
         }
-        match parse_slash("/heal off", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/heal off", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::Heal { mode }) => {
                 assert_eq!(mode, HealMode::Off);
             }
@@ -2485,7 +3310,7 @@ mod tests {
         // `/heal toggle` is an alias for the no-arg form. Tested
         // separately so a future reader doesn't assume "toggle" was
         // never a valid arg literal.
-        match parse_slash("/heal toggle", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/heal toggle", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::Heal { mode }) => {
                 assert_eq!(mode, HealMode::Toggle);
             }
@@ -2498,7 +3323,7 @@ mod tests {
         for s in ["/heal please", "/heal 1", "/heal nope"] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    parse_slash_t(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}"
@@ -2517,7 +3342,7 @@ mod tests {
             y: -7.0,
             z: 3.25,
         };
-        match parse_slash("/load_mmb 115 18", &empty_entities(), pos, None, None) {
+        match parse_slash_t("/load_mmb 115 18", &empty_entities(), pos, None, None) {
             SlashOutcome::LoadMmb {
                 file_id,
                 chunk_idx,
@@ -2538,7 +3363,7 @@ mod tests {
     /// is `Some` — but we still verify the field is populated.
     #[test]
     fn load_mmb_on_parses_entity_id() {
-        match parse_slash(
+        match parse_slash_t(
             "/load_mmb_on 1234 115 18",
             &empty_entities(),
             origin(),
@@ -2559,7 +3384,7 @@ mod tests {
         }
         // Alias and bad-args paths surface as SystemMessage.
         assert!(matches!(
-            parse_slash("/loadmmbon 99 7 0", &empty_entities(), origin(), None, None),
+            parse_slash_t("/loadmmbon 99 7 0", &empty_entities(), origin(), None, None),
             SlashOutcome::LoadMmb {
                 entity_id: Some(99),
                 ..
@@ -2573,7 +3398,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    parse_slash_t(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}",
@@ -2588,7 +3413,7 @@ mod tests {
     fn load_mmb_alias_and_bad_args() {
         // Alias `/loadmmb` (no underscore) still routes.
         assert!(matches!(
-            parse_slash("/loadmmb 115 18", &empty_entities(), origin(), None, None),
+            parse_slash_t("/loadmmb 115 18", &empty_entities(), origin(), None, None),
             SlashOutcome::LoadMmb {
                 file_id: 115,
                 chunk_idx: 18,
@@ -2605,7 +3430,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    parse_slash_t(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}",
@@ -2623,7 +3448,7 @@ mod tests {
             z: 3.0,
         };
         // No chunk_idx: `None`.
-        match parse_slash("/load_mzb 7368", &empty_entities(), pos, None, None) {
+        match parse_slash_t("/load_mzb 7368", &empty_entities(), pos, None, None) {
             SlashOutcome::LoadMzb {
                 file_id,
                 chunk_idx,
@@ -2636,7 +3461,7 @@ mod tests {
             other => panic!("expected LoadMzb, got {other:?}"),
         }
         // Explicit chunk_idx.
-        match parse_slash("/load_mzb 7368 2", &empty_entities(), pos, None, None) {
+        match parse_slash_t("/load_mzb 7368 2", &empty_entities(), pos, None, None) {
             SlashOutcome::LoadMzb {
                 chunk_idx: Some(2), ..
             } => {}
@@ -2644,7 +3469,7 @@ mod tests {
         }
         // Alias `/loadmzb`.
         assert!(matches!(
-            parse_slash("/loadmzb 7368", &empty_entities(), pos, None, None),
+            parse_slash_t("/loadmzb 7368", &empty_entities(), pos, None, None),
             SlashOutcome::LoadMzb {
                 chunk_idx: None,
                 ..
@@ -2654,7 +3479,7 @@ mod tests {
         for s in ["/load_mzb", "/load_mzb foo", "/load_mzb 7368 bar"] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    parse_slash_t(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}",
@@ -2664,7 +3489,7 @@ mod tests {
 
     #[test]
     fn navmesh_no_arg_toggles() {
-        match parse_slash("/navmesh", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/navmesh", &empty_entities(), origin(), None, None) {
             SlashOutcome::ToggleNavmesh(None) => {}
             other => panic!("expected ToggleNavmesh(None), got {other:?}"),
         }
@@ -2673,7 +3498,7 @@ mod tests {
     #[test]
     fn navmesh_on_and_off_select_explicit_modes() {
         for (cmd, expected) in [("/navmesh on", Some(true)), ("/navmesh off", Some(false))] {
-            match parse_slash(cmd, &empty_entities(), origin(), None, None) {
+            match parse_slash_t(cmd, &empty_entities(), origin(), None, None) {
                 SlashOutcome::ToggleNavmesh(setting) => assert_eq!(setting, expected),
                 other => panic!("expected ToggleNavmesh({expected:?}), got {other:?}"),
             }
@@ -2685,7 +3510,7 @@ mod tests {
         for s in ["/navmesh maybe", "/navmesh 1", "/navmesh ON!"] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    parse_slash_t(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}"
@@ -2695,7 +3520,7 @@ mod tests {
 
     #[test]
     fn pathto_numeric_three_args_dispatches() {
-        match parse_slash(
+        match parse_slash_t(
             "/pathto 1.5 2 -3.25",
             &empty_entities(),
             origin(),
@@ -2715,7 +3540,7 @@ mod tests {
     fn pathto_target_uses_current_target_pos() {
         let mut entity = ent(42, "Bob", EntityKind::Pc, 7.0, 8.0);
         entity.pos.z = 9.0;
-        match parse_slash("/pathto target", &[entity], origin(), Some(42), None) {
+        match parse_slash_t("/pathto target", &[entity], origin(), Some(42), None) {
             SlashOutcome::Command(AgentCommand::PathTo { x, y, z }) => {
                 assert_eq!((x, y, z), (7.0, 8.0, 9.0));
             }
@@ -2725,17 +3550,125 @@ mod tests {
 
     #[test]
     fn pathto_rejects_bad_input() {
-        // "/pathto target" with no current target also rejects.
+        // `/pathto target` with no current target rejects. `/pathto x y z`
+        // is a fuzzy lookup with no entities to match → rejects. `/pathto`
+        // bare rejects with the usage line. `/pathto 1 2 3 4` (too many
+        // numeric args) falls into fuzzy and finds no name → rejects.
+        //
+        // Note `/pathto 1 2` is NOT in this list — it is now valid as
+        // the 2-arg coord form (z defaults to self_pos.z).
         for s in [
             "/pathto",
-            "/pathto 1 2",
             "/pathto 1 2 3 4",
             "/pathto x y z",
             "/pathto target",
         ] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    parse_slash_t(s, &empty_entities(), origin(), None, None),
+                    SlashOutcome::SystemMessage(_)
+                ),
+                "expected SystemMessage for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn pathto_two_arg_form_uses_self_z() {
+        // `/pathto x y` — z defaults to current self_pos.z. Operator
+        // is on the same vertical plane and just wants to walk
+        // somewhere on this floor.
+        let mut self_pos = origin();
+        self_pos.z = 17.5;
+        match parse_slash_t("/pathto 10 20", &empty_entities(), self_pos, None, None) {
+            SlashOutcome::Command(AgentCommand::PathTo { x, y, z }) => {
+                assert_eq!((x, y, z), (10.0, 20.0, 17.5));
+            }
+            other => panic!("expected PathTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pathto_fuzzy_name_picks_entity() {
+        // `/pathto Bob` — no zone_id (so zone-lines skipped); falls
+        // through to entity prefix match.
+        let entity = ent(42, "Bob", EntityKind::Pc, 7.0, 8.0);
+        match parse_slash_t("/pathto bob", &[entity], origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::PathTo { x, y, .. }) => {
+                assert_eq!((x, y), (7.0, 8.0));
+            }
+            other => panic!("expected PathTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_numeric_three_args_emits_move() {
+        match parse_slash_t("/warp 1.5 2 -3.25", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::Move { x, y, z, heading }) => {
+                assert_eq!((x, y, z), (1.5, 2.0, -3.25));
+                // No self entity in the snapshot → heading defaults to 0.
+                assert_eq!(heading, 0);
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_two_arg_form_uses_self_z() {
+        let mut self_pos = origin();
+        self_pos.z = -42.0;
+        match parse_slash_t("/warp 1 2", &empty_entities(), self_pos, None, None) {
+            SlashOutcome::Command(AgentCommand::Move { x, y, z, .. }) => {
+                assert_eq!((x, y, z), (1.0, 2.0, -42.0));
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_preserves_self_heading() {
+        // Self entity carries heading=64. Warp must not zero it out
+        // (which would force the player to face north on every /warp).
+        let self_pos = origin();
+        let mut me = ent(1, "Me", EntityKind::Pc, self_pos.x, self_pos.y);
+        me.pos.z = self_pos.z;
+        me.heading = 64;
+        match parse_slash_t("/warp 100 200 5", &[me], self_pos, None, None) {
+            SlashOutcome::Command(AgentCommand::Move { heading, .. }) => {
+                assert_eq!(heading, 64);
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_target_form_emits_move_to_target() {
+        let entity = ent(42, "Mob", EntityKind::Mob, 11.0, 22.0);
+        match parse_slash_t("/warp target", &[entity], origin(), Some(42), None) {
+            SlashOutcome::Command(AgentCommand::Move { x, y, .. }) => {
+                assert_eq!((x, y), (11.0, 22.0));
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_fuzzy_entity_match() {
+        let entity = ent(42, "Bob", EntityKind::Pc, 7.0, 8.0);
+        match parse_slash_t("/warp bo", &[entity], origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::Move { x, y, .. }) => {
+                assert_eq!((x, y), (7.0, 8.0));
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warp_rejects_empty_and_unmatched() {
+        for s in ["/warp", "/warp nosuchname"] {
+            assert!(
+                matches!(
+                    parse_slash_t(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}"
@@ -2746,7 +3679,7 @@ mod tests {
     #[test]
     fn cancel_emits_cancel_command() {
         assert!(matches!(
-            parse_slash("/cancel", &empty_entities(), origin(), None, None),
+            parse_slash_t("/cancel", &empty_entities(), origin(), None, None),
             SlashOutcome::Command(AgentCommand::Cancel)
         ));
     }
@@ -2758,7 +3691,7 @@ mod tests {
         // pre-normalization semantics live under `/raw attack` (see
         // `raw_attack_preserves_direct_action`).
         let entities = vec![ent(42, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        let out = parse_slash("/attack", &entities, origin(), Some(42), None);
+        let out = parse_slash_t("/attack", &entities, origin(), Some(42), None);
         match out {
             SlashOutcome::Command(AgentCommand::Engage { target_id }) => {
                 assert_eq!(target_id, 42);
@@ -2770,7 +3703,7 @@ mod tests {
     #[test]
     fn engage_alias_matches_attack() {
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        match parse_slash("/engage", &entities, origin(), Some(7), None) {
+        match parse_slash_t("/engage", &entities, origin(), Some(7), None) {
             SlashOutcome::Command(AgentCommand::Engage { target_id }) => {
                 assert_eq!(target_id, 7);
             }
@@ -2781,7 +3714,7 @@ mod tests {
     #[test]
     fn attackoff_emits_attack_off_action() {
         let entities = vec![ent(9, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        match parse_slash("/attackoff", &entities, origin(), Some(9), None) {
+        match parse_slash_t("/attackoff", &entities, origin(), Some(9), None) {
             SlashOutcome::Command(AgentCommand::Action {
                 target_id, kind, ..
             }) => {
@@ -2795,7 +3728,7 @@ mod tests {
     #[test]
     fn check_uses_current_target_with_kind_check() {
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        let out = parse_slash("/check", &entities, origin(), Some(7), None);
+        let out = parse_slash_t("/check", &entities, origin(), Some(7), None);
         match out {
             SlashOutcome::Command(AgentCommand::CheckTarget {
                 target_id,
@@ -2813,13 +3746,13 @@ mod tests {
     #[test]
     fn checkname_and_checkparam_select_correct_kind() {
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        match parse_slash("/checkname", &entities, origin(), Some(7), None) {
+        match parse_slash_t("/checkname", &entities, origin(), Some(7), None) {
             SlashOutcome::Command(AgentCommand::CheckTarget { kind, .. }) => {
                 assert_eq!(kind, CheckKind::CheckName);
             }
             other => panic!("expected CheckTarget, got {other:?}"),
         }
-        match parse_slash("/checkparam", &entities, origin(), Some(7), None) {
+        match parse_slash_t("/checkparam", &entities, origin(), Some(7), None) {
             SlashOutcome::Command(AgentCommand::CheckTarget { kind, .. }) => {
                 assert_eq!(kind, CheckKind::CheckParam);
             }
@@ -2829,13 +3762,13 @@ mod tests {
 
     #[test]
     fn check_no_target_is_system_message() {
-        let out = parse_slash("/check", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/check", &empty_entities(), origin(), None, None);
         assert!(matches!(out, SlashOutcome::SystemMessage(_)));
     }
 
     #[test]
     fn buy_with_row_uses_qty_one_by_default() {
-        let out = parse_slash("/buy 3", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/buy 3", &empty_entities(), origin(), None, None);
         match out {
             SlashOutcome::ShopBuyRow { shop_index, qty } => {
                 assert_eq!(shop_index, 3);
@@ -2847,7 +3780,7 @@ mod tests {
 
     #[test]
     fn buy_with_qty_passes_it_through() {
-        let out = parse_slash("/buy 0 12", &empty_entities(), origin(), None, None);
+        let out = parse_slash_t("/buy 0 12", &empty_entities(), origin(), None, None);
         match out {
             SlashOutcome::ShopBuyRow { shop_index, qty } => {
                 assert_eq!(shop_index, 0);
@@ -2862,7 +3795,7 @@ mod tests {
         for s in ["/buy", "/buy abc", "/buy 1 0", "/buy 1 xyz"] {
             assert!(
                 matches!(
-                    parse_slash(s, &empty_entities(), origin(), None, None),
+                    parse_slash_t(s, &empty_entities(), origin(), None, None),
                     SlashOutcome::SystemMessage(_)
                 ),
                 "expected SystemMessage for {s}"
@@ -2883,7 +3816,7 @@ mod tests {
         // direct `Action { Attack }` action. The MCP `engage` tool sends
         // `AgentCommand::Engage` (reactor goal). They now match.
         let entities = vec![ent(99, "Bee", EntityKind::Mob, 1.0, 0.0)];
-        match parse_slash("/engage", &entities, origin(), Some(99), None) {
+        match parse_slash_t("/engage", &entities, origin(), Some(99), None) {
             SlashOutcome::Command(AgentCommand::Engage { target_id }) => {
                 assert_eq!(target_id, 99);
             }
@@ -2895,7 +3828,7 @@ mod tests {
     fn attack_is_alias_for_engage() {
         let entities = vec![ent(99, "Bee", EntityKind::Mob, 1.0, 0.0)];
         assert!(matches!(
-            parse_slash("/attack", &entities, origin(), Some(99), None),
+            parse_slash_t("/attack", &entities, origin(), Some(99), None),
             SlashOutcome::Command(AgentCommand::Engage { target_id: 99 })
         ));
     }
@@ -2905,7 +3838,7 @@ mod tests {
         // MCP has no `disengage` tool — agents call `cancel` to stop the
         // engage goal. The slash command matches.
         assert!(matches!(
-            parse_slash("/disengage", &empty_entities(), origin(), None, None),
+            parse_slash_t("/disengage", &empty_entities(), origin(), None, None),
             SlashOutcome::Command(AgentCommand::Cancel)
         ));
     }
@@ -2914,7 +3847,7 @@ mod tests {
     fn raw_attack_preserves_direct_action() {
         // Escape hatch for one-shot wire-level Attack.
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        match parse_slash("/raw attack", &entities, origin(), Some(7), None) {
+        match parse_slash_t("/raw attack", &entities, origin(), Some(7), None) {
             SlashOutcome::Command(AgentCommand::Action {
                 kind, target_id, ..
             }) => {
@@ -2928,7 +3861,7 @@ mod tests {
     #[test]
     fn raw_attackoff_preserves_direct_action() {
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        match parse_slash("/raw attackoff", &entities, origin(), Some(7), None) {
+        match parse_slash_t("/raw attackoff", &entities, origin(), Some(7), None) {
             SlashOutcome::Command(AgentCommand::Action { kind, .. }) => {
                 assert!(matches!(kind, ActionKind::AttackOff));
             }
@@ -2939,7 +3872,7 @@ mod tests {
     #[test]
     fn cast_with_explicit_target_and_ground_coords() {
         // `/cast 257 99 7 1.0 0.0 2.0` → Tractor (id=257) ground-targeted at (1,0,2).
-        match parse_slash(
+        match parse_slash_t(
             "/cast 257 99 7 1.0 0.0 2.0",
             &empty_entities(),
             origin(),
@@ -2971,7 +3904,7 @@ mod tests {
     #[test]
     fn cast_defaults_target_to_current() {
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        match parse_slash("/cast 1", &entities, origin(), Some(7), None) {
+        match parse_slash_t("/cast 1", &entities, origin(), Some(7), None) {
             SlashOutcome::Command(AgentCommand::Action {
                 target_id,
                 kind: ActionKind::CastMagic { spell_id, .. },
@@ -2987,7 +3920,7 @@ mod tests {
     #[test]
     fn weaponskill_basic() {
         let entities = vec![ent(7, "Mob", EntityKind::Mob, 0.0, 0.0)];
-        match parse_slash("/ws 16 7", &entities, origin(), Some(7), None) {
+        match parse_slash_t("/ws 16 7", &entities, origin(), Some(7), None) {
             SlashOutcome::Command(AgentCommand::Action {
                 kind: ActionKind::Weaponskill { skill_id },
                 target_id,
@@ -3002,7 +3935,7 @@ mod tests {
 
     #[test]
     fn job_ability_defaults_to_zero_target() {
-        match parse_slash("/ja 88", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/ja 88", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::Action {
                 target_id,
                 kind: ActionKind::JobAbility { ability_id },
@@ -3017,7 +3950,7 @@ mod tests {
 
     #[test]
     fn useitem_basic() {
-        match parse_slash("/useitem 0 4 4112", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/useitem 0 4 4112", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::UseItem {
                 container,
                 slot,
@@ -3038,27 +3971,21 @@ mod tests {
     #[test]
     fn endevent_aliases_dispatch_end_event() {
         for input in ["/endevent", "/endevt", "/clearevent", "/clearevt"] {
-            match parse_slash(input, &empty_entities(), origin(), None, None) {
+            match parse_slash_t(input, &empty_entities(), origin(), None, None) {
                 SlashOutcome::Command(AgentCommand::EndEvent) => {}
                 other => panic!("input {input:?}: expected EndEvent, got {other:?}"),
             }
         }
     }
 
-    /// `/endcutscene` with no arg resolves the CSID from the current
-    /// zone. Northern San d'Oria (zone 231) is the canonical test case
-    /// from `New_Character_Cutscenes.lua` (CSID 535).
+    /// `/endcutscene` with no arg emits `event_num = None`. The
+    /// dispatcher resolves it against the live `DialogState` /
+    /// start-zone fallback at send time, not at parse time.
     #[test]
-    fn endcutscene_resolves_zone_to_csid() {
-        match parse_slash(
-            "/endcutscene",
-            &empty_entities(),
-            origin(),
-            None,
-            Some(231),
-        ) {
-            SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, 535),
-            other => panic!("expected EndCutscene{{ 535 }}, got {other:?}"),
+    fn endcutscene_no_arg_returns_none() {
+        match parse_slash_t("/endcutscene", &empty_entities(), origin(), None, Some(231)) {
+            SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, None),
+            other => panic!("expected EndCutscene{{ None }}, got {other:?}"),
         }
     }
 
@@ -3067,43 +3994,22 @@ mod tests {
     /// `/endcutscene 7`.
     #[test]
     fn endcutscene_with_explicit_csid_overrides_zone_lookup() {
-        match parse_slash(
+        match parse_slash_t(
             "/endcutscene 7",
             &empty_entities(),
             origin(),
             None,
             Some(235), // Bastok Markets — zone lookup would return 0
         ) {
-            SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, 7),
-            other => panic!("expected EndCutscene{{ 7 }}, got {other:?}"),
-        }
-    }
-
-    /// Non-starting-zone with no explicit CSID is an error: no
-    /// guesswork, no silent dispatch.
-    #[test]
-    fn endcutscene_unknown_zone_no_arg_errors() {
-        match parse_slash(
-            "/endcutscene",
-            &empty_entities(),
-            origin(),
-            None,
-            Some(0xABCD), // not in the table
-        ) {
-            SlashOutcome::SystemMessage(msg) => {
-                assert!(
-                    msg.contains("starting nation") || msg.contains("CSID"),
-                    "unexpected message: {msg}"
-                );
-            }
-            other => panic!("expected SystemMessage, got {other:?}"),
+            SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, Some(7)),
+            other => panic!("expected EndCutscene{{ Some(7) }}, got {other:?}"),
         }
     }
 
     /// Bad numeric arg → operator-facing error, not silent.
     #[test]
     fn endcutscene_bad_csid_errors() {
-        match parse_slash(
+        match parse_slash_t(
             "/endcutscene abc",
             &empty_entities(),
             origin(),
@@ -3115,17 +4021,28 @@ mod tests {
         }
     }
 
+    /// `/release` and `/unwedge` both emit a chat-routed `!release` so
+    /// LSB's `release.lua` runs `player:release()` →
+    /// `endCurrentEvent()`. Pins the wire shape and the alias list.
+    #[test]
+    fn release_aliases_emit_bang_release_chat() {
+        for input in ["/release", "/unwedge"] {
+            match parse_slash_t(input, &empty_entities(), origin(), None, None) {
+                SlashOutcome::Command(AgentCommand::Chat { kind, text }) => {
+                    assert_eq!(kind, 0, "input {input:?}: expected Say (kind=0)");
+                    assert_eq!(text, "!release", "input {input:?}: unexpected text");
+                }
+                other => panic!("input {input:?}: expected Chat(!release), got {other:?}"),
+            }
+        }
+    }
+
     /// Alias coverage: every documented spelling produces the same outcome.
     #[test]
     fn endcutscene_aliases_all_work() {
-        for input in [
-            "/endcutscene",
-            "/endcs",
-            "/skipcutscene",
-            "/skipcs",
-        ] {
-            match parse_slash(input, &empty_entities(), origin(), None, Some(231)) {
-                SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, 535),
+        for input in ["/endcutscene", "/endcs", "/skipcutscene", "/skipcs"] {
+            match parse_slash_t(input, &empty_entities(), origin(), None, Some(231)) {
+                SlashOutcome::EndCutscene { event_num } => assert_eq!(event_num, None),
                 other => panic!("input {input:?}: expected EndCutscene, got {other:?}"),
             }
         }
@@ -3134,7 +4051,7 @@ mod tests {
     #[test]
     fn raisemenu_accept_and_decline() {
         for (input, expected) in &[("/raisemenu accept", true), ("/raisemenu decline", false)] {
-            match parse_slash(input, &empty_entities(), origin(), None, None) {
+            match parse_slash_t(input, &empty_entities(), origin(), None, None) {
                 SlashOutcome::Command(AgentCommand::Action {
                     kind: ActionKind::RaiseMenu { accept },
                     ..
@@ -3147,7 +4064,7 @@ mod tests {
     #[test]
     fn tractormenu_accept_and_decline() {
         for (input, expected) in &[("/tractormenu y", true), ("/tractormenu n", false)] {
-            match parse_slash(input, &empty_entities(), origin(), None, None) {
+            match parse_slash_t(input, &empty_entities(), origin(), None, None) {
                 SlashOutcome::Command(AgentCommand::Action {
                     kind: ActionKind::TractorMenu { accept },
                     ..
@@ -3159,7 +4076,7 @@ mod tests {
 
     #[test]
     fn homepointmenu_parses_status_id() {
-        match parse_slash("/homepointmenu 0", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/homepointmenu 0", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::Action {
                 kind: ActionKind::HomepointMenu { status_id },
                 ..
@@ -3171,14 +4088,14 @@ mod tests {
     #[test]
     fn snapshot_is_direct() {
         assert!(matches!(
-            parse_slash("/snapshot", &empty_entities(), origin(), None, None),
+            parse_slash_t("/snapshot", &empty_entities(), origin(), None, None),
             SlashOutcome::Command(AgentCommand::Snapshot)
         ));
     }
 
     #[test]
     fn bank_parses_threshold_and_zoneline() {
-        match parse_slash(
+        match parse_slash_t(
             "/bank 60 0xDEADBEEF",
             &empty_entities(),
             origin(),
@@ -3190,7 +4107,7 @@ mod tests {
             }
             _ => {}
         }
-        match parse_slash("/bank 60 12345", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/bank 60 12345", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::BankWhenFull {
                 threshold,
                 mog_house_zoneline,
@@ -3204,7 +4121,7 @@ mod tests {
 
     #[test]
     fn zonechange_parses_line_id() {
-        match parse_slash("/zonechange 42", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/zonechange 42", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::RequestZoneChange { line_id }) => {
                 assert_eq!(line_id, 42);
             }
@@ -3214,7 +4131,7 @@ mod tests {
 
     #[test]
     fn mhexit_defaults_to_home() {
-        match parse_slash("/mhexit", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/mhexit", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
                 assert!(matches!(kind, crate::state::MogHouseExit::Home));
                 assert_eq!(kind.wire_pair(), (1, 0));
@@ -3225,7 +4142,7 @@ mod tests {
 
     #[test]
     fn mhexit_region_with_slot() {
-        match parse_slash("/mhexit bastok 2", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/mhexit bastok 2", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
                 assert!(matches!(
                     kind,
@@ -3244,7 +4161,7 @@ mod tests {
             ("/mhexit 2f", 125),
             ("/mhexit garden", 127),
         ] {
-            match parse_slash(input, &empty_entities(), origin(), None, None) {
+            match parse_slash_t(input, &empty_entities(), origin(), None, None) {
                 SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
                     let (_, mode) = kind.wire_pair();
                     assert_eq!(mode, *expected_mode, "input={input}");
@@ -3258,7 +4175,7 @@ mod tests {
     fn mhexit_auto_resolves_known_zone() {
         // S. San d'Oria (zone 230) is in the Sandoria region (bit 1); auto
         // picks Option1 = S.Sandy. wire_pair → (1, 1).
-        match parse_slash("/mhexit auto", &empty_entities(), origin(), None, Some(230)) {
+        match parse_slash_t("/mhexit auto", &empty_entities(), origin(), None, Some(230)) {
             SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
                 assert!(matches!(
                     kind,
@@ -3274,7 +4191,7 @@ mod tests {
     fn mhexit_auto_errors_for_unknown_zone() {
         // Open-world zone (e.g. Ronfaure = 100) isn't in a Mog House region,
         // so `auto` returns a usage error rather than guessing.
-        match parse_slash("/mhexit auto", &empty_entities(), origin(), None, Some(100)) {
+        match parse_slash_t("/mhexit auto", &empty_entities(), origin(), None, Some(100)) {
             SlashOutcome::SystemMessage(msg) => {
                 assert!(msg.contains("auto"), "got: {msg}");
             }
@@ -3291,7 +4208,7 @@ mod tests {
             ("/agent status", AgentControlOp::Status),
             ("/agent", AgentControlOp::Status),
         ] {
-            match parse_slash(input, &empty_entities(), origin(), None, None) {
+            match parse_slash_t(input, &empty_entities(), origin(), None, None) {
                 SlashOutcome::AgentControl(op) => assert_eq!(&op, expected, "input: {input}"),
                 other => panic!("expected AgentControl for `{input}`, got {other:?}"),
             }
@@ -3300,7 +4217,7 @@ mod tests {
 
     #[test]
     fn agent_unknown_subcommand_is_system_message() {
-        match parse_slash("/agent wat", &empty_entities(), origin(), None, None) {
+        match parse_slash_t("/agent wat", &empty_entities(), origin(), None, None) {
             SlashOutcome::SystemMessage(s) => assert!(s.contains("wat")),
             other => panic!("expected SystemMessage, got {other:?}"),
         }
@@ -3430,7 +4347,7 @@ mod tests {
             // the GUI side effect of closing the window.
         ];
         for (slash, pred) in &cases {
-            let out = parse_slash(slash, &entities, pos, cur, None);
+            let out = parse_slash_t(slash, &entities, pos, cur, None);
             match out {
                 SlashOutcome::Command(ref cmd) => assert!(
                     pred(cmd),
@@ -3445,7 +4362,7 @@ mod tests {
     #[test]
     fn help_command_returns_multiline_listing() {
         for slash in ["/help", "/?"] {
-            let out = parse_slash(slash, &empty_entities(), origin(), None, None);
+            let out = parse_slash_t(slash, &empty_entities(), origin(), None, None);
             match out {
                 SlashOutcome::SystemMessage(s) => {
                     assert!(
@@ -3481,7 +4398,7 @@ mod tests {
             for entry in *entries {
                 for alias in entry.aliases {
                     let slash = format!("/{alias}");
-                    let out = parse_slash(&slash, &empty_entities(), origin(), None, None);
+                    let out = parse_slash_t(&slash, &empty_entities(), origin(), None, None);
                     if let SlashOutcome::SystemMessage(ref s) = out {
                         assert!(
                             !s.starts_with("unknown command:"),

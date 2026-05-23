@@ -128,6 +128,105 @@ pub fn walk(bytes: &[u8]) -> ChunkWalker<'_> {
     ChunkWalker::new(bytes)
 }
 
+/// One node in a DAT chunk *tree*. Built by [`walk_tree`].
+///
+/// FFXI DATs are hierarchical: `Rmp` chunks (kind 0x01) open a new
+/// container, all subsequent chunks become its children, and a
+/// `Terminate` chunk (kind 0x00) closes the container. lotus-ffxi's
+/// `dat.cpp` uses this tree to scope chunk lookups — e.g. when
+/// loading a character mesh, it iterates **only direct children of
+/// the root container**, ignoring OS2 chunks nested inside child
+/// `Rmp`s (which would be LOD variants, mirror copies, etc.).
+///
+/// Our flat [`walk`] returns *all* chunks regardless of structure,
+/// which can over-collect geometry from nested containers and cause
+/// duplicated mesh artifacts. Use `walk_tree` when faithfulness to
+/// lotus's scoping rules matters.
+#[derive(Debug, Clone)]
+pub struct ChunkNode<'a> {
+    pub chunk: Chunk<'a>,
+    pub children: Vec<ChunkNode<'a>>,
+}
+
+/// Build a chunk tree mirroring lotus-ffxi's `dat.cpp` parser.
+///
+/// Returns a synthetic root whose `children` are the top-level
+/// containers. In practice FFXI character DATs have exactly one
+/// top-level `Rmp` (e.g. `1mt_` for slot-1 Mithra), so the typical
+/// usage is `tree.children[0].children` for "the equipment's actual
+/// content."
+///
+/// Parsing rules (from `dat.cpp:67-86`):
+/// - `Terminate` (kind 0x00) pops back to parent (no-op at root).
+/// - `Rmp` (kind 0x01) creates a new container and **becomes** the
+///   active container — all subsequent chunks attach to it until a
+///   Terminate closes it.
+/// - Every other kind becomes a child of the current container.
+///
+/// Malformed input (extra Terminates, unclosed Rmps) is tolerated:
+/// the tree is whatever the bytes describe, and the caller can
+/// inspect what's present.
+pub fn walk_tree<'a>(bytes: &'a [u8]) -> ChunkNode<'a> {
+    // Synthetic root: a zero-info chunk that owns the top-level
+    // containers. Lets us treat the buffer's start as a "current
+    // container" without special-casing the first Rmp.
+    let synthetic_root = Chunk {
+        name: [0; 4],
+        kind: 0xFF,
+        data: &[],
+        offset: 0,
+    };
+    let mut root = ChunkNode {
+        chunk: synthetic_root,
+        children: Vec::new(),
+    };
+    // Stack of indices into the tree. Each entry is a path of
+    // children-indices from `root` to the currently-open container.
+    // We store paths rather than &mut references because nested
+    // mutable borrows of a tree are awkward in safe Rust.
+    let mut path: Vec<usize> = Vec::new();
+
+    fn at_path<'r, 'a>(root: &'r mut ChunkNode<'a>, path: &[usize]) -> &'r mut ChunkNode<'a> {
+        let mut cur = root;
+        for &i in path {
+            cur = &mut cur.children[i];
+        }
+        cur
+    }
+
+    for result in walk(bytes) {
+        let Ok(chunk) = result else { continue };
+        match chunk.kind {
+            0x00 => {
+                // Terminate: pop. If already at root, ignore (lotus does
+                // `current_chunk = current_chunk->parent` which would
+                // null at root; safer to clamp).
+                path.pop();
+            }
+            0x01 => {
+                // Rmp: append to current container, then descend into it.
+                let cur = at_path(&mut root, &path);
+                let idx = cur.children.len();
+                cur.children.push(ChunkNode {
+                    chunk,
+                    children: Vec::new(),
+                });
+                path.push(idx);
+            }
+            _ => {
+                // Any other chunk: append as child of current container.
+                let cur = at_path(&mut root, &path);
+                cur.children.push(ChunkNode {
+                    chunk,
+                    children: Vec::new(),
+                });
+            }
+        }
+    }
+
+    root
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

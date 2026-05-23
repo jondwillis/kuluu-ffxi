@@ -29,7 +29,7 @@ use bevy::image::Image;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use ffxi_dat::mmb::{MmbHeader, MmbSubRecord};
+use ffxi_dat::mmb::{parse_models, MmbHeader};
 use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::{mmb, walk, ChunkKind, DatRoot};
 
@@ -122,6 +122,12 @@ impl Plugin for DatOverlayPlugin {
                 (
                     crate::dat_mzb::cull_entities_by_distance,
                     crate::dat_mzb::apply_zone_geom_visibility,
+                    // `tick_skinned_actors` is registered in `lib.rs`
+                    // alongside its `combat_stance::track_entity_motion_system`
+                    // `.before(...)` ordering constraint — don't add it
+                    // here too or `.before(tick_skinned_actors)` becomes
+                    // an ambiguous SystemTypeSet and Bevy panics at
+                    // schedule init.
                 ),
             );
         // Phase 1 `cull_mzb_by_distance` was removed: Phase 3 merged
@@ -141,6 +147,12 @@ pub struct MmbSubMesh {
     pub uvs: Vec<[f32; 2]>,
     pub colors: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
+    /// Raw blending field from `SMMBModelHeader.blending`. Bit 0x8000
+    /// marks alpha-blended (translucent) geometry in lotus's pipeline
+    /// (`mesh->has_transparency = mmb_mesh.blending & 0x8000`). We
+    /// only check that bit at material-build time; the rest of the
+    /// field's bit-meaning is undocumented.
+    pub blending: u16,
 }
 
 /// One named IMG chunk decoded into RGBA. The `name` is the 8-byte
@@ -201,14 +213,18 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
 
     let decrypted = mmb::decrypt(chunk.data).map_err(|e| format!("decrypt: {e}"))?;
     let header = MmbHeader::parse(&decrypted).map_err(|e| format!("header parse: {e}"))?;
-    let subs = MmbSubRecord::find_all(header.payload);
+    // Structural walk (lotus-parity). The previous heuristic scanner
+    // (`MmbSubRecord::find_all`) found ASCII-looking 16-byte windows
+    // and missed real per-submesh records embedded in city assets —
+    // verified live against tshimonorig_06: scanner returned 2 of
+    // many submeshes, the structural walker returns all of them.
+    let models = parse_models(&decrypted);
 
-    // Stage 5b: scrape IMG chunks from the same DAT. Many files have
-    // dozens of IMGs (file 200 = 53; file 133 = 47); a *correct*
-    // submesh→texture pairing would route through MMB tex0/test00
-    // sub-records, but those aren't decoded yet. The first decodable
-    // IMG is what we'll bind to all submeshes for now — adequate for
-    // single-material props (Wells, HomePoints, MogHouse furniture).
+    // Scrape IMG chunks from the same DAT. Many files have dozens of
+    // IMGs (file 200 = 53; file 133 = 47). Each model's 8-byte texture
+    // name (from the last half of `SMMBModelHeader.textureName`) is
+    // paired against `NamedTexture.name` at spawn time; unmatched
+    // submeshes fall back to the first decodable IMG.
     let textures: Vec<NamedTexture> = chunks
         .iter()
         .filter(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::Img))
@@ -219,60 +235,72 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
         })
         .collect();
 
-    let mut out = Vec::with_capacity(subs.len());
-    for sub in &subs {
-        // Skip sub-records that aren't the standard `"model   "` tag —
-        // clod-style and other tags use a different body layout that
-        // `parse_vertices` cannot decode as 36-byte-stride. Without
-        // this filter, mis-parsed vertices appear as enormous shards
-        // radiating from each placement (Phase 8 / task #18).
-        if !sub.tag.starts_with(b"model") {
+    let mut out = Vec::with_capacity(models.len());
+    for m in &models {
+        if m.vertices.is_empty() || m.indices.is_empty() {
             continue;
         }
-        // Skip sub-records whose body can't fit a 36-byte vertex stride
-        // for the declared count, or whose strip yields no triangles
-        // after restart/winding decode.
-        let Some(verts) = sub.parse_vertices() else {
-            continue;
-        };
-        let tris = sub.parse_triangle_list();
-        if tris.is_empty() {
+        // Sanity check: real FFXI zone props are well within ±10000
+        // yards of origin. The structural walker already chooses the
+        // right vertex stride (36 vs 48), so this should almost never
+        // fire — kept as a defense against malformed/truncated DATs.
+        const COORD_SANE_LIMIT: f32 = 10_000.0;
+        if m.vertices.iter().any(|v| {
+            v.pos
+                .iter()
+                .any(|c| !c.is_finite() || c.abs() > COORD_SANE_LIMIT)
+        }) {
             continue;
         }
-        let positions: Vec<[f32; 3]> = verts.iter().map(|v| v.pos).collect();
-        let normals: Vec<[f32; 3]> = verts.iter().map(|v| v.normal).collect();
-        let uvs: Vec<[f32; 2]> = verts.iter().map(|v| v.uv).collect();
-        let colors: Vec<[f32; 4]> = verts
+        let positions: Vec<[f32; 3]> = m.vertices.iter().map(|v| v.pos).collect();
+        let normals: Vec<[f32; 3]> = m.vertices.iter().map(|v| v.normal).collect();
+        let uvs: Vec<[f32; 2]> = m.vertices.iter().map(|v| v.uv).collect();
+        // FFXI vertex colors use the "0x80 = 1.0" working range
+        // convention (lotus mmb.cppm:342-343 divides by 128 for all
+        // channels). Byte 128 = fully lit, byte 255 = "overbright"
+        // up to 2x. We previously divided by 255, halving FFXI's
+        // intended brightness on every MMB — visible as the dim/dark
+        // feel in earlier zone renders. It also pushed vertex alpha
+        // into the 0..0.5 range, which multiplied with our
+        // remapped-to-binary texture alpha (1.0) put `Mask(0.5)`
+        // right at its threshold and discarded most leaf pixels.
+        //
+        // Switch all channels to /128 to match lotus. HDR + TonyMcMapface
+        // tonemapping handles the >1.0 values gracefully (gives nice
+        // highlights instead of clipping).
+        let colors: Vec<[f32; 4]> = m
+            .vertices
             .iter()
             .map(|v| {
                 [
-                    v.rgba[0] as f32 / 255.0,
-                    v.rgba[1] as f32 / 255.0,
-                    v.rgba[2] as f32 / 255.0,
-                    v.rgba[3] as f32 / 255.0,
+                    v.rgba[0] as f32 / 128.0,
+                    v.rgba[1] as f32 / 128.0,
+                    v.rgba[2] as f32 / 128.0,
+                    v.rgba[3] as f32 / 128.0,
                 ]
             })
             .collect();
-        // Drop triangles whose indices reference past the actual
-        // vertex array. The strip-length header at the head of the
-        // index buffer and stray strip-restart sentinels can encode
-        // u16 values well above the vertex count; rendering them
-        // samples adjacent-buffer garbage and produces enormous
-        // shards that stretch out from the placement point. Bounds-
-        // check here keeps the visible geometry tight.
-        let vert_count = verts.len() as u16;
-        let indices: Vec<u32> = tris
-            .iter()
+        // Defense-in-depth bounds-check against the vertex array.
+        // `parse_models` produces well-formed indices, but a truncated
+        // DAT could still feed us bad bytes.
+        let vert_count = m.vertices.len() as u16;
+        let indices: Vec<u32> = m
+            .indices
+            .chunks_exact(3)
             .filter(|t| t[0] < vert_count && t[1] < vert_count && t[2] < vert_count)
             .flat_map(|t| [t[0] as u32, t[1] as u32, t[2] as u32])
             .collect();
+        if indices.is_empty() {
+            continue;
+        }
         out.push(MmbSubMesh {
-            variant_name: sub.variant_name_str(),
+            variant_name: m.texture_name.clone(),
             positions,
             normals,
             uvs,
             colors,
             indices,
+            blending: m.blending,
         });
     }
 
@@ -284,10 +312,58 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
     })
 }
 
+// Earlier alpha-probing attempts (any α<255; ≥1% pixels with α<16)
+// produced dithered-checkerboard rendering on FFXI textures because
+// FFXI authors alpha in a 0..128 working range ("0x80 = 1.0"
+// convention, same as its vertex-color decode). Empirical data from
+// Ronfaure (DAT 200 chunk 1165, `ron_wf`) shows alpha ranges like
+// [0..136] — not [0..255]. Lotus's MMB shader (mmb.slang::FragmentBlend)
+// remaps this on the fly: `bc2_alpha = raw >> 4`,
+// `output.alpha = bc2_alpha / 8.0` (clamped to 1.0). We bake the
+// equivalent remap into the texture at decode time below.
+
+/// Lotus-parity alpha remap. Input is the raw FFXI alpha byte;
+/// output is the value Bevy's `AlphaMode::Blend` should use as the
+/// blend factor.
+///
+/// Formula (lotus mmb.slang:107-110):
+///   `bc2_alpha = raw >> 4`       (extract 4-bit value, 0..15)
+///   `out_float = bc2_alpha / 8.0` (range 0..1.875, clamped to 1.0)
+///   `out_byte  = round(out_float * 255)`
+///
+/// Producing the table:
+///   raw 0..15   → 0   (lotus: discard; we'll let Blend handle it)
+///   raw 16..31  → 32
+///   raw 32..47  → 64
+///   raw 48..63  → 96
+///   raw 64..79  → 128
+///   raw 80..95  → 160
+///   raw 96..111 → 191
+///   raw 112..127→ 223
+///   raw 128..255→ 255 (clamped)
+#[inline]
+fn ffxi_alpha_remap(raw: u8) -> u8 {
+    // Float math (not integer) so we match lotus's `bc2_alpha / 8.0`
+    // exactly — integer division of `(1 * 255) / 8` yields 31, but
+    // lotus's float math `1/8 * 255 = 31.875` rounds to 32.
+    let bc2 = (raw >> 4) as f32; // 0..15
+    let scaled = bc2 * 255.0 / 8.0;
+    scaled.min(255.0).round() as u8
+}
+
 /// Convert a [`DecodedTexture`] into a Bevy [`Image`] asset. The
 /// texture decoder produces top-mip RGBA8 already; we just wrap it in
-/// the asset type Bevy expects for `base_color_texture`.
+/// the asset type Bevy expects for `base_color_texture` after
+/// remapping alpha bytes per [`ffxi_alpha_remap`].
 fn decoded_texture_to_image(t: &DecodedTexture) -> Image {
+    // Apply lotus's alpha remap. Opaque-mode submeshes ignore alpha
+    // entirely, so for them this is harmless. Blend-mode submeshes
+    // get correctly-scaled opacity (raw 128+ → fully opaque leaf
+    // body, raw 0 → fully transparent hole).
+    let mut rgba = t.rgba.clone();
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = ffxi_alpha_remap(px[3]);
+    }
     let mut img = Image::new(
         Extent3d {
             width: t.width,
@@ -295,7 +371,7 @@ fn decoded_texture_to_image(t: &DecodedTexture) -> Image {
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        t.rgba.clone(),
+        rgba,
         // sRGB — FFXI textures are authored for the gamma-encoded color
         // pipeline; using `Rgba8UnormSrgb` lets Bevy linearize correctly
         // for PBR lighting.
@@ -356,11 +432,42 @@ pub fn process_load_mmb_requests(
         return;
     }
 
+    // Tracks which (file_id, chunk_idx) MMBs we've already emitted a
+    // "MMB texture pool" diagnostic for in this frame. Without this
+    // the log fires once per zone-load placement (thousands of times
+    // for a city); with it, exactly once per unique asset per frame.
+    let mut mmb_logged: std::collections::HashSet<(u32, usize)> = std::collections::HashSet::new();
+
     // Cache one LoadedMmb per (file_id, chunk_idx).
     let mut mmb_cache: std::collections::HashMap<(u32, usize), Option<LoadedMmb>> =
         std::collections::HashMap::new();
+
+    // DIAG-zonegeom: remove after fix. Aggregator for the sibling
+    // diagnostic in build_zone_mmb_spawns — counts and exemplars of
+    // zero-submesh MMBs per file_id (cause (B) candidates: clod-style
+    // sub-records mis-parsed). Gated on `FFXI_DIAG_ZONE_GEOM` exactly
+    // like the MZB-side diag (file_id direct, or `=all`/`=*`/`=any`).
+    let diag_file_id: Option<u32> = match std::env::var("FFXI_DIAG_ZONE_GEOM") {
+        Ok(s) if s == "*" || s == "all" || s.eq_ignore_ascii_case("any") => Some(u32::MAX),
+        Ok(s) => s.parse::<u32>().ok(),
+        _ => None,
+    };
+    let mut diag_zero_submesh: std::collections::HashMap<u32, Vec<(usize, String)>> =
+        std::collections::HashMap::new();
+    let mut diag_loaded: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut diag_load_failed: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    let diag_matches = |fid: u32| -> bool {
+        match diag_file_id {
+            Some(u32::MAX) => true,
+            Some(want) => want == fid,
+            None => false,
+        }
+    };
     // Cache image handles per file_id (each IMG chunk in a DAT is
     // shared across all MMBs from that file).
+    // Per-DAT pool: name → image handle, plus a first-IMG fallback
+    // for submeshes whose texture name doesn't appear in the pool.
     let mut tex_pools: std::collections::HashMap<
         u32,
         (
@@ -378,10 +485,29 @@ pub fn process_load_mmb_requests(
                 &mut scene_state,
                 format!("/load_mmb {} {}: load failed", req.file_id, req.chunk_idx),
             );
+            // DIAG-zonegeom: remove after fix.
+            if diag_matches(req.file_id) {
+                *diag_load_failed.entry(req.file_id).or_insert(0) += 1;
+            }
             continue;
         };
 
+        // DIAG-zonegeom: remove after fix.
+        if diag_matches(req.file_id) {
+            *diag_loaded.entry(req.file_id).or_insert(0) += 1;
+        }
+
         if loaded.submeshes.is_empty() {
+            // DIAG-zonegeom: remove after fix. Capture cause (B)
+            // candidates: zone-spawn MMBs (world_transform is Some)
+            // that produce zero sub-records get silently skipped in
+            // the chat HUD path below — log them here so we see them.
+            if diag_matches(req.file_id) {
+                diag_zero_submesh
+                    .entry(req.file_id)
+                    .or_default()
+                    .push((req.chunk_idx, loaded.asset_name.clone()));
+            }
             // Suppress for zone-spawn events (req.world_transform is
             // Some). Hundreds of MMBs in a city zone are clod-style
             // sub-records we don't decode yet (task #18); spamming
@@ -420,6 +546,90 @@ pub fn process_load_mmb_requests(
         });
         let tex_by_name = &pool.0;
         let first_texture = pool.1.clone();
+
+        // Per-MMB diagnostic: log once per (file_id, chunk_idx) per
+        // frame so we can see blending values + texture alpha ranges
+        // for every distinct asset. Most zone loads only fire the
+        // first time the player zones in; the per-frame retry is a
+        // wash because mmb_cache deduplicates loads.
+        // Enable with `RUST_LOG=ffxi_viewer_core::dat_mmb=info`.
+        if mmb_logged.insert((req.file_id, req.chunk_idx)) {
+            // `SMMBHeader.pieces` (lotus mmb.cppm:98) sits at the first
+            // 4 bytes of the payload — i.e. decrypted bytes 32..36 from
+            // the file. We don't yet decode the block headers, so we
+            // just probe `pieces` to compare against what our heuristic
+            // scanner actually returned. A mismatch (pieces > 0 but
+            // we see far fewer than `numModel * pieces` submeshes)
+            // tells us the scanner is missing structural records.
+            // Alpha range per IMG texture: lets us see whether a
+            // transparency-flagged submesh's texture actually carries
+            // varying alpha (real cutout art) or is flat all-255
+            // (the architectural limit case — even lotus's FragmentBlend
+            // would render this opaque).
+            //
+            // Format: ["texname α[min..max]", …] sorted by name.
+            let mut img_stats: Vec<(String, u8, u8)> = loaded
+                .textures
+                .iter()
+                .filter(|nt| !nt.name.is_empty())
+                .map(|nt| {
+                    let (mut amin, mut amax) = (255u8, 0u8);
+                    for px in nt.texture.rgba.chunks_exact(4) {
+                        amin = amin.min(px[3]);
+                        amax = amax.max(px[3]);
+                    }
+                    (nt.name.clone(), amin, amax)
+                })
+                .collect();
+            img_stats.sort_by(|a, b| a.0.cmp(&b.0));
+            let img_names: Vec<String> = img_stats
+                .into_iter()
+                .map(|(n, amin, amax)| format!("{n} α[{amin}..{amax}]"))
+                .collect();
+            let mut requested: Vec<&str> = loaded
+                .submeshes
+                .iter()
+                .map(|s| s.variant_name.as_str())
+                .collect();
+            requested.sort_unstable();
+            requested.dedup();
+            let (matched, unmatched): (Vec<&str>, Vec<&str>) = requested
+                .iter()
+                .partition(|n| tex_by_name.contains_key(**n));
+            // Per-submesh blending dump — used to verify whether tree-
+            // leaf and similar foliage submeshes have `0x8000` set
+            // (which would trigger our AlphaMode::Blend path) or not
+            // (in which case lotus also renders them as opaque
+            // rectangles and we'd need to replicate its
+            // mmb.slang::FragmentBlend logic in a custom material).
+            //
+            // Format: ["texname:0xBLEND", ...] — sorted by texname so
+            // grep-friendly across runs.
+            let mut blending_view: Vec<(String, u16)> = loaded
+                .submeshes
+                .iter()
+                .map(|s| (s.variant_name.clone(), s.blending))
+                .collect();
+            blending_view.sort_by(|a, b| a.0.cmp(&b.0));
+            let blending_strs: Vec<String> = blending_view
+                .into_iter()
+                .map(|(name, b)| format!("{name}:0x{b:04X}"))
+                .collect();
+            info!(
+                target: "ffxi_viewer_core::dat_mmb",
+                file_id = req.file_id,
+                chunk_idx = req.chunk_idx,
+                asset = %loaded.asset_name,
+                submesh_count = loaded.submeshes.len(),
+                img_count = tex_by_name.len(),
+                imgs = ?img_names,
+                matched = ?matched,
+                unmatched = ?unmatched,
+                blending = ?blending_strs,
+                first_fallback = first_texture.is_some(),
+                "MMB texture pool",
+            );
+        }
 
         // Two parenting modes:
         //
@@ -464,7 +674,19 @@ pub fn process_load_mmb_requests(
                     None => Transform::from_translation(req.world_pos),
                 };
                 let is_zone_spawn = req.entity_id.is_none() && req.world_transform.is_some();
-                let mut e = commands.spawn((MmbOverlay, parent_transform, Visibility::default()));
+                // Tag with `InGameEntity` so `OnExit(AppPhase::InGame)`
+                // recursively despawns this parent and every submesh
+                // child below it. Without the marker, zone-spawned
+                // props (textured buildings, walls, foliage — the bulk
+                // of what you see in a city zone) and free `/load_mmb`
+                // overlays survived /logout and stayed rendered behind
+                // the launcher.
+                let mut e = commands.spawn((
+                    MmbOverlay,
+                    crate::components::InGameEntity,
+                    parent_transform,
+                    Visibility::default(),
+                ));
                 if is_zone_spawn {
                     e.insert(crate::dat_mzb::AutoMzbOverlay);
                 }
@@ -490,6 +712,40 @@ pub fn process_load_mmb_requests(
                 .cloned()
                 .or_else(|| first_texture.clone());
 
+            // Alpha mode is driven by `SMMBModelHeader.blending`:
+            //   any non-zero blending bit → AlphaMode::Mask(0.5)
+            //   blending == 0             → AlphaMode::Opaque
+            //
+            // Why "any non-zero" and not "& 0x8000" (which is lotus's
+            // check at mmb.cppm:501): empirically, FFXI uses multiple
+            // bits in this field. Ronfaure trees (asset
+            // `tshimonoyama_1_m`) flag leaves as `0x8000`, but San
+            // d'Oria plants (asset `tshimono_plant_03`) flag leaves
+            // as `0x2000`. Both are foliage textures with cutout
+            // intent. Lotus's narrow check means it would render the
+            // plant opaque too — we can do better by recognising any
+            // non-zero blending as a transparency signal.
+            //
+            // We use *Mask*, not Blend, because FFXI authors the
+            // "transparent" regions of leaf/foliage textures with
+            // dark RGB. Bevy's Blend mode multiplies `src.rgb *
+            // src.alpha + dst * (1-α)`; at α≈0 the dark src still
+            // contributes ~0 (correct), but mipmap-blended edge
+            // pixels with α≈0.5 contribute ~50% of their dark RGB,
+            // producing visible black outlines around leaf
+            // silhouettes. Mask discards below-threshold pixels
+            // entirely so those dark pixels never reach the
+            // framebuffer.
+            //
+            // The remap from `ffxi_alpha_remap` (lotus's bc2 / 8.0
+            // formula) pushes typical foliage textures with raw
+            // α[0..136] into a near-binary 0/255 distribution, so
+            // threshold 0.5 cleanly separates leaf from hole.
+            let alpha_mode = if sub.blending != 0 {
+                AlphaMode::Mask(0.5)
+            } else {
+                AlphaMode::Opaque
+            };
             let mat = materials.add(StandardMaterial {
                 // WHITE so the mesh's per-vertex `ATTRIBUTE_COLOR`
                 // (FFXI's baked vertex lighting) and the bound
@@ -498,19 +754,9 @@ pub fn process_load_mmb_requests(
                 // base_color × vertex_color × texture.
                 base_color: Color::WHITE,
                 base_color_texture: sub_texture,
-                // UNLIT is load-bearing: FFXI MMBs ship pre-rotated
-                // vertex normals and pre-baked vertex colors (the
-                // "lighting" is already painted into the mesh data).
-                // Letting PBR re-light produces (a) visible specular
-                // → "shiny stone walls", (b) sun bleed through wall
-                // cracks at dawn/dusk, (c) dark triangular patches
-                // on floors where the pre-rotated normals point
-                // away from the engine sun. Don't disable without
-                // also stripping the baked-color/normal channels.
-                unlit: true,
-                // FFXI triangle-strip winding isn't pinned to a
-                // canonical front/back convention — render both
-                // sides instead of guessing.
+                alpha_mode,
+                perceptual_roughness: 1.0,
+                reflectance: 0.0,
                 cull_mode: None,
                 ..default()
             });
@@ -535,17 +781,17 @@ pub fn process_load_mmb_requests(
             // mounts are already targetable via the entity capsule's
             // own Pickable so adding a second one would confuse the
             // click-to-target system.
-            if is_static_placement {
-                child.insert(crate::hud::mesh_debug::mesh_debug_bundle(
-                    crate::hud::mesh_debug::MmbDebugInfo {
-                        file_id: req.file_id,
-                        chunk_idx: req.chunk_idx,
-                        sub_index,
-                        asset_name: loaded.asset_name.clone(),
-                        variant_name: sub.variant_name.trim().to_string(),
-                    },
-                ));
-            }
+            // if is_static_placement {
+            child.insert(crate::hud::mesh_debug::mesh_debug_bundle(
+                crate::hud::mesh_debug::MmbDebugInfo {
+                    file_id: req.file_id,
+                    chunk_idx: req.chunk_idx,
+                    sub_index,
+                    asset_name: loaded.asset_name.clone(),
+                    variant_name: sub.variant_name.trim().to_string(),
+                },
+            ));
+            // }
         }
 
         // Per-event spawn confirmation: only emit for manual `/load_mmb`
@@ -578,6 +824,48 @@ pub fn process_load_mmb_requests(
             );
         }
     }
+
+    // DIAG-zonegeom: remove after fix. Per-file_id summary of the
+    // current event burst (zone-in fires hundreds-to-thousands of
+    // LoadMmbRequests in one frame; subsequent frames are quiet).
+    if diag_file_id.is_some() {
+        for (fid, examples) in &diag_zero_submesh {
+            if examples.is_empty() {
+                continue;
+            }
+            let loaded = diag_loaded.get(fid).copied().unwrap_or(0);
+            let load_failed = diag_load_failed.get(fid).copied().unwrap_or(0);
+            let head: Vec<&(usize, String)> = examples.iter().take(20).collect();
+            info!(
+                target: "ffxi_viewer_core::dat_mmb::diag",
+                file_id = *fid,
+                loaded,
+                load_failed,
+                zero_submesh = examples.len(),
+                "DIAG-zonegeom zero-submesh MMBs (chunk_idx, asset_name, top 20): {head:?}",
+            );
+        }
+        // Even when zero_submesh is empty, surface the counts so we
+        // know the system saw events for the target zone.
+        for (fid, loaded) in &diag_loaded {
+            if diag_zero_submesh
+                .get(fid)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let load_failed = diag_load_failed.get(fid).copied().unwrap_or(0);
+            info!(
+                target: "ffxi_viewer_core::dat_mmb::diag",
+                file_id = *fid,
+                loaded = *loaded,
+                load_failed,
+                zero_submesh = 0,
+                "DIAG-zonegeom MMB pass: all submeshes non-empty",
+            );
+        }
+    }
 }
 
 fn push_system_msg(scene_state: &mut SceneState, text: String) {
@@ -586,9 +874,59 @@ fn push_system_msg(scene_state: &mut SceneState, text: String) {
     // buffer is server-owned and the next ingest tick overwrites it.
     // `local_toasts` persists across ticks until the cap evicts it.
     scene_state.push_local_toast(ChatLine {
-        channel: ChatChannel::System,
+        channel: ChatChannel::Debug,
         sender: "client".into(),
         text,
         server_ts: 0,
+        local_seq: 0,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The remap implements lotus's `bc2_alpha / 8.0 * 255` formula
+    /// (see `mmb.slang:107-110`). What we verify here are the three
+    /// behavioural properties that matter for the renderer — exact
+    /// step values are a consequence of the formula, not a separate
+    /// spec, so we don't pin them:
+    ///
+    /// 1. The discard band (raw 0..15) maps to 0 — gives transparent
+    ///    pixels at Mask(0.5).
+    /// 2. FFXI's "0x80 = 1.0" opaque threshold (raw 128) maps to 255
+    ///    — gives fully opaque leaf bodies.
+    /// 3. Raw values empirically seen as opaque (e.g. 136 from
+    ///    `ron_wf`'s peak) also saturate to 255.
+    /// 4. Monotonicity — the remap is non-decreasing in `raw`.
+    #[test]
+    fn ffxi_alpha_remap_obeys_lotus_spec() {
+        // Discard band.
+        assert_eq!(ffxi_alpha_remap(0), 0);
+        assert_eq!(ffxi_alpha_remap(15), 0);
+        // FFXI's "0x80 = 1.0" threshold should saturate.
+        assert_eq!(ffxi_alpha_remap(128), 255);
+        assert_eq!(ffxi_alpha_remap(136), 255); // empirical leaf peak
+        assert_eq!(ffxi_alpha_remap(255), 255);
+
+        // Monotonic: raw_i <= raw_j ⇒ remap(raw_i) <= remap(raw_j).
+        let mut prev = 0u8;
+        for raw in 0u16..=255 {
+            let cur = ffxi_alpha_remap(raw as u8);
+            assert!(
+                cur >= prev,
+                "remap not monotonic at raw={raw}: prev={prev}, cur={cur}"
+            );
+            prev = cur;
+        }
+
+        // Above-threshold band always saturated.
+        for raw in 128u16..=255 {
+            assert_eq!(
+                ffxi_alpha_remap(raw as u8),
+                255,
+                "raw {raw} should saturate to 255"
+            );
+        }
+    }
 }

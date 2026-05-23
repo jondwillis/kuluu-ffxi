@@ -33,6 +33,7 @@ use bevy::ecs::system::SystemParam;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
+use bevy::window::{PresentMode, PrimaryWindow};
 use ffxi_viewer_core::dat_mmb::LoadMmbRequest;
 use ffxi_viewer_core::dat_mzb::LoadMzbRequest;
 use ffxi_viewer_core::hud::chat_panel::ChatScroll;
@@ -43,11 +44,29 @@ use ffxi_viewer_core::{
 
 use super::debug_heights::DebugHeightsRequest;
 
+/// Tracks `/capture` toggle state and snapshots the framepace limiter
+/// that was active *before* capture-mode was enabled, so `/capture off`
+/// can restore it (otherwise an operator who had `/fps 30` active loses
+/// that setting when toggling capture-mode).
+///
+/// Why this exists at all: on macOS, QuickTime's legacy screen-capture
+/// pipeline can deadlock a Bevy/wgpu Metal surface while
+/// `bevy_framepace` is parking the render thread against monitor
+/// refresh. Capture-mode disables the limiter and pins
+/// `PresentMode::Fifo` for the recording window.
+#[derive(Resource, Default)]
+pub struct CaptureMode {
+    pub active: bool,
+    /// `Some` while `active == true`; `None` otherwise. Stores the
+    /// limiter that was in effect at the moment capture was enabled.
+    pub restore_limiter: Option<bevy_framepace::Limiter>,
+}
+
 /// Bundle of `MessageWriter`s used by the slash-command dispatcher.
 /// Grouped into one `SystemParam` so `text_input_system` stays under
 /// Bevy's 16-param cap as we add more event-driven slash commands.
 #[derive(SystemParam)]
-pub struct SlashWriters<'w> {
+pub struct SlashWriters<'w, 's> {
     pub load_mmb: MessageWriter<'w, LoadMmbRequest>,
     pub load_mzb: MessageWriter<'w, LoadMzbRequest>,
     pub debug_heights: MessageWriter<'w, DebugHeightsRequest>,
@@ -61,6 +80,66 @@ pub struct SlashWriters<'w> {
     // `ResMut` on `text_input_system`) to stay under Bevy's 16-SystemParam
     // cap. `Mut` access is fine — only the chat submit path writes it.
     pub framepace: ResMut<'w, bevy_framepace::FramepaceSettings>,
+    /// `/capture` reconfigures the primary window's `present_mode` at
+    /// runtime — Bevy's wgpu backend reconfigures the surface on the
+    /// next frame when this field changes.
+    pub primary_window: Query<'w, 's, &'static mut Window, With<PrimaryWindow>>,
+    /// Persisted capture-toggle state — see [`CaptureMode`].
+    pub capture_mode: ResMut<'w, CaptureMode>,
+    /// `/bgm <id>` synthesizes a `ViewerEvent::MusicChanged` into
+    /// the EventLog so the audio plugin's existing drain → resolve
+    /// → decode pipeline plays the requested track. The EventLog
+    /// resource is the same buffer `ingest_system` populates from
+    /// real wire events; pushing here is indistinguishable
+    /// downstream.
+    pub event_log: ResMut<'w, ffxi_viewer_core::EventLog>,
+    /// `/sfx <id>` writes directly into the audio plugin's SFX
+    /// message queue. `SfxEvent::new(id)` plays once at full
+    /// volume; `play_sfx_system` handles the decode + spawn.
+    pub sfx_event: MessageWriter<'w, ffxi_viewer_core::audio::SfxEvent>,
+    /// `/screenshot [path]` — capture primary window to PNG. Consumer
+    /// in `view_native::screenshot::process_screenshot_requests`
+    /// spawns the Bevy `Screenshot` entity and observes save-to-disk.
+    pub screenshot: MessageWriter<'w, super::screenshot::ScreenshotRequest>,
+    /// Graphics-quality settings — mutated by the in-game Graphics
+    /// menu (Left/Right on a row cycles the highlighted field, Enter
+    /// cycles forward / fires the Reset action). The reactor systems
+    /// in `ffxi_viewer_core::graphics_settings` hot-apply on change,
+    /// and the persist system in `crate::graphics_store` writes the
+    /// new JSON. Bundled here to stay under Bevy's 16-SystemParam cap.
+    pub graphics: ResMut<'w, ffxi_viewer_core::GraphicsSettings>,
+    /// `/devhud on|off|toggle` — show/hide developer telemetry
+    /// overlays. The visibility-driving system in
+    /// `ffxi_viewer_core::hud::apply_dev_hud_visibility` reacts on
+    /// change, walking every `DevHud`-tagged entity.
+    pub hud_verbosity: ResMut<'w, ffxi_viewer_core::hud::HudVerbosity>,
+    /// `/minimap mode top|retail|auto` — image-source backend
+    /// selector. The reactor in
+    /// `ffxi_viewer_core::minimap::update_minimap_image_source`
+    /// repoints the `ImageNode` on change.
+    pub minimap_mode: ResMut<'w, ffxi_viewer_core::minimap::MinimapMode>,
+    /// `/minimap show|hide|toggle` — visibility flag mirrored onto
+    /// the UI root's `Display` by `update_minimap_visibility`.
+    pub minimap_visible: ResMut<'w, ffxi_viewer_core::minimap::MinimapVisible>,
+    /// `/minimap cull <N>` — ceiling-cull height in yalms for the
+    /// top-down bake. Change-detected by the top-down backend to
+    /// trigger a re-bake on the next zone-enter scan.
+    pub topdown_cull: ResMut<'w, ffxi_viewer_core::minimap::topdown::TopdownCullPolicy>,
+    /// `/sound on|off|toggle [bgm|sfx]` — operator-controlled mute
+    /// flags applied by `apply_bgm_system` (BGM) and
+    /// `play_sfx_system` (SFX). Survives logout/login.
+    pub audio_mute: ResMut<'w, ffxi_viewer_core::audio::AudioMuteState>,
+    /// `/minimap zoom in|out|fit|reset|<N>` — write side of the
+    /// [`MinimapZoom`] resource. Read by
+    /// `update_minimap_view` to derive the visible AABB.
+    pub minimap_zoom: ResMut<'w, ffxi_viewer_core::minimap::MinimapZoom>,
+    /// `/minimap zoom reset` also clears pan offset on
+    /// [`MinimapView`].
+    pub minimap_view: ResMut<'w, ffxi_viewer_core::minimap::MinimapView>,
+    /// Read-only access to the zone AABB so `/minimap zoom in/out`
+    /// can clamp against the zone's half-span (same logic the
+    /// scroll-wheel handler uses).
+    pub minimap_state: Res<'w, ffxi_viewer_core::minimap::MinimapState>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -104,6 +183,10 @@ pub fn text_input_system(
     // keys here and by the wheel system in `hud::chat_panel`. Single
     // source of truth so both inputs stay in sync.
     mut chat_scroll: ResMut<ChatScroll>,
+    // Stage 2 Magic/Abilities menu rows. Snapshot-driven; rebuilt
+    // each frame by `hud::menu::refresh_dynamic_menu_rows`. Read-only
+    // here — handle_menu_key uses it for cursor bounds + Enter dispatch.
+    dynamic_menu: Res<ffxi_viewer_core::hud::menu::DynamicMenu>,
 ) {
     // Snapshot the inputs we need from the scene before mutating it
     // below (clones are cheap relative to the per-keystroke event
@@ -142,6 +225,7 @@ pub fn text_input_system(
                     current_target,
                     &entities,
                     self_pos,
+                    scene_state.snapshot.self_char_id,
                     &mut target,
                 ) {
                     *mode = next;
@@ -178,6 +262,10 @@ pub fn text_input_system(
                     &mut scene_state,
                     &cmd_tx.0,
                     &mut keybinds_state,
+                    &mut slash_writers.graphics,
+                    &dynamic_menu,
+                    current_target,
+                    self_pos,
                 ) {
                     *mode = next;
                 }
@@ -252,6 +340,7 @@ fn handle_world_key(
     current_target: Option<u32>,
     entities: &[ffxi_viewer_wire::Entity],
     self_pos: ffxi_viewer_wire::Vec3,
+    self_id: Option<u32>,
     target: &mut Target,
 ) -> Option<InputMode> {
     // OpenChat (default Space) stays in this logical-key router rather
@@ -284,7 +373,7 @@ fn handle_world_key(
         // - With no target + no nearby NPC → open the menu directly.
         return match current_target {
             Some(_) => Some(InputMode::QuickAction(QuickActionState::for_target(true))),
-            None => match nearest_npc(entities, self_pos, AUTO_TARGET_RADIUS) {
+            None => match nearest_targetable(entities, self_pos, self_id, AUTO_TARGET_RADIUS) {
                 Some(ent) => {
                     target.id = Some(ent.id);
                     None
@@ -302,23 +391,30 @@ fn handle_world_key(
 /// "Enter near an NPC" works the same way it does in-game.
 const AUTO_TARGET_RADIUS: f32 = 8.0;
 
-/// Find the nearest NPC entity within `radius` yalms. Returns `None`
-/// if no NPC qualifies — the caller falls back to the quick-action
-/// picker in that case. Mobs/PCs are skipped since `Enter` for those
-/// shouldn't be silently auto-stolen by an in-range mob.
-fn nearest_npc<'a>(
+/// Find the nearest targetable entity within `radius` yalms. Returns
+/// `None` if nothing qualifies — the caller falls back to the
+/// quick-action picker. All non-self entity kinds participate (mobs,
+/// NPCs, other PCs, pets) so Enter-near-a-mob auto-targets it,
+/// matching the retail FFXI muscle memory of "step up, press Enter."
+/// Self is excluded via `self_id` so Enter doesn't silently target
+/// the player's own entity.
+fn nearest_targetable<'a>(
     entities: &'a [ffxi_viewer_wire::Entity],
     self_pos: ffxi_viewer_wire::Vec3,
+    self_id: Option<u32>,
     radius: f32,
 ) -> Option<&'a ffxi_viewer_wire::Entity> {
     let r2 = radius * radius;
     entities
         .iter()
-        .filter(|e| matches!(e.kind, ffxi_viewer_wire::EntityKind::Npc))
+        .filter(|e| Some(e.id) != self_id)
         .map(|e| {
+            // 3D distance — matches the server's range check and the
+            // nameplate readout. 2D undercounts altitude on slopes.
             let dx = e.pos.x - self_pos.x;
             let dy = e.pos.y - self_pos.y;
-            (e, dx * dx + dy * dy)
+            let dz = e.pos.z - self_pos.z;
+            (e, dx * dx + dy * dy + dz * dz)
         })
         .filter(|(_, d2)| *d2 <= r2)
         .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
@@ -413,6 +509,8 @@ fn apply_chat_action(
                     self_pos,
                     current_target,
                     scene_state.snapshot.zone_id,
+                    scene_state.snapshot.self_char_id,
+                    &scene_state.snapshot.party,
                 );
                 tracing::debug!(buffer = %trimmed, outcome = ?outcome, "chat submit: slash");
                 // Locally echo /say & friends so the operator sees their
@@ -429,6 +527,19 @@ fn apply_chat_action(
                     }
                     _ => {}
                 }
+                // Peek for OpenMenu before dispatch — `apply_slash_outcome`
+                // can't mutate `InputMode` (no &mut mode in its sig), so we
+                // capture the target submenu here and override the
+                // unconditional `*mode = InputMode::World;` at the bottom
+                // of this branch. Cloning is cheap (MenuKind is Copy).
+                let mode_override = match &outcome {
+                    SlashOutcome::OpenMenu(kind) => {
+                        let mut stack = MenuStack::root();
+                        stack.push(*kind);
+                        Some(InputMode::Menu(stack))
+                    }
+                    _ => None,
+                };
                 apply_slash_outcome(
                     outcome,
                     target,
@@ -446,6 +557,10 @@ fn apply_chat_action(
                     slash_writers,
                     draw_distance,
                 );
+                if let Some(next) = mode_override {
+                    *mode = next;
+                    return;
+                }
             } else {
                 // Default channel: Say. Tracing makes it visible whether the
                 // dispatch reached the session loop — the server's 0x017 echo
@@ -496,9 +611,9 @@ fn apply_slash_outcome(
                 push_system_chat_line(scene_state, toast.into());
             }
             if let Some(shutdown) = reqlogout_starts_countdown(&cmd) {
-                slash_writers.logout_requested.write(
-                    ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown },
-                );
+                slash_writers
+                    .logout_requested
+                    .write(ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown });
             }
             let send_result = cmd_tx.try_send(cmd);
             if let Err(e) = send_result {
@@ -552,9 +667,9 @@ fn apply_slash_outcome(
                 push_system_chat_line(scene_state, toast.into());
             }
             if let Some(shutdown) = reqlogout_starts_countdown(&req) {
-                slash_writers.logout_requested.write(
-                    ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown },
-                );
+                slash_writers
+                    .logout_requested
+                    .write(ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown });
             }
             let _ = cmd_tx.try_send(req);
             let _ = cmd_tx.try_send(AgentCommand::Disconnect);
@@ -605,7 +720,73 @@ fn apply_slash_outcome(
         SlashOutcome::DebugHeights => {
             slash_writers.debug_heights.write(DebugHeightsRequest);
         }
+        SlashOutcome::Screenshot { path } => {
+            // Auto-numbered default keeps the workflow scriptable: no
+            // arg → screenshot-0.png, screenshot-1.png, … per session.
+            // Counter is a `Local` on this system so it survives across
+            // calls.
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let resolved = path.unwrap_or_else(|| {
+                let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("screenshot-{n}.png")
+            });
+            slash_writers
+                .screenshot
+                .write(super::screenshot::ScreenshotRequest {
+                    path: std::path::PathBuf::from(&resolved),
+                });
+            // Consumer pushes its own toast on capture; this branch
+            // only routes the event.
+        }
+        SlashOutcome::PlayBgm { track_id } => {
+            // Synthesize the same wire event a 0x05F packet would
+            // produce — slot 0 (ZoneDay) is the default audible slot
+            // when nothing else is set. The audio plugin's
+            // drain_music_events_system folds this into BgmSlots
+            // and apply_bgm_system decodes + plays.
+            slash_writers
+                .event_log
+                .recent
+                .push_back(ffxi_viewer_wire::ViewerEvent::MusicChanged { slot: 0, track_id });
+            push_system_chat_line(scene_state, format!("/bgm {track_id}: queued"));
+        }
+        SlashOutcome::PlaySfx { se_id } => {
+            slash_writers
+                .sfx_event
+                .write(ffxi_viewer_core::audio::SfxEvent::new(se_id));
+            push_system_chat_line(scene_state, format!("/sfx {se_id}: fired"));
+        }
         SlashOutcome::EndCutscene { event_num } => {
+            // Resolve CSID: operator-explicit > live DialogState >
+            // start-zone fallback. The DialogState branch is the load-
+            // bearing fix for the EventPara=0 mismatch class — when the
+            // server is holding an event the client *did* see (so the
+            // CSID is in `snapshot.dialog.event_para`), the old
+            // zone-table guess could send the wrong number and the
+            // wedge stuck. See server-log line for 5/11:
+            // `Invalid GP_CLI_COMMAND_EVENTEND ... Event ID mismatch
+            // 11002 != 0`. Start-zone fallback only kicks in for
+            // event-blind callers who happen to be in a starting
+            // nation but never saw the EVENTSTART (e.g. the client
+            // attached mid-cutscene).
+            let resolved_csid = event_num
+                .or_else(|| scene_state.snapshot.dialog.as_ref().map(|d| d.event_para))
+                .or_else(|| {
+                    scene_state
+                        .snapshot
+                        .zone_id
+                        .and_then(crate::view_native::slash_commands::start_zone_cutscene)
+                });
+            let Some(csid) = resolved_csid else {
+                push_system_chat_line(
+                    scene_state,
+                    "/endcutscene: no active event and current zone isn't a \
+                     starting nation; pass an explicit CSID \
+                     (`/endcutscene <csid>`) or use `/release`"
+                        .into(),
+                );
+                return;
+            };
             // Resolve player's own UniqueNo + ActIndex. For a forced
             // cutscene fired by `player:startEvent(csid, ...)` the server
             // built the EVENTSTART with the player as the initiator, so
@@ -627,14 +808,14 @@ fn apply_slash_outcome(
                     push_system_chat_line(
                         scene_state,
                         format!(
-                            "/endcutscene: sending EVENT_END (csid={event_num}, \
+                            "/endcutscene: sending EVENT_END (csid={csid}, \
                              unique_no=0x{event_id:08X}, act_index={act_index})"
                         ),
                     );
                     if let Err(e) = cmd_tx.try_send(AgentCommand::EndEventChoice {
                         event_id,
                         act_index,
-                        event_num,
+                        event_num: csid,
                         choice: 0,
                     }) {
                         push_system_chat_line(
@@ -666,10 +847,180 @@ fn apply_slash_outcome(
                 }
             }
         }
+        SlashOutcome::SetCaptureMode(arg) => {
+            use bevy_framepace::Limiter;
+            let want_on = arg.unwrap_or(!slash_writers.capture_mode.active);
+            if want_on == slash_writers.capture_mode.active {
+                let label = if want_on { "on" } else { "off" };
+                push_system_chat_line(
+                    scene_state,
+                    format!("/capture: already {label} (no change)"),
+                );
+            } else if want_on {
+                // Snapshot the framepace limiter so `/capture off` can
+                // restore the operator's `/fps` choice. Then disable
+                // framepace and pin Fifo on the primary window.
+                slash_writers.capture_mode.restore_limiter =
+                    Some(slash_writers.framepace.limiter.clone());
+                slash_writers.framepace.limiter = Limiter::Off;
+                if let Ok(mut window) = slash_writers.primary_window.single_mut() {
+                    window.present_mode = PresentMode::Fifo;
+                }
+                slash_writers.capture_mode.active = true;
+                push_system_chat_line(
+                    scene_state,
+                    "/capture: on (framepace off, present_mode=Fifo) — \
+                     prefer OBS/Cmd+Shift+5 over QuickTime if recording still stalls"
+                        .into(),
+                );
+            } else {
+                let restored = slash_writers
+                    .capture_mode
+                    .restore_limiter
+                    .take()
+                    .unwrap_or(Limiter::Auto);
+                slash_writers.framepace.limiter = restored;
+                if let Ok(mut window) = slash_writers.primary_window.single_mut() {
+                    window.present_mode = PresentMode::AutoVsync;
+                }
+                slash_writers.capture_mode.active = false;
+                push_system_chat_line(scene_state, "/capture: off (settings restored)".into());
+            }
+        }
         SlashOutcome::SetZoneGeom(setting) => {
             let next = setting.unwrap_or_else(|| draw_distance.zone_geom_mode.cycle());
             draw_distance.zone_geom_mode = next;
             push_system_chat_line(scene_state, format!("/zonegeom: {}", next.label()));
+        }
+        SlashOutcome::SetDevHud(setting) => {
+            // `None` means toggle; explicit `on`/`off` overrides.
+            let next = setting.unwrap_or(!slash_writers.hud_verbosity.dev_hud);
+            slash_writers.hud_verbosity.dev_hud = next;
+            push_system_chat_line(
+                scene_state,
+                format!("/devhud: {}", if next { "on" } else { "off" }),
+            );
+        }
+        SlashOutcome::SetMinimap(op) => {
+            use super::slash_commands::MinimapOp;
+            use ffxi_viewer_core::minimap::MinimapMode;
+            let chat = match op {
+                MinimapOp::Status => format!(
+                    "/minimap: mode={:?} visible={} cull={:.1}",
+                    *slash_writers.minimap_mode,
+                    slash_writers.minimap_visible.0,
+                    slash_writers.topdown_cull.top_cull_yalms,
+                ),
+                MinimapOp::Show => {
+                    slash_writers.minimap_visible.0 = true;
+                    "/minimap: shown".into()
+                }
+                MinimapOp::Hide => {
+                    slash_writers.minimap_visible.0 = false;
+                    "/minimap: hidden".into()
+                }
+                MinimapOp::Toggle => {
+                    let next = !slash_writers.minimap_visible.0;
+                    slash_writers.minimap_visible.0 = next;
+                    format!("/minimap: {}", if next { "shown" } else { "hidden" })
+                }
+                MinimapOp::ModeTopDown => {
+                    *slash_writers.minimap_mode = MinimapMode::TopDown;
+                    "/minimap: mode=top-down".into()
+                }
+                MinimapOp::ModeRetail => {
+                    *slash_writers.minimap_mode = MinimapMode::Retail;
+                    "/minimap: mode=retail (no retail texture loaded yet for this zone)".into()
+                }
+                MinimapOp::ModeAuto => {
+                    *slash_writers.minimap_mode = MinimapMode::Auto;
+                    "/minimap: mode=auto".into()
+                }
+                MinimapOp::SetCull(v) => {
+                    slash_writers.topdown_cull.top_cull_yalms = v;
+                    format!("/minimap: cull={v:.1} yalms (re-baking next frame)")
+                }
+                MinimapOp::ZoomIn => {
+                    let half = ffxi_viewer_core::minimap::zone_half_span(
+                        slash_writers
+                            .minimap_state
+                            .active_aabb(*slash_writers.minimap_mode),
+                    );
+                    slash_writers.minimap_zoom.zoom_by(
+                        1.0 / ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR,
+                        half,
+                    );
+                    slash_writers.minimap_view.idle_frames = 0;
+                    format_zoom_status(&slash_writers.minimap_zoom)
+                }
+                MinimapOp::ZoomOut => {
+                    let half = ffxi_viewer_core::minimap::zone_half_span(
+                        slash_writers
+                            .minimap_state
+                            .active_aabb(*slash_writers.minimap_mode),
+                    );
+                    slash_writers
+                        .minimap_zoom
+                        .zoom_by(ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR, half);
+                    slash_writers.minimap_view.idle_frames = 0;
+                    format_zoom_status(&slash_writers.minimap_zoom)
+                }
+                MinimapOp::ZoomFit => {
+                    slash_writers.minimap_zoom.radius_yalms = None;
+                    slash_writers.minimap_view.idle_frames = 0;
+                    "/minimap zoom: fit-to-zone".into()
+                }
+                MinimapOp::ZoomSet(r) => {
+                    let clamped = r.max(ffxi_viewer_core::minimap::ZOOM_MIN_RADIUS);
+                    slash_writers.minimap_zoom.radius_yalms = Some(clamped);
+                    slash_writers.minimap_view.idle_frames = 0;
+                    format!("/minimap zoom: radius={clamped:.0} yalms")
+                }
+                MinimapOp::ZoomReset => {
+                    *slash_writers.minimap_zoom =
+                        ffxi_viewer_core::minimap::MinimapZoom::default();
+                    slash_writers.minimap_view.pan_offset_xz = bevy::math::Vec2::ZERO;
+                    slash_writers.minimap_view.idle_frames = 0;
+                    "/minimap zoom: reset to defaults".into()
+                }
+            };
+            push_system_chat_line(scene_state, chat);
+        }
+        SlashOutcome::SetSound(op) => {
+            use super::slash_commands::SoundOp;
+            let mute = &mut *slash_writers.audio_mute;
+            // Resolve `Option<bool>` → concrete target boolean. `None`
+            // (toggle) flips current state; `Some(b)` sets directly.
+            // The slash-command's `bool` is "is muted?", so on=false,
+            // off=true.
+            let apply = |cur: &mut bool, target: Option<bool>| {
+                *cur = target.unwrap_or(!*cur);
+            };
+            let chat = match op {
+                SoundOp::Status => format!(
+                    "/sound: bgm={} sfx={}",
+                    if mute.bgm { "off" } else { "on" },
+                    if mute.sfx { "off" } else { "on" },
+                ),
+                SoundOp::SetBoth(target) => {
+                    apply(&mut mute.bgm, target);
+                    apply(&mut mute.sfx, target);
+                    format!(
+                        "/sound: bgm={} sfx={}",
+                        if mute.bgm { "off" } else { "on" },
+                        if mute.sfx { "off" } else { "on" },
+                    )
+                }
+                SoundOp::SetBgm(target) => {
+                    apply(&mut mute.bgm, target);
+                    format!("/sound bgm: {}", if mute.bgm { "off" } else { "on" })
+                }
+                SoundOp::SetSfx(target) => {
+                    apply(&mut mute.sfx, target);
+                    format!("/sound sfx: {}", if mute.sfx { "off" } else { "on" })
+                }
+            };
+            push_system_chat_line(scene_state, chat);
         }
         SlashOutcome::SetDrawDistance(op) => {
             use super::slash_commands::DrawDistanceOp;
@@ -759,6 +1110,32 @@ fn apply_slash_outcome(
         SlashOutcome::CopyToasts { n } => {
             apply_copy_toasts(n, scene_state);
         }
+        SlashOutcome::OpenMenu(kind) => {
+            // The actual InputMode mutation is performed by the caller
+            // (`apply_chat_action`) — see the `mode_override` peek
+            // above the dispatch call. This arm exists to keep the
+            // outcome enum match exhaustive without giving
+            // `apply_slash_outcome` an &mut InputMode parameter.
+            let label: std::borrow::Cow<'static, str> = match kind {
+                ffxi_viewer_core::MenuKind::Magic => "Magic".into(),
+                ffxi_viewer_core::MenuKind::Abilities => "Abilities".into(),
+                ffxi_viewer_core::MenuKind::Items => "Items".into(),
+                ffxi_viewer_core::MenuKind::Equipment => "Equipment".into(),
+                ffxi_viewer_core::MenuKind::Root => "Root".into(),
+                ffxi_viewer_core::MenuKind::Config => "Config".into(),
+                ffxi_viewer_core::MenuKind::Graphics => "Graphics".into(),
+                // EquipSlot isn't reachable via a slash-OpenMenu today
+                // (no slash form opens a specific slot directly — the
+                // operator gets there by walking Equipment → row →
+                // Enter). Include for exhaustiveness; format the
+                // slot id so a future direct-open slash surfaces a
+                // useful chat toast instead of `<unknown>`.
+                ffxi_viewer_core::MenuKind::EquipSlot(slot) => {
+                    format!("EquipSlot({slot})").into()
+                }
+            };
+            push_system_chat_line(scene_state, format!("[menu] opened {label}"));
+        }
     }
 }
 
@@ -792,10 +1169,7 @@ fn apply_copy_toasts(n: usize, scene_state: &mut SceneState) {
     match arboard::Clipboard::new() {
         Ok(mut cb) => match cb.set_text(payload) {
             Ok(()) => {
-                push_system_chat_line(
-                    scene_state,
-                    format!("/copy: {take} toast(s) on clipboard"),
-                );
+                push_system_chat_line(scene_state, format!("/copy: {take} toast(s) on clipboard"));
             }
             Err(e) => {
                 push_system_chat_line(scene_state, format!("/copy: clipboard write failed: {e}"));
@@ -1028,6 +1402,15 @@ fn push_system_chat_line(scene_state: &mut SceneState, text: String) {
     scene_state.push_local_toast(system_chat_line(text));
 }
 
+/// Format the current minimap zoom for a `/minimap zoom in|out` echo
+/// so the operator sees what radius they landed on.
+fn format_zoom_status(zoom: &ffxi_viewer_core::minimap::MinimapZoom) -> String {
+    match zoom.radius_yalms {
+        Some(r) => format!("/minimap zoom: radius={r:.0} yalms"),
+        None => "/minimap zoom: fit-to-zone".into(),
+    }
+}
+
 /// If `cmd` is an `AgentCommand::ReqLogout`, return the local-toast text
 /// the user should see immediately when the slash is dispatched.
 ///
@@ -1104,6 +1487,7 @@ fn push_local_chat_line(scene_state: &mut SceneState, kind: u8, text: String) {
         sender,
         text,
         server_ts: 0,
+        local_seq: 0,
     });
 }
 
@@ -1119,6 +1503,7 @@ fn push_local_tell_echo(scene_state: &mut SceneState, to: String, text: String) 
         sender: to,
         text,
         server_ts: 0,
+        local_seq: 0,
     });
 }
 
@@ -1151,6 +1536,21 @@ enum MenuDispatch {
     NotImplemented(String),
 }
 
+/// Apply one Left/Right (or NavConfirm) cycle step to the field on
+/// row `cursor` of the Graphics submenu. Rows past the last field
+/// (the Reset action row) are no-ops here — Reset only fires on
+/// NavConfirm and is handled inline by the caller.
+fn apply_graphics_cycle(
+    cursor: usize,
+    delta: i32,
+    graphics: &mut ffxi_viewer_core::GraphicsSettings,
+) {
+    use ffxi_viewer_core::graphics_settings::GRAPHICS_FIELDS;
+    if let Some(&field) = GRAPHICS_FIELDS.get(cursor) {
+        graphics.cycle(field, delta);
+    }
+}
+
 fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
     match (kind, label) {
         // Logout: toggle the in-world LeaveGame timer. Choose toggle
@@ -1171,6 +1571,36 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
         // Config: open the keybind submenu. Real preset-switching is on
         // the next level; this entry just navigates.
         (MenuKind::Root, "Config") => MenuDispatch::OpenSubmenu(MenuKind::Config),
+        // Graphics: open the quality-settings submenu. The Graphics
+        // submenu itself doesn't go through `resolve_menu_entry` — its
+        // rows are index-driven (the cursor row maps 1:1 to
+        // GRAPHICS_FIELDS), handled directly in `handle_menu_key`.
+        (MenuKind::Root, "Graphics") => MenuDispatch::OpenSubmenu(MenuKind::Graphics),
+        // Retail-style action menus. Stage 0 wires the navigation (push
+        // submenu / Esc pops) only; each submenu shows a one-row
+        // placeholder until its data source lands in later stages. The
+        // slash twins `/magic`, `/abilities`, `/items`, `/equipment`
+        // open the same submenus from the chat input.
+        (MenuKind::Root, "Magic") => MenuDispatch::OpenSubmenu(MenuKind::Magic),
+        (MenuKind::Root, "Abilities") => MenuDispatch::OpenSubmenu(MenuKind::Abilities),
+        (MenuKind::Root, "Items") => MenuDispatch::OpenSubmenu(MenuKind::Items),
+        (MenuKind::Root, "Equipment") => MenuDispatch::OpenSubmenu(MenuKind::Equipment),
+        // Stage 0: pressing Enter on the placeholder row in any of the
+        // four action submenus surfaces a chat hint pointing at the
+        // staging plan, so an operator who finds the menus before
+        // Stages 1–4 land knows what's still pending.
+        (MenuKind::Magic, _) => MenuDispatch::NotImplemented(
+            "Magic — pending Stage 2 (learned-spell decoder)".into(),
+        ),
+        (MenuKind::Abilities, _) => MenuDispatch::NotImplemented(
+            "Abilities — pending Stage 2 (s2c 0x119 abil_recast)".into(),
+        ),
+        (MenuKind::Items, _) => MenuDispatch::NotImplemented(
+            "Items — pending Stage 3 (inventory submenu)".into(),
+        ),
+        (MenuKind::Equipment, _) => MenuDispatch::NotImplemented(
+            "Equipment — pending Stage 1 (s2c 0x050 equip_list)".into(),
+        ),
         // Config submenu entries → keybind updates. Labels match
         // `CONFIG_ENTRIES` in `hud/menu.rs`; keep them in sync.
         (MenuKind::Config, "Standard") => {
@@ -1192,6 +1622,377 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
     }
 }
 
+/// Activate the menu row at `stack.current().cursor`. Shared between the
+/// keyboard NavConfirm path and the mouse-click path
+/// (`mouse_nav_dispatch_system`) so the two stay in lockstep on every
+/// menu kind (Graphics cycle, Config preset apply, root submenu open,
+/// stub toast).
+fn confirm_menu_at_cursor(
+    bindings: &mut Bindings,
+    stack: &mut MenuStack,
+    scene_state: &mut SceneState,
+    cmd_tx: &Sender<AgentCommand>,
+    keybinds_state: &mut KeybindsStateRes,
+    graphics: &mut ffxi_viewer_core::GraphicsSettings,
+    dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
+    target_id: Option<u32>,
+    self_pos: ffxi_viewer_wire::Vec3,
+) -> Option<InputMode> {
+    let (kind, cursor) = {
+        let level = stack.current()?;
+        (level.kind, level.cursor)
+    };
+    if matches!(kind, MenuKind::Graphics) {
+        if cursor == ffxi_viewer_core::hud::menu::GRAPHICS_RESET_SLOT {
+            graphics.reset_to_default();
+            push_system_chat_line(scene_state, "[menu] Graphics reset to High".into());
+        } else {
+            apply_graphics_cycle(cursor, 1, graphics);
+        }
+        return None;
+    }
+    // Equipment-row Enter → push the EquipSlot sub-submenu that
+    // filters inventory to items valid for `cursor` slot. The
+    // dynamic-menu refresh system rebuilds the rows on the next
+    // tick; we don't dispatch any wire packet here.
+    if matches!(kind, MenuKind::Equipment) {
+        // SLOTTYPE values are bounded by 0..16 — EQUIPMENT_ENTRIES
+        // is exactly 16 rows so a cursor out of range can't reach
+        // here, but clamp defensively just in case.
+        let slot = (cursor as u8).min(15);
+        stack.push(MenuKind::EquipSlot(slot));
+        return None;
+    }
+    // Dynamic submenus (Magic / Abilities): pull the row's pre-resolved
+    // DynamicMenuAction from the resource and dispatch directly. Same
+    // wire path as `/cast` / `/ja` / `/ws` — see slash_commands.rs
+    // `parse_cast` / `parse_job_ability` / `parse_weaponskill`.
+    if ffxi_viewer_core::hud::menu::is_dynamic(kind) {
+        if let Some(action) = ffxi_viewer_core::hud::menu::entry_action(kind, cursor, dynamic) {
+            // Clone the entities slice up front so the &mut scene_state
+            // borrow taken by the dispatcher doesn't overlap with the
+            // &snapshot.entities read.
+            let entities = scene_state.snapshot.entities.clone();
+            dispatch_dynamic_menu_action(
+                action,
+                target_id,
+                self_pos,
+                &entities,
+                cmd_tx,
+                scene_state,
+            );
+            return Some(InputMode::World);
+        }
+        // Empty list (no spells / no abilities) — just toast.
+        push_system_chat_line(
+            scene_state,
+            format!("[menu] {kind:?} list is empty"),
+        );
+        return None;
+    }
+    let label = ffxi_viewer_core::hud::menu::entry_label(kind, cursor, dynamic);
+    match resolve_menu_entry(kind, label) {
+        MenuDispatch::CommandWithToast { cmd, toast } => {
+            if let Err(e) = cmd_tx.try_send(cmd) {
+                push_system_chat_line(scene_state, format!("[menu] dispatch dropped: {e}"));
+            } else {
+                push_system_chat_line(scene_state, toast);
+            }
+            Some(InputMode::World)
+        }
+        MenuDispatch::OpenSubmenu(submenu) => {
+            stack.push(submenu);
+            None
+        }
+        MenuDispatch::KeybindUpdate(update) => {
+            let stay = matches!(update, KeybindUpdate::List);
+            apply_keybind_update(update, bindings, keybinds_state, scene_state);
+            if stay {
+                None
+            } else {
+                Some(InputMode::World)
+            }
+        }
+        MenuDispatch::NotImplemented(label) => {
+            push_system_chat_line(scene_state, format!("[menu] {label} — not implemented"));
+            None
+        }
+    }
+}
+
+/// Map a [`DynamicMenuAction`] onto the matching `ActionKind` and
+/// dispatch it on the agent channel. Mirrors the existing `/cast` /
+/// `/ja` / `/ws` slash-command flow so the menu path and the slash
+/// path stay in lockstep — both call into the same `Action` packet.
+///
+/// Target resolution:
+///   - Spells: current target if any, otherwise self (matches retail
+///     "Cure" → cast on self when no target is selected).
+///   - Job abilities: current target if any, else self.
+///   - Weapon skills: require a battle target — toast on miss rather
+///     than dispatching uselessly.
+///   - Pet abilities: routed via `JobAbility` (same packet path).
+fn dispatch_dynamic_menu_action(
+    action: ffxi_viewer_core::hud::menu::DynamicMenuAction,
+    target_id: Option<u32>,
+    self_pos: ffxi_viewer_wire::Vec3,
+    entities: &[ffxi_viewer_wire::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+    scene_state: &mut SceneState,
+) {
+    use ffxi_viewer_core::hud::menu::DynamicMenuAction as A;
+    let self_char_id = scene_state.snapshot.self_char_id;
+    let pick_target = |require: bool| -> Option<(u32, u16)> {
+        if let Some(id) = target_id {
+            if let Some(ent) = entities.iter().find(|e| e.id == id) {
+                return Some((ent.id, ent.act_index));
+            }
+        }
+        if require {
+            return None;
+        }
+        // Fallback to self for self-cast / self-buff abilities.
+        let me_id = self_char_id?;
+        let me = entities.iter().find(|e| e.id == me_id)?;
+        Some((me.id, me.act_index))
+    };
+
+    let (kind_name, cmd) = match action {
+        A::CastSpell { spell_id } => {
+            let Some((tid, tidx)) = pick_target(false) else {
+                push_system_chat_line(
+                    scene_state,
+                    "[menu] cast: no target and self not resolved yet".into(),
+                );
+                return;
+            };
+            (
+                "cast",
+                AgentCommand::Action {
+                    target_id: tid,
+                    target_index: tidx,
+                    kind: ActionKind::CastMagic {
+                        spell_id: spell_id as u32,
+                        pos_x: self_pos.x,
+                        pos_y: self_pos.y,
+                        pos_z: self_pos.z,
+                    },
+                },
+            )
+        }
+        A::JobAbility { ability_id } | A::PetAbility { ability_id } => {
+            let Some((tid, tidx)) = pick_target(false) else {
+                push_system_chat_line(scene_state, "[menu] ability: no target".into());
+                return;
+            };
+            (
+                "ability",
+                AgentCommand::Action {
+                    target_id: tid,
+                    target_index: tidx,
+                    kind: ActionKind::JobAbility {
+                        ability_id: ability_id as u32,
+                    },
+                },
+            )
+        }
+        A::Weaponskill { skill_id } => {
+            // Weapon skills only work on engaged enemies; require an
+            // explicit target rather than self-falling back (retail
+            // rejects /ws without a battle target too).
+            let Some((tid, tidx)) = pick_target(true) else {
+                push_system_chat_line(
+                    scene_state,
+                    "[menu] weaponskill: requires a battle target".into(),
+                );
+                return;
+            };
+            (
+                "weaponskill",
+                AgentCommand::Action {
+                    target_id: tid,
+                    target_index: tidx,
+                    kind: ActionKind::Weaponskill {
+                        skill_id: skill_id as u32,
+                    },
+                },
+            )
+        }
+        A::UseItem {
+            container,
+            index,
+            item_no,
+        } => {
+            // Default target = self for consumables (potions, scrolls);
+            // current target wins if set. Future Stage 5 with the
+            // `<st>` picker can refine offensive items like Soultrappers
+            // to require a battle target.
+            let (tid, tidx) = pick_target(false).unwrap_or((0, 0));
+            (
+                "useitem",
+                AgentCommand::UseItem {
+                    container,
+                    slot: index,
+                    item_no: item_no as u32,
+                    target_id: tid,
+                    target_index: tidx,
+                },
+            )
+        }
+        A::EquipItem {
+            container,
+            container_index,
+            equip_slot,
+        } => {
+            // Equip is a 3-byte c2s 0x050 with no target — the source
+            // inventory slot + destination equipment slot are the only
+            // bindings. Server pushes back a matching s2c 0x050
+            // EQUIP_LIST that Stage 1's decoder folds into
+            // `SessionState.equipment`, so the Equipment menu's
+            // display refreshes on the next snapshot tick.
+            (
+                "equip",
+                AgentCommand::Equip {
+                    container,
+                    container_index,
+                    equip_slot,
+                },
+            )
+        }
+    };
+    if let Err(e) = cmd_tx.try_send(cmd) {
+        push_system_chat_line(scene_state, format!("[menu] {kind_name} dropped: {e}"));
+    }
+}
+
+/// Send `EndEventChoice` with the supplied choice index. Shared between
+/// the keyboard NavConfirm path and the mouse click on a numbered
+/// choice button.
+fn confirm_dialog_choice(
+    choice: u32,
+    scene_state: &mut SceneState,
+    cmd_tx: &Sender<AgentCommand>,
+) {
+    if let Some(d) = scene_state.snapshot.dialog.as_ref() {
+        let _ = cmd_tx.try_send(AgentCommand::EndEventChoice {
+            event_id: d.npc_id,
+            act_index: d.act_index,
+            event_num: d.event_num,
+            choice,
+        });
+    }
+}
+
+/// Activate the QA row at `state.cursor`. Shared between the keyboard
+/// NavConfirm path and the mouse-click path. Returns the new
+/// `InputMode` if the activation should exit the picker.
+fn confirm_quick_action_at_cursor(
+    state: &QuickActionState,
+    scene_state: &mut SceneState,
+    target_id: Option<u32>,
+    entities: &[ffxi_viewer_wire::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+) -> Option<InputMode> {
+    let label = ffxi_viewer_core::hud::quick_action::entry_label(state.has_target, state.cursor);
+    let target_ent = target_id.and_then(|id| entities.iter().find(|e| e.id == id));
+    match resolve_quick_action(label, target_ent) {
+        QuickActionDispatch::Command(cmd) => {
+            if let Err(e) = cmd_tx.try_send(cmd) {
+                push_system_chat_line(scene_state, format!("[quick] dispatch dropped: {e}"));
+            }
+            Some(InputMode::World)
+        }
+        QuickActionDispatch::SystemMessage(msg) => {
+            push_system_chat_line(scene_state, msg);
+            Some(InputMode::World)
+        }
+        QuickActionDispatch::NotImplemented(label) => {
+            push_system_chat_line(scene_state, format!("[quick] {label} — not implemented"));
+            Some(InputMode::World)
+        }
+        QuickActionDispatch::OpenMenu(kind) => {
+            // Replace the QA picker with the main menu stack rooted at
+            // the requested submenu. The Root level is also pushed so
+            // Esc from the submenu lands on Root rather than exiting
+            // back to World — matches retail's "Esc backs out one
+            // level" muscle memory.
+            let mut stack = MenuStack::root();
+            stack.push(kind);
+            Some(InputMode::Menu(stack))
+        }
+    }
+}
+
+/// Read HUD-emitted activation messages (menu row click, dialog choice
+/// click, quick-action click) and dispatch via the same helpers the
+/// keyboard NavConfirm path uses. Runs alongside `text_input_system`,
+/// so a single click activates a row exactly once (no double-fire
+/// because each `MessageReader` is private to this system).
+pub fn mouse_nav_dispatch_system(
+    mut menu_events: MessageReader<ffxi_viewer_core::hud::menu::MenuRowActivated>,
+    mut dialog_events: MessageReader<ffxi_viewer_core::hud::dialog::DialogChoiceActivated>,
+    mut qa_events: MessageReader<ffxi_viewer_core::hud::quick_action::QuickActionActivated>,
+    cmd_tx: Res<CommandTx>,
+    mut bindings: ResMut<Bindings>,
+    mut keybinds_state: ResMut<KeybindsStateRes>,
+    mut mode: ResMut<InputMode>,
+    target: Res<Target>,
+    mut scene_state: ResMut<SceneState>,
+    mut graphics: ResMut<ffxi_viewer_core::GraphicsSettings>,
+    dynamic_menu: Res<ffxi_viewer_core::hud::menu::DynamicMenu>,
+) {
+    let entities = scene_state.snapshot.entities.clone();
+    let current_target = target.id;
+    let self_pos = scene_state.snapshot.self_pos.pos;
+
+    for ev in menu_events.read() {
+        if let InputMode::Menu(stack) = &mut *mode {
+            if let Some(level) = stack.current_mut() {
+                level.cursor = ev.slot;
+            }
+            if let Some(next) = confirm_menu_at_cursor(
+                &mut bindings,
+                stack,
+                &mut scene_state,
+                &cmd_tx.0,
+                &mut keybinds_state,
+                &mut graphics,
+                &dynamic_menu,
+                current_target,
+                self_pos,
+            ) {
+                *mode = next;
+            }
+        }
+    }
+
+    for ev in dialog_events.read() {
+        if let InputMode::Dialog(cursor) = &mut *mode {
+            cursor.cursor = ev.choice;
+            confirm_dialog_choice(ev.choice, &mut scene_state, &cmd_tx.0);
+        }
+    }
+
+    for ev in qa_events.read() {
+        if let InputMode::QuickAction(state) = &mut *mode {
+            state.cursor = ev.slot;
+            let snapshot = QuickActionState {
+                cursor: state.cursor,
+                has_target: state.has_target,
+            };
+            if let Some(next) = confirm_quick_action_at_cursor(
+                &snapshot,
+                &mut scene_state,
+                current_target,
+                &entities,
+                &cmd_tx.0,
+            ) {
+                *mode = next;
+            }
+        }
+    }
+}
+
 /// Menu-mode keystroke handler. Returns `Some(new_mode)` to transition
 /// out of the menu (Esc on root → back to World, Enter on a wired entry
 /// → back to World); `None` to stay. The current frame's [`MenuKind`]
@@ -1208,6 +2009,10 @@ fn handle_menu_key(
     scene_state: &mut SceneState,
     cmd_tx: &Sender<AgentCommand>,
     keybinds_state: &mut KeybindsStateRes,
+    graphics: &mut ffxi_viewer_core::GraphicsSettings,
+    dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
+    target_id: Option<u32>,
+    self_pos: ffxi_viewer_wire::Vec3,
 ) -> Option<InputMode> {
     // Capture the active screen + cursor up front. `entry_count` and
     // `entry_label` both consult this — keeps the Root/Config branches
@@ -1216,7 +2021,21 @@ fn handle_menu_key(
         let level = stack.current()?;
         (level.kind, level.cursor)
     };
-    let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind);
+    let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind, dynamic);
+
+    // Graphics-only Left/Right cycle. Up/Down still moves the cursor
+    // row; Left/Right adjusts the value on the highlighted row.
+    if matches!(kind, MenuKind::Graphics) {
+        if bindings.matches_logical(Action::NavLeft, key) {
+            apply_graphics_cycle(cursor, -1, graphics);
+            return None;
+        }
+        if bindings.matches_logical(Action::NavRight, key) {
+            apply_graphics_cycle(cursor, 1, graphics);
+            return None;
+        }
+    }
+
     if bindings.matches_logical(Action::NavUp, key) {
         // Wrap: top → bottom (matches retail menu nav).
         let level = stack.current_mut()?;
@@ -1235,38 +2054,17 @@ fn handle_menu_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        let label = ffxi_viewer_core::hud::menu::entry_label(kind, cursor);
-        return match resolve_menu_entry(kind, label) {
-            MenuDispatch::CommandWithToast { cmd, toast } => {
-                if let Err(e) = cmd_tx.try_send(cmd) {
-                    push_system_chat_line(scene_state, format!("[menu] dispatch dropped: {e}"));
-                } else {
-                    push_system_chat_line(scene_state, toast);
-                }
-                Some(InputMode::World)
-            }
-            MenuDispatch::OpenSubmenu(submenu) => {
-                stack.push(submenu);
-                None
-            }
-            MenuDispatch::KeybindUpdate(update) => {
-                // List stays in the menu so the operator can flip
-                // presets after reading the current map. Preset/Reset
-                // exit to World once applied — same shape as the slash
-                // path's "fire and forget" UX.
-                let stay = matches!(update, KeybindUpdate::List);
-                apply_keybind_update(update, bindings, keybinds_state, scene_state);
-                if stay {
-                    None
-                } else {
-                    Some(InputMode::World)
-                }
-            }
-            MenuDispatch::NotImplemented(label) => {
-                push_system_chat_line(scene_state, format!("[menu] {label} — not implemented"));
-                None
-            }
-        };
+        return confirm_menu_at_cursor(
+            bindings,
+            stack,
+            scene_state,
+            cmd_tx,
+            keybinds_state,
+            graphics,
+            dynamic,
+            target_id,
+            self_pos,
+        );
     }
     if bindings.matches_logical(Action::NavCancel, key) {
         return if !stack.pop() {
@@ -1304,14 +2102,7 @@ fn handle_dialog_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        if let Some(d) = scene_state.snapshot.dialog.as_ref() {
-            let _ = cmd_tx.try_send(AgentCommand::EndEventChoice {
-                event_id: d.npc_id,
-                act_index: d.act_index,
-                event_num: d.event_num,
-                choice: cursor.cursor,
-            });
-        }
+        confirm_dialog_choice(cursor.cursor, scene_state, cmd_tx);
         return None;
     }
     if bindings.matches_logical(Action::NavCancel, key) {
@@ -1346,6 +2137,13 @@ enum QuickActionDispatch {
     Command(AgentCommand),
     SystemMessage(String),
     NotImplemented(String),
+    /// Pop the quick-action picker and push the named submenu on the
+    /// main menu stack. Used by the contextual Magic / Abilities /
+    /// Items rows — selecting them in the picker is "open the
+    /// corresponding `-` menu submenu" rather than dispatching a
+    /// single action (the submenu lets the operator pick which
+    /// spell / ability / item to use).
+    OpenMenu(MenuKind),
 }
 
 fn resolve_quick_action(
@@ -1387,6 +2185,15 @@ fn resolve_quick_action(
             }),
             None => QuickActionDispatch::SystemMessage("[quick] Talk: no target".into()),
         },
+        // Contextual Magic / Abilities / Items: open the corresponding
+        // `-` menu submenu instead of dispatching directly. The user
+        // then picks the actual spell/ability/item to use from that
+        // submenu, which (Stages 2–3) dispatches the wire packet.
+        // Mirrors retail's "Enter from rest opens the action picker,
+        // pick Magic, then pick the spell" flow.
+        "Magic" => QuickActionDispatch::OpenMenu(MenuKind::Magic),
+        "Abilities" => QuickActionDispatch::OpenMenu(MenuKind::Abilities),
+        "Items" => QuickActionDispatch::OpenMenu(MenuKind::Items),
         // Everything else is still a stub. As more entries get wired,
         // add their label match arms above this fall-through.
         other => QuickActionDispatch::NotImplemented(other.to_string()),
@@ -1420,23 +2227,7 @@ fn handle_quick_action_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        let label =
-            ffxi_viewer_core::hud::quick_action::entry_label(state.has_target, state.cursor);
-        let target_ent = target_id.and_then(|id| entities.iter().find(|e| e.id == id));
-        match resolve_quick_action(label, target_ent) {
-            QuickActionDispatch::Command(cmd) => {
-                if let Err(e) = cmd_tx.try_send(cmd) {
-                    push_system_chat_line(scene_state, format!("[quick] dispatch dropped: {e}"));
-                }
-            }
-            QuickActionDispatch::SystemMessage(msg) => {
-                push_system_chat_line(scene_state, msg);
-            }
-            QuickActionDispatch::NotImplemented(label) => {
-                push_system_chat_line(scene_state, format!("[quick] {label} — not implemented"));
-            }
-        }
-        return Some(InputMode::World);
+        return confirm_quick_action_at_cursor(state, scene_state, target_id, entities, cmd_tx);
     }
     if bindings.matches_logical(Action::NavCancel, key) {
         return Some(InputMode::World);
@@ -1600,11 +2391,34 @@ mod quick_action_tests {
         }
     }
 
+    /// Macros isn't wired yet (no operator-side macro system) — keep
+    /// the NotImplemented fallback covered so the catch-all doesn't
+    /// accidentally start producing actions.
     #[test]
     fn unwired_entry_stays_not_implemented() {
         let ent = target_ent(1, 1);
-        let result = resolve_quick_action("Magic", Some(&ent));
-        assert_eq!(result, QuickActionDispatch::NotImplemented("Magic".into()),);
+        let result = resolve_quick_action("Macros", Some(&ent));
+        assert_eq!(result, QuickActionDispatch::NotImplemented("Macros".into()),);
+    }
+
+    /// Magic / Abilities / Items in the contextual picker should open
+    /// the matching submenu (not dispatch a single action — there's
+    /// nothing to dispatch without first picking which spell/etc).
+    /// Mirrors retail's quick-action flow.
+    #[test]
+    fn contextual_action_categories_open_their_menu() {
+        for (label, expected) in [
+            ("Magic", MenuKind::Magic),
+            ("Abilities", MenuKind::Abilities),
+            ("Items", MenuKind::Items),
+        ] {
+            let result = resolve_quick_action(label, None);
+            assert_eq!(
+                result,
+                QuickActionDispatch::OpenMenu(expected),
+                "{label} should open {expected:?}",
+            );
+        }
     }
 }
 

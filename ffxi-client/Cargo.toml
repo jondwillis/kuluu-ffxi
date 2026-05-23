@@ -44,6 +44,12 @@ ffxi-dat = { path = "../ffxi-dat" }
 
 anyhow.workspace = true
 clap.workspace = true
+# Binary xiloader auth (e.g. HorizonXI's hxiloader v1.3) embeds the local
+# MAC at offset 0x50 of the login payload. mac_address resolves the
+# primary interface MAC cross-platform; thiserror gives us typed errors
+# distinct from the JSON flavor's anyhow! bails.
+mac_address = "1"
+thiserror = "1"
 rustls.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true

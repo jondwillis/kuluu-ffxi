@@ -427,6 +427,17 @@ pub struct ServerLogin {
     /// the client can seed its self-entity from the very first packet
     /// of zone-in without waiting for a CHAR_PC echo.
     pub pos_head: PosHead,
+    /// `MusicNum[5]` at body[82..92]. Pre-fills the BGM slots
+    /// 0..=4 on zone-in (LSB pushes these inline rather than via
+    /// 0x05F):
+    ///   [0] = ZoneDay     (music_day column)
+    ///   [1] = ZoneNight   (music_night column)
+    ///   [2] = CombatSolo  (battlesolo column)
+    ///   [3] = CombatParty (battlemulti column)
+    ///   [4] = Mount       (0x54 if mounted at zone-in, else 0xD4)
+    /// `None` only if the LOGIN body is too short to reach this
+    /// offset (extremely unusual — real LSB bodies are ~180+B).
+    pub music_num: Option<[u16; 5]>,
 }
 
 impl ServerLogin {
@@ -434,6 +445,18 @@ impl ServerLogin {
     /// `ZoneNo` (4B) = 48 bytes. Phoenix's full LOGIN body is much larger
     /// (~180+ bytes) but we only need the prefix.
     pub const SIZE: usize = 48;
+    /// Body offset of `MusicNum[0]`. Layout from LSB's `0x00a_login.h`:
+    ///   0x00 PosHead (44B)
+    ///   0x2C ZoneNo (4B)
+    ///   0x30 ntTime (4B)
+    ///   0x34 ntTimeSec (4B)
+    ///   0x38 GameTime (4B)
+    ///   0x3C EventNo (2B)
+    ///   0x3E MapNumber (2B)
+    ///   0x40 GrapIDTbl[9] (18B)
+    ///   0x52 MusicNum[5] (10B) ← we read here
+    pub const MUSIC_NUM_OFFSET: usize = 0x52;
+    pub const MUSIC_NUM_SIZE: usize = 5 * 2;
 
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
         if body.len() < Self::SIZE {
@@ -445,11 +468,26 @@ impl ServerLogin {
         // every time. So we read at the fixed offset.
         let zone_u32 = u32::from_le_bytes(body[44..48].try_into().unwrap());
         let pos_head = PosHead::decode(&body[..PosHead::SIZE_WITH_BT_TARGET])?;
+        // MusicNum is optional: short bodies (in synthetic tests, or
+        // hypothetical legacy clients) simply don't carry it.
+        let music_num = if body.len() >= Self::MUSIC_NUM_OFFSET + Self::MUSIC_NUM_SIZE {
+            let base = Self::MUSIC_NUM_OFFSET;
+            Some([
+                u16::from_le_bytes([body[base], body[base + 1]]),
+                u16::from_le_bytes([body[base + 2], body[base + 3]]),
+                u16::from_le_bytes([body[base + 4], body[base + 5]]),
+                u16::from_le_bytes([body[base + 6], body[base + 7]]),
+                u16::from_le_bytes([body[base + 8], body[base + 9]]),
+            ])
+        } else {
+            None
+        };
         Ok(Self {
             unique_no: pos_head.unique_no,
             act_index: pos_head.act_index,
             zone_no: zone_u32 as u16,
             pos_head,
+            music_num,
         })
     }
 }
@@ -557,6 +595,195 @@ impl WeatherPacket {
 
 pub fn decode_weather(sub: &SubPacket<'_>) -> Result<WeatherPacket, DecodeError> {
     WeatherPacket::decode(sub.data)
+}
+
+/// `POSMODE` enum mirrored from `vendor/server/src/map/packets/s2c/0x05b_wpos.h:28-39`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PosMode {
+    Normal = 0x00,
+    Event = 0x01,
+    Clear = 0x02,
+    Pop = 0x03,
+    Reset = 0x05,
+    Materialize = 0x06,
+    Lock = 0x08,
+    Unlock = 0x09,
+    Rotate = 0x0A,
+}
+
+impl PosMode {
+    pub fn from_u8(raw: u8) -> Option<Self> {
+        Some(match raw {
+            0x00 => PosMode::Normal,
+            0x01 => PosMode::Event,
+            0x02 => PosMode::Clear,
+            0x03 => PosMode::Pop,
+            0x05 => PosMode::Reset,
+            0x06 => PosMode::Materialize,
+            0x08 => PosMode::Lock,
+            0x09 => PosMode::Unlock,
+            0x0A => PosMode::Rotate,
+            _ => return None,
+        })
+    }
+
+    /// True when the mode carries an authoritative position the client
+    /// must adopt — mirrors the `if (mode == NORMAL || EVENT || POP ||
+    /// RESET || MATERIALIZE)` branch at
+    /// `vendor/server/src/map/packets/s2c/0x05b_wpos.cpp:33-44`.
+    /// LOCK / UNLOCK / CLEAR / ROTATE do not re-anchor the player.
+    pub fn carries_position(&self) -> bool {
+        matches!(
+            self,
+            PosMode::Normal
+                | PosMode::Event
+                | PosMode::Pop
+                | PosMode::Reset
+                | PosMode::Materialize
+        )
+    }
+}
+
+/// `GP_SERV_COMMAND_WPOS` (0x05B) and `GP_SERV_COMMAND_WPOS2` (0x065) —
+/// server-initiated forced position for the local player. Both opcodes
+/// share the same body layout (24 bytes):
+///
+/// ```text
+///   [ 0.. 4]  float x       (LSB.x — east/west)
+///   [ 4.. 8]  float y       (LSB.y — vertical / height)
+///   [ 8..12]  float z       (LSB.z — north/south)
+///   [12..16]  u32   UniqueNo
+///   [16..18]  u16   ActIndex
+///   [18]      u8    Mode    (POSMODE)
+///   [19]      i8    dir     (heading byte)
+///   [20..24]  u32   padding
+/// ```
+///
+/// References:
+/// - `vendor/server/src/map/packets/s2c/0x05b_wpos.h:43-59`
+/// - `vendor/server/src/map/packets/s2c/0x05b_wpos.cpp:28-65`
+/// - `vendor/server/src/map/packets/s2c/0x065_wpos2.h`
+///
+/// **Coordinate remap**: our `Vec3` is z-up (`.y = north/south`,
+/// `.z = height`), matching the `PosHead` decoder's `body[12..16]→z`,
+/// `body[16..20]→y` swap. We apply the same remap: LSB.y → our `.z`,
+/// LSB.z → our `.y`.
+///
+/// **Knockback note**: LSB does NOT emit WPOS for combat knockback.
+/// Knockback is purely an animation hint in the BATTLE2 (0x028) result —
+/// 3 bits at `vendor/server/src/map/packets/s2c/0x028_battle2.cpp:76`,
+/// table in `vendor/server/src/map/enums/action/knockback.h`. The retail
+/// client integrates the displacement locally over the per-level timer.
+/// WPOS covers the *other* forced-move family: cutscene-end teleports
+/// (`vendor/server/src/map/packets/c2s/0x05c_eventendxzy.cpp:68-73`),
+/// zone-line re-anchoring (`0x05e_maprect.cpp:47`), homepoint, GM warp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForcedMove {
+    pub unique_no: u32,
+    pub act_index: u16,
+    pub mode: PosMode,
+    pub x: f32,
+    /// North-south in our z-up frame (= LSB.z on the wire).
+    pub y: f32,
+    /// Height in our z-up frame (= LSB.y on the wire).
+    pub z: f32,
+    pub heading: u8,
+    /// Raw mode byte preserved for diagnostics when the wire value falls
+    /// outside the documented enum.
+    pub raw_mode: u8,
+}
+
+impl ForcedMove {
+    pub const SIZE: usize = 24;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        let lsb_x = f32::from_le_bytes(body[0..4].try_into().unwrap());
+        let lsb_y = f32::from_le_bytes(body[4..8].try_into().unwrap());
+        let lsb_z = f32::from_le_bytes(body[8..12].try_into().unwrap());
+        let unique_no = u32::from_le_bytes(body[12..16].try_into().unwrap());
+        let act_index = u16::from_le_bytes(body[16..18].try_into().unwrap());
+        let raw_mode = body[18];
+        // Unknown mode bytes fall back to Normal so a future LSB enum
+        // addition still re-anchors the player rather than silently dropping
+        // the packet. `raw_mode` is preserved separately for diagnostics.
+        let mode = PosMode::from_u8(raw_mode).unwrap_or(PosMode::Normal);
+        let heading = body[19];
+        Ok(Self {
+            unique_no,
+            act_index,
+            mode,
+            x: lsb_x,
+            y: lsb_z,
+            z: lsb_y,
+            heading,
+            raw_mode,
+        })
+    }
+}
+
+pub fn decode_forced_move(sub: &SubPacket<'_>) -> Result<ForcedMove, DecodeError> {
+    ForcedMove::decode(sub.data)
+}
+
+#[cfg(test)]
+mod forced_move_tests {
+    use super::*;
+
+    #[test]
+    fn forced_move_decodes_normal_mode_and_swaps_axes() {
+        let mut body = vec![0u8; ForcedMove::SIZE];
+        body[0..4].copy_from_slice(&12.5f32.to_le_bytes()); // LSB.x
+        body[4..8].copy_from_slice(&3.25f32.to_le_bytes()); // LSB.y (height)
+        body[8..12].copy_from_slice(&(-7.0f32).to_le_bytes()); // LSB.z (NS)
+        body[12..16].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        body[16..18].copy_from_slice(&42u16.to_le_bytes());
+        body[18] = 0x00; // POSMODE::NORMAL
+        body[19] = 64;
+        let fm = ForcedMove::decode(&body).expect("decode");
+        assert!((fm.x - 12.5).abs() < 1e-3);
+        assert!((fm.y - (-7.0)).abs() < 1e-3, "NS (our.y) ← LSB.z");
+        assert!((fm.z - 3.25).abs() < 1e-3, "height (our.z) ← LSB.y");
+        assert_eq!(fm.unique_no, 0xDEADBEEF);
+        assert_eq!(fm.act_index, 42);
+        assert_eq!(fm.mode, PosMode::Normal);
+        assert!(fm.mode.carries_position());
+        assert_eq!(fm.heading, 64);
+    }
+
+    #[test]
+    fn forced_move_lock_unlock_clear_do_not_carry_position() {
+        for raw in [0x08u8, 0x09u8, 0x02u8, 0x0A] {
+            let mut body = vec![0u8; ForcedMove::SIZE];
+            body[18] = raw;
+            let fm = ForcedMove::decode(&body).expect("decode");
+            assert!(
+                !fm.mode.carries_position(),
+                "mode 0x{raw:02x} must not be authoritative for position",
+            );
+        }
+    }
+
+    #[test]
+    fn forced_move_truncated_errors() {
+        let body = vec![0u8; ForcedMove::SIZE - 1];
+        assert!(matches!(
+            ForcedMove::decode(&body),
+            Err(DecodeError::Truncated(s, n)) if s == ForcedMove::SIZE && n == ForcedMove::SIZE - 1
+        ));
+    }
+
+    #[test]
+    fn forced_move_unknown_mode_falls_back_to_normal() {
+        let mut body = vec![0u8; ForcedMove::SIZE];
+        body[18] = 0x7F;
+        let fm = ForcedMove::decode(&body).expect("decode");
+        assert_eq!(fm.raw_mode, 0x7F);
+        assert_eq!(fm.mode, PosMode::Normal);
+    }
 }
 
 /// Common party-member fields shared by `0x0DD GROUP_LIST` (other members)
@@ -1049,6 +1276,137 @@ impl ItemAttr {
             extdata,
         })
     }
+}
+
+/// `GP_SERV_COMMAND_EQUIP_LIST` (0x050) — one slot of equipped-gear
+/// state. The server emits these once per equipment slot on login
+/// (after a preceding `EQUIP_CLEAR`) and whenever the player equips
+/// or unequips. The payload carries only the *reference* into the
+/// inventory (container + slot index); resolving to the actual
+/// `item_no` requires reading the inventory mirror.
+///
+/// Body: `PropertyItemIndex:u8 EquipKind:u8 Category:u8 padding00:u8`
+/// → 4 bytes. See
+/// `vendor/server/src/map/packets/s2c/0x050_equip_list.h`.
+#[derive(Debug, Clone, Copy)]
+pub struct EquipList {
+    /// Slot index inside the source container.
+    pub container_index: u8,
+    /// Equipment slot id (SLOTTYPE: Main=0, Sub=1, Ranged=2, Ammo=3,
+    /// Head=4, Body=5, Hands=6, Legs=7, Feet=8, Neck=9, Waist=10,
+    /// LEar=11, REar=12, LRing=13, RRing=14, Back=15).
+    pub equip_slot: u8,
+    /// Source container id (CONTAINER_ID: Inventory=0, Wardrobe1=8,
+    /// etc.).
+    pub container: u8,
+}
+
+impl EquipList {
+    pub const SIZE: usize = 4;
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        Ok(Self {
+            container_index: body[0],
+            equip_slot: body[1],
+            container: body[2],
+        })
+    }
+}
+
+/// `GP_SERV_COMMAND_MAGIC_DATA` (0x0AA) — 128-byte packed bitset of
+/// learned spells. Bit `N` set means spell id `N` is known. Mirror
+/// of `CCharEntity::m_SpellList: xi::bitset<1024>`. Server emits this
+/// once on login and again on every spell-learned event.
+///
+/// Body: 128 bytes, little-endian-bit (bit `N` is at
+/// `body[N >> 3] & (1 << (N & 7))`).
+#[derive(Debug, Clone, Copy)]
+pub struct MagicData<'a> {
+    pub bitmap: &'a [u8; MAGIC_DATA_SIZE],
+}
+
+/// Body size of `GP_SERV_COMMAND_MAGIC_DATA` — top-level because
+/// associated constants can't appear in type position in stable Rust.
+pub const MAGIC_DATA_SIZE: usize = 128;
+
+impl<'a> MagicData<'a> {
+    pub const SIZE: usize = MAGIC_DATA_SIZE;
+    /// Number of representable spell ids (`SIZE * 8`).
+    pub const SPELL_ID_LIMIT: usize = Self::SIZE * 8;
+    pub fn decode(body: &'a [u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        let bitmap: &[u8; MAGIC_DATA_SIZE] = body[..Self::SIZE].try_into().unwrap();
+        Ok(Self { bitmap })
+    }
+    /// Collect every set bit into a `Vec<u16>` of spell ids — caller
+    /// owns the allocation. Cheaper alternative for streaming consumers
+    /// is `is_known(id)`.
+    pub fn known_ids(&self) -> Vec<u16> {
+        collect_set_bits(self.bitmap)
+    }
+    pub fn is_known(&self, id: u16) -> bool {
+        let idx = id as usize;
+        if idx >= Self::SPELL_ID_LIMIT {
+            return false;
+        }
+        self.bitmap[idx >> 3] & (1 << (idx & 7)) != 0
+    }
+}
+
+/// `GP_SERV_COMMAND_COMMAND_DATA` (0x0AC) — four packed bitsets in a
+/// fixed order: WeaponSkills[64], JobAbilities[64], PetAbilities[64],
+/// Traits[32]. Sent once on login, on job-change, and after any
+/// trait/ability-acquisition event.
+///
+/// Bit `N` of each bitset indexes the corresponding LSB id (e.g.
+/// `JobAbilities` bit N ↔ ability id N from `abilities.sql`). The
+/// packet pads each section beyond what the server's `CCharEntity`
+/// actually stores (e.g. server `m_WeaponSkills[32]`, packet 64);
+/// the trailing bytes are always zero — see
+/// `vendor/server/src/map/packets/s2c/0x0ac_command_data.cpp`.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandData<'a> {
+    pub weapon_skills: &'a [u8; 64],
+    pub job_abilities: &'a [u8; 64],
+    pub pet_abilities: &'a [u8; 64],
+    pub traits: &'a [u8; 32],
+}
+
+impl<'a> CommandData<'a> {
+    pub const SIZE: usize = 64 + 64 + 64 + 32;
+    pub fn decode(body: &'a [u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        Ok(Self {
+            weapon_skills: body[0..64].try_into().unwrap(),
+            job_abilities: body[64..128].try_into().unwrap(),
+            pet_abilities: body[128..192].try_into().unwrap(),
+            traits: body[192..224].try_into().unwrap(),
+        })
+    }
+}
+
+/// Pull every set bit's ordinal out of `bitmap` as a `Vec<u16>` of ids.
+/// Both `MagicData` and `CommandData` consumers use this to collapse a
+/// bitset into a fixed list of ids the HUD can iterate.
+pub fn collect_set_bits(bitmap: &[u8]) -> Vec<u16> {
+    let mut out = Vec::new();
+    for (byte_idx, byte) in bitmap.iter().enumerate() {
+        if *byte == 0 {
+            continue;
+        }
+        for bit in 0..8 {
+            if byte & (1 << bit) != 0 {
+                out.push((byte_idx * 8 + bit) as u16);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1744,6 +2102,96 @@ mod tests {
         assert!(matches!(
             WeatherPacket::decode(&buf),
             Err(DecodeError::Truncated(WeatherPacket::SIZE, n)) if n == WeatherPacket::SIZE - 1
+        ));
+    }
+
+    /// `EQUIP_LIST` is byte-laid as
+    /// `PropertyItemIndex EquipKind Category padding00`.
+    /// Pin the field order so a field swap in a future edit can't
+    /// silently mis-attribute container vs slot vs index.
+    #[test]
+    fn equip_list_decodes_field_order() {
+        // Slot index 5 in container 8 (Wardrobe1) for equip slot 4 (Head).
+        let buf = [0x05u8, 0x04, 0x08, 0x00];
+        let e = EquipList::decode(&buf).expect("decode");
+        assert_eq!(e.container_index, 5);
+        assert_eq!(e.equip_slot, 4);
+        assert_eq!(e.container, 8);
+    }
+
+    #[test]
+    fn equip_list_truncated_returns_err() {
+        let buf = [0u8; EquipList::SIZE - 1];
+        assert!(matches!(
+            EquipList::decode(&buf),
+            Err(DecodeError::Truncated(EquipList::SIZE, n)) if n == EquipList::SIZE - 1
+        ));
+    }
+
+    /// `MagicData` bitmap layout: bit N of body[N>>3] == spell id N is
+    /// known. Pin the bit-order so a refactor that swaps the shift
+    /// direction (a common bug) gets caught.
+    #[test]
+    fn magic_data_known_ids_picks_set_bits() {
+        let mut buf = [0u8; MagicData::SIZE];
+        // Set spell ids 0, 7, 8, 17, and 1023 (the high bit of the
+        // last byte). Each comes from a different byte+bit pair so a
+        // shift-direction or bit-order regression surfaces here.
+        buf[0] = 0b1000_0001; // ids 0 + 7
+        buf[1] = 0b0000_0001; // id 8
+        buf[2] = 0b0000_0010; // id 17
+        buf[127] = 0b1000_0000; // id 1023
+        let m = MagicData::decode(&buf).unwrap();
+        assert_eq!(m.known_ids(), vec![0, 7, 8, 17, 1023]);
+        assert!(m.is_known(0));
+        assert!(m.is_known(7));
+        assert!(m.is_known(1023));
+        assert!(!m.is_known(1));
+        // Out-of-range queries return false rather than panicking
+        // (caller might pass an SQL-derived id that exceeds 1024 bits).
+        assert!(!m.is_known(u16::MAX));
+    }
+
+    #[test]
+    fn magic_data_truncated_returns_err() {
+        let buf = [0u8; MagicData::SIZE - 1];
+        assert!(matches!(
+            MagicData::decode(&buf),
+            Err(DecodeError::Truncated(MagicData::SIZE, n)) if n == MagicData::SIZE - 1
+        ));
+    }
+
+    /// `CommandData` slices: the four sub-bitsets must come out at
+    /// the right offsets and lengths so the HUD doesn't display
+    /// WeaponSkills as JobAbilities (or vice versa).
+    #[test]
+    fn command_data_splits_into_four_bitsets() {
+        let mut buf = [0u8; CommandData::SIZE];
+        // Plant a unique byte at the start of each sub-bitset so a
+        // wrong offset surfaces as a swap.
+        buf[0] = 0xA1; // weapon_skills[0]
+        buf[64] = 0xA2; // job_abilities[0]
+        buf[128] = 0xA3; // pet_abilities[0]
+        buf[192] = 0xA4; // traits[0]
+        let c = CommandData::decode(&buf).unwrap();
+        assert_eq!(c.weapon_skills[0], 0xA1);
+        assert_eq!(c.job_abilities[0], 0xA2);
+        assert_eq!(c.pet_abilities[0], 0xA3);
+        assert_eq!(c.traits[0], 0xA4);
+        // Sizes pinned for the same reason — a future "let's grow
+        // PetAbilities" would otherwise silently shift Traits.
+        assert_eq!(c.weapon_skills.len(), 64);
+        assert_eq!(c.job_abilities.len(), 64);
+        assert_eq!(c.pet_abilities.len(), 64);
+        assert_eq!(c.traits.len(), 32);
+    }
+
+    #[test]
+    fn command_data_truncated_returns_err() {
+        let buf = [0u8; CommandData::SIZE - 1];
+        assert!(matches!(
+            CommandData::decode(&buf),
+            Err(DecodeError::Truncated(CommandData::SIZE, n)) if n == CommandData::SIZE - 1
         ));
     }
 }

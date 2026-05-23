@@ -74,6 +74,7 @@ fn bar_color(stat: BarStat) -> Color {
 /// when the first snapshot with party data arrives.
 pub fn spawn_roster_panel(mut commands: Commands) {
     commands.spawn((
+        crate::components::InGameEntity,
         RosterPanel,
         Node {
             position_type: PositionType::Absolute,
@@ -248,14 +249,55 @@ fn stat_pct(member: &PartyMember, stat: BarStat) -> f32 {
     pct.clamp(0.0, 1.0)
 }
 
+/// LSB `JOBTYPE` enum (`vendor/server/src/map/lua/lualib/luautils.cpp`
+/// and `src/common/jobs.h`) maps `u8` → vanilla job abbreviation. Index
+/// 0 is unset / sub-not-chosen and renders as the em-dash. The post-30
+/// extension jobs (SCH/GEO/RUN) and the 60-cap MoP/RoV adds are
+/// included so a level-99 character with any sub renders correctly.
+///
+/// Out-of-range ids return `"???"` so we don't panic when the server
+/// surfaces a value we haven't catalogued yet.
+pub fn job_abbr(job_id: u8) -> &'static str {
+    match job_id {
+        0 => "—",
+        1 => "WAR",
+        2 => "MNK",
+        3 => "WHM",
+        4 => "BLM",
+        5 => "RDM",
+        6 => "THF",
+        7 => "PLD",
+        8 => "DRK",
+        9 => "BST",
+        10 => "BRD",
+        11 => "RNG",
+        12 => "SAM",
+        13 => "NIN",
+        14 => "DRG",
+        15 => "SMN",
+        16 => "BLU",
+        17 => "COR",
+        18 => "PUP",
+        19 => "DNC",
+        20 => "SCH",
+        21 => "GEO",
+        22 => "RUN",
+        _ => "???",
+    }
+}
+
 fn format_header(member: &PartyMember) -> String {
     let name = member.name.as_deref().unwrap_or("?");
-    // Show "MainJobLv/SubJobLv" with raw job numbers — mapping to
-    // string abbreviations (WAR/MNK/THF/...) lands in a later stage.
-    format!(
-        "{name}  {}{}/{}{}",
-        member.main_job, member.main_job_lv, member.sub_job, member.sub_job_lv
-    )
+    // "Name MainAbbrLv/SubAbbrLv" — e.g. "Sylvie SAM75/NIN37". Sub
+    // with no job set (sub_job == 0) collapses to the em-dash, matching
+    // retail's blank sub display.
+    let main = job_abbr(member.main_job);
+    let sub_part = if member.sub_job == 0 {
+        "—".to_string()
+    } else {
+        format!("{}{}", job_abbr(member.sub_job), member.sub_job_lv)
+    };
+    format!("{name}  {}{}/{}", main, member.main_job_lv, sub_part)
 }
 
 #[cfg(test)]
@@ -297,7 +339,25 @@ mod tests {
 
     #[test]
     fn header_format_includes_jobs() {
+        // pm() sets main_job=1 (WAR) lv 75, sub_job=6 (THF) lv 37.
         let m = pm(1, 100, 100, 0);
-        assert_eq!(format_header(&m), "p1  175/637");
+        assert_eq!(format_header(&m), "p1  WAR75/THF37");
+    }
+
+    #[test]
+    fn header_no_sub_when_sub_job_is_zero() {
+        let mut m = pm(2, 100, 100, 0);
+        m.sub_job = 0;
+        m.sub_job_lv = 0;
+        assert_eq!(format_header(&m), "p2  WAR75/—");
+    }
+
+    #[test]
+    fn job_abbr_covers_post_extension_jobs() {
+        assert_eq!(job_abbr(20), "SCH");
+        assert_eq!(job_abbr(21), "GEO");
+        assert_eq!(job_abbr(22), "RUN");
+        assert_eq!(job_abbr(0), "—");
+        assert_eq!(job_abbr(99), "???");
     }
 }

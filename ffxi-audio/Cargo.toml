@@ -1,0 +1,12 @@
+[package]
+name = "ffxi-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FFXI audio container parsing (.bgw / .spw) and ADPCM/PCM decoding. Ported from vendor/lotus-ffxi/ffxi/audio."
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hound = "3"

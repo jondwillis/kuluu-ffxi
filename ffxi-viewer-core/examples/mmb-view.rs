@@ -279,7 +279,7 @@ fn load_and_spawn_mmb(
         let mesh_handle = meshes.add(mesh);
         let mat_handle = materials.add(StandardMaterial {
             base_color: palette[i % palette.len()],
-            perceptual_roughness: 0.7,
+            perceptual_roughness: 1.0,
             // FFXI strip winding doesn't match GL CCW convention reliably,
             // so render both sides until we have a definitive winding map.
             cull_mode: None,

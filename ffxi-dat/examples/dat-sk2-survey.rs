@@ -27,10 +27,7 @@ use ffxi_dat::{walk, ChunkKind, DatRoot};
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!(
-            "usage: FFXI_DAT_PATH=... {} <file_id> [chunk_idx]",
-            args[0]
-        );
+        eprintln!("usage: FFXI_DAT_PATH=... {} <file_id> [chunk_idx]", args[0]);
         return ExitCode::from(2);
     }
     let file_id: u32 = match args[1].parse() {
@@ -98,7 +95,10 @@ fn dump_sk2(chunk_idx: usize, body: &[u8]) {
         body.len()
     );
     if body.len() < 16 {
-        println!("  body too short for Sk2 header (need >=16, got {})", body.len());
+        println!(
+            "  body too short for Sk2 header (need >=16, got {})",
+            body.len()
+        );
         return;
     }
     let hdr = u32::from_le_bytes(body[0..4].try_into().unwrap());
@@ -106,16 +106,12 @@ fn dump_sk2(chunk_idx: usize, body: &[u8]) {
     let flags = (hdr >> 16) as u16;
     let after_header = 16usize;
     let payload = body.len().saturating_sub(after_header);
-    println!(
-        "  header u32 = 0x{hdr:08x}  bone count = {count}  flags = 0x{flags:04x}"
-    );
+    println!("  header u32 = 0x{hdr:08x}  bone count = {count}  flags = 0x{flags:04x}");
     println!(
         "  next 12 bytes (header pad) = {}",
         hex(&body[4..16.min(body.len())])
     );
-    println!(
-        "  payload bytes after header = {payload}  → bytes-per-bone candidates:"
-    );
+    println!("  payload bytes after header = {payload}  → bytes-per-bone candidates:");
     for stride in [48usize, 56, 64, 80] {
         if count > 0 && payload % stride == 0 && payload / stride == count as usize {
             println!("    EXACT MATCH: stride={stride}  (count*stride == payload)");
@@ -154,9 +150,8 @@ fn dump_sk2(chunk_idx: usize, body: &[u8]) {
             let p_u16 = u16::from_le_bytes([body[off], body[off + 1]]);
             print!(" p_u16=0x{p_u16:04x}({p_u16})  floats:");
             for fi in 0..floats_per_rec {
-                let f = f32::from_le_bytes(
-                    body[off + fi * 4..off + fi * 4 + 4].try_into().unwrap(),
-                );
+                let f =
+                    f32::from_le_bytes(body[off + fi * 4..off + fi * 4 + 4].try_into().unwrap());
                 if f.is_finite() && f.abs() < 1e6 {
                     print!(" {f:>9.4}");
                 } else {
