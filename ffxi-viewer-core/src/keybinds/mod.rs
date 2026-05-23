@@ -115,6 +115,17 @@ pub enum Action {
     /// the reactor goal. The server's auto-attack timer drives subsequent
     /// 0x028 BATTLE2 packets while engaged.
     ToggleEngage,
+    /// Toggle the `Sit` rest stance (retail `/sit` + `/kneel`). Press to
+    /// enter — character locks to a sitting pose, all movement input is
+    /// converted to "stand up" until pressed again. Default unbound;
+    /// operator can rebind via `/keybinds set sit ...`.
+    Sit,
+    /// Toggle the `Heal` rest stance (retail `/heal` / CAMP). Sends the
+    /// server-side `AgentCommand::Heal { mode: Toggle }` to arm/clear
+    /// `EFFECT_HEALING`; locally mirrors that state via [`RestStance`]
+    /// so the avatar animates `hea` and movement input cancels the
+    /// rest the same way retail does. Default unbound.
+    Heal,
 
     // ----- UI activation (World mode) -----
     /// Open chat with empty buffer (default Space).

@@ -140,6 +140,12 @@ pub struct SlashWriters<'w, 's> {
     /// can clamp against the zone's half-span (same logic the
     /// scroll-wheel handler uses).
     pub minimap_state: Res<'w, ffxi_viewer_core::minimap::MinimapState>,
+    /// `/sit` / `/kneel` / `/stand` and the heal-arming slash twin
+    /// mirror the local rest-stance state here. Read by the movement
+    /// dispatcher (to suppress Move emission while resting) and by
+    /// `tick_skinned_actors` (to pick the sit / hea MO2 on the self
+    /// avatar).
+    pub rest_stance: ResMut<'w, ffxi_viewer_core::combat_stance::RestStance>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -615,6 +621,7 @@ fn apply_slash_outcome(
                     .logout_requested
                     .write(ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown });
             }
+            mirror_heal_stance(&cmd, &mut slash_writers.rest_stance);
             let send_result = cmd_tx.try_send(cmd);
             if let Err(e) = send_result {
                 // Channel full or closed — operator should see this; silent
@@ -633,6 +640,7 @@ fn apply_slash_outcome(
                 if let Some(toast) = reqlogout_ack_text(&cmd) {
                     push_system_chat_line(scene_state, toast.into());
                 }
+                mirror_heal_stance(&cmd, &mut slash_writers.rest_stance);
                 if let Some(shutdown) = reqlogout_starts_countdown(&cmd) {
                     slash_writers.logout_requested.write(
                         ffxi_viewer_core::hud::logout_countdown::LogoutRequested { shutdown },
@@ -683,6 +691,37 @@ fn apply_slash_outcome(
             for line in text.split('\n') {
                 push_system_chat_line(scene_state, line.to_string());
             }
+        }
+        SlashOutcome::SetSitStance(toggle) => {
+            use ffxi_viewer_core::combat_stance::RestKind;
+            use crate::view_native::slash_commands::SitToggle;
+            let next = match toggle {
+                SitToggle::On => RestKind::Sit,
+                SitToggle::Off => RestKind::None,
+                SitToggle::Toggle => match slash_writers.rest_stance.kind {
+                    RestKind::Sit => RestKind::None,
+                    // From any other stance, /sit enters Sit. If we were
+                    // in Heal, the heal-cancel keepalive arms when the
+                    // server sees position drift; without that, we'd
+                    // be visually sitting but server-side still
+                    // healing. Send Heal::Off explicitly to bring the
+                    // two surfaces back into sync.
+                    RestKind::Heal => {
+                        let _ = cmd_tx.try_send(AgentCommand::Heal {
+                            mode: crate::state::HealMode::Off,
+                        });
+                        RestKind::Sit
+                    }
+                    RestKind::None => RestKind::Sit,
+                },
+            };
+            slash_writers.rest_stance.kind = next;
+            let label = match next {
+                RestKind::Sit => "sitting",
+                RestKind::Heal => "healing",
+                RestKind::None => "standing",
+            };
+            push_system_chat_line(scene_state, format!("/sit: {label}"));
         }
         SlashOutcome::ToggleNavmesh(setting) => {
             let next = setting.unwrap_or(!navmesh_visible.0);
@@ -1454,6 +1493,36 @@ fn reqlogout_ack_text(cmd: &AgentCommand) -> Option<&'static str> {
         }
         ReqLogoutKind::ShutdownOff => "/shutdown: cancel requested",
     })
+}
+
+/// Mirror an outbound `AgentCommand::Heal` onto the local
+/// [`RestStance`] resource so the avatar animation + movement-lock
+/// machinery sees the same state the server is about to apply. The
+/// session loop also tracks `is_healing` for its own keepalive
+/// auto-cancel, but that's wire-side; this is the visual / input
+/// side. Non-Heal commands are no-ops.
+fn mirror_heal_stance(
+    cmd: &AgentCommand,
+    rest: &mut ffxi_viewer_core::combat_stance::RestStance,
+) {
+    use ffxi_viewer_core::combat_stance::RestKind;
+    let AgentCommand::Heal { mode } = cmd else {
+        return;
+    };
+    let next = match mode {
+        crate::state::HealMode::On => RestKind::Heal,
+        crate::state::HealMode::Off => match rest.kind {
+            // Only clear when we were the one healing — preserves a
+            // /sit stance someone bizarrely sent Heal::Off during.
+            RestKind::Heal => RestKind::None,
+            other => other,
+        },
+        crate::state::HealMode::Toggle => match rest.kind {
+            RestKind::Heal => RestKind::None,
+            _ => RestKind::Heal,
+        },
+    };
+    rest.kind = next;
 }
 
 /// Local chat-line echo for `/say`, `/sh`, `/p`, `/l`, `/y` etc. The

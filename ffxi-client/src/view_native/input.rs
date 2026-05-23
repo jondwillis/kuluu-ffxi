@@ -222,6 +222,7 @@ pub fn handle_input_system(
     mut lock_on: ResMut<LockOn>,
     cam_q: Query<(&Camera, &Transform), With<OperatorCamera>>,
     mut exit: MessageWriter<AppExit>,
+    mut rest_stance: ResMut<ffxi_viewer_core::combat_stance::RestStance>,
 ) {
     // Close-window: Cmd+Q, Cmd+W, or the OS-level WindowCloseRequested
     // event (red traffic light, App→Quit menu, etc.). Hard-wired (not
@@ -414,6 +415,45 @@ pub fn handle_input_system(
             }
         }
     }
+    // `Action::Sit` / `Action::Heal` press in World mode: toggle the
+    // matching rest stance. Press to enter; press again (or any
+    // movement-action press, handled in `dispatch_movement_system`)
+    // to exit. Default unbound — operator binds via `/keybinds set`.
+    //
+    // Heal goes through the same `AgentCommand::Heal` channel as
+    // the `/heal` slash so the server `EFFECT_HEALING` arms /
+    // clears; `mirror_heal_stance` in `text_input` would normally
+    // mirror that onto the resource, but the dispatcher doesn't run
+    // for direct keypress paths, so we set `RestStance.kind`
+    // ourselves here.
+    if bindings.just_pressed(Action::Sit, &keys) {
+        use ffxi_viewer_core::combat_stance::RestKind;
+        let next = match rest_stance.kind {
+            RestKind::Sit => RestKind::None,
+            // Press Sit while healing → stand up *and* arm Heal::Off
+            // so the server state catches up to the visual.
+            RestKind::Heal => {
+                let _ = cmd_tx.0.try_send(AgentCommand::Heal {
+                    mode: crate::state::HealMode::Off,
+                });
+                RestKind::None
+            }
+            RestKind::None => RestKind::Sit,
+        };
+        rest_stance.kind = next;
+    }
+    if bindings.just_pressed(Action::Heal, &keys) {
+        use ffxi_viewer_core::combat_stance::RestKind;
+        let (next_kind, wire_mode) = match rest_stance.kind {
+            RestKind::Heal => (RestKind::None, crate::state::HealMode::Off),
+            // Toggling Heal from any non-Heal state arms it; the
+            // server-side CAMP applies on the next outbound packet.
+            _ => (RestKind::Heal, crate::state::HealMode::On),
+        };
+        let _ = cmd_tx.0.try_send(AgentCommand::Heal { mode: wire_mode });
+        rest_stance.kind = next_kind;
+    }
+
     if bindings.just_pressed(Action::ToggleLockOn, &keys) {
         let result = lock_on.toggle(target.id);
         let toast = match result {
@@ -526,6 +566,7 @@ pub fn dispatch_movement_system(
     mut prediction: ResMut<LocalPlayerPrediction>,
     navmesh: Res<super::navmesh_overlay::NavmeshState>,
     minimap_hover: Res<ffxi_viewer_core::minimap::input::MinimapHoverGate>,
+    mut rest_stance: ResMut<ffxi_viewer_core::combat_stance::RestStance>,
 ) {
     // Pause walking only when the operator's actively typing (Chat) or
     // making an event choice (Dialog). Menu and QuickAction overlays
@@ -602,6 +643,58 @@ pub fn dispatch_movement_system(
         if zoom_d != 0.0 {
             chase.distance =
                 (chase.distance + zoom_d).clamp(ChaseCamera::DIST_MIN, ChaseCamera::DIST_MAX);
+        }
+    }
+
+    // --- rest-stance gate (sit/heal) ---
+    //
+    // While the local self is in a rest stance, no movement Move
+    // packets emit. Any *press* of a translation or rotation action
+    // (W/S/A/D/Q/E and the bound Strafe* / Turn*) stands the player
+    // up — that's the retail "stand on first input" behavior. The
+    // press is observed via `Bindings::just_pressed` so the cancel
+    // is edge-triggered; holding a key while transitioning into a
+    // rest stance won't fight the new state.
+    //
+    // When Heal is cleared this way we also send `Heal::Off` on the
+    // wire so the server's `EFFECT_HEALING` clears in the same tick
+    // as the client visual. The session loop has its own
+    // movement-detected auto-cancel (`session.rs:1936`), but that
+    // only fires when the keepalive thread next runs *and* observes
+    // a position delta — pre-empting it here keeps the visual /
+    // wire state synced on the press, before any position actually
+    // changes.
+    if rest_stance.is_resting() {
+        use ffxi_viewer_core::combat_stance::RestKind;
+        let move_actions = [
+            Action::MoveForward,
+            Action::MoveBackward,
+            Action::StrafeLeft,
+            Action::StrafeRight,
+            Action::TurnLeft,
+            Action::TurnRight,
+            Action::RotateLeft,
+            Action::RotateRight,
+        ];
+        let pressed_move = move_actions
+            .iter()
+            .any(|a| bindings.just_pressed(*a, &keys));
+        if pressed_move {
+            if matches!(rest_stance.kind, RestKind::Heal) {
+                let _ = cmd_tx.0.try_send(AgentCommand::Heal {
+                    mode: crate::state::HealMode::Off,
+                });
+            }
+            rest_stance.kind = RestKind::None;
+            // Fall through this tick to begin moving — the press
+            // that stood us up is also a valid first frame of
+            // locomotion, matching retail's behavior.
+        } else {
+            // Otherwise: full suppression. No Move emission this
+            // tick, autorun stays off, prediction holds.
+            autorun.phantom_forward = false;
+            autorun.strafe_held_since = None;
+            return;
         }
     }
 
