@@ -45,6 +45,7 @@ use ffxi_dat::anim::Mo2Animation;
 use ffxi_dat::{walk, ChunkKind, DatRoot};
 
 use crate::components::WorldEntity;
+use crate::snapshot::SceneState;
 
 /// Reverse-map a PC skeleton DAT id to its motion DAT id (battle
 /// animation set #0 — unarmed).
@@ -87,6 +88,28 @@ static RUN_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = Onc
 /// 68-bone full rig). PC-only; keyed by motion DAT id like
 /// [`BATTLE_IDLE_ANIMS`].
 static COMBAT_RUN_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> =
+    OnceLock::new();
+
+/// Cache for directional locomotion variants resolved by 3-char prefix
+/// against the skeleton DAT. Key is `(skel_file_id, prefix)`.
+///
+/// Probed prefixes (see [`directional_anim_for_skel`]):
+///   - `bck` — backpedal. Absent from every PC skeleton DAT we probed;
+///     callers fall back to `run` at negative time-scale.
+///   - `stl` / `str` — strafe-left / strafe-right. Absent from PC
+///     skeletons; retail does *not* ship strafe clips and the engine
+///     just plays `run` while the camera-relative input picks the
+///     direction. We probe them anyway in case beastman/NPC skels
+///     carry them; if they don't, the cached `None` makes lookups O(1).
+///   - `trn` — turn-in-place. Absent from PC skeletons; retail uses
+///     the idle pose with a yaw-only delta. Probed for NPC skeletons
+///     that may carry it (some ranger NPCs do).
+///   - `wlk` — walk. Present on most PC skeletons as `wlk0`; used
+///     for sub-base-run speeds (e.g. shadow walk, /walk toggle).
+///
+/// Cache entries are keyed by `(file_id, [u8; 3])` rather than a
+/// string so we don't pay a `String` allocation per query.
+static DIRECTIONAL_ANIMS: OnceLock<Mutex<HashMap<(u32, [u8; 3]), Option<Arc<Mo2Animation>>>>> =
     OnceLock::new();
 
 /// 3-char MO2 name prefix for the battle-idle pose inside a motion
@@ -162,6 +185,21 @@ pub fn combat_run_anim_for_skel(skel_file_id: u32) -> Option<Arc<Mo2Animation>> 
     loaded
 }
 
+/// Resolve a directional locomotion variant (`bck`/`stl`/`str`/`trn`/`wlk`)
+/// from a skeleton DAT. Cached; returns `None` and caches that `None`
+/// if the DAT carries no chunk with that 3-char prefix.
+pub fn directional_anim_for_skel(skel_file_id: u32, prefix: &[u8; 3]) -> Option<Arc<Mo2Animation>> {
+    let map = DIRECTIONAL_ANIMS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().ok()?;
+    let key = (skel_file_id, *prefix);
+    if let Some(entry) = guard.get(&key) {
+        return entry.clone();
+    }
+    let loaded = load_anim_with_prefix(skel_file_id, prefix).map(Arc::new);
+    guard.insert(key, loaded.clone());
+    loaded
+}
+
 /// Shared loader: open a DAT, walk its chunks, return the first MO2
 /// whose 3-char name prefix matches `prefix`. Used for `btl`, `run`,
 /// and any future prefix we wire up (`wlk`, `mvb`, …).
@@ -183,6 +221,105 @@ fn load_anim_with_prefix(file_id: u32, prefix: &[u8; 3]) -> Option<Mo2Animation>
     None
 }
 
+/// A logical animation slot picked by `tick_skinned_actors` for a
+/// given (engaged, motion-pattern) tuple. Used both as a key for
+/// detecting "the clip changed since last frame" and as the
+/// `from`/`to` ends of a [`AnimationBlend`].
+///
+/// We deliberately do NOT use `Arc<Mo2Animation>` pointer identity
+/// — the per-skel caches hand back the same `Arc` for repeated
+/// queries of the same slot, but multiple distinct
+/// `(skel, prefix)` combos may resolve to the same underlying clip
+/// when a race lacks a dedicated variant and falls back to e.g.
+/// `run`. Comparing by `ClipId` matches the *intent* (what the
+/// selection rule chose) rather than the resolved bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ClipId {
+    Idle,
+    BattleIdle,
+    Run,
+    CombatRun,
+    /// Backpedal — currently always resolves to `Run` played at
+    /// negative time-scale (no `bck` clip exists on PC skeletons we
+    /// probed). Carried as a distinct ClipId so the cross-fade trips
+    /// when transitioning between run and backpedal.
+    Backpedal,
+    /// Strafe left / right — falls back to `Run` when the
+    /// per-skeleton `stl`/`str` probe returns `None`.
+    StrafeLeft,
+    StrafeRight,
+    /// Turn-in-place — falls back to `Idle` when no `trn` clip.
+    TurnInPlace,
+    /// Walk speed (sub-base-run). Falls back to `Run` when no `wlk`.
+    Walk,
+}
+
+/// Per-actor cross-fade state. Stored in a `Resource` keyed by wire
+/// entity id (parallel to [`EntityMotion`]) rather than as an ECS
+/// `Component` so the lifetime is dictated by gameplay (clear when
+/// the entity vanishes from the snapshot) rather than ECS spawn /
+/// despawn churn.
+#[derive(Clone, Copy, Debug)]
+pub struct AnimationBlend {
+    pub from_clip: ClipId,
+    pub to_clip: ClipId,
+    /// Blend progress in [0, 1]. 0 = fully on `from`, 1 = fully
+    /// settled on `to`.
+    pub t: f32,
+    /// Total duration in seconds for this cross-fade. 0.15 is the
+    /// retail-feel default — long enough to hide popping, short
+    /// enough that fast direction changes still feel responsive.
+    pub duration: f32,
+}
+
+/// Per-actor cross-fade table. See [`AnimationBlend`].
+#[derive(Resource, Default)]
+pub struct AnimationBlends {
+    pub by_id: HashMap<u32, AnimationBlend>,
+}
+
+impl AnimationBlends {
+    pub const DEFAULT_DURATION: f32 = 0.15;
+
+    /// Start a cross-fade from the entity's last-selected clip to
+    /// `to`. If there is no last clip (first frame the entity is
+    /// seen) or the entity is already on `to`, sets the blend
+    /// directly to t=1.0 / no-op respectively. Call once per frame
+    /// per actor.
+    pub fn update(&mut self, id: u32, current: ClipId, dt: f32) {
+        match self.by_id.get_mut(&id) {
+            None => {
+                self.by_id.insert(
+                    id,
+                    AnimationBlend {
+                        from_clip: current,
+                        to_clip: current,
+                        t: 1.0,
+                        duration: Self::DEFAULT_DURATION,
+                    },
+                );
+            }
+            Some(blend) => {
+                if blend.to_clip != current {
+                    // Mid-blend retarget: pin the visual position by
+                    // treating the current interpolated state as the
+                    // new `from`. We approximate by setting from =
+                    // previous to and resetting t — the visual jump
+                    // is sub-frame because the blend was already
+                    // most of the way through the previous transition
+                    // in nearly every realistic case.
+                    blend.from_clip = blend.to_clip;
+                    blend.to_clip = current;
+                    blend.t = 0.0;
+                    blend.duration = Self::DEFAULT_DURATION;
+                } else if blend.t < 1.0 {
+                    blend.t = (blend.t + dt / blend.duration.max(1e-4)).min(1.0);
+                }
+            }
+        }
+    }
+}
+
 /// Per-entity motion state: last seen Bevy translation and the
 /// computed velocity magnitude from the previous frame.
 ///
@@ -200,12 +337,35 @@ fn load_anim_with_prefix(file_id: u32, prefix: &[u8; 3]) -> Option<Mo2Animation>
 /// practice the wrong-sign bug went the *other* way: the engaged
 /// path was never reached because the snapshot doesn't echo
 /// post-LOGIN speed changes consistently.
+/// Per-entity directional motion sample.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MotionSample {
+    /// Last observed Bevy translation. Used to derive next-frame
+    /// velocity by finite difference.
+    pub last_pos: Vec3,
+    /// xz speed magnitude in yalms/sec.
+    pub speed: f32,
+    /// Velocity projected onto the entity's facing direction (xz). +
+    /// = forward, − = backpedal. Magnitude is yalms/sec.
+    pub forward_component: f32,
+    /// Velocity projected perpendicular to facing. + = right (strafe-R),
+    /// − = left (strafe-L). Right is defined as a 90° CW rotation of
+    /// forward in the xz-plane (FFXI heading convention).
+    pub strafe_component: f32,
+    /// Last observed heading (u8 LSB convention). Stored as the
+    /// unwrapped float in radians so cross-zero wraps don't generate
+    /// spurious "instant 360° spin" rate spikes.
+    pub last_heading_rad: f32,
+    /// Heading rotation rate in rad/sec, unwrapped across the
+    /// 0/2π seam. Sign matches FFXI heading: + = clockwise from
+    /// above (per scene::heading_to_quat docstring).
+    pub heading_rate: f32,
+}
+
 #[derive(Resource, Default)]
 pub struct EntityMotion {
-    /// `(last_translation, current_speed_yalms_per_sec)` per wire
-    /// entity id. Speed is the magnitude of last frame's xz delta
-    /// divided by `Time::delta_secs()`.
-    pub by_id: HashMap<u32, (Vec3, f32)>,
+    /// Per-wire-entity motion sample. See [`MotionSample`].
+    pub by_id: HashMap<u32, MotionSample>,
 }
 
 impl EntityMotion {
@@ -215,14 +375,21 @@ impl EntityMotion {
     /// missing actual locomotion. FFXI base run speed is ~5
     /// yalms/sec, so 0.5 is well below the genuine-motion floor.
     pub fn is_moving(&self, id: u32) -> bool {
-        self.by_id.get(&id).is_some_and(|(_, v)| *v > Self::MOVE_THRESHOLD)
+        self.by_id
+            .get(&id)
+            .is_some_and(|s| s.speed > Self::MOVE_THRESHOLD)
     }
 
-    /// Minimum xz speed in yalms/sec to count as "moving". Above
-    /// the smoothing noise floor (`SNAP_DIST_SQ.sqrt() * VISUAL_SMOOTH
-    /// / dt` for a 60 Hz tick is ~0.6 yalms/sec at the extreme; 0.5
-    /// catches everything but a stop-and-go jitter sequence).
-    const MOVE_THRESHOLD: f32 = 0.5;
+    /// Lookup the full sample. Returns `None` for never-seen ids.
+    pub fn sample(&self, id: u32) -> Option<MotionSample> {
+        self.by_id.get(&id).copied()
+    }
+
+    /// Minimum xz speed in yalms/sec to count as "moving".
+    pub const MOVE_THRESHOLD: f32 = 0.5;
+    /// Minimum |heading_rate| in rad/sec to count as "turning in place".
+    /// ~28°/sec — above sample noise, well below combat-cam yaw flicks.
+    pub const TURN_THRESHOLD_RAD_PER_SEC: f32 = 0.5;
 }
 
 /// Per-frame: write each `WorldEntity`'s current xz speed into
@@ -231,20 +398,71 @@ impl EntityMotion {
 /// the same-frame motion state.
 pub fn track_entity_motion_system(
     time: Res<Time>,
+    state: Res<SceneState>,
     mut motion: ResMut<EntityMotion>,
     q: Query<(&WorldEntity, &Transform)>,
 ) {
     let dt = time.delta_secs().max(1e-4);
     for (world, transform) in &q {
         let pos = transform.translation;
-        let entry = motion.by_id.entry(world.id).or_insert((pos, 0.0));
-        let dx = pos.x - entry.0.x;
-        let dz = pos.z - entry.0.z;
-        let xz_dist = (dx * dx + dz * dz).sqrt();
-        // Y is ignored deliberately: terrain/floor snap can shift
-        // y per-frame without the entity actually moving.
-        entry.0 = pos;
-        entry.1 = xz_dist / dt;
+        // Convert wire heading (u8, 0..256) to radians using LSB
+        // convention echoed in `scene::heading_to_quat`: heading 0 =
+        // +Y in FFXI = -Z in Bevy. We compute the forward vector
+        // *directly in Bevy xz* so projection math stays consistent
+        // with the Transform we read above.
+        let heading_u8 = state
+            .snapshot
+            .entities
+            .iter()
+            .find(|e| e.id == world.id)
+            .map(|e| e.heading)
+            .unwrap_or(0);
+        let heading_rad =
+            (heading_u8 as f32) * std::f32::consts::TAU / 256.0;
+        // Forward in Bevy xz: heading 0 → (-Z). `Quat::from_rotation_y(-θ)`
+        // applied to default forward (0, 0, -1) gives
+        // (-sin(-θ), 0, -cos(-θ)) = (sin θ, 0, -cos θ).
+        let fwd_x = heading_rad.sin();
+        let fwd_z = -heading_rad.cos();
+        // Right vector = 90° CW from forward in xz-plane (looking
+        // down +Y). CW rotation of (x, z) by 90° is (z, -x).
+        let right_x = fwd_z;
+        let right_z = -fwd_x;
+
+        let prev = motion.by_id.get(&world.id).copied().unwrap_or(MotionSample {
+            last_pos: pos,
+            last_heading_rad: heading_rad,
+            ..Default::default()
+        });
+        let dx = pos.x - prev.last_pos.x;
+        let dz = pos.z - prev.last_pos.z;
+        let vx = dx / dt;
+        let vz = dz / dt;
+        let speed = (vx * vx + vz * vz).sqrt();
+        let forward_component = vx * fwd_x + vz * fwd_z;
+        let strafe_component = vx * right_x + vz * right_z;
+
+        // Heading rate: unwrap across the 0/2π seam so wrapping from
+        // 255 → 0 doesn't read as a ~2π/dt instant spin spike.
+        let mut dh = heading_rad - prev.last_heading_rad;
+        if dh > std::f32::consts::PI {
+            dh -= std::f32::consts::TAU;
+        } else if dh < -std::f32::consts::PI {
+            dh += std::f32::consts::TAU;
+        }
+        let heading_rate = dh / dt;
+
+        motion.by_id.insert(
+            world.id,
+            MotionSample {
+                last_pos: pos,
+                speed,
+                forward_component,
+                strafe_component,
+                last_heading_rad: heading_rad,
+                heading_rate,
+            },
+        );
     }
 }
 
@@ -350,10 +568,15 @@ mod tests {
     #[test]
     fn is_moving_threshold_behaviour() {
         let mut m = EntityMotion::default();
-        m.by_id.insert(1, (Vec3::ZERO, 0.0));
-        m.by_id.insert(2, (Vec3::ZERO, 0.49));
-        m.by_id.insert(3, (Vec3::ZERO, 0.51));
-        m.by_id.insert(4, (Vec3::ZERO, 6.0));
+        let make = |speed: f32| MotionSample {
+            last_pos: Vec3::ZERO,
+            speed,
+            ..Default::default()
+        };
+        m.by_id.insert(1, make(0.0));
+        m.by_id.insert(2, make(0.49));
+        m.by_id.insert(3, make(0.51));
+        m.by_id.insert(4, make(6.0));
         assert!(!m.is_moving(1), "0 speed should not animate");
         assert!(!m.is_moving(2), "below 0.5 should not animate");
         assert!(m.is_moving(3), "just above 0.5 should animate");

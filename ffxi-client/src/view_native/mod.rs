@@ -520,6 +520,8 @@ fn despawn_ingame_entities(
     mut system_sfx_cursor: ResMut<ffxi_viewer_core::audio::SystemSfxCursor>,
     mut engagement_chat_cursor: ResMut<ffxi_viewer_core::debug_chat::EngagementChatCursor>,
     mut speed_suppression_latch: ResMut<ffxi_viewer_core::debug_chat::SpeedSuppressionLatch>,
+    mut entity_motion: ResMut<ffxi_viewer_core::combat_stance::EntityMotion>,
+    mut animation_blends: ResMut<ffxi_viewer_core::combat_stance::AnimationBlends>,
 ) {
     let mut count = 0usize;
     for entity in q.iter() {
@@ -581,6 +583,15 @@ fn despawn_ingame_entities(
     // session's first snapshot lands.
     *scene = SceneState::default();
     events.recent.clear();
+    // Locomotion caches: both are keyed by wire entity id, and
+    // ids are session-scoped (the next session may reuse the same
+    // id for a totally different actor). Without draining, the new
+    // session's first frame would read a stale `last_pos` /
+    // `from_clip` and either emit a giant speed spike (snap) or
+    // cross-fade from an unrelated anim. Drain on InGame exit so
+    // each session starts with a clean per-actor history.
+    entity_motion.by_id.clear();
+    animation_blends.by_id.clear();
 
     tracing::info!(count, "OnExit(InGame): despawned scoped entities");
 }
