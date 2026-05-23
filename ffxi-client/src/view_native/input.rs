@@ -57,11 +57,17 @@ use tokio::sync::mpsc;
 
 use crate::state::{ActionKind, AgentCommand};
 
-/// 20 Hz rotation: heading delta per tick (~56 °/s — matches view3d).
-const ROTATE_STEP_HELD: u8 = 2;
-/// Camera yaw delta per tick when ←/→ held. Same angular rate as player
-/// rotation so the two feel comparable.
-const CAMERA_YAW_STEP: f32 = ROTATE_STEP_HELD as f32 * std::f32::consts::TAU / 256.0;
+/// Player A/D heading turn rate, **radians per second** of held key. Frame-
+/// rate-independent so the dispatch tick rate (currently 60 Hz; see
+/// `view_native::mod`) can change without retuning. 0.86 rad/s ≈ 49 °/s —
+/// matches the retail FFXI feel of a visible but unhurried pivot (full
+/// 180° in ~3.7 s) and keeps the older ROTATE_STEP_HELD=2-at-20-Hz target
+/// of ~56°/s within ±13%. Camera yaw turns lock-step at the same rate so
+/// the chase camera stays glued behind the player while turning in place.
+pub const HEADING_TURN_RATE: f32 = 0.86;
+/// Camera yaw delta per second when ←/→ held — same angular rate as
+/// player rotation so free-look and steered turns feel comparable.
+const CAMERA_YAW_RATE: f32 = HEADING_TURN_RATE;
 /// Camera pitch delta per tick when ↑/↓ held. ~17 °/s @ 20 Hz — slow on
 /// purpose so taps make small adjustments.
 const PITCH_STEP_HELD: f32 = 0.015;
@@ -86,6 +92,48 @@ pub struct CommandTx(pub mpsc::Sender<AgentCommand>);
 pub struct AutoRun {
     pub phantom_forward: bool,
     pub strafe_held_since: Option<Instant>,
+}
+
+/// Fractional carry for the time-based A/D heading turn. Heading is a
+/// u8 (256 units = 2π), but at 60 Hz dispatch the per-tick delta from a
+/// finite turn rate (≈0.58 u8/tick at 0.86 rad/s) rounds to zero —
+/// holding A/D would never accumulate enough to flip a unit. We keep a
+/// signed f32 accumulator across ticks and only emit whole-unit
+/// `wrapping_add` deltas when |accum| ≥ 1.0, draining the integer part
+/// each time. Reset to 0 when no turn key is held so a paused press
+/// doesn't replay leftover fraction.
+#[derive(Resource, Default)]
+pub struct HeadingTurnAccum {
+    pub units: f32,
+}
+
+/// Advance the A/D heading-turn accumulator by one tick. Returns
+/// `(integer_u8_delta_this_tick, float_u8_delta_this_tick)`:
+/// - `integer_u8_delta_this_tick` is what gets `wrapping_add`-ed to the
+///   server-visible u8 heading (and only emitted when nonzero).
+/// - `float_u8_delta_this_tick` is what the chase camera yaw consumes —
+///   smooth every tick so the camera doesn't visibly snap on integer
+///   ticks of the discretized heading.
+///
+/// On release (`dir == 0`) the leftover fractional units are discarded
+/// so a re-press doesn't start with a phantom partial unit. Pure
+/// function — extracted for unit testability since `dispatch_movement_system`
+/// is Bevy-ECS-heavy and can't be exercised in isolation.
+pub fn advance_heading_turn(
+    accum_units: &mut f32,
+    dir: i32,
+    dt_secs: f32,
+) -> (i32, f32) {
+    let turn_units_per_sec = HEADING_TURN_RATE * 256.0 / std::f32::consts::TAU;
+    let float_delta = dir as f32 * turn_units_per_sec * dt_secs;
+    if dir == 0 {
+        *accum_units = 0.0;
+        return (0, 0.0);
+    }
+    *accum_units += float_delta;
+    let whole = accum_units.trunc();
+    *accum_units -= whole;
+    (whole as i32, float_delta)
 }
 
 /// Edge-trigger handler: window-close shortcuts, target/autorun/lock-on
@@ -319,6 +367,7 @@ pub fn dispatch_movement_system(
     lock_on: Res<LockOn>,
     mut autorun: ResMut<AutoRun>,
     mut chase: ResMut<ChaseCamera>,
+    mut turn_accum: ResMut<HeadingTurnAccum>,
     navmesh: Res<super::navmesh_overlay::NavmeshState>,
 ) {
     // Pause walking only when the operator's actively typing (Chat) or
@@ -361,11 +410,12 @@ pub fn dispatch_movement_system(
 
     // --- camera yaw: ←/→ orbit the camera (player unaffected). ---
     let mut yaw_d = 0.0;
+    let yaw_step = CAMERA_YAW_RATE * time.delta_secs();
     if !in_picker && bindings.pressed(Action::CameraYawLeft, &keys) {
-        yaw_d += CAMERA_YAW_STEP;
+        yaw_d += yaw_step;
     }
     if !in_picker && bindings.pressed(Action::CameraYawRight, &keys) {
-        yaw_d -= CAMERA_YAW_STEP;
+        yaw_d -= yaw_step;
     }
     if yaw_d != 0.0 {
         chase.yaw += yaw_d;
@@ -405,14 +455,23 @@ pub fn dispatch_movement_system(
         autorun.phantom_forward = false;
     }
 
-    // --- rotate player only (no strafe, no camera). ---
-    let mut player_rotate: i32 = 0;
+    // --- rotate player (and chase camera lock-step). Time-based so the
+    //     turn rate is framerate-independent: `HEADING_TURN_RATE` rad/s
+    //     mapped onto the 256-unit FFXI heading scale. Holding A or D
+    //     should sweep the player heading at ~0.86 rad/s (~49°/s) — a
+    //     visible pivot rather than an instant snap, matching retail
+    //     FFXI. The fractional carry (`HeadingTurnAccum`) is what makes
+    //     sub-unit per-tick deltas at 60 Hz actually accumulate into
+    //     u8 ticks instead of rounding to zero every frame. ---
+    let mut player_rotate_dir: i32 = 0;
     if bindings.pressed(Action::RotateLeft, &keys) {
-        player_rotate -= 1;
+        player_rotate_dir -= 1;
     }
     if bindings.pressed(Action::RotateRight, &keys) {
-        player_rotate += 1;
+        player_rotate_dir += 1;
     }
+    let (player_rotate_u8, heading_delta_units) =
+        advance_heading_turn(&mut turn_accum.units, player_rotate_dir, time.delta_secs());
 
     // --- strafe perpendicular to current heading. Unbound under
     //     Compact 1 / Standard — `pressed` returns false for unbound
@@ -426,7 +485,7 @@ pub fn dispatch_movement_system(
     }
 
     // Sustained A/D-or-Q/E hold cancels autorun. A brief tap won't.
-    let any_strafe_or_rotate = player_rotate != 0 || strafe != 0;
+    let any_strafe_or_rotate = player_rotate_dir != 0 || strafe != 0;
     if any_strafe_or_rotate {
         let now = Instant::now();
         let started = *autorun.strafe_held_since.get_or_insert(now);
@@ -478,7 +537,22 @@ pub fn dispatch_movement_system(
     // the server sees the operator's facing track the target. Cheap —
     // only fires when the operator is locked AND the heading actually
     // moved by ≥1 u8 unit (~1.4°).
-    if forward == 0 && strafe == 0 && player_rotate == 0 {
+    // Update camera yaw smoothly every tick while A/D is held (float
+    // domain — doesn't wait for the u8 heading-accumulator to tick). This
+    // is what keeps the chase camera visibly glued behind the player
+    // mid-pivot, even on frames where the integer heading didn't advance.
+    if player_rotate_dir != 0 {
+        chase.yaw -= heading_delta_units * std::f32::consts::TAU / 256.0;
+    }
+
+    // Bail-out: nothing to send this tick. We still fall through to the
+    // lock-on heading-only branch below when the operator is locked on,
+    // and we still need to emit a Move when the u8 heading-accumulator
+    // advanced (so the server hears the new heading even when the player
+    // is standing still and just turning).
+    let no_input =
+        forward == 0 && strafe == 0 && player_rotate_u8 == 0;
+    if no_input {
         if let Some(h) = locked_heading {
             if h != self_pos.heading {
                 chase.yaw = ffxi_viewer_core::yaw_for_heading(h);
@@ -509,12 +583,12 @@ pub fn dispatch_movement_system(
     if forward != 0 {
         heading = heading_for_yaw(chase.yaw);
     }
-    if player_rotate != 0 {
-        let delta = (ROTATE_STEP_HELD as i32 * player_rotate).rem_euclid(256) as u8;
+    if player_rotate_u8 != 0 {
+        let delta = player_rotate_u8.rem_euclid(256) as u8;
         heading = heading.wrapping_add(delta);
-        // Lock-step camera rotation: yaw = -heading_angle, so a +Δh in
-        // heading u8 → -Δh·τ/256 in yaw radians.
-        chase.yaw -= player_rotate as f32 * ROTATE_STEP_HELD as f32 * std::f32::consts::TAU / 256.0;
+        // Note: camera yaw was already advanced smoothly above (float
+        // domain, every tick). No second yaw delta here, otherwise the
+        // camera would double-step on integer-tick frames and drift.
     }
 
     // Lock-on: heading already computed at the top of this function
@@ -722,6 +796,91 @@ mod tests {
         } else {
             Some(Vec3::new(p.x / 100.0, 0.0, 0.5))
         }
+    }
+
+    /// Holding A/D for one second at 60 Hz should accumulate close to
+    /// `HEADING_TURN_RATE * 256/τ` u8 units (~35 units = ~49°). This is
+    /// the "finite turn rate" contract: visible, framerate-independent
+    /// sweep at the documented rad/s.
+    #[test]
+    fn heading_turn_accumulates_to_finite_rate_over_one_second() {
+        let mut accum = 0.0_f32;
+        let dt = 1.0 / 60.0;
+        let mut total_u8: i32 = 0;
+        for _ in 0..60 {
+            let (whole, _f) = advance_heading_turn(&mut accum, 1, dt);
+            total_u8 += whole;
+        }
+        let expected = (HEADING_TURN_RATE * 256.0 / std::f32::consts::TAU).round() as i32;
+        // Should match expected within 1 u8 of accumulator slack.
+        assert!(
+            (total_u8 - expected).abs() <= 1,
+            "1s of held turn produced {total_u8} u8 (expected ~{expected})",
+        );
+        // Verify ≈ 49°/s — the finite, retail-feel rate.
+        let degrees = total_u8 as f32 * 360.0 / 256.0;
+        assert!(
+            (degrees - 49.0).abs() < 3.0,
+            "1s of held turn = {degrees:.1}°, expected ~49°",
+        );
+    }
+
+    /// At 60 Hz the per-tick float delta (≈0.58 u8/tick) is below 1.0 —
+    /// without an accumulator, every tick would round to zero and the
+    /// player would never turn. This regression-guards the fractional-
+    /// carry behavior.
+    #[test]
+    fn heading_turn_does_not_round_to_zero_per_tick() {
+        let mut accum = 0.0_f32;
+        let dt = 1.0 / 60.0;
+        // First tick: no whole unit yet (sub-1 delta).
+        let (whole_1, float_1) = advance_heading_turn(&mut accum, 1, dt);
+        assert_eq!(whole_1, 0, "first 60Hz tick must not yet flip a u8");
+        assert!(float_1 > 0.0 && float_1 < 1.0);
+        assert!(accum > 0.0, "fractional units must carry over");
+        // After enough ticks the carry must eventually flip.
+        let mut flipped = false;
+        for _ in 0..10 {
+            let (w, _) = advance_heading_turn(&mut accum, 1, dt);
+            if w != 0 {
+                flipped = true;
+                break;
+            }
+        }
+        assert!(flipped, "accumulator never produced a whole-unit step");
+    }
+
+    /// Releasing the turn key drops the fractional carry so a re-press
+    /// doesn't start with a phantom partial unit (which would feel like
+    /// a tiny snap on every tap).
+    #[test]
+    fn heading_turn_release_clears_fraction() {
+        let mut accum = 0.0_f32;
+        let dt = 1.0 / 60.0;
+        // Build up some fractional carry.
+        let _ = advance_heading_turn(&mut accum, 1, dt);
+        assert!(accum > 0.0);
+        // Release: accum must reset to exactly 0.
+        let (whole, fdelta) = advance_heading_turn(&mut accum, 0, dt);
+        assert_eq!(whole, 0);
+        assert_eq!(fdelta, 0.0);
+        assert_eq!(accum, 0.0);
+    }
+
+    /// Left and right turns are exact negatives of each other — holding
+    /// A then D for the same duration must net zero net heading change.
+    #[test]
+    fn heading_turn_is_symmetric() {
+        let dt = 1.0 / 60.0;
+        let mut accum_l = 0.0_f32;
+        let mut accum_r = 0.0_f32;
+        let mut total_l: i32 = 0;
+        let mut total_r: i32 = 0;
+        for _ in 0..30 {
+            total_l += advance_heading_turn(&mut accum_l, -1, dt).0;
+            total_r += advance_heading_turn(&mut accum_r, 1, dt).0;
+        }
+        assert_eq!(total_l, -total_r);
     }
 
     #[test]

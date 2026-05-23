@@ -51,7 +51,7 @@ use tokio::runtime::Handle as RtHandle;
 use crate::launcher::Defaults;
 
 use self::bridge::NativeSource;
-use self::input::{AutoRun, CommandTx};
+use self::input::{AutoRun, CommandTx, HeadingTurnAccum};
 use self::launcher_ui::{LoginErrorMsg, PendingConnect};
 
 /// Top-level phase of the unified native `App`.
@@ -205,6 +205,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // for highlight materials, breaking Tab targeting visuals.
     app.insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<AutoRun>()
+        .init_resource::<HeadingTurnAccum>()
         .insert_resource(ports)
         .insert_resource(RelayListen(relay_listen))
         .insert_resource(DatRootRes(dat_root));
