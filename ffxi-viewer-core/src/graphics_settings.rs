@@ -514,10 +514,36 @@ pub fn apply_anti_aliasing_system(
 /// Bloom; we just dial the intensity, including to ~0 for "off").
 pub fn apply_bloom_system(
     settings: Res<GraphicsSettings>,
-    mut q_cam: Query<&mut Bloom, With<OperatorCamera>>,
+    mut commands: Commands,
+    mut q_cam: Query<(Entity, Option<&mut Bloom>), With<OperatorCamera>>,
 ) {
-    for mut bloom in q_cam.iter_mut() {
-        bloom.intensity = settings.bloom_intensity;
+    // Profiling (May 2026): when `Bloom` is present, Bevy runs the full
+    // mip-chain downsample + upsample + composite render-pass set every
+    // frame regardless of intensity — wgpu render-pass dispatch was
+    // measured at ~30% of all hot-thread CPU time. Treat near-zero
+    // intensity as "off" and actually remove the component so the
+    // passes don't get scheduled. Matches the volumetric-fog pattern
+    // just below.
+    let want = settings.bloom_intensity;
+    let on = want > 1e-3;
+    for (entity, bloom) in q_cam.iter_mut() {
+        match (on, bloom) {
+            (true, Some(mut b)) => {
+                if (b.intensity - want).abs() > 1e-4 {
+                    b.intensity = want;
+                }
+            }
+            (true, None) => {
+                commands.entity(entity).insert(Bloom {
+                    intensity: want,
+                    ..Default::default()
+                });
+            }
+            (false, Some(_)) => {
+                commands.entity(entity).remove::<Bloom>();
+            }
+            (false, None) => {}
+        }
     }
 }
 
