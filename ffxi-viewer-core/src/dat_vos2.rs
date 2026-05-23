@@ -1573,6 +1573,12 @@ fn spawn_skinned_actor(
             base_color_texture: tex_handle.clone(),
             perceptual_roughness: 1.0,
             metallic: 0.0,
+            // FFXI character textures are baked diffuse; the engine
+            // never authored a Fresnel/spec response. Bevy's default
+            // reflectance of 0.5 (4% F0 non-metal) produces visible
+            // rim/sheen on cloth and skin. Zero it out — matches the
+            // MMB path which makes the same choice.
+            reflectance: 0.0,
             cull_mode: None,
             ..default()
         });
@@ -2189,6 +2195,11 @@ fn spawn_vos2_meshes_with_skeleton(
                 base_color_texture: tex_handle.clone(),
                 perceptual_roughness: group_roughness,
                 metallic: group_metallic,
+                // Same rationale as the vos2 NPC path above: FFXI's
+                // baked diffuse textures + Bevy's default 0.5 F0
+                // reflectance read as "shiny cloth/skin" — kill it
+                // until a proper FFXI-spec→Fresnel pipeline exists.
+                reflectance: 0.0,
                 cull_mode: None,
                 ..default()
             });
