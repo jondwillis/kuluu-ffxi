@@ -35,6 +35,10 @@ relay = [
     "dep:postcard",
     "dep:futures-util",
 ]
+# Per-system tracing via bevy/trace_chrome. Run with `--features trace`
+# to emit `trace-<pid>.json` in CWD; load in ui.perfetto.dev. Heavy —
+# slows the build, adds runtime overhead — strictly for profiling.
+trace = ["bevy/trace_chrome"]
 
 [dependencies]
 ffxi-proto = { path = "../ffxi-proto" }

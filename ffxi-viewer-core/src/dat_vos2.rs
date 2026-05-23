@@ -1655,6 +1655,16 @@ pub fn tick_skinned_actors(
     use crate::combat_stance::{ClipId, EntityMotion};
     let elapsed = time.elapsed_secs();
     let dt = time.delta_secs();
+    // Build a once-per-frame index of (id → bt_target_id) so the inner
+    // engagement lookup is O(1). Without this, the per-actor loop did
+    // a linear `find()` over the whole snapshot — quadratic in nearby
+    // entity count, which is the hot path in crowded zones.
+    let bt_target_by_id: std::collections::HashMap<u32, u32> = state
+        .snapshot
+        .entities
+        .iter()
+        .map(|e| (e.id, e.bt_target_id))
+        .collect();
     for (world, actor) in &q_actors {
         let Some(baked) = baked_skeleton_for_file(actor.dat_id) else {
             continue;
@@ -1667,12 +1677,9 @@ pub fn tick_skinned_actors(
         // `track_entity_motion_system`. The wire `speed` field is
         // movement *capability* (40 = base run, 0 = bound/stunned),
         // NOT current motion — see [`EntityMotion`] docs.
-        let engaged = state
-            .snapshot
-            .entities
-            .iter()
-            .find(|e| e.id == world.id)
-            .map(|e| e.bt_target_id != 0)
+        let engaged = bt_target_by_id
+            .get(&world.id)
+            .map(|&t| t != 0)
             .unwrap_or(false);
         let sample = motion
             .sample(world.id)

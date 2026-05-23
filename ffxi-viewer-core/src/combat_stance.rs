@@ -489,6 +489,16 @@ pub fn track_entity_motion_system(
     q: Query<(&WorldEntity, &Transform)>,
 ) {
     let dt = time.delta_secs().max(1e-4);
+    // Was O(N²): each entity in the query did a linear `.find()` over
+    // the full snapshot.entities Vec. With ~200 nearby entities that's
+    // 40k scans/frame on the locomotion path. Build a heading index
+    // once.
+    let heading_by_id: std::collections::HashMap<u32, u8> = state
+        .snapshot
+        .entities
+        .iter()
+        .map(|e| (e.id, e.heading))
+        .collect();
     for (world, transform) in &q {
         let pos = transform.translation;
         // Convert wire heading (u8, 0..256) to radians using LSB
@@ -496,13 +506,7 @@ pub fn track_entity_motion_system(
         // +Y in FFXI = -Z in Bevy. We compute the forward vector
         // *directly in Bevy xz* so projection math stays consistent
         // with the Transform we read above.
-        let heading_u8 = state
-            .snapshot
-            .entities
-            .iter()
-            .find(|e| e.id == world.id)
-            .map(|e| e.heading)
-            .unwrap_or(0);
+        let heading_u8 = heading_by_id.get(&world.id).copied().unwrap_or(0);
         let heading_rad =
             (heading_u8 as f32) * std::f32::consts::TAU / 256.0;
         // Forward in Bevy xz: heading 0 → (-Z). `Quat::from_rotation_y(-θ)`
