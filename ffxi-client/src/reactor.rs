@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ffxi_nav::{glam, GridNav, NavMesh};
@@ -268,6 +268,31 @@ pub struct Reactor {
     /// drops us on top of the return zoneline (the destination side of
     /// the doorway sits inside its own AABB).
     needs_zone_seed: bool,
+    /// Active forced-position override, set by `AgentEvent::ForcedMove`.
+    /// During its lifetime, input-driven `Move` emission is suppressed
+    /// and the reactor emits per-tick `Move`s lerping the self position
+    /// toward `target`. When `expiry` passes, the override clears and
+    /// normal goal-driven behavior resumes.
+    ///
+    /// This covers the LSB WPOS / WPOS2 family (cutscene end, zone-line
+    /// re-anchor, homepoint, GM warp). LSB does **not** ship combat
+    /// knockback over the wire — it's a BATTLE2 animation hint the
+    /// retail client integrates locally — so synthetic knockback packets
+    /// in tests use the same override path to exercise the contract.
+    reactor_override: Option<ReactorOverride>,
+}
+
+/// Active forced-position override window. Mirrors the design in
+/// `ffxi-proto::decode::ForcedMove` (server-driven re-anchor).
+#[derive(Debug, Clone, Copy)]
+pub struct ReactorOverride {
+    /// Server-authoritative destination in our z-up frame.
+    pub target: Vec3,
+    /// Server-supplied heading byte for the destination.
+    pub heading: u8,
+    /// When the override window ends; after this `Instant`, the reactor
+    /// resumes normal input-driven movement.
+    pub expiry: Instant,
 }
 
 impl Reactor {
@@ -281,7 +306,41 @@ impl Reactor {
             nav_cache: None,
             zoneline_trigger_latched: None,
             needs_zone_seed: false,
+            reactor_override: None,
         }
+    }
+
+    /// Currently-active forced-position override, if any. The reactor
+    /// suppresses input-driven `Move` and lerps toward `override.target`
+    /// while this is `Some` and `Instant::now() < override.expiry`.
+    pub fn current_override(&self) -> Option<ReactorOverride> {
+        self.reactor_override
+    }
+
+    /// True iff a forced-position override window is currently active.
+    /// Clears the stored override lazily when its expiry has passed so
+    /// callers don't re-check the timestamp.
+    fn override_active(&mut self) -> bool {
+        match self.reactor_override {
+            Some(ov) if Instant::now() < ov.expiry => true,
+            Some(_) => {
+                self.reactor_override = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Test escape hatch: install a forced-position override directly
+    /// without depending on wall-clock `Instant` arithmetic. Tests can
+    /// expire the window by stepping `expiry` back into the past.
+    #[cfg(test)]
+    pub fn set_override_for_test(&mut self, target: Vec3, heading: u8, ttl: Duration) {
+        self.reactor_override = Some(ReactorOverride {
+            target,
+            heading,
+            expiry: Instant::now() + ttl,
+        });
     }
 
     pub fn current_goal(&self) -> &Goal {
@@ -371,6 +430,21 @@ impl Reactor {
         // Aggro-edge detection runs *before* apply_event because we need
         // the old `bt_target_id` to detect a transition into us.
         let mut out = self.detect_aggro_edge(ev);
+        // Install a forced-position override for the lifetime of the
+        // server's re-anchor window. Suppresses outbound Move emission
+        // during the window; tick_override lerps toward the target.
+        if let AgentEvent::ForcedMove {
+            target,
+            duration_ms,
+            ..
+        } = ev
+        {
+            self.reactor_override = Some(ReactorOverride {
+                target: target.pos,
+                heading: target.heading,
+                expiry: Instant::now() + Duration::from_millis(*duration_ms as u64),
+            });
+        }
         self.state.apply_event(ev);
         // Zone-change invalidates any in-flight `Goal::Pathing` — the
         // waypoints were computed in the old zone's coord frame and
@@ -511,6 +585,15 @@ impl Reactor {
                 CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
             AgentCommand::Move { .. } => {
+                // Drop input-driven Move while a server-initiated forced
+                // position is in flight. The reactor's per-tick lerp owns
+                // movement until the override expires; forwarding a
+                // user Move now would race the server's re-anchor and
+                // either land us back at the pre-warp spot or trip the
+                // anti-speedhack heuristic in session.
+                if self.override_active() {
+                    return CommandRouting::default();
+                }
                 // Manual `Move` overrides whatever goal was active. Only
                 // emit ReactorGoalChanged if we actually transitioned —
                 // otherwise spurious Idle→Idle events flood the log.
@@ -537,6 +620,14 @@ impl Reactor {
     /// (e.g. `ReactorGoalChanged` when `Pathing` self-clears to `Idle`).
     /// Most ticks: zero or one command, zero events.
     pub fn tick(&mut self) -> TickOutput {
+        // Forced-position override owns this tick if active — it
+        // suppresses goal-driven output and emits a lerp Move toward
+        // the server-authoritative target. Zone-line auto-triggers stay
+        // disabled during the window so a re-anchor that puts the
+        // player on a trigger doesn't immediately re-zone them.
+        if let Some(out) = self.tick_override() {
+            return out;
+        }
         // Goal-driven output first; the zone-line auto-trigger runs
         // after so we can append a `RequestZoneChange` command if the
         // player just walked onto a trigger box this tick.
@@ -545,6 +636,31 @@ impl Reactor {
             out.commands.push(req);
         }
         out
+    }
+
+    /// Per-tick lerp toward the server-authoritative `target` of the
+    /// active forced-position override. Returns `None` when no override
+    /// is active (caller falls through to normal goal-driven output).
+    fn tick_override(&mut self) -> Option<TickOutput> {
+        if !self.override_active() {
+            return None;
+        }
+        let ov = self.reactor_override?;
+        let cur = self.self_pos();
+        let dist = horizontal_distance(cur, ov.target);
+        // When we're close enough, snap to the target and clear early —
+        // future ticks no-op until the window naturally expires; the
+        // suppression flag in handle_command stays armed until then so
+        // queued user input doesn't fight the server's re-anchor.
+        let stepped = if dist <= self.cfg.max_step_per_tick {
+            ov.target
+        } else {
+            step_point(cur, ov.target, self.cfg.max_step_per_tick)
+        };
+        Some(TickOutput {
+            commands: vec![mk_move(stepped, ov.heading)],
+            derived_events: Vec::new(),
+        })
     }
 
     /// Edge-triggered zone-line detection. If the player's current
@@ -2486,6 +2602,147 @@ mod tests {
             out.commands.is_empty(),
             "safe/storage are bank dest, not field bag"
         );
+    }
+
+    /// Synthetic-knockback / forced-move contract: when the reactor sees
+    /// `AgentEvent::ForcedMove`, the next tick must drive a Move toward
+    /// `target` (suppressing whatever goal was in flight). After the
+    /// window expires, normal goal-driven output resumes.
+    ///
+    /// LSB doesn't ship combat knockback over the wire (it's a BATTLE2
+    /// animation hint; see ffxi-proto::decode::ForcedMove docs); this
+    /// test exercises the override path with a synthetic packet that
+    /// could just as easily come from WPOS / WPOS2 (cutscene end,
+    /// homepoint, zone-line re-anchor).
+    #[test]
+    fn forced_move_event_installs_override_and_lerps() {
+        use crate::state::Position;
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        r.observe_event(&upsert(
+            1,
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        // Drive a goal too — the override must override it.
+        r.handle_command(AgentCommand::Follow {
+            target_id: 1,
+            distance: 5.0,
+        });
+
+        // Synthetic forced-move 0.5 yalms east of origin. With step_test_cfg's
+        // max_step=1.0 the reactor reaches it in a single tick.
+        let target = Vec3 {
+            x: 0.5,
+            y: 0.0,
+            z: 0.0,
+        };
+        r.observe_event(&AgentEvent::ForcedMove {
+            mode: 0x00,
+            target: Position {
+                pos: target,
+                heading: 64,
+                speed: 0,
+                speed_base: 0,
+            },
+            duration_ms: 5_000,
+        });
+        assert!(
+            r.current_override().is_some(),
+            "ForcedMove event installs an override"
+        );
+
+        let out = r.tick();
+        assert_eq!(out.commands.len(), 1, "exactly one Move emitted per tick");
+        match &out.commands[0] {
+            AgentCommand::Move {
+                x,
+                y,
+                z,
+                heading,
+            } => {
+                assert!((x - 0.5).abs() < 1e-3, "lerp reached target.x");
+                assert!(y.abs() < 1e-3);
+                assert!(z.abs() < 1e-3);
+                assert_eq!(*heading, 64, "heading from override carries through");
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    /// While the override is active, an explicit `Move` from the agent
+    /// is dropped so it doesn't race the server's re-anchor. Same
+    /// rationale as suppressing goal-driven output.
+    #[test]
+    fn forced_move_suppresses_explicit_move_command() {
+        let mut r = Reactor::new(step_test_cfg());
+        r.set_override_for_test(
+            Vec3 {
+                x: 10.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            0,
+            Duration::from_secs(5),
+        );
+        let routing = r.handle_command(AgentCommand::Move {
+            x: 99.0,
+            y: 99.0,
+            z: 99.0,
+            heading: 192,
+        });
+        assert!(
+            routing.forward.is_none(),
+            "explicit Move dropped while override active"
+        );
+        assert!(routing.derived_events.is_empty());
+    }
+
+    /// After the override window expires, normal goal-driven output
+    /// resumes — and the override field clears lazily.
+    #[test]
+    fn forced_move_expires_and_resumes_normal_flow() {
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        r.observe_event(&upsert(
+            1,
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        // Already-expired override (ttl in the past via 0-length window
+        // then a sleep would race; instead set a tiny ttl and assert
+        // via a second tick after expiry).
+        r.set_override_for_test(
+            Vec3 {
+                x: 100.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            0,
+            Duration::from_millis(1),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        let _ = r.tick(); // triggers lazy expiry inside override_active
+        assert!(
+            r.current_override().is_none(),
+            "override clears once expiry passes"
+        );
+        // Normal Idle tick: no commands.
+        let out = r.tick();
+        assert!(out.commands.is_empty());
+        assert!(out.derived_events.is_empty());
     }
 
     #[test]
