@@ -157,12 +157,17 @@ pub fn collect_mouse_system(
 /// Mouse → camera. Mutates [`ChaseCamera`] (yaw, pitch, distance) based on
 /// the pointer state and the active [`CameraMode`].
 ///
-/// - `Chase`: RMB-drag rotates the camera; wheel zooms within
-///   `[DIST_MIN, DIST_MAX]`.
-/// - `FirstPerson`: RMB-drag rotates the look direction; **on release**
-///   yaw/pitch snap back to "straight ahead" (aligned with the player's
-///   heading, level pitch). Matches retail FFXI's "peek with the mouse,
-///   release to recenter" feel. Wheel is ignored (no distance in FP).
+/// - `Chase`: either LMB or RMB drag rotates the camera; wheel zooms
+///   within `[DIST_MIN, DIST_MAX]`. Retail FFXI accepts primary-button
+///   drag for camera orbit, so we honor both.
+/// - `FirstPerson`: either-button drag rotates the look direction;
+///   **on release** yaw/pitch snap back to "straight ahead" (aligned
+///   with the player's heading, level pitch). Matches retail's "peek
+///   with the mouse, release to recenter" feel. Wheel is ignored.
+///
+/// LMB *clicks* (no drag) are routed through Bevy's `Pointer<Click>`
+/// events for click-to-target, which are dispatched separately from
+/// button-held drags — the two don't conflict.
 ///
 /// Pitch is clamped to the mode-specific range so chase doesn't dive
 /// underground and FP doesn't roll past vertical.
@@ -171,14 +176,12 @@ pub fn mouse_camera_system(
     camera_mode: Res<CameraMode>,
     state: Res<SceneState>,
     mut chase: ResMut<ChaseCamera>,
-    // Tracks the previous frame's RMB state so we can detect the
+    // Tracks the previous frame's drag state so we can detect the
     // pressed→released edge that triggers FP snap-back.
-    mut prev_right: Local<bool>,
+    mut prev_drag: Local<bool>,
 ) {
     let mode = *camera_mode;
-    // Both modes now drive the look from RMB-drag — FP no longer
-    // mouse-looks freely (the OG client never did that).
-    let drag_active = pointer.right;
+    let drag_active = pointer.left || pointer.right;
     if drag_active && pointer.delta != Vec2::ZERO {
         chase.yaw -= pointer.delta.x * MOUSE_YAW_SENS;
         // Bevy delivers MouseMotion with `delta.y > 0` for downward cursor
@@ -193,12 +196,12 @@ pub fn mouse_camera_system(
 
     // FP snap-back: pressed→released edge re-centers the look on the
     // player's facing direction. Chase mode keeps the operator's last
-    // orbit angle on release (long-standing behavior).
-    if matches!(mode, CameraMode::FirstPerson) && *prev_right && !pointer.right {
+    // orbit angle on release.
+    if matches!(mode, CameraMode::FirstPerson) && *prev_drag && !drag_active {
         chase.yaw = yaw_for_heading(state.snapshot.self_pos.heading);
         chase.pitch = 0.0;
     }
-    *prev_right = pointer.right;
+    *prev_drag = drag_active;
 
     // Wheel zoom — chase only. Positive wheel = scroll up = zoom in =
     // distance shrinks.

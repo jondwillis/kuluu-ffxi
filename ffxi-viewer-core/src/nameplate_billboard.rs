@@ -42,7 +42,7 @@ use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{Image, ImageSampler};
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use ffxi_viewer_wire::EntityKind;
 
 use crate::camera::{nameplate_anchor_y, OperatorCamera};
