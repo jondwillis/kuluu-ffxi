@@ -21,7 +21,7 @@ use bevy::prelude::*;
 use ffxi_viewer_wire::DialogState;
 
 use crate::hud::palette;
-use crate::input_mode::InputMode;
+use crate::input_mode::{InputMode, DIALOG_MAX_CHOICE};
 use crate::snapshot::SceneState;
 
 #[derive(Component)]
@@ -33,11 +33,28 @@ pub struct DialogHeader;
 #[derive(Component)]
 pub struct DialogBody;
 
+/// One clickable choice button (`0..=DIALOG_MAX_CHOICE`). FFXI events
+/// carry no English option text, so the buttons are bare numbers — the
+/// operator chooses by index, same as the keyboard cursor + Enter path.
+#[derive(Component)]
+pub struct DialogChoiceButton {
+    pub choice: u32,
+}
+
+/// Emitted when an operator clicks a choice button. Consumer in
+/// `ffxi-client/src/view_native/text_input.rs` sends `EndEventChoice`
+/// with the selected index, same as keyboard Enter on that cursor.
+#[derive(Message, Debug, Clone, Copy)]
+pub struct DialogChoiceActivated {
+    pub choice: u32,
+}
+
 const PANEL_WIDTH_PX: f32 = 420.0;
 
 pub fn spawn_dialog_panel(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             DialogPanel,
             Node {
                 position_type: PositionType::Absolute,
@@ -80,6 +97,47 @@ pub fn spawn_dialog_panel(mut commands: Commands) {
                 },
                 TextColor(palette::TEXT),
             ));
+            // Numbered choice buttons row. FFXI events don't carry
+            // option text, so the buttons are bare digits — same as
+            // keyboard, the operator picks an index `0..=DIALOG_MAX_CHOICE`.
+            p.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(4.0),
+                margin: UiRect {
+                    top: Val::Px(6.0),
+                    ..default()
+                },
+                ..default()
+            })
+            .with_children(|row| {
+                for choice in 0..=DIALOG_MAX_CHOICE {
+                    row.spawn((
+                        DialogChoiceButton { choice },
+                        Button,
+                        Node {
+                            width: Val::Px(28.0),
+                            height: Val::Px(22.0),
+                            padding: UiRect::axes(Val::Px(2.0), Val::Px(0.0)),
+                            border: UiRect::all(Val::Px(1.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(palette::BACKGROUND),
+                        BorderColor::all(palette::BORDER),
+                    ))
+                    .with_children(|btn| {
+                        btn.spawn((
+                            Text::new(choice.to_string()),
+                            TextFont {
+                                font_size: 12.0,
+                                ..default()
+                            },
+                            TextColor(palette::TEXT),
+                        ));
+                    });
+                }
+            });
         });
 }
 
@@ -141,6 +199,66 @@ pub fn update_dialog_panel_system(
         let want = format_body(dialog, cursor);
         if **text != want {
             **text = want;
+        }
+    }
+}
+
+/// Recolor each choice button so the currently-selected one (matching
+/// the `DialogCursor`) shows the cyan accent border. Other buttons sit
+/// in the muted state. Runs every frame in Dialog mode — cheap, since
+/// the button count is `1 + DIALOG_MAX_CHOICE`.
+pub fn update_dialog_choice_highlight_system(
+    mode: Res<InputMode>,
+    mut q: Query<(&DialogChoiceButton, &mut BorderColor)>,
+) {
+    let cursor = match &*mode {
+        InputMode::Dialog(c) => c.cursor,
+        _ => return,
+    };
+    for (btn, mut border) in &mut q {
+        let want = if btn.choice == cursor {
+            palette::ACCENT
+        } else {
+            palette::BORDER
+        };
+        if border.left != want {
+            *border = BorderColor::all(want);
+        }
+    }
+}
+
+/// Move the dialog cursor to follow mouse hover. Active only while
+/// `InputMode::Dialog` — the choice buttons are part of a panel that
+/// hides via `Display::None` when no dialog is up, so their
+/// `Interaction` stays Default in that case.
+pub fn dialog_mouse_hover_system(
+    mut mode: ResMut<InputMode>,
+    q: Query<(&Interaction, &DialogChoiceButton), Changed<Interaction>>,
+) {
+    let InputMode::Dialog(cursor) = &mut *mode else {
+        return;
+    };
+    for (interaction, btn) in &q {
+        if matches!(interaction, Interaction::Hovered | Interaction::Pressed)
+            && cursor.cursor != btn.choice
+        {
+            cursor.cursor = btn.choice;
+        }
+    }
+}
+
+/// Emit [`DialogChoiceActivated`] on choice-button click.
+pub fn dialog_mouse_click_system(
+    mode: Res<InputMode>,
+    q: Query<(&Interaction, &DialogChoiceButton), Changed<Interaction>>,
+    mut out: MessageWriter<DialogChoiceActivated>,
+) {
+    if !matches!(*mode, InputMode::Dialog(_)) {
+        return;
+    }
+    for (interaction, btn) in &q {
+        if *interaction == Interaction::Pressed {
+            out.write(DialogChoiceActivated { choice: btn.choice });
         }
     }
 }

@@ -58,6 +58,8 @@ pub struct MeshDebugHudText;
 pub fn spawn_mesh_debug_hud(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
+            crate::hud::DevHud,
             MeshDebugHud,
             Node {
                 position_type: PositionType::Absolute,
@@ -112,11 +114,11 @@ pub fn update_hover_state(
         // have — otherwise we'd zero the panel when leaving an entity
         // we never recorded (e.g. an HP-bar capsule).
         if let Ok(info) = debug_info_q.get(ev.entity) {
-            if hover
-                .current
-                .as_ref()
-                .is_some_and(|cur| cur.file_id == info.file_id && cur.chunk_idx == info.chunk_idx && cur.sub_index == info.sub_index)
-            {
+            if hover.current.as_ref().is_some_and(|cur| {
+                cur.file_id == info.file_id
+                    && cur.chunk_idx == info.chunk_idx
+                    && cur.sub_index == info.sub_index
+            }) {
                 hover.current = None;
                 hover.hit_position = None;
             }
@@ -148,6 +150,7 @@ pub fn update_hover_state(
 /// nothing is hovered.
 pub fn update_mesh_debug_hud(
     hover: Res<MeshHoverDebug>,
+    verbosity: Res<crate::hud::HudVerbosity>,
     mut hud_q: Query<&mut Visibility, With<MeshDebugHud>>,
     mut text_q: Query<&mut Text, With<MeshDebugHudText>>,
 ) {
@@ -157,6 +160,15 @@ pub fn update_mesh_debug_hud(
     let Ok(mut text) = text_q.single_mut() else {
         return;
     };
+    // Dev-HUD gate. When the operator has /devhud off, never reveal
+    // the hover panel — the DevHud visibility system parks it Hidden,
+    // and this short-circuit keeps us from racing to set Inherited.
+    if !verbosity.dev_hud {
+        if *vis != Visibility::Hidden {
+            *vis = Visibility::Hidden;
+        }
+        return;
+    }
     match &hover.current {
         Some(info) => {
             let pos = match hover.hit_position {
@@ -186,8 +198,6 @@ pub fn update_mesh_debug_hud(
 /// backend will raycast against it. Bundled with `Pickable::default()`
 /// at the call site rather than auto-inserted here so it remains
 /// explicit which meshes participate in picking.
-pub fn mesh_debug_bundle(
-    info: MmbDebugInfo,
-) -> (Pickable, MmbDebugInfo) {
+pub fn mesh_debug_bundle(info: MmbDebugInfo) -> (Pickable, MmbDebugInfo) {
     (Pickable::default(), info)
 }

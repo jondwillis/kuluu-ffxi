@@ -57,8 +57,23 @@ pub enum Action {
     // ----- Movement (World mode) -----
     MoveForward,
     MoveBackward,
+    /// Pure heading rotation in place. Camera yaw stays lock-step so the
+    /// camera trails behind the rotated player. No implicit walk
+    /// contribution — use [`Action::TurnLeft`]/[`Action::TurnRight`] for
+    /// the combined "rotate-while-walking" verb that produces FFXI
+    /// classic's orbital motion when held alone in 3rd person.
     RotateLeft,
     RotateRight,
+    /// Combined heading-rotation + forward-walk. In 3rd person, when
+    /// neither `MoveForward` nor `MoveBackward` is held, this implicitly
+    /// drives `forward = 1` so holding the key alone produces orbital
+    /// motion (heading rotates each tick, the forward vector sweeps with
+    /// it, character traces a circle). In first-person it behaves like
+    /// pure rotate — the forward implicit is suppressed since walking-
+    /// in-place-while-looking-around isn't useful when the camera is the
+    /// player's head.
+    TurnLeft,
+    TurnRight,
     StrafeLeft,
     StrafeRight,
 
@@ -91,6 +106,15 @@ pub enum Action {
     TargetParty4,
     TargetParty5,
     TargetParty6,
+
+    // ----- Combat (World mode) -----
+    /// Toggle engagement on the current target. If `Target` is set and we
+    /// are not currently engaged, dispatches `AgentCommand::Engage` (the
+    /// reactor's first tick emits `ActionKind::Attack`/0x01A subkind 0x02).
+    /// If already engaged, dispatches `AgentCommand::Cancel` which clears
+    /// the reactor goal. The server's auto-attack timer drives subsequent
+    /// 0x028 BATTLE2 packets while engaged.
+    ToggleEngage,
 
     // ----- UI activation (World mode) -----
     /// Open chat with empty buffer (default Space).
@@ -457,6 +481,9 @@ mod tests {
             b.get(Action::MoveForward),
             Some(KeyBind::new(KeyCode::KeyW))
         );
-        assert_eq!(b.get(Action::StrafeLeft), Some(KeyBind::new(KeyCode::KeyQ)));
+        // Q is bound to pure RotateLeft after the A/D=turn reshuffle;
+        // StrafeLeft is unbound by default in every shipped preset.
+        assert_eq!(b.get(Action::RotateLeft), Some(KeyBind::new(KeyCode::KeyQ)));
+        assert_eq!(b.get(Action::StrafeLeft), None);
     }
 }

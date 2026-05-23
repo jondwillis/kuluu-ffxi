@@ -329,6 +329,25 @@ pub struct MzbNormal {
     pub n: [f32; 3],
 }
 
+/// Per-triangle material/flag information packed into the high bits of
+/// the 4×u16 index record. The 4 top bits across (v0, v1, v2, n0)
+/// compose a 4-bit `material` id (0..15). Bit 14 of v1/v2 carries
+/// extra flags. Format cross-reference:
+/// `vendor/xi-tinkerer/crates/dats/src/formats/zone_data/mesh_block.rs:51-77`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MzbTriangleInfo {
+    /// 4-bit material id (0..15). Composed from the top bits of all
+    /// four index u16s in order `(v0_top << 0) | (v1_top << 1) |
+    /// (v2_top << 2) | (n0_top << 3)`.
+    pub material: u8,
+    /// Flagged by the client during DAT load when a triangle has two
+    /// vertices on top of each other (degenerate). Bit 14 of v1.
+    pub is_invalid: bool,
+    /// "Barrier" face — non-collision visual or special-purpose face.
+    /// Bit 14 of v2.
+    pub is_barrier: bool,
+}
+
 /// One mesh in the MZB mesh library: a vertex list, a normal list, and
 /// an index list. Indices index into `vertices` and `normals` (the
 /// normal index is per-triangle, one entry per triangle).
@@ -340,10 +359,17 @@ pub struct MzbNormal {
 pub struct MzbMesh {
     pub vertices: Vec<MzbVertex>,
     pub normals: Vec<MzbNormal>,
-    /// `[v0, v1, v2]` triples. Indices already masked with `& 0x3FFF`.
+    /// `[v0, v1, v2]` triples. Indices already masked: v0 with `0x7FFF`
+    /// (15 bits), v1/v2 with `0x3FFF` (14 bits). Top bits stripped for
+    /// the material/flag composition in [`tri_info`].
     pub triangles: Vec<[u32; 3]>,
     /// One per triangle, parallel to `triangles`. Indexes into `normals`.
+    /// Masked with `0x7FFF`.
     pub triangle_normals: Vec<u32>,
+    /// One per triangle, parallel to `triangles`. Carries the 4-bit
+    /// `material` id plus `is_invalid` / `is_barrier` flags extracted
+    /// from the index high bits.
+    pub tri_info: Vec<MzbTriangleInfo>,
     /// Per-mesh flags from the record header. Bit 0 = does NOT block
     /// line of sight (i.e. visual-only / non-collision).
     pub flags: u16,
@@ -482,17 +508,40 @@ fn parse_one_mesh(body: &[u8], pos: usize) -> Result<MzbMesh> {
 
     let mut triangles = Vec::with_capacity(tri_count);
     let mut triangle_normals = Vec::with_capacity(tri_count);
+    let mut tri_info = Vec::with_capacity(tri_count);
     for i in 0..tri_count {
         let o = tris_off + i * 8;
         if o + 8 > body.len() {
             break;
         }
-        let v0 = u16::from_le_bytes([body[o], body[o + 1]]) & 0x3FFF;
-        let v1 = u16::from_le_bytes([body[o + 2], body[o + 3]]) & 0x3FFF;
-        let v2 = u16::from_le_bytes([body[o + 4], body[o + 5]]) & 0x3FFF;
-        let n0 = u16::from_le_bytes([body[o + 6], body[o + 7]]) & 0x3FFF;
-        triangles.push([v0 as u32, v1 as u32, v2 as u32]);
-        triangle_normals.push(n0 as u32);
+        // Per-field bit layout (cross-ref:
+        // `vendor/xi-tinkerer/crates/dats/src/formats/zone_data/mesh_block.rs:51-77`):
+        //   v0_raw: bit 15 = material bit 0, bits 0..14 = vertex index (mask 0x7FFF).
+        //   v1_raw: bit 15 = material bit 1, bit 14 = is_invalid, bits 0..13 = index (mask 0x3FFF).
+        //   v2_raw: bit 15 = material bit 2, bit 14 = is_barrier, bits 0..13 = index (mask 0x3FFF).
+        //   n0_raw: bit 15 = material bit 3, bits 0..14 = normal index (mask 0x7FFF).
+        let v0_raw = u16::from_le_bytes([body[o], body[o + 1]]);
+        let v1_raw = u16::from_le_bytes([body[o + 2], body[o + 3]]);
+        let v2_raw = u16::from_le_bytes([body[o + 4], body[o + 5]]);
+        let n0_raw = u16::from_le_bytes([body[o + 6], body[o + 7]]);
+        let v0 = (v0_raw & 0x7FFF) as u32;
+        let v1 = (v1_raw & 0x3FFF) as u32;
+        let v2 = (v2_raw & 0x3FFF) as u32;
+        let n0 = (n0_raw & 0x7FFF) as u32;
+        let m0 = ((v0_raw >> 15) & 1) as u8;
+        let m1 = ((v1_raw >> 15) & 1) as u8;
+        let m2 = ((v2_raw >> 15) & 1) as u8;
+        let m3 = ((n0_raw >> 15) & 1) as u8;
+        let material = m0 | (m1 << 1) | (m2 << 2) | (m3 << 3);
+        let is_invalid = (v1_raw & 0x4000) != 0;
+        let is_barrier = (v2_raw & 0x4000) != 0;
+        triangles.push([v0, v1, v2]);
+        triangle_normals.push(n0);
+        tri_info.push(MzbTriangleInfo {
+            material,
+            is_invalid,
+            is_barrier,
+        });
     }
 
     Ok(MzbMesh {
@@ -500,6 +549,7 @@ fn parse_one_mesh(body: &[u8], pos: usize) -> Result<MzbMesh> {
         normals,
         triangles,
         triangle_normals,
+        tri_info,
         flags,
     })
 }
@@ -551,6 +601,19 @@ pub struct MzbPlacement {
     /// debugging / culling; not semantically meaningful for rendering.
     pub grid_x: u16,
     pub grid_y: u16,
+    /// MZB-Y of the water surface at this grid cell, when the vis-entry
+    /// records one. `None` for dry cells. Format (per lotus-ffxi
+    /// `parseGridMesh`): signed 26-bit fixed-point at `vis_entry+164`,
+    /// scaled by 1/1024. Y is in MZB-local space — convert with the
+    /// same axis-flip the renderer applies to mesh vertices.
+    ///
+    /// When this is `Some`, the renderer should spawn a flat alpha
+    /// quad at `(placement.translation.x, water_height, placement.translation.z)`
+    /// sized to the placement's geometry XZ extent. Multiple cells
+    /// often share the same water height (e.g. one lake spanning a
+    /// region); grouping by height lets the renderer batch them into
+    /// a single mesh.
+    pub water_height: Option<f32>,
 }
 
 /// Parse one mesh record at an absolute body offset. Used by the
@@ -691,6 +754,30 @@ pub fn parse_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbPlacem
                 // flags i16 — bit 0 = doesn't block LoS).
                 let flags = u16::from_le_bytes([body[geo_off + 14], body[geo_off + 15]]);
 
+                // Water surface height: lotus-ffxi reads a signed
+                // 26-bit fixed-point value at `vis_entry + 164` and
+                // scales by 1/1024 (`((v << 6) >> 10) / 1024.f`).
+                // The shift pair sign-extends the low 26 bits before
+                // the divide. Cells without water store 0; we surface
+                // that as `None` so the renderer can early-out.
+                let water_off = mat_off + 164;
+                let water_height = if water_off + 4 <= body.len() {
+                    let raw = i32::from_le_bytes([
+                        body[water_off],
+                        body[water_off + 1],
+                        body[water_off + 2],
+                        body[water_off + 3],
+                    ]);
+                    let signed_26 = (raw.wrapping_shl(6)) >> 10;
+                    if signed_26 == 0 {
+                        None
+                    } else {
+                        Some(signed_26 as f32 / 1024.0)
+                    }
+                } else {
+                    None
+                };
+
                 out.push(MzbPlacement {
                     geometry_offset: geo_off as u32,
                     transform: m,
@@ -698,6 +785,7 @@ pub fn parse_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbPlacem
                     flip_winding: det < 0.0,
                     grid_x: x as u16,
                     grid_y: y as u16,
+                    water_height,
                 });
             }
         }
@@ -988,9 +1076,19 @@ mod tests {
         buf[0x74..0x78].copy_from_slice(&1.0f32.to_le_bytes());
         buf[0x78..0x7C].copy_from_slice(&0.0f32.to_le_bytes());
 
-        // Triangles @ 0x7C: [0,1,2,0] and [0,2,3,0]
-        // Set the top bits to exercise the 0x3FFF mask: encode `0|0x4000` and ensure mask trims it.
-        let tris: [[u16; 4]; 2] = [[0 | 0x4000, 1, 2, 0], [0, 2, 3 | 0x8000, 0]];
+        // Triangles @ 0x7C: encoded with high-bit flags so we can
+        // verify the new bit-layout (15-bit v0/n0 mask, 14-bit v1/v2
+        // mask, plus material/invalid/barrier extraction):
+        //   Tri 0: v0=0|0x8000 (material bit 0), v1=1|0x4000 (is_invalid),
+        //          v2=2, n0=0  → indices [0,1,2], material=0b0001=1,
+        //          is_invalid=true.
+        //   Tri 1: v0=0, v1=2, v2=3|0x4000|0x8000 (is_barrier +
+        //          material bit 2), n0=0|0x8000 (material bit 3)
+        //          → indices [0,2,3], material=0b1100=12, is_barrier=true.
+        let tris: [[u16; 4]; 2] = [
+            [0 | 0x8000, 1 | 0x4000, 2, 0],
+            [0, 2, 3 | 0x4000 | 0x8000, 0 | 0x8000],
+        ];
         for (i, t) in tris.iter().enumerate() {
             let o = 0x7C + i * 8;
             for (j, &val) in t.iter().enumerate() {
@@ -1035,20 +1133,29 @@ mod tests {
         assert_eq!(m.vertices[0].pos, [0.0, 0.0, 0.0]);
         assert_eq!(m.vertices[1].pos, [1.0, 0.0, 0.0]);
 
-        // Triangle 0: [0 | 0x4000, 1, 2, 0] — top bit must be masked away.
+        // Triangle 0: encoded as v0=0|0x8000 (material bit 0),
+        // v1=1|0x4000 (is_invalid), v2=2, n0=0. After parse: indices
+        // [0,1,2], material=1, is_invalid=true, is_barrier=false.
         assert_eq!(
             m.triangles[0],
             [0, 1, 2],
-            "v0 high bit must be masked with 0x3FFF"
+            "indices: v0 masked with 0x7FFF, v1/v2 with 0x3FFF"
         );
         assert_eq!(m.triangle_normals[0], 0);
+        assert_eq!(m.tri_info[0].material, 0b0001, "material from v0 top bit");
+        assert!(m.tri_info[0].is_invalid, "is_invalid from v1 bit 14");
+        assert!(!m.tri_info[0].is_barrier);
 
-        // Triangle 1: [0, 2, 3 | 0x8000, 0] — top bit must be masked away.
+        // Triangle 1: v0=0, v1=2, v2=3|0x4000|0x8000 (is_barrier +
+        // material bit 2), n0=0|0x8000 (material bit 3). After parse:
+        // indices [0,2,3], material=0b1100=12, is_barrier=true.
+        assert_eq!(m.triangles[1], [0, 2, 3]);
         assert_eq!(
-            m.triangles[1],
-            [0, 2, 3],
-            "v2 high bit must be masked with 0x3FFF"
+            m.tri_info[1].material, 0b1100,
+            "material composed from v2 + n0 top bits"
         );
+        assert!(!m.tri_info[1].is_invalid);
+        assert!(m.tri_info[1].is_barrier, "is_barrier from v2 bit 14");
     }
 
     #[test]

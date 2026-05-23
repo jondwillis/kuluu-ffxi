@@ -27,6 +27,7 @@ const PANEL_WIDTH_PX: f32 = 380.0;
 pub fn spawn_death_prompt(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             DeathPromptPanel,
             Node {
                 position_type: PositionType::Absolute,

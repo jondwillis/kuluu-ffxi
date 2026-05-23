@@ -59,6 +59,7 @@ const PANEL_WIDTH_PX: f32 = 220.0;
 pub fn spawn_self_hud(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             SelfHudPanel,
             Node {
                 position_type: PositionType::Absolute,

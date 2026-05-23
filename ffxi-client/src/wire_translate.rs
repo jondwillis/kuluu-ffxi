@@ -72,7 +72,67 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         // `Weather::from_lsb` is the authoritative table (handles the
         // 0x14..=0x27 repeat range via mod-20).
         weather: s.current_weather.map(wire::Weather::from_lsb),
+        // Resolve each equipment slot's (container, index) reference
+        // against the inventory mirror into a flat per-slot
+        // `Option<item_no>`. The HUD never needs to know about
+        // containers — only the item id, which it pipes through
+        // `ffxi_proto::item_names`. A None either means the slot is
+        // unequipped or the inventory flood hasn't caught up yet;
+        // Stage 1 doesn't distinguish, so the render shows "—" in
+        // both cases.
+        equipped: resolve_equipment(s),
+        // Stage 2: surface the learned-spell / known-ability /
+        // known-weaponskill / known-pet-ability mirrors directly.
+        // No translation needed — Vec<u16> on both sides — and the
+        // session-side fold (`apply_event`) already pre-sorts the
+        // vecs ascending by id.
+        spells_known: s.spells_known.clone(),
+        job_abilities_known: s.job_abilities_known.clone(),
+        weaponskills_known: s.weaponskills_known.clone(),
+        pet_abilities_known: s.pet_abilities_known.clone(),
+        // Stage 3: flat projection of the main Inventory bag.
+        // Empty when the inventory mirror hasn't been initialised
+        // yet (zone-in flood hasn't started).
+        inventory_main: project_inventory_main(s),
     }
+}
+
+/// Pull container 0 (main Inventory bag) out of the session's
+/// inventory mirror as a flat `Vec<InventoryItem>` for the HUD.
+/// Other containers (Safe, Storage, Wardrobe, …) aren't projected
+/// because the in-game Items menu is inventory-only — the operator
+/// can't use items directly from a Mog House safe.
+fn project_inventory_main(s: &SessionState) -> Vec<wire::InventoryItem> {
+    let Some(bag) = s.inventory.containers.get(&0) else {
+        return Vec::new();
+    };
+    bag.slots
+        .iter()
+        .map(|slot| wire::InventoryItem {
+            container: 0,
+            index: slot.index,
+            item_no: slot.item_no,
+            quantity: slot.quantity,
+        })
+        .collect()
+}
+
+/// Project `SessionState.equipment` (container-relative references)
+/// onto a flat `[Option<item_no>; 16]` by looking each ref up in the
+/// inventory mirror. Returns `None` for slots that are empty or that
+/// reference an inventory slot we haven't received yet.
+fn resolve_equipment(s: &SessionState) -> [Option<u16>; 16] {
+    let mut out = [None; 16];
+    for (i, slot) in s.equipment.iter().enumerate() {
+        let Some(r) = slot else { continue };
+        out[i] = s
+            .inventory
+            .containers
+            .get(&r.container)
+            .and_then(|c| c.slots.iter().find(|s| s.index == r.container_index))
+            .map(|s| s.item_no);
+    }
+    out
 }
 
 pub fn shop_to_wire(s: &ShopState) -> wire::ShopState {
@@ -126,6 +186,25 @@ pub fn event_to_viewer_event(ev: AgentEvent) -> Option<wire::ViewerEvent> {
         AgentEvent::Reconnected { downtime_ms } => {
             Some(wire::ViewerEvent::Reconnected { downtime_ms })
         }
+        AgentEvent::MusicChanged { slot, track_id } => {
+            Some(wire::ViewerEvent::MusicChanged { slot, track_id })
+        }
+        AgentEvent::MusicVolumeChanged { slot, volume } => {
+            Some(wire::ViewerEvent::MusicVolumeChanged { slot, volume })
+        }
+        AgentEvent::LevelUp { player_id } => Some(wire::ViewerEvent::LevelUp { player_id }),
+        AgentEvent::SkillLevelUp { skill_id, level } => {
+            Some(wire::ViewerEvent::SkillLevelUp { skill_id, level })
+        }
+        AgentEvent::ActionStarted {
+            actor_id,
+            action_id,
+            action_kind,
+        } => Some(wire::ViewerEvent::ActionStarted {
+            actor_id,
+            action_id,
+            action_kind,
+        }),
         // Snapshot-folded signals (Connected, StageChanged, PositionChanged,
         // EntityUpserted, ChatLine, PartyMemberUpdated, Diagnostics) are
         // already visible through the state watch — no need to push them as
@@ -232,6 +311,13 @@ pub fn chat_to_wire(c: &ChatLine) -> wire::ChatLine {
         sender: c.sender.clone(),
         text: c.text.clone(),
         server_ts: c.server_ts,
+        // `local_seq` is the client-side monotonic arrival counter used
+        // to interleave server chat with `push_local_toast` entries in
+        // strict arrival order. Server-sourced lines (everything that
+        // flows through this bridge) carry 0 — the same sentinel the
+        // wire struct documents as "synthetic / test / pre-traffic".
+        // Local-toast emitters stamp their own non-zero values.
+        local_seq: 0,
     }
 }
 
@@ -246,6 +332,7 @@ pub fn channel_to_wire(c: ChatChannel) -> wire::ChatChannel {
         ChatChannel::System => wire::ChatChannel::System,
         ChatChannel::Other => wire::ChatChannel::Other,
         ChatChannel::Battle => wire::ChatChannel::Battle,
+        ChatChannel::Debug => wire::ChatChannel::Debug,
     }
 }
 
@@ -597,5 +684,71 @@ mod tests {
             snap.producer_monotonic_ms,
             snap2.producer_monotonic_ms,
         );
+    }
+
+    /// `resolve_equipment` joins `SessionState.equipment[i]`
+    /// (container + index) against the inventory mirror to produce
+    /// the flat `[Option<item_no>; 16]` the HUD reads. Empty slots
+    /// and unresolved-reference slots both surface as `None`; only
+    /// references that both exist *and* point at a populated
+    /// inventory slot resolve to `Some(item_no)`.
+    #[test]
+    fn resolve_equipment_joins_equipment_against_inventory() {
+        use crate::state::{ContainerInfo, EquippedRef, ItemSlot};
+        let mut s = SessionState::default();
+
+        // Put a Bronze Sword (item_no=16448 — arbitrary, just needs
+        // to be distinguishable) at container=0 (Inventory), index=3.
+        let mut inv0 = ContainerInfo::default();
+        inv0.slots.push(ItemSlot {
+            index: 3,
+            item_no: 16448,
+            quantity: 1,
+            locked: false,
+            price: 0,
+        });
+        s.inventory.containers.insert(0, inv0);
+
+        // Slot 0 (Main) references inventory[3] — resolves.
+        s.equipment[0] = Some(EquippedRef {
+            container: 0,
+            container_index: 3,
+        });
+        // Slot 4 (Head) references inventory[99] — dangling, must
+        // surface as None rather than panicking or pointing somewhere
+        // wrong. Catches a future regression where resolve_equipment
+        // is rewritten to use array indexing.
+        s.equipment[4] = Some(EquippedRef {
+            container: 0,
+            container_index: 99,
+        });
+        // Slot 5 (Body) is empty.
+
+        let snap = state_to_snapshot(&s);
+        assert_eq!(snap.equipped[0], Some(16448), "main slot resolves");
+        assert_eq!(snap.equipped[4], None, "dangling ref → None");
+        assert_eq!(snap.equipped[5], None, "empty slot → None");
+        // Sanity: array length matches the wire schema width.
+        assert_eq!(snap.equipped.len(), 16);
+    }
+
+    /// `0x04F EQUIP_CLEAR` arrives in the form `AgentEvent::EquipCleared`.
+    /// Apply it and confirm every slot is reset to `None`, regardless
+    /// of prior state. The fold lives in `state::apply_event`; the
+    /// downstream `state_to_snapshot` must then return all-None.
+    #[test]
+    fn equip_cleared_resets_all_slots() {
+        use crate::state::EquippedRef;
+        let mut s = SessionState::default();
+        // Pre-populate every slot with a sentinel ref so the clear
+        // has something to wipe.
+        for cell in s.equipment.iter_mut() {
+            *cell = Some(EquippedRef {
+                container: 0,
+                container_index: 0,
+            });
+        }
+        s.apply_event(&AgentEvent::EquipCleared);
+        assert!(s.equipment.iter().all(|c| c.is_none()));
     }
 }

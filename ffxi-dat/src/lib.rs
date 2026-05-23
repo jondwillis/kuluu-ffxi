@@ -13,22 +13,30 @@
 //!     file = file_dir & 0x7F (lower 7 bits)
 //!   path = {install}/FINAL FANTASY XI/{rom_dir}/{dir}/{file}.DAT
 
+pub mod action;
 pub mod anim;
 pub mod archive;
 pub mod bone;
 pub mod chunk;
+pub mod cib;
+pub mod d3m;
 pub mod ftable;
+pub mod generator;
 pub mod kind;
+pub mod map_image;
 pub mod mmb;
 pub mod mzb;
 pub mod npc_names;
+pub mod scheduler;
+pub mod sep;
 pub mod texture;
 pub mod vos2;
 pub mod vtable;
+pub mod weather;
 pub mod zone_dat;
 
 pub use archive::{DatLocation, DatRoot};
-pub use chunk::{walk, Chunk, ChunkWalker};
+pub use chunk::{walk, walk_tree, Chunk, ChunkNode, ChunkWalker};
 pub use kind::ChunkKind;
 pub use npc_names::{split_id, NpcNameTable, NPC_LIST_FILE_ID_BASE};
 
@@ -71,6 +79,9 @@ pub enum DatError {
 
     #[error("MZB error: {0}")]
     Mzb(String),
+
+    #[error("Weather error: {0}")]
+    Weather(String),
 }
 
 pub type Result<T> = std::result::Result<T, DatError>;

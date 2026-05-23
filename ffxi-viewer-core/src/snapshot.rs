@@ -8,7 +8,9 @@
 //! other system reads `SceneState` instead.
 
 use bevy::prelude::*;
-use ffxi_viewer_wire::{ChatLine, Entity, PartyMember, SceneDelta, SceneSnapshot, ViewerEvent};
+use ffxi_viewer_wire::{
+    ChatChannel, ChatLine, Entity, PartyMember, SceneDelta, SceneSnapshot, ViewerEvent,
+};
 
 use crate::source::SceneSource;
 
@@ -36,6 +38,14 @@ pub struct SceneState {
     /// and survive until either evicted by the cap or the user explicitly
     /// clears them.
     pub local_toasts: Vec<ChatLine>,
+    /// Monotonically-increasing counter stamped on every chat line as it
+    /// enters viewer state. Drives the merge in [`rendered_chat`] so a
+    /// debug toast pushed between two server-pushed battle lines lands
+    /// between them in render order, not at the tail of the toast bucket.
+    /// Field rather than `AtomicU64` because every mutation is from
+    /// `ingest_system` / `push_local_toast`, which run on the Bevy main
+    /// thread and hold `&mut SceneState`.
+    pub next_chat_seq: u64,
 }
 
 /// Cap on retained local toasts. Smaller than `CHAT_HISTORY_CAP` because
@@ -43,17 +53,65 @@ pub struct SceneState {
 /// plenty to scroll back over recent operator actions.
 pub const LOCAL_TOAST_CAP: usize = 32;
 
+/// Build a system-channel chat line. Routes to `ChatChannel::System` so
+/// the message shows in the Battle pane (Chat 2) regardless of `/devhud`
+/// state — used both for slash-command responses and for engine event
+/// surfacing that a normal player would want to see (zone change, BGM
+/// track change, sunrise, low-HP, aggro).
+///
+/// Counterpart to [`debug_chat_line`] for noisier per-event diagnostics
+/// that should stay hidden by default.
+pub fn system_chat_line(text: String) -> ChatLine {
+    ChatLine {
+        channel: ChatChannel::System,
+        sender: "client".into(),
+        text,
+        server_ts: 0,
+        local_seq: 0,
+    }
+}
+
+/// Build a debug-channel chat line for client-internal chatter that
+/// should stay hidden by default and only surface when `/devhud` is
+/// enabled. Used for high-frequency engine diagnostics (per-SFX fires,
+/// BGM loop boundaries, skybox keyframe crossings, unknown opcodes,
+/// individual inventory deltas). Counterpart to [`system_chat_line`].
+pub fn debug_chat_line(text: String) -> ChatLine {
+    ChatLine {
+        channel: ChatChannel::Debug,
+        sender: "client".into(),
+        text,
+        server_ts: 0,
+        local_seq: 0,
+    }
+}
+
 impl SceneState {
     /// Push a UI-local chat line that survives snapshot replacement.
     /// Trims to `LOCAL_TOAST_CAP` and marks the state dirty so the chat
     /// panel re-renders this frame.
-    pub fn push_local_toast(&mut self, line: ChatLine) {
+    pub fn push_local_toast(&mut self, mut line: ChatLine) {
+        line.local_seq = self.next_chat_seq;
+        self.next_chat_seq += 1;
         self.local_toasts.push(line);
         if self.local_toasts.len() > LOCAL_TOAST_CAP {
             let drop_n = self.local_toasts.len() - LOCAL_TOAST_CAP;
             self.local_toasts.drain(0..drop_n);
         }
         self.dirty = true;
+    }
+
+    /// Stamp `local_seq` on each newly-arrived server chat line. Called by
+    /// `ingest_system` after a poll/delta merges into `snapshot.chat`.
+    /// Walks the tail of `chat` and assigns seqs to entries that still
+    /// carry the default 0 — server-pushed lines arrive with seq=0 and
+    /// get a fresh number here in arrival order.
+    fn stamp_new_server_chat(&mut self, prev_len: usize) {
+        let n = self.snapshot.chat.len();
+        for i in prev_len..n {
+            self.snapshot.chat[i].local_seq = self.next_chat_seq;
+            self.next_chat_seq += 1;
+        }
     }
 }
 
@@ -78,11 +136,35 @@ pub fn ingest_system<S: SceneSource + Resource>(
 
     if let Some(snap) = source.poll_snapshot() {
         state.snapshot = *snap;
+        // Re-stamp chat seqs from 0 so server lines render in their
+        // canonical arrival order, then re-stamp local_toasts at the
+        // tail (seqs chat_n..chat_n+toast_n) so the seq-merge in
+        // `rendered_chat` pins them after the most-recent server line.
+        //
+        // Why not clear local_toasts: in the native bridge,
+        // `poll_snapshot` returns Some on every `state_rx.has_changed`
+        // tick — i.e. every frame the session mutates anything
+        // (position, HP, entities). Clearing on each poll wiped
+        // slash-command echos, DAT-load notices, and debug messages
+        // after a single frame. We treat toasts as part of the chat
+        // log (per the comment at `text_input.rs::push_system_chat_line`)
+        // and let `LOCAL_TOAST_CAP` bound retention.
+        let chat_n = state.snapshot.chat.len();
+        for i in 0..chat_n {
+            state.snapshot.chat[i].local_seq = i as u64;
+        }
+        let toast_n = state.local_toasts.len();
+        for i in 0..toast_n {
+            state.local_toasts[i].local_seq = (chat_n + i) as u64;
+        }
+        state.next_chat_seq = (chat_n + toast_n) as u64;
         state.dirty = true;
     }
 
     for delta in source.drain_deltas() {
+        let prev_len = state.snapshot.chat.len();
         apply_delta(&mut state.snapshot, &delta);
+        state.stamp_new_server_chat(prev_len);
         state.dirty = true;
     }
 
@@ -99,12 +181,27 @@ pub fn ingest_system<S: SceneSource + Resource>(
 /// rendering order matches the user's mental model — server messages
 /// arrive in the past, the toasts they triggered show below them.
 pub fn rendered_chat<'a>(state: &'a SceneState) -> Vec<&'a ChatLine> {
-    state
-        .snapshot
-        .chat
-        .iter()
-        .chain(state.local_toasts.iter())
-        .collect()
+    // Merge the two stamped streams by `local_seq` so a debug toast
+    // pushed at seq=42 lands between server lines stamped 41 and 43,
+    // not at the tail of the toast bucket. Both inputs are already
+    // sorted ascending by seq (ingest stamps in insertion order), so
+    // a linear two-way merge is sufficient and avoids an alloc-sort.
+    let s = &state.snapshot.chat;
+    let t = &state.local_toasts;
+    let mut out: Vec<&ChatLine> = Vec::with_capacity(s.len() + t.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < s.len() && j < t.len() {
+        if s[i].local_seq <= t[j].local_seq {
+            out.push(&s[i]);
+            i += 1;
+        } else {
+            out.push(&t[j]);
+            j += 1;
+        }
+    }
+    out.extend(s[i..].iter());
+    out.extend(t[j..].iter());
+    out
 }
 
 /// Pure fold: merge a delta into a snapshot. Mirrors the apply rules from
@@ -333,17 +430,57 @@ mod tests {
             sender: "Server".into(),
             text: "echo".into(),
             server_ts: 0,
+            local_seq: 0,
         });
         state.push_local_toast(ChatLine {
             channel: ChatChannel::System,
             sender: "client".into(),
             text: "/blarg".into(),
             server_ts: 0,
+            local_seq: 0,
         });
         let lines = rendered_chat(&state);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].sender, "Server");
         assert_eq!(lines[1].sender, "client");
+    }
+
+    #[test]
+    fn rendered_chat_interleaves_by_arrival_seq() {
+        // Stamp two server lines and one toast in arrival order
+        //   server seq=0, toast seq=1, server seq=2
+        // The merge must preserve that order even though the toast
+        // physically sits in `local_toasts` and the server lines in
+        // `snapshot.chat`.
+        let mut state = SceneState::default();
+        state.snapshot.chat.push(ChatLine {
+            channel: ChatChannel::Battle,
+            sender: "mob".into(),
+            text: "first".into(),
+            server_ts: 0,
+            local_seq: 0,
+        });
+        state.next_chat_seq = 1;
+        state.push_local_toast(ChatLine {
+            channel: ChatChannel::System,
+            sender: "client".into(),
+            text: "middle".into(),
+            server_ts: 0,
+            local_seq: 0,
+        });
+        // push_local_toast bumped next_chat_seq to 2.
+        state.snapshot.chat.push(ChatLine {
+            channel: ChatChannel::Battle,
+            sender: "mob".into(),
+            text: "last".into(),
+            server_ts: 0,
+            local_seq: state.next_chat_seq,
+        });
+        let lines = rendered_chat(&state);
+        assert_eq!(
+            lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["first", "middle", "last"]
+        );
     }
 
     #[test]
@@ -355,6 +492,7 @@ mod tests {
                 sender: "client".into(),
                 text: format!("toast {i}"),
                 server_ts: 0,
+                local_seq: 0,
             });
         }
         assert_eq!(state.local_toasts.len(), LOCAL_TOAST_CAP);
@@ -372,6 +510,7 @@ mod tests {
             sender: "x".into(),
             text: "hi".into(),
             server_ts: 0,
+            local_seq: 0,
         };
         let delta = SceneDelta {
             chat_appended: vec![line; CHAT_HISTORY_CAP + 5],
@@ -379,6 +518,78 @@ mod tests {
         };
         apply_delta(&mut snap, &delta);
         assert_eq!(snap.chat.len(), CHAT_HISTORY_CAP);
+    }
+
+    /// Regression: local toasts must survive a snapshot replacement and
+    /// land *after* the snapshot's chat in the merged stream. The native
+    /// bridge produces a fresh full snapshot every frame the session
+    /// mutates anything, so clearing toasts on each poll wiped slash-
+    /// command echos / DAT-load notices after a single frame ("<1s flash"
+    /// bug). The contract is now: toasts persist, get re-stamped at the
+    /// tail of the new chat, and remain visible until `LOCAL_TOAST_CAP`
+    /// evicts them.
+    #[test]
+    fn toasts_persist_through_snapshot_replacement() {
+        #[derive(Resource, Default)]
+        struct TestSource {
+            next_snapshot: Option<Box<SceneSnapshot>>,
+        }
+        impl SceneSource for TestSource {
+            fn poll_snapshot(&mut self) -> Option<Box<SceneSnapshot>> {
+                self.next_snapshot.take()
+            }
+            fn drain_deltas(&mut self) -> Vec<SceneDelta> {
+                vec![]
+            }
+            fn drain_events(&mut self) -> Vec<ViewerEvent> {
+                vec![]
+            }
+        }
+        let mut app = App::new();
+        app.init_resource::<TestSource>();
+        app.init_resource::<SceneState>();
+        app.init_resource::<EventLog>();
+        app.add_systems(Update, ingest_system::<TestSource>);
+
+        // Push a toast first ("/sound on" echo).
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .push_local_toast(ChatLine {
+                channel: ChatChannel::System,
+                sender: "client".into(),
+                text: "/sound on".into(),
+                server_ts: 0,
+                local_seq: 0,
+            });
+
+        // Then a fresh snapshot lands carrying two server chat lines —
+        // simulates the native bridge handing off updated session state
+        // (positions changed, etc.) on the very next frame.
+        let mut s = SceneSnapshot::default();
+        for text in ["server-a", "server-b"] {
+            s.chat.push(ChatLine {
+                channel: ChatChannel::Battle,
+                sender: "mob".into(),
+                text: text.into(),
+                server_ts: 0,
+                local_seq: 0,
+            });
+        }
+        app.world_mut().resource_mut::<TestSource>().next_snapshot = Some(Box::new(s));
+        app.update();
+
+        let state = app.world().resource::<SceneState>();
+        assert_eq!(
+            state.local_toasts.len(),
+            1,
+            "toast must survive snapshot replacement"
+        );
+        let lines = rendered_chat(state);
+        assert_eq!(
+            lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["server-a", "server-b", "/sound on"],
+            "toast re-stamped at the tail, after the new chat lines"
+        );
     }
 
     /// Confirm `ingest_system::<S>` compiles when S is a Resource +

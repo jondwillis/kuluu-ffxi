@@ -50,6 +50,8 @@ pub struct RecentToolsText;
 pub fn spawn_agent_hud(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
+            crate::hud::DevHud,
             AgentHud,
             Node {
                 position_type: PositionType::Absolute,
@@ -64,6 +66,7 @@ pub fn spawn_agent_hud(mut commands: Commands) {
             },
             BackgroundColor(palette::BACKGROUND),
             BorderColor::all(palette::BORDER),
+            Visibility::Hidden,
         ))
         .with_children(|p| {
             p.spawn(line_row("goal:")).with_children(|row| {

@@ -52,6 +52,7 @@ pub struct ZoneFlashLabel;
 pub fn spawn_zone_flash(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             ZoneFlashBanner,
             Node {
                 position_type: PositionType::Absolute,

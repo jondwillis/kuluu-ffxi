@@ -1,10 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["ffxi-proto", "ffxi-client", "ffxi-mcp", "ffxi-nav", "ffxi-nav-recast", "ffxi-viewer-wire", "ffxi-viewer-core", "ffxi-viewer-wasm", "ffxi-dat"]
+members = ["ffxi-proto", "ffxi-client", "ffxi-mcp", "ffxi-nav", "ffxi-nav-recast", "ffxi-viewer-wire", "ffxi-viewer-core", "ffxi-viewer-wasm", "ffxi-dat", "ffxi-audio"]
 
-# Vendored recastnavigation-rs with a one-line `#include <cstddef>` patch
-# in Deterministic.h so cxx-bridge-generated TUs see `size_t`. Without it,
-# `cargo test` fails with "unknown type name 'size_t'".
+# Vendored fork of recastnavigation-rs 0.1.0 with a one-line `#include
+# <cstddef>` in Deterministic.h. Without it, `cargo test` fails with
+# "unknown type name 'size_t'" because cxx-bridge-generated TUs don't
+# transitively include stdlib. See vendor/recastnavigation-rs/recastnavigation/
+# Deterministic/Include/Deterministic.h for the patch comment.
 [patch.crates-io]
 recastnavigation-rs = { path = "vendor/recastnavigation-rs" }
 

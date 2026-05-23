@@ -32,6 +32,7 @@ const CHIP_WIDTH_PX: f32 = 36.0;
 pub fn spawn_status_ribbon(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             StatusRibbon,
             Node {
                 position_type: PositionType::Absolute,

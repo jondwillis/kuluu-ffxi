@@ -24,7 +24,10 @@ fn read_u32(b: &[u8], o: usize) -> u32 {
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: FFXI_DAT_PATH=... {} <file_id> <name_substr>", args[0]);
+        eprintln!(
+            "usage: FFXI_DAT_PATH=... {} <file_id> <name_substr>",
+            args[0]
+        );
         return ExitCode::from(2);
     }
     let file_id: u32 = args[1].parse().unwrap();

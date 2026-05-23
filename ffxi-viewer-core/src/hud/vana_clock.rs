@@ -36,42 +36,59 @@ pub struct VanaClockPanel;
 #[derive(Component)]
 pub struct VanaClockLabel;
 
-pub fn spawn_vana_clock(mut commands: Commands) {
-    commands
-        .spawn((
-            VanaClockPanel,
-            Node {
-                position_type: PositionType::Absolute,
-                // Top-right column, slot 2: just below the compass.
-                // Compass: top 36..96 (60 px tall). Clock at 104 leaves
-                // an 8-px gap. The full top-right column stack is:
-                //   compass     top: 36   (60px)
-                //   vana_clock  top: 104  (~28px)
-                //   llm_badge   top: 140  (~32px)
-                //   roster      top: 200  (~variable, expands down)
-                top: Val::Px(104.0),
-                right: Val::Px(8.0),
-                padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
-                border: UiRect::all(Val::Px(1.0)),
+/// Spawn the Vana clock as a child of the bottom-left flex stack,
+/// docked above the minimap. Retail FFXI clusters its persistent
+/// indicators (minimap-compass + clock) in the same screen corner;
+/// this matches that layout rather than the previous top-right
+/// column.
+pub fn spawn_vana_clock_as_child(p: &mut ChildSpawnerCommands) {
+    p.spawn((
+        VanaClockPanel,
+        Node {
+            // `flex_shrink: 0` keeps the chip at its content width
+            // even when the chat panel expands and squeezes the
+            // bottom-left stack.
+            flex_shrink: 0.0,
+            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BackgroundColor(palette::BACKGROUND),
+        BorderColor::all(palette::BORDER),
+    ))
+    .with_children(|p| {
+        p.spawn((
+            VanaClockLabel,
+            Text::new("V—"),
+            TextFont {
+                font_size: 12.0,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
-        ))
-        .with_children(|p| {
-            p.spawn((
-                VanaClockLabel,
-                Text::new("V—"),
-                TextFont {
-                    font_size: 12.0,
-                    ..default()
-                },
-                TextColor(palette::TEXT),
-            ));
-        });
+            TextColor(palette::TEXT),
+        ));
+    });
 }
 
-pub fn update_vana_clock(time: Res<Time>, mut q: Query<&mut Text, With<VanaClockLabel>>) {
+/// FFXI 8-day week. Indexed by `total_vana_days % 8`; epoch (886/1/1)
+/// is Firesday per `vendor/server/settings/default/map.lua:77` and the
+/// authoritative ordering is `vendor/server/scripts/commands/time.lua`.
+const VANA_WEEKDAYS: [&str; 8] = [
+    "Firesday",
+    "Earthsday",
+    "Watersday",
+    "Windsday",
+    "Iceday",
+    "Lightningday",
+    "Lightsday",
+    "Darksday",
+];
+
+pub fn update_vana_clock(
+    time: Res<Time>,
+    mut q: Query<&mut Text, With<VanaClockLabel>>,
+    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut prev_vana_day: Local<Option<u64>>,
+) {
     let Ok(mut text) = q.single_mut() else {
         return;
     };
@@ -87,6 +104,40 @@ pub fn update_vana_clock(time: Res<Time>, mut q: Query<&mut Text, With<VanaClock
     if **text != want {
         **text = want;
     }
+
+    // Vana day rollover → System chat. The format string in the HUD
+    // label changes once per V-minute; we want one toast per V-day
+    // (every ~10 Earth minutes), so track the day index separately
+    // rather than diffing strings. First call seeds without firing
+    // so logging in mid-day doesn't immediately announce the current
+    // day as if it were a rollover.
+    let earth_since_vana = earth_now.saturating_sub(EARTH_EPOCH_UNIX);
+    let total_vana_days = earth_since_vana / EARTH_SECS_PER_VANA_DAY;
+    if let Some(prev) = *prev_vana_day {
+        if prev != total_vana_days {
+            let weekday = VANA_WEEKDAYS[(total_vana_days % 8) as usize];
+            scene_state.push_local_toast(crate::snapshot::system_chat_line(format!(
+                "📅 Vana day {} — {}",
+                total_vana_days, weekday,
+            )));
+        }
+    }
+    *prev_vana_day = Some(total_vana_days);
+}
+
+/// Monotonic Vana minutes since the V-epoch (8866-01-01 00:00).
+///
+/// Use this when you need a single increasing scalar across days —
+/// e.g. when a Scheduler-like timeline straddles a Vana-day rollover,
+/// or when comparing two Vana timestamps across an arbitrary span.
+/// For per-action timelines stay frame-based (see
+/// `ffxi_dat::scheduler::TimedStage::frame`); for in-day animations
+/// use [`crate::sun_moon::VanaSky::hour`].
+pub fn vana_minutes_since_epoch(earth_unix_secs: u64) -> u64 {
+    let earth_since_vana = earth_unix_secs.saturating_sub(EARTH_EPOCH_UNIX);
+    // 25 Earth seconds = 1 V-hour = 60 V-min, so 1 Earth-second = 60/25 = 2.4 V-min.
+    // Stay in integer math by scaling: vana-min = earth-sec * 60 / 25.
+    earth_since_vana.saturating_mul(60) / 25
 }
 
 /// Convert `earth_unix_secs` to a `V YYYY-MM-DD HH:MM` string.
@@ -152,5 +203,19 @@ mod tests {
         // at year 887.
         let s = format_vana(EARTH_EPOCH_UNIX + 360 * EARTH_SECS_PER_VANA_DAY);
         assert_eq!(s, "V 0887-01-01 00:00");
+    }
+
+    #[test]
+    fn vana_minutes_since_epoch_matches_formatter() {
+        // One V-hour = 60 V-min = 25 earth-sec.
+        assert_eq!(vana_minutes_since_epoch(EARTH_EPOCH_UNIX), 0);
+        assert_eq!(vana_minutes_since_epoch(EARTH_EPOCH_UNIX + 25), 60);
+        // A full V-day = 24 × 60 = 1440 V-min.
+        assert_eq!(
+            vana_minutes_since_epoch(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_DAY),
+            1440
+        );
+        // Pre-epoch clamps to 0 like the formatter.
+        assert_eq!(vana_minutes_since_epoch(0), 0);
     }
 }

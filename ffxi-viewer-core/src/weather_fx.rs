@@ -399,7 +399,9 @@ const FLASH_AMBIENT_MUL: f32 = 3.0;
 
 fn lcg_next(state: &mut u64) -> f32 {
     // Numerical Recipes LCG constants. We only need ~uniform[0,1).
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     ((*state >> 33) as f32) / (u32::MAX as f32)
 }
 
@@ -484,8 +486,7 @@ pub fn apply_weather_to_ambient_and_fog_system(
         base.blue * tint.blue,
         1.0,
     ));
-    ambient.brightness =
-        active.base_ambient_brightness * active.modifier.ambient_brightness_mul;
+    ambient.brightness = active.base_ambient_brightness * active.modifier.ambient_brightness_mul;
 
     if let (Ok(fog_slot), Ok(cam_entity)) = (q_cam.single_mut(), cam.single()) {
         if let Some(new_fog) = active.modifier.fog.clone() {
@@ -511,8 +512,7 @@ pub fn apply_weather_to_sun_system(
 ) {
     let flash_t = (lightning.flash_remaining / FLASH_DURATION).clamp(0.0, 1.0);
     let flash_curve = (flash_t * PI).sin(); // smooth in/out
-    let sun_mul = active.modifier.sun_illuminance_mul
-        * (1.0 + (FLASH_SUN_MUL - 1.0) * flash_curve);
+    let sun_mul = active.modifier.sun_illuminance_mul * (1.0 + (FLASH_SUN_MUL - 1.0) * flash_curve);
     let amb_mul = 1.0 + (FLASH_AMBIENT_MUL - 1.0) * flash_curve;
 
     if let Ok(mut sun) = q_sun.single_mut() {
@@ -534,7 +534,9 @@ pub fn manage_weather_particles_system(
     q_root: Query<(Entity, &WeatherParticleRoot)>,
     mut commands: Commands,
 ) {
-    let Ok(cam_entity) = q_cam.single() else { return };
+    let Ok(cam_entity) = q_cam.single() else {
+        return;
+    };
 
     // Determine whether the current set of particle roots matches the
     // desired profile. We key on `ParticleKind` — count changes alone
@@ -564,19 +566,15 @@ pub fn manage_weather_particles_system(
     // Lazily build mesh/material handles per kind.
     let (mesh, material) = match profile.kind {
         ParticleKind::Rain => {
-            let mesh = assets
-                .rain_mesh
-                .clone()
-                .unwrap_or_else(|| {
-                    let h = meshes.add(Sphere::new(1.0).mesh().ico(1).unwrap());
-                    assets.rain_mesh = Some(h.clone());
-                    h
-                });
+            let mesh = assets.rain_mesh.clone().unwrap_or_else(|| {
+                let h = meshes.add(Sphere::new(1.0).mesh().ico(1).unwrap());
+                assets.rain_mesh = Some(h.clone());
+                h
+            });
             let material = assets.rain_material.clone().unwrap_or_else(|| {
                 let h = mats.add(StandardMaterial {
                     base_color: profile.color,
                     emissive: LinearRgba::new(0.6, 0.7, 0.9, 1.0),
-                    unlit: true,
                     alpha_mode: AlphaMode::Blend,
                     ..default()
                 });
@@ -586,19 +584,15 @@ pub fn manage_weather_particles_system(
             (mesh, material)
         }
         ParticleKind::Snow => {
-            let mesh = assets
-                .snow_mesh
-                .clone()
-                .unwrap_or_else(|| {
-                    let h = meshes.add(Sphere::new(1.0).mesh().ico(1).unwrap());
-                    assets.snow_mesh = Some(h.clone());
-                    h
-                });
+            let mesh = assets.snow_mesh.clone().unwrap_or_else(|| {
+                let h = meshes.add(Sphere::new(1.0).mesh().ico(1).unwrap());
+                assets.snow_mesh = Some(h.clone());
+                h
+            });
             let material = assets.snow_material.clone().unwrap_or_else(|| {
                 let h = mats.add(StandardMaterial {
                     base_color: profile.color,
                     emissive: LinearRgba::new(1.2, 1.2, 1.4, 1.0),
-                    unlit: true,
                     alpha_mode: AlphaMode::Blend,
                     ..default()
                 });
@@ -748,7 +742,10 @@ mod tests {
         let m = weather_modifier_for(Weather::Thunderstorms);
         let p = m.particle.expect("thunderstorms must have particles");
         assert_eq!(p.kind, ParticleKind::Rain);
-        assert!(p.count > 300, "thunderstorms should be denser than light rain");
+        assert!(
+            p.count > 300,
+            "thunderstorms should be denser than light rain"
+        );
         let (lo, hi) = m.lightning.expect("thunderstorms must flash");
         assert!(lo < hi && lo > 0.0);
     }
@@ -759,8 +756,12 @@ mod tests {
             let m = weather_modifier_for(w);
             assert_eq!(m.particle.unwrap().kind, ParticleKind::Snow);
         }
-        for w in [Weather::Rain, Weather::Squall, Weather::Thunder, Weather::Thunderstorms]
-        {
+        for w in [
+            Weather::Rain,
+            Weather::Squall,
+            Weather::Thunder,
+            Weather::Thunderstorms,
+        ] {
             let m = weather_modifier_for(w);
             assert_eq!(m.particle.unwrap().kind, ParticleKind::Rain);
         }

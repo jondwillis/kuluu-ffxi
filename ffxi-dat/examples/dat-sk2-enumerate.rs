@@ -84,10 +84,7 @@ fn main() -> ExitCode {
                 0
             };
             let count_hi = (hdr >> 16) as u16;
-            println!(
-                "{fid},{ci},{},0x{hdr:08x},{count_hi}",
-                c.data.len()
-            );
+            println!("{fid},{ci},{},0x{hdr:08x},{count_hi}", c.data.len());
         }
         if file_had_sk2 {
             with_sk2 += 1;

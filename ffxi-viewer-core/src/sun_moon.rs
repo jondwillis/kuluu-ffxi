@@ -139,13 +139,20 @@ pub struct CelestialMaterials {
 
 /// Spawn the sun and moon directional lights *and* their visible
 /// discs. Call from `setup_world`.
+///
+/// The cascade config is derived from the current
+/// [`GraphicsSettings`](crate::graphics_settings::GraphicsSettings) so
+/// users with a persisted non-default preset don't see a one-frame
+/// flicker as the reactor systems re-snap the cascades.
 pub fn spawn_sun_and_moon(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    settings: &crate::graphics_settings::GraphicsSettings,
 ) {
-    use crate::scene::cascade_config_for_sun;
+    use crate::graphics_settings::cascade_config_from_settings;
     commands.spawn((
+        crate::components::InGameEntity,
         IsSun,
         DirectionalLight {
             illuminance: 0.0, // Real value set on first tick by sun_moon_system.
@@ -154,36 +161,39 @@ pub fn spawn_sun_and_moon(
             shadow_normal_bias: 1.0,
             ..default()
         },
-        cascade_config_for_sun(),
+        cascade_config_from_settings(settings),
         bevy::light::VolumetricLight,
         Transform::from_xyz(0.0, LIGHT_DISTANCE, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
+        crate::components::InGameEntity,
         IsMoon,
         DirectionalLight {
             illuminance: 0.0,
             // Moon shadows are subtle and expensive; off by default.
             // Flip to true if you want shadow-casting moonlight.
             shadows_enabled: false,
+            shadow_depth_bias: 0.2,
+            shadow_normal_bias: 1.0,
             ..default()
         },
         bevy::light::VolumetricLight,
         Transform::from_xyz(0.0, -LIGHT_DISTANCE, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // Visible discs. Emissive `StandardMaterial` with high HDR
-    // emissive intensity so the OLD_SCHOOL bloom halos them. Real
-    // emissive values are written each frame by `sun_moon_system`.
+    // Visible discs. Bevy 0.17's `pbr.wgsl` unlit branch (line 82-86)
+    // returns `base_color` directly and never reads `emissive` — so HDR
+    // colors must live in `base_color` for the bloom halo to fire.
+    // `unlit: true` keeps the disc self-luminous (no shading on top).
+    // Real per-frame colors are written by `sun_moon_system`.
     let sphere = meshes.add(Sphere::new(1.0).mesh().ico(3).unwrap());
     let sun_mat = materials.add(StandardMaterial {
-        base_color: Color::BLACK,
-        emissive: LinearRgba::new(20.0, 18.0, 10.0, 1.0),
+        base_color: Color::linear_rgb(20.0, 18.0, 10.0),
         unlit: true,
         ..default()
     });
     let moon_mat = materials.add(StandardMaterial {
-        base_color: Color::BLACK,
-        emissive: LinearRgba::new(2.0, 2.4, 4.0, 1.0),
+        base_color: Color::linear_rgb(2.0, 2.4, 4.0),
         unlit: true,
         ..default()
     });
@@ -194,6 +204,7 @@ pub fn spawn_sun_and_moon(
     // anyway; skip the shadow sampling work.
     use bevy::light::{NotShadowCaster, NotShadowReceiver};
     commands.spawn((
+        crate::components::InGameEntity,
         SunDisc,
         Mesh3d(sphere.clone()),
         MeshMaterial3d(sun_mat.clone()),
@@ -206,6 +217,7 @@ pub fn spawn_sun_and_moon(
         NotShadowReceiver,
     ));
     commands.spawn((
+        crate::components::InGameEntity,
         MoonDisc,
         Mesh3d(sphere),
         MeshMaterial3d(moon_mat.clone()),
@@ -265,6 +277,21 @@ pub fn moon_color_for_phase(phase: f32, moon_altitude: f32) -> (Color, f32) {
 
 /// Each-frame system: read Vana sky, update sun + moon transforms,
 /// colors, illuminance, and visible disc positions/emissives.
+/// 8-bucket moon-phase names. Indexed by `(phase * 8.0).floor() % 8`
+/// where `phase` is the `[0.0, 1.0)` value on `VanaSky` (0.0 = new,
+/// 0.5 = full). Standard astronomy 8-phase naming; FFXI's in-game moon
+/// percentage tracks illumination so we surface that alongside the name.
+const MOON_PHASE_NAMES: [&str; 8] = [
+    "New",
+    "Waxing Crescent",
+    "First Quarter",
+    "Waxing Gibbous",
+    "Full",
+    "Waning Gibbous",
+    "Last Quarter",
+    "Waning Crescent",
+];
+
 pub fn sun_moon_system(
     mut sky: ResMut<VanaSky>,
     mut q_sun: Query<
@@ -310,8 +337,63 @@ pub fn sun_moon_system(
     q_cam: Query<&Transform, With<crate::camera::OperatorCamera>>,
     materials_handle: Option<Res<CelestialMaterials>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut prev_sun_up: Local<Option<bool>>,
+    mut prev_moon_up: Local<Option<bool>>,
+    mut prev_phase_bucket: Local<Option<u8>>,
 ) {
     *sky = vana_sky_now();
+
+    // Sun/moon altitude zero-crossings → System chat. Edge-triggered
+    // so we get one line per rise/set, not one per frame while above
+    // the horizon. First frame (`prev_*_up = None`) seeds the state
+    // without firing, otherwise login at noon would fire a fake
+    // "sunrise" because we'd treat the absent prev as "below."
+    let sun_up_now = sky.sun_altitude > 0.0;
+    if let Some(prev) = *prev_sun_up {
+        if prev != sun_up_now {
+            scene_state.push_local_toast(crate::snapshot::system_chat_line(
+                if sun_up_now {
+                    "☀ Sunrise"
+                } else {
+                    "☀ Sunset"
+                }
+                .to_string(),
+            ));
+        }
+    }
+    *prev_sun_up = Some(sun_up_now);
+
+    let moon_up_now = sky.moon_altitude > 0.0;
+    if let Some(prev) = *prev_moon_up {
+        if prev != moon_up_now {
+            scene_state.push_local_toast(crate::snapshot::system_chat_line(
+                if moon_up_now {
+                    "☾ Moonrise"
+                } else {
+                    "☾ Moonset"
+                }
+                .to_string(),
+            ));
+        }
+    }
+    *prev_moon_up = Some(moon_up_now);
+
+    // Moon phase bucket — eight 12.5%-wide windows. Surfaces with the
+    // FFXI-style illumination percent (0% at new, 100% at full) so the
+    // line matches what retail's lunar HUD shows the player.
+    let phase_bucket = ((sky.moon_phase * 8.0).floor() as i32).rem_euclid(8) as u8;
+    if let Some(prev) = *prev_phase_bucket {
+        if prev != phase_bucket {
+            let illumination = (1.0 - (sky.moon_phase - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+            scene_state.push_local_toast(crate::snapshot::system_chat_line(format!(
+                "☾ Moon: {} ({:.0}% illuminated)",
+                MOON_PHASE_NAMES[phase_bucket as usize],
+                illumination * 100.0,
+            )));
+        }
+    }
+    *prev_phase_bucket = Some(phase_bucket);
 
     // Sun arcs east → up → west. We model the "world rotation" by
     // rotating the light source around the world Z axis (east-west)
@@ -351,7 +433,11 @@ pub fn sun_moon_system(
     if let Ok((mut disc, mut vis)) = q_sun_disc.single_mut() {
         disc.translation = cam_pos + sun_dir * SKY_RADIUS;
         disc.scale = Vec3::splat(SUN_DISC_RADIUS);
-        *vis = if sun_visible { Visibility::Inherited } else { Visibility::Hidden };
+        *vis = if sun_visible {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     }
     // Moon: hide when below horizon *or* when phase visibility is ~0
     // (new moon is invisible by definition).
@@ -360,13 +446,18 @@ pub fn sun_moon_system(
     if let Ok((mut disc, mut vis)) = q_moon_disc.single_mut() {
         disc.translation = cam_pos + moon_dir * SKY_RADIUS;
         disc.scale = Vec3::splat(MOON_DISC_RADIUS);
-        *vis = if moon_visible { Visibility::Inherited } else { Visibility::Hidden };
+        *vis = if moon_visible {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     }
 
-    // Recolor emissives. Sun emissive scales with daylight (so dawn /
-    // dusk sun reads as deep red, noon as blinding white). Moon
-    // emissive scales by phase visibility — new moon fades to nearly
-    // invisible.
+    // Recolor base_color (NOT emissive — unlit ignores emissive). Sun
+    // brightness scales with daylight (dawn/dusk red, noon blinding
+    // white). Moon brightness scales by phase visibility — new moon
+    // fades to nearly invisible (also gated by Visibility::Hidden
+    // above for the hard cutoff).
     if let Some(handles) = materials_handle.as_deref() {
         if let Some(sun_mat) = materials.get_mut(&handles.sun) {
             let visible = sky.sun_altitude.max(-0.2);
@@ -379,11 +470,10 @@ pub fn sun_moon_system(
                 (1.0 + 5.0 * (visible + 0.2) / 0.2).max(0.0)
             };
             let c = sun_color.to_linear();
-            sun_mat.emissive = LinearRgba::new(
+            sun_mat.base_color = Color::linear_rgb(
                 c.red * intensity,
                 c.green * intensity * 0.95,
                 c.blue * intensity * 0.75,
-                1.0,
             );
         }
         if let Some(moon_mat) = materials.get_mut(&handles.moon) {
@@ -394,8 +484,8 @@ pub fn sun_moon_system(
             } else {
                 0.0
             };
-            moon_mat.emissive =
-                LinearRgba::new(0.65 * intensity, 0.80 * intensity, 1.20 * intensity, 1.0);
+            moon_mat.base_color =
+                Color::linear_rgb(0.65 * intensity, 0.80 * intensity, 1.20 * intensity);
         }
     }
 }
