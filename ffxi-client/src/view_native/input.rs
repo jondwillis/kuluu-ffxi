@@ -796,13 +796,10 @@ pub fn dispatch_movement_system(
     //   lerps toward "behind heading". The two lerps drive the orbit
     //   dynamics; see HEADING_LERP_RATE_RAD_PER_SEC.
     //
-    // 1st person: no orbit visual to chase. Fold turn into player_rotate
-    //   so A still rotates the player at the snappy spin-to-face rate
-    //   via the standard per-tick u8 handler.
+    // 1st person: A/D already rotates heading via `player_rotate_dir`
+    //   (TurnLeft/Right are folded into the accumulator unconditionally
+    //   at the top of this fn), so no extra work is needed here.
     let turn_in_chase = turn != 0 && matches!(*camera_mode, CameraMode::Chase);
-    if turn != 0 && !turn_in_chase {
-        player_rotate += turn;
-    }
 
     // Lock-on heading override — computed before the no-input bail-out
     // so the camera pivots to follow the target even when the player
@@ -1381,7 +1378,7 @@ pub fn camera_polish_system(
     // Eye and head positions. Eye matches `firstperson_camera_system`'s
     // origin so the pitch we compute is the one that actually frames
     // the head on screen.
-    let eye = self_t.translation + Vec3::Y * ChaseCamera::FP_EYE_HEIGHT;
+    let eye = self_t.translation + Vec3::Y * ffxi_viewer_core::first_person_eye_y(None);
     let head = target_pos + Vec3::Y * TARGET_HEAD_OFFSET_Y;
     let to_head = head - eye;
     // Degenerate (target on top of player) — leave pitch alone.
