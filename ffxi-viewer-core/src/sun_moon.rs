@@ -45,9 +45,18 @@ pub struct IsMoon;
 #[derive(Component)]
 pub struct SunDisc;
 
-/// Tag a visible moon disc.
+/// Tag a visible moon disc (billboard with custom phase shader — used
+/// when `sky_realism.physical_moon_orbit` is off, matching retail's
+/// antipodal sun/moon layout where phase is a clock-driven mask).
 #[derive(Component)]
 pub struct MoonDisc;
+
+/// Tag a visible moon *sphere* (lit by the real sun `DirectionalLight`
+/// — used when `sky_realism.physical_moon_orbit` is on. The moon's
+/// sky position is derived from the LSB illumination so the lit
+/// fraction visible to the camera matches what `/clock` reports).
+#[derive(Component)]
+pub struct MoonSphere;
 
 /// Distance from the camera to the celestial discs. Large enough that
 /// player-scale parallax is negligible (the discs feel "infinitely
@@ -176,6 +185,22 @@ pub struct CelestialMaterials {
     pub moon: Handle<crate::moon_material::MoonMaterial>,
 }
 
+/// Handle for the physical-orbit moon sphere's material. Stored so
+/// `sun_moon_system` can retint by weekday color each frame.
+#[derive(Resource)]
+pub struct MoonSphereMaterial(pub Handle<StandardMaterial>);
+
+/// All the per-frame edge-trigger state `sun_moon_system` carries
+/// across ticks. Bundled into one `Local<>` because Bevy's
+/// `IntoSystem` trait caps SystemParam tuples at 16 entries.
+#[derive(Default)]
+pub struct MoonTransitionState {
+    pub prev_sun_up: Option<bool>,
+    pub prev_moon_up: Option<bool>,
+    pub prev_phase_bucket: Option<u8>,
+    pub prev_illumination: Option<f32>,
+}
+
 /// Spawn the sun and moon directional lights *and* their visible
 /// discs. Call from `setup_world`.
 ///
@@ -265,6 +290,33 @@ pub fn spawn_sun_and_moon(
         NotShadowCaster,
         NotShadowReceiver,
     ));
+    // Physical-orbit moon: a real lit sphere positioned in the sky
+    // so that the lit fraction from the sun directional light
+    // matches the LSB illumination. Hidden until /sky realmoon on.
+    let moon_sphere_mesh = meshes.add(Sphere::new(1.0).mesh().ico(4).unwrap());
+    let moon_sphere_mat = materials.add(StandardMaterial {
+        // Real moon albedo ≈ 0.12; slightly bumped for visibility.
+        // Cool tint will be modulated by the weekday color from the
+        // system each frame.
+        base_color: Color::linear_rgb(0.18, 0.18, 0.20),
+        // High roughness — the moon is a rough rocky body, not glossy.
+        perceptual_roughness: 0.95,
+        metallic: 0.0,
+        // Slight emissive so it's not totally black during new moon.
+        emissive: LinearRgba::new(0.005, 0.005, 0.008, 1.0),
+        ..default()
+    });
+    commands.spawn((
+        crate::components::InGameEntity,
+        MoonSphere,
+        Mesh3d(moon_sphere_mesh),
+        MeshMaterial3d(moon_sphere_mat.clone()),
+        Transform::from_scale(Vec3::splat(MOON_DISC_RADIUS)),
+        Visibility::Hidden,
+        NotShadowCaster,
+        NotShadowReceiver,
+    ));
+    commands.insert_resource(MoonSphereMaterial(moon_sphere_mat));
     commands.insert_resource(CelestialMaterials {
         sun: sun_mat,
         moon: moon_mat,
@@ -396,20 +448,39 @@ pub fn sun_moon_system(
             Without<SunDisc>,
             Without<IsSun>,
             Without<IsMoon>,
+            Without<MoonSphere>,
+            Without<crate::camera::OperatorCamera>,
+        ),
+    >,
+    mut q_moon_sphere: Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<MoonSphere>,
+            Without<MoonDisc>,
+            Without<SunDisc>,
+            Without<IsSun>,
+            Without<IsMoon>,
             Without<crate::camera::OperatorCamera>,
         ),
     >,
     q_cam: Query<&Transform, With<crate::camera::OperatorCamera>>,
     materials_handle: Option<Res<CelestialMaterials>>,
+    moon_sphere_handle: Option<Res<MoonSphereMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut moon_materials: ResMut<Assets<crate::moon_material::MoonMaterial>>,
     mut scene_state: ResMut<crate::snapshot::SceneState>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     sky_realism: Res<crate::sky_realism::SkyRealism>,
-    mut prev_sun_up: Local<Option<bool>>,
-    mut prev_moon_up: Local<Option<bool>>,
-    mut prev_phase_bucket: Local<Option<u8>>,
+    mut transition_state: Local<MoonTransitionState>,
 ) {
+    // Destructure once so the edge-trigger sites below read like
+    // plain `prev_*` instead of `transition_state.*`.
+    let MoonTransitionState {
+        prev_sun_up,
+        prev_moon_up,
+        prev_phase_bucket,
+        prev_illumination,
+    } = &mut *transition_state;
     *sky = vana_sky_from_clock(&vana_clock);
 
     // Sun/moon altitude zero-crossings → System chat. Edge-triggered
@@ -490,8 +561,33 @@ pub fn sun_moon_system(
         *xf = Transform::from_translation(sun_pos).looking_at(Vec3::ZERO, Vec3::Y);
     }
 
-    let moon_angle = sun_angle + PI;
-    let moon_dir = Vec3::new(moon_angle.cos(), moon_angle.sin(), 0.25).normalize();
+    // Default moon direction: antipodal to sun (retail behavior).
+    // Physical orbit mode replaces this with a geometrically-correct
+    // position where the lit fraction (driven by the sun-moon-camera
+    // angle) equals the LSB illumination lookup.
+    //
+    // Derivation: for an observer at origin, illumination =
+    // (1 − s·m) / 2 where s, m are unit vectors. Solving for the
+    // angle θ between s and m: cos(θ) = 1 − 2·illumination.
+    //   illum = 1 (full)  → θ = π   (moon antipodal to sun — retail's choice)
+    //   illum = 0.5 (half) → θ = π/2 (moon rises/sets at noon)
+    //   illum = 0 (new)   → θ = 0   (moon coincident with sun — eclipse path)
+    // Rotate around Z (the axis the sun arcs around) and sign by
+    // waxing so the moon leads/trails the sun consistently.
+    let moon_dir = if sky_realism.physical_moon_orbit {
+        let cos_theta = (1.0 - 2.0 * sky.moon_illumination).clamp(-1.0, 1.0);
+        let theta = cos_theta.acos();
+        let signed = if sky.moon_waxing { theta } else { -theta };
+        Quat::from_rotation_z(signed) * sun_dir
+    } else {
+        let moon_angle = sun_angle + PI;
+        Vec3::new(moon_angle.cos(), moon_angle.sin(), 0.25).normalize()
+    };
+    // Recompute moon altitude from the actual sky direction so
+    // downstream consumers (lighting, visibility gating, eclipse
+    // detection) see truth instead of the antipodal stub.
+    let moon_altitude = moon_dir.y.asin();
+    sky.moon_altitude = moon_altitude;
     let moon_pos = moon_dir * LIGHT_DISTANCE;
     let (moon_color, moon_lux) =
         moon_color_for_phase(sky.moon_illumination, sky.moon_altitude);
@@ -518,35 +614,60 @@ pub fn sun_moon_system(
         };
     }
     // Moon: hide when below horizon *or* when illumination is ~0
-    // (new moon is invisible by definition).
-    let moon_visible = sky.moon_altitude > 0.0 && sky.moon_illumination > 0.02;
+    // (new moon is invisible by definition). In physical-orbit
+    // mode, new moon visibility is also gated by the sun being above
+    // horizon (you can't see a new moon at night — it's coincident
+    // with the absent sun).
+    let moon_visible = sky.moon_altitude > 0.0
+        && (sky.moon_illumination > 0.02 || sky_realism.physical_moon_orbit);
+    let illusion = if sky_realism.moon_illusion {
+        // Smooth ramp from 1.30× at the horizon to 1.0× at 30°
+        // altitude. `altitude` is in radians; π/6 ≈ 30°.
+        let alt = sky.moon_altitude.max(0.0);
+        let t = (alt / (PI / 6.0)).clamp(0.0, 1.0);
+        1.30 - 0.30 * t
+    } else {
+        1.0
+    };
+    // Billboard disc (retail-style phase shader). Hidden in physical-
+    // orbit mode — the lit sphere takes over.
     if let Ok((mut disc, mut vis)) = q_moon_disc.single_mut() {
         let moon_world = cam_pos + moon_dir * SKY_RADIUS;
         disc.translation = moon_world;
         // Rectangle mesh is 1m across; ×2 to make `RADIUS` mean the
-        // on-screen disc radius. Moon-illusion bump: scale up when
-        // near horizon (perceptual, matches real artists' fakery).
-        let illusion = if sky_realism.moon_illusion {
-            // Smooth ramp from 1.30× at the horizon to 1.0× at 30°
-            // altitude. `altitude` is in radians; π/6 ≈ 30°.
-            let alt = sky.moon_altitude.max(0.0);
-            let t = (alt / (PI / 6.0)).clamp(0.0, 1.0);
-            1.30 - 0.30 * t
-        } else {
-            1.0
-        };
+        // on-screen disc radius.
         disc.scale = Vec3::splat(MOON_DISC_RADIUS * 2.0 * illusion);
-        // Billboard: face the camera. The Rectangle mesh lives in
-        // its local XY plane with +Z as its normal — so aim +Z at
-        // the camera. Using `Vec3::Y` as up keeps the disc upright;
-        // the phase-mask shader's "horizontal terminator" then maps
-        // intuitively to waxing/waning.
+        // Billboard: face the camera.
         disc.look_at(cam_pos, Vec3::Y);
-        *vis = if moon_visible {
+        *vis = if moon_visible && !sky_realism.physical_moon_orbit {
             Visibility::Inherited
         } else {
             Visibility::Hidden
         };
+    }
+    // Lit sphere (physical-orbit mode). Hidden otherwise.
+    if let Ok((mut sphere, mut vis)) = q_moon_sphere.single_mut() {
+        sphere.translation = cam_pos + moon_dir * SKY_RADIUS;
+        sphere.scale = Vec3::splat(MOON_DISC_RADIUS * illusion);
+        *vis = if moon_visible && sky_realism.physical_moon_orbit {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+    // Retint the physical moon sphere with the current weekday tint
+    // each frame. Subtle: clamp the tint into a low-albedo range so
+    // it doesn't paint the moon a saturated cartoon color.
+    if let Some(handle) = moon_sphere_handle.as_deref() {
+        if let Some(mat) = materials.get_mut(&handle.0) {
+            let earth_since = (vana_clock.earth_unix_now()
+                - crate::hud::vana_clock::EARTH_EPOCH_UNIX as f64)
+                .max(0.0);
+            let total_v_days = (earth_since * 25.0 / 86400.0) as u64;
+            let t = WEEKDAY_MOON_TINT[(total_v_days % 8) as usize];
+            // Scale into low-albedo space (×0.18, matching real moon).
+            mat.base_color = Color::linear_rgb(t[0] * 0.20, t[1] * 0.20, t[2] * 0.22);
+        }
     }
 
     // Recolor base_color (NOT emissive — unlit ignores emissive). Sun
@@ -626,6 +747,35 @@ pub fn sun_moon_system(
                 earthshine,
             );
         }
+    }
+
+    // Eclipse detection — only meaningful when physical orbit puts
+    // the moon and sun in the same hemisphere occasionally. Edge-
+    // trigger on illumination crossing the extremes so we surface
+    // exactly one toast per event per 84-V-day cycle, not a flood
+    // every frame the crossing condition holds.
+    if sky_realism.physical_moon_orbit && sky_realism.eclipses {
+        let illum = sky.moon_illumination;
+        if let Some(prev) = *prev_illumination {
+            // Lunar eclipse: moon hits full while above horizon (it's
+            // antipodal to the sun, sitting in Vana'diel's shadow).
+            if prev < 0.999 && illum >= 0.999 && sky.moon_altitude > 0.0 {
+                scene_state.push_local_toast(crate::snapshot::system_chat_line(
+                    "🌑 Lunar eclipse — Vana'diel's shadow falls upon the moon.".to_string(),
+                ));
+            }
+            // Solar eclipse: moon hits new while sun is above horizon
+            // (moon coincident with sun, blocking it from view).
+            if prev > 0.001 && illum <= 0.001 && sky.sun_altitude > 0.0 {
+                scene_state.push_local_toast(crate::snapshot::system_chat_line(
+                    "🌒 Solar eclipse — the moon crosses the sun.".to_string(),
+                ));
+            }
+        }
+        *prev_illumination = Some(illum);
+    } else {
+        // Reset so re-enabling later doesn't fire a spurious edge.
+        *prev_illumination = None;
     }
 }
 
