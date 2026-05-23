@@ -49,15 +49,21 @@ fn main() -> ExitCode {
 
         // bytes 0..64 of the decrypted body
         let head = &dec[..64.min(dec.len())];
-        print!("  chunk {i:5}  asset='{:18}' [v={} k=0x{:02x} f=0x{:04x}]  ",
-            trimmed, hdr.version, hdr.key_index, hdr.feature_flags);
+        print!(
+            "  chunk {i:5}  asset='{:18}' [v={} k=0x{:02x} f=0x{:04x}]  ",
+            trimmed, hdr.version, hdr.key_index, hdr.feature_flags
+        );
         // hex of 8..32 (asset_name + trailing padding)
         for b in &dec[8..32.min(dec.len())] {
             print!("{:02x}", b);
         }
         print!("  '");
         for &b in &dec[8..32.min(dec.len())] {
-            let c = if (32..127).contains(&b) { b as char } else { '.' };
+            let c = if (32..127).contains(&b) {
+                b as char
+            } else {
+                '.'
+            };
             print!("{c}");
         }
         println!("'");

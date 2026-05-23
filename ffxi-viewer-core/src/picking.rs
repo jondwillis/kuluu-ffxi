@@ -13,16 +13,14 @@
 //!   and write into [`Target`]. A click that lands on anything that *isn't*
 //!   a `WorldEntity` (the ground plane, primarily) clears the target —
 //!   matching FFXI's "click empty ground to deselect" feel.
-//!
-//! Hover highlighting (Pointer<Over>/Pointer<Out>) is intentionally deferred
-//! to a follow-up: the existing yellow-target material already gives strong
-//! feedback for the *selected* entity, and a per-entity hover state would
-//! need to interleave with `apply_entity_color_system`'s aggro/target
-//! overrides to avoid stomping each other. TODO(C4-hover): add a
-//! `Hovered` marker + per-frame brightener on `Nameplate` text alpha.
+//! - `Pointer<Over>` / `Pointer<Out>` updates [`HoveredEntity`] (the wire
+//!   id of the entity currently under the cursor, if any). The custom
+//!   cursor sprite reads this to request the `Hand` look, and the entity
+//!   hover-card HUD reads it to show a lightweight info chip.
 
+use bevy::picking::events::{Out, Over};
 use bevy::picking::mesh_picking::MeshPickingPlugin;
-use bevy::picking::pointer::PointerButton;
+use bevy::picking::pointer::{PointerButton, PointerId};
 use bevy::picking::prelude::*;
 use bevy::prelude::*;
 
@@ -30,16 +28,64 @@ use crate::components::WorldEntity;
 use crate::input_mode::{InputMode, QuickActionState};
 use crate::scene::Target;
 
-/// Plugin: registers `MeshPickingPlugin` (the raycast backend) and the
-/// click→target reader system. `DefaultPickingPlugins` is already added by
-/// `DefaultPlugins` on both the native and WASM front-ends, so we only need
-/// the backend here.
+/// FFXI wire id of the entity currently under the mouse cursor, if any.
+/// Updated by [`update_hovered_entity_system`] in response to
+/// `Pointer<Over>` / `Pointer<Out>` on entities that carry a
+/// [`WorldEntity`] component. Cleared when the cursor leaves the entity.
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct HoveredEntity {
+    pub id: Option<u32>,
+}
+
+/// Plugin: registers `MeshPickingPlugin` (the raycast backend), the
+/// click→target reader, and the hover-state tracker.
+/// `DefaultPickingPlugins` is already added by `DefaultPlugins` on both
+/// the native and WASM front-ends, so we only need the backend here.
 pub struct PickingPlugin;
 
 impl Plugin for PickingPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MeshPickingPlugin)
-            .add_systems(Update, click_to_target_system);
+            .init_resource::<HoveredEntity>()
+            .add_systems(Update, (click_to_target_system, update_hovered_entity_system));
+    }
+}
+
+/// Track which `WorldEntity` is under the mouse cursor. Uses
+/// `Pointer<Over>` / `Pointer<Out>` so the resource only changes on
+/// enter/leave, not per-frame. The self capsule (id == 0) is excluded —
+/// targeting yourself isn't a thing in FFXI and a Hand cursor over your
+/// own avatar would be misleading.
+///
+/// `Out` is processed before `Over` so a same-frame `Out → Over`
+/// (cursor sliding from one entity onto another) ends with the new
+/// entity's id, not `None`.
+pub fn update_hovered_entity_system(
+    mut over_events: MessageReader<Pointer<Over>>,
+    mut out_events: MessageReader<Pointer<Out>>,
+    world_q: Query<&WorldEntity>,
+    mut hovered: ResMut<HoveredEntity>,
+) {
+    for ev in out_events.read() {
+        if ev.pointer_id != PointerId::Mouse {
+            continue;
+        }
+        if let Ok(w) = world_q.get(ev.entity) {
+            if hovered.id == Some(w.id) {
+                hovered.id = None;
+            }
+        }
+    }
+    for ev in over_events.read() {
+        if ev.pointer_id != PointerId::Mouse {
+            continue;
+        }
+        if let Ok(w) = world_q.get(ev.entity) {
+            if w.id == 0 {
+                continue; // self capsule — never target / hover
+            }
+            hovered.id = Some(w.id);
+        }
     }
 }
 

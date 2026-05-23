@@ -5,10 +5,14 @@ pub mod agent_codec;
 pub mod agent_io;
 #[cfg(unix)]
 pub mod agent_socket;
+pub mod auth_binary;
 pub mod auth_client;
 pub mod goal_store;
-// Depends on ffxi-viewer-core (`Action`, `Bindings`, `Preset`), which is
-// only pulled in when the native-window feature is on.
+// Both keybinds_store and graphics_store depend on ffxi-viewer-core
+// types (`Bindings`/`Preset` and `GraphicsSettings` respectively),
+// which is only pulled in when the native-window feature is on.
+#[cfg(feature = "native-window")]
+pub mod graphics_store;
 #[cfg(feature = "native-window")]
 pub mod keybinds_store;
 pub mod lobby_client;

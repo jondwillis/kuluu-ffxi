@@ -15,25 +15,20 @@
 pub enum ChunkKind {
     Terminate = 0x00,
     Rmp = 0x01,       // file-header marker (mot_, 0hm_, npc_, ...)
+    Generator = 0x05, // particle/sound/model spawner (lotus `Generator`)
     Scheduler = 0x07, // event/scheduler records (sdam, sp00, ...)
     Tim = 0x09,       // texture (legacy TIM)
     Mzb = 0x1C,       // zone static mesh (collision)
+    D3m = 0x1F,       // particle/effect triangle billboards (lotus FFXI::D3M)
     Img = 0x20,       // image / texture container (D3S in some refs)
     Bone = 0x29,      // skeleton bones (Sk2)
     VertexOs2 = 0x2A, // vertex data (OS2)
     AnimMo2 = 0x2B,   // animation keyframes (Mo2)
     Mmb = 0x2E,       // composite entity model (decryption + inline vertex/bone)
+    Weather = 0x2F,   // per-zone TOD light/fog/skybox keyframes (FFXI::Weather)
     Rid = 0x36,       // resource id (file metadata)
-                      // TODO(atmosphere): identify and add variants for FFXI's
-                      // per-zone visual data. The viewer's `ZoneAtmosphereProvider`
-                      // (ffxi-viewer-core::atmosphere) is ready to consume:
-                      //   * Sky-dome / skybox cubemap (separate sky DATs keyed on zone id)
-                      //   * Per-zone ambient color & fog parameters
-                      //   * Indoor light emitters (likely an MZB placement subtype, not
-                      //     a top-level chunk — see `parse_placements`)
-                      // None of these chunk types are confirmed in this parser yet;
-                      // they need reverse-engineering against POLUtils / Windower notes
-                      // or empirical inspection of the DAT chunk streams.
+    Sep = 0x3D,       // sound effect pointer (body[8..12] = u32 SE id)
+    Cib = 0x45,       // character-info (footstep mat/size, motion ranges)
 }
 
 impl ChunkKind {
@@ -43,15 +38,20 @@ impl ChunkKind {
         Some(match k {
             0x00 => Self::Terminate,
             0x01 => Self::Rmp,
+            0x05 => Self::Generator,
             0x07 => Self::Scheduler,
             0x09 => Self::Tim,
             0x1C => Self::Mzb,
+            0x1F => Self::D3m,
             0x20 => Self::Img,
             0x29 => Self::Bone,
             0x2A => Self::VertexOs2,
             0x2B => Self::AnimMo2,
             0x2E => Self::Mmb,
+            0x2F => Self::Weather,
             0x36 => Self::Rid,
+            0x3D => Self::Sep,
+            0x45 => Self::Cib,
             _ => return None,
         })
     }
@@ -62,15 +62,20 @@ impl ChunkKind {
         match k {
             0x00 => "Terminate",
             0x01 => "Rmp",
+            0x05 => "Generator",
             0x07 => "Scheduler",
             0x09 => "Tim",
             0x1C => "Mzb",
+            0x1F => "D3m",
             0x20 => "Img",
             0x29 => "Bone",
             0x2A => "VertexOs2",
             0x2B => "AnimMo2",
             0x2E => "Mmb",
+            0x2F => "Weather",
             0x36 => "Rid",
+            0x3D => "Sep",
+            0x45 => "Cib",
             _ => "unknown",
         }
     }

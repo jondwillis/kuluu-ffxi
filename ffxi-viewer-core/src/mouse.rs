@@ -214,6 +214,10 @@ pub fn mouse_camera_system(
 /// browsers will silently no-op this if it didn't originate from a real
 /// user gesture. Toggle from inside a key handler (F8) so the gesture
 /// requirement is satisfied transitively.
+///
+/// Visibility is *not* touched here — `crate::cursor::CursorPlugin` owns
+/// it. The custom in-app cursor sprite needs the OS cursor permanently
+/// hidden so the two don't fight; this system only manages grab mode.
 pub fn apply_cursor_lock_system(
     request: Res<CursorLockRequest>,
     mut q: Query<&mut CursorOptions, With<PrimaryWindow>>,
@@ -228,7 +232,6 @@ pub fn apply_cursor_lock_system(
     };
     if opts.grab_mode != want {
         opts.grab_mode = want;
-        opts.visible = !request.locked;
     }
 }
 

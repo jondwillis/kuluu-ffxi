@@ -22,8 +22,9 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 use ffxi_viewer_wire::EntityKind;
 
-use crate::camera::OperatorCamera;
+use crate::camera::{nameplate_anchor_y, OperatorCamera};
 use crate::components::{Nameplate, WorldEntity};
+use crate::scene::BakedActor;
 use crate::snapshot::SceneState;
 
 /// Marker on the inner `Text` child of a nameplate. Lets the per-frame
@@ -59,6 +60,7 @@ pub fn spawn_nameplate(
     let owned = name.to_string();
     commands
         .spawn((
+            crate::components::InGameEntity,
             Nameplate { entity_id, kind },
             Node {
                 position_type: PositionType::Absolute,
@@ -125,8 +127,12 @@ pub fn format_coord(pos: Vec3) -> String {
 /// coords, write into the UI node. Despawn orphaned nameplates whose
 /// owning `WorldEntity` is gone.
 ///
-/// The 2.4-unit Y offset places the label roughly above the head of the
-/// default-sized capsule. Off-screen labels are pushed far off-canvas
+/// The per-entity Y offset is computed from each entity's [`BakedActor`]
+/// (`actor_height + NAMEPLATE_OFFSET_ABOVE_CROWN`) so the label sits
+/// just above the actor's actual crown — race-tall actors get a higher
+/// label, race-short actors a lower one. Entities without a baked
+/// skinned mesh (capsule mobs, first frame before VOS2 lands) fall back
+/// to a PC-sized default. Off-screen labels are pushed far off-canvas
 /// (`-9999`) rather than hidden, so we don't have to manage `Visibility`
 /// on each node — the cheap path stays cheap.
 ///
@@ -141,7 +147,7 @@ pub fn format_coord(pos: Vec3) -> String {
 pub fn update_nameplates_system(
     state: Res<SceneState>,
     cam_q: Query<(&Camera, &Transform), (With<OperatorCamera>, Without<WorldEntity>)>,
-    world_q: Query<(&Transform, &WorldEntity), Without<Nameplate>>,
+    world_q: Query<(&Transform, &WorldEntity, Option<&BakedActor>), Without<Nameplate>>,
     mut nameplate_q: Query<(Entity, &Nameplate, &mut Node, &Children)>,
     mut label_q: Query<(&NameplateLabel, &mut Text), Without<NameplateCoord>>,
     mut coord_q: Query<&mut Text, (With<NameplateCoord>, Without<NameplateLabel>)>,
@@ -152,9 +158,13 @@ pub fn update_nameplates_system(
     };
     let cam_global = GlobalTransform::from(*cam_t);
 
-    let mut pos_by_id: HashMap<u32, Vec3> = HashMap::new();
-    for (t, w) in &world_q {
-        pos_by_id.insert(w.id, t.translation);
+    // Build per-entity (feet position, label Y offset above feet). The
+    // offset comes from the entity's `BakedActor.actor_height` when
+    // present so race-tall PCs (Galka) get a higher label and race-short
+    // ones (Taru) a lower label — otherwise a PC-sized fallback applies.
+    let mut pos_by_id: HashMap<u32, (Vec3, f32)> = HashMap::new();
+    for (t, w, baked) in &world_q {
+        pos_by_id.insert(w.id, (t.translation, nameplate_anchor_y(baked)));
     }
 
     // HP lookup keyed by wire id. Only wire entities with HP are listed —
@@ -166,8 +176,8 @@ pub fn update_nameplates_system(
 
     for (ui_entity, np, mut node, children) in &mut nameplate_q {
         match pos_by_id.get(&np.entity_id) {
-            Some(&world_pos) => {
-                let head = world_pos + Vec3::Y * 2.4;
+            Some(&(world_pos, label_y)) => {
+                let head = world_pos + Vec3::Y * label_y;
                 match camera.world_to_viewport(&cam_global, head) {
                     Ok(screen) => {
                         // Approximate horizontal centering: assume ~7 px per

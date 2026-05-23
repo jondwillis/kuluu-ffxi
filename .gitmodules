@@ -6,3 +6,12 @@
 	path = vendor/server
 	url = git@github.com:LandSandBoat/server.git
 	branch = base
+[submodule "vendor/POLUtils"]
+	path = vendor/POLUtils
+	url = https://github.com/Windower/POLUtils.git
+[submodule "vendor/AltanaViewer"]
+	path = vendor/AltanaViewer
+	url = https://github.com/voliathon/AltanaViewer.git
+[submodule "vendor/AltanaListener"]
+	path = vendor/AltanaListener
+	url = https://github.com/voliathon/AltanaListener.git

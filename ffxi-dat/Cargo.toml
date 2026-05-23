@@ -8,6 +8,12 @@ build = "build.rs"
 
 [dependencies]
 thiserror = { workspace = true }
+# Used by the `dat-scan-sounds` example for one-job-per-file
+# parallel scanning. Examples can't see `dev-dependencies`, so
+# rayon lives in the regular dep set; it's a small no_std-friendly
+# crate and library consumers that don't use the example pay only
+# a trivial compile-time cost.
+rayon = "1"
 
 [build-dependencies]
 anyhow.workspace = true

@@ -58,7 +58,10 @@ fn main() -> ExitCode {
     if bones_end > body.len() {
         eprintln!("bones overrun body: need {bones_end}, have {}", body.len());
     }
-    println!("bones [4..{bones_end}]  trailing bytes after bones = {}", body.len().saturating_sub(bones_end));
+    println!(
+        "bones [4..{bones_end}]  trailing bytes after bones = {}",
+        body.len().saturating_sub(bones_end)
+    );
 
     let to_show = (count as usize).min(n_show);
     println!("\nidx  parent     quat(x,y,z,w)                              |q|       trans(x,y,z)");

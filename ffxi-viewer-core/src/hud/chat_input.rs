@@ -33,6 +33,7 @@ pub struct ChatInputText;
 pub fn spawn_chat_input(mut commands: Commands) {
     commands
         .spawn((
+            crate::components::InGameEntity,
             ChatInputBar,
             Node {
                 position_type: PositionType::Absolute,

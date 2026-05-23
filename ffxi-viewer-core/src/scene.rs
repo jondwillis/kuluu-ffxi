@@ -14,12 +14,13 @@
 
 use std::collections::HashMap;
 
-use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder, FogVolume};
+use bevy::light::FogVolume;
 use bevy::picking::Pickable;
 use bevy::prelude::*;
 use ffxi_viewer_wire::{EntityKind, Vec3 as WireVec3};
 
 use crate::components::{IsSelf, LookComp, Nameplate, WorldEntity};
+use crate::graphics_settings::GraphicsSettings;
 use crate::snapshot::SceneState;
 
 /// Map a wire-side FFXI position to a Bevy world position.
@@ -37,28 +38,52 @@ pub fn ffxi_to_bevy(p: WireVec3) -> Vec3 {
     Vec3::new(p.x, -p.z, -p.y)
 }
 
-/// Vertical distance from an entity's `transform.y` (the mesh center)
-/// down to the bottom of its visual mesh — i.e., its "feet."
+/// Visual top of an entity's mesh in the **entity's local frame**, i.e.
+/// how far above `transform.y` (which is now feet-on-ground for every
+/// entity — see [`setup_world`] and the spawn paths in `dat_vos2`) the
+/// mesh extends. Used by nameplate / camera anchoring; **not** by the
+/// snap (the snap doesn't need a "where are the feet" answer anymore —
+/// transform.y *is* the feet).
 ///
-/// Mirrors the meshes built by [`setup_world`]:
-///   - `Capsule3d::new(radius, half_length)` → bottom at center - (half_length + radius)
-///   - `Cuboid::new(_, side, _)` → bottom at center - side/2
-///
-/// Used by:
-///   - The navmesh gravity-snap (so feet sit on the navmesh, not the
-///     center sinks below it).
-///   - The target ring (so the ring sits at the entity's *ground*
-///     level, not at a hardcoded y=0).
-///
-/// If the mesh constructors in `setup_world` change, update here.
+/// For baked actors, prefer [`BakedActor::actor_height`] over this
+/// helper — it's the empirical bake extent rather than an estimate.
 #[inline]
-pub fn feet_offset(kind: EntityKind) -> f32 {
+pub fn entity_visual_height(kind: EntityKind) -> f32 {
     match kind {
-        EntityKind::Pc => 1.9 + 0.35, // pc capsule (radius=0.35, half_length=1.9)
-        EntityKind::Pet => 0.6 + 0.4, // pet capsule (radius=0.4, half_length=0.6)
-        EntityKind::Mob => 1.1 / 2.0, // mob cuboid (1.1 cube)
-        _ => 1.4 + 0.5,               // default capsule (radius=0.5, half_length=1.4)
+        // Capsule: total height = 2 * (radius + half_length).
+        EntityKind::Pc => 2.0 * (0.35 + 1.9), // 4.5 yalms
+        EntityKind::Pet => 2.0 * (0.4 + 0.6), // 2.0
+        // Cuboid mob: total height = side length.
+        EntityKind::Mob => 1.1,
+        _ => 2.0 * (0.5 + 1.4), // 3.8 (default capsule)
     }
+}
+
+/// Marker inserted on an entity once its baked PC/NPC mesh has been
+/// spawned (see `dat_vos2::spawn_equipped`). The mesh's spawn-time
+/// transform already includes a `Vec3::Y * -min_mesh_y` translation
+/// that pins the lowest baked vertex at the entity's local y=0, so
+/// downstream systems (snap, target ring, picking) can treat the
+/// entity's `Transform::translation.y` as the feet-on-ground position
+/// without any per-actor offset lookup.
+///
+/// `min_mesh_y` / `actor_height` are retained for diagnostics
+/// (`/debug heights`) and for anchoring features that need the head
+/// position (nameplate, chase camera look-at, first-person eye). They
+/// are *not* used by the snap.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct BakedActor {
+    /// Lowest local-y the bake reaches, **before** the feet-at-origin
+    /// translation was folded into the mesh's spawn transform. Negative
+    /// for the conventional "mesh root at hip, feet below" authoring;
+    /// kept around so the diagnostic can show whether the value the
+    /// snap used to assume (`-0.9`) matched reality for the actor's
+    /// race.
+    pub min_mesh_y: f32,
+    /// `max_mesh_y - min_mesh_y` — the actor's full visual height in
+    /// yalms. Use this for head anchoring (`transform.y + actor_height`
+    /// puts you at the top of the mesh).
+    pub actor_height: f32,
 }
 
 /// Per-frame visual smoothing for *non-self* entity transforms.
@@ -110,13 +135,6 @@ pub struct EntityMaterials {
 #[derive(Component)]
 pub struct Aggroing;
 
-/// HP bar quad parented to a `WorldEntity`. Width rescaled per tick from
-/// entity hp_pct; color lerps red↔green by HP fraction.
-#[derive(Component)]
-pub struct HpBar {
-    pub owner_id: u32,
-}
-
 /// Cached per-kind entity meshes. Distinct silhouettes give the operator a
 /// cheap visual differentiator before nameplates load. PC = tall slim
 /// capsule (humanoid); Mob = boxy cuboid; Pet = short capsule; everything
@@ -129,14 +147,61 @@ pub struct EntityMesh {
     pub pet: Handle<Mesh>,
 }
 
-/// HP bar mesh — a horizontal cuboid used for all HP indicators.
-#[derive(Resource)]
-pub struct HpBarMesh(pub Handle<Mesh>);
-
 /// Currently-targeted FFXI entity id. `None` when no target is selected.
 #[derive(Resource, Default)]
 pub struct Target {
     pub id: Option<u32>,
+}
+
+/// Pure decision: should the current target/lock-on be cleared given
+/// the latest snapshot?
+///
+/// Server-side, LSB never sends an explicit "clear your target"
+/// instruction — `/check` is the only command that has a hard 50-yalm
+/// gate (`0x0dd_equip_inspect.cpp:56`). Everything else just stops
+/// including the entity in `CHAR_*` / `MAB_TIDS` floods once it dies
+/// (charutils sets `m_isDead`) or once it leaves spawn range. So the
+/// client decides target validity from the snapshot:
+///
+/// - `id` missing entirely → mob despawned, zoned out, walked beyond
+///   spawn range (~50 yalms for most mobs). Clear.
+/// - `id` present, `hp_pct == Some(0)` → entity is mid-death animation
+///   on the server (`isDead()` returns true). Clear so the operator
+///   doesn't keep swinging at a corpse and the camera's lock-on stops
+///   tracking a body that's about to despawn.
+///
+/// Returns `true` if `Target.id` (or `LockOn.target_id`) should be
+/// reset to `None`. `id` of `None` always returns `false` so the
+/// system below can be unconditionally cheap.
+pub fn should_clear_target(
+    id: Option<u32>,
+    entities: &[ffxi_viewer_wire::Entity],
+) -> bool {
+    let Some(id) = id else {
+        return false;
+    };
+    match entities.iter().find(|e| e.id == id) {
+        None => true,
+        Some(e) => matches!(e.hp_pct, Some(0)),
+    }
+}
+
+/// Auto-clear `Target` and `LockOn` when their referenced entity has
+/// vanished from the snapshot or hit 0 HP. Runs every frame; cheap
+/// because the entity scan short-circuits on the `id == target_id`
+/// hit. See [`should_clear_target`] for the policy.
+pub fn auto_clear_target_system(
+    state: Res<SceneState>,
+    mut target: ResMut<Target>,
+    mut lock_on: ResMut<crate::lock_on::LockOn>,
+) {
+    let entities = &state.snapshot.entities;
+    if should_clear_target(target.id, entities) {
+        target.id = None;
+    }
+    if should_clear_target(lock_on.target_id, entities) {
+        lock_on.target_id = None;
+    }
 }
 
 /// Tracks which Bevy entity represents each wire entity id, so we can
@@ -146,30 +211,23 @@ pub struct TrackedEntities {
     pub by_id: HashMap<u32, Entity>,
 }
 
-/// 4-cascade shadow map used by the sun light. First cascade tight
-/// (~12m around the player) for sharp character self-shadowing; last
-/// cascade ~500m so distant terrain still receives shadows.
-pub fn cascade_config_for_sun() -> CascadeShadowConfig {
-    CascadeShadowConfigBuilder {
-        num_cascades: 4,
-        minimum_distance: 0.1,
-        maximum_distance: 500.0,
-        first_cascade_far_bound: 12.0,
-        overlap_proportion: 0.2,
-    }
-    .build()
-}
-
 /// Startup system: ground plane, key light, and the cached materials.
+///
+/// Reads `GraphicsSettings` for the initial cascade config so a player
+/// with a persisted non-default preset doesn't see a one-frame pop on
+/// zone-in (the reactor systems in
+/// `crate::graphics_settings` re-apply on the next change, but spawning
+/// straight to the right config avoids that initial mismatch).
 pub fn setup_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    settings: Res<GraphicsSettings>,
 ) {
     let mk = |c: Color, m: &mut Assets<StandardMaterial>| {
         m.add(StandardMaterial {
             base_color: c,
-            perceptual_roughness: 0.7,
+            perceptual_roughness: 1.0,
             metallic: 0.0,
             ..default()
         })
@@ -203,17 +261,26 @@ pub fn setup_world(
         // family, distinguishable side-by-side.
         mob_claimed_other: mk(Color::srgb(0.65, 0.10, 0.10), &mut materials),
     });
+    // Placeholder meshes anchored so that **mesh-y = 0 is the entity's
+    // feet**, not its geometric center. `Capsule3d::new(r, hl)` places
+    // its center at the origin; we translate the mesh up by `r + hl`
+    // so the bottom of the capsule lands at y=0. Same for the mob
+    // cuboid (translate up by half-side).
+    //
+    // This is the invariant the snap and target-ring rely on: every
+    // entity transform's Y is the actor's feet-on-ground position.
+    // No per-kind offset table at snap time, no per-actor estimate;
+    // the mesh literally extends from y=0 upward.
     commands.insert_resource(EntityMesh {
-        default: meshes.add(Capsule3d::new(0.5, 1.4)),
+        default: meshes.add(Capsule3d::new(0.5, 1.4).mesh().build().translated_by(Vec3::Y * (0.5 + 1.4))),
         // PCs: noticeably taller and thinner than NPCs so player characters
         // pop visually in the world.
-        pc: meshes.add(Capsule3d::new(0.35, 1.9)),
+        pc: meshes.add(Capsule3d::new(0.35, 1.9).mesh().build().translated_by(Vec3::Y * (0.35 + 1.9))),
         // Mobs: boxy. Distinct silhouette from anything humanoid.
-        mob: meshes.add(Cuboid::new(1.1, 1.1, 1.1)),
+        mob: meshes.add(Cuboid::new(1.1, 1.1, 1.1).mesh().build().translated_by(Vec3::Y * 0.55)),
         // Pets: small capsule, hugs the ground.
-        pet: meshes.add(Capsule3d::new(0.4, 0.6)),
+        pet: meshes.add(Capsule3d::new(0.4, 0.6).mesh().build().translated_by(Vec3::Y * (0.4 + 0.6))),
     });
-    commands.insert_resource(HpBarMesh(meshes.add(Cuboid::new(1.0, 0.12, 0.12))));
 
     // No placeholder ground plane: the navmesh wireframe overlay
     // (`ffxi-client::view_native::navmesh_overlay`) provides terrain
@@ -225,7 +292,7 @@ pub fn setup_world(
     // are tagged and updated each frame by `sun_moon::sun_moon_system`
     // from Vana'diel time (sun arcs east→west across the V-day; moon
     // is anti-phase; moon brightness follows the 84-day phase cycle).
-    crate::sun_moon::spawn_sun_and_moon(&mut commands, &mut meshes, &mut materials);
+    crate::sun_moon::spawn_sun_and_moon(&mut commands, &mut meshes, &mut materials, &settings);
 
     // Zone-scale fog volume. `FogVolume`'s bounds come from its
     // Transform scale (default 1m³); we make it a ~2km cube so the
@@ -234,6 +301,7 @@ pub fn setup_world(
     // readable. Pair with the camera's `VolumetricFog` and the
     // directional light's `VolumetricLight` marker above.
     commands.spawn((
+        crate::components::InGameEntity,
         FogVolume {
             fog_color: Color::srgb(0.65, 0.72, 0.82),
             density_factor: 0.06,
@@ -273,21 +341,15 @@ pub fn sync_entities_system(
     state: Res<SceneState>,
     target: Res<Target>,
     mesh: Res<EntityMesh>,
-    hp_bar_mesh: Res<HpBarMesh>,
     mats: Res<EntityMaterials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    billboard_font: Res<crate::nameplate_billboard::BillboardFont>,
     mut tracked: ResMut<TrackedEntities>,
     mut commands: Commands,
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     mut q_mat: Query<&mut MeshMaterial3d<StandardMaterial>, With<WorldEntity>>,
-    mut q_hp: Query<
-        (
-            &HpBar,
-            &mut Transform,
-            &mut MeshMaterial3d<StandardMaterial>,
-        ),
-        Without<WorldEntity>,
-    >,
     q_nameplates: Query<&Nameplate>,
 ) {
     if !state.dirty && !target.is_changed() {
@@ -347,11 +409,37 @@ pub fn sync_entities_system(
                     // integration — extra smoothing here only adds input
                     // lag. Other entities arrive at server tick rate, so
                     // visual smoothing fills the gaps.
-                    t.translation = if is_self {
-                        world_pos
+                    //
+                    // **Y ownership splits by entity kind:**
+                    // - Self + static NPCs (`Npc`, `Other`): the MZB-floor
+                    //   snap (`snap_entities_to_mzb_floor_system`) owns Y.
+                    //   Self because the server pings the player's last-
+                    //   known altitude, not the terrain the client renders;
+                    //   static NPC records because the spawn-time Y often
+                    //   doesn't match the runtime MZB floor at the same XZ
+                    //   (vendor floats in the air without the snap).
+                    // - Active entities (`Mob`, `Pc`, `Pet`): the server
+                    //   simulates fresh XYZ each tick on its own navmesh
+                    //   and is authoritative. Preserving the snap-set Y
+                    //   here would lie about server position — visual
+                    //   "rabbit on the ground" while the server says
+                    //   "rabbit 13y up the hillside" makes the server's
+                    //   3D range check reject attacks the operator
+                    //   thinks should be in range. Trust wire Y instead.
+                    let new_translation = if is_self {
+                        Vec3::new(world_pos.x, t.translation.y, world_pos.z)
                     } else {
-                        apply_visual_smoothing(t.translation, world_pos)
+                        let smoothed = apply_visual_smoothing(t.translation, world_pos);
+                        match wire.kind {
+                            EntityKind::Mob | EntityKind::Pc | EntityKind::Pet => {
+                                Vec3::new(smoothed.x, world_pos.y, smoothed.z)
+                            }
+                            EntityKind::Npc | EntityKind::Other => {
+                                Vec3::new(smoothed.x, t.translation.y, smoothed.z)
+                            }
+                        }
                     };
+                    t.translation = new_translation;
                     t.rotation = heading_to_quat(wire.heading);
                 }
                 if let Ok(mut m) = q_mat.get_mut(existing) {
@@ -369,6 +457,7 @@ pub fn sync_entities_system(
                     Pickable::default()
                 };
                 let mut spawn = commands.spawn((
+                    crate::components::InGameEntity,
                     WorldEntity {
                         id: wire.id,
                         act_index: wire.act_index,
@@ -398,23 +487,18 @@ pub fn sync_entities_system(
                         EntityKind::Mob | EntityKind::Pc | EntityKind::Pet
                     )
                 {
-                    let bar_color = hp_color(wire.hp_pct);
-                    commands.spawn((
-                        HpBar { owner_id: wire.id },
-                        // HP bars hover above an entity; without `IGNORE`
-                        // they would intercept clicks aimed at the capsule
-                        // beneath them and the click-to-target system
-                        // would think the operator clicked a non-entity.
-                        Pickable::IGNORE,
-                        Mesh3d(hp_bar_mesh.0.clone()),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: bar_color,
-                            perceptual_roughness: 0.5,
-                            ..default()
-                        })),
-                        Transform::from_xyz(0.0, 1.5, 0.0),
-                        ChildOf(bevy_e),
-                    ));
+                    // HP indicator is rendered as filled rectangles
+                    // inside the nameplate texture (see
+                    // `nameplate_billboard.rs`). No separate 3D entity:
+                    // the prior `HpBar` quad parented to the WorldEntity
+                    // followed the entity's heading rotation, so it
+                    // appeared horizontally-across-the-chest at any
+                    // camera angle that wasn't dead-aligned with the
+                    // entity's facing direction. Folding the bar into
+                    // the nameplate texture lets it inherit the same
+                    // Y-locked billboard rotation and stay perpendicular
+                    // to the camera for free.
+                    let _ = bevy_e;
                 }
             }
         }
@@ -435,12 +519,20 @@ pub fn sync_entities_system(
         });
         if let Some(name) = name.filter(|s| !s.is_empty()) {
             if !nameplated.contains(&wire.id) {
-                crate::nameplate::spawn_nameplate(
+                crate::nameplate_billboard::spawn_nameplate_billboard(
                     &mut commands,
+                    &mut meshes,
+                    &mut materials,
+                    &mut images,
+                    &billboard_font.0,
                     wire.id,
                     wire.kind,
                     name,
-                    nameplate_color(wire.kind),
+                    // Spawn-time color is the kind-only default with no
+                    // combat context. The update system re-derives the
+                    // engagement-aware color next tick (mob: aggro vs.
+                    // wandering, etc.) and re-rasterizes if needed.
+                    crate::nameplate_billboard::nameplate_color(wire.kind, false, false),
                 );
                 nameplated.insert(wire.id);
             }
@@ -469,21 +561,11 @@ pub fn sync_entities_system(
         }
     }
 
-    // Update HP bars.
-    for (bar, mut t, mut hm) in q_hp.iter_mut() {
-        if let Some(Some(pct)) = hp_by_id.get(&bar.owner_id).copied() {
-            let frac = (pct as f32 / 100.0).clamp(0.0, 1.0);
-            t.scale.x = frac;
-            t.translation.x = -(1.0 - frac) * 0.5;
-            hm.0 = materials.add(StandardMaterial {
-                base_color: hp_color(Some(pct)),
-                perceptual_roughness: 0.5,
-                ..default()
-            });
-        } else {
-            t.scale.x = 0.0;
-        }
-    }
+    // HP update path moved into `nameplate_billboard.rs`: the per-
+    // frame `update_nameplate_billboards_system` re-rasterizes the
+    // nameplate texture (which embeds the HP bar) only when the
+    // integer percentage actually changes, gated on a new `last_hp`
+    // field on `NameplateBillboard`.
 }
 
 /// Per-tick: reconcile the `Aggroing` marker on each ECS entity and
@@ -589,18 +671,6 @@ fn pick_mesh(m: &EntityMesh, kind: EntityKind) -> Handle<Mesh> {
     }
 }
 
-/// Nameplate text color per entity kind. Matches the body-material palette
-/// roughly, brightened so the label is legible against the dark scene.
-fn nameplate_color(kind: EntityKind) -> Color {
-    match kind {
-        EntityKind::Pc => Color::srgb(0.55, 0.95, 1.0),
-        EntityKind::Npc => Color::srgb(1.0, 0.92, 0.55),
-        EntityKind::Mob => Color::srgb(1.0, 0.55, 0.55),
-        EntityKind::Pet => Color::srgb(0.55, 0.95, 0.65),
-        EntityKind::Other => Color::srgb(0.85, 0.85, 0.85),
-    }
-}
-
 fn pick_material(m: &EntityMaterials, kind: EntityKind, is_self: bool) -> Handle<StandardMaterial> {
     if is_self {
         return m.self_pc.clone();
@@ -654,9 +724,14 @@ pub fn pick_mob_material<'a>(
 
 /// FFXI heading 0..=255 maps to 0..2π. Heading 0 = +y in FFXI = -z in Bevy
 /// = "camera-forward in default pose". Rotation axis is Bevy's Y-up.
+///
+/// Sign: FFXI heading increases clockwise from above (0=N, 64=E, 128=S,
+/// 192=W). Bevy `Quat::from_rotation_y(+θ)` rotates counterclockwise from
+/// above. So heading→yaw needs a sign flip; matches the convention in
+/// `camera::yaw_for_heading`.
 fn heading_to_quat(heading: u8) -> Quat {
     let angle = (heading as f32) * std::f32::consts::TAU / 256.0;
-    Quat::from_rotation_y(angle)
+    Quat::from_rotation_y(-angle)
 }
 
 /// Copy each wire entity's `look` field onto its Bevy `WorldEntity` as
@@ -671,6 +746,47 @@ fn heading_to_quat(heading: u8) -> Quat {
 /// many times per second per entity — even when the value is
 /// byte-identical to last tick. The explicit compare-then-insert here
 /// is what makes Bevy's change-detection meaningful for this surface.
+/// Launcher → game look bridge. The retail FFXI server zeros the
+/// self GrapIDTbl in CHAR_PC because the retail client rebuilds
+/// appearance from local equipment state — but we don't have that
+/// state on the wire (`session.rs:678` documents the empty slot).
+/// The launcher knows the player's appearance (`CharSlot`); it
+/// writes it into this resource before connecting, and
+/// [`ensure_self_lookcomp_system`] applies it to the self
+/// `WorldEntity` whenever the wire's `look` is empty.
+///
+/// `None` (the default) means no self override — entities use their
+/// wire look as-is. This is the launcher pre-login state, the wasm
+/// browser flow, and headless / MCP sessions.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct SelfAppearance {
+    pub look: Option<ffxi_viewer_wire::EntityLook>,
+}
+
+/// Ensure the self entity has a `LookComp` whenever a
+/// [`SelfAppearance`] override is set. Runs *after*
+/// `sync_entity_looks_system` so a real wire look (if it ever
+/// arrives) takes precedence — we only fill in when wire-side is
+/// absent.
+pub fn ensure_self_lookcomp_system(
+    appearance: Res<SelfAppearance>,
+    q_self: Query<(Entity, Option<&LookComp>), With<IsSelf>>,
+    mut commands: Commands,
+) {
+    let Some(look) = appearance.look.as_ref() else {
+        return;
+    };
+    for (e, current) in q_self.iter() {
+        let needs = match current {
+            None => true,
+            Some(LookComp(existing)) => existing != look,
+        };
+        if needs {
+            commands.entity(e).insert(LookComp(look.clone()));
+        }
+    }
+}
+
 pub fn sync_entity_looks_system(
     state: Res<SceneState>,
     tracked: Res<TrackedEntities>,
@@ -700,29 +816,23 @@ pub fn sync_entity_looks_system(
 
 /// React to look changes for spawned entities — Stage 3+ fills this in
 /// with `LoadMmbRequest` dispatch. Today it's a hook that just logs the
-/// transition via `info!`, so we can confirm Stage 2's change-detect
-/// plumbing is firing when (and only when) wire data actually changes.
+/// transition (at debug level) so we can verify change-detect plumbing.
 ///
 /// Uses Bevy's `Changed<LookComp>` rather than re-comparing snapshot
 /// state because [`sync_entity_looks_system`] already absorbed the
 /// "snapshot says X, world says Y" reconciliation upstream.
+///
+/// Note: empirically `Changed<LookComp>` fires every frame on the local
+/// PC during movement, even when the look bytes don't actually change.
+/// Demoted from `info!` to `debug!` so it stays opt-in via RUST_LOG;
+/// the underlying false-positive is a separate fix.
 pub fn process_entity_look_changes(q_changed: Query<(&WorldEntity, &LookComp), Changed<LookComp>>) {
     for (we, look) in q_changed.iter() {
-        // Tag the log with both the wire id and entity kind so
-        // operators can correlate it against `/entities` output.
-        info!(
+        debug!(
             "look changed for entity {} ({:?}): {:?}",
             we.id, we.kind, look.0
         );
     }
-}
-
-/// HP bar color: green at 100%, yellow at 50%, red at 0%.
-fn hp_color(pct: Option<u8>) -> Color {
-    let frac = pct.unwrap_or(100) as f32 / 100.0;
-    let r = frac.min(1.0);
-    let g = (1.0 - frac).min(1.0);
-    Color::srgb(r, g, 0.0)
 }
 
 #[cfg(test)]
@@ -850,5 +960,61 @@ mod tests {
         let at_threshold = SNAP_DIST_SQ.sqrt();
         let result = apply_visual_smoothing(Vec3::ZERO, Vec3::new(at_threshold, 0.0, 0.0));
         assert_eq!(result.x, at_threshold, "at threshold should snap");
+    }
+
+    /// `None` target → never clear. Keeps the auto-clear system from
+    /// fighting a freshly-set `Target` whose snapshot hasn't caught up.
+    #[test]
+    fn auto_clear_keeps_none() {
+        assert!(!should_clear_target(None, &[]));
+    }
+
+    /// Target present in the snapshot with healthy HP → keep.
+    #[test]
+    fn auto_clear_keeps_live_entity() {
+        let ents = vec![entity_with_hp(17, Some(75))];
+        assert!(!should_clear_target(Some(17), &ents));
+    }
+
+    /// Target id missing from the snapshot → clear. Covers both the
+    /// despawn case (mob died fully and was removed) and the
+    /// out-of-range case (mob walked past spawn range and the server
+    /// dropped it from our CHAR_* updates).
+    #[test]
+    fn auto_clear_drops_when_id_absent() {
+        let ents = vec![entity_with_hp(99, Some(50))];
+        assert!(should_clear_target(Some(17), &ents));
+    }
+
+    /// Target present but at 0 HP → clear (mid-death-anim corpse).
+    #[test]
+    fn auto_clear_drops_when_hp_zero() {
+        let ents = vec![entity_with_hp(17, Some(0))];
+        assert!(should_clear_target(Some(17), &ents));
+    }
+
+    /// `hp_pct == None` (server hasn't sent HP yet — common right at
+    /// spawn-in) is *not* death. Don't clear on missing data.
+    #[test]
+    fn auto_clear_keeps_when_hp_unknown() {
+        let ents = vec![entity_with_hp(17, None)];
+        assert!(!should_clear_target(Some(17), &ents));
+    }
+
+    fn entity_with_hp(id: u32, hp_pct: Option<u8>) -> ffxi_viewer_wire::Entity {
+        ffxi_viewer_wire::Entity {
+            id,
+            act_index: 0,
+            kind: EntityKind::Mob,
+            name: None,
+            pos: WireVec3 { x: 0.0, y: 0.0, z: 0.0 },
+            heading: 0,
+            hp_pct,
+            bt_target_id: 0,
+            claim_id: 0,
+            speed: 0,
+            speed_base: 0,
+            look: None,
+        }
     }
 }

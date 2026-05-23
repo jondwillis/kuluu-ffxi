@@ -30,13 +30,20 @@ fn main() -> ExitCode {
         if ChunkKind::from_u8(c.kind) != Some(ChunkKind::Mmb) {
             continue;
         }
-        let Ok(dec) = mmb::decrypt(c.data) else { continue; };
-        let Ok(hdr) = MmbHeader::parse(&dec) else { continue; };
+        let Ok(dec) = mmb::decrypt(c.data) else {
+            continue;
+        };
+        let Ok(hdr) = MmbHeader::parse(&dec) else {
+            continue;
+        };
         mmb_names.push((i, hdr.asset_name_str().trim().to_string()));
     }
 
     // Resolve placement IDs against MMB names.
-    let mzb_chunk = chunks.iter().find(|c| c.kind == ChunkKind::Mzb as u8).unwrap();
+    let mzb_chunk = chunks
+        .iter()
+        .find(|c| c.kind == ChunkKind::Mzb as u8)
+        .unwrap();
     let plain = mzb::decrypt(mzb_chunk.data).unwrap();
     let header = mzb::MzbHeader::parse(&plain).unwrap();
     let placements = mzb::parse_mmb_placements(&plain, &header).unwrap();
@@ -59,11 +66,13 @@ fn main() -> ExitCode {
         .collect();
     unplaced.sort_by_key(|(_, name)| name.to_string());
 
-    println!("DAT {file_id}: {} MMBs, {} placements, {} referenced, {} unplaced",
+    println!(
+        "DAT {file_id}: {} MMBs, {} placements, {} referenced, {} unplaced",
         mmb_names.len(),
         placements.len(),
         referenced.len(),
-        unplaced.len());
+        unplaced.len()
+    );
     println!();
     println!("Unplaced MMBs:");
     for (chunk_idx, name) in &unplaced {

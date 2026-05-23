@@ -136,6 +136,7 @@ pub fn sync_zone_lines_system(
         let column_center = ground_pos + Vec3::new(0.0, 6.05, 0.0);
 
         commands.spawn((
+            crate::components::InGameEntity,
             ZoneLineMarker {
                 line_id: desc.line_id,
                 to_zone: desc.to_zone,

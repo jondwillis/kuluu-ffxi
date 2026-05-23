@@ -30,7 +30,10 @@ fn main() -> ExitCode {
     let plain = mzb::decrypt(mzb_chunk.data).unwrap();
     let header = mzb::MzbHeader::parse(&plain).unwrap();
 
-    println!("DAT {file_id} MZB at chunk[{chunk_idx}] body_len={}", plain.len());
+    println!(
+        "DAT {file_id} MZB at chunk[{chunk_idx}] body_len={}",
+        plain.len()
+    );
     println!("  decode_length      {}", header.decode_length);
     println!("  node_count         {}", header.node_count);
     println!("  version            {}", header.version);
@@ -44,25 +47,43 @@ fn main() -> ExitCode {
     println!();
     let placements_size = (header.node_count as usize) * 100;
     let placements_end = 0x20 + placements_size;
-    println!("placement table: 0x20..0x{:x}  ({} bytes, stride 100)", placements_end, placements_size);
-    println!("byte gap to mesh_table: {} bytes",
-        (header.mesh_table_offset as i64) - (placements_end as i64));
-    println!("byte gap to quadtree:   {} bytes",
-        (header.quadtree_offset as i64) - (placements_end as i64));
-    println!("byte gap to maplist:    {} bytes",
-        (header.maplist_offset as i64) - (placements_end as i64));
+    println!(
+        "placement table: 0x20..0x{:x}  ({} bytes, stride 100)",
+        placements_end, placements_size
+    );
+    println!(
+        "byte gap to mesh_table: {} bytes",
+        (header.mesh_table_offset as i64) - (placements_end as i64)
+    );
+    println!(
+        "byte gap to quadtree:   {} bytes",
+        (header.quadtree_offset as i64) - (placements_end as i64)
+    );
+    println!(
+        "byte gap to maplist:    {} bytes",
+        (header.maplist_offset as i64) - (placements_end as i64)
+    );
     println!();
 
     // Dump the bytes immediately after the placement table to see if
     // there's a hidden second placement block.
     if placements_end < plain.len() {
         let peek_len = 256.min(plain.len() - placements_end);
-        println!("first {peek_len} bytes after placement table (offset 0x{:x}):", placements_end);
+        println!(
+            "first {peek_len} bytes after placement table (offset 0x{:x}):",
+            placements_end
+        );
         for chunk in plain[placements_end..placements_end + peek_len].chunks(16) {
             let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
             let ascii: String = chunk
                 .iter()
-                .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                .map(|&b| {
+                    if b.is_ascii_graphic() || b == b' ' {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
                 .collect();
             println!("  {}  |{}|", hex.join(" "), ascii);
         }

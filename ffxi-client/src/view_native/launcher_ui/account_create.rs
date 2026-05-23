@@ -13,9 +13,7 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 
-use super::{
-    CreateAccountErrorMsg, CreateAccountField, CreateAccountForm, LauncherState,
-};
+use super::{CreateAccountErrorMsg, CreateAccountField, CreateAccountForm, LauncherState};
 
 #[derive(Component)]
 pub(super) struct CreateAccountRoot;
@@ -53,9 +51,7 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<CreateAccountForm>) {
                 TextColor(Color::srgb(0.30, 1.0, 0.65)),
             ));
             parent.spawn((
-                Text::new(
-                    "Tab / Shift-Tab: switch field   Enter: create   Esc: back to login",
-                ),
+                Text::new("Tab / Shift-Tab: switch field   Enter: create   Esc: back to login"),
                 TextFont {
                     font_size: 11.0,
                     ..default()

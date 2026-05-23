@@ -42,11 +42,10 @@
 //! coords. Bevy is also y-up; the two differ only in z-handedness,
 //! so the transform is just `bevy = (d.x, d.y, -d.z)`.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
-use ffxi_viewer_core::{feet_offset, InputMode, IsSelf, SceneState, WorldEntity};
+use ffxi_viewer_core::{InputMode, SceneState, WorldEntity};
 
 use super::AppPhase;
 
@@ -57,7 +56,6 @@ impl Plugin for NavmeshOverlayPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<NavmeshOverlayVisible>()
             .init_resource::<NavmeshState>()
-            .init_resource::<SnapHeightCache>()
             .add_systems(
                 Update,
                 (
@@ -79,21 +77,13 @@ impl Plugin for NavmeshOverlayPlugin {
             // snap runs in a deterministic window every frame.
             .add_systems(
                 Update,
-                snap_entities_to_navmesh_system
+                snap_entities_to_mzb_floor_system
                     .after(ffxi_viewer_core::sync_entities_system)
                     .before(ffxi_viewer_core::chase_camera_system)
                     .run_if(in_state(AppPhase::InGame)),
             );
     }
 }
-
-/// Per-entity cache of the last navmesh height we resolved. Used as
-/// `z_hint` next frame instead of `t.translation.y`, which would
-/// otherwise oscillate between local-predicted and server-echoed z
-/// at high render fps and cause `find_nearest_poly_1` to flip between
-/// adjacent polys (visible as tick-tock vertical jitter).
-#[derive(Resource, Default)]
-struct SnapHeightCache(HashMap<u32, f32>);
 
 /// Toggle state. Default `false`: overlay is hidden until the first
 /// F9 press.
@@ -153,10 +143,11 @@ fn toggle_navmesh_overlay(
         "navmesh overlay: OFF".to_string()
     };
     state.push_local_toast(ffxi_viewer_wire::ChatLine {
-        channel: ffxi_viewer_wire::ChatChannel::System,
+        channel: ffxi_viewer_wire::ChatChannel::Debug,
         sender: "client".into(),
         text: msg,
         server_ts: 0,
+        local_seq: 0,
     });
 }
 
@@ -204,7 +195,12 @@ fn swap_navmesh_on_zone_change(scene: Res<SceneState>, mut state: ResMut<Navmesh
 /// in 4-5 lines. Nothing else in the plugin assumes anything about
 /// how the lines look.
 fn draw_navmesh_overlay(mut gizmos: Gizmos, state: Res<NavmeshState>) {
-    let color = Color::srgb(0.2, 1.0, 0.4);
+    // Lime-green at 0.75 alpha. Translucent so dense navmesh tiles don't
+    // hide the underlying MZB collision color, and pinned to the green
+    // axis so the navmesh has a clear visual identity vs.
+    // `/zonegeom camera` (cyan AABBs) and the chase-ray viz
+    // (yellow/magenta segments).
+    let color = Color::srgba(0.25, 1.0, 0.40, 0.75);
     // 0.05 yalm above the navmesh-height so the gizmo isn't depth-fought
     // against the MZB collision mesh at the same Y. The previous 1.0
     // lift dated from the floor-plane-only era — operators saw the
@@ -220,100 +216,117 @@ fn draw_navmesh_overlay(mut gizmos: Gizmos, state: Res<NavmeshState>) {
     }
 }
 
-/// Visual gravity: each frame, query the navmesh for the height at
-/// each entity's 2D position and snap the rendered Y to it. Runs
-/// **after** `sync_entities_system` populates transforms from the
-/// wire snapshot, so we override server-reported height with navmesh
-/// height — necessary when the server's `z` doesn't track terrain
-/// (often the case for static NPCs which sit at a fixed `z` regardless
-/// of where the placement engine put them on the actual ground).
+/// Visual gravity: each frame, query the MZB collision mesh for the
+/// floor height under self's XZ and snap `transform.y` to it.
 ///
-/// ## Stable z_hint
+/// **Applies to self only.** Every non-self entity — Mob, other Pc,
+/// Pet, static NPC, Other — is server-positioned; `sync_entities_system`
+/// writes their wire Y directly and we leave it alone. Overriding any
+/// of them to the local MZB floor would cause the rendered visual to
+/// disagree with the server's range check (a mob visually "on the
+/// ground" 5y away while the server sees it 15y up the hillside and
+/// rejects attacks as out of range). Even static NPCs: their server
+/// record is canonical, and silently rewriting their position to a
+/// raycast result would move them between visits.
 ///
-/// `find_nearest_poly_1` searches a vertical box around `z_hint`. If
-/// `z_hint` oscillates between two values (e.g., local-predicted vs
-/// server-echoed self z, which interleave at high render fps), the
-/// query can pick different adjacent polys whose heights differ
-/// slightly — visible as tick-tock jitter. We avoid this by feeding
-/// the *previous* snapped height back as the hint, cached per
-/// entity. The first frame for an entity falls back to its current
-/// rendered y; subsequent frames are stable.
+/// Self snaps because the player input pipeline writes X/Z but not Y,
+/// so the snap is the sole writer of self's vertical position. On
+/// zone-in, when MZB hasn't loaded yet, the snap falls back to wire Y
+/// for self (see the `tri_count() == 0` branch below) — otherwise
+/// self would stay at the *previous* zone's snap result and appear to
+/// fall through the world.
 ///
-/// ## Capsule feet offset
+/// Runs **after** `sync_entities_system` (which writes X/Z for self
+/// and full XYZ for active non-self) and **before** `chase_camera_system`.
 ///
-/// Server doesn't encode entity heights — capsules are client-side
-/// placeholders. With the snap setting `bevy.y = navmesh_h`, the
-/// capsule center sits *on* the navmesh and its feet are 1.9 yalms
-/// below it (capsule radius + half-height). We add a per-kind feet
-/// offset so the **feet** rest on the navmesh instead.
-fn snap_entities_to_navmesh_system(
-    state: Res<NavmeshState>,
+/// ## Why MZB only
+///
+/// The MZB collision mesh is the authoritative ground surface — it's
+/// what the visible floor renders from (decorative tris filtered out
+/// by the `is_collision` flag in `dat_mzb::process_load_mzb_requests`).
+/// The xiNavmesh is purpose-built for **pathing**, not gravity: its
+/// `nearest_height_at` smooths to polygon centers, oscillates between
+/// adjacent polys at high render fps (which forced a per-entity
+/// z-hint cache), and disagrees with the MZB collision surface by
+/// ~0.4 yalm in zones where both are loaded. Using it for gravity
+/// confused the two roles. After this refactor the navmesh is
+/// reactor-only (path queries from `dispatch_movement_system`); the
+/// snap touches only the collision surface.
+///
+/// Self off the loaded zone bounds gets no snap — `transform.y`
+/// stays at whatever the previous frame set, which for fresh spawns
+/// is the wire-derived `ffxi_to_bevy` value. No silent fallback to
+/// the pathing surface.
+///
+/// ## Why no offset table
+///
+/// Every entity's mesh is spawned with its feet at the parent's local
+/// y=0 — capsule placeholders via `Mesh::translated_by(Vec3::Y *
+/// (r + hl))` in `setup_world`, baked actors via the pivot/mesh-entity
+/// translation in `dat_vos2::spawn_skinned_actor` /
+/// `spawn_vos2_meshes_with_skeleton`. So `transform.y = ground` puts
+/// feet at ground by construction; no per-kind feet_offset, no
+/// per-actor `visual_root_offset` estimate.
+fn snap_entities_to_mzb_floor_system(
     collision_geom: Res<ffxi_viewer_core::dat_mzb::MzbCollisionGeometry>,
-    mut cache: ResMut<SnapHeightCache>,
-    mut q: Query<(&WorldEntity, &mut Transform, Has<IsSelf>)>,
+    scene: Res<SceneState>,
+    mut q: Query<(
+        &WorldEntity,
+        &mut Transform,
+        Has<ffxi_viewer_core::components::IsSelf>,
+    )>,
 ) {
-    // Two-tier ground snap:
-    //
-    // - **Self entity** uses the MZB collision-mesh raycast. This is
-    //   what the operator's eye is locked on — they notice if the
-    //   player floats off the rendered floor by even 0.4 yalms.
-    // - **All other entities** use the cheap Detour `nearest_height_at`
-    //   query. The two surfaces differ by ~0.4 yalms (per `/debug heights`
-    //   in Bastok); invisible at third-person NPC distance.
-    //
-    // Rationale: the linear MZB raycast scans ~5k tris per query
-    // (sufficient for one entity per frame at 1.5% CPU budget), but
-    // running it for every entity in a populated zone scales to
-    // tens-of-millions of intersections per frame — the cause of the
-    // FPS tank observed after the initial C3.1 rollout.
-    let nav_guard = state.nav.as_ref().and_then(|n| n.lock().ok());
-    let mzb_loaded = collision_geom.tri_count() > 0;
-    if !mzb_loaded && nav_guard.is_none() {
+    // Zone-change fallback: until the new zone's MZB collision finishes
+    // loading, the snap has no floor to anchor against. Without this
+    // branch the system early-returned, leaving self.y at the *previous*
+    // zone's snap result — visually "falling through the world" when
+    // the new zone's floor is at a different elevation at the same
+    // XZ. Trust wire Y for self in this window; the server's Y for the
+    // player is authoritative across zone transitions. Snap takes over
+    // again on the first frame `tri_count() > 0`.
+    if collision_geom.tri_count() == 0 {
+        let wire_self_y = ffxi_viewer_core::ffxi_to_bevy(scene.snapshot.self_pos.pos).y;
+        for (_we, mut t, is_self) in q.iter_mut() {
+            if is_self {
+                t.translation.y = wire_self_y;
+            }
+        }
         return;
     }
-
-    for (entity, mut t, is_self) in q.iter_mut() {
-        let ground_y: Option<f32> = if is_self && mzb_loaded {
-            // Player: MZB raycast. Fall back to navmesh if the
-            // column at the player's XZ has no triangle below
-            // (e.g., off the edge of the loaded zone bounds).
-            //
-            // `ceiling_y = current_y + STEP_TOLERANCE` so the snap
-            // ignores overhead geometry the player is walking
-            // *under* (gate tops, arches, eaves) but still allows
-            // small step-ups onto curbs and ramps.
-            const STEP_TOLERANCE: f32 = 2.0;
-            let ceiling_y = t.translation.y + STEP_TOLERANCE;
-            let mzb = collision_geom
-                .ground_raycast(Vec2::new(t.translation.x, t.translation.z), ceiling_y);
-            mzb.or_else(|| nav_y_bevy(&nav_guard, &mut cache, entity.id, &t))
-        } else {
-            // NPCs / mobs / other PCs: cheap navmesh query.
-            nav_y_bevy(&nav_guard, &mut cache, entity.id, &t)
-        };
-
-        if let Some(ground) = ground_y {
-            t.translation.y = ground + feet_offset(entity.kind);
+    for (_we, mut t, is_self) in q.iter_mut() {
+        // Self only. Everything else — Mob, other Pc, Pet, static NPC,
+        // Other — is server-positioned; `sync_entities_system` writes
+        // their wire Y directly. Overriding any of them to the local
+        // MZB floor causes the rendered visual to disagree with the
+        // server's range check (a mob visually "on the ground" 5y away
+        // while the server sees it 15y up the hillside and rejects
+        // attacks as out of range). Even static NPCs: their server-
+        // recorded Y is the canonical position, and rewriting it to a
+        // raycast result silently moves them between visits.
+        //
+        // The player's input pipeline writes X/Z but not Y, so the
+        // snap remains the sole writer of self's vertical position.
+        if !is_self {
+            continue;
+        }
+        // `ceiling_y` filters overhead floor-like geometry (arches,
+        // gate tops, second-floor surfaces the player is walking
+        // *under*). Of the candidates that pass `FLOOR_NORMAL_MIN`
+        // and the ceiling bound, `ground_raycast` picks the highest —
+        // multi-floor step-up support intact.
+        //
+        // STEP_TOLERANCE is generous (2 yalms) to absorb the case
+        // where the player briefly clips above the floor between snap
+        // ticks; the floor-normal filter does the actual "is this a
+        // walkable surface" work.
+        const STEP_TOLERANCE: f32 = 2.0;
+        let ceiling_y = t.translation.y + STEP_TOLERANCE;
+        if let Some(ground) = collision_geom
+            .ground_raycast(Vec2::new(t.translation.x, t.translation.z), ceiling_y)
+        {
+            t.translation.y = ground;
         }
     }
-}
-
-/// Navmesh `nearest_height_at` lookup, converted to Bevy Y-up. Returns
-/// `None` when no navmesh is loaded or the query fails. Mirrors the
-/// pre-C3.1 snap path verbatim so NPCs render identically to before.
-fn nav_y_bevy(
-    nav_guard: &Option<std::sync::MutexGuard<'_, ffxi_nav_recast::RecastNavMesh>>,
-    cache: &mut SnapHeightCache,
-    entity_id: u32,
-    t: &Transform,
-) -> Option<f32> {
-    let g = nav_guard.as_ref()?;
-    let ffxi_x = t.translation.x;
-    let ffxi_y = -t.translation.z;
-    let z_hint = cache.0.get(&entity_id).copied().unwrap_or(-t.translation.y);
-    let h = g.nearest_height_at(ffxi_x, ffxi_y, z_hint)?;
-    cache.0.insert(entity_id, h);
-    Some(-h)
 }
 
 /// Detour-space → Bevy world.

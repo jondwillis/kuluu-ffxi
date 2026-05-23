@@ -1,0 +1,42 @@
+[package]
+name = "recastnavigation-rs"
+version = "0.1.0"
+authors = ["SlimeYummy <zzzcccnnn@outlook.com>"]
+edition = "2021"
+rust-version = "1.75"
+description = "A rust binding for recastnavigation path finding library adds cross-platform deterministic."
+license = "MPL-2.0"
+homepage = "https://github.com/SlimeYummy/recastnavigation-rs"
+repository = "https://github.com/SlimeYummy/recastnavigation-rs"
+keywords = ["pathfinding", "navmesh", "fixed-point", "recastnavigation", "game"]
+categories = ["game-development", "api-bindings"]
+exclude = [
+    "/.circleci",
+    "/.github",
+    "/.vscode",
+    "/expected",
+    "/output",
+    "/resource",
+    "/scripts",
+    "/recastnavigation/.editorconfig",
+    "/recastnavigation/.github",
+    "/recastnavigation/CHANGELOG.md",
+    "/recastnavigation/CODE_OF_CONDUCT.md",
+    "/recastnavigation/Docs",
+    "/recastnavigation/Doxyfile",
+]
+resolver = "2"
+
+[features]
+default = ["rkyv"]
+rkyv = ["dep:rkyv", "dep:miniz_oxide"]
+
+[dependencies]
+cxx = "1.0"
+miniz_oxide = { version = "0.7", optional = true }
+rkyv = { version = "0.7", optional = true }
+static_assertions = "1.1"
+thiserror = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"

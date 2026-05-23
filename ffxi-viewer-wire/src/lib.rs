@@ -129,9 +129,26 @@ impl Weather {
     pub fn from_lsb(n: u16) -> Self {
         use Weather::*;
         const TABLE: [Weather; 20] = [
-            None, Sunshine, Clouds, Fog, HotSpell, HeatWave, Rain, Squall,
-            DustStorm, SandStorm, Wind, Gales, Snow, Blizzards, Thunder,
-            Thunderstorms, Auroras, StellarGlare, Gloom, Darkness,
+            None,
+            Sunshine,
+            Clouds,
+            Fog,
+            HotSpell,
+            HeatWave,
+            Rain,
+            Squall,
+            DustStorm,
+            SandStorm,
+            Wind,
+            Gales,
+            Snow,
+            Blizzards,
+            Thunder,
+            Thunderstorms,
+            Auroras,
+            StellarGlare,
+            Gloom,
+            Darkness,
         ];
         TABLE[(n as usize) % TABLE.len()]
     }
@@ -221,6 +238,11 @@ pub enum ChatChannel {
     /// 0x029 / 0x02D battle messages. Drawn in orange in the chat panel
     /// to mirror classic FFXI's combat-log color.
     Battle,
+    /// Client-internal toast: slash-command output, auto-load notes,
+    /// zone-change diagnostics, etc. Distinct from `System` (which is
+    /// reserved for server-pushed `0x053 SYSTEMMES` text) so the chat
+    /// panel can route operator-visible debug into its own pane.
+    Debug,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +251,14 @@ pub struct ChatLine {
     pub sender: String,
     pub text: String,
     pub server_ts: u32,
+    /// Monotonic arrival-order sequence stamped at chat-line creation
+    /// (either at server-ingest or at `push_local_toast`). The panel
+    /// renderer merges server chat and local toasts by this key so
+    /// strict-arrival order survives the dual-buffer split.
+    /// `0` is the default for synthetic / test lines and predates any
+    /// real session traffic.
+    #[serde(default)]
+    pub local_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +417,65 @@ pub struct SceneSnapshot {
     /// until the first weather packet for the current zone arrives.
     #[serde(default)]
     pub weather: Option<Weather>,
+    /// Currently-equipped item per slot (FFXI `SLOTTYPE`: 0=Main,
+    /// 1=Sub, 2=Ranged, 3=Ammo, 4=Head, 5=Body, 6=Hands, 7=Legs,
+    /// 8=Feet, 9=Neck, 10=Waist, 11=LEar, 12=REar, 13=LRing,
+    /// 14=RRing, 15=Back). `None` means the slot is empty *or* that
+    /// the inventory mirror hasn't yet resolved the (container,
+    /// index) reference the server sent — Stage 1 doesn't distinguish
+    /// between those cases.
+    ///
+    /// Populated by `state_to_snapshot` by joining
+    /// `SessionState.equipment[i]` against
+    /// `SessionState.inventory.containers[…].slots`. The viewer-core
+    /// HUD looks the resolved `item_no` up via
+    /// `ffxi_proto::item_names::lookup` at render time.
+    #[serde(default = "default_equipped")]
+    pub equipped: [Option<u16>; 16],
+    /// Spell ids the character has learned, sorted ascending. The
+    /// HUD's Magic menu iterates this and looks each id up via
+    /// `ffxi_proto::spell_names::lookup`. Empty until the server
+    /// sends `0x0AA MAGIC_DATA` (once per login, again on every
+    /// spell-learned event). Stage 2.
+    #[serde(default)]
+    pub spells_known: Vec<u16>,
+    /// Job-ability ids the character currently has, sorted ascending.
+    /// Driven by the `JobAbilities` sub-bitmap of `0x0AC COMMAND_DATA`.
+    #[serde(default)]
+    pub job_abilities_known: Vec<u16>,
+    /// Weapon-skill ids currently usable. Driven by the
+    /// `WeaponSkills` sub-bitmap of `0x0AC COMMAND_DATA`.
+    #[serde(default)]
+    pub weaponskills_known: Vec<u16>,
+    /// Pet-ability / Blood-pact ids. Only non-empty for BST/SMN/PUP
+    /// and similar jobs. Driven by the `PetAbilities` sub-bitmap of
+    /// `0x0AC COMMAND_DATA`.
+    #[serde(default)]
+    pub pet_abilities_known: Vec<u16>,
+    /// Flat view of the operator's main Inventory bag (container 0)
+    /// projected from `SessionState.inventory.containers[0]`. The
+    /// HUD's Items menu (Stage 3) iterates this directly; deeper
+    /// containers (Safe, Storage, Wardrobe, …) aren't surfaced
+    /// because the in-game "Items" menu is inventory-only too.
+    /// Empty until the first `ITEM_LIST` slot lands.
+    #[serde(default)]
+    pub inventory_main: Vec<InventoryItem>,
+}
+
+/// One slot of the main Inventory bag — the wire shape the HUD's
+/// Items menu reads. `container` is always 0 today (only the main
+/// bag is projected) but the field is kept explicit so a future
+/// expansion to multi-bag display doesn't change the wire schema.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InventoryItem {
+    pub container: u8,
+    pub index: u8,
+    pub item_no: u16,
+    pub quantity: u32,
+}
+
+fn default_equipped() -> [Option<u16>; 16] {
+    [None; 16]
 }
 
 /// Mirror of `ffxi-client::state::LogoutCountdown`. Carries just enough
@@ -500,13 +589,73 @@ pub struct SceneDelta {
 ///   `SceneSummary` / `PartyMemberLowHp` — internal signal
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ViewerEvent {
-    ZoneChanged { from: Option<u16>, to: u16 },
-    EntityRemoved { id: u32 },
-    Disconnected { reason: String },
-    LowHp { pct: u8 },
-    EngagedBy { entity_id: u32 },
-    TellReceived { from: String, text: String },
-    Reconnected { downtime_ms: u64 },
+    ZoneChanged {
+        from: Option<u16>,
+        to: u16,
+    },
+    EntityRemoved {
+        id: u32,
+    },
+    Disconnected {
+        reason: String,
+    },
+    LowHp {
+        pct: u8,
+    },
+    EngagedBy {
+        entity_id: u32,
+    },
+    TellReceived {
+        from: String,
+        text: String,
+    },
+    Reconnected {
+        downtime_ms: u64,
+    },
+    /// 0x05F `GP_SERV_COMMAND_MUSIC` — server selected a new track
+    /// for one of the 8 LSB `MusicSlot`s (0=ZoneDay…7=Fishing). The
+    /// viewer's BGM system decides which slot is audible based on
+    /// its own state machine (combat, mount, mog-house, etc.).
+    MusicChanged {
+        slot: u8,
+        track_id: u16,
+    },
+    /// 0x060 `GP_SERV_COMMAND_MUSICVOLUME` — per-slot volume tweak.
+    /// `volume` is the raw LSB byte (0..=127 typically); consumers
+    /// normalize before applying.
+    MusicVolumeChanged {
+        slot: u8,
+        volume: u8,
+    },
+    /// 0x02D BATTLE_MESSAGE2 with `MsgBasic::LevelUp` (id 9). The
+    /// player named by `player_id` reached the level encoded in the
+    /// server's chat-line payload; we surface only the actor id here
+    /// since the audio side only needs the trigger.
+    /// See `vendor/server/src/map/utils/charutils.cpp:5736`.
+    LevelUp {
+        player_id: u32,
+    },
+    /// 0x02D / 0x029 with `MsgBasic::SkillLevelUp` (id 53). Fires
+    /// every time a weapon/magic skill rank goes up — frequent at
+    /// low skill. `level` is the new skill level (server divides by
+    /// 10 before sending; consumers can render as integer).
+    /// See `vendor/server/src/map/utils/charutils.cpp:4161`.
+    SkillLevelUp {
+        skill_id: u16,
+        level: u32,
+    },
+    /// 0x028 BATTLE2 header — an action (spell, ability, mob-skill,
+    /// melee swing) started on `actor_id`. The viewer uses this to
+    /// load the action's DAT, parse its Scheduler/Generator/D3M/Sep
+    /// chunks, and drive animation + particle + audio playback on
+    /// the actor's Bevy entity. `action_kind` is the bit-4-wide
+    /// `cmd_no` field (e.g. `4` = Magic, `6` = Ability — see
+    /// `vendor/server/src/map/packets/s2c/0x028_battle2.cpp`).
+    ActionStarted {
+        actor_id: u32,
+        action_id: u32,
+        action_kind: u8,
+    },
 }
 
 /// Server→viewer frame on the WebSocket. `Snapshot` and `Delta` are boxed
@@ -651,6 +800,7 @@ mod tests {
                 sender: "Other".into(),
                 text: "hi".into(),
                 server_ts: 1_700_000_000,
+                local_seq: 0,
             }],
             diagnostics: Diagnostics {
                 stage: Some(Stage::InZone),
