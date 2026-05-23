@@ -341,6 +341,11 @@ const MOON_PHASE_NAMES: [&str; 8] = [
 /// `total_vana_days % 8` matching `hud::vana_clock::VANA_WEEKDAYS`.
 /// Colors are subtle (close to white) — retail's tint is barely
 /// perceptible and rides on top of the cratered grey base.
+#[inline]
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
 const WEEKDAY_MOON_TINT: [[f32; 3]; 8] = [
     [1.00, 0.82, 0.78], // Firesday — warm pink
     [1.00, 0.92, 0.78], // Earthsday — soft amber
@@ -400,6 +405,7 @@ pub fn sun_moon_system(
     mut moon_materials: ResMut<Assets<crate::moon_material::MoonMaterial>>,
     mut scene_state: ResMut<crate::snapshot::SceneState>,
     vana_clock: Res<crate::vana_time::VanaClock>,
+    sky_realism: Res<crate::sky_realism::SkyRealism>,
     mut prev_sun_up: Local<Option<bool>>,
     mut prev_moon_up: Local<Option<bool>>,
     mut prev_phase_bucket: Local<Option<u8>>,
@@ -518,8 +524,18 @@ pub fn sun_moon_system(
         let moon_world = cam_pos + moon_dir * SKY_RADIUS;
         disc.translation = moon_world;
         // Rectangle mesh is 1m across; ×2 to make `RADIUS` mean the
-        // on-screen disc radius.
-        disc.scale = Vec3::splat(MOON_DISC_RADIUS * 2.0);
+        // on-screen disc radius. Moon-illusion bump: scale up when
+        // near horizon (perceptual, matches real artists' fakery).
+        let illusion = if sky_realism.moon_illusion {
+            // Smooth ramp from 1.30× at the horizon to 1.0× at 30°
+            // altitude. `altitude` is in radians; π/6 ≈ 30°.
+            let alt = sky.moon_altitude.max(0.0);
+            let t = (alt / (PI / 6.0)).clamp(0.0, 1.0);
+            1.30 - 0.30 * t
+        } else {
+            1.0
+        };
+        disc.scale = Vec3::splat(MOON_DISC_RADIUS * 2.0 * illusion);
         // Billboard: face the camera. The Rectangle mesh lives in
         // its local XY plane with +Z as its normal — so aim +Z at
         // the camera. Using `Vec3::Y` as up keeps the disc upright;
@@ -558,28 +574,56 @@ pub fn sun_moon_system(
         }
         if let Some(moon_mat) = moon_materials.get_mut(&handles.moon) {
             let visibility = sky.moon_illumination.clamp(0.0, 1.0);
-            // Slight floor so an above-horizon crescent still reads as
-            // a faint disc rather than going completely black between
-            // earthshine and the (small) lit fraction.
-            let intensity = if sky.moon_altitude > 0.0 {
+            // Base intensity from phase. Slight floor so a thin
+            // crescent still reads above the night sky.
+            let mut intensity = if sky.moon_altitude > 0.0 {
                 0.6 + 1.4 * visibility
             } else {
                 0.0
             };
-            // Weekday tint: derive total V-days from sky.moon_phase's
-            // input. We don't have it on VanaSky, so recompute cheaply
-            // from the clock — same path the formula uses.
+            // Weekday tint: derive total V-days from the clock.
             let earth_since = (vana_clock.earth_unix_now()
                 - crate::hud::vana_clock::EARTH_EPOCH_UNIX as f64)
                 .max(0.0);
             let total_v_days = (earth_since * 25.0 / 86400.0) as u64;
-            let tint = WEEKDAY_MOON_TINT[(total_v_days % 8) as usize];
+            let mut tint = WEEKDAY_MOON_TINT[(total_v_days % 8) as usize];
+
+            // Horizon reddening: lerp tint toward warm orange as the
+            // moon approaches the horizon (Rayleigh through thick
+            // atmosphere; same physics that gives us red sunsets).
+            // Curve: 0 effect above 20° altitude, full effect at 0°.
+            if sky_realism.horizon_reddening && sky.moon_altitude > 0.0 {
+                let alt_norm = (sky.moon_altitude / (PI / 9.0)).clamp(0.0, 1.0);
+                let warmth = 1.0 - alt_norm; // 1 at horizon, 0 at ≥20°
+                let red_tint = [1.00, 0.55, 0.35]; // deep horizon orange
+                tint = [
+                    lerp(tint[0], red_tint[0], warmth * 0.7),
+                    lerp(tint[1], red_tint[1], warmth * 0.7),
+                    lerp(tint[2], red_tint[2], warmth * 0.7),
+                ];
+            }
+            // Horizon dimming: atmospheric extinction is *thicker*
+            // than reddening warrants — multiply intensity down too.
+            if sky_realism.horizon_dimming && sky.moon_altitude > 0.0 {
+                let alt_norm = (sky.moon_altitude / (PI / 6.0)).clamp(0.0, 1.0);
+                intensity *= 0.5 + 0.5 * alt_norm; // 0.5× at horizon → 1× at ≥30°
+            }
+
+            // Earthshine ramp: peaks at thin crescent, vanishes near
+            // full. `0.06` is the flat retail-equivalent floor.
+            let earthshine = if sky_realism.earthshine {
+                let crescent_strength = (1.0 - visibility).powf(2.0); // 1 at new, 0 at full
+                0.06 + 0.10 * crescent_strength
+            } else {
+                0.0
+            };
+
             moon_mat.data.tint = Vec4::new(tint[0], tint[1], tint[2], 1.0);
             moon_mat.data.params = Vec4::new(
                 sky.moon_illumination,
                 if sky.moon_waxing { 1.0 } else { -1.0 },
                 intensity,
-                0.0,
+                earthshine,
             );
         }
     }

@@ -16,7 +16,10 @@
 struct MoonUniform {
     tint: vec4<f32>,
     /// x = illumination [0,1], y = waxing sign (+1 / -1),
-    /// z = intensity multiplier, w = unused
+    /// z = intensity multiplier, w = earthshine strength [0,1]
+    /// (0 = unlit side stays fully dark; 0.06 = retail-equivalent
+    /// floor; higher = brighter Da-Vinci-glow on the dark crescent,
+    /// physically peaks near thin crescents and falls to ~0 at full).
     params: vec4<f32>,
 };
 
@@ -54,8 +57,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let term_x = k * sqrt(max(0.0, 1.0 - uv.y * uv.y));
     let lit = step(term_x, uv.x * waxing_sign);
     // Earthshine: keep the unlit side faintly visible so the disc
-    // doesn't snap to a hard half-moon edge in the night sky.
-    let brightness = mix(0.06, 1.0, lit);
+    // doesn't snap to a hard half-moon edge. Strength is supplied
+    // by the Rust side so we can ramp it by phase (peaks at thin
+    // crescent, fades to 0 near full).
+    let earthshine = data.params.w;
+    let brightness = mix(earthshine, 1.0, lit);
 
     // Limb darkening for the sphere illusion on a flat quad.
     let limb = mix(0.80, 1.0, sqrt(max(0.0, 1.0 - r2)));

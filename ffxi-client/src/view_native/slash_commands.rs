@@ -423,6 +423,11 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 usage: "[on|off|toggle]",
                 summary: "developer telemetry overlays (stage bar, agent goal, etc.)",
             },
+            HelpEntry {
+                aliases: &["sky"],
+                usage: "[<feature> [on|off|toggle]]",
+                summary: "toggle sky realism features (reddening / dimming / illusion / earthshine / realmoon / eclipses); bare `/sky` lists state",
+            },
         ],
     ),
 ];
@@ -593,6 +598,11 @@ pub enum SlashOutcome {
     /// `on` reveals the operator telemetry for debugging.
     /// `None` means toggle.
     SetDevHud(Option<bool>),
+    /// `/sky [<feature> [on|off|toggle]]` — read or mutate
+    /// [`ffxi_viewer_core::sky_realism::SkyRealism`]. Naked `/sky`
+    /// reports the current state of every flag; with a feature name
+    /// and optional value it sets/toggles that one.
+    SetSky(SkyOp),
     /// `/minimap [show|hide|toggle|mode <top|retail|auto>|cull <N>]`
     /// — drive the minimap HUD's visibility, image-source backend,
     /// and ceiling-cull height. See [`MinimapOp`].
@@ -1102,6 +1112,7 @@ pub fn parse_slash(
         "drawdistance" | "dd" => parse_drawdistance(rest),
         "zonegeom" => parse_zonegeom(rest),
         "devhud" => parse_devhud(rest),
+        "sky" => parse_sky(rest),
         "minimap" | "mm" => parse_minimap(rest),
         "sound" | "audio" | "mute" => parse_sound(rest),
         "debug" | "dbg" | "nearby" | "entities" => {
@@ -2416,6 +2427,49 @@ fn parse_weather(rest: &str) -> SlashOutcome {
         }
     };
     SlashOutcome::SetWeatherClient(w)
+}
+
+/// Parsed shape of the `/sky` slash command. See [`SlashOutcome::SetSky`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkyOp {
+    /// Bare `/sky` — print current state of every flag.
+    Status,
+    /// `/sky <feature> [on|off|toggle]` — set or toggle one flag.
+    Set {
+        feature: ffxi_viewer_core::sky_realism::SkyFeature,
+        value: Option<bool>,
+    },
+}
+
+fn parse_sky(rest: &str) -> SlashOutcome {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return SlashOutcome::SetSky(SkyOp::Status);
+    }
+    let mut parts = trimmed.split_ascii_whitespace();
+    let feature_str = parts.next().unwrap_or("");
+    let value_str = parts.next().unwrap_or("").to_ascii_lowercase();
+    let Some(feature) = ffxi_viewer_core::sky_realism::SkyFeature::parse(feature_str) else {
+        let known: Vec<&str> = ffxi_viewer_core::sky_realism::SkyFeature::ALL
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        return SlashOutcome::SystemMessage(format!(
+            "/sky: unknown feature `{feature_str}` (try: {})",
+            known.join(", ")
+        ));
+    };
+    let value = match value_str.as_str() {
+        "" | "toggle" => None,
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        other => {
+            return SlashOutcome::SystemMessage(format!(
+                "/sky: bad value `{other}` (use on|off|toggle)"
+            ));
+        }
+    };
+    SlashOutcome::SetSky(SkyOp::Set { feature, value })
 }
 
 /// `/devhud on|off|toggle` — show/hide developer telemetry overlays.

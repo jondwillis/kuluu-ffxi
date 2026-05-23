@@ -52,6 +52,7 @@ pub mod skybox;
 pub mod snapshot;
 pub mod source;
 pub mod moon_material;
+pub mod sky_realism;
 pub mod sun_moon;
 pub mod target_ring;
 pub mod vana_time;
@@ -180,6 +181,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<atmosphere::LastAtmosphereZone>()
             .init_resource::<sun_moon::VanaSky>()
             .init_resource::<vana_time::VanaClock>()
+            .init_resource::<sky_realism::SkyRealism>()
             .init_resource::<weather_fx::ActiveWeatherModifier>()
             .init_resource::<weather_fx::ParticleAssets>()
             .init_resource::<weather_fx::LightningState>()

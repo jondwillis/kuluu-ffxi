@@ -146,6 +146,8 @@ pub struct SlashWriters<'w, 's> {
     /// `tick_skinned_actors` (to pick the sit / hea MO2 on the self
     /// avatar).
     pub rest_stance: ResMut<'w, ffxi_viewer_core::combat_stance::RestStance>,
+    /// Sky-realism feature flags (`/sky`).
+    pub sky_realism: ResMut<'w, ffxi_viewer_core::sky_realism::SkyRealism>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -943,6 +945,38 @@ fn apply_slash_outcome(
                 scene_state,
                 format!("/devhud: {}", if next { "on" } else { "off" }),
             );
+        }
+        SlashOutcome::SetSky(op) => {
+            use super::slash_commands::SkyOp;
+            use ffxi_viewer_core::sky_realism::SkyFeature;
+            match op {
+                SkyOp::Status => {
+                    let sky = &*slash_writers.sky_realism;
+                    let lines: Vec<String> = SkyFeature::ALL
+                        .iter()
+                        .map(|(k, f)| {
+                            format!("  {}: {}", k, if f.get(sky) { "on" } else { "off" })
+                        })
+                        .collect();
+                    push_system_chat_line(
+                        scene_state,
+                        format!("/sky:\n{}", lines.join("\n")),
+                    );
+                }
+                SkyOp::Set { feature, value } => {
+                    let next =
+                        value.unwrap_or(!feature.get(&slash_writers.sky_realism));
+                    feature.set(&mut slash_writers.sky_realism, next);
+                    push_system_chat_line(
+                        scene_state,
+                        format!(
+                            "/sky {}: {}",
+                            feature.label(),
+                            if next { "on" } else { "off" }
+                        ),
+                    );
+                }
+            }
         }
         SlashOutcome::SetMinimap(op) => {
             use super::slash_commands::MinimapOp;
