@@ -50,11 +50,15 @@ const ANCHOR_EPSILON: f32 = 1e-3;
 /// change vs. before-collision behavior when the camera is just
 /// orbiting in open air.
 const OUTWARD_LERP: f32 = 0.18;
-/// Snap factor when **pulling in** (target < current — a wall just
-/// came between player and camera). 1.0 = instant. The invariant
-/// "camera ≤ ray hit" requires we never lag *outside* the wall, so
-/// inward must be effectively immediate.
-const INWARD_LERP: f32 = 1.0;
+/// Lerp factor when **pulling in** (target < current — a wall just
+/// came between player and camera). Was 1.0 (hard snap); softened to
+/// 0.45 so the camera eases inward over a few frames instead of
+/// teleporting, which read as a visible "pop". This **intentionally
+/// relaxes** the "camera ≤ ray hit" invariant for a few frames
+/// (≤ ~3 at 60 Hz before residual error falls below visible scale).
+/// WALL_PAD's ~0.2 yalm margin keeps the visible clipping minimal,
+/// and operator feedback preferred the easing over the snap.
+const INWARD_LERP: f32 = 0.45;
 
 /// Run AFTER `chase_camera_system` (Update) — schedule in PostUpdate.
 /// Recomputes the camera position from `ChaseCamera`'s wanted distance
@@ -222,16 +226,21 @@ pub fn clamp_chase_camera_to_collision(
     // `look_at` from origin == target.
     let target = (hit_t - WALL_PAD).min(wanted).max(ANCHOR_EPSILON);
 
-    // Smooth between frames. The asymmetric lerp keeps the invariant:
-    // when target shrinks (wall appeared, must move closer) we snap
-    // immediately (INWARD_LERP = 1.0); when target grows (wall cleared,
-    // can ease back out) we lerp at OUTWARD_LERP. Without this the raw
+    // Smooth between frames. Asymmetric lerp: when target shrinks
+    // (wall appeared, must move closer) we ease inward at INWARD_LERP
+    // (visibly fast, not a teleport); when target grows (wall cleared,
+    // can ease back out) we lerp slower at OUTWARD_LERP. Without this the raw
     // `target` jitters by sub-yalm amounts as the ray sweeps across
     // triangle edges during yaw rotation, and the chase camera (which
     // we override every frame) loses its own lerp's smoothing.
     let effective = match *smoothed_effective {
         Some(prev) if target < prev => {
-            // Pulling in — snap to satisfy the ≤ hit_t invariant.
+            // Pulling in — ease toward `target` at INWARD_LERP per frame.
+            // The "camera ≤ hit_t" invariant is **intentionally relaxed**
+            // here: the operator-perceived feel of a brief inward ease is
+            // worth a few frames of partial wall-clip, which is itself
+            // hidden by WALL_PAD's ~0.2 yalm margin. Retail's camera
+            // behaves similarly — see the design note in the unit-doc.
             target * INWARD_LERP + prev * (1.0 - INWARD_LERP)
         }
         Some(prev) => {

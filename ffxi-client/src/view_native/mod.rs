@@ -51,7 +51,7 @@ use tokio::runtime::Handle as RtHandle;
 use crate::launcher::Defaults;
 
 use self::bridge::NativeSource;
-use self::input::{AutoRun, CommandTx};
+use self::input::{AutoRun, CameraAutoRecenter, CommandTx};
 use self::launcher_ui::{LoginErrorMsg, PendingConnect};
 
 /// Top-level phase of the unified native `App`.
@@ -205,6 +205,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // for highlight materials, breaking Tab targeting visuals.
     app.insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<AutoRun>()
+        .init_resource::<CameraAutoRecenter>()
         .insert_resource(ports)
         .insert_resource(RelayListen(relay_listen))
         .insert_resource(DatRootRes(dat_root));
@@ -301,6 +302,18 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             input::dispatch_target_change_system,
         )
             .chain()
+            .run_if(in_state(AppPhase::InGame)),
+    );
+    // Camera polish: auto-recenter behind player on sustained forward,
+    // and 1p pitch-track the lock-on target's head. Mutates
+    // `ChaseCamera` only; ordered *before* the camera positioning
+    // systems so the yaw/pitch they read this frame already reflects
+    // the polish (otherwise the polish lags one frame behind).
+    app.add_systems(
+        Update,
+        input::camera_polish_system
+            .before(ffxi_viewer_core::chase_camera_system)
+            .before(ffxi_viewer_core::firstperson_camera_system)
             .run_if(in_state(AppPhase::InGame)),
     );
     app.add_systems(
