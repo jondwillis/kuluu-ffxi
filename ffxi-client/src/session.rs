@@ -800,6 +800,44 @@ fn handle_sub_packet(
             // it as "unknown opcode" once per action frame; intentionally
             // a no-op until we ship a bitstream decoder.
         }
+        op if op == s2c::WPOS || op == s2c::WPOS2 => {
+            // Server-initiated forced position for the local player. LSB
+            // emits this on cutscene end (0x05c), zone-line re-anchor
+            // (0x05e), homepoint, GM warp. POSMODE selects what the
+            // client should do; only NORMAL/EVENT/POP/RESET/MATERIALIZE
+            // re-anchor the player. See ffxi_proto::decode::ForcedMove
+            // for the body layout and the LSB vendor source cites.
+            //
+            // Knockback (BATTLE2 0x028 result.knockback) is intentionally
+            // NOT routed here — it's an animation hint integrated
+            // client-side, not a wire forced-move. The synthetic test in
+            // reactor.rs exercises the same code path against this
+            // event so the override semantics are still covered.
+            if let Ok(fm) = decode::ForcedMove::decode(sub.data) {
+                if fm.unique_no == self_char_id && fm.mode.carries_position() {
+                    *self_pos = Position {
+                        pos: Vec3 {
+                            x: fm.x,
+                            y: fm.y,
+                            z: fm.z,
+                        },
+                        heading: fm.heading,
+                        ..*self_pos
+                    };
+                    // Default override window: 1 second. The retail
+                    // client's POP/MATERIALIZE animation lasts roughly
+                    // that long; for instant teleports (NORMAL/EVENT)
+                    // it's a no-op the lerp finishes in the first tick.
+                    // A future enhancement can vary this per mode.
+                    let duration_ms = 1000u32;
+                    let _ = event_tx.send(AgentEvent::ForcedMove {
+                        mode: fm.raw_mode,
+                        target: *self_pos,
+                        duration_ms,
+                    });
+                }
+            }
+        }
         op if op == s2c::WEATHER => {
             // 0x057 — current zone weather. 8-byte fixed body:
             // `u32 StartTime, u16 WeatherNumber, u16 OffsetTime`. We only

@@ -901,6 +901,17 @@ impl SessionState {
             // High-signal events the LLM wakes for. They don't mutate
             // SessionState — the data is already there (HP via entity
             // updates, chat via ChatLine). They're notifications, not state.
+            AgentEvent::ForcedMove { target, .. } => {
+                // Re-anchor self-entity to the server-authoritative pos.
+                // Same fold as PositionChanged: only the self entity moves;
+                // pre-LOGIN no-ops.
+                if let Some(char_id) = self.char_id {
+                    if let Some(ent) = self.entities.iter_mut().find(|e| e.id == char_id) {
+                        ent.pos = target.pos;
+                        ent.heading = target.heading;
+                    }
+                }
+            }
             AgentEvent::LowHp { .. }
             | AgentEvent::PartyMemberLowHp { .. }
             | AgentEvent::EngagedBy { .. }
@@ -1128,6 +1139,31 @@ pub enum AgentEvent {
     /// may want to react (engage, flee, kite).
     EngagedBy {
         entity_id: u32,
+    },
+    /// Server-initiated forced position for the local player. Emitted when
+    /// `0x05B WPOS` or `0x065 WPOS2` lands carrying a `POSMODE` that
+    /// re-anchors (NORMAL / EVENT / POP / RESET / MATERIALIZE) — cutscene
+    /// end, zone-line re-anchor, homepoint, GM warp. The reactor installs
+    /// a `ReactorOverride` for `duration_ms` during which input-driven
+    /// `Move` emission is suppressed and the client lerps toward
+    /// `target_pos`. After the timer expires, normal input resumes.
+    ///
+    /// **Knockback caveat**: combat knockback is NOT delivered via WPOS —
+    /// it's a 3-bit animation hint inside the bit-packed BATTLE2 (0x028)
+    /// payload (`vendor/server/src/map/enums/action/knockback.h`,
+    /// integrated client-side over a per-level timer). This event covers
+    /// the broader server-forced-position family. Synthetic knockback
+    /// packets in unit tests use the same struct shape.
+    ForcedMove {
+        /// `LSB::POSMODE` raw byte. Decoders convert with
+        /// `ffxi_proto::decode::PosMode::from_u8`.
+        mode: u8,
+        target: Position,
+        /// Duration of the override window in milliseconds. Lerp speed
+        /// is chosen by the reactor (currently: max speed cap so the
+        /// override completes in one tick for short distances, smoothed
+        /// for long ones).
+        duration_ms: u32,
     },
     /// Set the target frame rate.
     SetFps {

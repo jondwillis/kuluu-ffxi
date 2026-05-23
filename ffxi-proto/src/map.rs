@@ -195,6 +195,31 @@ pub mod s2c {
     pub const EQUIP_CLEAR: u16 = 0x04F;
     pub const EQUIP_LIST: u16 = 0x050;
     pub const GRAP_LIST: u16 = 0x051;
+    /// `GP_SERV_COMMAND_WPOS` — server-initiated forced position update for
+    /// **the local player**. LSB emits this from a handful of code paths:
+    ///   - `vendor/server/src/map/packets/c2s/0x05c_eventendxzy.cpp:68-73` —
+    ///     teleport at end of cutscene (`POSMODE::NORMAL` / `EVENT`).
+    ///   - `vendor/server/src/map/packets/c2s/0x05e_maprect.cpp:47` —
+    ///     re-anchor on zone-line entry (`POSMODE::RESET`).
+    ///   - `vendor/server/src/map/utils/charutils.cpp` (homepoint, KO
+    ///     reset, GM `!warp`) — `POSMODE::POP` / `MATERIALIZE` / `LOCK` /
+    ///     `UNLOCK`.
+    ///
+    /// LSB does **not** emit forced-position for knockback in the BATTLE2
+    /// (0x028) family — knockback is purely an animation hint
+    /// (`vendor/server/src/map/enums/action/knockback.h`); the client
+    /// integrates the displacement locally. So WPOS is the wire signal
+    /// for "the server moved you, override your input."
+    ///
+    /// Body layout (after the 4-byte sub-packet header), 24 bytes:
+    /// `float x, y, z; u32 UniqueNo; u16 ActIndex; u8 Mode; i8 dir;
+    ///  u32 padding;` See
+    /// `vendor/server/src/map/packets/s2c/0x05b_wpos.h:43-59`.
+    pub const WPOS: u16 = 0x05B;
+    /// `GP_SERV_COMMAND_WPOS2` — same shape as `WPOS`, used during events
+    /// and a couple of LOCK/UNLOCK flows. Treat identically.
+    /// See `vendor/server/src/map/packets/s2c/0x065_wpos2.h`.
+    pub const WPOS2: u16 = 0x065;
     pub const ENTITY_UPDATE1: u16 = 0x067;
     pub const ENTITY_UPDATE2: u16 = 0x068;
     /// `GP_SERV_COMMAND_GROUP_LIST` — sent for OTHER party members
