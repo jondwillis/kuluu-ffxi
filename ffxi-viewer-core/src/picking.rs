@@ -64,13 +64,14 @@ pub fn update_hovered_entity_system(
     mut over_events: MessageReader<Pointer<Over>>,
     mut out_events: MessageReader<Pointer<Out>>,
     world_q: Query<&WorldEntity>,
+    parent_q: Query<&ChildOf>,
     mut hovered: ResMut<HoveredEntity>,
 ) {
     for ev in out_events.read() {
         if ev.pointer_id != PointerId::Mouse {
             continue;
         }
-        if let Ok(w) = world_q.get(ev.entity) {
+        if let Some(w) = find_world_entity(ev.entity, &world_q, &parent_q) {
             if hovered.id == Some(w.id) {
                 hovered.id = None;
             }
@@ -80,13 +81,36 @@ pub fn update_hovered_entity_system(
         if ev.pointer_id != PointerId::Mouse {
             continue;
         }
-        if let Ok(w) = world_q.get(ev.entity) {
+        if let Some(w) = find_world_entity(ev.entity, &world_q, &parent_q) {
             if w.id == 0 {
                 continue; // self capsule — never target / hover
             }
             hovered.id = Some(w.id);
         }
     }
+}
+
+/// Walk up the `ChildOf` chain from `entity` until we find a `WorldEntity`,
+/// or run out of ancestors. The picking backend reports the deepest hit
+/// mesh, which for loaded MMB / skinned actors is a sub-mesh child of the
+/// `WorldEntity`-bearing parent. Without this walk, click-to-target and
+/// hover only work on the bare placeholder capsules. Cap the depth at 8
+/// so a malformed hierarchy can't spin.
+fn find_world_entity<'q>(
+    mut entity: Entity,
+    world_q: &'q Query<&WorldEntity>,
+    parent_q: &Query<&ChildOf>,
+) -> Option<&'q WorldEntity> {
+    for _ in 0..8 {
+        if let Ok(w) = world_q.get(entity) {
+            return Some(w);
+        }
+        match parent_q.get(entity) {
+            Ok(parent) => entity = parent.0,
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// Resolve a left-click hit into a [`ClickResolution`]. Decides between
@@ -153,6 +177,7 @@ pub enum ClickResolution {
 pub fn click_to_target_system(
     mut clicks: MessageReader<Pointer<Click>>,
     q_world: Query<&WorldEntity>,
+    q_parent: Query<&ChildOf>,
     mut target: ResMut<Target>,
     mut input_mode: ResMut<InputMode>,
 ) {
@@ -163,7 +188,7 @@ pub fn click_to_target_system(
         if !matches!(*input_mode, InputMode::World) {
             continue;
         }
-        let world_entity = q_world.get(ev.entity).ok();
+        let world_entity = find_world_entity(ev.entity, &q_world, &q_parent);
         match resolve_click_target(world_entity, target.id) {
             ClickResolution::Set(id) => target.id = Some(id),
             ClickResolution::Clear => target.id = None,

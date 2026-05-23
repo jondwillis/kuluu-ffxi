@@ -111,11 +111,11 @@ fn build_cursor_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>
     });
 }
 
-/// Camera RMB-drag writer: while the right mouse button is held, request
-/// `Rotate`. Both Chase and FirstPerson modes use RMB to rotate, so this
-/// single gate covers both.
+/// Camera-drag writer: while either mouse button is held (retail accepts
+/// LMB or RMB for camera rotate), request `Rotate`. Both Chase and
+/// FirstPerson modes use the same gate.
 fn rotate_writer_system(pointer: Res<MousePointer>, mut req: ResMut<CursorRequests>) {
-    req.rotate = pointer.right;
+    req.rotate = pointer.left || pointer.right;
 }
 
 /// Entity-hover writer: when an in-world entity is under the cursor,
