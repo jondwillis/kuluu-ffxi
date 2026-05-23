@@ -547,18 +547,27 @@ fn bake_position(
         // stretched 1y forward" failures we saw on Mithra and
         // Galka. Single-bone bake on bone1 is a safer degradation.
         if let (Some(m1), Some(m2)) = (m1, m2) {
-            let p1 = bone::mat4_transform_point(*m1, bw.pos1);
-            let p2 = bone::mat4_transform_point(*m2, bw.pos2);
+            // Lotus two-weight blend (animation_skin.slang:56,63):
+            //   pos = (R1*p1) + t1*w1 + (R2*p2) + t2*w2
+            // Rotations apply to FULL positions; only translations are
+            // weight-blended. Our previous code did
+            // `w1*(R1*p1+t1) + w2*(R2*p2+t2)`, which under-weighted the
+            // rotated position by (1-w) and produced joint-region
+            // distortion (long necks, wide hips, skinny shoulders).
             let sum = bw.weight1 + bw.weight2;
             let (w1, w2) = if sum > 0.0 {
                 (bw.weight1 / sum, bw.weight2 / sum)
             } else {
                 (1.0, 0.0)
             };
+            let r1p1 = bone::mat4_transform_dir(*m1, bw.pos1);
+            let r2p2 = bone::mat4_transform_dir(*m2, bw.pos2);
+            let t1 = [m1[0][3], m1[1][3], m1[2][3]];
+            let t2 = [m2[0][3], m2[1][3], m2[2][3]];
             let blended = [
-                p1[0] * w1 + p2[0] * w2,
-                p1[1] * w1 + p2[1] * w2,
-                p1[2] * w1 + p2[2] * w2,
+                r1p1[0] + r2p2[0] + t1[0] * w1 + t2[0] * w2,
+                r1p1[1] + r2p2[1] + t1[1] * w1 + t2[1] * w2,
+                r1p1[2] + r2p2[2] + t1[2] * w1 + t2[2] * w2,
             ];
             return unroll_root_rotation(blended);
         }
@@ -604,19 +613,12 @@ fn bake_normal(
         let m1 = b1.and_then(|i| baked.world.get(i));
         let m2 = b2.and_then(|i| baked.world.get(i));
         if let (Some(m1), Some(m2)) = (m1, m2) {
+            // Lotus normal blend (animation_skin.slang:57,64): unweighted
+            // sum of rotated normals. The lighting path tolerates unit-
+            // length drift; matches our `bake_normal` doc-comment.
             let n1 = bone::mat4_transform_dir(*m1, bw.normal1);
             let n2 = bone::mat4_transform_dir(*m2, bw.normal2);
-            let sum = bw.weight1 + bw.weight2;
-            let (w1, w2) = if sum > 0.0 {
-                (bw.weight1 / sum, bw.weight2 / sum)
-            } else {
-                (1.0, 0.0)
-            };
-            let blended = [
-                n1[0] * w1 + n2[0] * w2,
-                n1[1] * w1 + n2[1] * w2,
-                n1[2] * w1 + n2[2] * w2,
-            ];
+            let blended = [n1[0] + n2[0], n1[1] + n2[1], n1[2] + n2[2]];
             return unroll_root_rotation(blended);
         }
         if let Some(m1) = m1 {
