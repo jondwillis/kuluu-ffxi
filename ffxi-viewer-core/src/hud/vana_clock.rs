@@ -79,7 +79,7 @@ pub fn spawn_vana_clock_as_child(p: &mut ChildSpawnerCommands) {
 /// FFXI 8-day week. Indexed by `total_vana_days % 8`; epoch (886/1/1)
 /// is Firesday per `vendor/server/settings/default/map.lua:77` and the
 /// authoritative ordering is `vendor/server/scripts/commands/time.lua`.
-const VANA_WEEKDAYS: [&str; 8] = [
+pub const VANA_WEEKDAYS: [&str; 8] = [
     "Firesday",
     "Earthsday",
     "Watersday",

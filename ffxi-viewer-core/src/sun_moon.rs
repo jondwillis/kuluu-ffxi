@@ -336,6 +336,22 @@ const MOON_PHASE_NAMES: [&str; 8] = [
     "Waxing Gibbous",
 ];
 
+/// Weekday tint for the moon disc. FFXIclopedia: "the moon has a
+/// faint tint corresponding to the day of the week". Indexed by
+/// `total_vana_days % 8` matching `hud::vana_clock::VANA_WEEKDAYS`.
+/// Colors are subtle (close to white) — retail's tint is barely
+/// perceptible and rides on top of the cratered grey base.
+const WEEKDAY_MOON_TINT: [[f32; 3]; 8] = [
+    [1.00, 0.82, 0.78], // Firesday — warm pink
+    [1.00, 0.92, 0.78], // Earthsday — soft amber
+    [0.82, 0.92, 1.00], // Watersday — pale blue
+    [0.85, 1.00, 0.88], // Windsday — pale green
+    [0.92, 0.98, 1.00], // Iceday — icy white
+    [0.95, 0.85, 1.00], // Lightningday — pale violet
+    [1.00, 1.00, 0.92], // Lightsday — warm white
+    [0.78, 0.72, 0.85], // Darksday — dusky violet
+];
+
 pub fn sun_moon_system(
     mut sky: ResMut<VanaSky>,
     mut q_sun: Query<
@@ -427,14 +443,24 @@ pub fn sun_moon_system(
 
     // Moon phase bucket — eight 12.5%-wide windows. The illumination
     // percent matches LSB's `moon::get_phase` so the line matches what
-    // retail's lunar HUD shows the player.
+    // retail's lunar HUD shows the player. Includes the current
+    // weekday so the tinted disc tells a coherent story (Firesday →
+    // pink moon, Iceday → icy white, etc. — per FFXIclopedia's "the
+    // moon has a faint tint corresponding to the day of the week").
     let phase_bucket = ((sky.moon_phase * 8.0).floor() as i32).rem_euclid(8) as u8;
     if let Some(prev) = *prev_phase_bucket {
         if prev != phase_bucket {
+            let earth_since = (vana_clock.earth_unix_now()
+                - crate::hud::vana_clock::EARTH_EPOCH_UNIX as f64)
+                .max(0.0);
+            let total_v_days = (earth_since * 25.0 / 86400.0) as u64;
+            let weekday =
+                crate::hud::vana_clock::VANA_WEEKDAYS[(total_v_days % 8) as usize];
             scene_state.push_local_toast(crate::snapshot::system_chat_line(format!(
-                "☾ Moon: {} ({:.0}% illuminated)",
+                "☾ Moon: {} ({:.0}% illuminated) — {}",
                 MOON_PHASE_NAMES[phase_bucket as usize],
                 sky.moon_illumination * 100.0,
+                weekday,
             )));
         }
     }
@@ -540,6 +566,15 @@ pub fn sun_moon_system(
             } else {
                 0.0
             };
+            // Weekday tint: derive total V-days from sky.moon_phase's
+            // input. We don't have it on VanaSky, so recompute cheaply
+            // from the clock — same path the formula uses.
+            let earth_since = (vana_clock.earth_unix_now()
+                - crate::hud::vana_clock::EARTH_EPOCH_UNIX as f64)
+                .max(0.0);
+            let total_v_days = (earth_since * 25.0 / 86400.0) as u64;
+            let tint = WEEKDAY_MOON_TINT[(total_v_days % 8) as usize];
+            moon_mat.data.tint = Vec4::new(tint[0], tint[1], tint[2], 1.0);
             moon_mat.data.params = Vec4::new(
                 sky.moon_illumination,
                 if sky.moon_waxing { 1.0 } else { -1.0 },
