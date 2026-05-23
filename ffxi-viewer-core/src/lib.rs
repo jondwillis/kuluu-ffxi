@@ -283,6 +283,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // NOT whether they're currently moving — see [`EntityMotion`]
         // module docs.
         app.init_resource::<combat_stance::EntityMotion>();
+        app.init_resource::<combat_stance::RestStance>();
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,

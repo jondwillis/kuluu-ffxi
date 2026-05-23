@@ -1639,6 +1639,7 @@ pub fn tick_skinned_actors(
     time: Res<Time>,
     state: Res<crate::snapshot::SceneState>,
     motion: Res<crate::combat_stance::EntityMotion>,
+    rest: Res<crate::combat_stance::RestStance>,
     q_actors: Query<(&crate::components::WorldEntity, &SkinnedActor)>,
     mut q_bones: Query<&mut Transform>,
 ) {
@@ -1663,6 +1664,59 @@ pub fn tick_skinned_actors(
             .map(|e| e.bt_target_id != 0)
             .unwrap_or(false);
         let moving = motion.is_moving(world.id);
+
+        // Rest stance (self only): when `/sit` / `/heal` / `/kneel` is
+        // active, self plays the sit / hea MO2 uninterruptibly until
+        // the [`RestStance`] resource clears (cleared by movement-key
+        // press in `dispatch_movement_system`, by re-pressing the
+        // bound `Action::Sit` / `Action::Heal`, or by server-driven
+        // heal-off when actual translation is detected). No
+        // crossfade — same hard toggle as the rest of the matrix.
+        let is_self = state
+            .snapshot
+            .self_char_id
+            .map(|sid| sid == world.id)
+            .unwrap_or(false);
+        if is_self {
+            use crate::combat_stance::RestKind;
+            let rest_anim = match rest.kind {
+                RestKind::Sit => crate::combat_stance::sit_anim_for_skel(actor.dat_id)
+                    .or_else(|| idle_anim_for_file(actor.dat_id)),
+                RestKind::Heal => crate::combat_stance::heal_anim_for_skel(actor.dat_id)
+                    .or_else(|| crate::combat_stance::sit_anim_for_skel(actor.dat_id))
+                    .or_else(|| idle_anim_for_file(actor.dat_id)),
+                RestKind::None => None,
+            };
+            if let Some(anim) = rest_anim {
+                if anim.frames > 0 {
+                    let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
+                    let frame_idx =
+                        ((elapsed / safe_speed).floor() as usize) % anim.frames as usize;
+                    for (i, bone) in raw.bones.iter().enumerate() {
+                        if i == 0 {
+                            continue;
+                        }
+                        let Some(&bone_e) = actor.bone_entities.get(i) else {
+                            continue;
+                        };
+                        let (rot, trans, scale) = match anim
+                            .per_bone
+                            .get(&(i as u32))
+                            .and_then(|frames| frames.get(frame_idx))
+                        {
+                            Some(f) => (f.rotation, f.translation, f.scale),
+                            None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
+                        };
+                        if let Ok(mut tf) = q_bones.get_mut(bone_e) {
+                            tf.rotation = Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]);
+                            tf.translation = Vec3::from_array(trans);
+                            tf.scale = Vec3::from_array(scale);
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
 
         // Pick the right anim per the (engaged, moving) matrix in
         // the doc comment above. Each `or_else` is a graceful

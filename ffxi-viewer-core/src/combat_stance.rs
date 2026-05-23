@@ -83,6 +83,15 @@ static BATTLE_IDLE_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>
 /// too — the existence check is the load itself.
 static RUN_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = OnceLock::new();
 
+/// Cache for the resting `sit` / `hea` animations. Keyed by skeleton
+/// DAT id; both clips live in the skeleton DAT on PC races (sit/hea
+/// are not weapon-class-specific, so they don't have motion-DAT
+/// variants). `None` is cached for skeletons that don't ship the
+/// clip — NPC skels routinely lack `hea` even when they have `sit`,
+/// so the lookup must be independent per clip.
+static SIT_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = OnceLock::new();
+static HEAL_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = OnceLock::new();
+
 /// Cache for the combat run animation in the motion DAT (`run1`,
 /// 68-bone full rig). PC-only; keyed by motion DAT id like
 /// [`BATTLE_IDLE_ANIMS`].
@@ -160,6 +169,83 @@ pub fn combat_run_anim_for_skel(skel_file_id: u32) -> Option<Arc<Mo2Animation>> 
     let loaded = load_anim_with_prefix(motion_dat, b"run").map(Arc::new);
     guard.insert(motion_dat, loaded.clone());
     loaded
+}
+
+/// Load the `sit` rest-pose MO2 from the skeleton DAT. Lotus's
+/// `actor_skeleton_static.cpp` resolves `/sit` against the same
+/// name-keyed animation map as `idle` / `run`, so the clip lives in
+/// the skeleton DAT (not the motion DAT). Some NPC skels ship it
+/// (chairs etc. that play "sit" on idle); most don't, so `None` is
+/// expected for the majority of skel ids.
+pub fn sit_anim_for_skel(skel_file_id: u32) -> Option<Arc<Mo2Animation>> {
+    let map = SIT_ANIMS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().ok()?;
+    if let Some(entry) = guard.get(&skel_file_id) {
+        return entry.clone();
+    }
+    let loaded = load_anim_with_prefix(skel_file_id, b"sit").map(Arc::new);
+    guard.insert(skel_file_id, loaded.clone());
+    loaded
+}
+
+/// Load the `hea` (heal / CAMP rest) MO2 from the skeleton DAT. PC-only
+/// in practice — the rest crouch animation is the same one the server
+/// gates `EFFECT_HEALING` on, and only the seven playable race skels
+/// ship it.
+pub fn heal_anim_for_skel(skel_file_id: u32) -> Option<Arc<Mo2Animation>> {
+    let map = HEAL_ANIMS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().ok()?;
+    if let Some(entry) = guard.get(&skel_file_id) {
+        return entry.clone();
+    }
+    let loaded = load_anim_with_prefix(skel_file_id, b"hea").map(Arc::new);
+    guard.insert(skel_file_id, loaded.clone());
+    loaded
+}
+
+/// Which rest stance the local self is currently in. Set by the
+/// `/sit` / `/heal` / `/kneel` slash commands and by the bound
+/// `Action::Sit` / `Action::Heal` keypresses; cleared by any
+/// movement-input press (`MoveForward` / `Backward` / `Strafe*` /
+/// `Turn*` / `Rotate*`) per retail FFXI behavior — stand-on-first-
+/// input.
+///
+/// While `kind != None`:
+///   - `dispatch_movement_system` discards translation and rotation
+///     deltas (and the *press* of any movement Action clears the
+///     stance back to `None`);
+///   - `tick_skinned_actors` selects the matching `sit` / `hea` MO2
+///     on the self avatar and treats it as uninterruptible
+///     (no cross-fade out until cleared);
+///   - the keepalive thread for `Heal` still arms server-side
+///     `EFFECT_HEALING` via the `AgentCommand::Heal` send path —
+///     this resource is the *visual / local-input* surface, not
+///     the wire protocol surface.
+///
+/// `Sit` is a pure client-side affordance — there is no `0x0Eb sit`
+/// packet in retail. The server has no opinion on a player sitting.
+#[derive(Resource, Default, Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RestStance {
+    pub kind: RestKind,
+}
+
+/// Which rest-pose is active.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub enum RestKind {
+    /// Not resting — normal locomotion / engagement animation rules apply.
+    #[default]
+    None,
+    /// `/sit` or `/kneel` — pure visual.
+    Sit,
+    /// `/heal` — server-armed CAMP plus visual.
+    Heal,
+}
+
+impl RestStance {
+    /// True if any rest pose is held.
+    pub fn is_resting(&self) -> bool {
+        !matches!(self.kind, RestKind::None)
+    }
 }
 
 /// Shared loader: open a DAT, walk its chunks, return the first MO2
@@ -359,6 +445,19 @@ mod tests {
         assert!(m.is_moving(3), "just above 0.5 should animate");
         assert!(m.is_moving(4), "full run speed should animate");
         assert!(!m.is_moving(99), "unknown id should not animate");
+    }
+
+    /// `RestStance::is_resting` reflects the kind variant.
+    #[test]
+    fn rest_stance_is_resting_matches_kind() {
+        let mut s = RestStance::default();
+        assert!(!s.is_resting());
+        s.kind = RestKind::Sit;
+        assert!(s.is_resting());
+        s.kind = RestKind::Heal;
+        assert!(s.is_resting());
+        s.kind = RestKind::None;
+        assert!(!s.is_resting());
     }
 
     /// Combat run lives in the motion DAT as `run1` (68-bone LOD).

@@ -232,14 +232,14 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
         "Status & Menus",
         &[
             HelpEntry {
-                aliases: &["sit"],
-                usage: "",
-                summary: "sit (not yet wired)",
+                aliases: &["sit", "kneel"],
+                usage: "[on|off]",
+                summary: "sit (locks movement; any movement key stands)",
             },
             HelpEntry {
                 aliases: &["stand"],
                 usage: "",
-                summary: "stand (not yet wired)",
+                summary: "stand (clear any rest stance)",
             },
             HelpEntry {
                 aliases: &["heal"],
@@ -501,6 +501,22 @@ pub enum SlashOutcome {
     /// Mirrors the `SetTarget(Option<u32>)` shape — a client-side
     /// state mutation, no agent/wire side effect.
     ToggleNavmesh(Option<bool>),
+    /// `/sit` / `/kneel` — set or toggle the local
+    /// [`RestStance`][rs] resource. Pure client-side affordance; the
+    /// retail server has no "is sitting" packet, so the dispatcher
+    /// just mutates the resource and the avatar animation system
+    /// picks up the new pose next frame.
+    ///
+    /// `kind = Some(RestStanceKind::Sit)` enters sit, `Some(None)`
+    /// stands, `None` (toggle) flips between the current `Sit`
+    /// stance and `None` (any other stance becomes `Sit`). The
+    /// `/heal` slash command does NOT route through this — it stays
+    /// on `AgentCommand::Heal` so the server-side CAMP machinery
+    /// runs, and the dispatcher mirrors `RestStance::Heal` on the
+    /// outbound side.
+    ///
+    /// [rs]: ffxi_viewer_core::combat_stance::RestStance
+    SetSitStance(SitToggle),
     /// `/keybinds preset|list|reset` — switch keybind preset, list the
     /// active map, or drop overrides back to the active preset's
     /// defaults. The dispatcher applies the change to the `Bindings`
@@ -733,6 +749,23 @@ pub enum SoundOp {
     SetSfx(Option<bool>),
 }
 
+/// `/sit` / `/kneel` argument variants. The parser turns the user's
+/// text into one of these; the dispatcher applies it to the
+/// [`RestStance`][rs] resource.
+///
+/// [rs]: ffxi_viewer_core::combat_stance::RestStance
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SitToggle {
+    /// Bare `/sit` or `/kneel` — flip Sit on/off. (`Heal` → `Sit`
+    /// when toggled, mirroring how retail's `/sit` while healing
+    /// stands you up out of CAMP and then sits.)
+    Toggle,
+    /// `/sit on` — explicitly enter Sit.
+    On,
+    /// `/sit off` or `/stand` — explicitly clear any rest stance.
+    Off,
+}
+
 /// `/agent` subcommand variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentControlOp {
@@ -938,8 +971,14 @@ pub fn parse_slash(
             }
         }
         "buy" => parse_buy(rest),
-        "sit" => SlashOutcome::SystemMessage("/sit: not yet wired".into()),
-        "stand" => SlashOutcome::SystemMessage("/stand: not yet wired".into()),
+        // `/sit` / `/kneel` — retail aliases for the sit rest pose. Pure
+        // client-side affordance: lock the local self avatar in the
+        // sit MO2 and refuse to emit outbound `Move` packets until a
+        // movement key clears the stance (retail-style stand-on-first-
+        // input). `/sit on` / `/sit off` are explicit setters; bare
+        // `/sit` toggles.
+        "sit" | "kneel" => parse_sit(rest),
+        "stand" => SlashOutcome::SetSitStance(SitToggle::Off),
         "bgm" => match rest.parse::<u16>() {
             Ok(id) => SlashOutcome::PlayBgm { track_id: id },
             Err(_) => SlashOutcome::SystemMessage("/bgm <track_id>".into()),
@@ -1187,6 +1226,24 @@ fn parse_reqlogout(rest: &str, shutdown: bool) -> SlashOutcome {
 /// `/heal [on|off]` — toggle/arm/cancel resting (0x0E8 CAMP). Empty arg
 /// is the always-safe Toggle form. Unknown arg → system message,
 /// mirroring `parse_reqlogout`'s usage-line shape.
+/// `/sit [on|off|toggle]` — parses the SitToggle variant for the
+/// rest-stance dispatcher. Bare `/sit` (or `/kneel`) toggles; unknown
+/// args produce a system message.
+fn parse_sit(rest: &str) -> SlashOutcome {
+    let arg = rest.trim().to_ascii_lowercase();
+    let toggle = match arg.as_str() {
+        "" | "toggle" => SitToggle::Toggle,
+        "on" => SitToggle::On,
+        "off" => SitToggle::Off,
+        other => {
+            return SlashOutcome::SystemMessage(format!(
+                "/sit: usage `/sit [on|off]` (got `{other}`)"
+            ));
+        }
+    };
+    SlashOutcome::SetSitStance(toggle)
+}
+
 fn parse_heal(rest: &str) -> SlashOutcome {
     let arg = rest.trim().to_ascii_lowercase();
     let mode = match arg.as_str() {
@@ -3280,6 +3337,44 @@ mod tests {
                 ),
                 "expected SystemMessage for {s}"
             );
+        }
+    }
+
+    #[test]
+    fn sit_no_arg_toggles() {
+        match parse_slash_t("/sit", &empty_entities(), origin(), None, None) {
+            SlashOutcome::SetSitStance(t) => assert_eq!(t, SitToggle::Toggle),
+            other => panic!("expected SetSitStance(Toggle), got {other:?}"),
+        }
+        // `/kneel` is the retail alias for `/sit`.
+        match parse_slash_t("/kneel", &empty_entities(), origin(), None, None) {
+            SlashOutcome::SetSitStance(t) => assert_eq!(t, SitToggle::Toggle),
+            other => panic!("expected SetSitStance(Toggle), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sit_on_off_and_stand() {
+        match parse_slash_t("/sit on", &empty_entities(), origin(), None, None) {
+            SlashOutcome::SetSitStance(t) => assert_eq!(t, SitToggle::On),
+            other => panic!("expected SetSitStance(On), got {other:?}"),
+        }
+        match parse_slash_t("/sit off", &empty_entities(), origin(), None, None) {
+            SlashOutcome::SetSitStance(t) => assert_eq!(t, SitToggle::Off),
+            other => panic!("expected SetSitStance(Off), got {other:?}"),
+        }
+        // `/stand` is the retail standalone-form of `/sit off`.
+        match parse_slash_t("/stand", &empty_entities(), origin(), None, None) {
+            SlashOutcome::SetSitStance(t) => assert_eq!(t, SitToggle::Off),
+            other => panic!("expected SetSitStance(Off), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sit_rejects_unknown_arg() {
+        match parse_slash_t("/sit bogus", &empty_entities(), origin(), None, None) {
+            SlashOutcome::SystemMessage(s) => assert!(s.contains("/sit:"), "{s}"),
+            other => panic!("expected SystemMessage, got {other:?}"),
         }
     }
 
