@@ -1,115 +1,198 @@
-//! Login screen: username/password fields + Enter-to-submit.
-//!
-//! Bevy 0.17 has no built-in text-input widget. We roll our own:
-//!  * `keyboard_input_system` reads `KeyboardInput` events directly so
-//!    we get raw character data alongside the `KeyCode` (the latter
-//!    alone can't disambiguate shifted vs unshifted layouts reliably).
-//!  * `redraw_login_form_system` runs every frame and rewrites the
-//!    `Text` nodes from the [`LoginForm`] resource. Cheaper than
-//!    diffing — these are short strings.
-//!
-//! Cursor positioning isn't supported (append-only). Backspace removes
-//! the last char. Tab cycles focus between the two fields.
+//! Login screen — feathers-based buttons + TextFields.
 
+use bevy::ecs::spawn::Spawn;
+use bevy::feathers::controls::{button, checkbox, ButtonProps, ButtonVariant};
+use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
+use bevy::ui::Checked;
+use bevy::ui_widgets::{Activate, ValueChange};
 
+use super::common::{hint, panel_node, row, screen_root, title};
+use crate::view_native::widgets::text_field::{text_field, TextFieldSubmitted};
+use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 use super::{Credentials, LauncherState, LoginErrorMsg, LoginField, LoginForm, ServerInfo};
 
-/// Marker for the remember-password indicator line.
-#[derive(Component)]
-pub(super) struct RememberText;
-
-/// Marker for the root login UI node so we can despawn the whole tree on
-/// state exit.
 #[derive(Component)]
 pub(super) struct LoginUiRoot;
-
-/// Marker for the username text node.
-#[derive(Component)]
-pub(super) struct UserText;
-
-/// Marker for the password text node (rendered as `*`s).
-#[derive(Component)]
-pub(super) struct PassText;
 
 pub(super) fn spawn_login_ui(
     mut commands: Commands,
     server: Res<ServerInfo>,
     form: Res<LoginForm>,
 ) {
+    let user_initial = form.user.clone();
+    let pass_initial = form.pass.clone();
+    let remember = form.remember_password;
+    let server_name = server.server.clone();
+
     commands
-        .spawn((
-            LoginUiRoot,
-            Node {
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                flex_direction: FlexDirection::Column,
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                row_gap: Val::Px(12.0),
+        .spawn((LoginUiRoot, screen_root()))
+        .with_children(|root| {
+            root.spawn(panel_node(480.0)).with_children(|panel| {
+                panel.spawn(title(format!("FFXI launcher — {server_name}")));
+                panel.spawn(hint("Tab cycles fields. Enter submits when both filled."));
+
+                spawn_field(panel, "Username", false, &user_initial, LoginField::User);
+                spawn_field(panel, "Password", true, &pass_initial, LoginField::Password);
+
+                let mut cb = panel.spawn(checkbox(
+                    (),
+                    Spawn((Text::new("Remember password"), ThemedText)),
+                ));
+                if remember {
+                    cb.insert(Checked);
+                }
+                cb.observe(
+                    |ev: On<ValueChange<bool>>,
+                     mut form: ResMut<LoginForm>,
+                     mut commands: Commands| {
+                        form.remember_password = ev.value;
+                        if ev.value {
+                            commands.entity(ev.source).insert(Checked);
+                        } else {
+                            commands.entity(ev.source).remove::<Checked>();
+                        }
+                    },
+                );
+
+                panel.spawn(row()).with_children(|r| {
+                    r.spawn(button(
+                        ButtonProps {
+                            variant: ButtonVariant::Primary,
+                            ..default()
+                        },
+                        (),
+                        Spawn((Text::new("Log in"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>,
+                         form: Res<LoginForm>,
+                         mut next: ResMut<NextState<LauncherState>>| {
+                            if !form.user.is_empty() && !form.pass.is_empty() {
+                                next.set(LauncherState::AuthInFlight);
+                            }
+                        },
+                    );
+
+                    r.spawn(button(
+                        ButtonProps::default(),
+                        (),
+                        Spawn((Text::new("Create account"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(LauncherState::CreateAccount);
+                        },
+                    );
+                });
+
+                panel.spawn(row()).with_children(|r| {
+                    r.spawn(button(
+                        ButtonProps::default(),
+                        (),
+                        Spawn((Text::new("Change password"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(LauncherState::ChangePassword);
+                        },
+                    );
+
+                    r.spawn(button(
+                        ButtonProps::default(),
+                        (),
+                        Spawn((Text::new("Server select"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(LauncherState::ServerSelect);
+                        },
+                    );
+
+                    r.spawn(button(
+                        ButtonProps::default(),
+                        (),
+                        Spawn((Text::new("Forget saved"), ThemedText)),
+                    ))
+                    .observe(|_ev: On<Activate>, mut form: ResMut<LoginForm>| {
+                        form.user.clear();
+                        form.pass.clear();
+                        form.remember_password = false;
+                    });
+                });
+            });
+        });
+}
+
+/// Spawn a labeled TextField row with per-entity observers for value
+/// edits and Enter-submit. The row layout matches `labeled_text_field`
+/// but is inlined here so we own the TextField entity and can attach
+/// `.observe()`.
+fn spawn_field(
+    parent: &mut ChildSpawnerCommands,
+    label: &str,
+    mask: bool,
+    initial: &str,
+    binding: LoginField,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            height: Val::Px(32.0),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Node {
+                    width: Val::Px(110.0),
+                    ..default()
+                },
+                Text::new(label.to_string()),
+                ThemedText,
+            ));
+            row.spawn(text_field(TextFieldProps {
+                initial: initial.to_string(),
+                mask,
+                submit_on_enter: true,
                 ..default()
-            },
-            BackgroundColor(Color::srgb(0.04, 0.04, 0.05)),
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new(format!("FFXI agent launcher — {}", server.server)),
-                TextFont {
-                    font_size: 22.0,
-                    ..default()
+            }))
+            .with_children(|tf| {
+                // Display child — mirrors the layout in widgets::mod.rs.
+                tf.spawn((
+                    Node {
+                        flex_grow: 1.0,
+                        ..default()
+                    },
+                    Text::new(String::new()),
+                    TextColor(Color::srgb(0.92, 0.92, 0.95)),
+                    TextFieldDisplay {
+                        owner: Entity::PLACEHOLDER,
+                    },
+                    ThemedText,
+                ));
+            })
+            .observe(
+                move |ev: On<ValueChange<String>>, mut form: ResMut<LoginForm>| {
+                    match binding {
+                        LoginField::User => form.user = ev.value.clone(),
+                        LoginField::Password => form.pass = ev.value.clone(),
+                    }
                 },
-                TextColor(Color::srgb(0.0, 1.0, 1.0)),
-            ));
-            parent.spawn((
-                Text::new(""),
-                TextFont {
-                    font_size: 12.0,
-                    ..default()
+            )
+            .observe(
+                move |_ev: On<TextFieldSubmitted>,
+                      form: Res<LoginForm>,
+                      mut next: ResMut<NextState<LauncherState>>| {
+                    if !form.user.is_empty() && !form.pass.is_empty() {
+                        next.set(LauncherState::AuthInFlight);
+                    }
                 },
-                TextColor(Color::srgb(0.6, 0.6, 0.6)),
-            ));
-            parent.spawn((
-                UserText,
-                Text::new(format_user_line(&form.user, form.focus == LoginField::User)),
-                TextFont {
-                    font_size: 18.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.95, 0.95, 0.95)),
-            ));
-            parent.spawn((
-                PassText,
-                Text::new(format_pass_line(
-                    &form.pass,
-                    form.focus == LoginField::Password,
-                )),
-                TextFont {
-                    font_size: 18.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.95, 0.95, 0.95)),
-            ));
-            parent.spawn((
-                RememberText,
-                Text::new(format_remember_line(form.remember_password)),
-                TextFont {
-                    font_size: 13.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.75, 0.75, 0.75)),
-            ));
-            parent.spawn((
-                Text::new(
-                    "Tab: switch field   Enter: login   Ctrl-N: new account   Ctrl-R: remember   Ctrl-P: change password   Esc: clear field",
-                ),
-                TextFont {
-                    font_size: 12.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.5, 0.5, 0.5)),
-            ));
+            );
         });
 }
 
@@ -119,175 +202,75 @@ pub(super) fn despawn_login_ui(mut commands: Commands, q: Query<Entity, With<Log
     }
 }
 
-/// Reads `KeyboardInput` events and mutates the form. Triggers transition
-/// to `AuthInFlight` on Enter when both fields are non-empty.
 pub(super) fn keyboard_input_system(
     mut events: MessageReader<KeyboardInput>,
     mut form: ResMut<LoginForm>,
-    mut next_state: ResMut<NextState<LauncherState>>,
-    keys: Res<ButtonInput<KeyCode>>,
 ) {
-    let ctrl = keys.pressed(KeyCode::ControlLeft)
-        || keys.pressed(KeyCode::ControlRight)
-        || keys.pressed(KeyCode::SuperLeft)
-        || keys.pressed(KeyCode::SuperRight);
     for ev in events.read() {
         if ev.state != ButtonState::Pressed {
             continue;
         }
-        // Ctrl-N (or Cmd-N on macOS) → jump to account-creation screen.
-        // We check the modifier before the Character match so the 'n'
-        // doesn't end up typed into the focused field.
-        if ctrl {
-            if let Key::Character(s) = &ev.logical_key {
-                if s.eq_ignore_ascii_case("n") {
-                    next_state.set(LauncherState::CreateAccount);
-                    return;
-                }
-                if s.eq_ignore_ascii_case("r") {
-                    form.remember_password = !form.remember_password;
-                    continue;
-                }
-                if s.eq_ignore_ascii_case("p") {
-                    next_state.set(LauncherState::ChangePassword);
-                    return;
-                }
-            }
-        }
-        match &ev.logical_key {
-            Key::Enter => {
-                if !form.user.is_empty() && !form.pass.is_empty() {
-                    next_state.set(LauncherState::AuthInFlight);
-                    return;
-                }
-            }
-            Key::Tab => {
-                form.focus = match form.focus {
-                    LoginField::User => LoginField::Password,
-                    LoginField::Password => LoginField::User,
-                };
-            }
-            Key::Backspace => match form.focus {
-                LoginField::User => {
-                    form.user.pop();
-                }
-                LoginField::Password => {
-                    form.pass.pop();
-                }
-            },
-            Key::Escape => match form.focus {
-                LoginField::User => form.user.clear(),
-                LoginField::Password => form.pass.clear(),
-            },
-            Key::Character(s) => {
-                // `s` is a SmolStr; iterate over chars to filter control
-                // bytes and append printable ones.
-                for c in s.chars() {
-                    if !c.is_control() {
-                        match form.focus {
-                            LoginField::User => form.user.push(c),
-                            LoginField::Password => form.pass.push(c),
-                        }
-                    }
-                }
-            }
-            Key::Space => match form.focus {
-                LoginField::User => form.user.push(' '),
-                LoginField::Password => form.pass.push(' '),
-            },
-            _ => {}
+        if matches!(ev.logical_key, Key::Escape) {
+            form.user.clear();
+            form.pass.clear();
         }
     }
 }
 
-pub(super) fn redraw_login_form_system(
-    form: Res<LoginForm>,
-    mut q_user: Query<
-        &mut Text,
-        (With<UserText>, Without<PassText>, Without<RememberText>),
-    >,
-    mut q_pass: Query<
-        &mut Text,
-        (With<PassText>, Without<UserText>, Without<RememberText>),
-    >,
-    mut q_rem: Query<&mut Text, (With<RememberText>, Without<UserText>, Without<PassText>)>,
-) {
-    if !form.is_changed() {
-        return;
-    }
-    for mut t in q_user.iter_mut() {
-        **t = format_user_line(&form.user, form.focus == LoginField::User);
-    }
-    for mut t in q_pass.iter_mut() {
-        **t = format_pass_line(&form.pass, form.focus == LoginField::Password);
-    }
-    for mut t in q_rem.iter_mut() {
-        **t = format_remember_line(form.remember_password);
-    }
-}
-
-fn format_remember_line(remember: bool) -> String {
-    let mark = if remember { "X" } else { " " };
-    format!("[{mark}] Remember password (Ctrl-R)")
-}
-
-fn format_user_line(user: &str, focused: bool) -> String {
-    let cursor = if focused { "_" } else { " " };
-    format!("Username:  {user}{cursor}")
-}
-
-fn format_pass_line(pass: &str, focused: bool) -> String {
-    let cursor = if focused { "_" } else { " " };
-    let masked: String = "*".repeat(pass.chars().count());
-    format!("Password:  {masked}{cursor}")
-}
+/// TextField self-renders — kept as a no-op so `mod.rs::register`'s
+/// existing system tuple compiles without a touch.
+pub(super) fn redraw_login_form_system() {}
 
 // --- LoginError state -----------------------------------------------------
 
-/// Marker for the error UI root.
 #[derive(Component)]
 pub(super) struct ErrorUiRoot;
 
 pub(super) fn spawn_error_ui(mut commands: Commands, msg: Res<LoginErrorMsg>) {
+    let body = msg.0.clone();
     commands
-        .spawn((
-            ErrorUiRoot,
-            Node {
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                flex_direction: FlexDirection::Column,
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                row_gap: Val::Px(20.0),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.04, 0.04, 0.05)),
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new("Login failed"),
-                TextFont {
-                    font_size: 22.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.95, 0.20, 0.20)),
-            ));
-            parent.spawn((
-                Text::new(msg.0.clone()),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.85, 0.85, 0.85)),
-            ));
-            parent.spawn((
-                Text::new("Press Esc to return to login."),
-                TextFont {
-                    font_size: 12.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.55, 0.55, 0.55)),
-            ));
+        .spawn((ErrorUiRoot, screen_root()))
+        .with_children(|root| {
+            root.spawn(panel_node(520.0)).with_children(|panel| {
+                panel.spawn((
+                    Text::new("Login failed"),
+                    TextFont {
+                        font_size: 22.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.95, 0.20, 0.20)),
+                    ThemedText,
+                ));
+                panel.spawn((
+                    Text::new(body),
+                    TextFont {
+                        font_size: 14.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.85, 0.85, 0.85)),
+                    ThemedText,
+                ));
+                panel
+                    .spawn(button(
+                        ButtonProps {
+                            variant: ButtonVariant::Primary,
+                            ..default()
+                        },
+                        (),
+                        Spawn((Text::new("Back to login"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>,
+                         mut form: ResMut<LoginForm>,
+                         mut creds: ResMut<Credentials>,
+                         mut next: ResMut<NextState<LauncherState>>| {
+                            form.pass.clear();
+                            creds.user.clear();
+                            creds.pass.clear();
+                            next.set(LauncherState::Login);
+                        },
+                    );
+            });
         });
 }
 
@@ -307,9 +290,7 @@ pub(super) fn error_keyboard_system(
         if ev.state != ButtonState::Pressed {
             continue;
         }
-        if matches!(ev.logical_key, Key::Escape | Key::Enter) {
-            // Wipe stale credentials but keep the username — same shape as
-            // the stdin launcher's "ask for password again" behaviour.
+        if matches!(ev.logical_key, Key::Escape) {
             form.pass.clear();
             creds.user.clear();
             creds.pass.clear();

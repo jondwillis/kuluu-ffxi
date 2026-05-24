@@ -54,6 +54,7 @@ mod char_create;
 mod char_create_preview;
 pub(crate) mod char_list;
 mod char_preview;
+mod common;
 mod login;
 mod server_edit;
 mod server_select;
@@ -81,12 +82,12 @@ pub(crate) enum LauncherState {
     /// `Login` via `direct_mode_login_autostart` / the prefill systems.
     ServerSelect,
     /// Add or edit a `ServerProfile`. Reached from `ServerSelect` via
-    /// Ctrl-N (new) or Ctrl-E (edit).
+    /// the `+ Add server` or `Edit selected` buttons.
     ServerEdit,
     /// Pick a saved account on the previously-selected server.
     AccountPicker,
     /// Change password form (old / new / confirm). Reached from Login via
-    /// Ctrl-P.
+    /// the `Change password` button.
     ChangePassword,
     /// Sending the change-password command. Success → Login; failure →
     /// LoginError.
@@ -119,8 +120,9 @@ pub(crate) enum LauncherState {
     /// Server rejected the create (name in use, banned word, etc.). Esc
     /// returns to the form; Enter retries.
     CharCreateError,
-    /// Inline confirmation modal for Ctrl-D on a char-list row. Enter
-    /// dispatches `CharDeleteInFlight`; Esc returns to `CharList`.
+    /// Inline confirmation modal for the `Delete selected` button on the
+    /// char-list screen. Confirm dispatches `CharDeleteInFlight`; Cancel
+    /// or Esc returns to `CharList`.
     /// (LSB's delete handler doesn't actually validate the `passwd`
     /// field — only `accountID` from the live session — so we use a
     /// simple Y/N confirm rather than re-prompting for the password.)
@@ -135,6 +137,13 @@ pub(crate) enum LauncherState {
 }
 
 /// Which field on the char-create form has keyboard focus.
+///
+/// Retained as a tag enum even after the feathers rewrite — screens still
+/// pass it to per-row spawn helpers to identify which form slot a
+/// TextField/Button writes into. The `focus` field on the form
+/// resource + the cycle helpers are dead with the new widget-driven
+/// flow but cheap to keep around.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum CharCreateField {
     #[default]
@@ -146,6 +155,7 @@ pub(crate) enum CharCreateField {
     Size,
 }
 
+#[allow(dead_code)]
 impl CharCreateField {
     pub(crate) fn next(self) -> Self {
         match self {
@@ -180,6 +190,7 @@ pub(crate) struct CharCreateForm {
     pub nation: u8,
     pub face: u8,
     pub size: u8,
+    #[allow(dead_code)]
     pub focus: CharCreateField,
 }
 
@@ -218,6 +229,7 @@ impl CharCreateForm {
     }
 
     /// Step the focused enum field. `delta` is +1 or -1.
+    #[allow(dead_code)]
     pub fn cycle_focused(&mut self, delta: i32) {
         match self.focus {
             CharCreateField::Name => {}
@@ -235,6 +247,7 @@ impl CharCreateForm {
     }
 }
 
+#[allow(dead_code)]
 fn cycle_table(table: &[(u8, &str)], current: u8, delta: i32) -> u8 {
     let idx = table.iter().position(|(v, _)| *v == current).unwrap_or(0) as i32;
     let n = table.len() as i32;
@@ -265,12 +278,14 @@ pub(crate) struct LoginForm {
     pub focus: LoginField,
     /// When true, a successful login persists the password to the OS
     /// keyring under `(KEYRING_SERVICE, server:user)`. Toggled with
-    /// Ctrl-R; pre-populated from `SavedAccount.remember_password` when
+    /// the `Remember password` checkbox on the login screen;
+    /// pre-populated from `SavedAccount.remember_password` when
     /// the account-picker prefills this form.
     pub remember_password: bool,
 }
 
 /// Field focus on the server-edit form.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum ServerEditField {
     #[default]
@@ -282,6 +297,7 @@ pub(crate) enum ServerEditField {
     Flavor,
 }
 
+#[allow(dead_code)]
 impl ServerEditField {
     pub(crate) fn next(self) -> Self {
         match self {
@@ -320,6 +336,7 @@ pub(crate) struct ServerEditForm {
     pub data_port: String,
     pub view_port: String,
     pub flavor: ffxi_client::launcher_store::AuthFlavorKind,
+    #[allow(dead_code)]
     pub focus: ServerEditField,
     pub editing_index: Option<usize>,
 }
@@ -354,6 +371,7 @@ impl ServerEditForm {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum ChangePasswordField {
     #[default]
@@ -362,6 +380,7 @@ pub(crate) enum ChangePasswordField {
     Confirm,
 }
 
+#[allow(dead_code)]
 impl ChangePasswordField {
     pub(crate) fn next(self) -> Self {
         match self {
@@ -377,11 +396,13 @@ pub(crate) struct ChangePasswordForm {
     pub old: String,
     pub new_pw: String,
     pub confirm: String,
+    #[allow(dead_code)]
     pub focus: ChangePasswordField,
     pub error: String,
 }
 
 /// Which field on the create-account form has keyboard focus.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum CreateAccountField {
     #[default]
@@ -390,6 +411,7 @@ pub(crate) enum CreateAccountField {
     PasswordConfirm,
 }
 
+#[allow(dead_code)]
 impl CreateAccountField {
     pub(crate) fn next(self) -> Self {
         match self {
@@ -416,6 +438,7 @@ pub(crate) struct CreateAccountForm {
     pub user: String,
     pub pass: String,
     pub pass_confirm: String,
+    #[allow(dead_code)]
     pub focus: CreateAccountField,
 }
 
@@ -1004,8 +1027,8 @@ fn decide_initial_screen(
     }
     // No CLI overrides + no matching last_used → always go through
     // ServerSelect. An empty server list is fine: ServerSelect's
-    // Ctrl-N escape into ServerEdit is the only way to add the first
-    // entry, so gating this on `!servers.is_empty()` would strand a
+    // `+ Add server` button is the only way to add the first entry,
+    // so gating this on `!servers.is_empty()` would strand a
     // fresh install with no path to a server.
     next.set(LauncherState::ServerSelect);
 }

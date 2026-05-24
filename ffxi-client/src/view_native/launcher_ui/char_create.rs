@@ -1,131 +1,273 @@
-//! Character-creation screen.
-//!
-//! Form layout: a column of named rows. The focused row is highlighted
-//! and accepts value changes via Left/Right (cycle enum) or typed chars
-//! (name field). Tab / Shift-Tab moves focus. Enter submits. Esc returns
-//! to CharList.
-//!
-//! Live spec validation happens client-side (length, char class, ranges)
-//! mirroring `vendor/server/src/login/login_helpers.cpp:216` so the user
-//! sees errors immediately rather than after a server round-trip.
+//! Character-creation screen — TextField for name, button-group enums
+//! for race/job/nation/size, slider for face index.
 
+use bevy::ecs::spawn::Spawn;
+use bevy::feathers::controls::{button, slider, ButtonProps, ButtonVariant, SliderProps};
+use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
+use bevy::ui_widgets::{Activate, ValueChange};
+
+use super::common::{hint, panel_node, row, screen_root, title};
+use crate::view_native::widgets::text_field::text_field;
+use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
 use super::{CharCreateError, CharCreateField, CharCreateForm, LauncherState};
 
-/// Race options. Indices map directly to LSB's race id 1..=8
-/// (see `vendor/server/src/login/login_helpers.cpp:228`).
 pub(super) const RACES: &[(u8, &str)] = &[
     (1, "Hume M"),
     (2, "Hume F"),
-    (3, "Elvaan M"),
-    (4, "Elvaan F"),
-    (5, "Tarutaru M"),
-    (6, "Tarutaru F"),
-    (7, "Mithra (F)"),
-    (8, "Galka (M)"),
+    (3, "Elv M"),
+    (4, "Elv F"),
+    (5, "Tar M"),
+    (6, "Tar F"),
+    (7, "Mithra"),
+    (8, "Galka"),
 ];
 
-/// Starting jobs only — server clamps to 1..=6
-/// (see `vendor/server/src/login/login_helpers.cpp:248`).
 pub(super) const JOBS: &[(u8, &str)] = &[
-    (1, "Warrior"),
-    (2, "Monk"),
-    (3, "White Mage"),
-    (4, "Black Mage"),
-    (5, "Red Mage"),
-    (6, "Thief"),
+    (1, "WAR"),
+    (2, "MNK"),
+    (3, "WHM"),
+    (4, "BLM"),
+    (5, "RDM"),
+    (6, "THF"),
 ];
 
-/// Nation determines starting zone — 0..=2 valid
-/// (see `vendor/server/src/login/login_helpers.cpp:261`).
-pub(super) const NATIONS: &[(u8, &str)] = &[(0, "San d'Oria"), (1, "Bastok"), (2, "Windurst")];
+pub(super) const NATIONS: &[(u8, &str)] =
+    &[(0, "San d'Oria"), (1, "Bastok"), (2, "Windurst")];
 
-/// Body size — 0..=2 (see `vendor/server/src/login/login_helpers.cpp:234`).
 pub(super) const SIZES: &[(u8, &str)] = &[(0, "Small"), (1, "Medium"), (2, "Large")];
 
-/// 16 faces (0..=15) — server enforces upper bound at
-/// `vendor/server/src/login/login_helpers.cpp:240`.
 pub(super) const FACE_MAX: u8 = 15;
 
 #[derive(Component)]
 pub(super) struct CharCreateRoot;
 
-/// Marker so `redraw_form_system` can find each row's value text.
-#[derive(Component)]
-pub(super) struct RowText {
-    pub field: CharCreateField,
-}
-
-/// Marker for the validation/error footer line.
 #[derive(Component)]
 pub(super) struct StatusText;
 
-pub(super) fn spawn_ui(mut commands: Commands, form: Res<CharCreateForm>) {
-    commands
-        .spawn((
-            CharCreateRoot,
-            Node {
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                flex_direction: FlexDirection::Column,
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                row_gap: Val::Px(10.0),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.04, 0.04, 0.05)),
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new("Create character"),
-                TextFont {
-                    font_size: 24.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.0, 1.0, 1.0)),
-            ));
-            parent.spawn((
-                Text::new(
-                    "Tab / Shift-Tab: switch field   ◀ ▶ : cycle value   Enter: create   Esc: back",
-                ),
-                TextFont {
-                    font_size: 11.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.55, 0.55, 0.55)),
-            ));
+#[derive(Component, Clone, Copy)]
+pub(super) struct EnumChoice {
+    field: CharCreateField,
+    value: u8,
+}
 
-            for field in [
-                CharCreateField::Name,
-                CharCreateField::Race,
-                CharCreateField::Job,
-                CharCreateField::Nation,
-                CharCreateField::Face,
-                CharCreateField::Size,
-            ] {
-                parent.spawn((
-                    RowText { field },
-                    Text::new(format_row(&form, field)),
+pub(super) fn spawn_ui(mut commands: Commands, form: Res<CharCreateForm>) {
+    let snap = (
+        form.name.clone(),
+        form.race,
+        form.job,
+        form.nation,
+        form.face,
+        form.size,
+    );
+    let initial_msg = form.validation_msg().unwrap_or_default();
+
+    commands
+        .spawn((CharCreateRoot, screen_root()))
+        .with_children(|root| {
+            root.spawn(panel_node(560.0)).with_children(|panel| {
+                panel.spawn(title("Create character"));
+                panel.spawn(hint(
+                    "Tab cycles fields. Click a value to set it. Esc returns to char list.",
+                ));
+
+                // Name field.
+                panel
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Px(32.0),
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            Node {
+                                width: Val::Px(80.0),
+                                ..default()
+                            },
+                            Text::new("Name"),
+                            ThemedText,
+                        ));
+                        row.spawn(text_field(TextFieldProps {
+                            initial: snap.0.clone(),
+                            submit_on_enter: false,
+                            ..default()
+                        }))
+                        .with_children(|tf| {
+                            tf.spawn((
+                                Node {
+                                    flex_grow: 1.0,
+                                    ..default()
+                                },
+                                Text::new(String::new()),
+                                TextColor(Color::srgb(0.92, 0.92, 0.95)),
+                                TextFieldDisplay {
+                                    owner: Entity::PLACEHOLDER,
+                                },
+                                ThemedText,
+                            ));
+                        })
+                        .observe(
+                            |ev: On<ValueChange<String>>, mut form: ResMut<CharCreateForm>| {
+                                // Server enforces alpha-only (login_helpers.cpp:220).
+                                let filtered: String = ev
+                                    .value
+                                    .chars()
+                                    .filter(|c| c.is_ascii_alphabetic())
+                                    .take(15)
+                                    .collect();
+                                form.name = filtered;
+                            },
+                        );
+                    });
+
+                spawn_enum_row(panel, "Race", CharCreateField::Race, RACES, snap.1);
+                spawn_enum_row(panel, "Job", CharCreateField::Job, JOBS, snap.2);
+                spawn_enum_row(panel, "Nation", CharCreateField::Nation, NATIONS, snap.3);
+                spawn_enum_row(panel, "Build", CharCreateField::Size, SIZES, snap.5);
+
+                // Face slider — integer 0..=15.
+                panel
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Px(32.0),
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            Node {
+                                width: Val::Px(80.0),
+                                ..default()
+                            },
+                            Text::new("Face"),
+                            ThemedText,
+                        ));
+                        row.spawn(slider(
+                            SliderProps {
+                                value: snap.4 as f32,
+                                min: 0.0,
+                                max: FACE_MAX as f32,
+                            },
+                            (),
+                        ))
+                        .observe(
+                            |ev: On<ValueChange<f32>>, mut form: ResMut<CharCreateForm>| {
+                                form.face = ev.value.round().clamp(0.0, FACE_MAX as f32) as u8;
+                            },
+                        );
+                    });
+
+                panel.spawn((
+                    StatusText,
+                    Text::new(initial_msg),
                     TextFont {
-                        font_size: 17.0,
+                        font_size: 13.0,
                         ..default()
                     },
-                    TextColor(Color::srgb(0.95, 0.95, 0.95)),
+                    TextColor(Color::srgb(0.95, 0.55, 0.30)),
+                    ThemedText,
                 ));
-            }
 
-            parent.spawn((
-                StatusText,
-                Text::new(form.validation_msg().unwrap_or_default()),
-                TextFont {
-                    font_size: 13.0,
+                panel.spawn(row()).with_children(|r| {
+                    r.spawn(button(
+                        ButtonProps {
+                            variant: ButtonVariant::Primary,
+                            ..default()
+                        },
+                        (),
+                        Spawn((Text::new("Create"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>,
+                         form: Res<CharCreateForm>,
+                         mut err: ResMut<CharCreateError>,
+                         mut next: ResMut<NextState<LauncherState>>| {
+                            if form.validation_msg().is_none() {
+                                err.0.clear();
+                                next.set(LauncherState::CharCreateInFlight);
+                            }
+                        },
+                    );
+
+                    r.spawn(button(
+                        ButtonProps::default(),
+                        (),
+                        Spawn((Text::new("Cancel"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>,
+                         mut err: ResMut<CharCreateError>,
+                         mut next: ResMut<NextState<LauncherState>>| {
+                            err.0.clear();
+                            next.set(LauncherState::CharList);
+                        },
+                    );
+                });
+            });
+        });
+}
+
+fn spawn_enum_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &str,
+    field: CharCreateField,
+    table: &'static [(u8, &'static str)],
+    current: u8,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(6.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Node {
+                    width: Val::Px(80.0),
                     ..default()
                 },
-                TextColor(Color::srgb(0.95, 0.55, 0.30)),
+                Text::new(label.to_string()),
+                ThemedText,
             ));
+            for (val, name) in table.iter() {
+                let val = *val;
+                let variant = if val == current {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Normal
+                };
+                row.spawn((
+                    button(
+                        ButtonProps {
+                            variant,
+                            ..default()
+                        },
+                        EnumChoice { field, value: val },
+                        Spawn((Text::new((*name).to_string()), ThemedText)),
+                    ),
+                ))
+                .observe(
+                    move |_ev: On<Activate>, mut form: ResMut<CharCreateForm>| {
+                        match field {
+                            CharCreateField::Race => form.race = val,
+                            CharCreateField::Job => form.job = val,
+                            CharCreateField::Nation => form.nation = val,
+                            CharCreateField::Size => form.size = val,
+                            CharCreateField::Name | CharCreateField::Face => {}
+                        }
+                    },
+                );
+            }
         });
 }
 
@@ -137,112 +279,50 @@ pub(super) fn despawn_ui(mut commands: Commands, q: Query<Entity, With<CharCreat
 
 pub(super) fn keyboard_input_system(
     mut events: MessageReader<KeyboardInput>,
-    mut form: ResMut<CharCreateForm>,
-    mut next_state: ResMut<NextState<LauncherState>>,
-    mut error: ResMut<CharCreateError>,
-    keys: Res<ButtonInput<KeyCode>>,
+    mut err: ResMut<CharCreateError>,
+    mut next: ResMut<NextState<LauncherState>>,
 ) {
-    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     for ev in events.read() {
         if ev.state != ButtonState::Pressed {
             continue;
         }
-        match &ev.logical_key {
-            Key::Escape => {
-                error.0.clear();
-                next_state.set(LauncherState::CharList);
-                return;
-            }
-            Key::Enter => {
-                if form.validation_msg().is_none() {
-                    error.0.clear();
-                    next_state.set(LauncherState::CharCreateInFlight);
-                    return;
-                }
-            }
-            Key::Tab => {
-                form.focus = if shift {
-                    form.focus.prev()
-                } else {
-                    form.focus.next()
-                };
-            }
-            Key::ArrowLeft => form.cycle_focused(-1),
-            Key::ArrowRight => form.cycle_focused(1),
-            Key::Backspace => {
-                if form.focus == CharCreateField::Name {
-                    form.name.pop();
-                }
-            }
-            Key::Character(s) => {
-                if form.focus == CharCreateField::Name {
-                    for c in s.chars() {
-                        // Server enforces alpha-only (login_helpers.cpp:220).
-                        // Reject early so the user can't even type punctuation.
-                        if c.is_ascii_alphabetic() && form.name.len() < 15 {
-                            form.name.push(c);
-                        }
-                    }
-                }
-            }
-            _ => {}
+        if matches!(ev.logical_key, Key::Escape) {
+            err.0.clear();
+            next.set(LauncherState::CharList);
+            return;
         }
     }
 }
 
+/// Update the enum-choice button variants + the status text when the
+/// form changes.
 pub(super) fn redraw_form_system(
     form: Res<CharCreateForm>,
-    mut q_rows: Query<(&RowText, &mut Text, &mut TextColor), Without<StatusText>>,
+    q_choices: Query<(Entity, &EnumChoice)>,
     mut q_status: Query<&mut Text, With<StatusText>>,
+    mut commands: Commands,
 ) {
     if !form.is_changed() {
         return;
     }
-    for (row, mut text, mut color) in q_rows.iter_mut() {
-        **text = format_row(&form, row.field);
-        *color = if row.field == form.focus {
-            TextColor(Color::srgb(0.30, 0.85, 1.00))
-        } else {
-            TextColor(Color::srgb(0.90, 0.90, 0.90))
+    for (e, choice) in q_choices.iter() {
+        let current = match choice.field {
+            CharCreateField::Race => form.race,
+            CharCreateField::Job => form.job,
+            CharCreateField::Nation => form.nation,
+            CharCreateField::Size => form.size,
+            CharCreateField::Name | CharCreateField::Face => continue,
         };
+        let v = if choice.value == current {
+            ButtonVariant::Primary
+        } else {
+            ButtonVariant::Normal
+        };
+        commands.entity(e).insert(v);
     }
     for mut t in q_status.iter_mut() {
         **t = form.validation_msg().unwrap_or_default();
     }
-}
-
-fn format_row(form: &CharCreateForm, field: CharCreateField) -> String {
-    let focused = form.focus == field;
-    let marker = if focused { "▶ " } else { "  " };
-    match field {
-        CharCreateField::Name => {
-            let cursor = if focused { "_" } else { " " };
-            format!("{marker}Name:    {name}{cursor}", name = form.name)
-        }
-        CharCreateField::Race => {
-            format!("{marker}Race:    ◀ {} ▶", lookup(RACES, form.race))
-        }
-        CharCreateField::Job => {
-            format!("{marker}Job:     ◀ {} ▶", lookup(JOBS, form.job))
-        }
-        CharCreateField::Nation => {
-            format!("{marker}Nation:  ◀ {} ▶", lookup(NATIONS, form.nation))
-        }
-        CharCreateField::Face => {
-            format!("{marker}Face:    ◀ {:>2} / {} ▶", form.face, FACE_MAX)
-        }
-        CharCreateField::Size => {
-            format!("{marker}Build:   ◀ {} ▶", lookup(SIZES, form.size))
-        }
-    }
-}
-
-fn lookup<'a>(table: &'a [(u8, &'a str)], val: u8) -> &'a str {
-    table
-        .iter()
-        .find(|(v, _)| *v == val)
-        .map(|(_, name)| *name)
-        .unwrap_or("?")
 }
 
 // --- CharCreateError state ------------------------------------------------
@@ -251,45 +331,55 @@ fn lookup<'a>(table: &'a [(u8, &'a str)], val: u8) -> &'a str {
 pub(super) struct CharCreateErrorRoot;
 
 pub(super) fn spawn_error_ui(mut commands: Commands, err: Res<CharCreateError>) {
+    let body = err.0.clone();
     commands
-        .spawn((
-            CharCreateErrorRoot,
-            Node {
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                flex_direction: FlexDirection::Column,
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                row_gap: Val::Px(16.0),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.04, 0.04, 0.05)),
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new("Character creation failed"),
-                TextFont {
-                    font_size: 22.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.95, 0.30, 0.30)),
-            ));
-            parent.spawn((
-                Text::new(err.0.clone()),
-                TextFont {
-                    font_size: 13.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.85, 0.85, 0.85)),
-            ));
-            parent.spawn((
-                Text::new("Esc: back to form   Enter: try again"),
-                TextFont {
-                    font_size: 11.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.55, 0.55, 0.55)),
-            ));
+        .spawn((CharCreateErrorRoot, screen_root()))
+        .with_children(|root| {
+            root.spawn(panel_node(520.0)).with_children(|panel| {
+                panel.spawn((
+                    Text::new("Character creation failed"),
+                    TextFont {
+                        font_size: 22.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.95, 0.30, 0.30)),
+                    ThemedText,
+                ));
+                panel.spawn((
+                    Text::new(body),
+                    TextFont {
+                        font_size: 13.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.85, 0.85, 0.85)),
+                    ThemedText,
+                ));
+                panel.spawn(row()).with_children(|r| {
+                    r.spawn(button(
+                        ButtonProps {
+                            variant: ButtonVariant::Primary,
+                            ..default()
+                        },
+                        (),
+                        Spawn((Text::new("Try again"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(LauncherState::CharCreateInFlight);
+                        },
+                    );
+                    r.spawn(button(
+                        ButtonProps::default(),
+                        (),
+                        Spawn((Text::new("Back to form"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(LauncherState::CharCreate);
+                        },
+                    );
+                });
+            });
         });
 }
 
@@ -310,16 +400,9 @@ pub(super) fn error_keyboard_system(
         if ev.state != ButtonState::Pressed {
             continue;
         }
-        match &ev.logical_key {
-            Key::Enter => {
-                next_state.set(LauncherState::CharCreateInFlight);
-                return;
-            }
-            Key::Escape => {
-                next_state.set(LauncherState::CharCreate);
-                return;
-            }
-            _ => {}
+        if matches!(ev.logical_key, Key::Escape) {
+            next_state.set(LauncherState::CharCreate);
+            return;
         }
     }
 }
