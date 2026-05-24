@@ -121,19 +121,25 @@ const STRAFE_SCALE: f32 = 0.75;
 ///     camera lags at flank.
 ///   - `HLR = CTR`: 50/50 split at 45° each.
 ///
-/// Shipped HLR = CTR = 2.0 (retail-feel):
-///   ω = HLR · π/4 ≈ 1.57 rad/sec (~90°/sec sustained turn)
-///   lag_head ≈ 45° (player turns visibly toward direction of motion)
-///   lag_chase ≈ 45° (camera trails permanently — never catches up)
-///   r ≈ 3.2 yalms (tight orbit circle when D held alone)
-/// Equal split puts the player on screen at 3/4 view during sustained
-/// A or D, which is the FFXI-retail signature.
-const HEADING_LERP_RATE_RAD_PER_SEC: f32 = 2.0;
+/// Heading spring constant (1/sec). Both heading-toward-motion and
+/// chase-yaw-toward-behind-player are **exponential lerps**: each
+/// tick advances by `residual * (1 - exp(-rate · dt))`, so the
+/// angular velocity is proportional to the residual angle. This is
+/// what produces the geometric 45°/45° steady-state lag — a
+/// fixed-rate clamped lerp would just preserve the initial offset
+/// (camera stays behind player at motion start) and never settle to
+/// the constraint `lag_head + lag_chase = π/2`.
+///
+/// Shipped HLR = CTR = 5.0:
+///   ω = HLR · π/4 ≈ 3.93 rad/sec (~225°/sec sustained turn)
+///   r = walk_speed / ω ≈ 2.0 yalm (tight orbit circle)
+///   lag_head = lag_chase = π/4 = 45° steady state
+const HEADING_LERP_RATE_RAD_PER_SEC: f32 = 5.0;
 
-/// Chase-camera yaw lerp rate toward "behind player heading", radians
-/// per real-time second. See [`HEADING_LERP_RATE_RAD_PER_SEC`] for the
-/// geometric trade-off and tuning notes.
-const CHASE_TRACK_RATE_RAD_PER_SEC: f32 = 2.0;
+/// Chase-camera yaw spring constant (1/sec). See
+/// [`HEADING_LERP_RATE_RAD_PER_SEC`]. Equal to HLR for the 45°/45°
+/// retail split.
+const CHASE_TRACK_RATE_RAD_PER_SEC: f32 = 5.0;
 
 /// Horizontal-distance threshold (yalms) above which `dispatch_movement_system`
 /// abandons its local prediction and re-seeds from the snapshot. Sized for:
@@ -970,18 +976,22 @@ pub fn dispatch_movement_system(
             let h_target = yaw_for_heading(motion_h);
             let h_current = yaw_for_heading(heading);
             let h_diff = wrap_signed_pi(h_target - h_current);
-            let h_max_step = HEADING_LERP_RATE_RAD_PER_SEC * time.delta_secs();
-            let h_step = h_diff.signum() * h_max_step.min(h_diff.abs());
-            heading = heading_for_yaw(h_current + h_step);
+            // Exponential lerp: residual * (1 - exp(-rate·dt)). Rate
+            // proportional to residual is what produces the 45°
+            // steady-state lag; a fixed-rate clamped lerp would just
+            // preserve initial conditions.
+            let h_alpha = 1.0 - (-HEADING_LERP_RATE_RAD_PER_SEC * time.delta_secs()).exp();
+            heading = heading_for_yaw(h_current + h_diff * h_alpha);
         }
 
-        // Chase-camera yaw lerps toward "behind player heading" (the
-        // lerped value above). In steady state `lag_c = ω/CTR`.
+        // Chase-camera yaw exponential-lerps toward "behind player
+        // heading" (the lerped value above). Equal rate to heading
+        // lerp produces the 45°/45° split: camera trails permanently,
+        // never catches up during sustained orbit.
         let chase_target = yaw_for_heading(heading);
         let c_diff = wrap_signed_pi(chase_target - chase.yaw);
-        let c_max_step = CHASE_TRACK_RATE_RAD_PER_SEC * time.delta_secs();
-        let c_step = c_diff.signum() * c_max_step.min(c_diff.abs());
-        chase.yaw += c_step;
+        let c_alpha = 1.0 - (-CHASE_TRACK_RATE_RAD_PER_SEC * time.delta_secs()).exp();
+        chase.yaw += c_diff * c_alpha;
 
         // Suppress the standard forward/strafe step handlers — composite
         // motion above is the sole position update this tick.
