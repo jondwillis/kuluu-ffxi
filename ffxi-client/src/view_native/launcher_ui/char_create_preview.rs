@@ -8,9 +8,11 @@
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
+use bevy::camera::visibility::RenderLayers;
 
 use super::char_preview::spawn_preview_pc;
 use super::{CharCreateForm, LauncherState};
+use crate::view_native::launcher_backdrop::PREVIEW_RENDER_LAYER;
 
 #[derive(Component)]
 struct CharCreatePreviewRoot;
@@ -42,13 +44,42 @@ const PREVIEW_CAMERA_OFFSET: Vec3 = Vec3::new(0.0, 1.3, 3.0);
 const PREVIEW_LOOK_AT_OFFSET: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 
 pub(super) fn register(app: &mut App) {
-    app.add_systems(OnEnter(LauncherState::CharCreate), spawn_preview)
+    app.add_observer(tag_create_preview_meshes)
+        .add_systems(OnEnter(LauncherState::CharCreate), spawn_preview)
         .add_systems(OnExit(LauncherState::CharCreate), despawn_preview)
         .add_systems(
             Update,
             (mark_dirty_on_form_change, rebake_if_debounced, turntable)
                 .run_if(in_state(LauncherState::CharCreate)),
         );
+}
+
+/// Tag baked meshes under `CharCreatePreviewParent` with the preview
+/// render layer so they don't render into the backdrop zone's pass.
+/// See `char_preview::tag_preview_meshes` for the same pattern on the
+/// char-list side; both share `PREVIEW_RENDER_LAYER` since the two
+/// states are mutually exclusive.
+fn tag_create_preview_meshes(
+    trigger: On<Add, Mesh3d>,
+    parents: Query<&ChildOf>,
+    preview_parents: Query<(), With<CharCreatePreviewParent>>,
+    mut commands: Commands,
+) {
+    let entity = trigger.target();
+    let mut cur = entity;
+    loop {
+        let Ok(child_of) = parents.get(cur) else {
+            return;
+        };
+        let parent = child_of.parent();
+        if preview_parents.contains(parent) {
+            commands
+                .entity(entity)
+                .insert(RenderLayers::layer(PREVIEW_RENDER_LAYER));
+            return;
+        }
+        cur = parent;
+    }
 }
 
 fn spawn_preview(
@@ -74,6 +105,9 @@ fn spawn_preview(
             order: -1,
             ..default()
         },
+        // Isolate from the backdrop zone's render pass — see
+        // `char_preview::spawn_preview` for the same reasoning.
+        RenderLayers::layer(PREVIEW_RENDER_LAYER),
         Transform::from_translation(PREVIEW_PARENT_POS + PREVIEW_CAMERA_OFFSET)
             .looking_at(PREVIEW_PARENT_POS + PREVIEW_LOOK_AT_OFFSET, Vec3::Y),
         ChildOf(root),

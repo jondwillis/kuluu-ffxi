@@ -31,7 +31,7 @@
 //! interference, no `cfg`/excludes needed.
 
 use bevy::prelude::*;
-use bevy::render::view::RenderLayers;
+use bevy::camera::visibility::RenderLayers;
 use ffxi_client::lobby_client::CharSlot;
 use ffxi_viewer_core::SceneState;
 

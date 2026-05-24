@@ -24,7 +24,7 @@
 //! clear of the model.
 
 use bevy::prelude::*;
-use bevy::render::view::RenderLayers;
+use bevy::camera::visibility::RenderLayers;
 use ffxi_client::lobby_client::CharSlot;
 use ffxi_viewer_core::dat_vos2::spawn_equipped;
 
@@ -186,7 +186,7 @@ pub(super) fn tag_preview_meshes(
     preview_parents: Query<(), With<CharPreviewParent>>,
     mut commands: Commands,
 ) {
-    let entity = trigger.entity;
+    let entity = trigger.target();
     let mut cur = entity;
     loop {
         let Ok(child_of) = parents.get(cur) else {

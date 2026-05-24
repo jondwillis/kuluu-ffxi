@@ -728,6 +728,10 @@ pub(crate) fn register(
     // Char list: spawn UI from the snapshot, dispatch on click.
     // `char_preview::spawn_preview` runs *after* `spawn_char_list_ui`
     // so the `CharCursor` resource it depends on already exists.
+    // Global observer tags any Mesh3d spawned under a
+    // CharPreviewParent with the preview render layer — keeps the PC
+    // model out of the backdrop zone's render pass.
+    app.add_observer(char_preview::tag_preview_meshes);
     app.add_systems(
         OnEnter(LauncherState::CharList),
         (char_list::spawn_char_list_ui, char_preview::spawn_preview).chain(),
