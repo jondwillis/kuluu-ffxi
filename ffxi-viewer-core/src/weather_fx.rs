@@ -33,6 +33,7 @@ use bevy::prelude::*;
 pub use ffxi_viewer_wire::Weather;
 
 use crate::camera::OperatorCamera;
+use crate::graphics_settings::GraphicsSettings;
 use crate::snapshot::SceneState;
 use crate::sun_moon::IsSun;
 
@@ -474,6 +475,7 @@ pub fn apply_weather_to_ambient_and_fog_system(
     mut q_cam: Query<Option<&mut DistanceFog>, With<OperatorCamera>>,
     mut commands: Commands,
     cam: Query<Entity, With<OperatorCamera>>,
+    settings: Res<GraphicsSettings>,
 ) {
     // Tint ambient color and scale brightness against the captured
     // base. `active.base_*` was sampled right after the zone wrote it,
@@ -489,13 +491,23 @@ pub fn apply_weather_to_ambient_and_fog_system(
     ambient.brightness = active.base_ambient_brightness * active.modifier.ambient_brightness_mul;
 
     if let (Ok(fog_slot), Ok(cam_entity)) = (q_cam.single_mut(), cam.single()) {
-        if let Some(new_fog) = active.modifier.fog.clone() {
-            match fog_slot {
-                Some(mut existing) => *existing = new_fog,
-                None => {
-                    commands.entity(cam_entity).insert(new_fog);
-                }
+        match (active.modifier.fog.clone(), fog_slot) {
+            (Some(new_fog), Some(mut existing)) => *existing = new_fog,
+            (Some(new_fog), None) => {
+                commands.entity(cam_entity).insert(new_fog);
             }
+            // No precipitation override active. If volumetric fog is
+            // on, the raymarched pass owns the atmosphere — remove
+            // any DistanceFog left behind by a prior precipitating
+            // weather so `/weather none` (or any clear transition)
+            // actually clears the haze. When volumetric is off, the
+            // baseline writer in `weather::apply_zone_weather` keeps
+            // refreshing the camera's DistanceFog each frame, so we
+            // leave it alone here.
+            (None, Some(_)) if settings.volumetric_fog => {
+                commands.entity(cam_entity).remove::<DistanceFog>();
+            }
+            (None, _) => {}
         }
     }
 }
