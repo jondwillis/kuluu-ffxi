@@ -718,19 +718,28 @@ pub fn dispatch_movement_system(
         autorun.phantom_forward = false;
     }
 
-    // --- Q/E (`RotateLeft`/`Right`): pure heading rotate. Time-based
-    //     via the accumulator so sub-unit per-tick deltas at 60 Hz
-    //     accumulate into u8 ticks instead of rounding to zero. A/D
-    //     (`TurnLeft`/`Right`) are NOT folded in here — they're the
-    //     camera-perpendicular orbit verb handled below; folding them
-    //     here would clobber the orbit's heading-lerp toward direction
-    //     of motion, defeating the retail steady-state circle. ---
+    // --- Heading rotate (accumulator-driven, framerate-independent).
+    //     Q/E (`RotateLeft`/`Right`) is pure rotate in both camera
+    //     modes. A/D (`TurnLeft`/`Right`) is folded in **only in
+    //     first-person** — FP has no orbit visual, so A/D collapses
+    //     to the same pivot as Q/E. In chase mode A/D is the
+    //     camera-relative orbit verb handled below; folding it here
+    //     would clobber the orbit's heading-lerp toward motion
+    //     direction, defeating the retail 45°/45° steady-state. ---
     let mut player_rotate_dir: i32 = 0;
     if bindings.pressed(Action::RotateLeft, &keys) {
         player_rotate_dir -= 1;
     }
     if bindings.pressed(Action::RotateRight, &keys) {
         player_rotate_dir += 1;
+    }
+    if matches!(*camera_mode, CameraMode::FirstPerson) {
+        if bindings.pressed(Action::TurnLeft, &keys) {
+            player_rotate_dir -= 1;
+        }
+        if bindings.pressed(Action::TurnRight, &keys) {
+            player_rotate_dir += 1;
+        }
     }
     let (player_rotate_u8, heading_delta_units) =
         advance_heading_turn(&mut turn_accum.units, player_rotate_dir, time.delta_secs());
@@ -793,20 +802,9 @@ pub fn dispatch_movement_system(
     // behind player) settle to lag_head + lag_chase = π/2 with the
     // shipped HLR=CTR=2.0 producing the retail 45°/45° split.
     //
-    // A/D in FirstPerson → folded into player_rotate so the look
-    // direction sweeps (pure rotate; FP has no orbit visual).
+    // A/D in FirstPerson is already folded into `player_rotate_dir`
+    // above (FP has no orbit visual, so A/D collapses to pure rotate).
     let turn_in_chase = turn != 0 && matches!(*camera_mode, CameraMode::Chase);
-    let mut fp_rotate_u8: i32 = 0;
-    if turn != 0 && !turn_in_chase {
-        // First-person: convert held A/D into accumulator-equivalent
-        // units this tick so the same HEADING_TURN_RATE applies.
-        let (whole, _) = advance_heading_turn(
-            &mut turn_accum.units,
-            turn,
-            time.delta_secs(),
-        );
-        fp_rotate_u8 = whole;
-    }
 
     // Lock-on heading override — computed before the no-input bail-out
     // so the camera pivots to follow the target even when the player
@@ -915,12 +913,6 @@ pub fn dispatch_movement_system(
         // Note: camera yaw was already advanced smoothly above (float
         // domain, every tick). No second yaw delta here, otherwise the
         // camera would double-step on integer-tick frames and drift.
-    }
-    if fp_rotate_u8 != 0 {
-        // First-person A/D: same finite-rate pivot, but no chase-yaw
-        // coupling (FP camera tracks heading directly).
-        let delta = fp_rotate_u8.rem_euclid(256) as u8;
-        heading = heading.wrapping_add(delta);
     }
 
     // Turn (3rd-person A/D) — strafe + heading-lerp + chase-lerp.
