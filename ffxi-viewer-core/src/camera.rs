@@ -380,7 +380,12 @@ pub fn build_operator_camera(
     if settings.volumetric_fog {
         camera.insert(VolumetricFog {
             step_count: settings.fog_step_count,
-            ambient_intensity: 0.1,
+            // Low ambient is critical for visible god rays — at 0.1
+            // the unlit shafts get filled in by ambient and the
+            // lit-vs-unlit contrast collapses to a uniform haze.
+            // 0.03 keeps a hint of fill so deep shadow doesn't read
+            // pure black through the fog.
+            ambient_intensity: 0.03,
             ambient_color: Color::srgb(0.85, 0.88, 1.0),
             jitter: 0.0,
         });

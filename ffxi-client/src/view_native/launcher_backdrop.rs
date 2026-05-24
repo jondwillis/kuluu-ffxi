@@ -31,11 +31,24 @@
 //! interference, no `cfg`/excludes needed.
 
 use bevy::prelude::*;
+use bevy::render::view::RenderLayers;
 use ffxi_client::lobby_client::CharSlot;
 use ffxi_viewer_core::SceneState;
 
-use super::launcher_ui::{CharListData, SelectedChar};
+use super::launcher_ui::{char_list::CharCursor, CharListData};
 use super::AppPhase;
+
+/// Render layer for the backdrop zone (and its camera). Anything that
+/// must NOT mix with the foreground PC-preview pipeline lives here.
+/// PC previews (char-list, char-create) live on
+/// [`PREVIEW_RENDER_LAYER`]; the two cameras see disjoint layer
+/// masks so the preview model can't clip into zone terrain.
+pub const BACKDROP_RENDER_LAYER: usize = 0;
+/// Render layer for the launcher's foreground PC previews
+/// (char-list `char_preview` and char-create `char_create_preview`).
+/// They never run simultaneously (different launcher states), so they
+/// can share one layer cheaply.
+pub const PREVIEW_RENDER_LAYER: usize = 1;
 
 /// West La Theine Plateau (retail zone id 102). See
 /// `ffxi-nav/src/zone_names.rs:132` for the canonical id → name
@@ -122,6 +135,12 @@ fn spawn_backdrop_camera(mut commands: Commands) {
             order: -2,
             ..default()
         },
+        // Lock backdrop to its own render layer. Without this, the
+        // char-list PC preview (which spawns meshes at world origin)
+        // gets rendered by this camera *inside* the loaded zone and
+        // clips through terrain. PC previews run on
+        // PREVIEW_RENDER_LAYER and use their own camera.
+        RenderLayers::layer(BACKDROP_RENDER_LAYER),
         // Placeholder viewpoint — eye-height above the FFXI world
         // origin (which is the zone-local origin for the MZB load),
         // looking slightly down toward the horizon. Real per-zone
@@ -176,23 +195,27 @@ fn mirror_backdrop_to_scene_state(
 /// debounce-update [`LauncherBackdropZone`] to its saved zone. Runs
 /// every frame; cheap reads only when nothing is hovered or the
 /// hover hasn't changed.
+///
+/// `CharCursor` is the per-row highlight (moves on arrow keys), not
+/// `SelectedChar` (which only fires on Enter/click commit). Reading
+/// `SelectedChar` here meant the backdrop only swapped at login-
+/// commit time, never on cursor navigation. `CharCursor` only exists
+/// while `LauncherState::CharList` is active — Option<Res<_>>
+/// pattern.
 fn update_backdrop_from_selection(
     time: Res<Time>,
-    sel: Res<SelectedChar>,
+    cursor: Option<Res<CharCursor>>,
     chars: Res<CharListData>,
     mut pending: ResMut<PendingBackdropSwap>,
     mut zone: ResMut<LauncherBackdropZone>,
 ) {
-    // Source of truth: SelectedChar when set (user picked one),
-    // else the first non-empty char in the list (a reasonable
-    // proxy for "current focus" without us needing to plumb
-    // CharCursor through). Either way we end up with a u16 zone
-    // id or `None` (no chars → no swap, stay on default).
-    let hovered: Option<u16> = sel
-        .0
-        .as_ref()
-        .and_then(slot_zone_for_backdrop)
-        .or_else(|| chars.0.iter().find_map(slot_zone_for_backdrop));
+    // CharCursor.0 indexes into chars.0; out-of-bounds (e.g. the
+    // synthetic "+ New character" row at chars.len()) → None, which
+    // leaves the backdrop on whatever zone was last loaded.
+    let hovered: Option<u16> = cursor
+        .as_deref()
+        .and_then(|c| chars.0.get(c.0))
+        .and_then(slot_zone_for_backdrop);
 
     // Track changes to the hovered target. Each new target resets
     // the elapsed timer; only commit once it's been stable for

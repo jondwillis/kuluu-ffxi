@@ -24,10 +24,12 @@
 //! clear of the model.
 
 use bevy::prelude::*;
+use bevy::render::view::RenderLayers;
 use ffxi_client::lobby_client::CharSlot;
 use ffxi_viewer_core::dat_vos2::spawn_equipped;
 
 use super::{char_list::CharCursor, CharListData};
+use crate::view_native::launcher_backdrop::PREVIEW_RENDER_LAYER;
 
 /// Root marker for everything spawned by the preview scene —
 /// camera, lighting, character parent. One despawn-tree under this
@@ -92,6 +94,11 @@ pub(super) fn spawn_preview(
             order: -1, // behind UI (UI defaults to 0/+1)
             ..default()
         },
+        // Render only PC-preview entities, not the backdrop zone.
+        // Without this, the camera would also see the loaded La
+        // Theine geometry (which the backdrop loads into world space)
+        // and the PC would be visually buried under terrain.
+        RenderLayers::layer(PREVIEW_RENDER_LAYER),
         Transform::from_translation(PREVIEW_PARENT_POS + PREVIEW_CAMERA_OFFSET)
             .looking_at(PREVIEW_PARENT_POS + PREVIEW_LOOK_AT_OFFSET, Vec3::Y),
         ChildOf(root),
@@ -163,6 +170,36 @@ pub(super) fn spawn_preview(
         commands.insert_resource(PreviewedSlot {
             char_id: Some(slot.char_id),
         });
+    }
+}
+
+/// Tag every mesh spawned under `CharPreviewParent` (transitively)
+/// with the preview render layer. `spawn_equipped` returns only a
+/// count, so we can't insert RenderLayers at spawn time — instead
+/// observe `OnAdd, Mesh3d` and walk up the `ChildOf` chain to decide
+/// whether the new mesh belongs to our preview subtree. Without
+/// this, baked PC meshes would render on the default backdrop layer
+/// and clip through zone terrain.
+pub(super) fn tag_preview_meshes(
+    trigger: On<Add, Mesh3d>,
+    parents: Query<&ChildOf>,
+    preview_parents: Query<(), With<CharPreviewParent>>,
+    mut commands: Commands,
+) {
+    let entity = trigger.entity;
+    let mut cur = entity;
+    loop {
+        let Ok(child_of) = parents.get(cur) else {
+            return;
+        };
+        let parent = child_of.parent();
+        if preview_parents.contains(parent) {
+            commands
+                .entity(entity)
+                .insert(RenderLayers::layer(PREVIEW_RENDER_LAYER));
+            return;
+        }
+        cur = parent;
     }
 }
 

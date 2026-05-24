@@ -34,7 +34,7 @@ pub(super) struct CharRowText {
 /// Tracks which row the keyboard cursor is on. Range: 0..=chars.len()
 /// (the last index is the "+ New character" row).
 #[derive(Resource, Default)]
-pub(super) struct CharCursor(pub usize);
+pub(crate) struct CharCursor(pub usize);
 
 pub(super) fn spawn_char_list_ui(
     mut commands: Commands,

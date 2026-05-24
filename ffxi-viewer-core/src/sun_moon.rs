@@ -335,16 +335,27 @@ pub fn sun_color_for_hour(hour: f32, sun_altitude: f32) -> (Color, f32) {
     // Normalized "elevation" 0..1: 0 at rise/set, 1 at noon.
     let elev = (sun_altitude / (PI / 2.0)).clamp(0.0, 1.0);
 
-    // Dawn warmth window (06–08) and dusk warmth window (16–18). Mid
-    // day is white. Curve picks "warmth" by distance from noon.
-    let warm = (1.0 - elev).powf(2.0); // 1 at horizon, 0 at noon.
+    // Twilight band — instead of fading warmth by elevation (which gives
+    // a peach-colored sun for half of the daylight hours), key warmth to
+    // *hour distance from the nearest horizon crossing*. This gives a
+    // narrow but strongly-tinted dawn/dusk band (~3 V-hours either side
+    // of sunrise/sunset) and a clean white midday. Matches retail's
+    // dramatic horizon-warm look and gives the dawn sun a real orange
+    // glow instead of a faint cream wash.
+    let band = 3.0_f32; // V-hours of twilight on each side of horizon.
+    let dist_from_horizon = (hour - 6.0).min(18.0 - hour).max(0.0);
+    let raw = ((band - dist_from_horizon) / band).clamp(0.0, 1.0);
+    // Smoothstep so warmth ramps in gently instead of stair-stepping.
+    let warm = raw * raw * (3.0 - 2.0 * raw);
+
     let near_dusk = hour > 12.0; // bias to red sunset, not gold dawn
     let (r, g, b) = if near_dusk {
-        // Dusk: ramps toward deep red/orange.
-        (1.0, 1.0 - 0.55 * warm, 1.0 - 0.85 * warm)
+        // Dusk: deep blood-red horizon (g down to 0.20, b down to 0.05).
+        (1.0, 1.0 - 0.80 * warm, 1.0 - 0.95 * warm)
     } else {
-        // Dawn: gentler, more gold than red.
-        (1.0, 1.0 - 0.35 * warm, 1.0 - 0.65 * warm)
+        // Dawn: still strong orange but slightly less red than dusk
+        // (atmospheric haze is thinner in the morning IRL).
+        (1.0, 1.0 - 0.65 * warm, 1.0 - 0.85 * warm)
     };
     // Illuminance peaks at noon (~10k lux), drops to ~1.5k at horizon.
     let lux = 1500.0 + 8500.0 * elev;
@@ -678,14 +689,23 @@ pub fn sun_moon_system(
     if let Some(handles) = materials_handle.as_deref() {
         if let Some(sun_mat) = materials.get_mut(&handles.sun) {
             let visible = sky.sun_altitude.max(-0.2);
-            // Below horizon: dim the disc but don't fully kill it (a
-            // faint glow on the horizon at twilight reads as "sun just
-            // set").
-            let intensity = if visible > 0.0 {
-                8.0 + 14.0 * (visible / (PI / 2.0))
+            // Disc intensity: drop hard at horizon so the red/orange
+            // tint survives the HDR tonemap instead of saturating to
+            // white. Real atmospheric extinction makes the horizon sun
+            // visibly dimmer than the noon sun — eye-safe to look at,
+            // even. Curve: ~2.0 at horizon, ~22 at noon. √-elev gives a
+            // soft early ramp so the rise is dramatic, then settles.
+            let elev_norm = (visible / (PI / 2.0)).clamp(0.0, 1.0);
+            let mut intensity = if visible > 0.0 {
+                2.0 + 20.0 * elev_norm.sqrt()
             } else {
                 (1.0 + 5.0 * (visible + 0.2) / 0.2).max(0.0)
             };
+            // /sky dimming gates the extra horizon extinction; if off,
+            // restore the old uniform intensity so this knob is honest.
+            if !sky_realism.horizon_dimming && visible > 0.0 {
+                intensity = 8.0 + 14.0 * elev_norm;
+            }
             let c = sun_color.to_linear();
             sun_mat.base_color = Color::linear_rgb(
                 c.red * intensity,

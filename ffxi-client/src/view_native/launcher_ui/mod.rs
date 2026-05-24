@@ -52,7 +52,7 @@ mod async_work;
 mod change_password;
 mod char_create;
 mod char_create_preview;
-mod char_list;
+pub(crate) mod char_list;
 mod char_preview;
 mod login;
 mod server_edit;

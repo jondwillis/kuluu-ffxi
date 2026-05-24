@@ -204,7 +204,16 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         .insert_resource(bevy::feathers::theme::UiTheme(
             bevy::feathers::dark_theme::create_dark_theme(),
         ))
-        .add_plugins(widgets::TextFieldPlugin);
+        .add_plugins(widgets::WidgetsPlugin);
+
+    // Smoke demo: spawn a couple of TextFields + a feathers Button so a
+    // follow-up agent can sanity-check the widget runtime before rewriting
+    // the real launcher screens. Gated on an env var to avoid touching the
+    // launcher state machine for a dev-only path. Overlays the launcher,
+    // doesn't replace it.
+    if std::env::var_os("FFXI_WIDGET_DEMO").is_some() {
+        app.add_systems(Startup, widgets::spawn_widget_demo);
+    }
 
     // Top-level phase. Launcher is the default starting phase regardless
     // of direct mode — direct-mode auto-advance happens via the

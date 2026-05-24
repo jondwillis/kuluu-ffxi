@@ -182,7 +182,18 @@ pub fn apply_zone_weather(
         // blowing out the volumetric pass. Floor at 0.04 keeps
         // the cleanest-sky keyframes from going invisible.
         let dist = rec.max_fog_dist_landscape.max(50.0);
-        fog.density_factor = (15.0 / dist).clamp(0.04, 0.18);
+        let mut density = (15.0 / dist).clamp(0.04, 0.18);
+        // Twilight god-ray boost: thicken the fog within ±3 V-hours
+        // of sunrise/sunset so volumetric-light shafts catch through
+        // buildings and trees the way real low-sun haze produces
+        // crepuscular rays. Falls back to the base weather density
+        // through the rest of the day.
+        let band = 3.0_f32;
+        let dist_from_horizon = (sky.hour - 6.0).min(18.0 - sky.hour).max(0.0);
+        let twilight = ((band - dist_from_horizon) / band).clamp(0.0, 1.0);
+        let twilight_smooth = twilight * twilight * (3.0 - 2.0 * twilight);
+        density = (density * (1.0 + 1.2 * twilight_smooth)).min(0.30);
+        fog.density_factor = density;
     }
 
     // Ambient: keep the hue from the weather record but scale
