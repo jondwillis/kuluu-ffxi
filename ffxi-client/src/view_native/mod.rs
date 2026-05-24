@@ -27,6 +27,7 @@ pub mod debug_heights;
 pub mod input;
 pub mod launcher_backdrop;
 pub mod launcher_ui;
+pub mod model_viewer;
 pub mod nameplate_occlude;
 pub mod navmesh_overlay;
 pub mod screenshot;

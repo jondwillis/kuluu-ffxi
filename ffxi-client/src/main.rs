@@ -166,6 +166,12 @@ enum Command {
         password: Option<String>,
         char_name: Option<String>,
     },
+    /// Standalone model viewer. Opens a Bevy window with a 3D preview
+    /// and form controls for inspecting arbitrary PC race/face/equipment
+    /// combos and NPC model_ids with animation playback. Bypasses auth /
+    /// lobby / map entirely — only the local DAT install is read.
+    #[cfg(feature = "native-window")]
+    ModelViewer,
 }
 
 fn main() -> Result<()> {
@@ -208,6 +214,10 @@ fn main() -> Result<()> {
     #[cfg(feature = "native-window")]
     if matches!(args.command, Command::Native { .. }) {
         return run_native_main_thread(&rt, args, auth);
+    }
+    #[cfg(feature = "native-window")]
+    if matches!(args.command, Command::ModelViewer) {
+        return run_model_viewer_main_thread(args);
     }
 
     rt.block_on(async move { run_command_async(args, auth).await })
@@ -648,6 +658,13 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                  it must not reach the tokio runtime body"
             );
         }
+        #[cfg(feature = "native-window")]
+        Command::ModelViewer => {
+            unreachable!(
+                "ModelViewer is dispatched on the main thread by \
+                 run_model_viewer_main_thread; it must not reach the tokio runtime body"
+            );
+        }
         Command::Lobby {
             user,
             password,
@@ -773,6 +790,13 @@ fn run_native_main_thread(
         dat_root,
     })
     .context("native viewer")
+}
+
+#[cfg(feature = "native-window")]
+fn run_model_viewer_main_thread(args: Args) -> Result<()> {
+    let dat_root = resolve_dat_root(args.require_dat)?;
+    view_native::model_viewer::run(view_native::model_viewer::ModelViewerArgs { dat_root })
+        .context("model viewer")
 }
 
 fn hex(b: &[u8]) -> String {

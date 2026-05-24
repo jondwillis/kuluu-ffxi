@@ -324,6 +324,7 @@ fn do_rebake(
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
     tracked: &mut TrackedEntities,
+    npc_loads: &mut MessageWriter<LoadVos2Request>,
     mode: ViewerMode,
     pc: &PcForm,
     npc: NpcForm,
@@ -387,14 +388,12 @@ fn do_rebake(
                 );
             }
             for chunk_idx in chunks {
-                commands.queue(move |world: &mut World| {
-                    world.send_message(LoadVos2Request {
-                        file_id: dat_id,
-                        chunk_idx,
-                        entity_id: PREVIEW_ENTITY_ID,
-                        race: 0,
-                        skeleton_file_id: Some(dat_id),
-                    });
+                npc_loads.write(LoadVos2Request {
+                    file_id: dat_id,
+                    chunk_idx,
+                    entity_id: PREVIEW_ENTITY_ID,
+                    race: 0,
+                    skeleton_file_id: Some(dat_id),
                 });
             }
             Some(dat_id)
@@ -457,6 +456,7 @@ fn debounced_rebake(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut tracked: ResMut<TrackedEntities>,
+    mut npc_loads: MessageWriter<LoadVos2Request>,
     mut clip_list: ResMut<ClipList>,
     mut state: ResMut<RebakeState>,
     mode: Res<ViewerMode>,
@@ -484,6 +484,7 @@ fn debounced_rebake(
         &mut materials,
         &mut images,
         &mut tracked,
+        &mut npc_loads,
         *mode,
         &pc,
         *npc,
