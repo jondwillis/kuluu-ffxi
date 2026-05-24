@@ -101,35 +101,59 @@ pub(super) fn spawn_preview(
         RenderLayers::layer(PREVIEW_RENDER_LAYER),
         Transform::from_translation(PREVIEW_PARENT_POS + PREVIEW_CAMERA_OFFSET)
             .looking_at(PREVIEW_PARENT_POS + PREVIEW_LOOK_AT_OFFSET, Vec3::Y),
+        // Per-camera AmbientLight component overrides the global
+        // resource just for this camera — pumping the global to fix
+        // dark HXI textures would also wash out the backdrop zone.
+        AmbientLight {
+            color: Color::srgb(0.88, 0.90, 1.0),
+            brightness: 2_500.0,
+            ..default()
+        },
         ChildOf(root),
     ));
 
-    // Three-point lighting: key from front-right, fill from back-
-    // left, ambient floor. Tuned to keep the dark equipment
-    // textures legible without blowing out the highlights.
+    // Three-point lighting. Key on the camera side (+Z) so the
+    // model's face — which `bind_to_bevy` flips to face +Z toward
+    // the camera — actually gets lit. The old setup put the key at
+    // z=3 between camera (z=3.5) and parent (z=0), which lit the
+    // model's right shoulder more than the front; HXI's dark
+    // ascetic-armor textures swallowed everything. RenderLayers
+    // pins each light to the preview layer so they don't leak into
+    // the backdrop zone's render pass.
     commands.spawn((
         DirectionalLight {
-            illuminance: 8_000.0,
+            illuminance: 15_000.0,
             shadows_enabled: false,
             ..default()
         },
-        Transform::from_xyz(2.0, 4.0, 3.0).looking_at(PREVIEW_PARENT_POS, Vec3::Y),
+        RenderLayers::layer(PREVIEW_RENDER_LAYER),
+        Transform::from_translation(PREVIEW_PARENT_POS + Vec3::new(1.5, 3.0, 5.0))
+            .looking_at(PREVIEW_PARENT_POS + Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
         ChildOf(root),
     ));
     commands.spawn((
         DirectionalLight {
-            illuminance: 3_000.0,
+            illuminance: 7_000.0,
             shadows_enabled: false,
             ..default()
         },
-        Transform::from_xyz(-2.0, 2.0, -2.0).looking_at(PREVIEW_PARENT_POS, Vec3::Y),
+        RenderLayers::layer(PREVIEW_RENDER_LAYER),
+        Transform::from_translation(PREVIEW_PARENT_POS + Vec3::new(-2.5, 2.0, 3.0))
+            .looking_at(PREVIEW_PARENT_POS + Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
         ChildOf(root),
     ));
-    commands.insert_resource(AmbientLight {
-        color: Color::srgb(0.85, 0.88, 1.0),
-        brightness: 200.0,
-        ..default()
-    });
+    // Rim light from behind to separate the model from the backdrop.
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 4_000.0,
+            shadows_enabled: false,
+            ..default()
+        },
+        RenderLayers::layer(PREVIEW_RENDER_LAYER),
+        Transform::from_translation(PREVIEW_PARENT_POS + Vec3::new(0.0, 2.5, -3.0))
+            .looking_at(PREVIEW_PARENT_POS + Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
+        ChildOf(root),
+    ));
 
     // The parent entity the equipment meshes will attach under.
     // Survives cursor-change refreshes; only its children get

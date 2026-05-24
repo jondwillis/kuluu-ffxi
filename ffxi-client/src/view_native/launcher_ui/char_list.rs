@@ -87,14 +87,57 @@ pub(super) fn spawn_char_list_ui(
                     } else {
                         ButtonVariant::Normal
                     };
-                    panel
-                        .spawn(button(
-                            ButtonProps {
-                                variant,
-                                ..default()
-                            },
+                    panel.spawn(row()).with_children(|r| {
+                        // Wrapper grows so the per-row [x] sits flush
+                        // right. See feedback memory: feathers' button
+                        // panics on a Node override, so layout goes on
+                        // an outer Node wrapper.
+                        r.spawn(Node {
+                            flex_grow: 1.0,
+                            flex_direction: FlexDirection::Row,
+                            ..default()
+                        })
+                        .with_children(|wrap| {
+                            wrap.spawn(button(
+                                ButtonProps {
+                                    variant,
+                                    ..default()
+                                },
+                                (),
+                                Spawn((Text::new(label), ThemedText)),
+                            ))
+                            .observe(
+                                move |_ev: On<Activate>,
+                                      chars: Res<CharListData>,
+                                      mut cursor: ResMut<CharCursor>,
+                                      mut sel: ResMut<SelectedChar>,
+                                      mut next: ResMut<NextState<LauncherState>>| {
+                                    cursor.0 = idx;
+                                    if let Some(slot) = chars.0.get(idx).cloned() {
+                                        sel.0 = Some(slot);
+                                        next.set(LauncherState::ConnectInFlight);
+                                    }
+                                },
+                            )
+                            .observe(
+                                move |_ev: On<Pointer<Over>>, mut cursor: ResMut<CharCursor>| {
+                                    if cursor.0 != idx {
+                                        cursor.0 = idx;
+                                    }
+                                },
+                            );
+                        });
+
+                        // Per-row delete — goes straight to the
+                        // existing CharDeleteConfirm state, which IS
+                        // the confirm step. No arm-then-confirm
+                        // needed here (unlike ServerSelect's inline x)
+                        // since the dedicated confirm screen already
+                        // gates the destructive action.
+                        r.spawn(button(
+                            ButtonProps::default(),
                             (),
-                            Spawn((Text::new(label), ThemedText)),
+                            Spawn((Text::new("×"), ThemedText)),
                         ))
                         .observe(
                             move |_ev: On<Activate>,
@@ -105,17 +148,11 @@ pub(super) fn spawn_char_list_ui(
                                 cursor.0 = idx;
                                 if let Some(slot) = chars.0.get(idx).cloned() {
                                     sel.0 = Some(slot);
-                                    next.set(LauncherState::ConnectInFlight);
-                                }
-                            },
-                        )
-                        .observe(
-                            move |_ev: On<Pointer<Over>>, mut cursor: ResMut<CharCursor>| {
-                                if cursor.0 != idx {
-                                    cursor.0 = idx;
+                                    next.set(LauncherState::CharDeleteConfirm);
                                 }
                             },
                         );
+                    });
                 }
 
                 panel.spawn(row()).with_children(|r| {
@@ -133,26 +170,6 @@ pub(super) fn spawn_char_list_ui(
                               mut next: ResMut<NextState<LauncherState>>| {
                             cursor.0 = new_char_index;
                             next.set(LauncherState::CharCreate);
-                        },
-                    );
-
-                    r.spawn(button(
-                        ButtonProps::default(),
-                        (),
-                        Spawn((Text::new("Delete selected"), ThemedText)),
-                    ))
-                    .observe(
-                        move |_ev: On<Activate>,
-                              chars: Res<CharListData>,
-                              cursor: Res<CharCursor>,
-                              mut sel: ResMut<SelectedChar>,
-                              mut next: ResMut<NextState<LauncherState>>| {
-                            if cursor.0 < chars.0.len() {
-                                if let Some(slot) = chars.0.get(cursor.0).cloned() {
-                                    sel.0 = Some(slot);
-                                    next.set(LauncherState::CharDeleteConfirm);
-                                }
-                            }
                         },
                     );
 

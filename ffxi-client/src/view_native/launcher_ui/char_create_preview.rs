@@ -110,28 +110,49 @@ fn spawn_preview(
         RenderLayers::layer(PREVIEW_RENDER_LAYER),
         Transform::from_translation(PREVIEW_PARENT_POS + PREVIEW_CAMERA_OFFSET)
             .looking_at(PREVIEW_PARENT_POS + PREVIEW_LOOK_AT_OFFSET, Vec3::Y),
+        // Per-camera ambient — avoids washing out the backdrop.
+        AmbientLight {
+            color: Color::srgb(0.88, 0.90, 1.0),
+            brightness: 2_500.0,
+            ..default()
+        },
         ChildOf(root),
     ));
 
-    // Neutral key + fill — the launcher can run before any zone
-    // (and thus any sun system) exists, so don't rely on world
-    // lighting. Match char_preview's three-point tuning.
+    // Key + fill + rim, all pinned to the preview render layer. See
+    // char_preview.rs for the geometry reasoning: model faces +Z
+    // (toward camera), so the key needs to come from the +Z side.
     commands.spawn((
         DirectionalLight {
-            illuminance: 8_000.0,
+            illuminance: 15_000.0,
             shadows_enabled: false,
             ..default()
         },
-        Transform::from_xyz(2.0, 4.0, 3.0).looking_at(PREVIEW_PARENT_POS, Vec3::Y),
+        RenderLayers::layer(PREVIEW_RENDER_LAYER),
+        Transform::from_translation(PREVIEW_PARENT_POS + Vec3::new(1.5, 3.0, 5.0))
+            .looking_at(PREVIEW_PARENT_POS + Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
         ChildOf(root),
     ));
     commands.spawn((
         DirectionalLight {
-            illuminance: 3_000.0,
+            illuminance: 7_000.0,
             shadows_enabled: false,
             ..default()
         },
-        Transform::from_xyz(-2.0, 2.0, -2.0).looking_at(PREVIEW_PARENT_POS, Vec3::Y),
+        RenderLayers::layer(PREVIEW_RENDER_LAYER),
+        Transform::from_translation(PREVIEW_PARENT_POS + Vec3::new(-2.5, 2.0, 3.0))
+            .looking_at(PREVIEW_PARENT_POS + Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
+        ChildOf(root),
+    ));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 4_000.0,
+            shadows_enabled: false,
+            ..default()
+        },
+        RenderLayers::layer(PREVIEW_RENDER_LAYER),
+        Transform::from_translation(PREVIEW_PARENT_POS + Vec3::new(0.0, 2.5, -3.0))
+            .looking_at(PREVIEW_PARENT_POS + Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
         ChildOf(root),
     ));
 
