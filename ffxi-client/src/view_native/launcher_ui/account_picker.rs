@@ -69,42 +69,49 @@ pub(super) fn spawn_ui(
                     panel.spawn(row()).with_children(|r| {
                         let pick_user = user.clone();
                         let pick_server = server_for_obs.clone();
-                        r.spawn(button(
-                            ButtonProps {
-                                variant,
-                                ..default()
-                            },
-                            Node {
-                                flex_grow: 1.0,
-                                ..default()
-                            },
-                            Spawn((Text::new(label), ThemedText)),
-                        ))
-                        .observe(
-                            move |_ev: On<Activate>,
-                                  mut cursor: ResMut<AccountPickerCursor>,
-                                  mut login: ResMut<LoginForm>,
-                                  mut next: ResMut<NextState<LauncherState>>| {
-                                cursor.0 = idx;
-                                login.user = pick_user.clone();
-                                login.pass.clear();
-                                login.remember_password = remember;
-                                if remember {
-                                    if let Some(pw) = SecretStore::get(
-                                        KEYRING_SERVICE,
-                                        &keyring_account_key(&pick_server, &pick_user),
-                                    ) {
-                                        login.pass = pw;
+                        // Wrapper grows so the per-row [Forget] sits
+                        // flush right. See server_select.rs for why we
+                        // can't pass Node directly into `button(...)`.
+                        r.spawn(Node {
+                            flex_grow: 1.0,
+                            flex_direction: FlexDirection::Row,
+                            ..default()
+                        })
+                        .with_children(|wrap| {
+                            wrap.spawn(button(
+                                ButtonProps {
+                                    variant,
+                                    ..default()
+                                },
+                                (),
+                                Spawn((Text::new(label), ThemedText)),
+                            ))
+                            .observe(
+                                move |_ev: On<Activate>,
+                                      mut cursor: ResMut<AccountPickerCursor>,
+                                      mut login: ResMut<LoginForm>,
+                                      mut next: ResMut<NextState<LauncherState>>| {
+                                    cursor.0 = idx;
+                                    login.user = pick_user.clone();
+                                    login.pass.clear();
+                                    login.remember_password = remember;
+                                    if remember {
+                                        if let Some(pw) = SecretStore::get(
+                                            KEYRING_SERVICE,
+                                            &keyring_account_key(&pick_server, &pick_user),
+                                        ) {
+                                            login.pass = pw;
+                                        }
                                     }
-                                }
-                                login.focus = if login.pass.is_empty() {
-                                    LoginField::Password
-                                } else {
-                                    LoginField::User
-                                };
-                                next.set(LauncherState::Login);
-                            },
-                        );
+                                    login.focus = if login.pass.is_empty() {
+                                        LoginField::Password
+                                    } else {
+                                        LoginField::User
+                                    };
+                                    next.set(LauncherState::Login);
+                                },
+                            );
+                        });
 
                         let forget_user = user.clone();
                         let forget_server = server_for_obs.clone();

@@ -62,34 +62,45 @@ pub(super) fn spawn_ui(
 
                     panel.spawn(row()).with_children(|r| {
                         let pick_name = server_name.clone();
-                        r.spawn(button(
-                            ButtonProps {
-                                variant,
-                                ..default()
-                            },
-                            Node {
-                                flex_grow: 1.0,
-                                ..default()
-                            },
-                            Spawn((Text::new(label), ThemedText)),
-                        ))
-                        .observe(
-                            move |_ev: On<Activate>,
-                                  mut commands: Commands,
-                                  mut cursor: ResMut<ServerSelectCursor>,
-                                  mut form: ResMut<ServerSelectForm>,
-                                  mut next: ResMut<NextState<LauncherState>>| {
-                                cursor.0 = idx;
-                                form.selected = Some(pick_name.clone());
-                                let store = launcher_store::load();
-                                if let Some(profile) =
-                                    store.servers.iter().find(|p| p.name == pick_name)
-                                {
-                                    super::apply_server_profile(&mut commands, profile);
-                                }
-                                next.set(LauncherState::AccountPicker);
-                            },
-                        );
+                        // Wrapper grows to consume row slack so the
+                        // contextual [Edit] [x] buttons sit flush
+                        // right. We can't pass Node directly into
+                        // `button(props, overrides, children)` — the
+                        // button bundle already carries its own Node
+                        // and Bevy panics on duplicate components in
+                        // a merged bundle.
+                        r.spawn(Node {
+                            flex_grow: 1.0,
+                            flex_direction: FlexDirection::Row,
+                            ..default()
+                        })
+                        .with_children(|wrap| {
+                            wrap.spawn(button(
+                                ButtonProps {
+                                    variant,
+                                    ..default()
+                                },
+                                (),
+                                Spawn((Text::new(label), ThemedText)),
+                            ))
+                            .observe(
+                                move |_ev: On<Activate>,
+                                      mut commands: Commands,
+                                      mut cursor: ResMut<ServerSelectCursor>,
+                                      mut form: ResMut<ServerSelectForm>,
+                                      mut next: ResMut<NextState<LauncherState>>| {
+                                    cursor.0 = idx;
+                                    form.selected = Some(pick_name.clone());
+                                    let store = launcher_store::load();
+                                    if let Some(profile) =
+                                        store.servers.iter().find(|p| p.name == pick_name)
+                                    {
+                                        super::apply_server_profile(&mut commands, profile);
+                                    }
+                                    next.set(LauncherState::AccountPicker);
+                                },
+                            );
+                        });
 
                         let edit_name = server_name.clone();
                         r.spawn(button(
