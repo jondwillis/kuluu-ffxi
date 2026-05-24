@@ -1002,9 +1002,12 @@ fn decide_initial_screen(
             return;
         }
     }
-    if !store.servers.is_empty() {
-        next.set(LauncherState::ServerSelect);
-    }
+    // No CLI overrides + no matching last_used → always go through
+    // ServerSelect. An empty server list is fine: ServerSelect's
+    // Ctrl-N escape into ServerEdit is the only way to add the first
+    // entry, so gating this on `!servers.is_empty()` would strand a
+    // fresh install with no path to a server.
+    next.set(LauncherState::ServerSelect);
 }
 
 /// Direct-mode helper: if creds are prefilled and `DirectModeAutostart`

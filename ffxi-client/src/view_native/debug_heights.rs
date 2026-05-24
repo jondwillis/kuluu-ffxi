@@ -49,7 +49,7 @@ pub fn process_debug_heights(
     collision_geom: Res<MzbCollisionGeometry>,
     self_q: Query<(&Transform, &WorldEntity, Option<&BakedActor>), With<IsSelf>>,
     scene_state: Res<SceneState>,
-    mut toasts: EventWriter<ffxi_viewer_core::snapshot::ToastEvent>,
+    mut toasts: MessageWriter<ffxi_viewer_core::snapshot::ToastEvent>,
 ) {
     if events.is_empty() {
         return;

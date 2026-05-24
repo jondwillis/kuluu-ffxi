@@ -129,7 +129,7 @@ fn toggle_navmesh_overlay(
     keys: Res<ButtonInput<KeyCode>>,
     mode: Res<InputMode>,
     mut visible: ResMut<NavmeshOverlayVisible>,
-    mut toasts: EventWriter<ToastEvent>,
+    mut toasts: MessageWriter<ToastEvent>,
 ) {
     if !matches!(*mode, InputMode::World) {
         return;

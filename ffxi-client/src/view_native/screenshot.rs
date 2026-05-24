@@ -36,7 +36,7 @@ pub struct ScreenshotRequest {
 pub fn process_screenshot_requests(
     mut events: MessageReader<ScreenshotRequest>,
     mut commands: Commands,
-    mut toasts: EventWriter<ToastEvent>,
+    mut toasts: MessageWriter<ToastEvent>,
 ) {
     for req in events.read() {
         let path = req.path.clone();

@@ -186,7 +186,7 @@ pub(super) fn tag_preview_meshes(
     preview_parents: Query<(), With<CharPreviewParent>>,
     mut commands: Commands,
 ) {
-    let entity = trigger.target();
+    let entity = trigger.event().event_target();
     let mut cur = entity;
     loop {
         let Ok(child_of) = parents.get(cur) else {
