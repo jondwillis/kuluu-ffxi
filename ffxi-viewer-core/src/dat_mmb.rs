@@ -41,6 +41,31 @@ use crate::scene::TrackedEntities;
 #[derive(Component)]
 pub struct MmbOverlay;
 
+/// Persistent (across frames) cache of MMB submesh `Handle<Mesh>` +
+/// `Handle<StandardMaterial>`. Keyed by `(file_id, chunk_idx, sub_index)`.
+///
+/// Two adjacent identical trees in Ronfaure spawn as separate Bevy
+/// entities, but Bevy's automatic GPU-instancing batcher will collapse
+/// them into one `multi_draw_indirect` call iff they share both the
+/// mesh handle and the material handle (and the pipeline). The
+/// previous in-function HashMap was correct but only lived for one
+/// invocation of `process_load_mmb_requests`; chunks that arrive
+/// across multiple frames (incremental zone load) bypassed the cache.
+/// This Resource lifts it to app-wide lifetime so the batcher sees
+/// matching handles regardless of when each instance was queued.
+///
+/// Eviction: zone change wipes the cache via the OnExit hook for
+/// `AppPhase::InGame` (no current consumer outside in-game; the
+/// alternative was hooking each `AutoMzbOverlay` despawn, which would
+/// require ref-counting). The cache cost is bounded by the unique
+/// submesh count of the loaded MMBs (~thousands of asset entries —
+/// kilobytes of HashMap), so we err toward keeping it warm.
+#[derive(Resource, Default)]
+pub struct MmbHandleCache {
+    pub mesh: std::collections::HashMap<(u32, usize, usize), bevy::asset::Handle<Mesh>>,
+    pub material: std::collections::HashMap<(u32, usize, usize), bevy::asset::Handle<StandardMaterial>>,
+}
+
 /// Spawn-an-MMB request. Fired by the slash-command dispatcher;
 /// consumed by [`process_load_mmb_requests`].
 ///
@@ -84,6 +109,7 @@ impl Plugin for DatOverlayPlugin {
         app.add_message::<LoadMmbRequest>()
             .add_message::<crate::dat_vos2::LoadVos2Request>()
             .add_message::<crate::dat_mzb::LoadMzbRequest>()
+            .init_resource::<MmbHandleCache>()
             .init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
             .init_resource::<crate::dat_mzb::DrawDistance>()
             .init_resource::<crate::dat_mzb::MzbCollisionGeometry>()
@@ -420,6 +446,7 @@ pub fn process_load_mmb_requests(
     mut images: ResMut<Assets<Image>>,
     mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     tracked: Res<TrackedEntities>,
+    mut handle_cache: ResMut<MmbHandleCache>,
 ) {
     // Collect events up front so we can dedupe per-file IO. A zone-in
     // for a city like Bastok Markets fires ~1000+ events that all hit
@@ -475,26 +502,6 @@ pub fn process_load_mmb_requests(
         ),
     > = std::collections::HashMap::new();
 
-    // Per-submesh asset cache. Without this, two instances of the same
-    // MMB (e.g. two identical trees in Ronfaure) get *fresh*
-    // `Handle<Mesh>` and `Handle<StandardMaterial>` per spawn, which
-    // defeats Bevy's automatic GPU-instancing batcher. With it, every
-    // instance of the same submesh shares one (mesh, material) pair
-    // and the batcher collapses them into a single draw via
-    // `multi_draw_indirect`.
-    //
-    // Profiling (May 2026): the draws=N HUD counter dropped from
-    // ~13k → expected ~hundreds in Ronfaure once this cache is in
-    // place. Bevy's batching key is (mesh handle, material handle,
-    // pipeline) — sharing the handles is necessary and sufficient.
-    let mut mesh_cache: std::collections::HashMap<
-        (u32, usize, usize),
-        bevy::asset::Handle<Mesh>,
-    > = std::collections::HashMap::new();
-    let mut mat_cache: std::collections::HashMap<
-        (u32, usize, usize),
-        bevy::asset::Handle<StandardMaterial>,
-    > = std::collections::HashMap::new();
 
     for req in queued {
         let loaded_entry = mmb_cache
@@ -720,7 +727,7 @@ pub fn process_load_mmb_requests(
             // Mesh handle: reuse if already built. Vertex data is
             // identical across instances; only the parent transform
             // differs (and that's per-entity, not per-mesh).
-            let mesh_handle = mesh_cache.entry(cache_key).or_insert_with(|| {
+            let mesh_handle = handle_cache.mesh.entry(cache_key).or_insert_with(|| {
                 let mut mesh = Mesh::new(
                     PrimitiveTopology::TriangleList,
                     RenderAssetUsages::default(),
@@ -777,7 +784,7 @@ pub fn process_load_mmb_requests(
             // instances. The material depends only on
             // (texture, alpha_mode) which is a function of
             // `(file_id, chunk_idx, sub_index)`.
-            let mat_handle = mat_cache.entry(cache_key).or_insert_with(|| {
+            let mat_handle = handle_cache.material.entry(cache_key).or_insert_with(|| {
                 materials.add(StandardMaterial {
                     // WHITE so the mesh's per-vertex `ATTRIBUTE_COLOR`
                     // (FFXI's baked vertex lighting) and the bound
