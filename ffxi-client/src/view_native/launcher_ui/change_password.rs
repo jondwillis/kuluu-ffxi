@@ -8,7 +8,7 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use super::common::{hint, panel_node, row, screen_root, spawn_server_chip, title};
+use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
 use crate::view_native::widgets::text_field::text_field;
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
@@ -33,7 +33,11 @@ pub(super) fn spawn_ui(
     commands
         .spawn((ChangePasswordRoot, screen_root()))
         .with_children(|root| {
-            spawn_server_chip(root, &server);
+            spawn_breadcrumb(
+                root,
+                &server,
+                &[Crumb::Sign(None), Crumb::Other("Change password".to_string())],
+            );
             root.spawn(panel_node(480.0)).with_children(|panel| {
                 panel.spawn(title("Change password"));
                 panel.spawn(hint("Tab cycles fields. Esc cancels."));

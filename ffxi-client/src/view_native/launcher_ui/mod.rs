@@ -85,10 +85,11 @@ pub(crate) fn apply_server_profile(commands: &mut Commands, profile: &ServerProf
         AuthFlavorKind::Json => AuthFlavor::Json,
         AuthFlavorKind::Binary => AuthFlavor::Binary,
     };
-    let auth = Arc::new(AuthClient::with_flavor(
+    let auth = Arc::new(AuthClient::with_flavor_and_version(
         profile.host.clone(),
         profile.auth_port,
         flavor,
+        profile.xiloader_version.as_deref(),
     ));
     let lobby = Arc::new(LobbyClient::new(
         profile.host.clone(),
@@ -346,6 +347,7 @@ pub(crate) enum ServerEditField {
     DataPort,
     ViewPort,
     Flavor,
+    XiloaderVersion,
 }
 
 #[allow(dead_code)]
@@ -357,7 +359,8 @@ impl ServerEditField {
             Self::AuthPort => Self::DataPort,
             Self::DataPort => Self::ViewPort,
             Self::ViewPort => Self::Flavor,
-            Self::Flavor => Self::Name,
+            Self::Flavor => Self::XiloaderVersion,
+            Self::XiloaderVersion => Self::Name,
         }
     }
 }
@@ -387,6 +390,9 @@ pub(crate) struct ServerEditForm {
     pub data_port: String,
     pub view_port: String,
     pub flavor: ffxi_client::launcher_store::AuthFlavorKind,
+    /// Empty string means "inherit the global default". Saved as `None`
+    /// in [`ServerProfile`]; populated otherwise.
+    pub xiloader_version: String,
     #[allow(dead_code)]
     pub focus: ServerEditField,
     pub editing_index: Option<usize>,
@@ -401,6 +407,7 @@ impl Default for ServerEditForm {
             data_port: String::from("54230"),
             view_port: String::from("54001"),
             flavor: ffxi_client::launcher_store::AuthFlavorKind::Json,
+            xiloader_version: String::new(),
             focus: ServerEditField::default(),
             editing_index: None,
         }
@@ -416,6 +423,7 @@ impl ServerEditForm {
             data_port: p.data_port.to_string(),
             view_port: p.view_port.to_string(),
             flavor: p.flavor,
+            xiloader_version: p.xiloader_version.clone().unwrap_or_default(),
             focus: ServerEditField::default(),
             editing_index: None,
         }
@@ -709,6 +717,7 @@ pub(crate) fn register(
         .insert_resource(CreateAccountErrorMsg::default())
         .insert_resource(ServerSelectForm::default())
         .insert_resource(ServerSelectCursor::default())
+        .insert_resource(server_select::PendingServerDelete::default())
         .insert_resource(AccountPickerCursor::default())
         .insert_resource(ServerEditForm::default())
         .insert_resource(ChangePasswordForm::default())

@@ -34,6 +34,13 @@ pub struct ServerProfile {
     pub data_port: u16,
     pub view_port: u16,
     pub flavor: AuthFlavorKind,
+    /// Per-server xiloader version override (e.g. `"2.0.0"`). `None`
+    /// inherits the global precedence chain handled by
+    /// `auth_client::resolve_client_version` (CLI flag → env →
+    /// hardcoded default). `#[serde(default)]` so launcher.json files
+    /// written before this field existed still load.
+    #[serde(default)]
+    pub xiloader_version: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

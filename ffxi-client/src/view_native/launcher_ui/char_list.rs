@@ -14,8 +14,8 @@ use bevy::picking::events::{Pointer, Over};
 use bevy::prelude::*;
 use bevy::ui_widgets::Activate;
 
-use super::common::{hint, panel_node, row, screen_root, spawn_server_chip, title};
-use super::{CharListData, DefaultCharName, LauncherState, SelectedChar, ServerInfo};
+use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
+use super::{CharListData, Credentials, DefaultCharName, LauncherState, SelectedChar, ServerInfo};
 
 #[derive(Component)]
 pub(super) struct CharListRoot;
@@ -30,6 +30,7 @@ pub(super) fn spawn_char_list_ui(
     chars: Res<CharListData>,
     default_name: Res<DefaultCharName>,
     server: Res<ServerInfo>,
+    creds: Res<Credentials>,
 ) {
     let new_char_index = chars.0.len();
     let initial_cursor = default_name
@@ -63,7 +64,16 @@ pub(super) fn spawn_char_list_ui(
             },
         ))
         .with_children(|root| {
-            spawn_server_chip(root, &server);
+            let sign_label = if creds.user.is_empty() {
+                None
+            } else {
+                Some(creds.user.clone())
+            };
+            spawn_breadcrumb(
+                root,
+                &server,
+                &[Crumb::Sign(sign_label), Crumb::Characters],
+            );
             root.spawn(panel_node(420.0)).with_children(|panel| {
                 panel.spawn(title("Select character"));
                 if chars.0.is_empty() {

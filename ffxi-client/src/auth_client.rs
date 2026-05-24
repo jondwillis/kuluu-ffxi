@@ -57,7 +57,7 @@ const AUTH_BUFFER_SIZE: usize = 4096;
 /// fork on a different pin — e.g. HorizonXI currently requires
 /// `2.0.x` and rejects `2.1.0` as "too old". The server only compares
 /// `major.minor`, so the patch value is free.
-const DEFAULT_CLIENT_VERSION: [u8; 3] = [2, 1, 0];
+const DEFAULT_CLIENT_VERSION: [u8; 3] = [2, 0, 0];
 
 /// Resolve the version triple to send. Precedence:
 /// 1. `override_` arg (e.g. from a CLI flag) — beats env so users can

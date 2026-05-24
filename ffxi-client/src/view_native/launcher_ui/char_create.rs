@@ -9,7 +9,7 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use super::common::{hint, panel_node, row, screen_root, spawn_server_chip, title};
+use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
 use crate::view_native::widgets::text_field::text_field;
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
@@ -72,7 +72,11 @@ pub(super) fn spawn_ui(
     commands
         .spawn((CharCreateRoot, screen_root()))
         .with_children(|root| {
-            spawn_server_chip(root, &server);
+            spawn_breadcrumb(
+                root,
+                &server,
+                &[Crumb::Characters, Crumb::Other("New character".to_string())],
+            );
             root.spawn(panel_node(560.0)).with_children(|panel| {
                 panel.spawn(title("Create character"));
                 panel.spawn(hint(

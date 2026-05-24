@@ -8,13 +8,14 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui_widgets::{Activate, ValueChange};
 
+use ffxi_client::auth_client;
 use ffxi_client::launcher_store::{self, AuthFlavorKind, ServerProfile};
 
-use super::common::{hint, panel_node, row, screen_root, title};
+use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
 use crate::view_native::widgets::text_field::text_field;
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
-use super::{LauncherState, ServerEditField, ServerEditForm};
+use super::{LauncherState, ServerEditField, ServerEditForm, ServerInfo};
 
 #[derive(Component)]
 pub(super) struct ServerEditRoot;
@@ -22,7 +23,11 @@ pub(super) struct ServerEditRoot;
 #[derive(Component, Clone, Copy)]
 pub(super) struct FlavorButton(AuthFlavorKind);
 
-pub(super) fn spawn_ui(mut commands: Commands, form: Res<ServerEditForm>) {
+pub(super) fn spawn_ui(
+    mut commands: Commands,
+    form: Res<ServerEditForm>,
+    server: Res<ServerInfo>,
+) {
     let editing = form.editing_index.is_some();
     let snap = (
         form.name.clone(),
@@ -31,20 +36,36 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<ServerEditForm>) {
         form.data_port.clone(),
         form.view_port.clone(),
         form.flavor,
+        form.xiloader_version.clone(),
     );
+
+    // Placeholder echoes the resolved global default so the user can see
+    // what they'll get if they leave the field blank.
+    let default_version = auth_client::resolve_client_version(None);
+    let version_placeholder = format!(
+        "{}.{}.{}",
+        default_version[0], default_version[1], default_version[2]
+    );
+
+    let leaf = if editing {
+        Crumb::Other(format!("Edit: {}", snap.0))
+    } else {
+        Crumb::Other("New server".to_string())
+    };
 
     commands
         .spawn((ServerEditRoot, screen_root()))
         .with_children(|root| {
-            root.spawn(panel_node(520.0)).with_children(|panel| {
+            spawn_breadcrumb(root, &server, &[Crumb::Server, leaf]);
+            root.spawn(panel_node(560.0)).with_children(|panel| {
                 panel.spawn(title(if editing { "Edit server" } else { "New server" }));
                 panel.spawn(hint("Tab cycles fields. Esc cancels."));
 
-                spawn_field(panel, "Name", &snap.0, ServerEditField::Name);
-                spawn_field(panel, "Host", &snap.1, ServerEditField::Host);
-                spawn_field(panel, "Auth port", &snap.2, ServerEditField::AuthPort);
-                spawn_field(panel, "Data port", &snap.3, ServerEditField::DataPort);
-                spawn_field(panel, "View port", &snap.4, ServerEditField::ViewPort);
+                spawn_field(panel, "Name", &snap.0, "", ServerEditField::Name);
+                spawn_field(panel, "Host", &snap.1, "", ServerEditField::Host);
+                spawn_field(panel, "Auth port", &snap.2, "", ServerEditField::AuthPort);
+                spawn_field(panel, "Data port", &snap.3, "", ServerEditField::DataPort);
+                spawn_field(panel, "View port", &snap.4, "", ServerEditField::ViewPort);
 
                 // Flavor radio row.
                 panel.spawn(row()).with_children(|r| {
@@ -59,6 +80,14 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<ServerEditForm>) {
                     spawn_flavor_button(r, "JSON", AuthFlavorKind::Json, snap.5);
                     spawn_flavor_button(r, "Binary", AuthFlavorKind::Binary, snap.5);
                 });
+
+                spawn_field(
+                    panel,
+                    "Xiloader version",
+                    &snap.6,
+                    &version_placeholder,
+                    ServerEditField::XiloaderVersion,
+                );
 
                 panel.spawn(row()).with_children(|r| {
                     r.spawn(button(
@@ -101,6 +130,14 @@ fn save_form(form: &ServerEditForm, next: &mut NextState<LauncherState>) {
     if auth_port == 0 || data_port == 0 || view_port == 0 {
         return;
     }
+    let xiloader_version = {
+        let trimmed = form.xiloader_version.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
     let profile = ServerProfile {
         name: form.name.clone(),
         host: form.host.clone(),
@@ -108,6 +145,7 @@ fn save_form(form: &ServerEditForm, next: &mut NextState<LauncherState>) {
         data_port,
         view_port,
         flavor: form.flavor,
+        xiloader_version,
     };
     let mut store = launcher_store::load();
     match form.editing_index {
@@ -124,6 +162,7 @@ fn spawn_field(
     parent: &mut ChildSpawnerCommands,
     label: &str,
     initial: &str,
+    placeholder: &str,
     binding: ServerEditField,
 ) {
     parent
@@ -138,7 +177,7 @@ fn spawn_field(
         .with_children(|row| {
             row.spawn((
                 Node {
-                    width: Val::Px(110.0),
+                    width: Val::Px(140.0),
                     ..default()
                 },
                 Text::new(label.to_string()),
@@ -146,6 +185,7 @@ fn spawn_field(
             ));
             row.spawn(text_field(TextFieldProps {
                 initial: initial.to_string(),
+                placeholder: placeholder.to_string(),
                 submit_on_enter: false,
                 ..default()
             }))
@@ -183,6 +223,13 @@ fn spawn_field(
                             if ev.value.chars().all(|c| c.is_ascii_digit()) {
                                 form.view_port = ev.value.clone();
                             }
+                        }
+                        ServerEditField::XiloaderVersion => {
+                            // No format validation here — resolve_client_version
+                            // logs a warning and falls back to env/default for
+                            // malformed values, so a typo degrades gracefully
+                            // rather than blocking save.
+                            form.xiloader_version = ev.value.clone();
                         }
                         ServerEditField::Flavor => {}
                     }

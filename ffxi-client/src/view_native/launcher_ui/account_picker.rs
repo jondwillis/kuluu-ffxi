@@ -12,7 +12,7 @@ use bevy::ui_widgets::Activate;
 use ffxi_client::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
 use ffxi_client::secret_store::SecretStore;
 
-use super::common::{hint, panel_node, row, screen_root, spawn_server_chip, title};
+use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
 use super::{AccountPickerCursor, LauncherState, LoginField, LoginForm, ServerInfo, ServerSelectForm};
 
 #[derive(Component)]
@@ -40,15 +40,15 @@ pub(super) fn spawn_ui(
     commands
         .spawn((AccountPickerRoot, screen_root()))
         .with_children(|root| {
-            spawn_server_chip(root, &server_info);
-            root.spawn(panel_node(520.0)).with_children(|panel| {
+            spawn_breadcrumb(root, &server_info, &[Crumb::AccountPicker]);
+            root.spawn(panel_node(560.0)).with_children(|panel| {
                 panel.spawn(title(format!("Accounts on {server}")));
                 if accts.is_empty() {
                     panel.spawn(hint(
                         "No saved accounts on this server — click '+ New account' to log in fresh.",
                     ));
                 } else {
-                    panel.spawn(hint("Click to pick. Highlighted row is the forget target."));
+                    panel.spawn(hint("Click to pick. Use Forget to remove a saved account."));
                 }
 
                 for (idx, (u, remember)) in accts.iter().enumerate() {
@@ -65,13 +65,19 @@ pub(super) fn spawn_ui(
                     } else {
                         ButtonVariant::Normal
                     };
-                    panel
-                        .spawn(button(
+
+                    panel.spawn(row()).with_children(|r| {
+                        let pick_user = user.clone();
+                        let pick_server = server_for_obs.clone();
+                        r.spawn(button(
                             ButtonProps {
                                 variant,
                                 ..default()
                             },
-                            (),
+                            Node {
+                                flex_grow: 1.0,
+                                ..default()
+                            },
                             Spawn((Text::new(label), ThemedText)),
                         ))
                         .observe(
@@ -80,13 +86,13 @@ pub(super) fn spawn_ui(
                                   mut login: ResMut<LoginForm>,
                                   mut next: ResMut<NextState<LauncherState>>| {
                                 cursor.0 = idx;
-                                login.user = user.clone();
+                                login.user = pick_user.clone();
                                 login.pass.clear();
                                 login.remember_password = remember;
                                 if remember {
                                     if let Some(pw) = SecretStore::get(
                                         KEYRING_SERVICE,
-                                        &keyring_account_key(&server_for_obs, &user),
+                                        &keyring_account_key(&pick_server, &pick_user),
                                     ) {
                                         login.pass = pw;
                                     }
@@ -99,6 +105,44 @@ pub(super) fn spawn_ui(
                                 next.set(LauncherState::Login);
                             },
                         );
+
+                        let forget_user = user.clone();
+                        let forget_server = server_for_obs.clone();
+                        r.spawn(button(
+                            ButtonProps::default(),
+                            (),
+                            Spawn((Text::new("Forget"), ThemedText)),
+                        ))
+                        .observe(
+                            move |_ev: On<Activate>,
+                                  mut cursor: ResMut<AccountPickerCursor>,
+                                  mut next: ResMut<NextState<LauncherState>>| {
+                                let mut store = launcher_store::load();
+                                store.accounts.retain(|a| {
+                                    !(a.server_name == forget_server
+                                        && a.username == forget_user)
+                                });
+                                if let Some((s, u)) = &store.last_used {
+                                    if *s == forget_server && *u == forget_user {
+                                        store.last_used = None;
+                                    }
+                                }
+                                if let Err(e) = launcher_store::save(&store) {
+                                    tracing::warn!(error = %e, "launcher_store: save failed");
+                                }
+                                SecretStore::delete(
+                                    KEYRING_SERVICE,
+                                    &keyring_account_key(&forget_server, &forget_user),
+                                );
+                                let new_accts = accounts_for(&forget_server);
+                                if cursor.0 >= new_accts.len() && !new_accts.is_empty() {
+                                    cursor.0 = new_accts.len() - 1;
+                                }
+                                // Refresh by re-entering.
+                                next.set(LauncherState::AccountPicker);
+                            },
+                        );
+                    });
                 }
 
                 panel.spawn(row()).with_children(|r| {
@@ -118,47 +162,6 @@ pub(super) fn spawn_ui(
                             login.pass.clear();
                             login.focus = LoginField::User;
                             next.set(LauncherState::Login);
-                        },
-                    );
-
-                    let server_for_forget = server.clone();
-                    r.spawn(button(
-                        ButtonProps::default(),
-                        (),
-                        Spawn((Text::new("Forget selected"), ThemedText)),
-                    ))
-                    .observe(
-                        move |_ev: On<Activate>,
-                              mut cursor: ResMut<AccountPickerCursor>,
-                              mut next: ResMut<NextState<LauncherState>>| {
-                            let accts = accounts_for(&server_for_forget);
-                            if accts.is_empty() {
-                                return;
-                            }
-                            let idx = cursor.0.min(accts.len() - 1);
-                            let (user, _) = accts[idx].clone();
-                            let mut store = launcher_store::load();
-                            store.accounts.retain(|a| {
-                                !(a.server_name == server_for_forget && a.username == user)
-                            });
-                            if let Some((s, u)) = &store.last_used {
-                                if *s == server_for_forget && *u == user {
-                                    store.last_used = None;
-                                }
-                            }
-                            if let Err(e) = launcher_store::save(&store) {
-                                tracing::warn!(error = %e, "launcher_store: save failed");
-                            }
-                            SecretStore::delete(
-                                KEYRING_SERVICE,
-                                &keyring_account_key(&server_for_forget, &user),
-                            );
-                            let new_accts = accounts_for(&server_for_forget);
-                            if cursor.0 >= new_accts.len() && !new_accts.is_empty() {
-                                cursor.0 = new_accts.len() - 1;
-                            }
-                            // Refresh by re-entering.
-                            next.set(LauncherState::AccountPicker);
                         },
                     );
 

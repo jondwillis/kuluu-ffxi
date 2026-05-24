@@ -1,6 +1,6 @@
-//! Server-select screen — one button per saved server, plus action
-//! buttons for add/edit/delete/skip. Single click on a server row picks
-//! it (commits the selection and advances to the account picker).
+//! Server-select screen — one row per saved server with inline
+//! Edit + delete actions, plus an `+ Add server` affordance and an
+//! optional `Cancel` button when there's somewhere to fall back to.
 
 use bevy::ecs::spawn::Spawn;
 use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
@@ -18,23 +18,36 @@ use super::{LauncherState, ServerSelectCursor, ServerSelectForm};
 #[derive(Component)]
 pub(super) struct ServerSelectRoot;
 
-pub(super) fn spawn_ui(mut commands: Commands, cursor: Res<ServerSelectCursor>) {
+/// Per-server "armed for delete" marker. The first `×` click flips a row
+/// into the armed state (button relabeled to `Confirm?`); the second
+/// click within the same screen lifetime actually deletes. Inline
+/// two-click was chosen over a separate confirm sub-state to avoid the
+/// state-machine churn for a destructive but recoverable (re-add)
+/// action.
+#[derive(Resource, Default)]
+pub(super) struct PendingServerDelete(pub Option<String>);
+
+pub(super) fn spawn_ui(
+    mut commands: Commands,
+    cursor: Res<ServerSelectCursor>,
+    pending: Option<Res<PendingServerDelete>>,
+) {
     let store = launcher_store::load();
     let cursor_idx = cursor.0;
     let servers = store.servers.clone();
     let n = servers.len();
+    let pending_name = pending.and_then(|p| p.0.clone());
+    let has_last_used = store.last_used.is_some();
 
     commands
         .spawn((ServerSelectRoot, screen_root()))
         .with_children(|root| {
-            root.spawn(panel_node(560.0)).with_children(|panel| {
-                panel.spawn(title("Select server"));
+            root.spawn(panel_node(620.0)).with_children(|panel| {
+                panel.spawn(title("Servers"));
                 if n == 0 {
                     panel.spawn(hint("No servers saved yet — click '+ Add server' below."));
                 } else {
-                    panel.spawn(hint(
-                        "Click a server to pick it. The highlighted row is the edit/delete target.",
-                    ));
+                    panel.spawn(hint("Click a server to pick it. Use Edit / × for per-row actions."));
                 }
 
                 for (idx, s) in servers.iter().enumerate() {
@@ -45,13 +58,19 @@ pub(super) fn spawn_ui(mut commands: Commands, cursor: Res<ServerSelectCursor>) 
                     } else {
                         ButtonVariant::Normal
                     };
-                    panel
-                        .spawn(button(
+                    let armed = pending_name.as_deref() == Some(s.name.as_str());
+
+                    panel.spawn(row()).with_children(|r| {
+                        let pick_name = server_name.clone();
+                        r.spawn(button(
                             ButtonProps {
                                 variant,
                                 ..default()
                             },
-                            (),
+                            Node {
+                                flex_grow: 1.0,
+                                ..default()
+                            },
                             Spawn((Text::new(label), ThemedText)),
                         ))
                         .observe(
@@ -61,22 +80,97 @@ pub(super) fn spawn_ui(mut commands: Commands, cursor: Res<ServerSelectCursor>) 
                                   mut form: ResMut<ServerSelectForm>,
                                   mut next: ResMut<NextState<LauncherState>>| {
                                 cursor.0 = idx;
-                                form.selected = Some(server_name.clone());
-                                // Re-bind the live AuthClient/LobbyClient
-                                // + window-title to the picked profile.
-                                // Without this the picker would just
-                                // relabel the keyring grouping and the
-                                // next login would still hit whatever
-                                // host main.rs constructed at startup.
+                                form.selected = Some(pick_name.clone());
                                 let store = launcher_store::load();
                                 if let Some(profile) =
-                                    store.servers.iter().find(|p| p.name == server_name)
+                                    store.servers.iter().find(|p| p.name == pick_name)
                                 {
                                     super::apply_server_profile(&mut commands, profile);
                                 }
                                 next.set(LauncherState::AccountPicker);
                             },
                         );
+
+                        let edit_name = server_name.clone();
+                        r.spawn(button(
+                            ButtonProps::default(),
+                            (),
+                            Spawn((Text::new("Edit"), ThemedText)),
+                        ))
+                        .observe(
+                            move |_ev: On<Activate>,
+                                  mut edit: ResMut<super::ServerEditForm>,
+                                  mut next: ResMut<NextState<LauncherState>>| {
+                                let store = launcher_store::load();
+                                if let Some((i, profile)) = store
+                                    .servers
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, p)| p.name == edit_name)
+                                {
+                                    *edit = super::ServerEditForm::from_profile(profile);
+                                    edit.editing_index = Some(i);
+                                    next.set(LauncherState::ServerEdit);
+                                }
+                            },
+                        );
+
+                        let del_name = server_name.clone();
+                        let (del_label, del_variant) = if armed {
+                            ("Confirm?", ButtonVariant::Primary)
+                        } else {
+                            ("×", ButtonVariant::Normal)
+                        };
+                        r.spawn(button(
+                            ButtonProps {
+                                variant: del_variant,
+                                ..default()
+                            },
+                            (),
+                            Spawn((Text::new(del_label), ThemedText)),
+                        ))
+                        .observe(
+                            move |_ev: On<Activate>,
+                                  mut commands: Commands,
+                                  mut cursor: ResMut<ServerSelectCursor>,
+                                  pending: Option<ResMut<PendingServerDelete>>,
+                                  mut next: ResMut<NextState<LauncherState>>| {
+                                let already_armed = pending
+                                    .as_ref()
+                                    .and_then(|p| p.0.clone())
+                                    == Some(del_name.clone());
+                                if !already_armed {
+                                    commands.insert_resource(PendingServerDelete(Some(
+                                        del_name.clone(),
+                                    )));
+                                    next.set(LauncherState::ServerSelect);
+                                    return;
+                                }
+                                let mut store = launcher_store::load();
+                                if let Some(pos) =
+                                    store.servers.iter().position(|p| p.name == del_name)
+                                {
+                                    let removed = store.servers.remove(pos);
+                                    store.accounts.retain(|a| a.server_name != removed.name);
+                                    if let Some((s, _)) = &store.last_used {
+                                        if *s == removed.name {
+                                            store.last_used = None;
+                                        }
+                                    }
+                                    if cursor.0 >= store.servers.len()
+                                        && !store.servers.is_empty()
+                                    {
+                                        cursor.0 = store.servers.len() - 1;
+                                    }
+                                    if let Err(e) = launcher_store::save(&store) {
+                                        tracing::warn!(error = %e, "launcher_store: save failed");
+                                    }
+                                }
+                                commands.insert_resource(PendingServerDelete(None));
+                                next.set(LauncherState::ServerSelect);
+                            },
+                        );
+                    });
                 }
 
                 panel.spawn(row()).with_children(|r| {
@@ -98,71 +192,23 @@ pub(super) fn spawn_ui(mut commands: Commands, cursor: Res<ServerSelectCursor>) 
                         },
                     );
 
-                    r.spawn(button(
-                        ButtonProps::default(),
-                        (),
-                        Spawn((Text::new("Edit selected"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>,
-                         cursor: Res<ServerSelectCursor>,
-                         mut edit: ResMut<super::ServerEditForm>,
-                         mut next: ResMut<NextState<LauncherState>>| {
-                            let store = launcher_store::load();
-                            if store.servers.is_empty() {
-                                return;
-                            }
-                            let idx = cursor.0.min(store.servers.len() - 1);
-                            *edit = super::ServerEditForm::from_profile(&store.servers[idx]);
-                            edit.editing_index = Some(idx);
-                            next.set(LauncherState::ServerEdit);
-                        },
-                    );
-
-                    r.spawn(button(
-                        ButtonProps::default(),
-                        (),
-                        Spawn((Text::new("Delete selected"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>,
-                         mut cursor: ResMut<ServerSelectCursor>,
-                         mut next: ResMut<NextState<LauncherState>>| {
-                            let mut store = launcher_store::load();
-                            if store.servers.is_empty() {
-                                return;
-                            }
-                            let idx = cursor.0.min(store.servers.len() - 1);
-                            let removed = store.servers.remove(idx);
-                            store.accounts.retain(|a| a.server_name != removed.name);
-                            if let Some((s, _)) = &store.last_used {
-                                if *s == removed.name {
-                                    store.last_used = None;
-                                }
-                            }
-                            if cursor.0 >= store.servers.len() && !store.servers.is_empty() {
-                                cursor.0 = store.servers.len() - 1;
-                            }
-                            if let Err(e) = launcher_store::save(&store) {
-                                tracing::warn!(error = %e, "launcher_store: save failed");
-                            }
-                            // Cheapest way to refresh the list: re-enter
-                            // the same state (OnExit despawns, OnEnter
-                            // rebuilds from the freshly-loaded store).
-                            next.set(LauncherState::ServerSelect);
-                        },
-                    );
-
-                    r.spawn(button(
-                        ButtonProps::default(),
-                        (),
-                        Spawn((Text::new("Skip → Login"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::Login);
-                        },
-                    );
+                    // Only render Cancel when there's a prior session to
+                    // fall back to. Without `last_used`, hitting Cancel
+                    // would land on a Login screen with no creds and no
+                    // sensible "back" — the user has to pick a server
+                    // first.
+                    if has_last_used {
+                        r.spawn(button(
+                            ButtonProps::default(),
+                            (),
+                            Spawn((Text::new("Cancel"), ThemedText)),
+                        ))
+                        .observe(
+                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(LauncherState::Login);
+                            },
+                        );
+                    }
                 });
             });
         });
@@ -174,9 +220,11 @@ pub(super) fn despawn_ui(mut commands: Commands, q: Query<Entity, With<ServerSel
     }
 }
 
-/// Esc skips back to login (matches every other cancel affordance).
+/// Esc cancels back to login when there's a fall-back account; otherwise
+/// it's swallowed (no valid target).
 pub(super) fn keyboard_input_system(
     mut events: MessageReader<KeyboardInput>,
+    mut commands: Commands,
     mut next: ResMut<NextState<LauncherState>>,
 ) {
     for ev in events.read() {
@@ -184,7 +232,12 @@ pub(super) fn keyboard_input_system(
             continue;
         }
         if matches!(ev.logical_key, Key::Escape) {
-            next.set(LauncherState::Login);
+            // Esc also clears any armed delete (so it doesn't carry
+            // over silently to the next entry).
+            commands.insert_resource(PendingServerDelete(None));
+            if launcher_store::load().last_used.is_some() {
+                next.set(LauncherState::Login);
+            }
             return;
         }
     }

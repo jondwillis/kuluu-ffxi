@@ -9,7 +9,7 @@ use bevy::prelude::*;
 use bevy::ui::Checked;
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use super::common::{hint, panel_node, row, screen_root, spawn_server_chip, title};
+use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
 use crate::view_native::widgets::text_field::{text_field, TextFieldSubmitted};
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 use super::{Credentials, LauncherState, LoginErrorMsg, LoginField, LoginForm, ServerInfo};
@@ -29,7 +29,7 @@ pub(super) fn spawn_login_ui(
     commands
         .spawn((LoginUiRoot, screen_root()))
         .with_children(|root| {
-            spawn_server_chip(root, &server);
+            spawn_breadcrumb(root, &server, &[Crumb::Sign(None)]);
             root.spawn(panel_node(480.0)).with_children(|panel| {
                 panel.spawn(title("Sign in"));
                 panel.spawn(hint("Tab cycles fields. Enter submits when both filled."));
@@ -86,9 +86,7 @@ pub(super) fn spawn_login_ui(
                             next.set(LauncherState::CreateAccount);
                         },
                     );
-                });
 
-                panel.spawn(row()).with_children(|r| {
                     r.spawn(button(
                         ButtonProps::default(),
                         (),
@@ -99,28 +97,6 @@ pub(super) fn spawn_login_ui(
                             next.set(LauncherState::ChangePassword);
                         },
                     );
-
-                    r.spawn(button(
-                        ButtonProps::default(),
-                        (),
-                        Spawn((Text::new("Server select"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::ServerSelect);
-                        },
-                    );
-
-                    r.spawn(button(
-                        ButtonProps::default(),
-                        (),
-                        Spawn((Text::new("Forget saved"), ThemedText)),
-                    ))
-                    .observe(|_ev: On<Activate>, mut form: ResMut<LoginForm>| {
-                        form.user.clear();
-                        form.pass.clear();
-                        form.remember_password = false;
-                    });
                 });
             });
         });

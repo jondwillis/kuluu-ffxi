@@ -32,6 +32,7 @@
 use bevy::feathers::tokens;
 use bevy::feathers::theme::ThemeBackgroundColor;
 use bevy::input::keyboard::{Key, KeyCode, KeyboardInput};
+use bevy::input::ButtonInput;
 use bevy::input::ButtonState;
 use bevy::input_focus::tab_navigation::TabIndex;
 use bevy::input_focus::{FocusedInput, InputFocus};
@@ -126,6 +127,7 @@ impl Plugin for TextFieldPlugin {
 fn text_field_on_key(
     mut ev: On<FocusedInput<KeyboardInput>>,
     mut q: Query<&mut TextField>,
+    keys: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
 ) {
     let Ok(mut field) = q.get_mut(ev.focused_entity) else {
@@ -139,6 +141,58 @@ fn text_field_on_key(
     // Tab is owned by the tab-navigation observer; don't consume it.
     if matches!(input.key_code, KeyCode::Tab) {
         return;
+    }
+
+    // Cmd (macOS) / Ctrl shortcuts. Checked first so `Key::Character("v")`
+    // arriving on the same press doesn't also get inserted as a literal 'v'.
+    let cmd_or_ctrl = keys.pressed(KeyCode::SuperLeft)
+        || keys.pressed(KeyCode::SuperRight)
+        || keys.pressed(KeyCode::ControlLeft)
+        || keys.pressed(KeyCode::ControlRight);
+    if cmd_or_ctrl {
+        match input.key_code {
+            KeyCode::KeyV => {
+                let pasted = match arboard::Clipboard::new()
+                    .and_then(|mut cb| cb.get_text())
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "text_field: clipboard read failed");
+                        ev.propagate(false);
+                        return;
+                    }
+                };
+                let sanitized: String = pasted
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect();
+                if !sanitized.is_empty() {
+                    let cur = field.cursor;
+                    field.value.insert_str(cur, &sanitized);
+                    field.cursor = cur + sanitized.len();
+                    let value = field.value.clone();
+                    commands.trigger(ValueChange {
+                        source: ev.focused_entity,
+                        value,
+                    });
+                }
+                ev.propagate(false);
+                return;
+            }
+            KeyCode::KeyC => {
+                // Copy the real value (not the masked rendering) — matches
+                // every other text widget's Cmd+C behavior.
+                let payload = field.value.clone();
+                if let Err(e) = arboard::Clipboard::new()
+                    .and_then(|mut cb| cb.set_text(payload))
+                {
+                    tracing::warn!(error = %e, "text_field: clipboard write failed");
+                }
+                ev.propagate(false);
+                return;
+            }
+            _ => {}
+        }
     }
 
     let mut mutated = false;
