@@ -25,12 +25,14 @@ pub mod camera_collision;
 pub mod collision_bvh;
 pub mod debug_heights;
 pub mod input;
+pub mod launcher_backdrop;
 pub mod launcher_ui;
 pub mod nameplate_occlude;
 pub mod navmesh_overlay;
 pub mod screenshot;
 pub mod slash_commands;
 pub mod text_input;
+pub mod widgets;
 
 use std::sync::Arc;
 
@@ -192,6 +194,18 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // `FramepaceSettings` resource directly (see `apply_slash_outcome`).
     app.add_plugins(bevy_framepace::FramepacePlugin);
 
+    // Bevy 0.17's official theming + headless widgets (button, checkbox,
+    // slider, radio, toggle_switch, virtual_keyboard). Single-line text
+    // input is NOT provided — see `widgets::text_field` for the local
+    // implementation. Dark theme is installed unconditionally; the
+    // launcher rewrite will consume the `tokens::*` palette so all
+    // screens stay visually consistent.
+    app.add_plugins(bevy::feathers::FeathersPlugins)
+        .insert_resource(bevy::feathers::theme::UiTheme(
+            bevy::feathers::dark_theme::create_dark_theme(),
+        ))
+        .add_plugins(widgets::TextFieldPlugin);
+
     // Top-level phase. Launcher is the default starting phase regardless
     // of direct mode — direct-mode auto-advance happens via the
     // `DirectModeAutostart` marker resource, see launcher_ui::register.
@@ -312,6 +326,12 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         HudPlugin,
         MousePlugin,
         navmesh_overlay::NavmeshOverlayPlugin,
+        // Launcher 3D backdrop: load La Theine (or the selected
+        // char's saved zone) behind the launcher screens. Re-uses
+        // viewer-core's `auto_load_zone_geometry_system` zone
+        // loader via `SceneState.snapshot.zone_id`. See module
+        // docs for the Phase-2 UI-translucency follow-up.
+        launcher_backdrop::LauncherBackdropPlugin,
     ))
     // Plug ffxi-nav's static zone-id → name table into the zone-flash
     // banner. Without this the banner falls back to `Zone #NNN`; with

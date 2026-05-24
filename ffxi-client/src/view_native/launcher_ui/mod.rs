@@ -51,6 +51,7 @@ mod account_picker;
 mod async_work;
 mod change_password;
 mod char_create;
+mod char_create_preview;
 mod char_list;
 mod char_preview;
 mod login;
@@ -783,6 +784,9 @@ pub(crate) fn register(
         Update,
         login::error_keyboard_system.run_if(in_state(LauncherState::LoginError)),
     );
+
+    // Live 3D preview overlay for the char-create form.
+    char_create_preview::register(app);
 
     // Character creation: form UI on enter, eats keys, redraws on each
     // frame, submits to CharCreateInFlight.

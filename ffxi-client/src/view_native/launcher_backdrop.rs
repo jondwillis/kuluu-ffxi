@@ -1,0 +1,229 @@
+//! Launcher 3D backdrop — load a real FFXI zone behind the launcher
+//! screens (login form, server-select, char-list, char-create).
+//!
+//! **Plumbing only.** The existing UI screens (`launcher_ui/*.rs`) still
+//! render opaque `BackgroundColor` panels on their full-screen roots,
+//! which will cover this 3D view until those panels are migrated to
+//! translucent surfaces in Phase 2. The backdrop *is* alive, the camera
+//! *is* rendering, and the zone *is* loading — but it won't be visible
+//! to the operator until the UI layer cooperates. See the module-level
+//! comment in `launcher_ui/login.rs` (and siblings) for the cleanup
+//! target. Setting `ClearColor(Color::NONE)` here gives the right
+//! baseline so the first non-opaque screen reveals the backdrop
+//! immediately, no further plumbing needed.
+//!
+//! # How it loads zones
+//!
+//! Re-uses the existing post-auth zone loader: `dat_mzb::
+//! auto_load_zone_geometry_system` watches `SceneState.snapshot.zone_id`
+//! and fires a `LoadMzbRequest` on every transition. We just write the
+//! desired zone id into that field from the Launcher phase — the
+//! loader is in an unconditional `Update` chain and doesn't know or
+//! care that no network session exists.
+//!
+//! # Camera
+//!
+//! Spawns a bare `Camera3d` with `order = -2` (behind char-preview's
+//! `-1` and UI's default 0). The viewer-core camera controllers
+//! (chase, first-person, collision clamp, polish) all key on the
+//! `OperatorCamera` marker component — by deliberately NOT attaching
+//! that marker we get a static viewpoint with zero controller
+//! interference, no `cfg`/excludes needed.
+
+use bevy::prelude::*;
+use ffxi_client::lobby_client::CharSlot;
+use ffxi_viewer_core::SceneState;
+
+use super::launcher_ui::{CharListData, SelectedChar};
+use super::AppPhase;
+
+/// West La Theine Plateau (retail zone id 102). See
+/// `ffxi-nav/src/zone_names.rs:132` for the canonical id → name
+/// mapping; `ffxi-dat/src/zone_dat.rs::zone_id_to_mzb_file_id`
+/// resolves it to DAT file_id 202.
+pub const DEFAULT_BACKDROP_ZONE: u16 = 102;
+
+/// Debounce window for selection-driven zone swaps. Arrow-keying
+/// through 8 characters in 200ms shouldn't kick off 8 zone loads —
+/// wait until the cursor has been still this long, then load.
+const SELECTION_DEBOUNCE: f32 = 0.5;
+
+/// The zone id currently driving the launcher backdrop. Written by
+/// the plugin's selection-watcher (and on startup); read by a system
+/// that mirrors it into `SceneState.snapshot.zone_id` to trigger the
+/// existing zone-load chain.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct LauncherBackdropZone(pub u16);
+
+/// Marker for the backdrop's `Camera3d`. Spawned on
+/// `OnEnter(AppPhase::Launcher)`, despawned on
+/// `OnExit(AppPhase::Launcher)`. Deliberately NOT carrying
+/// `OperatorCamera` so the chase/firstperson/collision systems
+/// ignore it — see module docs.
+#[derive(Component)]
+pub struct BackdropCamera;
+
+/// Marker for any backdrop-scoped entity (camera, lights). Used
+/// only by the `OnExit(Launcher)` despawn pass so the lights die
+/// with the camera and don't leak into the in-game scene.
+#[derive(Component)]
+struct BackdropScoped;
+
+/// Pending zone-swap state for the selection-driven debounce. Tracks
+/// the target zone the cursor is currently hovering on, plus the
+/// elapsed time since the cursor last changed targets. When the
+/// elapsed time exceeds [`SELECTION_DEBOUNCE`] we commit the swap.
+#[derive(Resource, Default)]
+struct PendingBackdropSwap {
+    target: Option<u16>,
+    elapsed: f32,
+}
+
+pub struct LauncherBackdropPlugin;
+
+impl Plugin for LauncherBackdropPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(LauncherBackdropZone(DEFAULT_BACKDROP_ZONE))
+            .init_resource::<PendingBackdropSwap>()
+            // Transparent clear so the 3D backdrop shows through any
+            // UI layer that doesn't paint its own opaque background.
+            // The launcher's existing roots DO paint opaque bg today
+            // (Phase 2 cleanup); once those go translucent the
+            // backdrop is visible with no further changes.
+            .insert_resource(ClearColor(Color::NONE))
+            .add_systems(OnEnter(AppPhase::Launcher), spawn_backdrop_camera)
+            .add_systems(OnExit(AppPhase::Launcher), despawn_backdrop_camera)
+            .add_systems(
+                Update,
+                (
+                    // Selection watcher runs before the mirror so a
+                    // same-frame commit lands on this frame's mirror
+                    // pass and the auto-loader sees the change next
+                    // frame (one-tick latency, fine for a backdrop).
+                    update_backdrop_from_selection,
+                    mirror_backdrop_to_scene_state,
+                )
+                    .chain()
+                    .run_if(in_state(AppPhase::Launcher)),
+            );
+    }
+}
+
+fn spawn_backdrop_camera(mut commands: Commands) {
+    commands.spawn((
+        BackdropCamera,
+        BackdropScoped,
+        Camera3d::default(),
+        Camera {
+            // Behind char-preview (-1) and UI (0). The launcher's
+            // 2D camera defaults to order 0 too — Bevy renders
+            // higher-order cameras on top, so -2 keeps us at the
+            // bottom of the stack.
+            order: -2,
+            ..default()
+        },
+        // Placeholder viewpoint — eye-height above the FFXI world
+        // origin (which is the zone-local origin for the MZB load),
+        // looking slightly down toward the horizon. Real per-zone
+        // viewpoints can be a later polish pass; this just gives
+        // the zone *something* to render against.
+        Transform::from_xyz(0.0, 6.0, 12.0).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
+    ));
+
+    // Lighting so the backdrop isn't pitch-black. The in-game sun/
+    // moon system gates on `EntityMesh` (not present in Launcher
+    // phase), so without this the zone geometry loads but renders
+    // pure black. Cheap directional + ambient — no shadows.
+    commands.spawn((
+        BackdropScoped,
+        DirectionalLight {
+            illuminance: 8_000.0,
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+}
+
+fn despawn_backdrop_camera(mut commands: Commands, q: Query<Entity, With<BackdropScoped>>) {
+    for e in q.iter() {
+        commands.entity(e).despawn();
+    }
+}
+
+/// Mirror [`LauncherBackdropZone`] into `SceneState.snapshot.zone_id`.
+/// The viewer-core `auto_load_zone_geometry_system` watches that
+/// field and fires the same `LoadMzbRequest` chain the post-auth
+/// path uses — by writing here we reuse the entire zone-load
+/// pipeline without duplicating any parse / spawn logic.
+fn mirror_backdrop_to_scene_state(
+    zone: Res<LauncherBackdropZone>,
+    mut scene: ResMut<SceneState>,
+) {
+    // No `is_changed()` gate: a return-to-Launcher path resets
+    // `SceneState` via `despawn_ingame_entities` without mutating
+    // our `LauncherBackdropZone`, so we need to detect the
+    // divergence by comparing values directly. Cheap read every
+    // frame; only writes when out of sync.
+    let desired = Some(zone.0);
+    if scene.snapshot.zone_id == desired {
+        return;
+    }
+    scene.snapshot.zone_id = desired;
+}
+
+/// Watch the char-list cursor's currently-hovered character and
+/// debounce-update [`LauncherBackdropZone`] to its saved zone. Runs
+/// every frame; cheap reads only when nothing is hovered or the
+/// hover hasn't changed.
+fn update_backdrop_from_selection(
+    time: Res<Time>,
+    sel: Res<SelectedChar>,
+    chars: Res<CharListData>,
+    mut pending: ResMut<PendingBackdropSwap>,
+    mut zone: ResMut<LauncherBackdropZone>,
+) {
+    // Source of truth: SelectedChar when set (user picked one),
+    // else the first non-empty char in the list (a reasonable
+    // proxy for "current focus" without us needing to plumb
+    // CharCursor through). Either way we end up with a u16 zone
+    // id or `None` (no chars → no swap, stay on default).
+    let hovered: Option<u16> = sel
+        .0
+        .as_ref()
+        .and_then(slot_zone_for_backdrop)
+        .or_else(|| chars.0.iter().find_map(slot_zone_for_backdrop));
+
+    // Track changes to the hovered target. Each new target resets
+    // the elapsed timer; only commit once it's been stable for
+    // SELECTION_DEBOUNCE seconds. Reverting to the current zone
+    // mid-debounce cancels the pending swap.
+    if pending.target != hovered {
+        pending.target = hovered;
+        pending.elapsed = 0.0;
+        return;
+    }
+
+    let Some(target) = pending.target else {
+        return;
+    };
+    if target == zone.0 {
+        return;
+    }
+    pending.elapsed += time.delta_secs();
+    if pending.elapsed >= SELECTION_DEBOUNCE {
+        zone.0 = target;
+        pending.elapsed = 0.0;
+    }
+}
+
+/// Filter: only return a zone id we can actually load. Empty char
+/// slots (race=0) and the synthetic "new character" row report
+/// `zone_id == 0`, which would force the backdrop to a zone that
+/// doesn't exist; skip those and let the previous backdrop stay.
+fn slot_zone_for_backdrop(slot: &CharSlot) -> Option<u16> {
+    if slot.race == 0 || slot.zone_id == 0 {
+        return None;
+    }
+    Some(slot.zone_id)
+}

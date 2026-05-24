@@ -78,15 +78,13 @@ pub fn spawn_roster_panel(mut commands: Commands) {
         RosterPanel,
         Node {
             position_type: PositionType::Absolute,
-            // Top-right column, slot 4: under the LLM badge. Retail
-            // FFXI puts the party list mid-right; this top: 200
-            // anchor approximates that while keeping the column
-            // sequence (compass / clock / llm-badge / roster)
-            // collision-free. See `hud/vana_clock.rs` for the
-            // canonical column layout.
-            top: Val::Px(200.0),
+            // Stacked directly above the player HP/MP/TP card
+            // (`hud/self_hud.rs` at bottom: 28, width: 220). Player
+            // card is ~90px tall (4 rows) + 8px gap. Width matches
+            // so the two panels form a clean right-edge column.
+            bottom: Val::Px(28.0 + 90.0 + 8.0),
             right: Val::Px(8.0),
-            width: Val::Px(280.0),
+            width: Val::Px(220.0),
             padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
             border: UiRect::all(Val::Px(1.0)),
             flex_direction: FlexDirection::Column,
@@ -115,6 +113,23 @@ pub fn update_roster_panel_system(
     };
 
     let party = &state.snapshot.party;
+
+    // Solo mode (self-only, or no party at all): hide the panel and
+    // skip the rest of the work. Retail FFXI doesn't show a party
+    // window until at least one other member is present.
+    let want_display = if party.len() <= 1 {
+        Display::None
+    } else {
+        Display::Flex
+    };
+    if let Ok(mut node) = node_q.get_mut(panel) {
+        if node.display != want_display {
+            node.display = want_display;
+        }
+    }
+    if want_display == Display::None {
+        return;
+    }
 
     // Decide whether shape changed: compare the ordered (id) list with
     // the current row set. RosterRow markers carry their member_id so we

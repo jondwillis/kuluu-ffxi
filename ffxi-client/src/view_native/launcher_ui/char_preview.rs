@@ -231,6 +231,27 @@ fn active_slot<'a>(chars: &'a CharListData, cursor: &CharCursor) -> Option<&'a C
     chars.0.get(cursor.0)
 }
 
+/// Bake a PC preview from raw appearance fields (no equipment).
+/// Shared with `char_create_preview` so the create-screen live
+/// preview goes through the exact same `spawn_equipped` path as the
+/// char-list preview — race/face changes look identical in both.
+pub(super) fn spawn_preview_pc(
+    commands: &mut Commands,
+    parent: Entity,
+    race: u8,
+    face: u8,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) -> usize {
+    if race == 0 {
+        return 0;
+    }
+    spawn_equipped(
+        commands, meshes, materials, images, parent, race, face, 0, 0, 0, 0, 0, 0, 0, 0,
+    )
+}
+
 /// Call `spawn_equipped` for a single slot, gated on race != 0.
 /// Empty/dummy chr_info2 slots arrive with all-zero
 /// `TC_OPERATION_MAKE`; rendering them would spawn 8 empty meshes

@@ -11,7 +11,7 @@
 //! `HudPlugin`); the smoothed-average value is shown so it doesn't flicker
 //! frame-to-frame.
 
-use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+use bevy::diagnostic::{Diagnostic, DiagnosticPath, Diagnostics, DiagnosticsStore, FrameTimeDiagnosticsPlugin, RegisterDiagnostic};
 use bevy::prelude::*;
 use ffxi_viewer_wire::BlowfishStatus;
 
@@ -19,6 +19,15 @@ use crate::hud::palette;
 use crate::snapshot::SceneState;
 
 const STALE_THRESHOLD_MS: u64 = 5_000;
+
+/// Proxy for "draw calls per frame": count of mesh-bearing entities the
+/// main camera will actually issue draws for after frustum + visibility
+/// culling. Real GPU draw count is slightly higher (post-process /
+/// shadow passes re-iterate visible meshes) but the proxy tracks
+/// magnitude — going from 200 to 2000 here means the GPU is doing 10×
+/// the draws.
+pub const VISIBLE_MESHES: DiagnosticPath =
+    DiagnosticPath::const_new("ffxi/visible_meshes");
 
 #[derive(Component)]
 pub struct DiagnosticsBar;
@@ -37,6 +46,9 @@ pub struct DiagMapValue;
 
 #[derive(Component)]
 pub struct DiagFpsValue;
+
+#[derive(Component)]
+pub struct DiagDrawValue;
 
 pub fn spawn_diagnostics(mut commands: Commands) {
     commands
@@ -71,6 +83,8 @@ pub fn spawn_diagnostics(mut commands: Commands) {
             spawn_label_value(p, "map=", DiagMapValue, "—");
             spawn_separator(p);
             spawn_label_value(p, "fps=", DiagFpsValue, "—");
+            spawn_separator(p);
+            spawn_label_value(p, "draws=", DiagDrawValue, "—");
             // Right-side spacer keeps the metric strip left-aligned even
             // after the key-hint legend was dropped (FFXI/Ashita never
             // surface keybindings in the always-on UI; if the operator
@@ -224,4 +238,43 @@ pub fn update_fps_system(
     if **text != want {
         **text = want;
     }
+}
+
+/// Count entities the camera will draw this frame. Bevy populates
+/// `ViewVisibility` in PostUpdate's `VisibilityPropagate` set, so this
+/// system runs in `PostUpdate` afterwards. The cost is a single linear
+/// scan over `Mesh3d` entities — bounded and cheap.
+pub fn count_visible_meshes_system(
+    q: Query<&ViewVisibility, With<Mesh3d>>,
+    mut diagnostics: Diagnostics,
+) {
+    let n = q.iter().filter(|v| v.get()).count();
+    diagnostics.add_measurement(&VISIBLE_MESHES, || n as f64);
+}
+
+/// HUD updater for the `draws=` field. Reads the smoothed value so a
+/// few-frame outlier doesn't make the number jitter unreadably.
+pub fn update_draws_system(
+    diagnostics: Res<DiagnosticsStore>,
+    mut draw_q: Query<&mut Text, With<DiagDrawValue>>,
+) {
+    let Ok(mut text) = draw_q.single_mut() else {
+        return;
+    };
+    let want = match diagnostics
+        .get(&VISIBLE_MESHES)
+        .and_then(|d| d.smoothed())
+    {
+        Some(n) => format!("{:.0}", n),
+        None => "—".into(),
+    };
+    if **text != want {
+        **text = want;
+    }
+}
+
+/// Register `ffxi/visible_meshes` so [`update_draws_system`] has a
+/// diagnostic slot to read. Call once at app build.
+pub fn register_visible_meshes_diagnostic(app: &mut App) {
+    app.register_diagnostic(Diagnostic::new(VISIBLE_MESHES).with_max_history_length(60));
 }

@@ -101,6 +101,13 @@ pub struct CharSlot {
     pub main: u16,
     pub sub: u16,
     pub ranged: u16,
+    /// The character's saved zone id, reconstructed from
+    /// `TC_OPERATION_MAKE::zone_no` (low byte) and `zone_no2` bit 0
+    /// (bit 8). See `vendor/server/src/login/data_session.cpp:185-186`
+    /// — LSB packs the 9-bit zone id across these two `uint8` fields.
+    /// Used by the launcher's 3D backdrop to load the character's
+    /// saved zone behind the char-select screen.
+    pub zone_id: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -886,6 +893,15 @@ async fn parse_view_chr_info2(stream: &mut TcpStream) -> Result<Vec<CharSlot>> {
         // resolve_equipment_slot so this is safe.
         let ranged = 0u16;
 
+        // TC_OPERATION_MAKE layout: zone_no at struct-offset 28
+        // (after mon_no/mjob/sjob/face/town/gen/hair/size/world +
+        // GrapIDTbl[8]=16B), zone_no2 at struct-offset 34 (after
+        // mjob_level/open_flag/GMCallCounter/version/skill1). LSB
+        // writes `zone_no = zone & 0xFF; zone_no2 = (zone >> 8) & 1;`.
+        let zone_no = rest[tc + 28];
+        let zone_no2 = rest[tc + 34];
+        let zone_id = (zone_no as u16) | (((zone_no2 & 0x01) as u16) << 8);
+
         slots.push(CharSlot {
             char_id,
             name,
@@ -900,6 +916,7 @@ async fn parse_view_chr_info2(stream: &mut TcpStream) -> Result<Vec<CharSlot>> {
             main,
             sub,
             ranged,
+            zone_id,
         });
     }
     Ok(slots)

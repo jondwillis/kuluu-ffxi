@@ -244,6 +244,7 @@ impl Plugin for HudPlugin {
                 quick_action::update_quick_action,
                 target_panel::update_target_panel_system,
                 diagnostics::update_fps_system,
+                diagnostics::update_draws_system,
                 dialog::update_dialog_panel_system,
                 shop::update_shop_panel_system,
                 compass::update_compass,
@@ -333,6 +334,12 @@ impl Plugin for HudPlugin {
         if !app.is_plugin_added::<bevy::diagnostic::FrameTimeDiagnosticsPlugin>() {
             app.add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default());
         }
+        // Draw-call proxy: a per-frame count of visible Mesh3d entities,
+        // registered as a Bevy `Diagnostic` so the HUD strip can display
+        // a smoothed value alongside FPS. Runs in PostUpdate after
+        // VisibilityPropagate so `ViewVisibility` is fresh.
+        diagnostics::register_visible_meshes_diagnostic(app);
+        app.add_systems(PostUpdate, diagnostics::count_visible_meshes_system);
     }
 }
 

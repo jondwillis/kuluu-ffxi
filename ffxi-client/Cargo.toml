@@ -68,7 +68,15 @@ tracing-subscriber.workspace = true
 # launcher screen. v3 is the current stable line.
 keyring = "3"
 
-bevy = { workspace = true, optional = true }
+bevy = { workspace = true, optional = true, features = [
+    # Bevy 0.17's official widget kit (button/checkbox/slider/radio/
+    # toggle_switch/virtual_keyboard + dark theme). `experimental_bevy_feathers`
+    # transitively pulls `experimental_bevy_ui_widgets` (headless primitives +
+    # `ValueChange` event), but we list both so a future split doesn't
+    # silently lose widget support.
+    "experimental_bevy_feathers",
+    "experimental_bevy_ui_widgets",
+] }
 # Frame-rate limiter for the native window. Pinned to 0.20.x because that's
 # the line tracking Bevy 0.17 — 0.21 jumps to Bevy 0.18 and would clash.
 # `default-features = false` strips the debug overlay we don't need.

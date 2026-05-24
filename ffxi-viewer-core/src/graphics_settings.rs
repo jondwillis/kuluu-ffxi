@@ -27,11 +27,10 @@ use bevy::light::{
 };
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
+use bevy::render::render_resource::TextureFormat;
+use bevy::render::renderer::RenderAdapter;
 use bevy::window::{PresentMode, PrimaryWindow};
 use serde::{Deserialize, Serialize};
-
-#[cfg(not(target_arch = "wasm32"))]
-use bevy::anti_alias::taa::TemporalAntiAliasing;
 
 use crate::camera::OperatorCamera;
 use crate::sun_moon::IsSun;
@@ -371,6 +370,94 @@ impl GraphicsSettings {
     }
 }
 
+/// Adapter-reported MSAA capability for the HDR color attachment
+/// (`Rgba16Float`, which Bevy's core_3d pipeline uses whenever the
+/// camera has `Hdr`). The WebGPU spec only guarantees `{1, 4}`; many
+/// Apple Silicon adapters cap at 4, integrated Intel parts often allow
+/// 2 but not 8, etc. Asking for an unsupported count makes wgpu panic
+/// inside the pipeline cache, so we clamp before writing `Msaa` to the
+/// camera. Populated once at startup by [`init_msaa_caps_system`].
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct MsaaCaps {
+    /// Bitmask of supported sample counts. Bit `n` set means the
+    /// adapter advertises N-sample MSAA on `Rgba16Float`.
+    pub mask: u32,
+}
+
+impl Default for MsaaCaps {
+    /// WebGPU-spec floor: every conformant device supports 1 and 4.
+    /// Used until [`init_msaa_caps_system`] queries the real adapter.
+    fn default() -> Self {
+        Self { mask: (1 << 1) | (1 << 4) }
+    }
+}
+
+impl MsaaCaps {
+    pub fn supports(self, samples: u32) -> bool {
+        samples > 0 && samples < 32 && (self.mask & (1 << samples)) != 0
+    }
+
+    /// Round `want` down to the highest supported sample count `<= want`,
+    /// falling back to `Msaa::Off` if nothing matches.
+    pub fn clamp(self, want: Msaa) -> Msaa {
+        for n in [want.samples(), 4, 2, 1] {
+            if n <= want.samples() && self.supports(n) {
+                return Msaa::from_samples(n);
+            }
+        }
+        Msaa::Off
+    }
+}
+
+/// Startup system: query the wgpu adapter for the MSAA counts it allows
+/// on `Rgba16Float` and store the result. Runs once; no-op on subsequent
+/// startups (only the first installs the resource).
+pub fn init_msaa_caps_system(
+    adapter: Option<Res<RenderAdapter>>,
+    mut settings: ResMut<GraphicsSettings>,
+    mut commands: Commands,
+) {
+    let caps = if let Some(adapter) = adapter {
+        // Intersect Rgba16Float (HDR color attachment) with Depth32Float
+        // (view depth target) — both must support the chosen sample
+        // count or Bevy's `prepare_view_targets` / `prepare_core_3d_depth_textures`
+        // will panic at create_texture time, before any Update reactor runs.
+        let color = adapter.get_texture_format_features(TextureFormat::Rgba16Float).flags;
+        let depth = adapter.get_texture_format_features(TextureFormat::Depth32Float).flags;
+        let mut mask = 0u32;
+        for n in [1u32, 2, 4, 8, 16] {
+            if color.sample_count_supported(n) && depth.sample_count_supported(n) {
+                mask |= 1 << n;
+            }
+        }
+        mask |= (1 << 1) | (1 << 4); // spec floor
+        MsaaCaps { mask }
+    } else {
+        MsaaCaps::default()
+    };
+    commands.insert_resource(caps);
+
+    // Clamp the persisted AA mode *now*, before `spawn_camera` reads
+    // it. Settings are not re-saved — bumping back to an unsupported
+    // GPU later (or fixing the driver) restores the user's original
+    // request from `graphics.json`.
+    let want = settings.msaa();
+    let got = caps.clamp(want);
+    if got != want {
+        settings.anti_aliasing = match got {
+            Msaa::Off => AaMode::Off,
+            Msaa::Sample2 => AaMode::Msaa2,
+            Msaa::Sample4 => AaMode::Msaa4,
+            Msaa::Sample8 => AaMode::Msaa8,
+        };
+        warn!(
+            "MSAA {}x unsupported on this adapter (color+depth intersection); clamped to {}x",
+            want.samples(),
+            got.samples()
+        );
+    }
+}
+
 /// 11 fields × 2 sections — used by `hud::menu` to size the row pool.
 pub const GRAPHICS_FIELDS: &[GraphicsField] = &[
     GraphicsField::Preset,
@@ -465,49 +552,58 @@ pub fn apply_cascade_config_system(
     }
 }
 
-/// Set MSAA + insert/remove TAA. Done in one system so the MSAA-off
-/// requirement for TAA is satisfied in the same Commands flush as the
-/// TAA insertion (`bevy_anti_alias/src/taa/mod.rs:164` no-ops + warns
-/// if MSAA is anything other than Off when TAA's render node runs).
-#[cfg(not(target_arch = "wasm32"))]
+/// Despawn + respawn the OperatorCamera when the AA mode changes.
+///
+/// In-place `Msaa` writes were racy: Bevy resizes the view-target's
+/// sample count on the next frame, but the pipeline cache keeps the
+/// previously-specialized pipelines around for one render pass —
+/// `main_opaque_pass_3d` then binds a 1-sample pipeline against a
+/// 2-sample render pass and wgpu panics. Rebuilding the camera entity
+/// forces the pipeline cache to compile fresh pipelines for the new
+/// sample count before any render pass references the new target.
+///
+/// `Local<Option<Msaa>>` remembers the last applied value so we only
+/// pay the respawn cost on actual AA changes, not on every
+/// `GraphicsSettings` mutation (bloom, fog, FOV, etc. all share the
+/// `resource_changed::<GraphicsSettings>` run-condition).
 pub fn apply_anti_aliasing_system(
     settings: Res<GraphicsSettings>,
     mut commands: Commands,
-    q_cam: Query<(Entity, Option<&Msaa>), With<OperatorCamera>>,
+    q_cam: Query<(Entity, &Transform), With<OperatorCamera>>,
+    caps: Option<Res<MsaaCaps>>,
+    mut last_applied: Local<Option<(Msaa, bool)>>,
 ) {
-    let target_msaa = settings.msaa();
+    let target_msaa = caps
+        .map(|c| c.clamp(settings.msaa()))
+        .unwrap_or_else(|| settings.msaa());
     let want_taa = settings.wants_taa();
-    for (entity, msaa) in q_cam.iter() {
-        // Always write Msaa as a component to ensure TAA's MSAA::Off
-        // requirement is in the same command queue flush as the
-        // (insert|remove) TemporalAntiAliasing below.
-        if msaa.copied() != Some(target_msaa) {
-            commands.entity(entity).insert(target_msaa);
-        }
-        if want_taa {
-            commands
-                .entity(entity)
-                .insert(TemporalAntiAliasing::default());
-        } else {
-            commands.entity(entity).remove::<TemporalAntiAliasing>();
-        }
-    }
-}
+    let next = (target_msaa, want_taa);
 
-/// WASM stub — same shape but without TAA, which isn't viable on WebGPU
-/// in 0.17 (motion-vector prepass too heavy). MSAA still cycles.
-#[cfg(target_arch = "wasm32")]
-pub fn apply_anti_aliasing_system(
-    settings: Res<GraphicsSettings>,
-    mut commands: Commands,
-    q_cam: Query<(Entity, Option<&Msaa>), With<OperatorCamera>>,
-) {
-    let target_msaa = settings.msaa();
-    for (entity, msaa) in q_cam.iter() {
-        if msaa.copied() != Some(target_msaa) {
-            commands.entity(entity).insert(target_msaa);
-        }
+    if *last_applied == Some(next) {
+        return;
     }
+
+    let Ok((entity, transform)) = q_cam.single() else {
+        // Camera hasn't spawned yet (PreStartup ran but Startup
+        // hasn't); record nothing and let the next change retry.
+        return;
+    };
+
+    commands.entity(entity).despawn();
+    let mut settings_for_respawn = settings.clone();
+    let aa = if want_taa {
+        AaMode::Taa
+    } else {
+        match target_msaa {
+            Msaa::Off => AaMode::Off,
+            Msaa::Sample2 => AaMode::Msaa2,
+            Msaa::Sample4 => AaMode::Msaa4,
+            Msaa::Sample8 => AaMode::Msaa8,
+        }
+    };
+    settings_for_respawn.anti_aliasing = aa;
+    crate::camera::build_operator_camera(&mut commands, &settings_for_respawn, Some(*transform));
+    *last_applied = Some(next);
 }
 
 /// Mutate Bloom in place — never insert/remove (the camera always has

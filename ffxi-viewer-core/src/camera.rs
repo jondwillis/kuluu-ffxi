@@ -295,11 +295,29 @@ pub fn camera_transition_system(
 }
 
 pub fn spawn_camera(mut commands: Commands, settings: Res<GraphicsSettings>) {
-    // Read AA, bloom, fog, view distance, and FOV from the user's
-    // persisted settings (defaults to High preset) so the first frame
-    // matches the loaded config — the reactor systems in
-    // `graphics_settings` re-apply on every change, but spawning at the
-    // right initial values avoids a one-frame visual pop.
+    build_operator_camera(&mut commands, &settings, None);
+    // Initial chase state; the respawn path (build_operator_camera
+    // called from apply_anti_aliasing_system) deliberately leaves
+    // ChaseCamera alone so the user's current distance/yaw/pitch
+    // survives an MSAA flip.
+    commands.insert_resource(ChaseCamera::default());
+}
+
+/// Spawn the OperatorCamera entity from current settings. Extracted so
+/// `apply_anti_aliasing_system` can despawn + respawn the camera on
+/// MSAA changes — patching `Msaa` in place hits a Bevy pipeline-cache
+/// race where the view target's sample count flips one frame before
+/// pipelines are re-specialized, panicking with "incompatible sample
+/// count" inside `main_opaque_pass_3d`. Recreating the camera forces
+/// Bevy to build fresh pipelines for the new sample count.
+///
+/// `restore_transform` reuses the camera's pose across the respawn so
+/// the user doesn't get yanked back to the default `(0, 12, 18)`.
+pub fn build_operator_camera(
+    commands: &mut Commands,
+    settings: &GraphicsSettings,
+    restore_transform: Option<Transform>,
+) {
     let mut camera = commands.spawn((
         crate::components::InGameEntity,
         OperatorCamera,
@@ -349,7 +367,9 @@ pub fn spawn_camera(mut commands: Commands, settings: Res<GraphicsSettings>) {
             fov: settings.fov_deg.to_radians(),
             ..default()
         }),
-        Transform::from_xyz(0.0, 12.0, 18.0).looking_at(Vec3::ZERO, Vec3::Y),
+        restore_transform.unwrap_or_else(|| {
+            Transform::from_xyz(0.0, 12.0, 18.0).looking_at(Vec3::ZERO, Vec3::Y)
+        }),
     ));
 
     // Raymarched volumetric fog is opt-in per the user's setting; pairs
@@ -374,8 +394,6 @@ pub fn spawn_camera(mut commands: Commands, settings: Res<GraphicsSettings>) {
     if matches!(settings.anti_aliasing, AaMode::Taa) {
         camera.insert(TemporalAntiAliasing::default());
     }
-
-    commands.insert_resource(ChaseCamera::default());
 }
 
 /// Position camera using spherical coords (yaw, pitch, distance) anchored
