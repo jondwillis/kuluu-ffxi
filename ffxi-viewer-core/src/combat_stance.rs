@@ -271,6 +271,34 @@ impl RestStance {
     }
 }
 
+/// Walk/run toggle (retail `Z`). When `walking` is true, the input
+/// dispatcher scales the step magnitude by [`WalkMode::WALK_SCALE`]
+/// (~50%), producing the slower retail walk gait. Flip via the
+/// `Action::ToggleWalk` keybind.
+///
+/// Pure local affordance — there is no server-side walk packet; the
+/// server only cares about the actual position deltas, which still
+/// land within the reactor speed envelope when scaled.
+#[derive(Resource, Default, Debug, Clone, Copy, Eq, PartialEq)]
+pub struct WalkMode {
+    pub walking: bool,
+}
+
+impl WalkMode {
+    /// Step-magnitude multiplier when walking. Retail walk is roughly
+    /// a quarter of run speed (slow, deliberate gait — easy to miss
+    /// with /target while moving). 0.25 matches that feel.
+    pub const WALK_SCALE: f32 = 0.25;
+    /// Returns the per-tick speed multiplier (1.0 for run, 0.5 for walk).
+    pub fn scale(self) -> f32 {
+        if self.walking {
+            Self::WALK_SCALE
+        } else {
+            1.0
+        }
+    }
+}
+
 /// Resolve a directional locomotion variant (`bck`/`stl`/`str`/`trn`/`wlk`)
 /// from a skeleton DAT. Cached; returns `None` and caches that `None`
 /// if the DAT carries no chunk with that 3-char prefix.

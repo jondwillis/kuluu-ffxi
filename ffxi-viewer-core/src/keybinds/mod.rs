@@ -126,6 +126,11 @@ pub enum Action {
     /// so the avatar animates `hea` and movement input cancels the
     /// rest the same way retail does. Default unbound.
     Heal,
+    /// Toggle walk/run movement mode (retail Z by default). When walking,
+    /// the step magnitude is scaled to ~50% of run. State lives in the
+    /// [`crate::movement::WalkMode`] resource; the input-dispatch step
+    /// calc reads it. Pressing again returns to run.
+    ToggleWalk,
 
     // ----- UI activation (World mode) -----
     /// Open chat with empty buffer (default Space).

@@ -98,6 +98,10 @@ fn shared() -> Vec<(Action, KeyBind)> {
         // layouts. We use the same default across every preset so
         // muscle memory carries between layouts.
         (Action::ToggleFirstPerson, KeyBind::new(KeyCode::KeyV)),
+        // Retail walk/run toggle: Z. Z is unbound for movement in every
+        // shipped layout (default Compact / Numpad both leave it free),
+        // so it's collision-safe across presets.
+        (Action::ToggleWalk, KeyBind::new(KeyCode::KeyZ)),
         // Retail Compact 1 zoom: `.` in, `,` out. Suppressed by the
         // dispatcher when the camera is in FirstPerson (no chase
         // distance to step). `Comma`/`Period` are the unshifted

@@ -121,17 +121,19 @@ const STRAFE_SCALE: f32 = 0.75;
 ///     camera lags at flank.
 ///   - `HLR = CTR`: 50/50 split at 45° each.
 ///
-/// At HLR=0.7, CTR=2.5 (shipped):
-///   ω ≈ 0.86 rad/sec (heading rotates ~49°/sec, visible turn)
-///   r ≈ 5.8 yalms
-///   lag_head ≈ 70° (player faces mostly back toward camera)
-///   lag_chase ≈ 20° (camera mostly behind, slightly off)
-const HEADING_LERP_RATE_RAD_PER_SEC: f32 = 0.7;
+/// Shipped HLR = CTR = 2.0 (retail-feel):
+///   ω = HLR · π/4 ≈ 1.57 rad/sec (~90°/sec sustained turn)
+///   lag_head ≈ 45° (player turns visibly toward direction of motion)
+///   lag_chase ≈ 45° (camera trails permanently — never catches up)
+///   r ≈ 3.2 yalms (tight orbit circle when D held alone)
+/// Equal split puts the player on screen at 3/4 view during sustained
+/// A or D, which is the FFXI-retail signature.
+const HEADING_LERP_RATE_RAD_PER_SEC: f32 = 2.0;
 
 /// Chase-camera yaw lerp rate toward "behind player heading", radians
 /// per real-time second. See [`HEADING_LERP_RATE_RAD_PER_SEC`] for the
 /// geometric trade-off and tuning notes.
-const CHASE_TRACK_RATE_RAD_PER_SEC: f32 = 2.5;
+const CHASE_TRACK_RATE_RAD_PER_SEC: f32 = 2.0;
 
 /// Horizontal-distance threshold (yalms) above which `dispatch_movement_system`
 /// abandons its local prediction and re-seeds from the snapshot. Sized for:
@@ -223,6 +225,7 @@ pub fn handle_input_system(
     cam_q: Query<(&Camera, &Transform), With<OperatorCamera>>,
     mut exit: MessageWriter<AppExit>,
     mut rest_stance: ResMut<ffxi_viewer_core::combat_stance::RestStance>,
+    mut walk_mode: ResMut<ffxi_viewer_core::combat_stance::WalkMode>,
 ) {
     // Close-window: Cmd+Q, Cmd+W, or the OS-level WindowCloseRequested
     // event (red traffic light, App→Quit menu, etc.). Hard-wired (not
@@ -364,6 +367,9 @@ pub fn handle_input_system(
         if bindings.pressed(Action::MoveForward, &keys) {
             autorun.phantom_forward = !autorun.phantom_forward;
         }
+    }
+    if bindings.just_pressed(Action::ToggleWalk, &keys) {
+        walk_mode.walking = !walk_mode.walking;
     }
     if bindings.just_pressed(Action::ToggleEngage, &keys) {
         // Toggle: if engaged, cancel the reactor goal (server clears
@@ -567,6 +573,7 @@ pub fn dispatch_movement_system(
     navmesh: Res<super::navmesh_overlay::NavmeshState>,
     minimap_hover: Res<ffxi_viewer_core::minimap::input::MinimapHoverGate>,
     mut rest_stance: ResMut<ffxi_viewer_core::combat_stance::RestStance>,
+    walk_mode: Res<ffxi_viewer_core::combat_stance::WalkMode>,
 ) {
     // Pause walking only when the operator's actively typing (Chat) or
     // making an event choice (Dialog). Menu and QuickAction overlays
@@ -711,27 +718,18 @@ pub fn dispatch_movement_system(
         autorun.phantom_forward = false;
     }
 
-    // --- rotate player (and chase camera lock-step). Time-based so the
-    //     turn rate is framerate-independent: `HEADING_TURN_RATE` rad/s
-    //     mapped onto the 256-unit FFXI heading scale. Holding A/D or
-    //     Q/E sweeps the player heading at ~0.86 rad/s (~49°/s) — a
-    //     visible pivot, not a snap. The fractional carry
-    //     (`HeadingTurnAccum`) makes sub-unit per-tick deltas at 60 Hz
-    //     accumulate into u8 ticks instead of rounding to zero every
-    //     frame. Both `RotateLeft`/`Right` (Q/E) and `TurnLeft`/`Right`
-    //     (A/D classic) feed the same accumulator; the A/D-implicit
-    //     forward step is added separately below via `turn`. ---
+    // --- Q/E (`RotateLeft`/`Right`): pure heading rotate. Time-based
+    //     via the accumulator so sub-unit per-tick deltas at 60 Hz
+    //     accumulate into u8 ticks instead of rounding to zero. A/D
+    //     (`TurnLeft`/`Right`) are NOT folded in here — they're the
+    //     camera-perpendicular orbit verb handled below; folding them
+    //     here would clobber the orbit's heading-lerp toward direction
+    //     of motion, defeating the retail steady-state circle. ---
     let mut player_rotate_dir: i32 = 0;
     if bindings.pressed(Action::RotateLeft, &keys) {
         player_rotate_dir -= 1;
     }
     if bindings.pressed(Action::RotateRight, &keys) {
-        player_rotate_dir += 1;
-    }
-    if bindings.pressed(Action::TurnLeft, &keys) {
-        player_rotate_dir -= 1;
-    }
-    if bindings.pressed(Action::TurnRight, &keys) {
         player_rotate_dir += 1;
     }
     let (player_rotate_u8, heading_delta_units) =
@@ -790,15 +788,25 @@ pub fn dispatch_movement_system(
     // check (turn must not trigger cancel) and AFTER the autorun
     // phantom_forward expansion (so W+A doesn't double-count forward).
     //
-    // A/D (TurnLeft/Right) rotate heading via `player_rotate_dir` in
-    // both Chase and FirstPerson — folded into the accumulator at the
-    // top of this fn. The legacy "turn_in_chase" orbit-strafe path was
-    // removed because it overwrote the accumulator's heading with a
-    // lerp-toward-motion, defeating the rotate. The orbit/circle feel
-    // is now an emergent property of `Rotate + MoveForward` composing
-    // naturally (heading sweeps → forward direction sweeps), which
-    // matches retail FFXI.
-    let turn_in_chase = false;
+    // A/D in Chase mode → orbit/strafe path below. Two coupled springs
+    // (heading lerp toward motion direction, chase-yaw lerp toward
+    // behind player) settle to lag_head + lag_chase = π/2 with the
+    // shipped HLR=CTR=2.0 producing the retail 45°/45° split.
+    //
+    // A/D in FirstPerson → folded into player_rotate so the look
+    // direction sweeps (pure rotate; FP has no orbit visual).
+    let turn_in_chase = turn != 0 && matches!(*camera_mode, CameraMode::Chase);
+    let mut fp_rotate_u8: i32 = 0;
+    if turn != 0 && !turn_in_chase {
+        // First-person: convert held A/D into accumulator-equivalent
+        // units this tick so the same HEADING_TURN_RATE applies.
+        let (whole, _) = advance_heading_turn(
+            &mut turn_accum.units,
+            turn,
+            time.delta_secs(),
+        );
+        fp_rotate_u8 = whole;
+    }
 
     // Lock-on heading override — computed before the no-input bail-out
     // so the camera pivots to follow the target even when the player
@@ -908,6 +916,12 @@ pub fn dispatch_movement_system(
         // domain, every tick). No second yaw delta here, otherwise the
         // camera would double-step on integer-tick frames and drift.
     }
+    if fp_rotate_u8 != 0 {
+        // First-person A/D: same finite-rate pivot, but no chase-yaw
+        // coupling (FP camera tracks heading directly).
+        let delta = fp_rotate_u8.rem_euclid(256) as u8;
+        heading = heading.wrapping_add(delta);
+    }
 
     // Turn (3rd-person A/D) — strafe + heading-lerp + chase-lerp.
     //
@@ -947,7 +961,8 @@ pub fn dispatch_movement_system(
         let my = cf_y * fwd_signed + cr_y * lat_signed;
         let len = (mx * mx + my * my).sqrt();
 
-        let step_magnitude = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs();
+        let step_magnitude =
+            self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs() * walk_mode.scale();
         if len > 1e-3 && step_magnitude > 0.0 {
             let inv = 1.0 / len;
             turn_dx = mx * inv * step_magnitude;
@@ -997,7 +1012,8 @@ pub fn dispatch_movement_system(
     // dt`. `speed=0` (entity hasn't been populated yet) → 0 step, which
     // silently skips movement instead of teleporting somewhere weird.
     // Speed_base is the unmodified value.
-    let raw_step = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs();
+    let raw_step =
+        self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs() * walk_mode.scale();
     // Retail direction caps (applied after reactor speed scaling):
     //   * Backpedal (S only)            → 0.5×
     //   * Pure strafe (A/D only, no W/S) → 0.75×

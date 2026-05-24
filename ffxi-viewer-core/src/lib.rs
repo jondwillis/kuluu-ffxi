@@ -177,6 +177,18 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             // `init_resource` here is a no-op in that case. WASM and
             // headless tests fall back to the default (High preset).
             .init_resource::<GraphicsSettings>()
+            // MSAA capability probe — replaced at Startup with the
+            // real adapter caps; default is the WebGPU spec floor so
+            // apply_anti_aliasing_system has something safe to clamp
+            // against on frame 0.
+            .init_resource::<graphics_settings::MsaaCaps>()
+            // PreStartup: must run before `spawn_camera` (front-end
+            // Startup system) which reads `settings.msaa()` and puts
+            // the result on the camera entity. If we ran in Startup we
+            // could end up after the camera spawn, and the render
+            // world's first extract would already see the unsupported
+            // sample count → panic in `prepare_view_targets`.
+            .add_systems(PreStartup, graphics_settings::init_msaa_caps_system)
             .init_resource::<atmosphere::ZoneAtmosphereProvider>()
             .init_resource::<atmosphere::LastAtmosphereZone>()
             .init_resource::<sun_moon::VanaSky>()
@@ -295,6 +307,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         app.init_resource::<combat_stance::EntityMotion>();
         app.init_resource::<combat_stance::RestStance>();
         app.init_resource::<combat_stance::AnimationBlends>();
+        app.init_resource::<combat_stance::WalkMode>();
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,
