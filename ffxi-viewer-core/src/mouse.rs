@@ -72,7 +72,19 @@ pub struct MousePointer {
     /// Total wheel scroll this frame, in lines (Bevy normalizes pixels and
     /// lines into the same `MouseScrollUnit::Line` axis under `.y`).
     pub wheel: f32,
+    /// True if the LMB has moved more than [`DRAG_THRESHOLD_PX`] since
+    /// the last press. Cleared on the next press; persists through the
+    /// release event so click handlers can distinguish a click from a
+    /// drag-release.
+    pub left_dragged: bool,
+    /// Right-button equivalent of [`Self::left_dragged`].
+    pub right_dragged: bool,
 }
+
+/// Squared pixel threshold above which a button-held + cursor-motion
+/// pair is considered a "drag" instead of a click. 5 px ≈ a couple of
+/// trackpad units; anything beyond is intentional cursor motion.
+const DRAG_THRESHOLD_PX_SQ: f32 = 25.0;
 
 /// Operator-set lock request. The cursor-lock system mirrors this onto the
 /// primary window's `CursorOptions`. Decoupling the request from the actual
@@ -141,10 +153,34 @@ pub fn collect_mouse_system(
     for ev in buttons.read() {
         let pressed = ev.state == ButtonState::Pressed;
         match ev.button {
-            MouseButton::Left => state.left = pressed,
-            MouseButton::Right => state.right = pressed,
+            MouseButton::Left => {
+                if pressed {
+                    // Rising edge: start a fresh drag-tracking window.
+                    state.left_dragged = false;
+                }
+                state.left = pressed;
+            }
+            MouseButton::Right => {
+                if pressed {
+                    state.right_dragged = false;
+                }
+                state.right = pressed;
+            }
             MouseButton::Middle => state.middle = pressed,
             _ => {}
+        }
+    }
+
+    // After button + motion events are drained, latch the dragged flags
+    // if the operator moved the cursor far enough while a button is held.
+    // The flag survives until the next press of that button — that way
+    // the release-frame click handler can still see it.
+    if state.delta.length_squared() > DRAG_THRESHOLD_PX_SQ {
+        if state.left {
+            state.left_dragged = true;
+        }
+        if state.right {
+            state.right_dragged = true;
         }
     }
 

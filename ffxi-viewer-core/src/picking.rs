@@ -178,6 +178,7 @@ pub fn click_to_target_system(
     mut clicks: MessageReader<Pointer<Click>>,
     q_world: Query<&WorldEntity>,
     q_parent: Query<&ChildOf>,
+    pointer: Res<crate::mouse::MousePointer>,
     mut target: ResMut<Target>,
     mut input_mode: ResMut<InputMode>,
 ) {
@@ -186,6 +187,14 @@ pub fn click_to_target_system(
             continue;
         }
         if !matches!(*input_mode, InputMode::World) {
+            continue;
+        }
+        // Suppress when the LMB-up that produced this Click was the end
+        // of a camera-drag rotation, not a discrete click. Bevy's
+        // `Pointer<Click>` fires for any press+release on the same
+        // target, so without this guard a drag-rotate that ended over
+        // empty ground would pop the context menu.
+        if pointer.left_dragged {
             continue;
         }
         let world_entity = find_world_entity(ev.entity, &q_world, &q_parent);

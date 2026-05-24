@@ -50,9 +50,21 @@
 
 use std::time::{Duration, Instant};
 
+use bevy::ecs::system::SystemParam;
 use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use bevy::window::WindowCloseRequested;
+
+/// Bundles camera-related ResMuts so `handle_input_system` stays under
+/// Bevy's 16-param SystemParam tuple limit.
+#[derive(SystemParam)]
+pub struct CameraInputParams<'w> {
+    pub mode: ResMut<'w, CameraMode>,
+    pub chase: ResMut<'w, ChaseCamera>,
+    pub cursor_lock: ResMut<'w, CursorLockRequest>,
+    pub lock_on: ResMut<'w, LockOn>,
+    pub transition: ResMut<'w, CameraTransition>,
+}
 use ffxi_viewer_core::{
     heading_for_yaw, yaw_for_heading, Action, Bindings, CameraMode, CameraTransition,
     ChaseCamera, ChatBuffer, CursorLockRequest, InputMode, IsSelf, LockOn, LockOnToggle,
@@ -224,16 +236,17 @@ pub fn handle_input_system(
     mut mode: ResMut<InputMode>,
     mut target: ResMut<Target>,
     mut autorun: ResMut<AutoRun>,
-    mut camera_mode: ResMut<CameraMode>,
-    mut chase: ResMut<ChaseCamera>,
-    mut cursor_lock: ResMut<CursorLockRequest>,
-    mut lock_on: ResMut<LockOn>,
+    mut camera: CameraInputParams,
     cam_q: Query<(&Camera, &Transform), With<OperatorCamera>>,
     mut exit: MessageWriter<AppExit>,
     mut rest_stance: ResMut<ffxi_viewer_core::combat_stance::RestStance>,
     mut walk_mode: ResMut<ffxi_viewer_core::combat_stance::WalkMode>,
-    mut camera_transition: ResMut<CameraTransition>,
 ) {
+    let camera_mode = &mut camera.mode;
+    let chase = &mut camera.chase;
+    let cursor_lock = &mut camera.cursor_lock;
+    let lock_on = &mut camera.lock_on;
+    let camera_transition = &mut camera.transition;
     // Close-window: Cmd+Q, Cmd+W, or the OS-level WindowCloseRequested
     // event (red traffic light, App→Quit menu, etc.). Hard-wired (not
     // bindings-driven) — quitting must work in any input mode and isn't
@@ -268,7 +281,7 @@ pub fn handle_input_system(
         // Retail dollies between 3p and 1p instead of cutting — start
         // a 0.35s zoom transition. `camera_transition_system` runs in
         // Update and handles mode-swap mid-dolly.
-        camera_transition.begin(*camera_mode, chase.distance);
+        camera_transition.begin(**camera_mode, chase.distance);
         cursor_lock.locked = false;
     }
 
@@ -1268,27 +1281,33 @@ where
     }
 }
 
-/// State for the auto-recenter behavior: how long forward has been
-/// continuously held with no operator yaw input. After
-/// [`AUTO_RECENTER_HOLD_S`] the chase camera lerps toward "behind the
-/// player at current heading" at [`AUTO_RECENTER_RATE`] rad/s. Any
-/// `CameraYawLeft`/`Right` press cancels and resets the timer.
+/// State for the auto-recenter behavior. `manual_override` latches true
+/// the moment the operator rotates the camera by hand (arrow keys or
+/// mouse drag) and stays true until the operator moves the character.
+/// While true, the post-motion chase-to-behind recenter is suppressed
+/// so a manually-positioned camera holds its orbit. The
+/// `forward_held_since` field is retained for diagnostic / future
+/// timer-gated polish work.
 #[derive(Resource, Default)]
 pub struct CameraAutoRecenter {
-    /// `Some(instant)` while MoveForward has been held continuously with
-    /// no yaw input since `instant`; `None` otherwise. Active recenter
-    /// begins once `now - instant >= AUTO_RECENTER_HOLD_S`.
+    /// Reserved — recenter is no longer gated on a forward-hold timer.
     pub forward_held_since: Option<Instant>,
+    /// True when the operator manually orbited the camera since the
+    /// last character-movement input. Suppresses the chase recenter
+    /// until a movement key clears it.
+    pub manual_override: bool,
 }
 
 /// Forward must be held this long with no yaw input before auto-recenter
 /// engages. Matches retail's "walk a beat before the camera trails" feel
 /// (long enough that brief forward taps don't twitch the camera).
 const AUTO_RECENTER_HOLD_S: f32 = 0.5;
-/// Angular rate of the auto-recenter lerp, radians/sec. ~0.6 rad/s ≈ 34°/s
-/// — fast enough to obviously settle while walking, slow enough to read
-/// as a smooth follow rather than a snap.
-const AUTO_RECENTER_RATE: f32 = 0.6;
+/// Spring constant for the post-motion chase recenter (1/sec).
+/// Exponential lerp: each tick the residual angle shrinks by
+/// `1 - exp(-rate · dt)`. At 0.9 the half-life is ~0.77s — the
+/// camera obviously chases without snapping. Bumped 50% from the
+/// initial 0.6 per operator feel.
+const AUTO_RECENTER_RATE: f32 = 0.9;
 /// First-person look-at-lock pitch tracking rate, radians/sec. ~3 rad/s
 /// is fast: when locked onto a tall mob the camera tips up to meet its
 /// head within ~½ second from a level start.
@@ -1317,6 +1336,7 @@ pub fn camera_polish_system(
     camera_mode: Res<CameraMode>,
     state: Res<SceneState>,
     lock_on: Res<LockOn>,
+    pointer: Res<ffxi_viewer_core::MousePointer>,
     mut chase: ResMut<ChaseCamera>,
     mut recenter: ResMut<CameraAutoRecenter>,
     self_q: Query<&Transform, (With<IsSelf>, Without<OperatorCamera>)>,
@@ -1328,6 +1348,28 @@ pub fn camera_polish_system(
     if !matches!(*mode, InputMode::World) {
         recenter.forward_held_since = None;
         return;
+    }
+
+    // Maintain the manual-orbit override flag.
+    //   - Arrow-key yaw or mouse drag → operator is moving the camera by
+    //     hand. Latch the override so we stop fighting them after they
+    //     release.
+    //   - Any character-movement input (W/S/A/D/strafe) → clear it. The
+    //     player chose to move, so the camera should now follow.
+    let yaw_input = bindings.pressed(Action::CameraYawLeft, &keys)
+        || bindings.pressed(Action::CameraYawRight, &keys);
+    let drag_active = pointer.left || pointer.right;
+    if yaw_input || drag_active {
+        recenter.manual_override = true;
+    }
+    let movement_input = bindings.pressed(Action::MoveForward, &keys)
+        || bindings.pressed(Action::MoveBackward, &keys)
+        || bindings.pressed(Action::StrafeLeft, &keys)
+        || bindings.pressed(Action::StrafeRight, &keys)
+        || bindings.pressed(Action::TurnLeft, &keys)
+        || bindings.pressed(Action::TurnRight, &keys);
+    if movement_input {
+        recenter.manual_override = false;
     }
 
     // --- (a) Persistent chase-to-behind-player ------------------------
@@ -1342,11 +1384,11 @@ pub fn camera_polish_system(
     // but doesn't fight the orbit-strafe's faster CHASE_TRACK_RATE
     // during sustained A/D (the orbit branch overwrites chase.yaw
     // every tick with a larger step before this runs).
-    let yaw_input = bindings.pressed(Action::CameraYawLeft, &keys)
-        || bindings.pressed(Action::CameraYawRight, &keys);
-    let _ = &mut recenter; // resource retained for future operator-tunable knobs
-
-    if !yaw_input && matches!(*camera_mode, CameraMode::Chase) {
+    if !yaw_input
+        && !drag_active
+        && !recenter.manual_override
+        && matches!(*camera_mode, CameraMode::Chase)
+    {
         let target_yaw = yaw_for_heading(state.snapshot.self_pos.heading);
         let tau = std::f32::consts::TAU;
         let mut diff = (target_yaw - chase.yaw).rem_euclid(tau);
