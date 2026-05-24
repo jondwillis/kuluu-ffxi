@@ -29,10 +29,46 @@ use tokio::sync::oneshot;
 use crate::launcher::Selection;
 
 use super::{
-    CharCreateError, CharCreateForm, CharListData, CreateAccountErrorMsg, CreateAccountForm,
-    Credentials, LauncherClients, LauncherState, LoginErrorMsg, LoginForm, OpenedLobby,
-    PendingConnect, RuntimeHandle, SelectedChar,
+    ChangePasswordForm, CharCreateError, CharCreateForm, CharListData, CreateAccountErrorMsg,
+    CreateAccountForm, Credentials, LauncherClients, LauncherState, LoginErrorMsg, LoginForm,
+    OpenedLobby, PendingConnect, RuntimeHandle, SelectedChar, ServerSelectForm,
 };
+
+use ffxi_client::launcher_store::{self, keyring_account_key, SavedAccount, KEYRING_SERVICE};
+use ffxi_client::secret_store::SecretStore;
+
+/// Single mutation entry-point called after a successful login or
+/// account-create. Updates `LauncherStore` to ensure a matching
+/// `SavedAccount` row exists, sets `last_used`, persists, and writes the
+/// password to the OS keyring iff `remember` is set (or removes any
+/// stale entry when `remember` was just toggled off). All errors are
+/// swallowed-to-warn — persistence failures must never block login.
+fn save_on_success(server_name: &str, username: &str, password: &str, remember: bool) {
+    let mut store = launcher_store::load();
+    if let Some(row) = store
+        .accounts
+        .iter_mut()
+        .find(|a| a.server_name == server_name && a.username == username)
+    {
+        row.remember_password = remember;
+    } else {
+        store.accounts.push(SavedAccount {
+            server_name: server_name.to_string(),
+            username: username.to_string(),
+            remember_password: remember,
+        });
+    }
+    store.last_used = Some((server_name.to_string(), username.to_string()));
+    if let Err(e) = launcher_store::save(&store) {
+        tracing::warn!(error = %e, "launcher_store: save failed");
+    }
+    let key = keyring_account_key(server_name, username);
+    if remember {
+        SecretStore::set(KEYRING_SERVICE, &key, password);
+    } else {
+        SecretStore::delete(KEYRING_SERVICE, &key);
+    }
+}
 
 /// Auth + lobby-open in one task: succeeds when both auth and the lobby
 /// `open()` returned (which is when we have the char list to render).
@@ -115,6 +151,9 @@ pub(super) fn poll_auth_system(
     mut chars: ResMut<CharListData>,
     opened: Res<OpenedLobby>,
     mut creds: ResMut<Credentials>,
+    form: Res<LoginForm>,
+    server_form: Res<ServerSelectForm>,
+    server_info: Res<super::ServerInfo>,
 ) {
     match chan.rx.try_recv() {
         Ok(Ok(ok)) => {
@@ -129,6 +168,11 @@ pub(super) fn poll_auth_system(
                 slot.handle = Some(ok.handle);
                 slot.auth = Some(ok.auth);
             }
+            let server_name = server_form
+                .selected
+                .clone()
+                .unwrap_or_else(|| server_info.server.clone());
+            save_on_success(&server_name, &ok.user, &ok.pass, form.remember_password);
             creds.user = ok.user;
             creds.pass = ok.pass;
             commands.remove_resource::<AuthInFlightChan>();
@@ -707,6 +751,240 @@ pub(super) fn spawn_account_create_ui(mut commands: Commands, form: Res<CreateAc
 pub(super) fn despawn_account_create_ui(
     mut commands: Commands,
     q: Query<Entity, With<AccountCreateUiRoot>>,
+) {
+    for e in q.iter() {
+        commands.entity(e).despawn();
+    }
+}
+
+// --- Change-password in flight -------------------------------------------
+
+#[derive(Resource)]
+pub(super) struct ChangePasswordChan {
+    rx: oneshot::Receiver<Result<()>>,
+}
+
+#[derive(Component)]
+pub(super) struct ChangePasswordUiRoot;
+
+pub(super) fn spawn_change_password_task(
+    mut commands: Commands,
+    runtime: Res<RuntimeHandle>,
+    clients: Res<LauncherClients>,
+    form: Res<ChangePasswordForm>,
+    login: Res<LoginForm>,
+) {
+    let (tx, rx) = oneshot::channel();
+    let auth: Arc<AuthClient> = clients.auth.clone();
+    let user = login.user.clone();
+    let old = form.old.clone();
+    let new_pw = form.new_pw.clone();
+    runtime.0.spawn(async move {
+        let res = auth
+            .change_password(&user, &old, &new_pw)
+            .await
+            .map_err(|e| anyhow!("change_password: {e}"));
+        let _ = tx.send(res);
+    });
+    commands.insert_resource(ChangePasswordChan { rx });
+}
+
+pub(super) fn poll_change_password_system(
+    mut commands: Commands,
+    mut chan: ResMut<ChangePasswordChan>,
+    mut next_state: ResMut<NextState<LauncherState>>,
+    mut err: ResMut<LoginErrorMsg>,
+    mut form: ResMut<ChangePasswordForm>,
+    mut login: ResMut<LoginForm>,
+) {
+    match chan.rx.try_recv() {
+        Ok(Ok(())) => {
+            // Push the new password into the Login form so the user can
+            // press Enter to re-authenticate without retyping it.
+            login.pass = form.new_pw.clone();
+            form.old.clear();
+            form.new_pw.clear();
+            form.confirm.clear();
+            form.error.clear();
+            commands.remove_resource::<ChangePasswordChan>();
+            next_state.set(LauncherState::Login);
+        }
+        Ok(Err(e)) => {
+            err.0 = format!("{e:#}");
+            commands.remove_resource::<ChangePasswordChan>();
+            next_state.set(LauncherState::LoginError);
+        }
+        Err(oneshot::error::TryRecvError::Empty) => {}
+        Err(oneshot::error::TryRecvError::Closed) => {
+            err.0 = "change-password task dropped its sender unexpectedly".into();
+            commands.remove_resource::<ChangePasswordChan>();
+            next_state.set(LauncherState::LoginError);
+        }
+    }
+}
+
+pub(super) fn spawn_change_password_ui(mut commands: Commands) {
+    commands
+        .spawn((
+            ChangePasswordUiRoot,
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(20.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.04, 0.04, 0.05)),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("Changing password..."),
+                TextFont {
+                    font_size: 20.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.0, 1.0, 1.0)),
+            ));
+        });
+}
+
+pub(super) fn despawn_change_password_ui(
+    mut commands: Commands,
+    q: Query<Entity, With<ChangePasswordUiRoot>>,
+) {
+    for e in q.iter() {
+        commands.entity(e).despawn();
+    }
+}
+
+// --- Char-delete in flight -----------------------------------------------
+
+struct CharDeleteOk {
+    handle: LobbyHandle,
+}
+
+#[derive(Resource)]
+pub(super) struct CharDeleteChan {
+    rx: oneshot::Receiver<Result<CharDeleteOk>>,
+}
+
+#[derive(Component)]
+pub(super) struct CharDeleteUiRoot;
+
+pub(super) fn spawn_char_delete_task(
+    mut commands: Commands,
+    runtime: Res<RuntimeHandle>,
+    sel: Res<SelectedChar>,
+    opened: Res<OpenedLobby>,
+) {
+    let (tx, rx) = oneshot::channel();
+    let Some(slot) = sel.0.clone() else {
+        runtime.0.spawn(async move {
+            let _ = tx.send(Err(anyhow!("no character selected for delete")));
+        });
+        commands.insert_resource(CharDeleteChan { rx });
+        return;
+    };
+    let (handle, auth) = match opened.0.lock() {
+        Ok(mut g) => (g.handle.take(), g.auth.take()),
+        Err(_) => (None, None),
+    };
+    let (Some(handle), Some(auth)) = (handle, auth) else {
+        runtime.0.spawn(async move {
+            let _ = tx.send(Err(anyhow!(
+                "no live lobby session available — please log in again"
+            )));
+        });
+        commands.insert_resource(CharDeleteChan { rx });
+        return;
+    };
+    runtime.0.spawn(async move {
+        let res = handle
+            .delete_character(&auth, slot.char_id)
+            .await
+            .map(|h| CharDeleteOk { handle: h })
+            .map_err(|e| anyhow!("delete_character: {e}"));
+        let _ = tx.send(res);
+    });
+    commands.insert_resource(CharDeleteChan { rx });
+}
+
+pub(super) fn poll_char_delete_system(
+    mut commands: Commands,
+    mut chan: ResMut<CharDeleteChan>,
+    mut next_state: ResMut<NextState<LauncherState>>,
+    mut err: ResMut<LoginErrorMsg>,
+    mut chars: ResMut<CharListData>,
+    opened: Res<OpenedLobby>,
+    creds: Res<Credentials>,
+    mut form: ResMut<LoginForm>,
+) {
+    match chan.rx.try_recv() {
+        Ok(Ok(ok)) => {
+            chars.0 = ok.handle.chars().to_vec();
+            // Same justCreatedNewChar caution as char-create: drop the
+            // post-mutation lobby handle so the next CharList entry
+            // opens a fresh session via AuthInFlight.
+            if let Ok(mut slot) = opened.0.lock() {
+                slot.handle = None;
+                slot.auth = None;
+            }
+            form.user = creds.user.clone();
+            form.pass = creds.pass.clone();
+            commands.remove_resource::<CharDeleteChan>();
+            next_state.set(LauncherState::AuthInFlight);
+        }
+        Ok(Err(e)) => {
+            err.0 = format!("{e:#}");
+            commands.remove_resource::<CharDeleteChan>();
+            next_state.set(LauncherState::LoginError);
+        }
+        Err(oneshot::error::TryRecvError::Empty) => {}
+        Err(oneshot::error::TryRecvError::Closed) => {
+            err.0 = "char-delete task dropped its sender unexpectedly".into();
+            commands.remove_resource::<CharDeleteChan>();
+            next_state.set(LauncherState::LoginError);
+        }
+    }
+}
+
+pub(super) fn spawn_char_delete_ui(mut commands: Commands, sel: Res<SelectedChar>) {
+    let name = sel
+        .0
+        .as_ref()
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "?".into());
+    commands
+        .spawn((
+            CharDeleteUiRoot,
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(20.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.04, 0.04, 0.05)),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new(format!("Deleting {name}...")),
+                TextFont {
+                    font_size: 20.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.95, 0.20, 0.20)),
+            ));
+        });
+}
+
+pub(super) fn despawn_char_delete_ui(
+    mut commands: Commands,
+    q: Query<Entity, With<CharDeleteUiRoot>>,
 ) {
     for e in q.iter() {
         commands.entity(e).despawn();

@@ -232,6 +232,13 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     if direct_mode_autostart {
         app.insert_resource(launcher_ui::DirectModeAutostart);
     }
+    // Treat a positional `user` arg as the "CLI override" signal — when
+    // present, skip the persisted ServerSelect/AccountPicker chain and
+    // seed the LoginForm directly (already done via `defaults` →
+    // `LoginForm` in `launcher_ui::register`).
+    if defaults.user.is_some() {
+        app.insert_resource(launcher_ui::CliOverridesPresent);
+    }
 
     // Launcher: registers its sub-state, resources, and per-state systems.
     launcher_ui::register(&mut app, &server, auth, lobby, defaults, runtime);

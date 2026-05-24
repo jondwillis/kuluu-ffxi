@@ -47,11 +47,15 @@
 //! ```
 
 mod account_create;
+mod account_picker;
 mod async_work;
+mod change_password;
 mod char_create;
 mod char_list;
 mod char_preview;
 mod login;
+mod server_edit;
+mod server_select;
 
 use std::sync::{Arc, Mutex};
 
@@ -71,6 +75,21 @@ use super::AppPhase;
 #[derive(SubStates, Default, Debug, Clone, Eq, PartialEq, Hash)]
 #[source(super::AppPhase = super::AppPhase::Launcher)]
 pub(crate) enum LauncherState {
+    /// Persisted-server picker. Default when no CLI overrides AND no
+    /// `last_used` entry — otherwise the launcher seeds straight into
+    /// `Login` via `direct_mode_login_autostart` / the prefill systems.
+    ServerSelect,
+    /// Add or edit a `ServerProfile`. Reached from `ServerSelect` via
+    /// Ctrl-N (new) or Ctrl-E (edit).
+    ServerEdit,
+    /// Pick a saved account on the previously-selected server.
+    AccountPicker,
+    /// Change password form (old / new / confirm). Reached from Login via
+    /// Ctrl-P.
+    ChangePassword,
+    /// Sending the change-password command. Success → Login; failure →
+    /// LoginError.
+    ChangePasswordInFlight,
     #[default]
     Login,
     /// Account creation form. Reached from `Login` via the C key.
@@ -99,6 +118,13 @@ pub(crate) enum LauncherState {
     /// Server rejected the create (name in use, banned word, etc.). Esc
     /// returns to the form; Enter retries.
     CharCreateError,
+    /// Inline confirmation modal for Ctrl-D on a char-list row. Enter
+    /// dispatches `CharDeleteInFlight`; Esc returns to `CharList`.
+    /// (LSB's delete handler doesn't actually validate the `passwd`
+    /// field — only `accountID` from the live session — so we use a
+    /// simple Y/N confirm rather than re-prompting for the password.)
+    CharDeleteConfirm,
+    CharDeleteInFlight,
     ConnectInFlight,
     LoginError,
     /// Terminal for the launcher: triggers transition to
@@ -236,6 +262,122 @@ pub(crate) struct LoginForm {
     pub user: String,
     pub pass: String,
     pub focus: LoginField,
+    /// When true, a successful login persists the password to the OS
+    /// keyring under `(KEYRING_SERVICE, server:user)`. Toggled with
+    /// Ctrl-R; pre-populated from `SavedAccount.remember_password` when
+    /// the account-picker prefills this form.
+    pub remember_password: bool,
+}
+
+/// Field focus on the server-edit form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum ServerEditField {
+    #[default]
+    Name,
+    Host,
+    AuthPort,
+    DataPort,
+    ViewPort,
+    Flavor,
+}
+
+impl ServerEditField {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Host,
+            Self::Host => Self::AuthPort,
+            Self::AuthPort => Self::DataPort,
+            Self::DataPort => Self::ViewPort,
+            Self::ViewPort => Self::Flavor,
+            Self::Flavor => Self::Name,
+        }
+    }
+}
+
+/// Server-select form: just tracks which server name was picked so the
+/// account-picker can filter by it.
+#[derive(Resource, Default)]
+pub(crate) struct ServerSelectForm {
+    pub selected: Option<String>,
+}
+
+/// Keyboard cursor for the server-select list.
+#[derive(Resource, Default)]
+pub(crate) struct ServerSelectCursor(pub usize);
+
+/// Keyboard cursor for the account-picker list.
+#[derive(Resource, Default)]
+pub(crate) struct AccountPickerCursor(pub usize);
+
+/// Server-edit form. `editing_index = Some(i)` overwrites the i-th
+/// `ServerProfile` in `LauncherStore`; `None` appends.
+#[derive(Resource)]
+pub(crate) struct ServerEditForm {
+    pub name: String,
+    pub host: String,
+    pub auth_port: String,
+    pub data_port: String,
+    pub view_port: String,
+    pub flavor: ffxi_client::launcher_store::AuthFlavorKind,
+    pub focus: ServerEditField,
+    pub editing_index: Option<usize>,
+}
+
+impl Default for ServerEditForm {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            host: String::new(),
+            auth_port: String::from("54231"),
+            data_port: String::from("54230"),
+            view_port: String::from("54001"),
+            flavor: ffxi_client::launcher_store::AuthFlavorKind::Json,
+            focus: ServerEditField::default(),
+            editing_index: None,
+        }
+    }
+}
+
+impl ServerEditForm {
+    pub fn from_profile(p: &ffxi_client::launcher_store::ServerProfile) -> Self {
+        Self {
+            name: p.name.clone(),
+            host: p.host.clone(),
+            auth_port: p.auth_port.to_string(),
+            data_port: p.data_port.to_string(),
+            view_port: p.view_port.to_string(),
+            flavor: p.flavor,
+            focus: ServerEditField::default(),
+            editing_index: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum ChangePasswordField {
+    #[default]
+    Old,
+    New,
+    Confirm,
+}
+
+impl ChangePasswordField {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Old => Self::New,
+            Self::New => Self::Confirm,
+            Self::Confirm => Self::Old,
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+pub(crate) struct ChangePasswordForm {
+    pub old: String,
+    pub new_pw: String,
+    pub confirm: String,
+    pub focus: ChangePasswordField,
+    pub error: String,
 }
 
 /// Which field on the create-account form has keyboard focus.
@@ -428,6 +570,13 @@ pub(crate) struct DefaultCharName(pub Option<String>);
 #[derive(Resource)]
 pub(crate) struct DirectModeAutostart;
 
+/// Marker resource set when *any* CLI override (--server / --username /
+/// --password / etc.) is present. Used to decide the launcher's initial
+/// state: with overrides → straight to `Login`; without → `ServerSelect`
+/// when a `LauncherStore` exists.
+#[derive(Resource)]
+pub(crate) struct CliOverridesPresent;
+
 /// 2D-camera marker. Spawned `OnEnter(AppPhase::Launcher)`, despawned
 /// `OnExit(AppPhase::Launcher)` so the in-game 3D camera (spawned by
 /// `OnEnter(AppPhase::InGame)`) doesn't compete with this 2D one.
@@ -471,6 +620,11 @@ pub(crate) fn register(
         .insert_resource(CharCreateError::default())
         .insert_resource(CreateAccountForm::default())
         .insert_resource(CreateAccountErrorMsg::default())
+        .insert_resource(ServerSelectForm::default())
+        .insert_resource(ServerSelectCursor::default())
+        .insert_resource(AccountPickerCursor::default())
+        .insert_resource(ServerEditForm::default())
+        .insert_resource(ChangePasswordForm::default())
         .insert_resource(DefaultCharName(defaults.char_name));
 
     // Launcher's 2D camera tracks the launcher phase exactly. The
@@ -482,6 +636,65 @@ pub(crate) fn register(
     // Re-entry hook: if returning to Launcher from a failed Connecting
     // bridge, jump straight to LoginError.
     app.add_systems(OnEnter(AppPhase::Launcher), restore_login_error_on_reentry);
+
+    // First-frame decision: if no CLI overrides and no last_used pair,
+    // jump from default Login → ServerSelect so the user manages
+    // profiles before being prompted for creds.
+    app.add_systems(OnEnter(LauncherState::Login), decide_initial_screen);
+
+    // New screens.
+    app.add_systems(OnEnter(LauncherState::ServerSelect), server_select::spawn_ui)
+        .add_systems(OnExit(LauncherState::ServerSelect), server_select::despawn_ui)
+        .add_systems(
+            Update,
+            server_select::keyboard_input_system.run_if(in_state(LauncherState::ServerSelect)),
+        );
+
+    app.add_systems(OnEnter(LauncherState::ServerEdit), server_edit::spawn_ui)
+        .add_systems(OnExit(LauncherState::ServerEdit), server_edit::despawn_ui)
+        .add_systems(
+            Update,
+            (
+                server_edit::keyboard_input_system,
+                server_edit::redraw_system,
+            )
+                .run_if(in_state(LauncherState::ServerEdit)),
+        );
+
+    app.add_systems(OnEnter(LauncherState::AccountPicker), account_picker::spawn_ui)
+        .add_systems(OnExit(LauncherState::AccountPicker), account_picker::despawn_ui)
+        .add_systems(
+            Update,
+            account_picker::keyboard_input_system.run_if(in_state(LauncherState::AccountPicker)),
+        );
+
+    app.add_systems(OnEnter(LauncherState::ChangePassword), change_password::spawn_ui)
+        .add_systems(OnExit(LauncherState::ChangePassword), change_password::despawn_ui)
+        .add_systems(
+            Update,
+            (
+                change_password::keyboard_input_system,
+                change_password::redraw_system,
+            )
+                .run_if(in_state(LauncherState::ChangePassword)),
+        );
+
+    app.add_systems(
+        OnEnter(LauncherState::ChangePasswordInFlight),
+        (
+            async_work::spawn_change_password_task,
+            async_work::spawn_change_password_ui,
+        ),
+    )
+    .add_systems(
+        OnExit(LauncherState::ChangePasswordInFlight),
+        async_work::despawn_change_password_ui,
+    )
+    .add_systems(
+        Update,
+        async_work::poll_change_password_system
+            .run_if(in_state(LauncherState::ChangePasswordInFlight)),
+    );
 
     // Login screen: builds UI on enter, eats keys, redraws on each frame
     // it's active.
@@ -603,6 +816,37 @@ pub(crate) fn register(
         async_work::poll_char_create_system.run_if(in_state(LauncherState::CharCreateInFlight)),
     );
 
+    // Char delete: confirm then in-flight.
+    app.add_systems(
+        OnEnter(LauncherState::CharDeleteConfirm),
+        char_list::spawn_delete_confirm_ui,
+    )
+    .add_systems(
+        OnExit(LauncherState::CharDeleteConfirm),
+        char_list::despawn_delete_confirm_ui,
+    )
+    .add_systems(
+        Update,
+        char_list::delete_confirm_keyboard_system
+            .run_if(in_state(LauncherState::CharDeleteConfirm)),
+    );
+
+    app.add_systems(
+        OnEnter(LauncherState::CharDeleteInFlight),
+        (
+            async_work::spawn_char_delete_task,
+            async_work::spawn_char_delete_ui,
+        ),
+    )
+    .add_systems(
+        OnExit(LauncherState::CharDeleteInFlight),
+        async_work::despawn_char_delete_ui,
+    )
+    .add_systems(
+        Update,
+        async_work::poll_char_delete_system.run_if(in_state(LauncherState::CharDeleteInFlight)),
+    );
+
     // Char-create error: simple message; Esc back to form, Enter retry.
     app.add_systems(
         OnEnter(LauncherState::CharCreateError),
@@ -700,6 +944,58 @@ fn restore_login_error_on_reentry(
 ) {
     if !err.0.is_empty() {
         next.set(LauncherState::LoginError);
+    }
+}
+
+/// On the first OnEnter(Login), check the persisted store: if no CLI
+/// overrides + no last_used → ServerSelect. If last_used + empty form
+/// → prefill from store + keyring. Runs every Login entry but the
+/// already-filled-form branch is a no-op, so re-entries (e.g. from
+/// AccountPicker) don't clobber what was just picked.
+fn decide_initial_screen(
+    overrides: Option<Res<CliOverridesPresent>>,
+    err: Res<LoginErrorMsg>,
+    mut form: ResMut<LoginForm>,
+    mut server_form: ResMut<ServerSelectForm>,
+    mut next: ResMut<NextState<LauncherState>>,
+) {
+    // Don't preempt an in-flight error screen — that path goes
+    // Login -> LoginError -> Login via the error_keyboard_system.
+    if !err.0.is_empty() {
+        return;
+    }
+    // If the account-picker already prefilled the form, don't touch.
+    if !form.user.is_empty() {
+        return;
+    }
+    let store = ffxi_client::launcher_store::load();
+    if overrides.is_some() {
+        return;
+    }
+    if let Some((server, user)) = store.last_used.clone() {
+        // Prefill from the most-recent login. Password comes from the
+        // keyring iff the matching SavedAccount has `remember_password`.
+        let acct = store
+            .accounts
+            .iter()
+            .find(|a| a.server_name == server && a.username == user);
+        if let Some(a) = acct {
+            form.user = user.clone();
+            form.remember_password = a.remember_password;
+            if a.remember_password {
+                if let Some(pw) = ffxi_client::secret_store::SecretStore::get(
+                    ffxi_client::launcher_store::KEYRING_SERVICE,
+                    &ffxi_client::launcher_store::keyring_account_key(&server, &user),
+                ) {
+                    form.pass = pw;
+                }
+            }
+            server_form.selected = Some(server);
+            return;
+        }
+    }
+    if !store.servers.is_empty() {
+        next.set(LauncherState::ServerSelect);
     }
 }
 

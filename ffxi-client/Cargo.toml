@@ -63,6 +63,10 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Cross-platform secret storage (macOS Keychain / Windows Credential
+# Manager / Linux Secret Service) for opt-in password remember on the
+# launcher screen. v3 is the current stable line.
+keyring = "3"
 
 bevy = { workspace = true, optional = true }
 # Frame-rate limiter for the native window. Pinned to 0.20.x because that's

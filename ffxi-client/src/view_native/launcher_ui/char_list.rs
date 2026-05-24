@@ -161,7 +161,9 @@ pub(super) fn spawn_char_list_ui(
                 });
 
             parent.spawn((
-                Text::new("Click or use ↑/↓ + Enter   N: new character   Esc: back to login"),
+                Text::new(
+                    "Click or use ↑/↓ + Enter   N: new   Ctrl-D: delete   Esc: back to login",
+                ),
                 TextFont {
                     font_size: 12.0,
                     ..default()
@@ -237,12 +239,17 @@ pub(super) fn handle_click_system(
 
 pub(super) fn handle_keyboard_system(
     mut events: MessageReader<KeyboardInput>,
+    keys: Res<ButtonInput<KeyCode>>,
     chars: Res<CharListData>,
     mut cursor: ResMut<CharCursor>,
     mut sel: ResMut<SelectedChar>,
     mut next_state: ResMut<NextState<LauncherState>>,
     mut q_rows: Query<(&CharRowText, &mut Text)>,
 ) {
+    let ctrl = keys.pressed(KeyCode::ControlLeft)
+        || keys.pressed(KeyCode::ControlRight)
+        || keys.pressed(KeyCode::SuperLeft)
+        || keys.pressed(KeyCode::SuperRight);
     // n = chars.len() + 1; the last index is the "+ New character" row.
     let new_char_index = chars.0.len();
     let n = new_char_index + 1;
@@ -250,6 +257,7 @@ pub(super) fn handle_keyboard_system(
     let mut chosen = false;
     let mut go_back = false;
     let mut new_char_shortcut = false;
+    let mut delete_shortcut = false;
     for ev in events.read() {
         if ev.state != ButtonState::Pressed {
             continue;
@@ -269,10 +277,20 @@ pub(super) fn handle_keyboard_system(
             Key::Character(s) if s.eq_ignore_ascii_case("n") => {
                 new_char_shortcut = true;
             }
+            Key::Character(s) if ctrl && s.eq_ignore_ascii_case("d") => {
+                delete_shortcut = true;
+            }
             Key::Escape => {
                 go_back = true;
             }
             _ => {}
+        }
+    }
+    if delete_shortcut && cursor.0 < new_char_index {
+        if let Some(slot) = chars.0.get(cursor.0).cloned() {
+            sel.0 = Some(slot);
+            next_state.set(LauncherState::CharDeleteConfirm);
+            return;
         }
     }
     if go_back {
@@ -322,4 +340,80 @@ fn format_char_row(
 fn format_new_char_row(focused: bool) -> String {
     let marker = if focused { ">" } else { " " };
     format!("{marker}  + New character")
+}
+
+// --- Char delete confirm + in-flight -------------------------------------
+
+#[derive(Component)]
+pub(super) struct DeleteConfirmRoot;
+
+pub(super) fn spawn_delete_confirm_ui(mut commands: Commands, sel: Res<SelectedChar>) {
+    let name = sel
+        .0
+        .as_ref()
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "?".into());
+    commands
+        .spawn((
+            DeleteConfirmRoot,
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(20.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.04, 0.04, 0.05)),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new(format!("Delete character '{name}'?")),
+                TextFont {
+                    font_size: 22.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.95, 0.20, 0.20)),
+            ));
+            parent.spawn((
+                Text::new("This is destructive. Enter to confirm, Esc to cancel."),
+                TextFont {
+                    font_size: 13.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.8, 0.8, 0.8)),
+            ));
+        });
+}
+
+pub(super) fn despawn_delete_confirm_ui(
+    mut commands: Commands,
+    q: Query<Entity, With<DeleteConfirmRoot>>,
+) {
+    for e in q.iter() {
+        commands.entity(e).despawn();
+    }
+}
+
+pub(super) fn delete_confirm_keyboard_system(
+    mut events: MessageReader<KeyboardInput>,
+    mut next_state: ResMut<NextState<LauncherState>>,
+) {
+    for ev in events.read() {
+        if ev.state != ButtonState::Pressed {
+            continue;
+        }
+        match &ev.logical_key {
+            Key::Enter => {
+                next_state.set(LauncherState::CharDeleteInFlight);
+                return;
+            }
+            Key::Escape => {
+                next_state.set(LauncherState::CharList);
+                return;
+            }
+            _ => {}
+        }
+    }
 }

@@ -17,6 +17,10 @@ use bevy::prelude::*;
 
 use super::{Credentials, LauncherState, LoginErrorMsg, LoginField, LoginForm, ServerInfo};
 
+/// Marker for the remember-password indicator line.
+#[derive(Component)]
+pub(super) struct RememberText;
+
 /// Marker for the root login UI node so we can despawn the whole tree on
 /// state exit.
 #[derive(Component)]
@@ -88,8 +92,17 @@ pub(super) fn spawn_login_ui(
                 TextColor(Color::srgb(0.95, 0.95, 0.95)),
             ));
             parent.spawn((
+                RememberText,
+                Text::new(format_remember_line(form.remember_password)),
+                TextFont {
+                    font_size: 13.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.75, 0.75, 0.75)),
+            ));
+            parent.spawn((
                 Text::new(
-                    "Tab: switch field   Enter: login   Ctrl-N: new account   Esc: clear field",
+                    "Tab: switch field   Enter: login   Ctrl-N: new account   Ctrl-R: remember   Ctrl-P: change password   Esc: clear field",
                 ),
                 TextFont {
                     font_size: 12.0,
@@ -129,6 +142,14 @@ pub(super) fn keyboard_input_system(
             if let Key::Character(s) = &ev.logical_key {
                 if s.eq_ignore_ascii_case("n") {
                     next_state.set(LauncherState::CreateAccount);
+                    return;
+                }
+                if s.eq_ignore_ascii_case("r") {
+                    form.remember_password = !form.remember_password;
+                    continue;
+                }
+                if s.eq_ignore_ascii_case("p") {
+                    next_state.set(LauncherState::ChangePassword);
                     return;
                 }
             }
@@ -181,8 +202,15 @@ pub(super) fn keyboard_input_system(
 
 pub(super) fn redraw_login_form_system(
     form: Res<LoginForm>,
-    mut q_user: Query<&mut Text, (With<UserText>, Without<PassText>)>,
-    mut q_pass: Query<&mut Text, (With<PassText>, Without<UserText>)>,
+    mut q_user: Query<
+        &mut Text,
+        (With<UserText>, Without<PassText>, Without<RememberText>),
+    >,
+    mut q_pass: Query<
+        &mut Text,
+        (With<PassText>, Without<UserText>, Without<RememberText>),
+    >,
+    mut q_rem: Query<&mut Text, (With<RememberText>, Without<UserText>, Without<PassText>)>,
 ) {
     if !form.is_changed() {
         return;
@@ -193,6 +221,14 @@ pub(super) fn redraw_login_form_system(
     for mut t in q_pass.iter_mut() {
         **t = format_pass_line(&form.pass, form.focus == LoginField::Password);
     }
+    for mut t in q_rem.iter_mut() {
+        **t = format_remember_line(form.remember_password);
+    }
+}
+
+fn format_remember_line(remember: bool) -> String {
+    let mark = if remember { "X" } else { " " };
+    format!("[{mark}] Remember password (Ctrl-R)")
 }
 
 fn format_user_line(user: &str, focused: bool) -> String {

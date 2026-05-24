@@ -8,6 +8,8 @@ pub mod agent_socket;
 pub mod auth_binary;
 pub mod auth_client;
 pub mod goal_store;
+pub mod launcher_store;
+pub mod secret_store;
 // Both keybinds_store and graphics_store depend on ffxi-viewer-core
 // types (`Bindings`/`Preset` and `GraphicsSettings` respectively),
 // which is only pulled in when the native-window feature is on.

@@ -99,6 +99,7 @@ fn parse_version_triple(s: &str) -> Option<[u8; 3]> {
 // Command IDs from server/src/login/auth_session.h.
 const LOGIN_ATTEMPT: u8 = 0x10;
 const LOGIN_CREATE: u8 = 0x20;
+const LOGIN_CHANGE_PASSWORD: u8 = 0x30;
 
 // Result IDs used by v1.
 pub const LOGIN_FAIL: u8 = 0x00;
@@ -106,6 +107,8 @@ pub const LOGIN_SUCCESS: u8 = 0x01;
 pub const LOGIN_ERROR: u8 = 0x02;
 pub const LOGIN_SUCCESS_CREATE: u8 = 0x03;
 pub const LOGIN_ERROR_CREATE_TAKEN: u8 = 0x04;
+pub const LOGIN_SUCCESS_CHANGE_PASSWORD: u8 = 0x06;
+pub const LOGIN_ERROR_CHANGE_PASSWORD: u8 = 0x07;
 pub const LOGIN_ERROR_CREATE_DISABLED: u8 = 0x08;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +192,42 @@ impl AuthClient {
             LOGIN_ERROR_CREATE_TAKEN => Ok(()), // pre-existing account is fine
             LOGIN_ERROR_CREATE_DISABLED => bail!("server disabled account creation"),
             other => bail!("LOGIN_CREATE failed with result {other:#x}: {resp}"),
+        }
+    }
+
+    /// Change the password of an existing account. Server-side handler:
+    /// `vendor/server/src/login/auth_session.cpp:391-455` — validates the
+    /// current password, then UPDATEs `accounts.password` with a fresh
+    /// bcrypt hash. On success the server replies with a JSON object
+    /// `{result: LOGIN_SUCCESS_CHANGE_PASSWORD (0x06), account_id, session_hash}`
+    /// then closes; any other `result` is treated as failure.
+    pub async fn change_password(
+        &self,
+        username: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<()> {
+        if self.flavor == AuthFlavor::Binary {
+            // hxiloader's binary protocol pre-dates LSB's CHANGE_PASSWORD
+            // opcode — no wire representation exists for it.
+            bail!("change_password unsupported in binary auth flavor");
+        }
+        let payload = json!({
+            "command": LOGIN_CHANGE_PASSWORD,
+            "username": username,
+            "password": current_password,
+            "new_password": new_password,
+            "version": self.version,
+        });
+        let resp = self.exchange(&payload).await?;
+        let result = resp
+            .get("result")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow!("LOGIN_CHANGE_PASSWORD response missing `result`: {resp}"))?
+            as u8;
+        match result {
+            LOGIN_SUCCESS_CHANGE_PASSWORD => Ok(()),
+            other => bail!("LOGIN_CHANGE_PASSWORD failed with result {other:#x}: {resp}"),
         }
     }
 

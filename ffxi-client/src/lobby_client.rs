@@ -35,6 +35,9 @@ const DATA_CMD_HANDOFF: u8 = 0xA2;
 
 const VIEW_CMD_REGISTER: u32 = 0x00;
 const VIEW_CMD_SELECT: u32 = 0x07;
+/// Delete-character view opcode — view_session.cpp:92. Server decodes a
+/// `lpkt_deletechr` (login_packets.h:170-189) from the read buffer.
+const VIEW_CMD_DELETE_CHAR: u32 = 0x14;
 /// Real "register character" command — see view_session.cpp:160. The
 /// previous `VIEW_CMD_CREATE = 0x01` value was wrong; the server has no
 /// case 0x01 in its dispatch switch, which is why creation hung forever.
@@ -214,6 +217,49 @@ impl LobbyHandle {
             new_name = %spec.name,
             total = self.chars.len(),
             "lobby handle: char list refreshed after create"
+        );
+        Ok(self)
+    }
+
+    /// Delete a character on this account. Sends opcode 0x14
+    /// (`lpkt_deletechr`) on the view socket, reads the 0x20 ACK reply,
+    /// then refreshes `chars` via a fresh 0xA1 / chr_info2 round-trip
+    /// (same pattern as `create_character`). LSB's delete handler doesn't
+    /// actually validate the `passwd` field — only `ffxi_id` and the
+    /// session's `accountID` are checked — so callers pass `[0u8; 16]`.
+    pub async fn delete_character(mut self, auth: &AuthSession, char_id: u32) -> Result<Self> {
+        let pkt = build_delete_char(char_id, 0, [0u8; 16], &self.session_hash);
+        self.view.write_all(&pkt).await?;
+        self.view.flush().await?;
+        tracing::debug!(char_id, "lobby handle: 0x14 delete-char sent");
+
+        // Server replies with a 0x20-byte ACK packet on the view socket
+        // (`do_write(0x20)` in view_session.cpp:119). Drain it so the next
+        // read aligns to the chr_info2 push that follows the 0xA1.
+        let mut ack = [0u8; 0x20];
+        self.view
+            .read_exact(&mut ack)
+            .await
+            .context("reading 0x14 delete-char ack on view socket")?;
+
+        let req_a1 = build_data_a1(auth.account_id, 0, &self.session_hash);
+        self.data.write_all(&req_a1).await?;
+        self.data.flush().await?;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = read_data_charlist(&mut self.data)
+            .await
+            .context("reading 0xA1 char-list refresh after delete")?;
+        let slots = parse_view_chr_info2(&mut self.view)
+            .await
+            .context("reading chr_info2 refresh after delete")?;
+        self.chars = slots
+            .into_iter()
+            .filter(|s| s.char_id != 0 && !s.name.starts_with(' '))
+            .collect();
+        tracing::info!(
+            char_id,
+            total = self.chars.len(),
+            "lobby handle: char list refreshed after delete"
         );
         Ok(self)
     }
@@ -511,6 +557,40 @@ fn build_view_select(char_id: u32, char_name: &str, session_hash: &[u8; 16]) -> 
     let name_bytes = char_name.as_bytes();
     let n = name_bytes.len().min(15);
     buf[36..36 + n].copy_from_slice(&name_bytes[..n]);
+    buf
+}
+
+/// Build an `lpkt_deletechr` view packet (opcode 0x14). Layout per
+/// `vendor/server/src/login/login_packets.h:170-189` with default struct
+/// packing (no `#pragma pack` in that header) — total 52 bytes, not the
+/// 40 the design note suggested:
+///   [0..4]   packet_size = 0x34 (52)
+///   [4..8]   IXFF terminator
+///   [8..12]  command = 0x14
+///   [12..28] identifer[16] — IXFF session-hash slot; reuse the auth
+///            `session_hash` here, matching every other view packet
+///            (see `ixff_header` + `build_view_select`).
+///   [28..32] ffxi_id (content id, LE u32)
+///   [32..36] ffxi_id_world (LE u32)
+///   [36..52] passwd[16] — current account password, NUL-padded.
+///            Server re-validates this against `accounts.password` via
+///            view_session.cpp:128-134's account-ownership check (the
+///            destructive op deliberately demands a fresh password).
+pub fn build_delete_char(
+    content_id: u32,
+    world_id: u32,
+    passwd: [u8; 16],
+    session_hash: &[u8; 16],
+) -> Vec<u8> {
+    let packet_size = 0x34u32; // 52
+    let mut buf = vec![0u8; packet_size as usize];
+    buf[0..4].copy_from_slice(&packet_size.to_le_bytes());
+    buf[4..8].copy_from_slice(&IXFF_TERMINATOR.to_le_bytes());
+    buf[8..12].copy_from_slice(&VIEW_CMD_DELETE_CHAR.to_le_bytes());
+    buf[12..28].copy_from_slice(session_hash);
+    buf[28..32].copy_from_slice(&content_id.to_le_bytes());
+    buf[32..36].copy_from_slice(&world_id.to_le_bytes());
+    buf[36..52].copy_from_slice(&passwd);
     buf
 }
 
