@@ -12,8 +12,8 @@ use bevy::ui_widgets::Activate;
 use ffxi_client::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
 use ffxi_client::secret_store::SecretStore;
 
-use super::common::{hint, panel_node, row, screen_root, title};
-use super::{AccountPickerCursor, LauncherState, LoginField, LoginForm, ServerSelectForm};
+use super::common::{hint, panel_node, row, screen_root, spawn_server_chip, title};
+use super::{AccountPickerCursor, LauncherState, LoginField, LoginForm, ServerInfo, ServerSelectForm};
 
 #[derive(Component)]
 pub(super) struct AccountPickerRoot;
@@ -31,6 +31,7 @@ pub(super) fn spawn_ui(
     mut commands: Commands,
     form: Res<ServerSelectForm>,
     cursor: Res<AccountPickerCursor>,
+    server_info: Res<ServerInfo>,
 ) {
     let server = form.selected.clone().unwrap_or_default();
     let accts = accounts_for(&server);
@@ -39,6 +40,7 @@ pub(super) fn spawn_ui(
     commands
         .spawn((AccountPickerRoot, screen_root()))
         .with_children(|root| {
+            spawn_server_chip(root, &server_info);
             root.spawn(panel_node(520.0)).with_children(|panel| {
                 panel.spawn(title(format!("Accounts on {server}")));
                 if accts.is_empty() {

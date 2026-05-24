@@ -4,9 +4,14 @@
 //! the zone backdrop show through, with a centered translucent panel
 //! containing the form.
 
+use bevy::ecs::spawn::Spawn;
+use bevy::feathers::controls::{button, ButtonProps};
 use bevy::feathers::theme::ThemedText;
 use bevy::input_focus::tab_navigation::TabGroup;
 use bevy::prelude::*;
+use bevy::ui_widgets::Activate;
+
+use super::{LauncherState, ServerInfo};
 
 /// Translucent form panel background — readable text without hiding the
 /// La Theine backdrop scene rendered behind the launcher UI.
@@ -70,6 +75,75 @@ pub(super) fn hint(text: impl Into<String>) -> impl Bundle {
         TextColor(Color::srgb(0.6, 0.6, 0.65)),
         ThemedText,
     )
+}
+
+/// Marker for the text node inside a [`server_chip`] so the
+/// `update_server_chips` system can refresh just the label when the
+/// active profile changes.
+#[derive(Component)]
+pub(super) struct ServerChipLabel;
+
+/// Top-anchored "Server: <name> [Change]" chip rendered above the form
+/// panel on every user-facing screen. The Change button jumps to
+/// `ServerSelect` so the server is always one click away — promoting
+/// it from buried-in-the-title-bar to a top-level navigation surface.
+pub(super) fn spawn_server_chip(parent: &mut ChildSpawnerCommands, server: &ServerInfo) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
+            margin: UiRect::bottom(Val::Px(12.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        })
+        .insert((
+            BackgroundColor(PANEL_BG),
+            BorderColor::all(Color::srgb(0.20, 0.20, 0.24)),
+            BorderRadius::all(Val::Px(4.0)),
+        ))
+        .with_children(|chip| {
+            chip.spawn((
+                Text::new(format!("Server: {}", server.display_label())),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.85, 0.85, 0.90)),
+                ThemedText,
+                ServerChipLabel,
+            ));
+            chip.spawn(button(
+                ButtonProps::default(),
+                (),
+                Spawn((Text::new("Change"), ThemedText)),
+            ))
+            .observe(
+                |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                    next.set(LauncherState::ServerSelect);
+                },
+            );
+        });
+}
+
+/// Keep [`ServerChipLabel`] text in sync with [`ServerInfo`] — survives
+/// the same launcher state if e.g. ServerSelect rebinds without
+/// despawning the chip. Cheap; only writes when the label string
+/// actually differs.
+pub(super) fn update_server_chips(
+    server: Res<ServerInfo>,
+    mut q: Query<&mut Text, With<ServerChipLabel>>,
+) {
+    if !server.is_changed() {
+        return;
+    }
+    let want = format!("Server: {}", server.display_label());
+    for mut t in q.iter_mut() {
+        if t.0 != want {
+            t.0 = want.clone();
+        }
+    }
 }
 
 /// Row container — horizontal flex with column gap.

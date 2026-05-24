@@ -8,11 +8,11 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use super::common::{hint, panel_node, row, screen_root, title};
+use super::common::{hint, panel_node, row, screen_root, spawn_server_chip, title};
 use crate::view_native::widgets::text_field::{text_field, TextFieldSubmitted};
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
-use super::{CreateAccountErrorMsg, CreateAccountField, CreateAccountForm, LauncherState};
+use super::{CreateAccountErrorMsg, CreateAccountField, CreateAccountForm, LauncherState, ServerInfo};
 
 #[derive(Component)]
 pub(super) struct CreateAccountRoot;
@@ -20,7 +20,11 @@ pub(super) struct CreateAccountRoot;
 #[derive(Component)]
 pub(super) struct StatusText;
 
-pub(super) fn spawn_ui(mut commands: Commands, form: Res<CreateAccountForm>) {
+pub(super) fn spawn_ui(
+    mut commands: Commands,
+    form: Res<CreateAccountForm>,
+    server: Res<ServerInfo>,
+) {
     let u0 = form.user.clone();
     let p0 = form.pass.clone();
     let c0 = form.pass_confirm.clone();
@@ -29,6 +33,7 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<CreateAccountForm>) {
     commands
         .spawn((CreateAccountRoot, screen_root()))
         .with_children(|root| {
+            spawn_server_chip(root, &server);
             root.spawn(panel_node(480.0)).with_children(|panel| {
                 panel.spawn(title("Create account"));
                 panel.spawn(hint("Tab cycles fields. Esc cancels back to login."));

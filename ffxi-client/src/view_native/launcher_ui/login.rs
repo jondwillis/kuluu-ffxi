@@ -9,7 +9,7 @@ use bevy::prelude::*;
 use bevy::ui::Checked;
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use super::common::{hint, panel_node, row, screen_root, title};
+use super::common::{hint, panel_node, row, screen_root, spawn_server_chip, title};
 use crate::view_native::widgets::text_field::{text_field, TextFieldSubmitted};
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 use super::{Credentials, LauncherState, LoginErrorMsg, LoginField, LoginForm, ServerInfo};
@@ -25,13 +25,13 @@ pub(super) fn spawn_login_ui(
     let user_initial = form.user.clone();
     let pass_initial = form.pass.clone();
     let remember = form.remember_password;
-    let server_name = server.server.clone();
 
     commands
         .spawn((LoginUiRoot, screen_root()))
         .with_children(|root| {
+            spawn_server_chip(root, &server);
             root.spawn(panel_node(480.0)).with_children(|panel| {
-                panel.spawn(title(format!("FFXI launcher — {server_name}")));
+                panel.spawn(title("Sign in"));
                 panel.spawn(hint("Tab cycles fields. Enter submits when both filled."));
 
                 spawn_field(panel, "Username", false, &user_initial, LoginField::User);

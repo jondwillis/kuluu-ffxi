@@ -56,11 +56,24 @@ pub(super) fn spawn_ui(mut commands: Commands, cursor: Res<ServerSelectCursor>) 
                         ))
                         .observe(
                             move |_ev: On<Activate>,
+                                  mut commands: Commands,
                                   mut cursor: ResMut<ServerSelectCursor>,
                                   mut form: ResMut<ServerSelectForm>,
                                   mut next: ResMut<NextState<LauncherState>>| {
                                 cursor.0 = idx;
                                 form.selected = Some(server_name.clone());
+                                // Re-bind the live AuthClient/LobbyClient
+                                // + window-title to the picked profile.
+                                // Without this the picker would just
+                                // relabel the keyring grouping and the
+                                // next login would still hit whatever
+                                // host main.rs constructed at startup.
+                                let store = launcher_store::load();
+                                if let Some(profile) =
+                                    store.servers.iter().find(|p| p.name == server_name)
+                                {
+                                    super::apply_server_profile(&mut commands, profile);
+                                }
                                 next.set(LauncherState::AccountPicker);
                             },
                         );

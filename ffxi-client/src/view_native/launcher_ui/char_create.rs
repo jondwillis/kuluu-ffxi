@@ -9,11 +9,11 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use super::common::{hint, panel_node, row, screen_root, title};
+use super::common::{hint, panel_node, row, screen_root, spawn_server_chip, title};
 use crate::view_native::widgets::text_field::text_field;
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
-use super::{CharCreateError, CharCreateField, CharCreateForm, LauncherState};
+use super::{CharCreateError, CharCreateField, CharCreateForm, LauncherState, ServerInfo};
 
 pub(super) const RACES: &[(u8, &str)] = &[
     (1, "Hume M"),
@@ -54,7 +54,11 @@ pub(super) struct EnumChoice {
     value: u8,
 }
 
-pub(super) fn spawn_ui(mut commands: Commands, form: Res<CharCreateForm>) {
+pub(super) fn spawn_ui(
+    mut commands: Commands,
+    form: Res<CharCreateForm>,
+    server: Res<ServerInfo>,
+) {
     let snap = (
         form.name.clone(),
         form.race,
@@ -68,6 +72,7 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<CharCreateForm>) {
     commands
         .spawn((CharCreateRoot, screen_root()))
         .with_children(|root| {
+            spawn_server_chip(root, &server);
             root.spawn(panel_node(560.0)).with_children(|panel| {
                 panel.spawn(title("Create character"));
                 panel.spawn(hint(

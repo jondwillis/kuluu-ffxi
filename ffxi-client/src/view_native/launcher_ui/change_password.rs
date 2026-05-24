@@ -8,11 +8,11 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use super::common::{hint, panel_node, row, screen_root, title};
+use super::common::{hint, panel_node, row, screen_root, spawn_server_chip, title};
 use crate::view_native::widgets::text_field::text_field;
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
-use super::{ChangePasswordField, ChangePasswordForm, LauncherState};
+use super::{ChangePasswordField, ChangePasswordForm, LauncherState, ServerInfo};
 
 #[derive(Component)]
 pub(super) struct ChangePasswordRoot;
@@ -20,7 +20,11 @@ pub(super) struct ChangePasswordRoot;
 #[derive(Component)]
 pub(super) struct ChangePasswordBody;
 
-pub(super) fn spawn_ui(mut commands: Commands, form: Res<ChangePasswordForm>) {
+pub(super) fn spawn_ui(
+    mut commands: Commands,
+    form: Res<ChangePasswordForm>,
+    server: Res<ServerInfo>,
+) {
     let o0 = form.old.clone();
     let n0 = form.new_pw.clone();
     let c0 = form.confirm.clone();
@@ -29,6 +33,7 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<ChangePasswordForm>) {
     commands
         .spawn((ChangePasswordRoot, screen_root()))
         .with_children(|root| {
+            spawn_server_chip(root, &server);
             root.spawn(panel_node(480.0)).with_children(|panel| {
                 panel.spawn(title("Change password"));
                 panel.spawn(hint("Tab cycles fields. Esc cancels."));

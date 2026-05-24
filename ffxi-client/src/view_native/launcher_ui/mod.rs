@@ -62,13 +62,64 @@ mod server_select;
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
-use ffxi_client::auth_client::AuthClient;
+use bevy::window::PrimaryWindow;
+use ffxi_client::auth_client::{AuthClient, AuthFlavor};
+use ffxi_client::launcher_store::{AuthFlavorKind, ServerProfile};
 use ffxi_client::lobby_client::LobbyClient;
 use tokio::runtime::Handle as RtHandle;
 
 use crate::launcher::{Defaults, Selection};
 
 use super::AppPhase;
+
+/// Swap the live `LauncherClients` + `ServerInfo` to point at a freshly-
+/// picked server profile. This is what makes ServerSelect's row click
+/// actually change the network endpoint — without this, picking a
+/// different profile only relabeled the keyring grouping and the next
+/// login still hit whatever the CLI started us on. New in-flight tasks
+/// (queued by AuthInFlight / ConnectInFlight) clone the Arc once at
+/// dispatch, so any tasks already in flight against the old server
+/// finish naturally on the old Arc; new tasks get the new endpoint.
+pub(crate) fn apply_server_profile(commands: &mut Commands, profile: &ServerProfile) {
+    let flavor = match profile.flavor {
+        AuthFlavorKind::Json => AuthFlavor::Json,
+        AuthFlavorKind::Binary => AuthFlavor::Binary,
+    };
+    let auth = Arc::new(AuthClient::with_flavor(
+        profile.host.clone(),
+        profile.auth_port,
+        flavor,
+    ));
+    let lobby = Arc::new(LobbyClient::new(
+        profile.host.clone(),
+        profile.data_port,
+        profile.view_port,
+    ));
+    commands.insert_resource(LauncherClients { auth, lobby });
+    commands.insert_resource(ServerInfo {
+        server: profile.host.clone(),
+        profile_name: Some(profile.name.clone()),
+    });
+}
+
+/// Mirror `ServerInfo` into the primary window's title bar. Was a
+/// one-shot at startup (`ffxi-client — 127.0.0.1`); now reactive so
+/// the title swaps when `ServerSelect` rebinds.
+fn sync_window_title(
+    server: Res<ServerInfo>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    if !server.is_changed() {
+        return;
+    }
+    let Ok(mut window) = windows.single_mut() else {
+        return;
+    };
+    let new_title = format!("ffxi-client — {}", server.display_label());
+    if window.title != new_title {
+        window.title = new_title;
+    }
+}
 
 /// Bevy state driving the launcher UI. `SubStates` of
 /// `AppPhase::Launcher` — only exists while the parent phase is
@@ -484,6 +535,17 @@ pub(crate) struct RuntimeHandle(pub RtHandle);
 #[derive(Resource, Clone)]
 pub(crate) struct ServerInfo {
     pub server: String,
+    /// Display name of the active server profile (when picked through
+    /// `ServerSelect`). Falls back to `server` (the raw host) when only
+    /// CLI args drove startup. Drives the persistent "Server: X" chip
+    /// surfaced on every user-facing screen + the window title.
+    pub profile_name: Option<String>,
+}
+
+impl ServerInfo {
+    pub fn display_label(&self) -> String {
+        self.profile_name.clone().unwrap_or_else(|| self.server.clone())
+    }
 }
 
 /// Auth + lobby clients shared across launcher systems.
@@ -633,6 +695,7 @@ pub(crate) fn register(
         .insert_resource(RuntimeHandle(runtime))
         .insert_resource(ServerInfo {
             server: server.to_string(),
+            profile_name: None,
         })
         .insert_resource(LauncherClients { auth, lobby })
         .insert_resource(OpenedLobby::default())
@@ -656,6 +719,15 @@ pub(crate) fn register(
     // `super::run`.
     app.add_systems(OnEnter(AppPhase::Launcher), spawn_launcher_camera)
         .add_systems(OnExit(AppPhase::Launcher), despawn_launcher_camera);
+
+    // Window title + per-screen Server chip reflect the active profile.
+    // Both run while the launcher is up — once the user is in-game,
+    // the title is a static distraction and the gameplay HUD shows
+    // connection state.
+    app.add_systems(
+        Update,
+        (sync_window_title, common::update_server_chips).run_if(in_state(AppPhase::Launcher)),
+    );
 
     // Re-entry hook: if returning to Launcher from a failed Connecting
     // bridge, jump straight to LoginError.
