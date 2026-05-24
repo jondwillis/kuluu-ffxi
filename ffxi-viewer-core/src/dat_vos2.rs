@@ -666,7 +666,6 @@ pub fn process_load_vos2_requests(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut inverse_bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
-    scene_state: ResMut<SceneState>,
     tracked: Res<TrackedEntities>,
     // Cross-tick state recovery: when a request batch spans multiple
     // frames the in-tick `actor_state` map is empty on the second
@@ -717,9 +716,6 @@ pub fn process_load_vos2_requests(
             // etc.). Per-failure chat toasts drown the HUD.
             continue;
         };
-        // `scene_state` is reserved for future per-spawn diagnostic
-        // toasts; reference it so the borrow checker is content.
-        let _ = &scene_state;
         if loaded.mesh.groups.is_empty() || loaded.mesh.vertices.is_empty() {
             continue;
         }
@@ -2462,13 +2458,3 @@ fn pbr_from_specular(exponent: f32, _intensity: f32) -> (f32, f32) {
     (roughness, 0.0)
 }
 
-fn push_system_msg(scene_state: &mut SceneState, text: String) {
-    use ffxi_viewer_wire::{ChatChannel, ChatLine};
-    scene_state.push_local_toast(ChatLine {
-        channel: ChatChannel::Debug,
-        sender: "client".into(),
-        text,
-        server_ts: 0,
-        local_seq: 0,
-    });
-}

@@ -505,7 +505,7 @@ pub fn apply_bgm_system(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut pcm_assets: ResMut<Assets<PcmAudio>>,
-    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     mut warned: Local<bool>,
 ) {
     // Without an install root we have nothing to play. Warn once so
@@ -624,7 +624,7 @@ pub fn apply_bgm_system(
     let (track_name, composer) = ffxi_audio::music_catalog::lookup(track_id)
         .map(|(_, n, c)| (n, c))
         .unwrap_or(("?", "?"));
-    scene_state.push_local_toast(crate::snapshot::system_chat_line(format!(
+    toasts.write(crate::snapshot::ToastEvent::system(format!(
         "♪ Now playing: \"{}\" by {} [track #{}, slot={}]",
         track_name,
         composer,
@@ -639,7 +639,7 @@ pub fn apply_bgm_system(
 /// integer of lag and advance the cursor. Runs in `Update`.
 pub fn report_bgm_loops_system(
     mut slots: ResMut<BgmSlots>,
-    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
 ) {
     let Some(counter) = slots.bgm_loop_counter.as_ref() else {
         return;
@@ -653,7 +653,7 @@ pub fn report_bgm_loops_system(
     // but if the reporter is starved (e.g. paused frame loop) we still
     // surface every boundary the audio thread observed.
     for n in (slots.bgm_loops_reported + 1)..=now {
-        scene_state.push_local_toast(crate::snapshot::debug_chat_line(format!(
+        toasts.write(crate::snapshot::ToastEvent::debug(format!(
             "♪ Loop: track #{} ({} loops since start)",
             track_id, n,
         )));
@@ -726,7 +726,7 @@ pub fn play_sfx_system(
     mut cache: ResMut<SfxCache>,
     mut pcm_assets: ResMut<Assets<PcmAudio>>,
     mut commands: Commands,
-    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     mut last_chat: Local<Option<(u32, std::time::Instant)>>,
     mut warned: Local<bool>,
 ) {
@@ -801,7 +801,7 @@ pub fn play_sfx_system(
                 && now.saturating_duration_since(t) < std::time::Duration::from_millis(250)
         );
         if !dup {
-            scene_state.push_local_toast(crate::snapshot::debug_chat_line(format!(
+            toasts.write(crate::snapshot::ToastEvent::debug(format!(
                 "✦ SFX #{}",
                 ev.se_id
             )));

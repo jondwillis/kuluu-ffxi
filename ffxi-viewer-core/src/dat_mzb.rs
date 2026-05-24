@@ -1019,7 +1019,7 @@ pub fn process_load_mzb_requests(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut scene_state: ResMut<SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     draw: Res<DrawDistance>,
     mut collision_geometry: ResMut<MzbCollisionGeometry>,
     mut load_mmb_tx: MessageWriter<crate::dat_mmb::LoadMmbRequest>,
@@ -1041,7 +1041,7 @@ pub fn process_load_mzb_requests(
             Ok(s) => s,
             Err(msg) => {
                 push_system_msg(
-                    &mut scene_state,
+                    &mut toasts,
                     format!("/load_mzb {}: {msg}", req.file_id),
                 );
                 continue;
@@ -1049,7 +1049,7 @@ pub fn process_load_mzb_requests(
         };
         if submeshes.is_empty() || instances.is_empty() {
             push_system_msg(
-                &mut scene_state,
+                &mut toasts,
                 format!(
                     "/load_mzb {}: 0 renderable meshes ({} submeshes, {} instances)",
                     req.file_id,
@@ -1283,7 +1283,7 @@ pub fn process_load_mzb_requests(
         let total_verts = collision_verts + noncollision_verts;
         let total_tris = collision_tris + noncollision_tris;
         push_system_msg(
-            &mut scene_state,
+            &mut toasts,
             format!(
                 "/load_mzb {}: {n_submeshes} submeshes, {n_instances} placements → merged {total_verts} verts / {total_tris} tris ({collision_verts}v {collision_tris}t collision, {noncollision_verts}v {noncollision_tris}t non-collision)",
                 req.file_id,
@@ -1381,7 +1381,7 @@ pub fn process_load_mzb_requests(
                 }
             }
             push_system_msg(
-                &mut scene_state,
+                &mut toasts,
                 format!(
                     "/load_mzb {}: {} water plane{} spawned",
                     req.file_id,
@@ -1409,7 +1409,7 @@ pub fn process_load_mzb_requests(
                     });
                 }
                 push_system_msg(
-                    &mut scene_state,
+                    &mut toasts,
                     format!(
                         "/load_mzb {}: queued {n} visual MMB placements",
                         req.file_id
@@ -1418,7 +1418,7 @@ pub fn process_load_mzb_requests(
             }
             Err(msg) => {
                 push_system_msg(
-                    &mut scene_state,
+                    &mut toasts,
                     format!("/load_mzb {}: zone-MMB spawn: {msg}", req.file_id),
                 );
             }
@@ -1450,7 +1450,8 @@ pub struct LastAutoLoadedZone {
 /// fired. The chat HUD gets a one-line note so the operator can tell
 /// the difference between "mapping missing" and "auto-load broken".
 pub fn auto_load_zone_geometry_system(
-    mut scene_state: ResMut<SceneState>,
+    scene_state: Res<SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     mut last: ResMut<LastAutoLoadedZone>,
     mut commands: Commands,
     mut load_tx: MessageWriter<LoadMzbRequest>,
@@ -1482,13 +1483,13 @@ pub fn auto_load_zone_geometry_system(
             });
             // Distinguish auto-load from manual `/load_mzb` in chat.
             push_system_msg(
-                &mut scene_state,
+                &mut toasts,
                 format!("auto-load: zone {zone_id} -> DAT file {file_id}"),
             );
         }
         None => {
             push_system_msg(
-                &mut scene_state,
+                &mut toasts,
                 format!("auto-load: no DAT mapping for zone {zone_id} (Phase 11b table pending)"),
             );
         }
@@ -1583,13 +1584,6 @@ pub fn cull_entities_by_distance(
     }
 }
 
-fn push_system_msg(scene_state: &mut SceneState, text: String) {
-    use ffxi_viewer_wire::{ChatChannel, ChatLine};
-    scene_state.push_local_toast(ChatLine {
-        channel: ChatChannel::Debug,
-        sender: "client".into(),
-        text,
-        server_ts: 0,
-        local_seq: 0,
-    });
+fn push_system_msg(toasts: &mut MessageWriter<crate::snapshot::ToastEvent>, text: String) {
+    toasts.write(crate::snapshot::ToastEvent::debug(text));
 }

@@ -33,7 +33,6 @@ use ffxi_viewer_core::components::{IsSelf, WorldEntity};
 use ffxi_viewer_core::dat_mzb::{MzbCollisionGeometry, FLOOR_NORMAL_MIN};
 use ffxi_viewer_core::scene::BakedActor;
 use ffxi_viewer_core::snapshot::SceneState;
-use ffxi_viewer_wire::{ChatChannel, ChatLine};
 
 use super::navmesh_overlay::NavmeshState;
 
@@ -49,7 +48,8 @@ pub fn process_debug_heights(
     nav: Res<NavmeshState>,
     collision_geom: Res<MzbCollisionGeometry>,
     self_q: Query<(&Transform, &WorldEntity, Option<&BakedActor>), With<IsSelf>>,
-    mut scene_state: ResMut<SceneState>,
+    scene_state: Res<SceneState>,
+    mut toasts: EventWriter<ffxi_viewer_core::snapshot::ToastEvent>,
 ) {
     if events.is_empty() {
         return;
@@ -59,10 +59,7 @@ pub fn process_debug_heights(
         let (player_t, player_w, baked) = match self_q.single() {
             Ok((t, w, b)) => (*t, *w, b.copied()),
             Err(_) => {
-                push(
-                    &mut scene_state,
-                    "/debug heights: no IsSelf entity yet".into(),
-                );
+                push(&mut toasts, "/debug heights: no IsSelf entity yet".into());
                 continue;
             }
         };
@@ -127,23 +124,23 @@ pub fn process_debug_heights(
             None => "  baked actor: <not loaded yet — capsule placeholder>".to_string(),
         };
 
-        push(&mut scene_state, server_line);
-        push(&mut scene_state, player_line);
-        push(&mut scene_state, mzb_line);
-        push(&mut scene_state, nav_line);
-        push(&mut scene_state, nav_mzb_line);
-        push(&mut scene_state, baked_line);
+        push(&mut toasts,server_line);
+        push(&mut toasts,player_line);
+        push(&mut toasts,mzb_line);
+        push(&mut toasts,nav_line);
+        push(&mut toasts,nav_mzb_line);
+        push(&mut toasts,baked_line);
 
         // Top-5 MZB hits with normal annotations — surfaces *why* the
         // snap chose a given tri (or rejected the actual floor).
         if ranked_hits.is_empty() {
             push(
-                &mut scene_state,
+                &mut toasts,
                 "  mzb hits @ player xz: <none>".to_string(),
             );
         } else {
             push(
-                &mut scene_state,
+                &mut toasts,
                 format!(
                     "  mzb hits @ player xz (top {}, ceiling={:.2}, floor_min={:.2}):",
                     ranked_hits.len().min(5),
@@ -161,7 +158,7 @@ pub fn process_debug_heights(
                     (false, false) => "above-wall",
                 };
                 push(
-                    &mut scene_state,
+                    &mut toasts,
                     format!(
                         "    #{}: y={:+.2} n.y={:+.2}  [{}]",
                         i + 1,
@@ -175,12 +172,9 @@ pub fn process_debug_heights(
     }
 }
 
-fn push(scene_state: &mut SceneState, text: String) {
-    scene_state.push_local_toast(ChatLine {
-        channel: ChatChannel::Debug,
-        sender: "client".into(),
-        text,
-        server_ts: 0,
-        local_seq: 0,
-    });
+fn push(
+    toasts: &mut MessageWriter<ffxi_viewer_core::snapshot::ToastEvent>,
+    text: String,
+) {
+    toasts.write(ffxi_viewer_core::snapshot::ToastEvent::debug(text));
 }

@@ -93,7 +93,7 @@ pub const VANA_WEEKDAYS: [&str; 8] = [
 pub fn update_vana_clock(
     time: Res<Time>,
     mut q: Query<&mut Text, With<VanaClockLabel>>,
-    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     mut prev_vana_day: Local<Option<u64>>,
 ) {
@@ -119,7 +119,7 @@ pub fn update_vana_clock(
     if let Some(prev) = *prev_vana_day {
         if prev != total_vana_days {
             let weekday = VANA_WEEKDAYS[(total_vana_days % 8) as usize];
-            scene_state.push_local_toast(crate::snapshot::system_chat_line(format!(
+            toasts.write(crate::snapshot::ToastEvent::system(format!(
                 "📅 Vana day {} — {}",
                 total_vana_days, weekday,
             )));

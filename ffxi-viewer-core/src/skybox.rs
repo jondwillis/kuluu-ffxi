@@ -150,7 +150,7 @@ fn update_skybox(
     cam_q: Query<&Transform, (With<crate::camera::OperatorCamera>, Without<SkyboxSphere>)>,
     mut sky_q: Query<(&mut Transform, &MeshMaterial3d<SkyboxGradientMaterial>), With<SkyboxSphere>>,
     mut mats: ResMut<Assets<SkyboxGradientMaterial>>,
-    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     mut prev_keyframe_time: Local<Option<u32>>,
 ) {
@@ -212,7 +212,7 @@ fn update_skybox(
         .map(|r| r.time_minutes);
     if active_keyframe_time.is_some() && *prev_keyframe_time != active_keyframe_time {
         if let (Some(prev), Some(now)) = (*prev_keyframe_time, active_keyframe_time) {
-            scene_state.push_local_toast(crate::snapshot::debug_chat_line(format!(
+            toasts.write(crate::snapshot::ToastEvent::debug(format!(
                 "🌅 Skybox keyframe V{:02}:{:02} → V{:02}:{:02}",
                 prev / 60,
                 prev % 60,

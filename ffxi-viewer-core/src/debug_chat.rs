@@ -16,7 +16,7 @@
 use bevy::prelude::*;
 use ffxi_viewer_wire::ViewerEvent;
 
-use crate::snapshot::{system_chat_line, EventLog, SceneState};
+use crate::snapshot::{EventLog, SceneState};
 
 /// Walks `EventLog.recent` since `pos` and emits one System chat line
 /// per `ZoneChanged` / `EngagedBy` / `LowHp` event. Same shape as
@@ -31,7 +31,8 @@ pub struct EngagementChatCursor {
 pub fn report_engagement_events_system(
     events: Res<EventLog>,
     mut cursor: ResMut<EngagementChatCursor>,
-    mut scene_state: ResMut<SceneState>,
+    scene_state: Res<SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
 ) {
     let len = events.recent.len();
     // VecDeque pop_front shifts indices — a cursor that survived a
@@ -68,7 +69,7 @@ pub fn report_engagement_events_system(
             _ => None,
         };
         if let Some(text) = line {
-            scene_state.push_local_toast(system_chat_line(text));
+            toasts.write(crate::snapshot::ToastEvent::system(text));
         }
     }
     cursor.pos = len;
@@ -85,7 +86,8 @@ pub struct SpeedSuppressionLatch {
 
 pub fn report_speed_state_system(
     mut latch: ResMut<SpeedSuppressionLatch>,
-    mut scene_state: ResMut<SceneState>,
+    scene_state: Res<SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
 ) {
     // Read self entity's current speed. If we don't have a self id or
     // self entity yet, leave the latch unset — the first frame after
@@ -115,7 +117,7 @@ pub fn report_speed_state_system(
     if let Some(text) = line {
         // System pane — the player wants to see why their character
         // stopped moving even when /devhud is off.
-        scene_state.push_local_toast(system_chat_line(text));
+        toasts.write(crate::snapshot::ToastEvent::system(text));
     }
 }
 

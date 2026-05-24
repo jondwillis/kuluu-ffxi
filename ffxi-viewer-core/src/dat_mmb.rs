@@ -35,7 +35,6 @@ use ffxi_dat::{mmb, walk, ChunkKind, DatRoot};
 
 use crate::look_resolver::dispatch_look_driven_models;
 use crate::scene::TrackedEntities;
-use crate::snapshot::SceneState;
 
 /// Marker for overlay entities spawned by this module — lets the
 /// `/load_mmb clear` command (future work) find and despawn them.
@@ -419,7 +418,7 @@ pub fn process_load_mmb_requests(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut scene_state: ResMut<SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     tracked: Res<TrackedEntities>,
 ) {
     // Collect events up front so we can dedupe per-file IO. A zone-in
@@ -482,7 +481,7 @@ pub fn process_load_mmb_requests(
             .or_insert_with(|| load_mmb(req.file_id, req.chunk_idx).ok());
         let Some(loaded) = loaded_entry.as_ref() else {
             push_system_msg(
-                &mut scene_state,
+                &mut toasts,
                 format!("/load_mmb {} {}: load failed", req.file_id, req.chunk_idx),
             );
             // DIAG-zonegeom: remove after fix.
@@ -514,7 +513,7 @@ pub fn process_load_mmb_requests(
             // chat for each one drowns out actual operator messages.
             if req.world_transform.is_none() {
                 push_system_msg(
-                    &mut scene_state,
+                    &mut toasts,
                     format!(
                         "/load_mmb {} {}: 0 renderable sub-records",
                         req.file_id, req.chunk_idx,
@@ -661,7 +660,7 @@ pub fn process_load_mmb_requests(
             None => {
                 if let Some(missing) = req.entity_id {
                     push_system_msg(
-                        &mut scene_state,
+                        &mut toasts,
                         format!(
                             "/load_mmb_on {missing} {} {}: no tracked entity for id {missing} \
                              — spawning at world_pos instead",
@@ -814,7 +813,7 @@ pub fn process_load_mmb_requests(
                 n => format!(" +{n} textures"),
             };
             push_system_msg(
-                &mut scene_state,
+                &mut toasts,
                 format!(
                     "/load_mmb {} {}: spawned {n_subs} sub-mesh{} {where_}{tex_note}",
                     req.file_id,
@@ -868,18 +867,11 @@ pub fn process_load_mmb_requests(
     }
 }
 
-fn push_system_msg(scene_state: &mut SceneState, text: String) {
-    use ffxi_viewer_wire::{ChatChannel, ChatLine};
-    // `push_local_toast`, not `snapshot.chat.push`: the snapshot's chat
-    // buffer is server-owned and the next ingest tick overwrites it.
-    // `local_toasts` persists across ticks until the cap evicts it.
-    scene_state.push_local_toast(ChatLine {
-        channel: ChatChannel::Debug,
-        sender: "client".into(),
-        text,
-        server_ts: 0,
-        local_seq: 0,
-    });
+fn push_system_msg(toasts: &mut MessageWriter<crate::snapshot::ToastEvent>, text: String) {
+    // Routes to the same `local_toasts` as direct `push_local_toast`
+    // calls did before, via the single drain system — keeps the chat
+    // chrome unchanged while letting this loader stay parallel-eligible.
+    toasts.write(crate::snapshot::ToastEvent::debug(text));
 }
 
 #[cfg(test)]

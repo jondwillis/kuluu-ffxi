@@ -23,10 +23,13 @@
 use std::fs;
 
 use bevy::light::FogVolume;
+use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::prelude::*;
 use ffxi_dat::weather::{collect_weather_records, sample_weather, WeatherRecord};
 use ffxi_dat::DatRoot;
 
+use crate::camera::OperatorCamera;
+use crate::graphics_settings::GraphicsSettings;
 use crate::snapshot::SceneState;
 
 /// Loaded weather keyframes for the current zone. Empty when no zone
@@ -47,8 +50,18 @@ pub struct WeatherPlugin;
 
 impl Plugin for WeatherPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ZoneWeather>()
-            .add_systems(Update, (load_zone_weather, apply_zone_weather));
+        app.init_resource::<ZoneWeather>().add_systems(
+            Update,
+            (
+                load_zone_weather,
+                // Run *before* the precipitation override so an active
+                // Rain/Squall/Fog modifier still wins the camera's
+                // DistanceFog slot — the baseline is just for the
+                // None/Sunshine case (and any zone-DAT-keyframed haze).
+                apply_zone_weather
+                    .before(crate::weather_fx::apply_weather_to_ambient_and_fog_system),
+            ),
+        );
     }
 }
 
@@ -56,8 +69,9 @@ impl Plugin for WeatherPlugin {
 /// the trigger logic in `dat_mzb::auto_load_zone_geometry_system` —
 /// fires once per zone change.
 pub fn load_zone_weather(
-    mut scene_state: ResMut<SceneState>,
+    scene_state: Res<SceneState>,
     mut zone_weather: ResMut<ZoneWeather>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
 ) {
     let current = scene_state.snapshot.zone_id;
     if current == zone_weather.zone_id {
@@ -105,7 +119,7 @@ pub fn load_zone_weather(
             "weather keyframes loaded at V-times: {}",
             times.join(", ")
         );
-        scene_state.push_local_toast(crate::snapshot::system_chat_line(format!(
+        toasts.write(crate::snapshot::ToastEvent::system(format!(
             "⛅ Zone weather loaded: zone 0x{:04X} ({} keyframes)",
             zone_id,
             zone_weather.records.len(),
@@ -136,6 +150,9 @@ pub fn apply_zone_weather(
     mut fog_q: Query<&mut FogVolume>,
     mut ambient: ResMut<AmbientLight>,
     vana_clock: Res<crate::vana_time::VanaClock>,
+    settings: Res<GraphicsSettings>,
+    mut cam_q: Query<(Entity, Option<&mut DistanceFog>), With<OperatorCamera>>,
+    mut commands: Commands,
 ) {
     if zone_weather.records.is_empty() {
         return;
@@ -153,6 +170,19 @@ pub fn apply_zone_weather(
     if let Some(mut fog) = fog_q.iter_mut().next() {
         let [r, g, b, _a] = rec.fog_landscape;
         fog.fog_color = Color::srgb(r, g, b);
+        // Map the FFXI fog-cylinder distance to a `FogVolume`
+        // density factor so every zone shows *some* atmospheric
+        // depth even when the server-side weather is `None`.
+        //
+        // Smaller `max_fog_dist_landscape` ⇒ tighter horizon ⇒
+        // denser volumetric haze. The 15.0 numerator was picked so
+        // a "normal" outdoor keyframe (~300y max) lands around the
+        // scene's spawn-time 0.06 baseline, and heavy-fog
+        // keyframes (50–80y) saturate near the ceiling without
+        // blowing out the volumetric pass. Floor at 0.04 keeps
+        // the cleanest-sky keyframes from going invisible.
+        let dist = rec.max_fog_dist_landscape.max(50.0);
+        fog.density_factor = (15.0 / dist).clamp(0.04, 0.18);
     }
 
     // Ambient: keep the hue from the weather record but scale
@@ -163,4 +193,45 @@ pub fn apply_zone_weather(
     let [r, g, b, _a] = rec.ambient_landscape;
     ambient.color = Color::srgb(r.max(0.05), g.max(0.05), b.max(0.05));
     ambient.brightness = 500.0 * rec.brightness_landscape.clamp(0.4, 1.5);
+
+    // Cheap fallback for Low / volumetric-off users: attach a
+    // per-pixel `DistanceFog` to the camera tinted from the same
+    // keyframe. The raymarched `FogVolume` written above is invisible
+    // without a camera-side `VolumetricFog` component (gated by the
+    // Low preset), so without this fallback Low-preset users see no
+    // atmospheric depth at all.
+    //
+    // `apply_weather_to_ambient_and_fog_system` (precipitation
+    // override) runs after this in the schedule (see `WeatherPlugin`),
+    // so an active Rain/Squall/Fog modifier still wins. When the
+    // operator toggles back to Medium+, the next-frame volumetric
+    // pass renders on top of this — slight double-fog until weather
+    // clears the slot or weather precipitation overwrites it. Rare
+    // enough to leave for now.
+    if !settings.volumetric_fog {
+        if let Ok((cam_entity, slot)) = cam_q.single_mut() {
+            let [fr, fg, fb, _] = rec.fog_landscape;
+            let color = Color::srgb(fr, fg, fb);
+            // Slight warm-shift on the in-scatter so the sun-facing
+            // hemisphere reads as "lit haze" instead of flat tint.
+            let inscatter = Color::srgb(
+                (fr * 1.08).min(1.0),
+                (fg * 1.06).min(1.0),
+                (fb * 1.02).min(1.0),
+            );
+            let visibility = rec.max_fog_dist_landscape.max(80.0);
+            let want = DistanceFog {
+                color,
+                directional_light_color: inscatter,
+                directional_light_exponent: 60.0,
+                falloff: FogFalloff::from_visibility_colors(visibility, color, inscatter),
+            };
+            match slot {
+                Some(mut existing) => *existing = want,
+                None => {
+                    commands.entity(cam_entity).insert(want);
+                }
+            }
+        }
+    }
 }

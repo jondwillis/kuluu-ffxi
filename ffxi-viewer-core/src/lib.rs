@@ -88,7 +88,7 @@ pub use scene::{
     sync_aggro_system, sync_entities_system, sync_entity_looks_system, Aggroing, BakedActor,
     EntityMaterials, EntityMesh, Target, TrackedEntities,
 };
-pub use snapshot::{apply_delta, ingest_system, EventLog, SceneState, CHAT_HISTORY_CAP};
+pub use snapshot::{apply_delta, drain_toast_events, ingest_system, EventLog, SceneState, ToastEvent, CHAT_HISTORY_CAP};
 pub use source::SceneSource;
 pub use zone_lines::{
     setup_zone_line_assets, sync_zone_lines_system, ZoneLineAssets, ZoneLineDescriptor,
@@ -227,7 +227,12 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             // (`mouse::apply_cursor_lock_system`) no longer touches
             // visibility — `CursorPlugin` is the sole owner.
             .add_plugins(CursorPlugin)
+            .add_message::<ToastEvent>()
             .add_systems(PreUpdate, ingest_system::<S>.run_if(resource_exists::<S>))
+            // Single mutator of SceneState.local_toasts outside of
+            // ingest_system. PostUpdate so all Update-stage toast
+            // emissions land before next frame's chat-panel render.
+            .add_systems(PostUpdate, drain_toast_events)
             // Drain VanaTimeSynced events out of the EventLog into the
             // VanaClock resource. Runs after ingest_system so the same
             // frame's events are visible.
@@ -244,7 +249,13 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             // active, so exactly one moves the camera.
             .add_systems(
                 Update,
+                // Split into two nested tuples — Bevy 0.17's
+                // `IntoSystemConfigs` tuple impls top out at 20
+                // elements, and this chain currently has 21. `.chain()`
+                // flattens nested tuples while preserving order, so the
+                // execution semantics are identical to a flat 21-tuple.
                 (
+                    (
                     sync_entities_system,
                     // Stage 2 of look→MMB pipeline: copy each wire
                     // entity's `look` onto its Bevy entity (when
@@ -270,6 +281,8 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                     target_ring::draw_engaged_ring_system,
                     sync_zone_lines_system,
                     atmosphere::apply_zone_atmosphere_system,
+                    ),
+                    (
                     // Order matters: update_weather_modifier_system runs
                     // *after* the zone atmosphere has written fresh base
                     // ambient values. apply_weather_to_ambient_and_fog
@@ -285,6 +298,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                     weather_fx::apply_weather_to_sun_system,
                     weather_fx::manage_weather_particles_system,
                     weather_fx::update_weather_particles_system,
+                    ),
                 )
                     .chain()
                     .run_if(resource_exists::<EntityMesh>),
@@ -341,19 +355,25 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
 
         // Graphics-settings reactors: each fires on the frame the user
         // touches a knob, applies its slice of state, then sleeps until
-        // the next change. Independent of each other and of the chained
-        // scene pipeline above; no ordering constraints.
+        // the next change. Chained so AA runs last — it despawns +
+        // respawns the OperatorCamera entity to dodge Bevy's
+        // pipeline-cache vs view-target sample-count race, which would
+        // panic any sibling reactor that still holds the old entity id.
+        // `build_operator_camera` re-reads bloom/fog/projection from
+        // settings, so the earlier reactors' work on the old entity is
+        // harmless when AA does respawn.
         app.add_systems(
             Update,
             (
                 graphics_settings::apply_shadow_map_size_system,
                 graphics_settings::apply_cascade_config_system,
-                graphics_settings::apply_anti_aliasing_system,
                 graphics_settings::apply_bloom_system,
                 graphics_settings::apply_volumetric_fog_system,
                 graphics_settings::apply_projection_system,
                 graphics_settings::apply_vsync_system,
+                graphics_settings::apply_anti_aliasing_system,
             )
+                .chain()
                 .run_if(resource_changed::<GraphicsSettings>),
         );
     }

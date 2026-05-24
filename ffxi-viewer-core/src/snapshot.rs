@@ -124,6 +124,49 @@ pub struct EventLog {
 
 const EVENT_LOG_CAP: usize = 64;
 
+/// Write-only channel for client-side toast messages. Producers use
+/// `EventWriter<ToastEvent>` so they can keep `Res<SceneState>` instead
+/// of needing `ResMut<SceneState>` just to call `push_local_toast`.
+/// Drained each frame by [`drain_toast_events`] (the single mutator).
+///
+/// Why this exists: before this event, ~17 systems took
+/// `ResMut<SceneState>` solely to emit a toast, which forced Bevy's
+/// parallel executor to serialize them all on a single core. Moving
+/// toast emission to a write-only event lets those systems run in
+/// parallel against each other and against the heavy
+/// `tick_skinned_actors` / `track_entity_motion_system` work.
+#[derive(Message, Debug, Clone)]
+pub struct ToastEvent {
+    pub line: ChatLine,
+}
+
+impl ToastEvent {
+    /// System-channel toast (default chat surface).
+    pub fn system(text: String) -> Self {
+        Self { line: system_chat_line(text) }
+    }
+    /// Debug-channel toast (only visible with `/devhud`).
+    pub fn debug(text: String) -> Self {
+        Self { line: debug_chat_line(text) }
+    }
+}
+
+/// Single-writer drain: reads `ToastEvent`s and folds them into
+/// `SceneState.local_toasts`. All other systems become read-only or
+/// write-only against `SceneState`, unlocking parallel scheduling.
+///
+/// Runs in `PostUpdate` so toasts emitted anywhere in `Update` land
+/// in `local_toasts` before the chat panel renders next frame's
+/// `rendered_chat`.
+pub fn drain_toast_events(
+    mut state: ResMut<SceneState>,
+    mut events: MessageReader<ToastEvent>,
+) {
+    for ev in events.read() {
+        state.push_local_toast(ev.line.clone());
+    }
+}
+
 /// Pull fresh state from the `SceneSource` into the Bevy resource. Runs in
 /// `PreUpdate` so downstream systems see a coherent view for the rest of
 /// the frame.

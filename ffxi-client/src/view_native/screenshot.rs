@@ -19,9 +19,7 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
-use ffxi_viewer_core::snapshot::SceneState;
-
-use super::slash_commands::system_chat_line;
+use ffxi_viewer_core::snapshot::ToastEvent;
 
 /// Fired by the slash-command dispatcher; consumed by
 /// [`process_screenshot_requests`].
@@ -38,7 +36,7 @@ pub struct ScreenshotRequest {
 pub fn process_screenshot_requests(
     mut events: MessageReader<ScreenshotRequest>,
     mut commands: Commands,
-    mut scene_state: ResMut<SceneState>,
+    mut toasts: EventWriter<ToastEvent>,
 ) {
     for req in events.read() {
         let path = req.path.clone();
@@ -46,7 +44,7 @@ pub fn process_screenshot_requests(
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(path));
-        scene_state.push_local_toast(system_chat_line(format!(
+        toasts.write(ToastEvent::system(format!(
             "/screenshot: capturing -> {display}"
         )));
     }

@@ -29,7 +29,7 @@
 //! `snapshot.logout_countdown` and we hide promptly via the same path.
 
 use bevy::prelude::*;
-use ffxi_viewer_wire::{ChatChannel, ChatLine, SceneSnapshot};
+use ffxi_viewer_wire::SceneSnapshot;
 
 use crate::hud::palette;
 use crate::snapshot::SceneState;
@@ -249,10 +249,12 @@ pub fn update_logout_countdown(
     time: Res<Time>,
     mut anchor: ResMut<LogoutCountdownAnchor>,
     mut optimistic: ResMut<OptimisticLogoutCountdown>,
-    // Single `ResMut` — we read `snapshot.logout_countdown` and write
-    // `local_toasts` via `push_local_toast`. Bevy refuses to grant both
-    // `Res` and `ResMut` of the same resource in one system param list.
-    mut scene_state: ResMut<SceneState>,
+    // Read snapshot.logout_countdown via `Res<SceneState>` and emit
+    // toasts via a write-only event — the dedicated `drain_toast_events`
+    // system folds them into `local_toasts` in PostUpdate so this
+    // system stays parallel-eligible.
+    scene_state: Res<SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     mut banner_q: Query<&mut Node, With<LogoutCountdownBanner>>,
     mut label_q: Query<&mut Text, With<LogoutCountdownLabel>>,
 ) {
@@ -310,16 +312,10 @@ pub fn update_logout_countdown(
             };
             let diagnostic = blocker_diagnostic(&scene_state.snapshot);
             let label = if shutdown { "/shutdown" } else { "/logout" };
-            scene_state.push_local_toast(ChatLine {
-                channel: ChatChannel::Debug,
-                sender: "client".into(),
-                text: format!(
-                    "{label}: server did not acknowledge (silent reject \
-                     by 0x0e7_reqlogout.cpp validator). {diagnostic}"
-                ),
-                server_ts: 0,
-                local_seq: 0,
-            });
+            toasts.write(crate::snapshot::ToastEvent::debug(format!(
+                "{label}: server did not acknowledge (silent reject \
+                 by 0x0e7_reqlogout.cpp validator). {diagnostic}"
+            )));
         }
     }
 

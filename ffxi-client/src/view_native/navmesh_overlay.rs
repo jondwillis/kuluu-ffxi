@@ -45,6 +45,7 @@
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
+use ffxi_viewer_core::snapshot::ToastEvent;
 use ffxi_viewer_core::{InputMode, SceneState, WorldEntity};
 
 use super::AppPhase;
@@ -128,7 +129,7 @@ fn toggle_navmesh_overlay(
     keys: Res<ButtonInput<KeyCode>>,
     mode: Res<InputMode>,
     mut visible: ResMut<NavmeshOverlayVisible>,
-    mut state: ResMut<SceneState>,
+    mut toasts: EventWriter<ToastEvent>,
 ) {
     if !matches!(*mode, InputMode::World) {
         return;
@@ -142,13 +143,7 @@ fn toggle_navmesh_overlay(
     } else {
         "navmesh overlay: OFF".to_string()
     };
-    state.push_local_toast(ffxi_viewer_wire::ChatLine {
-        channel: ffxi_viewer_wire::ChatChannel::Debug,
-        sender: "client".into(),
-        text: msg,
-        server_ts: 0,
-        local_seq: 0,
-    });
+    toasts.write(ToastEvent::debug(msg));
 }
 
 /// Re-load the navmesh whenever the snapshot's zone id changes.

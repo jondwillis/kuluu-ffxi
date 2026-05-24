@@ -468,7 +468,7 @@ pub fn sun_moon_system(
     moon_sphere_handle: Option<Res<MoonSphereMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut moon_materials: ResMut<Assets<crate::moon_material::MoonMaterial>>,
-    mut scene_state: ResMut<crate::snapshot::SceneState>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     sky_realism: Res<crate::sky_realism::SkyRealism>,
     mut transition_state: Local<MoonTransitionState>,
@@ -491,7 +491,7 @@ pub fn sun_moon_system(
     let sun_up_now = sky.sun_altitude > 0.0;
     if let Some(prev) = *prev_sun_up {
         if prev != sun_up_now {
-            scene_state.push_local_toast(crate::snapshot::system_chat_line(
+            toasts.write(crate::snapshot::ToastEvent::system(
                 if sun_up_now {
                     "☀ Sunrise"
                 } else {
@@ -506,7 +506,7 @@ pub fn sun_moon_system(
     let moon_up_now = sky.moon_altitude > 0.0;
     if let Some(prev) = *prev_moon_up {
         if prev != moon_up_now {
-            scene_state.push_local_toast(crate::snapshot::system_chat_line(
+            toasts.write(crate::snapshot::ToastEvent::system(
                 if moon_up_now {
                     "☾ Moonrise"
                 } else {
@@ -533,7 +533,7 @@ pub fn sun_moon_system(
             let total_v_days = (earth_since * 25.0 / 86400.0) as u64;
             let weekday =
                 crate::hud::vana_clock::VANA_WEEKDAYS[(total_v_days % 8) as usize];
-            scene_state.push_local_toast(crate::snapshot::system_chat_line(format!(
+            toasts.write(crate::snapshot::ToastEvent::system(format!(
                 "☾ Moon: {} ({:.0}% illuminated) — {}",
                 MOON_PHASE_NAMES[phase_bucket as usize],
                 sky.moon_illumination * 100.0,
@@ -760,14 +760,14 @@ pub fn sun_moon_system(
             // Lunar eclipse: moon hits full while above horizon (it's
             // antipodal to the sun, sitting in Vana'diel's shadow).
             if prev < 0.999 && illum >= 0.999 && sky.moon_altitude > 0.0 {
-                scene_state.push_local_toast(crate::snapshot::system_chat_line(
+                toasts.write(crate::snapshot::ToastEvent::system(
                     "🌑 Lunar eclipse — Vana'diel's shadow falls upon the moon.".to_string(),
                 ));
             }
             // Solar eclipse: moon hits new while sun is above horizon
             // (moon coincident with sun, blocking it from view).
             if prev > 0.001 && illum <= 0.001 && sky.sun_altitude > 0.0 {
-                scene_state.push_local_toast(crate::snapshot::system_chat_line(
+                toasts.write(crate::snapshot::ToastEvent::system(
                     "🌒 Solar eclipse — the moon crosses the sun.".to_string(),
                 ));
             }
