@@ -1645,12 +1645,57 @@ pub fn tick_skinned_actors(
     motion: Res<crate::combat_stance::EntityMotion>,
     rest: Res<crate::combat_stance::RestStance>,
     mut blends: ResMut<crate::combat_stance::AnimationBlends>,
+    clip_override: Option<Res<crate::combat_stance::ModelViewerClipOverride>>,
     q_actors: Query<(&crate::components::WorldEntity, &SkinnedActor)>,
     mut q_bones: Query<&mut Transform>,
 ) {
     use crate::combat_stance::{ClipId, EntityMotion};
     let elapsed = time.elapsed_secs();
     let dt = time.delta_secs();
+
+    // Model-viewer override: when the resource is present, force every
+    // actor onto a single named clip — same per-bone keyframe write as
+    // the matrix-driven path, just with the engagement / motion / rest
+    // selection bypassed. Resolves once (3-char prefix) against the
+    // skeleton DAT first, then the PC motion DAT.
+    if let Some(over) = clip_override.as_deref() {
+        let prefix = override_prefix(&over.clip_name);
+        for (_world, actor) in &q_actors {
+            let Some(baked) = baked_skeleton_for_file(actor.dat_id) else {
+                continue;
+            };
+            let Some(raw) = baked.raw else { continue };
+            let Some(anim) =
+                crate::combat_stance::override_anim_for_skel(actor.dat_id, &prefix)
+            else {
+                continue;
+            };
+            if anim.frames == 0 {
+                continue;
+            }
+            let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
+            let frame_idx = ((elapsed / safe_speed).floor() as usize) % anim.frames as usize;
+            for (i, bone) in raw.bones.iter().enumerate() {
+                if i == 0 {
+                    continue;
+                }
+                let Some(&bone_e) = actor.bone_entities.get(i) else { continue };
+                let (rot, trans, scale) = match anim
+                    .frames_for_bone(i)
+                    .and_then(|frames| frames.get(frame_idx))
+                {
+                    Some(f) => (f.rotation, f.translation, f.scale),
+                    None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
+                };
+                if let Ok(mut tf) = q_bones.get_mut(bone_e) {
+                    tf.rotation = Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]);
+                    tf.translation = Vec3::from_array(trans);
+                    tf.scale = Vec3::from_array(scale);
+                }
+            }
+        }
+        return;
+    }
     // Build a once-per-frame index of (id → bt_target_id) so the inner
     // engagement lookup is O(1). Without this, the per-actor loop did
     // a linear `find()` over the whole snapshot — quadratic in nearby
@@ -1920,6 +1965,20 @@ pub fn tick_skinned_actors(
             }
         }
     }
+}
+
+/// Coerce a user-typed clip name into the 3-byte ASCII-lowercase prefix
+/// that `load_anim_with_prefix` expects. `"run0"` and `"run"` both
+/// resolve to `b"run"`; shorter input is padded with NULs (which will
+/// fail to match any real chunk — the model viewer just shows no
+/// animation in that case).
+fn override_prefix(name: &str) -> [u8; 3] {
+    let bytes = name.as_bytes();
+    let mut p = [0u8; 3];
+    for (i, slot) in p.iter_mut().enumerate() {
+        *slot = bytes.get(i).copied().unwrap_or(0).to_ascii_lowercase();
+    }
+    p
 }
 
 /// Spawn one polygon-group's worth of Bevy meshes per group, each

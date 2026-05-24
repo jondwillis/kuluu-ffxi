@@ -317,7 +317,7 @@ pub fn directional_anim_for_skel(skel_file_id: u32, prefix: &[u8; 3]) -> Option<
 /// Shared loader: open a DAT, walk its chunks, return the first MO2
 /// whose 3-char name prefix matches `prefix`. Used for `btl`, `run`,
 /// and any future prefix we wire up (`wlk`, `mvb`, …).
-fn load_anim_with_prefix(file_id: u32, prefix: &[u8; 3]) -> Option<Mo2Animation> {
+pub fn load_anim_with_prefix(file_id: u32, prefix: &[u8; 3]) -> Option<Mo2Animation> {
     let root = DatRoot::from_env_or_default().ok()?;
     let loc = root.resolve(file_id).ok()?;
     let bytes = fs::read(loc.path_under(root.root())).ok()?;
@@ -581,6 +581,80 @@ pub fn track_entity_motion_system(
                 heading_rate,
             },
         );
+    }
+}
+
+/// Forces every `tick_skinned_actors` actor onto a single named clip,
+/// bypassing the engagement/motion/rest state machine. Only the
+/// `--model-viewer` subcommand registers this — its absence keeps the
+/// live-game path byte-identical.
+///
+/// `clip_name` is the 3-char MO2 prefix (`"idl"`, `"btl"`, `"run"`,
+/// `"sit"`, …). The override resolves against the skeleton DAT first,
+/// then the PC motion DAT (`motion_dat_for_skel`) so PC combat clips
+/// (`btl0`, `run1`) are reachable.
+#[derive(Resource, Debug, Clone)]
+pub struct ModelViewerClipOverride {
+    pub clip_name: String,
+}
+
+impl ModelViewerClipOverride {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { clip_name: name.into() }
+    }
+}
+
+/// Enumerate every animation chunk (clip) discoverable for a given
+/// skeleton DAT. For PC race skeletons, also appends clips from the
+/// race's motion DAT (`motion_dat_for_skel`) so battle/run1/etc. are
+/// discoverable alongside skeleton-resident clips like `idl`/`sit`/`wlk`.
+///
+/// One-shot read — not a hot path. The model viewer calls this on mode
+/// change to populate the clip cycler.
+pub fn enumerate_clips_for_skel(skel_file_id: u32) -> Vec<(String, Arc<Mo2Animation>)> {
+    let mut out = Vec::new();
+    let mut sources: Vec<u32> = vec![skel_file_id];
+    if let Some(motion) = motion_dat_for_skel(skel_file_id) {
+        sources.push(motion);
+    }
+    let mut seen = std::collections::HashSet::<String>::new();
+    for file_id in sources {
+        for_each_anim_chunk_in_dat(file_id, |name, anim| {
+            if seen.insert(name.clone()) {
+                out.push((name, Arc::new(anim)));
+            }
+        });
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Resolve a 3-char-prefix clip override against the skeleton DAT and,
+/// if no match, the PC motion DAT. Returns `None` for non-existent
+/// prefixes (e.g. typing `xxx`).
+pub fn override_anim_for_skel(skel_file_id: u32, prefix: &[u8; 3]) -> Option<Arc<Mo2Animation>> {
+    if let Some(a) = load_anim_with_prefix(skel_file_id, prefix) {
+        return Some(Arc::new(a));
+    }
+    let motion = motion_dat_for_skel(skel_file_id)?;
+    load_anim_with_prefix(motion, prefix).map(Arc::new)
+}
+
+fn for_each_anim_chunk_in_dat(file_id: u32, mut f: impl FnMut(String, Mo2Animation)) {
+    let Ok(root) = DatRoot::from_env_or_default() else { return };
+    let Ok(loc) = root.resolve(file_id) else { return };
+    let Ok(bytes) = fs::read(loc.path_under(root.root())) else { return };
+    for chunk in walk(&bytes).filter_map(Result::ok) {
+        if ChunkKind::from_u8(chunk.kind) != Some(ChunkKind::AnimMo2) {
+            continue;
+        }
+        if let Ok(anim) = ffxi_dat::anim::parse_mo2(chunk.data, &chunk.name) {
+            let name = String::from_utf8_lossy(&chunk.name)
+                .trim_end_matches('\0')
+                .trim_end()
+                .to_string();
+            f(name, anim);
+        }
     }
 }
 
