@@ -1304,10 +1304,9 @@ pub struct CameraAutoRecenter {
 const AUTO_RECENTER_HOLD_S: f32 = 0.5;
 /// Spring constant for the post-motion chase recenter (1/sec).
 /// Exponential lerp: each tick the residual angle shrinks by
-/// `1 - exp(-rate · dt)`. At 0.9 the half-life is ~0.77s — the
-/// camera obviously chases without snapping. Bumped 50% from the
-/// initial 0.6 per operator feel.
-const AUTO_RECENTER_RATE: f32 = 0.9;
+/// `1 - exp(-rate · dt)`. At 3.0 the half-life is ~0.23s — the
+/// camera settles fast and decisively after movement stops.
+const AUTO_RECENTER_RATE: f32 = 3.0;
 /// First-person look-at-lock pitch tracking rate, radians/sec. ~3 rad/s
 /// is fast: when locked onto a tall mob the camera tips up to meet its
 /// head within ~½ second from a level start.
