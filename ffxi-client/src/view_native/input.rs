@@ -54,7 +54,7 @@ use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use bevy::window::WindowCloseRequested;
 use ffxi_viewer_core::{
-    heading_for_yaw, toggle_camera_mode, yaw_for_heading, Action, Bindings, CameraMode,
+    heading_for_yaw, yaw_for_heading, Action, Bindings, CameraMode, CameraTransition,
     ChaseCamera, ChatBuffer, CursorLockRequest, InputMode, IsSelf, LockOn, LockOnToggle,
     MenuStack, OperatorCamera, PassiveCursorState, SceneState, Target, WorldEntity,
 };
@@ -232,6 +232,7 @@ pub fn handle_input_system(
     mut exit: MessageWriter<AppExit>,
     mut rest_stance: ResMut<ffxi_viewer_core::combat_stance::RestStance>,
     mut walk_mode: ResMut<ffxi_viewer_core::combat_stance::WalkMode>,
+    mut camera_transition: ResMut<CameraTransition>,
 ) {
     // Close-window: Cmd+Q, Cmd+W, or the OS-level WindowCloseRequested
     // event (red traffic light, App→Quit menu, etc.). Hard-wired (not
@@ -264,7 +265,10 @@ pub fn handle_input_system(
     if !matches!(*mode, InputMode::Chat(_))
         && bindings.just_pressed(Action::ToggleFirstPerson, &keys)
     {
-        toggle_camera_mode(&mut camera_mode, &mut chase);
+        // Retail dollies between 3p and 1p instead of cutting — start
+        // a 0.35s zoom transition. `camera_transition_system` runs in
+        // Update and handles mode-swap mid-dolly.
+        camera_transition.begin(*camera_mode, chase.distance);
         cursor_lock.locked = false;
     }
 
@@ -1326,44 +1330,31 @@ pub fn camera_polish_system(
         return;
     }
 
-    // --- (a) Auto-recenter ---------------------------------------------
-    // Track the "forward held with no yaw input" window. The yaw-input
-    // test uses Action::CameraYawLeft/Right specifically (per the unit
-    // spec) — A/D rotates the player AND the camera lock-step, so it's
-    // intentionally NOT considered a "free-look yaw input" that should
-    // cancel recenter.
+    // --- (a) Persistent chase-to-behind-player ------------------------
+    // Retail FFXI: the camera always wants to be behind the player.
+    // Continuously runs (in chase mode only) as long as the operator
+    // isn't actively rotating the camera with arrow keys. Subsumes the
+    // old "MoveForward held >0.5s" recenter gate — the camera should
+    // chase after A/D release too, until lag_c → 0.
     //
-    // Chase-mode only: in first-person, "behind the player at current
-    // heading" is not a meaningful concept (FP yaw drives the look
-    // direction directly).
-    let forward_held = bindings.pressed(Action::MoveForward, &keys);
+    // Exponential lerp at AUTO_RECENTER_RATE so the recenter is gentle
+    // when the player is standing still (small residual → small step)
+    // but doesn't fight the orbit-strafe's faster CHASE_TRACK_RATE
+    // during sustained A/D (the orbit branch overwrites chase.yaw
+    // every tick with a larger step before this runs).
     let yaw_input = bindings.pressed(Action::CameraYawLeft, &keys)
         || bindings.pressed(Action::CameraYawRight, &keys);
+    let _ = &mut recenter; // resource retained for future operator-tunable knobs
 
-    if yaw_input || !forward_held || !matches!(*camera_mode, CameraMode::Chase) {
-        recenter.forward_held_since = None;
-    } else {
-        let now = Instant::now();
-        let started = *recenter.forward_held_since.get_or_insert(now);
-        let elapsed = now.duration_since(started).as_secs_f32();
-        if elapsed >= AUTO_RECENTER_HOLD_S {
-            // Target yaw: camera directly behind the player at the
-            // player's current heading. `yaw_for_heading` is the
-            // already-used "camera-behind-player" mapping (see the
-            // one-shot sync in `chase_camera_system`).
-            let target_yaw = yaw_for_heading(state.snapshot.self_pos.heading);
-            // Shortest-arc delta wrapped into [-π, π] so we don't take
-            // the long way around when current yaw is already close to
-            // target on the "wrong" side of ±π.
-            let tau = std::f32::consts::TAU;
-            let mut diff = (target_yaw - chase.yaw).rem_euclid(tau);
-            if diff > std::f32::consts::PI {
-                diff -= tau;
-            }
-            let max_step = AUTO_RECENTER_RATE * time.delta_secs();
-            let step = diff.clamp(-max_step, max_step);
-            chase.yaw += step;
+    if !yaw_input && matches!(*camera_mode, CameraMode::Chase) {
+        let target_yaw = yaw_for_heading(state.snapshot.self_pos.heading);
+        let tau = std::f32::consts::TAU;
+        let mut diff = (target_yaw - chase.yaw).rem_euclid(tau);
+        if diff > std::f32::consts::PI {
+            diff -= tau;
         }
+        let alpha = 1.0 - (-AUTO_RECENTER_RATE * time.delta_secs()).exp();
+        chase.yaw += diff * alpha;
     }
 
     // --- (c) 1p auto-lock pitch tracking -------------------------------

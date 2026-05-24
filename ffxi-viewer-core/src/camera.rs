@@ -183,6 +183,117 @@ impl Default for ChaseCamera {
     }
 }
 
+/// 1p↔3p zoom transition state. Replaces the instant
+/// [`toggle_camera_mode`] behavior with a ~0.35s zoom interpolation —
+/// retail FFXI dollies the camera between chase distance and the
+/// eye-anchor rather than cutting. `target_mode` is the mode we land
+/// in when `t` reaches 1.0; the actual `CameraMode` resource swaps
+/// mid-transition based on the chase distance crossing
+/// [`ChaseCamera::DIST_MIN`].
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct CameraTransition {
+    /// True while a transition is in progress.
+    pub active: bool,
+    /// Linear progress 0..=1.
+    pub t: f32,
+    /// Total transition time in seconds.
+    pub duration: f32,
+    /// Chase distance at transition start.
+    pub from_dist: f32,
+    /// Chase distance at transition end.
+    pub to_dist: f32,
+    /// Mode the system should end up in once `t` reaches 1.
+    pub target_mode: CameraMode,
+    /// Cached chase distance prior to entering FirstPerson, so the
+    /// return trip restores the same orbit radius.
+    pub saved_chase_dist: f32,
+}
+
+impl Default for CameraTransition {
+    fn default() -> Self {
+        Self {
+            active: false,
+            t: 0.0,
+            duration: 0.35,
+            from_dist: 0.0,
+            to_dist: 0.0,
+            target_mode: CameraMode::Chase,
+            saved_chase_dist: 18.0,
+        }
+    }
+}
+
+impl CameraTransition {
+    /// Begin a transition. Caller passes the current mode + chase
+    /// distance; the system flips `target_mode` and computes the
+    /// from/to distances.
+    pub fn begin(&mut self, current_mode: CameraMode, current_dist: f32) {
+        match current_mode {
+            CameraMode::Chase => {
+                self.saved_chase_dist = current_dist;
+                self.from_dist = current_dist;
+                self.to_dist = 0.0;
+                self.target_mode = CameraMode::FirstPerson;
+            }
+            CameraMode::FirstPerson => {
+                self.from_dist = 0.0;
+                self.to_dist = self.saved_chase_dist;
+                self.target_mode = CameraMode::Chase;
+            }
+        }
+        self.active = true;
+        self.t = 0.0;
+    }
+}
+
+/// Tick system: drives the [`CameraTransition`] interpolation. Writes
+/// `chase.distance` each frame; swaps `CameraMode` once the camera
+/// crosses `DIST_MIN` (going in) or as soon as the transition starts
+/// (coming out, so the chase camera renders the entire dolly).
+pub fn camera_transition_system(
+    time: Res<Time>,
+    mut transition: ResMut<CameraTransition>,
+    mut mode: ResMut<CameraMode>,
+    mut chase: ResMut<ChaseCamera>,
+) {
+    if !transition.active {
+        return;
+    }
+    // On the first tick of a "to Chase" transition, swap mode so the
+    // chase system starts rendering immediately from the close-in
+    // distance. For "to FP", stay in Chase until the camera is close
+    // enough that swapping is visually indistinguishable.
+    if matches!(transition.target_mode, CameraMode::Chase)
+        && matches!(*mode, CameraMode::FirstPerson)
+    {
+        *mode = CameraMode::Chase;
+    }
+
+    transition.t = (transition.t + time.delta_secs() / transition.duration).min(1.0);
+    // Smoothstep for an ease-in/ease-out feel.
+    let s = transition.t * transition.t * (3.0 - 2.0 * transition.t);
+    chase.distance = transition.from_dist + (transition.to_dist - transition.from_dist) * s;
+
+    if matches!(transition.target_mode, CameraMode::FirstPerson)
+        && chase.distance < 1.0
+        && matches!(*mode, CameraMode::Chase)
+    {
+        *mode = CameraMode::FirstPerson;
+        chase.pitch = 0.0;
+    }
+
+    if transition.t >= 1.0 {
+        chase.distance = transition.to_dist;
+        *mode = transition.target_mode;
+        if matches!(transition.target_mode, CameraMode::Chase) {
+            chase.pitch = chase
+                .pitch
+                .clamp(ChaseCamera::PITCH_MIN, ChaseCamera::PITCH_MAX);
+        }
+        transition.active = false;
+    }
+}
+
 pub fn spawn_camera(mut commands: Commands, settings: Res<GraphicsSettings>) {
     // Read AA, bloom, fog, view distance, and FOV from the user's
     // persisted settings (defaults to High preset) so the first frame

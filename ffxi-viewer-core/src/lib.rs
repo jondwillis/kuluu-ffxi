@@ -62,10 +62,10 @@ pub mod weather_fx;
 pub mod zone_lines;
 
 pub use camera::{
-    chase_camera_system, first_person_eye_y, firstperson_camera_system, heading_for_yaw,
-    nameplate_anchor_y, self_visibility_for_camera_mode_system, spawn_camera,
-    third_person_anchor_y, toggle_camera_mode, yaw_for_heading, CameraMode, ChaseCamera,
-    OperatorCamera,
+    camera_transition_system, chase_camera_system, first_person_eye_y, firstperson_camera_system,
+    heading_for_yaw, nameplate_anchor_y, self_visibility_for_camera_mode_system, spawn_camera,
+    third_person_anchor_y, toggle_camera_mode, yaw_for_heading, CameraMode, CameraTransition,
+    ChaseCamera, OperatorCamera,
 };
 pub use components::{
     EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
@@ -260,6 +260,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                     // wins when present.
                     scene::ensure_self_lookcomp_system,
                     process_entity_look_changes,
+                    camera_transition_system,
                     chase_camera_system,
                     firstperson_camera_system,
                     sync_aggro_system,
@@ -308,6 +309,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         app.init_resource::<combat_stance::RestStance>();
         app.init_resource::<combat_stance::AnimationBlends>();
         app.init_resource::<combat_stance::WalkMode>();
+        app.init_resource::<camera::CameraTransition>();
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,
