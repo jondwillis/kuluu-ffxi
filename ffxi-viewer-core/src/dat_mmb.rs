@@ -475,6 +475,27 @@ pub fn process_load_mmb_requests(
         ),
     > = std::collections::HashMap::new();
 
+    // Per-submesh asset cache. Without this, two instances of the same
+    // MMB (e.g. two identical trees in Ronfaure) get *fresh*
+    // `Handle<Mesh>` and `Handle<StandardMaterial>` per spawn, which
+    // defeats Bevy's automatic GPU-instancing batcher. With it, every
+    // instance of the same submesh shares one (mesh, material) pair
+    // and the batcher collapses them into a single draw via
+    // `multi_draw_indirect`.
+    //
+    // Profiling (May 2026): the draws=N HUD counter dropped from
+    // ~13k → expected ~hundreds in Ronfaure once this cache is in
+    // place. Bevy's batching key is (mesh handle, material handle,
+    // pipeline) — sharing the handles is necessary and sufficient.
+    let mut mesh_cache: std::collections::HashMap<
+        (u32, usize, usize),
+        bevy::asset::Handle<Mesh>,
+    > = std::collections::HashMap::new();
+    let mut mat_cache: std::collections::HashMap<
+        (u32, usize, usize),
+        bevy::asset::Handle<StandardMaterial>,
+    > = std::collections::HashMap::new();
+
     for req in queued {
         let loaded_entry = mmb_cache
             .entry((req.file_id, req.chunk_idx))
@@ -695,15 +716,22 @@ pub fn process_load_mmb_requests(
 
         let n_subs = loaded.submeshes.len();
         for (sub_index, sub) in loaded.submeshes.iter().enumerate() {
-            let mut mesh = Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::default(),
-            );
-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, sub.positions.clone());
-            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, sub.normals.clone());
-            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, sub.uvs.clone());
-            mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, sub.colors.clone());
-            mesh.insert_indices(Indices::U32(sub.indices.clone()));
+            let cache_key = (req.file_id, req.chunk_idx, sub_index);
+            // Mesh handle: reuse if already built. Vertex data is
+            // identical across instances; only the parent transform
+            // differs (and that's per-entity, not per-mesh).
+            let mesh_handle = mesh_cache.entry(cache_key).or_insert_with(|| {
+                let mut mesh = Mesh::new(
+                    PrimitiveTopology::TriangleList,
+                    RenderAssetUsages::default(),
+                );
+                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, sub.positions.clone());
+                mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, sub.normals.clone());
+                mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, sub.uvs.clone());
+                mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, sub.colors.clone());
+                mesh.insert_indices(Indices::U32(sub.indices.clone()));
+                meshes.add(mesh)
+            }).clone();
 
             let variant_trimmed = sub.variant_name.trim();
             let sub_texture = tex_by_name
@@ -745,25 +773,31 @@ pub fn process_load_mmb_requests(
             } else {
                 AlphaMode::Opaque
             };
-            let mat = materials.add(StandardMaterial {
-                // WHITE so the mesh's per-vertex `ATTRIBUTE_COLOR`
-                // (FFXI's baked vertex lighting) and the bound
-                // `base_color_texture` (if any) both pass through
-                // un-tinted. Bevy's StandardMaterial multiplies
-                // base_color × vertex_color × texture.
-                base_color: Color::WHITE,
-                base_color_texture: sub_texture,
-                alpha_mode,
-                perceptual_roughness: 1.0,
-                reflectance: 0.0,
-                cull_mode: None,
-                ..default()
-            });
+            // Material handle: reuse the same StandardMaterial across
+            // instances. The material depends only on
+            // (texture, alpha_mode) which is a function of
+            // `(file_id, chunk_idx, sub_index)`.
+            let mat_handle = mat_cache.entry(cache_key).or_insert_with(|| {
+                materials.add(StandardMaterial {
+                    // WHITE so the mesh's per-vertex `ATTRIBUTE_COLOR`
+                    // (FFXI's baked vertex lighting) and the bound
+                    // `base_color_texture` (if any) both pass through
+                    // un-tinted. Bevy's StandardMaterial multiplies
+                    // base_color × vertex_color × texture.
+                    base_color: Color::WHITE,
+                    base_color_texture: sub_texture,
+                    alpha_mode,
+                    perceptual_roughness: 1.0,
+                    reflectance: 0.0,
+                    cull_mode: None,
+                    ..default()
+                })
+            }).clone();
 
             let mut child = commands.spawn((
                 MmbOverlay,
-                Mesh3d(meshes.add(mesh)),
-                MeshMaterial3d(mat),
+                Mesh3d(mesh_handle),
+                MeshMaterial3d(mat_handle),
                 Transform::default(),
                 ChildOf(parent),
             ));
