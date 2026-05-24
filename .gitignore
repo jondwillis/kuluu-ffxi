@@ -53,3 +53,4 @@ vendor/RZN-mapviewer/
 # WASM build outputs — each bundle is ~150MB and exceeds GitHub's 100MB
 # blob limit. Regenerate locally via the wasm toolchain.
 ffxi-viewer-wasm/dist/
+profile.json.gz
