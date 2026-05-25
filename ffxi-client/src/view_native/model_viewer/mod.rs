@@ -32,11 +32,43 @@ use super::launcher_backdrop::PREVIEW_RENDER_LAYER;
 
 mod panel;
 
-/// Inputs for [`run`]. Kept narrow on purpose — the viewer needs no
-/// network state, no relay, no agent socket. The DAT root is the one
-/// hard dependency since both PC and NPC bakes read DAT files directly.
+/// Inputs for [`run`]. The DAT root is the one hard dependency; every
+/// other field maps 1:1 to a form input and is pre-populated when set
+/// so a `/look <name>` line drops straight into a command. `None` for
+/// any field falls back to the form's default. Numeric ids accept hex
+/// (`0x1006`) or decimal — see [`parse_id_lenient`].
 pub struct ModelViewerArgs {
     pub dat_root: Option<std::sync::Arc<ffxi_dat::DatRoot>>,
+    pub race: Option<u8>,
+    pub face: Option<u8>,
+    pub head: Option<String>,
+    pub body: Option<String>,
+    pub hands: Option<String>,
+    pub legs: Option<String>,
+    pub feet: Option<String>,
+    pub main: Option<String>,
+    pub sub: Option<String>,
+    pub ranged: Option<String>,
+    /// When set, the viewer starts in NPC mode with this `model_id`
+    /// and the PC fields are ignored.
+    pub model_id: Option<String>,
+    /// Initial clip name (3-char prefix). Defaults to `"idl"`.
+    pub clip: Option<String>,
+}
+
+/// Parse a hex (`0x…`) or decimal numeric id from a CLI string. `None`
+/// on parse failure — caller logs a warning and the form field keeps
+/// its default. Same semantics as `panel::parse_u16_lenient`.
+fn parse_id_lenient(s: &str) -> Option<u16> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u16>().ok()
+    }
 }
 
 /// Synthetic wire-entity id used for the preview parent. Picked
@@ -156,7 +188,62 @@ impl ClipList {
 }
 
 pub fn run(args: ModelViewerArgs) -> Result<()> {
-    let ModelViewerArgs { dat_root } = args;
+    let ModelViewerArgs {
+        dat_root,
+        race,
+        face,
+        head,
+        body,
+        hands,
+        legs,
+        feet,
+        main,
+        sub,
+        ranged,
+        model_id,
+        clip,
+    } = args;
+
+    // Compose the initial form values from the CLI. `--model-id` forces
+    // NPC mode and the PC fields are ignored; otherwise PC mode is the
+    // default and the slot/race/face fields fall back to the form's
+    // built-in defaults whenever a flag was omitted.
+    let mut pc_form = PcForm::default();
+    if let Some(v) = race { pc_form.race = v; }
+    if let Some(v) = face { pc_form.face = v; }
+    let mut apply = |dst: &mut u16, src: Option<String>, name: &str| {
+        let Some(s) = src else { return };
+        match parse_id_lenient(&s) {
+            Some(v) => *dst = v,
+            None => warn!("model viewer: ignoring --{name}={s:?} (not a u16)"),
+        }
+    };
+    apply(&mut pc_form.head,   head,   "head");
+    apply(&mut pc_form.body,   body,   "body");
+    apply(&mut pc_form.hands,  hands,  "hands");
+    apply(&mut pc_form.legs,   legs,   "legs");
+    apply(&mut pc_form.feet,   feet,   "feet");
+    apply(&mut pc_form.main,   main,   "main");
+    apply(&mut pc_form.sub,    sub,    "sub");
+    apply(&mut pc_form.ranged, ranged, "ranged");
+
+    let mut npc_form = NpcForm::default();
+    let mode = if let Some(s) = model_id {
+        match parse_id_lenient(&s) {
+            Some(v) => {
+                npc_form.model_id = v;
+                ViewerMode::Npc
+            }
+            None => {
+                warn!("model viewer: ignoring --model-id={s:?} (not a u16); falling back to PC mode");
+                ViewerMode::Pc
+            }
+        }
+    } else {
+        ViewerMode::Pc
+    };
+
+    let initial_clip = clip.unwrap_or_else(|| "idl".to_string());
 
     let mut app = App::new();
 
@@ -191,15 +278,18 @@ pub fn run(args: ModelViewerArgs) -> Result<()> {
         .init_resource::<ffxi_viewer_core::combat_stance::EntityMotion>()
         .init_resource::<ffxi_viewer_core::combat_stance::AnimationBlends>()
         .init_resource::<RestStance>()
-        .init_resource::<ViewerMode>()
-        .init_resource::<PcForm>()
-        .init_resource::<NpcForm>()
         .init_resource::<RebakeState>()
         .init_resource::<ClipList>()
+        // CLI-seeded values override the form's built-in defaults. PcForm
+        // and NpcForm both carry every field the panel binds to, so the
+        // panel reads + writes the same resource the CLI populated.
+        .insert_resource(mode)
+        .insert_resource(pc_form)
+        .insert_resource(npc_form)
         // The override resource is what tells `tick_skinned_actors` to
         // bypass the engagement / motion / rest matrix and just play
         // whatever clip we name. Always present in viewer mode.
-        .insert_resource(ModelViewerClipOverride::new("idl"));
+        .insert_resource(ModelViewerClipOverride::new(initial_clip));
 
     // Dat root is what `spawn_equipped` / `enumerate_vos2_chunks` /
     // `load_anim_with_prefix` read from. Without it the bake silently

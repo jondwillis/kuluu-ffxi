@@ -57,7 +57,23 @@ pub fn register(app: &mut App) {
         .add_systems(Update, (update_clip_label, sync_clip_override));
 }
 
-fn spawn_panel(mut commands: Commands) {
+fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
+    // Snapshot the seeded form values so each TextField renders the
+    // CLI-pre-populated number on first frame. Hex format keeps slot
+    // ids readable (matches `/look` output); race/face stay decimal.
+    let race = pc.race.to_string();
+    let face = pc.face.to_string();
+    let fmt_id = |v: u16| if v == 0 { "0".to_string() } else { format!("0x{v:04X}") };
+    let head   = fmt_id(pc.head);
+    let body   = fmt_id(pc.body);
+    let hands  = fmt_id(pc.hands);
+    let legs   = fmt_id(pc.legs);
+    let feet   = fmt_id(pc.feet);
+    let main   = fmt_id(pc.main);
+    let sub    = fmt_id(pc.sub);
+    let ranged = fmt_id(pc.ranged);
+    let model_id = fmt_id(npc.model_id);
+
     commands
         .spawn((
             PanelRoot,
@@ -106,16 +122,16 @@ fn spawn_panel(mut commands: Commands) {
                 TextColor(Color::srgb(0.7, 0.85, 1.0)),
                 ThemedText,
             ));
-            spawn_pc_field(panel, "race",   "1",       PcField::Race);
-            spawn_pc_field(panel, "face",   "0",       PcField::Face);
-            spawn_pc_field(panel, "head",   "0",       PcField::Head);
-            spawn_pc_field(panel, "body",   "0",       PcField::Body);
-            spawn_pc_field(panel, "hands",  "0",       PcField::Hands);
-            spawn_pc_field(panel, "legs",   "0",       PcField::Legs);
-            spawn_pc_field(panel, "feet",   "0",       PcField::Feet);
-            spawn_pc_field(panel, "main",   "0",       PcField::Main);
-            spawn_pc_field(panel, "sub",    "0",       PcField::Sub);
-            spawn_pc_field(panel, "ranged", "0",       PcField::Ranged);
+            spawn_pc_field(panel, "race",   &race,   PcField::Race);
+            spawn_pc_field(panel, "face",   &face,   PcField::Face);
+            spawn_pc_field(panel, "head",   &head,   PcField::Head);
+            spawn_pc_field(panel, "body",   &body,   PcField::Body);
+            spawn_pc_field(panel, "hands",  &hands,  PcField::Hands);
+            spawn_pc_field(panel, "legs",   &legs,   PcField::Legs);
+            spawn_pc_field(panel, "feet",   &feet,   PcField::Feet);
+            spawn_pc_field(panel, "main",   &main,   PcField::Main);
+            spawn_pc_field(panel, "sub",    &sub,    PcField::Sub);
+            spawn_pc_field(panel, "ranged", &ranged, PcField::Ranged);
 
             // ---- NPC inputs ---------------------------------------------------
             panel.spawn((
@@ -123,7 +139,7 @@ fn spawn_panel(mut commands: Commands) {
                 TextColor(Color::srgb(0.7, 0.85, 1.0)),
                 ThemedText,
             ));
-            spawn_npc_modelid(panel);
+            spawn_npc_modelid(panel, &model_id);
 
             // ---- Animation cycler --------------------------------------------
             panel.spawn((
@@ -250,7 +266,8 @@ fn spawn_pc_field(parent: &mut ChildSpawnerCommands, label: &str, initial: &str,
         });
 }
 
-fn spawn_npc_modelid(parent: &mut ChildSpawnerCommands) {
+fn spawn_npc_modelid(parent: &mut ChildSpawnerCommands, initial: &str) {
+    let initial = initial.to_string();
     parent
         .spawn(Node {
             flex_direction: FlexDirection::Row,
@@ -268,7 +285,7 @@ fn spawn_npc_modelid(parent: &mut ChildSpawnerCommands) {
                 ThemedText,
             ));
             row.spawn(text_field(TextFieldProps {
-                initial: "0".to_string(),
+                initial,
                 ..default()
             }))
             .with_children(|tf| {

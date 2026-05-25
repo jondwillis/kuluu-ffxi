@@ -170,8 +170,53 @@ enum Command {
     /// and form controls for inspecting arbitrary PC race/face/equipment
     /// combos and NPC model_ids with animation playback. Bypasses auth /
     /// lobby / map entirely — only the local DAT install is read.
+    ///
+    /// All form fields can be pre-populated via flags so a
+    /// `/look <name>` output line drops straight into a command:
+    ///
+    ///   ffxi-client model-viewer --race 3 --face 11 \
+    ///       --head 0x1012 --body 0x2018 --hands 0x300F \
+    ///       --legs 0x4007 --feet 0x5011 --main 0x6000 --sub 0x7000
+    ///
+    /// `--model-id` switches the form to NPC mode (mutually exclusive
+    /// with the PC fields). `--clip` sets the initial animation
+    /// override (e.g. `idl`, `btl`, `run0`).
     #[cfg(feature = "native-window")]
-    ModelViewer,
+    ModelViewer {
+        /// PC race byte (1..=8). Hume M=1, Hume F=2, Elv M=3, Elv F=4,
+        /// Taru M=5, Taru F=6, Mithra=7, Galka=8.
+        #[arg(long)]
+        race: Option<u8>,
+        /// PC face index (1..=16ish; 0 falls back to 1).
+        #[arg(long)]
+        face: Option<u8>,
+        /// Equipment slot ids. Each accepts hex (`0x1006`) or decimal.
+        /// 0 = empty slot.
+        #[arg(long)]
+        head: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        hands: Option<String>,
+        #[arg(long)]
+        legs: Option<String>,
+        #[arg(long)]
+        feet: Option<String>,
+        #[arg(long)]
+        main: Option<String>,
+        #[arg(long)]
+        sub: Option<String>,
+        #[arg(long)]
+        ranged: Option<String>,
+        /// NPC mode: single u16 model_id (hex or decimal). When set,
+        /// the form starts in NPC mode and PC fields are ignored.
+        #[arg(long)]
+        model_id: Option<String>,
+        /// Initial animation clip name (3-char prefix, e.g. `idl`,
+        /// `btl`, `run0`, `sit`). Defaults to `idl`.
+        #[arg(long)]
+        clip: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -216,7 +261,7 @@ fn main() -> Result<()> {
         return run_native_main_thread(&rt, args, auth);
     }
     #[cfg(feature = "native-window")]
-    if matches!(args.command, Command::ModelViewer) {
+    if matches!(args.command, Command::ModelViewer { .. }) {
         return run_model_viewer_main_thread(args);
     }
 
@@ -659,7 +704,7 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             );
         }
         #[cfg(feature = "native-window")]
-        Command::ModelViewer => {
+        Command::ModelViewer { .. } => {
             unreachable!(
                 "ModelViewer is dispatched on the main thread by \
                  run_model_viewer_main_thread; it must not reach the tokio runtime body"
@@ -795,8 +840,39 @@ fn run_native_main_thread(
 #[cfg(feature = "native-window")]
 fn run_model_viewer_main_thread(args: Args) -> Result<()> {
     let dat_root = resolve_dat_root(args.require_dat)?;
-    view_native::model_viewer::run(view_native::model_viewer::ModelViewerArgs { dat_root })
-        .context("model viewer")
+    let Command::ModelViewer {
+        race,
+        face,
+        head,
+        body,
+        hands,
+        legs,
+        feet,
+        main,
+        sub,
+        ranged,
+        model_id,
+        clip,
+    } = args.command
+    else {
+        unreachable!("dispatched only when args.command is Command::ModelViewer");
+    };
+    view_native::model_viewer::run(view_native::model_viewer::ModelViewerArgs {
+        dat_root,
+        race,
+        face,
+        head,
+        body,
+        hands,
+        legs,
+        feet,
+        main,
+        sub,
+        ranged,
+        model_id,
+        clip,
+    })
+    .context("model viewer")
 }
 
 fn hex(b: &[u8]) -> String {
