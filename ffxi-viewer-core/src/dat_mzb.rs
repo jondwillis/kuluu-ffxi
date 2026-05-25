@@ -3,7 +3,9 @@
 //! instanced geometry as two merged meshes (collision + non-collision).
 //!
 //! Pattern mirrors [`crate::dat_mmb`] — slash-command dispatcher fires
-//! [`LoadMzbRequest`], [`process_load_mzb_requests`] consumes it.
+//! [`LoadMzbRequest`]; [`kick_load_mzb_tasks`] hands the parse off to a
+//! background `AsyncComputeTaskPool` task; [`poll_load_mzb_tasks`]
+//! picks up the result and runs the main-thread spawn.
 //! Placement transforms are decoded from the MZB header and applied
 //! per-instance inside [`load_mzb_placed`]; the resulting submeshes
 //! land at correct world coordinates relative to the zone origin.
@@ -28,11 +30,15 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::VecDeque;
 use std::fs;
+use std::sync::Arc;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use bevy::tasks::futures_lite::future;
+use bevy::tasks::{AsyncComputeTaskPool, Task};
 use ffxi_dat::mmb::MmbHeader;
 use ffxi_dat::{mmb, mzb, walk, ChunkKind, DatRoot};
 
@@ -60,7 +66,7 @@ pub const DEFAULT_MOB_DRAW_DISTANCE: f32 = 50.0;
 ///
 /// Values are linear sRGB scalars in `[0, 1]`. They're multiplied
 /// per-vertex with a `shade` factor (`0.4..1.0` from the upward normal
-/// component) inside [`process_load_mzb_requests`] before being baked
+/// component) inside [`spawn_mzb_overlay`] before being baked
 /// into `ATTRIBUTE_COLOR`. The material's WHITE base color lets the
 /// vertex color drive the final pixel.
 const MZB_MATERIAL_PALETTE: [[f32; 3]; 16] = [
@@ -179,6 +185,92 @@ pub struct MzbCollisionGeometry {
     /// downward raycast at the entity's XZ only scans the local cell
     /// rather than the whole zone. Empty when no MZB is loaded.
     pub cell_index: std::collections::HashMap<(i32, i32), Vec<u32>>,
+}
+
+/// One background MZB load completion: the same triple returned by
+/// [`load_mzb_placed`] plus the zone-MMB placement list from
+/// [`build_zone_mmb_spawns`]. Wrapped in `Arc`s so [`ZoneGeomCache`]
+/// and the spawn step can share ownership without cloning the bulky
+/// inner Vecs — `submeshes` for a populated city zone can run tens of
+/// thousands of entries.
+#[derive(Clone)]
+pub struct LoadedZoneGeom {
+    pub submeshes: Arc<Vec<MzbSubMesh>>,
+    pub instances: Arc<Vec<MzbInstance>>,
+    /// Zone-MMB placement table (`build_zone_mmb_spawns` result). `Err`
+    /// gets surfaced as a chat toast at spawn time, matching the
+    /// pre-background behaviour. `Ok(Vec::new())` for zones with no
+    /// MMB placement table.
+    pub mmb_spawns: Result<Vec<ZoneMmbSpawn>, String>,
+}
+
+/// In-flight background MZB-load tasks, keyed by `file_id`. Populated
+/// by [`kick_load_mzb_tasks`], drained by [`poll_load_mzb_tasks`] as
+/// each task reports `Ready`. The `Vec<LoadMzbRequest>` carries every
+/// request that arrived for the same `file_id` while the task was in
+/// flight, so a burst of duplicate auto-loads coalesces to one parse.
+///
+/// Dropped wholesale by `OnExit(AppPhase::InGame)` cleanup — pending
+/// tasks are cancelled when the `Task` is dropped, so a /logout
+/// mid-zone-load doesn't leak background work into the next session.
+#[derive(Resource, Default)]
+pub struct LoadMzbInFlight {
+    pub tasks: std::collections::HashMap<u32, (Vec<LoadMzbRequest>, Task<LoadedZoneGeom>)>,
+}
+
+/// Bounded LRU of recently-loaded zone geometry. Zone transitions in
+/// FFXI cycle through a small working set (La Theine ↔ Tahrongi ↔
+/// Selbina ↔ Mhaura, plus three character-house zones), so a 4-entry
+/// cache covers the common pattern of "user re-enters the previous
+/// zone". A cache hit skips file I/O + XOR decrypt + parse + bake
+/// entirely; the spawn step still runs (it owns the GPU asset upload
+/// + ECS spawns, which can't be cached because handles are scoped to
+/// the current session's `Assets<...>` storage).
+///
+/// `Arc<...>` lets the cache and the spawn step share the inner Vecs
+/// without copying — the spawn step iterates `&[MzbSubMesh]` /
+/// `&[MzbInstance]` so a borrow is sufficient. Also drained in
+/// `despawn_ingame_entities`: zone-geometry cache entries reference
+/// session-scoped data and a stale entry on relogin could otherwise
+/// short-circuit a fresh parse on the next zone-in.
+#[derive(Resource, Default)]
+pub struct ZoneGeomCache {
+    /// Front of the deque = most-recently-used. Pushes to front,
+    /// evicts from back when length exceeds [`ZONE_GEOM_CACHE_CAP`].
+    pub entries: VecDeque<(u32, LoadedZoneGeom)>,
+}
+
+/// Maximum number of cached zone geometries. Sized for the typical
+/// FFXI cycle: one outdoor zone + adjacent zones + a player house —
+/// four entries cover the round-trip without growing the cache
+/// indefinitely on long play sessions.
+pub const ZONE_GEOM_CACHE_CAP: usize = 4;
+
+impl ZoneGeomCache {
+    /// Cache hit: returns a clone of the `Arc` triple (cheap — atomic
+    /// refcount bumps, no Vec copies) and promotes the entry to MRU.
+    fn get_and_promote(&mut self, file_id: u32) -> Option<LoadedZoneGeom> {
+        let pos = self.entries.iter().position(|(id, _)| *id == file_id)?;
+        let entry = self.entries.remove(pos)?;
+        let geom = entry.1.clone();
+        self.entries.push_front(entry);
+        Some(geom)
+    }
+
+    /// Insert a freshly-parsed geometry at the MRU position; evict the
+    /// LRU entry when over capacity.
+    fn insert(&mut self, file_id: u32, geom: LoadedZoneGeom) {
+        // De-dupe: if the same file_id is already present (e.g. two
+        // back-to-back kicks before the first poll fired), replace it
+        // in place rather than pushing a second copy.
+        if let Some(pos) = self.entries.iter().position(|(id, _)| *id == file_id) {
+            self.entries.remove(pos);
+        }
+        self.entries.push_front((file_id, geom));
+        while self.entries.len() > ZONE_GEOM_CACHE_CAP {
+            self.entries.pop_back();
+        }
+    }
 }
 
 /// Width (yalms) of one XZ cell in [`MzbCollisionGeometry::cell_index`].
@@ -489,16 +581,28 @@ pub fn load_mzb_placed(
 
     if placements.is_empty() {
         // Fallback: no grid placements decoded — spawn the library at
-        // origin (old behavior).
+        // origin (old behavior). Bake every library mesh in parallel.
         let meshes =
             mzb::parse_meshes(&plain, &header).map_err(|e| format!("MZB parse_meshes: {e}"))?;
-        let mut submeshes = Vec::new();
-        let mut instances = Vec::new();
-        for m in meshes {
-            if m.vertices.is_empty() || m.triangles.is_empty() {
-                continue;
+        // Parallel bake: each `bake_submesh` is pure CPU and independent.
+        // Use `AsyncComputeTaskPool::scope` so the work joins before
+        // returning — matches the function's "load, parse, bake" sync
+        // contract (callers expect owned Vecs back).
+        let pool = AsyncComputeTaskPool::get();
+        let baked: Vec<Option<MzbSubMesh>> = pool.scope(|s| {
+            for m in &meshes {
+                s.spawn(async move {
+                    if m.vertices.is_empty() || m.triangles.is_empty() {
+                        None
+                    } else {
+                        Some(bake_submesh(m))
+                    }
+                });
             }
-            let sub = bake_submesh(&m);
+        });
+        let mut submeshes = Vec::with_capacity(baked.len());
+        let mut instances = Vec::with_capacity(baked.len());
+        for sub in baked.into_iter().flatten() {
             let idx = submeshes.len();
             submeshes.push(sub);
             instances.push(MzbInstance {
@@ -510,26 +614,59 @@ pub fn load_mzb_placed(
         return Ok((submeshes, instances));
     }
 
-    // Dedupe by geometry_offset.
+    // Dedupe by geometry_offset, then bake the unique offsets in parallel.
+    // The placement loop below references baked entries by `submesh_idx`,
+    // so the order of submeshes is fixed by the order we first see each
+    // unique offset — preserve that to keep the per-instance indices stable.
+    let mut unique_offsets: Vec<u32> = Vec::new();
     let mut offset_to_idx: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-    let mut submeshes: Vec<MzbSubMesh> = Vec::new();
-    let mut instances: Vec<MzbInstance> = Vec::new();
+    for p in &placements {
+        if let std::collections::hash_map::Entry::Vacant(e) = offset_to_idx.entry(p.geometry_offset)
+        {
+            e.insert(unique_offsets.len());
+            unique_offsets.push(p.geometry_offset);
+        }
+    }
+    // Parallel parse+bake of each unique geometry_offset. Empty/bad
+    // records bake to `None`; the placement loop below filters them.
+    // `pool.scope` blocks until every spawned task is done — we get
+    // back a Vec aligned 1:1 with `unique_offsets`.
+    let pool = AsyncComputeTaskPool::get();
+    let baked: Vec<Option<MzbSubMesh>> = pool.scope(|s| {
+        let plain_ref = &plain;
+        for &offset in &unique_offsets {
+            s.spawn(async move {
+                let m = mzb::parse_mesh_at(plain_ref, offset as usize).ok()?;
+                if m.vertices.is_empty() || m.triangles.is_empty() {
+                    return None;
+                }
+                Some(bake_submesh(&m))
+            });
+        }
+    });
+
+    // Compact `baked` into the dense `submeshes` Vec by remapping the
+    // unique-offset index → dense index (skipping bad records). Then the
+    // placement loop walks `offset_to_idx → unique_idx → dense_idx`.
+    let mut submeshes: Vec<MzbSubMesh> = Vec::with_capacity(baked.len());
+    let mut unique_to_dense: Vec<Option<usize>> = Vec::with_capacity(baked.len());
+    for sub in baked {
+        match sub {
+            Some(s) => {
+                unique_to_dense.push(Some(submeshes.len()));
+                submeshes.push(s);
+            }
+            None => unique_to_dense.push(None),
+        }
+    }
+    let mut instances: Vec<MzbInstance> = Vec::with_capacity(placements.len());
 
     for p in placements {
-        let idx = if let Some(&i) = offset_to_idx.get(&p.geometry_offset) {
-            i
-        } else {
-            let m = match mzb::parse_mesh_at(&plain, p.geometry_offset as usize) {
-                Ok(m) => m,
-                Err(_) => continue, // skip bad records — same posture as MMB
-            };
-            if m.vertices.is_empty() || m.triangles.is_empty() {
-                continue;
-            }
-            let i = submeshes.len();
-            submeshes.push(bake_submesh(&m));
-            offset_to_idx.insert(p.geometry_offset, i);
-            i
+        let Some(&unique_idx) = offset_to_idx.get(&p.geometry_offset) else {
+            continue;
+        };
+        let Some(idx) = unique_to_dense[unique_idx] else {
+            continue; // bad/empty record — skipped at bake time
         };
 
         // MZB coordinate convention — empirical, cross-checked against
@@ -666,22 +803,35 @@ pub fn build_zone_mmb_spawns(
 
     // Index every MMB chunk's asset_name → chunk_idx. Skip MMBs whose
     // header fails to parse (we already log this elsewhere).
-    let mut mmb_names: Vec<String> = Vec::new();
-    let mut mmb_indices: Vec<usize> = Vec::new();
-    for (idx, c) in chunks.iter().enumerate() {
-        if c.kind != ChunkKind::Mmb as u8 {
-            continue;
+    //
+    // Parallel pre-pass: decrypt + parse each MMB header in parallel
+    // (each is an independent ~kilobyte XOR + struct parse). City DATs
+    // carry dozens-to-hundreds of MMB chunks; on the main thread this
+    // is the second-largest portion of zone-load wall time after the
+    // MZB itself.
+    let pool = AsyncComputeTaskPool::get();
+    let mmb_chunk_refs: Vec<(usize, &[u8])> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.kind == ChunkKind::Mmb as u8)
+        .map(|(idx, c)| (idx, c.data))
+        .collect();
+    let parsed: Vec<Option<(usize, String)>> = pool.scope(|s| {
+        for (idx, data) in &mmb_chunk_refs {
+            let idx = *idx;
+            let data = *data;
+            s.spawn(async move {
+                let dec = mmb::decrypt(data).ok()?;
+                let hdr = MmbHeader::parse(&dec).ok()?;
+                Some((idx, hdr.asset_name_str().trim_end().to_string()))
+            });
         }
-        let dec = match mmb::decrypt(c.data) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let hdr = match MmbHeader::parse(&dec) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        mmb_names.push(hdr.asset_name_str().trim_end().to_string());
-        mmb_indices.push(idx);
+    });
+    let mut mmb_names: Vec<String> = Vec::with_capacity(parsed.len());
+    let mut mmb_indices: Vec<usize> = Vec::with_capacity(parsed.len());
+    for entry in parsed.into_iter().flatten() {
+        mmb_indices.push(entry.0);
+        mmb_names.push(entry.1);
     }
     let zone_prefix = mzb::infer_zone_prefix(&mmb_names);
 
@@ -1004,6 +1154,172 @@ pub fn load_mzb(file_id: u32, chunk_idx: Option<usize>) -> Result<Vec<MzbSubMesh
     Ok(out)
 }
 
+/// Phase-A kicker: drain incoming [`LoadMzbRequest`] events, look the
+/// requested `file_id` up in [`ZoneGeomCache`], and either feed the
+/// cached geometry directly into the spawn step (cache hit path,
+/// happens in the same frame the kick runs) or hand a fresh
+/// `AsyncComputeTaskPool` task that runs [`load_mzb_placed`] +
+/// [`build_zone_mmb_spawns`] off the main thread.
+///
+/// Multiple requests for the same `file_id` arriving in one frame are
+/// coalesced onto a single task — the request list is kept so each
+/// request's `world_pos` / `auto_loaded` flag still drives its own
+/// spawn at poll time.
+///
+/// The actual file read + XOR decrypt + chunk-walk + mesh parse + bake
+/// all run inside the spawned task (see [`load_mzb_placed`] for the
+/// internal Phase-B parallelism). The only main-thread cost here is
+/// the kick itself plus, on cache hit, the spawn step (which is the
+/// `Assets::add` + `commands.spawn` work that has to stay on the main
+/// thread).
+pub fn kick_load_mzb_tasks(
+    mut events: MessageReader<LoadMzbRequest>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
+    draw: Res<DrawDistance>,
+    mut collision_geometry: ResMut<MzbCollisionGeometry>,
+    mut load_mmb_tx: MessageWriter<crate::dat_mmb::LoadMmbRequest>,
+    mut in_flight: ResMut<LoadMzbInFlight>,
+    mut cache: ResMut<ZoneGeomCache>,
+) {
+    let init_vis = compute_init_visibility(draw.zone_geom_mode);
+    for req in events.read() {
+        // Cache hit: skip the background task entirely and spawn the
+        // overlay this frame. The poll system never sees this request.
+        if let Some(geom) = cache.get_and_promote(req.file_id) {
+            spawn_mzb_overlay(
+                *req,
+                &geom,
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                &mut toasts,
+                &mut collision_geometry,
+                &mut load_mmb_tx,
+                init_vis,
+                /*from_cache*/ true,
+            );
+            continue;
+        }
+        // Already a task in flight for this file_id — append the
+        // request so the poll fires once per original request even when
+        // multiple arrive while the parse is still running. Saves a
+        // duplicate parse for the rare case where the auto-load watcher
+        // + a manual `/load_mzb` fire in quick succession.
+        if let Some((reqs, _)) = in_flight.tasks.get_mut(&req.file_id) {
+            reqs.push(*req);
+            continue;
+        }
+        // Cache miss + no in-flight: spawn a background parse task.
+        // Inside the task we run the bulk of zone-load work that's
+        // currently main-thread-blocking: file I/O, XOR decrypt, chunk
+        // walk, MZB parse, per-submesh bake (parallelized in turn),
+        // and the zone-MMB placement table.
+        let file_id = req.file_id;
+        let chunk_idx = req.chunk_idx;
+        let pool = AsyncComputeTaskPool::get();
+        let task = pool.spawn(async move {
+            let (submeshes, instances) = match load_mzb_placed(file_id, chunk_idx) {
+                Ok(s) => s,
+                Err(msg) => {
+                    return LoadedZoneGeom {
+                        submeshes: Arc::new(Vec::new()),
+                        instances: Arc::new(Vec::new()),
+                        mmb_spawns: Err(msg),
+                    };
+                }
+            };
+            let mmb_spawns = build_zone_mmb_spawns(file_id, chunk_idx);
+            LoadedZoneGeom {
+                submeshes: Arc::new(submeshes),
+                instances: Arc::new(instances),
+                mmb_spawns,
+            }
+        });
+        in_flight.tasks.insert(file_id, (vec![*req], task));
+    }
+}
+
+/// Phase-A poller: scan in-flight tasks for completed parses. Each
+/// completed task gets fed into the spawn step once per coalesced
+/// request and then inserted into [`ZoneGeomCache`] for the next
+/// time the player zones back.
+///
+/// Polling is non-blocking: `future::poll_once` returns `None` when
+/// the task is still running and `Some(result)` when it's ready.
+/// We retain unfinished tasks across frames.
+pub fn poll_load_mzb_tasks(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
+    draw: Res<DrawDistance>,
+    mut collision_geometry: ResMut<MzbCollisionGeometry>,
+    mut load_mmb_tx: MessageWriter<crate::dat_mmb::LoadMmbRequest>,
+    mut in_flight: ResMut<LoadMzbInFlight>,
+    mut cache: ResMut<ZoneGeomCache>,
+) {
+    let init_vis = compute_init_visibility(draw.zone_geom_mode);
+    // Single pass: `poll_once` advances each in-flight task's futures
+    // state machine. When it returns `Some(output)` the task is done
+    // and we've consumed its `Output` — so we capture the value here
+    // and drop the `Task` afterwards via the `retain` filter. The
+    // previous "poll twice" shape silently hung because the second
+    // poll always returns `None` (a yielded result isn't re-yielded).
+    let mut completed: Vec<(u32, Vec<LoadMzbRequest>, LoadedZoneGeom)> = Vec::new();
+    in_flight.tasks.retain(|file_id, (reqs, task)| {
+        match future::block_on(future::poll_once(task)) {
+            Some(geom) => {
+                completed.push((*file_id, std::mem::take(reqs), geom));
+                false
+            }
+            None => true,
+        }
+    });
+    for (file_id, reqs, geom) in completed {
+        // Cache before spawning so a same-frame second kick for the
+        // same file_id (e.g. user mashing /load_mzb) hits the cache.
+        // Skip caching for empty results — the spawn step will surface
+        // the same toast each kick, and a stale empty cache entry would
+        // hide a real DAT fix from the next attempt.
+        let cache_eligible = !geom.submeshes.is_empty() && !geom.instances.is_empty();
+        if cache_eligible {
+            cache.insert(file_id, geom.clone());
+        }
+        for req in reqs {
+            spawn_mzb_overlay(
+                req,
+                &geom,
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                &mut toasts,
+                &mut collision_geometry,
+                &mut load_mmb_tx,
+                init_vis,
+                /*from_cache*/ false,
+            );
+        }
+    }
+}
+
+fn compute_init_visibility(mode: ZoneGeomMode) -> (Visibility, Visibility) {
+    // Capture current zonegeom mode so freshly-spawned merged meshes
+    // start at the correct visibility. `apply_zone_geom_visibility`
+    // only fires on `draw.is_changed()`, so a zone-in with the mode
+    // untouched would otherwise leave non-collision meshes visible
+    // even when the mode is `Collision`.
+    match mode {
+        ZoneGeomMode::Off => (Visibility::Hidden, Visibility::Hidden),
+        ZoneGeomMode::Collision | ZoneGeomMode::Camera => {
+            (Visibility::Inherited, Visibility::Hidden)
+        }
+        ZoneGeomMode::All => (Visibility::Inherited, Visibility::Inherited),
+    }
+}
+
 /// Spawn each MZB submesh as its own child entity under a parent
 /// transform at `world_pos`. Collision and non-collision meshes are
 /// distinct colors so the operator can see which geometry actually
@@ -1014,414 +1330,408 @@ pub fn load_mzb(file_id: u32, chunk_idx: Option<usize>) -> Result<Vec<MzbSubMesh
 /// (flags bit 0 cleared) and non-collision (flags bit 0 set) get
 /// different palettes so they're visually distinguishable when
 /// stacked at the same origin.
-pub fn process_load_mzb_requests(
-    mut events: MessageReader<LoadMzbRequest>,
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
-    draw: Res<DrawDistance>,
-    mut collision_geometry: ResMut<MzbCollisionGeometry>,
-    mut load_mmb_tx: MessageWriter<crate::dat_mmb::LoadMmbRequest>,
+///
+/// Main-thread only: every `Assets::add` and `commands.spawn` lives
+/// here. The CPU-bound parse + bake ran in the kicker's background
+/// task; we only touch the inputs through `&[MzbSubMesh]` and
+/// `&[MzbInstance]` so a cache-shared `Arc<Vec<...>>` works without
+/// cloning.
+#[allow(clippy::too_many_arguments)]
+fn spawn_mzb_overlay(
+    req: LoadMzbRequest,
+    geom: &LoadedZoneGeom,
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    toasts: &mut MessageWriter<crate::snapshot::ToastEvent>,
+    collision_geometry: &mut ResMut<MzbCollisionGeometry>,
+    load_mmb_tx: &mut MessageWriter<crate::dat_mmb::LoadMmbRequest>,
+    init_vis: (Visibility, Visibility),
+    _from_cache: bool,
 ) {
-    // Capture current zonegeom mode so freshly-spawned merged meshes
-    // start at the correct visibility. `apply_zone_geom_visibility`
-    // only fires on `draw.is_changed()`, so a zone-in with the mode
-    // untouched would otherwise leave non-collision meshes visible
-    // even when the mode is `Collision`.
-    let (init_collision_vis, init_noncollision_vis) = match draw.zone_geom_mode {
-        ZoneGeomMode::Off => (Visibility::Hidden, Visibility::Hidden),
-        ZoneGeomMode::Collision | ZoneGeomMode::Camera => {
-            (Visibility::Inherited, Visibility::Hidden)
-        }
-        ZoneGeomMode::All => (Visibility::Inherited, Visibility::Inherited),
-    };
-    for req in events.read() {
-        let (submeshes, instances) = match load_mzb_placed(req.file_id, req.chunk_idx) {
-            Ok(s) => s,
-            Err(msg) => {
-                push_system_msg(
-                    &mut toasts,
-                    format!("/load_mzb {}: {msg}", req.file_id),
-                );
-                continue;
-            }
-        };
-        if submeshes.is_empty() || instances.is_empty() {
-            push_system_msg(
-                &mut toasts,
-                format!(
-                    "/load_mzb {}: 0 renderable meshes ({} submeshes, {} instances)",
-                    req.file_id,
-                    submeshes.len(),
-                    instances.len(),
-                ),
-            );
-            continue;
-        }
-
-        let n_submeshes = submeshes.len();
-        let n_instances = instances.len();
-
-        // Two-sided. MZB walls are mostly single-sided polygons (the
-        // FFXI client lit them per-face from outside only), so backface
-        // culling makes interior surfaces invisible and produces
-        // "missing geometry" gaps. `cull_mode: None` doubles fragment
-        // cost but the per-zone draw count is two batched meshes, so
-        // the tradeoff is comfortably affordable.
-        //
-        // `base_color: WHITE` so the per-vertex `ATTRIBUTE_COLOR`
-        // (material_palette × normal-shade, baked above) carries the
-        // visible tint. This replaces the old single-color teal /
-        // translucent-amber appearance with material-distinguishable
-        // walls (stone, sand, wood, water etc. each gets its own hue
-        // from the 4-bit material_id decoded from the MZB triangle
-        // index high bits). Bevy's StandardMaterial multiplies the
-        // vertex color through unchanged, so the palette × shade bake
-        // survives PBR shading.
-        let collision_mat = materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            cull_mode: None,
-            ..default()
-        });
-        let noncollision_mat = materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            cull_mode: None,
-            ..default()
-        });
-
-        let mut parent_spawn = commands.spawn((
-            crate::components::InGameEntity,
-            MzbOverlay,
-            Transform::from_translation(req.world_pos),
-            Visibility::default(),
-        ));
-        if req.auto_loaded {
-            parent_spawn.insert(AutoMzbOverlay);
-        }
-        let parent = parent_spawn.id();
-
-        // Phase 3 perf — bake every placement into exactly two big
-        // meshes (collision / non-collision) so the per-frame ECS cost
-        // is O(2) instead of O(7000+ entities). Vertex positions are
-        // pre-transformed by the placement matrix at load time; the
-        // resulting buffer is in Bevy world space. Trade-off: lose
-        // per-instance despawn; whole-zone refresh on zone change is
-        // the only mutation, which is exactly what the auto-load does
-        // already.
-        let mut collision_positions: Vec<[f32; 3]> = Vec::new();
-        let mut collision_indices: Vec<u32> = Vec::new();
-        let mut collision_tri_mat: Vec<u8> = Vec::new();
-        let mut noncollision_positions: Vec<[f32; 3]> = Vec::new();
-        let mut noncollision_indices: Vec<u32> = Vec::new();
-        let mut noncollision_tri_mat: Vec<u8> = Vec::new();
-
-        for inst in &instances {
-            let sub = &submeshes[inst.submesh_idx];
-            let is_collision = sub.flags & 1 == 0;
-            let (positions, indices, tri_mat) = if is_collision {
-                (
-                    &mut collision_positions,
-                    &mut collision_indices,
-                    &mut collision_tri_mat,
-                )
-            } else {
-                (
-                    &mut noncollision_positions,
-                    &mut noncollision_indices,
-                    &mut noncollision_tri_mat,
-                )
-            };
-            let base = positions.len() as u32;
-            for v in &sub.positions {
-                let p = inst
-                    .bevy_transform
-                    .transform_point(Vec3::new(v[0], v[1], v[2]));
-                positions.push([p.x, p.y, p.z]);
-            }
-            for &i in &sub.indices {
-                indices.push(i + base);
-            }
-            tri_mat.extend_from_slice(&sub.tri_material);
-        }
-
-        // Spawn one child per non-empty merged mesh — usually both,
-        // sometimes only collision (zones without decorative walls).
-        // `is_collision` controls which sub-marker is attached so
-        // `/zonegeom` can toggle the two channels independently.
-        //
-        // Per-vertex material tint: each vertex carries the 4-bit
-        // `material` id (0..15) from the MZB triangle index high bits
-        // (decoded in `ffxi_dat::mzb::parse_one_mesh`). We bake one of
-        // 16 palette colors into the vertex color × `shade` from the
-        // computed normal. Shared vertices that span material
-        // boundaries get the LAST triangle's material — minor seam
-        // bleed but acceptable for a coarse-mesh proxy.
-        //
-        // The 16-color palette is HSV-distributed with a fixed
-        // saturation/value: distinct enough that operator-readable
-        // walls, floors, stairs, sand etc. don't all blur together,
-        // muted enough that the scene reads as solid (not rainbow).
-        let spawn_merged = |commands: &mut Commands,
-                            positions: Vec<[f32; 3]>,
-                            indices: Vec<u32>,
-                            tri_mat: Vec<u8>,
-                            material: Handle<StandardMaterial>,
-                            parent: bevy::ecs::entity::Entity,
-                            auto_loaded: bool,
-                            is_collision: bool,
-                            init_vis: Visibility,
-                            meshes: &mut ResMut<Assets<Mesh>>| {
-            if positions.is_empty() || indices.is_empty() {
-                return;
-            }
-            // Project per-triangle material id onto per-vertex slots.
-            // Last-write-wins at shared vertices.
-            let mut vert_mat: Vec<u8> = vec![0u8; positions.len()];
-            for (tri_idx, tri) in indices.chunks_exact(3).enumerate() {
-                let m = tri_mat.get(tri_idx).copied().unwrap_or(0);
-                vert_mat[tri[0] as usize] = m;
-                vert_mat[tri[1] as usize] = m;
-                vert_mat[tri[2] as usize] = m;
-            }
-            let mut mesh = Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::default(),
-            );
-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-            mesh.insert_indices(Indices::U32(indices));
-            // Smooth normals: indexed meshes share vertices and
-            // can't host per-face normals; smooth shading reads
-            // fine on the coarse MZB walls.
-            mesh.compute_smooth_normals();
-            // Vertex color = material_palette[mat] × shade(n.y).
-            // StandardMaterial multiplies vertex color × base_color,
-            // so this gives us a per-vertex shading + material tint
-            // bake on top of whatever PBR shading the scene lights add.
-            if let Some(normals) = mesh
-                .attribute(Mesh::ATTRIBUTE_NORMAL)
-                .and_then(|a| a.as_float3())
-            {
-                let colors: Vec<[f32; 4]> = normals
-                    .iter()
-                    .zip(vert_mat.iter())
-                    .map(|(n, &m)| {
-                        // n.y in [-1, +1]. Up-facing → shade=1.0,
-                        // down-facing → shade=0.4. Linear lerp.
-                        let shade = 0.4 + 0.6 * (n[1] * 0.5 + 0.5);
-                        let pal = MZB_MATERIAL_PALETTE[(m & 0x0F) as usize];
-                        [pal[0] * shade, pal[1] * shade, pal[2] * shade, 1.0]
-                    })
-                    .collect();
-                mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-            }
-            let mut child = commands.spawn((
-                MzbOverlay,
-                Mesh3d(meshes.add(mesh)),
-                MeshMaterial3d(material),
-                Transform::IDENTITY,
-                init_vis,
-                ChildOf(parent),
-            ));
-            if is_collision {
-                child.insert(MzbCollisionMesh);
-            } else {
-                child.insert(MzbNonCollisionMesh);
-            }
-            if auto_loaded {
-                child.insert(AutoMzbOverlay);
-            }
-        };
-        // Capture merge stats before we move the buffers into spawn_merged.
-        let collision_verts = collision_positions.len();
-        let collision_tris = collision_indices.len() / 3;
-        let noncollision_verts = noncollision_positions.len();
-        let noncollision_tris = noncollision_indices.len() / 3;
-
-        // Stash the collision geometry in a CPU-side resource so the
-        // ground-snap and `/debug heights` paths can do per-tick
-        // raycasts without walking the Bevy `Assets<Mesh>` storage.
-        // This replaces zone-N's geometry wholesale — on a zone change
-        // the new `LoadMzbRequest` lands here and overwrites.
-        collision_geometry.positions = collision_positions
-            .iter()
-            .map(|p| Vec3::new(p[0], p[1], p[2]))
-            .collect();
-        collision_geometry.indices = collision_indices.clone();
-        // XZ grid index for O(cell) raycasts. The snap fires per-frame
-        // for every entity in the zone, so the prior O(tris) linear
-        // scan tanked FPS in populated outdoor zones — see the
-        // historical comment in `snap_entities_to_navmesh_system`.
-        collision_geometry.cell_index =
-            build_cell_index(&collision_geometry.positions, &collision_geometry.indices);
-
-        spawn_merged(
-            &mut commands,
-            collision_positions,
-            collision_indices,
-            collision_tri_mat,
-            collision_mat,
-            parent,
-            req.auto_loaded,
-            true,
-            init_collision_vis,
-            &mut meshes,
-        );
-        spawn_merged(
-            &mut commands,
-            noncollision_positions,
-            noncollision_indices,
-            noncollision_tri_mat,
-            noncollision_mat,
-            parent,
-            req.auto_loaded,
-            false,
-            init_noncollision_vis,
-            &mut meshes,
-        );
-
-        let total_verts = collision_verts + noncollision_verts;
-        let total_tris = collision_tris + noncollision_tris;
+    let (init_collision_vis, init_noncollision_vis) = init_vis;
+    let submeshes: &[MzbSubMesh] = geom.submeshes.as_slice();
+    let instances: &[MzbInstance] = geom.instances.as_slice();
+    if submeshes.is_empty() || instances.is_empty() {
         push_system_msg(
-            &mut toasts,
+            toasts,
+            format!(
+                "/load_mzb {}: 0 renderable meshes ({} submeshes, {} instances)",
+                req.file_id,
+                submeshes.len(),
+                instances.len(),
+            ),
+        );
+        return;
+    }
+
+    let n_submeshes = submeshes.len();
+    let n_instances = instances.len();
+
+    // Two-sided. MZB walls are mostly single-sided polygons (the
+    // FFXI client lit them per-face from outside only), so backface
+    // culling makes interior surfaces invisible and produces
+    // "missing geometry" gaps. `cull_mode: None` doubles fragment
+    // cost but the per-zone draw count is two batched meshes, so
+    // the tradeoff is comfortably affordable.
+    //
+    // `base_color: WHITE` so the per-vertex `ATTRIBUTE_COLOR`
+    // (material_palette × normal-shade, baked above) carries the
+    // visible tint. This replaces the old single-color teal /
+    // translucent-amber appearance with material-distinguishable
+    // walls (stone, sand, wood, water etc. each gets its own hue
+    // from the 4-bit material_id decoded from the MZB triangle
+    // index high bits). Bevy's StandardMaterial multiplies the
+    // vertex color through unchanged, so the palette × shade bake
+    // survives PBR shading.
+    let collision_mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        cull_mode: None,
+        ..default()
+    });
+    let noncollision_mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        cull_mode: None,
+        ..default()
+    });
+
+    let mut parent_spawn = commands.spawn((
+        crate::components::InGameEntity,
+        MzbOverlay,
+        Transform::from_translation(req.world_pos),
+        Visibility::default(),
+    ));
+    if req.auto_loaded {
+        parent_spawn.insert(AutoMzbOverlay);
+    }
+    let parent = parent_spawn.id();
+
+    // Phase 3 perf — bake every placement into exactly two big
+    // meshes (collision / non-collision) so the per-frame ECS cost
+    // is O(2) instead of O(7000+ entities). Vertex positions are
+    // pre-transformed by the placement matrix at load time; the
+    // resulting buffer is in Bevy world space. Trade-off: lose
+    // per-instance despawn; whole-zone refresh on zone change is
+    // the only mutation, which is exactly what the auto-load does
+    // already.
+    let mut collision_positions: Vec<[f32; 3]> = Vec::new();
+    let mut collision_indices: Vec<u32> = Vec::new();
+    let mut collision_tri_mat: Vec<u8> = Vec::new();
+    let mut noncollision_positions: Vec<[f32; 3]> = Vec::new();
+    let mut noncollision_indices: Vec<u32> = Vec::new();
+    let mut noncollision_tri_mat: Vec<u8> = Vec::new();
+
+    for inst in instances.iter() {
+        let sub = &submeshes[inst.submesh_idx];
+        let is_collision = sub.flags & 1 == 0;
+        let (positions, indices, tri_mat) = if is_collision {
+            (
+                &mut collision_positions,
+                &mut collision_indices,
+                &mut collision_tri_mat,
+            )
+        } else {
+            (
+                &mut noncollision_positions,
+                &mut noncollision_indices,
+                &mut noncollision_tri_mat,
+            )
+        };
+        let base = positions.len() as u32;
+        for v in &sub.positions {
+            let p = inst
+                .bevy_transform
+                .transform_point(Vec3::new(v[0], v[1], v[2]));
+            positions.push([p.x, p.y, p.z]);
+        }
+        for &i in &sub.indices {
+            indices.push(i + base);
+        }
+        tri_mat.extend_from_slice(&sub.tri_material);
+    }
+
+    // Spawn one child per non-empty merged mesh — usually both,
+    // sometimes only collision (zones without decorative walls).
+    // `is_collision` controls which sub-marker is attached so
+    // `/zonegeom` can toggle the two channels independently.
+    //
+    // Per-vertex material tint: each vertex carries the 4-bit
+    // `material` id (0..15) from the MZB triangle index high bits
+    // (decoded in `ffxi_dat::mzb::parse_one_mesh`). We bake one of
+    // 16 palette colors into the vertex color × `shade` from the
+    // computed normal. Shared vertices that span material
+    // boundaries get the LAST triangle's material — minor seam
+    // bleed but acceptable for a coarse-mesh proxy.
+    //
+    // The 16-color palette is HSV-distributed with a fixed
+    // saturation/value: distinct enough that operator-readable
+    // walls, floors, stairs, sand etc. don't all blur together,
+    // muted enough that the scene reads as solid (not rainbow).
+    let spawn_merged = |commands: &mut Commands,
+                        positions: Vec<[f32; 3]>,
+                        indices: Vec<u32>,
+                        tri_mat: Vec<u8>,
+                        material: Handle<StandardMaterial>,
+                        parent: bevy::ecs::entity::Entity,
+                        auto_loaded: bool,
+                        is_collision: bool,
+                        init_vis: Visibility,
+                        meshes: &mut ResMut<Assets<Mesh>>| {
+        if positions.is_empty() || indices.is_empty() {
+            return;
+        }
+        // Project per-triangle material id onto per-vertex slots.
+        // Last-write-wins at shared vertices.
+        let mut vert_mat: Vec<u8> = vec![0u8; positions.len()];
+        for (tri_idx, tri) in indices.chunks_exact(3).enumerate() {
+            let m = tri_mat.get(tri_idx).copied().unwrap_or(0);
+            vert_mat[tri[0] as usize] = m;
+            vert_mat[tri[1] as usize] = m;
+            vert_mat[tri[2] as usize] = m;
+        }
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+        mesh.insert_indices(Indices::U32(indices));
+        // Smooth normals: indexed meshes share vertices and
+        // can't host per-face normals; smooth shading reads
+        // fine on the coarse MZB walls.
+        mesh.compute_smooth_normals();
+        // Vertex color = material_palette[mat] × shade(n.y).
+        // StandardMaterial multiplies vertex color × base_color,
+        // so this gives us a per-vertex shading + material tint
+        // bake on top of whatever PBR shading the scene lights add.
+        if let Some(normals) = mesh
+            .attribute(Mesh::ATTRIBUTE_NORMAL)
+            .and_then(|a| a.as_float3())
+        {
+            let colors: Vec<[f32; 4]> = normals
+                .iter()
+                .zip(vert_mat.iter())
+                .map(|(n, &m)| {
+                    // n.y in [-1, +1]. Up-facing → shade=1.0,
+                    // down-facing → shade=0.4. Linear lerp.
+                    let shade = 0.4 + 0.6 * (n[1] * 0.5 + 0.5);
+                    let pal = MZB_MATERIAL_PALETTE[(m & 0x0F) as usize];
+                    [pal[0] * shade, pal[1] * shade, pal[2] * shade, 1.0]
+                })
+                .collect();
+            mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+        }
+        let mut child = commands.spawn((
+            MzbOverlay,
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(material),
+            Transform::IDENTITY,
+            init_vis,
+            ChildOf(parent),
+        ));
+        if is_collision {
+            child.insert(MzbCollisionMesh);
+        } else {
+            child.insert(MzbNonCollisionMesh);
+        }
+        if auto_loaded {
+            child.insert(AutoMzbOverlay);
+        }
+    };
+    // Capture merge stats before we move the buffers into spawn_merged.
+    let collision_verts = collision_positions.len();
+    let collision_tris = collision_indices.len() / 3;
+    let noncollision_verts = noncollision_positions.len();
+    let noncollision_tris = noncollision_indices.len() / 3;
+
+    // Stash the collision geometry in a CPU-side resource so the
+    // ground-snap and `/debug heights` paths can do per-tick
+    // raycasts without walking the Bevy `Assets<Mesh>` storage.
+    // This replaces zone-N's geometry wholesale — on a zone change
+    // the new `LoadMzbRequest` lands here and overwrites.
+    collision_geometry.positions = collision_positions
+        .iter()
+        .map(|p| Vec3::new(p[0], p[1], p[2]))
+        .collect();
+    collision_geometry.indices = collision_indices.clone();
+    // XZ grid index for O(cell) raycasts. The snap fires per-frame
+    // for every entity in the zone, so the prior O(tris) linear
+    // scan tanked FPS in populated outdoor zones — see the
+    // historical comment in `snap_entities_to_navmesh_system`.
+    collision_geometry.cell_index =
+        build_cell_index(&collision_geometry.positions, &collision_geometry.indices);
+
+    spawn_merged(
+        commands,
+        collision_positions,
+        collision_indices,
+        collision_tri_mat,
+        collision_mat,
+        parent,
+        req.auto_loaded,
+        true,
+        init_collision_vis,
+        meshes,
+    );
+    spawn_merged(
+        commands,
+        noncollision_positions,
+        noncollision_indices,
+        noncollision_tri_mat,
+        noncollision_mat,
+        parent,
+        req.auto_loaded,
+        false,
+        init_noncollision_vis,
+        meshes,
+    );
+
+    let total_verts = collision_verts + noncollision_verts;
+    let total_tris = collision_tris + noncollision_tris;
+    push_system_msg(
+            toasts,
             format!(
                 "/load_mzb {}: {n_submeshes} submeshes, {n_instances} placements → merged {total_verts} verts / {total_tris} tris ({collision_verts}v {collision_tris}t collision, {noncollision_verts}v {noncollision_tris}t non-collision)",
                 req.file_id,
             ),
         );
 
-        // Water planes: group placements with `water_height_bevy` set
-        // by height (rounded to the nearest mm so float-noise duplicates
-        // don't fragment a single lake into N near-identical groups),
-        // then spawn one flat alpha quad per group sized to the union
-        // of the placements' geometry XZ extents.
-        //
-        // Lotus's pipeline animates a 30-frame water texture; we ship a
-        // static teal-blue alpha quad instead — the per-placement extent
-        // is what fixes "lakes render as collision boxes underwater."
-        // Texture animation lands when the particle/animated-texture
-        // pipeline does.
-        let mut water_groups: std::collections::HashMap<i32, (Vec3, Vec3)> =
-            std::collections::HashMap::new();
-        for inst in &instances {
-            let Some(h_bevy) = inst.water_height_bevy else {
-                continue;
-            };
-            let sub = &submeshes[inst.submesh_idx];
-            if sub.positions.is_empty() {
-                continue;
-            }
-            // World-space XZ bbox for this placement's geometry.
-            let mut min = Vec3::splat(f32::INFINITY);
-            let mut max = Vec3::splat(f32::NEG_INFINITY);
-            for v in &sub.positions {
-                let p = inst
-                    .bevy_transform
-                    .transform_point(Vec3::new(v[0], v[1], v[2]));
-                min = min.min(p);
-                max = max.max(p);
-            }
-            // Key by mm-rounded height — float noise on the parser
-            // side would otherwise split one lake into 10 near-equal
-            // groups.
-            let key = (h_bevy * 1000.0).round() as i32;
-            water_groups
-                .entry(key)
-                .and_modify(|(mn, mx)| {
-                    *mn = mn.min(min);
-                    *mx = mx.max(max);
-                })
-                .or_insert((min, max));
+    // Water planes: group placements with `water_height_bevy` set
+    // by height (rounded to the nearest mm so float-noise duplicates
+    // don't fragment a single lake into N near-identical groups),
+    // then spawn one flat alpha quad per group sized to the union
+    // of the placements' geometry XZ extents.
+    //
+    // Lotus's pipeline animates a 30-frame water texture; we ship a
+    // static teal-blue alpha quad instead — the per-placement extent
+    // is what fixes "lakes render as collision boxes underwater."
+    // Texture animation lands when the particle/animated-texture
+    // pipeline does.
+    let mut water_groups: std::collections::HashMap<i32, (Vec3, Vec3)> =
+        std::collections::HashMap::new();
+    for inst in instances.iter() {
+        let Some(h_bevy) = inst.water_height_bevy else {
+            continue;
+        };
+        let sub = &submeshes[inst.submesh_idx];
+        if sub.positions.is_empty() {
+            continue;
         }
-        let water_count = water_groups.len();
-        if water_count > 0 {
-            let water_mat = materials.add(StandardMaterial {
-                base_color: Color::srgba(0.20, 0.45, 0.70, 0.55),
-                cull_mode: None,
-                alpha_mode: AlphaMode::Blend,
-                ..default()
-            });
-            for (height_key, (min, max)) in water_groups {
-                let h = height_key as f32 / 1000.0;
-                let dx = (max.x - min.x).max(0.01);
-                let dz = (max.z - min.z).max(0.01);
-                let cx = 0.5 * (min.x + max.x);
-                let cz = 0.5 * (min.z + max.z);
-                let mut mesh = Mesh::new(
-                    PrimitiveTopology::TriangleList,
-                    RenderAssetUsages::default(),
-                );
-                // Flat quad in the XZ plane, centered on (cx, h, cz).
-                let hx = dx * 0.5;
-                let hz = dz * 0.5;
-                let positions: Vec<[f32; 3]> = vec![
-                    [cx - hx, h, cz - hz],
-                    [cx + hx, h, cz - hz],
-                    [cx + hx, h, cz + hz],
-                    [cx - hx, h, cz + hz],
-                ];
-                let normals: Vec<[f32; 3]> = vec![[0.0, 1.0, 0.0]; 4];
-                let uvs: Vec<[f32; 2]> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-                let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
-                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-                mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-                mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-                mesh.insert_indices(Indices::U32(indices));
-                let mut child = commands.spawn((
-                    MzbOverlay,
-                    Mesh3d(meshes.add(mesh)),
-                    MeshMaterial3d(water_mat.clone()),
-                    Transform::IDENTITY,
-                    init_noncollision_vis,
-                    ChildOf(parent),
-                    MzbNonCollisionMesh,
-                ));
-                if req.auto_loaded {
-                    child.insert(AutoMzbOverlay);
-                }
+        // World-space XZ bbox for this placement's geometry.
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for v in &sub.positions {
+            let p = inst
+                .bevy_transform
+                .transform_point(Vec3::new(v[0], v[1], v[2]));
+            min = min.min(p);
+            max = max.max(p);
+        }
+        // Key by mm-rounded height — float noise on the parser
+        // side would otherwise split one lake into 10 near-equal
+        // groups.
+        let key = (h_bevy * 1000.0).round() as i32;
+        water_groups
+            .entry(key)
+            .and_modify(|(mn, mx)| {
+                *mn = mn.min(min);
+                *mx = mx.max(max);
+            })
+            .or_insert((min, max));
+    }
+    let water_count = water_groups.len();
+    if water_count > 0 {
+        let water_mat = materials.add(StandardMaterial {
+            base_color: Color::srgba(0.20, 0.45, 0.70, 0.55),
+            cull_mode: None,
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        });
+        for (height_key, (min, max)) in water_groups {
+            let h = height_key as f32 / 1000.0;
+            let dx = (max.x - min.x).max(0.01);
+            let dz = (max.z - min.z).max(0.01);
+            let cx = 0.5 * (min.x + max.x);
+            let cz = 0.5 * (min.z + max.z);
+            let mut mesh = Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::default(),
+            );
+            // Flat quad in the XZ plane, centered on (cx, h, cz).
+            let hx = dx * 0.5;
+            let hz = dz * 0.5;
+            let positions: Vec<[f32; 3]> = vec![
+                [cx - hx, h, cz - hz],
+                [cx + hx, h, cz - hz],
+                [cx + hx, h, cz + hz],
+                [cx - hx, h, cz + hz],
+            ];
+            let normals: Vec<[f32; 3]> = vec![[0.0, 1.0, 0.0]; 4];
+            let uvs: Vec<[f32; 2]> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+            let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
+            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+            mesh.insert_indices(Indices::U32(indices));
+            let mut child = commands.spawn((
+                MzbOverlay,
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(water_mat.clone()),
+                Transform::IDENTITY,
+                init_noncollision_vis,
+                ChildOf(parent),
+                MzbNonCollisionMesh,
+            ));
+            if req.auto_loaded {
+                child.insert(AutoMzbOverlay);
+            }
+        }
+        push_system_msg(
+            toasts,
+            format!(
+                "/load_mzb {}: {} water plane{} spawned",
+                req.file_id,
+                water_count,
+                if water_count == 1 { "" } else { "s" },
+            ),
+        );
+    }
+
+    // Also instance the zone's visual MMBs at their MZB-placement
+    // transforms. This is the "textured visual world" half of the
+    // zone — MZB merged meshes above are collision-only, MMBs are
+    // the per-prop textured walls/buildings/floor tiles.
+    //
+    // The spawn-table parse already ran inside the background task
+    // (see `kick_load_mzb_tasks` → `LoadedZoneGeom.mmb_spawns`);
+    // here we just consume the `Result` and fire the per-placement
+    // events. On a cache hit the same `Arc<Result<...>>` is reused
+    // — no re-parse cost on zone re-entry.
+    match &geom.mmb_spawns {
+        Ok(spawns) => {
+            let n = spawns.len();
+            let offset = Mat4::from_translation(req.world_pos);
+            for s in spawns {
+                load_mmb_tx.write(crate::dat_mmb::LoadMmbRequest {
+                    file_id: req.file_id,
+                    chunk_idx: s.chunk_idx,
+                    world_pos: Vec3::ZERO,
+                    entity_id: None,
+                    world_transform: Some(offset * s.bevy_transform),
+                });
             }
             push_system_msg(
-                &mut toasts,
+                toasts,
                 format!(
-                    "/load_mzb {}: {} water plane{} spawned",
-                    req.file_id,
-                    water_count,
-                    if water_count == 1 { "" } else { "s" },
+                    "/load_mzb {}: queued {n} visual MMB placements",
+                    req.file_id
                 ),
             );
         }
-
-        // Also instance the zone's visual MMBs at their MZB-placement
-        // transforms. This is the "textured visual world" half of the
-        // zone — MZB merged meshes above are collision-only, MMBs are
-        // the per-prop textured walls/buildings/floor tiles.
-        match build_zone_mmb_spawns(req.file_id, req.chunk_idx) {
-            Ok(spawns) => {
-                let n = spawns.len();
-                let offset = Mat4::from_translation(req.world_pos);
-                for s in &spawns {
-                    load_mmb_tx.write(crate::dat_mmb::LoadMmbRequest {
-                        file_id: req.file_id,
-                        chunk_idx: s.chunk_idx,
-                        world_pos: Vec3::ZERO,
-                        entity_id: None,
-                        world_transform: Some(offset * s.bevy_transform),
-                    });
-                }
-                push_system_msg(
-                    &mut toasts,
-                    format!(
-                        "/load_mzb {}: queued {n} visual MMB placements",
-                        req.file_id
-                    ),
-                );
-            }
-            Err(msg) => {
-                push_system_msg(
-                    &mut toasts,
-                    format!("/load_mzb {}: zone-MMB spawn: {msg}", req.file_id),
-                );
-            }
+        Err(msg) => {
+            push_system_msg(
+                toasts,
+                format!("/load_mzb {}: zone-MMB spawn: {msg}", req.file_id),
+            );
         }
     }
 }

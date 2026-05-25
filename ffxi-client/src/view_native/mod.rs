@@ -296,7 +296,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     //
     // Mirrors the symmetric `OnExit(AppPhase::Launcher)` 2D-camera
     // despawn in `launcher_ui/mod.rs:437`.
-    app.add_systems(OnExit(AppPhase::InGame), despawn_ingame_entities);
+    app.add_systems(
+        OnExit(AppPhase::InGame),
+        (despawn_ingame_entities, drain_mzb_load_state),
+    );
 
     // Keybinds: load persisted preset+overrides from disk before plugins
     // run. `ViewerCorePlugin::build` calls `init_resource::<Bindings>()`,
@@ -645,6 +648,35 @@ fn despawn_ingame_entities(
     animation_blends.by_id.clear();
 
     tracing::info!(count, "OnExit(InGame): despawned scoped entities");
+}
+
+/// Sibling drain for the Phase-A background-MZB-load Resources. Lives
+/// in its own system because adding the two `ResMut`s to
+/// [`despawn_ingame_entities`] would push past Bevy's 16-`SystemParam`
+/// ceiling.
+///
+/// Drops every in-flight MZB-parse task (the `Task` cancels on drop —
+/// the spawned background work either runs to completion and its
+/// result is silently discarded, or short-circuits if the executor
+/// supports cancellation). Clears the per-zone cache so a fresh
+/// session picks up any operator-changed install-root or DAT file on
+/// the first zone-in instead of re-using a stale parse from the prior
+/// session.
+fn drain_mzb_load_state(
+    mut mzb_in_flight: ResMut<ffxi_viewer_core::dat_mzb::LoadMzbInFlight>,
+    mut zone_geom_cache: ResMut<ffxi_viewer_core::dat_mzb::ZoneGeomCache>,
+) {
+    let dropped_tasks = mzb_in_flight.tasks.len();
+    let dropped_cache = zone_geom_cache.entries.len();
+    mzb_in_flight.tasks.clear();
+    zone_geom_cache.entries.clear();
+    if dropped_tasks > 0 || dropped_cache > 0 {
+        tracing::info!(
+            dropped_tasks,
+            dropped_cache,
+            "OnExit(InGame): drained MZB-load state",
+        );
+    }
 }
 
 /// Disconnect-watcher: when `SceneState.snapshot.stage` flips to

@@ -63,7 +63,8 @@ pub struct MmbOverlay;
 #[derive(Resource, Default)]
 pub struct MmbHandleCache {
     pub mesh: std::collections::HashMap<(u32, usize, usize), bevy::asset::Handle<Mesh>>,
-    pub material: std::collections::HashMap<(u32, usize, usize), bevy::asset::Handle<StandardMaterial>>,
+    pub material:
+        std::collections::HashMap<(u32, usize, usize), bevy::asset::Handle<StandardMaterial>>,
 }
 
 /// Spawn-an-MMB request. Fired by the slash-command dispatcher;
@@ -113,6 +114,8 @@ impl Plugin for DatOverlayPlugin {
             .init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
             .init_resource::<crate::dat_mzb::DrawDistance>()
             .init_resource::<crate::dat_mzb::MzbCollisionGeometry>()
+            .init_resource::<crate::dat_mzb::LoadMzbInFlight>()
+            .init_resource::<crate::dat_mzb::ZoneGeomCache>()
             .add_systems(
                 Update,
                 (
@@ -132,7 +135,18 @@ impl Plugin for DatOverlayPlugin {
                     // zone-MMB spawn list it emits (one LoadMmbRequest
                     // per placement record) gets consumed in the same
                     // frame the zone changes.
-                    crate::dat_mzb::process_load_mzb_requests,
+                    //
+                    // Phase A: parse + bake now runs on a background
+                    // `AsyncComputeTaskPool` task. `kick_load_mzb_tasks`
+                    // drains the event into either a cache hit (spawn
+                    // this frame) or a new task. `poll_load_mzb_tasks`
+                    // runs immediately after so a hit-or-fast-task can
+                    // still fire its `LoadMmbRequest`s within the same
+                    // frame the zone changed. Slow zones (large city
+                    // DATs) take one or more frames to land, with no
+                    // main-thread blocking in the meantime.
+                    crate::dat_mzb::kick_load_mzb_tasks,
+                    crate::dat_mzb::poll_load_mzb_tasks,
                     process_load_mmb_requests,
                     crate::dat_vos2::process_load_vos2_requests,
                 )
@@ -502,7 +516,6 @@ pub fn process_load_mmb_requests(
         ),
     > = std::collections::HashMap::new();
 
-
     for req in queued {
         let loaded_entry = mmb_cache
             .entry((req.file_id, req.chunk_idx))
@@ -642,7 +655,7 @@ pub fn process_load_mmb_requests(
                 .into_iter()
                 .map(|(name, b)| format!("{name}:0x{b:04X}"))
                 .collect();
-            info!(
+            debug!(
                 target: "ffxi_viewer_core::dat_mmb",
                 file_id = req.file_id,
                 chunk_idx = req.chunk_idx,
@@ -727,18 +740,22 @@ pub fn process_load_mmb_requests(
             // Mesh handle: reuse if already built. Vertex data is
             // identical across instances; only the parent transform
             // differs (and that's per-entity, not per-mesh).
-            let mesh_handle = handle_cache.mesh.entry(cache_key).or_insert_with(|| {
-                let mut mesh = Mesh::new(
-                    PrimitiveTopology::TriangleList,
-                    RenderAssetUsages::default(),
-                );
-                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, sub.positions.clone());
-                mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, sub.normals.clone());
-                mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, sub.uvs.clone());
-                mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, sub.colors.clone());
-                mesh.insert_indices(Indices::U32(sub.indices.clone()));
-                meshes.add(mesh)
-            }).clone();
+            let mesh_handle = handle_cache
+                .mesh
+                .entry(cache_key)
+                .or_insert_with(|| {
+                    let mut mesh = Mesh::new(
+                        PrimitiveTopology::TriangleList,
+                        RenderAssetUsages::default(),
+                    );
+                    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, sub.positions.clone());
+                    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, sub.normals.clone());
+                    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, sub.uvs.clone());
+                    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, sub.colors.clone());
+                    mesh.insert_indices(Indices::U32(sub.indices.clone()));
+                    meshes.add(mesh)
+                })
+                .clone();
 
             let variant_trimmed = sub.variant_name.trim();
             let sub_texture = tex_by_name
@@ -784,22 +801,26 @@ pub fn process_load_mmb_requests(
             // instances. The material depends only on
             // (texture, alpha_mode) which is a function of
             // `(file_id, chunk_idx, sub_index)`.
-            let mat_handle = handle_cache.material.entry(cache_key).or_insert_with(|| {
-                materials.add(StandardMaterial {
-                    // WHITE so the mesh's per-vertex `ATTRIBUTE_COLOR`
-                    // (FFXI's baked vertex lighting) and the bound
-                    // `base_color_texture` (if any) both pass through
-                    // un-tinted. Bevy's StandardMaterial multiplies
-                    // base_color × vertex_color × texture.
-                    base_color: Color::WHITE,
-                    base_color_texture: sub_texture,
-                    alpha_mode,
-                    perceptual_roughness: 1.0,
-                    reflectance: 0.0,
-                    cull_mode: None,
-                    ..default()
+            let mat_handle = handle_cache
+                .material
+                .entry(cache_key)
+                .or_insert_with(|| {
+                    materials.add(StandardMaterial {
+                        // WHITE so the mesh's per-vertex `ATTRIBUTE_COLOR`
+                        // (FFXI's baked vertex lighting) and the bound
+                        // `base_color_texture` (if any) both pass through
+                        // un-tinted. Bevy's StandardMaterial multiplies
+                        // base_color × vertex_color × texture.
+                        base_color: Color::WHITE,
+                        base_color_texture: sub_texture,
+                        alpha_mode,
+                        perceptual_roughness: 1.0,
+                        reflectance: 0.0,
+                        cull_mode: None,
+                        ..default()
+                    })
                 })
-            }).clone();
+                .clone();
 
             let mut child = commands.spawn((
                 MmbOverlay,
