@@ -373,34 +373,49 @@ fn do_rebake(
     let skel_file_id = match mode {
         ViewerMode::Pc => {
             // Force the GPU-skinned path by setting `skeleton_file_id`
-            // on every dispatched slot. Live play deliberately keeps
-            // PCs on the CPU-baked path (`look_resolver.rs:715-744`)
-            // because three GPU regressions (orientation, mirror,
-            // bone-table) blocked it in production — the model viewer
-            // is a debug surface where surfacing those is the point.
+            // on every dispatched slot. Mirrors live-play's Equipped
+            // dispatch (`look_resolver.rs:715-744`) since `0454f11`
+            // flipped that branch onto the same path.
+            //
+            // `enumerate_vos2_chunks` returns every OS2 chunk index in
+            // the DAT — face DATs and some slot DATs ship more than
+            // one (head LOD variants etc.). Hardcoding `chunk_idx: 4`
+            // (the live-play convention for equipment slots) silently
+            // missed the face mesh entirely. Match `spawn_equipped`'s
+            // pass-1 loop: enumerate per-DAT, dispatch one request
+            // per chunk.
             let Some(skel) = pc_race_to_skel(pc.race) else {
                 return None;
             };
+            let mut dispatch_dat = |file_id: u32| {
+                let chunks = enumerate_vos2_chunks(file_id);
+                if chunks.is_empty() {
+                    return;
+                }
+                for chunk_idx in chunks {
+                    npc_loads.write(LoadVos2Request {
+                        file_id,
+                        chunk_idx,
+                        entity_id: PREVIEW_ENTITY_ID,
+                        race: pc.race,
+                        skeleton_file_id: Some(skel),
+                    });
+                }
+            };
             if let Some(face_file) = resolve_face(pc.face, pc.race) {
-                npc_loads.write(LoadVos2Request {
-                    file_id: face_file,
-                    chunk_idx: 4,
-                    entity_id: PREVIEW_ENTITY_ID,
-                    race: pc.race,
-                    skeleton_file_id: Some(skel),
-                });
+                dispatch_dat(face_file);
+            } else {
+                warn!(
+                    race = pc.race,
+                    face = pc.face,
+                    "model viewer: resolve_face returned None"
+                );
             }
             for slot_id in [pc.head, pc.body, pc.hands, pc.legs, pc.feet, pc.main, pc.sub, pc.ranged] {
                 let Some(file_id) = resolve_equipment_slot(slot_id, pc.race) else {
                     continue;
                 };
-                npc_loads.write(LoadVos2Request {
-                    file_id,
-                    chunk_idx: 4,
-                    entity_id: PREVIEW_ENTITY_ID,
-                    race: pc.race,
-                    skeleton_file_id: Some(skel),
-                });
+                dispatch_dat(file_id);
             }
             Some(skel)
         }
