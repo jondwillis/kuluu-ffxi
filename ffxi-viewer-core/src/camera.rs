@@ -151,10 +151,10 @@ impl ChaseCamera {
     pub const FP_PITCH_MAX: f32 = std::f32::consts::FRAC_PI_2 - 0.05;
     /// Closest the chase camera can pull in. Below ~3.0 the player capsule
     /// clips through the near plane; for closer-than-3 use FirstPerson.
-    pub const DIST_MIN: f32 = 3.0;
+    pub const DIST_MIN: f32 = 2.0;
     /// Furthest the chase camera can pull out. Beyond 30 the avatar is too
     /// small to read on the operator's screen and HUD becomes the main signal.
-    pub const DIST_MAX: f32 = 30.0;
+    pub const DIST_MAX: f32 = 20.0;
     /// Keyboard zoom rate, **yalms per second of held key**. Used by
     /// the `.` / `,` bindings (`Action::CameraZoomIn`/`Out`). Time-based
     /// rather than per-press so holding the key produces smooth,
