@@ -56,10 +56,12 @@ pub const PREVIEW_RENDER_LAYER: usize = 1;
 /// resolves it to DAT file_id 202.
 pub const DEFAULT_BACKDROP_ZONE: u16 = 102;
 
-/// Debounce window for selection-driven zone swaps. Arrow-keying
-/// through 8 characters in 200ms shouldn't kick off 8 zone loads —
-/// wait until the cursor has been still this long, then load.
-const SELECTION_DEBOUNCE: f32 = 0.5;
+/// No time-based debounce on cursor moves: the fade state machine
+/// itself throttles. A second target captured mid-fade waits in
+/// `PendingBackdropSwap` until the current FadingOut → Holding →
+/// FadingIn cycle completes, then a new fade kicks. Net effect:
+/// at most one zone load per ~1s fade cycle, but every change is
+/// acknowledged immediately.
 
 /// The zone id currently driving the launcher backdrop. Written by
 /// the plugin's selection-watcher (and on startup); read by a system
@@ -82,14 +84,12 @@ pub struct BackdropCamera;
 #[derive(Component)]
 struct BackdropScoped;
 
-/// Pending zone-swap state for the selection-driven debounce. Tracks
-/// the target zone the cursor is currently hovering on, plus the
-/// elapsed time since the cursor last changed targets. When the
-/// elapsed time exceeds [`SELECTION_DEBOUNCE`] we commit the swap.
+/// Most-recent cursor-derived zone target. Latched every frame
+/// `update_backdrop_from_selection` runs. When a fade completes and
+/// this still differs from the current zone, a new fade kicks.
 #[derive(Resource, Default)]
 struct PendingBackdropSwap {
     target: Option<u16>,
-    elapsed: f32,
 }
 
 /// Crossfade state for zone changes. Hides the visual gap between
@@ -308,7 +308,6 @@ fn mirror_backdrop_to_scene_state(
 /// while `LauncherState::CharList` is active — Option<Res<_>>
 /// pattern.
 fn update_backdrop_from_selection(
-    time: Res<Time>,
     cursor: Option<Res<CharCursor>>,
     chars: Res<CharListData>,
     mut pending: ResMut<PendingBackdropSwap>,
@@ -322,45 +321,35 @@ fn update_backdrop_from_selection(
         .as_deref()
         .and_then(|c| chars.0.get(c.0))
         .and_then(slot_zone_for_backdrop);
+    pending.target = hovered;
 
-    // Track changes to the hovered target. Each new target resets
-    // the elapsed timer; only commit once it's been stable for
-    // SELECTION_DEBOUNCE seconds. Reverting to the current zone
-    // mid-debounce cancels the pending swap.
-    if pending.target != hovered {
-        pending.target = hovered;
-        pending.elapsed = 0.0;
+    // Kick a new fade only when idle. The fade itself is the rate
+    // limit — arrow-keying through 8 chars updates `pending.target`
+    // 8 times but only the latest one ends up driving the next
+    // fade cycle. `drive_backdrop_fade` re-checks pending.target
+    // when it returns to Idle.
+    if !fade.is_idle() {
         return;
     }
-
-    let Some(target) = pending.target else {
+    let Some(target) = hovered else {
         return;
     };
     if target == zone.0 {
         return;
     }
-    pending.elapsed += time.delta_secs();
-    if pending.elapsed >= SELECTION_DEBOUNCE {
-        // Kick a fade rather than swapping the zone directly. The
-        // FadingOut → Holding step commits `zone.0 = target` at
-        // peak overlay alpha, so the hard MZB despawn/respawn pop is
-        // hidden behind the curtain. Skipping if a fade is already
-        // running prevents the same target from queueing twice if
-        // the cursor sits on a row past the debounce window.
-        if fade.is_idle() {
-            *fade = BackdropFade::FadingOut { target, elapsed: 0.0 };
-        }
-        pending.elapsed = 0.0;
-    }
+    *fade = BackdropFade::FadingOut { target, elapsed: 0.0 };
 }
 
 /// Tick the fade state machine. Driven by `Time` so it's frame-rate
 /// independent. Transitions: FadingOut → (commit target) → Holding →
-/// FadingIn → Idle.
+/// FadingIn → Idle. On returning to Idle, immediately re-checks
+/// `PendingBackdropSwap.target` and kicks another fade if the cursor
+/// moved to a different zone during the previous cycle.
 fn drive_backdrop_fade(
     time: Res<Time>,
     mut fade: ResMut<BackdropFade>,
     mut zone: ResMut<LauncherBackdropZone>,
+    pending: Res<PendingBackdropSwap>,
 ) {
     let dt = time.delta_secs();
     *fade = match *fade {
@@ -385,7 +374,15 @@ fn drive_backdrop_fade(
         BackdropFade::FadingIn { elapsed } => {
             let next = elapsed + dt;
             if next >= FADE_IN_SECS {
-                BackdropFade::Idle
+                // Cycle done — but if the cursor moved during the
+                // fade and points at a different zone, kick the
+                // next cycle without a frame of Idle in between.
+                match pending.target {
+                    Some(target) if target != zone.0 => {
+                        BackdropFade::FadingOut { target, elapsed: 0.0 }
+                    }
+                    _ => BackdropFade::Idle,
+                }
             } else {
                 BackdropFade::FadingIn { elapsed: next }
             }
