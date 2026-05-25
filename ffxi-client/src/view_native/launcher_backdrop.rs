@@ -139,12 +139,20 @@ const FADE_IN_SECS: f32 = 0.35;
 /// rather than a sudden hard cut to pure black.
 const FADE_COLOR: Color = Color::srgb(0.04, 0.04, 0.05);
 
-/// Marker for the full-screen UI overlay used to crossfade between
-/// zones. One persistent entity for the entire `AppPhase::Launcher`
-/// lifetime; its `BackgroundColor` alpha is animated by
-/// [`drive_backdrop_fade`].
+/// Marker for the camera-facing quad that crossfades between zones.
+/// Lives on `BACKDROP_RENDER_LAYER` so only the backdrop camera
+/// renders it — the PC-preview camera (on `PREVIEW_RENDER_LAYER`)
+/// stays visible through the entire transition. The quad is parented
+/// to the backdrop camera so it tracks any future viewpoint change
+/// for free.
 #[derive(Component)]
-struct BackdropFadeOverlay;
+struct BackdropFadeQuad;
+
+/// Handle to the fade quad's material, kept in a Resource so
+/// [`apply_overlay_alpha`] can mutate `base_color.alpha` each frame
+/// without a `Query<&MeshMaterial3d<…>>` round-trip.
+#[derive(Resource)]
+struct BackdropFadeMaterial(Handle<StandardMaterial>);
 
 pub struct LauncherBackdropPlugin;
 
@@ -179,56 +187,69 @@ impl Plugin for LauncherBackdropPlugin {
     }
 }
 
-fn spawn_backdrop_camera(mut commands: Commands) {
-    // Full-screen UI overlay used to crossfade between zones. Spawned
-    // first (before any per-screen launcher root) so it sits *behind*
-    // the panels in UI z-order — panels stay readable while the
-    // overlay blacks out the 3D backdrop + PC preview during a swap.
-    commands.spawn((
-        BackdropFadeOverlay,
-        BackdropScoped,
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(0.0),
-            left: Val::Px(0.0),
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            ..default()
-        },
-        BackgroundColor(FADE_COLOR.with_alpha(0.0)),
-        // Sit between the 3D cameras and the per-screen UI roots so
-        // panels still receive interaction events. UI tree order
-        // would normally do this for free, but the overlay is spawned
-        // at Launcher entry and screens come and go; an explicit
-        // negative global z guarantees we stay underneath.
-        ZIndex(-1),
-    ));
+fn spawn_backdrop_camera(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let cam = commands
+        .spawn((
+            BackdropCamera,
+            BackdropScoped,
+            Camera3d::default(),
+            Camera {
+                // Behind char-preview (-1) and UI (0). The launcher's
+                // 2D camera defaults to order 0 too — Bevy renders
+                // higher-order cameras on top, so -2 keeps us at the
+                // bottom of the stack.
+                order: -2,
+                ..default()
+            },
+            // Lock backdrop to its own render layer. Without this, the
+            // char-list PC preview (which spawns meshes at world origin)
+            // gets rendered by this camera *inside* the loaded zone and
+            // clips through terrain. PC previews run on
+            // PREVIEW_RENDER_LAYER and use their own camera.
+            RenderLayers::layer(BACKDROP_RENDER_LAYER),
+            // Placeholder viewpoint — eye-height above the FFXI world
+            // origin (which is the zone-local origin for the MZB load),
+            // looking slightly down toward the horizon. Real per-zone
+            // viewpoints can be a later polish pass; this just gives
+            // the zone *something* to render against.
+            Transform::from_xyz(0.0, 6.0, 12.0).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
+        ))
+        .id();
 
-    commands.spawn((
-        BackdropCamera,
-        BackdropScoped,
-        Camera3d::default(),
-        Camera {
-            // Behind char-preview (-1) and UI (0). The launcher's
-            // 2D camera defaults to order 0 too — Bevy renders
-            // higher-order cameras on top, so -2 keeps us at the
-            // bottom of the stack.
-            order: -2,
-            ..default()
-        },
-        // Lock backdrop to its own render layer. Without this, the
-        // char-list PC preview (which spawns meshes at world origin)
-        // gets rendered by this camera *inside* the loaded zone and
-        // clips through terrain. PC previews run on
-        // PREVIEW_RENDER_LAYER and use their own camera.
-        RenderLayers::layer(BACKDROP_RENDER_LAYER),
-        // Placeholder viewpoint — eye-height above the FFXI world
-        // origin (which is the zone-local origin for the MZB load),
-        // looking slightly down toward the horizon. Real per-zone
-        // viewpoints can be a later polish pass; this just gives
-        // the zone *something* to render against.
-        Transform::from_xyz(0.0, 6.0, 12.0).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
-    ));
+    // Camera-facing fade quad parented to the backdrop camera. Lives
+    // on the backdrop's render layer only, so the PC-preview camera
+    // (layer 1) sees clean through the fade — the previewed model
+    // stays visible across zone swaps. Positioned just past the
+    // default 0.1 near plane, sized to safely overfill the FOV.
+    // alpha starts at 0; `apply_overlay_alpha` writes the active
+    // fade alpha into base_color each frame.
+    let quad = meshes.add(Rectangle::new(40.0, 40.0));
+    let mat = materials.add(StandardMaterial {
+        base_color: FADE_COLOR.with_alpha(0.0),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        ..default()
+    });
+    commands.entity(cam).with_children(|c| {
+        c.spawn((
+            BackdropFadeQuad,
+            BackdropScoped,
+            Mesh3d(quad),
+            MeshMaterial3d(mat.clone()),
+            RenderLayers::layer(BACKDROP_RENDER_LAYER),
+            // Rectangle's normal is +Z by default — a child of the
+            // camera at local (0,0,-0.2) faces back toward camera
+            // origin (i.e., the camera sees its front face). The
+            // negative z places it past the near plane.
+            Transform::from_xyz(0.0, 0.0, -0.2),
+        ));
+    });
+    commands.insert_resource(BackdropFadeMaterial(mat));
 
     // Lighting so the backdrop isn't pitch-black. The in-game sun/
     // moon system gates on `EntityMesh` (not present in Launcher
@@ -249,6 +270,9 @@ fn despawn_backdrop_camera(mut commands: Commands, q: Query<Entity, With<Backdro
     for e in q.iter() {
         commands.entity(e).despawn();
     }
+    // The fade material handle outlived its quad — drop it so a
+    // re-entry to Launcher rebuilds a fresh one.
+    commands.remove_resource::<BackdropFadeMaterial>();
 }
 
 /// Mirror [`LauncherBackdropZone`] into `SceneState.snapshot.zone_id`.
@@ -369,20 +393,27 @@ fn drive_backdrop_fade(
     };
 }
 
-/// Apply the current fade alpha to the overlay's `BackgroundColor`.
-/// Cheap; only writes when the alpha actually changes.
+/// Apply the current fade alpha to the camera-facing quad's material.
+/// Cheap; only writes through `Assets<StandardMaterial>` when the
+/// alpha actually changes (avoids spurious change-detection for the
+/// renderer's material upload).
 fn apply_overlay_alpha(
     fade: Res<BackdropFade>,
-    mut q: Query<&mut BackgroundColor, With<BackdropFadeOverlay>>,
+    mat_handle: Option<Res<BackdropFadeMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let Some(mat_handle) = mat_handle else {
+        return;
+    };
+    let Some(mat) = materials.get_mut(&mat_handle.0) else {
+        return;
+    };
     let want = fade.alpha();
-    for mut bg in q.iter_mut() {
-        let current = bg.0.alpha();
-        if (current - want).abs() < 0.001 {
-            continue;
-        }
-        bg.0 = FADE_COLOR.with_alpha(want);
+    let current = mat.base_color.alpha();
+    if (current - want).abs() < 0.001 {
+        return;
     }
+    mat.base_color = FADE_COLOR.with_alpha(want);
 }
 
 /// Filter: only return a zone id we can actually load. Empty char
