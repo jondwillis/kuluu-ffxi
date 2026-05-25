@@ -92,12 +92,67 @@ struct PendingBackdropSwap {
     elapsed: f32,
 }
 
+/// Crossfade state for zone changes. Hides the visual gap between
+/// despawning the old zone geometry and the new one's first lit
+/// frame; without it the swap is a hard pop (often through an
+/// empty/black frame).
+#[derive(Resource, Default, Clone, Copy)]
+enum BackdropFade {
+    #[default]
+    Idle,
+    /// Lerping overlay alpha 0 → 1. At end: commit `target` to
+    /// [`LauncherBackdropZone`] and transition to `Holding`.
+    FadingOut { target: u16, elapsed: f32 },
+    /// Overlay fully opaque while the new zone loads. Avoids
+    /// fading back in onto empty/half-loaded geometry.
+    Holding { elapsed: f32 },
+    /// Lerping overlay alpha 1 → 0.
+    FadingIn { elapsed: f32 },
+}
+
+impl BackdropFade {
+    fn is_idle(&self) -> bool {
+        matches!(self, BackdropFade::Idle)
+    }
+    /// Current overlay alpha in 0..=1.
+    fn alpha(&self) -> f32 {
+        match *self {
+            BackdropFade::Idle => 0.0,
+            BackdropFade::FadingOut { elapsed, .. } => (elapsed / FADE_OUT_SECS).clamp(0.0, 1.0),
+            BackdropFade::Holding { .. } => 1.0,
+            BackdropFade::FadingIn { elapsed } => 1.0 - (elapsed / FADE_IN_SECS).clamp(0.0, 1.0),
+        }
+    }
+}
+
+const FADE_OUT_SECS: f32 = 0.25;
+/// Time to leave the overlay opaque while the new zone's MZB load
+/// (mesh parse + spawn) completes. Tuned conservatively — most zones
+/// load in well under 250ms but a cold cache for a large zone (e.g.
+/// city) can take longer; better to hold a beat too long than to
+/// fade back into a partially-spawned scene.
+const FADE_HOLD_SECS: f32 = 0.40;
+const FADE_IN_SECS: f32 = 0.35;
+
+/// Color the overlay fades toward. Matches the launcher's panel
+/// background so the transition reads as "panel-tinted blackout"
+/// rather than a sudden hard cut to pure black.
+const FADE_COLOR: Color = Color::srgb(0.04, 0.04, 0.05);
+
+/// Marker for the full-screen UI overlay used to crossfade between
+/// zones. One persistent entity for the entire `AppPhase::Launcher`
+/// lifetime; its `BackgroundColor` alpha is animated by
+/// [`drive_backdrop_fade`].
+#[derive(Component)]
+struct BackdropFadeOverlay;
+
 pub struct LauncherBackdropPlugin;
 
 impl Plugin for LauncherBackdropPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(LauncherBackdropZone(DEFAULT_BACKDROP_ZONE))
             .init_resource::<PendingBackdropSwap>()
+            .init_resource::<BackdropFade>()
             // Transparent clear so the 3D backdrop shows through any
             // UI layer that doesn't paint its own opaque background.
             // The launcher's existing roots DO paint opaque bg today
@@ -114,6 +169,8 @@ impl Plugin for LauncherBackdropPlugin {
                     // pass and the auto-loader sees the change next
                     // frame (one-tick latency, fine for a backdrop).
                     update_backdrop_from_selection,
+                    drive_backdrop_fade,
+                    apply_overlay_alpha,
                     mirror_backdrop_to_scene_state,
                 )
                     .chain()
@@ -123,6 +180,30 @@ impl Plugin for LauncherBackdropPlugin {
 }
 
 fn spawn_backdrop_camera(mut commands: Commands) {
+    // Full-screen UI overlay used to crossfade between zones. Spawned
+    // first (before any per-screen launcher root) so it sits *behind*
+    // the panels in UI z-order — panels stay readable while the
+    // overlay blacks out the 3D backdrop + PC preview during a swap.
+    commands.spawn((
+        BackdropFadeOverlay,
+        BackdropScoped,
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(0.0),
+            left: Val::Px(0.0),
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            ..default()
+        },
+        BackgroundColor(FADE_COLOR.with_alpha(0.0)),
+        // Sit between the 3D cameras and the per-screen UI roots so
+        // panels still receive interaction events. UI tree order
+        // would normally do this for free, but the overlay is spawned
+        // at Launcher entry and screens come and go; an explicit
+        // negative global z guarantees we stay underneath.
+        ZIndex(-1),
+    ));
+
     commands.spawn((
         BackdropCamera,
         BackdropScoped,
@@ -207,7 +288,8 @@ fn update_backdrop_from_selection(
     cursor: Option<Res<CharCursor>>,
     chars: Res<CharListData>,
     mut pending: ResMut<PendingBackdropSwap>,
-    mut zone: ResMut<LauncherBackdropZone>,
+    zone: Res<LauncherBackdropZone>,
+    mut fade: ResMut<BackdropFade>,
 ) {
     // CharCursor.0 indexes into chars.0; out-of-bounds (e.g. the
     // synthetic "+ New character" row at chars.len()) → None, which
@@ -235,8 +317,71 @@ fn update_backdrop_from_selection(
     }
     pending.elapsed += time.delta_secs();
     if pending.elapsed >= SELECTION_DEBOUNCE {
-        zone.0 = target;
+        // Kick a fade rather than swapping the zone directly. The
+        // FadingOut → Holding step commits `zone.0 = target` at
+        // peak overlay alpha, so the hard MZB despawn/respawn pop is
+        // hidden behind the curtain. Skipping if a fade is already
+        // running prevents the same target from queueing twice if
+        // the cursor sits on a row past the debounce window.
+        if fade.is_idle() {
+            *fade = BackdropFade::FadingOut { target, elapsed: 0.0 };
+        }
         pending.elapsed = 0.0;
+    }
+}
+
+/// Tick the fade state machine. Driven by `Time` so it's frame-rate
+/// independent. Transitions: FadingOut → (commit target) → Holding →
+/// FadingIn → Idle.
+fn drive_backdrop_fade(
+    time: Res<Time>,
+    mut fade: ResMut<BackdropFade>,
+    mut zone: ResMut<LauncherBackdropZone>,
+) {
+    let dt = time.delta_secs();
+    *fade = match *fade {
+        BackdropFade::Idle => return,
+        BackdropFade::FadingOut { target, elapsed } => {
+            let next = elapsed + dt;
+            if next >= FADE_OUT_SECS {
+                zone.0 = target;
+                BackdropFade::Holding { elapsed: 0.0 }
+            } else {
+                BackdropFade::FadingOut { target, elapsed: next }
+            }
+        }
+        BackdropFade::Holding { elapsed } => {
+            let next = elapsed + dt;
+            if next >= FADE_HOLD_SECS {
+                BackdropFade::FadingIn { elapsed: 0.0 }
+            } else {
+                BackdropFade::Holding { elapsed: next }
+            }
+        }
+        BackdropFade::FadingIn { elapsed } => {
+            let next = elapsed + dt;
+            if next >= FADE_IN_SECS {
+                BackdropFade::Idle
+            } else {
+                BackdropFade::FadingIn { elapsed: next }
+            }
+        }
+    };
+}
+
+/// Apply the current fade alpha to the overlay's `BackgroundColor`.
+/// Cheap; only writes when the alpha actually changes.
+fn apply_overlay_alpha(
+    fade: Res<BackdropFade>,
+    mut q: Query<&mut BackgroundColor, With<BackdropFadeOverlay>>,
+) {
+    let want = fade.alpha();
+    for mut bg in q.iter_mut() {
+        let current = bg.0.alpha();
+        if (current - want).abs() < 0.001 {
+            continue;
+        }
+        bg.0 = FADE_COLOR.with_alpha(want);
     }
 }
 
