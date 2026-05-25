@@ -19,10 +19,10 @@ use ffxi_viewer_core::combat_stance::{
 };
 use ffxi_viewer_core::components::WorldEntity;
 use ffxi_viewer_core::dat_vos2::{
-    enumerate_vos2_chunks, process_load_vos2_requests, spawn_equipped, tick_skinned_actors,
+    enumerate_vos2_chunks, process_load_vos2_requests, tick_skinned_actors,
     LoadVos2Request, SkinnedActor,
 };
-use ffxi_viewer_core::look_resolver::npc_dat_id;
+use ffxi_viewer_core::look_resolver::{npc_dat_id, resolve_equipment_slot, resolve_face};
 use ffxi_viewer_core::scene::{BakedActor, TrackedEntities};
 use ffxi_viewer_core::snapshot::SceneState;
 use ffxi_viewer_wire::EntityKind;
@@ -369,14 +369,40 @@ fn do_rebake(
 
     tracked.by_id.insert(PREVIEW_ENTITY_ID, parent);
 
+    let _ = (meshes, materials, images); // reserved for a future CPU-bake fallback
     let skel_file_id = match mode {
         ViewerMode::Pc => {
-            spawn_equipped(
-                commands, meshes, materials, images, parent,
-                pc.race, pc.face, pc.head, pc.body, pc.hands,
-                pc.legs, pc.feet, pc.main, pc.sub, pc.ranged,
-            );
-            pc_race_to_skel(pc.race)
+            // Force the GPU-skinned path by setting `skeleton_file_id`
+            // on every dispatched slot. Live play deliberately keeps
+            // PCs on the CPU-baked path (`look_resolver.rs:715-744`)
+            // because three GPU regressions (orientation, mirror,
+            // bone-table) blocked it in production — the model viewer
+            // is a debug surface where surfacing those is the point.
+            let Some(skel) = pc_race_to_skel(pc.race) else {
+                return None;
+            };
+            if let Some(face_file) = resolve_face(pc.face, pc.race) {
+                npc_loads.write(LoadVos2Request {
+                    file_id: face_file,
+                    chunk_idx: 4,
+                    entity_id: PREVIEW_ENTITY_ID,
+                    race: pc.race,
+                    skeleton_file_id: Some(skel),
+                });
+            }
+            for slot_id in [pc.head, pc.body, pc.hands, pc.legs, pc.feet, pc.main, pc.sub, pc.ranged] {
+                let Some(file_id) = resolve_equipment_slot(slot_id, pc.race) else {
+                    continue;
+                };
+                npc_loads.write(LoadVos2Request {
+                    file_id,
+                    chunk_idx: 4,
+                    entity_id: PREVIEW_ENTITY_ID,
+                    race: pc.race,
+                    skeleton_file_id: Some(skel),
+                });
+            }
+            Some(skel)
         }
         ViewerMode::Npc => {
             let dat_id = npc_dat_id(npc.model_id);
