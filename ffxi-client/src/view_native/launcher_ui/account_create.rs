@@ -36,7 +36,7 @@ pub(super) fn spawn_ui(
             spawn_breadcrumb(
                 root,
                 &server,
-                &[Crumb::AccountPicker, Crumb::Other("New account".to_string())],
+                &[Crumb::Sign(None), Crumb::Other("New account".to_string())],
             );
             root.spawn(panel_node(480.0)).with_children(|panel| {
                 panel.spawn(title("Create account"));

@@ -47,7 +47,6 @@
 //! ```
 
 mod account_create;
-mod account_picker;
 mod async_work;
 mod change_password;
 mod char_create;
@@ -136,8 +135,6 @@ pub(crate) enum LauncherState {
     /// Add or edit a `ServerProfile`. Reached from `ServerSelect` via
     /// the `+ Add server` or `Edit selected` buttons.
     ServerEdit,
-    /// Pick a saved account on the previously-selected server.
-    AccountPicker,
     /// Change password form (old / new / confirm). Reached from Login via
     /// the `Change password` button.
     ChangePassword,
@@ -375,10 +372,6 @@ pub(crate) struct ServerSelectForm {
 /// Keyboard cursor for the server-select list.
 #[derive(Resource, Default)]
 pub(crate) struct ServerSelectCursor(pub usize);
-
-/// Keyboard cursor for the account-picker list.
-#[derive(Resource, Default)]
-pub(crate) struct AccountPickerCursor(pub usize);
 
 /// Server-edit form. `editing_index = Some(i)` overwrites the i-th
 /// `ServerProfile` in `LauncherStore`; `None` appends.
@@ -718,7 +711,6 @@ pub(crate) fn register(
         .insert_resource(ServerSelectForm::default())
         .insert_resource(ServerSelectCursor::default())
         .insert_resource(server_select::PendingServerDelete::default())
-        .insert_resource(AccountPickerCursor::default())
         .insert_resource(ServerEditForm::default())
         .insert_resource(ChangePasswordForm::default())
         .insert_resource(DefaultCharName(defaults.char_name));
@@ -764,13 +756,6 @@ pub(crate) fn register(
                 server_edit::redraw_system,
             )
                 .run_if(in_state(LauncherState::ServerEdit)),
-        );
-
-    app.add_systems(OnEnter(LauncherState::AccountPicker), account_picker::spawn_ui)
-        .add_systems(OnExit(LauncherState::AccountPicker), account_picker::despawn_ui)
-        .add_systems(
-            Update,
-            account_picker::keyboard_input_system.run_if(in_state(LauncherState::AccountPicker)),
         );
 
     app.add_systems(OnEnter(LauncherState::ChangePassword), change_password::spawn_ui)
@@ -1063,7 +1048,7 @@ fn restore_login_error_on_reentry(
 /// overrides + no last_used → ServerSelect. If last_used + empty form
 /// → prefill from store + keyring. Runs every Login entry but the
 /// already-filled-form branch is a no-op, so re-entries (e.g. from
-/// AccountPicker) don't clobber what was just picked.
+/// clicking a saved-account chip) don't clobber what was just picked.
 fn decide_initial_screen(
     overrides: Option<Res<CliOverridesPresent>>,
     err: Res<LoginErrorMsg>,

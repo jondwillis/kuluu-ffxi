@@ -66,7 +66,16 @@ tracing-subscriber.workspace = true
 # Cross-platform secret storage (macOS Keychain / Windows Credential
 # Manager / Linux Secret Service) for opt-in password remember on the
 # launcher screen. v3 is the current stable line.
-keyring = "3"
+#
+# keyring 3 ships every backend behind a feature — without one, `Entry`
+# constructs fine but every get/set returns `NoStorageAccess`, silently
+# breaking the Remember-password flow. We opt in to the native backend
+# for each platform we ship binaries on.
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+] }
 
 bevy = { workspace = true, optional = true, features = [
     # Bevy 0.17's official widget kit (button/checkbox/slider/radio/

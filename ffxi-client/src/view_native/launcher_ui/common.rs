@@ -27,8 +27,6 @@ pub(super) enum Crumb {
     /// Sign-in form. The optional username, when present, becomes part
     /// of the label ("Sign in: user").
     Sign(Option<String>),
-    /// Saved-account list for the current server.
-    AccountPicker,
     /// Char-select for the current account.
     Characters,
     /// Current-screen leaf — never clickable; rendered as plain text.
@@ -41,7 +39,6 @@ impl Crumb {
             Crumb::Server => "Servers".to_string(),
             Crumb::Sign(Some(u)) => format!("Sign in: {u}"),
             Crumb::Sign(None) => "Sign in".to_string(),
-            Crumb::AccountPicker => "Accounts".to_string(),
             Crumb::Characters => "Characters".to_string(),
             Crumb::Other(s) => s.clone(),
         }
@@ -51,7 +48,6 @@ impl Crumb {
         match self {
             Crumb::Server => Some(LauncherState::ServerSelect),
             Crumb::Sign(_) => Some(LauncherState::Login),
-            Crumb::AccountPicker => Some(LauncherState::AccountPicker),
             Crumb::Characters => Some(LauncherState::CharList),
             Crumb::Other(_) => None,
         }

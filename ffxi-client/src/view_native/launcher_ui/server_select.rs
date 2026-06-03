@@ -88,6 +88,7 @@ pub(super) fn spawn_ui(
                                       mut commands: Commands,
                                       mut cursor: ResMut<ServerSelectCursor>,
                                       mut form: ResMut<ServerSelectForm>,
+                                      mut login: ResMut<super::LoginForm>,
                                       mut next: ResMut<NextState<LauncherState>>| {
                                     cursor.0 = idx;
                                     form.selected = Some(pick_name.clone());
@@ -97,7 +98,16 @@ pub(super) fn spawn_ui(
                                     {
                                         super::apply_server_profile(&mut commands, profile);
                                     }
-                                    next.set(LauncherState::AccountPicker);
+                                    // Drop any stale form state from the
+                                    // prior server — the Login screen's
+                                    // saved-account chips are now the
+                                    // discovery path for the picked
+                                    // server's accounts.
+                                    login.user.clear();
+                                    login.pass.clear();
+                                    login.remember_password = false;
+                                    login.focus = super::LoginField::User;
+                                    next.set(LauncherState::Login);
                                 },
                             );
                         });
