@@ -12,8 +12,11 @@
 //!    each `Update` and updates the [`BgmSlots`] resource — one
 //!    track id per LSB `MusicSlot` (0=ZoneDay…7=Fishing).
 //! 4. [`apply_bgm_system`] picks the audible slot from a priority
-//!    ladder and, if the resolved track changed, decodes the
-//!    matching `.bgw` and swaps the audio sink.
+//!    ladder and, if the resolved *track id* changed, decodes the
+//!    matching `.bgw` and crossfades the audio sink (`AudioFade`
+//!    component, driven by [`tick_audio_fades`]). Changes that only
+//!    flip the slot (e.g. ZoneDay → ZoneNight on the same file) keep
+//!    the sink running so the loop isn't broken mid-bar.
 //!
 //! SE / SFX is deferred (the action→SE table requires DAT-format
 //! research). The plugin module is structured so the SFX path can
@@ -491,13 +494,30 @@ fn slot_name(slot: u8) -> &'static str {
     }
 }
 
-/// React to the resolved slot. If the (slot, track) pair changed
-/// since last frame, decode the new track and spawn a fresh
-/// `AudioPlayer`, despawning any previous sink entity. Sync decode
-/// is acceptable here: BGM swaps are rare (zone-in, combat
-/// engage) and a 3-min ADPCM track decodes in ~50ms on a modern
-/// CPU. If that proves wrong in practice, lift this into an
+/// True iff `new` represents a different audio file than `prev`.
+/// Compares track ids only — a slot-only change (ZoneDay ↔ ZoneNight
+/// on the same track id) is *not* a swap. Silence ↔ playing IS a
+/// swap on both sides (None vs Some). Pure helper so the invariant
+/// can be tested without the full audio pipeline.
+fn bgm_swap_needed(prev: Option<(u8, u16)>, new: Option<(u8, u16)>) -> bool {
+    prev.map(|(_, t)| t) != new.map(|(_, t)| t)
+}
+
+/// React to the resolved slot. If the resolved *track id* changed
+/// since last frame, decode the new track and crossfade in a fresh
+/// `AudioPlayer` while fading out the previous sink. Sync decode is
+/// acceptable here: BGM swaps are rare (zone-in, combat engage) and
+/// a 3-min ADPCM track decodes in ~50ms on a modern CPU. If that
+/// proves wrong in practice, lift this into an
 /// `AsyncComputeTaskPool` task.
+///
+/// Comparison is on `track_id` alone — not `(slot, track_id)` —
+/// because many zones share one track across ZoneDay and ZoneNight.
+/// When the Vana clock crosses dawn/dusk, `resolve_audible_slot`
+/// switches from slot 0 to slot 1; if both slots carry the same
+/// track id, the file is identical and restarting the sink would
+/// break the loop mid-bar. Slot bookkeeping in `slots.active` is
+/// still updated for diagnostic continuity.
 pub fn apply_bgm_system(
     mut slots: ResMut<BgmSlots>,
     state: Res<BgmPlaybackState>,
@@ -533,7 +553,11 @@ pub fn apply_bgm_system(
         resolve_audible_slot(&slots, &state)
     };
 
-    if resolved == slots.active {
+    if !bgm_swap_needed(slots.active, resolved) {
+        // File unchanged — keep the sink running. Update slot
+        // bookkeeping so future diagnostics reflect the current
+        // resolution (e.g. ZoneDay → ZoneNight with same track id).
+        slots.active = resolved;
         return;
     }
 
@@ -548,9 +572,12 @@ pub fn apply_bgm_system(
         slots.active, resolved, slots.tracks, *state
     );
 
-    // Despawn the previous sink.
+    // Crossfade out the previous sink instead of an instant despawn:
+    // `tick_audio_fades` drops it when the volume tween reaches 0.
     if let Some(e) = slots.active_entity.take() {
-        commands.entity(e).despawn();
+        if let Ok(mut ent) = commands.get_entity(e) {
+            ent.insert(AudioFade::fade_out(BGM_FADE_SECS));
+        }
     }
     slots.active = resolved;
     // New sink coming (or silence) — reset loop tracking so the next
@@ -610,7 +637,11 @@ pub fn apply_bgm_system(
             // `PlaybackSettings::ONCE` because looping is handled
             // inside `PcmSource::next()` — rodio's outer LOOP would
             // restart at sample 0 and ignore the BGW's loop_start.
-            PlaybackSettings::ONCE,
+            // Start at volume 0; `AudioFade::fade_in` ramps up over
+            // `BGM_FADE_SECS` so the new track crossfades against
+            // any previous sink still fading out.
+            PlaybackSettings::ONCE.with_volume(bevy::audio::Volume::Linear(0.0)),
+            AudioFade::fade_in(BGM_FADE_SECS),
         ))
         .id();
     slots.active_entity = Some(entity);
@@ -1123,6 +1154,12 @@ pub struct WeatherSfxEntry {
 /// transition pacing; tunable here for taste.
 pub const WEATHER_FADE_SECS: f32 = 1.0;
 
+/// Crossfade duration applied to BGM track swaps. Slightly longer
+/// than weather because music transitions are more perceptible —
+/// hard cuts on a melody read as glitches; a smooth tail-out plus
+/// head-in feels intentional. Tunable for taste.
+pub const BGM_FADE_SECS: f32 = 1.5;
+
 /// Mapping from LSB `Weather` variants to SE ids. Default = every
 /// entry is `(None, None)` (silent) — operators set ids after
 /// listening through `/sfx <id>`. Indexed by `Weather as usize`.
@@ -1175,8 +1212,9 @@ pub struct WeatherAmbient {
 /// volume tween over `duration` seconds. `t` advances each frame;
 /// when `t >= duration` the system writes the final volume and
 /// removes the component (or despawns the entity if `despawn_on_end`).
+/// Used for both weather-ambient crossfades and BGM crossfades.
 #[derive(Component, Debug, Clone, Copy)]
-pub struct WeatherFade {
+pub struct AudioFade {
     pub from: f32,
     pub to: f32,
     pub t: f32,
@@ -1184,7 +1222,7 @@ pub struct WeatherFade {
     pub despawn_on_end: bool,
 }
 
-impl WeatherFade {
+impl AudioFade {
     fn fade_in(duration: f32) -> Self {
         Self {
             from: 0.0,
@@ -1218,7 +1256,7 @@ pub fn observe_weather_changes(
     mut pcm_assets: ResMut<Assets<PcmAudio>>,
     mut ambient: ResMut<WeatherAmbient>,
     mut sfx_writer: MessageWriter<SfxEvent>,
-    fade_q: Query<Entity, With<WeatherFade>>,
+    fade_q: Query<Entity, With<AudioFade>>,
     mut commands: Commands,
 ) {
     let current = scene.snapshot.weather;
@@ -1233,7 +1271,7 @@ pub fn observe_weather_changes(
         // anything still playing.
         if let Some(e) = ambient.active_entity.take() {
             if let Ok(mut ent) = commands.get_entity(e) {
-                ent.insert(WeatherFade::fade_out(WEATHER_FADE_SECS));
+                ent.insert(AudioFade::fade_out(WEATHER_FADE_SECS));
             }
             ambient.active_weather = None;
         }
@@ -1265,7 +1303,7 @@ pub fn observe_weather_changes(
     // accumulate sinks if weather flips quickly.
     if let Some(e) = ambient.active_entity.take() {
         if let Ok(mut ent) = commands.get_entity(e) {
-            ent.insert(WeatherFade::fade_out(WEATHER_FADE_SECS));
+            ent.insert(AudioFade::fade_out(WEATHER_FADE_SECS));
         }
     }
     // Also catch orphaned faders if scene cleared without us
@@ -1334,7 +1372,7 @@ pub fn observe_weather_changes(
             InGameEntity,
             AudioPlayer(looped_handle),
             PlaybackSettings::ONCE.with_volume(bevy::audio::Volume::Linear(0.0)),
-            WeatherFade::fade_in(WEATHER_FADE_SECS),
+            AudioFade::fade_in(WEATHER_FADE_SECS),
         ))
         .id();
     ambient.active_entity = Some(entity);
@@ -1344,16 +1382,12 @@ pub fn observe_weather_changes(
     );
 }
 
-/// Advance every `WeatherFade` component each frame, applying the
+/// Advance every `AudioFade` component each frame, applying the
 /// interpolated volume to the entity's `AudioSink` and despawning
 /// the entity if `despawn_on_end` and the tween completes.
-pub fn tick_weather_fades(
+pub fn tick_audio_fades(
     time: Res<Time>,
-    mut q: Query<(
-        Entity,
-        &mut WeatherFade,
-        Option<&mut bevy::audio::AudioSink>,
-    )>,
+    mut q: Query<(Entity, &mut AudioFade, Option<&mut bevy::audio::AudioSink>)>,
     mut commands: Commands,
 ) {
     let dt = time.delta_secs();
@@ -1368,7 +1402,7 @@ pub fn tick_weather_fades(
             if fade.despawn_on_end {
                 commands.entity(entity).despawn();
             } else {
-                commands.entity(entity).remove::<WeatherFade>();
+                commands.entity(entity).remove::<AudioFade>();
             }
         }
     }
@@ -1420,7 +1454,7 @@ impl Plugin for AudioPlugin {
                     // precede `play_sfx_system`.
                     observe_weather_changes,
                     play_sfx_system,
-                    tick_weather_fades,
+                    tick_audio_fades,
                 )
                     .chain(),
             );
@@ -1483,6 +1517,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_audible_slot(&slots, &state), None);
+    }
+
+    #[test]
+    fn swap_skipped_when_only_slot_changes() {
+        // The user-visible regression: switching from ZoneDay (slot
+        // 0) to ZoneNight (slot 1) when both slots hold the same
+        // track id used to despawn-and-respawn the sink mid-loop. The
+        // swap predicate must consider only the track id.
+        assert!(!bgm_swap_needed(Some((0, 24)), Some((1, 24))));
+        assert!(!bgm_swap_needed(Some((1, 24)), Some((0, 24))));
+        // Different track ids: real swap.
+        assert!(bgm_swap_needed(Some((0, 24)), Some((1, 25))));
+        // Silence → playing and playing → silence both swap.
+        assert!(bgm_swap_needed(None, Some((0, 24))));
+        assert!(bgm_swap_needed(Some((0, 24)), None));
+        // Silence → silence: no swap.
+        assert!(!bgm_swap_needed(None, None));
     }
 
     #[test]
@@ -1634,7 +1685,7 @@ mod tests {
         let mut slots = BgmSlots::default();
         slots.tracks[0] = Some(101); // ZoneDay filled
         let state = BgmPlaybackState::default(); // engaged_solo=false → zone audible
-        // Unmuted: resolver picks slot 0.
+                                                 // Unmuted: resolver picks slot 0.
         let mute = AudioMuteState::default();
         let resolved = if mute.bgm {
             None
