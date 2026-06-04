@@ -55,6 +55,7 @@ pub mod snapshot;
 pub mod source;
 pub mod sun_moon;
 pub mod target_ring;
+pub mod target_strobe;
 pub mod vana_time;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod weather;
@@ -283,7 +284,8 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                         sync_aggro_system,
                         nameplate::update_nameplates_system,
                         nameplate_billboard::update_nameplate_billboards_system,
-                        target_ring::draw_target_ring_system,
+                        target_strobe::target_strobe_system,
+                        target_ring::draw_target_arrow_system,
                         target_ring::draw_engaged_ring_system,
                         sync_zone_lines_system,
                         atmosphere::apply_zone_atmosphere_system,

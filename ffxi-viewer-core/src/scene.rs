@@ -117,8 +117,6 @@ pub struct EntityMaterials {
     pub mob: Handle<StandardMaterial>,
     pub pet: Handle<StandardMaterial>,
     pub other: Handle<StandardMaterial>,
-    /// Bright yellow + emissive so the targeted entity stands out.
-    pub target: Handle<StandardMaterial>,
     /// Aggro override: saturated red + emissive for mobs targeting the player.
     pub aggro: Handle<StandardMaterial>,
     /// Mob claimed by the player: bright white. Canonical FFXI cue that
@@ -237,12 +235,6 @@ pub fn setup_world(
         mob: mk(Color::srgb(0.95, 0.40, 0.40), &mut materials),
         pet: mk(Color::srgb(0.40, 0.85, 0.50), &mut materials),
         other: mk(Color::srgb(0.60, 0.60, 0.60), &mut materials),
-        target: materials.add(StandardMaterial {
-            base_color: Color::srgb(1.00, 0.95, 0.20),
-            emissive: LinearRgba::new(1.0, 0.95, 0.0, 1.0) * 0.6,
-            perceptual_roughness: 0.4,
-            ..default()
-        }),
         aggro: materials.add(StandardMaterial {
             base_color: Color::srgb(1.00, 0.10, 0.10),
             emissive: LinearRgba::new(1.5, 0.0, 0.0, 1.0),
@@ -354,8 +346,14 @@ pub fn setup_world(
 }
 
 /// Sync wire-side entities with the Bevy world. Spawns new entities,
-/// updates transforms for existing ones, despawns missing ones. Also
-/// applies target highlight and manages HP bars.
+/// updates transforms for existing ones, despawns missing ones.
+///
+/// The selected target is **not** recolored here — classic FFXI leaves
+/// the targeted model at its normal appearance and conveys selection
+/// purely through the floating arrow (`target_ring::draw_target_arrow_system`)
+/// plus a one-shot white strobe on selection (`target_strobe`). Claim
+/// coloring (white/red mob) and aggro red are still applied; only the
+/// old persistent "selected = yellow" tint is gone.
 ///
 /// Heuristic for "self": the snapshot's `self_pos` is the truth, but it
 /// doesn't carry an id. We mirror it as a *synthetic* tracked entity at
@@ -363,7 +361,6 @@ pub fn setup_world(
 /// other world entities.
 pub fn sync_entities_system(
     state: Res<SceneState>,
-    target: Res<Target>,
     mesh: Res<EntityMesh>,
     mats: Res<EntityMaterials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -376,7 +373,7 @@ pub fn sync_entities_system(
     mut q_mat: Query<&mut MeshMaterial3d<StandardMaterial>, With<WorldEntity>>,
     q_nameplates: Query<&Nameplate>,
 ) {
-    if !state.dirty && !target.is_changed() {
+    if !state.dirty {
         return;
     }
 
@@ -403,24 +400,23 @@ pub fn sync_entities_system(
         seen.insert(wire.id);
         hp_by_id.insert(wire.id, wire.hp_pct);
         let world_pos = ffxi_to_bevy(wire.pos);
-        let is_target = target.id == Some(wire.id);
         let is_self = self_char_id != 0 && wire.id == self_char_id;
         // Material selection:
         //   - Self: dedicated `self_pc` material (camera-anchored capsule).
         //   - Mobs: claim-aware (white = self-claim, red = other-claim) so
-        //     ownership is visible regardless of target state.
-        //   - Other PCs/NPCs/pets: target overrides everything else.
-        // `sync_aggro_system` runs after this and rewrites materials for
-        // entities that should glow red — that's why `is_aggro = false`
-        // here.
+        //     ownership is visible at a glance.
+        //   - Other PCs/NPCs/pets: plain per-kind material.
+        // The selected target is deliberately *not* recolored — the arrow
+        // + strobe carry that cue now. `sync_aggro_system` runs after this
+        // and rewrites materials for entities that should glow red, which
+        // is why `is_aggro = false` here.
         let mat = if is_self {
             mats.self_pc.clone()
         } else {
             match wire.kind {
                 EntityKind::Mob => {
-                    pick_mob_material(&mats, wire.claim_id, self_char_id, is_target, false).clone()
+                    pick_mob_material(&mats, wire.claim_id, self_char_id, false).clone()
                 }
-                _ if is_target => mats.target.clone(),
                 _ => pick_material(&mats, wire.kind, false),
             }
         };
@@ -602,7 +598,6 @@ pub fn sync_entities_system(
 pub fn sync_aggro_system(
     mut commands: Commands,
     state: Res<SceneState>,
-    target: Res<Target>,
     mats: Res<EntityMaterials>,
     // Drop the `Without<WorldEntity>` filter that used to live here: the
     // synthetic-id=0 self capsule has been removed, and the real self
@@ -651,7 +646,6 @@ pub fn sync_aggro_system(
 
     for (e, w, t, mut m, has_aggro) in q.iter_mut() {
         let should_aggro = aggroing.get(&w.id).copied().unwrap_or(false);
-        let is_target = Some(w.id) == target.id;
         match (should_aggro, has_aggro.is_some()) {
             (true, false) => {
                 commands.entity(e).insert(Aggroing);
@@ -667,9 +661,7 @@ pub fn sync_aggro_system(
                 // after the player breaks aggro).
                 let restore = if matches!(w.kind, EntityKind::Mob) {
                     let claim = claim_by_id.get(&w.id).copied().unwrap_or(0);
-                    pick_mob_material(&mats, claim, self_char_id, is_target, false).clone()
-                } else if is_target {
-                    mats.target.clone()
+                    pick_mob_material(&mats, claim, self_char_id, false).clone()
                 } else {
                     pick_material(&mats, w.kind, false)
                 };
@@ -715,10 +707,13 @@ fn pick_material(m: &EntityMaterials, kind: EntityKind, is_self: bool) -> Handle
 ///      operator needs to see "this is fighting me" regardless of who
 ///      claimed it (especially the case of a kited claimed mob aggroing
 ///      a passerby).
-///   2. **Target ring** — the operator's selected target. Yellow.
-///   3. **Self-claim** — `claim_id == self_id`, both non-zero. White.
-///   4. **Other-claim** — `claim_id != 0 && claim_id != self_id`. Muted red.
-///   5. **Unclaimed** — `claim_id == 0`. Default mob material (yellow tint).
+///   2. **Self-claim** — `claim_id == self_id`, both non-zero. White.
+///   3. **Other-claim** — `claim_id != 0 && claim_id != self_id`. Muted red.
+///   4. **Unclaimed** — `claim_id == 0`. Default mob material (yellow tint).
+///
+/// Note: selection ("target") is intentionally absent from this chain —
+/// the targeted model keeps its claim/kind color and selection is shown
+/// by the floating arrow + strobe instead.
 ///
 /// `self_id == 0` means "we don't know our own UniqueNo yet"; in that
 /// state we can't distinguish self-claim from other-claim, so any
@@ -727,14 +722,10 @@ pub fn pick_mob_material<'a>(
     mats: &'a EntityMaterials,
     claim_id: u32,
     self_id: u32,
-    is_target: bool,
     is_aggro: bool,
 ) -> &'a Handle<StandardMaterial> {
     if is_aggro {
         return &mats.aggro;
-    }
-    if is_target {
-        return &mats.target;
     }
     if claim_id == 0 {
         return &mats.mob;
@@ -896,7 +887,6 @@ mod tests {
             mob: Handle::default(),
             pet: Handle::default(),
             other: Handle::default(),
-            target: Handle::default(),
             aggro: Handle::default(),
             mob_claimed_self: Handle::default(),
             mob_claimed_other: Handle::default(),
@@ -908,7 +898,7 @@ mod tests {
     #[test]
     fn pick_mob_material_unclaimed_uses_default_mob() {
         let mats = dummy_materials();
-        let h = pick_mob_material(&mats, 0, 0xCAFE, false, false);
+        let h = pick_mob_material(&mats, 0, 0xCAFE, false);
         assert!(std::ptr::eq(h, &mats.mob), "unclaimed mob → mats.mob");
     }
 
@@ -916,7 +906,7 @@ mod tests {
     #[test]
     fn pick_mob_material_self_claim_uses_white() {
         let mats = dummy_materials();
-        let h = pick_mob_material(&mats, 0xCAFE, 0xCAFE, false, false);
+        let h = pick_mob_material(&mats, 0xCAFE, 0xCAFE, false);
         assert!(std::ptr::eq(h, &mats.mob_claimed_self));
     }
 
@@ -926,12 +916,12 @@ mod tests {
     #[test]
     fn pick_mob_material_other_claim_uses_muted_red() {
         let mats = dummy_materials();
-        let h = pick_mob_material(&mats, 0x4242, 0xCAFE, false, false);
+        let h = pick_mob_material(&mats, 0x4242, 0xCAFE, false);
         assert!(
             std::ptr::eq(h, &mats.mob_claimed_other),
             "other player's claim"
         );
-        let h_unknown_self = pick_mob_material(&mats, 0x4242, 0, false, false);
+        let h_unknown_self = pick_mob_material(&mats, 0x4242, 0, false);
         assert!(
             std::ptr::eq(h_unknown_self, &mats.mob_claimed_other),
             "unknown self_id falls through to other-claim",
@@ -944,27 +934,12 @@ mod tests {
     #[test]
     fn pick_mob_material_aggro_overrides_claim() {
         let mats = dummy_materials();
-        let h_self = pick_mob_material(&mats, 0xCAFE, 0xCAFE, false, true);
+        let h_self = pick_mob_material(&mats, 0xCAFE, 0xCAFE, true);
         assert!(std::ptr::eq(h_self, &mats.aggro), "aggro > self-claim");
-        let h_other = pick_mob_material(&mats, 0x4242, 0xCAFE, false, true);
+        let h_other = pick_mob_material(&mats, 0x4242, 0xCAFE, true);
         assert!(std::ptr::eq(h_other, &mats.aggro), "aggro > other-claim");
-        let h_unclaimed = pick_mob_material(&mats, 0, 0xCAFE, false, true);
+        let h_unclaimed = pick_mob_material(&mats, 0, 0xCAFE, true);
         assert!(std::ptr::eq(h_unclaimed, &mats.aggro), "aggro > unclaimed");
-        // Aggro also beats target highlight — the existing system already
-        // had this implicit ordering; the helper makes it explicit.
-        let h_target_too = pick_mob_material(&mats, 0xCAFE, 0xCAFE, true, true);
-        assert!(std::ptr::eq(h_target_too, &mats.aggro), "aggro > target");
-    }
-
-    /// Target ring beats claim coloring (when not aggroing): the operator
-    /// needs the "this is what I selected" cue regardless of who claimed
-    /// it. Aggro still beats target — the priority chain is aggro >
-    /// target > claim > unclaimed.
-    #[test]
-    fn pick_mob_material_target_overrides_claim_when_not_aggro() {
-        let mats = dummy_materials();
-        let h = pick_mob_material(&mats, 0xCAFE, 0xCAFE, true, false);
-        assert!(std::ptr::eq(h, &mats.target));
     }
 
     /// At exactly the snap threshold, snap (not lerp). Below threshold,

@@ -302,7 +302,7 @@ fn dot_color(kind: EntityKind, is_target: bool, is_locked: bool) -> Color {
         return Color::srgb(1.0, 0.4, 0.8);
     }
     if is_target {
-        return Color::srgb(1.0, 0.95, 0.2); // matches mats.target yellow
+        return Color::srgb(1.0, 0.95, 0.2); // matches the target arrow yellow
     }
     match kind {
         EntityKind::Pc => Color::srgb(0.40, 0.85, 1.00),
