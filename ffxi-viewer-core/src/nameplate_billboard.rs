@@ -41,6 +41,7 @@ use std::sync::Arc;
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{Image, ImageSampler};
+use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use ffxi_viewer_wire::EntityKind;
@@ -241,6 +242,8 @@ pub fn spawn_nameplate_billboard(
             // flash at (0,0,0).
             Transform::from_translation(Vec3::new(0.0, -1_000_000.0, 0.0)),
             Visibility::Hidden,
+            NotShadowCaster,
+            NotShadowReceiver,
         ))
         .id()
 }
