@@ -12,9 +12,13 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Keyring service name used for every cached launcher password. The
-/// per-account key is built by [`keyring_account_key`].
-pub const KEYRING_SERVICE: &str = "ffxi-mcp";
+/// Keyring service name used for every cached launcher password — this
+/// is the label macOS surfaces in its Keychain-access prompt, so it
+/// names the *app*, not an internal codename. (Was `"ffxi-mcp"`, a
+/// historical leak from the MCP-only era; the on-disk config dir keeps
+/// that name but the user-facing secret does not.) The per-account key
+/// is built by [`keyring_account_key`].
+pub const KEYRING_SERVICE: &str = "ffxi-client";
 
 /// Mirror of `auth_client::AuthFlavor` for on-disk serialization. Kept
 /// separate so the on-disk schema doesn't drift if `AuthFlavor` ever

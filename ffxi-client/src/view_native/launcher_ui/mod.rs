@@ -692,6 +692,7 @@ pub(crate) fn register(
 
     app.add_sub_state::<LauncherState>()
         .insert_resource(form)
+        .insert_resource(login::LoginUiDirty::default())
         .insert_resource(LoginErrorMsg::default())
         .insert_resource(RuntimeHandle(runtime))
         .insert_resource(ServerInfo {
@@ -796,6 +797,7 @@ pub(crate) fn register(
                 direct_mode_login_autostart,
                 login::keyboard_input_system,
                 login::redraw_login_form_system,
+                login::rebuild_login_ui_system,
             )
                 .run_if(in_state(LauncherState::Login)),
         );
@@ -1061,8 +1063,17 @@ fn decide_initial_screen(
     if !err.0.is_empty() {
         return;
     }
-    // If the account-picker already prefilled the form, don't touch.
+    // If a chip / prefill already populated the form, don't touch.
     if !form.user.is_empty() {
+        return;
+    }
+    // If the user has explicitly picked a server (via ServerSelect or a
+    // prior prefill), STAY on Login — its form is the entry point for a
+    // brand-new account, even when the picked server has zero saved
+    // accounts. Without this guard, picking a fresh server bounces
+    // straight back to ServerSelect every `OnEnter(Login)`, stranding
+    // the user with no way to type a new login.
+    if server_form.selected.is_some() {
         return;
     }
     let store = ffxi_client::launcher_store::load();
