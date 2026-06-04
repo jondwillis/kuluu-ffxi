@@ -210,6 +210,13 @@ impl Plugin for HudPlugin {
         // Update tick after `OnEnter(InGame)` panics on missing resource.
         app.init_resource::<zone_flash::ZoneFlashState>();
         app.init_resource::<self_hud::SelfHealTracker>();
+        // Status-icon sprite cache + DAT-root handle. The cache is a
+        // persistent asset cache (icon sheet is session-invariant); the
+        // front-end fills `StatusIconDatRoot` from the same DatRoot Arc
+        // it hands the minimap. Both default to empty/None so the ribbon
+        // degrades to numeric chips when no install is reachable.
+        app.init_resource::<status_ribbon::StatusIconCache>();
+        app.init_resource::<status_ribbon::StatusIconDatRoot>();
         app.init_resource::<target_panel::SwingPulse>();
         app.init_resource::<logout_countdown::LogoutCountdownAnchor>();
         app.init_resource::<logout_countdown::OptimisticLogoutCountdown>();

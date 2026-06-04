@@ -249,6 +249,12 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         .insert_resource(ffxi_viewer_core::minimap::retail::MinimapDatRoot(
             dat_root.clone(),
         ))
+        // Same Arc again for the status-icon ribbon: it resolves the
+        // status-icon sheet (file_id 87, ROM/119/57.DAT) to a disk path.
+        // Without it the ribbon falls back to numeric chips.
+        .insert_resource(ffxi_viewer_core::hud::status_ribbon::StatusIconDatRoot(
+            dat_root.clone(),
+        ))
         .insert_resource(DatRootRes(dat_root));
     #[cfg(unix)]
     app.insert_resource(AgentListen(agent_listen));
