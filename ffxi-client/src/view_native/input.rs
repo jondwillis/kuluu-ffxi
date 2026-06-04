@@ -92,13 +92,22 @@ const PITCH_STEP_HELD: f32 = 0.015;
 /// Sustained A/D hold required to cancel autorun. A brief tap (single
 /// 50 ms tick) won't trip this; a held sidestep will.
 const STRAFE_CANCEL_MS: u64 = 300;
-/// Yalms-per-second contributed per unit of server-set speed. FFXI base
-/// `speed = 25` gives 25 × 0.2 = 5 yalms/sec, matching the documented
-/// "FFXI base ~5 yalms/sec" reactor comment. Step per tick is then
+/// Yalms-per-second per unit of *server-set* speed — the engine's fixed
+/// speed-unit→yalms conversion, not a per-server tuning knob. The dynamic
+/// term is `self_pos.speed`, which the server pushes in every CHAR_PC /
+/// 0x0A `PosHead` (`UpdateSpeed()` → gear/buff/weight-modified). LSB's
+/// `BASE_SPEED = 50` (settings/default/map.lua) renders as the documented
+/// retail ~5 yalms/sec, so the conversion is 5 / 50 = 0.1. A classic
+/// server sending a lower base byte therefore renders proportionally
+/// slower (40 → 4 yps); haste gear pushing speed > base renders faster.
+/// This matches the reactor's own "5 yalms/sec base" assumption
+/// (`reactor.rs` `max_step_per_tick`); the previous 0.2 assumed a base of
+/// 25 the server never sends, doubling local speed and desyncing the
+/// avatar from server-confirmed position. Step per tick is
 /// `speed * SPEED_TO_YPS * delta_secs` — frame-rate-independent so the
 /// dispatch rate (currently 60 Hz; see `view_native::mod`) can change
 /// without retuning movement speed.
-const SPEED_TO_YPS: f32 = 0.2;
+const SPEED_TO_YPS: f32 = 0.1;
 
 /// Retail movement-speed caps applied per direction (post reactor speed
 /// scaling). Backing up is half-speed; pure strafe is three-quarters;
