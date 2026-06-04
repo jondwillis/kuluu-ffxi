@@ -77,9 +77,7 @@ impl Default for SkyboxGradientMaterial {
         let zenith = Vec4::new(0.55, 0.75, 0.95, 1.0);
         Self {
             data: SkyboxUniform {
-                colors: [
-                    horizon, horizon, mid, mid, mid, zenith, zenith, zenith,
-                ],
+                colors: [horizon, horizon, mid, mid, mid, zenith, zenith, zenith],
                 // Spread 8 altitudes evenly across [-1, 1]. Lotus does
                 // nonlinear spacing per zone — we'll overwrite this once
                 // a real WeatherRecord arrives.

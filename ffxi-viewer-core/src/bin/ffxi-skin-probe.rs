@@ -19,7 +19,9 @@ fn main() {
     if args.len() < 4 {
         eprintln!(
             "usage: {} <skel_file_id> <mesh_file_id> <mesh_chunk_idx>",
-            args.first().map(String::as_str).unwrap_or("ffxi-skin-probe")
+            args.first()
+                .map(String::as_str)
+                .unwrap_or("ffxi-skin-probe")
         );
         std::process::exit(2);
     }

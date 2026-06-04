@@ -388,7 +388,9 @@ impl Default for MsaaCaps {
     /// WebGPU-spec floor: every conformant device supports 1 and 4.
     /// Used until [`init_msaa_caps_system`] queries the real adapter.
     fn default() -> Self {
-        Self { mask: (1 << 1) | (1 << 4) }
+        Self {
+            mask: (1 << 1) | (1 << 4),
+        }
     }
 }
 
@@ -422,8 +424,12 @@ pub fn init_msaa_caps_system(
         // (view depth target) — both must support the chosen sample
         // count or Bevy's `prepare_view_targets` / `prepare_core_3d_depth_textures`
         // will panic at create_texture time, before any Update reactor runs.
-        let color = adapter.get_texture_format_features(TextureFormat::Rgba16Float).flags;
-        let depth = adapter.get_texture_format_features(TextureFormat::Depth32Float).flags;
+        let color = adapter
+            .get_texture_format_features(TextureFormat::Rgba16Float)
+            .flags;
+        let depth = adapter
+            .get_texture_format_features(TextureFormat::Depth32Float)
+            .flags;
         let mut mask = 0u32;
         for n in [1u32, 2, 4, 8, 16] {
             if color.sample_count_supported(n) && depth.sample_count_supported(n) {

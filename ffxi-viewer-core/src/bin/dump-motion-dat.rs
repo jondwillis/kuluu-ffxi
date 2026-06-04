@@ -25,7 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(motion_id_str) = args.get(1) else {
         eprintln!(
             "usage: {} <motion_dat_id>",
-            args.first().map(String::as_str).unwrap_or("dump-motion-dat")
+            args.first()
+                .map(String::as_str)
+                .unwrap_or("dump-motion-dat")
         );
         eprintln!();
         eprintln!("Motion DAT ids (from lotus PCSkeletonIDs):");
@@ -39,7 +41,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loc = root.resolve(motion_id)?;
     let bytes = fs::read(loc.path_under(root.root()))?;
 
-    println!("motion DAT {motion_id}: {}", loc.path_under(root.root()).display());
+    println!(
+        "motion DAT {motion_id}: {}",
+        loc.path_under(root.root()).display()
+    );
     let mut mo2_count = 0;
     for chunk in walk(&bytes).filter_map(Result::ok) {
         if ChunkKind::from_u8(chunk.kind) != Some(ChunkKind::AnimMo2) {

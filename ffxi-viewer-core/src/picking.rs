@@ -47,7 +47,10 @@ impl Plugin for PickingPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MeshPickingPlugin)
             .init_resource::<HoveredEntity>()
-            .add_systems(Update, (click_to_target_system, update_hovered_entity_system));
+            .add_systems(
+                Update,
+                (click_to_target_system, update_hovered_entity_system),
+            );
     }
 }
 

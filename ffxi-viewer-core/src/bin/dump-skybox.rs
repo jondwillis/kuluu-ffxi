@@ -71,9 +71,13 @@ fn dump_zone(root: &DatRoot, zone_id: u16) -> Result<(), Box<dyn std::error::Err
         println!("  no record at V12:01");
         return Ok(());
     };
-    println!("  @V12:00 floor record V{:02}:{:02}, ceil V{:02}:{:02}",
-        r0.time_minutes / 60, r0.time_minutes % 60,
-        r1.time_minutes / 60, r1.time_minutes % 60);
+    println!(
+        "  @V12:00 floor record V{:02}:{:02}, ceil V{:02}:{:02}",
+        r0.time_minutes / 60,
+        r0.time_minutes % 60,
+        r1.time_minutes / 60,
+        r1.time_minutes % 60
+    );
     for i in 0..8 {
         let c = r0.skybox_colors[i];
         let lin_r = srgb_to_linear(c[0]);
@@ -81,8 +85,7 @@ fn dump_zone(root: &DatRoot, zone_id: u16) -> Result<(), Box<dyn std::error::Err
         let lin_b = srgb_to_linear(c[2]);
         println!(
             "    band {} alt={:.3} srgb=({:.3},{:.3},{:.3}) → linear=({:.3},{:.3},{:.3})",
-            i, r0.skybox_altitudes[i], c[0], c[1], c[2],
-            lin_r, lin_g, lin_b,
+            i, r0.skybox_altitudes[i], c[0], c[1], c[2], lin_r, lin_g, lin_b,
         );
     }
     let _ = &r1;

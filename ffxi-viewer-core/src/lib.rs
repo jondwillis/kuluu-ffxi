@@ -23,15 +23,15 @@ pub mod camera;
 pub mod combat_stance;
 pub mod components;
 pub mod cursor;
-pub mod debug_chat;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod dat_mmb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_d3m;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dat_mmb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_mzb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_vos2;
+pub mod debug_chat;
 pub mod graphics_settings;
 pub mod hud;
 pub mod input_mode;
@@ -41,18 +41,18 @@ pub mod lock_on;
 pub mod look_resolver;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod minimap;
+pub mod moon_material;
 pub mod mouse;
 pub mod nameplate;
 pub mod nameplate_billboard;
 pub mod picking;
 pub mod scene;
 pub mod scheduler_runtime;
+pub mod sky_realism;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod skybox;
 pub mod snapshot;
 pub mod source;
-pub mod moon_material;
-pub mod sky_realism;
 pub mod sun_moon;
 pub mod target_ring;
 pub mod vana_time;
@@ -70,6 +70,7 @@ pub use camera::{
 pub use components::{
     EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
 };
+pub use cursor::{CursorAssets, CursorPlugin, CursorRequests, CursorStyle};
 pub use graphics_settings::{AaMode, GraphicsField, GraphicsSettings, QualityPreset};
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
@@ -78,7 +79,6 @@ pub use input_mode::{
 };
 pub use keybinds::{Action, Bindings, KeyBind, Modifiers, Preset};
 pub use lock_on::{LockOn, ToggleResult as LockOnToggle};
-pub use cursor::{CursorAssets, CursorPlugin, CursorRequests, CursorStyle};
 pub use mouse::{CursorLockRequest, MousePlugin, MousePointer};
 pub use picking::{
     click_to_target_system, resolve_click_target, ClickResolution, HoveredEntity, PickingPlugin,
@@ -88,7 +88,10 @@ pub use scene::{
     sync_aggro_system, sync_entities_system, sync_entity_looks_system, Aggroing, BakedActor,
     EntityMaterials, EntityMesh, Target, TrackedEntities,
 };
-pub use snapshot::{apply_delta, drain_toast_events, ingest_system, EventLog, SceneState, ToastEvent, CHAT_HISTORY_CAP};
+pub use snapshot::{
+    apply_delta, drain_toast_events, ingest_system, EventLog, SceneState, ToastEvent,
+    CHAT_HISTORY_CAP,
+};
 pub use source::SceneSource;
 pub use zone_lines::{
     setup_zone_line_assets, sync_zone_lines_system, ZoneLineAssets, ZoneLineDescriptor,
@@ -236,7 +239,10 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             // Drain VanaTimeSynced events out of the EventLog into the
             // VanaClock resource. Runs after ingest_system so the same
             // frame's events are visible.
-            .add_systems(PreUpdate, vana_time::ingest_vana_time.after(ingest_system::<S>))
+            .add_systems(
+                PreUpdate,
+                vana_time::ingest_vana_time.after(ingest_system::<S>),
+            )
             // The Update tuple needs the world resources `setup_world`
             // inserts (EntityMesh/EntityMaterials/HpBarMesh) — those
             // are `Res<>` params, which Bevy treats as hard requirements
@@ -256,48 +262,48 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                 // execution semantics are identical to a flat 21-tuple.
                 (
                     (
-                    sync_entities_system,
-                    // Stage 2 of look→MMB pipeline: copy each wire
-                    // entity's `look` onto its Bevy entity (when
-                    // changed) and emit a hook system that Stage 3+
-                    // will hang `LoadMmbRequest` dispatch off. Order
-                    // matters: must run after the spawn pass so the
-                    // `TrackedEntities` map is current.
-                    sync_entity_looks_system,
-                    // Inject the launcher-supplied self look when
-                    // the wire snapshot leaves it empty (the LSB
-                    // self-CHAR_PC case). Must run *after*
-                    // sync_entity_looks_system so wire-side data
-                    // wins when present.
-                    scene::ensure_self_lookcomp_system,
-                    process_entity_look_changes,
-                    camera_transition_system,
-                    chase_camera_system,
-                    firstperson_camera_system,
-                    sync_aggro_system,
-                    nameplate::update_nameplates_system,
-                    nameplate_billboard::update_nameplate_billboards_system,
-                    target_ring::draw_target_ring_system,
-                    target_ring::draw_engaged_ring_system,
-                    sync_zone_lines_system,
-                    atmosphere::apply_zone_atmosphere_system,
+                        sync_entities_system,
+                        // Stage 2 of look→MMB pipeline: copy each wire
+                        // entity's `look` onto its Bevy entity (when
+                        // changed) and emit a hook system that Stage 3+
+                        // will hang `LoadMmbRequest` dispatch off. Order
+                        // matters: must run after the spawn pass so the
+                        // `TrackedEntities` map is current.
+                        sync_entity_looks_system,
+                        // Inject the launcher-supplied self look when
+                        // the wire snapshot leaves it empty (the LSB
+                        // self-CHAR_PC case). Must run *after*
+                        // sync_entity_looks_system so wire-side data
+                        // wins when present.
+                        scene::ensure_self_lookcomp_system,
+                        process_entity_look_changes,
+                        camera_transition_system,
+                        chase_camera_system,
+                        firstperson_camera_system,
+                        sync_aggro_system,
+                        nameplate::update_nameplates_system,
+                        nameplate_billboard::update_nameplate_billboards_system,
+                        target_ring::draw_target_ring_system,
+                        target_ring::draw_engaged_ring_system,
+                        sync_zone_lines_system,
+                        atmosphere::apply_zone_atmosphere_system,
                     ),
                     (
-                    // Order matters: update_weather_modifier_system runs
-                    // *after* the zone atmosphere has written fresh base
-                    // ambient values. apply_weather_to_ambient_and_fog
-                    // then multiplies the modifier onto that base. The
-                    // sun system writes time-of-day illuminance, and
-                    // apply_weather_to_sun multiplies the modifier
-                    // onto that — see `weather_fx` module docs for the
-                    // scheduling rationale.
-                    weather_fx::sync_current_weather_from_snapshot,
-                    weather_fx::update_weather_modifier_system,
-                    weather_fx::apply_weather_to_ambient_and_fog_system,
-                    sun_moon::sun_moon_system,
-                    weather_fx::apply_weather_to_sun_system,
-                    weather_fx::manage_weather_particles_system,
-                    weather_fx::update_weather_particles_system,
+                        // Order matters: update_weather_modifier_system runs
+                        // *after* the zone atmosphere has written fresh base
+                        // ambient values. apply_weather_to_ambient_and_fog
+                        // then multiplies the modifier onto that base. The
+                        // sun system writes time-of-day illuminance, and
+                        // apply_weather_to_sun multiplies the modifier
+                        // onto that — see `weather_fx` module docs for the
+                        // scheduling rationale.
+                        weather_fx::sync_current_weather_from_snapshot,
+                        weather_fx::update_weather_modifier_system,
+                        weather_fx::apply_weather_to_ambient_and_fog_system,
+                        sun_moon::sun_moon_system,
+                        weather_fx::apply_weather_to_sun_system,
+                        weather_fx::manage_weather_particles_system,
+                        weather_fx::update_weather_particles_system,
                     ),
                 )
                     .chain()

@@ -1665,8 +1665,7 @@ pub fn tick_skinned_actors(
                 continue;
             };
             let Some(raw) = baked.raw else { continue };
-            let Some(anim) =
-                crate::combat_stance::override_anim_for_skel(actor.dat_id, &prefix)
+            let Some(anim) = crate::combat_stance::override_anim_for_skel(actor.dat_id, &prefix)
             else {
                 continue;
             };
@@ -1679,7 +1678,9 @@ pub fn tick_skinned_actors(
                 if i == 0 {
                     continue;
                 }
-                let Some(&bone_e) = actor.bone_entities.get(i) else { continue };
+                let Some(&bone_e) = actor.bone_entities.get(i) else {
+                    continue;
+                };
                 let (rot, trans, scale) = match anim
                     .frames_for_bone(i)
                     .and_then(|frames| frames.get(frame_idx))
@@ -1791,7 +1792,11 @@ pub fn tick_skinned_actors(
         // *and* the strafe component must dominate.
         let dir_threshold = EntityMotion::MOVE_THRESHOLD * 0.5;
         let clip_id = if engaged {
-            if moving { ClipId::CombatRun } else { ClipId::BattleIdle }
+            if moving {
+                ClipId::CombatRun
+            } else {
+                ClipId::BattleIdle
+            }
         } else if moving {
             let fwd = sample.forward_component;
             let strafe = sample.strafe_component;
@@ -1799,7 +1804,11 @@ pub fn tick_skinned_actors(
                 && strafe.abs() > dir_threshold
                 && fwd.abs() > dir_threshold * 0.5
             {
-                if strafe > 0.0 { ClipId::StrafeRight } else { ClipId::StrafeLeft }
+                if strafe > 0.0 {
+                    ClipId::StrafeRight
+                } else {
+                    ClipId::StrafeLeft
+                }
             } else if fwd < -dir_threshold {
                 ClipId::Backpedal
             } else {
@@ -1825,45 +1834,63 @@ pub fn tick_skinned_actors(
         // Walk (`wlk`) IS present on most PC skel DATs. The probe is
         // still in `directional_anim_for_skel` so that beastman / NPC
         // skels carrying these clips (if any) light up automatically.
-        let resolve = |clip: ClipId| -> Option<(std::sync::Arc<ffxi_dat::anim::Mo2Animation>, f32)> {
-            match clip {
-                ClipId::CombatRun => crate::combat_stance::combat_run_anim_for_skel(actor.dat_id)
-                    .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
-                    .or_else(|| crate::combat_stance::battle_idle_anim_for_skel(actor.dat_id))
-                    .or_else(|| idle_anim_for_file(actor.dat_id))
-                    .map(|a| (a, 1.0)),
-                ClipId::BattleIdle => crate::combat_stance::battle_idle_anim_for_skel(actor.dat_id)
-                    .or_else(|| idle_anim_for_file(actor.dat_id))
-                    .map(|a| (a, 1.0)),
-                ClipId::Run => crate::combat_stance::run_anim_for_skel(actor.dat_id)
-                    .or_else(|| idle_anim_for_file(actor.dat_id))
-                    .map(|a| (a, 1.0)),
-                ClipId::Backpedal => crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"bck")
-                    .map(|a| (a, 1.0))
-                    .or_else(|| {
-                        // No dedicated bck clip on PC skels — play run
-                        // reversed in time to fake the backpedal cycle.
-                        crate::combat_stance::run_anim_for_skel(actor.dat_id).map(|a| (a, -1.0))
-                    })
-                    .or_else(|| idle_anim_for_file(actor.dat_id).map(|a| (a, 1.0))),
-                ClipId::StrafeLeft => crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"stl")
-                    .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
-                    .or_else(|| idle_anim_for_file(actor.dat_id))
-                    .map(|a| (a, 1.0)),
-                ClipId::StrafeRight => crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"str")
-                    .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
-                    .or_else(|| idle_anim_for_file(actor.dat_id))
-                    .map(|a| (a, 1.0)),
-                ClipId::TurnInPlace => crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"trn")
-                    .or_else(|| idle_anim_for_file(actor.dat_id))
-                    .map(|a| (a, 1.0)),
-                ClipId::Walk => crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"wlk")
-                    .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
-                    .or_else(|| idle_anim_for_file(actor.dat_id))
-                    .map(|a| (a, 1.0)),
-                ClipId::Idle => idle_anim_for_file(actor.dat_id).map(|a| (a, 1.0)),
-            }
-        };
+        let resolve =
+            |clip: ClipId| -> Option<(std::sync::Arc<ffxi_dat::anim::Mo2Animation>, f32)> {
+                match clip {
+                    ClipId::CombatRun => {
+                        crate::combat_stance::combat_run_anim_for_skel(actor.dat_id)
+                            .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
+                            .or_else(|| {
+                                crate::combat_stance::battle_idle_anim_for_skel(actor.dat_id)
+                            })
+                            .or_else(|| idle_anim_for_file(actor.dat_id))
+                            .map(|a| (a, 1.0))
+                    }
+                    ClipId::BattleIdle => {
+                        crate::combat_stance::battle_idle_anim_for_skel(actor.dat_id)
+                            .or_else(|| idle_anim_for_file(actor.dat_id))
+                            .map(|a| (a, 1.0))
+                    }
+                    ClipId::Run => crate::combat_stance::run_anim_for_skel(actor.dat_id)
+                        .or_else(|| idle_anim_for_file(actor.dat_id))
+                        .map(|a| (a, 1.0)),
+                    ClipId::Backpedal => {
+                        crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"bck")
+                            .map(|a| (a, 1.0))
+                            .or_else(|| {
+                                // No dedicated bck clip on PC skels — play run
+                                // reversed in time to fake the backpedal cycle.
+                                crate::combat_stance::run_anim_for_skel(actor.dat_id)
+                                    .map(|a| (a, -1.0))
+                            })
+                            .or_else(|| idle_anim_for_file(actor.dat_id).map(|a| (a, 1.0)))
+                    }
+                    ClipId::StrafeLeft => {
+                        crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"stl")
+                            .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
+                            .or_else(|| idle_anim_for_file(actor.dat_id))
+                            .map(|a| (a, 1.0))
+                    }
+                    ClipId::StrafeRight => {
+                        crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"str")
+                            .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
+                            .or_else(|| idle_anim_for_file(actor.dat_id))
+                            .map(|a| (a, 1.0))
+                    }
+                    ClipId::TurnInPlace => {
+                        crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"trn")
+                            .or_else(|| idle_anim_for_file(actor.dat_id))
+                            .map(|a| (a, 1.0))
+                    }
+                    ClipId::Walk => {
+                        crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"wlk")
+                            .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
+                            .or_else(|| idle_anim_for_file(actor.dat_id))
+                            .map(|a| (a, 1.0))
+                    }
+                    ClipId::Idle => idle_anim_for_file(actor.dat_id).map(|a| (a, 1.0)),
+                }
+            };
 
         // Advance / start the cross-fade. After this call the blend's
         // `to_clip` is `clip_id`; on a fresh switch `t = 0`; on a
@@ -1940,7 +1967,8 @@ pub fn tick_skinned_actors(
                         Some(f) => (f.rotation, f.translation, f.scale),
                         None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
                     };
-                    let q_from = Quat::from_xyzw(from_rot[0], from_rot[1], from_rot[2], from_rot[3]);
+                    let q_from =
+                        Quat::from_xyzw(from_rot[0], from_rot[1], from_rot[2], from_rot[3]);
                     let q_to = Quat::from_xyzw(to_rot[0], to_rot[1], to_rot[2], to_rot[3]);
                     let q = q_from.slerp(q_to, blend_t);
                     let t_from = Vec3::from_array(from_trans);
@@ -1949,11 +1977,7 @@ pub fn tick_skinned_actors(
                     let s_from = Vec3::from_array(from_scale_arr);
                     let s_to = Vec3::from_array(to_scale_arr);
                     let s = s_from.lerp(s_to, blend_t);
-                    (
-                        [q.x, q.y, q.z, q.w],
-                        [t.x, t.y, t.z],
-                        [s.x, s.y, s.z],
-                    )
+                    ([q.x, q.y, q.z, q.w], [t.x, t.y, t.z], [s.x, s.y, s.z])
                 }
                 None => (to_rot, to_trans, to_scale_arr),
             };
@@ -2516,4 +2540,3 @@ fn pbr_from_specular(exponent: f32, _intensity: f32) -> (f32, f32) {
     };
     (roughness, 0.0)
 }
-

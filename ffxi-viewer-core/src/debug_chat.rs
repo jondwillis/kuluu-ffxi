@@ -63,9 +63,7 @@ pub fn report_engagement_events_system(
                     .unwrap_or_else(|| format!("0x{:08X}", entity_id));
                 Some(format!("⚔ Engaged by {} (0x{:08X})", name, entity_id))
             }
-            ViewerEvent::LowHp { pct } => {
-                Some(format!("❤ Low HP: self at {}%", pct))
-            }
+            ViewerEvent::LowHp { pct } => Some(format!("❤ Low HP: self at {}%", pct)),
             _ => None,
         };
         if let Some(text) = line {

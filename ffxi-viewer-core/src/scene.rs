@@ -173,10 +173,7 @@ pub struct Target {
 /// Returns `true` if `Target.id` (or `LockOn.target_id`) should be
 /// reset to `None`. `id` of `None` always returns `false` so the
 /// system below can be unconditionally cheap.
-pub fn should_clear_target(
-    id: Option<u32>,
-    entities: &[ffxi_viewer_wire::Entity],
-) -> bool {
+pub fn should_clear_target(id: Option<u32>, entities: &[ffxi_viewer_wire::Entity]) -> bool {
     let Some(id) = id else {
         return false;
     };
@@ -273,14 +270,34 @@ pub fn setup_world(
     // No per-kind offset table at snap time, no per-actor estimate;
     // the mesh literally extends from y=0 upward.
     commands.insert_resource(EntityMesh {
-        default: meshes.add(Capsule3d::new(0.5, 1.4).mesh().build().translated_by(Vec3::Y * (0.5 + 1.4))),
+        default: meshes.add(
+            Capsule3d::new(0.5, 1.4)
+                .mesh()
+                .build()
+                .translated_by(Vec3::Y * (0.5 + 1.4)),
+        ),
         // PCs: noticeably taller and thinner than NPCs so player characters
         // pop visually in the world.
-        pc: meshes.add(Capsule3d::new(0.35, 1.9).mesh().build().translated_by(Vec3::Y * (0.35 + 1.9))),
+        pc: meshes.add(
+            Capsule3d::new(0.35, 1.9)
+                .mesh()
+                .build()
+                .translated_by(Vec3::Y * (0.35 + 1.9)),
+        ),
         // Mobs: boxy. Distinct silhouette from anything humanoid.
-        mob: meshes.add(Cuboid::new(1.1, 1.1, 1.1).mesh().build().translated_by(Vec3::Y * 0.55)),
+        mob: meshes.add(
+            Cuboid::new(1.1, 1.1, 1.1)
+                .mesh()
+                .build()
+                .translated_by(Vec3::Y * 0.55),
+        ),
         // Pets: small capsule, hugs the ground.
-        pet: meshes.add(Capsule3d::new(0.4, 0.6).mesh().build().translated_by(Vec3::Y * (0.4 + 0.6))),
+        pet: meshes.add(
+            Capsule3d::new(0.4, 0.6)
+                .mesh()
+                .build()
+                .translated_by(Vec3::Y * (0.4 + 0.6)),
+        ),
     });
 
     // No placeholder ground plane: the navmesh wireframe overlay
@@ -1014,7 +1031,11 @@ mod tests {
             act_index: 0,
             kind: EntityKind::Mob,
             name: None,
-            pos: WireVec3 { x: 0.0, y: 0.0, z: 0.0 },
+            pos: WireVec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
             heading: 0,
             hp_pct,
             bt_target_id: 0,

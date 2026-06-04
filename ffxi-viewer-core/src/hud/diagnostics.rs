@@ -11,7 +11,10 @@
 //! `HudPlugin`); the smoothed-average value is shown so it doesn't flicker
 //! frame-to-frame.
 
-use bevy::diagnostic::{Diagnostic, DiagnosticPath, Diagnostics, DiagnosticsStore, FrameTimeDiagnosticsPlugin, RegisterDiagnostic};
+use bevy::diagnostic::{
+    Diagnostic, DiagnosticPath, Diagnostics, DiagnosticsStore, FrameTimeDiagnosticsPlugin,
+    RegisterDiagnostic,
+};
 use bevy::prelude::*;
 use ffxi_viewer_wire::BlowfishStatus;
 
@@ -26,8 +29,7 @@ const STALE_THRESHOLD_MS: u64 = 5_000;
 /// shadow passes re-iterate visible meshes) but the proxy tracks
 /// magnitude — going from 200 to 2000 here means the GPU is doing 10×
 /// the draws.
-pub const VISIBLE_MESHES: DiagnosticPath =
-    DiagnosticPath::const_new("ffxi/visible_meshes");
+pub const VISIBLE_MESHES: DiagnosticPath = DiagnosticPath::const_new("ffxi/visible_meshes");
 
 #[derive(Component)]
 pub struct DiagnosticsBar;
@@ -261,10 +263,7 @@ pub fn update_draws_system(
     let Ok(mut text) = draw_q.single_mut() else {
         return;
     };
-    let want = match diagnostics
-        .get(&VISIBLE_MESHES)
-        .and_then(|d| d.smoothed())
-    {
+    let want = match diagnostics.get(&VISIBLE_MESHES).and_then(|d| d.smoothed()) {
         Some(n) => format!("{:.0}", n),
         None => "—".into(),
     };

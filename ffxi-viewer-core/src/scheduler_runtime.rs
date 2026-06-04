@@ -322,10 +322,7 @@ pub fn dispatch_sound_stages(
         // Only sound-kind stages have a Sep to resolve. Particle /
         // Motion / Unknown ignored here (handled elsewhere).
         let kind = ev.stage.stage.kind;
-        if !matches!(
-            kind,
-            StageKind::SoundOnCaster | StageKind::SoundOnTarget
-        ) {
+        if !matches!(kind, StageKind::SoundOnCaster | StageKind::SoundOnTarget) {
             continue;
         }
         let Ok(assets) = q_actors.get(ev.actor) else {
@@ -533,7 +530,10 @@ mod tests {
             ],
         );
         let a = ActiveScheduler::from_scheduler(&sched);
-        assert_eq!(a.stages.iter().map(|t| t.frame).collect::<Vec<_>>(), vec![10, 30, 60]);
+        assert_eq!(
+            a.stages.iter().map(|t| t.frame).collect::<Vec<_>>(),
+            vec![10, 30, 60]
+        );
     }
 
     #[test]

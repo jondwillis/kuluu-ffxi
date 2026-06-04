@@ -197,10 +197,7 @@ const MAX_ENTRY_COUNT: usize = {
 pub fn is_dynamic(kind: MenuKind) -> bool {
     matches!(
         kind,
-        MenuKind::Magic
-            | MenuKind::Abilities
-            | MenuKind::Items
-            | MenuKind::EquipSlot(_)
+        MenuKind::Magic | MenuKind::Abilities | MenuKind::Items | MenuKind::EquipSlot(_)
     )
 }
 
@@ -231,14 +228,21 @@ pub fn entry_label<'a>(kind: MenuKind, idx: usize, dynamic: &'a DynamicMenu) -> 
             .map(|r| r.label.as_str())
             .unwrap_or("<unknown>");
     }
-    static_entries(kind).get(idx).copied().unwrap_or("<unknown>")
+    static_entries(kind)
+        .get(idx)
+        .copied()
+        .unwrap_or("<unknown>")
 }
 
 /// Resolve a dynamic-menu row's dispatch action by cursor index.
 /// Returns `None` when the submenu isn't dynamic, when the resource
 /// is empty (the placeholder row has no action), or when the index
 /// is out of range.
-pub fn entry_action(kind: MenuKind, idx: usize, dynamic: &DynamicMenu) -> Option<DynamicMenuAction> {
+pub fn entry_action(
+    kind: MenuKind,
+    idx: usize,
+    dynamic: &DynamicMenu,
+) -> Option<DynamicMenuAction> {
     if !is_dynamic(kind) {
         return None;
     }
@@ -454,9 +458,7 @@ pub fn refresh_dynamic_menu_rows(
                     if !ffxi_proto::equip_info::fits_slot(&info, equip_slot) {
                         return None;
                     }
-                    if main_job != 0
-                        && !ffxi_proto::equip_info::fits_job(&info, main_job)
-                    {
+                    if main_job != 0 && !ffxi_proto::equip_info::fits_job(&info, main_job) {
                         return None;
                     }
                     if main_lv != 0 && info.level > main_lv {
@@ -523,8 +525,7 @@ pub fn update_main_menu(
             // larger, so we slide a window of `DYNAMIC_VISIBLE_ROWS`
             // around the cursor. Static menus return their natural
             // slice and `viewport_start = 0`.
-            let (total_count, viewport_start) =
-                resolve_viewport(kind, c, &dynamic);
+            let (total_count, viewport_start) = resolve_viewport(kind, c, &dynamic);
             for (row, mut row_node, mut text, mut color) in row_q.iter_mut() {
                 // Map this row's pool index → list index via the
                 // viewport offset. Rows beyond the visible window
@@ -552,13 +553,8 @@ pub fn update_main_menu(
                     row_node.display = Display::Flex;
                 }
                 let is_cursor = list_idx == c;
-                let body = format_row_body(
-                    kind,
-                    list_idx,
-                    &label_owned,
-                    &settings,
-                    &scene.snapshot,
-                );
+                let body =
+                    format_row_body(kind, list_idx, &label_owned, &settings, &scene.snapshot);
                 let want = if is_cursor {
                     format!("> {body}")
                 } else {

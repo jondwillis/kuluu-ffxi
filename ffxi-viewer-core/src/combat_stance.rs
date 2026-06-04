@@ -61,7 +61,7 @@ use crate::snapshot::SceneState;
 /// archive.
 pub fn motion_dat_for_skel(skel_file_id: u32) -> Option<u32> {
     match skel_file_id {
-        7072 => Some(9672),  // Hume M
+        7072 => Some(9672),   // Hume M
         10248 => Some(12848), // Hume F
         13424 => Some(16024), // Elvaan M
         16600 => Some(19200), // Elvaan F
@@ -96,8 +96,7 @@ static HEAL_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = On
 /// Cache for the combat run animation in the motion DAT (`run1`,
 /// 68-bone full rig). PC-only; keyed by motion DAT id like
 /// [`BATTLE_IDLE_ANIMS`].
-static COMBAT_RUN_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> =
-    OnceLock::new();
+static COMBAT_RUN_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = OnceLock::new();
 
 /// Cache for directional locomotion variants resolved by 3-char prefix
 /// against the skeleton DAT. Key is `(skel_file_id, prefix)`.
@@ -535,8 +534,7 @@ pub fn track_entity_motion_system(
         // *directly in Bevy xz* so projection math stays consistent
         // with the Transform we read above.
         let heading_u8 = heading_by_id.get(&world.id).copied().unwrap_or(0);
-        let heading_rad =
-            (heading_u8 as f32) * std::f32::consts::TAU / 256.0;
+        let heading_rad = (heading_u8 as f32) * std::f32::consts::TAU / 256.0;
         // Forward in Bevy xz: heading 0 → (-Z). `Quat::from_rotation_y(-θ)`
         // applied to default forward (0, 0, -1) gives
         // (-sin(-θ), 0, -cos(-θ)) = (sin θ, 0, -cos θ).
@@ -547,11 +545,15 @@ pub fn track_entity_motion_system(
         let right_x = fwd_z;
         let right_z = -fwd_x;
 
-        let prev = motion.by_id.get(&world.id).copied().unwrap_or(MotionSample {
-            last_pos: pos,
-            last_heading_rad: heading_rad,
-            ..Default::default()
-        });
+        let prev = motion
+            .by_id
+            .get(&world.id)
+            .copied()
+            .unwrap_or(MotionSample {
+                last_pos: pos,
+                last_heading_rad: heading_rad,
+                ..Default::default()
+            });
         let dx = pos.x - prev.last_pos.x;
         let dz = pos.z - prev.last_pos.z;
         let vx = dx / dt;
@@ -600,7 +602,9 @@ pub struct ModelViewerClipOverride {
 
 impl ModelViewerClipOverride {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { clip_name: name.into() }
+        Self {
+            clip_name: name.into(),
+        }
     }
 }
 
@@ -641,9 +645,15 @@ pub fn override_anim_for_skel(skel_file_id: u32, prefix: &[u8; 3]) -> Option<Arc
 }
 
 fn for_each_anim_chunk_in_dat(file_id: u32, mut f: impl FnMut(String, Mo2Animation)) {
-    let Ok(root) = DatRoot::from_env_or_default() else { return };
-    let Ok(loc) = root.resolve(file_id) else { return };
-    let Ok(bytes) = fs::read(loc.path_under(root.root())) else { return };
+    let Ok(root) = DatRoot::from_env_or_default() else {
+        return;
+    };
+    let Ok(loc) = root.resolve(file_id) else {
+        return;
+    };
+    let Ok(bytes) = fs::read(loc.path_under(root.root())) else {
+        return;
+    };
     for chunk in walk(&bytes).filter_map(Result::ok) {
         if ChunkKind::from_u8(chunk.kind) != Some(ChunkKind::AnimMo2) {
             continue;
@@ -727,8 +737,7 @@ mod tests {
             return;
         }
         for skel in [7072u32, 10248, 13424, 16600, 19776, 23176, 26352] {
-            let anim =
-                battle_idle_anim_for_skel(skel).expect("battle-idle MO2 missing for skel");
+            let anim = battle_idle_anim_for_skel(skel).expect("battle-idle MO2 missing for skel");
             assert!(
                 anim.frames > 0,
                 "skel {skel}: btl MO2 has zero frames — parse drift?"

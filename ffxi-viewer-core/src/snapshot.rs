@@ -143,11 +143,15 @@ pub struct ToastEvent {
 impl ToastEvent {
     /// System-channel toast (default chat surface).
     pub fn system(text: String) -> Self {
-        Self { line: system_chat_line(text) }
+        Self {
+            line: system_chat_line(text),
+        }
     }
     /// Debug-channel toast (only visible with `/devhud`).
     pub fn debug(text: String) -> Self {
-        Self { line: debug_chat_line(text) }
+        Self {
+            line: debug_chat_line(text),
+        }
     }
 }
 
@@ -158,10 +162,7 @@ impl ToastEvent {
 /// Runs in `PostUpdate` so toasts emitted anywhere in `Update` land
 /// in `local_toasts` before the chat panel renders next frame's
 /// `rendered_chat`.
-pub fn drain_toast_events(
-    mut state: ResMut<SceneState>,
-    mut events: MessageReader<ToastEvent>,
-) {
+pub fn drain_toast_events(mut state: ResMut<SceneState>, mut events: MessageReader<ToastEvent>) {
     for ev in events.read() {
         state.push_local_toast(ev.line.clone());
     }
