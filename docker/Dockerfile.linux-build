@@ -1,0 +1,53 @@
+# Linux x86_64 build environment for `ffxi-client` (native-window),
+# targeting the Steam Deck (SteamOS / Arch, glibc >= 2.37).
+#
+# We build on Debian *bookworm* (glibc 2.36) deliberately: a binary
+# linked against an OLDER glibc runs on the Deck's NEWER glibc, but not
+# vice-versa. Everything links dynamically against libraries SteamOS
+# already ships (ALSA, Mesa/Vulkan, X11, Wayland, libxkbcommon, dbus).
+#
+# The image carries only the toolchain. The workspace is bind-mounted at
+# `docker run` time (see docker/build-linux.sh) so the 19 GB `vendor/Game`
+# install never enters the build context and `target/` stays a Linux-only
+# dir separate from the host's macOS artifacts.
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# When this image is built under emulation on Apple Silicon (colima's
+# Rosetta), apt's `gpgv` signature check mis-executes and fails with
+# "At least one invalid signature was encountered". Marking the sources
+# `[trusted=yes]` skips gpgv entirely (no signature verification), which
+# is acceptable for a throwaway local build container fetching over the
+# official Debian mirrors. Replaces the deb822 default sources file.
+RUN rm -f /etc/apt/sources.list.d/debian.sources && printf '%s\n' \
+        'deb [trusted=yes] http://deb.debian.org/debian bookworm main' \
+        'deb [trusted=yes] http://deb.debian.org/debian bookworm-updates main' \
+        'deb [trusted=yes] http://deb.debian.org/debian-security bookworm-security main' \
+        > /etc/apt/sources.list
+
+# Build-time system deps:
+#   clang / cmake / pkg-config / make  — recastnavigation-rs (cxx-build) + -sys crates
+#   libasound2-dev                     — bevy_audio -> cpal -> alsa
+#   libudev-dev                        — bevy_gilrs -> gilrs (gamepad hotplug)
+#   libdbus-1-dev                      — keyring (Secret Service, remember-password)
+#   libwayland-dev libxkbcommon-dev    — winit Wayland backend
+#   libx11/xcursor/xrandr/xi-dev       — winit X11 backend (Desktop Mode / Xwayland)
+#   libgl1-mesa-dev                    — GL headers some transitive deps probe
+#   perl                               — ring asm path (belt-and-suspenders)
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update \
+    && apt-get install -y --no-install-recommends --allow-unauthenticated \
+        ca-certificates curl git pkg-config make cmake clang \
+        libasound2-dev libudev-dev libdbus-1-dev \
+        libwayland-dev libxkbcommon-dev \
+        libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+        libgl1-mesa-dev perl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin a recent stable Rust. CARGO_HOME/registry are redirected to a
+# mounted volume by the run script so the crate cache survives rebuilds.
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal
+
+WORKDIR /src

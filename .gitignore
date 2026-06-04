@@ -54,3 +54,6 @@ vendor/RZN-mapviewer/
 # blob limit. Regenerate locally via the wasm toolchain.
 ffxi-viewer-wasm/dist/
 profile.json.gz
+
+# Container-built Linux binaries (docker/build-linux.sh)
+/dist/
