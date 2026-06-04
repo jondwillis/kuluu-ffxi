@@ -26,7 +26,6 @@
 //! directly.
 
 use std::f32::consts::PI;
-use std::time::SystemTime;
 
 use bevy::prelude::*;
 
@@ -108,17 +107,6 @@ pub struct VanaSky {
     pub sun_altitude: f32,
     /// Moon altitude angle in radians. Negative = below horizon.
     pub moon_altitude: f32,
-}
-
-/// Sample Vana'diel sky state from system time (no server anchor).
-/// Prefer [`vana_sky_from_clock`] in systems where a [`crate::vana_time::VanaClock`]
-/// is available.
-pub fn vana_sky_now() -> VanaSky {
-    let earth_now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(EARTH_EPOCH_UNIX as f64);
-    vana_sky_from_unix(earth_now)
 }
 
 /// Sample Vana'diel sky state from a server-anchored [`crate::vana_time::VanaClock`].
@@ -542,8 +530,7 @@ pub fn sun_moon_system(
                 - crate::hud::vana_clock::EARTH_EPOCH_UNIX as f64)
                 .max(0.0);
             let total_v_days = (earth_since * 25.0 / 86400.0) as u64;
-            let weekday =
-                crate::hud::vana_clock::VANA_WEEKDAYS[(total_v_days % 8) as usize];
+            let weekday = crate::hud::vana_clock::VANA_WEEKDAYS[(total_v_days % 8) as usize];
             toasts.write(crate::snapshot::ToastEvent::system(format!(
                 "☾ Moon: {} ({:.0}% illuminated) — {}",
                 MOON_PHASE_NAMES[phase_bucket as usize],
@@ -600,8 +587,7 @@ pub fn sun_moon_system(
     let moon_altitude = moon_dir.y.asin();
     sky.moon_altitude = moon_altitude;
     let moon_pos = moon_dir * LIGHT_DISTANCE;
-    let (moon_color, moon_lux) =
-        moon_color_for_phase(sky.moon_illumination, sky.moon_altitude);
+    let (moon_color, moon_lux) = moon_color_for_phase(sky.moon_illumination, sky.moon_altitude);
     if let Ok((mut light, mut xf)) = q_moon.single_mut() {
         light.color = moon_color;
         light.illuminance = moon_lux;
