@@ -77,6 +77,38 @@ pub fn map_count_for_zone(zone_id: u16) -> usize {
         .count()
 }
 
+/// Retail status-effect icon sheet. `DatRoot::resolve(STATUS_ICON_FILE_ID)`
+/// lands on `ROM/119/57.DAT` on the dev install — a flat array of 640
+/// fixed-size blocks, one per `status_id` (the same id space the 0x063
+/// STATUS_ICONS packet carries, and HXUI's `0.png..639.png` theme files).
+///
+/// Each block embeds a standard [`parse_graphic`] chunk (flag `0x91`,
+/// category `sts_icon`, 32×32, 32bpp BGRA) at byte `STATUS_ICON_GRAPHIC_OFFSET`
+/// within the block. The file is neither chunk-framed (`crate::walk`
+/// misses it) nor paletted (`scan_graphics` misses it), so index by block.
+pub const STATUS_ICON_FILE_ID: u32 = 87;
+/// Bytes per icon block in the status-icon sheet.
+pub const STATUS_ICON_BLOCK_STRIDE: usize = 0x1800;
+/// Offset of the `0x91` Graphic flag byte within each block.
+pub const STATUS_ICON_GRAPHIC_OFFSET: usize = 0x284;
+/// Number of icon blocks in the sheet (`status_id` 0..=639).
+pub const STATUS_ICON_COUNT: usize = 640;
+
+/// Decode the status-effect icon for `status_id` from the raw bytes of
+/// the status-icon DAT (`STATUS_ICON_FILE_ID`). Returns `None` when the
+/// id is out of range, the block is truncated, or the embedded Graphic
+/// doesn't parse (e.g. an empty/placeholder slot).
+pub fn status_icon_at(dat_bytes: &[u8], status_id: u16) -> Option<GraphicImage> {
+    let id = status_id as usize;
+    if id >= STATUS_ICON_COUNT {
+        return None;
+    }
+    let block_start = id * STATUS_ICON_BLOCK_STRIDE + STATUS_ICON_GRAPHIC_OFFSET;
+    let block_end = (id + 1) * STATUS_ICON_BLOCK_STRIDE;
+    let chunk = dat_bytes.get(block_start..block_end)?;
+    parse_graphic(chunk).ok().flatten().map(|(img, _)| img)
+}
+
 /// Graphic chunk flag byte. Decides which pixel-data layout follows
 /// the BITMAPINFOHEADER.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,17 +207,25 @@ pub fn parse_graphic(bytes: &[u8]) -> Result<Option<(GraphicImage, usize)>> {
 
     match flag {
         GraphicFlag::Bitmap | GraphicFlag::AlphaBitmap => {
-            let with_alpha = matches!(flag, GraphicFlag::AlphaBitmap);
-            let (rgba, consumed) = decode_paletted_bitmap(
-                &bytes[57..],
-                width_u,
-                height_u,
-                bit_count,
-                used_colors,
-                with_alpha,
-                top_down,
-                compression,
-            )?;
+            // 8bpp ships a palette; 32bpp ships packed BGRA inline. FFXI's
+            // status-effect icons (`sts_icon`, ROM/119/57.DAT) are the
+            // 32bpp case — the 8bpp `decode_paletted_bitmap` rejects them
+            // (`used_colors == 0`, no palette), so route by `bit_count`.
+            let (rgba, consumed) = if bit_count == 32 {
+                decode_packed_bgra32(&bytes[57..], width_u, height_u, top_down, compression)?
+            } else {
+                let with_alpha = matches!(flag, GraphicFlag::AlphaBitmap);
+                decode_paletted_bitmap(
+                    &bytes[57..],
+                    width_u,
+                    height_u,
+                    bit_count,
+                    used_colors,
+                    with_alpha,
+                    top_down,
+                    compression,
+                )?
+            };
             Ok(Some((
                 GraphicImage {
                     category,
@@ -326,6 +366,51 @@ fn decode_paletted_bitmap(
     Ok((rgba, palette_len + pixel_data_len))
 }
 
+/// Decode a 32bpp packed BGRA bitmap (no palette). Used by FFXI's
+/// status-effect icons. Each pixel is 4 bytes on disk in B, G, R, A
+/// order; rows are bottom-up unless `top_down`. Alpha is FFXI's 7-bit
+/// convention (0..=0x80), scaled to 8-bit by `(a * 2).min(255)` — the
+/// same rule [`crate::texture`] applies to DXT alpha.
+fn decode_packed_bgra32(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    top_down: bool,
+    compression: u32,
+) -> Result<(Vec<u8>, usize)> {
+    if compression != 0 {
+        return Err(DatError::Mmb(format!(
+            "32bpp bitmap with compression={compression}: only BI_RGB (uncompressed) is supported"
+        )));
+    }
+    // 32bpp rows are inherently 4-byte aligned, so the BMP scanline
+    // padding is a no-op; stride == width * 4.
+    let row_stride = width as usize * 4;
+    let pixel_data_len = row_stride * height as usize;
+    if bytes.len() < pixel_data_len {
+        return Err(DatError::Mmb(format!(
+            "32bpp bitmap: pixel data truncated (need {pixel_data_len} bytes, have {})",
+            bytes.len()
+        )));
+    }
+
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height as usize {
+        let src_y = if top_down { y } else { height as usize - 1 - y };
+        let src = src_y * row_stride;
+        for x in 0..width as usize {
+            let s = src + x * 4;
+            let dst = (y * width as usize + x) * 4;
+            rgba[dst] = bytes[s + 2]; // R
+            rgba[dst + 1] = bytes[s + 1]; // G
+            rgba[dst + 2] = bytes[s]; // B
+            // FFXI 7-bit alpha (0..=0x80) → 8-bit.
+            rgba[dst + 3] = ((bytes[s + 3] as u16) * 2).min(255) as u8;
+        }
+    }
+    Ok((rgba, pixel_data_len))
+}
+
 #[inline]
 fn read_ascii_field(bytes: &[u8]) -> String {
     let s: String = bytes
@@ -450,6 +535,71 @@ mod tests {
         // — proves the Err is routed into the advance-by-one path.
         let v: Vec<_> = scan_graphics(&bytes).collect();
         assert!(v.is_empty());
+    }
+
+    /// Synthetic 2×2 32bpp packed-BGRA bitmap (bottom-up, the FFXI
+    /// status-icon case). Validates the BGRA→RGBA swap, the 7-bit
+    /// alpha doubling, and bottom-up row normalization.
+    #[test]
+    fn parse_graphic_decodes_32bpp_packed_bgra() {
+        let mut bytes = vec![0x91u8];
+        bytes.extend_from_slice(b"sts_icon"); // 8-byte category
+        bytes.extend_from_slice(b"st01_32 "); // 8-byte id
+        bytes.extend_from_slice(&40u32.to_le_bytes()); // bmi_size
+        bytes.extend_from_slice(&2i32.to_le_bytes()); // width
+        bytes.extend_from_slice(&2i32.to_le_bytes()); // height (positive = bottom-up)
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // planes
+        bytes.extend_from_slice(&32u16.to_le_bytes()); // bit_count = 32
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // compression
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // image_size
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // x_pels
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // y_pels
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // used_colors = 0 (no palette)
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // important_colors
+                                                      // Pixels, BGRA, bottom-up. Disk row 0 = bottom output row.
+                                                      // alpha 0x80 (=128) must scale to 255 (opaque).
+        bytes.extend_from_slice(&[0x00, 0x00, 0xFF, 0x80]); // (0,0) disk: red, opaque
+        bytes.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00]); // (1,0) disk: blue, transparent
+        bytes.extend_from_slice(&[0x00, 0xFF, 0x00, 0x40]); // (0,1) disk: green, alpha 64→128
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x80]); // (1,1) disk: black, opaque
+
+        let (img, _consumed) = parse_graphic(&bytes).unwrap().unwrap();
+        assert_eq!(img.category, "sts_icon");
+        assert_eq!((img.width, img.height), (2, 2));
+        // Output row 0 is disk's bottom row (disk row 1): green, black.
+        assert_eq!(&img.rgba[0..4], &[0x00, 0xFF, 0x00, 0x80]); // green, 64→128
+        assert_eq!(&img.rgba[4..8], &[0x00, 0x00, 0x00, 0xFF]); // black, opaque
+        // Output row 1 is disk's top row (disk row 0): red, blue.
+        assert_eq!(&img.rgba[8..12], &[0xFF, 0x00, 0x00, 0xFF]); // red, opaque
+        assert_eq!(&img.rgba[12..16], &[0x00, 0x00, 0xFF, 0x00]); // blue, transparent
+    }
+
+    /// `status_icon_at` indexes block `N` and parses the embedded
+    /// Graphic at the fixed sub-offset. Builds a minimal two-block
+    /// sheet and checks id 1 resolves to the second block's icon.
+    #[test]
+    fn status_icon_at_indexes_blocks() {
+        // One real 1×1 32bpp Graphic, placed at GRAPHIC_OFFSET in block 1.
+        let mut graphic = vec![0x91u8];
+        graphic.extend_from_slice(b"sts_icon");
+        graphic.extend_from_slice(b"st01_32 ");
+        graphic.extend_from_slice(&40u32.to_le_bytes());
+        graphic.extend_from_slice(&1i32.to_le_bytes()); // width 1
+        graphic.extend_from_slice(&1i32.to_le_bytes()); // height 1
+        graphic.extend_from_slice(&1u16.to_le_bytes());
+        graphic.extend_from_slice(&32u16.to_le_bytes());
+        graphic.extend_from_slice(&[0u8; 24]); // comp..important
+        graphic.extend_from_slice(&[0x11, 0x22, 0x33, 0x80]); // B,G,R,A
+
+        let mut sheet = vec![0u8; 2 * STATUS_ICON_BLOCK_STRIDE];
+        let at = STATUS_ICON_BLOCK_STRIDE + STATUS_ICON_GRAPHIC_OFFSET;
+        sheet[at..at + graphic.len()].copy_from_slice(&graphic);
+
+        let img = status_icon_at(&sheet, 1).expect("block 1 decodes");
+        assert_eq!((img.width, img.height), (1, 1));
+        assert_eq!(&img.rgba[0..4], &[0x33, 0x22, 0x11, 0xFF]); // R,G,B,A(opaque)
+        // Out-of-range id is None, not a panic.
+        assert!(status_icon_at(&sheet, STATUS_ICON_COUNT as u16).is_none());
     }
 
     /// Synthetic 2×2 paletted bitmap with a top-down row order
