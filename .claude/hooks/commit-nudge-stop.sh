@@ -44,20 +44,27 @@ file_count=$(printf '%s\n' "$session_lines" | grep -c . || true)
 
 # ─── TUNE-ME ───────────────────────────────────────────────────
 # Stop fires every turn end. The block below re-invokes the agent so it
-# can decide whether to commit — without the user sending a message. To
-# keep that from happening on *every* turn while the agent legitimately
-# defers, throttle to once per session per window. Knobs:
-#   - Higher file floor:  if [ "$file_count" -lt 3 ]; then exit 0; fi
-#   - Throttle window (seconds):
-THROTTLE_SECS=300
+# can decide whether to commit — without the user sending a message.
+#
+# Guard is CHANGE-BASED, not time-based: re-block only when the session's
+# uncommitted work differs from what the agent last saw and declined. A
+# pure timer would swallow a commit-worthy unit that lands inside the
+# window; signing the actual work instead means every new change-set gets
+# its own shot, however fast it arrives, while an already-declined,
+# unchanged pile stays quiet. Signature = the session file list + the
+# tracked-content diff, so both a new file and more edits to an
+# already-listed file count as "new work".
+#   - Add a floor if you only want larger piles:
+#       if [ "$file_count" -lt 3 ]; then exit 0; fi
 if [ "$file_count" -lt 1 ]; then exit 0; fi
 
-throttle_file="$snap_dir/${session_id}.last-nudge"
-if [ -f "$throttle_file" ] && \
-   [ $(($(date +%s) - $(stat -f %m "$throttle_file"))) -lt "$THROTTLE_SECS" ]; then
-  exit 0
+sig=$( { printf '%s\n' "$session_lines"; git -C "$cwd" diff HEAD 2>/dev/null; } \
+  | shasum -a 256 | cut -d' ' -f1)
+sig_file="$snap_dir/${session_id}.sig"
+if [ -f "$sig_file" ] && [ "$(cat "$sig_file")" = "$sig" ]; then
+  exit 0  # identical to the work the agent already decided on — don't re-ask
 fi
-touch "$throttle_file"
+printf '%s' "$sig" > "$sig_file"
 # ───────────────────────────────────────────────────────────────
 
 shown=$(printf '%s\n' "$session_lines" | head -20)
@@ -71,7 +78,7 @@ fi
 # changes form one or more coherent, uncontroversial commits, and either
 # commits them (scoped `git add <paths>`, never `-A` — sibling sessions
 # may have unrelated edits in this tree) or stops if the work is mid-flight.
-reason=$(printf 'Stop-hook checkpoint: this session produced %s uncommitted file(s):\n%s\n\nDecide — do these form one or more coherent, uncontroversial commits? If so, commit now with scoped `git add <paths>` (NEVER `git add -A`; other sessions may have unrelated edits) and a clear message. If the work is mid-flight or not yet coherent, do nothing and stop. This checkpoint fires at most once per %ss, so deferring is fine.' \
-  "$file_count" "$shown" "$THROTTLE_SECS")
+reason=$(printf 'Stop-hook checkpoint: this session produced %s uncommitted file(s):\n%s\n\nDecide — do these form one or more coherent, uncontroversial commits? If so, commit now with scoped `git add <paths>` (NEVER `git add -A`; other sessions may have unrelated edits) and a clear message. If the work is mid-flight or not yet coherent, do nothing and stop. Deferring is fine — this checkpoint stays quiet until the uncommitted work changes again, then re-asks.' \
+  "$file_count" "$shown")
 
 jq -n --arg r "$reason" '{ decision: "block", reason: $r }'
