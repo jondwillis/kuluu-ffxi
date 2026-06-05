@@ -76,7 +76,7 @@ pub struct SwingPulse {
 /// distinct pulses, not a continuous glow.
 const PULSE_DECAY_SECS: f32 = 0.25;
 
-const PANEL_WIDTH_PX: f32 = 280.0;
+const PANEL_WIDTH_PX: f32 = 220.0;
 const HP_BAR_WIDTH_PX: f32 = 200.0;
 const HP_BAR_HEIGHT_PX: f32 = 6.0;
 

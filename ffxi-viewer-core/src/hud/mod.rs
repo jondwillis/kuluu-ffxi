@@ -259,7 +259,11 @@ impl Plugin for HudPlugin {
                 compass::update_compass,
                 vana_clock::update_vana_clock,
                 zone_flash::update_zone_flash,
-                (self_hud::update_self_hud, self_hud::update_self_status),
+                (
+                    self_hud::update_self_hud,
+                    self_hud::update_self_status,
+                    self_hud::update_self_party_indicator,
+                ),
                 status_ribbon::update_status_ribbon,
                 (
                     death_prompt::update_death_prompt_system,
