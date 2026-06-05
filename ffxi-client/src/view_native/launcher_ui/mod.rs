@@ -1052,6 +1052,7 @@ fn restore_login_error_on_reentry(
 /// already-filled-form branch is a no-op, so re-entries (e.g. from
 /// clicking a saved-account chip) don't clobber what was just picked.
 fn decide_initial_screen(
+    mut commands: Commands,
     overrides: Option<Res<CliOverridesPresent>>,
     err: Res<LoginErrorMsg>,
     mut form: ResMut<LoginForm>,
@@ -1097,6 +1098,17 @@ fn decide_initial_screen(
                 ) {
                     form.pass = pw;
                 }
+            }
+            // Fully restore the last-used server, not just its name: apply
+            // the matching profile so the network endpoint, the "Server:"
+            // chip, and the window title all point at it. `main.rs` seeds
+            // the launcher from CLI defaults (127.0.0.1) and never reads
+            // the store, so without this the prefilled username would
+            // authenticate against the wrong host. No-op when last_used
+            // was a raw-host CLI login with no matching saved profile —
+            // the CLI default endpoint already matches in that case.
+            if let Some(profile) = store.servers.iter().find(|p| p.name == server) {
+                apply_server_profile(&mut commands, profile);
             }
             server_form.selected = Some(server);
             return;
