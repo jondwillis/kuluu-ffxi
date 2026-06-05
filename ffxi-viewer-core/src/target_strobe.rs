@@ -32,10 +32,10 @@ use bevy::prelude::*;
 
 use crate::scene::{Target, TrackedEntities};
 
-/// Total length of the three-pulse flash, in seconds. Short and punchy —
-/// long enough to register three distinct humps, short enough to feel
-/// like an "acquired" blip rather than an ongoing glow.
-const STROBE_DURATION: f32 = 0.6;
+/// Total length of the three-pulse flash, in seconds. A slow, deliberate
+/// shimmer — the three humps read individually rather than as a fast
+/// blink, matching the classic client's languid target-acquire pulse.
+const STROBE_DURATION: f32 = 2.1;
 
 /// Number of white humps over [`STROBE_DURATION`]. Three is the classic
 /// count.

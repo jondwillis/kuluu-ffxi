@@ -7,8 +7,8 @@
 //!    floats just above the selected entity's nameplate, bobbing gently.
 //!    This replaces the old flat ground *ring*: classic FFXI marks the
 //!    current target with a cursor arrow above the head, not a circle on
-//!    the floor. Yellow normally, red while the player is auto-attacking
-//!    that exact target (see [`target_ring_color`]).
+//!    the floor. Neutral white normally, red while the player is
+//!    auto-attacking that exact target (see [`target_ring_color`]).
 //! 2. **Engaged ring** — a red ring under the *player's own* feet while in
 //!    combat. Unrelated to selection; kept as a separate "I am swinging"
 //!    cue so it can coexist with the target arrow.
@@ -26,25 +26,26 @@ use crate::components::WorldEntity;
 use crate::scene::{BakedActor, Target};
 use crate::snapshot::SceneState;
 
-/// Bright yellow matching the minimap target dot so the cue reads as
-/// "the thing I selected".
-const ARROW_COLOR: Color = Color::srgb(1.0, 0.95, 0.20);
+/// Neutral near-white so the cursor reads as a plain "this is selected"
+/// pointer rather than a colored attention flag — the classic client's
+/// target arrow is a soft white, not a saturated hue.
+const ARROW_COLOR: Color = Color::srgb(0.90, 0.90, 0.92);
 
 /// Red arrow while auto-attacking this exact target. Distinct from the
-/// yellow selection color so "selected" vs "fighting" stay legible.
+/// neutral selection color so "selected" vs "fighting" stay legible.
 const ARROW_ENGAGED_COLOR: Color = Color::srgb(1.00, 0.18, 0.22);
 
 /// Arrow footprint in yalms. Width = the span of the wide (top) edge;
-/// height = apex-to-edge. Tuned to read clearly above a nameplate
-/// without dwarfing it.
-const ARROW_WIDTH: f32 = 0.85;
-const ARROW_HEIGHT: f32 = 0.65;
+/// height = apex-to-edge. Kept compact so it reads as a small cursor
+/// sitting on the nameplate, not a banner over the model.
+const ARROW_WIDTH: f32 = 0.55;
+const ARROW_HEIGHT: f32 = 0.42;
 
 /// Lift of the arrow's *tip* above the nameplate anchor (crown + the
 /// nameplate's small crown offset). The nameplate quad is centered at
-/// the anchor and reaches up ~0.35 yalms; placing the tip 0.55 above
-/// the anchor keeps the arrow clear of the text at all label sizes.
-const ARROW_TIP_ABOVE_ANCHOR: f32 = 0.55;
+/// the anchor and reaches up ~0.35 yalms; placing the tip just above
+/// that keeps the arrow hugging the label without overlapping the text.
+const ARROW_TIP_ABOVE_ANCHOR: f32 = 0.30;
 
 /// Gentle vertical bob so the arrow reads as a live cursor rather than a
 /// decal. Amplitude in yalms, angular frequency in rad/s (~0.5 Hz).
@@ -70,7 +71,7 @@ const ENGAGED_RING_RADIUS: f32 = 1.7;
 
 /// Pure decision: which color should the target arrow be?
 ///
-/// Yellow on a non-combat selection, red when the player is currently
+/// Neutral white on a non-combat selection, red when the player is currently
 /// auto-attacking this exact target (`self.bt_target_id == target_id`,
 /// the same wire signal `target_panel` uses for the engagement badge).
 /// Lifting this into a pure function keeps the visual policy testable
@@ -219,20 +220,20 @@ mod tests {
 
     /// Engagement on the *same* entity that's currently targeted → red
     /// arrow. Operator wants the cue to visually echo combat state rather
-    /// than stay yellow throughout a fight.
+    /// than stay neutral throughout a fight.
     #[test]
     fn engaged_target_uses_red() {
         assert_eq!(target_ring_color(true), ARROW_ENGAGED_COLOR);
     }
 
     /// Targeting an entity we aren't fighting (e.g. an idle mob before
-    /// pressing F) keeps the yellow attention-getting color.
+    /// pressing F) keeps the neutral selection color.
     #[test]
-    fn unengaged_target_uses_yellow() {
+    fn unengaged_target_uses_neutral() {
         assert_eq!(target_ring_color(false), ARROW_COLOR);
     }
 
-    /// Yellow and red must remain visually distinct — if a future
+    /// Neutral and red must remain visually distinct — if a future
     /// refactor accidentally points them at the same constant, the "in
     /// combat" UI cue collapses silently.
     #[test]
