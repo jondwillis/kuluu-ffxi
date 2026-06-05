@@ -83,9 +83,13 @@ use crate::state::{ActionKind, AgentCommand};
 /// of ~56°/s within ±13%. Camera yaw turns lock-step at the same rate so
 /// the chase camera stays glued behind the player while turning in place.
 pub const HEADING_TURN_RATE: f32 = 0.86;
-/// Camera yaw delta per second when ←/→ held — same angular rate as
-/// player rotation so free-look and steered turns feel comparable.
-const CAMERA_YAW_RATE: f32 = HEADING_TURN_RATE;
+/// Camera yaw delta per second when ←/→ held. Free-look panning runs at
+/// 2× the player A/D turn rate (~98 °/s, full 180° in ~1.8 s): the camera
+/// has no momentum or animation to sell, so matching the player pivot rate
+/// felt sluggish — retail's arrow-pan sweeps noticeably faster than the
+/// body turns. Decoupled from `HEADING_TURN_RATE` so steered-turn feel is
+/// unaffected.
+const CAMERA_YAW_RATE: f32 = HEADING_TURN_RATE * 2.0;
 /// Camera pitch delta per tick when ↑/↓ held. ~17 °/s @ 20 Hz — slow on
 /// purpose so taps make small adjustments.
 const PITCH_STEP_HELD: f32 = 0.015;
