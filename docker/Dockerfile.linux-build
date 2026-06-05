@@ -35,9 +35,11 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources && printf '%s\n' \
 #   libx11/xcursor/xrandr/xi-dev       — winit X11 backend (Desktop Mode / Xwayland)
 #   libgl1-mesa-dev                    — GL headers some transitive deps probe
 #   perl                               — ring asm path (belt-and-suspenders)
+#   binutils                           — strip/readelf (shrink + inspect the binary)
+#   file                               — ELF type sanity check
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update \
     && apt-get install -y --no-install-recommends --allow-unauthenticated \
-        ca-certificates curl git pkg-config make cmake clang \
+        ca-certificates curl git pkg-config make cmake clang binutils file \
         libasound2-dev libudev-dev libdbus-1-dev \
         libwayland-dev libxkbcommon-dev \
         libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
