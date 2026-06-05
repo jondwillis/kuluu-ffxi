@@ -1,0 +1,61 @@
+name: Setup build environment
+description: >-
+  Initialise the build-time submodules, install system dependencies (Linux),
+  and provision a cached Rust toolchain. Shared by CI and release workflows so
+  the dependency list lives in one place.
+
+inputs:
+  components:
+    description: Extra rustup components (comma separated), e.g. "rustfmt, clippy".
+    required: false
+    default: ""
+  targets:
+    description: Extra rustup targets, e.g. "wasm32-unknown-unknown".
+    required: false
+    default: ""
+  cache-key:
+    description: Suffix to distinguish the rust-cache entry between jobs.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # vendor/server (LSB) is consumed at build time by ffxi-proto / ffxi-nav /
+    # ffxi-dat build.rs scripts and is REQUIRED — the build panics without it.
+    # .gitmodules declares it (and Phoenix) with git@ SSH URLs; rewrite the
+    # public LandSandBoat repo to HTTPS so no SSH key is needed. We init only the
+    # public submodules the build actually reads and deliberately skip Phoenix /
+    # AltanaViewer to avoid private-repo auth.
+    - name: Rewrite SSH submodule URLs to HTTPS
+      shell: bash
+      run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+    - name: Initialise build submodules
+      shell: bash
+      run: git submodule update --init vendor/server vendor/AltanaListener vendor/POLUtils
+
+    # Mirrors docker/Dockerfile.linux-build. macOS runners already ship clang /
+    # cmake / pkg-config via Xcode, so this step is Linux-only.
+    - name: Install Linux system dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          clang cmake pkg-config \
+          libasound2-dev libudev-dev libdbus-1-dev \
+          libwayland-dev libxkbcommon-dev \
+          libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+          libgl1-mesa-dev
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - name: Rust build cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}

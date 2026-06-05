@@ -1,0 +1,54 @@
+name: Auto Release on Version Bump
+
+# When the workspace version in Cargo.toml increases on main, tag it (bare
+# semver, no "v" prefix) and run the release pipeline. A manually pushed tag
+# triggers release.yml directly instead and is unaffected by this workflow.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    name: Detect version bump
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: check
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version=1 \
+            | jq -r '.packages[] | select(.name=="ffxi-client") | .version')
+          echo "Workspace version: ${version}"
+          if git rev-parse "refs/tags/${version}" >/dev/null 2>&1; then
+            echo "Tag ${version} already exists — no release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag "${version}"
+            git push origin "${version}"
+            echo "Created and pushed tag ${version}."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "tag=${version}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # A tag pushed by GITHUB_TOKEN does NOT re-trigger release.yml's push event,
+  # so we invoke the reusable workflow directly to perform the release.
+  release:
+    name: Release
+    needs: detect
+    if: needs.detect.outputs.release == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.detect.outputs.tag }}
+    permissions:
+      contents: write

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Newer pushes to the same ref cancel in-flight runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: fmt · clippy · test · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-build
+        with:
+          components: rustfmt, clippy
+          cache-key: ci
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked --features native-window -- -D warnings
+
+      # Integration tests that need a live LSB server self-skip when it is
+      # unreachable, so the full suite is safe on a network-isolated runner.
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # Build-check with the same flags the release uses, so a broken release
+      # build surfaces on the PR rather than at tag time.
+      - name: Build
+        run: cargo build --workspace --locked --features native-window

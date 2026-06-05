@@ -1,0 +1,163 @@
+name: Release
+
+on:
+  # Manual semver tag (no leading "v"), e.g. `git push origin 0.2.0`.
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+*']
+  # Called by auto-release-on-main.yml after a version-bump-driven tag.
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag/version being released (e.g. 0.2.0).
+        required: true
+        type: string
+  # Re-run a release by hand.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag/version to release (e.g. 0.2.0).
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    name: Resolve tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - id: resolve
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+          echo "Releasing tag: ${tag}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Build (x86_64 Linux)
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-build
+        with:
+          cache-key: release-linux
+
+      - name: Build binaries
+        run: |
+          cargo build --release --locked -p ffxi-client --features native-window
+          cargo build --release --locked -p ffxi-mcp
+
+      - name: Package
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          mkdir -p dist
+          strip target/release/ffxi-client target/release/ffxi-mcp target/release/ffxi-mcp-repl
+          tar -C target/release -czf "dist/ffxi-client-${TAG}-x86_64-linux.tar.gz" ffxi-client
+          tar -C target/release -czf "dist/ffxi-mcp-${TAG}-x86_64-linux.tar.gz" ffxi-mcp ffxi-mcp-repl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  macos:
+    name: Build (aarch64 macOS)
+    needs: setup
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      # The committed .cargo/config.toml hardcodes a developer-machine CXXFLAGS
+      # -isysroot for the Recast C++ bridge. Cargo's [env] is set without
+      # force=true, so exporting CXXFLAGS here (pointing at the runner's actual
+      # SDK) takes precedence — no edit to the tracked config needed.
+      - name: Point CXXFLAGS at the runner SDK
+        run: echo "CXXFLAGS=-isysroot $(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+
+      - uses: ./.github/actions/setup-build
+        with:
+          cache-key: release-macos
+
+      - name: Build binaries
+        run: |
+          cargo build --release --locked -p ffxi-client --features native-window
+          cargo build --release --locked -p ffxi-mcp
+
+      - name: Package
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          mkdir -p dist
+          bins="target/release/ffxi-client target/release/ffxi-mcp target/release/ffxi-mcp-repl"
+          strip $bins
+          # strip invalidates the linker's ad-hoc signature on arm64, which makes
+          # the binary fail to launch ("killed: 9"); re-sign ad-hoc to restore it.
+          codesign --force --sign - $bins
+          tar -C target/release -czf "dist/ffxi-client-${TAG}-aarch64-macos.tar.gz" ffxi-client
+          tar -C target/release -czf "dist/ffxi-mcp-${TAG}-aarch64-macos.tar.gz" ffxi-mcp ffxi-mcp-repl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  wasm:
+    name: Build (browser WASM)
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-build
+        with:
+          targets: wasm32-unknown-unknown
+          cache-key: release-wasm
+
+      # Trunk auto-downloads matching wasm-bindgen-cli and wasm-opt at build time.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+
+      - name: Build WASM bundle
+        working-directory: ffxi-viewer-wasm
+        run: trunk build --release
+
+      - name: Package
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          mkdir -p dist
+          ( cd ffxi-viewer-wasm/dist && zip -r "../../dist/ffxi-viewer-wasm-${TAG}.zip" . )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm
+          path: dist/*
+
+  publish:
+    name: Publish GitHub Release
+    needs: [setup, linux, macos, wasm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.setup.outputs.tag }}
+          generate_release_notes: true
+          files: artifacts/*
