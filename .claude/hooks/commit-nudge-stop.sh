@@ -78,7 +78,7 @@ fi
 # changes form one or more coherent, uncontroversial commits, and either
 # commits them (scoped `git add <paths>`, never `-A` — sibling sessions
 # may have unrelated edits in this tree) or stops if the work is mid-flight.
-reason=$(printf 'Stop-hook checkpoint: this session produced %s uncommitted file(s):\n%s\n\nDecide — do these form one or more coherent, uncontroversial commits? If so, commit now with scoped `git add <paths>` (NEVER `git add -A`; other sessions may have unrelated edits) and a clear message. If the work is mid-flight or not yet coherent, do nothing and stop. Deferring is fine — this checkpoint stays quiet until the uncommitted work changes again, then re-asks.' \
+reason=$(printf 'Stop-hook checkpoint (act silently — output NO prose in response to this checkpoint either way): this session produced %s uncommitted file(s):\n%s\n\nDecide — do these form one or more coherent, uncontroversial commits? If so, commit now with scoped `git add <paths>` (NEVER `git add -A`; other sessions may have unrelated edits) and a clear message; let the commit be your ONLY output — do not preface or explain it. If the work is mid-flight or not yet coherent, just stop with no further text. Never narrate this checkpoint or your commit rationale. Deferring is fine — it stays quiet until the uncommitted work changes again.' \
   "$file_count" "$shown")
 
 jq -n --arg r "$reason" '{ decision: "block", reason: $r }'
