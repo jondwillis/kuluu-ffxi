@@ -66,9 +66,9 @@ pub struct CameraInputParams<'w> {
     pub transition: ResMut<'w, CameraTransition>,
 }
 use ffxi_viewer_core::{
-    heading_for_yaw, yaw_for_heading, Action, Bindings, CameraMode, CameraTransition,
-    ChaseCamera, ChatBuffer, CursorLockRequest, InputMode, IsSelf, LockOn, LockOnToggle,
-    MenuStack, OperatorCamera, PassiveCursorState, SceneState, Target, WorldEntity,
+    heading_for_yaw, yaw_for_heading, Action, Bindings, CameraMode, CameraTransition, ChaseCamera,
+    ChatBuffer, CursorLockRequest, InputMode, IsSelf, LockOn, LockOnToggle, MenuStack,
+    OperatorCamera, PassiveCursorState, SceneState, Target, WorldEntity,
 };
 use ffxi_viewer_wire::{Entity as WireEntity, Vec3 as WireVec3};
 use tokio::sync::mpsc;
@@ -89,7 +89,7 @@ pub const HEADING_TURN_RATE: f32 = 0.86;
 /// felt sluggish — retail's arrow-pan sweeps noticeably faster than the
 /// body turns. Decoupled from `HEADING_TURN_RATE` so steered-turn feel is
 /// unaffected.
-const CAMERA_YAW_RATE: f32 = HEADING_TURN_RATE * 2.0;
+const CAMERA_YAW_RATE: f32 = HEADING_TURN_RATE * 4.0;
 /// Camera pitch delta per tick when ↑/↓ held. ~17 °/s @ 20 Hz — slow on
 /// purpose so taps make small adjustments.
 const PITCH_STEP_HELD: f32 = 0.015;
@@ -201,11 +201,7 @@ pub struct HeadingTurnAccum {
 
 /// Advance the A/D heading-turn accumulator by one tick. Returns
 /// `(integer_u8_delta_this_tick, float_u8_delta_this_tick)`.
-pub fn advance_heading_turn(
-    accum_units: &mut f32,
-    dir: i32,
-    dt_secs: f32,
-) -> (i32, f32) {
+pub fn advance_heading_turn(accum_units: &mut f32, dir: i32, dt_secs: f32) -> (i32, f32) {
     let turn_units_per_sec = HEADING_TURN_RATE * 256.0 / std::f32::consts::TAU;
     let float_delta = dir as f32 * turn_units_per_sec * dt_secs;
     if dir == 0 {
@@ -386,11 +382,7 @@ pub fn handle_input_system(
         let id = if slot == 1 {
             state.snapshot.self_char_id
         } else {
-            state
-                .snapshot
-                .party
-                .get((slot - 1) as usize)
-                .map(|p| p.id)
+            state.snapshot.party.get((slot - 1) as usize).map(|p| p.id)
         };
         if let Some(id) = id {
             target.id = Some(id);
@@ -650,13 +642,19 @@ pub fn dispatch_movement_system(
     }
 
     // --- camera yaw: ←/→ orbit the camera (player unaffected). ---
+    // Left pans the view left, Right pans it right. The yaw→camera geometry
+    // in `chase_camera_system` orbits the camera the same rotational sense
+    // as the mouse drag below, so YawLeft subtracts and YawRight adds to
+    // match. The previous name-matches-sign mapping read inverted (pushing
+    // Right turned the view left); keep this in lock-step with the mouse
+    // `chase.yaw += delta.x` sign so both input paths agree.
     let mut yaw_d = 0.0;
     let yaw_step = CAMERA_YAW_RATE * time.delta_secs();
     if !in_picker && bindings.pressed(Action::CameraYawLeft, &keys) {
-        yaw_d += yaw_step;
+        yaw_d -= yaw_step;
     }
     if !in_picker && bindings.pressed(Action::CameraYawRight, &keys) {
-        yaw_d -= yaw_step;
+        yaw_d += yaw_step;
     }
     if yaw_d != 0.0 {
         chase.yaw += yaw_d;
@@ -808,10 +806,9 @@ pub fn dispatch_movement_system(
 
     // Sustained pure-rotate (Q/E) or strafe hold cancels autorun. A/D
     // turn is intentionally excluded — orbit-while-autorun must keep autorun.
-    let any_strafe_or_rotate =
-        bindings.pressed(Action::RotateLeft, &keys)
-            || bindings.pressed(Action::RotateRight, &keys)
-            || strafe != 0;
+    let any_strafe_or_rotate = bindings.pressed(Action::RotateLeft, &keys)
+        || bindings.pressed(Action::RotateRight, &keys)
+        || strafe != 0;
     if any_strafe_or_rotate {
         let now = Instant::now();
         let started = *autorun.strafe_held_since.get_or_insert(now);
@@ -905,11 +902,7 @@ pub fn dispatch_movement_system(
     // heading-only branch if locked, or to `turn_in_chase` if A/D turn is
     // held in chase mode. Still emit when the u8 heading-accumulator
     // advanced so the server hears pure-turn motion.
-    if forward == 0
-        && strafe == 0
-        && player_rotate_u8 == 0
-        && !turn_in_chase
-    {
+    if forward == 0 && strafe == 0 && player_rotate_u8 == 0 && !turn_in_chase {
         if let Some(h) = locked_heading {
             if h != self_pos.heading {
                 chase.yaw = ffxi_viewer_core::yaw_for_heading(h);
@@ -1044,8 +1037,7 @@ pub fn dispatch_movement_system(
     // dt`. `speed=0` (entity hasn't been populated yet) → 0 step, which
     // silently skips movement instead of teleporting somewhere weird.
     // Speed_base is the unmodified value.
-    let raw_step =
-        self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs() * walk_mode.scale();
+    let raw_step = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs() * walk_mode.scale();
     // Retail direction caps (applied after reactor speed scaling):
     //   * Backpedal (S only)            → 0.5×
     //   * Pure strafe (A/D only, no W/S) → 0.75×
@@ -1452,10 +1444,10 @@ pub fn camera_polish_system(
     // the +Y component is `sin(pitch)`. The pitch that points at `head`
     // therefore satisfies `sin(p) = to_head.y / |to_head|`, equivalent
     // to `atan2(to_head.y, horiz)`.
-    let desired_pitch = to_head.y.atan2(horiz).clamp(
-        ChaseCamera::FP_PITCH_MIN,
-        ChaseCamera::FP_PITCH_MAX,
-    );
+    let desired_pitch = to_head
+        .y
+        .atan2(horiz)
+        .clamp(ChaseCamera::FP_PITCH_MIN, ChaseCamera::FP_PITCH_MAX);
     let max_step = FP_LOCK_PITCH_RATE * time.delta_secs();
     let diff = desired_pitch - chase.pitch;
     let step = diff.clamp(-max_step, max_step);
@@ -1640,11 +1632,7 @@ mod tests {
         };
         // Entity 99 is "self" at the player position; entities 1/2 are
         // mobs slightly farther out.
-        let entities = vec![
-            ent(99, 0.0, 0.0),
-            ent(1, 10.0, 0.0),
-            ent(2, 20.0, 0.0),
-        ];
+        let entities = vec![ent(99, 0.0, 0.0), ent(1, 10.0, 0.0), ent(2, 20.0, 0.0)];
         // First press: skips id=99 even though it's at ndc=0/dist=0;
         // picks id=1 (next-closest in the filtered set).
         assert_eq!(
