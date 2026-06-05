@@ -21,9 +21,11 @@ use ffxi_client::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
 use ffxi_client::secret_store::SecretStore;
 
 use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
+use super::{
+    Credentials, LauncherState, LoginErrorMsg, LoginField, LoginForm, ServerInfo, ServerSelectForm,
+};
 use crate::view_native::widgets::text_field::{text_field, TextFieldSubmitted};
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
-use super::{Credentials, LauncherState, LoginErrorMsg, LoginField, LoginForm, ServerInfo, ServerSelectForm};
 
 #[derive(Component)]
 pub(super) struct LoginUiRoot;
@@ -43,10 +45,7 @@ pub(super) struct LoginUiDirty(pub bool);
 /// `ServerSelectForm.selected` points at. Falls back to `ServerInfo.server`
 /// when no profile has been explicitly picked yet (CLI-args path).
 fn saved_accounts_for(form: &ServerSelectForm, info: &ServerInfo) -> (String, Vec<(String, bool)>) {
-    let server_key = form
-        .selected
-        .clone()
-        .unwrap_or_else(|| info.server.clone());
+    let server_key = form.selected.clone().unwrap_or_else(|| info.server.clone());
     let accts = launcher_store::load()
         .accounts
         .into_iter()
@@ -259,9 +258,9 @@ fn spawn_saved_accounts_row(
                       mut login: ResMut<LoginForm>,
                       mut dirty: ResMut<LoginUiDirty>| {
                     let mut store = launcher_store::load();
-                    store.accounts.retain(|a| {
-                        !(a.server_name == forget_server && a.username == forget_user)
-                    });
+                    store
+                        .accounts
+                        .retain(|a| !(a.server_name == forget_server && a.username == forget_user));
                     if let Some((s, u)) = &store.last_used {
                         if *s == forget_server && *u == forget_user {
                             store.last_used = None;
@@ -294,9 +293,7 @@ fn spawn_saved_accounts_row(
             Spawn((Text::new("+ New"), ThemedText)),
         ))
         .observe(
-            |_ev: On<Activate>,
-             mut login: ResMut<LoginForm>,
-             mut dirty: ResMut<LoginUiDirty>| {
+            |_ev: On<Activate>, mut login: ResMut<LoginForm>, mut dirty: ResMut<LoginUiDirty>| {
                 login.user.clear();
                 login.pass.clear();
                 login.remember_password = false;
@@ -358,11 +355,9 @@ fn spawn_field(
                 ));
             })
             .observe(
-                move |ev: On<ValueChange<String>>, mut form: ResMut<LoginForm>| {
-                    match binding {
-                        LoginField::User => form.user = ev.value.clone(),
-                        LoginField::Password => form.pass = ev.value.clone(),
-                    }
+                move |ev: On<ValueChange<String>>, mut form: ResMut<LoginForm>| match binding {
+                    LoginField::User => form.user = ev.value.clone(),
+                    LoginField::Password => form.pass = ev.value.clone(),
                 },
             )
             .observe(

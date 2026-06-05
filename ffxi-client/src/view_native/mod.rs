@@ -60,7 +60,9 @@ use tokio::runtime::Handle as RtHandle;
 use crate::launcher::Defaults;
 
 use self::bridge::NativeSource;
-use self::input::{AutoRun, CameraAutoRecenter, CommandTx, HeadingTurnAccum, LocalPlayerPrediction};
+use self::input::{
+    AutoRun, CameraAutoRecenter, CommandTx, HeadingTurnAccum, LocalPlayerPrediction,
+};
 use self::launcher_ui::{LoginErrorMsg, PendingConnect};
 
 /// Top-level phase of the unified native `App`.

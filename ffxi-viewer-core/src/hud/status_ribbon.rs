@@ -110,7 +110,9 @@ impl StatusIconCache {
                 Some(arc)
             }
             None => {
-                warn!("status icons: DAT file_id {STATUS_ICON_FILE_ID} unreadable; numeric fallback");
+                warn!(
+                    "status icons: DAT file_id {STATUS_ICON_FILE_ID} unreadable; numeric fallback"
+                );
                 self.dat_unavailable = true;
                 None
             }
@@ -120,7 +122,10 @@ impl StatusIconCache {
 
 /// Upload a decoded 32×32 icon as a Bevy texture. Linear sampling so the
 /// 32px source reads cleanly when drawn at [`ICON_SIZE_PX`].
-fn upload_icon(img: ffxi_dat::map_image::GraphicImage, images: &mut Assets<Image>) -> Handle<Image> {
+fn upload_icon(
+    img: ffxi_dat::map_image::GraphicImage,
+    images: &mut Assets<Image>,
+) -> Handle<Image> {
     let mut image = Image::new(
         Extent3d {
             width: img.width,

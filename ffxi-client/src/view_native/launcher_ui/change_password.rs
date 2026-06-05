@@ -36,7 +36,10 @@ pub(super) fn spawn_ui(
             spawn_breadcrumb(
                 root,
                 &server,
-                &[Crumb::Sign(None), Crumb::Other("Change password".to_string())],
+                &[
+                    Crumb::Sign(None),
+                    Crumb::Other("Change password".to_string()),
+                ],
             );
             root.spawn(panel_node(480.0)).with_children(|panel| {
                 panel.spawn(title("Change password"));

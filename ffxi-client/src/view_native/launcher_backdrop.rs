@@ -30,8 +30,8 @@
 //! that marker we get a static viewpoint with zero controller
 //! interference, no `cfg`/excludes needed.
 
-use bevy::prelude::*;
 use bevy::camera::visibility::RenderLayers;
+use bevy::prelude::*;
 use ffxi_client::lobby_client::CharSlot;
 use ffxi_viewer_core::SceneState;
 
@@ -280,10 +280,7 @@ fn despawn_backdrop_camera(mut commands: Commands, q: Query<Entity, With<Backdro
 /// field and fires the same `LoadMzbRequest` chain the post-auth
 /// path uses — by writing here we reuse the entire zone-load
 /// pipeline without duplicating any parse / spawn logic.
-fn mirror_backdrop_to_scene_state(
-    zone: Res<LauncherBackdropZone>,
-    mut scene: ResMut<SceneState>,
-) {
+fn mirror_backdrop_to_scene_state(zone: Res<LauncherBackdropZone>, mut scene: ResMut<SceneState>) {
     // No `is_changed()` gate: a return-to-Launcher path resets
     // `SceneState` via `despawn_ingame_entities` without mutating
     // our `LauncherBackdropZone`, so we need to detect the
@@ -337,7 +334,10 @@ fn update_backdrop_from_selection(
     if target == zone.0 {
         return;
     }
-    *fade = BackdropFade::FadingOut { target, elapsed: 0.0 };
+    *fade = BackdropFade::FadingOut {
+        target,
+        elapsed: 0.0,
+    };
 }
 
 /// Tick the fade state machine. Driven by `Time` so it's frame-rate
@@ -360,7 +360,10 @@ fn drive_backdrop_fade(
                 zone.0 = target;
                 BackdropFade::Holding { elapsed: 0.0 }
             } else {
-                BackdropFade::FadingOut { target, elapsed: next }
+                BackdropFade::FadingOut {
+                    target,
+                    elapsed: next,
+                }
             }
         }
         BackdropFade::Holding { elapsed } => {
@@ -378,9 +381,10 @@ fn drive_backdrop_fade(
                 // fade and points at a different zone, kick the
                 // next cycle without a frame of Idle in between.
                 match pending.target {
-                    Some(target) if target != zone.0 => {
-                        BackdropFade::FadingOut { target, elapsed: 0.0 }
-                    }
+                    Some(target) if target != zone.0 => BackdropFade::FadingOut {
+                        target,
+                        elapsed: 0.0,
+                    },
                     _ => BackdropFade::Idle,
                 }
             } else {

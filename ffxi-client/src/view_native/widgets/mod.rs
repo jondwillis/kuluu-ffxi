@@ -15,9 +15,7 @@ use bevy::feathers::theme::ThemedText;
 use bevy::input_focus::tab_navigation::TabGroup;
 use bevy::prelude::*;
 
-pub use text_field::{
-    text_field, TextField, TextFieldDisplay, TextFieldPlugin, TextFieldProps,
-};
+pub use text_field::{text_field, TextField, TextFieldDisplay, TextFieldPlugin, TextFieldProps};
 // Re-exported separately because the demo doesn't reference it but
 // downstream launcher code will subscribe to it.
 #[allow(unused_imports)]

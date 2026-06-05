@@ -47,7 +47,9 @@ pub(super) fn spawn_ui(
                 if n == 0 {
                     panel.spawn(hint("No servers saved yet — click '+ Add server' below."));
                 } else {
-                    panel.spawn(hint("Click a server to pick it. Use Edit / × for per-row actions."));
+                    panel.spawn(hint(
+                        "Click a server to pick it. Use Edit / × for per-row actions.",
+                    ));
                 }
 
                 for (idx, s) in servers.iter().enumerate() {

@@ -35,8 +35,7 @@ pub(super) const JOBS: &[(u8, &str)] = &[
     (6, "THF"),
 ];
 
-pub(super) const NATIONS: &[(u8, &str)] =
-    &[(0, "San d'Oria"), (1, "Bastok"), (2, "Windurst")];
+pub(super) const NATIONS: &[(u8, &str)] = &[(0, "San d'Oria"), (1, "Bastok"), (2, "Windurst")];
 
 pub(super) const SIZES: &[(u8, &str)] = &[(0, "Small"), (1, "Medium"), (2, "Large")];
 
@@ -54,11 +53,7 @@ pub(super) struct EnumChoice {
     value: u8,
 }
 
-pub(super) fn spawn_ui(
-    mut commands: Commands,
-    form: Res<CharCreateForm>,
-    server: Res<ServerInfo>,
-) {
+pub(super) fn spawn_ui(mut commands: Commands, form: Res<CharCreateForm>, server: Res<ServerInfo>) {
     let snap = (
         form.name.clone(),
         form.race,
@@ -255,27 +250,23 @@ fn spawn_enum_row(
                 } else {
                     ButtonVariant::Normal
                 };
-                row.spawn((
-                    button(
-                        ButtonProps {
-                            variant,
-                            ..default()
-                        },
-                        EnumChoice { field, value: val },
-                        Spawn((Text::new((*name).to_string()), ThemedText)),
-                    ),
-                ))
-                .observe(
-                    move |_ev: On<Activate>, mut form: ResMut<CharCreateForm>| {
-                        match field {
+                row.spawn((button(
+                    ButtonProps {
+                        variant,
+                        ..default()
+                    },
+                    EnumChoice { field, value: val },
+                    Spawn((Text::new((*name).to_string()), ThemedText)),
+                ),))
+                    .observe(
+                        move |_ev: On<Activate>, mut form: ResMut<CharCreateForm>| match field {
                             CharCreateField::Race => form.race = val,
                             CharCreateField::Job => form.job = val,
                             CharCreateField::Nation => form.nation = val,
                             CharCreateField::Size => form.size = val,
                             CharCreateField::Name | CharCreateField::Face => {}
-                        }
-                    },
-                );
+                        },
+                    );
             }
         });
 }

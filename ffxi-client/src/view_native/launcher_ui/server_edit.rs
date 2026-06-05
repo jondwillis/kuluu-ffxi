@@ -23,11 +23,7 @@ pub(super) struct ServerEditRoot;
 #[derive(Component, Clone, Copy)]
 pub(super) struct FlavorButton(AuthFlavorKind);
 
-pub(super) fn spawn_ui(
-    mut commands: Commands,
-    form: Res<ServerEditForm>,
-    server: Res<ServerInfo>,
-) {
+pub(super) fn spawn_ui(mut commands: Commands, form: Res<ServerEditForm>, server: Res<ServerInfo>) {
     let editing = form.editing_index.is_some();
     let snap = (
         form.name.clone(),
@@ -252,21 +248,17 @@ fn spawn_flavor_button(
         ButtonVariant::Normal
     };
     parent
-        .spawn((
-            button(
-                ButtonProps {
-                    variant,
-                    ..default()
-                },
-                FlavorButton(kind),
-                Spawn((Text::new(label.to_string()), ThemedText)),
-            ),
-        ))
-        .observe(
-            move |_ev: On<Activate>, mut form: ResMut<ServerEditForm>| {
-                form.flavor = kind;
+        .spawn((button(
+            ButtonProps {
+                variant,
+                ..default()
             },
-        );
+            FlavorButton(kind),
+            Spawn((Text::new(label.to_string()), ThemedText)),
+        ),))
+        .observe(move |_ev: On<Activate>, mut form: ResMut<ServerEditForm>| {
+            form.flavor = kind;
+        });
 }
 
 /// Update the Primary/Normal variant of the flavor toggles when the form

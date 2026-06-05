@@ -1277,9 +1277,7 @@ fn handle_sub_packet(
             // 0x0AA: 128-byte bitmap of learned spells. Collapse into
             // a sorted `Vec<u16>` of ids the HUD can iterate.
             if let Ok(m) = decode::MagicData::decode(sub.data) {
-                let _ = event_tx.send(AgentEvent::SpellsKnownUpdated {
-                    ids: m.known_ids(),
-                });
+                let _ = event_tx.send(AgentEvent::SpellsKnownUpdated { ids: m.known_ids() });
             }
         }
         op if op == s2c::COMMAND_DATA => {
@@ -2793,9 +2791,7 @@ fn synth_check_line(
     match message_num {
         170..=178 => Some(render_check_mob(message_num, data1, data2, tar_name)),
 
-        712 => Some(format!(
-            "Main weapon — Accuracy: {data1}, Attack: {data2}."
-        )),
+        712 => Some(format!("Main weapon — Accuracy: {data1}, Attack: {data2}.")),
         713 => {
             if data1 == 0 && data2 == 0 {
                 Some("Auxiliary weapon: none equipped.".to_string())
@@ -3855,9 +3851,7 @@ fn should_emit_pos(
     pos_delta_yalms: f32,
     heading_changed: bool,
 ) -> bool {
-    elapsed >= MOVE_EMISSION_PERIOD
-        || pos_delta_yalms > MOVE_BIG_JUMP_YALMS
-        || heading_changed
+    elapsed >= MOVE_EMISSION_PERIOD || pos_delta_yalms > MOVE_BIG_JUMP_YALMS || heading_changed
 }
 
 #[cfg(test)]
@@ -3977,10 +3971,7 @@ mod tests {
         // ~13 yalms apart — snap (zone teleport).
         let local = v(0.0, 0.0, 0.0);
         let server = v(12.0, 5.0, 0.0); // distance 13
-        assert_eq!(
-            reconcile_self_pos(local, server),
-            SelfPosReconcile::Snap,
-        );
+        assert_eq!(reconcile_self_pos(local, server), SelfPosReconcile::Snap,);
     }
 
     #[test]
@@ -4802,13 +4793,7 @@ mod tests {
     /// Build a 0x029 BattleMessage body for a synth-decoded id (Check
     /// or Checkparam family) so the helper paths can be exercised
     /// end-to-end through `decode_battle_message`.
-    fn check_message(
-        message_num: u16,
-        data1: u32,
-        data2: u32,
-        cas: u32,
-        tar: u32,
-    ) -> Vec<u8> {
+    fn check_message(message_num: u16, data1: u32, data2: u32, cas: u32, tar: u32) -> Vec<u8> {
         let mut data = vec![0u8; 24];
         data[0..4].copy_from_slice(&cas.to_le_bytes());
         data[4..8].copy_from_slice(&tar.to_le_bytes());

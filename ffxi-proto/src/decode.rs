@@ -656,11 +656,7 @@ impl PosMode {
     pub fn carries_position(&self) -> bool {
         matches!(
             self,
-            PosMode::Normal
-                | PosMode::Event
-                | PosMode::Pop
-                | PosMode::Reset
-                | PosMode::Materialize
+            PosMode::Normal | PosMode::Event | PosMode::Pop | PosMode::Reset | PosMode::Materialize
         )
     }
 }

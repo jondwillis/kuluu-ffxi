@@ -10,7 +10,7 @@ use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
-use bevy::picking::events::{Pointer, Over};
+use bevy::picking::events::{Over, Pointer};
 use bevy::prelude::*;
 use bevy::ui_widgets::Activate;
 
@@ -69,11 +69,7 @@ pub(super) fn spawn_char_list_ui(
             } else {
                 Some(creds.user.clone())
             };
-            spawn_breadcrumb(
-                root,
-                &server,
-                &[Crumb::Sign(sign_label), Crumb::Characters],
-            );
+            spawn_breadcrumb(root, &server, &[Crumb::Sign(sign_label), Crumb::Characters]);
             root.spawn(panel_node(420.0)).with_children(|panel| {
                 panel.spawn(title("Select character"));
                 if chars.0.is_empty() {

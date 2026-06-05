@@ -404,7 +404,7 @@ fn decode_packed_bgra32(
             rgba[dst] = bytes[s + 2]; // R
             rgba[dst + 1] = bytes[s + 1]; // G
             rgba[dst + 2] = bytes[s]; // B
-            // FFXI 7-bit alpha (0..=0x80) → 8-bit.
+                                      // FFXI 7-bit alpha (0..=0x80) → 8-bit.
             rgba[dst + 3] = ((bytes[s + 3] as u16) * 2).min(255) as u8;
         }
     }
@@ -569,7 +569,7 @@ mod tests {
         // Output row 0 is disk's bottom row (disk row 1): green, black.
         assert_eq!(&img.rgba[0..4], &[0x00, 0xFF, 0x00, 0x80]); // green, 64→128
         assert_eq!(&img.rgba[4..8], &[0x00, 0x00, 0x00, 0xFF]); // black, opaque
-        // Output row 1 is disk's top row (disk row 0): red, blue.
+                                                                // Output row 1 is disk's top row (disk row 0): red, blue.
         assert_eq!(&img.rgba[8..12], &[0xFF, 0x00, 0x00, 0xFF]); // red, opaque
         assert_eq!(&img.rgba[12..16], &[0x00, 0x00, 0xFF, 0x00]); // blue, transparent
     }
@@ -598,7 +598,7 @@ mod tests {
         let img = status_icon_at(&sheet, 1).expect("block 1 decodes");
         assert_eq!((img.width, img.height), (1, 1));
         assert_eq!(&img.rgba[0..4], &[0x33, 0x22, 0x11, 0xFF]); // R,G,B,A(opaque)
-        // Out-of-range id is None, not a panic.
+                                                                // Out-of-range id is None, not a panic.
         assert!(status_icon_at(&sheet, STATUS_ICON_COUNT as u16).is_none());
     }
 

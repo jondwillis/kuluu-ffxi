@@ -538,10 +538,7 @@ pub fn update_main_menu(
     scene: Res<crate::snapshot::SceneState>,
     dynamic: Res<DynamicMenu>,
     mut menu_q: Query<&mut Node, (With<MainMenu>, Without<MainMenuRow>)>,
-    mut row_q: Query<
-        (&MainMenuRow, &mut Node, &mut Text, &mut TextColor),
-        Without<MainMenuTitle>,
-    >,
+    mut row_q: Query<(&MainMenuRow, &mut Node, &mut Text, &mut TextColor), Without<MainMenuTitle>>,
     mut title_q: Query<&mut Text, (With<MainMenuTitle>, Without<MainMenuRow>)>,
 ) {
     let Ok(mut node) = menu_q.single_mut() else {

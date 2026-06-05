@@ -23,8 +23,8 @@
 //! camera there — the UI's `padding: right(40px)` keeps the column
 //! clear of the model.
 
-use bevy::prelude::*;
 use bevy::camera::visibility::RenderLayers;
+use bevy::prelude::*;
 use ffxi_client::lobby_client::CharSlot;
 use ffxi_viewer_core::dat_vos2::spawn_equipped;
 

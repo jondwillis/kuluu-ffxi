@@ -2661,12 +2661,7 @@ mod tests {
         let out = r.tick();
         assert_eq!(out.commands.len(), 1, "exactly one Move emitted per tick");
         match &out.commands[0] {
-            AgentCommand::Move {
-                x,
-                y,
-                z,
-                heading,
-            } => {
+            AgentCommand::Move { x, y, z, heading } => {
                 assert!((x - 0.5).abs() < 1e-3, "lerp reached target.x");
                 assert!(y.abs() < 1e-3);
                 assert!(z.abs() < 1e-3);

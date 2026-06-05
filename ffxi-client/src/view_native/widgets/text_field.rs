@@ -29,8 +29,8 @@
 //! the feathers widgets use for scalar changes). Submission fires
 //! `TextFieldSubmitted`.
 
-use bevy::feathers::tokens;
 use bevy::feathers::theme::ThemeBackgroundColor;
+use bevy::feathers::tokens;
 use bevy::input::keyboard::{Key, KeyCode, KeyboardInput};
 use bevy::input::ButtonInput;
 use bevy::input::ButtonState;
@@ -152,9 +152,7 @@ fn text_field_on_key(
     if cmd_or_ctrl {
         match input.key_code {
             KeyCode::KeyV => {
-                let pasted = match arboard::Clipboard::new()
-                    .and_then(|mut cb| cb.get_text())
-                {
+                let pasted = match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!(error = %e, "text_field: clipboard read failed");
@@ -162,10 +160,7 @@ fn text_field_on_key(
                         return;
                     }
                 };
-                let sanitized: String = pasted
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .collect();
+                let sanitized: String = pasted.chars().filter(|c| !c.is_control()).collect();
                 if !sanitized.is_empty() {
                     let cur = field.cursor;
                     field.value.insert_str(cur, &sanitized);
@@ -183,9 +178,7 @@ fn text_field_on_key(
                 // Copy the real value (not the masked rendering) — matches
                 // every other text widget's Cmd+C behavior.
                 let payload = field.value.clone();
-                if let Err(e) = arboard::Clipboard::new()
-                    .and_then(|mut cb| cb.set_text(payload))
-                {
+                if let Err(e) = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(payload)) {
                     tracing::warn!(error = %e, "text_field: clipboard write failed");
                 }
                 ev.propagate(false);

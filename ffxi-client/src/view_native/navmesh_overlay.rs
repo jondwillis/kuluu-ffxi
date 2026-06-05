@@ -316,8 +316,8 @@ fn snap_entities_to_mzb_floor_system(
         // walkable surface" work.
         const STEP_TOLERANCE: f32 = 2.0;
         let ceiling_y = t.translation.y + STEP_TOLERANCE;
-        if let Some(ground) = collision_geom
-            .ground_raycast(Vec2::new(t.translation.x, t.translation.z), ceiling_y)
+        if let Some(ground) =
+            collision_geom.ground_raycast(Vec2::new(t.translation.x, t.translation.z), ceiling_y)
         {
             t.translation.y = ground;
         }

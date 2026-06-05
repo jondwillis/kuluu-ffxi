@@ -328,9 +328,21 @@ pub fn draw_camera_collision_debug(
     // risers, not at ankle level).
     let cross = 0.3;
     let cross_color = Color::srgba(1.0, 1.0, 1.0, 0.90);
-    gizmos.line(anchor - Vec3::X * cross, anchor + Vec3::X * cross, cross_color);
-    gizmos.line(anchor - Vec3::Y * cross, anchor + Vec3::Y * cross, cross_color);
-    gizmos.line(anchor - Vec3::Z * cross, anchor + Vec3::Z * cross, cross_color);
+    gizmos.line(
+        anchor - Vec3::X * cross,
+        anchor + Vec3::X * cross,
+        cross_color,
+    );
+    gizmos.line(
+        anchor - Vec3::Y * cross,
+        anchor + Vec3::Y * cross,
+        cross_color,
+    );
+    gizmos.line(
+        anchor - Vec3::Z * cross,
+        anchor + Vec3::Z * cross,
+        cross_color,
+    );
 
     // Ray viz is only meaningful in Chase mode (FP doesn't ray-cast). In
     // FP we already drew the anchor crosshair above; that's enough.
@@ -362,6 +374,10 @@ pub fn draw_camera_collision_debug(
     // the gap is sub-perceptible (< 0.05 yalm) to reduce flicker.
     let clip_amount = (wanted_end - effective_end).length();
     if clip_amount > 0.05 {
-        gizmos.line(effective_end, wanted_end, Color::srgba(1.0, 0.25, 0.55, 0.85));
+        gizmos.line(
+            effective_end,
+            wanted_end,
+            Color::srgba(1.0, 0.25, 0.55, 0.85),
+        );
     }
 }

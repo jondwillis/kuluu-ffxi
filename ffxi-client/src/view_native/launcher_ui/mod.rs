@@ -545,7 +545,9 @@ pub(crate) struct ServerInfo {
 
 impl ServerInfo {
     pub fn display_label(&self) -> String {
-        self.profile_name.clone().unwrap_or_else(|| self.server.clone())
+        self.profile_name
+            .clone()
+            .unwrap_or_else(|| self.server.clone())
     }
 }
 
@@ -741,12 +743,18 @@ pub(crate) fn register(
     app.add_systems(OnEnter(LauncherState::Login), decide_initial_screen);
 
     // New screens.
-    app.add_systems(OnEnter(LauncherState::ServerSelect), server_select::spawn_ui)
-        .add_systems(OnExit(LauncherState::ServerSelect), server_select::despawn_ui)
-        .add_systems(
-            Update,
-            server_select::keyboard_input_system.run_if(in_state(LauncherState::ServerSelect)),
-        );
+    app.add_systems(
+        OnEnter(LauncherState::ServerSelect),
+        server_select::spawn_ui,
+    )
+    .add_systems(
+        OnExit(LauncherState::ServerSelect),
+        server_select::despawn_ui,
+    )
+    .add_systems(
+        Update,
+        server_select::keyboard_input_system.run_if(in_state(LauncherState::ServerSelect)),
+    );
 
     app.add_systems(OnEnter(LauncherState::ServerEdit), server_edit::spawn_ui)
         .add_systems(OnExit(LauncherState::ServerEdit), server_edit::despawn_ui)
@@ -759,16 +767,22 @@ pub(crate) fn register(
                 .run_if(in_state(LauncherState::ServerEdit)),
         );
 
-    app.add_systems(OnEnter(LauncherState::ChangePassword), change_password::spawn_ui)
-        .add_systems(OnExit(LauncherState::ChangePassword), change_password::despawn_ui)
-        .add_systems(
-            Update,
-            (
-                change_password::keyboard_input_system,
-                change_password::redraw_system,
-            )
-                .run_if(in_state(LauncherState::ChangePassword)),
-        );
+    app.add_systems(
+        OnEnter(LauncherState::ChangePassword),
+        change_password::spawn_ui,
+    )
+    .add_systems(
+        OnExit(LauncherState::ChangePassword),
+        change_password::despawn_ui,
+    )
+    .add_systems(
+        Update,
+        (
+            change_password::keyboard_input_system,
+            change_password::redraw_system,
+        )
+            .run_if(in_state(LauncherState::ChangePassword)),
+    );
 
     app.add_systems(
         OnEnter(LauncherState::ChangePasswordInFlight),
