@@ -105,7 +105,9 @@ resolves it.
     contributions welcome
 - [x] PC + NPC skinned meshes
 - [ ] Airships, boats, elevators
-- [ ] Interactible doors (open/close, zone transition surfaces)
+- [ ] Interactible doors (open/close, zone transition surfaces) — incl. the
+  retail door flow: yes/no confirm dialog → open animation → fade-to-black →
+  "Downloading data" indicator → fade-in → zone changed
 - [x] Skybox dome with sRGB-correct lerp
 - [~] Sun + moon — billboards render; arc, color, and Vana-day timing not
   verified against retail
@@ -124,8 +126,25 @@ resolves it.
 - [x] Stage bar, chat panes (Social / Battle / Debug), self HUD, party
   roster, target panel, Vana clock, weather icon, zone flash, dialog
   window, death prompt, logout countdown, status ribbon
-- [~] Main menu (`-`): Equipment, Magic, Abilities, Items submenus wired;
-  Status, Party, Search, Macros, Graphics submenus still stubbed
+- [ ] Self HUD solo / party indicator (shown in the bottom-right self panel
+  alongside name + HP/MP bars)
+- [ ] Target panel width parity — target panel must match the self/party
+  panel width (currently 280px vs 220px)
+- [ ] **Target-action contextual menu** (vanilla): select an entity → confirm
+  opens Chat / Magic / Abilities / Trust / Items / Trade / Check. Chat is a
+  cycle-button (Say→Tell→Party→Linkshell→Unity→Shout, default `/tell`); each
+  entry has contextual visibility and "no X available" / "cannot use that here"
+  error strings. This is the vanilla spine; **not** the Enhanced quick-action
+  ring (see Enhanced below).
+- [ ] Item detail / tooltip panel (docked bottom-left, replaces compass+clock
+  while open): icon, name, rare/ex, slot, race/job, level, enchantment, uses
+  remaining + recast, and consumable status-effect grant + duration
+- [~] Main menu (`-`), title "Commands": Equipment, Magic, Abilities, Items
+  submenus wired; Status, Party, Search, Macros, Graphics submenus still
+  stubbed. Order/contents diverge from retail's two-column layout (Status,
+  Equipment, Magic, Items, Synthesis, Abilities, Party, Trade, Search,
+  Linkshell, Region Info, Map | Missions, Quests, Key Items, View House,
+  Macros, Config, Help Desk, Time, Communication, Shut Down, Log Out)
 - [ ] Full-screen region map, quest markers, zone-line glyphs
 - [ ] Recast-timer display
 - [ ] Buff / debuff duration timers
@@ -137,11 +156,16 @@ resolves it.
 - [x] Auto-attack engage / disengage, engaged-target ring
 - [x] Combat-stance animation
 - [x] `/check` — mob con (level / defense estimate)
-- [ ] `/check` on players — inspect equipment / bazaar wares.
-  `TODO(litigate)` confirm this is what "item /check" meant in the old
-  scoreboard
+- [ ] `/check` on players — bazaar "View Wares" + 4×4 equipment grid
+  inspector, with per-slot item detail and a "`<name>` examines you" chat line
+  (confirmed: this is the "item /check" from the old scoreboard)
 - [~] Action dispatch from menu — item use wired; magic / ability dispatch
   partial
+- [ ] Magic list spell categories (White / Black / Songs / Summoning / Blue;
+  classic set) with a "No spells available" empty state per category
+- [ ] Abilities sub-grouping: Job Abilities / Weapon Skill / Ranged Attack /
+  Mount / Pet Command, with contextual error strings ("You cannot use that
+  command here.", "No mounts available.")
 - [ ] Weaponskill chain UI (vanilla skillchain message + animation, not the
   addon visualizer)
 
@@ -151,7 +175,10 @@ resolves it.
   Case, Wardrobe, Mog Locker, Gobbiebag) data-ready, no per-container view
 - [~] Equipment: 16 slots displayed, equip-from-inventory works — unequip
   and basic gear management missing
-- [ ] Stack split, drop, sort
+- [ ] Stack split, drop, sort — sort menu has Auto (yes/no → server sort),
+  Manual (swap positions), Recycle Bin (recently discarded); Manual + Recycle
+  Bin are incomplete even upstream, so Auto is the parity target. Item list
+  shows held/capacity count (e.g. 14/30) and a "Select an item." helper
 
 #### Party & social
 
@@ -162,12 +189,16 @@ resolves it.
 - [ ] `/search` + player search panel
 - [ ] Search-comment edit
 - [ ] Bazaar (browse / sell)
-- [ ] Player ↔ player trade window
+- [ ] Player ↔ player trade window — 4×2 item grid + gil selector (tab to fill
+  digits / max) + per-stack quantity selector + OK/Cancel; rare/ex and equipped
+  items disabled; reuses the item detail panel
 - [ ] Emote animations
 
 #### World interaction
 
 - [x] Zone change, system messages
+- [ ] NPC interaction range gate (~6 yalms): talk / trade / check fail with
+  "Target out of range" beyond it; no contextual menu opens out of range
 - [~] NPC dialogue — text renders; **choice branching missing** (no
   progression past the first prompt)
 - [~] NPC shops — buy works; sell-to-NPC missing
@@ -181,7 +212,10 @@ resolves it.
 
 #### Character & progression
 
-- [ ] Status menu (jobs, levels, skills, stats breakdown)
+- [ ] Status menu (jobs, levels, skills, stats breakdown) — submenu: Profile,
+  Job Levels, Master Levels, Combat / Magic / Craft Skill, Currencies (1 & 2),
+  Unity, Play Time (→ chat), Merit Points, Job Points. Profile panel shows
+  name, job/sub-job + levels, item level, HP/MP/TP, STR/DEX/VIT/AGI/INT/MND/CHR
 - [ ] Magic spell list (learned spells)
 - [ ] Abilities / job traits list
 - [ ] Merits, job points, capacity points
@@ -206,9 +240,10 @@ parity isn't compromised by default.
 - [~] WoW / Ashita-style minimap — retail and topdown modes; self-marker
   not heading-rotated. This replaces the vanilla compass for users who
   want it.
-- [~] Quick-action bar — routes to submenus; direct one-press cast not
-  wired. `TODO(litigate)` confirm whether "quick action menu" is the
-  preferred name.
+- [~] Quick-action ring (`hud/quick_action.rs`) — routes to submenus; direct
+  one-press cast not wired. This is the Enhanced addon ring, **distinct from**
+  the vanilla target-action contextual menu tracked under Vanilla → HUD.
+  `TODO(litigate)` confirm whether "quick action menu" is the preferred name.
 - [ ] DPS meter / combat-log parser
 - [ ] Skillchain visualizer
 - [ ] Item compare tooltips
@@ -241,6 +276,11 @@ the scoreboard stays honest.
 
 Before adding a new line: decide which scoreboard it belongs on. If the
 official FFXI client doesn't have it, it goes under **Enhanced / addon**.
+
+The vanilla menu / target-interaction gaps (target-action contextual menu,
+trade window, item detail panel, status/profile panel, main-menu "Commands"
+ordering, NPC range gate, door zone-transition flow) are specced and staged in
+[`docs/vanilla-menu-parity-plan.md`](docs/vanilla-menu-parity-plan.md).
 
 For protocol questions, the headless `play` subcommand emits a JSON event
 stream that's easy to inspect. For rendering work, the native window is
