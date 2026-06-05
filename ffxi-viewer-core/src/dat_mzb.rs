@@ -1775,7 +1775,14 @@ pub fn auto_load_zone_geometry_system(
     // don't end up firing a new one (covers the Some(A) → None
     // "logout / charselect" case).
     for e in auto_q.iter() {
-        commands.entity(e).despawn();
+        // `get_entity` guard: a session-scoped drain may have already
+        // queued a despawn of this overlay earlier in the frame, so the
+        // query can hand us an entity that's gone by flush time. Skip
+        // quietly rather than double-despawn (which the command error
+        // handler logs as a WARN).
+        if let Ok(mut ec) = commands.get_entity(e) {
+            ec.despawn();
+        }
     }
     last.zone_id = current;
     let Some(zone_id) = current else { return };

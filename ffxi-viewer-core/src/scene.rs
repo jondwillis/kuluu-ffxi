@@ -797,7 +797,16 @@ pub fn ensure_self_lookcomp_system(
             Some(LookComp(existing)) => existing != look,
         };
         if needs {
-            commands.entity(e).insert(LookComp(look.clone()));
+            // Guard against the stale-query race: an earlier system in
+            // this same Update tuple (e.g. `sync_entities_system` on a
+            // zone transition) may have queued a despawn of the self
+            // entity. Commands don't flush until `apply_deferred`, so the
+            // `IsSelf` query above can still return an entity that is
+            // about to vanish. `get_entity` skips quietly in that window
+            // instead of panicking at flush time.
+            if let Ok(mut ec) = commands.get_entity(e) {
+                ec.insert(LookComp(look.clone()));
+            }
         }
     }
 }
