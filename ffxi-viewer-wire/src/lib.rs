@@ -65,9 +65,10 @@ impl Default for Position {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
+    #[default]
     Idle,
     Authenticating,
     LobbyHandshake,
@@ -75,12 +76,6 @@ pub enum Stage {
     Zoning,
     InZone,
     Disconnected,
-}
-
-impl Default for Stage {
-    fn default() -> Self {
-        Stage::Idle
-    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -537,7 +532,7 @@ pub struct DialogState {
 pub struct ShopState {
     /// `ShopItemOffsetIndex` from the 0x03C header — the per-shop offset
     /// the server uses to compose successive list packets for shops with
-    /// >19 items. Echoed back in `ShopBuy` via `ShopNo` so the server
+    /// more than 19 items. Echoed back in `ShopBuy` via `ShopNo` so the server
     /// resolves which shop list this is referring to.
     pub offset_index: u16,
     /// One row per item the shop sells. Order matches the wire `ShopIndex`,
@@ -847,7 +842,14 @@ mod tests {
             dialog: None,
             shop: None,
             status_icons: Vec::new(),
+            logout_countdown: None,
             weather: None,
+            equipped: [None; 16],
+            spells_known: Vec::new(),
+            job_abilities_known: Vec::new(),
+            weaponskills_known: Vec::new(),
+            pet_abilities_known: Vec::new(),
+            inventory_main: Vec::new(),
         }
     }
 
