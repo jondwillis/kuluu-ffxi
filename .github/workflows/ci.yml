@@ -31,6 +31,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked --features native-window -- -D warnings
 
+      # Comment/doc discipline, advisory for now. broken_intra_doc_links
+      # catches symbol references in /// docs that no longer resolve (the
+      # de-sync rot family); doc_markdown / suspicious_doc_comments catch
+      # formatting. continue-on-error keeps it non-blocking until the tree
+      # is clean — promote to a hard gate (drop continue-on-error, flip the
+      # flags to -D) once it reports zero.
+      - name: Doc lints (advisory)
+        continue-on-error: true
+        run: |
+          RUSTDOCFLAGS="-W rustdoc::broken_intra_doc_links" \
+            cargo doc --workspace --no-deps --document-private-items --locked --features native-window
+          cargo clippy --workspace --locked --features native-window -- \
+            -W clippy::doc_markdown -W clippy::suspicious_doc_comments \
+            -W clippy::empty_docs -W clippy::undocumented_unsafe_blocks
+
       # Integration tests that need a live LSB server self-skip when it is
       # unreachable, so the full suite is safe on a network-isolated runner.
       - name: Test
