@@ -1,7 +1,6 @@
 # Rust workspace artifacts (defense-in-depth; component .gitignores cover this too)
 **/target/
 **/*.rs.bk
-Cargo.lock
 
 # Node / abandoned scaffolds
 **/node_modules/
