@@ -1803,7 +1803,7 @@ mod tests {
         buf[0] = 81;
         // Mog Safe (id=1): legacy 81, wide 201 → wide wins → 200.
         buf[1] = 81;
-        let wide_off = 18 + 14 + 1 * 2;
+        let wide_off = 18 + 14 + 2;
         buf[wide_off..wide_off + 2].copy_from_slice(&201u16.to_le_bytes());
         // Wardrobe2 (id=10): legacy 0, wide 81 → wide-only → 80.
         let wide_off = 18 + 14 + 10 * 2;

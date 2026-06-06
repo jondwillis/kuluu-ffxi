@@ -320,7 +320,7 @@ fn decode_paletted_bitmap(
     }
     let palette = &bytes[..palette_len];
 
-    let row_stride = ((width as usize * bit_count as usize + 31) / 32) * 4;
+    let row_stride = (width as usize * bit_count as usize).div_ceil(32) * 4;
     let pixel_data_len = row_stride * height as usize;
     if bytes.len() < palette_len + pixel_data_len {
         return Err(DatError::Mmb(format!(
@@ -337,8 +337,8 @@ fn decode_paletted_bitmap(
         // BMP rows are bottom-up unless height was negative (top_down).
         let src_y = if top_down { y } else { height as usize - 1 - y };
         let src_row = &pixels[src_y * row_stride..src_y * row_stride + width as usize];
-        for x in 0..width as usize {
-            let idx = src_row[x] as usize;
+        for (x, &pal_byte) in src_row.iter().enumerate() {
+            let idx = pal_byte as usize;
             if idx >= palette_entries {
                 // Same scanner-resilience rationale as the
                 // `used_colors == 0` check above: an indexed byte
@@ -352,7 +352,7 @@ fn decode_paletted_bitmap(
             // BGRA on disk → RGBA in output. Alpha is 0 for flag
             // 0x91 (interpret as opaque); use the byte directly for
             // 0xB1.
-            let dst = ((y * width as usize + x) * 4) as usize;
+            let dst = (y * width as usize + x) * 4;
             rgba[dst] = palette[pal_off + 2]; // R
             rgba[dst + 1] = palette[pal_off + 1]; // G
             rgba[dst + 2] = palette[pal_off]; // B

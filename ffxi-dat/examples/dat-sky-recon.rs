@@ -69,7 +69,7 @@ fn looks_like_dxt1(buf: &[u8]) -> bool {
 }
 
 fn divisible_by_six(body_len: usize) -> bool {
-    body_len != 0 && body_len % 6 == 0
+    body_len != 0 && body_len.is_multiple_of(6)
 }
 
 fn hex_preview(buf: &[u8], n: usize) -> String {

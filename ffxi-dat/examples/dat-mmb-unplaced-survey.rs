@@ -62,7 +62,7 @@ fn main() -> ExitCode {
         .iter()
         .enumerate()
         .filter(|(local, _)| !referenced.contains(local))
-        .map(|(local, (chunk_idx, name))| (*chunk_idx, name))
+        .map(|(_local, (chunk_idx, name))| (*chunk_idx, name))
         .collect();
     unplaced.sort_by_key(|(_, name)| name.to_string());
 

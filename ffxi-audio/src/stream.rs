@@ -7,6 +7,11 @@
 //! decoded buffer instead, which is what the Bevy glue currently
 //! uses (the largest BGM track is ~30MB f32, comfortable for RAM).
 
+// Per-channel decode + frame-interleave transpose: the loop index drives both
+// the per-channel buffer and byte-offset arithmetic, so range-index loops read
+// clearer than iterator adapters would here.
+#![allow(clippy::needless_range_loop)]
+
 use crate::adpcm::{decode_block_into, ChannelState};
 use crate::header::AudioHeader;
 use crate::Result;

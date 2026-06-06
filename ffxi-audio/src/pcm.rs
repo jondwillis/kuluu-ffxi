@@ -10,6 +10,11 @@
 //! Channels are laid out block-by-block in channel-major order, just
 //! like the ADPCM SeWave variant.
 
+// Channel-major decode + frame-interleave transpose: the loop index drives both
+// the per-channel buffer and byte-offset arithmetic, so range-index loops read
+// clearer than iterator adapters would here.
+#![allow(clippy::needless_range_loop)]
+
 use crate::header::AudioHeader;
 use crate::Result;
 

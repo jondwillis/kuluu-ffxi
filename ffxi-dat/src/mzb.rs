@@ -734,9 +734,9 @@ pub fn parse_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbPlacem
 
                 // 16 f32s, on-disk order.
                 let mut m = [0.0f32; 16];
-                for k in 0..16 {
+                for (k, slot) in m.iter_mut().enumerate() {
                     let o = mat_off + k * 4;
-                    m[k] = f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+                    *slot = f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
                 }
 
                 // Determinant of the 3×3 linear part. Per the
@@ -1086,8 +1086,8 @@ mod tests {
         //          material bit 2), n0=0|0x8000 (material bit 3)
         //          → indices [0,2,3], material=0b1100=12, is_barrier=true.
         let tris: [[u16; 4]; 2] = [
-            [0 | 0x8000, 1 | 0x4000, 2, 0],
-            [0, 2, 3 | 0x4000 | 0x8000, 0 | 0x8000],
+            [0x8000, 1 | 0x4000, 2, 0],
+            [0, 2, 3 | 0x4000 | 0x8000, 0x8000],
         ];
         for (i, t) in tris.iter().enumerate() {
             let o = 0x7C + i * 8;

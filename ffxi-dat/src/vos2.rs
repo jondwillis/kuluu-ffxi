@@ -894,7 +894,7 @@ mod tests {
         // Hand-build a minimal Vos2Mesh; bypass parse_vos2 since we
         // just want to exercise the resolver logic.
         let mut mesh = Vos2Mesh {
-            header: Vos2Header::parse(&vec![0u8; 0x40]).unwrap(),
+            header: Vos2Header::parse(&[0u8; 0x40]).unwrap(),
             vertices: vec![Vos2Vertex {
                 pos: [0.0; 3],
                 normal: [0.0; 3],
@@ -979,9 +979,9 @@ mod tests {
 
         // Bone indices stream: vertex 0 → palette[1]=20; vertex 1 → palette[2]=30
         // (rigid verts consume 2 records each; only the first matters).
-        let bi0 = (0u16 << 14) | (0u16 << 7) | 1u16; // bone1=1
+        let bi0 = 1u16; // bone1=1
         let bi1 = 0u16; // pad slot
-        let bi2 = (0u16 << 14) | (0u16 << 7) | 2u16; // bone1=2
+        let bi2 = 2u16; // bone1=2
         let bi3 = 0u16;
         for (i, &w) in [bi0, bi1, bi2, bi3].iter().enumerate() {
             buf[BISTART + i * 2..BISTART + i * 2 + 2].copy_from_slice(&w.to_le_bytes());

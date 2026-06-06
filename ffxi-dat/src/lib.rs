@@ -13,6 +13,12 @@
 //!     file = file_dir & 0x7F (lower 7 bits)
 //!   path = {install}/FINAL FANTASY XI/{rom_dir}/{dir}/{file}.DAT
 
+// This crate's module docs use hand-aligned byte-offset layout tables to
+// describe FFXI's binary DAT formats; clippy's markdown list heuristics flag
+// the deliberate indentation. Allow the doc-list style lints crate-wide rather
+// than mangling the format documentation.
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
+
 pub mod action;
 pub mod anim;
 pub mod archive;

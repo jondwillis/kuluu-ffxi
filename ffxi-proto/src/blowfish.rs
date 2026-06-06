@@ -100,9 +100,9 @@ pub fn encipher(xl: &mut u32, xr: &mut u32, p: &[u32; 18], s: &[u32; 1024]) {
     let mut x_l = *xl;
     let mut x_r = *xr;
 
-    for i in 0..N {
-        x_l ^= p[i];
-        x_r = tt(x_l, s) ^ x_r;
+    for &round_key in &p[..N] {
+        x_l ^= round_key;
+        x_r ^= tt(x_l, s);
         std::mem::swap(&mut x_l, &mut x_r);
     }
     std::mem::swap(&mut x_l, &mut x_r);
@@ -121,7 +121,7 @@ pub fn decipher(xl: &mut u32, xr: &mut u32, p: &[u32; 18], s: &[u32; 1024]) {
 
     for i in (2..=(N + 1)).rev() {
         x_l ^= p[i];
-        x_r = tt(x_l, s) ^ x_r;
+        x_r ^= tt(x_l, s);
         std::mem::swap(&mut x_l, &mut x_r);
     }
     std::mem::swap(&mut x_l, &mut x_r);

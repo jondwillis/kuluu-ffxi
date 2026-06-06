@@ -16,6 +16,11 @@
 //! 5-entry filter tables (`filter0`/`filter1`) are PS2 ADPCM
 //! coefficients — see `adpcm.cppm:37-38`.
 
+// Channel-major decode + frame-interleave transpose: the loop index drives both
+// the per-channel buffer and byte-offset arithmetic, so range-index loops read
+// clearer than iterator adapters would here.
+#![allow(clippy::needless_range_loop)]
+
 use crate::header::AudioHeader;
 use crate::{AudioError, Result};
 

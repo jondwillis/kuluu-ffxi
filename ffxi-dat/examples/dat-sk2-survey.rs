@@ -18,6 +18,10 @@
 //! If `chunk_idx` is supplied, only that chunk is dumped; otherwise
 //! every 0x29 chunk in the file is dumped.
 
+// Hand-aligned layout/target notes; the crate's lib allows this doc-list lint
+// but examples compile standalone, so allow it here too.
+#![allow(clippy::doc_overindented_list_items)]
+
 use std::env;
 use std::fs;
 use std::process::ExitCode;
@@ -113,7 +117,7 @@ fn dump_sk2(chunk_idx: usize, body: &[u8]) {
     );
     println!("  payload bytes after header = {payload}  → bytes-per-bone candidates:");
     for stride in [48usize, 56, 64, 80] {
-        if count > 0 && payload % stride == 0 && payload / stride == count as usize {
+        if count > 0 && payload.is_multiple_of(stride) && payload / stride == count as usize {
             println!("    EXACT MATCH: stride={stride}  (count*stride == payload)");
         } else if count > 0 {
             let extra = payload as i64 - count as i64 * stride as i64;

@@ -383,7 +383,7 @@ fn decode_dxt_common(
     block_size: usize,
     mut block_decode: impl FnMut(&[u8], &mut [u8; 64]),
 ) -> std::result::Result<Vec<u8>, TextureError> {
-    if width == 0 || height == 0 || width % 4 != 0 || height % 4 != 0 {
+    if width == 0 || height == 0 || !width.is_multiple_of(4) || !height.is_multiple_of(4) {
         return Err(TextureError::BadDimensions { width, height });
     }
     let (w, h) = (width as usize, height as usize);
@@ -579,7 +579,7 @@ mod tests {
         // Pixel (2,0): index 0 → red.
         assert_eq!(&rgba[8..12], &[255, 0, 0, 255]);
         // Pixel (0,1): row 1 col 0 — index 0 → red.
-        let row1_col0 = (1 * 4 + 0) * 4;
+        let row1_col0 = 4 * 4;
         assert_eq!(&rgba[row1_col0..row1_col0 + 4], &[255, 0, 0, 255]);
     }
 
