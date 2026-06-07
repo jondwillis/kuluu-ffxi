@@ -30,7 +30,6 @@ use ffxi_dat::vos2::{parse_vos2, Vos2Mesh};
 use ffxi_dat::{walk, walk_tree, ChunkKind, ChunkNode, DatRoot};
 
 use crate::scene::TrackedEntities;
-use crate::snapshot::SceneState;
 
 /// Parent-side actor state for an NPC rendered via Bevy `SkinnedMesh`.
 /// One bone-entity is created per skeleton bone; each holds a `Transform`
@@ -673,6 +672,11 @@ pub fn process_load_vos2_requests(
     // from this component. Within a single tick the in-tick map is
     // the source of truth (Commands::insert is deferred).
     q_skinned_actor: Query<&SkinnedActor>,
+    // Cross-tick merge of the CPU-bake actor extent: PC equipment
+    // slots arrive across multiple frames, so the running (min, max)
+    // already committed for this entity is read back from its
+    // `BakedActor` when the in-tick `cpu_extent` map is empty.
+    q_baked: Query<&crate::scene::BakedActor>,
     // Pivot re-anchoring: every request whose merged min is deeper
     // than the pivot's current translation rewrites it via this
     // query so the actor stays glued to feet-on-ground.
@@ -699,6 +703,12 @@ pub fn process_load_vos2_requests(
     // re-fires across frames), we fall back to the `SkinnedActor`
     // component for state recovery; see the lookup below.
     let mut actor_state: std::collections::HashMap<u32, (Vec<Entity>, Entity, f32, f32)> =
+        std::collections::HashMap::new();
+    // In-tick running (min, max) parent-local Y for the CPU-bake (PC)
+    // path, accumulated across an actor's equipment slots so the
+    // `BakedActor` we attach reflects the whole body, not just the
+    // last slot processed this tick.
+    let mut cpu_extent: std::collections::HashMap<u32, (f32, f32)> =
         std::collections::HashMap::new();
 
     for req in queued {
@@ -930,7 +940,7 @@ pub fn process_load_vos2_requests(
         // skeletons have feet sole exactly at mesh-Z=0, so 0 is
         // correct for nearly all visible cases.
         let fallback_translation = 0.0;
-        let _ = spawn_vos2_meshes_with_skeleton(
+        let slot_extent = spawn_vos2_meshes_with_skeleton(
             &mut commands,
             &mut meshes,
             &mut materials,
@@ -947,6 +957,41 @@ pub fn process_load_vos2_requests(
             loaded.mesh.vertices.len(),
             loaded.mesh.groups.len(),
         );
+
+        // Attach/refresh `BakedActor` from the just-spawned slot's
+        // extent. This is the *primary* in-game PC route, yet it used
+        // to drop the returned `(min, max)` on the floor — leaving
+        // every PC `baked=false`, so `nameplate_anchor_y` fell back to
+        // `FALLBACK_ACTOR_HEIGHT` (3.0) and floated the name ~1 yalm
+        // above a real ~2.3-yalm crown. The GPU path (above) and the
+        // launcher's `spawn_equipped` already do this; the CPU path
+        // was the gap. PC-only (`race != 0`): NPCs anchor through the
+        // GPU path and only reach here on a rare skeleton misfit, where
+        // this frame's extent convention wouldn't match theirs.
+        if req.race != 0 {
+            if let Some((slot_min, slot_max)) = slot_extent {
+                // Merge across the actor's slots: in-tick map first
+                // (deferred inserts aren't query-visible yet), then the
+                // cross-tick `BakedActor`, then this slot alone.
+                let (prev_min, prev_max) = cpu_extent
+                    .get(&req.entity_id)
+                    .copied()
+                    .or_else(|| {
+                        q_baked
+                            .get(bevy_e)
+                            .ok()
+                            .map(|b| (b.min_mesh_y, b.min_mesh_y + b.actor_height))
+                    })
+                    .unwrap_or((f32::INFINITY, f32::NEG_INFINITY));
+                let merged_min = prev_min.min(slot_min);
+                let merged_max = prev_max.max(slot_max);
+                cpu_extent.insert(req.entity_id, (merged_min, merged_max));
+                commands.entity(bevy_e).insert(crate::scene::BakedActor {
+                    min_mesh_y: merged_min,
+                    actor_height: (merged_max - merged_min).max(0.1),
+                });
+            }
+        }
     }
 }
 
@@ -1725,7 +1770,7 @@ pub fn tick_skinned_actors(
             .unwrap_or(false);
         let sample = motion
             .sample(world.id)
-            .unwrap_or(crate::combat_stance::MotionSample::default());
+            .unwrap_or_default();
         let moving = sample.speed > EntityMotion::MOVE_THRESHOLD;
 
         // Rest stance (self only): when `/sit` / `/heal` / `/kneel` is
@@ -2417,8 +2462,19 @@ pub fn spawn_equipped(
                     if let Some((min_y, max_y)) =
                         measure_post_bake_y_extent(&loaded, baked_skel.as_ref())
                     {
-                        actor_min_local_y = actor_min_local_y.min(min_y);
-                        actor_max_local_y = actor_max_local_y.max(max_y);
+                        // Weapons (main/sub/ranged) routinely tower above
+                        // the crown in the bind pose — a polearm/staff is
+                        // ~2 yalms grip-to-tip, a bow rides high on the
+                        // back. Letting them widen the actor bbox pushes
+                        // both the feet anchor and the nameplate crown to
+                        // weapon-tip height, which floats the label far
+                        // above the head. Measure the body silhouette only;
+                        // the weapon meshes still spawn and render, they
+                        // just don't drive the anchors.
+                        if !matches!(label, "main" | "sub" | "ranged") {
+                            actor_min_local_y = actor_min_local_y.min(min_y);
+                            actor_max_local_y = actor_max_local_y.max(max_y);
+                        }
                     }
                     loaded_slots.push(LoadedSlot {
                         loaded,
