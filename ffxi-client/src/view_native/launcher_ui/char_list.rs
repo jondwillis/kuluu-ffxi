@@ -250,9 +250,7 @@ pub(super) fn keyboard_nav_system(
             Key::Character(s) if s.eq_ignore_ascii_case("w") => {
                 cursor.0 = (cursor.0 + count - 1) % count
             }
-            Key::Character(s) if s.eq_ignore_ascii_case("s") => {
-                cursor.0 = (cursor.0 + 1) % count
-            }
+            Key::Character(s) if s.eq_ignore_ascii_case("s") => cursor.0 = (cursor.0 + 1) % count,
             Key::Enter => {
                 if cursor.0 == chars.0.len() {
                     next.set(LauncherState::CharCreate);

@@ -279,8 +279,16 @@ pub(super) fn refresh_preview_on_cursor_change(
     match active {
         Some(slot) if slot.race != 0 => {
             let (race, face, head, body, hands, legs, feet, main, sub, ranged) = (
-                slot.race, slot.face, slot.head, slot.body, slot.hands, slot.legs, slot.feet,
-                slot.main, slot.sub, slot.ranged,
+                slot.race,
+                slot.face,
+                slot.head,
+                slot.body,
+                slot.hands,
+                slot.legs,
+                slot.feet,
+                slot.main,
+                slot.sub,
+                slot.ranged,
             );
             let char_id = slot.char_id;
             let task = AsyncComputeTaskPool::get().spawn(async move {
@@ -367,4 +375,3 @@ pub(super) fn spawn_preview_pc(
         commands, meshes, materials, images, parent, race, face, 0, 0, 0, 0, 0, 0, 0, 0,
     )
 }
-

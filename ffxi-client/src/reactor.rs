@@ -94,8 +94,7 @@ impl Default for ReactorConfig {
 
 /// Active high-level intent. `Idle` produces no per-tick output. Each
 /// non-idle variant is what the agent / LLM committed to last.
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Goal {
     #[default]
     Idle,
@@ -129,7 +128,6 @@ pub enum Goal {
         mog_house_zoneline: u32,
     },
 }
-
 
 /// Project the reactor's internal `Goal` into the serializable
 /// `ReactorGoalSnapshot` mirror in `state.rs`. Exhaustive on the current
@@ -387,9 +385,10 @@ impl Reactor {
                     .collect();
                 // The first waypoint coincides with `from`; skip it so
                 // the agent starts moving toward the next corner.
-                if waypoints.first().is_some_and(|w| {
-                    horizontal_distance(*w, cur) < self.cfg.max_step_per_tick
-                }) {
+                if waypoints
+                    .first()
+                    .is_some_and(|w| horizontal_distance(*w, cur) < self.cfg.max_step_per_tick)
+                {
                     waypoints.remove(0);
                 }
                 // Off-mesh last-mile: Detour's `find_straight_path`

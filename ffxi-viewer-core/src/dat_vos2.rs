@@ -1768,9 +1768,7 @@ pub fn tick_skinned_actors(
             .get(&world.id)
             .map(|&t| t != 0)
             .unwrap_or(false);
-        let sample = motion
-            .sample(world.id)
-            .unwrap_or_default();
+        let sample = motion.sample(world.id).unwrap_or_default();
         let moving = sample.speed > EntityMotion::MOVE_THRESHOLD;
 
         // Rest stance (self only): when `/sit` / `/heal` / `/kneel` is

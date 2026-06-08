@@ -88,14 +88,12 @@ const TURNTABLE_RAD_PER_SEC: f32 = 0.3;
 const REBAKE_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Which input set the form is showing: PC equipment vs. NPC modelid.
-#[derive(Resource, Debug, Clone, Copy, Eq, PartialEq)]
-#[derive(Default)]
+#[derive(Resource, Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum ViewerMode {
     #[default]
     Pc,
     Npc,
 }
-
 
 /// The currently-displayed PC inputs. Edited by [`panel`] via
 /// `ValueChange<String>` triggers; consumed on rebake by

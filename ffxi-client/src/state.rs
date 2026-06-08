@@ -555,7 +555,6 @@ pub enum ReactorGoalSnapshot {
     },
 }
 
-
 fn one_u32() -> u32 {
     1
 }
@@ -1102,7 +1101,6 @@ impl SessionState {
         }
     }
 }
-
 
 /// Events emitted by the Session actor. The JSON sidechannel writes these
 /// one-per-line to stdout; the TUI consumes them via a `tokio::sync::broadcast`.

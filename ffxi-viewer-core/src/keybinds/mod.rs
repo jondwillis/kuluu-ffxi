@@ -478,9 +478,11 @@ mod tests {
 
     #[test]
     fn iter_is_deterministic() {
-        let pairs = [(Action::MoveForward, KeyBind::new(KeyCode::KeyW)),
+        let pairs = [
+            (Action::MoveForward, KeyBind::new(KeyCode::KeyW)),
             (Action::CycleTarget, KeyBind::new(KeyCode::Tab)),
-            (Action::OpenMenu, KeyBind::new(KeyCode::Minus))];
+            (Action::OpenMenu, KeyBind::new(KeyCode::Minus)),
+        ];
         let b1 = Bindings::from_pairs(pairs.iter().copied());
         let b2 = Bindings::from_pairs(pairs.iter().rev().copied());
         let v1: Vec<_> = b1.iter().collect();
