@@ -29,7 +29,7 @@ use std::f32::consts::PI;
 
 use bevy::prelude::*;
 
-use crate::hud::vana_clock::{EARTH_EPOCH_UNIX, EARTH_SECS_PER_VANA_DAY};
+use crate::hud::vana_clock::EARTH_EPOCH_UNIX;
 
 /// Tag the canonical sun directional light. There should be exactly one.
 #[derive(Component)]
@@ -788,6 +788,7 @@ pub fn sun_moon_system(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hud::vana_clock::EARTH_SECS_PER_VANA_DAY;
 
     #[test]
     fn noon_sun_is_overhead() {

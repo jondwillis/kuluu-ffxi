@@ -62,7 +62,7 @@ pub const DEFAULT_BACKDROP_ZONE: u16 = 102;
 /// FadingIn cycle completes, then a new fade kicks. Net effect:
 /// at most one zone load per ~1s fade cycle, but every change is
 /// acknowledged immediately.
-
+///
 /// The zone id currently driving the launcher backdrop. Written by
 /// the plugin's selection-watcher (and on startup); read by a system
 /// that mirrors it into `SceneState.snapshot.zone_id` to trigger the

@@ -81,7 +81,7 @@ fn cast_magic_action_layout_matches_phoenix_struct() {
 fn weaponskill_action_writes_skill_id_only() {
     let buf = build_subpacket_action(
         0,
-        0x0DEAD_BEEF,
+        0xDEAD_BEEF,
         0x10,
         &ActionKind::Weaponskill { skill_id: 0xCAFE },
     );

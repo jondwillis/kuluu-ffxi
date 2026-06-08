@@ -292,10 +292,7 @@ pub fn update_self_party_indicator(
 /// been resolved yet so the HUD shows *something* during the post-zone
 /// race window where party data has arrived but `self_char_id` is
 /// still `None`.
-pub fn resolve_self<'a>(
-    party: &'a [PartyMember],
-    self_char_id: Option<u32>,
-) -> Option<&'a PartyMember> {
+pub fn resolve_self(party: &[PartyMember], self_char_id: Option<u32>) -> Option<&PartyMember> {
     if let Some(id) = self_char_id {
         if let Some(m) = party.iter().find(|m| m.id == id) {
             return Some(m);

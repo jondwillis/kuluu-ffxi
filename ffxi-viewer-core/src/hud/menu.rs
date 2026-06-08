@@ -217,7 +217,7 @@ pub fn entry_count(kind: MenuKind, dynamic: &DynamicMenu) -> usize {
 /// Label for a given menu screen + cursor index. For dynamic menus the
 /// label comes from `DynamicMenu.rows[idx].label`; out-of-range
 /// returns `"<unknown>"` rather than panicking.
-pub fn entry_label<'a>(kind: MenuKind, idx: usize, dynamic: &'a DynamicMenu) -> &'a str {
+pub fn entry_label(kind: MenuKind, idx: usize, dynamic: &DynamicMenu) -> &str {
     if is_dynamic(kind) {
         if dynamic.rows.is_empty() {
             return empty_dynamic_hint(kind);

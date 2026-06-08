@@ -131,6 +131,9 @@ pub async fn serve(
 
 /// Per-connection driver. Holds its own subscribers; a slow consumer
 /// only affects its own queue.
+// The accept_hdr_async callback's `Result<Response, ErrorResponse>` is dictated
+// by tungstenite's API, so the large Err variant is unavoidable here.
+#[allow(clippy::result_large_err)]
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,

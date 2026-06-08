@@ -2349,15 +2349,9 @@ fn parse_sound(rest: &str) -> SlashOutcome {
             }
         }
     }
-    let verb = match verb {
-        Some(v) => v,
-        None => {
-            // A bare category (`/sound bgm`) with no verb reads as
-            // toggle — same convention `/devhud` uses when called
-            // with no arg.
-            None
-        }
-    };
+    // A bare category (`/sound bgm`) with no verb reads as toggle — same
+    // convention `/devhud` uses when called with no arg.
+    let verb = verb.unwrap_or_default();
     let op = match category {
         Some("bgm") => SoundOp::SetBgm(verb),
         Some("sfx") => SoundOp::SetSfx(verb),

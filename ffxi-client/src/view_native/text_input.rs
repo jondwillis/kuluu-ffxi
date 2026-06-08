@@ -473,8 +473,6 @@ fn handle_chat_key(key: &Key, bindings: &Bindings, buffer: &mut ChatBuffer) -> C
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn apply_chat_action(
     action: ChatAction,
     mode: &mut InputMode,

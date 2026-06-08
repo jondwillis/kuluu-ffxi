@@ -224,7 +224,7 @@ pub fn ingest_system<S: SceneSource + Resource>(
 /// UI-local `local_toasts`. The chat panel calls this each frame so the
 /// rendering order matches the user's mental model — server messages
 /// arrive in the past, the toasts they triggered show below them.
-pub fn rendered_chat<'a>(state: &'a SceneState) -> Vec<&'a ChatLine> {
+pub fn rendered_chat(state: &SceneState) -> Vec<&ChatLine> {
     // Merge the two stamped streams by `local_seq` so a debug toast
     // pushed at seq=42 lands between server lines stamped 41 and 43,
     // not at the tail of the toast bucket. Both inputs are already
@@ -662,8 +662,10 @@ mod tests {
         app.add_systems(Update, ingest_system::<TestSource>);
 
         // Hand the source a snapshot, run one update, verify it lands.
-        let mut s = SceneSnapshot::default();
-        s.stage = Stage::InZone;
+        let s = SceneSnapshot {
+            stage: Stage::InZone,
+            ..Default::default()
+        };
         app.world_mut().resource_mut::<TestSource>().next_snapshot = Some(Box::new(s));
         app.update();
         assert_eq!(

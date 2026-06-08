@@ -530,7 +530,7 @@ pub fn sync_entities_system(
         // when the LOGIN-seed Entity has `name = None` (CHAR_PC hasn't
         // arrived yet) so the nameplate doesn't briefly disappear after
         // zone-in.
-        let name = wire.name.as_deref().or_else(|| {
+        let name = wire.name.as_deref().or({
             if is_self {
                 snap.char_name.as_deref()
             } else {
@@ -718,12 +718,12 @@ fn pick_material(m: &EntityMaterials, kind: EntityKind, is_self: bool) -> Handle
 /// `self_id == 0` means "we don't know our own UniqueNo yet"; in that
 /// state we can't distinguish self-claim from other-claim, so any
 /// non-zero `claim_id` falls through to "other".
-pub fn pick_mob_material<'a>(
-    mats: &'a EntityMaterials,
+pub fn pick_mob_material(
+    mats: &EntityMaterials,
     claim_id: u32,
     self_id: u32,
     is_aggro: bool,
-) -> &'a Handle<StandardMaterial> {
+) -> &Handle<StandardMaterial> {
     if is_aggro {
         return &mats.aggro;
     }
@@ -805,7 +805,7 @@ pub fn ensure_self_lookcomp_system(
             // about to vanish. `get_entity` skips quietly in that window
             // instead of panicking at flush time.
             if let Ok(mut ec) = commands.get_entity(e) {
-                ec.insert(LookComp(look.clone()));
+                ec.insert(LookComp(*look));
             }
         }
     }
@@ -828,7 +828,7 @@ pub fn sync_entity_looks_system(
         match (&wire.look, current) {
             (Some(new), Some(LookComp(old))) if new == old => {}
             (Some(new), _) => {
-                commands.entity(bevy_e).insert(LookComp(new.clone()));
+                commands.entity(bevy_e).insert(LookComp(*new));
             }
             (None, Some(_)) => {
                 commands.entity(bevy_e).remove::<LookComp>();

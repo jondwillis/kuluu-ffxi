@@ -1194,7 +1194,6 @@ where
 {
     struct Cand {
         id: u32,
-        ndc_x: f32,
         ndc_mag_sq: f32,
         dist_sq: f32,
         in_frustum: bool,
@@ -1231,7 +1230,6 @@ where
             let in_frustum = ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0;
             Some(Cand {
                 id: e.id,
-                ndc_x: ndc.x,
                 ndc_mag_sq: ndc.x * ndc.x + ndc.y * ndc.y,
                 dist_sq: dx * dx + dy * dy + dz * dz,
                 in_frustum,
@@ -1303,10 +1301,6 @@ pub struct CameraAutoRecenter {
     pub manual_override: bool,
 }
 
-/// Forward must be held this long with no yaw input before auto-recenter
-/// engages. Matches retail's "walk a beat before the camera trails" feel
-/// (long enough that brief forward taps don't twitch the camera).
-const AUTO_RECENTER_HOLD_S: f32 = 0.5;
 /// Spring constant for the post-motion chase recenter (1/sec).
 /// Exponential lerp: each tick the residual angle shrinks by
 /// `1 - exp(-rate · dt)`. At 3.0 the half-life is ~0.23s — the

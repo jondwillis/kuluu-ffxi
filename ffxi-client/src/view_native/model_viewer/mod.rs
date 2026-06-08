@@ -479,9 +479,7 @@ fn do_rebake(
             // missed the face mesh entirely. Match `spawn_equipped`'s
             // pass-1 loop: enumerate per-DAT, dispatch one request
             // per chunk.
-            let Some(skel) = pc_race_to_skel(pc.race) else {
-                return None;
-            };
+            let skel = pc_race_to_skel(pc.race)?;
             let mut dispatch_dat = |file_id: u32| {
                 let chunks = enumerate_vos2_chunks(file_id);
                 if chunks.is_empty() {

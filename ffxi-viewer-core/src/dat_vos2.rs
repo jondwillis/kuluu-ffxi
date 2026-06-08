@@ -269,9 +269,6 @@ static BAKED_SKELETONS: OnceLock<
 
 #[derive(Clone)]
 struct BakedSkeleton {
-    /// DAT file id this skeleton came from. Used by the animation
-    /// path to look up the matching idle MO2 (same file).
-    file_id: u32,
     /// `bind_pose_world()` result cached so we don't recompose the
     /// matrix chain on every VOS2 load. Indexed by skeleton bone id.
     world: Vec<[[f32; 4]; 4]>,
@@ -358,7 +355,6 @@ fn load_skeleton(file_id: u32) -> Option<BakedSkeleton> {
         max_z - min_z,
     );
     Some(BakedSkeleton {
-        file_id,
         world,
         raw: Some(std::sync::Arc::new(skeleton)),
     })
@@ -406,43 +402,6 @@ fn idle_anim_for_file(file_id: u32) -> Option<std::sync::Arc<ffxi_dat::anim::Mo2
     let loaded = load_idle_animation_for_file(file_id).map(std::sync::Arc::new);
     guard.insert(file_id, loaded.clone());
     loaded
-}
-
-/// Sample frame `frame_idx` of an animation: build per-bone local
-/// overrides keyed by skeleton bone id. Bones the animation doesn't
-/// touch get `None` (the bake falls back to bind-pose local).
-fn anim_frame_overrides(
-    anim: &ffxi_dat::anim::Mo2Animation,
-    frame_idx: usize,
-    bone_count: usize,
-) -> Vec<Option<ffxi_dat::bone::BoneLocal>> {
-    let mut out: Vec<Option<ffxi_dat::bone::BoneLocal>> = vec![None; bone_count];
-    for (&bone, frames) in &anim.per_bone {
-        let bi = bone as usize;
-        if bi >= bone_count {
-            continue;
-        }
-        // Skip the root bone (id 0). MO2 keyframes are absolute (full
-        // local transform per frame, per lotus mo2.cppm); for idle
-        // animations the root frame is typically identity, which
-        // would OVERWRITE the SK2-baked 270°-Y engine-axis rotation
-        // and break `unroll_root_rotation` on the CPU bake path /
-        // produce sideways rigs on the GPU SkinnedMesh path. The
-        // root never moves during idle anyway, so preserving SK2's
-        // bind value is both correct and safe.
-        if bi == 0 {
-            continue;
-        }
-        let Some(f) = frames.get(frame_idx) else {
-            continue;
-        };
-        out[bi] = Some(ffxi_dat::bone::BoneLocal {
-            rotation: f.rotation,
-            translation: f.translation,
-            scale: f.scale,
-        });
-    }
-    out
 }
 
 /// Resolve `race` → BakedSkeleton, or `None` when the race has no
