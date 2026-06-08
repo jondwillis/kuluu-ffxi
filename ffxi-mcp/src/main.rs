@@ -1644,6 +1644,7 @@ mod tests {
             claim_id: 0,
             speed: 25,
             speed_base: 25,
+            look: None,
         });
         // Seed 35 entities at increasing distances; only nearest 30 should
         // appear, sorted ascending.
@@ -1664,6 +1665,7 @@ mod tests {
                 claim_id: 0,
                 speed: 0,
                 speed_base: 0,
+                look: None,
             });
         }
         let v = entities_view(&s);
@@ -1691,6 +1693,7 @@ mod tests {
             claim_id: 0,
             speed: 0,
             speed_base: 0,
+            look: None,
         });
         s.entities.push(Entity {
             id: 100,
@@ -1708,6 +1711,7 @@ mod tests {
             claim_id: 0,
             speed: 0,
             speed_base: 0,
+            look: None,
         });
         let v = entities_view(&s);
         assert_eq!(v["entities"][0]["claimed_by"], 4242);

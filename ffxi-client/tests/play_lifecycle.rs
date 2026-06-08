@@ -88,6 +88,8 @@ async fn play_lifecycle_against_live_lsb() {
         password: fixture.password.clone(),
         char_selection: CharSelection::Name(fixture.charname.clone()),
         initial_state: None,
+        dat_root: None,
+        user_driven_events: false,
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCommand>(32);
