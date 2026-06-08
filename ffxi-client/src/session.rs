@@ -2088,7 +2088,7 @@ async fn keepalive_loop(
                     server_last_seq = header.id_and_size;
                     for sub in framing::walk_sub_packets(&buf[framing::FFXI_HEADER_SIZE..]).flatten() {
                         if sub.opcode == ffxi_proto::map::s2c::LOGOUT {
-                            if let Some(logout) = decode::ServerLogout::decode(sub.data).ok() {
+                            if let Ok(logout) = decode::ServerLogout::decode(sub.data) {
                                 if logout.is_zone_change() {
                                     let new_addr = parse_logout_addr(&logout, map.server_addr());
                                     let _ = event_tx.send(AgentEvent::ZoneChanged {
@@ -4556,14 +4556,14 @@ mod tests {
                 (1u64 << bits) - 1
             };
             let shifted = (value & mask) << bit_in_byte;
-            let cover = (total_bits + 7) / 8;
+            let cover = total_bits.div_ceil(8);
             for i in 0..cover {
                 self.data[byte_offset + i] |= ((shifted >> (i * 8)) & 0xFF) as u8;
             }
             self.pos += bits as usize;
         }
         fn into_bytes(self) -> Vec<u8> {
-            let used = (self.pos + 7) / 8;
+            let used = self.pos.div_ceil(8);
             self.data[..used].to_vec()
         }
     }
@@ -4758,7 +4758,7 @@ mod tests {
         // workSize byte itself). The bitstream begins at bit 8 and ends
         // at the current writer position; round up to bytes.
         let bitstream_bits = data.len() * 8 - 8;
-        data[0] = ((bitstream_bits + 7) / 8) as u8;
+        data[0] = bitstream_bits.div_ceil(8) as u8;
 
         let mut cache = HashMap::new();
         cache.insert(0xCAFEu32, "Daisy".to_string());

@@ -1171,7 +1171,7 @@ pub fn parse_slash(
 // slash commands and viewer-core engine systems (audio, skybox, sun/moon,
 // weather, vana clock) can emit them. Re-exported here so existing callers
 // (`text_input.rs`, `screenshot.rs`) keep importing from this module.
-pub use ffxi_viewer_core::snapshot::{debug_chat_line, system_chat_line};
+pub use ffxi_viewer_core::snapshot::system_chat_line;
 
 fn chat_or_empty(rest: &str, kind: u8, label: &str) -> SlashOutcome {
     if rest.is_empty() {
@@ -1661,10 +1661,7 @@ fn parse_job_ability(
     // self_id isn't in scope here. Caller passes 0/0 which the
     // server interprets as self for self-target abilities.
     let (target_id, target_index) =
-        match resolve_target_args(&parts[1..], entities, self_pos, current_target) {
-            Ok(pair) => pair,
-            Err(_) => (0, 0),
-        };
+        resolve_target_args(&parts[1..], entities, self_pos, current_target).unwrap_or_default();
     SlashOutcome::Command(AgentCommand::Action {
         target_id,
         target_index,
@@ -1709,10 +1706,7 @@ fn parse_use_item(
     };
     let tail: &[&str] = parts.get(3..).unwrap_or(&[]);
     let (target_id, target_index) =
-        match resolve_target_args(tail, entities, self_pos, current_target) {
-            Ok(pair) => pair,
-            Err(_) => (0, 0),
-        };
+        resolve_target_args(tail, entities, self_pos, current_target).unwrap_or_default();
     SlashOutcome::Command(AgentCommand::UseItem {
         container,
         slot,
@@ -2295,11 +2289,11 @@ fn render_debug_entity(arg: &str, entities: &[WireEntity], self_pos: WireVec3) -
 /// see it explicitly tagged. Returns `(entity, sq_dist)` pairs so callers
 /// can reuse the squared distance for sorting/rendering without redoing
 /// the math.
-fn nearby_entities<'a>(
-    entities: &'a [WireEntity],
+fn nearby_entities(
+    entities: &[WireEntity],
     from: WireVec3,
     limit: usize,
-) -> Vec<(&'a WireEntity, f32)> {
+) -> Vec<(&WireEntity, f32)> {
     let mut scored: Vec<(&WireEntity, f32)> =
         entities.iter().map(|e| (e, sq_dist(e.pos, from))).collect();
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -4322,17 +4316,14 @@ mod tests {
 
     #[test]
     fn bank_parses_threshold_and_zoneline() {
-        match parse_slash_t(
+        if let SlashOutcome::SystemMessage(_) = parse_slash_t(
             "/bank 60 0xDEADBEEF",
             &empty_entities(),
             origin(),
             None,
             None,
         ) {
-            SlashOutcome::SystemMessage(_) => {
-                // 0xDEADBEEF doesn't parse as plain u32; decimal works.
-            }
-            _ => {}
+            // 0xDEADBEEF doesn't parse as plain u32; decimal works.
         }
         match parse_slash_t("/bank 60 12345", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::BankWhenFull {

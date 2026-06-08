@@ -89,16 +89,13 @@ const REBAKE_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Which input set the form is showing: PC equipment vs. NPC modelid.
 #[derive(Resource, Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Default)]
 pub enum ViewerMode {
+    #[default]
     Pc,
     Npc,
 }
 
-impl Default for ViewerMode {
-    fn default() -> Self {
-        ViewerMode::Pc
-    }
-}
 
 /// The currently-displayed PC inputs. Edited by [`panel`] via
 /// `ValueChange<String>` triggers; consumed on rebake by
@@ -215,7 +212,7 @@ pub fn run(args: ModelViewerArgs) -> Result<()> {
     if let Some(v) = face {
         pc_form.face = v;
     }
-    let mut apply = |dst: &mut u16, src: Option<String>, name: &str| {
+    let apply = |dst: &mut u16, src: Option<String>, name: &str| {
         let Some(s) = src else { return };
         match parse_id_lenient(&s) {
             Some(v) => *dst = v,

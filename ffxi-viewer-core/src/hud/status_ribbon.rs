@@ -324,7 +324,7 @@ mod tests {
     /// thin Bevy/asset glue, covered by the `ffxi-dat` decode tests.)
     #[test]
     fn slot_allocation_matches_icon_index() {
-        let icons = vec![10u16, 20, 30];
+        let icons = [10u16, 20, 30];
         for slot in 0..MAX_VISIBLE {
             let got = icons.get(slot).copied();
             let want = match slot {

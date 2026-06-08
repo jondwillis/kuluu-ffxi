@@ -164,7 +164,7 @@ impl MapClient {
         // and `zlib_compress()` returning `read + 8`. Convert with `(bits+7)/8`.
         let compressed_bits =
             u32::from_le_bytes(buf[size_off..size_off + 4].try_into().unwrap()) as usize;
-        let compressed_bytes = (compressed_bits + 7) / 8;
+        let compressed_bytes = compressed_bits.div_ceil(8);
         let compressed_end = framing::FFXI_HEADER_SIZE + compressed_bytes;
         if compressed_end > size_off {
             bail!(

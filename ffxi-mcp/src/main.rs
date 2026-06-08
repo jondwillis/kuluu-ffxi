@@ -615,7 +615,7 @@ impl FfxiServer {
         let uri = p.uri.as_str();
         let started = std::time::Instant::now();
         let state = self.state.read().await;
-        let content = read_resource(&state, &*self.goal_store, uri)
+        let content = read_resource(&state, &self.goal_store, uri)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
         let elapsed_us = started.elapsed().as_micros() as u64;
@@ -745,7 +745,7 @@ impl ServerHandler for FfxiServer {
         let uri = request.uri.as_str();
         let started = std::time::Instant::now();
         let state = self.state.read().await;
-        let body = read_resource(&state, &*self.goal_store, uri)
+        let body = read_resource(&state, &self.goal_store, uri)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
         let elapsed_us = started.elapsed().as_micros() as u64;

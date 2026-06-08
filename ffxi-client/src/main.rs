@@ -907,9 +907,9 @@ fn build_encrypted_login_subpacket(
     buf[2..4].copy_from_slice(&2u16.to_le_bytes());
 
     buf[12..16].copy_from_slice(&char_id.to_le_bytes());
-    let n = char_name.as_bytes().len().min(15);
+    let n = char_name.len().min(15);
     buf[34..34 + n].copy_from_slice(&char_name.as_bytes()[..n]);
-    let n = account_name.as_bytes().len().min(15);
+    let n = account_name.len().min(15);
     buf[49..49 + n].copy_from_slice(&account_name.as_bytes()[..n]);
     buf[64..80].copy_from_slice(&ticket);
     buf[84..88].copy_from_slice(b"PC\0\0");
@@ -954,7 +954,7 @@ fn build_subpacket_pos(sync: u16, x: f32, y: f32, z: f32, heading: u8) -> Vec<u8
     buf[12..16].copy_from_slice(&y.to_le_bytes());
     // MovTime (u16), MoveFlame (u16) — 0 for stationary
     // dir (i8), mode (bitfield u8)
-    buf[20] = heading as u8;
+    buf[20] = heading;
     // facetarget (u16) — leave 0
     // TimeNow (u32) — client-side timestamp; server uses for jitter detection
     let now = std::time::SystemTime::now()

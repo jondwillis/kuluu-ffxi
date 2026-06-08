@@ -274,11 +274,11 @@ where
     let msg = match format {
         WireFormat::Postcard => {
             let bytes = postcard::to_allocvec(frame).context("postcard encoding Frame")?;
-            Message::Binary(bytes.into())
+            Message::Binary(bytes)
         }
         WireFormat::Json => {
             let s = serde_json::to_string(frame).context("json encoding Frame")?;
-            Message::Text(s.into())
+            Message::Text(s)
         }
     };
     sink.send(msg).await.context("sending websocket frame")?;

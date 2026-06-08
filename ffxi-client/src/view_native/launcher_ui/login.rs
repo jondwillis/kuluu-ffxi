@@ -100,7 +100,7 @@ fn build_login_ui(
     commands
         .spawn((LoginUiRoot, screen_root()))
         .with_children(|root| {
-            spawn_breadcrumb(root, &server, &[Crumb::Sign(None)]);
+            spawn_breadcrumb(root, server, &[Crumb::Sign(None)]);
             root.spawn(panel_node(560.0)).with_children(|panel| {
                 panel.spawn(title(format!("Sign in to {}", server.display_label())));
                 panel.spawn(hint("Tab cycles fields. Enter submits when both filled."));

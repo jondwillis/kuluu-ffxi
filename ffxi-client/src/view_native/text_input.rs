@@ -406,12 +406,12 @@ const AUTO_TARGET_RADIUS: f32 = 8.0;
 /// matching the retail FFXI muscle memory of "step up, press Enter."
 /// Self is excluded via `self_id` so Enter doesn't silently target
 /// the player's own entity.
-fn nearest_targetable<'a>(
-    entities: &'a [ffxi_viewer_wire::Entity],
+fn nearest_targetable(
+    entities: &[ffxi_viewer_wire::Entity],
     self_pos: ffxi_viewer_wire::Vec3,
     self_id: Option<u32>,
     radius: f32,
-) -> Option<&'a ffxi_viewer_wire::Entity> {
+) -> Option<&ffxi_viewer_wire::Entity> {
     let r2 = radius * radius;
     entities
         .iter()

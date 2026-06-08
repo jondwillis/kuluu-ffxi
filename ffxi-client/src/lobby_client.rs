@@ -560,7 +560,7 @@ fn build_view_select(char_id: u32, char_name: &str, session_hash: &[u8; 16]) -> 
     buf[12..28].copy_from_slice(session_hash);
     buf[28..32].copy_from_slice(&char_id.to_le_bytes());
     // ffxi_id_world (lower 16 bits of char_id) — populate for completeness.
-    buf[32..36].copy_from_slice(&((char_id & 0xFFFF) as u32).to_le_bytes());
+    buf[32..36].copy_from_slice(&(char_id & 0xFFFF).to_le_bytes());
     let name_bytes = char_name.as_bytes();
     let n = name_bytes.len().min(15);
     buf[36..36 + n].copy_from_slice(&name_bytes[..n]);
@@ -770,7 +770,7 @@ async fn parse_view_chr_info2(stream: &mut TcpStream) -> Result<Vec<CharSlot>> {
         .await
         .context("reading lpkt_chr_info2 size header — server may not be sending chr_info2")?;
     let size = u32::from_le_bytes(size_bytes) as usize;
-    if size < IXFF_HEADER_SIZE || size > 64 * 1024 {
+    if !(IXFF_HEADER_SIZE..=64 * 1024).contains(&size) {
         bail!("implausible lpkt_chr_info2 size {size}");
     }
     let mut rest = vec![0u8; size - 4];

@@ -95,7 +95,9 @@ impl Default for ReactorConfig {
 /// Active high-level intent. `Idle` produces no per-tick output. Each
 /// non-idle variant is what the agent / LLM committed to last.
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum Goal {
+    #[default]
     Idle,
     Following {
         target_id: u32,
@@ -128,11 +130,6 @@ pub enum Goal {
     },
 }
 
-impl Default for Goal {
-    fn default() -> Self {
-        Goal::Idle
-    }
-}
 
 /// Project the reactor's internal `Goal` into the serializable
 /// `ReactorGoalSnapshot` mirror in `state.rs`. Exhaustive on the current
@@ -390,7 +387,7 @@ impl Reactor {
                     .collect();
                 // The first waypoint coincides with `from`; skip it so
                 // the agent starts moving toward the next corner.
-                if waypoints.first().map_or(false, |w| {
+                if waypoints.first().is_some_and(|w| {
                     horizontal_distance(*w, cur) < self.cfg.max_step_per_tick
                 }) {
                     waypoints.remove(0);
