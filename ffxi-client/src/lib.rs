@@ -1,6 +1,14 @@
 //! Library entry point exposing the modules that the integration tests
 //! (and any future external embedders) need to drive a session.
 
+// Bevy/ECS-heavy view code makes these lints noise (see ffxi-viewer-core).
+#![allow(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items
+)]
+
 pub mod agent_codec;
 pub mod agent_io;
 #[cfg(unix)]

@@ -15,6 +15,16 @@
 //! ```
 
 #![forbid(unsafe_code)]
+// Bevy systems legitimately take many parameters and use deeply-nested Query
+// types; `too_many_arguments`/`type_complexity` are noise for an ECS codebase.
+// The doc-list lints fire on hand-aligned layout/diagram docs; the CI's
+// advisory doc-lint step still covers doc_markdown and friends.
+#![allow(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items
+)]
 
 pub mod atmosphere;
 #[cfg(not(target_arch = "wasm32"))]

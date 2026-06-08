@@ -1,5 +1,13 @@
 //! FFXI agent-driven client — entry point.
 
+// Bevy/ECS-heavy view code makes these lints noise (see ffxi-viewer-core).
+#![allow(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items
+)]
+
 #[cfg(any(feature = "native-window", feature = "relay"))]
 use ffxi_client::state;
 use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session};
