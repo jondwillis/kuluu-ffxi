@@ -2402,20 +2402,36 @@ fn spawn_vos2_meshes_with_skeleton(
     }
 }
 
-/// Compose: resolve each of the 8 equipment slots to a DAT file via
-/// the equipment formula, load each VOS2 chunk, and spawn it under
-/// `parent` with the race's bind-pose skeleton applied. Slots set
-/// to `0`-id sentinels are silently skipped (no item equipped).
+/// One loaded equipment/face slot: parsed VOS2 plus a diagnostics
+/// label. Produced by [`prepare_equipped`] (Pass 1), consumed by
+/// [`spawn_prepared_equipped`] (Pass 2).
+pub struct LoadedSlot {
+    pub loaded: LoadedVos2,
+    pub label: String,
+}
+
+/// Result of Pass 1 of the equipment bake: every slot's parsed VOS2
+/// plus the actor-wide vertical extent used to anchor feet at y=0.
 ///
-/// Returns the number of slots that actually produced geometry —
-/// the launcher can use this to decide whether to fall back to a
-/// placeholder when the spawn was a total miss.
-pub fn spawn_equipped(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-    images: &mut Assets<Image>,
-    parent: Entity,
+/// Holds only owned, `Send` data (`LoadedVos2` is `Vec`/`String`/POD),
+/// so it can be produced off the main thread on an
+/// `AsyncComputeTaskPool` task and handed to [`spawn_prepared_equipped`]
+/// for the main-thread asset + entity work.
+pub struct PreparedEquipped {
+    pub slots: Vec<LoadedSlot>,
+    pub feet_translation_y: f32,
+    pub min_mesh_y: f32,
+    pub max_mesh_y: f32,
+    pub race: u8,
+}
+
+/// Pass 1: resolve the 8 equipment slots + face to DAT files, load and
+/// parse every VOS2 chunk, and measure the actor-wide post-bake Y
+/// extent. Pure CPU work (file IO + parse + measure) with no Bevy
+/// `Commands`/`Assets` — safe to run on a background task. See
+/// [`spawn_equipped`] for the combined synchronous path and
+/// [`spawn_prepared_equipped`] for the main-thread spawn half.
+pub fn prepare_equipped(
     race: u8,
     face: u8,
     head: u16,
@@ -2426,9 +2442,8 @@ pub fn spawn_equipped(
     main: u16,
     sub: u16,
     ranged: u16,
-) -> usize {
+) -> PreparedEquipped {
     use crate::look_resolver::{resolve_equipment_slot, resolve_face};
-    use crate::scene::BakedActor;
     let slot_names = [
         "head", "body", "hands", "legs", "feet", "main", "sub", "ranged",
     ];
@@ -2444,11 +2459,7 @@ pub fn spawn_equipped(
     // ~1 yalm apart, and the assembled rig collapsed.
     //
     // Each entry holds the loaded VOS2 + a label for diagnostics. We
-    // walk it again in pass 2 to actually spawn meshes.
-    struct LoadedSlot {
-        loaded: LoadedVos2,
-        label: String,
-    }
+    // walk it again in pass 2 (`spawn_prepared_equipped`) to spawn meshes.
     let baked_skel = baked_skeleton(race);
     let mut loaded_slots: Vec<LoadedSlot> = Vec::new();
     let mut actor_min_local_y: f32 = f32::INFINITY;
@@ -2527,17 +2538,15 @@ pub fn spawn_equipped(
         load_chunks(file_id, chunks, &label);
     }
 
-    if loaded_slots.is_empty() {
-        return 0;
-    }
-
-    // ---- Pass 2: spawn every slot with the actor-wide translation ----
+    // Pass 1 done. Compute the actor-wide feet anchor. An empty slot
+    // list falls through with the (-0.9, 1.6) fallback extent; Pass 2
+    // (`spawn_prepared_equipped`) returns 0 for it.
     //
-    // `feet_translation_y` lifts every slot's geometry so that the
-    // deepest baked vertex (across the whole actor) sits at the
-    // parent entity's local y=0 — the snap-invariant feet position.
-    // Every slot uses the same number; inter-slot relative positions
-    // are preserved.
+    // `feet_translation_y` lifts every slot's geometry so the deepest
+    // baked body vertex (across the whole actor) sits at the parent
+    // entity's local y=0 — the snap-invariant feet position. Every
+    // slot uses the same number; inter-slot relative positions are
+    // preserved.
     let (min_mesh_y, max_mesh_y) = if actor_min_local_y.is_finite() && actor_max_local_y.is_finite()
     {
         (actor_min_local_y, actor_max_local_y)
@@ -2545,8 +2554,33 @@ pub fn spawn_equipped(
         (-0.9, 1.6)
     };
     let feet_translation_y = -min_mesh_y;
+    PreparedEquipped {
+        slots: loaded_slots,
+        feet_translation_y,
+        min_mesh_y,
+        max_mesh_y,
+        race,
+    }
+}
+
+/// Pass 2: spawn Bevy mesh entities for a [`PreparedEquipped`] under
+/// `parent`, lifting every slot by the shared `feet_translation_y`.
+/// Must run on the main thread (touches `Assets` + spawns entities).
+///
+/// Returns the number of slots that actually produced geometry — the
+/// launcher can use this to decide whether to fall back to a
+/// placeholder when the spawn was a total miss.
+pub fn spawn_prepared_equipped(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    parent: Entity,
+    prepared: &PreparedEquipped,
+) -> usize {
+    use crate::scene::BakedActor;
     let mut spawned = 0usize;
-    for slot in &loaded_slots {
+    for slot in &prepared.slots {
         if spawn_vos2_meshes(
             commands,
             meshes,
@@ -2554,8 +2588,8 @@ pub fn spawn_equipped(
             images,
             parent,
             &slot.loaded,
-            race,
-            feet_translation_y,
+            prepared.race,
+            prepared.feet_translation_y,
         )
         .is_some()
         {
@@ -2565,13 +2599,45 @@ pub fn spawn_equipped(
     }
 
     if spawned > 0 {
-        let actor_height = (max_mesh_y - min_mesh_y).max(0.1);
+        let actor_height = (prepared.max_mesh_y - prepared.min_mesh_y).max(0.1);
         commands.entity(parent).insert(BakedActor {
-            min_mesh_y,
+            min_mesh_y: prepared.min_mesh_y,
             actor_height,
         });
     }
     spawned
+}
+
+/// Compose: resolve each of the 8 equipment slots to a DAT file, load
+/// each VOS2 chunk, and spawn it under `parent` with the race's
+/// bind-pose skeleton applied. Slots set to `0`-id sentinels are
+/// silently skipped (no item equipped).
+///
+/// Combined synchronous bake: [`prepare_equipped`] (Pass 1) then
+/// [`spawn_prepared_equipped`] (Pass 2) back-to-back on the calling
+/// thread. Retained for callers that bake on the main thread (the
+/// char-create live preview). The char-list preview instead runs
+/// `prepare_equipped` on a background task and polls the result — see
+/// `launcher_ui::char_preview`.
+pub fn spawn_equipped(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    parent: Entity,
+    race: u8,
+    face: u8,
+    head: u16,
+    body: u16,
+    hands: u16,
+    legs: u16,
+    feet: u16,
+    main: u16,
+    sub: u16,
+    ranged: u16,
+) -> usize {
+    let prepared = prepare_equipped(race, face, head, body, hands, legs, feet, main, sub, ranged);
+    spawn_prepared_equipped(commands, meshes, materials, images, parent, &prepared)
 }
 
 /// Translate FFXI Phong specular params to Bevy PBR `(roughness,

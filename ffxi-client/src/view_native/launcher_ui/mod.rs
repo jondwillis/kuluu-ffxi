@@ -282,16 +282,16 @@ impl CharCreateForm {
     pub fn cycle_focused(&mut self, delta: i32) {
         match self.focus {
             CharCreateField::Name => {}
-            CharCreateField::Race => self.race = cycle_table(&char_create::RACES, self.race, delta),
-            CharCreateField::Job => self.job = cycle_table(&char_create::JOBS, self.job, delta),
+            CharCreateField::Race => self.race = cycle_table(char_create::RACES, self.race, delta),
+            CharCreateField::Job => self.job = cycle_table(char_create::JOBS, self.job, delta),
             CharCreateField::Nation => {
-                self.nation = cycle_table(&char_create::NATIONS, self.nation, delta)
+                self.nation = cycle_table(char_create::NATIONS, self.nation, delta)
             }
             CharCreateField::Face => {
                 let next = (self.face as i32 + delta).rem_euclid(char_create::FACE_MAX as i32 + 1);
                 self.face = next as u8;
             }
-            CharCreateField::Size => self.size = cycle_table(&char_create::SIZES, self.size, delta),
+            CharCreateField::Size => self.size = cycle_table(char_create::SIZES, self.size, delta),
         }
     }
 }
@@ -854,7 +854,10 @@ pub(crate) fn register(
             direct_mode_charlist_autoselect,
             char_list::handle_click_system,
             char_list::handle_keyboard_system,
+            char_list::keyboard_nav_system,
+            char_list::redraw_char_list_system,
             char_preview::refresh_preview_on_cursor_change,
+            char_preview::poll_pending_preview,
         )
             .run_if(in_state(LauncherState::CharList)),
     );

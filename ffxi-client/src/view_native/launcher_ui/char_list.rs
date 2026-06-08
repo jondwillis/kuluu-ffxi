@@ -25,6 +25,14 @@ pub(super) struct CharListRoot;
 #[derive(Resource, Default)]
 pub(crate) struct CharCursor(pub usize);
 
+/// Marks a navigable row button with its [`CharCursor`] index so
+/// [`redraw_char_list_system`] can move the `ButtonVariant::Primary`
+/// highlight as the cursor changes. Carried by each per-character
+/// button and the "+ New character" button; the per-row `×` delete
+/// buttons are intentionally untagged (not cursor targets).
+#[derive(Component)]
+pub(super) struct CharRowButton(pub usize);
+
 pub(super) fn spawn_char_list_ui(
     mut commands: Commands,
     chars: Res<CharListData>,
@@ -99,7 +107,7 @@ pub(super) fn spawn_char_list_ui(
                                     variant,
                                     ..default()
                                 },
-                                (),
+                                CharRowButton(idx),
                                 Spawn((Text::new(label), ThemedText)),
                             ))
                             .observe(
@@ -152,12 +160,17 @@ pub(super) fn spawn_char_list_ui(
                 }
 
                 panel.spawn(row()).with_children(|r| {
+                    let new_variant = if new_char_index == initial_cursor {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Normal
+                    };
                     r.spawn(button(
                         ButtonProps {
-                            variant: ButtonVariant::Primary,
+                            variant: new_variant,
                             ..default()
                         },
-                        (),
+                        CharRowButton(new_char_index),
                         Spawn((Text::new("+ New character"), ThemedText)),
                     ))
                     .observe(
@@ -191,7 +204,9 @@ pub(super) fn despawn_char_list_ui(mut commands: Commands, q: Query<Entity, With
     commands.remove_resource::<CharCursor>();
 }
 
-/// Esc returns to login. All other navigation is via buttons now.
+/// Esc returns to login. Arrow/W-S navigation + Enter confirm live in
+/// [`keyboard_nav_system`]; mouse hover and click stay on the
+/// per-button observers.
 pub(super) fn handle_keyboard_system(
     mut events: MessageReader<KeyboardInput>,
     mut next: ResMut<NextState<LauncherState>>,
@@ -204,6 +219,75 @@ pub(super) fn handle_keyboard_system(
             next.set(LauncherState::Login);
             return;
         }
+    }
+}
+
+/// Keyboard navigation across the character rows (and the trailing
+/// "+ New character" row). Up/ArrowUp/W and Down/ArrowDown/S move the
+/// [`CharCursor`] with wraparound over `0..=chars.len()`; Enter
+/// confirms — a character row mirrors the per-button `Activate`
+/// observer (select + connect), the new-char row opens the create
+/// form. Moving the cursor marks the resource changed, which drives
+/// both [`redraw_char_list_system`] (highlight) and the 3D preview
+/// refresh. Esc stays in [`handle_keyboard_system`].
+pub(super) fn keyboard_nav_system(
+    mut events: MessageReader<KeyboardInput>,
+    chars: Res<CharListData>,
+    mut cursor: ResMut<CharCursor>,
+    mut sel: ResMut<SelectedChar>,
+    mut next: ResMut<NextState<LauncherState>>,
+) {
+    // Rows 0..=chars.len(); the final index is the "+ New character"
+    // row, so the navigable count is one more than the char count.
+    let count = chars.0.len() + 1;
+    for ev in events.read() {
+        if ev.state != ButtonState::Pressed {
+            continue;
+        }
+        match &ev.logical_key {
+            Key::ArrowUp => cursor.0 = (cursor.0 + count - 1) % count,
+            Key::ArrowDown => cursor.0 = (cursor.0 + 1) % count,
+            Key::Character(s) if s.eq_ignore_ascii_case("w") => {
+                cursor.0 = (cursor.0 + count - 1) % count
+            }
+            Key::Character(s) if s.eq_ignore_ascii_case("s") => {
+                cursor.0 = (cursor.0 + 1) % count
+            }
+            Key::Enter => {
+                if cursor.0 == chars.0.len() {
+                    next.set(LauncherState::CharCreate);
+                } else if let Some(slot) = chars.0.get(cursor.0).cloned() {
+                    sel.0 = Some(slot);
+                    next.set(LauncherState::ConnectInFlight);
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Move the `ButtonVariant::Primary` highlight to the row whose
+/// [`CharRowButton`] index matches the [`CharCursor`]. Gated on
+/// `cursor.is_changed()` (true on the insert frame too, so it also
+/// paints the initial highlight). Both keyboard nav and mouse hover
+/// mutate `CharCursor`, so this is the single highlight source of
+/// truth. Mirrors `char_create::redraw_form_system`.
+pub(super) fn redraw_char_list_system(
+    cursor: Res<CharCursor>,
+    q_buttons: Query<(Entity, &CharRowButton)>,
+    mut commands: Commands,
+) {
+    if !cursor.is_changed() {
+        return;
+    }
+    for (e, btn) in q_buttons.iter() {
+        let v = if btn.0 == cursor.0 {
+            ButtonVariant::Primary
+        } else {
+            ButtonVariant::Normal
+        };
+        commands.entity(e).insert(v);
     }
 }
 

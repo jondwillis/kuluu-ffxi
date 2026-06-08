@@ -306,7 +306,11 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // despawn in `launcher_ui/mod.rs:437`.
     app.add_systems(
         OnExit(AppPhase::InGame),
-        (despawn_ingame_entities, drain_mzb_load_state),
+        (
+            despawn_ingame_entities,
+            drain_mzb_load_state,
+            drain_mmb_load_state,
+        ),
     );
 
     // Keybinds: load persisted preset+overrides from disk before plugins
@@ -683,6 +687,33 @@ fn drain_mzb_load_state(
             dropped_tasks,
             dropped_cache,
             "OnExit(InGame): drained MZB-load state",
+        );
+    }
+}
+
+/// Sibling of [`drain_mzb_load_state`] for the MMB side. Clears the
+/// per-frame load backlog (else the old zone's queued placements would
+/// pop into the new zone after a fast re-zone) plus the cross-frame
+/// parse/texture caches and the mesh/material handle cache. Wiping
+/// `MmbHandleCache` here also makes good on `dat_mmb.rs`'s long-standing
+/// doc claim that it's evicted on `OnExit(AppPhase::InGame)` — until now
+/// nothing actually did so.
+fn drain_mmb_load_state(
+    mut queue: ResMut<ffxi_viewer_core::dat_mmb::MmbLoadQueue>,
+    mut parse_cache: ResMut<ffxi_viewer_core::dat_mmb::MmbParseCache>,
+    mut tex_pools: ResMut<ffxi_viewer_core::dat_mmb::MmbTexPools>,
+    mut handle_cache: ResMut<ffxi_viewer_core::dat_mmb::MmbHandleCache>,
+) {
+    let dropped_queued = queue.pending.len();
+    queue.pending.clear();
+    parse_cache.by_asset.clear();
+    tex_pools.by_file.clear();
+    handle_cache.mesh.clear();
+    handle_cache.material.clear();
+    if dropped_queued > 0 {
+        tracing::info!(
+            dropped_queued,
+            "OnExit(InGame): drained MMB-load backlog + caches",
         );
     }
 }
