@@ -772,8 +772,10 @@ mod tests {
     /// Explicit modes pass through unchanged regardless of state.
     #[test]
     fn resolved_mode_explicit_passes_through() {
-        let mut state = MinimapState::default();
-        state.retail_image = Some(Handle::default());
+        let state = MinimapState {
+            retail_image: Some(Handle::default()),
+            ..Default::default()
+        };
         assert_eq!(
             state.resolved_mode(MinimapMode::TopDown),
             MinimapMode::TopDown

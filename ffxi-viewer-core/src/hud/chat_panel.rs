@@ -776,9 +776,7 @@ pub fn apply_wheel_delta(
     let next = (current as i32 + whole).clamp(0, max_rows);
     // Reset the accumulator at the bounds — otherwise the user has to
     // "spend" all the over-scroll before motion resumes the other way.
-    let frac = if next == 0 && whole < 0 {
-        0.0
-    } else if next == max_rows && whole > 0 {
+    let frac = if (next == 0 && whole < 0) || (next == max_rows && whole > 0) {
         0.0
     } else {
         frac

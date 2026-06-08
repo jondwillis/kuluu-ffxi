@@ -288,7 +288,6 @@ pub fn weather_modifier_for(weather: Weather) -> WeatherModifier {
                 size: 0.045,
             }),
             lightning: Some((5.0, 20.0)),
-            ..default()
         },
         Thunderstorms => WeatherModifier {
             sun_illuminance_mul: 0.3,
@@ -304,7 +303,6 @@ pub fn weather_modifier_for(weather: Weather) -> WeatherModifier {
                 size: 0.05,
             }),
             lightning: Some((2.0, 8.0)),
-            ..default()
         },
 
         Auroras => WeatherModifier {
