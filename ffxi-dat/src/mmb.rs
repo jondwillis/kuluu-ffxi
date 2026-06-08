@@ -254,7 +254,7 @@ impl<'a> MmbSubRecord<'a> {
     /// "tag + variant" headers. Two real-world tag patterns:
     ///   - `"model   <variant>"` — kabu-style accessory MMBs
     ///   - `"<prefix>   <variant>"` — clod-style cloth MMBs (prefix
-    ///                                 matches the asset shortname)
+    ///     matches the asset shortname)
     ///
     /// Detection: at a 16-byte aligned offset, the first 4 bytes are
     /// ASCII alphanumerics/underscore/space and the byte at offset+16
@@ -585,12 +585,11 @@ pub struct MmbModel {
 ///     * if `offsetBlockHeader != 0`: that's the first block; any
 ///       additional pointers come from the 4..N words between offset
 ///       64 and offsetBlockHeader.
-///   - For each piece: SMMBBlockHeader(32 B) = numModel(4) +
-///     6×f32(24) + numFace(4). Followed by `numModel` inline
-///     SMMBModelHeader records (20 B each), each immediately
-///     followed by `vertexsize × Vertex` and then a u16 num_indices
-///     + 2 B pad + indices (u16 × num_indices), plus an odd-pad u16
-///     if num_indices is odd.
+///   - For each piece: SMMBBlockHeader(32 B) = numModel(4) + 6×f32(24) +
+///     numFace(4). Followed by `numModel` inline SMMBModelHeader records
+///     (20 B each), each immediately followed by `vertexsize × Vertex` and
+///     then a u16 num_indices + 2 B pad + indices (u16 × num_indices), plus
+///     an odd-pad u16 if num_indices is odd.
 pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
     const SMMB_HEAD_SIZE: usize = 16;
     const SMMB_HEADER_SIZE: usize = 48; // imgID(16)+pieces(4)+bbox(24)+offset(4)

@@ -105,9 +105,13 @@
 //! geometry_offset)`:
 //!   - `matrix_offset` → 16 consecutive f32s, a 4×4 row-major affine
 //!     where column 3 is translation:
-//!       p_world.x = m[0]*x + m[4]*y + m[8]*z  + m[12]
-//!       p_world.y = m[1]*x + m[5]*y + m[9]*z  + m[13]
-//!       p_world.z = m[2]*x + m[6]*y + m[10]*z + m[14]
+//!
+//!     ```text
+//!     p_world.x = m[0]*x + m[4]*y + m[8]*z  + m[12]
+//!     p_world.y = m[1]*x + m[5]*y + m[9]*z  + m[13]
+//!     p_world.z = m[2]*x + m[6]*y + m[10]*z + m[14]
+//!     ```
+//!
 //!     (i.e. m[0..4]=column 0, m[12..16]=column 3 = translation).
 //!   - `geometry_offset` → an MzbMesh record (same on-disk layout as
 //!     the mesh-library entries). Many grid cells can reuse the same

@@ -11,16 +11,12 @@
 //!   FFXI_DAT_PATH=... cargo run -p ffxi-dat --example dat-sk2-survey -- <file_id> [chunk_idx]
 //!
 //! Known-good targets for character work:
-//!   - 13746            Kuu Mohzolhil body — equipment file, chunk[1]
-//!                      should be the slot's Sk2 (per look_resolver doc)
-//!   - 7072 chunk 70    hum_ humanoid skeleton (per bone.rs module doc)
+//!   - 13746 — Kuu Mohzolhil body (equipment file, chunk[1] should be the
+//!     slot's Sk2, per look_resolver doc)
+//!   - 7072 chunk 70 — hum_ humanoid skeleton (per bone.rs module doc)
 //!
 //! If `chunk_idx` is supplied, only that chunk is dumped; otherwise
 //! every 0x29 chunk in the file is dumped.
-
-// Hand-aligned layout/target notes; the crate's lib allows this doc-list lint
-// but examples compile standalone, so allow it here too.
-#![allow(clippy::doc_overindented_list_items)]
 
 use std::env;
 use std::fs;

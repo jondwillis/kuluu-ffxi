@@ -1,12 +1,15 @@
 //! NPC-name DAT decoder. Server-agnostic: derives names from the FFXI
 //! client install, never from emulator (LSB/Phoenix) SQL.
 //!
-//! Format (POLUtils `PlayOnline.FFXI.Utils.NPCRenamer`, Apache-2.0):
-//!   - Each zone's NPC name list lives at `file_id = 6720 + zone_id`.
-//!   - Files are flat sequential 32-byte records, no chunk header:
-//!       [0x00..0x1C]  28 bytes ASCII name, NUL-padded, NUL-terminated
-//!       [0x1C..0x20]  u32 LE npc id
-//!   - Slot 0 is reserved (name "none", id 0).
+//! Format (POLUtils `PlayOnline.FFXI.Utils.NPCRenamer`, Apache-2.0): each
+//! zone's NPC name list lives at `file_id = 6720 + zone_id`. Files are flat
+//! sequential 32-byte records (no chunk header); slot 0 is reserved (name
+//! "none", id 0). Each record:
+//!
+//! ```text
+//! [0x00..0x1C]  28 bytes ASCII name, NUL-padded, NUL-terminated
+//! [0x1C..0x20]  u32 LE npc id
+//! ```
 //!
 //! Static (database-resident) NPC ids follow the same encoding the
 //! DAT stores: `0x01000000 | (zone << 12) | slot`. The low 12 bits
