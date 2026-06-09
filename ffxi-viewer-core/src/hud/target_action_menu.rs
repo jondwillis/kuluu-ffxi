@@ -48,7 +48,7 @@
 
 use bevy::prelude::*;
 
-use crate::hud::action_model::{ActionEntry, ActionEntryKind};
+use crate::hud::action_model::{ActionEntry, ActionEntryKind, TargetActionId};
 use crate::hud::overlay::ActiveOverlay;
 use crate::hud::palette;
 use crate::input_mode::{InputMode, SubAction};
@@ -216,6 +216,10 @@ pub fn spawn_target_action_menu(mut commands: Commands) {
 pub fn update_target_action_menu(
     mode: Res<InputMode>,
     overlay: Res<ActiveOverlay>,
+    // Needed for the `AbilitiesGroup` leaf frame, which renders rows built
+    // from the live snapshot's known-ability vectors (mirrors
+    // status_panel / check_view, which also take `Res<SceneState>`).
+    scene: Res<crate::snapshot::SceneState>,
     mut panel_q: Query<&mut Node, With<TargetActionMenu>>,
     mut row_q: Query<
         (&TargetActionRow, &mut Node, &mut Text, &mut TextColor),
@@ -264,8 +268,73 @@ pub fn update_target_action_menu(
         }
     }
 
-    let entries = overlay.0.resolve_target_actions(&state.ctx);
+    let mut entries = overlay.0.resolve_target_actions(&state.ctx);
+    // The entry list is rebuilt fresh each frame (mode_idx == 0), so mirror
+    // the chat send-mode the input router has cycled into onto the Chat
+    // entry — otherwise the inline `Chat: Say` text never advances.
+    for entry in entries.iter_mut() {
+        // Both Chat and Abilities are `Select` cyclers whose index lives in
+        // the persistent state (the rebuilt entry always carries
+        // `mode_idx == 0`); re-apply each so the inline `X: Y` text advances.
+        let cycled = match entry.id {
+            TargetActionId::Chat => Some(state.chat_mode_idx),
+            TargetActionId::Abilities => Some(state.abilities_group_idx),
+            _ => None,
+        };
+        if let Some(idx) = cycled {
+            if let ActionEntryKind::Select { modes, mode_idx } = &mut entry.kind {
+                if !modes.is_empty() {
+                    *mode_idx = idx % modes.len();
+                }
+            }
+        }
+    }
     let cursor = state.cursor;
+
+    // While an Abilities group is pushed, the slot pool renders that group's
+    // leaf list (or its contextual error) instead of the dimmed top-level
+    // verbs — the leaf is the active surface and owns the cursor.
+    if let Some(SubAction::AbilitiesGroup(group)) = sub_active {
+        let rows = crate::hud::menu::ability_group_rows(&scene.snapshot, group);
+        let sub_cursor = state.sub.as_ref().map(|s| s.cursor).unwrap_or(0);
+        for (row, mut node, mut text, mut color) in row_q.iter_mut() {
+            let (want, want_color) = if rows.is_empty() {
+                // Empty group: the contextual error occupies the single
+                // first slot; the rest are hidden.
+                if row.slot == 0 {
+                    (
+                        format!("  {}", crate::hud::menu::ability_group_empty_hint(group)),
+                        palette::MUTED,
+                    )
+                } else {
+                    if node.display != Display::None {
+                        node.display = Display::None;
+                    }
+                    continue;
+                }
+            } else if let Some(leaf) = rows.get(row.slot) {
+                let is_cursor = row.slot == sub_cursor;
+                let caret = if is_cursor { "> " } else { "  " };
+                let color = if is_cursor { palette::ACCENT } else { palette::TEXT };
+                (format!("{caret}{}", leaf.label), color)
+            } else {
+                if node.display != Display::None {
+                    node.display = Display::None;
+                }
+                continue;
+            };
+            if node.display != Display::Flex {
+                node.display = Display::Flex;
+            }
+            if **text != want {
+                **text = want;
+            }
+            if color.0 != want_color {
+                color.0 = want_color;
+            }
+        }
+        return;
+    }
 
     for (row, mut node, mut text, mut color) in row_q.iter_mut() {
         match entries.get(row.slot) {

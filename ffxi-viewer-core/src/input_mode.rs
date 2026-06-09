@@ -286,6 +286,20 @@ pub struct TargetActionState {
     pub cursor: usize,
     pub ctx: crate::hud::action_model::TargetActionContext,
     pub sub: Option<SubActionStack>,
+    /// Which send mode the Chat `Select` entry has been cycled into
+    /// (index into action_model's Chat `modes`:
+    /// Say / Tell / Party / Linkshell / Unity / Shout). Tracked here
+    /// because the entry list is rebuilt from `ctx` every frame — the
+    /// rebuilt entry always carries `mode_idx == 0`, so the cycled value
+    /// has to live in the persistent state and be re-applied by both the
+    /// renderer and the input router.
+    pub chat_mode_idx: usize,
+    /// Which Abilities group (`action_model::AbilityGroup::ALL` index) the
+    /// Abilities `Select` entry has been cycled into. Confirming the
+    /// Abilities row pushes this group as a `SubAction::AbilitiesGroup`
+    /// leaf. Persisted here for the same reason as `chat_mode_idx`: the
+    /// entry list is rebuilt from `ctx` every frame.
+    pub abilities_group_idx: usize,
 }
 
 impl TargetActionState {
@@ -295,6 +309,8 @@ impl TargetActionState {
             cursor: 0,
             ctx,
             sub: None,
+            chat_mode_idx: 0,
+            abilities_group_idx: 0,
         }
     }
 }

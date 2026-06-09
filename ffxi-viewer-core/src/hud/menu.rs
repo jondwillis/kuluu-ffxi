@@ -556,6 +556,71 @@ pub fn refresh_dynamic_menu_rows(
     }
 }
 
+/// Build the dispatchable rows for a single Abilities *group* from the
+/// snapshot's per-category known-id vectors. Used by the contextual
+/// target-action menu's `SubAction::AbilitiesGroup` leaf frame so the
+/// group list and the flat `MenuKind::Abilities` list dispatch through the
+/// identical `DynamicMenuAction` path (the `Abilities` branch of
+/// [`refresh_dynamic_menu_rows`] is the source-of-truth mapping this
+/// mirrors per-group). Rows are name-sorted to match the flat list.
+///
+/// `RangedAttack` and `Mount` return empty: there is no decoded snapshot
+/// source for either yet (no ranged-weapon id surfaced, no mount roster),
+/// so the caller renders [`ability_group_empty_hint`] instead of rows.
+pub fn ability_group_rows(
+    snap: &ffxi_viewer_wire::SceneSnapshot,
+    group: crate::hud::action_model::AbilityGroup,
+) -> Vec<DynamicMenuRow> {
+    use crate::hud::action_model::AbilityGroup as G;
+    let mut rows: Vec<DynamicMenuRow> = match group {
+        G::JobAbilities => snap
+            .job_abilities_known
+            .iter()
+            .filter_map(|&id| {
+                ffxi_proto::ability_names::lookup(id).map(|name| DynamicMenuRow {
+                    label: name.to_string(),
+                    action: DynamicMenuAction::JobAbility { ability_id: id },
+                })
+            })
+            .collect(),
+        G::WeaponSkill => snap
+            .weaponskills_known
+            .iter()
+            .filter_map(|&id| {
+                ffxi_proto::ability_names::lookup(id).map(|name| DynamicMenuRow {
+                    label: name.to_string(),
+                    action: DynamicMenuAction::Weaponskill { skill_id: id },
+                })
+            })
+            .collect(),
+        G::PetCommand => snap
+            .pet_abilities_known
+            .iter()
+            .filter_map(|&id| {
+                ffxi_proto::ability_names::lookup(id).map(|name| DynamicMenuRow {
+                    label: name.to_string(),
+                    action: DynamicMenuAction::PetAbility { ability_id: id },
+                })
+            })
+            .collect(),
+        G::RangedAttack | G::Mount => Vec::new(),
+    };
+    rows.sort_by(|a, b| a.label.cmp(&b.label));
+    rows
+}
+
+/// Contextual error shown as the sole row when an Abilities group has no
+/// usable entries. Strings mirror retail's contextual refusals so the
+/// operator sees the same wording as the live client.
+pub fn ability_group_empty_hint(group: crate::hud::action_model::AbilityGroup) -> &'static str {
+    use crate::hud::action_model::AbilityGroup as G;
+    match group {
+        G::RangedAttack => "You cannot use that command here.",
+        G::Mount => "No mounts available.",
+        _ => "No abilities available.",
+    }
+}
+
 /// Per-frame: toggle visibility, update cursor highlighting, swap entry
 /// labels when the active `MenuKind` changes (e.g. Root → Config).
 pub fn update_main_menu(

@@ -441,6 +441,341 @@ fn nearest_targetable(
         .map(|(e, _)| e)
 }
 
+/// Open the vanilla contextual target-action menu over the current
+/// target. Classifies the target kind + in-range state into a captured
+/// [`ffxi_viewer_core::hud::action_model::TargetActionContext`] so the
+/// verb list stays stable across navigation.
+fn open_target_action_menu(
+    current_target: Option<u32>,
+    entities: &[ffxi_viewer_wire::Entity],
+    self_pos: ffxi_viewer_wire::Vec3,
+    self_id: Option<u32>,
+) -> InputMode {
+    let ctx = build_target_action_context(current_target, entities, self_pos, self_id);
+    InputMode::TargetAction(ffxi_viewer_core::input_mode::TargetActionState::open(ctx))
+}
+
+/// Build the contextual [`TargetActionContext`] from the current target:
+/// classify its kind and whether it's within
+/// [`ffxi_viewer_core::hud::action_model::NPC_INTERACT_YALMS`].
+fn build_target_action_context(
+    current_target: Option<u32>,
+    entities: &[ffxi_viewer_wire::Entity],
+    self_pos: ffxi_viewer_wire::Vec3,
+    self_id: Option<u32>,
+) -> ffxi_viewer_core::hud::action_model::TargetActionContext {
+    use ffxi_viewer_core::hud::action_model::{
+        TargetActionContext, TargetKindLite, NPC_INTERACT_YALMS,
+    };
+    use ffxi_viewer_wire::EntityKind;
+
+    let ent = current_target.and_then(|id| entities.iter().find(|e| e.id == id));
+    let (target_kind, in_range) = match ent {
+        Some(e) => {
+            let kind = match e.kind {
+                EntityKind::Pc if Some(e.id) == self_id => TargetKindLite::SelfPc,
+                EntityKind::Pc => TargetKindLite::Pc,
+                EntityKind::Npc => TargetKindLite::Npc,
+                EntityKind::Mob => TargetKindLite::Mob,
+                // Pets / unknown kinds aren't chat/trade/check targets;
+                // treat as untargeted so only self-castable verbs show.
+                EntityKind::Pet | EntityKind::Other => TargetKindLite::None,
+            };
+            let dx = e.pos.x - self_pos.x;
+            let dy = e.pos.y - self_pos.y;
+            let dz = e.pos.z - self_pos.z;
+            let in_range = dx * dx + dy * dy + dz * dz <= NPC_INTERACT_YALMS * NPC_INTERACT_YALMS;
+            (kind, in_range)
+        }
+        None => (TargetKindLite::None, false),
+    };
+    TargetActionContext {
+        has_target: ent.is_some(),
+        target_kind,
+        in_range,
+        trusts_available: false,
+    }
+}
+
+/// Contextual target-action menu keystroke handler. Mirrors
+/// [`handle_quick_action_key`] but over the vanilla
+/// [`ffxi_viewer_core::hud::action_model`] entry model: Up/Down move the
+/// cursor (wrapping), NavRight cycles the Chat entry's send mode
+/// (Say / Tell / Party / …), NavConfirm fires or routes the entry, and
+/// NavCancel exits to World.
+fn handle_target_action_key(
+    key: &Key,
+    bindings: &Bindings,
+    state: &mut ffxi_viewer_core::input_mode::TargetActionState,
+    scene_state: &mut SceneState,
+    current_target: Option<u32>,
+    entities: &[ffxi_viewer_wire::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+) -> Option<InputMode> {
+    use ffxi_viewer_core::hud::action_model::{ActionEntryKind, TargetActionId};
+    use ffxi_viewer_core::input_mode::SubAction;
+
+    // A pushed `AbilitiesGroup` leaf owns navigation: the top-level verb
+    // rows are dimmed and inert while it's open (mirrors the renderer).
+    if let Some(SubAction::AbilitiesGroup(group)) = state.sub.as_ref().and_then(|s| s.current()) {
+        return handle_abilities_group_key(
+            key,
+            bindings,
+            state,
+            group,
+            scene_state,
+            current_target,
+            entities,
+            cmd_tx,
+        );
+    }
+
+    // The active overlay isn't a system param here — `text_input_system`
+    // already sits at Bevy's 16-param cap, and `/overlay` switching isn't
+    // wired yet — so resolve against the RETAIL base, the same overlay the
+    // renderer's default `ActiveOverlay` holds. When overlay switching
+    // lands, thread the resource in via a bundled `SystemParam`.
+    let entries = ffxi_viewer_core::hud::overlay::RETAIL.resolve_target_actions(&state.ctx);
+    let count = entries.len();
+    if count == 0 {
+        return Some(InputMode::World);
+    }
+    if state.cursor >= count {
+        state.cursor = count - 1;
+    }
+
+    if bindings.matches_logical(Action::NavUp, key) {
+        state.cursor = if state.cursor == 0 {
+            count - 1
+        } else {
+            state.cursor - 1
+        };
+        return None;
+    }
+    if bindings.matches_logical(Action::NavDown, key) {
+        let next = state.cursor + 1;
+        state.cursor = if next >= count { 0 } else { next };
+        return None;
+    }
+    if bindings.matches_logical(Action::NavRight, key) {
+        // Cycle the highlighted `Select` verb's mode in place. Chat picks a
+        // send channel; Abilities picks which group confirming will descend
+        // into. Magic's Category/Flat toggle is still deferred.
+        if let Some(entry) = entries.get(state.cursor) {
+            if let ActionEntryKind::Select { modes, .. } = &entry.kind {
+                if !modes.is_empty() {
+                    match entry.id {
+                        TargetActionId::Chat => {
+                            state.chat_mode_idx = (state.chat_mode_idx + 1) % modes.len();
+                        }
+                        TargetActionId::Abilities => {
+                            state.abilities_group_idx =
+                                (state.abilities_group_idx + 1) % modes.len();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    if bindings.matches_logical(Action::NavConfirm, key) {
+        return confirm_target_action_at_cursor(
+            state,
+            &entries,
+            scene_state,
+            current_target,
+            entities,
+            cmd_tx,
+        );
+    }
+    if bindings.matches_logical(Action::NavCancel, key) {
+        return Some(InputMode::World);
+    }
+    None
+}
+
+/// Route the highlighted contextual verb. Disabled verbs surface their
+/// hint and keep the menu open; enabled verbs either open a chat compose
+/// (Chat), push an in-place `SubAction` leaf frame (Abilities — rendered
+/// under the breadcrumb without leaving `TargetAction`), descend into a
+/// `-`-menu submenu (Magic / Items — reusing the proven dynamic-menu
+/// lists), dispatch directly (Check), or report not-yet-implemented
+/// (Trade / Trust).
+fn confirm_target_action_at_cursor(
+    state: &mut ffxi_viewer_core::input_mode::TargetActionState,
+    entries: &[ffxi_viewer_core::hud::action_model::ActionEntry],
+    scene_state: &mut SceneState,
+    current_target: Option<u32>,
+    entities: &[ffxi_viewer_wire::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+) -> Option<InputMode> {
+    use ffxi_viewer_core::hud::action_model::TargetActionId;
+
+    let Some(entry) = entries.get(state.cursor) else {
+        return Some(InputMode::World);
+    };
+    if !entry.enabled {
+        // Greyed verb (e.g. "Target out of range."): explain and stay put
+        // rather than swallowing the keypress silently.
+        if let Some(hint) = &entry.hint {
+            push_system_chat_line(scene_state, format!("[menu] {hint}"));
+        }
+        return None;
+    }
+
+    let target_ent = current_target.and_then(|id| entities.iter().find(|e| e.id == id));
+    match entry.id {
+        TargetActionId::Chat => Some(InputMode::Chat(chat_buffer_for_mode(
+            state.chat_mode_idx,
+            target_ent,
+        ))),
+        TargetActionId::Magic => Some(open_submenu(MenuKind::Magic)),
+        TargetActionId::Abilities => {
+            // Push the selected group as an in-place leaf frame rather than
+            // leaving `TargetAction` for the flat `-`-menu: the renderer
+            // shows the group's rows under the existing breadcrumb and Esc
+            // pops back to the verb row. NavRight on the Abilities row
+            // cycles which group `abilities_group_idx` selects.
+            use ffxi_viewer_core::hud::action_model::AbilityGroup;
+            use ffxi_viewer_core::input_mode::{SubAction, SubActionStack};
+            let group = AbilityGroup::ALL[state.abilities_group_idx % AbilityGroup::ALL.len()];
+            state.sub = Some(SubActionStack::with(SubAction::AbilitiesGroup(group)));
+            None
+        }
+        TargetActionId::Items => Some(open_submenu(MenuKind::Items)),
+        TargetActionId::Check => {
+            match target_ent {
+                Some(e) => {
+                    let cmd = AgentCommand::CheckTarget {
+                        target_id: e.id,
+                        target_index: e.act_index,
+                        kind: CheckKind::Check,
+                    };
+                    if let Err(err) = cmd_tx.try_send(cmd) {
+                        push_system_chat_line(
+                            scene_state,
+                            format!("[menu] Check dispatch dropped: {err}"),
+                        );
+                    }
+                }
+                None => push_system_chat_line(scene_state, "[menu] Check: no target".into()),
+            }
+            Some(InputMode::World)
+        }
+        TargetActionId::Trade => {
+            push_system_chat_line(scene_state, "[menu] Trade — not implemented yet".into());
+            Some(InputMode::World)
+        }
+        TargetActionId::Trust => {
+            push_system_chat_line(scene_state, "[menu] Trust — not implemented yet".into());
+            Some(InputMode::World)
+        }
+    }
+}
+
+/// Navigate + dispatch within a pushed `AbilitiesGroup` leaf frame. Up/Down
+/// move the sub-cursor (clamped to the group's row count), Confirm fires the
+/// selected ability through the shared `dispatch_dynamic_menu_action` path
+/// (so the contextual leaf and the flat `-`-menu fire the identical packet),
+/// and Cancel pops one frame — leaving sub-mode (`state.sub = None`) when the
+/// pop empties the stack, mirroring `handle_menu_key`'s Esc-pop. An empty
+/// group shows only its contextual error and has no selectable rows, so
+/// Confirm is a no-op there.
+#[allow(clippy::too_many_arguments)]
+fn handle_abilities_group_key(
+    key: &Key,
+    bindings: &Bindings,
+    state: &mut ffxi_viewer_core::input_mode::TargetActionState,
+    group: ffxi_viewer_core::hud::action_model::AbilityGroup,
+    scene_state: &mut SceneState,
+    current_target: Option<u32>,
+    entities: &[ffxi_viewer_wire::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+) -> Option<InputMode> {
+    let rows = ffxi_viewer_core::hud::menu::ability_group_rows(&scene_state.snapshot, group);
+    let count = rows.len();
+
+    let Some(sub) = state.sub.as_mut() else {
+        return None;
+    };
+    if count > 0 && sub.cursor >= count {
+        sub.cursor = count - 1;
+    }
+
+    if bindings.matches_logical(Action::NavUp, key) {
+        if count > 0 {
+            sub.cursor = if sub.cursor == 0 {
+                count - 1
+            } else {
+                sub.cursor - 1
+            };
+        }
+        return None;
+    }
+    if bindings.matches_logical(Action::NavDown, key) {
+        if count > 0 {
+            let next = sub.cursor + 1;
+            sub.cursor = if next >= count { 0 } else { next };
+        }
+        return None;
+    }
+    if bindings.matches_logical(Action::NavConfirm, key) {
+        if let Some(row) = rows.get(sub.cursor) {
+            let self_pos = scene_state.snapshot.self_pos.pos;
+            dispatch_dynamic_menu_action(
+                row.action,
+                current_target,
+                self_pos,
+                entities,
+                cmd_tx,
+                scene_state,
+            );
+            return Some(InputMode::World);
+        }
+        // Empty group (contextual-error-only): nothing to fire.
+        return None;
+    }
+    if bindings.matches_logical(Action::NavCancel, key) {
+        if !sub.pop() {
+            // Stack emptied — drop back to the top-level verb rows.
+            state.sub = None;
+        }
+        return None;
+    }
+    None
+}
+
+/// Open the main-menu stack rooted at `kind` (Root pushed underneath so
+/// Esc backs out one level rather than straight to World). Shared by the
+/// contextual Magic / Abilities / Items verbs and the quick-action ring.
+fn open_submenu(kind: MenuKind) -> InputMode {
+    let mut stack = MenuStack::root();
+    stack.push(kind);
+    InputMode::Menu(stack)
+}
+
+/// Pre-seed a chat buffer with the slash prefix for the cycled Chat send
+/// mode. Index order matches action_model's Chat `modes`
+/// (`Say / Tell / Party / Linkshell / Unity / Shout`). Tell aims at the
+/// selected PC by name (retail's default); modes with no slash channel
+/// yet (Say, Unity) fall back to a plain Say buffer.
+fn chat_buffer_for_mode(
+    mode_idx: usize,
+    target_ent: Option<&ffxi_viewer_wire::Entity>,
+) -> ChatBuffer {
+    match mode_idx {
+        1 => match target_ent.and_then(|e| e.name.as_deref()) {
+            Some(name) => ChatBuffer::with_prefix(&format!("/tell {name} ")),
+            None => ChatBuffer::empty(),
+        },
+        2 => ChatBuffer::with_prefix("/p "),
+        3 => ChatBuffer::with_prefix("/l "),
+        5 => ChatBuffer::with_prefix("/sh "),
+        _ => ChatBuffer::empty(),
+    }
+}
+
 /// Result of a chat-mode keystroke. `Stay` keeps the buffer; `Submit`
 /// triggers slash parsing or a Say chat send; `Exit` returns to World.
 enum ChatAction {

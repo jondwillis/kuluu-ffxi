@@ -112,6 +112,16 @@ pub enum AbilityGroup {
 }
 
 impl AbilityGroup {
+    /// Retail group order, for the contextual menu's NavRight cycler and
+    /// any ordered iteration. Mirrors `SpellCategory::ALL`.
+    pub const ALL: [AbilityGroup; 5] = [
+        AbilityGroup::JobAbilities,
+        AbilityGroup::WeaponSkill,
+        AbilityGroup::RangedAttack,
+        AbilityGroup::Mount,
+        AbilityGroup::PetCommand,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             AbilityGroup::JobAbilities => "Job Abilities",
@@ -195,7 +205,17 @@ pub fn build_target_action_entries(
                 },
                 "Magic".to_string(),
             ),
-            TargetActionId::Abilities => (ActionEntryKind::Plain, "Abilities".to_string()),
+            TargetActionId::Abilities => (
+                // Cycler over the five ability groups; NavRight advances the
+                // group that confirming the row will descend into (the input
+                // router tracks the cycled index in `abilities_group_idx`,
+                // since this entry is rebuilt at `mode_idx == 0` each frame).
+                ActionEntryKind::Select {
+                    modes: AbilityGroup::ALL.iter().map(|g| g.label()).collect(),
+                    mode_idx: 0,
+                },
+                "Abilities".to_string(),
+            ),
             TargetActionId::Trust => (ActionEntryKind::Plain, "Trust".to_string()),
             TargetActionId::Items => (ActionEntryKind::Plain, "Items".to_string()),
             TargetActionId::Trade => (ActionEntryKind::Plain, "Trade".to_string()),
