@@ -155,6 +155,11 @@ pub struct SlashWriters<'w, 's> {
     /// (`status_panel`'s doc-contract). Bundled here to keep
     /// `text_input_system` under Bevy's 16-SystemParam cap.
     pub status_profile_open: ResMut<'w, ffxi_viewer_core::hud::status_panel::StatusProfileOpen>,
+    /// `/check`-window visibility, set when the operator confirms Check on a
+    /// PC and cleared on back-out (see [`check_view::CheckTarget`]'s
+    /// doc-contract). Bundled here to keep `text_input_system` under Bevy's
+    /// 16-SystemParam cap.
+    pub check_target: ResMut<'w, ffxi_viewer_core::hud::check_view::CheckTarget>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -320,11 +325,19 @@ pub fn text_input_system(
                     *mode = next;
                 }
             }
-            InputMode::TargetAction(_state) => {
-                // The TargetAction mode's foundation types (hud::action_model,
-                // hud::overlay, TargetActionState) have landed but its key
-                // handler has not. Nothing transitions into this mode yet, so
-                // ignore keys here until `handle_target_action_key` exists.
+            InputMode::TargetAction(state) => {
+                if let Some(next) = handle_target_action_key(
+                    &ev.logical_key,
+                    &bindings,
+                    state,
+                    &mut scene_state,
+                    current_target,
+                    &entities,
+                    &cmd_tx.0,
+                    &mut slash_writers.check_target,
+                ) {
+                    *mode = next;
+                }
             }
         }
     }
@@ -513,6 +526,7 @@ fn handle_target_action_key(
     current_target: Option<u32>,
     entities: &[ffxi_viewer_wire::Entity],
     cmd_tx: &Sender<AgentCommand>,
+    check_target: &mut ffxi_viewer_core::hud::check_view::CheckTarget,
 ) -> Option<InputMode> {
     use ffxi_viewer_core::hud::action_model::{ActionEntryKind, TargetActionId};
     use ffxi_viewer_core::input_mode::SubAction;
@@ -589,9 +603,17 @@ fn handle_target_action_key(
             current_target,
             entities,
             cmd_tx,
+            check_target,
         );
     }
     if bindings.matches_logical(Action::NavCancel, key) {
+        // Pair the Check open with a close: when `/check` is up, backing out
+        // of the menu must clear the window (lifecycle symmetry — the
+        // `CheckTarget` doc-contract says back-out clears it).
+        if check_target.open {
+            check_target.open = false;
+            check_target.target_id = None;
+        }
         return Some(InputMode::World);
     }
     None
@@ -611,6 +633,7 @@ fn confirm_target_action_at_cursor(
     current_target: Option<u32>,
     entities: &[ffxi_viewer_wire::Entity],
     cmd_tx: &Sender<AgentCommand>,
+    check_target: &mut ffxi_viewer_core::hud::check_view::CheckTarget,
 ) -> Option<InputMode> {
     use ffxi_viewer_core::hud::action_model::TargetActionId;
 
@@ -647,8 +670,12 @@ fn confirm_target_action_at_cursor(
         }
         TargetActionId::Items => Some(open_submenu(MenuKind::Items)),
         TargetActionId::Check => {
+            use ffxi_viewer_core::hud::action_model::TargetKindLite;
             match target_ent {
                 Some(e) => {
+                    // Always dispatch the wire Check so the server runs its
+                    // examine handler (the "<name> examines you" feedback the
+                    // target sees) regardless of target kind.
                     let cmd = AgentCommand::CheckTarget {
                         target_id: e.id,
                         target_index: e.act_index,
@@ -660,10 +687,31 @@ fn confirm_target_action_at_cursor(
                             format!("[menu] Check dispatch dropped: {err}"),
                         );
                     }
+                    // Only PCs get the examine window; NPCs/mobs have no
+                    // equipment doll or bazaar to show. `target_kind` is
+                    // captured at menu-open in `build_target_action_context`.
+                    let is_pc = matches!(
+                        state.ctx.target_kind,
+                        TargetKindLite::Pc | TargetKindLite::SelfPc
+                    );
+                    if is_pc {
+                        // Set `target_id` per the resource contract even
+                        // though today's renderer reads the self doll — a
+                        // later wire addition of a checked-PC mirror will key
+                        // off it. Stay in TargetAction so the window persists
+                        // and NavCancel above clears it.
+                        check_target.open = true;
+                        check_target.target_id = Some(e.id);
+                        None
+                    } else {
+                        Some(InputMode::World)
+                    }
                 }
-                None => push_system_chat_line(scene_state, "[menu] Check: no target".into()),
+                None => {
+                    push_system_chat_line(scene_state, "[menu] Check: no target".into());
+                    Some(InputMode::World)
+                }
             }
-            Some(InputMode::World)
         }
         TargetActionId::Trade => {
             push_system_chat_line(scene_state, "[menu] Trade — not implemented yet".into());
@@ -2464,6 +2512,7 @@ pub fn mouse_nav_dispatch_system(
     mut graphics: ResMut<ffxi_viewer_core::GraphicsSettings>,
     mut status_profile_open: ResMut<ffxi_viewer_core::hud::status_panel::StatusProfileOpen>,
     dynamic_menu: Res<ffxi_viewer_core::hud::menu::DynamicMenu>,
+    mut check_target: ResMut<ffxi_viewer_core::hud::check_view::CheckTarget>,
 ) {
     let entities = scene_state.snapshot.entities.clone();
     let current_target = target.id;
@@ -2511,6 +2560,27 @@ pub fn mouse_nav_dispatch_system(
                 current_target,
                 &entities,
                 &cmd_tx.0,
+            ) {
+                *mode = next;
+            }
+        }
+    }
+
+    for ev in ta_events.read() {
+        if let InputMode::TargetAction(state) = &mut *mode {
+            state.cursor = ev.slot;
+            // Resolve against RETAIL to match the keyboard path (see
+            // `handle_target_action_key`'s overlay note).
+            let entries =
+                ffxi_viewer_core::hud::overlay::RETAIL.resolve_target_actions(&state.ctx);
+            if let Some(next) = confirm_target_action_at_cursor(
+                state,
+                &entries,
+                &mut scene_state,
+                current_target,
+                &entities,
+                &cmd_tx.0,
+                &mut check_target,
             ) {
                 *mode = next;
             }
