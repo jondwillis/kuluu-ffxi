@@ -43,11 +43,15 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
-          clang cmake pkg-config \
+          build-essential clang cmake pkg-config \
           libasound2-dev libudev-dev libdbus-1-dev \
           libwayland-dev libxkbcommon-dev \
           libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
           libgl1-mesa-dev
+        # The cxx/Recast C++ bridge needs the glibc dev headers (features.h);
+        # build-essential pulls libc6-dev. Belt-and-suspenders in case the
+        # runner image ships without it.
+        sudo apt-get install -y --no-install-recommends libc6-dev
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
