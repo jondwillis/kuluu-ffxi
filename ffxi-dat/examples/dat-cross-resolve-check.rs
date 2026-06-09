@@ -228,7 +228,7 @@ fn main() {
         println!("  cross       = {cross}");
         println!("  miss        = {miss}");
         let mut dist: Vec<_> = cross_dist.into_iter().collect();
-        dist.sort_by(|a, b| b.1.cmp(&a.1));
+        dist.sort_by_key(|x| std::cmp::Reverse(x.1));
         println!(
             "  cross_top10 = {:?}",
             &dist.iter().take(10).collect::<Vec<_>>()

@@ -957,7 +957,7 @@ pub fn build_zone_mmb_spawns(
             .filter(|(_, &c)| c > 1)
             .map(|(&n, &c)| (n, c))
             .collect();
-        dup_names.sort_by(|a, b| b.1.cmp(&a.1));
+        dup_names.sort_by_key(|x| std::cmp::Reverse(x.1));
 
         // Per-placement match-count buckets.
         let mut placement_id_counts: HashMap<String, u32> = HashMap::new();
@@ -988,7 +988,7 @@ pub fn build_zone_mmb_spawns(
                 roundrobin_smoke.push((id.clone(), *count, m));
             }
         }
-        roundrobin_smoke.sort_by(|a, b| b.1.cmp(&a.1));
+        roundrobin_smoke.sort_by_key(|x| std::cmp::Reverse(x.1));
 
         // Compact unmatched / ambiguous lists (dedup by id).
         let mut unmatched_unique: HashMap<String, u32> = HashMap::new();
@@ -996,7 +996,7 @@ pub fn build_zone_mmb_spawns(
             *unmatched_unique.entry(id.clone()).or_insert(0) += 1;
         }
         let mut um_list: Vec<(String, u32)> = unmatched_unique.into_iter().collect();
-        um_list.sort_by(|a, b| b.1.cmp(&a.1));
+        um_list.sort_by_key(|x| std::cmp::Reverse(x.1));
 
         info!(
             target: "ffxi_viewer_core::dat_mzb::diag",
