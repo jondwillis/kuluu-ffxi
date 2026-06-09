@@ -31,6 +31,9 @@
 struct SkyboxUniform {
     colors: array<vec4<f32>, 8>,
     altitudes_packed: array<vec4<f32>, 2>,
+    // x = coverage [0,1], y = opacity [0,1] (0 disables the layer),
+    // zw = UV scroll offset. Procedural clouds, Enhanced style only.
+    cloud_params: vec4<f32>,
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> data: SkyboxUniform;
@@ -43,6 +46,34 @@ fn get_altitude(i: u32) -> f32 {
     if (inner == 1u) { return v.y; }
     if (inner == 2u) { return v.z; }
     return v.w;
+}
+
+// --- Value-noise FBM for the procedural cloud layer. ---
+fn hash2(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+
+fn vnoise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash2(i);
+    let b = hash2(i + vec2<f32>(1.0, 0.0));
+    let c = hash2(i + vec2<f32>(0.0, 1.0));
+    let d = hash2(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn fbm(p: vec2<f32>) -> f32 {
+    var v = 0.0;
+    var amp = 0.5;
+    var freq = p;
+    for (var i = 0; i < 5; i = i + 1) {
+        v = v + amp * vnoise(freq);
+        freq = freq * 2.0;
+        amp = amp * 0.5;
+    }
+    return v;
 }
 
 @fragment
@@ -76,6 +107,33 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let lo_col = data.colors[lo_idx];
     let hi_col = data.colors[hi_idx];
-    let col = mix(lo_col, hi_col, t);
-    return vec4<f32>(col.rgb, 1.0);
+    var col = mix(lo_col, hi_col, t).rgb;
+
+    // --- Procedural cloud layer (Enhanced style; opacity 0 = off). ---
+    let opacity = data.cloud_params.y;
+    if (opacity > 0.001 && altitude > 0.02) {
+        let coverage = data.cloud_params.x;
+        let scroll = data.cloud_params.zw;
+        // Planar projection onto a virtual sheet overhead. Near the
+        // horizon ray.y → 0 stretches the sheet to infinity; clamp the
+        // denominator so the band stays finite and the clouds compress
+        // toward the horizon the way a real overcast does.
+        let proj = ray.xz / max(ray.y, 0.12);
+        let density = fbm(proj * 1.2 + scroll);
+        // Threshold the noise into cloud shapes: higher coverage lowers
+        // the cut so more sky fills in.
+        let cut = 1.0 - coverage;
+        let shape = smoothstep(cut, cut + 0.35, density);
+        // Fade in from the horizon so clouds don't knife-edge at the
+        // skyline, and ride on the opacity knob.
+        let horizon_fade = smoothstep(0.02, 0.30, altitude);
+        let cloud_a = clamp(shape * horizon_fade * opacity, 0.0, 1.0);
+        // Tint clouds by the local sky color so they share its hue
+        // (warm at dusk, blue at noon) but read brighter — the
+        // texColor·skyColor idea from retail, done procedurally.
+        let cloud_col = mix(col, vec3<f32>(1.0, 1.0, 1.0), 0.6) * (0.7 + 0.3 * density);
+        col = mix(col, cloud_col, cloud_a);
+    }
+
+    return vec4<f32>(col, 1.0);
 }

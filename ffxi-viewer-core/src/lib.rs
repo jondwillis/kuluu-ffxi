@@ -45,6 +45,7 @@ pub mod keybinds;
 pub mod lock_on;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod look_resolver;
+pub mod lens_flare;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod minimap;
 pub mod moon_material;
@@ -66,6 +67,7 @@ pub mod vana_time;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod weather;
 pub mod weather_fx;
+pub mod zone_lights;
 pub mod zone_lines;
 
 pub use camera::{
@@ -78,7 +80,7 @@ pub use components::{
     EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
 };
 pub use cursor::{CursorAssets, CursorPlugin, CursorRequests, CursorStyle};
-pub use graphics_settings::{AaMode, GraphicsField, GraphicsSettings, QualityPreset};
+pub use graphics_settings::{AaMode, GraphicsField, GraphicsSettings, QualityPreset, SkyStyle};
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
     ChatBuffer, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack, PassiveCursorFocus,
@@ -168,6 +170,13 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(skybox::SkyboxPlugin);
         app.add_plugins(moon_material::MoonMaterialPlugin);
+        // Screen-space lens flare — Enhanced sky style only; the system
+        // gates itself on `SkyStyle` and sun visibility.
+        app.add_plugins(lens_flare::LensFlarePlugin);
+        // Dynamic local lights (lanterns/fires) from baked over-bright
+        // MMB vertices. PointLights are Enhanced-only; flame sprites
+        // show in both styles.
+        app.add_plugins(zone_lights::ZoneLightsPlugin);
         // Debug chat surfacing: routes engine + protocol events
         // (zone change, aggro, low HP, speed suppression) to the
         // System chat pane. Cross-platform: the drain reads the same
@@ -386,6 +395,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                 graphics_settings::apply_projection_system,
                 graphics_settings::apply_vsync_system,
                 graphics_settings::apply_anti_aliasing_system,
+                graphics_settings::apply_sky_style_system,
             )
                 .chain()
                 .run_if(resource_changed::<GraphicsSettings>),

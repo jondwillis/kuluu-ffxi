@@ -94,6 +94,38 @@ impl AaMode {
     }
 }
 
+/// Sky rendering style. Picks the overall *look* of the sky, sun, and
+/// moon, independent of the quality tier. `Enhanced` is our modern,
+/// embellished sky (horizon reddening, earthshine, moon illusion, sun
+/// flare, procedural clouds); `Retail` reproduces the stylized 2002
+/// client look (fixed antipodal moon, no embellishments). A reactor
+/// (`apply_sky_style_system`) maps this onto the fine-grained
+/// [`crate::sky_realism::SkyRealism`] knobs and gates the retail-only
+/// render features.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SkyStyle {
+    #[default]
+    Enhanced,
+    Retail,
+}
+
+impl SkyStyle {
+    pub const fn label(self) -> &'static str {
+        match self {
+            SkyStyle::Enhanced => "Enhanced",
+            SkyStyle::Retail => "Retail",
+        }
+    }
+
+    /// The [`crate::sky_realism::SkyRealism`] preset this style implies.
+    pub const fn sky_realism(self) -> crate::sky_realism::SkyRealism {
+        match self {
+            SkyStyle::Enhanced => crate::sky_realism::SkyRealism::enhanced(),
+            SkyStyle::Retail => crate::sky_realism::SkyRealism::retail(),
+        }
+    }
+}
+
 /// Selector used by the menu row → cycle dispatch. One variant per
 /// row on the Graphics tab; the row layout in `hud::menu` follows this
 /// order top-down.
@@ -110,6 +142,7 @@ pub enum GraphicsField {
     ViewDistance,
     VSync,
     Fov,
+    SkyStyle,
 }
 
 impl GraphicsField {
@@ -127,6 +160,7 @@ impl GraphicsField {
             GraphicsField::ViewDistance => "View Distance",
             GraphicsField::VSync => "VSync",
             GraphicsField::Fov => "FOV",
+            GraphicsField::SkyStyle => "Sky Style",
         }
     }
 }
@@ -147,6 +181,12 @@ pub struct GraphicsSettings {
     pub view_distance: f32,
     pub vsync: bool,
     pub fov_deg: f32,
+    /// Sky/sun/moon rendering style. Orthogonal to the quality tier —
+    /// preset cycles leave it untouched. Defaults via `#[serde(default)]`
+    /// so a `graphics.json` written before this field existed still
+    /// loads (lands on `Enhanced`, the prior hard-coded behavior).
+    #[serde(default)]
+    pub sky_style: SkyStyle,
 }
 
 impl Default for GraphicsSettings {
@@ -195,6 +235,8 @@ const PRESET_CYCLE: &[QualityPreset] = &[
     QualityPreset::Ultra,
 ];
 
+const SKY_STYLE_CYCLE: &[SkyStyle] = &[SkyStyle::Enhanced, SkyStyle::Retail];
+
 impl GraphicsSettings {
     /// Concrete values for each preset tier. Touching this table changes
     /// what "fresh install" feels like.
@@ -213,6 +255,7 @@ impl GraphicsSettings {
                 view_distance: 2000.0,
                 vsync: true,
                 fov_deg: 75.0,
+                sky_style: SkyStyle::Enhanced,
             },
             QualityPreset::Medium => Self {
                 preset,
@@ -226,6 +269,7 @@ impl GraphicsSettings {
                 view_distance: 4000.0,
                 vsync: true,
                 fov_deg: 75.0,
+                sky_style: SkyStyle::Enhanced,
             },
             QualityPreset::High => Self {
                 preset,
@@ -239,6 +283,7 @@ impl GraphicsSettings {
                 view_distance: 6000.0,
                 vsync: true,
                 fov_deg: 75.0,
+                sky_style: SkyStyle::Enhanced,
             },
             QualityPreset::Ultra => Self {
                 preset,
@@ -255,6 +300,7 @@ impl GraphicsSettings {
                 view_distance: 6000.0,
                 vsync: true,
                 fov_deg: 75.0,
+                sky_style: SkyStyle::Enhanced,
             },
             // Custom: identical to High at construction; the caller
             // mutates fields after. Used by the on-disk loader when
@@ -287,6 +333,7 @@ impl GraphicsSettings {
             GraphicsField::ViewDistance => format!("{:.0}m", self.view_distance),
             GraphicsField::VSync => bool_label(self.vsync).into(),
             GraphicsField::Fov => format!("{:.0}°", self.fov_deg),
+            GraphicsField::SkyStyle => self.sky_style.label().to_string(),
         }
     }
 
@@ -297,9 +344,14 @@ impl GraphicsSettings {
     pub fn cycle(&mut self, field: GraphicsField, delta: i32) {
         match field {
             GraphicsField::Preset => {
+                // Sky style is orthogonal to the quality tier; preserve
+                // it across a preset overwrite so picking Low doesn't
+                // silently revert the user's Retail sky to Enhanced.
+                let sky = self.sky_style;
                 let next =
                     cycle_slot(self.preset, PRESET_CYCLE, delta).unwrap_or(QualityPreset::High);
                 *self = Self::for_preset(next);
+                self.sky_style = sky;
             }
             GraphicsField::ShadowMapSize => {
                 self.shadow_map_size =
@@ -344,6 +396,12 @@ impl GraphicsSettings {
             GraphicsField::Fov => {
                 self.fov_deg = cycle_slot_f32(self.fov_deg, FOV_SLOTS, delta);
                 self.preset = QualityPreset::Custom;
+            }
+            GraphicsField::SkyStyle => {
+                // Orthogonal to quality — does NOT flip the preset to
+                // Custom. Just cycles the style enum.
+                self.sky_style = cycle_slot(self.sky_style, SKY_STYLE_CYCLE, delta)
+                    .unwrap_or(SkyStyle::Enhanced);
             }
         }
     }
@@ -464,7 +522,8 @@ pub fn init_msaa_caps_system(
     }
 }
 
-/// 11 fields × 2 sections — used by `hud::menu` to size the row pool.
+/// Menu row order — used by `hud::menu` to size the row pool. Each
+/// entry is one row on the Graphics tab, top-down.
 pub const GRAPHICS_FIELDS: &[GraphicsField] = &[
     GraphicsField::Preset,
     GraphicsField::ShadowMapSize,
@@ -477,6 +536,7 @@ pub const GRAPHICS_FIELDS: &[GraphicsField] = &[
     GraphicsField::ViewDistance,
     GraphicsField::VSync,
     GraphicsField::Fov,
+    GraphicsField::SkyStyle,
 ];
 
 // ---------------------------------------------------------------------------
@@ -709,6 +769,25 @@ pub fn apply_vsync_system(
     }
 }
 
+/// Push the chosen [`SkyStyle`] onto the [`crate::sky_realism::SkyRealism`]
+/// knobs whenever the style actually changes. Shares the
+/// `resource_changed::<GraphicsSettings>` run-condition with the other
+/// reactors, but the `Local` guard means an unrelated change (bloom,
+/// FOV, …) won't re-derive — so a `/sky <feature>` runtime override,
+/// which mutates `SkyRealism` directly and never touches
+/// `GraphicsSettings`, survives until the user picks a different style.
+pub fn apply_sky_style_system(
+    settings: Res<GraphicsSettings>,
+    mut sky: ResMut<crate::sky_realism::SkyRealism>,
+    mut last: Local<Option<SkyStyle>>,
+) {
+    if *last == Some(settings.sky_style) {
+        return;
+    }
+    *sky = settings.sky_style.sky_realism();
+    *last = Some(settings.sky_style);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -792,6 +871,42 @@ mod tests {
         s.cycle(GraphicsField::Preset, 1);
         let medium = GraphicsSettings::for_preset(QualityPreset::Medium);
         assert_eq!(s, medium);
+    }
+
+    /// Sky style cycles Enhanced ↔ Retail without flipping the preset
+    /// tag to Custom (it's orthogonal to the quality tier), and maps
+    /// onto the matching SkyRealism preset.
+    #[test]
+    fn sky_style_cycles_without_custom() {
+        let mut s = GraphicsSettings::default();
+        assert_eq!(s.sky_style, SkyStyle::Enhanced);
+        s.cycle(GraphicsField::SkyStyle, 1);
+        assert_eq!(s.sky_style, SkyStyle::Retail);
+        assert_eq!(s.preset, QualityPreset::High, "style must not flip preset");
+        s.cycle(GraphicsField::SkyStyle, 1);
+        assert_eq!(s.sky_style, SkyStyle::Enhanced, "two variants wrap");
+    }
+
+    /// `SkyStyle::sky_realism()` returns the expected presets — Retail
+    /// is the all-off stylized look, Enhanced keeps the embellishments.
+    #[test]
+    fn sky_style_maps_to_realism() {
+        use crate::sky_realism::SkyRealism;
+        assert_eq!(SkyStyle::Retail.sky_realism(), SkyRealism::retail());
+        assert_eq!(SkyStyle::Enhanced.sky_realism(), SkyRealism::enhanced());
+        assert!(!SkyRealism::retail().earthshine);
+        assert!(SkyRealism::enhanced().earthshine);
+    }
+
+    /// Picking a quality preset must preserve the sky style — it's an
+    /// independent axis, so cycling Preset can't silently revert it.
+    #[test]
+    fn preset_cycle_preserves_sky_style() {
+        let mut s = GraphicsSettings::default();
+        s.cycle(GraphicsField::SkyStyle, 1);
+        assert_eq!(s.sky_style, SkyStyle::Retail);
+        s.cycle(GraphicsField::Preset, 1); // High → Ultra
+        assert_eq!(s.sky_style, SkyStyle::Retail, "preset cycle kept the style");
     }
 
     /// Cycle wraps with rem_euclid — last slot + 1 → first slot, and

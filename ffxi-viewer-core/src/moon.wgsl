@@ -53,18 +53,28 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let waxing_sign = data.params.y;
     let intensity = data.params.z;
 
+    // Retail's moon was a flat, bright textured disc; the Enhanced
+    // look adds earthshine + sphere-like limb darkening. The Rust side
+    // already drives `earthshine` to 0 in Retail style and >0 in
+    // Enhanced, so it doubles as a faithful "flat disc" selector with
+    // no extra uniform: `flat ≈ 1` in Retail, `0` in Enhanced.
+    let earthshine = data.params.w;
+    let flat = 1.0 - smoothstep(0.0, 0.02, earthshine);
+
     let k = 1.0 - 2.0 * illumination;
     let term_x = k * sqrt(max(0.0, 1.0 - uv.y * uv.y));
-    let lit = step(term_x, uv.x * waxing_sign);
-    // Earthshine: keep the unlit side faintly visible so the disc
-    // doesn't snap to a hard half-moon edge. Strength is supplied
-    // by the Rust side so we can ramp it by phase (peaks at thin
-    // crescent, fades to 0 near full).
-    let earthshine = data.params.w;
+    // Anti-alias the terminator over a thin band instead of a hard
+    // `step`, so the half-moon edge isn't jagged. Band is narrow so
+    // Retail still reads as a crisp terminator.
+    let lit = smoothstep(-0.02, 0.02, uv.x * waxing_sign - term_x);
+    // Earthshine keeps the unlit side faintly visible (Enhanced only).
     let brightness = mix(earthshine, 1.0, lit);
 
-    // Limb darkening for the sphere illusion on a flat quad.
-    let limb = mix(0.80, 1.0, sqrt(max(0.0, 1.0 - r2)));
+    // Limb darkening for the sphere illusion on a flat quad — eased
+    // toward a flat disc in Retail, and the disc rides a touch brighter
+    // there to match retail's luminous moon.
+    let limb_min = mix(0.80, 0.96, flat);
+    let limb = mix(limb_min, 1.0, sqrt(max(0.0, 1.0 - r2))) * mix(1.0, 1.08, flat);
 
     // Soft edge antialias against the discard.
     let edge = smoothstep(1.0, 0.97, r);
