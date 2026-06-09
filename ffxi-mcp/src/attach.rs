@@ -1,4 +1,4 @@
-//! Attach mode: connect to a long-lived `ffxi-client native
+//! Attach mode: connect to a long-lived `ffxi-client play
 //! --agent-listen` Unix socket instead of spawning a headless
 //! supervisor subprocess.
 //!

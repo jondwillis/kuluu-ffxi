@@ -27,7 +27,7 @@
 //! # Environment
 //!
 //! All `FFXI_*` env vars are inherited by the child. Set `FFXI_ATTACH=auto`
-//! before running the REPL to drive a long-lived `ffxi-client native
+//! before running the REPL to drive a long-lived `ffxi-client play
 //! --agent-listen auto` instead of spawning a fresh headless session.
 
 use std::path::PathBuf;

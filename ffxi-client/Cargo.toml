@@ -13,8 +13,12 @@ name = "ffxi-client"
 path = "src/main.rs"
 
 [features]
-default = []
-# Enable the native windowed viewer (`native` subcommand). Opens a real
+# GUI is the default `play` mode, so the windowed viewer ships by default.
+# Headless-only consumers (CI lint/test, the `ffxi-mcp` library dep) build
+# with `--no-default-features` to skip the Bevy toolchain; `play --headless`
+# still works on such builds since the stdio path isn't feature-gated.
+default = ["native-window"]
+# Enable the native windowed viewer (the default `play` GUI). Opens a real
 # OS window via bevy_winit. Bevy's winit event loop must run on the OS
 # main thread on macOS, so main.rs handles the dispatch specially when
 # this feature is active.

@@ -111,7 +111,7 @@ impl Plugin for WidgetsPlugin {
 /// the runtime before rewriting the real launcher screens:
 ///
 /// ```sh
-/// FFXI_WIDGET_DEMO=1 cargo run -p ffxi-client --features native-window -- native
+/// FFXI_WIDGET_DEMO=1 cargo run -p ffxi-client -- play
 /// ```
 ///
 /// The demo overlays the launcher (z-order: spawned after) and prints

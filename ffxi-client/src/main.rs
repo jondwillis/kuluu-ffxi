@@ -5,7 +5,7 @@
 
 #[cfg(any(feature = "native-window", feature = "relay"))]
 use ffxi_client::state;
-use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session};
+use ffxi_client::{agent_io, auth_client, lobby_client, session};
 // Re-import the lib-level relay/wire_translate at the binary crate root
 // so that submodules under main.rs can keep referring to them via
 // `crate::wire_translate` / `crate::relay`. `wire_translate` is only
@@ -70,8 +70,8 @@ struct Args {
     map_host_override: Option<String>,
 
     /// Bind a WebSocket relay on `<addr>` that publishes
-    /// `ffxi-viewer-wire` frames (same shape the native viewer reads).
-    /// Compatible with `play`, `tui`, and `native`. Accepts either
+    /// `ffxi-viewer-wire` frames (same shape the GUI viewer reads).
+    /// Works in both `play` modes (GUI and `--headless`). Accepts either
     /// `host:port` (e.g. `127.0.0.1:7777`) or the literal `auto` (alias
     /// for `127.0.0.1:0` — the OS picks a free port and the chosen
     /// address is printed to stderr at startup). Defaults to off;
@@ -82,10 +82,11 @@ struct Args {
     relay_listen: Option<std::net::SocketAddr>,
 
     /// Bind a Unix-domain socket at `<path>` that speaks the same
-    /// JSON-line `AgentCommand` / `AgentEvent` protocol as `play`'s
-    /// stdio. Used by `ffxi-mcp` in attach mode (`FFXI_ATTACH=…`) to
-    /// drive a long-lived `native`-window client without spawning its
-    /// own headless subprocess. Accepts an absolute path or `auto`
+    /// JSON-line `AgentCommand` / `AgentEvent` protocol as `play
+    /// --headless`'s stdio. Used by `ffxi-mcp` in attach mode
+    /// (`FFXI_ATTACH=…`) to drive a long-lived GUI `play` client without
+    /// spawning its own headless subprocess. Accepts an absolute path or
+    /// `auto`
     /// (writes `${TMPDIR}/ffxi-agent-{pid}.sock` plus a discovery
     /// pidfile at `${TMPDIR}/ffxi-agent.pid`). If unset, falls back
     /// to the `FFXI_AGENT_LISTEN` env var.
@@ -125,26 +126,15 @@ enum Command {
         size: u8,
         face: u8,
     },
-    /// Authenticate and print the resulting session metadata.
-    Login { user: String, password: String },
-    /// End-to-end login + lobby handshake; print the map server handoff.
-    Lobby {
-        user: String,
-        password: String,
-        char_id: u32,
-        char_name: String,
-    },
-    /// Full login → map UDP bootstrap. Sends the unencrypted 0x00A and
-    /// dumps the first encrypted reply.
-    MapBootstrap {
-        user: String,
-        password: String,
-        char_id: u32,
-        char_name: String,
-    },
-    /// End-to-end session: auth → lobby → map → zone-in → keepalive,
-    /// emitting JSON-line `AgentEvent`s on stdout and reading `AgentCommand`s
-    /// from stdin.
+    /// End-to-end agent-drivable session: auth → lobby → map → zone-in →
+    /// keepalive.
+    ///
+    /// Default opens a real native OS window via `bevy_winit` (Esc to
+    /// disconnect). Pass `--headless` to run without a window, emitting
+    /// JSON-line `AgentEvent`s on stdout and reading `AgentCommand`s from
+    /// stdin — the transport `ffxi-mcp` and other harnesses drive. Both
+    /// modes also accept `--agent-listen` (Unix socket) and
+    /// `--relay-listen` (WebSocket).
     ///
     /// All three positional args are optional; when any are missing, the
     /// command drops into an interactive launcher (see `launcher.rs`)
@@ -156,18 +146,12 @@ enum Command {
         user: Option<String>,
         password: Option<String>,
         char_name: Option<String>,
-    },
-    /// Same session as `Play`, but renders into a real native OS window
-    /// via `bevy_winit` (no terminal involved). Esc to disconnect.
-    ///
-    /// All three positional args are optional; when any are missing, the
-    /// command drops into the same interactive launcher as `tui`/`play`,
-    /// then opens the window once a character is selected.
-    #[cfg(feature = "native-window")]
-    Native {
-        user: Option<String>,
-        password: Option<String>,
-        char_name: Option<String>,
+        /// Run without a GUI window: drive the session purely over the
+        /// stdio JSON agent protocol (and any `--agent-listen` /
+        /// `--relay-listen` transports). Required on builds compiled
+        /// without the `native-window` feature.
+        #[arg(long)]
+        headless: bool,
     },
     /// Standalone model viewer. Opens a Bevy window with a 3D preview
     /// and form controls for inspecting arbitrary PC race/face/equipment
@@ -232,9 +216,10 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Logs go to stderr by default (so stdout stays clean for `play`'s
-    // JSON-line event stream). `native` opens its own OS window and
-    // leaves the launching terminal alone, so stderr is fine there too.
+    // Logs go to stderr by default (so stdout stays clean for `play
+    // --headless`'s JSON-line event stream). The GUI `play` opens its own
+    // OS window and leaves the launching terminal alone, so stderr is fine
+    // there too.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -258,17 +243,27 @@ fn main() -> Result<()> {
 
     // Bevy/winit on macOS strictly requires its event loop on the OS main
     // thread (Cocoa restriction). Build the tokio runtime explicitly so the
-    // Native command can run preflight async work via `block_on`, then run
-    // Bevy synchronously on this (main) thread. All other commands run
-    // entirely inside the runtime.
+    // GUI `play` path can run preflight async work via `block_on`, then run
+    // Bevy synchronously on this (main) thread. All other commands (and
+    // `play --headless`) run entirely inside the runtime.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?;
 
+    // GUI is the default `play` mode; `--headless` falls through to the
+    // tokio runtime body below. When compiled without `native-window`,
+    // this branch vanishes and the headless guard in `run_command_async`
+    // handles a stray non-`--headless` invocation.
     #[cfg(feature = "native-window")]
-    if matches!(args.command, Command::Native { .. }) {
-        return run_native_main_thread(&rt, args, auth);
+    if matches!(
+        args.command,
+        Command::Play {
+            headless: false,
+            ..
+        }
+    ) {
+        return run_gui_main_thread(&rt, args, auth);
     }
     #[cfg(feature = "native-window")]
     if matches!(args.command, Command::ModelViewer { .. }) {
@@ -346,209 +341,22 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                 .context("character creation")?;
             tracing::info!(char_name = %name, race, job, nation, "character created");
         }
-        Command::Login { user, password } => {
-            let session = auth
-                .login(&user, &password)
-                .await
-                .context("login attempt")?;
-            tracing::info!(
-                account_id = session.account_id,
-                session_hash = %hex(&session.session_hash),
-                cert_sha256 = ?auth.verifier.fingerprint_hex(),
-                "login OK"
-            );
-        }
-        Command::MapBootstrap {
-            user,
-            password,
-            char_id,
-            char_name,
-        } => {
-            auth.ensure_account(&user, &password).await.ok();
-            let session = auth.login(&user, &password).await.context("login")?;
-            let lobby =
-                lobby_client::LobbyClient::new(args.server.clone(), args.data_port, args.view_port);
-            let mut key3 = [0u8; 20];
-            for (i, b) in key3.iter_mut().enumerate() {
-                *b = ((i as u8).wrapping_mul(0x37)) ^ 0x42;
-            }
-            let handoff = lobby
-                .handshake(&session, char_id, &char_name, 0, key3)
-                .await
-                .context("lobby")?;
-            let ip = handoff.server_ip;
-            let lobby_ip_str = format!(
-                "{}.{}.{}.{}",
-                ip & 0xFF,
-                (ip >> 8) & 0xFF,
-                (ip >> 16) & 0xFF,
-                (ip >> 24) & 0xFF,
-            );
-            let server_addr: std::net::SocketAddr = match args.map_host_override.as_deref() {
-                Some(host) => tokio::net::lookup_host((host, handoff.server_port))
-                    .await
-                    .context("resolving map_host_override")?
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("no addrs for {host}"))?,
-                None => format!("{lobby_ip_str}:{}", handoff.server_port)
-                    .parse()
-                    .context("parsing handoff socket addr")?,
-            };
-            tracing::info!(
-                lobby_said = %lobby_ip_str,
-                using = %server_addr,
-                "map server endpoint"
-            );
-
-            // Give the server a beat for the connect→map ZMQ CharZone message
-            // to land and create our pending session. Without this the map
-            // server sees a 0x00A with no pending session and silently drops.
-            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
-            let map = map_client::MapClient::connect(server_addr, key3).await?;
-            map.send_bootstrap(&map_client::BootstrapArgs {
-                char_id,
-                char_name: &char_name,
-                account_name: &user,
-                ticket: session.session_hash,
-                version: 0,
-                platform: *b"PC\0\0",
-                cli_lang: 0,
-            })
-            .await?;
-            tracing::info!(map_server = %server_addr, "0x00A bootstrap sent");
-
-            // Server-side trick: `recv_parse` takes PSession by value, so the
-            // caller's pointer stays null after the first bootstrap creates
-            // the session — the early-return at map_networking.cpp:95
-            // prevents send_parse from running. Retail clients always send a
-            // second packet; on that receive `getSessionByIPP` returns the
-            // freshly-created session, parse() dispatches our 0x00A
-            // sub-packet, and the queued response flushes. We mimic that by
-            // sending the same unencrypted bootstrap twice — simpler than
-            // implementing FFXI's custom (non-zlib) bit-packed compression
-            // for an encrypted second packet.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            map.send_bootstrap(&map_client::BootstrapArgs {
-                char_id,
-                char_name: &char_name,
-                account_name: &user,
-                ticket: session.session_hash,
-                version: 0,
-                platform: *b"PC\0\0",
-                cli_lang: 0,
-            })
-            .await?;
-            tracing::info!("second bootstrap sent, listening for response");
-
-            // Listen for multiple bundles over the zone-in flood window.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            let mut total_subs = 0usize;
-            loop {
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                let remaining = deadline - now;
-                match tokio::time::timeout(remaining, map.recv_decrypted()).await {
-                    Ok(Ok(buf)) => {
-                        let walker = ffxi_proto::framing::walk_sub_packets(
-                            &buf[ffxi_proto::framing::FFXI_HEADER_SIZE..],
-                        );
-                        let mut subs = Vec::new();
-                        for r in walker {
-                            match r {
-                                Ok(sub) => subs.push((sub.opcode, sub.sequence, sub.data.len())),
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "sub-packet walk error");
-                                    break;
-                                }
-                            }
-                        }
-                        let opcodes: Vec<String> = subs
-                            .iter()
-                            .map(|(op, seq, len)| format!("0x{op:03x}@{seq}({len}b)"))
-                            .collect();
-                        tracing::info!(
-                            bundle_bytes = buf.len(),
-                            sub_count = subs.len(),
-                            "bundle: {}",
-                            opcodes.join(" ")
-                        );
-                        total_subs += subs.len();
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "recv error");
-                    }
-                    Err(_) => break,
-                }
-            }
-            if total_subs == 0 {
-                bail!("no reply from map server");
-            }
-            tracing::info!(total_subs, "zone-in flood complete");
-
-            // Send encrypted 0x00D NETEND + 0x011 ZONE_TRANSITION to complete
-            // the zone-in handshake. After this, the server expects regular
-            // 0x015 POS packets to keep the session alive.
-            let mut sub_seq: u16 = 2;
-            let mut bundle_seq: u16 = 3; // we used 1, 1, 2 so far
-            let netend = build_subpacket_netend(sub_seq);
-            sub_seq += 1;
-            let zone_transition = build_subpacket_zone_transition(sub_seq);
-            sub_seq += 1;
-            let mut payload = netend;
-            payload.extend(zone_transition);
-            map.send_encrypted(&payload, bundle_seq, /*ack=*/ 1).await?;
-            tracing::info!(bundle_seq, "sent 0x00D + 0x011 (zone-in finalize)");
-            bundle_seq += 1;
-
-            // 1 Hz keepalive loop: send 0x015 POS with last-known position.
-            // Server-side `cleanupSessions` expires sessions after ~60s of silence.
-            // We also drain incoming bundles to keep the parse loop healthy.
-            let self_x = 0.0f32;
-            let self_y = 0.0f32;
-            let self_z = 0.0f32;
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-            tick.tick().await; // first tick fires immediately
-            let mut last_recv = std::time::Instant::now();
-            for _ in 0..30 {
-                tokio::select! {
-                    _ = tick.tick() => {
-                        let pos = build_subpacket_pos(sub_seq, self_x, self_y, self_z, 0);
-                        sub_seq = sub_seq.wrapping_add(1);
-                        if let Err(e) = map.send_encrypted(&pos, bundle_seq, sub_seq.wrapping_sub(1)).await {
-                            tracing::warn!(error = %e, "send POS failed");
-                            break;
-                        }
-                        bundle_seq = bundle_seq.wrapping_add(1);
-                    }
-                    res = tokio::time::timeout(std::time::Duration::from_millis(50), map.recv_decrypted()) => {
-                        if let Ok(Ok(buf)) = res {
-                            last_recv = std::time::Instant::now();
-                            let walker = ffxi_proto::framing::walk_sub_packets(
-                                &buf[ffxi_proto::framing::FFXI_HEADER_SIZE..]
-                            );
-                            let opcodes: Vec<String> = walker
-                                .filter_map(|r| r.ok().map(|s| format!("0x{:03x}", s.opcode)))
-                                .collect();
-                            tracing::info!(bytes = buf.len(), "in-zone bundle: {}", opcodes.join(" "));
-                        }
-                    }
-                }
-                let age_ms = last_recv.elapsed().as_millis();
-                if age_ms > 30_000 {
-                    tracing::warn!(age_ms, "no server packets for 30s — exiting keepalive");
-                    break;
-                }
-            }
-            tracing::info!("keepalive loop ended");
-        }
         Command::Play {
             user,
             password,
             char_name,
+            headless,
         } => {
+            // Reached for `play --headless`, or — on builds without the
+            // `native-window` feature — any `play`. The GUI default is
+            // intercepted on the main thread in `main`, so a non-headless
+            // invocation here means the GUI simply isn't compiled in.
+            if !headless {
+                bail!(
+                    "this build has no GUI window (compiled without --features native-window); \
+                     pass --headless to run the stdio agent session, or rebuild with the feature"
+                );
+            }
             let dat_root = resolve_dat_root(args.require_dat)?;
             let lobby =
                 lobby_client::LobbyClient::new(args.server.clone(), args.data_port, args.view_port);
@@ -707,53 +515,10 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             }
         }
         #[cfg(feature = "native-window")]
-        Command::Native { .. } => {
-            unreachable!(
-                "Native is dispatched on the main thread by run_native_main_thread; \
-                 it must not reach the tokio runtime body"
-            );
-        }
-        #[cfg(feature = "native-window")]
         Command::ModelViewer { .. } => {
             unreachable!(
                 "ModelViewer is dispatched on the main thread by \
                  run_model_viewer_main_thread; it must not reach the tokio runtime body"
-            );
-        }
-        Command::Lobby {
-            user,
-            password,
-            char_id,
-            char_name,
-        } => {
-            auth.ensure_account(&user, &password).await.ok(); // best-effort
-            let session = auth.login(&user, &password).await.context("login")?;
-            let lobby =
-                lobby_client::LobbyClient::new(args.server.clone(), args.data_port, args.view_port);
-            // Random key3 per session — server uses it as the Blowfish seed.
-            let mut key3 = [0u8; 20];
-            for (i, b) in key3.iter_mut().enumerate() {
-                *b = (i as u8).wrapping_mul(0x37);
-            }
-            // search_server_ip: 0 means "let server fill in default".
-            let handoff = lobby
-                .handshake(&session, char_id, &char_name, 0, key3)
-                .await
-                .context("lobby handshake")?;
-            let ip = handoff.server_ip;
-            let ip_str = format!(
-                "{}.{}.{}.{}",
-                ip & 0xFF,
-                (ip >> 8) & 0xFF,
-                (ip >> 16) & 0xFF,
-                (ip >> 24) & 0xFF
-            );
-            tracing::info!(
-                char_id = handoff.char_id,
-                character = %handoff.character_name,
-                map_server = %format!("{}:{}", ip_str, handoff.server_port),
-                key3 = %hex(&handoff.session_key_seed),
-                "lobby handoff OK"
             );
         }
     }
@@ -762,7 +527,7 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
 }
 
 #[cfg(feature = "native-window")]
-fn run_native_main_thread(
+fn run_gui_main_thread(
     rt: &tokio::runtime::Runtime,
     args: Args,
     auth: auth_client::AuthClient,
@@ -799,13 +564,14 @@ fn run_native_main_thread(
         command,
         ..
     } = args;
-    let Command::Native {
+    let Command::Play {
         user,
         password,
         char_name,
+        ..
     } = command
     else {
-        unreachable!("dispatched only when args.command is Command::Native");
+        unreachable!("dispatched only when args.command is Command::Play (GUI mode)");
     };
 
     // Direct mode = all three positional args provided. The launcher
@@ -883,86 +649,4 @@ fn run_model_viewer_main_thread(args: Args) -> Result<()> {
         clip,
     })
     .context("model viewer")
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-/// Build a single GP_CLI_COMMAND_LOGIN sub-packet (4-byte header + 88-byte
-/// body) suitable for inclusion as the only sub-packet in an encrypted
-/// bundle. Mirrors `map_client::build_bootstrap_packet` body construction
-/// without the FFXI bundle header or MD5 trailer.
-#[allow(dead_code)]
-fn build_encrypted_login_subpacket(
-    char_id: u32,
-    char_name: &str,
-    account_name: &str,
-    ticket: [u8; 16],
-) -> Vec<u8> {
-    let mut buf = vec![0u8; 92];
-
-    let id: u16 = 0x00A;
-    let size_words: u16 = 23;
-    let header_word = id | (size_words << 9);
-    buf[0..2].copy_from_slice(&header_word.to_le_bytes());
-    buf[2..4].copy_from_slice(&2u16.to_le_bytes());
-
-    buf[12..16].copy_from_slice(&char_id.to_le_bytes());
-    let n = char_name.len().min(15);
-    buf[34..34 + n].copy_from_slice(&char_name.as_bytes()[..n]);
-    let n = account_name.len().min(15);
-    buf[49..49 + n].copy_from_slice(&account_name.as_bytes()[..n]);
-    buf[64..80].copy_from_slice(&ticket);
-    buf[84..88].copy_from_slice(b"PC\0\0");
-
-    let sum: u32 = buf[8..].iter().map(|&b| b as u32).sum();
-    buf[4] = sum as u8;
-
-    buf
-}
-
-fn build_subpacket_header(opcode: u16, size_words: u16, sync: u16) -> [u8; 4] {
-    let id_and_size = opcode | (size_words << 9);
-    let mut h = [0u8; 4];
-    h[0..2].copy_from_slice(&id_and_size.to_le_bytes());
-    h[2..4].copy_from_slice(&sync.to_le_bytes());
-    h
-}
-
-/// `GP_CLI_COMMAND_NETEND` — 4-byte header + 4-byte body = 8 bytes (size_words=2).
-fn build_subpacket_netend(sync: u16) -> Vec<u8> {
-    let mut buf = vec![0u8; 8];
-    buf[0..4].copy_from_slice(&build_subpacket_header(0x00D, 2, sync));
-    // [State u16 = 0, padding00 u16 = 0]
-    buf
-}
-
-/// `GP_CLI_COMMAND_ZONE_TRANSITION` — 4-byte header + 4-byte body = 8 bytes.
-fn build_subpacket_zone_transition(sync: u16) -> Vec<u8> {
-    let mut buf = vec![0u8; 8];
-    buf[0..4].copy_from_slice(&build_subpacket_header(0x011, 2, sync));
-    buf
-}
-
-/// `GP_CLI_COMMAND_POS` — 4-byte header + 28-byte body = 32 bytes (size_words=8).
-/// Heading is a single-byte signed direction (0..=255 mapping to 0°..360°).
-fn build_subpacket_pos(sync: u16, x: f32, y: f32, z: f32, heading: u8) -> Vec<u8> {
-    let mut buf = vec![0u8; 32];
-    buf[0..4].copy_from_slice(&build_subpacket_header(0x015, 8, sync));
-    buf[4..8].copy_from_slice(&x.to_le_bytes());
-    // server's order is (x, z, y) — z and y swapped from screen-space mental model
-    buf[8..12].copy_from_slice(&z.to_le_bytes());
-    buf[12..16].copy_from_slice(&y.to_le_bytes());
-    // MovTime (u16), MoveFlame (u16) — 0 for stationary
-    // dir (i8), mode (bitfield u8)
-    buf[20] = heading;
-    // facetarget (u16) — leave 0
-    // TimeNow (u32) — client-side timestamp; server uses for jitter detection
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
-    buf[24..28].copy_from_slice(&now.to_le_bytes());
-    buf
 }

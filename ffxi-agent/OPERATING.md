@@ -178,7 +178,7 @@ Useful when an LLM is on the wheel and you want a glanceable picture of
 what it's deciding.
 
 ```bash
-cargo run -p ffxi-client --bin ffxi-client -- native
+cargo run -p ffxi-client --bin ffxi-client -- play
 ```
 
 (Direct mode — pass `--user`, `--password`, `--char` to skip the launcher.

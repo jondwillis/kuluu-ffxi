@@ -37,8 +37,9 @@ independently and so the agent/MCP harnesses can reuse the client without
 pulling in Bevy.
 
 - `ffxi-proto` — wire protocol for LSB / Phoenix private servers.
-- `ffxi-client` — interactive client; subcommands `play` (headless / JSON
-  event stream) and `native` (GUI window). Login, session, input, reactor.
+- `ffxi-client` — interactive client; the `play` subcommand opens the GUI
+  window by default, or `play --headless` runs the JSON event-stream agent
+  session. Login, session, input, reactor.
 - `ffxi-viewer-core` — Bevy systems: scene graph, HUD, audio, minimap,
   camera, sky/weather, picking.
 - `ffxi-viewer-wire`, `ffxi-viewer-wasm` — viewer transport + browser build.
@@ -65,16 +66,16 @@ export FFXI_CHAR=...           # exact display name
 export FFXI_SERVER=127.0.0.1   # server hostname or IP
 ```
 
-Native window:
-
-```bash
-cargo run -p ffxi-client --features native-window -- native
-```
-
-Headless (text-mode session, useful for protocol work):
+Native window (the default `play` mode; GUI ships by default):
 
 ```bash
 cargo run -p ffxi-client -- play
+```
+
+Headless (JSON-line agent session, useful for protocol work):
+
+```bash
+cargo run -p ffxi-client --no-default-features -- play --headless
 ```
 
 If any credential env var is unset, the launcher prompts for it and lists
@@ -282,6 +283,6 @@ trade window, item detail panel, status/profile panel, main-menu "Commands"
 ordering, NPC range gate, door zone-transition flow) are specced and staged in
 [`docs/vanilla-menu-parity-plan.md`](docs/vanilla-menu-parity-plan.md).
 
-For protocol questions, the headless `play` subcommand emits a JSON event
-stream that's easy to inspect. For rendering work, the native window is
-the fast iteration loop.
+For protocol questions, `play --headless` emits a JSON event stream that's
+easy to inspect. For rendering work, the default `play` GUI window is the
+fast iteration loop.

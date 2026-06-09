@@ -25,7 +25,10 @@ path = "src/bin/ffxi-mcp-repl.rs"
 # `relay` enables the WebSocket viewer relay so an LLM-driven session can
 # be observed in the browser viewer (`ffxi-viewer-wasm`) while the agent
 # is operating. Opt-in at runtime via the `FFXI_RELAY_LISTEN` env var.
-ffxi-client = { path = "../ffxi-client", features = ["relay"] }
+# `default-features = false` keeps the GUI (`native-window` → Bevy) out of
+# the headless, network-facing MCP crate now that it's a default feature of
+# ffxi-client. We only want the `relay` transport here.
+ffxi-client = { path = "../ffxi-client", default-features = false, features = ["relay"] }
 # Direct dep so headless MCP can attempt a DAT-install load for the
 # Config's `dat_root` field. AGPL note: ffxi-dat is built against
 # POLUtils (Apache-2.0), not xi-tinkerer, so linking from the

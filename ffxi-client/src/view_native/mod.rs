@@ -7,7 +7,7 @@
 //! # Threading
 //!
 //! Bevy's winit-driven event loop must run on the **main thread on macOS**
-//! (Cocoa requires it). The caller — `main.rs::run_native_main_thread` —
+//! (Cocoa requires it). The caller — `main.rs::run_gui_main_thread` —
 //! handles this: it builds an explicit tokio Runtime, then invokes
 //! [`run`] synchronously on the main thread.
 //!
@@ -135,7 +135,7 @@ pub(crate) struct DatRootRes(pub Option<std::sync::Arc<ffxi_dat::DatRoot>>);
 #[derive(Resource, Clone)]
 pub(crate) struct AgentPaused(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
 
-/// Inputs for [`run`]. Bundled to keep `run_native_main_thread`
+/// Inputs for [`run`]. Bundled to keep `run_gui_main_thread`
 /// readable now that the App owns more state.
 pub struct NativeRunArgs {
     pub server: String,

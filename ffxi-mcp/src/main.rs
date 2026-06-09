@@ -1227,7 +1227,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Attach mode means the credentials/character live in the running
-    // `ffxi-client native` peer, not here — skip FFXI_USER/PASS/CHAR
+    // `ffxi-client play` peer, not here — skip FFXI_USER/PASS/CHAR
     // reads so attach works with a clean MCP environment.
     let attach_arg = std::env::var("FFXI_ATTACH").ok();
     let cfg = if attach_arg.is_some() {
@@ -1319,7 +1319,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(RwLock::new(SessionState::default()));
 
     // Producer task: either the in-process supervisor (default headless
-    // mode) or an attach-mode bridge to a long-lived `ffxi-client native
+    // mode) or an attach-mode bridge to a long-lived `ffxi-client play
     // --agent-listen` peer. `FFXI_ATTACH=<path|auto>` (read earlier into
     // `attach_arg`) selects the latter.
     let event_tx_for_producer = event_tx.clone();
