@@ -1766,6 +1766,8 @@ pub fn auto_load_zone_geometry_system(
     mut commands: Commands,
     mut load_tx: MessageWriter<LoadMzbRequest>,
     auto_q: Query<Entity, With<AutoMzbOverlay>>,
+    mut mzb_in_flight: ResMut<LoadMzbInFlight>,
+    mut mmb_queue: ResMut<crate::dat_mmb::MmbLoadQueue>,
 ) {
     let current = scene_state.snapshot.zone_id;
     if current == last.zone_id {
@@ -1784,6 +1786,28 @@ pub fn auto_load_zone_geometry_system(
             ec.despawn();
         }
     }
+    // Cancel the *previous* zone's in-flight loads so its geometry can't
+    // bleed into the new zone. Despawning the already-spawned overlays
+    // above isn't enough on its own: the MZB parse runs on a background
+    // task and the per-placement MMB spawns drain over many frames
+    // (frame-budgeted), so without this a fast cursor hover (zone A
+    // loading → hover B) would keep spawning A's buildings/textures into
+    // B's now-presented scene. This runs *before* `kick_load_mzb_tasks`
+    // in the chain, so it only ever clears the old zone — the new zone's
+    // task/requests are produced downstream this same frame.
+    //
+    // `tasks.clear()` drops the stale MZB parse (re-parsed on re-entry;
+    // a prior completed visit still lives in `ZoneGeomCache`). The queue
+    // `retain` drops only *zone-placement* MMB spawns
+    // (`entity_id.is_none() && world_transform.is_some()`) — entity-look
+    // model loads (NPC/PC/pet appearances) share the same queue and must
+    // survive a zone change.
+    if !mzb_in_flight.tasks.is_empty() {
+        mzb_in_flight.tasks.clear();
+    }
+    mmb_queue
+        .pending
+        .retain(|r| !(r.entity_id.is_none() && r.world_transform.is_some()));
     last.zone_id = current;
     let Some(zone_id) = current else { return };
 
