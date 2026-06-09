@@ -253,6 +253,8 @@ pub struct LoadedMmb {
     /// MZB placement table looks up. Useful for mouse-over debug HUDs
     /// that identify which placement-table entry a mesh came from.
     pub asset_name: String,
+    /// True if the header carries FFXI's `"clod"` sky-cloud marker.
+    pub is_cloud: bool,
 }
 
 /// Load + decrypt + parse an MMB at the given file_id / chunk_idx.
@@ -384,10 +386,12 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
     }
 
     let asset_name = header.asset_name_str().trim().to_string();
+    let is_cloud = header.is_cloud();
     Ok(LoadedMmb {
         submeshes: out,
         textures,
         asset_name,
+        is_cloud,
     })
 }
 
@@ -783,18 +787,16 @@ pub fn process_load_mmb_requests(
             }
         };
 
-        // Cloud mesh: FFXI tags the sky cloud MMB with the header name
-        // "clod" (cite: lotus landscape_entity, RZN FFXILandscapeMesh).
-        // Mark the parent so `zone_clouds` can gate its visibility by sky
-        // style (Retail shows this authored mesh; Enhanced uses the
-        // procedural dome) and drift it slowly. Detection is name-based
-        // on the already-decoded `asset_name` — no extra DAT parsing.
-        if loaded
-            .asset_name
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("clod")
-        {
+        // Cloud mesh: FFXI tags the sky cloud MMB with the "clod" marker
+        // in the header imgID (cite: RZN FFXILandscapeMesh). Mark the
+        // parent so `zone_clouds` can gate its visibility by sky style
+        // (Retail shows this authored mesh; Enhanced uses the procedural
+        // dome) and drift it slowly.
+        if loaded.is_cloud {
+            info!(
+                "zone_clouds: detected cloud MMB '{}' (file {} chunk {})",
+                loaded.asset_name, req.file_id, req.chunk_idx
+            );
             commands
                 .entity(parent)
                 .insert(crate::zone_clouds::CloudMesh);

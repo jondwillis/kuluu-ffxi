@@ -150,6 +150,13 @@ pub struct MmbHeader<'a> {
     pub key_index: u8,
     pub feature_flags: u16,
     pub asset_name: &'a [u8],
+    /// The 32-byte decrypted header window (offset 0..32). `asset_name`
+    /// is the [8..32] slice of this; the [0..8] prefix carries
+    /// version/key/flags bytes *and*, per RZN's `SMMBHeader.imgID`,
+    /// the cloud marker `"clod"` for sky-cloud meshes. Kept whole so
+    /// callers can scan for that marker regardless of exactly where in
+    /// the window it lands (our framing vs. RZN's differ by 8 bytes).
+    pub header_window: &'a [u8],
     /// Body following the 32-byte header (sub-records etc.).
     pub payload: &'a [u8],
 }
@@ -164,6 +171,7 @@ impl<'a> MmbHeader<'a> {
             key_index: decrypted[5],
             feature_flags: u16::from_le_bytes([decrypted[6], decrypted[7]]),
             asset_name: &decrypted[8..32],
+            header_window: &decrypted[0..32],
             payload: &decrypted[32..],
         })
     }
@@ -177,6 +185,18 @@ impl<'a> MmbHeader<'a> {
             .map(|&b| if b == 0 { '.' } else { b as char })
             .collect();
         raw.trim_end().to_string()
+    }
+
+    /// True if this MMB is the zone's sky-cloud mesh. FFXI tags it with
+    /// the ASCII marker `"clod"` in the header `imgID` (cite: RZN
+    /// `FFXILandscapeMesh`); we scan the whole decrypted header window
+    /// case-insensitively because our header framing differs from RZN's
+    /// by an 8-byte prefix, so the marker may sit in either region.
+    pub fn is_cloud(&self) -> bool {
+        const MARKER: &[u8; 4] = b"clod";
+        self.header_window
+            .windows(4)
+            .any(|w| w.eq_ignore_ascii_case(MARKER))
     }
 }
 
