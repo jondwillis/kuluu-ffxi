@@ -160,6 +160,15 @@ pub struct SlashWriters<'w, 's> {
     /// doc-contract). Bundled here to keep `text_input_system` under Bevy's
     /// 16-SystemParam cap.
     pub check_target: ResMut<'w, ffxi_viewer_core::hud::check_view::CheckTarget>,
+    /// Trade-window state, opened when the operator confirms the contextual
+    /// Trade verb and cleared on OK/Cancel/Esc (see [`trade::TradeState`]'s
+    /// lifecycle contract). Bundled here to keep `text_input_system` under
+    /// Bevy's 16-SystemParam cap.
+    pub trade_state: ResMut<'w, ffxi_viewer_core::hud::trade::TradeState>,
+    /// Trade intent stream — OK emits [`trade::TradeIntent::Confirm`] for a
+    /// later consumer to turn into the outbound `0x036 TRADE_REQUEST`. The
+    /// packet edge is intentionally out of viewer-core; this is the seam.
+    pub trade_intent: MessageWriter<'w, ffxi_viewer_core::hud::trade::TradeIntent>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -335,6 +344,8 @@ pub fn text_input_system(
                     &entities,
                     &cmd_tx.0,
                     &mut slash_writers.check_target,
+                    &mut slash_writers.trade_state,
+                    &mut slash_writers.trade_intent,
                 ) {
                     *mode = next;
                 }
@@ -518,6 +529,7 @@ fn build_target_action_context(
 /// cursor (wrapping), NavRight cycles the Chat entry's send mode
 /// (Say / Tell / Party / …), NavConfirm fires or routes the entry, and
 /// NavCancel exits to World.
+#[allow(clippy::too_many_arguments)]
 fn handle_target_action_key(
     key: &Key,
     bindings: &Bindings,
@@ -527,9 +539,19 @@ fn handle_target_action_key(
     entities: &[ffxi_viewer_wire::Entity],
     cmd_tx: &Sender<AgentCommand>,
     check_target: &mut ffxi_viewer_core::hud::check_view::CheckTarget,
+    trade_state: &mut ffxi_viewer_core::hud::trade::TradeState,
+    trade_intent: &mut MessageWriter<ffxi_viewer_core::hud::trade::TradeIntent>,
 ) -> Option<InputMode> {
     use ffxi_viewer_core::hud::action_model::{ActionEntryKind, TargetActionId};
     use ffxi_viewer_core::input_mode::SubAction;
+
+    // The open Trade window owns navigation before any verb-row handling:
+    // its visibility is driven off the `TradeState.open` resource (no
+    // `SubAction::Trade` frame) the same way `CheckTarget` gates the check
+    // window, so the verb rows stay inert while the trade grid is up.
+    if trade_state.open {
+        return handle_trade_key(key, bindings, trade_state, trade_intent, scene_state);
+    }
 
     // A pushed `AbilitiesGroup` leaf owns navigation: the top-level verb
     // rows are dimmed and inert while it's open (mirrors the renderer).
@@ -604,6 +626,7 @@ fn handle_target_action_key(
             entities,
             cmd_tx,
             check_target,
+            trade_state,
         );
     }
     if bindings.matches_logical(Action::NavCancel, key) {
@@ -619,6 +642,159 @@ fn handle_target_action_key(
     None
 }
 
+/// Route a keypress into the open Trade window's pure [`TradeState`]
+/// mutators. Gated on `trade_state.open` by the caller; returns
+/// `Some(InputMode::World)` only when the window closes (OK / Cancel /
+/// Esc-with-no-selector), `None` otherwise so the operator stays in the
+/// grid.
+///
+/// Item placement is intentionally out of this first increment: filling a
+/// slot needs a from-inventory picker UI (a sizeable sub-part), and the
+/// minimum shippable slice is grid + gil + OK/Cancel. Confirming a Slot
+/// here therefore toasts that placement is deferred rather than opening a
+/// half-built picker — see the OK toast for the gil-only trade note.
+fn handle_trade_key(
+    key: &Key,
+    bindings: &Bindings,
+    trade_state: &mut ffxi_viewer_core::hud::trade::TradeState,
+    trade_intent: &mut MessageWriter<ffxi_viewer_core::hud::trade::TradeIntent>,
+    scene_state: &mut SceneState,
+) -> Option<InputMode> {
+    use ffxi_viewer_core::hud::trade::{self, TradeFocus, TradeSelector};
+
+    // An open selector captures input first: while editing gil or a stack
+    // count, the grid is inert (mirrors the modal-selector contract in
+    // trade.rs — Up/Down/Enter/digits drive the selector, Esc cancels it).
+    if let Some(selector) = trade_state.selector.clone() {
+        match selector {
+            TradeSelector::Gil { .. } => {
+                if bindings.matches_logical(Action::NavConfirm, key) {
+                    trade::gil_confirm(trade_state);
+                    return None;
+                }
+                if bindings.matches_logical(Action::NavCancel, key) {
+                    // Close the selector back to the grid rather than the
+                    // whole window — Esc is "abandon this edit", a second Esc
+                    // (no selector) then closes the window.
+                    trade_state.selector = None;
+                    return None;
+                }
+                // Tab fills the buffer to the operator's full gil (= max).
+                if matches!(key, Key::Tab) {
+                    trade::gil_fill_max(trade_state);
+                    return None;
+                }
+                // Digit characters accumulate into the buffer; the mutator
+                // ignores non-digits defensively.
+                if let Key::Character(s) = key {
+                    for c in s.chars() {
+                        trade::gil_push_digit(trade_state, c);
+                    }
+                }
+                return None;
+            }
+            TradeSelector::Stack { .. } => {
+                if bindings.matches_logical(Action::NavConfirm, key) {
+                    trade::stack_confirm(trade_state);
+                    return None;
+                }
+                if bindings.matches_logical(Action::NavCancel, key) {
+                    trade_state.selector = None;
+                    return None;
+                }
+                if bindings.matches_logical(Action::NavUp, key) {
+                    trade::stack_adjust(trade_state, 1);
+                    return None;
+                }
+                if bindings.matches_logical(Action::NavDown, key) {
+                    trade::stack_adjust(trade_state, -1);
+                    return None;
+                }
+                if bindings.matches_logical(Action::NavRight, key) {
+                    // Jump straight to the stack ceiling — the spinner's
+                    // "fill to max" shortcut, parallel to gil's Tab.
+                    if let Some(TradeSelector::Stack { value, max, .. }) =
+                        trade_state.selector.as_mut()
+                    {
+                        *value = *max;
+                    }
+                    return None;
+                }
+                return None;
+            }
+        }
+    }
+
+    // No selector open: drive grid focus + button activation.
+    if bindings.matches_logical(Action::NavUp, key) {
+        trade::focus_up(trade_state);
+        return None;
+    }
+    if bindings.matches_logical(Action::NavDown, key) {
+        trade::focus_down(trade_state);
+        return None;
+    }
+    if bindings.matches_logical(Action::NavLeft, key) {
+        trade::focus_left(trade_state);
+        return None;
+    }
+    if bindings.matches_logical(Action::NavRight, key) {
+        trade::focus_right(trade_state);
+        return None;
+    }
+    if bindings.matches_logical(Action::NavConfirm, key) {
+        match trade_state.focus {
+            TradeFocus::Gil => {
+                // SceneSnapshot carries no gil/currency field yet (verified:
+                // ffxi-viewer-wire has none), so the operator's real balance
+                // is unknown — open the entry with max=0 (degraded; any typed
+                // value clamps to 0). TODO: surface gil on the wire snapshot
+                // and pass it here so the field can be filled to the real
+                // balance.
+                let snapshot_gil = 0;
+                trade::begin_gil_entry(trade_state, snapshot_gil);
+                None
+            }
+            TradeFocus::Slot(_) => {
+                // Placement needs a from-inventory picker (deferred); a gil-
+                // only trade is the shippable slice. Toast so the operator
+                // isn't left wondering why Enter on a slot does nothing.
+                push_system_chat_line(
+                    scene_state,
+                    "[trade] Item placement not wired yet — gil-only for now".into(),
+                );
+                None
+            }
+            TradeFocus::Ok => {
+                // The packet edge lives outside viewer-core: emit the intent
+                // for a later consumer to turn into 0x036 TRADE_REQUEST, then
+                // reset (lifecycle symmetry: open ↔ reset).
+                trade_intent.write(trade::TradeIntent::Confirm {
+                    target_id: trade_state.target_id,
+                });
+                push_system_chat_line(
+                    scene_state,
+                    "[trade] Trade sent (gil only; outbound 0x036 pending consumer)".into(),
+                );
+                trade_state.reset();
+                Some(InputMode::World)
+            }
+            TradeFocus::Cancel => {
+                trade_intent.write(trade::TradeIntent::Cancel);
+                trade_state.reset();
+                Some(InputMode::World)
+            }
+        }
+    } else if bindings.matches_logical(Action::NavCancel, key) {
+        // No selector open (handled above) → Esc closes the whole window.
+        trade_intent.write(trade::TradeIntent::Cancel);
+        trade_state.reset();
+        Some(InputMode::World)
+    } else {
+        None
+    }
+}
+
 /// Route the highlighted contextual verb. Disabled verbs surface their
 /// hint and keep the menu open; enabled verbs either open a chat compose
 /// (Chat), push an in-place `SubAction` leaf frame (Abilities — rendered
@@ -626,6 +802,7 @@ fn handle_target_action_key(
 /// `-`-menu submenu (Magic / Items — reusing the proven dynamic-menu
 /// lists), dispatch directly (Check), or report not-yet-implemented
 /// (Trade / Trust).
+#[allow(clippy::too_many_arguments)]
 fn confirm_target_action_at_cursor(
     state: &mut ffxi_viewer_core::input_mode::TargetActionState,
     entries: &[ffxi_viewer_core::hud::action_model::ActionEntry],
@@ -634,6 +811,7 @@ fn confirm_target_action_at_cursor(
     entities: &[ffxi_viewer_wire::Entity],
     cmd_tx: &Sender<AgentCommand>,
     check_target: &mut ffxi_viewer_core::hud::check_view::CheckTarget,
+    trade_state: &mut ffxi_viewer_core::hud::trade::TradeState,
 ) -> Option<InputMode> {
     use ffxi_viewer_core::hud::action_model::TargetActionId;
 
@@ -714,8 +892,21 @@ fn confirm_target_action_at_cursor(
             }
         }
         TargetActionId::Trade => {
-            push_system_chat_line(scene_state, "[menu] Trade — not implemented yet".into());
-            Some(InputMode::World)
+            // The Trade verb is PC/NPC-only and already disabled out of range
+            // by `action_model` (the `!entry.enabled` guard above caught that
+            // case). Opening the resource-backed window keeps us in
+            // TargetAction mode so `handle_trade_key` (gated on
+            // `trade_state.open`) receives subsequent nav keys.
+            match target_ent {
+                Some(e) => {
+                    *trade_state = ffxi_viewer_core::hud::trade::TradeState::open(e.id);
+                    None
+                }
+                None => {
+                    push_system_chat_line(scene_state, "[menu] Trade: no target".into());
+                    Some(InputMode::World)
+                }
+            }
         }
         TargetActionId::Trust => {
             push_system_chat_line(scene_state, "[menu] Trust — not implemented yet".into());
@@ -2513,6 +2704,7 @@ pub fn mouse_nav_dispatch_system(
     mut status_profile_open: ResMut<ffxi_viewer_core::hud::status_panel::StatusProfileOpen>,
     dynamic_menu: Res<ffxi_viewer_core::hud::menu::DynamicMenu>,
     mut check_target: ResMut<ffxi_viewer_core::hud::check_view::CheckTarget>,
+    mut trade_state: ResMut<ffxi_viewer_core::hud::trade::TradeState>,
 ) {
     let entities = scene_state.snapshot.entities.clone();
     let current_target = target.id;
@@ -2581,6 +2773,7 @@ pub fn mouse_nav_dispatch_system(
                 &entities,
                 &cmd_tx.0,
                 &mut check_target,
+                &mut trade_state,
             ) {
                 *mode = next;
             }
