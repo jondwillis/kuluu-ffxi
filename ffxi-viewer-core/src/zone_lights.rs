@@ -168,9 +168,12 @@ fn detect_zone_light_emitters(
                 break;
             }
             let color = cluster.warm_light_color();
+            // Bevy's unlit branch returns `base_color` and ignores
+            // `emissive` (same gotcha as the sun disc), so the HDR glow
+            // colour must live in `base_color`. With AlphaMode::Add it
+            // blends premultiplied-additive over the scene.
             let flame_mat = materials.add(StandardMaterial {
-                base_color: Color::BLACK,
-                emissive: (color.to_linear() * 6.0).into(),
+                base_color: (color.to_linear() * 4.0).into(),
                 unlit: true,
                 alpha_mode: AlphaMode::Add,
                 ..default()

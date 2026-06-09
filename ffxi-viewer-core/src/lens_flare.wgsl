@@ -43,7 +43,12 @@ fn disc(uv: vec2<f32>, centre: vec2<f32>, radius: f32, aspect: f32) -> f32 {
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let intensity = data.params.z;
     if (intensity <= 0.0) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        // Premultiplied-alpha "Add" blend (Bevy maps AlphaMode::Add to
+        // BLEND_PREMULTIPLIED_ALPHA = src·1 + dst·(1−src.a)). Output
+        // alpha MUST be 0 so the destination is preserved (dst·1) and we
+        // add nothing; alpha=1 here would paint an opaque black quad
+        // over the whole world.
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
     let uv = in.uv;
     let sun = data.params.xy;
@@ -86,5 +91,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // strongest with the sun framed, washing out as it leaves view.
     let edge = 1.0 - smoothstep(0.35, 0.75, length((sun - centre) * vec2<f32>(aspect, 1.0)));
 
-    return vec4<f32>(col * intensity * edge, 1.0);
+    // Premultiplied additive: rgb is the light to add, alpha = 0 so the
+    // world behind shows through everywhere the flare is dark. (alpha=1
+    // would replace the scene with black — the opaque-overlay bug.)
+    return vec4<f32>(col * intensity * edge, 0.0);
 }
