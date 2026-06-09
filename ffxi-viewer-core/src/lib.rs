@@ -45,6 +45,7 @@ pub mod keybinds;
 pub mod lock_on;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod look_resolver;
+pub mod lens_flare;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod minimap;
 pub mod moon_material;
@@ -168,6 +169,9 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(skybox::SkyboxPlugin);
         app.add_plugins(moon_material::MoonMaterialPlugin);
+        // Screen-space lens flare — Enhanced sky style only; the system
+        // gates itself on `SkyStyle` and sun visibility.
+        app.add_plugins(lens_flare::LensFlarePlugin);
         // Debug chat surfacing: routes engine + protocol events
         // (zone change, aggro, low HP, speed suppression) to the
         // System chat pane. Cross-platform: the drain reads the same
