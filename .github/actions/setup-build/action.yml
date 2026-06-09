@@ -28,17 +28,24 @@ runs:
     # public submodules the build actually reads and deliberately skip Phoenix /
     # AltanaViewer to avoid private-repo auth.
     # The Bevy/wgpu/Recast test+build artifacts are huge; on a stock runner the
-    # ~14 GB disk fills and `ld` dies with SIGBUS. Reclaim the preinstalled
-    # toolchains we don't use (~25 GB), and strip debug info from dev/test
-    # builds so object files stay small.
+    # ~14 GB disk fills and `ld` dies with SIGBUS. Reclaim the big preinstalled
+    # toolchains the Rust build never touches. The maintained action deletes the
+    # selected categories in parallel (faster than a serial rm -rf) and tracks
+    # runner-image path changes for us. We enable only android (~9 GB), dotnet
+    # (~2.7 GB) and haskell (~5 GB) — definitely unused and the bulk of the
+    # space — and skip the slow ones: large-packages (apt purge, minutes for
+    # little gain), docker-images and swap-storage (not needed here).
     - name: Free disk space (Linux)
       if: runner.os == 'Linux'
-      shell: bash
-      run: |
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-          /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
-          /usr/local/share/powershell /usr/share/swift || true
-        df -h /
+      uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      with:
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: false
+        docker-images: false
+        swap-storage: false
+        tool-cache: false
 
     - name: Slim dev/test build artifacts
       shell: bash
