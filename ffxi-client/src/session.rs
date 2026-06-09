@@ -3299,8 +3299,8 @@ fn decode_miscdata_status_icons(data: &[u8]) -> Option<Vec<u16>> {
     Some(out)
 }
 
-/// `GP_CLI_COMMAND_SHOP_BUY` (0x083) builder. 4-byte sub-packet header
-/// + 12-byte body = 16 bytes (size_words = 4).
+/// `GP_CLI_COMMAND_SHOP_BUY` (0x083) builder. 4-byte sub-packet header +
+/// 12-byte body = 16 bytes (size_words = 4).
 ///
 /// Body per `vendor/server/src/map/packets/c2s/0x083_shop_buy.h`:
 ///   u32 ItemNum (qty), u16 ShopNo, u16 ShopItemIndex,
@@ -3482,8 +3482,8 @@ fn build_subpacket_event_end(
     buf
 }
 
-/// `GP_CLI_COMMAND_ACTION` (0x01A) — 4-byte header + 4 UniqueNo + 2 ActIndex
-/// + 2 ActionID + 16 ActionBuf = 28 bytes (size_words=7). The `ActionKind`
+/// `GP_CLI_COMMAND_ACTION` (0x01A) — 4-byte header + 4 UniqueNo + 2 ActIndex +
+/// 2 ActionID + 16 ActionBuf = 28 bytes (size_words=7). The `ActionKind`
 /// determines both the wire `ActionID` and the layout of the 16-byte buf
 /// (see `ActionKind::fill_action_buf`).
 pub fn build_subpacket_action(
@@ -3503,8 +3503,8 @@ pub fn build_subpacket_action(
     buf
 }
 
-/// `GP_CLI_COMMAND_ITEM_USE` (0x037) — 4-byte header + 4 UniqueNo + 4 ItemNum
-/// + 2 ActIndex + 1 PropertyItemIndex + 1 padding00 + 4 Category = 20 bytes
+/// `GP_CLI_COMMAND_ITEM_USE` (0x037) — 4-byte header + 4 UniqueNo + 4 ItemNum +
+/// 2 ActIndex + 1 PropertyItemIndex + 1 padding00 + 4 Category = 20 bytes
 /// (size_words=5). Per Phoenix/src/map/packets/c2s/0x037_item_use.cpp the
 /// server validates `ItemNum == 0` and looks up the item via
 /// `getStorage(Category)->GetItem(PropertyItemIndex)`, then resolves the
@@ -3512,10 +3512,11 @@ pub fn build_subpacket_action(
 ///
 /// - `unique_no`  → wire `UniqueNo`     = recipient UniqueNo (self for potions).
 /// - `act_index`  → wire `ActIndex`     = recipient ActIndex.
-/// - `category`   → wire `Category`     = container id (0 LOC_INVENTORY,
-///                                                     1 LOC_TEMPITEMS, …).
+/// - `category`   → wire `Category`     = container id
+///   (0 LOC_INVENTORY, 1 LOC_TEMPITEMS, …).
 /// - `slot`       → wire `PropertyItemIndex` = slot index within the container.
 /// - `ItemNum`    → forced to 0 (server enforces).
+///
 /// `GP_CLI_COMMAND_EQUIP_INSPECT` (0x0DD) — `/check` and friends. 4-byte
 /// header + 4 UniqueNo + 4 ActIndex + 1 Kind + 3 padding = 16 bytes
 /// (size_words=4). `kind` is `0=Check, 1=CheckName, 2=CheckParam` per
@@ -3685,8 +3686,8 @@ fn party_member_from_attrs(
     }
 }
 
-/// `GP_CLI_COMMAND_MAPRECT` (0x05E) — 4-byte header + RectID(4) + x/y/z(12)
-/// + ActIndex(2) + MyRoomExitBit(1) + MyRoomExitMode(1) = 24 bytes
+/// `GP_CLI_COMMAND_MAPRECT` (0x05E) — 4-byte header + RectID(4) + x/y/z(12) +
+/// ActIndex(2) + MyRoomExitBit(1) + MyRoomExitMode(1) = 24 bytes
 /// (size_words=6). Wire field order is (x, y, z) — note this differs from
 /// 0x015 POS (x, z, y).
 ///

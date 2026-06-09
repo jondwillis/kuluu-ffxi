@@ -223,8 +223,8 @@ pub struct LoadMzbInFlight {
 /// Selbina ↔ Mhaura, plus three character-house zones), so a 4-entry
 /// cache covers the common pattern of "user re-enters the previous
 /// zone". A cache hit skips file I/O + XOR decrypt + parse + bake
-/// entirely; the spawn step still runs (it owns the GPU asset upload
-/// + ECS spawns, which can't be cached because handles are scoped to
+/// entirely; the spawn step still runs (it owns the GPU asset upload +
+/// ECS spawns, which can't be cached because handles are scoped to
 /// the current session's `Assets<...>` storage).
 ///
 /// `Arc<...>` lets the cache and the spawn step share the inner Vecs

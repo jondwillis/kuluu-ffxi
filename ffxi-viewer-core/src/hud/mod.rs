@@ -81,7 +81,7 @@ pub struct BottomLeftStack;
 /// and subsequent children upward:
 ///
 ///   1. chat panels (bottom of stack — the active one is visible,
-///                   inactive Display::None and skipped by flex)
+///      inactive Display::None and skipped by flex)
 ///   2. tab bar     (above the active panel)
 ///   3. minimap     (above the tab bar) — native only
 pub fn spawn_bottom_left_stack(

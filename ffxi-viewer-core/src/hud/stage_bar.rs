@@ -6,10 +6,12 @@
 //!
 //! - "▌ ffxi-client" in bold cyan
 //! - "●" + stage label color-coded:
-//!     idle → dark gray
-//!     authenticating / lobby_handshake / map_bootstrap / zoning → yellow
-//!     in_zone → green
-//!     disconnected → red
+//!   ```text
+//!   idle → dark gray
+//!   authenticating / lobby_handshake / map_bootstrap / zoning → yellow
+//!   in_zone → green
+//!   disconnected → red
+//!   ```
 //! - "▪" separators in default text color
 //! - charname falls back to "(no char)", zone to "—"
 //! - 1px DarkGray border, very dark background

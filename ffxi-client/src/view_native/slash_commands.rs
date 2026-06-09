@@ -2083,6 +2083,7 @@ fn parse_zoneto(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
 /// `/debug <subcommand>` — namespaced diagnostics. Currently:
 ///   - `heights` — dump player/navmesh/MZB collision heights at the
 ///     player's XZ. Used to diagnose the navmesh-vs-MZB vertical gap.
+///
 /// `/debug` family — diagnostic dumps for the entity/target/look surface.
 ///
 /// Subcommands:
@@ -2541,8 +2542,8 @@ fn parse_minimap(rest: &str) -> SlashOutcome {
 
 /// `/zonegeom off|collision|all|camera|toggle` — set MZB overlay visibility.
 /// `on` is an alias for `all` (back-compat with the old bool toggle).
-/// `camera`/`cam` activates the camera-collision debug overlay (MZB collision
-/// + BVH AABBs + active raycast gizmos). `toggle`/empty cycles
+/// `camera`/`cam` activates the camera-collision debug overlay (MZB collision +
+/// BVH AABBs + active raycast gizmos). `toggle`/empty cycles
 /// Collision → All → Camera → Off → Collision.
 fn parse_zonegeom(rest: &str) -> SlashOutcome {
     use ffxi_viewer_core::dat_mzb::ZoneGeomMode;

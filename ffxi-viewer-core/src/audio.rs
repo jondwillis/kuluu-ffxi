@@ -285,8 +285,8 @@ fn resolve_install_root() -> Option<PathBuf> {
 /// to play *nothing* in this slot" — we treat it as silence
 /// (don't fall through to the next slot).
 ///
-/// LSB pushes ALL relevant tracks on zone-in (ZoneDay + ZoneNight
-/// + CombatSolo + CombatParty + …) — they're cached for later. The
+/// LSB pushes ALL relevant tracks on zone-in (ZoneDay + ZoneNight +
+/// CombatSolo + CombatParty + …) — they're cached for later. The
 /// client must NOT play CombatSolo just because it's filled; it
 /// must check whether the player is actually engaged. Same for
 /// Mount, MogHouse, Dead, Fishing. The earlier naive
