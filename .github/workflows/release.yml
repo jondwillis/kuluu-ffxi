@@ -68,7 +68,7 @@ jobs:
           tar -C target/release -czf "dist/ffxi-client-${TAG}-x86_64-linux.tar.gz" ffxi-client
           tar -C target/release -czf "dist/ffxi-mcp-${TAG}-x86_64-linux.tar.gz" ffxi-mcp ffxi-mcp-repl
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: dist/*
@@ -111,7 +111,7 @@ jobs:
           tar -C target/release -czf "dist/ffxi-client-${TAG}-aarch64-macos.tar.gz" ffxi-client
           tar -C target/release -czf "dist/ffxi-mcp-${TAG}-aarch64-macos.tar.gz" ffxi-mcp ffxi-mcp-repl
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: dist/*
@@ -145,7 +145,7 @@ jobs:
           mkdir -p dist
           ( cd ffxi-viewer-wasm/dist && zip -r "../../dist/ffxi-viewer-wasm-${TAG}.zip" . )
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wasm
           path: dist/*
