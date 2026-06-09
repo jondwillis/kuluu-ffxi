@@ -37,7 +37,7 @@ bevy = { version = "0.17", default-features = false, features = [
 ] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-gloo-net = { version = "0.6", features = ["websocket"] }
+gloo-net = { version = "0.7", features = ["websocket"] }
 gloo-utils = "0.2"
 postcard = { version = "1", features = ["use-std"] }
 flume = { version = "0.11", default-features = false }
