@@ -27,6 +27,25 @@ runs:
     # public LandSandBoat repo to HTTPS so no SSH key is needed. We init only the
     # public submodules the build actually reads and deliberately skip Phoenix /
     # AltanaViewer to avoid private-repo auth.
+    # The Bevy/wgpu/Recast test+build artifacts are huge; on a stock runner the
+    # ~14 GB disk fills and `ld` dies with SIGBUS. Reclaim the preinstalled
+    # toolchains we don't use (~25 GB), and strip debug info from dev/test
+    # builds so object files stay small.
+    - name: Free disk space (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+          /usr/local/share/powershell /usr/share/swift || true
+        df -h /
+
+    - name: Slim dev/test debug info
+      shell: bash
+      run: |
+        echo "CARGO_PROFILE_DEV_DEBUG=0" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
+
     - name: Rewrite SSH submodule URLs to HTTPS
       shell: bash
       run: git config --global url."https://github.com/".insteadOf "git@github.com:"
