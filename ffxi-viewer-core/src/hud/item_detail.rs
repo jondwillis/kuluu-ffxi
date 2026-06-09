@@ -323,8 +323,11 @@ pub enum SortOptionId {
 }
 
 /// The Sort-Options rows, in retail display order.
-pub const SORT_OPTIONS: &[SortOptionId] =
-    &[SortOptionId::Auto, SortOptionId::Manual, SortOptionId::Recycle];
+pub const SORT_OPTIONS: &[SortOptionId] = &[
+    SortOptionId::Auto,
+    SortOptionId::Manual,
+    SortOptionId::Recycle,
+];
 
 /// Max body rows the panel pools. Covers the worst-case detail
 /// (rare/ex + slot + races + jobs + level + uses + recast + equipped +
@@ -549,7 +552,10 @@ pub fn update_item_detail(
             Without<ItemDetailCounts>,
         ),
     >,
-    mut icon_q: Query<(&mut Node, &mut ImageNode), (With<ItemDetailIcon>, Without<ItemDetailPanel>)>,
+    mut icon_q: Query<
+        (&mut Node, &mut ImageNode),
+        (With<ItemDetailIcon>, Without<ItemDetailPanel>),
+    >,
     mut body_q: Query<
         (&ItemDetailBodyRow, &mut Node, &mut Text),
         (
@@ -678,7 +684,10 @@ fn icon_cache_static(
 /// "has a positive quantity"); `total` is the distinct inventory rows;
 /// `held` is the selected item's quantity (or total bag fill when nothing
 /// is selected); capacity is the main-bag size.
-fn format_counts(snapshot: &ffxi_viewer_wire::SceneSnapshot, detail: Option<&ItemDetail>) -> String {
+fn format_counts(
+    snapshot: &ffxi_viewer_wire::SceneSnapshot,
+    detail: Option<&ItemDetail>,
+) -> String {
     let total = snapshot.inventory_main.len() as u32;
     let usable = snapshot
         .inventory_main
@@ -758,7 +767,10 @@ mod tests {
     fn recast_formats_current_over_base() {
         assert_eq!(format_recast(None, None), None);
         // Ready, base 60s.
-        assert_eq!(format_recast(Some(60), None), Some("0:00/(1:00)".to_string()));
+        assert_eq!(
+            format_recast(Some(60), None),
+            Some("0:00/(1:00)".to_string())
+        );
         // On cooldown: 30s left of a 60s recast.
         assert_eq!(
             format_recast(Some(60), Some((30, 60))),

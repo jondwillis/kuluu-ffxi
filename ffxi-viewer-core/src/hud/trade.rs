@@ -111,11 +111,7 @@ pub enum TradeSelector {
     /// Stack count selector for the stackable item placed (or being
     /// placed) in `slot`. `value` is the chosen count, clamped
     /// `1..=max`.
-    Stack {
-        slot: usize,
-        value: u16,
-        max: u16,
-    },
+    Stack { slot: usize, value: u16, max: u16 },
 }
 
 /// The full state the operator builds in the Trade window. Lives as a
@@ -587,7 +583,12 @@ pub fn update_trade_window(
     trade: Res<TradeState>,
     mut panel_q: Query<&mut Node, With<TradePanel>>,
     mut cell_q: Query<
-        (&TradeCell, &mut BorderColor, &mut BackgroundColor, &Children),
+        (
+            &TradeCell,
+            &mut BorderColor,
+            &mut BackgroundColor,
+            &Children,
+        ),
         Without<TradePanel>,
     >,
     mut text_q: Query<&mut Text, Without<TradeStatusLine>>,
@@ -719,7 +720,7 @@ mod tests {
         let mut s = TradeState::open(42);
         s.gil = 777; // a prior trade left a value behind
         begin_gil_entry(&mut s, 5000); // re-entry resets the buffer to empty
-        // Buffer starts empty → committing now would be 0.
+                                       // Buffer starts empty → committing now would be 0.
         gil_fill_max(&mut s); // tab past digits = max
         let committed = gil_confirm(&mut s).unwrap();
         assert_eq!(committed, 5000);
@@ -787,7 +788,14 @@ mod tests {
     fn place_rejects_untradeable() {
         let mut s = TradeState::open(1);
         let sn = snap();
-        assert!(!place_item(&mut s, 0, 1, 1, Some(&rare_ex(ITEM_FLAG_RARE)), &sn));
+        assert!(!place_item(
+            &mut s,
+            0,
+            1,
+            1,
+            Some(&rare_ex(ITEM_FLAG_RARE)),
+            &sn
+        ));
         assert!(s.slots[0].is_none());
         assert!(place_item(&mut s, 0, 1, 1, Some(&rare_ex(0)), &sn));
         assert_eq!(s.slots[0].unwrap().item_no, 1);

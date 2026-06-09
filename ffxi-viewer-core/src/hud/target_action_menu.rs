@@ -93,9 +93,7 @@ pub struct TargetActionActivated {
 /// renderer shows (same discipline as `quick_action::entries_for`).
 pub fn entries_for_mode(mode: &InputMode, overlay: &ActiveOverlay) -> Option<Vec<ActionEntry>> {
     match mode {
-        InputMode::TargetAction(state) => {
-            Some(overlay.0.resolve_target_actions(&state.ctx))
-        }
+        InputMode::TargetAction(state) => Some(overlay.0.resolve_target_actions(&state.ctx)),
         _ => None,
     }
 }
@@ -416,8 +414,7 @@ mod tests {
     fn select_entry_renders_mode_inline() {
         // Chat is a Select cycler; its text should show the active mode.
         let overlay = ActiveOverlay(&RETAIL);
-        let entries =
-            build_target_action_entries(&npc_ctx(true), overlay.0);
+        let entries = build_target_action_entries(&npc_ctx(true), overlay.0);
         let chat = entries
             .iter()
             .find(|e| e.id == TargetActionId::Chat)
@@ -431,8 +428,7 @@ mod tests {
     #[test]
     fn plain_entry_renders_bare_label() {
         let overlay = ActiveOverlay(&RETAIL);
-        let entries =
-            build_target_action_entries(&npc_ctx(true), overlay.0);
+        let entries = build_target_action_entries(&npc_ctx(true), overlay.0);
         let items = entries
             .iter()
             .find(|e| e.id == TargetActionId::Items)
@@ -443,8 +439,7 @@ mod tests {
     #[test]
     fn hint_renders_as_suffix() {
         let overlay = ActiveOverlay(&RETAIL);
-        let entries =
-            build_target_action_entries(&npc_ctx(false), overlay.0);
+        let entries = build_target_action_entries(&npc_ctx(false), overlay.0);
         let chat = entries
             .iter()
             .find(|e| e.id == TargetActionId::Chat)

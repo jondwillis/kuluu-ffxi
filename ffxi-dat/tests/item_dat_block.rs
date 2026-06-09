@@ -8,9 +8,7 @@
 //! field extraction, the inline string table, and the embedded-icon
 //! decode all hang together — without a real client install.
 
-use ffxi_dat::item_dat::{
-    self, ITEM_BLOCK_STRIDE, ITEM_FLAG_EX, ITEM_FLAG_RARE, ITEM_ICON_OFFSET,
-};
+use ffxi_dat::item_dat::{self, ITEM_BLOCK_STRIDE, ITEM_FLAG_EX, ITEM_FLAG_RARE, ITEM_ICON_OFFSET};
 
 /// On-disk encode: rotate each byte RIGHT by 3, which the parser's
 /// rotate-RIGHT-by-5 inverts (rotate_right(3) ∘ rotate_right(5) ==
@@ -196,7 +194,7 @@ fn icon_at_matches_lookup_icon() {
 #[test]
 fn lookup_out_of_range_is_none() {
     let dat = vec![0u8; ITEM_BLOCK_STRIDE]; // one all-zero block (index 0)
-    // Index 1 is past the end.
+                                            // Index 1 is past the end.
     assert!(item_dat::lookup(&dat, 1).is_none());
     // A short buffer that can't hold even one block.
     let short = vec![0u8; 16];
