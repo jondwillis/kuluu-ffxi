@@ -82,9 +82,10 @@ impl Default for ZoneLightConfig {
             warm_only: true,
             max_per_mesh: 3,
             max_total: 96,
-            point_intensity: 40_000.0,
-            point_range: 12.0,
-            flame_radius: 0.14,
+            point_intensity: 25_000.0,
+            point_range: 10.0,
+            // Small + dim: the flame is a subtle glow, not a bloom orb.
+            flame_radius: 0.06,
             flicker: true,
         }
     }
@@ -123,7 +124,14 @@ fn detect_zone_light_emitters(
     meshes: Res<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     flame: Option<Res<FlameAssets>>,
-    q_new: Query<(Entity, &Mesh3d), Added<MmbOverlay>>,
+    q_new: Query<
+        (
+            Entity,
+            &Mesh3d,
+            Option<&crate::hud::mesh_debug::MmbDebugInfo>,
+        ),
+        Added<MmbOverlay>,
+    >,
     q_existing: Query<(), With<ZoneLightEmitter>>,
 ) {
     if !cfg.enabled {
@@ -140,7 +148,7 @@ fn detect_zone_light_emitters(
         return;
     }
 
-    for (entity, mesh3d) in &q_new {
+    for (entity, mesh3d, debug) in &q_new {
         if live >= cfg.max_total {
             break;
         }
@@ -162,6 +170,19 @@ fn detect_zone_light_emitters(
             continue;
         }
 
+        // Diagnostic: which prop did we light? This is how we learn the
+        // asset names of real lanterns/braziers vs. lit signboards so we
+        // can later target detection by name instead of pure brightness.
+        let (asset, file_id, chunk_idx) = match debug {
+            Some(d) => (d.asset_name.as_str(), d.file_id, d.chunk_idx),
+            None => ("?", 0u32, 0usize),
+        };
+        info!(
+            "zone_lights: {} cluster(s) on MMB '{}' (file {file_id} chunk {chunk_idx})",
+            clusters.len(),
+            asset,
+        );
+
         let n = (clusters.len() as u32).min(cfg.max_per_mesh);
         for cluster in clusters.into_iter().take(n as usize) {
             if live >= cfg.max_total {
@@ -171,9 +192,11 @@ fn detect_zone_light_emitters(
             // Bevy's unlit branch returns `base_color` and ignores
             // `emissive` (same gotcha as the sun disc), so the HDR glow
             // colour must live in `base_color`. With AlphaMode::Add it
-            // blends premultiplied-additive over the scene.
+            // blends premultiplied-additive over the scene. Keep the
+            // multiplier modest (×1.3) — higher and bloom turns every
+            // flame into a giant white orb.
             let flame_mat = materials.add(StandardMaterial {
-                base_color: (color.to_linear() * 4.0).into(),
+                base_color: (color.to_linear() * 1.3).into(),
                 unlit: true,
                 alpha_mode: AlphaMode::Add,
                 ..default()
