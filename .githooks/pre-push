@@ -16,11 +16,11 @@ fi
 
 cd "$(git rev-parse --show-toplevel)"
 
-# Match CI exactly so a green hook means a green CI fmt/clippy.
-FEATURES=(--features native-window)
-
-echo "pre-push: cargo fmt --all --check"
-if ! cargo fmt --all --check; then
+# Delegate the actual fmt/clippy invocation to the shared script so this gate
+# and CI run byte-identical flags. A green hook therefore proves a green CI
+# fmt/clippy. (The hook stops at clippy for speed; clippy --all-targets still
+# compiles the tests, so broken constructors surface — it just doesn't run them.)
+if ! scripts/checks.sh fmt; then
   echo "pre-push: ✗ formatting — run 'cargo fmt --all' (or 'git push --no-verify' to bypass)" >&2
   exit 1
 fi
@@ -30,10 +30,7 @@ if [[ "${PREPUSH_FAST:-}" == "1" ]]; then
   exit 0
 fi
 
-# --all-targets also compiles tests/examples, so stale constructors and broken
-# examples surface here (not just lints). --locked catches an out-of-date lockfile.
-echo "pre-push: cargo clippy --workspace --all-targets --locked ${FEATURES[*]} -- -D warnings"
-if ! cargo clippy --workspace --all-targets --locked "${FEATURES[@]}" -- -D warnings; then
+if ! scripts/checks.sh clippy; then
   echo "pre-push: ✗ clippy — fix the warnings above (or 'git push --no-verify' to bypass)" >&2
   exit 1
 fi
