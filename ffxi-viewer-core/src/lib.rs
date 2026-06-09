@@ -67,6 +67,7 @@ pub mod vana_time;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod weather;
 pub mod weather_fx;
+pub mod zone_lights;
 pub mod zone_lines;
 
 pub use camera::{
@@ -172,6 +173,10 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // Screen-space lens flare — Enhanced sky style only; the system
         // gates itself on `SkyStyle` and sun visibility.
         app.add_plugins(lens_flare::LensFlarePlugin);
+        // Dynamic local lights (lanterns/fires) from baked over-bright
+        // MMB vertices. PointLights are Enhanced-only; flame sprites
+        // show in both styles.
+        app.add_plugins(zone_lights::ZoneLightsPlugin);
         // Debug chat surfacing: routes engine + protocol events
         // (zone change, aggro, low HP, speed suppression) to the
         // System chat pane. Cross-platform: the drain reads the same
