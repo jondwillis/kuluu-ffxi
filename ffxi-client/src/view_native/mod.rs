@@ -257,6 +257,12 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         .insert_resource(ffxi_viewer_core::hud::status_ribbon::StatusIconDatRoot(
             dat_root.clone(),
         ))
+        // Same Arc for the moon material: resolves the lunar texture
+        // (file 55660, Menu:MoonPhases). Without it the moon stays on
+        // its procedural surface.
+        .insert_resource(ffxi_viewer_core::moon_material::MoonDatRoot(
+            dat_root.clone(),
+        ))
         .insert_resource(DatRootRes(dat_root));
     #[cfg(unix)]
     app.insert_resource(AgentListen(agent_listen));

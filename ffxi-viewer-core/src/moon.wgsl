@@ -24,6 +24,10 @@ struct MoonUniform {
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> data: MoonUniform;
+// Real lunar texture (file 55660). Bound to a default white texture
+// until loaded; `data.tint.w` gates whether we actually sample it.
+@group(#{MATERIAL_BIND_GROUP}) @binding(1) var surface_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(2) var surface_samp: sampler;
 
 fn hash(p: vec2<f32>) -> f32 {
     return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
@@ -79,6 +83,15 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Soft edge antialias against the discard.
     let edge = smoothstep(1.0, 0.97, r);
 
-    let color = data.tint.rgb * grey * brightness * limb * intensity;
+    // Surface: the real lunar texture when loaded (tint.w ≥ 0.5),
+    // otherwise the procedural grey. The texture supplies per-texel
+    // colour; the procedural maria are the fallback. The phase
+    // terminator, tint, limb and intensity all still ride on top, so
+    // the moon waxes/wanes correctly regardless of source.
+    let tex = textureSample(surface_tex, surface_samp, in.uv).rgb;
+    let has_tex = step(0.5, data.tint.w);
+    let surface_rgb = mix(vec3<f32>(grey, grey, grey), tex, has_tex);
+
+    let color = data.tint.rgb * surface_rgb * brightness * limb * intensity;
     return vec4<f32>(color, edge);
 }
