@@ -49,7 +49,7 @@ jobs:
     env:
       CXXFLAGS: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-build
         with:
           cache-key: release-linux
@@ -80,7 +80,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # The committed .cargo/config.toml hardcodes a developer-machine CXXFLAGS
       # -isysroot for the Recast C++ bridge. Cargo's [env] is set without
@@ -123,7 +123,7 @@ jobs:
     env:
       CXXFLAGS: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-build
         with:
           targets: wasm32-unknown-unknown
