@@ -470,10 +470,21 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // only affecting next frame's input. The amplified yaw-rotation
     // jitter (camera, text, nameplate apparent motion) was the
     // visible symptom of that frame lag.
+    //
+    // `.before(update_nameplate_billboards_system)`: the billboard
+    // orients + distance-scales itself against the camera Transform it
+    // reads this frame. This clamp overwrites that Transform every
+    // frame (it re-derives `anchor + dir * effective`, discarding the
+    // chase lerp), so a billboard that ran *before* the clamp faced a
+    // stale lerp-intermediate camera while the renderer used the
+    // clamped one. The gap is widest while the player moves (the chase
+    // lerp trails most then) and flickered as scheduler order varied —
+    // the visible "nameplate catches up / jitters while moving" bug.
     app.add_systems(
         Update,
         camera_collision::clamp_chase_camera_to_collision
             .after(ffxi_viewer_core::chase_camera_system)
+            .before(ffxi_viewer_core::nameplate_billboard::update_nameplate_billboards_system)
             .run_if(in_state(AppPhase::InGame)),
     );
 
