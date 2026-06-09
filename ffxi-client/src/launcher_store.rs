@@ -270,7 +270,11 @@ mod tests {
             override_env: false,
         };
         std::env::remove_var(var);
-        assert_eq!(ov.resolved(var), Some("/gui/path".into()), "fills when unset");
+        assert_eq!(
+            ov.resolved(var),
+            Some("/gui/path".into()),
+            "fills when unset"
+        );
         std::env::set_var(var, "/env/path");
         assert_eq!(ov.resolved(var), None, "env wins when set");
         std::env::remove_var(var);
