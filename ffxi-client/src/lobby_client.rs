@@ -55,6 +55,41 @@ const VIEW_RESP_NEXT_LOGIN: u32 = 0x0B;
 /// read.
 const NEXT_LOGIN_PACKET_SIZE: u32 = 0x48;
 
+/// Per-step ceiling for a single blocking lobby read. The handshake is
+/// strictly request/response: every `read_*` below waits on the server
+/// to push the next packet. With no bound, a server that accepts the TCP
+/// connection but never replies (wrong build, half-open NAT, a stalled
+/// session pointer server-side) hangs the whole connect flow forever —
+/// the launcher sits in `ConnectInFlight` showing nothing, with no way
+/// to recover but to close the window. 20s is generous for a real
+/// internet private server (e.g. HorizonXI) yet still turns a dead
+/// exchange into a retryable `LoginError` instead of a frozen UI.
+const LOBBY_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wrap a single lobby read in [`LOBBY_IO_TIMEOUT`]. `step` names the
+/// exchange so a timeout surfaces a precise, retryable error (and a WARN
+/// log) pointing at exactly which packet the server withheld, rather
+/// than an indefinite await with no diagnostic.
+async fn lobby_io<T>(
+    step: &'static str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(LOBBY_IO_TIMEOUT, fut).await {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            tracing::warn!(
+                step,
+                secs = LOBBY_IO_TIMEOUT.as_secs(),
+                "lobby step timed out waiting for server"
+            );
+            bail!(
+                "lobby {step}: server did not respond within {}s",
+                LOBBY_IO_TIMEOUT.as_secs()
+            )
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CharListEntry {
     pub content_id: u32,
@@ -283,22 +318,26 @@ impl LobbyHandle {
         let req_select = build_view_select(char_id, char_name, &self.session_hash);
         self.view.write_all(&req_select).await?;
         self.view.flush().await?;
-        tracing::debug!(char_id, "lobby: 0x07 select sent");
+        tracing::info!(char_id, "lobby: 0x07 select sent");
 
         let mut ack = [0u8; 5];
-        self.data
-            .read_exact(&mut ack)
-            .await
-            .context("reading 0x07 ack on data port")?;
+        lobby_io("0x02 ack (data)", async {
+            self.data
+                .read_exact(&mut ack)
+                .await
+                .context("reading 0x07 ack on data port")?;
+            Ok(())
+        })
+        .await?;
         if ack[0] != 0x02 {
             bail!("expected 0x02 ack after view select, got {ack:?}");
         }
-        tracing::debug!("lobby: 0x02 ack received");
+        tracing::info!("lobby: 0x02 ack received");
 
         let req_a2 = build_data_a2(&key3);
         self.data.write_all(&req_a2).await?;
         self.data.flush().await?;
-        tracing::debug!("lobby: 0xA2 handoff sent");
+        tracing::info!("lobby: 0xA2 handoff sent");
 
         // Same race-mitigation rationale as the sleep in `open()` before
         // 0xA1: LSB's 0xA2 handler writes lpkt_next_login to
@@ -309,8 +348,12 @@ impl LobbyHandle {
         // generous nudge that costs nothing on the happy path.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let handoff = read_lpkt_next_login(&mut self.view, char_id, &key3).await?;
-        tracing::debug!(
+        let handoff = lobby_io(
+            "lpkt_next_login (view)",
+            read_lpkt_next_login(&mut self.view, char_id, &key3),
+        )
+        .await?;
+        tracing::info!(
             server_port = handoff.server_port,
             "lobby: lpkt_next_login received"
         );
@@ -338,9 +381,9 @@ impl LobbyClient {
     /// (the bug that surfaced as `early eof`).
     pub async fn open(&self, auth: &AuthSession) -> Result<LobbyHandle> {
         let mut view = self.connect(self.view_port).await?;
-        tracing::debug!("lobby: view socket connected");
+        tracing::info!("lobby: view socket connected");
         let mut data = self.connect(self.data_port).await?;
-        tracing::debug!("lobby: data socket connected");
+        tracing::info!("lobby: data socket connected");
 
         let register = ixff_header(
             IXFF_HEADER_SIZE as u32,
@@ -349,7 +392,7 @@ impl LobbyClient {
         );
         view.write_all(&register).await?;
         view.flush().await?;
-        tracing::debug!("lobby: VIEW_CMD_REGISTER sent");
+        tracing::info!("lobby: VIEW_CMD_REGISTER sent");
 
         // Race-condition mitigation: LSB's data_session::read_func handles
         // 0xA1 by writing chr_info2 to `session.view_session->buffer_`, but
@@ -366,24 +409,24 @@ impl LobbyClient {
         let req_a1 = build_data_a1(auth.account_id, 0, &auth.session_hash);
         data.write_all(&req_a1).await?;
         data.flush().await?;
-        tracing::debug!(
+        tracing::info!(
             account_id = auth.account_id,
             "lobby: 0xA1 char-list request sent"
         );
 
-        let charlist = read_data_charlist(&mut data).await?;
-        tracing::debug!(
+        let charlist = lobby_io("0xA1 char-list (data)", read_data_charlist(&mut data)).await?;
+        tracing::info!(
             count = charlist.characters.len(),
             "lobby: 0xA1 char-list received"
         );
-        let slots = parse_view_chr_info2(&mut view).await?;
+        let slots = lobby_io("chr_info2 (view)", parse_view_chr_info2(&mut view)).await?;
         // Drop empty slots (server marks them with status=0x01 and a leading
         // space byte in `character_name`, see view_session.cpp:222).
         let chars: Vec<CharSlot> = slots
             .into_iter()
             .filter(|s| s.char_id != 0 && !s.name.starts_with(' '))
             .collect();
-        tracing::debug!(populated = chars.len(), "lobby: chr_info2 parsed");
+        tracing::info!(populated = chars.len(), "lobby: chr_info2 parsed");
 
         Ok(LobbyHandle {
             view,
@@ -501,9 +544,15 @@ impl LobbyClient {
     }
 
     async fn connect(&self, port: u16) -> Result<TcpStream> {
-        TcpStream::connect((self.host.as_str(), port))
-            .await
-            .with_context(|| format!("TCP connect to {}:{}", self.host, port))
+        // Bound the connect too: a black-holed host:port (SYN with no
+        // reply) otherwise blocks at the OS default (~1–2 min) before the
+        // launcher sees an error.
+        lobby_io("TCP connect", async {
+            TcpStream::connect((self.host.as_str(), port))
+                .await
+                .with_context(|| format!("TCP connect to {}:{}", self.host, port))
+        })
+        .await
     }
 }
 
