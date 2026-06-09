@@ -783,6 +783,23 @@ pub fn process_load_mmb_requests(
             }
         };
 
+        // Cloud mesh: FFXI tags the sky cloud MMB with the header name
+        // "clod" (cite: lotus landscape_entity, RZN FFXILandscapeMesh).
+        // Mark the parent so `zone_clouds` can gate its visibility by sky
+        // style (Retail shows this authored mesh; Enhanced uses the
+        // procedural dome) and drift it slowly. Detection is name-based
+        // on the already-decoded `asset_name` — no extra DAT parsing.
+        if loaded
+            .asset_name
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("clod")
+        {
+            commands
+                .entity(parent)
+                .insert(crate::zone_clouds::CloudMesh);
+        }
+
         let n_subs = loaded.submeshes.len();
         for (sub_index, sub) in loaded.submeshes.iter().enumerate() {
             let cache_key = (req.file_id, req.chunk_idx, sub_index);

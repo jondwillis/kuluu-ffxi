@@ -67,6 +67,7 @@ pub mod vana_time;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod weather;
 pub mod weather_fx;
+pub mod zone_clouds;
 pub mod zone_lights;
 pub mod zone_lines;
 
@@ -177,6 +178,9 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // MMB vertices. PointLights are Enhanced-only; flame sprites
         // show in both styles.
         app.add_plugins(zone_lights::ZoneLightsPlugin);
+        // Faithful cloud mesh (the zone's "clod" MMB) — shown + drifted
+        // in Retail style; hidden in Enhanced (procedural dome wins).
+        app.add_plugins(zone_clouds::ZoneCloudsPlugin);
         // Debug chat surfacing: routes engine + protocol events
         // (zone change, aggro, low HP, speed suppression) to the
         // System chat pane. Cross-platform: the drain reads the same
