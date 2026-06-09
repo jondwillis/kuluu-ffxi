@@ -59,6 +59,12 @@ const SKYBOX_RADIUS: f32 = 5500.0;
 pub struct SkyboxUniform {
     pub colors: [Vec4; 8],
     pub altitudes_packed: [Vec4; 2],
+    /// Procedural cloud layer (Enhanced sky style only):
+    /// `x` = coverage `[0,1]` (higher → more sky filled),
+    /// `y` = opacity `[0,1]` (0 disables the layer entirely — Retail
+    ///        sets this to 0 so the faithful MMB clouds can own the sky),
+    /// `z`, `w` = UV scroll offset, advanced by elapsed time.
+    pub cloud_params: Vec4,
 }
 
 #[derive(Asset, AsBindGroup, Clone, Debug, TypePath)]
@@ -85,6 +91,8 @@ impl Default for SkyboxGradientMaterial {
                     Vec4::new(-1.0, -0.5, -0.2, 0.0),
                     Vec4::new(0.2, 0.4, 0.7, 1.0),
                 ],
+                // Off by default; `update_skybox` enables it for Enhanced.
+                cloud_params: Vec4::new(0.5, 0.0, 0.0, 0.0),
             },
         }
     }
@@ -150,6 +158,8 @@ fn update_skybox(
     mut mats: ResMut<Assets<SkyboxGradientMaterial>>,
     mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     vana_clock: Res<crate::vana_time::VanaClock>,
+    settings: Res<crate::graphics_settings::GraphicsSettings>,
+    time: Res<Time>,
     mut prev_keyframe_time: Local<Option<u32>>,
 ) {
     let cam_pos = cam_q.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
@@ -256,6 +266,20 @@ fn update_skybox(
             lerp(a0[7], a1[7]),
         ),
     ];
+
+    // Procedural cloud layer — Enhanced style only. Retail disables it
+    // (opacity 0) so the faithful textured MMB clouds can own the sky
+    // once that DAT-driven path lands. Scroll drifts the cloud UVs with
+    // real elapsed time for slow, continuous motion; the shader tints
+    // the clouds by the sky gradient so they redden at dusk.
+    let enhanced = settings.sky_style == crate::graphics_settings::SkyStyle::Enhanced;
+    let t = time.elapsed_secs();
+    mat.data.cloud_params = if enhanced {
+        // Slow drift: ~0.004 uv/sec along a slightly diagonal heading.
+        Vec4::new(0.55, 0.85, t * 0.004, t * 0.0016)
+    } else {
+        Vec4::new(0.55, 0.0, 0.0, 0.0)
+    };
 }
 
 pub struct SkyboxPlugin;
