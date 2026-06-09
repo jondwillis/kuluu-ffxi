@@ -1074,6 +1074,7 @@ fn decide_initial_screen(
     err: Res<LoginErrorMsg>,
     mut form: ResMut<LoginForm>,
     mut server_form: ResMut<ServerSelectForm>,
+    mut server_info: ResMut<ServerInfo>,
     mut next: ResMut<NextState<LauncherState>>,
 ) {
     // Don't preempt an in-flight error screen — that path goes
@@ -1094,42 +1095,46 @@ fn decide_initial_screen(
     if server_form.selected.is_some() {
         return;
     }
-    let store = ffxi_client::launcher_store::load();
     if overrides.is_some() {
         return;
     }
-    if let Some((server, user)) = store.last_used.clone() {
+    let store = ffxi_client::launcher_store::load();
+    if let Some(prefill) = store.login_prefill() {
         // Prefill from the most-recent login. Password comes from the
         // keyring iff the matching SavedAccount has `remember_password`.
-        let acct = store
-            .accounts
-            .iter()
-            .find(|a| a.server_name == server && a.username == user);
-        if let Some(a) = acct {
-            form.user = user.clone();
-            form.remember_password = a.remember_password;
-            if a.remember_password {
-                if let Some(pw) = ffxi_client::secret_store::SecretStore::get(
-                    ffxi_client::launcher_store::KEYRING_SERVICE,
-                    &ffxi_client::launcher_store::keyring_account_key(&server, &user),
-                ) {
-                    form.pass = pw;
-                }
+        form.user = prefill.account.username.clone();
+        form.remember_password = prefill.account.remember_password;
+        if prefill.account.remember_password {
+            if let Some(pw) = ffxi_client::secret_store::SecretStore::get(
+                ffxi_client::launcher_store::KEYRING_SERVICE,
+                &ffxi_client::launcher_store::keyring_account_key(
+                    &prefill.account.server_name,
+                    &prefill.account.username,
+                ),
+            ) {
+                form.pass = pw;
             }
-            // Fully restore the last-used server, not just its name: apply
-            // the matching profile so the network endpoint, the "Server:"
-            // chip, and the window title all point at it. `main.rs` seeds
-            // the launcher from CLI defaults (127.0.0.1) and never reads
-            // the store, so without this the prefilled username would
-            // authenticate against the wrong host. No-op when last_used
-            // was a raw-host CLI login with no matching saved profile —
-            // the CLI default endpoint already matches in that case.
-            if let Some(profile) = store.servers.iter().find(|p| p.name == server) {
-                apply_server_profile(&mut commands, profile);
-            }
-            server_form.selected = Some(server);
-            return;
         }
+        // Fully restore the last-used server, not just its name: apply the
+        // matching profile so the network endpoint, the "Server:" chip,
+        // and the window title all point at it. `main.rs` seeds the
+        // launcher from CLI defaults (127.0.0.1) and never reads the store,
+        // so without this the prefilled username would authenticate against
+        // the wrong host.
+        if let Some(profile) = prefill.profile {
+            apply_server_profile(&mut commands, profile);
+            // `apply_server_profile` swaps `ServerInfo` via a *command*,
+            // which doesn't flush until after this OnEnter schedule — but
+            // `login::spawn_login_ui` runs later in this *same* schedule
+            // (it's `.before`-ordered after us) and reads `ServerInfo` to
+            // build the "Sign in to X" title. Write the resource directly
+            // too so that first paint shows the real server, not the stale
+            // CLI default. The deferred insert lands the identical value.
+            server_info.server = profile.host.clone();
+            server_info.profile_name = Some(profile.name.clone());
+        }
+        server_form.selected = Some(prefill.account.server_name.clone());
+        return;
     }
     // No CLI overrides + no matching last_used → always go through
     // ServerSelect. An empty server list is fine: ServerSelect's

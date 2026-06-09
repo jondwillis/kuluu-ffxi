@@ -142,6 +142,51 @@ pub struct LauncherStore {
     pub settings: Settings,
 }
 
+impl LauncherStore {
+    /// The account to pre-select when `server_name` becomes the active
+    /// server (e.g. the user picks it in ServerSelect). Returns the only
+    /// saved account when a server has exactly one, otherwise the
+    /// most-recently-used one. `None` means the server has no saved
+    /// accounts and the user must type fresh credentials.
+    ///
+    /// Recency is encoded by list position: [`crate::view_native`]'s
+    /// post-login `save_on_success` moves the just-used account to the
+    /// front of `accounts`, so the first row matching `server_name` is
+    /// both "the only one" (single-account case) and "the last one used"
+    /// (multi-account case) — one rule covers both.
+    pub fn preselect_account_for(&self, server_name: &str) -> Option<&SavedAccount> {
+        self.accounts.iter().find(|a| a.server_name == server_name)
+    }
+
+    /// What the launcher should pre-fill on the first `OnEnter(Login)`:
+    /// the [`SavedAccount`] named by `last_used` plus the matching
+    /// [`ServerProfile`] (so the caller can restore the network endpoint,
+    /// the window title, and the "Server:" chip — not just the username).
+    ///
+    /// `None` means "fall through to ServerSelect": either there's no
+    /// `last_used` yet, or it names an account that's since been forgotten.
+    /// `profile` can be `None` even when the account matches — that's the
+    /// legacy raw-host CLI login whose `server_name` was the bare host with
+    /// no saved profile; the caller keeps the CLI-default endpoint then.
+    pub fn login_prefill(&self) -> Option<LoginPrefill<'_>> {
+        let (server, user) = self.last_used.as_ref()?;
+        let account = self
+            .accounts
+            .iter()
+            .find(|a| &a.server_name == server && &a.username == user)?;
+        let profile = self.servers.iter().find(|p| &p.name == server);
+        Some(LoginPrefill { account, profile })
+    }
+}
+
+/// Result of [`LauncherStore::login_prefill`] — the account to restore and
+/// (when one exists) the server profile it was last used against. Borrows
+/// the store so no cloning happens in the decision itself.
+pub struct LoginPrefill<'a> {
+    pub account: &'a SavedAccount,
+    pub profile: Option<&'a ServerProfile>,
+}
+
 /// Canonical keyring account key for `(server, user)`. Centralized so
 /// the save path and the auto-fill path can never disagree on the
 /// lookup string.
@@ -238,6 +283,113 @@ mod tests {
         assert!(back.accounts.is_empty());
         assert!(back.last_used.is_none());
         assert_eq!(back.settings, Settings::default());
+    }
+
+    fn acct(server: &str, user: &str) -> SavedAccount {
+        SavedAccount {
+            server_name: server.into(),
+            username: user.into(),
+            remember_password: false,
+        }
+    }
+
+    #[test]
+    fn preselect_single_account_regardless_of_order() {
+        let mut store = LauncherStore::default();
+        store.accounts = vec![acct("other", "x"), acct("local", "solo")];
+        assert_eq!(
+            store
+                .preselect_account_for("local")
+                .map(|a| a.username.as_str()),
+            Some("solo"),
+            "the sole account on a server is always pre-selected",
+        );
+    }
+
+    #[test]
+    fn preselect_multi_account_takes_most_recent_front() {
+        let mut store = LauncherStore::default();
+        // save_on_success inserts most-recent at the front, so `b` here
+        // stands in for "logged in more recently than a".
+        store.accounts = vec![acct("local", "b"), acct("local", "a")];
+        assert_eq!(
+            store
+                .preselect_account_for("local")
+                .map(|a| a.username.as_str()),
+            Some("b"),
+            "with several accounts the front (most-recent) one wins",
+        );
+    }
+
+    #[test]
+    fn preselect_none_when_server_has_no_accounts() {
+        let store = LauncherStore::default();
+        assert!(store.preselect_account_for("local").is_none());
+    }
+
+    fn profile(name: &str, host: &str) -> ServerProfile {
+        ServerProfile {
+            name: name.into(),
+            host: host.into(),
+            auth_port: 54231,
+            data_port: 54230,
+            view_port: 54001,
+            flavor: AuthFlavorKind::Json,
+            xiloader_version: None,
+        }
+    }
+
+    #[test]
+    fn login_prefill_restores_account_and_profile() {
+        let mut store = LauncherStore::default();
+        store.servers = vec![
+            profile("HXI", "play.horizonxi.com"),
+            profile("local", "127.0.0.1"),
+        ];
+        store.accounts = vec![acct("HXI", "batti"), acct("local", "claude")];
+        store.last_used = Some(("HXI".into(), "batti".into()));
+
+        let p = store
+            .login_prefill()
+            .expect("last_used account is restorable");
+        assert_eq!(p.account.username, "batti");
+        assert_eq!(p.account.server_name, "HXI");
+        // The matched profile carries the host the launcher must point the
+        // title / network endpoint at — not the CLI default.
+        assert_eq!(
+            p.profile.map(|p| p.host.as_str()),
+            Some("play.horizonxi.com")
+        );
+    }
+
+    #[test]
+    fn login_prefill_none_when_last_used_account_was_forgotten() {
+        let mut store = LauncherStore::default();
+        store.servers = vec![profile("HXI", "play.horizonxi.com")];
+        // last_used points at an account no longer in `accounts` (forgotten).
+        store.accounts = vec![acct("HXI", "someone_else")];
+        store.last_used = Some(("HXI".into(), "batti".into()));
+        assert!(store.login_prefill().is_none());
+    }
+
+    #[test]
+    fn login_prefill_none_without_last_used() {
+        let mut store = LauncherStore::default();
+        store.accounts = vec![acct("HXI", "batti")];
+        assert!(store.login_prefill().is_none());
+    }
+
+    #[test]
+    fn login_prefill_matches_account_without_a_saved_profile() {
+        // Legacy raw-host login: account exists, but no ServerProfile is
+        // named for it. We still restore the account; profile is None so
+        // the caller keeps the CLI-default endpoint.
+        let mut store = LauncherStore::default();
+        store.accounts = vec![acct("127.0.0.1", "batti")];
+        store.last_used = Some(("127.0.0.1".into(), "batti".into()));
+        let p = store.login_prefill().expect("account still restorable");
+        assert_eq!(p.account.username, "batti");
+        assert!(p.profile.is_none());
     }
 
     #[test]
