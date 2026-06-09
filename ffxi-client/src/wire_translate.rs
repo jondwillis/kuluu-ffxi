@@ -94,6 +94,14 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         // Empty when the inventory mirror hasn't been initialised
         // yet (zone-in flood hasn't started).
         inventory_main: project_inventory_main(s),
+        // Stage 3 menu suite: char stats / bazaar / play-time are not
+        // yet folded out of SessionState, so emit the additive defaults.
+        // The producer-side fold lands these once the corresponding
+        // server packets (0x061 CHAR_STATS, bazaar, play-time) are
+        // mirrored; the wire schema is ready for them now.
+        stats: None,
+        bazaar: Vec::new(),
+        play_time_s: 0,
     }
 }
 

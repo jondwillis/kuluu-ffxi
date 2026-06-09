@@ -22,6 +22,7 @@ pub mod cib;
 pub mod d3m;
 pub mod ftable;
 pub mod generator;
+pub mod item_dat;
 pub mod kind;
 pub mod map_image;
 pub mod mmb;
@@ -37,6 +38,7 @@ pub mod zone_dat;
 
 pub use archive::{DatLocation, DatRoot};
 pub use chunk::{walk, walk_tree, Chunk, ChunkNode, ChunkWalker};
+pub use item_dat::ItemStatic;
 pub use kind::ChunkKind;
 pub use npc_names::{split_id, NpcNameTable, NPC_LIST_FILE_ID_BASE};
 

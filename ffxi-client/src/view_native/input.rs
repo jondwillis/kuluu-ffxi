@@ -557,6 +557,7 @@ pub fn dispatch_target_change_system(
         InputMode::World
             | InputMode::Menu(_)
             | InputMode::QuickAction(_)
+            | InputMode::TargetAction(_)
             | InputMode::PassiveCursor(_)
     ) {
         // Chat-mode target changes don't happen (the input router blocks
@@ -620,7 +621,10 @@ pub fn dispatch_movement_system(
     // for the camera.
     let in_picker = matches!(
         *mode,
-        InputMode::Menu(_) | InputMode::QuickAction(_) | InputMode::PassiveCursor(_)
+        InputMode::Menu(_)
+            | InputMode::QuickAction(_)
+            | InputMode::TargetAction(_)
+            | InputMode::PassiveCursor(_)
     );
 
     // --- camera pitch: ↑ raises camera (more overhead), ↓ lowers it. ---

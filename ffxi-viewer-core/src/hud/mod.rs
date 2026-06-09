@@ -19,11 +19,14 @@ pub mod action_model;
 pub mod agent_hud;
 pub mod chat_input;
 pub mod chat_panel;
+pub mod check_view;
 pub mod compass;
 pub mod death_prompt;
 pub mod diagnostics;
 pub mod dialog;
 pub mod entity_hover_card;
+pub mod item_dat_root;
+pub mod item_detail;
 pub mod item_meta;
 pub mod llm_badge;
 pub mod logout_countdown;
@@ -35,8 +38,11 @@ pub mod roster;
 pub mod self_hud;
 pub mod shop;
 pub mod stage_bar;
+pub mod status_panel;
 pub mod status_ribbon;
+pub mod target_action_menu;
 pub mod target_panel;
+pub mod trade;
 pub mod vana_clock;
 pub mod weather_icon;
 pub mod zone_flash;
@@ -224,6 +230,25 @@ impl Plugin for HudPlugin {
         // degrades to numeric chips when no install is reachable.
         app.init_resource::<status_ribbon::StatusIconCache>();
         app.init_resource::<status_ribbon::StatusIconDatRoot>();
+        // Stage-3 menu suite. Item-DAT root + icon cache mirror the
+        // status-icon pair: the front-end overwrites `.0` with the live
+        // DatRoot Arc; both caches are session-invariant (asset/static
+        // decode) so they are NOT drained on logout. `SortOptions` is a
+        // UI preference, also not session-scoped.
+        app.init_resource::<item_dat_root::ItemDatRoot>();
+        app.init_resource::<item_dat_root::ItemIconCache>();
+        app.init_resource::<item_detail::SortOptions>();
+        // Visibility signals driven by the wiring/input transitions
+        // (text_input.rs flips them on Check / Status > Profile select).
+        app.init_resource::<check_view::CheckTarget>();
+        app.init_resource::<status_panel::StatusProfileOpen>();
+        // Trade window state — single visibility switch (`TradeState::open`).
+        // Cleared on TradeIntent::Cancel/completion for lifecycle symmetry.
+        app.init_resource::<trade::TradeState>();
+        // Stage-3 menu-suite messages: target contextual-menu activation
+        // and the trade intent stream (wiring maps TradeIntent → 0x036).
+        app.add_message::<target_action_menu::TargetActionActivated>();
+        app.add_message::<trade::TradeIntent>();
         app.init_resource::<target_panel::SwingPulse>();
         app.init_resource::<logout_countdown::LogoutCountdownAnchor>();
         app.init_resource::<logout_countdown::OptimisticLogoutCountdown>();
@@ -291,6 +316,22 @@ impl Plugin for HudPlugin {
         // impls cap out at 20 entries, and the block above hit that
         // ceiling — adding a 21st entry trips the trait-bound error.
         app.add_systems(Update, logout_countdown::update_logout_countdown);
+        // Stage-3 menu-suite Update systems. Grouped in their own
+        // add_systems calls to stay clear of the 20-tuple ceiling the
+        // primary Update block already sits at.
+        app.add_systems(
+            Update,
+            (
+                target_action_menu::update_target_action_menu,
+                target_action_menu::target_action_mouse_hover_system,
+                target_action_menu::target_action_mouse_click_system,
+                item_detail::update_item_detail,
+                item_detail::update_sort_options,
+                trade::update_trade_window,
+                check_view::update_check_view,
+                status_panel::update_status_panel,
+            ),
+        );
         app.add_systems(Update, apply_dev_hud_visibility);
         app.add_systems(Update, chat_panel::chat_tab_click_system);
         app.add_systems(Update, chat_panel::chat_auto_switch_click_system);
@@ -394,6 +435,20 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             logout_countdown::spawn_logout_countdown,
             mesh_debug::spawn_mesh_debug_hud,
             entity_hover_card::spawn_entity_hover_card,
+        ),
+    );
+    // Stage-3 menu-suite spawners in a second call: the tuple above is
+    // near the 20-entry IntoScheduleConfigs ceiling, so the new panels
+    // get their own grouped registration. All spawn `InGameEntity`-
+    // tagged roots (verified in each module).
+    app.add_systems(
+        schedule,
+        (
+            target_action_menu::spawn_target_action_menu,
+            item_detail::spawn_item_detail,
+            trade::spawn_trade_window,
+            check_view::spawn_check_view,
+            status_panel::spawn_status_panel,
         ),
     );
     // Minimap, Vana clock, and weather icon all spawn as children of
