@@ -34,7 +34,14 @@ run_clippy() {
 run_test() {
   # Integration tests that need a live LSB server self-skip when unreachable,
   # so this is safe on a network-isolated runner.
-  cargo test --workspace --locked
+  #
+  # Uses the same --features as clippy/build deliberately: cargo compiles the
+  # dependency graph once per feature-set, so matching them lets test reuse the
+  # dep artifacts clippy/build already produced instead of recompiling the whole
+  # tree under a different feature unification. (No #[test] opens a window — the
+  # winit/DefaultPlugins code is confined to examples — so native-window is safe
+  # to compile headlessly here.)
+  cargo test --workspace --locked "${FEATURES[@]}"
 }
 
 run_build() {
