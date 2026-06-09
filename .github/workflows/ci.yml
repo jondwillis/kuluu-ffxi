@@ -17,6 +17,12 @@ jobs:
   checks:
     name: fmt · clippy · test · build
     runs-on: ubuntu-latest
+    # Neutralise the macOS -isysroot CXXFLAGS in the committed .cargo/config.toml
+    # (it is a dev-machine workaround); on Linux it points the C++ Recast bridge
+    # at a non-existent macOS SDK. Cargo's non-forced [env] won't override a var
+    # already present in the environment, so setting it here wins.
+    env:
+      CXXFLAGS: ""
     steps:
       - uses: actions/checkout@v4
 

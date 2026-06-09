@@ -44,6 +44,10 @@ jobs:
     name: Build (x86_64 Linux)
     needs: setup
     runs-on: ubuntu-latest
+    # Neutralise the macOS -isysroot CXXFLAGS from .cargo/config.toml on Linux
+    # (see ci.yml) so the C++ Recast bridge builds.
+    env:
+      CXXFLAGS: ""
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-build
@@ -116,6 +120,8 @@ jobs:
     name: Build (browser WASM)
     needs: setup
     runs-on: ubuntu-latest
+    env:
+      CXXFLAGS: ""
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-build
