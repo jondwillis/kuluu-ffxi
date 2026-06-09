@@ -1,0 +1,14 @@
+# Pinned nightly so the dev profile can use the Cranelift codegen backend
+# (`[profile.dev] codegen-backend = "cranelift"` in Cargo.toml, gated by
+# `[unstable] codegen-backend = true` in .cargo/config.toml).
+#
+# A *dated* nightly is pinned rather than bare `nightly` so a bad nightly
+# can't silently break the build; bump this deliberately.
+#
+# Cranelift is dev-only — `cargo build --release` (and the Steam Deck
+# cross-build, which is --release) still uses the LLVM backend, so this
+# does not affect shipped/optimized binaries.
+[toolchain]
+channel = "nightly-2026-06-01"
+components = ["rustc-codegen-cranelift-preview", "clippy", "rustfmt"]
+targets = ["aarch64-apple-darwin", "wasm32-unknown-unknown"]

@@ -24,3 +24,31 @@
 # against. 14.0 is a safe modern floor.
 [env]
 CXXFLAGS = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1"
+
+# ## Build-speed tuning
+#
+# Enables the per-profile `codegen-backend` key used by [profile.dev] in the
+# workspace Cargo.toml. Requires a nightly cargo (see rust-toolchain.toml).
+# NOTE: this block makes a *stable* cargo error out, so every consumer of this
+# repo must be on nightly — including the Steam Deck cross-build container
+# (docker/Dockerfile.linux-build), which auto-switches to nightly because it
+# bind-mounts this repo and reads rust-toolchain.toml. That build is --release,
+# so Cranelift (dev-only) never runs there; it just uses LLVM.
+[unstable]
+codegen-backend = true
+
+# sccache caches compiled rlibs keyed by inputs. Cargo only marks *workspace*
+# crates as incremental, so sccache transparently caches the heavy registry
+# deps (bevy / wgpu / naga) and reuses them across the .claude/worktrees/*
+# trees and clean rebuilds, while the interactive edit loop keeps incremental
+# + Cranelift on workspace crates. Install with `brew install sccache`.
+[build]
+rustc-wrapper = "sccache"
+
+# Link the large client binary with LLVM lld instead of Apple ld. Modest here
+# (Apple ld-1267 is already the fast "ld-prime") but still typically quicker on
+# a binary this size. macOS-target-scoped, so the Linux/Deck cross-build is
+# untouched. Install with `brew install lld` (the `ld64.lld` Mach-O driver
+# lives in the standalone `lld` formula, not `llvm`).
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=--ld-path=/opt/homebrew/opt/lld/bin/ld64.lld"]
