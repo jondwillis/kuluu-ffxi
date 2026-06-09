@@ -223,8 +223,8 @@ pub struct LoadMzbInFlight {
 /// Selbina ↔ Mhaura, plus three character-house zones), so a 4-entry
 /// cache covers the common pattern of "user re-enters the previous
 /// zone". A cache hit skips file I/O + XOR decrypt + parse + bake
-/// entirely; the spawn step still runs (it owns the GPU asset upload
-/// + ECS spawns, which can't be cached because handles are scoped to
+/// entirely; the spawn step still runs (it owns the GPU asset upload +
+/// ECS spawns, which can't be cached because handles are scoped to
 /// the current session's `Assets<...>` storage).
 ///
 /// `Arc<...>` lets the cache and the spawn step share the inner Vecs
@@ -957,7 +957,7 @@ pub fn build_zone_mmb_spawns(
             .filter(|(_, &c)| c > 1)
             .map(|(&n, &c)| (n, c))
             .collect();
-        dup_names.sort_by(|a, b| b.1.cmp(&a.1));
+        dup_names.sort_by_key(|x| std::cmp::Reverse(x.1));
 
         // Per-placement match-count buckets.
         let mut placement_id_counts: HashMap<String, u32> = HashMap::new();
@@ -988,7 +988,7 @@ pub fn build_zone_mmb_spawns(
                 roundrobin_smoke.push((id.clone(), *count, m));
             }
         }
-        roundrobin_smoke.sort_by(|a, b| b.1.cmp(&a.1));
+        roundrobin_smoke.sort_by_key(|x| std::cmp::Reverse(x.1));
 
         // Compact unmatched / ambiguous lists (dedup by id).
         let mut unmatched_unique: HashMap<String, u32> = HashMap::new();
@@ -996,7 +996,7 @@ pub fn build_zone_mmb_spawns(
             *unmatched_unique.entry(id.clone()).or_insert(0) += 1;
         }
         let mut um_list: Vec<(String, u32)> = unmatched_unique.into_iter().collect();
-        um_list.sort_by(|a, b| b.1.cmp(&a.1));
+        um_list.sort_by_key(|x| std::cmp::Reverse(x.1));
 
         info!(
             target: "ffxi_viewer_core::dat_mzb::diag",
@@ -1766,6 +1766,8 @@ pub fn auto_load_zone_geometry_system(
     mut commands: Commands,
     mut load_tx: MessageWriter<LoadMzbRequest>,
     auto_q: Query<Entity, With<AutoMzbOverlay>>,
+    mut mzb_in_flight: ResMut<LoadMzbInFlight>,
+    mut mmb_queue: ResMut<crate::dat_mmb::MmbLoadQueue>,
 ) {
     let current = scene_state.snapshot.zone_id;
     if current == last.zone_id {
@@ -1775,8 +1777,37 @@ pub fn auto_load_zone_geometry_system(
     // don't end up firing a new one (covers the Some(A) → None
     // "logout / charselect" case).
     for e in auto_q.iter() {
-        commands.entity(e).despawn();
+        // `get_entity` guard: a session-scoped drain may have already
+        // queued a despawn of this overlay earlier in the frame, so the
+        // query can hand us an entity that's gone by flush time. Skip
+        // quietly rather than double-despawn (which the command error
+        // handler logs as a WARN).
+        if let Ok(mut ec) = commands.get_entity(e) {
+            ec.despawn();
+        }
     }
+    // Cancel the *previous* zone's in-flight loads so its geometry can't
+    // bleed into the new zone. Despawning the already-spawned overlays
+    // above isn't enough on its own: the MZB parse runs on a background
+    // task and the per-placement MMB spawns drain over many frames
+    // (frame-budgeted), so without this a fast cursor hover (zone A
+    // loading → hover B) would keep spawning A's buildings/textures into
+    // B's now-presented scene. This runs *before* `kick_load_mzb_tasks`
+    // in the chain, so it only ever clears the old zone — the new zone's
+    // task/requests are produced downstream this same frame.
+    //
+    // `tasks.clear()` drops the stale MZB parse (re-parsed on re-entry;
+    // a prior completed visit still lives in `ZoneGeomCache`). The queue
+    // `retain` drops only *zone-placement* MMB spawns
+    // (`entity_id.is_none() && world_transform.is_some()`) — entity-look
+    // model loads (NPC/PC/pet appearances) share the same queue and must
+    // survive a zone change.
+    if !mzb_in_flight.tasks.is_empty() {
+        mzb_in_flight.tasks.clear();
+    }
+    mmb_queue
+        .pending
+        .retain(|r| !(r.entity_id.is_none() && r.world_transform.is_some()));
     last.zone_id = current;
     let Some(zone_id) = current else { return };
 

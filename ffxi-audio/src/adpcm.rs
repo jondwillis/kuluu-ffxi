@@ -101,10 +101,10 @@ pub fn decode_channel_major_then_interleave(data: &[u8], h: &AudioHeader) -> Res
 
     for block_i in 0..blocks {
         let block_base = block_i * block_bytes_total;
-        for ch in 0..channels {
+        for (ch, chan) in per_channel.iter_mut().enumerate() {
             let off = block_base + ch * block_bytes_per_channel;
             let slice = &data[off..off + block_bytes_per_channel];
-            decode_block_into(slice, block_size, &mut states[ch], &mut per_channel[ch])?;
+            decode_block_into(slice, block_size, &mut states[ch], chan)?;
         }
     }
 
@@ -113,11 +113,8 @@ pub fn decode_channel_major_then_interleave(data: &[u8], h: &AudioHeader) -> Res
     // — accept the shorter common length.
     let frames = per_channel.iter().map(|v| v.len()).min().unwrap_or(0);
     let mut out = Vec::with_capacity(frames * channels);
-    for i in 0..frames {
-        for ch in 0..channels {
-            out.push(per_channel[ch][i]);
-        }
-    }
+    // Frame-interleave: emit frame i of every channel before advancing.
+    out.extend((0..frames).flat_map(|i| per_channel.iter().map(move |c| c[i])));
     Ok(out)
 }
 
@@ -146,19 +143,16 @@ pub fn decode_interleaved(data: &[u8], h: &AudioHeader) -> Result<Vec<f32>> {
         let mut scratch: Vec<Vec<f32>> = (0..channels)
             .map(|_| Vec::with_capacity(frames_per_block))
             .collect();
-        for ch in 0..channels {
+        for (ch, scratch_chan) in scratch.iter_mut().enumerate() {
             let off = block_base + ch * block_bytes_per_channel;
             let slice = &data[off..off + block_bytes_per_channel];
             tmp.clear();
             decode_block_into(slice, block_size, &mut states[ch], &mut tmp)?;
-            scratch[ch].extend_from_slice(&tmp);
+            scratch_chan.extend_from_slice(&tmp);
         }
         let frames = scratch.iter().map(|v| v.len()).min().unwrap_or(0);
-        for i in 0..frames {
-            for ch in 0..channels {
-                out.push(scratch[ch][i]);
-            }
-        }
+        // Frame-interleave: emit frame i of every channel before advancing.
+        out.extend((0..frames).flat_map(|i| scratch.iter().map(move |c| c[i])));
     }
     Ok(out)
 }

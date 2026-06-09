@@ -8,6 +8,8 @@
 //! the HTML shell.
 
 #![forbid(unsafe_code)]
+// See ffxi-viewer-core: Bevy ECS dictates system signatures (insurmountable).
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 mod source;
 

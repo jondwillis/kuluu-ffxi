@@ -109,7 +109,7 @@ impl Skeleton {
     /// (they hold the GeneratorPoint table and other sections we
     /// don't model).
     pub fn parse(body: &[u8]) -> Result<Self> {
-        let header = BoneHeader::parse(body).ok_or_else(|| crate::DatError::TruncatedChunk {
+        let header = BoneHeader::parse(body).ok_or(crate::DatError::TruncatedChunk {
             offset: 0,
             needed: 4,
             available: body.len(),
@@ -224,10 +224,10 @@ pub struct BoneLocal {
 /// local space) before the rotation/translation lift.
 fn mat4_from_quat_trans_scale(q: [f32; 4], t: [f32; 3], s: [f32; 3]) -> [[f32; 4]; 4] {
     let mut m = mat4_from_quat_trans(q, t);
-    for r in 0..3 {
-        m[r][0] *= s[0];
-        m[r][1] *= s[1];
-        m[r][2] *= s[2];
+    for row in m.iter_mut().take(3) {
+        row[0] *= s[0];
+        row[1] *= s[1];
+        row[2] *= s[2];
     }
     m
 }

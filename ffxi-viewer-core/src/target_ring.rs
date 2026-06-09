@@ -1,80 +1,122 @@
-//! Flat ground ring drawn under the currently-targeted entity.
+//! Selected-target visual cues drawn with [`Gizmos`] (no mesh-asset
+//! bookkeeping; everything here is re-emitted every frame).
 //!
-//! The kind/target material swap in `scene::sync_entities_system` already
-//! highlights the targeted body, but in busy scenes the colour change is
-//! easy to miss. A bright yellow ring on the ground gives the operator a
-//! cheap, unmistakable visual cue.
+//! Two cues live in this module:
 //!
-//! Implementation: re-emitted every frame via [`Gizmos`] (no mesh-asset
-//! bookkeeping). Placed slightly above `y=0` so it sits *on* the ground
-//! plane spawned by `scene::setup_world`. Skips entirely when no target
-//! is set.
+//! 1. **Target arrow** — a downward-pointing, camera-facing triangle that
+//!    floats just above the selected entity's nameplate, bobbing gently.
+//!    This replaces the old flat ground *ring*: classic FFXI marks the
+//!    current target with a cursor arrow above the head, not a circle on
+//!    the floor. Neutral white normally, red while the player is
+//!    auto-attacking that exact target (see [`target_ring_color`]).
+//! 2. **Engaged ring** — a red ring under the *player's own* feet while in
+//!    combat. Unrelated to selection; kept as a separate "I am swinging"
+//!    cue so it can coexist with the target arrow.
+//!
+//! The selected model itself is no longer recolored — `scene` leaves it at
+//! its normal claim/kind material and a one-shot white strobe
+//! (`target_strobe`) fires on selection. The arrow is the persistent cue.
 
 use std::f32::consts::PI;
 
 use bevy::prelude::*;
 
+use crate::camera::{nameplate_anchor_y, OperatorCamera};
 use crate::components::WorldEntity;
-use crate::scene::Target;
+use crate::scene::{BakedActor, Target};
 use crate::snapshot::SceneState;
 
-/// Bevy world units. Tuned so the ring reads clearly around the default
-/// PC capsule footprint without overlapping neighbours in tight clusters.
-const RING_RADIUS: f32 = 1.5;
+/// Neutral near-white so the cursor reads as a plain "this is selected"
+/// pointer rather than a colored attention flag — the classic client's
+/// target arrow is a soft white, not a saturated hue.
+const ARROW_COLOR: Color = Color::srgb(0.90, 0.90, 0.92);
 
-/// Lift above the entity's ground level to avoid z-fighting with
-/// the navmesh / floor. Applied to the per-entity foot position, not
-/// to a hardcoded y=0 — entities now sit at navmesh-height (variable)
-/// rather than on a flat plane.
-const RING_Y_LIFT: f32 = 0.05;
+/// Red arrow while auto-attacking this exact target. Distinct from the
+/// neutral selection color so "selected" vs "fighting" stay legible.
+const ARROW_ENGAGED_COLOR: Color = Color::srgb(1.00, 0.18, 0.22);
 
-/// Bright yellow matching `EntityMaterials::target` so the ring colour
-/// reads as "the same kind of attention" as the body emissive.
-const RING_COLOR: Color = Color::srgb(1.0, 0.95, 0.20);
+/// Arrow footprint in yalms. Width = the span of the wide (top) edge;
+/// height = apex-to-edge. Kept compact so it reads as a small cursor
+/// sitting on the nameplate, not a banner over the model.
+const ARROW_WIDTH: f32 = 0.55;
+const ARROW_HEIGHT: f32 = 0.42;
+
+/// Lift of the arrow's *tip* above the nameplate anchor (crown + the
+/// nameplate's small crown offset). The nameplate quad is centered at
+/// the anchor and reaches up ~0.35 yalms; placing the tip just above
+/// that keeps the arrow hugging the label without overlapping the text.
+const ARROW_TIP_ABOVE_ANCHOR: f32 = 0.30;
+
+/// Gentle vertical bob so the arrow reads as a live cursor rather than a
+/// decal. Amplitude in yalms, angular frequency in rad/s (~0.5 Hz).
+const ARROW_BOB_AMPLITUDE: f32 = 0.08;
+const ARROW_BOB_FREQUENCY: f32 = 3.0;
+
+/// Number of horizontal scanlines used to fake a *filled* triangle out
+/// of line gizmos. 6 reads as solid at the arrow's on-screen size while
+/// staying cheap (≈9 line segments total per frame for the one arrow).
+const ARROW_FILL_SCANLINES: u32 = 6;
 
 /// Red ring around the player when engaged (self has a non-zero
-/// `bt_target_id`). Distinct from the target ring's yellow so both can
-/// be visible simultaneously: yellow under whoever the operator is
-/// looking at, red under the operator's own feet while in combat.
+/// `bt_target_id`). Distinct from the arrow's yellow so both can be
+/// visible simultaneously: yellow arrow over whoever the operator is
+/// looking at, red ring under the operator's own feet while in combat.
 const ENGAGED_RING_COLOR: Color = Color::srgb(1.00, 0.18, 0.22);
 
-/// Slightly larger than the target ring so the two are visually
-/// distinct when the operator targets themselves.
+/// Lift above the entity's ground level to avoid z-fighting with the
+/// navmesh / floor. Applied to the per-entity foot position.
+const RING_Y_LIFT: f32 = 0.05;
+
 const ENGAGED_RING_RADIUS: f32 = 1.7;
 
-/// Pure decision: which color should the target ring be?
+/// Pure decision: which color should the target arrow be?
 ///
-/// Yellow on a non-combat selection, red when the player is currently
+/// Neutral white on a non-combat selection, red when the player is currently
 /// auto-attacking this exact target (`self.bt_target_id == target_id`,
-/// the same wire signal `target_panel` uses for the engagement
-/// badge). Lifting this into a pure function keeps the visual policy
-/// testable without needing a Bevy world.
+/// the same wire signal `target_panel` uses for the engagement badge).
+/// Lifting this into a pure function keeps the visual policy testable
+/// without needing a Bevy world.
 pub fn target_ring_color(engaged_on_target: bool) -> Color {
     if engaged_on_target {
-        ENGAGED_RING_COLOR
+        ARROW_ENGAGED_COLOR
     } else {
-        RING_COLOR
+        ARROW_COLOR
     }
 }
 
-/// Draw a flat ring at the targeted entity's xz, every frame. Red when
-/// engaged on this target, yellow otherwise (see [`target_ring_color`]).
+/// Pure helper: vertical bob offset (yalms) for the arrow at time `t`.
+/// Factored out so the bob curve is unit-testable and so the drawing
+/// code reads as "apex + bob".
+pub fn arrow_bob_offset(seconds: f32) -> f32 {
+    (seconds * ARROW_BOB_FREQUENCY).sin() * ARROW_BOB_AMPLITUDE
+}
+
+/// Draw the camera-facing target arrow above the selected entity, every
+/// frame. Red when engaged on this target, yellow otherwise (see
+/// [`target_ring_color`]).
 ///
-/// Runs in `Update` after `sync_entities_system` so the `Target` resource
-/// and any newly-spawned `WorldEntity` transforms have been reconciled.
-pub fn draw_target_ring_system(
+/// Runs in `Update` after `sync_entities_system` (so `Target` and the
+/// `WorldEntity` transforms are reconciled) and after the camera systems
+/// (so the billboard orientation uses the settled camera pose).
+pub fn draw_target_arrow_system(
     target: Res<Target>,
     state: Res<SceneState>,
-    world_q: Query<(&Transform, &WorldEntity)>,
+    time: Res<Time>,
+    cam_q: Query<&Transform, With<OperatorCamera>>,
+    world_q: Query<(&Transform, &WorldEntity, Option<&BakedActor>)>,
     mut gizmos: Gizmos,
 ) {
     let Some(target_id) = target.id else {
         return;
     };
+    let Ok(cam_t) = cam_q.single() else {
+        return;
+    };
+    let cam_pos = cam_t.translation;
 
-    // Server-authoritative engagement check: self's `bt_target_id` is
-    // the server's notion of "what am I swinging at." Falls back to
-    // `false` when self isn't in the snapshot yet (early post-zone-in).
+    // Server-authoritative engagement check: self's `bt_target_id` is the
+    // server's notion of "what am I swinging at." Falls back to `false`
+    // when self isn't in the snapshot yet (early post-zone-in).
     let engaged_on_target = state
         .snapshot
         .self_char_id
@@ -83,22 +125,53 @@ pub fn draw_target_ring_system(
         .unwrap_or(false);
     let color = target_ring_color(engaged_on_target);
 
-    for (t, w) in &world_q {
-        if w.id == target_id {
-            // After the feet-at-origin refactor `transform.y` *is* the
-            // entity's ground level. Just lift the ring a hairline to
-            // avoid z-fight with the floor.
-            let ground_y = t.translation.y + RING_Y_LIFT;
-            let pos = Vec3::new(t.translation.x, ground_y, t.translation.z);
-            // Default circle is in the xy plane; rotate -90° around X so it
-            // lies flat on xz.
-            gizmos.circle(
-                Isometry3d::new(pos, Quat::from_rotation_x(-PI / 2.0)),
-                RING_RADIUS,
-                color,
-            );
-            break;
+    for (t, w, baked) in &world_q {
+        if w.id != target_id {
+            continue;
         }
+        // Tip sits a little above the nameplate anchor, plus the bob.
+        let tip_y = t.translation.y
+            + nameplate_anchor_y(baked)
+            + ARROW_TIP_ABOVE_ANCHOR
+            + arrow_bob_offset(time.elapsed_secs());
+        let apex = Vec3::new(t.translation.x, tip_y, t.translation.z);
+        draw_camera_facing_arrow(&mut gizmos, apex, cam_pos, color);
+        break;
+    }
+}
+
+/// Emit the line gizmos for one downward-pointing, camera-facing,
+/// Y-locked arrow whose tip is at `apex`. "Y-locked" means the arrow's
+/// up axis stays world-up so the triangle never rolls when the camera
+/// pitches — same trick the nameplate billboards use.
+fn draw_camera_facing_arrow(gizmos: &mut Gizmos, apex: Vec3, cam_pos: Vec3, color: Color) {
+    let up = Vec3::Y;
+    // Screen-right in world space: perpendicular to both world-up and the
+    // view direction. Degenerate only when the camera is directly above
+    // the arrow (looking straight down), which the chase camera's pitch
+    // clamp prevents; fall back to +X just in case.
+    let to_cam = cam_pos - apex;
+    let right = up.cross(to_cam).try_normalize().unwrap_or(Vec3::X);
+
+    let top_center = apex + up * ARROW_HEIGHT;
+    let half = right * (ARROW_WIDTH * 0.5);
+    let top_left = top_center - half;
+    let top_right = top_center + half;
+
+    // Outline: the two slanted sides meeting at the tip, plus the top.
+    gizmos.line(apex, top_left, color);
+    gizmos.line(apex, top_right, color);
+    gizmos.line(top_left, top_right, color);
+
+    // Fake a filled triangle with horizontal scanlines. At fractional
+    // height `f` (0 = tip, 1 = top edge) the half-width grows linearly
+    // with `f`, so each scanline spans `±(ARROW_WIDTH/2)*f` around the
+    // vertical axis.
+    for i in 1..ARROW_FILL_SCANLINES {
+        let f = i as f32 / ARROW_FILL_SCANLINES as f32;
+        let center = apex + up * (ARROW_HEIGHT * f);
+        let hw = right * (ARROW_WIDTH * 0.5 * f);
+        gizmos.line(center - hw, center + hw, color);
     }
 }
 
@@ -145,26 +218,44 @@ pub fn draw_engaged_ring_system(
 mod tests {
     use super::*;
 
-    /// Engagement on the *same* entity that's currently targeted →
-    /// red ring. Operator wants the ring to visually echo combat state
-    /// rather than stay yellow throughout a fight.
+    /// Engagement on the *same* entity that's currently targeted → red
+    /// arrow. Operator wants the cue to visually echo combat state rather
+    /// than stay neutral throughout a fight.
     #[test]
     fn engaged_target_uses_red() {
-        assert_eq!(target_ring_color(true), ENGAGED_RING_COLOR);
+        assert_eq!(target_ring_color(true), ARROW_ENGAGED_COLOR);
     }
 
     /// Targeting an entity we aren't fighting (e.g. an idle mob before
-    /// pressing F) keeps the yellow attention-getting ring.
+    /// pressing F) keeps the neutral selection color.
     #[test]
-    fn unengaged_target_uses_yellow() {
-        assert_eq!(target_ring_color(false), RING_COLOR);
+    fn unengaged_target_uses_neutral() {
+        assert_eq!(target_ring_color(false), ARROW_COLOR);
     }
 
-    /// Yellow and red must remain visually distinct — if a future
-    /// refactor accidentally points them at the same constant, the
-    /// "in combat" UI cue collapses silently.
+    /// Neutral and red must remain visually distinct — if a future
+    /// refactor accidentally points them at the same constant, the "in
+    /// combat" UI cue collapses silently.
     #[test]
     fn engaged_and_unengaged_colors_differ() {
-        assert_ne!(RING_COLOR, ENGAGED_RING_COLOR);
+        assert_ne!(ARROW_COLOR, ARROW_ENGAGED_COLOR);
+    }
+
+    /// The bob is a bounded oscillation centered on zero: never pushes the
+    /// arrow more than the amplitude in either direction, so the tip can't
+    /// drift into the nameplate or float away.
+    #[test]
+    fn bob_is_bounded_by_amplitude() {
+        for i in 0..64 {
+            let s = i as f32 * 0.1;
+            assert!(arrow_bob_offset(s).abs() <= ARROW_BOB_AMPLITUDE + 1e-6);
+        }
+    }
+
+    /// Bob crosses zero at t=0 so the arrow starts at its rest height the
+    /// instant a target is acquired (no first-frame jump).
+    #[test]
+    fn bob_starts_at_rest() {
+        assert!(arrow_bob_offset(0.0).abs() < 1e-6);
     }
 }

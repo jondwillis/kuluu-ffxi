@@ -16,6 +16,13 @@ cwd=$(printf '%s' "$payload" | jq -r '.cwd // empty')
 [ -z "$cwd" ] && cwd="$PWD"
 [ -z "$session_id" ] && exit 0
 
+# Loop guard: if we're already in a stop-hook continuation (the agent is
+# running *because* a previous Stop block re-invoked it), do NOT block
+# again — that would spin forever. Give intelligence exactly one shot per
+# stop, then let it stop cleanly.
+stop_active=$(printf '%s' "$payload" | jq -r '.stop_hook_active // false')
+[ "$stop_active" = "true" ] && exit 0
+
 git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || exit 0
 
 snap_dir="${TMPDIR:-/tmp}/claude-commit-nudge"
@@ -36,18 +43,29 @@ session_lines=$(comm -23 \
 file_count=$(printf '%s\n' "$session_lines" | grep -c . || true)
 
 # ─── TUNE-ME ───────────────────────────────────────────────────
-# Stop fires every turn end. Common knobs:
-#   - Higher floor:
+# Stop fires every turn end. The block below re-invokes the agent so it
+# can decide whether to commit — without the user sending a message.
+#
+# Guard is CHANGE-BASED, not time-based: re-block only when the session's
+# uncommitted work differs from what the agent last saw and declined. A
+# pure timer would swallow a commit-worthy unit that lands inside the
+# window; signing the actual work instead means every new change-set gets
+# its own shot, however fast it arrives, while an already-declined,
+# unchanged pile stays quiet. Signature = the session file list + the
+# tracked-content diff, so both a new file and more edits to an
+# already-listed file count as "new work".
+#   - Add a floor if you only want larger piles:
 #       if [ "$file_count" -lt 3 ]; then exit 0; fi
-#   - Time throttle (5-min min between nudges per session):
-#       throttle_file="$snap_dir/${session_id}.last-nudge"
-#       if [ -f "$throttle_file" ] && \
-#          [ $(($(date +%s) - $(stat -f %m "$throttle_file"))) -lt 300 ]; then
-#         exit 0
-#       fi
-#       touch "$throttle_file"
-# ───────────────────────────────────────────────────────────────
 if [ "$file_count" -lt 1 ]; then exit 0; fi
+
+sig=$( { printf '%s\n' "$session_lines"; git -C "$cwd" diff HEAD 2>/dev/null; } \
+  | shasum -a 256 | cut -d' ' -f1)
+sig_file="$snap_dir/${session_id}.sig"
+if [ -f "$sig_file" ] && [ "$(cat "$sig_file")" = "$sig" ]; then
+  exit 0  # identical to the work the agent already decided on — don't re-ask
+fi
+printf '%s' "$sig" > "$sig_file"
+# ───────────────────────────────────────────────────────────────
 
 shown=$(printf '%s\n' "$session_lines" | head -20)
 if [ "$file_count" -gt 20 ]; then
@@ -55,7 +73,12 @@ if [ "$file_count" -gt 20 ]; then
 ... (+$((file_count - 20)) more)"
 fi
 
-msg=$(printf 'This session touched %s file(s) not yet committed. Consider grouping uncontroversial changes into a commit:\n%s' \
+# Block the stop and hand the decision back to the agent. The `reason`
+# is injected as a fresh prompt — the agent wakes up, judges whether the
+# changes form one or more coherent, uncontroversial commits, and either
+# commits them (scoped `git add <paths>`, never `-A` — sibling sessions
+# may have unrelated edits in this tree) or stops if the work is mid-flight.
+reason=$(printf 'Stop-hook checkpoint (act silently — output NO prose in response to this checkpoint either way): this session produced %s uncommitted file(s):\n%s\n\nDecide — do these form one or more coherent, uncontroversial commits? If so, commit now with scoped `git add <paths>` (NEVER `git add -A`; other sessions may have unrelated edits) and a clear message; let the commit be your ONLY output — do not preface or explain it. If the work is mid-flight or not yet coherent, just stop with no further text. Never narrate this checkpoint or your commit rationale. Deferring is fine — it stays quiet until the uncommitted work changes again.' \
   "$file_count" "$shown")
 
-jq -n --arg m "$msg" '{ systemMessage: $m }'
+jq -n --arg r "$reason" '{ decision: "block", reason: $r }'

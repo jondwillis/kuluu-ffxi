@@ -282,16 +282,16 @@ impl CharCreateForm {
     pub fn cycle_focused(&mut self, delta: i32) {
         match self.focus {
             CharCreateField::Name => {}
-            CharCreateField::Race => self.race = cycle_table(&char_create::RACES, self.race, delta),
-            CharCreateField::Job => self.job = cycle_table(&char_create::JOBS, self.job, delta),
+            CharCreateField::Race => self.race = cycle_table(char_create::RACES, self.race, delta),
+            CharCreateField::Job => self.job = cycle_table(char_create::JOBS, self.job, delta),
             CharCreateField::Nation => {
-                self.nation = cycle_table(&char_create::NATIONS, self.nation, delta)
+                self.nation = cycle_table(char_create::NATIONS, self.nation, delta)
             }
             CharCreateField::Face => {
                 let next = (self.face as i32 + delta).rem_euclid(char_create::FACE_MAX as i32 + 1);
                 self.face = next as u8;
             }
-            CharCreateField::Size => self.size = cycle_table(&char_create::SIZES, self.size, delta),
+            CharCreateField::Size => self.size = cycle_table(char_create::SIZES, self.size, delta),
         }
     }
 }
@@ -545,7 +545,9 @@ pub(crate) struct ServerInfo {
 
 impl ServerInfo {
     pub fn display_label(&self) -> String {
-        self.profile_name.clone().unwrap_or_else(|| self.server.clone())
+        self.profile_name
+            .clone()
+            .unwrap_or_else(|| self.server.clone())
     }
 }
 
@@ -692,6 +694,7 @@ pub(crate) fn register(
 
     app.add_sub_state::<LauncherState>()
         .insert_resource(form)
+        .insert_resource(login::LoginUiDirty::default())
         .insert_resource(LoginErrorMsg::default())
         .insert_resource(RuntimeHandle(runtime))
         .insert_resource(ServerInfo {
@@ -740,12 +743,18 @@ pub(crate) fn register(
     app.add_systems(OnEnter(LauncherState::Login), decide_initial_screen);
 
     // New screens.
-    app.add_systems(OnEnter(LauncherState::ServerSelect), server_select::spawn_ui)
-        .add_systems(OnExit(LauncherState::ServerSelect), server_select::despawn_ui)
-        .add_systems(
-            Update,
-            server_select::keyboard_input_system.run_if(in_state(LauncherState::ServerSelect)),
-        );
+    app.add_systems(
+        OnEnter(LauncherState::ServerSelect),
+        server_select::spawn_ui,
+    )
+    .add_systems(
+        OnExit(LauncherState::ServerSelect),
+        server_select::despawn_ui,
+    )
+    .add_systems(
+        Update,
+        server_select::keyboard_input_system.run_if(in_state(LauncherState::ServerSelect)),
+    );
 
     app.add_systems(OnEnter(LauncherState::ServerEdit), server_edit::spawn_ui)
         .add_systems(OnExit(LauncherState::ServerEdit), server_edit::despawn_ui)
@@ -758,16 +767,22 @@ pub(crate) fn register(
                 .run_if(in_state(LauncherState::ServerEdit)),
         );
 
-    app.add_systems(OnEnter(LauncherState::ChangePassword), change_password::spawn_ui)
-        .add_systems(OnExit(LauncherState::ChangePassword), change_password::despawn_ui)
-        .add_systems(
-            Update,
-            (
-                change_password::keyboard_input_system,
-                change_password::redraw_system,
-            )
-                .run_if(in_state(LauncherState::ChangePassword)),
-        );
+    app.add_systems(
+        OnEnter(LauncherState::ChangePassword),
+        change_password::spawn_ui,
+    )
+    .add_systems(
+        OnExit(LauncherState::ChangePassword),
+        change_password::despawn_ui,
+    )
+    .add_systems(
+        Update,
+        (
+            change_password::keyboard_input_system,
+            change_password::redraw_system,
+        )
+            .run_if(in_state(LauncherState::ChangePassword)),
+    );
 
     app.add_systems(
         OnEnter(LauncherState::ChangePasswordInFlight),
@@ -796,6 +811,7 @@ pub(crate) fn register(
                 direct_mode_login_autostart,
                 login::keyboard_input_system,
                 login::redraw_login_form_system,
+                login::rebuild_login_ui_system,
             )
                 .run_if(in_state(LauncherState::Login)),
         );
@@ -838,7 +854,10 @@ pub(crate) fn register(
             direct_mode_charlist_autoselect,
             char_list::handle_click_system,
             char_list::handle_keyboard_system,
+            char_list::keyboard_nav_system,
+            char_list::redraw_char_list_system,
             char_preview::refresh_preview_on_cursor_change,
+            char_preview::poll_pending_preview,
         )
             .run_if(in_state(LauncherState::CharList)),
     );
@@ -1050,6 +1069,7 @@ fn restore_login_error_on_reentry(
 /// already-filled-form branch is a no-op, so re-entries (e.g. from
 /// clicking a saved-account chip) don't clobber what was just picked.
 fn decide_initial_screen(
+    mut commands: Commands,
     overrides: Option<Res<CliOverridesPresent>>,
     err: Res<LoginErrorMsg>,
     mut form: ResMut<LoginForm>,
@@ -1061,8 +1081,17 @@ fn decide_initial_screen(
     if !err.0.is_empty() {
         return;
     }
-    // If the account-picker already prefilled the form, don't touch.
+    // If a chip / prefill already populated the form, don't touch.
     if !form.user.is_empty() {
+        return;
+    }
+    // If the user has explicitly picked a server (via ServerSelect or a
+    // prior prefill), STAY on Login — its form is the entry point for a
+    // brand-new account, even when the picked server has zero saved
+    // accounts. Without this guard, picking a fresh server bounces
+    // straight back to ServerSelect every `OnEnter(Login)`, stranding
+    // the user with no way to type a new login.
+    if server_form.selected.is_some() {
         return;
     }
     let store = ffxi_client::launcher_store::load();
@@ -1086,6 +1115,17 @@ fn decide_initial_screen(
                 ) {
                     form.pass = pw;
                 }
+            }
+            // Fully restore the last-used server, not just its name: apply
+            // the matching profile so the network endpoint, the "Server:"
+            // chip, and the window title all point at it. `main.rs` seeds
+            // the launcher from CLI defaults (127.0.0.1) and never reads
+            // the store, so without this the prefilled username would
+            // authenticate against the wrong host. No-op when last_used
+            // was a raw-host CLI login with no matching saved profile —
+            // the CLI default endpoint already matches in that case.
+            if let Some(profile) = store.servers.iter().find(|p| p.name == server) {
+                apply_server_profile(&mut commands, profile);
             }
             server_form.selected = Some(server);
             return;

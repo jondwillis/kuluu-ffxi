@@ -615,7 +615,7 @@ impl FfxiServer {
         let uri = p.uri.as_str();
         let started = std::time::Instant::now();
         let state = self.state.read().await;
-        let content = read_resource(&state, &*self.goal_store, uri)
+        let content = read_resource(&state, &self.goal_store, uri)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
         let elapsed_us = started.elapsed().as_micros() as u64;
@@ -666,8 +666,8 @@ impl ServerHandler for FfxiServer {
                 annotations: None,
             }
         };
-        let mut result = ListResourcesResult::default();
-        result.resources = vec![
+        let result = ListResourcesResult {
+            resources: vec![
             mk(
                 "scene://current",
                 "scene",
@@ -710,7 +710,9 @@ impl ServerHandler for FfxiServer {
                 "application/json",
                 "Diagnostic ring buffer (cap 64) of CHAR_PC/CHAR_NPC packets where `PosHead::try_extract_name` returned None. Each entry has opcode, unique_no, act_index, the SendFlg byte (body[6]), body length, hex dump of the leading 96 bytes, and a classification of the failure reason. Use this to audit why specific entities show as `?` in scene://entities.",
             ),
-        ];
+            ],
+            ..Default::default()
+        };
         Ok(result)
     }
 
@@ -745,7 +747,7 @@ impl ServerHandler for FfxiServer {
         let uri = request.uri.as_str();
         let started = std::time::Instant::now();
         let state = self.state.read().await;
-        let body = read_resource(&state, &*self.goal_store, uri)
+        let body = read_resource(&state, &self.goal_store, uri)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
         let elapsed_us = started.elapsed().as_micros() as u64;
@@ -1622,9 +1624,11 @@ mod tests {
 
     #[test]
     fn entities_view_sorts_by_distance_and_caps() {
-        let mut s = SessionState::default();
-        s.zone_id = Some(230);
-        s.char_id = Some(7);
+        let mut s = SessionState {
+            zone_id: Some(230),
+            char_id: Some(7),
+            ..Default::default()
+        };
         // Self position now lives on the self entity in the entity list
         // (looked up by `id == char_id`). Seed it at the origin so the
         // distance ordering below is identical to the original test.
@@ -1644,6 +1648,7 @@ mod tests {
             claim_id: 0,
             speed: 25,
             speed_base: 25,
+            look: None,
         });
         // Seed 35 entities at increasing distances; only nearest 30 should
         // appear, sorted ascending.
@@ -1664,6 +1669,7 @@ mod tests {
                 claim_id: 0,
                 speed: 0,
                 speed_base: 0,
+                look: None,
             });
         }
         let v = entities_view(&s);
@@ -1691,6 +1697,7 @@ mod tests {
             claim_id: 0,
             speed: 0,
             speed_base: 0,
+            look: None,
         });
         s.entities.push(Entity {
             id: 100,
@@ -1708,6 +1715,7 @@ mod tests {
             claim_id: 0,
             speed: 0,
             speed_base: 0,
+            look: None,
         });
         let v = entities_view(&s);
         assert_eq!(v["entities"][0]["claimed_by"], 4242);
@@ -1877,11 +1885,13 @@ mod tests {
 
         // Case 1: live mirror is in `Following`. The live goal wins
         // over the stale disk PathTo.
-        let mut state = SessionState::default();
-        state.current_goal = Some(ReactorGoalSnapshot::Following {
-            target_id: 42,
-            distance: 3.0,
-        });
+        let state = SessionState {
+            current_goal: Some(ReactorGoalSnapshot::Following {
+                target_id: 42,
+                distance: 3.0,
+            }),
+            ..Default::default()
+        };
         let body = read_resource(&state, &mutex, "goal://current")
             .await
             .expect("read live goal");
@@ -1894,8 +1904,10 @@ mod tests {
         // Case 2: live mirror says Idle. Disk falls back into play —
         // this preserves the headless-restart use case where the
         // persisted file is the only source.
-        let mut state = SessionState::default();
-        state.current_goal = Some(ReactorGoalSnapshot::Idle);
+        let state = SessionState {
+            current_goal: Some(ReactorGoalSnapshot::Idle),
+            ..Default::default()
+        };
         let body = read_resource(&state, &mutex, "goal://current")
             .await
             .expect("read disk fallback");

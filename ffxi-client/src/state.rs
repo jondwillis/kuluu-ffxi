@@ -24,7 +24,9 @@ pub fn process_monotonic_ms() -> u64 {
 /// Stage of the end-to-end login flow we're currently in.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Stage {
+    #[default]
     Idle,
     Authenticating,
     LobbyHandshake,
@@ -520,7 +522,9 @@ pub enum InventoryUpdate {
 /// how the reactor implements it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ReactorGoalSnapshot {
+    #[default]
     Idle,
     Following {
         target_id: u32,
@@ -549,12 +553,6 @@ pub enum ReactorGoalSnapshot {
         threshold: u8,
         mog_house_zoneline: u32,
     },
-}
-
-impl Default for ReactorGoalSnapshot {
-    fn default() -> Self {
-        ReactorGoalSnapshot::Idle
-    }
 }
 
 fn one_u32() -> u32 {
@@ -818,7 +816,7 @@ impl SessionState {
                     // by a position-only CHAR_PC blanks `look` and the
                     // model-spawn dispatcher's `Changed<LookComp>` query
                     // sees a remove instead of a stable signature.
-                    let preserved_look = entity.look.clone().or_else(|| existing.look.clone());
+                    let preserved_look = entity.look.or(existing.look);
                     *existing = Entity {
                         name: preserved_name,
                         kind: merged_kind,
@@ -921,12 +919,12 @@ impl SessionState {
                     } else {
                         existing.name.clone()
                     };
-                    let preserved_leader = if !member.name.is_some() {
+                    let preserved_leader = if member.name.is_none() {
                         existing.is_party_leader
                     } else {
                         member.is_party_leader
                     };
-                    let preserved_alliance = if !member.name.is_some() {
+                    let preserved_alliance = if member.name.is_none() {
                         existing.is_alliance_leader
                     } else {
                         member.is_alliance_leader
@@ -1101,12 +1099,6 @@ impl SessionState {
                 self.shop = None;
             }
         }
-    }
-}
-
-impl Default for Stage {
-    fn default() -> Self {
-        Stage::Idle
     }
 }
 
@@ -2309,7 +2301,7 @@ mod tests {
             sub: 0x7000,
             ranged: 0x8000,
         };
-        ent.look = Some(look.clone());
+        ent.look = Some(look);
         s.apply_event(&AgentEvent::EntityUpserted { entity: ent });
         assert!(matches!(
             s.entities[0].look,

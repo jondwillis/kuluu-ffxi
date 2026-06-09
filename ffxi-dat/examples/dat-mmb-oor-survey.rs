@@ -99,7 +99,7 @@ fn main() -> ExitCode {
     println!();
     println!("Top 20 OOR values (likely restart sentinels if concentrated):");
     let mut vec: Vec<(u16, u64)> = oor_value_hist.into_iter().collect();
-    vec.sort_by(|a, b| b.1.cmp(&a.1));
+    vec.sort_by_key(|x| std::cmp::Reverse(x.1));
     for (val, n) in vec.iter().take(20) {
         println!("  0x{val:04x} = {val:5}   {n}×");
     }

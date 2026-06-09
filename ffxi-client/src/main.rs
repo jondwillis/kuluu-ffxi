@@ -1,5 +1,8 @@
 //! FFXI agent-driven client — entry point.
 
+// Bevy ECS dictates system signatures (see ffxi-viewer-core; insurmountable).
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
+
 #[cfg(any(feature = "native-window", feature = "relay"))]
 use ffxi_client::state;
 use ffxi_client::{agent_io, auth_client, lobby_client, map_client, session};
@@ -238,6 +241,13 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(env_filter)
         .init();
+
+    // Apply persisted launcher Settings (FFXI_DAT_PATH / FFXI_NAVMESH_DIR /
+    // FFXI_MAC) to the process environment NOW — single-threaded, before the
+    // tokio runtime spawns workers and before any `from_env_or_default`
+    // resolution downstream. Real env vars still win unless the launcher's
+    // per-field "override" box is ticked (see launcher_store::Settings).
+    ffxi_client::launcher_store::load().settings.apply_to_env();
 
     let auth = auth_client::AuthClient::with_flavor_and_version(
         args.server.clone(),
@@ -899,9 +909,9 @@ fn build_encrypted_login_subpacket(
     buf[2..4].copy_from_slice(&2u16.to_le_bytes());
 
     buf[12..16].copy_from_slice(&char_id.to_le_bytes());
-    let n = char_name.as_bytes().len().min(15);
+    let n = char_name.len().min(15);
     buf[34..34 + n].copy_from_slice(&char_name.as_bytes()[..n]);
-    let n = account_name.as_bytes().len().min(15);
+    let n = account_name.len().min(15);
     buf[49..49 + n].copy_from_slice(&account_name.as_bytes()[..n]);
     buf[64..80].copy_from_slice(&ticket);
     buf[84..88].copy_from_slice(b"PC\0\0");
@@ -946,7 +956,7 @@ fn build_subpacket_pos(sync: u16, x: f32, y: f32, z: f32, heading: u8) -> Vec<u8
     buf[12..16].copy_from_slice(&y.to_le_bytes());
     // MovTime (u16), MoveFlame (u16) — 0 for stationary
     // dir (i8), mode (bitfield u8)
-    buf[20] = heading as u8;
+    buf[20] = heading;
     // facetarget (u16) — leave 0
     // TimeNow (u32) — client-side timestamp; server uses for jitter detection
     let now = std::time::SystemTime::now()

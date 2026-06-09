@@ -2,7 +2,7 @@
 //!
 //! Loads an MZB zone, spawns its grid-cell placement geometry, waits for
 //! a few frames, captures a screenshot to disk, and exits. Reuses the
-//! production `process_load_mzb_requests` system so the bake matches
+//! production `kick_load_mzb_tasks` / `poll_load_mzb_tasks` systems so the bake matches
 //! exactly what the live client renders for the same zone — only the
 //! palette is swappable for empirical work.
 //!
@@ -30,7 +30,8 @@ use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Capturing, Screenshot};
 use ffxi_viewer_core::dat_mmb::LoadMmbRequest;
 use ffxi_viewer_core::dat_mzb::{
-    process_load_mzb_requests, DrawDistance, LoadMzbRequest, MzbCollisionGeometry, ZoneGeomMode,
+    kick_load_mzb_tasks, poll_load_mzb_tasks, DrawDistance, LoadMzbInFlight, LoadMzbRequest,
+    MzbCollisionGeometry, ZoneGeomCache, ZoneGeomMode,
 };
 use ffxi_viewer_core::SceneState;
 use std::env;
@@ -89,18 +90,19 @@ fn main() {
             ..default()
         }))
         .add_message::<LoadMzbRequest>()
-        // Registered (no consumer here) so `process_load_mzb_requests`
-        // can emit its companion LoadMmbRequest events without panicking.
-        // We don't render MMB; only MZB is needed for the empirical
-        // material workflow.
+        // Registered (no consumer here) so the MZB loader can emit its
+        // companion LoadMmbRequest events without panicking. We don't render
+        // MMB; only MZB is needed for the empirical material workflow.
         .add_message::<LoadMmbRequest>()
         .init_resource::<DrawDistance>()
         .init_resource::<MzbCollisionGeometry>()
+        .init_resource::<LoadMzbInFlight>()
+        .init_resource::<ZoneGeomCache>()
         .init_resource::<SceneState>()
         .add_systems(Startup, (setup_camera, fire_load_request))
         .add_systems(
             Update,
-            (process_load_mzb_requests, capture_and_exit).chain(),
+            (kick_load_mzb_tasks, poll_load_mzb_tasks, capture_and_exit).chain(),
         )
         .run();
 }

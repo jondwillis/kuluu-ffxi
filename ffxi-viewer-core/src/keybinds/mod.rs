@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn iter_is_deterministic() {
-        let pairs = vec![
+        let pairs = [
             (Action::MoveForward, KeyBind::new(KeyCode::KeyW)),
             (Action::CycleTarget, KeyBind::new(KeyCode::Tab)),
             (Action::OpenMenu, KeyBind::new(KeyCode::Minus)),

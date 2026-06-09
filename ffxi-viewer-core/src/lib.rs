@@ -15,6 +15,12 @@
 //! ```
 
 #![forbid(unsafe_code)]
+// Insurmountable for a Bevy ECS crate: system signatures are dictated by the
+// framework — a system's parameter list IS its dependency set (often >7 Res /
+// Query params), and `Query<...>` filter/data tuples are inherently deep. The
+// idiomatic alternatives (SystemParam bundles, query type aliases) don't reduce
+// the real complexity, they only move it. Scoped to exactly these two lints.
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 pub mod atmosphere;
 #[cfg(not(target_arch = "wasm32"))]
@@ -55,6 +61,7 @@ pub mod snapshot;
 pub mod source;
 pub mod sun_moon;
 pub mod target_ring;
+pub mod target_strobe;
 pub mod vana_time;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod weather;
@@ -283,7 +290,8 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                         sync_aggro_system,
                         nameplate::update_nameplates_system,
                         nameplate_billboard::update_nameplate_billboards_system,
-                        target_ring::draw_target_ring_system,
+                        target_strobe::target_strobe_system,
+                        target_ring::draw_target_arrow_system,
                         target_ring::draw_engaged_ring_system,
                         sync_zone_lines_system,
                         atmosphere::apply_zone_atmosphere_system,

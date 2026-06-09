@@ -23,8 +23,11 @@
 //! A small state machine in [`BakeStage`] drives bake-once semantics:
 //!
 //! 1. `Idle` — nothing to do.
-//! 2. `Requested` — a zone change was detected. The next render-budget
-//!    system spawns the bake camera and moves to `Awaiting`.
+//! 2. `Requested` — a zone change was detected. The bake camera renders
+//!    the *live* scene, so we can't snapshot until the zone's textured
+//!    MMB placements have finished streaming in and uploaded to the GPU
+//!    — otherwise the snapshot captures black, untextured geometry. This
+//!    stage holds until those visuals are ready (see [`spawn_bake_camera`]).
 //! 3. `Awaiting` — wait one frame for the render graph to commit the
 //!    bake texture, then despawn the camera and return to `Idle`.
 //!
@@ -39,7 +42,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 
 use crate::components::InGameEntity;
-use crate::dat_mzb::MzbCollisionGeometry;
+use crate::dat_mmb::MmbLoadQueue;
+use crate::dat_mzb::{LoadMzbInFlight, MzbCollisionGeometry};
 use crate::snapshot::SceneState;
 
 use super::{MinimapAabb, MinimapState, MINIMAP_TEX_SIZE};
@@ -81,9 +85,13 @@ impl Default for TopdownCullPolicy {
 pub enum BakeStage {
     #[default]
     Idle,
-    /// Zone-change or cull-policy-change detected; spawn the bake
-    /// camera on the next [`spawn_bake_camera`] tick.
-    Requested,
+    /// Zone-change or cull-policy-change detected. The bake can't fire
+    /// yet: the camera snapshots the live scene, and the zone's textured
+    /// MMB placements stream in over many frames *after* the collision
+    /// geometry lands (which is what triggered the request). `waited`
+    /// counts frames since the request; [`spawn_bake_camera`] holds here
+    /// until the visual load has drained — see [`BAKE_MIN_WARMUP_FRAMES`].
+    Requested { waited: u8 },
     /// Bake camera spawned; wait `frames_remaining` ticks for the
     /// render graph to commit, then despawn.
     Awaiting {
@@ -96,6 +104,21 @@ pub enum BakeStage {
 /// despawning it. Minimum 1 so the camera survives the
 /// Update→PostUpdate→Render path of the same frame.
 const BAKE_FRAMES_TO_HOLD: u8 = 1;
+
+/// Minimum frames to hold in [`BakeStage::Requested`] before a bake may
+/// fire, *on top of* the "visuals drained" gate.
+///
+/// The `LoadMmbRequest` events that spawn the zone's textured props are
+/// written in the very same call that mutates `MzbCollisionGeometry`
+/// (and thus triggers the request), but they only land in
+/// [`MmbLoadQueue::pending`] a frame later, when `process_load_mmb_requests`
+/// drains them. So for the first frame or two after a request the queue
+/// reads *empty* even though a full city's worth of props is inbound —
+/// gating on emptiness alone would bake black. This floor guarantees the
+/// queue has had time to fill before an empty reading counts as "done",
+/// and doubles as a couple of frames' GPU-upload settle for the last
+/// batch of textures.
+const BAKE_MIN_WARMUP_FRAMES: u8 = 4;
 
 /// Marker on the secondary orthographic camera used for the bake. Lets
 /// [`despawn_bake_camera`] find and clean up the entity without
@@ -167,12 +190,21 @@ pub fn bake_topdown_on_zone_or_policy_change(
         // — nothing to do.
         return;
     }
-    *stage = BakeStage::Requested;
+    *stage = BakeStage::Requested { waited: 0 };
 }
 
-/// Stage 2 of the bake loop: when stage is `Requested`, compute the
-/// zone AABB, allocate a render target, spawn the bake camera, and
-/// publish the texture handle + AABB onto [`MinimapState`].
+/// Stage 2 of the bake loop: when stage is `Requested` *and the zone's
+/// visuals have finished loading*, compute the zone AABB, allocate a
+/// render target, spawn the bake camera, and publish the texture handle
+/// + AABB onto [`MinimapState`].
+///
+/// The bake camera renders the live scene — the textured MMB props, not
+/// the collision soup. Those props stream in over many frames after the
+/// collision geometry lands, which is what fired the request. Snapshot
+/// too early and the camera captures black, untextured geometry. So we
+/// hold in `Requested` until [`MmbLoadQueue`] and [`LoadMzbInFlight`]
+/// have both drained (plus a [`BAKE_MIN_WARMUP_FRAMES`] floor — see that
+/// constant for the enqueue-lag subtlety).
 ///
 /// The published handle is live before the GPU has actually rendered
 /// into it — that's fine, because the UI's `ImageNode` doesn't sample
@@ -182,12 +214,25 @@ pub fn spawn_bake_camera(
     geom: Res<MzbCollisionGeometry>,
     policy: Res<TopdownCullPolicy>,
     scene_state: Res<SceneState>,
+    mmb_queue: Res<MmbLoadQueue>,
+    mzb_in_flight: Res<LoadMzbInFlight>,
     mut state: ResMut<MinimapState>,
     mut stage: ResMut<BakeStage>,
     mut images: ResMut<Assets<Image>>,
     mut commands: Commands,
 ) {
-    if !matches!(*stage, BakeStage::Requested) {
+    let BakeStage::Requested { waited } = *stage else {
+        return;
+    };
+    // The warmup floor is load-bearing, not just settle: right after a
+    // request the queue still reads empty because the placement events
+    // haven't enqueued yet, so "empty" there means "not filled", not
+    // "done". See BAKE_MIN_WARMUP_FRAMES.
+    let visuals_pending = !mmb_queue.pending.is_empty() || !mzb_in_flight.tasks.is_empty();
+    if waited < BAKE_MIN_WARMUP_FRAMES || visuals_pending {
+        *stage = BakeStage::Requested {
+            waited: waited.saturating_add(1),
+        };
         return;
     }
     let Some(aabb_3d) = compute_world_aabb(&geom.positions) else {

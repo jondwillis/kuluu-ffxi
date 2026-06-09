@@ -241,14 +241,14 @@ mod tests {
 
     #[test]
     fn targeted_includes_check_and_talk() {
-        let labels: Vec<&str> = entries_for(true).iter().copied().collect();
+        let labels: Vec<&str> = entries_for(true).to_vec();
         assert!(labels.contains(&"Check"));
         assert!(labels.contains(&"Talk"));
     }
 
     #[test]
     fn untargeted_excludes_attack() {
-        let labels: Vec<&str> = entries_for(false).iter().copied().collect();
+        let labels: Vec<&str> = entries_for(false).to_vec();
         assert!(!labels.contains(&"Attack"));
         assert!(!labels.contains(&"Check")); // Check requires a target.
     }

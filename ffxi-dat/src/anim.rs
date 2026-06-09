@@ -145,9 +145,7 @@ impl Mo2Animation {
     /// return `None`; callers should fall back to bind pose.
     #[inline]
     pub fn frames_for_bone(&self, bone: usize) -> Option<&[Mo2Frame]> {
-        self.per_bone_dense
-            .get(bone)
-            .and_then(|o| o.as_deref())
+        self.per_bone_dense.get(bone).and_then(|o| o.as_deref())
     }
 }
 
@@ -292,8 +290,7 @@ pub fn parse_mo2(body: &[u8], chunk_name: &[u8; 4]) -> Result<Mo2Animation> {
 
     let frames = header_frames.saturating_sub(1);
     let max_bone = per_bone.keys().copied().max().unwrap_or(0) as usize;
-    let mut per_bone_dense: Vec<Option<Vec<Mo2Frame>>> =
-        (0..=max_bone).map(|_| None).collect();
+    let mut per_bone_dense: Vec<Option<Vec<Mo2Frame>>> = (0..=max_bone).map(|_| None).collect();
     for (&bone, kfs) in &per_bone {
         if (bone as usize) < per_bone_dense.len() {
             per_bone_dense[bone as usize] = Some(kfs.clone());

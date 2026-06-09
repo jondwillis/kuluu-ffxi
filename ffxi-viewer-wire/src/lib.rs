@@ -65,9 +65,10 @@ impl Default for Position {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
+    #[default]
     Idle,
     Authenticating,
     LobbyHandshake,
@@ -75,12 +76,6 @@ pub enum Stage {
     Zoning,
     InZone,
     Disconnected,
-}
-
-impl Default for Stage {
-    fn default() -> Self {
-        Stage::Idle
-    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -460,6 +455,43 @@ pub struct SceneSnapshot {
     /// Empty until the first `ITEM_LIST` slot lands.
     #[serde(default)]
     pub inventory_main: Vec<InventoryItem>,
+    /// Operator's character stats (item level + primary attributes).
+    /// `None` until the server sends `0x061 CHAR_STATS`. Read by the
+    /// Status > Profile panel. Additive (Stage 3 menu suite).
+    #[serde(default)]
+    pub stats: Option<CharStats>,
+    /// Items the *examined* target has up for bazaar sale (the `/check`
+    /// View Wares list). Empty for targets with no bazaar. Additive.
+    #[serde(default)]
+    pub bazaar: Vec<BazaarEntry>,
+    /// Total seconds this character has been played. Surfaced by the
+    /// Status > Play Time chat line. 0 until the server reports it.
+    #[serde(default)]
+    pub play_time_s: u64,
+}
+
+/// Operator character stats for the Status > Profile screen. Field names
+/// use a trailing underscore for `str_`/`int_` to dodge the reserved-ish
+/// identifiers. Additive over the wire (`#[serde(default)]` on the
+/// snapshot field means older producers simply omit it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CharStats {
+    pub item_level: u16,
+    pub str_: u16,
+    pub dex: u16,
+    pub vit: u16,
+    pub agi: u16,
+    pub int_: u16,
+    pub mnd: u16,
+    pub chr: u16,
+}
+
+/// One bazaar listing on an examined target — the `/check` View Wares row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BazaarEntry {
+    pub item_no: u16,
+    pub quantity: u32,
+    pub price: u32,
 }
 
 /// One slot of the main Inventory bag — the wire shape the HUD's
@@ -537,7 +569,7 @@ pub struct DialogState {
 pub struct ShopState {
     /// `ShopItemOffsetIndex` from the 0x03C header — the per-shop offset
     /// the server uses to compose successive list packets for shops with
-    /// >19 items. Echoed back in `ShopBuy` via `ShopNo` so the server
+    /// more than 19 items. Echoed back in `ShopBuy` via `ShopNo` so the server
     /// resolves which shop list this is referring to.
     pub offset_index: u16,
     /// One row per item the shop sells. Order matches the wire `ShopIndex`,
@@ -847,7 +879,17 @@ mod tests {
             dialog: None,
             shop: None,
             status_icons: Vec::new(),
+            logout_countdown: None,
             weather: None,
+            equipped: [None; 16],
+            spells_known: Vec::new(),
+            job_abilities_known: Vec::new(),
+            weaponskills_known: Vec::new(),
+            pet_abilities_known: Vec::new(),
+            inventory_main: Vec::new(),
+            stats: None,
+            bazaar: Vec::new(),
+            play_time_s: 0,
         }
     }
 

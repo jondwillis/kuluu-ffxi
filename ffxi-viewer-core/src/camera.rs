@@ -41,12 +41,14 @@ const FIRST_PERSON_EYE_FRAC: f32 = 0.92;
 const NAMEPLATE_OFFSET_ABOVE_CROWN: f32 = 0.1;
 
 /// Fallback actor height (yalms) used when an entity lacks a
-/// [`BakedActor`] — capsule-only fallbacks, mobs without a skinned
-/// mesh, or the first frame or two before VOS2 dispatch attaches the
-/// component. 4.5 matches the default PC capsule (`2*(0.35 + 1.9)`,
-/// see `scene::entity_visual_height`), so a freshly-spawned PC reads
-/// roughly the same anchors before and after its skin loads.
-const FALLBACK_ACTOR_HEIGHT: f32 = 3.0;
+/// [`BakedActor`] — mobs without a skinned mesh, or the frames before
+/// VOS2 dispatch attaches the component. Matched to the baked PC crown
+/// (the CPU bake lands the head top at Y≈2.29) rather than the debug
+/// capsule height (4.5): the capsule is hidden the moment skin loads,
+/// so anchoring to it floated nameplates ~1 yalm high during the
+/// pre-bake window. Matching the rendered body keeps the anchor stable
+/// before and after the bake attaches the real `BakedActor`.
+const FALLBACK_ACTOR_HEIGHT: f32 = 2.3;
 
 /// Third-person camera anchor Y above an entity's feet, derived from
 /// its [`BakedActor`] when present. The chase camera pivots both its

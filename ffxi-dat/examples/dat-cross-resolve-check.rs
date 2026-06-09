@@ -179,13 +179,13 @@ fn main() {
         // Placement IDs are the full asset name. Match by: take id's first 8 chars,
         // find any local MMB whose last 8 trim-end chars equal those.
         let try_local_vendor = |id: &str| -> bool {
-            if id.len() < 1 {
+            if id.is_empty() {
                 return false;
             }
             let id8: String = id.chars().take(8).collect();
             mmbs.iter().any(|n| {
                 let t = n.trim_end();
-                t.len() >= 8 && &t[t.len() - 8..] == id8
+                t.len() >= 8 && t[t.len() - 8..] == id8
             })
         };
         let mut local_vendor = 0u32;
@@ -228,7 +228,7 @@ fn main() {
         println!("  cross       = {cross}");
         println!("  miss        = {miss}");
         let mut dist: Vec<_> = cross_dist.into_iter().collect();
-        dist.sort_by(|a, b| b.1.cmp(&a.1));
+        dist.sort_by_key(|x| std::cmp::Reverse(x.1));
         println!(
             "  cross_top10 = {:?}",
             &dist.iter().take(10).collect::<Vec<_>>()

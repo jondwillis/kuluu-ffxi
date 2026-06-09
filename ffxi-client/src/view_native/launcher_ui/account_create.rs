@@ -12,7 +12,9 @@ use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title,
 use crate::view_native::widgets::text_field::{text_field, TextFieldSubmitted};
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
-use super::{CreateAccountErrorMsg, CreateAccountField, CreateAccountForm, LauncherState, ServerInfo};
+use super::{
+    CreateAccountErrorMsg, CreateAccountField, CreateAccountForm, LauncherState, ServerInfo,
+};
 
 #[derive(Component)]
 pub(super) struct CreateAccountRoot;
@@ -152,9 +154,7 @@ fn spawn_field(
                     match binding {
                         CreateAccountField::User => form.user = ev.value.clone(),
                         CreateAccountField::Password => form.pass = ev.value.clone(),
-                        CreateAccountField::PasswordConfirm => {
-                            form.pass_confirm = ev.value.clone()
-                        }
+                        CreateAccountField::PasswordConfirm => form.pass_confirm = ev.value.clone(),
                     }
                 },
             )

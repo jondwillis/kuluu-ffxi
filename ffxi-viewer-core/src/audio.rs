@@ -285,8 +285,8 @@ fn resolve_install_root() -> Option<PathBuf> {
 /// to play *nothing* in this slot" — we treat it as silence
 /// (don't fall through to the next slot).
 ///
-/// LSB pushes ALL relevant tracks on zone-in (ZoneDay + ZoneNight
-/// + CombatSolo + CombatParty + …) — they're cached for later. The
+/// LSB pushes ALL relevant tracks on zone-in (ZoneDay + ZoneNight +
+/// CombatSolo + CombatParty + …) — they're cached for later. The
 /// client must NOT play CombatSolo just because it's filled; it
 /// must check whether the player is actually engaged. Same for
 /// Mount, MogHouse, Dead, Fishing. The earlier naive
@@ -852,7 +852,7 @@ pub fn play_sfx_system(
 /// runtime. The earlier `/sfx_bind` rebind affordance was scaffolding
 /// for unfounded defaults — removing it forces every value to come
 /// from a citable source or stay silent.
-#[derive(Resource, Debug, Clone)]
+#[derive(Resource, Debug, Clone, Default)]
 pub struct SystemSfxTable {
     /// `ViewerEvent::ZoneChanged` → zone-line confirm chime.
     pub zone_changed: Option<u32>,
@@ -898,42 +898,6 @@ pub struct SystemSfxTable {
     pub ui_command_ok: Option<u32>,
     /// UI: slash command parse failed / unknown command.
     pub ui_command_err: Option<u32>,
-}
-
-impl Default for SystemSfxTable {
-    fn default() -> Self {
-        // Every value here needs a citable source — either a DAT-scan
-        // observation tied to retail behavior, or a known reference in
-        // an open-source vendor catalog. Unsourced placeholders should
-        // stay `None` so silence is the default rather than a guess.
-        //
-        // Today none of the SE→event mappings have been verified — the
-        // earlier defaults were guesses propped up by `/sfx_bind` for
-        // runtime correction. With `/sfx_bind` removed we'd rather
-        // ship silence than wrong sound. The companion task (build a
-        // sourced catalog in `ffxi-audio/sfx_catalog.csv` from vendor/
-        // references) populates real defaults; until then each event
-        // stays muted.
-        Self {
-            zone_changed: None,
-            low_hp: None,
-            engaged_by: None,
-            engage_self: None,
-            swing_tick: None,
-            tell_received: None,
-            level_up: None,
-            skill_level_up: None,
-            ui_chat_open: None,
-            ui_chat_send: None,
-            ui_chat_cancel: None,
-            ui_menu_open: None,
-            ui_menu_move: None,
-            ui_menu_confirm: None,
-            ui_menu_cancel: None,
-            ui_command_ok: None,
-            ui_command_err: None,
-        }
-    }
 }
 
 /// Wire-event → SFX bridge for the events our session reactor
@@ -1034,7 +998,7 @@ pub fn fire_system_sfx_events(
 /// transitions (World↔Chat etc.) without false-firing on internal
 /// payload updates (e.g. each keystroke that mutates `ChatBuffer`).
 #[derive(Default, PartialEq, Eq, Clone, Copy, Debug)]
-enum InputModeKind {
+pub enum InputModeKind {
     #[default]
     World,
     Chat,
@@ -1051,6 +1015,11 @@ impl InputModeKind {
             crate::InputMode::Chat(_) => Self::Chat,
             crate::InputMode::Menu(_) => Self::Menu,
             crate::InputMode::QuickAction(_) => Self::QuickAction,
+            // The vanilla contextual target-action menu shares the
+            // quick-action picker's SFX lifecycle (it is the same
+            // confirm-on-target surface, just rendered as a list rather
+            // than the Enhanced ring).
+            crate::InputMode::TargetAction(_) => Self::QuickAction,
             crate::InputMode::Dialog(_) => Self::Dialog,
             crate::InputMode::PassiveCursor(_) => Self::PassiveCursor,
         }
@@ -1163,20 +1132,9 @@ pub const BGM_FADE_SECS: f32 = 1.5;
 /// Mapping from LSB `Weather` variants to SE ids. Default = every
 /// entry is `(None, None)` (silent) — operators set ids after
 /// listening through `/sfx <id>`. Indexed by `Weather as usize`.
-#[derive(Resource, Debug, Clone)]
+#[derive(Resource, Debug, Clone, Default)]
 pub struct WeatherSfxTable {
     pub entries: [WeatherSfxEntry; 20],
-}
-
-impl Default for WeatherSfxTable {
-    fn default() -> Self {
-        // All `None` — see module docs for why we don't ship guessed
-        // ids for weather. Bind via mutating this resource at
-        // runtime (or a future /weather_bind slash command).
-        Self {
-            entries: [WeatherSfxEntry::default(); 20],
-        }
-    }
 }
 
 impl WeatherSfxTable {
@@ -1592,10 +1550,12 @@ mod tests {
         // and the test is about dispatch behavior, not which slots
         // happen to be populated.
         let mut app = App::new();
-        let mut table = SystemSfxTable::default();
-        table.zone_changed = Some(7001);
-        table.low_hp = Some(7002);
-        table.engaged_by = Some(7003);
+        let table = SystemSfxTable {
+            zone_changed: Some(7001),
+            low_hp: Some(7002),
+            engaged_by: Some(7003),
+            ..Default::default()
+        };
         // tell_received stays None — Reconnected stays None too —
         // both should be silent below.
         app.add_message::<SfxEvent>()
@@ -1754,8 +1714,10 @@ mod tests {
         app.init_asset::<PcmAudio>();
         // Override the resolved install root so the test uses the
         // env-supplied path even if the default resolver missed.
-        let mut slots = BgmSlots::default();
-        slots.install_root = Some(std::path::PathBuf::from(install));
+        let slots = BgmSlots {
+            install_root: Some(std::path::PathBuf::from(install)),
+            ..Default::default()
+        };
         app.insert_resource(slots)
             .init_resource::<EventLog>()
             .init_resource::<BgmPlaybackState>()

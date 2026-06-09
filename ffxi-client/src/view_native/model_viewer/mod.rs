@@ -19,16 +19,16 @@ use ffxi_viewer_core::combat_stance::{
 };
 use ffxi_viewer_core::components::WorldEntity;
 use ffxi_viewer_core::dat_vos2::{
-    enumerate_vos2_chunks, process_load_vos2_requests, tick_skinned_actors,
-    LoadVos2Request, SkinnedActor,
+    enumerate_vos2_chunks, process_load_vos2_requests, tick_skinned_actors, LoadVos2Request,
+    SkinnedActor,
 };
 use ffxi_viewer_core::look_resolver::{npc_dat_id, resolve_equipment_slot, resolve_face};
 use ffxi_viewer_core::scene::{BakedActor, TrackedEntities};
 use ffxi_viewer_core::snapshot::SceneState;
 use ffxi_viewer_wire::EntityKind;
 
-use super::widgets;
 use super::launcher_backdrop::PREVIEW_RENDER_LAYER;
+use super::widgets;
 
 mod panel;
 
@@ -88,16 +88,11 @@ const TURNTABLE_RAD_PER_SEC: f32 = 0.3;
 const REBAKE_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Which input set the form is showing: PC equipment vs. NPC modelid.
-#[derive(Resource, Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Resource, Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum ViewerMode {
+    #[default]
     Pc,
     Npc,
-}
-
-impl Default for ViewerMode {
-    fn default() -> Self {
-        ViewerMode::Pc
-    }
 }
 
 /// The currently-displayed PC inputs. Edited by [`panel`] via
@@ -209,22 +204,26 @@ pub fn run(args: ModelViewerArgs) -> Result<()> {
     // default and the slot/race/face fields fall back to the form's
     // built-in defaults whenever a flag was omitted.
     let mut pc_form = PcForm::default();
-    if let Some(v) = race { pc_form.race = v; }
-    if let Some(v) = face { pc_form.face = v; }
-    let mut apply = |dst: &mut u16, src: Option<String>, name: &str| {
+    if let Some(v) = race {
+        pc_form.race = v;
+    }
+    if let Some(v) = face {
+        pc_form.face = v;
+    }
+    let apply = |dst: &mut u16, src: Option<String>, name: &str| {
         let Some(s) = src else { return };
         match parse_id_lenient(&s) {
             Some(v) => *dst = v,
             None => warn!("model viewer: ignoring --{name}={s:?} (not a u16)"),
         }
     };
-    apply(&mut pc_form.head,   head,   "head");
-    apply(&mut pc_form.body,   body,   "body");
-    apply(&mut pc_form.hands,  hands,  "hands");
-    apply(&mut pc_form.legs,   legs,   "legs");
-    apply(&mut pc_form.feet,   feet,   "feet");
-    apply(&mut pc_form.main,   main,   "main");
-    apply(&mut pc_form.sub,    sub,    "sub");
+    apply(&mut pc_form.head, head, "head");
+    apply(&mut pc_form.body, body, "body");
+    apply(&mut pc_form.hands, hands, "hands");
+    apply(&mut pc_form.legs, legs, "legs");
+    apply(&mut pc_form.feet, feet, "feet");
+    apply(&mut pc_form.main, main, "main");
+    apply(&mut pc_form.sub, sub, "sub");
     apply(&mut pc_form.ranged, ranged, "ranged");
 
     let mut npc_form = NpcForm::default();
@@ -235,7 +234,9 @@ pub fn run(args: ModelViewerArgs) -> Result<()> {
                 ViewerMode::Npc
             }
             None => {
-                warn!("model viewer: ignoring --model-id={s:?} (not a u16); falling back to PC mode");
+                warn!(
+                    "model viewer: ignoring --model-id={s:?} (not a u16); falling back to PC mode"
+                );
                 ViewerMode::Pc
             }
         }
@@ -341,7 +342,11 @@ pub fn run(args: ModelViewerArgs) -> Result<()> {
     Ok(())
 }
 
-fn spawn_static_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<StandardMaterial>>) {
+fn spawn_static_scene(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
     // Root carries the camera + lights so we can keep them across
     // rebakes (rebake despawns `PreviewParent` only).
     let root = commands
@@ -474,9 +479,7 @@ fn do_rebake(
             // missed the face mesh entirely. Match `spawn_equipped`'s
             // pass-1 loop: enumerate per-DAT, dispatch one request
             // per chunk.
-            let Some(skel) = pc_race_to_skel(pc.race) else {
-                return None;
-            };
+            let skel = pc_race_to_skel(pc.race)?;
             let mut dispatch_dat = |file_id: u32| {
                 let chunks = enumerate_vos2_chunks(file_id);
                 if chunks.is_empty() {
@@ -501,7 +504,9 @@ fn do_rebake(
                     "model viewer: resolve_face returned None"
                 );
             }
-            for slot_id in [pc.head, pc.body, pc.hands, pc.legs, pc.feet, pc.main, pc.sub, pc.ranged] {
+            for slot_id in [
+                pc.head, pc.body, pc.hands, pc.legs, pc.feet, pc.main, pc.sub, pc.ranged,
+            ] {
                 let Some(file_id) = resolve_equipment_slot(slot_id, pc.race) else {
                     continue;
                 };
@@ -647,7 +652,9 @@ fn tag_preview_meshes(
     // Walk up until we hit either the PreviewParent (then the mesh is
     // part of the bake) or the world root.
     for _ in 0..32 {
-        let Ok(child_of) = parents.get(cur) else { break };
+        let Ok(child_of) = parents.get(cur) else {
+            break;
+        };
         let parent = child_of.parent();
         if preview_parents.contains(parent) || skinned.contains(parent) {
             commands

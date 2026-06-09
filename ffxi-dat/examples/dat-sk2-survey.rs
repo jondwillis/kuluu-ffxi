@@ -11,9 +11,9 @@
 //!   FFXI_DAT_PATH=... cargo run -p ffxi-dat --example dat-sk2-survey -- <file_id> [chunk_idx]
 //!
 //! Known-good targets for character work:
-//!   - 13746            Kuu Mohzolhil body — equipment file, chunk[1]
-//!                      should be the slot's Sk2 (per look_resolver doc)
-//!   - 7072 chunk 70    hum_ humanoid skeleton (per bone.rs module doc)
+//!   - 13746 — Kuu Mohzolhil body (equipment file, chunk[1] should be the
+//!     slot's Sk2, per look_resolver doc)
+//!   - 7072 chunk 70 — hum_ humanoid skeleton (per bone.rs module doc)
 //!
 //! If `chunk_idx` is supplied, only that chunk is dumped; otherwise
 //! every 0x29 chunk in the file is dumped.
@@ -113,7 +113,7 @@ fn dump_sk2(chunk_idx: usize, body: &[u8]) {
     );
     println!("  payload bytes after header = {payload}  → bytes-per-bone candidates:");
     for stride in [48usize, 56, 64, 80] {
-        if count > 0 && payload % stride == 0 && payload / stride == count as usize {
+        if count > 0 && payload.is_multiple_of(stride) && payload / stride == count as usize {
             println!("    EXACT MATCH: stride={stride}  (count*stride == payload)");
         } else if count > 0 {
             let extra = payload as i64 - count as i64 * stride as i64;

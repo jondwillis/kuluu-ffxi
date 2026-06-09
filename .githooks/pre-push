@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Pre-push gate that mirrors .github/workflows/ci.yml so a red CI is caught
+# locally before the push. Checks the working tree (what you'd push next).
+#
+# Bypass once:   git push --no-verify
+# Bypass via env: SKIP_PREPUSH=1 git push
+# Skip the slow clippy pass: PREPUSH_FAST=1 git push   (runs fmt only)
+#
+# Install (per clone): scripts/install-hooks.sh   (sets core.hooksPath=.githooks)
+set -euo pipefail
+
+if [[ "${SKIP_PREPUSH:-}" == "1" ]]; then
+  echo "pre-push: skipped (SKIP_PREPUSH=1)"
+  exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Delegate the actual fmt/clippy invocation to the shared script so this gate
+# and CI run byte-identical flags. A green hook therefore proves a green CI
+# fmt/clippy. (The hook stops at clippy for speed; clippy --all-targets still
+# compiles the tests, so broken constructors surface — it just doesn't run them.)
+if ! scripts/checks.sh fmt; then
+  echo "pre-push: ✗ formatting — run 'cargo fmt --all' (or 'git push --no-verify' to bypass)" >&2
+  exit 1
+fi
+
+if [[ "${PREPUSH_FAST:-}" == "1" ]]; then
+  echo "pre-push: ok (fmt only; PREPUSH_FAST=1)"
+  exit 0
+fi
+
+if ! scripts/checks.sh clippy; then
+  echo "pre-push: ✗ clippy — fix the warnings above (or 'git push --no-verify' to bypass)" >&2
+  exit 1
+fi
+
+echo "pre-push: ok"

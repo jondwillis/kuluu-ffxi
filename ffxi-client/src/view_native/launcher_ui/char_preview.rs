@@ -23,10 +23,14 @@
 //! camera there — the UI's `padding: right(40px)` keeps the column
 //! clear of the model.
 
-use bevy::prelude::*;
 use bevy::camera::visibility::RenderLayers;
+use bevy::prelude::*;
+use bevy::tasks::futures_lite::future;
+use bevy::tasks::{AsyncComputeTaskPool, Task};
 use ffxi_client::lobby_client::CharSlot;
-use ffxi_viewer_core::dat_vos2::spawn_equipped;
+use ffxi_viewer_core::dat_vos2::{
+    prepare_equipped, spawn_equipped, spawn_prepared_equipped, PreparedEquipped,
+};
 
 use super::{char_list::CharCursor, CharListData};
 use crate::view_native::launcher_backdrop::PREVIEW_RENDER_LAYER;
@@ -54,6 +58,17 @@ pub(super) struct PreviewedSlot {
     pub char_id: Option<u32>,
 }
 
+/// In-flight background bake of the cursored character. The `u32` is
+/// the target `char_id`; [`poll_pending_preview`] compares it against
+/// the current cursor when the task lands and drops stale results from
+/// rapid cursor movement. Loading the face + up to 8 equipment DATs is
+/// 100–500 ms of synchronous IO/parse, so it runs on an
+/// `AsyncComputeTaskPool` task instead of blocking the main thread.
+#[derive(Resource, Default)]
+pub(super) struct PendingPreview {
+    pub task: Option<(u32, Task<PreparedEquipped>)>,
+}
+
 const PREVIEW_PARENT_POS: Vec3 = Vec3::new(-1.4, 0.0, 0.0);
 /// Camera position relative to the preview parent.
 ///
@@ -67,15 +82,14 @@ const PREVIEW_CAMERA_OFFSET: Vec3 = Vec3::new(0.0, 1.3, 3.5);
 /// rule-of-thirds composition.
 const PREVIEW_LOOK_AT_OFFSET: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 
-pub(super) fn spawn_preview(
-    mut commands: Commands,
-    chars: Res<CharListData>,
-    cursor: Res<CharCursor>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-) {
+pub(super) fn spawn_preview(mut commands: Commands) {
+    // Start with no previewed character + no pending task. The first
+    // `refresh_preview_on_cursor_change` Update frame sees
+    // `previewed.char_id == None != active.char_id` and kicks the
+    // initial bake on a background task — so even the first preview is
+    // non-blocking, identical to every cursor move after it.
     commands.insert_resource(PreviewedSlot::default());
+    commands.insert_resource(PendingPreview::default());
 
     // Root entity owns the whole subgraph — camera, light, parent.
     // Needs Transform + Visibility so children inherit GlobalTransform
@@ -180,21 +194,7 @@ pub(super) fn spawn_preview(
             ChildOf(root),
         ))
         .id();
-
-    // Initial spawn for whichever slot the cursor lands on.
-    if let Some(slot) = active_slot(&chars, &cursor) {
-        spawn_for_slot(
-            &mut commands,
-            parent,
-            slot,
-            &mut meshes,
-            &mut materials,
-            &mut images,
-        );
-        commands.insert_resource(PreviewedSlot {
-            char_id: Some(slot.char_id),
-        });
-    }
+    let _ = parent; // populated asynchronously by `poll_pending_preview`
 }
 
 /// Tag every mesh spawned under `CharPreviewParent` (transitively)
@@ -235,6 +235,7 @@ pub(super) fn despawn_preview(
         commands.entity(e).despawn();
     }
     commands.remove_resource::<PreviewedSlot>();
+    commands.remove_resource::<PendingPreview>();
 }
 
 /// Refresh the preview when the cursor moves to a different
@@ -246,10 +247,8 @@ pub(super) fn refresh_preview_on_cursor_change(
     chars: Res<CharListData>,
     cursor: Res<CharCursor>,
     mut previewed: ResMut<PreviewedSlot>,
+    mut pending: ResMut<PendingPreview>,
     q_parent: Query<(Entity, Option<&Children>), With<CharPreviewParent>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
 ) {
     // No `cursor.is_changed()` gate here. Hover-driven cursor updates
     // (from the click/hover handler) should also force a refresh; the
@@ -262,27 +261,91 @@ pub(super) fn refresh_preview_on_cursor_change(
     if new_id == previewed.char_id {
         return;
     }
-    let Ok((parent, kids)) = q_parent.single() else {
+    let Ok((_parent, kids)) = q_parent.single() else {
         return;
     };
-    // Despawn the existing equipment meshes (children of the
-    // preview parent). Leaves camera + lights intact.
+    // Despawn the existing equipment meshes (children of the preview
+    // parent) immediately, so the old character clears even while the
+    // new bake is still running on the task pool. Leaves camera +
+    // lights intact.
     if let Some(kids) = kids {
         for child in kids.iter() {
             commands.entity(child).despawn();
         }
     }
-    if let Some(slot) = active {
-        spawn_for_slot(
+    // Kick the new bake on a background task. The new-char row and
+    // empty/dummy slots (`race == 0`, all-zero `TC_OPERATION_MAKE`)
+    // render nothing — clear any in-flight task instead of baking.
+    match active {
+        Some(slot) if slot.race != 0 => {
+            let (race, face, head, body, hands, legs, feet, main, sub, ranged) = (
+                slot.race,
+                slot.face,
+                slot.head,
+                slot.body,
+                slot.hands,
+                slot.legs,
+                slot.feet,
+                slot.main,
+                slot.sub,
+                slot.ranged,
+            );
+            let char_id = slot.char_id;
+            let task = AsyncComputeTaskPool::get().spawn(async move {
+                prepare_equipped(race, face, head, body, hands, legs, feet, main, sub, ranged)
+            });
+            pending.task = Some((char_id, task));
+        }
+        _ => pending.task = None,
+    }
+    previewed.char_id = new_id;
+}
+
+/// Poll the in-flight preview bake. When the task lands, spawn its
+/// meshes under `CharPreviewParent` — but only if the cursor is still
+/// on the character the task baked (rapid cursor movement supersedes
+/// stale bakes). Non-blocking: `poll_once` returns `None` while the
+/// task is still running. The `tag_preview_meshes` observer applies
+/// the render layer regardless of which frame the meshes spawn.
+pub(super) fn poll_pending_preview(
+    mut commands: Commands,
+    chars: Res<CharListData>,
+    cursor: Res<CharCursor>,
+    mut pending: ResMut<PendingPreview>,
+    q_parent: Query<Entity, With<CharPreviewParent>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    // Advance the task one poll without blocking; `ready` is owned
+    // (the future's output moves out), so the `as_mut` borrow ends
+    // before we `take()` below.
+    let ready = match pending.task.as_mut() {
+        Some((_, task)) => future::block_on(future::poll_once(task)),
+        None => return,
+    };
+    let Some(prepared) = ready else {
+        return; // still running
+    };
+    let (target_id, _) = pending.task.take().expect("task present when ready");
+    // Staleness guard: if the cursor moved to a different character
+    // while this bake ran, drop the result. A fresh task for the
+    // current slot is already in flight (refresh kicked it), or
+    // `previewed.char_id` already matches and none is needed.
+    if active_slot(&chars, &cursor).map(|s| s.char_id) != Some(target_id) {
+        return;
+    }
+    if let Ok(parent) = q_parent.single() {
+        let spawned = spawn_prepared_equipped(
             &mut commands,
-            parent,
-            slot,
             &mut meshes,
             &mut materials,
             &mut images,
+            parent,
+            &prepared,
         );
+        debug!("char preview: char_id={target_id} equipment_slots_spawned={spawned}");
     }
-    previewed.char_id = new_id;
 }
 
 /// Pick the character slot the cursor is currently on, or `None`
@@ -311,57 +374,4 @@ pub(super) fn spawn_preview_pc(
     spawn_equipped(
         commands, meshes, materials, images, parent, race, face, 0, 0, 0, 0, 0, 0, 0, 0,
     )
-}
-
-/// Call `spawn_equipped` for a single slot, gated on race != 0.
-/// Empty/dummy chr_info2 slots arrive with all-zero
-/// `TC_OPERATION_MAKE`; rendering them would spawn 8 empty meshes
-/// (each `resolve_equipment_slot(0, 0)` returns None) — harmless
-/// but noisy in logs. The `race == 0` gate avoids that.
-fn spawn_for_slot(
-    commands: &mut Commands,
-    parent: Entity,
-    slot: &CharSlot,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-    images: &mut Assets<Image>,
-) {
-    if slot.race == 0 {
-        return;
-    }
-    let spawned = spawn_equipped(
-        commands,
-        meshes,
-        materials,
-        images,
-        parent,
-        slot.race,
-        slot.face,
-        slot.head,
-        slot.body,
-        slot.hands,
-        slot.legs,
-        slot.feet,
-        slot.main,
-        slot.sub,
-        slot.ranged,
-    );
-    info!(
-        "char preview: char_id={} race={} face={} \
-         head=0x{:04X} body=0x{:04X} hands=0x{:04X} legs=0x{:04X} \
-         feet=0x{:04X} main=0x{:04X} sub=0x{:04X} ranged=0x{:04X} \
-         equipment_slots_spawned={}",
-        slot.char_id,
-        slot.race,
-        slot.face,
-        slot.head,
-        slot.body,
-        slot.hands,
-        slot.legs,
-        slot.feet,
-        slot.main,
-        slot.sub,
-        slot.ranged,
-        spawned,
-    );
 }

@@ -94,8 +94,9 @@ impl Default for ReactorConfig {
 
 /// Active high-level intent. `Idle` produces no per-tick output. Each
 /// non-idle variant is what the agent / LLM committed to last.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Goal {
+    #[default]
     Idle,
     Following {
         target_id: u32,
@@ -126,12 +127,6 @@ pub enum Goal {
         threshold: u8,
         mog_house_zoneline: u32,
     },
-}
-
-impl Default for Goal {
-    fn default() -> Self {
-        Goal::Idle
-    }
 }
 
 /// Project the reactor's internal `Goal` into the serializable
@@ -390,9 +385,10 @@ impl Reactor {
                     .collect();
                 // The first waypoint coincides with `from`; skip it so
                 // the agent starts moving toward the next corner.
-                if waypoints.first().map_or(false, |w| {
-                    horizontal_distance(*w, cur) < self.cfg.max_step_per_tick
-                }) {
+                if waypoints
+                    .first()
+                    .is_some_and(|w| horizontal_distance(*w, cur) < self.cfg.max_step_per_tick)
+                {
                     waypoints.remove(0);
                 }
                 // Off-mesh last-mile: Detour's `find_straight_path`
@@ -2661,12 +2657,7 @@ mod tests {
         let out = r.tick();
         assert_eq!(out.commands.len(), 1, "exactly one Move emitted per tick");
         match &out.commands[0] {
-            AgentCommand::Move {
-                x,
-                y,
-                z,
-                heading,
-            } => {
+            AgentCommand::Move { x, y, z, heading } => {
                 assert!((x - 0.5).abs() < 1e-3, "lerp reached target.x");
                 assert!(y.abs() < 1e-3);
                 assert!(z.abs() < 1e-3);

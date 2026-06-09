@@ -26,23 +26,20 @@ pub fn decode_interleaved(data: &[u8], h: &AudioHeader) -> Result<Vec<f32>> {
 
     for block_i in 0..blocks {
         let base = block_i * bytes_per_block;
-        for ch in 0..channels {
+        for (ch, chan) in per_channel.iter_mut().enumerate() {
             let chunk_base = base + ch * bytes_per_channel_block;
             for s in 0..block_size {
                 let off = chunk_base + s * 2;
                 let val = i16::from_le_bytes([data[off], data[off + 1]]);
-                per_channel[ch].push(val as f32 / 32768.0);
+                chan.push(val as f32 / 32768.0);
             }
         }
     }
 
     let frames = per_channel.iter().map(|v| v.len()).min().unwrap_or(0);
     let mut out = Vec::with_capacity(frames * channels);
-    for i in 0..frames {
-        for ch in 0..channels {
-            out.push(per_channel[ch][i]);
-        }
-    }
+    // Frame-interleave: emit frame i of every channel before advancing.
+    out.extend((0..frames).flat_map(|i| per_channel.iter().map(move |c| c[i])));
     Ok(out)
 }
 

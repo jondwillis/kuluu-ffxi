@@ -105,9 +105,13 @@
 //! geometry_offset)`:
 //!   - `matrix_offset` → 16 consecutive f32s, a 4×4 row-major affine
 //!     where column 3 is translation:
-//!       p_world.x = m[0]*x + m[4]*y + m[8]*z  + m[12]
-//!       p_world.y = m[1]*x + m[5]*y + m[9]*z  + m[13]
-//!       p_world.z = m[2]*x + m[6]*y + m[10]*z + m[14]
+//!
+//!     ```text
+//!     p_world.x = m[0]*x + m[4]*y + m[8]*z  + m[12]
+//!     p_world.y = m[1]*x + m[5]*y + m[9]*z  + m[13]
+//!     p_world.z = m[2]*x + m[6]*y + m[10]*z + m[14]
+//!     ```
+//!
 //!     (i.e. m[0..4]=column 0, m[12..16]=column 3 = translation).
 //!   - `geometry_offset` → an MzbMesh record (same on-disk layout as
 //!     the mesh-library entries). Many grid cells can reuse the same
@@ -734,9 +738,9 @@ pub fn parse_placements(body: &[u8], header: &MzbHeader) -> Result<Vec<MzbPlacem
 
                 // 16 f32s, on-disk order.
                 let mut m = [0.0f32; 16];
-                for k in 0..16 {
+                for (k, slot) in m.iter_mut().enumerate() {
                     let o = mat_off + k * 4;
-                    m[k] = f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+                    *slot = f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
                 }
 
                 // Determinant of the 3×3 linear part. Per the
@@ -1086,8 +1090,8 @@ mod tests {
         //          material bit 2), n0=0|0x8000 (material bit 3)
         //          → indices [0,2,3], material=0b1100=12, is_barrier=true.
         let tris: [[u16; 4]; 2] = [
-            [0 | 0x8000, 1 | 0x4000, 2, 0],
-            [0, 2, 3 | 0x4000 | 0x8000, 0 | 0x8000],
+            [0x8000, 1 | 0x4000, 2, 0],
+            [0, 2, 3 | 0x4000 | 0x8000, 0x8000],
         ];
         for (i, t) in tris.iter().enumerate() {
             let o = 0x7C + i * 8;

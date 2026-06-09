@@ -208,7 +208,7 @@ fn u32_to_rgba(c: u32) -> [f32; 4] {
 fn parse_time_name(name: &[u8; 4]) -> Result<u32> {
     let mut acc = 0u32;
     for &b in name {
-        if !(b'0'..=b'9').contains(&b) {
+        if !b.is_ascii_digit() {
             return Err(WeatherError::BadTimeName(*name).into());
         }
         acc = acc * 10 + (b - b'0') as u32;

@@ -217,7 +217,7 @@ pub fn entry_count(kind: MenuKind, dynamic: &DynamicMenu) -> usize {
 /// Label for a given menu screen + cursor index. For dynamic menus the
 /// label comes from `DynamicMenu.rows[idx].label`; out-of-range
 /// returns `"<unknown>"` rather than panicking.
-pub fn entry_label<'a>(kind: MenuKind, idx: usize, dynamic: &'a DynamicMenu) -> &'a str {
+pub fn entry_label(kind: MenuKind, idx: usize, dynamic: &DynamicMenu) -> &str {
     if is_dynamic(kind) {
         if dynamic.rows.is_empty() {
             return empty_dynamic_hint(kind);
@@ -282,9 +282,32 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
     }
 }
 
+/// Title-row label for a given menu screen. The root menu reads
+/// "Commands" to mirror vanilla FFXI's main command list; submenus name
+/// the screen they're on. Returned as a `&'static str` so the per-frame
+/// renderer can compare without allocating.
+fn menu_title(kind: MenuKind) -> &'static str {
+    match kind {
+        MenuKind::Root => "Commands",
+        MenuKind::Config => "Config",
+        MenuKind::Graphics => "Graphics",
+        MenuKind::Equipment => "Equipment",
+        MenuKind::Magic => "Magic",
+        MenuKind::Abilities => "Abilities",
+        MenuKind::Items => "Items",
+        MenuKind::EquipSlot(_) => "Equip",
+    }
+}
+
 /// Marker on the menu root.
 #[derive(Component)]
 pub struct MainMenu;
+
+/// Marker on the title row (top child of the menu). Carries no data —
+/// the per-frame `update_main_menu` writes the screen name (e.g.
+/// "Commands" for [`MenuKind::Root`]) into its [`Text`].
+#[derive(Component)]
+pub struct MainMenuTitle;
 
 /// Marker on each menu row. `slot` is the row index 0..entries.len().
 #[derive(Component)]
@@ -327,6 +350,18 @@ pub fn spawn_main_menu(mut commands: Commands) {
             BorderColor::all(palette::ACCENT),
         ))
         .with_children(|p| {
+            // Title row — spawned first so it's the top child and renders
+            // above the row pool. `update_main_menu` writes the active
+            // screen name (e.g. "Commands" for Root) into it each frame.
+            p.spawn((
+                MainMenuTitle,
+                Text::new(""),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(palette::ACCENT),
+            ));
             // Spawn the maximum-sized row pool once. The update system
             // hides rows past `entry_count(kind)` per frame so smaller
             // submenus (Config has 5 entries, Root has 9) don't leave
@@ -503,7 +538,8 @@ pub fn update_main_menu(
     scene: Res<crate::snapshot::SceneState>,
     dynamic: Res<DynamicMenu>,
     mut menu_q: Query<&mut Node, (With<MainMenu>, Without<MainMenuRow>)>,
-    mut row_q: Query<(&MainMenuRow, &mut Node, &mut Text, &mut TextColor)>,
+    mut row_q: Query<(&MainMenuRow, &mut Node, &mut Text, &mut TextColor), Without<MainMenuTitle>>,
+    mut title_q: Query<&mut Text, (With<MainMenuTitle>, Without<MainMenuRow>)>,
 ) {
     let Ok(mut node) = menu_q.single_mut() else {
         return;
@@ -520,6 +556,14 @@ pub fn update_main_menu(
     match active {
         Some((kind, c)) => {
             node.display = Display::Flex;
+            // Refresh the title row from the active screen, writing only
+            // on change to avoid churning Bevy's text layout each frame.
+            if let Ok(mut text) = title_q.single_mut() {
+                let want = menu_title(kind);
+                if **text != *want {
+                    **text = want.to_string();
+                }
+            }
             // Dynamic submenus (Magic / Abilities) get viewport
             // windowing — the row pool size is fixed, the list can be
             // larger, so we slide a window of `DYNAMIC_VISIBLE_ROWS`

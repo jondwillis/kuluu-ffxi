@@ -1277,9 +1277,7 @@ fn handle_sub_packet(
             // 0x0AA: 128-byte bitmap of learned spells. Collapse into
             // a sorted `Vec<u16>` of ids the HUD can iterate.
             if let Ok(m) = decode::MagicData::decode(sub.data) {
-                let _ = event_tx.send(AgentEvent::SpellsKnownUpdated {
-                    ids: m.known_ids(),
-                });
+                let _ = event_tx.send(AgentEvent::SpellsKnownUpdated { ids: m.known_ids() });
             }
         }
         op if op == s2c::COMMAND_DATA => {
@@ -2090,7 +2088,7 @@ async fn keepalive_loop(
                     server_last_seq = header.id_and_size;
                     for sub in framing::walk_sub_packets(&buf[framing::FFXI_HEADER_SIZE..]).flatten() {
                         if sub.opcode == ffxi_proto::map::s2c::LOGOUT {
-                            if let Some(logout) = decode::ServerLogout::decode(sub.data).ok() {
+                            if let Ok(logout) = decode::ServerLogout::decode(sub.data) {
                                 if logout.is_zone_change() {
                                     let new_addr = parse_logout_addr(&logout, map.server_addr());
                                     let _ = event_tx.send(AgentEvent::ZoneChanged {
@@ -2793,9 +2791,7 @@ fn synth_check_line(
     match message_num {
         170..=178 => Some(render_check_mob(message_num, data1, data2, tar_name)),
 
-        712 => Some(format!(
-            "Main weapon — Accuracy: {data1}, Attack: {data2}."
-        )),
+        712 => Some(format!("Main weapon — Accuracy: {data1}, Attack: {data2}.")),
         713 => {
             if data1 == 0 && data2 == 0 {
                 Some("Auxiliary weapon: none equipped.".to_string())
@@ -3303,8 +3299,8 @@ fn decode_miscdata_status_icons(data: &[u8]) -> Option<Vec<u16>> {
     Some(out)
 }
 
-/// `GP_CLI_COMMAND_SHOP_BUY` (0x083) builder. 4-byte sub-packet header
-/// + 12-byte body = 16 bytes (size_words = 4).
+/// `GP_CLI_COMMAND_SHOP_BUY` (0x083) builder. 4-byte sub-packet header +
+/// 12-byte body = 16 bytes (size_words = 4).
 ///
 /// Body per `vendor/server/src/map/packets/c2s/0x083_shop_buy.h`:
 ///   u32 ItemNum (qty), u16 ShopNo, u16 ShopItemIndex,
@@ -3486,8 +3482,8 @@ fn build_subpacket_event_end(
     buf
 }
 
-/// `GP_CLI_COMMAND_ACTION` (0x01A) — 4-byte header + 4 UniqueNo + 2 ActIndex
-/// + 2 ActionID + 16 ActionBuf = 28 bytes (size_words=7). The `ActionKind`
+/// `GP_CLI_COMMAND_ACTION` (0x01A) — 4-byte header + 4 UniqueNo + 2 ActIndex +
+/// 2 ActionID + 16 ActionBuf = 28 bytes (size_words=7). The `ActionKind`
 /// determines both the wire `ActionID` and the layout of the 16-byte buf
 /// (see `ActionKind::fill_action_buf`).
 pub fn build_subpacket_action(
@@ -3507,8 +3503,8 @@ pub fn build_subpacket_action(
     buf
 }
 
-/// `GP_CLI_COMMAND_ITEM_USE` (0x037) — 4-byte header + 4 UniqueNo + 4 ItemNum
-/// + 2 ActIndex + 1 PropertyItemIndex + 1 padding00 + 4 Category = 20 bytes
+/// `GP_CLI_COMMAND_ITEM_USE` (0x037) — 4-byte header + 4 UniqueNo + 4 ItemNum +
+/// 2 ActIndex + 1 PropertyItemIndex + 1 padding00 + 4 Category = 20 bytes
 /// (size_words=5). Per Phoenix/src/map/packets/c2s/0x037_item_use.cpp the
 /// server validates `ItemNum == 0` and looks up the item via
 /// `getStorage(Category)->GetItem(PropertyItemIndex)`, then resolves the
@@ -3516,10 +3512,11 @@ pub fn build_subpacket_action(
 ///
 /// - `unique_no`  → wire `UniqueNo`     = recipient UniqueNo (self for potions).
 /// - `act_index`  → wire `ActIndex`     = recipient ActIndex.
-/// - `category`   → wire `Category`     = container id (0 LOC_INVENTORY,
-///                                                     1 LOC_TEMPITEMS, …).
+/// - `category`   → wire `Category`     = container id
+///   (0 LOC_INVENTORY, 1 LOC_TEMPITEMS, …).
 /// - `slot`       → wire `PropertyItemIndex` = slot index within the container.
 /// - `ItemNum`    → forced to 0 (server enforces).
+///
 /// `GP_CLI_COMMAND_EQUIP_INSPECT` (0x0DD) — `/check` and friends. 4-byte
 /// header + 4 UniqueNo + 4 ActIndex + 1 Kind + 3 padding = 16 bytes
 /// (size_words=4). `kind` is `0=Check, 1=CheckName, 2=CheckParam` per
@@ -3689,8 +3686,8 @@ fn party_member_from_attrs(
     }
 }
 
-/// `GP_CLI_COMMAND_MAPRECT` (0x05E) — 4-byte header + RectID(4) + x/y/z(12)
-/// + ActIndex(2) + MyRoomExitBit(1) + MyRoomExitMode(1) = 24 bytes
+/// `GP_CLI_COMMAND_MAPRECT` (0x05E) — 4-byte header + RectID(4) + x/y/z(12) +
+/// ActIndex(2) + MyRoomExitBit(1) + MyRoomExitMode(1) = 24 bytes
 /// (size_words=6). Wire field order is (x, y, z) — note this differs from
 /// 0x015 POS (x, z, y).
 ///
@@ -3855,9 +3852,7 @@ fn should_emit_pos(
     pos_delta_yalms: f32,
     heading_changed: bool,
 ) -> bool {
-    elapsed >= MOVE_EMISSION_PERIOD
-        || pos_delta_yalms > MOVE_BIG_JUMP_YALMS
-        || heading_changed
+    elapsed >= MOVE_EMISSION_PERIOD || pos_delta_yalms > MOVE_BIG_JUMP_YALMS || heading_changed
 }
 
 #[cfg(test)]
@@ -3977,10 +3972,7 @@ mod tests {
         // ~13 yalms apart — snap (zone teleport).
         let local = v(0.0, 0.0, 0.0);
         let server = v(12.0, 5.0, 0.0); // distance 13
-        assert_eq!(
-            reconcile_self_pos(local, server),
-            SelfPosReconcile::Snap,
-        );
+        assert_eq!(reconcile_self_pos(local, server), SelfPosReconcile::Snap,);
     }
 
     #[test]
@@ -4565,14 +4557,14 @@ mod tests {
                 (1u64 << bits) - 1
             };
             let shifted = (value & mask) << bit_in_byte;
-            let cover = (total_bits + 7) / 8;
+            let cover = total_bits.div_ceil(8);
             for i in 0..cover {
                 self.data[byte_offset + i] |= ((shifted >> (i * 8)) & 0xFF) as u8;
             }
             self.pos += bits as usize;
         }
         fn into_bytes(self) -> Vec<u8> {
-            let used = (self.pos + 7) / 8;
+            let used = self.pos.div_ceil(8);
             self.data[..used].to_vec()
         }
     }
@@ -4767,7 +4759,7 @@ mod tests {
         // workSize byte itself). The bitstream begins at bit 8 and ends
         // at the current writer position; round up to bytes.
         let bitstream_bits = data.len() * 8 - 8;
-        data[0] = ((bitstream_bits + 7) / 8) as u8;
+        data[0] = bitstream_bits.div_ceil(8) as u8;
 
         let mut cache = HashMap::new();
         cache.insert(0xCAFEu32, "Daisy".to_string());
@@ -4802,13 +4794,7 @@ mod tests {
     /// Build a 0x029 BattleMessage body for a synth-decoded id (Check
     /// or Checkparam family) so the helper paths can be exercised
     /// end-to-end through `decode_battle_message`.
-    fn check_message(
-        message_num: u16,
-        data1: u32,
-        data2: u32,
-        cas: u32,
-        tar: u32,
-    ) -> Vec<u8> {
+    fn check_message(message_num: u16, data1: u32, data2: u32, cas: u32, tar: u32) -> Vec<u8> {
         let mut data = vec![0u8; 24];
         data[0..4].copy_from_slice(&cas.to_le_bytes());
         data[4..8].copy_from_slice(&tar.to_le_bytes());

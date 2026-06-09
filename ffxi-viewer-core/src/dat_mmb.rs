@@ -67,6 +67,43 @@ pub struct MmbHandleCache {
         std::collections::HashMap<(u32, usize, usize), bevy::asset::Handle<StandardMaterial>>,
 }
 
+/// Cross-frame backlog of pending [`LoadMmbRequest`]s. A city zone-in
+/// fires ~1000+ requests in one frame; draining them all at once locks
+/// the main thread for hundreds of ms. [`process_load_mmb_requests`]
+/// instead enqueues here and drains a bounded budget per frame, so the
+/// zone fills in progressively over a handful of frames. Cleared on
+/// `OnExit(AppPhase::InGame)` so a re-zone doesn't pop the old zone's
+/// backlog into the new one.
+#[derive(Resource, Default)]
+pub struct MmbLoadQueue {
+    pub pending: std::collections::VecDeque<LoadMmbRequest>,
+}
+
+/// One parsed [`LoadedMmb`] per `(file_id, chunk_idx)`, persisted across
+/// frames. Lifting the former per-frame cache to app lifetime preserves
+/// the per-asset parse-once dedup now that draining spans frames — a
+/// request popped in frame N+5 for a file parsed in frame N is still a
+/// cache hit. `None` marks a load that failed (don't retry every pop).
+#[derive(Resource, Default)]
+pub struct MmbParseCache {
+    pub by_asset: std::collections::HashMap<(u32, usize), Option<LoadedMmb>>,
+}
+
+/// Per-DAT decoded-texture pool (`name → image handle`, plus a first-IMG
+/// fallback), persisted across frames for the same reason as
+/// [`MmbParseCache`] — build the IMG pool once per `file_id` regardless
+/// of which frame each MMB from that file is drained.
+#[derive(Resource, Default)]
+pub struct MmbTexPools {
+    pub by_file: std::collections::HashMap<
+        u32,
+        (
+            std::collections::HashMap<String, Handle<Image>>,
+            Option<Handle<Image>>,
+        ),
+    >,
+}
+
 /// Spawn-an-MMB request. Fired by the slash-command dispatcher;
 /// consumed by [`process_load_mmb_requests`].
 ///
@@ -111,6 +148,9 @@ impl Plugin for DatOverlayPlugin {
             .add_message::<crate::dat_vos2::LoadVos2Request>()
             .add_message::<crate::dat_mzb::LoadMzbRequest>()
             .init_resource::<MmbHandleCache>()
+            .init_resource::<MmbLoadQueue>()
+            .init_resource::<MmbParseCache>()
+            .init_resource::<MmbTexPools>()
             .init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
             .init_resource::<crate::dat_mzb::DrawDistance>()
             .init_resource::<crate::dat_mzb::MzbCollisionGeometry>()
@@ -461,32 +501,30 @@ pub fn process_load_mmb_requests(
     mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     tracked: Res<TrackedEntities>,
     mut handle_cache: ResMut<MmbHandleCache>,
+    mut queue: ResMut<MmbLoadQueue>,
+    mut parse_cache: ResMut<MmbParseCache>,
+    mut tex_pools_res: ResMut<MmbTexPools>,
 ) {
-    // Collect events up front so we can dedupe per-file IO. A zone-in
-    // for a city like Bastok Markets fires ~1000+ events that all hit
-    // one file_id; parsing each MMB chunk + decoding the IMG pool once
-    // (instead of once per event) is the difference between a CPU lock
-    // and a one-frame hitch.
-    let queued: Vec<LoadMmbRequest> = events.read().copied().collect();
-    if queued.is_empty() {
+    // Enqueue this frame's new requests at the back of the backlog. A
+    // zone-in for a city like Bastok Markets fires ~1000+ events that
+    // all hit one file_id; draining them all in one frame is the CPU
+    // lock we're avoiding, so we spread the work across frames below.
+    queue.pending.extend(events.read().copied());
+    if queue.pending.is_empty() {
         return;
     }
 
-    // Tracks which (file_id, chunk_idx) MMBs we've already emitted a
-    // "MMB texture pool" diagnostic for in this frame. Without this
-    // the log fires once per zone-load placement (thousands of times
-    // for a city); with it, exactly once per unique asset per frame.
+    // Per-frame dedup for the "MMB texture pool" diagnostic below. Each
+    // unique asset is popped exactly once across all frames, so a
+    // frame-local set still logs each asset ~once — no need to persist.
     let mut mmb_logged: std::collections::HashSet<(u32, usize)> = std::collections::HashSet::new();
-
-    // Cache one LoadedMmb per (file_id, chunk_idx).
-    let mut mmb_cache: std::collections::HashMap<(u32, usize), Option<LoadedMmb>> =
-        std::collections::HashMap::new();
 
     // DIAG-zonegeom: remove after fix. Aggregator for the sibling
     // diagnostic in build_zone_mmb_spawns — counts and exemplars of
     // zero-submesh MMBs per file_id (cause (B) candidates: clod-style
     // sub-records mis-parsed). Gated on `FFXI_DIAG_ZONE_GEOM` exactly
     // like the MZB-side diag (file_id direct, or `=all`/`=*`/`=any`).
+    // Now reports per-frame slices since draining spans frames.
     let diag_file_id: Option<u32> = match std::env::var("FFXI_DIAG_ZONE_GEOM") {
         Ok(s) if s == "*" || s == "all" || s.eq_ignore_ascii_case("any") => Some(u32::MAX),
         Ok(s) => s.parse::<u32>().ok(),
@@ -504,20 +542,31 @@ pub fn process_load_mmb_requests(
             None => false,
         }
     };
-    // Cache image handles per file_id (each IMG chunk in a DAT is
-    // shared across all MMBs from that file).
-    // Per-DAT pool: name → image handle, plus a first-IMG fallback
-    // for submeshes whose texture name doesn't appear in the pool.
-    let mut tex_pools: std::collections::HashMap<
-        u32,
-        (
-            std::collections::HashMap<String, Handle<Image>>,
-            Option<Handle<Image>>,
-        ),
-    > = std::collections::HashMap::new();
 
-    for req in queued {
-        let loaded_entry = mmb_cache
+    // Weighted per-frame budget. A cold parse (cache miss → fs::read +
+    // XOR-decrypt + parse + IMG decode) costs `HEAVY`; a warm cache-hit
+    // spawn costs 1. So a frame does ~6 cold loads OR ~48 warm spawns,
+    // and a ~1000-MMB city zone fills in over ~20 frames (~0.3 s @60fps)
+    // with no single-frame hitch. A count budget (not a wall-clock
+    // `Instant`) because the per-file cache makes per-request cost
+    // bimodal — a count is predictable and testable, where a time
+    // budget would make the spawn count frame-rate-dependent.
+    const MMB_SPAWN_BUDGET: usize = 48;
+    const HEAVY: usize = 8;
+    let mut work = 0usize;
+
+    while work < MMB_SPAWN_BUDGET {
+        let Some(req) = queue.pending.pop_front() else {
+            break;
+        };
+        // Count the work before any early-`continue` so a cold load that
+        // fails or yields zero submeshes still draws down the budget.
+        let was_cached = parse_cache
+            .by_asset
+            .contains_key(&(req.file_id, req.chunk_idx));
+        work += if was_cached { 1 } else { HEAVY };
+        let loaded_entry = parse_cache
+            .by_asset
             .entry((req.file_id, req.chunk_idx))
             .or_insert_with(|| load_mmb(req.file_id, req.chunk_idx).ok());
         let Some(loaded) = loaded_entry.as_ref() else {
@@ -569,7 +618,7 @@ pub fn process_load_mmb_requests(
         // body's internal name (`extract_texture_name`). Submeshes that
         // don't match fall back to the first IMG or no texture.
         let texture_count = loaded.textures.len();
-        let pool = tex_pools.entry(req.file_id).or_insert_with(|| {
+        let pool = tex_pools_res.by_file.entry(req.file_id).or_insert_with(|| {
             let mut by_name: std::collections::HashMap<String, Handle<Image>> =
                 std::collections::HashMap::with_capacity(texture_count);
             let mut first: Option<Handle<Image>> = None;

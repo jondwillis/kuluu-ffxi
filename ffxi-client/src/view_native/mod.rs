@@ -60,7 +60,9 @@ use tokio::runtime::Handle as RtHandle;
 use crate::launcher::Defaults;
 
 use self::bridge::NativeSource;
-use self::input::{AutoRun, CameraAutoRecenter, CommandTx, HeadingTurnAccum, LocalPlayerPrediction};
+use self::input::{
+    AutoRun, CameraAutoRecenter, CommandTx, HeadingTurnAccum, LocalPlayerPrediction,
+};
 use self::launcher_ui::{LoginErrorMsg, PendingConnect};
 
 /// Top-level phase of the unified native `App`.
@@ -249,6 +251,12 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         .insert_resource(ffxi_viewer_core::minimap::retail::MinimapDatRoot(
             dat_root.clone(),
         ))
+        // Same Arc again for the status-icon ribbon: it resolves the
+        // status-icon sheet (file_id 87, ROM/119/57.DAT) to a disk path.
+        // Without it the ribbon falls back to numeric chips.
+        .insert_resource(ffxi_viewer_core::hud::status_ribbon::StatusIconDatRoot(
+            dat_root.clone(),
+        ))
         .insert_resource(DatRootRes(dat_root));
     #[cfg(unix)]
     app.insert_resource(AgentListen(agent_listen));
@@ -298,7 +306,11 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // despawn in `launcher_ui/mod.rs:437`.
     app.add_systems(
         OnExit(AppPhase::InGame),
-        (despawn_ingame_entities, drain_mzb_load_state),
+        (
+            despawn_ingame_entities,
+            drain_mzb_load_state,
+            drain_mmb_load_state,
+        ),
     );
 
     // Keybinds: load persisted preset+overrides from disk before plugins
@@ -458,10 +470,21 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // only affecting next frame's input. The amplified yaw-rotation
     // jitter (camera, text, nameplate apparent motion) was the
     // visible symptom of that frame lag.
+    //
+    // `.before(update_nameplate_billboards_system)`: the billboard
+    // orients + distance-scales itself against the camera Transform it
+    // reads this frame. This clamp overwrites that Transform every
+    // frame (it re-derives `anchor + dir * effective`, discarding the
+    // chase lerp), so a billboard that ran *before* the clamp faced a
+    // stale lerp-intermediate camera while the renderer used the
+    // clamped one. The gap is widest while the player moves (the chase
+    // lerp trails most then) and flickered as scheduler order varied —
+    // the visible "nameplate catches up / jitters while moving" bug.
     app.add_systems(
         Update,
         camera_collision::clamp_chase_camera_to_collision
             .after(ffxi_viewer_core::chase_camera_system)
+            .before(ffxi_viewer_core::nameplate_billboard::update_nameplate_billboards_system)
             .run_if(in_state(AppPhase::InGame)),
     );
 
@@ -675,6 +698,33 @@ fn drain_mzb_load_state(
             dropped_tasks,
             dropped_cache,
             "OnExit(InGame): drained MZB-load state",
+        );
+    }
+}
+
+/// Sibling of [`drain_mzb_load_state`] for the MMB side. Clears the
+/// per-frame load backlog (else the old zone's queued placements would
+/// pop into the new zone after a fast re-zone) plus the cross-frame
+/// parse/texture caches and the mesh/material handle cache. Wiping
+/// `MmbHandleCache` here also makes good on `dat_mmb.rs`'s long-standing
+/// doc claim that it's evicted on `OnExit(AppPhase::InGame)` — until now
+/// nothing actually did so.
+fn drain_mmb_load_state(
+    mut queue: ResMut<ffxi_viewer_core::dat_mmb::MmbLoadQueue>,
+    mut parse_cache: ResMut<ffxi_viewer_core::dat_mmb::MmbParseCache>,
+    mut tex_pools: ResMut<ffxi_viewer_core::dat_mmb::MmbTexPools>,
+    mut handle_cache: ResMut<ffxi_viewer_core::dat_mmb::MmbHandleCache>,
+) {
+    let dropped_queued = queue.pending.len();
+    queue.pending.clear();
+    parse_cache.by_asset.clear();
+    tex_pools.by_file.clear();
+    handle_cache.mesh.clear();
+    handle_cache.material.clear();
+    if dropped_queued > 0 {
+        tracing::info!(
+            dropped_queued,
+            "OnExit(InGame): drained MMB-load backlog + caches",
         );
     }
 }

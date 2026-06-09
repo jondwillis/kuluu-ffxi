@@ -52,9 +52,8 @@ pub fn decrypt_in_place(data: &mut [u8]) -> Result<()> {
         let key_seed = keys::KEY_TABLE[(data[5] ^ 0xf0) as usize] as i32;
         let mut key: i32 = key_seed;
         let mut key_count: i32 = 0;
-        let len = data.len();
 
-        for pos in 8..len {
+        for byte in data.iter_mut().skip(8) {
             // C# (signed int 32 arithmetic; we mirror with i32):
             //   x = ((key & 0xFF) << 8) | (key & 0xFF)
             //   key += ++keyCount
@@ -69,7 +68,7 @@ pub fn decrypt_in_place(data: &mut [u8]) -> Result<()> {
             // Per C#: `(byte)(x >> shift)` — C# `>>` on int is arithmetic, but
             // since x is non-negative (max 0xFFFF) this matches a logical shift.
             let mask = ((x >> shift) & 0xFF) as u8;
-            data[pos] ^= mask;
+            *byte ^= mask;
 
             key_count = key_count.wrapping_add(1);
             key = key.wrapping_add(key_count);
@@ -255,7 +254,7 @@ impl<'a> MmbSubRecord<'a> {
     /// "tag + variant" headers. Two real-world tag patterns:
     ///   - `"model   <variant>"` — kabu-style accessory MMBs
     ///   - `"<prefix>   <variant>"` — clod-style cloth MMBs (prefix
-    ///                                 matches the asset shortname)
+    ///     matches the asset shortname)
     ///
     /// Detection: at a 16-byte aligned offset, the first 4 bytes are
     /// ASCII alphanumerics/underscore/space and the byte at offset+16
@@ -586,12 +585,11 @@ pub struct MmbModel {
 ///     * if `offsetBlockHeader != 0`: that's the first block; any
 ///       additional pointers come from the 4..N words between offset
 ///       64 and offsetBlockHeader.
-///   - For each piece: SMMBBlockHeader(32 B) = numModel(4) +
-///     6×f32(24) + numFace(4). Followed by `numModel` inline
-///     SMMBModelHeader records (20 B each), each immediately
-///     followed by `vertexsize × Vertex` and then a u16 num_indices
-///     + 2 B pad + indices (u16 × num_indices), plus an odd-pad u16
-///     if num_indices is odd.
+///   - For each piece: SMMBBlockHeader(32 B) = numModel(4) + 6×f32(24) +
+///     numFace(4). Followed by `numModel` inline SMMBModelHeader records
+///     (20 B each), each immediately followed by `vertexsize × Vertex` and
+///     then a u16 num_indices + 2 B pad + indices (u16 × num_indices), plus
+///     an odd-pad u16 if num_indices is odd.
 pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
     const SMMB_HEAD_SIZE: usize = 16;
     const SMMB_HEADER_SIZE: usize = 48; // imgID(16)+pieces(4)+bbox(24)+offset(4)
@@ -821,7 +819,7 @@ pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
             // d3==2); otherwise triangle-strip. Convert strip → list
             // inline so the downstream renderer doesn't need to know.
             let mut indices: Vec<u16> = Vec::new();
-            let is_list = is_v1 || (!is_v1 && d3 == 2);
+            let is_list = is_v1 || d3 == 2;
             if off + num_indices * 2 > decrypted.len() {
                 break;
             }
@@ -850,7 +848,7 @@ pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
                 }
             }
             off += num_indices * 2;
-            if num_indices % 2 != 0 {
+            if !num_indices.is_multiple_of(2) {
                 off += 2; // odd-pad align
             }
 

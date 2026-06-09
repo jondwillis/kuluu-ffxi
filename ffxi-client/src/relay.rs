@@ -131,6 +131,9 @@ pub async fn serve(
 
 /// Per-connection driver. Holds its own subscribers; a slow consumer
 /// only affects its own queue.
+// The accept_hdr_async callback's `Result<Response, ErrorResponse>` is dictated
+// by tungstenite's API, so the large Err variant is unavoidable here.
+#[allow(clippy::result_large_err)]
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -274,11 +277,11 @@ where
     let msg = match format {
         WireFormat::Postcard => {
             let bytes = postcard::to_allocvec(frame).context("postcard encoding Frame")?;
-            Message::Binary(bytes.into())
+            Message::Binary(bytes)
         }
         WireFormat::Json => {
             let s = serde_json::to_string(frame).context("json encoding Frame")?;
-            Message::Text(s.into())
+            Message::Text(s)
         }
     };
     sink.send(msg).await.context("sending websocket frame")?;

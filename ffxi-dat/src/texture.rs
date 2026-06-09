@@ -91,11 +91,11 @@ pub struct DecodedTexture {
 /// name); we return just the name portion (last 8 bytes, space-trimmed).
 /// Returns `None` if the body is too short or `flg != 0xA1`.
 pub fn extract_texture_name(body: &[u8]) -> Option<String> {
-    if body.len() < 0x11 || body[0] != 0xA1 {
+    if body.len() < imginfo::NAME_END || body[0] != imginfo::FLG_DXT {
         return None;
     }
-    // id[16] sits at body[1..0x11]. The last 8 bytes are the asset name.
-    let raw = &body[9..0x11];
+    // id[16] sits at body[1..NAME_END]. The last 8 bytes are the asset name.
+    let raw = &body[9..imginfo::NAME_END];
     let s: String = raw
         .iter()
         .map(|&b| {
@@ -108,6 +108,30 @@ pub fn extract_texture_name(body: &[u8]) -> Option<String> {
         .take_while(|&c| c != '\0')
         .collect();
     Some(s.trim().to_string())
+}
+
+/// On-disk offsets and discriminants for the IMG chunk header. The decoders
+/// ([`decode_imginfo_a1`], [`decode_palettized`]) and the round-trip test all
+/// reference these names so the framing is defined exactly once — a stray edit
+/// can no longer drift the test away from the code it exercises. Field-by-field
+/// meanings are tabulated on [`decode_texture`].
+mod imginfo {
+    /// `flg` discriminant for the DXT-compressed variant.
+    pub(super) const FLG_DXT: u8 = 0xA1;
+    /// End of the `id[16]` name field (`flg` byte + 16 bytes).
+    pub(super) const NAME_END: usize = 0x11;
+    /// `imgx` (width), i32 LE.
+    pub(super) const WIDTH_OFF: usize = 0x15;
+    /// `imgy` (height), i32 LE — also the end of the width field.
+    pub(super) const HEIGHT_OFF: usize = 0x19;
+    /// End of the height field.
+    pub(super) const DIMS_END: usize = 0x1D;
+    /// `ddsType` FourCC ("1TXD"/"3TXD"/"5TXD", reversed).
+    pub(super) const MAGIC_OFF: usize = 0x39;
+    /// End of the FourCC.
+    pub(super) const MAGIC_END: usize = 0x3D;
+    /// `sizeof(IMGINFOA1)` — first byte of DXT pixel data.
+    pub(super) const HEADER_SIZE: usize = 0x45;
 }
 
 /// Errors raised by the texture pixel-decode path.
@@ -141,18 +165,18 @@ pub fn find_texture_format(body: &[u8]) -> Result<Option<(usize, TexFormat)>> {
 /// Decode an FFXI IMG chunk body into top-mip RGBA8 pixels.
 ///
 /// Body layout for `flg=0xA1` (DXT-compressed, the variant used by zone
-/// IMG chunks in MZB/MMB-bearing DATs):
-///   - 0x00:        flg byte (0xA1 here)
+/// IMG chunks in MZB/MMB-bearing DATs). Named offsets live in [`imginfo`]:
+///   - 0x00:        flg byte (`FLG_DXT` = 0xA1 here)
 ///   - 0x01..0x11:  id[16] — ASCII texture name (e.g. `"model   s_bas_h"`)
 ///   - 0x11..0x15:  dwnazo1 DWORD (purpose unknown)
-///   - 0x15..0x19:  imgx (width) i32 LE
-///   - 0x19..0x1D:  imgy (height) i32 LE
+///   - 0x15..0x19:  imgx (width) i32 LE          (`WIDTH_OFF..HEIGHT_OFF`)
+///   - 0x19..0x1D:  imgy (height) i32 LE         (`HEIGHT_OFF..DIMS_END`)
 ///   - 0x1D..0x35:  dwnazo2[6] (24 bytes, purpose unknown)
 ///   - 0x35..0x39:  widthbyte DWORD
-///   - 0x39..0x3D:  ddsType FourCC: `"3TXD"`/`"1TXD"`/`"5TXD"` reversed
+///   - 0x39..0x3D:  ddsType FourCC `"1TXD"`/`"3TXD"`/`"5TXD"` (`MAGIC_OFF..MAGIC_END`)
 ///   - 0x3D..0x41:  size DWORD — pixel-data byte count
 ///   - 0x41..0x45:  noBlock DWORD
-///   - 0x45..:      pixel data (`size` bytes, then padding to chunk end)
+///   - 0x45..:      pixel data (`HEADER_SIZE`..; `size` bytes + padding)
 ///
 /// `sizeof(IMGINFOA1) = 69` (0x45). DXT3 sample verifies: a 128×256
 /// chunk has body 32848 = 69 header + 32768 pixels (= 128*256 bytes for
@@ -165,7 +189,7 @@ pub fn decode_texture(body: &[u8]) -> std::result::Result<DecodedTexture, Textur
         return Err(TextureError::NoMagic);
     }
     match body[0] {
-        0xA1 => decode_imginfo_a1(body),
+        imginfo::FLG_DXT => decode_imginfo_a1(body),
         0x01 | 0x81 | 0x91 => decode_palettized(body, 0x39, 0x439),
         0xB1 => decode_palettized(body, 0x3D, 0x43D),
         // 0x05 (IMGINFO05, no embedded palette) and unknown flg values
@@ -179,15 +203,23 @@ pub fn decode_texture(body: &[u8]) -> std::result::Result<DecodedTexture, Textur
 /// DXT-compressed IMGINFOA1 layout. See [`decode_texture`] for the
 /// per-field offset table; this branch handles `flg = 0xA1`.
 fn decode_imginfo_a1(body: &[u8]) -> std::result::Result<DecodedTexture, TextureError> {
-    if body.len() < 0x45 {
+    if body.len() < imginfo::HEADER_SIZE {
         return Err(TextureError::Truncated {
             offset: 0,
-            needed: 0x45,
+            needed: imginfo::HEADER_SIZE,
             available: body.len(),
         });
     }
-    let width = i32::from_le_bytes(body[0x15..0x19].try_into().unwrap());
-    let height = i32::from_le_bytes(body[0x19..0x1D].try_into().unwrap());
+    let width = i32::from_le_bytes(
+        body[imginfo::WIDTH_OFF..imginfo::HEIGHT_OFF]
+            .try_into()
+            .unwrap(),
+    );
+    let height = i32::from_le_bytes(
+        body[imginfo::HEIGHT_OFF..imginfo::DIMS_END]
+            .try_into()
+            .unwrap(),
+    );
     if width <= 0 || height <= 0 {
         return Err(TextureError::BadDimensions {
             width: width as u32,
@@ -197,9 +229,9 @@ fn decode_imginfo_a1(body: &[u8]) -> std::result::Result<DecodedTexture, Texture
     let width = width as u32;
     let height = height as u32;
 
-    let magic = &body[0x39..0x3D];
+    let magic = &body[imginfo::MAGIC_OFF..imginfo::MAGIC_END];
     let fmt = TexFormat::from_magic(magic).ok_or(TextureError::NoMagic)?;
-    let pixel_off = 0x45usize;
+    let pixel_off = imginfo::HEADER_SIZE;
     let pixels = &body[pixel_off..];
     let rgba = match fmt {
         TexFormat::Dxt1 => decode_dxt1_blocks(pixels, width, height)?,
@@ -235,8 +267,16 @@ fn decode_palettized(
             available: body.len(),
         });
     }
-    let width = i32::from_le_bytes(body[0x15..0x19].try_into().unwrap());
-    let height = i32::from_le_bytes(body[0x19..0x1D].try_into().unwrap());
+    let width = i32::from_le_bytes(
+        body[imginfo::WIDTH_OFF..imginfo::HEIGHT_OFF]
+            .try_into()
+            .unwrap(),
+    );
+    let height = i32::from_le_bytes(
+        body[imginfo::HEIGHT_OFF..imginfo::DIMS_END]
+            .try_into()
+            .unwrap(),
+    );
     if width <= 0 || height <= 0 {
         return Err(TextureError::BadDimensions {
             width: width as u32,
@@ -383,7 +423,7 @@ fn decode_dxt_common(
     block_size: usize,
     mut block_decode: impl FnMut(&[u8], &mut [u8; 64]),
 ) -> std::result::Result<Vec<u8>, TextureError> {
-    if width == 0 || height == 0 || width % 4 != 0 || height % 4 != 0 {
+    if width == 0 || height == 0 || !width.is_multiple_of(4) || !height.is_multiple_of(4) {
         return Err(TextureError::BadDimensions { width, height });
     }
     let (w, h) = (width as usize, height as usize);
@@ -579,7 +619,7 @@ mod tests {
         // Pixel (2,0): index 0 → red.
         assert_eq!(&rgba[8..12], &[255, 0, 0, 255]);
         // Pixel (0,1): row 1 col 0 — index 0 → red.
-        let row1_col0 = (1 * 4 + 0) * 4;
+        let row1_col0 = 4 * 4;
         assert_eq!(&rgba[row1_col0..row1_col0 + 4], &[255, 0, 0, 255]);
     }
 
@@ -662,12 +702,15 @@ mod tests {
 
     #[test]
     fn decode_texture_dxt1_round_trip() {
-        // Synthesize a body that matches the documented (spec-based)
-        // FFXI framing: magic + u32 width + u32 height + DXT1 blocks.
-        let mut body = Vec::new();
-        body.extend_from_slice(b"1TXD");
-        body.extend_from_slice(&4u32.to_le_bytes());
-        body.extend_from_slice(&4u32.to_le_bytes());
+        // Build a minimal IMGINFOA1 (flg 0xA1) body using the same named
+        // offsets the decoder reads, so the framing is asserted from a single
+        // source of truth instead of duplicated magic numbers.
+        use imginfo::*;
+        let mut body = vec![0u8; HEADER_SIZE];
+        body[0] = FLG_DXT;
+        body[WIDTH_OFF..HEIGHT_OFF].copy_from_slice(&4i32.to_le_bytes());
+        body[HEIGHT_OFF..DIMS_END].copy_from_slice(&4i32.to_le_bytes());
+        body[MAGIC_OFF..MAGIC_END].copy_from_slice(b"1TXD");
         body.extend_from_slice(&dxt1_red_blue_block());
         let dec = decode_texture(&body).unwrap();
         assert_eq!(dec.width, 4);

@@ -85,9 +85,7 @@ fn main() -> Result<()> {
     s.push_str("//\n");
     s.push_str("// License of source data: GPL-3.0 (LandSandBoat/FFXI-NavMesh-Builder)\n");
     s.push_str("//                         GPL-3.0-or-later (LandSandBoat/server)\n\n");
-    s.push_str(&format!(
-        "/// `(zone_id, file_id)` pairs, sorted by `zone_id` for binary search.\n"
-    ));
+    s.push_str("/// `(zone_id, file_id)` pairs, sorted by `zone_id` for binary search.\n");
     s.push_str("pub const ZONE_DAT_TABLE: &[(u16, u32)] = &[\n");
     for (zid, fid) in &rows {
         s.push_str(&format!("    ({zid}, {fid}),\n"));

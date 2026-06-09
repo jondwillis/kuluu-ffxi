@@ -58,8 +58,8 @@ fn main() -> ExitCode {
     println!("file size      {} bytes", bytes.len());
     println!();
     println!(
-        "{:>5}  {:>8}  {:6}  {:>4}  {:>10}  {}",
-        "idx", "offset", "name", "kind", "body_len", "preview"
+        "{:>5}  {:>8}  {:6}  {:>4}  {:>10}  preview",
+        "idx", "offset", "name", "kind", "body_len"
     );
 
     let mut idx = 0;

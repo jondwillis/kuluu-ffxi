@@ -312,6 +312,12 @@ pub fn text_input_system(
                     *mode = next;
                 }
             }
+            InputMode::TargetAction(_state) => {
+                // The TargetAction mode's foundation types (hud::action_model,
+                // hud::overlay, TargetActionState) have landed but its key
+                // handler has not. Nothing transitions into this mode yet, so
+                // ignore keys here until `handle_target_action_key` exists.
+            }
         }
     }
 }
@@ -406,12 +412,12 @@ const AUTO_TARGET_RADIUS: f32 = 8.0;
 /// matching the retail FFXI muscle memory of "step up, press Enter."
 /// Self is excluded via `self_id` so Enter doesn't silently target
 /// the player's own entity.
-fn nearest_targetable<'a>(
-    entities: &'a [ffxi_viewer_wire::Entity],
+fn nearest_targetable(
+    entities: &[ffxi_viewer_wire::Entity],
     self_pos: ffxi_viewer_wire::Vec3,
     self_id: Option<u32>,
     radius: f32,
-) -> Option<&'a ffxi_viewer_wire::Entity> {
+) -> Option<&ffxi_viewer_wire::Entity> {
     let r2 = radius * radius;
     entities
         .iter()
@@ -473,8 +479,6 @@ fn handle_chat_key(key: &Key, bindings: &Bindings, buffer: &mut ChatBuffer) -> C
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn apply_chat_action(
     action: ChatAction,
     mode: &mut InputMode,
@@ -699,8 +703,8 @@ fn apply_slash_outcome(
             push_system_chat_line(scene_state, format!("weather override: {w:?}"));
         }
         SlashOutcome::SetSitStance(toggle) => {
-            use ffxi_viewer_core::combat_stance::RestKind;
             use crate::view_native::slash_commands::SitToggle;
+            use ffxi_viewer_core::combat_stance::RestKind;
             let next = match toggle {
                 SitToggle::On => RestKind::Sit,
                 SitToggle::Off => RestKind::None,
@@ -954,18 +958,12 @@ fn apply_slash_outcome(
                     let sky = &*slash_writers.sky_realism;
                     let lines: Vec<String> = SkyFeature::ALL
                         .iter()
-                        .map(|(k, f)| {
-                            format!("  {}: {}", k, if f.get(sky) { "on" } else { "off" })
-                        })
+                        .map(|(k, f)| format!("  {}: {}", k, if f.get(sky) { "on" } else { "off" }))
                         .collect();
-                    push_system_chat_line(
-                        scene_state,
-                        format!("/sky:\n{}", lines.join("\n")),
-                    );
+                    push_system_chat_line(scene_state, format!("/sky:\n{}", lines.join("\n")));
                 }
                 SkyOp::Set { feature, value } => {
-                    let next =
-                        value.unwrap_or(!feature.get(&slash_writers.sky_realism));
+                    let next = value.unwrap_or(!feature.get(&slash_writers.sky_realism));
                     feature.set(&mut slash_writers.sky_realism, next);
                     push_system_chat_line(
                         scene_state,
@@ -1023,10 +1021,9 @@ fn apply_slash_outcome(
                             .minimap_state
                             .active_aabb(*slash_writers.minimap_mode),
                     );
-                    slash_writers.minimap_zoom.zoom_by(
-                        1.0 / ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR,
-                        half,
-                    );
+                    slash_writers
+                        .minimap_zoom
+                        .zoom_by(1.0 / ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR, half);
                     slash_writers.minimap_view.idle_frames = 0;
                     format_zoom_status(&slash_writers.minimap_zoom)
                 }
@@ -1054,8 +1051,7 @@ fn apply_slash_outcome(
                     format!("/minimap zoom: radius={clamped:.0} yalms")
                 }
                 MinimapOp::ZoomReset => {
-                    *slash_writers.minimap_zoom =
-                        ffxi_viewer_core::minimap::MinimapZoom::default();
+                    *slash_writers.minimap_zoom = ffxi_viewer_core::minimap::MinimapZoom::default();
                     slash_writers.minimap_view.pan_offset_xz = bevy::math::Vec2::ZERO;
                     slash_writers.minimap_view.idle_frames = 0;
                     "/minimap zoom: reset to defaults".into()
@@ -1207,9 +1203,7 @@ fn apply_slash_outcome(
                 // Enter). Include for exhaustiveness; format the
                 // slot id so a future direct-open slash surfaces a
                 // useful chat toast instead of `<unknown>`.
-                ffxi_viewer_core::MenuKind::EquipSlot(slot) => {
-                    format!("EquipSlot({slot})").into()
-                }
+                ffxi_viewer_core::MenuKind::EquipSlot(slot) => format!("EquipSlot({slot})").into(),
             };
             push_system_chat_line(scene_state, format!("[menu] opened {label}"));
         }
@@ -1539,10 +1533,7 @@ fn reqlogout_ack_text(cmd: &AgentCommand) -> Option<&'static str> {
 /// session loop also tracks `is_healing` for its own keepalive
 /// auto-cancel, but that's wire-side; this is the visual / input
 /// side. Non-Heal commands are no-ops.
-fn mirror_heal_stance(
-    cmd: &AgentCommand,
-    rest: &mut ffxi_viewer_core::combat_stance::RestStance,
-) {
+fn mirror_heal_stance(cmd: &AgentCommand, rest: &mut ffxi_viewer_core::combat_stance::RestStance) {
     use ffxi_viewer_core::combat_stance::RestKind;
     let AgentCommand::Heal { mode } = cmd else {
         return;
@@ -1696,15 +1687,15 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
         // four action submenus surfaces a chat hint pointing at the
         // staging plan, so an operator who finds the menus before
         // Stages 1–4 land knows what's still pending.
-        (MenuKind::Magic, _) => MenuDispatch::NotImplemented(
-            "Magic — pending Stage 2 (learned-spell decoder)".into(),
-        ),
+        (MenuKind::Magic, _) => {
+            MenuDispatch::NotImplemented("Magic — pending Stage 2 (learned-spell decoder)".into())
+        }
         (MenuKind::Abilities, _) => MenuDispatch::NotImplemented(
             "Abilities — pending Stage 2 (s2c 0x119 abil_recast)".into(),
         ),
-        (MenuKind::Items, _) => MenuDispatch::NotImplemented(
-            "Items — pending Stage 3 (inventory submenu)".into(),
-        ),
+        (MenuKind::Items, _) => {
+            MenuDispatch::NotImplemented("Items — pending Stage 3 (inventory submenu)".into())
+        }
         (MenuKind::Equipment, _) => MenuDispatch::NotImplemented(
             "Equipment — pending Stage 1 (s2c 0x050 equip_list)".into(),
         ),
@@ -1791,10 +1782,7 @@ fn confirm_menu_at_cursor(
             return Some(InputMode::World);
         }
         // Empty list (no spells / no abilities) — just toast.
-        push_system_chat_line(
-            scene_state,
-            format!("[menu] {kind:?} list is empty"),
-        );
+        push_system_chat_line(scene_state, format!("[menu] {kind:?} list is empty"));
         return None;
     }
     let label = ffxi_viewer_core::hud::menu::entry_label(kind, cursor, dynamic);
@@ -1975,11 +1963,7 @@ fn dispatch_dynamic_menu_action(
 /// Send `EndEventChoice` with the supplied choice index. Shared between
 /// the keyboard NavConfirm path and the mouse click on a numbered
 /// choice button.
-fn confirm_dialog_choice(
-    choice: u32,
-    scene_state: &mut SceneState,
-    cmd_tx: &Sender<AgentCommand>,
-) {
+fn confirm_dialog_choice(choice: u32, scene_state: &mut SceneState, cmd_tx: &Sender<AgentCommand>) {
     if let Some(d) = scene_state.snapshot.dialog.as_ref() {
         let _ = cmd_tx.try_send(AgentCommand::EndEventChoice {
             event_id: d.npc_id,
@@ -2554,18 +2538,11 @@ mod menu_dispatch_tests {
 
     #[test]
     fn unwired_root_entries_stay_not_implemented() {
-        // `Config` was wired up as a submenu in commit c4a9321 (preset
-        // switcher + `/keybinds list`); the test was not updated at
-        // the time. The remaining root entries below are still stubs.
-        for label in [
-            "Magic",
-            "Abilities",
-            "Items",
-            "Status",
-            "Party",
-            "Search",
-            "Macros",
-        ] {
+        // Config/Graphics — and now Magic/Abilities/Items/Equipment — open
+        // (still-stub) submenus, so they no longer resolve to NotImplemented at
+        // the root. The entries below have no submenu yet, so the root match
+        // falls through to NotImplemented.
+        for label in ["Status", "Party", "Search", "Macros"] {
             assert_eq!(
                 resolve_menu_entry(MenuKind::Root, label),
                 MenuDispatch::NotImplemented(label.into()),

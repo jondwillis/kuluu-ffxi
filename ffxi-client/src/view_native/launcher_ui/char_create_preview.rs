@@ -7,8 +7,8 @@
 
 use std::time::{Duration, Instant};
 
-use bevy::prelude::*;
 use bevy::camera::visibility::RenderLayers;
+use bevy::prelude::*;
 
 use super::char_preview::spawn_preview_pc;
 use super::{CharCreateForm, LauncherState};
@@ -193,20 +193,14 @@ fn spawn_preview(
     });
 }
 
-fn despawn_preview(
-    mut commands: Commands,
-    q_root: Query<Entity, With<CharCreatePreviewRoot>>,
-) {
+fn despawn_preview(mut commands: Commands, q_root: Query<Entity, With<CharCreatePreviewRoot>>) {
     for e in q_root.iter() {
         commands.entity(e).despawn();
     }
     commands.remove_resource::<PreviewRebakeState>();
 }
 
-fn mark_dirty_on_form_change(
-    form: Res<CharCreateForm>,
-    mut state: ResMut<PreviewRebakeState>,
-) {
+fn mark_dirty_on_form_change(form: Res<CharCreateForm>, mut state: ResMut<PreviewRebakeState>) {
     if !form.is_changed() {
         return;
     }
@@ -256,10 +250,7 @@ fn rebake_if_debounced(
     state.last_face = form.face;
 }
 
-fn turntable(
-    time: Res<Time>,
-    mut q: Query<&mut Transform, With<CharCreatePreviewTurntable>>,
-) {
+fn turntable(time: Res<Time>, mut q: Query<&mut Transform, With<CharCreatePreviewTurntable>>) {
     let delta = TURNTABLE_RAD_PER_SEC * time.delta_secs();
     for mut t in q.iter_mut() {
         t.rotation = Quat::from_rotation_y(delta) * t.rotation;

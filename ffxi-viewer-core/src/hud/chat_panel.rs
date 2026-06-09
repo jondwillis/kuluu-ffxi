@@ -776,9 +776,7 @@ pub fn apply_wheel_delta(
     let next = (current as i32 + whole).clamp(0, max_rows);
     // Reset the accumulator at the bounds — otherwise the user has to
     // "spend" all the over-scroll before motion resumes the other way.
-    let frac = if next == 0 && whole < 0 {
-        0.0
-    } else if next == max_rows && whole > 0 {
+    let frac = if (next == 0 && whole < 0) || (next == max_rows && whole > 0) {
         0.0
     } else {
         frac
@@ -1181,8 +1179,8 @@ mod tests {
         // A single small delta below the sensitivity threshold should
         // not move the cursor yet — it banks into the accumulator. The
         // very next equivalent delta crosses 1.0 and steps.
-        // WHEEL_ROWS_PER_UNIT = 0.25, so a delta of 1.0 banks 0.25
-        // rows, well under 1.
+        // WHEEL_ROWS_PER_UNIT is well under 1, so a single delta of 1.0
+        // banks a fractional row, under the 1-row step threshold.
         let (rows, accum) = apply_wheel_delta(0, 0.0, 1.0, 100);
         assert_eq!(rows, 0);
         assert!(accum > 0.0 && accum < 1.0);
@@ -1190,13 +1188,16 @@ mod tests {
 
     #[test]
     fn accumulator_eventually_spends_a_row() {
-        // Repeated small deltas accumulate to a whole row.
-        // With WHEEL_ROWS_PER_UNIT = 0.25, 4 ticks of delta=1.0 sum
-        // to a full row.
-        let (rows, accum) = apply_wheel_delta(0, 0.0, 1.0, 100);
-        let (rows, accum) = apply_wheel_delta(rows, accum, 1.0, 100);
-        let (rows, accum) = apply_wheel_delta(rows, accum, 1.0, 100);
-        let (rows, _accum) = apply_wheel_delta(rows, accum, 1.0, 100);
+        // Repeated small deltas accumulate to a whole row. Derive the tick
+        // count from WHEEL_ROWS_PER_UNIT so the test stays correct if the
+        // sensitivity constant changes (delta=1.0 banks that many rows/tick).
+        let ticks = (1.0 / WHEEL_ROWS_PER_UNIT).ceil() as usize;
+        let mut rows = 0;
+        let mut accum = 0.0;
+        for _ in 0..ticks {
+            (rows, accum) = apply_wheel_delta(rows, accum, 1.0, 100);
+        }
+        let _ = accum;
         assert_eq!(rows, 1);
     }
 

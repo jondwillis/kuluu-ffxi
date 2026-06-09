@@ -219,7 +219,10 @@ pub fn mouse_camera_system(
     let mode = *camera_mode;
     let drag_active = pointer.left || pointer.right;
     if drag_active && pointer.delta != Vec2::ZERO {
-        chase.yaw -= pointer.delta.x * MOUSE_YAW_SENS;
+        // Drag right (delta.x > 0) pans the view right; drag left pans left.
+        // `+=` matches the keyboard ←/→ yaw sign in `view_native::input` —
+        // the earlier `-=` read inverted (drag right turned the view left).
+        chase.yaw += pointer.delta.x * MOUSE_YAW_SENS;
         // Bevy delivers MouseMotion with `delta.y > 0` for downward cursor
         // motion; mouse-up should pitch up, hence the sign flip.
         let pitch_d = -pointer.delta.y * MOUSE_PITCH_SENS;
@@ -293,6 +296,7 @@ mod tests {
             .add_message::<MouseWheel>()
             .add_message::<CursorMoved>()
             .init_resource::<InputMode>()
+            .init_resource::<SceneState>()
             .add_plugins(MousePlugin);
 
         // Frame 1: send one motion + one wheel notch; expect both reflected.
@@ -330,6 +334,7 @@ mod tests {
             .add_message::<MouseWheel>()
             .add_message::<CursorMoved>()
             .init_resource::<InputMode>()
+            .init_resource::<SceneState>()
             .add_plugins(MousePlugin);
 
         app.world_mut().write_message(MouseButtonInput {
@@ -375,7 +380,8 @@ mod tests {
         app.update();
         assert_eq!(app.world().resource::<ChaseCamera>().yaw, initial_yaw);
 
-        // RMB held: yaw moves by -delta.x * MOUSE_YAW_SENS.
+        // RMB held: yaw moves by +delta.x * MOUSE_YAW_SENS (drag right
+        // pans the view right).
         let mut app = test_app();
         app.insert_resource(MousePointer {
             right: true,
@@ -388,17 +394,19 @@ mod tests {
         app.update();
         let yaw = app.world().resource::<ChaseCamera>().yaw;
         assert!(
-            (yaw - (initial_yaw - 20.0 * MOUSE_YAW_SENS)).abs() < 1e-6,
+            (yaw - (initial_yaw + 20.0 * MOUSE_YAW_SENS)).abs() < 1e-6,
             "yaw {yaw} should match expected after drag"
         );
     }
 
-    /// In first-person mode the cursor is locked, so any motion is
-    /// intentional — yaw/pitch update without requiring a button held.
+    /// First-person look is gated on a held button (RMB drag), same as
+    /// chase orbit — see the F8 doc in `view_native::input`. With the
+    /// button held, drag right (delta.x > 0) pans yaw right (+) and
+    /// mouse-up (delta.y < 0) pitches up.
     #[test]
-    fn mouse_camera_fp_freelook_no_button_required() {
+    fn mouse_camera_fp_freelook_drag() {
         let pointer = MousePointer {
-            right: false,
+            right: true,
             delta: Vec2::new(10.0, -10.0),
             ..Default::default()
         };
@@ -410,8 +418,8 @@ mod tests {
         app.update();
         let chase = app.world().resource::<ChaseCamera>();
         assert!(
-            (chase.yaw - (-10.0 * MOUSE_YAW_SENS)).abs() < 1e-6,
-            "FP yaw moves on motion alone"
+            (chase.yaw - (10.0 * MOUSE_YAW_SENS)).abs() < 1e-6,
+            "FP yaw moves +delta.x on drag"
         );
         // delta.y = -10 (mouse-up) → pitch += 10 * MOUSE_PITCH_SENS.
         assert!(
@@ -470,6 +478,10 @@ mod tests {
     fn test_app() -> App {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
+        // `mouse_camera_system` reads `SceneState` for the FP snap-back
+        // path; insert a default so the tests can drive the system without
+        // the full viewer scene.
+        app.insert_resource(SceneState::default());
         app
     }
 
@@ -487,6 +499,7 @@ mod tests {
             .add_message::<MouseWheel>()
             .add_message::<CursorMoved>()
             .insert_resource(InputMode::Chat(ChatBuffer::empty()))
+            .init_resource::<SceneState>()
             .add_plugins(MousePlugin);
 
         app.world_mut().write_message(MouseMotion {

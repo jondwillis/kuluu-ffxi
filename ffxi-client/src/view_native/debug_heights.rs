@@ -91,10 +91,7 @@ pub fn process_debug_heights(
         );
         let player_line = format!(
             "  player bevy (feet): x={:.2} y={:.2} z={:.2}  (baked={})",
-            player_t.translation.x,
-            player_t.translation.y,
-            player_t.translation.z,
-            has_baked,
+            player_t.translation.x, player_t.translation.y, player_t.translation.z, has_baked,
         );
         let mzb_line = match mzb_h_bevy {
             Some(h) => format!(
@@ -124,20 +121,17 @@ pub fn process_debug_heights(
             None => "  baked actor: <not loaded yet — capsule placeholder>".to_string(),
         };
 
-        push(&mut toasts,server_line);
-        push(&mut toasts,player_line);
-        push(&mut toasts,mzb_line);
-        push(&mut toasts,nav_line);
-        push(&mut toasts,nav_mzb_line);
-        push(&mut toasts,baked_line);
+        push(&mut toasts, server_line);
+        push(&mut toasts, player_line);
+        push(&mut toasts, mzb_line);
+        push(&mut toasts, nav_line);
+        push(&mut toasts, nav_mzb_line);
+        push(&mut toasts, baked_line);
 
         // Top-5 MZB hits with normal annotations — surfaces *why* the
         // snap chose a given tri (or rejected the actual floor).
         if ranked_hits.is_empty() {
-            push(
-                &mut toasts,
-                "  mzb hits @ player xz: <none>".to_string(),
-            );
+            push(&mut toasts, "  mzb hits @ player xz: <none>".to_string());
         } else {
             push(
                 &mut toasts,
@@ -172,9 +166,6 @@ pub fn process_debug_heights(
     }
 }
 
-fn push(
-    toasts: &mut MessageWriter<ffxi_viewer_core::snapshot::ToastEvent>,
-    text: String,
-) {
+fn push(toasts: &mut MessageWriter<ffxi_viewer_core::snapshot::ToastEvent>, text: String) {
     toasts.write(ffxi_viewer_core::snapshot::ToastEvent::debug(text));
 }

@@ -6,7 +6,6 @@
 //!   FFXI_DAT_PATH=... cargo run -p ffxi-dat --example dat-find-tba --release
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::path::Path;
 

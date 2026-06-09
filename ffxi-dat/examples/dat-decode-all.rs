@@ -93,7 +93,7 @@ fn main() -> ExitCode {
                     keyframes.len()
                 );
             }
-            _ => println!(""),
+            _ => println!(),
         }
     }
     if chunks.len() > 40 {

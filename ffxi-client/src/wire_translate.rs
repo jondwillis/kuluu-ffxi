@@ -94,6 +94,14 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         // Empty when the inventory mirror hasn't been initialised
         // yet (zone-in flood hasn't started).
         inventory_main: project_inventory_main(s),
+        // Stage 3 menu suite: char stats / bazaar / play-time are not
+        // yet folded out of SessionState, so emit the additive defaults.
+        // The producer-side fold lands these once the corresponding
+        // server packets (0x061 CHAR_STATS, bazaar, play-time) are
+        // mirrored; the wire schema is ready for them now.
+        stats: None,
+        bazaar: Vec::new(),
+        play_time_s: 0,
     }
 }
 
@@ -580,35 +588,37 @@ mod tests {
 
     #[test]
     fn state_to_snapshot_populates_v2_fields() {
-        // SessionState::default + manual writes to the four observability
-        // fields. The translator must surface every one of them.
-        let mut s = SessionState::default();
-        s.character = Some("Sylvie".into());
-        s.zone_id = Some(230);
-        s.current_goal = Some(ReactorGoalSnapshot::Engaged {
-            target_id: 0xCAFE,
-            attack_issued: true,
-        });
-        s.last_reconnect = Some(ReconnectInfo {
-            downtime_ms: 800,
-            at_unix_ms: 1_700_000_002_000,
-        });
-        s.recent_decisions = VecDeque::from(vec![
-            LlmDecision {
-                kind: LlmDecisionKind::NotificationFired {
-                    uri: "scene://current".into(),
+        // Set just the four observability fields; the translator must surface
+        // every one of them.
+        let s = SessionState {
+            character: Some("Sylvie".into()),
+            zone_id: Some(230),
+            current_goal: Some(ReactorGoalSnapshot::Engaged {
+                target_id: 0xCAFE,
+                attack_issued: true,
+            }),
+            last_reconnect: Some(ReconnectInfo {
+                downtime_ms: 800,
+                at_unix_ms: 1_700_000_002_000,
+            }),
+            recent_decisions: VecDeque::from(vec![
+                LlmDecision {
+                    kind: LlmDecisionKind::NotificationFired {
+                        uri: "scene://current".into(),
+                    },
+                    latency_us: 200,
+                    at_monotonic_ms: 100,
                 },
-                latency_us: 200,
-                at_monotonic_ms: 100,
-            },
-            LlmDecision {
-                kind: LlmDecisionKind::ToolDispatched {
-                    tool: "engage".into(),
+                LlmDecision {
+                    kind: LlmDecisionKind::ToolDispatched {
+                        tool: "engage".into(),
+                    },
+                    latency_us: 25_000,
+                    at_monotonic_ms: 200,
                 },
-                latency_us: 25_000,
-                at_monotonic_ms: 200,
-            },
-        ]);
+            ]),
+            ..Default::default()
+        };
 
         let snap = state_to_snapshot(&s);
         assert_eq!(snap.char_name.as_deref(), Some("Sylvie"));

@@ -813,8 +813,10 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn taa_implies_msaa_off() {
-        let mut s = GraphicsSettings::default();
-        s.anti_aliasing = AaMode::Taa;
+        let s = GraphicsSettings {
+            anti_aliasing: AaMode::Taa,
+            ..Default::default()
+        };
         assert_eq!(s.msaa(), Msaa::Off);
         assert!(s.wants_taa());
     }

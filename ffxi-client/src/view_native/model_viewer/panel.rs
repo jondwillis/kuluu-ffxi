@@ -63,14 +63,20 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
     // ids readable (matches `/look` output); race/face stay decimal.
     let race = pc.race.to_string();
     let face = pc.face.to_string();
-    let fmt_id = |v: u16| if v == 0 { "0".to_string() } else { format!("0x{v:04X}") };
-    let head   = fmt_id(pc.head);
-    let body   = fmt_id(pc.body);
-    let hands  = fmt_id(pc.hands);
-    let legs   = fmt_id(pc.legs);
-    let feet   = fmt_id(pc.feet);
-    let main   = fmt_id(pc.main);
-    let sub    = fmt_id(pc.sub);
+    let fmt_id = |v: u16| {
+        if v == 0 {
+            "0".to_string()
+        } else {
+            format!("0x{v:04X}")
+        }
+    };
+    let head = fmt_id(pc.head);
+    let body = fmt_id(pc.body);
+    let hands = fmt_id(pc.hands);
+    let legs = fmt_id(pc.legs);
+    let feet = fmt_id(pc.feet);
+    let main = fmt_id(pc.main);
+    let sub = fmt_id(pc.sub);
     let ranged = fmt_id(pc.ranged);
     let model_id = fmt_id(npc.model_id);
 
@@ -122,15 +128,15 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
                 TextColor(Color::srgb(0.7, 0.85, 1.0)),
                 ThemedText,
             ));
-            spawn_pc_field(panel, "race",   &race,   PcField::Race);
-            spawn_pc_field(panel, "face",   &face,   PcField::Face);
-            spawn_pc_field(panel, "head",   &head,   PcField::Head);
-            spawn_pc_field(panel, "body",   &body,   PcField::Body);
-            spawn_pc_field(panel, "hands",  &hands,  PcField::Hands);
-            spawn_pc_field(panel, "legs",   &legs,   PcField::Legs);
-            spawn_pc_field(panel, "feet",   &feet,   PcField::Feet);
-            spawn_pc_field(panel, "main",   &main,   PcField::Main);
-            spawn_pc_field(panel, "sub",    &sub,    PcField::Sub);
+            spawn_pc_field(panel, "race", &race, PcField::Race);
+            spawn_pc_field(panel, "face", &face, PcField::Face);
+            spawn_pc_field(panel, "head", &head, PcField::Head);
+            spawn_pc_field(panel, "body", &body, PcField::Body);
+            spawn_pc_field(panel, "hands", &hands, PcField::Hands);
+            spawn_pc_field(panel, "legs", &legs, PcField::Legs);
+            spawn_pc_field(panel, "feet", &feet, PcField::Feet);
+            spawn_pc_field(panel, "main", &main, PcField::Main);
+            spawn_pc_field(panel, "sub", &sub, PcField::Sub);
             spawn_pc_field(panel, "ranged", &ranged, PcField::Ranged);
 
             // ---- NPC inputs ---------------------------------------------------
@@ -160,12 +166,14 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
                         (),
                         Spawn((Text::new("<"), ThemedText)),
                     ))
-                    .observe(|_ev: On<Activate>, mut list: ResMut<ClipList>| {
-                        if list.names.is_empty() {
-                            return;
-                        }
-                        list.index = (list.index + list.names.len() - 1) % list.names.len();
-                    });
+                    .observe(
+                        |_ev: On<Activate>, mut list: ResMut<ClipList>| {
+                            if list.names.is_empty() {
+                                return;
+                            }
+                            list.index = (list.index + list.names.len() - 1) % list.names.len();
+                        },
+                    );
                     row.spawn((
                         ClipNameLabel,
                         Node {
@@ -181,12 +189,14 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
                         (),
                         Spawn((Text::new(">"), ThemedText)),
                     ))
-                    .observe(|_ev: On<Activate>, mut list: ResMut<ClipList>| {
-                        if list.names.is_empty() {
-                            return;
-                        }
-                        list.index = (list.index + 1) % list.names.len();
-                    });
+                    .observe(
+                        |_ev: On<Activate>, mut list: ResMut<ClipList>| {
+                            if list.names.is_empty() {
+                                return;
+                            }
+                            list.index = (list.index + 1) % list.names.len();
+                        },
+                    );
                 });
 
             panel.spawn((
@@ -218,9 +228,11 @@ fn spawn_mode_button(parent: &mut ChildSpawnerCommands, mode: ViewerMode, label:
                 Spawn((Text::new(label.to_string()), ThemedText)),
             ),
         ))
-        .observe(move |_ev: On<Activate>, mut viewer_mode: ResMut<ViewerMode>| {
-            *viewer_mode = mode;
-        });
+        .observe(
+            move |_ev: On<Activate>, mut viewer_mode: ResMut<ViewerMode>| {
+                *viewer_mode = mode;
+            },
+        );
 }
 
 fn spawn_pc_field(parent: &mut ChildSpawnerCommands, label: &str, initial: &str, field: PcField) {
@@ -260,9 +272,11 @@ fn spawn_pc_field(parent: &mut ChildSpawnerCommands, label: &str, initial: &str,
                     ThemedText,
                 ));
             })
-            .observe(move |ev: On<ValueChange<String>>, mut form: ResMut<PcForm>| {
-                apply_pc_field(&mut form, field, &ev.value);
-            });
+            .observe(
+                move |ev: On<ValueChange<String>>, mut form: ResMut<PcForm>| {
+                    apply_pc_field(&mut form, field, &ev.value);
+                },
+            );
         });
 }
 
@@ -395,10 +409,7 @@ fn parse_u8_lenient(s: &str) -> Option<u8> {
 /// Keep the clip-name label in sync with [`ClipList::current`]. Runs
 /// every frame but the `Text::set_if_neq` no-ops when the string didn't
 /// change, so the write is cheap on stable selections.
-fn update_clip_label(
-    list: Res<ClipList>,
-    mut q: Query<&mut Text, With<ClipNameLabel>>,
-) {
+fn update_clip_label(list: Res<ClipList>, mut q: Query<&mut Text, With<ClipNameLabel>>) {
     if !list.is_changed() {
         return;
     }

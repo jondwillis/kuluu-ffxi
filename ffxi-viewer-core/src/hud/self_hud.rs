@@ -42,6 +42,12 @@ pub struct SelfTpRow;
 #[derive(Component)]
 pub struct SelfStatusRow;
 
+/// Solo / party roster indicator row. Mirrors roster.rs's `len() <= 1`
+/// solo test: "Solo" when the party holds only self, "Party N/6"
+/// otherwise.
+#[derive(Component)]
+pub struct SelfPartyRow;
+
 /// Tracks the most recently observed self HP and how long the heal pulse
 /// has been visible. Reset by `update_self_status` each tick; the badge
 /// shows "+N HP" for `HEAL_PULSE_SECS` after an increase, then fades.
@@ -85,6 +91,7 @@ pub fn spawn_self_hud(mut commands: Commands) {
             spawn_row(p, SelfMpRow, "MP", "—");
             spawn_row(p, SelfTpRow, "TP", "—");
             spawn_row(p, SelfStatusRow, "", "");
+            spawn_row(p, SelfPartyRow, "", "Solo");
         });
 }
 
@@ -256,15 +263,36 @@ pub fn update_self_status(
     }
 }
 
+/// Per-frame: drive the solo / party roster indicator. Uses the same
+/// `party.len() <= 1` solo test as roster.rs so the two panels agree.
+/// Shows "Solo" when only self is in the party, "Party N/6" otherwise.
+pub fn update_self_party_indicator(
+    state: Res<SceneState>,
+    mut q: Query<&mut Text, With<SelfPartyRow>>,
+) {
+    if !state.dirty {
+        return;
+    }
+    let Ok(mut text) = q.single_mut() else {
+        return;
+    };
+    let n = state.snapshot.party.len();
+    let want = if n <= 1 {
+        "Solo".to_string()
+    } else {
+        format!("Party {n}/6")
+    };
+    if **text != want {
+        **text = want;
+    }
+}
+
 /// Resolve the operator's own party row. Prefer `self_char_id` lookup
 /// for correctness; fall back to the first member when the id hasn't
 /// been resolved yet so the HUD shows *something* during the post-zone
 /// race window where party data has arrived but `self_char_id` is
 /// still `None`.
-pub fn resolve_self<'a>(
-    party: &'a [PartyMember],
-    self_char_id: Option<u32>,
-) -> Option<&'a PartyMember> {
+pub fn resolve_self(party: &[PartyMember], self_char_id: Option<u32>) -> Option<&PartyMember> {
     if let Some(id) = self_char_id {
         if let Some(m) = party.iter().find(|m| m.id == id) {
             return Some(m);

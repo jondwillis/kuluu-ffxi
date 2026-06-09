@@ -346,8 +346,8 @@ fn percentile_pair(decisions: &VecDeque<LlmDecision>) -> Option<(u64, u64)> {
     let mut sorted: Vec<u64> = decisions.iter().map(|d| d.latency_us).collect();
     sorted.sort_unstable();
     let n = sorted.len();
-    let p50 = sorted[((n * 50 + 99) / 100).saturating_sub(1).min(n - 1)];
-    let p99 = sorted[((n * 99 + 99) / 100).saturating_sub(1).min(n - 1)];
+    let p50 = sorted[(n * 50).div_ceil(100).saturating_sub(1).min(n - 1)];
+    let p99 = sorted[(n * 99).div_ceil(100).saturating_sub(1).min(n - 1)];
     Some((p50, p99))
 }
 

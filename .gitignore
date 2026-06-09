@@ -1,7 +1,6 @@
 # Rust workspace artifacts (defense-in-depth; component .gitignores cover this too)
 **/target/
 **/*.rs.bk
-Cargo.lock
 
 # Node / abandoned scaffolds
 **/node_modules/
@@ -54,3 +53,6 @@ vendor/RZN-mapviewer/
 # blob limit. Regenerate locally via the wasm toolchain.
 ffxi-viewer-wasm/dist/
 profile.json.gz
+
+# Container-built Linux binaries (docker/build-linux.sh)
+/dist/

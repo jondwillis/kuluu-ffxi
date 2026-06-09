@@ -1,6 +1,9 @@
 //! Library entry point exposing the modules that the integration tests
 //! (and any future external embedders) need to drive a session.
 
+// Bevy ECS dictates system signatures (see ffxi-viewer-core; insurmountable).
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
+
 pub mod agent_codec;
 pub mod agent_io;
 #[cfg(unix)]

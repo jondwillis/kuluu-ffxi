@@ -47,7 +47,7 @@ pub struct DecompressTable {
 
 impl DecompressTable {
     pub fn new() -> Result<Self, ZlibError> {
-        if DECOMPRESS_RAW.len() % 4 != 0 || DECOMPRESS_RAW.is_empty() {
+        if !DECOMPRESS_RAW.len().is_multiple_of(4) || DECOMPRESS_RAW.is_empty() {
             return Err(ZlibError::MalformedTable);
         }
         let mut raw: Vec<u32> = DECOMPRESS_RAW
@@ -122,7 +122,7 @@ pub struct CompressTable {
 
 impl CompressTable {
     pub fn new() -> Result<Self, ZlibError> {
-        if COMPRESS_RAW.len() % 4 != 0 || COMPRESS_RAW.is_empty() {
+        if !COMPRESS_RAW.len().is_multiple_of(4) || COMPRESS_RAW.is_empty() {
             return Err(ZlibError::MalformedTable);
         }
         let raw: Vec<u32> = COMPRESS_RAW
@@ -142,7 +142,7 @@ impl CompressTable {
         // Each input byte produces up to 32 bits. Worst case: 8x expansion
         // plus the magic byte.
         let max_bits = input.len() * 32 + 8;
-        let max_bytes = (max_bits + 7) / 8 + 1;
+        let max_bytes = max_bits.div_ceil(8) + 1;
         let mut out = vec![0u8; max_bytes];
         let mut bit_pos: usize = 0;
 
@@ -153,7 +153,7 @@ impl CompressTable {
             let v_bytes = value.to_le_bytes();
             for j in 0..bit_count {
                 // Bit `j` of `v_bytes`, LSB-first across the four bytes.
-                let bit = ((v_bytes[j / 8] >> (j & 7)) & 1) as u8;
+                let bit = (v_bytes[j / 8] >> (j & 7)) & 1;
                 let dst = bit_pos + j;
                 let dst_byte = 1 + dst / 8; // +1 for the magic byte at out[0]
                 let dst_shift = dst & 7;
@@ -165,7 +165,7 @@ impl CompressTable {
         out[0] = 1;
         // C++ returns `read + 8` bits, accounting for the magic-byte prefix.
         let total_bits = bit_pos + 8;
-        let total_bytes = (total_bits + 7) / 8;
+        let total_bytes = total_bits.div_ceil(8);
         out.truncate(total_bytes);
         Ok((total_bits, out))
     }

@@ -61,22 +61,19 @@ impl<'a> AdpcmStream<'a> {
         }
         let mut scratch: Vec<Vec<f32>> =
             (0..channels).map(|_| Vec::with_capacity(frames)).collect();
-        for ch in 0..channels {
+        for (ch, scratch_chan) in scratch.iter_mut().enumerate() {
             let off = base + ch * self.block_bytes_per_channel;
             let slice = &self.data[off..off + self.block_bytes_per_channel];
             decode_block_into(
                 slice,
                 self.header.block_size,
                 &mut self.states[ch],
-                &mut scratch[ch],
+                scratch_chan,
             )?;
         }
         let actual_frames = scratch.iter().map(|v| v.len()).min().unwrap_or(0);
-        for i in 0..actual_frames {
-            for ch in 0..channels {
-                out.push(scratch[ch][i]);
-            }
-        }
+        // Frame-interleave: emit frame i of every channel before advancing.
+        out.extend((0..actual_frames).flat_map(|i| scratch.iter().map(move |c| c[i])));
         self.current_block += 1;
         Ok(true)
     }
