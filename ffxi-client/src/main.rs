@@ -242,6 +242,13 @@ fn main() -> Result<()> {
         .with_env_filter(env_filter)
         .init();
 
+    // Apply persisted launcher Settings (FFXI_DAT_PATH / FFXI_NAVMESH_DIR /
+    // FFXI_MAC) to the process environment NOW — single-threaded, before the
+    // tokio runtime spawns workers and before any `from_env_or_default`
+    // resolution downstream. Real env vars still win unless the launcher's
+    // per-field "override" box is ticked (see launcher_store::Settings).
+    ffxi_client::launcher_store::load().settings.apply_to_env();
+
     let auth = auth_client::AuthClient::with_flavor_and_version(
         args.server.clone(),
         args.auth_port,
