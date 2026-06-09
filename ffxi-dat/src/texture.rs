@@ -662,12 +662,14 @@ mod tests {
 
     #[test]
     fn decode_texture_dxt1_round_trip() {
-        // Synthesize a body that matches the documented (spec-based)
-        // FFXI framing: magic + u32 width + u32 height + DXT1 blocks.
-        let mut body = Vec::new();
-        body.extend_from_slice(b"1TXD");
-        body.extend_from_slice(&4u32.to_le_bytes());
-        body.extend_from_slice(&4u32.to_le_bytes());
+        // Build a minimal IMGINFOA1 (flg 0xA1) body — the framing
+        // `decode_texture` actually dispatches on: dims at 0x15/0x19, the
+        // FourCC magic at 0x39, DXT1 pixels at 0x45.
+        let mut body = vec![0u8; 0x45];
+        body[0] = 0xA1;
+        body[0x15..0x19].copy_from_slice(&4i32.to_le_bytes());
+        body[0x19..0x1D].copy_from_slice(&4i32.to_le_bytes());
+        body[0x39..0x3D].copy_from_slice(b"1TXD");
         body.extend_from_slice(&dxt1_red_blue_block());
         let dec = decode_texture(&body).unwrap();
         assert_eq!(dec.width, 4);

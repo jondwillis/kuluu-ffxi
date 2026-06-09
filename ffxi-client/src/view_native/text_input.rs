@@ -2532,18 +2532,11 @@ mod menu_dispatch_tests {
 
     #[test]
     fn unwired_root_entries_stay_not_implemented() {
-        // `Config` was wired up as a submenu in commit c4a9321 (preset
-        // switcher + `/keybinds list`); the test was not updated at
-        // the time. The remaining root entries below are still stubs.
-        for label in [
-            "Magic",
-            "Abilities",
-            "Items",
-            "Status",
-            "Party",
-            "Search",
-            "Macros",
-        ] {
+        // Config/Graphics — and now Magic/Abilities/Items/Equipment — open
+        // (still-stub) submenus, so they no longer resolve to NotImplemented at
+        // the root. The entries below have no submenu yet, so the root match
+        // falls through to NotImplemented.
+        for label in ["Status", "Party", "Search", "Macros"] {
             assert_eq!(
                 resolve_menu_entry(MenuKind::Root, label),
                 MenuDispatch::NotImplemented(label.into()),
