@@ -148,7 +148,7 @@ pub fn load_zone_weather(
 pub fn apply_zone_weather(
     zone_weather: Res<ZoneWeather>,
     mut fog_q: Query<&mut FogVolume>,
-    mut ambient: ResMut<AmbientLight>,
+    mut ambient: ResMut<GlobalAmbientLight>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     settings: Res<GraphicsSettings>,
     mut cam_q: Query<(Entity, Option<&mut DistanceFog>), With<OperatorCamera>>,

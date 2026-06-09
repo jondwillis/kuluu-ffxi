@@ -113,7 +113,7 @@ fn setup_scene(mut commands: Commands) {
 
     // Ambient for fill — FFXI vertex colors are mostly neutral gray so
     // we want enough light to show shape.
-    commands.insert_resource(AmbientLight {
+    commands.insert_resource(GlobalAmbientLight {
         color: Color::WHITE,
         brightness: 200.0,
         ..default()

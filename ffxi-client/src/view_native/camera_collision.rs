@@ -311,8 +311,11 @@ pub fn draw_camera_collision_debug(
         };
         let center = (mn + mx) * 0.5;
         let extents = mx - mn;
-        gizmos.cuboid(
-            Transform::from_translation(center).with_scale(extents),
+        // bevy 0.18 removed `Gizmos::cuboid`; draw the box via the
+        // primitive API (full-size `Cuboid`, axis-aligned isometry).
+        gizmos.primitive_3d(
+            &Cuboid::from_size(extents),
+            Isometry3d::from_translation(center),
             aabb_color,
         );
     }

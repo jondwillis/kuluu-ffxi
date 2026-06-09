@@ -338,7 +338,7 @@ pub fn setup_world(
     // floors near-black. 500 lux is a compromise: shadows still read
     // as shadows (~20:1 contrast vs 10k-lux sun) but the texture on
     // back-facing walls stays visible.
-    commands.insert_resource(AmbientLight {
+    commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.85, 0.88, 1.0),
         brightness: 500.0,
         ..default()

@@ -175,7 +175,7 @@ pub struct LastAtmosphereZone {
 /// Apply [`ZoneAtmosphere`] to the live world on zone transitions.
 ///
 /// Touches:
-///   * `Res<AmbientLight>` — global fill color/brightness.
+///   * `Res<GlobalAmbientLight>` — global fill color/brightness.
 ///   * The unique `DirectionalLight` — color, illuminance, transform.
 ///   * The `OperatorCamera`'s `DistanceFog` (when the provider supplied one).
 ///   * The `OperatorCamera`'s `Skybox` slot (added or removed).
@@ -188,7 +188,7 @@ pub fn apply_zone_atmosphere_system(
     state: Res<SceneState>,
     provider: Res<ZoneAtmosphereProvider>,
     mut last: ResMut<LastAtmosphereZone>,
-    mut ambient: ResMut<AmbientLight>,
+    mut ambient: ResMut<GlobalAmbientLight>,
     mut active_weather: ResMut<crate::weather_fx::ActiveWeatherModifier>,
     mut q_cam: Query<(Entity, Option<&mut DistanceFog>, Option<&Skybox>), With<OperatorCamera>>,
     mut commands: Commands,

@@ -417,7 +417,7 @@ fn lcg_next(state: &mut u64) -> f32 {
 pub fn update_weather_modifier_system(
     current: Res<CurrentWeather>,
     mut active: ResMut<ActiveWeatherModifier>,
-    ambient: Res<AmbientLight>,
+    ambient: Res<GlobalAmbientLight>,
     mut lightning: ResMut<LightningState>,
     time: Res<Time>,
 ) {
@@ -469,7 +469,7 @@ pub fn update_weather_modifier_system(
 /// values (whose changes capture the new base into `active`).
 pub fn apply_weather_to_ambient_and_fog_system(
     active: Res<ActiveWeatherModifier>,
-    mut ambient: ResMut<AmbientLight>,
+    mut ambient: ResMut<GlobalAmbientLight>,
     mut q_cam: Query<Option<&mut DistanceFog>, With<OperatorCamera>>,
     mut commands: Commands,
     cam: Query<Entity, With<OperatorCamera>>,
@@ -517,7 +517,7 @@ pub fn apply_weather_to_ambient_and_fog_system(
 pub fn apply_weather_to_sun_system(
     active: Res<ActiveWeatherModifier>,
     lightning: Res<LightningState>,
-    mut ambient: ResMut<AmbientLight>,
+    mut ambient: ResMut<GlobalAmbientLight>,
     mut q_sun: Query<&mut DirectionalLight, With<IsSun>>,
 ) {
     let flash_t = (lightning.flash_remaining / FLASH_DURATION).clamp(0.0, 1.0);
