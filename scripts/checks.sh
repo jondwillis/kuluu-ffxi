@@ -14,6 +14,17 @@
 # distinct steps for per-stage pass/fail reporting while still sharing flags.
 set -euo pipefail
 
+# GUI git clients (Fork, Tower, GitKraken…) run hooks with a stripped PATH that
+# omits ~/.cargo/bin, so `cargo` isn't found. Pull in rustup's env when it's
+# missing. No-op on CI / interactive shells, where cargo is already on PATH.
+if ! command -v cargo >/dev/null 2>&1; then
+  if [ -f "$HOME/.cargo/env" ]; then
+    . "$HOME/.cargo/env"
+  else
+    export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+fi
+
 cd "$(git rev-parse --show-toplevel)"
 
 # The single feature set the client/viewer build under. Keep in lockstep with
