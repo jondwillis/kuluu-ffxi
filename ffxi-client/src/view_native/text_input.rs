@@ -312,6 +312,12 @@ pub fn text_input_system(
                     *mode = next;
                 }
             }
+            InputMode::TargetAction(_state) => {
+                // The TargetAction mode's foundation types (hud::action_model,
+                // hud::overlay, TargetActionState) have landed but its key
+                // handler has not. Nothing transitions into this mode yet, so
+                // ignore keys here until `handle_target_action_key` exists.
+            }
         }
     }
 }
