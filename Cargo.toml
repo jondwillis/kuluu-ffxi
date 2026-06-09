@@ -46,7 +46,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # constrained by `bevy_ratatui_camera`'s feature requirements (the TUI
 # subcommand was removed); future work can now trim Bevy default
 # features per `[features]` of the native-window build.
-bevy = "0.17"
+bevy = "0.18"
 
 # MCP server SDK for the ffxi-mcp crate (Stage 4).
 rmcp = { version = "1.7", features = ["server", "macros", "schemars", "transport-io"] }
