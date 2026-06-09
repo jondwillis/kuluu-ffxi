@@ -148,6 +148,8 @@ pub struct SlashWriters<'w, 's> {
     pub rest_stance: ResMut<'w, ffxi_viewer_core::combat_stance::RestStance>,
     /// Sky-realism feature flags (`/sky`).
     pub sky_realism: ResMut<'w, ffxi_viewer_core::sky_realism::SkyRealism>,
+    /// Dynamic lantern/fire light tuning (`/lights`).
+    pub zone_lights: ResMut<'w, ffxi_viewer_core::zone_lights::ZoneLightConfig>,
     /// Status → Profile panel visibility. The menu sets this true on the
     /// Profile row and clears it on back-out of `MenuKind::Status`
     /// (`status_panel`'s doc-contract). Bundled here to keep
@@ -1316,6 +1318,41 @@ fn apply_slash_outcome(
                     );
                 }
             }
+        }
+        SlashOutcome::SetLights(op) => {
+            use super::slash_commands::LightsOp;
+            let cfg = &mut *slash_writers.zone_lights;
+            let chat = match op {
+                LightsOp::Status => format!(
+                    "/lights: {} · threshold {:.2} · intensity {:.0} · range {:.1} · flicker {}",
+                    if cfg.enabled { "on" } else { "off" },
+                    cfg.overbright_threshold,
+                    cfg.point_intensity,
+                    cfg.point_range,
+                    if cfg.flicker { "on" } else { "off" },
+                ),
+                LightsOp::Enable(v) => {
+                    cfg.enabled = v.unwrap_or(!cfg.enabled);
+                    format!("/lights: {}", if cfg.enabled { "on" } else { "off" })
+                }
+                LightsOp::Threshold(v) => {
+                    cfg.overbright_threshold = v;
+                    format!("/lights threshold: {v:.2} (re-enter zone to re-detect)")
+                }
+                LightsOp::Intensity(v) => {
+                    cfg.point_intensity = v;
+                    format!("/lights intensity: {v:.0}")
+                }
+                LightsOp::Range(v) => {
+                    cfg.point_range = v;
+                    format!("/lights range: {v:.1}")
+                }
+                LightsOp::Flicker(v) => {
+                    cfg.flicker = v.unwrap_or(!cfg.flicker);
+                    format!("/lights flicker: {}", if cfg.flicker { "on" } else { "off" })
+                }
+            };
+            push_system_chat_line(scene_state, chat);
         }
         SlashOutcome::SetMinimap(op) => {
             use super::slash_commands::MinimapOp;

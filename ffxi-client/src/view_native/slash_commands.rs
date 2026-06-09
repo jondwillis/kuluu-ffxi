@@ -428,6 +428,11 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 usage: "[<feature> [on|off|toggle]]",
                 summary: "toggle sky realism features (reddening / dimming / illusion / earthshine / realmoon / eclipses); bare `/sky` lists state",
             },
+            HelpEntry {
+                aliases: &["lights", "lanterns"],
+                usage: "[on|off | threshold N | intensity N | range N | flicker on|off]",
+                summary: "tune dynamic lantern/fire lights (from over-bright vertices); bare `/lights` lists state",
+            },
         ],
     ),
 ];
@@ -603,6 +608,11 @@ pub enum SlashOutcome {
     /// reports the current state of every flag; with a feature name
     /// and optional value it sets/toggles that one.
     SetSky(SkyOp),
+    /// `/lights [...]` — read or tune
+    /// [`ffxi_viewer_core::zone_lights::ZoneLightConfig`], the dynamic
+    /// lantern/fire lights detected from over-bright vertices. Naked
+    /// `/lights` reports current state.
+    SetLights(LightsOp),
     /// `/minimap [show|hide|toggle|mode <top|retail|auto>|cull <N>]`
     /// — drive the minimap HUD's visibility, image-source backend,
     /// and ceiling-cull height. See [`MinimapOp`].
@@ -1113,6 +1123,7 @@ pub fn parse_slash(
         "zonegeom" => parse_zonegeom(rest),
         "devhud" => parse_devhud(rest),
         "sky" => parse_sky(rest),
+        "lights" | "lanterns" => parse_lights(rest),
         "minimap" | "mm" => parse_minimap(rest),
         "sound" | "audio" | "mute" => parse_sound(rest),
         "debug" | "dbg" | "nearby" | "entities" => {
@@ -2459,6 +2470,71 @@ fn parse_sky(rest: &str) -> SlashOutcome {
         }
     };
     SlashOutcome::SetSky(SkyOp::Set { feature, value })
+}
+
+/// Parsed shape of the `/lights` slash command. See
+/// [`SlashOutcome::SetLights`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LightsOp {
+    /// Bare `/lights` — report the current config + live emitter count.
+    Status,
+    /// `/lights on|off|toggle` — master enable.
+    Enable(Option<bool>),
+    /// `/lights threshold <f>` — over-bright detection cutoff.
+    Threshold(f32),
+    /// `/lights intensity <f>` — PointLight lumens (Enhanced).
+    Intensity(f32),
+    /// `/lights range <f>` — PointLight range in metres.
+    Range(f32),
+    /// `/lights flicker on|off|toggle`.
+    Flicker(Option<bool>),
+}
+
+fn parse_lights(rest: &str) -> SlashOutcome {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return SlashOutcome::SetLights(LightsOp::Status);
+    }
+    let mut parts = trimmed.split_ascii_whitespace();
+    let verb = parts.next().unwrap_or("").to_ascii_lowercase();
+    let arg = parts.next().unwrap_or("");
+
+    // on|off|toggle → Option<bool>; anything else is an error sentinel.
+    let toggle = |a: &str| -> Result<Option<bool>, ()> {
+        match a.to_ascii_lowercase().as_str() {
+            "" | "toggle" => Ok(None),
+            "on" | "true" | "1" => Ok(Some(true)),
+            "off" | "false" | "0" => Ok(Some(false)),
+            _ => Err(()),
+        }
+    };
+    let num = |a: &str| a.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0);
+
+    match verb.as_str() {
+        "on" | "off" | "toggle" => match toggle(&verb) {
+            Ok(v) => SlashOutcome::SetLights(LightsOp::Enable(v)),
+            Err(()) => unreachable!(),
+        },
+        "threshold" | "thresh" => match num(arg) {
+            Some(v) => SlashOutcome::SetLights(LightsOp::Threshold(v)),
+            None => SlashOutcome::SystemMessage(format!("/lights threshold: bad value `{arg}`")),
+        },
+        "intensity" | "int" => match num(arg) {
+            Some(v) => SlashOutcome::SetLights(LightsOp::Intensity(v)),
+            None => SlashOutcome::SystemMessage(format!("/lights intensity: bad value `{arg}`")),
+        },
+        "range" => match num(arg) {
+            Some(v) => SlashOutcome::SetLights(LightsOp::Range(v)),
+            None => SlashOutcome::SystemMessage(format!("/lights range: bad value `{arg}`")),
+        },
+        "flicker" => match toggle(arg) {
+            Ok(v) => SlashOutcome::SetLights(LightsOp::Flicker(v)),
+            Err(()) => SlashOutcome::SystemMessage(format!("/lights flicker: bad value `{arg}`")),
+        },
+        other => SlashOutcome::SystemMessage(format!(
+            "/lights: unknown `{other}` (use on|off|threshold N|intensity N|range N|flicker on|off)"
+        )),
+    }
 }
 
 /// `/devhud on|off|toggle` — show/hide developer telemetry overlays.

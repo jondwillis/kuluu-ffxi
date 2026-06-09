@@ -90,13 +90,12 @@ impl Default for ZoneLightConfig {
     }
 }
 
-/// One detected light source. Holds the un-flickered baselines so the
-/// flicker system can modulate around them, plus a per-emitter phase so
-/// neighbouring flames don't pulse in lockstep.
+/// One detected light source. Intensity/range/scale are read live from
+/// [`ZoneLightConfig`] each frame so `/lights` tuning is responsive
+/// without re-detecting; only the per-emitter flicker `phase` (so
+/// neighbouring flames don't pulse in lockstep) is stored here.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct ZoneLightEmitter {
-    pub base_point_intensity: f32,
-    pub base_flame_scale: f32,
     pub phase: f32,
 }
 
@@ -180,11 +179,7 @@ fn detect_zone_light_emitters(
             commands.entity(entity).with_children(|c| {
                 c.spawn((
                     InGameEntity,
-                    ZoneLightEmitter {
-                        base_point_intensity: cfg.point_intensity,
-                        base_flame_scale: cfg.flame_radius,
-                        phase,
-                    },
+                    ZoneLightEmitter { phase },
                     PointLight {
                         color,
                         intensity: cfg.point_intensity,
@@ -294,13 +289,12 @@ fn animate_zone_lights(
         } else {
             1.0
         };
-        light.intensity = if enhanced {
-            emitter.base_point_intensity * flick
-        } else {
-            0.0
-        };
-        let scale = emitter.base_flame_scale * (0.85 + 0.15 * flick);
-        xf.scale = Vec3::splat(scale);
+        // Read intensity/range/scale live from the config so `/lights`
+        // tuning takes effect immediately on existing emitters (only the
+        // detection threshold needs a zone re-enter).
+        light.intensity = if enhanced { cfg.point_intensity * flick } else { 0.0 };
+        light.range = cfg.point_range;
+        xf.scale = Vec3::splat(cfg.flame_radius * (0.85 + 0.15 * flick));
     }
 }
 
