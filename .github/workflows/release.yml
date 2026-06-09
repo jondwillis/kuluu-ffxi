@@ -49,7 +49,7 @@ jobs:
     env:
       CXXFLAGS: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-build
         with:
           cache-key: release-linux
@@ -68,7 +68,7 @@ jobs:
           tar -C target/release -czf "dist/ffxi-client-${TAG}-x86_64-linux.tar.gz" ffxi-client
           tar -C target/release -czf "dist/ffxi-mcp-${TAG}-x86_64-linux.tar.gz" ffxi-mcp ffxi-mcp-repl
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: dist/*
@@ -80,7 +80,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # The committed .cargo/config.toml hardcodes a developer-machine CXXFLAGS
       # -isysroot for the Recast C++ bridge. Cargo's [env] is set without
@@ -111,7 +111,7 @@ jobs:
           tar -C target/release -czf "dist/ffxi-client-${TAG}-aarch64-macos.tar.gz" ffxi-client
           tar -C target/release -czf "dist/ffxi-mcp-${TAG}-aarch64-macos.tar.gz" ffxi-mcp ffxi-mcp-repl
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: dist/*
@@ -123,7 +123,7 @@ jobs:
     env:
       CXXFLAGS: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-build
         with:
           targets: wasm32-unknown-unknown
@@ -145,7 +145,7 @@ jobs:
           mkdir -p dist
           ( cd ffxi-viewer-wasm/dist && zip -r "../../dist/ffxi-viewer-wasm-${TAG}.zip" . )
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wasm
           path: dist/*
@@ -157,12 +157,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.setup.outputs.tag }}
           generate_release_notes: true

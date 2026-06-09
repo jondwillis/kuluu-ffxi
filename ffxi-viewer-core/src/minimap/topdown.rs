@@ -279,13 +279,15 @@ pub fn spawn_bake_camera(
                 // shader — the UI does — but earlier is harmless and
                 // makes the dependency direction explicit).
                 order: -1,
-                target: RenderTarget::Image(render_target.clone().into()),
                 // Clear to transparent so unrendered margins (zones
                 // whose AABB doesn't square-fill the texture) blend
                 // cleanly with the UI's BACKGROUND color underneath.
                 clear_color: ClearColorConfig::Custom(Color::NONE),
                 ..default()
             },
+            // bevy 0.18 moved the render target off `Camera` into a
+            // standalone `RenderTarget` component spawned beside it.
+            RenderTarget::Image(render_target.clone().into()),
             Projection::Orthographic(OrthographicProjection {
                 scaling_mode: ScalingMode::Fixed {
                     width: span_x,

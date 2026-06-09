@@ -102,10 +102,10 @@ pub fn text_field(props: TextFieldProps) -> impl Bundle {
             align_items: AlignItems::Center,
             padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
             border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(3.0)),
             ..default()
         },
         BorderColor::all(Color::srgb(0.25, 0.25, 0.28)),
-        BorderRadius::all(Val::Px(3.0)),
         ThemeBackgroundColor(tokens::BUTTON_BG),
         TabIndex(0),
     )

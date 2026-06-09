@@ -92,11 +92,11 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
                 row_gap: Val::Px(8.0),
                 padding: UiRect::all(Val::Px(16.0)),
                 border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
             BackgroundColor(Color::srgba(0.04, 0.04, 0.05, 0.88)),
             BorderColor::all(Color::srgb(0.20, 0.20, 0.24)),
-            BorderRadius::all(Val::Px(6.0)),
             TabGroup::default(),
         ))
         .with_children(|panel| {

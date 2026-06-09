@@ -70,11 +70,12 @@ pub(super) fn panel_node(width_px: f32) -> impl Bundle {
             row_gap: Val::Px(12.0),
             padding: UiRect::all(Val::Px(24.0)),
             border: UiRect::all(Val::Px(1.0)),
+            // bevy 0.18: BorderRadius is now a `Node` field, not a component.
+            border_radius: BorderRadius::all(Val::Px(6.0)),
             ..default()
         },
         BackgroundColor(PANEL_BG),
         BorderColor::all(Color::srgb(0.20, 0.20, 0.24)),
-        BorderRadius::all(Val::Px(6.0)),
         TabGroup::default(),
     )
 }
@@ -141,12 +142,12 @@ pub(super) fn spawn_breadcrumb(
             padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
             margin: UiRect::bottom(Val::Px(12.0)),
             border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(4.0)),
             ..default()
         })
         .insert((
             BackgroundColor(PANEL_BG),
             BorderColor::all(Color::srgb(0.20, 0.20, 0.24)),
-            BorderRadius::all(Val::Px(4.0)),
         ))
         .with_children(|chip| {
             // Server chip: always the first segment and always a button

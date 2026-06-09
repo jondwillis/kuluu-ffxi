@@ -209,7 +209,7 @@ fn setup_camera(mut commands: Commands, params: Res<RenderParams>, mut draw: Res
 
     // MZB materials carry baked vertex lighting (palette × normal
     // shade) so an ambient is enough; no directional light needed.
-    commands.insert_resource(AmbientLight {
+    commands.insert_resource(GlobalAmbientLight {
         color: Color::WHITE,
         brightness: 200.0,
         ..default()

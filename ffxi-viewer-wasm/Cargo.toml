@@ -27,7 +27,7 @@ crate-type = ["cdylib", "rlib"]
 # on a workspace inherit when the workspace entry itself doesn't disable
 # defaults — and the workspace pin keeps full defaults to satisfy
 # `bevy_ratatui_camera`'s transitive requirement on the native side.
-bevy = { version = "0.17", default-features = false, features = [
+bevy = { version = "0.18", default-features = false, features = [
     "bevy_winit",
     "bevy_render",
     "bevy_pbr",
@@ -37,7 +37,7 @@ bevy = { version = "0.17", default-features = false, features = [
 ] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-gloo-net = { version = "0.6", features = ["websocket"] }
+gloo-net = { version = "0.7", features = ["websocket"] }
 gloo-utils = "0.2"
 postcard = { version = "1", features = ["use-std"] }
 flume = { version = "0.11", default-features = false }
