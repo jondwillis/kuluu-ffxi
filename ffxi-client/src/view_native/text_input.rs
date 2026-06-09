@@ -148,6 +148,11 @@ pub struct SlashWriters<'w, 's> {
     pub rest_stance: ResMut<'w, ffxi_viewer_core::combat_stance::RestStance>,
     /// Sky-realism feature flags (`/sky`).
     pub sky_realism: ResMut<'w, ffxi_viewer_core::sky_realism::SkyRealism>,
+    /// Status → Profile panel visibility. The menu sets this true on the
+    /// Profile row and clears it on back-out of `MenuKind::Status`
+    /// (`status_panel`'s doc-contract). Bundled here to keep
+    /// `text_input_system` under Bevy's 16-SystemParam cap.
+    pub status_profile_open: ResMut<'w, ffxi_viewer_core::hud::status_panel::StatusProfileOpen>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -271,6 +276,7 @@ pub fn text_input_system(
                     &cmd_tx.0,
                     &mut keybinds_state,
                     &mut slash_writers.graphics,
+                    &mut slash_writers.status_profile_open,
                     &dynamic_menu,
                     current_target,
                     self_pos,
@@ -1197,6 +1203,7 @@ fn apply_slash_outcome(
                 ffxi_viewer_core::MenuKind::Root => "Root".into(),
                 ffxi_viewer_core::MenuKind::Config => "Config".into(),
                 ffxi_viewer_core::MenuKind::Graphics => "Graphics".into(),
+                ffxi_viewer_core::MenuKind::Status => "Status".into(),
                 // EquipSlot isn't reachable via a slash-OpenMenu today
                 // (no slash form opens a specific slot directly — the
                 // operator gets there by walking Equipment → row →
@@ -1683,6 +1690,12 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
         (MenuKind::Root, "Abilities") => MenuDispatch::OpenSubmenu(MenuKind::Abilities),
         (MenuKind::Root, "Items") => MenuDispatch::OpenSubmenu(MenuKind::Items),
         (MenuKind::Root, "Equipment") => MenuDispatch::OpenSubmenu(MenuKind::Equipment),
+        // Status: open the Status submenu. Its rows aren't routed through
+        // `resolve_menu_entry` — they're index-driven (cursor →
+        // `status_panel::STATUS_ENTRIES[cursor].kind`), handled directly
+        // in `confirm_menu_at_cursor` so the Profile panel + Play Time
+        // chat line can reach their resources.
+        (MenuKind::Root, "Status") => MenuDispatch::OpenSubmenu(MenuKind::Status),
         // Stage 0: pressing Enter on the placeholder row in any of the
         // four action submenus surfaces a chat hint pointing at the
         // staging plan, so an operator who finds the menus before
@@ -1732,6 +1745,7 @@ fn confirm_menu_at_cursor(
     cmd_tx: &Sender<AgentCommand>,
     keybinds_state: &mut KeybindsStateRes,
     graphics: &mut ffxi_viewer_core::GraphicsSettings,
+    status_profile_open: &mut ffxi_viewer_core::hud::status_panel::StatusProfileOpen,
     dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
     target_id: Option<u32>,
     self_pos: ffxi_viewer_wire::Vec3,
@@ -1740,6 +1754,52 @@ fn confirm_menu_at_cursor(
         let level = stack.current()?;
         (level.kind, level.cursor)
     };
+    // Status rows map cursor → `STATUS_ENTRIES[cursor].kind`. Profile
+    // flips the panel resource and stays in-menu (Esc clears it); Play
+    // Time emits a chat line; the rest toast (disabled screens) or report
+    // not-yet-decoded (no snapshot data populates them — there's no
+    // `snapshot.job_levels`/skill/currency field yet).
+    if matches!(kind, MenuKind::Status) {
+        use ffxi_viewer_core::hud::status_panel::{StatusEntryKind, STATUS_ENTRIES};
+        let Some(entry) = STATUS_ENTRIES.get(cursor) else {
+            return None;
+        };
+        match entry.kind {
+            StatusEntryKind::Profile => {
+                status_profile_open.0 = true;
+            }
+            StatusEntryKind::PlayTime => {
+                let line = ffxi_viewer_core::hud::status_panel::play_time_chat_line(
+                    &scene_state.snapshot,
+                );
+                push_system_chat_line(scene_state, line);
+            }
+            // Master Levels / Merit Points: present-for-parity but outside
+            // this client's classic scope (StatusEntry.enabled == false).
+            StatusEntryKind::MasterLevels | StatusEntryKind::MeritPoints => {
+                push_system_chat_line(
+                    scene_state,
+                    format!("[menu] {} — not available", entry.label),
+                );
+            }
+            // No snapshot field decodes these screens yet, so there's
+            // nothing to render — toast rather than open an empty panel.
+            StatusEntryKind::JobLevels
+            | StatusEntryKind::CombatSkill
+            | StatusEntryKind::MagicSkill
+            | StatusEntryKind::CraftSkill
+            | StatusEntryKind::Currencies
+            | StatusEntryKind::Currencies2
+            | StatusEntryKind::Unity
+            | StatusEntryKind::JobPoints => {
+                push_system_chat_line(
+                    scene_state,
+                    format!("[menu] {} — not yet decoded", entry.label),
+                );
+            }
+        }
+        return None;
+    }
     if matches!(kind, MenuKind::Graphics) {
         if cursor == ffxi_viewer_core::hud::menu::GRAPHICS_RESET_SLOT {
             graphics.reset_to_default();
@@ -2030,6 +2090,7 @@ pub fn mouse_nav_dispatch_system(
     target: Res<Target>,
     mut scene_state: ResMut<SceneState>,
     mut graphics: ResMut<ffxi_viewer_core::GraphicsSettings>,
+    mut status_profile_open: ResMut<ffxi_viewer_core::hud::status_panel::StatusProfileOpen>,
     dynamic_menu: Res<ffxi_viewer_core::hud::menu::DynamicMenu>,
 ) {
     let entities = scene_state.snapshot.entities.clone();
@@ -2048,6 +2109,7 @@ pub fn mouse_nav_dispatch_system(
                 &cmd_tx.0,
                 &mut keybinds_state,
                 &mut graphics,
+                &mut status_profile_open,
                 &dynamic_menu,
                 current_target,
                 self_pos,
@@ -2101,6 +2163,7 @@ fn handle_menu_key(
     cmd_tx: &Sender<AgentCommand>,
     keybinds_state: &mut KeybindsStateRes,
     graphics: &mut ffxi_viewer_core::GraphicsSettings,
+    status_profile_open: &mut ffxi_viewer_core::hud::status_panel::StatusProfileOpen,
     dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
     target_id: Option<u32>,
     self_pos: ffxi_viewer_wire::Vec3,
@@ -2152,12 +2215,20 @@ fn handle_menu_key(
             cmd_tx,
             keybinds_state,
             graphics,
+            status_profile_open,
             dynamic,
             target_id,
             self_pos,
         );
     }
     if bindings.matches_logical(Action::NavCancel, key) {
+        // Backing out of the Status submenu clears the Profile panel —
+        // it's opened by Enter-on-Profile but stays visible while the
+        // menu is up, so the pop is the explicit clear half of
+        // `StatusProfileOpen`'s set/clear contract.
+        if matches!(kind, MenuKind::Status) {
+            status_profile_open.0 = false;
+        }
         return if !stack.pop() {
             Some(InputMode::World)
         } else {

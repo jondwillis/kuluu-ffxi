@@ -127,6 +127,27 @@ const EQUIPMENT_ENTRIES: &[&str] = &[
     "L.Ear", "R.Ear", "L.Ring", "R.Ring", "Back",
 ];
 
+/// Status submenu row labels, in the same order as
+/// [`crate::hud::status_panel::STATUS_ENTRIES`]. Duplicated as a
+/// `&'static str` slice (rather than derived at runtime from the
+/// `StatusEntry` structs) so the static-slice cursor path can reach them
+/// without an allocation; `status_labels_match_entries` asserts the two
+/// never drift.
+const STATUS_LABELS: &[&str] = &[
+    "Profile",
+    "Job Levels",
+    "Master Levels",
+    "Combat Skill",
+    "Magic Skill",
+    "Craft Skill",
+    "Currencies",
+    "Currencies 2",
+    "Unity",
+    "Play Time",
+    "Merit Points",
+    "Job Points",
+];
+
 /// Config submenu entries. Order is "presets first, smallest delta from
 /// retail names first; meta-entries last." The labels pass through to
 /// `text_input::resolve_menu_entry` for `MenuKind::Config`, which maps
@@ -176,6 +197,7 @@ const MAX_ENTRY_COUNT: usize = {
     let c = CONFIG_ENTRIES.len();
     let g = GRAPHICS_ENTRIES.len();
     let e = EQUIPMENT_ENTRIES.len();
+    let s = STATUS_LABELS.len();
     // The dynamic menus (Magic / Abilities) get DYNAMIC_VISIBLE_ROWS
     // worth of viewport — beyond that the list scrolls, so the row
     // pool only needs the visible-window size.
@@ -183,8 +205,9 @@ const MAX_ENTRY_COUNT: usize = {
     let rc = if r >= c { r } else { c };
     let rcg = if rc >= g { rc } else { g };
     let rcge = if rcg >= e { rcg } else { e };
-    if rcge >= d {
-        rcge
+    let rcges = if rcge >= s { rcge } else { s };
+    if rcges >= d {
+        rcges
     } else {
         d
     }
@@ -275,6 +298,11 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
         // `SceneSnapshot.equipped[i]` — the slot-name slice gives the
         // cursor + count, the snapshot gives the right column.
         MenuKind::Equipment => EQUIPMENT_ENTRIES,
+        // Status rows are fixed (see STATUS_LABELS); disabled screens
+        // (Master Levels / Merit Points) stay in the list and toast on
+        // select rather than being skipped, so cursor indices line up
+        // 1:1 with `status_panel::STATUS_ENTRIES`.
+        MenuKind::Status => STATUS_LABELS,
         // Stage 4 EquipSlot is dynamic; the static fallback only
         // surfaces when the dynamic resource hasn't been populated,
         // and serves as a "go back" hint.
@@ -295,6 +323,7 @@ fn menu_title(kind: MenuKind) -> &'static str {
         MenuKind::Magic => "Magic",
         MenuKind::Abilities => "Abilities",
         MenuKind::Items => "Items",
+        MenuKind::Status => "Status",
         MenuKind::EquipSlot(_) => "Equip",
     }
 }
@@ -754,6 +783,18 @@ fn format_row_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// STATUS_LABELS is the static-slice cursor source; the Wire phase
+    /// maps the same cursor index onto `status_panel::STATUS_ENTRIES[i].kind`
+    /// for dispatch — a length/order drift would mis-route a row.
+    #[test]
+    fn status_labels_match_entries() {
+        use crate::hud::status_panel::STATUS_ENTRIES;
+        assert_eq!(STATUS_LABELS.len(), STATUS_ENTRIES.len());
+        for (i, entry) in STATUS_ENTRIES.iter().enumerate() {
+            assert_eq!(STATUS_LABELS[i], entry.label, "Status row {i} label drift");
+        }
+    }
 
     /// GRAPHICS_ENTRIES is the dispatcher's source of truth for routing
     /// (text_input matches on these labels), and GraphicsField::label()

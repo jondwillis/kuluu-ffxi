@@ -153,6 +153,13 @@ pub enum MenuKind {
     /// rows reflect actual equipped items; Stage 4 turns each slot row
     /// into a "pick from inventory" sub-submenu.
     Equipment,
+    /// Retail "Status" submenu — Profile, Job Levels, the skill/currency
+    /// screens, Unity, Play Time, Job Points (see
+    /// `hud::status_panel::STATUS_ENTRIES`). Static-slice cursor path;
+    /// selecting Profile opens the already-built profile panel via the
+    /// `StatusProfileOpen` resource, Play Time emits a `/playtime` chat
+    /// line, and the undecoded screens toast a placeholder.
+    Status,
     /// Stage-4 sub-submenu pushed when an operator presses Enter on a
     /// row in the Equipment menu. The contained byte is the SLOTTYPE
     /// id (0=Main..15=Back) that's being filled — `refresh_dynamic_menu_rows`
