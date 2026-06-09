@@ -50,7 +50,19 @@ pub enum InputMode {
     Menu(MenuStack),
     /// The Enter-from-rest quick-action picker is open. Up/Down moves the
     /// cursor; Enter selects; Esc returns to `World`.
+    ///
+    /// Retained but only constructed behind the Enhanced flag. The default
+    /// confirm-on-target path constructs [`InputMode::TargetAction`]
+    /// instead (the single switch lives in wiring → text_input.rs).
     QuickAction(QuickActionState),
+    /// The vanilla contextual target-action menu, opened by confirming on
+    /// a target. Renders over the shared
+    /// [`crate::hud::action_model`] model; the Enhanced ring is a skin
+    /// over the same entries. Up/Down moves `cursor`; right-arrow cycles a
+    /// `Select` entry; Enter pushes a [`SubAction`] (Magic category,
+    /// Abilities group, Items list, Chat compose) or fires a `Plain`
+    /// entry; Esc pops a sub-frame or exits to `World`.
+    TargetAction(TargetActionState),
     /// An NPC event dialog is on screen. Up/Down moves the choice cursor
     /// `0..=DIALOG_MAX_CHOICE`; Enter dispatches `EndEventChoice` with the
     /// chosen `EndPara`; Esc sends `EndEvent` (which uses choice 0). The
@@ -250,6 +262,90 @@ impl PassiveCursorState {
     pub fn fresh_chat() -> Self {
         Self {
             focus: PassiveCursorFocus::Chat,
+        }
+    }
+}
+
+/// State for the vanilla contextual target-action menu
+/// ([`InputMode::TargetAction`]). Sibling to [`QuickActionState`].
+///
+/// `ctx` is captured at open time (see
+/// [`crate::hud::action_model::TargetActionContext`]) so the entry list
+/// stays stable across navigation even if a server snapshot changes the
+/// target. `sub` models pushing into a leaf list (Magic category,
+/// Abilities group, Items) and backing out, mirroring [`MenuStack`].
+#[derive(Debug, Clone, Default)]
+pub struct TargetActionState {
+    pub cursor: usize,
+    pub ctx: crate::hud::action_model::TargetActionContext,
+    pub sub: Option<SubActionStack>,
+}
+
+impl TargetActionState {
+    /// Open the contextual menu over the captured target context.
+    pub fn open(ctx: crate::hud::action_model::TargetActionContext) -> Self {
+        Self {
+            cursor: 0,
+            ctx,
+            sub: None,
+        }
+    }
+}
+
+/// A leaf sub-view reached from the top-level target-action menu. Pushing
+/// one of these descends into a filtered list; popping returns to the
+/// parent action row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubAction {
+    /// A specific spell category's spell list.
+    MagicCategory(crate::hud::overlay::SpellCategory),
+    /// A specific ability group's list.
+    AbilitiesGroup(crate::hud::action_model::AbilityGroup),
+    /// The usable-items list.
+    Items,
+    /// The chat-compose buffer for the selected chat mode.
+    ChatCompose,
+}
+
+/// The push/pop stack for [`SubAction`] frames, mirroring [`MenuStack`].
+/// `cursor` is the highlighted row of the *current* (top) frame; per-frame
+/// cursors below it are not preserved in this foundation shape (leaf views
+/// are shallow). Empty `frames` means "at the top-level action row".
+#[derive(Debug, Clone, Default)]
+pub struct SubActionStack {
+    pub frames: Vec<SubAction>,
+    pub cursor: usize,
+}
+
+impl SubActionStack {
+    /// Fresh stack with a single frame.
+    pub fn with(frame: SubAction) -> Self {
+        Self {
+            frames: vec![frame],
+            cursor: 0,
+        }
+    }
+
+    /// The current (top) sub-action frame, if any.
+    pub fn current(&self) -> Option<SubAction> {
+        self.frames.last().copied()
+    }
+
+    /// Push a deeper sub-frame, resetting the cursor.
+    pub fn push(&mut self, frame: SubAction) {
+        self.frames.push(frame);
+        self.cursor = 0;
+    }
+
+    /// Pop one frame. Returns `true` if a frame was popped, `false` if the
+    /// stack was already empty (caller should then leave sub-mode and
+    /// return to the top-level action row).
+    pub fn pop(&mut self) -> bool {
+        if self.frames.pop().is_some() {
+            self.cursor = 0;
+            !self.frames.is_empty()
+        } else {
+            false
         }
     }
 }

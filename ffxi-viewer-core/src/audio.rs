@@ -1015,6 +1015,11 @@ impl InputModeKind {
             crate::InputMode::Chat(_) => Self::Chat,
             crate::InputMode::Menu(_) => Self::Menu,
             crate::InputMode::QuickAction(_) => Self::QuickAction,
+            // The vanilla contextual target-action menu shares the
+            // quick-action picker's SFX lifecycle (it is the same
+            // confirm-on-target surface, just rendered as a list rather
+            // than the Enhanced ring).
+            crate::InputMode::TargetAction(_) => Self::QuickAction,
             crate::InputMode::Dialog(_) => Self::Dialog,
             crate::InputMode::PassiveCursor(_) => Self::PassiveCursor,
         }

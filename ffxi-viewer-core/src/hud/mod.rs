@@ -15,6 +15,7 @@
 //! └────────────────────────────────────────────────────┘
 //! ```
 
+pub mod action_model;
 pub mod agent_hud;
 pub mod chat_input;
 pub mod chat_panel;
@@ -23,10 +24,12 @@ pub mod death_prompt;
 pub mod diagnostics;
 pub mod dialog;
 pub mod entity_hover_card;
+pub mod item_meta;
 pub mod llm_badge;
 pub mod logout_countdown;
 pub mod menu;
 pub mod mesh_debug;
+pub mod overlay;
 pub mod quick_action;
 pub mod roster;
 pub mod self_hud;
@@ -198,6 +201,10 @@ impl Plugin for HudPlugin {
         // `refresh_dynamic_menu_rows` (registered below) rebuilds it
         // every frame from the active SceneSnapshot mirrors.
         app.init_resource::<menu::DynamicMenu>();
+        // Active client-profile overlay (retail base by default). The
+        // menu / magic / action-model feature agents read this to tailor
+        // entries; `/overlay <name>` switches it at runtime (wired later).
+        app.init_resource::<overlay::ActiveOverlay>();
         app.init_resource::<chat_panel::ActiveChatTab>();
         app.init_resource::<chat_panel::ChatAutoSwitch>();
         app.init_resource::<chat_panel::ChatUnread>();
