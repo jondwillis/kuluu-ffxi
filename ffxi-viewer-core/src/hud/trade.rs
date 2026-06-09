@@ -195,7 +195,7 @@ pub fn effective_gil(digits: &str, max: u32) -> u32 {
 /// `max` is itself capped at [`STACK_MAX`]. Used by both the keyboard
 /// increment/decrement and the digit-typed stack selector.
 pub fn clamp_stack(value: u16, max: u16) -> u16 {
-    let ceiling = max.min(STACK_MAX).max(1);
+    let ceiling = max.clamp(1, STACK_MAX);
     value.clamp(1, ceiling)
 }
 
@@ -367,7 +367,7 @@ pub fn gil_confirm(state: &mut TradeState) -> Option<u32> {
 /// (retail defaults the spinner to the whole stack). `stack_max` is the
 /// item's stack ceiling; the value is clamped to `1..=min(stack_max, 99)`.
 pub fn begin_stack_entry(state: &mut TradeState, slot: usize, stack_max: u16) {
-    let max = stack_max.min(STACK_MAX).max(1);
+    let max = stack_max.clamp(1, STACK_MAX);
     state.selector = Some(TradeSelector::Stack {
         slot,
         value: max,
