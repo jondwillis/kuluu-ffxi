@@ -51,14 +51,37 @@ pub struct SkyRealism {
 
 impl Default for SkyRealism {
     fn default() -> Self {
+        Self::enhanced()
+    }
+}
+
+impl SkyRealism {
+    /// Our default, modern look — every enhancement on except the
+    /// physical moon orbit (which departs visibly from retail's
+    /// antipodal sun/moon and is opt-in via `/sky realmoon`).
+    pub const fn enhanced() -> Self {
         Self {
             horizon_reddening: true,
             horizon_dimming: true,
             moon_illusion: true,
             earthshine: true,
-            // Off by default to preserve retail-faithful behavior.
             physical_moon_orbit: false,
             eclipses: true,
+        }
+    }
+
+    /// Retail-faithful look — every post-2002 embellishment off. The
+    /// moon stays a fixed-size icy disc antipodal to the sun, with no
+    /// horizon reddening/dimming, no earthshine, no eclipse events. The
+    /// stylized 2002 sky the original client shipped.
+    pub const fn retail() -> Self {
+        Self {
+            horizon_reddening: false,
+            horizon_dimming: false,
+            moon_illusion: false,
+            earthshine: false,
+            physical_moon_orbit: false,
+            eclipses: false,
         }
     }
 }

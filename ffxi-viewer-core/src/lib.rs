@@ -78,7 +78,7 @@ pub use components::{
     EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
 };
 pub use cursor::{CursorAssets, CursorPlugin, CursorRequests, CursorStyle};
-pub use graphics_settings::{AaMode, GraphicsField, GraphicsSettings, QualityPreset};
+pub use graphics_settings::{AaMode, GraphicsField, GraphicsSettings, QualityPreset, SkyStyle};
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
     ChatBuffer, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack, PassiveCursorFocus,
@@ -386,6 +386,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                 graphics_settings::apply_projection_system,
                 graphics_settings::apply_vsync_system,
                 graphics_settings::apply_anti_aliasing_system,
+                graphics_settings::apply_sky_style_system,
             )
                 .chain()
                 .run_if(resource_changed::<GraphicsSettings>),
