@@ -440,27 +440,50 @@ async fn run_map_session(
 ///
 /// The hard case is `look.size` 0/5/6 (standard monster meshes): real mobs
 /// AND a class of static/triggerable NPCs that reuse a monster model (e.g.
-/// the Auction House counter) both land here. LSB only writes the live-mob
-/// marker (body byte 0x25 = `hp>0 ? 0x08 : 0`) in the TYPE_MOB/PET/TRUST
-/// branch of `entity_update.cpp`; the TYPE_NPC branch never touches it. That
-/// byte is gated on `UPDATE_HP`, so:
-///   * no UPDATE_HP this packet → we can't tell → `Other`, letting
-///     `state::merge_kind` keep any prior specialized kind (never forcing a
-///     standard-model NPC back to Mob on a position-only tick);
-///   * UPDATE_HP + marker set → genuine live creature → `Mob` (or `Pet` when
-///     PMaster is a PC);
-///   * UPDATE_HP + marker clear → static/triggerable NPC on a monster model
-///     → `Npc`, so combat verbs aren't offered against it.
+/// the Auction House counter) both land here. We resolve it with two LSB
+/// signals, in priority order:
+///   * `act_index` (targid) in 0x700..=0x8FF → a dynamically-spawned
+///     MOB/PET/TRUST (`zone_entities.cpp:594-627`). This is on *every* packet
+///     and is authoritative, so a field mob classifies as `Mob` even when an
+///     individual update omits the live-mob marker (the marker is gated on
+///     `UPDATE_HP`, which made intermittently-updating mobs flip to `Npc`).
+///   * otherwise (static targid `& 0xFFF`, < 0x700 — static NPCs and static
+///     instance/BCNM mobs) fall back to the live-mob marker (body byte 0x25 =
+///     `hp>0 ? 0x08 : 0`), which LSB writes only in the TYPE_MOB/PET/TRUST
+///     branch of `entity_update.cpp`; the TYPE_NPC branch never touches it.
+///     That byte is gated on `UPDATE_HP`, so:
+///       - no UPDATE_HP this packet → can't tell → `Other`, letting
+///         `state::merge_kind` keep any prior specialized kind;
+///       - UPDATE_HP + marker set → live creature → `Mob`;
+///       - UPDATE_HP + marker clear → static NPC on a monster model → `Npc`.
+///
+/// A PC-owned standard model (`PMaster` is a PC) is `Pet` regardless.
 fn classify_char_npc(
     look_size: Option<u16>,
+    act_index: u16,
     owned_by_pc: bool,
     has_hp_update: bool,
     is_live_mob: bool,
 ) -> EntityKind {
+    // LSB allocates dynamic entities (MOB/PET/TRUST) a targid in
+    // 0x700..=0x8FF (`zone_entities.cpp:595-627`, range constant
+    // `DYNAMIC_ENTITY_TARGID_RANGE_START = 0x700`), and documents at
+    // `zone_entities.cpp:594` that 0x0E updates are valid for "0 to 1023 and
+    // 1792 to 2303" (0x700..=0x8FF). A standard-mesh CHAR_NPC in that range
+    // is therefore a genuine spawned creature — present on *every* packet,
+    // unlike the UPDATE_HP-gated live-mob marker. Static NPCs and static
+    // instance mobs get `targid & 0xFFF` (< 0x700) and still need the marker
+    // to disambiguate (the AH counter reuses a monster mesh but is an NPC).
+    let dynamic_targid = (0x700..=0x8FF).contains(&act_index);
     match look_size {
         Some(0) | Some(5) | Some(6) => {
             if owned_by_pc {
                 EntityKind::Pet
+            } else if dynamic_targid {
+                // Authoritative: a live creature regardless of whether this
+                // packet carried the (flaky, UPDATE_HP-gated) marker. Fixes
+                // dynamic mobs that intermittently classified as Npc.
+                EntityKind::Mob
             } else if !has_hp_update {
                 EntityKind::Other
             } else if is_live_mob {
@@ -722,7 +745,13 @@ fn handle_sub_packet(
                         sub.data.get(UPDATEMASK_OFFSET).copied().unwrap_or(0) & UPDATE_HP != 0;
                     let is_live_mob =
                         sub.data.get(MOB_MARKER_OFFSET).copied().unwrap_or(0) & 0x08 != 0;
-                    classify_char_npc(look_size, owned_by_pc, has_hp_update, is_live_mob)
+                    classify_char_npc(
+                        look_size,
+                        head.act_index,
+                        owned_by_pc,
+                        has_hp_update,
+                        is_live_mob,
+                    )
                 };
                 if op == s2c::CHAR_PC && head.unique_no == self_char_id {
                     *self_act_index = Some(head.act_index);
@@ -3904,43 +3933,65 @@ mod tests {
 
     // ---- CHAR_NPC entity classification (LSB live-mob marker) ----
 
+    // A static targid (< 0x700) for the AH-counter / NPC cases; a dynamic
+    // targid (0x700..=0x8FF) for spawned creatures.
+    const STATIC_TARGID: u16 = 0x123;
+    const DYNAMIC_TARGID: u16 = 0x712;
+
     #[test]
     fn standard_model_npc_is_not_a_mob() {
-        // Auction House case: standard monster model (size 0), UPDATE_HP
-        // present, but the live-mob marker (LSB body 0x25) is clear because
-        // entity_update.cpp's TYPE_NPC branch never writes it. Must be Npc so
-        // combat verbs aren't offered.
+        // Auction House case: standard monster model (size 0), static targid,
+        // UPDATE_HP present, but the live-mob marker (LSB body 0x25) is clear
+        // because entity_update.cpp's TYPE_NPC branch never writes it. Must be
+        // Npc so combat verbs aren't offered.
         assert_eq!(
-            classify_char_npc(Some(0), false, true, false),
+            classify_char_npc(Some(0), STATIC_TARGID, false, true, false),
             EntityKind::Npc
         );
     }
 
     #[test]
     fn standard_model_live_mob_is_a_mob() {
-        // Real mob: standard model, UPDATE_HP set, marker set (hp>0).
+        // Static instance mob: standard model, static targid, UPDATE_HP set,
+        // marker set (hp>0) — resolved via the marker fallback.
         assert_eq!(
-            classify_char_npc(Some(0), false, true, true),
+            classify_char_npc(Some(0), STATIC_TARGID, false, true, true),
+            EntityKind::Mob
+        );
+    }
+
+    #[test]
+    fn dynamic_targid_mob_is_a_mob_without_marker() {
+        // Regression: a field mob (Zeruhn Mines Leech) spawned with a dynamic
+        // targid must be Mob even on a packet whose live-mob marker is clear
+        // (no UPDATE_HP this tick). The targid range alone is authoritative.
+        assert_eq!(
+            classify_char_npc(Some(0), DYNAMIC_TARGID, false, false, false),
+            EntityKind::Mob
+        );
+        assert_eq!(
+            classify_char_npc(Some(0), DYNAMIC_TARGID, false, true, false),
             EntityKind::Mob
         );
     }
 
     #[test]
     fn standard_model_without_hp_update_defers_to_merge_kind() {
-        // No UPDATE_HP: can't read the marker, so emit Other and let
-        // merge_kind keep any prior kind — never flip an established NPC to
-        // Mob on a position-only tick.
+        // Static targid + no UPDATE_HP: can't read the marker, so emit Other
+        // and let merge_kind keep any prior kind — never flip an established
+        // NPC to Mob on a position-only tick.
         assert_eq!(
-            classify_char_npc(Some(0), false, false, false),
+            classify_char_npc(Some(0), STATIC_TARGID, false, false, false),
             EntityKind::Other
         );
     }
 
     #[test]
     fn pc_owned_standard_model_is_a_pet() {
-        // PMaster-is-a-PC wins over the mob marker (jug pet / charmed mob).
+        // PMaster-is-a-PC wins over both the targid range and the mob marker
+        // (jug pet / charmed mob).
         assert_eq!(
-            classify_char_npc(Some(0), true, true, true),
+            classify_char_npc(Some(0), DYNAMIC_TARGID, true, true, true),
             EntityKind::Pet
         );
     }
@@ -3948,20 +3999,23 @@ mod tests {
     #[test]
     fn equipped_models_are_npcs_and_furniture_is_other() {
         assert_eq!(
-            classify_char_npc(Some(1), false, true, false),
+            classify_char_npc(Some(1), STATIC_TARGID, false, true, false),
             EntityKind::Npc
         );
         assert_eq!(
-            classify_char_npc(Some(7), false, false, false),
+            classify_char_npc(Some(7), STATIC_TARGID, false, false, false),
             EntityKind::Npc
         );
         for door_size in [2u16, 3, 4] {
             assert_eq!(
-                classify_char_npc(Some(door_size), false, true, false),
+                classify_char_npc(Some(door_size), STATIC_TARGID, false, true, false),
                 EntityKind::Other
             );
         }
-        assert_eq!(classify_char_npc(None, false, true, true), EntityKind::Other);
+        assert_eq!(
+            classify_char_npc(None, STATIC_TARGID, false, true, true),
+            EntityKind::Other
+        );
     }
 
     // ---- 10 Hz Move cadence + rubber-band reconciliation ----
