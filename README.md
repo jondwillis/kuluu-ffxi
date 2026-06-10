@@ -27,6 +27,18 @@ git submodule update --init --depth 1 \
 cargo build
 ```
 
+**Enable the git hooks (once per clone).** A `pre-push` gate runs the same
+fmt + clippy as CI so a red build is caught before you push. It's off until you
+opt in (git won't let a repo auto-enable its own hooks):
+
+```bash
+cargo xtask install-hooks          # sets core.hooksPath=.githooks
+cargo xtask install-hooks --check  # verify it's active (non-zero exit if not)
+```
+
+Bypass a single push with `git push --no-verify`; `PREPUSH_FAST=1 git push`
+runs fmt only. (`scripts/install-hooks.sh` does the same thing without a build.)
+
 That's everything the compiler needs. Upstream repos that are **not used by
 the build** — only cited in source comments for reference (`Phoenix`,
 `AltanaViewer`, `lotus-ffxi`, `xi-tinkerer`) — live under `research/`, not

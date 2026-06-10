@@ -17,6 +17,15 @@
 //! `cargo xtask game` to wire the result into `vendor/game-files/`. Downloading
 //! the client is free; a registration code / subscription is needed to *play*.
 //!
+//! ## `cargo xtask install-hooks [--check]`
+//!
+//! Activate the versioned git hooks in `.githooks/` for this clone by pointing
+//! `core.hooksPath` at it (the fmt+clippy pre-push gate). Mirrors
+//! `scripts/install-hooks.sh`, kept as a compile-free fast path. It's per-clone
+//! because `git config` writes the uncommitted `.git/config` — git won't let a
+//! repo auto-enable its own hooks. `--check` only verifies (non-zero exit when
+//! inactive) so the README / CI / a setup doctor can assert the gate is live.
+//!
 //! Std-only by design — see Cargo.toml; HTTP and the installer run by shelling
 //! out to `curl` and `wine`.
 
@@ -42,6 +51,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("install-hooks") => match cmd_install_hooks(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some(other) => {
             eprintln!("unknown xtask `{other}`\n");
             usage();
@@ -58,6 +74,7 @@ fn usage() {
     eprintln!(
         "usage: cargo xtask game [PATH] [--copy] [--force]\n\
          \x20      cargo xtask game --download [--region us|eu] [--yes]\n\
+         \x20      cargo xtask install-hooks [--check]\n\
          \n\
          Wire a retail FFXI install into vendor/game-files/.\n\
          PATH        an install dir to use (skips auto-detection)\n\
@@ -65,7 +82,10 @@ fn usage() {
          --force     replace an existing vendor/game-files link\n\
          --download  download SE's official client installer and launch it\n\
          --region    us (default) or eu, for --download\n\
-         --yes       skip the --download confirmation prompt"
+         --yes       skip the --download confirmation prompt\n\
+         \n\
+         Activate the versioned git hooks (.githooks/) for this clone.\n\
+         --check     verify the pre-push gate is active; non-zero exit if not"
     );
 }
 
@@ -84,7 +104,10 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
             "--download" => download = true,
             "--yes" | "-y" => yes = true,
             "--region" => {
-                region = it.next().ok_or("--region needs a value (us|eu)")?.to_lowercase();
+                region = it
+                    .next()
+                    .ok_or("--region needs a value (us|eu)")?
+                    .to_lowercase();
             }
             s if s.starts_with("--") => return Err(format!("unknown flag `{s}`")),
             s => explicit = Some(PathBuf::from(s)),
@@ -101,7 +124,10 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
 
     // Already wired up and valid? Nothing to do.
     if is_ffxi_root(&dest) {
-        println!("vendor/game-files already has a valid install:\n  {}", show(&dest));
+        println!(
+            "vendor/game-files already has a valid install:\n  {}",
+            show(&dest)
+        );
         print_env_hint(&dest);
         return Ok(());
     }
@@ -141,12 +167,15 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
     // Refuse to clobber a real directory (only ever replace our own symlink).
     if dest.exists() || is_symlink(&dest) {
         if is_symlink(&dest) && force {
-            std::fs::remove_file(&dest).map_err(|e| format!("removing old link {}: {e}", dest.display()))?;
+            std::fs::remove_file(&dest)
+                .map_err(|e| format!("removing old link {}: {e}", dest.display()))?;
         } else if is_symlink(&dest) {
             return Err(format!(
                 "{} is already a link (to {}). Re-run with --force to replace it.",
                 dest.display(),
-                std::fs::read_link(&dest).map(|p| p.display().to_string()).unwrap_or_default()
+                std::fs::read_link(&dest)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
             ));
         } else {
             return Err(format!(
@@ -156,7 +185,8 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
         }
     }
 
-    std::fs::create_dir_all(&dest_se).map_err(|e| format!("creating {}: {e}", dest_se.display()))?;
+    std::fs::create_dir_all(&dest_se)
+        .map_err(|e| format!("creating {}: {e}", dest_se.display()))?;
 
     if copy {
         println!("Copying (this can be ~19 GB) ...");
@@ -177,6 +207,112 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// --- git hook activation ---
+
+/// The hooks dir we point `core.hooksPath` at, relative to the workspace root.
+const HOOKS_DIR: &str = ".githooks";
+
+/// Activate (or, with `--check`, verify) the versioned git hooks for this clone.
+/// Sets `core.hooksPath=.githooks` so the pre-push fmt/clippy gate runs. The same
+/// effect as `scripts/install-hooks.sh`; both write byte-identical config so they
+/// can't drift.
+fn cmd_install_hooks(args: &[String]) -> Result<(), String> {
+    let mut check = false;
+    for a in args {
+        match a.as_str() {
+            "--check" => check = true,
+            s => {
+                return Err(format!(
+                    "unknown flag `{s}` (install-hooks takes only --check)"
+                ))
+            }
+        }
+    }
+
+    require_tool("git")?;
+    let workspace = workspace_root();
+    // Guard against running outside the repo: the hook we're enabling must exist.
+    if !workspace.join(HOOKS_DIR).join("pre-push").is_file() {
+        return Err(format!(
+            "{HOOKS_DIR}/pre-push not found under {} — run this from the ffxi repo",
+            show(&workspace)
+        ));
+    }
+
+    if check {
+        return match git_config_get(&workspace, "core.hooksPath")?.as_deref() {
+            Some(HOOKS_DIR) => {
+                println!("ok: git hooks active (core.hooksPath={HOOKS_DIR})");
+                Ok(())
+            }
+            Some(other) => Err(format!(
+                "git hooks NOT active: core.hooksPath={other} (expected {HOOKS_DIR})\n\
+                 run: cargo xtask install-hooks"
+            )),
+            None => Err("git hooks NOT active: core.hooksPath is unset\n\
+                 run: cargo xtask install-hooks"
+                .to_string()),
+        };
+    }
+
+    git_config_set(&workspace, "core.hooksPath", HOOKS_DIR)?;
+    make_executable(&workspace.join(HOOKS_DIR));
+    println!("installed: core.hooksPath={HOOKS_DIR} (pre-push gate active)");
+    println!("bypass a push with: git push --no-verify");
+    Ok(())
+}
+
+/// Set a git config key in the workspace repo (writes `.git/config`).
+fn git_config_set(workspace: &Path, key: &str, value: &str) -> Result<(), String> {
+    let status = Command::new("git")
+        .current_dir(workspace)
+        .args(["config", key, value])
+        .status()
+        .map_err(|e| format!("running git config: {e}"))?;
+    if !status.success() {
+        return Err(format!("`git config {key} {value}` failed ({status})"));
+    }
+    Ok(())
+}
+
+/// Read a git config key; `None` if unset (`git config --get` exits 1 for that).
+fn git_config_get(workspace: &Path, key: &str) -> Result<Option<String>, String> {
+    let out = Command::new("git")
+        .current_dir(workspace)
+        .args(["config", "--get", key])
+        .output()
+        .map_err(|e| format!("running git config: {e}"))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok((!val.is_empty()).then_some(val))
+}
+
+/// `chmod +x` every file in the hooks dir so git can run them. No-op on Windows,
+/// where git ignores the unix exec bit.
+#[cfg(unix)]
+fn make_executable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&p) {
+            let mut perms = meta.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            let _ = std::fs::set_permissions(&p, perms);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn make_executable(_dir: &Path) {}
+
 /// A directory is the FFXI DAT root if it holds VTABLE.DAT and a ROM/ tree.
 fn is_ffxi_root(dir: &Path) -> bool {
     dir.join(MARKER).is_file() && dir.join("ROM").is_dir()
@@ -195,7 +331,9 @@ fn find_ffxi_root(start: &Path, depth: usize) -> Option<PathBuf> {
         if d > depth || visited > 20_000 {
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if !p.is_dir() || is_symlink(&p) {
@@ -218,8 +356,12 @@ fn detect() -> Vec<PathBuf> {
 
     if cfg!(target_os = "windows") {
         for drive in ["C:\\", "D:\\"] {
-            roots.push(PathBuf::from(format!("{drive}Program Files (x86)\\PlayOnline")));
-            roots.push(PathBuf::from(format!("{drive}Program Files (x86)\\HorizonXI")));
+            roots.push(PathBuf::from(format!(
+                "{drive}Program Files (x86)\\PlayOnline"
+            )));
+            roots.push(PathBuf::from(format!(
+                "{drive}Program Files (x86)\\HorizonXI"
+            )));
         }
         if let Some(p) = std::env::var_os("LOCALAPPDATA") {
             roots.push(PathBuf::from(p).join("HorizonXI"));
@@ -321,7 +463,9 @@ fn confirm(prompt: &str) -> Result<bool, String> {
     print!("{prompt} [y/N] ");
     std::io::stdout().flush().ok();
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line).map_err(|e| format!("reading input: {e}"))?;
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("reading input: {e}"))?;
     Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
@@ -369,7 +513,9 @@ fn launch_installer(exe: &Path) -> Result<(), String> {
     if let Some(parent) = exe.parent() {
         cmd.current_dir(parent);
     }
-    let status = cmd.status().map_err(|e| format!("launching installer: {e}"))?;
+    let status = cmd
+        .status()
+        .map_err(|e| format!("launching installer: {e}"))?;
     if !status.success() {
         return Err(format!("installer exited with {status}"));
     }
@@ -379,16 +525,22 @@ fn launch_installer(exe: &Path) -> Result<(), String> {
 // --- small fs helpers (std-only) ---
 
 fn is_symlink(p: &Path) -> bool {
-    std::fs::symlink_metadata(p).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+    std::fs::symlink_metadata(p)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 fn show(p: &Path) -> String {
-    p.strip_prefix(workspace_root()).unwrap_or(p).display().to_string()
+    p.strip_prefix(workspace_root())
+        .unwrap_or(p)
+        .display()
+        .to_string()
 }
 
 #[cfg(unix)]
 fn symlink_dir(src: &Path, dst: &Path) -> Result<(), String> {
-    std::os::unix::fs::symlink(src, dst).map_err(|e| format!("symlink {} -> {}: {e}", dst.display(), src.display()))
+    std::os::unix::fs::symlink(src, dst)
+        .map_err(|e| format!("symlink {} -> {}: {e}", dst.display(), src.display()))
 }
 
 #[cfg(windows)]
@@ -409,11 +561,14 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     for e in entries.flatten() {
         let from = e.path();
         let to = dst.join(e.file_name());
-        let ft = e.file_type().map_err(|err| format!("stat {}: {err}", from.display()))?;
+        let ft = e
+            .file_type()
+            .map_err(|err| format!("stat {}: {err}", from.display()))?;
         if ft.is_dir() {
             copy_dir(&from, &to)?;
         } else {
-            std::fs::copy(&from, &to).map_err(|err| format!("copy {} -> {}: {err}", from.display(), to.display()))?;
+            std::fs::copy(&from, &to)
+                .map_err(|err| format!("copy {} -> {}: {err}", from.display(), to.display()))?;
         }
     }
     Ok(())
@@ -422,5 +577,8 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
 /// Workspace root = the dir holding this xtask crate's parent. `CARGO_MANIFEST_DIR`
 /// is `<workspace>/xtask`, so its parent is the workspace root.
 fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
