@@ -34,6 +34,7 @@ pub mod screenshot;
 pub mod slash_commands;
 pub mod text_input;
 pub mod widgets;
+pub mod zone_transition;
 
 use std::sync::Arc;
 
@@ -373,6 +374,11 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         // loader via `SceneState.snapshot.zone_id`. See module
         // docs for the Phase-2 UI-translucency follow-up.
         launcher_backdrop::LauncherBackdropPlugin,
+        // Retail-style zoning blackout: hides the HUD, fades to black,
+        // shows "Downloading data", and holds through the `zone_id == None`
+        // transient until the destination zone is position-seeded + its
+        // geometry has loaded. See module docs.
+        zone_transition::ZoneTransitionOverlayPlugin,
     ))
     // Plug ffxi-nav's static zone-id → name table into the zone-flash
     // banner. Without this the banner falls back to `Zone #NNN`; with

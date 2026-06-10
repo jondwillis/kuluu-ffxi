@@ -29,7 +29,15 @@ use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::vos2::{parse_vos2, Vos2Mesh};
 use ffxi_dat::{walk, walk_tree, ChunkKind, ChunkNode, DatRoot};
 
-use crate::scene::TrackedEntities;
+use bevy::render::storage::ShaderStorageBuffer;
+
+use crate::graphics_settings::{CharacterRenderPath, GraphicsSettings};
+use crate::scene::{BakedActor, TrackedEntities};
+use crate::skeleton_instance::{eval_bind_pose, eval_pose, pc_pivot_rotation, FfxiActor};
+use crate::skinned_ffxi_material::{
+    FfxiLightingUniform, FfxiSkinnedMaterial, ATTR_COLOR, ATTR_JOINT0, ATTR_JOINT1,
+    ATTR_JOINT_WEIGHT, ATTR_NORMAL0, ATTR_NORMAL1, ATTR_POSITION0, ATTR_POSITION1,
+};
 
 /// Parent-side actor state for an NPC rendered via Bevy `SkinnedMesh`.
 /// One bone-entity is created per skeleton bone; each holds a `Transform`
@@ -640,7 +648,13 @@ pub fn process_load_vos2_requests(
     // than the pivot's current translation rewrites it via this
     // query so the actor stays glued to feet-on-ground.
     mut q_xform: Query<&mut Transform>,
+    settings: Res<GraphicsSettings>,
 ) {
+    // FFXI-faithful path active → `process_load_vos2_requests_ffxi` owns
+    // these requests; this Bevy-SkinnedMesh path stands down.
+    if settings.character_path() == CharacterRenderPath::FfxiFaithful {
+        return;
+    }
     let queued: Vec<LoadVos2Request> = events.read().copied().collect();
     if queued.is_empty() {
         return;
@@ -1603,6 +1617,434 @@ fn spawn_skinned_actor(
     (bone_entities, pivot)
 }
 
+// ---------------------------------------------------------------------------
+// FFXI-faithful character path (custom material + GPU skinning).
+//
+// Selected by `GraphicsSettings::character_path() == FfxiFaithful`. Unlike
+// the Bevy `SkinnedMesh` path above, bones are NOT entities — each actor
+// owns one `ShaderStorageBuffer` of world-pose matrices (uploaded by
+// `tick_ffxi_actors`), and the custom vertex layout carries both bone-local
+// positions so the shader reproduces FFXI's exact dual-position skinning.
+// ---------------------------------------------------------------------------
+
+/// Per-vertex attribute arrays for the FFXI skinned material, computed
+/// once per mesh and shared across that mesh's texture groups (only UVs +
+/// indices vary per group).
+struct FfxiVertexData {
+    position0: Vec<[f32; 3]>,
+    position1: Vec<[f32; 3]>,
+    normal0: Vec<[f32; 3]>,
+    normal1: Vec<[f32; 3]>,
+    weight: Vec<f32>,
+    joint0: Vec<u32>,
+    joint1: Vec<u32>,
+    color: Vec<[f32; 4]>,
+}
+
+/// Negate one axis of a bone-local vector for symmetry mirroring (XIM
+/// `flipVector`): `flip_axis` 1→x, 2→y, 3→z, else unchanged.
+fn flip_axis(v: [f32; 3], axis: u8) -> [f32; 3] {
+    match axis {
+        1 => [-v[0], v[1], v[2]],
+        2 => [v[0], -v[1], v[2]],
+        3 => [v[0], v[1], -v[2]],
+        _ => v,
+    }
+}
+
+/// Build the per-vertex skinning attributes from a parsed VOS2 mesh,
+/// returning `(data, mirrored)` where `mirrored` is true when symmetry
+/// expansion appended a flipped copy (verts `[n..2n)` mirror `[0..n)`).
+///
+/// Rigid (1-weight) verts: the single bone-local position goes in slot 0,
+/// slot 1 is zeroed with weight 1 so the shader's second term vanishes.
+/// 2-weight verts: `pos1`/`pos2` (separate bone-local positions) fill
+/// slots 0/1 with the FFXI weight pair. Bones that overflow the skeleton
+/// (race/slot mismatch) clamp to bone 0 (the hip) so the vert stays
+/// visible-but-rigid rather than skinning to garbage.
+///
+/// When `header.flip != 0` the mesh ships one symmetric half; we append the
+/// other half per XIM's `flipVertex`: each mirrored vert negates its
+/// bone-local position/normal along the per-vertex `flipAxis` and re-binds
+/// to the `flippedIndex` (other-side) bone — NOT a crude world-space X-flip.
+fn build_ffxi_vertex_data(mesh: &Vos2Mesh, skel_bones: usize) -> (FfxiVertexData, bool) {
+    let n = mesh.vertices.len();
+    let weight2_count = mesh.bone_weights.len();
+    let weight1_count = n.saturating_sub(weight2_count);
+    let mirrored = mesh.header.flip != 0;
+    let total = if mirrored { n * 2 } else { n };
+
+    let mut vd = FfxiVertexData {
+        position0: vec![[0.0; 3]; total],
+        position1: vec![[0.0; 3]; total],
+        normal0: vec![[0.0; 3]; total],
+        normal1: vec![[0.0; 3]; total],
+        weight: vec![1.0; total],
+        joint0: vec![0; total],
+        joint1: vec![0; total],
+        color: vec![[1.0, 1.0, 1.0, 1.0]; total],
+    };
+
+    let clamp_bone = |b: Option<u16>| -> u32 {
+        match b {
+            Some(b) if (b as usize) < skel_bones => b as u32,
+            _ => 0,
+        }
+    };
+
+    for i in 0..n {
+        let b0 = clamp_bone(mesh.skeleton_bone_for(i));
+        vd.joint0[i] = b0;
+        if i < weight1_count {
+            // Rigid: only bone 0 contributes.
+            vd.position0[i] = mesh.vertices[i].pos;
+            vd.normal0[i] = mesh.vertices[i].normal;
+            vd.joint1[i] = b0;
+            vd.weight[i] = 1.0;
+        } else {
+            let bw = &mesh.bone_weights[i - weight1_count];
+            vd.position0[i] = bw.pos1;
+            vd.normal0[i] = bw.normal1;
+            let raw_b1 = mesh.skeleton_bone2_for(i);
+            let b1_valid = raw_b1.map(|b| (b as usize) < skel_bones).unwrap_or(false);
+            if b1_valid {
+                vd.position1[i] = bw.pos2;
+                vd.normal1[i] = bw.normal2;
+                vd.joint1[i] = raw_b1.unwrap() as u32;
+                let sum = bw.weight1 + bw.weight2;
+                vd.weight[i] = if sum > 0.0 { bw.weight1 / sum } else { 1.0 };
+            } else {
+                // Secondary bone out of range — degrade to rigid on bone 0.
+                vd.joint1[i] = b0;
+                vd.weight[i] = 1.0;
+            }
+        }
+    }
+
+    if mirrored {
+        // Per-vertex flip metadata lives in the parallel `bone_indices`
+        // stream (2 records per vertex): record[i*2] is jointRef0 (primary),
+        // record[i*2+1] is jointRef1. Each packs `bone_index2` = flippedIndex
+        // (the other-side bone) and `mirror_axis` = flipAxis.
+        let indirect = |raw: u8| -> Option<u16> {
+            if mesh.header.use_bone_table() {
+                mesh.bone_table.get(raw as usize).copied()
+            } else {
+                Some(raw as u16)
+            }
+        };
+        for i in 0..n {
+            let m = n + i;
+            let jr0 = mesh.bone_indices.get(i * 2);
+            let jr1 = mesh.bone_indices.get(i * 2 + 1);
+            let axis0 = jr0.map(|r| r.mirror_axis).unwrap_or(0);
+            let axis1 = jr1.map(|r| r.mirror_axis).unwrap_or(0);
+            vd.position0[m] = flip_axis(vd.position0[i], axis0);
+            vd.position1[m] = flip_axis(vd.position1[i], axis1);
+            vd.normal0[m] = flip_axis(vd.normal0[i], axis0);
+            vd.normal1[m] = flip_axis(vd.normal1[i], axis1);
+            vd.weight[m] = vd.weight[i];
+            vd.color[m] = vd.color[i];
+            vd.joint0[m] = clamp_bone(jr0.and_then(|r| indirect(r.bone_index2)));
+            vd.joint1[m] = clamp_bone(jr1.and_then(|r| indirect(r.bone_index2)));
+        }
+    }
+
+    (vd, mirrored)
+}
+
+/// Spawn (or extend) an FFXI-faithful actor for one loaded VOS2 slot.
+/// Returns `(pivot, bone_buffer, new_material_handles)` so the caller can
+/// accumulate actor-wide state across an actor's multiple slots.
+///
+/// `existing = Some((pivot, buffer))` reuses the pivot + bone buffer from a
+/// prior slot of the same actor (all slots share one skeleton/buffer).
+#[allow(clippy::too_many_arguments)]
+fn spawn_ffxi_actor(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<FfxiSkinnedMaterial>,
+    images: &mut Assets<Image>,
+    buffers: &mut Assets<ShaderStorageBuffer>,
+    parent: Entity,
+    loaded: &LoadedVos2,
+    skeleton: &std::sync::Arc<Skeleton>,
+    existing: Option<(Entity, Handle<ShaderStorageBuffer>)>,
+    is_pc: bool,
+    min_local_y: f32,
+) -> (Entity, Handle<ShaderStorageBuffer>, Vec<Handle<FfxiSkinnedMaterial>>) {
+    let (pivot, bone_buffer) = match existing {
+        Some(pb) => pb,
+        None => {
+            // The pivot carries the single FFXI-skeleton→Bevy basis change
+            // (PC: `Q_y(π/2)·Q_x(π)`, equal to the known-good CPU bake's
+            // total; NPC rigs land Y-up so identity) plus feet-on-ground.
+            let rotation = if is_pc {
+                pc_pivot_rotation()
+            } else {
+                Quat::IDENTITY
+            };
+            let pivot = commands
+                .spawn((
+                    Transform {
+                        translation: Vec3::Y * -min_local_y,
+                        rotation,
+                        scale: Vec3::ONE,
+                    },
+                    GlobalTransform::default(),
+                    Visibility::default(),
+                    ChildOf(parent),
+                ))
+                .id();
+            // Seed the bone buffer with the bind pose; `tick_ffxi_actors`
+            // overwrites it each frame once animation lands (M4).
+            let bind = eval_bind_pose(skeleton);
+            let buf = buffers.add(ShaderStorageBuffer::from(bind));
+            (pivot, buf)
+        }
+    };
+
+    // Texture pool (colocated IMG chunks), keyed by the group's tex name.
+    let mut by_name: std::collections::HashMap<String, Handle<Image>> =
+        std::collections::HashMap::with_capacity(loaded.textures.len());
+    let mut first: Option<Handle<Image>> = None;
+    for nt in &loaded.textures {
+        let handle = images.add(decoded_texture_to_image(&nt.texture));
+        if first.is_none() {
+            first = Some(handle.clone());
+        }
+        if !nt.name.is_empty() {
+            by_name.insert(nt.name.clone(), handle);
+        }
+    }
+
+    let (vd, mirrored) = build_ffxi_vertex_data(&loaded.mesh, skeleton.bones.len());
+    let n = loaded.mesh.vertices.len();
+    let total = vd.position0.len();
+    let mut out_materials = Vec::new();
+
+    for group in &loaded.mesh.groups {
+        if group.triangles.is_empty() {
+            continue;
+        }
+        let mut uvs: Vec<[f32; 2]> = vec![[0.0, 0.0]; total];
+        let mut uv_set: Vec<bool> = vec![false; total];
+        let tri_factor = if mirrored { 2 } else { 1 };
+        let mut indices: Vec<u32> = Vec::with_capacity(group.triangles.len() * 3 * tri_factor);
+        for t in &group.triangles {
+            for c in 0..3 {
+                let i = t.indices[c] as usize;
+                if i < n && !uv_set[i] {
+                    uvs[i] = t.uvs[c];
+                    uv_set[i] = true;
+                }
+                indices.push(t.indices[c] as u32);
+            }
+            // Mirrored half: same UVs, same winding, indices shifted by `n`
+            // into the appended mirror-vertex range (cull is off so winding
+            // doesn't matter; the flipped normals carry the shading).
+            if mirrored {
+                for c in 0..3 {
+                    let i = t.indices[c] as usize;
+                    let mi = i + n;
+                    if mi < total && !uv_set[mi] {
+                        uvs[mi] = t.uvs[c];
+                        uv_set[mi] = true;
+                    }
+                    indices.push((t.indices[c] as u32) + n as u32);
+                }
+            }
+        }
+        let tex_handle = by_name
+            .get(&group.texture_name)
+            .cloned()
+            .or_else(|| {
+                let trimmed = group.texture_name.trim_start_matches("tim").trim();
+                by_name.get(trimmed).cloned()
+            })
+            .or_else(|| first.clone());
+
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(ATTR_POSITION0, vd.position0.clone());
+        mesh.insert_attribute(ATTR_POSITION1, vd.position1.clone());
+        mesh.insert_attribute(ATTR_NORMAL0, vd.normal0.clone());
+        mesh.insert_attribute(ATTR_NORMAL1, vd.normal1.clone());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+        mesh.insert_attribute(ATTR_JOINT_WEIGHT, vd.weight.clone());
+        // Vec<u32> -> the Uint32 variant explicitly (no blanket From).
+        mesh.insert_attribute(
+            ATTR_JOINT0,
+            bevy::mesh::VertexAttributeValues::Uint32(vd.joint0.clone()),
+        );
+        mesh.insert_attribute(
+            ATTR_JOINT1,
+            bevy::mesh::VertexAttributeValues::Uint32(vd.joint1.clone()),
+        );
+        mesh.insert_attribute(ATTR_COLOR, vd.color.clone());
+        mesh.insert_indices(Indices::U32(indices));
+
+        let mat = materials.add(FfxiSkinnedMaterial {
+            lighting: FfxiLightingUniform::default(),
+            base_color_texture: tex_handle,
+            joint_matrices: bone_buffer.clone(),
+        });
+        out_materials.push(mat.clone());
+
+        commands.spawn((
+            Vos2Overlay,
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(mat),
+            Transform::default(),
+            ChildOf(pivot),
+        ));
+    }
+
+    (pivot, bone_buffer, out_materials)
+}
+
+/// FFXI-faithful counterpart to `process_load_vos2_requests`. Reads the
+/// same `LoadVos2Request` stream but only acts when the FFXI render path is
+/// active; the Bevy-path system early-returns in that case (each system has
+/// its own message cursor, so gating one off is clean).
+#[allow(clippy::too_many_arguments)]
+pub fn process_load_vos2_requests_ffxi(
+    mut events: MessageReader<LoadVos2Request>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    settings: Res<GraphicsSettings>,
+    tracked: Res<TrackedEntities>,
+    q_actor: Query<&FfxiActor>,
+    mut q_xform: Query<&mut Transform>,
+) {
+    if settings.character_path() != CharacterRenderPath::FfxiFaithful {
+        return;
+    }
+    let queued: Vec<LoadVos2Request> = events.read().copied().collect();
+    if queued.is_empty() {
+        return;
+    }
+    let mut load_cache: std::collections::HashMap<(u32, usize), Option<LoadedVos2>> =
+        std::collections::HashMap::new();
+    let mut despawned: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // In-tick actor accumulation: (pivot, bone_buffer, min, max, materials).
+    type ActorAcc = (
+        Entity,
+        Handle<ShaderStorageBuffer>,
+        f32,
+        f32,
+        Vec<Handle<FfxiSkinnedMaterial>>,
+    );
+    let mut actor_state: std::collections::HashMap<u32, ActorAcc> =
+        std::collections::HashMap::new();
+
+    for req in queued {
+        let Some(&bevy_e) = tracked.by_id.get(&req.entity_id) else {
+            continue;
+        };
+        let entry = load_cache
+            .entry((req.file_id, req.chunk_idx))
+            .or_insert_with(|| load_vos2(req.file_id, req.chunk_idx).ok());
+        let Some(loaded) = entry.as_ref() else {
+            continue;
+        };
+        if loaded.mesh.groups.is_empty() || loaded.mesh.vertices.is_empty() {
+            continue;
+        }
+        // Skeleton: explicit file id (NPC; same DAT as mesh) or race-keyed (PC).
+        let baked = match req.skeleton_file_id {
+            Some(id) => baked_skeleton_for_file(id),
+            None => baked_skeleton(req.race),
+        };
+        let Some(baked) = baked else {
+            continue;
+        };
+        let Some(skeleton) = baked.raw.as_ref() else {
+            continue;
+        };
+
+        if despawned.insert(req.entity_id) {
+            commands.entity(bevy_e).remove::<Mesh3d>();
+        }
+
+        let is_pc = req.race != 0;
+        let (slot_min, slot_max) = if is_pc {
+            measure_post_bake_y_extent(loaded, Some(&baked)).unwrap_or((0.0, 1.9))
+        } else {
+            compute_skinned_local_y_extent(loaded, is_pc).unwrap_or((-0.9, 1.6))
+        };
+
+        let existing = actor_state
+            .get(&req.entity_id)
+            .map(|(p, b, _, _, _)| (*p, b.clone()))
+            .or_else(|| {
+                q_actor
+                    .get(bevy_e)
+                    .ok()
+                    .map(|a| (a.pivot, a.bone_buffer.clone()))
+            });
+        let (cur_min, cur_max, mut mats_acc) = actor_state
+            .get(&req.entity_id)
+            .map(|(_, _, mn, mx, m)| (*mn, *mx, m.clone()))
+            .or_else(|| {
+                q_actor
+                    .get(bevy_e)
+                    .ok()
+                    .map(|a| (a.min_local_y, a.max_local_y, a.materials.clone()))
+            })
+            .unwrap_or((f32::INFINITY, f32::NEG_INFINITY, Vec::new()));
+
+        let (pivot, bone_buffer, new_mats) = spawn_ffxi_actor(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut images,
+            &mut buffers,
+            bevy_e,
+            loaded,
+            skeleton,
+            existing,
+            is_pc,
+            slot_min,
+        );
+        mats_acc.extend(new_mats);
+
+        let actor_min = cur_min.min(slot_min);
+        let actor_max = cur_max.max(slot_max);
+        if let Ok(mut piv) = q_xform.get_mut(pivot) {
+            piv.translation.y = -actor_min;
+        }
+        actor_state.insert(
+            req.entity_id,
+            (pivot, bone_buffer.clone(), actor_min, actor_max, mats_acc.clone()),
+        );
+
+        let actor_height = (actor_max - actor_min).max(0.1);
+        commands.entity(bevy_e).try_insert(FfxiActor {
+            skeleton: skeleton.clone(),
+            // Same recovery the Bevy path uses for `SkinnedActor`: the
+            // skeleton came through `BAKED_SKELETONS`, so this returns the
+            // file id `tick_ffxi_actors` feeds to `combat_stance` /
+            // `idle_anim_for_file`.
+            dat_id: raw_dat_id_for_skeleton(skeleton),
+            bone_buffer,
+            pivot,
+            materials: mats_acc,
+            min_local_y: actor_min,
+            max_local_y: actor_max,
+        });
+        commands.entity(bevy_e).try_insert(BakedActor {
+            min_mesh_y: actor_min,
+            actor_height,
+        });
+    }
+}
+
 /// `SkinnedActor.dat_id` recovery: we have `&Arc<Skeleton>` but no
 /// back-pointer to the file_id. Look it up via the `BAKED_SKELETONS`
 /// cache by scanning entries — there are only a handful per session
@@ -1657,337 +2099,52 @@ pub fn tick_skinned_actors(
     q_actors: Query<(&crate::components::WorldEntity, &SkinnedActor)>,
     mut q_bones: Query<&mut Transform>,
 ) {
-    use crate::combat_stance::{ClipId, EntityMotion};
     let elapsed = time.elapsed_secs();
     let dt = time.delta_secs();
+    let bt_target_by_id = bt_target_index(&state);
 
-    // Model-viewer override: when the resource is present, force every
-    // actor onto a single named clip — same per-bone keyframe write as
-    // the matrix-driven path, just with the engagement / motion / rest
-    // selection bypassed. Resolves once (3-char prefix) against the
-    // skeleton DAT first, then the PC motion DAT.
-    if let Some(over) = clip_override.as_deref() {
-        let prefix = override_prefix(&over.clip_name);
-        for (_world, actor) in &q_actors {
-            let Some(baked) = baked_skeleton_for_file(actor.dat_id) else {
-                continue;
-            };
-            let Some(raw) = baked.raw else { continue };
-            let Some(anim) = crate::combat_stance::override_anim_for_skel(actor.dat_id, &prefix)
-            else {
-                continue;
-            };
-            if anim.frames == 0 {
-                continue;
-            }
-            let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
-            let frame_idx = ((elapsed / safe_speed).floor() as usize) % anim.frames as usize;
-            for (i, bone) in raw.bones.iter().enumerate() {
-                if i == 0 {
-                    continue;
-                }
-                let Some(&bone_e) = actor.bone_entities.get(i) else {
-                    continue;
-                };
-                let (rot, trans, scale) = match anim
-                    .frames_for_bone(i)
-                    .and_then(|frames| frames.get(frame_idx))
-                {
-                    Some(f) => (f.rotation, f.translation, f.scale),
-                    None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
-                };
-                if let Ok(mut tf) = q_bones.get_mut(bone_e) {
-                    tf.rotation = Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]);
-                    tf.translation = Vec3::from_array(trans);
-                    tf.scale = Vec3::from_array(scale);
-                }
-            }
-        }
-        return;
-    }
-    // Build a once-per-frame index of (id → bt_target_id) so the inner
-    // engagement lookup is O(1). Without this, the per-actor loop did
-    // a linear `find()` over the whole snapshot — quadratic in nearby
-    // entity count, which is the hot path in crowded zones.
-    let bt_target_by_id: std::collections::HashMap<u32, u32> = state
-        .snapshot
-        .entities
-        .iter()
-        .map(|e| (e.id, e.bt_target_id))
-        .collect();
     for (world, actor) in &q_actors {
         let Some(baked) = baked_skeleton_for_file(actor.dat_id) else {
             continue;
         };
         let Some(raw) = baked.raw else { continue };
-
-        // Engagement comes from the snapshot's `bt_target_id` (the
-        // server's auto-attack target — authoritative). Motion is
-        // derived from per-frame Bevy Transform deltas by
-        // `track_entity_motion_system`. The wire `speed` field is
-        // movement *capability* (40 = base run, 0 = bound/stunned),
-        // NOT current motion — see [`EntityMotion`] docs.
-        let engaged = bt_target_by_id
-            .get(&world.id)
-            .map(|&t| t != 0)
-            .unwrap_or(false);
-        let sample = motion.sample(world.id).unwrap_or_default();
-        let moving = sample.speed > EntityMotion::MOVE_THRESHOLD;
-
-        // Rest stance (self only): when `/sit` / `/heal` / `/kneel` is
-        // active, self plays the sit / hea MO2 uninterruptibly until
-        // the [`RestStance`] resource clears (cleared by movement-key
-        // press in `dispatch_movement_system`, by re-pressing the
-        // bound `Action::Sit` / `Action::Heal`, or by server-driven
-        // heal-off when actual translation is detected). No
-        // crossfade — same hard toggle as the rest of the matrix.
         let is_self = state
             .snapshot
             .self_char_id
             .map(|sid| sid == world.id)
             .unwrap_or(false);
-        if is_self {
-            use crate::combat_stance::RestKind;
-            let rest_anim = match rest.kind {
-                RestKind::Sit => crate::combat_stance::sit_anim_for_skel(actor.dat_id)
-                    .or_else(|| idle_anim_for_file(actor.dat_id)),
-                RestKind::Heal => crate::combat_stance::heal_anim_for_skel(actor.dat_id)
-                    .or_else(|| crate::combat_stance::sit_anim_for_skel(actor.dat_id))
-                    .or_else(|| idle_anim_for_file(actor.dat_id)),
-                RestKind::None => None,
-            };
-            if let Some(anim) = rest_anim {
-                if anim.frames > 0 {
-                    let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
-                    let frame_idx =
-                        ((elapsed / safe_speed).floor() as usize) % anim.frames as usize;
-                    for (i, bone) in raw.bones.iter().enumerate() {
-                        if i == 0 {
-                            continue;
-                        }
-                        let Some(&bone_e) = actor.bone_entities.get(i) else {
-                            continue;
-                        };
-                        let (rot, trans, scale) = match anim
-                            .frames_for_bone(i)
-                            .and_then(|frames| frames.get(frame_idx))
-                        {
-                            Some(f) => (f.rotation, f.translation, f.scale),
-                            None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
-                        };
-                        if let Ok(mut tf) = q_bones.get_mut(bone_e) {
-                            tf.rotation = Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]);
-                            tf.translation = Vec3::from_array(trans);
-                            tf.scale = Vec3::from_array(scale);
-                        }
-                    }
-                    continue;
-                }
-            }
-        }
 
-        // Pick a logical ClipId. The directional rule (strafe /
-        // backpedal / turn-in-place) only applies to the casual,
-        // non-engaged locomotion path; the engaged path keeps the
-        // simpler (engaged, moving) matrix because retail combat
-        // stance has no strafe variants — combat run with a yawed
-        // root looks the same in every horizontal direction.
-        //
-        // Magnitude threshold for the strafe-vs-forward decision is
-        // half the run threshold — both components must be non-trivial
-        // *and* the strafe component must dominate.
-        let dir_threshold = EntityMotion::MOVE_THRESHOLD * 0.5;
-        let clip_id = if engaged {
-            if moving {
-                ClipId::CombatRun
-            } else {
-                ClipId::BattleIdle
-            }
-        } else if moving {
-            let fwd = sample.forward_component;
-            let strafe = sample.strafe_component;
-            if strafe.abs() > fwd.abs()
-                && strafe.abs() > dir_threshold
-                && fwd.abs() > dir_threshold * 0.5
-            {
-                if strafe > 0.0 {
-                    ClipId::StrafeRight
-                } else {
-                    ClipId::StrafeLeft
-                }
-            } else if fwd < -dir_threshold {
-                ClipId::Backpedal
-            } else {
-                ClipId::Run
-            }
-        } else if sample.heading_rate.abs() > EntityMotion::TURN_THRESHOLD_RAD_PER_SEC {
-            ClipId::TurnInPlace
-        } else {
-            ClipId::Idle
-        };
+        // Shared selection + sampling: returns one optional local
+        // transform per bone (bone 0 and undriven bones are `None`).
+        let pose = sample_animation_pose(
+            &raw,
+            actor.dat_id,
+            world.id,
+            is_self,
+            elapsed,
+            dt,
+            &motion,
+            &rest,
+            &mut blends,
+            clip_override.as_deref(),
+            &bt_target_by_id,
+        );
 
-        // Resolve a ClipId to (anim, time_scale_signum). Each step is
-        // a graceful degradation — NPC skels lack motion DATs, no PC
-        // skel ships a `bck`/`stl`/`str`/`trn` clip (probed empty), so
-        // the chain always ends on something universally present.
-        //
-        // INLINE NOTE: empirically the following 3-char prefixes are
-        // ABSENT from every retail PC skeleton DAT and motion DAT we
-        // could probe:
-        //   - `bck` (backpedal)  — fall back to `run` at -1× time scale
-        //   - `stl` / `str` (strafe L/R) — fall back to `run` (no sign flip)
-        //   - `trn` (turn-in-place)      — fall back to `idl`
-        // Walk (`wlk`) IS present on most PC skel DATs. The probe is
-        // still in `directional_anim_for_skel` so that beastman / NPC
-        // skels carrying these clips (if any) light up automatically.
-        let resolve =
-            |clip: ClipId| -> Option<(std::sync::Arc<ffxi_dat::anim::Mo2Animation>, f32)> {
-                match clip {
-                    ClipId::CombatRun => {
-                        crate::combat_stance::combat_run_anim_for_skel(actor.dat_id)
-                            .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
-                            .or_else(|| {
-                                crate::combat_stance::battle_idle_anim_for_skel(actor.dat_id)
-                            })
-                            .or_else(|| idle_anim_for_file(actor.dat_id))
-                            .map(|a| (a, 1.0))
-                    }
-                    ClipId::BattleIdle => {
-                        crate::combat_stance::battle_idle_anim_for_skel(actor.dat_id)
-                            .or_else(|| idle_anim_for_file(actor.dat_id))
-                            .map(|a| (a, 1.0))
-                    }
-                    ClipId::Run => crate::combat_stance::run_anim_for_skel(actor.dat_id)
-                        .or_else(|| idle_anim_for_file(actor.dat_id))
-                        .map(|a| (a, 1.0)),
-                    ClipId::Backpedal => {
-                        crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"bck")
-                            .map(|a| (a, 1.0))
-                            .or_else(|| {
-                                // No dedicated bck clip on PC skels — play run
-                                // reversed in time to fake the backpedal cycle.
-                                crate::combat_stance::run_anim_for_skel(actor.dat_id)
-                                    .map(|a| (a, -1.0))
-                            })
-                            .or_else(|| idle_anim_for_file(actor.dat_id).map(|a| (a, 1.0)))
-                    }
-                    ClipId::StrafeLeft => {
-                        crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"stl")
-                            .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
-                            .or_else(|| idle_anim_for_file(actor.dat_id))
-                            .map(|a| (a, 1.0))
-                    }
-                    ClipId::StrafeRight => {
-                        crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"str")
-                            .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
-                            .or_else(|| idle_anim_for_file(actor.dat_id))
-                            .map(|a| (a, 1.0))
-                    }
-                    ClipId::TurnInPlace => {
-                        crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"trn")
-                            .or_else(|| idle_anim_for_file(actor.dat_id))
-                            .map(|a| (a, 1.0))
-                    }
-                    ClipId::Walk => {
-                        crate::combat_stance::directional_anim_for_skel(actor.dat_id, b"wlk")
-                            .or_else(|| crate::combat_stance::run_anim_for_skel(actor.dat_id))
-                            .or_else(|| idle_anim_for_file(actor.dat_id))
-                            .map(|a| (a, 1.0))
-                    }
-                    ClipId::Idle => idle_anim_for_file(actor.dat_id).map(|a| (a, 1.0)),
-                }
-            };
-
-        // Advance / start the cross-fade. After this call the blend's
-        // `to_clip` is `clip_id`; on a fresh switch `t = 0`; on a
-        // stable selection `t` ticks toward 1.
-        blends.update(world.id, clip_id, dt);
-        let blend = blends.by_id.get(&world.id).copied().expect("just inserted");
-
-        let Some((to_anim, to_scale)) = resolve(blend.to_clip) else {
-            continue;
-        };
-        // While the blend is still in flight, sample both `from` and
-        // `to` and lerp per-bone. Once `t >= 1`, skip the `from` sample
-        // entirely — saves a DAT lookup + map walk.
-        let from_resolved = if blend.t < 1.0 && blend.from_clip != blend.to_clip {
-            resolve(blend.from_clip)
-        } else {
-            None
-        };
-
-        // Convert (anim, time_scale_signum) → current frame index. A
-        // negative `time_scale` runs the clip backwards (used for the
-        // run-as-backpedal fallback).
-        let frame_of = |anim: &ffxi_dat::anim::Mo2Animation, scale: f32| -> usize {
-            if anim.frames == 0 {
-                return 0;
-            }
-            let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
-            let t_local = elapsed * scale / safe_speed;
-            // Rust % can be negative; wrap into [0, frames).
-            let frames = anim.frames as i64;
-            let raw = t_local.floor() as i64;
-            let idx = ((raw % frames) + frames) % frames;
-            idx as usize
-        };
-        let to_frame = frame_of(&to_anim, to_scale);
-        let from_frame = from_resolved
-            .as_ref()
-            .map(|(a, s)| frame_of(a, *s))
-            .unwrap_or(0);
-
-        let blend_t = blend.t.clamp(0.0, 1.0);
-
+        // Bone[0] carries the `bind_to_bevy` axis flip set up in
+        // `spawn_skinned_actor`; `sample_animation_pose` never drives it.
+        // For every other bone, `Some` writes the sampled local; `None`
+        // refreshes the bind local (a no-op since it was set at spawn).
         for (i, bone) in raw.bones.iter().enumerate() {
-            // Bone[0] carries the `bind_to_bevy` axis flip set up in
-            // `spawn_skinned_actor`. Animating it from the MO2 frame
-            // would overwrite that flip and rotate the whole skeleton
-            // back into FFXI-engine axes — character lays on its side.
-            // Skip it; idle anim's root-bone motion is small enough
-            // (slight sway/breathing translate) that losing it is
-            // invisible vs. the cost of axis corruption.
             if i == 0 {
                 continue;
             }
             let Some(&bone_e) = actor.bone_entities.get(i) else {
                 continue;
             };
-
-            // Sample `to` first (always live). Then optionally sample
-            // `from` and slerp / lerp by `blend_t`.
-            let (to_rot, to_trans, to_scale_arr) = match to_anim
-                .frames_for_bone(i)
-                .and_then(|frames| frames.get(to_frame))
-            {
-                Some(f) => (f.rotation, f.translation, f.scale),
+            let (rot, trans, scale) = match &pose[i] {
+                Some(bl) => (bl.rotation, bl.translation, bl.scale),
                 None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
             };
-
-            let (rot, trans, scale) = match from_resolved.as_ref() {
-                Some((from_anim, _)) => {
-                    let (from_rot, from_trans, from_scale_arr) = match from_anim
-                        .frames_for_bone(i)
-                        .and_then(|frames| frames.get(from_frame))
-                    {
-                        Some(f) => (f.rotation, f.translation, f.scale),
-                        None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
-                    };
-                    let q_from =
-                        Quat::from_xyzw(from_rot[0], from_rot[1], from_rot[2], from_rot[3]);
-                    let q_to = Quat::from_xyzw(to_rot[0], to_rot[1], to_rot[2], to_rot[3]);
-                    let q = q_from.slerp(q_to, blend_t);
-                    let t_from = Vec3::from_array(from_trans);
-                    let t_to = Vec3::from_array(to_trans);
-                    let t = t_from.lerp(t_to, blend_t);
-                    let s_from = Vec3::from_array(from_scale_arr);
-                    let s_to = Vec3::from_array(to_scale_arr);
-                    let s = s_from.lerp(s_to, blend_t);
-                    ([q.x, q.y, q.z, q.w], [t.x, t.y, t.z], [s.x, s.y, s.z])
-                }
-                None => (to_rot, to_trans, to_scale_arr),
-            };
-
             if let Ok(mut tf) = q_bones.get_mut(bone_e) {
                 tf.rotation = Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]);
                 tf.translation = Vec3::from_array(trans);
@@ -1995,6 +2152,349 @@ pub fn tick_skinned_actors(
             }
         }
     }
+}
+
+/// FFXI-faithful animation tick. The counterpart to [`tick_skinned_actors`]:
+/// identical clip selection (via the shared [`sample_animation_pose`]), but
+/// instead of writing one `Transform` per bone entity it evaluates the whole
+/// pose on the CPU ([`eval_pose`]) and uploads the world-pose matrices into
+/// the actor's shared storage buffer, which the [`FfxiSkinnedMaterial`]
+/// shader reads at binding 3.
+///
+/// Gated on the FFXI render path: when the Bevy path is active there are no
+/// [`FfxiActor`]s spawned, so this is a no-op either way, but the explicit
+/// early-return keeps it from building the engagement index for nothing.
+pub fn tick_ffxi_actors(
+    time: Res<Time>,
+    state: Res<crate::snapshot::SceneState>,
+    motion: Res<crate::combat_stance::EntityMotion>,
+    rest: Res<crate::combat_stance::RestStance>,
+    mut blends: ResMut<crate::combat_stance::AnimationBlends>,
+    clip_override: Option<Res<crate::combat_stance::ModelViewerClipOverride>>,
+    settings: Res<GraphicsSettings>,
+    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    q_actors: Query<(&crate::components::WorldEntity, &FfxiActor)>,
+) {
+    if settings.character_path() != CharacterRenderPath::FfxiFaithful {
+        return;
+    }
+    let elapsed = time.elapsed_secs();
+    let dt = time.delta_secs();
+    let bt_target_by_id = bt_target_index(&state);
+
+    for (world, actor) in &q_actors {
+        let is_self = state
+            .snapshot
+            .self_char_id
+            .map(|sid| sid == world.id)
+            .unwrap_or(false);
+
+        let pose = sample_animation_pose(
+            &actor.skeleton,
+            actor.dat_id,
+            world.id,
+            is_self,
+            elapsed,
+            dt,
+            &motion,
+            &rest,
+            &mut blends,
+            clip_override.as_deref(),
+            &bt_target_by_id,
+        );
+
+        // `pose[0]` is `None`, so bone 0 keeps its raw bind local — the
+        // 270°-Y root roll the actor pivot's `Q_y(π/2)·Q_x(π)` depends on.
+        // Every other bone is animated; `None` falls back to bind inside
+        // `pose_world`.
+        let mats = eval_pose(&actor.skeleton, &pose);
+        if let Some(buf) = buffers.get_mut(&actor.bone_buffer) {
+            buf.set_data(mats);
+        }
+    }
+}
+
+/// Build a once-per-frame `id → bt_target_id` index so the per-actor
+/// engagement lookup is O(1). Without it the per-actor loop did a linear
+/// `find()` over the whole snapshot — quadratic in nearby-entity count,
+/// the hot path in crowded zones. Shared by both character ticks.
+fn bt_target_index(
+    state: &crate::snapshot::SceneState,
+) -> std::collections::HashMap<u32, u32> {
+    state
+        .snapshot
+        .entities
+        .iter()
+        .map(|e| (e.id, e.bt_target_id))
+        .collect()
+}
+
+/// Shared MO2 pose sampler for both character render paths. Encapsulates
+/// the full clip-selection state machine — model-viewer override, self rest
+/// stance, then engagement/motion-driven locomotion with a crossfade blend —
+/// and returns one optional bone-local transform per skeleton bone.
+///
+/// `out[0]` is always `None`: bone 0 carries the root axis convention (the
+/// Bevy path bakes `bind_to_bevy` into bone 0's entity; the FFXI path keeps
+/// bone 0's raw bind local under the actor pivot). Animating it from the MO2
+/// root channel would corrupt orientation in both. Every undriven bone is
+/// `None` too, so callers fall back to the bind local.
+///
+/// Mutates `blends` (advances the crossfade) only on the locomotion path;
+/// the override and rest paths return before touching it, matching the
+/// original `tick_skinned_actors` control flow exactly.
+#[allow(clippy::too_many_arguments)]
+fn sample_animation_pose(
+    raw: &Skeleton,
+    dat_id: u32,
+    world_id: u32,
+    is_self: bool,
+    elapsed: f32,
+    dt: f32,
+    motion: &crate::combat_stance::EntityMotion,
+    rest: &crate::combat_stance::RestStance,
+    blends: &mut crate::combat_stance::AnimationBlends,
+    clip_override: Option<&crate::combat_stance::ModelViewerClipOverride>,
+    bt_target_by_id: &std::collections::HashMap<u32, u32>,
+) -> Vec<Option<bone::BoneLocal>> {
+    use crate::combat_stance::{ClipId, EntityMotion};
+    let n = raw.bones.len();
+    let mut out: Vec<Option<bone::BoneLocal>> = vec![None; n];
+
+    // Sample `anim` at `frame_idx` into every driven bone > 0.
+    let fill = |out: &mut [Option<bone::BoneLocal>],
+                anim: &ffxi_dat::anim::Mo2Animation,
+                frame_idx: usize| {
+        for (i, slot) in out.iter_mut().enumerate().skip(1) {
+            if let Some(f) = anim.frames_for_bone(i).and_then(|fr| fr.get(frame_idx)) {
+                *slot = Some(bone::BoneLocal {
+                    rotation: f.rotation,
+                    translation: f.translation,
+                    scale: f.scale,
+                });
+            }
+        }
+    };
+    // Forward-time wrapped frame index for the non-blended (override /
+    // rest) paths.
+    let wrap_frame = |anim: &ffxi_dat::anim::Mo2Animation| -> usize {
+        if anim.frames == 0 {
+            return 0;
+        }
+        let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
+        ((elapsed / safe_speed).floor() as usize) % anim.frames as usize
+    };
+
+    // 1. Model-viewer override: force one named clip, no engagement /
+    // motion / rest selection, no blend. Resolves once (3-char prefix)
+    // against the skeleton DAT first, then the PC motion DAT.
+    if let Some(over) = clip_override {
+        let prefix = override_prefix(&over.clip_name);
+        if let Some(anim) = crate::combat_stance::override_anim_for_skel(dat_id, &prefix) {
+            if anim.frames > 0 {
+                fill(&mut out, &anim, wrap_frame(&anim));
+            }
+        }
+        return out;
+    }
+
+    // 2. Rest stance (self only): when `/sit` / `/heal` / `/kneel` is
+    // active, self plays the sit / hea MO2 uninterruptibly until the
+    // [`RestStance`] resource clears. No crossfade — hard toggle.
+    if is_self {
+        use crate::combat_stance::RestKind;
+        let rest_anim = match rest.kind {
+            RestKind::Sit => crate::combat_stance::sit_anim_for_skel(dat_id)
+                .or_else(|| idle_anim_for_file(dat_id)),
+            RestKind::Heal => crate::combat_stance::heal_anim_for_skel(dat_id)
+                .or_else(|| crate::combat_stance::sit_anim_for_skel(dat_id))
+                .or_else(|| idle_anim_for_file(dat_id)),
+            RestKind::None => None,
+        };
+        if let Some(anim) = rest_anim {
+            if anim.frames > 0 {
+                fill(&mut out, &anim, wrap_frame(&anim));
+                return out;
+            }
+        }
+    }
+
+    // 3. Engagement / motion-driven locomotion with a crossfade blend.
+    //
+    // Engagement comes from the snapshot's `bt_target_id` (the server's
+    // auto-attack target — authoritative). Motion is derived from
+    // per-frame Bevy Transform deltas by `track_entity_motion_system`.
+    let engaged = bt_target_by_id
+        .get(&world_id)
+        .map(|&t| t != 0)
+        .unwrap_or(false);
+    let sample = motion.sample(world_id).unwrap_or_default();
+    let moving = sample.speed > EntityMotion::MOVE_THRESHOLD;
+
+    // Pick a logical ClipId. The directional rule (strafe / backpedal /
+    // turn-in-place) only applies to the casual, non-engaged locomotion
+    // path; the engaged path keeps the simpler (engaged, moving) matrix
+    // because retail combat stance has no strafe variants. The strafe
+    // magnitude threshold is half the run threshold — both components
+    // must be non-trivial *and* the strafe component must dominate.
+    let dir_threshold = EntityMotion::MOVE_THRESHOLD * 0.5;
+    let clip_id = if engaged {
+        if moving {
+            ClipId::CombatRun
+        } else {
+            ClipId::BattleIdle
+        }
+    } else if moving {
+        let fwd = sample.forward_component;
+        let strafe = sample.strafe_component;
+        if strafe.abs() > fwd.abs()
+            && strafe.abs() > dir_threshold
+            && fwd.abs() > dir_threshold * 0.5
+        {
+            if strafe > 0.0 {
+                ClipId::StrafeRight
+            } else {
+                ClipId::StrafeLeft
+            }
+        } else if fwd < -dir_threshold {
+            ClipId::Backpedal
+        } else {
+            ClipId::Run
+        }
+    } else if sample.heading_rate.abs() > EntityMotion::TURN_THRESHOLD_RAD_PER_SEC {
+        ClipId::TurnInPlace
+    } else {
+        ClipId::Idle
+    };
+
+    // Resolve a ClipId to (anim, time_scale_signum). Each step is a
+    // graceful degradation — NPC skels lack motion DATs, no PC skel ships
+    // a `bck`/`stl`/`str`/`trn` clip (probed empty), so the chain always
+    // ends on something universally present.
+    //
+    // INLINE NOTE: empirically these 3-char prefixes are ABSENT from
+    // every retail PC skeleton DAT and motion DAT we could probe:
+    //   - `bck` (backpedal)          — fall back to `run` at -1× time scale
+    //   - `stl` / `str` (strafe L/R) — fall back to `run` (no sign flip)
+    //   - `trn` (turn-in-place)      — fall back to `idl`
+    // Walk (`wlk`) IS present on most PC skel DATs. The probe is still in
+    // `directional_anim_for_skel` so beastman / NPC skels carrying these
+    // clips (if any) light up automatically.
+    let resolve = |clip: ClipId| -> Option<(std::sync::Arc<ffxi_dat::anim::Mo2Animation>, f32)> {
+        match clip {
+            ClipId::CombatRun => crate::combat_stance::combat_run_anim_for_skel(dat_id)
+                .or_else(|| crate::combat_stance::run_anim_for_skel(dat_id))
+                .or_else(|| crate::combat_stance::battle_idle_anim_for_skel(dat_id))
+                .or_else(|| idle_anim_for_file(dat_id))
+                .map(|a| (a, 1.0)),
+            ClipId::BattleIdle => crate::combat_stance::battle_idle_anim_for_skel(dat_id)
+                .or_else(|| idle_anim_for_file(dat_id))
+                .map(|a| (a, 1.0)),
+            ClipId::Run => crate::combat_stance::run_anim_for_skel(dat_id)
+                .or_else(|| idle_anim_for_file(dat_id))
+                .map(|a| (a, 1.0)),
+            ClipId::Backpedal => {
+                crate::combat_stance::directional_anim_for_skel(dat_id, b"bck")
+                    .map(|a| (a, 1.0))
+                    .or_else(|| {
+                        // No dedicated bck clip on PC skels — play run
+                        // reversed in time to fake the backpedal cycle.
+                        crate::combat_stance::run_anim_for_skel(dat_id).map(|a| (a, -1.0))
+                    })
+                    .or_else(|| idle_anim_for_file(dat_id).map(|a| (a, 1.0)))
+            }
+            ClipId::StrafeLeft => crate::combat_stance::directional_anim_for_skel(dat_id, b"stl")
+                .or_else(|| crate::combat_stance::run_anim_for_skel(dat_id))
+                .or_else(|| idle_anim_for_file(dat_id))
+                .map(|a| (a, 1.0)),
+            ClipId::StrafeRight => crate::combat_stance::directional_anim_for_skel(dat_id, b"str")
+                .or_else(|| crate::combat_stance::run_anim_for_skel(dat_id))
+                .or_else(|| idle_anim_for_file(dat_id))
+                .map(|a| (a, 1.0)),
+            ClipId::TurnInPlace => crate::combat_stance::directional_anim_for_skel(dat_id, b"trn")
+                .or_else(|| idle_anim_for_file(dat_id))
+                .map(|a| (a, 1.0)),
+            ClipId::Walk => crate::combat_stance::directional_anim_for_skel(dat_id, b"wlk")
+                .or_else(|| crate::combat_stance::run_anim_for_skel(dat_id))
+                .or_else(|| idle_anim_for_file(dat_id))
+                .map(|a| (a, 1.0)),
+            ClipId::Idle => idle_anim_for_file(dat_id).map(|a| (a, 1.0)),
+        }
+    };
+
+    // Advance / start the cross-fade. After this the blend's `to_clip` is
+    // `clip_id`; on a fresh switch `t = 0`; on a stable selection `t`
+    // ticks toward 1.
+    blends.update(world_id, clip_id, dt);
+    let blend = blends.by_id.get(&world_id).copied().expect("just inserted");
+
+    let Some((to_anim, to_scale)) = resolve(blend.to_clip) else {
+        return out;
+    };
+    // While the blend is in flight, sample both `from` and `to` and lerp
+    // per bone. Once `t >= 1`, skip the `from` sample entirely.
+    let from_resolved = if blend.t < 1.0 && blend.from_clip != blend.to_clip {
+        resolve(blend.from_clip)
+    } else {
+        None
+    };
+
+    // (anim, time_scale_signum) → current frame index. Negative `scale`
+    // runs the clip backwards (the run-as-backpedal fallback).
+    let frame_of = |anim: &ffxi_dat::anim::Mo2Animation, scale: f32| -> usize {
+        if anim.frames == 0 {
+            return 0;
+        }
+        let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
+        let t_local = elapsed * scale / safe_speed;
+        // Rust % can be negative; wrap into [0, frames).
+        let frames = anim.frames as i64;
+        let r = t_local.floor() as i64;
+        (((r % frames) + frames) % frames) as usize
+    };
+    let to_frame = frame_of(&to_anim, to_scale);
+    let from_frame = from_resolved
+        .as_ref()
+        .map(|(a, s)| frame_of(a, *s))
+        .unwrap_or(0);
+    let blend_t = blend.t.clamp(0.0, 1.0);
+
+    for (i, bone) in raw.bones.iter().enumerate().skip(1) {
+        // Sample `to` first (always live). Then optionally sample `from`
+        // and slerp / lerp by `blend_t`.
+        let (to_rot, to_trans, to_scale_arr) = match to_anim
+            .frames_for_bone(i)
+            .and_then(|frames| frames.get(to_frame))
+        {
+            Some(f) => (f.rotation, f.translation, f.scale),
+            None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
+        };
+        let (rot, trans, scale) = match from_resolved.as_ref() {
+            Some((from_anim, _)) => {
+                let (from_rot, from_trans, from_scale_arr) = match from_anim
+                    .frames_for_bone(i)
+                    .and_then(|frames| frames.get(from_frame))
+                {
+                    Some(f) => (f.rotation, f.translation, f.scale),
+                    None => (bone.rot, bone.trans, [1.0, 1.0, 1.0]),
+                };
+                let q_from = Quat::from_xyzw(from_rot[0], from_rot[1], from_rot[2], from_rot[3]);
+                let q_to = Quat::from_xyzw(to_rot[0], to_rot[1], to_rot[2], to_rot[3]);
+                let q = q_from.slerp(q_to, blend_t);
+                let t = Vec3::from_array(from_trans).lerp(Vec3::from_array(to_trans), blend_t);
+                let s =
+                    Vec3::from_array(from_scale_arr).lerp(Vec3::from_array(to_scale_arr), blend_t);
+                ([q.x, q.y, q.z, q.w], [t.x, t.y, t.z], [s.x, s.y, s.z])
+            }
+            None => (to_rot, to_trans, to_scale_arr),
+        };
+        out[i] = Some(bone::BoneLocal {
+            rotation: rot,
+            translation: trans,
+            scale,
+        });
+    }
+    out
 }
 
 /// Coerce a user-typed clip name into the 3-byte ASCII-lowercase prefix
@@ -2624,4 +3124,92 @@ fn pbr_from_specular(exponent: f32, _intensity: f32) -> (f32, f32) {
         (1.0 - (exponent.ln_1p() / 5.0)).clamp(0.3, 1.0)
     };
     (roughness, 0.0)
+}
+
+#[cfg(test)]
+mod ffxi_skin_tests {
+    use super::*;
+    use ffxi_dat::vos2::{Vos2BoneIndices, Vos2Header, Vos2Vertex};
+
+    fn empty_header(flip: u16, kind_type: u16) -> Vos2Header {
+        Vos2Header {
+            version: 1,
+            kind_type,
+            flip,
+            off_poly_bytes: 0,
+            off_bone_table_bytes: 0,
+            bone_table_count: 0,
+            off_weight_bytes: 0,
+            off_bone_bytes: 0,
+            bone_indices_count: 0,
+            off_vertex_bytes: 0,
+            off_poly_load_bytes: 0,
+            poly_lod2_count: 0,
+        }
+    }
+
+    /// Two rigid verts, mirroring on. Confirms: rigid verts bind both
+    /// slots to bone0 at weight 1 with a zeroed second position; the
+    /// appended mirror half re-binds to the `flippedIndex` (bone_index2)
+    /// bone and negates the position along the per-vertex flip axis.
+    #[test]
+    fn rigid_and_mirror_expansion() {
+        let mesh = Vos2Mesh {
+            header: empty_header(1, 0), // flip=1 (mirror), use_bone_table=false
+            vertices: vec![
+                Vos2Vertex { pos: [1.0, 2.0, 3.0], normal: [1.0, 0.0, 0.0] },
+                Vos2Vertex { pos: [4.0, 5.0, 6.0], normal: [0.0, 1.0, 0.0] },
+            ],
+            groups: vec![],
+            bone_table: vec![],
+            // 2 records per vertex: jointRef0 then jointRef1.
+            // v0: primary bone 3, flip bone 5, flip axis 1 (X). v1: 4 / 6 / 1.
+            bone_indices: vec![
+                Vos2BoneIndices { bone_index1: 3, bone_index2: 5, mirror_axis: 1 },
+                Vos2BoneIndices { bone_index1: 0, bone_index2: 0, mirror_axis: 0 },
+                Vos2BoneIndices { bone_index1: 4, bone_index2: 6, mirror_axis: 1 },
+                Vos2BoneIndices { bone_index1: 0, bone_index2: 0, mirror_axis: 0 },
+            ],
+            bone_weights: vec![],
+        };
+
+        let (vd, mirrored) = build_ffxi_vertex_data(&mesh, 16);
+        assert!(mirrored);
+        assert_eq!(vd.position0.len(), 4); // 2 base + 2 mirror
+
+        // Base rigid vert 0.
+        assert_eq!(vd.joint0[0], 3);
+        assert_eq!(vd.joint1[0], 3);
+        assert_eq!(vd.weight[0], 1.0);
+        assert_eq!(vd.position0[0], [1.0, 2.0, 3.0]);
+        assert_eq!(vd.position1[0], [0.0, 0.0, 0.0]);
+
+        // Mirror of vert 0: flipped bone 5, X negated.
+        assert_eq!(vd.joint0[2], 5);
+        assert_eq!(vd.position0[2], [-1.0, 2.0, 3.0]);
+        assert_eq!(vd.normal0[2], [-1.0, 0.0, 0.0]);
+        // Mirror of vert 1: flipped bone 6, X negated.
+        assert_eq!(vd.joint0[3], 6);
+        assert_eq!(vd.position0[3], [-4.0, 5.0, 6.0]);
+    }
+
+    /// Bone indices that overflow the skeleton clamp to bone 0 (hip)
+    /// rather than indexing past the bone-matrix buffer.
+    #[test]
+    fn overflow_bone_clamps_to_zero() {
+        let mesh = Vos2Mesh {
+            header: empty_header(0, 0),
+            vertices: vec![Vos2Vertex { pos: [0.0; 3], normal: [0.0; 3] }],
+            groups: vec![],
+            bone_table: vec![],
+            bone_indices: vec![
+                Vos2BoneIndices { bone_index1: 99, bone_index2: 0, mirror_axis: 0 },
+                Vos2BoneIndices { bone_index1: 0, bone_index2: 0, mirror_axis: 0 },
+            ],
+            bone_weights: vec![],
+        };
+        let (vd, mirrored) = build_ffxi_vertex_data(&mesh, 16); // skeleton has 16 bones
+        assert!(!mirrored);
+        assert_eq!(vd.joint0[0], 0); // bone 99 >= 16 → clamped to hip
+    }
 }

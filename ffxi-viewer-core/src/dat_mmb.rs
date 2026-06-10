@@ -189,6 +189,11 @@ impl Plugin for DatOverlayPlugin {
                     crate::dat_mzb::poll_load_mzb_tasks,
                     process_load_mmb_requests,
                     crate::dat_vos2::process_load_vos2_requests,
+                    // FFXI-faithful character path. Reads the same
+                    // `LoadVos2Request` stream; only one of this and
+                    // `process_load_vos2_requests` acts per frame
+                    // (gated on `GraphicsSettings::character_path`).
+                    crate::dat_vos2::process_load_vos2_requests_ffxi,
                 )
                     .chain(),
             )

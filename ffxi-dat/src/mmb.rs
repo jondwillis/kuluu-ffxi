@@ -187,6 +187,29 @@ impl<'a> MmbHeader<'a> {
         raw.trim_end().to_string()
     }
 
+    /// The 16-byte ZoneMesh *name* — `decrypted[16..32]`, NUL/space
+    /// trimmed. This is the field FFXI's zone engine (and XIM's
+    /// `ZoneMeshSection`) keys mesh lookup on: a `ZoneDef` placement's
+    /// `id` is matched against exactly this name (`getZoneMeshResourceByNameAs`).
+    ///
+    /// Distinct from [`asset_name_str`], which returns `decrypted[8..32]`
+    /// (24 bytes = an 8-byte author/zone tag followed by this name). The
+    /// extra prefix makes `asset_name_str` unusable as a placement match
+    /// key — e.g. a floor slab whose true name is `"8"` shows up in
+    /// `asset_name` as `"<tag>8"`, so prefix-fuzzy matching against it
+    /// silently drops every numerically-named floor/terrain mesh. Use
+    /// this for placement→mesh resolution; use `asset_name_str` only for
+    /// human-facing debug.
+    pub fn zone_mesh_name(&self) -> String {
+        self.header_window[16..32]
+            .iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '\0' })
+            .take_while(|&c| c != '\0')
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
     /// True if this MMB is the zone's sky-cloud mesh. FFXI tags it with
     /// the ASCII marker `"clod"` in the header `imgID` (cite: RZN
     /// `FFXILandscapeMesh`); we scan the whole decrypted header window
@@ -904,6 +927,32 @@ mod tests {
         let mut buf = [0u8; 4];
         let err = decrypt_in_place(&mut buf).unwrap_err();
         assert!(matches!(err, DatError::Mmb(_)));
+    }
+
+    /// Regression guard for the zone-floor bug: a ZoneDef placement is
+    /// resolved against the **16-byte name at `decrypted[16..32]`**
+    /// (`zone_mesh_name`), NOT `asset_name` (`decrypted[8..32]`, which
+    /// prepends an 8-byte author/zone tag). Conflating the two — i.e.
+    /// matching placement ids against `asset_name` — silently drops every
+    /// numerically-named floor/terrain mesh in a zone (e.g. a slab named
+    /// `"8"` appears in `asset_name` as `"bastok8 8"`), leaving the floor
+    /// unrendered. This test pins the offset so a future edit can't drift
+    /// the two fields back together.
+    #[test]
+    fn zone_mesh_name_is_bytes_16_to_32_not_asset_name() {
+        // 32-byte header: [0..8] crypto/flags, [8..16] author tag,
+        // [16..32] the ZoneMesh name FFXI matches placements against.
+        let mut hdr = vec![0u8; 40];
+        hdr[3] = 4; // version < 5 → decrypt is a noop, header is plaintext
+        hdr[8..16].copy_from_slice(b"bastok  "); // 8-byte author/zone tag
+        hdr[16..32].copy_from_slice(b"8\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"); // name = "8"
+        let h = MmbHeader::parse(&hdr).unwrap();
+        // The placement match key must be exactly "8".
+        assert_eq!(h.zone_mesh_name(), "8");
+        // asset_name would NOT match a placement id of "8" — it carries
+        // the author prefix. This is the trap the fix avoids.
+        assert_ne!(h.asset_name_str(), "8");
+        assert!(h.asset_name_str().starts_with("bastok"));
     }
 
     #[test]

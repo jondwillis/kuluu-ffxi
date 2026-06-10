@@ -55,6 +55,10 @@ pub mod nameplate_billboard;
 pub mod picking;
 pub mod scene;
 pub mod scheduler_runtime;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod skeleton_instance;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod skinned_ffxi_material;
 pub mod sky_realism;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod skybox;
@@ -83,8 +87,8 @@ pub use components::{
 };
 pub use cursor::{CursorAssets, CursorPlugin, CursorRequests, CursorStyle};
 pub use graphics_settings::{
-    AaMode, DynamicLights, GraphicsField, GraphicsSettings, QualityPreset, SkyStyle,
-    GRAPHICS_FIELDS,
+    AaMode, CharacterRenderPath, DynamicLights, GraphicsField, GraphicsSettings, QualityPreset,
+    SkyStyle, GRAPHICS_FIELDS,
 };
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
@@ -230,6 +234,11 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(skybox::SkyboxPlugin);
         app.add_plugins(moon_material::MoonMaterialPlugin);
+        // FFXI-faithful skinned-character material (ported from FFXI /
+        // research-xim). Coexists with StandardMaterial; the character
+        // render path is selected by `GraphicsSettings::character_path`.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins(skinned_ffxi_material::FfxiMaterialPlugin);
         // Screen-space lens flare — Enhanced sky style only; the system
         // gates itself on `SkyStyle` and sun visibility.
         app.add_plugins(lens_flare::LensFlarePlugin);
@@ -398,6 +407,13 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(Update, dat_vos2::tick_skinned_actors);
 
+        // FFXI-faithful counterpart: drives the per-actor bone storage
+        // buffer the custom skinned material reads, using the same clip
+        // selection as `tick_skinned_actors`. Self-gates on the FFXI
+        // render path, so it's a no-op on the Bevy path (and vice-versa).
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(Update, dat_vos2::tick_ffxi_actors);
+
         // Per-entity motion tracker for combat-stance / locomotion
         // animation selection. Runs *before* `tick_skinned_actors`
         // (which reads `EntityMotion`) so the locomotion decision
@@ -413,7 +429,9 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,
-            combat_stance::track_entity_motion_system.before(dat_vos2::tick_skinned_actors),
+            combat_stance::track_entity_motion_system
+                .before(dat_vos2::tick_skinned_actors)
+                .before(dat_vos2::tick_ffxi_actors),
         );
 
         // Server doesn't send an explicit "clear your target" signal —

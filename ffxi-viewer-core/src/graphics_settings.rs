@@ -175,6 +175,31 @@ impl DynamicLights {
     }
 }
 
+/// Which renderer draws animated character models (PCs + NPCs).
+/// Orthogonal to the quality tier (preset cycles preserve it), like
+/// [`SkyStyle`] / [`DynamicLights`]. Persisted in `graphics.json`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CharacterRenderPath {
+    /// Existing path: Bevy `SkinnedMesh` + `StandardMaterial`. NPCs
+    /// animate on the GPU; PCs render as static CPU-baked bind pose.
+    #[default]
+    BevyStandard,
+    /// FFXI-faithful path: the custom [`crate::skinned_ffxi_material`]
+    /// with per-frame bone matrices from [`crate::skeleton_instance`].
+    /// Unifies PCs and NPCs and reproduces FFXI's dual-position skinning,
+    /// symmetry, and `2*vertexColor*texel` shading.
+    FfxiFaithful,
+}
+
+impl CharacterRenderPath {
+    pub const fn label(self) -> &'static str {
+        match self {
+            CharacterRenderPath::BevyStandard => "Bevy",
+            CharacterRenderPath::FfxiFaithful => "FFXI",
+        }
+    }
+}
+
 /// Selector used by the menu row → cycle dispatch. One variant per
 /// row on the Graphics tab; the row layout in `hud::menu` follows this
 /// order top-down.
@@ -316,6 +341,12 @@ pub struct GraphicsSettings {
     /// `/lights flicker` — animate emitter intensity/scale.
     #[serde(default = "default_light_flicker")]
     pub light_flicker: bool,
+    /// Which renderer draws animated characters. `#[serde(default)]` lands
+    /// a pre-existing `graphics.json` on `BevyStandard` (prior behavior).
+    /// See [`GraphicsSettings::character_path`] for the runtime accessor
+    /// (which honors the `FFXI_CHARACTER_PATH` dev override).
+    #[serde(default)]
+    pub character_render_path: CharacterRenderPath,
 }
 
 /// Default fine dynamic-light knobs. Kept in lockstep with
@@ -425,6 +456,7 @@ impl GraphicsSettings {
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
+                character_render_path: CharacterRenderPath::BevyStandard,
             },
             QualityPreset::Medium => Self {
                 preset,
@@ -444,6 +476,7 @@ impl GraphicsSettings {
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
+                character_render_path: CharacterRenderPath::BevyStandard,
             },
             QualityPreset::High => Self {
                 preset,
@@ -463,6 +496,7 @@ impl GraphicsSettings {
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
+                character_render_path: CharacterRenderPath::BevyStandard,
             },
             QualityPreset::Ultra => Self {
                 preset,
@@ -485,6 +519,7 @@ impl GraphicsSettings {
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
+                character_render_path: CharacterRenderPath::BevyStandard,
             },
             // Custom: identical to High at construction; the caller
             // mutates fields after. Used by the on-disk loader when
@@ -493,6 +528,18 @@ impl GraphicsSettings {
                 preset,
                 ..Self::for_preset(QualityPreset::High)
             },
+        }
+    }
+
+    /// Active character render path, honoring the `FFXI_CHARACTER_PATH`
+    /// dev override (`ffxi`/`faithful` or `bevy`/`standard`) so the two
+    /// paths can be A/B'd at launch without editing `graphics.json`. The
+    /// stored [`Self::character_render_path`] wins when the env var is unset.
+    pub fn character_path(&self) -> CharacterRenderPath {
+        match std::env::var("FFXI_CHARACTER_PATH").ok().as_deref() {
+            Some("ffxi") | Some("faithful") => CharacterRenderPath::FfxiFaithful,
+            Some("bevy") | Some("standard") => CharacterRenderPath::BevyStandard,
+            _ => self.character_render_path,
         }
     }
 

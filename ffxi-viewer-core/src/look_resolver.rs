@@ -38,7 +38,8 @@ use ffxi_viewer_wire::EntityLook;
 
 use crate::components::{EntityModel, LookComp, WorldEntity};
 use crate::dat_mmb::LoadMmbRequest;
-use crate::dat_vos2::LoadVos2Request;
+use crate::dat_vos2::{skeleton_file_id_for_race, LoadVos2Request};
+use crate::graphics_settings::{CharacterRenderPath, GraphicsSettings};
 use crate::scene::TrackedEntities;
 use crate::snapshot::SceneState;
 
@@ -672,10 +673,12 @@ pub fn dispatch_look_driven_models(
     load_mmb_tx: MessageWriter<LoadMmbRequest>,
     mut load_vos2_tx: MessageWriter<LoadVos2Request>,
     mut commands: Commands,
+    settings: Res<GraphicsSettings>,
 ) {
     let Some(zone_id) = state.snapshot.zone_id else {
         return;
     };
+    let ffxi_path = settings.character_path() == CharacterRenderPath::FfxiFaithful;
     for (we, look, current_model) in q_changed.iter() {
         // Already showing the right model? Skip.
         if let Some(EntityModel(sig)) = current_model {
@@ -742,13 +745,24 @@ pub fn dispatch_look_driven_models(
             // The GPU-path code in `dat_vos2::spawn_skinned_actor` is
             // kept intact for the NPC path (which works) and for
             // future PC re-enable once #1–#3 are addressed.
+            //
+            // On the FFXI-faithful path, PCs DO skin on the GPU: hand the
+            // race skeleton's file_id to `process_load_vos2_requests_ffxi`
+            // (its dual-position skinning + correct pivot dissolve the
+            // three blockers above). On the Bevy path PCs stay `None`
+            // (CPU bake, as before).
+            let pc_skeleton = if ffxi_path {
+                skeleton_file_id_for_race(race)
+            } else {
+                None
+            };
             if let Some(file_id) = face_file_id {
                 load_vos2_tx.write(LoadVos2Request {
                     file_id,
                     chunk_idx: 4,
                     entity_id: we.id,
                     race,
-                    skeleton_file_id: None,
+                    skeleton_file_id: pc_skeleton,
                 });
                 dispatched += 1;
             }
@@ -761,7 +775,7 @@ pub fn dispatch_look_driven_models(
                     chunk_idx: 4,
                     entity_id: we.id,
                     race,
-                    skeleton_file_id: None,
+                    skeleton_file_id: pc_skeleton,
                 });
                 dispatched += 1;
             }

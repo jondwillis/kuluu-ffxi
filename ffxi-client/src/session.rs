@@ -356,6 +356,11 @@ async fn run_map_session(
     // so the first keepalive after Stage::InZone sends server-authoritative
     // coords rather than `Position::default()`.
     let mut self_pos = Position::default();
+    // Flips `true` on the destination zone's `0x00A LOGIN` self-seed (or a
+    // CHAR_PC for self). Until then `self_pos` is still origin, so the
+    // flood-drain must keep waiting and keepalive must not emit POS — see
+    // `should_break_flood` and the keepalive POS gate.
+    let mut self_pos_seeded = false;
     // False until a `0x0DF GROUP_ATTR` for self lands with `MoghouseFlg!=0`.
     // Tracked across the flood drain *and* re-used after the wait-loop hands
     // off to the per-tick reactor (see the outer `flood_in_mog_house`).
@@ -381,20 +386,42 @@ async fn run_map_session(
                         &mut name_miss_dedup,
                         &mut current_zone_id,
                         &mut self_pos,
+                        &mut self_pos_seeded,
                         &mut npc_name_resolver,
                         &mut flood_in_mog_house,
                     );
                 }
             }
-            _ => break,
+            // Socket closed / decode error — nothing more is coming.
+            Ok(Err(_)) => break,
+            // 500ms idle gap. Don't leave the flood until the server has
+            // handed us an authoritative self position (the `0x00A LOGIN`
+            // seed): a slow destination-zone flood would otherwise drop us
+            // into keepalive at origin, and the first POS would tell LSB
+            // we're at (0,0,0). `flood_deadline` (8s) is the hard cap.
+            Err(_elapsed) => {
+                if should_break_flood(self_pos_seeded) {
+                    break;
+                }
+            }
         }
     }
     tracing::info!(
         iteration,
         total_subs,
         server_last_seq,
+        self_pos_seeded,
         "zone-in flood drained"
     );
+    if !self_pos_seeded {
+        tracing::warn!(
+            iteration,
+            current_zone_id,
+            "zone-in flood ended without a self-position seed (no 0x00A LOGIN \
+             for self before deadline) — outbound POS suppressed until a \
+             CHAR_PC for self lands"
+        );
+    }
 
     let mut sub_seq: u16 = 2;
     let mut bundle_seq: u16 = 3;
@@ -437,6 +464,7 @@ async fn run_map_session(
         kind_cache,
         name_miss_dedup,
         self_pos,
+        self_pos_seeded,
         npc_name_resolver,
     )
     .await
@@ -563,6 +591,10 @@ fn handle_sub_packet(
     // keepalive overrides the server's `loc.p` with garbage — lands
     // the player at the origin or wherever Move last walked us.
     self_pos: &mut Position,
+    // Set `true` once the server hands us an authoritative self position
+    // (the `0x00A LOGIN` spawn seed or a self CHAR_PC). See
+    // `should_break_flood` for why the flood-drain and keepalive gate on it.
+    self_pos_seeded: &mut bool,
     // Static-NPC name resolver backed by the FFXI client install
     // DATs. Used as a fallback for CHAR_NPC packets that arrive
     // without `UPDATE_NAME` set — LSB's `entity_update.cpp:293-295`
@@ -656,6 +688,9 @@ fn handle_sub_packet(
                         speed: head.speed,
                         speed_base: head.speed_base,
                     };
+                    // We now hold server-authoritative coords; release the
+                    // flood-drain wait and the keepalive POS gate.
+                    *self_pos_seeded = true;
                     // Seed the self entity from LOGIN's `PosHead` so the
                     // entity list (and therefore the wire snapshot's
                     // `self_pos`, which is now derived from it) reflects
@@ -796,6 +831,12 @@ fn handle_sub_packet(
                         heading: head.dir,
                         ..*self_pos
                     };
+                    // A self CHAR_PC is also a server-authoritative anchor —
+                    // covers the deadline-recovery path where the flood
+                    // exited before a LOGIN seed (keepalive resumes POS from
+                    // here) and the rare zone-in flood that sends CHAR_PC
+                    // for self before/without a 0x00A LOGIN.
+                    *self_pos_seeded = true;
                 }
                 let wire_name = decode::PosHead::try_extract_name(op, sub.data);
                 if wire_name.is_none() {
@@ -1544,6 +1585,12 @@ async fn keepalive_loop(
         std::time::Instant,
     >,
     mut self_pos: Position,
+    // Carried over from the flood drain: `true` once the server has handed
+    // us an authoritative self position. While `false` the loop refuses to
+    // put an outbound `0x015 POS` on the wire (it would report origin). A
+    // late self CHAR_PC flips it via `handle_sub_packet`, after which POS
+    // emission resumes with the now-authoritative coords.
+    mut self_pos_seeded: bool,
     mut npc_name_resolver: NpcNameResolver,
 ) -> Result<MapOutcome> {
     let mut last_recv = std::time::Instant::now();
@@ -2186,16 +2233,21 @@ async fn keepalive_loop(
                 //   - position delta from last emission > 0.5 yalm (jump),
                 //   - heading byte changed (immediate flush).
                 // First tick (`last_move_emission == None`) always emits so
-                // the server's zone-in handshake has an authoritative pos.
+                // the server's zone-in handshake has an authoritative pos —
+                // BUT only once `self_pos_seeded`: until the destination
+                // zone's `0x00A LOGIN` (or a self CHAR_PC) seeds `self_pos`,
+                // it's still `Position::default()`, and emitting that first
+                // tick would tell LSB we're at the origin.
                 let dx = self_pos.pos.x - last_emitted_pos.x;
                 let dy = self_pos.pos.y - last_emitted_pos.y;
                 let dz = self_pos.pos.z - last_emitted_pos.z;
                 let pos_delta = (dx * dx + dy * dy + dz * dz).sqrt();
                 let heading_changed = self_pos.heading != last_emitted_heading;
-                let include_pos = match last_move_emission {
-                    None => true,
-                    Some(t) => should_emit_pos(t.elapsed(), pos_delta, heading_changed),
-                };
+                let include_pos = self_pos_seeded
+                    && match last_move_emission {
+                        None => true,
+                        Some(t) => should_emit_pos(t.elapsed(), pos_delta, heading_changed),
+                    };
                 if include_pos {
                     payload.extend(build_subpacket_pos(
                         sub_seq,
@@ -2292,6 +2344,7 @@ async fn keepalive_loop(
                                 &mut name_miss_dedup,
                                 &mut current_zone_id,
                                 &mut self_pos,
+                                &mut self_pos_seeded,
                                 &mut npc_name_resolver,
                                 &mut self_in_mog_house,
                             );
@@ -4083,6 +4136,19 @@ fn should_emit_pos(
     elapsed >= MOVE_EMISSION_PERIOD || pos_delta_yalms > MOVE_BIG_JUMP_YALMS || heading_changed
 }
 
+/// Whether the zone-in flood-drain should stop on a recv idle gap.
+///
+/// We only leave the flood once the server has handed us an authoritative
+/// self position (`self_pos_seeded`) — the `0x00A LOGIN` spawn seed or a
+/// self CHAR_PC. Exiting earlier drops us into keepalive with `self_pos`
+/// still at `Position::default()`, and the first POS subpacket would then
+/// report (0,0,0), which LSB adopts as the player's location. The caller's
+/// `flood_deadline` guard is the independent hard cap, so a zone that never
+/// sends a self seed still can't wedge the drain forever.
+fn should_break_flood(self_pos_seeded: bool) -> bool {
+    self_pos_seeded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4224,6 +4290,17 @@ mod tests {
             0.0,
             true,
         ));
+    }
+
+    /// The zone-in flood must keep draining through a recv idle gap until
+    /// the server has seeded an authoritative self position; only then may
+    /// it exit (the caller's `flood_deadline` is the independent hard cap).
+    /// Pins the invariant so a future drive-by edit can't reintroduce the
+    /// "drop into keepalive at origin → POS (0,0,0)" zone-in bug.
+    #[test]
+    fn flood_drain_waits_for_self_pos_seed() {
+        assert!(!should_break_flood(false));
+        assert!(should_break_flood(true));
     }
 
     /// Cadence end-to-end: feed a synthetic 30 Hz integrator stream
