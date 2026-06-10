@@ -81,7 +81,9 @@ pub use components::{
     EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
 };
 pub use cursor::{CursorAssets, CursorPlugin, CursorRequests, CursorStyle};
-pub use graphics_settings::{AaMode, GraphicsField, GraphicsSettings, QualityPreset, SkyStyle};
+pub use graphics_settings::{
+    AaMode, DynamicLights, GraphicsField, GraphicsSettings, QualityPreset, SkyStyle,
+};
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
     ChatBuffer, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack, PassiveCursorFocus,

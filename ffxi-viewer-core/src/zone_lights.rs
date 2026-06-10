@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::components::InGameEntity;
 use crate::dat_mmb::MmbOverlay;
-use crate::graphics_settings::{GraphicsSettings, SkyStyle};
+use crate::graphics_settings::{DynamicLights, GraphicsSettings, SkyStyle};
 
 /// Runtime knobs for the dynamic-light heuristic. Persisted nowhere yet
 /// (resets each launch); tuned live via `/lights`.
@@ -386,6 +386,25 @@ fn animate_zone_lights(
     }
 }
 
+/// Push the `Dynamic Lights` graphics-menu setting onto
+/// [`ZoneLightConfig`] whenever it changes. A [`Local`] guard means an
+/// unrelated `GraphicsSettings` change won't clobber a live `/lights`
+/// tweak — that runtime override (which mutates `ZoneLightConfig`
+/// directly) survives until the user picks a different menu slot, the
+/// same pattern as `apply_sky_style_system` vs `/sky`.
+fn apply_dynamic_lights_setting(
+    settings: Res<GraphicsSettings>,
+    mut cfg: ResMut<ZoneLightConfig>,
+    mut last: Local<Option<DynamicLights>>,
+) {
+    if *last == Some(settings.dynamic_lights) {
+        return;
+    }
+    cfg.enabled = settings.dynamic_lights.enabled();
+    cfg.max_total = settings.dynamic_lights.max_total();
+    *last = Some(settings.dynamic_lights);
+}
+
 pub struct ZoneLightsPlugin;
 
 impl Plugin for ZoneLightsPlugin {
@@ -395,7 +414,13 @@ impl Plugin for ZoneLightsPlugin {
             .add_systems(Startup, init_flame_assets)
             .add_systems(
                 Update,
-                (enqueue_light_scan, drain_light_scan, animate_zone_lights).chain(),
+                (
+                    apply_dynamic_lights_setting,
+                    enqueue_light_scan,
+                    drain_light_scan,
+                    animate_zone_lights,
+                )
+                    .chain(),
             );
     }
 }

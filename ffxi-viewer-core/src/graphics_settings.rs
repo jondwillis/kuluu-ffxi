@@ -126,6 +126,46 @@ impl SkyStyle {
     }
 }
 
+/// Dynamic environmental lights (lanterns/braziers) synthesized from
+/// over-bright vertex clusters — an Enhanced-only embellishment (see
+/// `crate::zone_lights`). This is a real frame-time lever, so it gets a
+/// menu row: `Off` disables detection entirely, `Few`/`Many` cap the
+/// live emitter count. Orthogonal to the quality tier (preset cycles
+/// leave it untouched), like [`SkyStyle`].
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DynamicLights {
+    Off,
+    Few,
+    #[default]
+    Many,
+}
+
+impl DynamicLights {
+    pub const fn label(self) -> &'static str {
+        match self {
+            DynamicLights::Off => "Off",
+            DynamicLights::Few => "Few",
+            DynamicLights::Many => "Many",
+        }
+    }
+
+    /// Hard cap on simultaneously live emitters this setting implies —
+    /// fed into `ZoneLightConfig::max_total` by the reactor in
+    /// `crate::zone_lights`. `Off` maps to 0 *and* flips `enabled` off.
+    pub const fn max_total(self) -> u32 {
+        match self {
+            DynamicLights::Off => 0,
+            DynamicLights::Few => 24,
+            DynamicLights::Many => 48,
+        }
+    }
+
+    /// Whether detection runs at all.
+    pub const fn enabled(self) -> bool {
+        !matches!(self, DynamicLights::Off)
+    }
+}
+
 /// Selector used by the menu row → cycle dispatch. One variant per
 /// row on the Graphics tab; the row layout in `hud::menu` follows this
 /// order top-down.
@@ -143,6 +183,7 @@ pub enum GraphicsField {
     VSync,
     Fov,
     SkyStyle,
+    DynamicLights,
 }
 
 impl GraphicsField {
@@ -161,6 +202,7 @@ impl GraphicsField {
             GraphicsField::VSync => "VSync",
             GraphicsField::Fov => "FOV",
             GraphicsField::SkyStyle => "Sky Style",
+            GraphicsField::DynamicLights => "Dynamic Lights",
         }
     }
 }
@@ -187,6 +229,11 @@ pub struct GraphicsSettings {
     /// loads (lands on `Enhanced`, the prior hard-coded behavior).
     #[serde(default)]
     pub sky_style: SkyStyle,
+    /// Synthesized environmental lights. Orthogonal to the quality tier
+    /// (preset cycles preserve it). `#[serde(default)]` lands a
+    /// pre-existing `graphics.json` on `Many`, the prior behavior.
+    #[serde(default)]
+    pub dynamic_lights: DynamicLights,
 }
 
 impl Default for GraphicsSettings {
@@ -237,6 +284,9 @@ const PRESET_CYCLE: &[QualityPreset] = &[
 
 const SKY_STYLE_CYCLE: &[SkyStyle] = &[SkyStyle::Enhanced, SkyStyle::Retail];
 
+const DYNAMIC_LIGHTS_CYCLE: &[DynamicLights] =
+    &[DynamicLights::Off, DynamicLights::Few, DynamicLights::Many];
+
 impl GraphicsSettings {
     /// Concrete values for each preset tier. Touching this table changes
     /// what "fresh install" feels like.
@@ -256,6 +306,7 @@ impl GraphicsSettings {
                 vsync: true,
                 fov_deg: 75.0,
                 sky_style: SkyStyle::Enhanced,
+                dynamic_lights: DynamicLights::Many,
             },
             QualityPreset::Medium => Self {
                 preset,
@@ -270,6 +321,7 @@ impl GraphicsSettings {
                 vsync: true,
                 fov_deg: 75.0,
                 sky_style: SkyStyle::Enhanced,
+                dynamic_lights: DynamicLights::Many,
             },
             QualityPreset::High => Self {
                 preset,
@@ -284,6 +336,7 @@ impl GraphicsSettings {
                 vsync: true,
                 fov_deg: 75.0,
                 sky_style: SkyStyle::Enhanced,
+                dynamic_lights: DynamicLights::Many,
             },
             QualityPreset::Ultra => Self {
                 preset,
@@ -301,6 +354,7 @@ impl GraphicsSettings {
                 vsync: true,
                 fov_deg: 75.0,
                 sky_style: SkyStyle::Enhanced,
+                dynamic_lights: DynamicLights::Many,
             },
             // Custom: identical to High at construction; the caller
             // mutates fields after. Used by the on-disk loader when
@@ -334,6 +388,7 @@ impl GraphicsSettings {
             GraphicsField::VSync => bool_label(self.vsync).into(),
             GraphicsField::Fov => format!("{:.0}°", self.fov_deg),
             GraphicsField::SkyStyle => self.sky_style.label().to_string(),
+            GraphicsField::DynamicLights => self.dynamic_lights.label().to_string(),
         }
     }
 
@@ -344,14 +399,17 @@ impl GraphicsSettings {
     pub fn cycle(&mut self, field: GraphicsField, delta: i32) {
         match field {
             GraphicsField::Preset => {
-                // Sky style is orthogonal to the quality tier; preserve
-                // it across a preset overwrite so picking Low doesn't
-                // silently revert the user's Retail sky to Enhanced.
+                // Sky style and dynamic lights are orthogonal to the
+                // quality tier; preserve them across a preset overwrite so
+                // picking Low doesn't silently revert the user's Retail sky
+                // to Enhanced or re-enable lights they turned off.
                 let sky = self.sky_style;
+                let lights = self.dynamic_lights;
                 let next =
                     cycle_slot(self.preset, PRESET_CYCLE, delta).unwrap_or(QualityPreset::High);
                 *self = Self::for_preset(next);
                 self.sky_style = sky;
+                self.dynamic_lights = lights;
             }
             GraphicsField::ShadowMapSize => {
                 self.shadow_map_size =
@@ -402,6 +460,12 @@ impl GraphicsSettings {
                 // Custom. Just cycles the style enum.
                 self.sky_style = cycle_slot(self.sky_style, SKY_STYLE_CYCLE, delta)
                     .unwrap_or(SkyStyle::Enhanced);
+            }
+            GraphicsField::DynamicLights => {
+                // Orthogonal to quality, like SkyStyle — cycle Off/Few/Many
+                // without flipping the preset to Custom.
+                self.dynamic_lights = cycle_slot(self.dynamic_lights, DYNAMIC_LIGHTS_CYCLE, delta)
+                    .unwrap_or(DynamicLights::Many);
             }
         }
     }
@@ -537,6 +601,7 @@ pub const GRAPHICS_FIELDS: &[GraphicsField] = &[
     GraphicsField::VSync,
     GraphicsField::Fov,
     GraphicsField::SkyStyle,
+    GraphicsField::DynamicLights,
 ];
 
 // ---------------------------------------------------------------------------
@@ -907,6 +972,35 @@ mod tests {
         assert_eq!(s.sky_style, SkyStyle::Retail);
         s.cycle(GraphicsField::Preset, 1); // High → Ultra
         assert_eq!(s.sky_style, SkyStyle::Retail, "preset cycle kept the style");
+    }
+
+    /// Dynamic lights cycle Off → Few → Many without flipping the preset
+    /// tag to Custom (orthogonal to the quality tier), and the slot maps
+    /// onto the right max_total / enabled values.
+    #[test]
+    fn dynamic_lights_cycles_without_custom() {
+        let mut s = GraphicsSettings::default();
+        assert_eq!(s.dynamic_lights, DynamicLights::Many);
+        s.cycle(GraphicsField::DynamicLights, 1); // Many -> Off (wrap)
+        assert_eq!(s.dynamic_lights, DynamicLights::Off);
+        assert_eq!(s.preset, QualityPreset::High, "lights must not flip preset");
+        assert!(!s.dynamic_lights.enabled());
+        assert_eq!(s.dynamic_lights.max_total(), 0);
+        s.cycle(GraphicsField::DynamicLights, 1); // Off -> Few
+        assert_eq!(s.dynamic_lights, DynamicLights::Few);
+        assert_eq!(s.dynamic_lights.max_total(), 24);
+        assert!(s.dynamic_lights.enabled());
+    }
+
+    /// Picking a quality preset preserves the dynamic-lights slot — it's
+    /// an independent axis, like the sky style.
+    #[test]
+    fn preset_cycle_preserves_dynamic_lights() {
+        let mut s = GraphicsSettings::default();
+        s.cycle(GraphicsField::DynamicLights, 1); // Many -> Off
+        assert_eq!(s.dynamic_lights, DynamicLights::Off);
+        s.cycle(GraphicsField::Preset, 1); // High -> Ultra
+        assert_eq!(s.dynamic_lights, DynamicLights::Off, "preset cycle kept it");
     }
 
     /// Cycle wraps with rem_euclid — last slot + 1 → first slot, and
