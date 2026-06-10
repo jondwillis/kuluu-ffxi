@@ -42,7 +42,7 @@ pub(super) struct GraphicsRoot;
 /// can refresh just that text when the shared [`GraphicsSettings`] changes
 /// — no panel rebuild on every ◀ / ▶ click.
 #[derive(Component)]
-struct GraphicsValueText(GraphicsField);
+pub(super) struct GraphicsValueText(GraphicsField);
 
 pub(super) fn spawn_ui(
     mut commands: Commands,

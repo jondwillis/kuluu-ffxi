@@ -184,6 +184,17 @@ fn build_login_ui(
                             next.set(LauncherState::Settings);
                         },
                     );
+
+                    r.spawn(button(
+                        ButtonProps::default(),
+                        (),
+                        Spawn((Text::new("Graphics"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(LauncherState::Graphics);
+                        },
+                    );
                 });
             });
         });
