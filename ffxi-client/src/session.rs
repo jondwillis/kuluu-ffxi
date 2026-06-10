@@ -331,6 +331,13 @@ async fn run_map_session(
     let mut pending_event_end: Vec<(u32, u16, u16)> = Vec::new();
     let mut self_act_index: Option<u16> = None;
     let mut name_cache: std::collections::HashMap<u32, String> = Default::default();
+    // Parallel id→`EntityKind` table, populated from the same CHAR_PC /
+    // CHAR_NPC classification as the entity-spawn events. Battle-message
+    // rendering reads it to decide whether an entity takes the "the"
+    // article that LSB's `msg_basic.h` comment templates bake in — PCs
+    // never do, monsters do. See `substitute_battle_placeholders`.
+    let mut kind_cache: std::collections::HashMap<u32, crate::state::EntityKind> =
+        Default::default();
     // Static-NPC name resolver backed by the FFXI client install DATs.
     // Lazy-loads one zone's name table on first lookup miss; swaps it
     // out when the next CHAR_NPC's zone bits differ. `cfg.dat_root`
@@ -370,6 +377,7 @@ async fn run_map_session(
                         bootstrap.char_name,
                         &mut self_act_index,
                         &mut name_cache,
+                        &mut kind_cache,
                         &mut name_miss_dedup,
                         &mut current_zone_id,
                         &mut self_pos,
@@ -426,6 +434,7 @@ async fn run_map_session(
         event_tx.clone(),
         cfg.user_driven_events,
         name_cache,
+        kind_cache,
         name_miss_dedup,
         self_pos,
         npc_name_resolver,
@@ -528,6 +537,11 @@ fn handle_sub_packet(
     self_char_name: &str,
     self_act_index: &mut Option<u16>,
     name_cache: &mut std::collections::HashMap<u32, String>,
+    // Parallel id→`EntityKind` table (see the declaration in
+    // `establish_session`). Updated from the same CHAR_PC/CHAR_NPC
+    // classification that drives entity-spawn events, and read by the
+    // battle-message decoders for article handling.
+    kind_cache: &mut std::collections::HashMap<u32, crate::state::EntityKind>,
     // Per-(entity, miss-kind) timestamps used to rate-limit
     // `NameExtractionMiss` events. Without this, a populated zone where
     // most entities never sent UPDATE_NAME would emit hundreds of
@@ -628,6 +642,10 @@ fn handle_sub_packet(
                 }
                 if login.unique_no == self_char_id {
                     *self_act_index = Some(login.act_index);
+                    // Seed our own kind so battle lines render correctly
+                    // even before a name-bearing CHAR_PC for self arrives
+                    // (e.g. the first kill right after zone-in).
+                    kind_cache.insert(login.unique_no, EntityKind::Pc);
                     *self_pos = Position {
                         pos: Vec3 {
                             x: head.x,
@@ -753,6 +771,20 @@ fn handle_sub_packet(
                         is_live_mob,
                     )
                 };
+                // Mirror the kind into the battle-message lookup table.
+                // `Other` is the "unknown" bucket — never let it demote an
+                // already-established Pc/Mob/Npc/Pet (same rule as
+                // `state::merge_kind`), since a position-only CHAR_NPC tick
+                // can classify as `Other` when the discriminating markers
+                // aren't in the packet.
+                kind_cache
+                    .entry(head.unique_no)
+                    .and_modify(|existing| {
+                        if !matches!(kind, EntityKind::Other) {
+                            *existing = kind;
+                        }
+                    })
+                    .or_insert(kind);
                 if op == s2c::CHAR_PC && head.unique_no == self_char_id {
                     *self_act_index = Some(head.act_index);
                     *self_pos = Position {
@@ -945,14 +977,14 @@ fn handle_sub_packet(
         op if op == s2c::BATTLE_MESSAGE => {
             // is_029 = true: Data/Data2 sit at offsets 8/12 (before ActIndex
             // pair). See `decode_battle_message` doc for the two layouts.
-            if let Some(line) = decode_battle_message(sub.data, name_cache, true) {
+            if let Some(line) = decode_battle_message(sub.data, name_cache, kind_cache, true) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
             emit_battle_message_audio_event(sub.data, true, event_tx);
         }
         op if op == s2c::BATTLE_MESSAGE2 => {
             // 0x02D moves Data/Data2 to offsets 12/16, after the ActIndex pair.
-            if let Some(line) = decode_battle_message(sub.data, name_cache, false) {
+            if let Some(line) = decode_battle_message(sub.data, name_cache, kind_cache, false) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
             emit_battle_message_audio_event(sub.data, false, event_tx);
@@ -996,7 +1028,7 @@ fn handle_sub_packet(
                     action_kind,
                 });
             }
-            for line in decode_battle2_action(sub.data, name_cache) {
+            for line in decode_battle2_action(sub.data, name_cache, kind_cache) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
         }
@@ -1462,6 +1494,35 @@ fn record_name_miss(
     let _ = event_tx.send(AgentEvent::NameExtractionMiss { miss });
 }
 
+/// De-duplicate the inbound server bundle stream by sequence number.
+///
+/// LSB's map protocol is a reliable-delivery layer over UDP: every
+/// outbound bundle is stamped with `server_packet_id` (bundle header
+/// offset 0, surfaced here as [`framing::Header::id_and_size`]), and the
+/// server **keeps re-sending the previous bundle verbatim** until the
+/// client's ack catches up (`vendor/server/src/map/map_networking.cpp`
+/// `:477-494` resends the cached `server_packet_data`; `:103-108` drives
+/// it). The id only advances once the client acks the latest (`:499`),
+/// so two bundles sharing a sequence are byte-identical retransmits.
+/// The receiver must therefore apply each sequence exactly once —
+/// mirroring the server's own inbound guard (`:425`,
+/// `seq <= client_packet_id` → skip).
+///
+/// Without this, a retransmit re-runs every sub-packet in the bundle.
+/// Idempotent ones (POS, CHAR_PC, UPDATE_HP) are invisible, but
+/// chat-line emitters like the `BATTLE_MESSAGE` defeat line (msg id 6)
+/// post a duplicate row — the symptom this guards against.
+///
+/// Comparison is RFC-1982 serial arithmetic so the u16 wrap (~every
+/// 65536 bundles) doesn't strand the session by marking fresh sequences
+/// as stale; this is intentionally stricter than LSB's naive `<=`.
+fn is_fresh_bundle(last_applied: Option<u16>, incoming: u16) -> bool {
+    match last_applied {
+        None => true,
+        Some(prev) => incoming != prev && incoming.wrapping_sub(prev) < 0x8000,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn keepalive_loop(
     map: &mut MapClient,
@@ -1477,6 +1538,7 @@ async fn keepalive_loop(
     event_tx: broadcast::Sender<AgentEvent>,
     user_driven_events: bool,
     mut name_cache: std::collections::HashMap<u32, String>,
+    mut kind_cache: std::collections::HashMap<u32, crate::state::EntityKind>,
     mut name_miss_dedup: std::collections::HashMap<
         (u32, crate::state::NameMissKind),
         std::time::Instant,
@@ -1485,6 +1547,15 @@ async fn keepalive_loop(
     mut npc_name_resolver: NpcNameResolver,
 ) -> Result<MapOutcome> {
     let mut last_recv = std::time::Instant::now();
+    // Highest server bundle sequence whose sub-packets we've already
+    // dispatched. Gates the inbound dispatch so LSB's verbatim bundle
+    // retransmits (sent until our ack catches up) don't re-run their
+    // sub-packets — see `is_fresh_bundle`. `None` until the first bundle
+    // lands. Scoped to the keepalive loop (not the zone-in flood): the
+    // flood drains idempotent spawn state and pre-dates our first ack,
+    // so its bundles can legitimately share a sequence and must not be
+    // deduped.
+    let mut server_seq_applied: Option<u16> = None;
     // 100 ms tick gives the spec's ~10 Hz Move cadence under sustained
     // movement. POS subpacket inclusion is further gated by `should_emit_pos`
     // so heading-only / big-jump events can still bypass the rate-limit.
@@ -2157,7 +2228,23 @@ async fn keepalive_loop(
                 if let Ok(Ok(buf)) = res {
                     last_recv = std::time::Instant::now();
                     let header = framing::Header::read(&buf[..framing::FFXI_HEADER_SIZE]);
+                    // `server_last_seq` always tracks the latest sequence
+                    // we've *seen* so the next keepalive acks it (lets the
+                    // server advance / stop retransmitting). Dispatching
+                    // the sub-packets is separately gated on freshness so
+                    // a retransmit doesn't re-run them.
                     server_last_seq = header.id_and_size;
+                    // A verbatim bundle retransmit (LSB resends until our
+                    // ack catches up) carries a sequence we've already
+                    // applied — skip it so chat-line emitters don't post
+                    // duplicate rows. Safe to `continue` here: `last_recv`
+                    // is already refreshed above, and the watchdog /
+                    // reconnect flags below are only set inside the
+                    // dispatch we're skipping.
+                    if !is_fresh_bundle(server_seq_applied, server_last_seq) {
+                        continue;
+                    }
+                    server_seq_applied = Some(server_last_seq);
                     for sub in framing::walk_sub_packets(&buf[framing::FFXI_HEADER_SIZE..]).flatten() {
                         if sub.opcode == ffxi_proto::map::s2c::LOGOUT {
                             if let Ok(logout) = decode::ServerLogout::decode(sub.data) {
@@ -2201,6 +2288,7 @@ async fn keepalive_loop(
                                 &character_name,
                                 &mut self_act_index,
                                 &mut name_cache,
+                                &mut kind_cache,
                                 &mut name_miss_dedup,
                                 &mut current_zone_id,
                                 &mut self_pos,
@@ -2514,6 +2602,7 @@ fn emit_battle_message_audio_event(
 fn decode_battle_message(
     data: &[u8],
     name_cache: &std::collections::HashMap<u32, String>,
+    kind_cache: &std::collections::HashMap<u32, crate::state::EntityKind>,
     is_029: bool,
 ) -> Option<ChatLine> {
     if data.len() < 24 {
@@ -2552,8 +2641,17 @@ fn decode_battle_message(
         });
     }
     let raw = template_for_id(message_num)?;
-    let text =
-        substitute_battle_placeholders(raw, &cas_name, &tar_name, data1, data2, message_num, None);
+    let text = substitute_battle_placeholders(
+        raw,
+        &cas_name,
+        &tar_name,
+        is_pc(cas_id, kind_cache),
+        is_pc(tar_id, kind_cache),
+        data1,
+        data2,
+        message_num,
+        None,
+    );
     Some(ChatLine {
         channel: ChatChannel::Battle,
         // Use the actor's name as the sender so the chat row reads
@@ -2675,6 +2773,7 @@ pub fn decode_battle2_header(data: &[u8]) -> Option<(u32, u32, u8)> {
 fn decode_battle2_action(
     data: &[u8],
     name_cache: &std::collections::HashMap<u32, String>,
+    kind_cache: &std::collections::HashMap<u32, crate::state::EntityKind>,
 ) -> Vec<ChatLine> {
     let mut out: Vec<ChatLine> = Vec::new();
     // Skip the 1-byte workSize prefix; the bitstream proper starts at bit 8.
@@ -2695,6 +2794,7 @@ fn decode_battle2_action(
     let _info = br.read(32); // recast etc.
 
     let cas_name = name_for_id(actor_id, name_cache);
+    let cas_is_pc = is_pc(actor_id, kind_cache);
 
     for _t in 0..trg_sum.min(15) {
         let Some(target_id) = br.read(32) else {
@@ -2702,6 +2802,7 @@ fn decode_battle2_action(
         };
         let result_sum = br.read(4).unwrap_or(0) as usize;
         let tar_name = name_for_id(target_id as u32, name_cache);
+        let tar_is_pc = is_pc(target_id as u32, kind_cache);
 
         for _r in 0..result_sum.min(8) {
             // Core result fields. Layout from `unpack`:
@@ -2747,26 +2848,44 @@ fn decode_battle2_action(
             // animation half of a spell that also carries a damage
             // result in a sibling slot). Drop those.
             if message_num != 0 {
-                if let Some(line) =
-                    build_battle2_line(message_num, &cas_name, &tar_name, value, cmd_arg)
-                {
+                if let Some(line) = build_battle2_line(
+                    message_num,
+                    &cas_name,
+                    &tar_name,
+                    cas_is_pc,
+                    tar_is_pc,
+                    value,
+                    cmd_arg,
+                ) {
                     out.push(line);
                 }
             }
             // Additional-effect line (proc): "Additional effect: ..."
             // Usually packed with its own messageID like 163.
             if has_proc && proc_message != 0 {
-                if let Some(line) =
-                    build_battle2_line(proc_message, &cas_name, &tar_name, proc_value, cmd_arg)
-                {
+                if let Some(line) = build_battle2_line(
+                    proc_message,
+                    &cas_name,
+                    &tar_name,
+                    cas_is_pc,
+                    tar_is_pc,
+                    proc_value,
+                    cmd_arg,
+                ) {
                     out.push(line);
                 }
             }
             // Reaction line (spikes/parry/etc.).
             if has_react && react_message != 0 {
-                if let Some(line) =
-                    build_battle2_line(react_message, &cas_name, &tar_name, react_value, cmd_arg)
-                {
+                if let Some(line) = build_battle2_line(
+                    react_message,
+                    &cas_name,
+                    &tar_name,
+                    cas_is_pc,
+                    tar_is_pc,
+                    react_value,
+                    cmd_arg,
+                ) {
                     out.push(line);
                 }
             }
@@ -2783,6 +2902,8 @@ fn build_battle2_line(
     message_num: u16,
     cas_name: &str,
     tar_name: &str,
+    cas_is_pc: bool,
+    tar_is_pc: bool,
     amount: u32,
     action_id: u32,
 ) -> Option<ChatLine> {
@@ -2791,6 +2912,8 @@ fn build_battle2_line(
         raw,
         cas_name,
         tar_name,
+        cas_is_pc,
+        tar_is_pc,
         amount,
         0,
         message_num,
@@ -2987,6 +3110,35 @@ fn name_for_id(id: u32, name_cache: &std::collections::HashMap<u32, String>) -> 
         .unwrap_or_else(|| format!("#{:08X}", id))
 }
 
+/// Whether `id` is a known player character. Drives battle-message
+/// article handling: PCs are proper nouns (no "the"), monsters/NPCs are
+/// common nouns that LSB's templates prefix with "the"/"The". An unknown
+/// id (not yet classified) is treated as non-PC so we preserve the
+/// template's baked article rather than risk stripping it off a monster.
+fn is_pc(id: u32, kind_cache: &std::collections::HashMap<u32, crate::state::EntityKind>) -> bool {
+    matches!(kind_cache.get(&id), Some(crate::state::EntityKind::Pc))
+}
+
+/// Replace placeholder `tok` with `name`. When the entity is a PC, also
+/// strip an immediately-preceding article that the LSB `msg_basic.h`
+/// comment template bakes in ("The "/"the ") — those templates assume a
+/// monster subject, so the article is wrong for a player. The article'd
+/// forms are consumed before the bare token so possessives like
+/// "the <player>'s control" collapse to "Atti's control".
+///
+/// Monsters keep the baked article (it's correct for them). We never
+/// *insert* an article for an article-less mob placeholder — that path
+/// needs sentence-position-aware casing we don't model yet.
+fn replace_named_token(s: &str, tok: &str, name: &str, entity_is_pc: bool) -> String {
+    if entity_is_pc {
+        s.replace(&format!("The {tok}"), name)
+            .replace(&format!("the {tok}"), name)
+            .replace(tok, name)
+    } else {
+        s.replace(tok, name)
+    }
+}
+
 /// Substitute the FFXI placeholder tokens used in `msg_basic.h` comments.
 /// We handle the high-frequency tokens directly; rare ones (`<spell>`,
 /// `<item>`, `<job>`, …) require lookup tables we don't ship yet and are
@@ -3001,6 +3153,8 @@ fn substitute_battle_placeholders(
     raw: &str,
     cas_name: &str,
     tar_name: &str,
+    cas_is_pc: bool,
+    tar_is_pc: bool,
     data1: u32,
     data2: u32,
     message_num: u16,
@@ -3012,20 +3166,22 @@ fn substitute_battle_placeholders(
     // the actor into Cas). Grouped with the actor placeholders so any
     // template using these reads as the actor's action.
     for tag in ["<user>", "<attacker>", "<caster>", "<entity>"] {
-        s = s.replace(tag, cas_name);
+        s = replace_named_token(&s, tag, cas_name, cas_is_pc);
     }
-    let (player_name, target_name) = if subject_is_tar(message_num) {
-        (tar_name, cas_name)
+    // The article flags track the *name* binding, which the subject
+    // swap flips alongside it.
+    let (player_name, target_name, player_is_pc, target_is_pc) = if subject_is_tar(message_num) {
+        (tar_name, cas_name, tar_is_pc, cas_is_pc)
     } else {
-        (cas_name, tar_name)
+        (cas_name, tar_name, cas_is_pc, tar_is_pc)
     };
-    s = s.replace("<player>", player_name);
-    s = s.replace("<target>", target_name);
+    s = replace_named_token(&s, "<player>", player_name, player_is_pc);
+    s = replace_named_token(&s, "<target>", target_name, target_is_pc);
     // `<mob>` appears in a handful of templates (e.g.
     // `CheckImpossibleToGauge = 249`, "<mob> strength is impossible to
     // gauge!") where the mob entity is in the wire's `Tar` slot —
     // LSB's call sites for these ids pass `(PChar, PMobTarget, ...)`.
-    s = s.replace("<mob>", target_name);
+    s = replace_named_token(&s, "<mob>", target_name, target_is_pc);
     let amount = data1.to_string();
     for tag in ["<amount>", "<number>"] {
         s = s.replace(tag, &amount);
@@ -4391,7 +4547,7 @@ mod tests {
         cache.insert(0x1111_1111u32, "Sylvie".to_string());
         cache.insert(0x2222_2222u32, "Mandy".to_string());
 
-        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
         assert_eq!(line.channel, ChatChannel::Battle);
         assert_eq!(line.sender, "Sylvie");
         assert!(line.text.contains("Sylvie"));
@@ -4417,7 +4573,7 @@ mod tests {
         data[20..22].copy_from_slice(&1u16.to_le_bytes()); // MessageNum=1
 
         let cache = HashMap::new();
-        let line = decode_battle_message(&data, &cache, false).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), false).expect("decoded");
         assert!(
             line.text.contains("999"),
             "expected amount=999 from offsets [12..16], got: {}",
@@ -4436,7 +4592,8 @@ mod tests {
         data[4..8].copy_from_slice(&0u32.to_le_bytes()); // tar = 0 → "<no one>"
         data[8..12].copy_from_slice(&5u32.to_le_bytes());
         data[20..22].copy_from_slice(&1u16.to_le_bytes());
-        let line = decode_battle_message(&data, &HashMap::new(), true).expect("decoded");
+        let line =
+            decode_battle_message(&data, &HashMap::new(), &HashMap::new(), true).expect("decoded");
         assert_eq!(line.sender, "#DEADBEEF");
         assert!(line.text.contains("<no one>") || line.text.contains("#DEADBEEF"));
     }
@@ -4468,7 +4625,7 @@ mod tests {
         cache.insert(killer_id, "Orcish_Fodder".to_string());
         cache.insert(victim_id, "Vanari".to_string());
 
-        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
         // Subject (sender) of the chat row should be the victim.
         assert_eq!(line.sender, "Vanari");
         // Body should read "Vanari was defeated by the Orcish_Fodder."
@@ -4479,6 +4636,90 @@ mod tests {
             "victim must precede killer in the rendered template, got: {}",
             line.text
         );
+    }
+
+    #[test]
+    fn battle_message_6_defeats_strips_baked_article_for_pc_subject() {
+        // DefeatsTarget = 6, template "The <player> defeats <target>." The
+        // article LSB bakes in front of `<player>` is correct for a monster
+        // subject but wrong when the killer is a PC (the production bug:
+        // "The Atti defeats Tunnel Worm."). With the actor classified Pc,
+        // the leading "The " must be stripped.
+        use crate::state::EntityKind;
+        use std::collections::HashMap;
+
+        let pc_id = 0x0100_0001u32;
+        let mob_id = 0x0100_0700u32;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&pc_id.to_le_bytes()); // cas = killer (PC)
+        data[4..8].copy_from_slice(&mob_id.to_le_bytes()); // tar = victim (mob)
+        data[20..22].copy_from_slice(&6u16.to_le_bytes());
+
+        let mut names = HashMap::new();
+        names.insert(pc_id, "Atti".to_string());
+        names.insert(mob_id, "Tunnel Worm".to_string());
+        let mut kinds = HashMap::new();
+        kinds.insert(pc_id, EntityKind::Pc);
+        kinds.insert(mob_id, EntityKind::Mob);
+
+        let line = decode_battle_message(&data, &names, &kinds, true).expect("decoded");
+        assert_eq!(
+            line.text, "Atti defeats Tunnel Worm.",
+            "PC subject must not carry the baked article, got: {}",
+            line.text
+        );
+        assert!(
+            !line.text.starts_with("The "),
+            "leading article leaked: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn battle_message_6_defeats_keeps_article_for_mob_subject() {
+        // Same id 6, but the subject is a monster (e.g. a charmed pet or
+        // mob-vs-mob). LSB's baked "The " is correct here and must survive.
+        use crate::state::EntityKind;
+        use std::collections::HashMap;
+
+        let mob_a = 0x0100_0700u32;
+        let mob_b = 0x0100_0701u32;
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&mob_a.to_le_bytes());
+        data[4..8].copy_from_slice(&mob_b.to_le_bytes());
+        data[20..22].copy_from_slice(&6u16.to_le_bytes());
+
+        let mut names = HashMap::new();
+        names.insert(mob_a, "Goblin Smithy".to_string());
+        names.insert(mob_b, "Forest Hare".to_string());
+        let mut kinds = HashMap::new();
+        kinds.insert(mob_a, EntityKind::Mob);
+        kinds.insert(mob_b, EntityKind::Mob);
+
+        let line = decode_battle_message(&data, &names, &kinds, true).expect("decoded");
+        assert_eq!(
+            line.text, "The Goblin Smithy defeats Forest Hare.",
+            "got: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn is_fresh_bundle_dedups_retransmits_and_survives_wrap() {
+        // First sight of any sequence is fresh.
+        assert!(is_fresh_bundle(None, 0));
+        assert!(is_fresh_bundle(None, 5000));
+        // A verbatim retransmit (same sequence) is stale — this is the
+        // guard that stops the duplicate defeat line.
+        assert!(!is_fresh_bundle(Some(42), 42));
+        // A strictly newer sequence advances.
+        assert!(is_fresh_bundle(Some(42), 43));
+        // A late/out-of-order resend of an older sequence is stale even
+        // though it arrived after a newer one was applied.
+        assert!(!is_fresh_bundle(Some(43), 42));
+        // RFC-1982 wrap: 0x0001 is "newer" than 0xFFFF, not 65534 behind.
+        assert!(is_fresh_bundle(Some(0xFFFF), 0x0001));
+        assert!(!is_fresh_bundle(Some(0x0001), 0xFFFF));
     }
 
     #[test]
@@ -4497,7 +4738,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(0xCAFEu32, "hello".to_string());
         // is_029=false matches the 0x02D layout.
-        let line = decode_battle_message(&data, &cache, false).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), false).expect("decoded");
         assert!(
             line.text.contains("420") && !line.text.contains('#'),
             "expected '#' to be replaced with 420, got: {}",
@@ -4519,7 +4760,7 @@ mod tests {
         data[20..22].copy_from_slice(&38u16.to_le_bytes());
         let mut cache = HashMap::new();
         cache.insert(0xCAFEu32, "hello".to_string());
-        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
         // Retail divides the raw amount by 10 for display: 3 → "0.3".
         assert!(
             line.text.contains("Fishing") && line.text.contains("rises 0.3 points"),
@@ -4542,7 +4783,7 @@ mod tests {
         data[20..22].copy_from_slice(&53u16.to_le_bytes());
         let mut cache = HashMap::new();
         cache.insert(0xCAFEu32, "hello".to_string());
-        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
         assert!(
             line.text.contains("level 12") && !line.text.contains("1.2"),
             "expected integer level, got: {}",
@@ -4564,7 +4805,7 @@ mod tests {
         data[20..22].copy_from_slice(&253u16.to_le_bytes());
         let mut cache = HashMap::new();
         cache.insert(0xCAFEu32, "hello".to_string());
-        let line = decode_battle_message(&data, &cache, false).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), false).expect("decoded");
         assert!(
             line.text.contains("chain 5!") && line.text.contains("gains 320"),
             "expected 'chain 5!' and 'gains 320', got: {}",
@@ -4589,6 +4830,8 @@ mod tests {
             "reaches level X. BoXing.",
             "cas",
             "tar",
+            false,
+            false,
             0,
             7,
             53,
@@ -4613,7 +4856,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(0xCAFEu32, "Daisy".to_string());
         cache.insert(0xBEEFu32, "Mandragora".to_string());
-        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
         assert!(
             line.text.contains("Daisy")
                 && line.text.contains("Mandragora")
@@ -4640,7 +4883,7 @@ mod tests {
         data[20..22].copy_from_slice(&565u16.to_le_bytes());
         let mut cache = HashMap::new();
         cache.insert(0xCAFEu32, "Mithy".to_string());
-        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
         assert_eq!(line.text, "Mithy obtains 4 gil.", "got: {}", line.text);
     }
 
@@ -4652,6 +4895,8 @@ mod tests {
             "gains the effect of <status>.",
             "cas",
             "tar",
+            false,
+            false,
             40,
             0,
             186,
@@ -4677,7 +4922,7 @@ mod tests {
         data[20..22].copy_from_slice(&43u16.to_le_bytes());
         let mut cache = HashMap::new();
         cache.insert(0xCAFEu32, "Daisy".to_string());
-        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
         assert!(
             line.text.contains("Daisy readies Hand-to-Hand") && !line.text.contains("<entity>"),
             "expected '<entity>' → Daisy, got: {}",
@@ -4761,7 +5006,7 @@ mod tests {
         cache.insert(0xCAFEu32, "Daisy".to_string());
         cache.insert(0xBEEFu32, "Mandragora".to_string());
 
-        let lines = decode_battle2_action(&data, &cache);
+        let lines = decode_battle2_action(&data, &cache, &HashMap::new());
         assert_eq!(lines.len(), 1, "expected one line, got: {:?}", lines);
         let l = &lines[0];
         assert_eq!(l.channel, ChatChannel::Battle);
@@ -4805,7 +5050,7 @@ mod tests {
         cache.insert(0xCAFEu32, "Daisy".to_string());
         cache.insert(0xBEEFu32, "Mandragora".to_string());
 
-        let lines = decode_battle2_action(&data, &cache);
+        let lines = decode_battle2_action(&data, &cache, &HashMap::new());
         assert_eq!(lines.len(), 1);
         let l = &lines[0];
         assert!(
@@ -4841,7 +5086,7 @@ mod tests {
         w.write(0, 1);
         w.write(0, 1);
         let data = w.into_bytes();
-        let lines = decode_battle2_action(&data, &HashMap::new());
+        let lines = decode_battle2_action(&data, &HashMap::new(), &HashMap::new());
         assert!(lines.is_empty(), "expected drop, got: {:?}", lines);
     }
 
@@ -4924,7 +5169,7 @@ mod tests {
         cache.insert(0xCAFEu32, "Daisy".to_string());
         cache.insert(0xBEEFu32, "Mandragora".to_string());
 
-        let lines = decode_battle2_action(&data, &cache);
+        let lines = decode_battle2_action(&data, &cache, &HashMap::new());
         assert_eq!(
             lines.len(),
             1,
@@ -4947,7 +5192,7 @@ mod tests {
         use std::collections::HashMap;
         let mut data = vec![0u8; 24];
         data[20..22].copy_from_slice(&0xFFFFu16.to_le_bytes());
-        assert!(decode_battle_message(&data, &HashMap::new(), true).is_none());
+        assert!(decode_battle_message(&data, &HashMap::new(), &HashMap::new(), true).is_none());
     }
 
     /// Build a 0x029 BattleMessage body for a synth-decoded id (Check
@@ -4974,7 +5219,7 @@ mod tests {
         cache.insert(1u32, "Daisy".to_string());
         cache.insert(2u32, "Goblin".to_string());
 
-        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
         assert_eq!(line.sender, "Daisy");
         assert!(
             line.text.contains("Goblin")
@@ -5021,7 +5266,8 @@ mod tests {
         ];
         for &(msg, def_phrase, eva_phrase) in cases {
             let data = check_message(msg, 25, 64 + 3, 1, 2); // Lv 25, Decent Challenge
-            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            let line =
+                decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
             for (label, phrase) in [("def", def_phrase), ("eva", eva_phrase)] {
                 if let Some(p) = phrase {
                     assert!(
@@ -5062,7 +5308,8 @@ mod tests {
         ];
         for (tier, expected) in tiers {
             let data = check_message(174, 50, 64 + tier, 1, 2);
-            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            let line =
+                decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
             assert!(
                 line.text.contains(expected),
                 "tier {tier} expected {expected:?}: {}",
@@ -5084,7 +5331,8 @@ mod tests {
             (715, "Evasion"),
         ] {
             let data = check_message(msg, 321, 654, 1, 1);
-            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            let line =
+                decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
             assert!(
                 line.text.contains("321") && line.text.contains("654"),
                 "msg {msg}: missing numeric pair in {}",
@@ -5107,7 +5355,8 @@ mod tests {
         let cache: HashMap<u32, String> = [(1u32, "Daisy".to_string())].into_iter().collect();
         for msg in [713u16, 714] {
             let data = check_message(msg, 0, 0, 1, 1);
-            let line = decode_battle_message(&data, &cache, true).expect("decoded");
+            let line =
+                decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
             assert!(
                 line.text.to_ascii_lowercase().contains("none equipped"),
                 "msg {msg} with (0,0) should read \"none equipped\", got: {}",
@@ -5127,7 +5376,7 @@ mod tests {
         cache.insert(1u32, "Daisy".to_string());
         cache.insert(2u32, "King Behemoth".to_string());
 
-        let line = decode_battle_message(&data, &cache, true).expect("decoded");
+        let line = decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
         assert!(
             line.text.contains("King Behemoth")
                 && line.text.to_ascii_lowercase().contains("impossible"),
