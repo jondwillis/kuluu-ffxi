@@ -27,11 +27,11 @@ git submodule update --init --depth 1 \
 cargo build
 ```
 
-That's everything the compiler needs. The other entries under `vendor/`
-(`Phoenix`, `AltanaViewer`, `lotus-ffxi`, `xi-tinkerer`) are **not used by the
-build** — they're upstream references cited in source comments. Leave them
-deinitialized; `git submodule update --init <path>` restores any of them if you
-want to read the upstream sources.
+That's everything the compiler needs. Upstream repos that are **not used by
+the build** — only cited in source comments for reference (`Phoenix`,
+`AltanaViewer`, `lotus-ffxi`, `xi-tinkerer`) — live under `research/`, not
+`vendor/`. They stay deinitialized; `git submodule update --init research/<name>`
+populates one if you want to read the upstream sources.
 
 To actually *run* the client you also need a user-provided retail install
 mounted at `vendor/Game` (19G, never committed — see [Run](#run) below).
