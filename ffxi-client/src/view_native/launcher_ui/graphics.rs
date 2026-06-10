@@ -101,7 +101,17 @@ pub(super) fn spawn_ui(
 /// One settings row: `Label  [◀]  Value  [▶]`. The ◀ / ▶ observers cycle
 /// the shared resource by ∓1 / ±1; the value cell is refreshed by
 /// [`redraw_graphics_system`] rather than rebuilt here.
+///
+/// Placeholder rows (Stage-2 sky features, [`GraphicsField::is_placeholder`])
+/// are advertised but not adjustable: they render dimmed with no ◀ / ▶
+/// buttons. They stay reachable via the `/sky` command.
 fn spawn_field_row(panel: &mut ChildSpawnerCommands, field: GraphicsField, settings: &GraphicsSettings) {
+    let placeholder = field.is_placeholder();
+    let value_color = if placeholder {
+        Color::srgb(0.45, 0.45, 0.50)
+    } else {
+        Color::srgb(0.92, 0.92, 0.95)
+    };
     panel
         .spawn(Node {
             width: Val::Percent(100.0),
@@ -111,7 +121,7 @@ fn spawn_field_row(panel: &mut ChildSpawnerCommands, field: GraphicsField, setti
             ..default()
         })
         .with_children(|rowc| {
-            rowc.spawn((
+            let mut label = rowc.spawn((
                 Node {
                     width: Val::Px(160.0),
                     ..default()
@@ -119,15 +129,20 @@ fn spawn_field_row(panel: &mut ChildSpawnerCommands, field: GraphicsField, setti
                 Text::new(field.label().to_string()),
                 ThemedText,
             ));
+            if placeholder {
+                label.insert(TextColor(value_color));
+            }
 
-            rowc.spawn(button(
-                ButtonProps::default(),
-                (),
-                Spawn((Text::new("◀"), ThemedText)),
-            ))
-            .observe(move |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
-                settings.cycle(field, -1);
-            });
+            if !placeholder {
+                rowc.spawn(button(
+                    ButtonProps::default(),
+                    (),
+                    Spawn((Text::new("◀"), ThemedText)),
+                ))
+                .observe(move |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
+                    settings.cycle(field, -1);
+                });
+            }
 
             rowc.spawn((
                 Node {
@@ -136,19 +151,21 @@ fn spawn_field_row(panel: &mut ChildSpawnerCommands, field: GraphicsField, setti
                     ..default()
                 },
                 Text::new(settings.value_label(field)),
-                TextColor(Color::srgb(0.92, 0.92, 0.95)),
+                TextColor(value_color),
                 GraphicsValueText(field),
                 ThemedText,
             ));
 
-            rowc.spawn(button(
-                ButtonProps::default(),
-                (),
-                Spawn((Text::new("▶"), ThemedText)),
-            ))
-            .observe(move |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
-                settings.cycle(field, 1);
-            });
+            if !placeholder {
+                rowc.spawn(button(
+                    ButtonProps::default(),
+                    (),
+                    Spawn((Text::new("▶"), ThemedText)),
+                ))
+                .observe(move |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
+                    settings.cycle(field, 1);
+                });
+            }
         });
 }
 

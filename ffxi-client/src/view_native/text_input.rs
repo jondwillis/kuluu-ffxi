@@ -146,10 +146,6 @@ pub struct SlashWriters<'w, 's> {
     /// `tick_skinned_actors` (to pick the sit / hea MO2 on the self
     /// avatar).
     pub rest_stance: ResMut<'w, ffxi_viewer_core::combat_stance::RestStance>,
-    /// Sky-realism feature flags (`/sky`).
-    pub sky_realism: ResMut<'w, ffxi_viewer_core::sky_realism::SkyRealism>,
-    /// Dynamic lantern/fire light tuning (`/lights`).
-    pub zone_lights: ResMut<'w, ffxi_viewer_core::zone_lights::ZoneLightConfig>,
     /// Status → Profile panel visibility. The menu sets this true on the
     /// Profile row and clears it on back-out of `MenuKind::Status`
     /// (`status_panel`'s doc-contract). Bundled here to keep
@@ -1535,18 +1531,27 @@ fn apply_slash_outcome(
         SlashOutcome::SetSky(op) => {
             use super::slash_commands::SkyOp;
             use ffxi_viewer_core::sky_realism::SkyFeature;
+            // Mutate the persisted source of truth (`GraphicsSettings`); the
+            // viewer-core reactor mirrors it onto the runtime `SkyRealism`
+            // resource and `graphics_store` persists the change. The menu's
+            // `Sky Style` row reflects it (Enhanced/Retail/Custom) too.
+            let g = &mut *slash_writers.graphics;
             match op {
                 SkyOp::Status => {
-                    let sky = &*slash_writers.sky_realism;
                     let lines: Vec<String> = SkyFeature::ALL
                         .iter()
-                        .map(|(k, f)| format!("  {}: {}", k, if f.get(sky) { "on" } else { "off" }))
+                        .map(|(k, f)| {
+                            format!("  {}: {}", k, if f.get(&g.sky_realism) { "on" } else { "off" })
+                        })
                         .collect();
-                    push_system_chat_line(scene_state, format!("/sky:\n{}", lines.join("\n")));
+                    push_system_chat_line(
+                        scene_state,
+                        format!("/sky ({}):\n{}", g.sky_style().label(), lines.join("\n")),
+                    );
                 }
                 SkyOp::Set { feature, value } => {
-                    let next = value.unwrap_or(!feature.get(&slash_writers.sky_realism));
-                    feature.set(&mut slash_writers.sky_realism, next);
+                    let next = value.unwrap_or(!feature.get(&g.sky_realism));
+                    feature.set(&mut g.sky_realism, next);
                     push_system_chat_line(
                         scene_state,
                         format!(
@@ -1560,35 +1565,50 @@ fn apply_slash_outcome(
         }
         SlashOutcome::SetLights(op) => {
             use super::slash_commands::LightsOp;
-            let cfg = &mut *slash_writers.zone_lights;
+            use ffxi_viewer_core::graphics_settings::DynamicLights;
+            // Same single-source-of-truth path as `/sky`: write
+            // `GraphicsSettings`, let the reactor push it onto
+            // `ZoneLightConfig`. `/lights on|off` maps to the coarse tier
+            // (off → Off, on → Many when currently Off); the fine knobs map
+            // to the `light_*` fields. The `Dynamic Lights` row shows
+            // "Custom" once a fine knob leaves its default.
+            let g = &mut *slash_writers.graphics;
             let chat = match op {
                 LightsOp::Status => format!(
                     "/lights: {} · threshold {:.2} · intensity {:.0} · range {:.1} · flicker {}",
-                    if cfg.enabled { "on" } else { "off" },
-                    cfg.overbright_threshold,
-                    cfg.point_intensity,
-                    cfg.point_range,
-                    if cfg.flicker { "on" } else { "off" },
+                    if g.dynamic_lights.enabled() { "on" } else { "off" },
+                    g.light_threshold,
+                    g.light_intensity,
+                    g.light_range,
+                    if g.light_flicker { "on" } else { "off" },
                 ),
                 LightsOp::Enable(v) => {
-                    cfg.enabled = v.unwrap_or(!cfg.enabled);
-                    format!("/lights: {}", if cfg.enabled { "on" } else { "off" })
+                    let on = v.unwrap_or(!g.dynamic_lights.enabled());
+                    g.dynamic_lights = if !on {
+                        DynamicLights::Off
+                    } else if g.dynamic_lights == DynamicLights::Off {
+                        DynamicLights::Many
+                    } else {
+                        g.dynamic_lights
+                    };
+                    format!("/lights: {}", if on { "on" } else { "off" })
                 }
                 LightsOp::Threshold(v) => {
-                    cfg.overbright_threshold = v;
+                    g.light_threshold = v;
                     format!("/lights threshold: {v:.2} (re-enter zone to re-detect)")
                 }
                 LightsOp::Intensity(v) => {
-                    cfg.point_intensity = v;
+                    g.light_intensity = v;
                     format!("/lights intensity: {v:.0}")
                 }
                 LightsOp::Range(v) => {
-                    cfg.point_range = v;
+                    g.light_range = v;
                     format!("/lights range: {v:.1}")
                 }
                 LightsOp::Flicker(v) => {
-                    cfg.flicker = v.unwrap_or(!cfg.flicker);
-                    format!("/lights flicker: {}", if cfg.flicker { "on" } else { "off" })
+                    let f = v.unwrap_or(!g.light_flicker);
+                    g.light_flicker = f;
+                    format!("/lights flicker: {}", if f { "on" } else { "off" })
                 }
             };
             push_system_chat_line(scene_state, chat);

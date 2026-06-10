@@ -272,7 +272,7 @@ fn update_skybox(
     // once that DAT-driven path lands. Scroll drifts the cloud UVs with
     // real elapsed time for slow, continuous motion; the shader tints
     // the clouds by the sky gradient so they redden at dusk.
-    let enhanced = settings.sky_style == crate::graphics_settings::SkyStyle::Enhanced;
+    let enhanced = settings.sky_embellishments_enabled();
     let t = time.elapsed_secs();
     mat.data.cloud_params = if enhanced {
         // Drift the cloud field across the sky for visible motion the way

@@ -107,6 +107,11 @@ pub enum SkyStyle {
     #[default]
     Enhanced,
     Retail,
+    /// At least one individual sky-realism feature has been toggled away
+    /// from a named style's preset (via the menu sub-rows or `/sky`).
+    /// This variant is *derived*, never stored — see
+    /// [`GraphicsSettings::sky_style`]; `sky_realism` is the source of truth.
+    Custom,
 }
 
 impl SkyStyle {
@@ -114,13 +119,17 @@ impl SkyStyle {
         match self {
             SkyStyle::Enhanced => "Enhanced",
             SkyStyle::Retail => "Retail",
+            SkyStyle::Custom => "Custom",
         }
     }
 
     /// The [`crate::sky_realism::SkyRealism`] preset this style implies.
+    /// `Custom` has no canonical preset (it *is* the off-preset state); it
+    /// falls back to `enhanced()` so the `const fn` match stays total — the
+    /// cycle path only ever calls this for the two named styles.
     pub const fn sky_realism(self) -> crate::sky_realism::SkyRealism {
         match self {
-            SkyStyle::Enhanced => crate::sky_realism::SkyRealism::enhanced(),
+            SkyStyle::Enhanced | SkyStyle::Custom => crate::sky_realism::SkyRealism::enhanced(),
             SkyStyle::Retail => crate::sky_realism::SkyRealism::retail(),
         }
     }
@@ -182,12 +191,31 @@ pub enum GraphicsField {
     ViewDistance,
     VSync,
     Fov,
+    /// Coarse sky preset (Enhanced / Retail / derived Custom). The six
+    /// `Sky*` rows below are its fine-grained sub-toggles (the `/sky` knobs).
     SkyStyle,
+    SkyHorizonReddening,
+    SkyHorizonDimming,
+    SkyMoonIllusion,
+    SkyEarthshine,
+    /// Placeholder — backing feature is Stage-2/unwired; rendered greyed
+    /// and inert in the GUIs (still flippable via `/sky realmoon`).
+    SkyRealMoon,
+    /// Placeholder — see [`GraphicsField::SkyRealMoon`].
+    SkyEclipses,
+    /// Coarse dynamic-light tier (Off / Few / Many / derived Custom). The
+    /// four `Light*` rows below are its fine-grained sub-knobs (`/lights`).
     DynamicLights,
+    LightThreshold,
+    LightIntensity,
+    LightRange,
+    LightFlicker,
 }
 
 impl GraphicsField {
-    /// Display label as it appears left of the bracketed value.
+    /// Display label as it appears left of the bracketed value. Sky/light
+    /// sub-rows are indented two spaces so they read as a group under their
+    /// coarse parent in both GUIs.
     pub const fn label(self) -> &'static str {
         match self {
             GraphicsField::Preset => "Preset",
@@ -202,8 +230,40 @@ impl GraphicsField {
             GraphicsField::VSync => "VSync",
             GraphicsField::Fov => "FOV",
             GraphicsField::SkyStyle => "Sky Style",
+            GraphicsField::SkyHorizonReddening => "  Reddening",
+            GraphicsField::SkyHorizonDimming => "  Dimming",
+            GraphicsField::SkyMoonIllusion => "  Moon Illusion",
+            GraphicsField::SkyEarthshine => "  Earthshine",
+            GraphicsField::SkyRealMoon => "  Real Moon",
+            GraphicsField::SkyEclipses => "  Eclipses",
             GraphicsField::DynamicLights => "Dynamic Lights",
+            GraphicsField::LightThreshold => "  Threshold",
+            GraphicsField::LightIntensity => "  Intensity",
+            GraphicsField::LightRange => "  Range",
+            GraphicsField::LightFlicker => "  Flicker",
         }
+    }
+
+    /// The [`crate::sky_realism::SkyFeature`] a `Sky*` sub-row drives, or
+    /// `None` for non-sky-feature fields (`SkyStyle` and everything else).
+    pub fn sky_feature(self) -> Option<crate::sky_realism::SkyFeature> {
+        use crate::sky_realism::SkyFeature;
+        Some(match self {
+            GraphicsField::SkyHorizonReddening => SkyFeature::HorizonReddening,
+            GraphicsField::SkyHorizonDimming => SkyFeature::HorizonDimming,
+            GraphicsField::SkyMoonIllusion => SkyFeature::MoonIllusion,
+            GraphicsField::SkyEarthshine => SkyFeature::Earthshine,
+            GraphicsField::SkyRealMoon => SkyFeature::PhysicalMoonOrbit,
+            GraphicsField::SkyEclipses => SkyFeature::Eclipses,
+            _ => return None,
+        })
+    }
+
+    /// Rows the GUIs show but grey out and refuse to cycle: the backing
+    /// feature isn't wired into rendering yet (Stage 2). They remain
+    /// reachable via the `/sky` command for power users.
+    pub const fn is_placeholder(self) -> bool {
+        matches!(self, GraphicsField::SkyRealMoon | GraphicsField::SkyEclipses)
     }
 }
 
@@ -223,17 +283,65 @@ pub struct GraphicsSettings {
     pub view_distance: f32,
     pub vsync: bool,
     pub fov_deg: f32,
-    /// Sky/sun/moon rendering style. Orthogonal to the quality tier —
-    /// preset cycles leave it untouched. Defaults via `#[serde(default)]`
-    /// so a `graphics.json` written before this field existed still
-    /// loads (lands on `Enhanced`, the prior hard-coded behavior).
-    #[serde(default)]
-    pub sky_style: SkyStyle,
-    /// Synthesized environmental lights. Orthogonal to the quality tier
-    /// (preset cycles preserve it). `#[serde(default)]` lands a
-    /// pre-existing `graphics.json` on `Many`, the prior behavior.
+    /// Fine-grained sky/sun/moon realism toggles — the source of truth for
+    /// the sky look (the coarse `Sky Style` row derives Enhanced/Retail/
+    /// Custom from this; see [`GraphicsSettings::sky_style`]). Mutated by the
+    /// menu sub-rows *and* the `/sky` command, persisted here, and mirrored
+    /// onto the runtime [`crate::sky_realism::SkyRealism`] resource by
+    /// `apply_sky_realism_system`. Orthogonal to the quality tier — preset
+    /// cycles preserve it. `#[serde(default)]` so a `graphics.json` written
+    /// before this field existed loads on the Enhanced preset (prior
+    /// behavior). NOTE: a pre-existing `sky_style` key in such a file is
+    /// ignored (serde drops unknown fields), so an older `Retail` save
+    /// lands back on Enhanced once.
+    #[serde(default = "default_sky_realism")]
+    pub sky_realism: crate::sky_realism::SkyRealism,
+    /// Synthesized environmental lights — coarse tier (enabled + emitter
+    /// cap). Orthogonal to the quality tier (preset cycles preserve it).
+    /// `#[serde(default)]` lands a pre-existing `graphics.json` on `Many`,
+    /// the prior behavior. The four `light_*` knobs below are its
+    /// fine-grained sub-settings (the `/lights` knobs).
     #[serde(default)]
     pub dynamic_lights: DynamicLights,
+    /// `/lights threshold` — over-bright detection cutoff fed into
+    /// [`crate::zone_lights::ZoneLightConfig::overbright_threshold`].
+    #[serde(default = "default_light_threshold")]
+    pub light_threshold: f32,
+    /// `/lights intensity` — PointLight lumens before flicker.
+    #[serde(default = "default_light_intensity")]
+    pub light_intensity: f32,
+    /// `/lights range` — PointLight range in metres.
+    #[serde(default = "default_light_range")]
+    pub light_range: f32,
+    /// `/lights flicker` — animate emitter intensity/scale.
+    #[serde(default = "default_light_flicker")]
+    pub light_flicker: bool,
+}
+
+/// Default fine dynamic-light knobs. Kept in lockstep with
+/// [`crate::zone_lights::ZoneLightConfig`]'s defaults so the menu's "Many"
+/// tier and a fresh `ZoneLightConfig` agree — `zone_lights` carries a test
+/// pinning the two together (graphics_settings can't import ZoneLightConfig
+/// without a dependency cycle).
+pub const DEFAULT_LIGHT_THRESHOLD: f32 = 1.15;
+pub const DEFAULT_LIGHT_INTENSITY: f32 = 25_000.0;
+pub const DEFAULT_LIGHT_RANGE: f32 = 8.0;
+pub const DEFAULT_LIGHT_FLICKER: bool = true;
+
+fn default_sky_realism() -> crate::sky_realism::SkyRealism {
+    crate::sky_realism::SkyRealism::enhanced()
+}
+fn default_light_threshold() -> f32 {
+    DEFAULT_LIGHT_THRESHOLD
+}
+fn default_light_intensity() -> f32 {
+    DEFAULT_LIGHT_INTENSITY
+}
+fn default_light_range() -> f32 {
+    DEFAULT_LIGHT_RANGE
+}
+fn default_light_flicker() -> bool {
+    DEFAULT_LIGHT_FLICKER
 }
 
 impl Default for GraphicsSettings {
@@ -284,6 +392,12 @@ const PRESET_CYCLE: &[QualityPreset] = &[
 
 const SKY_STYLE_CYCLE: &[SkyStyle] = &[SkyStyle::Enhanced, SkyStyle::Retail];
 
+// Fine dynamic-light knob slots. Each default (1.15 / 25000 / 8.0) appears
+// in its list so cycling from a fresh tier starts on a real slot.
+const LIGHT_THRESHOLD_SLOTS: &[f32] = &[1.05, 1.15, 1.30, 1.50, 1.80];
+const LIGHT_INTENSITY_SLOTS: &[f32] = &[5_000.0, 10_000.0, 25_000.0, 50_000.0, 100_000.0];
+const LIGHT_RANGE_SLOTS: &[f32] = &[4.0, 6.0, 8.0, 12.0, 16.0];
+
 const DYNAMIC_LIGHTS_CYCLE: &[DynamicLights] =
     &[DynamicLights::Off, DynamicLights::Few, DynamicLights::Many];
 
@@ -305,8 +419,12 @@ impl GraphicsSettings {
                 view_distance: 2000.0,
                 vsync: true,
                 fov_deg: 50.0,
-                sky_style: SkyStyle::Enhanced,
+                sky_realism: crate::sky_realism::SkyRealism::enhanced(),
                 dynamic_lights: DynamicLights::Many,
+                light_threshold: DEFAULT_LIGHT_THRESHOLD,
+                light_intensity: DEFAULT_LIGHT_INTENSITY,
+                light_range: DEFAULT_LIGHT_RANGE,
+                light_flicker: DEFAULT_LIGHT_FLICKER,
             },
             QualityPreset::Medium => Self {
                 preset,
@@ -320,8 +438,12 @@ impl GraphicsSettings {
                 view_distance: 4000.0,
                 vsync: true,
                 fov_deg: 50.0,
-                sky_style: SkyStyle::Enhanced,
+                sky_realism: crate::sky_realism::SkyRealism::enhanced(),
                 dynamic_lights: DynamicLights::Many,
+                light_threshold: DEFAULT_LIGHT_THRESHOLD,
+                light_intensity: DEFAULT_LIGHT_INTENSITY,
+                light_range: DEFAULT_LIGHT_RANGE,
+                light_flicker: DEFAULT_LIGHT_FLICKER,
             },
             QualityPreset::High => Self {
                 preset,
@@ -335,8 +457,12 @@ impl GraphicsSettings {
                 view_distance: 6000.0,
                 vsync: true,
                 fov_deg: 50.0,
-                sky_style: SkyStyle::Enhanced,
+                sky_realism: crate::sky_realism::SkyRealism::enhanced(),
                 dynamic_lights: DynamicLights::Many,
+                light_threshold: DEFAULT_LIGHT_THRESHOLD,
+                light_intensity: DEFAULT_LIGHT_INTENSITY,
+                light_range: DEFAULT_LIGHT_RANGE,
+                light_flicker: DEFAULT_LIGHT_FLICKER,
             },
             QualityPreset::Ultra => Self {
                 preset,
@@ -353,8 +479,12 @@ impl GraphicsSettings {
                 view_distance: 6000.0,
                 vsync: true,
                 fov_deg: 50.0,
-                sky_style: SkyStyle::Enhanced,
+                sky_realism: crate::sky_realism::SkyRealism::enhanced(),
                 dynamic_lights: DynamicLights::Many,
+                light_threshold: DEFAULT_LIGHT_THRESHOLD,
+                light_intensity: DEFAULT_LIGHT_INTENSITY,
+                light_range: DEFAULT_LIGHT_RANGE,
+                light_flicker: DEFAULT_LIGHT_FLICKER,
             },
             // Custom: identical to High at construction; the caller
             // mutates fields after. Used by the on-disk loader when
@@ -387,8 +517,32 @@ impl GraphicsSettings {
             GraphicsField::ViewDistance => format!("{:.0}m", self.view_distance),
             GraphicsField::VSync => bool_label(self.vsync).into(),
             GraphicsField::Fov => format!("{:.0}°", self.fov_deg),
-            GraphicsField::SkyStyle => self.sky_style.label().to_string(),
-            GraphicsField::DynamicLights => self.dynamic_lights.label().to_string(),
+            // Coarse sky row: derived Enhanced / Retail / Custom.
+            GraphicsField::SkyStyle => self.sky_style().label().to_string(),
+            GraphicsField::SkyHorizonReddening
+            | GraphicsField::SkyHorizonDimming
+            | GraphicsField::SkyMoonIllusion
+            | GraphicsField::SkyEarthshine => {
+                // `unwrap` is safe: each of these arms maps to a SkyFeature.
+                bool_label(field.sky_feature().unwrap().get(&self.sky_realism)).into()
+            }
+            // Placeholders advertise the toggle but flag it as not-yet-live.
+            GraphicsField::SkyRealMoon | GraphicsField::SkyEclipses => format!(
+                "{} (soon)",
+                bool_label(field.sky_feature().unwrap().get(&self.sky_realism))
+            ),
+            // Coarse lights row: named tier, or Custom when a fine knob moves.
+            GraphicsField::DynamicLights => {
+                if self.lights_fine_is_default() {
+                    self.dynamic_lights.label().to_string()
+                } else {
+                    "Custom".to_string()
+                }
+            }
+            GraphicsField::LightThreshold => format!("{:.2}", self.light_threshold),
+            GraphicsField::LightIntensity => format!("{:.0}", self.light_intensity),
+            GraphicsField::LightRange => format!("{:.0}m", self.light_range),
+            GraphicsField::LightFlicker => bool_label(self.light_flicker).into(),
         }
     }
 
@@ -399,17 +553,27 @@ impl GraphicsSettings {
     pub fn cycle(&mut self, field: GraphicsField, delta: i32) {
         match field {
             GraphicsField::Preset => {
-                // Sky style and dynamic lights are orthogonal to the
+                // The sky and dynamic-light settings are orthogonal to the
                 // quality tier; preserve them across a preset overwrite so
                 // picking Low doesn't silently revert the user's Retail sky
                 // to Enhanced or re-enable lights they turned off.
-                let sky = self.sky_style;
+                let sky = self.sky_realism;
                 let lights = self.dynamic_lights;
+                let (lt, li, lr, lf) = (
+                    self.light_threshold,
+                    self.light_intensity,
+                    self.light_range,
+                    self.light_flicker,
+                );
                 let next =
                     cycle_slot(self.preset, PRESET_CYCLE, delta).unwrap_or(QualityPreset::High);
                 *self = Self::for_preset(next);
-                self.sky_style = sky;
+                self.sky_realism = sky;
                 self.dynamic_lights = lights;
+                self.light_threshold = lt;
+                self.light_intensity = li;
+                self.light_range = lr;
+                self.light_flicker = lf;
             }
             GraphicsField::ShadowMapSize => {
                 self.shadow_map_size =
@@ -456,16 +620,56 @@ impl GraphicsSettings {
                 self.preset = QualityPreset::Custom;
             }
             GraphicsField::SkyStyle => {
-                // Orthogonal to quality — does NOT flip the preset to
-                // Custom. Just cycles the style enum.
-                self.sky_style = cycle_slot(self.sky_style, SKY_STYLE_CYCLE, delta)
+                // Cycle Enhanced <-> Retail and stamp the matching feature
+                // preset onto `sky_realism`. From the derived `Custom` (not in
+                // the cycle list) we fall back to the first slot. Orthogonal
+                // to the quality tier — never flips `preset`.
+                let next = cycle_slot(self.sky_style(), SKY_STYLE_CYCLE, delta)
                     .unwrap_or(SkyStyle::Enhanced);
+                self.sky_realism = next.sky_realism();
+            }
+            GraphicsField::SkyHorizonReddening
+            | GraphicsField::SkyHorizonDimming
+            | GraphicsField::SkyMoonIllusion
+            | GraphicsField::SkyEarthshine
+            | GraphicsField::SkyRealMoon
+            | GraphicsField::SkyEclipses => {
+                // Placeholder rows (realmoon/eclipses) are inert in the GUI.
+                if field.is_placeholder() {
+                    return;
+                }
+                // Toggle the feature; the `Sky Style` row's derived label
+                // follows automatically. Orthogonal to quality — no `preset`.
+                if let Some(feat) = field.sky_feature() {
+                    let cur = feat.get(&self.sky_realism);
+                    feat.set(&mut self.sky_realism, !cur);
+                }
             }
             GraphicsField::DynamicLights => {
                 // Orthogonal to quality, like SkyStyle — cycle Off/Few/Many
-                // without flipping the preset to Custom.
+                // without flipping the preset to Custom. Picking a named tier
+                // resets the fine knobs to defaults (preset-overwrite
+                // semantics) so the row leaves the derived "Custom" label.
                 self.dynamic_lights = cycle_slot(self.dynamic_lights, DYNAMIC_LIGHTS_CYCLE, delta)
                     .unwrap_or(DynamicLights::Many);
+                self.light_threshold = DEFAULT_LIGHT_THRESHOLD;
+                self.light_intensity = DEFAULT_LIGHT_INTENSITY;
+                self.light_range = DEFAULT_LIGHT_RANGE;
+                self.light_flicker = DEFAULT_LIGHT_FLICKER;
+            }
+            GraphicsField::LightThreshold => {
+                self.light_threshold =
+                    cycle_slot_f32(self.light_threshold, LIGHT_THRESHOLD_SLOTS, delta);
+            }
+            GraphicsField::LightIntensity => {
+                self.light_intensity =
+                    cycle_slot_f32(self.light_intensity, LIGHT_INTENSITY_SLOTS, delta);
+            }
+            GraphicsField::LightRange => {
+                self.light_range = cycle_slot_f32(self.light_range, LIGHT_RANGE_SLOTS, delta);
+            }
+            GraphicsField::LightFlicker => {
+                self.light_flicker = !self.light_flicker;
             }
         }
     }
@@ -473,6 +677,39 @@ impl GraphicsSettings {
     /// Drop all overrides and snap back to High.
     pub fn reset_to_default(&mut self) {
         *self = Self::for_preset(QualityPreset::High);
+    }
+
+    /// The coarse sky style derived from the stored [`Self::sky_realism`]
+    /// knobs: the named style when they match a preset exactly, else
+    /// [`SkyStyle::Custom`]. This is the displayed `Sky Style` row value.
+    pub fn sky_style(&self) -> SkyStyle {
+        use crate::sky_realism::SkyRealism;
+        if self.sky_realism == SkyRealism::retail() {
+            SkyStyle::Retail
+        } else if self.sky_realism == SkyRealism::enhanced() {
+            SkyStyle::Enhanced
+        } else {
+            SkyStyle::Custom
+        }
+    }
+
+    /// Whether the Enhanced-only embellishments — the procedural cloud dome
+    /// ([`crate::skybox`]), the sun lens flare ([`crate::lens_flare`]), and
+    /// the synthesized zone lights ([`crate::zone_lights`]) — should render.
+    /// On for Enhanced *and* Custom; off only for full Retail (so flipping a
+    /// single feature off doesn't strip the whole enhanced look).
+    pub fn sky_embellishments_enabled(&self) -> bool {
+        self.sky_realism != crate::sky_realism::SkyRealism::retail()
+    }
+
+    /// True when every fine dynamic-light knob is at its default. The
+    /// `Dynamic Lights` row shows the named tier (Off/Few/Many) in that case
+    /// and the derived "Custom" otherwise.
+    fn lights_fine_is_default(&self) -> bool {
+        (self.light_threshold - DEFAULT_LIGHT_THRESHOLD).abs() < 1e-3
+            && (self.light_intensity - DEFAULT_LIGHT_INTENSITY).abs() < 1.0
+            && (self.light_range - DEFAULT_LIGHT_RANGE).abs() < 1e-3
+            && self.light_flicker == DEFAULT_LIGHT_FLICKER
     }
 
     /// Map `AaMode` → Bevy `Msaa` component value. TAA forces MSAA off
@@ -600,8 +837,20 @@ pub const GRAPHICS_FIELDS: &[GraphicsField] = &[
     GraphicsField::ViewDistance,
     GraphicsField::VSync,
     GraphicsField::Fov,
+    // Sky group: coarse style + its fine `/sky` toggles.
     GraphicsField::SkyStyle,
+    GraphicsField::SkyHorizonReddening,
+    GraphicsField::SkyHorizonDimming,
+    GraphicsField::SkyMoonIllusion,
+    GraphicsField::SkyEarthshine,
+    GraphicsField::SkyRealMoon,
+    GraphicsField::SkyEclipses,
+    // Lights group: coarse tier + its fine `/lights` knobs.
     GraphicsField::DynamicLights,
+    GraphicsField::LightThreshold,
+    GraphicsField::LightIntensity,
+    GraphicsField::LightRange,
+    GraphicsField::LightFlicker,
 ];
 
 // ---------------------------------------------------------------------------
@@ -834,23 +1083,21 @@ pub fn apply_vsync_system(
     }
 }
 
-/// Push the chosen [`SkyStyle`] onto the [`crate::sky_realism::SkyRealism`]
-/// knobs whenever the style actually changes. Shares the
+/// Mirror the stored [`GraphicsSettings::sky_realism`] knobs onto the
+/// runtime [`crate::sky_realism::SkyRealism`] resource that the sun / moon /
+/// cloud renderers read. `GraphicsSettings` is the single source of truth —
+/// the menu sub-rows, the coarse `Sky Style` row, and the `/sky` command all
+/// mutate it — so this is a plain one-way copy. Shares the
 /// `resource_changed::<GraphicsSettings>` run-condition with the other
-/// reactors, but the `Local` guard means an unrelated change (bloom,
-/// FOV, …) won't re-derive — so a `/sky <feature>` runtime override,
-/// which mutates `SkyRealism` directly and never touches
-/// `GraphicsSettings`, survives until the user picks a different style.
-pub fn apply_sky_style_system(
+/// reactors; the equality guard avoids an idle change-tick when an unrelated
+/// field (bloom, FOV, …) moved.
+pub fn apply_sky_realism_system(
     settings: Res<GraphicsSettings>,
     mut sky: ResMut<crate::sky_realism::SkyRealism>,
-    mut last: Local<Option<SkyStyle>>,
 ) {
-    if *last == Some(settings.sky_style) {
-        return;
+    if *sky != settings.sky_realism {
+        *sky = settings.sky_realism;
     }
-    *sky = settings.sky_style.sky_realism();
-    *last = Some(settings.sky_style);
 }
 
 // ---------------------------------------------------------------------------
@@ -938,18 +1185,92 @@ mod tests {
         assert_eq!(s, medium);
     }
 
-    /// Sky style cycles Enhanced ↔ Retail without flipping the preset
-    /// tag to Custom (it's orthogonal to the quality tier), and maps
-    /// onto the matching SkyRealism preset.
+    /// Sky style cycles Enhanced ↔ Retail without flipping the *quality*
+    /// preset to Custom (it's orthogonal to the quality tier), and stamps
+    /// the matching SkyRealism preset onto `sky_realism`.
     #[test]
     fn sky_style_cycles_without_custom() {
         let mut s = GraphicsSettings::default();
-        assert_eq!(s.sky_style, SkyStyle::Enhanced);
+        assert_eq!(s.sky_style(), SkyStyle::Enhanced);
         s.cycle(GraphicsField::SkyStyle, 1);
-        assert_eq!(s.sky_style, SkyStyle::Retail);
+        assert_eq!(s.sky_style(), SkyStyle::Retail);
+        assert_eq!(s.sky_realism, crate::sky_realism::SkyRealism::retail());
         assert_eq!(s.preset, QualityPreset::High, "style must not flip preset");
         s.cycle(GraphicsField::SkyStyle, 1);
-        assert_eq!(s.sky_style, SkyStyle::Enhanced, "two variants wrap");
+        assert_eq!(s.sky_style(), SkyStyle::Enhanced, "two variants wrap");
+    }
+
+    /// Toggling an individual sky feature derives `Custom` for the coarse
+    /// row but keeps the embellishment gate on (Custom ≠ full Retail) and
+    /// never touches the quality preset.
+    #[test]
+    fn toggling_a_sky_feature_marks_custom() {
+        let mut s = GraphicsSettings::default();
+        assert_eq!(s.sky_style(), SkyStyle::Enhanced);
+        s.cycle(GraphicsField::SkyEarthshine, 1); // earthshine on -> off
+        assert!(!s.sky_realism.earthshine);
+        assert_eq!(s.sky_style(), SkyStyle::Custom);
+        assert!(s.sky_embellishments_enabled(), "Custom keeps embellishments");
+        assert_eq!(s.value_label(GraphicsField::SkyStyle), "Custom");
+        assert_eq!(s.preset, QualityPreset::High, "sky feature ⟂ quality tier");
+    }
+
+    /// Placeholder sky rows (realmoon/eclipses) are inert when cycled from
+    /// the GUI and are flagged as placeholders.
+    #[test]
+    fn placeholder_sky_features_are_inert() {
+        let mut s = GraphicsSettings::default();
+        let before = s.sky_realism;
+        s.cycle(GraphicsField::SkyRealMoon, 1);
+        s.cycle(GraphicsField::SkyEclipses, 1);
+        assert_eq!(s.sky_realism, before, "placeholder rows don't mutate state");
+        assert!(GraphicsField::SkyRealMoon.is_placeholder());
+        assert!(GraphicsField::SkyEclipses.is_placeholder());
+        assert!(!GraphicsField::SkyEarthshine.is_placeholder());
+    }
+
+    /// Embellishments are gated off only for *full* Retail. Retail + one
+    /// feature toggled back on is Custom, which re-enables the gate.
+    #[test]
+    fn embellishments_off_only_for_full_retail() {
+        let mut s = GraphicsSettings::default();
+        assert!(s.sky_embellishments_enabled());
+        s.cycle(GraphicsField::SkyStyle, 1); // -> Retail
+        assert!(!s.sky_embellishments_enabled());
+        s.cycle(GraphicsField::SkyHorizonReddening, 1); // retail + reddening
+        assert_eq!(s.sky_style(), SkyStyle::Custom);
+        assert!(s.sky_embellishments_enabled());
+    }
+
+    /// Tuning a fine light knob derives `Custom` for the coarse row but
+    /// leaves the cap tier and quality preset untouched; re-picking the
+    /// tier resets the fine knobs.
+    #[test]
+    fn tuning_a_light_knob_marks_custom() {
+        let mut s = GraphicsSettings::default();
+        assert_eq!(s.value_label(GraphicsField::DynamicLights), "Many");
+        s.cycle(GraphicsField::LightIntensity, 1);
+        assert_eq!(s.value_label(GraphicsField::DynamicLights), "Custom");
+        assert_eq!(s.dynamic_lights, DynamicLights::Many, "cap tier unchanged");
+        assert_eq!(s.preset, QualityPreset::High, "light knob ⟂ quality tier");
+        s.cycle(GraphicsField::DynamicLights, 1); // Many -> Off, resets knobs
+        assert!(s.lights_fine_is_default());
+        assert_eq!(s.value_label(GraphicsField::DynamicLights), "Off");
+    }
+
+    /// Light-knob defaults must each sit on a real slot so cycling from a
+    /// fresh tier starts cleanly.
+    #[test]
+    fn light_defaults_are_slot_aligned() {
+        assert!(LIGHT_THRESHOLD_SLOTS
+            .iter()
+            .any(|x| (x - DEFAULT_LIGHT_THRESHOLD).abs() < 1e-3));
+        assert!(LIGHT_INTENSITY_SLOTS
+            .iter()
+            .any(|x| (x - DEFAULT_LIGHT_INTENSITY).abs() < 1.0));
+        assert!(LIGHT_RANGE_SLOTS
+            .iter()
+            .any(|x| (x - DEFAULT_LIGHT_RANGE).abs() < 1e-3));
     }
 
     /// `SkyStyle::sky_realism()` returns the expected presets — Retail
@@ -969,9 +1290,10 @@ mod tests {
     fn preset_cycle_preserves_sky_style() {
         let mut s = GraphicsSettings::default();
         s.cycle(GraphicsField::SkyStyle, 1);
-        assert_eq!(s.sky_style, SkyStyle::Retail);
+        assert_eq!(s.sky_style(), SkyStyle::Retail);
         s.cycle(GraphicsField::Preset, 1); // High → Ultra
-        assert_eq!(s.sky_style, SkyStyle::Retail, "preset cycle kept the style");
+        assert_eq!(s.sky_style(), SkyStyle::Retail, "preset cycle kept the style");
+        assert_eq!(s.sky_realism, crate::sky_realism::SkyRealism::retail());
     }
 
     /// Dynamic lights cycle Off → Few → Many without flipping the preset
@@ -1030,16 +1352,26 @@ mod tests {
         assert!(s.wants_taa());
     }
 
-    /// Value labels are human-readable — used by the menu row renderer.
+    /// Value labels render with the right shape — units/suffixes applied per
+    /// field type. Each field is set explicitly so the test owns its inputs
+    /// and stays decoupled from the preset default *values* (those change
+    /// over time; the format strings shouldn't). Non-default values are
+    /// chosen so a label accidentally hard-wired to a default still fails.
     #[test]
     fn value_label_smoke() {
-        let s = GraphicsSettings::default();
-        assert_eq!(s.value_label(GraphicsField::Preset), "High");
-        assert_eq!(s.value_label(GraphicsField::ShadowMapSize), "4096px");
-        assert_eq!(s.value_label(GraphicsField::ShadowCascadeCount), "4");
-        assert_eq!(s.value_label(GraphicsField::ShadowMaxDistance), "600m");
+        let mut s = GraphicsSettings::default();
+        s.preset = QualityPreset::Ultra;
+        s.shadow_map_size = 2048;
+        s.shadow_cascade_count = 3;
+        s.shadow_max_distance = 400.0;
+        s.volumetric_fog = true;
+        s.fov_deg = 90.0;
+        assert_eq!(s.value_label(GraphicsField::Preset), "Ultra");
+        assert_eq!(s.value_label(GraphicsField::ShadowMapSize), "2048px");
+        assert_eq!(s.value_label(GraphicsField::ShadowCascadeCount), "3");
+        assert_eq!(s.value_label(GraphicsField::ShadowMaxDistance), "400m");
         assert_eq!(s.value_label(GraphicsField::VolumetricFog), "On");
-        assert_eq!(s.value_label(GraphicsField::Fov), "75°");
+        assert_eq!(s.value_label(GraphicsField::Fov), "90°");
     }
 
     /// reset_to_default snaps any custom state back to the High preset.

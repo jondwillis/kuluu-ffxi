@@ -179,6 +179,18 @@ const GRAPHICS_ENTRIES: &[&str] = &[
     "View Distance",
     "VSync",
     "FOV",
+    "Sky Style",
+    "  Reddening",
+    "  Dimming",
+    "  Moon Illusion",
+    "  Earthshine",
+    "  Real Moon",
+    "  Eclipses",
+    "Dynamic Lights",
+    "  Threshold",
+    "  Intensity",
+    "  Range",
+    "  Flicker",
     "Reset to High",
 ];
 
@@ -664,12 +676,16 @@ pub fn update_main_menu(
             // around the cursor. Static menus return their natural
             // slice and `viewport_start = 0`.
             let (total_count, viewport_start) = resolve_viewport(kind, c, &dynamic);
+            // Only dynamic menus (Magic / Abilities) window to a fixed
+            // viewport; static menus show every row up to their length —
+            // the Graphics tab alone is now 24 rows, past DYNAMIC_VISIBLE_ROWS.
+            let window = visible_window(kind, total_count);
             for (row, mut row_node, mut text, mut color) in row_q.iter_mut() {
                 // Map this row's pool index → list index via the
                 // viewport offset. Rows beyond the visible window
                 // hide.
                 let list_idx = viewport_start + row.slot;
-                let visible = row.slot < DYNAMIC_VISIBLE_ROWS && list_idx < total_count;
+                let visible = row.slot < window && list_idx < total_count;
                 if !visible {
                     if row_node.display != Display::None {
                         row_node.display = Display::None;
@@ -701,7 +717,16 @@ pub fn update_main_menu(
                 if **text != want {
                     **text = want;
                 }
-                let want_color = if is_cursor {
+                // Greyed, inert placeholder rows (Stage-2 sky features) read
+                // dimmer than a normal muted row even under the cursor, so
+                // it's clear they can't be changed here.
+                let placeholder = matches!(kind, MenuKind::Graphics)
+                    && GRAPHICS_FIELDS
+                        .get(list_idx)
+                        .is_some_and(|f| f.is_placeholder());
+                let want_color = if placeholder {
+                    palette::DARK
+                } else if is_cursor {
                     palette::ACCENT
                 } else {
                     palette::MUTED
@@ -724,6 +749,19 @@ pub fn update_main_menu(
 /// the row pool, so no windowing needed. Dynamic menus center the
 /// viewport on the cursor when the list overflows
 /// [`DYNAMIC_VISIBLE_ROWS`].
+/// How many pool rows render for the active menu. Dynamic menus (Magic /
+/// Abilities) window to a fixed [`DYNAMIC_VISIBLE_ROWS`] viewport and scroll;
+/// static menus show their whole list — Graphics alone is 24 rows, past the
+/// dynamic window, and [`MAX_ENTRY_COUNT`] sizes the pool to fit it. Used by
+/// the render / hover / click systems so all agree on which rows are live.
+fn visible_window(kind: MenuKind, total: usize) -> usize {
+    if is_dynamic(kind) {
+        DYNAMIC_VISIBLE_ROWS
+    } else {
+        total
+    }
+}
+
 fn resolve_viewport(kind: MenuKind, cursor: usize, dynamic: &DynamicMenu) -> (usize, usize) {
     if is_dynamic(kind) {
         let total = dynamic.rows.len().max(1);
@@ -761,12 +799,13 @@ pub fn menu_mouse_hover_system(
     // viewport; translate back to a list index before applying as the
     // cursor.
     let (total, viewport_start) = resolve_viewport(kind, level.cursor, &dynamic);
+    let window = visible_window(kind, total);
     for (interaction, row) in &rows {
         if !matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
             continue;
         }
         let list_idx = viewport_start + row.slot;
-        if list_idx >= total || row.slot >= DYNAMIC_VISIBLE_ROWS {
+        if list_idx >= total || row.slot >= window {
             continue;
         }
         if level.cursor != list_idx {
@@ -793,12 +832,13 @@ pub fn menu_mouse_click_system(
     };
     let kind = level.kind;
     let (total, viewport_start) = resolve_viewport(kind, level.cursor, &dynamic);
+    let window = visible_window(kind, total);
     for (interaction, row) in &rows {
         if *interaction != Interaction::Pressed {
             continue;
         }
         let list_idx = viewport_start + row.slot;
-        if list_idx < total && row.slot < DYNAMIC_VISIBLE_ROWS {
+        if list_idx < total && row.slot < window {
             out.write(MenuRowActivated { slot: list_idx });
         }
     }
@@ -858,6 +898,32 @@ mod tests {
         assert_eq!(STATUS_LABELS.len(), STATUS_ENTRIES.len());
         for (i, entry) in STATUS_ENTRIES.iter().enumerate() {
             assert_eq!(STATUS_LABELS[i], entry.label, "Status row {i} label drift");
+        }
+    }
+
+    /// Every static menu must fit the spawned row pool and show *all* its
+    /// rows (no dynamic windowing). Regression guard: the Graphics tab grew
+    /// past the old DYNAMIC_VISIBLE_ROWS cap when the sky/light sub-rows
+    /// landed, which would have hidden its last rows.
+    #[test]
+    fn static_menus_fit_pool_and_show_all_rows() {
+        for kind in [
+            MenuKind::Root,
+            MenuKind::Config,
+            MenuKind::Graphics,
+            MenuKind::Equipment,
+            MenuKind::Status,
+        ] {
+            let total = static_entries(kind).len();
+            assert!(
+                total <= MAX_ENTRY_COUNT,
+                "{kind:?} has {total} rows, exceeds row pool {MAX_ENTRY_COUNT}"
+            );
+            assert_eq!(
+                visible_window(kind, total),
+                total,
+                "{kind:?} is static and must render every row"
+            );
         }
     }
 

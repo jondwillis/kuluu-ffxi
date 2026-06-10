@@ -6,10 +6,13 @@
 //! a stylized 2002 fake (sun/moon antipodal regardless of phase, etc.
 //! — see `ffxi-viewer-core/src/sun_moon.rs` docs for the trade).
 //!
-//! Operators flip features at runtime via `/sky <feature> [on|off|toggle]`
-//! (parsed in `ffxi-client/src/view_native/slash_commands.rs::parse_sky`).
-//! Persistence to disk lives with [`crate::graphics_settings::GraphicsSettings`]
-//! as a future hook — for now the resource resets on launch.
+//! This resource is the *runtime* copy the renderers read; the source of
+//! truth is [`crate::graphics_settings::GraphicsSettings::sky_realism`]
+//! (persisted to `graphics.json`). The menu's `Sky Style` sub-rows and the
+//! `/sky <feature> [on|off|toggle]` command (parsed in
+//! `ffxi-client/src/view_native/slash_commands.rs::parse_sky`) both mutate
+//! `GraphicsSettings`; `apply_sky_realism_system` mirrors it onto this
+//! resource. So `/sky` tweaks now persist across launches.
 
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};

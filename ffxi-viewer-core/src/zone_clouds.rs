@@ -35,7 +35,9 @@ fn drive_cloud_mesh(
     settings: Res<GraphicsSettings>,
     mut q: Query<(&mut Visibility, &mut Transform), With<CloudMesh>>,
 ) {
-    let retail = settings.sky_style == SkyStyle::Retail;
+    // Faithful MMB clouds show only in *full* Retail; the procedural dome
+    // (`crate::skybox`) owns Enhanced/Custom.
+    let retail = settings.sky_style() == SkyStyle::Retail;
     let dt = time.delta_secs();
     for (mut vis, mut xf) in &mut q {
         *vis = if retail {

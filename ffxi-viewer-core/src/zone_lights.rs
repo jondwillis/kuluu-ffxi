@@ -54,10 +54,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::components::InGameEntity;
 use crate::dat_mmb::MmbOverlay;
-use crate::graphics_settings::{DynamicLights, GraphicsSettings, SkyStyle};
+use crate::graphics_settings::GraphicsSettings;
 
-/// Runtime knobs for the dynamic-light heuristic. Persisted nowhere yet
-/// (resets each launch); tuned live via `/lights`.
+/// Runtime knobs for the dynamic-light heuristic. This is the resource the
+/// detection/animation systems read; it's *driven* by
+/// [`GraphicsSettings`] (coarse tier + the `light_*` knobs, persisted to
+/// `graphics.json`) via [`apply_lights_settings`]. `warm_only`,
+/// `max_per_mesh`, and `flame_radius` aren't surfaced in the UI/`/lights`
+/// yet, so they keep these defaults.
 #[derive(Resource, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct ZoneLightConfig {
     /// Master on/off. When off, no emitters are detected or spawned
@@ -173,7 +177,7 @@ fn drain_light_scan(
     // Synthesised vertex-cluster lights are an Enhanced-only embellishment
     // with no retail basis (see module docs). When disabled or in Retail,
     // drop any queued work so it can't accumulate or fire on a later switch.
-    if !cfg.enabled || settings.sky_style != SkyStyle::Enhanced {
+    if !cfg.enabled || !settings.sky_embellishments_enabled() {
         pending.0.clear();
         return;
     }
@@ -360,7 +364,7 @@ fn animate_zone_lights(
         &mut Visibility,
     )>,
 ) {
-    let enhanced = settings.sky_style == SkyStyle::Enhanced;
+    let enhanced = settings.sky_embellishments_enabled();
     let t = time.elapsed_secs();
     for (emitter, mut light, mut xf, mut vis) in &mut q {
         *vis = if enhanced {
@@ -386,23 +390,39 @@ fn animate_zone_lights(
     }
 }
 
-/// Push the `Dynamic Lights` graphics-menu setting onto
-/// [`ZoneLightConfig`] whenever it changes. A [`Local`] guard means an
-/// unrelated `GraphicsSettings` change won't clobber a live `/lights`
-/// tweak — that runtime override (which mutates `ZoneLightConfig`
-/// directly) survives until the user picks a different menu slot, the
-/// same pattern as `apply_sky_style_system` vs `/sky`.
-fn apply_dynamic_lights_setting(
-    settings: Res<GraphicsSettings>,
-    mut cfg: ResMut<ZoneLightConfig>,
-    mut last: Local<Option<DynamicLights>>,
-) {
-    if *last == Some(settings.dynamic_lights) {
+/// Mirror the dynamic-light settings from [`GraphicsSettings`] onto
+/// [`ZoneLightConfig`]. `GraphicsSettings` is the single source of truth
+/// (the coarse tier + fine knobs come from the menu rows *and* the
+/// `/lights` command, persisted to `graphics.json`); this copies the coarse
+/// tier into `enabled`/`max_total` and the four fine knobs into their
+/// matching fields. Each assignment is guarded so an unrelated
+/// `GraphicsSettings` change doesn't spuriously re-tick `ZoneLightConfig`'s
+/// change detection. `warm_only` / `max_per_mesh` / `flame_radius` are not
+/// UI-exposed and are left at their `ZoneLightConfig::default()` values.
+fn apply_lights_settings(settings: Res<GraphicsSettings>, mut cfg: ResMut<ZoneLightConfig>) {
+    if !settings.is_changed() {
         return;
     }
-    cfg.enabled = settings.dynamic_lights.enabled();
-    cfg.max_total = settings.dynamic_lights.max_total();
-    *last = Some(settings.dynamic_lights);
+    let enabled = settings.dynamic_lights.enabled();
+    let max_total = settings.dynamic_lights.max_total();
+    if cfg.enabled != enabled {
+        cfg.enabled = enabled;
+    }
+    if cfg.max_total != max_total {
+        cfg.max_total = max_total;
+    }
+    if (cfg.overbright_threshold - settings.light_threshold).abs() > f32::EPSILON {
+        cfg.overbright_threshold = settings.light_threshold;
+    }
+    if (cfg.point_intensity - settings.light_intensity).abs() > f32::EPSILON {
+        cfg.point_intensity = settings.light_intensity;
+    }
+    if (cfg.point_range - settings.light_range).abs() > f32::EPSILON {
+        cfg.point_range = settings.light_range;
+    }
+    if cfg.flicker != settings.light_flicker {
+        cfg.flicker = settings.light_flicker;
+    }
 }
 
 pub struct ZoneLightsPlugin;
@@ -415,7 +435,7 @@ impl Plugin for ZoneLightsPlugin {
             .add_systems(
                 Update,
                 (
-                    apply_dynamic_lights_setting,
+                    apply_lights_settings,
                     enqueue_light_scan,
                     drain_light_scan,
                     animate_zone_lights,
@@ -467,5 +487,18 @@ mod tests {
         let colors = vec![[1.0, 0.9, 0.8, 1.0]]; // peak 1.0 < 1.15
         let positions = vec![[0.0, 0.0, 0.0]];
         assert!(cluster_overbright(&colors, &positions, &cfg).is_empty());
+    }
+
+    /// `GraphicsSettings`' fine-light defaults must equal a fresh
+    /// `ZoneLightConfig`, so the menu's "Many" tier and a default config
+    /// agree (the constants live in graphics_settings to avoid a dep cycle).
+    #[test]
+    fn graphics_light_defaults_match_config() {
+        use crate::graphics_settings as gs;
+        let d = ZoneLightConfig::default();
+        assert!((d.overbright_threshold - gs::DEFAULT_LIGHT_THRESHOLD).abs() < 1e-6);
+        assert!((d.point_intensity - gs::DEFAULT_LIGHT_INTENSITY).abs() < 1e-3);
+        assert!((d.point_range - gs::DEFAULT_LIGHT_RANGE).abs() < 1e-6);
+        assert_eq!(d.flicker, gs::DEFAULT_LIGHT_FLICKER);
     }
 }

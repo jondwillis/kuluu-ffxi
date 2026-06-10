@@ -27,7 +27,7 @@ use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::shader::ShaderRef;
 
 use crate::components::InGameEntity;
-use crate::graphics_settings::{GraphicsSettings, SkyStyle};
+use crate::graphics_settings::GraphicsSettings;
 use crate::sun_moon::{SunDisc, VanaSky};
 
 #[derive(Clone, Debug, ShaderType)]
@@ -126,7 +126,7 @@ fn lens_flare_system(
         return;
     };
 
-    let enhanced = settings.sky_style == SkyStyle::Enhanced;
+    let enhanced = settings.sky_embellishments_enabled();
     let sun_up = sky.sun_altitude > 0.0;
     if !enhanced || !sun_up {
         *vis = Visibility::Hidden;
