@@ -19,9 +19,15 @@
 //!   * The client's camera-zoom handler reads `MinimapHoverGate` and
 //!     short-circuits when hovered.
 //!
-//! Scroll-wheel coordination is even simpler — we set
-//! `MousePointer::wheel = 0.0` after consuming the event, same
-//! pattern the chat panel uses.
+//! Scroll-wheel coordination uses the same consume-by-zeroing trick
+//! the chat panel does: [`handle_minimap_zoom_input`] sets
+//! `MousePointer::wheel = 0.0` after a hovered scroll so the chase
+//! camera doesn't zoom on the same notch. The catch is *ordering* —
+//! the zero must be written before `mouse::mouse_camera_system` reads
+//! the wheel. Chat earns that for free by running in `PreUpdate`; this
+//! handler runs in `Update`, so `MinimapPlugin` pins it
+//! `.before(mouse_camera_system)` (see the plugin's `build`). Without
+//! that edge the two `Update` systems race and the camera wins.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -210,5 +216,128 @@ pub fn recenter_minimap_view(
     view.pan_offset_xz *= 1.0 - t;
     if view.pan_offset_xz.length_squared() < 0.01 {
         view.pan_offset_xz = Vec2::ZERO;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera::{CameraMode, ChaseCamera};
+    use crate::snapshot::SceneState;
+    use bevy::input::mouse::MouseScrollUnit;
+    use bevy::input::ButtonInput;
+
+    use super::super::{MinimapState, MinimapView, MinimapZoom, ZOOM_DEFAULT_RADIUS};
+
+    /// Build a minimal app wired with every resource + message the
+    /// minimap zoom handler (and, for the end-to-end test, the camera
+    /// system) reads. `hovered` seeds [`MinimapHoverGate`]; the caller
+    /// adds the systems under test and writes the wheel event.
+    fn zoom_test_app(hovered: bool) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<MouseWheel>()
+            .init_resource::<MinimapState>()
+            .init_resource::<MinimapMode>()
+            .init_resource::<MinimapView>()
+            .init_resource::<MinimapZoom>()
+            .init_resource::<Bindings>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<SceneState>()
+            .init_resource::<CameraMode>()
+            .init_resource::<ChaseCamera>()
+            .insert_resource(MinimapHoverGate { hovered })
+            .insert_resource(MousePointer {
+                wheel: 5.0,
+                ..Default::default()
+            });
+        app
+    }
+
+    fn write_scroll_up(app: &mut App) {
+        app.world_mut().write_message(MouseWheel {
+            unit: MouseScrollUnit::Line,
+            x: 0.0,
+            y: 5.0,
+            window: Entity::PLACEHOLDER,
+        });
+    }
+
+    /// Hovered scroll zooms the minimap in *and* zeros
+    /// `MousePointer::wheel` — the suppression signal the chase camera
+    /// relies on to not double-zoom on the same notch.
+    #[test]
+    fn hovered_scroll_zooms_minimap_and_consumes_wheel() {
+        let mut app = zoom_test_app(true);
+        app.add_systems(Update, handle_minimap_zoom_input);
+        write_scroll_up(&mut app);
+        app.update();
+
+        // Default 50 yalms / ZOOM_STEP_FACTOR(1.25) = 40 → zoomed in.
+        assert_eq!(
+            app.world().resource::<MinimapZoom>().radius_yalms,
+            Some(ZOOM_DEFAULT_RADIUS / ZOOM_STEP_FACTOR),
+            "scroll-up over the minimap should zoom it in"
+        );
+        assert_eq!(
+            app.world().resource::<MousePointer>().wheel,
+            0.0,
+            "consuming the wheel must zero MousePointer::wheel so the \
+             camera doesn't also zoom"
+        );
+    }
+
+    /// Without hover the handler passes the wheel through untouched, so
+    /// the camera still gets to zoom — scroll only "takes focus" while
+    /// the cursor is actually over the widget.
+    #[test]
+    fn unhovered_scroll_leaves_wheel_for_camera() {
+        let mut app = zoom_test_app(false);
+        app.add_systems(Update, handle_minimap_zoom_input);
+        write_scroll_up(&mut app);
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<MinimapZoom>().radius_yalms,
+            Some(ZOOM_DEFAULT_RADIUS),
+            "minimap zoom must not change when the cursor is elsewhere"
+        );
+        assert_eq!(
+            app.world().resource::<MousePointer>().wheel,
+            5.0,
+            "an un-hovered wheel must reach the camera untouched"
+        );
+    }
+
+    /// End-to-end: with the zoom handler ordered before the camera
+    /// (as `MinimapPlugin` pins it), a hovered scroll zooms the minimap
+    /// and leaves the chase distance untouched. Guards the regression
+    /// where the camera consumed the wheel first and zoomed anyway.
+    #[test]
+    fn hovered_scroll_does_not_move_camera_distance() {
+        let mut app = zoom_test_app(true);
+        app.insert_resource(CameraMode::Chase);
+        let initial = app.world().resource::<ChaseCamera>().distance;
+        app.add_systems(
+            Update,
+            (
+                handle_minimap_zoom_input,
+                crate::mouse::mouse_camera_system,
+            )
+                .chain(),
+        );
+        write_scroll_up(&mut app);
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<ChaseCamera>().distance,
+            initial,
+            "scrolling over the minimap must not zoom the chase camera"
+        );
+        assert_eq!(
+            app.world().resource::<MinimapZoom>().radius_yalms,
+            Some(ZOOM_DEFAULT_RADIUS / ZOOM_STEP_FACTOR),
+            "the same scroll should have zoomed the minimap instead"
+        );
     }
 }

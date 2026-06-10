@@ -386,7 +386,21 @@ impl Plugin for MinimapPlugin {
                         overlay::update_minimap_overlay,
                     ),
                 )
-                    .chain(),
+                    .chain()
+                    // `handle_minimap_zoom_input` zeros `MousePointer::wheel`
+                    // when the cursor is over the minimap, to stop a hovered
+                    // scroll from also zooming the chase camera. That write
+                    // must land *before* `mouse_camera_system` reads the
+                    // wheel — both run in `Update`, so without this edge the
+                    // scheduler is free to run the camera first and the
+                    // suppression no-ops (the camera zooms anyway). Chat gets
+                    // the same guarantee for free by consuming in `PreUpdate`;
+                    // the minimap zoom handler lives in `Update` (it also
+                    // reads per-frame UI hover state), so it states the order
+                    // explicitly. Constraining the head of the chain
+                    // transitively orders the whole chain before the camera,
+                    // which is harmless — none of these read camera state.
+                    .before(crate::mouse::mouse_camera_system),
             );
     }
 }
