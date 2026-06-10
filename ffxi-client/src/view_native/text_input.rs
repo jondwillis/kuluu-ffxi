@@ -2694,6 +2694,9 @@ pub fn mouse_nav_dispatch_system(
     mut menu_events: MessageReader<ffxi_viewer_core::hud::menu::MenuRowActivated>,
     mut dialog_events: MessageReader<ffxi_viewer_core::hud::dialog::DialogChoiceActivated>,
     mut qa_events: MessageReader<ffxi_viewer_core::hud::quick_action::QuickActionActivated>,
+    mut ta_events: MessageReader<
+        ffxi_viewer_core::hud::target_action_menu::TargetActionActivated,
+    >,
     cmd_tx: Res<CommandTx>,
     mut bindings: ResMut<Bindings>,
     mut keybinds_state: ResMut<KeybindsStateRes>,
