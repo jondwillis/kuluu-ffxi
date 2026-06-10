@@ -68,8 +68,18 @@ vendor/game-files/
       sound/win/…
 ```
 
-Either drop (or symlink) your install at `vendor/game-files/`, or point the
-client at an existing copy:
+Then wire it up with the cross-platform helper, which detects an existing
+install (HorizonXI / Lutris / Wine / CrossOver / PlayOnline), validates it, and
+symlinks it into `vendor/game-files/`:
+
+```bash
+cargo xtask game                 # auto-detect
+cargo xtask game "/path/to/..."  # or point it at a known install
+cargo xtask game --copy          # copy instead of symlink
+```
+
+Or do it by hand — drop/symlink your install at `vendor/game-files/`, or just
+point the client at an existing copy:
 
 ```bash
 export FFXI_DAT_PATH="/path/to/.../SquareEnix/FINAL FANTASY XI"

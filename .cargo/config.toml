@@ -49,3 +49,9 @@ codegen-backend = true
 # lives in the standalone `lld` formula, not `llvm`).
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=--ld-path=/opt/homebrew/opt/lld/bin/ld64.lld"]
+
+# Project automation. `cargo xtask game` wires a retail FFXI install into
+# vendor/game-files/ — see xtask/src/main.rs and the README "Getting the game
+# files" section.
+[alias]
+xtask = "run --quiet --package xtask --"

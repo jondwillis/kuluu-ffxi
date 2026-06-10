@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["ffxi-proto", "ffxi-client", "ffxi-mcp", "ffxi-nav", "ffxi-nav-recast", "ffxi-viewer-wire", "ffxi-viewer-core", "ffxi-viewer-wasm", "ffxi-dat", "ffxi-audio"]
+members = ["ffxi-proto", "ffxi-client", "ffxi-mcp", "ffxi-nav", "ffxi-nav-recast", "ffxi-viewer-wire", "ffxi-viewer-core", "ffxi-viewer-wasm", "ffxi-dat", "ffxi-audio", "xtask"]
+# `xtask` is project automation run on demand via `cargo xtask` — exclude it
+# from the default set so plain `cargo build`/`test` don't compile it.
+default-members = ["ffxi-proto", "ffxi-client", "ffxi-mcp", "ffxi-nav", "ffxi-nav-recast", "ffxi-viewer-wire", "ffxi-viewer-core", "ffxi-viewer-wasm", "ffxi-dat", "ffxi-audio"]
 
 # Vendored fork of recastnavigation-rs 0.1.0 with a one-line `#include
 # <cstddef>` in Deterministic.h. Without it, `cargo test` fails with
