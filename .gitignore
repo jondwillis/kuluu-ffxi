@@ -46,6 +46,12 @@ vendor/xi-tinkerer/
 # all-rights-reserved: do NOT copy, derive, paste, or link from any crate.
 # See vendor/RZN-mapviewer/CLAIM.md and memory note `rzn_mapviewer_cite_only`.
 vendor/RZN-mapviewer/
+
+# XIM browser FFXI client (GPL-3) — read-only feature reference, NEVER commit.
+# Fetch a local copy with `research/fetch-xim.sh`. See research/README.md.
+research/xim/
+# stray top-level copy (older fetch location)
+/xim/
 .functional-emotions
 .claude/worktrees/
 
