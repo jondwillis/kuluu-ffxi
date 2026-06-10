@@ -386,7 +386,9 @@ fn spawn_static_scene(
         Transform::from_xyz(-2.0, 2.0, -2.0).looking_at(PREVIEW_PARENT_POS, Vec3::Y),
         ChildOf(root),
     ));
-    commands.insert_resource(AmbientLight {
+    // Bevy 0.18: the global ambient is `GlobalAmbientLight` (the old
+    // `AmbientLight` resource is now a per-camera component).
+    commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.85, 0.88, 1.0),
         brightness: 200.0,
         ..default()
