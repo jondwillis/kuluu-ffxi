@@ -345,6 +345,23 @@ parity isn't compromised by default.
 - [ ] Plugin / extension API (the umbrella that lets the rest of this
   section exist as community contributions)
 
+## Reference material (`research/`)
+
+When re-implementing a feature it helps to read how other community clients
+behave. Those upstreams live under `research/` as **read-only references** —
+never redistributed by this repo (gitignored or submodule pointers). Study the
+behavior and re-express it in our own code; don't copy source in.
+
+The most useful one is [XIM](https://xim.pages.dev/), a from-scratch browser
+FFXI client. Fetch a local copy with the helper script (GPL-3, gitignored):
+
+```bash
+research/fetch-xim.sh
+```
+
+See [`research/README.md`](research/README.md) for the full list, sources, and
+the reference-only policy.
+
 ## Contributing
 
 Pick a `[~]` or `[ ]` line above and open a PR. When you finish a feature
