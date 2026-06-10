@@ -44,10 +44,12 @@ struct HelpEntry {
 }
 
 /// Categorized listing rendered by `/help` and `/?`. Single source of
-/// truth for the help screen — the `help_entries_dispatch_known`
-/// test below pins each canonical alias against `parse_slash` so a
-/// new command added to the match without a help entry (or vice
-/// versa) trips a test failure.
+/// truth for the help screen, kept in lockstep with the `parse_slash`
+/// dispatch match by two tests: `help_entries_dispatch_known` (every
+/// help alias must parse) and `dispatch_arms_have_help_entries` (every
+/// dispatched command must have a help entry). Together they make the
+/// help set and the dispatch set identical, so a new command can never
+/// be added to the match without showing up in `/help` and `/?`.
 const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
     (
         "Help",
@@ -135,6 +137,33 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 aliases: &["target"],
                 usage: "[name]",
                 summary: "set or clear current target",
+            },
+            HelpEntry {
+                aliases: &["targetnpc", "targetnpc2"],
+                usage: "",
+                summary: "cycle nearest NPC/mob/pet (targetnpc2 cycles in reverse)",
+            },
+            HelpEntry {
+                aliases: &["targetenemy"],
+                usage: "",
+                summary: "cycle nearest enemy (mobs only)",
+            },
+            HelpEntry {
+                aliases: &["targetnpcparty"],
+                usage: "",
+                summary: "cycle owned party NPCs (trusts/fellows/pets)",
+            },
+            HelpEntry {
+                aliases: &[
+                    "targetparty1",
+                    "targetparty2",
+                    "targetparty3",
+                    "targetparty4",
+                    "targetparty5",
+                    "targetparty6",
+                ],
+                usage: "",
+                summary: "target party slot 1-6 (slot 1 = self)",
             },
             HelpEntry {
                 aliases: &["debug", "dbg", "nearby", "entities"],
@@ -4696,6 +4725,77 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Reverse drift guard: every command the `parse_slash` match
+    /// dispatches must have a HELP_CATEGORIES entry, so a new command
+    /// can never be added to the match while staying invisible to
+    /// `/help` and `/?`. We can't reflect on match arms, so we scrape
+    /// this source file: rustfmt anchors every top-level arm pattern at
+    /// an 8-space indent starting with a quote (continuation lines for
+    /// long alias lists start with `| "..."` at the same indent), and
+    /// the catch-all `unknown =>` terminates the dispatch block. Every
+    /// quoted alias before each arm's `=>` must appear in the help
+    /// table. Pairs with `help_entries_dispatch_known` (the forward
+    /// direction) to make the two sets identical.
+    #[test]
+    fn dispatch_arms_have_help_entries() {
+        let src = include_str!("slash_commands.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.contains("match cmd.as_str()"))
+            .expect("dispatch match not found");
+        let end = lines[start..]
+            .iter()
+            .position(|l| l.starts_with("        unknown =>"))
+            .map(|i| start + i)
+            .expect("dispatch fallthrough not found");
+
+        let help: std::collections::HashSet<&str> = HELP_CATEGORIES
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .flat_map(|e| e.aliases.iter().copied())
+            .collect();
+
+        let extract_literals = |s: &str| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    out.push((&mut chars).take_while(|&c| c != '"').collect());
+                }
+            }
+            out
+        };
+
+        let mut i = start + 1;
+        while i < end {
+            if lines[i].starts_with("        \"") {
+                // Accumulate the arm pattern across any continuation
+                // lines until we reach the `=>` that ends it.
+                let mut acc = lines[i].to_string();
+                while !acc.contains("=>") && i + 1 < end {
+                    i += 1;
+                    acc.push(' ');
+                    acc.push_str(lines[i]);
+                }
+                let head = acc.split("=>").next().unwrap_or("");
+                for alias in extract_literals(head) {
+                    // The bare `"" =>` arm handles an empty command line;
+                    // there is no `/` to list in help.
+                    if alias.is_empty() {
+                        continue;
+                    }
+                    assert!(
+                        help.contains(alias.as_str()),
+                        "dispatched command `/{alias}` has no HELP_CATEGORIES entry \
+                         (it would be invisible to /help and /?)"
+                    );
+                }
+            }
+            i += 1;
         }
     }
 }
