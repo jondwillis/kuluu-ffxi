@@ -77,7 +77,12 @@ pub struct SwingPulse {
 const PULSE_DECAY_SECS: f32 = 0.25;
 
 const PANEL_WIDTH_PX: f32 = 220.0;
-const HP_BAR_WIDTH_PX: f32 = 200.0;
+// Track width must leave room on the same row for the "NN%" + "d=…y"
+// readouts plus two 8px gaps inside the ~202px panel content box. At
+// 100px it matches the roster bars and never forces a flex-shrink that
+// would desync the fill (which is sized by *percentage* of the track,
+// see `spawn_target_panel` / `update_target_panel_system`).
+const HP_BAR_WIDTH_PX: f32 = 100.0;
 const HP_BAR_HEIGHT_PX: f32 = 6.0;
 
 pub fn spawn_target_panel(mut commands: Commands) {
@@ -139,21 +144,29 @@ pub fn spawn_target_panel(mut commands: Commands) {
                 ..default()
             })
             .with_children(|row| {
-                // HP track.
+                // HP track. `flex_shrink: 0.0` keeps it at exactly
+                // HP_BAR_WIDTH_PX even when the percent/distance text shares
+                // the row — without it flexbox squeezes the track and the
+                // percentage-sized fill no longer reads as the true HP%.
                 row.spawn((
                     Node {
                         width: Val::Px(HP_BAR_WIDTH_PX),
                         height: Val::Px(HP_BAR_HEIGHT_PX),
+                        flex_shrink: 0.0,
                         ..default()
                     },
                     BackgroundColor(palette::DARK),
                 ))
                 .with_children(|track| {
+                    // Fill width is a *percentage of the track*, set each
+                    // frame from `hp_pct`. Percent (not Px) makes the fill
+                    // correct regardless of the track's rendered width.
                     track.spawn((
                         TargetHpFill,
                         Node {
-                            width: Val::Px(0.0),
+                            width: Val::Percent(0.0),
                             height: Val::Px(HP_BAR_HEIGHT_PX),
+                            flex_shrink: 0.0,
                             ..default()
                         },
                         BackgroundColor(hp_color(100)),
@@ -317,9 +330,9 @@ pub fn update_target_panel_system(
 
     let pct = ent.hp_pct.unwrap_or(0);
     if let Ok((mut fill, mut bg)) = hp_fill_q.single_mut() {
-        let want_w = HP_BAR_WIDTH_PX * (pct as f32 / 100.0).clamp(0.0, 1.0);
-        if fill.width != Val::Px(want_w) {
-            fill.width = Val::Px(want_w);
+        let want_w = Val::Percent((pct as f32).clamp(0.0, 100.0));
+        if fill.width != want_w {
+            fill.width = want_w;
         }
         let want_color = hp_color(pct);
         if bg.0 != want_color {
