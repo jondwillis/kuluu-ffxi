@@ -57,6 +57,7 @@ mod common;
 mod login;
 mod server_edit;
 mod server_select;
+mod settings;
 
 use std::sync::{Arc, Mutex};
 
@@ -135,6 +136,12 @@ pub(crate) enum LauncherState {
     /// Add or edit a `ServerProfile`. Reached from `ServerSelect` via
     /// the `+ Add server` or `Edit selected` buttons.
     ServerEdit,
+    /// Global launcher settings — the DAT install path, navmesh dir, and
+    /// MAC override (each an `EnvOverride` in `LauncherStore::settings`).
+    /// Reached from the `Settings` button on `ServerSelect` / `Login`.
+    /// Saving rebuilds the shared `DatRoot` and reloads the backdrop zone
+    /// in place.
+    Settings,
     /// Change password form (old / new / confirm). Reached from Login via
     /// the `Change password` button.
     ChangePassword,
@@ -715,6 +722,8 @@ pub(crate) fn register(
         .insert_resource(ServerSelectCursor::default())
         .insert_resource(server_select::PendingServerDelete::default())
         .insert_resource(ServerEditForm::default())
+        .insert_resource(settings::SettingsForm::default())
+        .insert_resource(settings::SettingsUiDirty::default())
         .insert_resource(ChangePasswordForm::default())
         .insert_resource(DefaultCharName(defaults.char_name));
 
@@ -739,8 +748,19 @@ pub(crate) fn register(
 
     // First-frame decision: if no CLI overrides and no last_used pair,
     // jump from default Login → ServerSelect so the user manages
-    // profiles before being prompted for creds.
-    app.add_systems(OnEnter(LauncherState::Login), decide_initial_screen);
+    // profiles before being prompted for creds. MUST run before
+    // `login::spawn_login_ui` (registered below on the same OnEnter):
+    // the prefill branch mutates `LoginForm` / `ServerSelectForm`, and
+    // the UI builder reads those to seed the username field + saved-
+    // account chips + active server. Both touch the same resources, so
+    // Bevy serializes them — but in an unspecified order unless pinned.
+    // Without `.before`, `spawn_login_ui` could (and did) win, building
+    // the form from the still-empty `LoginForm` and stranding the user
+    // on a blank login with no last-used prefill.
+    app.add_systems(
+        OnEnter(LauncherState::Login),
+        decide_initial_screen.before(login::spawn_login_ui),
+    );
 
     // New screens.
     app.add_systems(
@@ -766,6 +786,23 @@ pub(crate) fn register(
             )
                 .run_if(in_state(LauncherState::ServerEdit)),
         );
+
+    // Settings screen: load the form from the persisted store on enter
+    // (before building the UI), tear it down on exit, and drive the
+    // Browse picker + in-place rebuild every frame it's active.
+    app.add_systems(
+        OnEnter(LauncherState::Settings),
+        (settings::load_settings_form, settings::spawn_ui).chain(),
+    )
+    .add_systems(OnExit(LauncherState::Settings), settings::despawn_ui)
+    .add_systems(
+        Update,
+        (
+            settings::keyboard_input_system,
+            settings::rebuild_settings_ui_system,
+        )
+            .run_if(in_state(LauncherState::Settings)),
+    );
 
     app.add_systems(
         OnEnter(LauncherState::ChangePassword),

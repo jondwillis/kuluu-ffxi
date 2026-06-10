@@ -10,7 +10,8 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui_widgets::Activate;
 
-use ffxi_client::launcher_store;
+use ffxi_client::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
+use ffxi_client::secret_store::SecretStore;
 
 use super::common::{hint, panel_node, row, screen_root, title};
 use super::{LauncherState, ServerSelectCursor, ServerSelectForm};
@@ -29,12 +30,30 @@ pub(super) struct PendingServerDelete(pub Option<String>);
 
 pub(super) fn spawn_ui(
     mut commands: Commands,
-    cursor: Res<ServerSelectCursor>,
+    mut cursor: ResMut<ServerSelectCursor>,
+    form: Res<ServerSelectForm>,
     pending: Option<Res<PendingServerDelete>>,
 ) {
     let store = launcher_store::load();
-    let cursor_idx = cursor.0;
     let servers = store.servers.clone();
+
+    // Prefer an explicit in-session pick (`ServerSelectForm.selected`, set
+    // when returning from Login), then the persisted `last_used` pair, so
+    // the highlight lands on the relevant server. Clamp to a valid row so a
+    // deleted/renamed server can't strand the cursor out of range.
+    let preferred = form
+        .selected
+        .clone()
+        .or_else(|| store.last_used.as_ref().map(|(s, _)| s.clone()));
+    if let Some(name) = preferred {
+        if let Some(idx) = servers.iter().position(|s| s.name == name) {
+            cursor.0 = idx;
+        }
+    }
+    if cursor.0 >= servers.len() {
+        cursor.0 = servers.len().saturating_sub(1);
+    }
+    let cursor_idx = cursor.0;
     let n = servers.len();
     let pending_name = pending.and_then(|p| p.0.clone());
     let has_last_used = store.last_used.is_some();
@@ -100,15 +119,40 @@ pub(super) fn spawn_ui(
                                     {
                                         super::apply_server_profile(&mut commands, profile);
                                     }
-                                    // Drop any stale form state from the
-                                    // prior server — the Login screen's
-                                    // saved-account chips are now the
-                                    // discovery path for the picked
-                                    // server's accounts.
-                                    login.user.clear();
-                                    login.pass.clear();
-                                    login.remember_password = false;
-                                    login.focus = super::LoginField::User;
+                                    // Pre-select this server's account: the
+                                    // sole saved account if there's one,
+                                    // else the most-recently-used. Pull its
+                                    // password from the keyring when it opted
+                                    // into remember; otherwise leave the form
+                                    // blank for fresh credentials.
+                                    if let Some(acct) =
+                                        store.preselect_account_for(&pick_name)
+                                    {
+                                        login.user = acct.username.clone();
+                                        login.remember_password = acct.remember_password;
+                                        login.pass = if acct.remember_password {
+                                            SecretStore::get(
+                                                KEYRING_SERVICE,
+                                                &keyring_account_key(
+                                                    &pick_name,
+                                                    &acct.username,
+                                                ),
+                                            )
+                                            .unwrap_or_default()
+                                        } else {
+                                            String::new()
+                                        };
+                                        login.focus = if login.pass.is_empty() {
+                                            super::LoginField::Password
+                                        } else {
+                                            super::LoginField::User
+                                        };
+                                    } else {
+                                        login.user.clear();
+                                        login.pass.clear();
+                                        login.remember_password = false;
+                                        login.focus = super::LoginField::User;
+                                    }
                                     next.set(LauncherState::Login);
                                 },
                             );
@@ -212,6 +256,17 @@ pub(super) fn spawn_ui(
                             *edit = super::ServerEditForm::default();
                             edit.editing_index = None;
                             next.set(LauncherState::ServerEdit);
+                        },
+                    );
+
+                    r.spawn(button(
+                        ButtonProps::default(),
+                        (),
+                        Spawn((Text::new("Settings"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(LauncherState::Settings);
                         },
                     );
 

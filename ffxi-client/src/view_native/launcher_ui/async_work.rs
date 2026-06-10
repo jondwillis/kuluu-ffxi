@@ -43,21 +43,27 @@ use ffxi_client::secret_store::SecretStore;
 /// password to the OS keyring iff `remember` is set (or removes any
 /// stale entry when `remember` was just toggled off). All errors are
 /// swallowed-to-warn — persistence failures must never block login.
+///
+/// The just-used account is moved to the front of `accounts` because
+/// `LauncherStore::preselect_account_for` treats list position as recency
+/// — first-matching = most-recently-used — to pick which account to
+/// pre-fill when the user returns to a server with several saved logins.
 fn save_on_success(server_name: &str, username: &str, password: &str, remember: bool) {
     let mut store = launcher_store::load();
-    if let Some(row) = store
+    // Drop any existing row for this (server, user) so we can re-insert it
+    // at the front with the latest `remember` flag — a single move keeps
+    // the recency ordering honest whether the account is new or returning.
+    store
         .accounts
-        .iter_mut()
-        .find(|a| a.server_name == server_name && a.username == username)
-    {
-        row.remember_password = remember;
-    } else {
-        store.accounts.push(SavedAccount {
+        .retain(|a| !(a.server_name == server_name && a.username == username));
+    store.accounts.insert(
+        0,
+        SavedAccount {
             server_name: server_name.to_string(),
             username: username.to_string(),
             remember_password: remember,
-        });
-    }
+        },
+    );
     store.last_used = Some((server_name.to_string(), username.to_string()));
     if let Err(e) = launcher_store::save(&store) {
         tracing::warn!(error = %e, "launcher_store: save failed");

@@ -173,6 +173,17 @@ fn build_login_ui(
                             next.set(LauncherState::ChangePassword);
                         },
                     );
+
+                    r.spawn(button(
+                        ButtonProps::default(),
+                        (),
+                        Spawn((Text::new("Settings"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(LauncherState::Settings);
+                        },
+                    );
                 });
             });
         });
