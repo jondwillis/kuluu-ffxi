@@ -114,12 +114,17 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if (opacity > 0.001 && altitude > 0.02) {
         let coverage = data.cloud_params.x;
         let scroll = data.cloud_params.zw;
-        // Planar projection onto a virtual sheet overhead. Near the
-        // horizon ray.y → 0 stretches the sheet to infinity; clamp the
-        // denominator so the band stays finite and the clouds compress
-        // toward the horizon the way a real overcast does.
-        let proj = ray.xz / max(ray.y, 0.12);
-        let density = fbm(proj * 1.2 + scroll);
+        // Stereographic projection of the ray onto a horizontal disc
+        // (projection point at the nadir). The naive ray.xz/ray.y planar
+        // map diverges as ray.y → 0, smearing the noise into radial
+        // streaks along the horizon and forcing a clamp whose frozen
+        // region shows up as vertical banding. Stereographic projection
+        // is *conformal* — it preserves local angles, so a round cloud
+        // puff stays round from zenith to skyline instead of stretching —
+        // and bounded (|proj| ≤ 1 for any visible altitude), so there's
+        // no singularity and no clamp discontinuity to band.
+        let proj = ray.xz / (1.0 + ray.y);
+        let density = fbm(proj * 3.5 + scroll);
         // Threshold the noise into cloud shapes: higher coverage lowers
         // the cut so more sky fills in.
         let cut = 1.0 - coverage;

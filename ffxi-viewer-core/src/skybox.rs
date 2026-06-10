@@ -275,8 +275,14 @@ fn update_skybox(
     let enhanced = settings.sky_style == crate::graphics_settings::SkyStyle::Enhanced;
     let t = time.elapsed_secs();
     mat.data.cloud_params = if enhanced {
-        // Slow drift: ~0.004 uv/sec along a slightly diagonal heading.
-        Vec4::new(0.55, 0.85, t * 0.004, t * 0.0016)
+        // Drift the cloud field across the sky for visible motion the way
+        // retail's scrolling cloud layer does. The noise domain spans
+        // ~3.5 units (see `proj * 3.5` in skybox.wgsl), so ~0.010 unit/sec
+        // primary (with a slight diagonal heading) crosses the visible
+        // field in a few real minutes while the fine FBM octaves shimmer
+        // within seconds. The previous 0.004 was ~4 min per cloud-width —
+        // too slow to perceive.
+        Vec4::new(0.55, 0.85, t * 0.010, t * 0.004)
     } else {
         Vec4::new(0.55, 0.0, 0.0, 0.0)
     };
