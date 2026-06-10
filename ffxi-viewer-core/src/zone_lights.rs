@@ -46,7 +46,7 @@
 //! generator (`0x47`) path once we parse particle effects; that is the
 //! correct future home for "real" dynamic lights in *both* styles.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use bevy::mesh::VertexAttributeValues;
 use bevy::prelude::*;
@@ -94,9 +94,9 @@ impl Default for ZoneLightConfig {
             overbright_threshold: 1.15,
             warm_only: true,
             max_per_mesh: 3,
-            max_total: 96,
+            max_total: 48,
             point_intensity: 25_000.0,
-            point_range: 10.0,
+            point_range: 8.0,
             // Small + dim: the flame is a subtle glow, not a bloom orb.
             flame_radius: 0.06,
             flicker: true,
@@ -126,35 +126,55 @@ fn init_flame_assets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     commands.insert_resource(FlameAssets { mesh });
 }
 
-/// Scan freshly spawned MMB submeshes for over-bright vertex clusters
-/// and spawn an emitter child at each. Runs only on the frame a mesh is
-/// added, so the per-frame cost is bounded by how many props spawn that
-/// frame.
+/// MMB submeshes awaiting an over-bright scan. A zone load spawns
+/// thousands of submeshes in a tight burst; scanning + clustering +
+/// material/light spawning all of them on the frames they're `Added`
+/// stalls the load. We instead enqueue here and drain a small budget
+/// per frame ([`SCAN_BUDGET_PER_FRAME`]), amortising the cost across the
+/// frames *after* the burst so the load stays responsive.
+#[derive(Resource, Default)]
+struct PendingLightScan(VecDeque<Entity>);
+
+/// How many queued submeshes [`drain_light_scan`] processes per frame.
+/// A vertex scan is microseconds and most meshes have no clusters, so
+/// the common case is cheap; the costly part — spawning an emitter (a
+/// new `StandardMaterial` + `PointLight`) — is separately bounded by
+/// `max_total`. This budget caps the per-frame *scan* work so a load
+/// burst of thousands of submeshes can't stall a single frame, while
+/// still draining the queue within ~1–2 s of entering a zone.
+const SCAN_BUDGET_PER_FRAME: usize = 24;
+
+/// Cheap, runs every frame: just record freshly spawned MMB submeshes so
+/// the budgeted drain can scan them later. `Added` fires once per entity,
+/// so we must capture them here even if we won't process them this frame.
+fn enqueue_light_scan(
+    mut pending: ResMut<PendingLightScan>,
+    q_new: Query<Entity, Added<MmbOverlay>>,
+) {
+    for e in &q_new {
+        pending.0.push_back(e);
+    }
+}
+
+/// Drain up to [`SCAN_BUDGET_PER_FRAME`] queued submeshes: scan each for
+/// over-bright vertex clusters and spawn an emitter child per cluster.
 #[allow(clippy::too_many_arguments)]
-fn detect_zone_light_emitters(
+fn drain_light_scan(
     mut commands: Commands,
     cfg: Res<ZoneLightConfig>,
     settings: Res<GraphicsSettings>,
     meshes: Res<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     flame: Option<Res<FlameAssets>>,
-    q_new: Query<
-        (
-            Entity,
-            &Mesh3d,
-            Option<&crate::hud::mesh_debug::MmbDebugInfo>,
-        ),
-        Added<MmbOverlay>,
-    >,
+    mut pending: ResMut<PendingLightScan>,
+    q_mesh: Query<(&Mesh3d, Option<&crate::hud::mesh_debug::MmbDebugInfo>)>,
     q_existing: Query<(), With<ZoneLightEmitter>>,
 ) {
-    if !cfg.enabled {
-        return;
-    }
     // Synthesised vertex-cluster lights are an Enhanced-only embellishment
-    // with no retail basis (see module docs) — skip detection entirely in
-    // Retail so the over-bright surfaces carry the look on their own.
-    if settings.sky_style != SkyStyle::Enhanced {
+    // with no retail basis (see module docs). When disabled or in Retail,
+    // drop any queued work so it can't accumulate or fire on a later switch.
+    if !cfg.enabled || settings.sky_style != SkyStyle::Enhanced {
+        pending.0.clear();
         return;
     }
     let Some(flame) = flame else {
@@ -165,13 +185,24 @@ fn detect_zone_light_emitters(
     // emitter children), with no manual bookkeeping.
     let mut live = q_existing.iter().count() as u32;
     if live >= cfg.max_total {
+        pending.0.clear();
         return;
     }
 
-    for (entity, mesh3d, debug) in &q_new {
+    let mut processed = 0usize;
+    while processed < SCAN_BUDGET_PER_FRAME {
         if live >= cfg.max_total {
+            pending.0.clear();
             break;
         }
+        let Some(entity) = pending.0.pop_front() else {
+            break;
+        };
+        processed += 1;
+        // Entity may have despawned (zone change) before we got to it.
+        let Ok((mesh3d, debug)) = q_mesh.get(entity) else {
+            continue;
+        };
         let Some(mesh) = meshes.get(&mesh3d.0) else {
             continue;
         };
@@ -360,8 +391,12 @@ pub struct ZoneLightsPlugin;
 impl Plugin for ZoneLightsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ZoneLightConfig>()
+            .init_resource::<PendingLightScan>()
             .add_systems(Startup, init_flame_assets)
-            .add_systems(Update, (detect_zone_light_emitters, animate_zone_lights));
+            .add_systems(
+                Update,
+                (enqueue_light_scan, drain_light_scan, animate_zone_lights).chain(),
+            );
     }
 }
 
