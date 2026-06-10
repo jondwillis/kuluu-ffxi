@@ -48,6 +48,7 @@ use ffxi_viewer_core::{
     add_hud_spawners,
     atmosphere::LastAtmosphereZone,
     audio::BgmSlots,
+    configure_gizmo_render_layer,
     dat_mzb::{LastAutoLoadedZone, MzbCollisionGeometry},
     hud::zone_flash::ZoneNameResolver,
     scene::TrackedEntities,
@@ -190,6 +191,14 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             .build()
             .disable::<LogPlugin>(),
     );
+
+    // Move all gizmo overlays (camera-collision debug, navmesh, target
+    // ring, aggro lines) off the default render layer so the minimap's
+    // top-down bake camera — pinned to layer 0 — stops capturing them
+    // into the static minimap texture. The live OperatorCamera opts back
+    // into the gizmo layer in `build_operator_camera`. Startup so it runs
+    // once after GizmoPlugin (DefaultPlugins) has inserted the store.
+    app.add_systems(Startup, configure_gizmo_render_layer);
 
     // Frame-rate limiter for `/fps <max>`. Default `Limiter::Auto` matches
     // the monitor refresh; `/fps N` swaps in `Limiter::from_framerate(N)`,

@@ -270,6 +270,12 @@ pub fn spawn_bake_camera(
         .spawn((
             InGameEntity,
             MinimapBakeCamera,
+            // Geometry only: layer 0 sees the world (props/terrain/lights
+            // all default to layer 0) but NOT the gizmo overlays, which
+            // live on `WORLD_GIZMO_LAYER`. Without this the bake captured
+            // the blue camera-collision wireframes (and any other overlay
+            // active at zone-enter) into the static minimap texture.
+            bevy::camera::visibility::RenderLayers::layer(0),
             Camera3d::default(),
             Camera {
                 // Negative order renders before the main view. The

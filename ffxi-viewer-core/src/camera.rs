@@ -87,6 +87,40 @@ pub fn nameplate_anchor_y(baked: Option<&BakedActor>) -> f32 {
 #[derive(Component)]
 pub struct OperatorCamera;
 
+/// Render layer that all world-overlay gizmos (camera-collision debug,
+/// navmesh overlay, target ring/arrow, aggro lines) are drawn on.
+///
+/// Gizmos default to render layer 0 — the same layer as the world
+/// geometry — which means *every* camera renders them, including the
+/// minimap's top-down "bake" camera in [`crate::minimap::topdown`].
+/// That baked the blue collision wireframes (and any other overlay live
+/// at zone-enter) straight into the static minimap texture.
+///
+/// The fix is a layer split: the default gizmo group is moved onto this
+/// layer (front-ends call [`configure_gizmo_render_layer`] once at
+/// startup), the live [`OperatorCamera`] opts back into it via
+/// [`build_operator_camera`], and the bake camera is pinned to layer 0
+/// only — so gizmos show in the live 3D view but never in the minimap.
+///
+/// Layers 0 (world / launcher backdrop) and 1 (launcher character
+/// preview) are already taken, so this is 2.
+pub const WORLD_GIZMO_LAYER: usize = 2;
+
+/// Point the default gizmo config group at [`WORLD_GIZMO_LAYER`] so
+/// gizmos render only to cameras that explicitly opt into that layer
+/// (the live [`OperatorCamera`]) and never to the minimap bake camera.
+///
+/// Front-ends run this once at startup — it needs Bevy's `GizmoPlugin`
+/// (part of `DefaultPlugins`) to have inserted `GizmoConfigStore`, which
+/// a library crate can't assume in unit tests, so the wiring lives at
+/// the app-assembly layer rather than in a viewer-core plugin.
+pub fn configure_gizmo_render_layer(
+    mut store: ResMut<bevy::gizmos::config::GizmoConfigStore>,
+) {
+    let (config, _) = store.config_mut::<bevy::gizmos::config::DefaultGizmoConfigGroup>();
+    config.render_layers = bevy::camera::visibility::RenderLayers::layer(WORLD_GIZMO_LAYER);
+}
+
 /// Active camera projection. `Chase` is the FFXI-default third-person
 /// orbit, `FirstPerson` snaps the camera to the player's eyes and lets the
 /// look direction track [`ChaseCamera::yaw`]/`pitch` 1:1 (so mouse-look in
@@ -323,6 +357,12 @@ pub fn build_operator_camera(
     let mut camera = commands.spawn((
         crate::components::InGameEntity,
         OperatorCamera,
+        // See world layer 0 *and* the gizmo overlay layer. World
+        // geometry/lights default to layer 0; gizmos are moved to
+        // WORLD_GIZMO_LAYER (see `configure_gizmo_render_layer`) so the
+        // minimap bake camera — which stays on layer 0 only — never
+        // captures them. The live view opts back into both here.
+        bevy::camera::visibility::RenderLayers::from_layers(&[0, WORLD_GIZMO_LAYER]),
         Camera3d::default(),
         // HDR is a marker component in Bevy 0.17 (was `camera.hdr`
         // in older versions). Required for bloom and for TonyMcMapface
@@ -642,6 +682,42 @@ mod tests {
         assert!(
             (look - expected).length() < 1e-6,
             "look {look:?} != expected {expected:?}"
+        );
+    }
+
+    /// The operator camera must render BOTH the world layer (0) and the
+    /// gizmo overlay layer ([`WORLD_GIZMO_LAYER`]): dropping layer 0 hides
+    /// the world, dropping the gizmo layer hides the camera-collision /
+    /// navmesh / target overlays from the live view. The minimap bake
+    /// camera deliberately omits the gizmo layer — this test pins the
+    /// live-view side of that split.
+    #[test]
+    fn operator_camera_renders_world_and_gizmo_layers() {
+        use bevy::camera::visibility::RenderLayers;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(GraphicsSettings::default());
+        app.add_systems(
+            Startup,
+            |mut commands: Commands, settings: Res<GraphicsSettings>| {
+                build_operator_camera(&mut commands, &settings, None);
+            },
+        );
+        app.update();
+
+        let mut q = app
+            .world_mut()
+            .query_filtered::<&RenderLayers, With<OperatorCamera>>();
+        let layers = q.single(app.world()).expect("operator camera spawned");
+        assert!(
+            layers.intersects(&RenderLayers::layer(0)),
+            "operator camera must still see world layer 0"
+        );
+        assert!(
+            layers.intersects(&RenderLayers::layer(WORLD_GIZMO_LAYER)),
+            "operator camera must see the gizmo overlay layer so debug \
+             overlays still show in the live 3D view"
         );
     }
 }

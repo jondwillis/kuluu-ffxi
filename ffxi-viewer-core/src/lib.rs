@@ -72,10 +72,11 @@ pub mod zone_lights;
 pub mod zone_lines;
 
 pub use camera::{
-    camera_transition_system, chase_camera_system, first_person_eye_y, firstperson_camera_system,
-    heading_for_yaw, nameplate_anchor_y, self_visibility_for_camera_mode_system, spawn_camera,
-    third_person_anchor_y, toggle_camera_mode, yaw_for_heading, CameraMode, CameraTransition,
-    ChaseCamera, OperatorCamera,
+    camera_transition_system, chase_camera_system, configure_gizmo_render_layer,
+    first_person_eye_y, firstperson_camera_system, heading_for_yaw, nameplate_anchor_y,
+    self_visibility_for_camera_mode_system, spawn_camera, third_person_anchor_y,
+    toggle_camera_mode, yaw_for_heading, CameraMode, CameraTransition, ChaseCamera, OperatorCamera,
+    WORLD_GIZMO_LAYER,
 };
 pub use components::{
     EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
@@ -457,7 +458,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                 graphics_settings::apply_projection_system,
                 graphics_settings::apply_vsync_system,
                 graphics_settings::apply_anti_aliasing_system,
-                graphics_settings::apply_sky_style_system,
+                graphics_settings::apply_sky_realism_system,
             )
                 .chain()
                 .run_if(resource_changed::<GraphicsSettings>),
