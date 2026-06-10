@@ -267,7 +267,7 @@ fn resolve_install_root() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("FFXI_DAT_PATH") {
         return Some(PathBuf::from(root));
     }
-    let fallback = PathBuf::from("vendor/Game/SquareEnix/FINAL FANTASY XI");
+    let fallback = PathBuf::from(ffxi_dat::archive::DEFAULT_INSTALL_DIR);
     if fallback.join("sound/win").is_dir() {
         return Some(fallback);
     }
@@ -535,7 +535,7 @@ pub fn apply_bgm_system(
         if !*warned {
             warn!(
                 "audio: BGM disabled — neither FFXI_DAT_PATH is set \
-                 nor does ./vendor/Game/SquareEnix/FINAL FANTASY XI/sound/win exist. \
+                 nor does ./vendor/game-files/SquareEnix/FINAL FANTASY XI/sound/win exist. \
                  Set FFXI_DAT_PATH to the install root to enable BGM."
             );
             *warned = true;

@@ -19,9 +19,9 @@
 //!
 //! ## Why procedural sprites, not PNG assets
 //!
-//! `vendor/Game/SquareEnix/PlayOnlineViewer/.../cursor.png` is encrypted
+//! `vendor/game-files/SquareEnix/PlayOnlineViewer/.../cursor.png` is encrypted
 //! (POLViewer XOR asset format, header `d6 7c b4 cc`). The HXUI addon
-//! cursors (`vendor/Game/_addons/HXUI/assets/cursors/`) are real PNGs but
+//! cursors (`vendor/game-files/_addons/HXUI/assets/cursors/`) are real PNGs but
 //! are third-party addon assets. Authoring small in-tree bitmaps as
 //! `&[&str]` ASCII art keeps the cursor under our control, makes diffs
 //! reviewable, and avoids any vendor/license question. Each character

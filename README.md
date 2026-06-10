@@ -34,12 +34,49 @@ the build** — only cited in source comments for reference (`Phoenix`,
 populates one if you want to read the upstream sources.
 
 To actually *run* the client you also need a user-provided retail install
-mounted at `vendor/Game` (19G, never committed — see [Run](#run) below).
+(~19G, never committed — see [Getting the game files](#getting-the-game-files)).
 
 > **Shallow-clone caveat:** `--depth 1` works only while the pinned submodule
 > commit is still reachable from its tracked branch tip. If an upstream
 > force-push moves it out of reach, re-run without `--depth` (or with a larger
 > `--depth N`) for that submodule.
+
+## Getting the game files
+
+The FFXI client DATs (geometry, textures, audio, animations) are Square Enix
+copyrighted and must come from a **legitimate install** — Kuluu never ships or
+commits them. The client reads them from `vendor/game-files/` by default
+(gitignored), or wherever `FFXI_DAT_PATH` points.
+
+Get an install one of these ways:
+
+- **HorizonXI launcher (Windows):** install via <https://horizonxi.com>; its
+  launcher downloads a full FFXI + Ashita tree.
+- **Lutris (Linux):** <https://lutris.net/games/horizonxi/>. Files land under
+  `~/Games/.../drive_c/.../SquareEnix/FINAL FANTASY XI/`.
+- **Copy an existing install:** the PlayOnline tree from any retail/private-server
+  install (`.../PlayOnline/SquareEnix/FINAL FANTASY XI/`).
+
+Kuluu expects this layout (the parent of `SquareEnix/`):
+
+```
+vendor/game-files/
+  SquareEnix/
+    FINAL FANTASY XI/      <- FFXI_DAT_PATH points here
+      VTABLE.DAT  FTABLE.DAT
+      ROM/  ROM2/ … ROM9/
+      sound/win/…
+```
+
+Either drop (or symlink) your install at `vendor/game-files/`, or point the
+client at an existing copy:
+
+```bash
+export FFXI_DAT_PATH="/path/to/.../SquareEnix/FINAL FANTASY XI"
+```
+
+`FFXI_DAT_PATH` also overrides at runtime and can be set from the launcher's
+settings UI, so you never have to move a large install to use it.
 
 ## Project goals & non-goals
 
@@ -53,7 +90,7 @@ mounted at `vendor/Game` (19G, never committed — see [Run](#run) below).
   swap, …) ship as opt-in flavors/builds/packs that compose with vanilla,
   never replace it.
 - **No asset redistribution.** Kuluu requires a user-provided retail install
-  (e.g. mounted at `vendor/Game`). Translated tables vendored from LSB,
+  (e.g. mounted at `vendor/game-files`). Translated tables vendored from LSB,
   POLUtils, AltanaListener, etc. are stored as derived constants under the
   upstream license — never as game content.
 - **Not for retail.** The retail FFXI service enforces anti-cheat and Terms

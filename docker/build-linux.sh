@@ -18,7 +18,7 @@
 #    faster — a full build is ~10-15 min, incremental rebuilds far less.
 #  * The host Docker runtime here is colima, whose host bind-mounts are
 #    unreliable, so we never bind-mount the repo. Instead the build-relevant
-#    source subset (everything EXCEPT the 19 GB vendor/Game, target/, .git,
+#    source subset (everything EXCEPT the 19 GB vendor/game-files, target/, .git,
 #    and cite-only vendor dirs no build.rs reads) is streamed via tar into a
 #    Docker NAMED VOLUME that lives inside the VM. The crate cache and a
 #    Linux-only target dir are likewise named volumes, so the host's macOS
@@ -41,11 +41,11 @@ if [ "${#CARGO_ARGS[@]}" -eq 0 ]; then
     CARGO_ARGS=(build --release --locked -p ffxi-client --features native-window)
 fi
 
-echo ">> [1/5] staging build source into $STAGE (excluding vendor/Game, target, .git)..."
+echo ">> [1/5] staging build source into $STAGE (excluding vendor/game-files, target, .git)..."
 mkdir -p "$STAGE"
 rsync -a --delete \
     --exclude='/target/' --exclude='/dist/' --exclude='/.git/' \
-    --exclude='/vendor/Game/' --exclude='/vendor/Phoenix/' \
+    --exclude='/vendor/game-files/' --exclude='/vendor/Phoenix/' \
     --exclude='/vendor/xi-tinkerer/' --exclude='/vendor/RZN-mapviewer/' \
     --exclude='/vendor/AltanaViewer/' \
     --exclude='/.omc/' --exclude='/.omo/' --exclude='/.claude/' \

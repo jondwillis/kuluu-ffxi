@@ -4,7 +4,7 @@
 //!
 //! The `_or_default` variant means the workspace `cargo run` path
 //! works without anyone setting `FFXI_DAT_PATH` — it falls back to
-//! `vendor/Game/SquareEnix/FINAL FANTASY XI`. Installed-binary users
+//! `vendor/game-files/SquareEnix/FINAL FANTASY XI`. Installed-binary users
 //! still need to set the env var explicitly (the fallback resolves
 //! relative to CWD, not relative to the executable).
 //!

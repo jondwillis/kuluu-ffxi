@@ -7,7 +7,7 @@
 # already ships (ALSA, Mesa/Vulkan, X11, Wayland, libxkbcommon, dbus).
 #
 # The image carries only the toolchain. The workspace is bind-mounted at
-# `docker run` time (see docker/build-linux.sh) so the 19 GB `vendor/Game`
+# `docker run` time (see docker/build-linux.sh) so the 19 GB `vendor/game-files`
 # install never enters the build context and `target/` stays a Linux-only
 # dir separate from the host's macOS artifacts.
 FROM debian:bookworm-slim

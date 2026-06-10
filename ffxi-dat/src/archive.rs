@@ -31,6 +31,12 @@ use crate::{DatError, Result};
 /// today; the slack covers a hypothetical future expansion.
 const MAX_ROM_INDEX: u8 = 19;
 
+/// Workspace-relative default DAT root (the "FINAL FANTASY XI" folder),
+/// used by [`DatRoot::from_env_or_default`] when `FFXI_DAT_PATH` is unset.
+/// Lives in one place so other crates (e.g. `ffxi-audio` consumers) point
+/// at the same install path without re-typing the literal.
+pub const DEFAULT_INSTALL_DIR: &str = "vendor/game-files/SquareEnix/FINAL FANTASY XI";
+
 /// Decoded location of a DAT within the install. Preserves the structured
 /// rom/dir/file triple so callers can log, dedupe, or compose paths
 /// without re-running the table lookup.
@@ -109,12 +115,11 @@ impl DatRoot {
         Self::open(PathBuf::from(root))
     }
 
-    /// Tries `FFXI_DAT_PATH` first; if unset, falls back to the
-    /// workspace-relative vendor path that the dev environment uses
-    /// (`./vendor/Game/SquareEnix/FINAL FANTASY XI`). The fallback
-    /// resolves relative to the process CWD, so it works for
-    /// `cargo run` from the workspace root but not for installed
-    /// binaries run from elsewhere — those must set the env var.
+    /// Tries `FFXI_DAT_PATH` first; if unset, falls back to
+    /// [`DEFAULT_INSTALL_DIR`]. The fallback resolves relative to the
+    /// process CWD, so it works for `cargo run` from the workspace root
+    /// but not for installed binaries run from elsewhere — those must set
+    /// the env var.
     ///
     /// Returns `DatError::EnvMissing` only when both attempts fail
     /// (env unset *and* fallback path doesn't exist), giving callers
@@ -123,7 +128,7 @@ impl DatRoot {
         if let Some(root) = env::var_os("FFXI_DAT_PATH") {
             return Self::open(PathBuf::from(root));
         }
-        let fallback = PathBuf::from("vendor/Game/SquareEnix/FINAL FANTASY XI");
+        let fallback = PathBuf::from(DEFAULT_INSTALL_DIR);
         if !fallback.join("VTABLE.DAT").exists() {
             return Err(DatError::EnvMissing);
         }

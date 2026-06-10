@@ -351,7 +351,7 @@ fn main() -> ExitCode {
         Ok(r) => r,
         Err(e) => {
             eprintln!("DatRoot::from_env_or_default: {e}");
-            eprintln!("(set FFXI_DAT_PATH or place install at vendor/Game/SquareEnix/...)");
+            eprintln!("(set FFXI_DAT_PATH or place install at vendor/game-files/SquareEnix/...)");
             return ExitCode::from(2);
         }
     };

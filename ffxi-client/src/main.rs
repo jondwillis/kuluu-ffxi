@@ -96,7 +96,7 @@ struct Args {
 
     /// Hard-fail at startup if no FFXI client DAT install is reachable
     /// (env var `FFXI_DAT_PATH` unset *and* the workspace-relative
-    /// fallback `./vendor/Game/SquareEnix/FINAL FANTASY XI` doesn't
+    /// fallback `./vendor/game-files/SquareEnix/FINAL FANTASY XI` doesn't
     /// exist). Default behavior is soft-degrade: log a warning, run
     /// without static-NPC name resolution. Agents that depend on
     /// non-`?` NPC names (the farming / scout playbooks) should set
@@ -295,7 +295,8 @@ fn resolve_dat_root(require_dat: bool) -> Result<Option<std::sync::Arc<ffxi_dat:
             tracing::warn!(
                 error = %err,
                 "no FFXI DAT install reachable; static NPC names will render as '?'. \
-                 Set FFXI_DAT_PATH or pass --require-dat to fail fast."
+                 Put an install at vendor/game-files/ or set FFXI_DAT_PATH (see README \
+                 'Getting the game files'); pass --require-dat to fail fast."
             );
             Ok(None)
         }

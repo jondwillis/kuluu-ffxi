@@ -33,8 +33,9 @@ ffxi-agent/dist/
 
 # FFXI client DATs — SE-copyrighted, NEVER commit. Local copy of the user's
 # HorizonXI install lives here (see ffxi-dat/README or the async-watching-waffle
-# plan for layout). Point FFXI_DAT_PATH at vendor/Game/FINAL FANTASY XI/ to use.
-vendor/Game/
+# plan for layout). See README "Getting the game files"; FFXI_DAT_PATH points at
+# vendor/game-files/SquareEnix/FINAL FANTASY XI/.
+vendor/game-files/
 
 # xi-tinkerer — vendored as AGPL-3 reference only (read-only, never linked).
 # See vendor/xi-tinkerer/CLAIM.md and memory note `xi_tinkerer_agpl_reference`.
