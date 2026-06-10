@@ -37,13 +37,10 @@ CXXFLAGS = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -isyst
 [unstable]
 codegen-backend = true
 
-# sccache caches compiled rlibs keyed by inputs. Cargo only marks *workspace*
-# crates as incremental, so sccache transparently caches the heavy registry
-# deps (bevy / wgpu / naga) and reuses them across the .claude/worktrees/*
-# trees and clean rebuilds, while the interactive edit loop keeps incremental
-# + Cranelift on workspace crates. Install with `brew install sccache`.
-[build]
-rustc-wrapper = "sccache"
+# NOTE: sccache was tried here and removed — measured 0.32% hit rate in this
+# tree (it only helps clean/cross-machine rebuilds, not the incremental edit
+# loop) while adding per-rustc wrapper overhead. Re-add `[build] rustc-wrapper
+# = "sccache"` only if you start doing frequent from-scratch builds.
 
 # Link the large client binary with LLVM lld instead of Apple ld. Modest here
 # (Apple ld-1267 is already the fast "ld-prime") but still typically quicker on
