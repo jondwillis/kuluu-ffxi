@@ -1,37 +1,50 @@
-//! Dynamic local lights from baked over-bright vertices — lanterns,
-//! braziers, torches, campfires.
+//! Dynamic local lights from baked over-bright vertices — an
+//! **Enhanced-only** embellishment, *not* a retail-faithful feature.
 //!
-//! # Why this exists
+//! # Why this is Enhanced-only
 //!
-//! Retail FFXI's 2002 engine placed almost no real-time point lights;
-//! the warm pool a lantern throws on a wall is **baked into the MMB
-//! vertex colours**, and the flame itself is an animated additive
-//! sprite. Crucially, FFXI authored those lamp/flame texels with the
-//! "0x80 = 1.0" convention pushed past 1.0 — i.e. the glowing parts of
-//! a lamp model carry **over-bright vertex colours** (channels > 1.0).
-//! We already decode that overbright (see `dat_mmb.rs`), but until now
-//! it only fed bloom — nothing actually lit the surroundings, so the
-//! world looked flat next to a lantern.
+//! First-principles research into the retail engine (cross-referenced
+//! against the lotus-ffxi reimplementation) is unambiguous:
 //!
-//! # What we do
+//!   * **The MZB zone-layout format carries no light records.** Its
+//!     block structs are pure placement/collision/culling (object
+//!     shortname + transform, collision mesh, quadtree); there is no
+//!     position+colour+radius light array anywhere
+//!     (`vendor/lotus-ffxi/.../mzb.cppm:23-31,211-245`). A lamp "glows
+//!     at night" only because its vertices are authored over-bright
+//!     ("0x80 = 1.0" pushed past 1.0) while everything around it darkens
+//!     under the global TOD/weather uniforms. No light lights the wall.
+//!   * **The only discrete real-time lights come from the particle /
+//!     effect generator path** — DAT chunk type `0x47` "pointLightProg"
+//!     (`vendor/lotus-ffxi/.../dat.cpp:641`), built in
+//!     `generator_light.cpp:94-97` and gated behind a *hardcoded test
+//!     position*. These attach to animated fire EFFECTS (campfires,
+//!     braziers), never to static geometry.
 //!
-//! When an MMB submesh spawns ([`MmbOverlay`]), we scan its
-//! `ATTRIBUTE_COLOR` for over-bright (and, by default, warm) vertices,
-//! cluster them in local space, and spawn an emitter **child** at each
-//! cluster. Being a child, the emitter inherits the prop's world
-//! transform for free and despawns with it — no coordinate maths, no
-//! extra lifecycle drain.
+//! So synthesising point lights by scanning static-mesh vertex colours
+//! is a modern look with no retail analogue — and it misfires: the
+//! over-bright signal also lives on handrails, signboards, and interior
+//! walls (observed clusters on `tshimonowi_hand13/17`, `..._h_in00`),
+//! none of which retail ever lit. We therefore keep it **only in the
+//! Enhanced sky style**; Retail renders the over-bright emissive
+//! surfaces with no synthesised lights, matching the original.
 //!
-//! Each emitter carries:
-//!   * a [`PointLight`] — active only in **Enhanced** sky style (the
-//!     modern dynamic look),
-//!   * a small additive emissive sphere — the **flame sprite**, shown
-//!     in both styles (the faithful retail element),
-//! and a flicker that wobbles both each frame.
+//! # What we do (Enhanced only)
+//!
+//! When an MMB submesh spawns ([`MmbOverlay`]) *and* the active sky
+//! style is Enhanced, we scan its `ATTRIBUTE_COLOR` for over-bright
+//! (and, by default, warm) vertices, cluster them in local space, and
+//! spawn an emitter **child** at each cluster — a [`PointLight`] plus a
+//! small additive flame sprite, both flickering. Being a child, the
+//! emitter inherits the prop's world transform and despawns with it.
 //!
 //! Detection is a heuristic with no ground-truth DAT placement data, so
 //! everything is tunable at runtime through [`ZoneLightConfig`] (see the
 //! `/lights` slash command) — threshold, intensity, range, caps.
+//!
+//! Faithful campfire/torch lights would instead come from the effect
+//! generator (`0x47`) path once we parse particle effects; that is the
+//! correct future home for "real" dynamic lights in *both* styles.
 
 use std::collections::HashMap;
 
@@ -121,6 +134,7 @@ fn init_flame_assets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 fn detect_zone_light_emitters(
     mut commands: Commands,
     cfg: Res<ZoneLightConfig>,
+    settings: Res<GraphicsSettings>,
     meshes: Res<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     flame: Option<Res<FlameAssets>>,
@@ -135,6 +149,12 @@ fn detect_zone_light_emitters(
     q_existing: Query<(), With<ZoneLightEmitter>>,
 ) {
     if !cfg.enabled {
+        return;
+    }
+    // Synthesised vertex-cluster lights are an Enhanced-only embellishment
+    // with no retail basis (see module docs) — skip detection entirely in
+    // Retail so the over-bright surfaces carry the look on their own.
+    if settings.sky_style != SkyStyle::Enhanced {
         return;
     }
     let Some(flame) = flame else {
@@ -294,18 +314,29 @@ fn cluster_overbright(
     out
 }
 
-/// Per-frame: flicker each emitter and gate the [`PointLight`] on the
-/// active sky style. The additive flame sprite stays lit in both styles
-/// (faithful), but only Enhanced gets a real dynamic [`PointLight`].
+/// Per-frame: flicker each emitter and gate it on the active sky style.
+/// These synthesised lights are Enhanced-only (see module docs), so in
+/// Retail any emitters left over from a mid-zone style switch hide
+/// entirely (the over-bright surface carries the look on its own).
 fn animate_zone_lights(
     time: Res<Time>,
     cfg: Res<ZoneLightConfig>,
     settings: Res<GraphicsSettings>,
-    mut q: Query<(&ZoneLightEmitter, &mut PointLight, &mut Transform)>,
+    mut q: Query<(
+        &ZoneLightEmitter,
+        &mut PointLight,
+        &mut Transform,
+        &mut Visibility,
+    )>,
 ) {
     let enhanced = settings.sky_style == SkyStyle::Enhanced;
     let t = time.elapsed_secs();
-    for (emitter, mut light, mut xf) in &mut q {
+    for (emitter, mut light, mut xf, mut vis) in &mut q {
+        *vis = if enhanced {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
         // Organic flicker: two detuned sines so it reads as a flame, not
         // a sine pulse. Range ~[0.78, 1.0].
         let flick = if cfg.flicker {
