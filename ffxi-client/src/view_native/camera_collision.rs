@@ -39,7 +39,7 @@ use ffxi_viewer_core::dat_mzb::{DrawDistance, ZoneGeomMode};
 use ffxi_viewer_core::scene::BakedActor;
 use ffxi_viewer_core::{third_person_anchor_y, CameraMode, ChaseCamera, OperatorCamera};
 
-use super::collision_bvh::CollisionBvh;
+use super::collision_bvh::{CollisionBvh, ZoneCollisionBvh};
 
 /// Pull the camera this many Bevy units shy of the wall hit so the near
 /// plane doesn't slice into the geometry. 0.2 yalms ≈ a few centimeters
@@ -79,13 +79,16 @@ pub fn clamp_chase_camera_to_collision(
     mode: Res<CameraMode>,
     chase: Res<ChaseCamera>,
     time: Res<Time>,
+    draw: Res<DrawDistance>,
+    zone_bvh: Res<ZoneCollisionBvh>,
     self_q: Query<(&Transform, Option<&BakedActor>), (With<IsSelf>, Without<OperatorCamera>)>,
     mut cam_q: Query<&mut Transform, (With<OperatorCamera>, Without<IsSelf>)>,
     bvh_q: Query<&CollisionBvh>,
-    // TEMP probe: count entities that are CameraOccluder-marked but
-    // haven't yet received a CollisionBvh. If this stays > 0 across
-    // frames, the build system is silently skipping some meshes — that
-    // matches the user's "only some meshes" symptom.
+    // TEMP probe: count CameraOccluder-marked MMB placements that haven't
+    // yet received a per-entity CollisionBvh. Only meaningful when the
+    // active source includes MMB; on the default `Mzb` path these are
+    // never built (see `build_collision_bvh_system`) so a non-zero count
+    // is expected and harmless.
     pending_q: Query<
         Entity,
         (
@@ -115,6 +118,7 @@ pub fn clamp_chase_camera_to_collision(
     //   pending     = MzbCollisionMesh entities still without a BVH
     //   per_bvh     = tri count + world-space AABB of each BVH so the
     //                 operator can sanity-check positioning
+    let source = draw.camera_collision_source;
     let bvh_count = bvh_q.iter().count();
     let pending_count = pending_q.iter().count();
     let summary = (bvh_count, pending_count);
@@ -127,12 +131,15 @@ pub fn clamp_chase_camera_to_collision(
                 tri_count = bvh.tri_count(),
                 aabb_min = ?(mn.x, mn.y, mn.z),
                 aabb_max = ?(mx.x, mx.y, mx.z),
-                "camera_collision probe: BVH summary"
+                "camera_collision probe: MMB BVH summary"
             );
         }
         tracing::debug!(
-            bvhs = bvh_count,
-            pending_meshes = pending_count,
+            source = source.label(),
+            mmb_bvhs = bvh_count,
+            mmb_pending = pending_count,
+            zone_bvh = zone_bvh.0.is_some(),
+            zone_bvh_tris = zone_bvh.0.as_ref().map(|b| b.tri_count()).unwrap_or(0),
             "camera_collision probe: coverage summary"
         );
     }
@@ -183,16 +190,35 @@ pub fn clamp_chase_camera_to_collision(
 
     let wanted = chase.distance;
 
-    // Closest forward hit across all collision-mesh BVHs. Each BVH's
-    // ray_cast is roughly O(log N) plus a small leaf scan, so total
-    // cost is bounded even in triangle-dense zones.
+    // Closest forward hit, taken from whichever source(s) the operator
+    // selected via `/zonegeom source` (default `Mzb` — the retail-faithful
+    // MZB collision channel; grass/foliage MMBs are excluded). Each
+    // `ray_cast` is roughly O(log N) plus a small leaf scan, so total cost
+    // is bounded even in triangle-dense zones.
     let mut hit_t = wanted;
     let mut hit_any = false;
-    for bvh in bvh_q.iter() {
-        if let Some(t) = bvh.ray_cast(anchor, dir, hit_t) {
-            if t < hit_t {
-                hit_t = t;
-                hit_any = true;
+    // MZB collision BVH — one zone-level BVH, the authoritative "solid"
+    // signal (mesh flag bit 0 == 0).
+    if source.uses_mzb() {
+        if let Some(bvh) = &zone_bvh.0 {
+            if let Some(t) = bvh.ray_cast(anchor, dir, hit_t) {
+                if t < hit_t {
+                    hit_t = t;
+                    hit_any = true;
+                }
+            }
+        }
+    }
+    // Per-placement MMB occluders — legacy / diagnostic path. Includes
+    // decorative props; kept behind the source flag until MZB-only is
+    // verified faithful.
+    if source.uses_mmb() {
+        for bvh in bvh_q.iter() {
+            if let Some(t) = bvh.ray_cast(anchor, dir, hit_t) {
+                if t < hit_t {
+                    hit_t = t;
+                    hit_any = true;
+                }
             }
         }
     }
@@ -209,19 +235,37 @@ pub fn clamp_chase_camera_to_collision(
     let now = time.elapsed_secs();
     if now - *last_probe_log >= 1.0 {
         *last_probe_log = now;
+        // Brute-force the **same** source set the clamp used, so a
+        // BVH-vs-brute mismatch points at a traversal/structure bug
+        // (brute force is ground truth). This now also covers the new
+        // zone-level MZB BVH, which is the default path.
         let mut brute_hit_t = wanted;
         let mut brute_hit_any = false;
         let mut total_tris: usize = 0;
-        for bvh in bvh_q.iter() {
-            total_tris += bvh.tri_count();
-            if let Some(t) = bvh.ray_cast_brute_force(anchor, dir, brute_hit_t) {
-                if t < brute_hit_t {
-                    brute_hit_t = t;
-                    brute_hit_any = true;
+        if source.uses_mzb() {
+            if let Some(bvh) = &zone_bvh.0 {
+                total_tris += bvh.tri_count();
+                if let Some(t) = bvh.ray_cast_brute_force(anchor, dir, brute_hit_t) {
+                    if t < brute_hit_t {
+                        brute_hit_t = t;
+                        brute_hit_any = true;
+                    }
+                }
+            }
+        }
+        if source.uses_mmb() {
+            for bvh in bvh_q.iter() {
+                total_tris += bvh.tri_count();
+                if let Some(t) = bvh.ray_cast_brute_force(anchor, dir, brute_hit_t) {
+                    if t < brute_hit_t {
+                        brute_hit_t = t;
+                        brute_hit_any = true;
+                    }
                 }
             }
         }
         tracing::debug!(
+            source = source.label(),
             anchor = ?(anchor.x, anchor.y, anchor.z),
             dir = ?(dir.x, dir.y, dir.z),
             wanted,
@@ -229,7 +273,6 @@ pub fn clamp_chase_camera_to_collision(
             bvh_hit_t = if hit_any { hit_t } else { f32::NAN },
             brute_hit = brute_hit_any,
             brute_hit_t = if brute_hit_any { brute_hit_t } else { f32::NAN },
-            bvhs = bvh_q.iter().count(),
             total_tris,
             "camera_collision probe: per-cast outcome"
         );
@@ -274,12 +317,17 @@ pub fn clamp_chase_camera_to_collision(
 /// is a no-op unless `DrawDistance.zone_geom_mode == ZoneGeomMode::Camera`,
 /// so it costs essentially nothing when not active.
 ///
-/// What it draws:
-/// - Each [`CollisionBvh`]'s root AABB as a green wirebox — the bounds
-///   the camera raycast actually tests against. Useful for spotting
-///   coverage gaps ("this room's ceiling has no AABB, that's why the
-///   camera tunnels through it").
-/// - The active player→camera ray and clamp state — TODO below.
+/// What it draws (only for the **active** `/zonegeom source`):
+/// - The zone-level MZB [`ZoneCollisionBvh`] root AABB as a **cyan**
+///   wirebox when the source includes MZB — the bounds the retail-faithful
+///   raycast tests against. Useful for spotting coverage gaps ("this
+///   room's ceiling has no AABB, that's why the camera tunnels through
+///   it").
+/// - Each per-placement MMB [`CollisionBvh`] root AABB as an **orange**
+///   wirebox when the source includes MMB, so grass/prop occluders are
+///   visually distinct from the MZB channel under `both`.
+/// - The active player→camera ray and clamp state (yellow effective +
+///   magenta clipped segments).
 ///
 /// Lifecycle (per `bevy-lifecycle-symmetry`): gizmos are ephemeral —
 /// drawn into a per-frame retained buffer that Bevy clears each frame.
@@ -293,31 +341,41 @@ pub fn draw_camera_collision_debug(
     self_q: Query<(&Transform, Option<&BakedActor>), (With<IsSelf>, Without<OperatorCamera>)>,
     cam_q: Query<&Transform, (With<OperatorCamera>, Without<IsSelf>)>,
     bvh_q: Query<&CollisionBvh>,
+    zone_bvh: Res<ZoneCollisionBvh>,
     mut gizmos: Gizmos,
 ) {
     if draw.zone_geom_mode != ZoneGeomMode::Camera {
         return;
     }
 
-    // BVH coverage — one wirebox per loaded CollisionBvh. **Cyan** so it
-    // doesn't blur into the navmesh overlay (bright green); slightly
-    // translucent (alpha 0.55) so the actual zone geometry behind it
-    // stays legible. Picked deliberately away from the green/yellow/red
-    // ramp the ray-state segments use below.
-    let aabb_color = Color::srgba(0.20, 0.80, 1.0, 0.55);
-    for bvh in bvh_q.iter() {
-        let Some((mn, mx)) = bvh.root_aabb() else {
-            continue;
-        };
-        let center = (mn + mx) * 0.5;
-        let extents = mx - mn;
-        // bevy 0.18 removed `Gizmos::cuboid`; draw the box via the
-        // primitive API (full-size `Cuboid`, axis-aligned isometry).
+    let source = draw.camera_collision_source;
+    // bevy 0.18 removed `Gizmos::cuboid`; draw each BVH's root AABB via the
+    // primitive API (full-size `Cuboid`, axis-aligned isometry). Only the
+    // AABBs of the **active** source(s) are drawn so the overlay matches
+    // what the clamp actually tests against.
+    let mut draw_aabb = |mn: Vec3, mx: Vec3, color: Color| {
         gizmos.primitive_3d(
-            &Cuboid::from_size(extents),
-            Isometry3d::from_translation(center),
-            aabb_color,
+            &Cuboid::from_size(mx - mn),
+            Isometry3d::from_translation((mn + mx) * 0.5),
+            color,
         );
+    };
+    // Zone-level MZB collision BVH — **cyan**, the retail-faithful source.
+    // Translucent (alpha 0.55) so the geometry behind stays legible, and
+    // away from the green/yellow/red ramp the ray-state segments use.
+    if source.uses_mzb() {
+        if let Some((mn, mx)) = zone_bvh.0.as_ref().and_then(|b| b.root_aabb()) {
+            draw_aabb(mn, mx, Color::srgba(0.20, 0.80, 1.0, 0.55));
+        }
+    }
+    // Per-placement MMB occluders — **orange**, so the operator can tell a
+    // grass/prop occluder apart from the MZB channel when running `Both`.
+    if source.uses_mmb() {
+        for bvh in bvh_q.iter() {
+            if let Some((mn, mx)) = bvh.root_aabb() {
+                draw_aabb(mn, mx, Color::srgba(1.0, 0.55, 0.10, 0.55));
+            }
+        }
     }
 
     let Ok((self_t, baked)) = self_q.single() else {

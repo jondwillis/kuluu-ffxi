@@ -21,11 +21,27 @@
 
 use bevy::prelude::*;
 use ffxi_viewer_core::components::CameraOccluder;
+use ffxi_viewer_core::dat_mzb::{DrawDistance, MzbCollisionGeometry};
 
 /// Maximum triangles per leaf. Below this we stop subdividing — the
 /// per-leaf scan is faster than the AABB tests on smaller groups.
 /// 16 was picked by feel; tune with a bench if it ever matters.
 const LEAF_THRESHOLD: usize = 16;
+
+/// Single zone-level BVH over the merged MZB **collision** triangle soup
+/// ([`MzbCollisionGeometry`]). This is the retail-faithful camera
+/// occlusion source: the MZB collision flag (bit 0 == 0) is FFXI's
+/// authoritative "what is solid" signal, the same one ground-snap
+/// already trusts. Built by [`build_zone_collision_bvh_system`] whenever
+/// the geometry resource changes (zone-in, zone change, logout-clear),
+/// so there's exactly **one** BVH per zone instead of one per MMB
+/// placement.
+///
+/// `None` when no MZB is loaded (launcher, between zones). Drained on
+/// `OnExit(AppPhase::InGame)` alongside the geometry it mirrors — see
+/// `drain_mzb_load_state`.
+#[derive(Resource, Default)]
+pub struct ZoneCollisionBvh(pub Option<CollisionBvh>);
 
 /// Per-entity BVH. Inserted by [`build_collision_bvh_system`] once the
 /// underlying [`Mesh3d`] asset is loaded; never mutated after build.
@@ -132,6 +148,14 @@ impl CollisionBvh {
         }
 
         (hit_t < max_t).then_some(hit_t)
+    }
+
+    /// Build a BVH directly from world-space triangles. Used for the
+    /// single zone-level MZB-collision BVH ([`ZoneCollisionBvh`]), which
+    /// is baked from [`MzbCollisionGeometry`] rather than walking a Bevy
+    /// `Mesh` asset like [`build_collision_bvh_system`] does.
+    pub fn from_world_triangles(triangles: Vec<[Vec3; 3]>) -> Self {
+        build_bvh_with_leaf_offsets(triangles)
     }
 
     fn build(triangles: Vec<[Vec3; 3]>) -> Self {
@@ -357,12 +381,23 @@ fn ray_tri_intersect(orig: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> Opt
 /// makes it a no-op once every entity is processed).
 pub fn build_collision_bvh_system(
     mut commands: Commands,
+    draw: Res<DrawDistance>,
     query: Query<
         (Entity, &Mesh3d, &GlobalTransform),
         (With<CameraOccluder>, Without<CollisionBvh>),
     >,
     meshes: Res<Assets<Mesh>>,
 ) {
+    // Per-placement MMB occluder BVHs are only consulted when the camera
+    // collision source includes MMB (`Mmb`/`Both`). On the default `Mzb`
+    // path the camera clamps against the single zone-level
+    // [`ZoneCollisionBvh`] instead, so building thousands of per-MMB BVHs
+    // would be pure waste. Skip entirely; the `Without<CollisionBvh>`
+    // filter makes this resumable, so flipping to `Mmb`/`Both` at runtime
+    // just lets the build catch up over the next few frames.
+    if !draw.camera_collision_source.uses_mmb() {
+        return;
+    }
     for (entity, mesh3d, global) in query.iter() {
         let Some(mesh) = meshes.get(mesh3d.0.id()) else {
             // Asset not loaded yet — try again next frame.
@@ -406,6 +441,49 @@ pub fn build_collision_bvh_system(
         );
         commands.entity(entity).insert(bvh);
     }
+}
+
+/// Rebuild the zone-level MZB-collision BVH whenever
+/// [`MzbCollisionGeometry`] changes. That resource is replaced wholesale
+/// on every zone load and cleared on logout, so `is_changed()` is the
+/// exact trigger — no per-frame work once the zone is stable, and the
+/// rebuild rides the same data the ground-snap raycast already trusts.
+///
+/// Lifecycle (per `bevy-lifecycle-symmetry`): the output
+/// [`ZoneCollisionBvh`] is a cached `Resource`. Its drain partner is in
+/// `drain_mzb_load_state` (`OnExit(AppPhase::InGame)`); here we also
+/// self-heal by clearing to `None` when the geometry empties, which
+/// covers the logout-clear that happens while still `InGame`.
+pub fn build_zone_collision_bvh_system(
+    geom: Res<MzbCollisionGeometry>,
+    mut zone_bvh: ResMut<ZoneCollisionBvh>,
+) {
+    if !geom.is_changed() {
+        return;
+    }
+    if geom.indices.is_empty() {
+        // Logout / between-zones clear — drop the stale BVH so a steep
+        // camera pitch in the launcher backdrop can't ray-hit ghost
+        // triangles from the previous zone.
+        zone_bvh.0 = None;
+        return;
+    }
+    let mut tris: Vec<[Vec3; 3]> = Vec::with_capacity(geom.indices.len() / 3);
+    for tri in geom.indices.chunks_exact(3) {
+        tris.push([
+            geom.positions[tri[0] as usize],
+            geom.positions[tri[1] as usize],
+            geom.positions[tri[2] as usize],
+        ]);
+    }
+    let tri_count = tris.len();
+    let bvh = CollisionBvh::from_world_triangles(tris);
+    debug!(
+        triangles = tri_count,
+        nodes = bvh.nodes.len(),
+        "built zone-level MZB collision BVH"
+    );
+    zone_bvh.0 = Some(bvh);
 }
 
 /// Wrapper around [`CollisionBvh::build`] that also patches each leaf

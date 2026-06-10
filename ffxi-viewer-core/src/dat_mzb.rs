@@ -142,6 +142,67 @@ impl ZoneGeomMode {
     }
 }
 
+/// Which geometry the third-person chase camera collision clamp tests
+/// against. A runtime toggle so retail-faithfulness can be A/B-verified
+/// in-game **before** the legacy MMB-occluder path is deleted.
+///
+/// Background: FFXI's authoritative "what is solid" signal is the MZB
+/// per-mesh collision/LoS flag (bit 0 == 0) — the same flag
+/// LandSandBoat's FFXI-NavMesh-Builder feeds into navmesh/LoS
+/// generation (see `ffxi-dat/src/mzb.rs`). Decorative MMB placements
+/// (grass, plants, furniture) carry no collision flag and should not
+/// push the camera. The legacy path clamped against *every* static MMB
+/// placement, which is why Sarutabaruta grass (`tshimono_sal_w04_m`)
+/// occluded the camera.
+///
+/// `Mzb` is the faithful target and the default. `Mmb` reproduces the
+/// legacy behaviour for comparison; `Both` is the diagnostic union —
+/// anything `Both` blocks that `Mzb` doesn't is an MMB-only solid the
+/// MZB collision channel is missing (cross-check against
+/// `research/Phoenix/losmeshes` before trusting it).
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraCollisionSource {
+    /// Clamp only against the merged MZB collision mesh (flag bit 0 ==
+    /// 0). The retail-faithful source — foliage MMBs are excluded.
+    #[default]
+    Mzb,
+    /// Clamp only against static MMB placements (legacy behaviour).
+    /// Kept for A/B comparison; grass/plants occlude in this mode.
+    Mmb,
+    /// Clamp against both sources. Diagnostic — surfaces solids present
+    /// in one source but not the other.
+    Both,
+}
+
+impl CameraCollisionSource {
+    /// `toggle`-cycle order: Mzb → Mmb → Both → Mzb.
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Mzb => Self::Mmb,
+            Self::Mmb => Self::Both,
+            Self::Both => Self::Mzb,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mzb => "mzb",
+            Self::Mmb => "mmb",
+            Self::Both => "both",
+        }
+    }
+
+    /// Whether this source consults the zone-level MZB collision BVH.
+    pub fn uses_mzb(self) -> bool {
+        matches!(self, Self::Mzb | Self::Both)
+    }
+
+    /// Whether this source consults per-placement MMB occluder BVHs.
+    pub fn uses_mmb(self) -> bool {
+        matches!(self, Self::Mmb | Self::Both)
+    }
+}
+
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct DrawDistance {
     pub world: f32,
@@ -149,6 +210,11 @@ pub struct DrawDistance {
     /// `/zonegeom` setting — bundled into this resource so the
     /// text-input dispatcher stays under Bevy's 16 `SystemParam` limit.
     pub zone_geom_mode: ZoneGeomMode,
+    /// `/zonegeom source` setting — which geometry the chase-camera
+    /// collision clamp tests against. Bundled here for the same reason
+    /// as `zone_geom_mode`: keeps the text-input dispatcher under the
+    /// 16-`SystemParam` ceiling.
+    pub camera_collision_source: CameraCollisionSource,
 }
 
 impl Default for DrawDistance {
@@ -157,6 +223,7 @@ impl Default for DrawDistance {
             world: DEFAULT_WORLD_DRAW_DISTANCE,
             mob: DEFAULT_MOB_DRAW_DISTANCE,
             zone_geom_mode: ZoneGeomMode::default(),
+            camera_collision_source: CameraCollisionSource::default(),
         }
     }
 }
@@ -823,7 +890,13 @@ pub fn build_zone_mmb_spawns(
             s.spawn(async move {
                 let dec = mmb::decrypt(data).ok()?;
                 let hdr = MmbHeader::parse(&dec).ok()?;
-                Some((idx, hdr.asset_name_str().trim_end().to_string()))
+                // Match key = the 16-byte ZoneMesh name (decrypted[16..32]),
+                // NOT asset_name (decrypted[8..32]). FFXI/XIM resolve a
+                // ZoneDef placement by `id == ZoneMesh.name` exactly; the
+                // 8-byte author prefix in asset_name broke fuzzy matching
+                // for numerically-named floor/terrain slabs ("1".."53"),
+                // dropping the entire zone floor → see `zone_mesh_name`.
+                Some((idx, hdr.zone_mesh_name()))
             });
         }
     });
@@ -833,7 +906,16 @@ pub fn build_zone_mmb_spawns(
         mmb_indices.push(entry.0);
         mmb_names.push(entry.1);
     }
-    let zone_prefix = mzb::infer_zone_prefix(&mmb_names);
+    // Exact name → local-index map (XIM `getZoneMeshResourceByNameAs`).
+    // A name can map to several chunks (LOD/variant families like `cube`);
+    // the placement loop round-robins among them.
+    use std::collections::HashMap;
+    let mut name_to_locals: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (local, name) in mmb_names.iter().enumerate() {
+        if !name.is_empty() {
+            name_to_locals.entry(name.as_str()).or_default().push(local);
+        }
+    }
 
     // Locate MZB chunk and parse the placement table.
     let (_, mzb_chunk) = match chunk_idx {
@@ -859,38 +941,27 @@ pub fn build_zone_mmb_spawns(
     let placements = mzb::parse_mmb_placements(&plain, &header)
         .map_err(|e| format!("MZB parse_mmb_placements: {e}"))?;
 
-    // Round-robin pairing for placement_id → chunk_idx (replaces the
-    // historical singular `resolve_mmb_index` call that collapsed
-    // every variant onto the first match).
+    // Resolve each placement id → MMB chunk(s) by EXACT ZoneMesh-name
+    // match — `placement.id == chunk.zone_mesh_name` (decrypted[16..32]),
+    // i.e. FFXI/XIM `getZoneMeshResourceByNameAs`. This replaces the old
+    // `asset_name` (decrypted[8..32]) + `infer_zone_prefix` /
+    // `resolve_mmb_indices` fuzzy matcher, whose 8-byte author prefix
+    // silently dropped every numerically-named floor/terrain slab
+    // ("1".."53" — ~40 large meshes, the entire zone floor), rendering as
+    // black holes. Exact matching resolves all of them.
     //
-    // Some placement ids resolve to *multiple* MMB chunks — typically
-    // because the placement name (e.g. `cube`, `water`, `saku`) matches
-    // a family of variants in the chunk stream. Bastok Mines has
-    // `cube` × 75 placements pointing at 2 distinct `cube` MMBs and
-    // `water` × 24 pointing at 2 `water` MMBs. With the singular
-    // resolver, all 75 cube placements bound to the first match and
-    // the second variant never rendered (visible in-game as a missing
-    // family of stair / pillar / fence pieces). The plural resolver
-    // returns every match; we pair them round-robin by maintaining a
-    // per-id counter that advances each time we consume a placement.
-    // Policy: wrap modulo the match count when N placements exceed N
-    // matches (FFXI authoring assumes "place N copies of variant"
-    // wraps cleanly when N exceeds the variant set).
-    //
-    // Cited bug location for the singular collapse:
-    // `ffxi-dat/src/mzb.rs:820-829` documents the pairing requirement;
-    // this call site is what actually consumes the indices vec.
-    use std::collections::HashMap;
-    let mut rr_cursor: HashMap<String, usize> = HashMap::new();
+    // A name can still map to several chunks (LOD/variant families like
+    // `cube` × 2). We round-robin among them per id so all variants get
+    // used — Bastok Mines places `cube` × 75 across 2 `cube` meshes, etc.
+    // Wrap modulo the match count when placements exceed variants.
+    let mut rr_cursor: HashMap<&str, usize> = HashMap::new();
     let mut out = Vec::with_capacity(placements.len());
     for p in &placements {
-        let name = p.id_str().trim_end_matches('\0');
-        let trimmed = name.trim_end();
-        let matches = mzb::resolve_mmb_indices(trimmed, &zone_prefix, &mmb_names);
-        if matches.is_empty() {
+        let id = p.id_str().trim_end_matches('\0').trim_end();
+        let Some(matches) = name_to_locals.get(id) else {
             continue;
-        }
-        let cursor = rr_cursor.entry(trimmed.to_string()).or_insert(0);
+        };
+        let cursor = rr_cursor.entry(id).or_insert(0);
         let local_idx = matches[*cursor % matches.len()];
         *cursor += 1;
         let chunk_idx = mmb_indices[local_idx];
@@ -967,8 +1038,8 @@ pub fn build_zone_mmb_spawns(
         for p in &placements {
             let id = p.id_str().trim_end_matches('\0').trim_end().to_string();
             *placement_id_counts.entry(id.clone()).or_insert(0) += 1;
-            let matches = mzb::resolve_mmb_indices(&id, &zone_prefix, &mmb_names);
-            match matches.len() {
+            let matches_len = name_to_locals.get(id.as_str()).map_or(0, |v| v.len());
+            match matches_len {
                 0 => bucket0.push(id),
                 1 => bucket1 += 1,
                 n => bucket_many.push((id, n)),
@@ -983,7 +1054,7 @@ pub fn build_zone_mmb_spawns(
             if *count < 2 {
                 continue;
             }
-            let m = mzb::resolve_mmb_indices(id, &zone_prefix, &mmb_names).len();
+            let m = name_to_locals.get(id.as_str()).map_or(0, |v| v.len());
             if m > 1 {
                 roundrobin_smoke.push((id.clone(), *count, m));
             }
@@ -1004,7 +1075,7 @@ pub fn build_zone_mmb_spawns(
             placements = placements.len(),
             spawned = out.len(),
             mmb_names = mmb_names.len(),
-            zone_prefix = %zone_prefix,
+            distinct_names = name_to_locals.len(),
             dup_asset_names = dup_names.len(),
             match0 = bucket0.len(),
             match1 = bucket1,

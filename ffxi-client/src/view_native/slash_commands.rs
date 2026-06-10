@@ -993,6 +993,11 @@ pub enum SlashOutcome {
     /// operators can hide the visually-noisy non-collision (decorative)
     /// meshes while keeping the LoS-blocking collision mesh visible.
     SetZoneGeom(Option<ffxi_viewer_core::dat_mzb::ZoneGeomMode>),
+    /// `/zonegeom source mzb|mmb|both` — which geometry the chase-camera
+    /// collision clamp tests against. `None` means cycle. `Mzb` is the
+    /// retail-faithful default; the others are A/B / diagnostic paths
+    /// retained until MZB-only collision is verified.
+    SetCameraCollisionSource(Option<ffxi_viewer_core::dat_mzb::CameraCollisionSource>),
     /// `/devhud on|off|toggle` — show/hide the dev-only HUD widgets
     /// (stage bar, agent goal panel, MMB hover info, LLM badge,
     /// bf/sync/last/map/fps strip, [dbg] chat pane). Default off so the
@@ -2721,10 +2726,36 @@ fn parse_minimap(rest: &str) -> SlashOutcome {
 /// `camera`/`cam` activates the camera-collision debug overlay (MZB collision +
 /// BVH AABBs + active raycast gizmos). `toggle`/empty cycles
 /// Collision → All → Camera → Off → Collision.
+///
+/// `/zonegeom source mzb|mmb|both|toggle` — orthogonal axis: which
+/// geometry the chase-camera collision clamp tests against.
+/// `mzb` (default) is the retail-faithful MZB collision channel; `mmb`
+/// reproduces the legacy per-placement behaviour (grass occludes);
+/// `both` is the diagnostic union. See [`CameraCollisionSource`].
 fn parse_zonegeom(rest: &str) -> SlashOutcome {
-    use ffxi_viewer_core::dat_mzb::ZoneGeomMode;
+    use ffxi_viewer_core::dat_mzb::{CameraCollisionSource, ZoneGeomMode};
     let arg = rest.trim().to_ascii_lowercase();
-    let setting = match arg.as_str() {
+    let mut tokens = arg.split_whitespace();
+    let first = tokens.next().unwrap_or("");
+
+    // `source` axis is parsed first so it doesn't collide with the
+    // visibility-mode keywords below.
+    if matches!(first, "source" | "src" | "camsrc" | "camsource") {
+        let src = match tokens.next().unwrap_or("") {
+            "" | "toggle" => None,
+            "mzb" => Some(CameraCollisionSource::Mzb),
+            "mmb" => Some(CameraCollisionSource::Mmb),
+            "both" => Some(CameraCollisionSource::Both),
+            other => {
+                return SlashOutcome::SystemMessage(format!(
+                    "/zonegeom source: bad arg `{other}` (use mzb|mmb|both|toggle)"
+                ));
+            }
+        };
+        return SlashOutcome::SetCameraCollisionSource(src);
+    }
+
+    let setting = match first {
         "" | "toggle" => None,
         "off" | "false" | "0" => Some(ZoneGeomMode::Off),
         "collision" | "coll" => Some(ZoneGeomMode::Collision),
@@ -2732,7 +2763,7 @@ fn parse_zonegeom(rest: &str) -> SlashOutcome {
         "camera" | "cam" => Some(ZoneGeomMode::Camera),
         other => {
             return SlashOutcome::SystemMessage(format!(
-                "/zonegeom: bad arg `{other}` (use off|collision|all|camera|toggle)"
+                "/zonegeom: bad arg `{other}` (use off|collision|all|camera|source|toggle)"
             ));
         }
     };

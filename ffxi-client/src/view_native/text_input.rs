@@ -1519,6 +1519,14 @@ fn apply_slash_outcome(
             draw_distance.zone_geom_mode = next;
             push_system_chat_line(scene_state, format!("/zonegeom: {}", next.label()));
         }
+        SlashOutcome::SetCameraCollisionSource(setting) => {
+            let next = setting.unwrap_or_else(|| draw_distance.camera_collision_source.cycle());
+            draw_distance.camera_collision_source = next;
+            push_system_chat_line(
+                scene_state,
+                format!("/zonegeom source: {}", next.label()),
+            );
+        }
         SlashOutcome::SetDevHud(setting) => {
             // `None` means toggle; explicit `on`/`off` overrides.
             let next = setting.unwrap_or(!slash_writers.hud_verbosity.dev_hud);

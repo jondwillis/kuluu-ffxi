@@ -250,6 +250,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         .init_resource::<HeadingTurnAccum>()
         .init_resource::<LocalPlayerPrediction>()
         .init_resource::<text_input::CaptureMode>()
+        .init_resource::<collision_bvh::ZoneCollisionBvh>()
         .insert_resource(ports)
         .insert_resource(RelayListen(relay_listen))
         // Mirror the DAT-root Arc into the minimap's retail backend
@@ -495,6 +496,17 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // clamped one. The gap is widest while the player moves (the chase
     // lerp trails most then) and flickered as scheduler order varied —
     // the visible "nameplate catches up / jitters while moving" bug.
+    // Zone-level MZB-collision BVH — the retail-faithful camera occlusion
+    // source. Change-detected off `MzbCollisionGeometry`, so it's a cheap
+    // resource-read every frame and only rebuilds on zone-in / zone-change
+    // / logout-clear. Ordered `.before` the clamp so a freshly-loaded zone
+    // is occlusion-correct on the same frame its geometry lands.
+    app.add_systems(
+        Update,
+        collision_bvh::build_zone_collision_bvh_system
+            .before(camera_collision::clamp_chase_camera_to_collision)
+            .run_if(in_state(AppPhase::InGame)),
+    );
     app.add_systems(
         Update,
         camera_collision::clamp_chase_camera_to_collision
@@ -703,11 +715,20 @@ fn despawn_ingame_entities(
 fn drain_mzb_load_state(
     mut mzb_in_flight: ResMut<ffxi_viewer_core::dat_mzb::LoadMzbInFlight>,
     mut zone_geom_cache: ResMut<ffxi_viewer_core::dat_mzb::ZoneGeomCache>,
+    mut zone_collision_bvh: ResMut<collision_bvh::ZoneCollisionBvh>,
 ) {
     let dropped_tasks = mzb_in_flight.tasks.len();
     let dropped_cache = zone_geom_cache.entries.len();
     mzb_in_flight.tasks.clear();
     zone_geom_cache.entries.clear();
+    // Drain partner for the zone-level camera-collision BVH: it mirrors
+    // `MzbCollisionGeometry` (cleared in `despawn_ingame_entities`), but
+    // the build system that would otherwise self-heal it is gated
+    // `in_state(InGame)` and won't run post-exit. Clear it here so a stale
+    // zone's collision can't survive into the launcher backdrop / next
+    // session. (Lives here, not in `despawn_ingame_entities`, which is at
+    // the 16-`SystemParam` ceiling.)
+    zone_collision_bvh.0 = None;
     if dropped_tasks > 0 || dropped_cache > 0 {
         tracing::info!(
             dropped_tasks,
