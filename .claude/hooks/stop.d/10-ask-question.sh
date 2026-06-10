@@ -27,14 +27,27 @@ load_payload
 # continuation) there's no second chance. One slurp per attempt, one total
 # once settled.
 #
-# $blocks = assistant content after the last genuine user prompt (a user
-# message carrying a text block — tool_result users don't count). ready
+# $blocks = assistant content after the last turn boundary: the most recent
+# user message that ISN'T a pure tool_result carrier. That boundary set is
+# (a) genuine prompts — string content OR an array carrying a text block —
+# and (b) our own injected Stop-hook checkpoints, which land as string-content
+# user messages (isMeta). Resetting at the checkpoint is the whole point: it
+# scopes the judged text to JUST the latest continuation turn.
+#
+# An earlier version reset only at array+text prompts. Checkpoints (strings)
+# then weren't boundaries, so $blocks accumulated EVERY assistant text block
+# since the real prompt and grew each cycle. Two failures compounded into a
+# loop: (1) the signature is a hash of that text, so growing text => new sig
+# every cycle => sig_changed never suppressed a re-fire; (2) choice_re is
+# matched over the whole blob, so one stale "1." / "2." list or a long-gone
+# question latched choice_hit=1 forever. Net: re-fired every turn until the
+# dispatcher's depth backstop. Scoping to the last turn kills both. ready
 # keys off the last assistant entry in the whole transcript.
 extract='. as $all
   | ([ range(0; length)
        | select($all[.].type == "user"
-                and ($all[.].message.content | type) == "array"
-                and ([$all[.].message.content[].type] | index("text")) != null) ]
+                and ( ($all[.].message.content | type) == "string"
+                      or ([$all[.].message.content[]?.type] | index("text")) != null )) ]
      | last) as $u
   | ([ $all[ (($u // -1) + 1) : ][] | select(.type == "assistant") | .message.content[]? ]) as $blocks
   | (([ $all[] | select(.type == "assistant") ] | last) // {}) as $lastA
