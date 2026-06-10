@@ -33,127 +33,321 @@ use crate::state::{ActionKind, AgentCommand, CheckKind, HealMode, ReqLogoutKind}
 /// etc.) but never reaches 65535; this catches obvious typos.
 const MAX_ZONE_ID: u16 = 600;
 
-/// One row in the `/help` listing. `aliases[0]` is the canonical name;
-/// the rest are accepted spellings (mirroring the `match` arms in
-/// `parse_slash`). `usage` is the brief arg shape; `summary` is the
-/// one-line description rendered in chat.
-struct HelpEntry {
+/// Everything a command handler might need, bundled so each handler is
+/// a plain `fn(&SlashCtx) -> SlashOutcome`. `parse_slash` builds one of
+/// these per invocation and hands it to the matched command's handler.
+struct SlashCtx<'a> {
+    /// The lowercased command word (the alias the user actually typed —
+    /// handlers that serve multiple aliases branch on this, e.g.
+    /// `targetnpc` vs `targetnpc2`).
+    cmd: &'a str,
+    /// Everything after the command word, trimmed.
+    rest: &'a str,
+    entities: &'a [WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+    zone_id: Option<u16>,
+    self_char_id: Option<u32>,
+    party: &'a [ffxi_viewer_wire::PartyMember],
+}
+
+/// One command in the registry: its accepted spellings, help metadata,
+/// and the handler that runs it. `aliases[0]` is the canonical name;
+/// the rest are accepted spellings. `usage` is the brief arg shape;
+/// `summary` is the one-line `/help` description. Because the handler
+/// lives in the same struct as the help text, a command physically
+/// cannot be dispatched without also carrying a `/help` entry — the
+/// invariant the old hand-kept `match` could only approximate with
+/// drift-guard tests.
+struct Command {
     aliases: &'static [&'static str],
     usage: &'static str,
     summary: &'static str,
+    handler: fn(&SlashCtx) -> SlashOutcome,
 }
 
-/// Categorized listing rendered by `/help` and `/?`. Single source of
-/// truth for the help screen, kept in lockstep with the `parse_slash`
-/// dispatch match by two tests: `help_entries_dispatch_known` (every
-/// help alias must parse) and `dispatch_arms_have_help_entries` (every
-/// dispatched command must have a help entry). Together they make the
-/// help set and the dispatch set identical, so a new command can never
-/// be added to the match without showing up in `/help` and `/?`.
-const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
+/// Shared "unknown command" toast, used by the dispatcher's fallthrough
+/// and by the menu-opening commands whose no-arg guard rejects args.
+fn unknown_command(cmd: &str) -> SlashOutcome {
+    SlashOutcome::SystemMessage(format!("unknown command: /{cmd}"))
+}
+
+/// The command registry: the single source of truth for both dispatch
+/// and the `/help` / `/?` listing. `parse_slash` looks a command up here
+/// by alias and calls its handler; `render_help` walks the same table
+/// grouped by category. Adding a command means adding one `Command`
+/// (handler + help text together), so a dispatchable command with no
+/// help entry — or a help entry with no handler — is now unrepresentable
+/// rather than merely test-guarded. Category and within-category order
+/// is the `/help` display order.
+const COMMANDS: &[(&str, &[Command])] = &[
     (
         "Help",
-        &[HelpEntry {
+        &[Command {
             aliases: &["help", "?"],
             usage: "",
             summary: "show this slash-command reference",
+            handler: |_| SlashOutcome::SystemMessage(render_help()),
         }],
     ),
     (
         "Movement & Navigation",
         &[
-            HelpEntry {
+            Command {
                 aliases: &["follow"],
                 usage: "[name]",
                 summary: "follow target or current selection",
+                handler: |c| match resolve_target_or_current(
+                    c.rest,
+                    c.entities,
+                    c.self_pos,
+                    c.current_target,
+                ) {
+                    Some(id) => SlashOutcome::Command(AgentCommand::Follow {
+                        target_id: id,
+                        distance: 3.0,
+                    }),
+                    None => SlashOutcome::SystemMessage("/follow: no target".into()),
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["pathto"],
                 usage: "<x> <y> [z] | <name> | target",
                 summary: "pathfind: coords (z optional), fuzzy zone-line/entity, or current target",
+                handler: |c| {
+                    parse_pathto(c.rest, c.entities, c.self_pos, c.current_target, c.zone_id)
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["warp"],
                 usage: "<x> <y> [z] | <name> | target",
-                summary:
-                    "debug teleport (Move): coords (z optional), fuzzy zone-line/entity, or target",
+                summary: "debug teleport (Move): coords (z optional), fuzzy zone-line/entity, or target",
+                handler: |c| {
+                    parse_warp(c.rest, c.entities, c.self_pos, c.current_target, c.zone_id)
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["zones"],
                 usage: "",
                 summary: "list zone-line destinations from current zone",
+                handler: |c| parse_zones(c.zone_id),
             },
-            HelpEntry {
+            Command {
                 aliases: &["zoneto"],
                 usage: "<name|id>",
                 summary: "pathfind to a zone-line (alias of `/pathto <name>`)",
+                handler: |c| parse_zoneto(c.rest, c.zone_id),
             },
-            HelpEntry {
+            Command {
                 aliases: &["navmesh"],
                 usage: "[on|off]",
                 summary: "toggle the navmesh debug overlay",
+                handler: |c| parse_navmesh(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["navinfo"],
                 usage: "",
                 summary: "report navmesh snap status at current position",
+                handler: |_| SlashOutcome::NavInfo,
             },
-            HelpEntry {
+            Command {
                 aliases: &["whereami", "pos"],
                 usage: "",
                 summary: "print self position and zone id",
+                handler: |c| {
+                    SlashOutcome::SystemMessage(format!(
+                        "self_pos: x={:.2} y={:.2} z={:.2}  zone={}",
+                        c.self_pos.x,
+                        c.self_pos.y,
+                        c.self_pos.z,
+                        c.zone_id.map_or("?".to_string(), |z| z.to_string()),
+                    ))
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["return", "homepoint", "hp"],
                 usage: "",
                 summary: "warp to home point (alive or dead)",
+                // Accept the homepoint warp menu — what the official client
+                // sends when the player picks "Return to home point" after
+                // dying. The warp fires regardless of death state; we don't
+                // gate locally because the agent harness wants exactly the
+                // wire-protocol contract.
+                handler: |_| SlashOutcome::Command(AgentCommand::ReturnToHomePoint),
             },
         ],
     ),
     (
         "Combat & Targeting",
         &[
-            HelpEntry {
+            Command {
                 aliases: &["attack", "engage"],
                 usage: "[name]",
                 summary: "engage target (reactor goal)",
+                // Reactor goal — matches the MCP `engage` tool's wire shape.
+                // For the legacy one-shot `ActionKind::Attack` semantics, see
+                // `/raw attack`.
+                handler: |c| match resolve_action_target(
+                    c.rest,
+                    c.entities,
+                    c.self_pos,
+                    c.current_target,
+                ) {
+                    Some((id, _idx)) => {
+                        SlashOutcome::Command(AgentCommand::Engage { target_id: id })
+                    }
+                    None => SlashOutcome::SystemMessage(format!("/{}: no target", c.cmd)),
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["disengage"],
                 usage: "",
                 summary: "clear active reactor goal",
+                // Clears the active reactor goal (the agent uses `cancel` to
+                // stop attacking). The low-level wire `Action::AttackOff` is
+                // available as `/raw attackoff`.
+                handler: |_| SlashOutcome::Command(AgentCommand::Cancel),
             },
-            HelpEntry {
+            Command {
                 aliases: &["attackoff"],
                 usage: "",
                 summary: "one-shot attack-off packet on current target",
+                handler: |c| match c.current_target {
+                    Some(id) => match c.entities.iter().find(|e| e.id == id) {
+                        Some(ent) => SlashOutcome::Command(AgentCommand::Action {
+                            target_id: ent.id,
+                            target_index: ent.act_index,
+                            kind: ActionKind::AttackOff,
+                        }),
+                        None => {
+                            SlashOutcome::SystemMessage(format!("/{}: target not in zone", c.cmd))
+                        }
+                    },
+                    None => SlashOutcome::SystemMessage(format!("/{}: no target", c.cmd)),
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["assist"],
                 usage: "[name]",
                 summary: "assist target (inherit their target)",
+                handler: |c| match resolve_action_target(
+                    c.rest,
+                    c.entities,
+                    c.self_pos,
+                    c.current_target,
+                ) {
+                    Some((id, idx)) => SlashOutcome::Command(AgentCommand::Action {
+                        target_id: id,
+                        target_index: idx,
+                        kind: ActionKind::Assist,
+                    }),
+                    None => SlashOutcome::SystemMessage("/assist: no target".into()),
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["target"],
                 usage: "[name]",
                 summary: "set or clear current target",
+                handler: |c| {
+                    if c.rest.is_empty() {
+                        SlashOutcome::SetTarget(None)
+                    } else {
+                        match resolve_name(c.rest, c.entities, c.self_pos) {
+                            Some(ent) => SlashOutcome::SetTarget(Some(ent.id)),
+                            None => SlashOutcome::SystemMessage(format!(
+                                "/target: no entity '{}'",
+                                c.rest
+                            )),
+                        }
+                    }
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["targetnpc", "targetnpc2"],
                 usage: "",
                 summary: "cycle nearest NPC/mob/pet (targetnpc2 cycles in reverse)",
+                // Retail `/targetnpc`: cycle the nearest non-PC by 3D distance.
+                // Pet entities included. `/targetnpc2` walks the same pool
+                // backward.
+                handler: |c| {
+                    let reverse = c.cmd == "targetnpc2";
+                    let kinds = [
+                        ffxi_viewer_wire::EntityKind::Npc,
+                        ffxi_viewer_wire::EntityKind::Mob,
+                        ffxi_viewer_wire::EntityKind::Pet,
+                    ];
+                    match cycle_kind_filtered(
+                        c.entities,
+                        c.self_pos,
+                        c.current_target,
+                        &kinds,
+                        reverse,
+                    ) {
+                        Some(id) => SlashOutcome::SetTarget(Some(id)),
+                        None => SlashOutcome::SystemMessage(format!("/{}: no NPC nearby", c.cmd)),
+                    }
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["targetenemy"],
                 usage: "",
                 summary: "cycle nearest enemy (mobs only)",
+                // Mobs only — skips friendly NPCs even if closer, so the
+                // operator can punch through a vendor crowd to the aggro target.
+                handler: |c| {
+                    let kinds = [ffxi_viewer_wire::EntityKind::Mob];
+                    match cycle_kind_filtered(
+                        c.entities,
+                        c.self_pos,
+                        c.current_target,
+                        &kinds,
+                        false,
+                    ) {
+                        Some(id) => SlashOutcome::SetTarget(Some(id)),
+                        None => SlashOutcome::SystemMessage("/targetenemy: no enemy nearby".into()),
+                    }
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["targetnpcparty"],
                 usage: "",
                 summary: "cycle owned party NPCs (trusts/fellows/pets)",
+                // Best-effort filter — claim_id == self_char_id picks up pets
+                // and trusts the server attributes them to the player.
+                handler: |c| {
+                    let owner = c.self_char_id.unwrap_or(0);
+                    let owned: Vec<&WireEntity> = c
+                        .entities
+                        .iter()
+                        .filter(|e| {
+                            matches!(e.kind, ffxi_viewer_wire::EntityKind::Pet)
+                                && e.claim_id == owner
+                        })
+                        .collect();
+                    let ids: Vec<u32> = {
+                        let mut sorted = owned.clone();
+                        sorted.sort_by(|a, b| {
+                            let da = sq_dist(a.pos, c.self_pos);
+                            let db = sq_dist(b.pos, c.self_pos);
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        sorted.into_iter().map(|e| e.id).collect()
+                    };
+                    if ids.is_empty() {
+                        SlashOutcome::SystemMessage("/targetnpcparty: no party NPCs".into())
+                    } else {
+                        let next = match c
+                            .current_target
+                            .and_then(|id| ids.iter().position(|x| *x == id))
+                        {
+                            Some(i) => ids[(i + 1) % ids.len()],
+                            None => ids[0],
+                        };
+                        SlashOutcome::SetTarget(Some(next))
+                    }
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &[
                     "targetparty1",
                     "targetparty2",
@@ -164,303 +358,477 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
                 ],
                 usage: "",
                 summary: "target party slot 1-6 (slot 1 = self)",
+                // slot 1 = self, slots 2..6 = party members in insertion order
+                // (the best the wire gives us — the server's slot index isn't
+                // broadcast separately).
+                handler: |c| {
+                    let slot = c
+                        .cmd
+                        .strip_prefix("targetparty")
+                        .and_then(|s| s.parse::<u8>().ok())
+                        .unwrap_or(0);
+                    match resolve_party_slot(slot, c.self_char_id, c.party) {
+                        Some(id) => SlashOutcome::SetTarget(Some(id)),
+                        None => SlashOutcome::SystemMessage(format!("/{}: slot empty", c.cmd)),
+                    }
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["debug", "dbg", "nearby", "entities"],
                 usage: "[name|id|heights]",
                 summary: "dump current target + nearby entities (or one entity in detail)",
+                handler: |c| parse_debug(c.rest, c.entities, c.self_pos, c.current_target),
             },
-            HelpEntry {
+            Command {
                 aliases: &["check", "checkname", "checkparam"],
                 usage: "[name]",
                 summary: "check target — strength / name / parameters",
+                handler: |c| match resolve_action_target(
+                    c.rest,
+                    c.entities,
+                    c.self_pos,
+                    c.current_target,
+                ) {
+                    Some((id, idx)) => SlashOutcome::Command(AgentCommand::CheckTarget {
+                        target_id: id,
+                        target_index: idx,
+                        kind: match c.cmd {
+                            "checkname" => CheckKind::CheckName,
+                            "checkparam" => CheckKind::CheckParam,
+                            _ => CheckKind::Check,
+                        },
+                    }),
+                    None => SlashOutcome::SystemMessage(format!("/{}: no target", c.cmd)),
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["cast"],
                 usage: "<spell> [target]",
                 summary: "cast a spell",
+                handler: |c| parse_cast(c.rest, c.entities, c.self_pos, c.current_target),
             },
-            HelpEntry {
+            Command {
                 aliases: &["ws", "weaponskill"],
                 usage: "<name> [target]",
                 summary: "weapon skill",
+                handler: |c| parse_weaponskill(c.rest, c.entities, c.self_pos, c.current_target),
             },
-            HelpEntry {
+            Command {
                 aliases: &["ja", "jobability"],
                 usage: "<name> [target]",
                 summary: "job ability",
+                handler: |c| parse_job_ability(c.rest, c.entities, c.self_pos, c.current_target),
             },
-            HelpEntry {
+            Command {
                 aliases: &["useitem", "use"],
                 usage: "<name> [target]",
                 summary: "use an item",
+                handler: |c| parse_use_item(c.rest, c.entities, c.self_pos, c.current_target),
             },
-            HelpEntry {
+            Command {
                 aliases: &["magic"],
                 usage: "",
                 summary: "open the Magic menu (no-arg form; with args use /ma)",
+                // No-arg opens the menu; the action form (`/ma`) covers
+                // <name> [target]. With args, falls through to "unknown" just
+                // as the old guarded match arm did.
+                handler: |c| {
+                    if c.rest.is_empty() {
+                        SlashOutcome::OpenMenu(MenuKind::Magic)
+                    } else {
+                        unknown_command(c.cmd)
+                    }
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["abilities", "abi"],
                 usage: "",
                 summary: "open the Abilities menu (no-arg form; with args use /ja)",
+                handler: |c| {
+                    if c.rest.is_empty() {
+                        SlashOutcome::OpenMenu(MenuKind::Abilities)
+                    } else {
+                        unknown_command(c.cmd)
+                    }
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["items"],
                 usage: "",
                 summary: "open the Items menu (no-arg form; with args use /useitem)",
+                handler: |c| {
+                    if c.rest.is_empty() {
+                        SlashOutcome::OpenMenu(MenuKind::Items)
+                    } else {
+                        unknown_command(c.cmd)
+                    }
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["equipment", "equip"],
                 usage: "[slot item]",
                 summary: "no-arg form opens Equipment menu; <slot> <item> equips directly (Stage 4)",
+                // No-arg (either alias) opens the menu. `/equip <slot> <item>`
+                // is reserved for the Stage-4 direct-equip action and reports
+                // "not yet wired"; `/equipment <args>` has no such form and
+                // falls through to "unknown", matching the old guarded arms.
+                handler: |c| {
+                    if c.rest.is_empty() {
+                        SlashOutcome::OpenMenu(MenuKind::Equipment)
+                    } else if c.cmd == "equip" {
+                        SlashOutcome::SystemMessage(
+                            "/equip <slot> <item>: not yet wired (Stage 4); /equip with no args opens the Equipment menu".into(),
+                        )
+                    } else {
+                        unknown_command(c.cmd)
+                    }
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["cancel"],
                 usage: "",
                 summary: "cancel current reactor goal / action",
+                handler: |_| SlashOutcome::Command(AgentCommand::Cancel),
             },
-            HelpEntry {
+            Command {
                 aliases: &["raw"],
                 usage: "<attack|attackoff> [name]",
                 summary: "low-level Action packet (bypasses reactor)",
+                // Low-level escape hatch: sends the underlying one-shot
+                // `Action` packet, bypassing the reactor. For wire-level
+                // debugging when the operator wants the pre-Stage-4 behavior.
+                handler: |c| parse_raw(c.rest, c.entities, c.self_pos, c.current_target),
             },
         ],
     ),
     (
         "Chat",
         &[
-            HelpEntry {
+            Command {
                 aliases: &["s", "say"],
                 usage: "<text>",
                 summary: "say (local chat)",
+                handler: |c| chat_or_empty(c.rest, 0, "/s"),
             },
-            HelpEntry {
+            Command {
                 aliases: &["p", "party"],
                 usage: "<text>",
                 summary: "party chat",
+                handler: |c| chat_or_empty(c.rest, 4, "/p"),
             },
-            HelpEntry {
+            Command {
                 aliases: &["sh", "shout"],
                 usage: "<text>",
                 summary: "shout chat",
+                handler: |c| chat_or_empty(c.rest, 1, "/sh"),
             },
-            HelpEntry {
+            Command {
                 aliases: &["l", "ls", "linkshell"],
                 usage: "<text>",
                 summary: "linkshell chat",
+                handler: |c| chat_or_empty(c.rest, 5, "/l"),
             },
-            HelpEntry {
+            Command {
                 aliases: &["t", "tell"],
                 usage: "<name> <text>",
                 summary: "tell another player",
+                handler: |c| parse_tell(c.rest),
             },
         ],
     ),
     (
         "Status & Menus",
         &[
-            HelpEntry {
+            Command {
                 aliases: &["sit", "kneel"],
                 usage: "[on|off]",
                 summary: "sit (locks movement; any movement key stands)",
+                // Pure client-side affordance: lock the local avatar in the
+                // sit pose and refuse outbound Move packets until a movement
+                // key clears the stance. `on`/`off` are explicit; bare toggles.
+                handler: |c| parse_sit(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["stand"],
                 usage: "",
                 summary: "stand (clear any rest stance)",
+                handler: |_| SlashOutcome::SetSitStance(SitToggle::Off),
             },
-            HelpEntry {
+            Command {
                 aliases: &["heal"],
                 usage: "[on|off]",
                 summary: "toggle resting (CAMP)",
+                // Toggle is the always-safe default; explicit on/off give
+                // deterministic control but the server rejects a mismatch.
+                // Movement implicitly cancels via the keepalive interceptor.
+                handler: |c| parse_heal(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["raisemenu"],
                 usage: "<option>",
                 summary: "respond to raise dialog",
+                handler: |c| parse_raise_menu(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["tractormenu"],
                 usage: "<option>",
                 summary: "respond to tractor dialog",
+                handler: |c| parse_tractor_menu(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["homepointmenu"],
                 usage: "<option>",
                 summary: "respond to homepoint dialog",
+                handler: |c| parse_homepoint_menu(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["endevent", "endevt", "clearevent", "clearevt"],
                 usage: "",
                 summary: "flush pending NPC events (unblock /logout)",
+                // Flush every `pending_event_end` entry as a 0x05B EVENT_END
+                // subpacket. Primary use: clear `BlockedState::InEvent` so
+                // /logout can succeed. No-op when nothing is pending.
+                handler: |_| SlashOutcome::Command(AgentCommand::EndEvent),
             },
-            HelpEntry {
+            Command {
                 aliases: &["endcutscene", "endcs", "skipcutscene", "skipcs"],
                 usage: "[csid]",
                 summary: "end a forced cutscene (new-char intro, etc.)",
+                // Escape a forced cutscene the client never registered in
+                // `pending_event_end`. Without an arg, looks up the CSID from
+                // the current zone; with one, trusts the operator's value.
+                handler: |c| parse_endcutscene(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["release", "unwedge"],
                 usage: "",
                 summary: "server-side !release: forcibly end any pinned event (gmlevel>=1)",
+                // Emit the LSB GM command `!release` as chat. Server-side
+                // `release.lua` runs `endCurrentEvent()`, unblocking
+                // `BlockedState::InEvent`. Requires gmlevel >= 1. The heavy
+                // hammer when `/endcutscene` can't resolve the right CSID.
+                handler: |_| {
+                    SlashOutcome::Command(AgentCommand::Chat {
+                        kind: 0,
+                        text: "!release".into(),
+                    })
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["buy"],
                 usage: "<row> [qty]",
                 summary: "buy from open shop by row index",
+                handler: |c| parse_buy(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["bank"],
                 usage: "<subcommand>",
                 summary: "gil-bank operations",
+                handler: |c| parse_bank(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["minimap", "mm"],
                 usage: "[show|hide|toggle|mode <top|retail|auto>|cull <N>|zoom ...]",
                 summary: "drive the minimap HUD (visibility, backend, cull, zoom)",
+                handler: |c| parse_minimap(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["sound", "audio", "mute"],
                 usage: "[on|off|toggle|status] [bgm|sfx]",
                 summary: "bare /sound toggles all audio; survives logout",
+                handler: |c| parse_sound(c.rest),
             },
         ],
     ),
     (
         "Session",
         &[
-            HelpEntry {
+            Command {
                 aliases: &["logout"],
                 usage: "[on|off]",
                 summary: "request logout (30s LeaveGame timer)",
+                // In-world request that arms the server's LeaveGame effect
+                // (30s for normal players, immediate for GMs / Mog Houses).
+                // Toggles by default; on/off arm or cancel explicitly.
+                handler: |c| parse_reqlogout(c.rest, /* shutdown = */ false),
             },
-            HelpEntry {
+            Command {
                 aliases: &["shutdown"],
                 usage: "[on|off]",
                 summary: "request shutdown (LeaveGame, then close)",
+                handler: |c| parse_reqlogout(c.rest, /* shutdown = */ true),
             },
-            HelpEntry {
+            Command {
                 aliases: &["exit"],
                 usage: "",
                 summary: "polite logout + close window",
+                // Courteous variant: tell the server we're logging out (so it
+                // runs normal cleanup) AND close the window immediately.
+                // Distinct from /logout (window stays open during countdown)
+                // and /quit (no server notification).
+                handler: |_| SlashOutcome::QuitWithLogout(ReqLogoutKind::LogoutOn),
             },
-            HelpEntry {
+            Command {
                 aliases: &["disconnect", "quit"],
                 usage: "",
                 summary: "drop the connection immediately",
+                // Skip the in-world LeaveGame timer and just drop the sockets.
+                handler: |_| SlashOutcome::Quit,
             },
         ],
     ),
     (
         "Debug & Tooling",
         &[
-            HelpEntry {
+            Command {
                 aliases: &["snapshot"],
                 usage: "",
                 summary: "emit a one-shot scene snapshot",
+                handler: |_| SlashOutcome::Command(AgentCommand::Snapshot),
             },
-            HelpEntry {
+            Command {
                 aliases: &["zonechange", "rzc"],
                 usage: "<id>",
                 summary: "request zone change (debug)",
+                handler: |c| parse_zone_change(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["mhexit"],
                 usage: "[home|1f|2f|garden|<region> [slot]]",
                 summary: "leave the current Mog House (sends 0x05E zmrq)",
+                handler: |c| parse_mhexit(c.rest, c.zone_id),
             },
-            HelpEntry {
+            Command {
                 aliases: &["agent"],
                 usage: "<pause|resume|status>",
                 summary: "human-in-control flag for agent commands",
+                handler: |c| parse_agent(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["keybinds", "keybind", "binds"],
                 usage: "<preset|list|reset>",
                 summary: "manage keybind presets",
+                handler: |c| parse_keybinds(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["load_mmb", "loadmmb"],
                 usage: "<file_id> <chunk_idx>",
                 summary: "spawn MMB model at self_pos (debug overlay)",
+                handler: |c| parse_load_mmb(c.rest, c.self_pos),
             },
-            HelpEntry {
+            Command {
                 aliases: &["load_mmb_on", "loadmmbon"],
                 usage: "<entity_id> <file_id> <chunk_idx>",
                 summary: "attach MMB model under a tracked entity (debug)",
+                handler: |c| parse_load_mmb_on(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["load_mzb", "loadmzb"],
                 usage: "<file_id> [chunk_idx]",
                 summary: "load MZB mesh-library at self_pos (debug overlay)",
+                handler: |c| parse_load_mzb(c.rest, c.self_pos),
             },
-            HelpEntry {
+            Command {
                 aliases: &["fps"],
                 usage: "<max>",
                 summary: "set target frame rate",
+                handler: |c| parse_fps(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["capture"],
                 usage: "[on|off|toggle]",
-                summary:
-                    "screen-capture-friendly mode (disables framepace; avoids QuickTime lockup)",
+                summary: "screen-capture-friendly mode (disables framepace; avoids QuickTime lockup)",
+                handler: |c| parse_capture(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["screenshot", "ss"],
                 usage: "[path.png]",
                 summary: "capture primary window to PNG (default: screenshot-N.png in CWD)",
+                handler: |c| parse_screenshot(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["drawdistance", "dd"],
                 usage: "[setworld|setmob] [N]",
                 summary: "set draw distance",
+                handler: |c| parse_drawdistance(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["copy"],
                 usage: "[n]",
                 summary: "copy the last n system-toast lines to the clipboard (default 1)",
+                // `/copy` => n=1; `/copy N` => n=N (positive integer). Anything
+                // else falls through to a parse-error toast rather than
+                // silently copying the wrong amount.
+                handler: |c| {
+                    if c.rest.is_empty() {
+                        SlashOutcome::CopyToasts { n: 1 }
+                    } else {
+                        match c.rest.parse::<usize>() {
+                            Ok(n) if n > 0 => SlashOutcome::CopyToasts { n },
+                            _ => SlashOutcome::SystemMessage(format!(
+                                "/copy: expected a positive integer, got `{}`",
+                                c.rest
+                            )),
+                        }
+                    }
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["bgm"],
                 usage: "<track_id>",
                 summary: "audition a BGM track id (synthetic 0x05F slot 0)",
+                handler: |c| match c.rest.parse::<u16>() {
+                    Ok(id) => SlashOutcome::PlayBgm { track_id: id },
+                    Err(_) => SlashOutcome::SystemMessage("/bgm <track_id>".into()),
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["sfx"],
                 usage: "<se_id>",
                 summary: "fire a one-shot SE by numeric id",
+                handler: |c| match c.rest.parse::<u32>() {
+                    Ok(id) => SlashOutcome::PlaySfx { se_id: id },
+                    Err(_) => SlashOutcome::SystemMessage("/sfx <se_id>".into()),
+                },
             },
-            HelpEntry {
+            Command {
                 aliases: &["look"],
                 usage: "[name|act_index]",
                 summary: "print decoded LookData (race/gear) for an entity",
+                handler: |c| parse_look(c.rest, c.entities, c.self_pos, c.current_target),
             },
-            HelpEntry {
+            Command {
                 aliases: &["zonegeom"],
                 usage: "[off|collision|all|toggle]",
                 summary: "MZB overlay visibility (collision-only vs decorative)",
+                handler: |c| parse_zonegeom(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["weather"],
                 usage: "<id|name>",
-                summary:
-                    "client-side weather override (e.g. `rain`, `none`, `12`); lasts until the next server WEATHER packet",
+                summary: "client-side weather override (e.g. `rain`, `none`, `12`); lasts until the next server WEATHER packet",
+                // Writes directly to the local snapshot so the visual FX flip
+                // immediately without a server round-trip. Naturally reverts on
+                // the next server 0x057 WEATHER packet.
+                handler: |c| parse_weather(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["devhud"],
                 usage: "[on|off|toggle]",
                 summary: "developer telemetry overlays (stage bar, agent goal, etc.)",
+                handler: |c| parse_devhud(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["sky"],
                 usage: "[<feature> [on|off|toggle]]",
                 summary: "toggle sky realism features (reddening / dimming / illusion / earthshine / realmoon / eclipses); bare `/sky` lists state",
+                handler: |c| parse_sky(c.rest),
             },
-            HelpEntry {
+            Command {
                 aliases: &["lights", "lanterns"],
                 usage: "[on|off | threshold N | intensity N | range N | flicker on|off]",
                 summary: "tune dynamic lantern/fire lights (from over-bright vertices); bare `/lights` lists state",
+                handler: |c| parse_lights(c.rest),
             },
         ],
     ),
@@ -471,7 +839,7 @@ const HELP_CATEGORIES: &[(&str, &[HelpEntry])] = &[
 /// long lines at render time so no column-padding is needed.
 fn render_help() -> String {
     let mut out = String::from("=== Slash command reference ===");
-    for (category, entries) in HELP_CATEGORIES {
+    for (category, entries) in COMMANDS {
         out.push_str("\n[");
         out.push_str(category);
         out.push(']');
@@ -882,328 +1250,31 @@ pub fn parse_slash(
     let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
     let rest = parts.next().unwrap_or("").trim();
 
-    match cmd.as_str() {
-        "follow" => match resolve_target_or_current(rest, entities, self_pos, current_target) {
-            Some(id) => SlashOutcome::Command(AgentCommand::Follow {
-                target_id: id,
-                distance: 3.0,
-            }),
-            None => SlashOutcome::SystemMessage("/follow: no target".into()),
-        },
-        "attack" | "engage" => {
-            // Reactor goal — matches the MCP `engage` tool's wire shape.
-            // `spawn_session_with_reactor` (`lib.rs:92`) wires the reactor
-            // in front of `cmd_rx` for the native viewer, so goal commands
-            // are absorbed by the per-tick state machine. For the legacy
-            // one-shot `ActionKind::Attack` semantics, see `/raw attack`.
-            match resolve_action_target(rest, entities, self_pos, current_target) {
-                Some((id, _idx)) => SlashOutcome::Command(AgentCommand::Engage { target_id: id }),
-                None => SlashOutcome::SystemMessage(format!("/{cmd}: no target")),
-            }
-        }
-        // `/disengage` clears the active reactor goal (matching the lack
-        // of a dedicated `disengage` MCP tool — the agent uses `cancel`
-        // to stop attacking). The low-level wire `Action::AttackOff` is
-        // available as `/raw attackoff` when the operator specifically
-        // wants the one-shot packet.
-        "disengage" => SlashOutcome::Command(AgentCommand::Cancel),
-        "attackoff" => match current_target {
-            Some(id) => match entities.iter().find(|e| e.id == id) {
-                Some(ent) => SlashOutcome::Command(AgentCommand::Action {
-                    target_id: ent.id,
-                    target_index: ent.act_index,
-                    kind: ActionKind::AttackOff,
-                }),
-                None => SlashOutcome::SystemMessage(format!("/{cmd}: target not in zone")),
-            },
-            None => SlashOutcome::SystemMessage(format!("/{cmd}: no target")),
-        },
-        // Low-level escape hatch: `/raw <action>` sends the underlying
-        // one-shot `Action` packet, bypassing the reactor. Use for
-        // wire-level debugging when the operator specifically wants the
-        // pre-Stage-4 behavior. Currently supports `attack` and
-        // `attackoff`; `move` would also belong here but `/move` is
-        // already keybind-driven so there's no slash-form pressure yet.
-        "raw" => parse_raw(rest, entities, self_pos, current_target),
-        "target" => {
-            if rest.is_empty() {
-                SlashOutcome::SetTarget(None)
-            } else {
-                match resolve_name(rest, entities, self_pos) {
-                    Some(ent) => SlashOutcome::SetTarget(Some(ent.id)),
-                    None => SlashOutcome::SystemMessage(format!("/target: no entity '{rest}'")),
-                }
-            }
-        }
-        // Retail `/targetnpc`: cycle the nearest non-PC by 3D distance.
-        // Pet entities included (trusts/jugs/avatars are addressable as
-        // "NPCs" in the retail sense). `/targetnpc2` is the reverse-
-        // direction variant — same pool, walked backward.
-        "targetnpc" | "targetnpc2" => {
-            let reverse = cmd == "targetnpc2";
-            let kinds = [
-                ffxi_viewer_wire::EntityKind::Npc,
-                ffxi_viewer_wire::EntityKind::Mob,
-                ffxi_viewer_wire::EntityKind::Pet,
-            ];
-            match cycle_kind_filtered(entities, self_pos, current_target, &kinds, reverse) {
-                Some(id) => SlashOutcome::SetTarget(Some(id)),
-                None => SlashOutcome::SystemMessage(format!("/{cmd}: no NPC nearby")),
-            }
-        }
-        // Retail `/targetenemy`: mobs only. Skips friendly NPCs even if
-        // closer, so the operator can punch through a vendor crowd to
-        // grab the aggro target.
-        "targetenemy" => {
-            let kinds = [ffxi_viewer_wire::EntityKind::Mob];
-            match cycle_kind_filtered(entities, self_pos, current_target, &kinds, false) {
-                Some(id) => SlashOutcome::SetTarget(Some(id)),
-                None => SlashOutcome::SystemMessage("/targetenemy: no enemy nearby".into()),
-            }
-        }
-        // Retail `/targetnpcparty`: trusts/fellows the player owns.
-        // Best-effort filter — claim_id == self_char_id picks up pets
-        // and trusts the server attributes to the player. If LSB uses
-        // a different signal for fellow NPCs, this gets refined later.
-        "targetnpcparty" => {
-            let owner = self_char_id.unwrap_or(0);
-            let owned: Vec<&WireEntity> = entities
-                .iter()
-                .filter(|e| {
-                    matches!(e.kind, ffxi_viewer_wire::EntityKind::Pet) && e.claim_id == owner
-                })
-                .collect();
-            // Reuse the same nearest+cycle pattern, but on a pre-filtered list.
-            let ids: Vec<u32> = {
-                let mut sorted = owned.clone();
-                sorted.sort_by(|a, b| {
-                    let da = sq_dist(a.pos, self_pos);
-                    let db = sq_dist(b.pos, self_pos);
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                sorted.into_iter().map(|e| e.id).collect()
-            };
-            if ids.is_empty() {
-                SlashOutcome::SystemMessage("/targetnpcparty: no party NPCs".into())
-            } else {
-                let next = match current_target.and_then(|id| ids.iter().position(|x| *x == id)) {
-                    Some(i) => ids[(i + 1) % ids.len()],
-                    None => ids[0],
-                };
-                SlashOutcome::SetTarget(Some(next))
-            }
-        }
-        // Retail `/targetparty1..6`: slot 1 = self, slots 2..6 = party
-        // members in insertion order (the best the wire gives us — the
-        // server's actual slot index isn't broadcast separately, so a
-        // freshly-joined member may "shift" pre-existing ones until the
-        // next party refresh).
-        "targetparty1" | "targetparty2" | "targetparty3" | "targetparty4" | "targetparty5"
-        | "targetparty6" => {
-            let slot = cmd
-                .strip_prefix("targetparty")
-                .and_then(|s| s.parse::<u8>().ok())
-                .unwrap_or(0);
-            match resolve_party_slot(slot, self_char_id, party) {
-                Some(id) => SlashOutcome::SetTarget(Some(id)),
-                None => SlashOutcome::SystemMessage(format!("/{cmd}: slot empty")),
-            }
-        }
-        "assist" => match resolve_action_target(rest, entities, self_pos, current_target) {
-            Some((id, idx)) => SlashOutcome::Command(AgentCommand::Action {
-                target_id: id,
-                target_index: idx,
-                kind: ActionKind::Assist,
-            }),
-            None => SlashOutcome::SystemMessage("/assist: no target".into()),
-        },
-        "check" | "checkname" | "checkparam" => {
-            match resolve_action_target(rest, entities, self_pos, current_target) {
-                Some((id, idx)) => SlashOutcome::Command(AgentCommand::CheckTarget {
-                    target_id: id,
-                    target_index: idx,
-                    kind: match cmd.as_str() {
-                        "checkname" => CheckKind::CheckName,
-                        "checkparam" => CheckKind::CheckParam,
-                        _ => CheckKind::Check,
-                    },
-                }),
-                None => SlashOutcome::SystemMessage(format!("/{cmd}: no target")),
-            }
-        }
-        "buy" => parse_buy(rest),
-        // `/sit` / `/kneel` — retail aliases for the sit rest pose. Pure
-        // client-side affordance: lock the local self avatar in the
-        // sit MO2 and refuse to emit outbound `Move` packets until a
-        // movement key clears the stance (retail-style stand-on-first-
-        // input). `/sit on` / `/sit off` are explicit setters; bare
-        // `/sit` toggles.
-        "sit" | "kneel" => parse_sit(rest),
-        "stand" => SlashOutcome::SetSitStance(SitToggle::Off),
-        "bgm" => match rest.parse::<u16>() {
-            Ok(id) => SlashOutcome::PlayBgm { track_id: id },
-            Err(_) => SlashOutcome::SystemMessage("/bgm <track_id>".into()),
-        },
-        "sfx" => match rest.parse::<u32>() {
-            Ok(id) => SlashOutcome::PlaySfx { se_id: id },
-            Err(_) => SlashOutcome::SystemMessage("/sfx <se_id>".into()),
-        },
-        "cancel" => SlashOutcome::Command(AgentCommand::Cancel),
-        // ---- Stage 4 lockstep: every MCP tool has a slash twin -----------
-        // The MCP `cast` / `weaponskill` / `job_ability` tools wrap the same
-        // `Action { ActionKind::* }` shape — slash twins dispatch the
-        // identical AgentCommand. `slash_mcp_lockstep.rs` pins this.
-        "cast" => parse_cast(rest, entities, self_pos, current_target),
-        "ws" | "weaponskill" => parse_weaponskill(rest, entities, self_pos, current_target),
-        "ja" | "jobability" => parse_job_ability(rest, entities, self_pos, current_target),
-        "useitem" | "use" => parse_use_item(rest, entities, self_pos, current_target),
-        // Retail-style "open the X menu" no-arg slashes. The action
-        // forms (cast / ja / useitem above) already cover the
-        // <name> [target] use case; these just push the visible menu.
-        "magic" if rest.is_empty() => SlashOutcome::OpenMenu(MenuKind::Magic),
-        "abilities" | "abi" if rest.is_empty() => SlashOutcome::OpenMenu(MenuKind::Abilities),
-        "items" if rest.is_empty() => SlashOutcome::OpenMenu(MenuKind::Items),
-        // `/equip` (no args) opens the Equipment menu. `/equip <slot> <item>`
-        // is reserved for the direct-equip action wired in Stage 4; until
-        // then, equip-with-args falls through to "not yet wired".
-        "equipment" if rest.is_empty() => SlashOutcome::OpenMenu(MenuKind::Equipment),
-        "equip" if rest.is_empty() => SlashOutcome::OpenMenu(MenuKind::Equipment),
-        "equip" => SlashOutcome::SystemMessage(
-            "/equip <slot> <item>: not yet wired (Stage 4); /equip with no args opens the Equipment menu".into(),
-        ),
-        "raisemenu" => parse_raise_menu(rest),
-        "tractormenu" => parse_tractor_menu(rest),
-        "homepointmenu" => parse_homepoint_menu(rest),
-        "snapshot" => SlashOutcome::Command(AgentCommand::Snapshot),
-        // `/endevent` — flush every `pending_event_end` entry as a 0x05B
-        // EVENT_END subpacket. Session loop drains the list
-        // (`session.rs::AgentCommand::EndEvent`); we just provide a slash
-        // surface. Primary use: clear `BlockedState::InEvent` so /logout
-        // can succeed. No-op when nothing is pending.
-        "endevent" | "endevt" | "clearevent" | "clearevt" => {
-            SlashOutcome::Command(AgentCommand::EndEvent)
-        }
-        // `/endcutscene [csid]` — escape a forced cutscene the client
-        // never registered in `pending_event_end` (new-character
-        // openings, `onZoneIn` cinematics). Without an arg the parser
-        // tries to look up the CSID from the current zone; with one it
-        // trusts the operator's value.
-        "endcutscene" | "endcs" | "skipcutscene" | "skipcs" => parse_endcutscene(rest),
-        // `/release` (alias `/unwedge`) — emit the LSB GM command
-        // `!release` as chat. Server-side `release.lua` calls
-        // `player:release()` which runs `endCurrentEvent()` and clears
-        // `currentEvent`, unblocking `BlockedState::InEvent`. Requires
-        // `gmlevel >= 1`. Use as the heavy hammer when `/endcutscene`
-        // can't resolve the right CSID (e.g. in-session events the
-        // client never saw because of a packet drop). The server
-        // intercepts `!`-prefixed chat *before* it routes to Say, so
-        // this doesn't leak the command into the chat channel.
-        "release" | "unwedge" => SlashOutcome::Command(AgentCommand::Chat {
-            kind: 0,
-            text: "!release".into(),
-        }),
-        // `/weather <id|name>` — client-side weather override. Writes
-        // directly to the local snapshot/`CurrentWeather` resource so
-        // the visual FX (particles, fog, sun modulation) flip
-        // immediately without a server round-trip. No GM requirement,
-        // and `none` actually clears (the LSB `!setweather` early-
-        // returns when the zone's already at the requested weather).
-        // Naturally reverts on the next server 0x057 WEATHER packet —
-        // same lifetime as the GM command had server-side.
-        "weather" => parse_weather(rest),
-        "bank" => parse_bank(rest),
-        "zonechange" | "rzc" => parse_zone_change(rest),
-        "mhexit" => parse_mhexit(rest, zone_id),
-        "agent" => parse_agent(rest),
-        // `/disconnect` and `/quit` skip the in-world LeaveGame timer
-        // and just drop the TCP/UDP sockets. Distinct from `/logout` —
-        // the operator chose to abandon the session, not to politely
-        // return to char-select.
-        "disconnect" | "quit" => SlashOutcome::Quit,
-        // `/exit` is the courteous variant: tell the server we're
-        // logging out (so it runs its normal status-effect cleanup /
-        // session-end paths) AND close the window immediately. Distinct
-        // from `/logout` (which leaves the window open during the 30s
-        // countdown) and from `/quit` (which doesn't notify the server).
-        "exit" => SlashOutcome::QuitWithLogout(ReqLogoutKind::LogoutOn),
-        // `/logout` and `/shutdown`: in-world request that arms the
-        // server's LeaveGame effect (30s countdown for normal players,
-        // immediate for GMs and inside Mog Houses). Toggles by default;
-        // `on`/`off` arguments arm or cancel explicitly.
-        "logout" => parse_reqlogout(rest, /* shutdown = */ false),
-        // `/heal` — toggle resting (`EFFECT_HEALING`). Default arg is
-        // Toggle, the always-safe form; explicit `on`/`off` give the
-        // operator deterministic control but the server rejects the
-        // packet when the mode mismatches the current state ("Requested
-        // healing when already healing" / "Requested stop healing when
-        // not healing"). Movement implicitly cancels — the session-loop
-        // keepalive interceptor prepends `0x0E8 Mode::Off` when the
-        // next tick's `self_pos` differs from the last keepalived one.
-        "heal" => parse_heal(rest),
-        "navmesh" => parse_navmesh(rest),
-        "load_mmb" | "loadmmb" => parse_load_mmb(rest, self_pos),
-        "load_mmb_on" | "loadmmbon" => parse_load_mmb_on(rest),
-        "load_mzb" | "loadmzb" => parse_load_mzb(rest, self_pos),
-        "look" => parse_look(rest, entities, self_pos, current_target),
-        "fps" => parse_fps(rest),
-        "capture" => parse_capture(rest),
-        "screenshot" | "ss" => parse_screenshot(rest),
-        "drawdistance" | "dd" => parse_drawdistance(rest),
-        "zonegeom" => parse_zonegeom(rest),
-        "devhud" => parse_devhud(rest),
-        "sky" => parse_sky(rest),
-        "lights" | "lanterns" => parse_lights(rest),
-        "minimap" | "mm" => parse_minimap(rest),
-        "sound" | "audio" | "mute" => parse_sound(rest),
-        "debug" | "dbg" | "nearby" | "entities" => {
-            parse_debug(rest, entities, self_pos, current_target)
-        }
-        "keybinds" | "keybind" | "binds" => parse_keybinds(rest),
-        "pathto" => parse_pathto(rest, entities, self_pos, current_target, zone_id),
-        "warp" => parse_warp(rest, entities, self_pos, current_target, zone_id),
-        "zones" => parse_zones(zone_id),
-        "zoneto" => parse_zoneto(rest, zone_id),
-        "navinfo" => SlashOutcome::NavInfo,
-        "whereami" | "pos" => SlashOutcome::SystemMessage(format!(
-            "self_pos: x={:.2} y={:.2} z={:.2}  zone={}",
-            self_pos.x,
-            self_pos.y,
-            self_pos.z,
-            zone_id.map_or("?".to_string(), |z| z.to_string()),
-        )),
-        "shutdown" => parse_reqlogout(rest, /* shutdown = */ true),
-        // Accept the homepoint warp menu — what the official FFXI client
-        // sends when the player picks "Return to home point" after dying.
-        // Phoenix sets `requestedWarp = true` and the zone-tick processes
-        // it via `charutils::HomePoint`. The warp fires regardless of
-        // death state — typing `/return` while alive will still HP-warp
-        // (with the dead-or-alive flavor passed by `PChar->isDead()`).
-        // We don't gate locally because the agent harness wants exactly
-        // the wire-protocol contract; gating would diverge from retail.
-        "return" | "homepoint" | "hp" => SlashOutcome::Command(AgentCommand::ReturnToHomePoint),
-        "p" | "party" => chat_or_empty(rest, 4, "/p"),
-        "sh" | "shout" => chat_or_empty(rest, 1, "/sh"),
-        "l" | "linkshell" | "ls" => chat_or_empty(rest, 5, "/l"),
-        "s" | "say" => chat_or_empty(rest, 0, "/s"),
-        "t" | "tell" => parse_tell(rest),
-        "copy" => {
-            // `/copy` => n=1; `/copy N` => n=N (positive integer).
-            // Anything else falls through to a parse-error toast rather
-            // than silently copying the wrong amount.
-            if rest.is_empty() {
-                SlashOutcome::CopyToasts { n: 1 }
-            } else {
-                match rest.parse::<usize>() {
-                    Ok(n) if n > 0 => SlashOutcome::CopyToasts { n },
-                    _ => SlashOutcome::SystemMessage(format!(
-                        "/copy: expected a positive integer, got `{rest}`"
-                    )),
-                }
-            }
-        }
-        "help" | "?" => SlashOutcome::SystemMessage(render_help()),
-        "" => SlashOutcome::SystemMessage("empty command".into()),
-        unknown => SlashOutcome::SystemMessage(format!("unknown command: /{unknown}")),
+    if cmd.is_empty() {
+        return SlashOutcome::SystemMessage("empty command".into());
+    }
+
+    let ctx = SlashCtx {
+        cmd: &cmd,
+        rest,
+        entities,
+        self_pos,
+        current_target,
+        zone_id,
+        self_char_id,
+        party,
+    };
+
+    // Single lookup over the registry. Because `Command` couples the
+    // handler to its `/help` metadata, dispatch and the help screen can
+    // never drift: there is no second list to keep in sync.
+    match COMMANDS
+        .iter()
+        .flat_map(|(_, cmds)| cmds.iter())
+        .find(|c| c.aliases.contains(&cmd.as_str()))
+    {
+        Some(command) => (command.handler)(&ctx),
+        None => unknown_command(&cmd),
     }
 }
 
@@ -1694,7 +1765,7 @@ fn parse_job_ability(
     let ability_id: u32 = match parts[0].parse() {
         Ok(n) => n,
         Err(_) => {
-            return SlashOutcome::SystemMessage(format!("/ja: bad ability_id `{}`", parts[0]))
+            return SlashOutcome::SystemMessage(format!("/ja: bad ability_id `{}`", parts[0]));
         }
     };
     // JAs default to self-target when no explicit target — but
@@ -1730,7 +1801,7 @@ fn parse_use_item(
     let container: u8 = match parts[0].parse() {
         Ok(n) => n,
         Err(_) => {
-            return SlashOutcome::SystemMessage(format!("/useitem: bad container `{}`", parts[0]))
+            return SlashOutcome::SystemMessage(format!("/useitem: bad container `{}`", parts[0]));
         }
     };
     let slot: u8 = match parts[1].parse() {
@@ -2684,7 +2755,7 @@ fn parse_drawdistance(rest: &str) -> SlashOutcome {
         _ => {
             return SlashOutcome::SystemMessage(format!(
                 "/drawdistance: bad value `{value_str}` (expected positive number)"
-            ))
+            ));
         }
     };
     match sub.as_str() {
@@ -2808,13 +2879,13 @@ fn parse_load_mmb(rest: &str, self_pos: WireVec3) -> SlashOutcome {
     let file_id: u32 = match file_str.parse() {
         Ok(n) => n,
         Err(_) => {
-            return SlashOutcome::SystemMessage(format!("/load_mmb: bad file_id `{file_str}`"))
+            return SlashOutcome::SystemMessage(format!("/load_mmb: bad file_id `{file_str}`"));
         }
     };
     let chunk_idx: usize = match chunk_str.parse() {
         Ok(n) => n,
         Err(_) => {
-            return SlashOutcome::SystemMessage(format!("/load_mmb: bad chunk_idx `{chunk_str}`"))
+            return SlashOutcome::SystemMessage(format!("/load_mmb: bad chunk_idx `{chunk_str}`"));
         }
     };
     SlashOutcome::LoadMmb {
@@ -2845,13 +2916,13 @@ fn parse_load_mmb_on(rest: &str) -> SlashOutcome {
         Err(_) => {
             return SlashOutcome::SystemMessage(format!(
                 "/load_mmb_on: bad entity_id `{entity_str}`"
-            ))
+            ));
         }
     };
     let file_id: u32 = match file_str.parse() {
         Ok(n) => n,
         Err(_) => {
-            return SlashOutcome::SystemMessage(format!("/load_mmb_on: bad file_id `{file_str}`"))
+            return SlashOutcome::SystemMessage(format!("/load_mmb_on: bad file_id `{file_str}`"));
         }
     };
     let chunk_idx: usize = match chunk_str.parse() {
@@ -2859,7 +2930,7 @@ fn parse_load_mmb_on(rest: &str) -> SlashOutcome {
         Err(_) => {
             return SlashOutcome::SystemMessage(format!(
                 "/load_mmb_on: bad chunk_idx `{chunk_str}`"
-            ))
+            ));
         }
     };
     SlashOutcome::LoadMmb {
@@ -2890,7 +2961,7 @@ fn parse_load_mzb(rest: &str, self_pos: WireVec3) -> SlashOutcome {
     let file_id: u32 = match file_str.parse() {
         Ok(n) => n,
         Err(_) => {
-            return SlashOutcome::SystemMessage(format!("/load_mzb: bad file_id `{file_str}`"))
+            return SlashOutcome::SystemMessage(format!("/load_mzb: bad file_id `{file_str}`"));
         }
     };
     let chunk_idx = match parts.next() {
@@ -2898,7 +2969,7 @@ fn parse_load_mzb(rest: &str, self_pos: WireVec3) -> SlashOutcome {
         Some(s) => match s.parse::<usize>() {
             Ok(n) => Some(n),
             Err(_) => {
-                return SlashOutcome::SystemMessage(format!("/load_mzb: bad chunk_idx `{s}`"))
+                return SlashOutcome::SystemMessage(format!("/load_mzb: bad chunk_idx `{s}`"));
             }
         },
     };
@@ -4688,7 +4759,7 @@ mod tests {
                         "{slash} missing header"
                     );
                     // Each category header should be present.
-                    for (category, _) in HELP_CATEGORIES {
+                    for (category, _) in COMMANDS {
                         assert!(
                             s.contains(category),
                             "{slash} output missing category `{category}`"
@@ -4703,24 +4774,23 @@ mod tests {
         }
     }
 
-    /// Drift guard: every alias listed in HELP_CATEGORIES must be a
-    /// command the parser actually accepts. If someone removes a
-    /// command from the match without updating the help table (or
-    /// adds an entry with a typo), this fails. We check by asserting
-    /// the parser does NOT return the "unknown command" SystemMessage
-    /// — any other outcome (Command, Commands, SystemMessage with a
-    /// usage line, ToggleNavmesh, etc.) counts as "known".
+    /// Self-consistency: every registered alias must dispatch to its own
+    /// handler rather than the "unknown command" fallthrough. With the
+    /// registry this is nearly tautological (lookup finds anything that
+    /// is registered), but it still catches a handler that rejects its
+    /// own bare alias — e.g. a menu command whose no-arg guard regressed.
     #[test]
-    fn help_entries_dispatch_known() {
-        for (_, entries) in HELP_CATEGORIES {
-            for entry in *entries {
-                for alias in entry.aliases {
+    fn every_alias_dispatches() {
+        for (_, cmds) in COMMANDS {
+            for cmd in *cmds {
+                for alias in cmd.aliases {
                     let slash = format!("/{alias}");
                     let out = parse_slash_t(&slash, &empty_entities(), origin(), None, None);
                     if let SlashOutcome::SystemMessage(ref s) = out {
                         assert!(
                             !s.starts_with("unknown command:"),
-                            "help entry `/{alias}` is not accepted by parse_slash (drift)"
+                            "registered alias `/{alias}` dispatched to the unknown-command \
+                             fallthrough"
                         );
                     }
                 }
@@ -4728,74 +4798,24 @@ mod tests {
         }
     }
 
-    /// Reverse drift guard: every command the `parse_slash` match
-    /// dispatches must have a HELP_CATEGORIES entry, so a new command
-    /// can never be added to the match while staying invisible to
-    /// `/help` and `/?`. We can't reflect on match arms, so we scrape
-    /// this source file: rustfmt anchors every top-level arm pattern at
-    /// an 8-space indent starting with a quote (continuation lines for
-    /// long alias lists start with `| "..."` at the same indent), and
-    /// the catch-all `unknown =>` terminates the dispatch block. Every
-    /// quoted alias before each arm's `=>` must appear in the help
-    /// table. Pairs with `help_entries_dispatch_known` (the forward
-    /// direction) to make the two sets identical.
+    /// No alias may appear in more than one `Command`. Dispatch lookup is
+    /// first-match-wins, so a duplicate would silently shadow the later
+    /// entry (and split it across two `/help` lines). The registry makes
+    /// help/dispatch drift impossible; this guards the one remaining way
+    /// to get it wrong — claiming the same alias twice.
     #[test]
-    fn dispatch_arms_have_help_entries() {
-        let src = include_str!("slash_commands.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.contains("match cmd.as_str()"))
-            .expect("dispatch match not found");
-        let end = lines[start..]
-            .iter()
-            .position(|l| l.starts_with("        unknown =>"))
-            .map(|i| start + i)
-            .expect("dispatch fallthrough not found");
-
-        let help: std::collections::HashSet<&str> = HELP_CATEGORIES
-            .iter()
-            .flat_map(|(_, entries)| entries.iter())
-            .flat_map(|e| e.aliases.iter().copied())
-            .collect();
-
-        let extract_literals = |s: &str| -> Vec<String> {
-            let mut out = Vec::new();
-            let mut chars = s.chars();
-            while let Some(c) = chars.next() {
-                if c == '"' {
-                    out.push((&mut chars).take_while(|&c| c != '"').collect());
-                }
-            }
-            out
-        };
-
-        let mut i = start + 1;
-        while i < end {
-            if lines[i].starts_with("        \"") {
-                // Accumulate the arm pattern across any continuation
-                // lines until we reach the `=>` that ends it.
-                let mut acc = lines[i].to_string();
-                while !acc.contains("=>") && i + 1 < end {
-                    i += 1;
-                    acc.push(' ');
-                    acc.push_str(lines[i]);
-                }
-                let head = acc.split("=>").next().unwrap_or("");
-                for alias in extract_literals(head) {
-                    // The bare `"" =>` arm handles an empty command line;
-                    // there is no `/` to list in help.
-                    if alias.is_empty() {
-                        continue;
+    fn aliases_are_unique() {
+        let mut seen = std::collections::HashMap::new();
+        for (category, cmds) in COMMANDS {
+            for cmd in *cmds {
+                for alias in cmd.aliases {
+                    if let Some(prev) = seen.insert(*alias, *category) {
+                        panic!(
+                            "alias `/{alias}` is registered twice (in `{prev}` and `{category}`)"
+                        );
                     }
-                    assert!(
-                        help.contains(alias.as_str()),
-                        "dispatched command `/{alias}` has no HELP_CATEGORIES entry \
-                         (it would be invisible to /help and /?)"
-                    );
                 }
             }
-            i += 1;
         }
     }
 }
