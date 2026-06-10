@@ -40,6 +40,14 @@ relay = [
 # to emit `trace-<pid>.json` in CWD; load in ui.perfetto.dev. Heavy —
 # slows the build, adds runtime overhead — strictly for profiling.
 trace = ["bevy/trace_chrome"]
+# DEV-ONLY build-speed feature. Compiles Bevy as a shared `.dylib` so the
+# final link of this large binary becomes a quick relink against the dylib
+# instead of statically linking all of Bevy on every rebuild — the biggest
+# edit->run win for a Bevy app. NEVER ship a release built with this (the
+# binary then depends on libstd/bevy dylibs at the exact toolchain version).
+# Combine with native-window, e.g.:
+#   cargo run -p ffxi-client --features=native-window,relay,dynamic_linking
+dynamic_linking = ["bevy/dynamic_linking"]
 
 [dependencies]
 ffxi-proto = { path = "../ffxi-proto" }
@@ -90,7 +98,7 @@ bevy = { workspace = true, optional = true, features = [
 # Frame-rate limiter for the native window. Pinned to 0.20.x because that's
 # the line tracking Bevy 0.17 — 0.21 jumps to Bevy 0.18 and would clash.
 # `default-features = false` strips the debug overlay we don't need.
-bevy_framepace = { version = "0.20.1", optional = true, default-features = false }
+bevy_framepace = { version = "0.21", optional = true, default-features = false }
 # System clipboard. Used by `/copy` to push recent system-toast lines to
 # the OS clipboard. Optional + gated on `native-window` because the
 # headless/relay binary has no GUI session and no clipboard to write to.
