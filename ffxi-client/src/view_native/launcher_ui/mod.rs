@@ -54,6 +54,7 @@ mod char_create_preview;
 pub(crate) mod char_list;
 mod char_preview;
 mod common;
+mod graphics;
 mod login;
 mod server_edit;
 mod server_select;
@@ -142,6 +143,11 @@ pub(crate) enum LauncherState {
     /// Saving rebuilds the shared `DatRoot` and reloads the backdrop zone
     /// in place.
     Settings,
+    /// Graphics quality settings — the same [`GraphicsSettings`] knobs the
+    /// in-game menu drives (shadows, AA, fog, view distance, …). Reached
+    /// from the `Graphics` button on `ServerSelect`. Edits apply live and
+    /// autosave to `graphics.json` (shared with the in-game menu).
+    Graphics,
     /// Change password form (old / new / confirm). Reached from Login via
     /// the `Change password` button.
     ChangePassword,
@@ -803,6 +809,22 @@ pub(crate) fn register(
         )
             .run_if(in_state(LauncherState::Settings)),
     );
+
+    // Graphics screen: spawn the value rows on enter, tear them down on
+    // exit, and refresh the value cells + eat Esc each frame it's active.
+    // No load/persist wiring here — `GraphicsSettings` is a global resource
+    // (inserted in `view_native::run`) and `persist_graphics_on_change`
+    // autosaves any mutation the ◀ / ▶ buttons make.
+    app.add_systems(OnEnter(LauncherState::Graphics), graphics::spawn_ui)
+        .add_systems(OnExit(LauncherState::Graphics), graphics::despawn_ui)
+        .add_systems(
+            Update,
+            (
+                graphics::keyboard_input_system,
+                graphics::redraw_graphics_system,
+            )
+                .run_if(in_state(LauncherState::Graphics)),
+        );
 
     app.add_systems(
         OnEnter(LauncherState::ChangePassword),

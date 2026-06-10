@@ -270,6 +270,17 @@ pub(super) fn spawn_ui(
                         },
                     );
 
+                    r.spawn(button(
+                        ButtonProps::default(),
+                        (),
+                        Spawn((Text::new("Graphics"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(LauncherState::Graphics);
+                        },
+                    );
+
                     // Only render Cancel when there's a prior session to
                     // fall back to. Without `last_used`, hitting Cancel
                     // would land on a Login screen with no creds and no

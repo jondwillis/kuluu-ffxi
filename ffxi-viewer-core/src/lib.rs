@@ -83,6 +83,7 @@ pub use components::{
 pub use cursor::{CursorAssets, CursorPlugin, CursorRequests, CursorStyle};
 pub use graphics_settings::{
     AaMode, DynamicLights, GraphicsField, GraphicsSettings, QualityPreset, SkyStyle,
+    GRAPHICS_FIELDS,
 };
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
