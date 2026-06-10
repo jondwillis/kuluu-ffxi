@@ -29,8 +29,13 @@ recastnavigation-rs = { path = "vendor/recastnavigation-rs" }
 #     drops variable-level debuginfo, cutting codegen + final link time on
 #     the large client binary. Use debug = true if you need lldb stepping.
 # Cranelift is dev-only; release/wasm builds are untouched (LLVM).
+# opt-level = 2 (not 1): the viewer-core hot paths — per-vertex overbright
+# scanning, cloud/zone mesh building, texture decode — run in *our* crates,
+# so opt-level=1 left them slow enough to stutter zone-loads in dev (release
+# is unaffected). opt-level=2 with Cranelift recovers most of that runtime
+# speed for a modest codegen-time hit; drop back to 1 if rebuilds feel slow.
 [profile.dev]
-opt-level = 1
+opt-level = 2
 debug = "line-tables-only"
 codegen-backend = "cranelift"
 
