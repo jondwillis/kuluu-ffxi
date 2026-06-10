@@ -20,11 +20,35 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 FIRE=10
 
 payload=$(cat)
-
-# Loop guard: never block twice in one stop continuation — one shot per
-# stop, then let the agent stop cleanly.
 stop_active=$(printf '%s' "$payload" | jq -r '.stop_hook_active // false')
-[ "$stop_active" = "true" ] && exit 0
+session_id=$(printf '%s' "$payload" | jq -r '.session_id // "unknown"')
+
+# Loop guard — a bounded continuation DEPTH, not a one-shot.
+#
+# We deliberately do NOT bail on every stop_hook_active stop. That older
+# rule gave each check exactly one shot per continuation chain: if a
+# high-priority check transiently missed on the first stop — e.g.
+# 10-ask-question read the transcript a beat before the final assistant
+# text block (the question) had landed on disk — the lower checks fired,
+# the chain continued, and the next stop (stop_hook_active=true) was
+# swallowed whole. The question was then fully present but never
+# re-examined, silently defeating the stop.d/ precedence order.
+#
+# Per-check sig_changed (see stop-lib.sh) is the real same-content loop
+# guard: a check never re-fires for content it already fired on, so a
+# settled chain converges to all-pass on its own. This counter is only a
+# backstop against a check that fires on ever-CHANGING content. Reset on
+# a natural stop; bump once per continuation.
+depth_dir="${TMPDIR:-/tmp}/claude-stop-dispatch"
+mkdir -p "$depth_dir"
+depth_file="$depth_dir/${session_id}.depth"
+if [ "$stop_active" = "true" ]; then
+  depth=$(( $(cat "$depth_file" 2>/dev/null || echo 0) + 1 ))
+else
+  depth=0
+fi
+printf '%s' "$depth" > "$depth_file"
+[ "$depth" -ge 8 ] && exit 0
 
 for check in "$here"/stop.d/*.sh; do
   [ -e "$check" ] || continue  # literal glob when stop.d/ is empty

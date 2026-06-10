@@ -16,24 +16,47 @@ load_payload
 
 [ -f "$TRANSCRIPT" ] || exit 0
 
-# Assistant content after the last genuine user prompt (a user message
-# carrying a text block — tool_result user messages don't count).
-sel='. as $all
+# Wait for the final assistant text block to land, then pull everything we
+# need in ONE slurp. The Stop hook can read $TRANSCRIPT a beat before the
+# model's closing prose is durably appended (observed: a question written
+# at T+0 wasn't on disk when hooks ran ~0.3s later). A turn that ends
+# naturally ends in a text block; while the last assistant entry still ends
+# in thinking/tool_use the tail is mid-flush, so re-read up to ~0.5s.
+# Judging a stale tail would miss the trailing "?" and pass silently — and
+# on a clean tree (nothing for the lower checks to fire on, so no
+# continuation) there's no second chance. One slurp per attempt, one total
+# once settled.
+#
+# $blocks = assistant content after the last genuine user prompt (a user
+# message carrying a text block — tool_result users don't count). ready
+# keys off the last assistant entry in the whole transcript.
+extract='. as $all
   | ([ range(0; length)
        | select($all[.].type == "user"
                 and ($all[.].message.content | type) == "array"
                 and ([$all[.].message.content[].type] | index("text")) != null) ]
      | last) as $u
-  | [ $all[ (($u // -1) + 1) : ][] | select(.type == "assistant") | .message.content[]? ]'
+  | ([ $all[ (($u // -1) + 1) : ][] | select(.type == "assistant") | .message.content[]? ]) as $blocks
+  | (([ $all[] | select(.type == "assistant") ] | last) // {}) as $lastA
+  | { ready: (($lastA.message.content[-1].type?) == "text"),
+      tools: ([ $blocks[] | select(.type == "tool_use") | .name ] | unique),
+      text:  ([ $blocks[] | select(.type == "text") | .text ] | join("\n")) }'
 
-tools=$(jq -s -r "$sel | [ .[] | select(.type==\"tool_use\") | .name ] | unique | join(\",\")" \
-  "$TRANSCRIPT" 2>/dev/null || true)
-text=$(jq -s -r "$sel | [ .[] | select(.type==\"text\") | .text ] | join(\"\n\")" \
-  "$TRANSCRIPT" 2>/dev/null || true)
+result='{}'
+for _ in 1 2 3 4 5; do
+  result=$(jq -s -c "$extract" "$TRANSCRIPT" 2>/dev/null || echo '{}')
+  [ "$(printf '%s' "$result" | jq -r '.ready // false')" = "true" ] && break
+  sleep 0.1
+done
+
+tools=$(printf '%s' "$result" | jq -r '.tools | join(",")' 2>/dev/null || true)
+text=$(printf '%s' "$result" | jq -r '.text // ""' 2>/dev/null || true)
 
 # Already re-posed via the tool this turn, or no prose at all — pass.
+# (grep, not ${text//[[:space:]]/}: that bash substitution is ~O(n^2) under
+# macOS bash 3.2 and burned ~8s on a few KB of prose.)
 printf '%s' "$tools" | grep -q 'AskUserQuestion' && exit 0
-[ -z "${text//[[:space:]]/}" ] && exit 0
+printf '%s' "$text" | grep -q '[^[:space:]]' || exit 0
 
 # Strong signal: the last non-empty line ends with "?".
 last_line=$(printf '%s\n' "$text" | grep -v '^[[:space:]]*$' | tail -1)
