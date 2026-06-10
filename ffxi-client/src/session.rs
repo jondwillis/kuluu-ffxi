@@ -433,6 +433,50 @@ async fn run_map_session(
     .await
 }
 
+/// Classify a CHAR_NPC (0x00E) entity from its decoded `look.size` plus the
+/// per-packet markers the caller reads out of the entity-update body. Split
+/// out of [`handle_sub_packet`] so the LSB-boundary invariants are unit-
+/// testable.
+///
+/// The hard case is `look.size` 0/5/6 (standard monster meshes): real mobs
+/// AND a class of static/triggerable NPCs that reuse a monster model (e.g.
+/// the Auction House counter) both land here. LSB only writes the live-mob
+/// marker (body byte 0x25 = `hp>0 ? 0x08 : 0`) in the TYPE_MOB/PET/TRUST
+/// branch of `entity_update.cpp`; the TYPE_NPC branch never touches it. That
+/// byte is gated on `UPDATE_HP`, so:
+///   * no UPDATE_HP this packet → we can't tell → `Other`, letting
+///     `state::merge_kind` keep any prior specialized kind (never forcing a
+///     standard-model NPC back to Mob on a position-only tick);
+///   * UPDATE_HP + marker set → genuine live creature → `Mob` (or `Pet` when
+///     PMaster is a PC);
+///   * UPDATE_HP + marker clear → static/triggerable NPC on a monster model
+///     → `Npc`, so combat verbs aren't offered against it.
+fn classify_char_npc(
+    look_size: Option<u16>,
+    owned_by_pc: bool,
+    has_hp_update: bool,
+    is_live_mob: bool,
+) -> EntityKind {
+    match look_size {
+        Some(0) | Some(5) | Some(6) => {
+            if owned_by_pc {
+                EntityKind::Pet
+            } else if !has_hp_update {
+                EntityKind::Other
+            } else if is_live_mob {
+                EntityKind::Mob
+            } else {
+                EntityKind::Npc
+            }
+        }
+        Some(1) | Some(7) => EntityKind::Npc,
+        Some(2) | Some(3) | Some(4) => EntityKind::Other,
+        // Truncated body or unknown look size — emit `Other` so
+        // `state::merge_kind` preserves any prior specialized classification.
+        _ => EntityKind::Other,
+    }
+}
+
 /// Decode a single S2C sub-packet and emit typed `AgentEvent`s. Returns the
 /// `(UniqueNo, ActIndex, EventNum)` triple if it's an event-start packet so
 /// the caller can queue an auto-dismiss `0x05B EVENT_END`.
@@ -637,49 +681,48 @@ fn handle_sub_packet(
                     //
                     // `look.size` is written on *every* CHAR_NPC packet
                     // (`entity_update.cpp:451-484`, outside the
-                    // UPDATE_HP gate), so we don't have to wait for an
-                    // HP-bearing tick to classify.
+                    // UPDATE_HP gate), so we always have it to classify.
+                    // But look.size 0/5/6 (standard monster meshes) is
+                    // NOT mob-exclusive: a class of static/triggerable
+                    // NPCs reuse a monster model (e.g. the Auction House
+                    // counter), so look.size alone tags them as Mob and
+                    // makes "attack" wrongly available. We disambiguate
+                    // standard-model entities with LSB's live-mob marker
+                    // (see `classify_char_npc`).
                     //
-                    // Why not the alternatives we tried first:
-                    //   * Allegiance byte at packet 0x29 — `CNpcEntity`
-                    //     defaults `allegiance = ALLEGIANCE_TYPE::MOB`
-                    //     (`npcentity.cpp:44`), so most friendly NPCs
-                    //     come through indistinguishable from mobs.
-                    //   * Live-mob marker at packet 0x25 — only written
-                    //     under UPDATE_HP and didn't produce the
-                    //     expected 0x08 byte for Tunnel_Worm packets in
-                    //     Ronfaure (empirical observation).
+                    // Why not the allegiance byte at packet 0x29:
+                    // `CNpcEntity` defaults `allegiance = ALLEGIANCE_TYPE::MOB`
+                    // (`npcentity.cpp:44`), so most friendly NPCs come
+                    // through indistinguishable from mobs.
                     //
                     // Pet split: byte 0x27 bit 0x08 = "PMaster is a PC"
                     // (`entity_update.cpp:390-392`), gated on UPDATE_HP.
                     // Promotes a creature-shaped model with a PC owner
                     // (jug pet, BST jug, charmed mob, fellow) to Pet so
                     // the nameplate module picks the friendly palette.
-                    // When UPDATE_HP isn't set we can't read it; that
-                    // misclassifies fresh pets as Mob for a tick, then
-                    // merge_kind upgrades on the next HP packet.
-                    const LOOK_SIZE_OFFSET: usize = 0x2C;
+                    // When UPDATE_HP isn't set we can't read it; the
+                    // classifier returns Other and merge_kind preserves
+                    // the prior specialized kind.
+                    //
+                    // Packet-offset note: the client's `sub.data` is the
+                    // LSB packet body minus its 4-byte sub-header, so each
+                    // client offset is the LSB offset minus 4 (verified by
+                    // look.size: LSB 0x30 → 0x2C; pet bit: LSB 0x27 → 0x23).
+                    const LOOK_SIZE_OFFSET: usize = 0x2C; // LSB 0x30
+                    const UPDATEMASK_OFFSET: usize = 0x06; // LSB 0x0A
+                    const MOB_MARKER_OFFSET: usize = 0x21; // LSB 0x25
+                    const UPDATE_HP: u8 = 0x04; // baseentity.h:171
                     let look_size = sub
                         .data
                         .get(LOOK_SIZE_OFFSET..LOOK_SIZE_OFFSET + 2)
                         .map(|s| u16::from_le_bytes([s[0], s[1]]));
                     let owned_by_pc = head.send_flag & 0x04 != 0
                         && (sub.data.get(35).copied().unwrap_or(0) & 0x08) != 0;
-                    match look_size {
-                        Some(0) | Some(5) | Some(6) => {
-                            if owned_by_pc {
-                                EntityKind::Pet
-                            } else {
-                                EntityKind::Mob
-                            }
-                        }
-                        Some(1) | Some(7) => EntityKind::Npc,
-                        Some(2) | Some(3) | Some(4) => EntityKind::Other,
-                        // Truncated body or unknown look size — emit
-                        // `Other` so `state::merge_kind` preserves any
-                        // prior specialized classification.
-                        _ => EntityKind::Other,
-                    }
+                    let has_hp_update =
+                        sub.data.get(UPDATEMASK_OFFSET).copied().unwrap_or(0) & UPDATE_HP != 0;
+                    let is_live_mob =
+                        sub.data.get(MOB_MARKER_OFFSET).copied().unwrap_or(0) & 0x08 != 0;
+                    classify_char_npc(look_size, owned_by_pc, has_hp_update, is_live_mob)
                 };
                 if op == s2c::CHAR_PC && head.unique_no == self_char_id {
                     *self_act_index = Some(head.act_index);
@@ -3858,6 +3901,68 @@ fn should_emit_pos(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- CHAR_NPC entity classification (LSB live-mob marker) ----
+
+    #[test]
+    fn standard_model_npc_is_not_a_mob() {
+        // Auction House case: standard monster model (size 0), UPDATE_HP
+        // present, but the live-mob marker (LSB body 0x25) is clear because
+        // entity_update.cpp's TYPE_NPC branch never writes it. Must be Npc so
+        // combat verbs aren't offered.
+        assert_eq!(
+            classify_char_npc(Some(0), false, true, false),
+            EntityKind::Npc
+        );
+    }
+
+    #[test]
+    fn standard_model_live_mob_is_a_mob() {
+        // Real mob: standard model, UPDATE_HP set, marker set (hp>0).
+        assert_eq!(
+            classify_char_npc(Some(0), false, true, true),
+            EntityKind::Mob
+        );
+    }
+
+    #[test]
+    fn standard_model_without_hp_update_defers_to_merge_kind() {
+        // No UPDATE_HP: can't read the marker, so emit Other and let
+        // merge_kind keep any prior kind — never flip an established NPC to
+        // Mob on a position-only tick.
+        assert_eq!(
+            classify_char_npc(Some(0), false, false, false),
+            EntityKind::Other
+        );
+    }
+
+    #[test]
+    fn pc_owned_standard_model_is_a_pet() {
+        // PMaster-is-a-PC wins over the mob marker (jug pet / charmed mob).
+        assert_eq!(
+            classify_char_npc(Some(0), true, true, true),
+            EntityKind::Pet
+        );
+    }
+
+    #[test]
+    fn equipped_models_are_npcs_and_furniture_is_other() {
+        assert_eq!(
+            classify_char_npc(Some(1), false, true, false),
+            EntityKind::Npc
+        );
+        assert_eq!(
+            classify_char_npc(Some(7), false, false, false),
+            EntityKind::Npc
+        );
+        for door_size in [2u16, 3, 4] {
+            assert_eq!(
+                classify_char_npc(Some(door_size), false, true, false),
+                EntityKind::Other
+            );
+        }
+        assert_eq!(classify_char_npc(None, false, true, true), EntityKind::Other);
+    }
 
     // ---- 10 Hz Move cadence + rubber-band reconciliation ----
 
