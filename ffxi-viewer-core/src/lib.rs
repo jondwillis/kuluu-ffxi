@@ -135,8 +135,63 @@ impl<S> Default for ViewerCorePlugin<S> {
     }
 }
 
+/// App-wide error handler that downgrades the "command targeted an entity
+/// that despawned before the command flushed" race from a panic to a
+/// warning, while letting every other error keep Bevy's default panic
+/// behavior so genuine bugs still surface.
+///
+/// Why this is needed: in Bevy 0.18 `EntityCommands::remove` / `despawn`
+/// already swallow this race — both queue with the `warn` handler — but
+/// `insert` queues with the *default* handler, which panics
+/// (`bevy_ecs::error::handler::panic`). In a server-synced client,
+/// snapshot churn despawns actors constantly (mob death, zone-out, logout
+/// teardown); any system that captured an actor's `Entity` and then
+/// `insert`s a component on it after the actor despawned — same-frame, or
+/// a stale handle held across a despawn+slot-reuse — would otherwise take
+/// down the whole session. Per-site `try_insert` covers the known hot
+/// paths (scene/look/dat_vos2 actor sync); this handler is the safety net
+/// for every other present and future `insert` site.
+///
+/// Scope is deliberately narrow: only `ErrorContext::Command` errors whose
+/// payload is an entity-not-spawned/despawned error are tolerated. A
+/// fallible system returning `Err`, an aliased-mutability command bug, or
+/// any other error still routes to `panic`.
+fn tolerate_command_entity_despawn(
+    error: bevy::ecs::error::BevyError,
+    ctx: bevy::ecs::error::ErrorContext,
+) {
+    use bevy::ecs::error::ErrorContext;
+    use bevy::ecs::world::error::EntityMutableFetchError;
+
+    // Entity commands fail with `EntityMutableFetchError::NotSpawned(..)`
+    // (the `get_entity_mut` path); a few commands surface the inner
+    // `EntityNotSpawnedError` directly. Match both, but never the
+    // `AliasedMutability` variant — that's a real double-borrow bug.
+    let is_despawn_race = error
+        .downcast_ref::<EntityMutableFetchError>()
+        .is_some_and(|e| matches!(e, EntityMutableFetchError::NotSpawned(_)))
+        || error
+            .downcast_ref::<bevy::ecs::entity::EntityNotSpawnedError>()
+            .is_some();
+
+    if is_despawn_race && matches!(ctx, ErrorContext::Command { .. }) {
+        warn!("command skipped: target entity despawned before flush ({error})");
+        return;
+    }
+
+    bevy::ecs::error::panic(error, ctx);
+}
+
 impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
     fn build(&self, app: &mut App) {
+        // Install the despawn-race-tolerant command error handler before
+        // anything else so it's in force for every system this plugin (and
+        // its sub-plugins) registers. `set_error_handler` asserts it's
+        // called at most once per `App`; this plugin is added exactly once
+        // and no front-end sets its own, so the assert holds. See
+        // [`tolerate_command_entity_despawn`] for the rationale.
+        app.set_error_handler(tolerate_command_entity_despawn);
+
         // Native-only: `/load_mmb` reads the user's local DAT install
         // via `fs::read`. wasm can't yet — see `dat_mmb.rs` for the gate.
         #[cfg(not(target_arch = "wasm32"))]

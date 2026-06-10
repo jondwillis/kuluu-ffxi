@@ -448,10 +448,13 @@ pub fn dispatch_action_started(
             .find(|s| &s.name == b"main")
             .or_else(|| schedulers.first());
         let Some(scheduler) = scheduler else { continue };
+        // `try_insert`: the casting actor can despawn between the queued
+        // ActionStarted event and this flush (e.g. a mob that casts and
+        // immediately dies). Tolerate that race rather than panic.
         commands
             .entity(actor_entity)
-            .insert(ActiveScheduler::from_scheduler(scheduler))
-            .insert(assets);
+            .try_insert(ActiveScheduler::from_scheduler(scheduler))
+            .try_insert(assets);
     }
 }
 

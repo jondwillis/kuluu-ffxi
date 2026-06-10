@@ -771,7 +771,8 @@ pub fn dispatch_look_driven_models(
                     we.id, race, dispatched
                 );
                 if let Some(&bevy_e) = tracked.by_id.get(&we.id) {
-                    commands.entity(bevy_e).insert(EntityModel(look.0));
+                    // `try_insert`: actor may despawn between dispatch and flush.
+            commands.entity(bevy_e).try_insert(EntityModel(look.0));
                 }
             }
             continue;
@@ -826,7 +827,8 @@ pub fn dispatch_look_driven_models(
             chunk_indices.len()
         );
         if let Some(&bevy_e) = tracked.by_id.get(&we.id) {
-            commands.entity(bevy_e).insert(EntityModel(look.0));
+            // `try_insert`: actor may despawn between dispatch and flush.
+            commands.entity(bevy_e).try_insert(EntityModel(look.0));
         }
         // `load_mmb_tx` is still useful for door / transport models
         // once those resolvers exist — keep the param to avoid

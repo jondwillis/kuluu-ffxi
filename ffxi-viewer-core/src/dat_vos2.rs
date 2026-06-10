@@ -847,14 +847,17 @@ pub fn process_load_vos2_requests(
                 );
 
                 let actor_height = (actor_max_y - actor_min_y).max(0.1);
-                commands.entity(bevy_e).insert(SkinnedActor {
+                // `try_insert`: `bevy_e` is from `TrackedEntities`, but the
+                // actor can despawn between the async DAT load and this
+                // flush. Tolerate that race rather than panic.
+                commands.entity(bevy_e).try_insert(SkinnedActor {
                     dat_id: raw_dat_id_for_skeleton(raw),
                     bone_entities,
                     pivot,
                     min_local_y: actor_min_y,
                     max_local_y: actor_max_y,
                 });
-                commands.entity(bevy_e).insert(crate::scene::BakedActor {
+                commands.entity(bevy_e).try_insert(crate::scene::BakedActor {
                     min_mesh_y: actor_min_y,
                     actor_height,
                 });
@@ -945,7 +948,8 @@ pub fn process_load_vos2_requests(
                 let merged_min = prev_min.min(slot_min);
                 let merged_max = prev_max.max(slot_max);
                 cpu_extent.insert(req.entity_id, (merged_min, merged_max));
-                commands.entity(bevy_e).insert(crate::scene::BakedActor {
+                // `try_insert`: actor may despawn between async load and flush.
+                commands.entity(bevy_e).try_insert(crate::scene::BakedActor {
                     min_mesh_y: merged_min,
                     actor_height: (merged_max - merged_min).max(0.1),
                 });
@@ -2557,7 +2561,9 @@ pub fn spawn_prepared_equipped(
 
     if spawned > 0 {
         let actor_height = (prepared.max_mesh_y - prepared.min_mesh_y).max(0.1);
-        commands.entity(parent).insert(BakedActor {
+        // `try_insert`: `parent` is caller-supplied and may be an in-game
+        // actor that despawned before this flush. Tolerate that race.
+        commands.entity(parent).try_insert(BakedActor {
             min_mesh_y: prepared.min_mesh_y,
             actor_height,
         });

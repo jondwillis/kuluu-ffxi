@@ -648,7 +648,11 @@ pub fn sync_aggro_system(
         let should_aggro = aggroing.get(&w.id).copied().unwrap_or(false);
         match (should_aggro, has_aggro.is_some()) {
             (true, false) => {
-                commands.entity(e).insert(Aggroing);
+                // `try_insert`: the entity is live in this frame's query,
+                // but snapshot churn can despawn it before the command
+                // flushes. `insert` would panic on that race (unlike the
+                // `remove` below, which Bevy already warns-and-skips).
+                commands.entity(e).try_insert(Aggroing);
                 m.0 = mats.aggro.clone();
             }
             (true, true) => {
@@ -828,7 +832,10 @@ pub fn sync_entity_looks_system(
         match (&wire.look, current) {
             (Some(new), Some(LookComp(old))) if new == old => {}
             (Some(new), _) => {
-                commands.entity(bevy_e).insert(LookComp(*new));
+                // `try_insert`: `bevy_e` comes from `TrackedEntities`, which
+                // is current, but the actor can despawn between this queue
+                // and the flush. Tolerate that race rather than panic.
+                commands.entity(bevy_e).try_insert(LookComp(*new));
             }
             (None, Some(_)) => {
                 commands.entity(bevy_e).remove::<LookComp>();
