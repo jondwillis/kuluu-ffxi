@@ -786,7 +786,7 @@ pub fn dispatch_look_driven_models(
                 );
                 if let Some(&bevy_e) = tracked.by_id.get(&we.id) {
                     // `try_insert`: actor may despawn between dispatch and flush.
-            commands.entity(bevy_e).try_insert(EntityModel(look.0));
+                    commands.entity(bevy_e).try_insert(EntityModel(look.0));
                 }
             }
             continue;

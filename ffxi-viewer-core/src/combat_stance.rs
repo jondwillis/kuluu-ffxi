@@ -473,6 +473,15 @@ pub struct MotionSample {
     /// 0/2π seam. Sign matches FFXI heading: + = clockwise from
     /// above (per scene::heading_to_quat docstring).
     pub heading_rate: f32,
+    /// EMA-smoothed xz velocity. Server-driven entity positions update in
+    /// steps, so the raw per-frame finite-difference velocity is 0 on most
+    /// frames and a large spike on update frames — at high frame rates that
+    /// flips the locomotion clip Idle↔Run every few frames. `speed` /
+    /// `forward_component` / `strafe_component` are derived from this
+    /// low-pass-filtered velocity instead, which a steadily-moving entity
+    /// keeps above [`EntityMotion::MOVE_THRESHOLD`] regardless of frame rate.
+    pub smooth_vx: f32,
+    pub smooth_vz: f32,
 }
 
 #[derive(Resource, Default)]
@@ -556,11 +565,17 @@ pub fn track_entity_motion_system(
             });
         let dx = pos.x - prev.last_pos.x;
         let dz = pos.z - prev.last_pos.z;
-        let vx = dx / dt;
-        let vz = dz / dt;
-        let speed = (vx * vx + vz * vz).sqrt();
-        let forward_component = vx * fwd_x + vz * fwd_z;
-        let strafe_component = vx * right_x + vz * right_z;
+        // Low-pass the finite-difference velocity (see `MotionSample`).
+        // `alpha = 1 - e^(-dt/τ)` makes the smoothing frame-rate-independent;
+        // τ ≈ 0.25 s holds a steadily-moving entity above the move threshold
+        // between stepped position updates without lagging start/stop noticeably.
+        const VEL_TAU: f32 = 0.25;
+        let alpha = 1.0 - (-dt / VEL_TAU).exp();
+        let smooth_vx = prev.smooth_vx + alpha * (dx / dt - prev.smooth_vx);
+        let smooth_vz = prev.smooth_vz + alpha * (dz / dt - prev.smooth_vz);
+        let speed = (smooth_vx * smooth_vx + smooth_vz * smooth_vz).sqrt();
+        let forward_component = smooth_vx * fwd_x + smooth_vz * fwd_z;
+        let strafe_component = smooth_vx * right_x + smooth_vz * right_z;
 
         // Heading rate: unwrap across the 0/2π seam so wrapping from
         // 255 → 0 doesn't read as a ~2π/dt instant spin spike.
@@ -581,6 +596,8 @@ pub fn track_entity_motion_system(
                 strafe_component,
                 last_heading_rad: heading_rad,
                 heading_rate,
+                smooth_vx,
+                smooth_vz,
             },
         );
     }

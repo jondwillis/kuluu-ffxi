@@ -691,6 +691,18 @@ fn handle_sub_packet(
                     // We now hold server-authoritative coords; release the
                     // flood-drain wait and the keepalive POS gate.
                     *self_pos_seeded = true;
+                    // Diagnostic: the seed *applied* path was previously
+                    // silent (only the unique_no-mismatch skip warned), so a
+                    // spawn-at-origin couldn't be distinguished from a bad
+                    // server pos. Log the coords we just took as truth.
+                    tracing::info!(
+                        unique_no = login.unique_no,
+                        self_char_id,
+                        zone_no = login.zone_no,
+                        pos = format!("({:.1},{:.1},{:.1})", head.x, head.y, head.z),
+                        heading = head.dir,
+                        "self_pos seeded from 0x00A LOGIN"
+                    );
                     // Seed the self entity from LOGIN's `PosHead` so the
                     // entity list (and therefore the wire snapshot's
                     // `self_pos`, which is now derived from it) reflects
@@ -837,6 +849,20 @@ fn handle_sub_packet(
                     // here) and the rare zone-in flood that sends CHAR_PC
                     // for self before/without a 0x00A LOGIN.
                     *self_pos_seeded = true;
+                    // Diagnostic: this seed is unconditional (no
+                    // `SendFlg.Position` gate) and, during the flood drain,
+                    // runs with no rubber-band reconciliation — so a CHAR_PC
+                    // carrying origin would clobber a good LOGIN seed. Log the
+                    // coords + `SendFlg` so an origin spawn is traceable to
+                    // the exact packet that wrote it.
+                    tracing::info!(
+                        unique_no = head.unique_no,
+                        self_char_id,
+                        send_flag = format!("0x{:02x}", head.send_flag),
+                        pos = format!("({:.1},{:.1},{:.1})", head.x, head.y, head.z),
+                        heading = head.dir,
+                        "self_pos seeded from CHAR_PC for self"
+                    );
                 }
                 let wire_name = decode::PosHead::try_extract_name(op, sub.data);
                 if wire_name.is_none() {
@@ -4138,13 +4164,11 @@ fn should_emit_pos(
 
 /// Whether the zone-in flood-drain should stop on a recv idle gap.
 ///
-/// We only leave the flood once the server has handed us an authoritative
-/// self position (`self_pos_seeded`) — the `0x00A LOGIN` spawn seed or a
-/// self CHAR_PC. Exiting earlier drops us into keepalive with `self_pos`
-/// still at `Position::default()`, and the first POS subpacket would then
-/// report (0,0,0), which LSB adopts as the player's location. The caller's
-/// `flood_deadline` guard is the independent hard cap, so a zone that never
-/// sends a self seed still can't wedge the drain forever.
+/// Exit before the server seeds an authoritative self position and we drop
+/// into keepalive with `self_pos` still at `Position::default()`; the first
+/// POS subpacket then reports (0,0,0), which LSB adopts as the player's
+/// location. The deadline cap is enforced separately by the
+/// `while … < flood_deadline` loop guard at the call site.
 fn should_break_flood(self_pos_seeded: bool) -> bool {
     self_pos_seeded
 }

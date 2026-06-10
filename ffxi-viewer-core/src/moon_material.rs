@@ -109,8 +109,8 @@ fn load_moon_texture(
         };
         // Largest Graphic by pixel count — same heuristic the minimap
         // uses for map DATs that ship overlay glyphs alongside the art.
-        let Some(graphic) = ffxi_dat::map_image::scan_graphics(&bytes)
-            .max_by_key(|g| g.width * g.height)
+        let Some(graphic) =
+            ffxi_dat::map_image::scan_graphics(&bytes).max_by_key(|g| g.width * g.height)
         else {
             continue;
         };

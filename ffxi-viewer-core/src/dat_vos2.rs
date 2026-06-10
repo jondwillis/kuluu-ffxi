@@ -29,14 +29,14 @@ use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::vos2::{parse_vos2, Vos2Mesh};
 use ffxi_dat::{walk, walk_tree, ChunkKind, ChunkNode, DatRoot};
 
-use bevy::render::storage::ShaderStorageBuffer;
-
 use crate::graphics_settings::{CharacterRenderPath, GraphicsSettings};
 use crate::scene::{BakedActor, TrackedEntities};
-use crate::skeleton_instance::{eval_bind_pose, eval_pose, pc_pivot_rotation, FfxiActor};
+use crate::skeleton_instance::{
+    eval_bind_pose, eval_pose, pc_pivot_rotation, pc_pivot_translation, FfxiActor,
+};
 use crate::skinned_ffxi_material::{
-    FfxiLightingUniform, FfxiSkinnedMaterial, ATTR_COLOR, ATTR_JOINT0, ATTR_JOINT1,
-    ATTR_JOINT_WEIGHT, ATTR_NORMAL0, ATTR_NORMAL1, ATTR_POSITION0, ATTR_POSITION1,
+    FfxiJointMatrices, FfxiLightingUniform, FfxiSkinnedMaterial, ATTR_COLOR, ATTR_JOINT0,
+    ATTR_JOINT1, ATTR_JOINT_WEIGHT, ATTR_NORMAL0, ATTR_NORMAL1, ATTR_POSITION0, ATTR_POSITION1,
 };
 
 /// Parent-side actor state for an NPC rendered via Bevy `SkinnedMesh`.
@@ -871,10 +871,12 @@ pub fn process_load_vos2_requests(
                     min_local_y: actor_min_y,
                     max_local_y: actor_max_y,
                 });
-                commands.entity(bevy_e).try_insert(crate::scene::BakedActor {
-                    min_mesh_y: actor_min_y,
-                    actor_height,
-                });
+                commands
+                    .entity(bevy_e)
+                    .try_insert(crate::scene::BakedActor {
+                        min_mesh_y: actor_min_y,
+                        actor_height,
+                    });
                 info!(
                     "skinned actor spawn: file_id={} entity_id={} verts={} groups={} \
                      slot=[{:.2}..{:.2}] actor=[{:.2}..{:.2}] actor_height={:.2}",
@@ -963,10 +965,12 @@ pub fn process_load_vos2_requests(
                 let merged_max = prev_max.max(slot_max);
                 cpu_extent.insert(req.entity_id, (merged_min, merged_max));
                 // `try_insert`: actor may despawn between async load and flush.
-                commands.entity(bevy_e).try_insert(crate::scene::BakedActor {
-                    min_mesh_y: merged_min,
-                    actor_height: (merged_max - merged_min).max(0.1),
-                });
+                commands
+                    .entity(bevy_e)
+                    .try_insert(crate::scene::BakedActor {
+                        min_mesh_y: merged_min,
+                        actor_height: (merged_max - merged_min).max(0.1),
+                    });
             }
         }
     }
@@ -1621,10 +1625,11 @@ fn spawn_skinned_actor(
 // FFXI-faithful character path (custom material + GPU skinning).
 //
 // Selected by `GraphicsSettings::character_path() == FfxiFaithful`. Unlike
-// the Bevy `SkinnedMesh` path above, bones are NOT entities — each actor
-// owns one `ShaderStorageBuffer` of world-pose matrices (uploaded by
-// `tick_ffxi_actors`), and the custom vertex layout carries both bone-local
-// positions so the shader reproduces FFXI's exact dual-position skinning.
+// the Bevy `SkinnedMesh` path above, bones are NOT entities — each group
+// material carries the actor's world-pose matrices inline as a bone uniform
+// (uploaded by `tick_ffxi_actors`), and the custom vertex layout carries
+// both bone-local positions so the shader reproduces FFXI's exact
+// dual-position skinning.
 // ---------------------------------------------------------------------------
 
 /// Per-vertex attribute arrays for the FFXI skinned material, computed
@@ -1754,40 +1759,44 @@ fn build_ffxi_vertex_data(mesh: &Vos2Mesh, skel_bones: usize) -> (FfxiVertexData
 }
 
 /// Spawn (or extend) an FFXI-faithful actor for one loaded VOS2 slot.
-/// Returns `(pivot, bone_buffer, new_material_handles)` so the caller can
-/// accumulate actor-wide state across an actor's multiple slots.
+/// Returns `(pivot, new_material_handles)` so the caller can accumulate
+/// actor-wide state across an actor's multiple slots.
 ///
-/// `existing = Some((pivot, buffer))` reuses the pivot + bone buffer from a
-/// prior slot of the same actor (all slots share one skeleton/buffer).
+/// `existing = Some(pivot)` reuses the pivot from a prior slot of the same
+/// actor (all slots share one skeleton, hence one pivot).
 #[allow(clippy::too_many_arguments)]
 fn spawn_ffxi_actor(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<FfxiSkinnedMaterial>,
     images: &mut Assets<Image>,
-    buffers: &mut Assets<ShaderStorageBuffer>,
     parent: Entity,
     loaded: &LoadedVos2,
     skeleton: &std::sync::Arc<Skeleton>,
-    existing: Option<(Entity, Handle<ShaderStorageBuffer>)>,
+    existing: Option<Entity>,
     is_pc: bool,
-    min_local_y: f32,
-) -> (Entity, Handle<ShaderStorageBuffer>, Vec<Handle<FfxiSkinnedMaterial>>) {
-    let (pivot, bone_buffer) = match existing {
-        Some(pb) => pb,
+    // Feet-on-ground is applied caller-side via `-actor_min`; kept for the
+    // call site's per-slot extent, currently unused at spawn time.
+    _min_local_y: f32,
+) -> (Entity, Vec<Handle<FfxiSkinnedMaterial>>) {
+    let pivot = match existing {
+        Some(p) => p,
         None => {
             // The pivot carries the single FFXI-skeleton→Bevy basis change
-            // (PC: `Q_y(π/2)·Q_x(π)`, equal to the known-good CPU bake's
-            // total; NPC rigs land Y-up so identity) plus feet-on-ground.
+            // FFXI→Bevy basis change. PCs add a yaw (`Q_y(π/2)`) on top of
+            // the `Q_x(π)` vertical flip; NPCs just need the flip (without it
+            // they render upside-down). Feet-on-ground (`-actor_min`) is
+            // applied caller-side once all slots are measured.
             let rotation = if is_pc {
                 pc_pivot_rotation()
             } else {
-                Quat::IDENTITY
+                Quat::from_rotation_x(std::f32::consts::PI)
             };
-            let pivot = commands
+            let translation = pc_pivot_translation();
+            commands
                 .spawn((
                     Transform {
-                        translation: Vec3::Y * -min_local_y,
+                        translation,
                         rotation,
                         scale: Vec3::ONE,
                     },
@@ -1795,14 +1804,14 @@ fn spawn_ffxi_actor(
                     Visibility::default(),
                     ChildOf(parent),
                 ))
-                .id();
-            // Seed the bone buffer with the bind pose; `tick_ffxi_actors`
-            // overwrites it each frame once animation lands (M4).
-            let bind = eval_bind_pose(skeleton);
-            let buf = buffers.add(ShaderStorageBuffer::from(bind));
-            (pivot, buf)
+                .id()
         }
     };
+
+    // Seed each material's bone uniform with the bind pose; `tick_ffxi_actors`
+    // overwrites it each frame from the animated pose.
+    let mut bind_joints = FfxiJointMatrices::default();
+    bind_joints.set_from(&eval_bind_pose(skeleton));
 
     // Texture pool (colocated IMG chunks), keyed by the group's tex name.
     let mut by_name: std::collections::HashMap<String, Handle<Image>> =
@@ -1889,7 +1898,7 @@ fn spawn_ffxi_actor(
         let mat = materials.add(FfxiSkinnedMaterial {
             lighting: FfxiLightingUniform::default(),
             base_color_texture: tex_handle,
-            joint_matrices: bone_buffer.clone(),
+            joints: bind_joints.clone(),
         });
         out_materials.push(mat.clone());
 
@@ -1902,7 +1911,7 @@ fn spawn_ffxi_actor(
         ));
     }
 
-    (pivot, bone_buffer, out_materials)
+    (pivot, out_materials)
 }
 
 /// FFXI-faithful counterpart to `process_load_vos2_requests`. Reads the
@@ -1916,7 +1925,6 @@ pub fn process_load_vos2_requests_ffxi(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
     settings: Res<GraphicsSettings>,
     tracked: Res<TrackedEntities>,
     q_actor: Query<&FfxiActor>,
@@ -1932,14 +1940,8 @@ pub fn process_load_vos2_requests_ffxi(
     let mut load_cache: std::collections::HashMap<(u32, usize), Option<LoadedVos2>> =
         std::collections::HashMap::new();
     let mut despawned: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    // In-tick actor accumulation: (pivot, bone_buffer, min, max, materials).
-    type ActorAcc = (
-        Entity,
-        Handle<ShaderStorageBuffer>,
-        f32,
-        f32,
-        Vec<Handle<FfxiSkinnedMaterial>>,
-    );
+    // In-tick actor accumulation: (pivot, min, max, materials).
+    type ActorAcc = (Entity, f32, f32, Vec<Handle<FfxiSkinnedMaterial>>);
     let mut actor_state: std::collections::HashMap<u32, ActorAcc> =
         std::collections::HashMap::new();
 
@@ -1981,16 +1983,11 @@ pub fn process_load_vos2_requests_ffxi(
 
         let existing = actor_state
             .get(&req.entity_id)
-            .map(|(p, b, _, _, _)| (*p, b.clone()))
-            .or_else(|| {
-                q_actor
-                    .get(bevy_e)
-                    .ok()
-                    .map(|a| (a.pivot, a.bone_buffer.clone()))
-            });
+            .map(|(p, _, _, _)| *p)
+            .or_else(|| q_actor.get(bevy_e).ok().map(|a| a.pivot));
         let (cur_min, cur_max, mut mats_acc) = actor_state
             .get(&req.entity_id)
-            .map(|(_, _, mn, mx, m)| (*mn, *mx, m.clone()))
+            .map(|(_, mn, mx, m)| (*mn, *mx, m.clone()))
             .or_else(|| {
                 q_actor
                     .get(bevy_e)
@@ -1999,12 +1996,11 @@ pub fn process_load_vos2_requests_ffxi(
             })
             .unwrap_or((f32::INFINITY, f32::NEG_INFINITY, Vec::new()));
 
-        let (pivot, bone_buffer, new_mats) = spawn_ffxi_actor(
+        let (pivot, new_mats) = spawn_ffxi_actor(
             &mut commands,
             &mut meshes,
             &mut materials,
             &mut images,
-            &mut buffers,
             bevy_e,
             loaded,
             skeleton,
@@ -2021,7 +2017,7 @@ pub fn process_load_vos2_requests_ffxi(
         }
         actor_state.insert(
             req.entity_id,
-            (pivot, bone_buffer.clone(), actor_min, actor_max, mats_acc.clone()),
+            (pivot, actor_min, actor_max, mats_acc.clone()),
         );
 
         let actor_height = (actor_max - actor_min).max(0.1);
@@ -2032,7 +2028,6 @@ pub fn process_load_vos2_requests_ffxi(
             // file id `tick_ffxi_actors` feeds to `combat_stance` /
             // `idle_anim_for_file`.
             dat_id: raw_dat_id_for_skeleton(skeleton),
-            bone_buffer,
             pivot,
             materials: mats_acc,
             min_local_y: actor_min,
@@ -2172,7 +2167,7 @@ pub fn tick_ffxi_actors(
     mut blends: ResMut<crate::combat_stance::AnimationBlends>,
     clip_override: Option<Res<crate::combat_stance::ModelViewerClipOverride>>,
     settings: Res<GraphicsSettings>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
     q_actors: Query<(&crate::components::WorldEntity, &FfxiActor)>,
 ) {
     if settings.character_path() != CharacterRenderPath::FfxiFaithful {
@@ -2203,13 +2198,109 @@ pub fn tick_ffxi_actors(
             &bt_target_by_id,
         );
 
-        // `pose[0]` is `None`, so bone 0 keeps its raw bind local — the
-        // 270°-Y root roll the actor pivot's `Q_y(π/2)·Q_x(π)` depends on.
-        // Every other bone is animated; `None` falls back to bind inside
-        // `pose_world`.
+        // `pose[0]` is `None` (bone 0 isn't animated); `eval_pose` then
+        // forces bone 0 to identity-rotation + bind-translation, dropping
+        // the SK2 root roll. Every other bone is animated; `None` falls back
+        // to bind inside `pose_world`. Stamp the pose into each group
+        // material's bone uniform (`get_mut` also flags the asset so the
+        // bind group re-uploads — atomic with the uniform write, unlike a
+        // separate storage buffer).
         let mats = eval_pose(&actor.skeleton, &pose);
-        if let Some(buf) = buffers.get_mut(&actor.bone_buffer) {
-            buf.set_data(mats);
+        for h in &actor.materials {
+            if let Some(m) = materials.get_mut(h) {
+                m.joints.set_from(&mats);
+            }
+        }
+    }
+}
+
+/// M7: source the FFXI light model from the live zone lights, the same
+/// data `atmosphere` / `sun_moon` drive for the Bevy/PBR path. Reads
+/// `GlobalAmbientLight` for fill plus the `IsSun` / `IsMoon` directional
+/// lights for the two key directions, normalizes their lux-scale
+/// intensities into the ~0..1 band the faithful shader expects, and
+/// stamps the result onto every `FfxiActor`'s materials.
+///
+/// Gated on the FFXI path; on the Bevy path the `StandardMaterial`s are
+/// lit by Bevy's own pipeline, so this is a no-op there. The two
+/// reference-lux constants are brightness-only knobs — they scale the
+/// light uniform, not the geometry — so they're safe to tune by eye.
+pub fn update_ffxi_lighting_system(
+    settings: Res<GraphicsSettings>,
+    ambient: Res<GlobalAmbientLight>,
+    q_sun: Query<
+        (&DirectionalLight, &GlobalTransform),
+        (
+            With<crate::sun_moon::IsSun>,
+            Without<crate::sun_moon::IsMoon>,
+        ),
+    >,
+    q_moon: Query<
+        (&DirectionalLight, &GlobalTransform),
+        (
+            With<crate::sun_moon::IsMoon>,
+            Without<crate::sun_moon::IsSun>,
+        ),
+    >,
+    q_actors: Query<&FfxiActor>,
+    mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
+) {
+    if settings.character_path() != CharacterRenderPath::FfxiFaithful {
+        return;
+    }
+
+    // Reference scales: `GlobalAmbientLight`'s default brightness is 500
+    // lux; the sun curve peaks ~10k lux at noon, ~1.5k at the horizon
+    // (see `sun_moon::sun_color_for_hour`). Map both into the shader's
+    // unit-scale contribution band (XIM's per-vertex light is ~0..1).
+    const AMBIENT_REF_LUX: f32 = 1000.0;
+    const DIR_REF_LUX: f32 = 12000.0;
+
+    let amb = ambient.color.to_linear();
+    let amb_k = (ambient.brightness / AMBIENT_REF_LUX).clamp(0.0, 1.5);
+    let ambient_v = Vec4::new(amb.red * amb_k, amb.green * amb_k, amb.blue * amb_k, 1.0);
+
+    // (dir, color·intensity) for one directional light. A below-horizon
+    // light (`illuminance == 0`) contributes nothing. `forward()` is the
+    // unit vector the light travels along, which the shader negates for
+    // the N·L term.
+    let extract = |opt: Option<(&DirectionalLight, &GlobalTransform)>| -> (Vec4, Vec4) {
+        match opt {
+            Some((dl, gt)) if dl.illuminance > 0.0 => {
+                let f = gt.forward();
+                let c = dl.color.to_linear();
+                let k = (dl.illuminance / DIR_REF_LUX).clamp(0.0, 1.0);
+                (
+                    Vec4::new(f.x, f.y, f.z, 0.0),
+                    Vec4::new(c.red, c.green, c.blue, k),
+                )
+            }
+            _ => (Vec4::ZERO, Vec4::ZERO),
+        }
+    };
+    let (dir0_dir, dir0_color) = extract(q_sun.single().ok());
+    let (dir1_dir, dir1_color) = extract(q_moon.single().ok());
+
+    let lighting = FfxiLightingUniform {
+        ambient: ambient_v,
+        dir0_dir,
+        dir0_color,
+        dir1_dir,
+        dir1_color,
+        // A zeroed `.w` (range) makes the shader's point loop skip the
+        // slot, so these contribute nothing until zone point lights are
+        // wired into the faithful path.
+        point_pos: [Vec4::ZERO; 4],
+        point_color: [Vec4::ZERO; 4],
+    };
+
+    // Stamp onto every faithful material. Mutating through `get_mut` flags
+    // the asset changed, so the uniform re-uploads next frame.
+    for actor in &q_actors {
+        for h in &actor.materials {
+            if let Some(m) = materials.get_mut(h) {
+                m.lighting = lighting.clone();
+            }
         }
     }
 }
@@ -2218,9 +2309,7 @@ pub fn tick_ffxi_actors(
 /// engagement lookup is O(1). Without it the per-actor loop did a linear
 /// `find()` over the whole snapshot — quadratic in nearby-entity count,
 /// the hot path in crowded zones. Shared by both character ticks.
-fn bt_target_index(
-    state: &crate::snapshot::SceneState,
-) -> std::collections::HashMap<u32, u32> {
+fn bt_target_index(state: &crate::snapshot::SceneState) -> std::collections::HashMap<u32, u32> {
     state
         .snapshot
         .entities
@@ -2228,6 +2317,12 @@ fn bt_target_index(
         .map(|e| (e.id, e.bt_target_id))
         .collect()
 }
+
+/// Animation keyframe playback rate (frames per second) that the MO2
+/// `speed` multiplier scales. FFXI authored its skeletal animations at
+/// 30 fps; XIM nominally drives them off a 60 Hz clock, which renders ~2×
+/// too fast here, so we use 30.
+const ANIM_FPS: f32 = 30.0;
 
 /// Shared MO2 pose sampler for both character render paths. Encapsulates
 /// the full clip-selection state machine — model-viewer override, self rest
@@ -2276,13 +2371,17 @@ fn sample_animation_pose(
         }
     };
     // Forward-time wrapped frame index for the non-blended (override /
-    // rest) paths.
+    // rest) paths. The MO2 `speed` field is XIM's `keyFrameDuration`:
+    // keyframes advanced per engine-frame (a multiplier, NOT seconds-per-
+    // frame), so the keyframe position is `elapsed·fps·speed`. FFXI
+    // animations are authored at 30 fps (empirically ~2× too fast at XIM's
+    // nominal 60), so [`ANIM_FPS`] = 30.
     let wrap_frame = |anim: &ffxi_dat::anim::Mo2Animation| -> usize {
         if anim.frames == 0 {
             return 0;
         }
         let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
-        ((elapsed / safe_speed).floor() as usize) % anim.frames as usize
+        ((elapsed * ANIM_FPS * safe_speed).floor() as usize) % anim.frames as usize
     };
 
     // 1. Model-viewer override: force one named clip, no engagement /
@@ -2440,13 +2539,15 @@ fn sample_animation_pose(
     };
 
     // (anim, time_scale_signum) → current frame index. Negative `scale`
-    // runs the clip backwards (the run-as-backpedal fallback).
+    // runs the clip backwards (the run-as-backpedal fallback). Keyframe
+    // position is `elapsed·ANIM_FPS·speed` (see `wrap_frame`); `scale`
+    // flips time direction.
     let frame_of = |anim: &ffxi_dat::anim::Mo2Animation, scale: f32| -> usize {
         if anim.frames == 0 {
             return 0;
         }
         let safe_speed = if anim.speed > 0.0 { anim.speed } else { 1.0 };
-        let t_local = elapsed * scale / safe_speed;
+        let t_local = elapsed * ANIM_FPS * safe_speed * scale;
         // Rust % can be negative; wrap into [0, frames).
         let frames = anim.frames as i64;
         let r = t_local.floor() as i64;
@@ -3157,18 +3258,40 @@ mod ffxi_skin_tests {
         let mesh = Vos2Mesh {
             header: empty_header(1, 0), // flip=1 (mirror), use_bone_table=false
             vertices: vec![
-                Vos2Vertex { pos: [1.0, 2.0, 3.0], normal: [1.0, 0.0, 0.0] },
-                Vos2Vertex { pos: [4.0, 5.0, 6.0], normal: [0.0, 1.0, 0.0] },
+                Vos2Vertex {
+                    pos: [1.0, 2.0, 3.0],
+                    normal: [1.0, 0.0, 0.0],
+                },
+                Vos2Vertex {
+                    pos: [4.0, 5.0, 6.0],
+                    normal: [0.0, 1.0, 0.0],
+                },
             ],
             groups: vec![],
             bone_table: vec![],
             // 2 records per vertex: jointRef0 then jointRef1.
             // v0: primary bone 3, flip bone 5, flip axis 1 (X). v1: 4 / 6 / 1.
             bone_indices: vec![
-                Vos2BoneIndices { bone_index1: 3, bone_index2: 5, mirror_axis: 1 },
-                Vos2BoneIndices { bone_index1: 0, bone_index2: 0, mirror_axis: 0 },
-                Vos2BoneIndices { bone_index1: 4, bone_index2: 6, mirror_axis: 1 },
-                Vos2BoneIndices { bone_index1: 0, bone_index2: 0, mirror_axis: 0 },
+                Vos2BoneIndices {
+                    bone_index1: 3,
+                    bone_index2: 5,
+                    mirror_axis: 1,
+                },
+                Vos2BoneIndices {
+                    bone_index1: 0,
+                    bone_index2: 0,
+                    mirror_axis: 0,
+                },
+                Vos2BoneIndices {
+                    bone_index1: 4,
+                    bone_index2: 6,
+                    mirror_axis: 1,
+                },
+                Vos2BoneIndices {
+                    bone_index1: 0,
+                    bone_index2: 0,
+                    mirror_axis: 0,
+                },
             ],
             bone_weights: vec![],
         };
@@ -3199,12 +3322,23 @@ mod ffxi_skin_tests {
     fn overflow_bone_clamps_to_zero() {
         let mesh = Vos2Mesh {
             header: empty_header(0, 0),
-            vertices: vec![Vos2Vertex { pos: [0.0; 3], normal: [0.0; 3] }],
+            vertices: vec![Vos2Vertex {
+                pos: [0.0; 3],
+                normal: [0.0; 3],
+            }],
             groups: vec![],
             bone_table: vec![],
             bone_indices: vec![
-                Vos2BoneIndices { bone_index1: 99, bone_index2: 0, mirror_axis: 0 },
-                Vos2BoneIndices { bone_index1: 0, bone_index2: 0, mirror_axis: 0 },
+                Vos2BoneIndices {
+                    bone_index1: 99,
+                    bone_index2: 0,
+                    mirror_axis: 0,
+                },
+                Vos2BoneIndices {
+                    bone_index1: 0,
+                    bone_index2: 0,
+                    mirror_axis: 0,
+                },
             ],
             bone_weights: vec![],
         };

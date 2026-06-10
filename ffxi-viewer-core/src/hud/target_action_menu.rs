@@ -315,7 +315,11 @@ pub fn update_target_action_menu(
             } else if let Some(leaf) = rows.get(row.slot) {
                 let is_cursor = row.slot == sub_cursor;
                 let caret = if is_cursor { "> " } else { "  " };
-                let color = if is_cursor { palette::ACCENT } else { palette::TEXT };
+                let color = if is_cursor {
+                    palette::ACCENT
+                } else {
+                    palette::TEXT
+                };
                 (format!("{caret}{}", leaf.label), color)
             } else {
                 if node.display != Display::None {

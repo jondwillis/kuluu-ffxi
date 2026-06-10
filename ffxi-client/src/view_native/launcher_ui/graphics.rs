@@ -105,7 +105,11 @@ pub(super) fn spawn_ui(
 /// Placeholder rows (Stage-2 sky features, [`GraphicsField::is_placeholder`])
 /// are advertised but not adjustable: they render dimmed with no ◀ / ▶
 /// buttons. They stay reachable via the `/sky` command.
-fn spawn_field_row(panel: &mut ChildSpawnerCommands, field: GraphicsField, settings: &GraphicsSettings) {
+fn spawn_field_row(
+    panel: &mut ChildSpawnerCommands,
+    field: GraphicsField,
+    settings: &GraphicsSettings,
+) {
     let placeholder = field.is_placeholder();
     let value_color = if placeholder {
         Color::srgb(0.45, 0.45, 0.50)
@@ -139,9 +143,11 @@ fn spawn_field_row(panel: &mut ChildSpawnerCommands, field: GraphicsField, setti
                     (),
                     Spawn((Text::new("◀"), ThemedText)),
                 ))
-                .observe(move |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
-                    settings.cycle(field, -1);
-                });
+                .observe(
+                    move |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
+                        settings.cycle(field, -1);
+                    },
+                );
             }
 
             rowc.spawn((
@@ -162,9 +168,11 @@ fn spawn_field_row(panel: &mut ChildSpawnerCommands, field: GraphicsField, setti
                     (),
                     Spawn((Text::new("▶"), ThemedText)),
                 ))
-                .observe(move |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
-                    settings.cycle(field, 1);
-                });
+                .observe(
+                    move |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
+                        settings.cycle(field, 1);
+                    },
+                );
             }
         });
 }

@@ -42,10 +42,10 @@ pub mod graphics_settings;
 pub mod hud;
 pub mod input_mode;
 pub mod keybinds;
+pub mod lens_flare;
 pub mod lock_on;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod look_resolver;
-pub mod lens_flare;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod minimap;
 pub mod moon_material;
@@ -413,6 +413,12 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // render path, so it's a no-op on the Bevy path (and vice-versa).
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(Update, dat_vos2::tick_ffxi_actors);
+
+        // FFXI-faithful lighting: pull the live zone sun / moon / ambient
+        // into each faithful material's light uniform every frame. Also
+        // self-gates on the FFXI render path.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(Update, dat_vos2::update_ffxi_lighting_system);
 
         // Per-entity motion tracker for combat-stance / locomotion
         // animation selection. Runs *before* `tick_skinned_actors`

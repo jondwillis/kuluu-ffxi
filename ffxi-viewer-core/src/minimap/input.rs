@@ -320,11 +320,7 @@ mod tests {
         let initial = app.world().resource::<ChaseCamera>().distance;
         app.add_systems(
             Update,
-            (
-                handle_minimap_zoom_input,
-                crate::mouse::mouse_camera_system,
-            )
-                .chain(),
+            (handle_minimap_zoom_input, crate::mouse::mouse_camera_system).chain(),
         );
         write_scroll_up(&mut app);
         app.update();

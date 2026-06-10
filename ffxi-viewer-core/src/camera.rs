@@ -114,9 +114,7 @@ pub const WORLD_GIZMO_LAYER: usize = 2;
 /// (part of `DefaultPlugins`) to have inserted `GizmoConfigStore`, which
 /// a library crate can't assume in unit tests, so the wiring lives at
 /// the app-assembly layer rather than in a viewer-core plugin.
-pub fn configure_gizmo_render_layer(
-    mut store: ResMut<bevy::gizmos::config::GizmoConfigStore>,
-) {
+pub fn configure_gizmo_render_layer(mut store: ResMut<bevy::gizmos::config::GizmoConfigStore>) {
     let (config, _) = store.config_mut::<bevy::gizmos::config::DefaultGizmoConfigGroup>();
     config.render_layers = bevy::camera::visibility::RenderLayers::layer(WORLD_GIZMO_LAYER);
 }

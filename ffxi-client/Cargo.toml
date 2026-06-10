@@ -13,7 +13,14 @@ name = "ffxi-client"
 path = "src/main.rs"
 
 [features]
-default = []
+# The native windowed viewer is the mode we develop and ship by default, so
+# enable it out of the box: a bare `cargo build`/`cargo test -p ffxi-client`
+# then compiles `view_native` and runs its tests instead of silently skipping
+# them (its tests only exist under this feature). CI / release / checks.sh
+# still pass `--features native-window` explicitly, so this only affects bare
+# invocations. For the lean headless/relay-only binary (no Bevy), build with
+# `--no-default-features`.
+default = ["native-window"]
 # Enable the native windowed viewer (`native` subcommand). Opens a real
 # OS window via bevy_winit. Bevy's winit event loop must run on the OS
 # main thread on macOS, so main.rs handles the dispatch specially when

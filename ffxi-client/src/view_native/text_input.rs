@@ -1522,10 +1522,7 @@ fn apply_slash_outcome(
         SlashOutcome::SetCameraCollisionSource(setting) => {
             let next = setting.unwrap_or_else(|| draw_distance.camera_collision_source.cycle());
             draw_distance.camera_collision_source = next;
-            push_system_chat_line(
-                scene_state,
-                format!("/zonegeom source: {}", next.label()),
-            );
+            push_system_chat_line(scene_state, format!("/zonegeom source: {}", next.label()));
         }
         SlashOutcome::SetDevHud(setting) => {
             // `None` means toggle; explicit `on`/`off` overrides.
@@ -1549,7 +1546,11 @@ fn apply_slash_outcome(
                     let lines: Vec<String> = SkyFeature::ALL
                         .iter()
                         .map(|(k, f)| {
-                            format!("  {}: {}", k, if f.get(&g.sky_realism) { "on" } else { "off" })
+                            format!(
+                                "  {}: {}",
+                                k,
+                                if f.get(&g.sky_realism) { "on" } else { "off" }
+                            )
                         })
                         .collect();
                     push_system_chat_line(
@@ -1581,8 +1582,9 @@ fn apply_slash_outcome(
             // to the `light_*` fields. The `Dynamic Lights` row shows
             // "Custom" once a fine knob leaves its default.
             let g = &mut *slash_writers.graphics;
-            let chat = match op {
-                LightsOp::Status => format!(
+            let chat =
+                match op {
+                    LightsOp::Status => format!(
                     "/lights: {} · threshold {:.2} · intensity {:.0} · range {:.1} · flicker {}",
                     if g.dynamic_lights.enabled() { "on" } else { "off" },
                     g.light_threshold,
@@ -1590,35 +1592,35 @@ fn apply_slash_outcome(
                     g.light_range,
                     if g.light_flicker { "on" } else { "off" },
                 ),
-                LightsOp::Enable(v) => {
-                    let on = v.unwrap_or(!g.dynamic_lights.enabled());
-                    g.dynamic_lights = if !on {
-                        DynamicLights::Off
-                    } else if g.dynamic_lights == DynamicLights::Off {
-                        DynamicLights::Many
-                    } else {
-                        g.dynamic_lights
-                    };
-                    format!("/lights: {}", if on { "on" } else { "off" })
-                }
-                LightsOp::Threshold(v) => {
-                    g.light_threshold = v;
-                    format!("/lights threshold: {v:.2} (re-enter zone to re-detect)")
-                }
-                LightsOp::Intensity(v) => {
-                    g.light_intensity = v;
-                    format!("/lights intensity: {v:.0}")
-                }
-                LightsOp::Range(v) => {
-                    g.light_range = v;
-                    format!("/lights range: {v:.1}")
-                }
-                LightsOp::Flicker(v) => {
-                    let f = v.unwrap_or(!g.light_flicker);
-                    g.light_flicker = f;
-                    format!("/lights flicker: {}", if f { "on" } else { "off" })
-                }
-            };
+                    LightsOp::Enable(v) => {
+                        let on = v.unwrap_or(!g.dynamic_lights.enabled());
+                        g.dynamic_lights = if !on {
+                            DynamicLights::Off
+                        } else if g.dynamic_lights == DynamicLights::Off {
+                            DynamicLights::Many
+                        } else {
+                            g.dynamic_lights
+                        };
+                        format!("/lights: {}", if on { "on" } else { "off" })
+                    }
+                    LightsOp::Threshold(v) => {
+                        g.light_threshold = v;
+                        format!("/lights threshold: {v:.2} (re-enter zone to re-detect)")
+                    }
+                    LightsOp::Intensity(v) => {
+                        g.light_intensity = v;
+                        format!("/lights intensity: {v:.0}")
+                    }
+                    LightsOp::Range(v) => {
+                        g.light_range = v;
+                        format!("/lights range: {v:.1}")
+                    }
+                    LightsOp::Flicker(v) => {
+                        let f = v.unwrap_or(!g.light_flicker);
+                        g.light_flicker = f;
+                        format!("/lights flicker: {}", if f { "on" } else { "off" })
+                    }
+                };
             push_system_chat_line(scene_state, chat);
         }
         SlashOutcome::SetMinimap(op) => {
@@ -2408,9 +2410,8 @@ fn confirm_menu_at_cursor(
                 status_profile_open.0 = true;
             }
             StatusEntryKind::PlayTime => {
-                let line = ffxi_viewer_core::hud::status_panel::play_time_chat_line(
-                    &scene_state.snapshot,
-                );
+                let line =
+                    ffxi_viewer_core::hud::status_panel::play_time_chat_line(&scene_state.snapshot);
                 push_system_chat_line(scene_state, line);
             }
             // Master Levels / Merit Points: present-for-parity but outside
@@ -2722,9 +2723,7 @@ pub fn mouse_nav_dispatch_system(
     mut menu_events: MessageReader<ffxi_viewer_core::hud::menu::MenuRowActivated>,
     mut dialog_events: MessageReader<ffxi_viewer_core::hud::dialog::DialogChoiceActivated>,
     mut qa_events: MessageReader<ffxi_viewer_core::hud::quick_action::QuickActionActivated>,
-    mut ta_events: MessageReader<
-        ffxi_viewer_core::hud::target_action_menu::TargetActionActivated,
-    >,
+    mut ta_events: MessageReader<ffxi_viewer_core::hud::target_action_menu::TargetActionActivated>,
     cmd_tx: Res<CommandTx>,
     mut bindings: ResMut<Bindings>,
     mut keybinds_state: ResMut<KeybindsStateRes>,
@@ -2794,8 +2793,7 @@ pub fn mouse_nav_dispatch_system(
             state.cursor = ev.slot;
             // Resolve against RETAIL to match the keyboard path (see
             // `handle_target_action_key`'s overlay note).
-            let entries =
-                ffxi_viewer_core::hud::overlay::RETAIL.resolve_target_actions(&state.ctx);
+            let entries = ffxi_viewer_core::hud::overlay::RETAIL.resolve_target_actions(&state.ctx);
             if let Some(next) = confirm_target_action_at_cursor(
                 state,
                 &entries,
@@ -3275,11 +3273,11 @@ mod menu_dispatch_tests {
 
     #[test]
     fn unwired_root_entries_stay_not_implemented() {
-        // Config/Graphics — and now Magic/Abilities/Items/Equipment — open
-        // (still-stub) submenus, so they no longer resolve to NotImplemented at
-        // the root. The entries below have no submenu yet, so the root match
-        // falls through to NotImplemented.
-        for label in ["Status", "Party", "Search", "Macros"] {
+        // Only Party/Search/Macros lack a submenu, so they hit the catch-all
+        // NotImplemented arm. The rest (Config/Graphics/Status and the
+        // Magic/Abilities/Items/Equipment action menus) open submenus matched
+        // earlier in `resolve_menu_entry`, so they're excluded here.
+        for label in ["Party", "Search", "Macros"] {
             assert_eq!(
                 resolve_menu_entry(MenuKind::Root, label),
                 MenuDispatch::NotImplemented(label.into()),

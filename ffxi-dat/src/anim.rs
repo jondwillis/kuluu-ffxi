@@ -242,19 +242,22 @@ pub fn parse_mo2(body: &[u8], chunk_name: &[u8; 4]) -> Result<Mo2Animation> {
         let s_idx = [read_i32(off + 60), read_i32(off + 64), read_i32(off + 68)];
         let s_base = [read_f(off + 72), read_f(off + 76), read_f(off + 80)];
 
-        // lotus: if ANY component index is negative, this element is
-        // entirely identity (bone stays at its bind pose).
+        // lotus marks an unanimated bone by negating its channel indices;
+        // the bone should stay at its BIND pose. Emit no keyframes for it
+        // (so `frames_for_bone` → `None` and consumers fall back to bind)
+        // rather than identity keyframes: a REPLACE consumer writes an
+        // identity frame as the bone's whole local, collapsing it onto its
+        // parent — that froze run-cycle arms and tucked legs into the torso.
         let any_negative = q_idx
             .iter()
             .chain(t_idx.iter())
             .chain(s_idx.iter())
             .any(|&i| i < 0);
+        if any_negative {
+            continue;
+        }
         let mut frames = Vec::with_capacity(header_frames as usize);
         for f in 0..header_frames {
-            if any_negative {
-                frames.push(Mo2Frame::IDENTITY);
-                continue;
-            }
             let sample = |idx: i32, base: f32| -> f32 {
                 if idx > 0 {
                     read_f32(idx as usize + f as usize).unwrap_or(base)

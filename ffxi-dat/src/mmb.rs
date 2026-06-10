@@ -203,7 +203,13 @@ impl<'a> MmbHeader<'a> {
     pub fn zone_mesh_name(&self) -> String {
         self.header_window[16..32]
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '\0' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '\0'
+                }
+            })
             .take_while(|&c| c != '\0')
             .collect::<String>()
             .trim()

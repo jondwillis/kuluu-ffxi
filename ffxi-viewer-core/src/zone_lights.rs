@@ -210,10 +210,14 @@ fn drain_light_scan(
         let Some(mesh) = meshes.get(&mesh3d.0) else {
             continue;
         };
-        let (Some(VertexAttributeValues::Float32x4(colors)), Some(VertexAttributeValues::Float32x3(positions))) = (
+        let (
+            Some(VertexAttributeValues::Float32x4(colors)),
+            Some(VertexAttributeValues::Float32x3(positions)),
+        ) = (
             mesh.attribute(Mesh::ATTRIBUTE_COLOR),
             mesh.attribute(Mesh::ATTRIBUTE_POSITION),
-        ) else {
+        )
+        else {
             continue;
         };
         if colors.len() != positions.len() {
@@ -271,7 +275,8 @@ fn drain_light_scan(
                     },
                     Mesh3d(flame.mesh.clone()),
                     MeshMaterial3d(flame_mat),
-                    Transform::from_translation(cluster.local).with_scale(Vec3::splat(cfg.flame_radius)),
+                    Transform::from_translation(cluster.local)
+                        .with_scale(Vec3::splat(cfg.flame_radius)),
                     Visibility::Inherited,
                     bevy::light::NotShadowCaster,
                     bevy::light::NotShadowReceiver,
@@ -384,7 +389,11 @@ fn animate_zone_lights(
         // Read intensity/range/scale live from the config so `/lights`
         // tuning takes effect immediately on existing emitters (only the
         // detection threshold needs a zone re-enter).
-        light.intensity = if enhanced { cfg.point_intensity * flick } else { 0.0 };
+        light.intensity = if enhanced {
+            cfg.point_intensity * flick
+        } else {
+            0.0
+        };
         light.range = cfg.point_range;
         xf.scale = Vec3::splat(cfg.flame_radius * (0.85 + 0.15 * flick));
     }
@@ -467,7 +476,11 @@ mod tests {
             [-5.0, 1.0, 3.0],
         ];
         let clusters = cluster_overbright(&colors, &positions, &cfg);
-        assert_eq!(clusters.len(), 1, "the two warm texels merge, cold/dim drop");
+        assert_eq!(
+            clusters.len(),
+            1,
+            "the two warm texels merge, cold/dim drop"
+        );
         let c = clusters[0].warm_light_color().to_srgba();
         assert!(c.red >= c.blue, "light colour is warm (r >= b)");
     }

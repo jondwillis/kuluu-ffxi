@@ -4,8 +4,9 @@
 //! `InZone → Zoning → InZone` (the intermediate `Zoning` spans the
 //! between-map-servers reconnect, during which `SceneState.snapshot.zone_id`
 //! is `None` — the "zone 0" transient). This plugin masks that whole window:
-//! it hides the HUD, fades the screen to black, shows a centered
-//! "Downloading data" label, holds black until the destination zone is both
+//! it hides the HUD, fades the screen to black, shows a bottom-right
+//! "Downloading data" label (animated ellipsis, like retail), holds black
+//! until the destination zone is both
 //! position-seeded (`Stage::InZone` — gated on the server-authoritative
 //! spawn seed in `session.rs`) and geometry-loaded, then fades back in and
 //! restores the HUD.
@@ -51,6 +52,14 @@ const FADE_HOLD_MIN_SECS: f32 = 0.35;
 /// (lost LOGIN) or whose geometry never settles still fades in eventually
 /// rather than wedging the player behind a permanent black screen.
 const MAX_HOLD_SECS: f32 = 15.0;
+
+/// Loading-screen text, matching retail's bottom-right "Downloading data".
+const LOADING_TEXT: &str = "Downloading data";
+/// Animated-ellipsis frames. Trailing spaces pad each to a constant width
+/// so [`LOADING_TEXT`] holds position as the dots cycle.
+const DOT_FRAMES: [&str; 4] = ["   ", ".  ", ".. ", "..."];
+/// Seconds each ellipsis frame holds before advancing.
+const DOT_PERIOD_SECS: f32 = 0.4;
 
 /// Crossfade state for the zoning blackout. `Idle` is the steady in-zone
 /// state (overlay transparent + `Display::None` so it never intercepts
@@ -126,11 +135,20 @@ fn tick(state: ZoneOverlayFade, dt: f32, ready: bool) -> ZoneOverlayFade {
 #[derive(Resource, Default)]
 struct HudVisibilityStash(std::collections::HashMap<Entity, Visibility>);
 
+/// Cadence accumulator for the loading label's animated ellipsis.
+/// `elapsed` resets to 0 while the overlay is idle so each zone-in starts
+/// dot-less; `last_frame` gates text rewrites to once per frame change.
+#[derive(Resource, Default)]
+struct LoadingDots {
+    elapsed: f32,
+    last_frame: usize,
+}
+
 /// Full-screen blackout node.
 #[derive(Component)]
 struct ZoneOverlayRoot;
 
-/// The centered "Downloading data" label (child of [`ZoneOverlayRoot`]).
+/// The bottom-right "Downloading data" label (child of [`ZoneOverlayRoot`]).
 #[derive(Component)]
 struct ZoneOverlayLabel;
 
@@ -149,6 +167,7 @@ impl Plugin for ZoneTransitionOverlayPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ZoneOverlayFade>()
             .init_resource::<HudVisibilityStash>()
+            .init_resource::<LoadingDots>()
             .add_systems(OnEnter(AppPhase::InGame), spawn_zone_overlay)
             .add_systems(
                 Update,
@@ -185,8 +204,16 @@ fn spawn_zone_overlay(
                 left: Val::Px(0.0),
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::Center,
+                // Anchor the label to the bottom-right corner like retail,
+                // inset from the screen edge. Row main-axis = horizontal, so
+                // `FlexEnd` on both axes parks the single child bottom-right.
+                align_items: AlignItems::FlexEnd,
+                justify_content: JustifyContent::FlexEnd,
+                padding: UiRect {
+                    right: Val::Px(40.0),
+                    bottom: Val::Px(28.0),
+                    ..default()
+                },
                 ..default()
             },
             BackgroundColor(Color::BLACK.with_alpha(1.0)),
@@ -201,9 +228,10 @@ fn spawn_zone_overlay(
         .with_children(|p| {
             p.spawn((
                 ZoneOverlayLabel,
-                Text::new("Downloading data"),
+                // Start at the dot-less frame (trailing spaces hold width).
+                Text::new(format!("{LOADING_TEXT}{}", DOT_FRAMES[0])),
                 TextFont {
-                    font_size: 22.0,
+                    font_size: 20.0,
                     ..default()
                 },
                 TextColor(Color::WHITE.with_alpha(1.0)),
@@ -263,7 +291,9 @@ fn drive_zone_overlay_fade(
 
     // Reveal complete — restore each stashed HUD node to its pre-blackout
     // `Visibility`, handing control back to the HUD's own `Display` logic.
-    if !matches!(prev, ZoneOverlayFade::Idle) && *fade == ZoneOverlayFade::Idle && !stash.0.is_empty()
+    if !matches!(prev, ZoneOverlayFade::Idle)
+        && *fade == ZoneOverlayFade::Idle
+        && !stash.0.is_empty()
     {
         for (e, mut vis) in hud_roots.iter_mut() {
             if let Some(prev_vis) = stash.0.get(&e) {
@@ -274,19 +304,19 @@ fn drive_zone_overlay_fade(
     }
 }
 
-/// Push the current fade alpha onto the overlay backdrop + label, and park
-/// the node at `Display::None` when idle so it never intercepts input.
+/// Push the current fade alpha onto the overlay backdrop + label, animate
+/// the loading ellipsis, and park the node at `Display::None` when idle so
+/// a transparent full-screen node can't intercept input.
 fn apply_zone_overlay_alpha(
     fade: Res<ZoneOverlayFade>,
+    time: Res<Time>,
+    mut dots: ResMut<LoadingDots>,
     mut root_q: Query<(&mut BackgroundColor, &mut Node), With<ZoneOverlayRoot>>,
-    mut label_q: Query<&mut TextColor, With<ZoneOverlayLabel>>,
+    mut label_q: Query<(&mut Text, &mut TextColor), With<ZoneOverlayLabel>>,
 ) {
     let alpha = fade.alpha();
-    let want_display = if matches!(*fade, ZoneOverlayFade::Idle) {
-        Display::None
-    } else {
-        Display::Flex
-    };
+    let idle = matches!(*fade, ZoneOverlayFade::Idle);
+    let want_display = if idle { Display::None } else { Display::Flex };
     if let Ok((mut bg, mut node)) = root_q.single_mut() {
         if node.display != want_display {
             node.display = want_display;
@@ -295,7 +325,19 @@ fn apply_zone_overlay_alpha(
             bg.0 = Color::BLACK.with_alpha(alpha);
         }
     }
-    if let Ok(mut tc) = label_q.single_mut() {
+    // Advance the ellipsis only while the overlay is up; reset at idle so
+    // the next zone-in starts dot-less.
+    if idle {
+        dots.elapsed = 0.0;
+    } else {
+        dots.elapsed += time.delta_secs();
+    }
+    let frame = ((dots.elapsed / DOT_PERIOD_SECS) as usize) % DOT_FRAMES.len();
+    if let Ok((mut text, mut tc)) = label_q.single_mut() {
+        if frame != dots.last_frame {
+            dots.last_frame = frame;
+            **text = format!("{LOADING_TEXT}{}", DOT_FRAMES[frame]);
+        }
         if (tc.0.alpha() - alpha).abs() > 0.001 {
             tc.0 = Color::WHITE.with_alpha(alpha);
         }
@@ -325,7 +367,11 @@ mod tests {
 
     #[test]
     fn fade_out_advances_to_hold() {
-        let s = tick(ZoneOverlayFade::FadingOut { elapsed: 0.0 }, FADE_OUT_SECS, false);
+        let s = tick(
+            ZoneOverlayFade::FadingOut { elapsed: 0.0 },
+            FADE_OUT_SECS,
+            false,
+        );
         assert_eq!(s, ZoneOverlayFade::Holding { elapsed: 0.0 });
     }
 
@@ -374,7 +420,11 @@ mod tests {
 
     #[test]
     fn fade_in_completes_to_idle() {
-        let s = tick(ZoneOverlayFade::FadingIn { elapsed: 0.0 }, FADE_IN_SECS, false);
+        let s = tick(
+            ZoneOverlayFade::FadingIn { elapsed: 0.0 },
+            FADE_IN_SECS,
+            false,
+        );
         assert_eq!(s, ZoneOverlayFade::Idle);
     }
 }

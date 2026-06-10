@@ -182,12 +182,12 @@ impl DynamicLights {
 pub enum CharacterRenderPath {
     /// Existing path: Bevy `SkinnedMesh` + `StandardMaterial`. NPCs
     /// animate on the GPU; PCs render as static CPU-baked bind pose.
-    #[default]
     BevyStandard,
     /// FFXI-faithful path: the custom [`crate::skinned_ffxi_material`]
     /// with per-frame bone matrices from [`crate::skeleton_instance`].
     /// Unifies PCs and NPCs and reproduces FFXI's dual-position skinning,
     /// symmetry, and `2*vertexColor*texel` shading.
+    #[default]
     FfxiFaithful,
 }
 
@@ -288,7 +288,10 @@ impl GraphicsField {
     /// feature isn't wired into rendering yet (Stage 2). They remain
     /// reachable via the `/sky` command for power users.
     pub const fn is_placeholder(self) -> bool {
-        matches!(self, GraphicsField::SkyRealMoon | GraphicsField::SkyEclipses)
+        matches!(
+            self,
+            GraphicsField::SkyRealMoon | GraphicsField::SkyEclipses
+        )
     }
 }
 
@@ -456,7 +459,7 @@ impl GraphicsSettings {
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
-                character_render_path: CharacterRenderPath::BevyStandard,
+                character_render_path: CharacterRenderPath::FfxiFaithful,
             },
             QualityPreset::Medium => Self {
                 preset,
@@ -476,7 +479,7 @@ impl GraphicsSettings {
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
-                character_render_path: CharacterRenderPath::BevyStandard,
+                character_render_path: CharacterRenderPath::FfxiFaithful,
             },
             QualityPreset::High => Self {
                 preset,
@@ -496,7 +499,7 @@ impl GraphicsSettings {
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
-                character_render_path: CharacterRenderPath::BevyStandard,
+                character_render_path: CharacterRenderPath::FfxiFaithful,
             },
             QualityPreset::Ultra => Self {
                 preset,
@@ -519,7 +522,7 @@ impl GraphicsSettings {
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
-                character_render_path: CharacterRenderPath::BevyStandard,
+                character_render_path: CharacterRenderPath::FfxiFaithful,
             },
             // Custom: identical to High at construction; the caller
             // mutates fields after. Used by the on-disk loader when
@@ -1257,7 +1260,10 @@ mod tests {
         s.cycle(GraphicsField::SkyEarthshine, 1); // earthshine on -> off
         assert!(!s.sky_realism.earthshine);
         assert_eq!(s.sky_style(), SkyStyle::Custom);
-        assert!(s.sky_embellishments_enabled(), "Custom keeps embellishments");
+        assert!(
+            s.sky_embellishments_enabled(),
+            "Custom keeps embellishments"
+        );
         assert_eq!(s.value_label(GraphicsField::SkyStyle), "Custom");
         assert_eq!(s.preset, QualityPreset::High, "sky feature ⟂ quality tier");
     }
@@ -1339,7 +1345,11 @@ mod tests {
         s.cycle(GraphicsField::SkyStyle, 1);
         assert_eq!(s.sky_style(), SkyStyle::Retail);
         s.cycle(GraphicsField::Preset, 1); // High → Ultra
-        assert_eq!(s.sky_style(), SkyStyle::Retail, "preset cycle kept the style");
+        assert_eq!(
+            s.sky_style(),
+            SkyStyle::Retail,
+            "preset cycle kept the style"
+        );
         assert_eq!(s.sky_realism, crate::sky_realism::SkyRealism::retail());
     }
 

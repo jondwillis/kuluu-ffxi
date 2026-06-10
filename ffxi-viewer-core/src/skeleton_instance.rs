@@ -1,34 +1,21 @@
-//! CPU skeleton evaluation for the FFXI-faithful character path — the
-//! Rust counterpart to FFXI's `SkeletonInstance` (cross-referenced
-//! against `research/xim`). Produces the per-bone
-//! **world-pose** matrices the skinned shader multiplies vertices by
-//! (no inverse bind; vertices are authored bone-local).
-//!
-//! The matrices come straight from [`ffxi_dat::bone::Skeleton`]: bind
-//! pose via [`Skeleton::bind_pose_world`], animated pose via
-//! [`Skeleton::pose_world`] with per-bone overrides. The only conversion
-//! here is row-major (`ffxi-dat`) → column-major glam [`Mat4`] for upload.
-//!
-//! Orientation: these matrices stay in FFXI skeleton space. The actor's
-//! pivot entity carries the single FFXI→Bevy basis change + heading +
-//! feet-on-ground (see [`pc_pivot_rotation`] and `spawn_xim_actor`). This
-//! mirrors the known-good CPU bake, whose total skeleton→Bevy rotation is
-//! `Q_y(π/2) · Q_x(π)` — the per-vertex `[p0, p2, -p1]` swap (`R_x(-π/2)`)
-//! folded into the pivot's `Q_y(π/2) · Q_x(-π/2)`.
+//! CPU skeleton evaluation for the FFXI-faithful character path — the Rust
+//! counterpart to FFXI/XIM's `SkeletonInstance`. Produces the per-bone
+//! world-pose matrices the skinned shader multiplies (no inverse bind).
+//! Matrices stay in FFXI skeleton space; the actor pivot carries the
+//! FFXI→Bevy basis change + feet-on-ground.
 
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 
 use bevy::prelude::*;
-use bevy::render::storage::ShaderStorageBuffer;
 use ffxi_dat::bone::{BoneLocal, Skeleton};
 
 use crate::skinned_ffxi_material::FfxiSkinnedMaterial;
 
 /// Parent-side state for one actor rendered via [`crate::skinned_ffxi_material`].
-/// All of an actor's mesh-group entities share this actor's single bone
-/// buffer; the per-frame tick rewrites the buffer from the evaluated pose.
+/// The per-frame tick evaluates the pose once and stamps it into every
+/// mesh-group material's bone uniform.
 #[derive(Component)]
 pub struct FfxiActor {
     /// Raw skeleton, kept so the per-frame tick can recompose `pose_world`
@@ -39,16 +26,13 @@ pub struct FfxiActor {
     /// `tick_ffxi_actors` exactly as `SkinnedActor::dat_id` does for the
     /// Bevy path.
     pub dat_id: u32,
-    /// Per-actor bone-matrix storage buffer bound at the material's
-    /// binding 3. Length = `skeleton.bones.len()`.
-    pub bone_buffer: Handle<ShaderStorageBuffer>,
     /// Pivot entity between the wire entity and the mesh groups. Carries
     /// the FFXI→Bevy basis change and the feet-on-ground translation, so
     /// neither has to live in the bone matrices.
     pub pivot: Entity,
     /// One material asset per spawned mesh group (an actor's equipment
     /// slots each contribute groups). The per-frame tick stamps the live
-    /// lighting onto each; all reference the same `bone_buffer`.
+    /// bone pose + lighting into each.
     pub materials: Vec<Handle<FfxiSkinnedMaterial>>,
     /// Running min local-Y across loaded slots (feet anchor).
     pub min_local_y: f32,
@@ -56,12 +40,17 @@ pub struct FfxiActor {
     pub max_local_y: f32,
 }
 
-/// FFXI skeleton-space → Bevy rotation for PC rigs. Equal to the known-
-/// good CPU bake's total (`Q_y(π/2) · Q_x(π)`): stand the character up
-/// (X) then yaw 90° (Y) so forward lands on Bevy -Z, matching
-/// `scene::heading_to_quat`.
+/// FFXI skeleton-space → Bevy rotation for PC rigs: `Q_y(π/2)·Q_x(π)`, the
+/// known-good CPU-bake total. The `Q_x(π)` stands the rig up (FFXI→Bevy
+/// up-axis); the `Q_y(π/2)` cancels bone 0's `(0,0.7071,0,-0.7071)` −90°-Y
+/// root roll, which the faithful tick leaves un-unrolled (`pose[0]=None`).
+/// Dropping the `Q_y(π/2)` yaws the whole actor 90° (legs read as missing).
 pub fn pc_pivot_rotation() -> Quat {
     Quat::from_rotation_y(std::f32::consts::FRAC_PI_2) * Quat::from_rotation_x(std::f32::consts::PI)
+}
+
+pub fn pc_pivot_translation() -> Vec3 {
+    Vec3::Y
 }
 
 /// Convert one `ffxi-dat` row-major 4×4 (column-vector convention,
@@ -78,21 +67,33 @@ pub fn row_major_to_mat4(m: &[[f32; 4]; 4]) -> Mat4 {
     ])
 }
 
-/// Bind-pose world matrices for upload (no animation).
+/// Bind-pose world matrices for upload (no animation). Bone 0's root roll
+/// is dropped, same as [`eval_pose`].
 pub fn eval_bind_pose(skeleton: &Skeleton) -> Vec<Mat4> {
-    skeleton
-        .bind_pose_world()
-        .iter()
-        .map(row_major_to_mat4)
-        .collect()
+    eval_pose(skeleton, &[])
 }
 
-/// Animated world matrices for upload. `overrides[i] = Some(local)`
-/// replaces bone `i`'s bind-time local transform with the animation
-/// sample; `None` keeps the bind pose. Length should match the skeleton.
+/// Animated world matrices for upload via [`Skeleton::pose_world_anim`].
 pub fn eval_pose(skeleton: &Skeleton, overrides: &[Option<BoneLocal>]) -> Vec<Mat4> {
+    // Cancel bone 0's SK2 root roll (the pivot carries the FFXI→Bevy basis
+    // change; leaving the roll in yaws the actor ~90°). Since pose_world_anim
+    // composes `anim·bind`, feeding the conjugate of bind makes bone 0's
+    // rotation identity.
+    let n = skeleton.bones.len();
+    let mut ov: Vec<Option<BoneLocal>> = overrides.to_vec();
+    if ov.len() < n {
+        ov.resize(n, None);
+    }
+    if n > 0 {
+        let q = skeleton.bones[0].rot;
+        ov[0] = Some(BoneLocal {
+            rotation: [-q[0], -q[1], -q[2], q[3]],
+            translation: [0.0, 0.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+        });
+    }
     skeleton
-        .pose_world(overrides)
+        .pose_world_anim(&ov)
         .iter()
         .map(row_major_to_mat4)
         .collect()
@@ -110,9 +111,24 @@ mod tests {
         let q = [0.0f32, 1.0, 0.0, 0.0]; // x,y,z,w (180° about Y)
         let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
         let row_major = [
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y), 10.0],
-            [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x), 0.0],
-            [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y), 0.0],
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - w * z),
+                2.0 * (x * z + w * y),
+                10.0,
+            ],
+            [
+                2.0 * (x * y + w * z),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - w * x),
+                0.0,
+            ],
+            [
+                2.0 * (x * z - w * y),
+                2.0 * (y * z + w * x),
+                1.0 - 2.0 * (x * x + y * y),
+                0.0,
+            ],
             [0.0, 0.0, 0.0, 1.0],
         ];
         let m = row_major_to_mat4(&row_major);

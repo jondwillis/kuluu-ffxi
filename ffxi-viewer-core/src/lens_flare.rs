@@ -196,6 +196,9 @@ impl Plugin for LensFlarePlugin {
         app.add_plugins(MaterialPlugin::<LensFlareMaterial>::default())
             .add_systems(Startup, spawn_lens_flare)
             // After sun_moon_system so the SunDisc transform is current.
-            .add_systems(Update, lens_flare_system.after(crate::sun_moon::sun_moon_system));
+            .add_systems(
+                Update,
+                lens_flare_system.after(crate::sun_moon::sun_moon_system),
+            );
     }
 }

@@ -38,12 +38,17 @@ struct FfxiLighting {
     point_color: array<vec4<f32>, 4>,
 };
 
+// Mirror of `FfxiJointMatrices` in skinned_ffxi_material.rs. 128 = MAX_JOINTS.
+struct FfxiJoints {
+    matrices: array<mat4x4<f32>, 128>,
+};
+
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> lighting: FfxiLighting;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var base_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var base_samp: sampler;
-// Per-actor bone world-pose matrices, up to 128. Runtime-sized so the
-// CPU side uploads exactly `skeleton.bones.len()` entries.
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<storage, read> joints: array<mat4x4<f32>>;
+// Per-actor bone world-pose matrices uploaded inline as a uniform (see the
+// `FfxiJointMatrices` doc for why this is a uniform, not a storage buffer).
+@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> joints: FfxiJoints;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -71,8 +76,8 @@ fn vertex(v: Vertex) -> VertexOutput {
     var out: VertexOutput;
 
     let w = v.joint_weight;
-    let m0 = joints[v.joint0];
-    let m1 = joints[v.joint1];
+    let m0 = joints.matrices[v.joint0];
+    let m1 = joints.matrices[v.joint1];
 
     // FFXI faithful dual-position skinning (see header).
     let model_pos = m0 * vec4<f32>(v.position0, w)

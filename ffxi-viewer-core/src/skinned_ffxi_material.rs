@@ -11,9 +11,9 @@
 //!   * shading is `2*vertexColor*texel` with an alpha-test discard, not PBR.
 //!
 //! The mesh feeds a custom vertex layout (the [`ATTR_*`] attributes) and
-//! the material binds a per-actor [`ShaderStorageBuffer`] of bone matrices
-//! at binding 3. One material asset (and one storage buffer) is allocated
-//! per actor; [`crate::skeleton_instance`] rewrites the buffer each frame.
+//! the material carries the per-actor bone matrices inline as a uniform at
+//! binding 3 ([`FfxiJointMatrices`]); [`crate::skeleton_instance`] rewrites
+//! that uniform each frame from the evaluated pose.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -24,12 +24,12 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{
     AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
 };
-use bevy::render::storage::ShaderStorageBuffer;
 use bevy::shader::ShaderRef;
 
 /// Maximum bones a single actor skeleton can have (FFXI's `maxNumJoints`).
-/// The storage buffer is runtime-sized, but joint indices are a single
-/// byte on the wire so 128 is the hard ceiling.
+/// Fixes the size of the bone uniform array; joint indices are a single
+/// byte on the wire so 128 is the hard ceiling. 128 × 64 B = 8 KiB, well
+/// under the uniform-binding size limit.
 pub const MAX_JOINTS: usize = 128;
 
 // Custom vertex attributes. IDs use an "FFXI" ASCII prefix in the high
@@ -95,9 +95,44 @@ impl Default for FfxiLightingUniform {
     }
 }
 
-/// FFXI-faithful skinned character material. One asset per actor; the
-/// `joint_matrices` buffer is rewritten each frame from the actor's
-/// evaluated skeleton pose.
+/// Per-actor bone world-pose matrices, uploaded as the material's uniform
+/// at binding 3 — the world-space pose the skinned vertices multiply
+/// through (no inverse bind). Mirrors `FfxiJoints` in `skinned_ffxi.wgsl`.
+///
+/// This is a fixed-size *uniform* array rather than a separately-prepared
+/// [`ShaderStorageBuffer`] on purpose. A storage asset reallocates its GPU
+/// buffer on every `set_data`, while the material's bind group caches the
+/// prior buffer by value — so per-frame rewrites reach the shader only
+/// when the bind group happens to rebuild, and the two race frame-to-frame
+/// (a frame-rate-coupled jiggle). Inlining the bones as a uniform makes the
+/// upload atomic with the material's own bind group (same mechanism as
+/// `lighting`), and matches how XIM uploads its bone array.
+#[derive(Clone, Debug, ShaderType)]
+pub struct FfxiJointMatrices {
+    pub matrices: [Mat4; MAX_JOINTS],
+}
+
+impl Default for FfxiJointMatrices {
+    fn default() -> Self {
+        Self {
+            matrices: [Mat4::IDENTITY; MAX_JOINTS],
+        }
+    }
+}
+
+impl FfxiJointMatrices {
+    /// Overwrite the leading `pose.len()` bones from an evaluated pose;
+    /// trailing slots stay as-is (vertex joint indices are bone ids within
+    /// `pose.len()`). Clamped to `MAX_JOINTS`.
+    pub fn set_from(&mut self, pose: &[Mat4]) {
+        let n = pose.len().min(MAX_JOINTS);
+        self.matrices[..n].copy_from_slice(&pose[..n]);
+    }
+}
+
+/// FFXI-faithful skinned character material. One asset per mesh group; the
+/// `joints` uniform is rewritten each frame from the actor's evaluated
+/// skeleton pose.
 #[derive(Asset, AsBindGroup, TypePath, Clone, Debug)]
 pub struct FfxiSkinnedMaterial {
     #[uniform(0)]
@@ -105,8 +140,8 @@ pub struct FfxiSkinnedMaterial {
     #[texture(1)]
     #[sampler(2)]
     pub base_color_texture: Option<Handle<Image>>,
-    #[storage(3, read_only)]
-    pub joint_matrices: Handle<ShaderStorageBuffer>,
+    #[uniform(3)]
+    pub joints: FfxiJointMatrices,
 }
 
 impl Material for FfxiSkinnedMaterial {

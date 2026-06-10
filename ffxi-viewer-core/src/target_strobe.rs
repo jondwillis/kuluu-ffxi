@@ -44,7 +44,7 @@ const STROBE_PULSES: f32 = 3.0;
 /// Peak emissive added at the top of each hump. "Slightly white" per the
 /// reference: a visible flash that doesn't blow the model out to a solid
 /// white silhouette.
-const STROBE_PEAK: f32 = 0.6;
+const STROBE_PEAK: f32 = 0.4;
 
 /// Per-entity strobe state. Holds the material swaps so the flash can be
 /// reverted cleanly when it finishes (or when selection changes).

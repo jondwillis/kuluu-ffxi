@@ -180,6 +180,36 @@ impl Skeleton {
         out
     }
 
+    /// Apply MO2 animation overrides as XIM does (`SkeletonInstance.kt:195-219`):
+    /// per bone, rotation composes onto bind (`anim · bind`), translation adds
+    /// to bind, scale multiplies. `None` keeps the full bind local.
+    pub fn pose_world_anim(&self, overrides: &[Option<BoneLocal>]) -> Vec<[[f32; 4]; 4]> {
+        let n = self.bones.len();
+        let mut out = vec![identity4(); n];
+        for i in 0..n {
+            let b = &self.bones[i];
+            let local = if let Some(ov) = overrides.get(i).and_then(|o| o.as_ref()) {
+                let t = [
+                    b.trans[0] + ov.translation[0],
+                    b.trans[1] + ov.translation[1],
+                    b.trans[2] + ov.translation[2],
+                ];
+                let r = quat_mul(ov.rotation, b.rot);
+                mat4_from_quat_trans_scale(r, t, ov.scale)
+            } else {
+                mat4_from_quat_trans(b.rot, b.trans)
+            };
+            let p = b.parent as usize;
+            let is_root = b.parent == PARENT_ROOT || p == i || p >= n;
+            out[i] = if is_root {
+                local
+            } else {
+                mat4_mul(out[p], local)
+            };
+        }
+        out
+    }
+
     pub fn bind_pose_world(&self) -> Vec<[[f32; 4]; 4]> {
         let n = self.bones.len();
         let mut out = vec![identity4(); n];
@@ -230,6 +260,20 @@ fn mat4_from_quat_trans_scale(q: [f32; 4], t: [f32; 3], s: [f32; 3]) -> [[f32; 4
         row[2] *= s[2];
     }
     m
+}
+
+/// Hamilton product `a · b` of two xyzw quaternions (matches XIM
+/// `Quaternion.multiplyAndStore(a, b, out)`). Used by
+/// [`Skeleton::pose_world_anim`] to compose an animation rotation onto bind.
+fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let [ax, ay, az, aw] = a;
+    let [bx, by, bz, bw] = b;
+    [
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ]
 }
 
 /// Build a row-major 4x4 from a quaternion (x,y,z,w) and a
