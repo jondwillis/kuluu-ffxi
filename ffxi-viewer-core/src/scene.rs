@@ -550,8 +550,8 @@ pub fn sync_entities_system(
                     name,
                     // Spawn-time color is the kind-only default with no
                     // combat context. The update system re-derives the
-                    // engagement-aware color next tick (mob: aggro vs.
-                    // wandering, etc.) and re-rasterizes if needed.
+                    // engagement-aware color next tick (mob: engaged /
+                    // wandering / dead) and re-rasterizes if needed.
                     crate::nameplate_billboard::nameplate_color(wire.kind, false, false),
                 );
                 nameplated.insert(wire.id);

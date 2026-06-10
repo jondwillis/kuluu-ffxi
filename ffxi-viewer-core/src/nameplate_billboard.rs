@@ -256,21 +256,28 @@ pub fn spawn_nameplate_billboard(
 ///   yellow collides too easily with the unengaged-mob cue below;
 ///   green reads unambiguously as "talk to me, not fight me."
 /// - **Mob**: depends on combat state, evaluated per-frame:
-///     * **reddish-orange** when *either* the player is engaged with
-///       this mob (`self.bt_target_id == mob.id`) or the mob is
-///       aggroing the player (`mob.bt_target_id == self.uniqueNo`).
-///       Mirrors the same two signals the chase ring and the body
-///       material use, so the cues stay in lockstep across the HUD.
+///     * **grey** when `dead` (HP hit 0) — matches retail, which greys a
+///       defeated mob's name during the brief window before the server
+///       despawns it. Checked first so a mob you killed doesn't flash
+///       back to the engaged color on its last HP=0 tick.
+///     * **reddish-orange** when the mob is `engaged` — i.e. the local
+///       player has claimed it (`mob.claim_id == self.char_id`). Claim
+///       (`m_OwnerID`) is set the instant combat begins, so it tracks
+///       "I'm fighting this mob." Mirrors the body-capsule claim
+///       coloring (`sync_aggro_system` / `pick_mob_material`) so the
+///       cues stay in lockstep across the HUD.
 ///     * **whitish-yellow** otherwise — the "wandering, not yet a
 ///       threat" baseline.
 /// - **Pet**: pale green.
 /// - **Other**: neutral gray.
-pub fn nameplate_color(kind: EntityKind, is_engaged_with: bool, is_aggroing: bool) -> Color {
+pub fn nameplate_color(kind: EntityKind, engaged: bool, dead: bool) -> Color {
     match kind {
         EntityKind::Pc => Color::srgb(0.55, 0.95, 1.0),
         EntityKind::Npc => Color::srgb(0.55, 1.0, 0.55),
         EntityKind::Mob => {
-            if is_engaged_with || is_aggroing {
+            if dead {
+                Color::srgb(0.55, 0.55, 0.55)
+            } else if engaged {
                 Color::srgb(1.0, 0.55, 0.25)
             } else {
                 Color::srgb(1.0, 0.95, 0.7)
@@ -337,22 +344,17 @@ pub fn update_nameplate_billboards_system(
     // HP lookup keyed by wire id — only the entities the snapshot says
     // have a known HP appear here; missing means "no suffix this frame."
     //
-    // While we're walking `snapshot.entities`, also pull the player's
-    // `uniqueNo` and current `bt_target_id` so we can decide aggro vs.
-    // engaged state per billboard below. `sync_in` is the same low-16
-    // unique-id the server uses in `bt_target_id`, mirroring the exact
-    // comparison `sync_aggro_system` does (scene.rs).
-    let self_uid: Option<u16> = state.snapshot.diagnostics.sync_in;
+    // While we're walking `snapshot.entities`, also pull each entity's
+    // claim id (`m_OwnerID`) so the per-billboard pass below can decide
+    // whether a mob is engaged with the local player. The comparison is
+    // against our full `char_id` — see the per-nameplate note for why we
+    // use claim rather than `bt_target_id` / `diagnostics.sync_in`.
     let self_char_id: Option<u32> = state.snapshot.self_char_id;
     let mut hp_by_id: std::collections::HashMap<u32, Option<u8>> = std::collections::HashMap::new();
-    let mut bt_target_by_id: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    let mut self_bt_target: u32 = 0;
+    let mut claim_by_id: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     for ent in &state.snapshot.entities {
         hp_by_id.insert(ent.id, ent.hp_pct);
-        bt_target_by_id.insert(ent.id, ent.bt_target_id);
-        if Some(ent.id) == self_char_id {
-            self_bt_target = ent.bt_target_id;
-        }
+        claim_by_id.insert(ent.id, ent.claim_id);
     }
 
     for (ui_entity, mut np, mut aspect, mut transform, mut vis, mat) in &mut billboards {
@@ -397,20 +399,30 @@ pub fn update_nameplate_billboards_system(
         *vis = Visibility::Visible;
 
         // Combat-state-derived color. Recomputed every frame so a mob
-        // turning hostile / breaking aggro flips the label color even
-        // for an otherwise unchanged name.
-        let is_engaged_with = self_bt_target != 0 && self_bt_target == np.entity_id;
-        let is_aggroing = match (self_uid, bt_target_by_id.get(&np.entity_id).copied()) {
-            // Match `sync_aggro_system`'s comparison exactly: cast the
-            // entity-side u32 down to u16 and compare against the
-            // player's UniqueNo. Limit to Mob/Pet kinds so a PC that
-            // happens to bt_target the player isn't painted red.
-            (Some(uid), Some(bt)) if matches!(np.kind, EntityKind::Mob | EntityKind::Pet) => {
-                bt as u16 == uid && bt != 0
-            }
-            _ => false,
-        };
-        let want_color = color_to_rgba8(nameplate_color(np.kind, is_engaged_with, is_aggroing));
+        // flips the moment claim changes, even for an otherwise unchanged
+        // name.
+        //
+        // "Engaged" == the local player has claimed this mob: its
+        // `m_OwnerID` (claim id) equals our full `char_id`. Claim is set
+        // the instant combat starts, so it's the signal that tracks "I'm
+        // fighting this mob," and it's the same field the body capsule
+        // colors from (`pick_mob_material`). We deliberately do NOT read
+        // the player's own `bt_target_id` (the server hard-codes the self
+        // BtTargetID to 0 — `char_update.cpp`) nor `diagnostics.sync_in`
+        // (a packet sequence counter, not our UniqueNo) — both of which
+        // used to drive this and never actually fired. Mirrors
+        // `reactor::detect_aggro_edge`'s proven `bt_target_id == self_id`.
+        let engaged = matches!(np.kind, EntityKind::Mob)
+            && self_char_id.is_some_and(|cid| {
+                cid != 0 && claim_by_id.get(&np.entity_id).copied() == Some(cid)
+            });
+        // A mob whose HP reached 0 is defeated — grey it like retail does
+        // during the short pre-despawn window. `hp_pct == Some(0)` is the
+        // server's UPDATE_HP=0 tick (preserved by the reducer); `None`
+        // (HP never observed) is not death.
+        let dead = matches!(np.kind, EntityKind::Mob)
+            && hp_by_id.get(&np.entity_id).copied().flatten() == Some(0);
+        let want_color = color_to_rgba8(nameplate_color(np.kind, engaged, dead));
 
         // HP bar is only rendered for kinds whose snapshot carries
         // an HP percentage (Mob/Pet). NPCs/PCs/Others stay bar-less
