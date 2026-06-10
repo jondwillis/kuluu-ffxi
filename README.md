@@ -78,6 +78,20 @@ cargo xtask game "/path/to/..."  # or point it at a known install
 cargo xtask game --copy          # copy instead of symlink
 ```
 
+Don't have an install yet? The helper can also download Square Enix's **official**
+client installer from the public PlayOnline CDN and launch it (opt-in and
+confirmation-gated; runs under Wine on macOS/Linux). The download is free; a
+registration code / subscription is needed to play on the official service:
+
+```bash
+cargo xtask game --download             # official US client; prompts first
+cargo xtask game --download --region eu
+```
+
+Complete the installer GUI, then run `cargo xtask game` to wire it up. (This is
+official-client only — HorizonXI and other flavors must be obtained through
+their own launchers.)
+
 Or do it by hand — drop/symlink your install at `vendor/game-files/`, or just
 point the client at an existing copy:
 
