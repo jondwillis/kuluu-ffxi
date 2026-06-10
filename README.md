@@ -8,6 +8,39 @@ Kuluu is a **game-preservation effort**. FINAL FANTASY XI is a Square Enix
 property; this repo has no affiliation with, and no endorsement from, Square
 Enix. If you enjoy FFXI, please support the official service.
 
+## Setup / first build
+
+The workspace builds from a clean checkout once the few **build-time** vendor
+submodules are present. Build scripts read data files out of them and translate
+the values into compile-time Rust constants; no copyrighted asset bytes leave
+the user's machine, and the submodules are *not* needed at runtime.
+
+```bash
+git clone <repo> ffxi && cd ffxi
+
+# Init only the submodules the build actually reads (shallow — history trimmed).
+# `server` is large; --depth 1 keeps the working tree without the full history.
+git submodule update --init --depth 1 \
+  vendor/server vendor/POLUtils vendor/AltanaListener
+
+# ffxi-navmesh-builder and recastnavigation-rs are vendored in-tree (no submodule).
+cargo build
+```
+
+That's everything the compiler needs. The other entries under `vendor/`
+(`Phoenix`, `AltanaViewer`, `lotus-ffxi`, `xi-tinkerer`) are **not used by the
+build** — they're upstream references cited in source comments. Leave them
+deinitialized; `git submodule update --init <path>` restores any of them if you
+want to read the upstream sources.
+
+To actually *run* the client you also need a user-provided retail install
+mounted at `vendor/Game` (19G, never committed — see [Run](#run) below).
+
+> **Shallow-clone caveat:** `--depth 1` works only while the pinned submodule
+> commit is still reachable from its tracked branch tip. If an upstream
+> force-push moves it out of reach, re-run without `--depth` (or with a larger
+> `--depth N`) for that submodule.
+
 ## Project goals & non-goals
 
 - **Vanilla parity is the base.** The aim is close to 1:1 with the official
@@ -22,8 +55,7 @@ Enix. If you enjoy FFXI, please support the official service.
 - **No asset redistribution.** Kuluu requires a user-provided retail install
   (e.g. mounted at `vendor/Game`). Translated tables vendored from LSB,
   POLUtils, AltanaListener, etc. are stored as derived constants under the
-  upstream license — never as game content. See [vendored data sources]
-  below.
+  upstream license — never as game content.
 - **Not for retail.** The retail FFXI service enforces anti-cheat and Terms
   of Service that Kuluu makes no attempt to honor. Do not point it there.
 - **Not a server.** Kuluu speaks to community-run FFXI-protocol servers
@@ -251,23 +283,6 @@ parity isn't compromised by default.
 - [ ] Gear sets / gear-swap macros (beyond vanilla macro palette)
 - [ ] Plugin / extension API (the umbrella that lets the rest of this
   section exist as community contributions)
-
-## Vendored data sources
-
-Kuluu's `vendor/` tree holds reference material that is **read-only and
-gitignored** unless the upstream license allows redistribution. Examples:
-
-- `vendor/server/` — LandSandBoat (LSB), authoritative for protocol /
-  server-behavior questions.
-- `vendor/xiNavmeshes/` — Recast/Detour navmeshes (GPL-2).
-- `vendor/AltanaListener/` — BGM catalog, used by `ffxi-audio/build.rs` to
-  generate a 220-row `(track_id, name, composer)` constant table.
-- `vendor/POLUtils/` — XML mappings (e.g. ROMFileMappings → zone → map-DAT
-  lookup table generated at build time).
-- `vendor/Game/` — **user-provided retail install**. Never committed.
-
-Build scripts translate these into compile-time Rust constants; no
-copyrighted asset bytes leave the user's machine.
 
 ## Contributing
 
