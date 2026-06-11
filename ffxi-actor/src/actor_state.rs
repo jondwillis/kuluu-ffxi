@@ -33,23 +33,37 @@ pub enum EngageAnimationState {
 }
 
 impl EngageAnimationState {
-    /// XIM: `state == Engaged || state == Disengaging` selects `btl?`.
-    fn is_battle_idle(self) -> bool {
+    /// XIM: `state == Engaged || state == Disengaging` selects `btl?`. Also the
+    /// render-side engage-resolution key: when this flips, a future weapon-
+    /// battle animation directory would win (or stop winning) the per-slot clip
+    /// resolution, so the render path must re-resolve the registered clips even
+    /// though the *selected id* (`run?`/`wlk?`) is unchanged.
+    pub fn is_battle_idle(self) -> bool {
         matches!(self, Self::Engaged | Self::Disengaging)
     }
 }
 
-/// Rest postures. XIM models all of these through the same resting state
-/// machine (`res0`/`res1`/`res2`) plus chair-sitting (`chi0`/`chi2`); FFXI has
-/// no distinct "heal" clip — healing is resting.
+/// Rest postures. XIM dispatches these through `EffectRoutine` wrappers
+/// (`res0`/`res1`/`res2` for the kneeling resting state; `chi0`/`chi2` only for
+/// chair-sitting, which needs a chair furniture entity). Those routine ids are
+/// *indirection*: each one's `SkeletonAnimationRoutine` opcode references a
+/// parameterized `0x2B` animation id that actually drives the bones. The
+/// player-driven `/sit` and `/heal` poses resolve (verified by scanning the
+/// Hume-M skel DAT 7072) to these two-layer composites (like `run0`/`run1`):
+///
+/// - `/sit`  (ground sit)        -> `si0?`  (`si00` legs + `si01` torso/arms)
+/// - `/heal` / kneel (CAMP pose) -> `rx0?`  (`rx00` legs + `rx01` torso/arms)
+///
+/// The routine names (`res0`/`sit0`/`chi0`) are NOT `0x2B` clips and never
+/// match the render resolver, so the code must ask for the `si0?`/`rx0?` ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestKind {
     None,
-    /// Sit on the ground / heal — the kneeling resting state (`res0` loop).
+    /// `/sit` — relaxed ground sit (`si0?`).
     Sit,
-    /// Heal — same resting state machine as `Sit` in XIM.
+    /// `/heal` — the kneeling CAMP pose (`rx0?`), same resting state machine.
     Heal,
-    /// Kneel — the resting state machine (`restingState.kneeling`).
+    /// Kneel — the kneeling resting state (`rx0?`).
     Kneel,
 }
 
@@ -236,16 +250,51 @@ pub fn movement_animation(inputs: &ActorAnimInputs) -> Vec<DatId> {
     }
 }
 
-/// Rest/sit/dead model-routine ids (XIM `DatResource` companion + `Actor`):
-///   * `Sit`   -> `chi0` (chair-sit start; `chi2` is the stand routine)
-///   * `Heal`/`Kneel` -> `res0` (resting start; `res1` loop, `res2` stop)
-///   * `None`  -> no routine.
+/// The three phases of a rest posture. FFXI plays a transition-IN (kneel/sit
+/// down), holds a LOOP (subtle breathing), then plays a transition-OUT (stand
+/// up) on exit. XIM drives this by enqueuing `startResting`/`stopResting` model
+/// routines (`Actor.kt:740` `updateRestingDisplay`); the underlying `0x2B`
+/// clips encode the phase in the id's 3rd char — `*0?` in / `*1?` loop / `*2?`
+/// out (ground sit `si0?`/`si1?`/`si2?`, kneel `rx0?`/`rx1?`/`rx2?`, all
+/// present in the Hume-M skel DAT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestPhase {
+    /// Transition INTO the pose (kneel/sit down) — plays once.
+    In,
+    /// Held resting LOOP (subtle breathing) — loops while resting.
+    Loop,
+    /// Transition OUT of the pose (stand up) — plays once on exit.
+    Out,
+}
+
+/// Rest-pose clip id for a posture + [`RestPhase`] — the underlying
+/// parameterized `0x2B` clip the render resolver can `parameterized_match`, NOT
+/// the `EffectRoutine` wrapper names (`res0`/`sit0`/`chi0`), which are `0x07`
+/// chunks that never appear in the actor's animation set (so they'd resolve to
+/// nothing and fall back to a standing idle — the bug this fixes). The render
+/// path plays `In` once, loops `Loop`, then plays `Out` once when rest ends:
+///   * `Sit`          -> `si{0,1,2}?` (ground sit: `si?0` legs + `si?1` torso/arms)
+///   * `Heal`/`Kneel` -> `rx{0,1,2}?` (kneel/CAMP: `rx?0` legs + `rx?1` torso/arms)
+///   * `None`         -> no clip.
+pub fn rest_animation_id_phase(rest: RestKind, phase: RestPhase) -> Option<DatId> {
+    let prefix = match rest {
+        RestKind::None => return None,
+        RestKind::Sit => b"si",
+        RestKind::Heal | RestKind::Kneel => b"rx",
+    };
+    let digit = match phase {
+        RestPhase::In => b'0',
+        RestPhase::Loop => b'1',
+        RestPhase::Out => b'2',
+    };
+    Some(DatId::from_name(&[prefix[0], prefix[1], digit, b'?']))
+}
+
+/// The two-layer START clip a rest posture begins with (`si0?`/`rx0?`); the
+/// transition-IN phase of [`rest_animation_id_phase`]. Kept as the entry point
+/// the clip resolver/regression tests reference.
 pub fn rest_animation_id(rest: RestKind) -> Option<DatId> {
-    match rest {
-        RestKind::None => None,
-        RestKind::Sit => Some(DatId::from_str("chi0")),
-        RestKind::Heal | RestKind::Kneel => Some(DatId::from_str("res0")),
-    }
+    rest_animation_id_phase(rest, RestPhase::In)
 }
 
 /// The corpse model routine (XIM `enqueueModelRoutineIfReady(DatId("corp"))`).
@@ -528,10 +577,23 @@ mod tests {
     #[test]
     fn rest_ids() {
         assert!(rest_animation_id(RestKind::None).is_none());
-        assert_eq!(idstr(rest_animation_id(RestKind::Sit).unwrap()), "chi0");
-        assert_eq!(idstr(rest_animation_id(RestKind::Heal).unwrap()), "res0");
-        assert_eq!(idstr(rest_animation_id(RestKind::Kneel).unwrap()), "res0");
+        assert_eq!(idstr(rest_animation_id(RestKind::Sit).unwrap()), "si0?");
+        assert_eq!(idstr(rest_animation_id(RestKind::Heal).unwrap()), "rx0?");
+        assert_eq!(idstr(rest_animation_id(RestKind::Kneel).unwrap()), "rx0?");
         assert_eq!(idstr(corpse_routine_id()), "corp");
+    }
+
+    #[test]
+    fn rest_phase_ids() {
+        use RestPhase::{In, Loop, Out};
+        // 3rd char encodes the phase: in=0, loop=1, out=2.
+        assert_eq!(idstr(rest_animation_id_phase(RestKind::Sit, In).unwrap()), "si0?");
+        assert_eq!(idstr(rest_animation_id_phase(RestKind::Sit, Loop).unwrap()), "si1?");
+        assert_eq!(idstr(rest_animation_id_phase(RestKind::Sit, Out).unwrap()), "si2?");
+        assert_eq!(idstr(rest_animation_id_phase(RestKind::Kneel, In).unwrap()), "rx0?");
+        assert_eq!(idstr(rest_animation_id_phase(RestKind::Heal, Loop).unwrap()), "rx1?");
+        assert_eq!(idstr(rest_animation_id_phase(RestKind::Kneel, Out).unwrap()), "rx2?");
+        assert!(rest_animation_id_phase(RestKind::None, In).is_none());
     }
 
     #[test]

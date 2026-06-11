@@ -24,7 +24,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 
-use ffxi_actor::actor_state::{self, ActorAnimInputs};
+use ffxi_actor::actor_state::{self, ActorAnimInputs, RestKind};
 use ffxi_actor::animation::{LoopParams, SkeletonAnimationCoordinator};
 use ffxi_actor::skeleton_instance::{pose_world, RootTransform};
 
@@ -537,12 +537,42 @@ pub struct FfxiRenderActor {
     pub facing_dir: f32,
     /// Uniform scale applied to the whole skeleton via the root.
     pub scale: f32,
-    /// The id currently registered into the coordinator, so we only re-register
-    /// on a real change.
-    current_clip: Option<DatId>,
+    /// The id currently registered into the coordinator (plus the engaged flag
+    /// it was resolved under), so we only re-register on a real change. The
+    /// engaged flag is part of the key because XIM resolves an engaged actor's
+    /// movement clips (`run?`/`wlk?`) through a prepended WEAPON-BATTLE
+    /// animation directory (Actor.kt:430 `getAllAnimationDirectories`), so the
+    /// SAME selected id can resolve to DIFFERENT clips depending on engaged-ness.
+    /// Today that battle directory isn't loaded (no weapon class on the wire),
+    /// so engaged-run resolves identically to casual-run — but keying on the
+    /// flag means the moment a battle dir IS loaded, an engage flip re-resolves
+    /// the registered set instead of keeping the stale casual clips.
+    current_clip: Option<(DatId, bool)>,
+    /// Rest-posture playback phase (sit/kneel start->loop->stop). See
+    /// [`RestPlayback`] / [`advance_rest_phase`].
+    rest_phase: RestPlayback,
     /// Diagnostics for the example overlay.
     pub last_clip: Option<DatId>,
     pub last_frame: f32,
+}
+
+/// Per-actor rest-posture playback phase. FFXI rest is a transition-IN clip
+/// (`si0?`/`rx0?`) played ONCE, a held LOOP (`si1?`/`rx1?`), then a
+/// transition-OUT / stand-up (`si2?`/`rx2?`) played ONCE on exit — NOT the
+/// kneel-down looping forever. Driven as a small time-based state machine off
+/// [`ActorAnimInputs::rest`] (the desired posture, `None` while standing):
+/// IN advances to LOOP after the IN clip's `length_in_frames`, and STOP
+/// advances to done after the OUT clip's length. Mirrors XIM's
+/// `startResting`/`stopResting` model-routine enqueue (`Actor.kt:740`).
+#[derive(Clone, Copy, PartialEq)]
+enum RestPlayback {
+    Inactive,
+    /// Playing the transition-IN for `kind`; `remaining` frames until the loop.
+    Starting { kind: RestKind, remaining: f32 },
+    /// Holding the resting loop for `kind`.
+    Looping { kind: RestKind },
+    /// Playing the stand-up transition-OUT; `remaining` frames until idle.
+    Stopping { kind: RestKind, remaining: f32 },
 }
 
 impl LoadedActor {
@@ -827,6 +857,7 @@ fn make_render_actor(
         facing_dir,
         scale,
         current_clip: None,
+        rest_phase: RestPlayback::Inactive,
         last_clip: None,
         last_frame: 0.0,
     }
@@ -930,21 +961,173 @@ pub fn tick_ffxi_render_actors(
     }
 }
 
+/// Resolve a selected parameterized id (`run?`/`wlk?`/`btl?`/`idl?`/`si0?`/
+/// `rx0?`/…) to ALL the clips that drive it, mirroring XIM `fetchAnimations`
+/// (`ActorModel.kt:201` — collect every clip whose id `parameterizedMatch`es
+/// across the actor's animation directories).
+///
+/// FFXI splits one pose across DISJOINT body-region slots keyed by the clip's
+/// final digit: e.g. `run0` (slot 0) animates only the legs/feet (joints
+/// 25..37) and `run1` (slot 1) only the spine/arms/head (3..24, 49..88) —
+/// non-overlapping sets the coordinator composites per-joint into a full-body
+/// pose. So this returns BOTH layers; registering just one animates only that
+/// half ("running only torso-down"). Falls back to `idl?` when nothing matches
+/// so the actor never freezes blank.
+///
+/// NOTE on engaged-ness: this takes only the resolved `selected_id`, not the
+/// engage flag, because today the same id resolves to the same clips whether
+/// engaged or not (there is no weapon-battle directory on the wire yet — see
+/// `current_clip`). The id selection upstream (`actor_state::selected_animation`)
+/// already encodes the engaged IDLE switch (`idl?`->`btl?`); engaged MOVEMENT
+/// keeps the `run?`/`wlk?` id. When a per-weapon battle directory is later
+/// loaded, this is the seam where battle-tagged clips would win the per-final-
+/// digit slot (XIM `distinctBy { it.id }`, battle dir first).
+fn select_pose_clips(animations: &[SkeletonAnimation], selected_id: DatId) -> Vec<SkeletonAnimation> {
+    let m: Vec<SkeletonAnimation> = animations
+        .iter()
+        .filter(|a| a.id.parameterized_match(&selected_id))
+        .cloned()
+        .collect();
+    if m.is_empty() {
+        let idle = DatId::from_str("idl?");
+        animations
+            .iter()
+            .filter(|a| a.id.parameterized_match(&idle))
+            .cloned()
+            .collect()
+    } else {
+        m
+    }
+}
+
+/// Longest matching layer length (in frames) for a parameterized rest id, or
+/// `0.0` when no clip matches — so a missing transition phase completes
+/// instantly (is skipped) rather than stalling the rest state machine.
+fn rest_clip_len_frames(animations: &[SkeletonAnimation], id: DatId) -> f32 {
+    animations
+        .iter()
+        .filter(|a| a.id.parameterized_match(&id))
+        .map(|a| a.length_in_frames())
+        .fold(0.0_f32, f32::max)
+}
+
+/// Advance the rest-posture state machine one frame and return the rest clip id
+/// to play this frame, or `None` when no rest is active (the caller then falls
+/// through to the normal idle/movement selection). `desired` is the requested
+/// posture this frame ([`ActorAnimInputs::rest`], `None` while standing). See
+/// [`RestPlayback`]: enter -> transition-IN once -> held LOOP; exit -> stand-up
+/// transition-OUT once -> idle.
+fn advance_rest_phase(
+    phase: &mut RestPlayback,
+    desired: RestKind,
+    animations: &[SkeletonAnimation],
+    elapsed_frames: f32,
+) -> Option<DatId> {
+    use actor_state::RestPhase;
+
+    // Begin a transition-IN for `kind`, returning its (two-layer) id.
+    let begin_in = |phase: &mut RestPlayback, kind: RestKind| {
+        let id = actor_state::rest_animation_id_phase(kind, RestPhase::In).unwrap();
+        *phase = RestPlayback::Starting {
+            kind,
+            remaining: rest_clip_len_frames(animations, id),
+        };
+        Some(id)
+    };
+    // Begin the stand-up transition-OUT for `kind`, returning its id.
+    let begin_out = |phase: &mut RestPlayback, kind: RestKind| {
+        let id = actor_state::rest_animation_id_phase(kind, RestPhase::Out).unwrap();
+        *phase = RestPlayback::Stopping {
+            kind,
+            remaining: rest_clip_len_frames(animations, id),
+        };
+        Some(id)
+    };
+
+    match *phase {
+        RestPlayback::Inactive => {
+            if desired == RestKind::None {
+                None
+            } else {
+                begin_in(phase, desired)
+            }
+        }
+        RestPlayback::Starting { kind, remaining } => {
+            if desired == RestKind::None {
+                begin_out(phase, kind)
+            } else if desired != kind {
+                begin_in(phase, desired)
+            } else {
+                let remaining = remaining - elapsed_frames;
+                if remaining <= 0.0 {
+                    *phase = RestPlayback::Looping { kind };
+                    actor_state::rest_animation_id_phase(kind, RestPhase::Loop)
+                } else {
+                    *phase = RestPlayback::Starting { kind, remaining };
+                    actor_state::rest_animation_id_phase(kind, RestPhase::In)
+                }
+            }
+        }
+        RestPlayback::Looping { kind } => {
+            if desired == RestKind::None {
+                begin_out(phase, kind)
+            } else if desired != kind {
+                begin_in(phase, desired)
+            } else {
+                actor_state::rest_animation_id_phase(kind, RestPhase::Loop)
+            }
+        }
+        RestPlayback::Stopping { kind, remaining } => {
+            // Re-requesting the SAME posture mid-stand-up restarts the IN.
+            if desired == kind {
+                begin_in(phase, kind)
+            } else {
+                let remaining = remaining - elapsed_frames;
+                if remaining <= 0.0 {
+                    *phase = RestPlayback::Inactive;
+                    None
+                } else {
+                    *phase = RestPlayback::Stopping { kind, remaining };
+                    actor_state::rest_animation_id_phase(kind, RestPhase::Out)
+                }
+            }
+        }
+    }
+}
+
 /// Shared per-actor pose pipeline used by both [`tick_ffxi_render_actors`]
 /// (harness) and [`tick_live_ffxi_actors`] (live): clip selection ->
 /// coordinator register/update -> `pose_world` -> stamp every group material's
 /// bone uniform. The caller sets `actor.inputs` / `actor.facing_dir` first;
 /// this function only reads them.
+///
+/// On a pose change (selected id OR engaged-ness flips) it `clear()`s every
+/// coordinator slot before re-registering, so a slot left occupied by the
+/// PREVIOUS pose can't keep playing (e.g. idle is `idl0`, slot 0 only — a stale
+/// slot 1 would keep the arms running after the legs stop). Steady-state looping
+/// keeps each slot's frame cursor so the legs/arms stay phase-locked.
 fn advance_actor_pose(
     actor: &mut FfxiRenderActor,
     elapsed_frames: f32,
     materials: &mut Assets<FfxiSkinnedMaterial>,
 ) {
-    // Rest postures (sit/kneel/heal) play a dedicated model routine
-    // (chi0/res0), which XIM selects outside `selected_animation`. When a
-    // rest is active, prefer its id; otherwise fall through to the
-    // idle-vs-movement selection. `idle` here just controls low-priority.
-    let (selected_id, is_idle) = match actor_state::rest_animation_id(actor.inputs.rest) {
+    // Rest postures (sit/kneel/heal) play dedicated rest clips XIM selects
+    // outside `selected_animation`. `advance_rest_phase` drives the start->loop
+    // ->stop state machine: the transition-IN (`si0?`/`rx0?`) plays once, then
+    // the held LOOP (`si1?`/`rx1?`), then on exit the stand-up OUT (`si2?`/
+    // `rx2?`) plays once before falling through to idle — so kneeling/sitting
+    // settles and holds (and stands back up) instead of looping the kneel-down.
+    // Each phase id changes the selected id, so the `current_clip` change-key
+    // below re-registers the two-layer clip set per phase. `is_idle=true` keeps
+    // rest low-priority. When inactive it returns `None` and we fall through to
+    // the normal idle-vs-movement selection.
+    let rest_id = advance_rest_phase(
+        &mut actor.rest_phase,
+        actor.inputs.rest,
+        &actor.animations,
+        elapsed_frames,
+    );
+    let (selected_id, is_idle) = match rest_id {
         Some(rest_id) => (rest_id, true),
         None => {
             let s = actor_state::selected_animation(&actor.inputs);
@@ -952,42 +1135,25 @@ fn advance_actor_pose(
         }
     };
 
-    // Resolve the selected parameterized id to ALL matching clips and register
-    // each into its final-digit slot (XIM `fetchAnimations` + per-clip
-    // `registerAnimation`). FFXI splits one pose across DISJOINT body-region
-    // slots keyed by the clip's final digit: e.g. `run0` (slot 0) animates only
-    // the legs/feet (joints 25..37) and `run1` (slot 1) only the spine/arms/
-    // head (3..24, 49..88) — non-overlapping sets the coordinator composites
-    // per-joint into a full-body pose. Registering just one slot animates only
-    // that half ("running only torso-down"). And a slot left occupied by the
-    // PREVIOUS pose keeps playing it (idle is `idl0`, slot 0 only, so a stale
-    // slot 1 keeps the arms running after the legs stop) — so on a pose change
-    // clear every slot first, then register the whole set. Fall back to `idl?`
-    // when nothing matches so the actor never freezes blank.
-    let matches: Vec<SkeletonAnimation> = {
-        let m: Vec<SkeletonAnimation> = actor
-            .animations
-            .iter()
-            .filter(|a| a.id.parameterized_match(&selected_id))
-            .cloned()
-            .collect();
-        if m.is_empty() {
-            let idle = DatId::from_str("idl?");
-            actor
-                .animations
-                .iter()
-                .filter(|a| a.id.parameterized_match(&idle))
-                .cloned()
-                .collect()
-        } else {
-            m
-        }
-    };
+    // Resolve the selected parameterized id to ALL matching clips (see
+    // `select_pose_clips` for the layer-composite + idle-fallback rationale).
+    let matches: Vec<SkeletonAnimation> = select_pose_clips(&actor.animations, selected_id);
 
-    // Re-register only when the SELECTED id changes, so steady-state looping
-    // keeps each slot's frame cursor (and the legs/arms stay phase-locked).
-    if !matches.is_empty() && actor.current_clip != Some(selected_id) {
-        actor.current_clip = Some(selected_id);
+    // Re-register only when the SELECTED id (or engaged-ness) changes, so
+    // steady-state looping keeps each slot's frame cursor (and the legs/arms
+    // stay phase-locked). The engaged flag is part of the key so that once a
+    // weapon-battle directory is loaded (XIM prepends it when engaged and its
+    // clips win the per-id dedup — Actor.kt:430 + ActorModel.kt:201), an engage
+    // flip re-resolves `matches` to the battle-stance clips instead of holding
+    // the stale casual set. Until that directory exists on the wire, engaged
+    // movement resolves to the same casual `run0`/`run1` clips as not-engaged —
+    // which is the correct, faithful baseline for the unarmed/index-0 case (no
+    // separate unarmed engaged-run clip exists; the visible "weapon out"
+    // difference is the engaged IDLE `btl?` + the weapon mesh, not a different
+    // run cycle).
+    let engaged = actor.inputs.engage_state.is_battle_idle();
+    if !matches.is_empty() && actor.current_clip != Some((selected_id, engaged)) {
+        actor.current_clip = Some((selected_id, engaged));
         actor.coordinator.clear();
         let loop_params = LoopParams {
             loop_duration: None,
@@ -1120,11 +1286,33 @@ pub fn tick_live_ffxi_actors(
     walk_mode: Res<combat_stance::WalkMode>,
     mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
     mut q_actors: Query<&mut FfxiRenderActor>,
+    // Previous frame's zone id, to detect a zone transition. `Option<Option<_>>`
+    // so the first-ever frame (outer `None`) is distinguishable from "no zone"
+    // (inner `None`) and doesn't read as a spurious change.
+    mut prev_zone: Local<Option<Option<u16>>>,
 ) {
     use ffxi_actor::actor_state::{EngageAnimationState, RestKind};
 
     let elapsed_frames = time.delta_secs() * FRAME_RATE;
     let self_id = state.snapshot.self_char_id;
+
+    // Reset every actor to idle the frame the zone changes (zoneline cross,
+    // logout-to-char-select), so nobody carries their pre-zone run/engage clip
+    // into the new scene. The wire snapshot is rebuilt on zone-in, so this is a
+    // one-frame snap to idle; normal motion resumes next frame.
+    let zone = state.snapshot.zone_id;
+    let zone_changed = matches!(*prev_zone, Some(p) if p != zone);
+    *prev_zone = Some(zone);
+
+    // World-ids present in the current snapshot. An actor whose wire entity has
+    // left it (logout clears the list; out-of-range / despawn drops one) is
+    // about to be removed — force it to idle so its last few frames before
+    // despawn don't keep playing its stale movement/engaged animation (the
+    // "running ghost" on logout/zoning). Self is exempt: it isn't always echoed
+    // into `entities[]`, so its presence is keyed off `self_char_id` instead —
+    // but a zone change still resets it via `zone_changed`.
+    let present: std::collections::HashSet<u32> =
+        state.snapshot.entities.iter().map(|e| e.id).collect();
 
     // Once-per-frame indices so the per-actor lookups stay O(1) in crowded
     // zones (engagement + dead both scrape the snapshot entity list).
@@ -1153,6 +1341,19 @@ pub fn tick_live_ffxi_actors(
         }
 
         let is_self = Some(world_id) == self_id;
+
+        // Force idle on a zone change, or when this actor's wire entity has left
+        // the snapshot (logout / despawn-in-progress). Clears any active rest
+        // phase too, so a logging-out/zoning actor snaps straight to idle rather
+        // than persisting its last animation. Self is only reset by `zone_changed`
+        // (it may legitimately be absent from `entities[]` during normal play).
+        if zone_changed || (!is_self && !present.contains(&world_id)) {
+            actor.inputs = ActorAnimInputs::default();
+            actor.rest_phase = RestPlayback::Inactive;
+            advance_actor_pose(&mut actor, elapsed_frames, &mut materials);
+            continue;
+        }
+
         let sample = motion.sample(world_id).unwrap_or_default();
         let engaged = bt_target_by_id
             .get(&world_id)
@@ -1403,4 +1604,152 @@ pub fn inputs_for_pose(state: PoseState, engaged: bool) -> ActorAnimInputs {
     }
 
     inputs
+}
+
+#[cfg(test)]
+mod pose_resolution_tests {
+    //! DAT-backed regression gates for the locomotion + rest clip resolution.
+    //! Skipped silently when the retail DAT root isn't reachable (so CI without
+    //! DATs still runs), mirroring `combat_stance`'s integration tests.
+
+    use super::*;
+    use ffxi_actor::actor_state::ActorAnimInputs;
+
+    /// Resolve the SORTED set of clip-id strings that a given pose registers,
+    /// exactly as `advance_actor_pose` does (rest id wins; else
+    /// `selected_animation`; then `select_pose_clips`). This is the unit-level
+    /// equivalent of "which clips would be composited" — the headless A/B
+    /// render is the same comparison at the pixel level, but frame-phase jitter
+    /// between separate processes makes pixels non-deterministic, so the clip
+    /// SET is the reliable regression gate.
+    fn resolved_clip_ids(actor: &LoadedActor, inputs: &ActorAnimInputs) -> Vec<String> {
+        let animations = actor.all_animations();
+        let selected_id = match actor_state::rest_animation_id(inputs.rest) {
+            Some(rest_id) => rest_id,
+            None => actor_state::selected_animation(inputs).id,
+        };
+        let mut ids: Vec<String> = select_pose_clips(&animations, selected_id)
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    fn load_hume_m() -> Option<LoadedActor> {
+        if DatRoot::from_env_or_default().is_err() {
+            eprintln!("skipping: no retail DAT root");
+            return None;
+        }
+        // race 1 = Hume M (skel 7072 + motion 9672).
+        Some(load_pc(1, &[]).expect("load Hume M"))
+    }
+
+    /// Casual run composites BOTH body-region layers: `run0` (legs) + `run1`
+    /// (spine/arms/head). A run that resolved to only one would be the
+    /// "torso-only" / "legs-only" bug. (Verified by `zz-anim-cov`: run0=12 legs
+    /// joints, run1=40 arms/spine joints — disjoint.)
+    #[test]
+    fn run_composites_both_layers() {
+        let Some(actor) = load_hume_m() else { return };
+        let ids = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Run, false));
+        assert!(
+            ids.contains(&"run0".to_string()) && ids.contains(&"run1".to_string()),
+            "casual run must register run0+run1 (got {ids:?})"
+        );
+    }
+
+    /// THE locomotion regression gate. Engaged-run resolves to the SAME clip
+    /// set as casual-run today (unarmed / weapon-class index 0): the id is the
+    /// same `run?` and no weapon-battle directory is loaded, so the per-id dedup
+    /// has only the casual clips to choose. This is the correct faithful
+    /// baseline — NOT a bug. When a per-weapon battle DAT is later loaded and
+    /// prepended (XIM Actor.kt:430), this assertion is the seam that MUST flip
+    /// to `assert_ne!` for armed classes; leaving it here makes that future
+    /// change a deliberate, reviewed edit rather than a silent regression.
+    #[test]
+    fn engaged_run_equals_casual_run_for_unarmed() {
+        let Some(actor) = load_hume_m() else { return };
+        let casual = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Run, false));
+        let engaged = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Run, true));
+        assert_eq!(
+            casual, engaged,
+            "unarmed engaged-run must equal casual-run until a weapon-battle DAT is loaded"
+        );
+    }
+
+    /// Engaged-IDLE switches to the battle stance (`btl?`) while casual idle is
+    /// `idl?` — different clip sets. This is the engaged difference that DOES
+    /// work today (btl0/btl1 live in the +2600 motion DAT that load_pc loads).
+    #[test]
+    fn engaged_idle_differs_from_casual_idle() {
+        let Some(actor) = load_hume_m() else { return };
+        let idle = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Idle, false));
+        let battle = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Idle, true));
+        assert_ne!(idle, battle, "engaged idle must switch idl?->btl?");
+        assert!(idle.iter().any(|s| s.starts_with("idl")), "casual idle = idl? (got {idle:?})");
+        assert!(battle.iter().any(|s| s.starts_with("btl")), "engaged idle = btl? (got {battle:?})");
+    }
+
+    /// Walk is a distinct gait (`wlk0`+`wlk1`), not the run cycle.
+    #[test]
+    fn walk_differs_from_run() {
+        let Some(actor) = load_hume_m() else { return };
+        let run = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Run, false));
+        let walk = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Walk, false));
+        assert_ne!(run, walk, "walk must be a different clip set than run");
+        assert!(walk.contains(&"wlk0".to_string()) && walk.contains(&"wlk1".to_string()),
+            "walk must register wlk0+wlk1 (got {walk:?})");
+    }
+
+    /// `/sit` resolves to the two-layer ground-sit composite `si00`+`si01`
+    /// (NOT a standing idle fallback — the bug this batch fixes), and `/heal`/
+    /// kneel to `rx00`+`rx01`. The routine names (`chi0`/`res0`) would resolve
+    /// to nothing and fall back to idle.
+    #[test]
+    fn rest_poses_resolve_to_layered_clips() {
+        let Some(actor) = load_hume_m() else { return };
+
+        let sit = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Sit, false));
+        assert!(
+            sit.contains(&"si00".to_string()) && sit.contains(&"si01".to_string()),
+            "/sit must register si00+si01 (got {sit:?})"
+        );
+
+        let kneel = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Kneel, false));
+        let heal = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Heal, false));
+        assert!(
+            kneel.contains(&"rx00".to_string()) && kneel.contains(&"rx01".to_string()),
+            "/kneel must register rx00+rx01 (got {kneel:?})"
+        );
+        assert_eq!(kneel, heal, "/heal and /kneel share the rx0? kneel pose");
+
+        // The rest poses must NOT degrade to the idle fallback.
+        let idle = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Idle, false));
+        assert_ne!(sit, idle, "/sit must not fall back to idle");
+        assert_ne!(kneel, idle, "/kneel must not fall back to idle");
+    }
+
+    /// The rest phase machine sequences transition-IN once, then the held LOOP,
+    /// then the stand-up transition-OUT once, then back to idle — it does NOT
+    /// loop the kneel-down. Uses an empty animation set so each transition has
+    /// length 0 (completes the next frame), isolating the phase ORDERING from
+    /// clip durations (no DATs needed).
+    #[test]
+    fn rest_phase_machine_sequences_in_loop_out() {
+        let anims: Vec<SkeletonAnimation> = Vec::new();
+        let mut phase = RestPlayback::Inactive;
+        let mut step = |phase: &mut RestPlayback, desired| {
+            advance_rest_phase(phase, desired, &anims, 1.0).map(|d| d.as_str())
+        };
+        // Enter kneel: transition-IN, then settle into the held LOOP.
+        assert_eq!(step(&mut phase, RestKind::Kneel).as_deref(), Some("rx0?"));
+        assert_eq!(step(&mut phase, RestKind::Kneel).as_deref(), Some("rx1?"));
+        assert_eq!(step(&mut phase, RestKind::Kneel).as_deref(), Some("rx1?"));
+        // Exit: stand-up transition-OUT once, then back to idle (None).
+        assert_eq!(step(&mut phase, RestKind::None).as_deref(), Some("rx2?"));
+        assert_eq!(step(&mut phase, RestKind::None), None);
+        assert_eq!(step(&mut phase, RestKind::None), None);
+    }
 }

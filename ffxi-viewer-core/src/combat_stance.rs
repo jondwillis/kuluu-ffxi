@@ -44,8 +44,9 @@ use bevy::prelude::*;
 use ffxi_dat::anim::Mo2Animation;
 use ffxi_dat::{walk, ChunkKind, DatRoot};
 
-use crate::components::WorldEntity;
+use crate::components::{IsSelf, WorldEntity};
 use crate::snapshot::SceneState;
+use ffxi_viewer_wire::EntityKind;
 
 /// Reverse-map a PC skeleton DAT id to its motion DAT id (battle
 /// animation set #0 — unarmed).
@@ -78,10 +79,21 @@ pub fn motion_dat_for_skel(skel_file_id: u32) -> Option<u32> {
 static BATTLE_IDLE_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> =
     OnceLock::new();
 
-/// Cache for the casual run animation in the skeleton DAT (`run0`,
-/// 16-bone LOD). Keyed by skeleton DAT id; not all skeletons have a
-/// run anim (NPCs that never relocate) so we cache the `None` result
-/// too — the existence check is the load itself.
+/// Cache for the `run0` run animation in the skeleton DAT. Keyed by
+/// skeleton DAT id; not all skeletons have a run anim (NPCs that never
+/// relocate) so we cache the `None` result too — the existence check is
+/// the load itself.
+///
+/// NOTE (verified by `zz-anim-cov 7072 9672 run0 run1`): `run0` is NOT a
+/// low-LOD of `run1`. `run0` is the LEGS/FEET body-region LAYER (~12 joints
+/// incl RightFoot=31/LeftFoot=37, in the skeleton DAT); `run1` is the
+/// DISJOINT spine/arms/head layer (~40 joints, in the motion DAT). They
+/// composite into ONE full-body run — neither is "casual" vs "combat". The
+/// engaged/casual run distinction is NOT `run0` vs `run1`: it comes from
+/// resolving the SAME `run?` id through a weapon-specific BATTLE animation
+/// directory (XIM Actor.kt:430), which retail picks by weapon class. This
+/// helper feeds the legacy `dat_vos2` CPU-bake path only; the live faithful
+/// path (`ffxi_actor_render::advance_actor_pose`) composites both layers.
 static RUN_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = OnceLock::new();
 
 /// Cache for the resting `sit` / `hea` animations. Keyed by skeleton
@@ -93,9 +105,16 @@ static RUN_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = Onc
 static SIT_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = OnceLock::new();
 static HEAL_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = OnceLock::new();
 
-/// Cache for the combat run animation in the motion DAT (`run1`,
-/// 68-bone full rig). PC-only; keyed by motion DAT id like
-/// [`BATTLE_IDLE_ANIMS`].
+/// Cache for the `run1` run animation in the motion DAT. PC-only; keyed
+/// by motion DAT id like [`BATTLE_IDLE_ANIMS`].
+///
+/// MISNOMER WARNING: despite the historical name, `run1` is NOT a "combat
+/// run". It is the spine/arms/head body-region LAYER of the run cycle (the
+/// disjoint complement of `run0`'s legs layer — see [`RUN_ANIMS`]). The live
+/// faithful path composites `run0`+`run1` for EVERY run, engaged or not. This
+/// helper exists only for the legacy `dat_vos2` path, which (incorrectly)
+/// treated `run1` as a standalone "combat" clip; do not propagate that
+/// interpretation into new code.
 static COMBAT_RUN_ANIMS: OnceLock<Mutex<HashMap<u32, Option<Arc<Mo2Animation>>>>> = OnceLock::new();
 
 /// Cache for directional locomotion variants resolved by 3-char prefix
@@ -122,9 +141,10 @@ static DIRECTIONAL_ANIMS: OnceLock<Mutex<HashMap<(u32, [u8; 3]), Option<Arc<Mo2A
 
 /// 3-char MO2 name prefix for the battle-idle pose inside a motion
 /// DAT. Discovered by running `bin/dump-motion-dat 9672` against the
-/// Hume M retail archive — the motion DAT carries `btl0` (16-bone
-/// LOD) and `btl1` (68-bone LOD), but no `idl*` chunk; resting idle
-/// lives in the *skeleton* DAT only. Lotus's
+/// Hume M retail archive — the motion DAT carries `btl0` (legs/feet
+/// layer) and `btl1` (spine/arms/head layer — they composite, NOT
+/// LODs), but no `idl*` chunk; resting idle lives in the *skeleton*
+/// DAT only. Lotus's
 /// `actor_skeleton_static.cpp` loads the entire motion DAT into a
 /// name-keyed map and picks the right pose by string, so the
 /// 4-char name (`btl0`/`btl1`) acts as the protocol-level handle.
@@ -156,13 +176,16 @@ fn load_battle_idle(motion_dat_id: u32) -> Option<Mo2Animation> {
     load_anim_with_prefix(motion_dat_id, BATTLE_IDLE_PREFIX)
 }
 
-/// Load the casual (non-combat) run animation from a *skeleton* DAT.
+/// Load the `run0` (legs/feet layer) run animation from a *skeleton* DAT.
 /// Lotus's classic-input `playAnimationLoop("run", speed)` resolves
 /// against the skeleton DAT's animation map
 /// (`actor_skeleton_static.cpp:86-108`), which is where `run0` lives
-/// for PCs (16-bone LOD). NPC skeleton DATs also carry `run` when
-/// they're meant to relocate; non-relocating NPCs return `None` and
-/// the caller stays on idle.
+/// for PCs. NPC skeleton DATs also carry `run` when they're meant to
+/// relocate; non-relocating NPCs return `None` and the caller stays on idle.
+///
+/// `run0` is one HALF of the run cycle (legs/feet only); a faithful run needs
+/// the `run1` arms/spine layer composited on top — see [`RUN_ANIMS`]. The
+/// legacy `dat_vos2` path that calls this only plays one layer at a time.
 pub fn run_anim_for_skel(skel_file_id: u32) -> Option<Arc<Mo2Animation>> {
     let map = RUN_ANIMS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().ok()?;
@@ -174,13 +197,18 @@ pub fn run_anim_for_skel(skel_file_id: u32) -> Option<Arc<Mo2Animation>> {
     loaded
 }
 
-/// Load the combat (battle-aware) run animation from the PC race's
-/// motion DAT. This is `run1` (68-bone full rig) — lotus picks it
-/// via `battle_animations[index]` in
-/// `actor_skeleton_static.cpp:205-208` when the actor is engaged.
+/// Load the `run1` (spine/arms/head layer) run animation from the PC race's
+/// motion DAT.
 ///
-/// Returns `None` for non-PC skeletons (NPCs etc.); caller should
-/// fall back to [`run_anim_for_skel`] or to idle.
+/// MISNOMER WARNING: this is NOT a "combat run". `run1` is the disjoint
+/// upper-body LAYER of the casual run cycle — it composites with `run0`
+/// (legs, from the skeleton DAT) for EVERY run, engaged or not (verified by
+/// `zz-anim-cov`: `run1` = ~40 spine/arms/head joints, no leg joints). A real
+/// engaged/combat run would come from a weapon-specific BATTLE directory
+/// resolved by weapon class (XIM Actor.kt:430), not from `run1`. Kept only for
+/// the legacy `dat_vos2` path; the live faithful path composites both layers.
+///
+/// Returns `None` for non-PC skeletons (NPCs etc.).
 pub fn combat_run_anim_for_skel(skel_file_id: u32) -> Option<Arc<Mo2Animation>> {
     let motion_dat = motion_dat_for_skel(skel_file_id)?;
     let map = COMBAT_RUN_ANIMS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -350,7 +378,14 @@ pub fn load_anim_with_prefix(file_id: u32, prefix: &[u8; 3]) -> Option<Mo2Animat
 pub enum ClipId {
     Idle,
     BattleIdle,
+    /// `run0` (legs/feet layer) in the legacy single-layer `dat_vos2` path.
     Run,
+    /// MISNOMER: `run1` (spine/arms/head layer), NOT a distinct combat run.
+    /// The legacy `dat_vos2` path swaps `Run`->`CombatRun` (legs->upper body)
+    /// when engaged, which is wrong — it shows only the upper-body layer with
+    /// no legs. The live faithful path composites BOTH layers and has no such
+    /// swap. A genuine engaged run would come from a weapon-class battle dir,
+    /// not from `run1`. Retained only to keep the legacy path compiling.
     CombatRun,
     /// Backpedal — currently always resolves to `Run` played at
     /// negative time-scale (no `bck` clip exists on PC skeletons we
@@ -482,6 +517,13 @@ pub struct MotionSample {
     /// keeps above [`EntityMotion::MOVE_THRESHOLD`] regardless of frame rate.
     pub smooth_vx: f32,
     pub smooth_vz: f32,
+    /// Latched "is moving" state with hysteresis (see
+    /// [`EntityMotion::apply_move_hysteresis`]). Crossing a single threshold
+    /// chatters idle↔run when `speed` hovers at the boundary; the latch only
+    /// flips on the wider [`EntityMotion::MOVE_ENTER`] /
+    /// [`EntityMotion::MOVE_EXIT`] bands. [`EntityMotion::is_moving`] reads
+    /// this, NOT the raw `speed`.
+    pub moving: bool,
 }
 
 #[derive(Resource, Default)]
@@ -491,15 +533,13 @@ pub struct EntityMotion {
 }
 
 impl EntityMotion {
-    /// Pure decision: is this entity currently moving fast enough
-    /// to warrant a run animation? Threshold tuned to filter out
-    /// floor-snap jitter (`scene::apply_visual_smoothing`) without
-    /// missing actual locomotion. FFXI base run speed is ~5
-    /// yalms/sec, so 0.5 is well below the genuine-motion floor.
+    /// Is this entity currently moving (latched, hysteretic)? Reads the
+    /// [`MotionSample::moving`] latch that `track_entity_motion_system`
+    /// maintains via [`apply_move_hysteresis`](Self::apply_move_hysteresis) —
+    /// NOT the raw `speed` — so a steady walker right at the boundary doesn't
+    /// flip idle↔run every few frames.
     pub fn is_moving(&self, id: u32) -> bool {
-        self.by_id
-            .get(&id)
-            .is_some_and(|s| s.speed > Self::MOVE_THRESHOLD)
+        self.by_id.get(&id).is_some_and(|s| s.moving)
     }
 
     /// Lookup the full sample. Returns `None` for never-seen ids.
@@ -507,8 +547,30 @@ impl EntityMotion {
         self.by_id.get(&id).copied()
     }
 
-    /// Minimum xz speed in yalms/sec to count as "moving".
+    /// Hysteresis for the [`MotionSample::moving`] latch: enter the moving
+    /// state only above [`MOVE_ENTER`](Self::MOVE_ENTER), leave it only below
+    /// [`MOVE_EXIT`](Self::MOVE_EXIT), and hold the previous state in between.
+    /// The gap between the two thresholds is what kills idle↔run chatter near
+    /// the boundary.
+    pub fn apply_move_hysteresis(prev_moving: bool, speed: f32) -> bool {
+        if speed >= Self::MOVE_ENTER {
+            true
+        } else if speed <= Self::MOVE_EXIT {
+            false
+        } else {
+            prev_moving
+        }
+    }
+
+    /// Minimum xz speed in yalms/sec to count as "moving" (legacy single
+    /// threshold; superseded by the [`MOVE_ENTER`](Self::MOVE_ENTER) /
+    /// [`MOVE_EXIT`](Self::MOVE_EXIT) hysteresis band but retained for the
+    /// walk/run boundary lower bound and existing call sites).
     pub const MOVE_THRESHOLD: f32 = 0.5;
+    /// Upper hysteresis band: speed must exceed this to flip idle→moving.
+    pub const MOVE_ENTER: f32 = 0.8;
+    /// Lower hysteresis band: speed must drop below this to flip moving→idle.
+    pub const MOVE_EXIT: f32 = 0.35;
     /// Minimum |heading_rate| in rad/sec to count as "turning in place".
     /// ~28°/sec — above sample noise, well below combat-cam yaw flicks.
     pub const TURN_THRESHOLD_RAD_PER_SEC: f32 = 0.5;
@@ -598,8 +660,241 @@ pub fn track_entity_motion_system(
                 heading_rate,
                 smooth_vx,
                 smooth_vz,
+                moving: EntityMotion::apply_move_hysteresis(prev.moving, speed),
             },
         );
+    }
+}
+
+// =========================================================================
+// Dead-reckoning ("object in motion stays in motion") for remote actors
+// =========================================================================
+//
+// The wire snapshot for other actors (Mob/Pc/Pet) only changes on
+// packet-arrival frames (`snapshot::ingest_system` flips `dirty` only when
+// the session mutated), and `scene::sync_entities_system` early-returns on
+// `!dirty`. So without prediction a remote actor's Bevy `Transform` freezes
+// between server updates and then jumps — the classic stop-start stutter,
+// which also flips the locomotion clip idle↔run every tick.
+//
+// This module makes the predictor the SOLE writer of the rendered XZ + facing
+// for moving non-self kinds. `sync_entities_system` pushes each server sample
+// in via [`EntityPrediction::observe`]; [`predict_entities_system`] runs every
+// frame (NOT gated on `dirty`), extrapolating along the last-known velocity
+// and rubber-banding the rendered position toward the server-authoritative
+// track. Self is exempt (locally integrated + reconciled in the client crate);
+// static Npc/Other keep their direct transform write in `sync_entities_system`.
+
+/// Per-entity dead-reckoning state. See module note above.
+#[derive(Clone, Copy, Debug)]
+pub struct PredictSample {
+    /// Position we actually write to `Transform` (XZ dead-reckoned, Y smoothed).
+    pub rendered_pos: Vec3,
+    /// Last server-authoritative position (Bevy space) — the rubber-band anchor.
+    pub server_pos: Vec3,
+    /// `server_pos` at the previous ingest — used to derive measured velocity.
+    pub last_server_pos: Vec3,
+    /// Smoothed dead-reckon velocity (Bevy XZ; y always 0).
+    pub dr_velocity: Vec3,
+    /// Last server heading (u8 LSB convention).
+    pub target_heading: u8,
+    /// Heading actually applied this frame (radians, "heading space" — the
+    /// `Quat::from_rotation_y(-rendered_heading_rad)` sign matches
+    /// `scene::heading_to_quat`). Slewed toward `target_heading`.
+    pub rendered_heading_rad: f32,
+    /// Seconds since the current `server_pos` arrived (drives Δt, the
+    /// server-track extrapolation, and the stale-velocity decay).
+    pub secs_since_update: f32,
+    /// Set by `observe` when `server_pos` actually moved; consumed (cleared)
+    /// by the predictor's ingest path. A HP-only tick that preserves position
+    /// must NOT raise this (else it re-ingests a zero Δpos and decays velocity).
+    pub sample_dirty: bool,
+    /// False until the first server sample seeds the entry.
+    pub initialized: bool,
+}
+
+impl PredictSample {
+    fn seed(server_pos: Vec3, heading: u8) -> Self {
+        PredictSample {
+            rendered_pos: server_pos,
+            server_pos,
+            last_server_pos: server_pos,
+            dr_velocity: Vec3::ZERO,
+            target_heading: heading,
+            rendered_heading_rad: heading_to_rad(heading),
+            secs_since_update: 0.0,
+            sample_dirty: false,
+            initialized: true,
+        }
+    }
+}
+
+/// Per-wire-entity dead-reckoning table, keyed by `Entity::id`. Parallel to
+/// [`EntityMotion`]; drained on the same stale-id set in
+/// `scene::sync_entities_system` and cleared on `OnExit(AppPhase::InGame)`.
+#[derive(Resource, Default)]
+pub struct EntityPrediction {
+    pub by_id: HashMap<u32, PredictSample>,
+}
+
+impl EntityPrediction {
+    /// Discontinuity gate (yalm²): if the fresh server position is farther than
+    /// this from where we predicted the actor to be, snap instead of
+    /// dead-reckoning (teleport / zone / respawn). Reuses
+    /// `scene::SNAP_DIST_SQ`'s 2-yalm gate. Compared against `rendered_pos`,
+    /// NOT `last_server_pos`, so a fast mover whose prediction is tracking the
+    /// server doesn't snap every tick.
+    pub const SNAP_DIST_SQ: f32 = 4.0;
+    /// Accel/decel time constant: how fast `dr_velocity` blends toward the
+    /// freshly-measured velocity. Never hard-set, so direction/speed changes
+    /// ease in.
+    pub const VEL_BLEND_TAU: f32 = 0.20;
+    /// Rubber-band time constant: how fast `rendered_pos` converges to the
+    /// extrapolated server track. Kept tight so the rendered position never
+    /// drifts far from the server-authoritative one (the server's 3D range
+    /// check uses the true position, so the operator must be aiming near it).
+    pub const CORRECT_TAU: f32 = 0.12;
+    /// Vertical smoothing time constant. Y is server-authoritative and NOT
+    /// dead-reckoned (extrapolating Y floats actors through terrain steps the
+    /// server resolves discretely); just low-passed toward `server_pos.y`.
+    pub const Y_TAU: f32 = 0.15;
+    /// Heading slew time constant.
+    pub const HEADING_TAU: f32 = 0.10;
+    /// Once a sample is older than [`STALE_VEL_SECS`](Self::STALE_VEL_SECS),
+    /// decay `dr_velocity` with this time constant so an actor that stops
+    /// getting updates coasts to a stop instead of drifting forever.
+    pub const DECEL_TAU: f32 = 0.25;
+    /// Age (seconds) past which `dr_velocity` starts decaying (~2 missed ticks).
+    pub const STALE_VEL_SECS: f32 = 0.6;
+    /// Velocity clamp (yalms/sec): base run ≈5, leaving headroom for
+    /// haste/mounts without letting one jumpy sample fling the prediction.
+    pub const MAX_DR_SPEED: f32 = 7.0;
+    /// Δt ceiling (seconds): a gap longer than this is a stall/respawn, treated
+    /// as a discontinuity (snap) rather than a velocity estimate.
+    pub const DT_SERVER_CEIL: f32 = 1.0;
+    /// XZ-distance² (yalm²) a server sample must move before it counts as a new
+    /// position. Filters HP-only ticks that re-send the preserved position.
+    const SAMPLE_EPSILON_SQ: f32 = 1e-4;
+
+    /// Push a server sample for a moving non-self entity. Seeds the entry on
+    /// first sight (no lurch from origin); afterward records the new
+    /// `server_pos` + heading and raises `sample_dirty` only when the position
+    /// actually changed.
+    pub fn observe(&mut self, id: u32, server_pos: Vec3, heading: u8) {
+        match self.by_id.get_mut(&id) {
+            None => {
+                self.by_id.insert(id, PredictSample::seed(server_pos, heading));
+            }
+            Some(e) => {
+                if e.server_pos.distance_squared(server_pos) > Self::SAMPLE_EPSILON_SQ {
+                    e.server_pos = server_pos;
+                    e.sample_dirty = true;
+                }
+                e.target_heading = heading;
+            }
+        }
+    }
+}
+
+/// FFXI heading byte → radians in "heading space" (0..τ). The applied
+/// rotation is `Quat::from_rotation_y(-rad)`, matching `scene::heading_to_quat`.
+#[inline]
+fn heading_to_rad(heading: u8) -> f32 {
+    (heading as f32) * std::f32::consts::TAU / 256.0
+}
+
+/// Frame-rate-independent exponential approach: move `from` a fraction of the
+/// way to `to` such that the gap decays with time constant `tau`.
+#[inline]
+fn exp_approach(from: f32, to: f32, tau: f32, dt: f32) -> f32 {
+    let alpha = 1.0 - (-dt / tau.max(1e-4)).exp();
+    from + alpha * (to - from)
+}
+
+/// Advance one dead-reckoning sample by `dt`, consuming a fresh server sample
+/// first when `sample_dirty`. Pure so it can be unit-tested without Bevy.
+/// Returns the `(rendered_pos, rendered_heading_rad)` to apply to the transform.
+fn advance_prediction(s: &mut PredictSample, dt: f32) -> (Vec3, f32) {
+    use std::f32::consts::{PI, TAU};
+
+    // --- Ingest a fresh server sample (if one arrived this frame) ---
+    if s.sample_dirty {
+        s.sample_dirty = false;
+        let dt_server = s.secs_since_update;
+        let discontinuity = dt_server > EntityPrediction::DT_SERVER_CEIL
+            || s.server_pos.distance_squared(s.rendered_pos) >= EntityPrediction::SNAP_DIST_SQ;
+        if discontinuity {
+            // Teleport / zone / respawn: snap, never seed velocity.
+            s.rendered_pos = s.server_pos;
+            s.dr_velocity = Vec3::ZERO;
+        } else {
+            let dt_eff = dt_server.max(1e-3);
+            let mut v_meas = (s.server_pos - s.last_server_pos) / dt_eff;
+            v_meas.y = 0.0;
+            let alpha = 1.0 - (-dt_eff / EntityPrediction::VEL_BLEND_TAU).exp();
+            s.dr_velocity += (v_meas - s.dr_velocity) * alpha;
+            s.dr_velocity.y = 0.0;
+            let speed = s.dr_velocity.length();
+            if speed > EntityPrediction::MAX_DR_SPEED {
+                s.dr_velocity *= EntityPrediction::MAX_DR_SPEED / speed;
+            }
+        }
+        s.last_server_pos = s.server_pos;
+        s.secs_since_update = 0.0;
+    }
+
+    // --- Advance every frame: dead-reckon + rubber-band toward server track ---
+    let mut pos = s.rendered_pos + s.dr_velocity * dt;
+    let server_track = s.server_pos + s.dr_velocity * s.secs_since_update;
+    // XZ converges to the extrapolated server track; Y just smooths to server.
+    pos.x = exp_approach(pos.x, server_track.x, EntityPrediction::CORRECT_TAU, dt);
+    pos.z = exp_approach(pos.z, server_track.z, EntityPrediction::CORRECT_TAU, dt);
+    pos.y = exp_approach(s.rendered_pos.y, s.server_pos.y, EntityPrediction::Y_TAU, dt);
+    s.rendered_pos = pos;
+
+    s.secs_since_update += dt;
+    if s.secs_since_update > EntityPrediction::STALE_VEL_SECS {
+        s.dr_velocity *= (-dt / EntityPrediction::DECEL_TAU).exp();
+    }
+
+    // --- Heading slew (unwrap across the 0/τ seam) ---
+    let target = heading_to_rad(s.target_heading);
+    let mut dh = target - s.rendered_heading_rad;
+    dh = dh.rem_euclid(TAU);
+    if dh > PI {
+        dh -= TAU;
+    }
+    let alpha_h = 1.0 - (-dt / EntityPrediction::HEADING_TAU).exp();
+    s.rendered_heading_rad += dh * alpha_h;
+
+    (s.rendered_pos, s.rendered_heading_rad)
+}
+
+/// Per-frame: dead-reckon the rendered transform for every moving non-self
+/// actor from its [`EntityPrediction`] entry. Runs after
+/// `scene::sync_entities_system` (which feeds server samples in) and before
+/// [`track_entity_motion_system`] (which then reads the now-smooth transform).
+/// NOT gated on `SceneState::dirty` — that's the whole point: it advances on
+/// the frames between server packets.
+pub fn predict_entities_system(
+    time: Res<Time>,
+    mut prediction: ResMut<EntityPrediction>,
+    mut q: Query<(&WorldEntity, &mut Transform), Without<IsSelf>>,
+) {
+    let dt = time.delta_secs().max(1e-4);
+    for (world, mut transform) in &mut q {
+        if !matches!(world.kind, EntityKind::Mob | EntityKind::Pc | EntityKind::Pet) {
+            continue;
+        }
+        let Some(sample) = prediction.by_id.get_mut(&world.id) else {
+            continue;
+        };
+        if !sample.initialized {
+            continue;
+        }
+        let (pos, heading_rad) = advance_prediction(sample, dt);
+        transform.translation = pos;
+        transform.rotation = Quat::from_rotation_y(-heading_rad);
     }
 }
 
@@ -815,10 +1110,13 @@ mod tests {
         assert!(!s.is_resting());
     }
 
-    /// Combat run lives in the motion DAT as `run1` (68-bone LOD).
-    /// Distinct from casual `run0` — verify both load and that the
-    /// motion-DAT version has the higher bone count so a future
-    /// "wait, am I getting the right LOD" bug fails loudly.
+    /// `run1` (motion DAT) and `run0` (skeleton DAT) are DISJOINT body-region
+    /// LAYERS, not LODs: `run0` = ~12 legs/feet joints, `run1` = ~40 spine/
+    /// arms/head joints (verified by `zz-anim-cov`). Because `run1` covers the
+    /// larger upper-body region it has the higher bone count — this test pins
+    /// that both load and that the layer sizes don't silently swap (which would
+    /// flag a DAT-routing regression), NOT that one is a higher LOD of the
+    /// other. Neither is "combat" vs "casual"; see [`COMBAT_RUN_ANIMS`].
     #[test]
     fn combat_run_resolves_with_higher_bone_count_than_casual() {
         if DatRoot::from_env_or_default().is_err() {
