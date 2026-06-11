@@ -55,7 +55,8 @@ impl NavMesh for LoadedNav {
 use tokio::sync::{broadcast, mpsc};
 
 use crate::state::{
-    ActionKind, AgentCommand, AgentEvent, EntityKind, ReactorGoalSnapshot, SessionState, Vec3,
+    model_radius, ActionKind, AgentCommand, AgentEvent, EntityKind, ReactorGoalSnapshot,
+    SessionState, Vec3, CONTACT_GAP,
 };
 
 /// Reactor parameters. Defaults match the plan's "tactical loop" target.
@@ -740,7 +741,7 @@ impl Reactor {
             } => {
                 let mut commands = Vec::new();
                 if !attack_issued {
-                    if let Some((act_index, _)) = self.entity_target_info(target_id) {
+                    if let Some((act_index, _, _)) = self.entity_target_info(target_id) {
                         commands.push(AgentCommand::Action {
                             target_id,
                             target_index: act_index,
@@ -898,19 +899,29 @@ impl Reactor {
             .unwrap_or_default()
     }
 
-    fn entity_target_info(&self, target_id: u32) -> Option<(u16, Vec3)> {
+    fn entity_target_info(&self, target_id: u32) -> Option<(u16, Vec3, EntityKind)> {
         self.state
             .entities
             .iter()
             .find(|e| e.id == target_id)
-            .map(|e| (e.act_index, e.pos))
+            .map(|e| (e.act_index, e.pos, e.kind))
     }
 
-    fn step_toward_entity(&self, target_id: u32, hold_distance: f32) -> Option<AgentCommand> {
-        let (_, target_pos) = self.entity_target_info(target_id)?;
+    /// Step toward `target_id`, holding at model-radius contact.
+    ///
+    /// `min_hold` is a floor on the stop distance (yalms, center-to-center):
+    /// `/follow` passes `0.0` so the approach stops exactly when the two
+    /// models' radii touch, while callers that want an explicit standoff
+    /// (relay `Follow`, a restored persisted goal) still get at least that
+    /// distance. Self is always a PC; the target radius is read from its
+    /// kind. Mirrors the native lock-on/auto-run clamp in `view_native::input`.
+    fn step_toward_entity(&self, target_id: u32, min_hold: f32) -> Option<AgentCommand> {
+        let (_, target_pos, target_kind) = self.entity_target_info(target_id)?;
+        let hold =
+            min_hold.max(model_radius(EntityKind::Pc) + model_radius(target_kind) + CONTACT_GAP);
         let cur = self.self_pos();
         let dist = horizontal_distance(cur, target_pos);
-        if dist <= hold_distance {
+        if dist <= hold {
             return None;
         }
         let step = self.effective_step_per_tick();
@@ -920,7 +931,7 @@ impl Reactor {
             // and then get broadcast as a speedhack-shaped delta.
             return None;
         }
-        let step_size = (dist - hold_distance).min(step);
+        let step_size = (dist - hold).min(step);
         let stepped = step_point(cur, target_pos, step_size);
         Some(mk_move(stepped, heading_toward(cur, target_pos)))
     }
@@ -959,7 +970,7 @@ impl Reactor {
     }
 
     fn face_entity(&self, target_id: u32) -> Option<AgentCommand> {
-        let (_, target_pos) = self.entity_target_info(target_id)?;
+        let (_, target_pos, _) = self.entity_target_info(target_id)?;
         let cur = self.self_pos();
         Some(mk_move(cur, heading_toward(cur, target_pos)))
     }
@@ -1473,6 +1484,127 @@ mod tests {
             distance: 5.0,
         });
         assert!(r.tick().commands.is_empty(), "no entity → no movement");
+    }
+
+    #[test]
+    fn follow_holds_at_pc_model_radius() {
+        // `/follow` passes distance 0.0, so the hold collapses to the two
+        // PCs' model radii (0.35 + 0.35 ≈ 0.70). 0.8 yalms apart still steps
+        // (the old fixed 3.0 hold would have stood still here); inside the
+        // contact ring it holds.
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        r.observe_event(&upsert(1, Vec3::default(), 100, EntityKind::Pc, 1));
+        r.observe_event(&upsert(
+            2,
+            Vec3 {
+                x: 0.8,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            2,
+        ));
+        r.handle_command(AgentCommand::Follow {
+            target_id: 2,
+            distance: 0.0,
+        });
+        assert_eq!(
+            r.tick().commands.len(),
+            1,
+            "outside PC contact radius (0.8 > ~0.70): step"
+        );
+
+        r.observe_event(&upsert(
+            2,
+            Vec3 {
+                x: 0.6,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            2,
+        ));
+        assert!(
+            r.tick().commands.is_empty(),
+            "inside PC contact radius (0.6 < ~0.70): hold"
+        );
+    }
+
+    #[test]
+    fn follow_hold_scales_with_target_kind() {
+        // A Mob's larger radius (0.55) pushes the contact ring to ~0.90, so
+        // 0.8 yalms — where a PC target would still step — holds against a Mob.
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        r.observe_event(&upsert(1, Vec3::default(), 100, EntityKind::Pc, 1));
+        r.observe_event(&upsert(
+            2,
+            Vec3 {
+                x: 0.8,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Mob,
+            2,
+        ));
+        r.handle_command(AgentCommand::Follow {
+            target_id: 2,
+            distance: 0.0,
+        });
+        assert!(
+            r.tick().commands.is_empty(),
+            "inside Mob contact radius (0.8 < ~0.90): hold"
+        );
+
+        r.observe_event(&upsert(
+            2,
+            Vec3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Mob,
+            2,
+        ));
+        assert_eq!(
+            r.tick().commands.len(),
+            1,
+            "outside Mob contact radius (1.0 > ~0.90): step"
+        );
+    }
+
+    #[test]
+    fn follow_distance_floor_still_honored() {
+        // Callers other than `/follow` (relay Follow, a restored persisted
+        // goal) can still request an explicit standoff: `distance` is a floor,
+        // so 5.0 dominates the ~0.70 model-contact and holds 4 yalms out.
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        r.observe_event(&upsert(1, Vec3::default(), 100, EntityKind::Pc, 1));
+        r.observe_event(&upsert(
+            2,
+            Vec3 {
+                x: 4.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Pc,
+            2,
+        ));
+        r.handle_command(AgentCommand::Follow {
+            target_id: 2,
+            distance: 5.0,
+        });
+        assert!(
+            r.tick().commands.is_empty(),
+            "within explicit floor distance (4.0 < 5.0): hold"
+        );
     }
 
     #[test]

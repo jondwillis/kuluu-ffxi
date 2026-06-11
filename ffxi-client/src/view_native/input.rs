@@ -20,10 +20,13 @@
 //!             unchanged until W/S press, which snaps it to camera-forward.
 //!   ↑/↓       camera pitch (↑ raises camera/more overhead, ↓ lowers it).
 //!   R         toggle autorun while forward is currently held.
-//!   Tab       sweep targets left-to-right across the screen. First press
-//!             picks the entity nearest the camera-frustum center; further
-//!             presses step rightward through visible (plus slightly-out-
-//!             of-view) entities. Mirrors FFXI retail.
+//!   Tab       cycle on-screen targets. First press picks the nearest
+//!             on-screen entity (party/own-pet sorted last); further
+//!             presses step through a stable, frozen order one per press
+//!             until every candidate is visited, then rebuild. Off-screen
+//!             entities are never cycled. Mirrors FFXI retail.
+//!   Enter     with no target, acquires the nearest on-screen entity (same
+//!             pick as Tab); with a target, acts on it (see text_input.rs).
 //!   Esc       clear target selection (does NOT close the window).
 //!   F8        toggle first-person camera. In FP, the cursor is locked
 //!             (pointer-lock on web) and mouse-look (C3) drives heading 1:1.
@@ -48,6 +51,7 @@
 //! tap-R from a standstill is a noop). Cancels: S press immediately, or
 //! A/D held ≥ STRAFE_CANCEL_MS so a quick sidestep tap doesn't kill it.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use bevy::ecs::system::SystemParam;
@@ -70,7 +74,7 @@ use ffxi_viewer_core::{
     ChatBuffer, CursorLockRequest, InputMode, IsSelf, LockOn, LockOnToggle, MenuStack,
     OperatorCamera, PassiveCursorState, SceneState, Target, WorldEntity,
 };
-use ffxi_viewer_wire::{Entity as WireEntity, Vec3 as WireVec3};
+use ffxi_viewer_wire::{Entity as WireEntity, EntityKind, Vec3 as WireVec3};
 use tokio::sync::mpsc;
 
 use crate::state::{ActionKind, AgentCommand};
@@ -250,6 +254,7 @@ pub fn handle_input_system(
     mut exit: MessageWriter<AppExit>,
     mut rest_stance: ResMut<ffxi_viewer_core::combat_stance::RestStance>,
     mut walk_mode: ResMut<ffxi_viewer_core::combat_stance::WalkMode>,
+    mut tab_stack: ResMut<TabCycleStack>,
 ) {
     let camera_mode = &mut camera.mode;
     let chase = &mut camera.chase;
@@ -340,21 +345,56 @@ pub fn handle_input_system(
         // FFXI: Esc deselects (target → none, menus close). No quit.
         target.id = None;
     }
-    if bindings.just_pressed(Action::CycleTarget, &keys) {
-        // Viewport-aware Tab: only entities currently inside the camera
-        // frustum are candidates. First press picks the *nearest*; later
-        // presses cycle left-to-right across the screen. Mirrors retail
-        // FFXI better than "all targetable, sorted by distance" — Tab
-        // shouldn't ever land on something behind the player or off-screen.
+
+    // Tab cycle and Enter-with-no-target acquire share one on-screen,
+    // *stable* stack (`TabCycleStack`): the candidate order is built once
+    // and stepped through one pop per press, so Tab reliably advances
+    // through a crowd instead of oscillating. Both need the camera
+    // projection — which only this system has — so the Enter *acquire*
+    // lives here, next to Tab. The Enter *act* on an existing target
+    // (Talk for NPCs / action menu for combatants) stays in
+    // `text_input.rs`'s logical-key path so that opening a menu doesn't
+    // immediately re-dispatch the same Enter event into it.
+    let tab = bindings.just_pressed(Action::CycleTarget, &keys);
+    // Enter acquires here only when nothing is targeted yet; with a target
+    // it's an "act" handled in `handle_world_key`. Suppressed while dead —
+    // the death prompt routes Enter to `ReturnToHomePoint`.
+    let enter_acquire = bindings.just_pressed(Action::ConfirmAction, &keys)
+        && target.id.is_none()
+        && !ffxi_viewer_core::hud::death_prompt::is_dead(&state);
+    if tab || enter_acquire {
         if let Ok((camera, cam_t)) = cam_q.single() {
             let cam_global = GlobalTransform::from(*cam_t);
-            target.id = cycle_target_viewport(
+            // Party members + own pet sort to the end of the cycle. No
+            // entity-level `owner` on the wire, so the owned-pet test
+            // reuses the codebase's `Pet && claim_id == self` heuristic
+            // (same as `/targetnpcparty`).
+            let party_ids: Vec<u32> = state.snapshot.party.iter().map(|p| p.id).collect();
+            let owner = state.snapshot.self_char_id.unwrap_or(0);
+            let owned_pet_ids: Vec<u32> = state
+                .snapshot
+                .entities
+                .iter()
+                .filter(|e| matches!(e.kind, EntityKind::Pet) && e.claim_id == owner)
+                .map(|e| e.id)
+                .collect();
+            // `None` = no on-screen candidate to advance to → keep the
+            // current target (XIM `targetCycle` returns false / no change).
+            // An empty Tab must never *clear* the target, and Enter-acquire
+            // with nothing on-screen leaves `target.id` as `None` so
+            // `handle_world_key` opens the no-target menu.
+            if let Some(next) = tab_cycle_next(
+                &mut tab_stack,
                 &state.snapshot.entities,
                 state.snapshot.self_pos.pos,
                 target.id,
                 state.snapshot.self_char_id,
+                &party_ids,
+                &owned_pet_ids,
                 |world_pos| camera.world_to_ndc(&cam_global, world_pos),
-            );
+            ) {
+                target.id = Some(next);
+            }
         }
     }
 
@@ -894,6 +934,27 @@ pub fn dispatch_movement_system(
             })
     });
 
+    // Lock-on contact clamp: how far we may still advance *toward* the
+    // locked target before the player's model touches the target's model.
+    // `None` when nothing is locked (no clamp). Computed from `basis_pos`
+    // (the prediction-authoritative position the step is applied to) so
+    // multiple FixedUpdate runs per render frame stay stable. Used to cap
+    // forward motion below so we hold at contact instead of overshooting and
+    // re-facing — and chasing resumes naturally when the target walks away.
+    let lock_forward_allowance: Option<f32> = lock_on.target_id.and_then(|id| {
+        state
+            .snapshot
+            .entities
+            .iter()
+            .find(|e| e.id == id)
+            .map(|ent| {
+                let stop = crate::state::MODEL_RADIUS_PC
+                    + radius_for_wire_kind(ent.kind)
+                    + crate::state::CONTACT_GAP;
+                forward_allowance((basis_pos.x, basis_pos.y), (ent.pos.x, ent.pos.y), stop)
+            })
+    });
+
     // Update camera yaw smoothly every tick while a rotate-direction key is
     // held (float domain — doesn't wait for the u8 heading-accumulator to
     // tick). Keeps the chase camera visibly glued behind the player
@@ -1066,8 +1127,18 @@ pub fn dispatch_movement_system(
     y += turn_dy;
     if forward != 0 && step > 0.0 {
         let (fwd_x, fwd_y) = heading_to_forward(heading);
-        x += fwd_x * step * forward as f32;
-        y += fwd_y * step * forward as f32;
+        // Under lock-on, `heading` points straight at the target, so forward
+        // motion is along the player→target axis. Cap it at the contact-ring
+        // allowance so we stop on contact instead of overshooting and
+        // flipping 180° to re-face. Only when advancing (forward > 0):
+        // backpedal stays unclamped so you can always back away, and strafe
+        // (below) is untouched so you can still orbit a contacted target.
+        let fwd_step = match (forward > 0, lock_forward_allowance) {
+            (true, Some(allowed)) => step.min(allowed),
+            _ => step,
+        };
+        x += fwd_x * fwd_step * forward as f32;
+        y += fwd_y * fwd_step * forward as f32;
     }
     if strafe != 0 && step > 0.0 {
         // Strafe-right = heading + 90° (clockwise viewed from above, FFXI
@@ -1149,6 +1220,33 @@ fn heading_to_forward(heading: u8) -> (f32, f32) {
     (angle.cos(), -angle.sin())
 }
 
+/// Model collision radius for a wire entity kind, in yalms. Bridges the
+/// `ffxi_viewer_wire::EntityKind` of snapshot entities to the single source
+/// of truth (`crate::state::MODEL_RADIUS_*`), so the lock-on/auto-run clamp
+/// and the reactor follow goal use identical numbers. (Inline match over the
+/// wire enum, mirroring the precedent in `text_input.rs`.)
+fn radius_for_wire_kind(kind: EntityKind) -> f32 {
+    match kind {
+        EntityKind::Pc => crate::state::MODEL_RADIUS_PC,
+        EntityKind::Npc => crate::state::MODEL_RADIUS_NPC,
+        EntityKind::Mob => crate::state::MODEL_RADIUS_MOB,
+        EntityKind::Pet => crate::state::MODEL_RADIUS_PET,
+        EntityKind::Other => crate::state::MODEL_RADIUS_OTHER,
+    }
+}
+
+/// Remaining distance the player may advance toward a target before its
+/// model touches the target's, given a center-to-center `stop` distance.
+/// `0.0` once already at or inside contact (never negative), so a caller
+/// clamping forward motion with `step.min(allowance)` holds at the ring and
+/// never pushes through. Ground plane only (x, y).
+fn forward_allowance(from_xy: (f32, f32), target_xy: (f32, f32), stop: f32) -> f32 {
+    let dx = target_xy.0 - from_xy.0;
+    let dy = target_xy.1 - from_xy.1;
+    let dist = (dx * dx + dy * dy).sqrt();
+    (dist - stop).max(0.0)
+}
+
 /// Map an angle difference into `[-π, π]` so the turn handler's heading
 /// and chase-yaw lerps always take the shortest arc around the modular
 /// τ boundary.
@@ -1158,54 +1256,75 @@ fn wrap_signed_pi(x: f32) -> f32 {
     (x + PI).rem_euclid(TAU) - PI
 }
 
-/// Pure helper: viewport-aware Tab cycle, FFXI-retail style.
+/// Persistent Tab/Enter target-cycle state. This is what makes the cycle
+/// *stable*: instead of recomputing the candidate order on every press
+/// (the old `cycle_target_viewport`, whose score shifted frame-to-frame as
+/// entities/camera moved, so Tab oscillated), we build the ordered list
+/// **once** into `ids`, pop one per press, and only rebuild when the stack
+/// empties or goes idle. Mirrors XIM's `PlayerTargetSelector.TargetStack`
+/// (research/xim/.../game/PlayerTargetSelector.kt:18-117).
+#[derive(Resource, Default)]
+pub struct TabCycleStack {
+    /// Ordered candidate ids, front = next to pop. Built once per refresh.
+    ids: VecDeque<u32>,
+    /// Seconds since the last cycle advance (Tab / Enter-acquire). Ticked
+    /// in `tab_cycle_invalidate_system`; past the reset threshold the stack
+    /// is cleared so the next press rebuilds from the current nearest.
+    idle_secs: f32,
+    /// The id the cycle itself last wrote to `Target.id`. Lets
+    /// `tab_cycle_invalidate_system` tell an internal advance (keep the
+    /// stack) from an external target change — Esc / click / slash / party
+    /// key (rebuild the stack) — without threading a reset through every
+    /// `target.id =` site.
+    last_emitted: Option<u32>,
+}
+
+/// Build the ordered Tab/Enter candidate list (front = best pick). Pure and
+/// testable; the camera is injected as `project`.
 ///
 /// `project` maps an FFXI world position to NDC (`[-1, 1]` x/y; z `[0, 1]`
 /// for in-front-of-camera, outside that range = behind / clipped).
-/// Returns `None` when the math fails (camera at the same point as the
-/// entity, etc.) — those entities are silently dropped.
 ///
-/// Cycle behavior:
-/// - First press (no current target, or current target is off-screen):
-///   pick the entity **nearest the screen center** (smallest NDC magnitude)
-///   among those *strictly* inside the camera frustum. World distance is
-///   only used to break ties when two entities share the same angular
-///   position. Falls back to the relaxed-frustum set if nothing is
-///   strictly in-view.
-/// - Subsequent presses: order candidates by hybrid score (same scoring
-///   as first press — nearest in world with a small off-center penalty)
-///   and step to the entry after the current target. Wraps at the end.
-///   This matches FFXI retail's "Tab cycles nearest → next-nearest"
-///   model rather than a screen-x sweep.
+/// **On-screen only** (per retail): an entity must project inside the
+/// (slightly relaxed, [`CYCLE_NDC_LIMIT`]) camera frustum to be eligible —
+/// targets behind the player or well off-screen are never cycled.
 ///
-/// Frustum inclusion is **relaxed** past the strict `[-1, 1]` box (see
-/// [`CYCLE_NDC_LIMIT`]) so that entities sitting just off the screen
-/// edge — the common chase-cam "mob over my shoulder" case — stay in
-/// the cycle. Retail FFXI exhibits the same forgiving behavior.
+/// Ordering keys, in priority order:
+/// 1. **tier** — party members and the player's own pet sort to the *end*,
+///    so plain Tab walks enemies/NPCs/other-PCs first (XIM
+///    `getTargetableActors:168-169`).
+/// 2. **strictly in-frustum** before the relaxed band, so the slightly-
+///    off-screen "mob over the shoulder" entries come last.
+/// 3. **hybrid score** `world_dist + NDC_PENALTY_YALMS·ndc_mag` — nearest
+///    in world with a small screen-offset penalty, the "distance + facing"
+///    proxy for an on-screen candidate set.
 ///
-/// Self is excluded explicitly via `self_id` — the wire entity list
-/// now includes the player's own entry (matched by `self_char_id`),
-/// so Tab would otherwise auto-select self on the first press.
-pub fn cycle_target_viewport<F>(
+/// Self is excluded via `self_id` (the wire entity list includes the
+/// player's own entry, matched by `self_char_id`).
+pub fn build_tab_candidates<F>(
     entities: &[WireEntity],
     from: WireVec3,
-    current: Option<u32>,
     self_id: Option<u32>,
+    party_ids: &[u32],
+    owned_pet_ids: &[u32],
     project: F,
-) -> Option<u32>
+) -> Vec<u32>
 where
     F: Fn(Vec3) -> Option<Vec3>,
 {
     struct Cand {
         id: u32,
-        ndc_mag_sq: f32,
-        dist_sq: f32,
+        tier: u8,
         in_frustum: bool,
+        score: f32,
     }
 
     let mut candidates: Vec<Cand> = entities
         .iter()
         .filter(|e| Some(e.id) != self_id)
+        // `Other` is non-combat filler (doors, transports, unnamed
+        // effects) — never a Tab/Enter target.
+        .filter(|e| !matches!(e.kind, EntityKind::Other))
         .filter_map(|e| {
             // FFXI position → Bevy world: same mapping as `ffxi_to_bevy`.
             // Inlined here so we don't pull a Bevy dep into this fn for
@@ -1218,73 +1337,116 @@ where
             if ndc.z < 0.0 || ndc.z > 1.0 {
                 return None;
             }
-            // Relaxed lateral / vertical cull. Entities well past the
-            // screen edge (more than ~30% beyond the frustum) are out;
-            // anything closer than that may still be in the cycle.
+            // Lateral / vertical cull. Past the (slightly relaxed) screen
+            // edge → off-screen → not eligible.
             if ndc.x.abs() > CYCLE_NDC_LIMIT || ndc.y.abs() > CYCLE_NDC_LIMIT {
                 return None;
             }
             // 3D distance: server range checks use all three axes, so
-            // the cycle's "closeness" tiebreaker has to as well. On a
-            // slope, a 2D-closer mob can be several yalms farther in 3D
-            // and unreachable.
+            // the cycle's "closeness" key has to as well. On a slope, a
+            // 2D-closer mob can be several yalms farther in 3D.
             let dx = e.pos.x - from.x;
             let dy = e.pos.y - from.y;
             let dz = e.pos.z - from.z;
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+            let ndc_mag = (ndc.x * ndc.x + ndc.y * ndc.y).sqrt();
             let in_frustum = ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0;
+            let tier = u8::from(party_ids.contains(&e.id) || owned_pet_ids.contains(&e.id));
             Some(Cand {
                 id: e.id,
-                ndc_mag_sq: ndc.x * ndc.x + ndc.y * ndc.y,
-                dist_sq: dx * dx + dy * dy + dz * dz,
+                tier,
                 in_frustum,
+                score: dist + NDC_PENALTY_YALMS * ndc_mag,
             })
         })
         .collect();
 
-    if candidates.is_empty() {
-        return None;
+    candidates.sort_by(|a, b| {
+        a.tier
+            .cmp(&b.tier)
+            // `true` (strictly in-frustum) sorts before `false`.
+            .then_with(|| b.in_frustum.cmp(&a.in_frustum))
+            .then_with(|| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    candidates.into_iter().map(|c| c.id).collect()
+}
+
+/// Advance the persistent stack one step and return the new target id.
+///
+/// The stack is what keeps the cycle stable: the ordered candidate list is
+/// built once and consumed one pop per press; it rebuilds only when empty
+/// (XIM `PlayerTargetSelector.kt:98-101`). Stale/vanished entries and the
+/// current target are dropped from the front first (XIM `.kt:96`).
+///
+/// Passing `current = None` returns the first pick (nearest on-screen) and
+/// seeds the stack with the rest — this is how Enter-with-no-target
+/// acquires *and* leaves a cycle a following Tab can continue.
+///
+/// Returns `None` when there's nothing to advance to — either no on-screen
+/// candidates at all, or the current target is the only one. The caller
+/// treats `None` as "no change" and keeps the current target, never clears
+/// it (XIM `targetCycle` returns `false` in the same cases).
+#[allow(clippy::too_many_arguments)]
+pub fn tab_cycle_next<F>(
+    stack: &mut TabCycleStack,
+    entities: &[WireEntity],
+    from: WireVec3,
+    current: Option<u32>,
+    self_id: Option<u32>,
+    party_ids: &[u32],
+    owned_pet_ids: &[u32],
+    project: F,
+) -> Option<u32>
+where
+    F: Fn(Vec3) -> Option<Vec3>,
+{
+    // Drop the current target + ids that have left the scene (XIM .kt:96).
+    stack
+        .ids
+        .retain(|id| Some(*id) != current && entities.iter().any(|e| e.id == *id));
+    // Refill only when exhausted — the order stays frozen until every
+    // candidate this round has been visited.
+    if stack.ids.is_empty() {
+        let order =
+            build_tab_candidates(entities, from, self_id, party_ids, owned_pet_ids, &project);
+        stack.ids = order
+            .into_iter()
+            .filter(|id| Some(*id) != current)
+            .collect();
     }
+    let next = stack.ids.pop_front()?;
+    stack.idle_secs = 0.0;
+    stack.last_emitted = Some(next);
+    Some(next)
+}
 
-    let current_in_cycle =
-        current.and_then(|id| candidates.iter().any(|c| c.id == id).then_some(id));
-
-    match current_in_cycle {
-        Some(curr) => {
-            // Cycle by hybrid score (nearest first, with the same
-            // off-center penalty used on first press). Retail FFXI's
-            // Tab cycles nearest → next-nearest, not by screen-x —
-            // walking through a mob crowd, the second Tab should land
-            // on the second-closest mob, not the next one to the right.
-            candidates.sort_by(|a, b| {
-                let sa = a.dist_sq.sqrt() + NDC_PENALTY_YALMS * a.ndc_mag_sq.sqrt();
-                let sb = b.dist_sq.sqrt() + NDC_PENALTY_YALMS * b.ndc_mag_sq.sqrt();
-                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let pos = candidates.iter().position(|c| c.id == curr)?;
-            Some(candidates[(pos + 1) % candidates.len()].id)
-        }
-        None => {
-            // First press: prefer strictly-in-frustum entities; only fall
-            // back to the relaxed set if nothing in-view qualifies. Among
-            // the preferred pool, pick the lowest hybrid score —
-            // world distance (yalms) plus a screen-offset penalty. At
-            // NDC magnitude = 1 (entity at the frustum edge), the entity
-            // is treated as `NDC_PENALTY_YALMS` further than its true
-            // distance. This keeps Tab biased toward what's "in front
-            // of you" while still letting a close off-center mob beat
-            // a far centered one — the previous pure-NDC ranking would
-            // skip the near mob entirely.
-            let any_strict = candidates.iter().any(|c| c.in_frustum);
-            candidates
-                .iter()
-                .filter(|c| !any_strict || c.in_frustum)
-                .min_by(|a, b| {
-                    let sa = a.dist_sq.sqrt() + NDC_PENALTY_YALMS * a.ndc_mag_sq.sqrt();
-                    let sb = b.dist_sq.sqrt() + NDC_PENALTY_YALMS * b.ndc_mag_sq.sqrt();
-                    sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|c| c.id)
-        }
+/// Tick the cycle's idle timer and invalidate the stack on *external*
+/// target changes. One change-detection system replaces a `stack.clear()`
+/// at all eight `target.id =` sites.
+///
+/// The discriminator is [`TabCycleStack::last_emitted`]: `tab_cycle_next`
+/// records every id it writes to `Target.id`, so an internal advance reads
+/// back as `target.id == last_emitted` (keep the stack). Esc-clear, click,
+/// slash `/target*`, party F-keys, and `auto_clear_target_system` all write
+/// `Target.id` *without* touching `last_emitted`, so `id != last_emitted`
+/// clears the stack and the next press rebuilds. On first insert both are
+/// `None`, so `None != None` is false — no spurious clear.
+pub fn tab_cycle_invalidate_system(
+    target: Res<Target>,
+    time: Res<Time>,
+    mut stack: ResMut<TabCycleStack>,
+) {
+    stack.idle_secs += time.delta_secs();
+    if stack.idle_secs > TAB_CYCLE_IDLE_RESET_SECS {
+        stack.ids.clear();
+    }
+    if target.is_changed() && target.id != stack.last_emitted {
+        stack.ids.clear();
+        stack.last_emitted = target.id;
     }
 }
 
@@ -1453,11 +1615,19 @@ pub fn camera_polish_system(
 }
 
 /// How far past the strict `[-1, 1]` NDC frustum an entity may sit and
-/// still appear in the Tab cycle. 1.3 ≈ 15% past each edge — enough to
-/// pick up the "mob just barely off-screen behind your shoulder" case
-/// that FFXI retail tabs to, without inviting entities that are clearly
-/// behind the camera or far peripheral.
-const CYCLE_NDC_LIMIT: f32 = 1.3;
+/// still appear in the Tab cycle. Retail is **on-screen only**, so this is
+/// a small margin (1.1 ≈ 5% past each edge), not a generous one — it only
+/// compensates for projecting against the entity *origin* (its feet) when
+/// the body still straddles the screen edge. Strictly-in-frustum entities
+/// (`|ndc| ≤ 1.0`) always sort ahead of this relaxed band, so it acts as a
+/// fallback, not a co-equal pool. See [`build_tab_candidates`].
+const CYCLE_NDC_LIMIT: f32 = 1.1;
+
+/// Idle gap after which the Tab/Enter cycle stack resets, so the next press
+/// rebuilds from the current nearest rather than continuing a stale order.
+/// XIM uses 5s (`PlayerTargetSelector.kt:28`); retail feel per the user is
+/// snappier.
+const TAB_CYCLE_IDLE_RESET_SECS: f32 = 2.0;
 
 /// First-press off-center penalty (yalms). The Tab cycle's first-press
 /// score is `world_dist + NDC_PENALTY_YALMS * ndc_mag`; at the strict
@@ -1471,6 +1641,37 @@ const NDC_PENALTY_YALMS: f32 = 10.0;
 mod tests {
     use super::*;
     use ffxi_viewer_wire::{Entity as WireEntity, EntityKind, Vec3 as WireVec3};
+
+    #[test]
+    fn forward_allowance_caps_at_contact() {
+        // 5 yalms apart, stop at 0.7 (two PC radii) → may advance 4.3.
+        let a = forward_allowance((0.0, 0.0), (5.0, 0.0), 0.7);
+        assert!((a - 4.3).abs() < 1e-3, "got {a}");
+    }
+
+    #[test]
+    fn forward_allowance_zero_at_or_inside_contact() {
+        // Exactly at the ring → no further advance.
+        assert!(forward_allowance((0.0, 0.0), (0.7, 0.0), 0.7).abs() < 1e-6);
+        // Already inside the ring → clamped to 0 (never negative → no push-out).
+        assert_eq!(forward_allowance((0.0, 0.0), (0.4, 0.0), 0.7), 0.0);
+    }
+
+    #[test]
+    fn radius_for_wire_kind_matches_state_source() {
+        assert_eq!(
+            radius_for_wire_kind(EntityKind::Pc),
+            crate::state::MODEL_RADIUS_PC
+        );
+        assert_eq!(
+            radius_for_wire_kind(EntityKind::Mob),
+            crate::state::MODEL_RADIUS_MOB
+        );
+        assert_eq!(
+            radius_for_wire_kind(EntityKind::Pet),
+            crate::state::MODEL_RADIUS_PET
+        );
+    }
 
     fn ent(id: u32, x: f32, y: f32) -> WireEntity {
         ent_xyz(id, x, y, 0.0)
@@ -1604,267 +1805,302 @@ mod tests {
         Some(Vec3::new(p.x / 100.0, p.y / 100.0, 0.5))
     }
 
-    #[test]
-    fn first_press_picks_nearest_to_screen_center() {
-        let from = WireVec3 {
+    fn from0() -> WireVec3 {
+        WireVec3 {
             x: 0.0,
             y: 0.0,
             z: 0.0,
-        };
-        // ndc.x = pos.x/100: entity 2 sits at 0.1, entity 3 at 0.2,
-        // entity 1 at 0.3 — entity 2 is most centered.
+        }
+    }
+
+    /// Like [`ent`] but with an explicit kind (party/pet/npc tiering tests).
+    fn ent_k(id: u32, x: f32, kind: EntityKind) -> WireEntity {
+        let mut e = ent(id, x, 0.0);
+        e.kind = kind;
+        e
+    }
+
+    /// First Tab/Enter pick (nearest on-screen) with no party/pet present.
+    fn first_pick<F: Fn(Vec3) -> Option<Vec3>>(
+        entities: &[WireEntity],
+        self_id: Option<u32>,
+        project: F,
+    ) -> Option<u32> {
+        build_tab_candidates(entities, from0(), self_id, &[], &[], project)
+            .first()
+            .copied()
+    }
+
+    /// Drive the real stateful cycle `n` presses, feeding each result back
+    /// as the next `current` — exactly how the Tab handler calls it.
+    fn drive<F: Fn(Vec3) -> Option<Vec3> + Copy>(
+        entities: &[WireEntity],
+        self_id: Option<u32>,
+        n: usize,
+        project: F,
+    ) -> Vec<u32> {
+        let mut stack = TabCycleStack::default();
+        let mut current = None;
+        let mut out = Vec::new();
+        for _ in 0..n {
+            current = tab_cycle_next(
+                &mut stack,
+                entities,
+                from0(),
+                current,
+                self_id,
+                &[],
+                &[],
+                project,
+            );
+            out.push(current.expect("cycle should yield a target"));
+        }
+        out
+    }
+
+    #[test]
+    fn first_press_picks_nearest_on_screen() {
+        // ndc.x = pos.x/100; hybrid score = dist + 10·ndc_mag. Entity 2 is
+        // both nearest and most centered, so it's the first pick.
         let entities = vec![ent(1, 30.0, 0.0), ent(2, 10.0, 0.0), ent(3, 20.0, 0.0)];
-        let next = cycle_target_viewport(&entities, from, None, None, fake_proj);
-        assert_eq!(next, Some(2));
+        assert_eq!(first_pick(&entities, None, fake_proj), Some(2));
     }
 
     #[test]
     fn cycle_excludes_self() {
-        // Self is in the wire entity list (matched by `self_char_id`).
-        // Tab must skip it on first press AND on subsequent cycle
-        // steps, otherwise the operator will land on their own model.
-        let from = WireVec3 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        // Entity 99 is "self" at the player position; entities 1/2 are
-        // mobs slightly farther out.
+        // Self (id=99) is in the wire entity list (matched by
+        // `self_char_id`); it must never appear in the cycle.
         let entities = vec![ent(99, 0.0, 0.0), ent(1, 10.0, 0.0), ent(2, 20.0, 0.0)];
-        // First press: skips id=99 even though it's at ndc=0/dist=0;
-        // picks id=1 (next-closest in the filtered set).
-        assert_eq!(
-            cycle_target_viewport(&entities, from, None, Some(99), fake_proj),
-            Some(1)
-        );
-        // Cycling from id=1 wraps to id=2, never returning id=99.
-        assert_eq!(
-            cycle_target_viewport(&entities, from, Some(1), Some(99), fake_proj),
-            Some(2)
-        );
-        assert_eq!(
-            cycle_target_viewport(&entities, from, Some(2), Some(99), fake_proj),
-            Some(1)
-        );
+        assert_eq!(first_pick(&entities, Some(99), fake_proj), Some(1));
+        // Driven cycle alternates 1 ↔ 2, never lands on self.
+        assert_eq!(drive(&entities, Some(99), 4, fake_proj), vec![1, 2, 1, 2]);
     }
 
     #[test]
     fn first_press_3d_distance_includes_altitude() {
-        // Two entities at identical (x, y) and identical NDC, distinguished
-        // only by FFXI z (altitude). The closer-in-3D one must win.
-        // Catches a 2D-distance regression in the first-press score.
-        let from = WireVec3 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        // Both project to the same NDC under `fake_proj` (z is ignored
-        // by that projector). Entity 1 is 5y above, entity 2 is 50y above.
+        // Identical (x, y) and identical NDC, distinguished only by FFXI z
+        // (altitude). The closer-in-3D one wins — guards a 2D regression.
         let entities = vec![ent_xyz(1, 0.0, 0.0, 5.0), ent_xyz(2, 0.0, 0.0, 50.0)];
-        assert_eq!(
-            cycle_target_viewport(&entities, from, None, None, fake_proj),
-            Some(1)
-        );
+        assert_eq!(first_pick(&entities, None, fake_proj), Some(1));
     }
 
     #[test]
     fn first_press_close_off_center_beats_far_centered() {
-        // Regression: the user-reported "Tab fails to select the closest
-        // mob" bug. Pure NDC-magnitude ranking would pick a far entity
-        // that happens to sit dead-center on screen over a much closer
-        // entity that's slightly off-axis. With the hybrid score
-        // (world_dist + NDC_PENALTY_YALMS * ndc_mag), the closer entity
-        // wins as long as the screen offset is reasonable.
-        let from = WireVec3 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        // fake_proj: ndc.x = pos.x/100, ndc.y = 0.
-        //   Entity 1 at (5, 30): ndc=(0.05, 0), |ndc|=0.05.
-        //                         dist=√(25+900)=30.41, score=30.41+0.5=30.91
-        //   Entity 2 at (20, 5): ndc=(0.20, 0), |ndc|=0.20.
-        //                         dist=√(400+25)=20.62, score=20.62+2.0=22.62
-        // Hybrid: entity 2 wins (lower score). Closer in world reaches.
+        // Regression: the "Tab fails to select the closest mob" bug. A
+        // close, slightly-off-axis entity must beat a far dead-centered one.
+        //   Entity 1 (5, 30): ndc 0.05, dist 30.4, score 30.9
+        //   Entity 2 (20, 5): ndc 0.20, dist 20.6, score 22.6  ← wins
         let entities = vec![ent(1, 5.0, 30.0), ent(2, 20.0, 5.0)];
-        assert_eq!(
-            cycle_target_viewport(&entities, from, None, None, fake_proj),
-            Some(2)
-        );
+        assert_eq!(first_pick(&entities, None, fake_proj), Some(2));
     }
 
     #[test]
     fn first_press_combined_ndc_and_world_distance() {
-        // Entity high on the screen but horizontally centered should
-        // lose to a slightly-off-center entity that's much closer in
-        // world space (the hybrid score combines both signals).
-        let from = WireVec3 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        // xy_proj reads bevy.x, bevy.y → after conversion that's
-        // (FFXI.x, FFXI.z).
-        //   Entity 1: FFXI (0, 0, 80)  → ndc=(0.00, 0.80), |ndc|=0.80,
-        //                                 dist=80, score=80+8.0=88.
-        //   Entity 2: FFXI (15, 0, 15) → ndc=(0.15, 0.15), |ndc|=0.212,
-        //                                 dist=√(225+225)=21.2,
-        //                                 score=21.2+2.12=23.3.
-        // Entity 2 wins on combined score.
+        // Centered-but-high entity loses to a slightly-off-center, much
+        // closer one (the hybrid score combines both signals).
+        //   Entity 1 (0,0,80): ndc (0, 0.8), dist 80, score 88
+        //   Entity 2 (15,0,15): ndc (0.15, 0.15), dist 21.2, score 23.3 ← wins
         let entities = vec![ent_xyz(1, 0.0, 0.0, 80.0), ent_xyz(2, 15.0, 0.0, 15.0)];
+        assert_eq!(first_pick(&entities, None, xy_proj), Some(2));
+    }
+
+    #[test]
+    fn cycle_walks_nearest_to_farthest_then_wraps() {
+        // Hybrid scores: id=2 (5.5), id=3 (16.5), id=1 (33) → order [2,3,1].
+        // The driven cycle visits them in that order and wraps to the start.
+        let entities = vec![ent(1, 30.0, 0.0), ent(2, 5.0, 0.0), ent(3, 15.0, 0.0)];
+        assert_eq!(drive(&entities, None, 4, fake_proj), vec![2, 3, 1, 2]);
+    }
+
+    #[test]
+    fn cycle_is_stable_under_position_jitter() {
+        // The core regression: the OLD code recomputed the order every press
+        // (the score shifts as entities/camera move), so Tab oscillated. The
+        // stack freezes the order, so even with per-press position jitter a
+        // single round visits every candidate exactly once before repeating.
+        let mut entities = vec![
+            ent(1, 5.0, 0.0),
+            ent(2, 10.0, 0.0),
+            ent(3, 15.0, 0.0),
+            ent(4, 20.0, 0.0),
+            ent(5, 25.0, 0.0),
+        ];
+        let mut stack = TabCycleStack::default();
+        let mut current = None;
+        let mut visited = Vec::new();
+        for i in 0..5 {
+            // Shuffle positions each press — a recompute WOULD reorder.
+            for e in entities.iter_mut() {
+                e.pos.x += if i % 2 == 0 { 3.0 } else { -2.0 };
+            }
+            current = tab_cycle_next(
+                &mut stack,
+                &entities,
+                from0(),
+                current,
+                None,
+                &[],
+                &[],
+                fake_proj,
+            );
+            visited.push(current.unwrap());
+        }
+        let mut sorted = visited.clone();
+        sorted.sort_unstable();
         assert_eq!(
-            cycle_target_viewport(&entities, from, None, None, xy_proj),
-            Some(2)
+            sorted,
+            vec![1, 2, 3, 4, 5],
+            "no repeats in a round: {visited:?}"
         );
     }
 
     #[test]
-    fn subsequent_presses_cycle_by_distance() {
-        let from = WireVec3 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
+    fn cycle_refills_after_exhaustion() {
+        // After a full round the stack rebuilds rather than returning None.
+        let entities = vec![ent(1, 5.0, 0.0), ent(2, 10.0, 0.0), ent(3, 15.0, 0.0)];
+        let seq = drive(&entities, None, 6, fake_proj);
+        assert_eq!(seq.len(), 6);
+        assert!(seq.iter().all(|&x| (1..=3).contains(&x)));
+        let mut round1 = seq[0..3].to_vec();
+        round1.sort_unstable();
+        assert_eq!(round1, vec![1, 2, 3], "first round visits every candidate");
+    }
+
+    #[test]
+    fn party_and_own_pet_sort_last() {
+        // Plain Tab walks enemies/NPCs first; party members and the
+        // player's own pet are tiered to the end (XIM parity).
+        let entities = vec![
+            ent(1, 10.0, 0.0),               // mob (tier 0)
+            ent_k(2, 5.0, EntityKind::Pc),   // party PC (tier 1 via party_ids)
+            ent_k(3, 15.0, EntityKind::Pet), // own pet (tier 1 via owned_pet_ids)
+            ent_k(4, 20.0, EntityKind::Npc), // npc (tier 0)
+        ];
+        let order = build_tab_candidates(&entities, from0(), None, &[2], &[3], fake_proj);
+        // tier 0 by score: 1 (11), 4 (22); tier 1 by score: 2 (5.5), 3 (16.5).
+        assert_eq!(order, vec![1, 4, 2, 3]);
+    }
+
+    #[test]
+    fn tab_keeps_current_when_it_is_the_only_candidate() {
+        // Only the current target is on-screen → no advance. `tab_cycle_next`
+        // returns None ("no change"); the caller keeps the current target
+        // rather than clearing it. Regression guard for an empty Tab
+        // deselecting the sole visible mob.
+        let entities = vec![ent(1, 10.0, 0.0)];
+        let mut stack = TabCycleStack::default();
+        assert_eq!(
+            tab_cycle_next(
+                &mut stack,
+                &entities,
+                from0(),
+                Some(1),
+                None,
+                &[],
+                &[],
+                fake_proj
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn other_kind_is_never_a_candidate() {
+        // `Other` is non-combat filler (doors, transports) — excluded.
+        let entities = vec![ent_k(1, 10.0, EntityKind::Other), ent(2, 20.0, 0.0)];
+        assert_eq!(first_pick(&entities, None, fake_proj), Some(2));
+    }
+
+    #[test]
+    fn advance_records_last_emitted_and_resets_idle() {
+        // `last_emitted` is the discriminator `tab_cycle_invalidate_system`
+        // uses to tell an internal advance from an external target change;
+        // the idle timer resets on every advance.
+        let entities = vec![ent(1, 10.0, 0.0), ent(2, 20.0, 0.0)];
+        let mut stack = TabCycleStack {
+            idle_secs: 99.0,
+            ..Default::default()
         };
-        // Three entities at clearly distinct distances. Hybrid scores:
-        //   id=2 at (5, 0)   → dist=5,  ndc=0.05 → score = 5.5
-        //   id=3 at (15, 0)  → dist=15, ndc=0.15 → score = 16.5
-        //   id=1 at (30, 0)  → dist=30, ndc=0.30 → score = 33.0
-        // Sorted order: [2, 3, 1].
-        let entities = vec![ent(1, 30.0, 0.0), ent(2, 5.0, 0.0), ent(3, 15.0, 0.0)];
-        // From id=2 (nearest) → id=3 (next-nearest).
-        assert_eq!(
-            cycle_target_viewport(&entities, from, Some(2), None, fake_proj),
-            Some(3)
+        let next = tab_cycle_next(
+            &mut stack,
+            &entities,
+            from0(),
+            None,
+            None,
+            &[],
+            &[],
+            fake_proj,
         );
-        // From id=3 → id=1 (third-nearest).
-        assert_eq!(
-            cycle_target_viewport(&entities, from, Some(3), None, fake_proj),
-            Some(1)
-        );
-        // From id=1 → wraps back to id=2.
-        assert_eq!(
-            cycle_target_viewport(&entities, from, Some(1), None, fake_proj),
-            Some(2)
-        );
+        assert_eq!(next, Some(1));
+        assert_eq!(stack.last_emitted, Some(1));
+        assert_eq!(stack.idle_secs, 0.0);
     }
 
     #[test]
     fn cycle_includes_slightly_out_of_view_entities() {
-        // FFXI-retail parity: an entity sitting just past the strict
-        // frustum edge (chase-cam "mob over my shoulder") is still part
-        // of the cycle. With CYCLE_NDC_LIMIT=1.3, NDC.x up to ±1.3 is
-        // eligible.
-        let from = WireVec3 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        // wide_proj: ndc.x = pos.x / 50.
-        //   Entity 1: x=-25 → ndc.x=-0.5 (strictly in frustum).
-        //   Entity 2: x=60  → ndc.x=1.2  (slightly out — relaxed bound).
-        //   Entity 3: x=80  → ndc.x=1.6  (well past — excluded).
-        let entities = vec![ent(1, -25.0, 0.0), ent(2, 60.0, 0.0), ent(3, 80.0, 0.0)];
-        // Currently targeting entity 1; pressing Tab cycles to entity 2
-        // (the slightly-out one) and skips entity 3 entirely.
-        assert_eq!(
-            cycle_target_viewport(&entities, from, Some(1), None, wide_proj),
-            Some(2)
-        );
-        // From entity 2, wrap back to entity 1 (entity 3 stays excluded).
-        assert_eq!(
-            cycle_target_viewport(&entities, from, Some(2), None, wide_proj),
-            Some(1)
-        );
+        // On-screen-only, but with a small origin-vs-silhouette margin
+        // (CYCLE_NDC_LIMIT = 1.1). wide_proj: ndc.x = x/50.
+        //   Entity 1: x=-25 → -0.5 (strictly in frustum)
+        //   Entity 2: x=52  →  1.04 (relaxed band, still eligible)
+        //   Entity 3: x=70  →  1.4  (off-screen — excluded)
+        // Strict sorts before relaxed; entity 3 never appears.
+        let entities = vec![ent(1, -25.0, 0.0), ent(2, 52.0, 0.0), ent(3, 70.0, 0.0)];
+        let order = build_tab_candidates(&entities, from0(), None, &[], &[], wide_proj);
+        assert_eq!(order, vec![1, 2]);
     }
 
     #[test]
     fn first_press_prefers_strictly_in_frustum() {
-        // When entities exist both strictly in-frustum and in the
-        // relaxed band, the initial Tab pick comes from the in-frustum
-        // pool even if a relaxed-band entity is closer to screen center.
-        let from = WireVec3 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        // wide_proj: ndc.x = pos.x / 50.
-        //   Entity 1: x=45 → ndc.x=0.90 (in frustum, off-center).
-        //   Entity 2: x=60 → ndc.x=1.20 (slightly out — would be more
-        //                                 centered if wrapped, but isn't).
-        // Entity 1 wins because it's the only strict-in-frustum candidate.
-        let entities = vec![ent(1, 45.0, 0.0), ent(2, 60.0, 0.0)];
+        // wide_proj: ndc.x = x/50. Entity 1 (x=45 → 0.90) is strictly in
+        // frustum; entity 2 (x=52 → 1.04) is in the relaxed band. The
+        // strict one is the first pick.
+        let entities = vec![ent(1, 45.0, 0.0), ent(2, 52.0, 0.0)];
+        assert_eq!(first_pick(&entities, None, wide_proj), Some(1));
+    }
+
+    #[test]
+    fn first_press_falls_back_to_relaxed_when_none_in_frustum() {
+        // Nothing strictly in-view; first press still picks the closer
+        // relaxed-band entity rather than returning None.
+        //   Entity 1: x=55 → 1.10   Entity 2: x=52 → 1.04 (closer) ← wins
+        let entities = vec![ent(1, 55.0, 0.0), ent(2, 52.0, 0.0)];
+        assert_eq!(first_pick(&entities, None, wide_proj), Some(2));
+    }
+
+    #[test]
+    fn off_screen_entities_are_skipped() {
+        // entity 4 at x=100 is culled by `culled_proj` (x>50 → None).
+        let entities = vec![ent(1, 0.0, 0.0), ent(4, 100.0, 0.0)];
+        assert_eq!(first_pick(&entities, None, culled_proj), Some(1));
+        // A current target that's off-screen falls back to nearest visible
+        // rather than getting stuck.
+        let mut stack = TabCycleStack::default();
         assert_eq!(
-            cycle_target_viewport(&entities, from, None, None, wide_proj),
+            tab_cycle_next(
+                &mut stack,
+                &entities,
+                from0(),
+                Some(4),
+                None,
+                &[],
+                &[],
+                culled_proj
+            ),
             Some(1)
         );
     }
 
     #[test]
-    fn first_press_falls_back_to_relaxed_when_none_in_frustum() {
-        // If literally nothing is strictly in-view, first-press still
-        // picks the most-centered relaxed-band entity rather than
-        // returning None.
-        let from = WireVec3 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        // wide_proj: ndc.x = pos.x / 50.
-        //   Entity 1: x=60 → ndc.x=1.20 (relaxed, slightly less centered).
-        //   Entity 2: x=55 → ndc.x=1.10 (relaxed, more centered).
-        let entities = vec![ent(1, 60.0, 0.0), ent(2, 55.0, 0.0)];
-        assert_eq!(
-            cycle_target_viewport(&entities, from, None, None, wide_proj),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn off_screen_entities_are_skipped() {
-        let from = WireVec3 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        // entity 4 at x=100 will be culled by `culled_proj`.
-        let entities = vec![ent(1, 0.0, 0.0), ent(4, 100.0, 0.0)];
-        let next = cycle_target_viewport(&entities, from, None, None, culled_proj);
-        assert_eq!(next, Some(1));
-        // From off-screen current → falls back to nearest visible.
-        let next = cycle_target_viewport(&entities, from, Some(4), None, culled_proj);
-        assert_eq!(next, Some(1));
-    }
-
-    #[test]
     fn empty_or_all_off_screen_returns_none() {
-        let from = WireVec3 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        let entities: Vec<WireEntity> = vec![];
+        let none: Vec<WireEntity> = vec![];
+        assert_eq!(first_pick(&none, None, fake_proj), None);
+        let mut stack = TabCycleStack::default();
         assert_eq!(
-            cycle_target_viewport(&entities, from, None, None, fake_proj),
+            tab_cycle_next(&mut stack, &none, from0(), None, None, &[], &[], fake_proj),
             None
         );
         // All off-screen.
         let entities = vec![ent(1, 100.0, 0.0), ent(2, 200.0, 0.0)];
-        assert_eq!(
-            cycle_target_viewport(&entities, from, None, None, culled_proj),
-            None
-        );
-    }
-
-    #[test]
-    fn current_offscreen_falls_back_to_nearest() {
-        let from = WireVec3 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        let entities = vec![ent(1, 30.0, 0.0), ent(99, 1000.0, 0.0)];
-        // 99 not visible — should pick nearest visible (1).
-        let next = cycle_target_viewport(&entities, from, Some(99), None, culled_proj);
-        assert_eq!(next, Some(1));
+        assert_eq!(first_pick(&entities, None, culled_proj), None);
     }
 }

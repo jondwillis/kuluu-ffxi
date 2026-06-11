@@ -152,6 +152,41 @@ pub enum EntityKind {
     Other,
 }
 
+/// Per-kind model "collision" radius in yalms, used to stop movement on
+/// contact (`/follow`, lock-on, auto-run) instead of running into / through
+/// a target. These mirror the visible capsule/cuboid extents in
+/// `ffxi-viewer-core/src/scene.rs` (`entity_visual_height` + the per-kind
+/// meshes, ~lines 266-291): PC capsule radius 0.35, default (NPC/Other)
+/// capsule 0.5, Mob cuboid half-side 0.55 (`Cuboid::new(1.1,..)`), Pet
+/// capsule 0.4. They are duplicated here rather than shared because
+/// `scene.rs` lives in the optional `ffxi-viewer-core` crate, while this
+/// module is always compiled (the headless reactor reads it) — keep the two
+/// number sets in sync.
+pub const MODEL_RADIUS_PC: f32 = 0.35;
+pub const MODEL_RADIUS_NPC: f32 = 0.5;
+pub const MODEL_RADIUS_MOB: f32 = 0.55;
+pub const MODEL_RADIUS_PET: f32 = 0.4;
+pub const MODEL_RADIUS_OTHER: f32 = 0.5;
+
+/// Extra standoff added on top of the two models' radii before the
+/// approach stops. `0.0` = stop exactly when the surfaces touch (the
+/// literal "collide with the model radius"). Bump this in one place if the
+/// real rendered meshes read as interpenetrating.
+pub const CONTACT_GAP: f32 = 0.0;
+
+/// Collision radius for an entity of `kind`, in yalms. Single source of
+/// truth shared by the reactor follow goal and the native lock-on/auto-run
+/// clamp.
+pub fn model_radius(kind: EntityKind) -> f32 {
+    match kind {
+        EntityKind::Pc => MODEL_RADIUS_PC,
+        EntityKind::Npc => MODEL_RADIUS_NPC,
+        EntityKind::Mob => MODEL_RADIUS_MOB,
+        EntityKind::Pet => MODEL_RADIUS_PET,
+        EntityKind::Other => MODEL_RADIUS_OTHER,
+    }
+}
+
 /// Merge two observations of an entity's kind. `Other` is the "unknown"
 /// bucket — once a specialized classification (`Pc`/`Npc`/`Mob`/`Pet`) has
 /// been established for an entity, a follow-up `Other` should not demote it.

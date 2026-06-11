@@ -105,7 +105,9 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 ) {
                     Some(id) => SlashOutcome::Command(AgentCommand::Follow {
                         target_id: id,
-                        distance: 3.0,
+                        // 0.0 = stop at model-radius contact; the reactor
+                        // derives the real hold from the target's kind.
+                        distance: 0.0,
                     }),
                     None => SlashOutcome::SystemMessage("/follow: no target".into()),
                 },
