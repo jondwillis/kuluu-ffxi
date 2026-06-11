@@ -13,7 +13,7 @@ pub mod zonelines;
 
 pub use grid::{GridNav, NavError};
 pub use zone_names::zone_name;
-pub use zonelines::{zone_lines_for, ZoneLine};
+pub use zonelines::{to_pos_for_line, zone_lines_for, ZoneLine};
 
 /// Trait implemented by any navigable representation of a zone.
 ///

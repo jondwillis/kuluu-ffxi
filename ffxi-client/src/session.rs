@@ -88,7 +88,16 @@ enum MapOutcome {
     /// Server signaled zone change. Caller should rotate `key3[16..20]` by
     /// +2 (LE u32) and reconnect the UDP socket to `new_addr`, then run a
     /// fresh bootstrap.
-    Reconnect { new_addr: std::net::SocketAddr },
+    ///
+    /// `via_zoneline` carries the `zonelineid` of the `0x05E MAPRECT` we
+    /// sent to trigger this change (when the change came from a zoneline
+    /// rather than a homepoint / GM warp). The caller resolves it to the
+    /// baked destination `to_pos` and hands that to the next session's
+    /// flood-drain as a spawn fallback — see `apply_zoneline_spawn_fallback`.
+    Reconnect {
+        new_addr: std::net::SocketAddr,
+        via_zoneline: Option<u32>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +236,10 @@ pub async fn run(
     // the socket must persist on a single-process LSB dev stack.
     let mut current_seed = key3;
     let mut iteration: u32 = 0;
+    // Spawn position for the *next* session's flood-drain, resolved from the
+    // zoneline we just crossed. `None` on the initial connect and on any
+    // non-zoneline reconnect. Consumed (cleared) by each `run_map_session`.
+    let mut spawn_fallback: Option<Vec3> = None;
     emit_stage(&event_tx, Stage::MapBootstrap);
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     let mut map = MapClient::connect(server_addr, current_seed).await?;
@@ -239,6 +252,7 @@ pub async fn run(
             &mut map,
             cert_sha256.clone(),
             iteration,
+            spawn_fallback.take(),
             &mut cmd_rx,
             &event_tx,
         )
@@ -246,7 +260,21 @@ pub async fn run(
 
         match outcome {
             MapOutcome::Disconnected => return Ok(()),
-            MapOutcome::Reconnect { new_addr } => {
+            MapOutcome::Reconnect {
+                new_addr,
+                via_zoneline,
+            } => {
+                // Resolve the crossed zoneline's baked destination so the
+                // next flood-drain can override an origin spawn the server
+                // sends when its `zonelines.to_pos` is zeroed (the zone +
+                // heading still arrive correctly; only the position is lost).
+                spawn_fallback = via_zoneline
+                    .and_then(ffxi_nav::to_pos_for_line)
+                    .map(|p| Vec3 {
+                        x: p[0],
+                        y: p[1],
+                        z: p[2],
+                    });
                 let prev_status = BlowfishStatus::PendingZone;
                 map_client::rotate_session_key_seed(&mut current_seed);
                 let _ = event_tx.send(AgentEvent::KeyRotated {
@@ -301,6 +329,10 @@ async fn run_map_session(
     map: &mut MapClient,
     cert_sha256: Option<String>,
     iteration: u32,
+    // Destination spawn from the zoneline that led here, used to override an
+    // origin self-seed during this session's flood-drain. `None` on the
+    // initial connect and on non-zoneline reconnects.
+    spawn_fallback: Option<Vec3>,
     cmd_rx: &mut mpsc::Receiver<AgentCommand>,
     event_tx: &broadcast::Sender<AgentEvent>,
 ) -> Result<MapOutcome> {
@@ -389,6 +421,7 @@ async fn run_map_session(
                         &mut self_pos_seeded,
                         &mut npc_name_resolver,
                         &mut flood_in_mog_house,
+                        spawn_fallback,
                     );
                 }
             }
@@ -608,6 +641,11 @@ fn handle_sub_packet(
     // keeps zone id equal to the surrounding city while in a Mog House —
     // there's no other wire signal).
     was_in_mog_house: &mut bool,
+    // Baked destination spawn for the zoneline that led into this zone, used
+    // to repair an origin self-seed. `None` outside the post-zoneline flood-
+    // drain (the keepalive caller always passes `None`). See
+    // [`apply_zoneline_spawn_fallback`].
+    zoneline_spawn_fallback: Option<Vec3>,
 ) {
     use ffxi_proto::map::s2c;
     match sub.opcode {
@@ -678,12 +716,18 @@ fn handle_sub_packet(
                     // even before a name-bearing CHAR_PC for self arrives
                     // (e.g. the first kill right after zone-in).
                     kind_cache.insert(login.unique_no, EntityKind::Pc);
+                    // Repair an origin spawn the server sends when its
+                    // `zonelines.to_pos` is zeroed (the zone + heading still
+                    // arrive correctly). No-op when the server's pos is sane.
+                    let raw_pos = Vec3 {
+                        x: head.x,
+                        y: head.y,
+                        z: head.z,
+                    };
+                    let seed_pos =
+                        apply_zoneline_spawn_fallback(raw_pos, zoneline_spawn_fallback);
                     *self_pos = Position {
-                        pos: Vec3 {
-                            x: head.x,
-                            y: head.y,
-                            z: head.z,
-                        },
+                        pos: seed_pos,
                         heading: head.dir,
                         speed: head.speed,
                         speed_base: head.speed_base,
@@ -694,12 +738,15 @@ fn handle_sub_packet(
                     // Diagnostic: the seed *applied* path was previously
                     // silent (only the unique_no-mismatch skip warned), so a
                     // spawn-at-origin couldn't be distinguished from a bad
-                    // server pos. Log the coords we just took as truth.
+                    // server pos. Log the coords we took as truth, flagging
+                    // any zoneline-fallback override.
                     tracing::info!(
                         unique_no = login.unique_no,
                         self_char_id,
                         zone_no = login.zone_no,
-                        pos = format!("({:.1},{:.1},{:.1})", head.x, head.y, head.z),
+                        pos = format!("({:.1},{:.1},{:.1})", seed_pos.x, seed_pos.y, seed_pos.z),
+                        raw_pos = format!("({:.1},{:.1},{:.1})", raw_pos.x, raw_pos.y, raw_pos.z),
+                        fallback_applied = seed_pos != raw_pos,
                         heading = head.dir,
                         "self_pos seeded from 0x00A LOGIN"
                     );
@@ -723,11 +770,7 @@ fn handle_sub_packet(
                             // the player as "?" until/unless a name-bearing
                             // CHAR_PC happens to arrive.
                             name: Some(self_char_name.to_string()),
-                            pos: Vec3 {
-                                x: head.x,
-                                y: head.y,
-                                z: head.z,
-                            },
+                            pos: seed_pos,
                             heading: head.dir,
                             hp_pct: Some(head.hpp),
                             bt_target_id: head.bt_target_id,
@@ -739,6 +782,9 @@ fn handle_sub_packet(
                             // SendFlg.Name happens to be set.
                             look: None,
                         },
+                        // 0x00A LOGIN is the zone-in spawn; `seed_pos` is the
+                        // server-authoritative spawn coordinate.
+                        pos_present: true,
                     });
                     // Mirror to legacy `state.self_pos` so the fallback
                     // path in `state_to_snapshot` (used pre-`char_id`
@@ -834,35 +880,53 @@ fn handle_sub_packet(
                     .or_insert(kind);
                 if op == s2c::CHAR_PC && head.unique_no == self_char_id {
                     *self_act_index = Some(head.act_index);
-                    *self_pos = Position {
-                        pos: Vec3 {
+                    // Gate the self-position seed on `UPDATE_POS` (0x01):
+                    // LSB only writes pos/heading under that bit
+                    // (`entity_update.cpp:314`). A non-position CHAR_PC for
+                    // self (e.g. an HP-only self update) carries origin in
+                    // the pos slots from the freshly-constructed packet
+                    // buffer; applying it would clobber `self_pos` with
+                    // (0,0,0). The zoneline fallback below only repairs the
+                    // flood-drain window, so the gate is the real guard.
+                    if head.send_flag & 0x01 != 0 {
+                        // Same origin-spawn repair as the LOGIN seed: during
+                        // the post-zoneline flood-drain a CHAR_PC for self
+                        // carrying origin would otherwise clobber the
+                        // destination. No-op outside the flood-drain
+                        // (fallback is `None` there).
+                        let raw_pos = Vec3 {
                             x: head.x,
                             y: head.y,
                             z: head.z,
-                        },
-                        heading: head.dir,
-                        ..*self_pos
-                    };
-                    // A self CHAR_PC is also a server-authoritative anchor —
-                    // covers the deadline-recovery path where the flood
-                    // exited before a LOGIN seed (keepalive resumes POS from
-                    // here) and the rare zone-in flood that sends CHAR_PC
-                    // for self before/without a 0x00A LOGIN.
-                    *self_pos_seeded = true;
-                    // Diagnostic: this seed is unconditional (no
-                    // `SendFlg.Position` gate) and, during the flood drain,
-                    // runs with no rubber-band reconciliation — so a CHAR_PC
-                    // carrying origin would clobber a good LOGIN seed. Log the
-                    // coords + `SendFlg` so an origin spawn is traceable to
-                    // the exact packet that wrote it.
-                    tracing::info!(
-                        unique_no = head.unique_no,
-                        self_char_id,
-                        send_flag = format!("0x{:02x}", head.send_flag),
-                        pos = format!("({:.1},{:.1},{:.1})", head.x, head.y, head.z),
-                        heading = head.dir,
-                        "self_pos seeded from CHAR_PC for self"
-                    );
+                        };
+                        let seed_pos =
+                            apply_zoneline_spawn_fallback(raw_pos, zoneline_spawn_fallback);
+                        *self_pos = Position {
+                            pos: seed_pos,
+                            heading: head.dir,
+                            ..*self_pos
+                        };
+                        // A self CHAR_PC is also a server-authoritative
+                        // anchor — covers the deadline-recovery path where
+                        // the flood exited before a LOGIN seed (keepalive
+                        // resumes POS from here) and the rare zone-in flood
+                        // that sends CHAR_PC for self before/without a
+                        // 0x00A LOGIN.
+                        *self_pos_seeded = true;
+                        // Diagnostic: log the coords + `SendFlg` so an
+                        // origin spawn is traceable to the exact packet that
+                        // wrote it.
+                        tracing::info!(
+                            unique_no = head.unique_no,
+                            self_char_id,
+                            send_flag = format!("0x{:02x}", head.send_flag),
+                            fallback_applied = seed_pos != raw_pos,
+                            pos =
+                                format!("({:.1},{:.1},{:.1})", seed_pos.x, seed_pos.y, seed_pos.z),
+                            heading = head.dir,
+                            "self_pos seeded from CHAR_PC for self"
+                        );
+                    }
                 }
                 let wire_name = decode::PosHead::try_extract_name(op, sub.data);
                 if wire_name.is_none() {
@@ -971,6 +1035,18 @@ fn handle_sub_packet(
                         "CHAR_PC for self: look decoded None (body[0x44..0x56] dumped)"
                     );
                 }
+                // Gate the position group on `UPDATE_POS` (0x01) in the
+                // updatemask byte at body[6] — the same bit LSB checks
+                // before writing pos/heading/speed (`entity_update.cpp:314`).
+                // On HP-only / status-only ticks (constant during battle:
+                // `battleutils.cpp:3773,3784`) the bit is clear and
+                // head.x/y/z, head.dir, head.speed are zero from the
+                // freshly-constructed packet buffer. `pos_present = false`
+                // makes the reducer keep the entity's last-known position
+                // instead of snapping it to the zone origin — the cause of
+                // mobs teleporting >600 yalms / vanishing mid-fight.
+                const UPDATE_POS: u8 = 0x01; // baseentity.h:169
+                let pos_present = send_flag & UPDATE_POS != 0;
                 let _ = event_tx.send(AgentEvent::EntityUpserted {
                     entity: Entity {
                         id: head.unique_no,
@@ -990,6 +1066,7 @@ fn handle_sub_packet(
                         speed_base: head.speed_base,
                         look,
                     },
+                    pos_present,
                 });
             }
         }
@@ -1635,6 +1712,11 @@ async fn keepalive_loop(
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     tick.tick().await;
     let mut reconnect_addr: Option<std::net::SocketAddr> = None;
+    // `zonelineid` of the in-flight MAPRECT when a zone change lands, so the
+    // outer `run` can resolve the destination spawn for the next session's
+    // flood-drain (origin-spawn repair). `None` for homepoint / GM-warp
+    // reconnects, which carry no zoneline.
+    let mut reconnect_via_zoneline: Option<u32> = None;
     let mut terminal_disconnect = false;
     // Watchdog for `0x05E MAPRECT`. LSB's `validate().blockedBy(InEvent)`
     // path drops the packet without sending `0x053 SYSTEMMES`, so a stuck
@@ -2333,6 +2415,12 @@ async fn keepalive_loop(
                                         to: 0,
                                     });
                                     reconnect_addr = Some(new_addr);
+                                    // Capture the zoneline that triggered this
+                                    // change (if any) before the watchdog can
+                                    // clear it — feeds the next session's
+                                    // origin-spawn repair.
+                                    reconnect_via_zoneline =
+                                        pending_maprect.map(|(_, line_id)| line_id);
                                 } else {
                                     let _ = event_tx.send(AgentEvent::Disconnected {
                                         reason: format!(
@@ -2373,6 +2461,10 @@ async fn keepalive_loop(
                                 &mut self_pos_seeded,
                                 &mut npc_name_resolver,
                                 &mut self_in_mog_house,
+                                // No zoneline-spawn repair in steady state —
+                                // that's only for the post-zoneline flood-
+                                // drain, which runs in `run_map_session`.
+                                None,
                             );
                             // Self-reconciliation (rubber-band). The
                             // handler just clobbered `self_pos` with the
@@ -2488,7 +2580,10 @@ async fn keepalive_loop(
     // See `MapClient::retarget` for the LSB single-process rationale.
 
     if let Some(addr) = reconnect_addr {
-        Ok(MapOutcome::Reconnect { new_addr: addr })
+        Ok(MapOutcome::Reconnect {
+            new_addr: addr,
+            via_zoneline: reconnect_via_zoneline,
+        })
     } else {
         Ok(MapOutcome::Disconnected)
     }
@@ -4173,9 +4268,92 @@ fn should_break_flood(self_pos_seeded: bool) -> bool {
     self_pos_seeded
 }
 
+/// Repair a zone-in self-seed that the server places at the world origin.
+///
+/// Observed against LSB instances whose `zonelines.to_pos` is zeroed for a
+/// line: `GP_CLI_COMMAND_MAPRECT` still resolves the destination zone and
+/// `to_rotation` (so the player zones correctly and faces the right way),
+/// but `nextSpawnPosition()` returns `(0,0,0)` and the `0x00A LOGIN` /
+/// CHAR_PC seed lands the player at the origin. When we know the zoneline we
+/// crossed, the baked `ffxi-nav` `to_pos` is the authoritative destination,
+/// so substitute it.
+///
+/// Guard rails so a legitimate seed is never disturbed:
+/// - only overrides when the *seed* is within `ORIGIN_EPS` of the origin
+///   (no real FFXI zoneline lands a player on world (0,0,0)), and
+/// - only when the `fallback` itself is a real (non-origin) position — if
+///   our own table is also ~origin there's nothing better to offer.
+fn apply_zoneline_spawn_fallback(seed: Vec3, fallback: Option<Vec3>) -> Vec3 {
+    const ORIGIN_EPS: f32 = 1.0;
+    let near_origin =
+        |p: Vec3| p.x.abs() < ORIGIN_EPS && p.y.abs() < ORIGIN_EPS && p.z.abs() < ORIGIN_EPS;
+    match fallback {
+        Some(fb) if near_origin(seed) && !near_origin(fb) => fb,
+        _ => seed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- zoneline origin-spawn repair (apply_zoneline_spawn_fallback) ----
+    // (uses the module-shared `v(x, y, z)` Vec3 helper defined further down)
+
+    #[test]
+    fn origin_seed_with_valid_fallback_is_repaired() {
+        // The Bastok Mines destination from line 813314682.
+        let dest = v(-16.039, -132.804, -4.217);
+        assert_eq!(
+            apply_zoneline_spawn_fallback(v(0.0, 0.0, 0.0), Some(dest)),
+            dest,
+            "origin seed must be replaced by the baked destination"
+        );
+    }
+
+    #[test]
+    fn sane_seed_is_never_overridden() {
+        // Server sent a real position — keep it even if a fallback exists.
+        let server = v(573.0, -326.6, -1.1);
+        let dest = v(-16.039, -132.804, -4.217);
+        assert_eq!(
+            apply_zoneline_spawn_fallback(server, Some(dest)),
+            server,
+            "a non-origin server seed must win over the fallback"
+        );
+    }
+
+    #[test]
+    fn origin_seed_without_fallback_stays_origin() {
+        // Non-zoneline reconnect (homepoint / GM warp): nothing to offer.
+        assert_eq!(
+            apply_zoneline_spawn_fallback(v(0.0, 0.0, 0.0), None),
+            v(0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn origin_fallback_does_not_replace_origin_seed() {
+        // If our own table is also ~origin, don't pretend we know better.
+        assert_eq!(
+            apply_zoneline_spawn_fallback(v(0.0, 0.0, 0.0), Some(v(0.2, -0.1, 0.0))),
+            v(0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn baked_zoneline_resolves_bastok_mines_destination() {
+        // Guards the data path the repair depends on: the South Gustaberg →
+        // Bastok Mines line (813314682) must resolve to its non-origin
+        // `to_pos` so the fallback has something real to substitute.
+        let to_pos = ffxi_nav::to_pos_for_line(813314682)
+            .expect("line 813314682 (S. Gustaberg → Bastok Mines) must exist");
+        let dest = v(to_pos[0], to_pos[1], to_pos[2]);
+        assert!(
+            apply_zoneline_spawn_fallback(v(0.0, 0.0, 0.0), Some(dest)) == dest,
+            "baked to_pos {to_pos:?} should be treated as a valid destination"
+        );
+    }
 
     // ---- CHAR_NPC entity classification (LSB live-mob marker) ----
 

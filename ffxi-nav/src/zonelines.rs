@@ -50,6 +50,16 @@ pub fn total_count() -> usize {
     ZONE_LINES.len()
 }
 
+/// The landing position (`to_pos`, FFXI-native `(x, y, z)`) for the
+/// zone-line with the given LSB `line_id`, or `None` if no such line
+/// exists. Linear scan over the full table — fine for the once-per-
+/// zone-transition call site that uses it (the client's spawn-fallback
+/// guard, which substitutes this when a server hands back an origin
+/// spawn after a zoneline transition).
+pub fn to_pos_for_line(line_id: u32) -> Option<[f32; 3]> {
+    ZONE_LINES.iter().find(|z| z.line_id == line_id).map(|z| z.to_pos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +99,23 @@ mod tests {
     fn unknown_zone_returns_empty() {
         // Zone 0xFFFF should not exist.
         assert!(zone_lines_for(0xFFFF).is_empty());
+    }
+
+    #[test]
+    fn to_pos_for_line_resolves_known_line() {
+        // South Gustaberg → Bastok Mines (zonelineid 813314682). The
+        // client's origin-spawn repair substitutes this when the server
+        // hands back (0,0,0), so the non-origin destination must survive
+        // any SQL re-scrape. Native (x, y, z) = SQL (to_x, to_z, to_y).
+        let to_pos = to_pos_for_line(813314682).expect("line 813314682 must exist");
+        assert!((to_pos[0] - -16.039).abs() < 0.01, "x = {}", to_pos[0]);
+        assert!((to_pos[1] - -132.804).abs() < 0.01, "y = {}", to_pos[1]);
+        assert!((to_pos[2] - -4.217).abs() < 0.01, "z = {}", to_pos[2]);
+    }
+
+    #[test]
+    fn to_pos_for_line_unknown_is_none() {
+        assert!(to_pos_for_line(0xDEAD_BEEF).is_none());
     }
 
     #[test]
