@@ -718,10 +718,27 @@ pub fn dispatch_look_driven_models(
             }
             let slot_ids = [head, body, hands, legs, feet, main, sub, ranged];
             debug_assert_eq!(slot_ids.len(), EQUIP_SLOT_ORDER_LEN);
-            for slot in slot_ids {
-                if let Some(file_id) = resolve_equipment_slot(slot, race) {
+            // Per-slot resolution trace. `equip=1` (face only) in the dispatch
+            // log means every slot below sentineled to `None` — the
+            // `PC_MODEL_IDS` breakpoints only cover base-game model ids, so
+            // higher-id (expansion) gear that max-level players wear resolves
+            // to nothing and the actor renders head-only. Logging each
+            // `(slot_u16, file_id?)` shows exactly which model ids fall past
+            // the table so Phase 5 (equipment-model-table completion) can scope
+            // the missing ranges.
+            let mut slot_trace: [(u16, Option<u32>); 8] = Default::default();
+            for (i, &slot) in slot_ids.iter().enumerate() {
+                let file_id = resolve_equipment_slot(slot, race);
+                slot_trace[i] = (slot, file_id);
+                if let Some(file_id) = file_id {
                     equipment.push(file_id);
                 }
+            }
+            if slot_trace.iter().any(|(_, r)| r.is_none()) {
+                info!(
+                    "pc equip unresolved (entity {} race {}): {:?}",
+                    we.id, race, slot_trace
+                );
             }
 
             // One faithful render request per entity (replaces the per-slot

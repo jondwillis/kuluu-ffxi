@@ -268,19 +268,29 @@ pub fn load_pc(race: u8, equipment: &[u32]) -> Result<LoadedActor, String> {
         equipment
     };
 
+    // Per-equipment-file mesh-count trace. A live PC that renders "head only"
+    // (reported for Taru) drops here in one of two ways: an equipment file that
+    // can't be read (`read`), or one that parses but yields no skel meshes
+    // (`0 meshes`). Logging the count per file_id pinpoints which slot/item
+    // is the culprit so a live look at the actor diagnoses it precisely.
+    let mut equip_trace: Vec<(u32, &'static str)> = Vec::new();
     for &file_id in equipment {
         let Some(bytes) = read_dat(&root, file_id) else {
+            equip_trace.push((file_id, "unreadable"));
             continue;
         };
         let dir = ResourceDir::from_bytes(bytes.clone());
         let meshes = dir.collect_skel_meshes();
         if meshes.is_empty() {
+            equip_trace.push((file_id, "0 meshes"));
             continue;
         }
+        equip_trace.push((file_id, "ok"));
         skel_meshes.extend(meshes);
         collect_textures(&walk_tree(&bytes), &mut textures);
         anim_dirs.push(ResourceDir::from_bytes(bytes));
     }
+    debug!("load_pc race={race}: equipment {equip_trace:?}");
 
     // Full-rig (`*1` LOD) locomotion + battle clips live in the race's MOTION
     // DAT (skel + 2600), NOT the skeleton DAT — which carries only the low-LOD
