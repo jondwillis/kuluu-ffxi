@@ -921,6 +921,37 @@ pub(crate) fn register(
             .run_if(in_state(LauncherState::CharList)),
     );
 
+    // Faithful char-select animation, gated on CharList so the preview
+    // ticks here WITHOUT double-ticking in-game (the in-game path uses
+    // `tick_live_ffxi_actors`, which skips `world_id == 0` harness-style
+    // actors like the preview anyway, but the explicit gate keeps the
+    // preview's per-frame cost out of every in-game frame). Order:
+    //
+    //   drive_preview_pose            -> sets the actor's idle inputs
+    //   tick_ffxi_render_actors       -> selects clip + stamps the
+    //                                    animated bone matrices (reads
+    //                                    those inputs same-frame)
+    //   relight_preview_actor         -> re-stamps a legible launcher
+    //                                    light uniform, AFTER the app-wide
+    //                                    `update_ffxi_render_actor_lighting`
+    //                                    has clobbered it with the (absent)
+    //                                    in-game sun.
+    //
+    // `FfxiMaterialPlugin` (the `FfxiSkinnedMaterial` asset + shader) is
+    // already registered app-wide by `ViewerCorePlugin`, so nothing extra
+    // is needed for the material itself.
+    app.add_systems(
+        Update,
+        (
+            char_preview::drive_preview_pose,
+            ffxi_viewer_core::ffxi_actor_render::tick_ffxi_render_actors,
+            char_preview::relight_preview_actor
+                .after(ffxi_viewer_core::ffxi_actor_render::update_ffxi_render_actor_lighting),
+        )
+            .chain()
+            .run_if(in_state(LauncherState::CharList)),
+    );
+
     // Connect in flight: spawn task, poll oneshot. Also: copy the
     // selected character's appearance into `SelfAppearance` so the
     // in-game look_resolver has something to render once the player
