@@ -545,6 +545,30 @@ impl SkeletonAnimationCoordinator {
         }
     }
 
+    /// Bitmask of currently-occupied slots (bit `i` set ⇒ slot `i` has an
+    /// animator). Used by the live tick to find slots the previous pose
+    /// occupied but the incoming one doesn't.
+    pub fn occupied_slots(&self) -> u8 {
+        let mut mask = 0u8;
+        for (i, slot) in self.animations.iter().enumerate() {
+            if slot.is_some() {
+                mask |= 1 << i;
+            }
+        }
+        mask
+    }
+
+    /// Empty a single slot, leaving the others' frame cursors intact (unlike
+    /// [`clear`](Self::clear), which resets everything). The live tick uses
+    /// this to retire an orphan layer — e.g. the run upper-body layer (slot 1)
+    /// when the next pose is a slot-0-only idle — so it doesn't keep animating
+    /// under the new pose, while the surviving slots still crossfade in place.
+    pub fn clear_slot(&mut self, slot: usize) {
+        if let Some(s) = self.animations.get_mut(slot) {
+            *s = None;
+        }
+    }
+
     fn get_or_put(&mut self, slot: usize) -> &mut SkeletonAnimator {
         if self.animations[slot].is_none() {
             self.animations[slot] = Some(SkeletonAnimator::new(slot));

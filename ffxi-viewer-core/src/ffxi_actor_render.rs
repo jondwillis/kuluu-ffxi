@@ -25,7 +25,7 @@ use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 
 use ffxi_actor::actor_state::{self, ActorAnimInputs, RestKind};
-use ffxi_actor::animation::{LoopParams, SkeletonAnimationCoordinator};
+use ffxi_actor::animation::{LoopParams, SkeletonAnimationCoordinator, TransitionParams};
 use ffxi_actor::skeleton_instance::{pose_world, RootTransform};
 
 use ffxi_dat::d3m::D3m;
@@ -81,6 +81,33 @@ pub struct FfxiRenderRoot(pub Entity);
 /// runtime's `get_joint_transform` already scales by `key_frame_duration`, so
 /// the tick feeds it `elapsed_seconds * FRAME_RATE` as an elapsed-frames count.
 pub const FRAME_RATE: f32 = 30.0;
+
+/// Crossfade (in animation frames at [`FRAME_RATE`]) eased when entering a
+/// locomotion pose from idle — `idl0` → `run0`/`wlk0`. A touch longer than the
+/// out-fade so starting to move reads as a gentle lean-in rather than a snap.
+/// 9 frames ≈ 300 ms.
+pub const LOCOMOTION_XFADE_IN: f32 = 9.0;
+/// Crossfade (frames) eased when leaving a locomotion pose for idle — the XIM
+/// default. 7.5 frames ≈ 250 ms.
+pub const LOCOMOTION_XFADE_OUT: f32 = 7.5;
+
+/// Dead-reckoned speed (yalms/sec) below which a *remote* moving actor uses the
+/// walk gait (`wlk?`) instead of run (`run?`). FFXI base run ≈ 5 yalms/sec;
+/// retail walk is roughly half that, so 3.0 catches genuinely slow movers
+/// (sneaking NPCs, near-wall shuffles) without flipping a normal runner to
+/// walk. Self ignores this (it has the explicit `/walk` toggle).
+pub const WALK_RUN_BOUNDARY: f32 = 3.0;
+
+/// Remote-actor gait inference: a moving actor whose dead-reckoned `speed`
+/// (yalms/sec) is above the move floor but below [`WALK_RUN_BOUNDARY`] uses the
+/// walk gait (`wlk?`); faster movers run (`run?`). Self is excluded by the
+/// caller (it carries the explicit `/walk` toggle). The lower bound is
+/// [`combat_stance::EntityMotion::MOVE_EXIT`] so a near-stationary actor that
+/// hasn't yet flipped to idle isn't classed as "walking".
+#[inline]
+pub fn infers_walk_gait(speed: f32) -> bool {
+    speed > combat_stance::EntityMotion::MOVE_EXIT && speed < WALK_RUN_BOUNDARY
+}
 
 /// FFXI skeleton-space -> Bevy basis. The new `pose_world` leaves the rig in
 /// FFXI engine space (Y-down-ish: a Y-up Bevy camera looks at the rig
@@ -1101,11 +1128,16 @@ fn advance_rest_phase(
 /// bone uniform. The caller sets `actor.inputs` / `actor.facing_dir` first;
 /// this function only reads them.
 ///
-/// On a pose change (selected id OR engaged-ness flips) it `clear()`s every
-/// coordinator slot before re-registering, so a slot left occupied by the
-/// PREVIOUS pose can't keep playing (e.g. idle is `idl0`, slot 0 only — a stale
-/// slot 1 would keep the arms running after the legs stop). Steady-state looping
-/// keeps each slot's frame cursor so the legs/arms stay phase-locked.
+/// On a pose change (selected id OR engaged-ness flips) it crossfades into the
+/// new pose instead of hard-cutting: surviving slots transition in place, and
+/// only the *orphan* slots the new pose doesn't cover are retired (e.g. idle is
+/// `idl0`, slot 0 only — the run upper-body layer in slot 1 is cleared so it
+/// can't keep playing after the legs stop). Steady-state looping keeps each
+/// slot's frame cursor so the legs/arms stay phase-locked.
+///
+/// The crossfade durations live in [`LOCOMOTION_XFADE_IN`] /
+/// [`LOCOMOTION_XFADE_OUT`]; both are in animation frames (the coordinator
+/// advances in frames — `elapsed_frames = dt * FRAME_RATE`).
 fn advance_actor_pose(
     actor: &mut FfxiRenderActor,
     elapsed_frames: f32,
@@ -1154,16 +1186,61 @@ fn advance_actor_pose(
     let engaged = actor.inputs.engage_state.is_battle_idle();
     if !matches.is_empty() && actor.current_clip != Some((selected_id, engaged)) {
         actor.current_clip = Some((selected_id, engaged));
-        actor.coordinator.clear();
-        let loop_params = LoopParams {
-            loop_duration: None,
-            num_loops: None,
-            low_priority: is_idle,
-        };
+
+        // Slots the incoming pose covers (each clip lands in the slot of its
+        // id's final digit).
+        let mut new_mask = 0u8;
         for clip in &matches {
-            actor
-                .coordinator
-                .register_animation(clip.clone(), loop_params, None, |_| true);
+            let slot = (clip.id.final_digit().unwrap_or(0) as usize).min(7);
+            new_mask |= 1 << slot;
+        }
+        // Retire orphan slots — occupied by the OLD pose but not the new one —
+        // so e.g. the run upper-body layer (slot 1) doesn't keep animating
+        // under a slot-0-only idle. Clearing only the orphans (rather than
+        // every slot, as the old hard-cut did) lets the surviving slots
+        // crossfade in place. A looping run layer can't fade *itself* out via
+        // the cross-slot machinery (it never "completes", and forcing eager
+        // transition-out would snap it instantly), so an explicit clear is the
+        // correct retirement for the shrinking-pose direction (run → idle).
+        let old_mask = actor.coordinator.occupied_slots();
+        for slot in 0..8usize {
+            if old_mask & (1 << slot) != 0 && new_mask & (1 << slot) == 0 {
+                actor.coordinator.clear_slot(slot);
+            }
+        }
+
+        if is_idle {
+            // Idle / rest / battle-idle: low-priority loop, gated on
+            // transition-out readiness. Crossfades from the outgoing clip using
+            // that clip's `transition_out_time` (e.g. run0 → idl0 over
+            // LOCOMOTION_XFADE_OUT).
+            for clip in &matches {
+                actor.coordinator.register_idle_animation(clip.clone(), true);
+            }
+        } else {
+            // Locomotion: crossfade into each layer. `transition_in_time` eases
+            // idle → run/walk; `transition_out_time` is what this clip hands to
+            // the idle that later replaces it. Not `eager_transition_out` — a
+            // continuously-looping run layer never "completes", so eager would
+            // make it snap rather than fade.
+            let tp = TransitionParams {
+                transition_in_time: LOCOMOTION_XFADE_IN,
+                transition_out_time: LOCOMOTION_XFADE_OUT,
+                ..Default::default()
+            };
+            let loop_params = LoopParams {
+                loop_duration: None,
+                num_loops: None,
+                low_priority: false,
+            };
+            for clip in &matches {
+                actor.coordinator.register_animation(
+                    clip.clone(),
+                    loop_params,
+                    Some(tp.clone()),
+                    |_| true,
+                );
+            }
         }
     }
     // Overlay diagnostic: the fullest registered clip's id.
@@ -1389,9 +1466,18 @@ pub fn tick_live_ffxi_actors(
         } else {
             (0.0, 0.0)
         };
-        // /walk is a self-only local toggle; remote actors carry no wire
-        // signal for it, so they always use the run gait.
-        let walking = is_self && walk_mode.walking;
+        // `/walk` is a self-only local toggle. Remote actors carry no wire
+        // walk/run signal — the server per-actor speed byte is unpopulated
+        // today (always the default; see `ffxi-client/src/state.rs`) — so infer
+        // the gait from the dead-reckoned speed: a slow mover (still moving but
+        // below WALK_RUN_BOUNDARY) plays the walk gait, a normal runner plays
+        // run. Skeletons lacking a `wlk` clip degrade to run via
+        // `select_pose_clips`.
+        let walking = if is_self {
+            walk_mode.walking
+        } else {
+            infers_walk_gait(sample.speed)
+        };
 
         actor.facing_dir = 0.0; // heading carried by the parent rotation.
         actor.inputs = ActorAnimInputs {

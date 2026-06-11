@@ -325,6 +325,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         OnExit(AppPhase::InGame),
         (
             despawn_ingame_entities,
+            drain_entity_prediction,
             drain_mzb_load_state,
             drain_mmb_load_state,
         ),
@@ -704,6 +705,18 @@ fn despawn_ingame_entities(
     animation_blends.by_id.clear();
 
     tracing::info!(count, "OnExit(InGame): despawned scoped entities");
+}
+
+/// Sibling drain for the dead-reckoning predictor table. Separate system
+/// because [`despawn_ingame_entities`] is already at Bevy's 16-`SystemParam`
+/// ceiling. Same rationale as the `entity_motion` / `animation_blends` drain
+/// there: the table is keyed by session-scoped wire id, so a stale entry would
+/// seed the next session's actor (which may reuse the id) with a bogus velocity
+/// / rendered position before its first server sample lands.
+fn drain_entity_prediction(
+    mut prediction: ResMut<ffxi_viewer_core::combat_stance::EntityPrediction>,
+) {
+    prediction.by_id.clear();
 }
 
 /// Sibling drain for the Phase-A background-MZB-load Resources. Lives

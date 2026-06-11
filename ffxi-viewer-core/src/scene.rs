@@ -368,6 +368,9 @@ pub fn sync_entities_system(
     mut images: ResMut<Assets<Image>>,
     billboard_font: Res<crate::nameplate_billboard::BillboardFont>,
     mut tracked: ResMut<TrackedEntities>,
+    mut prediction: ResMut<crate::combat_stance::EntityPrediction>,
+    mut motion: ResMut<crate::combat_stance::EntityMotion>,
+    mut blends: ResMut<crate::combat_stance::AnimationBlends>,
     mut commands: Commands,
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     mut q_mat: Query<&mut MeshMaterial3d<StandardMaterial>, With<WorldEntity>>,
@@ -401,6 +404,15 @@ pub fn sync_entities_system(
         hp_by_id.insert(wire.id, wire.hp_pct);
         let world_pos = ffxi_to_bevy(wire.pos);
         let is_self = self_char_id != 0 && wire.id == self_char_id;
+        // Dead-reckoning: the predictor owns rendered XZ + facing for moving
+        // non-self kinds. Feed it this server sample; `predict_entities_system`
+        // (combat_stance) integrates and writes their Transform every frame —
+        // including the frames between server packets, which is what stops the
+        // freeze-and-jump stutter. Self + static NPCs keep the direct writes
+        // below.
+        if !is_self && matches!(wire.kind, EntityKind::Mob | EntityKind::Pc | EntityKind::Pet) {
+            prediction.observe(wire.id, world_pos, wire.heading);
+        }
         // Material selection:
         //   - Self: dedicated `self_pc` material (camera-anchored capsule).
         //   - Mobs: claim-aware (white = self-claim, red = other-claim) so
@@ -424,43 +436,32 @@ pub fn sync_entities_system(
         match tracked.by_id.get(&wire.id).copied() {
             Some(existing) => {
                 if let Ok(mut t) = q_xform.get_mut(existing) {
-                    // Self snaps directly to the wire position because the
-                    // 60 Hz `dispatch_movement_system` already does its own
-                    // integration — extra smoothing here only adds input
-                    // lag. Other entities arrive at server tick rate, so
-                    // visual smoothing fills the gaps.
-                    //
-                    // **Y ownership splits by entity kind:**
-                    // - Self + static NPCs (`Npc`, `Other`): the MZB-floor
-                    //   snap (`snap_entities_to_mzb_floor_system`) owns Y.
-                    //   Self because the server pings the player's last-
-                    //   known altitude, not the terrain the client renders;
-                    //   static NPC records because the spawn-time Y often
-                    //   doesn't match the runtime MZB floor at the same XZ
-                    //   (vendor floats in the air without the snap).
-                    // - Active entities (`Mob`, `Pc`, `Pet`): the server
-                    //   simulates fresh XYZ each tick on its own navmesh
-                    //   and is authoritative. Preserving the snap-set Y
-                    //   here would lie about server position — visual
-                    //   "rabbit on the ground" while the server says
-                    //   "rabbit 13y up the hillside" makes the server's
-                    //   3D range check reject attacks the operator
-                    //   thinks should be in range. Trust wire Y instead.
-                    let new_translation = if is_self {
-                        Vec3::new(world_pos.x, t.translation.y, world_pos.z)
-                    } else {
+                    // **Transform ownership splits by entity kind:**
+                    // - Self: snaps directly to the wire position — the 60 Hz
+                    //   `dispatch_movement_system` already integrates locally,
+                    //   so extra smoothing here only adds input lag. Keeps its
+                    //   own Y (chase camera + MZB-floor snap own it; the server
+                    //   pings last-known altitude, not the rendered terrain).
+                    // - Active kinds (`Mob`, `Pc`, `Pet`): the dead-reckoning
+                    //   predictor (`combat_stance::predict_entities_system`)
+                    //   owns XZ + rotation + Y-smoothing and writes the
+                    //   transform EVERY frame from the samples fed via
+                    //   `prediction.observe` above. We leave the transform
+                    //   untouched here so the two writers don't fight. Y stays
+                    //   server-authoritative (smoothed) inside the predictor —
+                    //   preserving a snap-set Y would lie about server position
+                    //   and make the server's 3D range check reject attacks the
+                    //   operator thinks are in range.
+                    // - Static kinds (`Npc`, `Other`): never move, so smooth XZ
+                    //   toward the wire and keep current Y (spawn/MZB floor).
+                    if is_self {
+                        t.translation = Vec3::new(world_pos.x, t.translation.y, world_pos.z);
+                        t.rotation = heading_to_quat(wire.heading);
+                    } else if matches!(wire.kind, EntityKind::Npc | EntityKind::Other) {
                         let smoothed = apply_visual_smoothing(t.translation, world_pos);
-                        match wire.kind {
-                            EntityKind::Mob | EntityKind::Pc | EntityKind::Pet => {
-                                Vec3::new(smoothed.x, world_pos.y, smoothed.z)
-                            }
-                            EntityKind::Npc | EntityKind::Other => {
-                                Vec3::new(smoothed.x, t.translation.y, smoothed.z)
-                            }
-                        }
-                    };
-                    t.translation = new_translation;
-                    t.rotation = heading_to_quat(wire.heading);
+                        t.translation = Vec3::new(smoothed.x, t.translation.y, smoothed.z);
+                        t.rotation = heading_to_quat(wire.heading);
+                    }
                 }
                 if let Ok(mut m) = q_mat.get_mut(existing) {
                     m.0 = mat;
@@ -579,6 +580,14 @@ pub fn sync_entities_system(
         if let Some(bevy_e) = tracked.by_id.remove(&id) {
             commands.entity(bevy_e).despawn();
         }
+        // Symmetric cleanup: the per-id motion / prediction / blend tables are
+        // keyed by wire id (not ECS entity), so the recursive despawn above
+        // doesn't reach them. Drain them on the same stale-id set so a
+        // despawned mob / zoned-out PC can't leak a stale sample (and so a
+        // fresh entity that later reuses the id starts clean).
+        prediction.by_id.remove(&id);
+        motion.by_id.remove(&id);
+        blends.by_id.remove(&id);
     }
 
     // HP update path moved into `nameplate_billboard.rs`: the per-

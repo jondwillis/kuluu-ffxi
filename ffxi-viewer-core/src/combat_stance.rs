@@ -1073,28 +1073,164 @@ mod tests {
         }
     }
 
-    /// `is_moving` threshold: 0 → never moving; below threshold →
-    /// not moving (smoothing jitter); above → moving. Pin the
-    /// threshold value so a future tweak that bumps the constant
-    /// silently disabling run animation on slow movement gets
+    /// `is_moving` now reads the hysteresis latch ([`MotionSample::moving`]),
+    /// not the raw instantaneous speed — so a clip selection can't chatter when
+    /// `speed` hovers at a single threshold.
+    #[test]
+    fn is_moving_reads_latch_not_raw_speed() {
+        let mut m = EntityMotion::default();
+        m.by_id.insert(
+            1,
+            MotionSample {
+                moving: true,
+                speed: 0.0,
+                ..Default::default()
+            },
+        );
+        m.by_id.insert(
+            2,
+            MotionSample {
+                moving: false,
+                speed: 9.0,
+                ..Default::default()
+            },
+        );
+        assert!(m.is_moving(1), "latched-moving animates even at instant speed 0");
+        assert!(!m.is_moving(2), "latched-idle stays idle even at instant speed 9");
+        assert!(!m.is_moving(99), "unknown id should not animate");
+    }
+
+    /// Hysteresis: enter only above `MOVE_ENTER`, leave only below `MOVE_EXIT`,
+    /// hold the previous state in the band between. Pins the band ordering so a
+    /// future tweak that collapses it (re-introducing idle↔run chatter) is
     /// caught.
     #[test]
-    fn is_moving_threshold_behaviour() {
-        let mut m = EntityMotion::default();
-        let make = |speed: f32| MotionSample {
-            last_pos: Vec3::ZERO,
-            speed,
-            ..Default::default()
-        };
-        m.by_id.insert(1, make(0.0));
-        m.by_id.insert(2, make(0.49));
-        m.by_id.insert(3, make(0.51));
-        m.by_id.insert(4, make(6.0));
-        assert!(!m.is_moving(1), "0 speed should not animate");
-        assert!(!m.is_moving(2), "below 0.5 should not animate");
-        assert!(m.is_moving(3), "just above 0.5 should animate");
-        assert!(m.is_moving(4), "full run speed should animate");
-        assert!(!m.is_moving(99), "unknown id should not animate");
+    fn move_hysteresis_enter_exit_and_hold() {
+        assert!(
+            EntityMotion::MOVE_EXIT < EntityMotion::MOVE_ENTER,
+            "there must be a genuine hold band"
+        );
+        let mid = 0.5 * (EntityMotion::MOVE_EXIT + EntityMotion::MOVE_ENTER);
+        // From idle.
+        assert!(!EntityMotion::apply_move_hysteresis(false, EntityMotion::MOVE_EXIT));
+        assert!(!EntityMotion::apply_move_hysteresis(false, mid), "idle holds in band");
+        assert!(EntityMotion::apply_move_hysteresis(false, EntityMotion::MOVE_ENTER + 0.1));
+        // From moving.
+        assert!(EntityMotion::apply_move_hysteresis(true, mid), "moving holds in band");
+        assert!(EntityMotion::apply_move_hysteresis(true, EntityMotion::MOVE_ENTER + 0.1));
+        assert!(!EntityMotion::apply_move_hysteresis(true, EntityMotion::MOVE_EXIT - 0.01));
+        assert!(!EntityMotion::apply_move_hysteresis(true, 0.0));
+    }
+
+    /// The walk/run boundary sits inside the moving band but below base run, so
+    /// a genuinely slow mover walks while a normal runner (~5 yalm/s) runs.
+    #[test]
+    fn walk_run_boundary_is_sane() {
+        use crate::ffxi_actor_render::{infers_walk_gait, WALK_RUN_BOUNDARY};
+        assert!(EntityMotion::MOVE_EXIT < WALK_RUN_BOUNDARY);
+        assert!(WALK_RUN_BOUNDARY < 5.0, "a base-run actor must NOT be classed as walking");
+        assert!(!infers_walk_gait(0.0), "stationary is not walking");
+        assert!(infers_walk_gait(1.5), "slow mover walks");
+        assert!(!infers_walk_gait(6.0), "runner runs, not walks");
+    }
+
+    // ---- Dead-reckoning predictor ----
+
+    /// Build a sample as if `observe` had just set a fresh `server_pos` `age`
+    /// seconds after the previous one, with the predicted position currently
+    /// sitting at the previous server position (the steady-tracking case).
+    fn dirty_sample(server: Vec3, prev: Vec3, age: f32) -> PredictSample {
+        PredictSample {
+            rendered_pos: prev,
+            server_pos: server,
+            last_server_pos: prev,
+            dr_velocity: Vec3::ZERO,
+            target_heading: 0,
+            rendered_heading_rad: 0.0,
+            secs_since_update: age,
+            sample_dirty: true,
+            initialized: true,
+        }
+    }
+
+    #[test]
+    fn prediction_ingest_seeds_velocity_from_displacement() {
+        // Server moved +1 yalm in x over 0.2s → ~5 yalm/s eastward.
+        let mut s = dirty_sample(Vec3::new(1.0, 0.0, 0.0), Vec3::ZERO, 0.2);
+        advance_prediction(&mut s, 1.0 / 30.0);
+        assert!(s.dr_velocity.x > 0.5, "x velocity seeded: {}", s.dr_velocity.x);
+        assert!(s.dr_velocity.y.abs() < 1e-6 && s.dr_velocity.z.abs() < 1e-6);
+        assert!(!s.sample_dirty, "sample consumed by ingest");
+    }
+
+    #[test]
+    fn prediction_clamps_velocity_to_max() {
+        // A 100-yalm displacement in 0.1s would imply 1000 yalm/s — but it's
+        // also a discontinuity (far from rendered_pos), so it must SNAP and
+        // zero velocity rather than fling.
+        let mut s = dirty_sample(Vec3::new(100.0, 0.0, 0.0), Vec3::ZERO, 0.1);
+        let (pos, _) = advance_prediction(&mut s, 1.0 / 30.0);
+        assert!(s.dr_velocity.length() < 1e-6, "snap zeroes velocity");
+        assert!((pos.x - 100.0).abs() < 0.5, "snapped onto server: {}", pos.x);
+    }
+
+    #[test]
+    fn prediction_extrapolates_between_updates() {
+        // Seeded with steady eastward velocity, no fresh sample → keeps moving.
+        let mut s = PredictSample::seed(Vec3::ZERO, 0);
+        s.dr_velocity = Vec3::new(5.0, 0.0, 0.0);
+        let start = s.rendered_pos.x;
+        for _ in 0..10 {
+            advance_prediction(&mut s, 1.0 / 30.0);
+        }
+        assert!(
+            s.rendered_pos.x > start + 0.5,
+            "dead-reckons forward between updates: {} -> {}",
+            start,
+            s.rendered_pos.x
+        );
+    }
+
+    #[test]
+    fn prediction_velocity_decays_when_stale() {
+        let mut s = PredictSample::seed(Vec3::ZERO, 0);
+        s.dr_velocity = Vec3::new(5.0, 0.0, 0.0);
+        for _ in 0..120 {
+            // ~4s, well past STALE_VEL_SECS, no fresh samples.
+            advance_prediction(&mut s, 1.0 / 30.0);
+        }
+        assert!(
+            s.dr_velocity.length() < 0.5,
+            "stale velocity coasts to a stop: {}",
+            s.dr_velocity.length()
+        );
+    }
+
+    #[test]
+    fn prediction_static_actor_does_not_drift() {
+        let anchor = Vec3::new(3.0, 1.0, 2.0);
+        let mut s = PredictSample::seed(anchor, 64);
+        for _ in 0..60 {
+            advance_prediction(&mut s, 1.0 / 30.0);
+        }
+        assert!((s.rendered_pos - anchor).length() < 0.05, "stays put: {:?}", s.rendered_pos);
+        assert!(s.dr_velocity.length() < 1e-3);
+    }
+
+    #[test]
+    fn observe_seeds_then_flags_only_on_real_move() {
+        let mut p = EntityPrediction::default();
+        p.observe(7, Vec3::new(1.0, 0.0, 0.0), 10);
+        let s = p.by_id[&7];
+        assert!(s.initialized && !s.sample_dirty, "first sight seeds, not dirty");
+        assert_eq!(s.rendered_pos, Vec3::new(1.0, 0.0, 0.0));
+        // HP-only style re-send of the same position must NOT re-ingest.
+        p.observe(7, Vec3::new(1.0, 0.0, 0.0), 10);
+        assert!(!p.by_id[&7].sample_dirty, "unchanged position must not re-ingest");
+        // A real move raises the dirty flag and records the new heading.
+        p.observe(7, Vec3::new(2.0, 0.0, 0.0), 20);
+        assert!(p.by_id[&7].sample_dirty, "moved position raises dirty");
+        assert_eq!(p.by_id[&7].target_heading, 20);
     }
 
     /// `RestStance::is_resting` reflects the kind variant.
