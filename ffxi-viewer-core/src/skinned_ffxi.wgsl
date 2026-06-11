@@ -104,13 +104,16 @@ fn vertex(v: Vertex) -> VertexOutput {
     return out;
 }
 
-// FFXI light model: flat ambient + 2 directional (N·L) + 4 point,
-// modulated by the per-vertex color. Mirrors XIM's per-vertex lighting
-// (we evaluate per-fragment for smoother gradients; the math is the same).
-fn ffxi_light(n: vec3<f32>, p: vec3<f32>, vc: vec4<f32>) -> vec4<f32> {
+// Scene irradiance at a surface: ambient sky fill + 2 directional (sun/moon)
+// + 4 point lights, all sourced from the live zone lighting uniform. `wrap`
+// softens the N·L terminator (0 = hard Lambert). Shared by both shading
+// models below.
+fn scene_irradiance(n: vec3<f32>, p: vec3<f32>, wrap: f32) -> vec3<f32> {
     var rgb = lighting.ambient.rgb;
-    rgb += max(dot(n, -lighting.dir0_dir.xyz), 0.0) * lighting.dir0_color.rgb * lighting.dir0_color.w;
-    rgb += max(dot(n, -lighting.dir1_dir.xyz), 0.0) * lighting.dir1_color.rgb * lighting.dir1_color.w;
+    let nl0 = max((dot(n, -lighting.dir0_dir.xyz) + wrap) / (1.0 + wrap), 0.0);
+    rgb += nl0 * lighting.dir0_color.rgb * lighting.dir0_color.w;
+    let nl1 = max((dot(n, -lighting.dir1_dir.xyz) + wrap) / (1.0 + wrap), 0.0);
+    rgb += nl1 * lighting.dir1_color.rgb * lighting.dir1_color.w;
     for (var i = 0u; i < 4u; i = i + 1u) {
         let range = lighting.point_color[i].w;
         if (range > 0.0) {
@@ -119,7 +122,7 @@ fn ffxi_light(n: vec3<f32>, p: vec3<f32>, vc: vec4<f32>) -> vec4<f32> {
             rgb += atten * lighting.point_color[i].rgb;
         }
     }
-    return vec4<f32>(rgb * vc.rgb, vc.a);
+    return rgb;
 }
 
 @fragment
@@ -127,6 +130,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Untextured FFXI meshes (C/CS ops) carry a null TextureLink: treat the
     // texel as white opaque and skip the alpha-test so the vertex color shows.
     let has_texture = material_flags.flags.x > 0.5;
+    // flags.y selects the realistic (Bevy-scene-driven) lighting model.
+    let realistic = material_flags.flags.y > 0.5;
     var texel = vec4<f32>(1.0);
     if (has_texture) {
         texel = textureSample(base_tex, base_samp, in.uv);
@@ -136,8 +141,33 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             discard;
         }
     }
-    let frag_color = ffxi_light(normalize(in.world_normal), in.world_position, in.color);
-    // FFXI composites baked-diffuse textures at 2x the lit vertex color.
-    let rgb = 2.0 * frag_color.rgb * texel.rgb;
-    return vec4<f32>(rgb, frag_color.a * texel.a);
+
+    let n = normalize(in.world_normal);
+    if (realistic) {
+        // Energy-conserving: albedo (texture * vertex color) lit ONCE by the
+        // live scene sun/moon/ambient (+ point lights), with a soft wrap so
+        // the unshadowed back side fades instead of clamping to hard black.
+        // No FFXI 2x doubling, so characters sit naturally in the PBR-lit
+        // world. Bevy's post-process tonemap compresses the HDR result.
+        //
+        // The driven irradiance lands in a 0..~1 band, which tonemaps DARKER
+        // than the zone's PBR meshes (lit from the full-lux HDR sun). EXPOSURE
+        // lifts entities to sit at the zone's brightness; the small additive
+        // floor keeps the ambient-only (shadowed) side off pure black. Raise
+        // EXPOSURE if models still read dark against the zone; lower it if they
+        // blow out. (Exact parity needs true PBR + shadow receiving — a larger
+        // change; this is the tunable approximation.)
+        let EXPOSURE = 1.7;
+        let AMBIENT_FLOOR = 0.10;
+        let albedo = texel.rgb * in.color.rgb;
+        let irr = scene_irradiance(n, in.world_position, 0.3);
+        let rgb = albedo * (irr * EXPOSURE + vec3<f32>(AMBIENT_FLOOR));
+        return vec4<f32>(rgb, in.color.a * texel.a);
+    }
+
+    // FFXI-faithful: flat per-vertex light * vertex color, composited at 2x
+    // the baked-diffuse texel (XIM's `2 * vertexColor * texel`).
+    let lit = scene_irradiance(n, in.world_position, 0.0) * in.color.rgb;
+    let rgb = 2.0 * lit * texel.rgb;
+    return vec4<f32>(rgb, in.color.a * texel.a);
 }

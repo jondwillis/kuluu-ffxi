@@ -235,6 +235,8 @@ pub enum GraphicsField {
     LightIntensity,
     LightRange,
     LightFlicker,
+    /// FFXI-flat vs Bevy-realistic lighting for character / entity models.
+    CharacterLighting,
 }
 
 impl GraphicsField {
@@ -266,6 +268,7 @@ impl GraphicsField {
             GraphicsField::LightIntensity => "  Intensity",
             GraphicsField::LightRange => "  Range",
             GraphicsField::LightFlicker => "  Flicker",
+            GraphicsField::CharacterLighting => "Model Lighting",
         }
     }
 
@@ -350,6 +353,16 @@ pub struct GraphicsSettings {
     /// (which honors the `FFXI_CHARACTER_PATH` dev override).
     #[serde(default)]
     pub character_render_path: CharacterRenderPath,
+    /// Realistic (Bevy-scene-driven) lighting for character / entity models.
+    /// `false` (default) = FFXI-faithful flat `2*vertexColor*texel` shading;
+    /// `true` = energy-conserving Lambert lit by the live zone sun / moon /
+    /// ambient. Applied each frame by
+    /// `ffxi_actor_render::update_ffxi_render_actor_lighting`, which stamps the
+    /// material flag the skinned shader branches on. Orthogonal to the quality
+    /// tier (preset cycles preserve it). `#[serde(default)]` lands a
+    /// pre-existing `graphics.json` on the faithful default.
+    #[serde(default)]
+    pub realistic_character_lighting: bool,
 }
 
 /// Default fine dynamic-light knobs. Kept in lockstep with
@@ -460,6 +473,7 @@ impl GraphicsSettings {
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
                 character_render_path: CharacterRenderPath::FfxiFaithful,
+                realistic_character_lighting: false,
             },
             QualityPreset::Medium => Self {
                 preset,
@@ -480,6 +494,7 @@ impl GraphicsSettings {
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
                 character_render_path: CharacterRenderPath::FfxiFaithful,
+                realistic_character_lighting: false,
             },
             QualityPreset::High => Self {
                 preset,
@@ -500,6 +515,7 @@ impl GraphicsSettings {
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
                 character_render_path: CharacterRenderPath::FfxiFaithful,
+                realistic_character_lighting: false,
             },
             QualityPreset::Ultra => Self {
                 preset,
@@ -523,6 +539,7 @@ impl GraphicsSettings {
                 light_range: DEFAULT_LIGHT_RANGE,
                 light_flicker: DEFAULT_LIGHT_FLICKER,
                 character_render_path: CharacterRenderPath::FfxiFaithful,
+                realistic_character_lighting: false,
             },
             // Custom: identical to High at construction; the caller
             // mutates fields after. Used by the on-disk loader when
@@ -593,6 +610,13 @@ impl GraphicsSettings {
             GraphicsField::LightIntensity => format!("{:.0}", self.light_intensity),
             GraphicsField::LightRange => format!("{:.0}m", self.light_range),
             GraphicsField::LightFlicker => bool_label(self.light_flicker).into(),
+            // Named values read better than On/Off for a render-model choice.
+            GraphicsField::CharacterLighting => if self.realistic_character_lighting {
+                "Realistic"
+            } else {
+                "FFXI"
+            }
+            .into(),
         }
     }
 
@@ -615,6 +639,7 @@ impl GraphicsSettings {
                     self.light_range,
                     self.light_flicker,
                 );
+                let realistic = self.realistic_character_lighting;
                 let next =
                     cycle_slot(self.preset, PRESET_CYCLE, delta).unwrap_or(QualityPreset::High);
                 *self = Self::for_preset(next);
@@ -624,6 +649,7 @@ impl GraphicsSettings {
                 self.light_intensity = li;
                 self.light_range = lr;
                 self.light_flicker = lf;
+                self.realistic_character_lighting = realistic;
             }
             GraphicsField::ShadowMapSize => {
                 self.shadow_map_size =
@@ -720,6 +746,11 @@ impl GraphicsSettings {
             }
             GraphicsField::LightFlicker => {
                 self.light_flicker = !self.light_flicker;
+            }
+            GraphicsField::CharacterLighting => {
+                // Orthogonal to the quality tier (like Sky/Lights): a model-
+                // lighting preference shouldn't flip the preset to Custom.
+                self.realistic_character_lighting = !self.realistic_character_lighting;
             }
         }
     }
@@ -901,6 +932,8 @@ pub const GRAPHICS_FIELDS: &[GraphicsField] = &[
     GraphicsField::LightIntensity,
     GraphicsField::LightRange,
     GraphicsField::LightFlicker,
+    // Character/entity model lighting model (FFXI-flat vs Bevy-realistic).
+    GraphicsField::CharacterLighting,
 ];
 
 // ---------------------------------------------------------------------------

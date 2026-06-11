@@ -191,6 +191,7 @@ const GRAPHICS_ENTRIES: &[&str] = &[
     "  Intensity",
     "  Range",
     "  Flicker",
+    "Model Lighting",
     "Reset to High",
 ];
 
