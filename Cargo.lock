@@ -3003,6 +3003,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ffxi-actor"
+version = "0.1.0"
+dependencies = [
+ "ffxi-dat",
+ "glam",
+]
+
+[[package]]
 name = "ffxi-audio"
 version = "0.1.0"
 dependencies = [
