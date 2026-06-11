@@ -180,16 +180,32 @@ impl Material for FfxiSkinnedMaterial {
     }
 
     // The custom vertex layout (position0/position1/...) has no standard
-    // POSITION attribute, so the default prepass / shadow vertex shaders
-    // can't specialize against it. Disable both rather than author bespoke
-    // prepass shaders; characters not writing the depth prepass or casting
-    // shadows is an acceptable first cut (revisit if shadows are wanted).
+    // POSITION attribute, so the *default* prepass / shadow vertex shaders can't
+    // specialize against it. We supply a BESPOKE depth-only shadow shader
+    // (`skinned_ffxi_prepass.wgsl`) that reuses the FFXI dual-bone skin, so
+    // characters CAST directional-light shadows.
+    //
+    // `enable_shadows = true` runs that shader for the shadow pass.
+    // `enable_prepass = false` keeps the material OUT of the camera's
+    // depth/normal/motion-vector prepass: our prepass module is depth-only (no
+    // normal / motion-vector outputs), and a TAA/SSAO camera that runs those
+    // prepasses would otherwise mis-pipeline the material. Shadow RECEIVE for the
+    // realistic branch reads Bevy's shadow maps directly in the lit fragment, so
+    // it needs no camera prepass either.
     fn enable_prepass() -> bool {
         false
     }
 
     fn enable_shadows() -> bool {
-        false
+        true
+    }
+
+    fn prepass_vertex_shader() -> ShaderRef {
+        "embedded://ffxi_viewer_core/skinned_ffxi_prepass.wgsl".into()
+    }
+
+    fn prepass_fragment_shader() -> ShaderRef {
+        "embedded://ffxi_viewer_core/skinned_ffxi_prepass.wgsl".into()
     }
 
     fn specialize(
@@ -213,6 +229,15 @@ impl Material for FfxiSkinnedMaterial {
         // FFXI never backface-culls character geometry (symmetry/mirror
         // produces both windings); match that.
         descriptor.primitive.cull_mode = None;
+
+        // No `entry_point` override. The lit pass uses `skinned_ffxi.wgsl` and
+        // the shadow pass uses `skinned_ffxi_prepass.wgsl`; each module has a
+        // single `vertex` / `fragment` entry, so Bevy's `None` (auto-select)
+        // resolves the right one per pipeline. The previous all-in-one module
+        // needed a manual override keyed off the prepass mesh-key bits, but a TAA
+        // / SSAO camera sets those same bits on the MAIN pass — which routed the
+        // lit pass through the depth-only fragment and rendered every character
+        // pure black.
         Ok(())
     }
 }
@@ -223,6 +248,7 @@ pub struct FfxiMaterialPlugin;
 impl Plugin for FfxiMaterialPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "skinned_ffxi.wgsl");
+        embedded_asset!(app, "skinned_ffxi_prepass.wgsl");
         app.add_plugins(MaterialPlugin::<FfxiSkinnedMaterial>::default());
     }
 }

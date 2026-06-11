@@ -62,6 +62,11 @@ struct Params {
     /// `update_ffxi_render_actor_lighting` stamps from the graphics setting),
     /// so the energy-conserving shader branch can be A/B'd headlessly.
     realistic: bool,
+    /// Exercise the skinned-character shadow path: forces a ground plane, makes
+    /// the directional light a steep shadow-caster, and dims ambient so the cast
+    /// shadow on the plane (and self-shadowing on the body) is visible. Used to
+    /// verify both shadow CASTING (PC silhouette on the ground) and RECEIVING.
+    shadowtest: bool,
 }
 
 #[derive(Resource, Default)]
@@ -123,6 +128,7 @@ fn parse_params(args: &[String]) -> Params {
     let mut ground = false;
     let mut autoframe = false;
     let mut realistic = false;
+    let mut shadowtest = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -199,6 +205,11 @@ fn parse_params(args: &[String]) -> Params {
                 realistic = true;
                 i += 1;
             }
+            "--shadowtest" => {
+                shadowtest = true;
+                ground = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -217,6 +228,7 @@ fn parse_params(args: &[String]) -> Params {
         ground,
         autoframe,
         realistic,
+        shadowtest,
     }
 }
 
@@ -234,24 +246,55 @@ fn setup_scene(
         Transform::from_xyz(d * 0.45, look_y + d * 0.25, d)
             .looking_at(Vec3::new(0.0, look_y, 0.0), Vec3::Y),
     ));
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 9000.0,
+    if params.shadowtest {
+        // Shadow-caster sun: steep angle from +x/+y/+z so the PC's silhouette
+        // falls onto the ground toward -x and reads clearly. `shadows_enabled`
+        // is what makes Bevy allocate the directional shadow map AND set the
+        // DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT our shader looks for. The
+        // depth/normal bias defaults are tuned for ~1-2 unit characters; bump
+        // here (not in the shader) if acne / peter-panning appears.
+        commands.spawn((
+            DirectionalLight {
+                illuminance: 11000.0,
+                shadows_enabled: true,
+                ..default()
+            },
+            Transform::from_xyz(4.0, 7.0, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
+        ));
+        // Dim ambient so the cast shadow is a visible darkening, not washed out.
+        commands.insert_resource(GlobalAmbientLight {
+            color: Color::WHITE,
+            brightness: 150.0,
             ..default()
-        },
-        Transform::from_xyz(3.0, 6.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
-    commands.insert_resource(GlobalAmbientLight {
-        color: Color::WHITE,
-        brightness: 700.0,
-        ..default()
-    });
+        });
+    } else {
+        commands.spawn((
+            DirectionalLight {
+                illuminance: 9000.0,
+                ..default()
+            },
+            Transform::from_xyz(3.0, 6.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+        ));
+        commands.insert_resource(GlobalAmbientLight {
+            color: Color::WHITE,
+            brightness: 700.0,
+            ..default()
+        });
+    }
     if params.ground {
-        // A neutral reference plane at y=0 to judge feet/body height.
+        // A neutral reference plane at y=0 to judge feet/body height — and the
+        // shadow-receiving surface under `--shadowtest`. Under shadowtest the
+        // plane is lighter so the dark cast shadow stands out against it.
+        let base_color = if params.shadowtest {
+            Color::srgb(0.55, 0.56, 0.6)
+        } else {
+            Color::srgb(0.3, 0.32, 0.36)
+        };
         commands.spawn((
             Mesh3d(meshes.add(Plane3d::default().mesh().size(8.0, 8.0))),
             MeshMaterial3d(std_materials.add(StandardMaterial {
-                base_color: Color::srgb(0.3, 0.32, 0.36),
+                base_color,
+                perceptual_roughness: 1.0,
                 ..default()
             })),
             Transform::from_xyz(0.0, 0.0, 0.0),
