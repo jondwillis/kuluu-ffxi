@@ -311,7 +311,14 @@ fn viewer_command_to_agent(cmd: wire::ViewerCommand) -> Option<AgentCommand> {
             distance,
         },
         wire::ViewerCommand::Engage { target_id } => AgentCommand::Engage { target_id },
-        wire::ViewerCommand::PathTo { x, y, z } => AgentCommand::PathTo { x, y, z },
+        // Relay/MCP clients can't force-clip through walls — the wire
+        // `PathTo` stays collision-respecting (`force: false`).
+        wire::ViewerCommand::PathTo { x, y, z } => AgentCommand::PathTo {
+            x,
+            y,
+            z,
+            force: false,
+        },
         wire::ViewerCommand::Cancel => AgentCommand::Cancel,
         wire::ViewerCommand::Cast {
             spell_id,

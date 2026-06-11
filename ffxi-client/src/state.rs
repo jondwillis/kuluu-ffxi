@@ -1600,9 +1600,12 @@ pub enum AgentCommand {
     /// Reactor goal: face `target_id` and engage auto-attack. The reactor
     /// emits a single `Action::Attack` on transition, then keeps facing.
     Engage { target_id: u32 },
-    /// Reactor goal: walk to `(x, y, z)` along a single straight segment.
-    /// Multi-waypoint paths land in a future iteration.
-    PathTo { x: f32, y: f32, z: f32 },
+    /// Reactor goal: pathfind to `(x, y, z)` along the navmesh.
+    /// `force` skips collision: when no walkable route exists the reactor
+    /// beelines straight to the target (through walls) instead of
+    /// refusing. Normal `/pathto` sets `force: false` and stays on the
+    /// mesh; `/pathtoforce` sets it true for stuck-recovery.
+    PathTo { x: f32, y: f32, z: f32, force: bool },
     /// Reactor: clear any active goal, return to `Idle`.
     Cancel,
     /// `GP_CLI_COMMAND_ITEM_USE` (0x037) — use a consumable / equipment

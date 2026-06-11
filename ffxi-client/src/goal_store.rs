@@ -207,7 +207,8 @@ mod tests {
         assert!(is_persistable_goal(&AgentCommand::PathTo {
             x: 0.0,
             y: 0.0,
-            z: 0.0
+            z: 0.0,
+            force: false
         }));
         assert!(!is_persistable_goal(&AgentCommand::Cancel));
         assert!(!is_persistable_goal(&AgentCommand::Snapshot));

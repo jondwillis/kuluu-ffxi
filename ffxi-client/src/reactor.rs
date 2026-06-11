@@ -52,11 +52,25 @@ impl NavMesh for LoadedNav {
         }
     }
 }
+
+impl LoadedNav {
+    /// Wall-slide a per-tick step onto the navmesh. Delegates to
+    /// `RecastNavMesh::slide_along` (Detour `moveAlongSurface`); the grid
+    /// nav has no wall geometry, so it passes the move through unchanged
+    /// (`None` → caller keeps the raw target). Returns `None` when the
+    /// start is off-mesh, matching `slide_along`'s contract.
+    fn slide_along(&self, from: glam::Vec3, to: glam::Vec3) -> Option<glam::Vec3> {
+        match self {
+            LoadedNav::Recast(n) => n.slide_along(from, to),
+            LoadedNav::Grid(_) => None,
+        }
+    }
+}
 use tokio::sync::{broadcast, mpsc};
 
 use crate::state::{
-    model_radius, ActionKind, AgentCommand, AgentEvent, EntityKind, ReactorGoalSnapshot,
-    SessionState, Vec3, CONTACT_GAP,
+    model_radius, ActionKind, AgentCommand, AgentEvent, ChatChannel, ChatLine, EntityKind,
+    ReactorGoalSnapshot, SessionState, Vec3, CONTACT_GAP,
 };
 
 /// Reactor parameters. Defaults match the plan's "tactical loop" target.
@@ -115,9 +129,17 @@ pub enum Goal {
     /// final element is the requested destination. A straight-line
     /// path (no navmesh available) holds a single-element `waypoints`.
     /// Each tick steps toward `waypoints[idx]`; arrival advances idx.
+    ///
+    /// `clamp` re-projects each per-tick step onto the navmesh
+    /// (wall-slide), matching free-walk movement so `/pathto` can't run
+    /// through walls. It's `true` for normal pathing and `false` for the
+    /// `/pathtoforce` escape hatch (deliberate straight-line, walls and
+    /// all). The final off-mesh "last-mile" segment is exempt either way
+    /// so zone-line triggers stay reachable.
     Pathing {
         waypoints: Vec<Vec3>,
         idx: usize,
+        clamp: bool,
     },
     /// Stage-9 banking goal: monitor inventory; when any field bag
     /// (Inventory / Mog Satchel / Mog Sack / Mog Case) reaches
@@ -128,6 +150,19 @@ pub enum Goal {
         threshold: u8,
         mog_house_zoneline: u32,
     },
+}
+
+/// Build a debug-channel `ChatLine` for `/pathto` feedback. Routes to
+/// `ChatChannel::Debug` so it only shows when the operator has debug
+/// chat enabled, and flows through the normal chat pipeline
+/// (`run_event_folder` → `SessionState::apply_event` → snapshot).
+fn debug_pathto_line(text: String) -> ChatLine {
+    ChatLine {
+        channel: ChatChannel::Debug,
+        sender: "client".into(),
+        text,
+        server_ts: 0,
+    }
 }
 
 /// Project the reactor's internal `Goal` into the serializable
@@ -152,7 +187,7 @@ fn snapshot_goal(goal: &Goal) -> ReactorGoalSnapshot {
             target_id: *target_id,
             attack_issued: *attack_issued,
         },
-        Goal::Pathing { waypoints, idx } => {
+        Goal::Pathing { waypoints, idx, .. } => {
             // Surface the *final* destination so renderers stay simple
             // ("path → (x,y,z)"); attach the count of waypoints still
             // ahead (including the destination) so a multi-waypoint
@@ -366,10 +401,17 @@ impl Reactor {
         self.nav_cache.as_ref().map(|(_, n)| n)
     }
 
-    /// Build the waypoint list for a `PathTo`. Uses navmesh A* when
-    /// available; otherwise a single-segment straight line. Either
-    /// way, the final element is always the requested destination.
-    fn build_waypoints(&mut self, target: Vec3) -> Vec<Vec3> {
+    /// Build the waypoint list for a `PathTo`. Uses navmesh A* when a
+    /// route exists; the final element is then the requested destination.
+    ///
+    /// When no walkable route exists (no navmesh for the zone, or
+    /// `nav.path()` returns `None` because the endpoints are off-mesh or
+    /// in disconnected components), behaviour depends on `force`:
+    ///   - `force` → a single-segment straight line `vec![target]` (the
+    ///     old beeline, walls and all — used by `/pathtoforce`).
+    ///   - `!force` → an empty list, signalling "no route" so the caller
+    ///     refuses rather than clipping through geometry.
+    fn build_waypoints(&mut self, target: Vec3, force: bool) -> Vec<Vec3> {
         let cur = self.self_pos();
         let nav = self.ensure_nav_loaded();
         if let Some(nav) = nav {
@@ -415,10 +457,18 @@ impl Reactor {
             }
             tracing::warn!(
                 zone = self.state.zone_id,
-                "navmesh found but produced no path — straight-lining"
+                force,
+                "navmesh found but produced no path — {}",
+                if force { "force-straight-lining" } else { "refusing" }
             );
         }
-        vec![target]
+        // No route. Only beeline through geometry when explicitly forced;
+        // otherwise return empty so the caller refuses the path.
+        if force {
+            vec![target]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Fold an event into the mirror, then derive any threshold-crossing
@@ -561,11 +611,41 @@ impl Reactor {
                 };
                 CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
-            AgentCommand::PathTo { x, y, z } => {
+            AgentCommand::PathTo { x, y, z, force } => {
                 let target = Vec3 { x, y, z };
-                let waypoints = self.build_waypoints(target);
-                self.goal = Goal::Pathing { waypoints, idx: 0 };
-                CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
+                let waypoints = self.build_waypoints(target, force);
+                if waypoints.is_empty() {
+                    // No walkable route and not forced — refuse rather than
+                    // beeline through geometry. Leave the current goal
+                    // untouched and report on the debug channel.
+                    return CommandRouting {
+                        forward: None,
+                        derived_events: vec![AgentEvent::ChatLine {
+                            line: debug_pathto_line(format!(
+                                "pathto: no walkable route to ({x:.0}, {y:.0}, {z:.0}) — use /pathtoforce or /warp"
+                            )),
+                        }],
+                    };
+                }
+                let summary = debug_pathto_line(format!(
+                    "pathto \u{2192} ({x:.0}, {y:.0}, {z:.0}): {} wp{}",
+                    waypoints.len(),
+                    if force { " [force]" } else { "" }
+                ));
+                self.goal = Goal::Pathing {
+                    waypoints,
+                    idx: 0,
+                    clamp: !force,
+                };
+                CommandRouting {
+                    forward: None,
+                    derived_events: vec![
+                        AgentEvent::ReactorGoalChanged {
+                            goal: snapshot_goal(&self.goal),
+                        },
+                        AgentEvent::ChatLine { line: summary },
+                    ],
+                }
             }
             AgentCommand::Cancel => {
                 self.goal = Goal::Idle;
@@ -760,7 +840,11 @@ impl Reactor {
                     derived_events: Vec::new(),
                 }
             }
-            Goal::Pathing { waypoints, idx } => {
+            Goal::Pathing {
+                waypoints,
+                idx,
+                clamp,
+            } => {
                 if waypoints.get(idx).is_none() {
                     // Empty or exhausted — clear to Idle defensively.
                     self.goal = Goal::Idle;
@@ -797,7 +881,8 @@ impl Reactor {
                 // tracks whichever segment we're currently traversing
                 // so the player faces the right way as they round
                 // corners.
-                let mut cur = self.self_pos();
+                let start_pos = self.self_pos();
+                let mut cur = start_pos;
                 let mut budget = step;
                 let mut idx_local = idx;
                 // First iteration always sets `heading` (the pre-check
@@ -821,6 +906,32 @@ impl Reactor {
                     } else {
                         cur = step_point(cur, wp, budget);
                         break;
+                    }
+                }
+
+                // Wall-slide clamp: re-project the net step onto the
+                // navmesh so `/pathto` can't run through walls — the same
+                // collision discipline free-walk uses in
+                // `view_native/input.rs`. The final segment to the
+                // requested target is exempt: its last waypoint is
+                // deliberately off-mesh for zone-line trigger boxes
+                // (`build_waypoints`'s last-mile append), and clamping
+                // there would strand the agent at the mesh edge.
+                // `slide_along` returns `None` when the start is off-mesh,
+                // in which case we keep the raw step (fail-open — the
+                // clamp must never *break* movement).
+                let on_final_segment = path_done || idx_local + 1 >= waypoints.len();
+                if clamp && !on_final_segment {
+                    if let Some((_, nav)) = self.nav_cache.as_ref() {
+                        let from = glam::Vec3::new(start_pos.x, start_pos.y, start_pos.z);
+                        let to = glam::Vec3::new(cur.x, cur.y, cur.z);
+                        if let Some(slid) = nav.slide_along(from, to) {
+                            cur = Vec3 {
+                                x: slid.x,
+                                y: slid.y,
+                                z: slid.z,
+                            };
+                        }
                     }
                 }
 
@@ -1759,6 +1870,7 @@ mod tests {
                 x: 1.0,
                 y: 0.0,
                 z: 0.0,
+                force: false,
             },
             AgentCommand::Cancel,
         ] {
@@ -1815,12 +1927,17 @@ mod tests {
     #[test]
     fn path_to_emits_reactor_goal_changed() {
         let mut r = Reactor::new(ReactorConfig::default());
+        // No navmesh in this test, so a plain `/pathto` would refuse;
+        // `force` gives the straight-line single-waypoint path whose
+        // goal-changed event this test asserts on.
         let routing = r.handle_command(AgentCommand::PathTo {
             x: 1.0,
             y: 2.0,
             z: 3.0,
+            force: true,
         });
         assert!(routing.forward.is_none());
+        // Pathing emits the goal change first, then a debug summary line.
         match routing.derived_events.as_slice() {
             [AgentEvent::ReactorGoalChanged {
                 goal:
@@ -1830,15 +1947,82 @@ mod tests {
                         z,
                         waypoints_remaining,
                     },
-            }] => {
+            }, AgentEvent::ChatLine { line }] => {
                 assert!((*x - 1.0).abs() < 1e-3);
                 assert!((*y - 2.0).abs() < 1e-3);
                 assert!((*z - 3.0).abs() < 1e-3);
-                // No navmesh in this test → straight-line single waypoint.
+                // Forced straight-line → single waypoint.
                 assert_eq!(*waypoints_remaining, 1);
+                assert_eq!(line.channel, ChatChannel::Debug);
+                assert!(line.text.contains("pathto"));
             }
-            other => panic!("expected ReactorGoalChanged(Pathing), got {other:?}"),
+            other => panic!("expected [ReactorGoalChanged(Pathing), ChatLine], got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pathto_without_route_refuses_and_reports() {
+        // No navmesh loaded → no walkable route. A plain `/pathto`
+        // (force: false) must refuse rather than beeline through walls:
+        // the goal stays Idle and a single debug ChatLine is surfaced.
+        let mut r = Reactor::new(ReactorConfig::default());
+        let routing = r.handle_command(AgentCommand::PathTo {
+            x: 5.0,
+            y: 0.0,
+            z: 0.0,
+            force: false,
+        });
+        assert!(routing.forward.is_none());
+        assert!(
+            matches!(r.current_goal(), Goal::Idle),
+            "refused pathto must leave the goal Idle, got {:?}",
+            r.current_goal()
+        );
+        match routing.derived_events.as_slice() {
+            [AgentEvent::ChatLine { line }] => {
+                assert_eq!(line.channel, ChatChannel::Debug);
+                assert!(
+                    line.text.contains("no walkable route"),
+                    "got {:?}",
+                    line.text
+                );
+            }
+            other => panic!("expected a single refusal ChatLine, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pathto_force_beelines_without_route() {
+        // No navmesh, but `force: true` keeps the old straight-line
+        // behaviour: a single-waypoint path to the target with clamping
+        // disabled (so the per-tick wall-slide is skipped).
+        let mut r = Reactor::new(ReactorConfig::default());
+        let routing = r.handle_command(AgentCommand::PathTo {
+            x: 5.0,
+            y: 6.0,
+            z: 7.0,
+            force: true,
+        });
+        assert!(routing.forward.is_none());
+        match r.current_goal() {
+            Goal::Pathing {
+                waypoints,
+                idx,
+                clamp,
+            } => {
+                assert_eq!(*idx, 0);
+                assert!(!*clamp, "forced pathing must not wall-slide");
+                assert_eq!(waypoints.len(), 1);
+                let wp = waypoints[0];
+                assert!((wp.x - 5.0).abs() < 1e-3 && (wp.y - 6.0).abs() < 1e-3);
+            }
+            other => panic!("expected forced Pathing goal, got {other:?}"),
+        }
+        // Summary line carries the [force] marker.
+        assert!(routing.derived_events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ChatLine { line } if line.text.contains("[force]")
+        )));
     }
 
     #[test]
@@ -1863,6 +2047,7 @@ mod tests {
             x: 9.0,
             y: 0.0,
             z: 0.0,
+            force: false,
         });
         assert!(routing.forward.is_none());
         // The navmesh path must include at least one waypoint that
@@ -1870,7 +2055,7 @@ mod tests {
         // grid maps `x` → col and `z` → row at cell_size=1, that's
         // any waypoint with z >= 7).
         let goal = r.current_goal().clone();
-        let Goal::Pathing { waypoints, idx } = &goal else {
+        let Goal::Pathing { waypoints, idx, .. } = &goal else {
             panic!("expected Pathing goal, got {goal:?}");
         };
         assert_eq!(*idx, 0);
@@ -1978,6 +2163,7 @@ mod tests {
             x: 0.5,
             y: 0.0,
             z: 0.0,
+            force: true,
         });
         let out = r.tick();
         assert_eq!(out.commands.len(), 1);
@@ -2014,6 +2200,7 @@ mod tests {
             x: 0.5,
             y: 0.0,
             z: 0.0,
+            force: true,
         });
         let out = r.tick();
         assert!(matches!(r.current_goal(), Goal::Idle));
@@ -2044,6 +2231,7 @@ mod tests {
             x: 12.0,
             y: 0.0,
             z: 0.0,
+            force: true,
         });
         // Tick 1: step max_step_per_tick (=1.0 from step_test_cfg) yalms, still pathing.
         let out = r.tick();
@@ -2106,6 +2294,7 @@ mod tests {
                 },
             ],
             idx: 0,
+            clamp: false,
         };
 
         let out = r.tick();
@@ -2157,6 +2346,7 @@ mod tests {
                 })
                 .collect(),
             idx: 0,
+            clamp: false,
         };
 
         let out = r.tick();
@@ -2915,6 +3105,7 @@ mod tests {
             x: 10.0,
             y: 0.0,
             z: 0.0,
+            force: true,
         });
         let out = r.tick();
         assert!(
@@ -2945,6 +3136,7 @@ mod tests {
             x: 10.0,
             y: 0.0,
             z: 0.0,
+            force: true,
         });
         let out = r.tick();
         match out.commands.as_slice() {
@@ -2979,6 +3171,7 @@ mod tests {
             x: 10.0,
             y: 0.0,
             z: 0.0,
+            force: true,
         });
         let out = r.tick();
         match out.commands.as_slice() {

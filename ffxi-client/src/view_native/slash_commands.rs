@@ -115,9 +115,31 @@ const COMMANDS: &[(&str, &[Command])] = &[
             Command {
                 aliases: &["pathto"],
                 usage: "<x> <y> [z] | <name> | target",
-                summary: "pathfind: coords (z optional), fuzzy zone-line/entity, or current target",
+                summary: "pathfind (navmesh, stays on mesh): coords (z optional), fuzzy zone-line/entity, or current target",
                 handler: |c| {
-                    parse_pathto(c.rest, c.entities, c.self_pos, c.current_target, c.zone_id)
+                    parse_pathto(
+                        c.rest,
+                        c.entities,
+                        c.self_pos,
+                        c.current_target,
+                        c.zone_id,
+                        false,
+                    )
+                },
+            },
+            Command {
+                aliases: &["pathtoforce", "pathtof"],
+                usage: "<x> <y> [z] | <name> | target",
+                summary: "pathfind ignoring collision (straight-lines through walls when no route — stuck-recovery)",
+                handler: |c| {
+                    parse_pathto(
+                        c.rest,
+                        c.entities,
+                        c.self_pos,
+                        c.current_target,
+                        c.zone_id,
+                        true,
+                    )
                 },
             },
             Command {
@@ -1418,18 +1440,25 @@ fn parse_heal(rest: &str) -> SlashOutcome {
 ///   - `/pathto <name>` — fuzzy match against zone-line destinations
 ///     in the current zone, then entity names. Subsumes the old
 ///     `/zoneto`, which is kept as an alias.
+///
+/// `force` is set by `/pathtoforce`: it keeps walking even when no
+/// walkable navmesh route exists (straight line through walls, for
+/// stuck-recovery). Plain `/pathto` (`force: false`) stays on the mesh
+/// and refuses when there's no route.
 fn parse_pathto(
     rest: &str,
     entities: &[WireEntity],
     self_pos: WireVec3,
     current_target: Option<u32>,
     zone_id: Option<u16>,
+    force: bool,
 ) -> SlashOutcome {
+    let cmd_label = if force { "/pathtoforce" } else { "/pathto" };
     let trimmed = rest.trim();
     if trimmed.is_empty() {
-        return SlashOutcome::SystemMessage(
-            "/pathto: usage `/pathto <x> <y> [z]` | `/pathto <name>` | `/pathto target`".into(),
-        );
+        return SlashOutcome::SystemMessage(format!(
+            "{cmd_label}: usage `{cmd_label} <x> <y> [z]` | `{cmd_label} <name>` | `{cmd_label} target`"
+        ));
     }
     match parse_goto_target(
         trimmed,
@@ -1437,12 +1466,13 @@ fn parse_pathto(
         self_pos,
         current_target,
         zone_id,
-        "/pathto",
+        cmd_label,
     ) {
         Ok(pos) => SlashOutcome::Command(AgentCommand::PathTo {
             x: pos.x,
             y: pos.y,
             z: pos.z,
+            force,
         }),
         Err(msg) => SlashOutcome::SystemMessage(msg),
     }
@@ -2180,6 +2210,7 @@ fn parse_zoneto(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
             x: line.from_pos[0],
             y: line.from_pos[1],
             z: line.from_pos[2],
+            force: false,
         }),
         None => SlashOutcome::SystemMessage(format!(
             "/zoneto: no zone-line matches `{needle}` (try `/zones` to list)"
@@ -3952,7 +3983,7 @@ mod tests {
             None,
             None,
         ) {
-            SlashOutcome::Command(AgentCommand::PathTo { x, y, z }) => {
+            SlashOutcome::Command(AgentCommand::PathTo { x, y, z, .. }) => {
                 assert_eq!(x, 1.5);
                 assert_eq!(y, 2.0);
                 assert_eq!(z, -3.25);
@@ -3966,7 +3997,7 @@ mod tests {
         let mut entity = ent(42, "Bob", EntityKind::Pc, 7.0, 8.0);
         entity.pos.z = 9.0;
         match parse_slash_t("/pathto target", &[entity], origin(), Some(42), None) {
-            SlashOutcome::Command(AgentCommand::PathTo { x, y, z }) => {
+            SlashOutcome::Command(AgentCommand::PathTo { x, y, z, .. }) => {
                 assert_eq!((x, y, z), (7.0, 8.0, 9.0));
             }
             other => panic!("expected PathTo from target, got {other:?}"),
@@ -4006,7 +4037,7 @@ mod tests {
         let mut self_pos = origin();
         self_pos.z = 17.5;
         match parse_slash_t("/pathto 10 20", &empty_entities(), self_pos, None, None) {
-            SlashOutcome::Command(AgentCommand::PathTo { x, y, z }) => {
+            SlashOutcome::Command(AgentCommand::PathTo { x, y, z, .. }) => {
                 assert_eq!((x, y, z), (10.0, 20.0, 17.5));
             }
             other => panic!("expected PathTo, got {other:?}"),
