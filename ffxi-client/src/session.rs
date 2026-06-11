@@ -469,7 +469,14 @@ async fn run_map_session(
     let mut sub_seq: u16 = 2;
     let mut bundle_seq: u16 = 3;
     {
-        let mut payload = build_subpacket_netend(sub_seq);
+        // GAMEOK (0x00C) goes first — it's the gate that makes LSB push the
+        // init wave (job info, spells 0x0AA, abilities 0x0AC, merits, key
+        // items, inventory). The NETEND/ZONE_TRANSITION that follow are no-ops
+        // server-side but kept for handshake fidelity. The response flood lands
+        // during keepalive_loop and is decoded by the shared handle_sub_packet.
+        let mut payload = build_subpacket_gameok(sub_seq);
+        sub_seq = sub_seq.wrapping_add(1);
+        payload.extend(build_subpacket_netend(sub_seq));
         sub_seq = sub_seq.wrapping_add(1);
         payload.extend(build_subpacket_zone_transition(sub_seq));
         sub_seq = sub_seq.wrapping_add(1);
@@ -2703,6 +2710,20 @@ fn build_subpacket_header(opcode: u16, size_words: u16, sync: u16) -> [u8; 4] {
     h[0..2].copy_from_slice(&id_and_size.to_le_bytes());
     h[2..4].copy_from_slice(&sync.to_le_bytes());
     h
+}
+
+/// `0x00C GAMEOK` — the client's "I'm done zoning, send me everything" signal.
+/// LSB's handler (`server/src/map/packets/c2s/0x00c_gameok.cpp`) responds by
+/// pushing the init wave: JOB_INFO (0x01B), MAGIC_DATA (0x0AA), COMMAND_DATA
+/// (0x0AC), merits, key items and the full inventory. Without it the Magic and
+/// Abilities menus never receive any data. Body is `u32 ClientState, u32 flags`
+/// = 8 bytes (4-byte header + 8 = 12 bytes = 3 dwords); the server validator
+/// (`validate`) requires `ClientState == 0 && DebugClientFlg == 0`, so the
+/// zeroed body passes.
+fn build_subpacket_gameok(sync: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; 12];
+    buf[0..4].copy_from_slice(&build_subpacket_header(0x00C, 3, sync));
+    buf
 }
 
 fn build_subpacket_netend(sync: u16) -> Vec<u8> {
@@ -5832,6 +5853,35 @@ mod tests {
                 "Mode LE for {mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn gameok_packet_layout_matches_server_struct() {
+        // Layout per vendor/server/src/map/packets/c2s/0x00c_gameok.h:
+        //   uint32_t ClientState        // validator requires == 0
+        //   uint32_t DebugClientFlg:1   // validator requires == 0
+        //   uint32_t unused:31
+        // Sub-packet header (4 bytes) is 0x00C opcode + size_words=3 + sync.
+        let buf = build_subpacket_gameok(0xBEEF);
+        assert_eq!(buf.len(), 12, "header (4) + body (8)");
+        let hdr_word = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(hdr_word & 0x01FF, 0x00C, "opcode in low 9 bits");
+        assert_eq!((hdr_word >> 9) & 0x7F, 3, "size_words=3");
+        assert_eq!(
+            u16::from_le_bytes([buf[2], buf[3]]),
+            0xBEEF,
+            "sync echoed in header"
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            0,
+            "ClientState must be 0 to pass the server validator"
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            0,
+            "DebugClientFlg/unused must be 0 to pass the server validator"
+        );
     }
 
     #[test]

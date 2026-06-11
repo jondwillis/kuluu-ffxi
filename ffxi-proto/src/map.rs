@@ -13,6 +13,13 @@ pub const MAX_DATAGRAM: usize = 2500;
 /// Selected client→server opcodes used by v1.
 pub mod c2s {
     pub const LOGIN: u16 = 0x00A;
+    /// `GP_CLI_COMMAND_GAMEOK` — sent once after the zone-in flood to tell LSB
+    /// the client is ready for the init wave. Triggers the server to push
+    /// JOB_INFO (0x01B), MAGIC_DATA (0x0AA), COMMAND_DATA (0x0AC), merits, key
+    /// items and the full inventory. Body: `u32 ClientState (=0), u32 flags
+    /// (=0)` = 8 bytes (size_words=3); the validator demands both be 0. See
+    /// `vendor/server/src/map/packets/c2s/0x00c_gameok.{h,cpp}`.
+    pub const GAMEOK: u16 = 0x00C;
     pub const NETEND: u16 = 0x00D;
     pub const ZONE_TRANSITION: u16 = 0x011;
     pub const POS: u16 = 0x015;
