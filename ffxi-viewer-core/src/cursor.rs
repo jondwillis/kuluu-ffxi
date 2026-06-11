@@ -8,30 +8,31 @@
 //! - `Rotate`: while drag-rotating the camera (button held *and* dragged
 //!   past the motion threshold — a bare click never triggers it).
 //!
-//! ## How each state is drawn (and the macOS drag caveat)
+//! ## How the cursor is drawn (native vs web)
 //!
-//! `Arrow`/`Hand` use Bevy's `CursorIcon::Custom` — the OS compositor draws
-//! the cursor (NSCursor / SetCursor / wl_pointer), so it tracks pointer
-//! motion at native zero-lag. That path works while the pointer moves
-//! freely.
+//! **Web** uses Bevy's `CursorIcon::Custom` ([`apply_cursor_icon_system`]) —
+//! the browser draws a CSS cursor at zero lag, including during drags.
 //!
-//! It does **not** work during a camera drag on macOS. AppKit applies a
-//! window's cursor only through cursor *rects* (`resetCursorRects`), and it
-//! stops consulting them while a mouse button is held; winit-0.30 has no
-//! `cursorUpdate:` fallback (`macos/view.rs` only implements
-//! `resetCursorRects`). So a custom cursor set at drag-start survives
-//! exactly one frame, then AppKit reverts to the system arrow. The `Rotate`
-//! cursor — whose entire job is to show *during* a button-held drag — can't
-//! be delivered by the OS path on macOS.
+//! **Native (macOS in particular) can't rely on `CursorIcon::Custom`.**
+//! AppKit applies a window's cursor only through cursor *rects*
+//! (`resetCursorRects` → `addCursorRect:cursor:`) and winit-0.30 has no
+//! `cursorUpdate:` fallback (`macos/view.rs`). In a continuously-redrawing
+//! app the custom cursor reverts to the system arrow almost immediately — it
+//! shows for ~one frame after each change, then reverts — and AppKit stops
+//! consulting cursor rects entirely while a mouse button is held (a camera
+//! drag). Hiding the OS cursor (`set_cursor_visible`), by contrast, *is*
+//! honored reliably.
 //!
-//! `Rotate` is therefore handled FFXI-retail style: while dragging we lock
-//! the pointer (`CursorGrabMode::Locked`; raw `MouseMotion` still drives the
-//! camera), hide the OS cursor, and pin a `Rotate` sprite at the lock point
-//! via a UI overlay. On release the pointer unlocks and reappears where the
-//! drag began. This lock/hide/sprite path ([`apply_rotate_lock_system`]) is
-//! native-only — it's compiled out on web, where CSS cursors render
-//! correctly during drags and the `CursorIcon::Custom` path covers all three
-//! states.
+//! So on native we hide the OS cursor and draw it ourselves as a UI overlay
+//! sprite that follows the pointer ([`apply_cursor_sprite_system`]), swapping
+//! `Arrow`/`Hand`/`Rotate` art and offsetting by each state's hotspot. The
+//! tradeoff is ~one frame of pointer lag — far better than a cursor that
+//! won't persist at all.
+//!
+//! `Rotate` additionally locks the pointer (`CursorGrabMode::Locked`; raw
+//! `MouseMotion` still drives the camera) so a camera drag doesn't slide the
+//! pointer across the screen — the sprite pins at the lock point and the OS
+//! pointer reappears there on release, FFXI-retail style.
 //!
 //! ## Why procedural sprites, not PNG assets
 //!
@@ -96,12 +97,12 @@ pub struct CursorAssets {
     pub rotate_hotspot: (u16, u16),
 }
 
-/// Marker for the UI overlay sprite that stands in for the OS cursor while
-/// drag-rotating (see [`apply_rotate_lock_system`]). One persistent entity,
-/// spawned hidden at startup and toggled via `Node.display`. Not tagged
-/// `InGameEntity` — it's chrome that outlives zone changes.
+/// Marker for the UI overlay sprite that stands in for the OS cursor on
+/// native (see [`apply_cursor_sprite_system`]). One persistent entity,
+/// spawned hidden at startup; its image/position/visibility are driven each
+/// frame. Not tagged `InGameEntity` — it's chrome that outlives zone changes.
 #[derive(Component)]
-pub struct RotateCursorSprite;
+pub struct CursorSprite;
 
 pub struct CursorPlugin;
 
@@ -117,12 +118,16 @@ impl Plugin for CursorPlugin {
                     entity_hover_writer_system,
                     ui_hover_writer_system,
                     resolve_cursor_style_system,
+                    // Web: OS-native CSS cursor (zero-lag, persists). Native:
+                    // the icon never persists, so the sprite system below
+                    // hides the OS cursor and draws it instead — the icon
+                    // insert is a harmless no-op there.
                     apply_cursor_icon_system,
-                    // macOS can't show an OS cursor mid-drag; lock + hide +
-                    // pin a sprite instead. Web cursors work during drags,
-                    // so this is native-only.
+                    // Native: hide the OS cursor and draw an overlay sprite
+                    // for all three states (the OS custom cursor won't hold
+                    // on macOS); lock the pointer while drag-rotating.
                     #[cfg(not(target_arch = "wasm32"))]
-                    apply_rotate_lock_system,
+                    apply_cursor_sprite_system,
                 )
                     .chain(),
             );
@@ -136,12 +141,13 @@ fn build_cursor_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>
     let hand = images.add(rasterize(HAND_24));
     let rotate = images.add(rasterize(ROTATE_24));
 
-    // Persistent pinned-rotate sprite, hidden until a camera drag locks the
-    // pointer. Absolute-positioned UI overlay above all HUD chrome; ignores
-    // picking so it never intercepts hover/clicks.
+    // Persistent cursor sprite (native stand-in for the OS cursor), hidden
+    // until `apply_cursor_sprite_system` activates it. Absolute-positioned UI
+    // overlay above all HUD chrome; ignores picking so it never intercepts
+    // hover/clicks. Image swaps per `CursorStyle` at runtime.
     commands.spawn((
-        RotateCursorSprite,
-        ImageNode::new(rotate.clone()),
+        CursorSprite,
+        ImageNode::new(arrow.clone()),
         Node {
             position_type: PositionType::Absolute,
             width: Val::Px(24.0),
@@ -253,52 +259,64 @@ fn apply_cursor_icon_system(
         })));
 }
 
-/// Native-only `Rotate` handling: lock + hide the OS pointer and pin a
-/// `Rotate` sprite at the lock point for the duration of a camera drag.
+/// Native-only cursor renderer: hide the OS cursor and draw the active
+/// [`CursorStyle`] as a UI overlay sprite at the pointer.
 ///
-/// Why this exists: macOS (and X11) stop honoring a window's cursor rects
-/// while a mouse button is held, so the OS `Rotate` cursor set by
-/// [`apply_cursor_icon_system`] can't display during a drag (see the module
-/// docs). Locking the pointer freezes it in place while raw `MouseMotion`
-/// keeps driving [`crate::mouse::mouse_camera_system`]; hiding it removes the
-/// half-frame system-arrow flicker; the sprite shows the operator a rotate
-/// affordance pinned where the drag began. On release the pointer unlocks
-/// and the OS cursor reappears at that frozen position.
+/// On macOS the OS custom cursor ([`apply_cursor_icon_system`]) won't persist
+/// — it reverts to the system arrow within a frame (see the module docs) —
+/// but hiding the OS cursor *is* reliable, so we hide it and draw the sprite
+/// ourselves. While idle the sprite follows the pointer with ~one frame of
+/// lag; `Rotate` instead locks the pointer (raw `MouseMotion` still drives
+/// [`crate::mouse::mouse_camera_system`]) and pins the sprite at the lock
+/// point, so a camera drag doesn't slide the pointer — it reappears there on
+/// release.
 ///
 /// Sole owner of the primary window's [`CursorOptions`] (grab mode +
 /// visibility). The free-look lock request ([`CursorLockRequest`], F8) is
-/// unioned into the grab decision so it keeps working, but only a drag hides
-/// the cursor — free-look historically kept it visible.
+/// unioned into the grab decision so it keeps working.
+///
+/// The sprite hides (and the OS cursor returns) whenever the window is
+/// unfocused or the pointer is outside it. That also makes a blur (Cmd-Tab)
+/// that swallows the button-release event safe: a phantom held button can't
+/// strand the pointer locked + hidden, since losing focus collapses the
+/// active state and unlocks.
 #[cfg(not(target_arch = "wasm32"))]
-fn apply_rotate_lock_system(
+fn apply_cursor_sprite_system(
     style: Res<CursorStyle>,
     lock_request: Res<CursorLockRequest>,
-    pointer: Res<MousePointer>,
     assets: Option<Res<CursorAssets>>,
     win_q: Query<&Window, With<PrimaryWindow>>,
     mut opts_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
-    mut sprite_q: Query<&mut Node, With<RotateCursorSprite>>,
+    mut sprite_q: Query<(&mut Node, &mut ImageNode), With<CursorSprite>>,
     mut prev_rotating: Local<bool>,
     mut lock_point: Local<Vec2>,
 ) {
     let Some(assets) = assets else {
         return;
     };
-    // Gate the lock on focus: a blur (Cmd-Tab, etc.) can swallow the
-    // button-release event, leaving a phantom held button. Without this,
-    // that would strand the pointer locked + hidden — an invisible cursor
-    // over other apps. Losing focus collapses `rotating`, so the pointer
-    // unlocks and reappears immediately.
-    let focused = win_q.single().map(|w| w.focused).unwrap_or(false);
-    let rotating = matches!(*style, CursorStyle::Rotate) && focused;
+    let Ok(window) = win_q.single() else {
+        return;
+    };
+    let focused = window.focused;
+    // `None` once the pointer leaves the window. While `Rotate` holds the
+    // lock the latched point is used instead, so a transient `None` there is
+    // harmless.
+    let live_pos = window.cursor_position();
 
-    // Latch the pin position on the rising edge. Once the pointer locks,
-    // `cursor_pos` stops updating (no more `CursorMoved`), so this value
-    // stays put for the whole drag even as raw motion rotates the camera.
+    let rotating = matches!(*style, CursorStyle::Rotate) && focused;
+    // Latch the pin on the rising edge — under the lock `cursor_position`
+    // stops updating, so this holds for the whole drag even as raw motion
+    // rotates the camera.
     if rotating && !*prev_rotating {
-        *lock_point = pointer.cursor_pos.unwrap_or(Vec2::ZERO);
+        if let Some(p) = live_pos {
+            *lock_point = p;
+        }
     }
     *prev_rotating = rotating;
+
+    // Our sprite stands in for the OS cursor only while focused and over the
+    // window (a drag forces "over the window" via the latched point).
+    let active = focused && (rotating || live_pos.is_some());
 
     if let Ok(mut opts) = opts_q.single_mut() {
         let want_grab = if lock_request.locked || rotating {
@@ -309,19 +327,30 @@ fn apply_rotate_lock_system(
         if opts.grab_mode != want_grab {
             opts.grab_mode = want_grab;
         }
-        // Hide only during a rotate-drag; a free-look lock keeps the pointer
-        // visible, matching the prior free-look behavior.
-        let want_visible = !rotating;
+        // Hide the OS cursor exactly when our sprite is standing in for it.
+        let want_visible = !active;
         if opts.visible != want_visible {
             opts.visible = want_visible;
         }
     }
 
-    if let Ok(mut node) = sprite_q.single_mut() {
-        if rotating {
-            let (hx, hy) = assets.rotate_hotspot;
-            let left = Val::Px(lock_point.x - hx as f32);
-            let top = Val::Px(lock_point.y - hy as f32);
+    if let Ok((mut node, mut image)) = sprite_q.single_mut() {
+        if active {
+            let (handle, (hx, hy)) = match *style {
+                CursorStyle::Arrow => (assets.arrow.clone(), assets.arrow_hotspot),
+                CursorStyle::Hand => (assets.hand.clone(), assets.hand_hotspot),
+                CursorStyle::Rotate => (assets.rotate.clone(), assets.rotate_hotspot),
+            };
+            let pos = if rotating {
+                *lock_point
+            } else {
+                live_pos.unwrap_or(*lock_point)
+            };
+            if image.image != handle {
+                image.image = handle;
+            }
+            let left = Val::Px(pos.x - hx as f32);
+            let top = Val::Px(pos.y - hy as f32);
             if node.display != Display::Flex {
                 node.display = Display::Flex;
             }
