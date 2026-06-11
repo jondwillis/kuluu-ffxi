@@ -48,10 +48,16 @@ pub struct SceneState {
     pub next_chat_seq: u64,
 }
 
-/// Cap on retained local toasts. Smaller than `CHAT_HISTORY_CAP` because
-/// these are transient client-side messages — keeping the last 32 is
-/// plenty to scroll back over recent operator actions.
-pub const LOCAL_TOAST_CAP: usize = 32;
+/// Cap on retained local toasts. Matches `CHAT_HISTORY_CAP` (256) so a
+/// single multi-line client output is retained in full and stays
+/// scrollable in the chat panel — the chat scroll already walks the
+/// whole buffer (`buffer_len - 1` rows), so the only thing that can hide
+/// lines is eviction from this buffer. `/help` is the largest such
+/// output (~80 lines and growing with the command set); at the old cap
+/// of 32 its top categories were evicted before the operator could read
+/// them. A test in `ffxi-client`'s slash-command suite keeps the
+/// `render_help` reference under this bound.
+pub const LOCAL_TOAST_CAP: usize = 256;
 
 /// Build a system-channel chat line. Routes to `ChatChannel::System` so
 /// the message shows in the Battle pane (Chat 2) regardless of `/devhud`

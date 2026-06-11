@@ -4838,6 +4838,26 @@ mod tests {
         }
     }
 
+    /// The whole `/help` reference must fit in the chat panel's retention
+    /// buffer, or its top lines get evicted before the operator can scroll
+    /// to them (the chat scroll walks the full buffer, so retention is the
+    /// only ceiling). `render_help` emits one line per command plus a
+    /// header and one per category; this ties that growing total to
+    /// `LOCAL_TOAST_CAP` so adding commands can't silently re-truncate the
+    /// reference. If this fails, raise `LOCAL_TOAST_CAP` (and re-check the
+    /// chat-panel scroll budget) or split `/help` into pages.
+    #[test]
+    fn help_listing_fits_in_local_toast_cap() {
+        let lines = render_help().split('\n').count();
+        let cap = ffxi_viewer_core::snapshot::LOCAL_TOAST_CAP;
+        assert!(
+            lines <= cap,
+            "/help renders {lines} lines but the chat buffer retains only {cap}; \
+             the top {} lines would be evicted unreadable",
+            lines.saturating_sub(cap),
+        );
+    }
+
     /// Self-consistency: every registered alias must dispatch to its own
     /// handler rather than the "unknown command" fallthrough. With the
     /// registry this is nearly tautological (lookup finds anything that
