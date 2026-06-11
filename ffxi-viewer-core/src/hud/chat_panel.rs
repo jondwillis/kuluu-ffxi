@@ -38,8 +38,8 @@ pub const VISIBLE_ROWS: usize = 12;
 /// keeps the row pool from spilling above the panel rect when it shrinks.
 pub const PANEL_MAX_HEIGHT_PX: f32 = 220.0;
 pub const PANEL_MIN_HEIGHT_PX: f32 = 60.0;
-pub const FULL_HOLD_SECS: f32 = 4.0;
-pub const FADE_SECS: f32 = 1.5;
+pub const FULL_HOLD_SECS: f32 = 10.0;
+pub const FADE_SECS: f32 = 10.0;
 
 /// Per-panel decay state: when the panel last saw "activity" (any of:
 /// a new chat line in its filter, cursor hover, scroll != 0, passive
