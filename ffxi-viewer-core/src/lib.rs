@@ -87,7 +87,7 @@ pub use camera::{
 pub use components::{
     EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
 };
-pub use cursor::{CursorAssets, CursorPlugin, CursorRequests, CursorStyle};
+pub use cursor::{system_cursor_icon, CursorPlugin, CursorRequests, CursorStyle};
 pub use graphics_settings::{
     AaMode, CharacterRenderPath, DynamicLights, GraphicsField, GraphicsSettings, QualityPreset,
     SkyStyle, GRAPHICS_FIELDS,
@@ -314,12 +314,13 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             // reader. `DefaultPickingPlugins` (input/hover/interaction) is
             // already added by `DefaultPlugins` on both front-ends.
             .add_plugins(PickingPlugin)
-            // Custom cursor. `Arrow`/`Hand` use the OS-native cursor
-            // (`CursorIcon::Custom`, zero-lag). `Rotate` can't use it on
-            // macOS — AppKit drops cursor-rects while a button is held — so
-            // a camera drag instead locks + hides the OS pointer and pins a
-            // `Rotate` sprite at the lock point. `CursorPlugin` is the sole
-            // owner of the window's `CursorOptions` (grab mode + visibility).
+            // Cursor shape. `Arrow`/`Hand` swap the OS system cursor
+            // (`CursorIcon::System`, zero-lag, no assets). `Rotate` locks +
+            // hides the pointer during a camera drag (infinite orbit, retail
+            // feel). On native, feathers' `CursorIconPlugin` would otherwise
+            // revert our cursor each frame — `view_native::drive_feathers_cursor`
+            // feeds our shape into feathers' `DefaultCursor` to prevent that.
+            // `CursorPlugin` owns the window's `CursorOptions` (grab + hide).
             .add_plugins(CursorPlugin)
             .add_message::<ToastEvent>()
             .add_systems(PreUpdate, ingest_system::<S>.run_if(resource_exists::<S>))

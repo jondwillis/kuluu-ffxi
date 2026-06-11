@@ -53,8 +53,9 @@ use ffxi_viewer_core::{
     dat_mzb::{LastAutoLoadedZone, MzbCollisionGeometry},
     hud::zone_flash::ZoneNameResolver,
     scene::TrackedEntities,
-    setup_world, setup_zone_line_assets, spawn_camera, EventLog, HudPlugin, InGameEntity,
-    MousePlugin, SceneState, ViewerCorePlugin, ZoneLineDescriptor, ZoneLineResolver,
+    setup_world, setup_zone_line_assets, spawn_camera, system_cursor_icon, CursorStyle, EventLog,
+    HudPlugin, InGameEntity, MousePlugin, SceneState, ViewerCorePlugin, ZoneLineDescriptor,
+    ZoneLineResolver,
 };
 use ffxi_viewer_wire::{Stage as WireStage, ViewerEvent};
 use tokio::runtime::Handle as RtHandle;
@@ -66,6 +67,20 @@ use self::input::{
     AutoRun, CameraAutoRecenter, CommandTx, HeadingTurnAccum, LocalPlayerPrediction,
 };
 use self::launcher_ui::{LoginErrorMsg, PendingConnect};
+
+/// Mirror `cursor::CursorStyle` into feathers' `DefaultCursor` so feathers'
+/// own `update_cursor` applies our resolved system cursor instead of reverting
+/// the window to a plain arrow every frame. See the registration site for the
+/// why. Change-gated so it only writes when the shape changes.
+fn drive_feathers_cursor(
+    style: Res<CursorStyle>,
+    mut default_cursor: ResMut<bevy::feathers::cursor::DefaultCursor>,
+) {
+    let want = bevy::feathers::cursor::EntityCursor::System(system_cursor_icon(*style));
+    if default_cursor.0 != want {
+        default_cursor.0 = want;
+    }
+}
 
 /// Top-level phase of the unified native `App`.
 ///
@@ -217,7 +232,16 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         .insert_resource(bevy::feathers::theme::UiTheme(
             bevy::feathers::dark_theme::create_dark_theme(),
         ))
-        .add_plugins(widgets::WidgetsPlugin);
+        .add_plugins(widgets::WidgetsPlugin)
+        // feathers' `CursorIconPlugin` (unconditionally added by
+        // `FeathersPlugins`) forces the window cursor back to its
+        // `DefaultCursor` every frame whenever no feathers widget is hovered —
+        // which stomped `cursor::CursorPlugin`'s cursor one frame after it was
+        // set. Feed our resolved shape into `DefaultCursor` so feathers applies
+        // *our* system cursor instead of a plain arrow, preserving the zero-lag
+        // OS path. (Hovered feathers widgets still win, so the launcher's own
+        // button cursors are unaffected.)
+        .add_systems(Update, drive_feathers_cursor);
 
     // Smoke demo: spawn a couple of TextFields + a feathers Button so a
     // follow-up agent can sanity-check the widget runtime before rewriting
@@ -400,6 +424,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             .collect()
     }));
 
+    // Persistent Tab/Enter target-cycle stack (input.rs). Shared by the
+    // Tab handler and the Enter-with-no-target acquire.
+    app.init_resource::<input::TabCycleStack>();
+
     // Viewer-only Update / FixedUpdate systems. Gate them on InGame so
     // they don't try to read `CommandTx` / `NativeSource` while we're
     // still in the launcher.
@@ -425,6 +453,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             // target changes. Chained after the input handlers so the
             // `is_changed()` flag reflects this frame's mutations.
             input::dispatch_target_change_system,
+            // Ticks the cycle's idle timer and clears the stack on
+            // external target changes (Esc/click/slash/party). Chained
+            // last so it sees this frame's target mutations.
+            input::tab_cycle_invalidate_system,
         )
             .chain()
             // Run AFTER `chase_camera_system` so Tab's NDC projection
