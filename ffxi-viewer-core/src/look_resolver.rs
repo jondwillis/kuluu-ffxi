@@ -147,6 +147,27 @@ pub fn resolve_equipment_slot(slot_id: u16, race: u8) -> Option<u32> {
     Some(base + id - u32::from(thr))
 }
 
+/// Resolve a PC equipment slot from the **live wire shape**: an explicit
+/// `slot_index` (1=head, 2=body, 3=hands, 4=legs, 5=feet, 6=main, 7=sub,
+/// 8=ranged) plus a *pure* 12-bit `model_id` with no slot nibble.
+///
+/// This exists because the live look path strips the server's per-slot
+/// `0xN000` tag: `ffxi_proto::decode`'s CHAR_PC decoder masks each equipment
+/// field with `& 0x0FFF` (see `decode.rs`), so `EntityLook::Equipped::{head,
+/// body,…}` reach us as bare model ids. Feeding those straight to
+/// [`resolve_equipment_slot`] makes its `slot = slot_id >> 12` read `0` (the
+/// face slot) and return `None` for every piece — the "remote PCs render
+/// head-only" bug. Re-tagging the slot nibble here fixes it. The
+/// `& 0x0FFF` mask keeps this idempotent for callers that still pass an
+/// already-tagged value (the launcher / harness build slot-tagged u16s).
+pub fn resolve_equipment_model(slot_index: u8, model_id: u16, race: u8) -> Option<u32> {
+    if slot_index == 0 || slot_index > 8 {
+        return None;
+    }
+    let slot_id = (u16::from(slot_index) << 12) | (model_id & 0x0FFF);
+    resolve_equipment_slot(slot_id, race)
+}
+
 /// Transcribed from lotus's `PCModelIDs` table
 /// (`vendor/lotus-ffxi/ffxi/entity/actor_data.cppm:32-96`).
 /// Indexed `[race-1][slot]` where slot 0 = face (handled by
@@ -716,25 +737,26 @@ pub fn dispatch_look_driven_models(
             if let Some(file_id) = resolve_face(face, race) {
                 equipment.push(file_id);
             }
-            let slot_ids = [head, body, hands, legs, feet, main, sub, ranged];
-            debug_assert_eq!(slot_ids.len(), EQUIP_SLOT_ORDER_LEN);
-            // Per-slot resolution trace. `equip=1` (face only) in the dispatch
-            // log means every slot below sentineled to `None` — the
-            // `PC_MODEL_IDS` breakpoints only cover base-game model ids, so
-            // higher-id (expansion) gear that max-level players wear resolves
-            // to nothing and the actor renders head-only. Logging each
-            // `(slot_u16, file_id?)` shows exactly which model ids fall past
-            // the table so Phase 5 (equipment-model-table completion) can scope
-            // the missing ranges.
-            let mut slot_trace: [(u16, Option<u32>); 8] = Default::default();
-            for (i, &slot) in slot_ids.iter().enumerate() {
-                let file_id = resolve_equipment_slot(slot, race);
-                slot_trace[i] = (slot, file_id);
+            // The wire model ids arrive WITHOUT the slot nibble (the CHAR_PC
+            // decoder masks `& 0x0FFF`), so resolve each via the slot-indexed
+            // entry point — passing the bare value to `resolve_equipment_slot`
+            // would read slot 0 and drop every piece (the head-only bug).
+            // Index 0 = head … 7 = ranged, i.e. slot_index = i + 1.
+            let slot_models = [head, body, hands, legs, feet, main, sub, ranged];
+            debug_assert_eq!(slot_models.len(), EQUIP_SLOT_ORDER_LEN);
+            let mut slot_trace: [(u8, u16, Option<u32>); 8] = Default::default();
+            for (i, &model_id) in slot_models.iter().enumerate() {
+                let slot_index = (i + 1) as u8;
+                let file_id = resolve_equipment_model(slot_index, model_id, race);
+                slot_trace[i] = (slot_index, model_id, file_id);
                 if let Some(file_id) = file_id {
                     equipment.push(file_id);
                 }
             }
-            if slot_trace.iter().any(|(_, r)| r.is_none()) {
+            // Any unresolved slot still means a missing model-id range in
+            // `PC_MODEL_IDS`; log `(slot_index, model_id, file_id?)` so the
+            // gap can be scoped from a live capture.
+            if slot_trace.iter().any(|(_, _, r)| r.is_none()) {
                 info!(
                     "pc equip unresolved (entity {} race {}): {:?}",
                     we.id, race, slot_trace
@@ -847,6 +869,25 @@ mod tests {
         // body=0x2004 → slot=2, id=4, race 3 (Elvaan M) → tier 1
         // base 13720 + (4 - 0) = 13724
         assert_eq!(resolve_equipment_slot(0x2004, 3), Some(13724));
+    }
+
+    /// The wire-shape entry point: a bare 12-bit model id (no slot nibble,
+    /// as the CHAR_PC decoder delivers) must resolve via the slot index,
+    /// equal to the slot-tagged call. The OLD path of feeding the bare value
+    /// straight to `resolve_equipment_slot` reads slot 0 → `None` — the
+    /// head-only bug this guards against.
+    #[test]
+    fn equipment_model_retags_bare_wire_ids() {
+        // body slot (index 2), bare model id 4, race 3 → same as 0x2004.
+        assert_eq!(resolve_equipment_model(2, 4, 3), Some(13724));
+        // Feeding the bare id to the slot path reads slot 0 → None (the bug).
+        assert_eq!(resolve_equipment_slot(4, 3), None);
+        // Idempotent for an already-tagged value: the inner mask strips the
+        // stray nibble before re-tagging, so 0x2004 still lands on slot 2.
+        assert_eq!(resolve_equipment_model(2, 0x2004, 3), Some(13724));
+        // Out-of-range slot index → None (slot 0 is the face).
+        assert_eq!(resolve_equipment_model(0, 4, 3), None);
+        assert_eq!(resolve_equipment_model(9, 4, 3), None);
     }
 
     /// Slot=0 and race=0 are hard sentinels — face slot is handled
