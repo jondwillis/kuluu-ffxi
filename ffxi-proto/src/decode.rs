@@ -157,6 +157,54 @@ impl PosHead {
         Ok((head, claim_id))
     }
 
+    /// `UPDATE_DESPAWN` — the single updatemask bit (packet `0x0A` =
+    /// `body[6]`) LSB sets to mark a CHAR_NPC as an `ENTITY_DESPAWN`.
+    /// Mirrors `vendor/server/src/map/entities/baseentity.h:177`.
+    ///
+    /// LSB writes the *full* updatemask byte as `0x30` on the despawn path
+    /// (this bit OR'd with `UPDATE_LOOK 0x10` — `entity_update.cpp:285`),
+    /// but this bit alone is the authoritative signal: a full scan of the
+    /// server source shows `0x20` is never OR'd into any live `updatemask`
+    /// (`ENTITY_UPDATE`/`ENTITY_SPAWN` masks are built only from
+    /// `UPDATE_POS/STATUS/HP/COMBAT/NAME/LOOK`), so the bit is set
+    /// exclusively by the hard-coded despawn assignment. Keying on the bit
+    /// (rather than exact `== 0x30`) stays correct even if LSB later changes
+    /// which *other* bits ride along on the despawn packet.
+    pub const UPDATE_DESPAWN: u8 = 0x20;
+
+    /// True when a CHAR_NPC (0x00E) body is an `ENTITY_DESPAWN` — the
+    /// server removing the entity from the zone (mob defeated + looted,
+    /// PC/NPC walked out of range, trust/pet dismissed). LSB routes *every*
+    /// despawn through a 0x0E packet because `updateWith` forces
+    /// `packet->id = 0x0E` (`entity_update.cpp:272`), so this one predicate
+    /// covers all entity classes.
+    ///
+    /// # Why the updatemask bit is the marker
+    ///
+    /// Detected via the [`UPDATE_DESPAWN`](PosHead::UPDATE_DESPAWN) bit in
+    /// the updatemask byte at packet `0x0A` (= `body[6]`), which the despawn
+    /// path sets (`entity_update.cpp:285`, as part of the literal `0x30`)
+    /// and which no live update ever sets.
+    ///
+    /// The despawn *animation* byte at packet `0x1F` (= `body[27]`,
+    /// [`server_status`](PosHead::server_status)) is set to `0x02`
+    /// (`ANIMATION_DESPAWN`) at `entity_update.cpp:284` but is then
+    /// **overwritten** by `PEntity->animation` in the `UPDATE_HP` block
+    /// (`:345` for NPCs, `:384` for mobs) because despawn forces local
+    /// `updatemask = UPDATE_ALL_MOB`. So `body[27]` is *not* a usable
+    /// marker — the `UPDATE_DESPAWN` bit is the only reliable signal.
+    ///
+    /// Only meaningful for CHAR_NPC; returns `false` for any other opcode
+    /// (CHAR_PC despawns also arrive as 0x0E, never 0x0D).
+    pub fn is_char_npc_despawn(opcode: u16, body: &[u8]) -> bool {
+        use crate::map::s2c;
+        opcode == s2c::CHAR_NPC
+            && body
+                .get(6)
+                .copied()
+                .is_some_and(|mask| mask & Self::UPDATE_DESPAWN != 0)
+    }
+
     /// Extract the NUL-terminated ASCII name from a CHAR_PC or CHAR_NPC body.
     ///
     /// Both opcodes share the `GP_SERV_POS_HEAD` prefix and reuse byte
@@ -743,6 +791,68 @@ impl ForcedMove {
 
 pub fn decode_forced_move(sub: &SubPacket<'_>) -> Result<ForcedMove, DecodeError> {
     ForcedMove::decode(sub.data)
+}
+
+#[cfg(test)]
+mod despawn_tests {
+    use super::*;
+    use crate::map::s2c;
+
+    /// Build a minimal CHAR_NPC body with a given updatemask byte at body[6].
+    fn body_with_updatemask(mask: u8) -> Vec<u8> {
+        let mut body = vec![0u8; PosHead::SIZE_WITH_BT_TARGET];
+        body[6] = mask;
+        body
+    }
+
+    #[test]
+    fn lsb_despawn_byte_0x30_on_char_npc_is_despawn() {
+        // The literal value LSB writes on the despawn path
+        // (entity_update.cpp:285) = UPDATE_DESPAWN (0x20) | UPDATE_LOOK (0x10).
+        let body = body_with_updatemask(0x30);
+        assert!(PosHead::is_char_npc_despawn(s2c::CHAR_NPC, &body));
+    }
+
+    #[test]
+    fn despawn_bit_alone_is_despawn() {
+        // Keying on the bit (not exact 0x30) means even the bare
+        // UPDATE_DESPAWN bit reads as a despawn — robust to LSB changing
+        // which other bits ride along.
+        let body = body_with_updatemask(PosHead::UPDATE_DESPAWN);
+        assert!(PosHead::is_char_npc_despawn(s2c::CHAR_NPC, &body));
+    }
+
+    #[test]
+    fn spawn_and_normal_updatemasks_are_not_despawn() {
+        // ENTITY_SPAWN (UPDATE_ALL_MOB / equipped-spawn 0x57) and the common
+        // normal-tick masks (POS/STATUS/HP/COMBAT/NAME/LOOK combos) must never
+        // read as a despawn — otherwise live entities would vanish mid-play.
+        // None of these set the UPDATE_DESPAWN (0x20) bit.
+        for mask in [0x0F, 0x57, 0x01, 0x07, 0x08, 0x10, 0x1F] {
+            assert_eq!(mask & PosHead::UPDATE_DESPAWN, 0, "test mask sanity");
+            let body = body_with_updatemask(mask);
+            assert!(
+                !PosHead::is_char_npc_despawn(s2c::CHAR_NPC, &body),
+                "updatemask 0x{mask:02x} must not be treated as despawn",
+            );
+        }
+    }
+
+    #[test]
+    fn despawn_mask_on_char_pc_opcode_is_ignored() {
+        // CHAR_PC (0x0D) never carries a despawn — those route through 0x0E.
+        // The same byte pattern under the CHAR_PC opcode must read false.
+        let body = body_with_updatemask(0x30);
+        assert!(!PosHead::is_char_npc_despawn(s2c::CHAR_PC, &body));
+    }
+
+    #[test]
+    fn truncated_body_is_not_despawn() {
+        // A body too short to even reach the updatemask byte must not panic
+        // and must report "not a despawn".
+        assert!(!PosHead::is_char_npc_despawn(s2c::CHAR_NPC, &[]));
+        assert!(!PosHead::is_char_npc_despawn(s2c::CHAR_NPC, &[0u8; 4]));
+    }
 }
 
 #[cfg(test)]

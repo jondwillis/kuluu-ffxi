@@ -370,6 +370,15 @@ async fn run_map_session(
     // never do, monsters do. See `substitute_battle_placeholders`.
     let mut kind_cache: std::collections::HashMap<u32, crate::state::EntityKind> =
         Default::default();
+    // Last `m_OwnerID` (claim id) seen *with* the `UPDATE_STATUS` bit set,
+    // keyed by entity unique_no. LSB only writes m_OwnerID under
+    // UPDATE_STATUS (entity_update.cpp:418-420); position-only CHAR_NPC
+    // ticks leave the slot zero. Without carrying the last status-bearing
+    // claim forward, claim oscillates self→0→self every tick — flickering
+    // the engaged nameplate / capsule color and spamming
+    // `reactor::detect_aggro_edge`. Entity ids carry zone bits, so this
+    // never collides across zones and needs no zone-change prune.
+    let mut claim_cache: std::collections::HashMap<u32, u32> = Default::default();
     // Static-NPC name resolver backed by the FFXI client install DATs.
     // Lazy-loads one zone's name table on first lookup miss; swaps it
     // out when the next CHAR_NPC's zone bits differ. `cfg.dat_root`
@@ -415,6 +424,7 @@ async fn run_map_session(
                         &mut self_act_index,
                         &mut name_cache,
                         &mut kind_cache,
+                        &mut claim_cache,
                         &mut name_miss_dedup,
                         &mut current_zone_id,
                         &mut self_pos,
@@ -495,6 +505,7 @@ async fn run_map_session(
         cfg.user_driven_events,
         name_cache,
         kind_cache,
+        claim_cache,
         name_miss_dedup,
         self_pos,
         self_pos_seeded,
@@ -603,6 +614,10 @@ fn handle_sub_packet(
     // classification that drives entity-spawn events, and read by the
     // battle-message decoders for article handling.
     kind_cache: &mut std::collections::HashMap<u32, crate::state::EntityKind>,
+    // Last `m_OwnerID` (claim id) seen with `UPDATE_STATUS` set, keyed by
+    // unique_no. Carries claim across position-only ticks that don't write
+    // it (see the declaration in `establish_session`).
+    claim_cache: &mut std::collections::HashMap<u32, u32>,
     // Per-(entity, miss-kind) timestamps used to rate-limit
     // `NameExtractionMiss` events. Without this, a populated zone where
     // most entities never sent UPDATE_NAME would emit hundreds of
@@ -795,6 +810,28 @@ fn handle_sub_packet(
         }
         op if op == s2c::CHAR_PC || op == s2c::CHAR_NPC => {
             if let Ok(head) = decode::PosHead::decode(sub.data) {
+                // ENTITY_DESPAWN — the server is removing this entity from
+                // the zone (mob defeated + looted, PC/NPC walked out of
+                // range, trust/pet dismissed). Detected from the updatemask
+                // byte alone; see `PosHead::is_char_npc_despawn` for why that
+                // byte (and not the despawn animation byte) is the reliable
+                // marker, and why this one check covers every entity class.
+                if decode::PosHead::is_char_npc_despawn(op, sub.data) {
+                    // Drop the per-entity claim so a re-pop reusing this
+                    // unique_no can't inherit stale combat state before its
+                    // spawn tick rewrites it. `name_cache` / `kind_cache` are
+                    // left intact on purpose: a defeat/kill battle message can
+                    // arrive just after the despawn and still needs the name
+                    // to resolve, and a genuine re-pop's ENTITY_SPAWN carries
+                    // UPDATE_NAME (it's part of UPDATE_ALL_MOB) so it
+                    // repopulates them anyway.
+                    claim_cache.remove(&head.unique_no);
+                    let _ = event_tx.send(AgentEvent::EntityRemoved {
+                        id: head.unique_no,
+                    });
+                    // Despawn packets carry no live position/status to upsert.
+                    return;
+                }
                 let kind = if op == s2c::CHAR_PC {
                     EntityKind::Pc
                 } else {
@@ -880,53 +917,43 @@ fn handle_sub_packet(
                     .or_insert(kind);
                 if op == s2c::CHAR_PC && head.unique_no == self_char_id {
                     *self_act_index = Some(head.act_index);
-                    // Gate the self-position seed on `UPDATE_POS` (0x01):
-                    // LSB only writes pos/heading under that bit
-                    // (`entity_update.cpp:314`). A non-position CHAR_PC for
-                    // self (e.g. an HP-only self update) carries origin in
-                    // the pos slots from the freshly-constructed packet
-                    // buffer; applying it would clobber `self_pos` with
-                    // (0,0,0). The zoneline fallback below only repairs the
-                    // flood-drain window, so the gate is the real guard.
-                    if head.send_flag & 0x01 != 0 {
-                        // Same origin-spawn repair as the LOGIN seed: during
-                        // the post-zoneline flood-drain a CHAR_PC for self
-                        // carrying origin would otherwise clobber the
-                        // destination. No-op outside the flood-drain
-                        // (fallback is `None` there).
-                        let raw_pos = Vec3 {
-                            x: head.x,
-                            y: head.y,
-                            z: head.z,
-                        };
-                        let seed_pos =
-                            apply_zoneline_spawn_fallback(raw_pos, zoneline_spawn_fallback);
-                        *self_pos = Position {
-                            pos: seed_pos,
-                            heading: head.dir,
-                            ..*self_pos
-                        };
-                        // A self CHAR_PC is also a server-authoritative
-                        // anchor — covers the deadline-recovery path where
-                        // the flood exited before a LOGIN seed (keepalive
-                        // resumes POS from here) and the rare zone-in flood
-                        // that sends CHAR_PC for self before/without a
-                        // 0x00A LOGIN.
-                        *self_pos_seeded = true;
-                        // Diagnostic: log the coords + `SendFlg` so an
-                        // origin spawn is traceable to the exact packet that
-                        // wrote it.
-                        tracing::info!(
-                            unique_no = head.unique_no,
-                            self_char_id,
-                            send_flag = format!("0x{:02x}", head.send_flag),
-                            fallback_applied = seed_pos != raw_pos,
-                            pos =
-                                format!("({:.1},{:.1},{:.1})", seed_pos.x, seed_pos.y, seed_pos.z),
-                            heading = head.dir,
-                            "self_pos seeded from CHAR_PC for self"
-                        );
-                    }
+                    // Same origin-spawn repair as the LOGIN seed: during the
+                    // post-zoneline flood-drain a CHAR_PC for self carrying
+                    // origin would otherwise clobber the destination. No-op
+                    // outside the flood-drain (fallback is `None` there).
+                    let raw_pos = Vec3 {
+                        x: head.x,
+                        y: head.y,
+                        z: head.z,
+                    };
+                    let seed_pos =
+                        apply_zoneline_spawn_fallback(raw_pos, zoneline_spawn_fallback);
+                    *self_pos = Position {
+                        pos: seed_pos,
+                        heading: head.dir,
+                        ..*self_pos
+                    };
+                    // A self CHAR_PC is also a server-authoritative anchor —
+                    // covers the deadline-recovery path where the flood
+                    // exited before a LOGIN seed (keepalive resumes POS from
+                    // here) and the rare zone-in flood that sends CHAR_PC
+                    // for self before/without a 0x00A LOGIN.
+                    *self_pos_seeded = true;
+                    // Diagnostic: this seed is unconditional (no
+                    // `SendFlg.Position` gate) and, during the flood drain,
+                    // runs with no rubber-band reconciliation — so a CHAR_PC
+                    // carrying origin would clobber a good LOGIN seed. Log the
+                    // coords + `SendFlg` so an origin spawn is traceable to
+                    // the exact packet that wrote it.
+                    tracing::info!(
+                        unique_no = head.unique_no,
+                        self_char_id,
+                        send_flag = format!("0x{:02x}", head.send_flag),
+                        fallback_applied = seed_pos != raw_pos,
+                        pos = format!("({:.1},{:.1},{:.1})", seed_pos.x, seed_pos.y, seed_pos.z),
+                        heading = head.dir,
+                        "self_pos seeded from CHAR_PC for self"
+                    );
                 }
                 let wire_name = decode::PosHead::try_extract_name(op, sub.data);
                 if wire_name.is_none() {
@@ -981,14 +1008,36 @@ fn handle_sub_packet(
                     }
                 }
                 // CHAR_NPC body[40..44] holds `m_OwnerID` (claim id); CHAR_PC
-                // uses the same slot for `BtTargetID`. Decode them under
-                // their semantic names.
-                let claim_id = if op == s2c::CHAR_NPC {
-                    decode::PosHead::decode_char_npc(sub.data)
-                        .map(|(_, claim)| claim)
-                        .unwrap_or(0)
+                // uses the same slot for `BtTargetID`. They alias the same
+                // already-decoded bytes (`head.bt_target_id`).
+                //
+                // LSB only writes `m_OwnerID` when `UPDATE_STATUS (0x02)` is
+                // set in the updatemask (`entity_update.cpp:418-420`); a
+                // position-only tick leaves the slot zero from the freshly
+                // constructed packet buffer. Trusting that 0 makes claim
+                // oscillate self→0→self across ticks, which flickers the
+                // engaged nameplate / capsule color *and* re-fires
+                // `reactor::detect_aggro_edge` (one spurious `EngagedBy` per
+                // re-claim edge). So we only trust the decoded value when
+                // UPDATE_STATUS is set, and otherwise carry the last
+                // status-bearing claim forward via `claim_cache`. A genuine
+                // unclaim arrives *with* UPDATE_STATUS and m_OwnerID = 0, so
+                // it still clears the cache and propagates. For a mob the
+                // `bt_target_id` slot *is* this claim, so we stabilize both
+                // from one value — keeping `detect_aggro_edge` edge-true.
+                const UPDATE_STATUS: u8 = 0x02; // baseentity.h:170
+                let (claim_id, bt_target_id) = if op == s2c::CHAR_NPC {
+                    let carries_status =
+                        sub.data.get(6).copied().unwrap_or(0) & UPDATE_STATUS != 0;
+                    let claim = if carries_status {
+                        claim_cache.insert(head.unique_no, head.bt_target_id);
+                        head.bt_target_id
+                    } else {
+                        claim_cache.get(&head.unique_no).copied().unwrap_or(0)
+                    };
+                    (claim, claim)
                 } else {
-                    0
+                    (0, head.bt_target_id)
                 };
                 // Gate `hp_pct` on the UPDATE_HP bit (0x04) in the updatemask
                 // byte at body[6]. LSB only writes `Hpp` at packet offset 0x1E
@@ -1060,7 +1109,7 @@ fn handle_sub_packet(
                         },
                         heading: head.dir,
                         hp_pct,
-                        bt_target_id: head.bt_target_id,
+                        bt_target_id,
                         claim_id,
                         speed: head.speed,
                         speed_base: head.speed_base,
@@ -1683,6 +1732,7 @@ async fn keepalive_loop(
     user_driven_events: bool,
     mut name_cache: std::collections::HashMap<u32, String>,
     mut kind_cache: std::collections::HashMap<u32, crate::state::EntityKind>,
+    mut claim_cache: std::collections::HashMap<u32, u32>,
     mut name_miss_dedup: std::collections::HashMap<
         (u32, crate::state::NameMissKind),
         std::time::Instant,
@@ -2455,6 +2505,7 @@ async fn keepalive_loop(
                                 &mut self_act_index,
                                 &mut name_cache,
                                 &mut kind_cache,
+                                &mut claim_cache,
                                 &mut name_miss_dedup,
                                 &mut current_zone_id,
                                 &mut self_pos,
