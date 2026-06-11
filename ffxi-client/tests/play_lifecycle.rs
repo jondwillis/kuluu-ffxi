@@ -184,7 +184,7 @@ fn process_event(ev: &AgentEvent, tally: &mut EventTally) -> bool {
                 tally.stages_seen.push(*stage);
             }
         }
-        AgentEvent::EntityUpserted { entity } => {
+        AgentEvent::EntityUpserted { entity, .. } => {
             if entity.kind == EntityKind::Pc {
                 tally.pc_entity_seen = true;
             }

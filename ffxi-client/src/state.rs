@@ -80,6 +80,13 @@ fn default_fps() -> u32 {
     60
 }
 
+/// serde default for [`AgentEvent::EntityUpserted::pos_present`]. Events
+/// serialized before the flag existed predate the position-gating fix and
+/// always carried a valid position, so they decode as `true`.
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Position {
     fn default() -> Self {
         Self {
@@ -788,7 +795,10 @@ impl SessionState {
                     }
                 }
             }
-            AgentEvent::EntityUpserted { entity } => {
+            AgentEvent::EntityUpserted {
+                entity,
+                pos_present,
+            } => {
                 if let Some(existing) = self.entities.iter_mut().find(|e| e.id == entity.id) {
                     // CHAR_NPC (0x0E) only includes the name on packets where
                     // the server set UPDATE_NAME — typically ENTITY_SPAWN and
@@ -817,14 +827,44 @@ impl SessionState {
                     // model-spawn dispatcher's `Changed<LookComp>` query
                     // sees a remove instead of a stable signature.
                     let preserved_look = entity.look.or(existing.look);
+                    // Same gating rationale, for the position group. LSB
+                    // only writes pos/heading/speed under `UPDATE_POS`
+                    // (`entity_update.cpp:314-324`); on a non-position tick
+                    // the producer flags `pos_present = false` and the wire
+                    // bytes are zero from the freshly-constructed packet
+                    // buffer. Applying them would teleport the entity to the
+                    // zone origin — the >600-yalm "mob vanished mid-fight"
+                    // bug. Preserve the last-known position group instead.
+                    let (preserved_pos, preserved_heading, preserved_speed, preserved_speed_base) =
+                        if *pos_present {
+                            (entity.pos, entity.heading, entity.speed, entity.speed_base)
+                        } else {
+                            (
+                                existing.pos,
+                                existing.heading,
+                                existing.speed,
+                                existing.speed_base,
+                            )
+                        };
                     *existing = Entity {
                         name: preserved_name,
                         kind: merged_kind,
                         hp_pct: preserved_hp_pct,
                         look: preserved_look,
+                        pos: preserved_pos,
+                        heading: preserved_heading,
+                        speed: preserved_speed,
+                        speed_base: preserved_speed_base,
                         ..entity.clone()
                     };
                 } else {
+                    // First sighting of this entity. LSB always sends
+                    // ENTITY_SPAWN with `UPDATE_ALL_MOB` (which includes
+                    // `UPDATE_POS`), so a brand-new entity normally arrives
+                    // position-bearing. If we somehow see a non-position
+                    // tick first (e.g. attaching mid-session), we have no
+                    // prior coords to fall back on — insert as-is; the next
+                    // position tick corrects it.
                     self.entities.push(entity.clone());
                 }
             }
@@ -1125,6 +1165,19 @@ pub enum AgentEvent {
     },
     EntityUpserted {
         entity: Entity,
+        /// Whether this packet's `GP_SERV_POS_HEAD` actually carried a
+        /// position. LSB only writes `x/z/y`, `dir`, and the two speed
+        /// bytes when `SendFlg.Position` / `UPDATE_POS` (0x01) is set —
+        /// `vendor/server/src/map/packets/entity_update.cpp:314-324`. On
+        /// HP-only / status-only ticks (which the server emits constantly
+        /// during battle: `battleutils.cpp:3773,3784`, etc.) those slots
+        /// stay zero from the freshly-constructed packet buffer. The
+        /// producer sets this from `head.send_flag & UPDATE_POS`; when
+        /// `false`, the reducer preserves the entity's prior
+        /// pos/heading/speed instead of snapping it to the zone origin —
+        /// the cause of mobs teleporting >600 yalms / vanishing mid-fight.
+        #[serde(default = "default_true")]
+        pos_present: bool,
     },
     EntityRemoved {
         id: u32,
@@ -2108,6 +2161,7 @@ mod tests {
                 speed_base: 0,
                 look: None,
             },
+            pos_present: true,
         });
         assert_eq!(s.entities.len(), 1);
 
@@ -2131,6 +2185,7 @@ mod tests {
                 speed_base: 0,
                 look: None,
             },
+            pos_present: true,
         });
         assert_eq!(s.entities.len(), 1, "upsert must not duplicate by id");
         assert_eq!(s.entities[0].pos.x, 5.0, "upsert must overwrite");
@@ -2229,16 +2284,89 @@ mod tests {
         let mut s = SessionState::default();
         s.apply_event(&AgentEvent::EntityUpserted {
             entity: make_test_entity(42, Some("Sigli-Sea"), EntityKind::Npc),
+            pos_present: true,
         });
         assert_eq!(s.entities[0].name.as_deref(), Some("Sigli-Sea"));
 
         s.apply_event(&AgentEvent::EntityUpserted {
             entity: make_test_entity(42, None, EntityKind::Npc),
+            pos_present: true,
         });
         assert_eq!(
             s.entities[0].name.as_deref(),
             Some("Sigli-Sea"),
             "name must persist across attr-only update"
+        );
+    }
+
+    #[test]
+    fn entity_upserted_preserves_position_when_pos_absent() {
+        // The headline bug: during battle LSB streams HP-only / status-only
+        // CHAR_NPC ticks (`UPDATE_HP` / `UPDATE_STATUS`, no `UPDATE_POS`).
+        // Those packets carry zeroed pos/heading/speed slots, so the
+        // producer flags `pos_present: false`. The reducer must keep the
+        // entity's last-known position instead of snapping it to the zone
+        // origin — otherwise the mob teleports >600 yalms and gets culled.
+        let mut s = SessionState::default();
+        let mut ent = make_test_entity(42, Some("Tunnel Worm"), EntityKind::Mob);
+        ent.pos = Vec3 {
+            x: 123.0,
+            y: 4.0,
+            z: -89.0,
+        };
+        ent.heading = 200;
+        ent.speed = 40;
+        ent.speed_base = 40;
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: ent,
+            pos_present: true,
+        });
+        assert_eq!(s.entities[0].pos.x, 123.0);
+
+        // HP-only follow-up: the wire bytes for pos/heading/speed are zero
+        // and `pos_present` is false. Build an entity at the origin to model
+        // exactly what the producer would emit, then assert nothing moved.
+        let mut hp_only = make_test_entity(42, None, EntityKind::Mob);
+        hp_only.pos = Vec3::default(); // (0,0,0) — the zeroed packet buffer
+        hp_only.heading = 0;
+        hp_only.speed = 0;
+        hp_only.speed_base = 0;
+        hp_only.hp_pct = Some(75);
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: hp_only,
+            pos_present: false,
+        });
+        assert_eq!(
+            s.entities[0].pos,
+            Vec3 {
+                x: 123.0,
+                y: 4.0,
+                z: -89.0
+            },
+            "position must persist across a non-UPDATE_POS tick (no teleport to origin)"
+        );
+        assert_eq!(s.entities[0].heading, 200, "heading must persist too");
+        assert_eq!(s.entities[0].speed, 40, "speed must persist too");
+        assert_eq!(
+            s.entities[0].hp_pct,
+            Some(75),
+            "the HP this tick *did* carry must still apply"
+        );
+
+        // A real UPDATE_POS tick (pos_present: true) must still move it.
+        let mut moved = make_test_entity(42, None, EntityKind::Mob);
+        moved.pos = Vec3 {
+            x: 200.0,
+            y: 4.0,
+            z: -50.0,
+        };
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: moved,
+            pos_present: true,
+        });
+        assert_eq!(
+            s.entities[0].pos.x, 200.0,
+            "a genuine position update must overwrite, not get preserved"
         );
     }
 
@@ -2253,12 +2381,18 @@ mod tests {
         let mut s = SessionState::default();
         let mut ent = make_test_entity(42, Some("Worker Bee"), EntityKind::Npc);
         ent.hp_pct = Some(50);
-        s.apply_event(&AgentEvent::EntityUpserted { entity: ent });
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: ent,
+            pos_present: true,
+        });
         assert_eq!(s.entities[0].hp_pct, Some(50));
 
         let mut pos_only = make_test_entity(42, None, EntityKind::Npc);
         pos_only.hp_pct = None;
-        s.apply_event(&AgentEvent::EntityUpserted { entity: pos_only });
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: pos_only,
+            pos_present: true,
+        });
         assert_eq!(
             s.entities[0].hp_pct,
             Some(50),
@@ -2270,7 +2404,10 @@ mod tests {
         // `None`, not on the new value being zero.
         let mut died = make_test_entity(42, None, EntityKind::Npc);
         died.hp_pct = Some(0);
-        s.apply_event(&AgentEvent::EntityUpserted { entity: died });
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: died,
+            pos_present: true,
+        });
         assert_eq!(
             s.entities[0].hp_pct,
             Some(0),
@@ -2302,7 +2439,10 @@ mod tests {
             ranged: 0x8000,
         };
         ent.look = Some(look);
-        s.apply_event(&AgentEvent::EntityUpserted { entity: ent });
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: ent,
+            pos_present: true,
+        });
         assert!(matches!(
             s.entities[0].look,
             Some(LookData::Equipped { race: 3, .. })
@@ -2311,7 +2451,10 @@ mod tests {
         // Position-only refresh: look = None. Must keep the prior value.
         let mut pos_only = make_test_entity(42, None, EntityKind::Pc);
         pos_only.look = None;
-        s.apply_event(&AgentEvent::EntityUpserted { entity: pos_only });
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: pos_only,
+            pos_present: true,
+        });
         assert!(
             matches!(s.entities[0].look, Some(LookData::Equipped { race: 3, .. })),
             "look must persist across position-only refresh (no look bits set)"
@@ -2320,7 +2463,10 @@ mod tests {
         // A genuine appearance change (different `look`) must still win.
         let mut changed = make_test_entity(42, None, EntityKind::Pc);
         changed.look = Some(LookData::Standard { modelid: 99 });
-        s.apply_event(&AgentEvent::EntityUpserted { entity: changed });
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: changed,
+            pos_present: true,
+        });
         assert!(
             matches!(s.entities[0].look, Some(LookData::Standard { modelid: 99 })),
             "Some(new_look) must overwrite, not get preserved as the prior Equipped value"
@@ -2335,9 +2481,11 @@ mod tests {
         let mut s = SessionState::default();
         s.apply_event(&AgentEvent::EntityUpserted {
             entity: make_test_entity(7, Some("Stout Servitor"), EntityKind::Npc),
+            pos_present: true,
         });
         s.apply_event(&AgentEvent::EntityUpserted {
             entity: make_test_entity(7, Some("Stout Servitor"), EntityKind::Other),
+            pos_present: true,
         });
         assert_eq!(s.entities[0].kind, EntityKind::Npc);
     }
@@ -2347,6 +2495,7 @@ mod tests {
         let mut s = SessionState::default();
         s.apply_event(&AgentEvent::EntityUpserted {
             entity: make_test_entity(99, None, EntityKind::Other),
+            pos_present: true,
         });
         s.apply_event(&AgentEvent::EntityPatched {
             id: Some(99),
@@ -2366,7 +2515,10 @@ mod tests {
         let mut s = SessionState::default();
         let mut ent = make_test_entity(0xABCD, None, EntityKind::Other);
         ent.act_index = 0x07A5;
-        s.apply_event(&AgentEvent::EntityUpserted { entity: ent });
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: ent,
+            pos_present: true,
+        });
         s.apply_event(&AgentEvent::EntityPatched {
             id: None,
             act_index: Some(0x07A5),
@@ -2566,6 +2718,7 @@ mod tests {
                 speed_base: 40,
                 look: None,
             },
+            pos_present: true,
         });
         let p = s.self_position().expect("self entity present");
         assert_eq!(

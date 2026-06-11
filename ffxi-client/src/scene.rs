@@ -281,6 +281,7 @@ mod tests {
                 speed_base: 0,
                 look: None,
             },
+            pos_present: true,
         });
         // Other PC.
         s.apply_event(&AgentEvent::EntityUpserted {
@@ -302,6 +303,7 @@ mod tests {
                 speed_base: 0,
                 look: None,
             },
+            pos_present: true,
         });
         // NPC.
         s.apply_event(&AgentEvent::EntityUpserted {
@@ -319,6 +321,7 @@ mod tests {
                 speed_base: 0,
                 look: None,
             },
+            pos_present: true,
         });
         // Mob.
         s.apply_event(&AgentEvent::EntityUpserted {
@@ -336,6 +339,7 @@ mod tests {
                 speed_base: 0,
                 look: None,
             },
+            pos_present: true,
         });
 
         let scene = SceneSummary::from_state(&s);

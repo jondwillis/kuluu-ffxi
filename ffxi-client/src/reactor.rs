@@ -461,7 +461,7 @@ impl Reactor {
         let Some(self_id) = self.state.char_id else {
             return Vec::new();
         };
-        let AgentEvent::EntityUpserted { entity } = ev else {
+        let AgentEvent::EntityUpserted { entity, .. } = ev else {
             return Vec::new();
         };
         if entity.id == self_id {
@@ -500,7 +500,7 @@ impl Reactor {
     fn detect_threshold_events(&mut self, ev: &AgentEvent) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         match ev {
-            AgentEvent::EntityUpserted { entity } => {
+            AgentEvent::EntityUpserted { entity, .. } => {
                 if Some(entity.id) == self.state.char_id {
                     if let Some(pct) = entity.hp_pct {
                         let now_low = pct < self.cfg.low_hp_threshold;
@@ -1370,6 +1370,7 @@ mod tests {
                 speed_base,
                 look: None,
             },
+            pos_present: true,
         }
     }
 
