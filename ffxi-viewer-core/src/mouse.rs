@@ -17,7 +17,6 @@
 use bevy::input::mouse::{MouseButtonInput, MouseMotion, MouseWheel};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
-use bevy::window::{CursorOptions, PrimaryWindow};
 
 use crate::camera::{yaw_for_heading, CameraMode, ChaseCamera};
 use crate::input_mode::InputMode;
@@ -86,10 +85,12 @@ pub struct MousePointer {
 /// trackpad units; anything beyond is intentional cursor motion.
 const DRAG_THRESHOLD_PX_SQ: f32 = 25.0;
 
-/// Operator-set lock request. The cursor-lock system mirrors this onto the
-/// primary window's `CursorOptions`. Decoupling the request from the actual
-/// window mutation keeps the toggling code (F8 in `view_native/input.rs`)
-/// free of `Query<&mut CursorOptions>` plumbing — it just flips a bool.
+/// Operator-set free-look lock request (F8). Applied onto the primary
+/// window's `CursorOptions` by [`crate::cursor::apply_rotate_lock_system`],
+/// which unions it with the transient camera-drag lock. Decoupling the
+/// request from the window mutation keeps the toggling code (F8 in
+/// `view_native/input.rs`) free of `Query<&mut CursorOptions>` plumbing — it
+/// just flips a bool.
 #[derive(Resource, Debug, Default, Clone, Copy)]
 pub struct CursorLockRequest {
     pub locked: bool,
@@ -109,7 +110,7 @@ impl Plugin for MousePlugin {
             .init_resource::<CursorLockRequest>()
             .init_resource::<CameraMode>()
             .init_resource::<ChaseCamera>()
-            .add_systems(PreUpdate, (collect_mouse_system, apply_cursor_lock_system))
+            .add_systems(PreUpdate, collect_mouse_system)
             // mouse_camera_system runs in Update so it sees the pointer
             // state already collected this frame (PreUpdate) and the
             // camera systems pick up the result on the same Update tick.
@@ -247,33 +248,6 @@ pub fn mouse_camera_system(
     if pointer.wheel != 0.0 && matches!(mode, CameraMode::Chase) {
         chase.distance =
             (chase.distance - pointer.wheel * WHEEL_ZOOM_STEP).clamp(DIST_MIN, DIST_MAX);
-    }
-}
-
-/// Mirror [`CursorLockRequest`] onto the primary window's `CursorOptions`.
-///
-/// Bevy maps `CursorGrabMode::Locked` to Pointer Lock on the web target;
-/// browsers will silently no-op this if it didn't originate from a real
-/// user gesture. Toggle from inside a key handler (F8) so the gesture
-/// requirement is satisfied transitively.
-///
-/// Visibility is *not* touched here — `crate::cursor::CursorPlugin` owns
-/// it. The custom in-app cursor sprite needs the OS cursor permanently
-/// hidden so the two don't fight; this system only manages grab mode.
-pub fn apply_cursor_lock_system(
-    request: Res<CursorLockRequest>,
-    mut q: Query<&mut CursorOptions, With<PrimaryWindow>>,
-) {
-    let Ok(mut opts) = q.single_mut() else {
-        return;
-    };
-    let want = if request.locked {
-        bevy::window::CursorGrabMode::Locked
-    } else {
-        bevy::window::CursorGrabMode::None
-    };
-    if opts.grab_mode != want {
-        opts.grab_mode = want;
     }
 }
 

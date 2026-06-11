@@ -314,11 +314,12 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             // reader. `DefaultPickingPlugins` (input/hover/interaction) is
             // already added by `DefaultPlugins` on both front-ends.
             .add_plugins(PickingPlugin)
-            // Custom cursor sprite. Hides the OS cursor and renders a 24×24
-            // in-app sprite that swaps shape based on what's under the
-            // pointer (Arrow / Hand / Rotate). The OS cursor lock layer
-            // (`mouse::apply_cursor_lock_system`) no longer touches
-            // visibility — `CursorPlugin` is the sole owner.
+            // Custom cursor. `Arrow`/`Hand` use the OS-native cursor
+            // (`CursorIcon::Custom`, zero-lag). `Rotate` can't use it on
+            // macOS — AppKit drops cursor-rects while a button is held — so
+            // a camera drag instead locks + hides the OS pointer and pins a
+            // `Rotate` sprite at the lock point. `CursorPlugin` is the sole
+            // owner of the window's `CursorOptions` (grab mode + visibility).
             .add_plugins(CursorPlugin)
             .add_message::<ToastEvent>()
             .add_systems(PreUpdate, ingest_system::<S>.run_if(resource_exists::<S>))
@@ -426,10 +427,33 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // NOT whether they're currently moving — see [`EntityMotion`]
         // module docs.
         app.init_resource::<combat_stance::EntityMotion>();
+        app.init_resource::<combat_stance::EntityPrediction>();
         app.init_resource::<combat_stance::RestStance>();
         app.init_resource::<combat_stance::AnimationBlends>();
         app.init_resource::<combat_stance::WalkMode>();
         app.init_resource::<camera::CameraTransition>();
+        // Dead-reckoning predictor: the SOLE writer of rendered XZ + facing for
+        // moving non-self actors (Mob/Pc/Pet). `sync_entities_system` feeds it
+        // server samples and no longer writes those transforms itself, so the
+        // predictor must run after sync. It is NOT gated on snapshot `dirty` —
+        // that is the point: it advances the rendered position on the frames
+        // *between* server packets so other actors glide instead of freezing.
+        // On native it must also precede `track_entity_motion_system`, which
+        // reads the now-smooth transform to derive the locomotion velocity.
+        // Registered on wasm too, where it owns those transforms outright (the
+        // native-only motion tracker / faithful actor tick don't run there).
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(
+            Update,
+            combat_stance::predict_entities_system
+                .after(sync_entities_system)
+                .before(combat_stance::track_entity_motion_system),
+        );
+        #[cfg(target_arch = "wasm32")]
+        app.add_systems(
+            Update,
+            combat_stance::predict_entities_system.after(sync_entities_system),
+        );
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,
