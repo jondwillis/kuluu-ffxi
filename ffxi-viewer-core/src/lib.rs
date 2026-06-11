@@ -38,6 +38,8 @@ pub mod dat_mzb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dat_vos2;
 pub mod debug_chat;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ffxi_actor_render;
 pub mod graphics_settings;
 pub mod hud;
 pub mod input_mode;

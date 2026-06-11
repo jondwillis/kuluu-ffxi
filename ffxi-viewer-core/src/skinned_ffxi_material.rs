@@ -130,6 +130,24 @@ impl FfxiJointMatrices {
     }
 }
 
+/// Per-material flags packed into a uniform. `has_texture` is 1.0 when
+/// `base_color_texture` is a real texture and 0.0 for FFXI's untextured
+/// vertex-colored meshes (C/CS ops, e.g. bee wings); the shader then skips the
+/// texture sample + alpha-test and renders the vertex color directly. The
+/// remaining lanes are reserved padding to keep a 16-byte std140 stride.
+#[derive(Clone, Debug, ShaderType)]
+pub struct FfxiMaterialFlags {
+    pub flags: Vec4,
+}
+
+impl Default for FfxiMaterialFlags {
+    fn default() -> Self {
+        Self {
+            flags: Vec4::new(1.0, 0.0, 0.0, 0.0),
+        }
+    }
+}
+
 /// FFXI-faithful skinned character material. One asset per mesh group; the
 /// `joints` uniform is rewritten each frame from the actor's evaluated
 /// skeleton pose.
@@ -142,6 +160,8 @@ pub struct FfxiSkinnedMaterial {
     pub base_color_texture: Option<Handle<Image>>,
     #[uniform(3)]
     pub joints: FfxiJointMatrices,
+    #[uniform(4)]
+    pub material_flags: FfxiMaterialFlags,
 }
 
 impl Material for FfxiSkinnedMaterial {

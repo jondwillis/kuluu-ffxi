@@ -35,8 +35,9 @@ use crate::skeleton_instance::{
     eval_bind_pose, eval_pose, pc_pivot_rotation, pc_pivot_translation, FfxiActor,
 };
 use crate::skinned_ffxi_material::{
-    FfxiJointMatrices, FfxiLightingUniform, FfxiSkinnedMaterial, ATTR_COLOR, ATTR_JOINT0,
-    ATTR_JOINT1, ATTR_JOINT_WEIGHT, ATTR_NORMAL0, ATTR_NORMAL1, ATTR_POSITION0, ATTR_POSITION1,
+    FfxiJointMatrices, FfxiLightingUniform, FfxiMaterialFlags, FfxiSkinnedMaterial, ATTR_COLOR,
+    ATTR_JOINT0, ATTR_JOINT1, ATTR_JOINT_WEIGHT, ATTR_NORMAL0, ATTR_NORMAL1, ATTR_POSITION0,
+    ATTR_POSITION1,
 };
 
 /// Parent-side actor state for an NPC rendered via Bevy `SkinnedMesh`.
@@ -1899,6 +1900,7 @@ fn spawn_ffxi_actor(
             lighting: FfxiLightingUniform::default(),
             base_color_texture: tex_handle,
             joints: bind_joints.clone(),
+            material_flags: FfxiMaterialFlags::default(),
         });
         out_materials.push(mat.clone());
 

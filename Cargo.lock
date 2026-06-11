@@ -3121,6 +3121,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "bevy",
+ "ffxi-actor",
  "ffxi-audio",
  "ffxi-dat",
  "ffxi-proto",

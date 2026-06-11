@@ -43,12 +43,18 @@ struct FfxiJoints {
     matrices: array<mat4x4<f32>, 128>,
 };
 
+// Mirror of `FfxiMaterialFlags`. `flags.x` = has_texture (1.0 / 0.0).
+struct FfxiMaterialFlags {
+    flags: vec4<f32>,
+};
+
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> lighting: FfxiLighting;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var base_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var base_samp: sampler;
 // Per-actor bone world-pose matrices uploaded inline as a uniform (see the
 // `FfxiJointMatrices` doc for why this is a uniform, not a storage buffer).
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> joints: FfxiJoints;
+@group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> material_flags: FfxiMaterialFlags;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -118,11 +124,17 @@ fn ffxi_light(n: vec3<f32>, p: vec3<f32>, vc: vec4<f32>) -> vec4<f32> {
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    let texel = textureSample(base_tex, base_samp, in.uv);
-    // Alpha test (XIM discardThreshold = 69/255). Applied manually since
-    // a custom fragment shader bypasses Bevy's built-in mask handling.
-    if (texel.a < 0.271) {
-        discard;
+    // Untextured FFXI meshes (C/CS ops) carry a null TextureLink: treat the
+    // texel as white opaque and skip the alpha-test so the vertex color shows.
+    let has_texture = material_flags.flags.x > 0.5;
+    var texel = vec4<f32>(1.0);
+    if (has_texture) {
+        texel = textureSample(base_tex, base_samp, in.uv);
+        // Alpha test (XIM discardThreshold = 69/255). Applied manually since
+        // a custom fragment shader bypasses Bevy's built-in mask handling.
+        if (texel.a < 0.271) {
+            discard;
+        }
     }
     let frag_color = ffxi_light(normalize(in.world_normal), in.world_position, in.color);
     // FFXI composites baked-diffuse textures at 2x the lit vertex color.

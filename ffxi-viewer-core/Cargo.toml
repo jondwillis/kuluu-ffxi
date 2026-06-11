@@ -21,6 +21,12 @@ license.workspace = true
 bevy = { workspace = true, features = ["serialize"] }
 ffxi-viewer-wire = { path = "../ffxi-viewer-wire" }
 ffxi-dat = { path = "../ffxi-dat" }
+# Phase 3 faithful character render path: pure-Rust XIM port of per-joint
+# world pose (`skeleton_instance`), the 8-slot animation coordinator
+# (`animation`), and animation *selection* (`actor_state`). Glam-only, no
+# Bevy — `ffxi_actor_render` adapts its glam `Mat4` pose into the custom
+# skinned material's bone uniform.
+ffxi-actor = { path = "../ffxi-actor" }
 # Compile-time name tables (spell / ability / item id → English name)
 # scraped from LSB SQL. The HUD's menu modules — Equipment (Stage 1),
 # Magic / Abilities (Stage 2), Items (Stage 3) — look up display
