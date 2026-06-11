@@ -43,9 +43,7 @@ use ffxi_viewer_core::ffxi_actor_render::{
     inputs_for_pose, load_pc, spawn_loaded_actor, FfxiRenderActor, LoadedActor, PoseState,
 };
 use ffxi_viewer_core::look_resolver::{resolve_equipment_slot, resolve_face};
-use ffxi_viewer_core::skinned_ffxi_material::{
-    FfxiLightingUniform, FfxiSkinnedMaterial,
-};
+use ffxi_viewer_core::skinned_ffxi_material::{FfxiLightingUniform, FfxiSkinnedMaterial};
 
 use super::{char_list::CharCursor, CharListData};
 use crate::view_native::launcher_backdrop::PREVIEW_RENDER_LAYER;
@@ -287,6 +285,44 @@ pub(super) fn tag_preview_meshes(
     }
 }
 
+/// Deterministically keep every mesh of the faithful preview actor on the
+/// preview render layer.
+///
+/// The [`tag_preview_meshes`] `On<Add, Mesh3d>` observer is a fast path, but it
+/// races the spawn order: `spawn_loaded_actor` spawns the mesh groups as
+/// children of the actor-root and only AFTER it returns does
+/// [`poll_pending_preview`] attach the root under [`CharPreviewParent`]. So when
+/// the observer fires for each mesh, the actor-root has no `CharPreviewParent`
+/// ancestor yet — the `ChildOf`-walk fails and the mesh is left on the default
+/// (backdrop, layer 0) render layer. It then renders in the *backdrop camera's*
+/// pass, buried in the loaded zone near world origin (visible against a void,
+/// occluded by terrain — never in the intended foreground portrait).
+///
+/// This per-frame net walks the actor-root's descendants and tags any still-
+/// untagged `Mesh3d` with [`PREVIEW_RENDER_LAYER`]. It is idempotent
+/// (`Without<RenderLayers>` skips already-tagged meshes), so it self-heals one
+/// frame after spawn regardless of command-flush ordering.
+pub(super) fn ensure_preview_render_layer(
+    roots: Query<Entity, With<CharPreviewActorRoot>>,
+    children: Query<&Children>,
+    untagged_meshes: Query<(), (With<Mesh3d>, Without<RenderLayers>)>,
+    mut commands: Commands,
+) {
+    for root in &roots {
+        let mut stack = vec![root];
+        while let Some(entity) = stack.pop() {
+            if untagged_meshes.contains(entity) {
+                commands
+                    .entity(entity)
+                    .insert(RenderLayers::layer(PREVIEW_RENDER_LAYER));
+            }
+            if let Ok(kids) = children.get(entity) {
+                stack.extend(kids.iter());
+            }
+        }
+    }
+}
+
 pub(super) fn despawn_preview(
     mut commands: Commands,
     q_root: Query<Entity, With<CharPreviewRoot>>,
@@ -348,8 +384,7 @@ pub(super) fn refresh_preview_on_cursor_change(
             // skins each of these onto it.
             let equipment = pc_equipment_file_ids(slot);
             let char_id = slot.char_id;
-            let task = AsyncComputeTaskPool::get()
-                .spawn(async move { load_pc(race, &equipment) });
+            let task = AsyncComputeTaskPool::get().spawn(async move { load_pc(race, &equipment) });
             pending.task = Some((char_id, task));
         }
         _ => pending.task = None,
@@ -528,7 +563,14 @@ fn pc_equipment_file_ids(slot: &CharSlot) -> Vec<u32> {
         equipment.push(file_id);
     }
     let slot_ids = [
-        slot.head, slot.body, slot.hands, slot.legs, slot.feet, slot.main, slot.sub, slot.ranged,
+        slot.head,
+        slot.body,
+        slot.hands,
+        slot.legs,
+        slot.feet,
+        slot.main,
+        slot.sub,
+        slot.ranged,
     ];
     for slot_id in slot_ids {
         if let Some(file_id) = resolve_equipment_slot(slot_id, race) {

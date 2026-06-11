@@ -945,6 +945,10 @@ pub(crate) fn register(
         (
             char_preview::drive_preview_pose,
             ffxi_viewer_core::ffxi_actor_render::tick_ffxi_render_actors,
+            // Deterministic net: keep the preview actor's meshes on the preview
+            // render layer (the On<Add,Mesh3d> observer races the spawn order
+            // and can leave them on the backdrop layer — see the fn docs).
+            char_preview::ensure_preview_render_layer,
             char_preview::relight_preview_actor
                 .after(ffxi_viewer_core::ffxi_actor_render::update_ffxi_render_actor_lighting),
         )
