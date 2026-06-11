@@ -157,34 +157,42 @@ impl PosHead {
         Ok((head, claim_id))
     }
 
-    /// `UPDATE_DESPAWN` — the single updatemask bit (packet `0x0A` =
-    /// `body[6]`) LSB sets to mark a CHAR_NPC as an `ENTITY_DESPAWN`.
-    /// Mirrors `vendor/server/src/map/entities/baseentity.h:177`.
+    /// The single `body[6]` bit (packet `0x0A`) LSB sets to mark an
+    /// `ENTITY_DESPAWN`. Bit `0x20` in *both* despawn encodings:
+    /// `UPDATE_DESPAWN` in a CHAR_NPC (0x0E) `updatemask`
+    /// (`baseentity.h:177`) and `SendFlg.Despawn` in a CHAR_PC (0x0D)
+    /// `sendflags_t` (`char_update.cpp:38-46`) — the two bitfields overlay
+    /// the same byte.
     ///
-    /// LSB writes the *full* updatemask byte as `0x30` on the despawn path
-    /// (this bit OR'd with `UPDATE_LOOK 0x10` — `entity_update.cpp:285`),
-    /// but this bit alone is the authoritative signal: a full scan of the
-    /// server source shows `0x20` is never OR'd into any live `updatemask`
-    /// (`ENTITY_UPDATE`/`ENTITY_SPAWN` masks are built only from
-    /// `UPDATE_POS/STATUS/HP/COMBAT/NAME/LOOK`), so the bit is set
-    /// exclusively by the hard-coded despawn assignment. Keying on the bit
-    /// (rather than exact `== 0x30`) stays correct even if LSB later changes
-    /// which *other* bits ride along on the despawn packet.
+    /// For NPCs LSB writes the *full* byte as `0x30` on the despawn path
+    /// (this bit OR'd with `UPDATE_LOOK 0x10` — `entity_update.cpp:285`);
+    /// for PCs it sets `SendFlg.Despawn` alone (`char_update.cpp:244-246`).
+    /// Either way this bit alone is the authoritative signal: a full scan of
+    /// the server source shows `0x20` is never OR'd into any live
+    /// `updatemask`/`SendFlg` (`ENTITY_UPDATE`/`ENTITY_SPAWN` set only
+    /// `UPDATE_POS/STATUS/HP/COMBAT/NAME/LOOK` resp. `Position/ClaimStatus/
+    /// General/Name/Model`), so the bit is set exclusively by the hard-coded
+    /// despawn assignment. Keying on the bit (not the exact byte) stays
+    /// correct even if LSB later changes which *other* bits ride along.
     pub const UPDATE_DESPAWN: u8 = 0x20;
 
-    /// True when a CHAR_NPC (0x00E) body is an `ENTITY_DESPAWN` — the
-    /// server removing the entity from the zone (mob defeated + looted,
-    /// PC/NPC walked out of range, trust/pet dismissed). LSB routes *every*
-    /// despawn through a 0x0E packet because `updateWith` forces
-    /// `packet->id = 0x0E` (`entity_update.cpp:272`), so this one predicate
-    /// covers all entity classes.
+    /// True when a CHAR_PC (0x0D) or CHAR_NPC (0x0E) body is an
+    /// `ENTITY_DESPAWN` — the server removing the entity from the zone (mob
+    /// defeated + looted, PC/NPC walked out of range or *zoned*, trust/pet
+    /// dismissed).
     ///
-    /// # Why the updatemask bit is the marker
+    /// LSB routes a despawn through whichever packet class matches the
+    /// entity: `CCharEntity::updateEntityPacket` (`charentity.cpp:451`)
+    /// builds a `CCharUpdatePacket` (0x0D) for PCs and a
+    /// `CEntityUpdatePacket` (0x0E) for everything else, and `DespawnPC`
+    /// (`zone_entities.cpp:732`) sends a leaving PC down the 0x0D path. Both
+    /// classes encode the despawn in the *same* byte (`body[6]`) and the
+    /// *same* bit ([`UPDATE_DESPAWN`](PosHead::UPDATE_DESPAWN) `0x20`), so
+    /// once both opcodes are accepted this one predicate covers every entity
+    /// class. (An earlier version gated on CHAR_NPC only, which silently
+    /// leaked PC zone-outs — other players never despawned.)
     ///
-    /// Detected via the [`UPDATE_DESPAWN`](PosHead::UPDATE_DESPAWN) bit in
-    /// the updatemask byte at packet `0x0A` (= `body[6]`), which the despawn
-    /// path sets (`entity_update.cpp:285`, as part of the literal `0x30`)
-    /// and which no live update ever sets.
+    /// # Why the bit is the marker
     ///
     /// The despawn *animation* byte at packet `0x1F` (= `body[27]`,
     /// [`server_status`](PosHead::server_status)) is set to `0x02`
@@ -193,12 +201,9 @@ impl PosHead {
     /// (`:345` for NPCs, `:384` for mobs) because despawn forces local
     /// `updatemask = UPDATE_ALL_MOB`. So `body[27]` is *not* a usable
     /// marker — the `UPDATE_DESPAWN` bit is the only reliable signal.
-    ///
-    /// Only meaningful for CHAR_NPC; returns `false` for any other opcode
-    /// (CHAR_PC despawns also arrive as 0x0E, never 0x0D).
-    pub fn is_char_npc_despawn(opcode: u16, body: &[u8]) -> bool {
+    pub fn is_entity_despawn(opcode: u16, body: &[u8]) -> bool {
         use crate::map::s2c;
-        opcode == s2c::CHAR_NPC
+        (opcode == s2c::CHAR_PC || opcode == s2c::CHAR_NPC)
             && body
                 .get(6)
                 .copied()
@@ -810,7 +815,7 @@ mod despawn_tests {
         // The literal value LSB writes on the despawn path
         // (entity_update.cpp:285) = UPDATE_DESPAWN (0x20) | UPDATE_LOOK (0x10).
         let body = body_with_updatemask(0x30);
-        assert!(PosHead::is_char_npc_despawn(s2c::CHAR_NPC, &body));
+        assert!(PosHead::is_entity_despawn(s2c::CHAR_NPC, &body));
     }
 
     #[test]
@@ -819,7 +824,7 @@ mod despawn_tests {
         // UPDATE_DESPAWN bit reads as a despawn — robust to LSB changing
         // which other bits ride along.
         let body = body_with_updatemask(PosHead::UPDATE_DESPAWN);
-        assert!(PosHead::is_char_npc_despawn(s2c::CHAR_NPC, &body));
+        assert!(PosHead::is_entity_despawn(s2c::CHAR_NPC, &body));
     }
 
     #[test]
@@ -827,31 +832,41 @@ mod despawn_tests {
         // ENTITY_SPAWN (UPDATE_ALL_MOB / equipped-spawn 0x57) and the common
         // normal-tick masks (POS/STATUS/HP/COMBAT/NAME/LOOK combos) must never
         // read as a despawn — otherwise live entities would vanish mid-play.
-        // None of these set the UPDATE_DESPAWN (0x20) bit.
+        // None of these set the UPDATE_DESPAWN (0x20) bit. The CHAR_PC spawn
+        // SendFlg (0x1F = Position|ClaimStatus|General|Name|Model) is included
+        // since the predicate now also accepts CHAR_PC.
         for mask in [0x0F, 0x57, 0x01, 0x07, 0x08, 0x10, 0x1F] {
             assert_eq!(mask & PosHead::UPDATE_DESPAWN, 0, "test mask sanity");
             let body = body_with_updatemask(mask);
             assert!(
-                !PosHead::is_char_npc_despawn(s2c::CHAR_NPC, &body),
-                "updatemask 0x{mask:02x} must not be treated as despawn",
+                !PosHead::is_entity_despawn(s2c::CHAR_NPC, &body),
+                "CHAR_NPC updatemask 0x{mask:02x} must not be treated as despawn",
+            );
+            assert!(
+                !PosHead::is_entity_despawn(s2c::CHAR_PC, &body),
+                "CHAR_PC SendFlg 0x{mask:02x} must not be treated as despawn",
             );
         }
     }
 
     #[test]
-    fn despawn_mask_on_char_pc_opcode_is_ignored() {
-        // CHAR_PC (0x0D) never carries a despawn — those route through 0x0E.
-        // The same byte pattern under the CHAR_PC opcode must read false.
-        let body = body_with_updatemask(0x30);
-        assert!(!PosHead::is_char_npc_despawn(s2c::CHAR_PC, &body));
+    fn despawn_bit_on_char_pc_is_despawn() {
+        // A leaving PC despawns via 0x0D (CCharUpdatePacket) with
+        // SendFlg.Despawn (0x20) set alone (char_update.cpp:244-246). The
+        // same body[6] bit the CHAR_NPC path uses must read true under the
+        // CHAR_PC opcode too — otherwise other players never despawn when
+        // they zone out.
+        let body = body_with_updatemask(PosHead::UPDATE_DESPAWN);
+        assert!(PosHead::is_entity_despawn(s2c::CHAR_PC, &body));
     }
 
     #[test]
     fn truncated_body_is_not_despawn() {
         // A body too short to even reach the updatemask byte must not panic
         // and must report "not a despawn".
-        assert!(!PosHead::is_char_npc_despawn(s2c::CHAR_NPC, &[]));
-        assert!(!PosHead::is_char_npc_despawn(s2c::CHAR_NPC, &[0u8; 4]));
+        assert!(!PosHead::is_entity_despawn(s2c::CHAR_NPC, &[]));
+        assert!(!PosHead::is_entity_despawn(s2c::CHAR_NPC, &[0u8; 4]));
+        assert!(!PosHead::is_entity_despawn(s2c::CHAR_PC, &[0u8; 4]));
     }
 }
 

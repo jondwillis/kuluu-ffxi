@@ -812,11 +812,12 @@ fn handle_sub_packet(
             if let Ok(head) = decode::PosHead::decode(sub.data) {
                 // ENTITY_DESPAWN — the server is removing this entity from
                 // the zone (mob defeated + looted, PC/NPC walked out of
-                // range, trust/pet dismissed). Detected from the updatemask
-                // byte alone; see `PosHead::is_char_npc_despawn` for why that
-                // byte (and not the despawn animation byte) is the reliable
-                // marker, and why this one check covers every entity class.
-                if decode::PosHead::is_char_npc_despawn(op, sub.data) {
+                // range or zoned out, trust/pet dismissed). Detected from the
+                // `body[6]` bit alone; see `PosHead::is_entity_despawn` for
+                // why that byte (and not the despawn animation byte) is the
+                // reliable marker, and why this covers both 0x0D (PC) and
+                // 0x0E (NPC) despawns.
+                if decode::PosHead::is_entity_despawn(op, sub.data) {
                     // Drop the per-entity claim so a re-pop reusing this
                     // unique_no can't inherit stale combat state before its
                     // spawn tick rewrites it. `name_cache` / `kind_cache` are
