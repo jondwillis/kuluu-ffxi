@@ -146,6 +146,7 @@ impl Plugin for DatOverlayPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<LoadMmbRequest>()
             .add_message::<crate::dat_vos2::LoadVos2Request>()
+            .add_message::<crate::ffxi_actor_render::LoadActorRequest>()
             .add_message::<crate::dat_mzb::LoadMzbRequest>()
             .init_resource::<MmbHandleCache>()
             .init_resource::<MmbLoadQueue>()
@@ -188,12 +189,14 @@ impl Plugin for DatOverlayPlugin {
                     crate::dat_mzb::kick_load_mzb_tasks,
                     crate::dat_mzb::poll_load_mzb_tasks,
                     process_load_mmb_requests,
-                    crate::dat_vos2::process_load_vos2_requests,
-                    // FFXI-faithful character path. Reads the same
-                    // `LoadVos2Request` stream; only one of this and
-                    // `process_load_vos2_requests` acts per frame
-                    // (gated on `GraphicsSettings::character_path`).
-                    crate::dat_vos2::process_load_vos2_requests_ffxi,
+                    // FFXI-faithful character path. Consumes the
+                    // `LoadActorRequest`s `dispatch_look_driven_models`
+                    // emits this frame (one per entity), building each
+                    // rig from the NEW `ffxi-dat` parsers. The legacy
+                    // VOS2 consumers (`process_load_vos2_requests`,
+                    // `process_load_vos2_requests_ffxi`) are left defined
+                    // but no longer registered.
+                    crate::ffxi_actor_render::process_load_actor_requests,
                 )
                     .chain(),
             )

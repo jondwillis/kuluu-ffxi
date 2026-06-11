@@ -58,6 +58,10 @@ struct Params {
     /// the fixed humanoid view. Needed for non-humanoid subjects whose body
     /// isn't at torso height — e.g. the fire-elemental's flat y≈0 emitter disk.
     autoframe: bool,
+    /// Drive the material's realistic-lighting flag (the same flag the live
+    /// `update_ffxi_render_actor_lighting` stamps from the graphics setting),
+    /// so the energy-conserving shader branch can be A/B'd headlessly.
+    realistic: bool,
 }
 
 #[derive(Resource, Default)]
@@ -93,7 +97,14 @@ fn main() {
         .add_systems(Startup, (setup_scene, spawn_subject))
         .add_systems(
             Update,
-            (reframe_camera, set_inputs, tick_ffxi_render_actors, capture).chain(),
+            (
+                reframe_camera,
+                set_inputs,
+                apply_realistic_flag,
+                tick_ffxi_render_actors,
+                capture,
+            )
+                .chain(),
         )
         .run();
 }
@@ -111,6 +122,7 @@ fn parse_params(args: &[String]) -> Params {
     let mut scale = 1.0f32;
     let mut ground = false;
     let mut autoframe = false;
+    let mut realistic = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -183,6 +195,10 @@ fn parse_params(args: &[String]) -> Params {
                 autoframe = true;
                 i += 1;
             }
+            "--realistic" => {
+                realistic = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -200,6 +216,7 @@ fn parse_params(args: &[String]) -> Params {
         scale,
         ground,
         autoframe,
+        realistic,
     }
 }
 
@@ -323,6 +340,22 @@ fn set_inputs(params: Res<Params>, mut q: Query<&mut FfxiRenderActor>) {
     }
 }
 
+/// Mirror the live `update_ffxi_render_actor_lighting` realistic flag onto
+/// every spawned material so `--realistic` exercises the shader's
+/// energy-conserving branch. (The harness has no live graphics-settings
+/// resource; this drives the flag straight from the CLI param.)
+fn apply_realistic_flag(params: Res<Params>, mut materials: ResMut<Assets<FfxiSkinnedMaterial>>) {
+    let flag = if params.realistic { 1.0 } else { 0.0 };
+    let ids: Vec<_> = materials.ids().collect();
+    for id in ids {
+        if let Some(m) = materials.get_mut(id) {
+            if m.material_flags.flags.y != flag {
+                m.material_flags.flags.y = flag;
+            }
+        }
+    }
+}
+
 fn capture(
     mut commands: Commands,
     mut fc: ResMut<FrameCount>,
@@ -346,7 +379,11 @@ fn capture(
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(params.out.clone()));
         shot.0 = true;
-        let joints = q_actor.iter().next().map(|_| "actor present").unwrap_or("NO actor");
+        let joints = q_actor
+            .iter()
+            .next()
+            .map(|_| "actor present")
+            .unwrap_or("NO actor");
         eprintln!(
             "captured -> {} (frame {:.1}, {})",
             params.out,

@@ -37,12 +37,45 @@ use ffxi_dat::skel_mesh::{MeshBuffer, MeshType, SkelMesh};
 use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::{walk_tree, ChunkKind, ChunkNode, DatRoot};
 
+use crate::combat_stance;
 use crate::dat_vos2::skeleton_file_id_for_race;
 use crate::skinned_ffxi_material::{
     FfxiJointMatrices, FfxiLightingUniform, FfxiMaterialFlags, FfxiSkinnedMaterial, ATTR_COLOR,
     ATTR_JOINT0, ATTR_JOINT1, ATTR_JOINT_WEIGHT, ATTR_NORMAL0, ATTR_NORMAL1, ATTR_POSITION0,
     ATTR_POSITION1,
 };
+
+// ---------------------------------------------------------------------------
+// Live-client wiring: messages + per-entity render-root link
+// ---------------------------------------------------------------------------
+
+/// What an entity should be rendered as on the faithful path. Resolved by
+/// `look_resolver::dispatch_look_driven_models` from the wire `EntityLook`:
+/// `Equipped` → `Pc`, `Standard` → `Npc`.
+#[derive(Debug, Clone)]
+pub enum ActorSubject {
+    /// A player character: the race skeleton DAT plus the resolved equipment
+    /// (face + per-slot) file_ids, in the order `load_pc` expects.
+    Pc { race: u8, equipment: Vec<u32> },
+    /// A fixed NPC: the single actor DAT file_id (already through `npc_dat_id`).
+    Npc { file_id: u32 },
+}
+
+/// Request to (re)build the faithful render-root for one wire entity. Fired
+/// by the look dispatcher (one per entity, replacing the per-slot/per-chunk
+/// `LoadVos2Request` fan-out) and consumed by [`process_load_actor_requests`].
+/// Same derive/registration style as `dat_vos2::LoadVos2Request`.
+#[derive(Message, Debug, Clone)]
+pub struct LoadActorRequest {
+    pub entity_id: u32,
+    pub subject: ActorSubject,
+}
+
+/// Marks a wire `WorldEntity` whose faithful render-root has been spawned,
+/// storing that root entity so a later look change can despawn it (and its
+/// descendants) before spawning a replacement.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct FfxiRenderRoot(pub Entity);
 
 /// FFXI authoring rate: animation key frames advance ~30 per second. The
 /// runtime's `get_joint_transform` already scales by `key_frame_duration`, so
@@ -157,8 +190,8 @@ pub fn load_npc(file_id: u32) -> Result<LoadedActor, String> {
     let root = DatRoot::from_env_or_default().map_err(|e| format!("DatRoot: {e}"))?;
     let bytes = read_dat(&root, file_id).ok_or_else(|| format!("read npc dat {file_id}"))?;
 
-    let skeleton = first_skeleton(&bytes)
-        .ok_or_else(|| format!("no skeleton (0x29) in npc dat {file_id}"))?;
+    let skeleton =
+        first_skeleton(&bytes).ok_or_else(|| format!("no skeleton (0x29) in npc dat {file_id}"))?;
 
     let dir = ResourceDir::from_bytes(bytes.clone());
     let skel_meshes = dir.collect_skel_meshes();
@@ -247,6 +280,18 @@ pub fn load_pc(race: u8, equipment: &[u32]) -> Result<LoadedActor, String> {
         skel_meshes.extend(meshes);
         collect_textures(&walk_tree(&bytes), &mut textures);
         anim_dirs.push(ResourceDir::from_bytes(bytes));
+    }
+
+    // Full-rig (`*1` LOD) locomotion + battle clips live in the race's MOTION
+    // DAT (skel + 2600), NOT the skeleton DAT — which carries only the low-LOD
+    // `*0` clips (~12 joints, legs + spine, no arms). Without these the upper
+    // body never animates while running (`run?` would resolve to the legs-only
+    // `run0`); battle idle (`btl?`) and the full-rig death (`cor1`) are also
+    // motion-DAT-only. The motion DAT holds no skeleton/meshes, just clips.
+    if let Some(motion_id) = combat_stance::motion_dat_for_skel(skel_file_id) {
+        if let Some(bytes) = read_dat(&root, motion_id) {
+            anim_dirs.push(ResourceDir::from_bytes(bytes));
+        }
     }
 
     if skel_meshes.is_empty() {
@@ -402,7 +447,10 @@ fn build_d3m_mesh(d3m: &D3m) -> Mesh {
         ]);
     }
 
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
     mesh.insert_attribute(ATTR_POSITION0, position0);
     mesh.insert_attribute(ATTR_POSITION1, position1);
     mesh.insert_attribute(ATTR_NORMAL0, normal0);
@@ -471,6 +519,10 @@ pub struct FfxiRenderActor {
     materials: Vec<Handle<FfxiSkinnedMaterial>>,
     /// Current animation-selection inputs (set by the example harness).
     pub inputs: ActorAnimInputs,
+    /// Live link to the wire entity id, used by [`tick_live_ffxi_actors`] to
+    /// look up motion / engagement / rest each frame. `0` for the example
+    /// harness (which drives `inputs` directly and never queries live state).
+    pub world_id: u32,
     /// Actor facing in radians (root yaw), applied via `RootTransform`.
     pub facing_dir: f32,
     /// Uniform scale applied to the whole skeleton via the root.
@@ -571,6 +623,51 @@ pub fn spawn_loaded_actor(
     facing_dir: f32,
     scale: f32,
 ) -> Entity {
+    // Actor-root entity carries the single FFXI->Bevy basis + world position.
+    let actor_root = commands
+        .spawn((
+            Transform {
+                translation: world_pos,
+                rotation: ffxi_to_bevy_basis(),
+                scale: Vec3::ONE,
+            },
+            GlobalTransform::default(),
+            Visibility::default(),
+        ))
+        .id();
+
+    let material_handles = build_actor_children(
+        commands, meshes, materials, images, loaded, actor_root, facing_dir, scale,
+    );
+
+    commands.entity(actor_root).insert(make_render_actor(
+        loaded,
+        material_handles,
+        0,
+        facing_dir,
+        scale,
+    ));
+
+    actor_root
+}
+
+/// Build + attach every mesh-group (and effect-mesh) child of `actor_root`
+/// from `loaded`, returning the per-group material handles. The actor-root
+/// itself (with its FFXI->Bevy basis transform + parenting) is set up by the
+/// caller; this is the geometry/material body shared by [`spawn_loaded_actor`]
+/// (free harness root) and [`spawn_live_actor`] (root parented to a wire
+/// entity).
+#[allow(clippy::too_many_arguments)]
+fn build_actor_children(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<FfxiSkinnedMaterial>,
+    images: &mut Assets<Image>,
+    loaded: &LoadedActor,
+    actor_root: Entity,
+    facing_dir: f32,
+    scale: f32,
+) -> Vec<Handle<FfxiSkinnedMaterial>> {
     // Texture pool keyed XIM-style: a full `nameSpace/localName` map (tier 1)
     // and a `localName`-only map (tier 2 fallback), both filled from each
     // texture's own full 16-char name. A third `by_trimmed` map keys the WHOLE
@@ -625,19 +722,6 @@ pub fn spawn_loaded_actor(
         },
         &[],
     ));
-
-    // Actor-root entity carries the single FFXI->Bevy basis + world position.
-    let actor_root = commands
-        .spawn((
-            Transform {
-                translation: world_pos,
-                rotation: ffxi_to_bevy_basis(),
-                scale: Vec3::ONE,
-            },
-            GlobalTransform::default(),
-            Visibility::default(),
-        ))
-        .id();
 
     let mut material_handles = Vec::new();
 
@@ -710,18 +794,93 @@ pub fn spawn_loaded_actor(
         ));
     }
 
-    commands.entity(actor_root).insert(FfxiRenderActor {
+    material_handles
+}
+
+/// Assemble the [`FfxiRenderActor`] component from a loaded subject + the
+/// material handles built for it. Shared by the harness spawn (world_id 0)
+/// and the live spawn (a real wire id).
+fn make_render_actor(
+    loaded: &LoadedActor,
+    materials: Vec<Handle<FfxiSkinnedMaterial>>,
+    world_id: u32,
+    facing_dir: f32,
+    scale: f32,
+) -> FfxiRenderActor {
+    FfxiRenderActor {
         skeleton: loaded.skeleton.clone(),
         animations: loaded.all_animations(),
         coordinator: SkeletonAnimationCoordinator::new(),
-        materials: material_handles,
+        materials,
         inputs: ActorAnimInputs::default(),
+        world_id,
         facing_dir,
         scale,
         current_clip: None,
         last_clip: None,
         last_frame: 0.0,
-    });
+    }
+}
+
+/// Spawn a loaded actor as a CHILD of `wire_entity` (the tracked `WorldEntity`),
+/// so the rig inherits the wire entity's world position AND heading rotation —
+/// exactly like the legacy VOS2 path parents its pivot to the wire entity. The
+/// actor-root's local transform is `translation = ZERO` (position comes from the
+/// parent) and `rotation = ffxi_to_bevy_basis()` (the single FFXI->Bevy basis;
+/// the parent's `Q_y(-heading)` then composes on top, turning the rig to face
+/// the wire heading). `facing_dir` is held at `0.0` here: heading is carried by
+/// the inherited parent rotation, NOT by `RootTransform`.
+///
+/// Returns the spawned actor-root entity. The caller records it in a
+/// [`FfxiRenderRoot`] marker on the wire entity so a later look change can
+/// despawn it.
+///
+/// TUNABLES (coordinate frame): see [`ffxi_to_bevy_basis`]. Because the rig
+/// inherits the wire heading via parenting + the `Q_x(π)` basis while keeping
+/// `facing_dir = 0`, the new `pose_world` retains the root-joint roll that the
+/// legacy pivot canceled with a `Q_y(π/2)` — so the character may render at a
+/// fixed yaw offset (e.g. 90°/180°) from correct. Adjust by composing a yaw into
+/// [`ffxi_to_bevy_basis`] (see its doc). `scale` is passed by the caller
+/// (currently `1.0`); feet-on-ground relies on the wire position being the
+/// ground point (this path applies no `min_y` pivot).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_live_actor(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<FfxiSkinnedMaterial>,
+    images: &mut Assets<Image>,
+    loaded: &LoadedActor,
+    wire_entity: Entity,
+    world_id: u32,
+    scale: f32,
+) -> Entity {
+    // facing_dir stays 0: the parent (wire entity) carries the heading.
+    let facing_dir = 0.0;
+
+    let actor_root = commands
+        .spawn((
+            Transform {
+                translation: Vec3::ZERO,
+                rotation: ffxi_to_bevy_basis(),
+                scale: Vec3::ONE,
+            },
+            GlobalTransform::default(),
+            Visibility::default(),
+            ChildOf(wire_entity),
+        ))
+        .id();
+
+    let material_handles = build_actor_children(
+        commands, meshes, materials, images, loaded, actor_root, facing_dir, scale,
+    );
+
+    commands.entity(actor_root).insert(make_render_actor(
+        loaded,
+        material_handles,
+        world_id,
+        facing_dir,
+        scale,
+    ));
 
     actor_root
 }
@@ -756,84 +915,375 @@ pub fn tick_ffxi_render_actors(
     mut q_actors: Query<&mut FfxiRenderActor>,
 ) {
     let elapsed_frames = time.delta_secs() * FRAME_RATE;
-
     for mut actor in &mut q_actors {
-        // Rest postures (sit/kneel/heal) play a dedicated model routine
-        // (chi0/res0), which XIM selects outside `selected_animation`. When a
-        // rest is active, prefer its id; otherwise fall through to the
-        // idle-vs-movement selection. `idle` here just controls low-priority.
-        let (selected_id, is_idle) =
-            match actor_state::rest_animation_id(actor.inputs.rest) {
-                Some(rest_id) => (rest_id, true),
-                None => {
-                    let s = actor_state::selected_animation(&actor.inputs);
-                    (s.id, s.idle)
-                }
-            };
+        advance_actor_pose(&mut actor, elapsed_frames, &mut materials);
+    }
+}
 
-        // Resolve it against the actor's animation pool: first clip whose id
-        // parameterized-matches wins (mirrors XIM's directory resolution).
-        // Fall back to `idl?` when the selected clip has no match (e.g. an NPC
-        // skeleton lacking a `cor?`/`res0`), so the actor never freezes blank.
-        let resolved = actor
-            .animations
-            .iter()
-            .find(|a| a.id.parameterized_match(&selected_id))
-            .or_else(|| {
-                actor
-                    .animations
-                    .iter()
-                    .find(|a| a.id.parameterized_match(&DatId::from_str("idl?")))
-            })
-            .map(|a| (a.id, a.clone()));
-
-        if let Some((id, clip)) = resolved {
-            // Only (re)register when the resolved clip id actually changes, so
-            // a looping idle keeps its frame cursor across frames.
-            if actor.current_clip != Some(id) {
-                actor.current_clip = Some(id);
-                let loop_params = LoopParams {
-                    loop_duration: None,
-                    num_loops: None,
-                    low_priority: is_idle,
-                };
-                actor
-                    .coordinator
-                    .register_animation(clip, loop_params, None, |_| true);
-            }
-            actor.last_clip = Some(id);
+/// Shared per-actor pose pipeline used by both [`tick_ffxi_render_actors`]
+/// (harness) and [`tick_live_ffxi_actors`] (live): clip selection ->
+/// coordinator register/update -> `pose_world` -> stamp every group material's
+/// bone uniform. The caller sets `actor.inputs` / `actor.facing_dir` first;
+/// this function only reads them.
+fn advance_actor_pose(
+    actor: &mut FfxiRenderActor,
+    elapsed_frames: f32,
+    materials: &mut Assets<FfxiSkinnedMaterial>,
+) {
+    // Rest postures (sit/kneel/heal) play a dedicated model routine
+    // (chi0/res0), which XIM selects outside `selected_animation`. When a
+    // rest is active, prefer its id; otherwise fall through to the
+    // idle-vs-movement selection. `idle` here just controls low-priority.
+    let (selected_id, is_idle) = match actor_state::rest_animation_id(actor.inputs.rest) {
+        Some(rest_id) => (rest_id, true),
+        None => {
+            let s = actor_state::selected_animation(&actor.inputs);
+            (s.id, s.idle)
         }
+    };
 
-        actor.coordinator.update(elapsed_frames);
-        // Surface the high slot's frame cursor for the overlay.
-        actor.last_frame = actor
-            .coordinator
+    // Resolve the selected parameterized id to ALL matching clips and register
+    // each into its final-digit slot (XIM `fetchAnimations` + per-clip
+    // `registerAnimation`). FFXI splits one pose across DISJOINT body-region
+    // slots keyed by the clip's final digit: e.g. `run0` (slot 0) animates only
+    // the legs/feet (joints 25..37) and `run1` (slot 1) only the spine/arms/
+    // head (3..24, 49..88) — non-overlapping sets the coordinator composites
+    // per-joint into a full-body pose. Registering just one slot animates only
+    // that half ("running only torso-down"). And a slot left occupied by the
+    // PREVIOUS pose keeps playing it (idle is `idl0`, slot 0 only, so a stale
+    // slot 1 keeps the arms running after the legs stop) — so on a pose change
+    // clear every slot first, then register the whole set. Fall back to `idl?`
+    // when nothing matches so the actor never freezes blank.
+    let matches: Vec<SkeletonAnimation> = {
+        let m: Vec<SkeletonAnimation> = actor
             .animations
             .iter()
-            .flatten()
-            .filter_map(|a| a.current_animation.as_ref().map(|c| c.current_frame))
-            .next_back()
-            .unwrap_or(0.0);
+            .filter(|a| a.id.parameterized_match(&selected_id))
+            .cloned()
+            .collect();
+        if m.is_empty() {
+            let idle = DatId::from_str("idl?");
+            actor
+                .animations
+                .iter()
+                .filter(|a| a.id.parameterized_match(&idle))
+                .cloned()
+                .collect()
+        } else {
+            m
+        }
+    };
 
-        // Build the get_anim closure from the coordinator and evaluate.
-        let pose = {
-            let coordinator = &actor.coordinator;
-            pose_world(
-                &actor.skeleton,
-                |joint| coordinator.get_joint_transform(joint),
-                RootTransform {
-                    facing_dir: actor.facing_dir,
-                    skew: 0.0,
-                    slope_oriented: false,
-                    scale: Vec3::splat(actor.scale),
-                },
-                &[],
-            )
+    // Re-register only when the SELECTED id changes, so steady-state looping
+    // keeps each slot's frame cursor (and the legs/arms stay phase-locked).
+    if !matches.is_empty() && actor.current_clip != Some(selected_id) {
+        actor.current_clip = Some(selected_id);
+        actor.coordinator.clear();
+        let loop_params = LoopParams {
+            loop_duration: None,
+            num_loops: None,
+            low_priority: is_idle,
+        };
+        for clip in &matches {
+            actor
+                .coordinator
+                .register_animation(clip.clone(), loop_params, None, |_| true);
+        }
+    }
+    // Overlay diagnostic: the fullest registered clip's id.
+    actor.last_clip = matches.iter().max_by_key(|a| a.key_frame_sets.len()).map(|a| a.id);
+
+    actor.coordinator.update(elapsed_frames);
+    // Surface the high slot's frame cursor for the overlay.
+    actor.last_frame = actor
+        .coordinator
+        .animations
+        .iter()
+        .flatten()
+        .filter_map(|a| a.current_animation.as_ref().map(|c| c.current_frame))
+        .next_back()
+        .unwrap_or(0.0);
+
+    // Build the get_anim closure from the coordinator and evaluate.
+    let pose = {
+        let coordinator = &actor.coordinator;
+        pose_world(
+            &actor.skeleton,
+            |joint| coordinator.get_joint_transform(joint),
+            RootTransform {
+                facing_dir: actor.facing_dir,
+                skew: 0.0,
+                slope_oriented: false,
+                scale: Vec3::splat(actor.scale),
+            },
+            &[],
+        )
+    };
+
+    for handle in &actor.materials {
+        if let Some(m) = materials.get_mut(handle) {
+            m.joints.set_from(&pose);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live-client systems
+// ---------------------------------------------------------------------------
+
+/// Drain [`LoadActorRequest`]s: (re)build the faithful render-root for each
+/// requested wire entity. Resolves the wire `Entity` from `TrackedEntities`,
+/// despawns any prior [`FfxiRenderRoot`] (and its descendants), builds the
+/// `LoadedActor` for the subject, and spawns a new root parented to the wire
+/// entity. Load failures are logged and skipped (never panic).
+pub fn process_load_actor_requests(
+    mut events: MessageReader<LoadActorRequest>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    tracked: Res<crate::scene::TrackedEntities>,
+    q_existing: Query<&FfxiRenderRoot>,
+) {
+    for req in events.read() {
+        let Some(&wire_entity) = tracked.by_id.get(&req.entity_id) else {
+            // Entity not tracked yet (look arrived before the spawn). The look
+            // dispatcher re-fires on `Changed<LookComp>`, so this self-heals.
+            continue;
         };
 
-        for handle in &actor.materials {
-            if let Some(m) = materials.get_mut(handle) {
-                m.joints.set_from(&pose);
+        // Despawn any previously-spawned render-root for this entity. In Bevy
+        // 0.18 `despawn` is recursive, so the root's mesh/material children go
+        // with it.
+        if let Ok(FfxiRenderRoot(old_root)) = q_existing.get(wire_entity) {
+            commands.entity(*old_root).despawn();
+        }
+
+        let loaded = match &req.subject {
+            ActorSubject::Npc { file_id } => load_npc(*file_id),
+            ActorSubject::Pc { race, equipment } => load_pc(*race, equipment),
+        };
+        let loaded = match loaded {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("ffxi actor load failed (entity {}): {e}", req.entity_id);
+                continue;
+            }
+        };
+
+        // Scale is 1.0 for now (TUNABLE: see `spawn_live_actor`).
+        let root = spawn_live_actor(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut images,
+            &loaded,
+            wire_entity,
+            req.entity_id,
+            1.0,
+        );
+        // Hide the placeholder debug capsule (`scene::sync_entities_system`
+        // gives every wire entity a colored `Mesh3d` proxy): now that the
+        // faithful model is parented under the wire entity, the proxy would
+        // render as a solid capsule ON TOP of it. Drop the `Mesh3d` exactly
+        // like the legacy path did on model load (`dat_vos2.rs:709`); the
+        // `MeshMaterial3d` left behind is inert without geometry. Visibility
+        // is untouched, so the child model still shows (and self-in-first-
+        // person hiding via the wire entity's `Visibility` still works).
+        // `try_insert`: the wire entity may despawn between drain and flush.
+        commands
+            .entity(wire_entity)
+            .remove::<Mesh3d>()
+            .try_insert(FfxiRenderRoot(root));
+    }
+}
+
+/// Live counterpart to [`tick_ffxi_render_actors`]: build [`ActorAnimInputs`]
+/// from live game state (motion / engagement / rest / dead) for each actor
+/// with `world_id != 0`, then run the IDENTICAL pose pipeline. `facing_dir`
+/// stays `0.0` — the parent (wire entity) carries the heading.
+pub fn tick_live_ffxi_actors(
+    time: Res<Time>,
+    state: Res<crate::snapshot::SceneState>,
+    motion: Res<combat_stance::EntityMotion>,
+    rest: Res<combat_stance::RestStance>,
+    walk_mode: Res<combat_stance::WalkMode>,
+    mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
+    mut q_actors: Query<&mut FfxiRenderActor>,
+) {
+    use ffxi_actor::actor_state::{EngageAnimationState, RestKind};
+
+    let elapsed_frames = time.delta_secs() * FRAME_RATE;
+    let self_id = state.snapshot.self_char_id;
+
+    // Once-per-frame indices so the per-actor lookups stay O(1) in crowded
+    // zones (engagement + dead both scrape the snapshot entity list).
+    let bt_target_by_id: std::collections::HashMap<u32, u32> = state
+        .snapshot
+        .entities
+        .iter()
+        .map(|e| (e.id, e.bt_target_id))
+        .collect();
+    // Dead source: the wire `Entity.hp_pct`. `Some(0)` = at 0 HP (dead);
+    // `None`/non-zero = alive. (`hp_pct` is the only death signal on the wire
+    // today — there is no separate dead bool.)
+    let dead_by_id: std::collections::HashMap<u32, bool> = state
+        .snapshot
+        .entities
+        .iter()
+        .map(|e| (e.id, e.hp_pct == Some(0)))
+        .collect();
+
+    for mut actor in &mut q_actors {
+        let world_id = actor.world_id;
+        if world_id == 0 {
+            // Harness-style actor under the live tick — leave to the harness
+            // tick (not registered live) and skip.
+            continue;
+        }
+
+        let is_self = Some(world_id) == self_id;
+        let sample = motion.sample(world_id).unwrap_or_default();
+        let engaged = bt_target_by_id
+            .get(&world_id)
+            .map(|&t| t != 0)
+            .unwrap_or(false);
+        let dead = dead_by_id.get(&world_id).copied().unwrap_or(false);
+        // Rest stance is a self-only local affordance (`/sit` etc.); other
+        // entities never carry it on the wire. Map the viewer-core
+        // `combat_stance::RestKind` onto the `ffxi-actor` selection enum.
+        let rest_kind = if is_self {
+            match rest.kind {
+                combat_stance::RestKind::None => RestKind::None,
+                combat_stance::RestKind::Sit => RestKind::Sit,
+                combat_stance::RestKind::Heal => RestKind::Heal,
+            }
+        } else {
+            RestKind::None
+        };
+
+        // XIM lock/strafe gate (`actor_state::movement_direction` contract): a
+        // free-moving actor turns to face where it's going, so its velocity is
+        // purely forward and the clip is `run?`/`wlk?`. The sideways/backward
+        // strafe clips (`mvl?`/`mvr?`/`mvb?`) only apply when the actor's
+        // facing is pinned to a target while it moves — i.e. engaged. Feeding
+        // the raw projection for a free runner lets a stale wire heading
+        // project a forward run onto a strafe clip: legs splayed sideways with
+        // the arms left in bind. Self's heading is client-driven and not echoed
+        // back into the snapshot each frame, so its projection is never
+        // trustworthy; only use the projection for engaged *remote* actors,
+        // whose server-authored heading is authoritative.
+        let (forward_vel, strafe_vel) = if engaged && !is_self {
+            (sample.forward_component, sample.strafe_component)
+        } else {
+            (0.0, 0.0)
+        };
+        // /walk is a self-only local toggle; remote actors carry no wire
+        // signal for it, so they always use the run gait.
+        let walking = is_self && walk_mode.walking;
+
+        actor.facing_dir = 0.0; // heading carried by the parent rotation.
+        actor.inputs = ActorAnimInputs {
+            moving: motion.is_moving(world_id),
+            walking,
+            forward_vel,
+            strafe_vel,
+            heading_rate: sample.heading_rate,
+            engage_state: if engaged {
+                EngageAnimationState::Engaged
+            } else {
+                EngageAnimationState::NotEngaged
+            },
+            dead,
+            rest: rest_kind,
+            ..Default::default()
+        };
+
+        advance_actor_pose(&mut actor, elapsed_frames, &mut materials);
+    }
+}
+
+/// Per-frame: upload the live zone sun / moon / ambient into every faithful
+/// render-actor material's light uniform, and stamp the realistic-lighting
+/// toggle (`GraphicsSettings::realistic_character_lighting`) into the material
+/// flag the shader branches on.
+///
+/// Replaces `dat_vos2::update_ffxi_lighting_system`, which queried the retired
+/// `FfxiActor` component and so never reached the new live `FfxiRenderActor`
+/// materials — leaving them on the flat neutral default uniform. The lux→unit
+/// mapping matches that system so faithful shading is unchanged; only the
+/// target component (and the realistic flag) differ.
+pub fn update_ffxi_render_actor_lighting(
+    settings: Res<crate::graphics_settings::GraphicsSettings>,
+    ambient: Res<GlobalAmbientLight>,
+    q_sun: Query<
+        (&DirectionalLight, &GlobalTransform),
+        (
+            With<crate::sun_moon::IsSun>,
+            Without<crate::sun_moon::IsMoon>,
+        ),
+    >,
+    q_moon: Query<
+        (&DirectionalLight, &GlobalTransform),
+        (
+            With<crate::sun_moon::IsMoon>,
+            Without<crate::sun_moon::IsSun>,
+        ),
+    >,
+    q_actors: Query<&FfxiRenderActor>,
+    mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
+) {
+    // Reference scales (matched to `dat_vos2::update_ffxi_lighting_system`):
+    // GlobalAmbientLight defaults to ~500 lux; the sun curve peaks ~10k lux
+    // at noon. Map both into the shader's ~0..1 contribution band.
+    const AMBIENT_REF_LUX: f32 = 1000.0;
+    const DIR_REF_LUX: f32 = 12000.0;
+
+    let amb = ambient.color.to_linear();
+    let amb_k = (ambient.brightness / AMBIENT_REF_LUX).clamp(0.0, 1.5);
+    let ambient_v = Vec4::new(amb.red * amb_k, amb.green * amb_k, amb.blue * amb_k, 1.0);
+
+    let extract = |opt: Option<(&DirectionalLight, &GlobalTransform)>| -> (Vec4, Vec4) {
+        match opt {
+            Some((dl, gt)) if dl.illuminance > 0.0 => {
+                let f = gt.forward();
+                let c = dl.color.to_linear();
+                let k = (dl.illuminance / DIR_REF_LUX).clamp(0.0, 1.0);
+                (
+                    Vec4::new(f.x, f.y, f.z, 0.0),
+                    Vec4::new(c.red, c.green, c.blue, k),
+                )
+            }
+            _ => (Vec4::ZERO, Vec4::ZERO),
+        }
+    };
+    let (dir0_dir, dir0_color) = extract(q_sun.single().ok());
+    let (dir1_dir, dir1_color) = extract(q_moon.single().ok());
+
+    let lighting = FfxiLightingUniform {
+        ambient: ambient_v,
+        dir0_dir,
+        dir0_color,
+        dir1_dir,
+        dir1_color,
+        // Zone point lights aren't wired into the faithful path yet; a zeroed
+        // `.w` (range) makes the shader's point loop skip every slot.
+        point_pos: [Vec4::ZERO; 4],
+        point_color: [Vec4::ZERO; 4],
+    };
+
+    let realistic = if settings.realistic_character_lighting {
+        1.0
+    } else {
+        0.0
+    };
+
+    for actor in &q_actors {
+        for h in &actor.materials {
+            if let Some(m) = materials.get_mut(h) {
+                m.lighting = lighting.clone();
+                // Preserve `.x` (has_texture); only drive the realistic flag.
+                m.material_flags.flags.y = realistic;
             }
         }
     }

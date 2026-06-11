@@ -401,26 +401,22 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                     .run_if(resource_exists::<EntityMesh>),
             );
 
-        // Skinned-actor idle-animation tick. Runs on every `SkinnedActor`
-        // (currently NPCs; PC migration tracked separately). Independent
-        // of the main chained tuple above — it operates on a different
-        // entity set and has no ordering constraints with the
-        // sync/dispatch/camera pipeline.
-        #[cfg(not(target_arch = "wasm32"))]
-        app.add_systems(Update, dat_vos2::tick_skinned_actors);
+        // Phase 4a: the live character tick is now the faithful
+        // `ffxi_actor_render::tick_live_ffxi_actors` (registered below,
+        // after `track_entity_motion_system`). The legacy
+        // `dat_vos2::tick_skinned_actors` (Bevy CPU-bake path) and
+        // `dat_vos2::tick_ffxi_actors` (old GPU path) are left defined but
+        // no longer registered — a later pass removes them once the new
+        // path is confirmed in-game.
 
-        // FFXI-faithful counterpart: drives the per-actor bone storage
-        // buffer the custom skinned material reads, using the same clip
-        // selection as `tick_skinned_actors`. Self-gates on the FFXI
-        // render path, so it's a no-op on the Bevy path (and vice-versa).
+        // Faithful character lighting: pull the live zone sun / moon / ambient
+        // into each faithful render-actor material's light uniform every frame,
+        // and stamp the realistic-lighting toggle. Targets the live
+        // `FfxiRenderActor` materials (the legacy
+        // `dat_vos2::update_ffxi_lighting_system` queried the retired
+        // `FfxiActor` component and never reached them).
         #[cfg(not(target_arch = "wasm32"))]
-        app.add_systems(Update, dat_vos2::tick_ffxi_actors);
-
-        // FFXI-faithful lighting: pull the live zone sun / moon / ambient
-        // into each faithful material's light uniform every frame. Also
-        // self-gates on the FFXI render path.
-        #[cfg(not(target_arch = "wasm32"))]
-        app.add_systems(Update, dat_vos2::update_ffxi_lighting_system);
+        app.add_systems(Update, ffxi_actor_render::update_ffxi_render_actor_lighting);
 
         // Per-entity motion tracker for combat-stance / locomotion
         // animation selection. Runs *before* `tick_skinned_actors`
@@ -438,9 +434,13 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         app.add_systems(
             Update,
             combat_stance::track_entity_motion_system
-                .before(dat_vos2::tick_skinned_actors)
-                .before(dat_vos2::tick_ffxi_actors),
+                .before(ffxi_actor_render::tick_live_ffxi_actors),
         );
+        // Faithful live character animation tick. Runs *after*
+        // `track_entity_motion_system` (above) so its locomotion decision
+        // sees same-frame motion state.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(Update, ffxi_actor_render::tick_live_ffxi_actors);
 
         // Server doesn't send an explicit "clear your target" signal —
         // drop Target/LockOn refs to entities that fell out of the

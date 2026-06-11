@@ -38,8 +38,7 @@ use ffxi_viewer_wire::EntityLook;
 
 use crate::components::{EntityModel, LookComp, WorldEntity};
 use crate::dat_mmb::LoadMmbRequest;
-use crate::dat_vos2::{skeleton_file_id_for_race, LoadVos2Request};
-use crate::graphics_settings::{CharacterRenderPath, GraphicsSettings};
+use crate::graphics_settings::GraphicsSettings;
 use crate::scene::TrackedEntities;
 use crate::snapshot::SceneState;
 
@@ -671,14 +670,17 @@ pub fn dispatch_look_driven_models(
     tracked: Res<TrackedEntities>,
     q_changed: Query<(&WorldEntity, &LookComp, Option<&EntityModel>), Changed<LookComp>>,
     load_mmb_tx: MessageWriter<LoadMmbRequest>,
-    mut load_vos2_tx: MessageWriter<LoadVos2Request>,
+    mut load_actor_tx: MessageWriter<crate::ffxi_actor_render::LoadActorRequest>,
     mut commands: Commands,
     settings: Res<GraphicsSettings>,
 ) {
     let Some(zone_id) = state.snapshot.zone_id else {
         return;
     };
-    let ffxi_path = settings.character_path() == CharacterRenderPath::FfxiFaithful;
+    // The faithful actor path is now the only character path; `settings` is
+    // retained for any future Bevy-path toggle but no longer branches the
+    // dispatch.
+    let _ = &settings;
     for (we, look, current_model) in q_changed.iter() {
         // Already showing the right model? Skip.
         if let Some(EntityModel(sig)) = current_model {
@@ -704,90 +706,42 @@ pub fn dispatch_look_driven_models(
             ranged,
         } = look.0
         {
-            // Face mesh: lotus loads this as a 9th DAT alongside the
-            // 8 equipment slots. Its file id is resolved separately
-            // (see `resolve_face`) because face isn't a slot-encoded
-            // u16 like equipment — it's a raw face index 1..=32.
-            let face_file_id = resolve_face(face, race);
-
-            // Iterate slots in canonical order so a slot-by-slot
-            // multi-mesh layout (Stage 4b) stays predictable.
+            // Gather the PC's equipment file_ids in the SAME order/logic the
+            // legacy VOS2 path resolved them: face first (a raw face index
+            // 1..=32, not a slot-encoded u16 — see `resolve_face`), then the
+            // 8 equipment slots in canonical order. The faithful `load_pc`
+            // loads the race skeleton DAT itself and skins each of these onto
+            // it, so we hand it just the resolved file_ids.
+            let mut equipment: Vec<u32> = Vec::new();
+            if let Some(file_id) = resolve_face(face, race) {
+                equipment.push(file_id);
+            }
             let slot_ids = [head, body, hands, legs, feet, main, sub, ranged];
             debug_assert_eq!(slot_ids.len(), EQUIP_SLOT_ORDER_LEN);
-            let mut dispatched = 0;
-            // PCs stay on the CPU bake path (`skeleton_file_id: None`).
-            //
-            // We attempted GPU skinning for PCs (commits 4ccdcd7,
-            // 2f37bfb) but the result regressed visibly: face-up/face-
-            // left orientation, missing legs/feet, half-body — while
-            // the launcher visualizer (which calls `spawn_vos2_meshes`
-            // directly, also CPU-bake) renders the same DAT correctly.
-            // Three runtime iterations on the orientation pivot
-            // (`Q_y(π/2)*Q_x(-π/2)`, then `Q_x(π)`) didn't converge.
-            //
-            // Three intertwined blockers remain unsolved:
-            //   1. Orientation: bone-chain output frame doesn't
-            //      cleanly map to either `bind_to_bevy` or `Q_x(π)`.
-            //      The CPU bake hides this by pre-rotating per-vertex
-            //      via `[p[0], p[2], -p[1]]` after the bake.
-            //   2. Mirror copy: VOS2 ships one symmetric half; CPU
-            //      mirrors by X-flipping post-bake world positions.
-            //      GPU equivalent needs per-vertex `mirror_axis`
-            //      decoding so the flipped vertex re-skins to the
-            //      OTHER-side bone, not the same bone in inverted
-            //      local space.
-            //   3. Bone-table mapping: slot DATs ship `bone_table`
-            //      entries that exceed the race skeleton's bone count
-            //      for some slots (legs/feet). Permissive fallback to
-            //      bone[0] still didn't surface the missing geometry —
-            //      suggests the slot itself isn't even loading.
-            //
-            // The GPU-path code in `dat_vos2::spawn_skinned_actor` is
-            // kept intact for the NPC path (which works) and for
-            // future PC re-enable once #1–#3 are addressed.
-            //
-            // On the FFXI-faithful path, PCs DO skin on the GPU: hand the
-            // race skeleton's file_id to `process_load_vos2_requests_ffxi`
-            // (its dual-position skinning + correct pivot dissolve the
-            // three blockers above). On the Bevy path PCs stay `None`
-            // (CPU bake, as before).
-            let pc_skeleton = if ffxi_path {
-                skeleton_file_id_for_race(race)
-            } else {
-                None
-            };
-            if let Some(file_id) = face_file_id {
-                load_vos2_tx.write(LoadVos2Request {
-                    file_id,
-                    chunk_idx: 4,
-                    entity_id: we.id,
-                    race,
-                    skeleton_file_id: pc_skeleton,
-                });
-                dispatched += 1;
-            }
             for slot in slot_ids {
-                let Some(file_id) = resolve_equipment_slot(slot, race) else {
-                    continue;
-                };
-                load_vos2_tx.write(LoadVos2Request {
-                    file_id,
-                    chunk_idx: 4,
-                    entity_id: we.id,
-                    race,
-                    skeleton_file_id: pc_skeleton,
-                });
-                dispatched += 1;
-            }
-            if dispatched > 0 {
-                info!(
-                    "vos2 dispatch: entity_id={} race={} slots={}",
-                    we.id, race, dispatched
-                );
-                if let Some(&bevy_e) = tracked.by_id.get(&we.id) {
-                    // `try_insert`: actor may despawn between dispatch and flush.
-                    commands.entity(bevy_e).try_insert(EntityModel(look.0));
+                if let Some(file_id) = resolve_equipment_slot(slot, race) {
+                    equipment.push(file_id);
                 }
+            }
+
+            // One faithful render request per entity (replaces the per-slot
+            // VOS2 fan-out). `process_load_actor_requests` builds the rig.
+            load_actor_tx.write(crate::ffxi_actor_render::LoadActorRequest {
+                entity_id: we.id,
+                subject: crate::ffxi_actor_render::ActorSubject::Pc {
+                    race,
+                    equipment: equipment.clone(),
+                },
+            });
+            info!(
+                "actor dispatch (pc): entity_id={} race={} equip={}",
+                we.id,
+                race,
+                equipment.len()
+            );
+            if let Some(&bevy_e) = tracked.by_id.get(&we.id) {
+                // `try_insert`: actor may despawn between dispatch and flush.
+                commands.entity(bevy_e).try_insert(EntityModel(look.0));
             }
             continue;
         }
@@ -806,39 +760,28 @@ pub fn dispatch_look_driven_models(
             continue;
         }
         // NPC actor DAT (lotus-ffxi formula). The skeleton (SK2),
-        // animation library (MO2), and one-or-more body-part OS2s
-        // all live inside this one DAT.
+        // animation library (MO2), and one-or-more body meshes all live
+        // inside this one DAT — the faithful `load_npc` collects them.
         let dat_id = npc_dat_id(modelid);
-        let chunk_indices = crate::dat_vos2::enumerate_vos2_chunks(dat_id);
-        if chunk_indices.is_empty() {
-            // Formula picked a DAT with no OS2 — either the modelid
-            // is out-of-range for the bucket boundaries, or this
+        if crate::dat_vos2::enumerate_vos2_chunks(dat_id).is_empty() {
+            // Formula picked a DAT with no body geometry — either the
+            // modelid is out-of-range for the bucket boundaries, or this
             // entity uses a wrap container we don't yet support
-            // (DOOR/TRANSPORT). Silent skip — `_zone_id` is reserved
-            // for a future per-zone diagnostic toast.
+            // (DOOR/TRANSPORT). Silent skip — `zone_id` is reserved for a
+            // future per-zone diagnostic toast.
             let _ = zone_id;
             continue;
         }
         debug_assert!(tracked.by_id.contains_key(&we.id));
-        // Fire one VOS2 request per body-part chunk. The consumer
-        // dedupes the per-frame skeleton load via the BAKED_SKELETONS
-        // cache (`baked_skeleton_for_file`) so an N-chunk actor only
-        // pays the SK2 parse cost once.
-        for chunk_idx in &chunk_indices {
-            load_vos2_tx.write(LoadVos2Request {
-                file_id: dat_id,
-                chunk_idx: *chunk_idx,
-                entity_id: we.id,
-                race: 0,
-                skeleton_file_id: Some(dat_id),
-            });
-        }
+        // One faithful render request per entity. `process_load_actor_requests`
+        // builds the rig from this single DAT.
+        load_actor_tx.write(crate::ffxi_actor_render::LoadActorRequest {
+            entity_id: we.id,
+            subject: crate::ffxi_actor_render::ActorSubject::Npc { file_id: dat_id },
+        });
         info!(
-            "npc dispatch: entity_id={} modelid={} dat_id={} chunks={}",
-            we.id,
-            modelid,
-            dat_id,
-            chunk_indices.len()
+            "actor dispatch (npc): entity_id={} modelid={} dat_id={}",
+            we.id, modelid, dat_id
         );
         if let Some(&bevy_e) = tracked.by_id.get(&we.id) {
             // `try_insert`: actor may despawn between dispatch and flush.

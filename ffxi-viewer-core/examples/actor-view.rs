@@ -41,9 +41,8 @@ struct OrbitCam {
 fn main() {
     let args: Vec<String> = env::args().collect();
     // Default: a humanoid NPC (a Hume-type townsperson model).
-    let subject = parse_subject(&args).unwrap_or(Subject::Npc(
-        ffxi_viewer_core::look_resolver::npc_dat_id(2),
-    ));
+    let subject = parse_subject(&args)
+        .unwrap_or(Subject::Npc(ffxi_viewer_core::look_resolver::npc_dat_id(2)));
 
     App::new()
         .insert_resource(subject)
@@ -179,7 +178,11 @@ fn orbit_camera(time: Res<Time>, mut q: Query<(&mut Transform, &mut OrbitCam)>) 
         let (sp, cp) = cam.pitch.sin_cos();
         let target = Vec3::new(0.0, cam.target_y, 0.0);
         t.translation = target
-            + Vec3::new(cam.distance * cp * sy, cam.distance * sp, cam.distance * cp * cy);
+            + Vec3::new(
+                cam.distance * cp * sy,
+                cam.distance * sp,
+                cam.distance * cp * cy,
+            );
         t.look_at(target, Vec3::Y);
     }
 }
