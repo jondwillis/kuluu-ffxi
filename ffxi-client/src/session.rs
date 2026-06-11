@@ -3033,7 +3033,12 @@ fn decode_battle2_action(
     };
     let trg_sum = br.read(6).unwrap_or(0) as usize;
     let _res_sum = br.read(4); // unused by client (always 0)
-    let _cmd_no = br.read(4); // command type (4 = spell, 6 = ability, etc.)
+    // ActionCategory (cmd_no, 4 bits). Decides which wire field carries the
+    // resource id for `<spell>`/`<ability>`/`<item>`/`<job>` lookups: on
+    // "Start" actions `cmd_arg` is an animation FourCC and the resource id
+    // rides in the result `param`; on "Finish" actions `cmd_arg` *is* the
+    // resource id. See vendor/server/src/map/enums/action/category.h.
+    let cmd_no = br.read(4).unwrap_or(0) as u8;
     let cmd_arg = match br.read(32) {
         Some(v) => v as u32,
         None => return out,
@@ -3103,6 +3108,7 @@ fn decode_battle2_action(
                     tar_is_pc,
                     value,
                     cmd_arg,
+                    cmd_no,
                 ) {
                     out.push(line);
                 }
@@ -3118,6 +3124,7 @@ fn decode_battle2_action(
                     tar_is_pc,
                     proc_value,
                     cmd_arg,
+                    cmd_no,
                 ) {
                     out.push(line);
                 }
@@ -3132,6 +3139,7 @@ fn decode_battle2_action(
                     tar_is_pc,
                     react_value,
                     cmd_arg,
+                    cmd_no,
                 ) {
                     out.push(line);
                 }
@@ -3140,6 +3148,17 @@ fn decode_battle2_action(
     }
 
     out
+}
+
+/// ActionCategory (0x028 `cmd_no`) values whose action-level `actionid`
+/// (`cmd_arg`) is an animation FourCC rather than a resource id — on these
+/// the spell/item/skill id rides in the result `param` instead. Used to
+/// pick the right `<spell>`/`<item>`/… lookup source so "starts casting"
+/// resolves the same way "casts" does. See
+/// `vendor/server/src/map/enums/action/category.h` (SkillStart=7,
+/// MagicStart=8, ItemStart=9, AbilityStart=10, RangedStart=12).
+fn is_start_category(cmd_no: u8) -> bool {
+    matches!(cmd_no, 7 | 8 | 9 | 10 | 12)
 }
 
 /// Build a single `ChatLine` from a 0x028 result triple. Returns
@@ -3153,8 +3172,18 @@ fn build_battle2_line(
     tar_is_pc: bool,
     amount: u32,
     action_id: u32,
+    category: u8,
 ) -> Option<ChatLine> {
     let raw = template_for_id(message_num)?;
+    // Resource id for `<spell>`/`<ability>`/`<item>`/`<job>`: on Start
+    // actions `action_id` (cmd_arg) is an animation FourCC, so use the
+    // result `param` (== `amount`) where the server stashed the id; on
+    // Finish actions `action_id` is the id itself.
+    let resource_id = if is_start_category(category) {
+        amount
+    } else {
+        action_id
+    };
     let text = substitute_battle_placeholders(
         raw,
         cas_name,
@@ -3164,7 +3193,7 @@ fn build_battle2_line(
         amount,
         0,
         message_num,
-        Some(action_id),
+        Some(resource_id),
     );
     Some(ChatLine {
         channel: ChatChannel::Battle,
@@ -3443,13 +3472,15 @@ fn substitute_battle_placeholders(
         s = s.replace("<skill>", &skill);
     }
     // Vendor-scraped name tables resolve `<spell>`, `<ability>`,
-    // `<item>`, `<job>` against `action_id` (the canonical source on
-    // 0x028 — cmd_arg at the action level) with a `data1` fallback
-    // (the slot Phoenix uses on 0x029 BATTLE_MESSAGE). `<status>`
-    // takes `data1` directly: GainsEffect-family templates pack the
-    // status id into `param` on 0x029. For 0x028 action results the
-    // status id lives in the result's `modifier`/`info` bits, which
-    // `build_battle2_line` does not yet thread through — once those
+    // `<item>`, `<job>` against `action_id` (the caller-selected resource
+    // id) with a `data1` fallback (the slot 0x029 BATTLE_MESSAGE uses,
+    // where `action_id` is `None`). On 0x028 `build_battle2_line` picks
+    // that resource id per ActionCategory — `cmd_arg` for Finish actions,
+    // the result `param` for Start actions where `cmd_arg` is an animation
+    // FourCC. `<status>` takes `data1` directly: GainsEffect-family
+    // templates pack the status id into `param` on 0x029. For 0x028 action
+    // results the status id lives in the result's `modifier`/`info` bits,
+    // which `build_battle2_line` does not yet thread through — once those
     // surface, prefer them over data1.
     //
     // Unknown ids fall back to "spell #N" etc. so the operator at
@@ -5408,6 +5439,53 @@ mod tests {
         assert!(
             l.text.contains("Daisy") && l.text.contains("Fire") && l.text.contains("87"),
             "expected casts/Fire/87 in: {}",
+            l.text
+        );
+    }
+
+    #[test]
+    fn battle2_starts_casting_resolves_spell_from_param() {
+        // StartsCastingTarget (msg 327): "<entity> starts casting <spell>
+        // on <target>." On a MagicStart action (cmd_no = 8) the server puts
+        // an animation FourCC in cmd_arg and the spell id in the result
+        // `param`. The decoder must resolve `<spell>` from `param` (144 =
+        // Fire), NOT from the FourCC — which would miss and fall back to a
+        // raw "spell #N". Counterpart to the MagicFinish case above, where
+        // the spell id lives in cmd_arg instead.
+        use std::collections::HashMap;
+        let mut w = BattleBitWriter::new(8);
+        w.write(0xCAFE, 32);
+        w.write(1, 6); // trg_sum
+        w.write(0, 4); // res_sum
+        w.write(8, 4); // cmd_no = MagicStart
+        w.write(0x68776163, 32); // cmd_arg = animation FourCC (not a spell id)
+        w.write(0, 32);
+        w.write(0xBEEF, 32);
+        w.write(1, 4);
+        w.write(0, 3);
+        w.write(0, 2);
+        w.write(0, 12);
+        w.write(0, 5);
+        w.write(0, 5);
+        w.write(144, 17); // param = SpellID = Fire
+        w.write(327, 10); // message = StartsCastingTarget
+        w.write(0, 31);
+        w.write(0, 1);
+        w.write(0, 1);
+
+        let data = w.into_bytes();
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        cache.insert(0xBEEFu32, "Mandragora".to_string());
+
+        let lines = decode_battle2_action(&data, &cache, &HashMap::new());
+        assert_eq!(lines.len(), 1);
+        let l = &lines[0];
+        assert!(
+            l.text.contains("Daisy")
+                && l.text.contains("Fire")
+                && !l.text.contains("spell #"),
+            "expected resolved 'Fire' (not a raw spell # fallback) in: {}",
             l.text
         );
     }
