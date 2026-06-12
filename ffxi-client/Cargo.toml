@@ -119,7 +119,7 @@ arboard = { version = "3", optional = true, default-features = false }
 # Cocoa / Win32 dialogs. `tokio` satisfies the portal backend's
 # async-runtime requirement; the launcher calls the *blocking* API from
 # the winit main thread (never inside a tokio runtime), so no nesting.
-rfd = { version = "0.15", optional = true, default-features = false, features = [
+rfd = { version = "0.16", optional = true, default-features = false, features = [
     "xdg-portal",
     "tokio",
 ] }
