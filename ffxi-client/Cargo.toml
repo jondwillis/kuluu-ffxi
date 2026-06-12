@@ -130,7 +130,7 @@ ffxi-viewer-core = { path = "../ffxi-viewer-core", optional = true }
 # Relay-only deps. Postcard is the canonical encoding; tokio-tungstenite is
 # the WebSocket server. futures-util gives us the SinkExt/StreamExt traits
 # tungstenite's split sink/stream rely on.
-tokio-tungstenite = { version = "0.24", optional = true }
+tokio-tungstenite = { version = "0.29", optional = true }
 postcard = { version = "1", optional = true, features = ["use-std"] }
 futures-util = { version = "0.3", optional = true }
 
