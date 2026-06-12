@@ -476,32 +476,14 @@ async fn run_map_session(
     // 0x008 lands). Two things wedge the player server-side and must be avoided:
     // sending NETEND (0x00D, a zone-*out* packet) during zone-in, and sending the
     // 0x011 confirmation *before* 0x008 arrives — both were verified to freeze
-    // movement on a live server. Set FFXI_DISABLE_GAMEOK=1 to fall back to the
-    // legacy handshake (functional session, but empty menus) if a server rejects
-    // GAMEOK.
-    let send_gameok = std::env::var_os("FFXI_DISABLE_GAMEOK").is_none();
+    // movement on a live server.
     {
-        let mut payload = Vec::new();
-        if send_gameok {
-            // GAMEOK alone; 0x011 confirm is withheld until 0x008 ENTERZONE.
-            payload.extend(build_subpacket_gameok(sub_seq));
-            sub_seq = sub_seq.wrapping_add(1);
-        } else {
-            // Legacy handshake (no init wave): netend + 0x011 up-front.
-            payload.extend(build_subpacket_netend(sub_seq));
-            sub_seq = sub_seq.wrapping_add(1);
-            payload.extend(build_subpacket_zone_transition(sub_seq));
-            sub_seq = sub_seq.wrapping_add(1);
-        }
+        let payload = build_subpacket_gameok(sub_seq);
+        sub_seq = sub_seq.wrapping_add(1);
         map.send_encrypted(&payload, bundle_seq, server_last_seq)
             .await?;
         bundle_seq = bundle_seq.wrapping_add(1);
-        tracing::info!(
-            send_gameok,
-            bundle_seq,
-            sub_seq,
-            "zone-in handshake bundle sent"
-        );
+        tracing::info!(bundle_seq, sub_seq, "sent 0x00C GAMEOK (zone-in)");
     }
     emit_stage(event_tx, Stage::InZone);
     let _ = event_tx.send(AgentEvent::Diagnostics {
@@ -536,7 +518,6 @@ async fn run_map_session(
         self_pos,
         self_pos_seeded,
         npc_name_resolver,
-        send_gameok,
     )
     .await
 }
@@ -1773,19 +1754,15 @@ async fn keepalive_loop(
     // emission resumes with the now-authoritative coords.
     mut self_pos_seeded: bool,
     mut npc_name_resolver: NpcNameResolver,
-    // True when GAMEOK was sent and the handshake withheld the
-    // `0x011 ZONE_TRANSITION` confirmation: the server only completes zone entry
-    // (and resumes applying our POS) when 0x011 arrives *after* its
-    // `0x008 ENTERZONE` push, not before. False when the legacy handshake already
-    // sent 0x011 up-front; the `zone_transition_sent` latch below then sends it
-    // on the first outbound bundle after 0x008.
-    awaiting_enterzone_confirm: bool,
 ) -> Result<MapOutcome> {
     let mut last_recv = std::time::Instant::now();
-    // GAMEOK-mode 0x011 confirmation state: arm sending once 0x008 ENTERZONE is
-    // seen, then latch so we send it exactly once on the next outbound bundle.
+    // The zone-in handshake sent GAMEOK and withheld the `0x011 ZONE_TRANSITION`
+    // confirmation: the server only completes zone entry (and resumes applying
+    // our POS) when 0x011 arrives *after* its `0x008 ENTERZONE` push, not before.
+    // Arm sending once 0x008 ENTERZONE is seen, then latch so we send 0x011
+    // exactly once on the next outbound bundle.
     let mut enterzone_seen = false;
-    let mut zone_transition_sent = !awaiting_enterzone_confirm;
+    let mut zone_transition_sent = false;
     // Highest server bundle sequence whose sub-packets we've already
     // dispatched. Gates the inbound dispatch so LSB's verbatim bundle
     // retransmits (sent until our ack catches up) don't re-run their
@@ -2775,12 +2752,6 @@ fn build_subpacket_header(opcode: u16, size_words: u16, sync: u16) -> [u8; 4] {
 fn build_subpacket_gameok(sync: u16) -> Vec<u8> {
     let mut buf = vec![0u8; 12];
     buf[0..4].copy_from_slice(&build_subpacket_header(0x00C, 3, sync));
-    buf
-}
-
-fn build_subpacket_netend(sync: u16) -> Vec<u8> {
-    let mut buf = vec![0u8; 8];
-    buf[0..4].copy_from_slice(&build_subpacket_header(0x00D, 2, sync));
     buf
 }
 
