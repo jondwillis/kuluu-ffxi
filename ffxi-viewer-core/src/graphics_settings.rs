@@ -237,6 +237,9 @@ pub enum GraphicsField {
     LightFlicker,
     /// FFXI-flat vs Bevy-realistic lighting for character / entity models.
     CharacterLighting,
+    /// Whether character / entity models receive (and self-cast) the world's
+    /// directional shadows. Drives [`GraphicsSettings::faithful_shadow_receive`].
+    CharacterShadowReceive,
 }
 
 impl GraphicsField {
@@ -269,6 +272,7 @@ impl GraphicsField {
             GraphicsField::LightRange => "  Range",
             GraphicsField::LightFlicker => "  Flicker",
             GraphicsField::CharacterLighting => "Model Lighting",
+            GraphicsField::CharacterShadowReceive => "Model Shadows",
         }
     }
 
@@ -363,6 +367,22 @@ pub struct GraphicsSettings {
     /// pre-existing `graphics.json` on the faithful default.
     #[serde(default)]
     pub realistic_character_lighting: bool,
+    /// Whether character / entity models RECEIVE the world's directional
+    /// cast-shadows (and self-shadow) from the zone sun. `true` (default)
+    /// routes the live cascade shadow map into the skinned shader: the
+    /// realistic branch attenuates its sun term to the ambient floor, and the
+    /// faithful branch dims its sun term toward a soft floor rather than
+    /// cutting it out — faithful's ambient is intentionally low (the 2x
+    /// doubling compensates), so a full cut would crush the model to a black
+    /// silhouette. `false` keeps models flat-lit,
+    /// ignoring world shadows (they still CAST — the depth prepass is
+    /// independent of this flag). Applied each frame by
+    /// `ffxi_actor_render::update_ffxi_render_actor_lighting`, which stamps
+    /// `material_flags.flags.z`. Orthogonal to the quality tier (preset cycles
+    /// preserve it). `#[serde(default = ...)]` lands a pre-existing
+    /// `graphics.json` on the receive-on default.
+    #[serde(default = "default_faithful_shadow_receive")]
+    pub faithful_shadow_receive: bool,
 }
 
 /// Default fine dynamic-light knobs. Kept in lockstep with
@@ -389,6 +409,9 @@ fn default_light_range() -> f32 {
 }
 fn default_light_flicker() -> bool {
     DEFAULT_LIGHT_FLICKER
+}
+fn default_faithful_shadow_receive() -> bool {
+    true
 }
 
 impl Default for GraphicsSettings {
@@ -474,6 +497,7 @@ impl GraphicsSettings {
                 light_flicker: DEFAULT_LIGHT_FLICKER,
                 character_render_path: CharacterRenderPath::FfxiFaithful,
                 realistic_character_lighting: false,
+                faithful_shadow_receive: true,
             },
             QualityPreset::Medium => Self {
                 preset,
@@ -495,6 +519,7 @@ impl GraphicsSettings {
                 light_flicker: DEFAULT_LIGHT_FLICKER,
                 character_render_path: CharacterRenderPath::FfxiFaithful,
                 realistic_character_lighting: false,
+                faithful_shadow_receive: true,
             },
             QualityPreset::High => Self {
                 preset,
@@ -516,6 +541,7 @@ impl GraphicsSettings {
                 light_flicker: DEFAULT_LIGHT_FLICKER,
                 character_render_path: CharacterRenderPath::FfxiFaithful,
                 realistic_character_lighting: false,
+                faithful_shadow_receive: true,
             },
             QualityPreset::Ultra => Self {
                 preset,
@@ -540,6 +566,7 @@ impl GraphicsSettings {
                 light_flicker: DEFAULT_LIGHT_FLICKER,
                 character_render_path: CharacterRenderPath::FfxiFaithful,
                 realistic_character_lighting: false,
+                faithful_shadow_receive: true,
             },
             // Custom: identical to High at construction; the caller
             // mutates fields after. Used by the on-disk loader when
@@ -617,6 +644,9 @@ impl GraphicsSettings {
                 "FFXI"
             }
             .into(),
+            GraphicsField::CharacterShadowReceive => {
+                bool_label(self.faithful_shadow_receive).into()
+            }
         }
     }
 
@@ -640,6 +670,7 @@ impl GraphicsSettings {
                     self.light_flicker,
                 );
                 let realistic = self.realistic_character_lighting;
+                let receive = self.faithful_shadow_receive;
                 let next =
                     cycle_slot(self.preset, PRESET_CYCLE, delta).unwrap_or(QualityPreset::High);
                 *self = Self::for_preset(next);
@@ -650,6 +681,7 @@ impl GraphicsSettings {
                 self.light_range = lr;
                 self.light_flicker = lf;
                 self.realistic_character_lighting = realistic;
+                self.faithful_shadow_receive = receive;
             }
             GraphicsField::ShadowMapSize => {
                 self.shadow_map_size =
@@ -751,6 +783,11 @@ impl GraphicsSettings {
                 // Orthogonal to the quality tier (like Sky/Lights): a model-
                 // lighting preference shouldn't flip the preset to Custom.
                 self.realistic_character_lighting = !self.realistic_character_lighting;
+            }
+            GraphicsField::CharacterShadowReceive => {
+                // Orthogonal to the quality tier (like Model Lighting): a
+                // shadow-receipt preference shouldn't flip the preset to Custom.
+                self.faithful_shadow_receive = !self.faithful_shadow_receive;
             }
         }
     }
@@ -934,6 +971,8 @@ pub const GRAPHICS_FIELDS: &[GraphicsField] = &[
     GraphicsField::LightFlicker,
     // Character/entity model lighting model (FFXI-flat vs Bevy-realistic).
     GraphicsField::CharacterLighting,
+    // Whether models receive / self-cast the world's directional shadows.
+    GraphicsField::CharacterShadowReceive,
 ];
 
 // ---------------------------------------------------------------------------
@@ -977,15 +1016,21 @@ fn bool_label(b: bool) -> &'static str {
 
 /// Build the cascade config from settings. Used at spawn (in
 /// `sun_moon::spawn_sun_and_moon`) and by `apply_cascade_config_system`
-/// on hot apply. First cascade stays tight at 12m for sharp character
-/// self-shadowing; the rest stretch out to `shadow_max_distance`.
+/// on hot apply. The first cascade is kept deliberately TIGHT (8m) so its
+/// full shadow-map resolution is concentrated on the near character and
+/// the ground beneath it — that's what sharpens self-shadow contact and
+/// the cast-shadow edge (a 12m first bound spread the same texels over
+/// ~2x the area, reading "a bit soft"). The remaining cascades stretch out
+/// to `shadow_max_distance`. A slimmer `overlap_proportion` (0.15) further
+/// narrows the blend band between cascades so the crisp near cascade isn't
+/// diluted by the coarser next one right where the character stands.
 pub fn cascade_config_from_settings(s: &GraphicsSettings) -> CascadeShadowConfig {
     CascadeShadowConfigBuilder {
         num_cascades: s.shadow_cascade_count as usize,
         minimum_distance: 0.1,
         maximum_distance: s.shadow_max_distance,
-        first_cascade_far_bound: 12.0,
-        overlap_proportion: 0.2,
+        first_cascade_far_bound: 8.0,
+        overlap_proportion: 0.15,
     }
     .build()
 }
@@ -1462,6 +1507,37 @@ mod tests {
         assert_eq!(s.value_label(GraphicsField::ShadowMaxDistance), "400m");
         assert_eq!(s.value_label(GraphicsField::VolumetricFog), "On");
         assert_eq!(s.value_label(GraphicsField::Fov), "90°");
+    }
+
+    /// Model-shadow receipt must default on for every preset (and `default()`).
+    #[test]
+    fn model_shadows_default_on_for_all_presets() {
+        for &preset in PRESET_CYCLE {
+            assert!(
+                GraphicsSettings::for_preset(preset).faithful_shadow_receive,
+                "preset {preset:?} should default to receiving shadows"
+            );
+        }
+        assert!(GraphicsSettings::default().faithful_shadow_receive);
+    }
+
+    /// Toggling Model Shadows is orthogonal to the quality tier (no Custom
+    /// flip) and survives a preset cycle, like Model Lighting / Sky / Lights.
+    #[test]
+    fn model_shadows_toggle_is_orthogonal() {
+        let mut s = GraphicsSettings::default();
+        assert_eq!(s.value_label(GraphicsField::CharacterShadowReceive), "On");
+        s.cycle(GraphicsField::CharacterShadowReceive, 1);
+        assert!(!s.faithful_shadow_receive);
+        assert_eq!(s.value_label(GraphicsField::CharacterShadowReceive), "Off");
+        assert_eq!(
+            s.preset,
+            QualityPreset::High,
+            "shadow receipt ⟂ quality tier"
+        );
+        // A preset cycle must not silently re-enable it.
+        s.cycle(GraphicsField::Preset, 1); // High → Ultra
+        assert!(!s.faithful_shadow_receive, "preset cycle kept receipt off");
     }
 
     /// reset_to_default snaps any custom state back to the High preset.

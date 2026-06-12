@@ -394,7 +394,7 @@ pub fn spawn_item_detail(mut commands: Commands, mut images: ResMut<Assets<Image
             crate::components::InGameEntity,
             ItemDetailPanel,
             Node {
-                position_type: PositionType::Absolute,
+                position_type: PositionType::Relative,
                 bottom: Val::Px(8.0),
                 left: Val::Px(8.0),
                 width: Val::Px(240.0),
@@ -471,7 +471,7 @@ pub fn spawn_item_detail(mut commands: Commands, mut images: ResMut<Assets<Image
             crate::components::InGameEntity,
             SortOptionsPanel,
             Node {
-                position_type: PositionType::Absolute,
+                position_type: PositionType::Relative,
                 bottom: Val::Px(8.0),
                 left: Val::Px(256.0),
                 width: Val::Px(140.0),

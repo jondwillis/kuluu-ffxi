@@ -1535,10 +1535,26 @@ pub fn update_ffxi_render_actor_lighting(
     // at noon. Map both into the shader's ~0..1 contribution band.
     const AMBIENT_REF_LUX: f32 = 1000.0;
     const DIR_REF_LUX: f32 = 12000.0;
+    // XIM never lets a character crush to pure black. Its
+    // `EnvironmentSection.ambientToColor` brightens dim interior ambient with a
+    // per-channel `colorBias` and the engine always supplies a diffuse light
+    // (indoor key, or the moon at night). Our ambient is lux-driven and the
+    // sun/moon `extract` below falls to zero at night/indoors, so without these
+    // guards the faithful `2 * irradiance` path renders black in dim zones.
+    // Mirror XIM: bias dim ambient up, then floor it so interiors stay legible
+    // (`EnvironmentSection.kt:184-204`, colorBias `[1.4, 1.36, 1.45]`).
+    const COLOR_BIAS: Vec3 = Vec3::new(1.4, 1.36, 1.45);
+    const AMBIENT_BIAS_BELOW: f32 = 0.5;
+    const AMBIENT_FLOOR: f32 = 0.12;
 
     let amb = ambient.color.to_linear();
     let amb_k = (ambient.brightness / AMBIENT_REF_LUX).clamp(0.0, 1.5);
-    let ambient_v = Vec4::new(amb.red * amb_k, amb.green * amb_k, amb.blue * amb_k, 1.0);
+    let mut amb_rgb = Vec3::new(amb.red, amb.green, amb.blue) * amb_k;
+    if amb_rgb.max_element() < AMBIENT_BIAS_BELOW {
+        amb_rgb *= COLOR_BIAS;
+    }
+    amb_rgb = amb_rgb.max(Vec3::splat(AMBIENT_FLOOR));
+    let ambient_v = amb_rgb.extend(1.0);
 
     let extract = |opt: Option<(&DirectionalLight, &GlobalTransform)>| -> (Vec4, Vec4) {
         match opt {
@@ -1564,12 +1580,23 @@ pub fn update_ffxi_render_actor_lighting(
         dir1_dir,
         dir1_color,
         // Zone point lights aren't wired into the faithful path yet; a zeroed
-        // `.w` (range) makes the shader's point loop skip every slot.
+        // `.w` (range) makes the shader's point loop skip every slot. The
+        // faithful `0x47` particle source will populate these (see zone_lights).
         point_pos: [Vec4::ZERO; 4],
         point_color: [Vec4::ZERO; 4],
+        point_atten: [Vec4::ZERO; 4],
     };
 
     let realistic = if settings.realistic_character_lighting {
+        1.0
+    } else {
+        0.0
+    };
+    // flags.z gates directional shadow RECEIVE in the skinned shader (the
+    // "Model Shadows" setting). Stamped every frame — not once at spawn — so a
+    // newly-spawned actor (whose material defaults flags.z = 0) and a runtime
+    // toggle of the setting both take effect on the next frame.
+    let receive = if settings.faithful_shadow_receive {
         1.0
     } else {
         0.0
@@ -1579,8 +1606,77 @@ pub fn update_ffxi_render_actor_lighting(
         for h in &actor.materials {
             if let Some(m) = materials.get_mut(h) {
                 m.lighting = lighting.clone();
-                // Preserve `.x` (has_texture); only drive the realistic flag.
+                // Preserve `.x` (has_texture); drive the realistic + receive flags.
                 m.material_flags.flags.y = realistic;
+                m.material_flags.flags.z = receive;
+            }
+        }
+    }
+}
+
+/// Feed the nearest faithful zone point lights into each actor's light
+/// uniform — the `0x47` particle source for the shader's 4 point slots
+/// ([`crate::zone_point_lights`]). Runs AFTER
+/// [`update_ffxi_render_actor_lighting`], which rewrites the whole uniform
+/// each frame and zeroes the point slots; this then fills
+/// `point_pos/point_color/point_atten` for up to 4 in-range lights.
+///
+/// Selection is the ≤4 nearest lights whose `range` reaches the actor's world
+/// position (an empty/zeroed slot otherwise — the shader's `range <= 0` guard
+/// skips it). Actors take both zone and `'c'` character lights (XIM
+/// characterMode = true) and the `0.5` const-attenuation dampen that makes
+/// point lights affect actors less (`GLDrawer.kt:285-290`).
+pub fn update_ffxi_actor_point_lights(
+    store: Res<crate::zone_point_lights::ZonePointLights>,
+    q_actors: Query<(&FfxiRenderActor, &GlobalTransform)>,
+    mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
+) {
+    // The lighting system already zeroed every slot this frame, so with no
+    // zone lights there is nothing to add.
+    if store.lights.is_empty() {
+        return;
+    }
+    // FFXI applies point lights to actors "less": a 0.5 base (constant)
+    // attenuation term that dampens them relative to zone geometry.
+    const ACTOR_CONST_ATTEN: f32 = 0.5;
+
+    for (actor, gt) in &q_actors {
+        let pos = gt.translation();
+        // Keep the 4 nearest in-range lights by squared distance (no alloc).
+        let mut best: [(f32, usize); 4] = [(f32::INFINITY, usize::MAX); 4];
+        for (i, l) in store.lights.iter().enumerate() {
+            let d2 = pos.distance_squared(l.world_pos);
+            if d2 > l.range * l.range || d2 >= best[3].0 {
+                continue;
+            }
+            best[3] = (d2, i);
+            let mut j = 3;
+            while j > 0 && best[j].0 < best[j - 1].0 {
+                best.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+
+        let mut point_pos = [Vec4::ZERO; 4];
+        let mut point_color = [Vec4::ZERO; 4];
+        let mut point_atten = [Vec4::ZERO; 4];
+        for (slot, &(_, idx)) in best.iter().enumerate() {
+            if idx == usize::MAX {
+                break; // remaining slots stay zeroed (empty)
+            }
+            let l = &store.lights[idx];
+            point_pos[slot] = l.world_pos.extend(0.0);
+            // `.w` carries range (the shader's slot-enable + hard cutoff).
+            point_color[slot] = l.color.extend(l.range);
+            // (const, linear, quad); linear is unused in FFXI's model.
+            point_atten[slot] = Vec4::new(ACTOR_CONST_ATTEN, 0.0, l.attenuation, 0.0);
+        }
+
+        for h in &actor.materials {
+            if let Some(m) = materials.get_mut(h) {
+                m.lighting.point_pos = point_pos;
+                m.lighting.point_color = point_color;
+                m.lighting.point_atten = point_atten;
             }
         }
     }

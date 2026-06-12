@@ -211,7 +211,14 @@ pub fn spawn_sun_and_moon(
             illuminance: 0.0, // Real value set on first tick by sun_moon_system.
             shadows_enabled: true,
             shadow_depth_bias: 0.2,
-            shadow_normal_bias: 1.0,
+            // Lowered from 1.0 → 0.6 to sharpen the cast/self-shadow contact.
+            // `shadow_normal_bias` offsets the shadow lookup along the surface
+            // normal to suppress self-shadow acne, but it does so by detaching
+            // the shadow from the caster — too much reads as a soft, floating
+            // ("peter-panning") edge. Paired with the tighter near cascade in
+            // `cascade_config_from_settings`, 0.6 keeps acne off the curved
+            // character meshes while tightening the contact line.
+            shadow_normal_bias: 0.6,
             ..default()
         },
         cascade_config_from_settings(settings),

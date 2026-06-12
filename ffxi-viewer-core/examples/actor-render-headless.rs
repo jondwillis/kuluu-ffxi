@@ -383,17 +383,24 @@ fn set_inputs(params: Res<Params>, mut q: Query<&mut FfxiRenderActor>) {
     }
 }
 
-/// Mirror the live `update_ffxi_render_actor_lighting` realistic flag onto
-/// every spawned material so `--realistic` exercises the shader's
-/// energy-conserving branch. (The harness has no live graphics-settings
-/// resource; this drives the flag straight from the CLI param.)
+/// Mirror the live `update_ffxi_render_actor_lighting` material flags onto
+/// every spawned material so the CLI exercises the shader's branches. (The
+/// harness has no live graphics-settings resource; this drives the flags
+/// straight from the CLI params.)
+///   * `flags.y` (realistic) ← `--realistic`.
+///   * `flags.z` (receive_shadows) ← `--shadowtest`, so the shadow harness
+///     exercises both the realistic and the faithful soft-receive paths.
 fn apply_realistic_flag(params: Res<Params>, mut materials: ResMut<Assets<FfxiSkinnedMaterial>>) {
-    let flag = if params.realistic { 1.0 } else { 0.0 };
+    let realistic = if params.realistic { 1.0 } else { 0.0 };
+    let receive = if params.shadowtest { 1.0 } else { 0.0 };
     let ids: Vec<_> = materials.ids().collect();
     for id in ids {
         if let Some(m) = materials.get_mut(id) {
-            if m.material_flags.flags.y != flag {
-                m.material_flags.flags.y = flag;
+            if m.material_flags.flags.y != realistic {
+                m.material_flags.flags.y = realistic;
+            }
+            if m.material_flags.flags.z != receive {
+                m.material_flags.flags.z = receive;
             }
         }
     }

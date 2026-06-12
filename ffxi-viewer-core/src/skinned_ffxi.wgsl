@@ -39,6 +39,10 @@ struct FfxiLighting {
     dir1_color: vec4<f32>,
     point_pos: array<vec4<f32>, 4>,
     point_color: array<vec4<f32>, 4>,
+    // Per-point attenuation coefficients `(const, linear, quad)` in xyz (w
+    // unused). XIM's `1/(c + l·d + q·d²)` falloff; actors get `const = 0.5`
+    // (the FFXI "point-lights affect actors less" dampen, GLDrawer.kt:285-290).
+    point_atten: array<vec4<f32>, 4>,
 };
 
 // Mirror of `FfxiJointMatrices` in skinned_ffxi_material.rs. 128 = MAX_JOINTS.
@@ -120,11 +124,23 @@ fn scene_irradiance(n: vec3<f32>, p: vec3<f32>, wrap: f32, sun_scale: f32) -> ve
     let nl1 = max((dot(n, -lighting.dir1_dir.xyz) + wrap) / (1.0 + wrap), 0.0);
     rgb += nl1 * lighting.dir1_color.rgb * lighting.dir1_color.w;
     for (var i = 0u; i < 4u; i = i + 1u) {
+        // `.w` of the color carries the light's range; <= 0 means an empty slot.
         let range = lighting.point_color[i].w;
         if (range > 0.0) {
-            let d = p - lighting.point_pos[i].xyz;
-            let atten = 1.0 / (1.0 + dot(d, d) / (range * range));
-            rgb += atten * lighting.point_color[i].rgb;
+            // XIM's `pointLightCalc` (ShaderConstants.kt:186-198): diffuse N·L,
+            // `1/(c + l·d + q·d²)` falloff, hard-cut past `range`. Vertex color
+            // and the FFXI 2x/texel compositing are applied by the caller, so —
+            // unlike XIM, which folds vertexColor into every light term — this
+            // returns pure light (matching how the dir0/dir1 terms above work).
+            let to_light = lighting.point_pos[i].xyz - p;
+            let dist = length(to_light);
+            if (dist <= range) {
+                let a = lighting.point_atten[i].xyz; // (const, linear, quad)
+                let denom = a.x + a.y * dist + a.z * dist * dist;
+                let dist_factor = select(1.0 / denom, 0.0, denom <= 0.0);
+                let nl = max(dot(n, to_light / max(dist, 1e-5)), 0.0);
+                rgb += nl * dist_factor * lighting.point_color[i].rgb;
+            }
         }
     }
     return rgb;
@@ -161,6 +177,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let has_texture = material_flags.flags.x > 0.5;
     // flags.y selects the realistic (Bevy-scene-driven) lighting model.
     let realistic = material_flags.flags.y > 0.5;
+    // flags.z gates directional cast-shadow / self-shadow RECEIVE (the
+    // "Model Shadows" graphics setting). When off, both branches light the
+    // model with no shadow attenuation (sun term at full strength).
+    let receive_shadows = material_flags.flags.z > 0.5;
     var texel = vec4<f32>(1.0);
     if (has_texture) {
         texel = textureSample(base_tex, base_samp, in.uv);
@@ -173,12 +193,17 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let n = normalize(in.world_normal);
     if (realistic) {
-        // Cast-shadow attenuation for the sun term — ONLY in the realistic
-        // branch. The realistic model is energy-conserving (AMBIENT_FLOOR +
-        // EXPOSURE), so a fully-shadowed fragment fades to the ambient floor,
-        // never pure black. (Receive is deliberately absent from the faithful
-        // branch below — see there.)
-        let sun = sun_shadow_factor(in.world_position, n);
+        // Cast-shadow attenuation for the sun term. The realistic model is
+        // energy-conserving (AMBIENT_FLOOR + EXPOSURE), so a fully-shadowed
+        // fragment fades to the ambient floor, never pure black — it can take
+        // the full 0..1 shadow factor. Gated by the Model Shadows setting
+        // (`receive_shadows`); off → no attenuation (sun = 1.0). An `if` (not
+        // `select`) so the shadow-map sample is actually skipped when off —
+        // `select` evaluates both operands.
+        var sun = 1.0;
+        if (receive_shadows) {
+            sun = sun_shadow_factor(in.world_position, n);
+        }
         // Energy-conserving: albedo (texture * vertex color) lit ONCE by the
         // live scene sun/moon/ambient (+ point lights), with a soft wrap so
         // the unshadowed back side fades instead of clamping to hard black.
@@ -204,15 +229,27 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // FFXI-faithful: flat per-vertex light * vertex color, composited at 2x the
-    // baked-diffuse texel (XIM's `2 * vertexColor * texel`). NO dynamic
-    // shadow-receive here (`sun_scale = 1.0`): real FFXI PCs are flat-lit and do
-    // not receive the world's shadows, and — critically — this model's ambient
-    // is intentionally LOW (the 2x doubling compensates), so attenuating the
-    // dominant sun term to zero on a shadowed fragment collapses the character
-    // to near-black. Receive lives only in the realistic branch above; PCs still
-    // CAST shadows (the depth prepass writes the shadow map regardless of this
-    // branch).
-    let lit = scene_irradiance(n, in.world_position, 0.0, 1.0) * in.color.rgb;
+    // baked-diffuse texel (XIM's `2 * vertexColor * texel`).
+    //
+    // SOFT shadow-receive, gated by the Model Shadows setting (`receive_shadows`
+    // / flags.z). Real FFXI PCs are flat-lit and don't receive the world's
+    // shadows, but a gentle receive grounds the model in the scene. The catch:
+    // this model's ambient is intentionally LOW (the 2x doubling compensates),
+    // so cutting the dominant sun term to ZERO on a shadowed fragment collapses
+    // the character to near-black (the old silhouette regression). So unlike the
+    // realistic branch's full 0..1 factor, dim the sun term only PARTWAY — down
+    // to `FAITHFUL_SHADOW_FLOOR` — giving a soft shade that never crushes to a
+    // silhouette. PCs still CAST shadows regardless (the depth prepass writes the
+    // shadow map independent of this branch).
+    var sun_scale = 1.0;
+    if (receive_shadows) {
+        // Shadowed fragments keep this fraction of the sun term (0 = black,
+        // 1 = no receive). Tuned soft: visible shade without losing the model.
+        let FAITHFUL_SHADOW_FLOOR = 0.45;
+        let sun = sun_shadow_factor(in.world_position, n);
+        sun_scale = mix(FAITHFUL_SHADOW_FLOOR, 1.0, sun);
+    }
+    let lit = scene_irradiance(n, in.world_position, 0.0, sun_scale) * in.color.rgb;
     let rgb = 2.0 * lit * texel.rgb;
     // Opaque output (AlphaMode::Mask already discarded cut-out texels). A sub-1
     // alpha here would let the preview camera composite the character see-

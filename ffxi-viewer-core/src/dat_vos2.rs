@@ -2294,6 +2294,7 @@ pub fn update_ffxi_lighting_system(
         // wired into the faithful path.
         point_pos: [Vec4::ZERO; 4],
         point_color: [Vec4::ZERO; 4],
+        point_atten: [Vec4::ZERO; 4],
     };
 
     // Stamp onto every faithful material. Mutating through `get_mut` flags

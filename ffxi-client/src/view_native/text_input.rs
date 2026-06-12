@@ -18,8 +18,10 @@
 //!  │
 //!  ├──`-`──> Menu       ──Esc(root)──> World
 //!  │
-//!  └──Enter (target=Some) ─> Action::Talk dispatched
-//!  └──Enter (target=None) ─> QuickAction
+//!  ├──Enter (target=None) ─> acquire nearest on-screen (in input.rs);
+//!  │                          if none on-screen ─> QuickAction menu
+//!  ├──Enter (target=NPC, in range) ─> Action::Talk dispatched
+//!  └──Enter (target=combatant) ─> action menu
 //! ```
 //!
 //! World-mode triggers are consumed silently (we don't append the
@@ -220,6 +222,11 @@ pub fn text_input_system(
     let entities = scene_state.snapshot.entities.clone();
     let self_pos = scene_state.snapshot.self_pos.pos;
     let current_target = target.id;
+    // True when something already moved `Target` this frame — in World mode
+    // that's the camera-side Enter-acquire in `handle_input_system` (which
+    // runs before us in the chain). `handle_world_key` uses it to avoid
+    // acting on the same Enter that just acquired the target.
+    let target_changed = target.is_changed();
 
     for ev in events.read() {
         if ev.state != ButtonState::Pressed {
@@ -250,8 +257,8 @@ pub fn text_input_system(
                     current_target,
                     &entities,
                     self_pos,
-                    scene_state.snapshot.self_char_id,
-                    &mut target,
+                    target_changed,
+                    &cmd_tx.0,
                 ) {
                     *mode = next;
                 }
@@ -373,17 +380,23 @@ pub fn dialog_mode_sync_system(state: Res<SceneState>, mut mode: ResMut<InputMod
 }
 
 /// World-mode triggers. Returns `Some(new_mode)` to transition; `None`
-/// to stay in world. Pure router — Enter no longer dispatches Talk
-/// directly (it opens the contextual menu instead), so this function
-/// no longer needs the command sender.
+/// to stay in world.
+///
+/// Enter is "acquire, then act": the no-target *acquire* happens in
+/// `input.rs`'s `handle_input_system` (it owns the camera needed for the
+/// on-screen pick), signalled here by `target_changed`. This handler owns
+/// the *act* on an existing target — Talk for a static NPC (dispatched via
+/// `cmd_tx`), or opening the action menu for a combatant — because opening
+/// a menu must happen on the logical-key path so the same Enter event
+/// isn't re-dispatched into the freshly-opened menu.
 fn handle_world_key(
     key: &Key,
     bindings: &Bindings,
     current_target: Option<u32>,
     entities: &[ffxi_viewer_wire::Entity],
     self_pos: ffxi_viewer_wire::Vec3,
-    self_id: Option<u32>,
-    target: &mut Target,
+    target_changed: bool,
+    cmd_tx: &Sender<AgentCommand>,
 ) -> Option<InputMode> {
     // OpenChat (default Space) stays in this logical-key router rather
     // than moving to input.rs's physical-key path: Space arrives as
@@ -404,63 +417,44 @@ fn handle_world_key(
         return Some(InputMode::Chat(ChatBuffer::empty()));
     }
     if bindings.matches_logical(Action::ConfirmAction, key) {
-        // Enter (default ConfirmAction):
-        // - With a current target → open the contextual menu (FFXI-retail:
-        //   Enter on a target brings up the action ring, not a direct
-        //   Talk). The operator picks Attack/Check/Talk/etc from there.
-        // - With no target + nearby NPC → auto-acquire the NPC (no menu
-        //   yet). The next Enter press will then open the menu against
-        //   that target. This matches the retail "step up to NPC and
-        //   press Enter" muscle-memory.
-        // - With no target + no nearby NPC → open the menu directly.
+        // Enter — "acquire, then act":
+        // - No target, and the camera-side acquire in `handle_input_system`
+        //   just set one this frame (`target_changed`): consume this press;
+        //   the *next* Enter is the "act". This is what keeps acquire and
+        //   act on separate presses (retail / XIM handleDefaultEnter).
+        // - No target, nothing was on-screen to acquire: open the no-target
+        //   action menu (XIM opens the action context when the cycle finds
+        //   nothing).
+        // - Static NPC in range: interact directly (Talk, opcode 0x00) —
+        //   retail talks to the NPC rather than popping the action ring.
+        // - Combatant (mob / PC / pet), or NPC out of range: action menu.
         return match current_target {
-            Some(_) => Some(InputMode::QuickAction(QuickActionState::for_target(true))),
-            None => match nearest_targetable(entities, self_pos, self_id, AUTO_TARGET_RADIUS) {
-                Some(ent) => {
-                    target.id = Some(ent.id);
+            Some(_) if target_changed => None,
+            Some(id) => {
+                let ent = entities.iter().find(|e| e.id == id);
+                let is_npc = matches!(ent.map(|e| e.kind), Some(ffxi_viewer_wire::EntityKind::Npc));
+                let in_range = ent.is_some_and(|e| {
+                    let dx = e.pos.x - self_pos.x;
+                    let dy = e.pos.y - self_pos.y;
+                    let dz = e.pos.z - self_pos.z;
+                    let r = ffxi_viewer_core::hud::action_model::NPC_INTERACT_YALMS;
+                    dx * dx + dy * dy + dz * dz <= r * r
+                });
+                if let (true, true, Some(ent)) = (is_npc, in_range, ent) {
+                    let _ = cmd_tx.try_send(AgentCommand::Action {
+                        target_id: ent.id,
+                        target_index: ent.act_index,
+                        kind: ActionKind::Talk,
+                    });
                     None
+                } else {
+                    Some(InputMode::QuickAction(QuickActionState::for_target(true)))
                 }
-                None => Some(InputMode::QuickAction(QuickActionState::for_target(false))),
-            },
+            }
+            None => Some(InputMode::QuickAction(QuickActionState::for_target(false))),
         };
     }
     None
-}
-
-/// Yalms within which Enter-with-no-target auto-acquires the nearest
-/// NPC. 8 yalms is roughly the retail "interact with NPC" range; the
-/// auto-target should match that so the operator's mental model of
-/// "Enter near an NPC" works the same way it does in-game.
-const AUTO_TARGET_RADIUS: f32 = 8.0;
-
-/// Find the nearest targetable entity within `radius` yalms. Returns
-/// `None` if nothing qualifies — the caller falls back to the
-/// quick-action picker. All non-self entity kinds participate (mobs,
-/// NPCs, other PCs, pets) so Enter-near-a-mob auto-targets it,
-/// matching the retail FFXI muscle memory of "step up, press Enter."
-/// Self is excluded via `self_id` so Enter doesn't silently target
-/// the player's own entity.
-fn nearest_targetable(
-    entities: &[ffxi_viewer_wire::Entity],
-    self_pos: ffxi_viewer_wire::Vec3,
-    self_id: Option<u32>,
-    radius: f32,
-) -> Option<&ffxi_viewer_wire::Entity> {
-    let r2 = radius * radius;
-    entities
-        .iter()
-        .filter(|e| Some(e.id) != self_id)
-        .map(|e| {
-            // 3D distance — matches the server's range check and the
-            // nameplate readout. 2D undercounts altitude on slopes.
-            let dx = e.pos.x - self_pos.x;
-            let dy = e.pos.y - self_pos.y;
-            let dz = e.pos.z - self_pos.z;
-            (e, dx * dx + dy * dy + dz * dz)
-        })
-        .filter(|(_, d2)| *d2 <= r2)
-        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(e, _)| e)
 }
 
 /// Open the vanilla contextual target-action menu over the current

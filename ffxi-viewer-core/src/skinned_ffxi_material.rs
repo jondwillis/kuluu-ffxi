@@ -75,7 +75,13 @@ pub struct FfxiLightingUniform {
     pub dir1_dir: Vec4,
     pub dir1_color: Vec4,
     pub point_pos: [Vec4; 4],
+    /// Per-point RGB color in `xyz`; `w` carries the light's range (and a
+    /// `w <= 0` slot is treated as empty by the shader).
     pub point_color: [Vec4; 4],
+    /// Per-point attenuation `(const, linear, quad)` in `xyz` (`w` unused) for
+    /// XIM's `1/(c + l·d + q·d²)` falloff. Actors set `const = 0.5` (the FFXI
+    /// point-lights-affect-actors-less dampen, `GLDrawer.kt:285-290`).
+    pub point_atten: [Vec4; 4],
 }
 
 impl Default for FfxiLightingUniform {
@@ -91,6 +97,7 @@ impl Default for FfxiLightingUniform {
             dir1_color: Vec4::ZERO,
             point_pos: [Vec4::ZERO; 4],
             point_color: [Vec4::ZERO; 4],
+            point_atten: [Vec4::ZERO; 4],
         }
     }
 }
@@ -130,11 +137,22 @@ impl FfxiJointMatrices {
     }
 }
 
-/// Per-material flags packed into a uniform. `has_texture` is 1.0 when
-/// `base_color_texture` is a real texture and 0.0 for FFXI's untextured
-/// vertex-colored meshes (C/CS ops, e.g. bee wings); the shader then skips the
-/// texture sample + alpha-test and renders the vertex color directly. The
-/// remaining lanes are reserved padding to keep a 16-byte std140 stride.
+/// Per-material flags packed into a uniform, one boolean per lane (`> 0.5`
+/// = on), filling a 16-byte std140 `Vec4`:
+///   * `flags.x` — `has_texture`: 1.0 when `base_color_texture` is real, 0.0
+///     for FFXI's untextured vertex-colored meshes (C/CS ops, e.g. bee
+///     wings); 0.0 makes the shader skip the texture sample + alpha-test and
+///     render the vertex color directly.
+///   * `flags.y` — `realistic`: 1.0 selects the Bevy-scene-driven
+///     energy-conserving lighting model, 0.0 the FFXI-faithful
+///     `2*vertexColor*texel` model (the "Model Lighting" setting).
+///   * `flags.z` — `receive_shadows`: 1.0 routes the directional cascade
+///     shadow map into the lit fragment so the model receives world / self
+///     cast-shadows (the "Model Shadows" setting). The faithful branch dims
+///     toward a soft floor; the realistic branch takes the full factor.
+///   * `flags.w` — reserved padding.
+/// Lanes y/z are stamped each frame by
+/// `ffxi_actor_render::update_ffxi_render_actor_lighting`.
 #[derive(Clone, Debug, ShaderType)]
 pub struct FfxiMaterialFlags {
     pub flags: Vec4,

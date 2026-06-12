@@ -76,6 +76,8 @@ pub mod weather_fx;
 pub mod zone_clouds;
 pub mod zone_lights;
 pub mod zone_lines;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod zone_point_lights;
 
 pub use camera::{
     camera_transition_system, chase_camera_system, configure_gizmo_render_layer,
@@ -248,6 +250,12 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // MMB vertices. PointLights are Enhanced-only; flame sprites
         // show in both styles.
         app.add_plugins(zone_lights::ZoneLightsPlugin);
+        // Faithful dynamic point lights (braziers/lamps/torches) parsed from
+        // the zone's `0x47` particle generators — the retail source for the
+        // character shader's point slots (fed by
+        // `ffxi_actor_render::update_ffxi_actor_point_lights`).
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins(zone_point_lights::ZonePointLightsPlugin);
         // Faithful cloud mesh (the zone's "clod" MMB) — shown + drifted
         // in Retail style; hidden in Enhanced (procedural dome wins).
         app.add_plugins(zone_clouds::ZoneCloudsPlugin);
@@ -419,6 +427,15 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         // `FfxiActor` component and never reached them).
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(Update, ffxi_actor_render::update_ffxi_render_actor_lighting);
+        // Faithful zone point lights into each actor's point slots. Ordered
+        // AFTER the lighting system above, which rewrites the whole uniform
+        // (zeroing the point slots) every frame.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(
+            Update,
+            ffxi_actor_render::update_ffxi_actor_point_lights
+                .after(ffxi_actor_render::update_ffxi_render_actor_lighting),
+        );
 
         // Per-entity motion tracker for combat-stance / locomotion
         // animation selection. Runs *before* `tick_skinned_actors`
