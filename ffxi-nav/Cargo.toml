@@ -9,7 +9,7 @@ build = "build.rs"
 [dependencies]
 pathfinding = "4"
 serde = { workspace = true }
-bincode = "1"
+bincode = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 glam = "0.30"
 thiserror = { workspace = true }
