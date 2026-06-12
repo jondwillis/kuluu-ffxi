@@ -468,21 +468,40 @@ async fn run_map_session(
 
     let mut sub_seq: u16 = 2;
     let mut bundle_seq: u16 = 3;
+    // GAMEOK (0x00C) is the c2s gate that makes the server push the init wave
+    // (job info 0x01B, spells 0x0AA, abilities 0x0AC, merits, inventory) — without
+    // it the Magic/Abilities menus stay empty. The retail-faithful completion is
+    // GAMEOK *alone*: the init wave then pushes `0x008 ENTERZONE`, which the
+    // client answers with `0x011 ZONE_TRANSITION` (sent from keepalive_loop once
+    // 0x008 lands). Two things wedge the player server-side and must be avoided:
+    // sending NETEND (0x00D, a zone-*out* packet) during zone-in, and sending the
+    // 0x011 confirmation *before* 0x008 arrives — both were verified to freeze
+    // movement on a live server. Set FFXI_DISABLE_GAMEOK=1 to fall back to the
+    // legacy handshake (functional session, but empty menus) if a server rejects
+    // GAMEOK.
+    let send_gameok = std::env::var_os("FFXI_DISABLE_GAMEOK").is_none();
     {
-        // GAMEOK (0x00C) goes first — it's the gate that makes LSB push the
-        // init wave (job info, spells 0x0AA, abilities 0x0AC, merits, key
-        // items, inventory). The NETEND/ZONE_TRANSITION that follow are no-ops
-        // server-side but kept for handshake fidelity. The response flood lands
-        // during keepalive_loop and is decoded by the shared handle_sub_packet.
-        let mut payload = build_subpacket_gameok(sub_seq);
-        sub_seq = sub_seq.wrapping_add(1);
-        payload.extend(build_subpacket_netend(sub_seq));
-        sub_seq = sub_seq.wrapping_add(1);
-        payload.extend(build_subpacket_zone_transition(sub_seq));
-        sub_seq = sub_seq.wrapping_add(1);
+        let mut payload = Vec::new();
+        if send_gameok {
+            // GAMEOK alone; 0x011 confirm is withheld until 0x008 ENTERZONE.
+            payload.extend(build_subpacket_gameok(sub_seq));
+            sub_seq = sub_seq.wrapping_add(1);
+        } else {
+            // Legacy handshake (no init wave): netend + 0x011 up-front.
+            payload.extend(build_subpacket_netend(sub_seq));
+            sub_seq = sub_seq.wrapping_add(1);
+            payload.extend(build_subpacket_zone_transition(sub_seq));
+            sub_seq = sub_seq.wrapping_add(1);
+        }
         map.send_encrypted(&payload, bundle_seq, server_last_seq)
             .await?;
         bundle_seq = bundle_seq.wrapping_add(1);
+        tracing::info!(
+            send_gameok,
+            bundle_seq,
+            sub_seq,
+            "zone-in handshake bundle sent"
+        );
     }
     emit_stage(event_tx, Stage::InZone);
     let _ = event_tx.send(AgentEvent::Diagnostics {
@@ -517,6 +536,7 @@ async fn run_map_session(
         self_pos,
         self_pos_seeded,
         npc_name_resolver,
+        send_gameok,
     )
     .await
 }
@@ -1753,8 +1773,19 @@ async fn keepalive_loop(
     // emission resumes with the now-authoritative coords.
     mut self_pos_seeded: bool,
     mut npc_name_resolver: NpcNameResolver,
+    // True when GAMEOK was sent and the handshake withheld the
+    // `0x011 ZONE_TRANSITION` confirmation: the server only completes zone entry
+    // (and resumes applying our POS) when 0x011 arrives *after* its
+    // `0x008 ENTERZONE` push, not before. False when the legacy handshake already
+    // sent 0x011 up-front; the `zone_transition_sent` latch below then sends it
+    // on the first outbound bundle after 0x008.
+    awaiting_enterzone_confirm: bool,
 ) -> Result<MapOutcome> {
     let mut last_recv = std::time::Instant::now();
+    // GAMEOK-mode 0x011 confirmation state: arm sending once 0x008 ENTERZONE is
+    // seen, then latch so we send it exactly once on the next outbound bundle.
+    let mut enterzone_seen = false;
+    let mut zone_transition_sent = !awaiting_enterzone_confirm;
     // Highest server bundle sequence whose sub-packets we've already
     // dispatched. Gates the inbound dispatch so LSB's verbatim bundle
     // retransmits (sent until our ack catches up) don't re-run their
@@ -2336,6 +2367,18 @@ async fn keepalive_loop(
                 // the server's `BlockedState::InEvent` doesn't permanently wedge
                 // /logout + zone-change.
                 let mut payload = Vec::new();
+                // GAMEOK mode: now that 0x008 ENTERZONE has arrived, send the
+                // withheld 0x011 ZONE_TRANSITION confirmation exactly once so the
+                // server completes zone entry and resumes applying our POS.
+                if enterzone_seen && !zone_transition_sent {
+                    payload.extend(build_subpacket_zone_transition(sub_seq));
+                    sub_seq = sub_seq.wrapping_add(1);
+                    zone_transition_sent = true;
+                    tracing::info!(
+                        sub_seq,
+                        "sent 0x011 ZONE_TRANSITION after 0x008 ENTERZONE (GAMEOK mode)"
+                    );
+                }
                 if (!user_driven_events || watchdog_fires) && !pending_event_end.is_empty() {
                     for (unique_no, act_index, event_num) in pending_event_end.drain(..) {
                         payload.extend(build_subpacket_event_end(
@@ -2495,6 +2538,15 @@ async fn keepalive_loop(
                                 terminal_disconnect = true;
                             }
                         } else {
+                            // GAMEOK mode: the init wave's `0x008 ENTERZONE` is
+                            // the cue to send our withheld `0x011 ZONE_TRANSITION`
+                            // confirmation (armed below, sent on the next
+                            // outbound bundle). Seen once is enough.
+                            if !zone_transition_sent
+                                && sub.opcode == ffxi_proto::map::s2c::ENTERZONE
+                            {
+                                enterzone_seen = true;
+                            }
                             // Snapshot the local self-position *before*
                             // dispatching to `handle_sub_packet` — that
                             // handler unconditionally overwrites
