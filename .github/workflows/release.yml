@@ -79,6 +79,12 @@ jobs:
     runs-on: macos-14
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
+      # .cargo/config.toml pins target.aarch64-apple-darwin.rustflags to a
+      # dev-machine lld path (--ld-path=/opt/homebrew/opt/lld/bin/ld64.lld) that
+      # doesn't exist on the runner, breaking the link. RUSTFLAGS (higher cargo
+      # precedence than target.<triple>.rustflags) wins and *replaces* it, so an
+      # empty value drops the lld flag and falls back to the runner's default ld.
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v6
 

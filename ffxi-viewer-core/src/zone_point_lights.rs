@@ -326,6 +326,25 @@ fn animate_faithful_zone_lights(
     }
 }
 
+pub struct ZonePointLightsPlugin;
+
+impl Plugin for ZonePointLightsPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<ZonePointLights>()
+            .init_resource::<ActiveSceneLights>()
+            .add_systems(
+                Update,
+                (
+                    load_zone_point_lights,
+                    sync_faithful_zone_light_entities,
+                    animate_faithful_zone_lights,
+                    build_active_scene_lights,
+                )
+                    .chain(),
+            );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,24 +457,5 @@ mod tests {
             sticky_nearest_point_light_arrays(Vec3::new(5.0, 0.0, 0.0), &lights, &mut selected);
         assert_eq!(color[0].w, 10.0, "within range it enters");
         assert_eq!(selected, vec![Vec3::ZERO]);
-    }
-}
-
-pub struct ZonePointLightsPlugin;
-
-impl Plugin for ZonePointLightsPlugin {
-    fn build(&self, app: &mut App) {
-        app.init_resource::<ZonePointLights>()
-            .init_resource::<ActiveSceneLights>()
-            .add_systems(
-                Update,
-                (
-                    load_zone_point_lights,
-                    sync_faithful_zone_light_entities,
-                    animate_faithful_zone_lights,
-                    build_active_scene_lights,
-                )
-                    .chain(),
-            );
     }
 }

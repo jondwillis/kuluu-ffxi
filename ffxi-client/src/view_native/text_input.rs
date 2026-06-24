@@ -713,9 +713,7 @@ fn handle_abilities_group_key(
     let rows = ffxi_viewer_core::hud::menu::ability_group_rows(&scene_state.snapshot, group);
     let count = rows.len();
 
-    let Some(sub) = state.sub.as_mut() else {
-        return None;
-    };
+    let sub = state.sub.as_mut()?;
     if count > 0 && sub.cursor >= count {
         sub.cursor = count - 1;
     }
@@ -1963,9 +1961,7 @@ fn confirm_menu_at_cursor(
 
     if matches!(kind, MenuKind::Status) {
         use ffxi_viewer_core::hud::status_panel::{StatusEntryKind, STATUS_ENTRIES};
-        let Some(entry) = STATUS_ENTRIES.get(cursor) else {
-            return None;
-        };
+        let entry = STATUS_ENTRIES.get(cursor)?;
         match entry.kind {
             StatusEntryKind::Profile => {
                 status_profile_open.0 = true;

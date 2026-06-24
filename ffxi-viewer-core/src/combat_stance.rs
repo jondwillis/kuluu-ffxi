@@ -692,6 +692,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn move_hysteresis_enter_exit_and_hold() {
         assert!(
             EntityMotion::MOVE_EXIT < EntityMotion::MOVE_ENTER,
@@ -728,6 +729,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn walk_run_boundary_is_sane() {
         use crate::ffxi_actor_render::{infers_walk_gait, WALK_RUN_BOUNDARY};
         assert!(EntityMotion::MOVE_EXIT < WALK_RUN_BOUNDARY);

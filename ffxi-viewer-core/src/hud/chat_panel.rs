@@ -464,19 +464,13 @@ pub fn segment_chat_line(line: &str, base: Color) -> Vec<(String, Color)> {
             }
 
             let mut at = String::from('{');
-            let mut closed = false;
             for ic in chars.by_ref() {
                 at.push(ic);
                 if ic == '}' {
-                    closed = true;
                     break;
                 }
             }
-            if closed {
-                out.push((at, AUTOTRANSLATE_COLOR));
-            } else {
-                out.push((at, AUTOTRANSLATE_COLOR));
-            }
+            out.push((at, AUTOTRANSLATE_COLOR));
         } else {
             buf.push(c);
         }

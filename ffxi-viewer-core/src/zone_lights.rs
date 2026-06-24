@@ -5,6 +5,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::components::InGameEntity;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::dat_mmb::MmbOverlay;
 use crate::graphics_settings::GraphicsSettings;
 
@@ -66,6 +67,7 @@ struct PendingLightScan(VecDeque<Entity>);
 
 const SCAN_BUDGET_PER_FRAME: usize = 24;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn enqueue_light_scan(
     mut pending: ResMut<PendingLightScan>,
     q_new: Query<Entity, Added<MmbOverlay>>,
@@ -245,6 +247,7 @@ fn cluster_overbright(
     out
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn animate_zone_lights(
     time: Res<Time>,
     cfg: Res<ZoneLightConfig>,
@@ -327,17 +330,22 @@ impl Plugin for ZoneLightsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ZoneLightConfig>()
             .init_resource::<PendingLightScan>()
-            .add_systems(Startup, init_flame_assets)
-            .add_systems(
-                Update,
-                (
-                    apply_lights_settings,
-                    enqueue_light_scan,
-                    drain_light_scan,
-                    animate_zone_lights,
-                )
-                    .chain(),
-            );
+            .add_systems(Startup, init_flame_assets);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(
+            Update,
+            (
+                apply_lights_settings,
+                enqueue_light_scan,
+                drain_light_scan,
+                animate_zone_lights,
+            )
+                .chain(),
+        );
+
+        #[cfg(target_arch = "wasm32")]
+        app.add_systems(Update, (apply_lights_settings, drain_light_scan).chain());
     }
 }
 
@@ -373,8 +381,10 @@ mod tests {
 
     #[test]
     fn cold_texels_kept_when_warm_only_off() {
-        let mut cfg = ZoneLightConfig::default();
-        cfg.warm_only = false;
+        let cfg = ZoneLightConfig {
+            warm_only: false,
+            ..Default::default()
+        };
         let colors = vec![[0.3, 0.6, 1.9, 1.0]];
         let positions = vec![[0.0, 0.0, 0.0]];
         assert_eq!(cluster_overbright(&colors, &positions, &cfg).len(), 1);

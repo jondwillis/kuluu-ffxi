@@ -941,14 +941,6 @@ fn select_pose_clips_layered(
     }
 }
 
-#[cfg(test)]
-fn select_pose_clips(
-    animations: &[SkeletonAnimation],
-    selected_id: DatId,
-) -> Vec<SkeletonAnimation> {
-    select_pose_clips_layered(animations, &[], selected_id)
-}
-
 fn rest_clip_len_frames(animations: &[SkeletonAnimation], id: DatId) -> f32 {
     animations
         .iter()
@@ -2170,7 +2162,7 @@ mod pose_resolution_tests {
     fn rest_phase_machine_sequences_in_loop_out() {
         let anims: Vec<SkeletonAnimation> = Vec::new();
         let mut phase = RestPlayback::Inactive;
-        let mut step = |phase: &mut RestPlayback, desired| {
+        let step = |phase: &mut RestPlayback, desired| {
             advance_rest_phase(phase, desired, &anims, 1.0).map(|d| d.as_str())
         };
 
@@ -2267,8 +2259,7 @@ mod pose_resolution_tests {
 
         let anims = vec![synth_anim(b"ind0", 2), synth_anim(b"otd0", 1)];
         let mut m = EngageMachine::NotEngaged;
-        let mut step =
-            |m: &mut EngageMachine, want| advance_engage(m, want, &routines, &anims, 1.0);
+        let step = |m: &mut EngageMachine, want| advance_engage(m, want, &routines, &anims, 1.0);
 
         assert_eq!(step(&mut m, true), S::Engaging);
         assert_eq!(step(&mut m, true), S::Engaging);

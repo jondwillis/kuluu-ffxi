@@ -206,6 +206,7 @@ pub fn parse_action_bytes(bytes: &[u8]) -> (Vec<Scheduler>, ActionAssets) {
     (schedulers, assets)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn dispatch_sound_stages(
     mut events: MessageReader<SchedulerStageEvent>,
     q_actors: Query<&ActionAssets>,
@@ -233,6 +234,7 @@ pub fn dispatch_sound_stages(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn dispatch_motion_stages(
     mut events: MessageReader<SchedulerStageEvent>,
     q_children: Query<&Children>,

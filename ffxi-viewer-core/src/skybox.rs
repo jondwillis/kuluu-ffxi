@@ -202,10 +202,10 @@ fn update_skybox(
                 [lin.red, lin.green, lin.blue, srgb[3]]
             };
             let mut colors = [Vec4::ZERO; 8];
-            for i in 0..8 {
+            for (i, color) in colors.iter_mut().enumerate() {
                 let c0 = to_linear(r0.skybox_colors[i]);
                 let c1 = to_linear(r1.skybox_colors[i]);
-                colors[i] = Vec4::new(
+                *color = Vec4::new(
                     lerp(c0[0], c1[0]),
                     lerp(c0[1], c1[1]),
                     lerp(c0[2], c1[2]),

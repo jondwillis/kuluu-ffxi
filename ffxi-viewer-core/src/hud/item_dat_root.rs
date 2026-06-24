@@ -44,11 +44,7 @@ impl ItemIconCache {
         if self.dat_unavailable {
             return None;
         }
-        let root = match &dat_root.0 {
-            Some(r) => r,
-
-            None => return None,
-        };
+        let root = dat_root.0.as_ref()?;
 
         let loaded = ffxi_dat::item_dat::ITEM_DAT_FILE_ID
             .iter()

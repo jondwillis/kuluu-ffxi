@@ -235,7 +235,7 @@ impl FfxiServer {
             x: p.x,
             y: p.y,
             z: p.z,
-            force: false,
+            force: p.force,
         })
         .await
     }

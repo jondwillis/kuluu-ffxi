@@ -217,8 +217,10 @@ mod tests {
 
     #[test]
     fn preselect_single_account_regardless_of_order() {
-        let mut store = LauncherStore::default();
-        store.accounts = vec![acct("other", "x"), acct("local", "solo")];
+        let store = LauncherStore {
+            accounts: vec![acct("other", "x"), acct("local", "solo")],
+            ..Default::default()
+        };
         assert_eq!(
             store
                 .preselect_account_for("local")
@@ -230,9 +232,10 @@ mod tests {
 
     #[test]
     fn preselect_multi_account_takes_most_recent_front() {
-        let mut store = LauncherStore::default();
-
-        store.accounts = vec![acct("local", "b"), acct("local", "a")];
+        let store = LauncherStore {
+            accounts: vec![acct("local", "b"), acct("local", "a")],
+            ..Default::default()
+        };
         assert_eq!(
             store
                 .preselect_account_for("local")
@@ -262,13 +265,15 @@ mod tests {
 
     #[test]
     fn login_prefill_restores_account_and_profile() {
-        let mut store = LauncherStore::default();
-        store.servers = vec![
-            profile("HXI", "play.horizonxi.com"),
-            profile("local", "127.0.0.1"),
-        ];
-        store.accounts = vec![acct("HXI", "batti"), acct("local", "claude")];
-        store.last_used = Some(("HXI".into(), "batti".into()));
+        let store = LauncherStore {
+            servers: vec![
+                profile("HXI", "play.horizonxi.com"),
+                profile("local", "127.0.0.1"),
+            ],
+            accounts: vec![acct("HXI", "batti"), acct("local", "claude")],
+            last_used: Some(("HXI".into(), "batti".into())),
+            ..Default::default()
+        };
 
         let p = store
             .login_prefill()
@@ -284,26 +289,31 @@ mod tests {
 
     #[test]
     fn login_prefill_none_when_last_used_account_was_forgotten() {
-        let mut store = LauncherStore::default();
-        store.servers = vec![profile("HXI", "play.horizonxi.com")];
-
-        store.accounts = vec![acct("HXI", "someone_else")];
-        store.last_used = Some(("HXI".into(), "batti".into()));
+        let store = LauncherStore {
+            servers: vec![profile("HXI", "play.horizonxi.com")],
+            accounts: vec![acct("HXI", "someone_else")],
+            last_used: Some(("HXI".into(), "batti".into())),
+            ..Default::default()
+        };
         assert!(store.login_prefill().is_none());
     }
 
     #[test]
     fn login_prefill_none_without_last_used() {
-        let mut store = LauncherStore::default();
-        store.accounts = vec![acct("HXI", "batti")];
+        let store = LauncherStore {
+            accounts: vec![acct("HXI", "batti")],
+            ..Default::default()
+        };
         assert!(store.login_prefill().is_none());
     }
 
     #[test]
     fn login_prefill_matches_account_without_a_saved_profile() {
-        let mut store = LauncherStore::default();
-        store.accounts = vec![acct("127.0.0.1", "batti")];
-        store.last_used = Some(("127.0.0.1".into(), "batti".into()));
+        let store = LauncherStore {
+            accounts: vec![acct("127.0.0.1", "batti")],
+            last_used: Some(("127.0.0.1".into(), "batti".into())),
+            ..Default::default()
+        };
         let p = store.login_prefill().expect("account still restorable");
         assert_eq!(p.account.username, "batti");
         assert!(p.profile.is_none());

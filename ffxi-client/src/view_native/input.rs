@@ -213,9 +213,10 @@ pub fn handle_input_system(
         }
     }
     if bindings.just_pressed(Action::ToggleAutorun, &keys)
-        && bindings.pressed(Action::MoveForward, &keys) {
-            autorun.phantom_forward = !autorun.phantom_forward;
-        }
+        && bindings.pressed(Action::MoveForward, &keys)
+    {
+        autorun.phantom_forward = !autorun.phantom_forward;
+    }
     if bindings.just_pressed(Action::ToggleWalk, &keys) {
         walk_mode.walking = !walk_mode.walking;
     }
