@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Callable as a release gate: release.yml runs this against the tagged commit
+  # before building any artifacts.
+  workflow_call:
 
 # Newer pushes to the same ref cancel in-flight runs.
 concurrency:
@@ -14,9 +17,9 @@ permissions:
   contents: read
 
 jobs:
-  # fmt does no compilation, so it gets its own tiny job: it needs neither the
-  # submodules nor the apt/C++ toolchain, finishes in seconds, and runs in
-  # parallel with the heavy job below for fast "you forgot to format" feedback.
+  # fmt compiles nothing — no submodules, no C++ toolchain — so it gets its own
+  # seconds-long job and runs in parallel with the heavier jobs below for fast
+  # "you forgot to format" feedback.
   format:
     name: fmt
     runs-on: ubuntu-latest
@@ -27,33 +30,40 @@ jobs:
           components: rustfmt
       - run: scripts/checks.sh fmt
 
-  # clippy, test, and build all share one warm target/ — the bulk of the time
-  # is compiling the Bevy/wgpu/Recast dependency tree, which happens once and is
-  # reused across the three steps. Splitting them into separate jobs would force
-  # each onto a cold cache (caches only save at job end) and recompile that tree
-  # 3× in parallel — more total compute for marginal latency. So they stay
-  # sequential here; only fmt, which compiles nothing, is hived off above.
-  checks:
-    name: clippy · test · build
+  # clippy (check-mode) and test (codegen) share almost no compiled first-party
+  # artifacts — clippy emits .rmeta that test's codegen can't reuse — so a single
+  # sequential job would just recompile the ffxi-* tree twice back-to-back. They
+  # run as separate parallel jobs instead. Both restore the SAME warm dependency
+  # cache (Swatinem/rust-cache persists the Bevy/wgpu/Recast dep tree, not the
+  # workspace crates), so the expensive tree is a cache hit in each and only the
+  # first-party crates recompile. Wall-clock drops from clippy+test to
+  # max(clippy, test). They share cache-key `ci`: identical dep graph → identical
+  # dep rlibs → one cache, no duplicate storage.
+  #
+  # There is deliberately no `cargo build` job: `cargo test --workspace` already
+  # compiles AND links every lib and bin in normal (non-test) mode on top of the
+  # test harnesses, so it is the compile/link gate for PRs. The real per-OS
+  # --release artifacts are built by release.yml, which this workflow gates — a
+  # dev-profile `cargo build` here would only re-link what test already linked.
+  lint:
+    name: clippy
     runs-on: ubuntu-latest
     # Neutralise the macOS -isysroot CXXFLAGS in the committed .cargo/config.toml
-    # (it is a dev-machine workaround); on Linux it points the C++ Recast bridge
-    # at a non-existent macOS SDK. Cargo's non-forced [env] won't override a var
-    # already present in the environment, so setting it here wins.
+    # (a dev-machine workaround); on Linux it points the C++ Recast bridge at a
+    # non-existent macOS SDK. Cargo's non-forced [env] won't override a var
+    # already in the environment, so setting it here wins.
     env:
       CXXFLAGS: ""
     steps:
       - uses: actions/checkout@v6
-
       - uses: ./.github/actions/setup-build
         with:
           components: clippy
           cache-key: ci
+          # Restore the warm dep cache on every run, but only SAVE from main, so
+          # PR/Cargo.lock churn can't evict the rarely refreshed release-* caches.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Every stage delegates to scripts/checks.sh — the same script the local
-      # pre-push hook runs — so the flags live in exactly one place and CI can't
-      # drift from the gate developers run. Stages stay as separate steps for
-      # per-stage pass/fail reporting in the Actions UI.
       - name: Clippy
         run: scripts/checks.sh clippy
 
@@ -64,8 +74,17 @@ jobs:
         continue-on-error: true
         run: scripts/checks.sh doc
 
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    env:
+      CXXFLAGS: ""
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-build
+        with:
+          cache-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Test
         run: scripts/checks.sh test
-
-      - name: Build
-        run: scripts/checks.sh build

@@ -17,6 +17,16 @@ inputs:
     description: Suffix to distinguish the rust-cache entry between jobs.
     required: false
     default: ""
+  save-if:
+    description: >-
+      Whether this job may SAVE (not just restore) its rust-cache. Pass a
+      branch guard like "${{ github.ref == 'refs/heads/main' }}" for frequently
+      run PR jobs so they restore the warm cache but don't mint a new entry on
+      every Cargo.lock change — that churn evicts the rarely refreshed release
+      caches under GitHub's 10 GB/repo LRU budget. Leave the default for jobs
+      that must keep their own cache fresh (the release artifact builds).
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -107,6 +117,7 @@ runs:
       uses: Swatinem/rust-cache@v2
       with:
         key: ${{ inputs.cache-key }}
+        save-if: ${{ inputs.save-if }}
         # Save the dep/target cache even when a later step (test/build) fails,
         # so an iterative red→green push sequence doesn't recompile the whole
         # Bevy/wgpu/Recast tree cold on every attempt.

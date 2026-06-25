@@ -41,9 +41,20 @@ jobs:
           echo "Releasing tag: ${tag}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
+  # Gate the release on the full CI suite (fmt, clippy, test) re-run against the
+  # tagged commit. For the auto-release-on-main path CI already ran on the main
+  # push, so this is belt-and-suspenders; for a manually pushed tag or
+  # workflow_dispatch on an arbitrary commit it is the only check standing
+  # between an unverified tree and published binaries.
+  ci:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   linux:
     name: Build (x86_64 Linux)
-    needs: setup
+    needs: [setup, ci]
     runs-on: ubuntu-latest
     # Neutralise the macOS -isysroot CXXFLAGS from .cargo/config.toml on Linux
     # (see ci.yml) so the C++ Recast bridge builds.
@@ -73,7 +84,7 @@ jobs:
 
   macos:
     name: Build (aarch64 macOS)
-    needs: setup
+    needs: [setup, ci]
     runs-on: macos-14
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -118,7 +129,7 @@ jobs:
 
   windows:
     name: Build (x86_64 Windows)
-    needs: setup
+    needs: [setup, ci]
     runs-on: windows-latest
     # .cargo/config.toml's [env] pins CXXFLAGS to a macOS -isysroot for the
     # Recast C++ bridge; MSVC's cl.exe can't parse it. Cargo's non-forced [env]
@@ -153,7 +164,7 @@ jobs:
 
   wasm:
     name: Build (browser WASM)
-    needs: setup
+    needs: [setup, ci]
     runs-on: ubuntu-latest
     env:
       CXXFLAGS: ""

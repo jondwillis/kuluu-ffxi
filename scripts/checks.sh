@@ -8,7 +8,8 @@
 #
 # Usage: scripts/checks.sh <stage>...   stage ∈ {fmt, clippy, test, build, doc}
 #   scripts/checks.sh fmt clippy              # pre-push default
-#   scripts/checks.sh fmt clippy test build   # full CI gate
+#   scripts/checks.sh fmt clippy test         # the CI gate (ci.yml runs these)
+#   scripts/checks.sh build                   # local-only: see run_build below
 #
 # Each stage is a separate argument so callers (notably CI) can run them as
 # distinct steps for per-stage pass/fail reporting while still sharing flags.
@@ -56,7 +57,11 @@ run_test() {
 }
 
 run_build() {
-  # Same flags the release build uses, so a broken release surfaces early.
+  # Local-only convenience: a dev-profile, non-test compile+link of the whole
+  # workspace. CI does NOT run this — `cargo test` already compiles and links
+  # every lib/bin (so it is the CI compile gate), and release.yml builds the
+  # real per-OS --release artifacts. This is a fast local proxy for the latter,
+  # but note it is dev-profile/Cranelift, not the release LLVM build.
   cargo build --workspace --locked "${FEATURES[@]}"
 }
 
