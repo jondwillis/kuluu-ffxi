@@ -57,6 +57,18 @@ runs:
         # checkout it just bloats target/ and slows the rust-cache save/restore.
         echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
 
+    # Windows-only git hardening, applied before the submodule checkout below.
+    # autocrlf=false keeps the LSB SQL/lua/header build inputs byte-identical to
+    # Linux/macOS so the build.rs scrapers parse the same bytes on every OS;
+    # longpaths=true avoids the MAX_PATH (260-char) checkout failures the deep
+    # vendor/server tree otherwise hits. No-ops on Linux/macOS runners.
+    - name: Configure git for Windows checkouts
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        git config --global core.autocrlf false
+        git config --global core.longpaths true
+
     - name: Rewrite SSH submodule URLs to HTTPS
       shell: bash
       run: git config --global url."https://github.com/".insteadOf "git@github.com:"

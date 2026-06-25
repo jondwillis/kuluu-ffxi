@@ -54,19 +54,16 @@ jobs:
         with:
           cache-key: release-linux
 
-      - name: Build binaries
-        run: |
-          cargo build --release --locked -p ffxi-client --features native-window
-          cargo build --release --locked -p ffxi-mcp
+      - name: Build binary
+        run: cargo build --release --locked -p ffxi-client --features native-window
 
       - name: Package
         env:
           TAG: ${{ needs.setup.outputs.tag }}
         run: |
           mkdir -p dist
-          strip target/release/ffxi-client target/release/ffxi-mcp target/release/ffxi-mcp-repl
+          strip target/release/ffxi-client
           tar -C target/release -czf "dist/ffxi-client-${TAG}-x86_64-linux.tar.gz" ffxi-client
-          tar -C target/release -czf "dist/ffxi-mcp-${TAG}-x86_64-linux.tar.gz" ffxi-mcp ffxi-mcp-repl
 
       - uses: actions/upload-artifact@v7
         with:
@@ -99,27 +96,58 @@ jobs:
         with:
           cache-key: release-macos
 
-      - name: Build binaries
-        run: |
-          cargo build --release --locked -p ffxi-client --features native-window
-          cargo build --release --locked -p ffxi-mcp
+      - name: Build binary
+        run: cargo build --release --locked -p ffxi-client --features native-window
 
       - name: Package
         env:
           TAG: ${{ needs.setup.outputs.tag }}
         run: |
           mkdir -p dist
-          bins="target/release/ffxi-client target/release/ffxi-mcp target/release/ffxi-mcp-repl"
-          strip $bins
+          strip target/release/ffxi-client
           # strip invalidates the linker's ad-hoc signature on arm64, which makes
           # the binary fail to launch ("killed: 9"); re-sign ad-hoc to restore it.
-          codesign --force --sign - $bins
+          codesign --force --sign - target/release/ffxi-client
           tar -C target/release -czf "dist/ffxi-client-${TAG}-aarch64-macos.tar.gz" ffxi-client
-          tar -C target/release -czf "dist/ffxi-mcp-${TAG}-aarch64-macos.tar.gz" ffxi-mcp ffxi-mcp-repl
 
       - uses: actions/upload-artifact@v7
         with:
           name: macos
+          path: dist/*
+
+  windows:
+    name: Build (x86_64 Windows)
+    needs: setup
+    runs-on: windows-latest
+    # .cargo/config.toml's [env] pins CXXFLAGS to a macOS -isysroot for the
+    # Recast C++ bridge; MSVC's cl.exe can't parse it. Cargo's non-forced [env]
+    # yields to a var already in the environment (same trick as ci.yml on
+    # Linux), so an empty value here wins and the bridge builds against the
+    # runner's MSVC toolchain. No RUSTFLAGS override is needed: the lld link-arg
+    # in .cargo/config.toml is scoped to target.aarch64-apple-darwin only.
+    env:
+      CXXFLAGS: ""
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-build
+        with:
+          cache-key: release-windows
+
+      - name: Build binary
+        run: cargo build --release --locked -p ffxi-client --features native-window
+
+      - name: Package
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+        # Default shell on windows-latest is PowerShell. MSVC emits debug info
+        # into a separate .pdb, so the .exe ships lean without a strip step.
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/ffxi-client.exe -DestinationPath "dist/ffxi-client-$env:TAG-x86_64-windows.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
           path: dist/*
 
   wasm:
@@ -158,7 +186,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [setup, linux, macos, wasm]
+    needs: [setup, linux, macos, windows, wasm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
