@@ -1,8 +1,9 @@
 name: Auto Release on Version Bump
 
-# When the workspace version in Cargo.toml increases on main, tag it (bare
-# semver, no "v" prefix) and run the release pipeline. A manually pushed tag
-# triggers release.yml directly instead and is unaffected by this workflow.
+# When the workspace version in Cargo.toml increases on main, tag it
+# (v-prefixed semver, e.g. v0.2.0) and run the release pipeline. A manually
+# pushed tag triggers release.yml directly instead and is unaffected by this
+# workflow.
 on:
   push:
     branches: [main]
@@ -27,18 +28,19 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version=1 \
             | jq -r '.packages[] | select(.name=="ffxi-client") | .version')
-          echo "Workspace version: ${version}"
-          if git rev-parse "refs/tags/${version}" >/dev/null 2>&1; then
-            echo "Tag ${version} already exists — no release."
+          tag="v${version}"
+          echo "Workspace version: ${version} (tag ${tag})"
+          if git rev-parse "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists — no release."
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
             git config user.name  "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git tag "${version}"
-            git push origin "${version}"
-            echo "Created and pushed tag ${version}."
+            git tag "${tag}"
+            git push origin "${tag}"
+            echo "Created and pushed tag ${tag}."
             echo "release=true" >> "$GITHUB_OUTPUT"
-            echo "tag=${version}" >> "$GITHUB_OUTPUT"
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           fi
 
   # A tag pushed by GITHUB_TOKEN does NOT re-trigger release.yml's push event,

@@ -1,9 +1,10 @@
 name: Release
 
 on:
-  # Manual semver tag (no leading "v"), e.g. `git push origin 0.2.0`.
+  # Manual v-prefixed semver tag, e.g. `git push origin v0.2.0`. The trailing *
+  # also admits prerelease/build suffixes like v0.2.0-rc1 or v0.0.0-wintest.
   push:
-    tags: ['[0-9]+.[0-9]+.[0-9]+*']
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
   # Called by auto-release-on-main.yml after a version-bump-driven tag.
   workflow_call:
     inputs:
