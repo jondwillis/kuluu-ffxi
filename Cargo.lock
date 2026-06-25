@@ -3004,7 +3004,7 @@ dependencies = [
 
 [[package]]
 name = "ffxi-actor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ffxi-dat",
  "glam",
@@ -3012,7 +3012,7 @@ dependencies = [
 
 [[package]]
 name = "ffxi-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hound",
  "thiserror 2.0.18",
@@ -3020,7 +3020,7 @@ dependencies = [
 
 [[package]]
 name = "ffxi-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "ffxi-dat"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rayon",
@@ -3066,14 +3066,14 @@ dependencies = [
 
 [[package]]
 name = "ffxi-event"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ffxi-dat",
 ]
 
 [[package]]
 name = "ffxi-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ffxi-client",
@@ -3089,7 +3089,7 @@ dependencies = [
 
 [[package]]
 name = "ffxi-nav"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3103,7 +3103,7 @@ dependencies = [
 
 [[package]]
 name = "ffxi-nav-recast"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "ffxi-nav",
@@ -3117,7 +3117,7 @@ dependencies = [
 
 [[package]]
 name = "ffxi-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "md-5",
@@ -3126,7 +3126,7 @@ dependencies = [
 
 [[package]]
 name = "ffxi-viewer-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "bevy",
@@ -3143,7 +3143,7 @@ dependencies = [
 
 [[package]]
 name = "ffxi-viewer-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bevy",
  "console_error_panic_hook",
@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "ffxi-viewer-wire"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "postcard",
  "serde",
@@ -8391,7 +8391,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "yazi"
