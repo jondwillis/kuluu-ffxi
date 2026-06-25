@@ -20,11 +20,13 @@ inputs:
   save-if:
     description: >-
       Whether this job may SAVE (not just restore) its rust-cache. Pass a
-      branch guard like "${{ github.ref == 'refs/heads/main' }}" for frequently
+      branch-guard expression (true only on refs/heads/main) for frequently
       run PR jobs so they restore the warm cache but don't mint a new entry on
       every Cargo.lock change — that churn evicts the rarely refreshed release
       caches under GitHub's 10 GB/repo LRU budget. Leave the default for jobs
       that must keep their own cache fresh (the release artifact builds).
+      NOTE: keep example expressions out of this text — a literal ${X} here is
+      parsed by the Actions template engine and fails to validate.
     required: false
     default: "true"
 
