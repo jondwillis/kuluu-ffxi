@@ -8,6 +8,7 @@ const ROOT_ENTRIES: &[&str] = &[
     "Magic",
     "Abilities",
     "Items",
+    "Key Items",
     "Equipment",
     "Status",
     "Party",
