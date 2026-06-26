@@ -11,6 +11,7 @@ pub mod event_dat;
 pub mod event_locate;
 pub mod ftable;
 pub mod generator;
+pub mod install_detect;
 pub mod item_dat;
 pub mod kind;
 pub mod main_dll;
