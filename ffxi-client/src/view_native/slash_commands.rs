@@ -190,6 +190,25 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 },
             },
             Command {
+                aliases: &["dig"],
+                usage: "",
+                summary: "chocobo dig at current position (must be mounted on a chocobo)",
+                handler: |c| {
+                    let self_id = c.self_char_id.unwrap_or(0);
+                    let self_index = c
+                        .entities
+                        .iter()
+                        .find(|e| e.id == self_id)
+                        .map(|e| e.act_index)
+                        .unwrap_or(0);
+                    SlashOutcome::Command(AgentCommand::Action {
+                        target_id: self_id,
+                        target_index: self_index,
+                        kind: ActionKind::ChocoboDig,
+                    })
+                },
+            },
+            Command {
                 aliases: &["assist"],
                 usage: "[name]",
                 summary: "assist target (inherit their target)",
@@ -2751,6 +2770,22 @@ mod tests {
         assert!(matches!(
             parse_slash_t("/targetnpc", &entities, origin(), Some(3), None),
             SlashOutcome::SetTarget(Some(1))
+        ));
+    }
+
+    #[test]
+    fn dig_targets_self() {
+        let mut me = ent(42, "Me", EntityKind::Pc, 0.0, 0.0);
+        me.act_index = 7;
+        let entities = vec![me, ent(1, "Goblin", EntityKind::Mob, 3.0, 0.0)];
+        let outcome = parse_slash("/dig", &entities, origin(), Some(1), None, Some(42), &[]);
+        assert!(matches!(
+            outcome,
+            SlashOutcome::Command(AgentCommand::Action {
+                target_id: 42,
+                target_index: 7,
+                kind: ActionKind::ChocoboDig,
+            })
         ));
     }
 
