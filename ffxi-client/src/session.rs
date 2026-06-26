@@ -860,6 +860,14 @@ fn handle_sub_packet(
             let recasts = decode_abil_recast(sub.data);
             let _ = event_tx.send(AgentEvent::AbilityRecastsUpdated { recasts });
         }
+        op if op == s2c::SCENARIO_ITEM => {
+            if let Ok(ki) = decode::ScenarioItem::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::KeyItemsUpdated {
+                    table_index: ki.table_index,
+                    ids: ki.owned_key_item_ids(),
+                });
+            }
+        }
         op if op == s2c::EVENT => {
             if let Some(dialog) = decode_event_0x032(sub.data) {
                 emit_event_dialog(event_tx, &dialog, pending_event_end, name_cache);

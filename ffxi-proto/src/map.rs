@@ -114,6 +114,8 @@ pub mod s2c {
 
     pub const SYSTEMMES: u16 = 0x053;
 
+    pub const SCENARIO_ITEM: u16 = 0x055;
+
     pub const WEATHER: u16 = 0x057;
 
     pub const MUSIC: u16 = 0x05F;

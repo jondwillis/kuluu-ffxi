@@ -1906,6 +1906,9 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
         (MenuKind::Root, "Magic") => MenuDispatch::OpenSubmenu(MenuKind::Magic),
         (MenuKind::Root, "Abilities") => MenuDispatch::OpenSubmenu(MenuKind::Abilities),
         (MenuKind::Root, "Items") => MenuDispatch::OpenSubmenu(MenuKind::Items),
+        (MenuKind::Root, "Key Items") => {
+            MenuDispatch::NotImplemented("Key Items — pending submenu (s2c 0x055 decoded)".into())
+        }
         (MenuKind::Root, "Equipment") => MenuDispatch::OpenSubmenu(MenuKind::Equipment),
 
         (MenuKind::Root, "Status") => MenuDispatch::OpenSubmenu(MenuKind::Status),

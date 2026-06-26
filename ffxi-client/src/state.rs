@@ -303,9 +303,14 @@ pub struct SessionState {
 
     #[serde(default)]
     pub pet_abilities_known: Vec<u16>,
+
+    #[serde(default)]
+    pub key_items: Vec<u16>,
 }
 
 pub const EQUIPMENT_SLOTS: usize = 16;
+
+pub const KEY_ITEMS_PER_TABLE: usize = ffxi_proto::decode::ScenarioItem::BITS_PER_TABLE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EquippedRef {
@@ -802,6 +807,15 @@ impl SessionState {
                 self.job_abilities_known = job_abilities.clone();
                 self.pet_abilities_known = pet_abilities.clone();
             }
+            AgentEvent::KeyItemsUpdated { table_index, ids } => {
+                let base = *table_index as usize * KEY_ITEMS_PER_TABLE;
+                let table_range = base..base + KEY_ITEMS_PER_TABLE;
+                self.key_items
+                    .retain(|id| !table_range.contains(&(*id as usize)));
+                self.key_items.extend(ids.iter().copied());
+                self.key_items.sort_unstable();
+                self.key_items.dedup();
+            }
 
             AgentEvent::EventStart { .. } | AgentEvent::KeyRotated { .. } => {}
             AgentEvent::EventDialog { dialog } => {
@@ -1001,6 +1015,11 @@ pub enum AgentEvent {
         weapon_skills: Vec<u16>,
         job_abilities: Vec<u16>,
         pet_abilities: Vec<u16>,
+    },
+
+    KeyItemsUpdated {
+        table_index: u16,
+        ids: Vec<u16>,
     },
 
     ReactorGoalChanged {
@@ -1415,6 +1434,26 @@ mod tests {
             to: 231,
         });
         assert_eq!(s.current_weather, None);
+    }
+
+    #[test]
+    fn key_items_merge_across_tables_and_replace_in_place() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::KeyItemsUpdated {
+            table_index: 0,
+            ids: vec![1, 5],
+        });
+        s.apply_event(&AgentEvent::KeyItemsUpdated {
+            table_index: 1,
+            ids: vec![KEY_ITEMS_PER_TABLE as u16],
+        });
+        assert_eq!(s.key_items, vec![1, 5, KEY_ITEMS_PER_TABLE as u16]);
+
+        s.apply_event(&AgentEvent::KeyItemsUpdated {
+            table_index: 0,
+            ids: vec![5],
+        });
+        assert_eq!(s.key_items, vec![5, KEY_ITEMS_PER_TABLE as u16]);
     }
 
     #[test]
