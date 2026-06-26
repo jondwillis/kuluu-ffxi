@@ -1,0 +1,78 @@
+# dist `github-build-setup` fragment — a YAML *array of steps* (not a full
+# workflow) injected into dist's build-local-artifacts job after checkout and
+# before `dist build`. dist does its own checkout + Rust toolchain install, so
+# this only supplies what dist won't: the build submodules and the per-OS env
+# the hand-rolled release.yml carried inline. Keep the rationale here — this is
+# where release.yml:59-141's WHY lives once that file is deleted.
+
+# .gitmodules declares the vendor submodules with git@ SSH URLs; rewrite the
+# public LandSandBoat repo to HTTPS so no SSH key is needed on the runner.
+- name: Rewrite SSH submodule URLs to HTTPS
+  shell: bash
+  run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+# REQUIRED — vendor/server (LSB) is read at build time by the ffxi-proto /
+# ffxi-nav / ffxi-dat build.rs scripts; the build PANICS without it. dist's
+# plain checkout does not init submodules, so every leg fails at compile time
+# unless this runs. --depth 1: build.rs reads files, never history.
+- name: Initialise build submodules
+  shell: bash
+  run: git submodule update --init --depth 1 vendor/server vendor/AltanaListener vendor/POLUtils
+
+# The Bevy/wgpu/Recast artifacts are large; reclaim the big preinstalled
+# toolchains the Rust build never touches so `ld` doesn't SIGBUS on a full disk.
+- name: Free disk space (Linux)
+  if: runner.os == 'Linux'
+  uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+  with:
+    android: true
+    dotnet: true
+    haskell: true
+    large-packages: false
+    docker-images: false
+    swap-storage: false
+    tool-cache: false
+
+# Mirrors docker/Dockerfile.linux-build. macOS/Windows runners ship the C/C++
+# toolchain (Xcode / MSVC); only Linux needs the system -dev packages for the
+# Recast C++ bridge and Bevy's audio/windowing/GL backends.
+- name: Install Linux system dependencies
+  if: runner.os == 'Linux'
+  shell: bash
+  run: |
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends \
+      build-essential clang cmake pkg-config \
+      libasound2-dev libudev-dev libdbus-1-dev \
+      libwayland-dev libxkbcommon-dev \
+      libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+      libgl1-mesa-dev libc6-dev
+
+# .cargo/config.toml's [env] pins CXXFLAGS to a dev-machine -isysroot for the
+# Recast C++ bridge. That [env] is non-forced, so a value already present in
+# the environment wins. On Linux/Windows the dev -isysroot is wrong (clang /
+# cl.exe can't use it) — clear it so the bridge builds against the system SDK.
+- name: Neutralise dev CXXFLAGS (Linux/Windows Recast bridge)
+  if: runner.os != 'macOS'
+  shell: bash
+  run: echo "CXXFLAGS=" >> "$GITHUB_ENV"
+
+# On macOS, point CXXFLAGS at the runner's actual SDK instead of the dev path.
+- name: Point CXXFLAGS at the runner SDK (macOS Recast bridge)
+  if: runner.os == 'macOS'
+  shell: bash
+  run: echo "CXXFLAGS=-isysroot $(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+
+# .cargo/config.toml pins target.aarch64-apple-darwin.rustflags to a dev-machine
+# lld path (--ld-path=/opt/homebrew/opt/lld/bin/ld64.lld) absent on the runner.
+# RUSTFLAGS has higher precedence than target.<triple>.rustflags and *replaces*
+# it, so an empty value drops the lld flag and falls back to the runner's ld.
+- name: Clear RUSTFLAGS (macOS — drop dev lld path)
+  if: runner.os == 'macOS'
+  shell: bash
+  run: echo "RUSTFLAGS=" >> "$GITHUB_ENV"
+
+- name: Pin MACOSX_DEPLOYMENT_TARGET
+  if: runner.os == 'macOS'
+  shell: bash
+  run: echo "MACOSX_DEPLOYMENT_TARGET=14.0" >> "$GITHUB_ENV"

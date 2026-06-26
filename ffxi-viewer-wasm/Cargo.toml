@@ -49,3 +49,8 @@ web-sys = { version = "0.3", features = ["Location", "UrlSearchParams", "Window"
 
 ffxi-viewer-wire = { path = "../ffxi-viewer-wire" }
 ffxi-viewer-core = { path = "../ffxi-viewer-core" }
+
+# The browser bundle is built by trunk in the release-wasm custom job, not by
+# dist's cargo-build path — exclude it from dist's binary discovery.
+[package.metadata.dist]
+dist = false

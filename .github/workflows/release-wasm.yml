@@ -1,0 +1,63 @@
+name: release-wasm
+
+# dist `global-artifacts-jobs = ["./release-wasm"]` custom job. dist cannot
+# build a trunk/wasm bundle, so it calls this reusable workflow during the
+# build-global-artifacts phase and attaches the uploaded zip to the same
+# GitHub Release as the native archives + installers.
+#
+# Mirrors the wasm leg the hand-rolled release.yml carried. The `artifacts-*`
+# upload name is dist's collection convention (its host job downloads
+# `artifacts*` with merge-multiple). The exact collection wiring is confirmed
+# by the `v0.0.0-disttest` dry-run before the hand-rolled release.yml is
+# deleted — see bead kuluu-0kz.
+on:
+  workflow_call:
+    inputs:
+      # dist passes the plan (a JSON dist-manifest) to every custom job; we
+      # don't need it to build the bundle, but the contract requires it.
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-wasm:
+    name: Build browser WASM bundle
+    runs-on: ubuntu-latest
+    # Neutralise the dev-machine -isysroot CXXFLAGS from .cargo/config.toml so
+    # any C/C++ in the dependency graph builds against the runner toolchain.
+    env:
+      CXXFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reuse the shared composite: SSH→HTTPS rewrite, submodule init (REQUIRED
+      # — build.rs panics without vendor/server), disk-free, Linux deps, and a
+      # cached Rust toolchain with the wasm target. This job is separate from
+      # dist's build-local-artifacts job, so the github-build-setup fragment
+      # does NOT reach it — it must set itself up independently.
+      - uses: ./.github/actions/setup-build
+        with:
+          targets: wasm32-unknown-unknown
+          cache-key: release-wasm
+
+      # Trunk auto-downloads matching wasm-bindgen-cli and wasm-opt at build time.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+
+      - name: Build WASM bundle
+        working-directory: ffxi-viewer-wasm
+        run: trunk build --release
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          ( cd ffxi-viewer-wasm/dist && zip -r "../../dist/ffxi-viewer-wasm.zip" . )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-wasm
+          path: dist/ffxi-viewer-wasm.zip

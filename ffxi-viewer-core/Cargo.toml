@@ -3,6 +3,12 @@ name = "ffxi-viewer-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+
+# Ships dev-only bins (dump-motion-dat, dump-skybox, ffxi-skin-probe), so dist
+# would otherwise package it — only ffxi-client is a shipped artifact.
+[package.metadata.dist]
+dist = false
 
 # Bevy ECS plugins, world model, camera, and HUD shared by both the native
 # windowed viewer (ffxi-client/src/view_native/) and the browser viewer

@@ -3,7 +3,16 @@ name = "ffxi-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+# dist's MSI (WiX) installer requires an authors field on the shipped package.
+authors.workspace = true
 description = "TUI/agent-driven client for LSB/Phoenix FFXI private servers."
+
+[package.metadata.wix]
+upgrade-guid = "8A763252-3E78-40EC-892D-5F38AEBE713C"
+path-guid = "A4A3BB3C-3670-45CA-AD4F-6A74AFEFEE0F"
+license = false
+eula = false
 
 [lib]
 path = "src/lib.rs"

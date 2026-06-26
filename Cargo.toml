@@ -83,3 +83,41 @@ schemars = "1"
 # Test fixtures: direct MariaDB access so each integration test can stamp
 # out an isolated account+char and clean up after itself.
 mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
+
+# ---------------------------------------------------------------------------
+# Release packaging via dist (cargo-dist). dist OWNS the generated
+# .github/workflows/release.yml once `dist generate` runs; until the throwaway
+# `v0.0.0-disttest` dry-run validates the pipeline, the hand-rolled release.yml
+# still ships and this config is inert. Config lives here (not a separate
+# dist-workspace.toml) so the auto-release version-bump tooling keeps reading a
+# single file. Only ffxi-client ships — every other bin crate sets
+# `[package.metadata.dist] dist = false`.
+[workspace.metadata.dist]
+cargo-dist-version = "0.32.0"
+ci = ["github"]
+# Bare archives + the installers Windows/Unix users expect. Homebrew is
+# deferred until a tap repo + HOMEBREW_TAP_TOKEN exist.
+installers = ["shell", "powershell", "msi"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+# Mirror the hand-rolled legs' `cargo build -p ffxi-client --features native-window`.
+features = ["native-window"]
+default-features = true
+# A YAML array of steps injected before `dist build` (path is relative to
+# .github/workflows/). Carries the per-OS env + submodule-init the hand-rolled
+# release.yml did inline — REQUIRED, or build.rs panics with no vendor/server.
+github-build-setup = "build-setup.yml"
+# dist cannot build the trunk/wasm bundle; this custom job produces it and dist
+# attaches the zip to the same GitHub Release.
+global-artifacts-jobs = ["./release-wasm"]
+# PRs only run `dist plan` (no full build) — ci.yml already gates fmt/clippy/test.
+pr-run-mode = "plan"
+
+# dist builds under its own profile; inherit release (LLVM — Cranelift is
+# dev-only) and add thin LTO, matching what `dist init` would generate.
+[profile.dist]
+inherits = "release"
+lto = "thin"

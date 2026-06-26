@@ -9,3 +9,8 @@ publish = false
 # may run *before* the build-time vendor data is present, so it must not depend
 # on workspace crates whose build scripts read vendor/ (e.g. ffxi-dat).
 [dependencies]
+
+# Project automation, never a shipped artifact — keep dist's release packaging
+# focused on ffxi-client.
+[package.metadata.dist]
+dist = false
