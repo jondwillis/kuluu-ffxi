@@ -14,12 +14,17 @@
   <a href="https://github.com/jondwillis/kuluu-ffxi/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/jondwillis/kuluu-ffxi?logo=GitHub"></a>
 </p>
 
+
 Kuluu is a **fan-community game-preservation project**: a cross-platform, modern, extensible, open-source client for the
 FINAL FANTASY XI network protocol.
 
 FINAL FANTASY XI is a Square Enix property. **Kuluu has no affiliation with,
 and no endorsement from, Square Enix, and ships no game assets.** If you enjoy
 FFXI, please support the official service. See [LEGAL.md](LEGAL.md).
+
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/8bc7375b-262c-4074-965e-f073b342430a" controls width="640"></video>
+</p>
 
 ## Project goals
 
