@@ -178,10 +178,11 @@ runtime/visual check).
   Unity, Play Time, Job Points wired; Master Levels + Merit Points disabled.
   Profile panel shows name, job/sub-job + levels, item level, HP/MP/TP,
   STR/DEX/VIT/AGI/INT/MND/CHR
-- [~] Magic spell list (learned spells) — `spells_known` wired into the menu;
-  list view shows "data pending"
-- [~] Abilities / job traits list — `job_abilities_known` / `weaponskills_known`
-  / `pet_abilities_known` wired; list view shows "data pending"
+- [x] Magic spell list (learned spells) — `spells_known` renders learned
+  spells by name with cast actions; spell categories tracked separately
+- [x] Abilities / job traits list — `job_abilities_known` / `weaponskills_known`
+  / `pet_abilities_known` render by name with activation actions; sub-grouping
+  tracked separately
 - [ ] Merits, job points, capacity points (not in wire/session state)
 - [~] Homepoint UI — `/homepoint`, `/homepointmenu` slash commands exist; no
   interactive homepoint menu
@@ -210,7 +211,7 @@ parity isn't compromised by default.
   self-marker not heading-rotated; retail DXT / flag-`0xA1` map images aren't
   decoded yet, so those zones fall back to TopDown. Replaces the vanilla
   compass for users who want it.
-- [~] Render scale (`graphics::render_scale`, `/renderscale`) — render the 3D
+- [x] Render scale (`graphics::render_scale`, `/renderscale`) — render the 3D
   scene to an off-screen image at a fraction (perf) or multiple (SSAA) of the
   window resolution and upscale-composite it to the window; the HUD stays at
   native resolution. Cross-platform (Metal/Vulkan/DX), unlike Bevy 0.18's
