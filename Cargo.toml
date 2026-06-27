@@ -82,7 +82,7 @@ schemars = "1"
 
 # Test fixtures: direct MariaDB access so each integration test can stamp
 # out an isolated account+char and clean up after itself.
-mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
 
 # ---------------------------------------------------------------------------
 # Release packaging via dist (cargo-dist). dist OWNS the generated
