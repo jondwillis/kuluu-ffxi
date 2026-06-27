@@ -31,6 +31,7 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<ServerEditForm>, server
         form.view_port.clone(),
         form.flavor,
         form.xiloader_version.clone(),
+        form.version_check_url.clone(),
     );
 
     let default_version = auth_client::resolve_client_version(None);
@@ -78,6 +79,14 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<ServerEditForm>, server
                     &snap.6,
                     &version_placeholder,
                     ServerEditField::XiloaderVersion,
+                );
+
+                spawn_field(
+                    panel,
+                    "Version check URL",
+                    &snap.7,
+                    "https://server/version.json",
+                    ServerEditField::VersionCheckUrl,
                 );
 
                 panel.spawn(row()).with_children(|r| {
@@ -129,6 +138,14 @@ fn save_form(form: &ServerEditForm, next: &mut NextState<LauncherState>) {
             Some(trimmed.to_string())
         }
     };
+    let version_check_url = {
+        let trimmed = form.version_check_url.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
     let profile = ServerProfile {
         name: form.name.clone(),
         host: form.host.clone(),
@@ -137,6 +154,7 @@ fn save_form(form: &ServerEditForm, next: &mut NextState<LauncherState>) {
         view_port,
         flavor: form.flavor,
         xiloader_version,
+        version_check_url,
     };
     let mut store = launcher_store::load();
     match form.editing_index {
@@ -215,6 +233,9 @@ fn spawn_field(
                     }
                     ServerEditField::XiloaderVersion => {
                         form.xiloader_version = ev.value.clone();
+                    }
+                    ServerEditField::VersionCheckUrl => {
+                        form.version_check_url = ev.value.clone();
                     }
                     ServerEditField::Flavor => {}
                 },

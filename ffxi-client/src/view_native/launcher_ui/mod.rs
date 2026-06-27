@@ -11,6 +11,7 @@ mod graphics;
 mod login;
 mod server_edit;
 mod server_select;
+mod server_version_check;
 mod settings;
 mod updater;
 
@@ -242,6 +243,7 @@ pub(crate) enum ServerEditField {
     ViewPort,
     Flavor,
     XiloaderVersion,
+    VersionCheckUrl,
 }
 
 #[allow(dead_code)]
@@ -254,7 +256,8 @@ impl ServerEditField {
             Self::DataPort => Self::ViewPort,
             Self::ViewPort => Self::Flavor,
             Self::Flavor => Self::XiloaderVersion,
-            Self::XiloaderVersion => Self::Name,
+            Self::XiloaderVersion => Self::VersionCheckUrl,
+            Self::VersionCheckUrl => Self::Name,
         }
     }
 }
@@ -277,6 +280,7 @@ pub(crate) struct ServerEditForm {
     pub flavor: ffxi_client::launcher_store::AuthFlavorKind,
 
     pub xiloader_version: String,
+    pub version_check_url: String,
     #[allow(dead_code)]
     pub focus: ServerEditField,
     pub editing_index: Option<usize>,
@@ -292,6 +296,7 @@ impl Default for ServerEditForm {
             view_port: String::from("54001"),
             flavor: ffxi_client::launcher_store::AuthFlavorKind::Json,
             xiloader_version: String::new(),
+            version_check_url: String::new(),
             focus: ServerEditField::default(),
             editing_index: None,
         }
@@ -308,6 +313,7 @@ impl ServerEditForm {
             view_port: p.view_port.to_string(),
             flavor: p.flavor,
             xiloader_version: p.xiloader_version.clone().unwrap_or_default(),
+            version_check_url: p.version_check_url.clone().unwrap_or_default(),
             focus: ServerEditField::default(),
             editing_index: None,
         }
@@ -668,6 +674,7 @@ pub(crate) fn register(
                 direct_mode_login_autostart,
                 login::keyboard_input_system,
                 login::redraw_login_form_system,
+                login::mark_dirty_on_version_change.before(login::rebuild_login_ui_system),
                 login::rebuild_login_ui_system,
             )
                 .run_if(in_state(LauncherState::Login)),
@@ -755,6 +762,8 @@ pub(crate) fn register(
     char_create_preview::register(app);
 
     updater::register(app);
+
+    server_version_check::register(app);
 
     app.add_systems(OnEnter(LauncherState::CharCreate), char_create::spawn_ui)
         .add_systems(OnExit(LauncherState::CharCreate), char_create::despawn_ui)
