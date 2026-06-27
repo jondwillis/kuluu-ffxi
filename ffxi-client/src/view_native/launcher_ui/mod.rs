@@ -6,6 +6,7 @@ mod char_create_preview;
 pub(crate) mod char_list;
 mod char_preview;
 mod common;
+mod dat_setup;
 mod graphics;
 mod login;
 mod server_edit;
@@ -67,6 +68,8 @@ fn sync_window_title(
 #[derive(SubStates, Default, Debug, Clone, Eq, PartialEq, Hash)]
 #[source(super::AppPhase = super::AppPhase::Launcher)]
 pub(crate) enum LauncherState {
+    DatSetup,
+
     ServerSelect,
 
     ServerEdit,
@@ -490,6 +493,9 @@ pub(crate) struct DirectModeAutostart;
 #[derive(Resource)]
 pub(crate) struct CliOverridesPresent;
 
+#[derive(Resource)]
+pub(crate) struct DatGateDone;
+
 #[derive(Component)]
 pub(crate) struct LauncherCamera;
 
@@ -534,6 +540,8 @@ pub(crate) fn register(
         .insert_resource(ServerEditForm::default())
         .insert_resource(settings::SettingsForm::default())
         .insert_resource(settings::SettingsUiDirty::default())
+        .insert_resource(dat_setup::DatSetupForm::default())
+        .insert_resource(dat_setup::DatSetupUiDirty::default())
         .insert_resource(ChangePasswordForm::default())
         .insert_resource(DefaultCharName(defaults.char_name));
 
@@ -575,6 +583,20 @@ pub(crate) fn register(
             )
                 .run_if(in_state(LauncherState::ServerEdit)),
         );
+
+    app.add_systems(
+        OnEnter(LauncherState::DatSetup),
+        (dat_setup::enter_prefill, dat_setup::spawn_ui).chain(),
+    )
+    .add_systems(OnExit(LauncherState::DatSetup), dat_setup::despawn_ui)
+    .add_systems(
+        Update,
+        (
+            dat_setup::keyboard_input_system,
+            dat_setup::rebuild_ui_system,
+        )
+            .run_if(in_state(LauncherState::DatSetup)),
+    );
 
     app.add_systems(
         OnEnter(LauncherState::Settings),
@@ -877,6 +899,7 @@ fn restore_login_error_on_reentry(
 fn decide_initial_screen(
     mut commands: Commands,
     overrides: Option<Res<CliOverridesPresent>>,
+    gate_done: Option<Res<DatGateDone>>,
     err: Res<LoginErrorMsg>,
     mut form: ResMut<LoginForm>,
     mut server_form: ResMut<ServerSelectForm>,
@@ -884,6 +907,17 @@ fn decide_initial_screen(
     mut next: ResMut<NextState<LauncherState>>,
 ) {
     if !err.0.is_empty() {
+        return;
+    }
+
+    // No reachable DAT install → gate to DatSetup before login, else names
+    // render as "?" and no geometry loads. Direct-mode keeps its --require-dat
+    // path and is left to autostart.
+    if gate_done.is_none()
+        && overrides.is_none()
+        && ffxi_dat::DatRoot::from_env_or_default().is_err()
+    {
+        next.set(LauncherState::DatSetup);
         return;
     }
 
