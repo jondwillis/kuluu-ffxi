@@ -192,11 +192,18 @@ What that means for you:
 
 ## Roadmap
 
+[![open issues](https://img.shields.io/github/issues/jondwillis/kuluu-ffxi)](https://github.com/jondwillis/kuluu-ffxi/issues)
+[![good first issues](https://img.shields.io/github/issues/jondwillis/kuluu-ffxi/good%20first%20issue?label=good%20first%20issue&color=7057ff)](https://github.com/jondwillis/kuluu-ffxi/issues?q=is%3Aopen+label%3A%22good+first+issue%22)
+
 Progress is tracked honestly against retail in [`docs/ROADMAP.md`](docs/ROADMAP.md)
 — two scoreboards (**Vanilla parity** and **Enhanced / addon**) with an
-`[x] / [~] / [ ] / [?]` legend. Individual lines are mirrored into
-[GitHub issues](https://github.com/jondwillis/kuluu-ffxi/issues); pick one and open a
-PR.
+`[x] / [~] / [ ] / [?]` legend. The scoreboard's status column is reconciled
+against the `roadmap`-labelled [beads](.beads/) backlog by
+[`scripts/roadmap_sync.py`](scripts/roadmap_sync.py) (CI flags any drift), and
+every not-done line is published as a GitHub issue by
+[`roadmap-publish.yml`](.github/workflows/roadmap-publish.yml) — so the live
+counts above are generated, not a hand-kept promise. Pick an
+[open issue](https://github.com/jondwillis/kuluu-ffxi/issues) and open a PR.
 
 ## Contributing
 

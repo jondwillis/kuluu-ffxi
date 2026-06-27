@@ -1,0 +1,42 @@
+name: roadmap-check (scoreboard ⇄ beads drift)
+
+# Reconciles docs/ROADMAP.md glyphs against the roadmap-labelled beads (the
+# system of record for parity status). Reads .beads/issues.jsonl directly, so
+# no bd/Dolt is needed here. See scripts/roadmap_sync.py for the rules.
+#
+# NON-BLOCKING for now (continue-on-error) because a few known over-claims
+# exist ([x] lines whose bead is still in_progress). Once those are resolved,
+# drop continue-on-error to make scoreboard drift a hard gate.
+
+on:
+  pull_request:
+    paths:
+      - docs/ROADMAP.md
+      - .beads/issues.jsonl
+      - scripts/roadmap_sync.py
+  push:
+    branches: [main]
+    paths:
+      - docs/ROADMAP.md
+      - .beads/issues.jsonl
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check scoreboard ⇄ beads drift
+        id: drift
+        continue-on-error: true
+        run: |
+          { echo '```'; python3 scripts/roadmap_sync.py --check; echo '```'; } \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Flag drift in the job (non-fatal)
+        if: steps.drift.outcome == 'failure'
+        run: echo "::warning title=Roadmap drift::scoreboard glyphs disagree with beads — see the step summary"
