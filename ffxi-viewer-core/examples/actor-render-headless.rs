@@ -293,6 +293,10 @@ fn spawn_subject(
                 Vec3::ZERO,
                 params.yaw,
                 params.scale,
+                ffxi_viewer_core::zone_texture::TextureQuality {
+                    mipmaps: true,
+                    anisotropy: 8,
+                },
             );
         }
         Err(e) => eprintln!("load failed: {e}"),

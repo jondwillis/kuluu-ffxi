@@ -659,6 +659,7 @@ pub fn spawn_loaded_actor(
     world_pos: Vec3,
     facing_dir: f32,
     scale: f32,
+    q: crate::zone_texture::TextureQuality,
 ) -> Entity {
     let actor_root = commands
         .spawn((
@@ -673,7 +674,7 @@ pub fn spawn_loaded_actor(
         .id();
 
     let material_handles = build_actor_children(
-        commands, meshes, materials, images, loaded, actor_root, facing_dir, scale,
+        commands, meshes, materials, images, loaded, actor_root, facing_dir, scale, q,
     );
 
     commands.entity(actor_root).insert(make_render_actor(
@@ -697,6 +698,7 @@ fn build_actor_children(
     actor_root: Entity,
     facing_dir: f32,
     scale: f32,
+    q: crate::zone_texture::TextureQuality,
 ) -> Vec<Handle<FfxiSkinnedMaterial>> {
     let mut by_full: std::collections::HashMap<String, Handle<Image>> =
         std::collections::HashMap::with_capacity(loaded.textures.len());
@@ -705,7 +707,7 @@ fn build_actor_children(
     let mut by_trimmed: std::collections::HashMap<String, Handle<Image>> =
         std::collections::HashMap::with_capacity(loaded.textures.len());
     for nt in &loaded.textures {
-        let handle = images.add(decoded_texture_to_image(&nt.texture));
+        let handle = images.add(decoded_texture_to_image(&nt.texture, q));
         let trimmed = nt.name.trim_end_matches(['\0', ' ']).to_string();
         if !trimmed.is_empty() {
             by_trimmed.entry(trimmed).or_insert(handle.clone());
@@ -859,6 +861,7 @@ pub fn spawn_live_actor(
     wire_entity: Entity,
     world_id: u32,
     scale: f32,
+    q: crate::zone_texture::TextureQuality,
 ) -> Entity {
     let facing_dir = 0.0;
 
@@ -876,7 +879,7 @@ pub fn spawn_live_actor(
         .id();
 
     let material_handles = build_actor_children(
-        commands, meshes, materials, images, loaded, actor_root, facing_dir, scale,
+        commands, meshes, materials, images, loaded, actor_root, facing_dir, scale, q,
     );
 
     commands.entity(actor_root).insert(make_render_actor(
@@ -890,20 +893,16 @@ pub fn spawn_live_actor(
     actor_root
 }
 
-fn decoded_texture_to_image(t: &DecodedTexture) -> Image {
-    // Mip chain + anisotropic sampler (the zone path's builder). Character
-    // textures were bare mip-0 with the default sampler, so they aliased into a
-    // whole-body shimmer under any camera motion while the mipped world stayed
-    // crisp. Alpha is left exactly as the decoder produced it — the actor path
-    // does not apply the zone alpha remap — so only filtering changes here.
+fn decoded_texture_to_image(t: &DecodedTexture, q: crate::zone_texture::TextureQuality) -> Image {
+    // Mip chain + anisotropic sampler (the zone path's builder). Alpha is left
+    // exactly as the decoder produced it — the actor path does not apply the zone
+    // alpha remap — so only filtering changes here. Filtering follows the GUI
+    // Texture Filtering setting, like the zone/MMB paths.
     crate::zone_texture::image_with_mips(
         t.rgba.clone(),
         t.width,
         t.height,
-        crate::zone_texture::TextureQuality {
-            mipmaps: true,
-            anisotropy: 8,
-        },
+        q,
         crate::zone_texture::has_cutout_alpha(t),
     )
 }
@@ -1419,6 +1418,7 @@ pub fn process_load_actor_requests(
     mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
     mut std_materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    settings: Res<crate::graphics_settings::GraphicsSettings>,
     tracked: Res<crate::scene::TrackedEntities>,
     entity_mesh: Option<Res<crate::scene::EntityMesh>>,
     q_existing: Query<&FfxiRenderRoot>,
@@ -1427,6 +1427,10 @@ pub fn process_load_actor_requests(
     // EntityMesh only exists once a scene is loaded; skip until then.
     let Some(entity_mesh) = entity_mesh else {
         return;
+    };
+    let quality = crate::zone_texture::TextureQuality {
+        mipmaps: settings.texture_filtering.mipmaps(),
+        anisotropy: settings.texture_filtering.anisotropy(),
     };
     for req in events.read() {
         let Some(&wire_entity) = tracked.by_id.get(&req.entity_id) else {
@@ -1463,6 +1467,7 @@ pub fn process_load_actor_requests(
             wire_entity,
             req.entity_id,
             1.0,
+            quality,
         );
 
         // A transient child carries the stretch: the wire entity is driven by
