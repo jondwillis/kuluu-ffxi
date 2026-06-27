@@ -208,6 +208,14 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # SHA256SUMS pins the integrity contract the in-app updater verifies
+      # against (ffxi-client/src/view_native/launcher_ui/updater.rs). Hash the
+      # bare basenames so each line matches the asset filename the updater
+      # downloads, not the runner's artifacts/ directory prefix.
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: sha256sum * > SHA256SUMS
+
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.setup.outputs.tag }}

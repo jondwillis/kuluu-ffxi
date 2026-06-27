@@ -1,11 +1,14 @@
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::{anyhow, bail, Context, Result};
 use bevy::ecs::spawn::Spawn;
 use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::prelude::*;
 use bevy::ui_widgets::Activate;
+use sha2::{Digest, Sha256};
 
 use super::common::PANEL_BG;
 use super::RuntimeHandle;
@@ -13,6 +16,7 @@ use crate::view_native::AppPhase;
 
 const API_URL: &str = "https://api.github.com/repos/jondwillis/kuluu-ffxi/releases/latest";
 const RELEASE_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
+const DOWNLOAD_BASE_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/download");
 
 #[derive(Resource, Clone)]
 pub(crate) struct UpdateStatus {
@@ -21,6 +25,10 @@ pub(crate) struct UpdateStatus {
     pub newer_available: bool,
     pub checked: bool,
     pub dismissed: bool,
+    // Set by the self-update flow (kuluu-fwz) after fetch_and_verify_sha256
+    // passes; downstream gates the binary replace on it.
+    #[allow(dead_code)]
+    pub sha256_verified: bool,
 }
 
 impl Default for UpdateStatus {
@@ -31,6 +39,7 @@ impl Default for UpdateStatus {
             newer_available: false,
             checked: false,
             dismissed: false,
+            sha256_verified: false,
         }
     }
 }
@@ -82,6 +91,53 @@ fn is_newer(latest: &str, current: &str) -> bool {
         (Some(l), Some(c)) => l > c,
         _ => false,
     }
+}
+
+fn parse_sha256sums(body: &str, filename: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let line = line.trim();
+        let (digest, name) = line.split_once(char::is_whitespace)?;
+        // sha256sum prefixes binary-mode names with '*'; strip it before match.
+        let name = name.trim_start_matches('*').trim();
+        (name == filename).then(|| digest.trim().to_ascii_lowercase())
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[allow(dead_code)]
+pub(crate) fn fetch_and_verify_sha256(tag: &str, artifact_path: &Path) -> Result<()> {
+    let filename = artifact_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("artifact path has no filename: {}", artifact_path.display()))?;
+    let url = format!("{DOWNLOAD_BASE_URL}/{tag}/SHA256SUMS");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(8))
+        .build();
+    let body = agent
+        .get(&url)
+        .set(
+            "User-Agent",
+            concat!("kuluu-ffxi/", env!("CARGO_PKG_VERSION")),
+        )
+        .call()
+        .with_context(|| format!("fetching {url}"))?
+        .into_string()
+        .context("reading SHA256SUMS body")?;
+    let expected = parse_sha256sums(&body, filename)
+        .ok_or_else(|| anyhow!("no SHA256SUMS entry for {filename}"))?;
+    let bytes = std::fs::read(artifact_path)
+        .with_context(|| format!("reading artifact {}", artifact_path.display()))?;
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        bail!("sha256 mismatch for {filename}: expected {expected}, got {actual}");
+    }
+    Ok(())
 }
 
 fn open_url(url: &str) {
@@ -229,4 +285,43 @@ pub(super) fn register(app: &mut App) {
                 .chain()
                 .run_if(in_state(AppPhase::Launcher)),
         );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SUMS: &str = "\
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  ffxi-client-v0.2.0-x86_64-linux.tar.gz
+fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *ffxi-client-v0.2.0-aarch64-macos.tar.gz
+";
+
+    #[test]
+    fn parse_sha256sums_matches_filename() {
+        assert_eq!(
+            parse_sha256sums(SUMS, "ffxi-client-v0.2.0-x86_64-linux.tar.gz").as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_strips_binary_star() {
+        assert_eq!(
+            parse_sha256sums(SUMS, "ffxi-client-v0.2.0-aarch64-macos.tar.gz").as_deref(),
+            Some("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_unknown_filename_is_none() {
+        assert_eq!(parse_sha256sums(SUMS, "no-such-asset.zip"), None);
+    }
+
+    #[test]
+    fn sha256_hex_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+    }
 }
