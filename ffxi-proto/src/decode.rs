@@ -509,6 +509,60 @@ pub fn decode_weather(sub: &SubPacket<'_>) -> Result<WeatherPacket, DecodeError>
     WeatherPacket::decode(sub.data)
 }
 
+/// s2c 0x055 GP_SERV_COMMAND_SCENARIOITEM (key items). One packet carries a
+/// single 512-bit table: 16 u32 `GetItemFlag` (owned) followed by 16 u32
+/// `LookItemFlag` (examined), then the `TableIndex`. A key-item's global id is
+/// `table_index * 512 + bit`.
+/// vendor/server/src/map/packets/s2c/0x055_scenarioitem.h
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScenarioItem {
+    pub table_index: u16,
+    pub get_flags: [u32; Self::WORDS],
+    pub look_flags: [u32; Self::WORDS],
+}
+
+impl ScenarioItem {
+    pub const WORDS: usize = 16;
+    pub const BITS_PER_TABLE: usize = Self::WORDS * 32;
+    pub const SIZE: usize = Self::WORDS * 4 * 2 + 4;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        let rd = |o: usize| u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+        let mut get_flags = [0u32; Self::WORDS];
+        let mut look_flags = [0u32; Self::WORDS];
+        for i in 0..Self::WORDS {
+            get_flags[i] = rd(i * 4);
+            look_flags[i] = rd(Self::WORDS * 4 + i * 4);
+        }
+        let table_index = u16::from_le_bytes([body[Self::WORDS * 8], body[Self::WORDS * 8 + 1]]);
+        Ok(Self {
+            table_index,
+            get_flags,
+            look_flags,
+        })
+    }
+
+    pub fn owned_key_item_ids(&self) -> Vec<u16> {
+        let base = self.table_index as usize * Self::BITS_PER_TABLE;
+        let mut ids = Vec::new();
+        for (word, &flags) in self.get_flags.iter().enumerate() {
+            for bit in 0..32 {
+                if flags & (1 << bit) != 0 {
+                    ids.push((base + word * 32 + bit) as u16);
+                }
+            }
+        }
+        ids
+    }
+}
+
+pub fn decode_scenario_item(sub: &SubPacket<'_>) -> Result<ScenarioItem, DecodeError> {
+    ScenarioItem::decode(sub.data)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PosMode {
@@ -1988,6 +2042,55 @@ mod tests {
         assert!(matches!(
             CharStatus::decode(&buf),
             Err(DecodeError::Truncated(n, have)) if n == need && have == need - 1
+        ));
+    }
+}
+
+#[cfg(test)]
+mod scenario_item_tests {
+    use super::*;
+
+    fn body_with(table_index: u16, get: &[(usize, u32)], look: &[(usize, u32)]) -> Vec<u8> {
+        let mut body = vec![0u8; ScenarioItem::SIZE];
+        for &(word, flags) in get {
+            body[word * 4..word * 4 + 4].copy_from_slice(&flags.to_le_bytes());
+        }
+        for &(word, flags) in look {
+            let o = ScenarioItem::WORDS * 4 + word * 4;
+            body[o..o + 4].copy_from_slice(&flags.to_le_bytes());
+        }
+        let o = ScenarioItem::WORDS * 8;
+        body[o..o + 2].copy_from_slice(&table_index.to_le_bytes());
+        body
+    }
+
+    #[test]
+    fn decodes_table_index_and_flags() {
+        let body = body_with(2, &[(0, 0b101), (3, 1 << 7)], &[(0, 0b10)]);
+        let si = ScenarioItem::decode(&body).expect("decode");
+        assert_eq!(si.table_index, 2);
+        assert_eq!(si.get_flags[0], 0b101);
+        assert_eq!(si.get_flags[3], 1 << 7);
+        assert_eq!(si.look_flags[0], 0b10);
+    }
+
+    #[test]
+    fn owned_ids_account_for_table_offset() {
+        let body = body_with(2, &[(0, 0b101), (3, 1 << 7)], &[]);
+        let si = ScenarioItem::decode(&body).expect("decode");
+        let base = 2 * ScenarioItem::BITS_PER_TABLE;
+        assert_eq!(
+            si.owned_key_item_ids(),
+            vec![base as u16, (base + 2) as u16, (base + 3 * 32 + 7) as u16,]
+        );
+    }
+
+    #[test]
+    fn truncated_body_is_error() {
+        let buf = vec![0u8; ScenarioItem::SIZE - 1];
+        assert!(matches!(
+            ScenarioItem::decode(&buf),
+            Err(DecodeError::Truncated(n, have)) if n == ScenarioItem::SIZE && have == ScenarioItem::SIZE - 1
         ));
     }
 }
