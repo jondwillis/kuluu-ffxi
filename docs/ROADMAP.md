@@ -78,14 +78,14 @@ runtime/visual check).
 
 ### HUD
 
-- [x] Retail compass (minimal entity-direction widget)
+- [~] Retail compass (minimal entity-direction widget)
 - [~] Nameplate billboards — render; distance-to-scale curve still placeholder
 - [x] Stage bar, chat panes (Social / Battle / Debug), self HUD, party
   roster, target panel, Vana clock, weather icon, zone flash, dialog
   window, death prompt, logout countdown, status ribbon
 - [x] Self HUD solo / party indicator
 - [x] Target panel width parity — self/party/target panels share `PANEL_WIDTH_PX`
-- [x] Target-action contextual menu (vanilla) — select an entity → confirm
+- [~] Target-action contextual menu (vanilla) — select an entity → confirm
   opens Attack / Chat / Magic / Abilities / Trust / Items / Trade / Check, with
   per-entry contextual visibility. Engaged in battle swaps Attack → Switch
   Target (an `<st>`-style select cursor: Tab-cycle + re-engage) and adds
@@ -113,7 +113,7 @@ runtime/visual check).
 - [x] Auto-attack engage / disengage, engaged-target ring
 - [x] Combat-stance animation
 - [x] `/check` — mob con (level / defense estimate)
-- [x] `/check` on players — "View Wares" + 16-slot (4×4) equipment grid
+- [~] `/check` on players — "View Wares" + 16-slot (4×4) equipment grid
   inspector
 - [x] Action dispatch from menu — item / magic / ability all dispatch via the
   target-action contextual menu
@@ -150,7 +150,7 @@ runtime/visual check).
 - [ ] `/search` + player search panel
 - [ ] Search-comment edit
 - [ ] Bazaar (browse / sell)
-- [x] Player ↔ player trade window — 4×2 grid + gil selector + quantity +
+- [~] Player ↔ player trade window — 4×2 grid + gil selector + quantity +
   OK/Cancel
 - [ ] Emote animations
 
