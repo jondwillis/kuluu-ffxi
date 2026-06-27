@@ -219,6 +219,7 @@ pub(super) fn poll_pending_preview(
     cursor: Res<CharCursor>,
     mut pending: ResMut<PendingPreview>,
     q_parent: Query<Entity, With<CharPreviewParent>>,
+    settings: Res<ffxi_viewer_core::GraphicsSettings>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -246,6 +247,10 @@ pub(super) fn poll_pending_preview(
         return;
     };
 
+    let quality = ffxi_viewer_core::zone_texture::TextureQuality {
+        mipmaps: settings.texture_filtering.mipmaps(),
+        anisotropy: settings.texture_filtering.anisotropy(),
+    };
     let actor_root = spawn_loaded_actor(
         &mut commands,
         &mut meshes,
@@ -255,6 +260,7 @@ pub(super) fn poll_pending_preview(
         Vec3::ZERO,
         PREVIEW_FACING_DIR,
         PREVIEW_SCALE,
+        quality,
     );
     commands
         .entity(actor_root)
