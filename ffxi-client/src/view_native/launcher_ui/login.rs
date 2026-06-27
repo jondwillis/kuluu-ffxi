@@ -11,6 +11,7 @@ use ffxi_client::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
 use ffxi_client::secret_store::SecretStore;
 
 use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
+use super::server_version_check::{ServerVersionStatus, VersionViolation};
 use super::{
     Credentials, LauncherState, LoginErrorMsg, LoginField, LoginForm, ServerInfo, ServerSelectForm,
 };
@@ -39,8 +40,9 @@ pub(super) fn spawn_login_ui(
     server: Res<ServerInfo>,
     form: Res<LoginForm>,
     server_form: Res<ServerSelectForm>,
+    version: Res<ServerVersionStatus>,
 ) {
-    build_login_ui(&mut commands, &server, &form, &server_form);
+    build_login_ui(&mut commands, &server, &form, &server_form, &version);
 }
 
 pub(super) fn rebuild_login_ui_system(
@@ -50,6 +52,7 @@ pub(super) fn rebuild_login_ui_system(
     server: Res<ServerInfo>,
     form: Res<LoginForm>,
     server_form: Res<ServerSelectForm>,
+    version: Res<ServerVersionStatus>,
 ) {
     if !dirty.0 {
         return;
@@ -58,7 +61,16 @@ pub(super) fn rebuild_login_ui_system(
     for e in existing.iter() {
         commands.entity(e).despawn();
     }
-    build_login_ui(&mut commands, &server, &form, &server_form);
+    build_login_ui(&mut commands, &server, &form, &server_form, &version);
+}
+
+pub(super) fn mark_dirty_on_version_change(
+    version: Res<ServerVersionStatus>,
+    mut dirty: ResMut<LoginUiDirty>,
+) {
+    if version.is_changed() {
+        dirty.0 = true;
+    }
 }
 
 fn build_login_ui(
@@ -66,6 +78,7 @@ fn build_login_ui(
     server: &ServerInfo,
     form: &LoginForm,
     server_form: &ServerSelectForm,
+    version: &ServerVersionStatus,
 ) {
     let user_initial = form.user.clone();
     let pass_initial = form.pass.clone();
@@ -80,6 +93,8 @@ fn build_login_ui(
             root.spawn(panel_node(560.0)).with_children(|panel| {
                 panel.spawn(title(format!("Sign in to {}", server.display_label())));
                 panel.spawn(hint("Tab cycles fields. Enter submits when both filled."));
+
+                spawn_version_banner(panel, version);
 
                 spawn_saved_accounts_row(panel, &server_key, &active_user, &accts);
 
@@ -106,24 +121,28 @@ fn build_login_ui(
                     },
                 );
 
+                let blocked = version.violation == VersionViolation::BelowMinimum;
+
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button(
-                        ButtonProps {
-                            variant: ButtonVariant::Primary,
-                            ..default()
-                        },
-                        (),
-                        Spawn((Text::new("Log in"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>,
-                         form: Res<LoginForm>,
-                         mut next: ResMut<NextState<LauncherState>>| {
-                            if !form.user.is_empty() && !form.pass.is_empty() {
-                                next.set(LauncherState::AuthInFlight);
-                            }
-                        },
-                    );
+                    if !blocked {
+                        r.spawn(button(
+                            ButtonProps {
+                                variant: ButtonVariant::Primary,
+                                ..default()
+                            },
+                            (),
+                            Spawn((Text::new("Log in"), ThemedText)),
+                        ))
+                        .observe(
+                            |_ev: On<Activate>,
+                             form: Res<LoginForm>,
+                             mut next: ResMut<NextState<LauncherState>>| {
+                                if !form.user.is_empty() && !form.pass.is_empty() {
+                                    next.set(LauncherState::AuthInFlight);
+                                }
+                            },
+                        );
+                    }
 
                     r.spawn(button(
                         ButtonProps::default(),
@@ -290,6 +309,59 @@ fn spawn_saved_accounts_row(
     });
 }
 
+fn spawn_version_banner(panel: &mut ChildSpawnerCommands, version: &ServerVersionStatus) {
+    let (border, text_color, msg) = match version.violation {
+        VersionViolation::Ok => return,
+        VersionViolation::BelowRecommended => {
+            let rec = version.recommended.clone().unwrap_or_default();
+            (
+                Color::srgb(0.55, 0.45, 0.10),
+                Color::srgb(1.0, 0.85, 0.30),
+                format!(
+                    "This server recommends client {rec}; you are on {}. Some features may not work.",
+                    version.current
+                ),
+            )
+        }
+        VersionViolation::BelowMinimum => {
+            let min = version.minimum.clone().unwrap_or_default();
+            (
+                Color::srgb(0.55, 0.15, 0.15),
+                Color::srgb(1.0, 0.40, 0.40),
+                format!(
+                    "This server requires client {min}; you are on {}. Update before logging in.",
+                    version.current
+                ),
+            )
+        }
+    };
+
+    panel
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BorderColor::all(border),
+        ))
+        .with_children(|bar| {
+            bar.spawn((
+                Text::new(msg),
+                TextFont {
+                    font_size: 13.0,
+                    ..default()
+                },
+                TextColor(text_color),
+                ThemedText,
+            ));
+        });
+}
+
 fn spawn_field(
     parent: &mut ChildSpawnerCommands,
     label: &str,
@@ -344,7 +416,11 @@ fn spawn_field(
             .observe(
                 move |_ev: On<TextFieldSubmitted>,
                       form: Res<LoginForm>,
+                      version: Res<ServerVersionStatus>,
                       mut next: ResMut<NextState<LauncherState>>| {
+                    if version.violation == VersionViolation::BelowMinimum {
+                        return;
+                    }
                     if !form.user.is_empty() && !form.pass.is_empty() {
                         next.set(LauncherState::AuthInFlight);
                     }

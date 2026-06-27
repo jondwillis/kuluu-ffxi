@@ -22,6 +22,9 @@ pub struct ServerProfile {
 
     #[serde(default)]
     pub xiloader_version: Option<String>,
+
+    #[serde(default)]
+    pub version_check_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -260,6 +263,7 @@ mod tests {
             view_port: 54001,
             flavor: AuthFlavorKind::Json,
             xiloader_version: None,
+            version_check_url: None,
         }
     }
 
