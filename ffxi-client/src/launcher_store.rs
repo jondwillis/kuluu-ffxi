@@ -120,16 +120,72 @@ pub fn keyring_account_key(server_name: &str, username: &str) -> String {
     format!("{server_name}:{username}")
 }
 
-fn default_path() -> Option<PathBuf> {
-    let base = std::env::var("XDG_CONFIG_HOME")
+fn config_base() -> Option<PathBuf> {
+    std::env::var("XDG_CONFIG_HOME")
         .ok()
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var("HOME")
                 .ok()
                 .map(|h| PathBuf::from(h).join(".config"))
-        })?;
-    Some(base.join("ffxi-mcp").join("launcher.json"))
+        })
+}
+
+fn default_path() -> Option<PathBuf> {
+    Some(config_base()?.join("kuluu").join("launcher.json"))
+}
+
+fn legacy_path() -> Option<PathBuf> {
+    Some(config_base()?.join("ffxi-mcp").join("launcher.json"))
+}
+
+fn parse_store(path: &std::path::Path) -> Option<LauncherStore> {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<LauncherStore>(&bytes) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "launcher_store: parse failed; using empty defaults",
+                );
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "launcher_store: read failed; using empty defaults",
+            );
+            None
+        }
+    }
+}
+
+fn load_from(path: &std::path::Path, legacy: Option<&std::path::Path>) -> LauncherStore {
+    if let Some(store) = parse_store(path) {
+        return store;
+    }
+    if let Some(legacy) = legacy {
+        if let Some(store) = parse_store(legacy) {
+            tracing::warn!(
+                from = %legacy.display(),
+                to = %path.display(),
+                "launcher_store: migrating config from legacy ffxi-mcp dir to kuluu",
+            );
+            if let Err(e) = write_store(path, &store) {
+                tracing::warn!(
+                    to = %path.display(),
+                    error = %e,
+                    "launcher_store: migration write failed; keeping legacy file",
+                );
+            }
+            return store;
+        }
+    }
+    LauncherStore::default()
 }
 
 pub fn load() -> LauncherStore {
@@ -137,28 +193,19 @@ pub fn load() -> LauncherStore {
         tracing::warn!("launcher_store: no XDG_CONFIG_HOME / HOME; using empty defaults");
         return LauncherStore::default();
     };
-    match std::fs::read(&path) {
-        Ok(bytes) => match serde_json::from_slice::<LauncherStore>(&bytes) {
-            Ok(store) => store,
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "launcher_store: parse failed; using empty defaults",
-                );
-                LauncherStore::default()
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LauncherStore::default(),
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "launcher_store: read failed; using empty defaults",
-            );
-            LauncherStore::default()
-        }
+    load_from(&path, legacy_path().as_deref())
+}
+
+fn write_store(path: &std::path::Path, store: &LauncherStore) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let bytes = serde_json::to_vec_pretty(store)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 pub fn save(store: &LauncherStore) -> std::io::Result<()> {
@@ -168,15 +215,7 @@ pub fn save(store: &LauncherStore) -> std::io::Result<()> {
             "neither $XDG_CONFIG_HOME nor $HOME set",
         )
     })?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(store)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    write_store(&path, store)
 }
 
 #[cfg(test)]
@@ -186,6 +225,92 @@ mod tests {
     #[test]
     fn keyring_key_format() {
         assert_eq!(keyring_account_key("local", "test1"), "local:test1");
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("kuluu-launcher-store-{tag}-{n}"))
+    }
+
+    #[test]
+    fn config_paths_use_player_facing_dir() {
+        std::env::set_var("XDG_CONFIG_HOME", "/cfg");
+        assert_eq!(
+            default_path(),
+            Some(PathBuf::from("/cfg/kuluu/launcher.json"))
+        );
+        assert_eq!(
+            legacy_path(),
+            Some(PathBuf::from("/cfg/ffxi-mcp/launcher.json"))
+        );
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn load_migrates_legacy_then_writes_new_location() {
+        let dir = unique_dir("migrate");
+        let new = dir.join("kuluu").join("launcher.json");
+        let legacy = dir.join("ffxi-mcp").join("launcher.json");
+
+        let store = LauncherStore {
+            accounts: vec![acct("HXI", "batti")],
+            last_used: Some(("HXI".into(), "batti".into())),
+            ..Default::default()
+        };
+        write_store(&legacy, &store).unwrap();
+
+        assert!(!new.exists(), "precondition: new path absent");
+        let loaded = load_from(&new, Some(&legacy));
+        assert_eq!(loaded.accounts.len(), 1);
+        assert_eq!(loaded.accounts[0].username, "batti");
+        assert!(new.exists(), "migration writes the new location");
+
+        let migrated = load_from(&new, Some(&legacy));
+        assert_eq!(migrated.last_used, Some(("HXI".into(), "batti".into())));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_prefers_new_path_over_legacy() {
+        let dir = unique_dir("prefer-new");
+        let new = dir.join("kuluu").join("launcher.json");
+        let legacy = dir.join("ffxi-mcp").join("launcher.json");
+
+        write_store(
+            &new,
+            &LauncherStore {
+                accounts: vec![acct("local", "current")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_store(
+            &legacy,
+            &LauncherStore {
+                accounts: vec![acct("local", "stale")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let loaded = load_from(&new, Some(&legacy));
+        assert_eq!(loaded.accounts[0].username, "current");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_defaults_when_neither_path_exists() {
+        let dir = unique_dir("empty");
+        let new = dir.join("kuluu").join("launcher.json");
+        let legacy = dir.join("ffxi-mcp").join("launcher.json");
+        let loaded = load_from(&new, Some(&legacy));
+        assert!(loaded.accounts.is_empty());
+        assert!(loaded.last_used.is_none());
     }
 
     #[test]
