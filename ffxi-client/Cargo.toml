@@ -82,6 +82,11 @@ clap.workspace = true
 # distinct from the JSON flavor's anyhow! bails.
 mac_address = "1"
 thiserror = "1"
+# Already linked transitively via ffxi-nav-recast with the identical
+# default-features = false, features = ["tls"] spec, so the lock and binary are
+# unchanged. The launcher's update check uses it for a CA-validated GitHub API
+# GET; the client's own tls.rs is a TOFU verifier, unsuitable for public CAs.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 rustls.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true

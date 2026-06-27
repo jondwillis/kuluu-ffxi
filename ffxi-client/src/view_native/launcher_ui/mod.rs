@@ -12,6 +12,7 @@ mod login;
 mod server_edit;
 mod server_select;
 mod settings;
+mod updater;
 
 use std::sync::{Arc, Mutex};
 
@@ -752,6 +753,8 @@ pub(crate) fn register(
     );
 
     char_create_preview::register(app);
+
+    updater::register(app);
 
     app.add_systems(OnEnter(LauncherState::CharCreate), char_create::spawn_ui)
         .add_systems(OnExit(LauncherState::CharCreate), char_create::despawn_ui)
