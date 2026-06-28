@@ -19,6 +19,8 @@ use ffxi_viewer_wire::EntityKind;
 pub const DEFAULT_WORLD_DRAW_DISTANCE: f32 = 80.0;
 pub const DEFAULT_MOB_DRAW_DISTANCE: f32 = 50.0;
 
+pub const MMB_LOAD_DISTANCE_MARGIN: f32 = 1.25;
+
 const MZB_MATERIAL_PALETTE: [[f32; 3]; 16] = [
     [0.85, 0.55, 0.40],
     [0.75, 0.65, 0.45],
@@ -1373,6 +1375,35 @@ pub fn cull_mzb_by_distance(
             Visibility::Inherited
         };
 
+        if *vis != want {
+            *vis = want;
+        }
+    }
+}
+
+pub fn cull_mmb_props_by_distance(
+    draw: Res<DrawDistance>,
+    self_q: Query<&GlobalTransform, With<IsSelf>>,
+    mut prop_q: Query<
+        (&GlobalTransform, &mut Visibility),
+        (With<crate::dat_mmb::MmbOverlay>, With<AutoMzbOverlay>),
+    >,
+) {
+    let Ok(self_t) = self_q.single() else {
+        return;
+    };
+    let self_pos = self_t.translation();
+    let cull_sq = draw.world * draw.world;
+
+    for (prop_t, mut vis) in prop_q.iter_mut() {
+        let p = prop_t.translation();
+        let dx = p.x - self_pos.x;
+        let dz = p.z - self_pos.z;
+        let want = if dx * dx + dz * dz > cull_sq {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
         if *vis != want {
             *vis = want;
         }

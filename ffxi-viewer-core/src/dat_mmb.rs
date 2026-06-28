@@ -101,6 +101,7 @@ impl Plugin for DatOverlayPlugin {
                 Update,
                 (
                     crate::dat_mzb::cull_entities_by_distance,
+                    crate::dat_mzb::cull_mmb_props_by_distance,
                     crate::dat_mzb::apply_zone_geom_visibility,
                 ),
             )
@@ -246,6 +247,28 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
     })
 }
 
+fn is_zone_placement(req: &LoadMmbRequest) -> bool {
+    req.entity_id.is_none() && req.world_transform.is_some()
+}
+
+fn mmb_dist_sq_xz(req: &LoadMmbRequest, self_pos: Vec3) -> f32 {
+    let p = req
+        .world_transform
+        .map(|m| m.w_axis.truncate())
+        .unwrap_or(req.world_pos);
+    let dx = p.x - self_pos.x;
+    let dz = p.z - self_pos.z;
+    dx * dx + dz * dz
+}
+
+fn mmb_load_order_key(req: &LoadMmbRequest, self_pos: Vec3) -> f32 {
+    if is_zone_placement(req) {
+        mmb_dist_sq_xz(req, self_pos)
+    } else {
+        -1.0
+    }
+}
+
 pub fn process_load_mmb_requests(
     mut events: MessageReader<LoadMmbRequest>,
     mut commands: Commands,
@@ -259,11 +282,22 @@ pub fn process_load_mmb_requests(
     mut parse_cache: ResMut<MmbParseCache>,
     mut tex_pools_res: ResMut<MmbTexPools>,
     settings: Res<GraphicsSettings>,
+    draw: Res<crate::dat_mzb::DrawDistance>,
+    self_q: Query<&GlobalTransform, With<crate::components::IsSelf>>,
 ) {
     queue.pending.extend(events.read().copied());
     if queue.pending.is_empty() {
         return;
     }
+
+    let self_pos = self_q.single().ok().map(|t| t.translation());
+    if let Some(self_pos) = self_pos {
+        queue.pending.make_contiguous().sort_by(|a, b| {
+            mmb_load_order_key(a, self_pos).total_cmp(&mmb_load_order_key(b, self_pos))
+        });
+    }
+    let load_radius = draw.world * crate::dat_mzb::MMB_LOAD_DISTANCE_MARGIN;
+    let load_radius_sq = load_radius * load_radius;
 
     let mut mmb_logged: std::collections::HashSet<(u32, usize)> = std::collections::HashSet::new();
 
@@ -293,6 +327,13 @@ pub fn process_load_mmb_requests(
         let Some(req) = queue.pending.pop_front() else {
             break;
         };
+
+        if let Some(self_pos) = self_pos {
+            if is_zone_placement(&req) && mmb_dist_sq_xz(&req, self_pos) > load_radius_sq {
+                queue.pending.push_front(req);
+                break;
+            }
+        }
 
         let was_cached = parse_cache
             .by_asset
@@ -661,9 +702,53 @@ pub fn apply_texture_filtering_system(
 
 #[cfg(test)]
 mod tests {
-    use super::submesh_alpha_mode;
+    use super::{mmb_dist_sq_xz, mmb_load_order_key, submesh_alpha_mode, LoadMmbRequest};
     use crate::zone_texture::ffxi_alpha_remap;
-    use bevy::prelude::AlphaMode;
+    use bevy::prelude::{AlphaMode, Mat4, Vec3};
+
+    fn zone_placement_at(pos: Vec3) -> LoadMmbRequest {
+        LoadMmbRequest {
+            file_id: 0,
+            chunk_idx: 0,
+            world_pos: Vec3::ZERO,
+            entity_id: None,
+            world_transform: Some(Mat4::from_translation(pos)),
+        }
+    }
+
+    fn entity_spawn_at(pos: Vec3) -> LoadMmbRequest {
+        LoadMmbRequest {
+            file_id: 0,
+            chunk_idx: 0,
+            world_pos: pos,
+            entity_id: Some(7),
+            world_transform: None,
+        }
+    }
+
+    #[test]
+    fn dist_key_ignores_vertical_axis() {
+        let self_pos = Vec3::new(10.0, 999.0, 20.0);
+        let req = zone_placement_at(Vec3::new(13.0, -50.0, 24.0));
+        assert_eq!(mmb_dist_sq_xz(&req, self_pos), 3.0 * 3.0 + 4.0 * 4.0);
+    }
+
+    #[test]
+    fn entity_spawns_sort_ahead_of_any_zone_placement() {
+        let self_pos = Vec3::ZERO;
+        let entity = mmb_load_order_key(&entity_spawn_at(Vec3::new(500.0, 0.0, 500.0)), self_pos);
+        let nearest_prop =
+            mmb_load_order_key(&zone_placement_at(Vec3::new(0.1, 0.0, 0.0)), self_pos);
+        assert!(entity < nearest_prop);
+    }
+
+    #[test]
+    fn nearer_zone_placement_sorts_first() {
+        let self_pos = Vec3::ZERO;
+        let near = mmb_load_order_key(&zone_placement_at(Vec3::new(5.0, 0.0, 0.0)), self_pos);
+        let far = mmb_load_order_key(&zone_placement_at(Vec3::new(50.0, 0.0, 0.0)), self_pos);
+        assert!(near < far);
+    }
 
     #[test]
     fn underscore_model_is_cutout_at_xim_threshold() {
