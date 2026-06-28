@@ -815,9 +815,10 @@ fn handle_sub_packet(
         }
         op if op == s2c::CHAR_STATUS => {
             if let Ok(cs) = decode::CharStatus::decode(sub.data) {
-                if cs.unique_no == self_char_id && cs.hpp == 0 {
+                if cs.unique_no == self_char_id {
                     let _ = event_tx.send(AgentEvent::DeathTimerUpdated {
-                        seconds_until_homepoint: cs.seconds_until_homepoint(),
+                        seconds_until_homepoint: (cs.hpp == 0)
+                            .then(|| cs.seconds_until_homepoint()),
                     });
                 }
             }

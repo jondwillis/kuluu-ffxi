@@ -1648,12 +1648,13 @@ pub fn tick_live_ffxi_actors(
         .map(|e| (e.id, e.hp_pct == Some(0)))
         .collect();
 
-    // The self entity's hp_pct only updates when its CHAR_PC carries the UPDATE_HP
-    // flag, so it doesn't reliably mark the player KO'd. The party row is the
-    // authoritative self-HP source (same one the death prompt reads).
-    let self_dead = crate::hud::self_hud::resolve_self(&state.snapshot.party, self_id)
-        .map(|m| m.hp_pct == 0)
-        .unwrap_or(false);
+    // Self KO is unreliable via the entity hp_pct (only updated when CHAR_PC
+    // carries UPDATE_HP) and via the party row (absent/stale when solo).
+    // death_homepoint_secs comes straight from 0x037 CHAR_STATUS hpp==0.
+    let self_dead = state.snapshot.death_homepoint_secs.is_some()
+        || crate::hud::self_hud::resolve_self(&state.snapshot.party, self_id)
+            .map(|m| m.hp_pct == 0)
+            .unwrap_or(false);
 
     for (mut actor, actor_global) in &mut q_actors {
         let world_id = actor.world_id;

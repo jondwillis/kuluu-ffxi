@@ -223,7 +223,7 @@ pub fn derive_bgm_playback_state(
     scene: Res<crate::snapshot::SceneState>,
     sky: Res<crate::sun_moon::VanaSky>,
     mut state: ResMut<BgmPlaybackState>,
-    mut last_engage_log: Local<Option<(bool, u32, u8, bool)>>,
+    mut last_engage_log: Local<Option<(bool, u32, u8, bool, bool)>>,
 ) {
     const EFFECT_FISHING_IMAGERY: u16 = 235;
     const EFFECT_MOUNTED: u16 = 252;
@@ -246,13 +246,14 @@ pub fn derive_bgm_playback_state(
         .unwrap_or(false);
 
     let icons = &snap.status_icons;
-    let dead = self_entity.map(|e| e.is_dead()).unwrap_or(false);
+    let dead =
+        snap.death_homepoint_secs.is_some() || self_entity.map(|e| e.is_dead()).unwrap_or(false);
     let mounted = icons.contains(&EFFECT_MOUNTED);
     let fishing = icons.contains(&EFFECT_FISHING_IMAGERY);
 
     let is_night = sky.sun_altitude < 0.0;
 
-    let engage_key = (engaged, self_bt_target, self_status, goal_engaged);
+    let engage_key = (engaged, self_bt_target, self_status, goal_engaged, dead);
     if *last_engage_log != Some(engage_key) {
         *last_engage_log = Some(engage_key);
         info!(
@@ -262,6 +263,8 @@ pub fn derive_bgm_playback_state(
             self_bt_target_id = self_bt_target,
             self_status_byte = self_status,
             reactor_goal_engaged = goal_engaged,
+            dead,
+            death_homepoint_secs = ?snap.death_homepoint_secs,
             in_party,
             "engage signals: battle music driven by reactor goal OR bt_target"
         );

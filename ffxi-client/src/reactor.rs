@@ -325,10 +325,14 @@ impl Reactor {
 
         // Emit (don't just set) the reset: a silent reset left the folded
         // current_goal stuck at Engaged across a death / home-point warp.
-        if matches!(
+        let died = matches!(
             ev,
-            AgentEvent::ZoneChanged { .. } | AgentEvent::DeathTimerUpdated { .. }
-        ) && !matches!(self.goal, Goal::Idle)
+            AgentEvent::DeathTimerUpdated {
+                seconds_until_homepoint: Some(_)
+            }
+        );
+        if (died || matches!(ev, AgentEvent::ZoneChanged { .. }))
+            && !matches!(self.goal, Goal::Idle)
         {
             self.goal = Goal::Idle;
             out.push(AgentEvent::ReactorGoalChanged {
@@ -1410,7 +1414,7 @@ mod tests {
         assert!(matches!(r.current_goal(), Goal::Engaged { .. }));
 
         let derived = r.observe_event(&AgentEvent::DeathTimerUpdated {
-            seconds_until_homepoint: 60,
+            seconds_until_homepoint: Some(60),
         });
         assert!(
             matches!(r.current_goal(), Goal::Idle),
@@ -1447,12 +1451,27 @@ mod tests {
         assert!(matches!(r.current_goal(), Goal::Idle));
 
         let derived = r.observe_event(&AgentEvent::DeathTimerUpdated {
-            seconds_until_homepoint: 60,
+            seconds_until_homepoint: Some(60),
         });
         assert!(
             !emits_idle_goal(&derived),
             "already Idle: no spurious goal-change event while dead"
         );
+    }
+
+    #[test]
+    fn revive_event_does_not_disengage() {
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        r.handle_command(AgentCommand::Engage { target_id: 99 });
+        let derived = r.observe_event(&AgentEvent::DeathTimerUpdated {
+            seconds_until_homepoint: None,
+        });
+        assert!(
+            matches!(r.current_goal(), Goal::Engaged { .. }),
+            "an alive CHAR_STATUS (None) must not disengage"
+        );
+        assert!(!emits_idle_goal(&derived));
     }
 
     #[test]

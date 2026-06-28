@@ -834,7 +834,7 @@ impl SessionState {
             AgentEvent::DeathTimerUpdated {
                 seconds_until_homepoint,
             } => {
-                self.death_homepoint_secs = Some(*seconds_until_homepoint);
+                self.death_homepoint_secs = *seconds_until_homepoint;
             }
             AgentEvent::WeatherUpdated { weather_number } => {
                 self.current_weather = Some(*weather_number);
@@ -1038,7 +1038,7 @@ pub enum AgentEvent {
     },
 
     DeathTimerUpdated {
-        seconds_until_homepoint: u32,
+        seconds_until_homepoint: Option<u32>,
     },
 
     MusicVolumeChanged {
