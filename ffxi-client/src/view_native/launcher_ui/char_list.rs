@@ -116,7 +116,7 @@ pub(super) fn spawn_char_list_ui(
                         r.spawn(button(
                             ButtonProps::default(),
                             (),
-                            Spawn((Text::new("×"), ThemedText)),
+                            Spawn((Text::new("Delete"), ThemedText)),
                         ))
                         .observe(
                             move |_ev: On<Activate>,
@@ -154,17 +154,6 @@ pub(super) fn spawn_char_list_ui(
                               mut next: ResMut<NextState<LauncherState>>| {
                             cursor.0 = new_char_index;
                             next.set(LauncherState::CharCreate);
-                        },
-                    );
-
-                    r.spawn(button(
-                        ButtonProps::default(),
-                        (),
-                        Spawn((Text::new("Back to login"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::Login);
                         },
                     );
                 });

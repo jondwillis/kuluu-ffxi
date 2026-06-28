@@ -222,9 +222,9 @@ fn spawn_titlebar(
     title_text: impl Into<String>,
     action: NavAction,
 ) {
-    let glyph = match &action {
+    let label = match &action {
         NavAction::Close => "×",
-        NavAction::Back(_) => "<",
+        NavAction::Back(_) => "Back to login",
     };
     parent
         .spawn(Node {
@@ -252,7 +252,7 @@ fn spawn_titlebar(
                 let mut btn = slot.spawn(button(
                     ButtonProps::default(),
                     (),
-                    Spawn((Text::new(glyph), ThemedText)),
+                    Spawn((Text::new(label), ThemedText)),
                 ));
                 match action {
                     NavAction::Close => {
