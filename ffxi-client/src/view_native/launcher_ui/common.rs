@@ -248,25 +248,27 @@ fn spawn_titlebar(
                 TextColor(Color::srgb(0.0, 1.0, 1.0)),
                 ThemedText,
             ));
-            let mut btn = bar.spawn(button(
-                ButtonProps::default(),
-                (),
-                Spawn((Text::new(glyph), ThemedText)),
-            ));
-            match action {
-                NavAction::Close => {
-                    btn.observe(|_ev: On<Activate>, mut exit: MessageWriter<AppExit>| {
-                        exit.write_default();
-                    });
+            bar.spawn(Node::default()).with_children(|slot| {
+                let mut btn = slot.spawn(button(
+                    ButtonProps::default(),
+                    (),
+                    Spawn((Text::new(glyph), ThemedText)),
+                ));
+                match action {
+                    NavAction::Close => {
+                        btn.observe(|_ev: On<Activate>, mut exit: MessageWriter<AppExit>| {
+                            exit.write_default();
+                        });
+                    }
+                    NavAction::Back(target) => {
+                        btn.observe(
+                            move |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(target.clone());
+                            },
+                        );
+                    }
                 }
-                NavAction::Back(target) => {
-                    btn.observe(
-                        move |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(target.clone());
-                        },
-                    );
-                }
-            }
+            });
         });
 }
 

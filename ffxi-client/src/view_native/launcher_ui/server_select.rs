@@ -51,10 +51,6 @@ pub(super) fn spawn_ui(
                 spawn_close_titlebar(panel, "Servers");
                 if n == 0 {
                     panel.spawn(hint("No servers saved yet — click '+ Add server' below."));
-                } else {
-                    panel.spawn(hint(
-                        "Click a server to pick it. Use Edit / × for per-row actions.",
-                    ));
                 }
 
                 for (idx, s) in servers.iter().enumerate() {
@@ -161,7 +157,7 @@ pub(super) fn spawn_ui(
                         let (del_label, del_variant) = if armed {
                             ("Confirm?", ButtonVariant::Primary)
                         } else {
-                            ("×", ButtonVariant::Normal)
+                            ("Delete", ButtonVariant::Normal)
                         };
                         r.spawn(button(
                             ButtonProps {
