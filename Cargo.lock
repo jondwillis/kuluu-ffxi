@@ -3027,6 +3027,7 @@ dependencies = [
  "bevy",
  "bevy_framepace",
  "clap",
+ "dirs",
  "ffxi-dat",
  "ffxi-event",
  "ffxi-nav",

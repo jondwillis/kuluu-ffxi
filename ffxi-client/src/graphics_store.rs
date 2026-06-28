@@ -54,10 +54,10 @@ impl GraphicsStore {
 }
 
 pub fn load_or_default() -> (GraphicsSettings, GraphicsStore) {
-    let path = match crate::config_dir::migrate_then("graphics.json") {
+    let path = match GraphicsStore::default_path() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(error = %e, "graphics: no XDG/HOME path; using High preset");
+            tracing::warn!(error = %e, "graphics: no config dir; using High preset");
             return (
                 GraphicsSettings::default(),
                 GraphicsStore::new(std::env::temp_dir().join("ffxi-graphics.json")),

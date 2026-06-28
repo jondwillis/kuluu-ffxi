@@ -82,6 +82,11 @@ clap.workspace = true
 # distinct from the JSON flavor's anyhow! bails.
 mac_address = "1"
 thiserror = "1"
+# Native per-platform user config dir (macOS ~/Library/Application Support,
+# Windows %APPDATA%\Roaming, Linux $XDG_CONFIG_HOME else ~/.config) for the
+# launcher/graphics/keybinds/goal stores. Wraps the OS APIs and applies the XDG
+# basedir spec (empty/relative values ignored), so we don't hand-roll any of it.
+dirs = "5"
 # Already linked transitively via ffxi-nav-recast with the identical
 # default-features = false, features = ["tls"] spec, so the lock and binary are
 # unchanged. The launcher's update check uses it for a CA-validated GitHub API

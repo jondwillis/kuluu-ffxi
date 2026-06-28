@@ -26,11 +26,6 @@ impl GoalStore {
         crate::config_dir::config_file("goal.json")
     }
 
-    pub fn open_default() -> Result<GoalStore> {
-        let path = crate::config_dir::migrate_then("goal.json")?;
-        Ok(GoalStore::new(path))
-    }
-
     pub fn path(&self) -> &Path {
         &self.path
     }

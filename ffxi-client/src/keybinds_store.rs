@@ -100,10 +100,10 @@ impl KeybindsStore {
 }
 
 pub fn load_or_default() -> (Bindings, PersistedKeybinds) {
-    let path = match crate::config_dir::migrate_then("keybinds.json") {
+    let path = match KeybindsStore::default_path() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(error = %e, "keybinds: no XDG/HOME path; using default Compact 2");
+            tracing::warn!(error = %e, "keybinds: no config dir; using default Compact 2");
             let kb = PersistedKeybinds::from_preset(Preset::default());
             return (kb.clone().into_bindings(), kb);
         }
