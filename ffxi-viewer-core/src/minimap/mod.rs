@@ -329,6 +329,8 @@ pub fn spawn_minimap_as_child(p: &mut ChildSpawnerCommands, images: &mut Assets<
             },
         ));
 
+        crate::hud::compass::spawn_compass_overlay_as_child(p);
+
         p.spawn((
             Button,
             MinimapResetButton,

@@ -67,7 +67,6 @@ pub fn spawn_bottom_left_stack(
         .with_children(|p| {
             chat_panel::spawn_chat_panels_as_children(p);
             chat_panel::spawn_chat_tab_bar_as_child(p);
-            target_action_menu::spawn_target_action_menu_as_child(p);
 
             p.spawn(Node {
                 flex_direction: FlexDirection::Row,
@@ -76,19 +75,32 @@ pub fn spawn_bottom_left_stack(
                 ..default()
             })
             .with_children(|row| {
-                #[cfg(not(target_arch = "wasm32"))]
-                crate::minimap::spawn_minimap_as_child(row, &mut images);
-
                 row.spawn(Node {
                     flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::FlexStart,
                     row_gap: Val::Px(4.0),
                     ..default()
                 })
                 .with_children(|col| {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    crate::minimap::spawn_minimap_as_child(col, &mut images);
+
+                    #[cfg(target_arch = "wasm32")]
                     compass::spawn_compass_as_child(col);
-                    vana_clock::spawn_vana_clock_as_child(col);
-                    weather_icon::spawn_weather_icon_as_child(col);
+
+                    col.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(4.0),
+                        ..default()
+                    })
+                    .with_children(|under| {
+                        vana_clock::spawn_vana_clock_as_child(under);
+                        weather_icon::spawn_weather_icon_as_child(under);
+                    });
                 });
+
+                target_action_menu::spawn_target_action_menu_as_child(row);
             });
         });
 }

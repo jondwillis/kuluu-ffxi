@@ -11,6 +11,39 @@ pub struct CompassLabel;
 
 const PANEL_SIZE_PX: f32 = 32.0;
 
+const OVERLAY_BG: Color = Color::srgba(0.04, 0.04, 0.04, 0.66);
+
+pub fn spawn_compass_overlay_as_child(p: &mut ChildSpawnerCommands) {
+    p.spawn((
+        CompassPanel,
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(3.0),
+            left: Val::Px(3.0),
+            min_width: Val::Px(20.0),
+            padding: UiRect::axes(Val::Px(4.0), Val::Px(1.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        ZIndex(15),
+        BackgroundColor(OVERLAY_BG),
+        BorderColor::all(palette::BORDER),
+    ))
+    .with_children(|p| {
+        p.spawn((
+            CompassLabel,
+            Text::new("—"),
+            TextFont {
+                font_size: 13.0,
+                ..default()
+            },
+            TextColor(palette::ACCENT),
+        ));
+    });
+}
+
 pub fn spawn_compass_as_child(p: &mut ChildSpawnerCommands) {
     p.spawn((
         CompassPanel,
