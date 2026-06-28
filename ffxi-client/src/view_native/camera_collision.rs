@@ -109,8 +109,9 @@ pub fn clamp_chase_camera_to_collision(
     }
 
     let now = time.elapsed_secs();
-    if now - *last_probe_log >= 1.0 {
+    if now - *last_probe_log >= 1.0 && tracing::enabled!(tracing::Level::DEBUG) {
         *last_probe_log = now;
+        let probe_start = std::time::Instant::now();
 
         let mut brute_hit_t = wanted;
         let mut brute_hit_any = false;
@@ -149,6 +150,7 @@ pub fn clamp_chase_camera_to_collision(
             total_tris,
             "camera_collision probe: per-cast outcome"
         );
+        ffxi_viewer_core::perf_probe::note_debug_probe(probe_start.elapsed());
     }
 
     let target = (hit_t - WALL_PAD).min(wanted).max(ANCHOR_EPSILON);

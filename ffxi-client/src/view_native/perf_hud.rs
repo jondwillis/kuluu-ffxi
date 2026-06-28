@@ -43,12 +43,19 @@ pub struct PerfMonitor {
     prev_model_loads: u64,
     prev_nameplate_rasters: u64,
     prev_rebuilds: u64,
+    prev_probe_ns: u64,
     rebuild_rate: f32,
+
+    last_d_model: u64,
+    last_d_rasters: u64,
+    last_d_rebuilds: u64,
+    last_d_probe_us: u64,
 
     spike_model_loads: u64,
     spike_nameplate_rasters: u64,
     spike_rebuilt: bool,
     spike_rebuild_us: u64,
+    spike_probe_us: u64,
 
     log_cooldown_s: f32,
     suppressed: u32,
@@ -69,11 +76,17 @@ impl Default for PerfMonitor {
             prev_model_loads: 0,
             prev_nameplate_rasters: 0,
             prev_rebuilds: 0,
+            prev_probe_ns: 0,
             rebuild_rate: 0.0,
+            last_d_model: 0,
+            last_d_rasters: 0,
+            last_d_rebuilds: 0,
+            last_d_probe_us: 0,
             spike_model_loads: 0,
             spike_nameplate_rasters: 0,
             spike_rebuilt: false,
             spike_rebuild_us: 0,
+            spike_probe_us: 0,
             log_cooldown_s: 0.0,
             suppressed: 0,
         }
@@ -101,13 +114,28 @@ pub fn update_perf_monitor(
     let model = perf_probe::model_loads();
     let rasters = perf_probe::nameplate_rasters();
     let rebuilds = source.rebuilds_total;
+    let probe_ns = perf_probe::debug_probe_ns();
     let d_model = model.wrapping_sub(m.prev_model_loads);
     let d_rasters = rasters.wrapping_sub(m.prev_nameplate_rasters);
     let d_rebuilds = rebuilds.wrapping_sub(m.prev_rebuilds);
+    let d_probe_us = probe_ns.wrapping_sub(m.prev_probe_ns) / 1000;
     m.prev_model_loads = model;
     m.prev_nameplate_rasters = rasters;
     m.prev_rebuilds = rebuilds;
+    m.prev_probe_ns = probe_ns;
     m.rebuild_rate = m.rebuild_rate * 0.9 + (d_rebuilds as f32 / dt) * 0.1;
+
+    // `Time` delta is sampled at frame start but the counters here are read mid-Update, so a
+    // spike's cause can land one frame either side of its measured duration; sum a two-frame
+    // window to attribute it regardless of intra-frame system ordering.
+    let w_model = d_model + m.last_d_model;
+    let w_rasters = d_rasters + m.last_d_rasters;
+    let w_rebuilds = d_rebuilds + m.last_d_rebuilds;
+    let w_probe_us = d_probe_us + m.last_d_probe_us;
+    m.last_d_model = d_model;
+    m.last_d_rasters = d_rasters;
+    m.last_d_rebuilds = d_rebuilds;
+    m.last_d_probe_us = d_probe_us;
 
     if !m.seen_first {
         m.baseline_ms = dt_ms;
@@ -132,10 +160,11 @@ pub fn update_perf_monitor(
             m.interval_ema_s * 0.6 + interval * 0.4
         };
     }
-    m.spike_model_loads = d_model;
-    m.spike_nameplate_rasters = d_rasters;
-    m.spike_rebuilt = d_rebuilds > 0;
+    m.spike_model_loads = w_model;
+    m.spike_nameplate_rasters = w_rasters;
+    m.spike_rebuilt = w_rebuilds > 0;
     m.spike_rebuild_us = source.last_rebuild_us;
+    m.spike_probe_us = w_probe_us;
     m.secs_since_spike = 0.0;
 
     if m.log_cooldown_s > 0.0 {
@@ -157,7 +186,7 @@ pub fn update_perf_monitor(
     };
     warn!(
         target: "perf",
-        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} {rebuild}, model+{d_model} plate+{d_rasters}{extra}",
+        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s{extra}",
         m.baseline_ms,
         dt_ms - m.baseline_ms,
     );
@@ -315,7 +344,7 @@ fn build_text_lines(
 
     let cause = (
         format!(
-            "on spike: {}  model+{} plate+{}   snap {}\u{00b5}s n:{}  {:.0} rebuild/s",
+            "on spike: {}  model+{} plate+{} probe {}\u{00b5}s   snap {}\u{00b5}s n:{}  {:.0} rebuild/s",
             if m.spike_rebuilt {
                 format!("rebuild {}\u{00b5}s", m.spike_rebuild_us)
             } else {
@@ -323,6 +352,7 @@ fn build_text_lines(
             },
             m.spike_model_loads,
             m.spike_nameplate_rasters,
+            m.spike_probe_us,
             source.last_rebuild_us,
             source.last_entity_count,
             m.rebuild_rate,
