@@ -1,4 +1,4 @@
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::TAU;
 
 use bevy::prelude::*;
 
@@ -28,7 +28,14 @@ const ARROW_BORDER_THICK: f32 = 0.02;
 
 const RING_Y_LIFT: f32 = 0.08;
 
-const TARGET_RING_RADIUS: f32 = 1.4;
+const TARGET_RING_RADIUS: f32 = 0.8;
+
+const RING_SEGMENTS: usize = 48;
+
+const RING_RADIUS_FACTOR: f32 = 1.1;
+const RADIUS_PER_HEIGHT: f32 = 0.14;
+
+const MAX_GROUND_STEP: f32 = 2.0;
 
 const RING_NEUTRAL_RGB: [f32; 3] = [1.00, 0.82, 0.30];
 const RING_ENGAGED_RGB: [f32; 3] = [1.00, 0.16, 0.12];
@@ -147,17 +154,50 @@ fn ring_pulse(seconds: f32) -> (f32, f32) {
     (brightness, radius_scale)
 }
 
+fn model_ring_radius(baked: Option<&BakedActor>) -> f32 {
+    match baked {
+        Some(b) => (b.actor_height * RADIUS_PER_HEIGHT).clamp(0.5, 2.0) * RING_RADIUS_FACTOR,
+        None => TARGET_RING_RADIUS,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn draw_target_ring_system(
     target: Res<Target>,
     state: Res<SceneState>,
     time: Res<Time>,
-    world_q: Query<(&Transform, &WorldEntity)>,
+    world_q: Query<(&Transform, &WorldEntity, Option<&BakedActor>)>,
+    geom: Option<Res<crate::dat_mzb::MzbCollisionGeometry>>,
     mut gizmos: Gizmos,
+) {
+    let ground = |xz: Vec2, ref_y: f32| geom.as_ref().and_then(|g| g.ground_nearest(xz, ref_y));
+    draw_target_ring(&target, &state, &time, &world_q, &ground, &mut gizmos);
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn draw_target_ring_system(
+    target: Res<Target>,
+    state: Res<SceneState>,
+    time: Res<Time>,
+    world_q: Query<(&Transform, &WorldEntity, Option<&BakedActor>)>,
+    mut gizmos: Gizmos,
+) {
+    let ground = |_xz: Vec2, _ref_y: f32| None;
+    draw_target_ring(&target, &state, &time, &world_q, &ground, &mut gizmos);
+}
+
+fn draw_target_ring(
+    target: &Target,
+    state: &SceneState,
+    time: &Time,
+    world_q: &Query<(&Transform, &WorldEntity, Option<&BakedActor>)>,
+    ground: &impl Fn(Vec2, f32) -> Option<f32>,
+    gizmos: &mut Gizmos,
 ) {
     let Some(target_id) = target.id else {
         return;
     };
-    let base = if engaged_on(&state, target_id) {
+    let base = if engaged_on(state, target_id) {
         RING_ENGAGED_RGB
     } else {
         RING_NEUTRAL_RGB
@@ -170,32 +210,59 @@ pub fn draw_target_ring_system(
         base[1] * brightness,
         base[2] * brightness,
     );
-    let radius = TARGET_RING_RADIUS * radius_scale;
 
-    for (tr, w) in &world_q {
+    for (tr, w, baked) in world_q.iter() {
         if w.id != target_id {
             continue;
         }
-        let pos = Vec3::new(
-            tr.translation.x,
-            tr.translation.y + RING_Y_LIFT,
-            tr.translation.z,
-        );
-        let iso = Isometry3d::new(pos, Quat::from_rotation_x(-PI / 2.0));
-
-        for dr in RING_THICKNESS {
-            gizmos.circle(iso, radius + dr, color);
-        }
-
+        let radius = model_ring_radius(baked) * radius_scale;
+        let center = Vec2::new(tr.translation.x, tr.translation.z);
         let spin = t * RING_SPIN_RATE;
-        for i in 0..RING_TICKS {
-            let a = spin + (i as f32 / RING_TICKS as f32) * TAU;
-            let dir = Vec3::new(a.cos(), 0.0, a.sin());
-            let inner = pos + dir * (radius - RING_TICK_LEN);
-            let outer = pos + dir * (radius + RING_TICK_LEN);
-            gizmos.line(inner, outer, color);
-        }
+        draw_ground_ring(
+            gizmos,
+            center,
+            tr.translation.y,
+            radius,
+            color,
+            spin,
+            ground,
+        );
         break;
+    }
+}
+
+fn draw_ground_ring(
+    gizmos: &mut Gizmos,
+    center: Vec2,
+    ref_y: f32,
+    radius: f32,
+    color: LinearRgba,
+    spin: f32,
+    ground: &impl Fn(Vec2, f32) -> Option<f32>,
+) {
+    let point_at = |angle: f32, r: f32| {
+        let xz = center + Vec2::new(angle.cos(), angle.sin()) * r;
+        let floor = ground(xz, ref_y).filter(|y| (y - ref_y).abs() <= MAX_GROUND_STEP);
+        let y = floor.unwrap_or(ref_y) + RING_Y_LIFT;
+        Vec3::new(xz.x, y, xz.y)
+    };
+
+    for dr in RING_THICKNESS {
+        let r = radius + dr;
+        let mut prev = point_at(0.0, r);
+        for i in 1..=RING_SEGMENTS {
+            let a = (i as f32 / RING_SEGMENTS as f32) * TAU;
+            let cur = point_at(a, r);
+            gizmos.line(prev, cur, color);
+            prev = cur;
+        }
+    }
+
+    for i in 0..RING_TICKS {
+        let a = spin + (i as f32 / RING_TICKS as f32) * TAU;
+        let inner = point_at(a, radius - RING_TICK_LEN);
+        let outer = point_at(a, radius + RING_TICK_LEN);
+        gizmos.line(inner, outer, color);
     }
 }
 
