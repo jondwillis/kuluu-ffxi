@@ -133,6 +133,13 @@ impl EventVm {
         self.exec_pointer
     }
 
+    /// `Work_Zone[index]` as a signed value. `Work_Zone[1]` is the event-end
+    /// result the client returns in the 0x05B `EndPara`
+    /// (research/XiPackets/world/client/0x005B).
+    pub fn work_zone(&self, index: usize) -> i32 {
+        self.work_zone.get(index).copied().unwrap_or(0) as i32
+    }
+
     /// Run opcodes until the VM yields (one `EventIdle` tick).
     pub fn step(&mut self) -> StepResult {
         if self.finished {

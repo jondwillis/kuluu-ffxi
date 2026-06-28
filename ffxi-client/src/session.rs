@@ -1265,8 +1265,8 @@ async fn keepalive_loop(
                                     emit_event_speech_to_chat(&event_tx, &dialog);
                                     let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                                 }
-                                crate::event_dialog::Advance::Ended => {
-                                    let payload = build_subpacket_event_end(sub_seq, u, a, n, 0);
+                                crate::event_dialog::Advance::Ended { end_para } => {
+                                    let payload = build_subpacket_event_end(sub_seq, u, a, n, end_para);
                                     sub_seq = sub_seq.wrapping_add(1);
                                     if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
                                         tracing::warn!(error = %e, "EVENT_END (vm) send failed");
@@ -1287,6 +1287,8 @@ async fn keepalive_loop(
                             }
                             bundle_seq = bundle_seq.wrapping_add(1);
                             let _ = event_tx.send(AgentEvent::EventEnded);
+                        } else {
+                            let _ = event_tx.send(AgentEvent::EventEnded);
                         }
                     }
                     Some(AgentCommand::EndEventChoice {
@@ -1303,8 +1305,8 @@ async fn keepalive_loop(
                                     emit_event_speech_to_chat(&event_tx, &dialog);
                                     let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                                 }
-                                crate::event_dialog::Advance::Ended => {
-                                    let payload = build_subpacket_event_end(sub_seq, u, a, n, choice);
+                                crate::event_dialog::Advance::Ended { end_para } => {
+                                    let payload = build_subpacket_event_end(sub_seq, u, a, n, end_para);
                                     sub_seq = sub_seq.wrapping_add(1);
                                     if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
                                         tracing::warn!(error = %e, "EVENT_END (vm choice) send failed");

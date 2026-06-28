@@ -29,8 +29,9 @@ struct ActiveEvent {
 pub enum Advance {
     /// Show the next frame.
     Frame(DialogState),
-    /// The event is over — the caller sends EVENT_END.
-    Ended,
+    /// The event is over — the caller sends EVENT_END with `end_para` as the
+    /// 0x05B `EndPara` (the VM's `Work_Zone[1]`, or a cancel sentinel).
+    Ended { end_para: u32 },
 }
 
 pub struct DialogSession {
@@ -102,7 +103,7 @@ impl DialogSession {
                 self.active = Some(active);
                 Some(dialog)
             }
-            DialogStep::Ended | DialogStep::Stopped(_) => {
+            DialogStep::Ended { .. } | DialogStep::Stopped(_) => {
                 self.clear();
                 None
             }
@@ -121,16 +122,20 @@ impl DialogSession {
             self.active.as_ref(),
         ) else {
             self.clear();
-            return Advance::Ended;
+            return Advance::Ended { end_para: 0 };
         };
         match runner.advance(choice, strings) {
             DialogStep::Frame(frame) => {
                 let dialog = frame_to_dialog(active, frame);
                 Advance::Frame(dialog)
             }
-            DialogStep::Ended | DialogStep::Stopped(_) => {
+            DialogStep::Ended { end_para } => {
                 self.clear();
-                Advance::Ended
+                Advance::Ended { end_para }
+            }
+            DialogStep::Stopped(_) => {
+                self.clear();
+                Advance::Ended { end_para: 0 }
             }
         }
     }

@@ -21,8 +21,11 @@ pub enum DialogStep {
     /// Show this frame and wait for the player; pass their response to the next
     /// [`DialogRunner::advance`].
     Frame(DialogFrame),
-    /// The event finished (or cancelled) — the session sends EVENT_END.
-    Ended,
+    /// The event finished — the session sends EVENT_END with `end_para`, the
+    /// value the client returns in the 0x05B `EndPara`: `Work_Zone[1]` for a
+    /// normal end, `0x40000000` for a cancel (research/XiPackets/world/client/
+    /// 0x005B).
+    Ended { end_para: u32 },
     /// Hit an opcode the VM can't run; the session falls back (EVENT_END) rather
     /// than render a wrong frame. `op` is the opcode value.
     Stopped(u8),
@@ -83,7 +86,16 @@ impl DialogRunner {
                         choices,
                     });
                 }
-                StepResult::Done | StepResult::Cancelled => return DialogStep::Ended,
+                StepResult::Done => {
+                    return DialogStep::Ended {
+                        end_para: self.vm.work_zone(1) as u32,
+                    }
+                }
+                StepResult::Cancelled => {
+                    return DialogStep::Ended {
+                        end_para: 0x4000_0000,
+                    }
+                }
                 StepResult::Unimplemented(op) => return DialogStep::Stopped(op),
             }
         }
@@ -216,7 +228,7 @@ mod tests {
                     for _ in 0..16 {
                         match runner.advance(Some(0), &strings) {
                             DialogStep::Frame(_) => frames += 1,
-                            DialogStep::Ended => {
+                            DialogStep::Ended { .. } => {
                                 ended += 1;
                                 break;
                             }
@@ -272,7 +284,7 @@ mod tests {
         for _ in 0..16 {
             match runner.advance(Some(0), &strings) {
                 DialogStep::Frame(f) => frames.push(f.text),
-                DialogStep::Ended => {
+                DialogStep::Ended { .. } => {
                     ended = true;
                     break;
                 }
@@ -284,5 +296,48 @@ mod tests {
             frames.iter().any(|f| !f.trim().is_empty()),
             "event 32759 produced no real dialog text: {frames:?}"
         );
+    }
+
+    /// Picking the first option of Harara's menu ("Would you cast Signet on me?")
+    /// must end the event with `end_para == 1` — the `Work_Zone[1]` the client
+    /// returns in the 0x05B `EndPara`, which is the exact value
+    /// vendor/server/scripts/globals/conquest.lua (overseerOnEventFinish:
+    /// `if option == 1`) requires to grant Signet. Self-skips without an install.
+    #[test]
+    fn harara_signet_pick_returns_option_1() {
+        let Some(root) = install() else {
+            eprintln!("skipping: no FFXI install");
+            return;
+        };
+        const ZONE: u16 = 241;
+        const HARARA: u32 = 17_764_543;
+        const TALK_EVENT: u16 = 32759;
+        const ACT_INDEX: u16 = 0xBF;
+
+        let eloc = ffxi_dat::event_locate::zone_id_to_event_location(ZONE).expect("event loc");
+        let edat = EventDat::parse(&std::fs::read(eloc.path_under(root.root())).expect("read"))
+            .expect("parse event dat");
+        let sfid = ffxi_dat::zone_dat::zone_id_to_string_file_id(ZONE).expect("string file id");
+        let sloc = root.resolve(sfid).expect("resolve string dat");
+        let strings = StringDat::parse(
+            &std::fs::read(sloc.path_under(root.root())).expect("read string dat"),
+        )
+        .expect("parse string dat");
+
+        let block = edat.block_for_actor(HARARA).expect("harara block");
+        let mut runner = DialogRunner::start(block, TALK_EVENT, ACT_INDEX).expect("event 32759");
+
+        let mut end_para = None;
+        for _ in 0..32 {
+            match runner.advance(Some(0), &strings) {
+                DialogStep::Frame(_) => {}
+                DialogStep::Ended { end_para: ep } => {
+                    end_para = Some(ep);
+                    break;
+                }
+                DialogStep::Stopped(op) => panic!("event 32759 stopped on opcode 0x{op:02X}"),
+            }
+        }
+        assert_eq!(end_para, Some(1), "Signet pick must return EndPara == 1");
     }
 }

@@ -2440,9 +2440,9 @@ fn handle_dialog_key(
         return None;
     }
     if bindings.matches_logical(Action::NavCancel, key) {
+        // Reconcile via the session snapshot; clearing here flickers multi-frame events.
         let _ = cmd_tx.try_send(AgentCommand::EndEvent);
-        scene_state.snapshot.dialog = None;
-        return Some(InputMode::World);
+        return None;
     }
     None
 }
