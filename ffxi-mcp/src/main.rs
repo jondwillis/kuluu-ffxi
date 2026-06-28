@@ -574,7 +574,7 @@ impl ServerHandler for FfxiServer {
                 "goal://current",
                 "goal",
                 "application/json",
-                "Last goal command (Follow/Engage/PathTo) — persisted to ~/.config/ffxi-mcp/goal.json.",
+                "Last goal command (Follow/Engage/PathTo) — persisted to ~/.config/kuluu/goal.json.",
             ),
             mk(
                 "inventory://current",
@@ -1050,12 +1050,11 @@ async fn main() -> Result<()> {
         })
     };
 
-    let goal_path = match std::env::var("FFXI_MCP_GOAL_PATH") {
-        Ok(p) => std::path::PathBuf::from(p),
-        Err(_) => GoalStore::default_path()
+    let goal_store = match std::env::var("FFXI_MCP_GOAL_PATH") {
+        Ok(p) => GoalStore::new(std::path::PathBuf::from(p)),
+        Err(_) => GoalStore::open_default()
             .context("resolve goal_store path; set FFXI_MCP_GOAL_PATH to override")?,
     };
-    let goal_store = GoalStore::new(goal_path);
 
     let relay_addr: Option<std::net::SocketAddr> = match std::env::var("FFXI_RELAY_LISTEN") {
         Ok(s) if !s.is_empty() => match relay::parse_relay_listen(&s) {

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use bevy::prelude::Resource;
 use ffxi_viewer_core::{Action, Bindings, KeyBind, Preset};
 use serde::{Deserialize, Serialize};
@@ -66,16 +66,7 @@ impl KeybindsStore {
     }
 
     pub fn default_path() -> Result<PathBuf> {
-        let base = std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| PathBuf::from(h).join(".config"))
-            })
-            .ok_or_else(|| anyhow!("neither $XDG_CONFIG_HOME nor $HOME set"))?;
-        Ok(base.join("ffxi-mcp").join("keybinds.json"))
+        crate::config_dir::config_file("keybinds.json")
     }
 
     pub fn path(&self) -> &Path {
@@ -109,7 +100,7 @@ impl KeybindsStore {
 }
 
 pub fn load_or_default() -> (Bindings, PersistedKeybinds) {
-    let path = match KeybindsStore::default_path() {
+    let path = match crate::config_dir::migrate_then("keybinds.json") {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "keybinds: no XDG/HOME path; using default Compact 2");
@@ -154,6 +145,16 @@ mod tests {
             std::process::id()
         ));
         p
+    }
+
+    #[test]
+    fn default_path_uses_player_facing_dir() {
+        let path = KeybindsStore::default_path().unwrap();
+        assert!(
+            path.ends_with("kuluu/keybinds.json"),
+            "got {}",
+            path.display()
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod agent_io;
 pub mod agent_socket;
 pub mod auth_binary;
 pub mod auth_client;
+pub mod config_dir;
 pub mod event_dialog;
 pub mod goal_store;
 pub mod launcher_store;

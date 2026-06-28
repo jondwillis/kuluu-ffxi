@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use bevy::prelude::*;
 use ffxi_viewer_core::GraphicsSettings;
 
@@ -20,16 +20,7 @@ impl GraphicsStore {
     }
 
     pub fn default_path() -> Result<PathBuf> {
-        let base = std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| PathBuf::from(h).join(".config"))
-            })
-            .ok_or_else(|| anyhow!("neither $XDG_CONFIG_HOME nor $HOME set"))?;
-        Ok(base.join("ffxi-mcp").join("graphics.json"))
+        crate::config_dir::config_file("graphics.json")
     }
 
     pub fn path(&self) -> &Path {
@@ -63,7 +54,7 @@ impl GraphicsStore {
 }
 
 pub fn load_or_default() -> (GraphicsSettings, GraphicsStore) {
-    let path = match GraphicsStore::default_path() {
+    let path = match crate::config_dir::migrate_then("graphics.json") {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "graphics: no XDG/HOME path; using High preset");
@@ -119,6 +110,16 @@ mod tests {
             std::thread::current().id(),
         ));
         p
+    }
+
+    #[test]
+    fn default_path_uses_player_facing_dir() {
+        let path = GraphicsStore::default_path().unwrap();
+        assert!(
+            path.ends_with("kuluu/graphics.json"),
+            "got {}",
+            path.display()
+        );
     }
 
     #[test]

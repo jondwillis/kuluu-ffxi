@@ -23,16 +23,12 @@ impl GoalStore {
     }
 
     pub fn default_path() -> Result<PathBuf> {
-        let base = std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| PathBuf::from(h).join(".config"))
-            })
-            .ok_or_else(|| anyhow!("neither $XDG_CONFIG_HOME nor $HOME set"))?;
-        Ok(base.join("ffxi-mcp").join("goal.json"))
+        crate::config_dir::config_file("goal.json")
+    }
+
+    pub fn open_default() -> Result<GoalStore> {
+        let path = crate::config_dir::migrate_then("goal.json")?;
+        Ok(GoalStore::new(path))
     }
 
     pub fn path(&self) -> &Path {
@@ -105,6 +101,12 @@ mod tests {
             std::process::id()
         ));
         p
+    }
+
+    #[test]
+    fn default_path_uses_player_facing_dir() {
+        let path = GoalStore::default_path().unwrap();
+        assert!(path.ends_with("kuluu/goal.json"), "got {}", path.display());
     }
 
     #[test]
