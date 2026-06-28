@@ -297,6 +297,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         FixedUpdate,
         input::dispatch_movement_system.run_if(in_state(AppPhase::InGame)),
     );
+    app.add_systems(
+        Update,
+        input::reset_interaction_flags_on_zone_change.run_if(in_state(AppPhase::InGame)),
+    );
 
     app.add_systems(Update, crate::graphics_store::persist_graphics_on_change);
 

@@ -57,6 +57,26 @@ pub struct HeadingTurnAccum {
     pub units: f32,
 }
 
+pub fn reset_interaction_flags_on_zone_change(
+    state: Res<SceneState>,
+    mut prev_zone: Local<Option<Option<u16>>>,
+    mut autorun: ResMut<AutoRun>,
+    mut lock_on: ResMut<LockOn>,
+    mut target: ResMut<Target>,
+    mut rest: ResMut<ffxi_viewer_core::combat_stance::RestStance>,
+) {
+    let zone = state.snapshot.zone_id;
+    let changed = matches!(*prev_zone, Some(p) if p != zone);
+    *prev_zone = Some(zone);
+    if !changed {
+        return;
+    }
+    *autorun = AutoRun::default();
+    lock_on.target_id = None;
+    target.id = None;
+    *rest = ffxi_viewer_core::combat_stance::RestStance::default();
+}
+
 pub fn advance_heading_turn(accum_units: &mut f32, dir: i32, dt_secs: f32) -> (i32, f32) {
     let turn_units_per_sec = HEADING_TURN_RATE * 256.0 / std::f32::consts::TAU;
     let float_delta = dir as f32 * turn_units_per_sec * dt_secs;
