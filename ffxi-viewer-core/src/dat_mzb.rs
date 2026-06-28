@@ -1307,6 +1307,7 @@ pub fn auto_load_zone_geometry_system(
     auto_q: Query<Entity, With<AutoMzbOverlay>>,
     mut mzb_in_flight: ResMut<LoadMzbInFlight>,
     mut mmb_queue: ResMut<crate::dat_mmb::MmbLoadQueue>,
+    mut mmb_in_flight: ResMut<crate::dat_mmb::MmbLoadInFlight>,
 ) {
     let current = scene_state.snapshot.zone_id;
     if current == last.zone_id {
@@ -1325,6 +1326,7 @@ pub fn auto_load_zone_geometry_system(
     mmb_queue
         .pending
         .retain(|r| !(r.entity_id.is_none() && r.world_transform.is_some()));
+    mmb_in_flight.tasks.clear();
     last.zone_id = current;
     let Some(zone_id) = current else { return };
 

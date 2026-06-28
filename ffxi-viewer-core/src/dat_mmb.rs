@@ -6,6 +6,8 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::Image;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use bevy::tasks::futures_lite::future;
+use bevy::tasks::{AsyncComputeTaskPool, Task};
 use ffxi_dat::mmb::{parse_models, MmbHeader};
 use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::{mmb, walk, ChunkKind, DatRoot};
@@ -34,6 +36,11 @@ pub struct MmbLoadQueue {
 #[derive(Resource, Default)]
 pub struct MmbParseCache {
     pub by_asset: std::collections::HashMap<(u32, usize), Option<LoadedMmb>>,
+}
+
+#[derive(Resource, Default)]
+pub struct MmbLoadInFlight {
+    pub tasks: std::collections::HashMap<(u32, usize), Task<Option<LoadedMmb>>>,
 }
 
 #[derive(Resource, Default)]
@@ -77,6 +84,7 @@ impl Plugin for DatOverlayPlugin {
             .init_resource::<MmbHandleCache>()
             .init_resource::<MmbLoadQueue>()
             .init_resource::<MmbParseCache>()
+            .init_resource::<MmbLoadInFlight>()
             .init_resource::<MmbTexPools>()
             .init_resource::<AppliedTextureFiltering>()
             .init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
@@ -282,7 +290,22 @@ pub fn process_load_mmb_requests(
     mut tex_pools_res: ResMut<MmbTexPools>,
     settings: Res<GraphicsSettings>,
     self_q: Query<&GlobalTransform, With<crate::components::IsSelf>>,
+    mut in_flight: ResMut<MmbLoadInFlight>,
 ) {
+    let mut newly_parsed: Vec<((u32, usize), Option<LoadedMmb>)> = Vec::new();
+    in_flight.tasks.retain(
+        |asset, task| match future::block_on(future::poll_once(task)) {
+            Some(result) => {
+                newly_parsed.push((*asset, result));
+                false
+            }
+            None => true,
+        },
+    );
+    for (asset, result) in newly_parsed {
+        parse_cache.by_asset.entry(asset).or_insert(result);
+    }
+
     queue.pending.extend(events.read().copied());
     if queue.pending.is_empty() {
         return;
@@ -319,288 +342,308 @@ pub fn process_load_mmb_requests(
 
     const MMB_SPAWN_BUDGET: usize = 96;
     const HEAVY: usize = 8;
-    let mut work = 0usize;
+    const MMB_MAX_INFLIGHT: usize = 64;
+    let mut spawned = 0usize;
+    let mut retained: std::collections::VecDeque<LoadMmbRequest> =
+        std::collections::VecDeque::with_capacity(queue.pending.len());
 
-    while work < MMB_SPAWN_BUDGET {
-        let Some(req) = queue.pending.pop_front() else {
-            break;
-        };
-
+    while let Some(req) = queue.pending.pop_front() {
         if let Some(self_pos) = self_pos {
             if is_zone_placement(&req) && mmb_dist_sq_xz(&req, self_pos) > load_radius_sq {
-                queue.pending.push_front(req);
+                retained.push_back(req);
+                retained.append(&mut queue.pending);
                 break;
             }
         }
 
-        let was_cached = parse_cache
-            .by_asset
-            .contains_key(&(req.file_id, req.chunk_idx));
-        work += if was_cached { 1 } else { HEAVY };
-        let loaded_entry = parse_cache
-            .by_asset
-            .entry((req.file_id, req.chunk_idx))
-            .or_insert_with(|| load_mmb(req.file_id, req.chunk_idx).ok());
-        let Some(loaded) = loaded_entry.as_ref() else {
-            push_system_msg(
-                &mut toasts,
-                format!("/load_mmb {} {}: load failed", req.file_id, req.chunk_idx),
-            );
-
-            if diag_matches(req.file_id) {
-                *diag_load_failed.entry(req.file_id).or_insert(0) += 1;
-            }
-            continue;
-        };
-
-        if diag_matches(req.file_id) {
-            *diag_loaded.entry(req.file_id).or_insert(0) += 1;
-        }
-
-        if loaded.submeshes.is_empty() {
-            if diag_matches(req.file_id) {
-                diag_zero_submesh
-                    .entry(req.file_id)
-                    .or_default()
-                    .push((req.chunk_idx, loaded.asset_name.clone()));
-            }
-
-            if req.world_transform.is_none() {
-                push_system_msg(
-                    &mut toasts,
-                    format!(
-                        "/load_mmb {} {}: 0 renderable sub-records",
-                        req.file_id, req.chunk_idx,
-                    ),
-                );
-            }
-            continue;
-        }
-
-        let texture_count = loaded.textures.len();
-        let quality = TextureQuality {
-            mipmaps: settings.texture_filtering.mipmaps(),
-            anisotropy: settings.texture_filtering.anisotropy(),
-        };
-        let pool = tex_pools_res.by_file.entry(req.file_id).or_insert_with(|| {
-            let mut by_name: std::collections::HashMap<String, Handle<Image>> =
-                std::collections::HashMap::with_capacity(texture_count);
-            let mut first: Option<Handle<Image>> = None;
-            for nt in &loaded.textures {
-                let handle = images.add(decoded_texture_to_image(&nt.texture, quality));
-                if first.is_none() {
-                    first = Some(handle.clone());
+        let asset = (req.file_id, req.chunk_idx);
+        match parse_cache.by_asset.get(&asset) {
+            Some(Some(loaded)) => {
+                if diag_matches(req.file_id) {
+                    *diag_loaded.entry(req.file_id).or_insert(0) += 1;
                 }
-                if !nt.name.is_empty() {
-                    by_name.insert(nt.name.clone(), handle);
-                }
-            }
-            (by_name, first)
-        });
-        let tex_by_name = &pool.0;
-        let first_texture = pool.1.clone();
 
-        if mmb_logged.insert((req.file_id, req.chunk_idx)) {
-            let mut img_stats: Vec<(String, u8, u8)> = loaded
-                .textures
-                .iter()
-                .filter(|nt| !nt.name.is_empty())
-                .map(|nt| {
-                    let (mut amin, mut amax) = (255u8, 0u8);
-                    for px in nt.texture.rgba.chunks_exact(4) {
-                        amin = amin.min(px[3]);
-                        amax = amax.max(px[3]);
+                if loaded.submeshes.is_empty() {
+                    if diag_matches(req.file_id) {
+                        diag_zero_submesh
+                            .entry(req.file_id)
+                            .or_default()
+                            .push((req.chunk_idx, loaded.asset_name.clone()));
                     }
-                    (nt.name.clone(), amin, amax)
-                })
-                .collect();
-            img_stats.sort_by(|a, b| a.0.cmp(&b.0));
-            let img_names: Vec<String> = img_stats
-                .into_iter()
-                .map(|(n, amin, amax)| format!("{n} α[{amin}..{amax}]"))
-                .collect();
-            let mut requested: Vec<&str> = loaded
-                .submeshes
-                .iter()
-                .map(|s| s.variant_name.as_str())
-                .collect();
-            requested.sort_unstable();
-            requested.dedup();
-            let (matched, unmatched): (Vec<&str>, Vec<&str>) = requested
-                .iter()
-                .partition(|n| tex_by_name.contains_key(**n));
 
-            let mut blending_view: Vec<(String, u16)> = loaded
-                .submeshes
-                .iter()
-                .map(|s| (s.variant_name.clone(), s.blending))
-                .collect();
-            blending_view.sort_by(|a, b| a.0.cmp(&b.0));
-            let blending_strs: Vec<String> = blending_view
-                .into_iter()
-                .map(|(name, b)| format!("{name}:0x{b:04X}"))
-                .collect();
-            debug!(
-                target: "ffxi_viewer_core::dat_mmb",
-                file_id = req.file_id,
-                chunk_idx = req.chunk_idx,
-                asset = %loaded.asset_name,
-                mesh_name = %loaded.zone_mesh_name,
-                cutout = loaded.zone_mesh_name.starts_with('_'),
-                submesh_count = loaded.submeshes.len(),
-                img_count = tex_by_name.len(),
-                imgs = ?img_names,
-                matched = ?matched,
-                unmatched = ?unmatched,
-                blending = ?blending_strs,
-                first_fallback = first_texture.is_some(),
-                "MMB texture pool",
-            );
-        }
+                    if req.world_transform.is_none() {
+                        push_system_msg(
+                            &mut toasts,
+                            format!(
+                                "/load_mmb {} {}: 0 renderable sub-records",
+                                req.file_id, req.chunk_idx,
+                            ),
+                        );
+                    }
+                    continue;
+                }
 
-        let is_static_placement = req
-            .entity_id
-            .and_then(|id| tracked.by_id.get(&id))
-            .is_none();
-        let parent = match req.entity_id.and_then(|id| tracked.by_id.get(&id)) {
-            Some(&bevy_e) => {
-                commands.entity(bevy_e).remove::<Mesh3d>();
-                bevy_e
-            }
-            None => {
-                if let Some(missing) = req.entity_id {
-                    push_system_msg(
-                        &mut toasts,
-                        format!(
+                let pool_exists = tex_pools_res.by_file.contains_key(&req.file_id);
+                let cost = if pool_exists { 1 } else { HEAVY };
+                if spawned > 0 && spawned + cost > MMB_SPAWN_BUDGET {
+                    retained.push_back(req);
+                    continue;
+                }
+                spawned += cost;
+
+                let texture_count = loaded.textures.len();
+                let quality = TextureQuality {
+                    mipmaps: settings.texture_filtering.mipmaps(),
+                    anisotropy: settings.texture_filtering.anisotropy(),
+                };
+                let pool = tex_pools_res.by_file.entry(req.file_id).or_insert_with(|| {
+                    let mut by_name: std::collections::HashMap<String, Handle<Image>> =
+                        std::collections::HashMap::with_capacity(texture_count);
+                    let mut first: Option<Handle<Image>> = None;
+                    for nt in &loaded.textures {
+                        let handle = images.add(decoded_texture_to_image(&nt.texture, quality));
+                        if first.is_none() {
+                            first = Some(handle.clone());
+                        }
+                        if !nt.name.is_empty() {
+                            by_name.insert(nt.name.clone(), handle);
+                        }
+                    }
+                    (by_name, first)
+                });
+                let tex_by_name = &pool.0;
+                let first_texture = pool.1.clone();
+
+                if mmb_logged.insert((req.file_id, req.chunk_idx)) {
+                    let mut img_stats: Vec<(String, u8, u8)> = loaded
+                        .textures
+                        .iter()
+                        .filter(|nt| !nt.name.is_empty())
+                        .map(|nt| {
+                            let (mut amin, mut amax) = (255u8, 0u8);
+                            for px in nt.texture.rgba.chunks_exact(4) {
+                                amin = amin.min(px[3]);
+                                amax = amax.max(px[3]);
+                            }
+                            (nt.name.clone(), amin, amax)
+                        })
+                        .collect();
+                    img_stats.sort_by(|a, b| a.0.cmp(&b.0));
+                    let img_names: Vec<String> = img_stats
+                        .into_iter()
+                        .map(|(n, amin, amax)| format!("{n} α[{amin}..{amax}]"))
+                        .collect();
+                    let mut requested: Vec<&str> = loaded
+                        .submeshes
+                        .iter()
+                        .map(|s| s.variant_name.as_str())
+                        .collect();
+                    requested.sort_unstable();
+                    requested.dedup();
+                    let (matched, unmatched): (Vec<&str>, Vec<&str>) = requested
+                        .iter()
+                        .partition(|n| tex_by_name.contains_key(**n));
+
+                    let mut blending_view: Vec<(String, u16)> = loaded
+                        .submeshes
+                        .iter()
+                        .map(|s| (s.variant_name.clone(), s.blending))
+                        .collect();
+                    blending_view.sort_by(|a, b| a.0.cmp(&b.0));
+                    let blending_strs: Vec<String> = blending_view
+                        .into_iter()
+                        .map(|(name, b)| format!("{name}:0x{b:04X}"))
+                        .collect();
+                    debug!(
+                        target: "ffxi_viewer_core::dat_mmb",
+                        file_id = req.file_id,
+                        chunk_idx = req.chunk_idx,
+                        asset = %loaded.asset_name,
+                        mesh_name = %loaded.zone_mesh_name,
+                        cutout = loaded.zone_mesh_name.starts_with('_'),
+                        submesh_count = loaded.submeshes.len(),
+                        img_count = tex_by_name.len(),
+                        imgs = ?img_names,
+                        matched = ?matched,
+                        unmatched = ?unmatched,
+                        blending = ?blending_strs,
+                        first_fallback = first_texture.is_some(),
+                        "MMB texture pool",
+                    );
+                }
+
+                let is_static_placement = req
+                    .entity_id
+                    .and_then(|id| tracked.by_id.get(&id))
+                    .is_none();
+                let parent = match req.entity_id.and_then(|id| tracked.by_id.get(&id)) {
+                    Some(&bevy_e) => {
+                        commands.entity(bevy_e).remove::<Mesh3d>();
+                        bevy_e
+                    }
+                    None => {
+                        if let Some(missing) = req.entity_id {
+                            push_system_msg(
+                                &mut toasts,
+                                format!(
                             "/load_mmb_on {missing} {} {}: no tracked entity for id {missing} \
                              — spawning at world_pos instead",
                             req.file_id, req.chunk_idx,
                         ),
-                    );
-                }
-                let parent_transform = match req.world_transform {
-                    Some(m) => Transform::from_matrix(m),
-                    None => Transform::from_translation(req.world_pos),
+                            );
+                        }
+                        let parent_transform = match req.world_transform {
+                            Some(m) => Transform::from_matrix(m),
+                            None => Transform::from_translation(req.world_pos),
+                        };
+                        let is_zone_spawn =
+                            req.entity_id.is_none() && req.world_transform.is_some();
+
+                        let mut e = commands.spawn((
+                            MmbOverlay,
+                            crate::components::InGameEntity,
+                            parent_transform,
+                            Visibility::default(),
+                        ));
+                        if is_zone_spawn {
+                            e.insert(crate::dat_mzb::AutoMzbOverlay);
+                        }
+                        e.id()
+                    }
                 };
-                let is_zone_spawn = req.entity_id.is_none() && req.world_transform.is_some();
 
-                let mut e = commands.spawn((
-                    MmbOverlay,
-                    crate::components::InGameEntity,
-                    parent_transform,
-                    Visibility::default(),
-                ));
-                if is_zone_spawn {
-                    e.insert(crate::dat_mzb::AutoMzbOverlay);
-                }
-                e.id()
-            }
-        };
-
-        if loaded.is_cloud {
-            info!(
-                "zone_clouds: detected cloud MMB '{}' (file {} chunk {})",
-                loaded.asset_name, req.file_id, req.chunk_idx
-            );
-            commands
-                .entity(parent)
-                .insert(crate::zone_clouds::CloudMesh);
-        }
-
-        let n_subs = loaded.submeshes.len();
-        for (sub_index, sub) in loaded.submeshes.iter().enumerate() {
-            let cache_key = (req.file_id, req.chunk_idx, sub_index);
-
-            let mesh_handle = handle_cache
-                .mesh
-                .entry(cache_key)
-                .or_insert_with(|| {
-                    let mut mesh = Mesh::new(
-                        PrimitiveTopology::TriangleList,
-                        RenderAssetUsages::default(),
+                if loaded.is_cloud {
+                    info!(
+                        "zone_clouds: detected cloud MMB '{}' (file {} chunk {})",
+                        loaded.asset_name, req.file_id, req.chunk_idx
                     );
-                    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, sub.positions.clone());
-                    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, sub.normals.clone());
-                    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, sub.uvs.clone());
-                    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, sub.colors.clone());
-                    mesh.insert_indices(Indices::U32(sub.indices.clone()));
-                    meshes.add(mesh)
-                })
-                .clone();
+                    commands
+                        .entity(parent)
+                        .insert(crate::zone_clouds::CloudMesh);
+                }
 
-            let variant_trimmed = sub.variant_name.trim();
-            let sub_texture = tex_by_name
-                .get(variant_trimmed)
-                .cloned()
-                .or_else(|| first_texture.clone());
+                let n_subs = loaded.submeshes.len();
+                for (sub_index, sub) in loaded.submeshes.iter().enumerate() {
+                    let cache_key = (req.file_id, req.chunk_idx, sub_index);
 
-            let (alpha_mode, discard_threshold) =
-                submesh_alpha_mode(&loaded.zone_mesh_name, sub.blending, sub_texture.is_some());
-            let has_texture = if sub_texture.is_some() { 1.0 } else { 0.0 };
+                    let mesh_handle = handle_cache
+                        .mesh
+                        .entry(cache_key)
+                        .or_insert_with(|| {
+                            let mut mesh = Mesh::new(
+                                PrimitiveTopology::TriangleList,
+                                RenderAssetUsages::default(),
+                            );
+                            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, sub.positions.clone());
+                            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, sub.normals.clone());
+                            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, sub.uvs.clone());
+                            mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, sub.colors.clone());
+                            mesh.insert_indices(Indices::U32(sub.indices.clone()));
+                            meshes.add(mesh)
+                        })
+                        .clone();
 
-            let mat_handle = handle_cache
-                .material
-                .entry(cache_key)
-                .or_insert_with(|| {
-                    materials.add(FfxiZoneMaterial {
-                        lighting: crate::skinned_ffxi_material::FfxiLightingUniform::default(),
-                        base_color_texture: sub_texture,
-                        material_flags: crate::skinned_ffxi_material::FfxiMaterialFlags {
-                            flags: Vec4::new(has_texture, 0.0, 0.0, discard_threshold),
+                    let variant_trimmed = sub.variant_name.trim();
+                    let sub_texture = tex_by_name
+                        .get(variant_trimmed)
+                        .cloned()
+                        .or_else(|| first_texture.clone());
+
+                    let (alpha_mode, discard_threshold) = submesh_alpha_mode(
+                        &loaded.zone_mesh_name,
+                        sub.blending,
+                        sub_texture.is_some(),
+                    );
+                    let has_texture = if sub_texture.is_some() { 1.0 } else { 0.0 };
+
+                    let mat_handle = handle_cache
+                        .material
+                        .entry(cache_key)
+                        .or_insert_with(|| {
+                            materials.add(FfxiZoneMaterial {
+                                lighting:
+                                    crate::skinned_ffxi_material::FfxiLightingUniform::default(),
+                                base_color_texture: sub_texture,
+                                material_flags: crate::skinned_ffxi_material::FfxiMaterialFlags {
+                                    flags: Vec4::new(has_texture, 0.0, 0.0, discard_threshold),
+                                },
+                                alpha_mode,
+                            })
+                        })
+                        .clone();
+
+                    let mut child = commands.spawn((
+                        MmbOverlay,
+                        Mesh3d(mesh_handle),
+                        MeshMaterial3d(mat_handle),
+                        Transform::default(),
+                        ChildOf(parent),
+                    ));
+
+                    if is_static_placement {
+                        child.insert(crate::components::CameraOccluder);
+                    }
+
+                    child.insert(crate::hud::mesh_debug::mesh_debug_bundle(
+                        crate::hud::mesh_debug::MmbDebugInfo {
+                            file_id: req.file_id,
+                            chunk_idx: req.chunk_idx,
+                            sub_index,
+                            asset_name: loaded.asset_name.clone(),
+                            variant_name: sub.variant_name.trim().to_string(),
                         },
-                        alpha_mode,
-                    })
-                })
-                .clone();
+                    ));
+                }
 
-            let mut child = commands.spawn((
-                MmbOverlay,
-                Mesh3d(mesh_handle),
-                MeshMaterial3d(mat_handle),
-                Transform::default(),
-                ChildOf(parent),
-            ));
-
-            if is_static_placement {
-                child.insert(crate::components::CameraOccluder);
+                let is_zone_spawn = req.entity_id.is_none() && req.world_transform.is_some();
+                if !is_zone_spawn {
+                    let where_ = match req.entity_id {
+                        Some(id) => format!("on entity {id}"),
+                        None => format!(
+                            "at ({:.1}, {:.1}, {:.1})",
+                            req.world_pos.x, req.world_pos.y, req.world_pos.z,
+                        ),
+                    };
+                    let tex_note = match texture_count {
+                        0 => " (no texture)".to_string(),
+                        1 => " +1 texture".to_string(),
+                        n => format!(" +{n} textures"),
+                    };
+                    push_system_msg(
+                        &mut toasts,
+                        format!(
+                            "/load_mmb {} {}: spawned {n_subs} sub-mesh{} {where_}{tex_note}",
+                            req.file_id,
+                            req.chunk_idx,
+                            if n_subs == 1 { "" } else { "es" },
+                        ),
+                    );
+                }
             }
-
-            child.insert(crate::hud::mesh_debug::mesh_debug_bundle(
-                crate::hud::mesh_debug::MmbDebugInfo {
-                    file_id: req.file_id,
-                    chunk_idx: req.chunk_idx,
-                    sub_index,
-                    asset_name: loaded.asset_name.clone(),
-                    variant_name: sub.variant_name.trim().to_string(),
-                },
-            ));
-        }
-
-        let is_zone_spawn = req.entity_id.is_none() && req.world_transform.is_some();
-        if !is_zone_spawn {
-            let where_ = match req.entity_id {
-                Some(id) => format!("on entity {id}"),
-                None => format!(
-                    "at ({:.1}, {:.1}, {:.1})",
-                    req.world_pos.x, req.world_pos.y, req.world_pos.z,
-                ),
-            };
-            let tex_note = match texture_count {
-                0 => " (no texture)".to_string(),
-                1 => " +1 texture".to_string(),
-                n => format!(" +{n} textures"),
-            };
-            push_system_msg(
-                &mut toasts,
-                format!(
-                    "/load_mmb {} {}: spawned {n_subs} sub-mesh{} {where_}{tex_note}",
-                    req.file_id,
-                    req.chunk_idx,
-                    if n_subs == 1 { "" } else { "es" },
-                ),
-            );
+            Some(None) => {
+                push_system_msg(
+                    &mut toasts,
+                    format!("/load_mmb {} {}: load failed", req.file_id, req.chunk_idx),
+                );
+                if diag_matches(req.file_id) {
+                    *diag_load_failed.entry(req.file_id).or_insert(0) += 1;
+                }
+            }
+            None => {
+                if !in_flight.tasks.contains_key(&asset) && in_flight.tasks.len() < MMB_MAX_INFLIGHT
+                {
+                    let pool = AsyncComputeTaskPool::get();
+                    let (file_id, chunk_idx) = (req.file_id, req.chunk_idx);
+                    in_flight.tasks.insert(
+                        asset,
+                        pool.spawn(async move { load_mmb(file_id, chunk_idx).ok() }),
+                    );
+                }
+                retained.push_back(req);
+            }
         }
     }
+    queue.pending = retained;
 
     if diag_file_id.is_some() {
         for (fid, examples) in &diag_zero_submesh {
