@@ -9,6 +9,7 @@ pub mod launcher_ui;
 pub mod model_viewer;
 pub mod nameplate_occlude;
 pub mod navmesh_overlay;
+pub mod perf_hud;
 pub mod screenshot;
 pub mod slash_commands;
 pub mod target_list_hud;
@@ -197,15 +198,19 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         (setup_world, spawn_camera, setup_zone_line_assets),
     );
     add_hud_spawners(&mut app, OnEnter(AppPhase::InGame));
-    app.init_resource::<target_list_hud::FrameSpikeTracker>();
+    app.init_resource::<perf_hud::PerfMonitor>();
     app.add_systems(
         OnEnter(AppPhase::InGame),
-        target_list_hud::spawn_target_list_hud,
+        (
+            target_list_hud::spawn_target_list_hud,
+            perf_hud::spawn_perf_hud,
+        ),
     );
     app.add_systems(
         Update,
         (
-            target_list_hud::track_frame_spikes,
+            perf_hud::update_perf_monitor,
+            perf_hud::update_perf_graph,
             target_list_hud::update_target_list_hud,
         )
             .chain()
