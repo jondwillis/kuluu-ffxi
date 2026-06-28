@@ -211,3 +211,75 @@ pub(super) fn row() -> impl Bundle {
         ..default()
     }
 }
+
+enum NavAction {
+    Close,
+    Back(LauncherState),
+}
+
+fn spawn_titlebar(
+    parent: &mut ChildSpawnerCommands,
+    title_text: impl Into<String>,
+    action: NavAction,
+) {
+    let glyph = match &action {
+        NavAction::Close => "×",
+        NavAction::Back(_) => "<",
+    };
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|bar| {
+            bar.spawn((
+                Node {
+                    flex_grow: 1.0,
+                    ..default()
+                },
+                Text::new(title_text.into()),
+                TextFont {
+                    font_size: 22.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.0, 1.0, 1.0)),
+                ThemedText,
+            ));
+            let mut btn = bar.spawn(button(
+                ButtonProps::default(),
+                (),
+                Spawn((Text::new(glyph), ThemedText)),
+            ));
+            match action {
+                NavAction::Close => {
+                    btn.observe(|_ev: On<Activate>, mut exit: MessageWriter<AppExit>| {
+                        exit.write_default();
+                    });
+                }
+                NavAction::Back(target) => {
+                    btn.observe(
+                        move |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(target.clone());
+                        },
+                    );
+                }
+            }
+        });
+}
+
+pub(super) fn spawn_close_titlebar(
+    parent: &mut ChildSpawnerCommands,
+    title_text: impl Into<String>,
+) {
+    spawn_titlebar(parent, title_text, NavAction::Close);
+}
+
+pub(super) fn spawn_back_titlebar(
+    parent: &mut ChildSpawnerCommands,
+    title_text: impl Into<String>,
+) {
+    spawn_titlebar(parent, title_text, NavAction::Back(LauncherState::Login));
+}

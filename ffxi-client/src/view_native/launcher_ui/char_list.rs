@@ -7,7 +7,9 @@ use bevy::picking::events::{Over, Pointer};
 use bevy::prelude::*;
 use bevy::ui_widgets::Activate;
 
-use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
+use super::common::{
+    hint, panel_node, row, screen_root, spawn_back_titlebar, spawn_breadcrumb, Crumb,
+};
 use super::{CharListData, Credentials, DefaultCharName, LauncherState, SelectedChar, ServerInfo};
 
 #[derive(Component)]
@@ -62,7 +64,7 @@ pub(super) fn spawn_char_list_ui(
             };
             spawn_breadcrumb(root, &server, &[Crumb::Sign(sign_label), Crumb::Characters]);
             root.spawn(panel_node(420.0)).with_children(|panel| {
-                panel.spawn(title("Select character"));
+                spawn_back_titlebar(panel, "Select character");
                 if chars.0.is_empty() {
                     panel.spawn(hint("No characters on this account yet."));
                 }

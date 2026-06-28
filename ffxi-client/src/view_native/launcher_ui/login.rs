@@ -10,7 +10,9 @@ use bevy::ui_widgets::{Activate, ValueChange};
 use ffxi_client::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
 use ffxi_client::secret_store::SecretStore;
 
-use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
+use super::common::{
+    hint, panel_node, row, screen_root, spawn_breadcrumb, spawn_close_titlebar, Crumb,
+};
 use super::server_version_check::{ServerVersionStatus, VersionViolation};
 use super::{
     Credentials, LauncherState, LoginErrorMsg, LoginField, LoginForm, ServerInfo, ServerSelectForm,
@@ -91,8 +93,7 @@ fn build_login_ui(
         .with_children(|root| {
             spawn_breadcrumb(root, server, &[Crumb::Sign(None)]);
             root.spawn(panel_node(560.0)).with_children(|panel| {
-                panel.spawn(title(format!("Sign in to {}", server.display_label())));
-                panel.spawn(hint("Tab cycles fields. Enter submits when both filled."));
+                spawn_close_titlebar(panel, format!("Sign in to {}", server.display_label()));
 
                 spawn_version_banner(panel, version);
 

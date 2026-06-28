@@ -9,7 +9,7 @@ use bevy::ui_widgets::Activate;
 use ffxi_client::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
 use ffxi_client::secret_store::SecretStore;
 
-use super::common::{hint, panel_node, row, screen_root, title};
+use super::common::{hint, panel_node, row, screen_root, spawn_close_titlebar};
 use super::{LauncherState, ServerSelectCursor, ServerSelectForm};
 
 #[derive(Component)]
@@ -48,7 +48,7 @@ pub(super) fn spawn_ui(
         .spawn((ServerSelectRoot, screen_root()))
         .with_children(|root| {
             root.spawn(panel_node(620.0)).with_children(|panel| {
-                panel.spawn(title("Servers"));
+                spawn_close_titlebar(panel, "Servers");
                 if n == 0 {
                     panel.spawn(hint("No servers saved yet — click '+ Add server' below."));
                 } else {
