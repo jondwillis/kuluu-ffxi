@@ -206,13 +206,25 @@ pub struct BgmPlaybackState {
     pub is_night: bool,
 }
 
+fn self_engaged(snap: &ffxi_viewer_wire::SceneSnapshot) -> bool {
+    let self_bt_target = snap
+        .self_char_id
+        .and_then(|id| snap.entities.iter().find(|e| e.id == id))
+        .map(|e| e.bt_target_id)
+        .unwrap_or(0);
+    let goal_engaged = matches!(
+        snap.current_goal,
+        Some(ffxi_viewer_wire::ReactorGoal::Engaged { .. })
+    );
+    goal_engaged || self_bt_target != 0
+}
+
 pub fn derive_bgm_playback_state(
     scene: Res<crate::snapshot::SceneState>,
     sky: Res<crate::sun_moon::VanaSky>,
     mut state: ResMut<BgmPlaybackState>,
     mut last_engage_log: Local<Option<(bool, u32, u8, bool)>>,
 ) {
-    const EFFECT_KO: u16 = 0;
     const EFFECT_FISHING_IMAGERY: u16 = 235;
     const EFFECT_MOUNTED: u16 = 252;
 
@@ -225,7 +237,7 @@ pub fn derive_bgm_playback_state(
         snap.current_goal,
         Some(ffxi_viewer_wire::ReactorGoal::Engaged { .. })
     );
-    let engaged = self_bt_target != 0;
+    let engaged = self_engaged(snap);
     let in_party = snap.party.len() > 1;
 
     let in_mog_house = self_id
@@ -234,7 +246,7 @@ pub fn derive_bgm_playback_state(
         .unwrap_or(false);
 
     let icons = &snap.status_icons;
-    let dead = icons.contains(&EFFECT_KO);
+    let dead = self_entity.map(|e| e.is_dead()).unwrap_or(false);
     let mounted = icons.contains(&EFFECT_MOUNTED);
     let fishing = icons.contains(&EFFECT_FISHING_IMAGERY);
 
@@ -251,7 +263,7 @@ pub fn derive_bgm_playback_state(
             self_status_byte = self_status,
             reactor_goal_engaged = goal_engaged,
             in_party,
-            "engage signals: bt_target drives battle music; goal/status shown for comparison"
+            "engage signals: battle music driven by reactor goal OR bt_target"
         );
     }
 
@@ -920,9 +932,9 @@ pub fn tick_audio_fades(
         }
         if fade.t >= fade.duration {
             if fade.despawn_on_end {
-                commands.entity(entity).despawn();
+                commands.entity(entity).try_despawn();
             } else {
-                commands.entity(entity).remove::<AudioFade>();
+                commands.entity(entity).try_remove::<AudioFade>();
             }
         }
     }
@@ -987,6 +999,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_audible_slot(&slots, &engaged), Some((2, 99)));
+    }
+
+    #[test]
+    fn reactor_goal_drives_engaged_without_server_bt_target() {
+        use ffxi_viewer_wire::{ReactorGoal, SceneSnapshot};
+        let idle = SceneSnapshot {
+            self_char_id: Some(180907),
+            current_goal: Some(ReactorGoal::Idle),
+            ..Default::default()
+        };
+        assert!(!self_engaged(&idle));
+
+        let engaged = SceneSnapshot {
+            self_char_id: Some(180907),
+            current_goal: Some(ReactorGoal::Engaged {
+                target_id: 42,
+                attack_issued: true,
+            }),
+            ..Default::default()
+        };
+        assert!(self_engaged(&engaged));
     }
 
     #[test]

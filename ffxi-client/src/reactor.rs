@@ -320,8 +320,20 @@ impl Reactor {
         self.state.apply_event(ev);
 
         if matches!(ev, AgentEvent::ZoneChanged { .. }) {
-            self.goal = Goal::Idle;
             self.needs_zone_seed = true;
+        }
+
+        // Emit (don't just set) the reset: a silent reset left the folded
+        // current_goal stuck at Engaged across a death / home-point warp.
+        if matches!(
+            ev,
+            AgentEvent::ZoneChanged { .. } | AgentEvent::DeathTimerUpdated { .. }
+        ) && !matches!(self.goal, Goal::Idle)
+        {
+            self.goal = Goal::Idle;
+            out.push(AgentEvent::ReactorGoalChanged {
+                goal: snapshot_goal(&self.goal),
+            });
         }
         out.extend(self.detect_threshold_events(ev));
         out
@@ -1377,6 +1389,70 @@ mod tests {
         r.handle_command(AgentCommand::Cancel);
         assert!(matches!(r.current_goal(), Goal::Idle));
         assert!(r.tick().commands.is_empty());
+    }
+
+    fn emits_idle_goal(events: &[AgentEvent]) -> bool {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::ReactorGoalChanged {
+                    goal: ReactorGoalSnapshot::Idle
+                }
+            )
+        })
+    }
+
+    #[test]
+    fn death_timer_disengages_and_emits_goal_change() {
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        r.handle_command(AgentCommand::Engage { target_id: 99 });
+        assert!(matches!(r.current_goal(), Goal::Engaged { .. }));
+
+        let derived = r.observe_event(&AgentEvent::DeathTimerUpdated {
+            seconds_until_homepoint: 60,
+        });
+        assert!(
+            matches!(r.current_goal(), Goal::Idle),
+            "death must force disengage"
+        );
+        assert!(
+            emits_idle_goal(&derived),
+            "the reset must be emitted so the folded current_goal updates"
+        );
+    }
+
+    #[test]
+    fn zone_change_while_engaged_emits_idle_goal_change() {
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        r.handle_command(AgentCommand::Engage { target_id: 99 });
+        assert!(matches!(r.current_goal(), Goal::Engaged { .. }));
+
+        let derived = r.observe_event(&AgentEvent::ZoneChanged {
+            from: Some(116),
+            to: 240,
+        });
+        assert!(matches!(r.current_goal(), Goal::Idle));
+        assert!(
+            emits_idle_goal(&derived),
+            "home-point warp must propagate disengage to current_goal"
+        );
+    }
+
+    #[test]
+    fn death_after_disengage_is_idempotent_no_event() {
+        let mut r = Reactor::new(step_test_cfg());
+        r.observe_event(&connected(1));
+        assert!(matches!(r.current_goal(), Goal::Idle));
+
+        let derived = r.observe_event(&AgentEvent::DeathTimerUpdated {
+            seconds_until_homepoint: 60,
+        });
+        assert!(
+            !emits_idle_goal(&derived),
+            "already Idle: no spurious goal-change event while dead"
+        );
     }
 
     #[test]
