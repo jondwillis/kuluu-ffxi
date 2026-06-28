@@ -210,6 +210,7 @@ pub fn derive_bgm_playback_state(
     scene: Res<crate::snapshot::SceneState>,
     sky: Res<crate::sun_moon::VanaSky>,
     mut state: ResMut<BgmPlaybackState>,
+    mut last_engage_log: Local<Option<(bool, u32, u8, bool)>>,
 ) {
     const EFFECT_KO: u16 = 0;
     const EFFECT_FISHING_IMAGERY: u16 = 235;
@@ -218,7 +219,13 @@ pub fn derive_bgm_playback_state(
     let snap = &scene.snapshot;
     let self_id = snap.self_char_id;
     let self_entity = self_id.and_then(|id| snap.entities.iter().find(|e| e.id == id));
-    let engaged = self_entity.map(|e| e.bt_target_id != 0).unwrap_or(false);
+    let self_bt_target = self_entity.map(|e| e.bt_target_id).unwrap_or(0);
+    let self_status = self_entity.map(|e| e.status).unwrap_or(0);
+    let goal_engaged = matches!(
+        snap.current_goal,
+        Some(ffxi_viewer_wire::ReactorGoal::Engaged { .. })
+    );
+    let engaged = self_bt_target != 0;
     let in_party = snap.party.len() > 1;
 
     let in_mog_house = self_id
@@ -232,6 +239,21 @@ pub fn derive_bgm_playback_state(
     let fishing = icons.contains(&EFFECT_FISHING_IMAGERY);
 
     let is_night = sky.sun_altitude < 0.0;
+
+    let engage_key = (engaged, self_bt_target, self_status, goal_engaged);
+    if *last_engage_log != Some(engage_key) {
+        *last_engage_log = Some(engage_key);
+        info!(
+            target: "audio::bgm",
+            self_id = ?self_id,
+            engaged_signal = engaged,
+            self_bt_target_id = self_bt_target,
+            self_status_byte = self_status,
+            reactor_goal_engaged = goal_engaged,
+            in_party,
+            "engage signals: bt_target drives battle music; goal/status shown for comparison"
+        );
+    }
 
     *state = BgmPlaybackState {
         engaged_solo: engaged && !in_party,
