@@ -1381,35 +1381,6 @@ pub fn cull_mzb_by_distance(
     }
 }
 
-pub fn cull_mmb_props_by_distance(
-    draw: Res<DrawDistance>,
-    self_q: Query<&GlobalTransform, With<IsSelf>>,
-    mut prop_q: Query<
-        (&GlobalTransform, &mut Visibility),
-        (With<crate::dat_mmb::MmbOverlay>, With<AutoMzbOverlay>),
-    >,
-) {
-    let Ok(self_t) = self_q.single() else {
-        return;
-    };
-    let self_pos = self_t.translation();
-    let cull_sq = draw.world * draw.world;
-
-    for (prop_t, mut vis) in prop_q.iter_mut() {
-        let p = prop_t.translation();
-        let dx = p.x - self_pos.x;
-        let dz = p.z - self_pos.z;
-        let want = if dx * dx + dz * dz > cull_sq {
-            Visibility::Hidden
-        } else {
-            Visibility::Inherited
-        };
-        if *vis != want {
-            *vis = want;
-        }
-    }
-}
-
 pub fn cull_entities_by_distance(
     draw: Res<DrawDistance>,
     self_q: Query<&GlobalTransform, With<IsSelf>>,

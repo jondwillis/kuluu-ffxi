@@ -101,7 +101,6 @@ impl Plugin for DatOverlayPlugin {
                 Update,
                 (
                     crate::dat_mzb::cull_entities_by_distance,
-                    crate::dat_mzb::cull_mmb_props_by_distance,
                     crate::dat_mzb::apply_zone_geom_visibility,
                 ),
             )
@@ -282,7 +281,6 @@ pub fn process_load_mmb_requests(
     mut parse_cache: ResMut<MmbParseCache>,
     mut tex_pools_res: ResMut<MmbTexPools>,
     settings: Res<GraphicsSettings>,
-    draw: Res<crate::dat_mzb::DrawDistance>,
     self_q: Query<&GlobalTransform, With<crate::components::IsSelf>>,
 ) {
     queue.pending.extend(events.read().copied());
@@ -296,7 +294,7 @@ pub fn process_load_mmb_requests(
             mmb_load_order_key(a, self_pos).total_cmp(&mmb_load_order_key(b, self_pos))
         });
     }
-    let load_radius = draw.world * crate::dat_mzb::MMB_LOAD_DISTANCE_MARGIN;
+    let load_radius = settings.view_distance * crate::dat_mzb::MMB_LOAD_DISTANCE_MARGIN;
     let load_radius_sq = load_radius * load_radius;
 
     let mut mmb_logged: std::collections::HashSet<(u32, usize)> = std::collections::HashSet::new();
