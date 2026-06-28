@@ -317,7 +317,7 @@ pub fn process_load_mmb_requests(
         }
     };
 
-    const MMB_SPAWN_BUDGET: usize = 48;
+    const MMB_SPAWN_BUDGET: usize = 96;
     const HEAVY: usize = 8;
     let mut work = 0usize;
 
