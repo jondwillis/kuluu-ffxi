@@ -436,6 +436,12 @@ pub fn dispatch_movement_system(
         }
     }
 
+    if ffxi_viewer_core::hud::death_prompt::is_dead(&state) {
+        autorun.phantom_forward = false;
+        autorun.strafe_held_since = None;
+        return;
+    }
+
     if rest_stance.is_resting() {
         use ffxi_viewer_core::combat_stance::RestKind;
         let move_actions = [
