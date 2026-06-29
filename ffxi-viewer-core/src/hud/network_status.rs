@@ -77,15 +77,22 @@ pub fn spawn_network_status(mut commands: Commands) {
                 ));
             });
 
-            p.spawn((
-                NetPercentLabel,
-                Text::new("100%"),
-                TextFont {
-                    font_size: 13.0,
-                    ..default()
-                },
-                TextColor(health_color(100)),
-            ));
+            p.spawn(Node {
+                width: Val::Px(PERCENT_BOX_W),
+                justify_content: JustifyContent::FlexEnd,
+                ..default()
+            })
+            .with_children(|b| {
+                b.spawn((
+                    NetPercentLabel,
+                    Text::new("100%"),
+                    TextFont {
+                        font_size: 13.0,
+                        ..default()
+                    },
+                    TextColor(health_color(100)),
+                ));
+            });
 
             p.spawn(Node {
                 flex_direction: FlexDirection::Column,
@@ -93,26 +100,48 @@ pub fn spawn_network_status(mut commands: Commands) {
                 ..default()
             })
             .with_children(|col| {
-                col.spawn((
-                    NetSendLabel,
-                    Text::new("S 0"),
-                    TextFont {
-                        font_size: 11.0,
-                        ..default()
-                    },
-                    TextColor(palette::TEXT),
-                ));
-                col.spawn((
-                    NetRecvLabel,
-                    Text::new("R 0"),
-                    TextFont {
-                        font_size: 11.0,
-                        ..default()
-                    },
-                    TextColor(palette::TEXT),
-                ));
+                spawn_baud_row(col, "S", NetSendLabel);
+                spawn_baud_row(col, "R", NetRecvLabel);
             });
         });
+}
+
+const PERCENT_BOX_W: f32 = 36.0;
+const BAUD_BOX_W: f32 = 38.0;
+
+fn spawn_baud_row<M: Component>(col: &mut ChildSpawnerCommands, prefix: &str, value_marker: M) {
+    col.spawn(Node {
+        flex_direction: FlexDirection::Row,
+        align_items: AlignItems::Center,
+        column_gap: Val::Px(3.0),
+        ..default()
+    })
+    .with_children(|row| {
+        row.spawn((
+            Text::new(prefix.to_string()),
+            TextFont {
+                font_size: 11.0,
+                ..default()
+            },
+            TextColor(palette::MUTED),
+        ));
+        row.spawn(Node {
+            width: Val::Px(BAUD_BOX_W),
+            justify_content: JustifyContent::FlexEnd,
+            ..default()
+        })
+        .with_children(|b| {
+            b.spawn((
+                value_marker,
+                Text::new("0"),
+                TextFont {
+                    font_size: 11.0,
+                    ..default()
+                },
+                TextColor(palette::TEXT),
+            ));
+        });
+    });
 }
 
 #[allow(clippy::type_complexity)]
@@ -179,13 +208,13 @@ pub fn update_network_status(
         tc.0 = health_color(overall);
     }
     if let Ok(mut text) = send_label.single_mut() {
-        let want = format!("S {}", net.send_bps);
+        let want = net.send_bps.to_string();
         if **text != want {
             **text = want;
         }
     }
     if let Ok(mut text) = recv_label.single_mut() {
-        let want = format!("R {}", net.recv_bps);
+        let want = net.recv_bps.to_string();
         if **text != want {
             **text = want;
         }
