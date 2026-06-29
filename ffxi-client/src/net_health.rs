@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 pub const MAP_SILENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
-const RATE_MIN_WINDOW: Duration = Duration::from_millis(500);
+const RATE_REFRESH: Duration = Duration::from_secs(3);
 const RECV_DELTA_WINDOW: usize = 64;
 const SILENCE_GRACE: Duration = Duration::from_secs(3);
 const SEND_ACK_TOLERANCE: u16 = 2;
@@ -56,7 +56,7 @@ impl NetHealth {
             }
             Some(prev) => {
                 let elapsed = now.duration_since(prev);
-                if elapsed < RATE_MIN_WINDOW {
+                if elapsed < RATE_REFRESH {
                     return;
                 }
                 let ms = (elapsed.as_millis() as u64).max(1);
@@ -205,19 +205,21 @@ mod tests {
         h.sample_rates(t0, 0, 0);
         assert_eq!(h.snapshot(Duration::ZERO, 0).send_bps, 0);
 
-        let t1 = t0 + Duration::from_secs(1);
-        h.sample_rates(t1, 200, 600);
+        let t1 = t0 + RATE_REFRESH;
+        h.sample_rates(t1, 600, 1800);
         let s = h.snapshot(Duration::ZERO, 0);
         assert_eq!(s.send_bps, 200);
         assert_eq!(s.recv_bps, 600);
     }
 
     #[test]
-    fn rate_ignores_samples_inside_min_window() {
+    fn rate_holds_until_refresh_interval_elapses() {
         let mut h = NetHealth::new();
         let t0 = Instant::now();
         h.sample_rates(t0, 0, 0);
-        h.sample_rates(t0 + Duration::from_millis(100), 1000, 1000);
+        h.sample_rates(t0 + Duration::from_millis(500), 9000, 9000);
         assert_eq!(h.snapshot(Duration::ZERO, 0).recv_bps, 0);
+        h.sample_rates(t0 + RATE_REFRESH, 9000, 9000);
+        assert_eq!(h.snapshot(Duration::ZERO, 0).recv_bps, 3000);
     }
 }
