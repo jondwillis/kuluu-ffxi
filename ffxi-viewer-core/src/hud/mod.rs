@@ -13,6 +13,7 @@ pub mod item_meta;
 pub mod logout_countdown;
 pub mod menu;
 pub mod mesh_debug;
+pub mod network_status;
 pub mod overlay;
 pub mod quick_action;
 pub mod roster;
@@ -154,6 +155,7 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HudVerbosity>();
+        app.init_resource::<network_status::NetStatusVisible>();
 
         app.init_resource::<menu::DynamicMenu>();
 
@@ -252,6 +254,13 @@ impl Plugin for HudPlugin {
             ),
         );
         app.add_systems(Update, apply_dev_hud_visibility);
+        app.add_systems(
+            Update,
+            (
+                network_status::update_network_status,
+                network_status::apply_net_status_visibility,
+            ),
+        );
         app.add_systems(Update, chat_panel::chat_tab_click_system);
         app.add_systems(Update, chat_panel::chat_auto_switch_click_system);
 
@@ -325,6 +334,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             logout_countdown::spawn_logout_countdown,
             mesh_debug::spawn_mesh_debug_hud,
             entity_hover_card::spawn_entity_hover_card,
+            network_status::spawn_network_status,
         ),
     );
 

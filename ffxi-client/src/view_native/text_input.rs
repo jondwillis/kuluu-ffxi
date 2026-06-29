@@ -45,6 +45,8 @@ pub struct SlashWriters<'w, 's> {
 
     pub hud_verbosity: ResMut<'w, ffxi_viewer_core::hud::HudVerbosity>,
 
+    pub net_status_visible: ResMut<'w, ffxi_viewer_core::hud::network_status::NetStatusVisible>,
+
     pub minimap_mode: ResMut<'w, ffxi_viewer_core::minimap::MinimapMode>,
 
     pub minimap_visible: ResMut<'w, ffxi_viewer_core::minimap::MinimapVisible>,
@@ -1217,6 +1219,14 @@ fn apply_slash_outcome(
             push_system_chat_line(
                 scene_state,
                 format!("/devhud: {}", if next { "on" } else { "off" }),
+            );
+        }
+        SlashOutcome::SetNetStatus(setting) => {
+            let next = setting.unwrap_or(!slash_writers.net_status_visible.0);
+            slash_writers.net_status_visible.0 = next;
+            push_system_chat_line(
+                scene_state,
+                format!("/netstat: {}", if next { "on" } else { "off" }),
             );
         }
         SlashOutcome::SetRenderScale(setting) => {

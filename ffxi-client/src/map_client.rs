@@ -31,6 +31,9 @@ pub struct MapClient {
     decompress_table: zlib::DecompressTable,
     compress_table: zlib::CompressTable,
 
+    bytes_sent: std::sync::atomic::AtomicU64,
+    bytes_recv: std::sync::atomic::AtomicU64,
+
     pub seed: [u8; 20],
 }
 
@@ -59,6 +62,8 @@ impl MapClient {
             blowfish,
             decompress_table,
             compress_table,
+            bytes_sent: std::sync::atomic::AtomicU64::new(0),
+            bytes_recv: std::sync::atomic::AtomicU64::new(0),
             seed,
         })
     }
@@ -96,6 +101,8 @@ impl MapClient {
         if n != frame.len() {
             bail!("partial encrypted UDP send: {n} of {}", frame.len());
         }
+        self.bytes_sent
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -110,6 +117,8 @@ impl MapClient {
         if n != datagram.len() {
             bail!("partial UDP send: {n} of {}", datagram.len());
         }
+        self.bytes_sent
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -121,6 +130,8 @@ impl MapClient {
             .await
             .context("UDP recv_from")?;
         buf.truncate(n);
+        self.bytes_recv
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 
         if n < framing::MIN_FRAME_SIZE {
             bail!("undersized response datagram: {n} bytes");
@@ -183,6 +194,14 @@ impl MapClient {
 
     pub fn server_addr(&self) -> SocketAddr {
         self.server
+    }
+
+    pub fn traffic_totals(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.bytes_sent.load(Ordering::Relaxed),
+            self.bytes_recv.load(Ordering::Relaxed),
+        )
     }
 
     pub fn retarget(&mut self, new_server: SocketAddr, new_seed: [u8; 20]) {

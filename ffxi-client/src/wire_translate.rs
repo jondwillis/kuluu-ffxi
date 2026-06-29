@@ -17,6 +17,7 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         party: s.party.iter().map(party_to_wire).collect(),
         chat: s.chat.iter().map(chat_to_wire).collect(),
         diagnostics: diagnostics_to_wire(&s.diagnostics),
+        net_stats: net_stats_to_wire(&s.net_stats),
         current_goal: s.current_goal.as_ref().map(goal_to_wire),
         last_reconnect: s.last_reconnect.as_ref().map(reconnect_to_wire),
 
@@ -298,6 +299,15 @@ pub fn party_to_wire(m: &PartyMember) -> wire::PartyMember {
         is_party_leader: m.is_party_leader,
         is_alliance_leader: m.is_alliance_leader,
         in_mog_house: m.in_mog_house,
+    }
+}
+
+pub fn net_stats_to_wire(n: &crate::state::NetStats) -> wire::NetStats {
+    wire::NetStats {
+        send_bps: n.send_bps,
+        recv_bps: n.recv_bps,
+        send_health: n.send_health,
+        recv_health: n.recv_health,
     }
 }
 

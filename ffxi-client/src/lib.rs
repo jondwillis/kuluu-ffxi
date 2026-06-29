@@ -18,6 +18,7 @@ pub mod graphics_store;
 pub mod keybinds_store;
 pub mod lobby_client;
 pub mod map_client;
+pub mod net_health;
 pub mod reactor;
 pub mod scene;
 pub mod session;

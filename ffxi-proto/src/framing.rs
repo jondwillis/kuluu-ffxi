@@ -183,6 +183,23 @@ mod tests {
     }
 
     #[test]
+    fn datagram_header_field_offsets_match_lsb_layout() {
+        // LSB preparePacket (vendor/server/src/map/map_networking.cpp:653-654) writes a
+        // server->client datagram header as byte[0..2]=server seq, byte[2..4]=the server's
+        // ack of the client (MapSession::client_packet_id). Pin those offsets so the
+        // network-health metric's reading of `sync_in` as "server ack of us" can't drift.
+        let mut buf = [0u8; FFXI_HEADER_SIZE];
+        buf[0..2].copy_from_slice(&0xAABBu16.to_le_bytes());
+        buf[2..4].copy_from_slice(&0xCCDDu16.to_le_bytes());
+        let h = Header::read(&buf);
+        assert_eq!(h.id_and_size, 0xAABB, "byte[0..2] is the server sequence");
+        assert_eq!(
+            h.sync_in, 0xCCDD,
+            "byte[2..4] is the server's ack of the client"
+        );
+    }
+
+    #[test]
     fn encrypt_decrypt_round_trip() {
         let key = b"ffxi-test-key";
         let st = blowfish::State::new(key);

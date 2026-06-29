@@ -774,6 +774,12 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 handler: |c| parse_devhud(c.rest),
             },
             Command {
+                aliases: &["netstat", "network"],
+                usage: "[on|off|toggle]",
+                summary: "network health indicator (S/R baud, connection %, send/recv arrows)",
+                handler: |c| parse_netstat(c.rest),
+            },
+            Command {
                 aliases: &["renderscale", "rscale"],
                 usage: "[25-200 | 0.25-2.0]",
                 summary: "3D render scale: <100% renders the world at lower res and upscales (perf); >100% supersamples. HUD stays native. Bare `/renderscale` reports it.",
@@ -881,6 +887,8 @@ pub enum SlashOutcome {
     SetCameraCollisionSource(Option<ffxi_viewer_core::dat_mzb::CameraCollisionSource>),
 
     SetDevHud(Option<bool>),
+
+    SetNetStatus(Option<bool>),
 
     /// `Some(scale)` sets the 3D render scale (0.25–2.0); `None` reports it.
     SetRenderScale(Option<f32>),
@@ -2168,6 +2176,21 @@ fn parse_devhud(rest: &str) -> SlashOutcome {
         }
     };
     SlashOutcome::SetDevHud(setting)
+}
+
+fn parse_netstat(rest: &str) -> SlashOutcome {
+    let arg = rest.trim().to_ascii_lowercase();
+    let setting = match arg.as_str() {
+        "" | "toggle" => None,
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        other => {
+            return SlashOutcome::SystemMessage(format!(
+                "/netstat: bad arg `{other}` (use on|off|toggle)"
+            ));
+        }
+    };
+    SlashOutcome::SetNetStatus(setting)
 }
 
 fn parse_renderscale(rest: &str) -> SlashOutcome {

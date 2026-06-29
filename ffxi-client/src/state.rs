@@ -238,6 +238,14 @@ pub struct Diagnostics {
     pub map_server_addr: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetStats {
+    pub send_bps: u32,
+    pub recv_bps: u32,
+    pub send_health: u8,
+    pub recv_health: u8,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
     pub stage: Stage,
@@ -249,6 +257,9 @@ pub struct SessionState {
     pub party: Vec<PartyMember>,
     pub chat: Vec<ChatLine>,
     pub diagnostics: Diagnostics,
+
+    #[serde(default)]
+    pub net_stats: NetStats,
 
     #[serde(default)]
     pub inventory: Inventory,
@@ -651,6 +662,9 @@ impl SessionState {
             AgentEvent::Diagnostics { diagnostics } => {
                 self.diagnostics = diagnostics.clone();
             }
+            AgentEvent::NetStats { stats } => {
+                self.net_stats = *stats;
+            }
             AgentEvent::SetFps { max } => {
                 self.target_fps = *max;
             }
@@ -949,6 +963,10 @@ pub enum AgentEvent {
     },
     Diagnostics {
         diagnostics: Diagnostics,
+    },
+
+    NetStats {
+        stats: NetStats,
     },
 
     PartyMemberUpdated {

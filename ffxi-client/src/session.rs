@@ -1209,6 +1209,9 @@ async fn keepalive_loop(
 ) -> Result<MapOutcome> {
     let mut last_recv = std::time::Instant::now();
 
+    let mut net_health = crate::net_health::NetHealth::new();
+    let mut last_net_emit = std::time::Instant::now();
+
     let mut enterzone_seen = false;
     let mut zone_transition_sent = false;
 
@@ -1675,6 +1678,24 @@ async fn keepalive_loop(
             }
             _ = tick.tick() => {
 
+                {
+                    let (total_sent, total_recv) = map.traffic_totals();
+                    net_health.sample_rates(std::time::Instant::now(), total_sent, total_recv);
+                    if last_net_emit.elapsed() >= std::time::Duration::from_millis(500) {
+                        last_net_emit = std::time::Instant::now();
+                        let sample = net_health
+                            .snapshot(last_recv.elapsed(), bundle_seq.wrapping_sub(1));
+                        let _ = event_tx.send(AgentEvent::NetStats {
+                            stats: crate::state::NetStats {
+                                send_bps: sample.send_bps,
+                                recv_bps: sample.recv_bps,
+                                send_health: sample.send_health,
+                                recv_health: sample.recv_health,
+                            },
+                        });
+                    }
+                }
+
                 if let Some((sent_at, line_id)) = pending_maprect {
                     if sent_at.elapsed() > std::time::Duration::from_secs(3) {
                         tracing::warn!(
@@ -1815,6 +1836,10 @@ async fn keepalive_loop(
                         continue;
                     }
                     server_seq_applied = Some(server_last_seq);
+                    // datagram byte[2..4] (sync_in) on an inbound packet is the server's
+                    // ack of our client seq (LSB MapSession::client_packet_id, written by
+                    // preparePacket at vendor/server/src/map/map_networking.cpp:654).
+                    net_health.on_recv(server_last_seq, header.sync_in);
                     for sub in framing::walk_sub_packets(&buf[framing::FFXI_HEADER_SIZE..]).flatten() {
                         if sub.opcode == ffxi_proto::map::s2c::LOGOUT {
                             if let Ok(logout) = decode::ServerLogout::decode(sub.data) {
@@ -1986,7 +2011,7 @@ async fn keepalive_loop(
             break;
         }
 
-        if last_recv.elapsed() > std::time::Duration::from_secs(60) {
+        if last_recv.elapsed() > crate::net_health::MAP_SILENCE_TIMEOUT {
             let _ = event_tx.send(AgentEvent::Disconnected {
                 reason: "no server packets for 60s".into(),
             });

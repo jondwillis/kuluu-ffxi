@@ -281,6 +281,14 @@ pub struct Diagnostics {
     pub map_server_addr: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetStats {
+    pub send_bps: u32,
+    pub recv_bps: u32,
+    pub send_health: u8,
+    pub recv_health: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReactorGoal {
     Idle,
@@ -321,6 +329,9 @@ pub struct SceneSnapshot {
 
     pub chat: Vec<ChatLine>,
     pub diagnostics: Diagnostics,
+
+    #[serde(default)]
+    pub net_stats: NetStats,
 
     pub current_goal: Option<ReactorGoal>,
 
@@ -673,6 +684,12 @@ mod tests {
                 sync_out: Some(43),
                 last_server_packet_age_ms: Some(123),
                 map_server_addr: Some("127.0.0.1:54230".into()),
+            },
+            net_stats: NetStats {
+                send_bps: 152,
+                recv_bps: 539,
+                send_health: 100,
+                recv_health: 100,
             },
             current_goal: Some(ReactorGoal::Engaged {
                 target_id: 0x99,

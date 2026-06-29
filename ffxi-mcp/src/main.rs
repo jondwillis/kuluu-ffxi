@@ -788,6 +788,7 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::Disconnected { .. } => "disconnected",
         AgentEvent::Error { .. } => "error",
         AgentEvent::Diagnostics { .. } => "diagnostics",
+        AgentEvent::NetStats { .. } => "net_stats",
         AgentEvent::PartyMemberUpdated { .. } => "party_member_updated",
         AgentEvent::LowHp { .. } => "low_hp",
         AgentEvent::PartyMemberLowHp { .. } => "party_member_low_hp",
