@@ -1211,6 +1211,7 @@ async fn keepalive_loop(
 
     let mut net_health = crate::net_health::NetHealth::new();
     let mut last_net_emit = std::time::Instant::now();
+    let mut keepalive_send_failing = false;
 
     let mut enterzone_seen = false;
     let mut zone_transition_sent = false;
@@ -1817,12 +1818,25 @@ async fn keepalive_loop(
                 }
 
                 if !payload.is_empty() {
-                    if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
-                        tracing::warn!(error = %e, "keepalive send failed");
-                        let _ = event_tx.send(AgentEvent::Error { message: format!("keepalive send: {e}") });
-                        break;
+                    match map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
+                        Ok(()) => {
+                            if keepalive_send_failing {
+                                keepalive_send_failing = false;
+                                tracing::info!("keepalive send recovered");
+                            }
+                            bundle_seq = bundle_seq.wrapping_add(1);
+                        }
+                        // A failed keepalive send (link down) must NOT tear the session
+                        // down: retail holds the connection and decays the network-health
+                        // % while no packets flow, disconnecting only at the silence
+                        // timeout below. Hold and let last_recv age drive the decay.
+                        Err(e) => {
+                            if !keepalive_send_failing {
+                                keepalive_send_failing = true;
+                                tracing::warn!(error = %e, "keepalive send failing (link down?); holding until silence timeout");
+                            }
+                        }
                     }
-                    bundle_seq = bundle_seq.wrapping_add(1);
                 }
             }
             res = tokio::time::timeout(std::time::Duration::from_millis(50), map.recv_decrypted()) => {
