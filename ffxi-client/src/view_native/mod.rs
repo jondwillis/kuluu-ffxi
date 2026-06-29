@@ -207,6 +207,14 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         ),
     );
     app.add_systems(
+        First,
+        perf_hud::mark_frame_start.run_if(in_state(AppPhase::InGame)),
+    );
+    app.add_systems(
+        PostUpdate,
+        perf_hud::mark_frame_end.run_if(in_state(AppPhase::InGame)),
+    );
+    app.add_systems(
         Update,
         (
             perf_hud::update_perf_monitor,

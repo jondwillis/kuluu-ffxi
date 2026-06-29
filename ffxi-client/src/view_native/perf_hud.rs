@@ -31,6 +31,10 @@ pub struct PerfMonitor {
     samples: [f32; SAMPLES],
     head: usize,
 
+    frame_start: Option<std::time::Instant>,
+    last_cpu_us: u64,
+    spike_cpu_us: u64,
+
     seen_first: bool,
     baseline_ms: f32,
 
@@ -66,6 +70,9 @@ impl Default for PerfMonitor {
         Self {
             samples: [0.0; SAMPLES],
             head: 0,
+            frame_start: None,
+            last_cpu_us: 0,
+            spike_cpu_us: 0,
             seen_first: false,
             baseline_ms: 0.0,
             last_spike_ms: 0.0,
@@ -93,6 +100,16 @@ impl Default for PerfMonitor {
     }
 }
 
+pub fn mark_frame_start(mut m: ResMut<PerfMonitor>) {
+    m.frame_start = Some(std::time::Instant::now());
+}
+
+pub fn mark_frame_end(mut m: ResMut<PerfMonitor>) {
+    if let Some(start) = m.frame_start {
+        m.last_cpu_us = start.elapsed().as_micros() as u64;
+    }
+}
+
 pub fn update_perf_monitor(
     time: Res<Time<Real>>,
     source: Res<NativeSource>,
@@ -103,6 +120,7 @@ pub fn update_perf_monitor(
         return;
     }
     let dt_ms = dt * 1000.0;
+    let cpu_us = m.last_cpu_us;
     let head = m.head;
     m.samples[head] = dt_ms;
     m.head = (head + 1) % SAMPLES;
@@ -165,6 +183,7 @@ pub fn update_perf_monitor(
     m.spike_rebuilt = w_rebuilds > 0;
     m.spike_rebuild_us = source.last_rebuild_us;
     m.spike_probe_us = w_probe_us;
+    m.spike_cpu_us = cpu_us;
     m.secs_since_spike = 0.0;
 
     if m.log_cooldown_s > 0.0 {
@@ -184,11 +203,13 @@ pub fn update_perf_monitor(
     } else {
         String::new()
     };
+    let render_us = (dt_ms * 1000.0) as u64 - cpu_us.min((dt_ms * 1000.0) as u64);
     warn!(
         target: "perf",
-        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s{extra}",
+        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s render~{render_us}\u{00b5}s | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s{extra}",
         m.baseline_ms,
         dt_ms - m.baseline_ms,
+        cpu_us,
     );
 }
 
@@ -246,7 +267,8 @@ pub fn spawn_perf_hud(mut commands: Commands) {
             });
 
             spawn_text_line(p, 1, palette::TEXT);
-            spawn_text_line(p, 2, palette::MUTED);
+            spawn_text_line(p, 2, palette::TEXT);
+            spawn_text_line(p, 3, palette::MUTED);
         });
 }
 
@@ -342,6 +364,16 @@ fn build_text_lines(
         )
     };
 
+    let split = (
+        format!(
+            "spike split: cpu {}\u{00b5}s  render~{}\u{00b5}s",
+            m.spike_cpu_us,
+            (m.last_spike_ms * 1000.0) as u64
+                - m.spike_cpu_us.min((m.last_spike_ms * 1000.0) as u64),
+        ),
+        palette::TEXT,
+    );
+
     let cause = (
         format!(
             "on spike: {}  model+{} plate+{} probe {}\u{00b5}s   snap {}\u{00b5}s n:{}  {:.0} rebuild/s",
@@ -360,7 +392,7 @@ fn build_text_lines(
         palette::MUTED,
     );
 
-    vec![title, spike, cause]
+    vec![title, spike, split, cause]
 }
 
 fn sample_color(ms: f32) -> Color {

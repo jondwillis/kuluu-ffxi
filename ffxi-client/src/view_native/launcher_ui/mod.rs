@@ -410,6 +410,13 @@ pub(crate) struct CreateAccountErrorMsg(pub String);
 #[derive(Resource, Default)]
 pub(crate) struct LoginErrorMsg(pub String);
 
+#[derive(Resource, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum LoginErrorReturn {
+    #[default]
+    Login,
+    CharList,
+}
+
 #[derive(Resource, Clone)]
 pub(crate) struct RuntimeHandle(pub RtHandle);
 
@@ -526,6 +533,7 @@ pub(crate) fn register(
         .insert_resource(form)
         .insert_resource(login::LoginUiDirty::default())
         .insert_resource(LoginErrorMsg::default())
+        .insert_resource(LoginErrorReturn::default())
         .insert_resource(RuntimeHandle(runtime))
         .insert_resource(ServerInfo {
             server: server.to_string(),
@@ -753,7 +761,10 @@ pub(crate) fn register(
         OnEnter(LauncherState::LoginError),
         (login::spawn_error_ui, clear_direct_mode_on_error),
     )
-    .add_systems(OnExit(LauncherState::LoginError), login::despawn_error_ui)
+    .add_systems(
+        OnExit(LauncherState::LoginError),
+        (login::despawn_error_ui, reset_login_error_return),
+    )
     .add_systems(
         Update,
         login::error_keyboard_system.run_if(in_state(LauncherState::LoginError)),
@@ -899,11 +910,17 @@ fn advance_to_connecting(mut next_phase: ResMut<NextState<AppPhase>>) {
     next_phase.set(AppPhase::Connecting);
 }
 
+fn reset_login_error_return(mut ret: ResMut<LoginErrorReturn>) {
+    *ret = LoginErrorReturn::Login;
+}
+
 fn restore_login_error_on_reentry(
     err: Res<LoginErrorMsg>,
+    mut ret: ResMut<LoginErrorReturn>,
     mut next: ResMut<NextState<LauncherState>>,
 ) {
     if !err.0.is_empty() {
+        *ret = LoginErrorReturn::Login;
         next.set(LauncherState::LoginError);
     }
 }

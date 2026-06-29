@@ -11,8 +11,9 @@ use crate::launcher::Selection;
 
 use super::{
     ChangePasswordForm, CharCreateError, CharCreateForm, CharListData, CreateAccountErrorMsg,
-    CreateAccountForm, Credentials, LauncherClients, LauncherState, LoginErrorMsg, LoginForm,
-    OpenedLobby, PendingConnect, RuntimeHandle, SelectedChar, ServerSelectForm,
+    CreateAccountForm, Credentials, LauncherClients, LauncherState, LoginErrorMsg,
+    LoginErrorReturn, LoginForm, OpenedLobby, PendingConnect, RuntimeHandle, SelectedChar,
+    ServerSelectForm,
 };
 
 use ffxi_client::launcher_store::{self, keyring_account_key, SavedAccount, KEYRING_SERVICE};
@@ -209,9 +210,14 @@ struct ConnectOk {
     auth: ffxi_client::auth_client::AuthSession,
 }
 
+struct ConnectErr {
+    msg: String,
+    return_to: LoginErrorReturn,
+}
+
 #[derive(Resource)]
 pub(super) struct ConnectInFlightChan {
-    rx: oneshot::Receiver<Result<ConnectOk>>,
+    rx: oneshot::Receiver<std::result::Result<ConnectOk, ConnectErr>>,
 }
 
 #[derive(Component)]
@@ -227,7 +233,10 @@ pub(super) fn spawn_connect_task(
 ) {
     let Some(slot) = sel.0.clone() else {
         let (tx, rx) = oneshot::channel();
-        let _ = tx.send(Err(anyhow!("no character selected")));
+        let _ = tx.send(Err(ConnectErr {
+            msg: "no character selected".into(),
+            return_to: LoginErrorReturn::CharList,
+        }));
         commands.insert_resource(ConnectInFlightChan { rx });
         return;
     };
@@ -265,7 +274,7 @@ async fn select_with_existing_handle(
     handle: LobbyHandle,
     slot: &ffxi_client::lobby_client::CharSlot,
     auth_session: ffxi_client::auth_client::AuthSession,
-) -> Result<ConnectOk> {
+) -> std::result::Result<ConnectOk, ConnectErr> {
     let mut key3 = [0u8; 20];
     for (i, b) in key3.iter_mut().enumerate() {
         *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
@@ -273,7 +282,10 @@ async fn select_with_existing_handle(
     let handoff = handle
         .select(slot.char_id, &slot.name, key3)
         .await
-        .map_err(|e| anyhow!("lobby select: {e}"))?;
+        .map_err(|e| ConnectErr {
+            msg: format!("lobby select: {e}"),
+            return_to: LoginErrorReturn::CharList,
+        })?;
     Ok(ConnectOk {
         handoff,
         key3,
@@ -287,15 +299,15 @@ async fn reopen_and_select(
     user: &str,
     pass: &str,
     slot: &ffxi_client::lobby_client::CharSlot,
-) -> Result<ConnectOk> {
-    let session = auth
-        .login(user, pass)
-        .await
-        .map_err(|e| anyhow!("re-login: {e}"))?;
-    let handle = lobby
-        .open(&session)
-        .await
-        .map_err(|e| anyhow!("reopening lobby: {e}"))?;
+) -> std::result::Result<ConnectOk, ConnectErr> {
+    let session = auth.login(user, pass).await.map_err(|e| ConnectErr {
+        msg: format!("re-login: {e}"),
+        return_to: LoginErrorReturn::Login,
+    })?;
+    let handle = lobby.open(&session).await.map_err(|e| ConnectErr {
+        msg: format!("reopening lobby: {e}"),
+        return_to: LoginErrorReturn::CharList,
+    })?;
     let mut key3 = [0u8; 20];
     for (i, b) in key3.iter_mut().enumerate() {
         *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
@@ -303,7 +315,10 @@ async fn reopen_and_select(
     let handoff = handle
         .select(slot.char_id, &slot.name, key3)
         .await
-        .map_err(|e| anyhow!("lobby select: {e}"))?;
+        .map_err(|e| ConnectErr {
+            msg: format!("lobby select: {e}"),
+            return_to: LoginErrorReturn::CharList,
+        })?;
     Ok(ConnectOk {
         handoff,
         key3,
@@ -316,6 +331,7 @@ pub(super) fn poll_connect_system(
     mut chan: ResMut<ConnectInFlightChan>,
     mut next_state: ResMut<NextState<LauncherState>>,
     mut err: ResMut<LoginErrorMsg>,
+    mut err_return: ResMut<LoginErrorReturn>,
     sel: Res<SelectedChar>,
     creds: Res<Credentials>,
     mut pending: ResMut<PendingConnect>,
@@ -341,13 +357,15 @@ pub(super) fn poll_connect_system(
             next_state.set(LauncherState::Done);
         }
         Ok(Err(e)) => {
-            err.0 = format!("{e:#}");
+            err.0 = e.msg;
+            *err_return = e.return_to;
             commands.remove_resource::<ConnectInFlightChan>();
             next_state.set(LauncherState::LoginError);
         }
         Err(oneshot::error::TryRecvError::Empty) => {}
         Err(oneshot::error::TryRecvError::Closed) => {
             err.0 = "connect task dropped its sender unexpectedly".into();
+            *err_return = LoginErrorReturn::CharList;
             commands.remove_resource::<ConnectInFlightChan>();
             next_state.set(LauncherState::LoginError);
         }

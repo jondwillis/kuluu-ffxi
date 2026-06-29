@@ -15,7 +15,8 @@ use super::common::{
 };
 use super::server_version_check::{ServerVersionStatus, VersionViolation};
 use super::{
-    Credentials, LauncherState, LoginErrorMsg, LoginField, LoginForm, ServerInfo, ServerSelectForm,
+    Credentials, LauncherState, LoginErrorMsg, LoginErrorReturn, LoginField, LoginForm, ServerInfo,
+    ServerSelectForm,
 };
 use crate::view_native::widgets::text_field::{text_field, TextFieldSubmitted};
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
@@ -456,14 +457,24 @@ pub(super) fn redraw_login_form_system() {}
 #[derive(Component)]
 pub(super) struct ErrorUiRoot;
 
-pub(super) fn spawn_error_ui(mut commands: Commands, msg: Res<LoginErrorMsg>) {
+pub(super) fn spawn_error_ui(
+    mut commands: Commands,
+    msg: Res<LoginErrorMsg>,
+    ret: Res<LoginErrorReturn>,
+) {
     let body = msg.0.clone();
+    let (heading, back_label) = match *ret {
+        // The account is still signed in and the character list is intact —
+        // a lobby-select / map-handoff failure only needs another pick.
+        LoginErrorReturn::CharList => ("Couldn't enter world", "Back to characters"),
+        LoginErrorReturn::Login => ("Login failed", "Back to login"),
+    };
     commands
         .spawn((ErrorUiRoot, screen_root()))
         .with_children(|root| {
             root.spawn(panel_node(520.0)).with_children(|panel| {
                 panel.spawn((
-                    Text::new("Login failed"),
+                    Text::new(heading),
                     TextFont {
                         font_size: 22.0,
                         ..default()
@@ -487,21 +498,42 @@ pub(super) fn spawn_error_ui(mut commands: Commands, msg: Res<LoginErrorMsg>) {
                             ..default()
                         },
                         (),
-                        Spawn((Text::new("Back to login"), ThemedText)),
+                        Spawn((Text::new(back_label), ThemedText)),
                     ))
                     .observe(
                         |_ev: On<Activate>,
+                         ret: Res<LoginErrorReturn>,
+                         mut err: ResMut<LoginErrorMsg>,
                          mut form: ResMut<LoginForm>,
                          mut creds: ResMut<Credentials>,
                          mut next: ResMut<NextState<LauncherState>>| {
-                            form.pass.clear();
-                            creds.user.clear();
-                            creds.pass.clear();
-                            next.set(LauncherState::Login);
+                            back_from_error(*ret, &mut err, &mut form, &mut creds, &mut next);
                         },
                     );
             });
         });
+}
+
+fn back_from_error(
+    ret: LoginErrorReturn,
+    err: &mut LoginErrorMsg,
+    form: &mut LoginForm,
+    creds: &mut Credentials,
+    next: &mut NextState<LauncherState>,
+) {
+    // Dismissing the error consumes the message; a fresh disconnect/failure
+    // re-sets it, so leaving it would only re-trigger a phantom error later.
+    err.0.clear();
+    match ret {
+        // Keep the live credentials so a re-pick can reopen the lobby.
+        LoginErrorReturn::CharList => next.set(LauncherState::CharList),
+        LoginErrorReturn::Login => {
+            form.pass.clear();
+            creds.user.clear();
+            creds.pass.clear();
+            next.set(LauncherState::Login);
+        }
+    }
 }
 
 pub(super) fn despawn_error_ui(mut commands: Commands, q: Query<Entity, With<ErrorUiRoot>>) {
@@ -512,6 +544,8 @@ pub(super) fn despawn_error_ui(mut commands: Commands, q: Query<Entity, With<Err
 
 pub(super) fn error_keyboard_system(
     mut events: MessageReader<KeyboardInput>,
+    ret: Res<LoginErrorReturn>,
+    mut err: ResMut<LoginErrorMsg>,
     mut next_state: ResMut<NextState<LauncherState>>,
     mut form: ResMut<LoginForm>,
     mut creds: ResMut<Credentials>,
@@ -521,10 +555,7 @@ pub(super) fn error_keyboard_system(
             continue;
         }
         if matches!(ev.logical_key, Key::Escape) {
-            form.pass.clear();
-            creds.user.clear();
-            creds.pass.clear();
-            next_state.set(LauncherState::Login);
+            back_from_error(*ret, &mut err, &mut form, &mut creds, &mut next_state);
             return;
         }
     }
