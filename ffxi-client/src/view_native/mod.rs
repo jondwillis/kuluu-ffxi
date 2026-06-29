@@ -144,6 +144,8 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     app.add_systems(Startup, configure_gizmo_render_layer);
 
+    app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
+
     app.add_plugins(bevy_framepace::FramepacePlugin);
 
     app.add_plugins(bevy::feathers::FeathersPlugins)

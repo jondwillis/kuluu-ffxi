@@ -110,9 +110,36 @@ pub fn mark_frame_end(mut m: ResMut<PerfMonitor>) {
     }
 }
 
+fn top_render_spans(diag: &DiagnosticsStore) -> String {
+    let mut spans: Vec<(String, f64)> = diag
+        .iter()
+        .filter(|d| d.path().as_str().starts_with("render/"))
+        .filter_map(|d| {
+            let peak = d.values().copied().fold(0.0f64, f64::max);
+            (peak > 0.0).then(|| {
+                let name = d
+                    .path()
+                    .as_str()
+                    .trim_start_matches("render/")
+                    .replace("/elapsed_cpu", "~cpu")
+                    .replace("/elapsed_gpu", "~gpu");
+                (name, peak)
+            })
+        })
+        .collect();
+    spans.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    spans.truncate(3);
+    if spans.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = spans.iter().map(|(n, v)| format!("{n} {v:.1}ms")).collect();
+    format!("  peak render: {}", parts.join(", "))
+}
+
 pub fn update_perf_monitor(
     time: Res<Time<Real>>,
     source: Res<NativeSource>,
+    diag: Res<DiagnosticsStore>,
     mut m: ResMut<PerfMonitor>,
 ) {
     let dt = time.delta_secs();
@@ -204,9 +231,10 @@ pub fn update_perf_monitor(
         String::new()
     };
     let render_us = (dt_ms * 1000.0) as u64 - cpu_us.min((dt_ms * 1000.0) as u64);
+    let render_spans = top_render_spans(&diag);
     warn!(
         target: "perf",
-        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s render~{render_us}\u{00b5}s | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s{extra}",
+        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s render~{render_us}\u{00b5}s | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s{extra}{render_spans}",
         m.baseline_ms,
         dt_ms - m.baseline_ms,
         cpu_us,
