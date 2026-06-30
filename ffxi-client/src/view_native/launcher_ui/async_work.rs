@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use bevy::prelude::*;
 use ffxi_client::auth_client::AuthClient;
 use ffxi_client::lobby_client::{LobbyClient, LobbyHandle, MapHandoff};
@@ -476,7 +476,7 @@ async fn run_char_create(
     let refreshed = handle
         .create_character(&auth, &spec)
         .await
-        .map_err(|e| anyhow!("character creation: {e}"))?;
+        .context("character creation")?;
     tracing::info!(
         name = %name,
         char_count = refreshed.chars().len(),
@@ -518,7 +518,7 @@ pub(super) fn poll_char_create_system(
             next_state.set(LauncherState::AuthInFlight);
         }
         Ok(Err(e)) => {
-            tracing::error!(error = %e, "char-create failed");
+            tracing::error!(error = format!("{e:#}"), "char-create failed");
             err.0 = format!("{e:#}");
             commands.remove_resource::<CharCreateInFlightChan>();
             next_state.set(LauncherState::CharCreateError);
