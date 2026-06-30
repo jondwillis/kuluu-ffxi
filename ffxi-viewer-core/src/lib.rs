@@ -255,7 +255,12 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                         target_ring::draw_target_ring_system,
                         sync_zone_lines_system,
                         atmosphere::apply_zone_atmosphere_system,
-                    ),
+                    )
+                        // Chained so each camera writes its Transform before the nameplate and
+                        // target-ring systems read it. Left unordered, the first-person camera and
+                        // the self nameplate race on the camera Transform, so the overhead self
+                        // nameplate jitters/dips against the eye frame-to-frame (kuluu-gr2).
+                        .chain(),
                     (
                         weather_fx::sync_current_weather_from_snapshot,
                         weather_fx::update_weather_modifier_system,
