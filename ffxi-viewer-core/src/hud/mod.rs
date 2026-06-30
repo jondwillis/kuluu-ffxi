@@ -36,6 +36,13 @@ pub struct HudVerbosity {
     pub dev_hud: bool,
 }
 
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct HudPanels {
+    pub perf: bool,
+    pub target_cycle: bool,
+    pub mesh_debug: bool,
+}
+
 #[derive(Component)]
 pub struct DevHud;
 
@@ -155,6 +162,7 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HudVerbosity>();
+        app.init_resource::<HudPanels>();
         app.init_resource::<network_status::NetStatusVisible>();
 
         app.init_resource::<menu::DynamicMenu>();

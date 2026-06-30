@@ -16,6 +16,7 @@ const ROOT_ENTRIES: &[&str] = &[
     "Macros",
     "Graphics",
     "Config",
+    "Debug",
     "Logout",
 ];
 
@@ -93,6 +94,13 @@ const CONFIG_ENTRIES: &[&str] = &[
     "Reset to defaults",
     "Show current bindings",
 ];
+
+pub const DEBUG_PERF: &str = "Perf";
+pub const DEBUG_TARGET_CYCLE: &str = "Target Cycle";
+pub const DEBUG_MESH: &str = "Mesh Debug";
+pub const DEBUG_NET_STATUS: &str = "Net Status";
+
+const DEBUG_ENTRIES: &[&str] = &[DEBUG_PERF, DEBUG_TARGET_CYCLE, DEBUG_MESH, DEBUG_NET_STATUS];
 
 const GRAPHICS_ENTRIES: &[&str] = &[
     "Preset",
@@ -200,6 +208,7 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
     match kind {
         MenuKind::Root => ROOT_ENTRIES,
         MenuKind::Config => CONFIG_ENTRIES,
+        MenuKind::Debug => DEBUG_ENTRIES,
         MenuKind::Graphics => GRAPHICS_ENTRIES,
 
         MenuKind::Magic => &["(Magic — data pending)"],
@@ -218,6 +227,7 @@ fn menu_title(kind: MenuKind) -> &'static str {
     match kind {
         MenuKind::Root => "Commands",
         MenuKind::Config => "Config",
+        MenuKind::Debug => "Debug",
         MenuKind::Graphics => "Graphics",
         MenuKind::Equipment => "Equipment",
         MenuKind::Magic => "Magic",
@@ -466,6 +476,8 @@ pub fn ability_group_empty_hint(group: crate::hud::action_model::AbilityGroup) -
 pub fn update_main_menu(
     mode: Res<InputMode>,
     settings: Res<GraphicsSettings>,
+    panels: Res<crate::hud::HudPanels>,
+    net_status: Res<crate::hud::network_status::NetStatusVisible>,
 
     scene: Res<crate::snapshot::SceneState>,
     dynamic: Res<DynamicMenu>,
@@ -518,8 +530,15 @@ pub fn update_main_menu(
                     row_node.display = Display::Flex;
                 }
                 let is_cursor = list_idx == c;
-                let body =
-                    format_row_body(kind, list_idx, &label_owned, &settings, &scene.snapshot);
+                let body = format_row_body(
+                    kind,
+                    list_idx,
+                    &label_owned,
+                    &settings,
+                    &panels,
+                    net_status.0,
+                    &scene.snapshot,
+                );
                 let want = if is_cursor {
                     format!("> {body}")
                 } else {
@@ -631,6 +650,8 @@ fn format_row_body(
     slot: usize,
     label: &str,
     settings: &GraphicsSettings,
+    panels: &crate::hud::HudPanels,
+    net_status_on: bool,
     snapshot: &ffxi_viewer_wire::SceneSnapshot,
 ) -> String {
     match kind {
@@ -643,6 +664,10 @@ fn format_row_body(
 
             None => label.to_string(),
         },
+        MenuKind::Debug => {
+            let on = debug_panel_state(label, panels, net_status_on);
+            format!("{label:<14}[{}]", if on { "on" } else { "off" })
+        }
         MenuKind::Equipment => {
             let item_name = snapshot
                 .equipped
@@ -654,6 +679,16 @@ fn format_row_body(
             format!("{label:<7}: {item_name}")
         }
         _ => label.to_string(),
+    }
+}
+
+pub fn debug_panel_state(label: &str, panels: &crate::hud::HudPanels, net_status_on: bool) -> bool {
+    match label {
+        DEBUG_PERF => panels.perf,
+        DEBUG_TARGET_CYCLE => panels.target_cycle,
+        DEBUG_MESH => panels.mesh_debug,
+        DEBUG_NET_STATUS => net_status_on,
+        _ => false,
     }
 }
 
@@ -675,6 +710,7 @@ mod tests {
         for kind in [
             MenuKind::Root,
             MenuKind::Config,
+            MenuKind::Debug,
             MenuKind::Graphics,
             MenuKind::Equipment,
             MenuKind::Status,
@@ -688,6 +724,31 @@ mod tests {
                 visible_window(kind, total),
                 total,
                 "{kind:?} is static and must render every row"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_rows_map_to_distinct_panel_state() {
+        let panels = crate::hud::HudPanels {
+            perf: true,
+            target_cycle: false,
+            mesh_debug: true,
+        };
+        assert!(debug_panel_state(DEBUG_PERF, &panels, false));
+        assert!(!debug_panel_state(DEBUG_TARGET_CYCLE, &panels, false));
+        assert!(debug_panel_state(DEBUG_MESH, &panels, false));
+        assert!(debug_panel_state(DEBUG_NET_STATUS, &panels, true));
+        assert!(!debug_panel_state(DEBUG_NET_STATUS, &panels, false));
+
+        for label in DEBUG_ENTRIES {
+            assert_eq!(
+                static_entries(MenuKind::Debug)
+                    .iter()
+                    .filter(|e| *e == label)
+                    .count(),
+                1,
+                "Debug row {label:?} must appear exactly once"
             );
         }
     }

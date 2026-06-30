@@ -770,7 +770,7 @@ const COMMANDS: &[(&str, &[Command])] = &[
             Command {
                 aliases: &["devhud"],
                 usage: "[on|off|toggle]",
-                summary: "developer telemetry overlays (stage bar, agent goal, etc.)",
+                summary: "stage + diagnostics bars (top/bottom telemetry). Per-panel overlays (perf, target cycle, mesh, netstat) live in the in-game Debug menu",
                 handler: |c| parse_devhud(c.rest),
             },
             Command {

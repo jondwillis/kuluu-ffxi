@@ -48,6 +48,8 @@ pub enum MenuKind {
 
     Config,
 
+    Debug,
+
     Graphics,
 
     Magic,

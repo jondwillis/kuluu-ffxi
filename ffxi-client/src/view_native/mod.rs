@@ -226,6 +226,14 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             .chain()
             .run_if(in_state(AppPhase::InGame)),
     );
+    app.add_systems(
+        Update,
+        (
+            perf_hud::apply_perf_visibility,
+            target_list_hud::apply_target_list_visibility,
+        )
+            .run_if(in_state(AppPhase::InGame)),
+    );
 
     app.add_systems(
         OnExit(AppPhase::InGame),

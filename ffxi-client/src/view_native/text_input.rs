@@ -45,6 +45,8 @@ pub struct SlashWriters<'w, 's> {
 
     pub hud_verbosity: ResMut<'w, ffxi_viewer_core::hud::HudVerbosity>,
 
+    pub hud_panels: ResMut<'w, ffxi_viewer_core::hud::HudPanels>,
+
     pub net_status_visible: ResMut<'w, ffxi_viewer_core::hud::network_status::NetStatusVisible>,
 
     pub minimap_mode: ResMut<'w, ffxi_viewer_core::minimap::MinimapMode>,
@@ -72,6 +74,14 @@ pub struct SlashWriters<'w, 's> {
     pub trade_intent: MessageWriter<'w, ffxi_viewer_core::hud::trade::TradeIntent>,
 
     pub select_target: ResMut<'w, SelectTargetMode>,
+}
+
+#[derive(SystemParam)]
+pub struct MenuConfirmWriters<'w> {
+    pub graphics: ResMut<'w, ffxi_viewer_core::GraphicsSettings>,
+    pub status_profile_open: ResMut<'w, ffxi_viewer_core::hud::status_panel::StatusProfileOpen>,
+    pub hud_panels: ResMut<'w, ffxi_viewer_core::hud::HudPanels>,
+    pub net_status: ResMut<'w, ffxi_viewer_core::hud::network_status::NetStatusVisible>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -220,6 +230,8 @@ pub fn text_input_system(
                     &mut keybinds_state,
                     &mut slash_writers.graphics,
                     &mut slash_writers.status_profile_open,
+                    &mut slash_writers.hud_panels,
+                    &mut slash_writers.net_status_visible,
                     &dynamic_menu,
                     current_target,
                     self_pos,
@@ -1551,6 +1563,7 @@ fn apply_slash_outcome(
                 ffxi_viewer_core::MenuKind::Equipment => "Equipment".into(),
                 ffxi_viewer_core::MenuKind::Root => "Root".into(),
                 ffxi_viewer_core::MenuKind::Config => "Config".into(),
+                ffxi_viewer_core::MenuKind::Debug => "Debug".into(),
                 ffxi_viewer_core::MenuKind::Graphics => "Graphics".into(),
                 ffxi_viewer_core::MenuKind::Status => "Status".into(),
 
@@ -1911,6 +1924,8 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
 
         (MenuKind::Root, "Config") => MenuDispatch::OpenSubmenu(MenuKind::Config),
 
+        (MenuKind::Root, "Debug") => MenuDispatch::OpenSubmenu(MenuKind::Debug),
+
         (MenuKind::Root, "Graphics") => MenuDispatch::OpenSubmenu(MenuKind::Graphics),
 
         (MenuKind::Root, "Magic") => MenuDispatch::OpenSubmenu(MenuKind::Magic),
@@ -1963,6 +1978,8 @@ fn confirm_menu_at_cursor(
     keybinds_state: &mut KeybindsStateRes,
     graphics: &mut ffxi_viewer_core::GraphicsSettings,
     status_profile_open: &mut ffxi_viewer_core::hud::status_panel::StatusProfileOpen,
+    hud_panels: &mut ffxi_viewer_core::hud::HudPanels,
+    net_status: &mut ffxi_viewer_core::hud::network_status::NetStatusVisible,
     dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
     target_id: Option<u32>,
     self_pos: ffxi_viewer_wire::Vec3,
@@ -1971,6 +1988,12 @@ fn confirm_menu_at_cursor(
         let level = stack.current()?;
         (level.kind, level.cursor)
     };
+
+    if matches!(kind, MenuKind::Debug) {
+        let label = ffxi_viewer_core::hud::menu::entry_label(kind, cursor, dynamic);
+        toggle_debug_panel(label, hud_panels, net_status, scene_state);
+        return None;
+    }
 
     if matches!(kind, MenuKind::Status) {
         use ffxi_viewer_core::hud::status_panel::{StatusEntryKind, STATUS_ENTRIES};
@@ -2069,6 +2092,43 @@ fn confirm_menu_at_cursor(
             None
         }
     }
+}
+
+fn toggle_debug_panel(
+    label: &str,
+    hud_panels: &mut ffxi_viewer_core::hud::HudPanels,
+    net_status: &mut ffxi_viewer_core::hud::network_status::NetStatusVisible,
+    scene_state: &mut SceneState,
+) {
+    use ffxi_viewer_core::hud::menu::{
+        DEBUG_MESH, DEBUG_NET_STATUS, DEBUG_PERF, DEBUG_TARGET_CYCLE,
+    };
+    let on = match label {
+        DEBUG_PERF => {
+            hud_panels.perf = !hud_panels.perf;
+            hud_panels.perf
+        }
+        DEBUG_TARGET_CYCLE => {
+            hud_panels.target_cycle = !hud_panels.target_cycle;
+            hud_panels.target_cycle
+        }
+        DEBUG_MESH => {
+            hud_panels.mesh_debug = !hud_panels.mesh_debug;
+            hud_panels.mesh_debug
+        }
+        DEBUG_NET_STATUS => {
+            net_status.0 = !net_status.0;
+            net_status.0
+        }
+        other => {
+            push_system_chat_line(scene_state, format!("[menu] Debug: unknown `{other}`"));
+            return;
+        }
+    };
+    push_system_chat_line(
+        scene_state,
+        format!("[menu] {label}: {}", if on { "on" } else { "off" }),
+    );
 }
 
 fn dispatch_dynamic_menu_action(
@@ -2264,8 +2324,7 @@ pub fn mouse_nav_dispatch_system(
     mut mode: ResMut<InputMode>,
     target: Res<Target>,
     mut scene_state: ResMut<SceneState>,
-    mut graphics: ResMut<ffxi_viewer_core::GraphicsSettings>,
-    mut status_profile_open: ResMut<ffxi_viewer_core::hud::status_panel::StatusProfileOpen>,
+    mut menu_writers: MenuConfirmWriters,
     dynamic_menu: Res<ffxi_viewer_core::hud::menu::DynamicMenu>,
     mut check_target: ResMut<ffxi_viewer_core::hud::check_view::CheckTarget>,
     mut trade_state: ResMut<ffxi_viewer_core::hud::trade::TradeState>,
@@ -2286,8 +2345,10 @@ pub fn mouse_nav_dispatch_system(
                 &mut scene_state,
                 &cmd_tx.0,
                 &mut keybinds_state,
-                &mut graphics,
-                &mut status_profile_open,
+                &mut menu_writers.graphics,
+                &mut menu_writers.status_profile_open,
+                &mut menu_writers.hud_panels,
+                &mut menu_writers.net_status,
                 &dynamic_menu,
                 current_target,
                 self_pos,
@@ -2354,6 +2415,8 @@ fn handle_menu_key(
     keybinds_state: &mut KeybindsStateRes,
     graphics: &mut ffxi_viewer_core::GraphicsSettings,
     status_profile_open: &mut ffxi_viewer_core::hud::status_panel::StatusProfileOpen,
+    hud_panels: &mut ffxi_viewer_core::hud::HudPanels,
+    net_status: &mut ffxi_viewer_core::hud::network_status::NetStatusVisible,
     dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
     target_id: Option<u32>,
     self_pos: ffxi_viewer_wire::Vec3,
@@ -2399,6 +2462,8 @@ fn handle_menu_key(
             keybinds_state,
             graphics,
             status_profile_open,
+            hud_panels,
+            net_status,
             dynamic,
             target_id,
             self_pos,

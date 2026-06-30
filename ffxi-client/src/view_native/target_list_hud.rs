@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use ffxi_viewer_core::hud::{palette, DevHud, HudVerbosity};
+use ffxi_viewer_core::hud::{palette, HudPanels};
 use ffxi_viewer_core::{InGameEntity, OperatorCamera, SceneState, Target};
 use ffxi_viewer_wire::EntityKind;
 
@@ -24,7 +24,6 @@ pub fn spawn_target_list_hud(mut commands: Commands) {
     commands
         .spawn((
             InGameEntity,
-            DevHud,
             TargetListPanel,
             Node {
                 position_type: PositionType::Absolute,
@@ -79,8 +78,27 @@ struct RowData {
     color: Color,
 }
 
+pub fn apply_target_list_visibility(
+    panels: Res<HudPanels>,
+    mut q: Query<&mut Visibility, With<TargetListPanel>>,
+) {
+    if !panels.is_changed() {
+        return;
+    }
+    let want = if panels.target_cycle {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut v in q.iter_mut() {
+        if *v != want {
+            *v = want;
+        }
+    }
+}
+
 pub fn update_target_list_hud(
-    verbosity: Res<HudVerbosity>,
+    panels: Res<HudPanels>,
     time: Res<Time>,
     scene: Res<SceneState>,
     target: Res<Target>,
@@ -90,7 +108,7 @@ pub fn update_target_list_hud(
     mut info_q: Query<(&InfoLine, &mut Text, &mut TextColor), Without<TargetListRow>>,
     mut row_q: Query<(&TargetListRow, &mut Text, &mut TextColor, &mut Node), Without<InfoLine>>,
 ) {
-    if !verbosity.dev_hud {
+    if !panels.target_cycle {
         return;
     }
     *refresh += time.delta_secs();

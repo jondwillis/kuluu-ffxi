@@ -1,7 +1,7 @@
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use bevy::time::Real;
-use ffxi_viewer_core::hud::{palette, DevHud, HudVerbosity};
+use ffxi_viewer_core::hud::{palette, HudPanels};
 use ffxi_viewer_core::{perf_probe, InGameEntity};
 
 use super::bridge::NativeSource;
@@ -245,7 +245,6 @@ pub fn spawn_perf_hud(mut commands: Commands) {
     commands
         .spawn((
             InGameEntity,
-            DevHud,
             PerfPanel,
             Node {
                 position_type: PositionType::Absolute,
@@ -327,15 +326,34 @@ fn spawn_ref_line(g: &mut ChildSpawnerCommands, ms: f32, color: Color) {
     ));
 }
 
+pub fn apply_perf_visibility(
+    panels: Res<HudPanels>,
+    mut q: Query<&mut Visibility, With<PerfPanel>>,
+) {
+    if !panels.is_changed() {
+        return;
+    }
+    let want = if panels.perf {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut v in q.iter_mut() {
+        if *v != want {
+            *v = want;
+        }
+    }
+}
+
 pub fn update_perf_graph(
-    verbosity: Res<HudVerbosity>,
+    panels: Res<HudPanels>,
     m: Res<PerfMonitor>,
     source: Res<NativeSource>,
     diag: Res<DiagnosticsStore>,
     mut bars: Query<(&PerfGraphBar, &mut Node, &mut BackgroundColor)>,
     mut lines: Query<(&PerfTextLine, &mut Text, &mut TextColor)>,
 ) {
-    if !verbosity.dev_hud {
+    if !panels.perf {
         return;
     }
 

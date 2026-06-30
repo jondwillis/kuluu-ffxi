@@ -35,7 +35,6 @@ pub fn spawn_mesh_debug_hud(mut commands: Commands) {
     commands
         .spawn((
             crate::components::InGameEntity,
-            crate::hud::DevHud,
             MeshDebugHud,
             Node {
                 position_type: PositionType::Absolute,
@@ -110,7 +109,7 @@ pub fn update_hover_state(
 
 pub fn update_mesh_debug_hud(
     hover: Res<MeshHoverDebug>,
-    verbosity: Res<crate::hud::HudVerbosity>,
+    panels: Res<crate::hud::HudPanels>,
     mut hud_q: Query<&mut Visibility, With<MeshDebugHud>>,
     mut text_q: Query<&mut Text, With<MeshDebugHudText>>,
 ) {
@@ -121,7 +120,7 @@ pub fn update_mesh_debug_hud(
         return;
     };
 
-    if !verbosity.dev_hud {
+    if !panels.mesh_debug {
         if *vis != Visibility::Hidden {
             *vis = Visibility::Hidden;
         }
