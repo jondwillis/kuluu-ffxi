@@ -1004,10 +1004,13 @@ fn compute_init_visibility(mode: ZoneGeomMode) -> (Visibility, Visibility) {
 
 fn simple_water_material() -> StandardMaterial {
     StandardMaterial {
-        base_color: Color::srgba(0.18, 0.36, 0.40, 0.46),
-        perceptual_roughness: 0.08,
+        // Interim flat tint — placeholder for the real scrolling water texture.
+        // Murky grey-teal, more transparent and less mirror-bright than a pure
+        // blue so the bed reads through.
+        base_color: Color::srgba(0.20, 0.30, 0.31, 0.40),
+        perceptual_roughness: 0.2,
         metallic: 0.0,
-        reflectance: 0.5,
+        reflectance: 0.38,
         cull_mode: None,
         alpha_mode: AlphaMode::Blend,
         // Bounding-box plane is near-coplanar with the sloped pond bed at the
