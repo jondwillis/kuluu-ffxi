@@ -342,6 +342,10 @@ impl Reactor {
                 self.fishing.on_phase(*phase);
                 Vec::new()
             }
+            AgentEvent::FishingEnded => {
+                self.fishing.abort();
+                Vec::new()
+            }
             _ => Vec::new(),
         };
         if matches!(
@@ -349,6 +353,7 @@ impl Reactor {
             AgentEvent::FishingCast { .. }
                 | AgentEvent::FishHooked { .. }
                 | AgentEvent::FishingServerPhase { .. }
+                | AgentEvent::FishingEnded
         ) {
             let (cmds, events) = self.translate_fishing(fishing_outs);
             self.fishing_pending.extend(cmds);

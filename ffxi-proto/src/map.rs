@@ -63,6 +63,12 @@ pub mod action_id {
     pub const SHOOT: u16 = 0x10;
 }
 
+pub mod eventucoff_mode {
+    // GP_SERV_COMMAND_EVENTUCOFF_MODE, vendor/server/src/map/packets/s2c/0x052_eventucoff.h.
+    // The high bits can carry an event id, so match on the low byte.
+    pub const FISHING: u32 = 4;
+}
+
 pub mod chat_kind {
     pub const SAY: u8 = 0;
     pub const SHOUT: u8 = 1;
@@ -124,6 +130,11 @@ pub mod s2c {
     pub const MISCDATA: u16 = 0x063;
 
     pub const SYSTEMMES: u16 = 0x053;
+
+    // GP_SERV_COMMAND_EVENTUCOFF, vendor/server/src/map/packets/s2c/0x052_eventucoff.h.
+    // Mode 4 (Fishing) releases the fishing event lock — sent on a rejected cast or at the
+    // end of fishing.
+    pub const EVENTUCOFF: u16 = 0x052;
 
     pub const SCENARIO_ITEM: u16 = 0x055;
 

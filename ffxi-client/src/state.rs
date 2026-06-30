@@ -862,7 +862,9 @@ impl SessionState {
                 self.shop = None;
             }
             // Machine inputs (consumed by the reactor, not the rendered projection).
-            AgentEvent::FishingCast { .. } | AgentEvent::FishingServerPhase { .. } => {}
+            AgentEvent::FishingCast { .. }
+            | AgentEvent::FishingServerPhase { .. }
+            | AgentEvent::FishingEnded => {}
             AgentEvent::FishHooked { params } => {
                 let f = self.self_fishing.get_or_insert(SelfFishing {
                     phase: 1,
@@ -1136,6 +1138,10 @@ pub enum AgentEvent {
         fish_hp: u16,
         arrow: Option<FishingArrow>,
     },
+
+    /// The server released the fishing lock (0x052 EVENTUCOFF mode Fishing): a rejected
+    /// cast (no rod/bait/spot) or the end of fishing. Machine input that aborts to idle.
+    FishingEnded,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

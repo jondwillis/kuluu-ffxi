@@ -838,6 +838,18 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::FishHooked { params: f.into() });
             }
         }
+        op if op == s2c::EVENTUCOFF => {
+            // Mode (u32) sits right after the 4-byte sub-header; the high bits may carry an
+            // event id, so match the low byte. Fishing release = a rejected cast (no rod /
+            // bait / fishing spot) or the end of fishing.
+            // vendor/server/src/map/packets/s2c/0x052_eventucoff.h
+            if sub.data.len() >= 4 {
+                let mode = u32::from_le_bytes([sub.data[0], sub.data[1], sub.data[2], sub.data[3]]);
+                if mode & 0xFF == ffxi_proto::map::eventucoff_mode::FISHING {
+                    let _ = event_tx.send(AgentEvent::FishingEnded);
+                }
+            }
+        }
         op if op == s2c::WPOS || op == s2c::WPOS2 => {
             if let Ok(fm) = decode::ForcedMove::decode(sub.data) {
                 if fm.unique_no == self_char_id && fm.mode.carries_position() {

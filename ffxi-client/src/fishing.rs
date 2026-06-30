@@ -32,6 +32,10 @@ const CENTER_SECS: f32 = 0.6;
 /// clamps the reported value to 0..=10.
 const TIMEOUT_WARN_SECS: f32 = 10.0;
 
+/// Give up waiting for the server to confirm a cast after this long (watchdog for a
+/// rejection whose EVENTUCOFF release we never observed).
+const CAST_CONFIRM_TIMEOUT_SECS: f32 = 6.0;
+
 /// One thing the machine wants the surrounding runtime to do.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FishingOut {
@@ -97,8 +101,13 @@ impl Fight {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
     Idle,
-    /// Sent the start action; awaiting the server's FISHING_START confirmation.
-    Casting,
+    /// Sent the start action; awaiting the server's FISHING_START confirmation. `waited`
+    /// guards against a rejected cast (no rod/bait/fishing spot) where the server replies
+    /// with EVENTUCOFF + a message but never FISHING_START — if EVENTUCOFF is missed we
+    /// still recover instead of stranding here.
+    Casting {
+        waited: f32,
+    },
     /// Cast confirmed; counting the hook delay down before requesting a hook check.
     Waiting {
         remaining: f32,
@@ -141,7 +150,7 @@ impl FishingMachine {
     pub fn phase(&self) -> Option<u8> {
         match self.state {
             State::Idle => None,
-            State::Casting | State::Waiting { .. } | State::CheckingHook => Some(0),
+            State::Casting { .. } | State::Waiting { .. } | State::CheckingHook => Some(0),
             State::Fighting(_) => Some(1),
             // Resolution phases (2..=6) are dictated by the server's animation byte, which
             // is reflected straight to the renderer via FishingPhaseChanged, so the
@@ -155,17 +164,25 @@ impl FishingMachine {
         if self.is_active() {
             return Vec::new();
         }
-        self.state = State::Casting;
+        self.state = State::Casting { waited: 0.0 };
         vec![FishingOut::StartCast]
     }
 
     /// Server confirmed the cast (0x037 FISHING_START + hook delay, in seconds).
     pub fn on_cast(&mut self, hook_delay: u8) {
-        if matches!(self.state, State::Casting | State::Idle) {
+        if matches!(self.state, State::Casting { .. } | State::Idle) {
             self.state = State::Waiting {
                 remaining: f32::from(hook_delay),
             };
         }
+    }
+
+    /// The server released the fishing lock (s2c 0x052 EVENTUCOFF, mode Fishing): a
+    /// rejected cast (no rod, no bait, no fishing spot, too soon), an interrupt, or the
+    /// final release after a catch. Reset to idle from any state.
+    /// vendor/server/src/map/utils/fishingutils.cpp (StartFishing / InterruptFishing).
+    pub fn abort(&mut self) {
+        self.state = State::Idle;
     }
 
     /// A fish bit (0x115). Begins the reeling mini-game.
@@ -256,6 +273,15 @@ impl FishingMachine {
     /// Advance `dt` seconds.
     pub fn tick(&mut self, dt: f32) -> Vec<FishingOut> {
         match &mut self.state {
+            State::Casting { waited } => {
+                *waited += dt;
+                // The server normally confirms the cast within a frame or two; if it never
+                // does (rejection whose EVENTUCOFF we missed), give up rather than strand.
+                if *waited >= CAST_CONFIRM_TIMEOUT_SECS {
+                    self.state = State::Idle;
+                }
+                Vec::new()
+            }
             State::Waiting { remaining } => {
                 *remaining -= dt;
                 if *remaining <= 0.0 {
@@ -647,6 +673,46 @@ mod tests {
         m.on_cast(5);
         m.on_phase(None); // Waiting
         assert!(m.is_active());
+    }
+
+    #[test]
+    fn rejected_cast_aborts_to_idle() {
+        // No rod / no bait / no fishing spot: the server replies with EVENTUCOFF (mode
+        // Fishing) and never FISHING_START. abort() must clear the pending cast.
+        let mut m = FishingMachine::new(true);
+        m.start();
+        assert!(m.is_active());
+        m.abort();
+        assert!(!m.is_active());
+        assert_eq!(m.phase(), None);
+    }
+
+    #[test]
+    fn cast_watchdog_recovers_if_confirmation_missed() {
+        let mut m = FishingMachine::new(true);
+        m.start(); // Casting, awaiting FISHING_START
+        for _ in 0..200 {
+            m.tick(0.1);
+            if !m.is_active() {
+                break;
+            }
+        }
+        assert!(
+            !m.is_active(),
+            "a never-confirmed cast must not strand in Casting"
+        );
+    }
+
+    #[test]
+    fn abort_ends_an_active_fight() {
+        let mut m = FishingMachine::new(false);
+        m.start();
+        m.on_cast(0);
+        m.tick(0.1);
+        m.on_hooked(fish(50, 0));
+        assert_eq!(m.phase(), Some(1));
+        m.abort();
+        assert!(!m.is_active());
     }
 
     #[test]
