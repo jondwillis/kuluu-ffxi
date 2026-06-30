@@ -325,7 +325,6 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
     app.add_systems(
         schedule.clone(),
         (
-            stage_bar::spawn_stage_bar,
             spawn_bottom_left_stack,
             diagnostics::spawn_diagnostics,
             roster::spawn_roster_panel,

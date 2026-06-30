@@ -5,9 +5,6 @@ use crate::hud::palette;
 use crate::snapshot::SceneState;
 
 #[derive(Component)]
-pub struct StageBar;
-
-#[derive(Component)]
 pub struct StageDot;
 
 #[derive(Component)]
@@ -19,94 +16,63 @@ pub struct CharName;
 #[derive(Component)]
 pub struct ZoneLabel;
 
-pub fn spawn_stage_bar(mut commands: Commands) {
-    commands
-        .spawn((
-            crate::components::InGameEntity,
-            crate::hud::DevHud,
-            StageBar,
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(0.0),
-                left: Val::Px(0.0),
-                right: Val::Px(0.0),
-                height: Val::Px(28.0),
-                padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
-                border: UiRect::all(Val::Px(1.0)),
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(0.0),
-                ..default()
-            },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
-            Visibility::Hidden,
-        ))
-        .with_children(|p| {
-            p.spawn((
-                Text::new("▌ ffxi-client "),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(palette::ACCENT),
-            ));
+const FONT: f32 = 13.0;
 
-            p.spawn((
-                StageDot,
-                Text::new("● "),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(stage_color(Stage::default())),
-            ));
+pub fn spawn_stage_cluster_as_child(p: &mut ChildSpawnerCommands) {
+    p.spawn((
+        StageDot,
+        Text::new("● "),
+        TextFont {
+            font_size: FONT,
+            ..default()
+        },
+        TextColor(stage_color(Stage::default())),
+    ));
 
-            p.spawn((
-                StageLabel,
-                Text::new(stage_label(Stage::default()).to_string()),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(stage_color(Stage::default())),
-            ));
+    p.spawn((
+        StageLabel,
+        Text::new(stage_label(Stage::default()).to_string()),
+        TextFont {
+            font_size: FONT,
+            ..default()
+        },
+        TextColor(stage_color(Stage::default())),
+    ));
 
-            p.spawn((
-                Text::new("  ▪  "),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(palette::MUTED),
-            ));
-            p.spawn((
-                CharName,
-                Text::new("(no char)".to_string()),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(palette::TEXT),
-            ));
-            p.spawn((
-                Text::new("  ▪  "),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(palette::MUTED),
-            ));
-            p.spawn((
-                ZoneLabel,
-                Text::new("—".to_string()),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(palette::TEXT),
-            ));
-        });
+    p.spawn((
+        Text::new("  ▪  "),
+        TextFont {
+            font_size: FONT,
+            ..default()
+        },
+        TextColor(palette::MUTED),
+    ));
+    p.spawn((
+        CharName,
+        Text::new("(no char)".to_string()),
+        TextFont {
+            font_size: FONT,
+            ..default()
+        },
+        TextColor(palette::TEXT),
+    ));
+    p.spawn((
+        Text::new("  ▪  "),
+        TextFont {
+            font_size: FONT,
+            ..default()
+        },
+        TextColor(palette::MUTED),
+    ));
+    p.spawn((
+        ZoneLabel,
+        Text::new("—".to_string()),
+        TextFont {
+            font_size: FONT,
+            ..default()
+        },
+        TextColor(palette::TEXT),
+    ));
 }
 
 pub fn update_stage_bar(

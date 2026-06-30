@@ -57,6 +57,8 @@ pub fn spawn_diagnostics(mut commands: Commands) {
             Visibility::Hidden,
         ))
         .with_children(|p| {
+            crate::hud::stage_bar::spawn_stage_cluster_as_child(p);
+            spawn_separator(p);
             spawn_label_value(p, "bf=", DiagBfValue, "—");
             spawn_separator(p);
             spawn_label_value(p, "sync=", DiagSyncValue, "—");

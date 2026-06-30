@@ -126,28 +126,24 @@ pub fn update_mesh_debug_hud(
         }
         return;
     }
-    match &hover.current {
+    if *vis != Visibility::Inherited {
+        *vis = Visibility::Inherited;
+    }
+    let want = match &hover.current {
         Some(info) => {
             let pos = match hover.hit_position {
                 Some(p) => format!("  pos=({:.1}, {:.1}, {:.1})", p.x, p.y, p.z),
                 None => String::new(),
             };
-            let want = format!(
+            format!(
                 "MMB  file={}  chunk={}  sub={}  asset={}  variant={}{pos}",
                 info.file_id, info.chunk_idx, info.sub_index, info.asset_name, info.variant_name,
-            );
-            if **text != want {
-                **text = want;
-            }
-            if *vis != Visibility::Inherited {
-                *vis = Visibility::Inherited;
-            }
+            )
         }
-        None => {
-            if *vis != Visibility::Hidden {
-                *vis = Visibility::Hidden;
-            }
-        }
+        None => "MESH DEBUG — hover zone geometry for MMB details".to_string(),
+    };
+    if **text != want {
+        **text = want;
     }
 }
 
