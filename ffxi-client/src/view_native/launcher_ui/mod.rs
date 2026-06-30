@@ -117,6 +117,7 @@ pub(crate) enum CharCreateField {
     Job,
     Nation,
     Face,
+    Hair,
     Size,
 }
 
@@ -128,7 +129,8 @@ impl CharCreateField {
             Self::Race => Self::Job,
             Self::Job => Self::Nation,
             Self::Nation => Self::Face,
-            Self::Face => Self::Size,
+            Self::Face => Self::Hair,
+            Self::Hair => Self::Size,
             Self::Size => Self::Name,
         }
     }
@@ -139,7 +141,8 @@ impl CharCreateField {
             Self::Job => Self::Race,
             Self::Nation => Self::Job,
             Self::Face => Self::Nation,
-            Self::Size => Self::Face,
+            Self::Hair => Self::Face,
+            Self::Size => Self::Hair,
         }
     }
 }
@@ -187,21 +190,47 @@ impl CharCreateForm {
         None
     }
 
+    // The `face` byte combines face index (`face / 2`, shown as Face 1-8) and hair
+    // (`face % 2`, A/B). LSB caps creation at 15 = "Face 8B"
+    // (vendor/server/src/login/login_helpers.cpp). `field_selection`/`set_field`
+    // centralize that split so the button rows and `cycle_focused` stay consistent.
+    pub(crate) fn field_selection(&self, field: CharCreateField) -> u8 {
+        match field {
+            CharCreateField::Name => 0,
+            CharCreateField::Race => self.race,
+            CharCreateField::Job => self.job,
+            CharCreateField::Nation => self.nation,
+            CharCreateField::Face => self.face / 2,
+            CharCreateField::Hair => self.face % 2,
+            CharCreateField::Size => self.size,
+        }
+    }
+
+    pub(crate) fn set_field(&mut self, field: CharCreateField, value: u8) {
+        match field {
+            CharCreateField::Name => {}
+            CharCreateField::Race => self.race = value,
+            CharCreateField::Job => self.job = value,
+            CharCreateField::Nation => self.nation = value,
+            CharCreateField::Face => self.face = value * 2 + (self.face % 2),
+            CharCreateField::Hair => self.face = (self.face / 2) * 2 + value,
+            CharCreateField::Size => self.size = value,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn cycle_focused(&mut self, delta: i32) {
-        match self.focus {
-            CharCreateField::Name => {}
-            CharCreateField::Race => self.race = cycle_table(char_create::RACES, self.race, delta),
-            CharCreateField::Job => self.job = cycle_table(char_create::JOBS, self.job, delta),
-            CharCreateField::Nation => {
-                self.nation = cycle_table(char_create::NATIONS, self.nation, delta)
-            }
-            CharCreateField::Face => {
-                let next = (self.face as i32 + delta).rem_euclid(char_create::FACE_MAX as i32 + 1);
-                self.face = next as u8;
-            }
-            CharCreateField::Size => self.size = cycle_table(char_create::SIZES, self.size, delta),
-        }
+        let table: &[(u8, &str)] = match self.focus {
+            CharCreateField::Name => return,
+            CharCreateField::Race => char_create::RACES,
+            CharCreateField::Job => char_create::JOBS,
+            CharCreateField::Nation => char_create::NATIONS,
+            CharCreateField::Face => char_create::FACES,
+            CharCreateField::Hair => char_create::HAIRS,
+            CharCreateField::Size => char_create::SIZES,
+        };
+        let next = cycle_table(table, self.field_selection(self.focus), delta);
+        self.set_field(self.focus, next);
     }
 }
 

@@ -1,5 +1,5 @@
 use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button, slider, ButtonProps, ButtonVariant, SliderProps};
+use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -36,7 +36,21 @@ pub(super) const NATIONS: &[(u8, &str)] = &[(0, "San d'Oria"), (1, "Bastok"), (2
 
 pub(super) const SIZES: &[(u8, &str)] = &[(0, "Small"), (1, "Medium"), (2, "Large")];
 
-pub(super) const FACE_MAX: u8 = 15;
+// Retail picks Face (1-8) and Hair (A-B) as two separate menus; the wire `face`
+// byte packs them as `face_index * 2 + hair`. Values here are the face index and
+// hair bit; `CharCreateForm::set_field`/`field_selection` do the packing.
+pub(super) const FACES: &[(u8, &str)] = &[
+    (0, "1"),
+    (1, "2"),
+    (2, "3"),
+    (3, "4"),
+    (4, "5"),
+    (5, "6"),
+    (6, "7"),
+    (7, "8"),
+];
+
+pub(super) const HAIRS: &[(u8, &str)] = &[(0, "A"), (1, "B")];
 
 #[derive(Component)]
 pub(super) struct CharCreateRoot;
@@ -129,39 +143,8 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<CharCreateForm>, server
                 spawn_enum_row(panel, "Job", CharCreateField::Job, JOBS, snap.2);
                 spawn_enum_row(panel, "Nation", CharCreateField::Nation, NATIONS, snap.3);
                 spawn_enum_row(panel, "Build", CharCreateField::Size, SIZES, snap.5);
-
-                panel
-                    .spawn(Node {
-                        width: Val::Percent(100.0),
-                        height: Val::Px(32.0),
-                        flex_direction: FlexDirection::Row,
-                        align_items: AlignItems::Center,
-                        column_gap: Val::Px(8.0),
-                        ..default()
-                    })
-                    .with_children(|row| {
-                        row.spawn((
-                            Node {
-                                width: Val::Px(80.0),
-                                ..default()
-                            },
-                            Text::new("Face"),
-                            ThemedText,
-                        ));
-                        row.spawn(slider(
-                            SliderProps {
-                                value: snap.4 as f32,
-                                min: 0.0,
-                                max: FACE_MAX as f32,
-                            },
-                            (),
-                        ))
-                        .observe(
-                            |ev: On<ValueChange<f32>>, mut form: ResMut<CharCreateForm>| {
-                                form.face = ev.value.round().clamp(0.0, FACE_MAX as f32) as u8;
-                            },
-                        );
-                    });
+                spawn_enum_row(panel, "Face", CharCreateField::Face, FACES, snap.4 / 2);
+                spawn_enum_row(panel, "Hair", CharCreateField::Hair, HAIRS, snap.4 % 2);
 
                 panel.spawn((
                     StatusText,
@@ -252,15 +235,9 @@ fn spawn_enum_row(
                     EnumChoice { field, value: val },
                     Spawn((Text::new((*name).to_string()), ThemedText)),
                 ),))
-                    .observe(
-                        move |_ev: On<Activate>, mut form: ResMut<CharCreateForm>| match field {
-                            CharCreateField::Race => form.race = val,
-                            CharCreateField::Job => form.job = val,
-                            CharCreateField::Nation => form.nation = val,
-                            CharCreateField::Size => form.size = val,
-                            CharCreateField::Name | CharCreateField::Face => {}
-                        },
-                    );
+                    .observe(move |_ev: On<Activate>, mut form: ResMut<CharCreateForm>| {
+                        form.set_field(field, val);
+                    });
             }
         });
 }
@@ -298,14 +275,7 @@ pub(super) fn redraw_form_system(
         return;
     }
     for (e, choice) in q_choices.iter() {
-        let current = match choice.field {
-            CharCreateField::Race => form.race,
-            CharCreateField::Job => form.job,
-            CharCreateField::Nation => form.nation,
-            CharCreateField::Size => form.size,
-            CharCreateField::Name | CharCreateField::Face => continue,
-        };
-        let v = if choice.value == current {
+        let v = if choice.value == form.field_selection(choice.field) {
             ButtonVariant::Primary
         } else {
             ButtonVariant::Normal
