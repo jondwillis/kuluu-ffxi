@@ -112,3 +112,43 @@ impl Plugin for UiElementAtlasPlugin {
             .init_resource::<UiElementAtlas>();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn test_dat_root() -> Option<UiElementDatRoot> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(ffxi_dat::archive::DEFAULT_INSTALL_DIR);
+        if !root.join("VTABLE.DAT").exists() {
+            return None;
+        }
+        let root = DatRoot::open(root).ok()?;
+        Some(UiElementDatRoot(Some(Arc::new(root))))
+    }
+
+    // Gated on a retail install (self-skips). Exercises the whole viewer-side
+    // path against real data: load the UI DATs, resolve the frames->framesus
+    // alias, decode + crop, and upload a 14x14 day-orb image into Assets.
+    #[test]
+    fn real_dat_day_orb_uploads_14x14() {
+        let Some(dat_root) = test_dat_root() else {
+            return;
+        };
+        let mut images = Assets::<Image>::default();
+        let mut atlas = UiElementAtlas::default();
+
+        let handle = atlas
+            .ensure(FRAMES_JP, 106, &dat_root, &mut images)
+            .expect("Firesday orb resolves via the frames->framesus alias");
+        let image = images.get(&handle).expect("uploaded image present");
+        assert_eq!(image.width(), 14);
+        assert_eq!(image.height(), 14);
+
+        // Second lookup is served from the cache (same handle).
+        let again = atlas.ensure(FRAMES_JP, 106, &dat_root, &mut images);
+        assert_eq!(again.as_ref(), Some(&handle));
+    }
+}

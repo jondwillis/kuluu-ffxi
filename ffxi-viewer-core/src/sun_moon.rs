@@ -489,7 +489,7 @@ pub fn sun_moon_system(
                 - crate::hud::vana_clock::EARTH_EPOCH_UNIX as f64)
                 .max(0.0);
             let total_v_days = (earth_since * 25.0 / 86400.0) as u64;
-            let weekday = crate::hud::vana_clock::VANA_WEEKDAYS[(total_v_days % 8) as usize];
+            let weekday = crate::hud::vana_clock::VanaWeekday::from_vana_day(total_v_days).name();
             toasts.write(crate::snapshot::ToastEvent::system(format!(
                 "☾ Moon: {} ({:.0}% illuminated) — {}",
                 MOON_PHASE_NAMES[phase_bucket as usize],
