@@ -57,6 +57,6 @@ not formatted as `h:mm:ss`.
 - UI that's simply *absent* (contextual menu, trade, item detail, /check) →
   `vanilla-menu-parity-plan.md`.
 - Self-cast targeting + ability feedback + recast formatting → tracked in the
-  abilities plan (see `docs/ROADMAP.md` ability lines).
-- Roadmap parity glyphs for animation/despawn/message-substitution should reflect
-  these as `[~]`/`[ ]` where not already tracked.
+  abilities plan and the `roadmap`-labelled beads (`bd ready`).
+- Parity status for animation/despawn/message-substitution lives in beads — open
+  or update the relevant `roadmap` bead where these aren't already tracked.

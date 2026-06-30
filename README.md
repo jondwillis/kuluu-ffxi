@@ -30,9 +30,9 @@ FFXI, please support the official service. See [LEGAL.md](LEGAL.md).
 
 - **Vanilla parity is the base.** The aim is close to 1:1 with the official
   FFXI client in default mode — same menus, same compass, same combat feel.
-  Anything with no retail equivalent lives in the **Enhanced / addon** column
-  of the [roadmap](docs/ROADMAP.md), gated behind a feature flag or build
-  flavor so it never compromises vanilla by default.
+  Anything with no retail equivalent is an **Enhanced / addon** feature (the
+  `enhanced` label in the [backlog](#roadmap)), gated behind a feature flag or
+  build flavor so it never compromises vanilla by default.
 - **Modernization layers on top, opt-in.** Bevy + wgpu replace the legacy
   D3D8/D3D11 stack; a planned plugin/extension API aims to obviate
   Windower/Ashita.
@@ -195,23 +195,22 @@ What that means for you:
 [![open issues](https://img.shields.io/github/issues/jondwillis/kuluu-ffxi)](https://github.com/jondwillis/kuluu-ffxi/issues)
 [![good first issues](https://img.shields.io/github/issues/jondwillis/kuluu-ffxi/good%20first%20issue?label=good%20first%20issue&color=7057ff)](https://github.com/jondwillis/kuluu-ffxi/issues?q=is%3Aopen+label%3A%22good+first+issue%22)
 
-Progress is tracked honestly against retail in [`docs/ROADMAP.md`](docs/ROADMAP.md)
-— two scoreboards (**Vanilla parity** and **Enhanced / addon**) with an
-`[x] / [~] / [ ] / [?]` legend. The scoreboard's status column is reconciled
-against the `roadmap`-labelled [beads](.beads/) backlog by
-[`scripts/roadmap_sync.py`](scripts/roadmap_sync.py) (CI flags any drift), and
-every not-done line is published as a GitHub issue by
-[`roadmap-publish.yml`](.github/workflows/roadmap-publish.yml) — so the live
-counts above are generated, not a hand-kept promise. Pick an
+Progress is tracked honestly against retail in [beads](.beads/) — a git-backed
+issue tracker checked into the repo (`.beads/issues.jsonl`). Parity work carries
+the `roadmap` label, plus `vanilla`/`enhanced` and an area label
+(`hud`, `combat-action`, …); issue status (`open` / `in_progress` / `closed`) is
+the source of truth for what's done. The [open issues](https://github.com/jondwillis/kuluu-ffxi/issues)
+above are a generated projection of that backlog, published by
+[`scripts/beads-github-publish.py`](scripts/beads-github-publish.py) — so the
+live counts are not a hand-kept promise. Pick an
 [open issue](https://github.com/jondwillis/kuluu-ffxi/issues) and open a PR.
 
 ## Contributing
 
-Pick a `[~]` or `[ ]` line from the [roadmap](docs/ROADMAP.md) (or its mirror
-issue) and open a PR. When you finish a feature — or take it from missing to
-partial — flip its glyph in the same commit so the scoreboard stays honest.
-Before adding a new line, decide which scoreboard it belongs on: if the official
-FFXI client doesn't have it, it's **Enhanced / addon**.
+Pick an open [issue](https://github.com/jondwillis/kuluu-ffxi/issues) and open a
+PR. The backlog lives in beads (`bd ready` in a clone, or browse the mirrored
+GitHub issues); a feature that has no equivalent in the official FFXI client is
+**Enhanced / addon** and must be gated behind a feature flag.
 
 The vanilla menu / target-interaction gaps (target-action contextual menu,
 trade window, item detail panel, status/profile panel, main-menu "Commands"

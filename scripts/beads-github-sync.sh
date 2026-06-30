@@ -6,9 +6,11 @@
 # duplicating (bd import has upsert semantics). State maps OPEN→open,
 # CLOSED→closed; GitHub labels carry over plus a `github` tag.
 #
-# This is GitHub → beads ONLY. It never writes to GitHub, so beads-origin
-# issues (e.g. the `roadmap`-labelled seed) are not pushed up; publishing those
-# for contributors would need a separate beads → GitHub direction.
+# This is GitHub → beads ONLY (inbound). It never writes to GitHub. The OUTBOUND
+# direction — projecting the beads backlog onto GitHub Issues for contributors —
+# is scripts/beads-github-publish.py. The two are independent: the publisher keys
+# issues by a `beads-id` body marker, this importer by `external_ref: gh-<n>`, so
+# don't round-trip the same issues through both or you'll get duplicate beads.
 #
 #   scripts/beads-github-sync.sh            # sync now
 #   scripts/beads-github-sync.sh --dry-run  # print the beads JSONL, import nothing

@@ -28,10 +28,10 @@ counts=$(cd "$cwd" && bd stats 2>/dev/null \
 [ -z "$counts" ] && counts="  (bd stats unavailable)"
 
 msg=$(cat <<EOF
-Beads (\`bd\`) is the system of record for parity work in this repo — pick work from \`bd ready\`. It sits alongside, and does not replace:
+Beads (\`bd\`) is the single source of truth for all durable work in this repo — pick work from \`bd ready\`; the grounded parity backlog is the \`roadmap\`-labelled beads. It sits alongside, and does not replace:
 - MEMORY.md auto-memory (cross-session memory) — do NOT migrate it into \`bd remember\`.
 - TaskCreate, for ephemeral in-session todos.
-\`docs/ROADMAP.md\` is a directional overview only; the granular backlog is the \`roadmap\`-labelled beads. Full conventions: AGENTS.md → "Issue tracking (beads)".
+GitHub Issues are a generated projection of beads (\`scripts/beads-github-publish.py\`), not a second tracker. Full conventions: AGENTS.md → "Issue tracking (beads)".
 
 Issue counts:
 $counts
