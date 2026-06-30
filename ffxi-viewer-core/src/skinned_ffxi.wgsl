@@ -180,7 +180,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // flags.y selects the realistic (Bevy-scene-driven) lighting model.
     let realistic = material_flags.flags.y > 0.5;
     // flags.z gates directional cast-shadow / self-shadow RECEIVE (the
-    // "Model Shadows" graphics setting). When off, both branches light the
+    // "Model Shadow Receiving" graphics setting). When off, both branches light the
     // model with no shadow attenuation (sun term at full strength).
     let receive_shadows = material_flags.flags.z > 0.5;
     // flags.w is the target-strobe glow: an additive highlight pulsed onto the
@@ -201,7 +201,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         // Cast-shadow attenuation for the sun term. The realistic model is
         // energy-conserving (AMBIENT_FLOOR + EXPOSURE), so a fully-shadowed
         // fragment fades to the ambient floor, never pure black — it can take
-        // the full 0..1 shadow factor. Gated by the Model Shadows setting
+        // the full 0..1 shadow factor. Gated by the Model Shadow Receiving setting
         // (`receive_shadows`); off → no attenuation (sun = 1.0). An `if` (not
         // `select`) so the shadow-map sample is actually skipped when off —
         // `select` evaluates both operands.
@@ -236,7 +236,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // FFXI-faithful: flat per-vertex light * vertex color, composited at 2x the
     // baked-diffuse texel (XIM's `2 * vertexColor * texel`).
     //
-    // SOFT shadow-receive, gated by the Model Shadows setting (`receive_shadows`
+    // SOFT shadow-receive, gated by the Model Shadow Receiving setting (`receive_shadows`
     // / flags.z). Real FFXI PCs are flat-lit and don't receive the world's
     // shadows, but a gentle receive grounds the model in the scene. The catch:
     // this model's ambient is intentionally LOW (the 2x doubling compensates),

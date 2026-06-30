@@ -265,8 +265,8 @@ impl GraphicsField {
             GraphicsField::LightIntensity => "  Intensity",
             GraphicsField::LightRange => "  Range",
             GraphicsField::LightFlicker => "  Flicker",
-            GraphicsField::CharacterLighting => "Model Lighting",
-            GraphicsField::CharacterShadowReceive => "Model Shadows",
+            GraphicsField::CharacterLighting => "Shading",
+            GraphicsField::CharacterShadowReceive => "Model Shadow Receiving",
             GraphicsField::CharacterShadowCast => "Model Shadow Casting",
             GraphicsField::DepthOfField => "Depth of Field",
             GraphicsField::DofAperture => "DoF Aperture",
@@ -920,6 +920,7 @@ pub const GRAPHICS_FIELDS: &[GraphicsField] = &[
     GraphicsField::LightFlicker,
     GraphicsField::CharacterLighting,
     GraphicsField::CharacterShadowReceive,
+    GraphicsField::CharacterShadowCast,
     GraphicsField::DepthOfField,
     GraphicsField::DofAperture,
     GraphicsField::ZoneLineDisplay,
@@ -1525,6 +1526,34 @@ mod tests {
 
         s.cycle(GraphicsField::Preset, 1);
         assert!(!s.faithful_shadow_receive, "preset cycle kept receipt off");
+    }
+
+    #[test]
+    fn model_shadow_casting_follows_preset_tier() {
+        assert!(!GraphicsSettings::for_preset(QualityPreset::Low).character_shadow_cast);
+        assert!(!GraphicsSettings::for_preset(QualityPreset::Medium).character_shadow_cast);
+        assert!(GraphicsSettings::for_preset(QualityPreset::High).character_shadow_cast);
+        assert!(GraphicsSettings::for_preset(QualityPreset::Ultra).character_shadow_cast);
+        assert!(GraphicsSettings::default().character_shadow_cast);
+    }
+
+    #[test]
+    fn model_shadow_casting_is_quality_lever_tied_to_tier() {
+        let mut s = GraphicsSettings::default(); // High -> casting on
+        assert_eq!(s.value_label(GraphicsField::CharacterShadowCast), "On");
+        s.cycle(GraphicsField::CharacterShadowCast, 1);
+        assert!(!s.character_shadow_cast);
+        assert_eq!(s.value_label(GraphicsField::CharacterShadowCast), "Off");
+        assert_eq!(s.preset, QualityPreset::Custom, "casting is a quality knob");
+
+        // Unlike shadow receipt (orthogonal/sticky), casting tracks the tier: a
+        // preset change resets it to that tier's default, not the toggled value.
+        s.cycle(GraphicsField::Preset, -1); // Custom -> Ultra (tier default On)
+        assert_eq!(s.preset, QualityPreset::Ultra);
+        assert!(
+            s.character_shadow_cast,
+            "preset cycle reset casting to the Ultra tier default, not the toggled-off value"
+        );
     }
 
     #[test]

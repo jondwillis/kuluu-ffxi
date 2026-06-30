@@ -689,6 +689,9 @@ pub fn spawn_loaded_actor(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[derive(Component)]
+pub(crate) struct FfxiActorMeshChild;
+
 fn build_actor_children(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -784,6 +787,7 @@ fn build_actor_children(
                 Mesh3d(meshes.add(built.mesh)),
                 MeshMaterial3d(mat),
                 Transform::default(),
+                FfxiActorMeshChild,
                 ChildOf(actor_root),
             ));
         }
@@ -809,11 +813,41 @@ fn build_actor_children(
             Mesh3d(meshes.add(build_d3m_mesh(d3m))),
             MeshMaterial3d(mat),
             Transform::default(),
+            FfxiActorMeshChild,
             ChildOf(actor_root),
         ));
     }
 
     material_handles
+}
+
+// Not gated on resource_changed: it must run every frame so actor meshes spawned
+// after a settings change still get the current value via the Added query (full
+// sweeps over q_all happen only when the setting itself changes).
+pub(crate) fn apply_character_shadow_cast(
+    settings: Res<crate::graphics_settings::GraphicsSettings>,
+    mut commands: Commands,
+    q_added: Query<Entity, Added<FfxiActorMeshChild>>,
+    q_all: Query<Entity, With<FfxiActorMeshChild>>,
+) {
+    let cast = settings.character_shadow_cast;
+    let mut apply = |e: Entity| {
+        let mut ec = commands.entity(e);
+        if cast {
+            ec.remove::<bevy::light::NotShadowCaster>();
+        } else {
+            ec.insert(bevy::light::NotShadowCaster);
+        }
+    };
+    if settings.is_changed() {
+        for e in &q_all {
+            apply(e);
+        }
+    } else {
+        for e in &q_added {
+            apply(e);
+        }
+    }
 }
 
 fn make_render_actor(

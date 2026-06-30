@@ -272,6 +272,9 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         app.add_systems(Update, ffxi_actor_render::update_ffxi_render_actor_lighting);
 
         #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(Update, ffxi_actor_render::apply_character_shadow_cast);
+
+        #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,
             ffxi_actor_render::update_ffxi_actor_point_lights
