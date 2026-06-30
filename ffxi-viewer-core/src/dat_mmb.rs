@@ -555,6 +555,11 @@ pub fn process_load_mmb_requests(
                         sub_texture.is_some(),
                     );
                     let has_texture = if sub_texture.is_some() { 1.0 } else { 0.0 };
+                    let blend_flag = if matches!(alpha_mode, AlphaMode::Blend) {
+                        1.0
+                    } else {
+                        0.0
+                    };
 
                     let mat_handle = handle_cache
                         .material
@@ -565,7 +570,12 @@ pub fn process_load_mmb_requests(
                                     crate::skinned_ffxi_material::FfxiLightingUniform::default(),
                                 base_color_texture: sub_texture,
                                 material_flags: crate::skinned_ffxi_material::FfxiMaterialFlags {
-                                    flags: Vec4::new(has_texture, 0.0, 0.0, discard_threshold),
+                                    flags: Vec4::new(
+                                        has_texture,
+                                        blend_flag,
+                                        0.0,
+                                        discard_threshold,
+                                    ),
                                 },
                                 alpha_mode,
                             })
@@ -687,18 +697,19 @@ pub fn process_load_mmb_requests(
 /// Choose an MMB submesh's render mode, per XIM (`research/xim` ·
 /// `ZoneMeshSection.kt`). The model name (header bytes 16..32, our
 /// `zone_mesh_name`) starting with '_' selects an alpha-tested cutout at
-/// XIM's `discardThreshold` of 0.375; the `0x8000` flag bit marks translucency,
-/// approximated with a mask test because `FfxiZoneMaterial` emits opaque alpha.
-/// Everything else is opaque. The render mode is NEVER derived from texture
-/// alpha content — doing so punches holes in ordinary opaque ground/wall
-/// textures that carry incidental transparency.
+/// XIM's `discardThreshold` of 0.375; the `0x8000` flag bit marks translucency
+/// (water/glass), rendered as `AlphaMode::Blend` — the zone shader emits real
+/// alpha for these (see `flags.y` in `zone_ffxi.wgsl`). Everything else is
+/// opaque. The render mode is NEVER derived from texture alpha content — doing
+/// so punches holes in ordinary opaque ground/wall textures that carry
+/// incidental transparency.
 fn submesh_alpha_mode(zone_mesh_name: &str, blending: u16, has_texture: bool) -> (AlphaMode, f32) {
     if !has_texture {
         (AlphaMode::Opaque, 0.0)
     } else if zone_mesh_name.starts_with('_') {
         (AlphaMode::Mask(0.375), 0.375)
     } else if (blending & 0x8000) != 0 {
-        (AlphaMode::Mask(0.5), 0.5)
+        (AlphaMode::Blend, 0.0)
     } else {
         (AlphaMode::Opaque, 0.0)
     }
@@ -800,10 +811,12 @@ mod tests {
     }
 
     #[test]
-    fn blend_flag_masks_non_underscore_model() {
+    fn blend_flag_is_translucent_non_underscore_model() {
+        // XIM `ZoneMeshSection` 0x8000 -> real alpha blend (water/glass), not a
+        // cutout. discard threshold is 0.0 so the shader's mask test never fires.
         let (mode, t) = submesh_alpha_mode("kabuse_m", 0x8000, true);
-        assert_eq!(mode, AlphaMode::Mask(0.5));
-        assert_eq!(t, 0.5);
+        assert_eq!(mode, AlphaMode::Blend);
+        assert_eq!(t, 0.0);
     }
 
     #[test]

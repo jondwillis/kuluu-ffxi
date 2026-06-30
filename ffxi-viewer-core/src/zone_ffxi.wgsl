@@ -36,6 +36,7 @@ struct FfxiLighting {
 };
 
 // Mirror of `FfxiMaterialFlags`. `flags.x` = has_texture (1.0 / 0.0);
+// `flags.y` = blend mode (1.0 = translucent water/glass sub, emit real alpha);
 // `flags.w` = alpha discard threshold (0.0 = no discard, e.g. opaque subs).
 struct FfxiMaterialFlags {
     flags: vec4<f32>,
@@ -150,5 +151,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // light. Vertex colour is overbright (can exceed 1) — do NOT clamp it.
     let lit = scene_irradiance(n, in.world_position, sun) * in.color.rgb;
     let rgb = 2.0 * lit * texel.rgb;
-    return vec4<f32>(rgb, 1.0);
+    // XIM `ZoneMeshSection` 0x8000 subs blend (`coloredPixel.a = vertexColor.a *
+    // texel.a`, clamped). Our vertex alpha is pre-scaled /128 and texel alpha
+    // remapped, so the raw product matches XIM's 4·(va/255)·(ta/255). Opaque
+    // subs keep alpha 1.0 so ground/wall textures with incidental alpha stay solid.
+    var out_alpha = 1.0;
+    if (material_flags.flags.y > 0.5) {
+        out_alpha = clamp(in.color.a, 0.0, 1.0) * texel.a;
+    }
+    return vec4<f32>(rgb, out_alpha);
 }
