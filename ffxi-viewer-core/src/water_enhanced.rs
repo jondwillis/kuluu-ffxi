@@ -1,6 +1,5 @@
 #![cfg(feature = "enhanced-water")]
 
-use bevy::mesh::{MeshBuilder, PlaneMeshBuilder};
 use bevy::prelude::*;
 use bevy_water::material::WaterMaterial;
 use bevy_water::{WaterPlugin, WaterSettings};
@@ -27,28 +26,17 @@ impl Plugin for EnhancedWaterPlugin {
     }
 }
 
-pub fn build_pond_water(
-    meshes: &mut Assets<Mesh>,
+// Material for a water footprint mesh (built in dat_mzb, world-XZ UVs over the
+// `min..max` bounds). coord_offset/scale invert those UVs back to world XZ so the
+// wave field is continuous and world-scaled across differently-sized ponds.
+pub fn pond_water_material(
     water_materials: &mut Assets<StandardWaterMaterial>,
     min: Vec3,
     max: Vec3,
-    height: f32,
-) -> (Mesh3d, MeshMaterial3d<StandardWaterMaterial>, Transform) {
+) -> MeshMaterial3d<StandardWaterMaterial> {
     let dx = (max.x - min.x).max(0.01);
     let dz = (max.z - min.z).max(0.01);
-    let cx = 0.5 * (min.x + max.x);
-    let cz = 0.5 * (min.z + max.z);
-
-    let subdivisions = ((dx.max(dz) * 0.5) as u32).clamp(8, 64);
-    let mesh = meshes.add(
-        PlaneMeshBuilder::from_size(Vec2::new(dx, dz))
-            .subdivisions(subdivisions)
-            .build(),
-    );
-
-    // coord_offset/scale map the plane's 0..1 UVs onto world XZ so the wave
-    // function is continuous and world-scaled across differently-sized ponds.
-    let mat = water_materials.add(StandardWaterMaterial {
+    MeshMaterial3d(water_materials.add(StandardWaterMaterial {
         base: StandardMaterial {
             perceptual_roughness: 0.2,
             alpha_mode: AlphaMode::Blend,
@@ -62,11 +50,5 @@ pub fn build_pond_water(
             coord_scale: Vec2::new(dx, dz),
             ..default()
         },
-    });
-
-    (
-        Mesh3d(mesh),
-        MeshMaterial3d(mat),
-        Transform::from_xyz(cx, height, cz),
-    )
+    }))
 }

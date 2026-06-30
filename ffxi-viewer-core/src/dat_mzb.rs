@@ -363,11 +363,15 @@ pub struct AutoMzbOverlay;
 #[derive(Component)]
 pub struct WaterPlane;
 
-#[derive(Clone, Copy)]
+// Actual water footprint: the water-material submesh triangles flattened to the
+// surface height (world XZ preserved), NOT a bounding box — a box unions
+// disconnected ponds and floods the dry paths between them. The depth test clips
+// the flattened surface to wherever terrain sits below it.
 pub struct WaterSpec {
+    pub positions: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
     pub min: Vec3,
     pub max: Vec3,
-    pub height: f32,
     pub parent: Entity,
     pub auto_loaded: bool,
 }
@@ -1015,39 +1019,36 @@ fn simple_water_material() -> StandardMaterial {
     }
 }
 
-fn build_simple_water_mesh(min: Vec3, max: Vec3, height: f32) -> Mesh {
-    let dx = (max.x - min.x).max(0.01);
-    let dz = (max.z - min.z).max(0.01);
-    let cx = 0.5 * (min.x + max.x);
-    let cz = 0.5 * (min.z + max.z);
-    let hx = dx * 0.5;
-    let hz = dz * 0.5;
+fn build_water_surface_mesh(spec: &WaterSpec) -> Mesh {
+    let dx = (spec.max.x - spec.min.x).max(0.01);
+    let dz = (spec.max.z - spec.min.z).max(0.01);
+    // UVs are world XZ normalised over the footprint bounds, so bevy_water's
+    // `coord_offset`/`coord_scale` recover world coords for a continuous,
+    // world-scaled wave field. The vanilla material ignores them.
+    let uvs: Vec<[f32; 2]> = spec
+        .positions
+        .iter()
+        .map(|p| [(p[0] - spec.min.x) / dx, (p[2] - spec.min.z) / dz])
+        .collect();
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
     );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, spec.positions.clone());
     mesh.insert_attribute(
-        Mesh::ATTRIBUTE_POSITION,
-        vec![
-            [cx - hx, height, cz - hz],
-            [cx + hx, height, cz - hz],
-            [cx + hx, height, cz + hz],
-            [cx - hx, height, cz + hz],
-        ],
+        Mesh::ATTRIBUTE_NORMAL,
+        vec![[0.0, 1.0, 0.0]; spec.positions.len()],
     );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 4]);
-    mesh.insert_attribute(
-        Mesh::ATTRIBUTE_UV_0,
-        vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
-    );
-    mesh.insert_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(spec.indices.clone()));
     mesh
 }
 
-// Drains pond extents queued by the MZB load and spawns one surface each: the
-// vanilla translucent plane, or — when built with `enhanced-water` and the
-// GraphicsSettings toggle is on — an animated bevy_water mesh. Reads the setting
-// at drain time, so a toggle change takes effect on the next zone (re)load.
+// Drains water footprints queued by the MZB load and spawns one surface each:
+// the vanilla translucent plane, or — when built with `enhanced-water` and the
+// GraphicsSettings toggle is on — bevy_water's animated material on the same
+// footprint mesh. Reads the setting at drain time, so a toggle change takes
+// effect on the next zone (re)load.
 pub fn spawn_zone_water(
     mut commands: Commands,
     mut pending: ResMut<PendingWaterSpawns>,
@@ -1066,21 +1067,21 @@ pub fn spawn_zone_water(
     let simple_mat = materials.add(simple_water_material());
 
     for spec in specs {
+        let mesh = Mesh3d(meshes.add(build_water_surface_mesh(&spec)));
+
         #[cfg(feature = "enhanced-water")]
         if enhanced {
-            let (mesh, mat, xf) = crate::water_enhanced::build_pond_water(
-                &mut meshes,
+            let mat = crate::water_enhanced::pond_water_material(
                 &mut water_materials,
                 spec.min,
                 spec.max,
-                spec.height,
             );
             let mut e = commands.spawn((
                 MzbOverlay,
                 WaterPlane,
                 mesh,
                 mat,
-                xf,
+                Transform::IDENTITY,
                 Visibility::Inherited,
                 bevy::light::NotShadowReceiver,
                 ChildOf(spec.parent),
@@ -1094,7 +1095,7 @@ pub fn spawn_zone_water(
         let mut e = commands.spawn((
             MzbOverlay,
             WaterPlane,
-            Mesh3d(meshes.add(build_simple_water_mesh(spec.min, spec.max, spec.height))),
+            mesh,
             MeshMaterial3d(simple_mat.clone()),
             Transform::IDENTITY,
             Visibility::Inherited,
@@ -1311,43 +1312,52 @@ fn spawn_mzb_overlay(
             ),
         );
 
-    let mut water_groups: std::collections::HashMap<i32, (Vec3, Vec3)> =
+    #[derive(Default)]
+    struct WaterAccum {
+        positions: Vec<[f32; 3]>,
+        indices: Vec<u32>,
+        min: Vec3,
+        max: Vec3,
+    }
+    let mut water_groups: std::collections::HashMap<i32, WaterAccum> =
         std::collections::HashMap::new();
     for inst in instances.iter() {
         let Some(h_bevy) = inst.water_height_bevy else {
             continue;
         };
         let sub = &submeshes[inst.submesh_idx];
-        if sub.positions.is_empty() {
+        if sub.positions.is_empty() || sub.indices.is_empty() {
             continue;
         }
 
-        let mut min = Vec3::splat(f32::INFINITY);
-        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        let key = (h_bevy * 1000.0).round() as i32;
+        let acc = water_groups.entry(key).or_insert_with(|| WaterAccum {
+            min: Vec3::splat(f32::INFINITY),
+            max: Vec3::splat(f32::NEG_INFINITY),
+            ..Default::default()
+        });
+        let base = acc.positions.len() as u32;
         for v in &sub.positions {
             let p = inst
                 .bevy_transform
                 .transform_point(Vec3::new(v[0], v[1], v[2]));
-            min = min.min(p);
-            max = max.max(p);
+            // Flatten to the flat water surface; keep world XZ to follow the
+            // actual shoreline rather than a bounding box.
+            let flat = [p.x, h_bevy, p.z];
+            acc.min = acc.min.min(Vec3::from_array(flat));
+            acc.max = acc.max.max(Vec3::from_array(flat));
+            acc.positions.push(flat);
         }
-
-        let key = (h_bevy * 1000.0).round() as i32;
-        water_groups
-            .entry(key)
-            .and_modify(|(mn, mx)| {
-                *mn = mn.min(min);
-                *mx = mx.max(max);
-            })
-            .or_insert((min, max));
+        acc.indices.extend(sub.indices.iter().map(|i| i + base));
     }
     let water_count = water_groups.len();
     if water_count > 0 {
-        for (height_key, (min, max)) in water_groups {
+        for (_height_key, acc) in water_groups {
             pending_water.specs.push(WaterSpec {
-                min,
-                max,
-                height: height_key as f32 / 1000.0,
+                positions: acc.positions,
+                indices: acc.indices,
+                min: acc.min,
+                max: acc.max,
                 parent,
                 auto_loaded: req.auto_loaded,
             });
@@ -1355,7 +1365,7 @@ fn spawn_mzb_overlay(
         push_system_msg(
             toasts,
             format!(
-                "/load_mzb {}: {} water plane{} spawned",
+                "/load_mzb {}: {} water surface{} spawned",
                 req.file_id,
                 water_count,
                 if water_count == 1 { "" } else { "s" },
