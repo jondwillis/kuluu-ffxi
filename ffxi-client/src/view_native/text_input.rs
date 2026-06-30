@@ -2058,7 +2058,14 @@ fn confirm_menu_at_cursor(
                 cmd_tx,
                 scene_state,
             );
-            return Some(InputMode::World);
+            // Retail keeps the equip list up after a gear change so the player
+            // can keep swapping (or re-select to unequip); only the one-shot
+            // action menus (Magic/Abilities/Items) close back to the world.
+            return if matches!(kind, MenuKind::EquipSlot(_)) {
+                None
+            } else {
+                Some(InputMode::World)
+            };
         }
 
         push_system_chat_line(scene_state, format!("[menu] {kind:?} list is empty"));
@@ -2254,15 +2261,40 @@ fn dispatch_dynamic_menu_action(
             container,
             container_index,
             equip_slot,
-            item_no: _,
-        } => (
-            "equip",
-            AgentCommand::Equip {
-                container,
-                container_index,
-                equip_slot,
-            },
-        ),
+            item_no,
+        } => {
+            let already_equipped = scene_state
+                .snapshot
+                .equipped
+                .get(equip_slot as usize)
+                .copied()
+                .flatten()
+                == Some(item_no);
+            if already_equipped {
+                // Re-selecting the item already in this slot toggles it off.
+                // LSB unequips when slotID (container_index) is 0, regardless of
+                // container: vendor/server/src/map/utils/charutils.cpp:3147
+                // ("slotID of zero = unequip"). LOC_INVENTORY (0) always passes
+                // the equip_set container validation.
+                (
+                    "unequip",
+                    AgentCommand::Equip {
+                        container: 0,
+                        container_index: 0,
+                        equip_slot,
+                    },
+                )
+            } else {
+                (
+                    "equip",
+                    AgentCommand::Equip {
+                        container,
+                        container_index,
+                        equip_slot,
+                    },
+                )
+            }
+        }
     };
     if let Err(e) = cmd_tx.try_send(cmd) {
         push_system_chat_line(scene_state, format!("[menu] {kind_name} dropped: {e}"));

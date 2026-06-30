@@ -679,9 +679,23 @@ fn role_value(
             match dynamic.rows.get(list_idx) {
                 Some(row) => {
                     let cursor = list_idx == storage_cursor;
+                    let equipped = match row.action {
+                        crate::hud::menu::DynamicMenuAction::EquipItem { item_no, .. } => {
+                            snap.equipped.get(selected_slot as usize).copied().flatten()
+                                == Some(item_no)
+                        }
+                        _ => false,
+                    };
                     let prefix = if cursor { "> " } else { "  " };
-                    let color = if cursor { theme::CURSOR } else { theme::TEXT };
-                    (format!("{prefix}{}", row.label), color, true)
+                    let suffix = if equipped { " (E)" } else { "" };
+                    let color = if cursor {
+                        theme::CURSOR
+                    } else if equipped {
+                        theme::TITLE
+                    } else {
+                        theme::TEXT
+                    };
+                    (format!("{prefix}{}{suffix}", row.label), color, true)
                 }
                 None => (String::new(), theme::TEXT, false),
             }

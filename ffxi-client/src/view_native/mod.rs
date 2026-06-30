@@ -194,6 +194,9 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         .insert_resource(ffxi_viewer_core::hud::status_ribbon::StatusIconDatRoot(
             dat_root.clone(),
         ))
+        .insert_resource(ffxi_viewer_core::hud::item_dat_root::ItemDatRoot(
+            dat_root.clone(),
+        ))
         .insert_resource(ffxi_viewer_core::moon_material::MoonDatRoot(
             dat_root.clone(),
         ))

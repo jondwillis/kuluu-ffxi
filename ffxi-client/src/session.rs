@@ -4829,6 +4829,30 @@ mod tests {
     }
 
     #[test]
+    fn equip_set_packet_layout_matches_server_struct() {
+        // GP_CLI_COMMAND_EQUIP_SET (vendor/server/src/map/packets/c2s/0x050_equip_set.h):
+        // PropertyItemIndex(u8), EquipKind(u8), Category(u8).
+        let buf = build_subpacket_equip_set(0xBEEF, 7, 10, 0);
+        assert_eq!(buf.len(), 8, "header (4) + body (4)");
+        let hdr_word = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(hdr_word & 0x01FF, 0x050, "opcode = 0x050 EQUIP_SET");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0xBEEF, "sync");
+        assert_eq!(buf[4], 7, "PropertyItemIndex = container_index (slotID)");
+        assert_eq!(buf[5], 10, "EquipKind = equip_slot (Waist)");
+        assert_eq!(buf[6], 0, "Category = container (LOC_INVENTORY)");
+    }
+
+    #[test]
+    fn equip_set_unequip_uses_zero_slot_index() {
+        // LSB unequips a slot when PropertyItemIndex (slotID) is 0, regardless of
+        // container: vendor/server/src/map/utils/charutils.cpp:3147
+        // ("slotID of zero = unequip"). The re-select-to-unequip path encodes this.
+        let buf = build_subpacket_equip_set(0, 0, 10, 0);
+        assert_eq!(buf[4], 0, "slotID 0 = unequip");
+        assert_eq!(buf[5], 10, "still targets the equip slot being cleared");
+    }
+
+    #[test]
     fn item_use_with_nonzero_category_writes_full_u32() {
         let buf = build_subpacket_item_use(0, 0, 0, 8, 0);
         assert_eq!(
