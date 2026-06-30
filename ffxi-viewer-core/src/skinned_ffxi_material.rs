@@ -153,6 +153,11 @@ struct SkinBuffers {
     lighting: Buffer,
 }
 
+struct FlagsBuffer {
+    buffer: Buffer,
+    last: Vec4,
+}
+
 /// Render-world owner of the persistent material uniform buffers, written every
 /// frame by [`upload_ffxi_material_buffers`] and referenced by bind groups built
 /// once. `skin` (joints binding 3 + lighting binding 0) is shared per actor and
@@ -160,7 +165,7 @@ struct SkinBuffers {
 #[derive(Resource, Default)]
 pub struct FfxiMaterialBuffers {
     skin: HashMap<u64, SkinBuffers>,
-    flags: HashMap<u64, Buffer>,
+    flags: HashMap<u64, FlagsBuffer>,
 }
 
 impl AsBindGroup for FfxiSkinnedMaterial {
@@ -217,7 +222,7 @@ impl AsBindGroup for FfxiSkinnedMaterial {
                     ),
                 ),
                 (3, OwnedBindingResource::Buffer(skin.joints.clone())),
-                (4, OwnedBindingResource::Buffer(flags.clone())),
+                (4, OwnedBindingResource::Buffer(flags.buffer.clone())),
             ]),
         })
     }
@@ -361,11 +366,26 @@ fn upload_ffxi_material_buffers(
             write_uniform(&queue, &skin.lighting, &mat.lighting);
         }
 
-        let flags = cache
-            .flags
-            .entry(mat.instance_id)
-            .or_insert_with(|| uniform_buffer("ffxi_mat_flags", FfxiMaterialFlags::min_size()));
-        write_uniform(&queue, flags, &mat.material_flags);
+        // material_flags only changes when a graphics setting is toggled, so write
+        // it on first sight and on change, not every frame — this is the bulk of the
+        // per-frame write_buffer/staging churn the actor count otherwise multiplies.
+        match cache.flags.entry(mat.instance_id) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let fb = e.get_mut();
+                if fb.last != mat.material_flags.flags {
+                    write_uniform(&queue, &fb.buffer, &mat.material_flags);
+                    fb.last = mat.material_flags.flags;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let buffer = uniform_buffer("ffxi_mat_flags", FfxiMaterialFlags::min_size());
+                write_uniform(&queue, &buffer, &mat.material_flags);
+                e.insert(FlagsBuffer {
+                    buffer,
+                    last: mat.material_flags.flags,
+                });
+            }
+        }
         live_flags.insert(mat.instance_id);
     }
     cache.skin.retain(|id, _| live_skins.contains(id));
