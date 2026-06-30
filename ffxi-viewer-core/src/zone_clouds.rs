@@ -20,12 +20,10 @@ use crate::ffxi_zone_material::FfxiZoneMaterial;
 use crate::graphics_settings::{GraphicsSettings, SkyStyle};
 use crate::zone_texture::{decoded_texture_to_image, TextureQuality};
 
-// research/xim ParticleGeneratorAttachment.kt:46-62 (Sun pos = getSunPosition +
-// camera; None = camera-follow) + EnvironmentManager.kt:453-515 (updateWeatherEffects
-// reads weat/<type>/). cld1/cld2 follow the camera at their base offset; sun1 sits
-// on the sun direction. Distance the sun-attached layer rides out along sun_dir;
-// matches the SKY_RADIUS the SunDisc uses so cloud/sun share one dome scale.
-const SUN_LAYER_DISTANCE: f32 = 4000.0;
+// research/xim EnvironmentManager.kt:453-515 updateWeatherEffects reads weat/<type>/.
+// Only the cld1/cld2 camera-follow canopies are drawn here; the sun (sun1, attach=0xE)
+// is the single additive SunDisc in sun_moon.rs, so it shines through these clouds
+// rather than being a second, opaque blend mesh fighting it.
 
 // The authored 0x0F canopy scale (research/xim ParticleGeneratorParser.kt) varies per
 // zone/weather and often leaves the canopy rim nearer than the terrain, so the cloud
@@ -90,19 +88,13 @@ impl CloudFade {
     }
 }
 
-// research/xim ParticleGeneratorAttachment.kt:46-62: the generator's attachment
-// decides whether a layer rides the camera (None) or the sun direction (Sun).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CloudAttach {
-    Camera,
-    Sun,
-}
-
 #[derive(Component)]
 struct CloudLayer {
-    attach: CloudAttach,
     // FFXI-space base offset added camera-relative (cld1 [0,0,0] / cld2 [0,30,0]).
     base_position: Vec3,
+    // Per-weather opacity ceiling so clear weather (fine/suny) stays sparse and the
+    // sun/moon/stars read through, while overcast/storm progressively fills the sky.
+    max_alpha: f32,
     tracks: CloudColorTracks,
 }
 
@@ -113,9 +105,9 @@ struct CloudLayer {
 struct CloudLayerBuild {
     mesh: Handle<Mesh>,
     material: Handle<FfxiZoneMaterial>,
-    attach: CloudAttach,
     base_position: Vec3,
     scale: Vec3,
+    max_alpha: f32,
     tracks: CloudColorTracks,
 }
 
@@ -231,6 +223,7 @@ fn build_mesh(decrypted: &[u8]) -> Option<(Mesh, f32)> {
 fn build_cloud_layers(
     weat_type: &ChunkNode,
     quality: TextureQuality,
+    opacity: f32,
     meshes: &mut Assets<Mesh>,
     images: &mut Assets<Image>,
     materials: &mut Assets<FfxiZoneMaterial>,
@@ -261,21 +254,13 @@ fn build_cloud_layers(
         if c.chunk.kind != ChunkKind::Generator as u8 {
             continue;
         }
-        // Only cld1/cld2 (camera clouds) and sun1 (sun-attached) are placed here;
-        // moon/star/lens-flare generators live in their own subdirs/pillars.
-        let is_cloud = c.chunk.name == *b"cld1" || c.chunk.name == *b"cld2";
-        let is_sun = c.chunk.name == *b"sun1";
-        if !is_cloud && !is_sun {
+        // Only the cld1/cld2 camera canopies render here (attach 0x0 or 0x5, both
+        // camera-relative). The sun (sun1, attach=0xE) is the additive SunDisc in
+        // sun_moon.rs; moon/star/lens-flare live in their own subdirs.
+        if c.chunk.name != *b"cld1" && c.chunk.name != *b"cld2" {
             continue;
         }
         let Ok(Some(def)) = Generator::parse_cloud_generator(c.chunk.name, c.chunk.data) else {
-            continue;
-        };
-        let attach = if def.is_sun_attached() {
-            CloudAttach::Sun
-        } else if def.is_camera_cloud() {
-            CloudAttach::Camera
-        } else {
             continue;
         };
 
@@ -298,13 +283,25 @@ fn build_cloud_layers(
         out.push(CloudLayerBuild {
             mesh: meshes.add(mesh),
             material,
-            attach,
             base_position: def_base_to_vec(&def),
-            scale: layer_scale(attach, &def, half_xz),
+            scale: layer_scale(&def, half_xz),
+            max_alpha: opacity,
             tracks: resolve_color_tracks(weat_type, &def),
         });
     }
     out
+}
+
+// research/xim: clear weather (fine/suny) shows sparse cloud so the sun, moon and
+// stars read through; overcast (clod/mist) and storm (rain/thdr) progressively fill
+// the sky. Caps the cloud canopy's emitted alpha per weather type.
+fn weather_opacity(want: WeatherTypeId) -> f32 {
+    match &want {
+        b"fine" | b"suny" => 0.35,
+        b"clod" | b"mist" => 0.70,
+        b"rain" | b"thdr" => 0.90,
+        _ => 0.50,
+    }
 }
 
 fn def_base_to_vec(def: &CloudGeneratorDef) -> Vec3 {
@@ -315,24 +312,18 @@ fn def_base_to_vec(def: &CloudGeneratorDef) -> Vec3 {
     )
 }
 
-// Sun discs are placed out along sun_dir at SUN_LAYER_DISTANCE, so their authored
-// 0x0F scale is used as-is. Camera-follow cloud canopies sit on the camera, so their
-// rim (half_xz * authored scale) is pushed out to at least CLOUD_MIN_RIM — keeping the
-// authored aspect ratio — so distant terrain stays nearer and occludes them.
-fn layer_scale(attach: CloudAttach, def: &CloudGeneratorDef, half_xz: f32) -> Vec3 {
+// Camera-follow cloud canopies sit on the camera, so their rim (half_xz * authored
+// 0x0F scale) is pushed out to at least CLOUD_MIN_RIM — keeping the authored aspect
+// ratio — so distant terrain stays nearer and depth-occludes them.
+fn layer_scale(def: &CloudGeneratorDef, half_xz: f32) -> Vec3 {
     let authored = Vec3::from_array(def.scale);
-    match attach {
-        CloudAttach::Sun => authored,
-        CloudAttach::Camera => {
-            let rim = half_xz * authored.x.max(authored.z);
-            let factor = if rim > 1.0 {
-                (CLOUD_MIN_RIM / rim).max(1.0)
-            } else {
-                1.0
-            };
-            authored * factor
-        }
-    }
+    let rim = half_xz * authored.x.max(authored.z);
+    let factor = if rim > 1.0 {
+        (CLOUD_MIN_RIM / rim).max(1.0)
+    } else {
+        1.0
+    };
+    authored * factor
 }
 
 fn id_str(id: [u8; 4]) -> String {
@@ -422,7 +413,14 @@ fn rebuild_zone_clouds(
         mipmaps: settings.texture_filtering.mipmaps(),
         anisotropy: settings.texture_filtering.anisotropy(),
     };
-    let layers = build_cloud_layers(weat_type, quality, &mut meshes, &mut images, &mut materials);
+    let layers = build_cloud_layers(
+        weat_type,
+        quality,
+        weather_opacity(want),
+        &mut meshes,
+        &mut images,
+        &mut materials,
+    );
 
     let vanilla = settings.sky_style() == SkyStyle::Vanilla;
     for layer in layers {
@@ -436,8 +434,8 @@ fn rebuild_zone_clouds(
                 InGameEntity,
                 CloudMesh,
                 CloudLayer {
-                    attach: layer.attach,
                     base_position: layer.base_position,
+                    max_alpha: layer.max_alpha,
                     tracks: layer.tracks,
                 },
                 CloudFade {
@@ -485,8 +483,6 @@ fn drive_zone_clouds(
 ) {
     let vanilla = settings.sky_style() == SkyStyle::Vanilla;
     let cam_pos = cam_q.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
-    let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
-    let sun_dir = crate::sun_moon::sun_direction(sky.hour);
     let basis = ffxi_to_bevy_basis();
     let day_fraction = crate::hud::vana_clock::full_day_fraction(vana_clock.earth_unix_secs_now());
     let dt = time.delta_secs();
@@ -501,10 +497,7 @@ fn drive_zone_clouds(
             *vis = want;
         }
         xf.rotation = basis;
-        xf.translation = match layer.attach {
-            CloudAttach::Camera => cam_pos + basis * layer.base_position,
-            CloudAttach::Sun => cam_pos + sun_dir * SUN_LAYER_DISTANCE,
-        };
+        xf.translation = cam_pos + basis * layer.base_position;
 
         fade.elapsed += dt;
         if fade.finished_out() {
@@ -513,11 +506,12 @@ fn drive_zone_clouds(
             continue;
         }
 
-        // ToD color sets RGB; the keyframe alpha and the cross-fade alpha both
-        // multiply the emitted alpha (xim color.a multiplier × switchWeather fade).
+        // ToD color sets RGB; the keyframe alpha, the per-weather opacity cap and the
+        // cross-fade all multiply the emitted alpha so clear skies stay sparse (xim
+        // color.a multiplier × switchWeather fade).
         if let Some(material) = materials.get_mut(&mat.0) {
             let mut tint = layer.tracks.sample(day_fraction);
-            tint.w *= fade.alpha();
+            tint.w *= fade.alpha() * layer.max_alpha;
             material.tint = tint;
         }
     }
