@@ -44,9 +44,9 @@ impl QualityPreset {
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AaMode {
+    #[default]
     Off,
     Msaa2,
-    #[default]
     Msaa4,
     Msaa8,
 
@@ -70,8 +70,8 @@ impl AaMode {
 /// retail-faithful look — realism off, gradient skybox, painterly sun flare.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SkyStyle {
-    #[default]
     Enhanced,
+    #[default]
     Vanilla,
 }
 
@@ -172,9 +172,9 @@ impl CharacterRenderPath {
 /// the quality preset.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TextureFiltering {
+    #[default]
     Vanilla,
     Aniso2x,
-    #[default]
     Aniso4x,
     Aniso8x,
     Aniso16x,
@@ -403,13 +403,13 @@ impl Default for GraphicsSettings {
     }
 }
 
-const SHADOW_MAP_SIZE_SLOTS: &[u32] = &[1024, 2048, 4096, 8192];
+const SHADOW_MAP_SIZE_SLOTS: &[u32] = &[1024, 2048, 3072, 4096];
 const SHADOW_CASCADE_COUNT_SLOTS: &[u32] = &[2, 3, 4];
-const SHADOW_MAX_DISTANCE_SLOTS: &[f32] = &[200.0, 400.0, 600.0, 800.0, 1000.0];
+const SHADOW_MAX_DISTANCE_SLOTS: &[f32] = &[100.0, 200.0, 300.0, 700.0, 1100.0];
 const BLOOM_SLOTS: &[f32] = &[0.0, 0.04, 0.08, 0.12, 0.16];
 const FOG_STEP_SLOTS: &[u32] = &[32, 64, 96, 128];
 
-const VIEW_DISTANCE_SLOTS: &[f32] = &[1500.0, 2000.0, 3000.0, 4000.0, 4500.0, 6000.0];
+const VIEW_DISTANCE_SLOTS: &[f32] = &[200.0, 500.0, 700.0, 1100.0, 2300.0, 6100.0];
 const FOV_SLOTS: &[f32] = &[
     50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0,
 ];
