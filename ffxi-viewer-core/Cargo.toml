@@ -10,6 +10,12 @@ repository.workspace = true
 [package.metadata.dist]
 dist = false
 
+[features]
+default = []
+# Enhanced (non-retail) animated water surface via the bevy_water ocean
+# material, selectable at runtime in the graphics menu. Native-only.
+enhanced-water = ["dep:bevy_water"]
+
 # Bevy ECS plugins, world model, camera, and HUD shared by both the native
 # windowed viewer (ffxi-client/src/view_native/) and the browser viewer
 # (ffxi-viewer-wasm/). No tokio, no I/O — state arrives through the
@@ -54,6 +60,9 @@ ab_glyph = "0.2"
 # over the websocket if/when that's wanted.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ffxi-audio = { path = "../ffxi-audio" }
+# Optional enhanced animated water (feature `enhanced-water`). Crate version
+# tracks the Bevy version (0.18). Native-only; wasm viewer keeps the simple plane.
+bevy_water = { version = "0.18", optional = true }
 # Stable id for the synthetic picking pointer that bridges window-space mouse
 # input onto the off-screen render-scale target (graphics::render_scale, which
 # is itself native-only). from_u128 only — no getrandom needed.

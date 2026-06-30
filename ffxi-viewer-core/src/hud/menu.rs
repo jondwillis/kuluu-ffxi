@@ -116,6 +116,7 @@ const GRAPHICS_ENTRIES: &[&str] = &[
     "VSync",
     "FOV",
     "Sky Style",
+    "Water Style",
     "Dynamic Lights",
     "  Threshold",
     "  Intensity",

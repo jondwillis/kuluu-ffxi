@@ -224,6 +224,7 @@ pub enum GraphicsField {
     Fov,
 
     SkyStyle,
+    WaterStyle,
 
     DynamicLights,
     LightThreshold,
@@ -260,6 +261,7 @@ impl GraphicsField {
             GraphicsField::VSync => "VSync",
             GraphicsField::Fov => "FOV",
             GraphicsField::SkyStyle => "Sky Style",
+            GraphicsField::WaterStyle => "Water Style",
             GraphicsField::DynamicLights => "Dynamic Lights",
             GraphicsField::LightThreshold => "  Threshold",
             GraphicsField::LightIntensity => "  Intensity",
@@ -309,6 +311,11 @@ pub struct GraphicsSettings {
 
     #[serde(default)]
     pub sky_style: SkyStyle,
+
+    // Enhanced (non-retail) animated water via bevy_water; off = the vanilla
+    // translucent plane. Only takes effect when built with `enhanced-water`.
+    #[serde(default)]
+    pub enhanced_water: bool,
 
     #[serde(default)]
     pub dynamic_lights: DynamicLights,
@@ -470,6 +477,7 @@ impl GraphicsSettings {
                 vsync: true,
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
+                enhanced_water: false,
                 dynamic_lights: DynamicLights::Many,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
@@ -498,6 +506,7 @@ impl GraphicsSettings {
                 vsync: true,
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
+                enhanced_water: false,
                 dynamic_lights: DynamicLights::Many,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
@@ -526,6 +535,7 @@ impl GraphicsSettings {
                 vsync: true,
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
+                enhanced_water: false,
                 dynamic_lights: DynamicLights::Many,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
@@ -558,6 +568,7 @@ impl GraphicsSettings {
                 vsync: true,
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
+                enhanced_water: false,
                 dynamic_lights: DynamicLights::Many,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
@@ -611,6 +622,13 @@ impl GraphicsSettings {
 
             GraphicsField::SkyStyle => self.sky_style().label().to_string(),
 
+            GraphicsField::WaterStyle => if self.enhanced_water {
+                "Enhanced"
+            } else {
+                "Vanilla"
+            }
+            .into(),
+
             GraphicsField::DynamicLights => {
                 if self.lights_fine_is_default() {
                     self.dynamic_lights.label().to_string()
@@ -646,6 +664,7 @@ impl GraphicsSettings {
                 // Sky style is orthogonal to the quality tier, so carry it
                 // across a preset change.
                 let sky = self.sky_style;
+                let water = self.enhanced_water;
                 let lights = self.dynamic_lights;
                 let (lt, li, lr, lf) = (
                     self.light_threshold,
@@ -660,6 +679,7 @@ impl GraphicsSettings {
                     cycle_slot(self.preset, PRESET_CYCLE, delta).unwrap_or(QualityPreset::High);
                 *self = Self::for_preset(next);
                 self.sky_style = sky;
+                self.enhanced_water = water;
                 self.dynamic_lights = lights;
                 self.light_threshold = lt;
                 self.light_intensity = li;
@@ -724,6 +744,9 @@ impl GraphicsSettings {
                     SkyStyle::Enhanced => SkyStyle::Vanilla,
                     SkyStyle::Vanilla => SkyStyle::Enhanced,
                 };
+            }
+            GraphicsField::WaterStyle => {
+                self.enhanced_water = !self.enhanced_water;
             }
             GraphicsField::DynamicLights => {
                 self.dynamic_lights = cycle_slot(self.dynamic_lights, DYNAMIC_LIGHTS_CYCLE, delta)
@@ -913,6 +936,7 @@ pub const GRAPHICS_FIELDS: &[GraphicsField] = &[
     GraphicsField::VSync,
     GraphicsField::Fov,
     GraphicsField::SkyStyle,
+    GraphicsField::WaterStyle,
     GraphicsField::DynamicLights,
     GraphicsField::LightThreshold,
     GraphicsField::LightIntensity,
@@ -1384,6 +1408,20 @@ mod tests {
         s.cycle(GraphicsField::SkyStyle, 1);
         assert_eq!(s.sky_style(), SkyStyle::Vanilla);
         assert!(!s.sky_embellishments_enabled());
+    }
+
+    #[test]
+    fn water_style_toggles_and_is_orthogonal_to_preset() {
+        let mut s = GraphicsSettings::default();
+        assert!(!s.enhanced_water, "vanilla plane by default");
+        assert_eq!(s.value_label(GraphicsField::WaterStyle), "Vanilla");
+        s.cycle(GraphicsField::WaterStyle, 1);
+        assert!(s.enhanced_water);
+        assert_eq!(s.value_label(GraphicsField::WaterStyle), "Enhanced");
+        assert_eq!(s.preset, QualityPreset::High, "water style ⟂ quality tier");
+        // Orthogonal/sticky: a preset change carries the choice across.
+        s.cycle(GraphicsField::Preset, 1);
+        assert!(s.enhanced_water, "water style survives a preset change");
     }
 
     #[test]

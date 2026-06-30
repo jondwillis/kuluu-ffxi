@@ -360,6 +360,27 @@ pub struct MzbOverlay;
 #[derive(Component)]
 pub struct AutoMzbOverlay;
 
+#[derive(Component)]
+pub struct WaterPlane;
+
+#[derive(Clone, Copy)]
+pub struct WaterSpec {
+    pub min: Vec3,
+    pub max: Vec3,
+    pub height: f32,
+    pub parent: Entity,
+    pub auto_loaded: bool,
+}
+
+// MZB load computes pond extents (CPU-side) and queues them here; spawn_zone_water
+// drains it the same frame, picking the simple plane or enhanced bevy_water mesh
+// per the live GraphicsSettings. Decoupling the spawn from spawn_mzb_overlay keeps
+// the `enhanced-water` feature-gated material code in one system.
+#[derive(Resource, Default)]
+pub struct PendingWaterSpawns {
+    pub specs: Vec<WaterSpec>,
+}
+
 #[derive(Message, Debug, Clone, Copy)]
 pub struct LoadMzbRequest {
     pub file_id: u32,
@@ -867,6 +888,7 @@ pub fn kick_load_mzb_tasks(
     draw: Res<DrawDistance>,
     mut collision_geometry: ResMut<MzbCollisionGeometry>,
     mut load_mmb_tx: MessageWriter<crate::dat_mmb::LoadMmbRequest>,
+    mut pending_water: ResMut<PendingWaterSpawns>,
     mut in_flight: ResMut<LoadMzbInFlight>,
     mut cache: ResMut<ZoneGeomCache>,
 ) {
@@ -882,6 +904,7 @@ pub fn kick_load_mzb_tasks(
                 &mut toasts,
                 &mut collision_geometry,
                 &mut load_mmb_tx,
+                &mut pending_water,
                 init_vis,
                 true,
             );
@@ -926,6 +949,7 @@ pub fn poll_load_mzb_tasks(
     draw: Res<DrawDistance>,
     mut collision_geometry: ResMut<MzbCollisionGeometry>,
     mut load_mmb_tx: MessageWriter<crate::dat_mmb::LoadMmbRequest>,
+    mut pending_water: ResMut<PendingWaterSpawns>,
     mut in_flight: ResMut<LoadMzbInFlight>,
     mut cache: ResMut<ZoneGeomCache>,
 ) {
@@ -956,6 +980,7 @@ pub fn poll_load_mzb_tasks(
                 &mut toasts,
                 &mut collision_geometry,
                 &mut load_mmb_tx,
+                &mut pending_water,
                 init_vis,
                 false,
             );
@@ -973,6 +998,116 @@ fn compute_init_visibility(mode: ZoneGeomMode) -> (Visibility, Visibility) {
     }
 }
 
+fn simple_water_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::srgba(0.18, 0.36, 0.40, 0.46),
+        perceptual_roughness: 0.08,
+        metallic: 0.0,
+        reflectance: 0.5,
+        cull_mode: None,
+        alpha_mode: AlphaMode::Blend,
+        // Bounding-box plane is near-coplanar with the sloped pond bed at the
+        // shoreline; bias the translucent surface toward the camera so it wins
+        // the depth test there instead of z-fighting (constant bias is in
+        // depth-texture units, hence the large value).
+        depth_bias: 1000.0,
+        ..default()
+    }
+}
+
+fn build_simple_water_mesh(min: Vec3, max: Vec3, height: f32) -> Mesh {
+    let dx = (max.x - min.x).max(0.01);
+    let dz = (max.z - min.z).max(0.01);
+    let cx = 0.5 * (min.x + max.x);
+    let cz = 0.5 * (min.z + max.z);
+    let hx = dx * 0.5;
+    let hz = dz * 0.5;
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        vec![
+            [cx - hx, height, cz - hz],
+            [cx + hx, height, cz - hz],
+            [cx + hx, height, cz + hz],
+            [cx - hx, height, cz + hz],
+        ],
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 4]);
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_UV_0,
+        vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+    );
+    mesh.insert_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
+    mesh
+}
+
+// Drains pond extents queued by the MZB load and spawns one surface each: the
+// vanilla translucent plane, or — when built with `enhanced-water` and the
+// GraphicsSettings toggle is on — an animated bevy_water mesh. Reads the setting
+// at drain time, so a toggle change takes effect on the next zone (re)load.
+pub fn spawn_zone_water(
+    mut commands: Commands,
+    mut pending: ResMut<PendingWaterSpawns>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    settings: Res<crate::graphics::GraphicsSettings>,
+    #[cfg(feature = "enhanced-water")] mut water_materials: ResMut<
+        Assets<crate::water_enhanced::StandardWaterMaterial>,
+    >,
+) {
+    if pending.specs.is_empty() {
+        return;
+    }
+    let specs = std::mem::take(&mut pending.specs);
+    let enhanced = cfg!(feature = "enhanced-water") && settings.enhanced_water;
+    let simple_mat = materials.add(simple_water_material());
+
+    for spec in specs {
+        #[cfg(feature = "enhanced-water")]
+        if enhanced {
+            let (mesh, mat, xf) = crate::water_enhanced::build_pond_water(
+                &mut meshes,
+                &mut water_materials,
+                spec.min,
+                spec.max,
+                spec.height,
+            );
+            let mut e = commands.spawn((
+                MzbOverlay,
+                WaterPlane,
+                mesh,
+                mat,
+                xf,
+                Visibility::Inherited,
+                bevy::light::NotShadowReceiver,
+                ChildOf(spec.parent),
+            ));
+            if spec.auto_loaded {
+                e.insert(AutoMzbOverlay);
+            }
+            continue;
+        }
+
+        let mut e = commands.spawn((
+            MzbOverlay,
+            WaterPlane,
+            Mesh3d(meshes.add(build_simple_water_mesh(spec.min, spec.max, spec.height))),
+            MeshMaterial3d(simple_mat.clone()),
+            Transform::IDENTITY,
+            Visibility::Inherited,
+            bevy::light::NotShadowReceiver,
+            ChildOf(spec.parent),
+        ));
+        if spec.auto_loaded {
+            e.insert(AutoMzbOverlay);
+        }
+    }
+    let _ = enhanced;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_mzb_overlay(
     req: LoadMzbRequest,
@@ -983,6 +1118,7 @@ fn spawn_mzb_overlay(
     toasts: &mut MessageWriter<crate::snapshot::ToastEvent>,
     collision_geometry: &mut ResMut<MzbCollisionGeometry>,
     load_mmb_tx: &mut MessageWriter<crate::dat_mmb::LoadMmbRequest>,
+    pending_water: &mut PendingWaterSpawns,
     init_vis: (Visibility, Visibility),
     _from_cache: bool,
 ) {
@@ -1207,63 +1343,14 @@ fn spawn_mzb_overlay(
     }
     let water_count = water_groups.len();
     if water_count > 0 {
-        let water_mat = materials.add(StandardMaterial {
-            base_color: Color::srgba(0.18, 0.36, 0.40, 0.46),
-            perceptual_roughness: 0.08,
-            metallic: 0.0,
-            reflectance: 0.5,
-            cull_mode: None,
-            alpha_mode: AlphaMode::Blend,
-            // Bounding-box plane is near-coplanar with the sloped pond bed at the
-            // shoreline; bias the translucent surface toward the camera so it
-            // wins the depth test there instead of z-fighting (constant bias is
-            // in depth-texture units, hence the large value).
-            depth_bias: 1000.0,
-            ..default()
-        });
         for (height_key, (min, max)) in water_groups {
-            let h = height_key as f32 / 1000.0;
-            let dx = (max.x - min.x).max(0.01);
-            let dz = (max.z - min.z).max(0.01);
-            let cx = 0.5 * (min.x + max.x);
-            let cz = 0.5 * (min.z + max.z);
-            let mut mesh = Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::default(),
-            );
-
-            let hx = dx * 0.5;
-            let hz = dz * 0.5;
-            let positions: Vec<[f32; 3]> = vec![
-                [cx - hx, h, cz - hz],
-                [cx + hx, h, cz - hz],
-                [cx + hx, h, cz + hz],
-                [cx - hx, h, cz + hz],
-            ];
-            let normals: Vec<[f32; 3]> = vec![[0.0, 1.0, 0.0]; 4];
-            let uvs: Vec<[f32; 2]> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-            let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-            mesh.insert_indices(Indices::U32(indices));
-            // Water is real scene content, not debug geometry: tag MzbOverlay
-            // (despawn + distance cull) but NOT MzbNonCollisionMesh, so the
-            // zone-geom debug toggle (hidden outside `All` mode) never hides it.
-            // NotShadowReceiver: retail water does not take crisp cast shadows
-            // like opaque ground.
-            let mut child = commands.spawn((
-                MzbOverlay,
-                Mesh3d(meshes.add(mesh)),
-                MeshMaterial3d(water_mat.clone()),
-                Transform::IDENTITY,
-                Visibility::Inherited,
-                bevy::light::NotShadowReceiver,
-                ChildOf(parent),
-            ));
-            if req.auto_loaded {
-                child.insert(AutoMzbOverlay);
-            }
+            pending_water.specs.push(WaterSpec {
+                min,
+                max,
+                height: height_key as f32 / 1000.0,
+                parent,
+                auto_loaded: req.auto_loaded,
+            });
         }
         push_system_msg(
             toasts,

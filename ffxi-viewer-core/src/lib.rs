@@ -57,6 +57,8 @@ pub mod target_ring;
 pub mod target_strobe;
 pub mod ui_font;
 pub mod vana_time;
+#[cfg(feature = "enhanced-water")]
+pub mod water_enhanced;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod weather;
 pub mod weather_fx;
@@ -177,6 +179,9 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(ffxi_zone_material::FfxiZoneMaterialPlugin);
+
+        #[cfg(feature = "enhanced-water")]
+        app.add_plugins(water_enhanced::EnhancedWaterPlugin);
 
         app.add_plugins(lens_flare::LensFlarePlugin);
 
