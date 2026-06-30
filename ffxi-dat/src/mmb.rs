@@ -128,13 +128,6 @@ impl<'a> MmbHeader<'a> {
             .trim()
             .to_string()
     }
-
-    pub fn is_cloud(&self) -> bool {
-        const MARKER: &[u8; 4] = b"clod";
-        self.header_window
-            .windows(4)
-            .any(|w| w.eq_ignore_ascii_case(MARKER))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

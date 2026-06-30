@@ -58,6 +58,12 @@ pub struct ParticleGeneratorDef {
     pub scale_x_track: Option<[u8; 4]>,
     pub scale_y_track: Option<[u8; 4]>,
     pub alpha_track: Option<[u8; 4]>,
+
+    // research/xim ParticleUpdaters.kt:289-317 DayOfWeekColorUpdater (0x4E, 8xRGBA) and
+    // MoonPhaseColorUpdater (0x4F, 12xRGBA): indexed by day-of-week / moon-phase frame and
+    // applied as a 2x modulate (Particle.kt:218). RGBA in 0..=1.
+    pub day_of_week_color: Option<[[f32; 4]; 8]>,
+    pub moon_phase_color: Option<[[f32; 4]; 12]>,
 }
 
 impl ParticleGeneratorDef {
@@ -94,6 +100,8 @@ impl ParticleGeneratorDef {
         let mut scale_y_track = None;
         let mut alpha_track = None;
         let mut blend = ParticleBlend::Additive;
+        let mut day_of_week_color = None;
+        let mut moon_phase_color = None;
 
         while cursor + 4 <= body.len() {
             let cfg = u32_le(body, cursor);
@@ -154,6 +162,36 @@ impl ParticleGeneratorDef {
                         body[payload + 3] as f32 / 255.0,
                     ];
                 }
+                // research/xim ParticleUpdaters.kt:289-301 DayOfWeekColorUpdater: expectZero32
+                // then 8 RGBA quads (u8x4, 0..=255). payload+0 is the zero u32.
+                0x4E if payload + 4 + 32 <= body.len() => {
+                    let mut colors = [[0.0f32; 4]; 8];
+                    for (i, c) in colors.iter_mut().enumerate() {
+                        let o = payload + 4 + i * 4;
+                        *c = [
+                            body[o] as f32 / 255.0,
+                            body[o + 1] as f32 / 255.0,
+                            body[o + 2] as f32 / 255.0,
+                            body[o + 3] as f32 / 255.0,
+                        ];
+                    }
+                    day_of_week_color = Some(colors);
+                }
+                // research/xim ParticleUpdaters.kt:304-316 MoonPhaseColorUpdater: expectZero32
+                // then 12 RGBA quads.
+                0x4F if payload + 4 + 48 <= body.len() => {
+                    let mut colors = [[0.0f32; 4]; 12];
+                    for (i, c) in colors.iter_mut().enumerate() {
+                        let o = payload + 4 + i * 4;
+                        *c = [
+                            body[o] as f32 / 255.0,
+                            body[o + 1] as f32 / 255.0,
+                            body[o + 2] as f32 / 255.0,
+                            body[o + 3] as f32 / 255.0,
+                        ];
+                    }
+                    moon_phase_color = Some(colors);
+                }
                 // KeyFrameValueSetup: opcode selects the target channel; the track id is at payload+4.
                 0x27 if payload + 8 <= body.len() => scale_x_track = track_id(body, payload + 4),
                 0x28 if payload + 8 <= body.len() => scale_y_track = track_id(body, payload + 4),
@@ -196,6 +234,8 @@ impl ParticleGeneratorDef {
             scale_x_track,
             scale_y_track,
             alpha_track,
+            day_of_week_color,
+            moon_phase_color,
         }))
     }
 

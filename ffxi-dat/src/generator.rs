@@ -77,6 +77,144 @@ pub struct PointLightDef {
     pub base_position: [f32; 3],
 }
 
+// research/xim ParticleGeneratorAttachment.kt:46-62 — the StandardParticleSetup
+// attachment nibble (body[0] & 0x0F) selects how the generator's particles are
+// placed: 0xE = Sun (getSunPosition + camera), 0xF = Moon, 0x0 = None (clouds,
+// camera-follow when cfg bit 0x0004 is set; Particle.kt:232-258). The linked DAT
+// id at setup+8 is the model the generator instances; linked_type at setup+29 is
+// the linked-data class (0x0B StaticMesh-particle, etc.).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CloudGeneratorDef {
+    pub name: [u8; 4],
+    pub attach: u8,
+    pub follow_camera: bool,
+    pub linked_id: [u8; 4],
+    pub linked_type: u8,
+    pub base_position: [f32; 3],
+
+    // research/xim ParticleGeneratorParser.kt:271-274 the setup-section "ToD Color"
+    // KeyFrameValueSetup opcodes 0x60/0x61/0x62/0x63 (R/G/B/A; the 0x3C-0x3F
+    // ClockValueUpdaters at runtime) and 0x6D-0x70 "ToD Specular Color" (the
+    // 0x4A-0x4D sun-specular updaters). KeyFrameValueSetup.read (ParticleInitializers.kt
+    // :481-489) is expect32(0) then nextDatId — so the 0x19 keyframe DAT-id sits at
+    // payload+4. kcr1/kcg1/kcb1 drive cloud/sky RGB, ksr1/ksg1/ksb1 the sun; sampled
+    // at the full-day fraction (ParticleUpdaters.kt:172-183 ClockValueUpdater).
+    pub color_r_track: Option<[u8; 4]>,
+    pub color_g_track: Option<[u8; 4]>,
+    pub color_b_track: Option<[u8; 4]>,
+    pub alpha_mult_track: Option<[u8; 4]>,
+}
+
+impl Generator {
+    const ATTACH_NONE: u8 = 0x0;
+    const ATTACH_SUN: u8 = 0xE;
+    const CONFIG_FOLLOW_CAMERA: u16 = 0x0004;
+
+    // research/xim EnvironmentManager.kt:453-515 weat/<type>/ cld1/cld2/sun1 0x05
+    // generators. Mirrors dat-cloud-probe parse_setup: the StandardParticleSetup
+    // (sec1 op 0x01) carries the config word (camFollow bit), the linked model id
+    // and the base position; the chunk-body attachment nibble is body[0] & 0x0F.
+    pub fn parse_cloud_generator(name: [u8; 4], body: &[u8]) -> Result<Option<CloudGeneratorDef>> {
+        const HEADER_LEN: usize = 0x80;
+        if body.len() < HEADER_LEN {
+            return Err(DatError::TruncatedChunk {
+                offset: 0,
+                needed: HEADER_LEN,
+                available: body.len(),
+            });
+        }
+        let attach = body[0] & 0x0F;
+        let creation_offset = u32_le(body, 0x74) as usize;
+        if creation_offset < 16 || creation_offset - 16 >= body.len() {
+            return Ok(None);
+        }
+        let mut cursor = creation_offset - 16;
+        let mut setup: Option<CloudGeneratorDef> = None;
+        let mut color_r_track = None;
+        let mut color_g_track = None;
+        let mut color_b_track = None;
+        let mut alpha_mult_track = None;
+        while cursor + 4 <= body.len() {
+            let opcode = body[cursor];
+            if opcode == 0x00 {
+                break;
+            }
+            let size_words = (body[cursor + 1] & 0x1F) as usize;
+            if size_words == 0 {
+                break;
+            }
+            let block_len = size_words * 4;
+            let payload = cursor + 4;
+            if cursor + block_len > body.len() {
+                break;
+            }
+            match opcode {
+                0x01 if payload + 30 <= body.len() => {
+                    let config = u16::from_le_bytes([body[payload], body[payload + 1]]);
+                    setup = Some(CloudGeneratorDef {
+                        name,
+                        attach,
+                        follow_camera: config & Self::CONFIG_FOLLOW_CAMERA != 0,
+                        linked_id: [
+                            body[payload + 8],
+                            body[payload + 9],
+                            body[payload + 10],
+                            body[payload + 11],
+                        ],
+                        linked_type: body[payload + 29],
+                        base_position: [
+                            f32_le(body, payload + 16),
+                            f32_le(body, payload + 20),
+                            f32_le(body, payload + 24),
+                        ],
+                        color_r_track: None,
+                        color_g_track: None,
+                        color_b_track: None,
+                        alpha_mult_track: None,
+                    });
+                }
+                // ToD Color setup (0x60-0x63) and ToD Specular Color setup (0x6D-0x70):
+                // KeyFrameValueSetup stores the 0x19 keyframe DAT-id at payload+4.
+                0x60 | 0x6D if payload + 8 <= body.len() => {
+                    color_r_track = clock_track_id(body, payload + 4)
+                }
+                0x61 | 0x6E if payload + 8 <= body.len() => {
+                    color_g_track = clock_track_id(body, payload + 4)
+                }
+                0x62 | 0x6F if payload + 8 <= body.len() => {
+                    color_b_track = clock_track_id(body, payload + 4)
+                }
+                0x63 | 0x70 if payload + 8 <= body.len() => {
+                    alpha_mult_track = clock_track_id(body, payload + 4)
+                }
+                _ => {}
+            }
+            cursor += block_len;
+        }
+        Ok(setup.map(|mut def| {
+            def.color_r_track = color_r_track;
+            def.color_g_track = color_g_track;
+            def.color_b_track = color_b_track;
+            def.alpha_mult_track = alpha_mult_track;
+            def
+        }))
+    }
+}
+
+fn clock_track_id(b: &[u8], off: usize) -> Option<[u8; 4]> {
+    let id = [b[off], b[off + 1], b[off + 2], b[off + 3]];
+    (id != [0, 0, 0, 0]).then_some(id)
+}
+
+impl CloudGeneratorDef {
+    pub fn is_camera_cloud(&self) -> bool {
+        self.attach == Generator::ATTACH_NONE
+    }
+    pub fn is_sun_attached(&self) -> bool {
+        self.attach == Generator::ATTACH_SUN
+    }
+}
+
 // A particle-emitting generator (effect_type 0x0B). research/xim ParticleGeneratorParser.kt
 // Sec2: the 0x01 StandardParticleSetup carries the billboard flag, base position and the
 // billboard-mesh id; 0x0F is the initial scale; 0x16 the particle color. A faithful render
@@ -466,6 +604,116 @@ mod tests {
         push_block(&mut body, 0x01, 9, &setup);
         body.push(0x00);
         assert!(Generator::parse_point_light(&body).unwrap().is_none());
+    }
+
+    #[test]
+    fn parses_cloud_generator_camfollow_and_attach() {
+        // cld1: attach None, cfg camFollow, linked StaticMesh id "clod", base [0,20,0].
+        let mut body = make_body();
+        body[0] = 0x00; // attach nibble = None
+        let mut cmd = vec![0u8; 36];
+        cmd[0] = 0x01;
+        cmd[1] = 0x09;
+        cmd[4..6].copy_from_slice(&0x0004u16.to_le_bytes()); // config: camFollow
+        cmd[4 + 8..4 + 12].copy_from_slice(b"clod");
+        cmd[4 + 20..4 + 24].copy_from_slice(&20.0f32.to_le_bytes()); // base.y
+        cmd[4 + 29] = 0x0B; // linked StaticMesh particle
+        body.extend_from_slice(&cmd);
+
+        let g = Generator::parse_cloud_generator(*b"cld1", &body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.linked_id, *b"clod");
+        assert!(g.follow_camera);
+        assert!(g.is_camera_cloud());
+        assert!(!g.is_sun_attached());
+        assert!((g.base_position[1] - 20.0).abs() < 1e-6);
+        assert_eq!(g.color_r_track, None);
+    }
+
+    fn clock_block(opcode: u8, id: &[u8; 4]) -> Vec<u8> {
+        // KeyFrameValueSetup: size_words=4 (16-byte block); expect32(0) at payload+0,
+        // keyframe DAT-id at payload+4, config u32 at payload+8.
+        let mut blk = vec![0u8; 16];
+        blk[0] = opcode;
+        blk[1] = 0x04;
+        blk[8..12].copy_from_slice(id);
+        blk
+    }
+
+    #[test]
+    fn cloud_generator_collects_tod_color_tracks() {
+        // cld1 with 0x60/0x61/0x62 RGB + 0x63 alpha-mult ToD-color setups after 0x01.
+        let mut body = make_body();
+        body[0] = 0x00;
+        let mut cmd = vec![0u8; 36];
+        cmd[0] = 0x01;
+        cmd[1] = 0x09;
+        cmd[4 + 8..4 + 12].copy_from_slice(b"clod");
+        cmd[4 + 29] = 0x0B;
+        body.extend_from_slice(&cmd);
+        for (opcode, id) in [
+            (0x60u8, b"kcr1"),
+            (0x61, b"kcg1"),
+            (0x62, b"kcb1"),
+            (0x63, b"kca1"),
+        ] {
+            body.extend_from_slice(&clock_block(opcode, id));
+        }
+
+        let g = Generator::parse_cloud_generator(*b"cld1", &body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.color_r_track, Some(*b"kcr1"));
+        assert_eq!(g.color_g_track, Some(*b"kcg1"));
+        assert_eq!(g.color_b_track, Some(*b"kcb1"));
+        assert_eq!(g.alpha_mult_track, Some(*b"kca1"));
+    }
+
+    #[test]
+    fn sun_generator_collects_specular_color_tracks() {
+        // sun1 with 0x6D/0x6E/0x6F ToD-specular RGB setups (ksr1/ksg1/ksb1).
+        let mut body = make_body();
+        body[0] = 0x0E;
+        let mut cmd = vec![0u8; 36];
+        cmd[0] = 0x01;
+        cmd[1] = 0x09;
+        cmd[4 + 8..4 + 12].copy_from_slice(b"suns");
+        cmd[4 + 29] = 0x0B;
+        body.extend_from_slice(&cmd);
+        for (opcode, id) in [(0x6Du8, b"ksr1"), (0x6E, b"ksg1"), (0x6F, b"ksb1")] {
+            body.extend_from_slice(&clock_block(opcode, id));
+        }
+
+        let g = Generator::parse_cloud_generator(*b"sun1", &body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.color_r_track, Some(*b"ksr1"));
+        assert_eq!(g.color_g_track, Some(*b"ksg1"));
+        assert_eq!(g.color_b_track, Some(*b"ksb1"));
+        assert_eq!(g.alpha_mult_track, None);
+    }
+
+    #[test]
+    fn parses_sun_attached_generator() {
+        // sun1: attach 0xE (Sun), no camFollow, linked "suns".
+        let mut body = make_body();
+        body[0] = 0x0E;
+        let mut cmd = vec![0u8; 36];
+        cmd[0] = 0x01;
+        cmd[1] = 0x09;
+        cmd[4..6].copy_from_slice(&0x00c0u16.to_le_bytes());
+        cmd[4 + 8..4 + 12].copy_from_slice(b"suns");
+        cmd[4 + 29] = 0x0B;
+        body.extend_from_slice(&cmd);
+
+        let g = Generator::parse_cloud_generator(*b"sun1", &body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.linked_id, *b"suns");
+        assert!(!g.follow_camera);
+        assert!(g.is_sun_attached());
+        assert!(!g.is_camera_cloud());
     }
 
     #[test]
