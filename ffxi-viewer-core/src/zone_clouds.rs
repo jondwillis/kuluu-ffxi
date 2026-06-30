@@ -32,10 +32,9 @@ use crate::zone_texture::{decoded_texture_to_image, TextureQuality};
 // clouds — the same "sky is the farthest thing" rule the skybox dome relies on.
 const CLOUD_MIN_RIM: f32 = 4000.0;
 
-// Gentle wind: the canopy rotates slowly about the vertical so clouds visibly drift
-// across the sky — a stand-in for the retail 0x27/0x28 TextureCoordinateUpdater scroll
-// (research/xim ParticleUpdaters.kt). rad/s; cld2 rides a touch faster for parallax.
-const CLOUD_DRIFT_RATE: f32 = 0.005;
+// research/xim ParticleUpdaters.kt: TextureCoordinateUpdater velocities are per frame
+// of the retail/vanilla client, which runs at 30 fps.
+const RETAIL_FPS: f32 = 30.0;
 
 // research/xim EnvironmentManager.kt:351-369 switchWeather default 3.33s cross-fade
 // between the old and new weat/<type>/ effect sets on a 0x0057 weather change.
@@ -97,9 +96,9 @@ impl CloudFade {
 struct CloudLayer {
     // FFXI-space base offset added camera-relative (cld1 [0,0,0] / cld2 [0,30,0]).
     base_position: Vec3,
-    // Per-weather opacity ceiling so clear weather (fine/suny) stays sparse and the
-    // sun/moon/stars read through, while overcast/storm progressively fills the sky.
     max_alpha: f32,
+    // research/xim TextureCoordinateUpdater: per-frame UV-translate wind velocity.
+    uv_scroll: Vec2,
     tracks: CloudColorTracks,
 }
 
@@ -113,6 +112,7 @@ struct CloudLayerBuild {
     base_position: Vec3,
     scale: Vec3,
     max_alpha: f32,
+    uv_scroll: Vec2,
     tracks: CloudColorTracks,
 }
 
@@ -171,8 +171,7 @@ fn resolve_color_tracks(dir: &ChunkNode, def: &CloudGeneratorDef) -> CloudColorT
     }
 }
 
-// Returns the assembled mesh plus its horizontal half-extent (max |x|,|z| over all
-// verts) so the caller can scale the canopy rim out to a fixed sky radius.
+// The f32 is the mesh's horizontal half-extent (max |x|,|z|), used for rim scaling.
 fn build_mesh(decrypted: &[u8]) -> Option<(Mesh, f32)> {
     let models = parse_models(decrypted);
     let mut positions: Vec<[f32; 3]> = Vec::new();
@@ -291,15 +290,15 @@ fn build_cloud_layers(
             base_position: def_base_to_vec(&def),
             scale: layer_scale(&def, half_xz),
             max_alpha: opacity,
+            uv_scroll: Vec2::from_array(def.uv_scroll),
             tracks: resolve_color_tracks(weat_type, &def),
         });
     }
     out
 }
 
-// research/xim: clear weather (fine/suny) shows sparse cloud so the sun, moon and
-// stars read through; overcast (clod/mist) and storm (rain/thdr) progressively fill
-// the sky. Caps the cloud canopy's emitted alpha per weather type.
+// The cloud generators ship no 0x63 alpha keyframe, so canopy coverage can't be read
+// from the DAT — it's a deliberate per-weather tuning (clear sparse, storm dense).
 fn weather_opacity(want: WeatherTypeId) -> f32 {
     match &want {
         b"fine" | b"suny" => 0.35,
@@ -351,6 +350,7 @@ fn cloud_material(texture: Option<Handle<Image>>) -> FfxiZoneMaterial {
             flags: Vec4::new(has_texture, 1.0, 0.0, 0.0),
         },
         tint: Vec4::ONE,
+        uv_offset: Vec4::ZERO,
         alpha_mode: AlphaMode::Blend,
     }
 }
@@ -441,6 +441,7 @@ fn rebuild_zone_clouds(
                 CloudLayer {
                     base_position: layer.base_position,
                     max_alpha: layer.max_alpha,
+                    uv_scroll: layer.uv_scroll,
                     tracks: layer.tracks,
                 },
                 CloudFade {
@@ -491,7 +492,7 @@ fn drive_zone_clouds(
     let basis = ffxi_to_bevy_basis();
     let day_fraction = crate::hud::vana_clock::full_day_fraction(vana_clock.earth_unix_secs_now());
     let dt = time.delta_secs();
-    let drift = time.elapsed_secs() * CLOUD_DRIFT_RATE;
+    let frames = time.elapsed_secs() * RETAIL_FPS;
 
     for (entity, mut xf, mut vis, layer, mut fade, mat) in &mut clouds {
         let want = if vanilla {
@@ -502,9 +503,7 @@ fn drive_zone_clouds(
         if *vis != want {
             *vis = want;
         }
-        // Higher layers (cld2 base.y ~30) drift a touch faster for parallax.
-        let speed = 1.0 + layer.base_position.y.abs() * 0.01;
-        xf.rotation = Quat::from_rotation_y(drift * speed) * basis;
+        xf.rotation = basis;
         xf.translation = cam_pos + basis * layer.base_position;
 
         fade.elapsed += dt;
@@ -514,13 +513,13 @@ fn drive_zone_clouds(
             continue;
         }
 
-        // ToD color sets RGB; the keyframe alpha, the per-weather opacity cap and the
-        // cross-fade all multiply the emitted alpha so clear skies stay sparse (xim
-        // color.a multiplier × switchWeather fade).
         if let Some(material) = materials.get_mut(&mat.0) {
             let mut tint = layer.tracks.sample(day_fraction);
             tint.w *= fade.alpha() * layer.max_alpha;
             material.tint = tint;
+            // TextureCoordinateUpdater integrates UV velocity over elapsed frames.
+            let uv = layer.uv_scroll * frames;
+            material.uv_offset = Vec4::new(uv.x, uv.y, 0.0, 0.0);
         }
     }
 }
@@ -528,6 +527,9 @@ fn drive_zone_clouds(
 // Star dome (weat/<type>/star/ sta1 mesh + sta2 texture). Placed just inside the
 // skybox sphere so it reads as the farthest sky layer, behind the cloud canopy.
 const STAR_RADIUS: f32 = 5000.0;
+
+// Sun-altitude (radians below the horizon) over which the star field fades fully in.
+const STAR_TWILIGHT_BAND_RAD: f32 = 0.30;
 
 #[derive(Component)]
 struct StarDome;
@@ -672,8 +674,7 @@ fn drive_zone_stars(
     let cam_pos = cam_q.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
 
-    // Fade in as the sun drops below the horizon over a ~17deg twilight band.
-    let night = (-sky.sun_altitude / 0.30).clamp(0.0, 1.0);
+    let night = (-sky.sun_altitude / STAR_TWILIGHT_BAND_RAD).clamp(0.0, 1.0);
     let want = if vanilla && night > 0.0 {
         Visibility::Inherited
     } else {

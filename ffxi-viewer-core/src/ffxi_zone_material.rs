@@ -35,6 +35,12 @@ pub struct FfxiZoneMaterial {
     #[uniform(4)]
     pub tint: Vec4,
 
+    // research/xim ParticleUpdaters.kt TextureCoordinateUpdater: animated UV scroll
+    // (xy) that drifts the cloud canopy texture for wind. Zero (the default for every
+    // other zone mesh) is a no-op.
+    #[uniform(5)]
+    pub uv_offset: Vec4,
+
     pub alpha_mode: AlphaMode,
 }
 

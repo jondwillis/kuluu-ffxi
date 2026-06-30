@@ -96,6 +96,11 @@ pub struct CloudGeneratorDef {
     // dome size comes from this scale, so dropping it leaves a slab at the camera.
     pub scale: [f32; 3],
 
+    // research/xim ParticleUpdaters.kt TextureCoordinateUpdater: section-3 opcodes 0x27
+    // (U) / 0x28 (V) carry the per-frame UV-translate velocity that scrolls the cloud
+    // texture for wind. [0,0] = static (e.g. fine weather ships no scroll).
+    pub uv_scroll: [f32; 2],
+
     // research/xim ParticleGeneratorParser.kt:271-274 the setup-section "ToD Color"
     // KeyFrameValueSetup opcodes 0x60/0x61/0x62/0x63 (R/G/B/A; the 0x3C-0x3F
     // ClockValueUpdaters at runtime) and 0x6D-0x70 "ToD Specular Color" (the
@@ -173,6 +178,7 @@ impl Generator {
                             f32_le(body, payload + 24),
                         ],
                         scale: [1.0, 1.0, 1.0],
+                        uv_scroll: [0.0, 0.0],
                         color_r_track: None,
                         color_g_track: None,
                         color_b_track: None,
@@ -204,12 +210,44 @@ impl Generator {
             }
             cursor += block_len;
         }
+
+        // Section 3 (offset at body[0x78], the same sectionHeader+offset-16 convention
+        // as the setup section): the per-frame updaters. 0x27/0x28 TextureCoordinateUpdater
+        // each read one f32 UV-translate velocity (research/xim ParticleUpdaters.kt).
+        let mut uv_scroll = [0.0f32; 2];
+        let sec3 = u32_le(body, 0x78) as usize;
+        if sec3 >= 16 && sec3 - 16 < body.len() {
+            let mut cursor = sec3 - 16;
+            while cursor + 4 <= body.len() {
+                let opcode = body[cursor];
+                if opcode == 0x00 {
+                    break;
+                }
+                let size_words = (body[cursor + 1] & 0x1F) as usize;
+                if size_words == 0 {
+                    break;
+                }
+                let block_len = size_words * 4;
+                let payload = cursor + 4;
+                if cursor + block_len > body.len() {
+                    break;
+                }
+                match opcode {
+                    0x27 if payload + 4 <= body.len() => uv_scroll[0] = f32_le(body, payload),
+                    0x28 if payload + 4 <= body.len() => uv_scroll[1] = f32_le(body, payload),
+                    _ => {}
+                }
+                cursor += block_len;
+            }
+        }
+
         Ok(setup.map(|mut def| {
             def.color_r_track = color_r_track;
             def.color_g_track = color_g_track;
             def.color_b_track = color_b_track;
             def.alpha_mult_track = alpha_mult_track;
             def.scale = scale;
+            def.uv_scroll = uv_scroll;
             def
         }))
     }

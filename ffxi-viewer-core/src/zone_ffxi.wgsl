@@ -46,6 +46,7 @@ struct FfxiMaterialFlags {
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var base_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var base_samp: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> material_flags: FfxiMaterialFlags;
+@group(#{MATERIAL_BIND_GROUP}) @binding(5) var<uniform> uv_offset: vec4<f32>;
 // Per-mesh ToD tint: rgb is the cloud/sun-mesh color setter, w an alpha multiplier.
 // White (1,1,1,1) for every non-cloud zone mesh, so this is a no-op there.
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> tint: vec4<f32>;
@@ -138,7 +139,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let has_texture = material_flags.flags.x > 0.5;
     var texel = vec4<f32>(1.0);
     if (has_texture) {
-        texel = textureSample(base_tex, base_samp, in.uv);
+        texel = textureSample(base_tex, base_samp, in.uv + uv_offset.xy);
     }
     // XIM `coloredPixel.a = vertexColor.a * texel.a` (XIM's 4·(va/255)·(ta/255)
     // matches our /128 vertex alpha × remapped texel alpha). Vertex alpha is a

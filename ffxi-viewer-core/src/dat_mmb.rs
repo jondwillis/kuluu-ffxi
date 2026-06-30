@@ -566,6 +566,7 @@ pub fn process_load_mmb_requests(
                                     ),
                                 },
                                 tint: Vec4::ONE,
+                                uv_offset: Vec4::ZERO,
                                 alpha_mode,
                             })
                         })
