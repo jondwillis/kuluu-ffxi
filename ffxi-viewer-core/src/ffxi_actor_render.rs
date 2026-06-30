@@ -1639,6 +1639,20 @@ pub fn tick_morph_in(
     }
 }
 
+// Map an observed entity's broadcast animation byte (server_status / ANIMATIONTYPE)
+// to its persistent rest pose. `/heal` and `/sit` ride the same animation channel
+// the server uses for engage and fishing; SITCHAIR is left unmapped (needs a
+// chair-anchored clip). vendor/server/src/map/entities/baseentity.h.
+fn observed_rest_kind(animation: u8) -> ffxi_actor::actor_state::RestKind {
+    use ffxi_actor::actor_state::RestKind;
+    use ffxi_proto::decode::animation;
+    match animation {
+        animation::HEALING => RestKind::Heal,
+        animation::SIT => RestKind::Sit,
+        _ => RestKind::None,
+    }
+}
+
 pub fn tick_live_ffxi_actors(
     time: Res<Time>,
     state: Res<crate::snapshot::SceneState>,
@@ -1724,6 +1738,17 @@ pub fn tick_live_ffxi_actors(
         })
         .collect();
 
+    // Resting pose for observed players: the server broadcasts /heal and /sit in the
+    // entity's animation byte (server_status), the same channel as engage and fishing.
+    // Self drives its own rest pose from local input (RestStance), so the wire byte is
+    // consulted only for others.
+    let rest_kind_by_id: std::collections::HashMap<u32, RestKind> = state
+        .snapshot
+        .entities
+        .iter()
+        .map(|e| (e.id, observed_rest_kind(e.animation)))
+        .collect();
+
     // Self KO is unreliable via the entity hp_pct (only updated when CHAR_PC
     // carries UPDATE_HP) and via the party row (absent/stale when solo).
     // death_homepoint_secs comes straight from 0x037 CHAR_STATUS hpp==0.
@@ -1765,7 +1790,10 @@ pub fn tick_live_ffxi_actors(
                 combat_stance::RestKind::Heal => RestKind::Heal,
             }
         } else {
-            RestKind::None
+            rest_kind_by_id
+                .get(&world_id)
+                .copied()
+                .unwrap_or(RestKind::None)
         };
 
         let (forward_vel, strafe_vel) = if engaged && !is_self {
@@ -2272,6 +2300,15 @@ mod pose_resolution_tests {
         let idle = resolved_clip_ids(&actor, &inputs_for_pose(PoseState::Idle, false));
         assert_ne!(sit, idle, "/sit must not fall back to idle");
         assert_ne!(kneel, idle, "/kneel must not fall back to idle");
+    }
+
+    #[test]
+    fn observed_rest_kind_maps_broadcast_animation_byte() {
+        use ffxi_proto::decode::animation;
+        assert_eq!(observed_rest_kind(animation::HEALING), RestKind::Heal);
+        assert_eq!(observed_rest_kind(animation::SIT), RestKind::Sit);
+        assert_eq!(observed_rest_kind(animation::NONE), RestKind::None);
+        assert_eq!(observed_rest_kind(animation::ATTACK), RestKind::None);
     }
 
     #[test]
