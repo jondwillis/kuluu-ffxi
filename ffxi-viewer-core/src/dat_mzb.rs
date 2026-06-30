@@ -1208,10 +1208,10 @@ fn spawn_mzb_overlay(
     let water_count = water_groups.len();
     if water_count > 0 {
         let water_mat = materials.add(StandardMaterial {
-            base_color: Color::srgba(0.16, 0.40, 0.52, 0.62),
-            perceptual_roughness: 0.06,
+            base_color: Color::srgba(0.18, 0.36, 0.40, 0.46),
+            perceptual_roughness: 0.08,
             metallic: 0.0,
-            reflectance: 0.55,
+            reflectance: 0.5,
             cull_mode: None,
             alpha_mode: AlphaMode::Blend,
             ..default()
@@ -1245,12 +1245,15 @@ fn spawn_mzb_overlay(
             // Water is real scene content, not debug geometry: tag MzbOverlay
             // (despawn + distance cull) but NOT MzbNonCollisionMesh, so the
             // zone-geom debug toggle (hidden outside `All` mode) never hides it.
+            // NotShadowReceiver: retail water does not take crisp cast shadows
+            // like opaque ground.
             let mut child = commands.spawn((
                 MzbOverlay,
                 Mesh3d(meshes.add(mesh)),
                 MeshMaterial3d(water_mat.clone()),
                 Transform::IDENTITY,
                 Visibility::Inherited,
+                bevy::light::NotShadowReceiver,
                 ChildOf(parent),
             ));
             if req.auto_loaded {
