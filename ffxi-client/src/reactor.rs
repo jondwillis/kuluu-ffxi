@@ -1218,6 +1218,7 @@ mod tests {
                 heading: 0,
                 hp_pct: Some(hp_pct),
                 bt_target_id,
+                face_target: 0,
                 claim_id: 0,
                 speed,
                 speed_base,

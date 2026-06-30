@@ -1702,11 +1702,21 @@ pub fn tick_live_ffxi_actors(
     let present: std::collections::HashSet<u32> =
         state.snapshot.entities.iter().map(|e| e.id).collect();
 
-    let bt_target_by_id: std::collections::HashMap<u32, u32> = state
+    // Head-look: facetarget is a targid (act_index), so resolve it to the world_id
+    // the position maps are keyed by. Distinct from bt_target_id (the combat-claim
+    // UniqueNo), which only turns the head mid-combat and lives in a different
+    // id-space — see vendor/server char_update.cpp Flags0.facetarget.
+    let face_target_by_id: std::collections::HashMap<u32, u16> = state
         .snapshot
         .entities
         .iter()
-        .map(|e| (e.id, e.bt_target_id))
+        .map(|e| (e.id, e.face_target))
+        .collect();
+    let id_by_targid: std::collections::HashMap<u16, u32> = state
+        .snapshot
+        .entities
+        .iter()
+        .map(|e| (e.act_index, e.id))
         .collect();
 
     let engaged_by_id: std::collections::HashMap<u32, bool> = state
@@ -1844,7 +1854,11 @@ pub fn tick_live_ffxi_actors(
         let look_target_id = if is_self {
             target.id
         } else {
-            bt_target_by_id.get(&world_id).copied().filter(|&t| t != 0)
+            face_target_by_id
+                .get(&world_id)
+                .copied()
+                .filter(|&t| t != 0)
+                .and_then(|targid| id_by_targid.get(&targid).copied())
         };
         let look = look_target_id
             .filter(|&tid| tid != world_id)

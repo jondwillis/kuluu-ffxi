@@ -1100,6 +1100,7 @@ mod tests {
             heading: 0,
             hp_pct: None,
             bt_target_id: 0,
+            face_target: 0,
             claim_id: 0,
             speed: 0,
             speed_base: 0,

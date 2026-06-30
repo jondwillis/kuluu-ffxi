@@ -532,6 +532,7 @@ fn handle_sub_packet(
                             heading: head.dir,
                             hp_pct: Some(head.hpp),
                             bt_target_id: head.bt_target_id,
+                            face_target: head.facetarget(),
                             claim_id: 0,
                             speed: head.speed,
                             speed_base: head.speed_base,
@@ -723,6 +724,7 @@ fn handle_sub_packet(
                         heading: head.dir,
                         hp_pct,
                         bt_target_id,
+                        face_target: head.facetarget(),
                         claim_id,
                         speed: head.speed,
                         speed_base: head.speed_base,
@@ -1283,6 +1285,13 @@ async fn keepalive_loop(
     let mut last_emitted_pos: Vec3 = self_pos.pos;
     let mut last_emitted_heading: u8 = self_pos.heading;
 
+    // The targid we broadcast as our head-look (0x015 facetarget) so other clients
+    // turn our head. The session only sees the player's selection via target-bearing
+    // commands (Action/CheckTarget/UseItem), so track the last one; it stays sticky
+    // until the next, and self-heals when the target despawns (renderers can't
+    // resolve a stale targid).
+    let mut self_face_target: u16 = 0;
+
     let mut rubber_band_target: Option<Vec3> = None;
     let mut last_rubber_band_step: std::time::Instant = std::time::Instant::now();
 
@@ -1472,6 +1481,7 @@ async fn keepalive_loop(
                         target_index,
                         kind,
                     }) => {
+                        self_face_target = face_target_for(target_index, self_act_index);
                         let payload =
                             build_subpacket_action(sub_seq, target_id, target_index, &kind);
                         sub_seq = sub_seq.wrapping_add(1);
@@ -1565,6 +1575,7 @@ async fn keepalive_loop(
                         target_index,
                         kind,
                     }) => {
+                        self_face_target = face_target_for(target_index, self_act_index);
                         let payload = build_subpacket_equip_inspect(
                             sub_seq,
                             target_id,
@@ -1636,7 +1647,7 @@ async fn keepalive_loop(
                         target_id,
                         target_index,
                     }) => {
-
+                        self_face_target = face_target_for(target_index, self_act_index);
                         let payload = build_subpacket_item_use(
                             sub_seq,
                             target_id,
@@ -1876,6 +1887,7 @@ async fn keepalive_loop(
                         self_pos.pos.y,
                         self_pos.pos.z,
                         self_pos.heading,
+                        self_face_target,
                     ));
                     sub_seq = sub_seq.wrapping_add(1);
                     last_keepalive_pos = self_pos.pos;
@@ -3367,13 +3379,34 @@ fn build_subpacket_maprect_mh_exit(
     buf
 }
 
-fn build_subpacket_pos(sync: u16, x: f32, y: f32, z: f32, heading: u8) -> Vec<u8> {
+// Head-look targid we broadcast: a target-bearing command aimed at ourselves (or
+// no target) reads as "looking at nothing", which retail encodes as facetarget 0.
+fn face_target_for(target_index: u16, self_act_index: Option<u16>) -> u16 {
+    if target_index == 0 || Some(target_index) == self_act_index {
+        0
+    } else {
+        target_index
+    }
+}
+
+fn build_subpacket_pos(
+    sync: u16,
+    x: f32,
+    y: f32,
+    z: f32,
+    heading: u8,
+    face_target: u16,
+) -> Vec<u8> {
     let mut buf = vec![0u8; 32];
     buf[0..4].copy_from_slice(&build_subpacket_header(0x015, 8, sync));
     buf[4..8].copy_from_slice(&x.to_le_bytes());
     buf[8..12].copy_from_slice(&z.to_le_bytes());
     buf[12..16].copy_from_slice(&y.to_le_bytes());
     buf[20] = heading;
+    // GP_CLI_COMMAND_POS.facetarget (vendor/server/.../c2s/0x015_pos.h): the targid
+    // we're looking at, relayed by the server so other clients turn our head. +21
+    // is the TargetMode/RunMode/GroundMode bitfield, left 0.
+    buf[22..24].copy_from_slice(&face_target.to_le_bytes());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as u32)

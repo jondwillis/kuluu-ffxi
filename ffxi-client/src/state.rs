@@ -157,6 +157,12 @@ pub struct Entity {
     #[serde(default)]
     pub bt_target_id: u32,
 
+    /// Head-look target: the targid (act_index) this entity has selected, from
+    /// PosHead Flags0. Drives the head turn other clients see. Lives in the
+    /// Position block, so preserved across non-position updates (like `pos`).
+    #[serde(default)]
+    pub face_target: u16,
+
     #[serde(default)]
     pub claim_id: u32,
 
@@ -609,17 +615,29 @@ impl SessionState {
                     let preserved_look = entity.look.or(existing.look);
                     let preserved_npc_state = entity.npc_state.or(existing.npc_state);
 
-                    let (preserved_pos, preserved_heading, preserved_speed, preserved_speed_base) =
-                        if *pos_present {
-                            (entity.pos, entity.heading, entity.speed, entity.speed_base)
-                        } else {
-                            (
-                                existing.pos,
-                                existing.heading,
-                                existing.speed,
-                                existing.speed_base,
-                            )
-                        };
+                    let (
+                        preserved_pos,
+                        preserved_heading,
+                        preserved_speed,
+                        preserved_speed_base,
+                        preserved_face_target,
+                    ) = if *pos_present {
+                        (
+                            entity.pos,
+                            entity.heading,
+                            entity.speed,
+                            entity.speed_base,
+                            entity.face_target,
+                        )
+                    } else {
+                        (
+                            existing.pos,
+                            existing.heading,
+                            existing.speed,
+                            existing.speed_base,
+                            existing.face_target,
+                        )
+                    };
                     *existing = Entity {
                         name: preserved_name,
                         kind: merged_kind,
@@ -630,6 +648,7 @@ impl SessionState {
                         heading: preserved_heading,
                         speed: preserved_speed,
                         speed_base: preserved_speed_base,
+                        face_target: preserved_face_target,
                         ..entity.clone()
                     };
                 } else {
@@ -1848,6 +1867,7 @@ mod tests {
                 heading: 64,
                 hp_pct: Some(80),
                 bt_target_id: 0,
+                face_target: 0,
                 claim_id: 0,
                 speed: 0,
                 speed_base: 0,
@@ -1873,6 +1893,7 @@ mod tests {
                 heading: 32,
                 hp_pct: Some(50),
                 bt_target_id: 0,
+                face_target: 0,
                 claim_id: 0,
                 speed: 0,
                 speed_base: 0,
@@ -1955,6 +1976,7 @@ mod tests {
             heading: 0,
             hp_pct: Some(100),
             bt_target_id: 0,
+            face_target: 0,
             claim_id: 0,
             speed: 0,
             speed_base: 0,
@@ -2382,6 +2404,7 @@ mod tests {
                 heading: 64,
                 hp_pct: Some(100),
                 bt_target_id: 0,
+                face_target: 0,
                 claim_id: 0,
                 speed: 40,
                 speed_base: 40,

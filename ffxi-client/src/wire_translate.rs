@@ -272,6 +272,7 @@ pub fn entity_to_wire(e: &Entity) -> wire::Entity {
         heading: e.heading,
         hp_pct: e.hp_pct,
         bt_target_id: e.bt_target_id,
+        face_target: e.face_target,
         claim_id: e.claim_id,
         speed: e.speed,
         speed_base: e.speed_base,
