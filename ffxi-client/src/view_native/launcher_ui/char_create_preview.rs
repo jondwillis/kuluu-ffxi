@@ -28,8 +28,13 @@ const DEBOUNCE: Duration = Duration::from_millis(150);
 const TURNTABLE_RAD_PER_SEC: f32 = 0.3;
 
 const PREVIEW_PARENT_POS: Vec3 = Vec3::new(0.0, 0.0, 0.0);
-const PREVIEW_CAMERA_OFFSET: Vec3 = Vec3::new(0.0, 1.3, 3.0);
-const PREVIEW_LOOK_AT_OFFSET: Vec3 = Vec3::new(0.0, 1.0, 0.0);
+// Slide the camera (and its look-at) left of the model by the same amount so the
+// view axis stays parallel to -Z and the model sits off-centre to the RIGHT of
+// the full-screen preview render, beside the left-aligned create panel rather
+// than behind it. Tune alongside MODEL_AREA_PCT in char_create.rs.
+const MODEL_SCREEN_SHIFT: f32 = 1.05;
+const PREVIEW_CAMERA_OFFSET: Vec3 = Vec3::new(-MODEL_SCREEN_SHIFT, 1.3, 3.0);
+const PREVIEW_LOOK_AT_OFFSET: Vec3 = Vec3::new(-MODEL_SCREEN_SHIFT, 1.0, 0.0);
 
 pub(super) fn register(app: &mut App) {
     app.add_observer(tag_create_preview_meshes)

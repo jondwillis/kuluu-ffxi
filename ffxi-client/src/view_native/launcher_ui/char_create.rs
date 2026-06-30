@@ -12,6 +12,24 @@ use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
 use super::{CharCreateError, CharCreateField, CharCreateForm, LauncherState, ServerInfo};
 
+// The create screen reserves the right MODEL_AREA_PCT of the width for the 3D
+// character preview (char_create_preview.rs frames the model into it), centring
+// the form panel in the remaining left space so the model sits beside the panel
+// rather than behind it. Tune alongside MODEL_SCREEN_SHIFT in char_create_preview.
+const MODEL_AREA_PCT: f32 = 40.0;
+
+fn char_create_root() -> impl Bundle {
+    Node {
+        width: Val::Percent(100.0),
+        height: Val::Percent(100.0),
+        flex_direction: FlexDirection::Column,
+        justify_content: JustifyContent::Center,
+        align_items: AlignItems::Center,
+        padding: UiRect::right(Val::Percent(MODEL_AREA_PCT)),
+        ..default()
+    }
+}
+
 pub(super) const RACES: &[(u8, &str)] = &[
     (1, "Hume M"),
     (2, "Hume F"),
@@ -76,7 +94,7 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<CharCreateForm>, server
     let initial_msg = form.validation_msg().unwrap_or_default();
 
     commands
-        .spawn((CharCreateRoot, screen_root()))
+        .spawn((CharCreateRoot, char_create_root()))
         .with_children(|root| {
             spawn_breadcrumb(
                 root,

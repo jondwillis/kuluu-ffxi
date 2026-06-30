@@ -333,6 +333,17 @@ fn pc_equipment_file_ids(slot: &CharSlot) -> Vec<u32> {
     equipment
 }
 
+// A freshly-created character wears no gear, but FFXI still draws the naked
+// default body: each clothing slot's model id 0, slot-prefixed (slot_index << 12)
+// so resolve_equipment_slot tags it to the per-race base instead of reading the
+// prefix as "empty". Head and weapons stay 0 (truly empty) so the chosen hair
+// shows and no weapon is held. Mirrors ffxi_actor_render::default_pc_equipment.
+const SLOT_PREFIX_SHIFT: u16 = 12;
+const NAKED_BODY: u16 = 2 << SLOT_PREFIX_SHIFT;
+const NAKED_HANDS: u16 = 3 << SLOT_PREFIX_SHIFT;
+const NAKED_LEGS: u16 = 4 << SLOT_PREFIX_SHIFT;
+const NAKED_FEET: u16 = 5 << SLOT_PREFIX_SHIFT;
+
 pub(super) fn spawn_preview_pc(
     commands: &mut Commands,
     parent: Entity,
@@ -346,6 +357,20 @@ pub(super) fn spawn_preview_pc(
         return 0;
     }
     spawn_equipped(
-        commands, meshes, materials, images, parent, race, face, 0, 0, 0, 0, 0, 0, 0, 0,
+        commands,
+        meshes,
+        materials,
+        images,
+        parent,
+        race,
+        face,
+        0,
+        NAKED_BODY,
+        NAKED_HANDS,
+        NAKED_LEGS,
+        NAKED_FEET,
+        0,
+        0,
+        0,
     )
 }
