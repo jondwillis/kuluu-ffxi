@@ -5,6 +5,10 @@
 # Node / abandoned scaffolds
 **/node_modules/
 
+# Python bytecode (scripts/*.py)
+**/__pycache__/
+*.pyc
+
 # OS / editor
 .DS_Store
 *.swp
