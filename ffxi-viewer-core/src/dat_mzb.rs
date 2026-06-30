@@ -376,13 +376,13 @@ pub struct WaterSpec {
     pub auto_loaded: bool,
 }
 
-// MZB load computes pond extents (CPU-side) and queues them here; spawn_zone_water
-// drains it the same frame, picking the simple plane or enhanced bevy_water mesh
-// per the live GraphicsSettings. Decoupling the spawn from spawn_mzb_overlay keeps
-// the `enhanced-water` feature-gated material code in one system.
+// MZB load computes per-placement water footprints (CPU-side) and queues them
+// here; spawn_zone_water streams them in distance-gated and nearest-first, like
+// the MMB visual models (process_load_mmb_requests), instead of spawning the whole
+// zone's water at once. Cleared on zone change in auto_load_zone_geometry_system.
 #[derive(Resource, Default)]
 pub struct PendingWaterSpawns {
-    pub specs: Vec<WaterSpec>,
+    pub specs: std::collections::VecDeque<WaterSpec>,
 }
 
 #[derive(Message, Debug, Clone, Copy)]
@@ -1052,12 +1052,21 @@ fn build_water_surface_mesh(spec: &WaterSpec) -> Mesh {
 // GraphicsSettings toggle is on — bevy_water's animated material on the same
 // footprint mesh. Reads the setting at drain time, so a toggle change takes
 // effect on the next zone (re)load.
+fn water_dist_sq_xz(spec: &WaterSpec, self_pos: Vec3) -> f32 {
+    let cx = 0.5 * (spec.min.x + spec.max.x);
+    let cz = 0.5 * (spec.min.z + spec.max.z);
+    let dx = cx - self_pos.x;
+    let dz = cz - self_pos.z;
+    dx * dx + dz * dz
+}
+
 pub fn spawn_zone_water(
     mut commands: Commands,
     mut pending: ResMut<PendingWaterSpawns>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     settings: Res<crate::graphics::GraphicsSettings>,
+    self_q: Query<&GlobalTransform, With<IsSelf>>,
     #[cfg(feature = "enhanced-water")] mut water_materials: ResMut<
         Assets<crate::water_enhanced::StandardWaterMaterial>,
     >,
@@ -1065,13 +1074,41 @@ pub fn spawn_zone_water(
     if pending.specs.is_empty() {
         return;
     }
-    let specs = std::mem::take(&mut pending.specs);
+
+    let self_pos = self_q.single().ok().map(|t| t.translation());
+    if let Some(self_pos) = self_pos {
+        pending.specs.make_contiguous().sort_by(|a, b| {
+            water_dist_sq_xz(a, self_pos).total_cmp(&water_dist_sq_xz(b, self_pos))
+        });
+    }
+    let load_radius = settings.view_distance * MMB_LOAD_DISTANCE_MARGIN;
+    let load_radius_sq = load_radius * load_radius;
     let enhanced = cfg!(feature = "enhanced-water") && settings.enhanced_water;
     let simple_mat = materials.add(simple_water_material());
 
-    for spec in specs {
-        let mesh = Mesh3d(meshes.add(build_water_surface_mesh(&spec)));
+    const WATER_SPAWN_BUDGET: usize = 32;
+    let mut spawned = 0usize;
+    let mut retained: std::collections::VecDeque<WaterSpec> =
+        std::collections::VecDeque::with_capacity(pending.specs.len());
 
+    while let Some(spec) = pending.specs.pop_front() {
+        if let Some(self_pos) = self_pos {
+            // Sorted nearest-first, so the first out-of-range spec means the rest
+            // are too — retain them all for when the player moves closer.
+            if water_dist_sq_xz(&spec, self_pos) > load_radius_sq {
+                retained.push_back(spec);
+                retained.append(&mut pending.specs);
+                break;
+            }
+        }
+        if spawned >= WATER_SPAWN_BUDGET {
+            retained.push_back(spec);
+            continue;
+        }
+        spawned += 1;
+
+        let mesh = Mesh3d(meshes.add(build_water_surface_mesh(&spec)));
+        let mut e;
         #[cfg(feature = "enhanced-water")]
         if enhanced {
             let mat = crate::water_enhanced::pond_water_material(
@@ -1079,7 +1116,7 @@ pub fn spawn_zone_water(
                 spec.min,
                 spec.max,
             );
-            let mut e = commands.spawn((
+            e = commands.spawn((
                 MzbOverlay,
                 WaterPlane,
                 mesh,
@@ -1095,7 +1132,7 @@ pub fn spawn_zone_water(
             continue;
         }
 
-        let mut e = commands.spawn((
+        e = commands.spawn((
             MzbOverlay,
             WaterPlane,
             mesh,
@@ -1109,6 +1146,7 @@ pub fn spawn_zone_water(
             e.insert(AutoMzbOverlay);
         }
     }
+    pending.specs = retained;
     let _ = enhanced;
 }
 
@@ -1315,15 +1353,10 @@ fn spawn_mzb_overlay(
             ),
         );
 
-    #[derive(Default)]
-    struct WaterAccum {
-        positions: Vec<[f32; 3]>,
-        indices: Vec<u32>,
-        min: Vec3,
-        max: Vec3,
-    }
-    let mut water_groups: std::collections::HashMap<i32, WaterAccum> =
-        std::collections::HashMap::new();
+    // One localized footprint per water-material placement (NOT merged by height),
+    // so spawn_zone_water can distance-gate each like an MMB placement. Merging the
+    // whole zone's water into one mesh would make it un-streamable.
+    let mut water_added = 0usize;
     for inst in instances.iter() {
         let Some(h_bevy) = inst.water_height_bevy else {
             continue;
@@ -1333,13 +1366,9 @@ fn spawn_mzb_overlay(
             continue;
         }
 
-        let key = (h_bevy * 1000.0).round() as i32;
-        let acc = water_groups.entry(key).or_insert_with(|| WaterAccum {
-            min: Vec3::splat(f32::INFINITY),
-            max: Vec3::splat(f32::NEG_INFINITY),
-            ..Default::default()
-        });
-        let base = acc.positions.len() as u32;
+        let mut positions: Vec<[f32; 3]> = Vec::with_capacity(sub.positions.len());
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
         for v in &sub.positions {
             let p = inst
                 .bevy_transform
@@ -1347,31 +1376,28 @@ fn spawn_mzb_overlay(
             // Flatten to the flat water surface; keep world XZ to follow the
             // actual shoreline rather than a bounding box.
             let flat = [p.x, h_bevy, p.z];
-            acc.min = acc.min.min(Vec3::from_array(flat));
-            acc.max = acc.max.max(Vec3::from_array(flat));
-            acc.positions.push(flat);
+            min = min.min(Vec3::from_array(flat));
+            max = max.max(Vec3::from_array(flat));
+            positions.push(flat);
         }
-        acc.indices.extend(sub.indices.iter().map(|i| i + base));
+        pending_water.specs.push_back(WaterSpec {
+            positions,
+            indices: sub.indices.clone(),
+            min,
+            max,
+            parent,
+            auto_loaded: req.auto_loaded,
+        });
+        water_added += 1;
     }
-    let water_count = water_groups.len();
-    if water_count > 0 {
-        for (_height_key, acc) in water_groups {
-            pending_water.specs.push(WaterSpec {
-                positions: acc.positions,
-                indices: acc.indices,
-                min: acc.min,
-                max: acc.max,
-                parent,
-                auto_loaded: req.auto_loaded,
-            });
-        }
+    if water_added > 0 {
         push_system_msg(
             toasts,
             format!(
-                "/load_mzb {}: {} water surface{} spawned",
+                "/load_mzb {}: {} water surface{} queued",
                 req.file_id,
-                water_count,
-                if water_count == 1 { "" } else { "s" },
+                water_added,
+                if water_added == 1 { "" } else { "s" },
             ),
         );
     }
@@ -1421,6 +1447,7 @@ pub fn auto_load_zone_geometry_system(
     mut mzb_in_flight: ResMut<LoadMzbInFlight>,
     mut mmb_queue: ResMut<crate::dat_mmb::MmbLoadQueue>,
     mut mmb_in_flight: ResMut<crate::dat_mmb::MmbLoadInFlight>,
+    mut pending_water: ResMut<PendingWaterSpawns>,
 ) {
     let current = scene_state.snapshot.zone_id;
     if current == last.zone_id {
@@ -1440,6 +1467,9 @@ pub fn auto_load_zone_geometry_system(
         .pending
         .retain(|r| !(r.entity_id.is_none() && r.world_transform.is_some()));
     mmb_in_flight.tasks.clear();
+    // Drop any old-zone water footprints still queued for streaming; the spawned
+    // ones go with the despawned AutoMzbOverlay parent above.
+    pending_water.specs.clear();
     last.zone_id = current;
     let Some(zone_id) = current else { return };
 
