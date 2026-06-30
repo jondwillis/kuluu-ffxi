@@ -234,6 +234,7 @@ pub enum GraphicsField {
     CharacterLighting,
 
     CharacterShadowReceive,
+    CharacterShadowCast,
 
     DepthOfField,
     DofAperture,
@@ -266,6 +267,7 @@ impl GraphicsField {
             GraphicsField::LightFlicker => "  Flicker",
             GraphicsField::CharacterLighting => "Model Lighting",
             GraphicsField::CharacterShadowReceive => "Model Shadows",
+            GraphicsField::CharacterShadowCast => "Model Shadow Casting",
             GraphicsField::DepthOfField => "Depth of Field",
             GraphicsField::DofAperture => "DoF Aperture",
             GraphicsField::ZoneLineDisplay => "Zone Lines",
@@ -332,6 +334,9 @@ pub struct GraphicsSettings {
     #[serde(default = "default_faithful_shadow_receive")]
     pub faithful_shadow_receive: bool,
 
+    #[serde(default = "default_character_shadow_cast")]
+    pub character_shadow_cast: bool,
+
     #[serde(default)]
     pub depth_of_field: bool,
 
@@ -372,6 +377,9 @@ fn default_light_flicker() -> bool {
     DEFAULT_LIGHT_FLICKER
 }
 fn default_faithful_shadow_receive() -> bool {
+    true
+}
+fn default_character_shadow_cast() -> bool {
     true
 }
 fn default_dof_aperture() -> f32 {
@@ -470,6 +478,7 @@ impl GraphicsSettings {
                 character_render_path: CharacterRenderPath::FfxiFaithful,
                 realistic_character_lighting: false,
                 faithful_shadow_receive: true,
+                character_shadow_cast: false,
                 depth_of_field: false,
                 dof_aperture_f_stops: DEFAULT_DOF_APERTURE,
                 zone_line_display: ZoneLineDisplay::Off,
@@ -497,6 +506,7 @@ impl GraphicsSettings {
                 character_render_path: CharacterRenderPath::FfxiFaithful,
                 realistic_character_lighting: false,
                 faithful_shadow_receive: true,
+                character_shadow_cast: false,
                 depth_of_field: false,
                 dof_aperture_f_stops: DEFAULT_DOF_APERTURE,
                 zone_line_display: ZoneLineDisplay::Off,
@@ -524,6 +534,7 @@ impl GraphicsSettings {
                 character_render_path: CharacterRenderPath::FfxiFaithful,
                 realistic_character_lighting: false,
                 faithful_shadow_receive: true,
+                character_shadow_cast: true,
                 depth_of_field: false,
                 dof_aperture_f_stops: DEFAULT_DOF_APERTURE,
                 zone_line_display: ZoneLineDisplay::Off,
@@ -555,6 +566,7 @@ impl GraphicsSettings {
                 character_render_path: CharacterRenderPath::FfxiFaithful,
                 realistic_character_lighting: false,
                 faithful_shadow_receive: true,
+                character_shadow_cast: true,
                 depth_of_field: false,
                 dof_aperture_f_stops: DEFAULT_DOF_APERTURE,
                 zone_line_display: ZoneLineDisplay::Off,
@@ -620,6 +632,7 @@ impl GraphicsSettings {
             GraphicsField::CharacterShadowReceive => {
                 bool_label(self.faithful_shadow_receive).into()
             }
+            GraphicsField::CharacterShadowCast => bool_label(self.character_shadow_cast).into(),
             GraphicsField::DepthOfField => bool_label(self.depth_of_field).into(),
             GraphicsField::DofAperture => format!("f/{:.1}", self.dof_aperture_f_stops),
             GraphicsField::ZoneLineDisplay => self.zone_line_display.label().to_string(),
@@ -739,6 +752,10 @@ impl GraphicsSettings {
             }
             GraphicsField::CharacterShadowReceive => {
                 self.faithful_shadow_receive = !self.faithful_shadow_receive;
+            }
+            GraphicsField::CharacterShadowCast => {
+                self.character_shadow_cast = !self.character_shadow_cast;
+                self.preset = QualityPreset::Custom;
             }
             GraphicsField::DepthOfField => {
                 self.depth_of_field = !self.depth_of_field;
