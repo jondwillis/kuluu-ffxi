@@ -5,6 +5,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use ffxi_dat::item_dat::ItemTable;
 use ffxi_dat::DatRoot;
 
 #[derive(Resource, Default, Clone)]
@@ -12,9 +13,9 @@ pub struct ItemDatRoot(pub Option<Arc<DatRoot>>);
 
 #[derive(Resource, Default)]
 pub struct ItemIconCache {
-    dat: Option<Arc<Vec<u8>>>,
+    table: Option<Arc<ItemTable>>,
 
-    dat_unavailable: bool,
+    unavailable: bool,
 
     icons: HashMap<u16, Option<Handle<Image>>>,
 }
@@ -30,53 +31,41 @@ impl ItemIconCache {
             return slot.clone();
         }
         let handle = self
-            .dat_bytes(dat_root)
-            .and_then(|bytes| ffxi_dat::item_dat::icon_at(&bytes, item_no))
+            .table(dat_root)
+            .and_then(|t| t.icon(item_no))
             .map(|img| upload_icon(img, images));
         self.icons.insert(item_no, handle.clone());
         handle
     }
 
-    fn dat_bytes(&mut self, dat_root: &ItemDatRoot) -> Option<Arc<Vec<u8>>> {
-        if let Some(bytes) = &self.dat {
-            return Some(bytes.clone());
+    /// The resolved retail item database, built lazily once a DAT root is
+    /// available. Returns `None` until then (and latches off only when the root
+    /// exists but holds no readable item DATs), so the first frame with a root
+    /// retries.
+    pub fn table(&mut self, dat_root: &ItemDatRoot) -> Option<Arc<ItemTable>> {
+        if let Some(table) = &self.table {
+            return Some(table.clone());
         }
-        if self.dat_unavailable {
+        if self.unavailable {
             return None;
         }
         let root = dat_root.0.as_ref()?;
-
-        let loaded = ffxi_dat::item_dat::ITEM_DAT_FILE_ID
-            .iter()
-            .find_map(|&file_id| {
-                let path = root.resolve(file_id).ok()?.path_under(root.root());
-                let bytes = std::fs::read(path).ok()?;
-                (bytes.len() % ffxi_dat::item_dat::ITEM_BLOCK_STRIDE == 0 && !bytes.is_empty())
-                    .then_some(bytes)
-            });
-        match loaded {
-            Some(bytes) => {
-                let arc = Arc::new(bytes);
-                self.dat = Some(arc.clone());
-                Some(arc)
-            }
-            None => {
-                warn!(
-                    "item icons: no item DAT in {:?} resolved/readable; label-only fallback",
-                    ffxi_dat::item_dat::ITEM_DAT_FILE_ID
-                );
-                self.dat_unavailable = true;
-                None
-            }
+        let table = ItemTable::open(root.root());
+        if table.is_empty() {
+            warn!(
+                "item DAT: no item tables under {:?}; label-only fallback",
+                root.root()
+            );
+            self.unavailable = true;
+            return None;
         }
+        let arc = Arc::new(table);
+        self.table = Some(arc.clone());
+        Some(arc)
     }
 
-    pub fn dat_unavailable(&self) -> bool {
-        self.dat_unavailable
-    }
-
-    pub fn dat_bytes_for_static(&mut self, dat_root: &ItemDatRoot) -> Option<Arc<Vec<u8>>> {
-        self.dat_bytes(dat_root)
+    pub fn unavailable(&self) -> bool {
+        self.unavailable
     }
 }
 
@@ -107,7 +96,7 @@ mod tests {
     fn cache_without_root_does_not_latch() {
         let mut cache = ItemIconCache::default();
         let root = ItemDatRoot(None);
-        assert!(cache.dat_bytes(&root).is_none());
-        assert!(!cache.dat_unavailable, "must retry once root is provided");
+        assert!(cache.table(&root).is_none());
+        assert!(!cache.unavailable, "must retry once root is provided");
     }
 }

@@ -1,6 +1,22 @@
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
 use crate::map_image::{self, GraphicImage};
 
-pub const ITEM_DAT_FILE_ID: &[u32] = &[0x0DA9, 0x0DAA, 0x0DAB, 0x0DAC];
+// Retail packs item data into per-type DATs, each a gap-free ascending array of
+// 0xC00 blocks keyed by item id. Paths and split match XIM's InventoryItems
+// (research/xim/.../InventoryItemParser.kt:262-270), itself a port of Windower
+// POLUtils Item.cs. Block index within a file is `item_id - base_id`, where
+// base_id is the id stored in the file's first block.
+pub const ITEM_DAT_ROM_PATHS: &[&str] = &[
+    "ROM/118/106.DAT", // general items     0x0000..
+    "ROM/118/107.DAT", // usable items      0x1000..
+    "ROM/118/108.DAT", // weapons           0x4000..
+    "ROM/118/109.DAT", // armor             0x2800..
+    "ROM/174/48.DAT",  // currency
+    "ROM/286/73.DAT",  // armor (expansions)
+    "ROM/301/115.DAT", // items (expansions)
+];
 
 pub const ITEM_BLOCK_STRIDE: usize = 0xC00;
 
@@ -53,7 +69,10 @@ fn is_equipment(item_id: u32) -> bool {
 
 pub fn lookup(dat_bytes: &[u8], item_id: u16) -> Option<ItemStatic> {
     let block = decoded_block(dat_bytes, item_id)?;
+    decode_item_static(&block)
+}
 
+fn decode_item_static(block: &[u8]) -> Option<ItemStatic> {
     let stored_id = read_u32_le(block.get(0x00..0x04)?);
     let flags = read_u16_le(block.get(0x04..0x06)?);
     let item_type = read_u16_le(block.get(0x08..0x0A)?);
@@ -92,8 +111,8 @@ pub fn lookup(dat_bytes: &[u8], item_id: u16) -> Option<ItemStatic> {
             (0, 0, 0, 0, 0, 0)
         };
 
-    let (name, description) = read_item_strings(&block).unwrap_or_default();
-    let icon = decode_icon(&block);
+    let (name, description) = read_item_strings(block).unwrap_or_default();
+    let icon = decode_icon(block);
 
     Some(ItemStatic {
         name,
@@ -113,6 +132,90 @@ pub fn lookup(dat_bytes: &[u8], item_id: u16) -> Option<ItemStatic> {
 pub fn icon_at(dat_bytes: &[u8], item_id: u16) -> Option<GraphicImage> {
     let block = decoded_block(dat_bytes, item_id)?;
     decode_icon(&block)
+}
+
+struct ItemDatFile {
+    path: PathBuf,
+    base: u16,
+    blocks: usize,
+}
+
+/// The retail item database resolved across the per-type DATs. Each file is a
+/// gap-free ascending array of 0xC00 blocks, so a lookup is `O(1)`: pick the
+/// file whose `[base, base + blocks)` covers the id, then read block
+/// `id - base`. Blocks are read on demand (and decoded with the per-byte
+/// rotate-right-5 obfuscation), so the table itself stays tiny.
+pub struct ItemTable {
+    files: Vec<ItemDatFile>,
+}
+
+impl ItemTable {
+    /// Open every available item DAT under `root_dir` (the retail install root).
+    /// Missing or malformed files are skipped, so a partial install still yields
+    /// whatever ranges it has.
+    pub fn open(root_dir: &Path) -> ItemTable {
+        let mut files = Vec::new();
+        for rel in ITEM_DAT_ROM_PATHS {
+            let path = root_dir.join(rel);
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let len = meta.len() as usize;
+            if len == 0 || !len.is_multiple_of(ITEM_BLOCK_STRIDE) {
+                continue;
+            }
+            let Some(base) = read_block_id(&path, 0) else {
+                continue;
+            };
+            files.push(ItemDatFile {
+                path,
+                base,
+                blocks: len / ITEM_BLOCK_STRIDE,
+            });
+        }
+        ItemTable { files }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    fn block(&self, item_id: u16) -> Option<Vec<u8>> {
+        let file = self
+            .files
+            .iter()
+            .find(|f| item_id >= f.base && ((item_id - f.base) as usize) < f.blocks)?;
+        let offset = (item_id - file.base) as usize * ITEM_BLOCK_STRIDE;
+        let mut block = read_at(&file.path, offset, ITEM_BLOCK_STRIDE)?;
+        for b in block.iter_mut() {
+            *b = rotate_byte_right(*b, ITEM_BLOCK_SHIFT);
+        }
+        (read_u32_le(block.get(0x00..0x04)?) as u16 == item_id).then_some(block)
+    }
+
+    pub fn lookup(&self, item_id: u16) -> Option<ItemStatic> {
+        decode_item_static(&self.block(item_id)?)
+    }
+
+    pub fn icon(&self, item_id: u16) -> Option<GraphicImage> {
+        decode_icon(&self.block(item_id)?)
+    }
+}
+
+fn read_at(path: &Path, offset: usize, len: usize) -> Option<Vec<u8>> {
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(offset as u64)).ok()?;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn read_block_id(path: &Path, block_index: usize) -> Option<u16> {
+    let mut head = read_at(path, block_index * ITEM_BLOCK_STRIDE, 4)?;
+    for b in head.iter_mut() {
+        *b = rotate_byte_right(*b, ITEM_BLOCK_SHIFT);
+    }
+    Some(read_u32_le(&head) as u16)
 }
 
 fn is_weapon(item_id: u32) -> bool {

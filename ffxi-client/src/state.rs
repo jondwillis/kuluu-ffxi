@@ -844,7 +844,12 @@ impl SessionState {
                 container_index,
             } => {
                 if let Some(cell) = self.equipment.get_mut(*slot as usize) {
-                    *cell = Some(EquippedRef {
+                    // The server reports an empty/unequipped slot as inventory
+                    // index 0 (charutils.cpp:2268 queueEquipChange(LOC_INVENTORY,
+                    // 0, ...)). Index 0 is reserved (Gil in LOC_INVENTORY) and is
+                    // never a real equipped item, so treat it as cleared — else
+                    // resolve_equipment joins it to Gil.
+                    *cell = (*container_index != 0).then_some(EquippedRef {
                         container: *container,
                         container_index: *container_index,
                     });
@@ -1665,6 +1670,32 @@ mod tests {
             to: 231,
         });
         assert_eq!(s.current_weather, None);
+    }
+
+    #[test]
+    fn equip_updated_index_zero_clears_slot() {
+        let mut s = SessionState::default();
+        // Equip something in the waist slot (10).
+        s.apply_event(&AgentEvent::EquipUpdated {
+            slot: 10,
+            container: 0,
+            container_index: 7,
+        });
+        assert_eq!(
+            s.equipment[10],
+            Some(EquippedRef {
+                container: 0,
+                container_index: 7
+            })
+        );
+        // Server reports an unequipped slot as inventory index 0 (= Gil); the
+        // slot must clear, not point at inventory slot 0.
+        s.apply_event(&AgentEvent::EquipUpdated {
+            slot: 10,
+            container: 0,
+            container_index: 0,
+        });
+        assert_eq!(s.equipment[10], None, "index 0 = empty, not Gil");
     }
 
     #[test]

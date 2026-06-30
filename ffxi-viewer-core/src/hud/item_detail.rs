@@ -65,8 +65,11 @@ fn mmss(secs: u16) -> String {
     format!("{m}:{s:02}")
 }
 
-pub(crate) fn lookup_static(dat_bytes: &[u8], item_no: u16) -> Option<ItemStatic> {
-    let s = ffxi_dat::item_dat::lookup(dat_bytes, item_no)?;
+pub(crate) fn lookup_static(
+    table: &ffxi_dat::item_dat::ItemTable,
+    item_no: u16,
+) -> Option<ItemStatic> {
+    let s = table.lookup(item_no)?;
     Some(ItemStatic {
         name: s.name,
         description: s.description,
@@ -116,11 +119,13 @@ fn format_jobs(jobs_mask: u32) -> String {
     if jobs_mask == 0 {
         return "All".to_string();
     }
-    // LSB item_equipment.jobs is 1-indexed: bit (job - 1) is set for an equippable job.
-    // vendor/server/src/map/utils/charutils.cpp:2313 — getJobs() & (1 << (GetMJob() - 1))
+    // The *client item DAT* jobs field is 0-indexed (bit == job id), unlike LSB's
+    // item_equipment.jobs which is 1-indexed (bit == job - 1). Verified: White
+    // Belt (MNK-only, job 2) has DAT jobs 0x04 = bit 2. This consumes the DAT
+    // mask, so do NOT apply the -1 used by equip_info::fits_job.
     let parts: Vec<String> = (0..32u32)
         .filter(|bit| jobs_mask & (1 << bit) != 0)
-        .map(|bit| job_abbrev(bit as u8 + 1))
+        .map(|bit| job_abbrev(bit as u8))
         .collect();
     if parts.is_empty() {
         "All".to_string()
@@ -528,8 +533,8 @@ fn icon_cache_static(
     dat_root: &ItemDatRoot,
     item_no: u16,
 ) -> Option<ItemStatic> {
-    let bytes = cache.dat_bytes_for_static(dat_root)?;
-    lookup_static(&bytes, item_no)
+    let table = cache.table(dat_root)?;
+    lookup_static(&table, item_no)
 }
 
 fn format_counts(
@@ -627,11 +632,12 @@ mod tests {
     fn jobs_all_when_unrestricted() {
         assert_eq!(format_jobs(0), "All");
 
-        // LSB item_equipment.jobs is 1-indexed: bit (job-1) is the job.
-        // bit 0 = WAR (job 1), bit 1 = MNK (job 2), bit 3 = BLM (job 4).
-        assert_eq!(format_jobs(1 << 0), "WAR");
-        assert_eq!(format_jobs(1 << 1), "MNK");
-        assert_eq!(format_jobs((1 << 0) | (1 << 3)), "WAR/BLM");
+        // The client item DAT jobs field is 0-indexed (bit == job id).
+        // bit 1 = WAR (job 1), bit 2 = MNK (job 2) — White Belt's DAT jobs is
+        // 0x04 = bit 2 = MNK. bit 4 = BLM (job 4).
+        assert_eq!(format_jobs(1 << 1), "WAR");
+        assert_eq!(format_jobs(1 << 2), "MNK");
+        assert_eq!(format_jobs((1 << 1) | (1 << 4)), "WAR/BLM");
     }
 
     #[test]

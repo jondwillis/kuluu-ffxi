@@ -735,8 +735,8 @@ fn compose_focus_detail(
         return ("Select an item.".to_string(), Vec::new());
     };
     let dat = icon_cache
-        .dat_bytes_for_static(dat_root)
-        .and_then(|bytes| item_detail::lookup_static(&bytes, item_no));
+        .table(dat_root)
+        .and_then(|table| item_detail::lookup_static(&table, item_no));
     let detail = item_meta::compose_item_detail(item_no, snap, dat.clone());
     let name = dat
         .as_ref()
