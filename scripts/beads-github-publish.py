@@ -168,6 +168,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", default=os.environ.get("REPO", "jondwillis/kuluu-ffxi"))
     ap.add_argument("--all", action="store_true", help="publish every bead, not just the filtered set")
+    ap.add_argument(
+        "--prune-unmarked",
+        action="store_true",
+        help="close any OPEN issue that has no beads-id marker (one-time migration off "
+        "the legacy ROADMAP-derived issues). Skips hand-filed issues only if they carry "
+        "a marker, so use deliberately.",
+    )
     ap.add_argument("--dry-run", action="store_true", default=os.environ.get("DRY_RUN") == "1")
     args = ap.parse_args()
 
@@ -245,9 +252,25 @@ def main() -> int:
             gh(["issue", "reopen", num, "--repo", args.repo], dry=dry)
             reopened += 1
 
+    pruned = 0
+    if args.prune_unmarked:
+        # Read-only list always runs (even in dry); the close respects dry.
+        out = gh(
+            ["issue", "list", "--repo", args.repo, "--state", "open",
+             "--limit", "1000", "--json", "number,body"],
+            capture=True,
+        )
+        for issue in json.loads(out or "[]"):
+            if "<!-- beads-id:" in (issue.get("body") or ""):
+                continue
+            num = str(issue["number"])
+            print(f"   prune:  #{num} (no beads-id marker)")
+            gh(["issue", "close", num, "--repo", args.repo, "--reason", "not planned"], dry=dry)
+            pruned += 1
+
     print(
         f">> done. created={created} updated={updated} closed={closed} "
-        f"reopened={reopened} skipped(closed,unpublished)={skipped}"
+        f"reopened={reopened} pruned={pruned} skipped(closed,unpublished)={skipped}"
     )
     if dry:
         print(">> (dry run — GitHub was not modified)")
