@@ -181,7 +181,7 @@ pub fn load_npc(file_id: u32) -> Result<LoadedActor, String> {
 fn default_pc_equipment(race: u8) -> Vec<u32> {
     use crate::look_resolver::{resolve_equipment_slot, resolve_face};
     let mut out = Vec::new();
-    if let Some(f) = resolve_face(1, race) {
+    if let Some(f) = resolve_face(0, race) {
         out.push(f);
     }
 
@@ -251,6 +251,17 @@ pub fn load_pc(
         anim_dirs.push(ResourceDir::from_bytes(bytes));
     }
     debug!("load_pc race={race}: equipment {equip_trace:?}");
+    // A slot that resolved to a file but yielded no mesh renders as a missing
+    // body part (e.g. a headless PC when a head model fails to load) — surface it
+    // instead of silently dropping at debug level.
+    let dropped: Vec<u32> = equip_trace
+        .iter()
+        .filter(|(_, status)| *status != "ok")
+        .map(|&(file_id, _)| file_id)
+        .collect();
+    if !dropped.is_empty() {
+        warn!("load_pc race={race}: equipment files resolved but unrendered {dropped:?}");
+    }
 
     let weapon_anim_type = main_weapon
         .and_then(|wf| read_dat(&root, wf))

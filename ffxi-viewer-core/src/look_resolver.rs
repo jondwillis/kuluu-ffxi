@@ -525,13 +525,23 @@ const PC_MODEL_IDS: [[Breakpoints; 9]; 8] = [
 ];
 
 pub fn resolve_face(face: u8, race: u8) -> Option<u32> {
-    if race == 0 || race > 8 || face > 32 {
+    // The face byte is the 0-based index into the per-race Face sub-table (slot 0
+    // of the FFXiMain.dll equipment lookup): file = base + face, no -1. LSB caps
+    // creation faces at 15 ("Face 8B", vendor/server/src/login/login_helpers.cpp),
+    // the stylist spans the full slot; xim EquipmentModelTable.getItemModelPath
+    // indexes the Face slot directly the same way. PC_MODEL_IDS slot 0 is the
+    // single source for base/count — `[(0, base), (count, 0)]` — so don't
+    // hand-duplicate the bases.
+    if race == 0 || race > 8 {
         return None;
     }
-
-    let face = if face == 0 { 1 } else { face };
-    const FACE_BASE: [u32; 8] = [7080, 10256, 13432, 16608, 19784, 22960, 23184, 26360];
-    Some(FACE_BASE[(race - 1) as usize] + u32::from(face) - 1)
+    let face_band = PC_MODEL_IDS[(race - 1) as usize][0];
+    let base = face_band.first()?.1;
+    let count = face_band.get(1).map_or(u16::MAX, |&(thr, _)| thr);
+    if base == 0 || u16::from(face) >= count {
+        return None;
+    }
+    Some(base + u32::from(face))
 }
 
 pub fn dispatch_look_driven_models(
@@ -725,5 +735,30 @@ mod tests {
     #[test]
     fn equipment_rejects_high_race_codes() {
         assert_eq!(resolve_equipment_slot(0x2004, 29), None);
+    }
+
+    #[test]
+    fn face_is_zero_based_direct_index() {
+        // xim EquipmentModelTable indexes the Face slot directly: file = base + face.
+        // HumeM face base is 7080 (PC_MODEL_IDS[0][0]).
+        assert_eq!(resolve_face(0, 1), Some(7080));
+        assert_eq!(resolve_face(1, 1), Some(7081));
+        assert_eq!(resolve_face(17, 1), Some(7097));
+        // Mithra (race 7) face base is 23184.
+        assert_eq!(resolve_face(0, 7), Some(23184));
+        // Face 8B == 15 is LSB's creation maximum.
+        assert_eq!(resolve_face(15, 7), Some(23199));
+    }
+
+    #[test]
+    fn face_band_boundaries() {
+        // 32 face entries (0..31); index 31 is the last face file, 32 collides
+        // with the head slot (HumeM head base 7112).
+        assert_eq!(resolve_face(31, 1), Some(7111));
+        assert_eq!(resolve_face(32, 1), None);
+        assert_eq!(resolve_equipment_slot(0x1000, 1), Some(7112));
+        // Invalid races reject.
+        assert_eq!(resolve_face(0, 0), None);
+        assert_eq!(resolve_face(0, 9), None);
     }
 }
