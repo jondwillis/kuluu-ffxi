@@ -1214,6 +1214,11 @@ fn spawn_mzb_overlay(
             reflectance: 0.5,
             cull_mode: None,
             alpha_mode: AlphaMode::Blend,
+            // Bounding-box plane is near-coplanar with the sloped pond bed at the
+            // shoreline; bias the translucent surface toward the camera so it
+            // wins the depth test there instead of z-fighting (constant bias is
+            // in depth-texture units, hence the large value).
+            depth_bias: 1000.0,
             ..default()
         });
         for (height_key, (min, max)) in water_groups {
