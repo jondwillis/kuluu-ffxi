@@ -12,6 +12,11 @@ use crate::sun_moon::VanaSky;
 // carry only a handful of meshes; extra slots stay inert (count gates them).
 pub const MAX_FLARE_ELEMENTS: usize = 16;
 
+// Each element renders at its native sprite-texel size times this factor (the retail
+// flares draw larger than their low-res source). The per-element generator projection
+// scale isn't parsed yet, so this is the one tunable that sets absolute flare size.
+const LENS_FLARE_SCALE: f32 = 1.5;
+
 #[derive(Clone, Debug, ShaderType)]
 pub struct LensFlareUniform {
     // xyz = normalized world-space sun direction (projected to screen in the
@@ -24,8 +29,8 @@ pub struct LensFlareUniform {
     // chain) else 0.0 (analytic fallback), zw unused.
     pub flare_params: Vec4,
 
-    // Per-element: xy = offset fraction along sun->opposite (x carries the offset,
-    // y reserved), zw unused — kept as Vec4 for std140 16-byte stride.
+    // Per-element: x = offset fraction along sun->opposite; yz = native sprite
+    // half-size in texels (sized to screen in the shader); w unused.
     pub offsets: [Vec4; MAX_FLARE_ELEMENTS],
 
     // Per-element UV sub-rect (u0,v0,u1,v1) into the lf0x texture.
@@ -239,15 +244,17 @@ fn load_lens_flare_sheet(
         frames: frames.clone(),
     };
 
+    let (tex_w, tex_h) = (sheet.texture.width as f32, sheet.texture.height as f32);
     if let Some(mat) = mat {
         mat.flare_tex = Some(handle);
         mat.data.flare_params.x = n as f32;
         mat.data.flare_params.y = 1.0;
-        for (i, off) in offsets.iter().enumerate() {
-            mat.data.offsets[i] = Vec4::new(*off, 0.0, 0.0, 0.0);
-        }
-        for (i, f) in frames.iter().enumerate() {
-            mat.data.frame_uv[i] = *f;
+        mat.data.flare_params.z = LENS_FLARE_SCALE;
+        for i in 0..n {
+            let f = frames[i];
+            let half = Vec2::new((f.z - f.x) * tex_w, (f.w - f.y) * tex_h) * 0.5;
+            mat.data.offsets[i] = Vec4::new(offsets[i], half.x, half.y, 0.0);
+            mat.data.frame_uv[i] = f;
         }
     }
 }
