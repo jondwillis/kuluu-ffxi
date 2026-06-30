@@ -246,6 +246,22 @@ pub struct NetStats {
     pub recv_health: u8,
 }
 
+/// Self-character stat block, folded from s2c 0x061 (CLISTATUS). `bonus`/`resist`
+/// are signed gear/buff deltas; `ilvl` is the amount above 99 the server sends
+/// (0 when the character has no item-level gear).
+/// See ffxi_proto::decode::CliStatus.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CharStatsRaw {
+    pub hp_max: u32,
+    pub mp_max: u32,
+    pub bp_base: [u16; 7],
+    pub bonus: [i16; 7],
+    pub attack: u16,
+    pub defense: u16,
+    pub resist: [i16; 8],
+    pub ilvl: u8,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
     pub stage: Stage,
@@ -302,6 +318,9 @@ pub struct SessionState {
 
     #[serde(default = "default_equipment")]
     pub equipment: [Option<EquippedRef>; EQUIPMENT_SLOTS],
+
+    #[serde(default)]
+    pub char_stats: Option<CharStatsRaw>,
 
     #[serde(default)]
     pub spells_known: Vec<u16>,
@@ -573,6 +592,9 @@ impl SessionState {
                         ent.speed_base = pos.speed_base;
                     }
                 }
+            }
+            AgentEvent::CharStatsUpdated { stats } => {
+                self.char_stats = Some(*stats);
             }
             AgentEvent::EntityUpserted {
                 entity,
@@ -916,6 +938,9 @@ pub enum AgentEvent {
     },
     PositionChanged {
         pos: Position,
+    },
+    CharStatsUpdated {
+        stats: CharStatsRaw,
     },
     EntityUpserted {
         entity: Entity,

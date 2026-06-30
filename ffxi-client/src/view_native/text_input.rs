@@ -2254,6 +2254,7 @@ fn dispatch_dynamic_menu_action(
             container,
             container_index,
             equip_slot,
+            item_no: _,
         } => (
             "equip",
             AgentCommand::Equip {
@@ -2434,6 +2435,29 @@ fn handle_menu_key(
         }
         if bindings.matches_logical(Action::NavRight, key) {
             apply_graphics_cycle(cursor, 1, graphics);
+            return None;
+        }
+    }
+
+    // The Equipment screen is a 2D retail icon grid: arrows move between grid
+    // cells (cursor stays an internal slot index), not down a linear list.
+    if matches!(kind, MenuKind::Equipment) {
+        let delta = if bindings.matches_logical(Action::NavLeft, key) {
+            Some((-1, 0))
+        } else if bindings.matches_logical(Action::NavRight, key) {
+            Some((1, 0))
+        } else if bindings.matches_logical(Action::NavUp, key) {
+            Some((0, -1))
+        } else if bindings.matches_logical(Action::NavDown, key) {
+            Some((0, 1))
+        } else {
+            None
+        };
+        if let Some((dx, dy)) = delta {
+            let level = stack.current_mut()?;
+            level.cursor =
+                ffxi_viewer_core::hud::equipment_screen::grid_move(level.cursor as u8, dx, dy)
+                    as usize;
             return None;
         }
     }

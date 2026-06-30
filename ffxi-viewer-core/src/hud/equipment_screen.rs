@@ -1,0 +1,743 @@
+use bevy::prelude::*;
+
+use crate::hud::item_dat_root::{ItemDatRoot, ItemIconCache};
+use crate::hud::{item_detail, item_meta, status_panel};
+use crate::input_mode::{InputMode, MenuKind};
+use crate::snapshot::SceneState;
+
+// Retail FFXI's default "blue" window theme: a translucent navy frame with a
+// light steel-blue edge, pale-blue title text, near-white body text, and a
+// golden cursor highlight on the focused row/slot. These are deliberate
+// tunings (retail ships no palette file to scrape), named here per the
+// no-magic-numbers convention.
+mod theme {
+    use bevy::prelude::Color;
+
+    pub const FRAME_BG: Color = Color::srgba(0.05, 0.07, 0.16, 0.88);
+    pub const FRAME_EDGE: Color = Color::srgb(0.60, 0.69, 0.85);
+    pub const TITLE: Color = Color::srgb(0.80, 0.89, 1.0);
+    pub const TEXT: Color = Color::srgb(0.91, 0.92, 0.95);
+    pub const MUTED: Color = Color::srgb(0.58, 0.63, 0.74);
+    pub const CURSOR: Color = Color::srgb(1.0, 0.84, 0.36);
+    pub const CURSOR_BG: Color = Color::srgba(0.20, 0.28, 0.45, 0.65);
+    pub const CELL_BG: Color = Color::srgba(0.10, 0.13, 0.24, 0.85);
+    pub const CELL_EDGE: Color = Color::srgb(0.32, 0.38, 0.52);
+}
+
+pub const SLOT_NAMES: [&str; 16] = [
+    "Main", "Sub", "Ranged", "Ammo", "Head", "Body", "Hands", "Legs", "Feet", "Neck", "Waist",
+    "L.Ear", "R.Ear", "L.Ring", "R.Ring", "Back",
+];
+
+const SLOT_ABBR: [&str; 16] = [
+    "Main", "Sub", "Rng", "Amo", "Head", "Body", "Hnds", "Legs", "Feet", "Neck", "Wst", "L.Er",
+    "R.Er", "L.Rg", "R.Rg", "Back",
+];
+
+// Retail equipment-window grid, read column-major: weapons / head-neck-ears /
+// body-hands-rings / back-waist-legs-feet. Values are internal slot indices
+// (0=Main..15=Back) matching SceneSnapshot.equipped[16].
+pub const EQUIP_GRID: [[u8; 4]; 4] = [
+    [0, 4, 5, 15],  // Main,  Head, Body,  Back
+    [1, 9, 6, 10],  // Sub,   Neck, Hands, Waist
+    [2, 11, 13, 7], // Ranged,L.Ear,L.Ring,Legs
+    [3, 12, 14, 8], // Ammo,  R.Ear,R.Ring,Feet
+];
+
+fn slot_to_cell(slot: u8) -> (usize, usize) {
+    for (r, row) in EQUIP_GRID.iter().enumerate() {
+        for (c, &s) in row.iter().enumerate() {
+            if s == slot {
+                return (r, c);
+            }
+        }
+    }
+    (0, 0)
+}
+
+/// Move the grid cursor (an internal slot index) by `dx` columns / `dy` rows,
+/// wrapping like the retail window. Used by the menu key handler.
+pub fn grid_move(slot: u8, dx: i32, dy: i32) -> u8 {
+    let (r, c) = slot_to_cell(slot.min(15));
+    let nr = (r as i32 + dy).rem_euclid(EQUIP_GRID.len() as i32) as usize;
+    let nc = (c as i32 + dx).rem_euclid(EQUIP_GRID[0].len() as i32) as usize;
+    EQUIP_GRID[nr][nc]
+}
+
+const DETAIL_ROWS: usize = 10;
+const STORAGE_ROWS: usize = 16;
+const CELL_PX: f32 = 36.0;
+const ICON_PX: f32 = 30.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EquipRole {
+    Header,
+    StatusName,
+    StatusVitals,
+    StatusILvl,
+    StatusAttr(usize),
+    StatusCombat,
+    CellLabel(u8),
+    DetailName,
+    DetailRow(usize),
+    StorageTitle,
+    StorageRow(usize),
+}
+
+#[derive(Component, Clone, Copy)]
+pub(crate) struct EquipText(EquipRole);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IconSlot {
+    Cell(u8),
+    Detail,
+}
+
+#[derive(Component, Clone, Copy)]
+pub(crate) struct EquipIcon(IconSlot);
+
+#[derive(Component, Clone, Copy)]
+pub(crate) struct EquipCellFrame(u8);
+
+#[derive(Component)]
+pub(crate) struct EquipScreenRoot;
+
+#[derive(Component)]
+pub(crate) struct EquipStorageBox;
+
+enum ScreenState {
+    Closed,
+    SlotPicker {
+        selected_slot: u8,
+    },
+    StoragePicker {
+        selected_slot: u8,
+        storage_cursor: usize,
+    },
+}
+
+fn screen_state(mode: &InputMode) -> ScreenState {
+    let InputMode::Menu(stack) = mode else {
+        return ScreenState::Closed;
+    };
+    match stack.current() {
+        Some(level) => match level.kind {
+            MenuKind::Equipment => ScreenState::SlotPicker {
+                selected_slot: (level.cursor as u8).min(15),
+            },
+            MenuKind::EquipSlot(slot) => ScreenState::StoragePicker {
+                selected_slot: slot.min(15),
+                storage_cursor: level.cursor,
+            },
+            _ => ScreenState::Closed,
+        },
+        None => ScreenState::Closed,
+    }
+}
+
+fn text_font(size: f32) -> TextFont {
+    TextFont {
+        font_size: size,
+        ..default()
+    }
+}
+
+fn framed_box() -> (Node, BackgroundColor, BorderColor) {
+    (
+        Node {
+            padding: UiRect::axes(Val::Px(10.0), Val::Px(8.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(2.0),
+            ..default()
+        },
+        BackgroundColor(theme::FRAME_BG),
+        BorderColor::all(theme::FRAME_EDGE),
+    )
+}
+
+pub(crate) fn spawn_equipment_screen(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    let placeholder = transparent_placeholder(&mut images);
+
+    commands
+        .spawn((
+            crate::components::InGameEntity,
+            EquipScreenRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(48.0),
+                left: Val::Px(8.0),
+                column_gap: Val::Px(6.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::FlexStart,
+                display: Display::None,
+                ..default()
+            },
+        ))
+        .with_children(|root| {
+            // Left column: Status panel above the item-detail panel.
+            root.spawn(Node {
+                width: Val::Px(264.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(6.0),
+                ..default()
+            })
+            .with_children(|col| {
+                let (mut n, bg, bd) = framed_box();
+                n.min_width = Val::Px(264.0);
+                col.spawn((n, bg, bd)).with_children(|p| {
+                    spawn_text(p, EquipRole::StatusName, 14.0, theme::TITLE);
+                    spawn_text(p, EquipRole::StatusVitals, 13.0, theme::TEXT);
+                    spawn_text(p, EquipRole::StatusILvl, 12.0, theme::MUTED);
+                    for i in 0..status_panel::PRIMARY_ATTRS.len() {
+                        spawn_text(p, EquipRole::StatusAttr(i), 13.0, theme::TEXT);
+                    }
+                    spawn_text(p, EquipRole::StatusCombat, 13.0, theme::TEXT);
+                });
+
+                let (n, bg, bd) = framed_box();
+                col.spawn((n, bg, bd)).with_children(|p| {
+                    p.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(6.0),
+                        ..default()
+                    })
+                    .with_children(|h| {
+                        h.spawn((
+                            EquipIcon(IconSlot::Detail),
+                            Node {
+                                width: Val::Px(32.0),
+                                height: Val::Px(32.0),
+                                display: Display::None,
+                                ..default()
+                            },
+                            ImageNode::new(placeholder.clone()),
+                        ));
+                        h.spawn((
+                            EquipText(EquipRole::DetailName),
+                            Text::new(""),
+                            text_font(14.0),
+                            TextColor(theme::TITLE),
+                        ));
+                    });
+                    for i in 0..DETAIL_ROWS {
+                        spawn_row(p, EquipRole::DetailRow(i), 12.0, theme::TEXT);
+                    }
+                });
+            });
+
+            // Center: title + 4x4 equipment-slot icon grid.
+            let (n, bg, bd) = framed_box();
+            root.spawn((n, bg, bd)).with_children(|p| {
+                spawn_text(p, EquipRole::Header, 14.0, theme::TITLE);
+                p.spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(4.0),
+                    margin: UiRect::top(Val::Px(4.0)),
+                    ..default()
+                })
+                .with_children(|grid| {
+                    for row in EQUIP_GRID.iter() {
+                        grid.spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(4.0),
+                            ..default()
+                        })
+                        .with_children(|line| {
+                            for &slot in row.iter() {
+                                spawn_cell(line, slot, placeholder.clone());
+                            }
+                        });
+                    }
+                });
+            });
+
+            // Right: equippable-item storage list (only shown while picking).
+            let (mut n, bg, bd) = framed_box();
+            n.width = Val::Px(204.0);
+            root.spawn((EquipStorageBox, n, bg, bd)).with_children(|p| {
+                spawn_text(p, EquipRole::StorageTitle, 13.0, theme::TITLE);
+                for i in 0..STORAGE_ROWS {
+                    spawn_row(p, EquipRole::StorageRow(i), 12.0, theme::TEXT);
+                }
+            });
+        });
+}
+
+fn spawn_text(p: &mut ChildSpawnerCommands, role: EquipRole, size: f32, color: Color) {
+    p.spawn((
+        EquipText(role),
+        Text::new(""),
+        text_font(size),
+        TextColor(color),
+    ));
+}
+
+fn spawn_row(p: &mut ChildSpawnerCommands, role: EquipRole, size: f32, color: Color) {
+    p.spawn((
+        EquipText(role),
+        Text::new(""),
+        text_font(size),
+        TextColor(color),
+        Node {
+            display: Display::None,
+            ..default()
+        },
+    ));
+}
+
+fn spawn_cell(p: &mut ChildSpawnerCommands, slot: u8, placeholder: Handle<Image>) {
+    p.spawn((
+        EquipCellFrame(slot),
+        Node {
+            width: Val::Px(CELL_PX),
+            height: Val::Px(CELL_PX),
+            border: UiRect::all(Val::Px(1.0)),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        BackgroundColor(theme::CELL_BG),
+        BorderColor::all(theme::CELL_EDGE),
+    ))
+    .with_children(|c| {
+        c.spawn((
+            EquipIcon(IconSlot::Cell(slot)),
+            Node {
+                width: Val::Px(ICON_PX),
+                height: Val::Px(ICON_PX),
+                display: Display::None,
+                ..default()
+            },
+            ImageNode::new(placeholder),
+        ));
+        c.spawn((
+            EquipText(EquipRole::CellLabel(slot)),
+            Text::new(SLOT_ABBR[slot as usize]),
+            text_font(11.0),
+            TextColor(theme::MUTED),
+        ));
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_equipment_screen(
+    mode: Res<InputMode>,
+    state: Res<SceneState>,
+    dynamic: Res<crate::hud::menu::DynamicMenu>,
+    dat_root: Res<ItemDatRoot>,
+    mut icon_cache: ResMut<ItemIconCache>,
+    mut images: ResMut<Assets<Image>>,
+    mut root_q: Query<
+        &mut Node,
+        (
+            With<EquipScreenRoot>,
+            Without<EquipText>,
+            Without<EquipIcon>,
+            Without<EquipStorageBox>,
+        ),
+    >,
+    mut storage_q: Query<
+        &mut Node,
+        (
+            With<EquipStorageBox>,
+            Without<EquipScreenRoot>,
+            Without<EquipText>,
+            Without<EquipIcon>,
+        ),
+    >,
+    mut text_q: Query<
+        (&EquipText, &mut Text, &mut TextColor, &mut Node),
+        (
+            Without<EquipScreenRoot>,
+            Without<EquipIcon>,
+            Without<EquipStorageBox>,
+        ),
+    >,
+    mut icon_q: Query<
+        (&EquipIcon, &mut Node, &mut ImageNode),
+        (
+            Without<EquipScreenRoot>,
+            Without<EquipText>,
+            Without<EquipStorageBox>,
+        ),
+    >,
+    mut cell_q: Query<(&EquipCellFrame, &mut BorderColor, &mut BackgroundColor)>,
+) {
+    let st = screen_state(&mode);
+    let (selected_slot, storage_active, storage_cursor) = match st {
+        ScreenState::Closed => {
+            if let Ok(mut node) = root_q.single_mut() {
+                if node.display != Display::None {
+                    node.display = Display::None;
+                }
+            }
+            return;
+        }
+        ScreenState::SlotPicker { selected_slot } => (selected_slot, false, 0),
+        ScreenState::StoragePicker {
+            selected_slot,
+            storage_cursor,
+        } => (selected_slot, true, storage_cursor),
+    };
+
+    if let Ok(mut node) = root_q.single_mut() {
+        if node.display != Display::Flex {
+            node.display = Display::Flex;
+        }
+    }
+    if let Ok(mut node) = storage_q.single_mut() {
+        let want = if storage_active {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != want {
+            node.display = want;
+        }
+    }
+
+    let snap = &state.snapshot;
+    let me = crate::hud::self_hud::resolve_self(&snap.party, snap.self_char_id);
+
+    let equipped =
+        |slot: u8| -> Option<u16> { snap.equipped.get(slot as usize).copied().flatten() };
+
+    let focused_item: Option<u16> = if storage_active {
+        dynamic
+            .rows
+            .get(storage_cursor)
+            .and_then(|r| match r.action {
+                crate::hud::menu::DynamicMenuAction::EquipItem { item_no, .. } => Some(item_no),
+                _ => None,
+            })
+    } else {
+        equipped(selected_slot)
+    };
+
+    let (detail_name, detail_rows) =
+        compose_focus_detail(focused_item, snap, &dat_root, &mut icon_cache);
+
+    // Storage list viewport (keep the cursor in view).
+    let storage_total = dynamic.rows.len();
+    let storage_start = storage_cursor
+        .saturating_sub(STORAGE_ROWS / 2)
+        .min(storage_total.saturating_sub(STORAGE_ROWS));
+
+    for (tag, mut text, mut color, mut node) in text_q.iter_mut() {
+        let (want, want_color, visible) = role_value(
+            tag.0,
+            snap,
+            me,
+            selected_slot,
+            storage_active,
+            &detail_name,
+            &detail_rows,
+            &dynamic,
+            storage_cursor,
+            storage_start,
+        );
+        let display = if visible {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != display {
+            node.display = display;
+        }
+        if visible && **text != want {
+            **text = want;
+        }
+        if color.0 != want_color {
+            color.0 = want_color;
+        }
+    }
+
+    for (icon, mut node, mut image) in icon_q.iter_mut() {
+        let item = match icon.0 {
+            IconSlot::Cell(slot) => equipped(slot),
+            IconSlot::Detail => focused_item,
+        };
+        let handle = item.and_then(|n| icon_cache.ensure(n, &dat_root, &mut images));
+        match handle {
+            Some(h) => {
+                if image.image != h {
+                    image.image = h;
+                }
+                if image.color != Color::WHITE {
+                    image.color = Color::WHITE;
+                }
+                if node.display != Display::Flex {
+                    node.display = Display::Flex;
+                }
+            }
+            None => {
+                if node.display != Display::None {
+                    node.display = Display::None;
+                }
+            }
+        }
+    }
+
+    for (cell, mut border, mut bg) in cell_q.iter_mut() {
+        let focused = cell.0 == selected_slot;
+        let want_border = if focused {
+            theme::CURSOR
+        } else {
+            theme::CELL_EDGE
+        };
+        if border.left != want_border {
+            *border = BorderColor::all(want_border);
+        }
+        let want_bg = if focused {
+            theme::CURSOR_BG
+        } else {
+            theme::CELL_BG
+        };
+        if bg.0 != want_bg {
+            bg.0 = want_bg;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn role_value(
+    role: EquipRole,
+    snap: &ffxi_viewer_wire::SceneSnapshot,
+    me: Option<&ffxi_viewer_wire::PartyMember>,
+    selected_slot: u8,
+    storage_active: bool,
+    detail_name: &str,
+    detail_rows: &[String],
+    dynamic: &crate::hud::menu::DynamicMenu,
+    storage_cursor: usize,
+    storage_start: usize,
+) -> (String, Color, bool) {
+    let attr = |i: usize| -> Option<u16> {
+        snap.stats.as_ref().map(|s| match i {
+            0 => s.str_,
+            1 => s.dex,
+            2 => s.vit,
+            3 => s.agi,
+            4 => s.int_,
+            5 => s.mnd,
+            _ => s.chr,
+        })
+    };
+    match role {
+        EquipRole::Header => {
+            let item = snap
+                .equipped
+                .get(selected_slot as usize)
+                .copied()
+                .flatten()
+                .and_then(ffxi_proto::item_names::lookup)
+                .unwrap_or("(empty)");
+            (
+                format!("{}: {item}", SLOT_NAMES[selected_slot as usize]),
+                theme::TITLE,
+                true,
+            )
+        }
+        EquipRole::StatusName => (profile_line(snap, me), theme::TITLE, true),
+        EquipRole::StatusVitals => {
+            let s = match me {
+                Some(m) => match snap.stats.as_ref().filter(|s| s.hp_max > 0) {
+                    Some(st) => format!(
+                        "HP {}/{}  MP {}/{}  TP {}",
+                        m.hp, st.hp_max, m.mp, st.mp_max, m.tp
+                    ),
+                    None => format!("HP {}   MP {}   TP {}", m.hp, m.mp, m.tp),
+                },
+                None => "HP —   MP —   TP —".to_string(),
+            };
+            (s, theme::TEXT, true)
+        }
+        EquipRole::StatusILvl => {
+            let s = match snap.stats.as_ref().filter(|s| s.item_level > 0) {
+                Some(st) => format!("Item Level: {}", st.item_level),
+                None => "Item Level: —".to_string(),
+            };
+            (s, theme::MUTED, true)
+        }
+        EquipRole::StatusAttr(i) => {
+            let name = status_panel::PRIMARY_ATTRS.get(i).copied().unwrap_or("");
+            let s = match (attr(i), snap.stats.as_ref()) {
+                (Some(base), Some(st)) => {
+                    let bonus = st.bonus.get(i).copied().unwrap_or(0);
+                    if bonus != 0 {
+                        format!("{name:<4}{base:>4} {bonus:+}")
+                    } else {
+                        format!("{name:<4}{base:>4}")
+                    }
+                }
+                _ => format!("{name:<4}   —"),
+            };
+            (s, theme::TEXT, true)
+        }
+        EquipRole::StatusCombat => {
+            let s = match snap.stats.as_ref() {
+                Some(st) => format!("Attack {}    Defense {}", st.attack, st.defense),
+                None => "Attack —    Defense —".to_string(),
+            };
+            (s, theme::TEXT, true)
+        }
+        EquipRole::CellLabel(slot) => {
+            let has_item = snap
+                .equipped
+                .get(slot as usize)
+                .copied()
+                .flatten()
+                .is_some();
+            // The label is the no-icon fallback; the icon updater hides it when
+            // an icon loads. Tint the selected slot's label with the cursor color.
+            let color = if slot == selected_slot {
+                theme::CURSOR
+            } else if has_item {
+                theme::TEXT
+            } else {
+                theme::MUTED
+            };
+            (SLOT_ABBR[slot as usize].to_string(), color, true)
+        }
+        EquipRole::DetailName => (detail_name.to_string(), theme::TITLE, true),
+        EquipRole::DetailRow(i) => match detail_rows.get(i) {
+            Some(line) => (line.clone(), theme::TEXT, true),
+            None => (String::new(), theme::TEXT, false),
+        },
+        EquipRole::StorageTitle => ("Equip".to_string(), theme::TITLE, storage_active),
+        EquipRole::StorageRow(i) => {
+            if !storage_active {
+                return (String::new(), theme::TEXT, false);
+            }
+            let list_idx = storage_start + i;
+            if dynamic.rows.is_empty() && i == 0 {
+                return ("(no equippable items)".to_string(), theme::MUTED, true);
+            }
+            match dynamic.rows.get(list_idx) {
+                Some(row) => {
+                    let cursor = list_idx == storage_cursor;
+                    let prefix = if cursor { "> " } else { "  " };
+                    let color = if cursor { theme::CURSOR } else { theme::TEXT };
+                    (format!("{prefix}{}", row.label), color, true)
+                }
+                None => (String::new(), theme::TEXT, false),
+            }
+        }
+    }
+}
+
+fn profile_line(
+    snap: &ffxi_viewer_wire::SceneSnapshot,
+    me: Option<&ffxi_viewer_wire::PartyMember>,
+) -> String {
+    let name = me
+        .and_then(|m| m.name.clone())
+        .or_else(|| snap.char_name.clone())
+        .unwrap_or_else(|| "—".to_string());
+    match me {
+        Some(m) => {
+            let main = status_panel::job_abbrev(m.main_job);
+            if m.sub_job != 0 {
+                let sub = status_panel::job_abbrev(m.sub_job);
+                format!("{name}  {main}{} / {sub}{}", m.main_job_lv, m.sub_job_lv)
+            } else {
+                format!("{name}  {main}{}", m.main_job_lv)
+            }
+        }
+        None => name,
+    }
+}
+
+fn compose_focus_detail(
+    item_no: Option<u16>,
+    snap: &ffxi_viewer_wire::SceneSnapshot,
+    dat_root: &ItemDatRoot,
+    icon_cache: &mut ItemIconCache,
+) -> (String, Vec<String>) {
+    let Some(item_no) = item_no else {
+        return ("Select an item.".to_string(), Vec::new());
+    };
+    let dat = icon_cache
+        .dat_bytes_for_static(dat_root)
+        .and_then(|bytes| item_detail::lookup_static(&bytes, item_no));
+    let detail = item_meta::compose_item_detail(item_no, snap, dat.clone());
+    let name = dat
+        .as_ref()
+        .map(|s| s.name.clone())
+        .filter(|n| !n.is_empty())
+        .or_else(|| ffxi_proto::item_names::lookup(item_no).map(|s| s.to_string()))
+        .unwrap_or_else(|| format!("Item #{item_no}"));
+    (name, item_detail::detail_rows(&detail))
+}
+
+fn transparent_placeholder(images: &mut Assets<Image>) -> Handle<Image> {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::image::ImageSampler;
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    let mut image = Image::new(
+        Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        vec![0, 0, 0, 0],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = ImageSampler::nearest();
+    images.add(image)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_covers_all_16_slots_once() {
+        let mut seen = [false; 16];
+        for row in EQUIP_GRID.iter() {
+            for &slot in row.iter() {
+                assert!(!seen[slot as usize], "slot {slot} appears twice");
+                seen[slot as usize] = true;
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "every slot present");
+    }
+
+    #[test]
+    fn grid_columns_are_retail_groups() {
+        // Column 0 = weapons (Main/Sub/Ranged/Ammo); column 1 starts at Head.
+        assert_eq!(
+            [
+                EQUIP_GRID[0][0],
+                EQUIP_GRID[1][0],
+                EQUIP_GRID[2][0],
+                EQUIP_GRID[3][0]
+            ],
+            [0, 1, 2, 3]
+        );
+        assert_eq!(EQUIP_GRID[0][1], 4, "Head heads the second column");
+    }
+
+    #[test]
+    fn grid_move_wraps_and_steps() {
+        // From Main (0): right -> Head (4); down -> Sub (1).
+        assert_eq!(grid_move(0, 1, 0), 4);
+        assert_eq!(grid_move(0, 0, 1), 1);
+        // Wrap: up from Main (top of column 0) -> Ammo (bottom, slot 3).
+        assert_eq!(grid_move(0, 0, -1), 3);
+        // Wrap: left from Main (col 0) -> Back (col 3, row 0, slot 15).
+        assert_eq!(grid_move(0, -1, 0), 15);
+    }
+
+    #[test]
+    fn slot_names_and_abbr_aligned() {
+        assert_eq!(SLOT_NAMES.len(), 16);
+        assert_eq!(SLOT_ABBR.len(), 16);
+        assert_eq!(SLOT_NAMES[10], "Waist");
+        assert_eq!(SLOT_ABBR[10], "Wst");
+    }
+}

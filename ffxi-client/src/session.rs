@@ -838,6 +838,22 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::FishHooked { params: f.into() });
             }
         }
+        op if op == s2c::CLISTATUS => {
+            if let Ok(cs) = decode::CliStatus::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::CharStatsUpdated {
+                    stats: crate::state::CharStatsRaw {
+                        hp_max: cs.hp_max,
+                        mp_max: cs.mp_max,
+                        bp_base: cs.bp_base,
+                        bonus: cs.bp_adj,
+                        attack: cs.attack,
+                        defense: cs.defense,
+                        resist: cs.def_elem,
+                        ilvl: cs.ilvl,
+                    },
+                });
+            }
+        }
         op if op == s2c::EVENTUCOFF => {
             // Mode (u32) sits right after the 4-byte sub-header; the high bits may carry an
             // event id, so match the low byte. Fishing release = a rejected cast (no rod /

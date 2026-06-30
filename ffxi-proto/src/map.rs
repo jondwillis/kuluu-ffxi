@@ -98,6 +98,10 @@ pub mod s2c {
 
     pub const CHAR_STATUS: u16 = 0x037;
 
+    // GP_SERV_COMMAND_CLISTATUS, vendor/server/src/map/packets/s2c/0x061_clistatus.h.
+    // Self-character stat block: HP/MP max, base+gear stats, attack/defense, resists, iLv.
+    pub const CLISTATUS: u16 = 0x061;
+
     // GP_SERV_COMMAND_FISH, vendor/server/src/map/enums/packet_s2c.h:172. Sent to start
     // the fishing mini-game with the hooked fish's stats.
     pub const FISH: u16 = 0x115;

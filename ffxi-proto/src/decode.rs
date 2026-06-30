@@ -122,6 +122,17 @@ impl PosHead {
         })
     }
 
+    // Head-look target = the targid the entity has selected, packed into Flags0
+    // bits 17..31. Both 0x0D (char_update.cpp `Flags0.facetarget = m_TargID`) and
+    // 0x0E (entity_update.cpp `ref<uint16>(0x1A) = m_TargID << 1`) write it here.
+    // Distinct from bt_target_id (the combat-claim UniqueNo).
+    const FACETARGET_SHIFT: u32 = 17;
+    const FACETARGET_MASK: u32 = 0x7FFF;
+
+    pub fn facetarget(&self) -> u16 {
+        ((self.flags0 >> Self::FACETARGET_SHIFT) & Self::FACETARGET_MASK) as u16
+    }
+
     pub fn decode_char_npc(body: &[u8]) -> Result<(Self, u32), DecodeError> {
         let head = Self::decode(body)?;
 
@@ -475,6 +486,60 @@ impl CharStatus {
     /// charentity.cpp::GetTimeUntilDeathHomepoint, ai/states/death_state.cpp
     pub fn seconds_until_homepoint(&self) -> u32 {
         (self.dead_counter1 / 60).saturating_sub(360)
+    }
+}
+
+/// s2c 0x061 GP_SERV_COMMAND_CLISTATUS — the self-character stat block.
+/// Field offsets follow the `CLISTATUS` struct in
+/// vendor/server/src/map/packets/s2c/0x061_clistatus.h (mirror of
+/// research/XiPackets/world/server/0x0061). `bp_base`/`bp_adj` are STR, DEX, VIT,
+/// AGI, INT, MND, CHR in order; `bp_adj` is the signed gear/buff delta retail shows
+/// as the "+N" beside each stat. `def_elem` is Fire, Ice, Wind, Earth, Lightning,
+/// Water, Light, Dark. The struct declares `atk`/`def` as int16_t, but they are
+/// sourced from the non-negative ATT()/DEF() (.cpp:63-64), so we read them as u16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliStatus {
+    pub hp_max: u32,
+    pub mp_max: u32,
+    pub bp_base: [u16; 7],
+    pub bp_adj: [i16; 7],
+    pub attack: u16,
+    pub defense: u16,
+    pub def_elem: [i16; 8],
+    pub ilvl: u8,
+}
+
+impl CliStatus {
+    const ILVL_OFFSET: usize = 81;
+    const NEEDED: usize = Self::ILVL_OFFSET + 1;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::NEEDED {
+            return Err(DecodeError::Truncated(Self::NEEDED, body.len()));
+        }
+        let rd32 = |o: usize| u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+        let rd16 = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+        let rdi16 = |o: usize| i16::from_le_bytes([body[o], body[o + 1]]);
+        let mut bp_base = [0u16; 7];
+        let mut bp_adj = [0i16; 7];
+        for i in 0..7 {
+            bp_base[i] = rd16(16 + i * 2);
+            bp_adj[i] = rdi16(30 + i * 2);
+        }
+        let mut def_elem = [0i16; 8];
+        for (i, e) in def_elem.iter_mut().enumerate() {
+            *e = rdi16(48 + i * 2);
+        }
+        Ok(Self {
+            hp_max: rd32(0),
+            mp_max: rd32(4),
+            bp_base,
+            bp_adj,
+            attack: rd16(44),
+            defense: rd16(46),
+            def_elem,
+            ilvl: body[Self::ILVL_OFFSET],
+        })
     }
 }
 
@@ -1312,6 +1377,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clistatus_reads_stat_block_offsets() {
+        let mut buf = vec![0u8; 84];
+        buf[0..4].copy_from_slice(&1946u32.to_le_bytes()); // hp_max
+        buf[4..8].copy_from_slice(&1295u32.to_le_bytes()); // mp_max
+        for i in 0..7 {
+            buf[16 + i * 2..18 + i * 2].copy_from_slice(&((10 + i as u16) * 5).to_le_bytes());
+            buf[30 + i * 2..32 + i * 2].copy_from_slice(&((i as i16 + 1) * 7).to_le_bytes());
+        }
+        buf[44..46].copy_from_slice(&1048u16.to_le_bytes()); // attack
+        buf[46..48].copy_from_slice(&1006u16.to_le_bytes()); // defense
+        buf[48..50].copy_from_slice(&(-15i16).to_le_bytes()); // fire resist
+        buf[81] = 119; // ilvl
+
+        let cs = CliStatus::decode(&buf).expect("decodes");
+        assert_eq!(cs.hp_max, 1946);
+        assert_eq!(cs.mp_max, 1295);
+        assert_eq!(cs.bp_base[0], 50, "STR base");
+        assert_eq!(cs.bp_base[6], 80, "CHR base");
+        assert_eq!(cs.bp_adj[0], 7, "STR gear delta");
+        assert_eq!(cs.attack, 1048);
+        assert_eq!(cs.defense, 1006);
+        assert_eq!(cs.def_elem[0], -15, "fire resist signed");
+        assert_eq!(cs.ilvl, 119);
+        assert!(
+            CliStatus::decode(&buf[..80]).is_err(),
+            "truncation rejected"
+        );
+    }
+
+    #[test]
     fn look_data_decodes_standard_modelid() {
         let mut buf = vec![0u8; 0x40];
         buf[0x2C..0x2E].copy_from_slice(&0u16.to_le_bytes());
@@ -1613,6 +1708,24 @@ mod tests {
         let h = PosHead::decode(&buf).unwrap();
         assert_eq!(h.unique_no, 0xCAFE_F00D);
         assert_eq!(h.bt_target_id, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn pos_head_extracts_facetarget_from_flags0() {
+        // facetarget occupies Flags0 bits 17..31; targid 0x1A2 must round-trip
+        // and not bleed into the low MovTime/RunMode/GroundFlag/KingFlag bits.
+        let mut buf = vec![0u8; PosHead::SIZE_WITH_BT_TARGET];
+        let flags0 = (0x01A2u32 << 17) | 0x0001_FFFF;
+        buf[20..24].copy_from_slice(&flags0.to_le_bytes());
+        let h = PosHead::decode(&buf).unwrap();
+        assert_eq!(h.facetarget(), 0x01A2);
+    }
+
+    #[test]
+    fn pos_head_zero_flags0_has_no_facetarget() {
+        let buf = vec![0u8; PosHead::SIZE];
+        let h = PosHead::decode(&buf).unwrap();
+        assert_eq!(h.facetarget(), 0);
     }
 
     #[test]

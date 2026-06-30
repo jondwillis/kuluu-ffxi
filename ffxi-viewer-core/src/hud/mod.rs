@@ -7,6 +7,7 @@ pub mod death_prompt;
 pub mod diagnostics;
 pub mod dialog;
 pub mod entity_hover_card;
+pub mod equipment_screen;
 pub mod item_dat_root;
 pub mod item_detail;
 pub mod item_meta;
@@ -259,6 +260,7 @@ impl Plugin for HudPlugin {
                 trade::update_trade_window,
                 check_view::update_check_view,
                 status_panel::update_status_panel,
+                equipment_screen::update_equipment_screen.after(menu::refresh_dynamic_menu_rows),
             ),
         );
         app.add_systems(Update, apply_dev_hud_visibility);
@@ -352,6 +354,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             trade::spawn_trade_window,
             check_view::spawn_check_view,
             status_panel::spawn_status_panel,
+            equipment_screen::spawn_equipment_screen,
         ),
     );
 }

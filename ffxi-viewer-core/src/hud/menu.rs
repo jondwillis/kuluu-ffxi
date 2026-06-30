@@ -57,6 +57,7 @@ pub enum DynamicMenuAction {
         container: u8,
         container_index: u8,
         equip_slot: u8,
+        item_no: u16,
     },
 }
 
@@ -409,6 +410,7 @@ pub fn refresh_dynamic_menu_rows(
                             container: slot.container,
                             container_index: slot.index,
                             equip_slot,
+                            item_no: slot.item_no,
                         },
                     })
                 })
@@ -497,6 +499,13 @@ pub fn update_main_menu(
     };
 
     match active {
+        // The Equipment screen (hud::equipment_screen) renders its own framed
+        // multi-panel layout for these kinds; suppress the generic text panel.
+        Some((MenuKind::Equipment | MenuKind::EquipSlot(_), _)) => {
+            if node.display != Display::None {
+                node.display = Display::None;
+            }
+        }
         Some((kind, c)) => {
             node.display = Display::Flex;
 

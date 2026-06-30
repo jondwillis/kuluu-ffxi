@@ -53,7 +53,7 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
 
         inventory_main: project_inventory_main(s),
 
-        stats: None,
+        stats: s.char_stats.map(char_stats_to_wire),
         bazaar: Vec::new(),
         play_time_s: 0,
 
@@ -96,6 +96,33 @@ fn resolve_equipment(s: &SessionState) -> [Option<u16>; 16] {
             .map(|s| s.item_no);
     }
     out
+}
+
+fn char_stats_to_wire(c: crate::state::CharStatsRaw) -> wire::CharStats {
+    // CLISTATUS sends item level as the amount above 99 (0 = no iLv gear), so retail
+    // adds 99 back for display. vendor/server/src/map/utils/charutils.cpp getItemLevelDifference.
+    const ILVL_BASE: u16 = 99;
+    let item_level = if c.ilvl >= 1 {
+        ILVL_BASE + c.ilvl as u16
+    } else {
+        0
+    };
+    wire::CharStats {
+        item_level,
+        str_: c.bp_base[0],
+        dex: c.bp_base[1],
+        vit: c.bp_base[2],
+        agi: c.bp_base[3],
+        int_: c.bp_base[4],
+        mnd: c.bp_base[5],
+        chr: c.bp_base[6],
+        hp_max: c.hp_max,
+        mp_max: c.mp_max,
+        attack: c.attack,
+        defense: c.defense,
+        bonus: c.bonus,
+        resist: c.resist,
+    }
 }
 
 pub fn shop_to_wire(s: &ShopState) -> wire::ShopState {

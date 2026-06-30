@@ -433,6 +433,21 @@ pub struct CharStats {
     pub int_: u16,
     pub mnd: u16,
     pub chr: u16,
+    // Self-stat block from s2c 0x061 (CLISTATUS). `bonus` is the signed gear/buff
+    // delta retail renders as "+N"; `resist` is the 8 elemental defenses. New fields
+    // default so older postcard frames still deserialize.
+    #[serde(default)]
+    pub hp_max: u32,
+    #[serde(default)]
+    pub mp_max: u32,
+    #[serde(default)]
+    pub attack: u16,
+    #[serde(default)]
+    pub defense: u16,
+    #[serde(default)]
+    pub bonus: [i16; 7],
+    #[serde(default)]
+    pub resist: [i16; 8],
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

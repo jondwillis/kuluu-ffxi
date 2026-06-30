@@ -254,7 +254,7 @@ pub fn update_status_panel(
     }
 
     if let Ok(mut text) = ilvl_q.single_mut() {
-        let want = match snap.stats.as_ref() {
+        let want = match snap.stats.as_ref().filter(|s| s.item_level > 0) {
             Some(s) => format!("Item Level: {}", s.item_level),
             None => "Item Level: —".to_string(),
         };
@@ -267,12 +267,16 @@ pub fn update_status_panel(
         let Some(name) = PRIMARY_ATTRS.get(row.attr_index) else {
             continue;
         };
-        let want = match snap
-            .stats
-            .as_ref()
-            .and_then(|s| attr_value(s, row.attr_index))
-        {
-            Some(v) => format!("{name:<4}{v:>4}"),
+        let want = match snap.stats.as_ref() {
+            Some(s) => {
+                let base = attr_value(s, row.attr_index).unwrap_or(0);
+                let bonus = s.bonus.get(row.attr_index).copied().unwrap_or(0);
+                if bonus != 0 {
+                    format!("{name:<4}{base:>4} {bonus:+}")
+                } else {
+                    format!("{name:<4}{base:>4}")
+                }
+            }
             None => format!("{name:<4}   —"),
         };
         if **text != want {
@@ -303,7 +307,7 @@ fn profile_header(
     }
 }
 
-fn job_abbrev(job_id: u8) -> String {
+pub(crate) fn job_abbrev(job_id: u8) -> String {
     if job_id == 0 {
         return "---".to_string();
     }

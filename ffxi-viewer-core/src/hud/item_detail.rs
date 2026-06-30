@@ -65,7 +65,7 @@ fn mmss(secs: u16) -> String {
     format!("{m}:{s:02}")
 }
 
-fn lookup_static(dat_bytes: &[u8], item_no: u16) -> Option<ItemStatic> {
+pub(crate) fn lookup_static(dat_bytes: &[u8], item_no: u16) -> Option<ItemStatic> {
     let s = ffxi_dat::item_dat::lookup(dat_bytes, item_no)?;
     Some(ItemStatic {
         name: s.name,
@@ -81,7 +81,7 @@ fn lookup_static(dat_bytes: &[u8], item_no: u16) -> Option<ItemStatic> {
     })
 }
 
-fn detail_rows(detail: &ItemDetail) -> Vec<String> {
+pub(crate) fn detail_rows(detail: &ItemDetail) -> Vec<String> {
     let mut rows = Vec::new();
     let Some(s) = &detail.static_ else {
         rows.push("(no item DAT — names only)".to_string());
@@ -116,9 +116,11 @@ fn format_jobs(jobs_mask: u32) -> String {
     if jobs_mask == 0 {
         return "All".to_string();
     }
+    // LSB item_equipment.jobs is 1-indexed: bit (job - 1) is set for an equippable job.
+    // vendor/server/src/map/utils/charutils.cpp:2313 — getJobs() & (1 << (GetMJob() - 1))
     let parts: Vec<String> = (0..32u32)
         .filter(|bit| jobs_mask & (1 << bit) != 0)
-        .map(|bit| job_abbrev(bit as u8))
+        .map(|bit| job_abbrev(bit as u8 + 1))
         .collect();
     if parts.is_empty() {
         "All".to_string()
@@ -145,6 +147,12 @@ fn job_abbrev(job_id: u8) -> String {
         14 => "DRG",
         15 => "SMN",
         16 => "BLU",
+        17 => "COR",
+        18 => "PUP",
+        19 => "DNC",
+        20 => "SCH",
+        21 => "GEO",
+        22 => "RUN",
         other => return format!("J{other}"),
     };
     s.to_string()
@@ -619,8 +627,11 @@ mod tests {
     fn jobs_all_when_unrestricted() {
         assert_eq!(format_jobs(0), "All");
 
-        assert_eq!(format_jobs(1 << 1), "WAR");
-        assert_eq!(format_jobs((1 << 1) | (1 << 3)), "WAR/WHM");
+        // LSB item_equipment.jobs is 1-indexed: bit (job-1) is the job.
+        // bit 0 = WAR (job 1), bit 1 = MNK (job 2), bit 3 = BLM (job 4).
+        assert_eq!(format_jobs(1 << 0), "WAR");
+        assert_eq!(format_jobs(1 << 1), "MNK");
+        assert_eq!(format_jobs((1 << 0) | (1 << 3)), "WAR/BLM");
     }
 
     #[test]

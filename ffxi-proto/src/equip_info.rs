@@ -34,10 +34,12 @@ pub fn fits_slot(info: &EquipInfo, slot_id: u8) -> bool {
 }
 
 pub fn fits_job(info: &EquipInfo, job_id: u8) -> bool {
-    if job_id >= 32 {
+    // LSB item_equipment.jobs is 1-indexed: a job occupies bit (job - 1).
+    // vendor/server/src/map/utils/charutils.cpp:2313 — getJobs() & (1 << (GetMJob() - 1))
+    if job_id == 0 || job_id > 32 {
         return false;
     }
-    info.jobs_mask & (1 << job_id) != 0
+    info.jobs_mask & (1 << (job_id - 1)) != 0
 }
 
 #[cfg(test)]
@@ -65,6 +67,18 @@ mod tests {
         assert!(fits_slot(&info, 4), "fits Head");
         assert!(!fits_slot(&info, 0), "doesn't fit Main");
         assert!(!fits_slot(&info, 5), "doesn't fit Body");
+    }
+
+    #[test]
+    fn white_belt_fits_mnk_not_war() {
+        // White Belt (13184) has jobs=2 in LSB item_equipment = bit 1 = MNK (job 2),
+        // under the 1-indexed `1 << (job - 1)` convention. WAR (job 1) must NOT fit.
+        let info = lookup(13184).expect("white belt");
+        assert_eq!(info.jobs_mask, 2, "white belt jobs bitfield");
+        assert!(fits_slot(&info, 10), "fits Waist");
+        assert!(fits_job(&info, 2), "MNK can equip");
+        assert!(!fits_job(&info, 1), "WAR cannot equip");
+        assert!(!fits_job(&info, 0), "no-job never fits");
     }
 
     #[test]
