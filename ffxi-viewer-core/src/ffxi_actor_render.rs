@@ -1949,18 +1949,26 @@ pub fn update_ffxi_render_actor_lighting(
     const COLOR_BIAS: Vec3 = Vec3::new(1.4, 1.36, 1.45);
     const AMBIENT_BIAS_BELOW: f32 = 0.5;
     const AMBIENT_FLOOR: f32 = 0.12;
+    // The 0x2F entity sun/moon diffuse is authored overbright (up to ~1.27 at noon);
+    // clamping the model directional to 1.0 cropped that punch and flattened the form.
+    const MODEL_DIR_MAX: f32 = 1.5;
 
-    let amb = ambient.color.to_linear();
-    let amb_k = (ambient.brightness / AMBIENT_REF_LUX).clamp(0.0, 1.5);
-    let mut amb_rgb = Vec3::new(amb.red, amb.green, amb.blue) * amb_k;
     // research/xim EnvironmentSection.kt:144-148: actors are lit by the model block's
-    // ambient, not the terrain ambient the GlobalAmbientLight tracks.
-    if zone_lighting.valid {
-        amb_rgb = zone_lighting.ambient_entity * amb_k;
-    }
-    if amb_rgb.max_element() < AMBIENT_BIAS_BELOW {
-        amb_rgb *= COLOR_BIAS;
-    }
+    // entity ambient. When the zone ships 0x2F records, use that authored ambient
+    // directly — the data already carries the day/night level and a ~2.4:1 sun:ambient
+    // ratio, so scaling it by GlobalAmbientLight (amb_k) and the dark-fallback
+    // COLOR_BIAS only lifted the shadow side and flattened the model's form.
+    let mut amb_rgb = if zone_lighting.valid {
+        zone_lighting.ambient_entity
+    } else {
+        let amb = ambient.color.to_linear();
+        let amb_k = (ambient.brightness / AMBIENT_REF_LUX).clamp(0.0, 1.5);
+        let mut a = Vec3::new(amb.red, amb.green, amb.blue) * amb_k;
+        if a.max_element() < AMBIENT_BIAS_BELOW {
+            a *= COLOR_BIAS;
+        }
+        a
+    };
     amb_rgb = amb_rgb.max(Vec3::splat(AMBIENT_FLOOR));
     let ambient_v = amb_rgb.extend(1.0);
 
@@ -1988,7 +1996,12 @@ pub fn update_ffxi_render_actor_lighting(
             let c = zone_lighting.model_color;
             (
                 Vec4::new(f.x, f.y, f.z, 0.0),
-                Vec4::new(c.x, c.y, c.z, zone_lighting.model_k.clamp(0.0, 1.0)),
+                Vec4::new(
+                    c.x,
+                    c.y,
+                    c.z,
+                    zone_lighting.model_k.clamp(0.0, MODEL_DIR_MAX),
+                ),
             )
         } else {
             (Vec4::ZERO, Vec4::ZERO)

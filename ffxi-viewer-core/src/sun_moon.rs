@@ -592,7 +592,16 @@ pub fn sun_moon_system(
         let sun_rgb = e_sun_hue * e_sun_k;
         let moon_rgb = e_moon_hue * e_moon_k;
         let model_rgb = moon_rgb.lerp(sun_rgb, mix);
-        let (model_color, model_k) = diffuse_to_light([model_rgb.x, model_rgb.y, model_rgb.z]);
+        // Keep the authored overbright magnitude (>1): diffuse_to_light clamps k to 1.0,
+        // which cropped the entity directional and flattened actor form. The actor caps
+        // the ceiling (MODEL_DIR_MAX). Scalar max for the cranelift dev backend, which
+        // can't lower glam's horizontal-max intrinsic.
+        let model_k = model_rgb.x.max(model_rgb.y).max(model_rgb.z).max(0.0);
+        let model_color = if model_k > 1e-4 {
+            model_rgb / model_k
+        } else {
+            Vec3::ZERO
+        };
 
         let (s_hue, s_k) = diffuse_to_light([
             rec.sunlight_diffuse_landscape[0],
