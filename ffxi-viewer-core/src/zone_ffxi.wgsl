@@ -136,12 +136,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var texel = vec4<f32>(1.0);
     if (has_texture) {
         texel = textureSample(base_tex, base_samp, in.uv);
-        // Alpha test for Mask subs (threshold in flags.w; 0.0 for opaque subs
-        // means this never fires). A custom fragment bypasses Bevy's built-in
-        // mask handling, so do it manually.
-        if (texel.a < material_flags.flags.w) {
-            discard;
-        }
+    }
+    // XIM `coloredPixel.a = vertexColor.a * texel.a` (XIM's 4·(va/255)·(ta/255)
+    // matches our /128 vertex alpha × remapped texel alpha). Vertex alpha is a
+    // second alpha-clip layer FFXI leans on for river/water edges, so fold it
+    // into the cutout discard — not just the blend output. Opaque subs carry
+    // flags.w = 0, so the test never fires and ground/walls stay solid. A custom
+    // fragment bypasses Bevy's built-in mask handling, so do the test manually.
+    let combined_a = clamp(in.color.a, 0.0, 1.0) * texel.a;
+    if (combined_a < material_flags.flags.w) {
+        discard;
     }
     let n = normalize(in.world_normal);
     // Cast-shadow attenuation on the sun term only (ambient/point fill the rest,
@@ -151,13 +155,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // light. Vertex colour is overbright (can exceed 1) — do NOT clamp it.
     let lit = scene_irradiance(n, in.world_position, sun) * in.color.rgb;
     let rgb = 2.0 * lit * texel.rgb;
-    // XIM `ZoneMeshSection` 0x8000 subs blend (`coloredPixel.a = vertexColor.a *
-    // texel.a`, clamped). Our vertex alpha is pre-scaled /128 and texel alpha
-    // remapped, so the raw product matches XIM's 4·(va/255)·(ta/255). Opaque
-    // subs keep alpha 1.0 so ground/wall textures with incidental alpha stay solid.
+    // 0x8000 subs (water/glass) emit the blended alpha; everything else opaque.
     var out_alpha = 1.0;
     if (material_flags.flags.y > 0.5) {
-        out_alpha = clamp(in.color.a, 0.0, 1.0) * texel.a;
+        out_alpha = combined_a;
     }
     return vec4<f32>(rgb, out_alpha);
 }
