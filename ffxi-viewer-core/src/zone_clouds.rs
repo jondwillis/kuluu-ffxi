@@ -523,11 +523,183 @@ fn drive_zone_clouds(
     }
 }
 
+// Star dome (weat/<type>/star/ sta1 mesh + sta2 texture). Placed just inside the
+// skybox sphere so it reads as the farthest sky layer, behind the cloud canopy.
+const STAR_RADIUS: f32 = 5000.0;
+
+#[derive(Component)]
+struct StarDome;
+
+#[derive(Resource, Default)]
+struct ZoneStarState {
+    zone: Option<u16>,
+    entity: Option<Entity>,
+}
+
+fn find_star_dir<'a>(weat_type: &'a ChunkNode<'a>) -> Option<&'a ChunkNode<'a>> {
+    weat_type
+        .children
+        .iter()
+        .find(|c| c.chunk.kind == 0x01 && c.chunk.name == *b"star")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_zone_stars(
+    scene_state: Res<crate::snapshot::SceneState>,
+    current_weather: Res<crate::weather_fx::CurrentWeather>,
+    settings: Res<GraphicsSettings>,
+    mut state: ResMut<ZoneStarState>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let zone_id = scene_state.snapshot.zone_id;
+    if zone_id == state.zone {
+        return;
+    }
+    if let Some(e) = state.entity.take() {
+        commands.entity(e).despawn();
+    }
+    state.zone = zone_id;
+
+    let Some(zone_id) = zone_id else {
+        return;
+    };
+    let Some(file_id) = ffxi_dat::zone_dat::zone_id_to_mzb_file_id(zone_id) else {
+        return;
+    };
+    let Ok(root) = DatRoot::from_env_or_default() else {
+        return;
+    };
+    let Ok(location) = root.resolve(file_id) else {
+        return;
+    };
+    let Ok(bytes) = fs::read(location.path_under(root.root())) else {
+        return;
+    };
+
+    let tree = walk_tree(&bytes);
+    let want = weather_type_id(current_weather.0.map(|w| w as u16).unwrap_or(0));
+    let weat_type = match find_weat_type(&tree, want).or_else(|| find_weat_type(&tree, *b"fine")) {
+        Some(n) => n,
+        None => return,
+    };
+    let Some(star_dir) = find_star_dir(weat_type) else {
+        return;
+    };
+
+    let Some(mesh_chunk) = star_dir
+        .children
+        .iter()
+        .find(|c| c.chunk.kind == ChunkKind::Mmb as u8)
+    else {
+        return;
+    };
+    let Ok(decrypted) = mmb::decrypt(mesh_chunk.chunk.data) else {
+        return;
+    };
+    let Some((mesh, half_xz)) = build_mesh(&decrypted) else {
+        return;
+    };
+    let scale = if half_xz > 1.0 {
+        STAR_RADIUS / half_xz
+    } else {
+        1.0
+    };
+
+    let quality = TextureQuality {
+        mipmaps: settings.texture_filtering.mipmaps(),
+        anisotropy: settings.texture_filtering.anisotropy(),
+    };
+    let texture = star_dir
+        .children
+        .iter()
+        .find(|c| c.chunk.kind == ChunkKind::Img as u8)
+        .and_then(|c| decode_texture(c.chunk.data).ok())
+        .map(|t| images.add(decoded_texture_to_image(&t, quality)));
+
+    // Unlit additive: stars are self-luminous points on a black field, so scene
+    // lighting must not dim them and the black background must add nothing.
+    let material = materials.add(StandardMaterial {
+        base_color_texture: texture,
+        unlit: true,
+        alpha_mode: AlphaMode::Add,
+        ..default()
+    });
+
+    let visibility = if settings.sky_style() == SkyStyle::Vanilla {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    let e = commands
+        .spawn((
+            InGameEntity,
+            StarDome,
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(material),
+            Transform::from_rotation(ffxi_to_bevy_basis()).with_scale(Vec3::splat(scale)),
+            visibility,
+            bevy::light::NotShadowCaster,
+            bevy::light::NotShadowReceiver,
+        ))
+        .id();
+    state.entity = Some(e);
+}
+
+#[allow(clippy::type_complexity)]
+fn drive_zone_stars(
+    settings: Res<GraphicsSettings>,
+    vana_clock: Res<crate::vana_time::VanaClock>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    cam_q: Query<&Transform, (With<crate::camera::OperatorCamera>, Without<StarDome>)>,
+    mut stars: Query<
+        (
+            &mut Transform,
+            &mut Visibility,
+            &MeshMaterial3d<StandardMaterial>,
+        ),
+        With<StarDome>,
+    >,
+) {
+    let Ok((mut xf, mut vis, mat)) = stars.single_mut() else {
+        return;
+    };
+    let vanilla = settings.sky_style() == SkyStyle::Vanilla;
+    let cam_pos = cam_q.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+    let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
+
+    // Fade in as the sun drops below the horizon over a ~17deg twilight band.
+    let night = (-sky.sun_altitude / 0.30).clamp(0.0, 1.0);
+    let want = if vanilla && night > 0.0 {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    if *vis != want {
+        *vis = want;
+    }
+
+    // One slow celestial roll per Vana day.
+    let frac = crate::hud::vana_clock::full_day_fraction(vana_clock.earth_unix_secs_now());
+    let scale = xf.scale;
+    xf.translation = cam_pos;
+    xf.rotation = Quat::from_rotation_y(frac * std::f32::consts::TAU) * ffxi_to_bevy_basis();
+    xf.scale = scale;
+
+    if let Some(m) = materials.get_mut(&mat.0) {
+        m.base_color = Color::linear_rgb(night, night, night);
+    }
+}
+
 pub struct ZoneCloudsPlugin;
 
 impl Plugin for ZoneCloudsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ZoneCloudState>()
-            .add_systems(Update, (rebuild_zone_clouds, drive_zone_clouds).chain());
+            .init_resource::<ZoneStarState>()
+            .add_systems(Update, (rebuild_zone_clouds, drive_zone_clouds).chain())
+            .add_systems(Update, (rebuild_zone_stars, drive_zone_stars).chain());
     }
 }
