@@ -359,6 +359,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
                 graphics_settings::apply_vsync_system,
                 graphics_settings::apply_anti_aliasing_system,
                 graphics_settings::apply_sky_realism_system,
+                graphics_settings::apply_tonemapping_system,
             )
                 .chain()
                 .run_if(resource_changed::<GraphicsSettings>),

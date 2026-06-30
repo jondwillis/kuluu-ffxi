@@ -1,3 +1,4 @@
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{
     CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLightShadowMap, VolumetricFog,
 };
@@ -809,6 +810,17 @@ impl GraphicsSettings {
         self.sky_style
     }
 
+    // Retail outputs colour directly with no filmic tonemap, so Vanilla uses None for
+    // FFXI's punchy/saturated palette; the filmic TonyMcMapface desaturated and
+    // flattened the authored colours. Enhanced keeps it for its realistic HDR look.
+    pub fn tonemapping(&self) -> Tonemapping {
+        if self.sky_style == SkyStyle::Vanilla {
+            Tonemapping::None
+        } else {
+            Tonemapping::TonyMcMapface
+        }
+    }
+
     pub fn sky_embellishments_enabled(&self) -> bool {
         self.sky_style == SkyStyle::Enhanced
     }
@@ -1136,6 +1148,18 @@ pub fn apply_sky_realism_system(
     let want = settings.sky_style.sky_realism();
     if *sky != want {
         *sky = want;
+    }
+}
+
+pub fn apply_tonemapping_system(
+    settings: Res<GraphicsSettings>,
+    mut q_cam: Query<&mut Tonemapping, With<OperatorCamera>>,
+) {
+    let want = settings.tonemapping();
+    for mut tm in q_cam.iter_mut() {
+        if *tm != want {
+            *tm = want;
+        }
     }
 }
 

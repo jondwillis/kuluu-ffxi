@@ -1,4 +1,3 @@
-use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{ShadowFilteringMethod, VolumetricFog};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
@@ -214,7 +213,7 @@ pub fn build_operator_camera(
         bevy::camera::visibility::RenderLayers::from_layers(&[0, WORLD_GIZMO_LAYER]),
         Camera3d::default(),
         Hdr,
-        Tonemapping::TonyMcMapface,
+        settings.tonemapping(),
         ShadowFilteringMethod::Gaussian,
         settings.msaa(),
         Bloom {
