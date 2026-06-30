@@ -59,6 +59,21 @@ fn drive_feathers_cursor(
     }
 }
 
+// RenderDiagnosticsPlugin only records elapsed_gpu render-graph spans when the
+// device has wgpu timestamp queries, so without this the perf HUD can only show
+// CPU encode time and a frame spike's GPU cost is invisible. Gated by env var
+// because requesting a feature the adapter lacks aborts device creation.
+fn gpu_timing_render_plugin() -> bevy::render::RenderPlugin {
+    use bevy::render::settings::{RenderCreation, WgpuFeatures, WgpuSettings};
+    let mut settings = WgpuSettings::default();
+    settings.features |=
+        WgpuFeatures::TIMESTAMP_QUERY | WgpuFeatures::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    bevy::render::RenderPlugin {
+        render_creation: RenderCreation::Automatic(settings),
+        ..default()
+    }
+}
+
 #[derive(States, Default, Debug, Clone, Eq, PartialEq, Hash)]
 pub enum AppPhase {
     #[default]
@@ -127,16 +142,19 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     let mut app = App::new();
 
+    let mut plugins = DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: format!("ffxi-client — {server}"),
+            resolution: (1280u32, 800u32).into(),
+            ..default()
+        }),
+        ..default()
+    });
+    if std::env::var_os("FFXI_GPU_TIMING").is_some() {
+        plugins = plugins.set(gpu_timing_render_plugin());
+    }
     app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: format!("ffxi-client — {server}"),
-                    resolution: (1280u32, 800u32).into(),
-                    ..default()
-                }),
-                ..default()
-            })
+        plugins
             .build()
             .disable::<LogPlugin>()
             .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>(),
