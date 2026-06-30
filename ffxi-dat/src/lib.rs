@@ -28,6 +28,7 @@ pub mod skel_anim;
 pub mod skel_mesh;
 pub mod sprite_sheet;
 pub mod texture;
+pub mod ui_element;
 pub mod vos2;
 pub mod vtable;
 pub mod weather;
