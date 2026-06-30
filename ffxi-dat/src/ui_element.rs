@@ -406,4 +406,33 @@ mod tests {
         assert_eq!(&sprite.rgba[0..4], &red);
         assert_eq!(&sprite.rgba[4..8], &red);
     }
+
+    // Gated on a retail install (self-skips without one). Pins the parser +
+    // texture decode + crop against the real day-of-week orbs, which live in
+    // ROM/119/51.DAT group "menu    framesus" at index 106 + element (the JP
+    // "menu    frames  " is the same group; HorizonXI/US ships only framesus).
+    #[test]
+    fn real_dat_day_orbs_extract_14x14() {
+        let Some(root) = crate::archive::open_test_install() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(root.root().join("ROM/119/51.DAT")) else {
+            return;
+        };
+        let Some(group) = find_ui_element_group(&bytes, "menu    framesus") else {
+            return;
+        };
+        assert!(group.elements.len() > 113, "framesus has the 8 day orbs");
+
+        for idx in 106..=113usize {
+            let sprite = ui_sprite(&bytes, "menu    framesus", idx)
+                .unwrap_or_else(|| panic!("no sprite for framesus[{idx}]"));
+            assert_eq!(
+                (sprite.width, sprite.height),
+                (14, 14),
+                "day orb {idx} is a 14x14 sprite"
+            );
+            assert_eq!(sprite.rgba.len(), 14 * 14 * 4);
+        }
+    }
 }

@@ -55,6 +55,7 @@ pub mod sun_moon;
 pub mod target_ring;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod target_strobe;
+pub mod ui_element_atlas;
 pub mod ui_font;
 pub mod vana_time;
 #[cfg(feature = "enhanced-water")]
@@ -165,6 +166,9 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(minimap::MinimapPlugin);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins(ui_element_atlas::UiElementAtlasPlugin);
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(graphics::render_scale::RenderScalePlugin);

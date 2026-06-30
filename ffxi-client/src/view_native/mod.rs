@@ -197,6 +197,9 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         .insert_resource(ffxi_viewer_core::moon_material::MoonDatRoot(
             dat_root.clone(),
         ))
+        .insert_resource(ffxi_viewer_core::ui_element_atlas::UiElementDatRoot(
+            dat_root.clone(),
+        ))
         .insert_resource(DatRootRes(dat_root));
     #[cfg(unix)]
     app.insert_resource(AgentListen(agent_listen));

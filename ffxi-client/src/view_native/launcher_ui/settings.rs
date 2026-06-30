@@ -369,6 +369,9 @@ fn persist_and_reload(
     commands.insert_resource(ffxi_viewer_core::hud::item_dat_root::ItemDatRoot(Some(
         arc.clone(),
     )));
+    commands.insert_resource(ffxi_viewer_core::ui_element_atlas::UiElementDatRoot(Some(
+        arc.clone(),
+    )));
 
     cache.entries.clear();
     last_zone.zone_id = None;
