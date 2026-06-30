@@ -91,6 +91,10 @@ pub struct CloudGeneratorDef {
     pub linked_id: [u8; 4],
     pub linked_type: u8,
     pub base_position: [f32; 3],
+    // research/xim ParticleGeneratorParser.kt setup opcode 0x0F initial scale. The
+    // weat/<type>/ canopy mesh is authored small (clod ~120u half-width); the sky
+    // dome size comes from this scale, so dropping it leaves a slab at the camera.
+    pub scale: [f32; 3],
 
     // research/xim ParticleGeneratorParser.kt:271-274 the setup-section "ToD Color"
     // KeyFrameValueSetup opcodes 0x60/0x61/0x62/0x63 (R/G/B/A; the 0x3C-0x3F
@@ -134,6 +138,7 @@ impl Generator {
         let mut color_g_track = None;
         let mut color_b_track = None;
         let mut alpha_mult_track = None;
+        let mut scale = [1.0f32; 3];
         while cursor + 4 <= body.len() {
             let opcode = body[cursor];
             if opcode == 0x00 {
@@ -167,11 +172,19 @@ impl Generator {
                             f32_le(body, payload + 20),
                             f32_le(body, payload + 24),
                         ],
+                        scale: [1.0, 1.0, 1.0],
                         color_r_track: None,
                         color_g_track: None,
                         color_b_track: None,
                         alpha_mult_track: None,
                     });
+                }
+                0x0F if payload + 12 <= body.len() => {
+                    scale = [
+                        f32_le(body, payload),
+                        f32_le(body, payload + 4),
+                        f32_le(body, payload + 8),
+                    ];
                 }
                 // ToD Color setup (0x60-0x63) and ToD Specular Color setup (0x6D-0x70):
                 // KeyFrameValueSetup stores the 0x19 keyframe DAT-id at payload+4.
@@ -196,6 +209,7 @@ impl Generator {
             def.color_g_track = color_g_track;
             def.color_b_track = color_b_track;
             def.alpha_mult_track = alpha_mult_track;
+            def.scale = scale;
             def
         }))
     }
@@ -620,6 +634,13 @@ mod tests {
         cmd[4 + 29] = 0x0B; // linked StaticMesh particle
         body.extend_from_slice(&cmd);
 
+        // 0x0F initial-scale block (size_words=4 -> 12-byte payload).
+        let mut scl = vec![0x0Fu8, 0x04, 0x00, 0x00];
+        scl.extend_from_slice(&7.0f32.to_le_bytes());
+        scl.extend_from_slice(&5.0f32.to_le_bytes());
+        scl.extend_from_slice(&7.0f32.to_le_bytes());
+        body.extend_from_slice(&scl);
+
         let g = Generator::parse_cloud_generator(*b"cld1", &body)
             .unwrap()
             .unwrap();
@@ -629,6 +650,7 @@ mod tests {
         assert!(!g.is_sun_attached());
         assert!((g.base_position[1] - 20.0).abs() < 1e-6);
         assert_eq!(g.color_r_track, None);
+        assert_eq!(g.scale, [7.0, 5.0, 7.0]);
     }
 
     fn clock_block(opcode: u8, id: &[u8; 4]) -> Vec<u8> {

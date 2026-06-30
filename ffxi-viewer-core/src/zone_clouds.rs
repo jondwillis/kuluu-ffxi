@@ -27,6 +27,13 @@ use crate::zone_texture::{decoded_texture_to_image, TextureQuality};
 // matches the SKY_RADIUS the SunDisc uses so cloud/sun share one dome scale.
 const SUN_LAYER_DISTANCE: f32 = 4000.0;
 
+// The authored 0x0F canopy scale (research/xim ParticleGeneratorParser.kt) varies per
+// zone/weather and often leaves the canopy rim nearer than the terrain, so the cloud
+// sheet draped over zone geometry. Enforce a minimum rim radius (just inside
+// skybox::SKYBOX_RADIUS=5500) so terrain is always nearer and depth-occludes the
+// clouds — the same "sky is the farthest thing" rule the skybox dome relies on.
+const CLOUD_MIN_RIM: f32 = 4000.0;
+
 // research/xim EnvironmentManager.kt:351-369 switchWeather default 3.33s cross-fade
 // between the old and new weat/<type>/ effect sets on a 0x0057 weather change.
 const WEATHER_FADE_SECS: f32 = 3.33;
@@ -108,6 +115,7 @@ struct CloudLayerBuild {
     material: Handle<FfxiZoneMaterial>,
     attach: CloudAttach,
     base_position: Vec3,
+    scale: Vec3,
     tracks: CloudColorTracks,
 }
 
@@ -166,13 +174,16 @@ fn resolve_color_tracks(dir: &ChunkNode, def: &CloudGeneratorDef) -> CloudColorT
     }
 }
 
-fn build_mesh(decrypted: &[u8]) -> Option<Mesh> {
+// Returns the assembled mesh plus its horizontal half-extent (max |x|,|z| over all
+// verts) so the caller can scale the canopy rim out to a fixed sky radius.
+fn build_mesh(decrypted: &[u8]) -> Option<(Mesh, f32)> {
     let models = parse_models(decrypted);
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
     let mut colors: Vec<[f32; 4]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
+    let mut half_xz = 0.0f32;
 
     for m in &models {
         if m.vertices.is_empty() || m.indices.is_empty() {
@@ -181,6 +192,7 @@ fn build_mesh(decrypted: &[u8]) -> Option<Mesh> {
         let base = positions.len() as u32;
         let vert_count = m.vertices.len() as u16;
         for v in &m.vertices {
+            half_xz = half_xz.max(v.pos[0].abs()).max(v.pos[2].abs());
             positions.push(v.pos);
             normals.push(v.normal);
             uvs.push(v.uv);
@@ -213,7 +225,7 @@ fn build_mesh(decrypted: &[u8]) -> Option<Mesh> {
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(indices));
-    Some(mesh)
+    Some((mesh, half_xz))
 }
 
 fn build_cloud_layers(
@@ -273,7 +285,7 @@ fn build_cloud_layers(
         let Ok(decrypted) = mmb::decrypt(mesh_chunk.chunk.data) else {
             continue;
         };
-        let Some(mesh) = build_mesh(&decrypted) else {
+        let Some((mesh, half_xz)) = build_mesh(&decrypted) else {
             continue;
         };
 
@@ -288,6 +300,7 @@ fn build_cloud_layers(
             material,
             attach,
             base_position: def_base_to_vec(&def),
+            scale: layer_scale(attach, &def, half_xz),
             tracks: resolve_color_tracks(weat_type, &def),
         });
     }
@@ -300,6 +313,26 @@ fn def_base_to_vec(def: &CloudGeneratorDef) -> Vec3 {
         def.base_position[1],
         def.base_position[2],
     )
+}
+
+// Sun discs are placed out along sun_dir at SUN_LAYER_DISTANCE, so their authored
+// 0x0F scale is used as-is. Camera-follow cloud canopies sit on the camera, so their
+// rim (half_xz * authored scale) is pushed out to at least CLOUD_MIN_RIM — keeping the
+// authored aspect ratio — so distant terrain stays nearer and occludes them.
+fn layer_scale(attach: CloudAttach, def: &CloudGeneratorDef, half_xz: f32) -> Vec3 {
+    let authored = Vec3::from_array(def.scale);
+    match attach {
+        CloudAttach::Sun => authored,
+        CloudAttach::Camera => {
+            let rim = half_xz * authored.x.max(authored.z);
+            let factor = if rim > 1.0 {
+                (CLOUD_MIN_RIM / rim).max(1.0)
+            } else {
+                1.0
+            };
+            authored * factor
+        }
+    }
 }
 
 fn id_str(id: [u8; 4]) -> String {
@@ -413,7 +446,7 @@ fn rebuild_zone_clouds(
                 },
                 Mesh3d(layer.mesh),
                 MeshMaterial3d(layer.material),
-                Transform::from_rotation(ffxi_to_bevy_basis()),
+                Transform::from_rotation(ffxi_to_bevy_basis()).with_scale(layer.scale),
                 visibility,
                 bevy::light::NotShadowCaster,
                 bevy::light::NotShadowReceiver,
