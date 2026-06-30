@@ -32,6 +32,11 @@ use crate::zone_texture::{decoded_texture_to_image, TextureQuality};
 // clouds — the same "sky is the farthest thing" rule the skybox dome relies on.
 const CLOUD_MIN_RIM: f32 = 4000.0;
 
+// Gentle wind: the canopy rotates slowly about the vertical so clouds visibly drift
+// across the sky — a stand-in for the retail 0x27/0x28 TextureCoordinateUpdater scroll
+// (research/xim ParticleUpdaters.kt). rad/s; cld2 rides a touch faster for parallax.
+const CLOUD_DRIFT_RATE: f32 = 0.005;
+
 // research/xim EnvironmentManager.kt:351-369 switchWeather default 3.33s cross-fade
 // between the old and new weat/<type>/ effect sets on a 0x0057 weather change.
 const WEATHER_FADE_SECS: f32 = 3.33;
@@ -486,6 +491,7 @@ fn drive_zone_clouds(
     let basis = ffxi_to_bevy_basis();
     let day_fraction = crate::hud::vana_clock::full_day_fraction(vana_clock.earth_unix_secs_now());
     let dt = time.delta_secs();
+    let drift = time.elapsed_secs() * CLOUD_DRIFT_RATE;
 
     for (entity, mut xf, mut vis, layer, mut fade, mat) in &mut clouds {
         let want = if vanilla {
@@ -496,7 +502,9 @@ fn drive_zone_clouds(
         if *vis != want {
             *vis = want;
         }
-        xf.rotation = basis;
+        // Higher layers (cld2 base.y ~30) drift a touch faster for parallax.
+        let speed = 1.0 + layer.base_position.y.abs() * 0.01;
+        xf.rotation = Quat::from_rotation_y(drift * speed) * basis;
         xf.translation = cam_pos + basis * layer.base_position;
 
         fade.elapsed += dt;
