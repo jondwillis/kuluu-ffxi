@@ -106,10 +106,13 @@ targets = [
 # Mirror the hand-rolled legs' `cargo build -p ffxi-client --features native-window`.
 features = ["native-window"]
 default-features = true
-# A YAML array of steps injected before `dist build` (path is relative to
-# .github/workflows/). Carries the per-OS env + submodule-init the hand-rolled
-# release.yml did inline — REQUIRED, or build.rs panics with no vendor/server.
-github-build-setup = "build-setup.yml"
+# A YAML array of steps injected before `dist build`. The path is resolved
+# relative to .github/workflows/, so `../` keeps the fragment OUT of that dir —
+# GitHub Actions runs every *.yml under .github/workflows/ as a workflow, and a
+# bare step-array isn't a valid one (it fails the run at parse time). Carries the
+# per-OS env + submodule-init the hand-rolled release.yml did inline — REQUIRED,
+# or build.rs panics with no vendor/server.
+github-build-setup = "../build-setup.yml"
 # dist cannot build the trunk/wasm bundle; this custom job produces it and dist
 # attaches the zip to the same GitHub Release.
 global-artifacts-jobs = ["./release-wasm"]

@@ -1,9 +1,14 @@
 # dist `github-build-setup` fragment — a YAML *array of steps* (not a full
 # workflow) injected into dist's build-local-artifacts job after checkout and
-# before `dist build`. dist does its own checkout + Rust toolchain install, so
-# this only supplies what dist won't: the build submodules and the per-OS env
-# the hand-rolled release.yml carried inline. Keep the rationale here — this is
-# where release.yml:59-141's WHY lives once that file is deleted.
+# before `dist build`. Lives in .github/ (NOT .github/workflows/) on purpose:
+# Actions runs every *.yml under workflows/ as a workflow, and this bare
+# step-array isn't one — it fails the run at parse time. Referenced from
+# Cargo.toml [workspace.metadata.dist] as github-build-setup = "../build-setup.yml"
+# (dist resolves that path relative to .github/workflows/). dist does its own
+# checkout + Rust toolchain install, so this only supplies what dist won't: the
+# build submodules and the per-OS env the hand-rolled release.yml carried inline.
+# Keep the rationale here — this is where release.yml:59-141's WHY lives once
+# that file is deleted.
 
 # .gitmodules declares the vendor submodules with git@ SSH URLs; rewrite the
 # public LandSandBoat repo to HTTPS so no SSH key is needed on the runner.
