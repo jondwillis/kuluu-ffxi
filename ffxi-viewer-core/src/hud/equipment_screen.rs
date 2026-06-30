@@ -34,17 +34,75 @@ const SLOT_ABBR: [&str; 16] = [
     "R.Er", "L.Rg", "R.Rg", "Back",
 ];
 
-// Retail equipment-window grid, read column-major: weapons / head-neck-ears /
-// body-hands-rings / back-waist-legs-feet. Values are internal slot indices
-// (0=Main..15=Back) matching SceneSnapshot.equipped[16].
-pub const EQUIP_GRID: [[u8; 4]; 4] = [
-    [0, 4, 5, 15],  // Main,  Head, Body,  Back
-    [1, 9, 6, 10],  // Sub,   Neck, Hands, Waist
-    [2, 11, 13, 7], // Ranged,L.Ear,L.Ring,Legs
-    [3, 12, 14, 8], // Ammo,  R.Ear,R.Ring,Feet
-];
+// Discriminants are the internal slot indices used by SceneSnapshot.equipped[16]
+// and MenuKind::EquipSlot — `repr(u8)` lets `slot as usize` recover that index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EquipmentIndex {
+    Main = 0,
+    Sub = 1,
+    Range = 2,
+    Ammo = 3,
+    Head = 4,
+    Body = 5,
+    Hands = 6,
+    Legs = 7,
+    Feet = 8,
+    Neck = 9,
+    Waist = 10,
+    LeftEar = 11,
+    RightEar = 12,
+    LeftRing = 13,
+    RightRing = 14,
+    Back = 15,
+}
 
-fn slot_to_cell(slot: u8) -> (usize, usize) {
+impl EquipmentIndex {
+    pub const ALL: [EquipmentIndex; 16] = [
+        Self::Main,
+        Self::Sub,
+        Self::Range,
+        Self::Ammo,
+        Self::Head,
+        Self::Body,
+        Self::Hands,
+        Self::Legs,
+        Self::Feet,
+        Self::Neck,
+        Self::Waist,
+        Self::LeftEar,
+        Self::RightEar,
+        Self::LeftRing,
+        Self::RightRing,
+        Self::Back,
+    ];
+
+    pub fn from_index(index: u8) -> Option<Self> {
+        Self::ALL.get(index as usize).copied()
+    }
+
+    pub fn name(self) -> &'static str {
+        SLOT_NAMES[self as usize]
+    }
+
+    pub fn abbr(self) -> &'static str {
+        SLOT_ABBR[self as usize]
+    }
+}
+
+// Retail equipment-window grid, one group per row (ref: kuluu-y04 retail
+// screenshot): weapons / head-neck-ears / body-hands-rings / back-waist-legs-feet.
+pub const EQUIP_GRID: [[EquipmentIndex; 4]; 4] = {
+    use EquipmentIndex::*;
+    [
+        [Main, Sub, Range, Ammo],
+        [Head, Neck, LeftEar, RightEar],
+        [Body, Hands, LeftRing, RightRing],
+        [Back, Waist, Legs, Feet],
+    ]
+};
+
+fn slot_to_cell(slot: EquipmentIndex) -> (usize, usize) {
     for (r, row) in EQUIP_GRID.iter().enumerate() {
         for (c, &s) in row.iter().enumerate() {
             if s == slot {
@@ -58,10 +116,11 @@ fn slot_to_cell(slot: u8) -> (usize, usize) {
 /// Move the grid cursor (an internal slot index) by `dx` columns / `dy` rows,
 /// wrapping like the retail window. Used by the menu key handler.
 pub fn grid_move(slot: u8, dx: i32, dy: i32) -> u8 {
-    let (r, c) = slot_to_cell(slot.min(15));
+    let slot = EquipmentIndex::from_index(slot).unwrap_or(EquipmentIndex::Main);
+    let (r, c) = slot_to_cell(slot);
     let nr = (r as i32 + dy).rem_euclid(EQUIP_GRID.len() as i32) as usize;
     let nc = (c as i32 + dx).rem_euclid(EQUIP_GRID[0].len() as i32) as usize;
-    EQUIP_GRID[nr][nc]
+    EQUIP_GRID[nr][nc] as u8
 }
 
 const DETAIL_ROWS: usize = 10;
@@ -77,7 +136,7 @@ enum EquipRole {
     StatusILvl,
     StatusAttr(usize),
     StatusCombat,
-    CellLabel(u8),
+    CellLabel(EquipmentIndex),
     DetailName,
     DetailRow(usize),
     StorageTitle,
@@ -89,7 +148,7 @@ pub(crate) struct EquipText(EquipRole);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IconSlot {
-    Cell(u8),
+    Cell(EquipmentIndex),
     Detail,
 }
 
@@ -97,7 +156,7 @@ enum IconSlot {
 pub(crate) struct EquipIcon(IconSlot);
 
 #[derive(Component, Clone, Copy)]
-pub(crate) struct EquipCellFrame(u8);
+pub(crate) struct EquipCellFrame(EquipmentIndex);
 
 #[derive(Component)]
 pub(crate) struct EquipScreenRoot;
@@ -108,10 +167,10 @@ pub(crate) struct EquipStorageBox;
 enum ScreenState {
     Closed,
     SlotPicker {
-        selected_slot: u8,
+        selected_slot: EquipmentIndex,
     },
     StoragePicker {
-        selected_slot: u8,
+        selected_slot: EquipmentIndex,
         storage_cursor: usize,
     },
 }
@@ -123,10 +182,11 @@ fn screen_state(mode: &InputMode) -> ScreenState {
     match stack.current() {
         Some(level) => match level.kind {
             MenuKind::Equipment => ScreenState::SlotPicker {
-                selected_slot: (level.cursor as u8).min(15),
+                selected_slot: EquipmentIndex::from_index(level.cursor as u8)
+                    .unwrap_or(EquipmentIndex::Main),
             },
             MenuKind::EquipSlot(slot) => ScreenState::StoragePicker {
-                selected_slot: slot.min(15),
+                selected_slot: EquipmentIndex::from_index(slot).unwrap_or(EquipmentIndex::Main),
                 storage_cursor: level.cursor,
             },
             _ => ScreenState::Closed,
@@ -287,7 +347,7 @@ fn spawn_row(p: &mut ChildSpawnerCommands, role: EquipRole, size: f32, color: Co
     ));
 }
 
-fn spawn_cell(p: &mut ChildSpawnerCommands, slot: u8, placeholder: Handle<Image>) {
+fn spawn_cell(p: &mut ChildSpawnerCommands, slot: EquipmentIndex, placeholder: Handle<Image>) {
     p.spawn((
         EquipCellFrame(slot),
         Node {
@@ -314,7 +374,7 @@ fn spawn_cell(p: &mut ChildSpawnerCommands, slot: u8, placeholder: Handle<Image>
         ));
         c.spawn((
             EquipText(EquipRole::CellLabel(slot)),
-            Text::new(SLOT_ABBR[slot as usize]),
+            Text::new(slot.abbr()),
             text_font(11.0),
             TextColor(theme::MUTED),
         ));
@@ -401,8 +461,9 @@ pub(crate) fn update_equipment_screen(
     let snap = &state.snapshot;
     let me = crate::hud::self_hud::resolve_self(&snap.party, snap.self_char_id);
 
-    let equipped =
-        |slot: u8| -> Option<u16> { snap.equipped.get(slot as usize).copied().flatten() };
+    let equipped = |slot: EquipmentIndex| -> Option<u16> {
+        snap.equipped.get(slot as usize).copied().flatten()
+    };
 
     let focused_item: Option<u16> = if storage_active {
         dynamic
@@ -506,7 +567,7 @@ fn role_value(
     role: EquipRole,
     snap: &ffxi_viewer_wire::SceneSnapshot,
     me: Option<&ffxi_viewer_wire::PartyMember>,
-    selected_slot: u8,
+    selected_slot: EquipmentIndex,
     storage_active: bool,
     detail_name: &str,
     detail_rows: &[String],
@@ -535,7 +596,7 @@ fn role_value(
                 .and_then(ffxi_proto::item_names::lookup)
                 .unwrap_or("(empty)");
             (
-                format!("{}: {item}", SLOT_NAMES[selected_slot as usize]),
+                format!("{}: {item}", selected_slot.name()),
                 theme::TITLE,
                 true,
             )
@@ -599,7 +660,7 @@ fn role_value(
             } else {
                 theme::MUTED
             };
-            (SLOT_ABBR[slot as usize].to_string(), color, true)
+            (slot.abbr().to_string(), color, true)
         }
         EquipRole::DetailName => (detail_name.to_string(), theme::TITLE, true),
         EquipRole::DetailRow(i) => match detail_rows.get(i) {
@@ -700,7 +761,7 @@ mod tests {
         let mut seen = [false; 16];
         for row in EQUIP_GRID.iter() {
             for &slot in row.iter() {
-                assert!(!seen[slot as usize], "slot {slot} appears twice");
+                assert!(!seen[slot as usize], "slot {slot:?} appears twice");
                 seen[slot as usize] = true;
             }
         }
@@ -708,8 +769,19 @@ mod tests {
     }
 
     #[test]
-    fn grid_columns_are_retail_groups() {
-        // Column 0 = weapons (Main/Sub/Ranged/Ammo); column 1 starts at Head.
+    fn all_is_discriminant_ordered() {
+        for (i, &slot) in EquipmentIndex::ALL.iter().enumerate() {
+            assert_eq!(slot as usize, i, "ALL must be in discriminant order");
+            assert_eq!(EquipmentIndex::from_index(i as u8), Some(slot));
+        }
+        assert_eq!(EquipmentIndex::from_index(16), None);
+    }
+
+    #[test]
+    fn grid_rows_are_retail_groups() {
+        use EquipmentIndex::*;
+        // Row 0 = weapons (Main/Sub/Ranged/Ammo); column 0 = Main/Head/Body/Back.
+        assert_eq!(EQUIP_GRID[0], [Main, Sub, Range, Ammo]);
         assert_eq!(
             [
                 EQUIP_GRID[0][0],
@@ -717,20 +789,19 @@ mod tests {
                 EQUIP_GRID[2][0],
                 EQUIP_GRID[3][0]
             ],
-            [0, 1, 2, 3]
+            [Main, Head, Body, Back]
         );
-        assert_eq!(EQUIP_GRID[0][1], 4, "Head heads the second column");
     }
 
     #[test]
     fn grid_move_wraps_and_steps() {
-        // From Main (0): right -> Head (4); down -> Sub (1).
-        assert_eq!(grid_move(0, 1, 0), 4);
-        assert_eq!(grid_move(0, 0, 1), 1);
-        // Wrap: up from Main (top of column 0) -> Ammo (bottom, slot 3).
-        assert_eq!(grid_move(0, 0, -1), 3);
-        // Wrap: left from Main (col 0) -> Back (col 3, row 0, slot 15).
-        assert_eq!(grid_move(0, -1, 0), 15);
+        // From Main (0): right -> Sub (1); down -> Head (4).
+        assert_eq!(grid_move(0, 1, 0), 1);
+        assert_eq!(grid_move(0, 0, 1), 4);
+        // Wrap: up from Main (top of column 0) -> Back (bottom, slot 15).
+        assert_eq!(grid_move(0, 0, -1), 15);
+        // Wrap: left from Main (row 0) -> Ammo (col 3, row 0, slot 3).
+        assert_eq!(grid_move(0, -1, 0), 3);
     }
 
     #[test]
