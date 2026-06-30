@@ -14,9 +14,25 @@ pub struct MapCalibration {
     tried: bool,
 }
 
+impl MapCalibration {
+    fn ensure_dll(&mut self, root: &std::path::Path) -> Option<std::sync::Arc<MainDll>> {
+        if !self.tried {
+            self.tried = true;
+            self.dll = MainDll::load(root).ok().map(std::sync::Arc::new);
+        }
+        self.dll.clone()
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct PlayerMapGrid {
+    pub aabb: Option<MinimapAabb>,
+    zone: Option<u16>,
+}
+
 const MENUMAP_TEX: f32 = 512.0;
 
-fn zone_map_to_aabb(rec: &ZoneMapRecord) -> MinimapAabb {
+pub(crate) fn zone_map_to_aabb(rec: &ZoneMapRecord) -> MinimapAabb {
     let size = rec.size as f32;
     let off_x = rec.x_offset as f32;
     let off_y = rec.y_offset as f32;
@@ -44,6 +60,7 @@ impl Plugin for RetailBackendPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MinimapDatRoot>()
             .init_resource::<MapCalibration>()
+            .init_resource::<PlayerMapGrid>()
             .add_message::<LoadRetailMapRequest>()
             .add_systems(
                 Update,
@@ -52,8 +69,34 @@ impl Plugin for RetailBackendPlugin {
                     process_load_retail_map_requests,
                 )
                     .chain(),
-            );
+            )
+            .add_systems(Update, update_player_map_grid);
     }
+}
+
+pub fn update_player_map_grid(
+    scene_state: Res<SceneState>,
+    dat_root: Res<MinimapDatRoot>,
+    mut calib: ResMut<MapCalibration>,
+    mut grid: ResMut<PlayerMapGrid>,
+) {
+    let zone = scene_state.snapshot.zone_id;
+    if grid.zone == zone {
+        return;
+    }
+    grid.zone = zone;
+    grid.aabb = None;
+
+    let Some(zone_id) = zone.filter(|&z| z != 0) else {
+        return;
+    };
+    let Some(root) = dat_root.0.as_ref() else {
+        return;
+    };
+    let Some(dll) = calib.ensure_dll(root.root()) else {
+        return;
+    };
+    grid.aabb = dll.zone_map(zone_id, 0).map(|rec| zone_map_to_aabb(&rec));
 }
 
 fn graphic_flags_present(bytes: &[u8]) -> Vec<String> {
@@ -220,10 +263,7 @@ pub fn process_load_retail_map_requests(
             req.zone_id, req.file_id, graphic.width, graphic.height, graphic.category, graphic.id,
         );
 
-        if !calib.tried {
-            calib.tried = true;
-            calib.dll = MainDll::load(dat_root.root()).ok().map(std::sync::Arc::new);
-        }
+        calib.ensure_dll(dat_root.root());
 
         state.retail_image = Some(handle);
         state.retail_zone = Some(req.zone_id);

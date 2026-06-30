@@ -103,6 +103,10 @@ impl MinimapView {
     }
 }
 
+// research/xim/.../ui/MapDrawer.kt:59-60 indexes a 512-px map by floor(15f * pos / 512f),
+// i.e. a 16×16 grid whose last cell index is 15.
+const MAP_GRID_LAST_INDEX: f32 = 15.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MinimapAabb {
     pub min: Vec2,
@@ -142,6 +146,13 @@ impl MinimapAabb {
             return None;
         }
         Some(Vec2::new(u, v))
+    }
+
+    pub fn world_to_grid(&self, world: Vec3) -> (char, u8) {
+        let uv = self.world_to_uv(world);
+        let col = (MAP_GRID_LAST_INDEX * uv.x).floor() as u8;
+        let row = (MAP_GRID_LAST_INDEX * uv.y).floor() as u8;
+        ((b'A' + col) as char, row + 1)
     }
 }
 
@@ -617,5 +628,22 @@ mod tests {
 
         assert_eq!(zone_half_span(Some(aabb)), Some(200.0));
         assert_eq!(zone_half_span(None), None);
+    }
+
+    #[test]
+    fn world_to_grid_spans_a_to_p_and_1_to_16() {
+        let aabb = MinimapAabb {
+            min: Vec2::ZERO,
+            max: Vec2::splat(512.0),
+        };
+
+        assert_eq!(aabb.world_to_grid(Vec3::new(0.0, 0.0, 0.0)), ('A', 1));
+        assert_eq!(aabb.world_to_grid(Vec3::new(256.0, 0.0, 256.0)), ('H', 8));
+        assert_eq!(aabb.world_to_grid(Vec3::new(512.0, 0.0, 512.0)), ('P', 16));
+        // Off-map clamps to the edge cell rather than overflowing past 'P'/16.
+        assert_eq!(
+            aabb.world_to_grid(Vec3::new(9999.0, 0.0, 9999.0)),
+            ('P', 16)
+        );
     }
 }

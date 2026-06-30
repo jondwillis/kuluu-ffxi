@@ -4,15 +4,9 @@ use crate::hud::palette;
 
 pub const EARTH_EPOCH_UNIX: u64 = 1_009_810_800;
 
-const VANA_EPOCH_YEAR: u32 = 886;
-
 pub const EARTH_SECS_PER_VANA_HOUR: u64 = 144;
 
 pub const EARTH_SECS_PER_VANA_DAY: u64 = EARTH_SECS_PER_VANA_HOUR * 24;
-
-const VANA_DAYS_PER_MONTH: u32 = 30;
-const VANA_MONTHS_PER_YEAR: u32 = 12;
-const VANA_DAYS_PER_YEAR: u32 = VANA_DAYS_PER_MONTH * VANA_MONTHS_PER_YEAR;
 
 #[derive(Component)]
 pub struct VanaClockPanel;
@@ -35,7 +29,7 @@ pub fn spawn_vana_clock_as_child(p: &mut ChildSpawnerCommands) {
     .with_children(|p| {
         p.spawn((
             VanaClockLabel,
-            Text::new("V—"),
+            Text::new("0:00   (?-?)"),
             TextFont {
                 font_size: 12.0,
                 ..default()
@@ -57,8 +51,9 @@ pub const VANA_WEEKDAYS: [&str; 8] = [
 ];
 
 pub fn update_vana_clock(
-    time: Res<Time>,
     mut q: Query<&mut Text, With<VanaClockLabel>>,
+    q_self: Query<&Transform, With<crate::components::IsSelf>>,
+    grid: Option<Res<crate::minimap::retail::PlayerMapGrid>>,
     mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     mut prev_vana_day: Local<Option<u64>>,
@@ -66,10 +61,10 @@ pub fn update_vana_clock(
     let Ok(mut text) = q.single_mut() else {
         return;
     };
-    let _ = time;
 
     let earth_now = vana_clock.earth_unix_secs_now();
-    let want = format_vana(earth_now);
+    let cell = player_grid_cell(grid.as_deref(), q_self.single().ok());
+    let want = format!("{}   {}", format_vana_time(earth_now), cell);
     if **text != want {
         **text = want;
     }
@@ -103,22 +98,24 @@ pub fn full_day_fraction(earth_unix_secs: u64) -> f32 {
     (total_v_min % VANA_MINUTES_PER_DAY) as f32 / VANA_MINUTES_PER_DAY as f32
 }
 
-pub fn format_vana(earth_unix_secs: u64) -> String {
-    let earth_since_vana = earth_unix_secs.saturating_sub(EARTH_EPOCH_UNIX);
-
-    let total_v_min = earth_since_vana.saturating_mul(25) / 60;
-    let total_v_hour = total_v_min / 60;
-    let total_v_day = total_v_hour / 24;
-
+pub fn format_vana_time(earth_unix_secs: u64) -> String {
+    let total_v_min = vana_minutes_since_epoch(earth_unix_secs);
     let v_minute = total_v_min % 60;
-    let v_hour = total_v_hour % 24;
+    let v_hour = (total_v_min / 60) % 24;
+    format!("{v_hour}:{v_minute:02}")
+}
 
-    let v_year = VANA_EPOCH_YEAR as u64 + total_v_day / VANA_DAYS_PER_YEAR as u64;
-    let day_of_year = (total_v_day % VANA_DAYS_PER_YEAR as u64) as u32;
-    let v_month = day_of_year / VANA_DAYS_PER_MONTH + 1;
-    let v_day = day_of_year % VANA_DAYS_PER_MONTH + 1;
-
-    format!("V {v_year:04}-{v_month:02}-{v_day:02} {v_hour:02}:{v_minute:02}")
+fn player_grid_cell(
+    grid: Option<&crate::minimap::retail::PlayerMapGrid>,
+    player: Option<&Transform>,
+) -> String {
+    match (grid.and_then(|g| g.aabb), player) {
+        (Some(aabb), Some(tf)) => {
+            let (col, row) = aabb.world_to_grid(tf.translation);
+            format!("({col}-{row})")
+        }
+        _ => "(?-?)".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -126,39 +123,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vana_epoch_renders_as_first_day_midnight() {
-        let s = format_vana(EARTH_EPOCH_UNIX);
-        assert_eq!(s, "V 0886-01-01 00:00");
+    fn vana_epoch_renders_as_midnight() {
+        assert_eq!(format_vana_time(EARTH_EPOCH_UNIX), "0:00");
     }
 
     #[test]
-    fn one_vana_hour_after_epoch_is_01_00() {
-        let s = format_vana(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_HOUR);
-        assert_eq!(s, "V 0886-01-01 01:00");
+    fn one_vana_hour_after_epoch_is_1_00() {
+        assert_eq!(
+            format_vana_time(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_HOUR),
+            "1:00"
+        );
     }
 
     #[test]
-    fn one_vana_day_after_epoch_is_day_two() {
-        let s = format_vana(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_DAY);
-        assert_eq!(s, "V 0886-01-02 00:00");
+    fn afternoon_hour_has_no_leading_zero_minute_does() {
+        let five_vana_minutes = 5 * EARTH_SECS_PER_VANA_HOUR / 60;
+        assert_eq!(
+            format_vana_time(EARTH_EPOCH_UNIX + 13 * EARTH_SECS_PER_VANA_HOUR + five_vana_minutes),
+            "13:05"
+        );
     }
 
     #[test]
-    fn earth_time_before_vana_epoch_clamps_to_epoch() {
-        let s = format_vana(0);
-        assert_eq!(s, "V 0886-01-01 00:00");
+    fn hour_wraps_at_a_full_day() {
+        assert_eq!(
+            format_vana_time(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_DAY),
+            "0:00"
+        );
     }
 
     #[test]
-    fn month_rolls_over_at_30_days() {
-        let s = format_vana(EARTH_EPOCH_UNIX + 30 * EARTH_SECS_PER_VANA_DAY);
-        assert_eq!(s, "V 0886-02-01 00:00");
-    }
-
-    #[test]
-    fn year_rolls_over_at_360_days() {
-        let s = format_vana(EARTH_EPOCH_UNIX + 360 * EARTH_SECS_PER_VANA_DAY);
-        assert_eq!(s, "V 0887-01-01 00:00");
+    fn earth_time_before_vana_epoch_clamps_to_midnight() {
+        assert_eq!(format_vana_time(0), "0:00");
     }
 
     #[test]
