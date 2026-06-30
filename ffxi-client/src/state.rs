@@ -317,6 +317,9 @@ pub struct SessionState {
 
     #[serde(default)]
     pub key_items: Vec<u16>,
+
+    #[serde(default)]
+    pub self_fishing: Option<SelfFishing>,
 }
 
 pub const EQUIPMENT_SLOTS: usize = 16;
@@ -858,6 +861,37 @@ impl SessionState {
 
                 self.shop = None;
             }
+            // Machine inputs (consumed by the reactor, not the rendered projection).
+            AgentEvent::FishingCast { .. } | AgentEvent::FishingServerPhase { .. } => {}
+            AgentEvent::FishHooked { params } => {
+                let f = self.self_fishing.get_or_insert(SelfFishing {
+                    phase: 1,
+                    fish: None,
+                    fish_hp: 0,
+                    arrow: None,
+                });
+                f.fish = Some(*params);
+                f.fish_hp = params.stamina;
+            }
+            AgentEvent::FishingPhaseChanged { phase } => match phase {
+                Some(p) => {
+                    self.self_fishing
+                        .get_or_insert(SelfFishing {
+                            phase: *p,
+                            fish: None,
+                            fish_hp: 0,
+                            arrow: None,
+                        })
+                        .phase = *p;
+                }
+                None => self.self_fishing = None,
+            },
+            AgentEvent::FishingProgress { fish_hp, arrow } => {
+                if let Some(f) = self.self_fishing.as_mut() {
+                    f.fish_hp = *fish_hp;
+                    f.arrow = *arrow;
+                }
+            }
         }
     }
 }
@@ -1072,6 +1106,36 @@ pub enum AgentEvent {
         skill_id: u16,
         level: u32,
     },
+
+    /// Self has cast a line: the server set FISHING_START with this hook delay (frames).
+    /// Decoded from 0x037 GP_SERV_SERVERSTATUS.
+    FishingCast {
+        hook_delay: u8,
+    },
+
+    /// A fish bit; the mini-game can begin. Decoded from 0x115 GP_SERV_COMMAND_FISH.
+    FishHooked {
+        params: FishParams,
+    },
+
+    /// Raw self animation phase straight from the 0x037 byte (machine input for the
+    /// resolution/release handshake). Distinct from `FishingPhaseChanged`, which is the
+    /// reactor machine's published view.
+    FishingServerPhase {
+        phase: Option<u8>,
+    },
+
+    /// The reactor fishing machine's view phase (0..=6, see `ffxi_actor`'s `fishing_clip`),
+    /// or `None` once fishing ends. This is what drives the self pose / HUD visibility.
+    FishingPhaseChanged {
+        phase: Option<u8>,
+    },
+
+    /// Mini-game HUD progress published by the reactor's fishing machine each tick.
+    FishingProgress {
+        fish_hp: u16,
+        arrow: Option<FishingArrow>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1187,6 +1251,22 @@ pub enum AgentCommand {
     Heal {
         mode: HealMode,
     },
+
+    /// Begin fishing (`/fish`). The reactor casts and then drives the mini-game protocol.
+    Fish,
+
+    /// Player/agent input during the fishing mini-game (arrow reactions, hook, cancel).
+    FishingInput {
+        input: FishingInput,
+    },
+
+    /// Internal: emitted by the reactor's fishing machine; the session turns it into a
+    /// c2s 0x110 GP_CLI_COMMAND_FISHING_2 packet.
+    FishingRequest {
+        mode: FishingMode,
+        para: i32,
+        para2: i32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1298,6 +1378,89 @@ impl MogHouseExit {
             MogHouseExit::MogGarden => (0, 127),
         }
     }
+}
+
+/// The mode byte of a c2s 0x110 GP_CLI_COMMAND_FISHING_2 request.
+/// vendor/server/src/map/packets/c2s/0x110_fishing_2.h
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FishingMode {
+    /// The cast has settled; ask the server whether anything bit. para=0, para2=0.
+    CheckHook = 2,
+    /// The mini-game is over; report the outcome. para/para2 encode how it ended.
+    EndMiniGame = 3,
+    /// The resolution animation finished; ask the server to release the fishing lock.
+    Release = 4,
+    /// Time is nearly up; let the server warn the player. para=remaining time.
+    PotentialTimeout = 5,
+}
+
+/// Player/agent input fed to the fishing mini-game state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FishingInput {
+    /// Set the hook once a fish bites (Enter on retail).
+    Hook,
+    /// React to the on-screen arrow.
+    Left,
+    Right,
+    /// Abandon the cast / mini-game (movement or Escape on retail).
+    Cancel,
+}
+
+/// The fish stats from a s2c 0x115 GP_SERV_COMMAND_FISH, normalized into the values the
+/// client mini-game uses. Mirrors [`ffxi_proto::decode::FishPacket`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FishParams {
+    pub stamina: u16,
+    pub arrow_delay: u16,
+    pub regen: u16,
+    pub move_frequency: u16,
+    pub arrow_damage: u16,
+    pub arrow_regen: u16,
+    pub time: u16,
+    pub angler_sense: u8,
+    pub intuition: u32,
+}
+
+impl From<ffxi_proto::decode::FishPacket> for FishParams {
+    fn from(p: ffxi_proto::decode::FishPacket) -> Self {
+        Self {
+            stamina: p.stamina,
+            arrow_delay: p.arrow_delay,
+            regen: p.regen,
+            move_frequency: p.move_frequency,
+            arrow_damage: p.arrow_damage,
+            arrow_regen: p.arrow_regen,
+            time: p.time,
+            angler_sense: p.angler_sense,
+            intuition: p.intuition,
+        }
+    }
+}
+
+/// The on-screen arrow during the active mini-game state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FishingArrow {
+    /// The direction the player must press to land the hit.
+    pub left: bool,
+    /// Golden arrows (driven by intuition) deal more stamina damage.
+    pub golden: bool,
+}
+
+/// The self player's fishing state, as a view for the renderer/HUD. `None` when not
+/// fishing. The reactor's fishing machine is the authoritative owner; this is the
+/// projection it publishes through the event folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfFishing {
+    /// Macro-state phase 0..=6 for self pose selection (see `ffxi_actor::fishing_clip`).
+    pub phase: u8,
+    /// The hooked fish's parameters, present once a fish bites.
+    pub fish: Option<FishParams>,
+    /// Current fish stamina, for the HUD bar (clamped to the fish's max).
+    pub fish_hp: u16,
+    /// The arrow the player must currently react to, if any.
+    pub arrow: Option<FishingArrow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

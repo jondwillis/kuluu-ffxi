@@ -7,6 +7,43 @@ pub mod animation {
     pub const HEALING: u8 = 33;
 
     pub const SIT: u8 = 47;
+
+    // ANIMATIONTYPE, vendor/server/src/map/entities/baseentity.h:60. The server writes
+    // these into the entity's server_status (the 0x0D/0x37 animation byte) and broadcasts
+    // them; the client maps each to the matching fsh* model clip (research/xim Actor.kt:361).
+    // The pre-overhaul (38-43,50) and current (56-62) fishing systems share fsh0..fsh6.
+    pub const FISHING_FISH_OLD: u8 = 38;
+    pub const FISHING_CAUGHT_OLD: u8 = 39;
+    pub const FISHING_ROD_BREAK_OLD: u8 = 40;
+    pub const FISHING_LINE_BREAK_OLD: u8 = 41;
+    pub const FISHING_MONSTER_OLD: u8 = 42;
+    pub const FISHING_STOP_OLD: u8 = 43;
+    pub const FISHING_START_OLD: u8 = 50;
+
+    pub const FISHING_START: u8 = 56;
+    pub const FISHING_FISH: u8 = 57;
+    pub const FISHING_CAUGHT: u8 = 58;
+    pub const FISHING_ROD_BREAK: u8 = 59;
+    pub const FISHING_LINE_BREAK: u8 = 60;
+    pub const FISHING_MONSTER: u8 = 61;
+    pub const FISHING_STOP: u8 = 62;
+
+    /// Phase index 0..=6 of a fishing macro-state animation byte (current or pre-overhaul),
+    /// or `None` if the byte is not a fishing animation. The index selects the `fsh<n>` clip:
+    /// 0=cast/wait, 1=fighting, 2=caught fish, 3=rod break, 4=line break, 5=caught monster,
+    /// 6=stop/cancel.
+    pub fn fishing_phase(animation: u8) -> Option<u8> {
+        Some(match animation {
+            FISHING_START | FISHING_START_OLD => 0,
+            FISHING_FISH | FISHING_FISH_OLD => 1,
+            FISHING_CAUGHT | FISHING_CAUGHT_OLD => 2,
+            FISHING_ROD_BREAK | FISHING_ROD_BREAK_OLD => 3,
+            FISHING_LINE_BREAK | FISHING_LINE_BREAK_OLD => 4,
+            FISHING_MONSTER | FISHING_MONSTER_OLD => 5,
+            FISHING_STOP | FISHING_STOP_OLD => 6,
+            _ => return None,
+        })
+    }
 }
 
 use crate::framing::SubPacket;
@@ -386,7 +423,8 @@ impl ServerLogin {
 }
 
 /// s2c 0x037 GP_SERV_SERVERSTATUS (char status). Only the fields we consume are
-/// decoded: the subject id, its HP%, and the death/homepoint counters.
+/// decoded: the subject id, its HP%, the death/homepoint counters, the animation
+/// (`server_status`) byte, and the fishing hook-delay timer.
 /// vendor/server/src/map/packets/char_status.cpp
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CharStatus {
@@ -394,13 +432,22 @@ pub struct CharStatus {
     pub hpp: u8,
     pub dead_counter1: u32,
     pub dead_counter2: u32,
+    /// The self player's animation byte (ANIMATIONTYPE); see [`animation`]. Mirrors the
+    /// `server_status` that 0x0D broadcasts for other players.
+    pub server_status: u8,
+    /// Frames the client waits before the cast settles and it requests a hook check.
+    /// Only meaningful while `server_status == animation::FISHING_START`. 0 if the packet
+    /// was truncated before this field.
+    pub fishing_timer: u8,
 }
 
 impl CharStatus {
     pub const UNIQUE_NO_OFFSET: usize = 0x20;
     pub const FLAGS0_OFFSET: usize = 0x24;
+    pub const SERVER_STATUS_OFFSET: usize = 0x2C;
     pub const DEAD_COUNTER1_OFFSET: usize = 0x38;
     pub const DEAD_COUNTER2_OFFSET: usize = 0x3C;
+    pub const FISHING_TIMER_OFFSET: usize = 0x46;
 
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
         let need = Self::DEAD_COUNTER2_OFFSET + 4;
@@ -415,6 +462,8 @@ impl CharStatus {
             hpp: ((flags0 >> 16) & 0xFF) as u8,
             dead_counter1: rd(Self::DEAD_COUNTER1_OFFSET),
             dead_counter2: rd(Self::DEAD_COUNTER2_OFFSET),
+            server_status: body[Self::SERVER_STATUS_OFFSET],
+            fishing_timer: body.get(Self::FISHING_TIMER_OFFSET).copied().unwrap_or(0),
         })
     }
 
@@ -426,6 +475,60 @@ impl CharStatus {
     /// charentity.cpp::GetTimeUntilDeathHomepoint, ai/states/death_state.cpp
     pub fn seconds_until_homepoint(&self) -> u32 {
         (self.dead_counter1 / 60).saturating_sub(360)
+    }
+}
+
+/// s2c 0x115 GP_SERV_COMMAND_FISH. The server sends this once a fish bites to hand the
+/// client every parameter it needs to simulate the catch mini-game locally.
+/// vendor/server/src/map/packets/s2c/0x115_fish.h, research/XiPackets/world/server/0x0115
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FishPacket {
+    /// The fish's starting (and maximum) stamina.
+    pub stamina: u16,
+    /// Base reaction window for an arrow press (client adjusts by intuition).
+    pub arrow_delay: u16,
+    /// Per-tick stamina regen, biased by 128 server-side (`regen - 128`).
+    pub regen: u16,
+    /// How often the fish thrashes left/right (client scales by 20).
+    pub move_frequency: u16,
+    /// Stamina removed on a correct, on-time arrow press.
+    pub arrow_damage: u16,
+    /// Stamina restored on a missed/late arrow press.
+    pub arrow_regen: u16,
+    /// Time limit to land the fish, in seconds (client scales by 60 → frames).
+    pub time: u16,
+    /// Angler-sense flags: bit0 alters the music/arrow timing, bit1 triggers the
+    /// "intuition" light-bulb animation when the fish is first hooked.
+    pub angler_sense: u8,
+    /// Fishing intuition; reflected back to the server and used for the golden arrows.
+    pub intuition: u32,
+}
+
+impl FishPacket {
+    pub const SIZE: usize = 20;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        let rd16 = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+        Ok(Self {
+            stamina: rd16(0),
+            arrow_delay: rd16(2),
+            regen: rd16(4),
+            move_frequency: rd16(6),
+            arrow_damage: rd16(8),
+            arrow_regen: rd16(10),
+            time: rd16(12),
+            angler_sense: body[14],
+            intuition: u32::from_le_bytes([body[16], body[17], body[18], body[19]]),
+        })
+    }
+
+    /// `true` when the angler-sense bit that drives the "intuition" hook animation
+    /// (the light bulb) is set. vendor `fish->sense2`.
+    pub fn shows_intuition(&self) -> bool {
+        (self.angler_sense >> 1) & 1 == 1
     }
 }
 
@@ -483,6 +586,7 @@ pub fn decode_system_message(sub: &SubPacket<'_>) -> Result<SystemMessage, Decod
     SystemMessage::decode(sub.data)
 }
 
+// vendor/server/src/map/packets/s2c/0x057_weather.h:32-37 (StartTime u32, WeatherNumber, WeatherOffsetTime u16)
 #[derive(Debug, Clone, Copy)]
 pub struct WeatherPacket {
     pub start_time: u32,
@@ -2000,6 +2104,8 @@ mod tests {
             .copy_from_slice(&129_600u32.to_le_bytes());
         body[CharStatus::DEAD_COUNTER2_OFFSET..CharStatus::DEAD_COUNTER2_OFFSET + 4]
             .copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        body[CharStatus::SERVER_STATUS_OFFSET] = animation::FISHING_START;
+        body[CharStatus::FISHING_TIMER_OFFSET] = 42;
 
         let cs = CharStatus::decode(&body).unwrap();
         assert_eq!(cs.unique_no, 0x000B_C5EB);
@@ -2007,6 +2113,47 @@ mod tests {
         assert_eq!(cs.dead_counter1, 129_600);
         assert_eq!(cs.dead_counter2, 0x1122_3344);
         assert_eq!(cs.seconds_until_homepoint(), 1800);
+        assert_eq!(cs.server_status, animation::FISHING_START);
+        assert_eq!(cs.fishing_timer, 42);
+    }
+
+    #[test]
+    fn char_status_fishing_timer_zero_when_truncated_before_field() {
+        // dead_counter2 is the last guaranteed field; fishing_timer sits past it and must
+        // default to 0 rather than panic when the body stops short.
+        let body = vec![0u8; CharStatus::DEAD_COUNTER2_OFFSET + 4];
+        let cs = CharStatus::decode(&body).unwrap();
+        assert_eq!(cs.fishing_timer, 0);
+    }
+
+    #[test]
+    fn fish_packet_decodes_minigame_params() {
+        let mut body = vec![0u8; FishPacket::SIZE];
+        body[0..2].copy_from_slice(&200u16.to_le_bytes()); // stamina
+        body[2..4].copy_from_slice(&5u16.to_le_bytes()); // arrow_delay
+        body[4..6].copy_from_slice(&130u16.to_le_bytes()); // regen
+        body[6..8].copy_from_slice(&3u16.to_le_bytes()); // move_frequency
+        body[8..10].copy_from_slice(&40u16.to_le_bytes()); // arrow_damage
+        body[10..12].copy_from_slice(&10u16.to_le_bytes()); // arrow_regen
+        body[12..14].copy_from_slice(&30u16.to_le_bytes()); // time
+        body[14] = 0b11; // angler_sense: both bits set
+        body[16..20].copy_from_slice(&0x0000_0064u32.to_le_bytes()); // intuition
+
+        let f = FishPacket::decode(&body).unwrap();
+        assert_eq!(f.stamina, 200);
+        assert_eq!(f.arrow_delay, 5);
+        assert_eq!(f.regen, 130);
+        assert_eq!(f.move_frequency, 3);
+        assert_eq!(f.arrow_damage, 40);
+        assert_eq!(f.arrow_regen, 10);
+        assert_eq!(f.time, 30);
+        assert_eq!(f.intuition, 100);
+        assert!(f.shows_intuition());
+
+        assert!(matches!(
+            FishPacket::decode(&[0u8; FishPacket::SIZE - 1]),
+            Err(DecodeError::Truncated(n, _)) if n == FishPacket::SIZE
+        ));
     }
 
     #[test]
@@ -2017,6 +2164,8 @@ mod tests {
                 hpp: 0,
                 dead_counter1: dc1,
                 dead_counter2: 0,
+                server_status: 0,
+                fishing_timer: 0,
             }
             .seconds_until_homepoint()
         };

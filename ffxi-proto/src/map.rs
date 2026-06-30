@@ -17,6 +17,12 @@ pub mod c2s {
 
     pub const SHOP_BUY: u16 = 0x083;
 
+    // GP_CLI_COMMAND_FISHING_2, vendor/server/src/map/enums/packet_c2s.h. The current
+    // mini-game uses 0x110; 0x066 (GP_CLI_COMMAND_FISHING) is the pre-overhaul system,
+    // aliased to the same struct server-side.
+    pub const FISHING_2: u16 = 0x110;
+    pub const FISHING: u16 = 0x066;
+
     pub const EQUIP_SET: u16 = 0x050;
 
     pub const REQ_LOGOUT: u16 = 0x0E7;
@@ -52,6 +58,7 @@ pub mod action_id {
     pub const WEAPONSKILL: u16 = 0x07;
     pub const JOB_ABILITY: u16 = 0x09;
     pub const ASSIST: u16 = 0x0C;
+    pub const FISH: u16 = 0x0E;
     pub const CHANGE_TARGET: u16 = 0x0F;
     pub const SHOOT: u16 = 0x10;
 }
@@ -85,6 +92,10 @@ pub mod s2c {
 
     pub const CHAR_STATUS: u16 = 0x037;
 
+    // GP_SERV_COMMAND_FISH, vendor/server/src/map/enums/packet_s2c.h:172. Sent to start
+    // the fishing mini-game with the hooked fish's stats.
+    pub const FISH: u16 = 0x115;
+
     pub const CHAT: u16 = 0x017;
 
     pub const ITEM_MAX: u16 = 0x01C;
@@ -116,6 +127,7 @@ pub mod s2c {
 
     pub const SCENARIO_ITEM: u16 = 0x055;
 
+    // vendor/server/src/map/packets/s2c/0x057_weather.h
     pub const WEATHER: u16 = 0x057;
 
     pub const MUSIC: u16 = 0x05F;

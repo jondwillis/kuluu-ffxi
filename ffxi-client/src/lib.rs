@@ -8,6 +8,7 @@ pub mod auth_binary;
 pub mod auth_client;
 pub mod config_dir;
 pub mod event_dialog;
+pub mod fishing;
 pub mod goal_store;
 pub mod launcher_store;
 pub mod secret_store;

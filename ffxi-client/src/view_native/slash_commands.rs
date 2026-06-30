@@ -599,6 +599,49 @@ const COMMANDS: &[(&str, &[Command])] = &[
         ],
     ),
     (
+        "Fishing",
+        &[
+            Command {
+                aliases: &["fish"],
+                usage: "",
+                summary: "cast a line (drives the fishing mini-game)",
+                handler: |_| SlashOutcome::Command(AgentCommand::Fish),
+            },
+            Command {
+                aliases: &["hook"],
+                usage: "",
+                summary: "set the hook once a fish bites",
+                handler: |_| SlashOutcome::Command(AgentCommand::FishingInput {
+                    input: crate::state::FishingInput::Hook,
+                }),
+            },
+            Command {
+                aliases: &["reelleft", "rl"],
+                usage: "",
+                summary: "react to a left fishing arrow",
+                handler: |_| SlashOutcome::Command(AgentCommand::FishingInput {
+                    input: crate::state::FishingInput::Left,
+                }),
+            },
+            Command {
+                aliases: &["reelright", "rr"],
+                usage: "",
+                summary: "react to a right fishing arrow",
+                handler: |_| SlashOutcome::Command(AgentCommand::FishingInput {
+                    input: crate::state::FishingInput::Right,
+                }),
+            },
+            Command {
+                aliases: &["reelstop", "fishcancel"],
+                usage: "",
+                summary: "abandon the cast / mini-game",
+                handler: |_| SlashOutcome::Command(AgentCommand::FishingInput {
+                    input: crate::state::FishingInput::Cancel,
+                }),
+            },
+        ],
+    ),
+    (
         "Session",
         &[
             Command {

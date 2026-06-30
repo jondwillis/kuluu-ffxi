@@ -820,7 +820,22 @@ fn handle_sub_packet(
                         seconds_until_homepoint: (cs.hpp == 0)
                             .then(|| cs.seconds_until_homepoint()),
                     });
+                    // The server's animation byte carries our fishing macro-state. A fresh
+                    // FISHING_START also brings the hook delay; feed both to the machine.
+                    if cs.server_status == decode::animation::FISHING_START {
+                        let _ = event_tx.send(AgentEvent::FishingCast {
+                            hook_delay: cs.fishing_timer,
+                        });
+                    }
+                    let _ = event_tx.send(AgentEvent::FishingServerPhase {
+                        phase: decode::animation::fishing_phase(cs.server_status),
+                    });
                 }
+            }
+        }
+        op if op == s2c::FISH => {
+            if let Ok(f) = decode::FishPacket::decode(sub.data) {
+                let _ = event_tx.send(AgentEvent::FishHooked { params: f.into() });
             }
         }
         op if op == s2c::WPOS || op == s2c::WPOS2 => {
@@ -1443,6 +1458,30 @@ async fn keepalive_loop(
                         }
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
+                    Some(AgentCommand::FishingRequest { mode, para, para2 }) => {
+                        let payload = build_subpacket_fishing(
+                            sub_seq,
+                            self_char_id,
+                            self_act_index.unwrap_or(0),
+                            mode,
+                            para,
+                            para2,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "fishing request send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("fishing send: {e}"),
+                            });
+                        }
+                        bundle_seq = bundle_seq.wrapping_add(1);
+                    }
+                    // The reactor's fishing machine consumes Fish/FishingInput and emits
+                    // Action{Fish} + FishingRequest; they never reach the session directly.
+                    Some(AgentCommand::Fish) | Some(AgentCommand::FishingInput { .. }) => {}
                     Some(AgentCommand::ReturnToHomePoint) => {
 
                         let payload = build_subpacket_action(
@@ -3109,6 +3148,31 @@ pub fn build_subpacket_action(
     let mut action_buf = [0u8; 16];
     kind.fill_action_buf(&mut action_buf);
     buf[12..28].copy_from_slice(&action_buf);
+    buf
+}
+
+/// c2s 0x110 GP_CLI_COMMAND_FISHING_2 — the mini-game request the client streams while
+/// fishing (check-hook, end-game, release, timeout). `mode`/`para`/`para2` follow the
+/// LSB validator: vendor/server/src/map/packets/c2s/0x110_fishing_2.{h,cpp}.
+pub fn build_subpacket_fishing(
+    sync: u16,
+    unique_no: u32,
+    act_index: u16,
+    mode: crate::state::FishingMode,
+    para: i32,
+    para2: i32,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 20];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::FISHING_2,
+        5,
+        sync,
+    ));
+    buf[4..8].copy_from_slice(&unique_no.to_le_bytes());
+    buf[8..12].copy_from_slice(&para.to_le_bytes());
+    buf[12..14].copy_from_slice(&act_index.to_le_bytes());
+    buf[14] = mode as u8;
+    buf[16..20].copy_from_slice(&para2.to_le_bytes());
     buf
 }
 

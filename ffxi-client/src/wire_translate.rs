@@ -56,6 +56,16 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         stats: None,
         bazaar: Vec::new(),
         play_time_s: 0,
+
+        self_fishing: s.self_fishing.map(|f| wire::SelfFishing {
+            phase: f.phase,
+            fish_max: f.fish.map(|p| p.stamina).unwrap_or(0),
+            fish_hp: f.fish_hp,
+            arrow: f.arrow.map(|a| wire::FishingArrow {
+                left: a.left,
+                golden: a.golden,
+            }),
+        }),
     }
 }
 

@@ -1203,10 +1203,20 @@ fn advance_actor_pose(
         _ => None,
     };
 
+    // research/xim Actor.kt:361 (updateFishingState) — the fishing macro-pose overrides
+    // locomotion/idle/rest. fsh0 (cast/wait) and fsh1 (fighting) loop; fsh2..fsh6
+    // (resolution) play once and hold (see the one-shot handling below).
+    let fishing = actor
+        .inputs
+        .fishing_phase
+        .and_then(actor_state::fishing_clip);
+
     let (selected_id, is_idle) = if let Some(id) = action_id {
         (id, false)
     } else if let Some(id) = engage_overlay {
         (id, false)
+    } else if let Some(fc) = fishing {
+        (fc.id, fc.looping)
     } else {
         let rest_id = advance_rest_phase(
             &mut actor.rest_phase,
@@ -1268,9 +1278,15 @@ fn advance_actor_pose(
                 transition_out_time: action.map_or(LOCOMOTION_XFADE_OUT, |a| a.transition_out),
                 ..Default::default()
             };
+            // Fishing resolution clips (fsh2..fsh6) have no ActionPlayback, so without an
+            // explicit single loop they would default to looping forever — they must play
+            // once and hold the final frame until the server advances the state.
+            let one_shot_fishing = matches!(fishing, Some(fc) if !fc.looping);
             let loop_params = LoopParams {
                 loop_duration: None,
-                num_loops: action.and_then(|a| a.num_loops),
+                num_loops: action
+                    .and_then(|a| a.num_loops)
+                    .or(one_shot_fishing.then_some(1)),
                 low_priority: false,
             };
             for clip in &matches {
@@ -1682,6 +1698,21 @@ pub fn tick_live_ffxi_actors(
         .map(|e| (e.id, e.hp_pct == Some(0)))
         .collect();
 
+    // Fishing macro-pose for observed players: the server broadcasts the fsh* state in
+    // the entity's animation byte (server_status). Self drives its pose from the local
+    // mini-game instead, so it is excluded below.
+    let fishing_phase_by_id: std::collections::HashMap<u32, Option<u8>> = state
+        .snapshot
+        .entities
+        .iter()
+        .map(|e| {
+            (
+                e.id,
+                ffxi_proto::decode::animation::fishing_phase(e.animation),
+            )
+        })
+        .collect();
+
     // Self KO is unreliable via the entity hp_pct (only updated when CHAR_PC
     // carries UPDATE_HP) and via the party row (absent/stale when solo).
     // death_homepoint_secs comes straight from 0x037 CHAR_STATUS hpp==0.
@@ -1738,6 +1769,14 @@ pub fn tick_live_ffxi_actors(
             infers_walk_gait(sample.speed)
         };
 
+        // Self pose comes from the local mini-game machine (it knows the active reeling
+        // sub-states the server never broadcasts); others come from the wire animation byte.
+        let fishing_phase = if is_self {
+            state.snapshot.self_fishing.map(|f| f.phase)
+        } else {
+            fishing_phase_by_id.get(&world_id).copied().flatten()
+        };
+
         let engage_state = {
             let actor: &mut FfxiRenderActor = &mut actor;
             advance_engage(
@@ -1759,6 +1798,7 @@ pub fn tick_live_ffxi_actors(
             engage_state,
             dead,
             rest: rest_kind,
+            fishing_phase,
             ..Default::default()
         };
 
@@ -1846,6 +1886,7 @@ pub fn dispatch_action_overlay(
 pub fn update_ffxi_render_actor_lighting(
     settings: Res<crate::graphics_settings::GraphicsSettings>,
     ambient: Res<GlobalAmbientLight>,
+    zone_lighting: Res<crate::weather::ZoneDirectionalLighting>,
     q_sun: Query<
         (&DirectionalLight, &GlobalTransform),
         (
@@ -1873,6 +1914,11 @@ pub fn update_ffxi_render_actor_lighting(
     let amb = ambient.color.to_linear();
     let amb_k = (ambient.brightness / AMBIENT_REF_LUX).clamp(0.0, 1.5);
     let mut amb_rgb = Vec3::new(amb.red, amb.green, amb.blue) * amb_k;
+    // research/xim EnvironmentSection.kt:144-148: actors are lit by the model block's
+    // ambient, not the terrain ambient the GlobalAmbientLight tracks.
+    if zone_lighting.valid {
+        amb_rgb = zone_lighting.ambient_entity * amb_k;
+    }
     if amb_rgb.max_element() < AMBIENT_BIAS_BELOW {
         amb_rgb *= COLOR_BIAS;
     }
@@ -1893,8 +1939,27 @@ pub fn update_ffxi_render_actor_lighting(
             _ => (Vec4::ZERO, Vec4::ZERO),
         }
     };
-    let (dir0_dir, dir0_color) = extract(q_sun.single().ok());
-    let (dir1_dir, dir1_color) = extract(q_moon.single().ok());
+    // research/xim EnvironmentSection.kt:161-165: actors take a single time-blended
+    // model light (the moon<->sun cross-fade), so dir0 carries the blend and dir1 is
+    // unused. The procedural sun/moon DirectionalLights remain the fallback when the
+    // zone ships no 0x2F records.
+    let (dir0_dir, dir0_color, dir1_dir, dir1_color) = if zone_lighting.valid {
+        let (md, mc) = if zone_lighting.model_dir != Vec3::ZERO && zone_lighting.model_k > 0.0 {
+            let f = (-zone_lighting.model_dir).normalize_or_zero();
+            let c = zone_lighting.model_color;
+            (
+                Vec4::new(f.x, f.y, f.z, 0.0),
+                Vec4::new(c.x, c.y, c.z, zone_lighting.model_k.clamp(0.0, 1.0)),
+            )
+        } else {
+            (Vec4::ZERO, Vec4::ZERO)
+        };
+        (md, mc, Vec4::ZERO, Vec4::ZERO)
+    } else {
+        let (d0d, d0c) = extract(q_sun.single().ok());
+        let (d1d, d1c) = extract(q_moon.single().ok());
+        (d0d, d0c, d1d, d1c)
+    };
 
     let realistic = if settings.realistic_character_lighting {
         1.0

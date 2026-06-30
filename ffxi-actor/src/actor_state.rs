@@ -63,6 +63,11 @@ pub struct ActorAnimInputs {
     pub walking_mode: u8,
 
     pub running_mode: u8,
+
+    /// Fishing macro-state phase 0..=6 (see [`fishing_clip`]), or `None` when not fishing.
+    /// Driven by the entity's server_status animation byte for observed players, and by
+    /// the local mini-game state machine for self.
+    pub fishing_phase: Option<u8>,
 }
 
 impl Default for ActorAnimInputs {
@@ -85,8 +90,32 @@ impl Default for ActorAnimInputs {
             battle_mode: 0,
             walking_mode: 0,
             running_mode: 0,
+            fishing_phase: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FishingClip {
+    pub id: DatId,
+
+    /// `true` for the looping waiting/fighting poses, `false` for the resolution poses
+    /// that play once and hold the final frame.
+    pub looping: bool,
+}
+
+/// Maps a fishing macro-state phase (0..=6) to its `fsh<n>` model clip. Phases:
+/// 0=cast/wait, 1=fighting, 2=caught fish, 3=rod break, 4=line break, 5=caught monster,
+/// 6=stop/cancel. research/xim Actor.kt:361 (`updateFishingState`).
+pub fn fishing_clip(phase: u8) -> Option<FishingClip> {
+    if phase > 6 {
+        return None;
+    }
+    let id = DatId::from_name(&[b'f', b's', b'h', b'0' + phase]);
+    Some(FishingClip {
+        id,
+        looping: phase <= 1,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,6 +517,19 @@ mod tests {
             "rx2?"
         );
         assert!(rest_animation_id_phase(RestKind::None, In).is_none());
+    }
+
+    #[test]
+    fn fishing_clips_by_phase() {
+        assert_eq!(idstr(fishing_clip(0).unwrap().id), "fsh0");
+        assert!(fishing_clip(0).unwrap().looping);
+        assert!(fishing_clip(1).unwrap().looping);
+        for phase in 2u8..=6 {
+            let c = fishing_clip(phase).unwrap();
+            assert_eq!(idstr(c.id), format!("fsh{phase}"));
+            assert!(!c.looping, "resolution phase {phase} must not loop");
+        }
+        assert!(fishing_clip(7).is_none());
     }
 
     #[test]

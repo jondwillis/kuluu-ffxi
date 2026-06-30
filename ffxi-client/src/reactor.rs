@@ -30,6 +30,7 @@ impl LoadedNav {
 }
 use tokio::sync::{broadcast, mpsc};
 
+use crate::fishing::{FishingMachine, FishingOut};
 use crate::state::{
     model_radius, ActionKind, AgentCommand, AgentEvent, ChatChannel, ChatLine, EntityKind,
     ReactorGoalSnapshot, SessionState, Vec3, CONTACT_GAP,
@@ -181,6 +182,10 @@ pub struct Reactor {
     needs_zone_seed: bool,
 
     reactor_override: Option<ReactorOverride>,
+
+    fishing: FishingMachine,
+    fishing_phase_pub: Option<u8>,
+    fishing_pending: Vec<AgentCommand>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -204,6 +209,11 @@ impl Reactor {
             zoneline_trigger_latched: None,
             needs_zone_seed: false,
             reactor_override: None,
+            // Auto-play: the reactor reacts to arrows itself so an agent that issues `/fish`
+            // lands the fish without further input. A UI front-end drives via FishingInput.
+            fishing: FishingMachine::new(true),
+            fishing_phase_pub: None,
+            fishing_pending: Vec::new(),
         }
     }
 
@@ -318,6 +328,32 @@ impl Reactor {
             });
         }
         self.state.apply_event(ev);
+
+        // Feed the fishing machine its server-side inputs and publish any resulting phase
+        // change / immediate progress. Commands (e.g. the hook check after a bite) queue
+        // for the next tick.
+        let fishing_outs = match ev {
+            AgentEvent::FishingCast { hook_delay } => {
+                self.fishing.on_cast(*hook_delay);
+                Vec::new()
+            }
+            AgentEvent::FishHooked { params } => self.fishing.on_hooked(*params),
+            AgentEvent::FishingServerPhase { phase } => {
+                self.fishing.on_phase(*phase);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        };
+        if matches!(
+            ev,
+            AgentEvent::FishingCast { .. }
+                | AgentEvent::FishHooked { .. }
+                | AgentEvent::FishingServerPhase { .. }
+        ) {
+            let (cmds, events) = self.translate_fishing(fishing_outs);
+            self.fishing_pending.extend(cmds);
+            out.extend(events);
+        }
 
         if matches!(ev, AgentEvent::ZoneChanged { .. }) {
             self.needs_zone_seed = true;
@@ -507,20 +543,85 @@ impl Reactor {
                     derived_events: vec![AgentEvent::SceneSummary { text: summary.text }],
                 }
             }
+            AgentCommand::Fish => {
+                let outs = self.fishing.start();
+                self.route_fishing(outs)
+            }
+            AgentCommand::FishingInput { input } => {
+                let outs = self.fishing.input(input);
+                self.route_fishing(outs)
+            }
             other => CommandRouting::forward(other),
         }
     }
 
     pub fn tick(&mut self) -> TickOutput {
-        if let Some(out) = self.tick_override() {
-            return out;
-        }
-
-        let mut out = self.tick_goal();
-        if let Some(req) = self.check_zoneline_trigger() {
-            out.commands.push(req);
-        }
+        let mut out = if let Some(out) = self.tick_override() {
+            out
+        } else {
+            let mut out = self.tick_goal();
+            if let Some(req) = self.check_zoneline_trigger() {
+                out.commands.push(req);
+            }
+            out
+        };
+        self.tick_fishing(&mut out);
         out
+    }
+
+    /// Advance the fishing mini-game machine and fold its outputs into this tick.
+    fn tick_fishing(&mut self, out: &mut TickOutput) {
+        let dt = self.cfg.tick.as_secs_f32();
+        let outs = self.fishing.tick(dt);
+        let (cmds, events) = self.translate_fishing(outs);
+        out.commands.append(&mut self.fishing_pending);
+        out.commands.extend(cmds);
+        out.derived_events.extend(events);
+    }
+
+    /// Convert the fishing machine's outputs into outgoing commands + published events,
+    /// and emit a phase change whenever the machine's view phase moves.
+    fn translate_fishing(&mut self, outs: Vec<FishingOut>) -> (Vec<AgentCommand>, Vec<AgentEvent>) {
+        let mut cmds = Vec::new();
+        let mut events = Vec::new();
+        let self_id = self.state.char_id.unwrap_or(0);
+        let self_idx = self
+            .entity_target_info(self_id)
+            .map(|(idx, _, _)| idx)
+            .unwrap_or(0);
+        for o in outs {
+            match o {
+                FishingOut::StartCast => cmds.push(AgentCommand::Action {
+                    target_id: self_id,
+                    target_index: self_idx,
+                    kind: ActionKind::Fish,
+                }),
+                FishingOut::Request { mode, para, para2 } => {
+                    cmds.push(AgentCommand::FishingRequest { mode, para, para2 })
+                }
+                FishingOut::Progress { fish_hp, arrow } => {
+                    events.push(AgentEvent::FishingProgress { fish_hp, arrow })
+                }
+            }
+        }
+        let phase = self.fishing.phase();
+        if phase != self.fishing_phase_pub {
+            self.fishing_phase_pub = phase;
+            events.push(AgentEvent::FishingPhaseChanged { phase });
+        }
+        (cmds, events)
+    }
+
+    /// Route a fishing machine output set through a single [`CommandRouting`] (forwarding
+    /// the first command, queueing the rest for the next tick).
+    fn route_fishing(&mut self, outs: Vec<FishingOut>) -> CommandRouting {
+        let (mut cmds, derived_events) = self.translate_fishing(outs);
+        let forward = (!cmds.is_empty()).then(|| cmds.remove(0));
+        self.fishing_pending.extend(cmds);
+        CommandRouting {
+            forward,
+            derived_events,
+        }
     }
 
     fn tick_override(&mut self) -> Option<TickOutput> {

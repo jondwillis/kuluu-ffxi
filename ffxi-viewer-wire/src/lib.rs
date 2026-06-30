@@ -55,6 +55,7 @@ pub enum BlowfishStatus {
     PendingZone,
 }
 
+// vendor/server/src/map/enums/weather.h:24-46 (None=0..Darkness=19)
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Weather {
@@ -84,6 +85,7 @@ pub enum Weather {
 impl Weather {
     pub fn from_lsb(n: u16) -> Self {
         use Weather::*;
+        // vendor/server/src/map/enums/weather.h:24-46
         const TABLE: [Weather; 20] = [
             None,
             Sunshine,
@@ -106,7 +108,9 @@ impl Weather {
             Gloom,
             Darkness,
         ];
-        TABLE[(n as usize) % TABLE.len()]
+        // weather.h:46 notes a repeating 0x14-0x27 set whose usage is unknown;
+        // do not fabricate a real weather for undefined ids.
+        TABLE.get(n as usize).copied().unwrap_or(Weather::None)
     }
 }
 
@@ -392,6 +396,31 @@ pub struct SceneSnapshot {
 
     #[serde(default)]
     pub play_time_s: u64,
+
+    /// Self fishing state, present while the player is fishing. Drives the self pose and
+    /// the mini-game HUD.
+    #[serde(default)]
+    pub self_fishing: Option<SelfFishing>,
+}
+
+/// On-screen fishing arrow during the active mini-game state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FishingArrow {
+    pub left: bool,
+    pub golden: bool,
+}
+
+/// Self fishing view for the renderer/HUD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfFishing {
+    /// Macro-state phase 0..=6 for self pose selection (see `ffxi_actor::fishing_clip`).
+    pub phase: u8,
+    /// Fish max stamina, present once a fish bites (for the HUD bar denominator).
+    pub fish_max: u16,
+    /// Current fish stamina, for the HUD bar.
+    pub fish_hp: u16,
+    /// The arrow the player must react to, if any.
+    pub arrow: Option<FishingArrow>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -718,6 +747,7 @@ mod tests {
             stats: None,
             bazaar: Vec::new(),
             play_time_s: 0,
+            self_fishing: None,
         }
     }
 
@@ -912,5 +942,43 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_lsb_known_ids_map_in_order() {
+        use Weather::*;
+        let expected = [
+            None,
+            Sunshine,
+            Clouds,
+            Fog,
+            HotSpell,
+            HeatWave,
+            Rain,
+            Squall,
+            DustStorm,
+            SandStorm,
+            Wind,
+            Gales,
+            Snow,
+            Blizzards,
+            Thunder,
+            Thunderstorms,
+            Auroras,
+            StellarGlare,
+            Gloom,
+            Darkness,
+        ];
+        for (n, &w) in expected.iter().enumerate() {
+            assert_eq!(Weather::from_lsb(n as u16), w, "id {n}");
+        }
+    }
+
+    #[test]
+    fn from_lsb_unknown_ids_are_none() {
+        // weather.h:46 unknown 0x14-0x27 set must not wrap onto real weathers.
+        assert_eq!(Weather::from_lsb(20), Weather::None);
+        assert_eq!(Weather::from_lsb(26), Weather::None);
+        assert_eq!(Weather::from_lsb(39), Weather::None);
     }
 }
