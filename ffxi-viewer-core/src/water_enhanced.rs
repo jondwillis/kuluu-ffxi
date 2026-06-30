@@ -6,8 +6,11 @@ use bevy_water::{WaterPlugin, WaterSettings};
 
 pub use bevy_water::material::StandardWaterMaterial;
 
-const POND_AMPLITUDE: f32 = 0.1;
-const POND_CLARITY: f32 = 0.18;
+const POND_AMPLITUDE: f32 = 0.05;
+const POND_CLARITY: f32 = 0.2;
+// FFXI ponds are murky green-teal, not open-ocean blue.
+const POND_DEEP_COLOR: Color = Color::srgba(0.09, 0.20, 0.21, 1.0);
+const POND_SHALLOW_COLOR: Color = Color::srgba(0.26, 0.40, 0.39, 1.0);
 
 pub struct EnhancedWaterPlugin;
 
@@ -46,6 +49,8 @@ pub fn pond_water_material(
         extension: WaterMaterial {
             amplitude: POND_AMPLITUDE,
             clarity: POND_CLARITY,
+            deep_color: POND_DEEP_COLOR,
+            shallow_color: POND_SHALLOW_COLOR,
             coord_offset: Vec2::new(min.x, min.z),
             coord_scale: Vec2::new(dx, dz),
             ..default()
