@@ -94,6 +94,15 @@ pub fn vana_minutes_since_epoch(earth_unix_secs: u64) -> u64 {
     earth_since_vana.saturating_mul(25) / 60
 }
 
+// research/xim EnvironmentManager.kt:92-94 getFullDayInterpolation: the clock-driven
+// color tracks (ParticleUpdaters.kt:172-183 ClockValueUpdater) sample at the fraction
+// of the Vana'diel day elapsed, in [0, 1). One Vana day = 1440 Vana minutes.
+pub fn full_day_fraction(earth_unix_secs: u64) -> f32 {
+    let total_v_min = vana_minutes_since_epoch(earth_unix_secs);
+    const VANA_MINUTES_PER_DAY: u64 = 24 * 60;
+    (total_v_min % VANA_MINUTES_PER_DAY) as f32 / VANA_MINUTES_PER_DAY as f32
+}
+
 pub fn format_vana(earth_unix_secs: u64) -> String {
     let earth_since_vana = earth_unix_secs.saturating_sub(EARTH_EPOCH_UNIX);
 
@@ -150,6 +159,19 @@ mod tests {
     fn year_rolls_over_at_360_days() {
         let s = format_vana(EARTH_EPOCH_UNIX + 360 * EARTH_SECS_PER_VANA_DAY);
         assert_eq!(s, "V 0887-01-01 00:00");
+    }
+
+    #[test]
+    fn full_day_fraction_spans_the_vana_day() {
+        assert!((full_day_fraction(EARTH_EPOCH_UNIX) - 0.0).abs() < 1e-6);
+        // 12 Vana hours after epoch == midday == 0.5.
+        let half = EARTH_EPOCH_UNIX + 12 * EARTH_SECS_PER_VANA_HOUR;
+        assert!((full_day_fraction(half) - 0.5).abs() < 1e-6);
+        // A full day later wraps back to 0.0.
+        assert!((full_day_fraction(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_DAY) - 0.0).abs() < 1e-6);
+        // Always strictly below 1.0.
+        let late = EARTH_EPOCH_UNIX + 23 * EARTH_SECS_PER_VANA_HOUR;
+        assert!(full_day_fraction(late) < 1.0);
     }
 
     #[test]

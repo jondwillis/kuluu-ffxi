@@ -29,6 +29,11 @@ const MOON_PHASE_OFFSET: u64 = (886u64 * 360 + 26) % MOON_CYCLE_VANA_DAYS;
 
 const LIGHT_DISTANCE: f32 = 200.0;
 
+// Maps an F1 diffuse brightness k in [0,1] onto a DirectionalLight illuminance so
+// the zone/actor consumers' `k = illuminance / DIR_REF_LUX` recovers it (both use
+// DIR_REF_LUX = 12000.0).
+const DAT_DIR_REF_LUX: f32 = 12000.0;
+
 #[derive(Resource, Default, Clone, Copy, Debug)]
 pub struct VanaSky {
     pub hour: f32,
@@ -46,6 +51,14 @@ pub struct VanaSky {
 
 pub fn vana_sky_from_clock(clock: &crate::vana_time::VanaClock) -> VanaSky {
     vana_sky_from_unix(clock.earth_unix_now())
+}
+
+// The synthetic sun direction the sun DirectionalLight and sun-attached weather
+// generators (weat/<type>/sun1, ParticleGeneratorAttachment.kt:46-52 getSunPosition)
+// share: an east->west arc over the Vana'diel day with a small fixed +z tilt.
+pub fn sun_direction(hour: f32) -> Vec3 {
+    let sun_angle = (hour / 24.0) * 2.0 * PI - PI / 2.0;
+    Vec3::new(sun_angle.cos(), sun_angle.sin(), 0.25).normalize()
 }
 
 fn vana_sky_from_unix(earth_unix: f64) -> VanaSky {
@@ -94,6 +107,15 @@ fn vana_sky_from_unix(earth_unix: f64) -> VanaSky {
 pub struct CelestialMaterials {
     pub sun: Handle<StandardMaterial>,
     pub moon: Handle<crate::moon_material::MoonMaterial>,
+}
+
+// The SunDisc swaps between the procedural emissive sphere (no sprite) and an additive
+// textured billboard quad sized from the DAT "suns" sprite extents. Both meshes are
+// pre-built so the swap is a Mesh3d component write.
+#[derive(Resource)]
+pub struct SunDiscMeshes {
+    pub sphere: Handle<Mesh>,
+    pub quad: Handle<Mesh>,
 }
 
 #[derive(Resource)]
@@ -146,6 +168,7 @@ pub fn spawn_sun_and_moon(
     ));
 
     let sphere = meshes.add(Sphere::new(1.0).mesh().ico(3).unwrap());
+    let sun_quad = meshes.add(Rectangle::new(1.0, 1.0));
     let sun_mat = materials.add(StandardMaterial {
         base_color: Color::linear_rgb(20.0, 18.0, 10.0),
         unlit: true,
@@ -159,13 +182,17 @@ pub fn spawn_sun_and_moon(
     commands.spawn((
         crate::components::InGameEntity,
         SunDisc,
-        Mesh3d(sphere),
+        Mesh3d(sphere.clone()),
         MeshMaterial3d(sun_mat.clone()),
         Transform::from_scale(Vec3::splat(SUN_DISC_RADIUS)),
         Visibility::Hidden,
         NotShadowCaster,
         NotShadowReceiver,
     ));
+    commands.insert_resource(SunDiscMeshes {
+        sphere,
+        quad: sun_quad,
+    });
     commands.spawn((
         crate::components::InGameEntity,
         MoonDisc,
@@ -228,6 +255,37 @@ pub fn sun_color_for_hour(hour: f32, sun_altitude: f32) -> (Color, f32) {
     (Color::srgb(r, g, b), lux)
 }
 
+// Split an F1 diffuse color [r,g,b,a] (already mul/bias-applied in ffxi-dat) into
+// a hue (max-normalized so color * k == the original diffuse) and a brightness k
+// in [0,1], matching how the zone/actor consumers reconstruct color * k.
+fn diffuse_to_light(rgb: [f32; 3]) -> (Vec3, f32) {
+    let v = Vec3::new(rgb[0], rgb[1], rgb[2]).max(Vec3::ZERO);
+    let k = v.max_element();
+    if k <= 1e-4 {
+        (Vec3::ZERO, 0.0)
+    } else {
+        (v / k, k.min(1.0))
+    }
+}
+
+// research/xim EnvironmentSection.kt:206-225 modelLightMix: models swap moon->sun
+// at 06:00 (minute 360) and sun->moon at 18:00 (minute 1080), with a short blend
+// window on either side; t=1 means pure sun, t=0 means pure moon.
+fn model_light_mix(time_minutes: u32) -> f32 {
+    let m = (time_minutes % 1440) as f32;
+    if m < 355.0 {
+        0.0
+    } else if m < 365.0 {
+        (m - 355.0) / 10.0
+    } else if m < 1075.0 {
+        1.0
+    } else if m < 1085.0 {
+        (1085.0 - m) / 10.0
+    } else {
+        0.0
+    }
+}
+
 pub fn moon_color_for_phase(illumination: f32, moon_altitude: f32) -> (Color, f32) {
     if moon_altitude <= 0.0 {
         return (Color::BLACK, 0.0);
@@ -262,6 +320,9 @@ pub fn moon_phase_frame(moon_phase: f32) -> usize {
     (((moon_phase - 0.5).rem_euclid(1.0) * N as f32).round() as usize) % N
 }
 
+// No-DAT fallback only. The authoritative tints are the parsed 0x4E DayOfWeekColor /
+// 0x4F MoonPhaseColor generator opcodes (research/xim ParticleUpdaters.kt:289-317),
+// resolved by celestial_moon_tint below.
 const WEEKDAY_MOON_TINT: [[f32; 3]; 8] = [
     [1.00, 0.82, 0.78],
     [1.00, 0.92, 0.78],
@@ -273,10 +334,44 @@ const WEEKDAY_MOON_TINT: [[f32; 3]; 8] = [
     [0.78, 0.72, 0.85],
 ];
 
+// research/xim Particle.kt:217-218: getColor() applies colorDayOfWeek then colorMoonPhase
+// each via modulateInPlace(it, 2f) — a 2x modulate (out *= 2*c, clamped). Returns the
+// combined moon tint in RGB. Falls back to WEEKDAY_MOON_TINT when the zone ships no
+// 0x4E/0x4F tables (so the celestial look degrades to the hand-tuned constants).
+fn celestial_moon_tint(
+    tables: &crate::moon_material::CelestialColorTables,
+    total_v_days: u64,
+    moon_phase: f32,
+) -> [f32; 3] {
+    let mut rgb = WEEKDAY_MOON_TINT[(total_v_days % 8) as usize];
+    let mut has_dat = false;
+    if let Some(dow) = tables.day_of_week {
+        let c = dow[(total_v_days % 8) as usize];
+        rgb = [c[0], c[1], c[2]];
+        has_dat = true;
+    }
+    if let Some(mp) = tables.moon_phase {
+        let f = moon_phase_frame(moon_phase);
+        let c = mp[f];
+        let base = if has_dat { rgb } else { [1.0, 1.0, 1.0] };
+        rgb = [
+            (base[0] * 2.0 * c[0]).min(1.0),
+            (base[1] * 2.0 * c[1]).min(1.0),
+            (base[2] * 2.0 * c[2]).min(1.0),
+        ];
+    }
+    rgb
+}
+
 #[derive(bevy::ecs::system::SystemParam)]
 pub struct SunMoonRenderCfg<'w> {
     pub settings: Res<'w, crate::graphics_settings::GraphicsSettings>,
     pub moon_sprite: Res<'w, crate::moon_material::MoonSpriteFrames>,
+    pub color_tables: Res<'w, crate::moon_material::CelestialColorTables>,
+    pub sun_sprite: Res<'w, crate::moon_material::SunSprite>,
+    pub sun_disc_meshes: Option<Res<'w, SunDiscMeshes>>,
+    pub zone_weather: Res<'w, crate::weather::ZoneWeather>,
+    pub zone_lighting: ResMut<'w, crate::weather::ZoneDirectionalLighting>,
 }
 
 pub fn sun_moon_system(
@@ -302,7 +397,12 @@ pub fn sun_moon_system(
         ),
     >,
     mut q_sun_disc: Query<
-        (&mut Transform, &mut Visibility),
+        (
+            &mut Transform,
+            &mut Visibility,
+            &mut Mesh3d,
+            &MeshMaterial3d<StandardMaterial>,
+        ),
         (
             With<SunDisc>,
             Without<MoonDisc>,
@@ -341,7 +441,7 @@ pub fn sun_moon_system(
     mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     sky_realism: Res<crate::sky_realism::SkyRealism>,
-    render_cfg: SunMoonRenderCfg,
+    mut render_cfg: SunMoonRenderCfg,
     mut transition_state: Local<MoonTransitionState>,
 ) {
     let MoonTransitionState {
@@ -400,10 +500,24 @@ pub fn sun_moon_system(
     }
     *prev_phase_bucket = Some(phase_bucket);
 
-    let sun_angle = (sky.hour / 24.0) * 2.0 * PI - PI / 2.0;
-    let sun_dir = Vec3::new(sun_angle.cos(), sun_angle.sin(), 0.25).normalize();
+    let sun_dir = sun_direction(sky.hour);
     let sun_pos = sun_dir * LIGHT_DISTANCE;
-    let (sun_color, sun_lux) = sun_color_for_hour(sky.hour, sky.sun_altitude);
+
+    // research/xim EnvironmentSection.kt:151-159: the 0x2F terrain block's sun/moon
+    // diffuse colors are authoritative when the zone ships records; the synthetic
+    // sun_color_for_hour/moon_color_for_phase path is the records.is_empty() fallback.
+    let dat = render_cfg.zone_weather.current;
+    let time_minutes = (sky.hour * 60.0).rem_euclid(1440.0) as u32;
+
+    let (sun_color, sun_lux) = match dat {
+        Some(rec) if sky.sun_altitude > 0.0 => {
+            let d = rec.sunlight_diffuse_landscape;
+            let (hue, k) = diffuse_to_light([d[0], d[1], d[2]]);
+            (Color::linear_rgb(hue.x, hue.y, hue.z), k * DAT_DIR_REF_LUX)
+        }
+        Some(_) => (Color::BLACK, 0.0),
+        None => sun_color_for_hour(sky.hour, sky.sun_altitude),
+    };
 
     let physical_sky = render_cfg.settings.sky_style.physical();
 
@@ -433,26 +547,116 @@ pub fn sun_moon_system(
         let signed = if sky.moon_waxing { theta } else { -theta };
         Quat::from_rotation_z(signed) * sun_dir
     } else {
-        let moon_angle = sun_angle + PI;
+        let moon_angle = (sky.hour / 24.0) * 2.0 * PI - PI / 2.0 + PI;
         Vec3::new(moon_angle.cos(), moon_angle.sin(), 0.25).normalize()
     };
 
     let moon_altitude = moon_dir.y.asin();
     sky.moon_altitude = moon_altitude;
     let moon_pos = moon_dir * LIGHT_DISTANCE;
-    let (moon_color, moon_lux) = moon_color_for_phase(sky.moon_illumination, sky.moon_altitude);
+    let (moon_color, moon_lux) = match dat {
+        Some(rec) if sky.moon_altitude > 0.0 => {
+            let d = rec.moonlight_diffuse_landscape;
+            let (hue, k) = diffuse_to_light([d[0], d[1], d[2]]);
+            (Color::linear_rgb(hue.x, hue.y, hue.z), k * DAT_DIR_REF_LUX)
+        }
+        Some(_) => (Color::BLACK, 0.0),
+        None => moon_color_for_phase(sky.moon_illumination, sky.moon_altitude),
+    };
     if let Ok((mut light, mut xf)) = q_moon.single_mut() {
         light.color = moon_color;
         light.illuminance = moon_lux;
         *xf = Transform::from_translation(moon_pos).looking_at(Vec3::ZERO, Vec3::Y);
     }
 
+    // Publish the entity(model) + landscape(terrain) split for the actor- and
+    // zone-material lighting consumers. The model light is a single moon<->sun
+    // blend (research/xim EnvironmentSection.kt:206-225); landscape feeds both
+    // sun(dir0) and moon(dir1) slots from the terrain block.
+    if let Some(rec) = dat {
+        let sun_up = sky.sun_altitude > 0.0;
+        let moon_up = sky.moon_altitude > 0.0;
+
+        let (e_sun_hue, e_sun_k) = diffuse_to_light([
+            rec.sunlight_diffuse_entity[0],
+            rec.sunlight_diffuse_entity[1],
+            rec.sunlight_diffuse_entity[2],
+        ]);
+        let (e_moon_hue, e_moon_k) = diffuse_to_light([
+            rec.moonlight_diffuse_entity[0],
+            rec.moonlight_diffuse_entity[1],
+            rec.moonlight_diffuse_entity[2],
+        ]);
+        let mix = model_light_mix(time_minutes);
+        let model_dir = moon_dir.lerp(sun_dir, mix).normalize_or_zero();
+        let sun_rgb = e_sun_hue * e_sun_k;
+        let moon_rgb = e_moon_hue * e_moon_k;
+        let model_rgb = moon_rgb.lerp(sun_rgb, mix);
+        let (model_color, model_k) = diffuse_to_light([model_rgb.x, model_rgb.y, model_rgb.z]);
+
+        let (s_hue, s_k) = diffuse_to_light([
+            rec.sunlight_diffuse_landscape[0],
+            rec.sunlight_diffuse_landscape[1],
+            rec.sunlight_diffuse_landscape[2],
+        ]);
+        let (m_hue, m_k) = diffuse_to_light([
+            rec.moonlight_diffuse_landscape[0],
+            rec.moonlight_diffuse_landscape[1],
+            rec.moonlight_diffuse_landscape[2],
+        ]);
+
+        *render_cfg.zone_lighting = crate::weather::ZoneDirectionalLighting {
+            valid: true,
+            indoors: rec.indoors,
+            model_dir,
+            model_color,
+            model_k,
+            ambient_entity: Vec3::new(
+                rec.ambient_entity[0],
+                rec.ambient_entity[1],
+                rec.ambient_entity[2],
+            ),
+            sun_dir,
+            sun_color: s_hue,
+            sun_k: if sun_up { s_k } else { 0.0 },
+            moon_dir,
+            moon_color: m_hue,
+            moon_k: if moon_up { m_k } else { 0.0 },
+            ambient_landscape: Vec3::new(
+                rec.ambient_landscape[0],
+                rec.ambient_landscape[1],
+                rec.ambient_landscape[2],
+            ),
+        };
+    } else {
+        render_cfg.zone_lighting.valid = false;
+    }
+
     let cam_pos = q_cam.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
 
     let sun_visible = sky.sun_altitude > -0.05;
-    if let Ok((mut disc, mut vis)) = q_sun_disc.single_mut() {
+    let sun_sprite_tex = render_cfg.sun_sprite.texture.clone();
+    if let Ok((mut disc, mut vis, mut mesh3d, _)) = q_sun_disc.single_mut() {
         disc.translation = cam_pos + sun_dir * SKY_RADIUS;
-        disc.scale = Vec3::splat(SUN_DISC_RADIUS);
+        // research/xim: the sun is an attach=0xE additive billboard. With a "suns"
+        // sprite the disc is a camera-facing textured quad; otherwise the procedural
+        // emissive sphere (no sprite fallback).
+        if let Some(meshes) = render_cfg.sun_disc_meshes.as_deref() {
+            let want = if sun_sprite_tex.is_some() {
+                &meshes.quad
+            } else {
+                &meshes.sphere
+            };
+            if mesh3d.0 != *want {
+                mesh3d.0 = want.clone();
+            }
+        }
+        if sun_sprite_tex.is_some() {
+            disc.scale = Vec3::splat(SUN_DISC_RADIUS * 2.0);
+            disc.look_at(cam_pos, Vec3::Y);
+        } else {
+            disc.scale = Vec3::splat(SUN_DISC_RADIUS);
+        }
         *vis = if sun_visible {
             Visibility::Inherited
         } else {
@@ -500,7 +704,7 @@ pub fn sun_moon_system(
                 - crate::hud::vana_clock::EARTH_EPOCH_UNIX as f64)
                 .max(0.0);
             let total_v_days = (earth_since * 25.0 / 86400.0) as u64;
-            let t = WEEKDAY_MOON_TINT[(total_v_days % 8) as usize];
+            let t = celestial_moon_tint(&render_cfg.color_tables, total_v_days, sky.moon_phase);
 
             mat.base_color = Color::linear_rgb(t[0] * 0.20, t[1] * 0.20, t[2] * 0.22);
         }
@@ -526,6 +730,23 @@ pub fn sun_moon_system(
                 c.green * intensity * 0.95,
                 c.blue * intensity * 0.75,
             );
+            // With a retail "suns" sprite the disc renders as an additive textured
+            // billboard; without one it stays the untextured emissive sphere.
+            if sun_sprite_tex.is_some() {
+                if sun_mat.base_color_texture != sun_sprite_tex {
+                    sun_mat.base_color_texture = sun_sprite_tex.clone();
+                }
+                let f = render_cfg.sun_sprite.frame_uv;
+                sun_mat.uv_transform = bevy::math::Affine2::from_scale_angle_translation(
+                    Vec2::new(f.z - f.x, f.w - f.y),
+                    0.0,
+                    Vec2::new(f.x, f.y),
+                );
+                sun_mat.alpha_mode = AlphaMode::Add;
+            } else if sun_mat.base_color_texture.is_some() {
+                sun_mat.base_color_texture = None;
+                sun_mat.alpha_mode = AlphaMode::Opaque;
+            }
         }
         if let Some(moon_mat) = moon_materials.get_mut(&handles.moon) {
             let visibility = sky.moon_illumination.clamp(0.0, 1.0);
@@ -540,7 +761,8 @@ pub fn sun_moon_system(
                 - crate::hud::vana_clock::EARTH_EPOCH_UNIX as f64)
                 .max(0.0);
             let total_v_days = (earth_since * 25.0 / 86400.0) as u64;
-            let mut tint = WEEKDAY_MOON_TINT[(total_v_days % 8) as usize];
+            let mut tint =
+                celestial_moon_tint(&render_cfg.color_tables, total_v_days, sky.moon_phase);
 
             if sky_realism.horizon_reddening && sky.moon_altitude > 0.0 {
                 let alt_norm = (sky.moon_altitude / (PI / 9.0)).clamp(0.0, 1.0);
@@ -607,6 +829,35 @@ pub fn sun_moon_system(
 mod tests {
     use super::*;
     use crate::hud::vana_clock::EARTH_SECS_PER_VANA_DAY;
+
+    // research/xim EnvironmentSection.kt:206-225: pure moon before 355, ramp to pure
+    // sun by 365, pure sun until 1075, ramp back to pure moon by 1085.
+    #[test]
+    fn model_light_mix_matches_xim_thresholds() {
+        assert_eq!(model_light_mix(0), 0.0);
+        assert_eq!(model_light_mix(354), 0.0);
+        assert_eq!(model_light_mix(355), 0.0);
+        assert!((model_light_mix(360) - 0.5).abs() < 1e-5);
+        assert_eq!(model_light_mix(365), 1.0);
+        assert_eq!(model_light_mix(720), 1.0);
+        assert_eq!(model_light_mix(1074), 1.0);
+        assert!((model_light_mix(1080) - 0.5).abs() < 1e-5);
+        assert_eq!(model_light_mix(1085), 0.0);
+        assert_eq!(model_light_mix(1200), 0.0);
+    }
+
+    #[test]
+    fn diffuse_to_light_max_normalizes_and_preserves_product() {
+        let (hue, k) = diffuse_to_light([0.5, 0.25, 0.0]);
+        assert!((k - 0.5).abs() < 1e-6);
+        assert!((hue.x * k - 0.5).abs() < 1e-6);
+        assert!((hue.y * k - 0.25).abs() < 1e-6);
+        assert_eq!(hue.z, 0.0);
+
+        let (hue0, k0) = diffuse_to_light([0.0, 0.0, 0.0]);
+        assert_eq!(hue0, Vec3::ZERO);
+        assert_eq!(k0, 0.0);
+    }
 
     #[test]
     fn noon_sun_is_overhead() {

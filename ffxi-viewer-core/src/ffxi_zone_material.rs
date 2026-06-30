@@ -28,6 +28,13 @@ pub struct FfxiZoneMaterial {
     #[uniform(3)]
     pub material_flags: FfxiMaterialFlags,
 
+    // research/xim ParticleGeneratorParser.kt:431-434 ToD color: a per-mesh RGB(setter) +
+    // alpha(multiplier) the weat/<type>/ ClockValueUpdaters drive over the Vana day. Folded
+    // as a final modulate in the fragment shader. White (1,1,1,1) is the no-op default for
+    // every other zone mesh — only the cloud/sun layers (zone_clouds.rs) write a live tint.
+    #[uniform(4)]
+    pub tint: Vec4,
+
     pub alpha_mode: AlphaMode,
 }
 
@@ -82,6 +89,7 @@ const LIGHTING_EPSILON: f32 = 1.5e-3;
 
 fn update_zone_material_lighting(
     ambient: Res<GlobalAmbientLight>,
+    zone_lighting: Res<crate::weather::ZoneDirectionalLighting>,
     q_sun: Query<
         (&DirectionalLight, &GlobalTransform),
         (
@@ -133,8 +141,36 @@ fn update_zone_material_lighting(
             _ => (Vec4::ZERO, Vec4::ZERO),
         }
     };
-    let (dir0_dir, dir0_color) = extract(q_sun.single().ok());
-    let (dir1_dir, dir1_color) = extract(q_moon.single().ok());
+    // research/xim EnvironmentSection.kt:163-164: zone geometry takes both terrain
+    // sun(dir0)+moon(dir1) diffuse lights. The DirectionalLight's `forward` is the
+    // -to-celestial direction, so negate the stored to-sun/to-moon vectors to match.
+    let (dir0_dir, dir0_color, dir1_dir, dir1_color) = if zone_lighting.valid {
+        let pack = |to_dir: Vec3, color: Vec3, k: f32| -> (Vec4, Vec4) {
+            if k <= 0.0 || to_dir == Vec3::ZERO {
+                return (Vec4::ZERO, Vec4::ZERO);
+            }
+            let f = (-to_dir).normalize_or_zero();
+            (
+                Vec4::new(f.x, f.y, f.z, 0.0),
+                Vec4::new(color.x, color.y, color.z, k.clamp(0.0, 1.0)),
+            )
+        };
+        let (d0d, d0c) = pack(
+            zone_lighting.sun_dir,
+            zone_lighting.sun_color,
+            zone_lighting.sun_k,
+        );
+        let (d1d, d1c) = pack(
+            zone_lighting.moon_dir,
+            zone_lighting.moon_color,
+            zone_lighting.moon_k,
+        );
+        (d0d, d0c, d1d, d1c)
+    } else {
+        let (d0d, d0c) = extract(q_sun.single().ok());
+        let (d1d, d1c) = extract(q_moon.single().ok());
+        (d0d, d0c, d1d, d1c)
+    };
 
     let next = [ambient_v, dir0_dir, dir0_color, dir1_dir, dir1_color];
     let count = materials.len();

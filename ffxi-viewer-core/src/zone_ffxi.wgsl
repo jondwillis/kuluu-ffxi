@@ -46,6 +46,9 @@ struct FfxiMaterialFlags {
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var base_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var base_samp: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> material_flags: FfxiMaterialFlags;
+// Per-mesh ToD tint: rgb is the cloud/sun-mesh color setter, w an alpha multiplier.
+// White (1,1,1,1) for every non-cloud zone mesh, so this is a no-op there.
+@group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> tint: vec4<f32>;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -154,11 +157,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // XIM's `2 * vertexColor * texel`, with vertexColor modulating the scene
     // light. Vertex colour is overbright (can exceed 1) — do NOT clamp it.
     let lit = scene_irradiance(n, in.world_position, sun) * in.color.rgb;
-    let rgb = 2.0 * lit * texel.rgb;
+    // research/xim ParticleGeneratorParser.kt:431-434: ToD color.rgb is a setter folded
+    // over the lit texel; color multiplier (.w) scales the emitted alpha.
+    let rgb = 2.0 * lit * texel.rgb * tint.rgb;
     // 0x8000 subs (water/glass) emit the blended alpha; everything else opaque.
     var out_alpha = 1.0;
     if (material_flags.flags.y > 0.5) {
         out_alpha = combined_a;
     }
-    return vec4<f32>(rgb, out_alpha);
+    return vec4<f32>(rgb, out_alpha * tint.w);
 }

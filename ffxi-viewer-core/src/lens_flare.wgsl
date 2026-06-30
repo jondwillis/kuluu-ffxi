@@ -11,24 +11,35 @@
 // Additive blend: where the flare contributes nothing the fragment is black
 // (adds zero), so the quad can cover the whole screen cheaply.
 //
-// Three classic flare elements, all keyed off the sun→screen-centre axis the way
-// a real compound lens scatters light:
-//   * Halo      — bright bloom centred on the sun.
-//   * Ghosts    — a chain of dim discs marching through screen centre.
-//   * Streak    — a horizontal anamorphic flare bar through the sun.
+// When the zone ships an lf0x lens-flare sprite sheet (flare_params.y), the chain is
+// data-driven: each element is an additive textured quad placed along the
+// sun→screen-centre axis at sun*(1-offset)+opposite*offset, sized viewport/32
+// (research/xim ZoneDrawer.kt:233-236). Without a sheet it falls back to three
+// analytic elements keyed off the same axis: a halo bloom, a chain of ghost discs,
+// and a horizontal anamorphic streak.
 
 #import bevy_pbr::forward_io::VertexOutput
 #import bevy_pbr::mesh_view_bindings::view
 #import bevy_pbr::prepass_utils
+
+const MAX_FLARE_ELEMENTS: u32 = 16u;
 
 struct LensFlareUniform {
     // xyz = normalized world-space sun direction, w = intensity [0,1].
     sun_dir_intensity: vec4<f32>,
     // rgb = flare tint, a = unused.
     tint: vec4<f32>,
+    // x = element count, y = 1.0 when the lf0x sheet is loaded (data-driven chain).
+    flare_params: vec4<f32>,
+    // x = per-element offset fraction along sun->opposite.
+    offsets: array<vec4<f32>, 16>,
+    // (u0,v0,u1,v1) sub-rect of each element in the lf0x texture.
+    frame_uv: array<vec4<f32>, 16>,
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> data: LensFlareUniform;
+@group(#{MATERIAL_BIND_GROUP}) @binding(1) var flare_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(2) var flare_samp: sampler;
 
 // Distance used to synthesize a world point in the sun's direction. Matched to
 // the skybox radius (sun_moon::SKY_RADIUS) so the sun's depth equals the sky's
@@ -115,6 +126,34 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let tint = data.tint.rgb;
 
     var col = vec3<f32>(0.0);
+
+    // --- Data-driven lf0x chain (research/xim ZoneDrawer.kt:233-236). ---
+    // Each lens-flare mesh is an additive textured quad placed at
+    // sun*(1-offset) + opposite*offset along the sun->screen-centre axis (opposite =
+    // sun + 2*to_centre), sized viewport/32. Intensity rides the depth-prepass
+    // occlusion `visibility` instead of an analytic halo.
+    if (data.flare_params.y > 0.5) {
+        let count = u32(data.flare_params.x);
+        let to_centre_d = centre - sun;
+        let opposite = sun + to_centre_d * 2.0;
+        // Half-extent of each element in screen-UV: 32-px-scaled mesh / viewport.
+        let half = vec2<f32>(16.0, 16.0) / max(view.viewport.zw, vec2<f32>(1.0));
+        for (var i = 0u; i < count && i < MAX_FLARE_ELEMENTS; i = i + 1u) {
+            let offset = data.offsets[i].x;
+            let pos = sun * (1.0 - offset) + opposite * offset;
+            let local = (uv - pos) / half; // [-1,1] inside the quad
+            // Clamp + mask rather than `continue`, so the textureSample stays in
+            // uniform control flow (WGSL requires implicit-LOD sampling there).
+            let inside = step(abs(local.x), 1.0) * step(abs(local.y), 1.0);
+            let quad_uv = clamp(local * 0.5 + vec2<f32>(0.5), vec2<f32>(0.0), vec2<f32>(1.0));
+            let f = data.frame_uv[i];
+            let suv = vec2<f32>(mix(f.x, f.z, quad_uv.x), mix(f.y, f.w, quad_uv.y));
+            let texel = textureSample(flare_tex, flare_samp, suv);
+            col += tint * texel.rgb * texel.a * inside;
+        }
+        let edge_d = 1.0 - smoothstep(0.35, 0.75, length((sun - centre) * vec2<f32>(aspect, 1.0)));
+        return vec4<f32>(col * intensity * visibility * edge_d, 0.0);
+    }
 
     // --- Halo: tight bright core + wide soft bloom around the sun. ---
     let core = disc(uv, sun, 0.06, aspect);

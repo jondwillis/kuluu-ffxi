@@ -44,7 +44,7 @@ fn dump_zone(root: &DatRoot, zone_id: u16) -> Result<(), Box<dyn std::error::Err
             r.skybox_colors[7],
             r.ambient_landscape,
             r.fog_landscape,
-            r.brightness_landscape,
+            r.diffuse_mul_landscape,
         );
     }
 

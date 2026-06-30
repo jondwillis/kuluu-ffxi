@@ -8,6 +8,10 @@ use crate::components::InGameEntity;
 use crate::graphics_settings::GraphicsSettings;
 use crate::sun_moon::VanaSky;
 
+// Max lf0x flare elements packed into the uniform chain. Real lens-flare sheets
+// carry only a handful of meshes; extra slots stay inert (count gates them).
+pub const MAX_FLARE_ELEMENTS: usize = 16;
+
 #[derive(Clone, Debug, ShaderType)]
 pub struct LensFlareUniform {
     // xyz = normalized world-space sun direction (projected to screen in the
@@ -15,6 +19,17 @@ pub struct LensFlareUniform {
     pub sun_dir_intensity: Vec4,
 
     pub tint: Vec4,
+
+    // x = element count, y = 1.0 when the lf0x sheet/texture is loaded (data-driven
+    // chain) else 0.0 (analytic fallback), zw unused.
+    pub flare_params: Vec4,
+
+    // Per-element: xy = offset fraction along sun->opposite (x carries the offset,
+    // y reserved), zw unused — kept as Vec4 for std140 16-byte stride.
+    pub offsets: [Vec4; MAX_FLARE_ELEMENTS],
+
+    // Per-element UV sub-rect (u0,v0,u1,v1) into the lf0x texture.
+    pub frame_uv: [Vec4; MAX_FLARE_ELEMENTS],
 }
 
 impl Default for LensFlareUniform {
@@ -22,6 +37,9 @@ impl Default for LensFlareUniform {
         Self {
             sun_dir_intensity: Vec4::new(0.0, 1.0, 0.0, 0.0),
             tint: Vec4::new(1.0, 0.95, 0.85, 1.0),
+            flare_params: Vec4::ZERO,
+            offsets: [Vec4::ZERO; MAX_FLARE_ELEMENTS],
+            frame_uv: [Vec4::new(0.0, 0.0, 1.0, 1.0); MAX_FLARE_ELEMENTS],
         }
     }
 }
@@ -30,6 +48,18 @@ impl Default for LensFlareUniform {
 pub struct LensFlareMaterial {
     #[uniform(0)]
     pub data: LensFlareUniform,
+
+    #[texture(1)]
+    #[sampler(2)]
+    pub flare_tex: Option<Handle<Image>>,
+}
+
+// Per-zone lf0x sheet (offsets + UV frames), loaded from the zone DAT. None where the
+// zone ships no lens-flare sheet (then the analytic halo/ghost/streak is used).
+#[derive(Resource, Default, Clone)]
+pub struct LensFlareSheet {
+    pub offsets: Vec<f32>,
+    pub frames: Vec<Vec4>,
 }
 
 impl Material for LensFlareMaterial {
@@ -137,13 +167,100 @@ fn lens_flare_system(
     }
 }
 
+// Load the zone's lf0x lens-flare sprite sheet (per-mesh offset fractions + UV frames
+// + texture) from the zone DAT, mirroring moon_material::load_moon_sprite_sheet. When
+// present the shader draws the data-driven additive chain; otherwise it falls back to
+// the analytic halo/ghost/streak.
+#[allow(clippy::type_complexity)]
+fn load_lens_flare_sheet(
+    scene_state: Res<crate::snapshot::SceneState>,
+    dat_root: Option<Res<crate::moon_material::MoonDatRoot>>,
+    mut sheet_res: ResMut<LensFlareSheet>,
+    mut images: ResMut<Assets<Image>>,
+    flare_q: Query<&MeshMaterial3d<LensFlareMaterial>, With<LensFlareQuad>>,
+    mut mats: ResMut<Assets<LensFlareMaterial>>,
+    mut loaded_zone: Local<Option<Option<u16>>>,
+) {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::image::ImageSampler;
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+
+    let current = scene_state.snapshot.zone_id;
+    if *loaded_zone == Some(current) {
+        return;
+    }
+    let Some(dat_root) = dat_root.and_then(|r| r.0.clone()) else {
+        return;
+    };
+    *loaded_zone = Some(current);
+
+    let sheet = current
+        .and_then(ffxi_dat::zone_dat::zone_id_to_mzb_file_id)
+        .and_then(|file_id| dat_root.resolve(file_id).ok())
+        .and_then(|loc| std::fs::read(loc.path_under(dat_root.root())).ok())
+        .and_then(|bytes| ffxi_dat::sprite_sheet::extract_lens_flare_sheet(&bytes));
+
+    let mat = flare_q.single().ok().and_then(|m| mats.get_mut(&m.0));
+
+    let Some(sheet) = sheet else {
+        *sheet_res = LensFlareSheet::default();
+        if let Some(mat) = mat {
+            mat.flare_tex = None;
+            mat.data.flare_params.x = 0.0;
+            mat.data.flare_params.y = 0.0;
+        }
+        return;
+    };
+
+    let n = sheet.offsets.len().min(MAX_FLARE_ELEMENTS);
+    let offsets: Vec<f32> = sheet.offsets[..n].to_vec();
+    let frames: Vec<Vec4> = sheet.frames[..n]
+        .iter()
+        .map(|f| Vec4::new(f.u0, f.v0, f.u1, f.v1))
+        .collect();
+
+    let image = Image::new(
+        Extent3d {
+            width: sheet.texture.width,
+            height: sheet.texture.height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        sheet.texture.rgba.clone(),
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    let mut image = image;
+    image.sampler = ImageSampler::linear();
+    let handle = images.add(image);
+
+    *sheet_res = LensFlareSheet {
+        offsets: offsets.clone(),
+        frames: frames.clone(),
+    };
+
+    if let Some(mat) = mat {
+        mat.flare_tex = Some(handle);
+        mat.data.flare_params.x = n as f32;
+        mat.data.flare_params.y = 1.0;
+        for (i, off) in offsets.iter().enumerate() {
+            mat.data.offsets[i] = Vec4::new(*off, 0.0, 0.0, 0.0);
+        }
+        for (i, f) in frames.iter().enumerate() {
+            mat.data.frame_uv[i] = *f;
+        }
+    }
+}
+
 pub struct LensFlarePlugin;
 
 impl Plugin for LensFlarePlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "lens_flare.wgsl");
-        app.add_plugins(MaterialPlugin::<LensFlareMaterial>::default())
+        app.init_resource::<LensFlareSheet>()
+            .add_plugins(MaterialPlugin::<LensFlareMaterial>::default())
             .add_systems(Startup, spawn_lens_flare)
+            .add_systems(Update, load_lens_flare_sheet)
             .add_systems(
                 Update,
                 lens_flare_system.after(crate::sun_moon::sun_moon_system),

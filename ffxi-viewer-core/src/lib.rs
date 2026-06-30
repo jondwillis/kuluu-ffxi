@@ -62,6 +62,7 @@ pub mod water_enhanced;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod weather;
 pub mod weather_fx;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod zone_clouds;
 pub mod zone_lights;
 pub mod zone_lines;
@@ -190,6 +191,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(zone_point_lights::ZonePointLightsPlugin);
 
+        #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(zone_clouds::ZoneCloudsPlugin);
 
         app.add_plugins(debug_chat::DebugChatPlugin);
@@ -208,6 +210,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<atmosphere::ZoneAtmosphereProvider>()
             .init_resource::<atmosphere::LastAtmosphereZone>()
             .init_resource::<sun_moon::VanaSky>()
+            .init_resource::<weather::ZoneDirectionalLighting>()
             .init_resource::<vana_time::VanaClock>()
             .init_resource::<sky_realism::SkyRealism>()
             .init_resource::<weather_fx::ActiveWeatherModifier>()
@@ -272,6 +275,14 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             app.init_resource::<target_strobe::StrobeState>();
             app.add_systems(Update, target_strobe::target_strobe_system);
         }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        app.configure_sets(
+            Update,
+            weather::WeatherSampleSet
+                .before(sun_moon::sun_moon_system)
+                .after(weather_fx::sync_current_weather_from_snapshot),
+        );
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(Update, ffxi_actor_render::update_ffxi_render_actor_lighting);

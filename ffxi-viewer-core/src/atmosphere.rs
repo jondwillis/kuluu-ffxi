@@ -78,15 +78,14 @@ impl ZoneAtmosphere {
 #[derive(Resource)]
 pub struct ZoneAtmosphereProvider(pub Box<dyn Fn(u16) -> ZoneAtmosphere + Send + Sync>);
 
+// The zone-id indoor/cave heuristic was retired in favor of the F1 (0x2F) indoor
+// flag (research/xim EnvironmentSection.kt:275-277). apply_zone_atmosphere_system
+// selects indoor vs outdoor from the loaded ZoneWeather records; this provider is
+// the record-less fallback seed (outdoor), kept so zones without 0x2F don't go
+// black before apply_zone_weather can take authority.
 impl Default for ZoneAtmosphereProvider {
     fn default() -> Self {
-        Self(Box::new(|zone_id: u16| match zone_id {
-            230..=246 => ZoneAtmosphere::indoor(),
-
-            193..=199 | 207..=215 => ZoneAtmosphere::cave(),
-
-            _ => ZoneAtmosphere::outdoor(),
-        }))
+        Self(Box::new(|_zone_id: u16| ZoneAtmosphere::outdoor()))
     }
 }
 

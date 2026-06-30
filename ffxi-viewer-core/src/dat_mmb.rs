@@ -147,8 +147,6 @@ pub struct LoadedMmb {
     /// Header bytes 16..32 (XIM's section `name`). A leading '_' selects the
     /// alpha-tested cutout render mode for this model's submeshes.
     pub zone_mesh_name: String,
-
-    pub is_cloud: bool,
 }
 
 pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
@@ -246,13 +244,11 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
     // XIM (`ZoneMeshSection.kt`): the model name at header bytes 16..32 is the
     // alpha-test selector — a leading '_' marks a cutout (foliage) model.
     let zone_mesh_name = header.zone_mesh_name();
-    let is_cloud = header.is_cloud();
     Ok(LoadedMmb {
         submeshes: out,
         textures,
         asset_name,
         zone_mesh_name,
-        is_cloud,
     })
 }
 
@@ -514,16 +510,6 @@ pub fn process_load_mmb_requests(
                     }
                 };
 
-                if loaded.is_cloud {
-                    info!(
-                        "zone_clouds: detected cloud MMB '{}' (file {} chunk {})",
-                        loaded.asset_name, req.file_id, req.chunk_idx
-                    );
-                    commands
-                        .entity(parent)
-                        .insert(crate::zone_clouds::CloudMesh);
-                }
-
                 let n_subs = loaded.submeshes.len();
                 for (sub_index, sub) in loaded.submeshes.iter().enumerate() {
                     let cache_key = (req.file_id, req.chunk_idx, sub_index);
@@ -579,6 +565,7 @@ pub fn process_load_mmb_requests(
                                         discard_threshold,
                                     ),
                                 },
+                                tint: Vec4::ONE,
                                 alpha_mode,
                             })
                         })

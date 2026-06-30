@@ -49,34 +49,6 @@ fn get_altitude(i: u32) -> f32 {
     return v.w;
 }
 
-// --- Value-noise FBM for the procedural cloud layer. ---
-fn hash2(p: vec2<f32>) -> f32 {
-    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
-}
-
-fn vnoise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
-    let a = hash2(i);
-    let b = hash2(i + vec2<f32>(1.0, 0.0));
-    let c = hash2(i + vec2<f32>(0.0, 1.0));
-    let d = hash2(i + vec2<f32>(1.0, 1.0));
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-}
-
-fn fbm(p: vec2<f32>) -> f32 {
-    var v = 0.0;
-    var amp = 0.5;
-    var freq = p;
-    for (var i = 0; i < 5; i = i + 1) {
-        v = v + amp * vnoise(freq);
-        freq = freq * 2.0;
-        amp = amp * 0.5;
-    }
-    return v;
-}
-
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // World-space ray direction from camera to this fragment. The
@@ -108,48 +80,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let lo_col = data.colors[lo_idx];
     let hi_col = data.colors[hi_idx];
-    var col = mix(lo_col, hi_col, t).rgb;
+    let col = mix(lo_col, hi_col, t).rgb;
 
-    let clouds_only = data.extra.x > 0.5;
-
-    // --- Procedural cloud layer (Enhanced style; opacity 0 = off). ---
-    let opacity = data.cloud_params.y;
-    var cloud_a = 0.0;
-    var cloud_col = col;
-    if (opacity > 0.001 && altitude > 0.02) {
-        let coverage = data.cloud_params.x;
-        let scroll = data.cloud_params.zw;
-        // Stereographic projection of the ray onto a horizontal disc
-        // (projection point at the nadir). The naive ray.xz/ray.y planar
-        // map diverges as ray.y → 0, smearing the noise into radial
-        // streaks along the horizon and forcing a clamp whose frozen
-        // region shows up as vertical banding. Stereographic projection
-        // is *conformal* — it preserves local angles, so a round cloud
-        // puff stays round from zenith to skyline instead of stretching —
-        // and bounded (|proj| ≤ 1 for any visible altitude), so there's
-        // no singularity and no clamp discontinuity to band.
-        let proj = ray.xz / (1.0 + ray.y);
-        let density = fbm(proj * 3.5 + scroll);
-        // Threshold the noise into cloud shapes: higher coverage lowers
-        // the cut so more sky fills in.
-        let cut = 1.0 - coverage;
-        let shape = smoothstep(cut, cut + 0.35, density);
-        // Fade in from the horizon so clouds don't knife-edge at the
-        // skyline, and ride on the opacity knob.
-        let horizon_fade = smoothstep(0.02, 0.30, altitude);
-        cloud_a = clamp(shape * horizon_fade * opacity, 0.0, 1.0);
-        // Tint clouds by the local sky color so they share its hue
-        // (warm at dusk, blue at noon) but read brighter — the
-        // texColor·skyColor idea from retail, done procedurally.
-        cloud_col = mix(col, vec3<f32>(1.0, 1.0, 1.0), 0.6) * (0.7 + 0.3 * density);
-    }
-
-    // Clouds-only layer (drawn over the atmosphere): emit straight-alpha so
-    // the sky behind shows through everywhere the clouds are thin.
-    if (clouds_only) {
-        return vec4<f32>(cloud_col, cloud_a);
-    }
-
-    col = mix(col, cloud_col, cloud_a);
+    // Clouds are mesh-rendered from the weat/<type>/ DAT (zone_clouds.rs); the
+    // dome is pure gradient. cloud_params is retained in the uniform for layout
+    // compatibility but no longer drives a procedural layer here.
     return vec4<f32>(col, 1.0);
 }
