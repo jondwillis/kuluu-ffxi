@@ -817,6 +817,13 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::ActionStarted { .. } => "action_started",
         AgentEvent::VanaTimeSynced { .. } => "vana_time_synced",
         AgentEvent::KeyItemsUpdated { .. } => "key_items_updated",
+        AgentEvent::CharStatsUpdated { .. } => "char_stats_updated",
+        AgentEvent::FishingCast { .. } => "fishing_cast",
+        AgentEvent::FishHooked { .. } => "fish_hooked",
+        AgentEvent::FishingServerPhase { .. } => "fishing_server_phase",
+        AgentEvent::FishingPhaseChanged { .. } => "fishing_phase_changed",
+        AgentEvent::FishingProgress { .. } => "fishing_progress",
+        AgentEvent::FishingEnded => "fishing_ended",
     }
 }
 
@@ -847,6 +854,9 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         ReturnToHomePoint => "return_to_home_point",
         Heal { .. } => "heal",
         SetFps { .. } => "set_fps",
+        Fish => "fish",
+        FishingInput { .. } => "fishing_input",
+        FishingRequest { .. } => "fishing_request",
     }
 }
 
@@ -1362,6 +1372,7 @@ mod tests {
             heading: 64,
             hp_pct: Some(100),
             bt_target_id: 0,
+            face_target: 0,
             claim_id: 0,
             speed: 25,
             speed_base: 25,
@@ -1384,6 +1395,7 @@ mod tests {
                 heading: 0,
                 hp_pct: Some(100),
                 bt_target_id: 0,
+                face_target: 0,
                 claim_id: 0,
                 speed: 0,
                 speed_base: 0,
@@ -1414,6 +1426,7 @@ mod tests {
             heading: 0,
             hp_pct: Some(60),
             bt_target_id: 4242,
+            face_target: 0,
             claim_id: 0,
             speed: 0,
             speed_base: 0,
@@ -1434,6 +1447,7 @@ mod tests {
             heading: 0,
             hp_pct: Some(100),
             bt_target_id: 0,
+            face_target: 0,
             claim_id: 0,
             speed: 0,
             speed_base: 0,

@@ -363,10 +363,11 @@ mod tests {
     #[test]
     fn crop_vertical_flip_swaps_rows() {
         let mut rgba = vec![0u8; 2 * 2 * 4];
+        // First byte of each 4-byte BGRA texel: (0,0)=idx 0, (1,0)=idx 4, (0,1)=idx 8, (1,1)=idx 12.
         rgba[0] = 10; // (0,0)
-        rgba[1 * 4] = 11; // (1,0)
-        rgba[2 * 4] = 12; // (0,1)
-        rgba[3 * 4] = 13; // (1,1)
+        rgba[4] = 11; // (1,0)
+        rgba[8] = 12; // (0,1)
+        rgba[12] = 13; // (1,1)
         let tex = DecodedTexture {
             width: 2,
             height: 2,
