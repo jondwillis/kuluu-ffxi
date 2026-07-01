@@ -474,7 +474,7 @@ impl GraphicsSettings {
                 bloom_intensity: 0.0,
                 volumetric_fog: false,
                 fog_step_count: 32,
-                view_distance: 2000.0,
+                view_distance: 500.0,
                 vsync: true,
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
@@ -497,13 +497,13 @@ impl GraphicsSettings {
                 preset,
                 shadow_map_size: 2048,
                 shadow_cascade_count: 3,
-                shadow_max_distance: 400.0,
+                shadow_max_distance: 300.0,
                 anti_aliasing: aa_default,
                 texture_filtering: TextureFiltering::Vanilla,
                 bloom_intensity: 0.08,
                 volumetric_fog: true,
                 fog_step_count: 64,
-                view_distance: 4000.0,
+                view_distance: 1100.0,
                 vsync: true,
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
@@ -526,13 +526,13 @@ impl GraphicsSettings {
                 preset,
                 shadow_map_size: 4096,
                 shadow_cascade_count: 4,
-                shadow_max_distance: 600.0,
+                shadow_max_distance: 700.0,
                 anti_aliasing: aa_default,
                 texture_filtering: TextureFiltering::Aniso4x,
                 bloom_intensity: 0.08,
                 volumetric_fog: true,
                 fog_step_count: 64,
-                view_distance: 6000.0,
+                view_distance: 6100.0,
                 vsync: true,
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
@@ -553,9 +553,9 @@ impl GraphicsSettings {
             },
             QualityPreset::Ultra => Self {
                 preset,
-                shadow_map_size: 8192,
+                shadow_map_size: 4096,
                 shadow_cascade_count: 4,
-                shadow_max_distance: 800.0,
+                shadow_max_distance: 1100.0,
                 // MSAA8 rather than TAA: TAA needs a motion-vector camera prepass,
                 // which forces every zone/character draw through a second geometry
                 // pass. No preset should silently pay that — the prepass is opt-in
@@ -565,7 +565,7 @@ impl GraphicsSettings {
                 bloom_intensity: 0.12,
                 volumetric_fog: true,
                 fog_step_count: 96,
-                view_distance: 6000.0,
+                view_distance: 6100.0,
                 vsync: true,
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
@@ -1340,7 +1340,7 @@ mod tests {
         assert_eq!(s.preset, QualityPreset::High);
         assert_eq!(s.shadow_map_size, 4096);
         assert_eq!(s.shadow_cascade_count, 4);
-        assert!((s.shadow_max_distance - 600.0).abs() < 1e-6);
+        assert!((s.shadow_max_distance - 700.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1524,12 +1524,12 @@ mod tests {
     fn cycle_wraps_in_both_directions() {
         let mut s = GraphicsSettings::default();
 
+        // Default (High) sits on the top slot (4096), so +1 wraps to the bottom
+        // and -1 wraps back to the top.
         s.cycle(GraphicsField::ShadowMapSize, 1);
-        assert_eq!(s.shadow_map_size, 8192);
-        s.cycle(GraphicsField::ShadowMapSize, 1);
-        assert_eq!(s.shadow_map_size, 1024, "wrapped past 8192");
+        assert_eq!(s.shadow_map_size, 1024, "wrapped past 4096");
         s.cycle(GraphicsField::ShadowMapSize, -1);
-        assert_eq!(s.shadow_map_size, 8192, "wrapped back");
+        assert_eq!(s.shadow_map_size, 4096, "wrapped back");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
