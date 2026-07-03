@@ -28,11 +28,44 @@ const CC_NUM: u8 = 0x0a;
 const CC_SELECTION: u8 = 0x0b;
 const CC_CHOICE: u8 = 0x0c;
 const CC_ITEM: u8 = 0x19;
-const CC_CHOICE2: u8 = 0x1a;
-const CC_KEY_ITEM: u8 = 0x1c;
-const CC_ELEMENT: u8 = 0x1e;
+const CC_KEY_ITEM: u8 = 0x1a;
+const CC_CHOCOBO_NAME: u8 = 0x1c;
+const CC_SET_COLOR: u8 = 0x1e;
 const CC_AUTO: u8 = 0x7f;
 const PRINTABLE: std::ops::RangeInclusive<u8> = 0x20..=0x7e;
+
+/// Names [`StringDat::text`] wraps as `{Name}` (plain, via [`plain_marker`]) or
+/// `{Name:param}` (parameterized) for each control code. Render-layer
+/// post-processing matches on these, so they are defined here with the decoder
+/// that emits them — the single source of truth.
+/// `render_markers_match_emitted_output` guards the wrapping.
+pub const MARKER_PLAYER_NAME: &str = "PlayerName";
+pub const MARKER_SPEAKER_NAME: &str = "SpeakerName";
+pub const MARKER_SELECTION: &str = "Selection";
+pub const MARKER_NUM: &str = "Num";
+pub const MARKER_CHOICE: &str = "Choice";
+pub const MARKER_ITEM: &str = "Item";
+pub const MARKER_KEY_ITEM: &str = "KeyItem";
+pub const MARKER_CHOCOBO_NAME: &str = "ChocoboName";
+pub const MARKER_SET_COLOR: &str = "SetColor";
+pub const MARKER_AUTO: &str = "Auto";
+
+/// `{Auto` — prefix the render layer strips (an `{Auto:N}` formatting terminator,
+/// or bare `{Auto}`); derived from [`MARKER_AUTO`].
+pub const AUTO_MARKER_PREFIX: &str = "{Auto";
+/// `{SetColor` — prefix the render layer strips (a text-color code, not visible
+/// text); derived from [`MARKER_SET_COLOR`].
+pub const SET_COLOR_MARKER_PREFIX: &str = "{SetColor";
+/// `{Choice:` — prefix the render layer resolves (`{Choice:N}[a/b]`); derived from
+/// [`MARKER_CHOICE`].
+pub const CHOICE_MARKER_PREFIX: &str = "{Choice:";
+
+/// The `{Name}` text the decoder emits for a plain control code — the single
+/// place the plain-marker wrapping is spelled, shared by the decoder and the
+/// render layer that substitutes `{PlayerName}` / `{SpeakerName}`.
+pub fn plain_marker(name: &str) -> String {
+    format!("{{{name}}}")
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StringDatError {
@@ -163,16 +196,16 @@ fn decode_dialog_text(bytes: &[u8]) -> String {
         let b = bytes[i];
         match b {
             CC_NEWLINE => out.push('\n'),
-            CC_PLAYER_NAME => out.push_str("{PlayerName}"),
-            CC_SPEAKER_NAME => out.push_str("{SpeakerName}"),
-            CC_SELECTION => out.push_str("{Selection}"),
-            CC_NUM => push_param(&mut out, bytes, &mut i, "Num"),
-            CC_CHOICE => push_param(&mut out, bytes, &mut i, "Choice"),
-            CC_ITEM => push_param(&mut out, bytes, &mut i, "Item"),
-            CC_CHOICE2 => push_param(&mut out, bytes, &mut i, "Choice2"),
-            CC_KEY_ITEM => push_param(&mut out, bytes, &mut i, "KeyItem"),
-            CC_ELEMENT => push_param(&mut out, bytes, &mut i, "Element"),
-            CC_AUTO => push_param(&mut out, bytes, &mut i, "Auto"),
+            CC_PLAYER_NAME => push_plain(&mut out, MARKER_PLAYER_NAME),
+            CC_SPEAKER_NAME => push_plain(&mut out, MARKER_SPEAKER_NAME),
+            CC_SELECTION => push_plain(&mut out, MARKER_SELECTION),
+            CC_NUM => push_param(&mut out, bytes, &mut i, MARKER_NUM),
+            CC_CHOICE => push_param(&mut out, bytes, &mut i, MARKER_CHOICE),
+            CC_ITEM => push_param(&mut out, bytes, &mut i, MARKER_ITEM),
+            CC_KEY_ITEM => push_param(&mut out, bytes, &mut i, MARKER_KEY_ITEM),
+            CC_CHOCOBO_NAME => push_param(&mut out, bytes, &mut i, MARKER_CHOCOBO_NAME),
+            CC_SET_COLOR => push_param(&mut out, bytes, &mut i, MARKER_SET_COLOR),
+            CC_AUTO => push_param(&mut out, bytes, &mut i, MARKER_AUTO),
             _ if PRINTABLE.contains(&b) => out.push(b as char),
             _ if is_sjis_lead(b) => {
                 out.push('\u{FFFD}'); // cp932 double-byte run not yet mapped
@@ -185,13 +218,18 @@ fn decode_dialog_text(bytes: &[u8]) -> String {
     out
 }
 
+/// Emit `{name}` for a control code with no parameter.
+fn push_plain(out: &mut String, name: &str) {
+    out.push_str(&plain_marker(name));
+}
+
 /// Emit `{name:N}` for a parameterized control code, consuming the param byte.
 fn push_param(out: &mut String, bytes: &[u8], i: &mut usize, name: &str) {
     if let Some(&p) = bytes.get(*i + 1) {
         out.push_str(&format!("{{{name}:{p}}}"));
         *i += 1;
     } else {
-        out.push_str(&format!("{{{name}}}"));
+        push_plain(out, name);
     }
 }
 
@@ -237,6 +275,25 @@ mod tests {
         let entry = [b'H', b'i', b' ', 0x08, b',', b' ', 0x0a, 5];
         let dat = StringDat::parse(&synth(&[&entry])).expect("parse");
         assert_eq!(dat.text(0).as_deref(), Some("Hi {PlayerName}, {Num:5}"));
+    }
+
+    #[test]
+    fn render_markers_match_emitted_output() {
+        // The render layer strips {Auto…}/{SetColor…}, resolves {Choice:…}, and
+        // substitutes plain {PlayerName}; every prefix/marker it keys off must
+        // match what the decoder actually emits, and derive from the names.
+        let auto = StringDat::parse(&synth(&[&[CC_AUTO, 0x31]])).expect("parse");
+        assert!(auto.text(0).unwrap().starts_with(AUTO_MARKER_PREFIX));
+        let color = StringDat::parse(&synth(&[&[CC_SET_COLOR, 1]])).expect("parse");
+        assert!(color.text(0).unwrap().starts_with(SET_COLOR_MARKER_PREFIX));
+        let choice = StringDat::parse(&synth(&[&[CC_CHOICE, 0]])).expect("parse");
+        assert!(choice.text(0).unwrap().starts_with(CHOICE_MARKER_PREFIX));
+        let name = StringDat::parse(&synth(&[&[CC_PLAYER_NAME]])).expect("parse");
+        assert_eq!(name.text(0).unwrap(), plain_marker(MARKER_PLAYER_NAME));
+
+        assert!(AUTO_MARKER_PREFIX.ends_with(MARKER_AUTO));
+        assert!(SET_COLOR_MARKER_PREFIX.ends_with(MARKER_SET_COLOR));
+        assert_eq!(CHOICE_MARKER_PREFIX, format!("{{{MARKER_CHOICE}:"));
     }
 
     #[test]

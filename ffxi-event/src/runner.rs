@@ -1,7 +1,9 @@
 //! Drives an [`EventVm`] against a zone's dialog strings to produce renderable
 //! dialog frames — the bridge the session holds across player interactions.
 
-use ffxi_dat::dmsg::StringDat;
+use ffxi_dat::dmsg::{
+    StringDat, AUTO_MARKER_PREFIX, CHOICE_MARKER_PREFIX, SET_COLOR_MARKER_PREFIX,
+};
 use ffxi_dat::event_dat::EventBlock;
 
 use crate::vm::{EventVm, StepResult};
@@ -125,13 +127,22 @@ fn choice_text(strings: &StringDat, message_id: u32) -> (String, Vec<String>) {
     (prompt, choices)
 }
 
-/// Strip the auto-translate / layout `{Auto:N}` markers the dmsg decoder emits;
-/// they are formatting terminators, not visible text. Substitution placeholders
-/// (`{PlayerName}`, `{Num:N}`, `{Choice:N}`, …) are left for later resolution.
+/// Strip the formatting markers the dmsg decoder emits (`{Auto:N}` layout
+/// terminators, `{SetColor:N}` text-color codes) and resolve `{Choice:N}[a/b/…]`
+/// alternatives (see [`resolve_choice_brackets`]). The remaining substitution
+/// placeholders (`{PlayerName}`, `{SpeakerName}`, `{Num:N}`, …) are left for the
+/// caller, which has the runtime names/parameters they need.
 fn clean_display(s: &str) -> String {
+    let stripped = strip_marker(s, AUTO_MARKER_PREFIX);
+    let stripped = strip_marker(&stripped, SET_COLOR_MARKER_PREFIX);
+    resolve_choice_brackets(&stripped).trim().to_string()
+}
+
+/// Remove every `prefix…}` run — a formatting marker with no visible text.
+fn strip_marker(s: &str, prefix: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    while let Some(start) = rest.find("{Auto") {
+    while let Some(start) = rest.find(prefix) {
         out.push_str(&rest[..start]);
         match rest[start..].find('}') {
             Some(end) => rest = &rest[start + end + 1..],
@@ -142,7 +153,54 @@ fn clean_display(s: &str) -> String {
         }
     }
     out.push_str(rest);
-    out.trim().to_string()
+    out
+}
+
+/// Alternative picked for a `{Choice:N}[a/b/…]` run when the selecting message
+/// parameter isn't available. Retail reads message parameter `N` and shows that
+/// alternative; the parameter array isn't threaded through the VM yet (kuluu-6zy),
+/// so we take the first alternative, which is correct for the common case where a
+/// nation/gender variant simply lists its default first.
+const UNRESOLVED_CHOICE_ALT: usize = 0;
+
+/// Collapse `{Choice:N}[opt0/opt1/…]` runs to a single alternative — the dmsg
+/// decoder emits the `{Choice:N}` marker from control code 0x0C and leaves the
+/// following `[a/b]` bracket as literal text. `N` selects the alternative via a
+/// message parameter; lacking it we take [`UNRESOLVED_CHOICE_ALT`]. A `{Choice:N}`
+/// with no immediately-following bracket is left verbatim.
+fn resolve_choice_brackets(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find(CHOICE_MARKER_PREFIX) {
+        let after_tag = &rest[pos + CHOICE_MARKER_PREFIX.len()..];
+        let Some(close) = after_tag.find('}') else {
+            break;
+        };
+        let tail = &after_tag[close + 1..];
+        match tail
+            .strip_prefix('[')
+            .and_then(|b| b.find(']').map(|e| (b, e)))
+        {
+            Some((inner, end)) => {
+                out.push_str(&rest[..pos]);
+                let alts: Vec<&str> = inner[..end].split('/').collect();
+                let chosen = alts
+                    .get(UNRESOLVED_CHOICE_ALT)
+                    .or_else(|| alts.first())
+                    .copied()
+                    .unwrap_or("");
+                out.push_str(chosen);
+                rest = &inner[end + 1..];
+            }
+            None => {
+                let consumed = pos + CHOICE_MARKER_PREFIX.len() + close + 1;
+                out.push_str(&rest[..consumed]);
+                rest = &rest[consumed..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -153,12 +211,49 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn clean_display_strips_auto_markers_but_keeps_substitutions() {
+    fn clean_display_strips_formatting_but_keeps_substitutions() {
         assert_eq!(clean_display("Nothing.{Auto:49}"), "Nothing.");
         assert_eq!(clean_display("a{Auto:1}b{Auto:2}c"), "abc");
+        // {SetColor:N} is a text-color code, not visible text.
+        assert_eq!(clean_display("red{SetColor:5}text"), "redtext");
+        // Name substitutions are the caller's job (runtime names); left intact.
+        assert_eq!(
+            clean_display("Hello, {PlayerName}."),
+            "Hello, {PlayerName}."
+        );
+        // A {Choice:N} with no following bracket has nothing to resolve.
         assert_eq!(
             clean_display("Good luck, {Choice:0}!"),
             "Good luck, {Choice:0}!"
+        );
+    }
+
+    #[test]
+    fn clean_display_resolves_choice_alternatives() {
+        assert_eq!(
+            clean_display("Good luck, {Choice:0}[citizen/comrade]. See you."),
+            "Good luck, citizen. See you."
+        );
+    }
+
+    #[test]
+    fn resolve_choice_brackets_takes_first_alternative() {
+        // The baked N is the parameter index, not the alternative; without the
+        // parameter we always take the first alternative.
+        assert_eq!(resolve_choice_brackets("a {Choice:3}[x/y/z] b"), "a x b");
+        assert_eq!(resolve_choice_brackets("{Choice:0}[only]"), "only");
+    }
+
+    #[test]
+    fn resolve_choice_brackets_handles_multiple_and_bare_markers() {
+        assert_eq!(
+            resolve_choice_brackets("{Choice:0}[he/she] told {Choice:0}[him/her]"),
+            "he told him"
+        );
+        // No bracket -> marker left verbatim.
+        assert_eq!(
+            resolve_choice_brackets("plain {Choice:1} end"),
+            "plain {Choice:1} end"
         );
     }
 
@@ -295,6 +390,10 @@ mod tests {
         assert!(
             frames.iter().any(|f| !f.trim().is_empty()),
             "event 32759 produced no real dialog text: {frames:?}"
+        );
+        assert!(
+            frames.iter().all(|f| !f.contains(CHOICE_MARKER_PREFIX)),
+            "unresolved {{Choice:N}} marker leaked into Harara's dialog: {frames:?}"
         );
     }
 

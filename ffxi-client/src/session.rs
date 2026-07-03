@@ -1274,8 +1274,10 @@ async fn keepalive_loop(
 
     let mut pending_event_end_since: Option<std::time::Instant> = None;
 
-    let mut dialog_session =
-        crate::event_dialog::DialogSession::new(npc_name_resolver.root.clone());
+    let mut dialog_session = crate::event_dialog::DialogSession::new(
+        npc_name_resolver.root.clone(),
+        character_name.clone(),
+    );
 
     let mut is_healing = false;
 

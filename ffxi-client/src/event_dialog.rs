@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use ffxi_dat::dmsg::StringDat;
+use ffxi_dat::dmsg::{plain_marker, StringDat, MARKER_PLAYER_NAME, MARKER_SPEAKER_NAME};
 use ffxi_dat::event_dat::EventDat;
 use ffxi_dat::DatRoot;
 use ffxi_event::{DialogRunner, DialogStep};
@@ -36,6 +36,8 @@ pub enum Advance {
 
 pub struct DialogSession {
     dat_root: Option<Arc<DatRoot>>,
+    /// Logged-in character name, substituted for the `{PlayerName}` dialog marker.
+    player_name: String,
     loaded_zone: Option<u16>,
     event_dat: Option<EventDat>,
     strings: Option<StringDat>,
@@ -44,9 +46,10 @@ pub struct DialogSession {
 }
 
 impl DialogSession {
-    pub fn new(dat_root: Option<Arc<DatRoot>>) -> Self {
+    pub fn new(dat_root: Option<Arc<DatRoot>>, player_name: String) -> Self {
         Self {
             dat_root,
+            player_name,
             loaded_zone: None,
             event_dat: None,
             strings: None,
@@ -98,7 +101,7 @@ impl DialogSession {
         };
         match step {
             DialogStep::Frame(frame) => {
-                let dialog = frame_to_dialog(&active, frame);
+                let dialog = frame_to_dialog(&active, frame, &self.player_name);
                 self.runner = Some(runner);
                 self.active = Some(active);
                 Some(dialog)
@@ -126,7 +129,7 @@ impl DialogSession {
         };
         match runner.advance(choice, strings) {
             DialogStep::Frame(frame) => {
-                let dialog = frame_to_dialog(active, frame);
+                let dialog = frame_to_dialog(active, frame, &self.player_name);
                 Advance::Frame(dialog)
             }
             DialogStep::Ended { end_para } => {
@@ -146,7 +149,12 @@ impl DialogSession {
     }
 }
 
-fn frame_to_dialog(active: &ActiveEvent, frame: ffxi_event::DialogFrame) -> DialogState {
+fn frame_to_dialog(
+    active: &ActiveEvent,
+    frame: ffxi_event::DialogFrame,
+    player_name: &str,
+) -> DialogState {
+    let substitute = |text: String| substitute_names(text, player_name, active.npc_name.as_deref());
     DialogState {
         event_id: active.agent_event_id,
         npc_id: active.unique_no,
@@ -159,8 +167,19 @@ fn frame_to_dialog(active: &ActiveEvent, frame: ffxi_event::DialogFrame) -> Dial
         event_para2: 0,
         strings: Vec::new(),
         nums: Vec::new(),
-        prompt: Some(frame.text),
-        choices: frame.choices,
+        prompt: Some(substitute(frame.text)),
+        choices: frame.choices.into_iter().map(substitute).collect(),
+    }
+}
+
+/// Resolve the plain name markers the dmsg decoder leaves in dialog text:
+/// `{PlayerName}` → the logged-in character, `{SpeakerName}` → the speaking NPC.
+/// A `{SpeakerName}` with no known speaker name is left as-is.
+fn substitute_names(text: String, player_name: &str, speaker_name: Option<&str>) -> String {
+    let text = text.replace(&plain_marker(MARKER_PLAYER_NAME), player_name);
+    match speaker_name {
+        Some(name) => text.replace(&plain_marker(MARKER_SPEAKER_NAME), name),
+        None => text,
     }
 }
 
@@ -177,4 +196,27 @@ fn load_strings(root: Option<&DatRoot>, zone: u16) -> Option<StringDat> {
     let loc = root.resolve(file_id).ok()?;
     let bytes = std::fs::read(loc.path_under(root.root())).ok()?;
     StringDat::parse(&bytes).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn substitutes_player_and_speaker_names() {
+        let text = "{SpeakerName}: Well met, {PlayerName}.".to_string();
+        assert_eq!(
+            substitute_names(text, "Zeid", Some("Trion")),
+            "Trion: Well met, Zeid."
+        );
+    }
+
+    #[test]
+    fn leaves_speaker_marker_when_name_unknown() {
+        let text = "{SpeakerName} greets {PlayerName}.".to_string();
+        assert_eq!(
+            substitute_names(text, "Zeid", None),
+            "{SpeakerName} greets Zeid."
+        );
+    }
 }
