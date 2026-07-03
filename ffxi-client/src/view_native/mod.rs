@@ -165,7 +165,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // the periodic frame spikes are WindowServer compositor pacing.
     let window_mode = if std::env::var_os("FFXI_FULLSCREEN").is_some() {
         bevy::window::WindowMode::Fullscreen(
-            bevy::window::MonitorSelection::Current,
+            bevy::window::MonitorSelection::Primary,
             bevy::window::VideoModeSelection::Current,
         )
     } else {
