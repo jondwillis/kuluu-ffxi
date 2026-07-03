@@ -189,23 +189,40 @@ pub struct SortOptionRow {
     pub slot: usize,
 }
 
-#[derive(Resource, Debug, Clone, Copy, Default)]
+#[derive(Resource, Debug, Clone, Copy)]
 pub struct SortOptions {
     pub auto: bool,
+}
+
+impl Default for SortOptions {
+    fn default() -> Self {
+        // Retail defaults the Items window to auto-sort on.
+        Self { auto: true }
+    }
+}
+
+/// Which pane of the Items window has keyboard focus. The item list owns focus
+/// by default; pressing NavRight moves it into the sort-options box so Auto /
+/// Manual become navigable, and NavLeft / NavCancel returns to the list.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct ItemMenuFocus {
+    pub sort_focused: bool,
+    pub sort_cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOptionId {
     Auto,
     Manual,
-    Recycle,
 }
 
-pub const SORT_OPTIONS: &[SortOptionId] = &[
-    SortOptionId::Auto,
-    SortOptionId::Manual,
-    SortOptionId::Recycle,
-];
+pub const SORT_OPTIONS: &[SortOptionId] = &[SortOptionId::Auto, SortOptionId::Manual];
+
+/// Apply a sort choice. Auto keeps the list ordered by item id; Manual shows
+/// raw inventory order (see `menu::refresh_dynamic_menu_rows`).
+pub fn apply_sort_option(sort: &mut SortOptions, id: SortOptionId) {
+    sort.auto = matches!(id, SortOptionId::Auto);
+}
 
 const MAX_BODY_ROWS: usize = 10;
 
@@ -245,8 +262,10 @@ pub fn spawn_item_detail(mut commands: Commands, mut images: ResMut<Assets<Image
         .spawn((
             crate::components::InGameEntity,
             ItemDetailPanel,
+            // Retail anchors the focused-item detail card at the lower-left,
+            // below the item list (hud::item_screen, top-left).
             Node {
-                position_type: PositionType::Relative,
+                position_type: PositionType::Absolute,
                 bottom: Val::Px(8.0),
                 left: Val::Px(8.0),
                 width: Val::Px(240.0),
@@ -320,10 +339,12 @@ pub fn spawn_item_detail(mut commands: Commands, mut images: ResMut<Assets<Image
         .spawn((
             crate::components::InGameEntity,
             SortOptionsPanel,
+            // Retail's Options/Sort box sits at the upper-right of the Items
+            // window; the item list (hud::item_screen) owns the upper-left.
             Node {
-                position_type: PositionType::Relative,
-                bottom: Val::Px(8.0),
-                left: Val::Px(256.0),
+                position_type: PositionType::Absolute,
+                top: Val::Px(48.0),
+                right: Val::Px(8.0),
                 width: Val::Px(140.0),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
                 border: UiRect::all(Val::Px(1.0)),
@@ -337,7 +358,7 @@ pub fn spawn_item_detail(mut commands: Commands, mut images: ResMut<Assets<Image
         ))
         .with_children(|p| {
             p.spawn((
-                Text::new("Sort Options"),
+                Text::new("Sort"),
                 TextFont {
                     font_size: 13.0,
                     ..default()
@@ -347,6 +368,7 @@ pub fn spawn_item_detail(mut commands: Commands, mut images: ResMut<Assets<Image
             for slot in 0..SORT_OPTIONS.len() {
                 p.spawn((
                     SortOptionRow { slot },
+                    Button,
                     Text::new(""),
                     TextFont {
                         font_size: 12.0,
@@ -531,8 +553,9 @@ fn format_counts(
 pub fn update_sort_options(
     mode: Res<InputMode>,
     sort: Res<SortOptions>,
+    mut focus: ResMut<ItemMenuFocus>,
     mut panel_q: Query<&mut Node, With<SortOptionsPanel>>,
-    mut row_q: Query<(&SortOptionRow, &mut Text), Without<SortOptionsPanel>>,
+    mut row_q: Query<(&SortOptionRow, &mut Text, &mut TextColor), Without<SortOptionsPanel>>,
 ) {
     let open = item_detail_open(&mode);
     if let Ok(mut node) = panel_q.single_mut() {
@@ -542,20 +565,68 @@ pub fn update_sort_options(
         }
     }
     if !open {
+        // Leaving the Items window drops sort focus so it reopens on the list.
+        if focus.sort_focused {
+            focus.sort_focused = false;
+        }
         return;
     }
 
-    for (row, mut text) in row_q.iter_mut() {
-        let want = match SORT_OPTIONS.get(row.slot) {
-            Some(SortOptionId::Auto) => {
-                format!("Auto: {}", if sort.auto { "Yes" } else { "No" })
-            }
-            Some(SortOptionId::Manual) => "Manual (—)".to_string(),
-            Some(SortOptionId::Recycle) => "Recycle (—)".to_string(),
-            None => String::new(),
+    for (row, mut text, mut color) in row_q.iter_mut() {
+        let Some(id) = SORT_OPTIONS.get(row.slot).copied() else {
+            continue;
         };
+        let active = match id {
+            SortOptionId::Auto => sort.auto,
+            SortOptionId::Manual => !sort.auto,
+        };
+        let cursor = focus.sort_focused && focus.sort_cursor == row.slot;
+        let name = match id {
+            SortOptionId::Auto => "Auto",
+            SortOptionId::Manual => "Manual",
+        };
+        let marker = if active { "\u{25cf}" } else { "\u{25cb}" };
+        let prefix = if cursor { ">" } else { " " };
+        let want = format!("{prefix} {marker} {name}");
         if **text != want {
             **text = want;
+        }
+        let want_color = if cursor {
+            palette::ACCENT
+        } else if active {
+            palette::TEXT
+        } else {
+            palette::MUTED
+        };
+        if color.0 != want_color {
+            color.0 = want_color;
+        }
+    }
+}
+
+pub fn sort_option_mouse_system(
+    mode: Res<InputMode>,
+    mut sort: ResMut<SortOptions>,
+    mut focus: ResMut<ItemMenuFocus>,
+    rows: Query<(&Interaction, &SortOptionRow), Changed<Interaction>>,
+) {
+    if !item_detail_open(&mode) {
+        return;
+    }
+    for (interaction, row) in &rows {
+        match interaction {
+            Interaction::Hovered => {
+                focus.sort_focused = true;
+                focus.sort_cursor = row.slot;
+            }
+            Interaction::Pressed => {
+                focus.sort_focused = true;
+                focus.sort_cursor = row.slot;
+                if let Some(id) = SORT_OPTIONS.get(row.slot).copied() {
+                    apply_sort_option(&mut sort, id);
+                }
+            }
+            Interaction::None => {}
         }
     }
 }
@@ -631,5 +702,24 @@ mod tests {
     fn select_an_item_when_off_items_view() {
         let mode = InputMode::World;
         assert!(!item_detail_open(&mode));
+    }
+
+    #[test]
+    fn sort_defaults_to_auto() {
+        assert!(SortOptions::default().auto);
+    }
+
+    #[test]
+    fn sort_options_are_auto_then_manual() {
+        assert_eq!(SORT_OPTIONS, &[SortOptionId::Auto, SortOptionId::Manual]);
+    }
+
+    #[test]
+    fn apply_sort_option_selects_mode() {
+        let mut s = SortOptions { auto: true };
+        apply_sort_option(&mut s, SortOptionId::Manual);
+        assert!(!s.auto);
+        apply_sort_option(&mut s, SortOptionId::Auto);
+        assert!(s.auto);
     }
 }

@@ -307,6 +307,7 @@ pub fn spawn_main_menu(mut commands: Commands) {
 pub fn refresh_dynamic_menu_rows(
     mode: Res<InputMode>,
     scene: Res<crate::snapshot::SceneState>,
+    sort: Res<crate::hud::item_detail::SortOptions>,
     mut dynamic: ResMut<DynamicMenu>,
 ) {
     let active_kind = match &*mode {
@@ -420,9 +421,25 @@ pub fn refresh_dynamic_menu_rows(
     };
 
     let mut rows = rows;
-    rows.sort_by(|a, b| a.label.cmp(&b.label));
+    // Retail's Items window sorts by item id when "Auto" is on (grouping usable
+    // items, then weapons, then armor by their DAT id ranges) and otherwise
+    // shows raw inventory-slot order. Other dynamic menus stay alphabetical.
+    if matches!(kind, MenuKind::Items) {
+        if sort.auto {
+            rows.sort_by_key(item_row_sort_key);
+        }
+    } else {
+        rows.sort_by(|a, b| a.label.cmp(&b.label));
+    }
     if rows != dynamic.rows {
         dynamic.rows = rows;
+    }
+}
+
+fn item_row_sort_key(row: &DynamicMenuRow) -> u16 {
+    match row.action {
+        DynamicMenuAction::UseItem { item_no, .. } => item_no,
+        _ => u16::MAX,
     }
 }
 
@@ -499,9 +516,10 @@ pub fn update_main_menu(
     };
 
     match active {
-        // The Equipment screen (hud::equipment_screen) renders its own framed
-        // multi-panel layout for these kinds; suppress the generic text panel.
-        Some((MenuKind::Equipment | MenuKind::EquipSlot(_), _)) => {
+        // The Equipment screen (hud::equipment_screen) and the Items screen
+        // (hud::item_screen) render their own framed multi-panel layouts for
+        // these kinds; suppress the generic text panel.
+        Some((MenuKind::Equipment | MenuKind::EquipSlot(_) | MenuKind::Items, _)) => {
             if node.display != Display::None {
                 node.display = Display::None;
             }
@@ -762,6 +780,29 @@ mod tests {
                 "Debug row {label:?} must appear exactly once"
             );
         }
+    }
+
+    #[test]
+    fn item_rows_sort_by_id_when_auto() {
+        let use_item = |item_no: u16| DynamicMenuAction::UseItem {
+            container: 0,
+            index: 0,
+            item_no,
+        };
+        let mut rows = [
+            DynamicMenuRow {
+                label: "Apple".to_string(),
+                action: use_item(50),
+            },
+            DynamicMenuRow {
+                label: "Zeta".to_string(),
+                action: use_item(10),
+            },
+        ];
+        // Auto sort is by item id, so the alphabetically-last row (id 10) leads.
+        rows.sort_by_key(item_row_sort_key);
+        assert_eq!(rows[0].label, "Zeta");
+        assert_eq!(rows[1].label, "Apple");
     }
 
     #[test]

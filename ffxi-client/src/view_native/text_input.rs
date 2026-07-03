@@ -67,6 +67,10 @@ pub struct SlashWriters<'w, 's> {
 
     pub status_profile_open: ResMut<'w, ffxi_viewer_core::hud::status_panel::StatusProfileOpen>,
 
+    pub sort_options: ResMut<'w, ffxi_viewer_core::hud::item_detail::SortOptions>,
+
+    pub item_menu_focus: ResMut<'w, ffxi_viewer_core::hud::item_detail::ItemMenuFocus>,
+
     pub check_target: ResMut<'w, ffxi_viewer_core::hud::check_view::CheckTarget>,
 
     pub trade_state: ResMut<'w, ffxi_viewer_core::hud::trade::TradeState>,
@@ -232,6 +236,8 @@ pub fn text_input_system(
                     &mut slash_writers.status_profile_open,
                     &mut slash_writers.hud_panels,
                     &mut slash_writers.net_status_visible,
+                    &mut slash_writers.sort_options,
+                    &mut slash_writers.item_menu_focus,
                     &dynamic_menu,
                     current_target,
                     self_pos,
@@ -2450,6 +2456,8 @@ fn handle_menu_key(
     status_profile_open: &mut ffxi_viewer_core::hud::status_panel::StatusProfileOpen,
     hud_panels: &mut ffxi_viewer_core::hud::HudPanels,
     net_status: &mut ffxi_viewer_core::hud::network_status::NetStatusVisible,
+    sort_options: &mut ffxi_viewer_core::hud::item_detail::SortOptions,
+    item_menu_focus: &mut ffxi_viewer_core::hud::item_detail::ItemMenuFocus,
     dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
     target_id: Option<u32>,
     self_pos: ffxi_viewer_wire::Vec3,
@@ -2459,6 +2467,48 @@ fn handle_menu_key(
         (level.kind, level.cursor)
     };
     let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind, dynamic);
+
+    // The Items window has two panes: the item list and the sort-options box.
+    // Route keys to the sort box while it holds focus (NavRight enters it,
+    // NavLeft / NavCancel returns to the list) and otherwise fall through to the
+    // list navigation below.
+    if matches!(kind, MenuKind::Items) {
+        use ffxi_viewer_core::hud::item_detail::{apply_sort_option, SORT_OPTIONS};
+        if item_menu_focus.sort_focused {
+            let count = SORT_OPTIONS.len();
+            if bindings.matches_logical(Action::NavUp, key) {
+                item_menu_focus.sort_cursor = if item_menu_focus.sort_cursor == 0 {
+                    count - 1
+                } else {
+                    item_menu_focus.sort_cursor - 1
+                };
+                return None;
+            }
+            if bindings.matches_logical(Action::NavDown, key) {
+                let next = item_menu_focus.sort_cursor + 1;
+                item_menu_focus.sort_cursor = if next >= count { 0 } else { next };
+                return None;
+            }
+            if bindings.matches_logical(Action::NavConfirm, key) {
+                if let Some(&id) = SORT_OPTIONS.get(item_menu_focus.sort_cursor) {
+                    apply_sort_option(sort_options, id);
+                }
+                return None;
+            }
+            if bindings.matches_logical(Action::NavLeft, key)
+                || bindings.matches_logical(Action::NavCancel, key)
+            {
+                item_menu_focus.sort_focused = false;
+                return None;
+            }
+            // Swallow any other key so it can't leak into list navigation.
+            return None;
+        } else if bindings.matches_logical(Action::NavRight, key) {
+            item_menu_focus.sort_focused = true;
+            item_menu_focus.sort_cursor = if sort_options.auto { 0 } else { 1 };
+            return None;
+        }
+    }
 
     if matches!(kind, MenuKind::Graphics) {
         if bindings.matches_logical(Action::NavLeft, key) {
