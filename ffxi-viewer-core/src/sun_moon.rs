@@ -24,6 +24,12 @@ const SKY_RADIUS: f32 = 4000.0;
 const SUN_DISC_RADIUS: f32 = 120.0;
 const MOON_DISC_RADIUS: f32 = 350.0;
 
+// The sun disc is authored HDR-overbright to drive Enhanced-mode bloom, but the
+// uncapped ~22x peak blows the disc out to a solid white blob when it reflects
+// off a bevy_water surface. Cap it so it still clears the 1.0 bloom threshold
+// with plenty of headroom, without the reflection saturating.
+const SUN_DISC_MAX_INTENSITY: f32 = 8.0;
+
 const MOON_CYCLE_VANA_DAYS: u64 = 84;
 const MOON_PHASE_OFFSET: u64 = (886u64 * 360 + 26) % MOON_CYCLE_VANA_DAYS;
 
@@ -735,6 +741,7 @@ pub fn sun_moon_system(
             if !sky_realism.horizon_dimming && visible > 0.0 {
                 intensity = 8.0 + 14.0 * elev_norm;
             }
+            let intensity = intensity.min(SUN_DISC_MAX_INTENSITY);
             let c = sun_color.to_linear();
             sun_mat.base_color = Color::linear_rgb(
                 c.red * intensity,
