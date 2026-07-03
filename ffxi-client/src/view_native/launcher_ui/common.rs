@@ -42,24 +42,47 @@ impl Crumb {
 
 pub(super) const PANEL_BG: Color = Color::srgba(0.04, 0.04, 0.05, 0.85);
 
-pub(super) fn panel_node(width_px: f32) -> impl Bundle {
-    (
-        Node {
-            width: Val::Px(width_px),
-            flex_direction: FlexDirection::Column,
-            align_items: AlignItems::Stretch,
-            justify_content: JustifyContent::FlexStart,
-            row_gap: Val::Px(12.0),
-            padding: UiRect::all(Val::Px(24.0)),
-            border: UiRect::all(Val::Px(1.0)),
+const PANEL_ROW_GAP: f32 = 12.0;
+const PANEL_PADDING: f32 = 24.0;
+const PANEL_BORDER: f32 = 1.0;
+const PANEL_RADIUS: f32 = 6.0;
 
-            border_radius: BorderRadius::all(Val::Px(6.0)),
-            ..default()
-        },
+fn panel_layout(width_px: f32) -> Node {
+    Node {
+        width: Val::Px(width_px),
+        flex_direction: FlexDirection::Column,
+        align_items: AlignItems::Stretch,
+        justify_content: JustifyContent::FlexStart,
+        row_gap: Val::Px(PANEL_ROW_GAP),
+        padding: UiRect::all(Val::Px(PANEL_PADDING)),
+        border: UiRect::all(Val::Px(PANEL_BORDER)),
+        border_radius: BorderRadius::all(Val::Px(PANEL_RADIUS)),
+        ..default()
+    }
+}
+
+fn panel_bundle(node: Node) -> impl Bundle {
+    (
+        node,
         BackgroundColor(PANEL_BG),
         BorderColor::all(Color::srgb(0.20, 0.20, 0.24)),
         TabGroup::default(),
     )
+}
+
+pub(super) fn panel_node(width_px: f32) -> impl Bundle {
+    panel_bundle(panel_layout(width_px))
+}
+
+/// Like [`panel_node`] but capped to `max_height` so a body taller than the
+/// window scrolls inside the panel instead of spilling off screen. The caller
+/// gives one child `flex_grow: 1` + `min_height: 0` + `Overflow::scroll_y()` to
+/// be the scroll region; the panel's other children stay pinned.
+pub(super) fn panel_node_capped(width_px: f32, max_height: Val) -> impl Bundle {
+    panel_bundle(Node {
+        max_height,
+        ..panel_layout(width_px)
+    })
 }
 
 pub(super) fn screen_root() -> impl Bundle {

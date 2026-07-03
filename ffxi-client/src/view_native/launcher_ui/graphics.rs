@@ -2,17 +2,53 @@ use bevy::ecs::spawn::Spawn;
 use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
-use bevy::ui_widgets::Activate;
+use bevy::ui::{ComputedNode, Overflow, ScrollPosition};
+use bevy::ui_widgets::{Activate, ControlOrientation, CoreScrollbarThumb, Scrollbar};
 
 use ffxi_viewer_core::{GraphicsField, GraphicsSettings, GRAPHICS_FIELDS};
 
-use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
+use super::common::{hint, panel_node_capped, row, screen_root, spawn_breadcrumb, title, Crumb};
 use super::{LauncherState, ServerInfo};
+
+/// Compact metrics for the graphics list. [`LABEL_WIDTH`]/[`ROW_FONT_SIZE`] are
+/// sized so the longest label ("Model Shadow Receiving") stays on one line —
+/// wrapped labels were what made the list overflow the window.
+const ROW_FONT_SIZE: f32 = 13.0;
+const LABEL_WIDTH: f32 = 172.0;
+const VALUE_WIDTH: f32 = 110.0;
+const ROW_COLUMN_GAP: f32 = 6.0;
+const LIST_ROW_GAP: f32 = 4.0;
+const PANEL_WIDTH: f32 = 432.0;
+
+/// Cap the panel at a fraction of the viewport so a tall settings list scrolls
+/// inside it instead of spilling off the top and bottom of the window.
+const PANEL_MAX_VH: f32 = 90.0;
+
+/// Logical pixels the list scrolls per mouse-wheel line notch.
+const SCROLL_LINE_PX: f32 = 28.0;
+
+/// Width of the scrollbar track/thumb reserved to the right of the list.
+const SCROLLBAR_WIDTH: f32 = 6.0;
+/// Shortest the thumb shrinks to on a long list, so it stays grabbable.
+const SCROLLBAR_MIN_THUMB: f32 = 28.0;
+const SCROLLBAR_TRACK_COLOR: Color = Color::srgba(1.0, 1.0, 1.0, 0.06);
+const SCROLLBAR_THUMB_COLOR: Color = Color::srgba(0.62, 0.62, 0.68, 0.9);
 
 #[derive(Component)]
 pub(super) struct GraphicsRoot;
+
+/// The `Overflow::scroll_y` region holding the settings rows; scrolled by
+/// [`scroll_list_system`] while the title/hint/footer stay pinned.
+#[derive(Component)]
+pub(super) struct GraphicsScrollList;
+
+/// The scrollbar track paired with [`GraphicsScrollList`]; hidden by
+/// [`update_scrollbar_visibility`] when the list isn't overflowing.
+#[derive(Component)]
+pub(super) struct GraphicsScrollbar;
 
 #[derive(Component)]
 pub(super) struct GraphicsValueText(GraphicsField);
@@ -45,76 +81,144 @@ pub(super) fn spawn_ui(
         .spawn((GraphicsRoot, screen_root()))
         .with_children(|root| {
             spawn_breadcrumb(root, &server, &[Crumb::Other("Graphics".to_string())]);
-            root.spawn(panel_node(560.0)).with_children(|panel| {
-                panel.spawn(title("Graphics"));
-                panel.spawn(hint(
-                    "Tune the same quality settings as the in-game menu. \
-                     Changes apply when you connect and are saved \
-                     automatically. Esc goes back.",
-                ));
+            root.spawn(panel_node_capped(PANEL_WIDTH, Val::Vh(PANEL_MAX_VH)))
+                .with_children(|panel| {
+                    panel.spawn(title("Graphics"));
+                    panel.spawn(hint(
+                        "Tune the same quality settings as the in-game menu. \
+                         Changes apply when you connect and are saved \
+                         automatically. Scroll for more; Esc goes back.",
+                    ));
 
-                for &field in GRAPHICS_FIELDS.iter().filter(|f| !f.is_advanced()) {
-                    spawn_field_row(panel, field, &settings, false, open);
-                }
-
-                panel.spawn(row()).with_children(|r| {
-                    r.spawn(button(
-                        ButtonProps {
-                            variant: ButtonVariant::Normal,
+                    panel
+                        .spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Stretch,
+                            column_gap: Val::Px(SCROLLBAR_WIDTH),
+                            flex_grow: 1.0,
+                            min_height: Val::Px(0.0),
                             ..default()
-                        },
-                        (),
-                        Spawn((
-                            Text::new(if open {
-                                ADVANCED_EXPANDED
-                            } else {
-                                ADVANCED_COLLAPSED
-                            }),
-                            ThemedText,
-                            AdvancedToggleLabel,
-                        )),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut open: ResMut<GraphicsAdvancedOpen>| {
-                            open.0 = !open.0;
-                        },
-                    );
+                        })
+                        .with_children(|area| {
+                            let list = area
+                                .spawn((
+                                    GraphicsScrollList,
+                                    Node {
+                                        flex_grow: 1.0,
+                                        min_width: Val::Px(0.0),
+                                        min_height: Val::Px(0.0),
+                                        flex_direction: FlexDirection::Column,
+                                        align_items: AlignItems::Stretch,
+                                        row_gap: Val::Px(LIST_ROW_GAP),
+                                        overflow: Overflow::scroll_y(),
+                                        ..default()
+                                    },
+                                    ScrollPosition::default(),
+                                ))
+                                .with_children(|list| {
+                                    for &field in
+                                        GRAPHICS_FIELDS.iter().filter(|f| !f.is_advanced())
+                                    {
+                                        spawn_field_row(list, field, &settings, false, open);
+                                    }
+
+                                    list.spawn(row()).with_children(|r| {
+                                        r.spawn(button(
+                                            ButtonProps {
+                                                variant: ButtonVariant::Normal,
+                                                ..default()
+                                            },
+                                            (),
+                                            Spawn((
+                                                Text::new(if open {
+                                                    ADVANCED_EXPANDED
+                                                } else {
+                                                    ADVANCED_COLLAPSED
+                                                }),
+                                                ThemedText,
+                                                AdvancedToggleLabel,
+                                            )),
+                                        ))
+                                        .observe(
+                                            |_ev: On<Activate>,
+                                             mut open: ResMut<GraphicsAdvancedOpen>| {
+                                                open.0 = !open.0;
+                                            },
+                                        );
+                                    });
+
+                                    for &field in GRAPHICS_FIELDS.iter().filter(|f| f.is_advanced())
+                                    {
+                                        spawn_field_row(list, field, &settings, true, open);
+                                    }
+                                })
+                                .id();
+
+                            area.spawn((
+                                GraphicsScrollbar,
+                                Scrollbar::new(
+                                    list,
+                                    ControlOrientation::Vertical,
+                                    SCROLLBAR_MIN_THUMB,
+                                ),
+                                Node {
+                                    width: Val::Px(SCROLLBAR_WIDTH),
+                                    height: Val::Percent(100.0),
+                                    flex_shrink: 0.0,
+                                    overflow: Overflow::clip(),
+                                    border_radius: BorderRadius::all(Val::Px(
+                                        SCROLLBAR_WIDTH / 2.0,
+                                    )),
+                                    ..default()
+                                },
+                                BackgroundColor(SCROLLBAR_TRACK_COLOR),
+                            ))
+                            .with_children(|track| {
+                                track.spawn((
+                                    CoreScrollbarThumb,
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        border_radius: BorderRadius::all(Val::Px(
+                                            SCROLLBAR_WIDTH / 2.0,
+                                        )),
+                                        ..default()
+                                    },
+                                    BackgroundColor(SCROLLBAR_THUMB_COLOR),
+                                ));
+                            });
+                        });
+
+                    panel.spawn(row()).with_children(|r| {
+                        r.spawn(button(
+                            ButtonProps {
+                                variant: ButtonVariant::Normal,
+                                ..default()
+                            },
+                            (),
+                            Spawn((Text::new("Reset to High"), ThemedText)),
+                        ))
+                        .observe(
+                            |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
+                                settings.reset_to_default();
+                            },
+                        );
+
+                        r.spawn(button(
+                            ButtonProps {
+                                variant: ButtonVariant::Primary,
+                                ..default()
+                            },
+                            (),
+                            Spawn((Text::new("Back"), ThemedText)),
+                        ))
+                        .observe(
+                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(LauncherState::ServerSelect);
+                            },
+                        );
+                    });
                 });
-
-                for &field in GRAPHICS_FIELDS.iter().filter(|f| f.is_advanced()) {
-                    spawn_field_row(panel, field, &settings, true, open);
-                }
-
-                panel.spawn(row()).with_children(|r| {
-                    r.spawn(button(
-                        ButtonProps {
-                            variant: ButtonVariant::Normal,
-                            ..default()
-                        },
-                        (),
-                        Spawn((Text::new("Reset to High"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
-                            settings.reset_to_default();
-                        },
-                    );
-
-                    r.spawn(button(
-                        ButtonProps {
-                            variant: ButtonVariant::Primary,
-                            ..default()
-                        },
-                        (),
-                        Spawn((Text::new("Back"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::ServerSelect);
-                        },
-                    );
-                });
-            });
         });
 }
 
@@ -130,7 +234,7 @@ fn spawn_field_row(
         width: Val::Percent(100.0),
         flex_direction: FlexDirection::Row,
         align_items: AlignItems::Center,
-        column_gap: Val::Px(8.0),
+        column_gap: Val::Px(ROW_COLUMN_GAP),
         display: if advanced && !advanced_open {
             Display::None
         } else {
@@ -144,10 +248,15 @@ fn spawn_field_row(
     row_cmd.with_children(|rowc| {
         rowc.spawn((
             Node {
-                width: Val::Px(160.0),
+                width: Val::Px(LABEL_WIDTH),
+                flex_shrink: 0.0,
                 ..default()
             },
             Text::new(field.label().to_string()),
+            TextFont {
+                font_size: ROW_FONT_SIZE,
+                ..default()
+            },
             ThemedText,
         ));
 
@@ -164,11 +273,15 @@ fn spawn_field_row(
 
         rowc.spawn((
             Node {
-                width: Val::Px(150.0),
+                width: Val::Px(VALUE_WIDTH),
                 justify_content: JustifyContent::Center,
                 ..default()
             },
             Text::new(settings.value_label(field)),
+            TextFont {
+                font_size: ROW_FONT_SIZE,
+                ..default()
+            },
             TextColor(value_color),
             GraphicsValueText(field),
             ThemedText,
@@ -226,6 +339,51 @@ pub(super) fn redraw_advanced_visibility(
     for mut text in labels.iter_mut() {
         if text.0 != want {
             text.0 = want.to_string();
+        }
+    }
+}
+
+/// Scroll the settings list with the mouse wheel, clamped to its content so it
+/// never over- or under-scrolls. Bevy clamps the *rendered* offset but not the
+/// [`ScrollPosition`] component, so we clamp it here against [`ComputedNode`].
+pub(super) fn scroll_list_system(
+    mut wheel: MessageReader<MouseWheel>,
+    mut lists: Query<(&mut ScrollPosition, &ComputedNode), With<GraphicsScrollList>>,
+) {
+    let mut delta = 0.0;
+    for ev in wheel.read() {
+        delta += match ev.unit {
+            MouseScrollUnit::Line => ev.y * SCROLL_LINE_PX,
+            MouseScrollUnit::Pixel => ev.y,
+        };
+    }
+    if delta == 0.0 {
+        return;
+    }
+    for (mut scroll, node) in lists.iter_mut() {
+        let max = (node.content_size.y - node.size.y + node.scrollbar_size.y).max(0.0)
+            * node.inverse_scale_factor;
+        scroll.0.y = (scroll.0.y - delta).clamp(0.0, max);
+    }
+}
+
+/// Hide the scrollbar track when the list fits, so a full-height thumb never
+/// sits there implying scroll on a list that has none.
+pub(super) fn update_scrollbar_visibility(
+    lists: Query<&ComputedNode, With<GraphicsScrollList>>,
+    mut bars: Query<&mut Node, With<GraphicsScrollbar>>,
+) {
+    let Ok(list) = lists.single() else {
+        return;
+    };
+    let want = if list.content_size.y > list.size.y + 0.5 {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for mut node in bars.iter_mut() {
+        if node.display != want {
+            node.display = want;
         }
     }
 }

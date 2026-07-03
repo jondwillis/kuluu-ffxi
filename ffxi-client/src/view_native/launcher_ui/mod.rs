@@ -665,6 +665,8 @@ pub(crate) fn register(
                 graphics::keyboard_input_system,
                 graphics::redraw_graphics_system,
                 graphics::redraw_advanced_visibility,
+                graphics::scroll_list_system,
+                graphics::update_scrollbar_visibility,
             )
                 .run_if(in_state(LauncherState::Graphics)),
         );
