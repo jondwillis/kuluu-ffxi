@@ -63,6 +63,24 @@ fn drive_feathers_cursor(
 // device has wgpu timestamp queries, so without this the perf HUD can only show
 // CPU encode time and a frame spike's GPU cost is invisible. Gated by env var
 // because requesting a feature the adapter lacks aborts device creation.
+// Metal recompiles a shader on first draw of each pipeline variant, on the render thread, invisible
+// to the perf HUD's pass timings. Logging when new pipelines reach Ok lets those timestamps be
+// correlated against `perf: frame spike` lines to confirm/deny first-use compilation as the cause.
+fn log_pipeline_compiles(
+    cache: Res<bevy::render::render_resource::PipelineCache>,
+    mut prev_ready: Local<usize>,
+) {
+    use bevy::render::render_resource::CachedPipelineState;
+    let ready = cache
+        .pipelines()
+        .filter(|p| matches!(p.state, CachedPipelineState::Ok(_)))
+        .count();
+    if ready > *prev_ready {
+        warn!(target: "perf", "pipeline: +{} compiled (total {ready})", ready - *prev_ready);
+    }
+    *prev_ready = ready;
+}
+
 fn gpu_timing_render_plugin() -> bevy::render::RenderPlugin {
     use bevy::render::settings::{RenderCreation, WgpuFeatures, WgpuSettings};
     let mut settings = WgpuSettings::default();
@@ -142,10 +160,22 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     let mut app = App::new();
 
+    // FFXI_FULLSCREEN forces exclusive fullscreen so macOS presents Direct instead of Composited
+    // (native ⌃⌘F stays Composited); the Metal HUD's Composited/Direct flag then isolates whether
+    // the periodic frame spikes are WindowServer compositor pacing.
+    let window_mode = if std::env::var_os("FFXI_FULLSCREEN").is_some() {
+        bevy::window::WindowMode::Fullscreen(
+            bevy::window::MonitorSelection::Current,
+            bevy::window::VideoModeSelection::Current,
+        )
+    } else {
+        bevy::window::WindowMode::Windowed
+    };
     let mut plugins = DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: format!("ffxi-client — {server}"),
             resolution: (1280u32, 800u32).into(),
+            mode: window_mode,
             ..default()
         }),
         ..default()
@@ -162,6 +192,12 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             plugin_group.disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>();
     }
     app.add_plugins(plugin_group);
+
+    if std::env::var_os("FFXI_GPU_TIMING").is_some() {
+        if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+            render_app.add_systems(bevy::render::ExtractSchedule, log_pipeline_compiles);
+        }
+    }
 
     app.add_systems(Startup, configure_gizmo_render_layer);
 
