@@ -280,6 +280,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         perf_hud::mark_frame_end.run_if(in_state(AppPhase::InGame)),
     );
     app.add_systems(
+        Last,
+        perf_hud::mark_last_end.run_if(in_state(AppPhase::InGame)),
+    );
+    app.add_systems(
         Update,
         (
             perf_hud::update_perf_monitor,

@@ -33,7 +33,9 @@ pub struct PerfMonitor {
 
     frame_start: Option<std::time::Instant>,
     last_cpu_us: u64,
+    last_main_us: u64,
     spike_cpu_us: u64,
+    spike_main_us: u64,
 
     seen_first: bool,
     baseline_ms: f32,
@@ -72,7 +74,9 @@ impl Default for PerfMonitor {
             head: 0,
             frame_start: None,
             last_cpu_us: 0,
+            last_main_us: 0,
             spike_cpu_us: 0,
+            spike_main_us: 0,
             seen_first: false,
             baseline_ms: 0.0,
             last_spike_ms: 0.0,
@@ -107,6 +111,12 @@ pub fn mark_frame_start(mut m: ResMut<PerfMonitor>) {
 pub fn mark_frame_end(mut m: ResMut<PerfMonitor>) {
     if let Some(start) = m.frame_start {
         m.last_cpu_us = start.elapsed().as_micros() as u64;
+    }
+}
+
+pub fn mark_last_end(mut m: ResMut<PerfMonitor>) {
+    if let Some(start) = m.frame_start {
+        m.last_main_us = start.elapsed().as_micros() as u64;
     }
 }
 
@@ -211,6 +221,7 @@ pub fn update_perf_monitor(
     m.spike_rebuild_us = source.last_rebuild_us;
     m.spike_probe_us = w_probe_us;
     m.spike_cpu_us = cpu_us;
+    m.spike_main_us = m.last_main_us;
     m.secs_since_spike = 0.0;
 
     if m.log_cooldown_s > 0.0 {
@@ -230,11 +241,14 @@ pub fn update_perf_monitor(
     } else {
         String::new()
     };
-    let render_us = (dt_ms * 1000.0) as u64 - cpu_us.min((dt_ms * 1000.0) as u64);
+    let frame_us = (dt_ms * 1000.0) as u64;
+    let main_us = m.spike_main_us.min(frame_us);
+    let late_us = main_us.saturating_sub(cpu_us);
+    let render_us = frame_us.saturating_sub(main_us);
     let render_spans = top_render_spans(&diag);
     warn!(
         target: "perf",
-        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s render~{render_us}\u{00b5}s | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s{extra}{render_spans}",
+        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s late {late_us}\u{00b5}s render~{render_us}\u{00b5}s | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s{extra}{render_spans}",
         m.baseline_ms,
         dt_ms - m.baseline_ms,
         cpu_us,
@@ -410,12 +424,14 @@ fn build_text_lines(
         )
     };
 
+    let frame_us = (m.last_spike_ms * 1000.0) as u64;
+    let main_us = m.spike_main_us.min(frame_us);
     let split = (
         format!(
-            "spike split: cpu {}\u{00b5}s  render~{}\u{00b5}s",
+            "spike split: cpu {}\u{00b5}s  late {}\u{00b5}s  render~{}\u{00b5}s",
             m.spike_cpu_us,
-            (m.last_spike_ms * 1000.0) as u64
-                - m.spike_cpu_us.min((m.last_spike_ms * 1000.0) as u64),
+            main_us.saturating_sub(m.spike_cpu_us),
+            frame_us.saturating_sub(main_us),
         ),
         palette::TEXT,
     );
