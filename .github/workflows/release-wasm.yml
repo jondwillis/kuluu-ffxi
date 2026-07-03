@@ -57,7 +57,7 @@ jobs:
           mkdir -p dist
           ( cd ffxi-viewer-wasm/dist && zip -r "../../dist/ffxi-viewer-wasm.zip" . )
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: artifacts-wasm
           path: dist/ffxi-viewer-wasm.zip
