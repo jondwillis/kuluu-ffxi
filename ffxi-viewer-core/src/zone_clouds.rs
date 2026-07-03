@@ -17,7 +17,7 @@ use ffxi_dat::{ChunkKind, DatRoot};
 
 use crate::components::InGameEntity;
 use crate::ffxi_zone_material::FfxiZoneMaterial;
-use crate::graphics_settings::{GraphicsSettings, SkyStyle};
+use crate::graphics_settings::GraphicsSettings;
 use crate::zone_texture::{decoded_texture_to_image, TextureQuality};
 
 // research/xim EnvironmentManager.kt:453-515 updateWeatherEffects reads weat/<type>/.
@@ -427,13 +427,7 @@ fn rebuild_zone_clouds(
         &mut materials,
     );
 
-    let vanilla = settings.sky_style() == SkyStyle::Vanilla;
     for layer in layers {
-        let visibility = if vanilla {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
         let e = commands
             .spawn((
                 InGameEntity,
@@ -451,7 +445,7 @@ fn rebuild_zone_clouds(
                 Mesh3d(layer.mesh),
                 MeshMaterial3d(layer.material),
                 Transform::from_rotation(ffxi_to_bevy_basis()).with_scale(layer.scale),
-                visibility,
+                Visibility::Inherited,
                 bevy::light::NotShadowCaster,
                 bevy::light::NotShadowReceiver,
             ))
@@ -472,7 +466,6 @@ fn rebuild_zone_clouds(
 #[allow(clippy::type_complexity)]
 fn drive_zone_clouds(
     time: Res<Time>,
-    settings: Res<GraphicsSettings>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     mut materials: ResMut<Assets<FfxiZoneMaterial>>,
     mut commands: Commands,
@@ -481,28 +474,18 @@ fn drive_zone_clouds(
     mut clouds: Query<(
         Entity,
         &mut Transform,
-        &mut Visibility,
         &CloudLayer,
         &mut CloudFade,
         &MeshMaterial3d<FfxiZoneMaterial>,
     )>,
 ) {
-    let vanilla = settings.sky_style() == SkyStyle::Vanilla;
     let cam_pos = cam_q.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let basis = ffxi_to_bevy_basis();
     let day_fraction = crate::hud::vana_clock::full_day_fraction(vana_clock.earth_unix_secs_now());
     let dt = time.delta_secs();
     let frames = time.elapsed_secs() * RETAIL_FPS;
 
-    for (entity, mut xf, mut vis, layer, mut fade, mat) in &mut clouds {
-        let want = if vanilla {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-        if *vis != want {
-            *vis = want;
-        }
+    for (entity, mut xf, layer, mut fade, mat) in &mut clouds {
         xf.rotation = basis;
         xf.translation = cam_pos + basis * layer.base_position;
 
@@ -632,11 +615,8 @@ fn rebuild_zone_stars(
         ..default()
     });
 
-    let visibility = if settings.sky_style() == SkyStyle::Vanilla {
-        Visibility::Inherited
-    } else {
-        Visibility::Hidden
-    };
+    // Spawn hidden; drive_zone_stars (chained right after) sets visibility from
+    // the night factor this same frame.
     let e = commands
         .spawn((
             InGameEntity,
@@ -644,17 +624,17 @@ fn rebuild_zone_stars(
             Mesh3d(meshes.add(mesh)),
             MeshMaterial3d(material),
             Transform::from_rotation(ffxi_to_bevy_basis()).with_scale(Vec3::splat(scale)),
-            visibility,
+            Visibility::Hidden,
             bevy::light::NotShadowCaster,
             bevy::light::NotShadowReceiver,
         ))
         .id();
     state.entity = Some(e);
+    info!(zone_id, half_xz, scale, "zone star dome spawned");
 }
 
 #[allow(clippy::type_complexity)]
 fn drive_zone_stars(
-    settings: Res<GraphicsSettings>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     cam_q: Query<&Transform, (With<crate::camera::OperatorCamera>, Without<StarDome>)>,
@@ -666,22 +646,33 @@ fn drive_zone_stars(
         ),
         With<StarDome>,
     >,
+    mut prev_visible: Local<Option<bool>>,
 ) {
     let Ok((mut xf, mut vis, mat)) = stars.single_mut() else {
         return;
     };
-    let vanilla = settings.sky_style() == SkyStyle::Vanilla;
     let cam_pos = cam_q.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
 
+    // Stars fade in as the sun drops below the horizon, in both sky styles (both
+    // share the gradient dome now).
     let night = (-sky.sun_altitude / STAR_TWILIGHT_BAND_RAD).clamp(0.0, 1.0);
-    let want = if vanilla && night > 0.0 {
+    let want = if night > 0.0 {
         Visibility::Inherited
     } else {
         Visibility::Hidden
     };
     if *vis != want {
         *vis = want;
+    }
+    if *prev_visible != Some(night > 0.0) {
+        info!(
+            sun_altitude = sky.sun_altitude,
+            night,
+            visible = night > 0.0,
+            "zone stars visibility"
+        );
+        *prev_visible = Some(night > 0.0);
     }
 
     // One slow celestial roll per Vana day.

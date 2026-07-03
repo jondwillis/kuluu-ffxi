@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::core_pipeline::prepass::DepthPrepass;
 #[cfg(not(target_arch = "wasm32"))]
-use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
-#[cfg(not(target_arch = "wasm32"))]
 use bevy::post_process::dof::{DepthOfField, DepthOfFieldMode};
 
 use crate::camera::OperatorCamera;
@@ -65,9 +63,12 @@ impl AaMode {
     }
 }
 
-/// The two sky modes. `Enhanced` bundles every realism feature on plus Bevy's
-/// procedural atmosphere (desktop) and the bloom sun glare; `Vanilla` is the
-/// retail-faithful look — realism off, gradient skybox, painterly sun flare.
+/// The two sky modes. Both share the retail-faithful gradient skybox dome plus
+/// the weat/<type>/ clouds, stars and moon; they differ only in post/lighting
+/// polish. `Enhanced` layers the realism features on — filmic tonemap, bloom
+/// sun-glare, horizon reddening/dimming, moon illusion, earthshine, eclipses.
+/// `Vanilla` is the flat retail look — realism off, direct colour output,
+/// painterly sun flare.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SkyStyle {
     Enhanced,
@@ -88,12 +89,6 @@ impl SkyStyle {
             SkyStyle::Enhanced => crate::sky_realism::SkyRealism::enhanced(),
             SkyStyle::Vanilla => crate::sky_realism::SkyRealism::retail(),
         }
-    }
-
-    /// Enhanced uses Bevy's procedural atmosphere (desktop only); Vanilla keeps
-    /// the custom gradient skybox.
-    pub const fn physical(self) -> bool {
-        matches!(self, SkyStyle::Enhanced)
     }
 }
 
@@ -1275,63 +1270,6 @@ pub fn apply_camera_prepass_system(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Resource)]
-pub struct PhysicalSkyMedium(pub Handle<ScatteringMedium>);
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn init_physical_sky_medium_system(
-    mut commands: Commands,
-    media: Option<ResMut<Assets<ScatteringMedium>>>,
-) {
-    let Some(mut media) = media else {
-        return;
-    };
-    let handle = media.add(ScatteringMedium::default());
-    commands.insert_resource(PhysicalSkyMedium(handle));
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn apply_physical_sky_system(
-    settings: Res<GraphicsSettings>,
-    medium: Option<Res<PhysicalSkyMedium>>,
-    mut commands: Commands,
-    q_cam: Query<(Entity, Option<&Atmosphere>), With<OperatorCamera>>,
-    mut q_sky: Query<&mut Visibility, With<crate::skybox::SkyboxSphere>>,
-) {
-    let physical = settings.sky_style.physical();
-    if let Ok((entity, atmo)) = q_cam.single() {
-        match (physical, atmo.is_some()) {
-            (true, false) => {
-                if let Some(medium) = medium {
-                    commands.entity(entity).insert((
-                        Atmosphere::earthlike(medium.0.clone()),
-                        AtmosphereSettings::default(),
-                    ));
-                }
-            }
-            (false, true) => {
-                commands
-                    .entity(entity)
-                    .remove::<Atmosphere>()
-                    .remove::<AtmosphereSettings>();
-            }
-            _ => {}
-        }
-    }
-
-    let want = if physical {
-        Visibility::Hidden
-    } else {
-        Visibility::Inherited
-    };
-    for mut vis in q_sky.iter_mut() {
-        if *vis != want {
-            *vis = want;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1429,12 +1367,14 @@ mod tests {
         s.cycle(GraphicsField::SkyStyle, 1);
         assert_eq!(s.sky_style(), SkyStyle::Vanilla);
         assert!(!s.sky_embellishments_enabled());
-        assert!(!s.sky_style.physical(), "Vanilla keeps the gradient skybox");
         assert_eq!(s.preset, QualityPreset::High, "style must not flip preset");
         // Cycling in either direction just flips the two modes.
         s.cycle(GraphicsField::SkyStyle, -1);
         assert_eq!(s.sky_style(), SkyStyle::Enhanced);
-        assert!(s.sky_style.physical(), "Enhanced drives the atmosphere");
+        assert!(
+            s.sky_embellishments_enabled(),
+            "Enhanced adds the realism polish"
+        );
     }
 
     #[test]

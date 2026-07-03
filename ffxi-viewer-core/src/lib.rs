@@ -370,16 +370,9 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         );
 
         #[cfg(not(target_arch = "wasm32"))]
-        app.add_systems(Startup, graphics_settings::init_physical_sky_medium_system);
-
-        #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,
-            (
-                graphics_settings::apply_depth_of_field_system,
-                graphics_settings::apply_physical_sky_system,
-            )
-                .chain()
+            graphics_settings::apply_depth_of_field_system
                 .after(graphics_settings::apply_anti_aliasing_system)
                 .run_if(resource_changed::<GraphicsSettings>),
         );

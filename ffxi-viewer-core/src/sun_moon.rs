@@ -127,6 +127,7 @@ pub struct MoonTransitionState {
     pub prev_moon_up: Option<bool>,
     pub prev_phase_bucket: Option<u8>,
     pub prev_illumination: Option<f32>,
+    pub prev_disc_shown: Option<bool>,
 }
 
 pub fn spawn_sun_and_moon(
@@ -449,6 +450,7 @@ pub fn sun_moon_system(
         prev_moon_up,
         prev_phase_bucket,
         prev_illumination,
+        prev_disc_shown,
     } = &mut *transition_state;
     *sky = vana_sky_from_clock(&vana_clock);
 
@@ -519,24 +521,8 @@ pub fn sun_moon_system(
         None => sun_color_for_hour(sky.hour, sky.sun_altitude),
     };
 
-    let physical_sky = render_cfg.settings.sky_style.physical();
-
     if let Ok((mut light, mut xf)) = q_sun.single_mut() {
-        // Bevy's atmosphere uses this light's color as the incident sun radiance,
-        // so a saturated dusk tint reddens the whole dome on top of the
-        // wavelength-dependent reddening the scattering already produces. Feed it
-        // a near-white sun and let the atmosphere make the sunset; the Vanilla
-        // gradient path doesn't read this color, so it keeps the warm light.
-        light.color = if physical_sky {
-            let c = sun_color.to_linear();
-            Color::linear_rgb(
-                lerp(c.red, 1.0, 0.85),
-                lerp(c.green, 1.0, 0.85),
-                lerp(c.blue, 1.0, 0.85),
-            )
-        } else {
-            sun_color
-        };
+        light.color = sun_color;
         light.illuminance = sun_lux;
         *xf = Transform::from_translation(sun_pos).looking_at(Vec3::ZERO, Vec3::Y);
     }
@@ -690,11 +676,24 @@ pub fn sun_moon_system(
         disc.scale = Vec3::splat(MOON_DISC_RADIUS * 2.0 * illusion);
 
         disc.look_at(cam_pos, Vec3::Y);
-        *vis = if moon_visible && !sky_realism.physical_moon_orbit {
+        let disc_shown = moon_visible && !sky_realism.physical_moon_orbit;
+        *vis = if disc_shown {
             Visibility::Inherited
         } else {
             Visibility::Hidden
         };
+        if *prev_disc_shown != Some(disc_shown) {
+            info!(
+                hour = sky.hour,
+                moon_altitude = sky.moon_altitude,
+                moon_illumination = sky.moon_illumination,
+                disc_y = moon_world.y - cam_pos.y,
+                sprite_loaded = render_cfg.moon_sprite.0.is_some(),
+                shown = disc_shown,
+                "moon disc visibility"
+            );
+            *prev_disc_shown = Some(disc_shown);
+        }
     }
 
     if let Ok((mut sphere, mut vis)) = q_moon_sphere.single_mut() {
