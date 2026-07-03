@@ -122,14 +122,26 @@ fn update_zone_material_lighting(
     const COLOR_BIAS: Vec3 = Vec3::new(1.4, 1.36, 1.45);
     const AMBIENT_BIAS_BELOW: f32 = 0.5;
 
-    const AMBIENT_FLOOR: f32 = 0.28;
+    // Terrain ambient floor, matched to the actor path so ground and models
+    // darken together at night. (Was 0.28, which — ×2 in the overbright shader —
+    // floored night terrain to ~0.56 and washed the darkness out.)
+    const AMBIENT_FLOOR: f32 = 0.12;
 
-    let amb = ambient.color.to_linear();
-    let amb_k = (ambient.brightness / AMBIENT_REF_LUX).clamp(0.0, 1.5);
-    let mut amb_rgb = Vec3::new(amb.red, amb.green, amb.blue) * amb_k;
-    if amb_rgb.max_element() < AMBIENT_BIAS_BELOW {
-        amb_rgb *= COLOR_BIAS;
-    }
+    // research/xim EnvironmentSection.kt:163-164: the 0x2F landscape ambient is
+    // the authoritative per-hour base (dark at night). Use it directly when the
+    // zone ships records; the GlobalAmbientLight amb_k/COLOR_BIAS path is the
+    // no-DAT fallback (it re-derives from the atmosphere seed and inflates).
+    let mut amb_rgb = if zone_lighting.valid {
+        zone_lighting.ambient_landscape
+    } else {
+        let amb = ambient.color.to_linear();
+        let amb_k = (ambient.brightness / AMBIENT_REF_LUX).clamp(0.0, 1.5);
+        let mut a = Vec3::new(amb.red, amb.green, amb.blue) * amb_k;
+        if a.max_element() < AMBIENT_BIAS_BELOW {
+            a *= COLOR_BIAS;
+        }
+        a
+    };
     amb_rgb = amb_rgb.max(Vec3::splat(AMBIENT_FLOOR));
     let ambient_v = amb_rgb.extend(1.0);
 
