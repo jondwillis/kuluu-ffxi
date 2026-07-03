@@ -648,9 +648,13 @@ fn drive_zone_stars(
     >,
     mut prev_visible: Local<Option<bool>>,
 ) {
-    let Ok((mut xf, mut vis, mat)) = stars.single_mut() else {
+    // iter_mut, not single_mut: the InGame lifecycle can leave orphaned StarDome
+    // entities (OnExit bulk-despawn races the rebuild), and single_mut() silently
+    // returns Err on >1, leaving every dome stuck at its spawn-time Hidden.
+    let count = stars.iter().count();
+    if count == 0 {
         return;
-    };
+    }
     let cam_pos = cam_q.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
 
@@ -662,14 +666,12 @@ fn drive_zone_stars(
     } else {
         Visibility::Hidden
     };
-    if *vis != want {
-        *vis = want;
-    }
     if *prev_visible != Some(night > 0.0) {
         info!(
             sun_altitude = sky.sun_altitude,
             night,
             visible = night > 0.0,
+            dome_count = count,
             "zone stars visibility"
         );
         *prev_visible = Some(night > 0.0);
@@ -677,13 +679,17 @@ fn drive_zone_stars(
 
     // One slow celestial roll per Vana day.
     let frac = crate::hud::vana_clock::full_day_fraction(vana_clock.earth_unix_secs_now());
-    let scale = xf.scale;
-    xf.translation = cam_pos;
-    xf.rotation = Quat::from_rotation_y(frac * std::f32::consts::TAU) * ffxi_to_bevy_basis();
-    xf.scale = scale;
-
-    if let Some(m) = materials.get_mut(&mat.0) {
-        m.base_color = Color::linear_rgb(night, night, night);
+    for (mut xf, mut vis, mat) in stars.iter_mut() {
+        if *vis != want {
+            *vis = want;
+        }
+        let scale = xf.scale;
+        xf.translation = cam_pos;
+        xf.rotation = Quat::from_rotation_y(frac * std::f32::consts::TAU) * ffxi_to_bevy_basis();
+        xf.scale = scale;
+        if let Some(m) = materials.get_mut(&mat.0) {
+            m.base_color = Color::linear_rgb(night, night, night);
+        }
     }
 }
 

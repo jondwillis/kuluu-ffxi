@@ -521,7 +521,10 @@ pub fn sun_moon_system(
         None => sun_color_for_hour(sky.hour, sky.sun_altitude),
     };
 
-    if let Ok((mut light, mut xf)) = q_sun.single_mut() {
+    // iter_mut over single_mut throughout: the InGame OnExit bulk-despawn can race
+    // setup_world and leave duplicate/orphaned sun/moon entities; single_mut() then
+    // returns Err and silently stops updating light, position and visibility.
+    for (mut light, mut xf) in q_sun.iter_mut() {
         light.color = sun_color;
         light.illuminance = sun_lux;
         *xf = Transform::from_translation(sun_pos).looking_at(Vec3::ZERO, Vec3::Y);
@@ -549,7 +552,7 @@ pub fn sun_moon_system(
         Some(_) => (Color::BLACK, 0.0),
         None => moon_color_for_phase(sky.moon_illumination, sky.moon_altitude),
     };
-    if let Ok((mut light, mut xf)) = q_moon.single_mut() {
+    for (mut light, mut xf) in q_moon.iter_mut() {
         light.color = moon_color;
         light.illuminance = moon_lux;
         *xf = Transform::from_translation(moon_pos).looking_at(Vec3::ZERO, Vec3::Y);
@@ -631,7 +634,7 @@ pub fn sun_moon_system(
 
     let sun_visible = sky.sun_altitude > -0.05;
     let sun_sprite_tex = render_cfg.sun_sprite.texture.clone();
-    if let Ok((mut disc, mut vis, mut mesh3d, _)) = q_sun_disc.single_mut() {
+    for (mut disc, mut vis, mut mesh3d, _) in q_sun_disc.iter_mut() {
         disc.translation = cam_pos + sun_dir * SKY_RADIUS;
         // research/xim: the sun is an attach=0xE additive billboard. With a "suns"
         // sprite the disc is a camera-facing textured quad; otherwise the procedural
@@ -669,34 +672,34 @@ pub fn sun_moon_system(
         1.0
     };
 
-    if let Ok((mut disc, mut vis)) = q_moon_disc.single_mut() {
-        let moon_world = cam_pos + moon_dir * SKY_RADIUS;
+    let disc_shown = moon_visible && !sky_realism.physical_moon_orbit;
+    let moon_world = cam_pos + moon_dir * SKY_RADIUS;
+    let disc_count = q_moon_disc.iter().count();
+    for (mut disc, mut vis) in q_moon_disc.iter_mut() {
         disc.translation = moon_world;
-
         disc.scale = Vec3::splat(MOON_DISC_RADIUS * 2.0 * illusion);
-
         disc.look_at(cam_pos, Vec3::Y);
-        let disc_shown = moon_visible && !sky_realism.physical_moon_orbit;
         *vis = if disc_shown {
             Visibility::Inherited
         } else {
             Visibility::Hidden
         };
-        if *prev_disc_shown != Some(disc_shown) {
-            info!(
-                hour = sky.hour,
-                moon_altitude = sky.moon_altitude,
-                moon_illumination = sky.moon_illumination,
-                disc_y = moon_world.y - cam_pos.y,
-                sprite_loaded = render_cfg.moon_sprite.0.is_some(),
-                shown = disc_shown,
-                "moon disc visibility"
-            );
-            *prev_disc_shown = Some(disc_shown);
-        }
+    }
+    if *prev_disc_shown != Some(disc_shown) {
+        info!(
+            hour = sky.hour,
+            moon_altitude = sky.moon_altitude,
+            moon_illumination = sky.moon_illumination,
+            disc_y = moon_world.y - cam_pos.y,
+            sprite_loaded = render_cfg.moon_sprite.0.is_some(),
+            shown = disc_shown,
+            disc_count,
+            "moon disc visibility"
+        );
+        *prev_disc_shown = Some(disc_shown);
     }
 
-    if let Ok((mut sphere, mut vis)) = q_moon_sphere.single_mut() {
+    for (mut sphere, mut vis) in q_moon_sphere.iter_mut() {
         sphere.translation = cam_pos + moon_dir * SKY_RADIUS;
         sphere.scale = Vec3::splat(MOON_DISC_RADIUS * illusion);
         *vis = if moon_visible && sky_realism.physical_moon_orbit {
