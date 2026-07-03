@@ -403,7 +403,9 @@ impl Default for GraphicsSettings {
     }
 }
 
-const SHADOW_MAP_SIZE_SLOTS: &[u32] = &[1024, 2048, 3072, 4096];
+// wgpu/Bevy require power-of-two DirectionalLightShadowMap sizes; a non-PoT slot
+// (e.g. 3072) is silently rounded up by bevy_light, so the menu value would lie.
+const SHADOW_MAP_SIZE_SLOTS: &[u32] = &[1024, 2048, 4096];
 const SHADOW_CASCADE_COUNT_SLOTS: &[u32] = &[2, 3, 4];
 const SHADOW_MAX_DISTANCE_SLOTS: &[f32] = &[100.0, 200.0, 300.0, 700.0, 1100.0];
 const BLOOM_SLOTS: &[f32] = &[0.0, 0.04, 0.08, 0.12, 0.16];
@@ -1341,6 +1343,16 @@ mod tests {
         assert_eq!(s.shadow_map_size, 4096);
         assert_eq!(s.shadow_cascade_count, 4);
         assert!((s.shadow_max_distance - 700.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shadow_map_size_slots_are_power_of_two() {
+        for &size in SHADOW_MAP_SIZE_SLOTS {
+            assert!(
+                size.is_power_of_two(),
+                "shadow_map_size slot {size} is not a power of two; bevy_light rounds it up"
+            );
+        }
     }
 
     #[test]
