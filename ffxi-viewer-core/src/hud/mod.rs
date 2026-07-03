@@ -12,6 +12,7 @@ pub mod item_dat_root;
 pub mod item_detail;
 pub mod item_meta;
 pub mod item_screen;
+pub mod item_ui;
 pub mod logout_countdown;
 pub mod menu;
 pub mod mesh_debug;
@@ -258,8 +259,6 @@ impl Plugin for HudPlugin {
                 target_action_menu::target_action_mouse_hover_system,
                 target_action_menu::target_action_mouse_click_system,
                 item_screen::update_item_screen.after(menu::refresh_dynamic_menu_rows),
-                item_detail::update_item_detail,
-                item_detail::update_sort_options,
                 trade::update_trade_window,
                 check_view::update_check_view,
                 status_panel::update_status_panel,
@@ -295,7 +294,7 @@ impl Plugin for HudPlugin {
                 menu::menu_mouse_click_system,
                 item_screen::item_row_mouse_hover_system,
                 item_screen::item_row_mouse_click_system,
-                item_detail::sort_option_mouse_system,
+                item_screen::sort_option_mouse_system,
                 dialog::dialog_mouse_hover_system,
                 dialog::dialog_mouse_click_system,
                 quick_action::quick_action_mouse_hover_system,
@@ -356,7 +355,6 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
     app.add_systems(
         schedule,
         (
-            item_detail::spawn_item_detail,
             item_screen::spawn_item_screen,
             trade::spawn_trade_window,
             check_view::spawn_check_view,

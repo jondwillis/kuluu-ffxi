@@ -1,28 +1,10 @@
 use bevy::prelude::*;
 
 use crate::hud::item_dat_root::{ItemDatRoot, ItemIconCache};
-use crate::hud::{item_detail, item_meta, status_panel};
+use crate::hud::item_ui::{self, framed_box, text_font, theme, transparent_placeholder};
+use crate::hud::status_panel;
 use crate::input_mode::{InputMode, MenuKind};
 use crate::snapshot::SceneState;
-
-// Retail FFXI's default "blue" window theme: a translucent navy frame with a
-// light steel-blue edge, pale-blue title text, near-white body text, and a
-// golden cursor highlight on the focused row/slot. These are deliberate
-// tunings (retail ships no palette file to scrape), named here per the
-// no-magic-numbers convention.
-mod theme {
-    use bevy::prelude::Color;
-
-    pub const FRAME_BG: Color = Color::srgba(0.05, 0.07, 0.16, 0.88);
-    pub const FRAME_EDGE: Color = Color::srgb(0.60, 0.69, 0.85);
-    pub const TITLE: Color = Color::srgb(0.80, 0.89, 1.0);
-    pub const TEXT: Color = Color::srgb(0.91, 0.92, 0.95);
-    pub const MUTED: Color = Color::srgb(0.58, 0.63, 0.74);
-    pub const CURSOR: Color = Color::srgb(1.0, 0.84, 0.36);
-    pub const CURSOR_BG: Color = Color::srgba(0.20, 0.28, 0.45, 0.65);
-    pub const CELL_BG: Color = Color::srgba(0.10, 0.13, 0.24, 0.85);
-    pub const CELL_EDGE: Color = Color::srgb(0.32, 0.38, 0.52);
-}
 
 pub const SLOT_NAMES: [&str; 16] = [
     "Main", "Sub", "Ranged", "Ammo", "Head", "Body", "Hands", "Legs", "Feet", "Neck", "Waist",
@@ -193,27 +175,6 @@ fn screen_state(mode: &InputMode) -> ScreenState {
         },
         None => ScreenState::Closed,
     }
-}
-
-fn text_font(size: f32) -> TextFont {
-    TextFont {
-        font_size: size,
-        ..default()
-    }
-}
-
-fn framed_box() -> (Node, BackgroundColor, BorderColor) {
-    (
-        Node {
-            padding: UiRect::axes(Val::Px(10.0), Val::Px(8.0)),
-            border: UiRect::all(Val::Px(1.0)),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(2.0),
-            ..default()
-        },
-        BackgroundColor(theme::FRAME_BG),
-        BorderColor::all(theme::FRAME_EDGE),
-    )
 }
 
 pub(crate) fn spawn_equipment_screen(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
@@ -478,7 +439,7 @@ pub(crate) fn update_equipment_screen(
     };
 
     let (detail_name, detail_rows) =
-        compose_focus_detail(focused_item, snap, &dat_root, &mut icon_cache);
+        item_ui::focus_detail(focused_item, snap, &dat_root, &mut icon_cache);
 
     // Storage list viewport (keep the cursor in view).
     let storage_total = dynamic.rows.len();
@@ -722,47 +683,6 @@ fn profile_line(
         }
         None => name,
     }
-}
-
-fn compose_focus_detail(
-    item_no: Option<u16>,
-    snap: &ffxi_viewer_wire::SceneSnapshot,
-    dat_root: &ItemDatRoot,
-    icon_cache: &mut ItemIconCache,
-) -> (String, Vec<String>) {
-    let Some(item_no) = item_no else {
-        return ("Select an item.".to_string(), Vec::new());
-    };
-    let dat = icon_cache
-        .table(dat_root)
-        .and_then(|table| item_detail::lookup_static(&table, item_no));
-    let detail = item_meta::compose_item_detail(item_no, snap, dat.clone());
-    let name = dat
-        .as_ref()
-        .map(|s| s.name.clone())
-        .filter(|n| !n.is_empty())
-        .or_else(|| ffxi_proto::item_names::lookup(item_no).map(|s| s.to_string()))
-        .unwrap_or_else(|| format!("Item #{item_no}"));
-    (name, item_detail::detail_rows(&detail))
-}
-
-fn transparent_placeholder(images: &mut Assets<Image>) -> Handle<Image> {
-    use bevy::asset::RenderAssetUsages;
-    use bevy::image::ImageSampler;
-    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-    let mut image = Image::new(
-        Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        vec![0, 0, 0, 0],
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
-    );
-    image.sampler = ImageSampler::nearest();
-    images.add(image)
 }
 
 #[cfg(test)]

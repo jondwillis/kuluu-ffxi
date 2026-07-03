@@ -1,50 +1,70 @@
 use bevy::prelude::*;
 
 use crate::hud::item_dat_root::{ItemDatRoot, ItemIconCache};
+use crate::hud::item_detail::{self, ItemMenuFocus, SortOptionId, SortOptions, SORT_OPTIONS};
+use crate::hud::item_ui::{self, framed_box, text_font, theme};
 use crate::hud::menu::{DynamicMenu, DynamicMenuAction, MenuRowActivated};
-use crate::hud::palette;
 use crate::input_mode::{InputMode, MenuKind};
 use crate::snapshot::SceneState;
 
 pub const ITEM_LIST_ROWS: usize = 13;
 
+const DETAIL_ROWS: usize = 10;
+
 const ROW_ICON_PX: f32 = 18.0;
+
+const DETAIL_ICON_PX: f32 = 32.0;
 
 const MAIN_BAG_CAPACITY: u32 = 80;
 
-#[derive(Component)]
-pub struct ItemScreenPanel;
+const LIST_WIDTH_PX: f32 = 240.0;
 
-#[derive(Component)]
-pub struct ItemScreenHeader;
+const SORT_WIDTH_PX: f32 = 132.0;
 
-#[derive(Component)]
-pub struct ItemScreenRow {
-    pub slot: usize,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemRole {
+    ListHeader,
+    ListRowText(usize),
+    DetailName,
+    DetailRow(usize),
+    DetailCounts,
+    SortTitle,
+    SortRow(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IconSlot {
+    ListRow(usize),
+    Detail,
 }
 
 #[derive(Component)]
-pub struct ItemScreenRowIcon {
-    pub slot: usize,
-}
+pub(crate) struct ItemWindowRoot;
 
-#[derive(Component)]
-pub struct ItemScreenRowText {
-    pub slot: usize,
-}
+#[derive(Component, Clone, Copy)]
+pub(crate) struct ItemText(ItemRole);
+
+#[derive(Component, Clone, Copy)]
+pub(crate) struct ItemIcon(IconSlot);
+
+/// The per-list-row flex container (icon + label). Carries `Button` so the row
+/// is mouse-selectable; toggling its `Node` display hides the whole row.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct ItemListRow(usize);
 
 pub fn items_open(mode: &InputMode) -> bool {
     matches!(mode, InputMode::Menu(stack)
         if stack.current().is_some_and(|l| matches!(l.kind, MenuKind::Items)))
 }
 
-fn items_cursor(mode: &InputMode) -> Option<usize> {
+fn items_cursor(mode: &InputMode) -> usize {
     match mode {
         InputMode::Menu(stack) => stack
             .current()
             .filter(|l| matches!(l.kind, MenuKind::Items))
-            .map(|l| l.cursor),
-        _ => None,
+            .map(|l| l.cursor)
+            .unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -66,42 +86,70 @@ fn row_item_no(rows: &[crate::hud::menu::DynamicMenuRow], idx: usize) -> Option<
     }
 }
 
-pub fn spawn_item_screen(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
-    let placeholder = transparent_placeholder(&mut images);
+fn format_counts(snap: &ffxi_viewer_wire::SceneSnapshot) -> String {
+    let total = snap.inventory_main.len() as u32;
+    let usable = snap
+        .inventory_main
+        .iter()
+        .filter(|s| s.quantity > 0)
+        .count() as u32;
+    format!("Usable {usable}/{total} \u{b7} Bag {total}/{MAIN_BAG_CAPACITY}")
+}
+
+pub(crate) fn spawn_item_screen(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    let placeholder = item_ui::transparent_placeholder(&mut images);
 
     commands
         .spawn((
             crate::components::InGameEntity,
-            ItemScreenPanel,
+            ItemWindowRoot,
+            // One self-contained, content-sized window anchored top-left (like
+            // the Equipment screen): list + detail stacked in the left column,
+            // the sort box beside it. Sizing to content keeps it clear of the
+            // corner HUD (minimap, chat) instead of spanning the screen.
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Px(48.0),
                 left: Val::Px(8.0),
-                width: Val::Px(240.0),
-                padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
-                border: UiRect::all(Val::Px(1.0)),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(2.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::FlexStart,
+                column_gap: Val::Px(6.0),
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            ZIndex(item_ui::WINDOW_Z),
         ))
-        .with_children(|p| {
-            p.spawn((
-                ItemScreenHeader,
-                Text::new("Items"),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(palette::ACCENT),
-            ));
+        .with_children(|root| {
+            root.spawn(Node {
+                width: Val::Px(LIST_WIDTH_PX),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(6.0),
+                ..default()
+            })
+            .with_children(|col| {
+                spawn_list_box(col, placeholder.clone());
+                spawn_detail_box(col, placeholder.clone());
+            });
 
-            for slot in 0..ITEM_LIST_ROWS {
-                p.spawn((
-                    ItemScreenRow { slot },
+            spawn_sort_box(root);
+        });
+}
+
+fn spawn_list_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) {
+    let (mut n, bg, bd) = framed_box();
+    n.width = Val::Px(LIST_WIDTH_PX);
+    col.spawn((n, bg, bd)).with_children(|p| {
+        spawn_text(p, ItemRole::ListHeader, 14.0, theme::TITLE);
+        p.spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(2.0),
+            margin: UiRect::top(Val::Px(4.0)),
+            ..default()
+        })
+        .with_children(|list| {
+            for i in 0..ITEM_LIST_ROWS {
+                list.spawn((
+                    ItemListRow(i),
                     Button,
                     Node {
                         flex_direction: FlexDirection::Row,
@@ -113,7 +161,7 @@ pub fn spawn_item_screen(mut commands: Commands, mut images: ResMut<Assets<Image
                 ))
                 .with_children(|row| {
                     row.spawn((
-                        ItemScreenRowIcon { slot },
+                        ItemIcon(IconSlot::ListRow(i)),
                         Node {
                             width: Val::Px(ROW_ICON_PX),
                             height: Val::Px(ROW_ICON_PX),
@@ -123,41 +171,137 @@ pub fn spawn_item_screen(mut commands: Commands, mut images: ResMut<Assets<Image
                         ImageNode::new(placeholder.clone()),
                     ));
                     row.spawn((
-                        ItemScreenRowText { slot },
+                        ItemText(ItemRole::ListRowText(i)),
                         Text::new(""),
-                        TextFont {
-                            font_size: 13.0,
-                            ..default()
-                        },
-                        TextColor(palette::TEXT),
+                        text_font(13.0),
+                        TextColor(theme::TEXT),
                     ));
                 });
             }
         });
+    });
+}
+
+fn spawn_detail_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) {
+    let (mut n, bg, bd) = framed_box();
+    n.width = Val::Px(LIST_WIDTH_PX);
+    col.spawn((n, bg, bd)).with_children(|p| {
+        p.spawn(Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(6.0),
+            ..default()
+        })
+        .with_children(|h| {
+            h.spawn((
+                ItemIcon(IconSlot::Detail),
+                Node {
+                    width: Val::Px(DETAIL_ICON_PX),
+                    height: Val::Px(DETAIL_ICON_PX),
+                    display: Display::None,
+                    ..default()
+                },
+                ImageNode::new(placeholder),
+            ));
+            h.spawn((
+                ItemText(ItemRole::DetailName),
+                Text::new(""),
+                text_font(14.0),
+                TextColor(theme::TITLE),
+            ));
+        });
+        for i in 0..DETAIL_ROWS {
+            spawn_row(p, ItemRole::DetailRow(i), 12.0, theme::TEXT);
+        }
+        spawn_text(p, ItemRole::DetailCounts, 11.0, theme::MUTED);
+    });
+}
+
+fn spawn_sort_box(root: &mut ChildSpawnerCommands) {
+    let (mut n, bg, bd) = framed_box();
+    n.width = Val::Px(SORT_WIDTH_PX);
+    root.spawn((n, bg, bd)).with_children(|p| {
+        spawn_text(p, ItemRole::SortTitle, 13.0, theme::TITLE);
+        for i in 0..SORT_OPTIONS.len() {
+            p.spawn((
+                ItemText(ItemRole::SortRow(i)),
+                Button,
+                Text::new(""),
+                text_font(12.0),
+                TextColor(theme::MUTED),
+            ));
+        }
+    });
+}
+
+fn spawn_text(p: &mut ChildSpawnerCommands, role: ItemRole, size: f32, color: Color) {
+    p.spawn((
+        ItemText(role),
+        Text::new(""),
+        text_font(size),
+        TextColor(color),
+    ));
+}
+
+fn spawn_row(p: &mut ChildSpawnerCommands, role: ItemRole, size: f32, color: Color) {
+    p.spawn((
+        ItemText(role),
+        Text::new(""),
+        text_font(size),
+        TextColor(color),
+        Node {
+            display: Display::None,
+            ..default()
+        },
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn update_item_screen(
+pub(crate) fn update_item_screen(
     mode: Res<InputMode>,
     state: Res<SceneState>,
     dynamic: Res<DynamicMenu>,
+    sort: Res<SortOptions>,
+    focus: Res<ItemMenuFocus>,
     dat_root: Res<ItemDatRoot>,
     mut icon_cache: ResMut<ItemIconCache>,
     mut images: ResMut<Assets<Image>>,
-    mut panel_q: Query<&mut Node, With<ItemScreenPanel>>,
-    mut header_q: Query<&mut Text, (With<ItemScreenHeader>, Without<ItemScreenRowText>)>,
-    mut row_q: Query<
-        (&ItemScreenRow, &mut Node),
-        (Without<ItemScreenPanel>, Without<ItemScreenRowIcon>),
+    mut root_q: Query<
+        &mut Node,
+        (
+            With<ItemWindowRoot>,
+            Without<ItemText>,
+            Without<ItemIcon>,
+            Without<ItemListRow>,
+        ),
     >,
-    mut text_q: Query<(&ItemScreenRowText, &mut Text, &mut TextColor), Without<ItemScreenHeader>>,
+    mut listrow_q: Query<
+        (&ItemListRow, &mut Node),
+        (
+            Without<ItemWindowRoot>,
+            Without<ItemText>,
+            Without<ItemIcon>,
+        ),
+    >,
+    mut text_q: Query<
+        (&ItemText, &mut Text, &mut TextColor, &mut Node),
+        (
+            Without<ItemWindowRoot>,
+            Without<ItemIcon>,
+            Without<ItemListRow>,
+        ),
+    >,
     mut icon_q: Query<
-        (&ItemScreenRowIcon, &mut Node, &mut ImageNode),
-        (Without<ItemScreenRow>, Without<ItemScreenPanel>),
+        (&ItemIcon, &mut Node, &mut ImageNode),
+        (
+            Without<ItemWindowRoot>,
+            Without<ItemText>,
+            Without<ItemListRow>,
+        ),
     >,
 ) {
     let open = items_open(&mode);
-    if let Ok(mut node) = panel_q.single_mut() {
+    if let Ok(mut node) = root_q.single_mut() {
         let want = if open { Display::Flex } else { Display::None };
         if node.display != want {
             node.display = want;
@@ -167,22 +311,21 @@ pub fn update_item_screen(
         return;
     }
 
-    let cursor = items_cursor(&mode).unwrap_or(0);
+    let snap = &state.snapshot;
     let rows = &dynamic.rows;
     let total = rows.len();
+    let cursor = items_cursor(&mode);
     let start = viewport_start(cursor, total);
 
-    if let Ok(mut text) = header_q.single_mut() {
-        let used = state.snapshot.inventory_main.len() as u32;
-        let want = format!("Items  {used}/{MAIN_BAG_CAPACITY}");
-        if **text != want {
-            **text = want;
-        }
-    }
+    let focused_item = item_detail::selected_item_no(&mode, &dynamic);
+    let (detail_name, detail_rows) =
+        item_ui::focus_detail(focused_item, snap, &dat_root, &mut icon_cache);
+    let counts = format_counts(snap);
+    let header = format!("Items  {}/{}", snap.inventory_main.len(), MAIN_BAG_CAPACITY);
 
-    for (row, mut node) in row_q.iter_mut() {
-        let list_idx = start + row.slot;
-        let visible = row.slot < ITEM_LIST_ROWS && list_idx < total;
+    for (row, mut node) in listrow_q.iter_mut() {
+        let list_idx = start + row.0;
+        let visible = list_idx < total;
         let want = if visible {
             Display::Flex
         } else {
@@ -193,47 +336,47 @@ pub fn update_item_screen(
         }
     }
 
-    let empty = total == 0;
-    for (row, mut text, mut color) in text_q.iter_mut() {
-        let list_idx = start + row.slot;
-        if empty && row.slot == 0 {
-            let want = "(inventory empty)";
-            if **text != *want {
-                **text = want.to_string();
-            }
-            if color.0 != palette::MUTED {
-                color.0 = palette::MUTED;
-            }
-            continue;
-        }
-        let Some(entry) = rows.get(list_idx) else {
-            continue;
-        };
-        let is_cursor = list_idx == cursor;
-        let want = if is_cursor {
-            format!("> {}", entry.label)
+    for (tag, mut text, mut color, mut node) in text_q.iter_mut() {
+        let (want, want_color, visible) = role_value(
+            tag.0,
+            rows,
+            total,
+            cursor,
+            start,
+            &header,
+            &detail_name,
+            &detail_rows,
+            &counts,
+            &sort,
+            &focus,
+        );
+        let display = if visible {
+            Display::Flex
         } else {
-            format!("  {}", entry.label)
+            Display::None
         };
-        if **text != want {
+        if node.display != display {
+            node.display = display;
+        }
+        if visible && **text != want {
             **text = want;
         }
-        let want_color = if is_cursor {
-            palette::ACCENT
-        } else {
-            palette::TEXT
-        };
         if color.0 != want_color {
             color.0 = want_color;
         }
     }
 
     for (icon, mut node, mut image) in icon_q.iter_mut() {
-        let list_idx = start + icon.slot;
-        let handle = (!empty)
-            .then(|| row_item_no(rows, list_idx))
-            .flatten()
-            .and_then(|item_no| icon_cache.ensure(item_no, &dat_root, &mut images));
+        let item = match icon.0 {
+            IconSlot::ListRow(i) => {
+                let list_idx = start + i;
+                (list_idx < total)
+                    .then(|| row_item_no(rows, list_idx))
+                    .flatten()
+            }
+            IconSlot::Detail => focused_item,
+        };
+        let handle = item.and_then(|n| icon_cache.ensure(n, &dat_root, &mut images));
         match handle {
             Some(h) => {
                 if image.image != h {
@@ -255,10 +398,83 @@ pub fn update_item_screen(
     }
 }
 
-pub fn item_row_mouse_hover_system(
+#[allow(clippy::too_many_arguments)]
+fn role_value(
+    role: ItemRole,
+    rows: &[crate::hud::menu::DynamicMenuRow],
+    total: usize,
+    cursor: usize,
+    start: usize,
+    header: &str,
+    detail_name: &str,
+    detail_rows: &[String],
+    counts: &str,
+    sort: &SortOptions,
+    focus: &ItemMenuFocus,
+) -> (String, Color, bool) {
+    match role {
+        ItemRole::ListHeader => (header.to_string(), theme::TITLE, true),
+        ItemRole::ListRowText(i) => {
+            let list_idx = start + i;
+            if total == 0 {
+                return if i == 0 {
+                    ("(inventory empty)".to_string(), theme::MUTED, true)
+                } else {
+                    (String::new(), theme::TEXT, false)
+                };
+            }
+            match rows.get(list_idx) {
+                Some(entry) => {
+                    let is_cursor = list_idx == cursor;
+                    let prefix = if is_cursor { "> " } else { "  " };
+                    let color = if is_cursor {
+                        theme::CURSOR
+                    } else {
+                        theme::TEXT
+                    };
+                    (format!("{prefix}{}", entry.label), color, true)
+                }
+                None => (String::new(), theme::TEXT, false),
+            }
+        }
+        ItemRole::DetailName => (detail_name.to_string(), theme::TITLE, true),
+        ItemRole::DetailRow(i) => match detail_rows.get(i) {
+            Some(line) => (line.clone(), theme::TEXT, true),
+            None => (String::new(), theme::TEXT, false),
+        },
+        ItemRole::DetailCounts => (counts.to_string(), theme::MUTED, true),
+        ItemRole::SortTitle => ("Sort".to_string(), theme::TITLE, true),
+        ItemRole::SortRow(i) => match SORT_OPTIONS.get(i).copied() {
+            Some(id) => {
+                let active = match id {
+                    SortOptionId::Auto => sort.auto,
+                    SortOptionId::Manual => !sort.auto,
+                };
+                let cursor = focus.sort_focused && focus.sort_cursor == i;
+                let name = match id {
+                    SortOptionId::Auto => "Auto",
+                    SortOptionId::Manual => "Manual",
+                };
+                let marker = if active { "\u{25cf}" } else { "\u{25cb}" };
+                let prefix = if cursor { ">" } else { " " };
+                let color = if cursor {
+                    theme::CURSOR
+                } else if active {
+                    theme::TEXT
+                } else {
+                    theme::MUTED
+                };
+                (format!("{prefix} {marker} {name}"), color, true)
+            }
+            None => (String::new(), theme::TEXT, false),
+        },
+    }
+}
+
+pub(crate) fn item_row_mouse_hover_system(
     mut mode: ResMut<InputMode>,
     dynamic: Res<DynamicMenu>,
-    rows: Query<(&Interaction, &ItemScreenRow), Changed<Interaction>>,
+    rows: Query<(&Interaction, &ItemListRow), Changed<Interaction>>,
 ) {
     let InputMode::Menu(stack) = &mut *mode else {
         return;
@@ -275,17 +491,17 @@ pub fn item_row_mouse_hover_system(
         if !matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
             continue;
         }
-        let list_idx = start + row.slot;
+        let list_idx = start + row.0;
         if list_idx < total && level.cursor != list_idx {
             level.cursor = list_idx;
         }
     }
 }
 
-pub fn item_row_mouse_click_system(
+pub(crate) fn item_row_mouse_click_system(
     mode: Res<InputMode>,
     dynamic: Res<DynamicMenu>,
-    rows: Query<(&Interaction, &ItemScreenRow), Changed<Interaction>>,
+    rows: Query<(&Interaction, &ItemListRow), Changed<Interaction>>,
     mut out: MessageWriter<MenuRowActivated>,
 ) {
     let InputMode::Menu(stack) = &*mode else {
@@ -303,30 +519,41 @@ pub fn item_row_mouse_click_system(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        let list_idx = start + row.slot;
+        let list_idx = start + row.0;
         if list_idx < total {
             out.write(MenuRowActivated { slot: list_idx });
         }
     }
 }
 
-fn transparent_placeholder(images: &mut Assets<Image>) -> Handle<Image> {
-    use bevy::asset::RenderAssetUsages;
-    use bevy::image::ImageSampler;
-    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-    let mut image = Image::new(
-        Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        vec![0u8, 0, 0, 0],
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
-    );
-    image.sampler = ImageSampler::nearest();
-    images.add(image)
+pub(crate) fn sort_option_mouse_system(
+    mode: Res<InputMode>,
+    mut sort: ResMut<SortOptions>,
+    mut focus: ResMut<ItemMenuFocus>,
+    rows: Query<(&Interaction, &ItemText), Changed<Interaction>>,
+) {
+    if !items_open(&mode) {
+        return;
+    }
+    for (interaction, tag) in &rows {
+        let ItemRole::SortRow(i) = tag.0 else {
+            continue;
+        };
+        match interaction {
+            Interaction::Hovered => {
+                focus.sort_focused = true;
+                focus.sort_cursor = i;
+            }
+            Interaction::Pressed => {
+                focus.sort_focused = true;
+                focus.sort_cursor = i;
+                if let Some(&id) = SORT_OPTIONS.get(i) {
+                    item_detail::apply_sort_option(&mut sort, id);
+                }
+            }
+            Interaction::None => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -343,12 +570,9 @@ mod tests {
     #[test]
     fn viewport_centers_and_clamps() {
         let total = ITEM_LIST_ROWS * 3;
-        // Cursor near the top stays pinned to 0.
         assert_eq!(viewport_start(0, total), 0);
-        // Mid-list centers the cursor.
         let mid = total / 2;
         assert_eq!(viewport_start(mid, total), mid - ITEM_LIST_ROWS / 2);
-        // Cursor at the end clamps so the last row is visible.
         assert_eq!(viewport_start(total - 1, total), total - ITEM_LIST_ROWS);
     }
 }
