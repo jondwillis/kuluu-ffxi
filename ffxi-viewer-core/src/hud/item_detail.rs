@@ -201,6 +201,13 @@ pub fn apply_sort_option(sort: &mut SortOptions, id: SortOptionId) {
     sort.auto = matches!(id, SortOptionId::Auto);
 }
 
+/// Emitted when the user activates a sort option, so the client sends the
+/// server ITEM_STACK request. `container` is the LSB CONTAINER_ID to sort.
+#[derive(Message, Debug, Clone, Copy)]
+pub struct InventorySortRequested {
+    pub container: u8,
+}
+
 pub fn item_detail_open(mode: &InputMode) -> bool {
     match mode {
         InputMode::Menu(stack) => stack

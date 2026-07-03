@@ -98,6 +98,7 @@ mod tests {
             (c2s::CHAT, "CHAT"),
             (c2s::SHOP_BUY, "SHOP_BUY"),
             (c2s::EQUIP_SET, "EQUIP_SET"),
+            (c2s::ITEM_STACK, "ITEM_STACK"),
             (c2s::REQ_LOGOUT, "REQ_LOGOUT"),
         ] {
             assert!(

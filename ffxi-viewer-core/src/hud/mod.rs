@@ -201,6 +201,7 @@ impl Plugin for HudPlugin {
         app.add_message::<logout_countdown::LogoutRequested>();
 
         app.add_message::<menu::MenuRowActivated>();
+        app.add_message::<item_detail::InventorySortRequested>();
         app.add_message::<dialog::DialogChoiceActivated>();
         app.add_message::<quick_action::QuickActionActivated>();
 

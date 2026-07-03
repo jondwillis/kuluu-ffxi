@@ -1286,6 +1286,13 @@ pub enum AgentCommand {
         equip_slot: u8,
     },
 
+    /// Ask the server to consolidate same-id partial stacks in a container
+    /// (retail's inventory "Sort"). `container` is the LSB CONTAINER_ID
+    /// (LOC_INVENTORY = 0). See GP_CLI_COMMAND_ITEM_STACK (0x03A).
+    StackInventory {
+        container: u8,
+    },
+
     BankWhenFull {
         threshold: u8,
         mog_house_zoneline: u32,

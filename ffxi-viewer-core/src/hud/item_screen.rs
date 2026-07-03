@@ -530,6 +530,7 @@ pub(crate) fn sort_option_mouse_system(
     mode: Res<InputMode>,
     mut sort: ResMut<SortOptions>,
     mut focus: ResMut<ItemMenuFocus>,
+    mut sort_req: MessageWriter<item_detail::InventorySortRequested>,
     rows: Query<(&Interaction, &ItemText), Changed<Interaction>>,
 ) {
     if !items_open(&mode) {
@@ -550,6 +551,9 @@ pub(crate) fn sort_option_mouse_system(
                 if let Some(&id) = SORT_OPTIONS.get(i) {
                     item_detail::apply_sort_option(&mut sort, id);
                 }
+                // Perform the sort on the main inventory (LOC_INVENTORY = 0);
+                // the client turns this into an ITEM_STACK request.
+                sort_req.write(item_detail::InventorySortRequested { container: 0 });
             }
             Interaction::None => {}
         }

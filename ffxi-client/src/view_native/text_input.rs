@@ -2357,6 +2357,7 @@ pub fn mouse_nav_dispatch_system(
     mut dialog_events: MessageReader<ffxi_viewer_core::hud::dialog::DialogChoiceActivated>,
     mut qa_events: MessageReader<ffxi_viewer_core::hud::quick_action::QuickActionActivated>,
     mut ta_events: MessageReader<ffxi_viewer_core::hud::target_action_menu::TargetActionActivated>,
+    mut sort_req_events: MessageReader<ffxi_viewer_core::hud::item_detail::InventorySortRequested>,
     cmd_tx: Res<CommandTx>,
     mut bindings: ResMut<Bindings>,
     mut keybinds_state: ResMut<KeybindsStateRes>,
@@ -2443,6 +2444,12 @@ pub fn mouse_nav_dispatch_system(
             }
         }
     }
+
+    for ev in sort_req_events.read() {
+        let _ = cmd_tx.0.try_send(AgentCommand::StackInventory {
+            container: ev.container,
+        });
+    }
 }
 
 fn handle_menu_key(
@@ -2493,6 +2500,9 @@ fn handle_menu_key(
                 if let Some(&id) = SORT_OPTIONS.get(item_menu_focus.sort_cursor) {
                     apply_sort_option(sort_options, id);
                 }
+                // Perform the sort: ask the server to consolidate partial stacks
+                // in the main inventory (LOC_INVENTORY = 0).
+                let _ = cmd_tx.try_send(AgentCommand::StackInventory { container: 0 });
                 return None;
             }
             if bindings.matches_logical(Action::NavLeft, key)

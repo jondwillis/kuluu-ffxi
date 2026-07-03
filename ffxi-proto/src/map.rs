@@ -25,6 +25,11 @@ pub mod c2s {
 
     pub const EQUIP_SET: u16 = 0x050;
 
+    // GP_CLI_COMMAND_ITEM_STACK, vendor/server/src/map/packets/c2s/0x03a_item_stack.h.
+    // "Sort" for a container: the server consolidates same-id partial stacks.
+    // Payload is a single u32 Category = container id (LOC_INVENTORY = 0).
+    pub const ITEM_STACK: u16 = 0x03A;
+
     pub const REQ_LOGOUT: u16 = 0x0E7;
 }
 

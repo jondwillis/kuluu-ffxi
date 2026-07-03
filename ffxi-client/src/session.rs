@@ -1254,6 +1254,13 @@ async fn keepalive_loop(
 ) -> Result<MapOutcome> {
     let mut last_recv = std::time::Instant::now();
 
+    // ITEM_STACK is rate-limited server-side: a second sort of the same container
+    // within 1s trips LSB's lightluggage counter and can force-logout the char
+    // (vendor/server/src/map/packets/c2s/0x03a_item_stack.cpp:40). Throttle here
+    // so mashing the Sort key can never reach that.
+    let mut last_item_stack: std::collections::HashMap<u8, std::time::Instant> =
+        std::collections::HashMap::new();
+
     let mut net_health = crate::net_health::NetHealth::new();
     let mut last_net_emit = std::time::Instant::now();
     let mut keepalive_send_failing = false;
@@ -1641,6 +1648,31 @@ async fn keepalive_loop(
                             });
                         }
                         bundle_seq = bundle_seq.wrapping_add(1);
+                    }
+                    Some(AgentCommand::StackInventory { container }) => {
+                        const ITEM_STACK_MIN_INTERVAL: std::time::Duration =
+                            std::time::Duration::from_millis(1100);
+                        let now = std::time::Instant::now();
+                        let too_soon = last_item_stack
+                            .get(&container)
+                            .is_some_and(|t| now.duration_since(*t) < ITEM_STACK_MIN_INTERVAL);
+                        if too_soon {
+                            tracing::debug!(container, "item_stack throttled (<1.1s)");
+                        } else {
+                            last_item_stack.insert(container, now);
+                            let payload = build_subpacket_item_stack(sub_seq, container);
+                            sub_seq = sub_seq.wrapping_add(1);
+                            if let Err(e) = map
+                                .send_encrypted(&payload, bundle_seq, server_last_seq)
+                                .await
+                            {
+                                tracing::warn!(error = %e, "item_stack send failed");
+                                let _ = event_tx.send(AgentEvent::Error {
+                                    message: format!("item_stack send: {e}"),
+                                });
+                            }
+                            bundle_seq = bundle_seq.wrapping_add(1);
+                        }
                     }
                     Some(AgentCommand::UseItem {
                         container,
@@ -3290,6 +3322,21 @@ pub fn build_subpacket_equip_set(
     buf
 }
 
+// GP_CLI_COMMAND_ITEM_STACK, vendor/server/src/map/packets/c2s/0x03a_item_stack.h:
+// `uint32_t Category` (container id) after the 4-byte subpacket header, so 8 bytes
+// total (size_words = 2). The server consolidates same-id partial stacks.
+pub fn build_subpacket_item_stack(sync: u16, container: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::ITEM_STACK,
+        2,
+        sync,
+    ));
+    buf[4..8].copy_from_slice(&(container as u32).to_le_bytes());
+
+    buf
+}
+
 fn note_mog_transition(now_in_mog: bool, was: &mut bool, event_tx: &broadcast::Sender<AgentEvent>) {
     if now_in_mog && !*was {
         let _ = event_tx.send(AgentEvent::ChatLine {
@@ -4842,6 +4889,28 @@ mod tests {
         assert_eq!(buf[4], 7, "PropertyItemIndex = container_index (slotID)");
         assert_eq!(buf[5], 10, "EquipKind = equip_slot (Waist)");
         assert_eq!(buf[6], 0, "Category = container (LOC_INVENTORY)");
+    }
+
+    #[test]
+    fn item_stack_packet_layout_matches_server_struct() {
+        // GP_CLI_COMMAND_ITEM_STACK (vendor/server/src/map/packets/c2s/0x03a_item_stack.h):
+        // a single u32 Category (container id) after the 4-byte subpacket header.
+        let buf = build_subpacket_item_stack(0xCAFE, 0);
+        assert_eq!(buf.len(), 8, "header (4) + Category u32 (4)");
+        let hdr_word = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(hdr_word & 0x01FF, 0x03A, "opcode = 0x03A ITEM_STACK");
+        assert_eq!((hdr_word >> 9) & 0x7F, 2, "size_words = 2 (8 bytes)");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0xCAFE, "sync");
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            0,
+            "Category = container (LOC_INVENTORY = 0)"
+        );
+
+        // A non-zero container id must fill the full u32 (LSB validates any
+        // CONTAINER_ID, e.g. LOC_MOGSAFE = 1).
+        let buf = build_subpacket_item_stack(0, 1);
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 1);
     }
 
     #[test]
