@@ -153,12 +153,15 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     if std::env::var_os("FFXI_GPU_TIMING").is_some() {
         plugins = plugins.set(gpu_timing_render_plugin());
     }
-    app.add_plugins(
-        plugins
-            .build()
-            .disable::<LogPlugin>()
-            .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>(),
-    );
+    let mut plugin_group = plugins.build().disable::<LogPlugin>();
+    // Pipelined rendering (Bevy's macOS default) is disabled here by default; FFXI_PIPELINED_RENDER
+    // opts back in so CPU/GPU overlap can hide the serial present/GPU stalls that surface as
+    // render-bound frame spikes. Opt-in until proven safe against the native-window main-thread path.
+    if std::env::var_os("FFXI_PIPELINED_RENDER").is_none() {
+        plugin_group =
+            plugin_group.disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>();
+    }
+    app.add_plugins(plugin_group);
 
     app.add_systems(Startup, configure_gizmo_render_layer);
 
