@@ -488,12 +488,13 @@ pub fn ensure_self_lookcomp_system(
     let Some(look) = appearance.look.as_ref() else {
         return;
     };
+    // Seed the self look from the launcher-time appearance ONLY when nothing has
+    // set it yet, so the model shows before the server's CHAR_PC for self lands.
+    // Once a LookComp exists, sync_entity_looks_system (server-driven) owns it —
+    // otherwise this would clobber the server look every frame and the self model
+    // would never reflect gear changes (other PCs already update via that system).
     for (e, current) in q_self.iter() {
-        let needs = match current {
-            None => true,
-            Some(LookComp(existing)) => existing != look,
-        };
-        if needs {
+        if current.is_none() {
             if let Ok(mut ec) = commands.get_entity(e) {
                 ec.insert(LookComp(*look));
             }
