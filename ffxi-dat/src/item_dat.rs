@@ -241,7 +241,7 @@ fn decode_icon(block: &[u8]) -> Option<GraphicImage> {
     let start = ITEM_ICON_OFFSET + 4;
     let end = start.checked_add(size)?;
     let chunk = block.get(start..end.min(block.len()))?;
-    map_image::parse_graphic(chunk)
+    map_image::parse_graphic_icon(chunk)
         .ok()
         .flatten()
         .map(|(img, _)| img)

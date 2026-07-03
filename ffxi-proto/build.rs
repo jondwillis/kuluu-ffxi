@@ -148,12 +148,19 @@ fn main() -> Result<()> {
 
     let job_src = fs::read_to_string(LSB_JOB_NAME_LUA)
         .with_context(|| format!("reading {LSB_JOB_NAME_LUA}"))?;
-    let job_entries = parse_lua_indexed_pair_table(&job_src, "xi.jobName")?;
+    let job_entries = parse_lua_indexed_pair_table(&job_src, "xi.jobName", 3)?;
     write_u16_table(
         &out_dir.join("job_names_table.rs"),
         "JOB_NAMES",
         LSB_JOB_NAME_LUA,
         &job_entries,
+    )?;
+    let job_abbrevs = parse_lua_indexed_pair_table(&job_src, "xi.jobName", 1)?;
+    write_u16_table(
+        &out_dir.join("job_abbrevs_table.rs"),
+        "JOB_ABBREVS",
+        LSB_JOB_NAME_LUA,
+        &job_abbrevs,
     )?;
     println!(
         "cargo:warning=ffxi-proto: scraped {} job_name entries",
@@ -682,7 +689,13 @@ fn parse_xi_ident_table(src: &str, needle_prefix: &str) -> Result<Vec<(u32, Stri
     Ok(out)
 }
 
-fn parse_lua_indexed_pair_table(src: &str, needle_prefix: &str) -> Result<Vec<(u32, String)>> {
+// `field` selects which quoted string in each `[id] = { 'ABBR', 'Full Name' }`
+// row to keep: 1 = abbreviation, 3 = display name (split-by-`'` part index).
+fn parse_lua_indexed_pair_table(
+    src: &str,
+    needle_prefix: &str,
+    field: usize,
+) -> Result<Vec<(u32, String)>> {
     let needle = format!("{needle_prefix} =");
     let header = src
         .find(&needle)
@@ -711,10 +724,10 @@ fn parse_lua_indexed_pair_table(src: &str, needle_prefix: &str) -> Result<Vec<(u
         let rest = &line[open + 1 + close..];
         let parts: Vec<&str> = rest.split('\'').collect();
 
-        if parts.len() < 4 {
+        if parts.len() <= field {
             continue;
         }
-        let display = parts[3].trim();
+        let display = parts[field].trim();
         if display.is_empty() {
             continue;
         }

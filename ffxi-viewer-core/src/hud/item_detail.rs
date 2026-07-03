@@ -123,9 +123,10 @@ fn format_jobs(jobs_mask: u32) -> String {
     // item_equipment.jobs which is 1-indexed (bit == job - 1). Verified: White
     // Belt (MNK-only, job 2) has DAT jobs 0x04 = bit 2. This consumes the DAT
     // mask, so do NOT apply the -1 used by equip_info::fits_job.
-    let parts: Vec<String> = (0..32u32)
+    // Bit 0 is JOB_NONE; real jobs are 1..=22 (canonical codes scraped from LSB).
+    let parts: Vec<&str> = (1..32u32)
         .filter(|bit| jobs_mask & (1 << bit) != 0)
-        .map(|bit| job_abbrev(bit as u8))
+        .filter_map(|bit| ffxi_proto::job_names::abbrev(bit as u16))
         .collect();
     if parts.is_empty() {
         "All".to_string()
@@ -134,46 +135,22 @@ fn format_jobs(jobs_mask: u32) -> String {
     }
 }
 
-fn job_abbrev(job_id: u8) -> String {
-    let s = match job_id {
-        1 => "WAR",
-        2 => "MNK",
-        3 => "WHM",
-        4 => "BLM",
-        5 => "RDM",
-        6 => "THF",
-        7 => "PLD",
-        8 => "DRK",
-        9 => "BST",
-        10 => "BRD",
-        11 => "RNG",
-        12 => "SAM",
-        13 => "NIN",
-        14 => "DRG",
-        15 => "SMN",
-        16 => "BLU",
-        17 => "COR",
-        18 => "PUP",
-        19 => "DNC",
-        20 => "SCH",
-        21 => "GEO",
-        22 => "RUN",
-        other => return format!("J{other}"),
-    };
-    s.to_string()
-}
-
 fn format_races(races_mask: u16) -> String {
-    if races_mask == 0 {
+    // The item DAT races field is 1-indexed by race id (bit 0 = race None):
+    // Hume M/F = bits 1/2, Elvaan M/F = 3/4, Taru M/F = 5/6, Mithra = 7, Galka = 8.
+    // Verified vs retail DAT: Mithran Gaiters = 0x0080 (bit 7), Galkan Sandals =
+    // 0x0100 (bit 8). "All races" is 0x01FE (bits 1..=8), not 0.
+    const ALL_RACES: u16 = 0x01FE;
+    if races_mask == 0 || races_mask & ALL_RACES == ALL_RACES {
         return "All".to_string();
     }
 
     const RACES: &[(u16, &str)] = &[
-        (0x0003, "Hume"),
-        (0x000C, "Elvaan"),
-        (0x0030, "Tarutaru"),
-        (0x0040, "Mithra"),
-        (0x0080, "Galka"),
+        (0x0006, "Hume"),
+        (0x0018, "Elvaan"),
+        (0x0060, "Tarutaru"),
+        (0x0080, "Mithra"),
+        (0x0100, "Galka"),
     ];
     let parts: Vec<&str> = RACES
         .iter()
@@ -643,9 +620,11 @@ mod tests {
     #[test]
     fn races_collapse_per_gender_bits() {
         assert_eq!(format_races(0), "All");
-
-        assert_eq!(format_races(0x0003), "Hume");
-        assert_eq!(format_races(0x0040), "Mithra");
+        assert_eq!(format_races(0x01FE), "All"); // all 8 race bits set
+                                                 // 1-indexed race ids: Hume M = bit 1, Mithra = bit 7, Galka = bit 8.
+        assert_eq!(format_races(0x0002), "Hume");
+        assert_eq!(format_races(0x0080), "Mithra"); // Mithran Gaiters, not Galka
+        assert_eq!(format_races(0x0100), "Galka");
     }
 
     #[test]

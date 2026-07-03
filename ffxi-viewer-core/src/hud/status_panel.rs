@@ -311,27 +311,11 @@ pub(crate) fn job_abbrev(job_id: u8) -> String {
     if job_id == 0 {
         return "---".to_string();
     }
-    match ffxi_proto::job_names::lookup(job_id as u16) {
-        Some(full) => abbreviate(full),
+    // Canonical 3-letter code from LSB (2 → "MNK"); truncating "Monk" gives "MON".
+    match ffxi_proto::job_names::abbrev(job_id as u16) {
+        Some(code) => code.to_string(),
         None => format!("J{job_id}"),
     }
-}
-
-fn abbreviate(full: &str) -> String {
-    let words: Vec<&str> = full.split_whitespace().collect();
-    let tag: String = if words.len() >= 2 {
-        let w0 = words[0];
-        if w0.len() >= 3 {
-            w0.chars().take(3).collect()
-        } else {
-            let mut s: String = w0.chars().collect();
-            s.extend(words[1].chars().take(3usize.saturating_sub(w0.len())));
-            s
-        }
-    } else {
-        full.chars().take(3).collect()
-    };
-    tag.to_uppercase()
 }
 
 fn attr_value(stats: &ffxi_viewer_wire::CharStats, attr_index: usize) -> Option<u16> {
@@ -416,19 +400,12 @@ mod tests {
     }
 
     #[test]
-    fn job_abbrev_basic() {
+    fn job_abbrev_uses_canonical_codes() {
         assert_eq!(job_abbrev(0), "---");
-        let war = job_abbrev(1);
-        assert_eq!(war.len(), 3, "abbreviation is three letters: {war}");
-        assert_eq!(war, war.to_uppercase());
-    }
-
-    #[test]
-    fn abbreviate_two_word_jobs() {
-        assert_eq!(abbreviate("Black Mage"), "BLA");
-        assert_eq!(abbreviate("Warrior"), "WAR");
-
-        assert_eq!(abbreviate("Red Mage"), "RED");
+        assert_eq!(job_abbrev(1), "WAR");
+        assert_eq!(job_abbrev(2), "MNK"); // not "MON"
+        assert_eq!(job_abbrev(3), "WHM"); // not "WHI"
+        assert_eq!(job_abbrev(4), "BLM"); // not "BLA"
     }
 
     #[test]

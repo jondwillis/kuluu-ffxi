@@ -651,16 +651,15 @@ fn role_value(
                 .copied()
                 .flatten()
                 .is_some();
-            // The label is the no-icon fallback; the icon updater hides it when
-            // an icon loads. Tint the selected slot's label with the cursor color.
+            // Only empty slots show the slot-name label. When an item is equipped
+            // its icon fills the cell; keeping the label would sit it beside the
+            // icon (row flex) and push the icon off-center.
             let color = if slot == selected_slot {
                 theme::CURSOR
-            } else if has_item {
-                theme::TEXT
             } else {
                 theme::MUTED
             };
-            (slot.abbr().to_string(), color, true)
+            (slot.abbr().to_string(), color, !has_item)
         }
         EquipRole::DetailName => (detail_name.to_string(), theme::TITLE, true),
         EquipRole::DetailRow(i) => match detail_rows.get(i) {

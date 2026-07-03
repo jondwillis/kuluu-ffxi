@@ -71,6 +71,17 @@ pub struct GraphicImage {
 }
 
 pub fn parse_graphic(bytes: &[u8]) -> Result<Option<(GraphicImage, usize)>> {
+    parse_graphic_inner(bytes, false)
+}
+
+/// Like [`parse_graphic`], but for item icons: 8bpp palettes carry FFXI
+/// half-range alpha (transparent background) even under the plain `0x91` Bitmap
+/// flag, so honor it instead of forcing everything opaque.
+pub fn parse_graphic_icon(bytes: &[u8]) -> Result<Option<(GraphicImage, usize)>> {
+    parse_graphic_inner(bytes, true)
+}
+
+fn parse_graphic_inner(bytes: &[u8], icon: bool) -> Result<Option<(GraphicImage, usize)>> {
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -124,14 +135,20 @@ pub fn parse_graphic(bytes: &[u8]) -> Result<Option<(GraphicImage, usize)>> {
             let (rgba, consumed) = if bit_count == 32 {
                 decode_packed_bgra32(&bytes[57..], width_u, height_u, top_down, compression)?
             } else {
-                let with_alpha = matches!(flag, GraphicFlag::AlphaBitmap);
+                let alpha = if icon {
+                    PaletteAlpha::HalfScaled
+                } else if matches!(flag, GraphicFlag::AlphaBitmap) {
+                    PaletteAlpha::Raw
+                } else {
+                    PaletteAlpha::Opaque
+                };
                 decode_paletted_bitmap(
                     &bytes[57..],
                     width_u,
                     height_u,
                     bit_count,
                     used_colors,
-                    with_alpha,
+                    alpha,
                     top_down,
                     compression,
                 )?
@@ -213,6 +230,19 @@ pub fn scan_graphics(bytes: &[u8]) -> impl Iterator<Item = GraphicImage> + '_ {
     })
 }
 
+// How to derive per-pixel alpha from an 8bpp palette entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteAlpha {
+    // Ignore palette alpha, everything opaque (general 0x91 bitmaps: maps, zones).
+    Opaque,
+    // Palette alpha as stored (0xB1 AlphaBitmap).
+    Raw,
+    // FFXI half-range alpha (0..=128, 128 = opaque) scaled to 0..=255. Item
+    // icons are flag 0x91 but their palette carries this: index 0 = A0
+    // (transparent background), art pixels = A128.
+    HalfScaled,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_paletted_bitmap(
     bytes: &[u8],
@@ -220,7 +250,7 @@ fn decode_paletted_bitmap(
     height: u32,
     bit_count: u16,
     used_colors: u32,
-    with_alpha: bool,
+    alpha: PaletteAlpha,
     top_down: bool,
     compression: u32,
 ) -> Result<(Vec<u8>, usize)> {
@@ -280,10 +310,11 @@ fn decode_paletted_bitmap(
             rgba[dst] = palette[pal_off + 2];
             rgba[dst + 1] = palette[pal_off + 1];
             rgba[dst + 2] = palette[pal_off];
-            rgba[dst + 3] = if with_alpha {
-                palette[pal_off + 3]
-            } else {
-                0xFF
+            let a = palette[pal_off + 3];
+            rgba[dst + 3] = match alpha {
+                PaletteAlpha::Opaque => 0xFF,
+                PaletteAlpha::Raw => a,
+                PaletteAlpha::HalfScaled => ((a as u16) * 2).min(255) as u8,
             };
         }
     }
