@@ -257,16 +257,12 @@ impl EventVm {
                     }
                     self.exec_pointer += 1;
                 }
-                // XiEvent ReqSet/GetReqStatus family: ask an actor to play a
-                // motion tag and wait for it to finish. This dialog-only VM has
-                // no actor choreography, so every request completes instantly —
-                // skip by documented size (research/XiEvents/OpCodes/0x0027.md
-                // through 0x002A.md). Sizes: 0x27/0x28/0x29 = 7, 0x2A = 6.
-                OP_REQSET | OP_REQSET_CHECKED | OP_REQSET_PRIORITY => {
-                    self.exec_pointer += 7;
-                }
-                OP_REQWAIT => {
-                    self.exec_pointer += 6;
+                // XiEvent ReqSet/GetReqStatus family (research/XiEvents/OpCodes/
+                // 0x0027.md–0x002A.md): actor-choreography sync points. This
+                // dialog-only VM has no actors to wait on, so they complete
+                // instantly; explicit arms because the fallback refuses sets_ret.
+                OP_REQSET | OP_REQSET_CHECKED | OP_REQSET_PRIORITY | OP_REQWAIT => {
+                    self.exec_pointer += OPCODE_META[op as usize].size as usize;
                 }
                 _ => {
                     let meta = OPCODE_META.get(op as usize).copied();
@@ -431,17 +427,18 @@ mod tests {
 
     #[test]
     fn reqset_family_skips_by_size_and_continues() {
-        // The ReqSet/GetReqStatus opcodes are actor-choreography sync points with
-        // no dialog effect; a stalled dialog script must step past them (size 7 for
-        // 0x27/0x28/0x29, size 6 for 0x2A) and reach END rather than Unimplemented.
         for (op, size) in [
             (OP_REQSET, 7usize),
             (OP_REQSET_CHECKED, 7),
             (OP_REQSET_PRIORITY, 7),
             (OP_REQWAIT, 6),
         ] {
+            assert_eq!(
+                OPCODE_META[op as usize].size as usize, size,
+                "op 0x{op:02X} size drifted from research/XiEvents/OpCodes"
+            );
             let mut data = vec![op];
-            data.extend(std::iter::repeat_n(0u8, size - 1)); // operand padding
+            data.extend(std::iter::repeat_n(0u8, size - 1));
             data.push(OP_END);
             let mut e = vm(data, vec![]);
             assert_eq!(

@@ -1284,10 +1284,11 @@ async fn keepalive_loop(
 
     let mut pending_event_end_since: Option<std::time::Instant> = None;
 
-    // Events the VM could not drive (unimplemented opcode / missing DAT):
-    // released immediately on the next send tick so the server never leaves the
-    // character pinned InEvent behind an empty dialog.
-    let mut auto_event_end: Vec<(u32, u16, u16)> = Vec::new();
+    // Events the VM produced no frame for (frameless completion, unimplemented
+    // opcode, missing DAT): EVENT_END goes out on the next send tick so the
+    // server doesn't hold the character InEvent behind an empty dialog.
+    // (unique_no, act_index, event_id, end_para).
+    let mut auto_event_end: Vec<(u32, u16, u16, u32)> = Vec::new();
 
     let mut dialog_session = crate::event_dialog::DialogSession::new(
         npc_name_resolver.root.clone(),
@@ -1864,13 +1865,11 @@ async fn keepalive_loop(
                         "sent 0x011 ZONE_TRANSITION after 0x008 ENTERZONE (GAMEOK mode)"
                     );
                 }
-                // VM-undriveable events release immediately, GUI or headless.
-                for (unique_no, act_index, event_num) in auto_event_end.drain(..) {
+                for (unique_no, act_index, event_num, end_para) in auto_event_end.drain(..) {
                     payload.extend(build_subpacket_event_end(
-                        sub_seq, unique_no, act_index, event_num, 0,
+                        sub_seq, unique_no, act_index, event_num, end_para,
                     ));
                     sub_seq = sub_seq.wrapping_add(1);
-                    let _ = event_tx.send(AgentEvent::EventEnded);
                 }
 
                 if (!user_driven_events || watchdog_fires) && !pending_event_end.is_empty() {
@@ -2020,9 +2019,8 @@ async fn keepalive_loop(
                                 enterzone_seen = true;
                             }
 
-                            // Drive event triggers (0x32/0x33/0x34) through the
-                            // event VM for faithful dialog; fall back to the raw
-                            // decoder in handle_sub_packet when no DAT can run it.
+                            // Event triggers (0x32/0x33/0x34) route through the
+                            // event VM, never the legacy raw dialog.
                             if matches!(
                                 sub.opcode,
                                 ffxi_proto::map::s2c::EVENT
@@ -2037,39 +2035,56 @@ async fn keepalive_loop(
                                             .lookup(unique_no)
                                             .map(|s| s.replace('_', " "))
                                     });
-                                    if let Some(dialog) = dialog_session.begin(
+                                    match dialog_session.begin(
                                         current_zone_id,
                                         unique_no,
                                         act_index,
                                         event_id,
                                         name,
                                     ) {
-                                        let _ = event_tx.send(AgentEvent::EventStart {
-                                            event_id: dialog.event_id,
-                                        });
-                                        emit_event_speech_to_chat(&event_tx, &dialog);
-                                        let _ = event_tx
-                                            .send(AgentEvent::EventDialog { dialog });
-                                        pending_event_end.push((
-                                            unique_no, act_index, event_id,
-                                        ));
-                                        continue;
+                                        crate::event_dialog::Begin::Frame(dialog) => {
+                                            let _ = event_tx.send(AgentEvent::EventStart {
+                                                event_id: dialog.event_id,
+                                            });
+                                            emit_event_speech_to_chat(&event_tx, &dialog);
+                                            let _ = event_tx
+                                                .send(AgentEvent::EventDialog { dialog });
+                                            pending_event_end.push((
+                                                unique_no, act_index, event_id,
+                                            ));
+                                        }
+                                        crate::event_dialog::Begin::Ended { end_para } => {
+                                            auto_event_end.push((
+                                                unique_no, act_index, event_id, end_para,
+                                            ));
+                                        }
+                                        crate::event_dialog::Begin::Undriveable {
+                                            stopped_op,
+                                        } => {
+                                            tracing::warn!(
+                                                zone = current_zone_id,
+                                                unique_no,
+                                                act_index,
+                                                event_id,
+                                                stopped_op =
+                                                    ?stopped_op.map(|op| format!("0x{op:02X}")),
+                                                "auto-releasing VM-undriveable event"
+                                            );
+                                            auto_event_end.push((
+                                                unique_no, act_index, event_id, 0,
+                                            ));
+                                            let _ = event_tx.send(AgentEvent::ChatLine {
+                                                line: ChatLine {
+                                                    channel: ChatChannel::System,
+                                                    sender: "client".into(),
+                                                    text: format!(
+                                                        "[event] cutscene {event_id} auto-skipped (not yet supported)"
+                                                    ),
+                                                    server_ts: 0,
+                                                },
+                                            });
+                                        }
                                     }
-
-                                    // The VM can't drive this event. Never show an
-                                    // empty locked dialog — release it right away
-                                    // and tell the player what was skipped.
-                                    auto_event_end.push((unique_no, act_index, event_id));
-                                    let _ = event_tx.send(AgentEvent::ChatLine {
-                                        line: ChatLine {
-                                            channel: ChatChannel::System,
-                                            sender: "client".into(),
-                                            text: format!(
-                                                "[event] cutscene {event_id} auto-skipped (not yet supported)"
-                                            ),
-                                            server_ts: 0,
-                                        },
-                                    });
                                     continue;
                                 }
                             }
