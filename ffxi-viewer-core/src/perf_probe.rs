@@ -4,6 +4,9 @@ use std::time::Duration;
 static MODEL_LOADS: AtomicU64 = AtomicU64::new(0);
 static NAMEPLATE_RASTERS: AtomicU64 = AtomicU64::new(0);
 static DEBUG_PROBE_NS: AtomicU64 = AtomicU64::new(0);
+static RENDER_PREP_NS: AtomicU64 = AtomicU64::new(0);
+static RENDER_GRAPH_NS: AtomicU64 = AtomicU64::new(0);
+static RENDER_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 
 pub fn note_model_load() {
     MODEL_LOADS.fetch_add(1, Ordering::Relaxed);
@@ -27,4 +30,28 @@ pub fn nameplate_rasters() -> u64 {
 
 pub fn debug_probe_ns() -> u64 {
     DEBUG_PROBE_NS.load(Ordering::Relaxed)
+}
+
+pub fn note_render_prep(elapsed: Duration) {
+    RENDER_PREP_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
+
+pub fn note_render_graph(elapsed: Duration) {
+    RENDER_GRAPH_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
+
+pub fn note_render_total(elapsed: Duration) {
+    RENDER_TOTAL_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
+
+pub fn render_prep_ns() -> u64 {
+    RENDER_PREP_NS.load(Ordering::Relaxed)
+}
+
+pub fn render_graph_ns() -> u64 {
+    RENDER_GRAPH_NS.load(Ordering::Relaxed)
+}
+
+pub fn render_total_ns() -> u64 {
+    RENDER_TOTAL_NS.load(Ordering::Relaxed)
 }

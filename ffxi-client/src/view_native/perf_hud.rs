@@ -14,6 +14,7 @@ const GRAPH_MAX_MS: f32 = 60.0;
 const TARGET_MS: f32 = 1000.0 / 60.0;
 const FONT: f32 = 12.0;
 const LOG_COOLDOWN_S: f32 = 1.0;
+const SUMMARY_PERIOD_S: f32 = 5.0;
 
 const GRAPH_BG: Color = Color::srgb(0.08, 0.08, 0.10);
 
@@ -50,21 +51,42 @@ pub struct PerfMonitor {
     prev_nameplate_rasters: u64,
     prev_rebuilds: u64,
     prev_probe_ns: u64,
+    prev_rprep_ns: u64,
+    prev_rgraph_ns: u64,
+    prev_rtotal_ns: u64,
     rebuild_rate: f32,
 
     last_d_model: u64,
     last_d_rasters: u64,
     last_d_rebuilds: u64,
     last_d_probe_us: u64,
+    last_d_rprep_us: u64,
+    last_d_rgraph_us: u64,
+    last_d_rtotal_us: u64,
 
     spike_model_loads: u64,
     spike_nameplate_rasters: u64,
     spike_rebuilt: bool,
     spike_rebuild_us: u64,
     spike_probe_us: u64,
+    spike_rprep_us: u64,
+    spike_rgraph_us: u64,
+    spike_rtotal_us: u64,
+
+    prev_churn: [u64; 6],
+    last_d_churn: [u64; 6],
+    spike_churn: [u64; 6],
+    summary_churn: [u64; 6],
 
     log_cooldown_s: f32,
     suppressed: u32,
+
+    summary_s: f32,
+    summary_frames: u32,
+    summary_max_ms: f32,
+    summary_max_rprep_us: u64,
+    summary_max_rgraph_us: u64,
+    summary_max_rtotal_us: u64,
 }
 
 impl Default for PerfMonitor {
@@ -88,20 +110,86 @@ impl Default for PerfMonitor {
             prev_nameplate_rasters: 0,
             prev_rebuilds: 0,
             prev_probe_ns: 0,
+            prev_rprep_ns: 0,
+            prev_rgraph_ns: 0,
+            prev_rtotal_ns: 0,
             rebuild_rate: 0.0,
             last_d_model: 0,
             last_d_rasters: 0,
             last_d_rebuilds: 0,
             last_d_probe_us: 0,
+            last_d_rprep_us: 0,
+            last_d_rgraph_us: 0,
+            last_d_rtotal_us: 0,
             spike_model_loads: 0,
             spike_nameplate_rasters: 0,
             spike_rebuilt: false,
             spike_rebuild_us: 0,
             spike_probe_us: 0,
+            spike_rprep_us: 0,
+            spike_rgraph_us: 0,
+            spike_rtotal_us: 0,
+            prev_churn: [0; 6],
+            last_d_churn: [0; 6],
+            spike_churn: [0; 6],
+            summary_churn: [0; 6],
             log_cooldown_s: 0.0,
             suppressed: 0,
+            summary_s: 0.0,
+            summary_frames: 0,
+            summary_max_ms: 0.0,
+            summary_max_rprep_us: 0,
+            summary_max_rgraph_us: 0,
+            summary_max_rtotal_us: 0,
         }
     }
+}
+
+#[derive(Resource, Default)]
+pub struct AssetChurn {
+    images: u64,
+    image_bytes: u64,
+    meshes: u64,
+    std_mats: u64,
+    zone_mats: u64,
+    skinned_mats: u64,
+}
+
+pub fn track_asset_churn(
+    mut churn: ResMut<AssetChurn>,
+    mut img_ev: MessageReader<AssetEvent<Image>>,
+    mut mesh_ev: MessageReader<AssetEvent<Mesh>>,
+    mut std_ev: MessageReader<AssetEvent<StandardMaterial>>,
+    mut zone_ev: MessageReader<AssetEvent<ffxi_viewer_core::ffxi_zone_material::FfxiZoneMaterial>>,
+    mut skin_ev: MessageReader<
+        AssetEvent<ffxi_viewer_core::skinned_ffxi_material::FfxiSkinnedMaterial>,
+    >,
+    images: Res<Assets<Image>>,
+) {
+    for ev in img_ev.read() {
+        if let AssetEvent::Added { id } | AssetEvent::Modified { id } = ev {
+            churn.images += 1;
+            if let Some(img) = images.get(*id) {
+                churn.image_bytes += img.data.as_ref().map_or(0, Vec::len) as u64;
+            }
+        }
+    }
+    churn.meshes += mesh_ev
+        .read()
+        .filter(|e| matches!(e, AssetEvent::Added { .. } | AssetEvent::Modified { .. }))
+        .count() as u64;
+    churn.std_mats += std_ev
+        .read()
+        .filter(|e| matches!(e, AssetEvent::Added { .. } | AssetEvent::Modified { .. }))
+        .count() as u64;
+    churn.zone_mats += zone_ev
+        .read()
+        .filter(|e| matches!(e, AssetEvent::Added { .. } | AssetEvent::Modified { .. }))
+        .count() as u64;
+    churn.skinned_mats += skin_ev
+        .read()
+        .filter(|e| matches!(e, AssetEvent::Added { .. } | AssetEvent::Modified { .. }))
+        .count() as u64;
 }
 
 pub fn mark_frame_start(mut m: ResMut<PerfMonitor>) {
@@ -150,6 +238,7 @@ pub fn update_perf_monitor(
     time: Res<Time<Real>>,
     source: Res<NativeSource>,
     diag: Res<DiagnosticsStore>,
+    churn: Res<AssetChurn>,
     mut m: ResMut<PerfMonitor>,
 ) {
     let dt = time.delta_secs();
@@ -170,15 +259,75 @@ pub fn update_perf_monitor(
     let rasters = perf_probe::nameplate_rasters();
     let rebuilds = source.rebuilds_total;
     let probe_ns = perf_probe::debug_probe_ns();
+    let rprep_ns = perf_probe::render_prep_ns();
+    let rgraph_ns = perf_probe::render_graph_ns();
+    let rtotal_ns = perf_probe::render_total_ns();
     let d_model = model.wrapping_sub(m.prev_model_loads);
     let d_rasters = rasters.wrapping_sub(m.prev_nameplate_rasters);
     let d_rebuilds = rebuilds.wrapping_sub(m.prev_rebuilds);
     let d_probe_us = probe_ns.wrapping_sub(m.prev_probe_ns) / 1000;
+    let d_rprep_us = rprep_ns.wrapping_sub(m.prev_rprep_ns) / 1000;
+    let d_rgraph_us = rgraph_ns.wrapping_sub(m.prev_rgraph_ns) / 1000;
+    let d_rtotal_us = rtotal_ns.wrapping_sub(m.prev_rtotal_ns) / 1000;
     m.prev_model_loads = model;
     m.prev_nameplate_rasters = rasters;
     m.prev_rebuilds = rebuilds;
     m.prev_probe_ns = probe_ns;
+    m.prev_rprep_ns = rprep_ns;
+    m.prev_rgraph_ns = rgraph_ns;
+    m.prev_rtotal_ns = rtotal_ns;
     m.rebuild_rate = m.rebuild_rate * 0.9 + (d_rebuilds as f32 / dt) * 0.1;
+
+    let churn_now = [
+        churn.images,
+        churn.image_bytes,
+        churn.meshes,
+        churn.std_mats,
+        churn.zone_mats,
+        churn.skinned_mats,
+    ];
+    let mut d_churn = [0u64; 6];
+    let mut w_churn = [0u64; 6];
+    for i in 0..6 {
+        d_churn[i] = churn_now[i].wrapping_sub(m.prev_churn[i]);
+        w_churn[i] = d_churn[i] + m.last_d_churn[i];
+        m.summary_churn[i] += d_churn[i];
+    }
+    m.prev_churn = churn_now;
+    m.last_d_churn = d_churn;
+
+    m.summary_s += dt;
+    m.summary_frames += 1;
+    m.summary_max_ms = m.summary_max_ms.max(dt_ms);
+    m.summary_max_rprep_us = m.summary_max_rprep_us.max(d_rprep_us);
+    m.summary_max_rgraph_us = m.summary_max_rgraph_us.max(d_rgraph_us);
+    m.summary_max_rtotal_us = m.summary_max_rtotal_us.max(d_rtotal_us);
+    if m.summary_s >= SUMMARY_PERIOD_S {
+        let avg_fps = m.summary_frames as f32 / m.summary_s;
+        info!(
+            target: "perf",
+            "summary {avg_fps:.1}fps baseline {:.1}ms max {:.1}ms spikes {} | max rprep {}\u{00b5}s rgraph {}\u{00b5}s rtotal {}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}",
+            m.baseline_ms,
+            m.summary_max_ms,
+            m.spikes_total,
+            m.summary_max_rprep_us,
+            m.summary_max_rgraph_us,
+            m.summary_max_rtotal_us,
+            m.summary_churn[0],
+            m.summary_churn[1] / 1024,
+            m.summary_churn[2],
+            m.summary_churn[3],
+            m.summary_churn[4],
+            m.summary_churn[5],
+        );
+        m.summary_s = 0.0;
+        m.summary_frames = 0;
+        m.summary_max_ms = 0.0;
+        m.summary_max_rprep_us = 0;
+        m.summary_max_rgraph_us = 0;
+        m.summary_max_rtotal_us = 0;
+        m.summary_churn = [0; 6];
+    }
 
     // `Time` delta is sampled at frame start but the counters here are read mid-Update, so a
     // spike's cause can land one frame either side of its measured duration; sum a two-frame
@@ -187,10 +336,16 @@ pub fn update_perf_monitor(
     let w_rasters = d_rasters + m.last_d_rasters;
     let w_rebuilds = d_rebuilds + m.last_d_rebuilds;
     let w_probe_us = d_probe_us + m.last_d_probe_us;
+    let w_rprep_us = d_rprep_us + m.last_d_rprep_us;
+    let w_rgraph_us = d_rgraph_us + m.last_d_rgraph_us;
+    let w_rtotal_us = d_rtotal_us + m.last_d_rtotal_us;
     m.last_d_model = d_model;
     m.last_d_rasters = d_rasters;
     m.last_d_rebuilds = d_rebuilds;
     m.last_d_probe_us = d_probe_us;
+    m.last_d_rprep_us = d_rprep_us;
+    m.last_d_rgraph_us = d_rgraph_us;
+    m.last_d_rtotal_us = d_rtotal_us;
 
     if !m.seen_first {
         m.baseline_ms = dt_ms;
@@ -220,6 +375,10 @@ pub fn update_perf_monitor(
     m.spike_rebuilt = w_rebuilds > 0;
     m.spike_rebuild_us = source.last_rebuild_us;
     m.spike_probe_us = w_probe_us;
+    m.spike_rprep_us = w_rprep_us;
+    m.spike_rgraph_us = w_rgraph_us;
+    m.spike_rtotal_us = w_rtotal_us;
+    m.spike_churn = w_churn;
     m.spike_cpu_us = cpu_us;
     m.spike_main_us = m.last_main_us;
     m.secs_since_spike = 0.0;
@@ -248,10 +407,16 @@ pub fn update_perf_monitor(
     let render_spans = top_render_spans(&diag);
     warn!(
         target: "perf",
-        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s late {late_us}\u{00b5}s render~{render_us}\u{00b5}s | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s{extra}{render_spans}",
+        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s late {late_us}\u{00b5}s render~{render_us}\u{00b5}s [rprep {w_rprep_us}\u{00b5}s rgraph {w_rgraph_us}\u{00b5}s rtotal {w_rtotal_us}\u{00b5}s] | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}{extra}{render_spans}",
         m.baseline_ms,
         dt_ms - m.baseline_ms,
         cpu_us,
+        m.spike_churn[0],
+        m.spike_churn[1] / 1024,
+        m.spike_churn[2],
+        m.spike_churn[3],
+        m.spike_churn[4],
+        m.spike_churn[5],
     );
 }
 
@@ -428,10 +593,13 @@ fn build_text_lines(
     let main_us = m.spike_main_us.min(frame_us);
     let split = (
         format!(
-            "spike split: cpu {}\u{00b5}s  late {}\u{00b5}s  render~{}\u{00b5}s",
+            "spike split: cpu {}\u{00b5}s  late {}\u{00b5}s  render~{}\u{00b5}s  (rp {} rg {} rt {})",
             m.spike_cpu_us,
             main_us.saturating_sub(m.spike_cpu_us),
             frame_us.saturating_sub(main_us),
+            m.spike_rprep_us,
+            m.spike_rgraph_us,
+            m.spike_rtotal_us,
         ),
         palette::TEXT,
     );

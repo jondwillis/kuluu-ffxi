@@ -81,6 +81,41 @@ fn log_pipeline_compiles(
     *prev_ready = ready;
 }
 
+// The perf HUD's cpu/late marks stop at the main app's Last schedule; these three fences split the
+// remaining render-sub-app time into prep (extract→pre-graph, includes swapchain acquire), graph
+// (encode+submit+present), and total (through PostCleanup; total−prep−graph ≈ framepace sleep,
+// which bevy_framepace runs in RenderSystems::Cleanup).
+#[derive(Resource, Default)]
+struct RenderSpanStamp {
+    begin: Option<std::time::Instant>,
+    prep_done: Option<std::time::Instant>,
+}
+
+fn stamp_render_begin(mut s: ResMut<RenderSpanStamp>) {
+    s.begin = Some(std::time::Instant::now());
+    s.prep_done = None;
+}
+
+fn stamp_render_prep_done(mut s: ResMut<RenderSpanStamp>) {
+    if let Some(begin) = s.begin {
+        let now = std::time::Instant::now();
+        ffxi_viewer_core::perf_probe::note_render_prep(now - begin);
+        s.prep_done = Some(now);
+    }
+}
+
+fn stamp_render_graph_done(s: Res<RenderSpanStamp>) {
+    if let Some(prep_done) = s.prep_done {
+        ffxi_viewer_core::perf_probe::note_render_graph(prep_done.elapsed());
+    }
+}
+
+fn stamp_render_total(s: Res<RenderSpanStamp>) {
+    if let Some(begin) = s.begin {
+        ffxi_viewer_core::perf_probe::note_render_total(begin.elapsed());
+    }
+}
+
 fn gpu_timing_render_plugin() -> bevy::render::RenderPlugin {
     use bevy::render::settings::{RenderCreation, WgpuFeatures, WgpuSettings};
     let mut settings = WgpuSettings::default();
@@ -199,11 +234,33 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         }
     }
 
+    if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+        use bevy::render::{Render, RenderSystems};
+        render_app.init_resource::<RenderSpanStamp>();
+        render_app.add_systems(bevy::render::ExtractSchedule, stamp_render_begin);
+        render_app.add_systems(
+            Render,
+            (
+                stamp_render_prep_done
+                    .after(RenderSystems::Prepare)
+                    .before(RenderSystems::Render),
+                stamp_render_graph_done
+                    .after(RenderSystems::Render)
+                    .before(RenderSystems::Cleanup),
+                stamp_render_total.in_set(RenderSystems::PostCleanup),
+            ),
+        );
+    }
+
     app.add_systems(Startup, configure_gizmo_render_layer);
 
     app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
 
-    app.add_plugins(bevy_framepace::FramepacePlugin);
+    // FFXI_NO_FRAMEPACE bisects pacing-induced stutter: if a periodic hitch vanishes without the
+    // limiter, the cause is framepace's sleep interacting with vsync, not render work.
+    if std::env::var_os("FFXI_NO_FRAMEPACE").is_none() {
+        app.add_plugins(bevy_framepace::FramepacePlugin);
+    }
 
     app.add_plugins(bevy::feathers::FeathersPlugins)
         .insert_resource(bevy::feathers::theme::UiTheme(
@@ -264,6 +321,13 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
     add_hud_spawners(&mut app, OnEnter(AppPhase::InGame));
     app.init_resource::<perf_hud::PerfMonitor>();
+    app.init_resource::<perf_hud::AssetChurn>();
+    app.add_systems(
+        Update,
+        perf_hud::track_asset_churn
+            .before(perf_hud::update_perf_monitor)
+            .run_if(in_state(AppPhase::InGame)),
+    );
     app.add_systems(
         OnEnter(AppPhase::InGame),
         (
