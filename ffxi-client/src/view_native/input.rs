@@ -409,8 +409,7 @@ pub fn dispatch_movement_system(
     let rest_stance = &mut stance.rest_stance;
     let walk_mode = &stance.walk_mode;
     let move_intent = &mut stance.move_intent;
-    // Cleared every tick; the movement branch below re-asserts it while keys
-    // are actually held, so every early return reads as "stopped".
+    // Default to stopped so every early return below reports no movement.
     **move_intent = ffxi_viewer_core::combat_stance::SelfMoveIntent::default();
 
     if matches!(*mode, InputMode::Chat(_) | InputMode::Dialog(_)) {
@@ -648,8 +647,6 @@ pub fn dispatch_movement_system(
 
     **move_intent = ffxi_viewer_core::combat_stance::SelfMoveIntent {
         moving: forward != 0 || strafe != 0 || turn_in_chase,
-        forward: forward.signum() as i8,
-        strafe: strafe.signum() as i8,
     };
 
     let mut heading = self_pos.heading;

@@ -1889,6 +1889,10 @@ pub fn tick_live_ffxi_actors(
         state.snapshot.current_goal,
         Some(ffxi_viewer_wire::ReactorGoal::Engaged { .. })
     );
+    let self_reactor_driven = !matches!(
+        state.snapshot.current_goal,
+        None | Some(ffxi_viewer_wire::ReactorGoal::Idle)
+    );
 
     let zone = state.snapshot.zone_id;
     let zone_changed = matches!(*prev_zone, Some(p) if p != zone);
@@ -2034,10 +2038,7 @@ pub fn tick_live_ffxi_actors(
 
         actor.facing_dir = 0.0;
         actor.inputs = ActorAnimInputs {
-            // Self motion comes from real input intent: the prediction
-            // reconcile nudges the rendered transform enough to keep inferred
-            // speed above MOVE_EXIT, which held the run cycle after stopping.
-            moving: if is_self {
+            moving: if is_self && !self_reactor_driven {
                 self_move.moving
             } else {
                 motion.is_moving(world_id)
