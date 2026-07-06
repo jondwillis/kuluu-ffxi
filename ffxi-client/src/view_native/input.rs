@@ -7,6 +7,13 @@ use bevy::prelude::*;
 use bevy::window::WindowCloseRequested;
 
 #[derive(SystemParam)]
+pub struct StanceParams<'w> {
+    pub rest_stance: ResMut<'w, ffxi_viewer_core::combat_stance::RestStance>,
+    pub walk_mode: Res<'w, ffxi_viewer_core::combat_stance::WalkMode>,
+    pub move_intent: ResMut<'w, ffxi_viewer_core::combat_stance::SelfMoveIntent>,
+}
+
+#[derive(SystemParam)]
 pub struct CameraInputParams<'w> {
     pub mode: ResMut<'w, CameraMode>,
     pub chase: ResMut<'w, ChaseCamera>,
@@ -397,9 +404,15 @@ pub fn dispatch_movement_system(
     mut prediction: ResMut<LocalPlayerPrediction>,
     navmesh: Res<super::navmesh_overlay::NavmeshState>,
     minimap_hover: Res<ffxi_viewer_core::minimap::input::MinimapHoverGate>,
-    mut rest_stance: ResMut<ffxi_viewer_core::combat_stance::RestStance>,
-    walk_mode: Res<ffxi_viewer_core::combat_stance::WalkMode>,
+    mut stance: StanceParams,
 ) {
+    let rest_stance = &mut stance.rest_stance;
+    let walk_mode = &stance.walk_mode;
+    let move_intent = &mut stance.move_intent;
+    // Cleared every tick; the movement branch below re-asserts it while keys
+    // are actually held, so every early return reads as "stopped".
+    **move_intent = ffxi_viewer_core::combat_stance::SelfMoveIntent::default();
+
     if matches!(*mode, InputMode::Chat(_) | InputMode::Dialog(_)) {
         autorun.phantom_forward = false;
         autorun.strafe_held_since = None;
@@ -632,6 +645,12 @@ pub fn dispatch_movement_system(
         }
         return;
     }
+
+    **move_intent = ffxi_viewer_core::combat_stance::SelfMoveIntent {
+        moving: forward != 0 || strafe != 0 || turn_in_chase,
+        forward: forward.signum() as i8,
+        strafe: strafe.signum() as i8,
+    };
 
     let mut heading = self_pos.heading;
     if forward != 0 {

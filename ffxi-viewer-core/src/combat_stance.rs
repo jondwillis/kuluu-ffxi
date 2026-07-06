@@ -137,6 +137,20 @@ impl WalkMode {
     }
 }
 
+/// The self character's movement input this tick, written by the client's
+/// movement dispatch. The self pose reads this instead of inferring motion from
+/// transform deltas: prediction reconcile keeps nudging the rendered transform,
+/// so inferred speed can hover above `MOVE_EXIT` and hold the run cycle after
+/// the keys are released.
+#[derive(Resource, Default, Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SelfMoveIntent {
+    pub moving: bool,
+    /// -1 backpedal, 0 none, 1 forward.
+    pub forward: i8,
+    /// -1 left, 0 none, 1 right.
+    pub strafe: i8,
+}
+
 pub fn directional_anim_for_skel(skel_file_id: u32, prefix: &[u8; 3]) -> Option<Arc<Mo2Animation>> {
     let map = DIRECTIONAL_ANIMS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().ok()?;

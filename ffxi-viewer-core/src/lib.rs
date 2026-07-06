@@ -312,6 +312,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
         app.init_resource::<combat_stance::RestStance>();
         app.init_resource::<combat_stance::AnimationBlends>();
         app.init_resource::<combat_stance::WalkMode>();
+        app.init_resource::<combat_stance::SelfMoveIntent>();
         app.init_resource::<camera::CameraTransition>();
 
         #[cfg(not(target_arch = "wasm32"))]

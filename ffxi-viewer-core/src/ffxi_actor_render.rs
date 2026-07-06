@@ -1853,6 +1853,7 @@ pub fn tick_live_ffxi_actors(
     motion: Res<combat_stance::EntityMotion>,
     rest: Res<combat_stance::RestStance>,
     walk_mode: Res<combat_stance::WalkMode>,
+    self_move: Res<combat_stance::SelfMoveIntent>,
     mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
     target: Res<crate::scene::Target>,
     mut q_actors: Query<(&mut FfxiRenderActor, &GlobalTransform)>,
@@ -2033,7 +2034,14 @@ pub fn tick_live_ffxi_actors(
 
         actor.facing_dir = 0.0;
         actor.inputs = ActorAnimInputs {
-            moving: motion.is_moving(world_id),
+            // Self motion comes from real input intent: the prediction
+            // reconcile nudges the rendered transform enough to keep inferred
+            // speed above MOVE_EXIT, which held the run cycle after stopping.
+            moving: if is_self {
+                self_move.moving
+            } else {
+                motion.is_moving(world_id)
+            },
             walking,
             forward_vel,
             strafe_vel,
