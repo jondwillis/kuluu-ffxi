@@ -1281,6 +1281,11 @@ async fn keepalive_loop(
 
     let mut pending_event_end_since: Option<std::time::Instant> = None;
 
+    // Events the VM could not drive (unimplemented opcode / missing DAT):
+    // released immediately on the next send tick so the server never leaves the
+    // character pinned InEvent behind an empty dialog.
+    let mut auto_event_end: Vec<(u32, u16, u16)> = Vec::new();
+
     let mut dialog_session = crate::event_dialog::DialogSession::new(
         npc_name_resolver.root.clone(),
         character_name.clone(),
@@ -1856,6 +1861,15 @@ async fn keepalive_loop(
                         "sent 0x011 ZONE_TRANSITION after 0x008 ENTERZONE (GAMEOK mode)"
                     );
                 }
+                // VM-undriveable events release immediately, GUI or headless.
+                for (unique_no, act_index, event_num) in auto_event_end.drain(..) {
+                    payload.extend(build_subpacket_event_end(
+                        sub_seq, unique_no, act_index, event_num, 0,
+                    ));
+                    sub_seq = sub_seq.wrapping_add(1);
+                    let _ = event_tx.send(AgentEvent::EventEnded);
+                }
+
                 if (!user_driven_events || watchdog_fires) && !pending_event_end.is_empty() {
                     for (unique_no, act_index, event_num) in pending_event_end.drain(..) {
                         payload.extend(build_subpacket_event_end(
@@ -2038,6 +2052,22 @@ async fn keepalive_loop(
                                         ));
                                         continue;
                                     }
+
+                                    // The VM can't drive this event. Never show an
+                                    // empty locked dialog — release it right away
+                                    // and tell the player what was skipped.
+                                    auto_event_end.push((unique_no, act_index, event_id));
+                                    let _ = event_tx.send(AgentEvent::ChatLine {
+                                        line: ChatLine {
+                                            channel: ChatChannel::System,
+                                            sender: "client".into(),
+                                            text: format!(
+                                                "[event] cutscene {event_id} auto-skipped (not yet supported)"
+                                            ),
+                                            server_ts: 0,
+                                        },
+                                    });
+                                    continue;
                                 }
                             }
 
