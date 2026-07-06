@@ -319,7 +319,7 @@ impl Material for FfxiSkinnedMaterial {
     }
 }
 
-fn write_uniform<T: ShaderType + encase::internal::WriteInto>(
+pub(crate) fn write_uniform<T: ShaderType + encase::internal::WriteInto>(
     queue: &RenderQueue,
     buffer: &Buffer,
     value: &T,

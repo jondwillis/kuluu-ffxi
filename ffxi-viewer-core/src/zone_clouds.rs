@@ -343,16 +343,15 @@ fn id_str(id: [u8; 4]) -> String {
 // sky dome so they use AlphaMode::Blend with the texture's own alpha.
 fn cloud_material(texture: Option<Handle<Image>>) -> FfxiZoneMaterial {
     let has_texture = if texture.is_some() { 1.0 } else { 0.0 };
-    FfxiZoneMaterial {
-        lighting: crate::skinned_ffxi_material::FfxiLightingUniform::default(),
-        base_color_texture: texture,
-        material_flags: crate::skinned_ffxi_material::FfxiMaterialFlags {
+    FfxiZoneMaterial::new(
+        texture,
+        crate::skinned_ffxi_material::FfxiMaterialFlags {
             flags: Vec4::new(has_texture, 1.0, 0.0, 0.0),
         },
-        tint: Vec4::ONE,
-        uv_offset: Vec4::ZERO,
-        alpha_mode: AlphaMode::Blend,
-    }
+        Vec4::ONE,
+        Vec4::ZERO,
+        AlphaMode::Blend,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -496,7 +495,10 @@ fn drive_zone_clouds(
             continue;
         }
 
-        if let Some(material) = materials.get_mut(&mat.0) {
+        // get_mut_untracked: tint/uv flow to the GPU through the persistent
+        // buffers in upload_zone_material_buffers; marking the asset Modified
+        // here would needlessly rebuild its bind group every frame.
+        if let Some(material) = materials.get_mut_untracked(&mat.0) {
             let mut tint = layer.tracks.sample(day_fraction);
             tint.w *= fade.alpha() * layer.max_alpha;
             material.tint = tint;
@@ -647,6 +649,7 @@ fn drive_zone_stars(
         With<StarDome>,
     >,
     mut prev_visible: Local<Option<bool>>,
+    mut prev_night: Local<Option<f32>>,
 ) {
     // iter_mut, not single_mut: the InGame lifecycle can leave orphaned StarDome
     // entities (OnExit bulk-despawn races the rebuild), and single_mut() silently
@@ -677,6 +680,14 @@ fn drive_zone_stars(
         *prev_visible = Some(night > 0.0);
     }
 
+    // Sub-8-bit brightness steps are invisible; skipping them keeps the per-frame
+    // StandardMaterial Modified churn (bind-group rebuilds) out of the twilight fade.
+    const STAR_NIGHT_STEP: f32 = 1.0 / 255.0;
+    let write_night = prev_night.is_none_or(|p| (night - p).abs() >= STAR_NIGHT_STEP);
+    if write_night {
+        *prev_night = Some(night);
+    }
+
     // One slow celestial roll per Vana day.
     let frac = crate::hud::vana_clock::full_day_fraction(vana_clock.earth_unix_secs_now());
     for (mut xf, mut vis, mat) in stars.iter_mut() {
@@ -687,8 +698,10 @@ fn drive_zone_stars(
         xf.translation = cam_pos;
         xf.rotation = Quat::from_rotation_y(frac * std::f32::consts::TAU) * ffxi_to_bevy_basis();
         xf.scale = scale;
-        if let Some(m) = materials.get_mut(&mat.0) {
-            m.base_color = Color::linear_rgb(night, night, night);
+        if write_night {
+            if let Some(m) = materials.get_mut(&mat.0) {
+                m.base_color = Color::linear_rgb(night, night, night);
+            }
         }
     }
 }

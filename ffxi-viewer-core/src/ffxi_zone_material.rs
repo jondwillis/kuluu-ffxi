@@ -1,47 +1,265 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use bevy::asset::embedded_asset;
+use bevy::ecs::system::lifetimeless::SRes;
+use bevy::ecs::system::SystemParamItem;
 use bevy::mesh::{Mesh, MeshVertexBufferLayoutRef};
 use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin};
 use bevy::prelude::*;
+use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::{
-    AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    AsBindGroup, AsBindGroupError, BindGroupLayout, BindGroupLayoutEntry, BindingResources,
+    BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages, OwnedBindingResource,
+    RenderPipelineDescriptor, SamplerBindingType, ShaderStages, ShaderType,
+    SpecializedMeshPipelineError, TextureSampleType, TextureViewDimension, UnpreparedBindGroup,
 };
+use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::render::texture::{FallbackImage, GpuImage};
+use bevy::render::{Extract, ExtractSchedule, RenderApp};
 use bevy::shader::ShaderRef;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::skinned_ffxi_material::{FfxiLightingUniform, FfxiMaterialFlags};
+use crate::skinned_ffxi_material::{write_uniform, FfxiLightingUniform, FfxiMaterialFlags};
 
-// Cranelift's dev codegen backend can't lower the Vec4 horizontal-max NEON
-// intrinsic (`fmaxnmv.f32.v4f32`) that `Vec4::max_element()` emits, so reduce
-// component-wise with scalar `f32::max` (cranelift issue #171).
-fn vec4_max_element(v: Vec4) -> f32 {
-    v.x.max(v.y).max(v.z).max(v.w)
-}
+static NEXT_ZONE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Asset, AsBindGroup, TypePath, Clone, Debug)]
+/// Zone lighting is identical for every zone submesh, so it lives in ONE
+/// persistent GPU buffer shared by all zone-material bind groups
+/// ([`ZoneMaterialBuffers::lighting`]) and is refreshed by `write_buffer`, never
+/// by touching the material assets. The previous design gave each of the
+/// hundreds of per-submesh materials its own lighting uniform and pushed
+/// updates via `Assets::iter_mut()`, which flagged every material Modified the
+/// moment the Vana'diel sun crept past an epsilon — a full bind-group rebuild
+/// wave (~45ms) every ~0.9s, the visible periodic frame hitch.
+#[derive(Resource, Clone, Default)]
+pub struct ZoneGlobalLighting(pub FfxiLightingUniform);
+
+#[derive(Asset, TypePath, Clone, Debug)]
 pub struct FfxiZoneMaterial {
-    #[uniform(0)]
-    pub lighting: FfxiLightingUniform,
-    #[texture(1)]
-    #[sampler(2)]
     pub base_color_texture: Option<Handle<Image>>,
-    #[uniform(3)]
     pub material_flags: FfxiMaterialFlags,
 
     // research/xim ParticleGeneratorParser.kt:431-434 ToD color: a per-mesh RGB(setter) +
     // alpha(multiplier) the weat/<type>/ ClockValueUpdaters drive over the Vana day. Folded
     // as a final modulate in the fragment shader. White (1,1,1,1) is the no-op default for
     // every other zone mesh — only the cloud/sun layers (zone_clouds.rs) write a live tint.
-    #[uniform(4)]
     pub tint: Vec4,
 
     // research/xim ParticleUpdaters.kt TextureCoordinateUpdater: animated UV scroll
     // (xy) that drifts the cloud canopy texture for wind. Zero (the default for every
     // other zone mesh) is a no-op.
-    #[uniform(5)]
     pub uv_offset: Vec4,
 
     pub alpha_mode: AlphaMode,
+
+    // Keys this material's persistent flags/tint/uv buffers in ZoneMaterialBuffers.
+    // Per-frame data flows through those buffers via write_buffer, so mutating
+    // tint/uv (with get_mut_untracked) never marks the asset Modified and the bind
+    // group is built once instead of recreated on every lighting/animation step.
+    pub instance_id: u64,
+}
+
+impl FfxiZoneMaterial {
+    pub fn new(
+        base_color_texture: Option<Handle<Image>>,
+        material_flags: FfxiMaterialFlags,
+        tint: Vec4,
+        uv_offset: Vec4,
+        alpha_mode: AlphaMode,
+    ) -> Self {
+        Self {
+            base_color_texture,
+            material_flags,
+            tint,
+            uv_offset,
+            alpha_mode,
+            instance_id: NEXT_ZONE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+struct ZoneInstanceBuffers {
+    flags: Buffer,
+    tint: Buffer,
+    uv: Buffer,
+    last_flags: Vec4,
+    last_tint: Vec4,
+    last_uv: Vec4,
+}
+
+#[derive(Resource)]
+pub struct ZoneMaterialBuffers {
+    lighting: Buffer,
+    instances: HashMap<u64, ZoneInstanceBuffers>,
+}
+
+impl FromWorld for ZoneMaterialBuffers {
+    fn from_world(world: &mut World) -> Self {
+        let device = world.resource::<RenderDevice>();
+        Self {
+            lighting: device.create_buffer(&BufferDescriptor {
+                label: Some("ffxi_zone_lighting"),
+                size: FfxiLightingUniform::min_size().get(),
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            instances: HashMap::new(),
+        }
+    }
+}
+
+fn upload_zone_material_buffers(
+    lighting: Extract<Res<ZoneGlobalLighting>>,
+    materials: Extract<Res<Assets<FfxiZoneMaterial>>>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut cache: ResMut<ZoneMaterialBuffers>,
+) {
+    write_uniform(&queue, &cache.lighting, &lighting.0);
+
+    let uniform_buffer = |label: &'static str, size: std::num::NonZeroU64| {
+        device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size: size.get(),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    };
+
+    let mut live: HashSet<u64> = HashSet::with_capacity(materials.len());
+    for (_id, mat) in materials.iter() {
+        live.insert(mat.instance_id);
+        match cache.instances.entry(mat.instance_id) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let inst = e.get_mut();
+                if inst.last_flags != mat.material_flags.flags {
+                    write_uniform(&queue, &inst.flags, &mat.material_flags);
+                    inst.last_flags = mat.material_flags.flags;
+                }
+                if inst.last_tint != mat.tint {
+                    write_uniform(&queue, &inst.tint, &mat.tint);
+                    inst.last_tint = mat.tint;
+                }
+                if inst.last_uv != mat.uv_offset {
+                    write_uniform(&queue, &inst.uv, &mat.uv_offset);
+                    inst.last_uv = mat.uv_offset;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let flags = uniform_buffer("ffxi_zone_flags", FfxiMaterialFlags::min_size());
+                let tint = uniform_buffer("ffxi_zone_tint", Vec4::min_size());
+                let uv = uniform_buffer("ffxi_zone_uv", Vec4::min_size());
+                write_uniform(&queue, &flags, &mat.material_flags);
+                write_uniform(&queue, &tint, &mat.tint);
+                write_uniform(&queue, &uv, &mat.uv_offset);
+                e.insert(ZoneInstanceBuffers {
+                    flags,
+                    tint,
+                    uv,
+                    last_flags: mat.material_flags.flags,
+                    last_tint: mat.tint,
+                    last_uv: mat.uv_offset,
+                });
+            }
+        }
+    }
+    cache.instances.retain(|id, _| live.contains(id));
+}
+
+impl AsBindGroup for FfxiZoneMaterial {
+    type Data = ();
+    type Param = (
+        SRes<ZoneMaterialBuffers>,
+        SRes<RenderAssets<GpuImage>>,
+        SRes<FallbackImage>,
+    );
+
+    fn label() -> &'static str {
+        "ffxi_zone_material"
+    }
+
+    fn bind_group_data(&self) -> Self::Data {}
+
+    fn unprepared_bind_group(
+        &self,
+        _layout: &BindGroupLayout,
+        _render_device: &RenderDevice,
+        param: &mut SystemParamItem<'_, '_, Self::Param>,
+        _force_no_bindless: bool,
+    ) -> Result<UnpreparedBindGroup, AsBindGroupError> {
+        let (buffers, images, fallback) = param;
+        let inst = buffers
+            .instances
+            .get(&self.instance_id)
+            .ok_or(AsBindGroupError::RetryNextUpdate)?;
+        let image = match &self.base_color_texture {
+            Some(handle) => images
+                .get(handle)
+                .ok_or(AsBindGroupError::RetryNextUpdate)?,
+            None => &fallback.d2,
+        };
+        Ok(UnpreparedBindGroup {
+            bindings: BindingResources(vec![
+                (0, OwnedBindingResource::Buffer(buffers.lighting.clone())),
+                (
+                    1,
+                    OwnedBindingResource::TextureView(
+                        TextureViewDimension::D2,
+                        image.texture_view.clone(),
+                    ),
+                ),
+                (
+                    2,
+                    OwnedBindingResource::Sampler(
+                        SamplerBindingType::Filtering,
+                        image.sampler.clone(),
+                    ),
+                ),
+                (3, OwnedBindingResource::Buffer(inst.flags.clone())),
+                (4, OwnedBindingResource::Buffer(inst.tint.clone())),
+                (5, OwnedBindingResource::Buffer(inst.uv.clone())),
+            ]),
+        })
+    }
+
+    fn bind_group_layout_entries(
+        _render_device: &RenderDevice,
+        _force_no_bindless: bool,
+    ) -> Vec<BindGroupLayoutEntry> {
+        let uniform = |binding: u32, min: std::num::NonZeroU64| BindGroupLayoutEntry {
+            binding,
+            visibility: ShaderStages::VERTEX_FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: Some(min),
+            },
+            count: None,
+        };
+        vec![
+            uniform(0, FfxiLightingUniform::min_size()),
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            uniform(3, FfxiMaterialFlags::min_size()),
+            uniform(4, Vec4::min_size()),
+            uniform(5, Vec4::min_size()),
+        ]
+    }
 }
 
 impl Material for FfxiZoneMaterial {
@@ -91,8 +309,6 @@ impl Material for FfxiZoneMaterial {
     }
 }
 
-const LIGHTING_EPSILON: f32 = 1.5e-3;
-
 fn update_zone_material_lighting(
     ambient: Res<GlobalAmbientLight>,
     zone_lighting: Res<crate::weather::ZoneDirectionalLighting>,
@@ -110,13 +326,8 @@ fn update_zone_material_lighting(
             Without<crate::sun_moon::IsSun>,
         ),
     >,
-    mut materials: ResMut<Assets<FfxiZoneMaterial>>,
-    mut last: Local<Option<(usize, [Vec4; 5])>>,
+    mut global: ResMut<ZoneGlobalLighting>,
 ) {
-    if materials.is_empty() {
-        return;
-    }
-
     const AMBIENT_REF_LUX: f32 = 1000.0;
     const DIR_REF_LUX: f32 = 12000.0;
     const COLOR_BIAS: Vec3 = Vec3::new(1.4, 1.36, 1.45);
@@ -190,60 +401,29 @@ fn update_zone_material_lighting(
         (d0d, d0c, d1d, d1c)
     };
 
-    let next = [ambient_v, dir0_dir, dir0_color, dir1_dir, dir1_color];
-    let count = materials.len();
-
-    // Every zone submesh is its own FfxiZoneMaterial (hundreds per zone) and
-    // Assets::iter_mut() flags every one Modified, so the render world rebuilds
-    // all their bind groups that frame. The Vana'diel sun creeps ~1e-4 rad/frame,
-    // so skip the push until the lighting actually shifts past a perceptual
-    // epsilon (or a chunk streams in, changing the count) to keep that O(materials)
-    // upload off every frame.
-    if let Some((prev_count, prev)) = *last {
-        let unchanged = prev_count == count
-            && next
-                .iter()
-                .zip(prev.iter())
-                .all(|(a, b)| vec4_max_element((*a - *b).abs()) <= LIGHTING_EPSILON);
-        if unchanged {
-            return;
-        }
-    }
-
-    for (_, m) in materials.iter_mut() {
-        m.lighting.ambient = ambient_v;
-        m.lighting.dir0_dir = dir0_dir;
-        m.lighting.dir0_color = dir0_color;
-        m.lighting.dir1_dir = dir1_dir;
-        m.lighting.dir1_color = dir1_color;
-    }
-    *last = Some((count, next));
+    global.0.ambient = ambient_v;
+    global.0.dir0_dir = dir0_dir;
+    global.0.dir0_color = dir0_color;
+    global.0.dir1_dir = dir1_dir;
+    global.0.dir1_color = dir1_color;
 }
 
-const POINT_FEED_EPSILON: f32 = 1.0e-3;
-
-// Feeds the shader's four point-light slots (the "later per-zone feed"
-// zone_ffxi.wgsl anticipates) GLOBALLY: the four lights nearest the viewer go to
-// every zone material identically. Per-submesh selection is impossible here
-// because instanced MMB placements SHARE one cached FfxiZoneMaterial handle
-// (dat_mmb.rs keys it by file_id/chunk_idx/sub_index) — writing position-
-// dependent data into a shared material makes co-located submeshes fight every
-// frame and flicker as streaming overlays reshuffle query order. A single global
-// set sidesteps that, and the range cutoff in nearest_point_light_arrays keeps
-// far geometry dark. Change-gated so the O(materials) upload only fires when the
-// chosen set actually shifts (the viewer crossing a light boundary), not on the
-// flame flicker (which is steady here — see animate_zone_lights).
+// Feeds the shader's four point-light slots GLOBALLY: the four lights nearest
+// the viewer go to every zone material identically via the shared lighting
+// buffer. Per-submesh selection is impossible here because instanced MMB
+// placements SHARE one cached FfxiZoneMaterial handle (dat_mmb.rs keys it by
+// file_id/chunk_idx/sub_index) — writing position-dependent data into a shared
+// material makes co-located submeshes fight every frame and flicker as
+// streaming overlays reshuffle query order. A single global set sidesteps
+// that, and the range cutoff in nearest_point_light_arrays keeps far geometry
+// dark.
 fn update_zone_material_point_lights(
     active: Res<crate::zone_point_lights::ActiveSceneLights>,
     q_self: Query<&GlobalTransform, With<crate::components::IsSelf>>,
     q_cam: Query<&GlobalTransform, With<Camera3d>>,
-    mut materials: ResMut<Assets<FfxiZoneMaterial>>,
-    mut last: Local<Option<(usize, [Vec4; 4], [Vec4; 4], [Vec4; 4])>>,
+    mut global: ResMut<ZoneGlobalLighting>,
     mut selected: Local<Vec<Vec3>>,
 ) {
-    if materials.is_empty() {
-        return;
-    }
     let Some(focus) = q_self
         .iter()
         .next()
@@ -260,28 +440,9 @@ fn update_zone_material_point_lights(
             &mut selected,
         );
 
-    let count = materials.len();
-    let close = |a: &[Vec4; 4], b: &[Vec4; 4]| {
-        a.iter()
-            .zip(b)
-            .all(|(x, y)| vec4_max_element((*x - *y).abs()) <= POINT_FEED_EPSILON)
-    };
-    if let Some((pc, pp, pcol, pat)) = last.as_ref() {
-        if *pc == count
-            && close(pp, &point_pos)
-            && close(pcol, &point_color)
-            && close(pat, &point_atten)
-        {
-            return;
-        }
-    }
-
-    for (_, m) in materials.iter_mut() {
-        m.lighting.point_pos = point_pos;
-        m.lighting.point_color = point_color;
-        m.lighting.point_atten = point_atten;
-    }
-    *last = Some((count, point_pos, point_color, point_atten));
+    global.0.point_pos = point_pos;
+    global.0.point_color = point_color;
+    global.0.point_atten = point_atten;
 }
 
 pub struct FfxiZoneMaterialPlugin;
@@ -291,11 +452,21 @@ impl Plugin for FfxiZoneMaterialPlugin {
         embedded_asset!(app, "zone_ffxi.wgsl");
         embedded_asset!(app, "zone_ffxi_prepass.wgsl");
         app.add_plugins(MaterialPlugin::<FfxiZoneMaterial>::default())
+            .init_resource::<ZoneGlobalLighting>()
             .add_systems(Update, update_zone_material_lighting)
             .add_systems(
                 Update,
                 update_zone_material_point_lights
                     .after(crate::zone_point_lights::build_active_scene_lights),
             );
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.add_systems(ExtractSchedule, upload_zone_material_buffers);
+        }
+    }
+
+    fn finish(&self, app: &mut App) {
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.init_resource::<ZoneMaterialBuffers>();
+        }
     }
 }

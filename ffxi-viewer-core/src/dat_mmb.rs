@@ -553,11 +553,9 @@ pub fn process_load_mmb_requests(
                         .material
                         .entry(cache_key)
                         .or_insert_with(|| {
-                            materials.add(FfxiZoneMaterial {
-                                lighting:
-                                    crate::skinned_ffxi_material::FfxiLightingUniform::default(),
-                                base_color_texture: sub_texture,
-                                material_flags: crate::skinned_ffxi_material::FfxiMaterialFlags {
+                            materials.add(FfxiZoneMaterial::new(
+                                sub_texture,
+                                crate::skinned_ffxi_material::FfxiMaterialFlags {
                                     flags: Vec4::new(
                                         has_texture,
                                         blend_flag,
@@ -565,10 +563,10 @@ pub fn process_load_mmb_requests(
                                         discard_threshold,
                                     ),
                                 },
-                                tint: Vec4::ONE,
-                                uv_offset: Vec4::ZERO,
+                                Vec4::ONE,
+                                Vec4::ZERO,
                                 alpha_mode,
-                            })
+                            ))
                         })
                         .clone();
 
