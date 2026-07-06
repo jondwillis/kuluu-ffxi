@@ -2,8 +2,9 @@
 //!
 //! Holds the per-zone event + dialog DATs and the active [`DialogRunner`] across
 //! player interactions, turning VM yields into real [`DialogState`]s. When no
-//! event DAT can drive a trigger, [`DialogSession::begin`] returns `None` and the
-//! caller falls back to the legacy raw-packet dialog.
+//! event DAT can drive a trigger, [`DialogSession::begin`] returns
+//! [`Begin::Undriveable`] and the caller auto-releases the event (EVENT_END)
+//! rather than pin the character InEvent behind an empty dialog.
 
 use std::sync::Arc;
 
@@ -32,6 +33,19 @@ pub enum Advance {
     /// The event is over — the caller sends EVENT_END with `end_para` as the
     /// 0x05B `EndPara` (the VM's `Work_Zone[1]`, or a cancel sentinel).
     Ended { end_para: u32 },
+}
+
+/// Outcome of starting a VM-driven event.
+pub enum Begin {
+    /// Show the first frame and wait for the player.
+    Frame(DialogState),
+    /// The VM ran the whole event without producing a dialog frame
+    /// (choreography-only or bookkeeping script) — the caller sends EVENT_END
+    /// with `end_para`, same as [`Advance::Ended`].
+    Ended { end_para: u32 },
+    /// The VM can't drive the event: missing DAT/strings/block, or it stopped
+    /// on unimplemented opcode `stopped_op`.
+    Undriveable { stopped_op: Option<u8> },
 }
 
 pub struct DialogSession {
@@ -75,10 +89,7 @@ impl DialogSession {
         self.strings = load_strings(self.dat_root.as_deref(), zone);
     }
 
-    /// Begin a VM-driven event for a 0x32 trigger. Returns the first frame as a
-    /// [`DialogState`], or `None` if the event can't be driven (no DAT, no such
-    /// block/event, or the VM stalls immediately) so the caller uses the legacy
-    /// raw dialog instead.
+    /// Begin a VM-driven event for a 0x32 trigger.
     pub fn begin(
         &mut self,
         zone: u16,
@@ -86,11 +97,22 @@ impl DialogSession {
         act_index: u16,
         event_id: u16,
         npc_name: Option<String>,
-    ) -> Option<DialogState> {
+    ) -> Begin {
         self.ensure_zone(zone);
-        let strings = self.strings.as_ref()?;
-        let block = self.event_dat.as_ref()?.block_for_actor(unique_no)?;
-        let mut runner = DialogRunner::start(block, event_id, act_index)?;
+        let undriveable = Begin::Undriveable { stopped_op: None };
+        let Some(strings) = self.strings.as_ref() else {
+            return undriveable;
+        };
+        let Some(block) = self
+            .event_dat
+            .as_ref()
+            .and_then(|dat| dat.block_for_actor(unique_no))
+        else {
+            return undriveable;
+        };
+        let Some(mut runner) = DialogRunner::start(block, event_id, act_index) else {
+            return undriveable;
+        };
         let step = runner.advance(None, strings);
         let active = ActiveEvent {
             unique_no,
@@ -104,11 +126,17 @@ impl DialogSession {
                 let dialog = frame_to_dialog(&active, frame, &self.player_name);
                 self.runner = Some(runner);
                 self.active = Some(active);
-                Some(dialog)
+                Begin::Frame(dialog)
             }
-            DialogStep::Ended { .. } | DialogStep::Stopped(_) => {
+            DialogStep::Ended { end_para } => {
                 self.clear();
-                None
+                Begin::Ended { end_para }
+            }
+            DialogStep::Stopped(op) => {
+                self.clear();
+                Begin::Undriveable {
+                    stopped_op: Some(op),
+                }
             }
         }
     }
@@ -136,7 +164,11 @@ impl DialogSession {
                 self.clear();
                 Advance::Ended { end_para }
             }
-            DialogStep::Stopped(_) => {
+            DialogStep::Stopped(op) => {
+                tracing::warn!(
+                    op = format!("0x{op:02X}"),
+                    "event VM stopped mid-dialog; releasing with end_para 0"
+                );
                 self.clear();
                 Advance::Ended { end_para: 0 }
             }

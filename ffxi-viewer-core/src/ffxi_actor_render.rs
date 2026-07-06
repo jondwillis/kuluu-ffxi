@@ -1853,6 +1853,7 @@ pub fn tick_live_ffxi_actors(
     motion: Res<combat_stance::EntityMotion>,
     rest: Res<combat_stance::RestStance>,
     walk_mode: Res<combat_stance::WalkMode>,
+    self_move: Res<combat_stance::SelfMoveIntent>,
     mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
     target: Res<crate::scene::Target>,
     mut q_actors: Query<(&mut FfxiRenderActor, &GlobalTransform)>,
@@ -1887,6 +1888,10 @@ pub fn tick_live_ffxi_actors(
     let self_engaged_predicted = matches!(
         state.snapshot.current_goal,
         Some(ffxi_viewer_wire::ReactorGoal::Engaged { .. })
+    );
+    let self_reactor_driven = !matches!(
+        state.snapshot.current_goal,
+        None | Some(ffxi_viewer_wire::ReactorGoal::Idle)
     );
 
     let zone = state.snapshot.zone_id;
@@ -2033,7 +2038,11 @@ pub fn tick_live_ffxi_actors(
 
         actor.facing_dir = 0.0;
         actor.inputs = ActorAnimInputs {
-            moving: motion.is_moving(world_id),
+            moving: if is_self && !self_reactor_driven {
+                self_move.moving
+            } else {
+                motion.is_moving(world_id)
+            },
             walking,
             forward_vel,
             strafe_vel,

@@ -137,6 +137,18 @@ impl WalkMode {
     }
 }
 
+/// Whether the self character's movement keys are held this tick, written by
+/// the client's movement dispatch. While keys are what move the player, the
+/// self pose reads this instead of inferring motion from transform deltas:
+/// prediction reconcile keeps nudging the rendered transform, so inferred speed
+/// can hover above `MOVE_EXIT` and hold the run cycle after the keys are
+/// released. Not authoritative while a reactor goal (follow/goto/engage) moves
+/// the player with no keys held — the pose falls back to inference there.
+#[derive(Resource, Default, Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SelfMoveIntent {
+    pub moving: bool,
+}
+
 pub fn directional_anim_for_skel(skel_file_id: u32, prefix: &[u8; 3]) -> Option<Arc<Mo2Animation>> {
     let map = DIRECTIONAL_ANIMS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().ok()?;

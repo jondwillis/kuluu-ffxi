@@ -55,6 +55,10 @@ const OP_EXECEND: u8 = 0x21;
 const OP_MESWAIT: u8 = 0x23;
 const OP_QUERY: u8 = 0x24;
 const OP_QUERYWAIT: u8 = 0x25;
+const OP_REQSET: u8 = 0x27;
+const OP_REQSET_CHECKED: u8 = 0x28;
+const OP_REQSET_PRIORITY: u8 = 0x29;
+const OP_REQWAIT: u8 = 0x2A;
 const OP_SETBITWORK: u8 = 0x40;
 const OP_GETBITWORK: u8 = 0x41;
 const OP_SENDTAG: u8 = 0x43;
@@ -253,6 +257,13 @@ impl EventVm {
                     }
                     self.exec_pointer += 1;
                 }
+                // XiEvent ReqSet/GetReqStatus family (research/XiEvents/OpCodes/
+                // 0x0027.md–0x002A.md): actor-choreography sync points. This
+                // dialog-only VM has no actors to wait on, so they complete
+                // instantly; explicit arms because the fallback refuses sets_ret.
+                OP_REQSET | OP_REQSET_CHECKED | OP_REQSET_PRIORITY | OP_REQWAIT => {
+                    self.exec_pointer += OPCODE_META[op as usize].size as usize;
+                }
                 _ => {
                     let meta = OPCODE_META.get(op as usize).copied();
                     match meta {
@@ -412,6 +423,31 @@ mod tests {
         let mut e = vm(vec![OP_GOTO, 4, 0, 0xFF, OP_END], vec![]);
         assert_eq!(e.step(), StepResult::Done);
         assert_eq!(e.exec_pointer(), 4);
+    }
+
+    #[test]
+    fn reqset_family_skips_by_size_and_continues() {
+        for (op, size) in [
+            (OP_REQSET, 7usize),
+            (OP_REQSET_CHECKED, 7),
+            (OP_REQSET_PRIORITY, 7),
+            (OP_REQWAIT, 6),
+        ] {
+            assert_eq!(
+                OPCODE_META[op as usize].size as usize, size,
+                "op 0x{op:02X} size drifted from research/XiEvents/OpCodes"
+            );
+            let mut data = vec![op];
+            data.extend(std::iter::repeat_n(0u8, size - 1));
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            assert_eq!(
+                e.step(),
+                StepResult::Done,
+                "op 0x{op:02X} should run to END"
+            );
+            assert_eq!(e.exec_pointer(), size, "op 0x{op:02X} advanced wrong size");
+        }
     }
 
     #[test]
