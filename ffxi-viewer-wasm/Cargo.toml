@@ -40,7 +40,7 @@ wasm-bindgen-futures = "0.4"
 gloo-net = { version = "0.7", features = ["websocket"] }
 gloo-utils = "0.2"
 postcard = { version = "1", features = ["use-std"] }
-flume = { version = "0.11", default-features = false }
+flume = { version = "0.12", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 log = "0.4"
 console_log = { version = "1", features = ["color"] }
