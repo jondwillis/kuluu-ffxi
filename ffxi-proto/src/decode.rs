@@ -450,8 +450,8 @@ pub struct CharStatus {
     /// Only meaningful while `server_status == animation::FISHING_START`. 0 if the packet
     /// was truncated before this field.
     pub fishing_timer: u8,
-    /// Movement speed (LSB `char_status.cpp` Flags1.Speed, 12 bits). Probed
-    /// live: GM `!speed 120` flips the u16 at +0x28 from 0x0032 to 0x0078.
+    /// Movement speed, 0 while bound
+    /// (vendor/server/src/map/packets/char_status.cpp `Flags1.Speed`).
     pub speed: u16,
 }
 
@@ -463,9 +463,11 @@ impl CharStatus {
     pub const DEAD_COUNTER1_OFFSET: usize = 0x38;
     pub const DEAD_COUNTER2_OFFSET: usize = 0x3C;
     pub const FISHING_TIMER_OFFSET: usize = 0x46;
+    pub const SPEED_MASK: u16 = 0x0FFF;
+    pub const MIN_LEN: usize = Self::DEAD_COUNTER2_OFFSET + 4;
 
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
-        let need = Self::DEAD_COUNTER2_OFFSET + 4;
+        let need = Self::MIN_LEN;
         if body.len() < need {
             return Err(DecodeError::Truncated(need, body.len()));
         }
@@ -480,7 +482,7 @@ impl CharStatus {
             server_status: body[Self::SERVER_STATUS_OFFSET],
             fishing_timer: body.get(Self::FISHING_TIMER_OFFSET).copied().unwrap_or(0),
             speed: u16::from_le_bytes([body[Self::SPEED_OFFSET], body[Self::SPEED_OFFSET + 1]])
-                & 0x0FFF,
+                & Self::SPEED_MASK,
         })
     }
 
@@ -494,6 +496,8 @@ impl CharStatus {
         (self.dead_counter1 / 60).saturating_sub(360)
     }
 }
+
+const _: () = assert!(CharStatus::SPEED_OFFSET + 2 <= CharStatus::MIN_LEN);
 
 /// s2c 0x061 GP_SERV_COMMAND_CLISTATUS — the self-character stat block.
 /// Field offsets follow the `CLISTATUS` struct in
@@ -2316,9 +2320,7 @@ mod tests {
 
     #[test]
     fn char_status_decodes_speed_and_masks_high_nibble() {
-        let mut body = vec![0u8; CharStatus::DEAD_COUNTER2_OFFSET + 4];
-        // GM `!speed 120` sets Flags1.Speed (12 bits) at +0x28. The upper nibble
-        // holds unrelated flags and must be masked off.
+        let mut body = vec![0u8; CharStatus::MIN_LEN];
         body[CharStatus::SPEED_OFFSET..CharStatus::SPEED_OFFSET + 2]
             .copy_from_slice(&0xA078u16.to_le_bytes());
         assert_eq!(CharStatus::decode(&body).unwrap().speed, 0x078);
@@ -2326,10 +2328,16 @@ mod tests {
 
     #[test]
     fn char_status_base_speed_decodes() {
-        let mut body = vec![0u8; CharStatus::DEAD_COUNTER2_OFFSET + 4];
+        let mut body = vec![0u8; CharStatus::MIN_LEN];
         body[CharStatus::SPEED_OFFSET..CharStatus::SPEED_OFFSET + 2]
             .copy_from_slice(&0x0032u16.to_le_bytes());
         assert_eq!(CharStatus::decode(&body).unwrap().speed, 50);
+    }
+
+    #[test]
+    fn char_status_bound_speed_zero_decodes() {
+        let body = vec![0u8; CharStatus::MIN_LEN];
+        assert_eq!(CharStatus::decode(&body).unwrap().speed, 0);
     }
 }
 
