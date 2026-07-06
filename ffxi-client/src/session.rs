@@ -818,6 +818,10 @@ fn handle_sub_packet(
         op if op == s2c::CHAR_STATUS => {
             if let Ok(cs) = decode::CharStatus::decode(sub.data) {
                 if cs.unique_no == self_char_id {
+                    // GM !speed and status effects land here, not in CHAR_PC.
+                    if cs.speed > 0 {
+                        self_pos.speed = cs.speed.min(u16::from(u8::MAX)) as u8;
+                    }
                     let _ = event_tx.send(AgentEvent::DeathTimerUpdated {
                         seconds_until_homepoint: (cs.hpp == 0)
                             .then(|| cs.seconds_until_homepoint()),
