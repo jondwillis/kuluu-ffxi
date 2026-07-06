@@ -33,6 +33,12 @@ pub mod c2s {
     pub const REQ_LOGOUT: u16 = 0x0E7;
 }
 
+pub mod container {
+    // LSB CONTAINER_ID, vendor/server/src/map/item_container.h. The main
+    // inventory bag — the container the Items window sorts.
+    pub const LOC_INVENTORY: u8 = 0;
+}
+
 pub mod reqlogout {
 
     pub mod mode {

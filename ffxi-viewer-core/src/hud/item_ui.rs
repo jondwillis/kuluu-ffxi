@@ -1,7 +1,5 @@
-//! Shared building blocks for the item-bearing HUD windows (Equipment and
-//! Items) so the two screens stay visually and structurally DRY: one theme,
-//! one framed-box style, one transparent icon placeholder, and one item-detail
-//! composition.
+//! Shared building blocks for the Equipment and Items HUD windows: theme,
+//! framed-box, transparent icon placeholder, and item-detail composition.
 
 use bevy::prelude::*;
 

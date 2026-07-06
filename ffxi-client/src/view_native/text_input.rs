@@ -2446,9 +2446,11 @@ pub fn mouse_nav_dispatch_system(
     }
 
     for ev in sort_req_events.read() {
-        let _ = cmd_tx.0.try_send(AgentCommand::StackInventory {
+        if let Err(e) = cmd_tx.0.try_send(AgentCommand::StackInventory {
             container: ev.container,
-        });
+        }) {
+            push_system_chat_line(&mut scene_state, format!("sort dropped (channel): {e}"));
+        }
     }
 }
 
@@ -2500,9 +2502,11 @@ fn handle_menu_key(
                 if let Some(&id) = SORT_OPTIONS.get(item_menu_focus.sort_cursor) {
                     apply_sort_option(sort_options, id);
                 }
-                // Perform the sort: ask the server to consolidate partial stacks
-                // in the main inventory (LOC_INVENTORY = 0).
-                let _ = cmd_tx.try_send(AgentCommand::StackInventory { container: 0 });
+                if let Err(e) = cmd_tx.try_send(AgentCommand::StackInventory {
+                    container: ffxi_proto::map::container::LOC_INVENTORY,
+                }) {
+                    push_system_chat_line(scene_state, format!("sort dropped (channel): {e}"));
+                }
                 return None;
             }
             if bindings.matches_logical(Action::NavLeft, key)

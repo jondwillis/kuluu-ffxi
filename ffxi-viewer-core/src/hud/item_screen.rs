@@ -27,7 +27,6 @@ enum ItemRole {
     ListRowText(usize),
     DetailName,
     DetailRow(usize),
-    DetailCounts,
     SortTitle,
     SortRow(usize),
 }
@@ -84,16 +83,6 @@ fn row_item_no(rows: &[crate::hud::menu::DynamicMenuRow], idx: usize) -> Option<
         DynamicMenuAction::UseItem { item_no, .. } => Some(item_no),
         _ => None,
     }
-}
-
-fn format_counts(snap: &ffxi_viewer_wire::SceneSnapshot) -> String {
-    let total = snap.inventory_main.len() as u32;
-    let usable = snap
-        .inventory_main
-        .iter()
-        .filter(|s| s.quantity > 0)
-        .count() as u32;
-    format!("Usable {usable}/{total} \u{b7} Bag {total}/{MAIN_BAG_CAPACITY}")
 }
 
 pub(crate) fn spawn_item_screen(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
@@ -213,7 +202,6 @@ fn spawn_detail_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) 
         for i in 0..DETAIL_ROWS {
             spawn_row(p, ItemRole::DetailRow(i), 12.0, theme::TEXT);
         }
-        spawn_text(p, ItemRole::DetailCounts, 11.0, theme::MUTED);
     });
 }
 
@@ -262,7 +250,7 @@ pub(crate) fn update_item_screen(
     state: Res<SceneState>,
     dynamic: Res<DynamicMenu>,
     sort: Res<SortOptions>,
-    focus: Res<ItemMenuFocus>,
+    mut focus: ResMut<ItemMenuFocus>,
     dat_root: Res<ItemDatRoot>,
     mut icon_cache: ResMut<ItemIconCache>,
     mut images: ResMut<Assets<Image>>,
@@ -308,6 +296,10 @@ pub(crate) fn update_item_screen(
         }
     }
     if !open {
+        // Leaving the window drops sort focus so it reopens on the list.
+        if focus.sort_focused {
+            focus.sort_focused = false;
+        }
         return;
     }
 
@@ -320,7 +312,6 @@ pub(crate) fn update_item_screen(
     let focused_item = item_detail::selected_item_no(&mode, &dynamic);
     let (detail_name, detail_rows) =
         item_ui::focus_detail(focused_item, snap, &dat_root, &mut icon_cache);
-    let counts = format_counts(snap);
     let header = format!("Items  {}/{}", snap.inventory_main.len(), MAIN_BAG_CAPACITY);
 
     for (row, mut node) in listrow_q.iter_mut() {
@@ -346,7 +337,6 @@ pub(crate) fn update_item_screen(
             &header,
             &detail_name,
             &detail_rows,
-            &counts,
             &sort,
             &focus,
         );
@@ -408,7 +398,6 @@ fn role_value(
     header: &str,
     detail_name: &str,
     detail_rows: &[String],
-    counts: &str,
     sort: &SortOptions,
     focus: &ItemMenuFocus,
 ) -> (String, Color, bool) {
@@ -442,7 +431,6 @@ fn role_value(
             Some(line) => (line.clone(), theme::TEXT, true),
             None => (String::new(), theme::TEXT, false),
         },
-        ItemRole::DetailCounts => (counts.to_string(), theme::MUTED, true),
         ItemRole::SortTitle => ("Sort".to_string(), theme::TITLE, true),
         ItemRole::SortRow(i) => match SORT_OPTIONS.get(i).copied() {
             Some(id) => {
@@ -474,6 +462,7 @@ fn role_value(
 pub(crate) fn item_row_mouse_hover_system(
     mut mode: ResMut<InputMode>,
     dynamic: Res<DynamicMenu>,
+    mut focus: ResMut<ItemMenuFocus>,
     rows: Query<(&Interaction, &ItemListRow), Changed<Interaction>>,
 ) {
     let InputMode::Menu(stack) = &mut *mode else {
@@ -492,8 +481,15 @@ pub(crate) fn item_row_mouse_hover_system(
             continue;
         }
         let list_idx = start + row.0;
-        if list_idx < total && level.cursor != list_idx {
-            level.cursor = list_idx;
+        if list_idx < total {
+            // Hovering the list returns focus here, mirroring the sort box
+            // grabbing it on hover — so neither pane traps the keyboard.
+            if focus.sort_focused {
+                focus.sort_focused = false;
+            }
+            if level.cursor != list_idx {
+                level.cursor = list_idx;
+            }
         }
     }
 }
@@ -551,9 +547,9 @@ pub(crate) fn sort_option_mouse_system(
                 if let Some(&id) = SORT_OPTIONS.get(i) {
                     item_detail::apply_sort_option(&mut sort, id);
                 }
-                // Perform the sort on the main inventory (LOC_INVENTORY = 0);
-                // the client turns this into an ITEM_STACK request.
-                sort_req.write(item_detail::InventorySortRequested { container: 0 });
+                sort_req.write(item_detail::InventorySortRequested {
+                    container: ffxi_proto::map::container::LOC_INVENTORY,
+                });
             }
             Interaction::None => {}
         }

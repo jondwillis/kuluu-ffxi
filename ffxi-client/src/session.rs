@@ -1650,16 +1650,16 @@ async fn keepalive_loop(
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::StackInventory { container }) => {
-                        const ITEM_STACK_MIN_INTERVAL: std::time::Duration =
-                            std::time::Duration::from_millis(1100);
-                        let now = std::time::Instant::now();
-                        let too_soon = last_item_stack
-                            .get(&container)
-                            .is_some_and(|t| now.duration_since(*t) < ITEM_STACK_MIN_INTERVAL);
-                        if too_soon {
-                            tracing::debug!(container, "item_stack throttled (<1.1s)");
+                        if !item_stack_allowed(
+                            &mut last_item_stack,
+                            container,
+                            std::time::Instant::now(),
+                        ) {
+                            tracing::info!(
+                                container,
+                                "item_stack throttled (<1.1s) to avoid lightluggage kick"
+                            );
                         } else {
-                            last_item_stack.insert(container, now);
                             let payload = build_subpacket_item_stack(sub_seq, container);
                             sub_seq = sub_seq.wrapping_add(1);
                             if let Err(e) = map
@@ -3337,6 +3337,27 @@ pub fn build_subpacket_item_stack(sync: u16, container: u8) -> Vec<u8> {
     buf
 }
 
+// LSB kicks a character whose ITEM_STACK requests for one container arrive faster
+// than 1/sec (vendor/server/src/map/packets/c2s/0x03a_item_stack.cpp:40); 1.1s
+// keeps a margin over that window.
+const ITEM_STACK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1100);
+
+/// Whether an ITEM_STACK for `container` may be sent now. Records `now` as the
+/// last-sent time when it returns true, so the throttle is per-container.
+fn item_stack_allowed(
+    last: &mut std::collections::HashMap<u8, std::time::Instant>,
+    container: u8,
+    now: std::time::Instant,
+) -> bool {
+    let too_soon = last
+        .get(&container)
+        .is_some_and(|t| now.duration_since(*t) < ITEM_STACK_MIN_INTERVAL);
+    if !too_soon {
+        last.insert(container, now);
+    }
+    !too_soon
+}
+
 fn note_mog_transition(now_in_mog: bool, was: &mut bool, event_tx: &broadcast::Sender<AgentEvent>) {
     if now_in_mog && !*was {
         let _ = event_tx.send(AgentEvent::ChatLine {
@@ -4907,10 +4928,34 @@ mod tests {
             "Category = container (LOC_INVENTORY = 0)"
         );
 
-        // A non-zero container id must fill the full u32 (LSB validates any
-        // CONTAINER_ID, e.g. LOC_MOGSAFE = 1).
         let buf = build_subpacket_item_stack(0, 1);
         assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn item_stack_throttle_is_per_container() {
+        use std::time::{Duration, Instant};
+        let mut last = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        assert!(item_stack_allowed(&mut last, 0, t0), "first send passes");
+        assert!(
+            !item_stack_allowed(&mut last, 0, t0 + Duration::from_millis(500)),
+            "second within the interval is throttled"
+        );
+        assert!(
+            item_stack_allowed(&mut last, 1, t0 + Duration::from_millis(500)),
+            "a different container is independent"
+        );
+        assert!(
+            item_stack_allowed(&mut last, 0, t0 + ITEM_STACK_MIN_INTERVAL),
+            "passes again once the interval has elapsed"
+        );
+    }
+
+    #[test]
+    fn item_stack_interval_clears_server_window() {
+        // LSB trips at faster than 1/sec; the client margin must stay >= 1s.
+        assert!(ITEM_STACK_MIN_INTERVAL >= std::time::Duration::from_secs(1));
     }
 
     #[test]

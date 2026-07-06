@@ -799,7 +799,6 @@ mod tests {
                 action: use_item(10),
             },
         ];
-        // Auto sort is by item id, so the alphabetically-last row (id 10) leads.
         rows.sort_by_key(item_row_sort_key);
         assert_eq!(rows[0].label, "Zeta");
         assert_eq!(rows[1].label, "Apple");
