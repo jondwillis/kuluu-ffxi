@@ -7,6 +7,8 @@ use std::sync::Arc;
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
+use bevy::tasks::futures_lite::future;
+use bevy::tasks::{AsyncComputeTaskPool, Task};
 
 use ffxi_actor::actor_state::{self, ActorAnimInputs, RestKind};
 use ffxi_actor::animation::{LoopParams, SkeletonAnimationCoordinator, TransitionParams};
@@ -86,9 +88,189 @@ pub struct LoadedActor {
 
     textures: Vec<NamedTexture>,
 
-    anim_dirs: Vec<ResourceDir>,
+    animations: Arc<Vec<SkeletonAnimation>>,
 
-    battle_dirs: Vec<ResourceDir>,
+    battle_clips: Arc<Vec<SkeletonAnimation>>,
+
+    routines: Arc<HashMap<DatId, Scheduler>>,
+}
+
+// Clip/scheduler parsing is the expensive tail of an actor load; deriving it here
+// keeps it on the loader task instead of the render main thread, and the Arcs let
+// consumers share the parsed sets without deep-cloning keyframe data.
+fn derive_animation_sets(
+    anim_dirs: &[ResourceDir],
+    battle_dirs: &[ResourceDir],
+) -> (
+    Arc<Vec<SkeletonAnimation>>,
+    Arc<Vec<SkeletonAnimation>>,
+    Arc<HashMap<DatId, Scheduler>>,
+) {
+    let animations = dedup_clips(anim_dirs.iter());
+    let battle_clips = dedup_clips(battle_dirs.iter());
+    let mut routines: HashMap<DatId, Scheduler> = HashMap::new();
+    for dir in battle_dirs.iter().chain(anim_dirs.iter()) {
+        for sched in dir.collect_schedulers() {
+            routines
+                .entry(DatId::from_name(&sched.name))
+                .or_insert(sched);
+        }
+    }
+    (
+        Arc::new(animations),
+        Arc::new(battle_clips),
+        Arc::new(routines),
+    )
+}
+
+// Everything CPU-heavy about turning a LoadedActor into spawnable pieces —
+// vertex conversion, mip-chain generation, bind pose — happens here so the
+// loader task pays it, not the render main thread.
+pub struct PreparedParts {
+    images: Vec<Image>,
+
+    skel_built: Vec<BuiltGroup>,
+
+    d3m_built: Vec<BuiltGroup>,
+
+    bind_joints: FfxiJointMatrices,
+}
+
+pub struct PreparedActor {
+    pub loaded: LoadedActor,
+    parts: PreparedParts,
+}
+
+fn prepare_actor_parts(
+    loaded: &LoadedActor,
+    facing_dir: f32,
+    scale: f32,
+    q: crate::zone_texture::TextureQuality,
+) -> PreparedParts {
+    let occlusion: std::collections::HashSet<u8> =
+        loaded.skel_meshes.iter().map(|m| m.occlude_type).collect();
+    let joint_count = loaded.skeleton.joints.len();
+
+    let mut bind_joints = FfxiJointMatrices::default();
+    bind_joints.set_from(&pose_world(
+        &loaded.skeleton,
+        |_| None,
+        RootTransform {
+            facing_dir,
+            skew: 0.0,
+            slope_oriented: false,
+            scale: Vec3::splat(scale),
+        },
+        &[],
+    ));
+
+    let mut skel_built = Vec::new();
+    for skel_mesh in &loaded.skel_meshes {
+        for buffer in &skel_mesh.meshes {
+            if buffer.vertices.is_empty() || is_occluded(buffer, &occlusion) {
+                continue;
+            }
+            skel_built.push(BuiltGroup {
+                mesh: build_mesh(buffer, joint_count),
+                texture_name: buffer.texture_name.clone(),
+            });
+        }
+    }
+
+    let mut d3m_built = Vec::new();
+    for d3m in &loaded.effect_meshes {
+        if d3m.vertices.is_empty() {
+            continue;
+        }
+        d3m_built.push(BuiltGroup {
+            mesh: build_d3m_mesh(d3m),
+            texture_name: d3m.texture_name_str(),
+        });
+    }
+
+    let images = loaded
+        .textures
+        .iter()
+        .map(|nt| decoded_texture_to_image(&nt.texture, q))
+        .collect();
+
+    PreparedParts {
+        images,
+        skel_built,
+        d3m_built,
+        bind_joints,
+    }
+}
+
+// Re-sightings are constant while moving (entities flap in/out of the server's
+// sight radius), so prepared actors are cached by look + texture quality.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum ActorPrepKey {
+    Npc {
+        file_id: u32,
+        mipmaps: bool,
+        anisotropy: u16,
+    },
+    Pc {
+        race: u8,
+        equipment: Vec<u32>,
+        main_weapon: Option<u32>,
+        sub_weapon: Option<u32>,
+        mipmaps: bool,
+        anisotropy: u16,
+    },
+}
+
+fn prep_key(subject: &ActorSubject, q: crate::zone_texture::TextureQuality) -> ActorPrepKey {
+    match subject {
+        ActorSubject::Npc { file_id } => ActorPrepKey::Npc {
+            file_id: *file_id,
+            mipmaps: q.mipmaps,
+            anisotropy: q.anisotropy,
+        },
+        ActorSubject::Pc {
+            race,
+            equipment,
+            main_weapon,
+            sub_weapon,
+        } => ActorPrepKey::Pc {
+            race: *race,
+            equipment: equipment.clone(),
+            main_weapon: *main_weapon,
+            sub_weapon: *sub_weapon,
+            mipmaps: q.mipmaps,
+            anisotropy: q.anisotropy,
+        },
+    }
+}
+
+const ACTOR_PREP_CACHE_CAP: usize = 48;
+
+#[derive(Default)]
+struct ActorPrepCache {
+    map: HashMap<ActorPrepKey, Arc<PreparedActor>>,
+    order: std::collections::VecDeque<ActorPrepKey>,
+}
+
+impl ActorPrepCache {
+    fn get_and_promote(&mut self, key: &ActorPrepKey) -> Option<Arc<PreparedActor>> {
+        let hit = self.map.get(key).cloned()?;
+        self.order.retain(|k| k != key);
+        self.order.push_back(key.clone());
+        Some(hit)
+    }
+
+    fn insert(&mut self, key: ActorPrepKey, prepared: Arc<PreparedActor>) {
+        if self.map.insert(key.clone(), prepared).is_none() {
+            self.order.push_back(key);
+        }
+        while self.map.len() > ACTOR_PREP_CACHE_CAP {
+            let Some(evict) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&evict);
+        }
+    }
 }
 
 fn read_dat(root: &DatRoot, file_id: u32) -> Option<Vec<u8>> {
@@ -167,14 +349,16 @@ pub fn load_npc(file_id: u32) -> Result<LoadedActor, String> {
     let mut effect_meshes = Vec::new();
     collect_d3m(&tree, &mut effect_meshes);
 
+    let anim_dirs = vec![ResourceDir::from_bytes(bytes)];
+    let (animations, battle_clips, routines) = derive_animation_sets(&anim_dirs, &[]);
     Ok(LoadedActor {
         skeleton: Arc::new(skeleton),
         skel_meshes,
         effect_meshes,
         textures,
-        anim_dirs: vec![ResourceDir::from_bytes(bytes)],
-
-        battle_dirs: Vec::new(),
+        animations,
+        battle_clips,
+        routines,
     })
 }
 
@@ -298,14 +482,16 @@ pub fn load_pc(
         ));
     }
 
+    let (animations, battle_clips, routines) = derive_animation_sets(&anim_dirs, &battle_dirs);
     Ok(LoadedActor {
         skeleton: Arc::new(skeleton),
         skel_meshes,
 
         effect_meshes: Vec::new(),
         textures,
-        anim_dirs,
-        battle_dirs,
+        animations,
+        battle_clips,
+        routines,
     })
 }
 
@@ -474,11 +660,11 @@ fn is_blank_texture(name: &str) -> bool {
 pub struct FfxiRenderActor {
     pub skeleton: Arc<Skeleton>,
 
-    animations: Vec<SkeletonAnimation>,
+    animations: Arc<Vec<SkeletonAnimation>>,
 
-    battle_clips: Vec<SkeletonAnimation>,
+    battle_clips: Arc<Vec<SkeletonAnimation>>,
 
-    routines: HashMap<DatId, Scheduler>,
+    routines: Arc<HashMap<DatId, Scheduler>>,
     coordinator: SkeletonAnimationCoordinator,
     materials: Vec<Handle<FfxiSkinnedMaterial>>,
 
@@ -589,22 +775,16 @@ enum RestPlayback {
 }
 
 impl LoadedActor {
-    fn all_animations(&self) -> Vec<SkeletonAnimation> {
-        dedup_clips(self.anim_dirs.iter())
+    fn all_animations(&self) -> Arc<Vec<SkeletonAnimation>> {
+        Arc::clone(&self.animations)
     }
 
-    fn all_battle_clips(&self) -> Vec<SkeletonAnimation> {
-        dedup_clips(self.battle_dirs.iter())
+    fn all_battle_clips(&self) -> Arc<Vec<SkeletonAnimation>> {
+        Arc::clone(&self.battle_clips)
     }
 
-    fn all_routines(&self) -> HashMap<DatId, Scheduler> {
-        let mut out: HashMap<DatId, Scheduler> = HashMap::new();
-        for dir in self.battle_dirs.iter().chain(self.anim_dirs.iter()) {
-            for sched in dir.collect_schedulers() {
-                out.entry(DatId::from_name(&sched.name)).or_insert(sched);
-            }
-        }
-        out
+    fn all_routines(&self) -> Arc<HashMap<DatId, Scheduler>> {
+        Arc::clone(&self.routines)
     }
 
     pub fn bind_pose_bounds(&self, facing_dir: f32, scale: f32) -> Option<(Vec3, Vec3)> {
@@ -684,8 +864,9 @@ pub fn spawn_loaded_actor(
         ))
         .id();
 
+    let parts = prepare_actor_parts(loaded, facing_dir, scale, q);
     let material_handles = build_actor_children(
-        commands, meshes, materials, images, loaded, actor_root, facing_dir, scale, q,
+        commands, meshes, materials, images, loaded, &parts, actor_root,
     );
 
     commands.entity(actor_root).insert(make_render_actor(
@@ -709,10 +890,8 @@ fn build_actor_children(
     materials: &mut Assets<FfxiSkinnedMaterial>,
     images: &mut Assets<Image>,
     loaded: &LoadedActor,
+    parts: &PreparedParts,
     actor_root: Entity,
-    facing_dir: f32,
-    scale: f32,
-    q: crate::zone_texture::TextureQuality,
 ) -> Vec<Handle<FfxiSkinnedMaterial>> {
     let mut by_full: std::collections::HashMap<String, Handle<Image>> =
         std::collections::HashMap::with_capacity(loaded.textures.len());
@@ -720,8 +899,8 @@ fn build_actor_children(
         std::collections::HashMap::with_capacity(loaded.textures.len());
     let mut by_trimmed: std::collections::HashMap<String, Handle<Image>> =
         std::collections::HashMap::with_capacity(loaded.textures.len());
-    for nt in &loaded.textures {
-        let handle = images.add(decoded_texture_to_image(&nt.texture, q));
+    for (nt, image) in loaded.textures.iter().zip(parts.images.iter()) {
+        let handle = images.add(image.clone());
         let trimmed = nt.name.trim_end_matches(['\0', ' ']).to_string();
         if !trimmed.is_empty() {
             by_trimmed.entry(trimmed).or_insert(handle.clone());
@@ -742,86 +921,30 @@ fn build_actor_children(
             .cloned()
     };
 
-    let occlusion: std::collections::HashSet<u8> =
-        loaded.skel_meshes.iter().map(|m| m.occlude_type).collect();
-
-    let joint_count = loaded.skeleton.joints.len();
-
-    let mut bind_joints = FfxiJointMatrices::default();
-    bind_joints.set_from(&pose_world(
-        &loaded.skeleton,
-        |_| None,
-        RootTransform {
-            facing_dir,
-            skew: 0.0,
-            slope_oriented: false,
-            scale: Vec3::splat(scale),
-        },
-        &[],
-    ));
-
     let mut material_handles = Vec::new();
 
-    for skel_mesh in &loaded.skel_meshes {
-        for buffer in &skel_mesh.meshes {
-            if buffer.vertices.is_empty() {
-                continue;
-            }
-            if is_occluded(buffer, &occlusion) {
-                continue;
-            }
-            let built = BuiltGroup {
-                mesh: build_mesh(buffer, joint_count),
-                texture_name: buffer.texture_name.clone(),
-            };
-
-            let untextured = is_blank_texture(&built.texture_name);
-            let tex_handle = if untextured {
-                None
-            } else {
-                resolve_texture(&built.texture_name)
-            };
-            let has_texture = if tex_handle.is_some() { 1.0 } else { 0.0 };
-
-            let mat = materials.add(FfxiSkinnedMaterial::new(
-                actor_root.to_bits(),
-                FfxiLightingUniform::default(),
-                tex_handle,
-                bind_joints.clone(),
-                FfxiMaterialFlags {
-                    flags: Vec4::new(has_texture, 0.0, 0.0, 0.0),
-                },
-            ));
-            material_handles.push(mat.clone());
-
-            commands.spawn((
-                Mesh3d(meshes.add(built.mesh)),
-                MeshMaterial3d(mat),
-                Transform::default(),
-                FfxiActorMeshChild,
-                ChildOf(actor_root),
-            ));
-        }
-    }
-
-    for d3m in &loaded.effect_meshes {
-        if d3m.vertices.is_empty() {
-            continue;
-        }
-        let tex_handle = resolve_texture(&d3m.texture_name_str());
+    for built in parts.skel_built.iter().chain(parts.d3m_built.iter()) {
+        let untextured = is_blank_texture(&built.texture_name);
+        let tex_handle = if untextured {
+            None
+        } else {
+            resolve_texture(&built.texture_name)
+        };
         let has_texture = if tex_handle.is_some() { 1.0 } else { 0.0 };
+
         let mat = materials.add(FfxiSkinnedMaterial::new(
             actor_root.to_bits(),
             FfxiLightingUniform::default(),
             tex_handle,
-            bind_joints.clone(),
+            parts.bind_joints.clone(),
             FfxiMaterialFlags {
                 flags: Vec4::new(has_texture, 0.0, 0.0, 0.0),
             },
         ));
         material_handles.push(mat.clone());
+
         commands.spawn((
-            Mesh3d(meshes.add(build_d3m_mesh(d3m))),
+            Mesh3d(meshes.add(built.mesh.clone())),
             MeshMaterial3d(mat),
             Transform::default(),
             FfxiActorMeshChild,
@@ -902,11 +1025,10 @@ pub fn spawn_live_actor(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<FfxiSkinnedMaterial>,
     images: &mut Assets<Image>,
-    loaded: &LoadedActor,
+    prepared: &PreparedActor,
     wire_entity: Entity,
     world_id: u32,
     scale: f32,
-    q: crate::zone_texture::TextureQuality,
 ) -> Entity {
     let facing_dir = 0.0;
 
@@ -924,11 +1046,17 @@ pub fn spawn_live_actor(
         .id();
 
     let material_handles = build_actor_children(
-        commands, meshes, materials, images, loaded, actor_root, facing_dir, scale, q,
+        commands,
+        meshes,
+        materials,
+        images,
+        &prepared.loaded,
+        &prepared.parts,
+        actor_root,
     );
 
     commands.entity(actor_root).insert(make_render_actor(
-        loaded,
+        &prepared.loaded,
         material_handles,
         world_id,
         facing_dir,
@@ -1472,29 +1600,113 @@ mod head_look_tests {
     }
 }
 
-pub fn process_load_actor_requests(
+// Bounds per-frame asset-add + entity-spawn cost when several loads finish at
+// once (zone-in floods); the rest stay queued and drain on subsequent frames.
+const ACTOR_SPAWNS_PER_FRAME: usize = 2;
+
+#[derive(Resource, Default)]
+pub struct ActorLoadInFlight {
+    tasks: HashMap<u32, Task<Result<PreparedActor, String>>>,
+    keys: HashMap<u32, ActorPrepKey>,
+    ready: std::collections::VecDeque<(u32, Arc<PreparedActor>)>,
+    cache: ActorPrepCache,
+}
+
+pub fn kick_load_actor_tasks(
     mut events: MessageReader<LoadActorRequest>,
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
-    mut std_materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-    settings: Res<crate::graphics_settings::GraphicsSettings>,
     tracked: Res<crate::scene::TrackedEntities>,
-    entity_mesh: Option<Res<crate::scene::EntityMesh>>,
-    q_existing: Query<&FfxiRenderRoot>,
-    q_ball: Query<&MeshMaterial3d<StandardMaterial>, With<Mesh3d>>,
+    settings: Res<crate::graphics_settings::GraphicsSettings>,
+    mut in_flight: ResMut<ActorLoadInFlight>,
 ) {
-    // EntityMesh only exists once a scene is loaded; skip until then.
-    let Some(entity_mesh) = entity_mesh else {
-        return;
-    };
     let quality = crate::zone_texture::TextureQuality {
         mipmaps: settings.texture_filtering.mipmaps(),
         anisotropy: settings.texture_filtering.anisotropy(),
     };
     for req in events.read() {
-        let Some(&wire_entity) = tracked.by_id.get(&req.entity_id) else {
+        if !tracked.by_id.contains_key(&req.entity_id) {
+            continue;
+        }
+        let key = prep_key(&req.subject, quality);
+        if let Some(prepared) = in_flight.cache.get_and_promote(&key) {
+            in_flight.tasks.remove(&req.entity_id);
+            in_flight.keys.remove(&req.entity_id);
+            in_flight.ready.retain(|(id, _)| *id != req.entity_id);
+            in_flight.ready.push_back((req.entity_id, prepared));
+            continue;
+        }
+        let subject = req.subject.clone();
+        let task = AsyncComputeTaskPool::get().spawn(async move {
+            let loaded = match subject {
+                ActorSubject::Npc { file_id } => load_npc(file_id),
+                ActorSubject::Pc {
+                    race,
+                    equipment,
+                    main_weapon,
+                    sub_weapon,
+                } => load_pc(race, &equipment, main_weapon, sub_weapon),
+            }?;
+            let parts = prepare_actor_parts(&loaded, 0.0, 1.0, quality);
+            Ok(PreparedActor { loaded, parts })
+        });
+        // Newest look wins: replacing the entry drops any stale in-flight load.
+        in_flight.tasks.insert(req.entity_id, task);
+        in_flight.keys.insert(req.entity_id, key);
+        in_flight.ready.retain(|(id, _)| *id != req.entity_id);
+    }
+}
+
+pub fn poll_load_actor_tasks(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<FfxiSkinnedMaterial>>,
+    mut std_materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    tracked: Res<crate::scene::TrackedEntities>,
+    entity_mesh: Option<Res<crate::scene::EntityMesh>>,
+    mut in_flight: ResMut<ActorLoadInFlight>,
+    q_existing: Query<&FfxiRenderRoot>,
+    q_ball: Query<&MeshMaterial3d<StandardMaterial>, With<Mesh3d>>,
+) {
+    if in_flight.tasks.is_empty() && in_flight.ready.is_empty() {
+        return;
+    }
+    // EntityMesh only exists once a scene is loaded; park finished tasks until then.
+    let Some(entity_mesh) = entity_mesh else {
+        return;
+    };
+    let mut completed: Vec<(u32, Result<PreparedActor, String>)> = Vec::new();
+    in_flight.tasks.retain(
+        |entity_id, task| match future::block_on(future::poll_once(task)) {
+            Some(res) => {
+                completed.push((*entity_id, res));
+                false
+            }
+            None => true,
+        },
+    );
+    for (entity_id, prepared) in completed {
+        let key = in_flight.keys.remove(&entity_id);
+        match prepared {
+            Ok(p) => {
+                let p = Arc::new(p);
+                if let Some(key) = key {
+                    in_flight.cache.insert(key, Arc::clone(&p));
+                }
+                in_flight.ready.retain(|(id, _)| *id != entity_id);
+                in_flight.ready.push_back((entity_id, p));
+            }
+            Err(e) => {
+                warn!("ffxi actor load failed (entity {entity_id}): {e}");
+            }
+        }
+    }
+    for _ in 0..ACTOR_SPAWNS_PER_FRAME {
+        let Some((entity_id, prepared)) = in_flight.ready.pop_front() else {
+            break;
+        };
+        // The wire entity may have despawned (or been re-tracked) while the load
+        // ran; resolve it fresh and drop the result if it is gone.
+        let Some(&wire_entity) = tracked.by_id.get(&entity_id) else {
             continue;
         };
 
@@ -1502,33 +1714,15 @@ pub fn process_load_actor_requests(
             commands.entity(*old_root).despawn();
         }
 
-        let loaded = match &req.subject {
-            ActorSubject::Npc { file_id } => load_npc(*file_id),
-            ActorSubject::Pc {
-                race,
-                equipment,
-                main_weapon,
-                sub_weapon,
-            } => load_pc(*race, equipment, *main_weapon, *sub_weapon),
-        };
-        let loaded = match loaded {
-            Ok(l) => l,
-            Err(e) => {
-                warn!("ffxi actor load failed (entity {}): {e}", req.entity_id);
-                continue;
-            }
-        };
-
         let root = spawn_live_actor(
             &mut commands,
             &mut meshes,
             &mut materials,
             &mut images,
-            &loaded,
+            &prepared,
             wire_entity,
-            req.entity_id,
+            entity_id,
             1.0,
-            quality,
         );
 
         // A transient child carries the stretch: the wire entity is driven by

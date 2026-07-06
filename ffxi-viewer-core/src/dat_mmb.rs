@@ -93,6 +93,7 @@ impl Plugin for DatOverlayPlugin {
             .init_resource::<crate::dat_mzb::LoadMzbInFlight>()
             .init_resource::<crate::dat_mzb::ZoneGeomCache>()
             .init_resource::<crate::dat_mzb::PendingWaterSpawns>()
+            .init_resource::<crate::ffxi_actor_render::ActorLoadInFlight>()
             .add_systems(
                 Update,
                 (
@@ -102,7 +103,8 @@ impl Plugin for DatOverlayPlugin {
                     crate::dat_mzb::poll_load_mzb_tasks,
                     crate::dat_mzb::spawn_zone_water,
                     process_load_mmb_requests,
-                    crate::ffxi_actor_render::process_load_actor_requests,
+                    crate::ffxi_actor_render::kick_load_actor_tasks,
+                    crate::ffxi_actor_render::poll_load_actor_tasks,
                     crate::ffxi_actor_render::tick_morph_in,
                 )
                     .chain(),
