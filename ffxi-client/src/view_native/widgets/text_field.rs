@@ -123,16 +123,42 @@ fn ime_commit_system(
     }
 }
 
+/// Tracks Ctrl/Super held-state from the `FocusedInput<KeyboardInput>` stream
+/// itself rather than `Res<ButtonInput<KeyCode>>`. bevy_input_focus's
+/// `dispatch_focused_input` fires observers via a *deferred* `Commands::trigger`,
+/// so this observer only runs after `keyboard_input_system` has already
+/// processed the whole frame's raw key events. Gamescope's OSK paste
+/// synthesizes a full Ctrl+V chord (down/down/up/up) within a single frame, so
+/// by the time the deferred observer runs — for any of those four events —
+/// `ButtonInput<KeyCode>` already reflects Ctrl as released. Reconstructing
+/// modifier state from the events as this observer sees them, in their
+/// original per-event order, sidesteps that entirely.
+#[derive(Default)]
+struct KeyModifierTracker {
+    ctrl: bool,
+    super_: bool,
+}
+
 fn text_field_on_key(
     mut ev: On<FocusedInput<KeyboardInput>>,
     mut q: Query<&mut TextField>,
-    keys: Res<ButtonInput<KeyCode>>,
+    mut modifiers: Local<KeyModifierTracker>,
     mut commands: Commands,
 ) {
+    let input = &ev.event().input;
+    match input.key_code {
+        KeyCode::ControlLeft | KeyCode::ControlRight => {
+            modifiers.ctrl = input.state == ButtonState::Pressed;
+        }
+        KeyCode::SuperLeft | KeyCode::SuperRight => {
+            modifiers.super_ = input.state == ButtonState::Pressed;
+        }
+        _ => {}
+    }
+
     let Ok(mut field) = q.get_mut(ev.focused_entity) else {
         return;
     };
-    let input = &ev.event().input;
     if input.state != ButtonState::Pressed {
         return;
     }
@@ -141,20 +167,7 @@ fn text_field_on_key(
         return;
     }
 
-    let cmd_or_ctrl = keys.pressed(KeyCode::SuperLeft)
-        || keys.pressed(KeyCode::SuperRight)
-        || keys.pressed(KeyCode::ControlLeft)
-        || keys.pressed(KeyCode::ControlRight);
-    tracing::debug!(
-        key_code = ?input.key_code,
-        logical_key = ?input.logical_key,
-        cmd_or_ctrl,
-        ctrl_left = keys.pressed(KeyCode::ControlLeft),
-        ctrl_right = keys.pressed(KeyCode::ControlRight),
-        super_left = keys.pressed(KeyCode::SuperLeft),
-        super_right = keys.pressed(KeyCode::SuperRight),
-        "text_field: key event"
-    );
+    let cmd_or_ctrl = modifiers.ctrl || modifiers.super_;
     if cmd_or_ctrl {
         match input.key_code {
             KeyCode::KeyV => {
