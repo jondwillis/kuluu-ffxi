@@ -10,7 +10,7 @@ use ffxi_client::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
 use ffxi_client::secret_store::SecretStore;
 
 use super::common::{hint, panel_node, row, screen_root, spawn_close_titlebar};
-use super::{LauncherState, ServerSelectCursor, ServerSelectForm};
+use super::{LauncherState, RuntimeHandle, ServerSelectCursor, ServerSelectForm};
 
 #[derive(Component)]
 pub(super) struct ServerSelectRoot;
@@ -86,7 +86,8 @@ pub(super) fn spawn_ui(
                                       mut cursor: ResMut<ServerSelectCursor>,
                                       mut form: ResMut<ServerSelectForm>,
                                       mut login: ResMut<super::LoginForm>,
-                                      mut next: ResMut<NextState<LauncherState>>| {
+                                      mut next: ResMut<NextState<LauncherState>>,
+                                      runtime: Res<RuntimeHandle>| {
                                     cursor.0 = idx;
                                     form.selected = Some(pick_name.clone());
                                     let store = launcher_store::load();
@@ -96,18 +97,14 @@ pub(super) fn spawn_ui(
                                         super::apply_server_profile(&mut commands, profile);
                                     }
 
-                                    if let Some(acct) =
-                                        store.preselect_account_for(&pick_name)
-                                    {
+                                    if let Some(acct) = store.preselect_account_for(&pick_name) {
                                         login.user = acct.username.clone();
                                         login.remember_password = acct.remember_password;
                                         login.pass = if acct.remember_password {
                                             SecretStore::get(
+                                                &runtime.0,
                                                 KEYRING_SERVICE,
-                                                &keyring_account_key(
-                                                    &pick_name,
-                                                    &acct.username,
-                                                ),
+                                                &keyring_account_key(&pick_name, &acct.username),
                                             )
                                             .unwrap_or_default()
                                         } else {

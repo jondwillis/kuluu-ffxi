@@ -15,8 +15,8 @@ use super::common::{
 };
 use super::server_version_check::{ServerVersionStatus, VersionViolation};
 use super::{
-    Credentials, LauncherState, LoginErrorMsg, LoginErrorReturn, LoginField, LoginForm, ServerInfo,
-    ServerSelectForm,
+    Credentials, LauncherState, LoginErrorMsg, LoginErrorReturn, LoginField, LoginForm,
+    RuntimeHandle, ServerInfo, ServerSelectForm,
 };
 use crate::view_native::widgets::text_field::{text_field, TextFieldSubmitted};
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
@@ -233,12 +233,14 @@ fn spawn_saved_accounts_row(
             .observe(
                 move |_ev: On<Activate>,
                       mut login: ResMut<LoginForm>,
-                      mut dirty: ResMut<LoginUiDirty>| {
+                      mut dirty: ResMut<LoginUiDirty>,
+                      runtime: Res<RuntimeHandle>| {
                     login.user = pick_user.clone();
                     login.pass.clear();
                     login.remember_password = pick_remember;
                     if pick_remember {
                         if let Some(pw) = SecretStore::get(
+                            &runtime.0,
                             KEYRING_SERVICE,
                             &keyring_account_key(&pick_server, &pick_user),
                         ) {
@@ -265,7 +267,8 @@ fn spawn_saved_accounts_row(
             .observe(
                 move |_ev: On<Activate>,
                       mut login: ResMut<LoginForm>,
-                      mut dirty: ResMut<LoginUiDirty>| {
+                      mut dirty: ResMut<LoginUiDirty>,
+                      runtime: Res<RuntimeHandle>| {
                     let mut store = launcher_store::load();
                     store
                         .accounts
@@ -279,6 +282,7 @@ fn spawn_saved_accounts_row(
                         tracing::warn!(error = %e, "launcher_store: save failed");
                     }
                     SecretStore::delete(
+                        &runtime.0,
                         KEYRING_SERVICE,
                         &keyring_account_key(&forget_server, &forget_user),
                     );

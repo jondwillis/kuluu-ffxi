@@ -965,6 +965,7 @@ fn decide_initial_screen(
     mut server_form: ResMut<ServerSelectForm>,
     mut server_info: ResMut<ServerInfo>,
     mut next: ResMut<NextState<LauncherState>>,
+    runtime: Res<RuntimeHandle>,
 ) {
     if !err.0.is_empty() {
         return;
@@ -997,6 +998,7 @@ fn decide_initial_screen(
         form.remember_password = prefill.account.remember_password;
         if prefill.account.remember_password {
             if let Some(pw) = ffxi_client::secret_store::SecretStore::get(
+                &runtime.0,
                 ffxi_client::launcher_store::KEYRING_SERVICE,
                 &ffxi_client::launcher_store::keyring_account_key(
                     &prefill.account.server_name,

@@ -5,6 +5,7 @@ use bevy::prelude::*;
 use ffxi_client::auth_client::AuthClient;
 use ffxi_client::lobby_client::{LobbyClient, LobbyHandle, MapHandoff};
 use ffxi_client::session::InitialState;
+use tokio::runtime::Handle as RtHandle;
 use tokio::sync::oneshot;
 
 use crate::launcher::Selection;
@@ -19,7 +20,13 @@ use super::{
 use ffxi_client::launcher_store::{self, keyring_account_key, SavedAccount, KEYRING_SERVICE};
 use ffxi_client::secret_store::SecretStore;
 
-fn save_on_success(server_name: &str, username: &str, password: &str, remember: bool) {
+fn save_on_success(
+    runtime: &RtHandle,
+    server_name: &str,
+    username: &str,
+    password: &str,
+    remember: bool,
+) {
     let mut store = launcher_store::load();
 
     store
@@ -39,9 +46,9 @@ fn save_on_success(server_name: &str, username: &str, password: &str, remember: 
     }
     let key = keyring_account_key(server_name, username);
     if remember {
-        SecretStore::set(KEYRING_SERVICE, &key, password);
+        SecretStore::set(runtime, KEYRING_SERVICE, &key, password);
     } else {
-        SecretStore::delete(KEYRING_SERVICE, &key);
+        SecretStore::delete(runtime, KEYRING_SERVICE, &key);
     }
 }
 
@@ -124,6 +131,7 @@ pub(super) fn poll_auth_system(
     form: Res<LoginForm>,
     server_form: Res<ServerSelectForm>,
     server_info: Res<super::ServerInfo>,
+    runtime: Res<RuntimeHandle>,
 ) {
     match chan.rx.try_recv() {
         Ok(Ok(ok)) => {
@@ -141,7 +149,13 @@ pub(super) fn poll_auth_system(
                 .selected
                 .clone()
                 .unwrap_or_else(|| server_info.server.clone());
-            save_on_success(&server_name, &ok.user, &ok.pass, form.remember_password);
+            save_on_success(
+                &runtime.0,
+                &server_name,
+                &ok.user,
+                &ok.pass,
+                form.remember_password,
+            );
             creds.user = ok.user;
             creds.pass = ok.pass;
             commands.remove_resource::<AuthInFlightChan>();
