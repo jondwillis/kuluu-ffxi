@@ -3,6 +3,7 @@ pub mod camera_collision;
 pub mod collision_bvh;
 pub mod debug_heights;
 pub mod exit_watchdog;
+mod gamepad_input;
 pub mod input;
 pub mod launcher_backdrop;
 pub mod launcher_ui;
@@ -211,6 +212,9 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             title: format!("ffxi-client — {server}"),
             resolution: (1280u32, 800u32).into(),
             mode: window_mode,
+            // Lets Wayland/gamescope show the Steam Deck's on-screen keyboard
+            // when a text field gains focus; off by default.
+            ime_enabled: true,
             ..default()
         }),
         ..default()
@@ -419,6 +423,20 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     app.init_resource::<input::TabCycleStack>();
     app.init_resource::<input::SelectTargetMode>();
+    app.init_resource::<gamepad_input::GamepadAxisHeld>();
+
+    app.add_systems(
+        Update,
+        gamepad_input::gamepad_launcher_nav_system.run_if(in_state(AppPhase::Launcher)),
+    );
+
+    // PreUpdate so the held/released KeyCodes it synthesizes are already in
+    // place before this frame's FixedUpdate (dispatch_movement_system) and
+    // Update (handle_input_system) steps read `ButtonInput<KeyCode>`.
+    app.add_systems(
+        PreUpdate,
+        gamepad_input::gamepad_movement_camera_system.run_if(in_state(AppPhase::InGame)),
+    );
 
     app.add_systems(
         Update,
