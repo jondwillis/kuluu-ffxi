@@ -927,6 +927,12 @@ pub fn kick_load_mzb_tasks(
             let (submeshes, instances) = match load_mzb_placed(file_id, chunk_idx) {
                 Ok(s) => s,
                 Err(msg) => {
+                    warn!(
+                        file_id,
+                        ?chunk_idx,
+                        error = %msg,
+                        "load_mzb_placed: zone mesh load failed"
+                    );
                     return LoadedZoneGeom {
                         submeshes: Arc::new(Vec::new()),
                         instances: Arc::new(Vec::new()),
@@ -1168,15 +1174,14 @@ fn spawn_mzb_overlay(
     let submeshes: &[MzbSubMesh] = geom.submeshes.as_slice();
     let instances: &[MzbInstance] = geom.instances.as_slice();
     if submeshes.is_empty() || instances.is_empty() {
-        push_system_msg(
-            toasts,
-            format!(
-                "/load_mzb {}: 0 renderable meshes ({} submeshes, {} instances)",
-                req.file_id,
-                submeshes.len(),
-                instances.len(),
-            ),
-        );
+        let reason = match &geom.mmb_spawns {
+            Err(msg) => format!(": {msg}"),
+            Ok(_) => String::new(),
+        };
+        toasts.write(crate::snapshot::ToastEvent::system(format!(
+            "zone {}: mesh load failed, nothing will render here{reason}",
+            req.file_id,
+        )));
         return;
     }
 
