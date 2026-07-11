@@ -135,7 +135,9 @@ bevy_framepace = { version = "0.21", optional = true, default-features = false }
 # System clipboard. Used by `/copy` to push recent system-toast lines to
 # the OS clipboard. Optional + gated on `native-window` because the
 # headless/relay binary has no GUI session and no clipboard to write to.
-arboard = { version = "3", optional = true, default-features = false }
+arboard = { version = "3", optional = true, default-features = false, features = [
+    "wayland-data-control",
+] }
 # Native folder picker for the launcher Settings screen (FFXI_DAT_PATH /
 # FFXI_NAVMESH_DIR "Browse…" buttons). On Linux we deliberately select the
 # `xdg-portal` backend instead of rfd's default `gtk3` so the Steam Deck
