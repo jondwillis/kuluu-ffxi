@@ -145,6 +145,16 @@ fn text_field_on_key(
         || keys.pressed(KeyCode::SuperRight)
         || keys.pressed(KeyCode::ControlLeft)
         || keys.pressed(KeyCode::ControlRight);
+    tracing::debug!(
+        key_code = ?input.key_code,
+        logical_key = ?input.logical_key,
+        cmd_or_ctrl,
+        ctrl_left = keys.pressed(KeyCode::ControlLeft),
+        ctrl_right = keys.pressed(KeyCode::ControlRight),
+        super_left = keys.pressed(KeyCode::SuperLeft),
+        super_right = keys.pressed(KeyCode::SuperRight),
+        "text_field: key event"
+    );
     if cmd_or_ctrl {
         match input.key_code {
             KeyCode::KeyV => {
