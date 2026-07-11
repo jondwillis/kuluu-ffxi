@@ -1488,10 +1488,9 @@ pub fn auto_load_zone_geometry_system(
             );
         }
         None => {
-            push_system_msg(
-                &mut toasts,
-                format!("auto-load: no DAT mapping for zone {zone_id} (Phase 11b table pending)"),
-            );
+            toasts.write(crate::snapshot::ToastEvent::system(format!(
+                "zone {zone_id}: no client-side geometry available, nothing will render here"
+            )));
         }
     }
 }
