@@ -7,6 +7,7 @@ use bevy::input_focus::tab_navigation::TabIndex;
 use bevy::input_focus::{FocusedInput, InputFocus};
 use bevy::prelude::*;
 use bevy::ui_widgets::ValueChange;
+use bevy::window::Ime;
 
 #[derive(Component, Default, Debug, Clone)]
 pub struct TextField {
@@ -72,7 +73,42 @@ pub struct TextFieldPlugin;
 impl Plugin for TextFieldPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(text_field_on_key)
-            .add_systems(Update, (sync_display, sync_focus_border));
+            .add_systems(Update, (sync_display, sync_focus_border, ime_commit_system));
+    }
+}
+
+/// Gamescope's on-screen keyboard (and other IME-driven virtual keyboards)
+/// inserts and pastes text via `Ime::Commit` rather than synthesizing
+/// `Ctrl+V`/per-character `KeyboardInput`, so it bypasses `text_field_on_key`
+/// entirely unless handled here too.
+fn ime_commit_system(
+    mut ime_events: MessageReader<Ime>,
+    focus: Option<Res<InputFocus>>,
+    mut q: Query<&mut TextField>,
+    mut commands: Commands,
+) {
+    let Some(focused) = focus.and_then(|f| f.0) else {
+        return;
+    };
+    for ev in ime_events.read() {
+        let Ime::Commit { value, .. } = ev else {
+            continue;
+        };
+        let Ok(mut field) = q.get_mut(focused) else {
+            continue;
+        };
+        let sanitized: String = value.chars().filter(|c| !c.is_control()).collect();
+        if sanitized.is_empty() {
+            continue;
+        }
+        let cur = field.cursor;
+        field.value.insert_str(cur, &sanitized);
+        field.cursor = cur + sanitized.len();
+        let value = field.value.clone();
+        commands.trigger(ValueChange {
+            source: focused,
+            value,
+        });
     }
 }
 
