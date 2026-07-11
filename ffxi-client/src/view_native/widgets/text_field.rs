@@ -72,6 +72,17 @@ pub struct TextFieldPlugin;
 
 impl Plugin for TextFieldPlugin {
     fn build(&self, app: &mut App) {
+        // Gamescope's OSK paste gesture synthesizes Ctrl-down and V-down
+        // within the same PreUpdate tick, unlike a physical keyboard where
+        // they always land frames apart. Without this ordering, dispatch
+        // (which triggers text_field_on_key) can run before
+        // keyboard_input_system has recorded the Ctrl-down in
+        // `ButtonInput<KeyCode>`, so the paste's Ctrl+V reads as an
+        // unmodified 'V' and inserts a literal "v" instead of pasting.
+        app.configure_sets(
+            PreUpdate,
+            bevy::input_focus::InputFocusSystems::Dispatch.after(bevy::input::InputSystems),
+        );
         app.add_observer(text_field_on_key)
             .add_systems(Update, (sync_display, sync_focus_border, ime_commit_system));
     }
