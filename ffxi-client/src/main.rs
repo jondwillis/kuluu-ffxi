@@ -132,6 +132,26 @@ fn main() -> Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
+    // A file sink alongside stderr so a log always exists at a fixed,
+    // discoverable path regardless of how the client was launched (a bare
+    // terminal invocation with no redirect, or a Steam/gamescope entry with
+    // no terminal at all) — stderr-only logging is invisible in both cases.
+    let log_file = ffxi_client::config_dir::log_file("client.log")
+        .ok()
+        .and_then(|path| {
+            path.parent().map(std::fs::create_dir_all);
+            match std::fs::File::create(&path) {
+                Ok(f) => {
+                    eprintln!("logging to {}", path.display());
+                    Some(f)
+                }
+                Err(e) => {
+                    eprintln!("warning: could not open log file {}: {e}", path.display());
+                    None
+                }
+            }
+        });
+
     // Held for the lifetime of main so the chrome layer flushes its
     // trace-<n>.json when the app exits cleanly (close the window / Esc out —
     // a hard kill skips the flush).
@@ -143,15 +163,29 @@ fn main() -> Result<()> {
         tracing_subscriber::registry()
             .with(env_filter)
             .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .with(log_file.map(|f| {
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(f))
+            }))
             .with(chrome_layer)
             .init();
         guard
     };
     #[cfg(not(feature = "trace"))]
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(env_filter)
-        .init();
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .with(log_file.map(|f| {
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(f))
+            }))
+            .init();
+    }
 
     ffxi_client::launcher_store::load().settings.apply_to_env();
 
