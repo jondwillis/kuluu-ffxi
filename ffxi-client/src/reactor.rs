@@ -1235,7 +1235,7 @@ mod tests {
             account_id: 0,
             char_id,
             character: "Tester".into(),
-            zone_id: 0,
+            zone_id: Some(0),
         }
     }
 

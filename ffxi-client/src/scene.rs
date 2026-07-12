@@ -214,7 +214,7 @@ mod tests {
             account_id: 1,
             char_id: 42,
             character: "Vanari".into(),
-            zone_id: 230,
+            zone_id: Some(230),
         });
         s.apply_event(&AgentEvent::StageChanged {
             stage: Stage::InZone,
@@ -474,7 +474,7 @@ mod tests {
             account_id: 0,
             char_id: 42,
             character: "Vanari".into(),
-            zone_id: 230,
+            zone_id: Some(230),
         });
         s.apply_event(&AgentEvent::StageChanged {
             stage: Stage::InZone,

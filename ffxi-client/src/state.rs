@@ -572,7 +572,9 @@ impl SessionState {
                 self.account_id = Some(*account_id);
                 self.char_id = Some(*char_id);
                 self.character = Some(character.clone());
-                self.zone_id = Some(*zone_id);
+                if let Some(z) = zone_id {
+                    self.zone_id = Some(*z);
+                }
             }
             AgentEvent::StageChanged { stage } => {
                 self.stage = *stage;
@@ -951,7 +953,13 @@ pub enum AgentEvent {
         account_id: u32,
         char_id: u32,
         character: String,
-        zone_id: u16,
+        /// `None` means the zone isn't known yet at handshake time (the
+        /// server's 0x00A LOGIN hasn't been parsed) — leaves the existing
+        /// `zone_id` untouched rather than stomping it with a placeholder.
+        /// A hardcoded `0` here previously flashed the client into believing
+        /// it was in FFXI's meshless "Demonstration Area" on every
+        /// supervisor-driven reconnect, even mid-session in a real zone.
+        zone_id: Option<u16>,
     },
     StageChanged {
         stage: Stage,
@@ -1884,7 +1892,7 @@ mod tests {
             account_id: 42,
             char_id: 7,
             character: "Tester".into(),
-            zone_id: 100,
+            zone_id: Some(100),
         });
         assert_eq!(s.account_id, Some(42));
         assert_eq!(s.char_id, Some(7));
@@ -2423,7 +2431,7 @@ mod tests {
             account_id: 1,
             char_id: 99,
             character: "Self".into(),
-            zone_id: 230,
+            zone_id: Some(230),
         });
 
         assert!(s.self_position().is_none());

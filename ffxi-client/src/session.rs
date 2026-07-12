@@ -253,7 +253,13 @@ async fn run_map_session(
             account_id: 0,
             char_id: bootstrap.char_id,
             character: bootstrap.char_name.to_string(),
-            zone_id: 0,
+            // The 0x00A LOGIN carrying the real zone hasn't been parsed yet
+            // at handshake time. A hardcoded 0 here used to flash the client
+            // into believing it was in zone 0 (FFXI's meshless "Demonstration
+            // Area") on every supervisor-driven reconnect, even mid-session
+            // in a real zone — None leaves the last-known zone_id untouched
+            // until the real ZoneChanged/LOGIN update arrives.
+            zone_id: None,
         });
     }
     emit_stage(event_tx, Stage::Zoning);
@@ -1443,7 +1449,7 @@ async fn keepalive_loop(
                             account_id: 0,
                             char_id: self_char_id,
                             character: character_name.clone(),
-                            zone_id: current_zone_id,
+                            zone_id: Some(current_zone_id),
                         });
                         let _ = event_tx.send(AgentEvent::StageChanged {
                             stage: Stage::InZone,
