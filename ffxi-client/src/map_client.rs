@@ -187,6 +187,12 @@ impl MapClient {
                 sub_opcodes = opcodes.join(" "),
                 "recv"
             );
+        } else {
+            // Distinguishes "received something the server sent that decoded
+            // to zero sub-packets" (bare ack/keepalive) from "received
+            // nothing at all" — the two look identical from the caller's
+            // silence alone, but only one means the map connection is alive.
+            tracing::info!(bytes = n, src = %src, "recv (0 sub-packets)");
         }
 
         Ok(out)

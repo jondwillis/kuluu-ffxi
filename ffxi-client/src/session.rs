@@ -249,8 +249,19 @@ async fn run_map_session(
     cmd_rx: &mut mpsc::Receiver<AgentCommand>,
     event_tx: &broadcast::Sender<AgentEvent>,
 ) -> Result<MapOutcome> {
+    tracing::info!(
+        iteration,
+        server_addr = %map.server_addr(),
+        char_id = bootstrap.char_id,
+        "sending map-server bootstrap (1/2)"
+    );
     map.send_bootstrap(bootstrap).await?;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tracing::info!(
+        iteration,
+        server_addr = %map.server_addr(),
+        "sending map-server bootstrap (2/2)"
+    );
     map.send_bootstrap(bootstrap).await?;
 
     if iteration == 1 {
@@ -324,10 +335,23 @@ async fn run_map_session(
                 }
             }
 
-            Ok(Err(_)) => break,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    iteration,
+                    error = %e,
+                    "zone-in flood: recv_decrypted failed, aborting flood early"
+                );
+                break;
+            }
 
             Err(_elapsed) => {
                 if should_break_flood(self_pos_seeded) {
+                    tracing::warn!(
+                        iteration,
+                        total_subs,
+                        "zone-in flood: 500ms recv timeout with no self-position seed, \
+                         aborting flood early"
+                    );
                     break;
                 }
             }
