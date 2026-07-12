@@ -33,7 +33,7 @@ impl Default for SupervisorConfig {
 }
 
 pub async fn run(
-    cfg: session::Config,
+    mut cfg: session::Config,
     mut external_cmd_rx: mpsc::Receiver<AgentCommand>,
     event_tx: broadcast::Sender<AgentEvent>,
     sup_cfg: SupervisorConfig,
@@ -65,6 +65,15 @@ pub async fn run(
         let reactor_event_tx = event_tx.clone();
         let reactor_cfg_clone = reactor_cfg;
         let cfg_clone = cfg.clone();
+        // The launcher UI's already-completed auth+lobby handshake (initial_state)
+        // is only valid for this first attempt. Reusing it on a supervisor-driven
+        // reconnect sends the map server a stale, already-consumed key3 that it
+        // can't validate — packets go unrecognized, the map server's own pending
+        // session for this character silently times out after MAX_TIME_LASTUPDATE
+        // (60s, matching our own MAP_SILENCE_TIMEOUT), and the client sits waiting
+        // the whole time for a connection that was never going to complete.
+        // Clearing it here forces every retry to authenticate fresh.
+        cfg.initial_state = None;
         let mut reactor_handle = tokio::spawn(async move {
             reactor::run(cfg_clone, inner_rx, reactor_event_tx, reactor_cfg_clone).await
         });
