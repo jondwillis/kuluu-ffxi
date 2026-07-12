@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use ffxi_proto::{decode, framing};
+use rand::Rng;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::auth_client::AuthClient;
@@ -111,10 +112,14 @@ pub async fn run(
 
             emit_stage(&event_tx, Stage::LobbyHandshake);
             let lobby = LobbyClient::new(cfg.server.clone(), cfg.data_port, cfg.view_port);
+            // Must be fresh per login attempt: LSB stores this verbatim as
+            // accounts_sessions.session_key (src/login/data_session.cpp) and
+            // the map server keys its session/blowfish lookup off it — a
+            // repeated key3 can collide with a stale row from an earlier
+            // attempt that was never cleaned up, silently breaking the new
+            // connection.
             let mut key3 = [0u8; 20];
-            for (i, b) in key3.iter_mut().enumerate() {
-                *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
-            }
+            rand::rng().fill(&mut key3);
             let (char_id, handoff) = match &cfg.char_selection {
                 CharSelection::Id(cid) => {
                     let handoff = lobby

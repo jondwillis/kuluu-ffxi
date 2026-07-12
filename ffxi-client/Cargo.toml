@@ -83,6 +83,10 @@ clap.workspace = true
 # distinct from the JSON flavor's anyhow! bails.
 mac_address = "1"
 thiserror = "2"
+# Generates the map-server session key (key3) fresh per login attempt; it
+# must never repeat across connections (LSB stores it verbatim as
+# accounts_sessions.session_key and keys map-server session lookups off it).
+rand = "0.9"
 # Native per-platform user config dir (macOS ~/Library/Application Support,
 # Windows %APPDATA%\Roaming, Linux $XDG_CONFIG_HOME else ~/.config) for the
 # launcher/graphics/keybinds/goal stores. Wraps the OS APIs and applies the XDG
