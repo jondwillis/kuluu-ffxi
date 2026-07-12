@@ -25,6 +25,10 @@ pub mod c2s {
 
     pub const EQUIP_SET: u16 = 0x050;
 
+    // GP_CLI_COMMAND_MYROOM_JOB, vendor/server/src/map/packets/c2s/0x100_myroom_job.h.
+    // Mog House job change: MainJobIndex u8, SupportJobIndex u8 (0 = keep current).
+    pub const MYROOM_JOB: u16 = 0x100;
+
     // GP_CLI_COMMAND_ITEM_STACK, vendor/server/src/map/packets/c2s/0x03a_item_stack.h.
     // "Sort" for a container: the server consolidates same-id partial stacks.
     // Payload is a single u32 Category = container id (LOC_INVENTORY = 0).
@@ -108,6 +112,14 @@ pub mod s2c {
     pub const CHAR_NPC: u16 = 0x00E;
 
     pub const CHAR_STATUS: u16 = 0x037;
+
+    // GP_SERV_COMMAND_JOB_INFO, vendor/server/src/map/packets/s2c/0x01b_job_info.h.
+    // Per-job levels + unlocked-jobs bitmask for the self character.
+    pub const JOB_INFO: u16 = 0x01B;
+
+    // GP_SERV_COMMAND_OPENMOGMENU, vendor/server/src/map/packets/s2c/0x02e_openmogmenu.h.
+    // Header-only: tells the client to open the Mog House menu.
+    pub const OPENMOGMENU: u16 = 0x02E;
 
     // GP_SERV_COMMAND_CLISTATUS, vendor/server/src/map/packets/s2c/0x061_clistatus.h.
     // Self-character stat block: HP/MP max, base+gear stats, attack/defense, resists, iLv.

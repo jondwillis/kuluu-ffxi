@@ -45,6 +45,8 @@ mod tests {
             (s2c::CHAR_PC, "CHAR_PC"),
             (s2c::CHAR_NPC, "CHAR_NPC"),
             (s2c::CHAR_STATUS, "CHAR_STATUS"),
+            (s2c::JOB_INFO, "JOB_INFO"),
+            (s2c::OPENMOGMENU, "OPENMOGMENU"),
             (s2c::CHAT, "CHAT"),
             (s2c::ITEM_MAX, "ITEM_MAX"),
             (s2c::ITEM_SAME, "ITEM_SAME"),
@@ -99,6 +101,7 @@ mod tests {
             (c2s::SHOP_BUY, "SHOP_BUY"),
             (c2s::EQUIP_SET, "EQUIP_SET"),
             (c2s::ITEM_STACK, "ITEM_STACK"),
+            (c2s::MYROOM_JOB, "MYROOM_JOB"),
             (c2s::REQ_LOGOUT, "REQ_LOGOUT"),
         ] {
             assert!(

@@ -372,6 +372,66 @@ const _: () = {
     assert!(NpcState::ANIMATIONSUB_OFFSET < LookData::LOOK_BODY_OFFSET);
 };
 
+/// s2c 0x00A Mog House cluster. Body offsets follow
+/// vendor/server/src/map/packets/s2c/0x00a_login.h:115-127; `login_state` values are
+/// the SAVE_LOGIN_STATE enum (h:50-59). `map_number` is the MH interior MODEL id
+/// (GetMogHouseModelID, 0x00a_login.cpp:35-72), NOT a zone id; `mog_zone_flag` is
+/// only assigned in the non-MH branch (.cpp: CanUseMisc(MISC_MOGMENU)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerLoginMyroom {
+    pub login_state: u32,
+    pub sub_map_number: u8,
+    pub map_number: u16,
+    pub exit_bit: u8,
+    pub mog_zone_flag: u8,
+}
+
+impl ServerLoginMyroom {
+    pub const LOGIN_STATE_MYROOM: u32 = 1;
+    pub const LOGIN_STATE_GAME: u32 = 2;
+
+    /// MyroomMapNumber sentinel "not in a Mog House" (0x00a_login.cpp non-MH branch).
+    pub const MYROOM_NONE: u16 = 0x01FF;
+
+    /// MyroomSubMapNumber value while on the MH second floor (0x00a_login.cpp MH branch).
+    pub const SUB_MAP_2F: u8 = 0x02;
+
+    pub const LOGIN_STATE_OFFSET: usize = 0x7C;
+    pub const SUB_MAP_NUMBER_OFFSET: usize = 0xA4;
+    pub const MAP_NUMBER_OFFSET: usize = 0xA6;
+    pub const EXIT_BIT_OFFSET: usize = 0xAA;
+    pub const MOG_ZONE_FLAG_OFFSET: usize = 0xAB;
+    pub const MIN_LEN: usize = Self::MOG_ZONE_FLAG_OFFSET + 1;
+
+    fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() < Self::MIN_LEN {
+            return None;
+        }
+        Some(Self {
+            login_state: u32::from_le_bytes(
+                body[Self::LOGIN_STATE_OFFSET..Self::LOGIN_STATE_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
+            ),
+            sub_map_number: body[Self::SUB_MAP_NUMBER_OFFSET],
+            map_number: u16::from_le_bytes(
+                body[Self::MAP_NUMBER_OFFSET..Self::MAP_NUMBER_OFFSET + 2]
+                    .try_into()
+                    .unwrap(),
+            ),
+            exit_bit: body[Self::EXIT_BIT_OFFSET],
+            mog_zone_flag: body[Self::MOG_ZONE_FLAG_OFFSET],
+        })
+    }
+
+    /// The MH interior model id, only when the server actually placed the player in a
+    /// Mog House (LoginState MYROOM with a real model).
+    pub fn myroom_model(&self) -> Option<u16> {
+        (self.login_state == Self::LOGIN_STATE_MYROOM && self.map_number != Self::MYROOM_NONE)
+            .then_some(self.map_number)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ServerLogin {
     pub unique_no: u32,
@@ -383,6 +443,8 @@ pub struct ServerLogin {
     pub pos_head: PosHead,
 
     pub music_num: Option<[u16; 5]>,
+
+    pub myroom: Option<ServerLoginMyroom>,
 }
 
 impl ServerLogin {
@@ -429,6 +491,7 @@ impl ServerLogin {
             game_time,
             pos_head,
             music_num,
+            myroom: ServerLoginMyroom::decode(body),
         })
     }
 }
@@ -511,6 +574,10 @@ const _: () = assert!(CharStatus::SPEED_OFFSET + 2 <= CharStatus::MIN_LEN);
 pub struct CliStatus {
     pub hp_max: u32,
     pub mp_max: u32,
+    pub mjob_no: u8,
+    pub mjob_lv: u8,
+    pub sjob_no: u8,
+    pub sjob_lv: u8,
     pub bp_base: [u16; 7],
     pub bp_adj: [i16; 7],
     pub attack: u16,
@@ -520,6 +587,12 @@ pub struct CliStatus {
 }
 
 impl CliStatus {
+    // vendor/server/src/map/packets/s2c/0x061_clistatus.h:45-82 — the four job bytes
+    // sit between mpmax (@4) and exp_now (@12).
+    const MJOB_NO_OFFSET: usize = 8;
+    const MJOB_LV_OFFSET: usize = 9;
+    const SJOB_NO_OFFSET: usize = 10;
+    const SJOB_LV_OFFSET: usize = 11;
     const ILVL_OFFSET: usize = 81;
     const NEEDED: usize = Self::ILVL_OFFSET + 1;
 
@@ -543,12 +616,75 @@ impl CliStatus {
         Ok(Self {
             hp_max: rd32(0),
             mp_max: rd32(4),
+            mjob_no: body[Self::MJOB_NO_OFFSET],
+            mjob_lv: body[Self::MJOB_LV_OFFSET],
+            sjob_no: body[Self::SJOB_NO_OFFSET],
+            sjob_lv: body[Self::SJOB_LV_OFFSET],
             bp_base,
             bp_adj,
             attack: rd16(44),
             defense: rd16(46),
             def_elem,
             ilvl: body[Self::ILVL_OFFSET],
+        })
+    }
+}
+
+/// s2c 0x01B GP_SERV_COMMAND_JOB_INFO — per-job levels + unlocked-jobs bitmask for
+/// the self character. Body offsets follow the GP_MYROOM_DANCER struct in
+/// vendor/server/src/map/packets/s2c/0x01b_job_info.h:28-62 (filled in .cpp:30-57).
+/// `job_levels` reads `job_lev2` (the full `jobs.job[24]` memcpy, index = JOBTYPE);
+/// the legacy `job_lev[16]` @0x0C truncates at 16 jobs and is skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobInfo {
+    pub mjob_no: u8,
+    pub sjob_no: u8,
+    /// Bit N set = JOBTYPE N unlocked. Bit 0 is the subjob-feature flag, not a job
+    /// (`sjobflg = jobs.unlocked & 1`, 0x01b_job_info.cpp).
+    pub unlocked: u32,
+    pub sub_job_unlocked: bool,
+    pub job_levels: [u8; Self::MAX_JOBTYPE],
+    pub hp_max: i32,
+    pub mp_max: i32,
+    pub sjobflg: u8,
+}
+
+impl JobInfo {
+    /// MAX_JOBTYPE, vendor/server/src/map/entities/battleentity.h (JOBTYPE 1=WAR..23=MON).
+    pub const MAX_JOBTYPE: usize = 24;
+
+    pub const MJOB_NO_OFFSET: usize = 0x04;
+    pub const SJOB_NO_OFFSET: usize = 0x07;
+    pub const UNLOCKED_OFFSET: usize = 0x08;
+    pub const HP_MAX_OFFSET: usize = 0x38;
+    pub const MP_MAX_OFFSET: usize = 0x3C;
+    pub const SJOBFLG_OFFSET: usize = 0x40;
+    pub const JOB_LEVELS_OFFSET: usize = 0x44;
+    pub const MIN_LEN: usize = Self::JOB_LEVELS_OFFSET + Self::MAX_JOBTYPE;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::MIN_LEN {
+            return Err(DecodeError::Truncated(Self::MIN_LEN, body.len()));
+        }
+        let rdi32 = |o: usize| i32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+        let unlocked = u32::from_le_bytes(
+            body[Self::UNLOCKED_OFFSET..Self::UNLOCKED_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let mut job_levels = [0u8; Self::MAX_JOBTYPE];
+        job_levels.copy_from_slice(
+            &body[Self::JOB_LEVELS_OFFSET..Self::JOB_LEVELS_OFFSET + Self::MAX_JOBTYPE],
+        );
+        Ok(Self {
+            mjob_no: body[Self::MJOB_NO_OFFSET],
+            sjob_no: body[Self::SJOB_NO_OFFSET],
+            unlocked,
+            sub_job_unlocked: unlocked & 1 != 0,
+            job_levels,
+            hp_max: rdi32(Self::HP_MAX_OFFSET),
+            mp_max: rdi32(Self::MP_MAX_OFFSET),
+            sjobflg: body[Self::SJOBFLG_OFFSET],
         })
     }
 }
@@ -1063,11 +1199,17 @@ fn read_name_slot(slot: &[u8]) -> Option<String> {
 pub struct CharSync {
     pub targid: u16,
     pub id: u32,
+    /// MogExpansionFlag: MH second floor unlocked (`mhflag & 0x20`), byte 0x27 of the
+    /// full packet = body 0x23. vendor/server/src/map/packets/char_sync.cpp:61.
+    /// `None` when the packet is too short to carry it.
+    pub mh_2f_unlocked: Option<bool>,
 }
 
 impl CharSync {
     pub const SUB_TYPE: u8 = 0x02;
     pub const SIZE: usize = 8;
+
+    pub const MH_2F_UNLOCKED_OFFSET: usize = 0x23;
 
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
         if body.len() < Self::SIZE {
@@ -1076,6 +1218,7 @@ impl CharSync {
         Ok(Self {
             targid: u16::from_le_bytes(body[2..4].try_into().unwrap()),
             id: u32::from_le_bytes(body[4..8].try_into().unwrap()),
+            mh_2f_unlocked: body.get(Self::MH_2F_UNLOCKED_OFFSET).map(|&b| b != 0),
         })
     }
 }
@@ -1391,6 +1534,10 @@ mod tests {
         let mut buf = vec![0u8; 84];
         buf[0..4].copy_from_slice(&1946u32.to_le_bytes()); // hp_max
         buf[4..8].copy_from_slice(&1295u32.to_le_bytes()); // mp_max
+        buf[8] = 5; // mjob_no (RDM)
+        buf[9] = 75; // mjob_lv
+        buf[10] = 4; // sjob_no (BLM)
+        buf[11] = 37; // sjob_lv
         for i in 0..7 {
             buf[16 + i * 2..18 + i * 2].copy_from_slice(&((10 + i as u16) * 5).to_le_bytes());
             buf[30 + i * 2..32 + i * 2].copy_from_slice(&((i as i16 + 1) * 7).to_le_bytes());
@@ -1403,6 +1550,10 @@ mod tests {
         let cs = CliStatus::decode(&buf).expect("decodes");
         assert_eq!(cs.hp_max, 1946);
         assert_eq!(cs.mp_max, 1295);
+        assert_eq!(cs.mjob_no, 5);
+        assert_eq!(cs.mjob_lv, 75);
+        assert_eq!(cs.sjob_no, 4);
+        assert_eq!(cs.sjob_lv, 37);
         assert_eq!(cs.bp_base[0], 50, "STR base");
         assert_eq!(cs.bp_base[6], 80, "CHR base");
         assert_eq!(cs.bp_adj[0], 7, "STR gear delta");
@@ -1645,6 +1796,71 @@ mod tests {
             ServerLogin::decode(&buf),
             Err(DecodeError::Truncated(48, _))
         ));
+    }
+
+    #[test]
+    fn server_login_myroom_cluster_roundtrips() {
+        let mut buf = vec![0u8; 0x100];
+        buf[44..48].copy_from_slice(&230u32.to_le_bytes());
+        buf[ServerLoginMyroom::LOGIN_STATE_OFFSET..ServerLoginMyroom::LOGIN_STATE_OFFSET + 4]
+            .copy_from_slice(&ServerLoginMyroom::LOGIN_STATE_MYROOM.to_le_bytes());
+        buf[ServerLoginMyroom::SUB_MAP_NUMBER_OFFSET] = ServerLoginMyroom::SUB_MAP_2F;
+        buf[ServerLoginMyroom::MAP_NUMBER_OFFSET..ServerLoginMyroom::MAP_NUMBER_OFFSET + 2]
+            .copy_from_slice(&617u16.to_le_bytes());
+        buf[ServerLoginMyroom::EXIT_BIT_OFFSET] = 3;
+        buf[ServerLoginMyroom::MOG_ZONE_FLAG_OFFSET] = 1;
+
+        let l = ServerLogin::decode(&buf).unwrap();
+        let myroom = l.myroom.expect("full-size body carries the cluster");
+        assert_eq!(myroom.login_state, ServerLoginMyroom::LOGIN_STATE_MYROOM);
+        assert_eq!(myroom.sub_map_number, ServerLoginMyroom::SUB_MAP_2F);
+        assert_eq!(myroom.map_number, 617);
+        assert_eq!(myroom.exit_bit, 3);
+        assert_eq!(myroom.mog_zone_flag, 1);
+        assert_eq!(myroom.myroom_model(), Some(617));
+    }
+
+    #[test]
+    fn server_login_truncated_body_yields_no_myroom() {
+        let mut buf = vec![0u8; ServerLoginMyroom::MIN_LEN - 1];
+        buf[44..48].copy_from_slice(&230u32.to_le_bytes());
+        let l = ServerLogin::decode(&buf).unwrap();
+        assert_eq!(l.zone_no, 230);
+        assert!(l.myroom.is_none());
+    }
+
+    #[test]
+    fn server_login_myroom_jeuno_model_decodes() {
+        let mut buf = vec![0u8; 0x100];
+        buf[44..48].copy_from_slice(&243u32.to_le_bytes());
+        buf[ServerLoginMyroom::LOGIN_STATE_OFFSET..ServerLoginMyroom::LOGIN_STATE_OFFSET + 4]
+            .copy_from_slice(&ServerLoginMyroom::LOGIN_STATE_MYROOM.to_le_bytes());
+        buf[ServerLoginMyroom::MAP_NUMBER_OFFSET..ServerLoginMyroom::MAP_NUMBER_OFFSET + 2]
+            .copy_from_slice(&0x0100u16.to_le_bytes());
+
+        let myroom = ServerLogin::decode(&buf).unwrap().myroom.unwrap();
+        assert_eq!(myroom.myroom_model(), Some(0x0100));
+    }
+
+    #[test]
+    fn server_login_myroom_model_gated_on_state_and_sentinel() {
+        let mut buf = vec![0u8; 0x100];
+        buf[ServerLoginMyroom::LOGIN_STATE_OFFSET..ServerLoginMyroom::LOGIN_STATE_OFFSET + 4]
+            .copy_from_slice(&ServerLoginMyroom::LOGIN_STATE_GAME.to_le_bytes());
+        buf[ServerLoginMyroom::MAP_NUMBER_OFFSET..ServerLoginMyroom::MAP_NUMBER_OFFSET + 2]
+            .copy_from_slice(&ServerLoginMyroom::MYROOM_NONE.to_le_bytes());
+        let myroom = ServerLogin::decode(&buf).unwrap().myroom.unwrap();
+        assert_eq!(myroom.login_state, ServerLoginMyroom::LOGIN_STATE_GAME);
+        assert_eq!(myroom.myroom_model(), None, "GAME state carries no model");
+
+        buf[ServerLoginMyroom::LOGIN_STATE_OFFSET..ServerLoginMyroom::LOGIN_STATE_OFFSET + 4]
+            .copy_from_slice(&ServerLoginMyroom::LOGIN_STATE_MYROOM.to_le_bytes());
+        let myroom = ServerLogin::decode(&buf).unwrap().myroom.unwrap();
+        assert_eq!(
+            myroom.myroom_model(),
+            None,
+            "MYROOM with the 0x01FF sentinel carries no model"
+        );
     }
 
     #[test]
@@ -2114,6 +2330,77 @@ mod tests {
         let sync = CharSync::decode(&buf).unwrap();
         assert_eq!(sync.targid, 0x07F0);
         assert_eq!(sync.id, 0x0123_4567);
+        assert_eq!(
+            sync.mh_2f_unlocked, None,
+            "minimal body does not reach the 2F byte"
+        );
+    }
+
+    #[test]
+    fn char_sync_reads_mh_2f_unlock_bit() {
+        // char_sync.cpp builds a 0x28-byte packet → 0x24-byte body.
+        let mut buf = vec![0u8; 0x24];
+        buf[0] = CharSync::SUB_TYPE;
+        buf[4..8].copy_from_slice(&0x0123_4567u32.to_le_bytes());
+
+        let sync = CharSync::decode(&buf).unwrap();
+        assert_eq!(sync.mh_2f_unlocked, Some(false));
+
+        buf[CharSync::MH_2F_UNLOCKED_OFFSET] = 1;
+        let sync = CharSync::decode(&buf).unwrap();
+        assert_eq!(sync.mh_2f_unlocked, Some(true));
+    }
+
+    #[test]
+    fn job_info_decodes_synthetic_body() {
+        let mut buf = vec![0u8; 0x80];
+        buf[JobInfo::MJOB_NO_OFFSET] = 5; // RDM
+        buf[JobInfo::SJOB_NO_OFFSET] = 4; // BLM
+                                          // bit 0 = subjob feature, bits 1..6 = WAR..THF unlocked.
+        let unlocked: u32 = 0b0111_1111;
+        buf[JobInfo::UNLOCKED_OFFSET..JobInfo::UNLOCKED_OFFSET + 4]
+            .copy_from_slice(&unlocked.to_le_bytes());
+        buf[JobInfo::HP_MAX_OFFSET..JobInfo::HP_MAX_OFFSET + 4]
+            .copy_from_slice(&1946i32.to_le_bytes());
+        buf[JobInfo::MP_MAX_OFFSET..JobInfo::MP_MAX_OFFSET + 4]
+            .copy_from_slice(&1295i32.to_le_bytes());
+        buf[JobInfo::SJOBFLG_OFFSET] = 1;
+        for j in 0..JobInfo::MAX_JOBTYPE {
+            buf[JobInfo::JOB_LEVELS_OFFSET + j] = j as u8 * 3;
+        }
+        // Legacy truncated job_lev[16] @0x0C left zeroed: proves we read job_lev2.
+        let info = JobInfo::decode(&buf).unwrap();
+        assert_eq!(info.mjob_no, 5);
+        assert_eq!(info.sjob_no, 4);
+        assert_eq!(info.unlocked, unlocked);
+        assert!(info.sub_job_unlocked);
+        assert_eq!(info.hp_max, 1946);
+        assert_eq!(info.mp_max, 1295);
+        assert_eq!(info.sjobflg, 1);
+        assert_eq!(info.job_levels[1], 3, "WAR");
+        assert_eq!(
+            info.job_levels[22], 66,
+            "RUN — beyond the legacy 16-job array"
+        );
+    }
+
+    #[test]
+    fn job_info_truncated_errors() {
+        let buf = vec![0u8; JobInfo::MIN_LEN - 1];
+        assert!(matches!(
+            JobInfo::decode(&buf),
+            Err(DecodeError::Truncated(_, _))
+        ));
+    }
+
+    #[test]
+    fn job_info_without_subjob_flag() {
+        let mut buf = vec![0u8; JobInfo::MIN_LEN];
+        buf[JobInfo::UNLOCKED_OFFSET..JobInfo::UNLOCKED_OFFSET + 4]
+            .copy_from_slice(&0b0000_0110u32.to_le_bytes());
+        let info = JobInfo::decode(&buf).unwrap();
+        assert!(!info.sub_job_unlocked);
+        assert_eq!(info.sjobflg, 0);
     }
 
     #[test]

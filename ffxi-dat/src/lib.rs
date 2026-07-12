@@ -33,6 +33,7 @@ pub mod vos2;
 pub mod vtable;
 pub mod weather;
 pub mod zone_dat;
+pub mod zone_interaction;
 
 pub use archive::{DatLocation, DatRoot};
 pub use chunk::{walk, walk_tree, Chunk, ChunkNode, ChunkWalker};
@@ -82,6 +83,9 @@ pub enum DatError {
 
     #[error("Weather error: {0}")]
     Weather(String),
+
+    #[error("RID error: {0}")]
+    Rid(String),
 
     #[error("FFXiMain.dll marker {hint:#010x} not found")]
     DllMarkerNotFound { hint: u32 },
