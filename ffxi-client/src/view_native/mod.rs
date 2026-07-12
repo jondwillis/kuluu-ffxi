@@ -673,18 +673,26 @@ fn return_to_launcher_on_disconnect(
         return;
     }
 
-    let kind = events
-        .as_ref()
-        .and_then(|log| {
-            log.recent.iter().rev().find_map(|e| match e {
-                ViewerEvent::Disconnected { reason } => Some(classify_disconnect_reason(reason)),
-                _ => None,
-            })
+    let found = events.as_ref().and_then(|log| {
+        log.recent.iter().rev().find_map(|e| match e {
+            ViewerEvent::Disconnected { reason } => {
+                Some((classify_disconnect_reason(reason), reason.clone()))
+            }
+            _ => None,
         })
+    });
+    let kind = found
+        .as_ref()
+        .map(|(k, _)| *k)
         .unwrap_or(DisconnectKind::Forced);
 
     if matches!(kind, DisconnectKind::Forced) && err.0.is_empty() {
-        err.0 = "Disconnected from server. Press Esc to return to login.".into();
+        err.0 = match &found {
+            Some((_, reason)) => {
+                format!("Disconnected from server: {reason}\nPress Esc to return to login.")
+            }
+            None => "Disconnected from server. Press Esc to return to login.".into(),
+        };
     }
     tracing::info!(?kind, "disconnect-watcher: returning AppPhase to Launcher");
     next_phase.set(AppPhase::Launcher);
