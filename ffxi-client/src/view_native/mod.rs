@@ -580,7 +580,11 @@ fn despawn_ingame_entities(
 ) {
     let mut count = 0usize;
     for entity in q.iter() {
-        commands.entity(entity).despawn();
+        // try_despawn: the Update schedule's final InGame frame can still
+        // queue per-domain cleanup despawns (zone_clouds, dat_mzb,
+        // particle_sim, ...) for the same entities this bulk sweep also
+        // targets — an expected race with OnExit, not a bug.
+        commands.entity(entity).try_despawn();
         count += 1;
     }
 
