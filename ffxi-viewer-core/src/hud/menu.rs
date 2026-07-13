@@ -606,13 +606,7 @@ fn visible_window(kind: MenuKind, total: usize) -> usize {
 fn resolve_viewport(kind: MenuKind, cursor: usize, dynamic: &DynamicMenu) -> (usize, usize) {
     if is_dynamic(kind) {
         let total = dynamic.rows.len().max(1);
-        if total <= DYNAMIC_VISIBLE_ROWS {
-            return (total, 0);
-        }
-
-        let half = DYNAMIC_VISIBLE_ROWS / 2;
-        let max_start = total.saturating_sub(DYNAMIC_VISIBLE_ROWS);
-        let start = cursor.saturating_sub(half).min(max_start);
+        let start = super::nav_geometry::scroll_window(cursor, total, DYNAMIC_VISIBLE_ROWS);
         (total, start)
     } else {
         (static_entries(kind).len(), 0)

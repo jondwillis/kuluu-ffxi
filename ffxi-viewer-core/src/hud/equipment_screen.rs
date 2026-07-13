@@ -441,11 +441,9 @@ pub(crate) fn update_equipment_screen(
     let (detail_name, detail_rows) =
         item_ui::focus_detail(focused_item, snap, &dat_root, &mut icon_cache);
 
-    // Storage list viewport (keep the cursor in view).
     let storage_total = dynamic.rows.len();
-    let storage_start = storage_cursor
-        .saturating_sub(STORAGE_ROWS / 2)
-        .min(storage_total.saturating_sub(STORAGE_ROWS));
+    let storage_start =
+        super::nav_geometry::scroll_window(storage_cursor, storage_total, STORAGE_ROWS);
 
     for (tag, mut text, mut color, mut node) in text_q.iter_mut() {
         let (want, want_color, visible) = role_value(

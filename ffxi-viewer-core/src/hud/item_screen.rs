@@ -68,14 +68,9 @@ fn items_cursor(mode: &InputMode) -> usize {
 }
 
 /// First visible list index, keeping `cursor` inside the `ITEM_LIST_ROWS`
-/// viewport. Mirrors `menu::resolve_viewport` so keyboard and mouse agree.
+/// viewport.
 pub fn viewport_start(cursor: usize, total: usize) -> usize {
-    if total <= ITEM_LIST_ROWS {
-        return 0;
-    }
-    let half = ITEM_LIST_ROWS / 2;
-    let max_start = total - ITEM_LIST_ROWS;
-    cursor.saturating_sub(half).min(max_start)
+    super::nav_geometry::scroll_window(cursor, total, ITEM_LIST_ROWS)
 }
 
 fn row_item_no(rows: &[crate::hud::menu::DynamicMenuRow], idx: usize) -> Option<u16> {

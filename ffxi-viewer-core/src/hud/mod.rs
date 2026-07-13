@@ -16,6 +16,7 @@ pub mod item_ui;
 pub mod logout_countdown;
 pub mod menu;
 pub mod mesh_debug;
+pub mod nav_geometry;
 pub mod network_status;
 pub mod overlay;
 pub mod quick_action;
