@@ -64,6 +64,22 @@ pub struct HeadingTurnAccum {
     pub units: f32,
 }
 
+/// `InputMode`/`Target`/`LockOn` are process-lifetime resources, not
+/// per-session state — without this, logging back into the world (reconnect,
+/// crash recovery) resumes whatever mode was active when the previous
+/// session ended (e.g. `InputMode::TargetAction`, showing the action menu
+/// open with no input at all), since `reset_interaction_flags_on_zone_change`
+/// only fires on an in-session zone change, not a fresh world entry.
+pub fn reset_interaction_state_on_enter_world(
+    mut mode: ResMut<InputMode>,
+    mut lock_on: ResMut<LockOn>,
+    mut target: ResMut<Target>,
+) {
+    *mode = InputMode::World;
+    lock_on.target_id = None;
+    target.id = None;
+}
+
 pub fn reset_interaction_flags_on_zone_change(
     state: Res<SceneState>,
     mut prev_zone: Local<Option<Option<u16>>>,

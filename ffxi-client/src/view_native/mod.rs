@@ -321,7 +321,12 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     app.add_systems(
         OnEnter(AppPhase::InGame),
-        (setup_world, spawn_camera, setup_zone_line_assets),
+        (
+            setup_world,
+            spawn_camera,
+            setup_zone_line_assets,
+            input::reset_interaction_state_on_enter_world,
+        ),
     );
     add_hud_spawners(&mut app, OnEnter(AppPhase::InGame));
     app.init_resource::<perf_hud::PerfMonitor>();
