@@ -819,4 +819,41 @@ mod tests {
             "the slot past the last field must be the Reset action"
         );
     }
+
+    /// Second proven consumer of the headless HUD test harness: spawns the
+    /// real Root menu, moves the cursor, and asserts the rendered row
+    /// text/color reflect it — the "does the cursor arrow land on the right
+    /// row" class of check the menu refactor could previously only verify
+    /// by hand.
+    #[test]
+    fn root_menu_row_text_and_color_follow_cursor() {
+        use crate::hud::test_harness::{headless_hud_app, set_mode_and_settle};
+        use crate::input_mode::MenuStack;
+
+        let mut app = headless_hud_app();
+        set_mode_and_settle(&mut app, InputMode::Menu(MenuStack::root()));
+
+        {
+            let mut mode = app.world_mut().resource_mut::<InputMode>();
+            let InputMode::Menu(stack) = &mut *mode else {
+                panic!("expected Menu mode");
+            };
+            stack.current_mut().expect("root level exists").cursor = 2;
+        }
+        app.update();
+        app.update();
+
+        let mut rows: Vec<(usize, String, Color)> = app
+            .world_mut()
+            .query::<(&MainMenuRow, &Text, &TextColor)>()
+            .iter(app.world())
+            .map(|(row, text, color)| (row.slot, text.0.clone(), color.0))
+            .collect();
+        rows.sort_by_key(|(slot, ..)| *slot);
+
+        assert_eq!(rows[0].1, "  Magic");
+        assert_eq!(rows[0].2, palette::MUTED);
+        assert_eq!(rows[2].1, "> Items");
+        assert_eq!(rows[2].2, palette::ACCENT);
+    }
 }

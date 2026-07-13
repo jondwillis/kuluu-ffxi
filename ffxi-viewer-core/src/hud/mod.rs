@@ -28,6 +28,8 @@ pub mod status_panel;
 pub mod status_ribbon;
 pub mod target_action_menu;
 pub mod target_panel;
+#[cfg(test)]
+mod test_harness;
 pub mod trade;
 pub mod vana_clock;
 pub mod weather_icon;

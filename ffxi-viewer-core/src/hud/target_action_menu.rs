@@ -440,4 +440,73 @@ mod tests {
         let crumb = breadcrumb_text(Some(SubAction::Items)).expect("crumb");
         assert!(crumb.contains("Items"));
     }
+
+    /// Drills into an ability group, then cancels back out one level at a
+    /// time — pinning that popping the Sub level lands back on the base
+    /// action list (breadcrumb hidden again), not a jump straight to World.
+    /// The old two-tier TargetActionState (a bare cursor plus an
+    /// Option<SubActionStack>) made this round-trip easy to get subtly wrong
+    /// during the NavStack<TargetLevel> migration; this is the regression
+    /// test that migration didn't have.
+    #[test]
+    fn drill_into_abilities_and_cancel_back_out() {
+        use crate::hud::action_model::AbilityGroup;
+        use crate::hud::test_harness::{headless_hud_app, set_mode_and_settle};
+        use crate::input_mode::{SubAction, TargetLevel};
+
+        let mut app = headless_hud_app();
+        set_mode_and_settle(
+            &mut app,
+            InputMode::TargetAction(TargetActionState::open(pc_ctx(true))),
+        );
+
+        {
+            let mut mode = app.world_mut().resource_mut::<InputMode>();
+            let InputMode::TargetAction(state) = &mut *mode else {
+                panic!("expected TargetAction mode");
+            };
+            state.stack.push(TargetLevel::Sub(SubAction::AbilitiesGroup(
+                AbilityGroup::JobAbilities,
+            )));
+        }
+        app.update();
+        app.update();
+
+        let (crumb_node, crumb_text) = app
+            .world_mut()
+            .query_filtered::<(&Node, &Text), With<TargetActionBreadcrumb>>()
+            .single(app.world())
+            .expect("breadcrumb entity exists");
+        assert_eq!(crumb_node.display, Display::Flex);
+        assert!(crumb_text.0.contains("Abilities"));
+        assert!(crumb_text.0.contains("Job Abilities"));
+
+        {
+            let mut mode = app.world_mut().resource_mut::<InputMode>();
+            let InputMode::TargetAction(state) = &mut *mode else {
+                panic!("expected TargetAction mode");
+            };
+            assert!(state.stack.pop(), "should pop back to Root, not empty out");
+            assert_eq!(
+                state.stack.current().map(|l| l.kind),
+                Some(TargetLevel::Root)
+            );
+        }
+        app.update();
+        app.update();
+
+        assert!(
+            matches!(
+                app.world().resource::<InputMode>(),
+                InputMode::TargetAction(_)
+            ),
+            "one cancel should stay inside the target-action menu, not exit to World"
+        );
+        let (crumb_node, _) = app
+            .world_mut()
+            .query_filtered::<(&Node, &Text), With<TargetActionBreadcrumb>>()
+            .single(app.world())
+            .expect("breadcrumb entity exists");
+        assert_eq!(crumb_node.display, Display::None);
+    }
 }
