@@ -184,9 +184,10 @@ fn drive_zone_overlay_fade(
         }
     }
 
+    let want_file_id = ffxi_viewer_core::snapshot::effective_zone_file_id(&scene.snapshot);
     let ready = stage == Stage::InZone
-        && last_auto.zone_id.is_some()
-        && last_auto.zone_id == scene.snapshot.zone_id
+        && last_auto.file_id.is_some()
+        && last_auto.file_id == want_file_id
         && mzb_in_flight.tasks.is_empty();
 
     let prev = *fade;

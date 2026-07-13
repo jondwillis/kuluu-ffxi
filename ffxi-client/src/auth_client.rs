@@ -35,22 +35,29 @@ impl std::str::FromStr for AuthFlavor {
 
 const AUTH_BUFFER_SIZE: usize = 4096;
 
-const DEFAULT_CLIENT_VERSION: [u8; 3] = [2, 0, 0];
+const XILOADER_VERSION_ENV: &str = "FFXI_XILOADER_VERSION";
 
 pub fn resolve_client_version(override_: Option<&str>) -> [u8; 3] {
+    resolve_client_version_from(
+        override_,
+        std::env::var(XILOADER_VERSION_ENV).ok().as_deref(),
+    )
+}
+
+fn resolve_client_version_from(override_: Option<&str>, env: Option<&str>) -> [u8; 3] {
     if let Some(s) = override_ {
         if let Some(v) = parse_version_triple(s) {
             return v;
         }
         tracing::warn!("--xiloader-version={s:?} invalid; falling back to env/default");
     }
-    if let Ok(s) = std::env::var("FFXI_XILOADER_VERSION") {
-        if let Some(v) = parse_version_triple(&s) {
+    if let Some(s) = env {
+        if let Some(v) = parse_version_triple(s) {
             return v;
         }
-        tracing::warn!("FFXI_XILOADER_VERSION={s:?} invalid; using default");
+        tracing::warn!("{XILOADER_VERSION_ENV}={s:?} invalid; using default");
     }
-    DEFAULT_CLIENT_VERSION
+    ffxi_proto::login::SUPPORTED_XILOADER_VERSION
 }
 
 fn parse_version_triple(s: &str) -> Option<[u8; 3]> {
@@ -369,4 +376,53 @@ fn hex_dump(b: &[u8]) -> String {
 fn trim_trailing_zero(b: &[u8]) -> &[u8] {
     let end = b.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
     &b[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // vendor/server/src/login/auth_session.h SupportedXiloaderVersion
+    const LSB_SUPPORTED_XILOADER_VERSION: [u8; 3] = [2, 1, 0];
+
+    #[test]
+    fn default_version_matches_lsb_supported_xiloader() {
+        assert_eq!(
+            resolve_client_version_from(None, None),
+            LSB_SUPPORTED_XILOADER_VERSION
+        );
+        assert_eq!(
+            ffxi_proto::login::SUPPORTED_XILOADER_VERSION,
+            LSB_SUPPORTED_XILOADER_VERSION
+        );
+    }
+
+    #[test]
+    fn override_wins_over_env() {
+        assert_eq!(
+            resolve_client_version_from(Some("3.4.5"), Some("9.9.9")),
+            [3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn env_wins_over_default() {
+        assert_eq!(resolve_client_version_from(None, Some("2.9.1")), [2, 9, 1]);
+    }
+
+    #[test]
+    fn invalid_override_falls_back_to_env() {
+        assert_eq!(
+            resolve_client_version_from(Some("not-a-version"), Some("2.1.5")),
+            [2, 1, 5]
+        );
+    }
+
+    #[test]
+    fn invalid_override_and_env_fall_back_to_default() {
+        assert_eq!(
+            resolve_client_version_from(Some("x"), Some("1.2")),
+            LSB_SUPPORTED_XILOADER_VERSION
+        );
+    }
 }

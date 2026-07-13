@@ -557,8 +557,8 @@ fn despawn_ingame_entities(
     tracked.by_id.clear();
     collision.positions.clear();
     collision.indices.clear();
-    last_zone.zone_id = None;
-    last_atmo.zone_id = None;
+    last_zone.file_id = None;
+    last_atmo.file_id = None;
 
     bgm.active_entity = None;
     bgm.active = None;

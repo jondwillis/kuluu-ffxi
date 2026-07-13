@@ -155,6 +155,19 @@ pub fn auto_load_retail_for_zone_system(
         return;
     }
 
+    // MAP_DAT_TABLE is keyed by zone id, which inside the Mog House still names
+    // the surrounding city — there is no retail map for the interior, so drop
+    // retail mode and let the TopDown cull-bake re-bake from the MH geometry.
+    if scene_state.snapshot.myroom.is_some() {
+        if state.retail_image.is_some() {
+            state.retail_image = None;
+            state.retail_aabb = None;
+            state.retail_status =
+                RetailStatus::Failed("inside the Mog House (TopDown fallback)".into());
+        }
+        return;
+    }
+
     if state.retail_image.is_some() && state.retail_zone == Some(zone_id) {
         return;
     }

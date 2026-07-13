@@ -268,6 +268,40 @@ pub struct CharStatsRaw {
     pub ilvl: u8,
 }
 
+/// s2c 0x00A myroom cluster; present only while inside a Mog House. `model`
+/// is an interior model id, not a zone id
+/// (vendor/server/src/map/packets/s2c/0x00a_login.cpp:32-34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MyRoomInfo {
+    pub model: u16,
+    pub sub_map: u8,
+    pub exit_bit: u8,
+}
+
+/// s2c 0x01B JOB_INFO; `job_levels` is indexed by JOBTYPE and `unlocked` bit 0
+/// is the subjob-feature flag, not a job
+/// (vendor/server/src/map/packets/s2c/0x01b_job_info.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobInfoState {
+    pub mjob_no: u8,
+    pub sjob_no: u8,
+    pub unlocked: u32,
+    pub sub_job_unlocked: bool,
+    pub job_levels: [u8; ffxi_proto::decode::JobInfo::MAX_JOBTYPE],
+}
+
+impl From<ffxi_proto::decode::JobInfo> for JobInfoState {
+    fn from(j: ffxi_proto::decode::JobInfo) -> Self {
+        Self {
+            mjob_no: j.mjob_no,
+            sjob_no: j.sjob_no,
+            unlocked: j.unlocked,
+            sub_job_unlocked: j.sub_job_unlocked,
+            job_levels: j.job_levels,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
     pub stage: Stage,
@@ -345,6 +379,20 @@ pub struct SessionState {
 
     #[serde(default)]
     pub self_fishing: Option<SelfFishing>,
+
+    #[serde(default)]
+    pub myroom: Option<MyRoomInfo>,
+
+    #[serde(default)]
+    pub mog_zone_flag: bool,
+
+    #[serde(default)]
+    pub job_info: Option<JobInfoState>,
+
+    /// 2F-unlock bit from the self 0x067 CharSync
+    /// (vendor/server/src/map/packets/char_sync.cpp:61); `None` until one lands.
+    #[serde(default)]
+    pub mh_2f_unlocked: Option<bool>,
 }
 
 pub const EQUIPMENT_SLOTS: usize = 16;
@@ -538,6 +586,9 @@ const CHAT_HISTORY_CAP: usize = 256;
 
 impl SessionState {
     pub fn self_in_mog_house(&self) -> bool {
+        if self.myroom.is_some() {
+            return true;
+        }
         let Some(char_id) = self.char_id else {
             return false;
         };
@@ -578,8 +629,16 @@ impl SessionState {
                 self.stage = *stage;
                 self.diagnostics.stage = Some(*stage);
             }
-            AgentEvent::ZoneChanged { to, .. } => {
+            AgentEvent::ZoneChanged {
+                to,
+                myroom,
+                mog_zone_flag,
+                ..
+            } => {
                 self.zone_id = if *to == 0 { None } else { Some(*to) };
+
+                self.myroom = *myroom;
+                self.mog_zone_flag = *mog_zone_flag;
 
                 self.logout_countdown = None;
                 self.death_homepoint_secs = None;
@@ -894,6 +953,12 @@ impl SessionState {
             AgentEvent::AbilityRecastsUpdated { recasts } => {
                 self.ability_recasts = recasts.clone();
             }
+            AgentEvent::JobInfoUpdated { info } => {
+                self.job_info = Some(*info);
+            }
+            AgentEvent::MogHouse2fUnlockUpdated { unlocked } => {
+                self.mh_2f_unlocked = Some(*unlocked);
+            }
             AgentEvent::DeathTimerUpdated {
                 seconds_until_homepoint,
             } => {
@@ -959,6 +1024,12 @@ pub enum AgentEvent {
     ZoneChanged {
         from: Option<u16>,
         to: u16,
+
+        #[serde(default)]
+        myroom: Option<MyRoomInfo>,
+
+        #[serde(default)]
+        mog_zone_flag: bool,
     },
     PositionChanged {
         pos: Position,
@@ -1015,6 +1086,14 @@ pub enum AgentEvent {
 
     AbilityRecastsUpdated {
         recasts: Vec<(u16, u32)>,
+    },
+
+    JobInfoUpdated {
+        info: JobInfoState,
+    },
+
+    MogHouse2fUnlockUpdated {
+        unlocked: bool,
     },
 
     WeatherUpdated {
@@ -1213,6 +1292,18 @@ pub enum AgentCommand {
         kind: MogHouseExit,
     },
 
+    /// c2s 0x100 MYROOM_JOB; `None` → 0 = keep current. LSB acts only on
+    /// indices > 0, so there is deliberately no remove-subjob form
+    /// (vendor/server/src/map/packets/c2s/0x100_myroom_job.cpp).
+    ChangeJob {
+        main_job: Option<u8>,
+        sub_job: Option<u8>,
+    },
+
+    /// Client-local open of the same menu s2c 0x02E OPENMOGMENU triggers
+    /// (vendor/server/src/map/packets/s2c/0x02e_openmogmenu.h).
+    OpenMogMenu,
+
     EndEvent,
 
     EndEventChoice {
@@ -1404,19 +1495,38 @@ impl ReqLogoutKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MogHouseExit {
-    Home,
+    /// Mode-0 "area you entered from"; `exit_bit` echoes the 0x00A MyRoomExitBit
+    /// (retail derives it from the current zone — research/XiPackets/world/client/
+    /// 0x005E; LSB's mode-0 path never reads it, and 0 = Default is in the
+    /// MYROOMEXITBIT validator enum).
+    Home {
+        #[serde(default)]
+        exit_bit: u8,
+    },
 
-    Sandoria { slot: u8 },
+    Sandoria {
+        slot: u8,
+    },
 
-    Bastok { slot: u8 },
+    Bastok {
+        slot: u8,
+    },
 
-    Windurst { slot: u8 },
+    Windurst {
+        slot: u8,
+    },
 
-    Jeuno { slot: u8 },
+    Jeuno {
+        slot: u8,
+    },
 
-    Whitegate { slot: u8 },
+    Whitegate {
+        slot: u8,
+    },
 
-    Adoulin { slot: u8 },
+    Adoulin {
+        slot: u8,
+    },
 
     Mog1F,
 
@@ -1426,9 +1536,23 @@ pub enum MogHouseExit {
 }
 
 impl MogHouseExit {
+    /// Inverse of `wire_pair` for the city district exits (LSB MYROOMEXITBIT
+    /// 1..=5, 9); any other bit is the mode-0 `Home` exit echoing that bit.
+    pub fn from_bit_slot(bit: u8, slot: u8) -> Self {
+        match bit {
+            1 => MogHouseExit::Sandoria { slot },
+            2 => MogHouseExit::Bastok { slot },
+            3 => MogHouseExit::Windurst { slot },
+            4 => MogHouseExit::Jeuno { slot },
+            5 => MogHouseExit::Whitegate { slot },
+            9 => MogHouseExit::Adoulin { slot },
+            _ => MogHouseExit::Home { exit_bit: bit },
+        }
+    }
+
     pub fn wire_pair(self) -> (u8, u8) {
         match self {
-            MogHouseExit::Home => (1, 0),
+            MogHouseExit::Home { exit_bit } => (exit_bit, 0),
             MogHouseExit::Sandoria { slot } => (1, slot),
             MogHouseExit::Bastok { slot } => (2, slot),
             MogHouseExit::Windurst { slot } => (3, slot),
@@ -1675,8 +1799,63 @@ mod tests {
         s.apply_event(&AgentEvent::ZoneChanged {
             from: Some(230),
             to: 231,
+            myroom: None,
+            mog_zone_flag: false,
         });
         assert_eq!(s.current_weather, None);
+    }
+
+    #[test]
+    fn zone_change_sets_and_clears_myroom() {
+        let mut s = SessionState {
+            char_id: Some(0xCAFE),
+            ..Default::default()
+        };
+        let room = MyRoomInfo {
+            model: 257,
+            sub_map: 0,
+            exit_bit: 1,
+        };
+        s.apply_event(&AgentEvent::ZoneChanged {
+            from: None,
+            to: 230,
+            myroom: Some(room),
+            mog_zone_flag: false,
+        });
+        assert_eq!(s.myroom, Some(room));
+        assert!(
+            s.self_in_mog_house(),
+            "myroom must drive self_in_mog_house before any party attrs arrive"
+        );
+
+        s.apply_event(&AgentEvent::ZoneChanged {
+            from: Some(230),
+            to: 230,
+            myroom: None,
+            mog_zone_flag: false,
+        });
+        assert_eq!(s.myroom, None);
+        assert!(!s.self_in_mog_house());
+    }
+
+    #[test]
+    fn job_info_and_2f_unlock_fold() {
+        let mut s = SessionState::default();
+        let mut job_levels = [0u8; ffxi_proto::decode::JobInfo::MAX_JOBTYPE];
+        job_levels[1] = 75;
+        let info = JobInfoState {
+            mjob_no: 1,
+            sjob_no: 3,
+            unlocked: 0b1011,
+            sub_job_unlocked: true,
+            job_levels,
+        };
+        s.apply_event(&AgentEvent::JobInfoUpdated { info });
+        assert_eq!(s.job_info, Some(info));
+
+        assert_eq!(s.mh_2f_unlocked, None);
+        s.apply_event(&AgentEvent::MogHouse2fUnlockUpdated { unlocked: true });
+        assert_eq!(s.mh_2f_unlocked, Some(true));
     }
 
     #[test]
@@ -1965,6 +2144,8 @@ mod tests {
         s.apply_event(&AgentEvent::ZoneChanged {
             from: Some(100),
             to: 230,
+            myroom: None,
+            mog_zone_flag: false,
         });
         assert_eq!(s.zone_id, Some(230));
         assert!(

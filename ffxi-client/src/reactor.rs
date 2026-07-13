@@ -177,6 +177,10 @@ pub struct Reactor {
 
     nav_cache: Option<(u16, LoadedNav)>,
 
+    dat_root: Option<std::sync::Arc<ffxi_dat::DatRoot>>,
+
+    mh_rect_cache: Option<(u16, Vec<ffxi_dat::zone_interaction::ZoneInteraction>)>,
+
     zoneline_trigger_latched: Option<u32>,
 
     needs_zone_seed: bool,
@@ -206,6 +210,8 @@ impl Reactor {
             self_low_hp_latched: false,
             party_low_hp_latched: HashMap::new(),
             nav_cache: None,
+            dat_root: None,
+            mh_rect_cache: None,
             zoneline_trigger_latched: None,
             needs_zone_seed: false,
             reactor_override: None,
@@ -215,6 +221,14 @@ impl Reactor {
             fishing_phase_pub: None,
             fishing_pending: Vec::new(),
         }
+    }
+
+    pub fn set_dat_root(&mut self, root: Option<std::sync::Arc<ffxi_dat::DatRoot>>) {
+        self.dat_root = root;
+    }
+
+    fn in_mog_house(&self) -> bool {
+        self.state.self_in_mog_house()
     }
 
     pub fn current_override(&self) -> Option<ReactorOverride> {
@@ -251,6 +265,11 @@ impl Reactor {
     }
 
     fn ensure_nav_loaded(&mut self) -> Option<&LoadedNav> {
+        // MH interior is origin-space; the shared-zone-id town navmesh would
+        // path through the wrong geometry.
+        if self.in_mog_house() {
+            return None;
+        }
         let zone_id = self.state.zone_id?;
         let cached = matches!(&self.nav_cache, Some((z, _)) if *z == zone_id);
         if !cached {
@@ -650,6 +669,12 @@ impl Reactor {
 
     fn check_zoneline_trigger(&mut self) -> Option<AgentCommand> {
         let zone_id = self.state.zone_id?;
+        // In the MH the zone id stays the city's: town zonelines would misfire
+        // against origin-space coords; exit is menu-driven (zmrq) only.
+        if self.in_mog_house() {
+            self.zoneline_trigger_latched = None;
+            return None;
+        }
         let player = self.self_pos();
         let lines = ffxi_nav::zone_lines_for(zone_id);
 
@@ -672,9 +697,24 @@ impl Reactor {
                 );
             }
         }
+        // Scraped MH rows carry the town-side to_scale (thin enough to step
+        // over at run speed); prefer the DAT trigger OBB when available.
+        let mh_rects: &[ffxi_dat::zone_interaction::ZoneInteraction] =
+            if lines.iter().any(ffxi_nav::zonelines::is_mog_house_entry) {
+                self.ensure_mh_rects_loaded(zone_id)
+            } else {
+                &[]
+            };
         let inside = lines
             .iter()
-            .find(|line| is_inside_trigger_box(player, line))
+            .find(|line| {
+                if ffxi_nav::zonelines::is_mog_house_entry(line) {
+                    if let Some(rect) = mh_rects.iter().find(|r| r.rect_id() == line.line_id) {
+                        return is_inside_dat_obb(player, rect);
+                    }
+                }
+                is_inside_trigger_box(player, line)
+            })
             .map(|line| line.line_id);
         if self.needs_zone_seed {
             self.zoneline_trigger_latched = inside;
@@ -692,6 +732,23 @@ impl Reactor {
 
             _ => None,
         }
+    }
+
+    /// Per-zone lazy cache of the DAT MH trigger rects, loaded the same way
+    /// [`Self::ensure_nav_loaded`] loads nav data. Empty when no DAT root is
+    /// configured (callers fall back to the LSB-scraped box).
+    fn ensure_mh_rects_loaded(
+        &mut self,
+        zone_id: u16,
+    ) -> &[ffxi_dat::zone_interaction::ZoneInteraction] {
+        let cached = matches!(&self.mh_rect_cache, Some((z, _)) if *z == zone_id);
+        if !cached {
+            self.mh_rect_cache = Some((zone_id, load_mh_rects(self.dat_root.as_deref(), zone_id)));
+        }
+        self.mh_rect_cache
+            .as_ref()
+            .map(|(_, rects)| rects.as_slice())
+            .unwrap_or(&[])
     }
 
     fn tick_goal(&mut self) -> TickOutput {
@@ -916,6 +973,69 @@ impl Reactor {
     }
 }
 
+fn load_mh_rects(
+    root: Option<&ffxi_dat::DatRoot>,
+    zone_id: u16,
+) -> Vec<ffxi_dat::zone_interaction::ZoneInteraction> {
+    let Some(root) = root else {
+        return Vec::new();
+    };
+    let Some(file_id) = ffxi_dat::zone_dat::zone_id_to_mzb_file_id(zone_id) else {
+        return Vec::new();
+    };
+    let Ok(loc) = root.resolve(file_id) else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(loc.path_under(root.root())) else {
+        return Vec::new();
+    };
+    match ffxi_dat::zone_interaction::from_dat(&bytes) {
+        Ok(all) => {
+            let rects: Vec<_> = all.into_iter().filter(|i| i.is_mog_house_line()).collect();
+            for r in &rects {
+                if r.orientation[0] != 0.0 || r.orientation[2] != 0.0 {
+                    tracing::warn!(
+                        zone_id,
+                        rect_id = r.rect_id(),
+                        orientation = ?r.orientation,
+                        "MH rect has non-yaw Euler angles; is_inside_dat_obb tests the wrong volume"
+                    );
+                }
+            }
+            tracing::debug!(
+                zone_id,
+                count = rects.len(),
+                "MH trigger rects loaded from DAT"
+            );
+            rects
+        }
+        Err(e) => {
+            tracing::warn!(zone_id, error = %e, "RID parse failed; MH triggers fall back to the LSB scrape");
+            Vec::new()
+        }
+    }
+}
+
+/// Faithful DAT trigger-box test in FFXI-native zone space. State `Vec3` axes are
+/// (x, ground z, vertical y) — the GP_SERV_POS_HEAD wire order — while RID rects
+/// are native (x, y, z) with y vertical and vertically centered. Applies yaw only
+/// (`orientation[1]`): every observed zmr*/zms* rect has zero X/Z Euler, so this
+/// is the X=Z=0 reduction of XIM's box-to-world ZYX matrix (column-major, local =
+/// Rᵀ·(p − center); research/xim/src/jsMain/kotlin/xim/poc/CollisionShapes.kt:
+/// 242-247 + xim/math/Matrix4f.kt:132-160) — a counterexample warns at rect-load.
+/// Inside iff |local| ≤ size/2 per axis.
+fn is_inside_dat_obb(player: Vec3, rect: &ffxi_dat::zone_interaction::ZoneInteraction) -> bool {
+    let dx = player.x - rect.position[0];
+    let dz = player.y - rect.position[2];
+    let dv = player.z - rect.position[1];
+    let (sin_y, cos_y) = rect.orientation[1].sin_cos();
+    let local_x = dx * cos_y - dz * sin_y;
+    let local_z = dx * sin_y + dz * cos_y;
+    local_x.abs() <= rect.size[0] / 2.0
+        && local_z.abs() <= rect.size[2] / 2.0
+        && dv.abs() <= rect.size[1] / 2.0
+}
+
 fn is_inside_trigger_box(player: Vec3, line: &ffxi_nav::ZoneLine) -> bool {
     let dx = player.x - line.from_pos[0];
     let dy = player.y - line.from_pos[1];
@@ -1097,12 +1217,14 @@ pub async fn run(
     let (internal_cmd_tx, internal_cmd_rx) = mpsc::channel(64);
     let mut event_rx = event_tx.subscribe();
     let session_event_tx = event_tx.clone();
+    let dat_root = cfg.dat_root.clone();
     let mut session_handle =
         tokio::spawn(
             async move { crate::session::run(cfg, internal_cmd_rx, session_event_tx).await },
         );
 
     let mut reactor = Reactor::new(reactor_cfg);
+    reactor.set_dat_root(dat_root);
     let mut tick = tokio::time::interval(reactor_cfg.tick);
     tick.tick().await;
 
@@ -1543,6 +1665,8 @@ mod tests {
         let derived = r.observe_event(&AgentEvent::ZoneChanged {
             from: Some(116),
             to: 240,
+            myroom: None,
+            mog_zone_flag: false,
         });
         assert!(matches!(r.current_goal(), Goal::Idle));
         assert!(
@@ -2395,6 +2519,8 @@ mod tests {
         r.observe_event(&AgentEvent::ZoneChanged {
             from: Some(100),
             to: 230,
+            myroom: None,
+            mog_zone_flag: false,
         });
         r.state.zone_id = Some(230);
         r.observe_event(&upsert(
@@ -2461,6 +2587,152 @@ mod tests {
                 .any(|c| matches!(c, AgentCommand::RequestZoneChange { .. })),
             "deliberate re-entry after seeding must fire"
         );
+    }
+
+    #[test]
+    fn mog_house_prefix_sets_agree_across_crates() {
+        // ffxi-dat and ffxi-nav each classify MH lines from their own copy of the
+        // LSB prefix pair (0x05e_maprect.cpp:74-75); check_zoneline_trigger
+        // correlates the two by rect_id == line_id, so the sets must stay equal.
+        assert_eq!(
+            [
+                ffxi_dat::zone_interaction::MOG_HOUSE_PREFIX_CLASSIC.as_bytes(),
+                ffxi_dat::zone_interaction::MOG_HOUSE_PREFIX_WOTG.as_bytes(),
+            ],
+            [
+                ffxi_nav::zonelines::MOG_HOUSE_TAG_PREFIXES[0].as_slice(),
+                ffxi_nav::zonelines::MOG_HOUSE_TAG_PREFIXES[1].as_slice(),
+            ]
+        );
+    }
+
+    #[test]
+    fn zoneline_trigger_inert_inside_mog_house() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        r.observe_event(&AgentEvent::ZoneChanged {
+            from: Some(230),
+            to: 230,
+            myroom: Some(crate::state::MyRoomInfo {
+                model: 257,
+                sub_map: 0,
+                exit_bit: 1,
+            }),
+            mog_zone_flag: false,
+        });
+        r.state.zone_id = Some(230);
+
+        // Town west-exit trigger coords; must not fire from inside the MH.
+        r.observe_event(&upsert(
+            1,
+            Vec3 {
+                x: -113.372,
+                y: -57.418,
+                z: -4.075,
+            },
+            100,
+            EntityKind::Pc,
+            1,
+        ));
+        let first = r.tick();
+        let second = r.tick();
+        assert!(
+            !first
+                .commands
+                .iter()
+                .chain(second.commands.iter())
+                .any(|c| matches!(c, AgentCommand::RequestZoneChange { .. })),
+            "town zonelines must be inert while myroom is Some"
+        );
+    }
+
+    #[test]
+    fn nav_is_inert_inside_mog_house() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        r.set_nav_for_test(
+            230,
+            GridNav::from_walkable(1, 1, vec![true], glam::Vec2::ZERO, 1.0),
+        );
+        r.observe_event(&AgentEvent::ZoneChanged {
+            from: Some(230),
+            to: 230,
+            myroom: Some(crate::state::MyRoomInfo {
+                model: 257,
+                sub_map: 0,
+                exit_bit: 1,
+            }),
+            mog_zone_flag: false,
+        });
+        r.state.zone_id = Some(230);
+        assert!(
+            r.ensure_nav_loaded().is_none(),
+            "town navmesh must not drive pathing inside the MH"
+        );
+    }
+
+    /// The retail zone-230 residence-door trigger
+    /// (src=zmr0, center (164.933,-5.547,164.792), yaw 3.93, size 12×8×2 —
+    /// verified against the install in ffxi-dat::zone_interaction tests).
+    fn zmr0_rect() -> ffxi_dat::zone_interaction::ZoneInteraction {
+        ffxi_dat::zone_interaction::ZoneInteraction {
+            position: [164.933, -5.547, 164.792],
+            orientation: [0.0, 3.93, 0.0],
+            size: [12.0, 8.0, 2.0],
+            source_id: ffxi_dat::datid::DatId(*b"zmr0"),
+            dest_id: Some(ffxi_dat::datid::DatId(*b"zmr1")),
+            param: 253,
+            terrain_flags: 0,
+            map_id: 1,
+            elevator_bottom_y: -5.547,
+            elevator_top_y: -5.547,
+        }
+    }
+
+    #[test]
+    fn dat_obb_wide_axis_in_short_axis_out() {
+        let rect = zmr0_rect();
+        // Box center (state axes: x, ground z, vertical y).
+        let center = Vec3 {
+            x: 164.933,
+            y: 164.792,
+            z: -5.547,
+        };
+        assert!(is_inside_dat_obb(center, &rect));
+
+        // 4y along the door's wide (12y) axis — bearing 135° in ground space.
+        let wide = Vec3 {
+            x: center.x - 2.83,
+            y: center.y + 2.83,
+            ..center
+        };
+        assert!(is_inside_dat_obb(wide, &rect), "wide axis half-extent is 6");
+
+        // 3y along the walk-through (2y-deep) axis — bearing 225°.
+        let deep = Vec3 {
+            x: center.x - 2.12,
+            y: center.y - 2.12,
+            ..center
+        };
+        assert!(
+            !is_inside_dat_obb(deep, &rect),
+            "walk axis half-extent is 1"
+        );
+
+        // The lua exit reposition point (159.5, 160) sits ~7.2y out — outside,
+        // so leaving the MH cannot re-trigger the door.
+        let exit_spawn = Vec3 {
+            x: 159.5,
+            y: 160.0,
+            z: -2.0,
+        };
+        assert!(!is_inside_dat_obb(exit_spawn, &rect));
+
+        // Vertical extent is centered: ±4y around the box center (-5.547).
+        let above = Vec3 { z: -2.0, ..center };
+        assert!(is_inside_dat_obb(above, &rect));
+        let far_above = Vec3 { z: 3.0, ..center };
+        assert!(!is_inside_dat_obb(far_above, &rect));
     }
 
     #[test]

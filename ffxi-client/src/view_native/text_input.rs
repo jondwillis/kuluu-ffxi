@@ -884,6 +884,7 @@ fn apply_chat_action(
                     scene_state.snapshot.zone_id,
                     scene_state.snapshot.self_char_id,
                     &scene_state.snapshot.party,
+                    scene_state.snapshot.myroom,
                 );
                 tracing::debug!(buffer = %trimmed, outcome = ?outcome, "chat submit: slash");
 
@@ -977,6 +978,12 @@ fn apply_slash_outcome(
             mirror_heal_stance(&cmd, &mut slash_writers.rest_stance);
             let send_result = cmd_tx.try_send(cmd);
             if let Err(e) = send_result {
+                push_system_chat_line(scene_state, format!("command dropped (channel issue): {e}"));
+            }
+        }
+        SlashOutcome::CommandWithNotice { cmd, notice } => {
+            push_system_chat_line(scene_state, notice);
+            if let Err(e) = cmd_tx.try_send(cmd) {
                 push_system_chat_line(scene_state, format!("command dropped (channel issue): {e}"));
             }
         }

@@ -38,6 +38,7 @@ impl ZoneLineResolver {
 pub struct ZoneLineState {
     pub current_zone: Option<u16>,
     pub current_mode: Option<ZoneLineDisplay>,
+    pub current_in_mog_house: bool,
 }
 
 #[derive(Component, Debug)]
@@ -95,17 +96,29 @@ pub fn sync_zone_lines_system(
         return;
     };
     let mode = settings.zone_line_display;
-    if zl_state.current_zone == Some(zone_id) && zl_state.current_mode == Some(mode) {
+    let in_mog_house = state.snapshot.myroom.is_some();
+    if zl_state.current_zone == Some(zone_id)
+        && zl_state.current_mode == Some(mode)
+        && zl_state.current_in_mog_house == in_mog_house
+    {
         return;
     }
 
     for e in &existing {
-        commands.entity(e).despawn();
+        commands.entity(e).try_despawn();
     }
     zl_state.current_zone = Some(zone_id);
     zl_state.current_mode = Some(mode);
+    zl_state.current_in_mog_house = in_mog_house;
 
     if mode == ZoneLineDisplay::Off {
+        return;
+    }
+
+    // The scraped zonelines are the town's; inside the Mog House they sit in a
+    // different coordinate space and exit is menu-driven (0x05E zmrq), so no
+    // markers are spawned.
+    if in_mog_house {
         return;
     }
 

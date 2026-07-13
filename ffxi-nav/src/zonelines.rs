@@ -40,7 +40,7 @@ pub fn to_pos_for_line(line_id: u32) -> Option<[f32; 3]> {
 // c2s 0x05E RectID (vendor/server/src/map/packets/c2s/0x05e_maprect.cpp:74-75:
 // "zmr* classic cities; zms* WoTG [S] + Adoulin"). The zonelines.sql primary key IS
 // the trigger's fourcc as a LE u32, so the prefix test works on `line_id` directly.
-const MOG_HOUSE_TAG_PREFIXES: [&[u8; 3]; 2] = [b"zmr", b"zms"];
+pub const MOG_HOUSE_TAG_PREFIXES: [&[u8; 3]; 2] = [b"zmr", b"zms"];
 
 pub fn is_mog_house_entry(line: &ZoneLine) -> bool {
     let tag = line.line_id.to_le_bytes();

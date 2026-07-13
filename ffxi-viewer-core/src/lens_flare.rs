@@ -184,13 +184,13 @@ fn load_lens_flare_sheet(
     mut images: ResMut<Assets<Image>>,
     flare_q: Query<&MeshMaterial3d<LensFlareMaterial>, With<LensFlareQuad>>,
     mut mats: ResMut<Assets<LensFlareMaterial>>,
-    mut loaded_zone: Local<Option<Option<u16>>>,
+    mut loaded_zone: Local<Option<Option<u32>>>,
 ) {
     use bevy::asset::RenderAssetUsages;
     use bevy::image::ImageSampler;
     use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-    let current = scene_state.snapshot.zone_id;
+    let current = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
     if *loaded_zone == Some(current) {
         return;
     }
@@ -200,7 +200,6 @@ fn load_lens_flare_sheet(
     *loaded_zone = Some(current);
 
     let sheet = current
-        .and_then(ffxi_dat::zone_dat::zone_id_to_mzb_file_id)
         .and_then(|file_id| dat_root.resolve(file_id).ok())
         .and_then(|loc| std::fs::read(loc.path_under(dat_root.root())).ok())
         .and_then(|bytes| ffxi_dat::sprite_sheet::extract_lens_flare_sheet(&bytes));

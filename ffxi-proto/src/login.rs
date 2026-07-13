@@ -1,3 +1,5 @@
+include!(concat!(env!("OUT_DIR"), "/xiloader_version_table.rs"));
+
 pub const IXFF_TERMINATOR: u32 = u32::from_le_bytes(*b"IXFF");
 
 pub const LOGIN_AUTH_PORT: u16 = 54231;

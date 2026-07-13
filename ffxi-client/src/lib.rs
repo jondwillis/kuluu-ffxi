@@ -11,6 +11,7 @@ pub mod event_dialog;
 pub mod fishing;
 pub mod goal_store;
 pub mod launcher_store;
+pub mod local_menu;
 pub mod secret_store;
 
 #[cfg(feature = "native-window")]

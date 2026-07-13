@@ -206,6 +206,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn synth_entry(
         position: [f32; 3],
         orientation: [f32; 3],

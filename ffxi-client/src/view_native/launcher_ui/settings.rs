@@ -374,7 +374,7 @@ fn persist_and_reload(
     )));
 
     cache.entries.clear();
-    last_zone.zone_id = None;
+    last_zone.file_id = None;
 
     let mut msg = format!("Reloaded {app_count} archive(s) from {root_path}");
     if let Some(w) = persist_warn {

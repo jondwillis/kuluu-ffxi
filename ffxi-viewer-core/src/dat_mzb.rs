@@ -1434,7 +1434,7 @@ fn spawn_mzb_overlay(
 
 #[derive(Resource, Default)]
 pub struct LastAutoLoadedZone {
-    pub zone_id: Option<u16>,
+    pub file_id: Option<u32>,
 }
 
 pub fn auto_load_zone_geometry_system(
@@ -1449,8 +1449,8 @@ pub fn auto_load_zone_geometry_system(
     mut mmb_in_flight: ResMut<crate::dat_mmb::MmbLoadInFlight>,
     mut pending_water: ResMut<PendingWaterSpawns>,
 ) {
-    let current = scene_state.snapshot.zone_id;
-    if current == last.zone_id {
+    let current = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
+    if current == last.file_id {
         return;
     }
 
@@ -1470,10 +1470,9 @@ pub fn auto_load_zone_geometry_system(
     // Drop any old-zone water footprints still queued for streaming; the spawned
     // ones go with the despawned AutoMzbOverlay parent above.
     pending_water.specs.clear();
-    last.zone_id = current;
-    let Some(zone_id) = current else { return };
+    last.file_id = current;
 
-    match ffxi_dat::zone_dat::zone_id_to_mzb_file_id(zone_id) {
+    match current {
         Some(file_id) => {
             load_tx.write(LoadMzbRequest {
                 file_id,
@@ -1482,12 +1481,24 @@ pub fn auto_load_zone_geometry_system(
                 auto_loaded: true,
             });
 
+            let zone_label = scene_state
+                .snapshot
+                .zone_id
+                .map_or_else(|| "?".to_string(), |z| z.to_string());
+            let myroom_label = scene_state
+                .snapshot
+                .myroom
+                .map(|m| format!(" (Mog House model {})", m.model))
+                .unwrap_or_default();
             push_system_msg(
                 &mut toasts,
-                format!("auto-load: zone {zone_id} -> DAT file {file_id}"),
+                format!("auto-load: zone {zone_label}{myroom_label} -> DAT file {file_id}"),
             );
         }
         None => {
+            let Some(zone_id) = scene_state.snapshot.zone_id else {
+                return;
+            };
             push_system_msg(
                 &mut toasts,
                 format!("auto-load: no DAT mapping for zone {zone_id} (Phase 11b table pending)"),

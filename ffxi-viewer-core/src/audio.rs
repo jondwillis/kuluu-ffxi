@@ -162,12 +162,21 @@ fn resolve_install_root() -> Option<PathBuf> {
     None
 }
 
+// research/xim .../resource/table/ZoneSettingsTable.kt:42-45: the retail client
+// forces track 126 inside the Mog House. LSB sends the surrounding town's music in
+// the MH 0x00A (vendor/server/src/map/packets/s2c/0x00a_login.cpp:177-181), and a
+// 0x05F slot-6 track only arrives when promotional furniture is installed
+// (vendor/server/scripts/globals/moghouse.lua:181-229) — so 126 is the client-side
+// base and any received slot-6 track overrides it.
+pub const MOG_HOUSE_BGM: u16 = 126;
+const MOG_HOUSE_SLOT: u8 = 6;
+
 fn resolve_audible_slot(slots: &BgmSlots, state: &BgmPlaybackState) -> Option<(u8, u16)> {
     let zone_pref: [u8; 2] = if state.is_night { [1, 0] } else { [0, 1] };
     let candidates: [(u8, bool); SLOT_COUNT] = [
         (5, state.dead),
         (4, state.mounted),
-        (6, state.in_mog_house),
+        (MOG_HOUSE_SLOT, state.in_mog_house),
         (3, state.engaged_party),
         (2, state.engaged_solo),
         (7, state.fishing),
@@ -178,7 +187,12 @@ fn resolve_audible_slot(slots: &BgmSlots, state: &BgmPlaybackState) -> Option<(u
         if !eligible {
             continue;
         }
-        if let Some(track) = slots.tracks[slot as usize] {
+        let track = match slots.tracks[slot as usize] {
+            Some(track) => Some(track),
+            None if slot == MOG_HOUSE_SLOT => Some(MOG_HOUSE_BGM),
+            None => None,
+        };
+        if let Some(track) = track {
             if track == 0 {
                 return None;
             }
@@ -240,10 +254,9 @@ pub fn derive_bgm_playback_state(
     let engaged = self_engaged(snap);
     let in_party = snap.party.len() > 1;
 
-    let in_mog_house = self_id
-        .and_then(|id| snap.party.iter().find(|p| p.id == id))
-        .map(|p| p.in_mog_house)
-        .unwrap_or(false);
+    // snapshot.myroom is atomic with the MH 0x00A zone-in; the party-attr
+    // moghouse flag arrives later and is cleared with the party on zone change.
+    let in_mog_house = snap.myroom.is_some();
 
     let icons = &snap.status_icons;
     let dead =
@@ -1062,6 +1075,44 @@ mod tests {
         assert!(bgm_swap_needed(Some((0, 24)), None));
 
         assert!(!bgm_swap_needed(None, None));
+    }
+
+    #[test]
+    fn mog_house_forces_base_track_without_slot6() {
+        let mut slots = BgmSlots::default();
+        slots.tracks[0] = Some(101);
+        let state = BgmPlaybackState {
+            in_mog_house: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_audible_slot(&slots, &state),
+            Some((MOG_HOUSE_SLOT, MOG_HOUSE_BGM)),
+            "LSB sends town music in the MH 0x00A; the client must force 126"
+        );
+    }
+
+    #[test]
+    fn mog_house_slot6_override_beats_forced_base() {
+        let mut slots = BgmSlots::default();
+        slots.tracks[0] = Some(101);
+        slots.tracks[MOG_HOUSE_SLOT as usize] = Some(215);
+        let state = BgmPlaybackState {
+            in_mog_house: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_audible_slot(&slots, &state),
+            Some((MOG_HOUSE_SLOT, 215)),
+            "a furniture 0x05F slot-6 track overrides the forced base"
+        );
+    }
+
+    #[test]
+    fn mog_house_base_never_plays_outside_mog_house() {
+        let slots = BgmSlots::default();
+        let state = BgmPlaybackState::default();
+        assert_eq!(resolve_audible_slot(&slots, &state), None);
     }
 
     #[test]

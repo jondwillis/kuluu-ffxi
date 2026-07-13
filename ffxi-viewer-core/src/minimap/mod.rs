@@ -166,7 +166,9 @@ pub enum RetailStatus {
 
 #[derive(Resource, Default)]
 pub struct MinimapState {
-    pub zone_id: Option<u16>,
+    /// Resolved zone-DAT file id the current top-down bake mirrors (the Mog House
+    /// interior and the surrounding city share a zone_id but not a file id).
+    pub baked_file_id: Option<u32>,
 
     pub topdown_image: Option<Handle<Image>>,
 

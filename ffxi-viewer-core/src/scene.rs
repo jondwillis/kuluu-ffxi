@@ -209,7 +209,7 @@ pub fn sync_entities_system(
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     mut q_mat: Query<&mut MeshMaterial3d<StandardMaterial>, (With<WorldEntity>, Without<MorphIn>)>,
     q_nameplates: Query<&Nameplate>,
-    mut prev_zone: Local<Option<Option<u16>>>,
+    mut prev_zone: Local<Option<Option<u32>>>,
 ) {
     if !state.dirty {
         return;
@@ -217,8 +217,11 @@ pub fn sync_entities_system(
 
     let snap = &state.snapshot;
 
-    let zone_changed = matches!(*prev_zone, Some(p) if p != snap.zone_id);
-    *prev_zone = Some(snap.zone_id);
+    // Keyed on the resolved DAT file id, not zone_id: Mog House entry/exit keeps
+    // the city zone_id but teleports the player into a different interior.
+    let zone_key = crate::snapshot::effective_zone_file_id(snap);
+    let zone_changed = matches!(*prev_zone, Some(p) if p != zone_key);
+    *prev_zone = Some(zone_key);
 
     let mut nameplated: std::collections::HashSet<u32> =
         q_nameplates.iter().map(|n| n.entity_id).collect();
@@ -348,7 +351,7 @@ pub fn sync_entities_system(
         .collect();
     for id in stale {
         if let Some(bevy_e) = tracked.by_id.remove(&id) {
-            commands.entity(bevy_e).despawn();
+            commands.entity(bevy_e).try_despawn();
         }
 
         prediction.by_id.remove(&id);

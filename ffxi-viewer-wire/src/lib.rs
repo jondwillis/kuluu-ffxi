@@ -406,6 +406,20 @@ pub struct SceneSnapshot {
     /// the mini-game HUD.
     #[serde(default)]
     pub self_fishing: Option<SelfFishing>,
+
+    /// `Some` while the server has the player inside a Mog House (same zone_id as
+    /// the surrounding city); the renderer must re-key zone resources on it.
+    #[serde(default)]
+    pub myroom: Option<MyRoom>,
+}
+
+/// s2c 0x00A myroom cluster; `model` is an interior model id, not a zone id —
+/// resolve via `ffxi_dat::zone_dat::effective_zone_dat_file_id`
+/// (vendor/server/src/map/packets/s2c/0x00a_login.cpp:32-34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MyRoom {
+    pub model: u16,
+    pub sub_map: u8,
 }
 
 /// On-screen fishing arrow during the active mini-game state.
@@ -538,6 +552,12 @@ pub struct SceneDelta {
     pub party_upserted: Vec<PartyMember>,
     pub chat_appended: Vec<ChatLine>,
     pub diagnostics: Option<Diagnostics>,
+
+    /// `Some` = enter/update the Mog House view; `None` = no change (matching
+    /// `zone_id`'s merge convention — a delta cannot clear it, so MH exit must
+    /// arrive as a full snapshot, which every producer today sends anyway).
+    #[serde(default)]
+    pub myroom: Option<MyRoom>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -769,6 +789,10 @@ mod tests {
             bazaar: Vec::new(),
             play_time_s: 0,
             self_fishing: None,
+            myroom: Some(MyRoom {
+                model: 257,
+                sub_map: 0,
+            }),
         }
     }
 
@@ -865,6 +889,13 @@ mod tests {
                 let rc = s.last_reconnect.expect("last_reconnect");
                 assert_eq!(rc.downtime_ms, 1234);
                 assert_eq!(s.producer_monotonic_ms, 1_500);
+                assert_eq!(
+                    s.myroom,
+                    Some(MyRoom {
+                        model: 257,
+                        sub_map: 0
+                    })
+                );
             }
             other => panic!("wrong variant: {other:?}"),
         }

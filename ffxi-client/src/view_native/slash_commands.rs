@@ -15,6 +15,7 @@ struct SlashCtx<'a> {
     zone_id: Option<u16>,
     self_char_id: Option<u32>,
     party: &'a [ffxi_viewer_wire::PartyMember],
+    myroom: Option<ffxi_viewer_wire::MyRoom>,
 }
 
 struct Command {
@@ -547,6 +548,12 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 handler: |c| parse_homepoint_menu(c.rest),
             },
             Command {
+                aliases: &["jobchange", "jc"],
+                usage: "[<main> [sub]]",
+                summary: "no args: open the Mog Menu; with jobs: change main/sub (names, WAR/MNK codes, or ids)",
+                handler: |c| parse_jobchange(c.rest, c.myroom.is_some()),
+            },
+            Command {
                 aliases: &["endevent", "endevt", "clearevent", "clearevt"],
                 usage: "",
                 summary: "flush pending NPC events (unblock /logout)",
@@ -691,7 +698,7 @@ const COMMANDS: &[(&str, &[Command])] = &[
             Command {
                 aliases: &["mhexit"],
                 usage: "[home|1f|2f|garden|<region> [slot]]",
-                summary: "leave the current Mog House (sends 0x05E zmrq)",
+                summary: "leave the current Mog House (sends 0x05E zmrq; the Exit door offers the same Where to? menu)",
                 handler: |c| parse_mhexit(c.rest, c.zone_id),
             },
             Command {
@@ -873,6 +880,13 @@ fn render_help() -> String {
 #[derive(Debug, Clone)]
 pub enum SlashOutcome {
     Command(AgentCommand),
+
+    /// A command that still goes out, prefaced by an advisory chat line
+    /// (warn-don't-block, e.g. /jobchange outside a Mog House).
+    CommandWithNotice {
+        cmd: AgentCommand,
+        notice: String,
+    },
 
     Commands(Vec<AgentCommand>),
 
@@ -1067,6 +1081,7 @@ pub fn parse_slash(
     zone_id: Option<u16>,
     self_char_id: Option<u32>,
     party: &[ffxi_viewer_wire::PartyMember],
+    myroom: Option<ffxi_viewer_wire::MyRoom>,
 ) -> SlashOutcome {
     let trimmed = buffer.trim_start();
     let body = trimmed.strip_prefix('/').unwrap_or(trimmed);
@@ -1088,6 +1103,7 @@ pub fn parse_slash(
         zone_id,
         self_char_id,
         party,
+        myroom,
     };
 
     match COMMANDS
@@ -1669,7 +1685,9 @@ fn parse_mhexit(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
     let slot: u8 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
 
     let kind = match first {
-        None | Some("home") | Some("") => crate::state::MogHouseExit::Home,
+        None | Some("home") | Some("") => crate::state::MogHouseExit::Home {
+            exit_bit: zone_id.and_then(home_region_bit_for_zone).unwrap_or(0),
+        },
         Some("1f") | Some("mog1f") => crate::state::MogHouseExit::Mog1F,
         Some("2f") | Some("mog2f") => crate::state::MogHouseExit::Mog2F,
         Some("garden") | Some("moggarden") => crate::state::MogHouseExit::MogGarden,
@@ -1680,7 +1698,7 @@ fn parse_mhexit(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
         Some("whitegate") | Some("aht_urhgan") => crate::state::MogHouseExit::Whitegate { slot },
         Some("adoulin") => crate::state::MogHouseExit::Adoulin { slot },
         Some("auto") => match zone_id.and_then(home_region_bit_for_zone) {
-            Some(bit) => bit_and_slot_to_exit(bit, 1),
+            Some(bit) => crate::state::MogHouseExit::from_bit_slot(bit, 1),
             None => {
                 return SlashOutcome::SystemMessage(format!(
                     "/mhexit auto: zone {} isn't in the home-region table — \
@@ -1699,16 +1717,64 @@ fn parse_mhexit(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
     SlashOutcome::Command(AgentCommand::MogHouseExit { kind })
 }
 
-fn bit_and_slot_to_exit(bit: u8, slot: u8) -> crate::state::MogHouseExit {
-    use crate::state::MogHouseExit;
-    match bit {
-        1 => MogHouseExit::Sandoria { slot },
-        2 => MogHouseExit::Bastok { slot },
-        3 => MogHouseExit::Windurst { slot },
-        4 => MogHouseExit::Jeuno { slot },
-        5 => MogHouseExit::Whitegate { slot },
-        9 => MogHouseExit::Adoulin { slot },
-        _ => MogHouseExit::Home,
+// Job tokens accept the LSB-scraped full name ("Warrior"), the canonical
+// three-letter code ("WAR"), or the numeric JOBTYPE id — all case-insensitive.
+fn parse_job_token(token: &str) -> Option<u8> {
+    if let Ok(id) = token.parse::<u16>() {
+        return (id > 0 && ffxi_proto::job_names::lookup(id).is_some()).then_some(id as u8);
+    }
+    ffxi_proto::job_names::JOB_ABBREVS
+        .iter()
+        .chain(ffxi_proto::job_names::JOB_NAMES.iter())
+        .find(|(id, name)| *id > 0 && name.eq_ignore_ascii_case(token))
+        .map(|(id, _)| *id as u8)
+}
+
+fn parse_jobchange(rest: &str, in_mog_house: bool) -> SlashOutcome {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return SlashOutcome::Command(AgentCommand::OpenMogMenu);
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let main_token = parts.next().unwrap_or("");
+    let sub_token = parts.next();
+    if parts.next().is_some() {
+        return SlashOutcome::SystemMessage(
+            "/jobchange: usage `/jobchange [<main> [sub]]` (e.g. `/jc war mnk`)".into(),
+        );
+    }
+
+    let Some(main_job) = parse_job_token(main_token) else {
+        return SlashOutcome::SystemMessage(format!(
+            "/jobchange: unknown job `{main_token}` (use a name or code like WAR, MNK, WHM)"
+        ));
+    };
+    let sub_job = match sub_token {
+        Some(token) => match parse_job_token(token) {
+            Some(job) => Some(job),
+            None => {
+                return SlashOutcome::SystemMessage(format!(
+                    "/jobchange: unknown support job `{token}` (use a name or code like WAR, MNK, WHM)"
+                ));
+            }
+        },
+        None => None,
+    };
+
+    let cmd = AgentCommand::ChangeJob {
+        main_job: Some(main_job),
+        sub_job,
+    };
+    if in_mog_house {
+        SlashOutcome::Command(cmd)
+    } else {
+        SlashOutcome::CommandWithNotice {
+            cmd,
+            notice:
+                "/jobchange: you don't appear to be in a Mog House — the server may reject this"
+                    .into(),
+        }
     }
 }
 
@@ -2793,6 +2859,7 @@ mod tests {
             zone_id,
             None,
             &[],
+            None,
         )
     }
 
@@ -2845,7 +2912,16 @@ mod tests {
         let mut me = ent(42, "Me", EntityKind::Pc, 0.0, 0.0);
         me.act_index = 7;
         let entities = vec![me, ent(1, "Goblin", EntityKind::Mob, 3.0, 0.0)];
-        let outcome = parse_slash("/dig", &entities, origin(), Some(1), None, Some(42), &[]);
+        let outcome = parse_slash(
+            "/dig",
+            &entities,
+            origin(),
+            Some(1),
+            None,
+            Some(42),
+            &[],
+            None,
+        );
         assert!(matches!(
             outcome,
             SlashOutcome::Command(AgentCommand::Action {
@@ -2903,7 +2979,8 @@ mod tests {
                 None,
                 None,
                 Some(100),
-                &party
+                &party,
+                None
             ),
             SlashOutcome::SetTarget(Some(100))
         ));
@@ -2916,7 +2993,8 @@ mod tests {
                 None,
                 None,
                 Some(100),
-                &party
+                &party,
+                None
             ),
             SlashOutcome::SetTarget(Some(300))
         ));
@@ -2929,7 +3007,8 @@ mod tests {
                 None,
                 None,
                 Some(100),
-                &party
+                &party,
+                None
             ),
             SlashOutcome::SystemMessage(_)
         ));
@@ -4028,8 +4107,20 @@ mod tests {
     fn mhexit_defaults_to_home() {
         match parse_slash_t("/mhexit", &empty_entities(), origin(), None, None) {
             SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
-                assert!(matches!(kind, crate::state::MogHouseExit::Home));
-                assert_eq!(kind.wire_pair(), (1, 0));
+                assert!(matches!(
+                    kind,
+                    crate::state::MogHouseExit::Home { exit_bit: 0 }
+                ));
+                assert_eq!(kind.wire_pair(), (0, 0));
+            }
+            other => panic!("expected MogHouseExit::Home, got {other:?}"),
+        }
+
+        // With a known city zone, Home echoes the zone-derived bit like retail
+        // (research/XiPackets/world/client/0x005E).
+        match parse_slash_t("/mhexit home", &empty_entities(), origin(), None, Some(235)) {
+            SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
+                assert_eq!(kind.wire_pair(), (2, 0));
             }
             other => panic!("expected MogHouseExit::Home, got {other:?}"),
         }
@@ -4087,6 +4178,81 @@ mod tests {
                 assert!(msg.contains("auto"), "got: {msg}");
             }
             other => panic!("expected error SystemMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jobchange_no_args_opens_mog_menu() {
+        match parse_slash_t("/jc", &empty_entities(), origin(), None, None) {
+            SlashOutcome::Command(AgentCommand::OpenMogMenu) => {}
+            other => panic!("expected OpenMogMenu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jobchange_outside_mog_house_warns_but_sends() {
+        match parse_slash_t(
+            "/jobchange WAR mnk",
+            &empty_entities(),
+            origin(),
+            None,
+            None,
+        ) {
+            SlashOutcome::CommandWithNotice { cmd, notice } => {
+                assert!(matches!(
+                    cmd,
+                    AgentCommand::ChangeJob {
+                        main_job: Some(1),
+                        sub_job: Some(2)
+                    }
+                ));
+                assert!(notice.contains("Mog House"), "got: {notice}");
+            }
+            other => panic!("expected CommandWithNotice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jobchange_in_mog_house_sends_without_notice() {
+        let outcome = parse_slash(
+            "/jc warrior",
+            &empty_entities(),
+            origin(),
+            None,
+            Some(230),
+            None,
+            &[],
+            Some(ffxi_viewer_wire::MyRoom {
+                model: 257,
+                sub_map: 0,
+            }),
+        );
+        match outcome {
+            SlashOutcome::Command(AgentCommand::ChangeJob {
+                main_job: Some(1),
+                sub_job: None,
+            }) => {}
+            other => panic!("expected ChangeJob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jobchange_accepts_names_codes_and_ids_case_insensitively() {
+        assert_eq!(parse_job_token("WAR"), Some(1));
+        assert_eq!(parse_job_token("war"), Some(1));
+        assert_eq!(parse_job_token("Warrior"), Some(1));
+        assert_eq!(parse_job_token("mnk"), Some(2));
+        assert_eq!(parse_job_token("13"), Some(13));
+        assert_eq!(parse_job_token("0"), None, "0 = keep-current, not a job");
+        assert_eq!(parse_job_token("none"), None);
+        assert_eq!(parse_job_token("moogle"), None);
+    }
+
+    #[test]
+    fn jobchange_unknown_job_is_system_message() {
+        match parse_slash_t("/jc moogle", &empty_entities(), origin(), None, None) {
+            SlashOutcome::SystemMessage(msg) => assert!(msg.contains("moogle"), "got: {msg}"),
+            other => panic!("expected SystemMessage, got {other:?}"),
         }
     }
 

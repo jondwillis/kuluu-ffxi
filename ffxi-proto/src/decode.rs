@@ -396,6 +396,11 @@ impl ServerLoginMyroom {
     /// MyroomSubMapNumber value while on the MH second floor (0x00a_login.cpp MH branch).
     pub const SUB_MAP_2F: u8 = 0x02;
 
+    /// LSB reuses LoginState MYROOM + this MyroomMapNumber for ZONE_FERETORY
+    /// (Monstrosity), which is not a Mog House server-side
+    /// (0x00a_login.cpp:234-239 sets it with no m_moghouseID).
+    pub const MYROOM_FERETORY: u16 = 0x02D9;
+
     pub const LOGIN_STATE_OFFSET: usize = 0x7C;
     pub const SUB_MAP_NUMBER_OFFSET: usize = 0xA4;
     pub const MAP_NUMBER_OFFSET: usize = 0xA6;
@@ -424,10 +429,13 @@ impl ServerLoginMyroom {
         })
     }
 
-    /// The MH interior model id, only when the server actually placed the player in a
-    /// Mog House (LoginState MYROOM with a real model).
+    /// The MH interior model id, only when the server actually placed the player
+    /// in a Mog House: LoginState MYROOM excluding the [`Self::MYROOM_NONE`]
+    /// sentinel and the [`Self::MYROOM_FERETORY`] alias.
     pub fn myroom_model(&self) -> Option<u16> {
-        (self.login_state == Self::LOGIN_STATE_MYROOM && self.map_number != Self::MYROOM_NONE)
+        (self.login_state == Self::LOGIN_STATE_MYROOM
+            && self.map_number != Self::MYROOM_NONE
+            && self.map_number != Self::MYROOM_FERETORY)
             .then_some(self.map_number)
     }
 }
@@ -1861,6 +1869,57 @@ mod tests {
             None,
             "MYROOM with the 0x01FF sentinel carries no model"
         );
+
+        buf[ServerLoginMyroom::MAP_NUMBER_OFFSET..ServerLoginMyroom::MAP_NUMBER_OFFSET + 2]
+            .copy_from_slice(&ServerLoginMyroom::MYROOM_FERETORY.to_le_bytes());
+        let myroom = ServerLogin::decode(&buf).unwrap().myroom.unwrap();
+        assert_eq!(
+            myroom.myroom_model(),
+            None,
+            "Feretory MYROOM alias is not a Mog House"
+        );
+    }
+
+    /// Pins the myroom cluster to LSB's GP_SERV_COMMAND_LOGIN PacketData layout
+    /// (vendor/server/src/map/packets/s2c/0x00a_login.h:96-131; body offsets, no
+    /// sub-packet header) so an offset edit can't pass the roundtrip tests, which
+    /// build buffers through these same consts.
+    #[test]
+    fn myroom_cluster_offsets_and_sentinels_match_lsb_login_layout() {
+        assert_eq!(ServerLoginMyroom::LOGIN_STATE_OFFSET, 0x7C);
+        assert_eq!(ServerLoginMyroom::SUB_MAP_NUMBER_OFFSET, 0xA4);
+        assert_eq!(ServerLoginMyroom::MAP_NUMBER_OFFSET, 0xA6);
+        assert_eq!(ServerLoginMyroom::EXIT_BIT_OFFSET, 0xAA);
+        assert_eq!(ServerLoginMyroom::MOG_ZONE_FLAG_OFFSET, 0xAB);
+        assert_eq!(ServerLoginMyroom::LOGIN_STATE_MYROOM, 1, "SAVE_LOGIN_STATE");
+        assert_eq!(ServerLoginMyroom::LOGIN_STATE_GAME, 2, "SAVE_LOGIN_STATE");
+        assert_eq!(ServerLoginMyroom::MYROOM_NONE, 0x01FF);
+        assert_eq!(ServerLoginMyroom::SUB_MAP_2F, 0x02);
+        assert_eq!(ServerLoginMyroom::MYROOM_FERETORY, 0x02D9);
+    }
+
+    /// Pins JobInfo to LSB's GP_MYROOM_DANCER layout
+    /// (vendor/server/src/map/packets/s2c/0x01b_job_info.h:28-45; job_lev2, not
+    /// the legacy job_lev[16] @0x0C) and MAX_JOBTYPE
+    /// (vendor/server/src/map/entities/battleentity.h:100), since the decode
+    /// tests build buffers through these same consts.
+    #[test]
+    fn job_info_offsets_match_gp_myroom_dancer_layout() {
+        assert_eq!(JobInfo::MJOB_NO_OFFSET, 0x04);
+        assert_eq!(JobInfo::SJOB_NO_OFFSET, 0x07);
+        assert_eq!(JobInfo::UNLOCKED_OFFSET, 0x08);
+        assert_eq!(JobInfo::HP_MAX_OFFSET, 0x38);
+        assert_eq!(JobInfo::MP_MAX_OFFSET, 0x3C);
+        assert_eq!(JobInfo::SJOBFLG_OFFSET, 0x40);
+        assert_eq!(JobInfo::JOB_LEVELS_OFFSET, 0x44);
+        assert_eq!(JobInfo::MAX_JOBTYPE, 24);
+    }
+
+    /// Pins the 2F-unlock byte to LSB's full-packet offset 0x27 minus the 4-byte
+    /// sub-packet header (vendor/server/src/map/packets/char_sync.cpp:61).
+    #[test]
+    fn char_sync_2f_flag_sits_at_lsb_packet_byte_0x27() {
+        assert_eq!(CharSync::MH_2F_UNLOCKED_OFFSET, 0x27 - 4);
     }
 
     #[test]

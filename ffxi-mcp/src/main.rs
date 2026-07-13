@@ -824,6 +824,8 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::FishingPhaseChanged { .. } => "fishing_phase_changed",
         AgentEvent::FishingProgress { .. } => "fishing_progress",
         AgentEvent::FishingEnded => "fishing_ended",
+        AgentEvent::JobInfoUpdated { .. } => "job_info_updated",
+        AgentEvent::MogHouse2fUnlockUpdated { .. } => "mog_house_2f_unlock_updated",
     }
 }
 
@@ -845,6 +847,8 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         Cancel => "cancel",
         RequestZoneChange { .. } => "request_zone_change",
         MogHouseExit { .. } => "mog_house_exit",
+        ChangeJob { .. } => "change_job",
+        OpenMogMenu => "open_mog_menu",
         UseItem { .. } => "use_item",
         Equip { .. } => "equip",
         StackInventory { .. } => "stack_inventory",
@@ -1249,6 +1253,8 @@ mod tests {
         let ev = AgentEvent::ZoneChanged {
             from: Some(100),
             to: 230,
+            myroom: None,
+            mog_zone_flag: false,
         };
         assert_eq!(
             uris_for_event(&ev),

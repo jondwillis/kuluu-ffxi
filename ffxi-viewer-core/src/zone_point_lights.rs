@@ -1,7 +1,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use bevy::prelude::*;
-use ffxi_dat::{chunk::walk, generator::Generator, kind::ChunkKind, zone_dat, DatRoot};
+use ffxi_dat::{chunk::walk, generator::Generator, kind::ChunkKind, DatRoot};
 use ffxi_viewer_wire::Vec3 as WireVec3;
 
 use crate::components::InGameEntity;
@@ -60,7 +60,7 @@ pub struct ZonePointLight {
 
 #[derive(Resource, Default)]
 pub struct ZonePointLights {
-    pub zone_id: Option<u16>,
+    pub file_id: Option<u32>,
     pub lights: Vec<ZonePointLight>,
 }
 
@@ -209,17 +209,14 @@ pub fn sticky_nearest_point_light_arrays(
 }
 
 fn load_zone_point_lights(scene_state: Res<SceneState>, mut store: ResMut<ZonePointLights>) {
-    let current = scene_state.snapshot.zone_id;
-    if current == store.zone_id {
+    let current = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
+    if current == store.file_id {
         return;
     }
-    store.zone_id = current;
+    store.file_id = current;
     store.lights.clear();
 
-    let Some(zone_id) = current else {
-        return;
-    };
-    let Some(file_id) = zone_dat::zone_id_to_mzb_file_id(zone_id) else {
+    let Some(file_id) = current else {
         return;
     };
     let Ok(root) = DatRoot::from_env_or_default() else {
@@ -260,7 +257,7 @@ fn load_zone_point_lights(scene_state: Res<SceneState>, mut store: ResMut<ZonePo
     }
 
     info!(
-        "zone_point_lights: zone {zone_id} → {} faithful point light(s)",
+        "zone_point_lights: DAT {file_id} → {} faithful point light(s)",
         store.lights.len()
     );
 }
@@ -280,7 +277,7 @@ fn sync_faithful_zone_light_entities(
         return;
     }
     for e in &existing {
-        commands.entity(e).despawn();
+        commands.entity(e).try_despawn();
     }
     for l in &store.lights {
         if l.is_character {

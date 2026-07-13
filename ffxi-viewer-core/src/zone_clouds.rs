@@ -118,8 +118,8 @@ struct CloudLayerBuild {
 
 #[derive(Resource, Default)]
 struct ZoneCloudState {
-    // (zone_id, weather fourcc) the spawned entities currently mirror.
-    key: Option<(u16, WeatherTypeId)>,
+    // (resolved zone-DAT file id, weather fourcc) the spawned entities currently mirror.
+    key: Option<(u32, WeatherTypeId)>,
     entities: Vec<Entity>,
 }
 
@@ -365,36 +365,33 @@ fn rebuild_zone_clouds(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<FfxiZoneMaterial>>,
 ) {
-    let zone_id = scene_state.snapshot.zone_id;
+    let file_id = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
     let want = weather_type_id(current_weather.0.map(|w| w as u16).unwrap_or(0));
-    let key = zone_id.map(|z| (z, want));
+    let key = file_id.map(|f| (f, want));
     if key == state.key {
         return;
     }
 
-    // A weather change within the same zone cross-fades the old set out (xim
-    // switchWeather); a zone change despawns immediately — the old weat/ set
+    // A weather change within the same zone DAT cross-fades the old set out (xim
+    // switchWeather); a DAT change despawns immediately — the old weat/ set
     // belongs to a different DAT and the camera teleports, so a fade would smear.
-    let same_zone = match (state.key, key) {
-        (Some((prev_zone, _)), Some((next_zone, _))) => prev_zone == next_zone,
+    let same_dat = match (state.key, key) {
+        (Some((prev_file, _)), Some((next_file, _))) => prev_file == next_file,
         _ => false,
     };
     for e in state.entities.drain(..) {
-        if same_zone {
+        if same_dat {
             commands.entity(e).insert(CloudFade {
                 dir: FadeDir::Out,
                 elapsed: 0.0,
             });
         } else {
-            commands.entity(e).despawn();
+            commands.entity(e).try_despawn();
         }
     }
     state.key = key;
 
-    let Some(zone_id) = zone_id else {
-        return;
-    };
-    let Some(file_id) = ffxi_dat::zone_dat::zone_id_to_mzb_file_id(zone_id) else {
+    let Some(file_id) = file_id else {
         return;
     };
     let Ok(root) = DatRoot::from_env_or_default() else {
@@ -439,7 +436,7 @@ fn rebuild_zone_clouds(
                 },
                 CloudFade {
                     dir: FadeDir::In,
-                    elapsed: if same_zone { 0.0 } else { WEATHER_FADE_SECS },
+                    elapsed: if same_dat { 0.0 } else { WEATHER_FADE_SECS },
                 },
                 Mesh3d(layer.mesh),
                 MeshMaterial3d(layer.material),
@@ -454,7 +451,7 @@ fn rebuild_zone_clouds(
 
     if !state.entities.is_empty() {
         info!(
-            zone_id,
+            file_id,
             type_ = id_str(want),
             count = state.entities.len(),
             "zone clouds spawned"
@@ -491,7 +488,7 @@ fn drive_zone_clouds(
         fade.elapsed += dt;
         if fade.finished_out() {
             state.entities.retain(|&e| e != entity);
-            commands.entity(entity).despawn();
+            commands.entity(entity).try_despawn();
             continue;
         }
 
@@ -521,7 +518,7 @@ struct StarDome;
 
 #[derive(Resource, Default)]
 struct ZoneStarState {
-    zone: Option<u16>,
+    file_id: Option<u32>,
     entity: Option<Entity>,
 }
 
@@ -543,19 +540,16 @@ fn rebuild_zone_stars(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let zone_id = scene_state.snapshot.zone_id;
-    if zone_id == state.zone {
+    let file_id = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
+    if file_id == state.file_id {
         return;
     }
     if let Some(e) = state.entity.take() {
-        commands.entity(e).despawn();
+        commands.entity(e).try_despawn();
     }
-    state.zone = zone_id;
+    state.file_id = file_id;
 
-    let Some(zone_id) = zone_id else {
-        return;
-    };
-    let Some(file_id) = ffxi_dat::zone_dat::zone_id_to_mzb_file_id(zone_id) else {
+    let Some(file_id) = file_id else {
         return;
     };
     let Ok(root) = DatRoot::from_env_or_default() else {
@@ -632,7 +626,7 @@ fn rebuild_zone_stars(
         ))
         .id();
     state.entity = Some(e);
-    info!(zone_id, half_xz, scale, "zone star dome spawned");
+    info!(file_id, half_xz, scale, "zone star dome spawned");
 }
 
 #[allow(clippy::type_complexity)]

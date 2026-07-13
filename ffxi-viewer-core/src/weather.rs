@@ -29,7 +29,7 @@ pub struct ZoneWeather {
     // we only re-select on change.
     selected: Option<(WeatherTypeId, bool)>,
 
-    pub zone_id: Option<u16>,
+    pub file_id: Option<u32>,
 
     // research/xim EnvironmentManager.kt:399-451: one interpolated env source per
     // frame; skybox/lighting/sun_moon all read this instead of independently
@@ -163,19 +163,19 @@ pub fn load_zone_weather(
     mut zone_weather: ResMut<ZoneWeather>,
     mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
 ) {
-    let current = scene_state.snapshot.zone_id;
-    if current == zone_weather.zone_id {
+    let current = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
+    if current == zone_weather.file_id {
         return;
     }
-    zone_weather.zone_id = current;
+    zone_weather.file_id = current;
     zone_weather.sets = ZoneWeatherSets::default();
     zone_weather.records.clear();
     zone_weather.selected = None;
 
-    let Some(zone_id) = current else { return };
-    let Some(file_id) = ffxi_dat::zone_dat::zone_id_to_mzb_file_id(zone_id) else {
+    if scene_state.snapshot.myroom.is_some() {
         return;
-    };
+    }
+    let Some(file_id) = current else { return };
 
     let Ok(root) = DatRoot::from_env_or_default() else {
         return;
@@ -203,9 +203,9 @@ pub fn load_zone_weather(
         } else {
             format!("types [{}]", types.join(", "))
         };
-        info!(zone_id, "zone weather loaded: {}", summary);
+        info!(file_id, "zone weather loaded: {}", summary);
         toasts.write(crate::snapshot::ToastEvent::system(format!(
-            "⛅ Zone weather loaded: zone 0x{zone_id:04X} ({summary})"
+            "⛅ Zone weather loaded: DAT {file_id} ({summary})"
         )));
     }
 }

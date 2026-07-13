@@ -91,7 +91,7 @@ impl Default for ZoneAtmosphereProvider {
 
 #[derive(Resource, Default)]
 pub struct LastAtmosphereZone {
-    pub zone_id: Option<u16>,
+    pub file_id: Option<u32>,
 }
 
 pub fn apply_zone_atmosphere_system(
@@ -103,12 +103,14 @@ pub fn apply_zone_atmosphere_system(
     mut q_cam: Query<(Entity, Option<&mut DistanceFog>, Option<&Skybox>), With<OperatorCamera>>,
     mut commands: Commands,
 ) {
-    let current = state.snapshot.zone_id;
-    if current == last.zone_id {
+    let current = crate::snapshot::effective_zone_file_id(&state.snapshot);
+    if current == last.file_id {
         return;
     }
-    last.zone_id = current;
-    let Some(zone_id) = current else { return };
+    last.file_id = current;
+    let Some(zone_id) = state.snapshot.zone_id else {
+        return;
+    };
 
     let atmo = (provider.0)(zone_id);
 

@@ -17,7 +17,13 @@ pub fn sync_current_weather_from_snapshot(
     state: Res<SceneState>,
     mut current: ResMut<CurrentWeather>,
 ) {
-    let next = state.snapshot.weather;
+    // LSB sends the surrounding town's weather in the MH 0x00A
+    // (vendor/server/src/map/packets/s2c/0x00a_login.cpp:154); interiors show none.
+    let next = if state.snapshot.myroom.is_some() {
+        None
+    } else {
+        state.snapshot.weather
+    };
     if next != current.0 {
         current.0 = next;
     }
@@ -439,7 +445,7 @@ pub fn manage_weather_particles_system(
     }
 
     for (e, _) in q_root.iter() {
-        commands.entity(e).despawn();
+        commands.entity(e).try_despawn();
     }
 
     let Some(profile) = active.modifier.particle else {

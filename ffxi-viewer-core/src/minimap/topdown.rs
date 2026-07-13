@@ -84,12 +84,12 @@ pub fn bake_topdown_on_zone_or_policy_change(
     if geom.positions.is_empty() {
         return;
     }
-    let snapshot_zone = scene_state.snapshot.zone_id;
+    let snapshot_file_id = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
 
     if !matches!(*stage, BakeStage::Idle) {
         return;
     }
-    if snapshot_zone == state.zone_id && !policy_changed {
+    if snapshot_file_id == state.baked_file_id && !policy_changed {
         return;
     }
     *stage = BakeStage::Requested { waited: 0 };
@@ -182,7 +182,7 @@ pub fn spawn_bake_camera(
         ))
         .id();
 
-    state.zone_id = scene_state.snapshot.zone_id;
+    state.baked_file_id = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
     state.topdown_image = Some(render_target);
     state.aabb = Some(aabb);
 

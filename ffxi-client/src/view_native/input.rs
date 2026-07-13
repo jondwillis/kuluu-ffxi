@@ -97,6 +97,14 @@ pub fn advance_heading_turn(accum_units: &mut f32, dir: i32, dt_secs: f32) -> (i
     (whole as i32, float_delta)
 }
 
+pub fn autorun_after_toggle(phantom_forward: bool, toggle_just_pressed: bool) -> bool {
+    if toggle_just_pressed {
+        !phantom_forward
+    } else {
+        phantom_forward
+    }
+}
+
 #[derive(Resource, Default)]
 pub struct LocalPlayerPrediction {
     pub pos: Vec3,
@@ -239,11 +247,10 @@ pub fn handle_input_system(
             target.id = Some(id);
         }
     }
-    if bindings.just_pressed(Action::ToggleAutorun, &keys)
-        && bindings.pressed(Action::MoveForward, &keys)
-    {
-        autorun.phantom_forward = !autorun.phantom_forward;
-    }
+    autorun.phantom_forward = autorun_after_toggle(
+        autorun.phantom_forward,
+        bindings.just_pressed(Action::ToggleAutorun, &keys),
+    );
     if bindings.just_pressed(Action::ToggleWalk, &keys) {
         walk_mode.walking = !walk_mode.walking;
     }
@@ -1137,6 +1144,22 @@ mod tests {
         } else {
             Some(Vec3::new(p.x / 100.0, 0.0, 0.5))
         }
+    }
+
+    #[test]
+    fn autorun_toggle_engages_from_standstill() {
+        assert!(autorun_after_toggle(false, true));
+    }
+
+    #[test]
+    fn autorun_toggle_disengages_when_active() {
+        assert!(!autorun_after_toggle(true, true));
+    }
+
+    #[test]
+    fn autorun_unchanged_without_toggle_press() {
+        assert!(!autorun_after_toggle(false, false));
+        assert!(autorun_after_toggle(true, false));
     }
 
     #[test]

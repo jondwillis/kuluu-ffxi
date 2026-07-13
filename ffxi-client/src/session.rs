@@ -50,6 +50,20 @@ pub enum CharSelection {
     Name(String),
 }
 
+/// Self Mog House / job state the send loop needs synchronously for the local
+/// menus (the folded `SessionState` lives in another task).
+#[derive(Debug, Default, Clone, Copy)]
+struct SelfMogState {
+    myroom: Option<crate::state::MyRoomInfo>,
+    mog_zone_flag: bool,
+    /// Decoded `LoginState == MYROOM` from the last 0x00A. Kept separate from
+    /// `myroom`: a MYROOM login with the 0x01FF sentinel model still spawns at
+    /// the forced origin and must skip the zoneline seed repair.
+    in_myroom: bool,
+    mh_2f_unlocked: Option<bool>,
+    job_info: Option<crate::state::JobInfoState>,
+}
+
 #[derive(Debug)]
 enum MapOutcome {
     Disconnected,
@@ -283,6 +297,8 @@ async fn run_map_session(
     let mut self_pos_seeded = false;
 
     let mut flood_in_mog_house = false;
+
+    let mut mog = SelfMogState::default();
     while std::time::Instant::now() < flood_deadline {
         match tokio::time::timeout(std::time::Duration::from_millis(500), map.recv_decrypted())
             .await
@@ -308,6 +324,7 @@ async fn run_map_session(
                         &mut self_pos_seeded,
                         &mut npc_name_resolver,
                         &mut flood_in_mog_house,
+                        &mut mog,
                         spawn_fallback,
                     );
                 }
@@ -383,6 +400,7 @@ async fn run_map_session(
         self_pos,
         self_pos_seeded,
         npc_name_resolver,
+        mog,
     )
     .await
 }
@@ -446,6 +464,8 @@ fn handle_sub_packet(
 
     was_in_mog_house: &mut bool,
 
+    mog: &mut SelfMogState,
+
     zoneline_spawn_fallback: Option<Vec3>,
 ) {
     use ffxi_proto::map::s2c;
@@ -463,10 +483,42 @@ fn handle_sub_packet(
                 *current_zone_id = login.zone_no;
                 let head = login.pos_head;
 
+                mog.in_myroom = login.myroom.is_some_and(|m| {
+                    m.login_state == decode::ServerLoginMyroom::LOGIN_STATE_MYROOM
+                });
+                mog.myroom = login.myroom.and_then(|m| {
+                    m.myroom_model().map(|model| crate::state::MyRoomInfo {
+                        model,
+                        sub_map: m.sub_map_number,
+                        exit_bit: m.exit_bit,
+                    })
+                });
+                mog.mog_zone_flag = login.myroom.is_some_and(|m| m.mog_zone_flag != 0);
+                if let Some(m) = login.myroom {
+                    match m.login_state {
+                        decode::ServerLoginMyroom::LOGIN_STATE_MYROOM => {
+                            note_mog_transition(true, was_in_mog_house, event_tx);
+                        }
+                        decode::ServerLoginMyroom::LOGIN_STATE_GAME => {
+                            note_mog_transition(false, was_in_mog_house, event_tx);
+                        }
+                        _ => {}
+                    }
+                }
+
                 let _ = event_tx.send(AgentEvent::ZoneChanged {
                     from: None,
                     to: login.zone_no,
+                    myroom: mog.myroom,
+                    mog_zone_flag: mog.mog_zone_flag,
                 });
+
+                if let Some(room) = mog.myroom {
+                    let _ = event_tx.send(AgentEvent::EntityUpserted {
+                        entity: mh_door_entity(room.model),
+                        pos_present: true,
+                    });
+                }
 
                 if let Some(game_time) = login.game_time {
                     let _ = event_tx.send(AgentEvent::VanaTimeSynced { game_time });
@@ -500,7 +552,7 @@ fn handle_sub_packet(
                         y: head.y,
                         z: head.z,
                     };
-                    let seed_pos = apply_zoneline_spawn_fallback(raw_pos, zoneline_spawn_fallback);
+                    let seed_pos = spawn_seed_pos(raw_pos, zoneline_spawn_fallback, mog.in_myroom);
                     *self_pos = Position {
                         pos: seed_pos,
                         heading: head.dir,
@@ -604,7 +656,7 @@ fn handle_sub_packet(
                         y: head.y,
                         z: head.z,
                     };
-                    let seed_pos = apply_zoneline_spawn_fallback(raw_pos, zoneline_spawn_fallback);
+                    let seed_pos = spawn_seed_pos(raw_pos, zoneline_spawn_fallback, mog.in_myroom);
                     *self_pos = Position {
                         pos: seed_pos,
                         heading: head.dir,
@@ -752,7 +804,16 @@ fn handle_sub_packet(
                 }
             }
             Some(decode::CharSync::SUB_TYPE) => {
-                let _ = decode::CharSync::decode(sub.data);
+                if let Ok(sync) = decode::CharSync::decode(sub.data) {
+                    // The 2F bit is meaningful only on the SELF sync
+                    // (vendor/server/src/map/packets/char_sync.cpp:61).
+                    if sync.id == self_char_id {
+                        if let Some(unlocked) = sync.mh_2f_unlocked {
+                            mog.mh_2f_unlocked = Some(unlocked);
+                            let _ = event_tx.send(AgentEvent::MogHouse2fUnlockUpdated { unlocked });
+                        }
+                    }
+                }
             }
             _ => {}
         },
@@ -841,6 +902,13 @@ fn handle_sub_packet(
         op if op == s2c::FISH => {
             if let Ok(f) = decode::FishPacket::decode(sub.data) {
                 let _ = event_tx.send(AgentEvent::FishHooked { params: f.into() });
+            }
+        }
+        op if op == s2c::JOB_INFO => {
+            if let Ok(ji) = decode::JobInfo::decode(sub.data) {
+                let info = crate::state::JobInfoState::from(ji);
+                mog.job_info = Some(info);
+                let _ = event_tx.send(AgentEvent::JobInfoUpdated { info });
             }
         }
         op if op == s2c::CLISTATUS => {
@@ -1160,6 +1228,11 @@ const NAME_MISS_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_se
 
 const PENDING_EVENT_END_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+// Retail locks movement during events, so there is no upstream value: player
+// drift past this (above rubber-band jitter, ~one deliberate step at 5 yalm/s)
+// releases a pinned message-dialog as walked-away rather than waiting out the grace.
+const EVENT_WALKAWAY_YALMS: f32 = 2.0;
+
 const NAME_MISS_BODY_HEX_CAP: usize = 96;
 
 fn record_name_miss(
@@ -1254,6 +1327,7 @@ async fn keepalive_loop(
 
     mut self_pos_seeded: bool,
     mut npc_name_resolver: NpcNameResolver,
+    mut mog: SelfMogState,
 ) -> Result<MapOutcome> {
     let mut last_recv = std::time::Instant::now();
 
@@ -1283,6 +1357,7 @@ async fn keepalive_loop(
     let mut pending_maprect: Option<(std::time::Instant, u32)> = None;
 
     let mut pending_event_end_since: Option<std::time::Instant> = None;
+    let mut pending_event_end_anchor: Option<Vec3> = None;
 
     // Events the VM produced no frame for (frameless completion, unimplemented
     // opcode, missing DAT): EVENT_END goes out on the next send tick so the
@@ -1294,6 +1369,8 @@ async fn keepalive_loop(
         npc_name_resolver.root.clone(),
         character_name.clone(),
     );
+
+    let mut local_menu = crate::local_menu::LocalMenuSession::new();
 
     let mut is_healing = false;
 
@@ -1331,9 +1408,13 @@ async fn keepalive_loop(
                          let _ = event_tx.send(AgentEvent::SetFps { max });
                      }
                      Some(AgentCommand::EndEvent) => {
+                        // Local menus first: dismissing one never involves the server.
+                        if local_menu.active() {
+                            local_menu.clear();
+                            let _ = event_tx.send(AgentEvent::EventEnded);
                         // VM-driven event: advance to the next frame, or send
                         // EVENT_END only once the script ends.
-                        if let Some((u, a, n)) = dialog_session.active_end() {
+                        } else if let Some((u, a, n)) = dialog_session.active_end() {
                             match dialog_session.advance(None) {
                                 crate::event_dialog::Advance::Frame(dialog) => {
                                     emit_event_speech_to_chat(&event_tx, &dialog);
@@ -1371,9 +1452,59 @@ async fn keepalive_loop(
                         event_num,
                         choice,
                     }) => {
+                        // Local menus consume choices before the event VM.
+                        if local_menu.active() {
+                            match local_menu.advance(Some(choice)) {
+                                crate::local_menu::Advance::Frame(dialog) => {
+                                    let _ = event_tx.send(AgentEvent::EventDialog { dialog });
+                                }
+                                crate::local_menu::Advance::Stub { notice, frame } => {
+                                    let _ = event_tx.send(AgentEvent::ChatLine {
+                                        line: ChatLine {
+                                            channel: ChatChannel::System,
+                                            sender: "<client>".into(),
+                                            text: format!("[mog] {notice}"),
+                                            server_ts: 0,
+                                        },
+                                    });
+                                    let _ = event_tx
+                                        .send(AgentEvent::EventDialog { dialog: frame });
+                                }
+                                crate::local_menu::Advance::Exit(kind) => {
+                                    let _ = event_tx.send(AgentEvent::EventEnded);
+                                    send_mog_house_exit(
+                                        map,
+                                        kind,
+                                        self_pos,
+                                        self_act_index,
+                                        &mut sub_seq,
+                                        &mut bundle_seq,
+                                        server_last_seq,
+                                        &mut pending_maprect,
+                                        &event_tx,
+                                    )
+                                    .await;
+                                }
+                                crate::local_menu::Advance::ChangeJob { main_job, sub_job } => {
+                                    let _ = event_tx.send(AgentEvent::EventEnded);
+                                    send_myroom_job(
+                                        map,
+                                        main_job,
+                                        sub_job,
+                                        &mut sub_seq,
+                                        &mut bundle_seq,
+                                        server_last_seq,
+                                        &event_tx,
+                                    )
+                                    .await;
+                                }
+                                crate::local_menu::Advance::Close => {
+                                    let _ = event_tx.send(AgentEvent::EventEnded);
+                                }
+                            }
                         // VM-driven event: feed the selection to the script and
                         // advance; only send EVENT_END once it ends.
-                        if let Some((u, a, n)) = dialog_session.active_end() {
+                        } else if let Some((u, a, n)) = dialog_session.active_end() {
                             match dialog_session.advance(Some(choice)) {
                                 crate::event_dialog::Advance::Frame(dialog) => {
                                     emit_event_speech_to_chat(&event_tx, &dialog);
@@ -1499,6 +1630,20 @@ async fn keepalive_loop(
                         target_index,
                         kind,
                     }) => {
+                        // The MH exit door is client-synthesized (LSB spawns no door
+                        // NPC) — never let an action on it reach the wire.
+                        if target_id == crate::local_menu::MH_DOOR_ENTITY_ID {
+                            if matches!(kind, crate::state::ActionKind::Talk)
+                                && dialog_session.active_end().is_none()
+                            {
+                                if let Some(myroom) = mog.myroom {
+                                    let dialog =
+                                        local_menu.open_mh_exit(&myroom, mog.mh_2f_unlocked);
+                                    let _ = event_tx.send(AgentEvent::EventDialog { dialog });
+                                }
+                            }
+                            continue;
+                        }
                         self_face_target = face_target_for(target_index, self_act_index);
                         let payload =
                             build_subpacket_action(sub_seq, target_id, target_index, &kind);
@@ -1751,50 +1896,54 @@ async fn keepalive_loop(
                         bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::MogHouseExit { kind }) => {
-
-                        let Some(act_index) = self_act_index else {
-                            let _ = event_tx.send(AgentEvent::Error {
-                                message: "MogHouseExit before self ActIndex known".into(),
-                            });
-                            continue;
-                        };
-                        let (exit_bit, exit_mode) = kind.wire_pair();
-                        tracing::info!(
-                            ?kind,
-                            exit_bit,
-                            exit_mode,
-                            pos = format!(
-                                "({:.2},{:.2},{:.2})",
-                                self_pos.pos.x, self_pos.pos.y, self_pos.pos.z,
-                            ),
-                            "sending 0x05E MAPRECT (zmrq mog-house exit)",
-                        );
-                        let payload = build_subpacket_maprect_mh_exit(
-                            sub_seq,
-                            exit_bit,
-                            exit_mode,
-                            self_pos.pos.x,
-                            self_pos.pos.y,
-                            self_pos.pos.z,
-                            act_index,
-                        );
-                        sub_seq = sub_seq.wrapping_add(1);
-                        if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
-                            .await
-                        {
-                            tracing::warn!(error = %e, "mog-house exit MAPRECT send failed");
-                            let _ = event_tx.send(AgentEvent::Error {
-                                message: format!("MogHouseExit send: {e}"),
-                            });
-                        } else {
-
-                            const ZMRQ_LE: u32 =
-                                u32::from_le_bytes(*b"zmrq");
-                            pending_maprect =
-                                Some((std::time::Instant::now(), ZMRQ_LE));
+                        send_mog_house_exit(
+                            map,
+                            kind,
+                            self_pos,
+                            self_act_index,
+                            &mut sub_seq,
+                            &mut bundle_seq,
+                            server_last_seq,
+                            &mut pending_maprect,
+                            &event_tx,
+                        )
+                        .await;
+                    }
+                    Some(AgentCommand::ChangeJob { main_job, sub_job }) => {
+                        // Never update job state optimistically: LSB validation
+                        // failures are silent drops; state refreshes via the
+                        // follow-up 0x01B/0x061/0x0DF burst.
+                        send_myroom_job(
+                            map,
+                            main_job,
+                            sub_job,
+                            &mut sub_seq,
+                            &mut bundle_seq,
+                            server_last_seq,
+                            &event_tx,
+                        )
+                        .await;
+                    }
+                    Some(AgentCommand::OpenMogMenu) => {
+                        if dialog_session.active_end().is_none() {
+                            // Soft warning only: MISC_MOGMENU zones (nomad moogles)
+                            // are legal and the client cannot see that zone flag.
+                            if mog.myroom.is_none() && !mog.mog_zone_flag {
+                                let _ = event_tx.send(AgentEvent::ChatLine {
+                                    line: ChatLine {
+                                        channel: ChatChannel::System,
+                                        sender: "<client>".into(),
+                                        text: "Mog Menu opened outside a Mog House — the \
+                                               server silently drops job changes unless \
+                                               this zone allows the Mog Menu."
+                                            .into(),
+                                        server_ts: 0,
+                                    },
+                                });
+                            }
+                            let dialog = local_menu.open_mog_menu(mog.job_info);
+                            let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                 }
             }
@@ -1844,15 +1993,24 @@ async fn keepalive_loop(
                 match (pending_event_end.is_empty(), pending_event_end_since.is_some()) {
                     (false, false) => {
                         pending_event_end_since = Some(std::time::Instant::now());
+                        pending_event_end_anchor = Some(self_pos.pos);
                     }
                     (true, true) => {
                         pending_event_end_since = None;
+                        pending_event_end_anchor = None;
                     }
                     _ => {}
                 }
                 let watchdog_fires = pending_event_end_since
                     .map(|t| t.elapsed() > PENDING_EVENT_END_GRACE)
                     .unwrap_or(false);
+                let walk_dist = pending_event_end_anchor.map(|anchor| {
+                    let dx = self_pos.pos.x - anchor.x;
+                    let dy = self_pos.pos.y - anchor.y;
+                    let dz = self_pos.pos.z - anchor.z;
+                    (dx * dx + dy * dy + dz * dz).sqrt()
+                });
+                let walked_away = should_release_on_walkaway(user_driven_events, walk_dist);
 
                 let mut payload = Vec::new();
 
@@ -1872,7 +2030,9 @@ async fn keepalive_loop(
                     sub_seq = sub_seq.wrapping_add(1);
                 }
 
-                if (!user_driven_events || watchdog_fires) && !pending_event_end.is_empty() {
+                if (!user_driven_events || watchdog_fires || walked_away)
+                    && !pending_event_end.is_empty()
+                {
                     for (unique_no, act_index, event_num) in pending_event_end.drain(..) {
                         payload.extend(build_subpacket_event_end(
                             sub_seq, unique_no, act_index, event_num, 0,
@@ -1892,8 +2052,14 @@ async fn keepalive_loop(
                                 PENDING_EVENT_END_GRACE.as_secs()
                             ),
                         });
+                    } else if walked_away {
+                        tracing::info!(
+                            moved_yalms = walk_dist.unwrap_or(0.0),
+                            "released pinned event: player walked away from dialog"
+                        );
                     }
                     pending_event_end_since = None;
+                    pending_event_end_anchor = None;
                 }
 
                 if let Some(target) = rubber_band_target {
@@ -1991,6 +2157,8 @@ async fn keepalive_loop(
                                     let _ = event_tx.send(AgentEvent::ZoneChanged {
                                         from: None,
                                         to: 0,
+                                        myroom: None,
+                                        mog_zone_flag: false,
                                     });
                                     reconnect_addr = Some(new_addr);
 
@@ -2017,6 +2185,16 @@ async fn keepalive_loop(
                                 && sub.opcode == ffxi_proto::map::s2c::ENTERZONE
                             {
                                 enterzone_seen = true;
+                            }
+
+                            if sub.opcode == ffxi_proto::map::s2c::OPENMOGMENU {
+                                // Server events own the dialog surface; LSB also
+                                // blocks 0x05E/0x100 while InEvent.
+                                if dialog_session.active_end().is_none() {
+                                    let dialog = local_menu.open_mog_menu(mog.job_info);
+                                    let _ = event_tx.send(AgentEvent::EventDialog { dialog });
+                                }
+                                continue;
                             }
 
                             // Event triggers (0x32/0x33/0x34) route through the
@@ -2106,7 +2284,7 @@ async fn keepalive_loop(
                                 &mut self_pos_seeded,
                                 &mut npc_name_resolver,
                                 &mut self_in_mog_house,
-
+                                &mut mog,
                                 None,
                             );
 
@@ -3475,6 +3653,103 @@ fn build_subpacket_maprect(
     buf
 }
 
+/// The RectID fourcc LSB matches for the universal MH exit
+/// (vendor/server/src/map/packets/c2s/0x05e_maprect.cpp:72). Emitted by
+/// [`build_subpacket_maprect_mh_exit`]; also the `pending_maprect` line id.
+const ZMRQ_LE: u32 = u32::from_le_bytes(*b"zmrq");
+
+#[allow(clippy::too_many_arguments)]
+async fn send_mog_house_exit(
+    map: &mut MapClient,
+    kind: crate::state::MogHouseExit,
+    self_pos: Position,
+    self_act_index: Option<u16>,
+    sub_seq: &mut u16,
+    bundle_seq: &mut u16,
+    server_last_seq: u16,
+    pending_maprect: &mut Option<(std::time::Instant, u32)>,
+    event_tx: &broadcast::Sender<AgentEvent>,
+) {
+    let Some(act_index) = self_act_index else {
+        let _ = event_tx.send(AgentEvent::Error {
+            message: "MogHouseExit before self ActIndex known".into(),
+        });
+        return;
+    };
+    let (exit_bit, exit_mode) = kind.wire_pair();
+    tracing::info!(
+        ?kind,
+        exit_bit,
+        exit_mode,
+        pos = format!(
+            "({:.2},{:.2},{:.2})",
+            self_pos.pos.x, self_pos.pos.y, self_pos.pos.z,
+        ),
+        "sending 0x05E MAPRECT (zmrq mog-house exit)",
+    );
+    let payload = build_subpacket_maprect_mh_exit(
+        *sub_seq,
+        exit_bit,
+        exit_mode,
+        self_pos.pos.x,
+        self_pos.pos.y,
+        self_pos.pos.z,
+        act_index,
+    );
+    *sub_seq = sub_seq.wrapping_add(1);
+    if let Err(e) = map
+        .send_encrypted(&payload, *bundle_seq, server_last_seq)
+        .await
+    {
+        tracing::warn!(error = %e, "mog-house exit MAPRECT send failed");
+        let _ = event_tx.send(AgentEvent::Error {
+            message: format!("MogHouseExit send: {e}"),
+        });
+    } else {
+        *pending_maprect = Some((std::time::Instant::now(), ZMRQ_LE));
+    }
+    *bundle_seq = bundle_seq.wrapping_add(1);
+}
+
+async fn send_myroom_job(
+    map: &mut MapClient,
+    main_job: Option<u8>,
+    sub_job: Option<u8>,
+    sub_seq: &mut u16,
+    bundle_seq: &mut u16,
+    server_last_seq: u16,
+    event_tx: &broadcast::Sender<AgentEvent>,
+) {
+    let payload = build_subpacket_myroom_job(*sub_seq, main_job, sub_job);
+    tracing::info!(?main_job, ?sub_job, "sending 0x100 MYROOM_JOB");
+    *sub_seq = sub_seq.wrapping_add(1);
+    if let Err(e) = map
+        .send_encrypted(&payload, *bundle_seq, server_last_seq)
+        .await
+    {
+        tracing::warn!(error = %e, "myroom_job send failed");
+        let _ = event_tx.send(AgentEvent::Error {
+            message: format!("ChangeJob send: {e}"),
+        });
+    }
+    *bundle_seq = bundle_seq.wrapping_add(1);
+}
+
+// c2s 0x100 GP_CLI_COMMAND_MYROOM_JOB: MainJobIndex u8 @4, SupportJobIndex u8 @5,
+// u16 pad; 0 = keep the current job
+// (vendor/server/src/map/packets/c2s/0x100_myroom_job.h:27-31).
+pub fn build_subpacket_myroom_job(sync: u16, main_job: Option<u8>, sub_job: Option<u8>) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::MYROOM_JOB,
+        2,
+        sync,
+    ));
+    buf[4] = main_job.unwrap_or(0);
+    buf[5] = sub_job.unwrap_or(0);
+    buf
+}
+
 fn build_subpacket_maprect_mh_exit(
     sync: u16,
     exit_bit: u8,
@@ -3487,7 +3762,7 @@ fn build_subpacket_maprect_mh_exit(
     let mut buf = vec![0u8; 24];
     buf[0..4].copy_from_slice(&build_subpacket_header(0x05E, 6, sync));
 
-    buf[4..8].copy_from_slice(b"zmrq");
+    buf[4..8].copy_from_slice(&ZMRQ_LE.to_le_bytes());
     buf[8..12].copy_from_slice(&x.to_le_bytes());
     buf[12..16].copy_from_slice(&y.to_le_bytes());
     buf[16..20].copy_from_slice(&z.to_le_bytes());
@@ -3593,8 +3868,67 @@ fn should_emit_pos(
     elapsed >= MOVE_EMISSION_PERIOD || pos_delta_yalms > MOVE_BIG_JUMP_YALMS || heading_changed
 }
 
+fn should_release_on_walkaway(user_driven: bool, walk_dist: Option<f32>) -> bool {
+    user_driven && walk_dist.is_some_and(|d| d > EVENT_WALKAWAY_YALMS)
+}
+
 fn should_break_flood(self_pos_seeded: bool) -> bool {
     self_pos_seeded
+}
+
+/// LSB force-places the player at exactly (0,0,0) rot 192 on Mog House zone-in
+/// (vendor/server/scripts/globals/moghouse.lua:290), so a MYROOM login's origin
+/// seed is authoritative and the near-origin "repair" must not fire.
+fn spawn_seed_pos(seed: Vec3, fallback: Option<Vec3>, in_myroom: bool) -> Vec3 {
+    if in_myroom {
+        return seed;
+    }
+    apply_zoneline_spawn_fallback(seed, fallback)
+}
+
+// XIM synthesizes the MH exit-door actor at native (0, -1, -8) plus a per-model
+// doorOffset (research/xim/src/jsMain/kotlin/xim/poc/game/configuration/
+// assetviewer/AssetViewer.kt:651-671, model ids per xim/poc/tools/ZoneChanger.kt:
+// 18-36); wire entity order swaps the vertical into `z` (GP_SERV_POS_HEAD x/z/y
+// "Not a typo", vendor/server/src/map/packets/s2c/0x00a_login.cpp:142-144).
+fn mh_door_pos(model: u16) -> Vec3 {
+    const MH_2F_MODELS: std::ops::RangeInclusive<u16> = 615..=618;
+    const SANDORIA_S: u16 = 745;
+    const WINDURST_S: u16 = 219;
+    const ADOULIN: u16 = 292;
+    const BASTOK_S: u16 = 199;
+    let (off_x, off_ground) = match model {
+        m if MH_2F_MODELS.contains(&m) => (0.0, -3.15),
+        SANDORIA_S => (-0.5, 0.0),
+        WINDURST_S | ADOULIN => (-1.0, 0.0),
+        BASTOK_S => (-1.15, 0.0),
+        _ => (0.0, 0.0),
+    };
+    Vec3 {
+        x: off_x,
+        y: -8.0 + off_ground,
+        z: -1.0,
+    }
+}
+
+fn mh_door_entity(model: u16) -> Entity {
+    Entity {
+        id: crate::local_menu::MH_DOOR_ENTITY_ID,
+        act_index: 0,
+        kind: EntityKind::Npc,
+        name: Some(crate::local_menu::MH_DOOR_NAME.to_string()),
+        pos: mh_door_pos(model),
+        heading: 0,
+        hp_pct: None,
+        bt_target_id: 0,
+        face_target: 0,
+        claim_id: 0,
+        speed: 0,
+        speed_base: 0,
+        look: None,
+        npc_state: None,
+        status: 0,
+    }
 }
 
 fn apply_zoneline_spawn_fallback(seed: Vec3, fallback: Option<Vec3>) -> Vec3 {
@@ -3646,6 +3980,86 @@ mod tests {
             apply_zoneline_spawn_fallback(v(0.0, 0.0, 0.0), Some(v(0.2, -0.1, 0.0))),
             v(0.0, 0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn myroom_login_keeps_forced_origin_seed() {
+        // vendor/server/scripts/globals/moghouse.lua:290 setPos(0, 0, 0, 192):
+        // the MH origin spawn is authoritative, not a bad seed to repair.
+        let town_side = v(162.591, -4.103, 162.423);
+        assert_eq!(
+            spawn_seed_pos(v(0.0, 0.0, 0.0), Some(town_side), true),
+            v(0.0, 0.0, 0.0),
+            "MYROOM login must not be desynced to the town-side to_pos"
+        );
+        assert_eq!(
+            spawn_seed_pos(v(0.0, 0.0, 0.0), Some(town_side), false),
+            town_side,
+            "outside MYROOM the origin repair still applies"
+        );
+    }
+
+    /// Pins the XIM doorOffset branches (AssetViewer.kt:654-663): 2F interiors
+    /// shift the door 3.15 yalms along native z, the [S]-city/Adoulin bases shift
+    /// along x.
+    #[test]
+    fn mh_door_pos_applies_xim_per_model_offsets() {
+        assert_eq!(mh_door_pos(257), v(0.0, -8.0, -1.0), "classic 1F");
+        assert_eq!(mh_door_pos(745), v(-0.5, -8.0, -1.0), "San d'Oria [S]");
+        assert_eq!(mh_door_pos(219), v(-1.0, -8.0, -1.0), "Windurst [S]");
+        assert_eq!(mh_door_pos(292), v(-1.0, -8.0, -1.0), "Adoulin");
+        assert_eq!(mh_door_pos(199), v(-1.15, -8.0, -1.0), "Bastok [S]");
+        for model in 615..=618 {
+            let pos = mh_door_pos(model);
+            assert_eq!((pos.x, pos.z), (0.0, -1.0), "2F model {model}");
+            assert!(
+                (pos.y - (-8.0 - 3.15)).abs() < 1e-5,
+                "2F model {model} ground offset, got {}",
+                pos.y
+            );
+        }
+    }
+
+    #[test]
+    fn myroom_job_packet_layout_matches_lsb_struct() {
+        let buf = build_subpacket_myroom_job(0xBEEF, Some(5), Some(13));
+        assert_eq!(buf.len(), 8, "4 hdr + MainJobIndex + SupportJobIndex + pad");
+        let id_and_size = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(id_and_size & 0x1FF, 0x100, "opcode MYROOM_JOB");
+        assert_eq!(id_and_size >> 9, 2, "size_words");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0xBEEF, "sync");
+        assert_eq!(buf[4], 5, "MainJobIndex");
+        assert_eq!(buf[5], 13, "SupportJobIndex");
+        assert_eq!(&buf[6..8], &[0, 0], "padding00");
+
+        let keep = build_subpacket_myroom_job(0, None, None);
+        assert_eq!(&keep[4..6], &[0, 0], "None → 0 = keep current job");
+    }
+
+    #[test]
+    fn door_menu_picks_encode_zmrq_maprect_pairs() {
+        use crate::local_menu::{Advance, LocalMenuSession, HOME_ROW, MOG_GARDEN_ROW};
+        use crate::state::MyRoomInfo;
+
+        let room = MyRoomInfo {
+            model: 257,
+            sub_map: 0,
+            exit_bit: 1,
+        };
+        for (row, want_bit, want_mode) in [(HOME_ROW, 1u8, 0u8), (MOG_GARDEN_ROW, 0, 127)] {
+            let mut menu = LocalMenuSession::new();
+            let frame = menu.open_mh_exit(&room, None);
+            let idx = frame.choices.iter().position(|c| c == row).expect(row);
+            let Advance::Exit(kind) = menu.advance(Some(idx as u32)) else {
+                panic!("{row} must be a terminal exit");
+            };
+            let (bit, mode) = kind.wire_pair();
+            let buf = build_subpacket_maprect_mh_exit(7, bit, mode, 1.0, 2.0, 3.0, 0x42);
+            assert_eq!(&buf[4..8], b"zmrq", "RectID fourcc");
+            assert_eq!(buf[22], want_bit, "MyRoomExitBit for {row}");
+            assert_eq!(buf[23], want_mode, "MyRoomExitMode for {row}");
+        }
+        assert_eq!(u32::from_le_bytes(*b"zmrq"), ZMRQ_LE);
     }
 
     #[test]
@@ -3726,6 +4140,23 @@ mod tests {
 
     fn v(x: f32, y: f32, z: f32) -> Vec3 {
         Vec3 { x, y, z }
+    }
+
+    #[test]
+    fn walkaway_release_only_user_driven_past_threshold() {
+        assert!(!should_release_on_walkaway(
+            false,
+            Some(EVENT_WALKAWAY_YALMS + 1.0)
+        ));
+        assert!(!should_release_on_walkaway(true, None));
+        assert!(!should_release_on_walkaway(
+            true,
+            Some(EVENT_WALKAWAY_YALMS - 0.1)
+        ));
+        assert!(should_release_on_walkaway(
+            true,
+            Some(EVENT_WALKAWAY_YALMS + 0.1)
+        ));
     }
 
     #[test]

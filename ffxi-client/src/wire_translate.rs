@@ -66,6 +66,11 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
                 golden: a.golden,
             }),
         }),
+
+        myroom: s.myroom.map(|m| wire::MyRoom {
+            model: m.model,
+            sub_map: m.sub_map,
+        }),
     }
 }
 
@@ -163,7 +168,9 @@ pub fn dialog_to_wire(d: &DialogState) -> wire::DialogState {
 
 pub fn event_to_viewer_event(ev: AgentEvent) -> Option<wire::ViewerEvent> {
     match ev {
-        AgentEvent::ZoneChanged { from, to } => Some(wire::ViewerEvent::ZoneChanged { from, to }),
+        AgentEvent::ZoneChanged { from, to, .. } => {
+            Some(wire::ViewerEvent::ZoneChanged { from, to })
+        }
         AgentEvent::EntityRemoved { id } => Some(wire::ViewerEvent::EntityRemoved { id }),
         AgentEvent::Disconnected { reason } => Some(wire::ViewerEvent::Disconnected { reason }),
         AgentEvent::LowHp { pct } => Some(wire::ViewerEvent::LowHp { pct }),
@@ -572,6 +579,27 @@ mod tests {
             "monotonic violation: {} then {}",
             snap.producer_monotonic_ms,
             snap2.producer_monotonic_ms,
+        );
+    }
+
+    #[test]
+    fn myroom_crosses_the_wire_boundary() {
+        let mut s = SessionState::default();
+        assert!(state_to_snapshot(&s).myroom.is_none());
+
+        s.myroom = Some(crate::state::MyRoomInfo {
+            model: 615,
+            sub_map: 2,
+            exit_bit: 1,
+        });
+        let snap = state_to_snapshot(&s);
+        // exit_bit stays session-side: the exit menu is DialogState-driven.
+        assert_eq!(
+            snap.myroom,
+            Some(wire::MyRoom {
+                model: 615,
+                sub_map: 2
+            })
         );
     }
 

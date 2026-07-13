@@ -1711,7 +1711,7 @@ pub fn poll_load_actor_tasks(
         };
 
         if let Ok(FfxiRenderRoot(old_root)) = q_existing.get(wire_entity) {
-            commands.entity(*old_root).despawn();
+            commands.entity(*old_root).try_despawn();
         }
 
         let root = spawn_live_actor(
@@ -1824,7 +1824,7 @@ pub fn tick_morph_in(
                 tf.scale = Vec3::ONE;
             }
             if let Some(orb) = morph.orb {
-                commands.entity(orb).despawn();
+                commands.entity(orb).try_despawn();
             }
             commands
                 .entity(wire_entity)

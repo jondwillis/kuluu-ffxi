@@ -121,33 +121,18 @@ mod tests {
     }
 
     #[test]
-    fn moghouse_table_pins_all_verified_pairs() {
-        // research/xim/src/jsMain/kotlin/xim/poc/tools/ZoneChanger.kt:18-36 ×
-        // vendor/server/src/map/packets/s2c/0x00a_login.cpp:35-72.
-        for (model, file) in [
-            (256u16, 356u32),
-            (257, 357),
-            (258, 358),
-            (288, 388),
-            (289, 389),
-            (290, 390),
-            (291, 391),
-            (292, 392),
-            (214, 314),
-            (199, 299),
-            (219, 319),
-            (745, 83936),
-            (615, 83806),
-            (616, 83807),
-            (617, 83808),
-            (618, 83809),
-        ] {
-            assert_eq!(
-                moghouse_model_to_mzb_file_id(model),
-                Some(file),
-                "model {model}"
-            );
-        }
+    fn moghouse_table_spot_pins_and_count() {
+        // One pin per source branch of research/xim ZoneChanger.kt:18-36 ×
+        // vendor/server 0x00a_login.cpp:35-72 (classic low, WoTG high, 2F range),
+        // plus the count — the exhaustive pair list lives only in the table.
+        assert_eq!(MOGHOUSE_MODEL_DAT_TABLE.len(), 16);
+        assert_eq!(moghouse_model_to_mzb_file_id(256), Some(356), "Jeuno");
+        assert_eq!(
+            moghouse_model_to_mzb_file_id(745),
+            Some(83936),
+            "San d'Oria [S]"
+        );
+        assert_eq!(moghouse_model_to_mzb_file_id(615), Some(83806), "2F");
     }
 
     #[test]
@@ -189,5 +174,19 @@ mod tests {
         assert_eq!(effective_zone_dat_file_id(Some(230), None), Some(330));
         assert_eq!(effective_zone_dat_file_id(None, Some(617)), Some(83808));
         assert_eq!(effective_zone_dat_file_id(None, None), None);
+    }
+
+    #[test]
+    fn unmapped_myroom_model_falls_back_to_zone_dat() {
+        // LSB sends LoginState MYROOM + model 0x02D9 (729) for ZONE_FERETORY 285
+        // (vendor/server/src/map/packets/s2c/0x00a_login.cpp:234-239); the model
+        // is deliberately unmapped, so the zone fallback is what keeps a MYROOM
+        // login renderable.
+        let feretory = effective_zone_dat_file_id(Some(285), Some(729));
+        assert_eq!(feretory, zone_id_to_mzb_file_id(285));
+        assert!(
+            feretory.is_some(),
+            "Feretory must fall back to the zone DAT"
+        );
     }
 }

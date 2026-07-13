@@ -7,6 +7,12 @@ use crate::source::SceneSource;
 
 pub const CHAT_HISTORY_CAP: usize = 256;
 
+/// Single render key for zone-keyed DAT resources: inside the Mog House LSB
+/// keeps `zone_id` as the surrounding city, so `zone_id` edges miss the swap.
+pub fn effective_zone_file_id(snap: &SceneSnapshot) -> Option<u32> {
+    ffxi_dat::zone_dat::effective_zone_dat_file_id(snap.zone_id, snap.myroom.map(|m| m.model))
+}
+
 #[derive(Resource, Default)]
 pub struct SceneState {
     pub snapshot: SceneSnapshot,
@@ -180,6 +186,9 @@ pub fn apply_delta(snap: &mut SceneSnapshot, delta: &SceneDelta) {
 
     if let Some(d) = &delta.diagnostics {
         snap.diagnostics = d.clone();
+    }
+    if let Some(m) = delta.myroom {
+        snap.myroom = Some(m);
     }
 }
 
@@ -358,6 +367,66 @@ mod tests {
         assert_eq!(snap.party[0].name.as_deref(), Some("Vanari"));
         assert!(snap.party[0].is_party_leader);
         assert_eq!(snap.party[0].hp, 1500, "HP overwritten");
+    }
+
+    #[test]
+    fn delta_sets_myroom_and_none_is_no_change() {
+        use ffxi_viewer_wire::MyRoom;
+        let mut snap = SceneSnapshot::default();
+        apply_delta(
+            &mut snap,
+            &SceneDelta {
+                myroom: Some(MyRoom {
+                    model: 256,
+                    sub_map: 0,
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            snap.myroom,
+            Some(MyRoom {
+                model: 256,
+                sub_map: 0
+            })
+        );
+
+        apply_delta(&mut snap, &SceneDelta::default());
+        assert_eq!(
+            snap.myroom,
+            Some(MyRoom {
+                model: 256,
+                sub_map: 0
+            }),
+            "None delta must not clear myroom"
+        );
+    }
+
+    #[test]
+    fn effective_zone_file_id_prefers_myroom_over_zone() {
+        use ffxi_viewer_wire::MyRoom;
+        let mut snap = SceneSnapshot {
+            zone_id: Some(230),
+            ..Default::default()
+        };
+        assert_eq!(effective_zone_file_id(&snap), Some(330));
+
+        snap.myroom = Some(MyRoom {
+            model: 257,
+            sub_map: 0,
+        });
+        assert_eq!(
+            effective_zone_file_id(&snap),
+            Some(357),
+            "myroom model must resolve via the MH table, not zone_id_to_mzb_file_id"
+        );
+
+        snap.myroom = None;
+        assert_eq!(
+            effective_zone_file_id(&snap),
+            Some(330),
+            "exit restores the town key"
+        );
     }
 
     #[test]

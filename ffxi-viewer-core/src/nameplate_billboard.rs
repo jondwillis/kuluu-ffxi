@@ -182,7 +182,7 @@ pub fn update_nameplate_billboards_system(
 
     for (ui_entity, mut np, mut aspect, mut transform, mut vis, mat) in &mut billboards {
         let Some(&(entity_pos, head_y_offset)) = pos_by_id.get(&np.entity_id) else {
-            commands.entity(ui_entity).despawn();
+            commands.entity(ui_entity).try_despawn();
             continue;
         };
 

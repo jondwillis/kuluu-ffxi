@@ -98,9 +98,9 @@ fn load_moon_sprite_sheet(
     mut frames_res: ResMut<MoonSpriteFrames>,
     mut color_tables: ResMut<CelestialColorTables>,
     mut sun_sprite: ResMut<SunSprite>,
-    mut loaded_zone: Local<Option<Option<u16>>>,
+    mut loaded_zone: Local<Option<Option<u32>>>,
 ) {
-    let current = scene_state.snapshot.zone_id;
+    let current = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
     if *loaded_zone == Some(current) {
         return;
     }
@@ -113,7 +113,6 @@ fn load_moon_sprite_sheet(
     *loaded_zone = Some(current);
 
     let dat_bytes = current
-        .and_then(ffxi_dat::zone_dat::zone_id_to_mzb_file_id)
         .and_then(|file_id| dat_root.resolve(file_id).ok())
         .and_then(|loc| std::fs::read(loc.path_under(dat_root.root())).ok());
 
