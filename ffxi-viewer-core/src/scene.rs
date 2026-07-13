@@ -193,6 +193,12 @@ pub fn setup_world(
     });
 }
 
+#[derive(Default)]
+pub struct SyncEntitiesDiag {
+    prev_zone: Option<Option<u16>>,
+    last_logged_total: Option<usize>,
+}
+
 pub fn sync_entities_system(
     state: Res<SceneState>,
     mesh: Res<EntityMesh>,
@@ -209,7 +215,7 @@ pub fn sync_entities_system(
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     mut q_mat: Query<&mut MeshMaterial3d<StandardMaterial>, (With<WorldEntity>, Without<MorphIn>)>,
     q_nameplates: Query<&Nameplate>,
-    mut prev_zone: Local<Option<Option<u16>>>,
+    mut sync_diag: Local<SyncEntitiesDiag>,
 ) {
     if !state.dirty {
         return;
@@ -217,10 +223,17 @@ pub fn sync_entities_system(
 
     let snap = &state.snapshot;
 
-    let zone_changed = matches!(*prev_zone, Some(p) if p != snap.zone_id);
-    *prev_zone = Some(snap.zone_id);
-
+    let zone_changed = matches!(sync_diag.prev_zone, Some(p) if p != snap.zone_id);
     if zone_changed {
+        sync_diag.last_logged_total = None;
+    }
+    sync_diag.prev_zone = Some(snap.zone_id);
+
+    // Logged on every entity-count change (not just the zone-entry instant)
+    // so the initial zone-in flood settling in over several updates is
+    // actually captured, not just the near-empty first frame.
+    if sync_diag.last_logged_total != Some(snap.entities.len()) {
+        sync_diag.last_logged_total = Some(snap.entities.len());
         let mut pc = 0u32;
         let mut npc = 0u32;
         let mut mob = 0u32;
@@ -243,7 +256,7 @@ pub fn sync_entities_system(
             mob,
             pet,
             other,
-            "sync_entities_system: entity-kind breakdown on zone entry"
+            "sync_entities_system: entity-kind breakdown changed"
         );
     }
 
