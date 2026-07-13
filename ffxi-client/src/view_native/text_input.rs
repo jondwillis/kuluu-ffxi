@@ -341,6 +341,14 @@ fn handle_world_key(
                     let r = ffxi_viewer_core::hud::action_model::NPC_INTERACT_YALMS;
                     dx * dx + dy * dy + dz * dz <= r * r
                 });
+                tracing::info!(
+                    target_id = id,
+                    entity_found = ent.is_some(),
+                    entity_kind = ?ent.map(|e| e.kind),
+                    is_npc,
+                    in_range,
+                    "confirm-action dispatch"
+                );
                 if is_npc {
                     if let (true, Some(ent)) = (in_range, ent) {
                         let _ = cmd_tx.try_send(AgentCommand::Action {

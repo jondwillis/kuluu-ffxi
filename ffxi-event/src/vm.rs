@@ -59,6 +59,8 @@ const OP_REQSET: u8 = 0x27;
 const OP_REQSET_CHECKED: u8 = 0x28;
 const OP_REQSET_PRIORITY: u8 = 0x29;
 const OP_REQWAIT: u8 = 0x2A;
+const OP_LOADEXTSCHEDULER: u8 = 0x5B;
+const OP_LOADEXTSCHEDULER2: u8 = 0x66;
 const OP_SETBITWORK: u8 = 0x40;
 const OP_GETBITWORK: u8 = 0x41;
 const OP_SENDTAG: u8 = 0x43;
@@ -264,6 +266,13 @@ impl EventVm {
                 OP_REQSET | OP_REQSET_CHECKED | OP_REQSET_PRIORITY | OP_REQWAIT => {
                     self.exec_pointer += OPCODE_META[op as usize].size as usize;
                 }
+                // XiEvent LOADEXTSCHEDULER (research/XiEvents/OpCodes/0x005B.md,
+                // 0x0066.md): plays a motion between two actors, but always
+                // takes the "actor not found" early exit since this dialog-only
+                // VM models no actors.
+                OP_LOADEXTSCHEDULER | OP_LOADEXTSCHEDULER2 => {
+                    self.exec_pointer += OPCODE_META[op as usize].size as usize;
+                }
                 _ => {
                     let meta = OPCODE_META.get(op as usize).copied();
                     match meta {
@@ -435,6 +444,27 @@ mod tests {
         ] {
             assert_eq!(
                 OPCODE_META[op as usize].size as usize, size,
+                "op 0x{op:02X} size drifted from research/XiEvents/OpCodes"
+            );
+            let mut data = vec![op];
+            data.extend(std::iter::repeat_n(0u8, size - 1));
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            assert_eq!(
+                e.step(),
+                StepResult::Done,
+                "op 0x{op:02X} should run to END"
+            );
+            assert_eq!(e.exec_pointer(), size, "op 0x{op:02X} advanced wrong size");
+        }
+    }
+
+    #[test]
+    fn loadextscheduler_family_skips_by_size_and_continues() {
+        for op in [OP_LOADEXTSCHEDULER, OP_LOADEXTSCHEDULER2] {
+            let size = OPCODE_META[op as usize].size as usize;
+            assert_eq!(
+                size, 17,
                 "op 0x{op:02X} size drifted from research/XiEvents/OpCodes"
             );
             let mut data = vec![op];
