@@ -439,7 +439,7 @@ pub fn manage_weather_particles_system(
     }
 
     for (e, _) in q_root.iter() {
-        commands.entity(e).despawn();
+        commands.entity(e).try_despawn();
     }
 
     let Some(profile) = active.modifier.particle else {

@@ -100,7 +100,7 @@ pub fn sync_zone_lines_system(
     }
 
     for e in &existing {
-        commands.entity(e).despawn();
+        commands.entity(e).try_despawn();
     }
     zl_state.current_zone = Some(zone_id);
     zl_state.current_mode = Some(mode);

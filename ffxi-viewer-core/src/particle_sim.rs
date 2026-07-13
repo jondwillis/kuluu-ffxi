@@ -203,7 +203,7 @@ pub fn sync_particle_meshes(
 
     for &i in dead.iter().rev() {
         let g = sim.generators.swap_remove(i);
-        commands.entity(g.entity).despawn();
+        commands.entity(g.entity).try_despawn();
     }
 }
 

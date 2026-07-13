@@ -1461,7 +1461,7 @@ pub fn auto_load_zone_geometry_system(
 
     for e in auto_q.iter() {
         if let Ok(mut ec) = commands.get_entity(e) {
-            ec.despawn();
+            ec.try_despawn();
         }
     }
 

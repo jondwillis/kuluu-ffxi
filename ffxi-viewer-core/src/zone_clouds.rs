@@ -386,7 +386,7 @@ fn rebuild_zone_clouds(
                 elapsed: 0.0,
             });
         } else {
-            commands.entity(e).despawn();
+            commands.entity(e).try_despawn();
         }
     }
     state.key = key;
@@ -491,7 +491,7 @@ fn drive_zone_clouds(
         fade.elapsed += dt;
         if fade.finished_out() {
             state.entities.retain(|&e| e != entity);
-            commands.entity(entity).despawn();
+            commands.entity(entity).try_despawn();
             continue;
         }
 
@@ -548,7 +548,7 @@ fn rebuild_zone_stars(
         return;
     }
     if let Some(e) = state.entity.take() {
-        commands.entity(e).despawn();
+        commands.entity(e).try_despawn();
     }
     state.zone = zone_id;
 

@@ -280,7 +280,7 @@ fn sync_faithful_zone_light_entities(
         return;
     }
     for e in &existing {
-        commands.entity(e).despawn();
+        commands.entity(e).try_despawn();
     }
     for l in &store.lights {
         if l.is_character {
