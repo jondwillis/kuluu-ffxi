@@ -236,8 +236,10 @@ fn synth_bound_key(
 /// - West: `ToggleEngage` — combat engage/disengage gets its own button now
 ///   that South is the general-purpose interact button.
 /// - North: `OpenMenu`.
-/// - D-pad right: `CycleTarget` — without this there was no gamepad-only way
-///   to select an NPC or player to interact with at all.
+/// - D-pad: `CycleTarget` (right, `World` mode) for selecting an NPC/player to
+///   interact with; `NavUp`/`NavDown`/`NavLeft`/`NavRight` otherwise, for
+///   moving the selection within an open menu (e.g. into the Magic/Abilities/
+///   Items submenus).
 /// - Right trigger: `OpenChat`.
 ///
 /// Only the first connected `Gamepad` entity is read — see the doc comment
@@ -287,8 +289,24 @@ pub(super) fn gamepad_ingame_action_system(
         pulse_bound_key(&mut keys, &bindings, Action::OpenMenu);
     }
 
-    if in_world && gamepad.just_pressed(GamepadButton::DPadRight) {
-        pulse_bound_key(&mut keys, &bindings, Action::CycleTarget);
+    if gamepad.just_pressed(GamepadButton::DPadRight) {
+        if in_world {
+            pulse_bound_key(&mut keys, &bindings, Action::CycleTarget);
+        } else {
+            synth_bound_key(&mut keyboard_writer, window, &bindings, Action::NavRight);
+        }
+    }
+
+    if !in_world {
+        if gamepad.just_pressed(GamepadButton::DPadUp) {
+            synth_bound_key(&mut keyboard_writer, window, &bindings, Action::NavUp);
+        }
+        if gamepad.just_pressed(GamepadButton::DPadDown) {
+            synth_bound_key(&mut keyboard_writer, window, &bindings, Action::NavDown);
+        }
+        if gamepad.just_pressed(GamepadButton::DPadLeft) {
+            synth_bound_key(&mut keyboard_writer, window, &bindings, Action::NavLeft);
+        }
     }
 
     if in_world && gamepad.just_pressed(GamepadButton::RightTrigger2) {

@@ -430,20 +430,19 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         gamepad_input::gamepad_launcher_nav_system.run_if(in_state(AppPhase::Launcher)),
     );
 
-    // PreUpdate so the held/released KeyCodes it synthesizes are already in
-    // place before this frame's FixedUpdate (dispatch_movement_system) and
-    // Update (handle_input_system) steps read `ButtonInput<KeyCode>`.
+    // bevy::input::keyboard::keyboard_input_system::clear() must run first.
     app.add_systems(
         PreUpdate,
-        gamepad_input::gamepad_movement_camera_system.run_if(in_state(AppPhase::InGame)),
+        gamepad_input::gamepad_movement_camera_system
+            .after(bevy::input::InputSystems)
+            .run_if(in_state(AppPhase::InGame)),
     );
 
-    // PreUpdate for the same reason: the pulsed ButtonInput press/release and
-    // the synthesized KeyboardInput both need to be visible before this
-    // frame's Update-schedule handle_input_system/text_input_system chain.
     app.add_systems(
         PreUpdate,
-        gamepad_input::gamepad_ingame_action_system.run_if(in_state(AppPhase::InGame)),
+        gamepad_input::gamepad_ingame_action_system
+            .after(bevy::input::InputSystems)
+            .run_if(in_state(AppPhase::InGame)),
     );
 
     app.add_systems(

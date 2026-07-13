@@ -199,7 +199,7 @@ pub fn handle_input_system(
                 .map(|e| e.id)
                 .collect();
 
-            if let Some(next) = tab_cycle_next(
+            let next = tab_cycle_next(
                 &mut tab_stack,
                 &state.snapshot.entities,
                 state.snapshot.self_pos.pos,
@@ -208,9 +208,23 @@ pub fn handle_input_system(
                 &party_ids,
                 &owned_pet_ids,
                 |world_pos| camera.world_to_ndc(&cam_global, world_pos),
-            ) {
+            );
+            tracing::info!(
+                tab,
+                enter_acquire,
+                entity_count = state.snapshot.entities.len(),
+                acquired = ?next,
+                "cycle-target dispatch"
+            );
+            if let Some(next) = next {
                 target.id = Some(next);
             }
+        } else {
+            tracing::info!(
+                tab,
+                enter_acquire,
+                "cycle-target dispatch: no camera entity"
+            );
         }
     }
 
@@ -262,20 +276,31 @@ pub fn handle_input_system(
                 local_seq: 0,
             });
         } else {
-            match target.id {
-                Some(id) => {
-                    let name = state
-                        .snapshot
-                        .entities
-                        .iter()
-                        .find(|e| e.id == id)
-                        .and_then(|e| e.name.clone())
-                        .unwrap_or_else(|| format!("#{id:08X}"));
+            match target.id.and_then(|id| {
+                state
+                    .snapshot
+                    .entities
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| (id, e))
+            }) {
+                Some((id, entity)) if matches!(entity.kind, EntityKind::Mob) => {
+                    let name = entity.name.clone().unwrap_or_else(|| format!("#{id:08X}"));
                     let _ = cmd_tx.0.try_send(AgentCommand::Engage { target_id: id });
                     state.push_local_toast(ffxi_viewer_wire::ChatLine {
                         channel: ffxi_viewer_wire::ChatChannel::Debug,
                         sender: "client".into(),
                         text: format!("engaging {name}"),
+                        server_ts: 0,
+                        local_seq: 0,
+                    });
+                }
+                Some((_, entity)) => {
+                    let name = entity.name.clone().unwrap_or_else(|| "target".into());
+                    state.push_local_toast(ffxi_viewer_wire::ChatLine {
+                        channel: ffxi_viewer_wire::ChatChannel::Debug,
+                        sender: "client".into(),
+                        text: format!("cannot engage: {name} is not attackable"),
                         server_ts: 0,
                         local_seq: 0,
                     });
