@@ -438,6 +438,14 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         gamepad_input::gamepad_movement_camera_system.run_if(in_state(AppPhase::InGame)),
     );
 
+    // PreUpdate for the same reason: the pulsed ButtonInput press/release and
+    // the synthesized KeyboardInput both need to be visible before this
+    // frame's Update-schedule handle_input_system/text_input_system chain.
+    app.add_systems(
+        PreUpdate,
+        gamepad_input::gamepad_ingame_action_system.run_if(in_state(AppPhase::InGame)),
+    );
+
     app.add_systems(
         Update,
         (
