@@ -8,8 +8,7 @@ use bevy::input_focus::{InputFocus, InputFocusVisible};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
-use ffxi_viewer_core::hud::death_prompt::is_dead;
-use ffxi_viewer_core::{Action, Bindings, InputMode, SceneState, Target};
+use ffxi_viewer_core::{Action, Bindings, InputMode};
 
 const STICK_DEADZONE: f32 = 0.35;
 
@@ -198,17 +197,48 @@ fn synth_nav_key(writer: &mut MessageWriter<KeyboardInput>, window: Entity, key_
     });
 }
 
-/// South is a single context-sensitive action button. While the death prompt
-/// is up it mirrors `ConfirmAction` (the /return-home dispatch text_input.rs
-/// intercepts before generic World-mode handling); otherwise, whenever
-/// `InputMode` isn't `World` (a menu, dialog, or other overlay is open) it
-/// mirrors `NavConfirm`, exactly like `gamepad_launcher_nav_system` does for
-/// the launcher. In plain `World` mode it mirrors `ToggleEngage` if a target
-/// is selected, otherwise `OpenMenu` — matching `handle_input_system`'s own
-/// `InputMode::World` gating, so the two can never both fire off one press
-/// the way a raw keyboard-emulated `F` from Steam Input's Desktop profile
-/// could. East mirrors `NavCancel` so a menu opened this way can also be
-/// closed with the gamepad.
+/// Pulses (press then release within the same frame) whatever `KeyCode` is
+/// bound to `action`, so a `ButtonInput::just_pressed` reader (`bound_key`'s
+/// other caller, `gamepad_movement_camera_system`, holds instead) sees a
+/// one-frame press exactly like a physical key tap.
+fn pulse_bound_key(keys: &mut ButtonInput<KeyCode>, bindings: &Bindings, action: Action) {
+    if let Some(key) = bound_key(bindings, action) {
+        keys.press(key);
+        keys.release(key);
+    }
+}
+
+/// Synthesizes a `KeyboardInput` press for whatever `KeyCode` is bound to
+/// `action`, for actions `text_input.rs` reads as raw key events rather than
+/// `ButtonInput` state (`ConfirmAction`, `OpenChat`, `NavConfirm`,
+/// `NavCancel` — all restricted to `logical_key_for`'s fixed key set).
+fn synth_bound_key(
+    writer: &mut MessageWriter<KeyboardInput>,
+    window: Entity,
+    bindings: &Bindings,
+    action: Action,
+) {
+    if let Some(key) = bound_key(bindings, action) {
+        synth_nav_key(writer, window, key);
+    }
+}
+
+/// Face buttons + D-pad-right; combat/targeting ones are gated to
+/// `InputMode::World`, mirroring `handle_input_system`'s own gate.
+///
+/// - South: `ConfirmAction` in `World` mode — FFXI's actual "talk to this NPC
+///   / open the trade-check-invite menu for this target" dispatch (also the
+///   /return-home dispatch while the death prompt is up, both handled by
+///   `text_input.rs`'s own `InputMode::World` branch), not `ToggleEngage`.
+///   Outside `World` mode (a menu/dialog is open), `NavConfirm`.
+/// - East: `ClearTarget` in `World` mode, `NavCancel` otherwise — so a menu
+///   opened via South can also be closed with the gamepad.
+/// - West: `ToggleEngage` — combat engage/disengage gets its own button now
+///   that South is the general-purpose interact button.
+/// - North: `OpenMenu`.
+/// - D-pad right: `CycleTarget` — without this there was no gamepad-only way
+///   to select an NPC or player to interact with at all.
+/// - Right trigger: `OpenChat`.
 ///
 /// Only the first connected `Gamepad` entity is read — see the doc comment
 /// on `gamepad_launcher_nav_system` for why.
@@ -216,8 +246,6 @@ pub(super) fn gamepad_ingame_action_system(
     gamepads: Query<&Gamepad>,
     bindings: Res<Bindings>,
     mode: Res<InputMode>,
-    target: Res<Target>,
-    scene_state: Res<SceneState>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut keyboard_writer: MessageWriter<KeyboardInput>,
     windows: Query<Entity, With<PrimaryWindow>>,
@@ -228,30 +256,42 @@ pub(super) fn gamepad_ingame_action_system(
     let Some(gamepad) = gamepads.iter().next() else {
         return;
     };
+    let in_world = matches!(*mode, InputMode::World);
 
     if gamepad.just_pressed(GamepadButton::South) {
-        if matches!(*mode, InputMode::World) && is_dead(&scene_state) {
-            if let Some(key) = bound_key(&bindings, Action::ConfirmAction) {
-                synth_nav_key(&mut keyboard_writer, window, key);
-            }
-        } else if matches!(*mode, InputMode::World) {
-            let action = if target.id.is_some() {
-                Action::ToggleEngage
-            } else {
-                Action::OpenMenu
-            };
-            if let Some(key) = bound_key(&bindings, action) {
-                keys.press(key);
-                keys.release(key);
-            }
-        } else if let Some(key) = bound_key(&bindings, Action::NavConfirm) {
-            synth_nav_key(&mut keyboard_writer, window, key);
+        if in_world {
+            synth_bound_key(
+                &mut keyboard_writer,
+                window,
+                &bindings,
+                Action::ConfirmAction,
+            );
+        } else {
+            synth_bound_key(&mut keyboard_writer, window, &bindings, Action::NavConfirm);
         }
     }
 
-    if gamepad.just_pressed(GamepadButton::East) && !matches!(*mode, InputMode::World) {
-        if let Some(key) = bound_key(&bindings, Action::NavCancel) {
-            synth_nav_key(&mut keyboard_writer, window, key);
+    if gamepad.just_pressed(GamepadButton::East) {
+        if in_world {
+            pulse_bound_key(&mut keys, &bindings, Action::ClearTarget);
+        } else {
+            synth_bound_key(&mut keyboard_writer, window, &bindings, Action::NavCancel);
         }
+    }
+
+    if in_world && gamepad.just_pressed(GamepadButton::West) {
+        pulse_bound_key(&mut keys, &bindings, Action::ToggleEngage);
+    }
+
+    if in_world && gamepad.just_pressed(GamepadButton::North) {
+        pulse_bound_key(&mut keys, &bindings, Action::OpenMenu);
+    }
+
+    if in_world && gamepad.just_pressed(GamepadButton::DPadRight) {
+        pulse_bound_key(&mut keys, &bindings, Action::CycleTarget);
+    }
+
+    if in_world && gamepad.just_pressed(GamepadButton::RightTrigger2) {
+        synth_bound_key(&mut keyboard_writer, window, &bindings, Action::OpenChat);
     }
 }
