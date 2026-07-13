@@ -139,7 +139,10 @@ pub fn update_nameplates_system(
                 }
             }
             None => {
-                commands.entity(ui_entity).despawn();
+                // try_despawn: this entity's correlated world entity may
+                // have already been removed by a bulk zone-transition
+                // despawn this same frame — an expected race, not a bug.
+                commands.entity(ui_entity).try_despawn();
             }
         }
     }

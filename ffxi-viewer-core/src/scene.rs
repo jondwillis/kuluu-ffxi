@@ -348,7 +348,11 @@ pub fn sync_entities_system(
         .collect();
     for id in stale {
         if let Some(bevy_e) = tracked.by_id.remove(&id) {
-            commands.entity(bevy_e).despawn();
+            // try_despawn, not despawn: a bulk zone-transition despawn
+            // (despawn_ingame_entities, OnExit(AppPhase::InGame)) can beat
+            // this per-entity cleanup to the same entity in the same frame —
+            // an expected race, not a bug, so this shouldn't warn.
+            commands.entity(bevy_e).try_despawn();
         }
 
         prediction.by_id.remove(&id);
