@@ -73,3 +73,6 @@ profile.json.gz
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# skill-creator eval scratch (transient benchmark runs)
+.claude/skills/*-workspace/
