@@ -180,11 +180,7 @@ impl Default for SortOptions {
 /// Which pane of the Items window has keyboard focus. The item list owns focus
 /// by default; pressing NavRight moves it into the sort-options box so Auto /
 /// Manual become navigable, and NavLeft / NavCancel returns to the list.
-#[derive(Resource, Debug, Clone, Copy, Default)]
-pub struct ItemMenuFocus {
-    pub sort_focused: bool,
-    pub sort_cursor: usize,
-}
+pub type ItemMenuFocus = super::nav_geometry::PaneFocus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOptionId {

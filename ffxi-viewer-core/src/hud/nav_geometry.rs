@@ -2,6 +2,17 @@
 //! menu, so the list/grid/pane math backing each menu's "layout kind" is
 //! implemented once rather than re-derived per menu.
 
+use bevy::prelude::Resource;
+
+/// Focus state for a dual-pane menu: a primary list plus a small secondary
+/// box (e.g. the Items window's sort-options box) that can steal keyboard
+/// focus. The primary pane owns focus by default.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct PaneFocus {
+    pub secondary_focused: bool,
+    pub secondary_cursor: usize,
+}
+
 /// First visible row index for a `visible_rows`-tall scrolling window over a
 /// `total`-row list, centered on `cursor` and clamped so the window never
 /// runs past either end.

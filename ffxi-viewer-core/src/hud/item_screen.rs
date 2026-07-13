@@ -292,8 +292,8 @@ pub(crate) fn update_item_screen(
     }
     if !open {
         // Leaving the window drops sort focus so it reopens on the list.
-        if focus.sort_focused {
-            focus.sort_focused = false;
+        if focus.secondary_focused {
+            focus.secondary_focused = false;
         }
         return;
     }
@@ -433,7 +433,7 @@ fn role_value(
                     SortOptionId::Auto => sort.auto,
                     SortOptionId::Manual => !sort.auto,
                 };
-                let cursor = focus.sort_focused && focus.sort_cursor == i;
+                let cursor = focus.secondary_focused && focus.secondary_cursor == i;
                 let name = match id {
                     SortOptionId::Auto => "Auto",
                     SortOptionId::Manual => "Manual",
@@ -479,8 +479,8 @@ pub(crate) fn item_row_mouse_hover_system(
         if list_idx < total {
             // Hovering the list returns focus here, mirroring the sort box
             // grabbing it on hover — so neither pane traps the keyboard.
-            if focus.sort_focused {
-                focus.sort_focused = false;
+            if focus.secondary_focused {
+                focus.secondary_focused = false;
             }
             if level.cursor != list_idx {
                 level.cursor = list_idx;
@@ -533,12 +533,12 @@ pub(crate) fn sort_option_mouse_system(
         };
         match interaction {
             Interaction::Hovered => {
-                focus.sort_focused = true;
-                focus.sort_cursor = i;
+                focus.secondary_focused = true;
+                focus.secondary_cursor = i;
             }
             Interaction::Pressed => {
-                focus.sort_focused = true;
-                focus.sort_cursor = i;
+                focus.secondary_focused = true;
+                focus.secondary_cursor = i;
                 if let Some(&id) = SORT_OPTIONS.get(i) {
                     item_detail::apply_sort_option(&mut sort, id);
                 }

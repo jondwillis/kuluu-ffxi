@@ -2497,23 +2497,23 @@ fn handle_menu_key(
     // list navigation below.
     if matches!(kind, MenuKind::Items) {
         use ffxi_viewer_core::hud::item_detail::{apply_sort_option, SORT_OPTIONS};
-        if item_menu_focus.sort_focused {
+        if item_menu_focus.secondary_focused {
             let count = SORT_OPTIONS.len();
             if bindings.matches_logical(Action::NavUp, key) {
-                item_menu_focus.sort_cursor = if item_menu_focus.sort_cursor == 0 {
+                item_menu_focus.secondary_cursor = if item_menu_focus.secondary_cursor == 0 {
                     count - 1
                 } else {
-                    item_menu_focus.sort_cursor - 1
+                    item_menu_focus.secondary_cursor - 1
                 };
                 return None;
             }
             if bindings.matches_logical(Action::NavDown, key) {
-                let next = item_menu_focus.sort_cursor + 1;
-                item_menu_focus.sort_cursor = if next >= count { 0 } else { next };
+                let next = item_menu_focus.secondary_cursor + 1;
+                item_menu_focus.secondary_cursor = if next >= count { 0 } else { next };
                 return None;
             }
             if bindings.matches_logical(Action::NavConfirm, key) {
-                if let Some(&id) = SORT_OPTIONS.get(item_menu_focus.sort_cursor) {
+                if let Some(&id) = SORT_OPTIONS.get(item_menu_focus.secondary_cursor) {
                     apply_sort_option(sort_options, id);
                 }
                 if let Err(e) = cmd_tx.try_send(AgentCommand::StackInventory {
@@ -2526,14 +2526,14 @@ fn handle_menu_key(
             if bindings.matches_logical(Action::NavLeft, key)
                 || bindings.matches_logical(Action::NavCancel, key)
             {
-                item_menu_focus.sort_focused = false;
+                item_menu_focus.secondary_focused = false;
                 return None;
             }
             // Swallow any other key so it can't leak into list navigation.
             return None;
         } else if bindings.matches_logical(Action::NavRight, key) {
-            item_menu_focus.sort_focused = true;
-            item_menu_focus.sort_cursor = if sort_options.auto { 0 } else { 1 };
+            item_menu_focus.secondary_focused = true;
+            item_menu_focus.secondary_cursor = if sort_options.auto { 0 } else { 1 };
             return None;
         }
     }
