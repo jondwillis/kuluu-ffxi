@@ -156,29 +156,6 @@ impl PassiveCursorState {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct TargetActionState {
-    pub cursor: usize,
-    pub ctx: crate::hud::action_model::TargetActionContext,
-    pub sub: Option<SubActionStack>,
-
-    pub chat_mode_idx: usize,
-
-    pub abilities_group_idx: usize,
-}
-
-impl TargetActionState {
-    pub fn open(ctx: crate::hud::action_model::TargetActionContext) -> Self {
-        Self {
-            cursor: 0,
-            ctx,
-            sub: None,
-            chat_mode_idx: 0,
-            abilities_group_idx: 0,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubAction {
     MagicCategory(crate::hud::overlay::SpellCategory),
@@ -190,35 +167,32 @@ pub enum SubAction {
     ChatCompose,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct SubActionStack {
-    pub frames: Vec<SubAction>,
-    pub cursor: usize,
+/// A level in the target-action menu's `NavStack`: either the base list of
+/// actions for the current target, or a drilled-down `SubAction` (e.g. an
+/// ability group's own list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetLevel {
+    Root,
+    Sub(SubAction),
 }
 
-impl SubActionStack {
-    pub fn with(frame: SubAction) -> Self {
+#[derive(Debug, Clone)]
+pub struct TargetActionState {
+    pub stack: NavStack<TargetLevel>,
+    pub ctx: crate::hud::action_model::TargetActionContext,
+
+    pub chat_mode_idx: usize,
+
+    pub abilities_group_idx: usize,
+}
+
+impl TargetActionState {
+    pub fn open(ctx: crate::hud::action_model::TargetActionContext) -> Self {
         Self {
-            frames: vec![frame],
-            cursor: 0,
-        }
-    }
-
-    pub fn current(&self) -> Option<SubAction> {
-        self.frames.last().copied()
-    }
-
-    pub fn push(&mut self, frame: SubAction) {
-        self.frames.push(frame);
-        self.cursor = 0;
-    }
-
-    pub fn pop(&mut self) -> bool {
-        if self.frames.pop().is_some() {
-            self.cursor = 0;
-            !self.frames.is_empty()
-        } else {
-            false
+            stack: NavStack::single(TargetLevel::Root),
+            ctx,
+            chat_mode_idx: 0,
+            abilities_group_idx: 0,
         }
     }
 }

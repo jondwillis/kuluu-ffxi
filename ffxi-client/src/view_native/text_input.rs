@@ -403,13 +403,15 @@ fn handle_target_action_key(
     select_target: &mut SelectTargetMode,
 ) -> Option<InputMode> {
     use ffxi_viewer_core::hud::action_model::{ActionEntryKind, TargetActionId};
-    use ffxi_viewer_core::input_mode::SubAction;
+    use ffxi_viewer_core::input_mode::{SubAction, TargetLevel};
 
     if trade_state.open {
         return handle_trade_key(key, bindings, trade_state, trade_intent, scene_state);
     }
 
-    if let Some(SubAction::AbilitiesGroup(group)) = state.sub.as_ref().and_then(|s| s.current()) {
+    if let Some(TargetLevel::Sub(SubAction::AbilitiesGroup(group))) =
+        state.stack.current().map(|l| l.kind)
+    {
         return handle_abilities_group_key(
             key,
             bindings,
@@ -427,25 +429,26 @@ fn handle_target_action_key(
     if count == 0 {
         return Some(InputMode::World);
     }
-    if state.cursor >= count {
-        state.cursor = count - 1;
+    let level = state.stack.current_mut()?;
+    if level.cursor >= count {
+        level.cursor = count - 1;
     }
 
     if bindings.matches_logical(Action::NavUp, key) {
-        state.cursor = if state.cursor == 0 {
-            count - 1
-        } else {
-            state.cursor - 1
-        };
+        let level = state.stack.current_mut()?;
+        level.cursor =
+            ffxi_viewer_core::hud::nav_geometry::list_step_wrapping(level.cursor, count, -1);
         return None;
     }
     if bindings.matches_logical(Action::NavDown, key) {
-        let next = state.cursor + 1;
-        state.cursor = if next >= count { 0 } else { next };
+        let level = state.stack.current_mut()?;
+        level.cursor =
+            ffxi_viewer_core::hud::nav_geometry::list_step_wrapping(level.cursor, count, 1);
         return None;
     }
     if bindings.matches_logical(Action::NavRight, key) {
-        if let Some(entry) = entries.get(state.cursor) {
+        let cursor = state.stack.current().map(|l| l.cursor).unwrap_or(0);
+        if let Some(entry) = entries.get(cursor) {
             if let ActionEntryKind::Select { modes, .. } = &entry.kind {
                 if !modes.is_empty() {
                     match entry.id {
@@ -619,7 +622,8 @@ fn confirm_target_action_at_cursor(
 ) -> Option<InputMode> {
     use ffxi_viewer_core::hud::action_model::TargetActionId;
 
-    let Some(entry) = entries.get(state.cursor) else {
+    let cursor = state.stack.current().map(|l| l.cursor).unwrap_or(0);
+    let Some(entry) = entries.get(cursor) else {
         return Some(InputMode::World);
     };
     if !entry.enabled {
@@ -670,9 +674,11 @@ fn confirm_target_action_at_cursor(
         TargetActionId::Magic => Some(open_submenu(MenuKind::Magic)),
         TargetActionId::Abilities => {
             use ffxi_viewer_core::hud::action_model::AbilityGroup;
-            use ffxi_viewer_core::input_mode::{SubAction, SubActionStack};
+            use ffxi_viewer_core::input_mode::{SubAction, TargetLevel};
             let group = AbilityGroup::ALL[state.abilities_group_idx % AbilityGroup::ALL.len()];
-            state.sub = Some(SubActionStack::with(SubAction::AbilitiesGroup(group)));
+            state
+                .stack
+                .push(TargetLevel::Sub(SubAction::AbilitiesGroup(group)));
             None
         }
         TargetActionId::Items => Some(open_submenu(MenuKind::Items)),
@@ -741,30 +747,30 @@ fn handle_abilities_group_key(
     let rows = ffxi_viewer_core::hud::menu::ability_group_rows(&scene_state.snapshot, group);
     let count = rows.len();
 
-    let sub = state.sub.as_mut()?;
-    if count > 0 && sub.cursor >= count {
-        sub.cursor = count - 1;
+    let level = state.stack.current_mut()?;
+    if count > 0 && level.cursor >= count {
+        level.cursor = count - 1;
     }
 
     if bindings.matches_logical(Action::NavUp, key) {
         if count > 0 {
-            sub.cursor = if sub.cursor == 0 {
-                count - 1
-            } else {
-                sub.cursor - 1
-            };
+            let level = state.stack.current_mut()?;
+            level.cursor =
+                ffxi_viewer_core::hud::nav_geometry::list_step_wrapping(level.cursor, count, -1);
         }
         return None;
     }
     if bindings.matches_logical(Action::NavDown, key) {
         if count > 0 {
-            let next = sub.cursor + 1;
-            sub.cursor = if next >= count { 0 } else { next };
+            let level = state.stack.current_mut()?;
+            level.cursor =
+                ffxi_viewer_core::hud::nav_geometry::list_step_wrapping(level.cursor, count, 1);
         }
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        if let Some(row) = rows.get(sub.cursor) {
+        let cursor = state.stack.current().map(|l| l.cursor).unwrap_or(0);
+        if let Some(row) = rows.get(cursor) {
             let self_pos = scene_state.snapshot.self_pos.pos;
             dispatch_dynamic_menu_action(
                 row.action,
@@ -780,9 +786,7 @@ fn handle_abilities_group_key(
         return None;
     }
     if bindings.matches_logical(Action::NavCancel, key) {
-        if !sub.pop() {
-            state.sub = None;
-        }
+        state.stack.pop();
         return None;
     }
     None
@@ -2434,7 +2438,9 @@ pub fn mouse_nav_dispatch_system(
 
     for ev in ta_events.read() {
         if let InputMode::TargetAction(state) = &mut *mode {
-            state.cursor = ev.slot;
+            if let Some(level) = state.stack.current_mut() {
+                level.cursor = ev.slot;
+            }
 
             let entries = ffxi_viewer_core::hud::overlay::RETAIL.resolve_target_actions(&state.ctx);
             if let Some(next) = confirm_target_action_at_cursor(

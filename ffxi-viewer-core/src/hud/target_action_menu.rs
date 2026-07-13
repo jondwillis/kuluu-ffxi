@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use crate::hud::action_model::{ActionEntry, ActionEntryKind, TargetActionId};
 use crate::hud::overlay::ActiveOverlay;
 use crate::hud::palette;
-use crate::input_mode::{InputMode, SubAction};
+use crate::input_mode::{InputMode, SubAction, TargetLevel};
 
 const MAX_ROWS: usize = 7;
 
@@ -140,7 +140,10 @@ pub fn update_target_action_menu(
 
     panel.display = Display::Flex;
 
-    let sub_active = state.sub.as_ref().and_then(|s| s.current());
+    let sub_active = match state.stack.current().map(|l| l.kind) {
+        Some(TargetLevel::Sub(action)) => Some(action),
+        _ => None,
+    };
     if let Ok((mut node, mut text, mut color)) = crumb_q.single_mut() {
         match breadcrumb_text(sub_active) {
             Some(crumb) => {
@@ -179,11 +182,11 @@ pub fn update_target_action_menu(
             }
         }
     }
-    let cursor = state.cursor;
+    let cursor = state.stack.current().map(|l| l.cursor).unwrap_or(0);
 
     if let Some(SubAction::AbilitiesGroup(group)) = sub_active {
         let rows = crate::hud::menu::ability_group_rows(&scene.snapshot, group);
-        let sub_cursor = state.sub.as_ref().map(|s| s.cursor).unwrap_or(0);
+        let sub_cursor = cursor;
         for (row, mut node, mut text, mut color) in row_q.iter_mut() {
             let (want, want_color) = if rows.is_empty() {
                 if row.slot == 0 {
@@ -302,15 +305,21 @@ pub fn target_action_mouse_hover_system(
         return;
     };
 
-    if state.sub.as_ref().and_then(|s| s.current()).is_some() {
+    if matches!(
+        state.stack.current().map(|l| l.kind),
+        Some(TargetLevel::Sub(_))
+    ) {
         return;
     }
+    let Some(level) = state.stack.current_mut() else {
+        return;
+    };
     for (interaction, row) in &rows {
         if matches!(interaction, Interaction::Hovered | Interaction::Pressed)
             && row.slot < limit
-            && state.cursor != row.slot
+            && level.cursor != row.slot
         {
-            state.cursor = row.slot;
+            level.cursor = row.slot;
         }
     }
 }
@@ -325,7 +334,10 @@ pub fn target_action_mouse_click_system(
     let InputMode::TargetAction(state) = &*mode else {
         return;
     };
-    if state.sub.as_ref().and_then(|s| s.current()).is_some() {
+    if matches!(
+        state.stack.current().map(|l| l.kind),
+        Some(TargetLevel::Sub(_))
+    ) {
         return;
     }
     for (interaction, row) in &rows {
