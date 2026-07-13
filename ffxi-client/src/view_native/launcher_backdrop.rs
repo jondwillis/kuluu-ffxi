@@ -149,7 +149,10 @@ fn spawn_backdrop_camera(
 
 fn despawn_backdrop_camera(mut commands: Commands, q: Query<Entity, With<BackdropScoped>>) {
     for e in q.iter() {
-        commands.entity(e).despawn();
+        // try_despawn: this OnExit(Launcher) sweep can race the launcher's
+        // own Update-schedule backdrop-swap/preview teardown in the final
+        // frame before entering the game — an expected race, not a bug.
+        commands.entity(e).try_despawn();
     }
 
     commands.remove_resource::<BackdropFadeMaterial>();
