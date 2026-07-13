@@ -163,11 +163,11 @@ fn resolve_install_root() -> Option<PathBuf> {
 }
 
 // research/xim .../resource/table/ZoneSettingsTable.kt:42-45: the retail client
-// forces track 126 inside the Mog House. LSB sends the surrounding town's music in
-// the MH 0x00A (vendor/server/src/map/packets/s2c/0x00a_login.cpp:177-181), and a
-// 0x05F slot-6 track only arrives when promotional furniture is installed
-// (vendor/server/scripts/globals/moghouse.lua:181-229) — so 126 is the client-side
-// base and any received slot-6 track overrides it.
+// forces the Mog House theme inside the MH. LSB sends the surrounding town's
+// music in the MH 0x00A (vendor/server/src/map/packets/s2c/0x00a_login.cpp:
+// 177-181), and a 0x05F slot track only arrives when promotional furniture is
+// installed (vendor/server/scripts/globals/moghouse.lua:181-229) — so this is
+// the client-side base and any received MH-slot track overrides it.
 pub const MOG_HOUSE_BGM: u16 = 126;
 const MOG_HOUSE_SLOT: u8 = 6;
 

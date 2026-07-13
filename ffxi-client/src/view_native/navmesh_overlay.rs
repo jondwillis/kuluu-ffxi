@@ -42,6 +42,8 @@ pub struct NavmeshState {
     pub edges: Vec<([f32; 3], [f32; 3])>,
 
     pub zone_id: Option<u16>,
+
+    pub in_myroom: bool,
 }
 
 fn overlay_visible(visible: Res<NavmeshOverlayVisible>) -> bool {
@@ -71,16 +73,26 @@ fn toggle_navmesh_overlay(
 
 fn swap_navmesh_on_zone_change(scene: Res<SceneState>, mut state: ResMut<NavmeshState>) {
     let zone_id = scene.snapshot.zone_id;
-    if state.zone_id == zone_id {
+    let in_myroom = scene.snapshot.myroom.is_some();
+    if state.zone_id == zone_id && state.in_myroom == in_myroom {
         return;
     }
     state.zone_id = zone_id;
+    state.in_myroom = in_myroom;
     state.edges.clear();
     state.nav = None;
 
     let Some(zone) = zone_id else {
         return;
     };
+
+    // LSB navmeshes cover the surrounding city, not the Mog House interior model
+    // (the zone id stays the city's inside the MH) — re-grounding against the
+    // city mesh teleports the player onto the interior model's exterior shell.
+    if in_myroom {
+        tracing::debug!(zone_id = zone, "in Mog House — city navmesh off");
+        return;
+    }
 
     match ffxi_nav_recast::RecastNavMesh::for_zone(zone) {
         Ok(nav) => {

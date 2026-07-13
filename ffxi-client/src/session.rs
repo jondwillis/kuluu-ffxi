@@ -57,8 +57,8 @@ struct SelfMogState {
     myroom: Option<crate::state::MyRoomInfo>,
     mog_zone_flag: bool,
     /// Decoded `LoginState == MYROOM` from the last 0x00A. Kept separate from
-    /// `myroom`: a MYROOM login with the 0x01FF sentinel model still spawns at
-    /// the forced origin and must skip the zoneline seed repair.
+    /// `myroom`: a MYROOM login with the `MYROOM_NONE` sentinel model still
+    /// spawns at the forced origin and must skip the zoneline seed repair.
     in_myroom: bool,
     mh_2f_unlocked: Option<bool>,
     job_info: Option<crate::state::JobInfoState>,
@@ -1345,6 +1345,8 @@ async fn keepalive_loop(
     let mut enterzone_seen = false;
     let mut zone_transition_sent = false;
 
+    let mut resrdy_sent = false;
+
     let mut server_seq_applied: Option<u16> = None;
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -2028,6 +2030,23 @@ async fn keepalive_loop(
                         sub_seq, unique_no, act_index, event_num, end_para,
                     ));
                     sub_seq = sub_seq.wrapping_add(1);
+                }
+
+                // Inside the Mog House LSB spawns the Moogle NPC only in response
+                // to c2s 0x01A SendResRdy (SpawnConditionalNPCs, vendor/server/src/
+                // map/packets/c2s/0x01a_action.cpp:449-461) — the 0x015 pos path
+                // that spawns city NPCs early-returns when inMogHouse. Outside the
+                // MH the same action pre-warms NPC/MOB/TRUST spawn lists.
+                if zone_transition_sent && self_pos_seeded && !resrdy_sent {
+                    resrdy_sent = true;
+                    payload.extend(build_subpacket_action(
+                        sub_seq,
+                        self_char_id,
+                        self_act_index.unwrap_or(0),
+                        &crate::state::ActionKind::SendResRdy,
+                    ));
+                    sub_seq = sub_seq.wrapping_add(1);
+                    tracing::info!("sent 0x01A SendResRdy (post zone-in spawn request)");
                 }
 
                 if (!user_driven_events || watchdog_fires || walked_away)

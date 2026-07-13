@@ -7,9 +7,13 @@ use ffxi_viewer_core::{third_person_anchor_y, CameraMode, ChaseCamera, OperatorC
 
 use super::collision_bvh::{CollisionBvh, ZoneCollisionBvh};
 
-const WALL_PAD: f32 = 0.2;
+// research/xim/src/jsMain/kotlin/xim/poc/camera/PolarCamera.kt:209 —
+// `(distance - 0.25f).coerceAtLeast(0.5f)`: pad off the wall, but never pull the
+// camera closer than 0.5 to the anchor (tiny interiors like the Mog House would
+// otherwise collapse it inside the character model).
+const WALL_PAD: f32 = 0.25;
 
-const ANCHOR_EPSILON: f32 = 1e-3;
+const CAMERA_MIN_DISTANCE: f32 = 0.5;
 
 const OUTWARD_LERP: f32 = 0.18;
 
@@ -153,7 +157,7 @@ pub fn clamp_chase_camera_to_collision(
         ffxi_viewer_core::perf_probe::note_debug_probe(probe_start.elapsed());
     }
 
-    let target = (hit_t - WALL_PAD).min(wanted).max(ANCHOR_EPSILON);
+    let target = clamped_camera_distance(hit_t, wanted);
 
     let effective = match *smoothed_effective {
         Some(prev) if target < prev => target * INWARD_LERP + prev * (1.0 - INWARD_LERP),
@@ -164,6 +168,10 @@ pub fn clamp_chase_camera_to_collision(
 
     cam_t.translation = anchor + dir * effective;
     cam_t.look_at(anchor, Vec3::Y);
+}
+
+fn clamped_camera_distance(hit_t: f32, wanted: f32) -> f32 {
+    (hit_t - WALL_PAD).min(wanted).max(CAMERA_MIN_DISTANCE)
 }
 
 pub fn draw_camera_collision_debug(
@@ -247,5 +255,25 @@ pub fn draw_camera_collision_debug(
             wanted_end,
             Color::srgba(1.0, 0.25, 0.55, 0.85),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camera_distance_never_collapses_into_the_anchor() {
+        // XIM PolarCamera.kt:209: (distance - 0.25).coerceAtLeast(0.5) — a wall
+        // right at the anchor (tiny Mog House rooms) must not pull the camera
+        // inside the character model.
+        assert_eq!(clamped_camera_distance(0.0, 6.0), CAMERA_MIN_DISTANCE);
+        assert_eq!(clamped_camera_distance(0.3, 6.0), CAMERA_MIN_DISTANCE);
+    }
+
+    #[test]
+    fn camera_distance_pads_off_walls_and_caps_at_wanted() {
+        assert_eq!(clamped_camera_distance(3.0, 6.0), 3.0 - WALL_PAD);
+        assert_eq!(clamped_camera_distance(100.0, 6.0), 6.0);
     }
 }
