@@ -14,6 +14,25 @@ pub fn scroll_window(cursor: usize, total: usize, visible_rows: usize) -> usize 
     cursor.saturating_sub(half).min(max_start)
 }
 
+/// Step a flat list cursor by `delta`, wrapping past either end (e.g. Up at
+/// row 0 lands on the last row). `count == 0` always yields `0`.
+pub fn list_step_wrapping(cursor: usize, count: usize, delta: i32) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    (cursor as i32 + delta).rem_euclid(count as i32) as usize
+}
+
+/// Step a flat list cursor by `delta`, clamped at `0` and `count - 1` rather
+/// than wrapping (dialog choice lists use this — Up at the top choice stays
+/// put instead of jumping to the bottom). `count == 0` always yields `0`.
+pub fn list_step_clamped(cursor: usize, count: usize, delta: i32) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    (cursor as i32 + delta).clamp(0, count as i32 - 1) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,5 +52,21 @@ mod tests {
         let mid = total / 2;
         assert_eq!(scroll_window(mid, total, rows), mid - rows / 2);
         assert_eq!(scroll_window(total - 1, total, rows), total - rows);
+    }
+
+    #[test]
+    fn list_step_wrapping_wraps_at_both_ends() {
+        assert_eq!(list_step_wrapping(0, 5, -1), 4);
+        assert_eq!(list_step_wrapping(4, 5, 1), 0);
+        assert_eq!(list_step_wrapping(2, 5, 1), 3);
+        assert_eq!(list_step_wrapping(0, 0, 1), 0);
+    }
+
+    #[test]
+    fn list_step_clamped_stops_at_both_ends() {
+        assert_eq!(list_step_clamped(0, 5, -1), 0);
+        assert_eq!(list_step_clamped(4, 5, 1), 4);
+        assert_eq!(list_step_clamped(2, 5, 1), 3);
+        assert_eq!(list_step_clamped(0, 0, 1), 0);
     }
 }

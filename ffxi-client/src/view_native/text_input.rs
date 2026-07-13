@@ -2568,17 +2568,14 @@ fn handle_menu_key(
 
     if bindings.matches_logical(Action::NavUp, key) {
         let level = stack.current_mut()?;
-        level.cursor = if cursor == 0 {
-            entry_count.saturating_sub(1)
-        } else {
-            cursor - 1
-        };
+        level.cursor =
+            ffxi_viewer_core::hud::nav_geometry::list_step_wrapping(cursor, entry_count, -1);
         return None;
     }
     if bindings.matches_logical(Action::NavDown, key) {
         let level = stack.current_mut()?;
-        let next = cursor + 1;
-        level.cursor = if next >= entry_count { 0 } else { next };
+        level.cursor =
+            ffxi_viewer_core::hud::nav_geometry::list_step_wrapping(cursor, entry_count, 1);
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
@@ -2626,16 +2623,21 @@ fn handle_dialog_key(
         .unwrap_or(0)
         .min(ffxi_viewer_core::hud::dialog::MAX_OPTION_ROWS)
         .saturating_sub(1);
+    let count = max_index as usize + 1;
     if bindings.matches_logical(Action::NavUp, key) {
-        if cursor.cursor > 0 {
-            cursor.cursor -= 1;
-        }
+        cursor.cursor = ffxi_viewer_core::hud::nav_geometry::list_step_clamped(
+            cursor.cursor as usize,
+            count,
+            -1,
+        ) as u32;
         return None;
     }
     if bindings.matches_logical(Action::NavDown, key) {
-        if cursor.cursor < max_index {
-            cursor.cursor += 1;
-        }
+        cursor.cursor = ffxi_viewer_core::hud::nav_geometry::list_step_clamped(
+            cursor.cursor as usize,
+            count,
+            1,
+        ) as u32;
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
@@ -2710,16 +2712,13 @@ fn handle_quick_action_key(
 ) -> Option<InputMode> {
     let entry_count = ffxi_viewer_core::hud::quick_action::entry_count(state.has_target);
     if bindings.matches_logical(Action::NavUp, key) {
-        state.cursor = if state.cursor == 0 {
-            entry_count.saturating_sub(1)
-        } else {
-            state.cursor - 1
-        };
+        state.cursor =
+            ffxi_viewer_core::hud::nav_geometry::list_step_wrapping(state.cursor, entry_count, -1);
         return None;
     }
     if bindings.matches_logical(Action::NavDown, key) {
-        let next = state.cursor + 1;
-        state.cursor = if next >= entry_count { 0 } else { next };
+        state.cursor =
+            ffxi_viewer_core::hud::nav_geometry::list_step_wrapping(state.cursor, entry_count, 1);
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
