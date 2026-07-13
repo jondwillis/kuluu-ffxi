@@ -1391,6 +1391,12 @@ async fn keepalive_loop(
                 match cmd {
                     None => break,
                     Some(AgentCommand::Move { x, y, z, heading }) => {
+                        tracing::debug!(
+                            target: "agent_move_recv",
+                            pos = format!("({x:.1},{y:.1},{z:.1})"),
+                            heading,
+                            "AgentCommand::Move received"
+                        );
                         self_pos = Position { pos: Vec3 { x, y, z }, heading, ..self_pos };
                         let _ = event_tx.send(AgentEvent::PositionChanged { pos: self_pos });
                     }
@@ -1999,6 +2005,13 @@ async fn keepalive_loop(
                         Some(t) => should_emit_pos(t.elapsed(), pos_delta, heading_changed),
                     };
                 if include_pos {
+                    tracing::debug!(
+                        target: "outbound_pos",
+                        pos = format!("({:.1},{:.1},{:.1})", self_pos.pos.x, self_pos.pos.y, self_pos.pos.z),
+                        heading = self_pos.heading,
+                        pos_delta,
+                        "sent 0x015 POS"
+                    );
                     payload.extend(build_subpacket_pos(
                         sub_seq,
                         self_pos.pos.x,
