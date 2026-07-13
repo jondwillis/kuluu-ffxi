@@ -220,6 +220,33 @@ pub fn sync_entities_system(
     let zone_changed = matches!(*prev_zone, Some(p) if p != snap.zone_id);
     *prev_zone = Some(snap.zone_id);
 
+    if zone_changed {
+        let mut pc = 0u32;
+        let mut npc = 0u32;
+        let mut mob = 0u32;
+        let mut pet = 0u32;
+        let mut other = 0u32;
+        for e in &snap.entities {
+            match e.kind {
+                EntityKind::Pc => pc += 1,
+                EntityKind::Npc => npc += 1,
+                EntityKind::Mob => mob += 1,
+                EntityKind::Pet => pet += 1,
+                EntityKind::Other => other += 1,
+            }
+        }
+        info!(
+            zone_id = ?snap.zone_id,
+            total = snap.entities.len(),
+            pc,
+            npc,
+            mob,
+            pet,
+            other,
+            "sync_entities_system: entity-kind breakdown on zone entry"
+        );
+    }
+
     let mut nameplated: std::collections::HashSet<u32> =
         q_nameplates.iter().map(|n| n.entity_id).collect();
 
