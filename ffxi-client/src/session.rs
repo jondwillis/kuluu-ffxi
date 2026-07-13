@@ -599,7 +599,16 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::CHAR_PC || op == s2c::CHAR_NPC => {
-            if let Ok(head) = decode::PosHead::decode(sub.data) {
+            let decoded = decode::PosHead::decode(sub.data);
+            if let Err(ref e) = decoded {
+                tracing::warn!(
+                    op = format!("0x{op:03x}"),
+                    error = %e,
+                    body_len = sub.data.len(),
+                    "CHAR_PC/CHAR_NPC PosHead decode failed"
+                );
+            }
+            if let Ok(head) = decoded {
                 if decode::PosHead::is_entity_despawn(op, sub.data) {
                     claim_cache.remove(&head.unique_no);
                     let _ = event_tx.send(AgentEvent::EntityRemoved { id: head.unique_no });
@@ -636,6 +645,16 @@ fn handle_sub_packet(
                     }
                     kind
                 };
+
+                if op == s2c::CHAR_NPC {
+                    tracing::debug!(
+                        target: "char_npc_arrival",
+                        id = head.unique_no,
+                        act_index = head.act_index,
+                        ?kind,
+                        "CHAR_NPC arrived"
+                    );
+                }
 
                 kind_cache
                     .entry(head.unique_no)
