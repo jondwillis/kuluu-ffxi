@@ -33,6 +33,30 @@ pub fn list_step_clamped(cursor: usize, count: usize, delta: i32) -> usize {
     (cursor as i32 + delta).clamp(0, count as i32 - 1) as usize
 }
 
+/// Move a 2D grid cursor by `(dx, dy)` cells, wrapping past each edge.
+/// `table` is row-major (`table[row][col]`); `current` is searched for by
+/// value each call rather than tracked as a separate `(row, col)`, so grid
+/// menus can keep storing their cursor as the cell's own id type (e.g. an
+/// equipment slot enum) instead of a row/col pair.
+pub fn grid_step<const R: usize, const C: usize, T: Copy + PartialEq>(
+    table: &[[T; C]; R],
+    current: T,
+    dx: i32,
+    dy: i32,
+) -> T {
+    let mut cell = (0usize, 0usize);
+    for (r, row) in table.iter().enumerate() {
+        for (c, &t) in row.iter().enumerate() {
+            if t == current {
+                cell = (r, c);
+            }
+        }
+    }
+    let nr = (cell.0 as i32 + dy).rem_euclid(R as i32) as usize;
+    let nc = (cell.1 as i32 + dx).rem_euclid(C as i32) as usize;
+    table[nr][nc]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +92,15 @@ mod tests {
         assert_eq!(list_step_clamped(4, 5, 1), 4);
         assert_eq!(list_step_clamped(2, 5, 1), 3);
         assert_eq!(list_step_clamped(0, 0, 1), 0);
+    }
+
+    #[test]
+    fn grid_step_wraps_and_steps() {
+        let table = [[0, 1, 2], [3, 4, 5]];
+        assert_eq!(grid_step(&table, 0, 1, 0), 1);
+        assert_eq!(grid_step(&table, 2, 1, 0), 0);
+        assert_eq!(grid_step(&table, 0, 0, 1), 3);
+        assert_eq!(grid_step(&table, 3, 0, 1), 0);
+        assert_eq!(grid_step(&table, 0, -1, 0), 2);
     }
 }

@@ -84,25 +84,11 @@ pub const EQUIP_GRID: [[EquipmentIndex; 4]; 4] = {
     ]
 };
 
-fn slot_to_cell(slot: EquipmentIndex) -> (usize, usize) {
-    for (r, row) in EQUIP_GRID.iter().enumerate() {
-        for (c, &s) in row.iter().enumerate() {
-            if s == slot {
-                return (r, c);
-            }
-        }
-    }
-    (0, 0)
-}
-
 /// Move the grid cursor (an internal slot index) by `dx` columns / `dy` rows,
 /// wrapping like the retail window. Used by the menu key handler.
 pub fn grid_move(slot: u8, dx: i32, dy: i32) -> u8 {
     let slot = EquipmentIndex::from_index(slot).unwrap_or(EquipmentIndex::Main);
-    let (r, c) = slot_to_cell(slot);
-    let nr = (r as i32 + dy).rem_euclid(EQUIP_GRID.len() as i32) as usize;
-    let nc = (c as i32 + dx).rem_euclid(EQUIP_GRID[0].len() as i32) as usize;
-    EQUIP_GRID[nr][nc] as u8
+    super::nav_geometry::grid_step(&EQUIP_GRID, slot, dx, dy) as u8
 }
 
 const DETAIL_ROWS: usize = 10;
