@@ -65,37 +65,42 @@ pub enum MenuKind {
     EquipSlot(u8),
 }
 
+/// One entry in a `NavStack`: which sub-menu/sub-mode `K` is showing, and the
+/// list cursor it had the last time it was on top (restored on pop back to
+/// it, so backing out of a drilled-down level doesn't reset your place).
 #[derive(Debug, Clone)]
-pub struct MenuLevel {
-    pub kind: MenuKind,
+pub struct NavLevel<K> {
+    pub kind: K,
     pub cursor: usize,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct MenuStack {
-    pub levels: Vec<MenuLevel>,
+/// A generic push/pop stack of navigable menu levels, shared by every
+/// drill-down menu in the HUD (the root pause menu keyed by `MenuKind`, the
+/// target-action menu keyed by `TargetLevel`) so scroll-window/list-cursor
+/// behavior — including per-level cursor memory across push/pop — only needs
+/// implementing once.
+#[derive(Debug, Clone)]
+pub struct NavStack<K> {
+    pub levels: Vec<NavLevel<K>>,
 }
 
-impl MenuStack {
-    pub fn root() -> Self {
+impl<K> NavStack<K> {
+    pub fn single(kind: K) -> Self {
         Self {
-            levels: vec![MenuLevel {
-                kind: MenuKind::Root,
-                cursor: 0,
-            }],
+            levels: vec![NavLevel { kind, cursor: 0 }],
         }
     }
 
-    pub fn current(&self) -> Option<&MenuLevel> {
+    pub fn current(&self) -> Option<&NavLevel<K>> {
         self.levels.last()
     }
 
-    pub fn current_mut(&mut self) -> Option<&mut MenuLevel> {
+    pub fn current_mut(&mut self) -> Option<&mut NavLevel<K>> {
         self.levels.last_mut()
     }
 
-    pub fn push(&mut self, kind: MenuKind) {
-        self.levels.push(MenuLevel { kind, cursor: 0 });
+    pub fn push(&mut self, kind: K) {
+        self.levels.push(NavLevel { kind, cursor: 0 });
     }
 
     pub fn pop(&mut self) -> bool {
@@ -105,6 +110,15 @@ impl MenuStack {
         } else {
             false
         }
+    }
+}
+
+pub type MenuLevel = NavLevel<MenuKind>;
+pub type MenuStack = NavStack<MenuKind>;
+
+impl MenuStack {
+    pub fn root() -> Self {
+        Self::single(MenuKind::Root)
     }
 }
 
