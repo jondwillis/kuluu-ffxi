@@ -5,6 +5,7 @@ use bevy::prelude::*;
 use ffxi_client::auth_client::AuthClient;
 use ffxi_client::lobby_client::{LobbyClient, LobbyHandle, MapHandoff};
 use ffxi_client::session::InitialState;
+use rand::Rng;
 use tokio::runtime::Handle as RtHandle;
 use tokio::sync::oneshot;
 
@@ -289,10 +290,13 @@ async fn select_with_existing_handle(
     slot: &ffxi_client::lobby_client::CharSlot,
     auth_session: ffxi_client::auth_client::AuthSession,
 ) -> std::result::Result<ConnectOk, ConnectErr> {
+    // Must be fresh per login attempt: LSB stores this verbatim as
+    // accounts_sessions.session_key (src/login/data_session.cpp) and the map
+    // server keys its session/blowfish lookup off it — a repeated key3 can
+    // collide with a stale row from an earlier attempt that was never
+    // cleaned up, silently breaking the new connection.
     let mut key3 = [0u8; 20];
-    for (i, b) in key3.iter_mut().enumerate() {
-        *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
-    }
+    rand::rng().fill(&mut key3);
     let handoff = handle
         .select(slot.char_id, &slot.name, key3)
         .await
@@ -322,10 +326,13 @@ async fn reopen_and_select(
         msg: format!("reopening lobby: {e}"),
         return_to: LoginErrorReturn::CharList,
     })?;
+    // Must be fresh per login attempt: LSB stores this verbatim as
+    // accounts_sessions.session_key (src/login/data_session.cpp) and the map
+    // server keys its session/blowfish lookup off it — a repeated key3 can
+    // collide with a stale row from an earlier attempt that was never
+    // cleaned up, silently breaking the new connection.
     let mut key3 = [0u8; 20];
-    for (i, b) in key3.iter_mut().enumerate() {
-        *b = ((i as u8).wrapping_mul(0x37)) ^ 0x5a;
-    }
+    rand::rng().fill(&mut key3);
     let handoff = handle
         .select(slot.char_id, &slot.name, key3)
         .await
