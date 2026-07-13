@@ -721,6 +721,23 @@ async fn read_lpkt_next_login(
     let server_ip = u32::from_le_bytes(buf[56..60].try_into().unwrap());
     let server_port = u32::from_le_bytes(buf[60..64].try_into().unwrap()) as u16;
 
+    // A zeroed IP/port means our fixed-offset parse of lpkt_next_login landed
+    // on the wrong bytes (or the server genuinely sent garbage) — bootstrap
+    // would otherwise silently target 0.0.0.0:0 and every subsequent map
+    // packet would vanish with zero indication why.
+    if server_ip == 0 || server_port == 0 {
+        bail!(
+            "lpkt_next_login: degenerate map handoff (server_ip={server_ip:#010x}, \
+             server_port={server_port}) — response likely misparsed"
+        );
+    }
+
+    tracing::info!(
+        server_ip = %std::net::Ipv4Addr::from(server_ip.to_le_bytes()),
+        server_port,
+        "lobby: handoff resolved map-server address"
+    );
+
     Ok(MapHandoff {
         char_id,
         character_name,

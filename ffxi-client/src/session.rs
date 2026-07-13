@@ -172,6 +172,20 @@ pub async fn run(
         cli_lang: 0,
     };
 
+    // Only the first 4 bytes: enough to visually confirm key3 differs across
+    // attempts (catching a regression back to the old hardcoded constant)
+    // without logging the full session key.
+    let key3_prefix = key3[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    tracing::info!(
+        server_addr = %server_addr,
+        char_id = resolved_char_id,
+        key3_prefix,
+        "resolved map-server bootstrap target"
+    );
+
     let mut current_seed = key3;
     let mut iteration: u32 = 0;
 
