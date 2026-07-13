@@ -1,0 +1,29 @@
+{
+  "skill_name": "verify",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "Verify that the ffxi-client can log into the local LSB dev server and receives entity spawns after zone-in. Use a throwaway character \u2014 do not touch my real account. Capture concrete evidence of the spawn stream and quote it in your report.",
+      "expected_output": "A verification report: stack checked/brought up, throwaway char provisioned, headless session driven, entity-spawn events captured to a file and quoted (e.g. entity_upserted lines from the JSON event stream), clear verdict.",
+      "files": [],
+      "assertions": [
+        "Used a throwaway/test character; no real credentials sought or used",
+        "Raw evidence captured to files in outputs/ (event stream or client log), and spawn events (e.g. entity_upserted) quoted in the report",
+        "Stack health was checked (docker ps / port probe / server log) before driving the client",
+        "Verdict is grounded in the captured runtime observation, not code reading or unit tests"
+      ]
+    },
+    {
+      "id": 1,
+      "prompt": "I'm worried my recent session.rs changes may have broken the map session layer. Confirm the auth -> lobby -> map -> in-zone -> disconnect lifecycle still works end-to-end against the local LSB server, and tell me how you'd bisect which layer is broken if it weren't working.",
+      "expected_output": "Runs the live play_lifecycle integration test (or an equivalent live drive) against the running stack, reports it passing with output quoted, and explains the layer-bisect ladder (play_lifecycle -> zone_change -> agent_session).",
+      "files": [],
+      "assertions": [
+        "Exercised the real lifecycle against the live server (play_lifecycle integration test or an equivalent live driven session)",
+        "Did not substitute unit tests, clippy, or code reading for the live check",
+        "Report names a concrete layer-bisect ladder (e.g. play_lifecycle -> zone_change -> agent_session)",
+        "Report quotes the actual command(s) run and their captured output"
+      ]
+    }
+  ]
+}
