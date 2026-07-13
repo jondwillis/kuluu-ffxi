@@ -24,6 +24,7 @@ pub mod ffxi_zone_material;
 pub mod graphics;
 pub use graphics::settings as graphics_settings;
 pub mod hud;
+pub mod input_method;
 pub mod input_mode;
 pub mod keybinds;
 pub mod lens_flare;
@@ -88,6 +89,7 @@ pub use graphics_settings::{
     SkyStyle, TextureFiltering, ZoneLineDisplay, GRAPHICS_FIELDS,
 };
 pub use hud::{add_hud_spawners, HudPlugin};
+pub use input_method::{InputMethod, InputMethodPlugin};
 pub use input_mode::{
     ChatBuffer, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack, PassiveCursorFocus,
     PassiveCursorState, QuickActionState, DIALOG_MAX_CHOICE,
@@ -232,6 +234,7 @@ impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
             .init_resource::<ui_font::UiFont>()
             .add_plugins(PickingPlugin)
             .add_plugins(CursorPlugin)
+            .add_plugins(InputMethodPlugin)
             .add_message::<ToastEvent>()
             .add_systems(Startup, ui_font::load_ui_font)
             .add_systems(Update, ui_font::apply_ui_font)

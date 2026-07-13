@@ -8,7 +8,8 @@ use bevy::input_focus::{InputFocus, InputFocusVisible};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
-use ffxi_viewer_core::{Action, Bindings, InputMode, Target};
+use ffxi_viewer_core::hud::death_prompt::is_dead;
+use ffxi_viewer_core::{Action, Bindings, InputMode, SceneState, Target};
 
 const STICK_DEADZONE: f32 = 0.35;
 
@@ -44,6 +45,11 @@ fn bound_key(bindings: &Bindings, action: Action) -> Option<KeyCode> {
 /// activates the focused widget (mirrors Enter). Both ride the same
 /// `bevy_input_focus`/`bevy_ui_widgets` machinery every launcher_ui screen
 /// already uses for keyboard/mouse, so no per-screen changes are needed.
+///
+/// Only the first connected `Gamepad` entity is read: Steam Input can expose
+/// one physical controller as two simultaneous devices (e.g. the Deck's own
+/// pad plus a virtual Xbox-pad mirror it creates for compatibility), and
+/// processing every entity would fire each button press once per device.
 pub(super) fn gamepad_launcher_nav_system(
     gamepads: Query<&Gamepad>,
     nav: TabNavigation,
@@ -55,42 +61,44 @@ pub(super) fn gamepad_launcher_nav_system(
     let Ok(window) = windows.single() else {
         return;
     };
-    for gamepad in &gamepads {
-        let nav_action = if gamepad.just_pressed(GamepadButton::DPadDown)
-            || gamepad.just_pressed(GamepadButton::DPadRight)
-        {
-            Some(NavAction::Next)
-        } else if gamepad.just_pressed(GamepadButton::DPadUp)
-            || gamepad.just_pressed(GamepadButton::DPadLeft)
-        {
-            Some(NavAction::Previous)
-        } else {
-            None
-        };
-        if let Some(action) = nav_action {
-            match nav.navigate(&focus, action) {
-                Ok(next) => {
-                    focus.set(next);
-                    visible.0 = true;
-                }
-                Err(TabNavigationError::NoTabGroupForCurrentFocus { new_focus, .. }) => {
-                    focus.set(new_focus);
-                    visible.0 = true;
-                }
-                Err(_) => {}
-            }
-        }
+    let Some(gamepad) = gamepads.iter().next() else {
+        return;
+    };
 
-        if gamepad.just_pressed(GamepadButton::South) {
-            keyboard_writer.write(KeyboardInput {
-                key_code: KeyCode::Enter,
-                logical_key: Key::Enter,
-                state: ButtonState::Pressed,
-                text: None,
-                repeat: false,
-                window,
-            });
+    let nav_action = if gamepad.just_pressed(GamepadButton::DPadDown)
+        || gamepad.just_pressed(GamepadButton::DPadRight)
+    {
+        Some(NavAction::Next)
+    } else if gamepad.just_pressed(GamepadButton::DPadUp)
+        || gamepad.just_pressed(GamepadButton::DPadLeft)
+    {
+        Some(NavAction::Previous)
+    } else {
+        None
+    };
+    if let Some(action) = nav_action {
+        match nav.navigate(&focus, action) {
+            Ok(next) => {
+                focus.set(next);
+                visible.0 = true;
+            }
+            Err(TabNavigationError::NoTabGroupForCurrentFocus { new_focus, .. }) => {
+                focus.set(new_focus);
+                visible.0 = true;
+            }
+            Err(_) => {}
         }
+    }
+
+    if gamepad.just_pressed(GamepadButton::South) {
+        keyboard_writer.write(KeyboardInput {
+            key_code: KeyCode::Enter,
+            logical_key: Key::Enter,
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window,
+        });
     }
 }
 
@@ -159,14 +167,30 @@ pub(super) fn gamepad_movement_camera_system(
     }
 }
 
-fn synth_nav_key(writer: &mut MessageWriter<KeyboardInput>, window: Entity, key_code: KeyCode) {
-    let logical_key = match key_code {
+/// Mirrors `keybinds::nav_keycode_for`'s reverse direction (private to that
+/// module), for the same fixed key set `Bindings::matches_logical` accepts.
+fn logical_key_for(key_code: KeyCode) -> Key {
+    match key_code {
         KeyCode::Escape => Key::Escape,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Space => Key::Space,
+        KeyCode::ArrowUp => Key::ArrowUp,
+        KeyCode::ArrowDown => Key::ArrowDown,
+        KeyCode::ArrowLeft => Key::ArrowLeft,
+        KeyCode::ArrowRight => Key::ArrowRight,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
         _ => Key::Enter,
-    };
+    }
+}
+
+fn synth_nav_key(writer: &mut MessageWriter<KeyboardInput>, window: Entity, key_code: KeyCode) {
     writer.write(KeyboardInput {
         key_code,
-        logical_key,
+        logical_key: logical_key_for(key_code),
         state: ButtonState::Pressed,
         text: None,
         repeat: false,
@@ -174,20 +198,26 @@ fn synth_nav_key(writer: &mut MessageWriter<KeyboardInput>, window: Entity, key_
     });
 }
 
-/// South is a single context-sensitive action button: whenever `InputMode`
-/// isn't `World` (a menu, dialog, or other overlay is open) it mirrors
-/// `NavConfirm` (Enter), exactly like `gamepad_launcher_nav_system` does for
-/// the launcher. In `World` mode it mirrors `ToggleEngage` if a target is
-/// selected, otherwise `OpenMenu` — matching `handle_input_system`'s own
+/// South is a single context-sensitive action button. While the death prompt
+/// is up it mirrors `ConfirmAction` (the /return-home dispatch text_input.rs
+/// intercepts before generic World-mode handling); otherwise, whenever
+/// `InputMode` isn't `World` (a menu, dialog, or other overlay is open) it
+/// mirrors `NavConfirm`, exactly like `gamepad_launcher_nav_system` does for
+/// the launcher. In plain `World` mode it mirrors `ToggleEngage` if a target
+/// is selected, otherwise `OpenMenu` — matching `handle_input_system`'s own
 /// `InputMode::World` gating, so the two can never both fire off one press
 /// the way a raw keyboard-emulated `F` from Steam Input's Desktop profile
-/// could. East mirrors `NavCancel` (Escape) so a menu opened this way can
-/// also be closed with the gamepad.
+/// could. East mirrors `NavCancel` so a menu opened this way can also be
+/// closed with the gamepad.
+///
+/// Only the first connected `Gamepad` entity is read — see the doc comment
+/// on `gamepad_launcher_nav_system` for why.
 pub(super) fn gamepad_ingame_action_system(
     gamepads: Query<&Gamepad>,
     bindings: Res<Bindings>,
     mode: Res<InputMode>,
     target: Res<Target>,
+    scene_state: Res<SceneState>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut keyboard_writer: MessageWriter<KeyboardInput>,
     windows: Query<Entity, With<PrimaryWindow>>,
@@ -195,25 +225,33 @@ pub(super) fn gamepad_ingame_action_system(
     let Ok(window) = windows.single() else {
         return;
     };
-    for gamepad in &gamepads {
-        if gamepad.just_pressed(GamepadButton::South) {
-            if matches!(*mode, InputMode::World) {
-                let action = if target.id.is_some() {
-                    Action::ToggleEngage
-                } else {
-                    Action::OpenMenu
-                };
-                if let Some(key) = bound_key(&bindings, action) {
-                    keys.press(key);
-                    keys.release(key);
-                }
-            } else {
-                synth_nav_key(&mut keyboard_writer, window, KeyCode::Enter);
-            }
-        }
+    let Some(gamepad) = gamepads.iter().next() else {
+        return;
+    };
 
-        if gamepad.just_pressed(GamepadButton::East) && !matches!(*mode, InputMode::World) {
-            synth_nav_key(&mut keyboard_writer, window, KeyCode::Escape);
+    if gamepad.just_pressed(GamepadButton::South) {
+        if matches!(*mode, InputMode::World) && is_dead(&scene_state) {
+            if let Some(key) = bound_key(&bindings, Action::ConfirmAction) {
+                synth_nav_key(&mut keyboard_writer, window, key);
+            }
+        } else if matches!(*mode, InputMode::World) {
+            let action = if target.id.is_some() {
+                Action::ToggleEngage
+            } else {
+                Action::OpenMenu
+            };
+            if let Some(key) = bound_key(&bindings, action) {
+                keys.press(key);
+                keys.release(key);
+            }
+        } else if let Some(key) = bound_key(&bindings, Action::NavConfirm) {
+            synth_nav_key(&mut keyboard_writer, window, key);
+        }
+    }
+
+    if gamepad.just_pressed(GamepadButton::East) && !matches!(*mode, InputMode::World) {
+        if let Some(key) = bound_key(&bindings, Action::NavCancel) {
+            synth_nav_key(&mut keyboard_writer, window, key);
         }
     }
 }

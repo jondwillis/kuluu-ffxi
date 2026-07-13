@@ -4,6 +4,8 @@ use bevy::window::{CursorGrabMode, CursorOptions};
 use bevy::window::{CursorIcon, PrimaryWindow, SystemCursorIcon};
 
 #[cfg(not(target_arch = "wasm32"))]
+use crate::input_method::InputMethod;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::mouse::CursorLockRequest;
 use crate::mouse::MousePointer;
 use crate::picking::HoveredEntity;
@@ -106,6 +108,7 @@ fn apply_cursor_icon_system(
 fn apply_cursor_lock_system(
     style: Res<CursorStyle>,
     lock_request: Res<CursorLockRequest>,
+    method: Res<InputMethod>,
     win_q: Query<&Window, With<PrimaryWindow>>,
     mut opts_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
@@ -123,7 +126,7 @@ fn apply_cursor_lock_system(
     if opts.grab_mode != want_grab {
         opts.grab_mode = want_grab;
     }
-    let want_visible = !rotating;
+    let want_visible = !rotating && !matches!(*method, InputMethod::Gamepad);
     if opts.visible != want_visible {
         opts.visible = want_visible;
     }

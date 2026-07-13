@@ -2,13 +2,24 @@ use bevy::prelude::*;
 
 use crate::hud::palette;
 use crate::hud::self_hud::resolve_self;
+use crate::input_method::InputMethod;
 use crate::snapshot::SceneState;
 
 #[derive(Component)]
 pub struct DeathPromptPanel;
 
 #[derive(Component)]
+pub struct DeathPromptHint;
+
+#[derive(Component)]
 pub struct DeathCountdownText;
+
+fn hint_text(method: InputMethod) -> &'static str {
+    match method {
+        InputMethod::KeyboardMouse => "Press [Enter] to return to your home point.",
+        InputMethod::Gamepad => "Press [A] to return to your home point.",
+    }
+}
 
 const PANEL_WIDTH_PX: f32 = 380.0;
 
@@ -47,7 +58,8 @@ pub fn spawn_death_prompt(mut commands: Commands) {
                 TextColor(palette::STAGE_BAD),
             ));
             p.spawn((
-                Text::new("Press [Enter] to return to your home point."),
+                DeathPromptHint,
+                Text::new(hint_text(InputMethod::default())),
                 TextFont {
                     font_size: 13.0,
                     ..default()
@@ -81,9 +93,11 @@ pub struct DeathCountdownAnchor {
 pub fn update_death_prompt_system(
     time: Res<Time>,
     state: Res<SceneState>,
+    method: Res<InputMethod>,
     mut anchor: Local<DeathCountdownAnchor>,
     mut panel_q: Query<&mut Node, With<DeathPromptPanel>>,
     mut countdown_q: Query<&mut Text, With<DeathCountdownText>>,
+    mut hint_q: Query<&mut Text, (With<DeathPromptHint>, Without<DeathCountdownText>)>,
 ) {
     let snap = &state.snapshot;
 
@@ -119,6 +133,15 @@ pub fn update_death_prompt_system(
         };
         if **text != label {
             **text = label;
+        }
+    }
+
+    if method.is_changed() {
+        if let Ok(mut text) = hint_q.single_mut() {
+            let label = hint_text(*method);
+            if **text != label {
+                **text = label.to_string();
+            }
         }
     }
 }
