@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use bevy::input::gamepad::{Gamepad, GamepadButton};
+use bevy::input::gamepad::{Gamepad, GamepadButton, GamepadConnectionEvent};
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::{ButtonInput, ButtonState};
 use bevy::input_focus::tab_navigation::{NavAction, TabNavigation, TabNavigationError};
@@ -11,6 +11,40 @@ use bevy::window::PrimaryWindow;
 use ffxi_viewer_core::{Action, Bindings, InputMode};
 
 const STICK_DEADZONE: f32 = 0.35;
+
+/// Pins gamepad-reading systems to one physical device, rather than each
+/// calling `gamepads.iter().next()` independently. Steam Input can mirror one
+/// physical Deck controller as two simultaneous `Gamepad` entities (see the
+/// doc comment on `gamepad_launcher_nav_system`); if the launcher's and the
+/// in-game systems each pick a different one of the pair, a mirrored press
+/// can still read as `just_pressed` on the *other* entity on the very first
+/// in-game frame after a screen transition (e.g. login's character-select
+/// confirm bleeding into an in-game target-action confirm). Latching to the
+/// first-ever-connected entity and holding it across screens closes that gap.
+#[derive(Resource, Default)]
+pub(super) struct PrimaryGamepad(Option<Entity>);
+
+pub(super) fn track_primary_gamepad_system(
+    mut primary: ResMut<PrimaryGamepad>,
+    mut connections: MessageReader<GamepadConnectionEvent>,
+) {
+    for ev in connections.read() {
+        if ev.connected() {
+            if primary.0.is_none() {
+                primary.0 = Some(ev.gamepad);
+            }
+        } else if primary.0 == Some(ev.gamepad) {
+            primary.0 = None;
+        }
+    }
+}
+
+fn primary_gamepad<'a>(
+    primary: &PrimaryGamepad,
+    gamepads: &'a Query<&Gamepad>,
+) -> Option<&'a Gamepad> {
+    primary.0.and_then(|e| gamepads.get(e).ok())
+}
 
 #[derive(Resource, Default)]
 pub(super) struct GamepadAxisHeld {
@@ -45,12 +79,17 @@ fn bound_key(bindings: &Bindings, action: Action) -> Option<KeyCode> {
 /// `bevy_input_focus`/`bevy_ui_widgets` machinery every launcher_ui screen
 /// already uses for keyboard/mouse, so no per-screen changes are needed.
 ///
-/// Only the first connected `Gamepad` entity is read: Steam Input can expose
-/// one physical controller as two simultaneous devices (e.g. the Deck's own
-/// pad plus a virtual Xbox-pad mirror it creates for compatibility), and
-/// processing every entity would fire each button press once per device.
+/// Reads the pinned `PrimaryGamepad` device rather than picking one via
+/// `.iter().next()`: Steam Input can expose one physical controller as two
+/// simultaneous devices (e.g. the Deck's own pad plus a virtual Xbox-pad
+/// mirror it creates for compatibility), and processing every entity would
+/// fire each button press once per device. Pinning also keeps this system
+/// and the in-game ones (`gamepad_ingame_action_system`,
+/// `gamepad_movement_camera_system`) agreeing on the same device across a
+/// screen transition — see `PrimaryGamepad`'s doc comment.
 pub(super) fn gamepad_launcher_nav_system(
     gamepads: Query<&Gamepad>,
+    primary: Res<PrimaryGamepad>,
     nav: TabNavigation,
     mut focus: ResMut<InputFocus>,
     mut visible: ResMut<InputFocusVisible>,
@@ -60,7 +99,7 @@ pub(super) fn gamepad_launcher_nav_system(
     let Ok(window) = windows.single() else {
         return;
     };
-    let Some(gamepad) = gamepads.iter().next() else {
+    let Some(gamepad) = primary_gamepad(&primary, &gamepads) else {
         return;
     };
 
@@ -108,11 +147,12 @@ pub(super) fn gamepad_launcher_nav_system(
 /// see it exactly as if the bound key were physically held.
 pub(super) fn gamepad_movement_camera_system(
     gamepads: Query<&Gamepad>,
+    primary: Res<PrimaryGamepad>,
     bindings: Res<Bindings>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut held: ResMut<GamepadAxisHeld>,
 ) {
-    let Some(gamepad) = gamepads.iter().next() else {
+    let Some(gamepad) = primary_gamepad(&primary, &gamepads) else {
         for key in held.held.drain() {
             keys.release(key);
         }
@@ -244,10 +284,12 @@ fn synth_bound_key(
 ///   Items submenus).
 /// - Right trigger: `OpenChat`.
 ///
-/// Only the first connected `Gamepad` entity is read — see the doc comment
-/// on `gamepad_launcher_nav_system` for why.
+/// Reads the same pinned device every other gamepad system does — see
+/// `PrimaryGamepad`'s doc comment for why a per-call `.iter().next()` isn't
+/// enough to avoid Steam Input's dual-device mirroring.
 pub(super) fn gamepad_ingame_action_system(
     gamepads: Query<&Gamepad>,
+    primary: Res<PrimaryGamepad>,
     bindings: Res<Bindings>,
     mode: Res<InputMode>,
     trade_state: Res<ffxi_viewer_core::hud::trade::TradeState>,
@@ -258,7 +300,7 @@ pub(super) fn gamepad_ingame_action_system(
     let Ok(window) = windows.single() else {
         return;
     };
-    let Some(gamepad) = gamepads.iter().next() else {
+    let Some(gamepad) = primary_gamepad(&primary, &gamepads) else {
         return;
     };
     // A trade window doesn't change InputMode (text_input.rs checks

@@ -429,6 +429,12 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.init_resource::<input::TabCycleStack>();
     app.init_resource::<input::SelectTargetMode>();
     app.init_resource::<gamepad_input::GamepadAxisHeld>();
+    app.init_resource::<gamepad_input::PrimaryGamepad>();
+
+    app.add_systems(
+        PreUpdate,
+        gamepad_input::track_primary_gamepad_system.before(bevy::input::InputSystems),
+    );
 
     app.add_systems(
         Update,
