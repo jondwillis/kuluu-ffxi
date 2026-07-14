@@ -254,54 +254,10 @@ pub fn handle_input_system(
     if bindings.just_pressed(Action::ToggleWalk, &keys) {
         walk_mode.walking = !walk_mode.walking;
     }
-    // With no window open, retail's "Select active window" key has nothing to
-    // focus; we keep the pre-rename engage/disengage toggle as a non-retail
-    // convenience (retail engages via the Attack action menu entry).
-    if bindings.just_pressed(Action::SelectActiveWindow, &keys) {
-        let currently_engaged = matches!(
-            state.snapshot.current_goal,
-            Some(ffxi_viewer_wire::ReactorGoal::Engaged { .. })
-        );
-        if currently_engaged {
-            let _ = cmd_tx.0.try_send(AgentCommand::Cancel);
-            state.push_local_toast(ffxi_viewer_wire::ChatLine {
-                channel: ffxi_viewer_wire::ChatChannel::Debug,
-                sender: "client".into(),
-                text: "disengage".into(),
-                server_ts: 0,
-                local_seq: 0,
-            });
-        } else {
-            match target.id {
-                Some(id) => {
-                    let name = state
-                        .snapshot
-                        .entities
-                        .iter()
-                        .find(|e| e.id == id)
-                        .and_then(|e| e.name.clone())
-                        .unwrap_or_else(|| format!("#{id:08X}"));
-                    let _ = cmd_tx.0.try_send(AgentCommand::Engage { target_id: id });
-                    state.push_local_toast(ffxi_viewer_wire::ChatLine {
-                        channel: ffxi_viewer_wire::ChatChannel::Debug,
-                        sender: "client".into(),
-                        text: format!("engaging {name}"),
-                        server_ts: 0,
-                        local_seq: 0,
-                    });
-                }
-                None => {
-                    state.push_local_toast(ffxi_viewer_wire::ChatLine {
-                        channel: ffxi_viewer_wire::ChatChannel::Debug,
-                        sender: "client".into(),
-                        text: "engage: no target (Tab to cycle)".into(),
-                        server_ts: 0,
-                        local_seq: 0,
-                    });
-                }
-            }
-        }
-    }
+    // Retail's "Select active window" action toggles lock-on / focuses the
+    // active window; it never engages. The old engage/disengage toggle that
+    // lived on this action pre-rename has been removed — engaging goes through
+    // the Attack action menu entry.
 
     if bindings.just_pressed(Action::Sit, &keys) {
         use ffxi_viewer_core::combat_stance::RestKind;
