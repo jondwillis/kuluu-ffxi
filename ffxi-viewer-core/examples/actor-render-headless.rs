@@ -268,7 +268,7 @@ fn spawn_subject(
 ) {
     let loaded = match &params.subject {
         Subject::Npc(id) => load_npc(*id),
-        Subject::Pc(race, equip) => load_pc(*race, equip, None, None),
+        Subject::Pc(race, equip) => load_pc(0, *race, equip, None, None),
     };
     match loaded {
         Ok(loaded) => {

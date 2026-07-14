@@ -205,7 +205,7 @@ pub(super) fn refresh_preview_on_cursor_change(
             let char_id = slot.char_id;
 
             let task = AsyncComputeTaskPool::get()
-                .spawn(async move { load_pc(race, &equipment, None, None) });
+                .spawn(async move { load_pc(char_id, race, &equipment, None, None) });
             pending.task = Some((char_id, task));
         }
         _ => pending.task = None,

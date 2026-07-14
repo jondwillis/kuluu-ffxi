@@ -386,6 +386,7 @@ fn default_pc_equipment(race: u8) -> Vec<u32> {
 const FALLBACK_RACE: u8 = 1;
 
 pub fn load_pc(
+    entity_id: u32,
     race: u8,
     equipment: &[u32],
     main_weapon: Option<u32>,
@@ -399,9 +400,12 @@ pub fn load_pc(
         race
     } else {
         warn!(
+            entity_id,
             race,
+            equipment = ?equipment,
             fallback = FALLBACK_RACE,
-            "load_pc: race has no retail skeleton, falling back"
+            "load_pc: race has no retail skeleton, falling back — cross-check entity_id \
+             against the server's GetZone(id):getNPCs() to identify and fix the NPC's look data"
         );
         FALLBACK_RACE
     };
@@ -1656,6 +1660,7 @@ pub fn kick_load_actor_tasks(
             continue;
         }
         let subject = req.subject.clone();
+        let entity_id = req.entity_id;
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let loaded = match subject {
                 ActorSubject::Npc { file_id } => load_npc(file_id),
@@ -1664,7 +1669,7 @@ pub fn kick_load_actor_tasks(
                     equipment,
                     main_weapon,
                     sub_weapon,
-                } => load_pc(race, &equipment, main_weapon, sub_weapon),
+                } => load_pc(entity_id, race, &equipment, main_weapon, sub_weapon),
             }?;
             let parts = prepare_actor_parts(&loaded, 0.0, 1.0, quality);
             Ok(PreparedActor { loaded, parts })
@@ -2441,7 +2446,7 @@ mod pose_resolution_tests {
             return None;
         }
 
-        Some(load_pc(1, &[], None, None).expect("load Hume M"))
+        Some(load_pc(0, 1, &[], None, None).expect("load Hume M"))
     }
 
     #[test]

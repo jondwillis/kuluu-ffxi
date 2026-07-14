@@ -31,7 +31,7 @@ fn main() {
         load_npc(id).expect("load_npc failed")
     } else {
         let race: u8 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
-        load_pc(race, &[], None, None).expect("load_pc failed")
+        load_pc(0, race, &[], None, None).expect("load_pc failed")
     };
     let skel = &loaded.skeleton;
 
