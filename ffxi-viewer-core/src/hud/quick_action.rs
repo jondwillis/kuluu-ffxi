@@ -75,7 +75,7 @@ pub fn spawn_quick_action(mut commands: Commands) {
                     Node::default(),
                     Text::new(""),
                     TextFont {
-                        font_size: 13.0,
+                        font_size: 13.0.into(),
                         ..default()
                     },
                     TextColor(palette::MUTED),

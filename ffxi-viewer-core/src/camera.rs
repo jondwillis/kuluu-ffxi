@@ -1,7 +1,7 @@
+use bevy::camera::Hdr;
 use bevy::light::{ShadowFilteringMethod, VolumetricFog};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
-use bevy::render::view::Hdr;
 
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::anti_alias::taa::TemporalAntiAliasing;

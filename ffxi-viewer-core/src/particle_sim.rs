@@ -192,8 +192,8 @@ pub fn sync_particle_meshes(
 
     let mut dead = Vec::new();
     for (i, g) in sim.generators.iter().enumerate() {
-        if let Some(mesh) = meshes.get_mut(&g.mesh) {
-            rebuild_mesh(g, cam_rot, mesh);
+        if let Some(mut mesh) = meshes.get_mut(&g.mesh) {
+            rebuild_mesh(g, cam_rot, &mut mesh);
         }
         let done = g.particles.is_empty() && g.age_frames > g.emit_window_frames.max(1.0);
         if done {

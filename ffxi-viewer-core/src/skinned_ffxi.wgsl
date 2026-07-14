@@ -43,6 +43,8 @@ struct FfxiLighting {
     // unused). XIM's `1/(c + l·d + q·d²)` falloff; actors get `const = 0.5`
     // (the FFXI "point-lights affect actors less" dampen, GLDrawer.kt:285-290).
     point_atten: array<vec4<f32>, 4>,
+    // x = elapsed seconds, y = wind strength, z/w reserved.
+    time_params: vec4<f32>,
 };
 
 // Mirror of `FfxiJointMatrices` in skinned_ffxi_material.rs. 128 = MAX_JOINTS.

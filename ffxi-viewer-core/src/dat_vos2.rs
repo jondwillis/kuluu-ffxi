@@ -1626,7 +1626,7 @@ pub fn tick_ffxi_actors(
 
         let mats = eval_pose(&actor.skeleton, &pose);
         for h in &actor.materials {
-            if let Some(m) = materials.get_mut(h) {
+            if let Some(mut m) = materials.get_mut(h) {
                 m.joints.set_from(&mats);
             }
         }
@@ -1691,11 +1691,12 @@ pub fn update_ffxi_lighting_system(
         point_pos: [Vec4::ZERO; 4],
         point_color: [Vec4::ZERO; 4],
         point_atten: [Vec4::ZERO; 4],
+        time_params: Vec4::ZERO,
     };
 
     for actor in &q_actors {
         for h in &actor.materials {
-            if let Some(m) = materials.get_mut(h) {
+            if let Some(mut m) = materials.get_mut(h) {
                 m.lighting = lighting.clone();
             }
         }

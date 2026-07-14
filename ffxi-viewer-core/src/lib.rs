@@ -151,7 +151,9 @@ fn tolerate_command_entity_despawn(
     bevy::ecs::error::panic(error, ctx);
 }
 
-impl<S: SceneSource + Resource> Plugin for ViewerCorePlugin<S> {
+impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mutable>> Plugin
+    for ViewerCorePlugin<S>
+{
     fn build(&self, app: &mut App) {
         app.set_error_handler(tolerate_command_entity_despawn);
 

@@ -324,7 +324,7 @@ pub fn spawn_trade_window(mut commands: Commands) {
                 TradeTitle,
                 Text::new("Trade"),
                 TextFont {
-                    font_size: 15.0,
+                    font_size: 15.0.into(),
                     ..default()
                 },
                 TextColor(palette::ACCENT),
@@ -360,7 +360,7 @@ pub fn spawn_trade_window(mut commands: Commands) {
                 TradeStatusLine,
                 Text::new(""),
                 TextFont {
-                    font_size: 12.0,
+                    font_size: 12.0.into(),
                     ..default()
                 },
                 TextColor(palette::MUTED),
@@ -384,7 +384,7 @@ fn spawn_cell(p: &mut ChildSpawnerCommands, focus: TradeFocus, label: &str) {
         c.spawn((
             Text::new(label.to_string()),
             TextFont {
-                font_size: 12.0,
+                font_size: 12.0.into(),
                 ..default()
             },
             TextColor(palette::TEXT),

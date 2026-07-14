@@ -30,7 +30,7 @@ pub mod theme {
 
 pub fn text_font(size: f32) -> TextFont {
     TextFont {
-        font_size: size,
+        font_size: size.into(),
         ..default()
     }
 }

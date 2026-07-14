@@ -168,7 +168,7 @@ fn spawn_member_row(parent: &mut ChildSpawnerCommands, member: &PartyMember) {
                 RosterRowHeader,
                 Text::new(format_header(member)),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 13.0.into(),
                     ..default()
                 },
                 TextColor(palette::TEXT),

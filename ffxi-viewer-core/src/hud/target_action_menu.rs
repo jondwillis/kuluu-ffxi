@@ -91,7 +91,7 @@ fn spawn_target_action_rows(p: &mut ChildSpawnerCommands) {
         },
         Text::new(""),
         TextFont {
-            font_size: 11.0,
+            font_size: 11.0.into(),
             ..default()
         },
         TextColor(palette::MUTED),
@@ -103,7 +103,7 @@ fn spawn_target_action_rows(p: &mut ChildSpawnerCommands) {
             Node::default(),
             Text::new(""),
             TextFont {
-                font_size: 13.0,
+                font_size: 13.0.into(),
                 ..default()
             },
             TextColor(palette::MUTED),

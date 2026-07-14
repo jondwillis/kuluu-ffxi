@@ -50,7 +50,7 @@ pub fn spawn_vana_clock_as_child(p: &mut ChildSpawnerCommands) {
             VanaClockLabel,
             Text::new("0:00   (?-?)"),
             TextFont {
-                font_size: 12.0,
+                font_size: 12.0.into(),
                 ..default()
             },
             TextColor(palette::TEXT),

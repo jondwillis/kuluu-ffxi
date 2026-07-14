@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use bevy::text::{Font, TextFont};
+use bevy::text::{Font, FontSource, TextFont};
 
 // DejaVu Sans Mono (DejaVu license — see assets/fonts/DejaVu-LICENSE.txt). Bevy's
 // built-in default is a FiraMono *subset* with no geometric shapes / arrows /
@@ -10,19 +10,19 @@ pub const DEJAVU_SANS_MONO: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMo
 pub struct UiFont(pub Handle<Font>);
 
 pub fn load_ui_font(mut fonts: ResMut<Assets<Font>>, mut ui_font: ResMut<UiFont>) {
-    match Font::try_from_bytes(DEJAVU_SANS_MONO.to_vec()) {
-        Ok(font) => ui_font.0 = fonts.add(font),
-        Err(e) => error!("bundled UI font DejaVuSansMono.ttf failed to parse: {e}"),
-    }
+    // Parse errors surface later in the text pipeline under Parley; the
+    // unit tests below gate the bundled bytes at build time instead.
+    ui_font.0 = fonts.add(Font::from_bytes(DEJAVU_SANS_MONO.to_vec()));
 }
 
 pub fn apply_ui_font(ui_font: Res<UiFont>, mut q: Query<&mut TextFont, Added<TextFont>>) {
     if ui_font.0 == Handle::default() {
         return;
     }
+    let ours = FontSource::Handle(ui_font.0.clone());
     for mut text_font in &mut q {
-        if text_font.font != ui_font.0 {
-            text_font.font = ui_font.0.clone();
+        if text_font.font != ours {
+            text_font.font = ours.clone();
         }
     }
 }
@@ -33,8 +33,7 @@ mod tests {
     use ab_glyph::{Font as _, FontArc};
 
     #[test]
-    fn bundled_font_parses_for_bevy_and_ab_glyph() {
-        assert!(Font::try_from_bytes(DEJAVU_SANS_MONO.to_vec()).is_ok());
+    fn bundled_font_parses_for_ab_glyph() {
         assert!(FontArc::try_from_slice(DEJAVU_SANS_MONO).is_ok());
     }
 

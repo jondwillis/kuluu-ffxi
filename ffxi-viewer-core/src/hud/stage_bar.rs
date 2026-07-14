@@ -23,7 +23,7 @@ pub fn spawn_stage_cluster_as_child(p: &mut ChildSpawnerCommands) {
         StageDot,
         Text::new("● "),
         TextFont {
-            font_size: FONT,
+            font_size: FONT.into(),
             ..default()
         },
         TextColor(stage_color(Stage::default())),
@@ -33,7 +33,7 @@ pub fn spawn_stage_cluster_as_child(p: &mut ChildSpawnerCommands) {
         StageLabel,
         Text::new(stage_label(Stage::default()).to_string()),
         TextFont {
-            font_size: FONT,
+            font_size: FONT.into(),
             ..default()
         },
         TextColor(stage_color(Stage::default())),
@@ -42,7 +42,7 @@ pub fn spawn_stage_cluster_as_child(p: &mut ChildSpawnerCommands) {
     p.spawn((
         Text::new("  ▪  "),
         TextFont {
-            font_size: FONT,
+            font_size: FONT.into(),
             ..default()
         },
         TextColor(palette::MUTED),
@@ -51,7 +51,7 @@ pub fn spawn_stage_cluster_as_child(p: &mut ChildSpawnerCommands) {
         CharName,
         Text::new("(no char)".to_string()),
         TextFont {
-            font_size: FONT,
+            font_size: FONT.into(),
             ..default()
         },
         TextColor(palette::TEXT),
@@ -59,7 +59,7 @@ pub fn spawn_stage_cluster_as_child(p: &mut ChildSpawnerCommands) {
     p.spawn((
         Text::new("  ▪  "),
         TextFont {
-            font_size: FONT,
+            font_size: FONT.into(),
             ..default()
         },
         TextColor(palette::MUTED),
@@ -68,7 +68,7 @@ pub fn spawn_stage_cluster_as_child(p: &mut ChildSpawnerCommands) {
         ZoneLabel,
         Text::new("—".to_string()),
         TextFont {
-            font_size: FONT,
+            font_size: FONT.into(),
             ..default()
         },
         TextColor(palette::TEXT),

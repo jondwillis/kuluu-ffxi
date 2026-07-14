@@ -199,7 +199,7 @@ fn spawn_auto_switch_toggle(p: &mut ChildSpawnerCommands) {
             ChatAutoSwitchLabel,
             Text::new("auto \u{2713}"),
             TextFont {
-                font_size: 12.0,
+                font_size: 12.0.into(),
                 ..default()
             },
             TextColor(palette::ACCENT),
@@ -229,7 +229,7 @@ fn spawn_tab_button(p: &mut ChildSpawnerCommands, kind: ChatKind, label: &str, i
             ChatTabButtonLabel,
             Text::new(label.to_string()),
             TextFont {
-                font_size: 12.0,
+                font_size: 12.0.into(),
                 ..default()
             },
             TextColor(fg),
@@ -284,7 +284,7 @@ fn spawn_panel(parent: &mut ChildSpawnerCommands, kind: ChatKind, initial_displa
                             ..default()
                         },
                         TextFont {
-                            font_size: 13.0,
+                            font_size: 13.0.into(),
                             ..default()
                         },
                         TextColor(palette::TEXT),
@@ -295,7 +295,7 @@ fn spawn_panel(parent: &mut ChildSpawnerCommands, kind: ChatKind, initial_displa
                                 ChatRowSpan,
                                 TextSpan::new(""),
                                 TextFont {
-                                    font_size: 13.0,
+                                    font_size: 13.0.into(),
                                     ..default()
                                 },
                                 TextColor(palette::TEXT),

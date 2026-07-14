@@ -132,7 +132,7 @@ pub fn apply_zone_atmosphere_system(
         match (atmo.skybox, skybox_slot) {
             (Some(handle), _) => {
                 commands.entity(cam_entity).insert(Skybox {
-                    image: handle,
+                    image: Some(handle),
                     brightness: 1000.0,
                     ..default()
                 });

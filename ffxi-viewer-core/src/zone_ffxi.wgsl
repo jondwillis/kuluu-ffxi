@@ -33,6 +33,8 @@ struct FfxiLighting {
     point_pos: array<vec4<f32>, 4>,
     point_color: array<vec4<f32>, 4>,
     point_atten: array<vec4<f32>, 4>,
+    // x = elapsed seconds, y = wind strength, z/w reserved.
+    time_params: vec4<f32>,
 };
 
 // Mirror of `FfxiMaterialFlags`. `flags.x` = has_texture (1.0 / 0.0);

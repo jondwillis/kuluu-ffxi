@@ -100,7 +100,7 @@ pub fn spawn_logout_countdown(mut commands: Commands) {
                 LogoutCountdownLabel,
                 Text::new(""),
                 TextFont {
-                    font_size: 22.0,
+                    font_size: 22.0.into(),
                     ..default()
                 },
                 TextColor(palette::STAGE_BAD),

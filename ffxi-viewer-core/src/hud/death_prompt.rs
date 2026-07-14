@@ -41,7 +41,7 @@ pub fn spawn_death_prompt(mut commands: Commands) {
             p.spawn((
                 Text::new("You were defeated."),
                 TextFont {
-                    font_size: 16.0,
+                    font_size: 16.0.into(),
                     ..default()
                 },
                 TextColor(palette::STAGE_BAD),
@@ -49,7 +49,7 @@ pub fn spawn_death_prompt(mut commands: Commands) {
             p.spawn((
                 Text::new("Press [Enter] to return to your home point."),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 13.0.into(),
                     ..default()
                 },
                 TextColor(palette::TEXT),
@@ -58,7 +58,7 @@ pub fn spawn_death_prompt(mut commands: Commands) {
                 DeathCountdownText,
                 Text::new(String::new()),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 13.0.into(),
                     ..default()
                 },
                 TextColor(palette::STAGE_BAD),

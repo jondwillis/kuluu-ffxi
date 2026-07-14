@@ -363,7 +363,7 @@ pub fn spawn_minimap_as_child(p: &mut ChildSpawnerCommands, images: &mut Assets<
             btn.spawn((
                 Text::new("\u{2715}".to_string()),
                 TextFont {
-                    font_size: 11.0,
+                    font_size: 11.0.into(),
                     ..default()
                 },
                 TextColor(palette::ACCENT),

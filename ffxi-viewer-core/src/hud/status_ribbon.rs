@@ -176,7 +176,7 @@ pub fn spawn_status_ribbon(mut commands: Commands, mut images: ResMut<Assets<Ima
                         StatusChipFallback,
                         Text::new(""),
                         TextFont {
-                            font_size: 10.0,
+                            font_size: 10.0.into(),
                             ..default()
                         },
                         TextColor(palette::TEXT),
@@ -193,7 +193,7 @@ pub fn spawn_status_ribbon(mut commands: Commands, mut images: ResMut<Assets<Ima
                         },
                         Text::new(""),
                         TextFont {
-                            font_size: 8.0,
+                            font_size: 8.0.into(),
                             ..default()
                         },
                         TextColor(palette::ACCENT),

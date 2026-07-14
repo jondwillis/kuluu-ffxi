@@ -56,7 +56,7 @@ pub fn spawn_mesh_debug_hud(mut commands: Commands) {
                 MeshDebugHudText,
                 Text::new(""),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 13.0.into(),
                     ..default()
                 },
                 TextColor(palette::TEXT),

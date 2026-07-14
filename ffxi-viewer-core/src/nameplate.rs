@@ -48,7 +48,7 @@ pub fn spawn_nameplate(
                 },
                 Text::new(owned),
                 TextFont {
-                    font_size: 12.0,
+                    font_size: 12.0.into(),
                     ..default()
                 },
                 TextColor(color),
@@ -58,7 +58,7 @@ pub fn spawn_nameplate(
                 NameplateCoord,
                 Text::new(""),
                 TextFont {
-                    font_size: 10.0,
+                    font_size: 10.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgba(0.78, 0.78, 0.82, 0.85)),

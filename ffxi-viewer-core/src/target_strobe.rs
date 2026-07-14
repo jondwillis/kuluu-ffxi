@@ -71,7 +71,7 @@ fn set_actor_highlight(
             continue;
         }
         for handle in actor.material_handles() {
-            if let Some(m) = materials.get_mut(handle) {
+            if let Some(mut m) = materials.get_mut(handle) {
                 m.material_flags.flags.w = value;
             }
         }

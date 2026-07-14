@@ -145,7 +145,7 @@ fn update_skybox(
     });
 
     if let Some(handle) = sky_mat {
-        if let Some(mat) = mats.get_mut(&handle) {
+        if let Some(mut mat) = mats.get_mut(&handle) {
             if let Some((colors, altitudes)) = gradient {
                 mat.data.colors = colors;
                 mat.data.altitudes_packed = altitudes;

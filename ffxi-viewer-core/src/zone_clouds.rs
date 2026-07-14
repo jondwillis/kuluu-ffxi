@@ -696,7 +696,7 @@ fn drive_zone_stars(
         xf.rotation = Quat::from_rotation_y(frac * std::f32::consts::TAU) * ffxi_to_bevy_basis();
         xf.scale = scale;
         if write_night {
-            if let Some(m) = materials.get_mut(&mat.0) {
+            if let Some(mut m) = materials.get_mut(&mat.0) {
                 m.base_color = Color::linear_rgb(night, night, night);
             }
         }

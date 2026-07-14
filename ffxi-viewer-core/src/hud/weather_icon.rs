@@ -73,7 +73,7 @@ pub fn spawn_weather_icon_as_child(p: &mut ChildSpawnerCommands) {
             WeatherIconGlyph,
             Text::new(""),
             TextFont {
-                font_size: 14.0,
+                font_size: 14.0.into(),
                 ..default()
             },
             TextColor(palette::TEXT),

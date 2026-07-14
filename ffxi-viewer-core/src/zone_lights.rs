@@ -172,7 +172,7 @@ fn drain_light_scan(
                         intensity: cfg.point_intensity,
                         range: cfg.point_range,
                         radius: 0.05,
-                        shadows_enabled: false,
+                        shadow_maps_enabled: false,
                         ..default()
                     },
                     Mesh3d(flame.mesh.clone()),

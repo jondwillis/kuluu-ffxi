@@ -298,7 +298,7 @@ fn sync_faithful_zone_light_entities(
                 intensity: base_intensity,
                 range: l.range * ZONE_LIGHT_REACH_SCALE,
                 radius: 0.05,
-                shadows_enabled: false,
+                shadow_maps_enabled: false,
                 ..default()
             },
             Transform::from_translation(l.world_pos),

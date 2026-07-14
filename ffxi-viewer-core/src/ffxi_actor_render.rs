@@ -1811,7 +1811,7 @@ pub fn tick_morph_in(
             }
         }
         if let Some(handle) = &morph.orb_mat {
-            if let Some(mat) = std_materials.get_mut(handle) {
+            if let Some(mut mat) = std_materials.get_mut(handle) {
                 let fade = sxz;
                 let e = morph.orb_emissive;
                 mat.base_color = mat.base_color.with_alpha(fade);
@@ -2252,6 +2252,7 @@ pub fn update_ffxi_render_actor_lighting(
         point_pos: [Vec4::ZERO; 4],
         point_color: [Vec4::ZERO; 4],
         point_atten: [Vec4::ZERO; 4],
+        time_params: Vec4::ZERO,
     };
 
     for actor in &q_actors {

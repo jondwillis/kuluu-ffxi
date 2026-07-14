@@ -76,7 +76,7 @@ pub fn spawn_check_view(mut commands: Commands) {
             p.spawn((
                 Text::new("Check"),
                 TextFont {
-                    font_size: 14.0,
+                    font_size: 14.0.into(),
                     ..default()
                 },
                 TextColor(palette::ACCENT),
@@ -95,7 +95,7 @@ pub fn spawn_check_view(mut commands: Commands) {
                 w.spawn((
                     Text::new("View Wares"),
                     TextFont {
-                        font_size: 13.0,
+                        font_size: 13.0.into(),
                         ..default()
                     },
                     TextColor(palette::MUTED),
@@ -105,7 +105,7 @@ pub fn spawn_check_view(mut commands: Commands) {
                         CheckWaresRow { idx },
                         Text::new(""),
                         TextFont {
-                            font_size: 13.0,
+                            font_size: 13.0.into(),
                             ..default()
                         },
                         TextColor(palette::TEXT),
@@ -124,7 +124,7 @@ pub fn spawn_check_view(mut commands: Commands) {
                             CheckGridCell { grid_index },
                             Text::new(""),
                             TextFont {
-                                font_size: 13.0,
+                                font_size: 13.0.into(),
                                 ..default()
                             },
                             TextColor(palette::TEXT),
@@ -136,7 +136,7 @@ pub fn spawn_check_view(mut commands: Commands) {
                 CheckJobRibbon,
                 Text::new(""),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 13.0.into(),
                     ..default()
                 },
                 TextColor(palette::ACCENT),

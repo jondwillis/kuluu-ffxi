@@ -45,7 +45,7 @@ pub fn spawn_entity_hover_card(mut commands: Commands) {
                 EntityHoverCardName,
                 Text::new(""),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 13.0.into(),
                     ..default()
                 },
                 TextColor(palette::TEXT),
@@ -54,7 +54,7 @@ pub fn spawn_entity_hover_card(mut commands: Commands) {
                 EntityHoverCardHp,
                 Text::new(""),
                 TextFont {
-                    font_size: 12.0,
+                    font_size: 12.0.into(),
                     ..default()
                 },
                 TextColor(palette::MUTED),

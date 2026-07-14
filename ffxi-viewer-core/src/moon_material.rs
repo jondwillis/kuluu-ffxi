@@ -162,7 +162,7 @@ fn load_moon_sprite_sheet(
 
     let Some(sheet) = sheet else {
         frames_res.0 = None;
-        if let Some(mat) = moon_materials.get_mut(&celestial.moon) {
+        if let Some(mut mat) = moon_materials.get_mut(&celestial.moon) {
             mat.surface = None;
         }
         return;
@@ -192,7 +192,7 @@ fn load_moon_sprite_sheet(
     }
     frames_res.0 = Some(frames);
 
-    if let Some(mat) = moon_materials.get_mut(&celestial.moon) {
+    if let Some(mut mat) = moon_materials.get_mut(&celestial.moon) {
         mat.surface = Some(handle);
     }
     info!(

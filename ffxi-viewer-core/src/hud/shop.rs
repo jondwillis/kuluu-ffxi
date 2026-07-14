@@ -40,7 +40,7 @@ pub fn spawn_shop_panel(mut commands: Commands) {
                 ShopHeader,
                 Text::new(""),
                 TextFont {
-                    font_size: 14.0,
+                    font_size: 14.0.into(),
                     ..default()
                 },
                 TextColor(palette::ACCENT),
@@ -49,7 +49,7 @@ pub fn spawn_shop_panel(mut commands: Commands) {
                 ShopBody,
                 Text::new(""),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 13.0.into(),
                     ..default()
                 },
                 TextColor(palette::TEXT),

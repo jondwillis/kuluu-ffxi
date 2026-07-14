@@ -72,7 +72,7 @@ fn spawn_row<M: Component>(p: &mut ChildSpawnerCommands, marker: M, label: &str,
         row.spawn((
             Text::new(label.to_string()),
             TextFont {
-                font_size: 13.0,
+                font_size: 13.0.into(),
                 ..default()
             },
             TextColor(palette::MUTED),
@@ -81,7 +81,7 @@ fn spawn_row<M: Component>(p: &mut ChildSpawnerCommands, marker: M, label: &str,
             marker,
             Text::new(init.to_string()),
             TextFont {
-                font_size: 13.0,
+                font_size: 13.0.into(),
                 ..default()
             },
             TextColor(palette::TEXT),

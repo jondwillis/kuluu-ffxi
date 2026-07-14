@@ -140,7 +140,7 @@ pub fn spawn_status_panel(mut commands: Commands) {
                 StatusHeaderRow,
                 Text::new(""),
                 TextFont {
-                    font_size: 14.0,
+                    font_size: 14.0.into(),
                     ..default()
                 },
                 TextColor(palette::ACCENT),
@@ -149,7 +149,7 @@ pub fn spawn_status_panel(mut commands: Commands) {
                 StatusVitalsRow,
                 Text::new(""),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 13.0.into(),
                     ..default()
                 },
                 TextColor(palette::TEXT),
@@ -158,7 +158,7 @@ pub fn spawn_status_panel(mut commands: Commands) {
                 StatusItemLevelRow,
                 Text::new(""),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 13.0.into(),
                     ..default()
                 },
                 TextColor(palette::MUTED),
@@ -168,7 +168,7 @@ pub fn spawn_status_panel(mut commands: Commands) {
                     StatusAttrRow { attr_index },
                     Text::new(""),
                     TextFont {
-                        font_size: 13.0,
+                        font_size: 13.0.into(),
                         ..default()
                     },
                     TextColor(palette::TEXT),

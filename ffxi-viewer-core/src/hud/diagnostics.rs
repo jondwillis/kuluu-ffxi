@@ -87,7 +87,7 @@ fn spawn_label_value<M: Component>(
     parent.spawn((
         Text::new(label.to_string()),
         TextFont {
-            font_size: 13.0,
+            font_size: 13.0.into(),
             ..default()
         },
         TextColor(palette::MUTED),
@@ -96,7 +96,7 @@ fn spawn_label_value<M: Component>(
         marker,
         Text::new(initial.to_string()),
         TextFont {
-            font_size: 13.0,
+            font_size: 13.0.into(),
             ..default()
         },
         TextColor(palette::TEXT),
@@ -107,7 +107,7 @@ fn spawn_separator(parent: &mut ChildSpawnerCommands) {
     parent.spawn((
         Text::new("   "),
         TextFont {
-            font_size: 13.0,
+            font_size: 13.0.into(),
             ..default()
         },
         TextColor(palette::MUTED),

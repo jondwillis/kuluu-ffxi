@@ -60,6 +60,13 @@ pub struct FfxiLightingUniform {
     pub point_color: [Vec4; 4],
 
     pub point_atten: [Vec4; 4],
+
+    /// Shared per-frame animation parameters, written once per frame into the
+    /// single persistent lighting buffer (see `ZoneGlobalLighting`):
+    /// - `x` = elapsed time in seconds (uv scroll, wind phase)
+    /// - `y` = global wind strength scalar (foliage vertex blend, Phase C)
+    /// - `z`, `w` = reserved
+    pub time_params: Vec4,
 }
 
 impl Default for FfxiLightingUniform {
@@ -73,6 +80,7 @@ impl Default for FfxiLightingUniform {
             point_pos: [Vec4::ZERO; 4],
             point_color: [Vec4::ZERO; 4],
             point_atten: [Vec4::ZERO; 4],
+            time_params: Vec4::ZERO,
         }
     }
 }

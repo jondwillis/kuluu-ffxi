@@ -167,7 +167,7 @@ fn lens_flare_system(
     flare_xf.scale = Vec3::new(width, height, 1.0) * FLARE_OVERSCAN;
     *vis = Visibility::Inherited;
 
-    if let Some(mat) = mats.get_mut(&flare_mat.0) {
+    if let Some(mut mat) = mats.get_mut(&flare_mat.0) {
         mat.data.sun_dir_intensity = sun_dir.extend(intensity);
     }
 }
@@ -208,7 +208,7 @@ fn load_lens_flare_sheet(
 
     let Some(sheet) = sheet else {
         *sheet_res = LensFlareSheet::default();
-        if let Some(mat) = mat {
+        if let Some(mut mat) = mat {
             mat.flare_tex = None;
             mat.data.flare_params.x = 0.0;
             mat.data.flare_params.y = 0.0;
@@ -244,7 +244,7 @@ fn load_lens_flare_sheet(
     };
 
     let (tex_w, tex_h) = (sheet.texture.width as f32, sheet.texture.height as f32);
-    if let Some(mat) = mat {
+    if let Some(mut mat) = mat {
         mat.flare_tex = Some(handle);
         mat.data.flare_params.x = n as f32;
         mat.data.flare_params.y = 1.0;

@@ -1297,7 +1297,7 @@ dependencies = [
  "arrayvec",
  "bevy_reflect",
  "derive_more",
- "glam 0.32.1",
+ "glam",
  "itertools",
  "libm",
  "rand 0.10.1",
@@ -1327,7 +1327,7 @@ dependencies = [
  "bytemuck",
  "derive_more",
  "encase",
- "glam 0.32.1",
+ "glam",
  "half",
  "hexasphere",
  "serde",
@@ -1478,7 +1478,7 @@ dependencies = [
  "downcast-rs 2.0.2",
  "erased-serde",
  "foldhash 0.2.0",
- "glam 0.32.1",
+ "glam",
  "indexmap",
  "inventory",
  "petgraph",
@@ -1540,7 +1540,7 @@ dependencies = [
  "derive_more",
  "downcast-rs 2.0.2",
  "encase",
- "glam 0.32.1",
+ "glam",
  "image",
  "indexmap",
  "itertools",
@@ -3103,7 +3103,7 @@ name = "ffxi-actor"
 version = "0.2.0"
 dependencies = [
  "ffxi-dat",
- "glam 0.30.10",
+ "glam",
 ]
 
 [[package]]
@@ -3191,7 +3191,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "bincode",
- "glam 0.30.10",
+ "glam",
  "image",
  "pathfinding",
  "serde",
@@ -3205,7 +3205,7 @@ version = "0.2.0"
 dependencies = [
  "dirs",
  "ffxi-nav",
- "glam 0.30.10",
+ "glam",
  "recastnavigation-rs",
  "tempfile",
  "thiserror 2.0.18",
@@ -3588,12 +3588,6 @@ dependencies = [
 
 [[package]]
 name = "glam"
-version = "0.30.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
-
-[[package]]
-name = "glam"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f70749695b063ecbf6b62949ccccde2e733ec3ecbbd71d467dca4e5c6c97cca0"
@@ -3896,7 +3890,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "177ea6330876de4ef08e184f827b98acc037614a4ce409902c5b0d53a9c2e951"
 dependencies = [
  "constgebra",
- "glam 0.32.1",
+ "glam",
  "tinyvec",
 ]
 

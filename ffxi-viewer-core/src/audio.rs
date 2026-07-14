@@ -1,3 +1,4 @@
+use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -74,14 +75,16 @@ impl Iterator for PcmSource {
 }
 
 impl RodioSource for PcmSource {
-    fn current_frame_len(&self) -> Option<usize> {
+    fn current_span_len(&self) -> Option<usize> {
         Some(self.samples.len().saturating_sub(self.pos))
     }
-    fn channels(&self) -> u16 {
-        self.channels
+    // rodio 0.22 requires NonZero channel/rate; ffxi-audio decoders can in
+    // principle emit 0 for a corrupt container, so clamp rather than panic.
+    fn channels(&self) -> NonZero<u16> {
+        NonZero::new(self.channels).unwrap_or(NonZero::<u16>::MIN)
     }
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
+    fn sample_rate(&self) -> NonZero<u32> {
+        NonZero::new(self.sample_rate).unwrap_or(NonZero::<u32>::MIN)
     }
     fn total_duration(&self) -> Option<std::time::Duration> {
         if self.loop_start_sample.is_some() {
@@ -98,7 +101,6 @@ impl RodioSource for PcmSource {
 }
 
 impl Decodable for PcmAudio {
-    type DecoderItem = f32;
     type Decoder = PcmSource;
     fn decoder(&self) -> Self::Decoder {
         PcmSource {

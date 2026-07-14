@@ -35,7 +35,7 @@ pub fn spawn_chat_input(mut commands: Commands) {
                 ChatInputText,
                 Text::new("> _"),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 13.0.into(),
                     ..default()
                 },
                 TextColor(palette::TEXT),

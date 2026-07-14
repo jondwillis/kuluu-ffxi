@@ -62,7 +62,7 @@ pub fn spawn_target_panel(mut commands: Commands) {
                 TargetHeader,
                 Text::new(""),
                 TextFont {
-                    font_size: 14.0,
+                    font_size: 14.0.into(),
                     ..default()
                 },
                 TextColor(palette::TEXT),
@@ -72,7 +72,7 @@ pub fn spawn_target_panel(mut commands: Commands) {
                 TargetEngagedBadge,
                 Text::new(""),
                 TextFont {
-                    font_size: 12.0,
+                    font_size: 12.0.into(),
                     ..default()
                 },
                 TextColor(palette::STAGE_BAD),
@@ -110,7 +110,7 @@ pub fn spawn_target_panel(mut commands: Commands) {
                     TargetHpText,
                     Text::new("—"),
                     TextFont {
-                        font_size: 12.0,
+                        font_size: 12.0.into(),
                         ..default()
                     },
                     TextColor(palette::MUTED),
@@ -119,7 +119,7 @@ pub fn spawn_target_panel(mut commands: Commands) {
                     TargetDistText,
                     Text::new(""),
                     TextFont {
-                        font_size: 12.0,
+                        font_size: 12.0.into(),
                         ..default()
                     },
                     TextColor(palette::MUTED),

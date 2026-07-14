@@ -101,7 +101,11 @@ pub fn drain_toast_events(mut state: ResMut<SceneState>, mut events: MessageRead
     }
 }
 
-pub fn ingest_system<S: SceneSource + Resource>(
+// 0.19's resources-as-components: `ResMut` needs the resource's Component
+// impl to be mutable, which generic bounds must now spell out.
+pub fn ingest_system<
+    S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mutable>,
+>(
     mut source: ResMut<S>,
     mut state: ResMut<SceneState>,
     mut events: ResMut<EventLog>,

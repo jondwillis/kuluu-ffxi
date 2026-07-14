@@ -378,7 +378,8 @@ impl Material for FfxiZoneMaterial {
             // transparent pass already disables depth write, but the prepass
             // (enable_prepass = true) would otherwise still write it; AND the
             // flag in rather than overwrite whatever the pass chose.
-            ds.depth_write_enabled &= rk.depth_write;
+            ds.depth_write_enabled =
+                Some(ds.depth_write_enabled.unwrap_or(false) && rk.depth_write);
 
             // GLDrawer.kt: glPolygonOffset(zBias * -1, 1) pulls ZBiasLevel::High
             // decal layers toward the camera over the coplanar base terrain.
@@ -531,6 +532,14 @@ fn update_zone_material_point_lights(
     global.0.point_atten = point_atten;
 }
 
+/// Writes the shared per-frame animation params (`FfxiLightingUniform::
+/// time_params`) into the single persistent lighting buffer: `x` = elapsed
+/// seconds (uv scroll / wind phase), `y` = global wind strength. Consumers:
+/// scrolling water (Phase A), foliage vertex blend (Phase C).
+fn update_zone_material_time(time: Res<bevy::time::Time>, mut global: ResMut<ZoneGlobalLighting>) {
+    global.0.time_params.x = time.elapsed_secs_wrapped();
+}
+
 pub struct FfxiZoneMaterialPlugin;
 
 impl Plugin for FfxiZoneMaterialPlugin {
@@ -544,6 +553,7 @@ impl Plugin for FfxiZoneMaterialPlugin {
             // update_zone_material_lighting reads the resource unconditionally.
             .init_resource::<crate::weather::ZoneDirectionalLighting>()
             .add_systems(Update, update_zone_material_lighting)
+            .add_systems(Update, update_zone_material_time)
             .add_systems(
                 Update,
                 update_zone_material_point_lights

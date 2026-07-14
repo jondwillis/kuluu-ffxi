@@ -306,7 +306,7 @@ pub fn spawn_main_menu(mut commands: Commands) {
                 MainMenuTitle,
                 Text::new(""),
                 TextFont {
-                    font_size: 14.0,
+                    font_size: 14.0.into(),
                     ..default()
                 },
                 TextColor(palette::ACCENT),
@@ -318,7 +318,7 @@ pub fn spawn_main_menu(mut commands: Commands) {
                     Button,
                     Text::new(""),
                     TextFont {
-                        font_size: 14.0,
+                        font_size: 14.0.into(),
                         ..default()
                     },
                     TextColor(palette::MUTED),

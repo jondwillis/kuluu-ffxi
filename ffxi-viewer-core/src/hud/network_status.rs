@@ -61,7 +61,7 @@ pub fn spawn_network_status(mut commands: Commands) {
                     NetSendArrow,
                     Text::new("\u{25B2}"),
                     TextFont {
-                        font_size: 9.0,
+                        font_size: 9.0.into(),
                         ..default()
                     },
                     TextColor(health_color(100)),
@@ -70,7 +70,7 @@ pub fn spawn_network_status(mut commands: Commands) {
                     NetRecvArrow,
                     Text::new("\u{25BC}"),
                     TextFont {
-                        font_size: 9.0,
+                        font_size: 9.0.into(),
                         ..default()
                     },
                     TextColor(health_color(100)),
@@ -87,7 +87,7 @@ pub fn spawn_network_status(mut commands: Commands) {
                     NetPercentLabel,
                     Text::new("100%"),
                     TextFont {
-                        font_size: 13.0,
+                        font_size: 13.0.into(),
                         ..default()
                     },
                     TextColor(health_color(100)),
@@ -120,7 +120,7 @@ fn spawn_baud_row<M: Component>(col: &mut ChildSpawnerCommands, prefix: &str, va
         row.spawn((
             Text::new(prefix.to_string()),
             TextFont {
-                font_size: 11.0,
+                font_size: 11.0.into(),
                 ..default()
             },
             TextColor(palette::MUTED),
@@ -135,7 +135,7 @@ fn spawn_baud_row<M: Component>(col: &mut ChildSpawnerCommands, prefix: &str, va
                 value_marker,
                 Text::new("0"),
                 TextFont {
-                    font_size: 11.0,
+                    font_size: 11.0.into(),
                     ..default()
                 },
                 TextColor(palette::TEXT),

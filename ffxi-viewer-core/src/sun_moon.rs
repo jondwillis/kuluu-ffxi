@@ -149,7 +149,7 @@ pub fn spawn_sun_and_moon(
         IsSun,
         DirectionalLight {
             illuminance: 0.0,
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             shadow_depth_bias: 0.2,
 
             shadow_normal_bias: 0.6,
@@ -165,7 +165,7 @@ pub fn spawn_sun_and_moon(
         DirectionalLight {
             illuminance: 0.0,
 
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             shadow_depth_bias: 0.2,
             shadow_normal_bias: 1.0,
             ..default()
@@ -716,7 +716,7 @@ pub fn sun_moon_system(
     }
 
     if let Some(handle) = moon_sphere_handle.as_deref() {
-        if let Some(mat) = materials.get_mut(&handle.0) {
+        if let Some(mut mat) = materials.get_mut(&handle.0) {
             let earth_since = (vana_clock.earth_unix_now()
                 - crate::hud::vana_clock::EARTH_EPOCH_UNIX as f64)
                 .max(0.0);
@@ -728,7 +728,7 @@ pub fn sun_moon_system(
     }
 
     if let Some(handles) = materials_handle.as_deref() {
-        if let Some(sun_mat) = materials.get_mut(&handles.sun) {
+        if let Some(mut sun_mat) = materials.get_mut(&handles.sun) {
             let visible = sky.sun_altitude.max(-0.2);
 
             let elev_norm = (visible / (PI / 2.0)).clamp(0.0, 1.0);
@@ -766,7 +766,7 @@ pub fn sun_moon_system(
                 sun_mat.alpha_mode = AlphaMode::Opaque;
             }
         }
-        if let Some(moon_mat) = moon_materials.get_mut(&handles.moon) {
+        if let Some(mut moon_mat) = moon_materials.get_mut(&handles.moon) {
             let visibility = sky.moon_illumination.clamp(0.0, 1.0);
 
             let mut intensity = if sky.moon_altitude > 0.0 {

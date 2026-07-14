@@ -747,7 +747,7 @@ pub fn apply_texture_filtering_system(
         return;
     }
     let mut patch = |handle: &Handle<Image>| {
-        if let Some(img) = images.get_mut(handle) {
+        if let Some(mut img) = images.get_mut(handle) {
             img.sampler = bevy::image::ImageSampler::Descriptor(
                 crate::zone_texture::sampler_descriptor(aniso),
             );

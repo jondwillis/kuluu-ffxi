@@ -74,7 +74,7 @@ pub fn spawn_zone_flash(mut commands: Commands) {
                 ZoneFlashLabel,
                 Text::new(""),
                 TextFont {
-                    font_size: 20.0,
+                    font_size: 20.0.into(),
                     ..default()
                 },
                 TextColor(palette::ACCENT),
