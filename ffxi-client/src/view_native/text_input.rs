@@ -2569,13 +2569,14 @@ fn handle_menu_key(
     let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind, dynamic);
 
     // The Items window has two panes: the item list and the sort-options box.
-    // Route keys to the sort box while it holds focus (PageDown toggles it,
-    // NavLeft / NavCancel returns to the list) and otherwise fall through to the
+    // Route keys to the sort box while it holds focus (ToggleEngage — FFXI's
+    // window-change key, F in the compact presets — toggles it, NavLeft /
+    // NavCancel returns to the list) and otherwise fall through to the
     // list navigation below. NavLeft/NavRight step along the bag tab strip.
     if matches!(kind, MenuKind::Items) {
         use ffxi_viewer_core::hud::item_detail::{apply_sort_option, SORT_OPTIONS};
         if item_menu_focus.sort_focused {
-            if bindings.matches_logical(Action::PageDown, key) {
+            if bindings.matches_logical(Action::ToggleEngage, key) {
                 item_menu_focus.sort_focused = false;
                 return None;
             }
@@ -2612,7 +2613,7 @@ fn handle_menu_key(
             }
             // Swallow any other key so it can't leak into list navigation.
             return None;
-        } else if bindings.matches_logical(Action::PageDown, key) {
+        } else if bindings.matches_logical(Action::ToggleEngage, key) {
             item_menu_focus.sort_focused = true;
             item_menu_focus.sort_cursor = if sort_options.auto { 0 } else { 1 };
             return None;

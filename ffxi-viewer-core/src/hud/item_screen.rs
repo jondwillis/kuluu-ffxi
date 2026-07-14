@@ -405,6 +405,7 @@ pub(crate) fn update_item_screen(
     state: Res<SceneState>,
     dynamic: Res<DynamicMenu>,
     sort: Res<SortOptions>,
+    bindings: Res<crate::keybinds::Bindings>,
     mut active_bag: ResMut<ItemScreenContainer>,
     mut focus: ResMut<ItemMenuFocus>,
     dat_root: Res<ItemDatRoot>,
@@ -483,6 +484,12 @@ pub(crate) fn update_item_screen(
         .map(|c| (c.items.len(), c.capacity))
         .unwrap_or((0, 0));
     let header = format!("{bag_name}  {used}/{capacity}");
+    // Sort-pane hint follows whatever key ToggleEngage (FFXI's window-change
+    // key) is currently bound to, rather than a hard-coded key name.
+    let sort_title = match bindings.key_label(crate::keybinds::Action::ToggleEngage) {
+        Some(label) => format!("Sort  [{label}]"),
+        None => "Sort".to_string(),
+    };
 
     for (row, mut node) in listrow_q.iter_mut() {
         let list_idx = start + row.0;
@@ -507,6 +514,7 @@ pub(crate) fn update_item_screen(
             &header,
             &detail_name,
             &detail_rows,
+            &sort_title,
             &sort,
             &focus,
         );
@@ -568,6 +576,7 @@ fn role_value(
     header: &str,
     detail_name: &str,
     detail_rows: &[String],
+    sort_title: &str,
     sort: &SortOptions,
     focus: &ItemMenuFocus,
 ) -> (String, Color, bool) {
@@ -601,7 +610,7 @@ fn role_value(
             Some(line) => (line.clone(), theme::TEXT, true),
             None => (String::new(), theme::TEXT, false),
         },
-        ItemRole::SortTitle => ("Sort  [PgDn]".to_string(), theme::TITLE, true),
+        ItemRole::SortTitle => (sort_title.to_string(), theme::TITLE, true),
         ItemRole::SortRow(i) => match SORT_OPTIONS.get(i).copied() {
             Some(id) => {
                 let active = match id {

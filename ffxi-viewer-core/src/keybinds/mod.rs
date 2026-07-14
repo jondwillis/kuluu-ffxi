@@ -225,6 +225,17 @@ impl Bindings {
         }
         nav_keycode_for(key) == Some(b.key)
     }
+
+    /// Short display name for the key bound to `action`, for UI hints like
+    /// "Sort  [F]". Falls back to `None` when the action is unbound or the
+    /// bound key has no label yet.
+    pub fn key_label(&self, action: Action) -> Option<&'static str> {
+        let b = self.map.get(&action)?;
+        if b.mods != Modifiers::NONE {
+            return None;
+        }
+        keycode_label(b.key)
+    }
 }
 
 fn nav_keycode_for(key: &Key) -> Option<KeyCode> {
@@ -242,8 +253,103 @@ fn nav_keycode_for(key: &Key) -> Option<KeyCode> {
         Key::PageDown => Some(KeyCode::PageDown),
         Key::Home => Some(KeyCode::Home),
         Key::End => Some(KeyCode::End),
+        // Letter keys arrive as printable characters in logical key events.
+        // Resolve single ASCII letters so letter-bound actions (e.g. the
+        // window-change key, F in the compact presets) work inside menus.
+        // Other printable characters stay unmapped on purpose: symbol-bound
+        // actions like OpenMenu ("-") must not fire from text-like input.
+        Key::Character(s) => {
+            let mut chars = s.chars();
+            let (Some(c), None) = (chars.next(), chars.next()) else {
+                return None;
+            };
+            letter_keycode(c.to_ascii_uppercase())
+        }
         _ => None,
     }
+}
+
+fn letter_keycode(c: char) -> Option<KeyCode> {
+    Some(match c {
+        'A' => KeyCode::KeyA,
+        'B' => KeyCode::KeyB,
+        'C' => KeyCode::KeyC,
+        'D' => KeyCode::KeyD,
+        'E' => KeyCode::KeyE,
+        'F' => KeyCode::KeyF,
+        'G' => KeyCode::KeyG,
+        'H' => KeyCode::KeyH,
+        'I' => KeyCode::KeyI,
+        'J' => KeyCode::KeyJ,
+        'K' => KeyCode::KeyK,
+        'L' => KeyCode::KeyL,
+        'M' => KeyCode::KeyM,
+        'N' => KeyCode::KeyN,
+        'O' => KeyCode::KeyO,
+        'P' => KeyCode::KeyP,
+        'Q' => KeyCode::KeyQ,
+        'R' => KeyCode::KeyR,
+        'S' => KeyCode::KeyS,
+        'T' => KeyCode::KeyT,
+        'U' => KeyCode::KeyU,
+        'V' => KeyCode::KeyV,
+        'W' => KeyCode::KeyW,
+        'X' => KeyCode::KeyX,
+        'Y' => KeyCode::KeyY,
+        'Z' => KeyCode::KeyZ,
+        _ => return None,
+    })
+}
+
+fn keycode_label(key: KeyCode) -> Option<&'static str> {
+    Some(match key {
+        KeyCode::KeyA => "A",
+        KeyCode::KeyB => "B",
+        KeyCode::KeyC => "C",
+        KeyCode::KeyD => "D",
+        KeyCode::KeyE => "E",
+        KeyCode::KeyF => "F",
+        KeyCode::KeyG => "G",
+        KeyCode::KeyH => "H",
+        KeyCode::KeyI => "I",
+        KeyCode::KeyJ => "J",
+        KeyCode::KeyK => "K",
+        KeyCode::KeyL => "L",
+        KeyCode::KeyM => "M",
+        KeyCode::KeyN => "N",
+        KeyCode::KeyO => "O",
+        KeyCode::KeyP => "P",
+        KeyCode::KeyQ => "Q",
+        KeyCode::KeyR => "R",
+        KeyCode::KeyS => "S",
+        KeyCode::KeyT => "T",
+        KeyCode::KeyU => "U",
+        KeyCode::KeyV => "V",
+        KeyCode::KeyW => "W",
+        KeyCode::KeyX => "X",
+        KeyCode::KeyY => "Y",
+        KeyCode::KeyZ => "Z",
+        KeyCode::Enter => "Enter",
+        KeyCode::Escape => "Esc",
+        KeyCode::Backspace => "Bksp",
+        KeyCode::Tab => "Tab",
+        KeyCode::Space => "Space",
+        KeyCode::ArrowUp => "Up",
+        KeyCode::ArrowDown => "Down",
+        KeyCode::ArrowLeft => "Left",
+        KeyCode::ArrowRight => "Right",
+        KeyCode::PageUp => "PgUp",
+        KeyCode::PageDown => "PgDn",
+        KeyCode::Home => "Home",
+        KeyCode::End => "End",
+        KeyCode::Insert => "Ins",
+        KeyCode::Delete => "Del",
+        KeyCode::Minus => "-",
+        KeyCode::Slash => "/",
+        KeyCode::Period => ".",
+        KeyCode::Comma => ",",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -321,6 +427,29 @@ mod tests {
         let mut b = Bindings::empty();
         b.insert(Action::OpenMenu, KeyBind::new(KeyCode::Minus));
         assert!(!b.matches_logical(Action::OpenMenu, &Key::Character("-".into())));
+    }
+
+    #[test]
+    fn matches_logical_resolves_letter_chars() {
+        let mut b = Bindings::empty();
+        b.insert(Action::ToggleEngage, KeyBind::new(KeyCode::KeyF));
+
+        assert!(b.matches_logical(Action::ToggleEngage, &Key::Character("f".into())));
+        assert!(b.matches_logical(Action::ToggleEngage, &Key::Character("F".into())));
+
+        assert!(!b.matches_logical(Action::ToggleEngage, &Key::Character("g".into())));
+        assert!(!b.matches_logical(Action::ToggleEngage, &Key::Character("ff".into())));
+    }
+
+    #[test]
+    fn key_label_reports_bound_key() {
+        let mut b = Bindings::empty();
+        b.insert(Action::ToggleEngage, KeyBind::new(KeyCode::KeyF));
+        b.insert(Action::PageDown, KeyBind::new(KeyCode::PageDown));
+
+        assert_eq!(b.key_label(Action::ToggleEngage), Some("F"));
+        assert_eq!(b.key_label(Action::PageDown), Some("PgDn"));
+        assert_eq!(b.key_label(Action::PageUp), None);
     }
 
     #[test]
