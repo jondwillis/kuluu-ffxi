@@ -38,8 +38,9 @@ pub fn compose_item_detail(
     dat: Option<ItemStatic>,
 ) -> ItemDetail {
     let quantity = snapshot
-        .inventory_main
+        .containers
         .iter()
+        .flat_map(|c| c.items.iter())
         .filter(|s| s.item_no == item_no)
         .map(|s| s.quantity)
         .sum();

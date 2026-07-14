@@ -71,6 +71,8 @@ pub struct SlashWriters<'w, 's> {
 
     pub item_menu_focus: ResMut<'w, ffxi_viewer_core::hud::item_detail::ItemMenuFocus>,
 
+    pub item_screen_container: ResMut<'w, ffxi_viewer_core::hud::item_screen::ItemScreenContainer>,
+
     pub check_target: ResMut<'w, ffxi_viewer_core::hud::check_view::CheckTarget>,
 
     pub trade_state: ResMut<'w, ffxi_viewer_core::hud::trade::TradeState>,
@@ -86,6 +88,7 @@ pub struct MenuConfirmWriters<'w> {
     pub status_profile_open: ResMut<'w, ffxi_viewer_core::hud::status_panel::StatusProfileOpen>,
     pub hud_panels: ResMut<'w, ffxi_viewer_core::hud::HudPanels>,
     pub net_status: ResMut<'w, ffxi_viewer_core::hud::network_status::NetStatusVisible>,
+    pub item_screen_container: ResMut<'w, ffxi_viewer_core::hud::item_screen::ItemScreenContainer>,
 }
 use tokio::sync::mpsc::Sender;
 
@@ -238,6 +241,7 @@ pub fn text_input_system(
                     &mut slash_writers.net_status_visible,
                     &mut slash_writers.sort_options,
                     &mut slash_writers.item_menu_focus,
+                    &mut slash_writers.item_screen_container,
                     &dynamic_menu,
                     current_target,
                     self_pos,
@@ -265,6 +269,7 @@ pub fn text_input_system(
                     cursor,
                     &mut scene_state,
                     &cmd_tx.0,
+                    &mut slash_writers.item_screen_container,
                 ) {
                     *mode = next;
                 }
@@ -1580,6 +1585,9 @@ fn apply_slash_outcome(
                 ffxi_viewer_core::MenuKind::Graphics => "Graphics".into(),
                 ffxi_viewer_core::MenuKind::Status => "Status".into(),
 
+                ffxi_viewer_core::MenuKind::ItemAction { item_no, .. } => {
+                    format!("ItemAction({item_no})").into()
+                }
                 ffxi_viewer_core::MenuKind::EquipSlot(slot) => format!("EquipSlot({slot})").into(),
             };
             push_system_chat_line(scene_state, format!("[menu] opened {label}"));
@@ -2062,6 +2070,21 @@ fn confirm_menu_at_cursor(
 
     if ffxi_viewer_core::hud::menu::is_dynamic(kind) {
         if let Some(action) = ffxi_viewer_core::hud::menu::entry_action(kind, cursor, dynamic) {
+            use ffxi_viewer_core::hud::menu::DynamicMenuAction as A;
+            if let A::OpenItemAction {
+                container,
+                index,
+                item_no,
+            } = action
+            {
+                stack.push(MenuKind::ItemAction {
+                    container,
+                    index,
+                    item_no,
+                });
+                return None;
+            }
+            let moved = matches!(action, A::MoveItem { .. });
             let entities = scene_state.snapshot.entities.clone();
             dispatch_dynamic_menu_action(
                 action,
@@ -2072,9 +2095,14 @@ fn confirm_menu_at_cursor(
                 scene_state,
             );
             // Retail keeps the equip list up after a gear change so the player
-            // can keep swapping (or re-select to unequip); only the one-shot
-            // action menus (Magic/Abilities/Items) close back to the world.
+            // can keep swapping (or re-select to unequip), and keeps the bag
+            // open after moving an item so a sort/move session flows; the
+            // one-shot action menus (Magic/Abilities/item Use) close back to
+            // the world.
             return if matches!(kind, MenuKind::EquipSlot(_)) {
+                None
+            } else if moved {
+                stack.pop();
                 None
             } else {
                 Some(InputMode::World)
@@ -2270,6 +2298,24 @@ fn dispatch_dynamic_menu_action(
                 },
             )
         }
+        A::MoveItem {
+            quantity,
+            from_container,
+            from_slot,
+            to_container,
+            item_no: _,
+        } => (
+            "moveitem",
+            AgentCommand::MoveItem {
+                quantity,
+                from_container,
+                to_container,
+                from_slot,
+                to_slot: None,
+            },
+        ),
+        // Pushed as a submenu by confirm_menu_at_cursor, never dispatched.
+        A::OpenItemAction { .. } => return,
         A::EquipItem {
             container,
             container_index,
@@ -2314,8 +2360,17 @@ fn dispatch_dynamic_menu_action(
     }
 }
 
-fn confirm_dialog_choice(choice: u32, scene_state: &mut SceneState, cmd_tx: &Sender<AgentCommand>) {
+/// Sends the choice to the session; returns the container to browse when the
+/// choice was a Mog Menu storage row (the session closes the menu from the same
+/// choice, the viewer opens its Items window on the bag).
+fn confirm_dialog_choice(
+    choice: u32,
+    scene_state: &mut SceneState,
+    cmd_tx: &Sender<AgentCommand>,
+) -> Option<u8> {
+    let mut open_storage = None;
     if let Some(d) = scene_state.snapshot.dialog.as_ref() {
+        open_storage = mog_menu_storage_choice(d, choice);
         // EVENT_END validates against the event id, which the trigger carries in
         // EventPara (event_num is the zone) — see event_trigger_ids in session.rs.
         let _ = cmd_tx.try_send(AgentCommand::EndEventChoice {
@@ -2325,6 +2380,32 @@ fn confirm_dialog_choice(choice: u32, scene_state: &mut SceneState, cmd_tx: &Sen
             choice,
         });
     }
+    open_storage
+}
+
+fn mog_menu_storage_choice(d: &ffxi_viewer_wire::DialogState, choice: u32) -> Option<u8> {
+    use ffxi_client::local_menu::{MOG_LOCKER_ROW, MOG_MENU_ID, MOG_SAFE_ROW, STORAGE_ROW};
+    use ffxi_proto::map::container as c;
+    if d.npc_id != MOG_MENU_ID {
+        return None;
+    }
+    match d.choices.get(choice as usize)?.as_str() {
+        MOG_SAFE_ROW => Some(c::LOC_MOGSAFE),
+        STORAGE_ROW => Some(c::LOC_STORAGE),
+        MOG_LOCKER_ROW => Some(c::LOC_MOGLOCKER),
+        _ => None,
+    }
+}
+
+/// The Items window opened directly on `container` (from a Mog Menu storage row).
+fn open_items_on_bag(
+    container: u8,
+    item_bag: &mut ffxi_viewer_core::hud::item_screen::ItemScreenContainer,
+) -> InputMode {
+    item_bag.0 = container;
+    let mut stack = MenuStack::root();
+    stack.push(MenuKind::Items);
+    InputMode::Menu(stack)
 }
 
 fn confirm_quick_action_at_cursor(
@@ -2408,7 +2489,9 @@ pub fn mouse_nav_dispatch_system(
     for ev in dialog_events.read() {
         if let InputMode::Dialog(cursor) = &mut *mode {
             cursor.cursor = ev.choice;
-            confirm_dialog_choice(ev.choice, &mut scene_state, &cmd_tx.0);
+            if let Some(container) = confirm_dialog_choice(ev.choice, &mut scene_state, &cmd_tx.0) {
+                *mode = open_items_on_bag(container, &mut menu_writers.item_screen_container);
+            }
         }
     }
 
@@ -2474,6 +2557,7 @@ fn handle_menu_key(
     net_status: &mut ffxi_viewer_core::hud::network_status::NetStatusVisible,
     sort_options: &mut ffxi_viewer_core::hud::item_detail::SortOptions,
     item_menu_focus: &mut ffxi_viewer_core::hud::item_detail::ItemMenuFocus,
+    item_bag: &mut ffxi_viewer_core::hud::item_screen::ItemScreenContainer,
     dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
     target_id: Option<u32>,
     self_pos: ffxi_viewer_wire::Vec3,
@@ -2527,6 +2611,17 @@ fn handle_menu_key(
         } else if bindings.matches_logical(Action::NavRight, key) {
             item_menu_focus.sort_focused = true;
             item_menu_focus.sort_cursor = if sort_options.auto { 0 } else { 1 };
+            return None;
+        } else if bindings.matches_logical(Action::NavLeft, key) {
+            // Retail flips bags with left/right in the item window; the sort
+            // box owns NavRight here, so NavLeft cycles (header click too).
+            if ffxi_viewer_core::hud::item_screen::cycle_container(&scene_state.snapshot, item_bag)
+                .is_some()
+            {
+                if let Some(level) = stack.current_mut() {
+                    level.cursor = 0;
+                }
+            }
             return None;
         }
     }
@@ -2615,6 +2710,7 @@ fn handle_dialog_key(
     cursor: &mut DialogCursor,
     scene_state: &mut SceneState,
     cmd_tx: &Sender<AgentCommand>,
+    item_bag: &mut ffxi_viewer_core::hud::item_screen::ItemScreenContainer,
 ) -> Option<InputMode> {
     // Plain speech (no choices) clamps to 0 and still confirms/advances on Enter.
     let max_index = scene_state
@@ -2638,7 +2734,11 @@ fn handle_dialog_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        confirm_dialog_choice(cursor.cursor.min(max_index), scene_state, cmd_tx);
+        if let Some(container) =
+            confirm_dialog_choice(cursor.cursor.min(max_index), scene_state, cmd_tx)
+        {
+            return Some(open_items_on_bag(container, item_bag));
+        }
         return None;
     }
     if bindings.matches_logical(Action::NavCancel, key) {

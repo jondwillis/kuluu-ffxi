@@ -1357,23 +1357,37 @@ impl PetSync {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ItemMax {
-    pub capacities: [u16; 18],
+    pub capacities: [u16; Self::CONTAINER_COUNT],
 }
 
 impl ItemMax {
+    /// One capacity per LSB CONTAINER_ID (LOC_INVENTORY..=LOC_RECYCLEBIN),
+    /// vendor/server/src/map/item_container.h:32-49.
+    pub const CONTAINER_COUNT: usize = 18;
     pub const SIZE: usize = 96;
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
         if body.len() < Self::SIZE {
             return Err(DecodeError::Truncated(Self::SIZE, body.len()));
         }
-        let mut capacities = [0u16; 18];
+        let mut capacities = [0u16; Self::CONTAINER_COUNT];
+        // Fall back to the legacy u8 array only when the whole wide array is
+        // absent (pre-widening servers). A per-slot fallback would erase LSB's
+        // "container disabled" sentinel — ItemNum2 = 0 while the legacy byte
+        // stays sized, e.g. a lapsed Mog Locker lease
+        // (vendor/server/src/map/packets/s2c/0x01c_item_max.cpp:52-57).
+        let wide_at = |i: usize| {
+            let off = 18 + 14 + i * 2;
+            u16::from_le_bytes(body[off..off + 2].try_into().unwrap())
+        };
+        let wide_present = (0..Self::CONTAINER_COUNT).any(|i| wide_at(i) != 0);
         for (i, cap) in capacities.iter_mut().enumerate() {
-            let legacy = body[i] as u16;
-            let wide_off = 18 + 14 + i * 2;
-            let wide = u16::from_le_bytes(body[wide_off..wide_off + 2].try_into().unwrap());
-            let raw = if wide != 0 { wide } else { legacy };
+            let raw = if wide_present {
+                wide_at(i)
+            } else {
+                body[i] as u16
+            };
             *cap = raw.saturating_sub(1);
         }
         Ok(Self { capacities })
@@ -2205,10 +2219,6 @@ mod tests {
 
         let m = ItemMax::decode(&buf).unwrap();
         assert_eq!(
-            m.capacities[0], 80,
-            "Inventory: legacy fallback, +1 inverted"
-        );
-        assert_eq!(
             m.capacities[1], 200,
             "Mog Safe: wide takes precedence, +1 inverted"
         );
@@ -2219,13 +2229,33 @@ mod tests {
         );
     }
 
+    /// LSB's only ItemNum2 = 0 emitter is a DISABLED container (a lapsed Mog
+    /// Locker lease keeps its legacy byte sized), so once any wide value is
+    /// present a zero must stay zero rather than fall back per-slot
+    /// (vendor/server/src/map/packets/s2c/0x01c_item_max.cpp:52-57).
     #[test]
-    fn item_max_disabled_container_stays_zero() {
+    fn item_max_wide_zero_is_the_disable_sentinel_not_a_fallback() {
+        let mut buf = vec![0u8; ItemMax::SIZE];
+        buf[0] = 31;
+        buf[4] = 31; // lapsed locker: legacy still sized...
+        let wide_off = 18 + 14;
+        buf[wide_off..wide_off + 2].copy_from_slice(&31u16.to_le_bytes());
+        // ...but ItemNum2[LOC_MOGLOCKER] stays 0.
+
+        let m = ItemMax::decode(&buf).unwrap();
+        assert_eq!(m.capacities[0], 30);
+        assert_eq!(m.capacities[4], 0, "wide 0 = disabled, no legacy fallback");
+    }
+
+    #[test]
+    fn item_max_falls_back_to_legacy_only_when_wide_is_absent() {
         let mut buf = vec![0u8; ItemMax::SIZE];
 
+        buf[0] = 81;
         buf[4] = 21;
 
         let m = ItemMax::decode(&buf).unwrap();
+        assert_eq!(m.capacities[0], 80, "pre-widening server: legacy decoded");
         assert_eq!(m.capacities[4], 20, "moglocker: legacy decoded with -1");
         assert_eq!(
             m.capacities[1], 0,

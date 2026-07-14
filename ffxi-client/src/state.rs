@@ -859,10 +859,11 @@ impl SessionState {
                 let entry = self.inventory.containers.entry(*container).or_default();
                 match update {
                     InventoryUpdate::Capacities { capacities } => {
+                        // Zeros apply too: 0 is LSB's "container disabled"
+                        // sentinel (e.g. an expired Mog Locker lease across a
+                        // zone change) — sticky grants would keep offering a
+                        // bag the server rejects (s2c/0x01c_item_max.cpp:52).
                         for (id, cap) in capacities.iter().enumerate() {
-                            if *cap == 0 {
-                                continue;
-                            }
                             self.inventory
                                 .containers
                                 .entry(id as u8)
@@ -1382,6 +1383,19 @@ pub enum AgentCommand {
     /// (LOC_INVENTORY = 0). See GP_CLI_COMMAND_ITEM_STACK (0x03A).
     StackInventory {
         container: u8,
+    },
+
+    /// Move `quantity` of the item at `from_container`/`from_slot` into
+    /// `to_container` via c2s 0x029 ITEM_MOVE. `to_slot: None` lets the server
+    /// pick a free slot; `Some(slot)` requests a same-id stack merge, which the
+    /// server honors only when the FULL stack moves — a partial quantity always
+    /// splits into a server-picked slot (0x029_item_move.cpp process).
+    MoveItem {
+        quantity: u32,
+        from_container: u8,
+        to_container: u8,
+        from_slot: u8,
+        to_slot: Option<u8>,
     },
 
     BankWhenFull {
@@ -2713,9 +2727,18 @@ mod tests {
         assert_eq!(s.inventory.containers[&0].capacity, 80);
         assert_eq!(s.inventory.containers[&1].capacity, 200);
         assert_eq!(s.inventory.containers[&5].capacity, 30);
-        assert!(
-            !s.inventory.containers.contains_key(&7),
-            "zero-capacity entries skipped"
+
+        // A later 0 must land too — it is LSB's "container disabled" sentinel
+        // (e.g. a lapsed Mog Locker lease), not an absence of data.
+        let mut caps = vec![0u16; 18];
+        caps[0] = 80;
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container: 0,
+            update: InventoryUpdate::Capacities { capacities: caps },
+        });
+        assert_eq!(
+            s.inventory.containers[&5].capacity, 0,
+            "capacity grants must not be sticky"
         );
     }
 

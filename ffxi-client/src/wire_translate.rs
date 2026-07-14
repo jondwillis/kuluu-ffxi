@@ -51,7 +51,7 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         weaponskills_known: s.weaponskills_known.clone(),
         pet_abilities_known: s.pet_abilities_known.clone(),
 
-        inventory_main: project_inventory_main(s),
+        containers: project_containers(s),
 
         stats: s.char_stats.map(char_stats_to_wire),
         bazaar: Vec::new(),
@@ -71,22 +71,35 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
             model: m.model,
             sub_map: m.sub_map,
         }),
+
+        mh_2f_unlocked: s.mh_2f_unlocked,
     }
 }
 
-fn project_inventory_main(s: &SessionState) -> Vec<wire::InventoryItem> {
-    let Some(bag) = s.inventory.containers.get(&0) else {
-        return Vec::new();
-    };
-    bag.slots
+fn project_containers(s: &SessionState) -> Vec<wire::ContainerView> {
+    let mut out: Vec<wire::ContainerView> = s
+        .inventory
+        .containers
         .iter()
-        .map(|slot| wire::InventoryItem {
-            container: 0,
-            index: slot.index,
-            item_no: slot.item_no,
-            quantity: slot.quantity,
+        .filter(|(_, c)| c.capacity > 0 || !c.slots.is_empty())
+        .map(|(&id, c)| wire::ContainerView {
+            id,
+            capacity: c.capacity as u16,
+            items: c
+                .slots
+                .iter()
+                .map(|slot| wire::InventoryItem {
+                    container: id,
+                    index: slot.index,
+                    item_no: slot.item_no,
+                    quantity: slot.quantity,
+                    locked: slot.locked,
+                })
+                .collect(),
         })
-        .collect()
+        .collect();
+    out.sort_by_key(|c| c.id);
+    out
 }
 
 fn resolve_equipment(s: &SessionState) -> [Option<u16>; 16] {
@@ -424,6 +437,46 @@ pub fn reconnect_to_wire(r: &ReconnectInfo) -> wire::ReconnectInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every populated container crosses the wire (sorted by id, real
+    /// capacities), not just the main bag — the Mog House storage UI reads them.
+    #[test]
+    fn containers_project_sorted_with_capacities() {
+        use crate::state::{ContainerInfo, ItemSlot};
+        let mut s = SessionState::default();
+        for (id, capacity, items) in [(4u8, 30u8, 1usize), (0, 30, 2), (1, 60, 0)] {
+            let slots = (0..items)
+                .map(|i| ItemSlot {
+                    index: i as u8 + 1,
+                    item_no: 4509,
+                    quantity: 3,
+                    locked: false,
+                    price: 0,
+                })
+                .collect();
+            s.inventory
+                .containers
+                .insert(id, ContainerInfo { capacity, slots });
+        }
+        // Capacity 0 and empty = never granted; stays off the wire.
+        s.inventory.containers.insert(
+            9,
+            ContainerInfo {
+                capacity: 0,
+                slots: Vec::new(),
+            },
+        );
+
+        let out = project_containers(&s);
+        assert_eq!(
+            out.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![0, 1, 4],
+            "sorted by container id, capacity-0 bag dropped"
+        );
+        assert_eq!(out[1].capacity, 60);
+        assert_eq!(out[0].items.len(), 2);
+        assert_eq!(out[2].items[0].container, 4, "items tag their source bag");
+    }
 
     #[test]
     fn goal_to_wire_covers_all_variants() {

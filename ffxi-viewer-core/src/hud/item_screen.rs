@@ -15,11 +15,82 @@ const ROW_ICON_PX: f32 = 18.0;
 
 const DETAIL_ICON_PX: f32 = 32.0;
 
-const MAIN_BAG_CAPACITY: u32 = 80;
-
 const LIST_WIDTH_PX: f32 = 240.0;
 
 const SORT_WIDTH_PX: f32 = 132.0;
+
+/// The bag the Items window shows, an LSB CONTAINER_ID. Set by the Mog Menu
+/// storage rows and cycled from the window itself.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ItemScreenContainer(pub u8);
+
+/// Retail's bag-flip order in the item window.
+pub const BAG_DISPLAY_ORDER: &[u8] = {
+    use ffxi_proto::map::container as c;
+    &[
+        c::LOC_INVENTORY,
+        c::LOC_MOGSAFE,
+        c::LOC_MOGSAFE2,
+        c::LOC_STORAGE,
+        c::LOC_MOGLOCKER,
+        c::LOC_MOGSATCHEL,
+        c::LOC_MOGSACK,
+        c::LOC_MOGCASE,
+        c::LOC_WARDROBE,
+        c::LOC_WARDROBE2,
+        c::LOC_WARDROBE3,
+        c::LOC_WARDROBE4,
+        c::LOC_WARDROBE5,
+        c::LOC_WARDROBE6,
+        c::LOC_WARDROBE7,
+        c::LOC_WARDROBE8,
+        c::LOC_TEMPITEMS,
+    ]
+};
+
+/// Whether `id` is browsable right now. Mirrors LSB's 0x029 validContainers
+/// (vendor/server/src/map/packets/c2s/0x029_item_move.cpp): Safe/Safe 2F/
+/// Storage/Locker only inside your own Mog House, everything else whenever the
+/// server granted it capacity. Temporary items are server-managed (never a
+/// move destination) but stay viewable.
+pub fn container_accessible(snap: &ffxi_viewer_wire::SceneSnapshot, id: u8) -> bool {
+    use ffxi_proto::map::container as c;
+    let granted = snap.container(id).is_some_and(|v| v.capacity > 0);
+    let mh_only = matches!(
+        id,
+        c::LOC_MOGSAFE | c::LOC_MOGSAFE2 | c::LOC_STORAGE | c::LOC_MOGLOCKER
+    );
+    // Safe 2F additionally needs profile.mhflag & 0x20 server-side; the server
+    // streams its capacity regardless, so capacity alone over-offers it.
+    let flag_ok = id != c::LOC_MOGSAFE2 || snap.mh_2f_unlocked == Some(true);
+    granted && flag_ok && (!mh_only || snap.myroom.is_some())
+}
+
+/// The bags the window can flip through, in display order.
+pub fn accessible_containers(snap: &ffxi_viewer_wire::SceneSnapshot) -> Vec<u8> {
+    BAG_DISPLAY_ORDER
+        .iter()
+        .copied()
+        .filter(|&id| {
+            id == ffxi_proto::map::container::LOC_INVENTORY || container_accessible(snap, id)
+        })
+        .collect()
+}
+
+/// Advance the shown bag to the next accessible one (wrapping), returning the
+/// new id when it changed.
+pub fn cycle_container(
+    snap: &ffxi_viewer_wire::SceneSnapshot,
+    active: &mut ItemScreenContainer,
+) -> Option<u8> {
+    let bags = accessible_containers(snap);
+    let pos = bags.iter().position(|&id| id == active.0).unwrap_or(0);
+    let next = bags[(pos + 1) % bags.len()];
+    (next != active.0).then(|| {
+        active.0 = next;
+        next
+    })
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ItemRole {
@@ -80,7 +151,7 @@ pub fn viewport_start(cursor: usize, total: usize) -> usize {
 
 fn row_item_no(rows: &[crate::hud::menu::DynamicMenuRow], idx: usize) -> Option<u16> {
     match rows.get(idx)?.action {
-        DynamicMenuAction::UseItem { item_no, .. } => Some(item_no),
+        DynamicMenuAction::OpenItemAction { item_no, .. } => Some(item_no),
         _ => None,
     }
 }
@@ -128,7 +199,13 @@ fn spawn_list_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) {
     let (mut n, bg, bd) = framed_box();
     n.width = Val::Px(LIST_WIDTH_PX);
     col.spawn((n, bg, bd)).with_children(|p| {
-        spawn_text(p, ItemRole::ListHeader, 14.0, theme::TITLE);
+        p.spawn((
+            ItemText(ItemRole::ListHeader),
+            Button,
+            Text::new(""),
+            text_font(14.0),
+            TextColor(theme::TITLE),
+        ));
         p.spawn(Node {
             flex_direction: FlexDirection::Column,
             row_gap: Val::Px(2.0),
@@ -250,6 +327,7 @@ pub(crate) fn update_item_screen(
     state: Res<SceneState>,
     dynamic: Res<DynamicMenu>,
     sort: Res<SortOptions>,
+    mut active_bag: ResMut<ItemScreenContainer>,
     mut focus: ResMut<ItemMenuFocus>,
     dat_root: Res<ItemDatRoot>,
     mut icon_cache: ResMut<ItemIconCache>,
@@ -304,6 +382,15 @@ pub(crate) fn update_item_screen(
     }
 
     let snap = &state.snapshot;
+
+    // Leaving the Mog House (or losing a bag) snaps the view back to the
+    // inventory rather than showing a bag the server would reject.
+    if active_bag.0 != ffxi_proto::map::container::LOC_INVENTORY
+        && !container_accessible(snap, active_bag.0)
+    {
+        active_bag.0 = ffxi_proto::map::container::LOC_INVENTORY;
+    }
+
     let rows = &dynamic.rows;
     let total = rows.len();
     let cursor = items_cursor(&mode);
@@ -312,7 +399,16 @@ pub(crate) fn update_item_screen(
     let focused_item = item_detail::selected_item_no(&mode, &dynamic);
     let (detail_name, detail_rows) =
         item_ui::focus_detail(focused_item, snap, &dat_root, &mut icon_cache);
-    let header = format!("Items  {}/{}", snap.inventory_main.len(), MAIN_BAG_CAPACITY);
+    let bag_name = ffxi_proto::map::container::name(active_bag.0).unwrap_or("Items");
+    let (used, capacity) = snap
+        .container(active_bag.0)
+        .map(|c| (c.items.len(), c.capacity))
+        .unwrap_or((0, 0));
+    let bag_count = accessible_containers(snap).len();
+    // The ◀ ▶ affordance appears once another bag is reachable (header click /
+    // NavLeft cycles).
+    let flip = if bag_count > 1 { "  ◀▶" } else { "" };
+    let header = format!("{bag_name}  {used}/{capacity}{flip}");
 
     for (row, mut node) in listrow_q.iter_mut() {
         let list_idx = start + row.0;
@@ -518,6 +614,31 @@ pub(crate) fn item_row_mouse_click_system(
         let list_idx = start + row.0;
         if list_idx < total {
             out.write(MenuRowActivated { slot: list_idx });
+        }
+    }
+}
+
+/// Clicking the list header flips to the next accessible bag (the keyboard
+/// path is NavLeft in the list pane).
+pub(crate) fn bag_header_mouse_system(
+    mut mode: ResMut<InputMode>,
+    state: Res<SceneState>,
+    mut active_bag: ResMut<ItemScreenContainer>,
+    rows: Query<(&Interaction, &ItemText), Changed<Interaction>>,
+) {
+    if !items_open(&mode) {
+        return;
+    }
+    for (interaction, tag) in &rows {
+        if !matches!(tag.0, ItemRole::ListHeader) || *interaction != Interaction::Pressed {
+            continue;
+        }
+        if cycle_container(&state.snapshot, &mut active_bag).is_some() {
+            if let InputMode::Menu(stack) = &mut *mode {
+                if let Some(level) = stack.current_mut() {
+                    level.cursor = 0;
+                }
+            }
         }
     }
 }

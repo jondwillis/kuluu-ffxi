@@ -62,6 +62,9 @@ struct SelfMogState {
     in_myroom: bool,
     mh_2f_unlocked: Option<bool>,
     job_info: Option<crate::state::JobInfoState>,
+    /// Per-container capacities from the last 0x01C ITEM_MAX, indexed by LSB
+    /// CONTAINER_ID; gates which storage rows the Mog Menu offers.
+    container_caps: Option<[u16; decode::ItemMax::CONTAINER_COUNT]>,
     /// Cutscene embedded in the last 0x00A LOGIN ([`decode::ZoneInEvent`]);
     /// consumed by the keepalive loop, which must answer it with 0x05B.
     zone_in_event: Option<decode::ZoneInEvent>,
@@ -1096,6 +1099,7 @@ fn handle_sub_packet(
                         server_ts: 0,
                     },
                 });
+                mog.container_caps = Some(m.capacities);
                 let _ = event_tx.send(AgentEvent::InventoryUpdated {
                     container: 0,
                     update: InventoryUpdate::Capacities {
@@ -1568,6 +1572,22 @@ async fn keepalive_loop(
                                     )
                                     .await;
                                 }
+                                // Storage bags are browsed client-side (the server
+                                // already streamed every container); the native
+                                // viewer opens its Items window from the same choice.
+                                crate::local_menu::Advance::OpenStorage { container } => {
+                                    let _ = event_tx.send(AgentEvent::EventEnded);
+                                    let name = ffxi_proto::map::container::name(container)
+                                        .unwrap_or("storage");
+                                    let _ = event_tx.send(AgentEvent::ChatLine {
+                                        line: ChatLine {
+                                            channel: ChatChannel::System,
+                                            sender: "<client>".into(),
+                                            text: format!("[mog] Browsing {name}."),
+                                            server_ts: 0,
+                                        },
+                                    });
+                                }
                                 crate::local_menu::Advance::Close => {
                                     let _ = event_tx.send(AgentEvent::EventEnded);
                                 }
@@ -1888,6 +1908,32 @@ async fn keepalive_loop(
                             }
                         }
                     }
+                    Some(AgentCommand::MoveItem {
+                        quantity,
+                        from_container,
+                        to_container,
+                        from_slot,
+                        to_slot,
+                    }) => {
+                        let payload = build_subpacket_item_move(
+                            sub_seq,
+                            quantity,
+                            from_container,
+                            to_container,
+                            from_slot,
+                            to_slot,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "item_move send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("item_move send: {e}"),
+                            });
+                        }
+                    }
                     Some(AgentCommand::UseItem {
                         container,
                         slot,
@@ -1997,7 +2043,8 @@ async fn keepalive_loop(
                                     },
                                 });
                             }
-                            let dialog = local_menu.open_mog_menu(mog.job_info);
+                            let dialog = local_menu
+                                .open_mog_menu(mog.job_info, mog.container_caps.as_ref().map(|c| c.as_slice()));
                             let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                         }
                     }
@@ -2289,7 +2336,8 @@ async fn keepalive_loop(
                                 // Server events own the dialog surface; LSB also
                                 // blocks 0x05E/0x100 while InEvent.
                                 if dialog_session.active_end().is_none() {
-                                    let dialog = local_menu.open_mog_menu(mog.job_info);
+                                    let dialog = local_menu
+                                        .open_mog_menu(mog.job_info, mog.container_caps.as_ref().map(|c| c.as_slice()));
                                     let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                                 }
                                 continue;
@@ -3625,6 +3673,35 @@ pub fn build_subpacket_item_stack(sync: u16, container: u8) -> Vec<u8> {
     ));
     buf[4..8].copy_from_slice(&(container as u32).to_le_bytes());
 
+    buf
+}
+
+// GP_CLI_COMMAND_ITEM_MOVE, vendor/server/src/map/packets/c2s/0x029_item_move.h:
+// ItemNum u32 @4, Category1 u8 @8, Category2 u8 @9, ItemIndex1 u8 @10,
+// ItemIndex2 u8 @11 — 12 bytes (size_words = 3). An ItemIndex2 < 82 asks for a
+// same-id stack merge into that slot; anything larger lets the server pick a free
+// slot (0x029_item_move.cpp process), which retail requests with 0xFF.
+const ITEM_MOVE_AUTO_SLOT: u8 = 0xFF;
+
+pub fn build_subpacket_item_move(
+    sync: u16,
+    quantity: u32,
+    from_container: u8,
+    to_container: u8,
+    from_slot: u8,
+    to_slot: Option<u8>,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 12];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::ITEM_MOVE,
+        3,
+        sync,
+    ));
+    buf[4..8].copy_from_slice(&quantity.to_le_bytes());
+    buf[8] = from_container;
+    buf[9] = to_container;
+    buf[10] = from_slot;
+    buf[11] = to_slot.unwrap_or(ITEM_MOVE_AUTO_SLOT);
     buf
 }
 
@@ -5503,6 +5580,32 @@ mod tests {
 
         let buf = build_subpacket_item_stack(0, 1);
         assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn item_move_packet_layout_matches_server_struct() {
+        // GP_CLI_COMMAND_ITEM_MOVE (vendor/server/src/map/packets/c2s/0x029_item_move.h):
+        // ItemNum u32, Category1 u8, Category2 u8, ItemIndex1 u8, ItemIndex2 u8.
+        let buf = build_subpacket_item_move(0xBEEF, 12, 0, 1, 7, None);
+        assert_eq!(buf.len(), 12, "header (4) + ItemNum (4) + 4 bytes");
+        let hdr_word = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(hdr_word & 0x01FF, 0x029, "opcode = 0x029 ITEM_MOVE");
+        assert_eq!((hdr_word >> 9) & 0x7F, 3, "size_words = 3 (12 bytes)");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0xBEEF, "sync");
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            12,
+            "ItemNum = quantity"
+        );
+        assert_eq!(buf[8], 0, "Category1 = from LOC_INVENTORY");
+        assert_eq!(buf[9], 1, "Category2 = to LOC_MOGSAFE");
+        assert_eq!(buf[10], 7, "ItemIndex1 = from slot");
+        // The server treats ItemIndex2 < 82 as a stack-merge target; 0xFF asks
+        // for a free slot (0x029_item_move.cpp process).
+        assert_eq!(buf[11], 0xFF, "ItemIndex2 = auto slot");
+
+        let buf = build_subpacket_item_move(0, 1, 2, 0, 3, Some(9));
+        assert_eq!(buf[11], 9, "explicit ItemIndex2 = stack merge slot");
     }
 
     #[test]

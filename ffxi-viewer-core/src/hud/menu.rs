@@ -53,6 +53,22 @@ pub enum DynamicMenuAction {
         item_no: u16,
     },
 
+    /// c2s 0x029 ITEM_MOVE (full stack, server-picked destination slot).
+    MoveItem {
+        quantity: u32,
+        from_container: u8,
+        from_slot: u8,
+        to_container: u8,
+        item_no: u16,
+    },
+
+    /// Open the per-item context submenu for a slot.
+    OpenItemAction {
+        container: u8,
+        index: u8,
+        item_no: u16,
+    },
+
     EquipItem {
         container: u8,
         container_index: u8,
@@ -157,7 +173,11 @@ const MAX_ENTRY_COUNT: usize = {
 pub fn is_dynamic(kind: MenuKind) -> bool {
     matches!(
         kind,
-        MenuKind::Magic | MenuKind::Abilities | MenuKind::Items | MenuKind::EquipSlot(_)
+        MenuKind::Magic
+            | MenuKind::Abilities
+            | MenuKind::Items
+            | MenuKind::ItemAction { .. }
+            | MenuKind::EquipSlot(_)
     )
 }
 
@@ -201,7 +221,8 @@ fn empty_dynamic_hint(kind: MenuKind) -> &'static str {
     match kind {
         MenuKind::Magic => "(no spells learned yet)",
         MenuKind::Abilities => "(no abilities available — wrong job?)",
-        MenuKind::Items => "(inventory empty)",
+        MenuKind::Items => "(bag empty)",
+        MenuKind::ItemAction { .. } => "(item no longer in this bag)",
         MenuKind::EquipSlot(_) => "(no equippable items for this slot)",
         _ => "(empty)",
     }
@@ -222,6 +243,7 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
 
         MenuKind::Status => STATUS_LABELS,
 
+        MenuKind::ItemAction { .. } => &[],
         MenuKind::EquipSlot(_) => &["(loading equippable items…)"],
     }
 }
@@ -236,6 +258,7 @@ fn menu_title(kind: MenuKind) -> &'static str {
         MenuKind::Magic => "Magic",
         MenuKind::Abilities => "Abilities",
         MenuKind::Items => "Items",
+        MenuKind::ItemAction { .. } => "Item",
         MenuKind::Status => "Status",
         MenuKind::EquipSlot(_) => "Equip",
     }
@@ -308,6 +331,7 @@ pub fn refresh_dynamic_menu_rows(
     mode: Res<InputMode>,
     scene: Res<crate::snapshot::SceneState>,
     sort: Res<crate::hud::item_detail::SortOptions>,
+    active_bag: Res<crate::hud::item_screen::ItemScreenContainer>,
     mut dynamic: ResMut<DynamicMenu>,
 ) {
     let active_kind = match &*mode {
@@ -360,7 +384,9 @@ pub fn refresh_dynamic_menu_rows(
             out
         }
         MenuKind::Items => snap
-            .inventory_main
+            .container(active_bag.0)
+            .map(|c| c.items.as_slice())
+            .unwrap_or(&[])
             .iter()
             .filter_map(|slot| {
                 let name = ffxi_proto::item_names::lookup(slot.item_no)?;
@@ -372,7 +398,7 @@ pub fn refresh_dynamic_menu_rows(
                 };
                 Some(DynamicMenuRow {
                     label,
-                    action: DynamicMenuAction::UseItem {
+                    action: DynamicMenuAction::OpenItemAction {
                         container: slot.container,
                         index: slot.index,
                         item_no: slot.item_no,
@@ -380,13 +406,18 @@ pub fn refresh_dynamic_menu_rows(
                 })
             })
             .collect(),
+        MenuKind::ItemAction {
+            container,
+            index,
+            item_no,
+        } => item_action_rows(snap, container, index, item_no),
         MenuKind::EquipSlot(equip_slot) => {
             let (main_job, main_lv) = snap
                 .self_char_id
                 .and_then(|id| snap.party.iter().find(|m| m.id == id))
                 .map(|m| (m.main_job, m.main_job_lv))
                 .unwrap_or((0, 0));
-            snap.inventory_main
+            snap.inventory_main()
                 .iter()
                 .filter_map(|slot| {
                     let info = ffxi_proto::equip_info::lookup(slot.item_no)?;
@@ -423,13 +454,16 @@ pub fn refresh_dynamic_menu_rows(
     let mut rows = rows;
     // Retail's Items window sorts by item id when "Auto" is on (grouping usable
     // items, then weapons, then armor by their DAT id ranges) and otherwise
-    // shows raw inventory-slot order. Other dynamic menus stay alphabetical.
-    if matches!(kind, MenuKind::Items) {
-        if sort.auto {
-            rows.sort_by_key(item_row_sort_key);
+    // shows raw inventory-slot order. The item context submenu keeps its built
+    // order; other dynamic menus stay alphabetical.
+    match kind {
+        MenuKind::Items => {
+            if sort.auto {
+                rows.sort_by_key(item_row_sort_key);
+            }
         }
-    } else {
-        rows.sort_by(|a, b| a.label.cmp(&b.label));
+        MenuKind::ItemAction { .. } => {}
+        _ => rows.sort_by(|a, b| a.label.cmp(&b.label)),
     }
     if rows != dynamic.rows {
         dynamic.rows = rows;
@@ -438,9 +472,73 @@ pub fn refresh_dynamic_menu_rows(
 
 fn item_row_sort_key(row: &DynamicMenuRow) -> u16 {
     match row.action {
-        DynamicMenuAction::UseItem { item_no, .. } => item_no,
+        DynamicMenuAction::OpenItemAction { item_no, .. } => item_no,
         _ => u16::MAX,
     }
+}
+
+/// Context rows for one slot, mirroring the LSB 0x029 move rules
+/// (vendor/server/src/map/packets/c2s/0x029_item_move.cpp): Gil and Temporary
+/// items never move, wardrobes only take equipment, and "Take Out" leads when
+/// browsing a storage bag.
+pub fn item_action_rows(
+    snap: &ffxi_viewer_wire::SceneSnapshot,
+    container: u8,
+    index: u8,
+    item_no: u16,
+) -> Vec<DynamicMenuRow> {
+    use ffxi_proto::map::container as c;
+
+    let Some(slot) = snap
+        .container(container)
+        .and_then(|v| v.items.iter().find(|s| s.index == index))
+        .filter(|s| s.item_no == item_no)
+    else {
+        return Vec::new();
+    };
+
+    let mut rows = Vec::new();
+    if container == c::LOC_INVENTORY || container == c::LOC_TEMPITEMS {
+        rows.push(DynamicMenuRow {
+            label: "Use".to_string(),
+            action: DynamicMenuAction::UseItem {
+                container,
+                index,
+                item_no,
+            },
+        });
+    }
+
+    // Locked = equipped / linkshell / bazaar-reserved: the server rejects the
+    // move silently, so don't offer it.
+    let movable =
+        item_no != ffxi_proto::map::GIL_ITEM_NO && container != c::LOC_TEMPITEMS && !slot.locked;
+    if movable {
+        let equipable = ffxi_proto::equip_info::lookup(item_no).is_some();
+        for dest in crate::hud::item_screen::accessible_containers(snap) {
+            if dest == container || dest == c::LOC_TEMPITEMS || (c::is_wardrobe(dest) && !equipable)
+            {
+                continue;
+            }
+            let Some(name) = c::name(dest) else { continue };
+            let label = if dest == c::LOC_INVENTORY {
+                "Take Out".to_string()
+            } else {
+                format!("Put in {name}")
+            };
+            rows.push(DynamicMenuRow {
+                label,
+                action: DynamicMenuAction::MoveItem {
+                    quantity: slot.quantity,
+                    from_container: container,
+                    from_slot: index,
+                    to_container: dest,
+                    item_no,
+                },
+            });
+        }
+    }
+    rows
 }
 
 pub fn ability_group_rows(
@@ -725,6 +823,165 @@ pub fn debug_panel_state(label: &str, panels: &crate::hud::HudPanels, net_status
 mod tests {
     use super::*;
 
+    fn mh_snapshot() -> ffxi_viewer_wire::SceneSnapshot {
+        use ffxi_proto::map::container as c;
+        let bag =
+            |id: u8, capacity: u16, items: Vec<(u8, u16, u32)>| ffxi_viewer_wire::ContainerView {
+                id,
+                capacity,
+                items: items
+                    .into_iter()
+                    .map(
+                        |(index, item_no, quantity)| ffxi_viewer_wire::InventoryItem {
+                            container: id,
+                            index,
+                            item_no,
+                            quantity,
+                            locked: false,
+                        },
+                    )
+                    .collect(),
+            };
+        ffxi_viewer_wire::SceneSnapshot {
+            myroom: Some(ffxi_viewer_wire::MyRoom {
+                model: 289,
+                sub_map: 0,
+            }),
+            containers: vec![
+                // Slot 0 carries Gil (retail keeps it in inventory slot 0).
+                bag(
+                    c::LOC_INVENTORY,
+                    30,
+                    vec![(0, ffxi_proto::map::GIL_ITEM_NO, 1000), (1, 4509, 12)],
+                ),
+                bag(c::LOC_MOGSAFE, 50, vec![(1, 13327, 1)]),
+                bag(c::LOC_STORAGE, 8, vec![]),
+                bag(c::LOC_TEMPITEMS, 20, vec![(0, 4212, 1)]),
+                bag(c::LOC_WARDROBE, 8, vec![]),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Pins LSB 0x029 isValidMovement's ITEM_LOCKED rejection: locked slots
+    /// (equipped / linkshell / bazaar-reserved) get no move rows.
+    #[test]
+    fn locked_slot_offers_no_moves() {
+        use ffxi_proto::map::container as c;
+        let mut snap = mh_snapshot();
+        snap.containers[0].items[1].locked = true;
+        let rows = item_action_rows(&snap, c::LOC_INVENTORY, 1, 4509);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r.action, DynamicMenuAction::MoveItem { .. })),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.label == "Use"));
+    }
+
+    /// Pins the LSB validContainers Safe-2F gate (mhflag & 0x20,
+    /// 0x029_item_move.cpp): capacity alone must not offer Mog Safe 2.
+    #[test]
+    fn safe2_requires_the_2f_flag() {
+        use crate::hud::item_screen::container_accessible;
+        use ffxi_proto::map::container as c;
+        let mut snap = mh_snapshot();
+        snap.containers.push(ffxi_viewer_wire::ContainerView {
+            id: c::LOC_MOGSAFE2,
+            capacity: 60,
+            items: Vec::new(),
+        });
+        assert!(
+            !container_accessible(&snap, c::LOC_MOGSAFE2),
+            "flag unknown"
+        );
+        snap.mh_2f_unlocked = Some(false);
+        assert!(!container_accessible(&snap, c::LOC_MOGSAFE2));
+        snap.mh_2f_unlocked = Some(true);
+        assert!(container_accessible(&snap, c::LOC_MOGSAFE2));
+        assert!(
+            container_accessible(&snap, c::LOC_MOGSAFE),
+            "the 2F flag must not gate the 1F safe"
+        );
+    }
+
+    #[test]
+    fn storage_item_leads_with_take_out() {
+        use ffxi_proto::map::container as c;
+        // 13327 = an equipable ring in the retail id space; equip_info lookup
+        // decides wardrobe eligibility, not this test.
+        let rows = item_action_rows(&mh_snapshot(), c::LOC_MOGSAFE, 1, 13327);
+        assert_eq!(rows[0].label, "Take Out");
+        match rows[0].action {
+            DynamicMenuAction::MoveItem {
+                from_container,
+                to_container,
+                from_slot,
+                quantity,
+                ..
+            } => {
+                assert_eq!(from_container, c::LOC_MOGSAFE);
+                assert_eq!(to_container, c::LOC_INVENTORY);
+                assert_eq!(from_slot, 1);
+                assert_eq!(quantity, 1);
+            }
+            _ => panic!("Take Out must be a MoveItem"),
+        }
+        assert!(
+            !rows.iter().any(|r| r.label == "Use"),
+            "storage bags cannot use items: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn inventory_item_offers_use_and_put_in_bags() {
+        use ffxi_proto::map::container as c;
+        let rows = item_action_rows(&mh_snapshot(), c::LOC_INVENTORY, 1, 4509);
+        assert_eq!(rows[0].label, "Use");
+        assert!(rows.iter().any(|r| r.label == "Put in Mog Safe"));
+        assert!(rows.iter().any(|r| r.label == "Put in Storage"));
+        assert!(
+            !rows.iter().any(|r| r.label.contains("Temporary")),
+            "temp items bag is never a move destination: {rows:?}"
+        );
+        // 4509 (Distilled Water) is not equipment, so no wardrobe row.
+        assert!(!rows.iter().any(|r| r.label.contains("Wardrobe")));
+    }
+
+    /// Gil and Temporary items never move (LSB 0x029 isValidMovement /
+    /// validContainers).
+    #[test]
+    fn gil_and_temp_items_cannot_move() {
+        use ffxi_proto::map::container as c;
+        let snap = mh_snapshot();
+        let gil = item_action_rows(&snap, c::LOC_INVENTORY, 0, ffxi_proto::map::GIL_ITEM_NO);
+        assert!(
+            !gil.iter()
+                .any(|r| matches!(r.action, DynamicMenuAction::MoveItem { .. })),
+            "{gil:?}"
+        );
+        let temp = item_action_rows(&snap, c::LOC_TEMPITEMS, 0, 4212);
+        assert!(
+            !temp
+                .iter()
+                .any(|r| matches!(r.action, DynamicMenuAction::MoveItem { .. })),
+            "{temp:?}"
+        );
+        assert!(temp.iter().any(|r| r.label == "Use"), "{temp:?}");
+    }
+
+    #[test]
+    fn stale_slot_yields_no_rows() {
+        use ffxi_proto::map::container as c;
+        let snap = mh_snapshot();
+        assert!(item_action_rows(&snap, c::LOC_MOGSAFE, 5, 13327).is_empty());
+        assert!(
+            item_action_rows(&snap, c::LOC_MOGSAFE, 1, 999).is_empty(),
+            "item id mismatch means the slot changed under the menu"
+        );
+    }
+
     #[test]
     fn status_labels_match_entries() {
         use crate::hud::status_panel::STATUS_ENTRIES;
@@ -784,7 +1041,7 @@ mod tests {
 
     #[test]
     fn item_rows_sort_by_id_when_auto() {
-        let use_item = |item_no: u16| DynamicMenuAction::UseItem {
+        let item_row = |item_no: u16| DynamicMenuAction::OpenItemAction {
             container: 0,
             index: 0,
             item_no,
@@ -792,11 +1049,11 @@ mod tests {
         let mut rows = [
             DynamicMenuRow {
                 label: "Apple".to_string(),
-                action: use_item(50),
+                action: item_row(50),
             },
             DynamicMenuRow {
                 label: "Zeta".to_string(),
-                action: use_item(10),
+                action: item_row(10),
             },
         ];
         rows.sort_by_key(item_row_sort_key);

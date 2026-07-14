@@ -852,6 +852,7 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         UseItem { .. } => "use_item",
         Equip { .. } => "equip",
         StackInventory { .. } => "stack_inventory",
+        MoveItem { .. } => "move_item",
         BankWhenFull { .. } => "bank_when_full",
         CheckTarget { .. } => "check_target",
         ShopBuy { .. } => "shop_buy",

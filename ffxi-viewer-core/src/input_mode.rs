@@ -58,6 +58,14 @@ pub enum MenuKind {
 
     Items,
 
+    /// Per-item context menu pushed from the Items window (retail's item
+    /// submenu): Use / Take Out / Put in <bag> rows for the focused slot.
+    ItemAction {
+        container: u8,
+        index: u8,
+        item_no: u16,
+    },
+
     Equipment,
 
     Status,

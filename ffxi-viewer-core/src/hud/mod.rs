@@ -187,6 +187,7 @@ impl Plugin for HudPlugin {
         app.init_resource::<item_dat_root::ItemIconCache>();
         app.init_resource::<item_detail::SortOptions>();
         app.init_resource::<item_detail::ItemMenuFocus>();
+        app.init_resource::<item_screen::ItemScreenContainer>();
 
         app.init_resource::<check_view::CheckTarget>();
         app.init_resource::<status_panel::StatusProfileOpen>();
@@ -296,6 +297,7 @@ impl Plugin for HudPlugin {
                 item_screen::item_row_mouse_hover_system,
                 item_screen::item_row_mouse_click_system,
                 item_screen::sort_option_mouse_system,
+                item_screen::bag_header_mouse_system,
                 dialog::dialog_mouse_hover_system,
                 dialog::dialog_mouse_click_system,
                 quick_action::quick_action_mouse_hover_system,

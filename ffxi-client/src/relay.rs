@@ -285,6 +285,19 @@ fn viewer_command_to_agent(cmd: wire::ViewerCommand) -> Option<AgentCommand> {
             target_id,
             target_index,
         },
+        wire::ViewerCommand::MoveItem {
+            quantity,
+            from_container,
+            to_container,
+            from_slot,
+            to_slot,
+        } => AgentCommand::MoveItem {
+            quantity,
+            from_container,
+            to_container,
+            from_slot,
+            to_slot,
+        },
         wire::ViewerCommand::BankWhenFull {
             threshold,
             mog_house_zoneline,

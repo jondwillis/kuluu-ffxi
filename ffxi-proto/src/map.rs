@@ -34,14 +34,71 @@ pub mod c2s {
     // Payload is a single u32 Category = container id (LOC_INVENTORY = 0).
     pub const ITEM_STACK: u16 = 0x03A;
 
+    // GP_CLI_COMMAND_ITEM_MOVE, vendor/server/src/map/packets/c2s/0x029_item_move.h.
+    // Moves ItemNum of Category1/ItemIndex1 into Category2; ItemIndex2 < 82 targets
+    // a same-id stack merge into that slot, anything larger lets the server pick a
+    // free slot (0x029_item_move.cpp process).
+    pub const ITEM_MOVE: u16 = 0x029;
+
     pub const REQ_LOGOUT: u16 = 0x0E7;
 }
 
+// LSB CONTAINER_ID, vendor/server/src/map/item_container.h:32-49.
 pub mod container {
-    // LSB CONTAINER_ID, vendor/server/src/map/item_container.h. The main
-    // inventory bag — the container the Items window sorts.
     pub const LOC_INVENTORY: u8 = 0;
+    pub const LOC_MOGSAFE: u8 = 1;
+    pub const LOC_STORAGE: u8 = 2;
+    pub const LOC_TEMPITEMS: u8 = 3;
+    pub const LOC_MOGLOCKER: u8 = 4;
+    pub const LOC_MOGSATCHEL: u8 = 5;
+    pub const LOC_MOGSACK: u8 = 6;
+    pub const LOC_MOGCASE: u8 = 7;
+    pub const LOC_WARDROBE: u8 = 8;
+    pub const LOC_MOGSAFE2: u8 = 9;
+    pub const LOC_WARDROBE2: u8 = 10;
+    pub const LOC_WARDROBE3: u8 = 11;
+    pub const LOC_WARDROBE4: u8 = 12;
+    pub const LOC_WARDROBE5: u8 = 13;
+    pub const LOC_WARDROBE6: u8 = 14;
+    pub const LOC_WARDROBE7: u8 = 15;
+    pub const LOC_WARDROBE8: u8 = 16;
+    pub const LOC_RECYCLEBIN: u8 = 17;
+
+    /// Retail bag names as the item window shows them.
+    pub fn name(id: u8) -> Option<&'static str> {
+        Some(match id {
+            LOC_INVENTORY => "Inventory",
+            LOC_MOGSAFE => "Mog Safe",
+            LOC_STORAGE => "Storage",
+            LOC_TEMPITEMS => "Temporary",
+            LOC_MOGLOCKER => "Mog Locker",
+            LOC_MOGSATCHEL => "Mog Satchel",
+            LOC_MOGSACK => "Mog Sack",
+            LOC_MOGCASE => "Mog Case",
+            LOC_WARDROBE => "Mog Wardrobe",
+            LOC_MOGSAFE2 => "Mog Safe 2",
+            LOC_WARDROBE2 => "Mog Wardrobe 2",
+            LOC_WARDROBE3 => "Mog Wardrobe 3",
+            LOC_WARDROBE4 => "Mog Wardrobe 4",
+            LOC_WARDROBE5 => "Mog Wardrobe 5",
+            LOC_WARDROBE6 => "Mog Wardrobe 6",
+            LOC_WARDROBE7 => "Mog Wardrobe 7",
+            LOC_WARDROBE8 => "Mog Wardrobe 8",
+            LOC_RECYCLEBIN => "Recycle Bin",
+            _ => return None,
+        })
+    }
+
+    /// Only equipment/weapons may enter a wardrobe
+    /// (vendor/server/src/map/packets/c2s/0x029_item_move.cpp isValidMovement).
+    pub fn is_wardrobe(id: u8) -> bool {
+        id == LOC_WARDROBE || (LOC_WARDROBE2..=LOC_WARDROBE8).contains(&id)
+    }
 }
+
+// LSB ITEMID::GIL, vendor/server/src/map/items.h:150 — never movable between
+// containers (0x029_item_move.cpp isValidMovement).
+pub const GIL_ITEM_NO: u16 = 65535;
 
 pub mod reqlogout {
 

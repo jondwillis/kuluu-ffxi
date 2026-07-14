@@ -231,7 +231,7 @@ pub(crate) fn selected_item_no(
         return None;
     }
     match dynamic.rows.get(level.cursor)?.action {
-        crate::hud::menu::DynamicMenuAction::UseItem { item_no, .. } => Some(item_no),
+        crate::hud::menu::DynamicMenuAction::OpenItemAction { item_no, .. } => Some(item_no),
         _ => None,
     }
 }

@@ -390,8 +390,10 @@ pub struct SceneSnapshot {
     #[serde(default)]
     pub pet_abilities_known: Vec<u16>,
 
+    /// Every known item container (main bag + Mog House/global storage), sorted
+    /// by container id. Ids are LSB CONTAINER_ID (`ffxi_proto::map::container`).
     #[serde(default)]
-    pub inventory_main: Vec<InventoryItem>,
+    pub containers: Vec<ContainerView>,
 
     #[serde(default)]
     pub stats: Option<CharStats>,
@@ -411,6 +413,23 @@ pub struct SceneSnapshot {
     /// the surrounding city); the renderer must re-key zone resources on it.
     #[serde(default)]
     pub myroom: Option<MyRoom>,
+
+    /// Whether the Mog House 2nd floor is unlocked (0x055 char sync); gates the
+    /// Mog Safe 2 bag — the server drops moves into it without profile.mhflag
+    /// bit 0x20 (0x029_item_move.cpp validContainers). `None` = not yet known.
+    #[serde(default)]
+    pub mh_2f_unlocked: Option<bool>,
+}
+
+impl SceneSnapshot {
+    pub fn container(&self, id: u8) -> Option<&ContainerView> {
+        self.containers.iter().find(|c| c.id == id)
+    }
+
+    /// Container 0 (the main inventory bag), or empty if not yet received.
+    pub fn inventory_main(&self) -> &[InventoryItem] {
+        self.container(0).map(|c| c.items.as_slice()).unwrap_or(&[])
+    }
 }
 
 /// s2c 0x00A myroom cluster; `model` is an interior model id, not a zone id —
@@ -482,6 +501,17 @@ pub struct InventoryItem {
     pub index: u8,
     pub item_no: u16,
     pub quantity: u32,
+    /// LSB lock flag (equipped / linkshell / bazaar-reserved): the server
+    /// rejects moving locked items (0x029_item_move.cpp isValidMovement).
+    #[serde(default)]
+    pub locked: bool,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContainerView {
+    pub id: u8,
+    pub capacity: u16,
+    pub items: Vec<InventoryItem>,
 }
 
 fn default_equipped() -> [Option<u16>; 16] {
@@ -686,6 +716,15 @@ pub enum ViewerCommand {
         target_index: u16,
     },
 
+    /// c2s 0x029 ITEM_MOVE: `to_slot: None` lets the server pick a free slot.
+    MoveItem {
+        quantity: u32,
+        from_container: u8,
+        to_container: u8,
+        from_slot: u8,
+        to_slot: Option<u8>,
+    },
+
     BankWhenFull {
         threshold: u8,
         mog_house_zoneline: u32,
@@ -784,7 +823,7 @@ mod tests {
             job_abilities_known: Vec::new(),
             weaponskills_known: Vec::new(),
             pet_abilities_known: Vec::new(),
-            inventory_main: Vec::new(),
+            containers: Vec::new(),
             stats: None,
             bazaar: Vec::new(),
             play_time_s: 0,
@@ -793,6 +832,7 @@ mod tests {
                 model: 257,
                 sub_map: 0,
             }),
+            mh_2f_unlocked: None,
         }
     }
 
