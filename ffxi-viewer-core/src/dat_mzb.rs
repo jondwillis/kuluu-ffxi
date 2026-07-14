@@ -139,6 +139,13 @@ pub struct MzbCollisionGeometry {
     pub indices: Vec<u32>,
 
     pub cell_index: std::collections::HashMap<(i32, i32), Vec<u32>>,
+
+    /// DAT file the triangles came from. Grounding against a zone the player
+    /// is no longer in sticks entities to the wrong surface (the nearest-floor
+    /// snap is a fixed point), so the auto-loader clears this resource the
+    /// moment the effective zone DAT changes instead of waiting for the new
+    /// load to land.
+    pub source_file_id: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -1317,6 +1324,7 @@ fn spawn_mzb_overlay(
 
     collision_geometry.cell_index =
         build_cell_index(&collision_geometry.positions, &collision_geometry.indices);
+    collision_geometry.source_file_id = Some(req.file_id);
 
     spawn_merged(
         commands,
@@ -1448,6 +1456,7 @@ pub fn auto_load_zone_geometry_system(
     mut mmb_queue: ResMut<crate::dat_mmb::MmbLoadQueue>,
     mut mmb_in_flight: ResMut<crate::dat_mmb::MmbLoadInFlight>,
     mut pending_water: ResMut<PendingWaterSpawns>,
+    mut collision_geometry: ResMut<MzbCollisionGeometry>,
 ) {
     let current = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
     if current == last.file_id {
@@ -1458,6 +1467,14 @@ pub fn auto_load_zone_geometry_system(
         if let Ok(mut ec) = commands.get_entity(e) {
             ec.despawn();
         }
+    }
+
+    // Keeping the old zone's triangles until the new load lands grounds
+    // entities against geometry they're not in: entering a Mog House snapped
+    // the player onto a city surface at the MH-origin column, and the
+    // nearest-floor snap then resolved that stuck Y to the MH model's roof.
+    if collision_geometry.source_file_id != current {
+        *collision_geometry = MzbCollisionGeometry::default();
     }
 
     if !mzb_in_flight.tasks.is_empty() {
@@ -1602,6 +1619,7 @@ mod ground_tests {
             positions,
             indices,
             cell_index: std::collections::HashMap::new(),
+            source_file_id: None,
         }
     }
 
