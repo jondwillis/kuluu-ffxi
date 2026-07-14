@@ -3,6 +3,7 @@ use bevy::feathers::controls::{button, checkbox, ButtonProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
+use bevy::input_focus::{InputFocus, InputFocusVisible};
 use bevy::prelude::*;
 use bevy::ui::Checked;
 use bevy::ui_widgets::{Activate, ValueChange};
@@ -15,8 +16,8 @@ use super::common::{
 };
 use super::server_version_check::{ServerVersionStatus, VersionViolation};
 use super::{
-    Credentials, LauncherState, LoginErrorMsg, LoginErrorReturn, LoginField, LoginForm,
-    RuntimeHandle, ServerInfo, ServerSelectForm,
+    Credentials, LauncherState, LoginErrorMsg, LoginErrorReturn, LoginField, LoginFocusPending,
+    LoginForm, RuntimeHandle, ServerInfo, ServerSelectForm,
 };
 use crate::view_native::widgets::text_field::{text_field, TextFieldSubmitted};
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
@@ -44,8 +45,13 @@ pub(super) fn spawn_login_ui(
     form: Res<LoginForm>,
     server_form: Res<ServerSelectForm>,
     version: Res<ServerVersionStatus>,
+    mut pending: ResMut<LoginFocusPending>,
 ) {
     build_login_ui(&mut commands, &server, &form, &server_form, &version);
+    // Every entry into the Login screen (fresh launch, cancel-back from
+    // ServerSelect, etc.) should land InputFocus on form.focus rather than
+    // stranding it on whatever was focused on the previous screen.
+    pending.0 = true;
 }
 
 pub(super) fn rebuild_login_ui_system(
@@ -65,6 +71,31 @@ pub(super) fn rebuild_login_ui_system(
         commands.entity(e).despawn();
     }
     build_login_ui(&mut commands, &server, &form, &server_form, &version);
+}
+
+/// Restores `InputFocus` to the field `LoginForm::focus` points at after a
+/// saved-account pick (or the `mod.rs` server-select preselect path) rebuilds
+/// the login screen — the rebuilt `LoginField`-tagged text fields are new
+/// entities, so without this a gamepad/keyboard user loses focus back to the
+/// tab order's start. If both fields end up filled, focusing the password
+/// field is enough on its own: it's `submit_on_enter`, so one more
+/// confirm press logs in (see the `TextFieldSubmitted` observer below).
+pub(super) fn apply_login_focus_system(
+    mut pending: ResMut<LoginFocusPending>,
+    form: Res<LoginForm>,
+    fields: Query<(Entity, &LoginField)>,
+    mut focus: ResMut<InputFocus>,
+    mut visible: ResMut<InputFocusVisible>,
+) {
+    if !pending.0 {
+        return;
+    }
+    pending.0 = false;
+
+    if let Some((entity, _)) = fields.iter().find(|(_, f)| **f == form.focus) {
+        focus.set(entity);
+        visible.0 = true;
+    }
 }
 
 pub(super) fn mark_dirty_on_version_change(
@@ -234,6 +265,7 @@ fn spawn_saved_accounts_row(
                 move |_ev: On<Activate>,
                       mut login: ResMut<LoginForm>,
                       mut dirty: ResMut<LoginUiDirty>,
+                      mut pending: ResMut<LoginFocusPending>,
                       runtime: Res<RuntimeHandle>| {
                     login.user = pick_user.clone();
                     login.pass.clear();
@@ -254,6 +286,7 @@ fn spawn_saved_accounts_row(
                     };
 
                     dirty.0 = true;
+                    pending.0 = true;
                 },
             );
 
@@ -268,6 +301,7 @@ fn spawn_saved_accounts_row(
                 move |_ev: On<Activate>,
                       mut login: ResMut<LoginForm>,
                       mut dirty: ResMut<LoginUiDirty>,
+                      mut pending: ResMut<LoginFocusPending>,
                       runtime: Res<RuntimeHandle>| {
                     let mut store = launcher_store::load();
                     store
@@ -294,6 +328,7 @@ fn spawn_saved_accounts_row(
                         login.focus = LoginField::User;
                     }
                     dirty.0 = true;
+                    pending.0 = true;
                 },
             );
         }
@@ -304,12 +339,16 @@ fn spawn_saved_accounts_row(
             Spawn((Text::new("+ New"), ThemedText)),
         ))
         .observe(
-            |_ev: On<Activate>, mut login: ResMut<LoginForm>, mut dirty: ResMut<LoginUiDirty>| {
+            |_ev: On<Activate>,
+             mut login: ResMut<LoginForm>,
+             mut dirty: ResMut<LoginUiDirty>,
+             mut pending: ResMut<LoginFocusPending>| {
                 login.user.clear();
                 login.pass.clear();
                 login.remember_password = false;
                 login.focus = LoginField::User;
                 dirty.0 = true;
+                pending.0 = true;
             },
         );
     });
@@ -393,12 +432,15 @@ fn spawn_field(
                 Text::new(label.to_string()),
                 ThemedText,
             ));
-            row.spawn(text_field(TextFieldProps {
-                initial: initial.to_string(),
-                mask,
-                submit_on_enter: true,
-                ..default()
-            }))
+            row.spawn((
+                text_field(TextFieldProps {
+                    initial: initial.to_string(),
+                    mask,
+                    submit_on_enter: true,
+                    ..default()
+                }),
+                binding,
+            ))
             .with_children(|tf| {
                 tf.spawn((
                     Node {

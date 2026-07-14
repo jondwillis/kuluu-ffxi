@@ -245,12 +245,21 @@ fn cycle_table(table: &[(u8, &str)], current: u8, delta: i32) -> u8 {
 #[derive(Resource, Default)]
 pub(crate) struct CharCreateError(pub String);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Component)]
 pub(crate) enum LoginField {
     #[default]
     User,
     Password,
 }
+
+/// Set alongside `LoginForm::focus` whenever a saved-account pick (or
+/// forgetting one) rebuilds the login screen out from under the player's
+/// current `InputFocus` — the rebuilt widgets are new entities, so without
+/// this a gamepad/keyboard user would land back at the top of the tab order
+/// instead of on the field `LoginForm::focus` already says they should be on.
+/// Consumed by `login::apply_login_focus_system`.
+#[derive(Resource, Default)]
+pub(crate) struct LoginFocusPending(pub bool);
 
 #[derive(Resource, Default)]
 pub(crate) struct LoginForm {
@@ -561,6 +570,7 @@ pub(crate) fn register(
     app.add_sub_state::<LauncherState>()
         .insert_resource(form)
         .insert_resource(login::LoginUiDirty::default())
+        .insert_resource(LoginFocusPending::default())
         .insert_resource(LoginErrorMsg::default())
         .insert_resource(LoginErrorReturn::default())
         .insert_resource(RuntimeHandle(runtime))
@@ -705,19 +715,26 @@ pub(crate) fn register(
             .run_if(in_state(LauncherState::ChangePasswordInFlight)),
     );
 
-    app.add_systems(OnEnter(LauncherState::Login), login::spawn_login_ui)
-        .add_systems(OnExit(LauncherState::Login), login::despawn_login_ui)
-        .add_systems(
-            Update,
+    app.add_systems(
+        OnEnter(LauncherState::Login),
+        (login::spawn_login_ui, login::apply_login_focus_system).chain(),
+    )
+    .add_systems(OnExit(LauncherState::Login), login::despawn_login_ui)
+    .add_systems(
+        Update,
+        (
+            direct_mode_login_autostart,
+            login::keyboard_input_system,
+            login::redraw_login_form_system,
+            login::mark_dirty_on_version_change.before(login::rebuild_login_ui_system),
             (
-                direct_mode_login_autostart,
-                login::keyboard_input_system,
-                login::redraw_login_form_system,
-                login::mark_dirty_on_version_change.before(login::rebuild_login_ui_system),
                 login::rebuild_login_ui_system,
+                login::apply_login_focus_system,
             )
-                .run_if(in_state(LauncherState::Login)),
-        );
+                .chain(),
+        )
+            .run_if(in_state(LauncherState::Login)),
+    );
 
     app.add_systems(
         OnEnter(LauncherState::AuthInFlight),
