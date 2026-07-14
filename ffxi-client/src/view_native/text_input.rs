@@ -730,6 +730,30 @@ fn confirm_target_action_at_cursor(
             push_system_chat_line(scene_state, "[menu] Trust — not implemented yet".into());
             Some(InputMode::World)
         }
+        TargetActionId::Open => {
+            match target_ent {
+                Some(e) => {
+                    // Doors are TYPE_NPC server-side (look.size == 0x02) and
+                    // trigger through the same Talk action_id as any other
+                    // NPC — vendor/server/src/map/packets/c2s/0x01a_action.cpp:198,213.
+                    // The server's own door script drives the yes/no confirm
+                    // and zone change; nothing door-specific is needed here.
+                    let cmd = AgentCommand::Action {
+                        target_id: e.id,
+                        target_index: e.act_index,
+                        kind: ActionKind::Talk,
+                    };
+                    if let Err(err) = cmd_tx.try_send(cmd) {
+                        push_system_chat_line(
+                            scene_state,
+                            format!("[menu] Open dispatch dropped: {err}"),
+                        );
+                    }
+                }
+                None => push_system_chat_line(scene_state, "[menu] Open: no target".to_string()),
+            }
+            Some(InputMode::World)
+        }
     }
 }
 

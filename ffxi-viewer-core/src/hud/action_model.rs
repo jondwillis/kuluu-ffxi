@@ -14,6 +14,7 @@ pub enum TargetActionId {
     Trade,
     Disengage,
     Check,
+    Open,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -111,6 +112,8 @@ fn applies_to(id: TargetActionId, kind: TargetKindLite, engaged: bool) -> bool {
         TargetActionId::Items => matches!(kind, None | Mob | Pc | SelfPc),
 
         TargetActionId::Trust => matches!(kind, None | Pc | SelfPc),
+
+        TargetActionId::Open => matches!(kind, Door),
     }
 }
 
@@ -121,6 +124,7 @@ pub fn build_target_action_entries(
     const ORDER: &[TargetActionId] = &[
         TargetActionId::SwitchTarget,
         TargetActionId::Attack,
+        TargetActionId::Open,
         TargetActionId::Chat,
         TargetActionId::Magic,
         TargetActionId::Abilities,
@@ -140,7 +144,10 @@ pub fn build_target_action_entries(
             continue;
         }
 
-        let needs_range = matches!(id, TargetActionId::Chat | TargetActionId::Trade);
+        let needs_range = matches!(
+            id,
+            TargetActionId::Chat | TargetActionId::Trade | TargetActionId::Open
+        );
         let out_of_range = needs_range && ctx.has_target && !ctx.in_range;
 
         let (kind, label) = match id {
@@ -172,6 +179,7 @@ pub fn build_target_action_entries(
             TargetActionId::Items => (ActionEntryKind::Plain, "Items".to_string()),
             TargetActionId::Trade => (ActionEntryKind::Plain, "Trade".to_string()),
             TargetActionId::Check => (ActionEntryKind::Plain, "Check".to_string()),
+            TargetActionId::Open => (ActionEntryKind::Plain, "Open".to_string()),
         };
 
         let hint = if out_of_range {
@@ -203,12 +211,16 @@ pub fn context_for_target(
     let ent = target_id.and_then(|id| entities.iter().find(|e| e.id == id));
     let (target_kind, in_range) = match ent {
         Some(e) => {
-            let kind = match e.kind {
-                EntityKind::Pc if Some(e.id) == self_id => TargetKindLite::SelfPc,
-                EntityKind::Pc => TargetKindLite::Pc,
-                EntityKind::Npc => TargetKindLite::Npc,
-                EntityKind::Mob => TargetKindLite::Mob,
-                EntityKind::Pet | EntityKind::Other => TargetKindLite::None,
+            let kind = if matches!(e.look, Some(ffxi_viewer_wire::EntityLook::Door { .. })) {
+                TargetKindLite::Door
+            } else {
+                match e.kind {
+                    EntityKind::Pc if Some(e.id) == self_id => TargetKindLite::SelfPc,
+                    EntityKind::Pc => TargetKindLite::Pc,
+                    EntityKind::Npc => TargetKindLite::Npc,
+                    EntityKind::Mob => TargetKindLite::Mob,
+                    EntityKind::Pet | EntityKind::Other => TargetKindLite::None,
+                }
             };
             let dx = e.pos.x - self_pos.x;
             let dy = e.pos.y - self_pos.y;

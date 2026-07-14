@@ -23,6 +23,7 @@ pub enum MenuEntryId {
     TargetTrade,
     TargetDisengage,
     TargetCheck,
+    TargetOpen,
 }
 
 impl MenuEntryId {
@@ -38,6 +39,7 @@ impl MenuEntryId {
             TargetActionId::Trade => MenuEntryId::TargetTrade,
             TargetActionId::Disengage => MenuEntryId::TargetDisengage,
             TargetActionId::Check => MenuEntryId::TargetCheck,
+            TargetActionId::Open => MenuEntryId::TargetOpen,
         }
     }
 }
