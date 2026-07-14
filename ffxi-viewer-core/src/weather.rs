@@ -177,7 +177,7 @@ pub fn load_zone_weather(
         return;
     };
 
-    let Ok(root) = DatRoot::from_env_or_default() else {
+    let Ok(root) = DatRoot::shared() else {
         return;
     };
     let Ok(location) = root.resolve(file_id) else {

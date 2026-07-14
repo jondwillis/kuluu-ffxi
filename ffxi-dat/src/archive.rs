@@ -1,5 +1,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use crate::ftable::{FTable, SubPath};
 use crate::vtable::VTable;
@@ -84,6 +85,24 @@ impl DatRoot {
             return Err(DatError::EnvMissing);
         }
         Self::open(fallback)
+    }
+
+    /// Process-lifetime-cached [`DatRoot`], built once from
+    /// [`Self::from_env_or_default`] and shared across every caller.
+    /// `DatRoot::open` does a real `fs::read` for every ROM's VTABLE+FTABLE
+    /// pair (up to [`MAX_ROM_INDEX`] of them), and the retail install path
+    /// never changes mid-process, so rebuilding it per call — as every
+    /// `ffxi-viewer-core` DAT-loading site used to — was pure waste.
+    pub fn shared() -> Result<Arc<Self>> {
+        static SHARED: OnceLock<std::result::Result<Arc<DatRoot>, String>> = OnceLock::new();
+        SHARED
+            .get_or_init(|| {
+                Self::from_env_or_default()
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
+            })
+            .clone()
+            .map_err(DatError::Cached)
     }
 
     pub fn root(&self) -> &Path {

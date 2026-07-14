@@ -331,7 +331,7 @@ fn first_skeleton(bytes: &[u8]) -> Option<Skeleton> {
 
 pub fn load_npc(file_id: u32) -> Result<LoadedActor, String> {
     crate::perf_probe::note_model_load();
-    let root = DatRoot::from_env_or_default().map_err(|e| format!("DatRoot: {e}"))?;
+    let root = DatRoot::shared().map_err(|e| format!("DatRoot: {e}"))?;
     let bytes = read_dat(&root, file_id).ok_or_else(|| format!("read npc dat {file_id}"))?;
 
     let skeleton =
@@ -395,7 +395,7 @@ pub fn load_pc(
 ) -> Result<LoadedActor, String> {
     crate::perf_probe::note_model_load();
     let _ = sub_weapon;
-    let root = DatRoot::from_env_or_default().map_err(|e| format!("DatRoot: {e}"))?;
+    let root = DatRoot::shared().map_err(|e| format!("DatRoot: {e}"))?;
     let race = if skeleton_file_id_for_race(race).is_some() {
         race
     } else {
@@ -2441,7 +2441,7 @@ mod pose_resolution_tests {
     }
 
     fn load_hume_m() -> Option<LoadedActor> {
-        if DatRoot::from_env_or_default().is_err() {
+        if DatRoot::shared().is_err() {
             eprintln!("skipping: no retail DAT root");
             return None;
         }

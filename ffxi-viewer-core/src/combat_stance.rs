@@ -162,7 +162,7 @@ pub fn directional_anim_for_skel(skel_file_id: u32, prefix: &[u8; 3]) -> Option<
 }
 
 pub fn load_anim_with_prefix(file_id: u32, prefix: &[u8; 3]) -> Option<Mo2Animation> {
-    let root = DatRoot::from_env_or_default().ok()?;
+    let root = DatRoot::shared().ok()?;
     let loc = root.resolve(file_id).ok()?;
     let bytes = fs::read(loc.path_under(root.root())).ok()?;
     for chunk in walk(&bytes).filter_map(Result::ok) {
@@ -580,7 +580,7 @@ pub fn override_anim_for_skel(skel_file_id: u32, prefix: &[u8; 3]) -> Option<Arc
 }
 
 fn for_each_anim_chunk_in_dat(file_id: u32, mut f: impl FnMut(String, Mo2Animation)) {
-    let Ok(root) = DatRoot::from_env_or_default() else {
+    let Ok(root) = DatRoot::shared() else {
         return;
     };
     let Ok(loc) = root.resolve(file_id) else {
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn battle_idle_resolves_for_every_pc_race_when_dats_available() {
-        if DatRoot::from_env_or_default().is_err() {
+        if DatRoot::shared().is_err() {
             eprintln!("skipping: no retail DAT root");
             return;
         }
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn run_anim_resolves_for_every_pc_race_when_dats_available() {
-        if DatRoot::from_env_or_default().is_err() {
+        if DatRoot::shared().is_err() {
             eprintln!("skipping: no retail DAT root");
             return;
         }
@@ -874,7 +874,7 @@ mod tests {
 
     #[test]
     fn combat_run_resolves_with_higher_bone_count_than_casual() {
-        if DatRoot::from_env_or_default().is_err() {
+        if DatRoot::shared().is_err() {
             eprintln!("skipping: no retail DAT root");
             return;
         }

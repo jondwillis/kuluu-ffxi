@@ -353,7 +353,7 @@ pub fn dispatch_action_started(
         // FFXiMain.dll is only needed for weaponskill base indices; load it lazily once.
         if action_kind == 3 && !dll_cache.loaded {
             dll_cache.loaded = true;
-            if let Ok(root) = ffxi_dat::DatRoot::from_env_or_default() {
+            if let Ok(root) = ffxi_dat::DatRoot::shared() {
                 dll_cache.dll = ffxi_dat::main_dll::MainDll::load(root.root()).ok();
             }
         }
@@ -363,7 +363,7 @@ pub fn dispatch_action_started(
             continue;
         };
 
-        let Ok(root) = ffxi_dat::DatRoot::from_env_or_default() else {
+        let Ok(root) = ffxi_dat::DatRoot::shared() else {
             continue;
         };
         let Ok(loc) = root.resolve(file_id) else {

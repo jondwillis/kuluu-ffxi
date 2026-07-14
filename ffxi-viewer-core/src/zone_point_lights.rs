@@ -222,7 +222,7 @@ fn load_zone_point_lights(scene_state: Res<SceneState>, mut store: ResMut<ZonePo
     let Some(file_id) = zone_dat::zone_id_to_mzb_file_id(zone_id) else {
         return;
     };
-    let Ok(root) = DatRoot::from_env_or_default() else {
+    let Ok(root) = DatRoot::shared() else {
         return;
     };
     let Ok(loc) = root.resolve(file_id) else {

@@ -536,8 +536,7 @@ fn load_decrypted(
     file_id: u32,
     chunk_idx: Option<usize>,
 ) -> Result<(mzb::MzbHeader, Vec<u8>, ()), String> {
-    let root =
-        DatRoot::from_env_or_default().map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
+    let root = DatRoot::shared().map_err(|e| format!("DatRoot::shared: {e}"))?;
     let location = root
         .resolve(file_id)
         .map_err(|e| format!("resolve({file_id}): {e}"))?;
@@ -586,8 +585,7 @@ pub fn build_zone_mmb_spawns(
     file_id: u32,
     chunk_idx: Option<usize>,
 ) -> Result<Vec<ZoneMmbSpawn>, String> {
-    let root =
-        DatRoot::from_env_or_default().map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
+    let root = DatRoot::shared().map_err(|e| format!("DatRoot::shared: {e}"))?;
     let location = root
         .resolve(file_id)
         .map_err(|e| format!("resolve({file_id}): {e}"))?;
@@ -823,8 +821,7 @@ pub fn build_zone_mmb_spawns(
 }
 
 pub fn load_mzb(file_id: u32, chunk_idx: Option<usize>) -> Result<Vec<MzbSubMesh>, String> {
-    let root =
-        DatRoot::from_env_or_default().map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
+    let root = DatRoot::shared().map_err(|e| format!("DatRoot::shared: {e}"))?;
     let location = root
         .resolve(file_id)
         .map_err(|e| format!("resolve({file_id}): {e}"))?;

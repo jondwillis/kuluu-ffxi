@@ -64,7 +64,7 @@ pub struct LoadedVos2 {
 }
 
 pub fn enumerate_vos2_chunks(file_id: u32) -> Vec<usize> {
-    let Ok(root) = DatRoot::from_env_or_default() else {
+    let Ok(root) = DatRoot::shared() else {
         return Vec::new();
     };
     let Ok(loc) = root.resolve(file_id) else {
@@ -95,7 +95,7 @@ fn has_vos2_recursive(node: &ChunkNode<'_>) -> bool {
 }
 
 pub fn dat_has_skinned_mesh(file_id: u32) -> bool {
-    let Ok(root) = DatRoot::from_env_or_default() else {
+    let Ok(root) = DatRoot::shared() else {
         return false;
     };
     let Ok(loc) = root.resolve(file_id) else {
@@ -108,7 +108,7 @@ pub fn dat_has_skinned_mesh(file_id: u32) -> bool {
 }
 
 pub fn load_vos2(file_id: u32, chunk_idx: usize) -> Result<LoadedVos2, String> {
-    let root = DatRoot::from_env_or_default().map_err(|e| format!("DatRoot: {e}"))?;
+    let root = DatRoot::shared().map_err(|e| format!("DatRoot: {e}"))?;
     let location = root
         .resolve(file_id)
         .map_err(|e| format!("resolve({file_id}): {e}"))?;
@@ -198,7 +198,7 @@ fn baked_skeleton_for_file(file_id: u32) -> Option<BakedSkeleton> {
 }
 
 fn load_skeleton(file_id: u32) -> Option<BakedSkeleton> {
-    let root = DatRoot::from_env_or_default().ok()?;
+    let root = DatRoot::shared().ok()?;
     let loc = root.resolve(file_id).ok()?;
     let bytes = fs::read(loc.path_under(root.root())).ok()?;
     let chunks = walk(&bytes).filter_map(Result::ok);
@@ -258,7 +258,7 @@ fn load_skeleton(file_id: u32) -> Option<BakedSkeleton> {
 }
 
 fn load_idle_animation_for_file(file_id: u32) -> Option<ffxi_dat::anim::Mo2Animation> {
-    let root = DatRoot::from_env_or_default().ok()?;
+    let root = DatRoot::shared().ok()?;
     let loc = root.resolve(file_id).ok()?;
     let bytes = fs::read(loc.path_under(root.root())).ok()?;
     for chunk in walk(&bytes).filter_map(Result::ok) {

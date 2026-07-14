@@ -152,8 +152,7 @@ pub struct LoadedMmb {
 }
 
 pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
-    let root =
-        DatRoot::from_env_or_default().map_err(|e| format!("DatRoot::from_env_or_default: {e}"))?;
+    let root = DatRoot::shared().map_err(|e| format!("DatRoot::shared: {e}"))?;
     let location = root
         .resolve(file_id)
         .map_err(|e| format!("resolve({file_id}): {e}"))?;

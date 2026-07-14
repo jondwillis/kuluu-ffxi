@@ -397,7 +397,7 @@ fn rebuild_zone_clouds(
     let Some(file_id) = ffxi_dat::zone_dat::zone_id_to_mzb_file_id(zone_id) else {
         return;
     };
-    let Ok(root) = DatRoot::from_env_or_default() else {
+    let Ok(root) = DatRoot::shared() else {
         return;
     };
     let Ok(location) = root.resolve(file_id) else {
@@ -558,7 +558,7 @@ fn rebuild_zone_stars(
     let Some(file_id) = ffxi_dat::zone_dat::zone_id_to_mzb_file_id(zone_id) else {
         return;
     };
-    let Ok(root) = DatRoot::from_env_or_default() else {
+    let Ok(root) = DatRoot::shared() else {
         return;
     };
     let Ok(location) = root.resolve(file_id) else {

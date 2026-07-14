@@ -85,6 +85,9 @@ pub enum DatError {
 
     #[error("FFXiMain.dll marker {hint:#010x} not found")]
     DllMarkerNotFound { hint: u32 },
+
+    #[error("{0}")]
+    Cached(String),
 }
 
 pub type Result<T> = std::result::Result<T, DatError>;
