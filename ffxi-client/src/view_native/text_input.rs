@@ -2569,12 +2569,16 @@ fn handle_menu_key(
     let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind, dynamic);
 
     // The Items window has two panes: the item list and the sort-options box.
-    // Route keys to the sort box while it holds focus (NavRight enters it,
+    // Route keys to the sort box while it holds focus (PageDown toggles it,
     // NavLeft / NavCancel returns to the list) and otherwise fall through to the
-    // list navigation below.
+    // list navigation below. NavLeft/NavRight step along the bag tab strip.
     if matches!(kind, MenuKind::Items) {
         use ffxi_viewer_core::hud::item_detail::{apply_sort_option, SORT_OPTIONS};
         if item_menu_focus.sort_focused {
+            if bindings.matches_logical(Action::PageDown, key) {
+                item_menu_focus.sort_focused = false;
+                return None;
+            }
             let count = SORT_OPTIONS.len();
             if bindings.matches_logical(Action::NavUp, key) {
                 item_menu_focus.sort_cursor = if item_menu_focus.sort_cursor == 0 {
@@ -2608,21 +2612,32 @@ fn handle_menu_key(
             }
             // Swallow any other key so it can't leak into list navigation.
             return None;
-        } else if bindings.matches_logical(Action::NavRight, key) {
+        } else if bindings.matches_logical(Action::PageDown, key) {
             item_menu_focus.sort_focused = true;
             item_menu_focus.sort_cursor = if sort_options.auto { 0 } else { 1 };
             return None;
-        } else if bindings.matches_logical(Action::NavLeft, key) {
-            // Retail flips bags with left/right in the item window; the sort
-            // box owns NavRight here, so NavLeft cycles (header click too).
-            if ffxi_viewer_core::hud::item_screen::cycle_container(&scene_state.snapshot, item_bag)
+        } else {
+            let step = if bindings.matches_logical(Action::NavLeft, key) {
+                Some(-1)
+            } else if bindings.matches_logical(Action::NavRight, key) {
+                Some(1)
+            } else {
+                None
+            };
+            if let Some(step) = step {
+                if ffxi_viewer_core::hud::item_screen::cycle_container(
+                    &scene_state.snapshot,
+                    item_bag,
+                    step,
+                )
                 .is_some()
-            {
-                if let Some(level) = stack.current_mut() {
-                    level.cursor = 0;
+                {
+                    if let Some(level) = stack.current_mut() {
+                        level.cursor = 0;
+                    }
                 }
+                return None;
             }
-            return None;
         }
     }
 

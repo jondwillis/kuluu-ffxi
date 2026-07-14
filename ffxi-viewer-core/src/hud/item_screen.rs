@@ -66,6 +66,32 @@ pub fn container_accessible(snap: &ffxi_viewer_wire::SceneSnapshot, id: u8) -> b
     granted && flag_ok && (!mh_only || snap.myroom.is_some())
 }
 
+/// Short bag names for the tab strip; the header still shows the full
+/// `container::name`.
+pub fn tab_label(id: u8) -> &'static str {
+    use ffxi_proto::map::container as c;
+    match id {
+        c::LOC_INVENTORY => "Inv",
+        c::LOC_MOGSAFE => "Safe",
+        c::LOC_MOGSAFE2 => "Safe2",
+        c::LOC_STORAGE => "Storage",
+        c::LOC_MOGLOCKER => "Locker",
+        c::LOC_MOGSATCHEL => "Satchel",
+        c::LOC_MOGSACK => "Sack",
+        c::LOC_MOGCASE => "Case",
+        c::LOC_WARDROBE => "Wdr1",
+        c::LOC_WARDROBE2 => "Wdr2",
+        c::LOC_WARDROBE3 => "Wdr3",
+        c::LOC_WARDROBE4 => "Wdr4",
+        c::LOC_WARDROBE5 => "Wdr5",
+        c::LOC_WARDROBE6 => "Wdr6",
+        c::LOC_WARDROBE7 => "Wdr7",
+        c::LOC_WARDROBE8 => "Wdr8",
+        c::LOC_TEMPITEMS => "Temp",
+        _ => "?",
+    }
+}
+
 /// The bags the window can flip through, in display order.
 pub fn accessible_containers(snap: &ffxi_viewer_wire::SceneSnapshot) -> Vec<u8> {
     BAG_DISPLAY_ORDER
@@ -77,15 +103,16 @@ pub fn accessible_containers(snap: &ffxi_viewer_wire::SceneSnapshot) -> Vec<u8> 
         .collect()
 }
 
-/// Advance the shown bag to the next accessible one (wrapping), returning the
-/// new id when it changed.
+/// Step the shown bag along the tab strip (`step` of ±1, wrapping), returning
+/// the new id when it changed.
 pub fn cycle_container(
     snap: &ffxi_viewer_wire::SceneSnapshot,
     active: &mut ItemScreenContainer,
+    step: isize,
 ) -> Option<u8> {
     let bags = accessible_containers(snap);
-    let pos = bags.iter().position(|&id| id == active.0).unwrap_or(0);
-    let next = bags[(pos + 1) % bags.len()];
+    let pos = bags.iter().position(|&id| id == active.0).unwrap_or(0) as isize;
+    let next = bags[(pos + step).rem_euclid(bags.len() as isize) as usize];
     (next != active.0).then(|| {
         active.0 = next;
         next
@@ -121,6 +148,19 @@ pub(crate) struct ItemIcon(IconSlot);
 /// is mouse-selectable; toggling its `Node` display hides the whole row.
 #[derive(Component, Clone, Copy)]
 pub(crate) struct ItemListRow(usize);
+
+/// The bag tab strip above the item list; hidden while only one bag is
+/// accessible.
+#[derive(Component)]
+pub(crate) struct BagTabRow;
+
+/// One tab in the strip; the index is a position into
+/// `accessible_containers`, not a container id.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct BagTab(usize);
+
+#[derive(Component, Clone, Copy)]
+pub(crate) struct BagTabText(usize);
 
 pub fn items_open(mode: &InputMode) -> bool {
     matches!(mode, InputMode::Menu(stack)
@@ -187,6 +227,7 @@ pub(crate) fn spawn_item_screen(mut commands: Commands, mut images: ResMut<Asset
                 ..default()
             })
             .with_children(|col| {
+                spawn_bag_tabs(col);
                 spawn_list_box(col, placeholder.clone());
                 spawn_detail_box(col, placeholder.clone());
             });
@@ -195,13 +236,50 @@ pub(crate) fn spawn_item_screen(mut commands: Commands, mut images: ResMut<Asset
         });
 }
 
+fn spawn_bag_tabs(col: &mut ChildSpawnerCommands) {
+    col.spawn((
+        BagTabRow,
+        Node {
+            width: Val::Px(LIST_WIDTH_PX),
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::Wrap,
+            column_gap: Val::Px(3.0),
+            row_gap: Val::Px(3.0),
+            display: Display::None,
+            ..default()
+        },
+    ))
+    .with_children(|strip| {
+        for i in 0..BAG_DISPLAY_ORDER.len() {
+            strip
+                .spawn((
+                    BagTab(i),
+                    Button,
+                    Node {
+                        padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                        display: Display::None,
+                        ..default()
+                    },
+                    BackgroundColor(theme::CELL_BG),
+                ))
+                .with_children(|tab| {
+                    tab.spawn((
+                        BagTabText(i),
+                        Text::new(""),
+                        text_font(11.0),
+                        TextColor(theme::MUTED),
+                    ));
+                });
+        }
+    });
+}
+
 fn spawn_list_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) {
     let (mut n, bg, bd) = framed_box();
     n.width = Val::Px(LIST_WIDTH_PX);
     col.spawn((n, bg, bd)).with_children(|p| {
         p.spawn((
             ItemText(ItemRole::ListHeader),
-            Button,
             Text::new(""),
             text_font(14.0),
             TextColor(theme::TITLE),
@@ -404,11 +482,7 @@ pub(crate) fn update_item_screen(
         .container(active_bag.0)
         .map(|c| (c.items.len(), c.capacity))
         .unwrap_or((0, 0));
-    let bag_count = accessible_containers(snap).len();
-    // The ◀ ▶ affordance appears once another bag is reachable (header click /
-    // NavLeft cycles).
-    let flip = if bag_count > 1 { "  ◀▶" } else { "" };
-    let header = format!("{bag_name}  {used}/{capacity}{flip}");
+    let header = format!("{bag_name}  {used}/{capacity}");
 
     for (row, mut node) in listrow_q.iter_mut() {
         let list_idx = start + row.0;
@@ -527,7 +601,7 @@ fn role_value(
             Some(line) => (line.clone(), theme::TEXT, true),
             None => (String::new(), theme::TEXT, false),
         },
-        ItemRole::SortTitle => ("Sort".to_string(), theme::TITLE, true),
+        ItemRole::SortTitle => ("Sort  [PgDn]".to_string(), theme::TITLE, true),
         ItemRole::SortRow(i) => match SORT_OPTIONS.get(i).copied() {
             Some(id) => {
                 let active = match id {
@@ -618,22 +692,94 @@ pub(crate) fn item_row_mouse_click_system(
     }
 }
 
-/// Clicking the list header flips to the next accessible bag (the keyboard
-/// path is NavLeft in the list pane).
-pub(crate) fn bag_header_mouse_system(
-    mut mode: ResMut<InputMode>,
+/// Drives the tab strip: one tab per accessible bag in display order, active
+/// bag highlighted. Split from `update_item_screen` so the tab queries stay
+/// disjoint from the window's text/icon queries.
+pub(crate) fn update_bag_tabs(
+    mode: Res<InputMode>,
     state: Res<SceneState>,
-    mut active_bag: ResMut<ItemScreenContainer>,
-    rows: Query<(&Interaction, &ItemText), Changed<Interaction>>,
+    active_bag: Res<ItemScreenContainer>,
+    mut strip_q: Query<&mut Node, (With<BagTabRow>, Without<BagTab>)>,
+    mut tab_q: Query<(&BagTab, &mut Node, &mut BackgroundColor), Without<BagTabRow>>,
+    mut text_q: Query<(&BagTabText, &mut Text, &mut TextColor)>,
 ) {
     if !items_open(&mode) {
         return;
     }
-    for (interaction, tag) in &rows {
-        if !matches!(tag.0, ItemRole::ListHeader) || *interaction != Interaction::Pressed {
+    let bags = accessible_containers(&state.snapshot);
+    let strip_visible = bags.len() > 1;
+    if let Ok(mut node) = strip_q.single_mut() {
+        let want = if strip_visible {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != want {
+            node.display = want;
+        }
+    }
+    for (tab, mut node, mut bg) in tab_q.iter_mut() {
+        let visible = strip_visible && tab.0 < bags.len();
+        let want = if visible {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != want {
+            node.display = want;
+        }
+        if visible {
+            let active = bags[tab.0] == active_bag.0;
+            let want_bg = if active {
+                theme::CURSOR_BG
+            } else {
+                theme::CELL_BG
+            };
+            if bg.0 != want_bg {
+                bg.0 = want_bg;
+            }
+        }
+    }
+    for (tag, mut text, mut color) in text_q.iter_mut() {
+        let Some(&id) = bags.get(tag.0) else {
+            continue;
+        };
+        let want = tab_label(id);
+        if **text != want {
+            **text = want.to_string();
+        }
+        let want_color = if id == active_bag.0 {
+            theme::TITLE
+        } else {
+            theme::MUTED
+        };
+        if color.0 != want_color {
+            color.0 = want_color;
+        }
+    }
+}
+
+/// Clicking a tab jumps straight to that bag (the keyboard path is
+/// NavLeft/NavRight in the list pane).
+pub(crate) fn bag_tab_mouse_system(
+    mut mode: ResMut<InputMode>,
+    state: Res<SceneState>,
+    mut active_bag: ResMut<ItemScreenContainer>,
+    tabs: Query<(&Interaction, &BagTab), Changed<Interaction>>,
+) {
+    if !items_open(&mode) {
+        return;
+    }
+    for (interaction, tab) in &tabs {
+        if *interaction != Interaction::Pressed {
             continue;
         }
-        if cycle_container(&state.snapshot, &mut active_bag).is_some() {
+        let bags = accessible_containers(&state.snapshot);
+        let Some(&id) = bags.get(tab.0) else {
+            continue;
+        };
+        if id != active_bag.0 {
+            active_bag.0 = id;
             if let InputMode::Menu(stack) = &mut *mode {
                 if let Some(level) = stack.current_mut() {
                     level.cursor = 0;
@@ -695,5 +841,64 @@ mod tests {
         let mid = total / 2;
         assert_eq!(viewport_start(mid, total), mid - ITEM_LIST_ROWS / 2);
         assert_eq!(viewport_start(total - 1, total), total - ITEM_LIST_ROWS);
+    }
+
+    fn snapshot_with_bags(caps: &[(u8, u16)]) -> ffxi_viewer_wire::SceneSnapshot {
+        ffxi_viewer_wire::SceneSnapshot {
+            containers: caps
+                .iter()
+                .map(|&(id, capacity)| ffxi_viewer_wire::ContainerView {
+                    id,
+                    capacity,
+                    items: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cycle_steps_both_directions_and_wraps() {
+        use ffxi_proto::map::container as c;
+        let snap = snapshot_with_bags(&[
+            (c::LOC_INVENTORY, 30),
+            (c::LOC_MOGCASE, 80),
+            (c::LOC_WARDROBE, 80),
+        ]);
+        let mut active = ItemScreenContainer(c::LOC_INVENTORY);
+        assert_eq!(cycle_container(&snap, &mut active, 1), Some(c::LOC_MOGCASE));
+        assert_eq!(
+            cycle_container(&snap, &mut active, 1),
+            Some(c::LOC_WARDROBE)
+        );
+        assert_eq!(
+            cycle_container(&snap, &mut active, 1),
+            Some(c::LOC_INVENTORY)
+        );
+        assert_eq!(
+            cycle_container(&snap, &mut active, -1),
+            Some(c::LOC_WARDROBE)
+        );
+        assert_eq!(
+            cycle_container(&snap, &mut active, -1),
+            Some(c::LOC_MOGCASE)
+        );
+    }
+
+    #[test]
+    fn cycle_with_one_bag_is_a_no_op() {
+        use ffxi_proto::map::container as c;
+        let snap = snapshot_with_bags(&[(c::LOC_INVENTORY, 30)]);
+        let mut active = ItemScreenContainer(c::LOC_INVENTORY);
+        assert_eq!(cycle_container(&snap, &mut active, 1), None);
+        assert_eq!(cycle_container(&snap, &mut active, -1), None);
+        assert_eq!(active.0, c::LOC_INVENTORY);
+    }
+
+    #[test]
+    fn every_display_order_bag_has_a_tab_label() {
+        for &id in BAG_DISPLAY_ORDER {
+            assert_ne!(tab_label(id), "?", "container {id} missing a tab label");
+        }
     }
 }
