@@ -224,7 +224,9 @@ fn synth_bound_key(
 }
 
 /// Face buttons + D-pad-right; combat/targeting ones are gated to
-/// `InputMode::World`, mirroring `handle_input_system`'s own gate.
+/// `InputMode::World` (and not an open trade window, which stays in `World`
+/// mode but must route like a menu), mirroring `handle_input_system`'s own
+/// gate.
 ///
 /// - South: `ConfirmAction` in `World` mode — FFXI's actual "talk to this NPC
 ///   / open the trade-check-invite menu for this target" dispatch (also the
@@ -248,6 +250,7 @@ pub(super) fn gamepad_ingame_action_system(
     gamepads: Query<&Gamepad>,
     bindings: Res<Bindings>,
     mode: Res<InputMode>,
+    trade_state: Res<ffxi_viewer_core::hud::trade::TradeState>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut keyboard_writer: MessageWriter<KeyboardInput>,
     windows: Query<Entity, With<PrimaryWindow>>,
@@ -258,7 +261,11 @@ pub(super) fn gamepad_ingame_action_system(
     let Some(gamepad) = gamepads.iter().next() else {
         return;
     };
-    let in_world = matches!(*mode, InputMode::World);
+    // A trade window doesn't change InputMode (text_input.rs checks
+    // trade_state.open ahead of the InputMode match), so without this it's
+    // treated as World and D-pad/South/East go to combat/target actions
+    // instead of navigating trade slots.
+    let in_world = matches!(*mode, InputMode::World) && !trade_state.open;
 
     if gamepad.just_pressed(GamepadButton::South) {
         if in_world {
