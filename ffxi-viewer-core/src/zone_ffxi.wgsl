@@ -121,7 +121,7 @@ fn scene_irradiance(n: vec3<f32>, p: vec3<f32>, sun_scale: f32) -> vec3<f32> {
 // directional lights + cascade shadow maps at group(0); take the min shadow
 // factor over the shadow-enabled ones (1 = lit, 0 = occluded). Mirrors the
 // actor shader's sun_shadow_factor. No shadow-enabled light → returns 1.0.
-fn sun_shadow_factor(world_pos: vec3<f32>, world_normal: vec3<f32>) -> f32 {
+fn sun_shadow_factor(world_pos: vec3<f32>, world_normal: vec3<f32>, frag_coord_xy: vec2<f32>) -> f32 {
     let view_z = position_world_to_view(world_pos).z;
     let n = view_bindings::lights.n_directional_lights;
     var factor = 1.0;
@@ -131,7 +131,7 @@ fn sun_shadow_factor(world_pos: vec3<f32>, world_normal: vec3<f32>) -> f32 {
             continue;
         }
         factor = min(factor, shadows::fetch_directional_shadow(
-            i, vec4<f32>(world_pos, 1.0), world_normal, view_z));
+            i, vec4<f32>(world_pos, 1.0), world_normal, view_z, frag_coord_xy));
     }
     return factor;
 }
@@ -156,7 +156,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let n = normalize(in.world_normal);
     // Cast-shadow attenuation on the sun term only (ambient/point fill the rest,
     // so a shadowed fragment darkens without crushing to black).
-    let sun = sun_shadow_factor(in.world_position, n);
+    let sun = sun_shadow_factor(in.world_position, n, in.clip_position.xy);
     // XIM's `2 * vertexColor * texel`, with vertexColor modulating the scene
     // light. Vertex colour is overbright (can exceed 1) — do NOT clamp it.
     let lit = scene_irradiance(n, in.world_position, sun) * in.color.rgb;

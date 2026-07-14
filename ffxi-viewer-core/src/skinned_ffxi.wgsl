@@ -159,7 +159,7 @@ fn scene_irradiance(n: vec3<f32>, p: vec3<f32>, wrap: f32, sun_scale: f32) -> ve
 // flags) — every FFXI character receives. When the scene has no shadow-enabled
 // directional light (e.g. the live FfxiLighting-only path, or a headless capture
 // without `--shadowtest`), the loop finds none and this returns 1.0, a no-op.
-fn sun_shadow_factor(world_pos: vec3<f32>, world_normal: vec3<f32>) -> f32 {
+fn sun_shadow_factor(world_pos: vec3<f32>, world_normal: vec3<f32>, frag_coord_xy: vec2<f32>) -> f32 {
     let view_z = position_world_to_view(world_pos).z;
     let n = view_bindings::lights.n_directional_lights;
     var factor = 1.0;
@@ -169,7 +169,7 @@ fn sun_shadow_factor(world_pos: vec3<f32>, world_normal: vec3<f32>) -> f32 {
             continue;
         }
         factor = min(factor, shadows::fetch_directional_shadow(
-            i, vec4<f32>(world_pos, 1.0), world_normal, view_z));
+            i, vec4<f32>(world_pos, 1.0), world_normal, view_z, frag_coord_xy));
     }
     return factor;
 }
@@ -209,7 +209,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         // `select` evaluates both operands.
         var sun = 1.0;
         if (receive_shadows) {
-            sun = sun_shadow_factor(in.world_position, n);
+            sun = sun_shadow_factor(in.world_position, n, in.clip_position.xy);
         }
         // Energy-conserving: albedo (texture * vertex color) lit ONCE by the
         // live scene sun/moon/ambient (+ point lights), with a soft wrap so
@@ -253,7 +253,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         // Shadowed fragments keep this fraction of the sun term (0 = black,
         // 1 = no receive). Tuned soft: visible shade without losing the model.
         let FAITHFUL_SHADOW_FLOOR = 0.45;
-        let sun = sun_shadow_factor(in.world_position, n);
+        let sun = sun_shadow_factor(in.world_position, n, in.clip_position.xy);
         sun_scale = mix(FAITHFUL_SHADOW_FLOOR, 1.0, sun);
     }
     let lit = scene_irradiance(n, in.world_position, 0.0, sun_scale) * in.color.rgb;
