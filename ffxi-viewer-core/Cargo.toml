@@ -30,7 +30,9 @@ enhanced-water = ["dep:bevy_water"]
 # the rest of `bevy_input` — needed by `keybinds::KeyBind` so the on-disk
 # `keybinds.json` can name keys (`"KeyW"`, `"Numpad8"`, etc.) without a
 # hand-rolled match table covering every variant.
-bevy = { workspace = true, features = ["serialize"] }
+# `bevy_audio` is explicit because 0.19 stopped implying audio from the
+# ui/2d/3d feature collections and audio.rs implements rodio's traits directly.
+bevy = { workspace = true, features = ["serialize", "bevy_audio"] }
 ffxi-viewer-wire = { path = "../ffxi-viewer-wire" }
 ffxi-dat = { path = "../ffxi-dat" }
 # Phase 3 faithful character render path: pure-Rust XIM port of per-joint
@@ -60,8 +62,10 @@ ab_glyph = "0.2"
 # over the websocket if/when that's wanted.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ffxi-audio = { path = "../ffxi-audio" }
-# Optional enhanced animated water (feature `enhanced-water`). Crate version
-# tracks the Bevy version (0.18). Native-only; wasm viewer keeps the simple plane.
+# Optional enhanced animated water (feature `enhanced-water`). Native-only;
+# wasm viewer keeps the simple plane. The 0.18.x req is satisfied by the
+# workspace [patch.crates-io] git pin (upstream's Bevy 0.19 migration PR,
+# which keeps the 0.18.1 crate version); see kuluu-u11r.
 bevy_water = { version = "0.18", optional = true }
 # Stable id for the synthetic picking pointer that bridges window-space mouse
 # input onto the off-screen render-scale target (graphics::render_scale, which

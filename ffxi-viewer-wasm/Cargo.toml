@@ -14,7 +14,7 @@ license.workspace = true
 # values, which the `WasmSource` decodes off a `gloo_net` WebSocket and
 # forwards to the core ECS via flume channels.
 #
-# Bevy here is the workspace 0.17 pin, but with `default-features = false`
+# Bevy here matches the workspace pin, but with `default-features = false`
 # and only the renderer/UI features needed in the browser. `webgl2` is
 # load-bearing — `webgpu` is still gated by browser flags as of early 2026.
 
@@ -22,16 +22,19 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Pinned to "0.17" directly (matches `workspace.dependencies.bevy`) rather
-# than `workspace = true` because Cargo ignores `default-features = false`
+# Pinned directly (matches `workspace.dependencies.bevy`) rather than
+# `workspace = true` because Cargo ignores `default-features = false`
 # on a workspace inherit when the workspace entry itself doesn't disable
-# defaults — and the workspace pin keeps full defaults to satisfy
-# `bevy_ratatui_camera`'s transitive requirement on the native side.
-bevy = { version = "0.18", default-features = false, features = [
+# defaults — the workspace pin keeps full defaults for the native side.
+# 0.19 stopped cross-implying the ui/window/render features, so each is
+# listed explicitly; `bevy_ui_render` split out of `bevy_ui`.
+bevy = { version = "0.19", default-features = false, features = [
     "bevy_winit",
+    "bevy_window",
     "bevy_render",
     "bevy_pbr",
     "bevy_ui",
+    "bevy_ui_render",
     "bevy_text",
     "webgl2",
 ] }
