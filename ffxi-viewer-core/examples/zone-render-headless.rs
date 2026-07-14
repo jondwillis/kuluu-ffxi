@@ -8,7 +8,7 @@ use ffxi_viewer_core::dat_mmb::{
 };
 use ffxi_viewer_core::dat_mzb::{
     kick_load_mzb_tasks, poll_load_mzb_tasks, DrawDistance, LoadMzbInFlight, LoadMzbRequest,
-    MzbCollisionGeometry, ZoneGeomCache, ZoneGeomMode,
+    MzbCollisionGeometry, PendingWaterSpawns, ZoneGeomCache, ZoneGeomMode,
 };
 use ffxi_viewer_core::ffxi_zone_material::FfxiZoneMaterialPlugin;
 use ffxi_viewer_core::scene::TrackedEntities;
@@ -115,6 +115,10 @@ fn main() {
         .add_message::<ToastEvent>()
         .init_resource::<DrawDistance>()
         .init_resource::<MzbCollisionGeometry>()
+        .init_resource::<PendingWaterSpawns>()
+        .init_resource::<ffxi_viewer_core::zone_point_lights::ActiveSceneLights>()
+        .init_resource::<ffxi_viewer_core::graphics::settings::GraphicsSettings>()
+        .init_resource::<ffxi_viewer_core::dat_mmb::MmbLoadInFlight>()
         .init_resource::<LoadMzbInFlight>()
         .init_resource::<ZoneGeomCache>()
         .init_resource::<MmbHandleCache>()
