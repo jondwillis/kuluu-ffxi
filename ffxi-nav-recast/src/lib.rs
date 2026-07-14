@@ -124,6 +124,11 @@ impl RecastNavMesh {
         Some(detour_to_ffxi(snapped).z)
     }
 
+    /// Coverage-check search extent for [`Self::slide_along`]'s off-mesh
+    /// fallback: wide enough to say "there is truly no navmesh data near
+    /// this destination", not just "no directly-connected polygon".
+    const COVERAGE_CHECK_EXT: [f32; 3] = [15.0, 100.0, 15.0];
+
     pub fn slide_along(&self, from: Vec3, to: Vec3) -> Option<Vec3> {
         let filter = DtQueryFilter::default();
         let start = ffxi_to_detour(from);
@@ -142,6 +147,26 @@ impl RecastNavMesh {
             .query
             .move_along_surface(start_ref, &snapped_start, &end, &filter, &mut visited)
             .ok()?;
+
+        // move_along_surface clamps to the connected-polygon boundary
+        // whenever `end` isn't reachable, and that's indistinguishable from
+        // its result alone between "a real wall/edge" and "LSB's xiNavmeshes
+        // bake (built for mob pathing, not full player-walkable coverage)
+        // simply never generated data out here". Treating the latter as a
+        // wall regresses walkable retail space (e.g. decorative plazas mobs
+        // never path through), so: if nothing exists near the *destination*
+        // even under a generous search, there's no data at all — return
+        // None so the caller's off-mesh fallback lets the raw move through
+        // instead of clamping to this edge.
+        let has_nearby_coverage = self
+            .query
+            .find_nearest_poly_1(&end, &Self::COVERAGE_CHECK_EXT, &filter)
+            .ok()
+            .is_some_and(|(poly_ref, _)| !poly_ref.is_null());
+        if !has_nearby_coverage {
+            return None;
+        }
+
         Some(detour_to_ffxi(result_d))
     }
 }
