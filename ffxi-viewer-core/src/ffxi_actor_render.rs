@@ -986,9 +986,12 @@ pub(crate) fn apply_character_shadow_cast(
     let mut apply = |e: Entity| {
         let mut ec = commands.entity(e);
         if cast {
-            ec.remove::<bevy::light::NotShadowCaster>();
+            // try_remove: this sweep can race an actor mesh despawning
+            // (e.g. the NPC left render range) between the query snapshot
+            // above and this command applying — an expected race, not a bug.
+            ec.try_remove::<bevy::light::NotShadowCaster>();
         } else {
-            ec.insert(bevy::light::NotShadowCaster);
+            ec.try_insert(bevy::light::NotShadowCaster);
         }
     };
     if settings.is_changed() {
