@@ -152,7 +152,7 @@ fn spawn_ui(mut commands: Commands) {
     commands.spawn((
         Text::new("loading..."),
         TextFont {
-            font_size: 18.0,
+            font_size: 18.0.into(),
             ..default()
         },
         TextColor(Color::WHITE),

@@ -173,7 +173,7 @@ fn setup(mut c: Commands, p: Res<P>, mut d: ResMut<DrawDistance>) {
         IsSun,
         DirectionalLight {
             illuminance: p.sun,
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_xyz(300., 220., 120.).looking_at(Vec3::ZERO, Vec3::Y),

@@ -168,6 +168,7 @@ mod tests {
 
     fn write_scroll_up(app: &mut App) {
         app.world_mut().write_message(MouseWheel {
+            phase: bevy::input::touch::TouchPhase::Moved,
             unit: MouseScrollUnit::Line,
             x: 0.0,
             y: 5.0,

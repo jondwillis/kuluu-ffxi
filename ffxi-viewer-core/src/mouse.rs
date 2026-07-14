@@ -160,6 +160,7 @@ mod tests {
             delta: Vec2::new(3.0, 4.0),
         });
         app.world_mut().write_message(MouseWheel {
+            phase: bevy::input::touch::TouchPhase::Moved,
             unit: bevy::input::mouse::MouseScrollUnit::Line,
             x: 0.0,
             y: 1.0,

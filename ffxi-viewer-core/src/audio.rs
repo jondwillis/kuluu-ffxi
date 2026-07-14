@@ -1272,7 +1272,9 @@ mod tests {
         let mut sfx_messages: Vec<u32> = Vec::new();
         let world = app.world_mut();
         let mut reg = bevy::ecs::system::SystemState::<MessageReader<SfxEvent>>::new(world);
-        let mut reader = reg.get_mut(world);
+        let mut reader = reg
+            .get_mut(world)
+            .expect("SfxEvent MessageReader param valid");
         for ev in reader.read() {
             sfx_messages.push(ev.se_id);
         }

@@ -216,7 +216,7 @@ fn setup_scene(
         commands.spawn((
             DirectionalLight {
                 illuminance: 11000.0,
-                shadows_enabled: true,
+                shadow_maps_enabled: true,
                 ..default()
             },
             Transform::from_xyz(4.0, 7.0, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
@@ -340,7 +340,7 @@ fn apply_realistic_flag(params: Res<Params>, mut materials: ResMut<Assets<FfxiSk
     let receive = if params.shadowtest { 1.0 } else { 0.0 };
     let ids: Vec<_> = materials.ids().collect();
     for id in ids {
-        if let Some(m) = materials.get_mut(id) {
+        if let Some(mut m) = materials.get_mut(id) {
             if m.material_flags.flags.y != realistic {
                 m.material_flags.flags.y = realistic;
             }
