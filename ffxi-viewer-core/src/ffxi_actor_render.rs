@@ -377,14 +377,6 @@ fn default_pc_equipment(race: u8) -> Vec<u32> {
     out
 }
 
-/// Retail's PC race byte is only ever 1..=8 (`skeleton_file_id_for_race`'s
-/// table is exactly that size — there is no retail skeleton for anything
-/// else). An "Equipped"-look NPC broadcasting a race outside that range is
-/// bad server-side data, not a client gap; falling back to Hume Male here
-/// renders *a* humanoid instead of leaving the entity as a bare placeholder
-/// orb, at the cost of a wrong race/equipment fit for that one NPC.
-const FALLBACK_RACE: u8 = 1;
-
 pub fn load_pc(
     entity_id: u32,
     race: u8,
@@ -396,21 +388,15 @@ pub fn load_pc(
     crate::perf_probe::note_model_load();
     let _ = sub_weapon;
     let root = DatRoot::shared().map_err(|e| format!("DatRoot: {e}"))?;
-    let race = if skeleton_file_id_for_race(race).is_some() {
-        race
-    } else {
-        warn!(
-            entity_id,
-            race,
-            equipment = ?equipment,
-            fallback = FALLBACK_RACE,
-            "load_pc: race has no retail skeleton, falling back — cross-check entity_id \
-             against the server's GetZone(id):getNPCs() to identify and fix the NPC's look data"
-        );
-        FALLBACK_RACE
-    };
-    let skel_file_id =
-        skeleton_file_id_for_race(race).ok_or_else(|| format!("unsupported race {race}"))?;
+    let skel_file_id = skeleton_file_id_for_race(race).ok_or_else(|| {
+        // Retail's PC race byte is only ever 1..=8 (skeleton_file_id_for_race's
+        // table is exactly that size) — a real server never sends anything
+        // else, so this is bad server-side NPC look data, not a client gap.
+        // entity_id + equipment let it be cross-checked against the server's
+        // GetZone(id):getNPCs() to find and fix the NPC's look data.
+        warn!(entity_id, race, equipment = ?equipment, "load_pc: race has no retail skeleton");
+        format!("unsupported race {race}")
+    })?;
 
     let skel_bytes =
         read_dat(&root, skel_file_id).ok_or_else(|| format!("read skel dat {skel_file_id}"))?;
