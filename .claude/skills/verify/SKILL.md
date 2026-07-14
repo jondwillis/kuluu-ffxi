@@ -51,19 +51,24 @@ Two constraints shape everything:
 
 ## Character strategy
 
-- **Real character** (the user's) — the only reliable vehicle for zone-change /
-  Mog House E2E today. Credentials come from env (`FFXI_USER`/`FFXI_PASS`/
-  `FFXI_CHAR`); never commit or log them.
+- **Real character** (the user's) — credentials come from env
+  (`FFXI_USER`/`FFXI_PASS`/`FFXI_CHAR`); never commit or log them.
+- **Fresh provisioned chars** (`provision` + `create-char`, no DB teleport
+  needed) — full E2E vehicle including zone changes and Mog House entry. The
+  old "fresh chars get all c2s silently ignored" blocker was two client bugs,
+  both fixed: the c2s datagram header must be the last subpacket's sync
+  (`session.rs::datagram_header_id` — drift = server skips every subpacket
+  silently), and the new-char intro cutscene rides the 0x00A LOGIN packet
+  (`decode::ZoneInEvent`) and must be answered with 0x05B or the char sticks
+  InEvent (0x05E/0x0E7 rejected). If those symptoms ever return, check the
+  sync/header invariant first (`map_networking.cpp:419-428`).
 - **Ephemeral fixture chars** (`ffxi-client/tests/common/mod.rs::EphemeralChar`)
   — created against the live lobby + DB, gmlevel set pre-first-login; what the
-  integration tests use. Fine for login, spawn-stream, inventory observation.
-- **Known blocker**: manually provisioned fresh chars (lobby `create-char` +
-  DB pos teleport) get all substantive c2s **silently ignored** by the server
-  (0x05E zonelines, 0x0B5 chat — no response, no echo, no server log) while
-  keepalive/entity flow stays healthy. Reproduced across client commits, so
-  it's server-side char/account state (suspect: unfired new-char intro
-  cutscene). Don't burn time re-diagnosing it mid-verification; fall back to a
-  real char and note the gap.
+  integration tests use. Gotcha: when the accounts AUTO_INCREMENT outruns the
+  fixture's sentinel accid scheme, the lobby rejects the char select
+  ("mismatched character name" in connect logs) and the test dies at the 0x02
+  ack step. Also rebuild `target/debug/ffxi-mcp` — the agent_session test
+  spawns it without rebuilding.
 
 ## Reporting
 

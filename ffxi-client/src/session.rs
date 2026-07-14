@@ -62,6 +62,9 @@ struct SelfMogState {
     in_myroom: bool,
     mh_2f_unlocked: Option<bool>,
     job_info: Option<crate::state::JobInfoState>,
+    /// Cutscene embedded in the last 0x00A LOGIN ([`decode::ZoneInEvent`]);
+    /// consumed by the keepalive loop, which must answer it with 0x05B.
+    zone_in_event: Option<decode::ZoneInEvent>,
 }
 
 #[derive(Debug)]
@@ -356,16 +359,14 @@ async fn run_map_session(
         );
     }
 
-    let mut sub_seq: u16 = 2;
-    let mut bundle_seq: u16 = 3;
+    let mut sub_seq: u16 = map_client::BOOTSTRAP_SUB_SYNC.wrapping_add(1);
 
     {
         let payload = build_subpacket_gameok(sub_seq);
         sub_seq = sub_seq.wrapping_add(1);
-        map.send_encrypted(&payload, bundle_seq, server_last_seq)
+        map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
             .await?;
-        bundle_seq = bundle_seq.wrapping_add(1);
-        tracing::info!(bundle_seq, sub_seq, "sent 0x00C GAMEOK (zone-in)");
+        tracing::info!(sub_seq, "sent 0x00C GAMEOK (zone-in)");
     }
     emit_stage(event_tx, Stage::InZone);
     let _ = event_tx.send(AgentEvent::Diagnostics {
@@ -373,7 +374,7 @@ async fn run_map_session(
             stage: Some(Stage::InZone),
             blowfish_status: Some(BlowfishStatus::Accepted),
             sync_in: Some(server_last_seq),
-            sync_out: Some(bundle_seq),
+            sync_out: Some(datagram_header_id(sub_seq)),
             last_server_packet_age_ms: Some(0),
             cert_sha256,
             map_server_addr: Some(map.server_addr().to_string()),
@@ -382,7 +383,6 @@ async fn run_map_session(
 
     keepalive_loop(
         map,
-        bundle_seq,
         sub_seq,
         server_last_seq,
         pending_event_end,
@@ -494,6 +494,15 @@ fn handle_sub_packet(
                     })
                 });
                 mog.mog_zone_flag = login.myroom.is_some_and(|m| m.mog_zone_flag != 0);
+                if let Some(ev) = login.zone_in_event {
+                    tracing::info!(
+                        event_id = ev.event_para,
+                        event_zone = ev.event_num,
+                        event_mode = ev.event_mode,
+                        "0x00A LOGIN carries a zone-in cutscene"
+                    );
+                    mog.zone_in_event = login.zone_in_event;
+                }
                 if let Some(m) = login.myroom {
                     match m.login_state {
                         decode::ServerLoginMyroom::LOGIN_STATE_MYROOM => {
@@ -1302,10 +1311,73 @@ fn is_fresh_bundle(last_applied: Option<u16>, incoming: u16) -> bool {
     }
 }
 
+/// Route a server-initiated event into the event VM: display it when the VM
+/// can drive it (EVENT_END goes out when the script ends), auto-release it
+/// otherwise so the char never sticks server-side InEvent (which rejects
+/// zonelines, logout, and ~100 other c2s until 0x05B lands).
+#[allow(clippy::too_many_arguments)]
+fn begin_server_event(
+    dialog_session: &mut crate::event_dialog::DialogSession,
+    zone_id: u16,
+    unique_no: u32,
+    act_index: u16,
+    event_id: u16,
+    name: Option<String>,
+    event_tx: &broadcast::Sender<AgentEvent>,
+    pending_event_end: &mut Vec<(u32, u16, u16)>,
+    auto_event_end: &mut Vec<(u32, u16, u16, u32)>,
+) {
+    match dialog_session.begin(zone_id, unique_no, act_index, event_id, name) {
+        crate::event_dialog::Begin::Frame(dialog) => {
+            let _ = event_tx.send(AgentEvent::EventStart {
+                event_id: dialog.event_id,
+            });
+            emit_event_speech_to_chat(event_tx, &dialog);
+            let _ = event_tx.send(AgentEvent::EventDialog { dialog });
+            pending_event_end.push((unique_no, act_index, event_id));
+        }
+        crate::event_dialog::Begin::Ended { end_para } => {
+            auto_event_end.push((unique_no, act_index, event_id, end_para));
+        }
+        crate::event_dialog::Begin::Undriveable { stopped_op } => {
+            tracing::warn!(
+                zone = zone_id,
+                unique_no,
+                act_index,
+                event_id,
+                stopped_op = ?stopped_op.map(|op| format!("0x{op:02X}")),
+                "auto-releasing VM-undriveable event"
+            );
+            auto_event_end.push((unique_no, act_index, event_id, 0));
+            let _ = event_tx.send(AgentEvent::ChatLine {
+                line: ChatLine {
+                    channel: ChatChannel::System,
+                    sender: "client".into(),
+                    text: format!("[event] cutscene {event_id} auto-skipped (not yet supported)"),
+                    server_ts: 0,
+                },
+            });
+        }
+    }
+}
+
+/// Header id (u16 at datagram offset 0) for an outbound bundle, given the
+/// next-unused subpacket sync: the sync of the last subpacket placed in the
+/// bundle. LSB dispatches a subpacket only when its sync falls in
+/// `(client_packet_id, header_id]`, then advances `client_packet_id` to the
+/// header (vendor/server/src/map/map_networking.cpp:419-428,471) — a header
+/// counter that drifts from the subpacket syncs silently kills the session
+/// (subpackets skipped, keepalive/entity flow still healthy). The server's
+/// compares are not wrap-aware, so the one datagram straddling u16 wrap
+/// (~every 65k sends) is dropped and flow resumes — same loss retail covers
+/// by retransmitting unacked subpackets, which we don't implement.
+fn datagram_header_id(next_sub_sync: u16) -> u16 {
+    next_sub_sync.wrapping_sub(1)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn keepalive_loop(
     map: &mut MapClient,
-    mut bundle_seq: u16,
     mut sub_seq: u16,
     mut server_last_seq: u16,
     mut pending_event_end: Vec<(u32, u16, u16)>,
@@ -1423,12 +1495,11 @@ async fn keepalive_loop(
                                     let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                                 }
                                 crate::event_dialog::Advance::Ended { end_para } => {
-                                    let payload = build_subpacket_event_end(sub_seq, u, a, n, end_para);
+                                    let payload = build_subpacket_event_end(sub_seq, u, a, current_zone_id, n, end_para);
                                     sub_seq = sub_seq.wrapping_add(1);
-                                    if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
+                                    if let Err(e) = map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq).await {
                                         tracing::warn!(error = %e, "EVENT_END (vm) send failed");
                                     }
-                                    bundle_seq = bundle_seq.wrapping_add(1);
                                     pending_event_end.retain(|(uid, _, en)| !(*uid == u && *en == n));
                                     let _ = event_tx.send(AgentEvent::EventEnded);
                                 }
@@ -1436,13 +1507,12 @@ async fn keepalive_loop(
                         } else if !pending_event_end.is_empty() {
                             let mut payload = Vec::new();
                             for (unique_no, act_index, event_num) in pending_event_end.drain(..) {
-                                payload.extend(build_subpacket_event_end(sub_seq, unique_no, act_index, event_num, 0));
+                                payload.extend(build_subpacket_event_end(sub_seq, unique_no, act_index, current_zone_id, event_num, 0));
                                 sub_seq = sub_seq.wrapping_add(1);
                             }
-                            if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
+                            if let Err(e) = map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq).await {
                                 tracing::warn!(error = %e, "EVENT_END send failed");
                             }
-                            bundle_seq = bundle_seq.wrapping_add(1);
                             let _ = event_tx.send(AgentEvent::EventEnded);
                         } else {
                             let _ = event_tx.send(AgentEvent::EventEnded);
@@ -1480,7 +1550,6 @@ async fn keepalive_loop(
                                         self_pos,
                                         self_act_index,
                                         &mut sub_seq,
-                                        &mut bundle_seq,
                                         server_last_seq,
                                         &mut pending_maprect,
                                         &event_tx,
@@ -1494,7 +1563,6 @@ async fn keepalive_loop(
                                         main_job,
                                         sub_job,
                                         &mut sub_seq,
-                                        &mut bundle_seq,
                                         server_last_seq,
                                         &event_tx,
                                     )
@@ -1513,28 +1581,31 @@ async fn keepalive_loop(
                                     let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                                 }
                                 crate::event_dialog::Advance::Ended { end_para } => {
-                                    let payload = build_subpacket_event_end(sub_seq, u, a, n, end_para);
+                                    let payload = build_subpacket_event_end(sub_seq, u, a, current_zone_id, n, end_para);
                                     sub_seq = sub_seq.wrapping_add(1);
-                                    if let Err(e) = map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
+                                    if let Err(e) = map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq).await {
                                         tracing::warn!(error = %e, "EVENT_END (vm choice) send failed");
                                     }
-                                    bundle_seq = bundle_seq.wrapping_add(1);
                                     pending_event_end.retain(|(uid, _, en)| !(*uid == u && *en == n));
                                     let _ = event_tx.send(AgentEvent::EventEnded);
                                 }
                             }
                         } else {
                             let payload = build_subpacket_event_end(
-                                sub_seq, event_id, act_index, event_num, choice,
+                                sub_seq,
+                                event_id,
+                                act_index,
+                                current_zone_id,
+                                event_num,
+                                choice,
                             );
                             sub_seq = sub_seq.wrapping_add(1);
                             if let Err(e) = map
-                                .send_encrypted(&payload, bundle_seq, server_last_seq)
+                                .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                                 .await
                             {
                                 tracing::warn!(error = %e, "EVENT_END (choice) send failed");
                             }
-                            bundle_seq = bundle_seq.wrapping_add(1);
 
                             pending_event_end.retain(|(uid, _, en)| {
                                 !(*uid == event_id && *en == event_num)
@@ -1555,12 +1626,11 @@ async fn keepalive_loop(
                             mode,
                             kind_wire,
                             sub_seq,
-                            bundle_seq,
                             "reqlogout send (0x0E7)"
                         );
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, "reqlogout send failed");
@@ -1568,7 +1638,6 @@ async fn keepalive_loop(
                                 message: format!("reqlogout send: {e}"),
                             });
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::Snapshot) => {
 
@@ -1587,7 +1656,7 @@ async fn keepalive_loop(
                                 stage: Some(Stage::InZone),
                                 blowfish_status: Some(BlowfishStatus::Accepted),
                                 sync_in: Some(server_last_seq),
-                                sync_out: Some(bundle_seq),
+                                sync_out: Some(datagram_header_id(sub_seq)),
                                 last_server_packet_age_ms: Some(last_recv.elapsed().as_millis() as u64),
                                 cert_sha256: None,
                                 map_server_addr: Some(map.server_addr().to_string()),
@@ -1600,24 +1669,22 @@ async fn keepalive_loop(
                             kind,
                             len = text.len(),
                             sub_seq,
-                            bundle_seq,
                             payload_bytes = payload.len(),
                             "chat send (0x0B5)"
                         );
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, "chat send failed");
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::Tell { to, text }) => {
                         let payload = build_subpacket_tell(sub_seq, &to, &text);
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, "tell send failed");
@@ -1625,7 +1692,6 @@ async fn keepalive_loop(
                                 message: format!("tell send: {e}"),
                             });
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::Action {
                         target_id,
@@ -1651,7 +1717,7 @@ async fn keepalive_loop(
                             build_subpacket_action(sub_seq, target_id, target_index, &kind);
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, "action send failed");
@@ -1659,7 +1725,6 @@ async fn keepalive_loop(
                                 message: format!("action send: {e}"),
                             });
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::FishingRequest { mode, para, para2 }) => {
                         let payload = build_subpacket_fishing(
@@ -1672,7 +1737,7 @@ async fn keepalive_loop(
                         );
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, "fishing request send failed");
@@ -1680,7 +1745,6 @@ async fn keepalive_loop(
                                 message: format!("fishing send: {e}"),
                             });
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     // The reactor's fishing machine consumes Fish/FishingInput and emits
                     // Action{Fish} + FishingRequest; they never reach the session directly.
@@ -1695,7 +1759,7 @@ async fn keepalive_loop(
                         );
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, "homepoint_return send failed");
@@ -1703,7 +1767,6 @@ async fn keepalive_loop(
                                 message: format!("homepoint_return send: {e}"),
                             });
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::Follow { .. })
                     | Some(AgentCommand::Engage { .. })
@@ -1725,7 +1788,7 @@ async fn keepalive_loop(
                         let payload = build_subpacket_shop_buy(sub_seq, qty, shop_no, shop_index);
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, "shop_buy send failed");
@@ -1733,7 +1796,6 @@ async fn keepalive_loop(
                                 message: format!("buy send: {e}"),
                             });
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::CheckTarget {
                         target_id,
@@ -1749,7 +1811,7 @@ async fn keepalive_loop(
                         );
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, "equip_inspect send failed");
@@ -1757,13 +1819,12 @@ async fn keepalive_loop(
                                 message: format!("check send: {e}"),
                             });
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::Heal { mode }) => {
                         let payload = build_subpacket_camp(sub_seq, mode);
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, mode = ?mode, "camp send failed");
@@ -1779,7 +1840,6 @@ async fn keepalive_loop(
                             };
                             tracing::info!(?mode, is_healing, "camp send (0x0E8)");
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::Equip {
                         container,
@@ -1795,7 +1855,7 @@ async fn keepalive_loop(
                         );
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, "equip_set send failed");
@@ -1803,7 +1863,6 @@ async fn keepalive_loop(
                                 message: format!("equip_set send: {e}"),
                             });
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::StackInventory { container }) => {
                         if !item_stack_allowed(
@@ -1819,7 +1878,7 @@ async fn keepalive_loop(
                             let payload = build_subpacket_item_stack(sub_seq, container);
                             sub_seq = sub_seq.wrapping_add(1);
                             if let Err(e) = map
-                                .send_encrypted(&payload, bundle_seq, server_last_seq)
+                                .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                                 .await
                             {
                                 tracing::warn!(error = %e, "item_stack send failed");
@@ -1827,7 +1886,6 @@ async fn keepalive_loop(
                                     message: format!("item_stack send: {e}"),
                                 });
                             }
-                            bundle_seq = bundle_seq.wrapping_add(1);
                         }
                     }
                     Some(AgentCommand::UseItem {
@@ -1847,7 +1905,7 @@ async fn keepalive_loop(
                         );
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, "use_item send failed");
@@ -1855,7 +1913,6 @@ async fn keepalive_loop(
                                 message: format!("use_item send: {e}"),
                             });
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::RequestZoneChange { line_id }) => {
 
@@ -1885,7 +1942,7 @@ async fn keepalive_loop(
                         );
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
-                            .send_encrypted(&payload, bundle_seq, server_last_seq)
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
                             .await
                         {
                             tracing::warn!(error = %e, "MAPRECT send failed");
@@ -1895,7 +1952,6 @@ async fn keepalive_loop(
                         } else {
                             pending_maprect = Some((std::time::Instant::now(), line_id));
                         }
-                        bundle_seq = bundle_seq.wrapping_add(1);
                     }
                     Some(AgentCommand::MogHouseExit { kind }) => {
                         send_mog_house_exit(
@@ -1904,7 +1960,6 @@ async fn keepalive_loop(
                             self_pos,
                             self_act_index,
                             &mut sub_seq,
-                            &mut bundle_seq,
                             server_last_seq,
                             &mut pending_maprect,
                             &event_tx,
@@ -1920,7 +1975,6 @@ async fn keepalive_loop(
                             main_job,
                             sub_job,
                             &mut sub_seq,
-                            &mut bundle_seq,
                             server_last_seq,
                             &event_tx,
                         )
@@ -1957,7 +2011,7 @@ async fn keepalive_loop(
                     if last_net_emit.elapsed() >= std::time::Duration::from_millis(500) {
                         last_net_emit = std::time::Instant::now();
                         let sample = net_health
-                            .snapshot(last_recv.elapsed(), bundle_seq.wrapping_sub(1));
+                            .snapshot(last_recv.elapsed(), datagram_header_id(sub_seq));
                         let _ = event_tx.send(AgentEvent::NetStats {
                             stats: crate::state::NetStats {
                                 send_bps: sample.send_bps,
@@ -1982,8 +2036,8 @@ async fn keepalive_loop(
                                 sender: "<client>".into(),
                                 text: format!(
                                     "Zone change for line {line_id} silently dropped \
-                                     (no server response in 3s). Server-side state \
-                                     (likely InEvent flag) is blocking it — try relog."
+                                     (no server response in 3s). A pending server event \
+                                     blocks 0x05E — /endevent or /release to clear it."
                                 ),
                                 server_ts: 0,
                             },
@@ -2025,9 +2079,30 @@ async fn keepalive_loop(
                         "sent 0x011 ZONE_TRANSITION after 0x008 ENTERZONE (GAMEOK mode)"
                     );
                 }
+
+                if zone_transition_sent {
+                    if let Some(ev) = mog.zone_in_event.take() {
+                        begin_server_event(
+                            &mut dialog_session,
+                            ev.event_num,
+                            self_char_id,
+                            self_act_index.unwrap_or(0),
+                            ev.event_para,
+                            None,
+                            &event_tx,
+                            &mut pending_event_end,
+                            &mut auto_event_end,
+                        );
+                    }
+                }
                 for (unique_no, act_index, event_num, end_para) in auto_event_end.drain(..) {
                     payload.extend(build_subpacket_event_end(
-                        sub_seq, unique_no, act_index, event_num, end_para,
+                        sub_seq,
+                        unique_no,
+                        act_index,
+                        current_zone_id,
+                        event_num,
+                        end_para,
                     ));
                     sub_seq = sub_seq.wrapping_add(1);
                 }
@@ -2054,7 +2129,12 @@ async fn keepalive_loop(
                 {
                     for (unique_no, act_index, event_num) in pending_event_end.drain(..) {
                         payload.extend(build_subpacket_event_end(
-                            sub_seq, unique_no, act_index, event_num, 0,
+                            sub_seq,
+                            unique_no,
+                            act_index,
+                            current_zone_id,
+                            event_num,
+                            0,
                         ));
                         sub_seq = sub_seq.wrapping_add(1);
                         let _ = event_tx.send(AgentEvent::EventEnded);
@@ -2132,13 +2212,12 @@ async fn keepalive_loop(
                 }
 
                 if !payload.is_empty() {
-                    match map.send_encrypted(&payload, bundle_seq, server_last_seq).await {
+                    match map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq).await {
                         Ok(()) => {
                             if keepalive_send_failing {
                                 keepalive_send_failing = false;
                                 tracing::info!("keepalive send recovered");
                             }
-                            bundle_seq = bundle_seq.wrapping_add(1);
                         }
                         // A failed keepalive send (link down) must NOT tear the session
                         // down: retail holds the connection and decays the network-health
@@ -2232,56 +2311,17 @@ async fn keepalive_loop(
                                             .lookup(unique_no)
                                             .map(|s| s.replace('_', " "))
                                     });
-                                    match dialog_session.begin(
+                                    begin_server_event(
+                                        &mut dialog_session,
                                         current_zone_id,
                                         unique_no,
                                         act_index,
                                         event_id,
                                         name,
-                                    ) {
-                                        crate::event_dialog::Begin::Frame(dialog) => {
-                                            let _ = event_tx.send(AgentEvent::EventStart {
-                                                event_id: dialog.event_id,
-                                            });
-                                            emit_event_speech_to_chat(&event_tx, &dialog);
-                                            let _ = event_tx
-                                                .send(AgentEvent::EventDialog { dialog });
-                                            pending_event_end.push((
-                                                unique_no, act_index, event_id,
-                                            ));
-                                        }
-                                        crate::event_dialog::Begin::Ended { end_para } => {
-                                            auto_event_end.push((
-                                                unique_no, act_index, event_id, end_para,
-                                            ));
-                                        }
-                                        crate::event_dialog::Begin::Undriveable {
-                                            stopped_op,
-                                        } => {
-                                            tracing::warn!(
-                                                zone = current_zone_id,
-                                                unique_no,
-                                                act_index,
-                                                event_id,
-                                                stopped_op =
-                                                    ?stopped_op.map(|op| format!("0x{op:02X}")),
-                                                "auto-releasing VM-undriveable event"
-                                            );
-                                            auto_event_end.push((
-                                                unique_no, act_index, event_id, 0,
-                                            ));
-                                            let _ = event_tx.send(AgentEvent::ChatLine {
-                                                line: ChatLine {
-                                                    channel: ChatChannel::System,
-                                                    sender: "client".into(),
-                                                    text: format!(
-                                                        "[event] cutscene {event_id} auto-skipped (not yet supported)"
-                                                    ),
-                                                    server_ts: 0,
-                                                },
-                                            });
-                                        }
-                                    }
+                                        &event_tx,
+                                        &mut pending_event_end,
+                                        &mut auto_event_end,
+                                    );
                                     continue;
                                 }
                             }
@@ -3435,11 +3475,17 @@ fn build_subpacket_tell(sync: u16, recipient: &str, text: &str) -> Vec<u8> {
     buf
 }
 
+// c2s 0x05B GP_CLI_COMMAND_EVENTEND (vendor/server/src/map/packets/c2s/
+// 0x05b_eventend.h:34-41): UniqueNo u32, EndPara u32, ActIndex u16, Mode u16
+// (0 = End), EventNum u16 (zone id — retail echoes GP_SERV LOGIN EventNum,
+// 0x00a_login.cpp:187), EventPara u16 (the event id the validator matches
+// against currentEvent->eventId, validation.cpp:71-76).
 fn build_subpacket_event_end(
     sync: u16,
     unique_no: u32,
     act_index: u16,
-    event_num: u16,
+    event_zone: u16,
+    event_id: u16,
     choice: u32,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; 20];
@@ -3448,8 +3494,8 @@ fn build_subpacket_event_end(
     buf[8..12].copy_from_slice(&choice.to_le_bytes());
     buf[12..14].copy_from_slice(&act_index.to_le_bytes());
 
-    buf[16..18].copy_from_slice(&event_num.to_le_bytes());
-    buf[18..20].copy_from_slice(&event_num.to_le_bytes());
+    buf[16..18].copy_from_slice(&event_zone.to_le_bytes());
+    buf[18..20].copy_from_slice(&event_id.to_le_bytes());
     buf
 }
 
@@ -3684,7 +3730,6 @@ async fn send_mog_house_exit(
     self_pos: Position,
     self_act_index: Option<u16>,
     sub_seq: &mut u16,
-    bundle_seq: &mut u16,
     server_last_seq: u16,
     pending_maprect: &mut Option<(std::time::Instant, u32)>,
     event_tx: &broadcast::Sender<AgentEvent>,
@@ -3717,7 +3762,7 @@ async fn send_mog_house_exit(
     );
     *sub_seq = sub_seq.wrapping_add(1);
     if let Err(e) = map
-        .send_encrypted(&payload, *bundle_seq, server_last_seq)
+        .send_encrypted(&payload, datagram_header_id(*sub_seq), server_last_seq)
         .await
     {
         tracing::warn!(error = %e, "mog-house exit MAPRECT send failed");
@@ -3727,7 +3772,6 @@ async fn send_mog_house_exit(
     } else {
         *pending_maprect = Some((std::time::Instant::now(), ZMRQ_LE));
     }
-    *bundle_seq = bundle_seq.wrapping_add(1);
 }
 
 async fn send_myroom_job(
@@ -3735,7 +3779,6 @@ async fn send_myroom_job(
     main_job: Option<u8>,
     sub_job: Option<u8>,
     sub_seq: &mut u16,
-    bundle_seq: &mut u16,
     server_last_seq: u16,
     event_tx: &broadcast::Sender<AgentEvent>,
 ) {
@@ -3743,7 +3786,7 @@ async fn send_myroom_job(
     tracing::info!(?main_job, ?sub_job, "sending 0x100 MYROOM_JOB");
     *sub_seq = sub_seq.wrapping_add(1);
     if let Err(e) = map
-        .send_encrypted(&payload, *bundle_seq, server_last_seq)
+        .send_encrypted(&payload, datagram_header_id(*sub_seq), server_last_seq)
         .await
     {
         tracing::warn!(error = %e, "myroom_job send failed");
@@ -3751,7 +3794,6 @@ async fn send_myroom_job(
             message: format!("ChangeJob send: {e}"),
         });
     }
-    *bundle_seq = bundle_seq.wrapping_add(1);
 }
 
 // c2s 0x100 GP_CLI_COMMAND_MYROOM_JOB: MainJobIndex u8 @4, SupportJobIndex u8 @5,
@@ -4312,7 +4354,7 @@ mod tests {
 
     #[test]
     fn event_end_writes_csid_to_event_para_field() {
-        let buf = build_subpacket_event_end(0x1234, 0xDEADBEEF, 0x4242, 535, 0);
+        let buf = build_subpacket_event_end(0x1234, 0xDEADBEEF, 0x4242, 230, 535, 0);
         assert_eq!(buf.len(), 20, "header(4) + body(16)");
 
         assert_eq!(&buf[4..8], &0xDEADBEEFu32.to_le_bytes(), "UniqueNo");
@@ -4328,8 +4370,9 @@ mod tests {
 
         assert_eq!(
             &buf[16..18],
-            &535u16.to_le_bytes(),
-            "EventNum mirrors the CSID for atom0s wire symmetry",
+            &230u16.to_le_bytes(),
+            "EventNum carries the zone id (retail echoes LOGIN EventNum, \
+             0x00a_login.cpp:187); LSB's 0x05B handler never reads it",
         );
     }
 
@@ -4628,6 +4671,38 @@ mod tests {
 
         assert!(is_fresh_bundle(Some(0xFFFF), 0x0001));
         assert!(!is_fresh_bundle(Some(0x0001), 0xFFFF));
+    }
+
+    /// Model of LSB's c2s dispatch window
+    /// (vendor/server/src/map/map_networking.cpp:419-428,471): subpacket
+    /// dispatched iff `client_packet_id < sync <= header`, then
+    /// `client_packet_id = header`. Feeds it bundles built the way the
+    /// session builds them (one sync per subpacket, header from
+    /// [`datagram_header_id`]) and asserts nothing is ever skipped —
+    /// multi-subpacket bundles are the case most exposed to a header
+    /// counter that drifts from the subpacket syncs, which silently
+    /// deafens the server to the session.
+    #[test]
+    fn datagram_header_keeps_every_subpacket_inside_the_server_window() {
+        let mut client_packet_id: u16 = crate::map_client::BOOTSTRAP_SUB_SYNC;
+        let mut sub_seq: u16 = crate::map_client::BOOTSTRAP_SUB_SYNC.wrapping_add(1);
+
+        for bundle_len in [1usize, 1, 2, 1, 3, 1, 1, 5, 2, 1] {
+            let mut syncs = Vec::new();
+            for _ in 0..bundle_len {
+                syncs.push(sub_seq);
+                sub_seq = sub_seq.wrapping_add(1);
+            }
+            let header = datagram_header_id(sub_seq);
+            assert_eq!(header, *syncs.last().unwrap());
+            for sync in syncs {
+                assert!(
+                    client_packet_id < sync && sync <= header,
+                    "sync {sync} outside server window ({client_packet_id}, {header}]"
+                );
+            }
+            client_packet_id = header;
+        }
     }
 
     #[test]

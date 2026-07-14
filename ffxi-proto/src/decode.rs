@@ -453,6 +453,25 @@ pub struct ServerLogin {
     pub music_num: Option<[u16; 5]>,
 
     pub myroom: Option<ServerLoginMyroom>,
+
+    pub zone_in_event: Option<ZoneInEvent>,
+}
+
+/// Zone-in cutscene carried inside s2c 0x00A LOGIN: when `currentEvent` is
+/// already set at zone-in (e.g. the new-character intro, a Mog House 2F unlock
+/// CS), LSB delivers it via the login packet instead of a 0x032/0x034 push
+/// (vendor/server/src/map/packets/s2c/0x00a_login.cpp:183-192). The client
+/// must answer with 0x05B `End` (`EventPara` = this `event_para`) or the char
+/// stays InEvent server-side — zonelines/logout rejected — and the CS re-fires
+/// on every subsequent login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoneInEvent {
+    /// `EventNum`: the zone id the event belongs to.
+    pub event_num: u16,
+    /// `EventPara`: the cutscene/event id (`currentEvent->eventId`).
+    pub event_para: u16,
+    /// `EventMode`: `currentEvent->eventFlags` low half.
+    pub event_mode: u16,
 }
 
 impl ServerLogin {
@@ -462,6 +481,17 @@ impl ServerLogin {
     pub const MUSIC_NUM_SIZE: usize = 5 * 2;
 
     pub const GAME_TIME_OFFSET: usize = 0x38;
+
+    pub const EVENT_NUM_OFFSET: usize = 0x5E;
+    pub const EVENT_PARA_OFFSET: usize = 0x60;
+    pub const EVENT_MODE_OFFSET: usize = 0x62;
+
+    /// `PosHead.server_status` while a zone-in event is pending — the packet's
+    /// event fields are only written then, and event id 0 is a real cutscene
+    /// (Bastok Markets intro), so presence keys off the status byte
+    /// (0x00a_login.cpp:191, ANIMATION_EVENT in
+    /// vendor/server/src/map/entities/baseentity.h:66).
+    pub const SERVER_STATUS_EVENT: u8 = 4;
 
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
         if body.len() < Self::SIZE {
@@ -492,6 +522,25 @@ impl ServerLogin {
         } else {
             None
         };
+        let zone_in_event = (pos_head.server_status == Self::SERVER_STATUS_EVENT
+            && body.len() >= Self::EVENT_MODE_OFFSET + 2)
+            .then(|| ZoneInEvent {
+                event_num: u16::from_le_bytes(
+                    body[Self::EVENT_NUM_OFFSET..Self::EVENT_NUM_OFFSET + 2]
+                        .try_into()
+                        .unwrap(),
+                ),
+                event_para: u16::from_le_bytes(
+                    body[Self::EVENT_PARA_OFFSET..Self::EVENT_PARA_OFFSET + 2]
+                        .try_into()
+                        .unwrap(),
+                ),
+                event_mode: u16::from_le_bytes(
+                    body[Self::EVENT_MODE_OFFSET..Self::EVENT_MODE_OFFSET + 2]
+                        .try_into()
+                        .unwrap(),
+                ),
+            });
         Ok(Self {
             unique_no: pos_head.unique_no,
             act_index: pos_head.act_index,
@@ -500,6 +549,7 @@ impl ServerLogin {
             pos_head,
             music_num,
             myroom: ServerLoginMyroom::decode(body),
+            zone_in_event,
         })
     }
 }
@@ -1795,6 +1845,32 @@ mod tests {
         assert_eq!(l.unique_no, 0x0123_4567);
         assert_eq!(l.act_index, 0x00FF);
         assert_eq!(l.zone_no, 230);
+    }
+
+    #[test]
+    fn server_login_zone_in_event_keys_off_status_byte_not_event_id() {
+        let mut buf = vec![0u8; 0x100];
+        buf[44..48].copy_from_slice(&234u32.to_le_bytes());
+        buf[ServerLogin::EVENT_NUM_OFFSET..ServerLogin::EVENT_NUM_OFFSET + 2]
+            .copy_from_slice(&234u16.to_le_bytes());
+        // Bastok Markets intro cutscene is event id 0 — a zeroed EventPara must
+        // still decode as an event when the status byte says so.
+        buf[ServerLogin::EVENT_MODE_OFFSET..ServerLogin::EVENT_MODE_OFFSET + 2]
+            .copy_from_slice(&32u16.to_le_bytes());
+
+        let no_event = ServerLogin::decode(&buf).unwrap();
+        assert_eq!(no_event.zone_in_event, None);
+
+        buf[27] = ServerLogin::SERVER_STATUS_EVENT;
+        let with_event = ServerLogin::decode(&buf).unwrap();
+        assert_eq!(
+            with_event.zone_in_event,
+            Some(ZoneInEvent {
+                event_num: 234,
+                event_para: 0,
+                event_mode: 32,
+            })
+        );
     }
 
     #[test]

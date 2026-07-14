@@ -9,6 +9,12 @@ pub const GP_CLI_LOGIN_SIZE: usize = 92;
 
 pub const BOOTSTRAP_DATAGRAM_SIZE: usize = framing::FFXI_HEADER_SIZE + GP_CLI_LOGIN_SIZE + 16;
 
+/// Sync of the bootstrap subpacket (`ffxi_proto::map::c2s::LOGIN`), and
+/// thus the bootstrap datagram header. The server's `client_packet_id`
+/// starts at 0 (vendor/server/src/map/map_session.h:45) and advances here,
+/// so the first post-bootstrap subpacket must use the next sync.
+pub const BOOTSTRAP_SUB_SYNC: u16 = 1;
+
 #[derive(Debug, Clone)]
 pub struct BootstrapArgs<'a> {
     pub char_id: u32,
@@ -68,10 +74,15 @@ impl MapClient {
         })
     }
 
+    /// `last_sub_sync` must be the sync of the LAST subpacket in
+    /// `sub_packets_payload`: the server dispatches a subpacket only when its
+    /// sync falls in `(client_packet_id, header_u16[0]]` and then advances
+    /// `client_packet_id` to the header value — anything outside the window is
+    /// skipped with no log (vendor/server/src/map/map_networking.cpp:419-428,471).
     pub async fn send_encrypted(
         &self,
         sub_packets_payload: &[u8],
-        bundle_seq: u16,
+        last_sub_sync: u16,
         ack_server_seq: u16,
     ) -> Result<()> {
         let (compressed_bits, compressed) = self
@@ -85,9 +96,9 @@ impl MapClient {
         tail.extend_from_slice(&digest);
 
         let mut frame = vec![0u8; framing::FFXI_HEADER_SIZE + tail.len()];
-        frame[0..2].copy_from_slice(&bundle_seq.to_le_bytes());
+        frame[0..2].copy_from_slice(&last_sub_sync.to_le_bytes());
         frame[2..4].copy_from_slice(&ack_server_seq.to_le_bytes());
-        frame[4..6].copy_from_slice(&bundle_seq.to_le_bytes());
+        frame[4..6].copy_from_slice(&last_sub_sync.to_le_bytes());
 
         frame[framing::FFXI_HEADER_SIZE..].copy_from_slice(&tail);
 
@@ -230,8 +241,8 @@ fn derive_blowfish(seed: &[u8; 20]) -> blowfish::State {
 fn build_bootstrap_packet(args: &BootstrapArgs<'_>) -> Result<Vec<u8>> {
     let mut frame = vec![0u8; BOOTSTRAP_DATAGRAM_SIZE];
 
-    frame[0..2].copy_from_slice(&1u16.to_le_bytes());
-    frame[4..6].copy_from_slice(&1u16.to_le_bytes());
+    frame[0..2].copy_from_slice(&BOOTSTRAP_SUB_SYNC.to_le_bytes());
+    frame[4..6].copy_from_slice(&BOOTSTRAP_SUB_SYNC.to_le_bytes());
 
     let body = &mut frame[framing::FFXI_HEADER_SIZE..framing::FFXI_HEADER_SIZE + GP_CLI_LOGIN_SIZE];
 
@@ -240,7 +251,7 @@ fn build_bootstrap_packet(args: &BootstrapArgs<'_>) -> Result<Vec<u8>> {
     let header_word = id | (size_words << 9);
     body[0..2].copy_from_slice(&header_word.to_le_bytes());
 
-    body[2..4].copy_from_slice(&1u16.to_le_bytes());
+    body[2..4].copy_from_slice(&BOOTSTRAP_SUB_SYNC.to_le_bytes());
 
     body[12..16].copy_from_slice(&args.char_id.to_le_bytes());
 
