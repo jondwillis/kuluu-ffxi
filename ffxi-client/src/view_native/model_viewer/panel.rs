@@ -1,5 +1,5 @@
 use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
+use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input_focus::tab_navigation::TabGroup;
 use bevy::prelude::*;
@@ -82,7 +82,7 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
             panel.spawn((
                 Text::new("ffxi model viewer"),
                 TextFont {
-                    font_size: 18.0,
+                    font_size: 18.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.0, 1.0, 1.0)),
@@ -136,8 +136,8 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
                     ..default()
                 })
                 .with_children(|row| {
-                    row.spawn(button(
-                        ButtonProps::default(),
+                    row.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new("<"), ThemedText)),
                     ))
@@ -159,8 +159,8 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
                         TextColor(Color::srgb(0.92, 0.92, 0.95)),
                         ThemedText,
                     ));
-                    row.spawn(button(
-                        ButtonProps::default(),
+                    row.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new(">"), ThemedText)),
                     ))
@@ -182,7 +182,7 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
                 ),
                 TextColor(Color::srgb(0.65, 0.65, 0.7)),
                 TextFont {
-                    font_size: 11.0,
+                    font_size: 11.0.into(),
                     ..default()
                 },
                 ThemedText,
@@ -194,8 +194,8 @@ fn spawn_mode_button(parent: &mut ChildSpawnerCommands, mode: ViewerMode, label:
     parent
         .spawn((
             ModeButton(mode),
-            button(
-                ButtonProps {
+            button_bundle(
+                ButtonBundleProps {
                     variant: ButtonVariant::Primary,
                     ..default()
                 },

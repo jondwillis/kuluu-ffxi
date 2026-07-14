@@ -254,7 +254,10 @@ pub fn handle_input_system(
     if bindings.just_pressed(Action::ToggleWalk, &keys) {
         walk_mode.walking = !walk_mode.walking;
     }
-    if bindings.just_pressed(Action::ToggleEngage, &keys) {
+    // With no window open, retail's "Select active window" key has nothing to
+    // focus; we keep the pre-rename engage/disengage toggle as a non-retail
+    // convenience (retail engages via the Attack action menu entry).
+    if bindings.just_pressed(Action::SelectActiveWindow, &keys) {
         let currently_engaged = matches!(
             state.snapshot.current_goal,
             Some(ffxi_viewer_wire::ReactorGoal::Engaged { .. })

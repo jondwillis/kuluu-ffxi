@@ -148,7 +148,7 @@ fn spawn_zone_overlay(
                 ZoneOverlayLabel,
                 Text::new(format!("{LOADING_TEXT}{}", DOT_FRAMES[0])),
                 TextFont {
-                    font_size: 20.0,
+                    font_size: 20.0.into(),
                     ..default()
                 },
                 TextColor(Color::WHITE.with_alpha(1.0)),

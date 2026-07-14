@@ -483,11 +483,11 @@ fn spawn_text_line(p: &mut ChildSpawnerCommands, index: usize, color: Color) {
         PerfTextLine(index),
         Text::new(""),
         TextFont {
-            font_size: FONT,
+            font_size: FONT.into(),
             ..default()
         },
         TextColor(color),
-        TextLayout::new_with_no_wrap(),
+        TextLayout::no_wrap(),
     ));
 }
 

@@ -1,5 +1,5 @@
 use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
+use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -72,8 +72,8 @@ pub(super) fn spawn_ui(
                             ..default()
                         })
                         .with_children(|wrap| {
-                            wrap.spawn(button(
-                                ButtonProps {
+                            wrap.spawn(button_bundle(
+                                ButtonBundleProps {
                                     variant,
                                     ..default()
                                 },
@@ -130,8 +130,8 @@ pub(super) fn spawn_ui(
                         });
 
                         let edit_name = server_name.clone();
-                        r.spawn(button(
-                            ButtonProps::default(),
+                        r.spawn(button_bundle(
+                            ButtonBundleProps::default(),
                             (),
                             Spawn((Text::new("Edit"), ThemedText)),
                         ))
@@ -159,8 +159,8 @@ pub(super) fn spawn_ui(
                         } else {
                             ("Delete", ButtonVariant::Normal)
                         };
-                        r.spawn(button(
-                            ButtonProps {
+                        r.spawn(button_bundle(
+                            ButtonBundleProps {
                                 variant: del_variant,
                                 ..default()
                             },
@@ -212,8 +212,8 @@ pub(super) fn spawn_ui(
                 }
 
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button(
-                        ButtonProps {
+                    r.spawn(button_bundle(
+                        ButtonBundleProps {
                             variant: ButtonVariant::Primary,
                             ..default()
                         },
@@ -230,8 +230,8 @@ pub(super) fn spawn_ui(
                         },
                     );
 
-                    r.spawn(button(
-                        ButtonProps::default(),
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new("Settings"), ThemedText)),
                     ))
@@ -241,8 +241,8 @@ pub(super) fn spawn_ui(
                         },
                     );
 
-                    r.spawn(button(
-                        ButtonProps::default(),
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new("Graphics"), ThemedText)),
                     ))
@@ -253,8 +253,8 @@ pub(super) fn spawn_ui(
                     );
 
                     if has_last_used {
-                        r.spawn(button(
-                            ButtonProps::default(),
+                        r.spawn(button_bundle(
+                            ButtonBundleProps::default(),
                             (),
                             Spawn((Text::new("Cancel"), ThemedText)),
                         ))

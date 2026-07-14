@@ -140,7 +140,7 @@ fn spawn_backdrop_camera(
         BackdropScoped,
         DirectionalLight {
             illuminance: 8_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
@@ -245,7 +245,7 @@ fn apply_overlay_alpha(
     let Some(mat_handle) = mat_handle else {
         return;
     };
-    let Some(mat) = materials.get_mut(&mat_handle.0) else {
+    let Some(mut mat) = materials.get_mut(&mat_handle.0) else {
         return;
     };
     let want = fade.alpha();

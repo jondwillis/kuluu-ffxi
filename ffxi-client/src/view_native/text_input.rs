@@ -2568,18 +2568,30 @@ fn handle_menu_key(
     };
     let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind, dynamic);
 
-    // The Items window has two panes: the item list and the sort-options box.
-    // Route keys to the sort box while it holds focus (ToggleEngage — FFXI's
-    // window-change key, F in the compact presets — toggles it, NavLeft /
-    // NavCancel returns to the list) and otherwise fall through to the
-    // list navigation below. NavLeft/NavRight step along the bag tab strip.
+    // The Items window is a stack of panes: one per accessible bag plus the
+    // sort-options box. Retail's "Select active window" key (F in the compact
+    // presets, Numpad + on the full keyboard) steps focus through them in
+    // order, while NavLeft/NavRight page the item list a viewport at a time —
+    // matching the retail client, which never repurposes left/right for pane
+    // changes.
     if matches!(kind, MenuKind::Items) {
         use ffxi_viewer_core::hud::item_detail::{apply_sort_option, SORT_OPTIONS};
-        if item_menu_focus.sort_focused {
-            if bindings.matches_logical(Action::ToggleEngage, key) {
-                item_menu_focus.sort_focused = false;
-                return None;
+        if bindings.matches_logical(Action::SelectActiveWindow, key) {
+            if ffxi_viewer_core::hud::item_screen::select_active_window(
+                &scene_state.snapshot,
+                item_bag,
+                item_menu_focus,
+                sort_options.auto,
+            )
+            .is_some()
+            {
+                if let Some(level) = stack.current_mut() {
+                    level.cursor = 0;
+                }
             }
+            return None;
+        }
+        if item_menu_focus.sort_focused {
             let count = SORT_OPTIONS.len();
             if bindings.matches_logical(Action::NavUp, key) {
                 item_menu_focus.sort_cursor = if item_menu_focus.sort_cursor == 0 {
@@ -2613,32 +2625,26 @@ fn handle_menu_key(
             }
             // Swallow any other key so it can't leak into list navigation.
             return None;
-        } else if bindings.matches_logical(Action::ToggleEngage, key) {
-            item_menu_focus.sort_focused = true;
-            item_menu_focus.sort_cursor = if sort_options.auto { 0 } else { 1 };
-            return None;
+        }
+        // Retail pages the item list with left/right: one viewport per press,
+        // clamped at the ends (no wrap).
+        let page = if bindings.matches_logical(Action::NavLeft, key) {
+            Some(-1isize)
+        } else if bindings.matches_logical(Action::NavRight, key) {
+            Some(1)
         } else {
-            let step = if bindings.matches_logical(Action::NavLeft, key) {
-                Some(-1)
-            } else if bindings.matches_logical(Action::NavRight, key) {
-                Some(1)
-            } else {
-                None
-            };
-            if let Some(step) = step {
-                if ffxi_viewer_core::hud::item_screen::cycle_container(
-                    &scene_state.snapshot,
-                    item_bag,
-                    step,
-                )
-                .is_some()
-                {
-                    if let Some(level) = stack.current_mut() {
-                        level.cursor = 0;
-                    }
-                }
-                return None;
+            None
+        };
+        if let Some(dir) = page {
+            let rows = ffxi_viewer_core::hud::item_screen::ITEM_LIST_ROWS;
+            if let Some(level) = stack.current_mut() {
+                level.cursor = if dir < 0 {
+                    level.cursor.saturating_sub(rows)
+                } else {
+                    (level.cursor + rows).min(entry_count.saturating_sub(1))
+                };
             }
+            return None;
         }
     }
 

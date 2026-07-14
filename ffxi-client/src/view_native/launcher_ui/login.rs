@@ -1,5 +1,5 @@
 use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button, checkbox, ButtonProps, ButtonVariant};
+use bevy::feathers::controls::{button_bundle, checkbox_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -103,7 +103,7 @@ fn build_login_ui(
                 spawn_field(panel, "Username", false, &user_initial, LoginField::User);
                 spawn_field(panel, "Password", true, &pass_initial, LoginField::Password);
 
-                let mut cb = panel.spawn(checkbox(
+                let mut cb = panel.spawn(checkbox_bundle(
                     (),
                     Spawn((Text::new("Remember password"), ThemedText)),
                 ));
@@ -127,8 +127,8 @@ fn build_login_ui(
 
                 panel.spawn(row()).with_children(|r| {
                     if !blocked {
-                        r.spawn(button(
-                            ButtonProps {
+                        r.spawn(button_bundle(
+                            ButtonBundleProps {
                                 variant: ButtonVariant::Primary,
                                 ..default()
                             },
@@ -146,8 +146,8 @@ fn build_login_ui(
                         );
                     }
 
-                    r.spawn(button(
-                        ButtonProps::default(),
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new("Create account"), ThemedText)),
                     ))
@@ -157,8 +157,8 @@ fn build_login_ui(
                         },
                     );
 
-                    r.spawn(button(
-                        ButtonProps::default(),
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new("Change password"), ThemedText)),
                     ))
@@ -168,8 +168,8 @@ fn build_login_ui(
                         },
                     );
 
-                    r.spawn(button(
-                        ButtonProps::default(),
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new("Settings"), ThemedText)),
                     ))
@@ -179,8 +179,8 @@ fn build_login_ui(
                         },
                     );
 
-                    r.spawn(button(
-                        ButtonProps::default(),
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new("Graphics"), ThemedText)),
                     ))
@@ -222,8 +222,8 @@ fn spawn_saved_accounts_row(
             let pick_server = server_key.to_string();
             let pick_remember = *remember;
 
-            r.spawn(button(
-                ButtonProps {
+            r.spawn(button_bundle(
+                ButtonBundleProps {
                     variant,
                     ..default()
                 },
@@ -257,8 +257,8 @@ fn spawn_saved_accounts_row(
 
             let forget_user = u.clone();
             let forget_server = server_key.to_string();
-            r.spawn(button(
-                ButtonProps::default(),
+            r.spawn(button_bundle(
+                ButtonBundleProps::default(),
                 (),
                 Spawn((Text::new("×"), ThemedText)),
             ))
@@ -294,8 +294,8 @@ fn spawn_saved_accounts_row(
             );
         }
 
-        r.spawn(button(
-            ButtonProps::default(),
+        r.spawn(button_bundle(
+            ButtonBundleProps::default(),
             (),
             Spawn((Text::new("+ New"), ThemedText)),
         ))
@@ -355,7 +355,7 @@ fn spawn_version_banner(panel: &mut ChildSpawnerCommands, version: &ServerVersio
             bar.spawn((
                 Text::new(msg),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 13.0.into(),
                     ..default()
                 },
                 TextColor(text_color),
@@ -476,7 +476,7 @@ pub(super) fn spawn_error_ui(
                 panel.spawn((
                     Text::new(heading),
                     TextFont {
-                        font_size: 22.0,
+                        font_size: 22.0.into(),
                         ..default()
                     },
                     TextColor(Color::srgb(0.95, 0.20, 0.20)),
@@ -485,15 +485,15 @@ pub(super) fn spawn_error_ui(
                 panel.spawn((
                     Text::new(body),
                     TextFont {
-                        font_size: 14.0,
+                        font_size: 14.0.into(),
                         ..default()
                     },
                     TextColor(Color::srgb(0.85, 0.85, 0.85)),
                     ThemedText,
                 ));
                 panel
-                    .spawn(button(
-                        ButtonProps {
+                    .spawn(button_bundle(
+                        ButtonBundleProps {
                             variant: ButtonVariant::Primary,
                             ..default()
                         },

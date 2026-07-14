@@ -72,7 +72,7 @@ pub(super) fn spawn_preview(mut commands: Commands) {
     commands.spawn((
         DirectionalLight {
             illuminance: 15_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         RenderLayers::layer(PREVIEW_RENDER_LAYER),
@@ -83,7 +83,7 @@ pub(super) fn spawn_preview(mut commands: Commands) {
     commands.spawn((
         DirectionalLight {
             illuminance: 7_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         RenderLayers::layer(PREVIEW_RENDER_LAYER),
@@ -95,7 +95,7 @@ pub(super) fn spawn_preview(mut commands: Commands) {
     commands.spawn((
         DirectionalLight {
             illuminance: 4_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         RenderLayers::layer(PREVIEW_RENDER_LAYER),
@@ -295,7 +295,7 @@ pub(super) fn relight_preview_actor(
     for children in &q_root {
         for child in children.iter() {
             if let Ok(mat_handle) = q_mat.get(child) {
-                if let Some(mat) = materials.get_mut(&mat_handle.0) {
+                if let Some(mut mat) = materials.get_mut(&mat_handle.0) {
                     mat.lighting = lighting.clone();
 
                     mat.material_flags.flags.y = 0.0;

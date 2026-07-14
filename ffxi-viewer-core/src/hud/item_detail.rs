@@ -178,7 +178,8 @@ impl Default for SortOptions {
 }
 
 /// Which pane of the Items window has keyboard focus. The item list owns focus
-/// by default; pressing NavRight moves it into the sort-options box so Auto /
+/// by default; the "Select active window" key (`Action::SelectActiveWindow`)
+/// steps focus through the bags and then into the sort-options box so Auto /
 /// Manual become navigable, and NavLeft / NavCancel returns to the list.
 #[derive(Resource, Debug, Clone, Copy, Default)]
 pub struct ItemMenuFocus {

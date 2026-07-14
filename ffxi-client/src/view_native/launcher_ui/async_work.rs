@@ -182,7 +182,7 @@ pub(super) fn spawn_auth_ui(mut commands: Commands) {
             parent.spawn((
                 Text::new("Authenticating..."),
                 TextFont {
-                    font_size: 20.0,
+                    font_size: 20.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.0, 1.0, 1.0)),
@@ -190,7 +190,7 @@ pub(super) fn spawn_auth_ui(mut commands: Commands) {
             parent.spawn((
                 Text::new("Contacting auth + lobby servers."),
                 TextFont {
-                    font_size: 12.0,
+                    font_size: 12.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.6, 0.6, 0.6)),
@@ -392,7 +392,7 @@ pub(super) fn spawn_connect_ui(mut commands: Commands, sel: Res<SelectedChar>) {
             parent.spawn((
                 Text::new(format!("Selecting {name}...")),
                 TextFont {
-                    font_size: 20.0,
+                    font_size: 20.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.0, 1.0, 1.0)),
@@ -400,7 +400,7 @@ pub(super) fn spawn_connect_ui(mut commands: Commands, sel: Res<SelectedChar>) {
             parent.spawn((
                 Text::new("Lobby select + map handoff in progress."),
                 TextFont {
-                    font_size: 12.0,
+                    font_size: 12.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.6, 0.6, 0.6)),
@@ -552,7 +552,7 @@ pub(super) fn spawn_char_create_ui(mut commands: Commands, form: Res<CharCreateF
             parent.spawn((
                 Text::new(format!("Creating {name}...")),
                 TextFont {
-                    font_size: 20.0,
+                    font_size: 20.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.0, 1.0, 1.0)),
@@ -560,7 +560,7 @@ pub(super) fn spawn_char_create_ui(mut commands: Commands, form: Res<CharCreateF
             parent.spawn((
                 Text::new("Name check + register-char in progress."),
                 TextFont {
-                    font_size: 12.0,
+                    font_size: 12.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.6, 0.6, 0.6)),
@@ -672,7 +672,7 @@ pub(super) fn spawn_account_create_ui(mut commands: Commands, form: Res<CreateAc
             parent.spawn((
                 Text::new(format!("Creating account '{user}'...")),
                 TextFont {
-                    font_size: 20.0,
+                    font_size: 20.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.30, 1.0, 0.65)),
@@ -680,7 +680,7 @@ pub(super) fn spawn_account_create_ui(mut commands: Commands, form: Res<CreateAc
             parent.spawn((
                 Text::new("Contacting connect-server."),
                 TextFont {
-                    font_size: 12.0,
+                    font_size: 12.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.6, 0.6, 0.6)),
@@ -778,7 +778,7 @@ pub(super) fn spawn_change_password_ui(mut commands: Commands) {
             parent.spawn((
                 Text::new("Changing password..."),
                 TextFont {
-                    font_size: 20.0,
+                    font_size: 20.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.0, 1.0, 1.0)),
@@ -906,7 +906,7 @@ pub(super) fn spawn_char_delete_ui(mut commands: Commands, sel: Res<SelectedChar
             parent.spawn((
                 Text::new(format!("Deleting {name}...")),
                 TextFont {
-                    font_size: 20.0,
+                    font_size: 20.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.95, 0.20, 0.20)),

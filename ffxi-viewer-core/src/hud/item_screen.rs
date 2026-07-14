@@ -103,20 +103,40 @@ pub fn accessible_containers(snap: &ffxi_viewer_wire::SceneSnapshot) -> Vec<u8> 
         .collect()
 }
 
-/// Step the shown bag along the tab strip (`step` of ±1, wrapping), returning
-/// the new id when it changed.
-pub fn cycle_container(
+/// Retail's "Select active window" key (F on compact keyboards, Numpad + on
+/// the full keyboard) inside the Items window: each press steps focus along
+/// the window's panes — every accessible bag in display order, then the sort
+/// box, then back to the first bag. Returns the newly shown bag id when the
+/// bag changed (the caller resets the list cursor).
+pub fn select_active_window(
     snap: &ffxi_viewer_wire::SceneSnapshot,
     active: &mut ItemScreenContainer,
-    step: isize,
+    focus: &mut ItemMenuFocus,
+    sort_auto: bool,
 ) -> Option<u8> {
     let bags = accessible_containers(snap);
-    let pos = bags.iter().position(|&id| id == active.0).unwrap_or(0) as isize;
-    let next = bags[(pos + step).rem_euclid(bags.len() as isize) as usize];
-    (next != active.0).then(|| {
-        active.0 = next;
-        next
-    })
+    if focus.sort_focused {
+        // The sort box is the last pane; wrap back to the first bag.
+        focus.sort_focused = false;
+        let first = *bags.first()?;
+        (first != active.0).then(|| {
+            active.0 = first;
+            first
+        })
+    } else {
+        let pos = bags.iter().position(|&id| id == active.0).unwrap_or(0);
+        match bags.get(pos + 1) {
+            Some(&next) => {
+                active.0 = next;
+                Some(next)
+            }
+            None => {
+                focus.sort_focused = true;
+                focus.sort_cursor = if sort_auto { 0 } else { 1 };
+                None
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -484,9 +504,9 @@ pub(crate) fn update_item_screen(
         .map(|c| (c.items.len(), c.capacity))
         .unwrap_or((0, 0));
     let header = format!("{bag_name}  {used}/{capacity}");
-    // Sort-pane hint follows whatever key ToggleEngage (FFXI's window-change
+    // Sort-pane hint follows whatever key SelectActiveWindow (FFXI's window-change
     // key) is currently bound to, rather than a hard-coded key name.
-    let sort_title = match bindings.key_label(crate::keybinds::Action::ToggleEngage) {
+    let sort_title = match bindings.key_label(crate::keybinds::Action::SelectActiveWindow) {
         Some(label) => format!("Sort  [{label}]"),
         None => "Sort".to_string(),
     };
@@ -768,8 +788,8 @@ pub(crate) fn update_bag_tabs(
     }
 }
 
-/// Clicking a tab jumps straight to that bag (the keyboard path is
-/// NavLeft/NavRight in the list pane).
+/// Clicking a tab jumps straight to that bag (the keyboard path is the
+/// "Select active window" key stepping through the panes).
 pub(crate) fn bag_tab_mouse_system(
     mut mode: ResMut<InputMode>,
     state: Res<SceneState>,
@@ -867,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn cycle_steps_both_directions_and_wraps() {
+    fn select_active_window_steps_bags_then_sort_then_wraps() {
         use ffxi_proto::map::container as c;
         let snap = snapshot_with_bags(&[
             (c::LOC_INVENTORY, 30),
@@ -875,32 +895,49 @@ mod tests {
             (c::LOC_WARDROBE, 80),
         ]);
         let mut active = ItemScreenContainer(c::LOC_INVENTORY);
-        assert_eq!(cycle_container(&snap, &mut active, 1), Some(c::LOC_MOGCASE));
+        let mut focus = ItemMenuFocus::default();
         assert_eq!(
-            cycle_container(&snap, &mut active, 1),
-            Some(c::LOC_WARDROBE)
-        );
-        assert_eq!(
-            cycle_container(&snap, &mut active, 1),
-            Some(c::LOC_INVENTORY)
-        );
-        assert_eq!(
-            cycle_container(&snap, &mut active, -1),
-            Some(c::LOC_WARDROBE)
-        );
-        assert_eq!(
-            cycle_container(&snap, &mut active, -1),
+            select_active_window(&snap, &mut active, &mut focus, true),
             Some(c::LOC_MOGCASE)
         );
+        assert_eq!(
+            select_active_window(&snap, &mut active, &mut focus, true),
+            Some(c::LOC_WARDROBE)
+        );
+        // Past the last bag: focus moves into the sort box, bag unchanged.
+        assert_eq!(
+            select_active_window(&snap, &mut active, &mut focus, true),
+            None
+        );
+        assert!(focus.sort_focused);
+        assert_eq!(focus.sort_cursor, 0);
+        assert_eq!(active.0, c::LOC_WARDROBE);
+        // Next press wraps back to the first bag and leaves the sort box.
+        assert_eq!(
+            select_active_window(&snap, &mut active, &mut focus, true),
+            Some(c::LOC_INVENTORY)
+        );
+        assert!(!focus.sort_focused);
     }
 
     #[test]
-    fn cycle_with_one_bag_is_a_no_op() {
+    fn select_active_window_with_one_bag_toggles_sort_box() {
         use ffxi_proto::map::container as c;
         let snap = snapshot_with_bags(&[(c::LOC_INVENTORY, 30)]);
         let mut active = ItemScreenContainer(c::LOC_INVENTORY);
-        assert_eq!(cycle_container(&snap, &mut active, 1), None);
-        assert_eq!(cycle_container(&snap, &mut active, -1), None);
+        let mut focus = ItemMenuFocus::default();
+        assert_eq!(
+            select_active_window(&snap, &mut active, &mut focus, false),
+            None
+        );
+        assert!(focus.sort_focused);
+        // Cursor starts on the current sort mode (Manual here).
+        assert_eq!(focus.sort_cursor, 1);
+        assert_eq!(
+            select_active_window(&snap, &mut active, &mut focus, false),
+            None
+        );
+        assert!(!focus.sort_focused);
         assert_eq!(active.0, c::LOC_INVENTORY);
     }
 

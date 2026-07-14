@@ -118,6 +118,7 @@ fn text_field_on_key(
                     commands.trigger(ValueChange {
                         source: ev.focused_entity,
                         value,
+                        is_final: false,
                     });
                 }
                 ev.propagate(false);
@@ -205,6 +206,7 @@ fn text_field_on_key(
         commands.trigger(ValueChange {
             source: ev.focused_entity,
             value,
+            is_final: false,
         });
     }
 }
@@ -216,7 +218,7 @@ fn sync_display(
     mut q_display: Query<(&TextFieldDisplay, &mut Text, &mut TextColor)>,
 ) {
     let caret_on = time.elapsed_secs().rem_euclid(1.0) < 0.5;
-    let focused = focus.and_then(|f| f.0);
+    let focused = focus.and_then(|f| f.get());
     for (display, mut text, mut color) in q_display.iter_mut() {
         let Ok(field) = q_fields.get(display.owner) else {
             continue;
@@ -266,7 +268,7 @@ fn sync_focus_border(
     focus: Option<Res<InputFocus>>,
     mut q: Query<(Entity, &mut BorderColor), With<TextField>>,
 ) {
-    let focused = focus.and_then(|f| f.0);
+    let focused = focus.and_then(|f| f.get());
     for (e, mut bc) in q.iter_mut() {
         let target = if Some(e) == focused {
             Color::srgb(0.36, 0.62, 1.0)

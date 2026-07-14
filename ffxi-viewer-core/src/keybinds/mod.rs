@@ -47,7 +47,7 @@ pub enum Action {
     TargetParty5,
     TargetParty6,
 
-    ToggleEngage,
+    SelectActiveWindow,
 
     Sit,
 
@@ -263,6 +263,11 @@ fn nav_keycode_for(key: &Key) -> Option<KeyCode> {
             let (Some(c), None) = (chars.next(), chars.next()) else {
                 return None;
             };
+            // "+" resolves to Numpad + so the Standard preset's retail
+            // window-change key works inside menus too.
+            if c == '+' {
+                return Some(KeyCode::NumpadAdd);
+            }
             letter_keycode(c.to_ascii_uppercase())
         }
         _ => None,
@@ -345,6 +350,7 @@ fn keycode_label(key: KeyCode) -> Option<&'static str> {
         KeyCode::Insert => "Ins",
         KeyCode::Delete => "Del",
         KeyCode::Minus => "-",
+        KeyCode::NumpadAdd => "Num+",
         KeyCode::Slash => "/",
         KeyCode::Period => ".",
         KeyCode::Comma => ",",
@@ -432,22 +438,22 @@ mod tests {
     #[test]
     fn matches_logical_resolves_letter_chars() {
         let mut b = Bindings::empty();
-        b.insert(Action::ToggleEngage, KeyBind::new(KeyCode::KeyF));
+        b.insert(Action::SelectActiveWindow, KeyBind::new(KeyCode::KeyF));
 
-        assert!(b.matches_logical(Action::ToggleEngage, &Key::Character("f".into())));
-        assert!(b.matches_logical(Action::ToggleEngage, &Key::Character("F".into())));
+        assert!(b.matches_logical(Action::SelectActiveWindow, &Key::Character("f".into())));
+        assert!(b.matches_logical(Action::SelectActiveWindow, &Key::Character("F".into())));
 
-        assert!(!b.matches_logical(Action::ToggleEngage, &Key::Character("g".into())));
-        assert!(!b.matches_logical(Action::ToggleEngage, &Key::Character("ff".into())));
+        assert!(!b.matches_logical(Action::SelectActiveWindow, &Key::Character("g".into())));
+        assert!(!b.matches_logical(Action::SelectActiveWindow, &Key::Character("ff".into())));
     }
 
     #[test]
     fn key_label_reports_bound_key() {
         let mut b = Bindings::empty();
-        b.insert(Action::ToggleEngage, KeyBind::new(KeyCode::KeyF));
+        b.insert(Action::SelectActiveWindow, KeyBind::new(KeyCode::KeyF));
         b.insert(Action::PageDown, KeyBind::new(KeyCode::PageDown));
 
-        assert_eq!(b.key_label(Action::ToggleEngage), Some("F"));
+        assert_eq!(b.key_label(Action::SelectActiveWindow), Some("F"));
         assert_eq!(b.key_label(Action::PageDown), Some("PgDn"));
         assert_eq!(b.key_label(Action::PageUp), None);
     }

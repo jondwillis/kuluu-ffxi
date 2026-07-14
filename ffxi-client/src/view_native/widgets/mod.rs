@@ -1,6 +1,6 @@
 pub mod text_field;
 
-use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
+use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input_focus::tab_navigation::TabGroup;
 use bevy::prelude::*;
@@ -112,8 +112,8 @@ pub fn spawn_widget_demo(mut commands: Commands) {
                     ..default()
                 },
             ));
-            root.spawn(button(
-                ButtonProps {
+            root.spawn(button_bundle(
+                ButtonBundleProps {
                     variant: ButtonVariant::Primary,
                     ..default()
                 },

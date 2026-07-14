@@ -66,7 +66,7 @@ fn shared() -> Vec<(Action, KeyBind)> {
         (Action::TogglePassiveCursor, KeyBind::new(KeyCode::Insert)),
         (Action::CycleTarget, KeyBind::new(KeyCode::Tab)),
         (Action::ClearTarget, KeyBind::new(KeyCode::Escape)),
-        (Action::ToggleEngage, KeyBind::new(KeyCode::KeyF)),
+        (Action::SelectActiveWindow, KeyBind::new(KeyCode::KeyF)),
         (Action::TargetSelf, KeyBind::new(KeyCode::F1)),
         (Action::TargetParty2, KeyBind::new(KeyCode::F2)),
         (Action::TargetParty3, KeyBind::new(KeyCode::F3)),
@@ -133,6 +133,9 @@ pub fn standard() -> Bindings {
         (Action::CameraYawLeft, KeyBind::new(KeyCode::ArrowLeft)),
         (Action::CameraYawRight, KeyBind::new(KeyCode::ArrowRight)),
         (Action::ToggleAutorun, KeyBind::new(KeyCode::Numpad7)),
+        // Retail full keyboard: "Select active window" is Numpad + (F is the
+        // compact-keyboard binding inherited from shared()).
+        (Action::SelectActiveWindow, KeyBind::new(KeyCode::NumpadAdd)),
     ]);
     Bindings::from_pairs(pairs)
 }

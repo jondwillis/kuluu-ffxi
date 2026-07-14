@@ -287,7 +287,7 @@ fn spawn_static_scene(
     commands.spawn((
         DirectionalLight {
             illuminance: 8_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_xyz(2.0, 4.0, 3.0).looking_at(PREVIEW_PARENT_POS, Vec3::Y),
@@ -296,7 +296,7 @@ fn spawn_static_scene(
     commands.spawn((
         DirectionalLight {
             illuminance: 3_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_xyz(-2.0, 2.0, -2.0).looking_at(PREVIEW_PARENT_POS, Vec3::Y),

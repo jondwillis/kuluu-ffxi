@@ -47,11 +47,11 @@ pub fn spawn_target_list_hud(mut commands: Commands) {
                     InfoLine(i),
                     Text::new(""),
                     TextFont {
-                        font_size: ROW_FONT,
+                        font_size: ROW_FONT.into(),
                         ..default()
                     },
                     TextColor(palette::MUTED),
-                    TextLayout::new_with_no_wrap(),
+                    TextLayout::no_wrap(),
                 ));
             }
             for i in 0..MAX_ROWS {
@@ -59,11 +59,11 @@ pub fn spawn_target_list_hud(mut commands: Commands) {
                     TargetListRow(i),
                     Text::new(""),
                     TextFont {
-                        font_size: ROW_FONT,
+                        font_size: ROW_FONT.into(),
                         ..default()
                     },
                     TextColor(palette::TEXT),
-                    TextLayout::new_with_no_wrap(),
+                    TextLayout::no_wrap(),
                     Node {
                         display: Display::None,
                         ..default()

@@ -1,5 +1,5 @@
 use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
+use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -90,8 +90,8 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<ServerEditForm>, server
                 );
 
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button(
-                        ButtonProps {
+                    r.spawn(button_bundle(
+                        ButtonBundleProps {
                             variant: ButtonVariant::Primary,
                             ..default()
                         },
@@ -105,8 +105,8 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<ServerEditForm>, server
                             save_form(&form, &mut next);
                         },
                     );
-                    r.spawn(button(
-                        ButtonProps::default(),
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new("Cancel"), ThemedText)),
                     ))
@@ -255,8 +255,8 @@ fn spawn_flavor_button(
         ButtonVariant::Normal
     };
     parent
-        .spawn((button(
-            ButtonProps {
+        .spawn((button_bundle(
+            ButtonBundleProps {
                 variant,
                 ..default()
             },

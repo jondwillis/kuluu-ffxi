@@ -1,5 +1,5 @@
 use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button, checkbox, ButtonProps, ButtonVariant};
+use bevy::feathers::controls::{button_bundle, checkbox_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -151,7 +151,7 @@ fn build_ui(commands: &mut Commands, form: &SettingsForm, server: &ServerInfo) {
                     panel.spawn((
                         Text::new(text),
                         TextFont {
-                            font_size: 13.0,
+                            font_size: 13.0.into(),
                             ..default()
                         },
                         TextColor(color),
@@ -160,8 +160,8 @@ fn build_ui(commands: &mut Commands, form: &SettingsForm, server: &ServerInfo) {
                 }
 
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button(
-                        ButtonProps {
+                    r.spawn(button_bundle(
+                        ButtonBundleProps {
                             variant: ButtonVariant::Primary,
                             ..default()
                         },
@@ -170,8 +170,8 @@ fn build_ui(commands: &mut Commands, form: &SettingsForm, server: &ServerInfo) {
                     ))
                     .observe(save_observer);
 
-                    r.spawn(button(
-                        ButtonProps::default(),
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new("Back"), ThemedText)),
                     ))
@@ -245,8 +245,8 @@ fn spawn_path_field(
 
             if browsable {
                 let browse_label = label.to_string();
-                rowc.spawn(button(
-                    ButtonProps::default(),
+                rowc.spawn(button_bundle(
+                    ButtonBundleProps::default(),
                     (),
                     Spawn((Text::new("Browse…"), ThemedText)),
                 ))
@@ -260,7 +260,10 @@ fn spawn_path_field(
                 );
             }
 
-            let mut cb = rowc.spawn(checkbox((), Spawn((Text::new("Override"), ThemedText))));
+            let mut cb = rowc.spawn(checkbox_bundle(
+                (),
+                Spawn((Text::new("Override"), ThemedText)),
+            ));
             if override_env {
                 cb.insert(Checked);
             }

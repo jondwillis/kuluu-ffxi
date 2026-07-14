@@ -1,5 +1,5 @@
 use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
+use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -144,8 +144,8 @@ fn build_ui(commands: &mut Commands, form: &DatSetupForm) {
                             },
                         );
 
-                        rowc.spawn(button(
-                            ButtonProps::default(),
+                        rowc.spawn(button_bundle(
+                            ButtonBundleProps::default(),
                             (),
                             Spawn((Text::new("Browse…"), ThemedText)),
                         ))
@@ -163,7 +163,7 @@ fn build_ui(commands: &mut Commands, form: &DatSetupForm) {
                     panel.spawn((
                         Text::new(msg),
                         TextFont {
-                            font_size: 13.0,
+                            font_size: 13.0.into(),
                             ..default()
                         },
                         TextColor(color),
@@ -172,8 +172,8 @@ fn build_ui(commands: &mut Commands, form: &DatSetupForm) {
                 }
 
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button(
-                        ButtonProps {
+                    r.spawn(button_bundle(
+                        ButtonBundleProps {
                             variant: ButtonVariant::Primary,
                             ..default()
                         },

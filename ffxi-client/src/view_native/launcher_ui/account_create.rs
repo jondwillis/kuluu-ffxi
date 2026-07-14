@@ -1,5 +1,5 @@
 use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
+use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -56,7 +56,7 @@ pub(super) fn spawn_ui(
                     StatusText,
                     Text::new(initial_msg),
                     TextFont {
-                        font_size: 13.0,
+                        font_size: 13.0.into(),
                         ..default()
                     },
                     TextColor(Color::srgb(0.95, 0.55, 0.30)),
@@ -64,8 +64,8 @@ pub(super) fn spawn_ui(
                 ));
 
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button(
-                        ButtonProps {
+                    r.spawn(button_bundle(
+                        ButtonBundleProps {
                             variant: ButtonVariant::Primary,
                             ..default()
                         },
@@ -84,8 +84,8 @@ pub(super) fn spawn_ui(
                         },
                     );
 
-                    r.spawn(button(
-                        ButtonProps::default(),
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new("Cancel"), ThemedText)),
                     ))
@@ -222,7 +222,7 @@ pub(super) fn spawn_error_ui(mut commands: Commands, msg: Res<CreateAccountError
                 panel.spawn((
                     Text::new("Account creation failed"),
                     TextFont {
-                        font_size: 22.0,
+                        font_size: 22.0.into(),
                         ..default()
                     },
                     TextColor(Color::srgb(0.95, 0.30, 0.30)),
@@ -231,15 +231,15 @@ pub(super) fn spawn_error_ui(mut commands: Commands, msg: Res<CreateAccountError
                 panel.spawn((
                     Text::new(body),
                     TextFont {
-                        font_size: 13.0,
+                        font_size: 13.0.into(),
                         ..default()
                     },
                     TextColor(Color::srgb(0.85, 0.85, 0.85)),
                     ThemedText,
                 ));
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button(
-                        ButtonProps {
+                    r.spawn(button_bundle(
+                        ButtonBundleProps {
                             variant: ButtonVariant::Primary,
                             ..default()
                         },
@@ -251,8 +251,8 @@ pub(super) fn spawn_error_ui(mut commands: Commands, msg: Res<CreateAccountError
                             next.set(LauncherState::CreateAccountInFlight);
                         },
                     );
-                    r.spawn(button(
-                        ButtonProps::default(),
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
                         (),
                         Spawn((Text::new("Back to form"), ThemedText)),
                     ))

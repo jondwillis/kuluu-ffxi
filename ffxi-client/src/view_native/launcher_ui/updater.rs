@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
+use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::prelude::*;
 use bevy::ui_widgets::Activate;
@@ -242,14 +242,14 @@ fn build_banner(commands: &mut Commands, latest: &str) {
                 bar.spawn((
                     Text::new(format!("Update available → {latest}")),
                     TextFont {
-                        font_size: 13.0,
+                        font_size: 13.0.into(),
                         ..default()
                     },
                     TextColor(Color::srgb(0.0, 1.0, 1.0)),
                     ThemedText,
                 ));
-                bar.spawn(button(
-                    ButtonProps {
+                bar.spawn(button_bundle(
+                    ButtonBundleProps {
                         variant: ButtonVariant::Primary,
                         ..default()
                     },
@@ -257,8 +257,8 @@ fn build_banner(commands: &mut Commands, latest: &str) {
                     Spawn((Text::new("Open release page"), ThemedText)),
                 ))
                 .observe(|_ev: On<Activate>| open_url(RELEASE_URL));
-                bar.spawn(button(
-                    ButtonProps::default(),
+                bar.spawn(button_bundle(
+                    ButtonBundleProps::default(),
                     (),
                     Spawn((Text::new("Dismiss"), ThemedText)),
                 ))

@@ -5,7 +5,12 @@ pub mod debug_heights;
 pub mod exit_watchdog;
 pub mod input;
 pub mod launcher_backdrop;
+// 0.19 deprecated the feathers `*_bundle` spawn fns in favor of BSN scenes;
+// the launcher screens migrate to BSN in kuluu-dnr5, so tolerate the shims
+// until then.
+#[allow(deprecated)]
 pub mod launcher_ui;
+#[allow(deprecated)]
 pub mod model_viewer;
 pub mod nameplate_occlude;
 pub mod navmesh_overlay;
@@ -14,6 +19,7 @@ pub mod screenshot;
 pub mod slash_commands;
 pub mod target_list_hud;
 pub mod text_input;
+#[allow(deprecated)]
 pub mod widgets;
 pub mod zone_transition;
 
@@ -122,7 +128,7 @@ fn gpu_timing_render_plugin() -> bevy::render::RenderPlugin {
     settings.features |=
         WgpuFeatures::TIMESTAMP_QUERY | WgpuFeatures::TIMESTAMP_QUERY_INSIDE_ENCODERS;
     bevy::render::RenderPlugin {
-        render_creation: RenderCreation::Automatic(settings),
+        render_creation: RenderCreation::Automatic(Box::new(settings)),
         ..default()
     }
 }

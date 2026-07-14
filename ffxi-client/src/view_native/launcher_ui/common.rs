@@ -1,5 +1,5 @@
 use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
+use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input_focus::tab_navigation::TabGroup;
 use bevy::prelude::*;
@@ -100,7 +100,7 @@ pub(super) fn title(text: impl Into<String>) -> impl Bundle {
     (
         Text::new(text.into()),
         TextFont {
-            font_size: 22.0,
+            font_size: 22.0.into(),
             ..default()
         },
         TextColor(Color::srgb(0.0, 1.0, 1.0)),
@@ -112,7 +112,7 @@ pub(super) fn hint(text: impl Into<String>) -> impl Bundle {
     (
         Text::new(text.into()),
         TextFont {
-            font_size: 12.0,
+            font_size: 12.0.into(),
             ..default()
         },
         TextColor(Color::srgb(0.6, 0.6, 0.65)),
@@ -144,8 +144,8 @@ pub(super) fn spawn_breadcrumb(
             BorderColor::all(Color::srgb(0.20, 0.20, 0.24)),
         ))
         .with_children(|chip| {
-            chip.spawn(button(
-                ButtonProps::default(),
+            chip.spawn(button_bundle(
+                ButtonBundleProps::default(),
                 (),
                 Spawn((
                     Text::new(format!("Server: {}", server.display_label())),
@@ -164,7 +164,7 @@ pub(super) fn spawn_breadcrumb(
                 chip.spawn((
                     Text::new(">"),
                     TextFont {
-                        font_size: 14.0,
+                        font_size: 14.0.into(),
                         ..default()
                     },
                     TextColor(Color::srgb(0.55, 0.55, 0.60)),
@@ -175,15 +175,15 @@ pub(super) fn spawn_breadcrumb(
                     chip.spawn((
                         Text::new(label),
                         TextFont {
-                            font_size: 14.0,
+                            font_size: 14.0.into(),
                             ..default()
                         },
                         TextColor(Color::srgb(0.85, 0.85, 0.90)),
                         ThemedText,
                     ));
                 } else if let Some(target) = crumb.target() {
-                    chip.spawn(button(
-                        ButtonProps {
+                    chip.spawn(button_bundle(
+                        ButtonBundleProps {
                             variant: ButtonVariant::Normal,
                             ..default()
                         },
@@ -199,7 +199,7 @@ pub(super) fn spawn_breadcrumb(
                     chip.spawn((
                         Text::new(label),
                         TextFont {
-                            font_size: 14.0,
+                            font_size: 14.0.into(),
                             ..default()
                         },
                         TextColor(Color::srgb(0.85, 0.85, 0.90)),
@@ -265,15 +265,15 @@ fn spawn_titlebar(
                 },
                 Text::new(title_text.into()),
                 TextFont {
-                    font_size: 22.0,
+                    font_size: 22.0.into(),
                     ..default()
                 },
                 TextColor(Color::srgb(0.0, 1.0, 1.0)),
                 ThemedText,
             ));
             bar.spawn(Node::default()).with_children(|slot| {
-                let mut btn = slot.spawn(button(
-                    ButtonProps::default(),
+                let mut btn = slot.spawn(button_bundle(
+                    ButtonBundleProps::default(),
                     (),
                     Spawn((Text::new(label), ThemedText)),
                 ));

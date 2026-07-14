@@ -105,7 +105,7 @@ fn spawn_preview(
     commands.spawn((
         DirectionalLight {
             illuminance: 15_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         RenderLayers::layer(PREVIEW_RENDER_LAYER),
@@ -116,7 +116,7 @@ fn spawn_preview(
     commands.spawn((
         DirectionalLight {
             illuminance: 7_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         RenderLayers::layer(PREVIEW_RENDER_LAYER),
@@ -127,7 +127,7 @@ fn spawn_preview(
     commands.spawn((
         DirectionalLight {
             illuminance: 4_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         RenderLayers::layer(PREVIEW_RENDER_LAYER),

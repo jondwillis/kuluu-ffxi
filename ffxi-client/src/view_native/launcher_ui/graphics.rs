@@ -1,12 +1,12 @@
 use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button, ButtonProps, ButtonVariant};
+use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui::{ComputedNode, Overflow, ScrollPosition};
-use bevy::ui_widgets::{Activate, ControlOrientation, CoreScrollbarThumb, Scrollbar};
+use bevy::ui_widgets::{Activate, ControlOrientation, Scrollbar, ScrollbarThumb};
 
 use ffxi_viewer_core::{GraphicsField, GraphicsSettings, GRAPHICS_FIELDS};
 
@@ -124,8 +124,8 @@ pub(super) fn spawn_ui(
                                     }
 
                                     list.spawn(row()).with_children(|r| {
-                                        r.spawn(button(
-                                            ButtonProps {
+                                        r.spawn(button_bundle(
+                                            ButtonBundleProps {
                                                 variant: ButtonVariant::Normal,
                                                 ..default()
                                             },
@@ -176,12 +176,14 @@ pub(super) fn spawn_ui(
                             ))
                             .with_children(|track| {
                                 track.spawn((
-                                    CoreScrollbarThumb,
-                                    Node {
-                                        position_type: PositionType::Absolute,
+                                    ScrollbarThumb {
                                         border_radius: BorderRadius::all(Val::Px(
                                             SCROLLBAR_WIDTH / 2.0,
                                         )),
+                                        border: UiRect::DEFAULT,
+                                    },
+                                    Node {
+                                        position_type: PositionType::Absolute,
                                         ..default()
                                     },
                                     BackgroundColor(SCROLLBAR_THUMB_COLOR),
@@ -190,8 +192,8 @@ pub(super) fn spawn_ui(
                         });
 
                     panel.spawn(row()).with_children(|r| {
-                        r.spawn(button(
-                            ButtonProps {
+                        r.spawn(button_bundle(
+                            ButtonBundleProps {
                                 variant: ButtonVariant::Normal,
                                 ..default()
                             },
@@ -204,8 +206,8 @@ pub(super) fn spawn_ui(
                             },
                         );
 
-                        r.spawn(button(
-                            ButtonProps {
+                        r.spawn(button_bundle(
+                            ButtonBundleProps {
                                 variant: ButtonVariant::Primary,
                                 ..default()
                             },
@@ -254,14 +256,14 @@ fn spawn_field_row(
             },
             Text::new(field.label().to_string()),
             TextFont {
-                font_size: ROW_FONT_SIZE,
+                font_size: ROW_FONT_SIZE.into(),
                 ..default()
             },
             ThemedText,
         ));
 
-        rowc.spawn(button(
-            ButtonProps::default(),
+        rowc.spawn(button_bundle(
+            ButtonBundleProps::default(),
             (),
             Spawn((Text::new("◀"), ThemedText)),
         ))
@@ -279,7 +281,7 @@ fn spawn_field_row(
             },
             Text::new(settings.value_label(field)),
             TextFont {
-                font_size: ROW_FONT_SIZE,
+                font_size: ROW_FONT_SIZE.into(),
                 ..default()
             },
             TextColor(value_color),
@@ -287,8 +289,8 @@ fn spawn_field_row(
             ThemedText,
         ));
 
-        rowc.spawn(button(
-            ButtonProps::default(),
+        rowc.spawn(button_bundle(
+            ButtonBundleProps::default(),
             (),
             Spawn((Text::new("▶"), ThemedText)),
         ))
