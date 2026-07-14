@@ -7,13 +7,20 @@ drives the session underneath, screenshots are the evidence**.
 ## Launch with the agent socket
 
 ```bash
-FFXI_USER=... FFXI_PASS=... FFXI_CHAR=... FFXI_SERVER=127.0.0.1 \
-  cargo run -p ffxi-client -- --agent-listen auto play
+cargo run -p ffxi-client --features native-window -- \
+  --agent-listen auto play <user> '<password>' '<Char Name>'
 ```
 
+Credentials are **positional args to `play`** — the GUI path reads no
+`FFXI_USER`/`FFXI_PASS`/`FFXI_CHAR` env vars (only headless test fixtures
+do); launching without them leaves the in-window launcher waiting for input
+while the log looks alive (zone geometry loads behind the launcher).
+
 `--agent-listen auto` (or `FFXI_AGENT_LISTEN=auto`) writes
-`$TMPDIR/ffxi-agent.pid` with the unix-socket path. The GUI session runs the
-full reactor, so goals work.
+`$TMPDIR/ffxi-agent.pid` with the unix-socket path — but that file can be
+stale from a dead run; trust it only if its `pid` is alive, else glob
+`$TMPDIR/ffxi-agent-<pid>.sock` for the live process. The GUI session runs
+the full reactor, so goals work.
 
 ## Attach ffxi-mcp to the running window
 
@@ -45,15 +52,32 @@ to see.
 - Screen recordings for motion bugs (jank, camera): `screencapture -v` or ask
   the user to observe; say precisely what to look for.
 
+## Keystrokes via System Events (menus ARE drivable)
+
+The agent socket carries session-level `AgentCommand`s only, but macOS can
+inject real keystrokes, which exercises the whole input layer (dialog
+choices, menu stacks, the Items window — verified working for the Mog Menu
+storage flow):
+
+```bash
+osascript -e 'tell application "System Events"
+    set frontmost of (first process whose name contains "ffxi") to true
+    delay 0.4
+    key code 125  -- Down (126 Up, 123 Left, 124 Right)
+    delay 0.3
+    key code 36   -- Enter
+end tell'         -- key code 53 = Escape
+```
+
+Needs Accessibility permission for the invoking terminal. Keep `delay`s
+≥0.3s; screenshot after each step and Read it — keystrokes are fire-and-
+forget.
+
 ## What still needs human eyes
 
-The agent socket carries session-level `AgentCommand`s only — **no
-keystrokes**. Anything driven by the input layer is out of reach:
-
-- WASD/autorun movement (and everything downstream: wall-slide, re-ground,
-  `dispatch_movement_system`)
+- WASD/autorun movement *feel* (wall-slide, re-ground) — a scripted
+  key-hold isn't a human hand
 - Chase-camera orbit/zoom and camera collision feel
-- Menu/HUD keyboard navigation, slash-command entry
 
 For these: set the scene up via attach (position, zone, targets), then hand
 off with exact instructions — "walk into the north wall and watch whether the
@@ -69,3 +93,6 @@ a movement test.
 - `screencapture` needs Screen Recording permission for the invoking terminal.
 - One GUI client at a time: it holds the char's session; a parallel headless
   login with the same char will fight it (ghost-session lockout, stack.md).
+- **Don't run `scripts/checks.sh test` while a GUI session is live** — the
+  `agent_session` integration test logs into the same local LSB and kicks
+  the running session mid-verify. Gate first, then launch.
