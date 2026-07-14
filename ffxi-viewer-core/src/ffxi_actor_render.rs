@@ -377,6 +377,14 @@ fn default_pc_equipment(race: u8) -> Vec<u32> {
     out
 }
 
+/// Retail's PC race byte is only ever 1..=8 (`skeleton_file_id_for_race`'s
+/// table is exactly that size — there is no retail skeleton for anything
+/// else). An "Equipped"-look NPC broadcasting a race outside that range is
+/// bad server-side data, not a client gap; falling back to Hume Male here
+/// renders *a* humanoid instead of leaving the entity as a bare placeholder
+/// orb, at the cost of a wrong race/equipment fit for that one NPC.
+const FALLBACK_RACE: u8 = 1;
+
 pub fn load_pc(
     race: u8,
     equipment: &[u32],
@@ -387,6 +395,16 @@ pub fn load_pc(
     crate::perf_probe::note_model_load();
     let _ = sub_weapon;
     let root = DatRoot::from_env_or_default().map_err(|e| format!("DatRoot: {e}"))?;
+    let race = if skeleton_file_id_for_race(race).is_some() {
+        race
+    } else {
+        warn!(
+            race,
+            fallback = FALLBACK_RACE,
+            "load_pc: race has no retail skeleton, falling back"
+        );
+        FALLBACK_RACE
+    };
     let skel_file_id =
         skeleton_file_id_for_race(race).ok_or_else(|| format!("unsupported race {race}"))?;
 
