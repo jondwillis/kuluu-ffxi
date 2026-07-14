@@ -194,6 +194,11 @@ impl<'a> MmbSubRecord<'a> {
             .collect()
     }
 
+    /// Decoded view of the `blending` word; see [`MmbRenderState`].
+    pub fn render_state(&self) -> MmbRenderState {
+        MmbRenderState::from_blending(self.blending)
+    }
+
     pub fn parse_triangle_strip(&self) -> Vec<u16> {
         let vert_bytes = self.count as usize * 36;
         if vert_bytes >= self.body.len() {
@@ -332,10 +337,69 @@ fn is_ascii_variant(b: &[u8]) -> bool {
         .all(|&c| c == 0 || c.is_ascii_alphanumeric() || c == b'_' || c == b' ')
 }
 
+/// Per-mesh render state decoded from the 16-bit flags word at sub-record
+/// offset 18 (`MmbSubRecord::blending` / `MmbModel::blending`).
+///
+/// Bit layout follows xim's zone-mesh parser
+/// (research/xim/src/jsMain/kotlin/xim/resource/ZoneMeshSection.kt:79-81):
+/// - `0x8000`: alpha blending enabled (`blendEnabled`)
+/// - `0x2000`: back-face culling DISABLED (culling defaults to on/CCW;
+///   the set bit turns it off)
+///
+/// Derived state (not stored in the DAT, reproduced from xim):
+/// - depth bias: `blendEnabled` -> `ZBiasLevel.High`, else `Normal`
+///   (ZoneMeshSection.kt:120-123), applied by the GL layer as
+///   `polygonOffset(zBias * -1, 1)` (GLDrawer.kt:219, :363).
+/// - depth write: disabled for blended meshes (GLDrawer.kt:198-201, :332-342).
+/// - discard threshold: 0.375 when the zone-mesh *name* starts with `_`
+///   (ZoneMeshSection.kt:118) — i.e. the name-prefix heuristic in
+///   `dat_mmb.rs::submesh_alpha_mode` is retail-faithful, not a guess.
+///
+/// NOTE: `vertexBlendEnabled` is NOT in this word. It is the section-level
+/// config bit `0x2` (ZoneMeshSection.kt:35), which for SMMB corresponds to
+/// `d3 == 2` / vertex stride 48 (`MmbModel::vertex_blend_enabled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmbRenderState {
+    /// Alpha blending on (bit `0x8000`). Implies high depth bias and no
+    /// depth write.
+    pub blend_enabled: bool,
+    /// Back-face culling on (bit `0x2000` CLEAR).
+    pub back_face_culling: bool,
+}
+
+impl MmbRenderState {
+    pub fn from_blending(blending: u16) -> Self {
+        Self {
+            blend_enabled: blending & 0x8000 != 0,
+            back_face_culling: blending & 0x2000 == 0,
+        }
+    }
+
+    /// ZoneMeshSection.kt:120-123 — blended zone meshes render at
+    /// `ZBiasLevel.High` (1), opaque at `Normal` (0).
+    pub fn z_bias_level(&self) -> u8 {
+        if self.blend_enabled {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// GLDrawer.kt:198-201 — blended meshes do not write depth.
+    pub fn depth_write(&self) -> bool {
+        !self.blend_enabled
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MmbModel {
     pub texture_name: String,
     pub blending: u16,
+    /// Decoded view of `blending`; see [`MmbRenderState`].
+    pub render_state: MmbRenderState,
+    /// Section-level vertex-blend flag (`d3 == 2`, stride-48 layout).
+    /// Mirrors xim's `vertexBlendEnabled` (ZoneMeshSection.kt:35).
+    pub vertex_blend_enabled: bool,
     pub vertices: Vec<MmbVertex>,
 
     pub indices: Vec<u16>,
@@ -579,6 +643,8 @@ pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
                 models.push(MmbModel {
                     texture_name,
                     blending,
+                    render_state: MmbRenderState::from_blending(blending),
+                    vertex_blend_enabled: d3 == 2,
                     vertices,
                     indices,
                 });
@@ -727,6 +793,38 @@ mod tests {
         );
         assert_eq!(recs[0].count, 42);
         assert_eq!(recs[0].blending, 0x8000);
+    }
+
+    #[test]
+    fn render_state_decodes_blend_and_cull_bits() {
+        // ZoneMeshSection.kt:79-81 — 0x8000 = blend, 0x2000 = cull DISABLED.
+        let opaque = MmbRenderState::from_blending(0x0000);
+        assert!(!opaque.blend_enabled);
+        assert!(opaque.back_face_culling);
+        assert_eq!(opaque.z_bias_level(), 0);
+        assert!(opaque.depth_write());
+
+        let blended = MmbRenderState::from_blending(0x8000);
+        assert!(blended.blend_enabled);
+        assert!(blended.back_face_culling);
+        assert_eq!(blended.z_bias_level(), 1);
+        assert!(!blended.depth_write());
+
+        let no_cull = MmbRenderState::from_blending(0x2000);
+        assert!(!no_cull.blend_enabled);
+        assert!(!no_cull.back_face_culling);
+
+        let both = MmbRenderState::from_blending(0xA000);
+        assert!(both.blend_enabled);
+        assert!(!both.back_face_culling);
+    }
+
+    #[test]
+    fn render_state_ignores_unrelated_bits() {
+        // Bits other than 0x8000/0x2000 are not render state per xim.
+        let s = MmbRenderState::from_blending(0x1FFF);
+        assert!(!s.blend_enabled);
+        assert!(s.back_face_culling);
     }
 
     #[test]
