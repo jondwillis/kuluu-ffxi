@@ -9,8 +9,8 @@ use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::{
     AsBindGroup, AsBindGroupError, BindGroupLayout, BindGroupLayoutEntry, BindingResources,
-    BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages, OwnedBindingResource,
-    RenderPipelineDescriptor, SamplerBindingType, ShaderStages, ShaderType,
+    BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages, Face, FrontFace,
+    OwnedBindingResource, RenderPipelineDescriptor, SamplerBindingType, ShaderStages, ShaderType,
     SpecializedMeshPipelineError, TextureSampleType, TextureViewDimension, UnpreparedBindGroup,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
@@ -35,6 +35,47 @@ static NEXT_ZONE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Resource, Clone, Default)]
 pub struct ZoneGlobalLighting(pub FfxiLightingUniform);
 
+/// Pipeline-key half of the MMB/MZB render-state word (ffxi-dat
+/// `MmbRenderState`, decoded from the u16 at subrecord offset 18).
+///
+/// xim references:
+/// - ZoneMeshSection.kt:120-123 — blended zone meshes render at
+///   `ZBiasLevel.High` (1), opaque at `Normal` (0).
+/// - GLDrawer.kt:198-201 — blended meshes disable depth write and apply
+///   `glPolygonOffset(zBias * -1, 1)` to pull decals over the base terrain.
+/// - Bit `0x2000` CLEAR enables back-face culling.
+/// - GLDrawer.kt:186 — front face is `CW` (D3D-era winding), flipped to `CCW`
+///   when the instance is mirrored (`scale.x * scale.y * scale.z < 0`).
+///
+/// These flow into `specialize` via `AsBindGroup::Data`, so each distinct
+/// combination gets its own specialized render pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct FfxiZoneMaterialKey {
+    /// Cull back faces (`Face::Back`). FFXI winding is **clockwise** (D3D
+    /// convention, xim GLDrawer.kt:186), not Bevy's CCW default.
+    pub back_face_culling: bool,
+    /// Placement transform has a negative determinant (mirrored). Flips the
+    /// effective winding, so `specialize` flips `front_face` back to CCW.
+    /// Zone tiles are routinely placed mirrored in alternating checkerboard
+    /// patterns, so this must be per-placement, not per-chunk.
+    pub mirrored: bool,
+    /// 0 = Normal, 1 = High (blended decal layers).
+    pub z_bias_level: u8,
+    /// `false` for blended decals (they must not occlude later layers).
+    pub depth_write: bool,
+}
+
+impl FfxiZoneMaterialKey {
+    /// Key for meshes that predate render-state plumbing: no culling, no
+    /// bias, normal depth write — exactly the old hardcoded pipeline.
+    pub const LEGACY: Self = Self {
+        back_face_culling: false,
+        mirrored: false,
+        z_bias_level: 0,
+        depth_write: true,
+    };
+}
+
 #[derive(Asset, TypePath, Clone, Debug)]
 pub struct FfxiZoneMaterial {
     pub base_color_texture: Option<Handle<Image>>,
@@ -53,6 +94,10 @@ pub struct FfxiZoneMaterial {
 
     pub alpha_mode: AlphaMode,
 
+    /// Render-state bits that must specialize the pipeline (cull / bias /
+    /// depth write). See [`FfxiZoneMaterialKey`].
+    pub render_key: FfxiZoneMaterialKey,
+
     // Keys this material's persistent flags/tint/uv buffers in ZoneMaterialBuffers.
     // Per-frame data flows through those buffers via write_buffer, so mutating
     // tint/uv (with get_mut_untracked) never marks the asset Modified and the bind
@@ -67,6 +112,7 @@ impl FfxiZoneMaterial {
         tint: Vec4,
         uv_offset: Vec4,
         alpha_mode: AlphaMode,
+        render_key: FfxiZoneMaterialKey,
     ) -> Self {
         Self {
             base_color_texture,
@@ -74,6 +120,7 @@ impl FfxiZoneMaterial {
             tint,
             uv_offset,
             alpha_mode,
+            render_key,
             instance_id: NEXT_ZONE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -168,7 +215,7 @@ fn upload_zone_material_buffers(
 }
 
 impl AsBindGroup for FfxiZoneMaterial {
-    type Data = ();
+    type Data = FfxiZoneMaterialKey;
     type Param = (
         SRes<ZoneMaterialBuffers>,
         SRes<RenderAssets<GpuImage>>,
@@ -179,7 +226,9 @@ impl AsBindGroup for FfxiZoneMaterial {
         "ffxi_zone_material"
     }
 
-    fn bind_group_data(&self) -> Self::Data {}
+    fn bind_group_data(&self) -> Self::Data {
+        self.render_key
+    }
 
     fn unprepared_bind_group(
         &self,
@@ -295,7 +344,7 @@ impl Material for FfxiZoneMaterial {
         _pipeline: &MaterialPipeline,
         descriptor: &mut RenderPipelineDescriptor,
         layout: &MeshVertexBufferLayoutRef,
-        _key: MaterialPipelineKey<Self>,
+        key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
         let vertex_layout = layout.0.get_layout(&[
             Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
@@ -304,7 +353,44 @@ impl Material for FfxiZoneMaterial {
             Mesh::ATTRIBUTE_COLOR.at_shader_location(3),
         ])?;
         descriptor.vertex.buffers = vec![vertex_layout];
-        descriptor.primitive.cull_mode = None;
+
+        let rk = key.bind_group_data;
+
+        // xim renders FFXI zone geometry with back-face culling unless the
+        // render-state word sets bit 0x2000 (two-sided decals, fences, foliage
+        // cards). FFXI winding is CLOCKWISE (D3D convention) — GLDrawer.kt:186
+        // sets frontFace(CW), flipping to CCW for mirrored instances
+        // (scale.x * scale.y * scale.z < 0). Using Bevy's CCW default here
+        // culled every non-mirrored tile: inverted-checkerboard zone geometry.
+        descriptor.primitive.cull_mode = if rk.back_face_culling {
+            Some(Face::Back)
+        } else {
+            None
+        };
+        descriptor.primitive.front_face = if rk.mirrored {
+            FrontFace::Ccw
+        } else {
+            FrontFace::Cw
+        };
+
+        if let Some(ds) = descriptor.depth_stencil.as_mut() {
+            // GLDrawer.kt:198-201 — blended decals never write depth. Bevy's
+            // transparent pass already disables depth write, but the prepass
+            // (enable_prepass = true) would otherwise still write it; AND the
+            // flag in rather than overwrite whatever the pass chose.
+            ds.depth_write_enabled &= rk.depth_write;
+
+            // GLDrawer.kt: glPolygonOffset(zBias * -1, 1) pulls ZBiasLevel::High
+            // decal layers toward the camera over the coplanar base terrain.
+            // Bevy uses a reversed-Z depth buffer (closer = larger depth,
+            // GreaterEqual compare), so both GL terms flip sign: slope +zBias,
+            // constant -1.
+            if rk.z_bias_level > 0 {
+                ds.bias.slope_scale = rk.z_bias_level as f32;
+                ds.bias.constant = -1;
+            }
+        }
+
         Ok(())
     }
 }
@@ -453,6 +539,10 @@ impl Plugin for FfxiZoneMaterialPlugin {
         embedded_asset!(app, "zone_ffxi_prepass.wgsl");
         app.add_plugins(MaterialPlugin::<FfxiZoneMaterial>::default())
             .init_resource::<ZoneGlobalLighting>()
+            // Idempotent: the full viewer also inits this (lib.rs). Minimal apps
+            // (zone-render-headless) add only this plugin, and
+            // update_zone_material_lighting reads the resource unconditionally.
+            .init_resource::<crate::weather::ZoneDirectionalLighting>()
             .add_systems(Update, update_zone_material_lighting)
             .add_systems(
                 Update,

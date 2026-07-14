@@ -351,6 +351,9 @@ fn cloud_material(texture: Option<Handle<Image>>) -> FfxiZoneMaterial {
         Vec4::ONE,
         Vec4::ZERO,
         AlphaMode::Blend,
+        // Clouds are a synthetic layer with no DAT render-state word; keep the
+        // pre-render-state pipeline (no cull, no bias).
+        crate::ffxi_zone_material::FfxiZoneMaterialKey::LEGACY,
     )
 }
 

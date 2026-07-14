@@ -24,8 +24,12 @@ pub struct MmbOverlay;
 #[derive(Resource, Default)]
 pub struct MmbHandleCache {
     pub mesh: std::collections::HashMap<(u32, usize, usize), bevy::asset::Handle<Mesh>>,
+    /// Keyed by (file_id, chunk_idx, sub_index, mirrored). The mirror bit is
+    /// part of the pipeline key (front-face flip for negative-determinant
+    /// placements — xim GLDrawer.kt:186), so the same submesh placed both
+    /// ways needs two material instances.
     pub material:
-        std::collections::HashMap<(u32, usize, usize), bevy::asset::Handle<FfxiZoneMaterial>>,
+        std::collections::HashMap<(u32, usize, usize, bool), bevy::asset::Handle<FfxiZoneMaterial>>,
 }
 
 #[derive(Resource, Default)]
@@ -551,9 +555,26 @@ pub fn process_load_mmb_requests(
                         0.0
                     };
 
+                    // Render-state word -> pipeline key (cull / z-bias / depth
+                    // write). See FfxiZoneMaterialKey and ffxi-dat MmbRenderState.
+                    //
+                    // FFXI winding is clockwise (D3D). Mirrored placements
+                    // (negative-determinant transforms, ubiquitous for zone
+                    // tiles) flip effective winding, so the front-face choice
+                    // must ride the pipeline key per placement — xim
+                    // GLDrawer.kt:186 does the same via glFrontFace.
+                    let rs = ffxi_dat::mmb::MmbRenderState::from_blending(sub.blending);
+                    let mirrored = req.world_transform.is_some_and(|m| m.determinant() < 0.0);
+                    let render_key = crate::ffxi_zone_material::FfxiZoneMaterialKey {
+                        back_face_culling: rs.back_face_culling,
+                        mirrored,
+                        z_bias_level: rs.z_bias_level(),
+                        depth_write: rs.depth_write(),
+                    };
+
                     let mat_handle = handle_cache
                         .material
-                        .entry(cache_key)
+                        .entry((cache_key.0, cache_key.1, cache_key.2, mirrored))
                         .or_insert_with(|| {
                             materials.add(FfxiZoneMaterial::new(
                                 sub_texture,
@@ -568,6 +589,7 @@ pub fn process_load_mmb_requests(
                                 Vec4::ONE,
                                 Vec4::ZERO,
                                 alpha_mode,
+                                render_key,
                             ))
                         })
                         .clone();
