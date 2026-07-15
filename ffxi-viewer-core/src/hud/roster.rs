@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use ffxi_viewer_wire::PartyMember;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 #[derive(Component)]
@@ -54,8 +54,8 @@ pub fn spawn_roster_panel(mut commands: Commands) {
             row_gap: Val::Px(6.0),
             ..default()
         },
-        BackgroundColor(palette::BACKGROUND),
-        BorderColor::all(palette::BORDER),
+        BackgroundColor(theme::FRAME_BG),
+        BorderColor::all(theme::FRAME_EDGE),
     ));
 }
 
@@ -167,11 +167,8 @@ fn spawn_member_row(parent: &mut ChildSpawnerCommands, member: &PartyMember) {
             row.spawn((
                 RosterRowHeader,
                 Text::new(format_header(member)),
-                TextFont {
-                    font_size: 13.0.into(),
-                    ..default()
-                },
-                TextColor(palette::TEXT),
+                style::text_font(13.0),
+                TextColor(theme::TEXT),
             ));
 
             spawn_bar(row, member, BarStat::Hp);
@@ -188,7 +185,7 @@ fn spawn_bar(row: &mut ChildSpawnerCommands, member: &PartyMember, stat: BarStat
             height: Val::Px(BAR_HEIGHT_PX),
             ..default()
         },
-        BackgroundColor(palette::DARK),
+        BackgroundColor(theme::CELL_BG),
     ))
     .with_children(|track| {
         track.spawn((

@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use ffxi_viewer_wire::SceneSnapshot;
 
 use crate::hud::item_meta::{self, ItemDetail, ItemStatic};
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 pub const ITEM_FLAG_RARE: u16 = 0x8000;
@@ -316,18 +316,15 @@ pub fn spawn_trade_window(mut commands: Commands) {
                 ..default()
             },
             ZIndex(25),
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             p.spawn((
                 TradeTitle,
                 Text::new("Trade"),
-                TextFont {
-                    font_size: 15.0.into(),
-                    ..default()
-                },
-                TextColor(palette::ACCENT),
+                style::text_font(15.0),
+                TextColor(theme::TITLE),
             ));
 
             spawn_cell(p, TradeFocus::Gil, "Gil: 0");
@@ -359,11 +356,8 @@ pub fn spawn_trade_window(mut commands: Commands) {
             p.spawn((
                 TradeStatusLine,
                 Text::new(""),
-                TextFont {
-                    font_size: 12.0.into(),
-                    ..default()
-                },
-                TextColor(palette::MUTED),
+                style::text_font(12.0),
+                TextColor(theme::MUTED),
             ));
         });
 }
@@ -377,17 +371,14 @@ fn spawn_cell(p: &mut ChildSpawnerCommands, focus: TradeFocus, label: &str) {
             border: UiRect::all(Val::Px(1.0)),
             ..default()
         },
-        BorderColor::all(palette::BORDER),
+        BorderColor::all(theme::CELL_EDGE),
         BackgroundColor(Color::NONE),
     ))
     .with_children(|c| {
         c.spawn((
             Text::new(label.to_string()),
-            TextFont {
-                font_size: 12.0.into(),
-                ..default()
-            },
-            TextColor(palette::TEXT),
+            style::text_font(12.0),
+            TextColor(theme::TEXT),
         ));
     });
 }
@@ -427,9 +418,9 @@ pub fn update_trade_window(
         let focused = cell.focus == trade.focus;
 
         let want_border = if focused {
-            palette::ACCENT
+            theme::CURSOR
         } else {
-            palette::BORDER
+            theme::CELL_EDGE
         };
         if border.left != want_border {
             *border = BorderColor::all(want_border);

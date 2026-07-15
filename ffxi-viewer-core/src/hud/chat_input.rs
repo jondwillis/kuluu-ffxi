@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::input_mode::InputMode;
 
 #[derive(Component)]
@@ -27,18 +27,15 @@ pub fn spawn_chat_input(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             p.spawn((
                 ChatInputText,
                 Text::new("> _"),
-                TextFont {
-                    font_size: 13.0.into(),
-                    ..default()
-                },
-                TextColor(palette::TEXT),
+                style::text_font(13.0),
+                TextColor(theme::TEXT),
             ));
         });
 }

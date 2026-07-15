@@ -25,6 +25,7 @@ pub mod shop;
 pub mod stage_bar;
 pub mod status_panel;
 pub mod status_ribbon;
+pub mod style;
 pub mod target_action_menu;
 pub mod target_panel;
 pub mod trade;

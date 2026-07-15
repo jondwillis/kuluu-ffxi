@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use ffxi_viewer_wire::DialogState;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::input_mode::InputMode;
 use crate::snapshot::SceneState;
 
@@ -62,27 +62,21 @@ pub fn spawn_dialog_panel(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             p.spawn((
                 DialogHeader,
                 Text::new(""),
-                TextFont {
-                    font_size: 14.0.into(),
-                    ..default()
-                },
-                TextColor(palette::ACCENT),
+                style::text_font(14.0),
+                TextColor(theme::TITLE),
             ));
             p.spawn((
                 DialogBody,
                 Text::new(""),
-                TextFont {
-                    font_size: 13.0.into(),
-                    ..default()
-                },
-                TextColor(palette::TEXT),
+                style::text_font(13.0),
+                TextColor(theme::TEXT),
             ));
 
             p.spawn(Node {
@@ -105,17 +99,14 @@ pub fn spawn_dialog_panel(mut commands: Commands) {
                             display: Display::None,
                             ..default()
                         },
-                        BackgroundColor(palette::BACKGROUND),
+                        BackgroundColor(theme::FRAME_BG),
                     ))
                     .with_children(|btn| {
                         btn.spawn((
                             DialogOptionText { choice },
                             Text::new(""),
-                            TextFont {
-                                font_size: 13.0.into(),
-                                ..default()
-                            },
-                            TextColor(palette::TEXT),
+                            style::text_font(13.0),
+                            TextColor(theme::TEXT),
                         ));
                     });
                 }
@@ -214,11 +205,9 @@ pub fn update_dialog_options_system(
     }
     for (lbl, mut text, mut color) in &mut labels {
         let (want_text, want_color) = match choices.get(lbl.choice as usize) {
-            Some(opt) if lbl.choice == cursor => {
-                (format!("{CURSOR_MARKER} {opt}"), palette::ACCENT)
-            }
-            Some(opt) => (format!("  {opt}"), palette::TEXT),
-            None => (String::new(), palette::TEXT),
+            Some(opt) if lbl.choice == cursor => (format!("{CURSOR_MARKER} {opt}"), theme::CURSOR),
+            Some(opt) => (format!("  {opt}"), theme::TEXT),
+            None => (String::new(), theme::TEXT),
         };
         if **text != want_text {
             **text = want_text;

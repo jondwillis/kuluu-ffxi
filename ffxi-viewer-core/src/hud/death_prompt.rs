@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
-use crate::hud::palette;
 use crate::hud::self_hud::resolve_self;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 #[derive(Component)]
@@ -34,34 +34,25 @@ pub fn spawn_death_prompt(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::STAGE_BAD),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::DANGER),
         ))
         .with_children(|p| {
             p.spawn((
                 Text::new("You were defeated."),
-                TextFont {
-                    font_size: 16.0.into(),
-                    ..default()
-                },
-                TextColor(palette::STAGE_BAD),
+                style::text_font(16.0),
+                TextColor(theme::DANGER),
             ));
             p.spawn((
                 Text::new("Press [Enter] to return to your home point."),
-                TextFont {
-                    font_size: 13.0.into(),
-                    ..default()
-                },
-                TextColor(palette::TEXT),
+                style::text_font(13.0),
+                TextColor(theme::TEXT),
             ));
             p.spawn((
                 DeathCountdownText,
                 Text::new(String::new()),
-                TextFont {
-                    font_size: 13.0.into(),
-                    ..default()
-                },
-                TextColor(palette::STAGE_BAD),
+                style::text_font(13.0),
+                TextColor(theme::DANGER),
             ));
         });
 }

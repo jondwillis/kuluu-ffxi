@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 use crate::graphics_settings::{GraphicsSettings, GRAPHICS_FIELDS};
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::input_mode::{InputMode, MenuKind};
 
 const ROOT_ENTRIES: &[&str] = &[
@@ -298,18 +298,15 @@ pub fn spawn_main_menu(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             p.spawn((
                 MainMenuTitle,
                 Text::new(""),
-                TextFont {
-                    font_size: 14.0.into(),
-                    ..default()
-                },
-                TextColor(palette::ACCENT),
+                style::text_font(14.0),
+                TextColor(theme::TITLE),
             ));
 
             for slot in 0..MAX_ENTRY_COUNT {
@@ -317,11 +314,8 @@ pub fn spawn_main_menu(mut commands: Commands) {
                     MainMenuRow { slot },
                     Button,
                     Text::new(""),
-                    TextFont {
-                        font_size: 14.0.into(),
-                        ..default()
-                    },
-                    TextColor(palette::MUTED),
+                    style::text_font(14.0),
+                    TextColor(theme::TEXT),
                 ));
             }
         });
@@ -676,9 +670,9 @@ pub fn update_main_menu(
                 }
 
                 let want_color = if is_cursor {
-                    palette::ACCENT
+                    theme::CURSOR
                 } else {
-                    palette::MUTED
+                    theme::TEXT
                 };
                 if color.0 != want_color {
                     color.0 = want_color;

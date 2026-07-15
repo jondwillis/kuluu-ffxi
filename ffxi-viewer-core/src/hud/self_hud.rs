@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use ffxi_viewer_wire::PartyMember;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 #[derive(Component)]
@@ -50,8 +50,8 @@ pub fn spawn_self_hud(mut commands: Commands) {
                 row_gap: Val::Px(2.0),
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             spawn_row(p, SelfHpRow, "HP", "—");
@@ -71,20 +71,14 @@ fn spawn_row<M: Component>(p: &mut ChildSpawnerCommands, marker: M, label: &str,
     .with_children(|row| {
         row.spawn((
             Text::new(label.to_string()),
-            TextFont {
-                font_size: 13.0.into(),
-                ..default()
-            },
-            TextColor(palette::MUTED),
+            style::text_font(13.0),
+            TextColor(theme::MUTED),
         ));
         row.spawn((
             marker,
             Text::new(init.to_string()),
-            TextFont {
-                font_size: 13.0.into(),
-                ..default()
-            },
-            TextColor(palette::TEXT),
+            style::text_font(13.0),
+            TextColor(theme::TEXT),
         ));
     });
 }
@@ -118,7 +112,7 @@ pub fn update_self_hud(
             }
             None => {
                 **text = "—".into();
-                tc.0 = palette::MUTED;
+                tc.0 = theme::MUTED;
             }
         }
     }
@@ -130,7 +124,7 @@ pub fn update_self_hud(
             }
             None => {
                 **text = "—".into();
-                tc.0 = palette::MUTED;
+                tc.0 = theme::MUTED;
             }
         }
     }
@@ -146,7 +140,7 @@ pub fn update_self_hud(
             }
             None => {
                 **text = "—".into();
-                tc.0 = palette::MUTED;
+                tc.0 = theme::MUTED;
             }
         }
     }
@@ -202,7 +196,7 @@ pub fn update_self_status(
     } else if pulse_active {
         Color::srgb(0.30, 1.00, 0.45)
     } else {
-        palette::MUTED
+        theme::MUTED
     };
     if tc.0 != want_color {
         tc.0 = want_color;
@@ -241,11 +235,11 @@ pub fn resolve_self(party: &[PartyMember], self_char_id: Option<u32>) -> Option<
 
 pub fn hp_color(pct: u8) -> Color {
     if pct >= 76 {
-        palette::STAGE_GOOD
+        theme::GOOD
     } else if pct >= 26 {
-        palette::STAGE_TRANSITIONING
+        theme::WARN
     } else {
-        palette::STAGE_BAD
+        theme::DANGER
     }
 }
 
@@ -303,11 +297,11 @@ mod tests {
 
     #[test]
     fn hp_color_bands() {
-        assert_eq!(hp_color(100), palette::STAGE_GOOD);
-        assert_eq!(hp_color(76), palette::STAGE_GOOD);
-        assert_eq!(hp_color(75), palette::STAGE_TRANSITIONING);
-        assert_eq!(hp_color(26), palette::STAGE_TRANSITIONING);
-        assert_eq!(hp_color(25), palette::STAGE_BAD);
-        assert_eq!(hp_color(0), palette::STAGE_BAD);
+        assert_eq!(hp_color(100), theme::GOOD);
+        assert_eq!(hp_color(76), theme::GOOD);
+        assert_eq!(hp_color(75), theme::WARN);
+        assert_eq!(hp_color(26), theme::WARN);
+        assert_eq!(hp_color(25), theme::DANGER);
+        assert_eq!(hp_color(0), theme::DANGER);
     }
 }

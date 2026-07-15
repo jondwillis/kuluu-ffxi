@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use ffxi_viewer_wire::Weather;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 #[derive(Component)]
@@ -65,18 +65,15 @@ pub fn spawn_weather_icon_as_child(p: &mut ChildSpawnerCommands) {
             display: Display::None,
             ..default()
         },
-        BackgroundColor(palette::BACKGROUND),
-        BorderColor::all(palette::BORDER),
+        BackgroundColor(theme::FRAME_BG),
+        BorderColor::all(theme::FRAME_EDGE),
     ))
     .with_children(|p| {
         p.spawn((
             WeatherIconGlyph,
             Text::new(""),
-            TextFont {
-                font_size: 14.0.into(),
-                ..default()
-            },
-            TextColor(palette::TEXT),
+            style::text_font(14.0),
+            TextColor(theme::TEXT),
         ));
     });
 }

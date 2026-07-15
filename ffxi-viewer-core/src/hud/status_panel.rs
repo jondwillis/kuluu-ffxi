@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 use crate::hud::overlay::ActiveOverlay;
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 #[derive(Debug, Clone, Copy)]
@@ -132,46 +132,34 @@ pub fn spawn_status_panel(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             p.spawn((
                 StatusHeaderRow,
                 Text::new(""),
-                TextFont {
-                    font_size: 14.0.into(),
-                    ..default()
-                },
-                TextColor(palette::ACCENT),
+                style::text_font(14.0),
+                TextColor(theme::TITLE),
             ));
             p.spawn((
                 StatusVitalsRow,
                 Text::new(""),
-                TextFont {
-                    font_size: 13.0.into(),
-                    ..default()
-                },
-                TextColor(palette::TEXT),
+                style::text_font(13.0),
+                TextColor(theme::TEXT),
             ));
             p.spawn((
                 StatusItemLevelRow,
                 Text::new(""),
-                TextFont {
-                    font_size: 13.0.into(),
-                    ..default()
-                },
-                TextColor(palette::MUTED),
+                style::text_font(13.0),
+                TextColor(theme::MUTED),
             ));
             for attr_index in 0..PRIMARY_ATTRS.len() {
                 p.spawn((
                     StatusAttrRow { attr_index },
                     Text::new(""),
-                    TextFont {
-                        font_size: 13.0.into(),
-                        ..default()
-                    },
-                    TextColor(palette::TEXT),
+                    style::text_font(13.0),
+                    TextColor(theme::TEXT),
                 ));
             }
         });

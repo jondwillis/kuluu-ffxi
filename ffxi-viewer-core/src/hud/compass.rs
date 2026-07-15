@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 use crate::camera::ChaseCamera;
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 
 #[derive(Component)]
 pub struct CompassPanel;
@@ -29,17 +29,14 @@ pub fn spawn_compass_overlay_as_child(p: &mut ChildSpawnerCommands) {
         },
         ZIndex(15),
         BackgroundColor(OVERLAY_BG),
-        BorderColor::all(palette::BORDER),
+        BorderColor::all(theme::FRAME_EDGE),
     ))
     .with_children(|p| {
         p.spawn((
             CompassLabel,
             Text::new("—"),
-            TextFont {
-                font_size: 13.0.into(),
-                ..default()
-            },
-            TextColor(palette::ACCENT),
+            style::text_font(13.0),
+            TextColor(theme::TITLE),
         ));
     });
 }
@@ -57,18 +54,15 @@ pub fn spawn_compass_as_child(p: &mut ChildSpawnerCommands) {
             align_items: AlignItems::Center,
             ..default()
         },
-        BackgroundColor(palette::BACKGROUND),
-        BorderColor::all(palette::BORDER),
+        BackgroundColor(theme::FRAME_BG),
+        BorderColor::all(theme::FRAME_EDGE),
     ))
     .with_children(|p| {
         p.spawn((
             CompassLabel,
             Text::new("—"),
-            TextFont {
-                font_size: 14.0.into(),
-                ..default()
-            },
-            TextColor(palette::ACCENT),
+            style::text_font(14.0),
+            TextColor(theme::TITLE),
         ));
     });
 }

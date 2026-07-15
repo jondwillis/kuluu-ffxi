@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use ffxi_viewer_wire::{Entity as WireEntity, EntityKind, ReactorGoal};
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::scene::Target;
 use crate::snapshot::SceneState;
 
@@ -54,28 +54,22 @@ pub fn spawn_target_panel(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             p.spawn((
                 TargetHeader,
                 Text::new(""),
-                TextFont {
-                    font_size: 14.0.into(),
-                    ..default()
-                },
-                TextColor(palette::TEXT),
+                style::text_font(14.0),
+                TextColor(theme::TEXT),
             ));
 
             p.spawn((
                 TargetEngagedBadge,
                 Text::new(""),
-                TextFont {
-                    font_size: 12.0.into(),
-                    ..default()
-                },
-                TextColor(palette::STAGE_BAD),
+                style::text_font(12.0),
+                TextColor(theme::DANGER),
             ));
 
             p.spawn(Node {
@@ -92,7 +86,7 @@ pub fn spawn_target_panel(mut commands: Commands) {
                         flex_shrink: 0.0,
                         ..default()
                     },
-                    BackgroundColor(palette::DARK),
+                    BackgroundColor(theme::CELL_BG),
                 ))
                 .with_children(|track| {
                     track.spawn((
@@ -109,20 +103,14 @@ pub fn spawn_target_panel(mut commands: Commands) {
                 row.spawn((
                     TargetHpText,
                     Text::new("—"),
-                    TextFont {
-                        font_size: 12.0.into(),
-                        ..default()
-                    },
-                    TextColor(palette::MUTED),
+                    style::text_font(12.0),
+                    TextColor(theme::MUTED),
                 ));
                 row.spawn((
                     TargetDistText,
                     Text::new(""),
-                    TextFont {
-                        font_size: 12.0.into(),
-                        ..default()
-                    },
-                    TextColor(palette::MUTED),
+                    style::text_font(12.0),
+                    TextColor(theme::MUTED),
                 ));
             });
         });
@@ -222,9 +210,9 @@ pub fn update_target_panel_system(
     );
     let engaged_on_this = self_engaged_on_target || goal_engaged_on_target;
     let want_border = if engaged_on_this {
-        palette::STAGE_BAD
+        theme::DANGER
     } else {
-        palette::ACCENT
+        theme::FRAME_EDGE
     };
     if panel_border.left != want_border {
         *panel_border = BorderColor::all(want_border);
@@ -303,7 +291,7 @@ pub fn pulse_engaged_badge_color_system(
     let elapsed = (time.elapsed_secs() - pulse.last_swing_secs).max(0.0);
     let t = (elapsed / PULSE_DECAY_SECS).clamp(0.0, 1.0);
 
-    let base = palette::STAGE_BAD.to_srgba();
+    let base = theme::DANGER.to_srgba();
     let flash = bevy::prelude::Color::WHITE.to_srgba();
     let r = flash.red + (base.red - flash.red) * t;
     let g = flash.green + (base.green - flash.green) * t;

@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::input_mode::InputMode;
 
 const ENTRIES_TARGETED: &[&str] = &["Attack", "Check", "Talk"];
@@ -64,8 +64,8 @@ pub fn spawn_quick_action(mut commands: Commands) {
                 ..default()
             },
             ZIndex(20),
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             for slot in 0..MAX_ROWS {
@@ -74,11 +74,8 @@ pub fn spawn_quick_action(mut commands: Commands) {
                     Button,
                     Node::default(),
                     Text::new(""),
-                    TextFont {
-                        font_size: 13.0.into(),
-                        ..default()
-                    },
-                    TextColor(palette::MUTED),
+                    style::text_font(13.0),
+                    TextColor(theme::MUTED),
                 ));
             }
         });
@@ -122,9 +119,9 @@ pub fn update_quick_action(
                             **text = want;
                         }
                         let want_color = if is_cursor {
-                            palette::ACCENT
+                            theme::CURSOR
                         } else {
-                            palette::MUTED
+                            theme::MUTED
                         };
                         if color.0 != want_color {
                             color.0 = want_color;

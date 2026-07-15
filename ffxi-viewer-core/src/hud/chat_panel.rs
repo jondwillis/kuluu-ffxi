@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use bevy::ui::RelativeCursorPosition;
 use ffxi_viewer_wire::{ChatChannel, ChatLine};
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::input_mode::{InputMode, PassiveCursorFocus};
 use crate::mouse::MousePointer;
 use crate::snapshot::{rendered_chat, SceneState};
@@ -191,27 +191,24 @@ fn spawn_auto_switch_toggle(p: &mut ChildSpawnerCommands) {
             margin: UiRect::left(Val::Px(6.0)),
             ..default()
         },
-        BackgroundColor(palette::BACKGROUND),
-        BorderColor::all(palette::BORDER),
+        BackgroundColor(theme::FRAME_BG),
+        BorderColor::all(theme::FRAME_EDGE),
     ))
     .with_children(|btn| {
         btn.spawn((
             ChatAutoSwitchLabel,
             Text::new("auto \u{2713}"),
-            TextFont {
-                font_size: 12.0.into(),
-                ..default()
-            },
-            TextColor(palette::ACCENT),
+            style::text_font(12.0),
+            TextColor(theme::CURSOR),
         ));
     });
 }
 
 fn spawn_tab_button(p: &mut ChildSpawnerCommands, kind: ChatKind, label: &str, is_active: bool) {
     let (bg, fg, border) = if is_active {
-        (palette::BACKGROUND, palette::ACCENT, palette::ACCENT)
+        (theme::FRAME_BG, theme::CURSOR, theme::CURSOR)
     } else {
-        (palette::BACKGROUND, palette::MUTED, palette::BORDER)
+        (theme::FRAME_BG, theme::MUTED, theme::FRAME_EDGE)
     };
     p.spawn((
         Button,
@@ -228,10 +225,7 @@ fn spawn_tab_button(p: &mut ChildSpawnerCommands, kind: ChatKind, label: &str, i
         btn.spawn((
             ChatTabButtonLabel,
             Text::new(label.to_string()),
-            TextFont {
-                font_size: 12.0.into(),
-                ..default()
-            },
+            style::text_font(12.0),
             TextColor(fg),
         ));
     });
@@ -256,8 +250,8 @@ fn spawn_panel(parent: &mut ChildSpawnerCommands, kind: ChatKind, initial_displa
                 overflow: Overflow::clip(),
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             for slot in 0..VISIBLE_ROWS {
@@ -283,22 +277,16 @@ fn spawn_panel(parent: &mut ChildSpawnerCommands, kind: ChatKind, initial_displa
                             max_width: Val::Percent(100.0),
                             ..default()
                         },
-                        TextFont {
-                            font_size: 13.0.into(),
-                            ..default()
-                        },
-                        TextColor(palette::TEXT),
+                        style::text_font(13.0),
+                        TextColor(theme::TEXT),
                     ))
                     .with_children(|body| {
                         for _ in 0..SPANS_PER_ROW {
                             body.spawn((
                                 ChatRowSpan,
                                 TextSpan::new(""),
-                                TextFont {
-                                    font_size: 13.0.into(),
-                                    ..default()
-                                },
-                                TextColor(palette::TEXT),
+                                style::text_font(13.0),
+                                TextColor(theme::TEXT),
                             ));
                         }
                     });
@@ -354,9 +342,9 @@ pub fn update_chat_panel(
             ChatKind::Battle | ChatKind::Debug => scroll_offset != 0,
         };
         let want_border = if focused {
-            palette::ACCENT
+            theme::CURSOR
         } else {
-            palette::BORDER
+            theme::FRAME_EDGE
         };
         if border.left != want_border {
             *border = BorderColor::all(want_border);
@@ -420,7 +408,7 @@ pub fn update_chat_panel(
                     let (want_text, want_color): (&str, Color) = segments
                         .get(i)
                         .map(|(t, c)| (t.as_str(), *c))
-                        .unwrap_or(("", palette::TEXT));
+                        .unwrap_or(("", theme::TEXT));
                     if span_text.as_str() != want_text {
                         **span_text = want_text.to_string();
                     }
@@ -486,14 +474,14 @@ pub fn segment_chat_line(line: &str, base: Color) -> Vec<(String, Color)> {
 
 pub fn channel_color(c: ChatChannel) -> Color {
     match c {
-        ChatChannel::Say => palette::TEXT,
-        ChatChannel::Shout => palette::ACCENT,
+        ChatChannel::Say => theme::TEXT,
+        ChatChannel::Shout => Color::srgb(1.00, 0.65, 0.45),
         ChatChannel::Tell => Color::srgb(0.95, 0.40, 0.95),
         ChatChannel::Party => Color::srgb(0.50, 0.65, 1.00),
         ChatChannel::Linkshell => Color::srgb(0.40, 0.95, 0.50),
         ChatChannel::Yell => Color::srgb(1.00, 0.85, 0.20),
-        ChatChannel::System => palette::MUTED,
-        ChatChannel::Other => palette::DARK,
+        ChatChannel::System => theme::MUTED,
+        ChatChannel::Other => theme::FAINT,
 
         ChatChannel::Battle => Color::srgb(1.00, 0.55, 0.10),
 
@@ -688,11 +676,11 @@ pub fn update_chat_tab_visuals_system(
         let is_active = button.kind == active.0;
         let is_unread = !is_active && unread.get(button.kind);
         let (border_c, label_c) = if is_active {
-            (palette::ACCENT, palette::ACCENT)
+            (theme::CURSOR, theme::CURSOR)
         } else if is_unread {
             (unread_color, unread_color)
         } else {
-            (palette::BORDER, palette::MUTED)
+            (theme::FRAME_EDGE, theme::MUTED)
         };
         if border.left != border_c {
             *border = BorderColor::all(border_c);
@@ -707,9 +695,9 @@ pub fn update_chat_tab_visuals_system(
     }
 
     let (want_text, want_color, want_border) = if auto.0 {
-        ("auto \u{2713}", palette::ACCENT, palette::ACCENT)
+        ("auto \u{2713}", theme::CURSOR, theme::CURSOR)
     } else {
-        ("auto \u{2717}", palette::MUTED, palette::BORDER)
+        ("auto \u{2717}", theme::MUTED, theme::FRAME_EDGE)
     };
     for (mut border, children) in &mut toggle_q {
         if border.left != want_border {
@@ -734,17 +722,17 @@ mod tests {
 
     #[test]
     fn segment_plain_text_is_single_base_span() {
-        let segs = segment_chat_line("hello world", palette::TEXT);
+        let segs = segment_chat_line("hello world", theme::TEXT);
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].0, "hello world");
-        assert_eq!(segs[0].1, palette::TEXT);
+        assert_eq!(segs[0].1, theme::TEXT);
     }
 
     #[test]
     fn segment_splits_braces_and_colors_them() {
         let segs = segment_chat_line(
             "[Skaine] : {Looking for Party} {Experience points} : THF 59",
-            palette::TEXT,
+            theme::TEXT,
         );
         let texts: Vec<&str> = segs.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(
@@ -760,21 +748,21 @@ mod tests {
 
         assert_eq!(segs[1].1, AUTOTRANSLATE_COLOR);
         assert_eq!(segs[3].1, AUTOTRANSLATE_COLOR);
-        assert_eq!(segs[0].1, palette::TEXT);
-        assert_eq!(segs[2].1, palette::TEXT);
-        assert_eq!(segs[4].1, palette::TEXT);
+        assert_eq!(segs[0].1, theme::TEXT);
+        assert_eq!(segs[2].1, theme::TEXT);
+        assert_eq!(segs[4].1, theme::TEXT);
     }
 
     #[test]
     fn segment_empty_input_yields_single_empty_segment() {
-        let segs = segment_chat_line("", palette::TEXT);
+        let segs = segment_chat_line("", theme::TEXT);
         assert_eq!(segs.len(), 1);
         assert!(segs[0].0.is_empty());
     }
 
     #[test]
     fn segment_unclosed_brace_does_not_lose_tail() {
-        let segs = segment_chat_line("foo {open and never close", palette::TEXT);
+        let segs = segment_chat_line("foo {open and never close", theme::TEXT);
         let joined: String = segs.iter().map(|(t, _)| t.as_str()).collect();
         assert!(joined.contains("open and never close"));
         assert!(joined.contains('{'));
@@ -783,7 +771,7 @@ mod tests {
     #[test]
     fn segment_count_stays_under_pool_for_worst_case_shout() {
         let line = "{a}{b}{c}{d}{e}{f}{g}";
-        let segs = segment_chat_line(line, palette::TEXT);
+        let segs = segment_chat_line(line, theme::TEXT);
         assert!(
             segs.len() <= SPANS_PER_ROW,
             "{} segments overflows pool of {}",

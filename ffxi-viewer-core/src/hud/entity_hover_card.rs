@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use ffxi_viewer_wire::EntityKind;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::mouse::MousePointer;
 use crate::picking::HoveredEntity;
 use crate::scene::Target;
@@ -36,28 +36,22 @@ pub fn spawn_entity_hover_card(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
             ZIndex(i32::MAX - 1),
         ))
         .with_children(|p| {
             p.spawn((
                 EntityHoverCardName,
                 Text::new(""),
-                TextFont {
-                    font_size: 13.0.into(),
-                    ..default()
-                },
-                TextColor(palette::TEXT),
+                style::text_font(13.0),
+                TextColor(theme::TEXT),
             ));
             p.spawn((
                 EntityHoverCardHp,
                 Text::new(""),
-                TextFont {
-                    font_size: 12.0.into(),
-                    ..default()
-                },
-                TextColor(palette::MUTED),
+                style::text_font(12.0),
+                TextColor(theme::MUTED),
             ));
         });
 }

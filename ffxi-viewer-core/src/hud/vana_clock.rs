@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 
 pub const EARTH_EPOCH_UNIX: u64 = 1_009_810_800;
 
@@ -31,8 +31,8 @@ pub fn spawn_vana_clock_as_child(p: &mut ChildSpawnerCommands) {
             border: UiRect::all(Val::Px(1.0)),
             ..default()
         },
-        BackgroundColor(palette::BACKGROUND),
-        BorderColor::all(palette::BORDER),
+        BackgroundColor(theme::FRAME_BG),
+        BorderColor::all(theme::FRAME_EDGE),
     ))
     .with_children(|p| {
         p.spawn((
@@ -49,11 +49,8 @@ pub fn spawn_vana_clock_as_child(p: &mut ChildSpawnerCommands) {
         p.spawn((
             VanaClockLabel,
             Text::new("0:00   (?-?)"),
-            TextFont {
-                font_size: 12.0.into(),
-                ..default()
-            },
-            TextColor(palette::TEXT),
+            style::text_font(12.0),
+            TextColor(theme::TEXT),
         ));
     });
 }

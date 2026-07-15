@@ -2,7 +2,7 @@ use bevy::prelude::*;
 
 use crate::hud::action_model::{ActionEntry, ActionEntryKind, TargetActionId};
 use crate::hud::overlay::ActiveOverlay;
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::input_mode::{InputMode, SubAction};
 
 const MAX_ROWS: usize = 7;
@@ -76,8 +76,8 @@ pub fn spawn_target_action_menu_as_child(p: &mut ChildSpawnerCommands) {
             ..default()
         },
         ZIndex(20),
-        BackgroundColor(palette::BACKGROUND),
-        BorderColor::all(palette::ACCENT),
+        BackgroundColor(theme::FRAME_BG),
+        BorderColor::all(theme::FRAME_EDGE),
     ))
     .with_children(spawn_target_action_rows);
 }
@@ -90,11 +90,8 @@ fn spawn_target_action_rows(p: &mut ChildSpawnerCommands) {
             ..default()
         },
         Text::new(""),
-        TextFont {
-            font_size: 11.0.into(),
-            ..default()
-        },
-        TextColor(palette::MUTED),
+        style::text_font(11.0),
+        TextColor(theme::MUTED),
     ));
     for slot in 0..MAX_ROWS {
         p.spawn((
@@ -102,11 +99,8 @@ fn spawn_target_action_rows(p: &mut ChildSpawnerCommands) {
             Button,
             Node::default(),
             Text::new(""),
-            TextFont {
-                font_size: 13.0.into(),
-                ..default()
-            },
-            TextColor(palette::MUTED),
+            style::text_font(13.0),
+            TextColor(theme::MUTED),
         ));
     }
 }
@@ -150,7 +144,7 @@ pub fn update_target_action_menu(
                 if **text != crumb {
                     **text = crumb;
                 }
-                let want = palette::ACCENT;
+                let want = theme::TITLE;
                 if color.0 != want {
                     color.0 = want;
                 }
@@ -189,7 +183,7 @@ pub fn update_target_action_menu(
                 if row.slot == 0 {
                     (
                         format!("  {}", crate::hud::menu::ability_group_empty_hint(group)),
-                        palette::MUTED,
+                        theme::MUTED,
                     )
                 } else {
                     if node.display != Display::None {
@@ -208,13 +202,13 @@ pub fn update_target_action_menu(
                             leaf.label,
                             crate::hud::format_timer(remaining)
                         ),
-                        palette::DARK,
+                        theme::MUTED,
                     ),
                     None => {
                         let color = if is_cursor {
-                            palette::ACCENT
+                            theme::CURSOR
                         } else {
-                            palette::TEXT
+                            theme::TEXT
                         };
                         (format!("{caret}{}", leaf.label), color)
                     }
@@ -252,13 +246,13 @@ pub fn update_target_action_menu(
                 }
 
                 let want_color = if !entry.enabled {
-                    palette::DARK
+                    theme::MUTED
                 } else if sub_active.is_some() {
-                    palette::MUTED
+                    theme::MUTED
                 } else if is_cursor {
-                    palette::ACCENT
+                    theme::CURSOR
                 } else {
-                    palette::TEXT
+                    theme::TEXT
                 };
                 if color.0 != want_color {
                     color.0 = want_color;

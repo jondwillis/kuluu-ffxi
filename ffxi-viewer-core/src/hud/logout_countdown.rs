@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use ffxi_viewer_wire::SceneSnapshot;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 fn blocker_diagnostic(snap: &SceneSnapshot) -> String {
@@ -92,18 +92,15 @@ pub fn spawn_logout_countdown(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::STAGE_BAD),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::DANGER),
         ))
         .with_children(|p| {
             p.spawn((
                 LogoutCountdownLabel,
                 Text::new(""),
-                TextFont {
-                    font_size: 22.0.into(),
-                    ..default()
-                },
-                TextColor(palette::STAGE_BAD),
+                style::text_font(22.0),
+                TextColor(theme::DANGER),
             ));
         });
 }

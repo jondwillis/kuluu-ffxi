@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 #[derive(Component)]
@@ -32,27 +32,21 @@ pub fn spawn_shop_panel(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             p.spawn((
                 ShopHeader,
                 Text::new(""),
-                TextFont {
-                    font_size: 14.0.into(),
-                    ..default()
-                },
-                TextColor(palette::ACCENT),
+                style::text_font(14.0),
+                TextColor(theme::TITLE),
             ));
             p.spawn((
                 ShopBody,
                 Text::new(""),
-                TextFont {
-                    font_size: 13.0.into(),
-                    ..default()
-                },
-                TextColor(palette::TEXT),
+                style::text_font(13.0),
+                TextColor(theme::TEXT),
             ));
         });
 }

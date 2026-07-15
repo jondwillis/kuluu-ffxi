@@ -41,6 +41,43 @@ run_clippy() {
   # broken examples surface as errors here, not just lint warnings. --locked
   # additionally fails on an out-of-date Cargo.lock.
   cargo clippy --workspace --all-targets --locked "${FEATURES[@]}" -- -D warnings
+  run_style
+}
+
+run_style() {
+  # Game-window style conformance: player-facing HUD must take colors/chrome
+  # from hud::style (the shared game theme), never hud::palette (dev-overlay
+  # colors). This allowlist is the *only* set of files that may reference the
+  # palette; a new HUD file that reaches for it fails here, which is the point
+  # — the unification stays durable as windows are added.
+  local allow=(
+    mod.rs           # defines the palette
+    diagnostics.rs
+    mesh_debug.rs
+    network_status.rs
+    overlay.rs
+    stage_bar.rs
+  )
+  local hud_dir="ffxi-viewer-core/src/hud"
+  local bad=()
+  for f in "$hud_dir"/*.rs; do
+    local base
+    base="$(basename "$f")"
+    local allowed=0
+    for a in "${allow[@]}"; do
+      [[ "$base" == "$a" ]] && allowed=1 && break
+    done
+    [[ $allowed -eq 1 ]] && continue
+    if grep -Eq 'hud::palette|palette::' "$f"; then
+      bad+=("$f")
+    fi
+  done
+  if [[ ${#bad[@]} -gt 0 ]]; then
+    echo "checks: style — game-window file(s) reference hud::palette instead of hud::style:" >&2
+    printf '  %s\n' "${bad[@]}" >&2
+    echo "checks: use hud::style::{theme, text_font, window_frame}; palette is dev-overlay-only" >&2
+    return 1
+  fi
 }
 
 run_test() {
@@ -87,7 +124,7 @@ run_doc() {
 }
 
 if [[ $# -eq 0 ]]; then
-  echo "checks: no stage given (expected one or more of: fmt clippy test build doc)" >&2
+  echo "checks: no stage given (expected one or more of: fmt clippy style test build doc)" >&2
   exit 2
 fi
 
@@ -95,6 +132,7 @@ for stage in "$@"; do
   case "$stage" in
     fmt)    echo "checks: fmt";    run_fmt ;;
     clippy) echo "checks: clippy"; run_clippy ;;
+    style)  echo "checks: style";  run_style ;;
     test)   echo "checks: test";   run_test ;;
     build)  echo "checks: build";  run_build ;;
     doc)    echo "checks: doc";    run_doc ;;

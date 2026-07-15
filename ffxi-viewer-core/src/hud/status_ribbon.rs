@@ -8,7 +8,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use ffxi_dat::map_image::{status_icon_at, STATUS_ICON_FILE_ID};
 use ffxi_dat::DatRoot;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 #[derive(Resource, Default, Clone)]
@@ -175,11 +175,8 @@ pub fn spawn_status_ribbon(mut commands: Commands, mut images: ResMut<Assets<Ima
                     chip.spawn((
                         StatusChipFallback,
                         Text::new(""),
-                        TextFont {
-                            font_size: 10.0.into(),
-                            ..default()
-                        },
-                        TextColor(palette::TEXT),
+                        style::text_font(10.0),
+                        TextColor(theme::TEXT),
                     ));
                     chip.spawn((
                         StatusChipTimer,
@@ -192,11 +189,8 @@ pub fn spawn_status_ribbon(mut commands: Commands, mut images: ResMut<Assets<Ima
                             ..default()
                         },
                         Text::new(""),
-                        TextFont {
-                            font_size: 8.0.into(),
-                            ..default()
-                        },
-                        TextColor(palette::ACCENT),
+                        style::text_font(8.0),
+                        TextColor(theme::TITLE),
                     ));
                 });
             }
@@ -250,8 +244,8 @@ pub fn update_status_ribbon(
                 if image_node.color.alpha() != 0.0 {
                     image_node.color = Color::NONE;
                 }
-                if bg.0 != palette::BACKGROUND {
-                    bg.0 = palette::BACKGROUND;
+                if bg.0 != theme::CELL_BG {
+                    bg.0 = theme::CELL_BG;
                 }
                 set_fallback_text(children, &mut text_q, &format!("{icon_id}"));
             }

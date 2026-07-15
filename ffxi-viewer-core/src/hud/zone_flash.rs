@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use ffxi_viewer_wire::MyRoom;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 #[derive(Resource)]
@@ -66,18 +66,15 @@ pub fn spawn_zone_flash(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             p.spawn((
                 ZoneFlashLabel,
                 Text::new(""),
-                TextFont {
-                    font_size: 20.0.into(),
-                    ..default()
-                },
-                TextColor(palette::ACCENT),
+                style::text_font(20.0),
+                TextColor(theme::TITLE),
             ));
         });
 }
@@ -148,9 +145,9 @@ pub fn update_zone_flash(
         let fade_t = (t - HOLD_SECS) / FADE_SECS;
         1.0 - fade_t.clamp(0.0, 1.0)
     };
-    bg.0 = with_alpha(palette::BACKGROUND, alpha * 0.85);
-    *border = BorderColor::all(with_alpha(palette::ACCENT, alpha));
-    tc.0 = with_alpha(palette::ACCENT, alpha);
+    bg.0 = with_alpha(theme::FRAME_BG, alpha * 0.85);
+    *border = BorderColor::all(with_alpha(theme::FRAME_EDGE, alpha));
+    tc.0 = with_alpha(theme::TITLE, alpha);
 }
 
 fn with_alpha(c: Color, a: f32) -> Color {

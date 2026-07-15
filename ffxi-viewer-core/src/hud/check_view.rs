@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 use crate::hud::item_meta::{compose_item_detail, ItemDetail};
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 #[derive(Resource, Debug, Clone, Copy, Default)]
@@ -69,17 +69,14 @@ pub fn spawn_check_view(mut commands: Commands) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
             p.spawn((
                 Text::new("Check"),
-                TextFont {
-                    font_size: 14.0.into(),
-                    ..default()
-                },
-                TextColor(palette::ACCENT),
+                style::text_font(14.0),
+                TextColor(theme::TITLE),
             ));
 
             p.spawn((
@@ -94,21 +91,15 @@ pub fn spawn_check_view(mut commands: Commands) {
             .with_children(|w| {
                 w.spawn((
                     Text::new("View Wares"),
-                    TextFont {
-                        font_size: 13.0.into(),
-                        ..default()
-                    },
-                    TextColor(palette::MUTED),
+                    style::text_font(13.0),
+                    TextColor(theme::MUTED),
                 ));
                 for idx in 0..MAX_WARES_ROWS {
                     w.spawn((
                         CheckWaresRow { idx },
                         Text::new(""),
-                        TextFont {
-                            font_size: 13.0.into(),
-                            ..default()
-                        },
-                        TextColor(palette::TEXT),
+                        style::text_font(13.0),
+                        TextColor(theme::TEXT),
                     ));
                 }
             });
@@ -123,11 +114,8 @@ pub fn spawn_check_view(mut commands: Commands) {
                         g.spawn((
                             CheckGridCell { grid_index },
                             Text::new(""),
-                            TextFont {
-                                font_size: 13.0.into(),
-                                ..default()
-                            },
-                            TextColor(palette::TEXT),
+                            style::text_font(13.0),
+                            TextColor(theme::TEXT),
                         ));
                     }
                 });
@@ -135,11 +123,8 @@ pub fn spawn_check_view(mut commands: Commands) {
             p.spawn((
                 CheckJobRibbon,
                 Text::new(""),
-                TextFont {
-                    font_size: 13.0.into(),
-                    ..default()
-                },
-                TextColor(palette::ACCENT),
+                style::text_font(13.0),
+                TextColor(theme::TITLE),
             ));
         });
 }
@@ -222,11 +207,7 @@ pub fn update_check_view(
         if **text != body {
             **text = body;
         }
-        let want_color = if filled {
-            palette::TEXT
-        } else {
-            palette::MUTED
-        };
+        let want_color = if filled { theme::TEXT } else { theme::MUTED };
         if color.0 != want_color {
             color.0 = want_color;
         }
