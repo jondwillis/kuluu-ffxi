@@ -28,27 +28,31 @@ load_payload
 # once settled.
 #
 # $blocks = assistant content after the last turn boundary: the most recent
-# user message that ISN'T a pure tool_result carrier. That boundary set is
-# (a) genuine prompts — string content OR an array carrying a text block —
-# and (b) our own injected Stop-hook checkpoints, which land as string-content
-# user messages (isMeta). Resetting at the checkpoint is the whole point: it
-# scopes the judged text to JUST the latest continuation turn.
+# user entry of ANY kind — genuine prompts, our injected Stop-hook
+# checkpoints, AND pure tool_result carriers. At Stop time that scopes the
+# judged content to exactly the closing prose run: everything the assistant
+# emitted after its last tool call resolved.
 #
-# An earlier version reset only at array+text prompts. Checkpoints (strings)
-# then weren't boundaries, so $blocks accumulated EVERY assistant text block
-# since the real prompt and grew each cycle. Two failures compounded into a
-# loop: (1) the signature is a hash of that text, so growing text => new sig
-# every cycle => sig_changed never suppressed a re-fire; (2) choice_re is
-# matched over the whole blob, so one stale "1." / "2." list or a long-gone
-# question latched choice_hit=1 forever. Net: re-fired every turn until the
-# dispatcher's depth backstop. Scoping to the last turn kills both. ready
-# keys off the last assistant entry in the whole transcript.
+# Two earlier versions got this wrong by excluding some user entries:
+# (1) reset only at array+text prompts — checkpoints (string content)
+#     weren't boundaries, so $blocks accumulated every assistant text block
+#     since the real prompt and grew each cycle: the sig (a hash of that
+#     text) changed every cycle so sig_changed never suppressed a re-fire,
+#     and choice_re latched onto stale option lists. Re-fired until the
+#     dispatcher depth backstop.
+# (2) reset at text-bearing user entries but NOT tool_result carriers — a
+#     long autonomous stretch (user never types) kept the boundary pinned at
+#     a prompt hundreds of entries back, so ONE AskUserQuestion call
+#     anywhere in that stretch sat in $tools forever and the early-exit
+#     below disarmed the check for the rest of the session (observed:
+#     session 45801abe, trailing prose question never re-posed).
+# Including tool_result carriers is correct for the tool early-exit too: an
+# ANSWERED AskUserQuestion is followed by its tool_result (a user entry),
+# which pushes the boundary past it; only a genuinely-just-asked question
+# stays in scope. ready keys off the last assistant entry in the whole
+# transcript.
 extract='. as $all
-  | ([ range(0; length)
-       | select($all[.].type == "user"
-                and ( ($all[.].message.content | type) == "string"
-                      or ([$all[.].message.content[]?.type] | index("text")) != null )) ]
-     | last) as $u
+  | ([ range(0; length) | select($all[.].type == "user") ] | last) as $u
   | ([ $all[ (($u // -1) + 1) : ][] | select(.type == "assistant") | .message.content[]? ]) as $blocks
   | (([ $all[] | select(.type == "assistant") ] | last) // {}) as $lastA
   | { ready: (($lastA.message.content[-1].type?) == "text"),
