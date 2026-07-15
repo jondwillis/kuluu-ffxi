@@ -84,6 +84,13 @@ fn shared() -> Vec<(Action, KeyBind)> {
         (Action::ChatSubmit, KeyBind::new(KeyCode::Enter)),
         (Action::ChatExit, KeyBind::new(KeyCode::Escape)),
         (Action::ChatBackspace, KeyBind::new(KeyCode::Backspace)),
+        // Retail fishing: Enter sets the hook, ←/→ answer the arrow prompt,
+        // Escape gives up the cast. Modal while fishing, so the overlaps with
+        // ConfirmAction/NavLeft/NavRight/NavCancel are intentional.
+        (Action::FishingHook, KeyBind::new(KeyCode::Enter)),
+        (Action::FishingReelLeft, KeyBind::new(KeyCode::ArrowLeft)),
+        (Action::FishingReelRight, KeyBind::new(KeyCode::ArrowRight)),
+        (Action::FishingCancel, KeyBind::new(KeyCode::Escape)),
     ]
 }
 

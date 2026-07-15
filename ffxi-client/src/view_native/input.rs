@@ -29,7 +29,7 @@ use ffxi_viewer_core::{
 use ffxi_viewer_wire::{Entity as WireEntity, EntityKind, Vec3 as WireVec3};
 use tokio::sync::mpsc;
 
-use crate::state::{ActionKind, AgentCommand};
+use crate::state::{ActionKind, AgentCommand, FishingInput};
 
 pub const HEADING_TURN_RATE: f32 = 0.86;
 
@@ -173,6 +173,27 @@ pub fn handle_input_system(
 
     if !matches!(*mode, InputMode::World) {
         return;
+    }
+
+    // Fishing inputs are modal: while a cast is live they take priority over
+    // chat/menu/targeting so Enter sets the hook instead of acquiring a target
+    // (retail consumes these keys for the mini-game while the rod is out).
+    if state.snapshot.self_fishing.is_some() {
+        let fishing_input = if bindings.just_pressed(Action::FishingHook, &keys) {
+            Some(FishingInput::Hook)
+        } else if bindings.just_pressed(Action::FishingReelLeft, &keys) {
+            Some(FishingInput::Left)
+        } else if bindings.just_pressed(Action::FishingReelRight, &keys) {
+            Some(FishingInput::Right)
+        } else if bindings.just_pressed(Action::FishingCancel, &keys) {
+            Some(FishingInput::Cancel)
+        } else {
+            None
+        };
+        if let Some(input) = fishing_input {
+            let _ = cmd_tx.0.try_send(AgentCommand::FishingInput { input });
+            return;
+        }
     }
 
     if bindings.just_pressed(Action::OpenChatCommand, &keys) {

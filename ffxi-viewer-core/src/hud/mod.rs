@@ -20,6 +20,7 @@ pub mod network_status;
 pub mod overlay;
 pub mod quick_action;
 pub mod roster;
+pub mod self_fishing;
 pub mod self_hud;
 pub mod shop;
 pub mod stage_bar;
@@ -237,6 +238,7 @@ impl Plugin for HudPlugin {
                     self_hud::update_self_status,
                     self_hud::update_self_party_indicator,
                 ),
+                self_fishing::update_fishing_hud,
                 (
                     status_ribbon::update_status_ribbon,
                     status_ribbon::update_status_timers,
@@ -347,6 +349,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             dialog::spawn_dialog_panel,
             shop::spawn_shop_panel,
             zone_flash::spawn_zone_flash,
+            self_fishing::spawn_fishing_hud,
             self_hud::spawn_self_hud,
             status_ribbon::spawn_status_ribbon,
             death_prompt::spawn_death_prompt,

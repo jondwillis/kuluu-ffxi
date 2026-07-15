@@ -76,6 +76,14 @@ pub enum Action {
     ChatSubmit,
     ChatExit,
     ChatBackspace,
+
+    // Fishing mini-game inputs. Modal: consumed only while the self player is
+    // fishing, so they may share keys with nav/camera actions (same precedent
+    // as NavUp/CameraPitchUp both living on ArrowUp).
+    FishingHook,
+    FishingReelLeft,
+    FishingReelRight,
+    FishingCancel,
 }
 
 #[derive(
