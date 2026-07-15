@@ -556,7 +556,10 @@ fn despawn_ingame_entities(
 ) {
     let mut count = 0usize;
     for entity in q.iter() {
-        commands.entity(entity).despawn();
+        // try_despawn: despawn() is recursive, so a parent earlier in the query may have
+        // already freed this entity; bare despawn() would flood bevy_ecs error-handler
+        // WARNs for every freed child during zone teardown (kuluu-6wv3).
+        commands.entity(entity).try_despawn();
         count += 1;
     }
 
@@ -705,6 +708,88 @@ mod disconnect_tests {
             DisconnectKind::Forced
         );
         assert_eq!(classify_disconnect_reason(""), DisconnectKind::Forced);
+    }
+}
+
+#[cfg(test)]
+mod zone_teardown_tests {
+    use super::{despawn_ingame_entities, InGameEntity};
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // bevy_ecs's `warn` command error handler (what bare despawn() routes
+    // already-freed entities through) emits via the `log` facade under a
+    // `bevy_ecs`-prefixed target; count those records to detect the flood.
+    static BEVY_ECS_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    struct BevyEcsWarnCounter;
+
+    impl log::Log for BevyEcsWarnCounter {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            if record.level() == log::Level::Warn && record.target().starts_with("bevy_ecs") {
+                BEVY_ECS_WARN_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn world_with_teardown_resources() -> World {
+        let mut world = World::new();
+        world.init_resource::<super::SceneState>();
+        world.init_resource::<super::EventLog>();
+        world.init_resource::<super::TrackedEntities>();
+        world.init_resource::<super::MzbCollisionGeometry>();
+        world.init_resource::<super::LastAutoLoadedZone>();
+        world.init_resource::<super::LastAtmosphereZone>();
+        world.init_resource::<super::BgmSlots>();
+        world.init_resource::<ffxi_viewer_core::audio::WeatherAmbient>();
+        world.init_resource::<ffxi_viewer_core::audio::CombatSfxState>();
+        world.init_resource::<ffxi_viewer_core::audio::SystemSfxCursor>();
+        world.init_resource::<ffxi_viewer_core::debug_chat::EngagementChatCursor>();
+        world.init_resource::<ffxi_viewer_core::debug_chat::SpeedSuppressionLatch>();
+        world.init_resource::<ffxi_viewer_core::combat_stance::EntityMotion>();
+        world.init_resource::<ffxi_viewer_core::combat_stance::AnimationBlends>();
+        world
+    }
+
+    #[test]
+    fn teardown_tolerates_recursively_freed_children_without_warns() {
+        let _ = log::set_boxed_logger(Box::new(BevyEcsWarnCounter));
+        log::set_max_level(log::LevelFilter::Warn);
+
+        let mut world = world_with_teardown_resources();
+
+        // InGameEntity is inserted on the parent before the child so the
+        // parent's archetype — hence its query position — is created first:
+        // the parent's recursive despawn frees the child before the teardown
+        // loop reaches it, reproducing the zone-teardown double-despawn
+        // (kuluu-6wv3).
+        let parent = world.spawn_empty().id();
+        let child = world.spawn_empty().id();
+        world.entity_mut(parent).add_child(child);
+        world.entity_mut(parent).insert(InGameEntity);
+        world.entity_mut(child).insert(InGameEntity);
+
+        world
+            .run_system_once(despawn_ingame_entities)
+            .expect("despawn_ingame_entities runs");
+
+        let remaining = world
+            .query_filtered::<Entity, With<InGameEntity>>()
+            .iter(&world)
+            .count();
+        assert_eq!(remaining, 0, "teardown must despawn every InGameEntity");
+        assert_eq!(
+            BEVY_ECS_WARN_COUNT.load(Ordering::SeqCst),
+            0,
+            "already-freed children must not reach the bevy_ecs error handler"
+        );
     }
 }
 
