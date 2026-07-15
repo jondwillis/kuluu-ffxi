@@ -4,6 +4,9 @@ use crate::graphics_settings::{GraphicsSettings, GRAPHICS_FIELDS};
 use crate::hud::style::{self, theme};
 use crate::input_mode::{InputMode, MenuKind};
 
+pub const ROOT_LOG_OUT: &str = "Log Out";
+pub const ROOT_SHUT_DOWN: &str = "Shut Down";
+
 const ROOT_ENTRIES: &[&str] = &[
     "Magic",
     "Abilities",
@@ -17,7 +20,8 @@ const ROOT_ENTRIES: &[&str] = &[
     "Graphics",
     "Config",
     "Debug",
-    "Logout",
+    ROOT_LOG_OUT,
+    ROOT_SHUT_DOWN,
 ];
 
 const ITEMS_ENTRIES_STUB: &[&str] = &["(Items — Stage 3: pending inventory submenu)"];

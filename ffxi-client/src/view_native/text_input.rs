@@ -1964,13 +1964,23 @@ fn apply_graphics_cycle(
 }
 
 fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
+    use ffxi_viewer_core::hud::menu::{ROOT_LOG_OUT, ROOT_SHUT_DOWN};
     match (kind, label) {
-        (MenuKind::Root, "Logout") => MenuDispatch::CommandWithToast {
+        (MenuKind::Root, ROOT_LOG_OUT) => MenuDispatch::CommandWithToast {
             cmd: AgentCommand::ReqLogout {
                 kind: ReqLogoutKind::LogoutToggle,
             },
-            toast: "[menu] Logout requested (~30s; immediate for GMs / \
-                    in Mog House). Toggle again or `/logout off` to cancel."
+            toast: "[menu] Log Out requested (~30s; instant in Mog House). \
+                    Select again or `/logout off` to cancel."
+                .into(),
+        },
+
+        (MenuKind::Root, ROOT_SHUT_DOWN) => MenuDispatch::CommandWithToast {
+            cmd: AgentCommand::ReqLogout {
+                kind: ReqLogoutKind::ShutdownToggle,
+            },
+            toast: "[menu] Shut Down requested (~30s; instant in Mog House). \
+                    Select again or `/shutdown off` to cancel."
                 .into(),
         },
 
@@ -3053,8 +3063,9 @@ mod menu_dispatch_tests {
     use super::*;
 
     #[test]
-    fn logout_dispatches_reqlogout_with_toast() {
-        match resolve_menu_entry(MenuKind::Root, "Logout") {
+    fn log_out_dispatches_reqlogout_with_toast() {
+        use ffxi_viewer_core::hud::menu::ROOT_LOG_OUT;
+        match resolve_menu_entry(MenuKind::Root, ROOT_LOG_OUT) {
             MenuDispatch::CommandWithToast { cmd, toast } => {
                 assert_eq!(
                     cmd,
@@ -3063,11 +3074,31 @@ mod menu_dispatch_tests {
                     }
                 );
                 assert!(
-                    toast.to_lowercase().contains("logout"),
-                    "toast should mention logout, got {toast:?}"
+                    toast.to_lowercase().contains("log out"),
+                    "toast should mention log out, got {toast:?}"
                 );
             }
-            other => panic!("expected CommandWithToast for Logout, got {other:?}"),
+            other => panic!("expected CommandWithToast for Log Out, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shut_down_dispatches_shutdown_reqlogout_with_toast() {
+        use ffxi_viewer_core::hud::menu::ROOT_SHUT_DOWN;
+        match resolve_menu_entry(MenuKind::Root, ROOT_SHUT_DOWN) {
+            MenuDispatch::CommandWithToast { cmd, toast } => {
+                assert_eq!(
+                    cmd,
+                    AgentCommand::ReqLogout {
+                        kind: ReqLogoutKind::ShutdownToggle,
+                    }
+                );
+                assert!(
+                    toast.to_lowercase().contains("shut down"),
+                    "toast should mention shut down, got {toast:?}"
+                );
+            }
+            other => panic!("expected CommandWithToast for Shut Down, got {other:?}"),
         }
     }
 

@@ -33,7 +33,14 @@ const OPTIMISTIC_ACK_TIMEOUT_SECS: f64 = 2.0;
 
 const BLOCKED_DISPLAY_SECS: f64 = 5.0;
 
+/// LeaveGame runs 30s outside a Mog House: onEffectTick fires every 5s and
+/// disconnects after 5 ticks (vendor/server/scripts/effects/leavegame.lua).
 const OPTIMISTIC_TOTAL_SECS: u16 = 30;
+
+/// Inside the player's Mog House the server disconnects on effect gain with
+/// no countdown (vendor/server/scripts/effects/leavegame.lua onEffectGain:
+/// `target:inMogHouse()` → immediate `leaveGame()`).
+const MOG_HOUSE_TOTAL_SECS: u16 = 0;
 
 #[derive(Message, Debug, Clone, Copy)]
 pub struct LogoutRequested {
@@ -47,6 +54,7 @@ pub enum OptimisticState {
     Optimistic {
         started_at: f64,
         shutdown: bool,
+        total_secs: u16,
     },
     Blocked {
         entered_at: f64,
@@ -138,9 +146,10 @@ fn compute_display(
         OptimisticState::Optimistic {
             started_at,
             shutdown,
+            total_secs,
         } => {
             let elapsed = (now - started_at).max(0.0);
-            let remaining = (OPTIMISTIC_TOTAL_SECS as f64 - elapsed).max(0.0);
+            let remaining = (total_secs as f64 - elapsed).max(0.0);
             let secs = remaining.round() as u32;
             if secs == 0 {
                 DisplayMode::LoggingOut { shutdown }
@@ -183,9 +192,15 @@ pub fn update_logout_countdown(
         latest_request = Some(*ev);
     }
     if let Some(req) = latest_request {
+        let total_secs = if scene_state.snapshot.self_in_mog_house() {
+            MOG_HOUSE_TOTAL_SECS
+        } else {
+            OPTIMISTIC_TOTAL_SECS
+        };
         optimistic.state = OptimisticState::Optimistic {
             started_at: now,
             shutdown: req.shutdown,
+            total_secs,
         };
     }
 
@@ -209,6 +224,7 @@ pub fn update_logout_countdown(
     if let OptimisticState::Optimistic {
         started_at,
         shutdown,
+        ..
     } = optimistic.state
     {
         if now - started_at >= OPTIMISTIC_ACK_TIMEOUT_SECS {
@@ -294,6 +310,7 @@ mod tests {
         let opt = OptimisticState::Optimistic {
             started_at: 100.0,
             shutdown: false,
+            total_secs: OPTIMISTIC_TOTAL_SECS,
         };
         let mode = compute_display(100.5, server, opt);
         assert!(matches!(
@@ -310,6 +327,7 @@ mod tests {
         let opt = OptimisticState::Optimistic {
             started_at: 0.0,
             shutdown: false,
+            total_secs: OPTIMISTIC_TOTAL_SECS,
         };
 
         let mode = compute_display(5.0, None, opt);
@@ -336,6 +354,7 @@ mod tests {
         let opt = OptimisticState::Optimistic {
             started_at: 0.0,
             shutdown: false,
+            total_secs: OPTIMISTIC_TOTAL_SECS,
         };
         let mode = compute_display(OPTIMISTIC_TOTAL_SECS as f64 + 0.1, None, opt);
         assert_eq!(mode, DisplayMode::LoggingOut { shutdown: false });
@@ -360,10 +379,24 @@ mod tests {
     }
 
     #[test]
+    fn mog_house_total_shows_logging_out_immediately() {
+        let opt = OptimisticState::Optimistic {
+            started_at: 0.0,
+            shutdown: false,
+            total_secs: MOG_HOUSE_TOTAL_SECS,
+        };
+        assert_eq!(
+            compute_display(0.1, None, opt),
+            DisplayMode::LoggingOut { shutdown: false }
+        );
+    }
+
+    #[test]
     fn shutdown_label_propagates() {
         let opt = OptimisticState::Optimistic {
             started_at: 0.0,
             shutdown: true,
+            total_secs: OPTIMISTIC_TOTAL_SECS,
         };
         let mode = compute_display(5.0, None, opt);
         assert_eq!(

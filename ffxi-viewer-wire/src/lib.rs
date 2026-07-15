@@ -430,6 +430,23 @@ impl SceneSnapshot {
     pub fn inventory_main(&self) -> &[InventoryItem] {
         self.container(0).map(|c| c.items.as_slice()).unwrap_or(&[])
     }
+
+    /// Whether the self player is inside their Mog House: the s2c 0x00A myroom
+    /// cluster wins, otherwise the self party member's moghouse flag. Mirrors
+    /// `SessionState::self_in_mog_house` on the producer side.
+    pub fn self_in_mog_house(&self) -> bool {
+        if self.myroom.is_some() {
+            return true;
+        }
+        let Some(char_id) = self.self_char_id else {
+            return false;
+        };
+        self.party
+            .iter()
+            .find(|m| m.id == char_id)
+            .map(|m| m.in_mog_house)
+            .unwrap_or(false)
+    }
 }
 
 /// s2c 0x00A myroom cluster; `model` is an interior model id, not a zone id —
@@ -834,6 +851,41 @@ mod tests {
             }),
             mh_2f_unlocked: None,
         }
+    }
+
+    #[test]
+    fn self_in_mog_house_mirrors_producer_logic() {
+        let mut snap = sample_snapshot();
+        assert!(snap.self_in_mog_house(), "myroom cluster alone suffices");
+
+        snap.myroom = None;
+        assert!(!snap.self_in_mog_house(), "no myroom and empty party");
+
+        snap.party = vec![PartyMember {
+            id: 0xCAFE_F00D,
+            act_index: 0,
+            name: None,
+            hp: 1,
+            mp: 0,
+            tp: 0,
+            hp_pct: 100,
+            mp_pct: 100,
+            zone_no: 230,
+            main_job: 1,
+            main_job_lv: 1,
+            sub_job: 0,
+            sub_job_lv: 0,
+            is_party_leader: false,
+            is_alliance_leader: false,
+            in_mog_house: true,
+        }];
+        assert!(snap.self_in_mog_house(), "self party member flag suffices");
+
+        snap.party[0].id = 0xDEAD_BEEF;
+        assert!(
+            !snap.self_in_mog_house(),
+            "another member's flag must not count"
+        );
     }
 
     #[test]
