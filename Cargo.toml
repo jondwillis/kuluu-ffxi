@@ -96,7 +96,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bevy = { version = "0.19", features = ["debug"] }
 
 # MCP server SDK for the ffxi-mcp crate (Stage 4).
-rmcp = { version = "1.7", features = ["server", "macros", "schemars", "transport-io"] }
+rmcp = { version = "2.2", features = ["server", "macros", "schemars", "transport-io"] }
 schemars = "1"
 
 # Test fixtures: direct MariaDB access so each integration test can stamp
