@@ -17,6 +17,16 @@ pub mod c2s {
 
     pub const SHOP_BUY: u16 = 0x083;
 
+    // GP_CLI_COMMAND_SHOP_SELL_REQ, vendor/server/src/map/packets/c2s/0x084_shop_sell_req.h.
+    // Sell appraisal: ItemNum u32, ItemNo u16, ItemIndex u8 (LOC_INVENTORY slot), padding u8.
+    // The server answers with s2c SHOP_SELL (0x03D) carrying the unit sale price.
+    pub const SHOP_SELL_REQ: u16 = 0x084;
+
+    // GP_CLI_COMMAND_SHOP_SELL_SET, vendor/server/src/map/packets/c2s/0x085_shop_sell_set.h.
+    // Confirms the appraised sale: SellFlag u16, padding u16. Must follow SHOP_SELL_REQ
+    // (0x085_shop_sell_set.cpp requiresPriorPacket) and SellFlag must equal 1 (mustEqual).
+    pub const SHOP_SELL_SET: u16 = 0x085;
+
     // GP_CLI_COMMAND_FISHING_2, vendor/server/src/map/enums/packet_c2s.h. The current
     // mini-game uses 0x110; 0x066 (GP_CLI_COMMAND_FISHING) is the pre-overhaul system,
     // aliased to the same struct server-side.
@@ -208,6 +218,11 @@ pub mod s2c {
     pub const BATTLE_MESSAGE2: u16 = 0x02D;
 
     pub const SHOP_LIST: u16 = 0x03C;
+
+    // GP_SERV_COMMAND_SHOP_SELL, vendor/server/src/map/packets/s2c/0x03d_shop_sell.h.
+    // Reply to c2s SHOP_SELL_REQ: Price u32 (per unit), PropertyItemIndex u8 (inventory
+    // slot), Type u8 (0 = appraisal, 0x03d_shop_sell.cpp), padding u16, Count u32.
+    pub const SHOP_SELL: u16 = 0x03D;
 
     pub const SHOP_OPEN: u16 = 0x03E;
 

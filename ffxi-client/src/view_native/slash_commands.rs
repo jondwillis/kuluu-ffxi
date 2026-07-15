@@ -586,6 +586,12 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 handler: |c| parse_buy(c.rest),
             },
             Command {
+                aliases: &["sell"],
+                usage: "<slot> [qty] | confirm",
+                summary: "sell to open shop from inventory slot",
+                handler: |c| parse_sell(c.rest),
+            },
+            Command {
                 aliases: &["bank"],
                 usage: "<subcommand>",
                 summary: "gil-bank operations",
@@ -903,6 +909,13 @@ pub enum SlashOutcome {
         qty: u32,
     },
 
+    ShopSellSlot {
+        inv_slot: u8,
+        qty: u32,
+    },
+
+    ShopSellConfirm,
+
     PlayBgm {
         track_id: u16,
     },
@@ -1147,6 +1160,31 @@ fn parse_buy(rest: &str) -> SlashOutcome {
         None => 1,
     };
     SlashOutcome::ShopBuyRow { shop_index, qty }
+}
+
+fn parse_sell(rest: &str) -> SlashOutcome {
+    let mut parts = rest.split_whitespace();
+    let slot_str = parts.next().unwrap_or("");
+    if slot_str.is_empty() {
+        return SlashOutcome::SystemMessage(
+            "/sell: usage `/sell <slot> [qty]` or `/sell confirm`".into(),
+        );
+    }
+    if slot_str.eq_ignore_ascii_case("confirm") {
+        return SlashOutcome::ShopSellConfirm;
+    }
+    let inv_slot: u8 = match slot_str.parse() {
+        Ok(n) => n,
+        Err(_) => return SlashOutcome::SystemMessage(format!("/sell: bad slot `{slot_str}`")),
+    };
+    let qty: u32 = match parts.next() {
+        Some(q) => match q.parse() {
+            Ok(n) if n >= 1 => n,
+            _ => return SlashOutcome::SystemMessage(format!("/sell: bad qty `{q}`")),
+        },
+        None => 1,
+    };
+    SlashOutcome::ShopSellSlot { inv_slot, qty }
 }
 
 fn parse_reqlogout(rest: &str, shutdown: bool) -> SlashOutcome {
@@ -3794,6 +3832,47 @@ mod tests {
                 assert_eq!(qty, 12);
             }
             other => panic!("expected ShopBuyRow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sell_with_slot_uses_qty_one_by_default() {
+        let out = parse_slash_t("/sell 5", &empty_entities(), origin(), None, None);
+        match out {
+            SlashOutcome::ShopSellSlot { inv_slot, qty } => {
+                assert_eq!(inv_slot, 5);
+                assert_eq!(qty, 1);
+            }
+            other => panic!("expected ShopSellSlot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sell_with_qty_passes_it_through() {
+        let out = parse_slash_t("/sell 2 12", &empty_entities(), origin(), None, None);
+        match out {
+            SlashOutcome::ShopSellSlot { inv_slot, qty } => {
+                assert_eq!(inv_slot, 2);
+                assert_eq!(qty, 12);
+            }
+            other => panic!("expected ShopSellSlot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sell_confirm_maps_to_confirm_outcome() {
+        let out = parse_slash_t("/sell confirm", &empty_entities(), origin(), None, None);
+        assert!(matches!(out, SlashOutcome::ShopSellConfirm));
+    }
+
+    #[test]
+    fn sell_rejects_zero_qty_and_bad_input() {
+        for bad in ["/sell", "/sell x", "/sell 1 0", "/sell 1 x"] {
+            let out = parse_slash_t(bad, &empty_entities(), origin(), None, None);
+            assert!(
+                matches!(out, SlashOutcome::SystemMessage(_)),
+                "`{bad}` should be rejected"
+            );
         }
     }
 

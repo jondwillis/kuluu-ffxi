@@ -1552,6 +1552,37 @@ fn apply_slash_outcome(
             }
             None => push_system_chat_line(scene_state, "/buy: no shop is open".into()),
         },
+        SlashOutcome::ShopSellSlot { inv_slot, qty } => match scene_state.snapshot.shop.as_ref() {
+            Some(_) => {
+                let item_no = scene_state
+                    .snapshot
+                    .containers
+                    .iter()
+                    .find(|c| c.id == ffxi_proto::map::container::LOC_INVENTORY)
+                    .and_then(|c| c.items.iter().find(|s| s.index == inv_slot))
+                    .map(|s| s.item_no);
+                match item_no {
+                    Some(item_no) => {
+                        let _ = cmd_tx.try_send(AgentCommand::ShopSellReq {
+                            qty,
+                            item_no,
+                            item_index: inv_slot,
+                        });
+                    }
+                    None => push_system_chat_line(
+                        scene_state,
+                        format!("/sell: nothing in inventory slot {inv_slot}"),
+                    ),
+                }
+            }
+            None => push_system_chat_line(scene_state, "/sell: no shop is open".into()),
+        },
+        SlashOutcome::ShopSellConfirm => match scene_state.snapshot.shop.as_ref() {
+            Some(_) => {
+                let _ = cmd_tx.try_send(AgentCommand::ShopSellConfirm);
+            }
+            None => push_system_chat_line(scene_state, "/sell: no shop is open".into()),
+        },
         SlashOutcome::ApplyKeybinds(update) => {
             apply_keybind_update(update, bindings, keybinds_state, scene_state);
         }

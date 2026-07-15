@@ -163,3 +163,6 @@ futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 mysql_async.workspace = true
+# bevy_ecs routes failed-command diagnostics through the `log` facade; tests
+# install a counting logger to assert zone teardown never reaches it.
+log = "0.4"

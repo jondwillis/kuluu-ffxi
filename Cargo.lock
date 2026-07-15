@@ -3133,6 +3133,7 @@ dependencies = [
  "ffxi-viewer-wire",
  "futures-util",
  "keyring",
+ "log",
  "mac_address",
  "mysql_async",
  "postcard",

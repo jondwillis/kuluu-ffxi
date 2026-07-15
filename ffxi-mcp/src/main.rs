@@ -826,6 +826,7 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::FishingEnded => "fishing_ended",
         AgentEvent::JobInfoUpdated { .. } => "job_info_updated",
         AgentEvent::MogHouse2fUnlockUpdated { .. } => "mog_house_2f_unlock_updated",
+        AgentEvent::ShopSellAppraisal { .. } => "shop_sell_appraisal",
     }
 }
 
@@ -863,6 +864,8 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         Fish => "fish",
         FishingInput { .. } => "fishing_input",
         FishingRequest { .. } => "fishing_request",
+        ShopSellReq { .. } => "shop_sell_req",
+        ShopSellConfirm => "shop_sell_confirm",
     }
 }
 

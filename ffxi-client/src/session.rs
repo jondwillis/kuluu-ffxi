@@ -859,6 +859,15 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::ShopUpdated { shop });
             }
         }
+        op if op == s2c::SHOP_SELL => {
+            if let Some((price, item_index, count)) = decode_shop_sell(sub.data) {
+                let _ = event_tx.send(AgentEvent::ShopSellAppraisal {
+                    price,
+                    item_index,
+                    count,
+                });
+            }
+        }
         op if op == s2c::SHOP_OPEN => {}
         op if op == s2c::BATTLE2 => {
             if let Some((actor_id, action_id, action_kind)) = decode_battle2_header(sub.data) {
@@ -1814,6 +1823,37 @@ async fn keepalive_loop(
                             tracing::warn!(error = %e, "shop_buy send failed");
                             let _ = event_tx.send(AgentEvent::Error {
                                 message: format!("buy send: {e}"),
+                            });
+                        }
+                    }
+                    Some(AgentCommand::ShopSellReq {
+                        qty,
+                        item_no,
+                        item_index,
+                    }) => {
+                        let payload =
+                            build_subpacket_shop_sell_req(sub_seq, qty, item_no, item_index);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "shop_sell_req send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("sell appraise send: {e}"),
+                            });
+                        }
+                    }
+                    Some(AgentCommand::ShopSellConfirm) => {
+                        let payload = build_subpacket_shop_sell_set(sub_seq);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "shop_sell_set send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("sell confirm send: {e}"),
                             });
                         }
                     }
@@ -3320,6 +3360,22 @@ fn decode_shop_list(data: &[u8]) -> Option<ShopState> {
     })
 }
 
+// GP_SERV_COMMAND_SHOP_SELL, vendor/server/src/map/packets/s2c/0x03d_shop_sell.h:
+// Price u32, PropertyItemIndex u8, Type u8, padding u16, Count u32. LSB only emits it
+// as the SHOP_SELL_REQ appraisal answer (Type = 0, 0x03d_shop_sell.cpp); a completed
+// sale is announced via GP_SERV_COMMAND_MESSAGE + ITEM_SAME instead
+// (0x085_shop_sell_set.cpp process). Returns (price, item_index, count).
+fn decode_shop_sell(data: &[u8]) -> Option<(u32, u8, u32)> {
+    const BODY_LEN: usize = 12;
+    if data.len() < BODY_LEN {
+        return None;
+    }
+    let price = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let item_index = data[4];
+    let count = u32::from_le_bytes(data[8..12].try_into().unwrap());
+    Some((price, item_index, count))
+}
+
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3413,6 +3469,30 @@ pub fn build_subpacket_shop_buy(sync: u16, qty: u32, shop_no: u16, shop_index: u
     buf[8..10].copy_from_slice(&shop_no.to_le_bytes());
     buf[10..12].copy_from_slice(&(shop_index as u16).to_le_bytes());
     buf[12] = 0;
+    buf
+}
+
+// GP_CLI_COMMAND_SHOP_SELL_REQ, vendor/server/src/map/packets/c2s/0x084_shop_sell_req.h:
+// ItemNum u32, ItemNo u16, ItemIndex u8, padding u8. The server appraises the item in
+// that LOC_INVENTORY slot, clamps ItemNum to the held quantity, parks it in the shop
+// trade container, and answers with s2c 0x03D SHOP_SELL (0x084_shop_sell_req.cpp).
+pub fn build_subpacket_shop_sell_req(sync: u16, qty: u32, item_no: u16, item_index: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 12];
+    buf[0..4].copy_from_slice(&build_subpacket_header(0x084, 3, sync));
+    buf[4..8].copy_from_slice(&qty.to_le_bytes());
+    buf[8..10].copy_from_slice(&item_no.to_le_bytes());
+    buf[10] = item_index;
+    buf
+}
+
+// GP_CLI_COMMAND_SHOP_SELL_SET, vendor/server/src/map/packets/c2s/0x085_shop_sell_set.h:
+// SellFlag u16, padding u16. The server validator rejects the packet unless SellFlag
+// equals 1 and a SHOP_SELL_REQ preceded it (0x085_shop_sell_set.cpp validate).
+pub fn build_subpacket_shop_sell_set(sync: u16) -> Vec<u8> {
+    const SELL_FLAG_CONFIRM: u16 = 1;
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(0x085, 2, sync));
+    buf[4..6].copy_from_slice(&SELL_FLAG_CONFIRM.to_le_bytes());
     buf
 }
 
@@ -5468,6 +5548,62 @@ mod tests {
         );
         assert_eq!(buf[12], 0, "PropertyItemIndex = LOC_INVENTORY");
         assert_eq!(&buf[13..16], &[0u8; 3], "padding");
+    }
+
+    #[test]
+    fn shop_sell_req_packet_layout_matches_server_struct() {
+        let buf = build_subpacket_shop_sell_req(0xABCD, 7, 4096, 11);
+        assert_eq!(buf.len(), 12, "header (4) + body (8)");
+        let hdr = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(hdr & 0x01FF, 0x084, "opcode in low 9 bits");
+        assert_eq!((hdr >> 9) & 0x7F, 3, "size_words=3");
+        assert_eq!(
+            u16::from_le_bytes([buf[2], buf[3]]),
+            0xABCD,
+            "sync echoed in header"
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            7,
+            "ItemNum"
+        );
+        assert_eq!(
+            u16::from_le_bytes(buf[8..10].try_into().unwrap()),
+            4096,
+            "ItemNo"
+        );
+        assert_eq!(buf[10], 11, "ItemIndex");
+        assert_eq!(buf[11], 0, "padding");
+    }
+
+    #[test]
+    fn shop_sell_set_packet_layout_matches_server_struct() {
+        let buf = build_subpacket_shop_sell_set(0xBEEF);
+        assert_eq!(buf.len(), 8, "header (4) + body (4)");
+        let hdr = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(hdr & 0x01FF, 0x085, "opcode in low 9 bits");
+        assert_eq!((hdr >> 9) & 0x7F, 2, "size_words=2");
+        assert_eq!(
+            u16::from_le_bytes([buf[2], buf[3]]),
+            0xBEEF,
+            "sync echoed in header"
+        );
+        assert_eq!(
+            u16::from_le_bytes([buf[4], buf[5]]),
+            1,
+            "SellFlag must be 1 to pass the server validator"
+        );
+        assert_eq!(&buf[6..8], &[0u8; 2], "padding");
+    }
+
+    #[test]
+    fn shop_sell_decode_reads_price_slot_count() {
+        let mut body = vec![0u8; 12];
+        body[0..4].copy_from_slice(&1250u32.to_le_bytes());
+        body[4] = 9;
+        body[8..12].copy_from_slice(&12u32.to_le_bytes());
+        assert_eq!(decode_shop_sell(&body), Some((1250, 9, 12)));
+        assert_eq!(decode_shop_sell(&body[..11]), None, "short body rejected");
     }
 
     #[test]

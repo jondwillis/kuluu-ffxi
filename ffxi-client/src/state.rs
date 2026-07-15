@@ -947,6 +947,25 @@ impl SessionState {
             AgentEvent::ShopUpdated { shop } => {
                 self.shop = Some(shop.clone());
             }
+            AgentEvent::ShopSellAppraisal {
+                price,
+                item_index,
+                count,
+            } => {
+                self.chat.push(ChatLine {
+                    channel: ChatChannel::System,
+                    sender: "<shop>".into(),
+                    text: format!(
+                        "Appraisal: slot {item_index} x{count} sells for {price} gil each \
+                         — `/sell confirm` to accept"
+                    ),
+                    server_ts: 0,
+                });
+                if self.chat.len() > CHAT_HISTORY_CAP {
+                    let drop = self.chat.len() - CHAT_HISTORY_CAP;
+                    self.chat.drain(0..drop);
+                }
+            }
             AgentEvent::StatusIconsUpdated { icons, expiries } => {
                 self.status_icons = icons.clone();
                 self.status_icon_expiries = expiries.clone();
@@ -1077,6 +1096,13 @@ pub enum AgentEvent {
 
     ShopUpdated {
         shop: ShopState,
+    },
+
+    /// Server appraisal answer to a SHOP_SELL_REQ (s2c 0x03D): `price` is per unit.
+    ShopSellAppraisal {
+        price: u32,
+        item_index: u8,
+        count: u32,
     },
 
     StatusIconsUpdated {
@@ -1408,6 +1434,17 @@ pub enum AgentCommand {
         shop_index: u8,
         qty: u32,
     },
+
+    /// Appraise `qty` of the LOC_INVENTORY item in slot `item_index` for sale to an
+    /// NPC shop (0x084 SHOP_SELL_REQ); the server replies with the unit price (0x03D).
+    ShopSellReq {
+        qty: u32,
+        item_no: u16,
+        item_index: u8,
+    },
+
+    /// Confirm the pending sell appraisal (0x085 SHOP_SELL_SET).
+    ShopSellConfirm,
 
     CheckTarget {
         target_id: u32,
