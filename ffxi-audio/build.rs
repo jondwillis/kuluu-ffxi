@@ -37,7 +37,7 @@ fn main() {
     fs::write(out_dir.join("music_catalog_table.rs"), &out).expect("write music catalog");
 
     println!(
-        "cargo:warning=ffxi-audio: scraped {} music catalog entries",
+        "ffxi-audio: scraped {} music catalog entries",
         entries.len()
     );
 }

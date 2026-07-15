@@ -100,10 +100,7 @@ fn main() -> Result<()> {
     }
     out.push_str("];\n");
     fs::write(out_dir.join("msg_basic_table.rs"), &out)?;
-    println!(
-        "cargo:warning=ffxi-proto: scraped {} msg_basic entries",
-        entries.len()
-    );
+    println!("ffxi-proto: scraped {} msg_basic entries", entries.len());
 
     let lua_src =
         fs::read_to_string(LSB_MSG_LUA).with_context(|| format!("reading {LSB_MSG_LUA}"))?;
@@ -128,7 +125,7 @@ fn main() -> Result<()> {
         out.push_str("];\n");
         fs::write(out_dir.join(out_file), &out)?;
         println!(
-            "cargo:warning=ffxi-proto: scraped {} {} entries",
+            "ffxi-proto: scraped {} {} entries",
             entries.len(),
             lua_table_warning_label(lua_table),
         );
@@ -144,7 +141,7 @@ fn main() -> Result<()> {
         &effect_entries,
     )?;
     println!(
-        "cargo:warning=ffxi-proto: scraped {} status_effect entries",
+        "ffxi-proto: scraped {} status_effect entries",
         effect_entries.len(),
     );
 
@@ -164,10 +161,7 @@ fn main() -> Result<()> {
         LSB_JOB_NAME_LUA,
         &job_abbrevs,
     )?;
-    println!(
-        "cargo:warning=ffxi-proto: scraped {} job_name entries",
-        job_entries.len(),
-    );
+    println!("ffxi-proto: scraped {} job_name entries", job_entries.len(),);
 
     let spell_src = fs::read_to_string(LSB_SPELL_LIST_SQL)
         .with_context(|| format!("reading {LSB_SPELL_LIST_SQL}"))?;
@@ -178,10 +172,7 @@ fn main() -> Result<()> {
         LSB_SPELL_LIST_SQL,
         &spell_entries,
     )?;
-    println!(
-        "cargo:warning=ffxi-proto: scraped {} spell entries",
-        spell_entries.len(),
-    );
+    println!("ffxi-proto: scraped {} spell entries", spell_entries.len(),);
 
     let spell_skill_entries = parse_spell_skill_rows(&spell_src)?;
     write_u16_u8_table(
@@ -191,7 +182,7 @@ fn main() -> Result<()> {
         &spell_skill_entries,
     )?;
     println!(
-        "cargo:warning=ffxi-proto: scraped {} spell-skill entries",
+        "ffxi-proto: scraped {} spell-skill entries",
         spell_skill_entries.len(),
     );
 
@@ -203,7 +194,7 @@ fn main() -> Result<()> {
         &spell_target_entries,
     )?;
     println!(
-        "cargo:warning=ffxi-proto: scraped {} spell validTarget entries",
+        "ffxi-proto: scraped {} spell validTarget entries",
         spell_target_entries.len(),
     );
 
@@ -215,7 +206,7 @@ fn main() -> Result<()> {
         &spell_anim_entries,
     )?;
     println!(
-        "cargo:warning=ffxi-proto: scraped {} spell animation entries",
+        "ffxi-proto: scraped {} spell animation entries",
         spell_anim_entries.len(),
     );
 
@@ -228,10 +219,7 @@ fn main() -> Result<()> {
         LSB_ABILITIES_SQL,
         &abil_entries,
     )?;
-    println!(
-        "cargo:warning=ffxi-proto: scraped {} ability entries",
-        abil_entries.len(),
-    );
+    println!("ffxi-proto: scraped {} ability entries", abil_entries.len(),);
 
     let abil_target_entries = parse_u16_pair_rows(&abil_src, "abilities", 4)?;
     write_u16_u16_table(
@@ -241,7 +229,7 @@ fn main() -> Result<()> {
         &abil_target_entries,
     )?;
     println!(
-        "cargo:warning=ffxi-proto: scraped {} ability validTarget entries",
+        "ffxi-proto: scraped {} ability validTarget entries",
         abil_target_entries.len(),
     );
 
@@ -253,7 +241,7 @@ fn main() -> Result<()> {
         &abil_recast_entries,
     )?;
     println!(
-        "cargo:warning=ffxi-proto: scraped {} ability recastId entries",
+        "ffxi-proto: scraped {} ability recastId entries",
         abil_recast_entries.len(),
     );
 
@@ -265,7 +253,7 @@ fn main() -> Result<()> {
         &abil_anim_entries,
     )?;
     println!(
-        "cargo:warning=ffxi-proto: scraped {} ability animation entries",
+        "ffxi-proto: scraped {} ability animation entries",
         abil_anim_entries.len(),
     );
 
@@ -279,7 +267,7 @@ fn main() -> Result<()> {
         &ws_anim_entries,
     )?;
     println!(
-        "cargo:warning=ffxi-proto: scraped {} weapon-skill animation entries",
+        "ffxi-proto: scraped {} weapon-skill animation entries",
         ws_anim_entries.len(),
     );
 
@@ -292,17 +280,14 @@ fn main() -> Result<()> {
         LSB_ITEM_BASIC_SQL,
         &item_entries,
     )?;
-    println!(
-        "cargo:warning=ffxi-proto: scraped {} item entries",
-        item_entries.len(),
-    );
+    println!("ffxi-proto: scraped {} item entries", item_entries.len(),);
 
     let equip_src = fs::read_to_string(LSB_ITEM_EQUIPMENT_SQL)
         .with_context(|| format!("reading {LSB_ITEM_EQUIPMENT_SQL}"))?;
     let equip_entries = parse_sql_equip_rows(&equip_src)?;
     write_equip_info_table(&out_dir.join("equip_info_table.rs"), &equip_entries)?;
     println!(
-        "cargo:warning=ffxi-proto: scraped {} equip_info entries",
+        "ffxi-proto: scraped {} equip_info entries",
         equip_entries.len(),
     );
 
@@ -315,10 +300,7 @@ fn main() -> Result<()> {
         LSB_PACKET_S2C_H,
         &s2c_names,
     )?;
-    println!(
-        "cargo:warning=ffxi-proto: scraped {} s2c packet names",
-        s2c_names.len(),
-    );
+    println!("ffxi-proto: scraped {} s2c packet names", s2c_names.len(),);
 
     let pkt_c2s_src = fs::read_to_string(LSB_PACKET_C2S_H)
         .with_context(|| format!("reading {LSB_PACKET_C2S_H}"))?;
@@ -329,10 +311,7 @@ fn main() -> Result<()> {
         LSB_PACKET_C2S_H,
         &c2s_names,
     )?;
-    println!(
-        "cargo:warning=ffxi-proto: scraped {} c2s packet names",
-        c2s_names.len(),
-    );
+    println!("ffxi-proto: scraped {} c2s packet names", c2s_names.len(),);
 
     let auth_session_src = fs::read_to_string(LSB_AUTH_SESSION_H)
         .with_context(|| format!("reading {LSB_AUTH_SESSION_H}"))?;
@@ -345,7 +324,7 @@ fn main() -> Result<()> {
     );
     fs::write(out_dir.join("xiloader_version_table.rs"), &out)?;
     println!(
-        "cargo:warning=ffxi-proto: scraped SupportedXiloaderVersion {}.{}.{}",
+        "ffxi-proto: scraped SupportedXiloaderVersion {}.{}.{}",
         xiloader_version[0], xiloader_version[1], xiloader_version[2],
     );
 
