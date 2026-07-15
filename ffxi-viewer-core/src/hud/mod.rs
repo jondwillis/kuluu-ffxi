@@ -146,22 +146,6 @@ pub fn format_timer(secs: u32) -> String {
     }
 }
 
-pub mod palette {
-    use bevy::prelude::Color;
-
-    pub const BORDER: Color = Color::srgb(0.40, 0.40, 0.40);
-    pub const BACKGROUND: Color = Color::srgb(0.04, 0.04, 0.04);
-    pub const ACCENT: Color = Color::srgb(0.0, 1.0, 1.0);
-    pub const TEXT: Color = Color::srgb(0.95, 0.95, 0.95);
-    pub const MUTED: Color = Color::srgb(0.55, 0.55, 0.55);
-    pub const DARK: Color = Color::srgb(0.40, 0.40, 0.40);
-
-    pub const STAGE_IDLE: Color = DARK;
-    pub const STAGE_TRANSITIONING: Color = Color::srgb(1.0, 0.85, 0.0);
-    pub const STAGE_GOOD: Color = Color::srgb(0.0, 0.85, 0.0);
-    pub const STAGE_BAD: Color = Color::srgb(0.95, 0.20, 0.20);
-}
-
 pub struct HudPlugin;
 
 impl Plugin for HudPlugin {

@@ -245,9 +245,7 @@ pub fn update_target_action_menu(
                     **text = want;
                 }
 
-                let want_color = if !entry.enabled {
-                    theme::MUTED
-                } else if sub_active.is_some() {
+                let want_color = if !entry.enabled || sub_active.is_some() {
                     theme::MUTED
                 } else if is_cursor {
                     theme::CURSOR

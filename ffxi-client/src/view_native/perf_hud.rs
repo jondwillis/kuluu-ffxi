@@ -1,7 +1,7 @@
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use bevy::time::Real;
-use ffxi_viewer_core::hud::{palette, HudPanels};
+use ffxi_viewer_core::hud::{style::theme, HudPanels};
 use ffxi_viewer_core::{perf_probe, InGameEntity};
 
 use super::bridge::NativeSource;
@@ -436,13 +436,13 @@ pub fn spawn_perf_hud(mut commands: Commands) {
                 row_gap: Val::Px(3.0),
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
             GlobalZIndex(10),
             Visibility::Hidden,
         ))
         .with_children(|p| {
-            spawn_text_line(p, 0, palette::ACCENT);
+            spawn_text_line(p, 0, theme::TITLE);
 
             p.spawn((
                 Node {
@@ -465,16 +465,16 @@ pub fn spawn_perf_hud(mut commands: Commands) {
                             height: Val::Px(0.0),
                             ..default()
                         },
-                        BackgroundColor(palette::STAGE_GOOD),
+                        BackgroundColor(theme::GOOD),
                     ));
                 }
-                spawn_ref_line(g, TARGET_MS, palette::STAGE_GOOD);
-                spawn_ref_line(g, TARGET_MS * 2.0, palette::STAGE_TRANSITIONING);
+                spawn_ref_line(g, TARGET_MS, theme::GOOD);
+                spawn_ref_line(g, TARGET_MS * 2.0, theme::WARN);
             });
 
-            spawn_text_line(p, 1, palette::TEXT);
-            spawn_text_line(p, 2, palette::TEXT);
-            spawn_text_line(p, 3, palette::MUTED);
+            spawn_text_line(p, 1, theme::TEXT);
+            spawn_text_line(p, 2, theme::TEXT);
+            spawn_text_line(p, 3, theme::MUTED);
         });
 }
 
@@ -569,11 +569,11 @@ fn build_text_lines(
             "PERF  {fps:.0} fps  {:.1}ms  (scale {GRAPH_MAX_MS:.0}ms)",
             m.baseline_ms,
         ),
-        palette::ACCENT,
+        theme::TITLE,
     );
 
     let spike = if m.last_spike_ms <= 0.0 {
-        ("spike: none yet".to_string(), palette::MUTED)
+        ("spike: none yet".to_string(), theme::MUTED)
     } else {
         let recent = m.interval_ema_s > 0.0 && m.secs_since_spike < m.interval_ema_s * 2.0;
         (
@@ -581,11 +581,7 @@ fn build_text_lines(
                 "spike {:.0}ms  worst {:.0}ms  ~every {:.2}s  ({:.1}s ago)  n={}",
                 m.last_spike_ms, m.worst_ms, m.interval_ema_s, m.secs_since_spike, m.spikes_total,
             ),
-            if recent {
-                palette::STAGE_BAD
-            } else {
-                palette::MUTED
-            },
+            if recent { theme::DANGER } else { theme::MUTED },
         )
     };
 
@@ -601,7 +597,7 @@ fn build_text_lines(
             m.spike_rgraph_us,
             m.spike_rtotal_us,
         ),
-        palette::TEXT,
+        theme::TEXT,
     );
 
     let cause = (
@@ -619,7 +615,7 @@ fn build_text_lines(
             source.last_entity_count,
             m.rebuild_rate,
         ),
-        palette::MUTED,
+        theme::MUTED,
     );
 
     vec![title, spike, split, cause]
@@ -627,10 +623,10 @@ fn build_text_lines(
 
 fn sample_color(ms: f32) -> Color {
     if ms <= TARGET_MS * 1.25 {
-        palette::STAGE_GOOD
+        theme::GOOD
     } else if ms <= TARGET_MS * 2.0 {
-        palette::STAGE_TRANSITIONING
+        theme::WARN
     } else {
-        palette::STAGE_BAD
+        theme::DANGER
     }
 }

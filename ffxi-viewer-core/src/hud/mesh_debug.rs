@@ -3,7 +3,7 @@ use bevy::picking::pointer::PointerId;
 use bevy::picking::Pickable;
 use bevy::prelude::*;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 
 #[derive(Component, Debug, Clone)]
 pub struct MmbDebugInfo {
@@ -47,19 +47,16 @@ pub fn spawn_mesh_debug_hud(mut commands: Commands) {
                 justify_content: JustifyContent::Center,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::CURSOR),
             Visibility::Hidden,
         ))
         .with_children(|p| {
             p.spawn((
                 MeshDebugHudText,
                 Text::new(""),
-                TextFont {
-                    font_size: 13.0.into(),
-                    ..default()
-                },
-                TextColor(palette::TEXT),
+                style::text_font(13.0),
+                TextColor(theme::TEXT),
             ));
         });
 }

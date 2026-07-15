@@ -1,7 +1,8 @@
-//! The single style source for in-game windows (menus, items, shop, trade,
-//! dialog…). Dev/diagnostic overlays keep their own dev colors (`hud/mod.rs`);
-//! game windows must take colors and frames from here so they cannot drift
-//! apart.
+//! The single style source for the entire HUD: in-game windows (menus, items,
+//! shop, trade, dialog…) *and* dev/diagnostic overlays (diagnostics bar,
+//! stage bar, network status, mesh debug). Everything takes colors and frames
+//! from here so they cannot drift apart; the old `hud::palette` dev-overlay
+//! module was folded into `theme` and removed.
 
 use bevy::prelude::*;
 

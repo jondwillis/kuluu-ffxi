@@ -45,37 +45,23 @@ run_clippy() {
 }
 
 run_style() {
-  # Game-window style conformance: player-facing HUD must take colors/chrome
-  # from hud::style (the shared game theme), never hud::palette (dev-overlay
-  # colors). This allowlist is the *only* set of files that may reference the
-  # palette; a new HUD file that reaches for it fails here, which is the point
-  # — the unification stays durable as windows are added.
-  local allow=(
-    mod.rs           # defines the palette
-    diagnostics.rs
-    mesh_debug.rs
-    network_status.rs
-    overlay.rs
-    stage_bar.rs
-  )
+  # Style conformance: every HUD file (game windows *and* dev/debug overlays)
+  # takes colors/chrome from hud::style (the shared theme). The old
+  # hud::palette dev-overlay module is gone; any reference to it — including a
+  # reintroduced definition — fails here, which is the point: the unification
+  # stays durable as windows are added.
   local hud_dir="ffxi-viewer-core/src/hud"
   local bad=()
   for f in "$hud_dir"/*.rs; do
-    local base
-    base="$(basename "$f")"
-    local allowed=0
-    for a in "${allow[@]}"; do
-      [[ "$base" == "$a" ]] && allowed=1 && break
-    done
-    [[ $allowed -eq 1 ]] && continue
-    if grep -Eq 'hud::palette|palette::' "$f"; then
+    [[ "$(basename "$f")" == "style.rs" ]] && continue
+    if grep -Eq 'hud::palette|palette::|mod palette' "$f"; then
       bad+=("$f")
     fi
   done
   if [[ ${#bad[@]} -gt 0 ]]; then
-    echo "checks: style — game-window file(s) reference hud::palette instead of hud::style:" >&2
+    echo "checks: style — HUD file(s) reference hud::palette instead of hud::style:" >&2
     printf '  %s\n' "${bad[@]}" >&2
-    echo "checks: use hud::style::{theme, text_font, window_frame}; palette is dev-overlay-only" >&2
+    echo "checks: use hud::style::{theme, text_font, window_frame}; hud::palette was removed" >&2
     return 1
   fi
 }

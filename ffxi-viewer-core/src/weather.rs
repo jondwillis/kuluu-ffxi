@@ -232,6 +232,7 @@ pub fn apply_zone_weather(
         ),
         With<OperatorCamera>,
     >,
+    mut clear_color: ResMut<ClearColor>,
     mut commands: Commands,
 ) {
     let Some(rec) = zone_weather.current else {
@@ -240,12 +241,10 @@ pub fn apply_zone_weather(
     let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
 
     // Signed hours from the nearer horizon crossing: negative at night,
-    // positive during the day. `twilight` peaks at dawn/dusk; `daylight`
-    // ramps 0 (night) → 1 (day) across the same band.
+    // positive during the day. `daylight` ramps 0 (night) → 1 (day) across
+    // the horizon band.
     let band = 3.0_f32;
     let horizon_hours = (sky.hour - 6.0).min(18.0 - sky.hour);
-    let twilight = ((band - horizon_hours.max(0.0)) / band).clamp(0.0, 1.0);
-    let twilight_smooth = twilight * twilight * (3.0 - 2.0 * twilight);
     let daylight = ((horizon_hours + band) / (2.0 * band)).clamp(0.0, 1.0);
     let daylight_smooth = daylight * daylight * (3.0 - 2.0 * daylight);
 
@@ -256,10 +255,14 @@ pub fn apply_zone_weather(
         // reads as the zone's atmosphere rather than a neutral gray wall.
         fog.light_tint = Color::srgb(0.5 + 0.5 * r, 0.5 + 0.5 * g, 0.5 + 0.5 * b);
 
+        // Extinction = density * (absorption + scattering) ≈ density * 0.6, so
+        // density = 5/D gives ~5% transmittance (e^-3) at the DAT max fog
+        // distance D. The old (15/dist).clamp(0.04, ..) floored at 0.04/unit for
+        // any D > 375, crushing visibility to ~100 units regardless of the zone's
+        // fog range; the extra twilight boost double-applied time-of-day (the
+        // weather keyframes are already sampled per Vana'diel minute).
         let dist = rec.max_fog_dist_landscape.max(50.0);
-        let mut density = (15.0 / dist).clamp(0.04, 0.18);
-        density = (density * (1.0 + 1.2 * twilight_smooth)).min(0.30);
-        fog.density_factor = density;
+        fog.density_factor = (5.0 / dist).clamp(0.002, 0.03);
     }
 
     // research/xim EnvironmentManager.kt:399-445: ambient_landscape is the
@@ -315,7 +318,18 @@ pub fn apply_zone_weather(
         if let Some(mut vol) = vol_fog {
             let [fr, fg, fb, _] = rec.fog_landscape;
             vol.ambient_color = Color::srgb(fr, fg, fb);
-            vol.ambient_intensity = 0.005 + 0.045 * daylight_smooth;
+            vol.ambient_intensity = 0.01 + 0.17 * daylight_smooth;
+        }
+
+        // Retail fades the horizon to the zone fog color (the sky mesh does
+        // this in the client; headless captures and skyless indoor zones have
+        // no sky). Clearing to the daylight-scaled fog color gives the
+        // raymarch a matching backdrop instead of a hard black wall past the
+        // last drawn geometry.
+        {
+            let [fr, fg, fb, _] = rec.fog_landscape;
+            let lum = 0.03 + 0.97 * daylight_smooth;
+            clear_color.0 = Color::srgb(fr * lum, fg * lum, fb * lum);
         }
     }
 }

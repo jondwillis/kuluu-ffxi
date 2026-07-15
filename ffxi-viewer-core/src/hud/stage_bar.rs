@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use ffxi_viewer_wire::Stage;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 #[derive(Component)]
@@ -22,56 +22,38 @@ pub fn spawn_stage_cluster_as_child(p: &mut ChildSpawnerCommands) {
     p.spawn((
         StageDot,
         Text::new("● "),
-        TextFont {
-            font_size: FONT.into(),
-            ..default()
-        },
+        style::text_font(FONT),
         TextColor(stage_color(Stage::default())),
     ));
 
     p.spawn((
         StageLabel,
         Text::new(stage_label(Stage::default()).to_string()),
-        TextFont {
-            font_size: FONT.into(),
-            ..default()
-        },
+        style::text_font(FONT),
         TextColor(stage_color(Stage::default())),
     ));
 
     p.spawn((
         Text::new("  ▪  "),
-        TextFont {
-            font_size: FONT.into(),
-            ..default()
-        },
-        TextColor(palette::MUTED),
+        style::text_font(FONT),
+        TextColor(theme::MUTED),
     ));
     p.spawn((
         CharName,
         Text::new("(no char)".to_string()),
-        TextFont {
-            font_size: FONT.into(),
-            ..default()
-        },
-        TextColor(palette::TEXT),
+        style::text_font(FONT),
+        TextColor(theme::TEXT),
     ));
     p.spawn((
         Text::new("  ▪  "),
-        TextFont {
-            font_size: FONT.into(),
-            ..default()
-        },
-        TextColor(palette::MUTED),
+        style::text_font(FONT),
+        TextColor(theme::MUTED),
     ));
     p.spawn((
         ZoneLabel,
         Text::new("—".to_string()),
-        TextFont {
-            font_size: FONT.into(),
-            ..default()
-        },
-        TextColor(palette::TEXT),
+        style::text_font(FONT),
+        TextColor(theme::TEXT),
     ));
 }
 
@@ -128,11 +110,11 @@ fn stage_label(stage: Stage) -> &'static str {
 
 fn stage_color(stage: Stage) -> Color {
     match stage {
-        Stage::Idle => palette::STAGE_IDLE,
+        Stage::Idle => theme::FAINT,
         Stage::Authenticating | Stage::LobbyHandshake | Stage::MapBootstrap | Stage::Zoning => {
-            palette::STAGE_TRANSITIONING
+            theme::WARN
         }
-        Stage::InZone => palette::STAGE_GOOD,
-        Stage::Disconnected => palette::STAGE_BAD,
+        Stage::InZone => theme::GOOD,
+        Stage::Disconnected => theme::DANGER,
     }
 }

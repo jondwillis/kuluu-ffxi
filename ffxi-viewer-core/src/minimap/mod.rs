@@ -4,7 +4,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-use crate::hud::palette;
+use crate::hud::style::theme;
 
 pub mod input;
 pub mod overlay;
@@ -312,8 +312,8 @@ pub fn spawn_minimap_as_child(p: &mut ChildSpawnerCommands, images: &mut Assets<
             border: UiRect::all(Val::Px(1.0)),
             ..default()
         },
-        BackgroundColor(palette::BACKGROUND),
-        BorderColor::all(palette::BORDER),
+        BackgroundColor(theme::FRAME_BG),
+        BorderColor::all(theme::FRAME_EDGE),
         bevy::ui::RelativeCursorPosition::default(),
     ))
     .with_children(|p| {
@@ -356,8 +356,8 @@ pub fn spawn_minimap_as_child(p: &mut ChildSpawnerCommands, images: &mut Assets<
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::ACCENT),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::CURSOR),
         ))
         .with_children(|btn| {
             btn.spawn((
@@ -366,7 +366,7 @@ pub fn spawn_minimap_as_child(p: &mut ChildSpawnerCommands, images: &mut Assets<
                     font_size: 11.0.into(),
                     ..default()
                 },
-                TextColor(palette::ACCENT),
+                TextColor(theme::CURSOR),
             ));
         });
     });

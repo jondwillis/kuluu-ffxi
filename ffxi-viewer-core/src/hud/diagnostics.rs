@@ -5,7 +5,7 @@ use bevy::diagnostic::{
 use bevy::prelude::*;
 use ffxi_viewer_wire::BlowfishStatus;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 const STALE_THRESHOLD_MS: u64 = 5_000;
@@ -52,8 +52,8 @@ pub fn spawn_diagnostics(mut commands: Commands) {
                 column_gap: Val::Px(0.0),
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
             Visibility::Hidden,
         ))
         .with_children(|p| {
@@ -86,31 +86,22 @@ fn spawn_label_value<M: Component>(
 ) {
     parent.spawn((
         Text::new(label.to_string()),
-        TextFont {
-            font_size: 13.0.into(),
-            ..default()
-        },
-        TextColor(palette::MUTED),
+        style::text_font(13.0),
+        TextColor(theme::MUTED),
     ));
     parent.spawn((
         marker,
         Text::new(initial.to_string()),
-        TextFont {
-            font_size: 13.0.into(),
-            ..default()
-        },
-        TextColor(palette::TEXT),
+        style::text_font(13.0),
+        TextColor(theme::TEXT),
     ));
 }
 
 fn spawn_separator(parent: &mut ChildSpawnerCommands) {
     parent.spawn((
         Text::new("   "),
-        TextFont {
-            font_size: 13.0.into(),
-            ..default()
-        },
-        TextColor(palette::MUTED),
+        style::text_font(13.0),
+        TextColor(theme::MUTED),
     ));
 }
 
@@ -160,11 +151,11 @@ pub fn update_diagnostics(
 
     if let Ok((mut text, mut tc)) = bf_q.single_mut() {
         let (s, color) = match d.blowfish_status {
-            Some(BlowfishStatus::Accepted) => ("ok".into(), palette::STAGE_GOOD),
-            Some(BlowfishStatus::Sent) => ("sent".into(), palette::STAGE_TRANSITIONING),
-            Some(BlowfishStatus::Waiting) => ("waiting".into(), palette::STAGE_TRANSITIONING),
-            Some(BlowfishStatus::PendingZone) => ("pending".into(), palette::STAGE_TRANSITIONING),
-            None => ("—".into(), palette::MUTED),
+            Some(BlowfishStatus::Accepted) => ("ok".into(), theme::GOOD),
+            Some(BlowfishStatus::Sent) => ("sent".into(), theme::WARN),
+            Some(BlowfishStatus::Waiting) => ("waiting".into(), theme::WARN),
+            Some(BlowfishStatus::PendingZone) => ("pending".into(), theme::WARN),
+            None => ("—".into(), theme::MUTED),
         };
         **text = s;
         tc.0 = color;
@@ -181,15 +172,15 @@ pub fn update_diagnostics(
         match d.last_server_packet_age_ms {
             Some(ms) if ms < STALE_THRESHOLD_MS => {
                 **text = format!("{ms}ms");
-                tc.0 = palette::TEXT;
+                tc.0 = theme::TEXT;
             }
             Some(ms) => {
                 **text = format!("{ms}ms");
-                tc.0 = palette::STAGE_BAD;
+                tc.0 = theme::DANGER;
             }
             None => {
                 **text = "—".into();
-                tc.0 = palette::MUTED;
+                tc.0 = theme::MUTED;
             }
         }
     }

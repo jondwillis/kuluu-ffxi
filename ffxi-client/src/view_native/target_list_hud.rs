@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use ffxi_viewer_core::hud::{palette, HudPanels};
+use ffxi_viewer_core::hud::{style::theme, HudPanels};
 use ffxi_viewer_core::{InGameEntity, OperatorCamera, SceneState, Target};
 use ffxi_viewer_wire::EntityKind;
 
@@ -36,8 +36,8 @@ pub fn spawn_target_list_hud(mut commands: Commands) {
                 row_gap: Val::Px(1.0),
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
             GlobalZIndex(10),
             Visibility::Hidden,
         ))
@@ -50,7 +50,7 @@ pub fn spawn_target_list_hud(mut commands: Commands) {
                         font_size: ROW_FONT.into(),
                         ..default()
                     },
-                    TextColor(palette::MUTED),
+                    TextColor(theme::MUTED),
                     TextLayout::no_wrap(),
                 ));
             }
@@ -62,7 +62,7 @@ pub fn spawn_target_list_hud(mut commands: Commands) {
                         font_size: ROW_FONT.into(),
                         ..default()
                     },
-                    TextColor(palette::TEXT),
+                    TextColor(theme::TEXT),
                     TextLayout::no_wrap(),
                     Node {
                         display: Display::None,
@@ -179,7 +179,7 @@ fn build_info_lines(order: &[u32], tab_stack: &TabCycleStack) -> Vec<(String, Co
             tab_stack.pending_len(),
             tab_stack.idle_secs(),
         ),
-        palette::ACCENT,
+        theme::TITLE,
     );
 
     vec![header]
@@ -201,7 +201,7 @@ fn build_rows(
         if idx == MAX_ROWS - 1 && order.len() > MAX_ROWS {
             rows.push(RowData {
                 text: format!("   \u{2026} +{} more", order.len() - (MAX_ROWS - 1)),
-                color: palette::MUTED,
+                color: theme::MUTED,
             });
             break;
         }
@@ -230,11 +230,11 @@ fn build_rows(
             kind_label(kind),
         );
         let color = if is_current {
-            palette::ACCENT
+            theme::CURSOR
         } else if is_party {
-            palette::STAGE_GOOD
+            theme::GOOD
         } else {
-            palette::TEXT
+            theme::TEXT
         };
         rows.push(RowData { text, color });
     }

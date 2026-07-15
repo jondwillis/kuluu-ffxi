@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::hud::palette;
+use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
 #[derive(Resource, Debug, Clone, Copy)]
@@ -46,8 +46,8 @@ pub fn spawn_network_status(mut commands: Commands) {
                 column_gap: Val::Px(6.0),
                 ..default()
             },
-            BackgroundColor(palette::BACKGROUND),
-            BorderColor::all(palette::BORDER),
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::FRAME_EDGE),
             GlobalZIndex(10),
         ))
         .with_children(|p| {
@@ -60,19 +60,13 @@ pub fn spawn_network_status(mut commands: Commands) {
                 col.spawn((
                     NetSendArrow,
                     Text::new("\u{25B2}"),
-                    TextFont {
-                        font_size: 9.0.into(),
-                        ..default()
-                    },
+                    style::text_font(9.0),
                     TextColor(health_color(100)),
                 ));
                 col.spawn((
                     NetRecvArrow,
                     Text::new("\u{25BC}"),
-                    TextFont {
-                        font_size: 9.0.into(),
-                        ..default()
-                    },
+                    style::text_font(9.0),
                     TextColor(health_color(100)),
                 ));
             });
@@ -86,10 +80,7 @@ pub fn spawn_network_status(mut commands: Commands) {
                 b.spawn((
                     NetPercentLabel,
                     Text::new("100%"),
-                    TextFont {
-                        font_size: 13.0.into(),
-                        ..default()
-                    },
+                    style::text_font(13.0),
                     TextColor(health_color(100)),
                 ));
             });
@@ -119,11 +110,8 @@ fn spawn_baud_row<M: Component>(col: &mut ChildSpawnerCommands, prefix: &str, va
     .with_children(|row| {
         row.spawn((
             Text::new(prefix.to_string()),
-            TextFont {
-                font_size: 11.0.into(),
-                ..default()
-            },
-            TextColor(palette::MUTED),
+            style::text_font(11.0),
+            TextColor(theme::MUTED),
         ));
         row.spawn(Node {
             width: Val::Px(BAUD_BOX_W),
@@ -134,11 +122,8 @@ fn spawn_baud_row<M: Component>(col: &mut ChildSpawnerCommands, prefix: &str, va
             b.spawn((
                 value_marker,
                 Text::new("0"),
-                TextFont {
-                    font_size: 11.0.into(),
-                    ..default()
-                },
-                TextColor(palette::TEXT),
+                style::text_font(11.0),
+                TextColor(theme::TEXT),
             ));
         });
     });
