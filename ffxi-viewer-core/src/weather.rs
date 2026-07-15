@@ -217,7 +217,14 @@ pub fn apply_zone_weather(
     mut ambient: ResMut<GlobalAmbientLight>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     settings: Res<GraphicsSettings>,
-    mut cam_q: Query<(Entity, Option<&mut DistanceFog>), With<OperatorCamera>>,
+    mut cam_q: Query<
+        (
+            Entity,
+            Option<&mut DistanceFog>,
+            Option<&mut bevy::light::VolumetricFog>,
+        ),
+        With<OperatorCamera>,
+    >,
     mut commands: Commands,
 ) {
     let Some(rec) = zone_weather.current else {
@@ -225,17 +232,25 @@ pub fn apply_zone_weather(
     };
     let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
 
+    // Signed hours from the nearer horizon crossing: negative at night,
+    // positive during the day. `twilight` peaks at dawn/dusk; `daylight`
+    // ramps 0 (night) → 1 (day) across the same band.
+    let band = 3.0_f32;
+    let horizon_hours = (sky.hour - 6.0).min(18.0 - sky.hour);
+    let twilight = ((band - horizon_hours.max(0.0)) / band).clamp(0.0, 1.0);
+    let twilight_smooth = twilight * twilight * (3.0 - 2.0 * twilight);
+    let daylight = ((horizon_hours + band) / (2.0 * band)).clamp(0.0, 1.0);
+    let daylight_smooth = daylight * daylight * (3.0 - 2.0 * daylight);
+
     if let Some(mut fog) = fog_q.iter_mut().next() {
         let [r, g, b, _a] = rec.fog_landscape;
         fog.fog_color = Color::srgb(r, g, b);
+        // Tint the in-scattered light with the zone fog palette so the volume
+        // reads as the zone's atmosphere rather than a neutral gray wall.
+        fog.light_tint = Color::srgb(0.5 + 0.5 * r, 0.5 + 0.5 * g, 0.5 + 0.5 * b);
 
         let dist = rec.max_fog_dist_landscape.max(50.0);
         let mut density = (15.0 / dist).clamp(0.04, 0.18);
-
-        let band = 3.0_f32;
-        let dist_from_horizon = (sky.hour - 6.0).min(18.0 - sky.hour).max(0.0);
-        let twilight = ((band - dist_from_horizon) / band).clamp(0.0, 1.0);
-        let twilight_smooth = twilight * twilight * (3.0 - 2.0 * twilight);
         density = (density * (1.0 + 1.2 * twilight_smooth)).min(0.30);
         fog.density_factor = density;
     }
@@ -255,7 +270,7 @@ pub fn apply_zone_weather(
         500.0 * rec.diffuse_mul_landscape.clamp(0.4, 1.5) * active.modifier.ambient_brightness_mul;
 
     if !settings.volumetric_fog {
-        if let Ok((cam_entity, slot)) = cam_q.single_mut() {
+        if let Ok((cam_entity, slot, _)) = cam_q.single_mut() {
             let [fr, fg, fb, _] = rec.fog_landscape;
             let color = Color::srgb(fr, fg, fb);
 
@@ -277,6 +292,23 @@ pub fn apply_zone_weather(
                     commands.entity(cam_entity).insert(want);
                 }
             }
+        }
+    } else if let Ok((cam_entity, dist_fog, vol_fog)) = cam_q.single_mut() {
+        // Volumetric fog owns the atmosphere now: a `DistanceFog` left over
+        // from before the toggle would keep crushing view distance on top of
+        // the volumetric pass, so strip it (this branch is what makes the menu
+        // toggle usable without a zone change).
+        if dist_fog.is_some() {
+            commands.entity(cam_entity).remove::<DistanceFog>();
+        }
+
+        // Derive the volumetric ambient term from the zone fog palette and
+        // time of day: at night the DAT fog should read as a dim haze lit by
+        // the (already dim) moon, not a hardcoded blue-gray wall.
+        if let Some(mut vol) = vol_fog {
+            let [fr, fg, fb, _] = rec.fog_landscape;
+            vol.ambient_color = Color::srgb(fr, fg, fb);
+            vol.ambient_intensity = 0.005 + 0.045 * daylight_smooth;
         }
     }
 }

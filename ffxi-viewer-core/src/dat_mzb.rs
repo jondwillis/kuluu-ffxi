@@ -1009,23 +1009,65 @@ fn compute_init_visibility(mode: ZoneGeomMode) -> (Visibility, Visibility) {
     }
 }
 
-fn simple_water_material() -> StandardMaterial {
-    StandardMaterial {
-        // Interim flat tint — placeholder for the real scrolling water texture.
-        // Murky grey-teal, more transparent and less mirror-bright than a pure
-        // blue so the bed reads through.
-        base_color: Color::srgba(0.20, 0.30, 0.31, 0.40),
-        perceptual_roughness: 0.2,
-        metallic: 0.0,
-        reflectance: 0.38,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
-        // Bounding-box plane is near-coplanar with the sloped pond bed at the
-        // shoreline; bias the translucent surface toward the camera so it wins
-        // the depth test there instead of z-fighting (constant bias is in
-        // depth-texture units, hence the large value).
-        depth_bias: 1000.0,
-        ..default()
+// Interim flat water tint — linear-space conversion of the old
+// StandardMaterial placeholder srgba(0.20, 0.30, 0.31, 0.40). Placeholder
+// until the retail scrolling water texture (MMB 0x8000 section) is sourced
+// (Phase A1); unlike the old PBR material, this runs the FFXI zone lighting
+// model, so ponds track zone time-of-day/weather light like the terrain.
+const WATER_TINT: Vec4 = Vec4::new(0.033, 0.073, 0.078, 0.40);
+
+// Water UV scroll velocity, in footprint-normalised UV per second. Invisible
+// until a texture is sourced (texel = 1.0 without one), but wired now so the
+// texture drop-in is data-only. Rate is an aesthetic placeholder.
+const WATER_UV_SCROLL: Vec2 = Vec2::new(0.015, 0.009);
+
+/// Shared handle for the vanilla water-surface material, so `scroll_water_uv`
+/// can integrate `uv_offset` on one asset instead of per-spawn clones.
+#[derive(Resource, Default)]
+pub struct ZoneWaterMaterial(pub Option<Handle<crate::ffxi_zone_material::FfxiZoneMaterial>>);
+
+fn simple_water_material() -> crate::ffxi_zone_material::FfxiZoneMaterial {
+    crate::ffxi_zone_material::FfxiZoneMaterial::new(
+        None,
+        crate::skinned_ffxi_material::FfxiMaterialFlags {
+            // (has_texture, blend-emit [0x8000 translucent path], unused,
+            // discard threshold — 0 so the cutout test never fires).
+            flags: Vec4::new(0.0, 1.0, 0.0, 0.0),
+        },
+        WATER_TINT,
+        Vec4::ZERO,
+        AlphaMode::Blend,
+        crate::ffxi_zone_material::FfxiZoneMaterialKey {
+            // The old StandardMaterial was double-sided (cull_mode: None).
+            back_face_culling: false,
+            mirrored: false,
+            // Bounding-box plane is near-coplanar with the sloped pond bed at
+            // the shoreline; the decal polygon-offset pulls the surface toward
+            // the camera so it wins the depth test there (replaces the old
+            // constant `depth_bias: 1000.0`).
+            z_bias_level: 1,
+            depth_write: false,
+        },
+    )
+}
+
+/// Scrolls the shared water material's UVs. Runs on the single cached asset in
+/// [`ZoneWaterMaterial`]; every water plane in the zone shares it.
+pub fn scroll_water_uv(
+    time: Res<Time>,
+    water_mat: Res<ZoneWaterMaterial>,
+    mut materials: ResMut<Assets<crate::ffxi_zone_material::FfxiZoneMaterial>>,
+) {
+    let Some(handle) = water_mat.0.as_ref() else {
+        return;
+    };
+    // get_mut_untracked: uv_offset flows to the GPU through the persistent
+    // buffers in upload_zone_material_buffers; marking the asset Modified here
+    // would needlessly rebuild its bind group every frame (same pattern as
+    // zone_clouds).
+    if let Some(material) = materials.get_mut_untracked(handle) {
+        let uv = WATER_UV_SCROLL * time.elapsed_secs();
+        material.uv_offset = Vec4::new(uv.x, uv.y, 0.0, 0.0);
     }
 }
 
@@ -1050,6 +1092,13 @@ fn build_water_surface_mesh(spec: &WaterSpec) -> Mesh {
         vec![[0.0, 1.0, 0.0]; spec.positions.len()],
     );
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    // Neutral 0.5 vertex colour: the zone shader's XIM `2 · vertexColor`
+    // overbright convention makes 0.5 the identity, leaving the water colour
+    // entirely to WATER_TINT.
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_COLOR,
+        vec![[0.5, 0.5, 0.5, 1.0]; spec.positions.len()],
+    );
     mesh.insert_indices(Indices::U32(spec.indices.clone()));
     mesh
 }
@@ -1071,7 +1120,8 @@ pub fn spawn_zone_water(
     mut commands: Commands,
     mut pending: ResMut<PendingWaterSpawns>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<crate::ffxi_zone_material::FfxiZoneMaterial>>,
+    mut water_mat: ResMut<ZoneWaterMaterial>,
     settings: Res<crate::graphics::GraphicsSettings>,
     self_q: Query<&GlobalTransform, With<IsSelf>>,
     #[cfg(feature = "enhanced-water")] mut water_materials: ResMut<
@@ -1091,7 +1141,10 @@ pub fn spawn_zone_water(
     let load_radius = settings.view_distance * MMB_LOAD_DISTANCE_MARGIN;
     let load_radius_sq = load_radius * load_radius;
     let enhanced = cfg!(feature = "enhanced-water") && settings.enhanced_water;
-    let simple_mat = materials.add(simple_water_material());
+    let simple_mat = water_mat
+        .0
+        .get_or_insert_with(|| materials.add(simple_water_material()))
+        .clone();
 
     const WATER_SPAWN_BUDGET: usize = 32;
     let mut spawned = 0usize;

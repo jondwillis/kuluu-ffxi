@@ -97,6 +97,7 @@ impl Plugin for DatOverlayPlugin {
             .init_resource::<crate::dat_mzb::LoadMzbInFlight>()
             .init_resource::<crate::dat_mzb::ZoneGeomCache>()
             .init_resource::<crate::dat_mzb::PendingWaterSpawns>()
+            .init_resource::<crate::dat_mzb::ZoneWaterMaterial>()
             .init_resource::<crate::ffxi_actor_render::ActorLoadInFlight>()
             .add_systems(
                 Update,
@@ -118,6 +119,7 @@ impl Plugin for DatOverlayPlugin {
                 (
                     crate::dat_mzb::cull_entities_by_distance,
                     crate::dat_mzb::apply_zone_geom_visibility,
+                    crate::dat_mzb::scroll_water_uv,
                 ),
             )
             .add_systems(

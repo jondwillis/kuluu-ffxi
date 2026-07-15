@@ -1026,13 +1026,21 @@ pub fn apply_anti_aliasing_system(
     mut commands: Commands,
     q_cam: Query<(Entity, &Transform), With<OperatorCamera>>,
     caps: Option<Res<MsaaCaps>>,
-    mut last_applied: Local<Option<(Msaa, bool)>>,
+    mut last_applied: Local<Option<(Msaa, bool, bool)>>,
 ) {
     let target_msaa = caps
         .map(|c| c.clamp(settings.msaa()))
         .unwrap_or_else(|| settings.msaa());
     let want_taa = settings.wants_taa();
-    let next = (target_msaa, want_taa);
+    // volumetric_fog is part of the respawn key because bevy's
+    // `extract_volumetric_fog` is insert-only into the persistent render-world
+    // view entity (its cleanup path only runs when *no* `VolumetricLight`
+    // exists, and our sun/moon always carry one — see the `TODO: needs better
+    // way to handle clean up` in bevy_pbr::volumetric_fog::render). Removing
+    // `VolumetricFog` from a live camera therefore leaves fog rendering
+    // forever; despawning the camera and rebuilding it is the only reliable
+    // way to toggle it at runtime.
+    let next = (target_msaa, want_taa, settings.volumetric_fog);
 
     if *last_applied == Some(next) {
         return;
@@ -1087,25 +1095,25 @@ pub fn apply_bloom_system(
     }
 }
 
+/// Keeps `VolumetricFog` *values* (step count) in sync on a camera that
+/// already has the component. Presence is NOT toggled here: adding/removing
+/// `VolumetricFog` on a live camera doesn't round-trip through bevy's
+/// insert-only render-world extraction, so on/off is handled by the camera
+/// respawn in [`apply_anti_aliasing_system`] (which keys on
+/// `settings.volumetric_fog`) + the spawn path in
+/// `crate::camera::build_operator_camera`. Ambient color/intensity are owned
+/// by `crate::weather::apply_zone_weather`, which derives them from the zone
+/// fog DAT and time of day.
 pub fn apply_volumetric_fog_system(
     settings: Res<GraphicsSettings>,
-    mut commands: Commands,
-    q_cam: Query<(Entity, Option<&VolumetricFog>), With<OperatorCamera>>,
+    mut q_cam: Query<&mut VolumetricFog, With<OperatorCamera>>,
 ) {
-    for (entity, fog) in q_cam.iter() {
-        match (settings.volumetric_fog, fog) {
-            (true, Some(_)) | (true, None) => {
-                commands.entity(entity).insert(VolumetricFog {
-                    step_count: settings.fog_step_count,
-                    ambient_intensity: 0.1,
-                    ambient_color: Color::srgb(0.85, 0.88, 1.0),
-                    jitter: 0.0,
-                });
-            }
-            (false, Some(_)) => {
-                commands.entity(entity).remove::<VolumetricFog>();
-            }
-            (false, None) => {}
+    if !settings.volumetric_fog {
+        return;
+    }
+    for mut fog in q_cam.iter_mut() {
+        if fog.step_count != settings.fog_step_count {
+            fog.step_count = settings.fog_step_count;
         }
     }
 }

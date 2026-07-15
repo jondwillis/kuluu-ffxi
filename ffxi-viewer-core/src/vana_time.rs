@@ -36,6 +36,16 @@ impl VanaClock {
         self.anchor_earth_unix = Some(EARTH_EPOCH_UNIX + game_time as u64);
         self.anchor_instant = Some(Instant::now());
     }
+
+    // Pin the clock to a fixed Vana'diel hour (headless renders / tests).
+    // `vana_sky_from_unix` maps game_time seconds at 25x: hour = game_time * 25 / 3600,
+    // so one Vana hour is 144 anchor seconds.
+    pub fn anchored_at_hour(hour: f32) -> Self {
+        let game_time = (hour.rem_euclid(24.0) * 144.0) as u32;
+        let mut clock = Self::default();
+        clock.anchor(game_time);
+        clock
+    }
 }
 
 pub fn ingest_vana_time(
