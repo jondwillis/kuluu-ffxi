@@ -317,14 +317,10 @@ pub fn sync_entities_system(
             }
         }
 
-        let name = wire.name.as_deref().or({
-            if is_self {
-                snap.char_name.as_deref()
-            } else {
-                None
-            }
-        });
-        if let Some(name) = name.filter(|s| !s.is_empty()) {
+        // No self plate: retail never draws the local player's own overhead
+        // name, and the self plate's overhead projection sits just above the
+        // first-person eye where frame skew makes it dip/jitter (kuluu-gr2).
+        if let Some(name) = wire.name.as_deref().filter(|s| !s.is_empty() && !is_self) {
             if !nameplated.contains(&wire.id) {
                 crate::nameplate_billboard::spawn_nameplate_billboard(
                     &mut commands,
@@ -336,7 +332,6 @@ pub fn sync_entities_system(
                     wire.kind,
                     name,
                     crate::nameplate_billboard::nameplate_color(wire.kind, false, false),
-                    is_self,
                 );
                 nameplated.insert(wire.id);
             }

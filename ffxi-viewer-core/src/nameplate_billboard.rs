@@ -72,7 +72,6 @@ pub fn spawn_nameplate_billboard(
     kind: EntityKind,
     name: &str,
     color: Color,
-    is_self: bool,
 ) -> Entity {
     let rgba = color_to_rgba8(color);
 
@@ -93,7 +92,7 @@ pub fn spawn_nameplate_billboard(
         ..default()
     });
 
-    let id = commands
+    commands
         .spawn((
             InGameEntity,
             Nameplate { entity_id, kind },
@@ -116,12 +115,15 @@ pub fn spawn_nameplate_billboard(
             NotShadowCaster,
             NotShadowReceiver,
         ))
-        .id();
+        .id()
+}
 
-    if is_self {
-        commands.entity(id).insert(bevy::picking::Pickable::IGNORE);
-    }
-    id
+/// Retail never draws the local player's own overhead name, so the self plate
+/// is suppressed entirely. This also removes the near-degenerate overhead
+/// projection (plate anchored just above the first-person eye) whose 1-frame
+/// camera/plate skew dips and jitters on stutter frames (kuluu-gr2).
+pub fn is_self_billboard(entity_id: u32, self_char_id: Option<u32>) -> bool {
+    self_char_id.is_some_and(|cid| cid != 0 && cid == entity_id)
 }
 
 pub fn nameplate_color(kind: EntityKind, engaged: bool, dead: bool) -> Color {
@@ -181,6 +183,13 @@ pub fn update_nameplate_billboards_system(
     }
 
     for (ui_entity, mut np, mut aspect, mut transform, mut vis, mat) in &mut billboards {
+        // Covers plates spawned before self_char_id was known; the spawn path
+        // in scene.rs already skips self once the id is resolved (kuluu-gr2).
+        if is_self_billboard(np.entity_id, self_char_id) {
+            commands.entity(ui_entity).try_despawn();
+            continue;
+        }
+
         let Some(&(entity_pos, head_y_offset)) = pos_by_id.get(&np.entity_id) else {
             commands.entity(ui_entity).try_despawn();
             continue;
@@ -437,4 +446,29 @@ fn hp_color_rgba(pct: u8) -> [u8; 4] {
         (1.0, t)
     };
     [(r * 255.0).round() as u8, (g * 255.0).round() as u8, 0, 255]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_billboard_suppressed_for_known_self_id() {
+        assert!(is_self_billboard(0xCAFE, Some(0xCAFE)));
+    }
+
+    #[test]
+    fn other_entities_keep_billboards() {
+        assert!(!is_self_billboard(0x4242, Some(0xCAFE)));
+    }
+
+    #[test]
+    fn unknown_self_id_suppresses_nothing() {
+        assert!(!is_self_billboard(0xCAFE, None));
+    }
+
+    #[test]
+    fn zero_self_id_is_unresolved_not_a_match() {
+        assert!(!is_self_billboard(0, Some(0)));
+    }
 }
