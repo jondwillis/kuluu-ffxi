@@ -234,6 +234,37 @@ fn top_render_spans(diag: &DiagnosticsStore) -> String {
     format!("  peak render: {}", parts.join(", "))
 }
 
+/// One-shot dump of every `render/*` diagnostic path ~15s after startup, gated by
+/// `FFXI_GPU_TIMING`. Positive confirmation that GPU spans (e.g. shadow passes) are
+/// recording, since spikes are the only other way spans reach the log.
+pub fn dump_render_diagnostics(
+    time: Res<Time<Real>>,
+    diag: Res<DiagnosticsStore>,
+    mut done: Local<bool>,
+) {
+    if *done {
+        return;
+    }
+    if std::env::var_os("FFXI_GPU_TIMING").is_none() {
+        *done = true;
+        return;
+    }
+    if time.elapsed_secs() < 15.0 {
+        return;
+    }
+    *done = true;
+    let mut n = 0usize;
+    for d in diag
+        .iter()
+        .filter(|d| d.path().as_str().starts_with("render/"))
+    {
+        let peak = d.values().copied().fold(0.0f64, f64::max);
+        info!(target: "perf", "diag {} peak={peak:.2}ms", d.path().as_str());
+        n += 1;
+    }
+    info!(target: "perf", "diag dump complete ({n} render/* paths)");
+}
+
 pub fn update_perf_monitor(
     time: Res<Time<Real>>,
     source: Res<NativeSource>,

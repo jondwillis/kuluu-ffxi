@@ -328,6 +328,9 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     add_hud_spawners(&mut app, OnEnter(AppPhase::InGame));
     app.init_resource::<perf_hud::PerfMonitor>();
     app.init_resource::<perf_hud::AssetChurn>();
+    // Ungated: fires ~15s in regardless of app phase so the dump can't be
+    // silently skipped if InGame is late (or never) entered.
+    app.add_systems(Update, perf_hud::dump_render_diagnostics);
     app.add_systems(
         Update,
         perf_hud::track_asset_churn

@@ -17,6 +17,12 @@ recastnavigation-rs = { path = "vendor/recastnavigation-rs" }
 # bevy_water: Neopallium/bevy_water#45; bevy_framepace: aevyrie/bevy_framepace#78.
 bevy_water = { git = "https://github.com/gameartel/bevy_water", rev = "0da726338576cca487e1642d2403442573e2c276" }
 bevy_framepace = { git = "https://github.com/noprobelm/bevy_framepace", rev = "a9b8eb256dd3bbe746fda06fad77790bb3143ba7" }
+# Vendored copy of bevy_pbr 0.19.0 with one addition: a RenderDiagnosticsPlugin
+# pass_span around each shadow render pass (src/render/light.rs, grep "KULUU
+# PATCH"). Upstream records GPU timing for the main 3D passes but not shadow
+# passes, so shadow cost is invisible in the perf HUD without this. Drop when
+# upstream adds a shadow pass span (candidate for an upstream PR).
+bevy_pbr = { path = "vendor/bevy_pbr" }
 
 # Bevy's recommended dev profile: build our own crates at opt-level=1
 # (still fast to compile, still debuggable) but compile every dependency
