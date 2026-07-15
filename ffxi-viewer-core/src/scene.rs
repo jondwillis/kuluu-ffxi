@@ -116,6 +116,7 @@ pub fn setup_world(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut moon_materials: ResMut<Assets<crate::moon_material::MoonMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     settings: Res<GraphicsSettings>,
 ) {
     let orb = |c: Color, glow: f32, m: &mut Assets<StandardMaterial>| {
@@ -181,9 +182,13 @@ pub fn setup_world(
             scattering_asymmetry: 0.7,
             light_tint: Color::srgb(1.0, 0.96, 0.88),
             light_intensity: 1.0,
+            // Vertical falloff: ground haze that clears overhead so the sky
+            // stays visible (FFXI never fogs the sky dome). See weather.rs.
+            density_texture: Some(crate::weather::height_fog_density_texture(&mut images)),
             ..default()
         },
-        Transform::from_xyz(0.0, 200.0, 0.0).with_scale(Vec3::splat(2000.0)),
+        Transform::from_xyz(0.0, crate::weather::FOG_VOLUME_CENTER_Y, 0.0)
+            .with_scale(crate::weather::FOG_VOLUME_SCALE),
     ));
 
     commands.insert_resource(GlobalAmbientLight {

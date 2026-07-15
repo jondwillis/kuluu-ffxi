@@ -175,7 +175,12 @@ fn print_toasts(mut rx: MessageReader<ToastEvent>) {
         println!("[toast] {}", t.line.text);
     }
 }
-fn setup(mut c: Commands, p: Res<P>, mut d: ResMut<DrawDistance>) {
+fn setup(
+    mut c: Commands,
+    p: Res<P>,
+    mut d: ResMut<DrawDistance>,
+    mut images: ResMut<Assets<Image>>,
+) {
     d.zone_geom_mode = p.mode;
     d.world = 1e5;
     d.mob = 1e5;
@@ -221,9 +226,15 @@ fn setup(mut c: Commands, p: Res<P>, mut d: ResMut<DrawDistance>) {
                 scattering_asymmetry: 0.7,
                 light_tint: Color::srgb(1.0, 0.96, 0.88),
                 light_intensity: 1.0,
+                // Ground haze with vertical falloff so the sky stays visible;
+                // see height_fog_density_texture in weather.rs.
+                density_texture: Some(ffxi_viewer_core::weather::height_fog_density_texture(
+                    &mut images,
+                )),
                 ..default()
             },
-            Transform::from_xyz(0.0, 200.0, 0.0).with_scale(Vec3::splat(2000.0)),
+            Transform::from_xyz(0.0, ffxi_viewer_core::weather::FOG_VOLUME_CENTER_Y, 0.0)
+                .with_scale(ffxi_viewer_core::weather::FOG_VOLUME_SCALE),
         ));
     }
     c.insert_resource(GlobalAmbientLight {
