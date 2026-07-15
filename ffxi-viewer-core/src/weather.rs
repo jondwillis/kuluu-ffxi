@@ -1,19 +1,21 @@
-#![cfg(not(target_arch = "wasm32"))]
-
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 
 use bevy::light::FogVolume;
 use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
+use ffxi_dat::weather::collect_zone_weather_sets;
 use ffxi_dat::weather::{
-    collect_zone_weather_sets, sample_weather, weather_type_id, WeatherRecord, WeatherTypeId,
-    ZoneWeatherSets,
+    sample_weather, weather_type_id, WeatherRecord, WeatherTypeId, ZoneWeatherSets,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use ffxi_dat::DatRoot;
 use ffxi_viewer_wire::Weather;
 
 use crate::camera::OperatorCamera;
 use crate::graphics_settings::GraphicsSettings;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::snapshot::SceneState;
 
 #[derive(Resource, Default)]
@@ -105,13 +107,17 @@ pub struct WeatherPlugin;
 
 impl Plugin for WeatherPlugin {
     fn build(&self, app: &mut App) {
+        // load_zone_weather is filesystem-backed (DatRoot), so it is native-only;
+        // on wasm `sets` stays empty and sample_zone_weather leaves `current`
+        // unset, which is every consumer's existing no-records fallback
+        // (kuluu-ehye).
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(Update, load_zone_weather.before(WeatherSampleSet));
+
         app.init_resource::<ZoneWeather>().add_systems(
             Update,
             (
-                load_zone_weather,
-                sample_zone_weather
-                    .in_set(WeatherSampleSet)
-                    .after(load_zone_weather),
+                sample_zone_weather.in_set(WeatherSampleSet),
                 // research/xim EnvironmentManager.kt:399-445: the 0x2F record is the
                 // authoritative ambient base and weather modulates it. Run AFTER
                 // apply_weather_to_ambient_and_fog (which recomputes ambient from the
@@ -158,6 +164,7 @@ pub fn sample_zone_weather(
     zone_weather.current = sample_weather(&zone_weather.records, time_minutes);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_zone_weather(
     scene_state: Res<SceneState>,
     mut zone_weather: ResMut<ZoneWeather>,

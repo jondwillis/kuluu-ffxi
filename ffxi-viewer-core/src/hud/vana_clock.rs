@@ -8,6 +8,11 @@ pub const EARTH_SECS_PER_VANA_HOUR: u64 = 144;
 
 pub const EARTH_SECS_PER_VANA_DAY: u64 = EARTH_SECS_PER_VANA_HOUR * 24;
 
+// Placeholder cell when no PlayerMapGrid is available: pre-load on native, and
+// always on wasm, where crate::minimap (the grid's source) is compiled out
+// (kuluu-ehye).
+const GRID_CELL_UNKNOWN: &str = "(?-?)";
+
 const FRAMES_GROUP: &str = "menu    frames  ";
 const DAY_ORB_BASE_INDEX: usize = 106;
 const ORB_SIZE_PX: f32 = 14.0;
@@ -117,8 +122,8 @@ impl VanaWeekday {
 pub fn update_vana_clock(
     mut q: Query<&mut Text, With<VanaClockLabel>>,
     mut orb_q: Query<(&mut Node, &mut ImageNode), With<VanaClockOrb>>,
-    q_self: Query<&Transform, With<crate::components::IsSelf>>,
-    grid: Option<Res<crate::minimap::retail::PlayerMapGrid>>,
+    #[cfg(not(target_arch = "wasm32"))] q_self: Query<&Transform, With<crate::components::IsSelf>>,
+    #[cfg(not(target_arch = "wasm32"))] grid: Option<Res<crate::minimap::retail::PlayerMapGrid>>,
     atlas: Option<ResMut<crate::ui_element_atlas::UiElementAtlas>>,
     dat_root: Option<Res<crate::ui_element_atlas::UiElementDatRoot>>,
     mut images: ResMut<Assets<Image>>,
@@ -131,7 +136,10 @@ pub fn update_vana_clock(
     };
 
     let earth_now = vana_clock.earth_unix_secs_now();
+    #[cfg(not(target_arch = "wasm32"))]
     let cell = player_grid_cell(grid.as_deref(), q_self.single().ok());
+    #[cfg(target_arch = "wasm32")]
+    let cell = GRID_CELL_UNKNOWN;
     let want = format!("{}   {}", format_vana_time(earth_now), cell);
     if **text != want {
         **text = want;
@@ -201,6 +209,7 @@ pub fn format_vana_time(earth_unix_secs: u64) -> String {
     format!("{v_hour}:{v_minute:02}")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn player_grid_cell(
     grid: Option<&crate::minimap::retail::PlayerMapGrid>,
     player: Option<&Transform>,
@@ -210,7 +219,7 @@ fn player_grid_cell(
             let (col, row) = aabb.world_to_grid(tf.translation);
             format!("({col}-{row})")
         }
-        _ => "(?-?)".to_string(),
+        _ => GRID_CELL_UNKNOWN.to_string(),
     }
 }
 
@@ -228,6 +237,15 @@ mod tests {
             let weekday = VanaWeekday::from_vana_day(day as u64);
             assert_eq!(DAY_ORB_BASE_INDEX + weekday.element_index(), *want);
         }
+    }
+
+    #[test]
+    fn player_grid_cell_without_grid_matches_wasm_placeholder() {
+        // The wasm build of update_vana_clock substitutes GRID_CELL_UNKNOWN
+        // directly (crate::minimap is compiled out there, kuluu-ehye); this pins
+        // the native no-grid fallback to the same string so the two targets
+        // render identically before a map grid loads.
+        assert_eq!(player_grid_cell(None, None), GRID_CELL_UNKNOWN);
     }
 
     #[test]

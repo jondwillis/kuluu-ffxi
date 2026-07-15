@@ -272,6 +272,7 @@ fn load_weather(p: Res<P>, mut zone_weather: ResMut<ZoneWeather>) {
     zone_weather.file_id = Some(p.file_id);
     zone_weather.sets = collect_zone_weather_sets(&bytes);
 }
+#[allow(clippy::too_many_arguments)]
 fn cap(
     mut c: Commands,
     mut f: ResMut<FC>,

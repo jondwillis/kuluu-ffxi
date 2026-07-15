@@ -60,7 +60,6 @@ pub mod ui_font;
 pub mod vana_time;
 #[cfg(feature = "enhanced-water")]
 pub mod water_enhanced;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod weather;
 pub mod weather_fx;
 #[cfg(not(target_arch = "wasm32"))]
@@ -163,7 +162,6 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(audio::AudioPlugin);
 
-        #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(weather::WeatherPlugin);
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -287,7 +285,6 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
             app.add_systems(Update, target_strobe::target_strobe_system);
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
         app.configure_sets(
             Update,
             weather::WeatherSampleSet
