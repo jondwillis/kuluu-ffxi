@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
+use bevy::ui::UiTransform;
 use ffxi_viewer_wire::EntityKind;
 
 use crate::camera::ChaseCamera;
@@ -14,6 +15,12 @@ use super::{MinimapOverlayLayer, MinimapView};
 const DOT_DIAMETER_PX: f32 = 6.0;
 
 const SELF_MARKER_PX: f32 = 10.0;
+
+/// Nose protruding past the marker's top edge; without an asymmetric shape the
+/// heading rotation of a plain square is invisible at every 90-degree step.
+const SELF_MARKER_NOSE_PX: f32 = 4.0;
+
+const SELF_MARKER_COLOR: Color = Color::srgb(0.2, 1.0, 1.0);
 
 const TARGET_RING_PX: f32 = 2.0;
 
@@ -48,6 +55,7 @@ pub fn update_minimap_overlay(
     mut dots: ResMut<MinimapDots>,
     mut commands: Commands,
     mut q_dot_node: Query<(&mut Node, &mut BackgroundColor), With<MinimapDot>>,
+    mut q_marker_transform: Query<&mut UiTransform, With<MinimapDot>>,
 ) {
     let Some(aabb) = view.visible_aabb else {
         return;
@@ -97,14 +105,24 @@ pub fn update_minimap_overlay(
             overlay_layer,
             SELF_MARKER_ID,
             uv,
-            Color::srgb(0.2, 1.0, 1.0),
+            SELF_MARKER_COLOR,
             SELF_MARKER_PX,
             &mut q_dot_node,
             false,
         );
         seen.insert(SELF_MARKER_ID);
 
-        let _ = chase.yaw;
+        if let Some(&marker) = dots.by_id.get(&SELF_MARKER_ID) {
+            let rotation = self_marker_rotation(chase.yaw);
+            if let Ok(mut ui_transform) = q_marker_transform.get_mut(marker) {
+                if ui_transform.rotation != rotation {
+                    ui_transform.rotation = rotation;
+                }
+            } else if let Ok(mut ec) = commands.get_entity(marker) {
+                ec.insert(UiTransform::from_rotation(rotation))
+                    .with_children(spawn_self_marker_nose);
+            }
+        }
     }
 
     let stale: Vec<u32> = dots
@@ -202,6 +220,30 @@ fn upsert_dot(
     dots.by_id.insert(entity_id, dot_entity);
 }
 
+/// Clockwise UI rotation aligning the marker nose (screen-up when unrotated)
+/// with the player's forward direction. `world_to_uv` maps world +X to
+/// screen-right and +Z to screen-down, and the chase camera sits at
+/// +(sin yaw, cos yaw) behind the player (camera.rs chase placement), so
+/// forward on the map plane is (-sin yaw, -cos yaw) — screen-up rotated
+/// clockwise by -yaw.
+fn self_marker_rotation(yaw: f32) -> Rot2 {
+    Rot2::radians(-yaw)
+}
+
+fn spawn_self_marker_nose(parent: &mut ChildSpawnerCommands) {
+    parent.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px((SELF_MARKER_PX - SELF_MARKER_NOSE_PX) * 0.5),
+            top: Val::Px(-SELF_MARKER_NOSE_PX),
+            width: Val::Px(SELF_MARKER_NOSE_PX),
+            height: Val::Px(SELF_MARKER_NOSE_PX),
+            ..default()
+        },
+        BackgroundColor(SELF_MARKER_COLOR),
+    ));
+}
+
 fn dot_color(kind: EntityKind, is_target: bool, is_locked: bool) -> Color {
     if is_locked {
         return Color::srgb(1.0, 0.4, 0.8);
@@ -238,6 +280,33 @@ mod tests {
         let locked_pc = dot_color(EntityKind::Pc, false, true);
         let pc = dot_color(EntityKind::Pc, false, false);
         assert_ne!(locked_pc, pc);
+    }
+
+    #[test]
+    fn self_marker_rotation_aligns_nose_with_forward() {
+        // Screen space is +x right / +y down (Node left/top from world_to_uv);
+        // `UiTransform.rotation` applies its Rot2 matrix in that space.
+        for heading in [0u8, 32, 64, 96, 128, 160, 192, 224] {
+            let yaw = crate::camera::yaw_for_heading(heading);
+            let forward_screen = Vec2::new(-yaw.sin(), -yaw.cos());
+            let nose_screen = self_marker_rotation(yaw) * Vec2::new(0.0, -1.0);
+            assert!(
+                (nose_screen - forward_screen).length() < 1e-5,
+                "heading {heading}: nose {nose_screen:?} vs forward {forward_screen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_marker_rotation_heading_zero_points_screen_right() {
+        // FFXI heading 0 faces world +X (camera::yaw_for_heading), and
+        // world_to_uv maps +X to screen-right.
+        let rot = self_marker_rotation(crate::camera::yaw_for_heading(0));
+        let nose = rot * Vec2::new(0.0, -1.0);
+        assert!(
+            (nose - Vec2::new(1.0, 0.0)).length() < 1e-5,
+            "nose {nose:?}"
+        );
     }
 
     #[test]
