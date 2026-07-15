@@ -4,10 +4,10 @@ name: beads-github-publish (beads → GitHub Issues)
 # issue, keyed by a `<!-- beads-id: <id> -->` body marker, with title/body/labels
 # and open/closed state kept in sync. See scripts/beads-github-publish.py.
 #
-# Manual + dry-run-by-default for now. This WRITES to GitHub Issues (create /
-# edit / close), so it stays opt-in until a dry run is eyeballed and the one-time
-# migration off the old ROADMAP-derived issues is done. Flip dry_run=false to
-# publish for real; enable the push trigger below once that's trusted.
+# Runs automatically on push to main when .beads/issues.jsonl changed, publishing
+# ALL beads (verified 2026-07; the one-time migration off the old ROADMAP-derived
+# issues is done). This WRITES to GitHub Issues (create / edit / close).
+# workflow_dispatch remains available for manual and dry runs.
 
 on:
   workflow_dispatch:
@@ -19,10 +19,10 @@ on:
       all:
         description: "Publish every bead (default: only roadmap-labelled)"
         type: boolean
-        default: false
-  # push:
-  #   branches: [main]
-  #   paths: ['.beads/issues.jsonl']   # enable once a real run is verified
+        default: true
+  push:
+    branches: [main]
+    paths: ['.beads/issues.jsonl']
 
 permissions:
   issues: write
@@ -41,8 +41,8 @@ jobs:
       - name: Publish beads → GitHub Issues
         env:
           GH_TOKEN: ${{ github.token }}
-          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          DRY_RUN: ${{ github.event_name == 'push' && '0' || (inputs.dry_run && '1' || '0') }}
         run: |
           python3 scripts/beads-github-publish.py \
             --repo "${GITHUB_REPOSITORY}" \
-            ${{ inputs.all && '--all' || '' }}
+            ${{ (github.event_name == 'push' || inputs.all) && '--all' || '' }}
