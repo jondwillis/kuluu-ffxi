@@ -311,7 +311,10 @@ impl Material for FfxiZoneMaterial {
 
 fn update_zone_material_lighting(
     ambient: Res<GlobalAmbientLight>,
-    zone_lighting: Res<crate::weather::ZoneDirectionalLighting>,
+    // Optional: minimal apps (e.g. the zone-render-headless example) use
+    // FfxiZoneMaterialPlugin without the weather plugin, so the resource may
+    // not exist. Absent == not valid -> take the GlobalAmbientLight fallback.
+    zone_lighting: Option<Res<crate::weather::ZoneDirectionalLighting>>,
     q_sun: Query<
         (&DirectionalLight, &GlobalTransform),
         (
@@ -342,8 +345,9 @@ fn update_zone_material_lighting(
     // the authoritative per-hour base (dark at night). Use it directly when the
     // zone ships records; the GlobalAmbientLight amb_k/COLOR_BIAS path is the
     // no-DAT fallback (it re-derives from the atmosphere seed and inflates).
-    let mut amb_rgb = if zone_lighting.valid {
-        zone_lighting.ambient_landscape
+    let zone_lighting = zone_lighting.filter(|z| z.valid);
+    let mut amb_rgb = if let Some(zl) = zone_lighting.as_deref() {
+        zl.ambient_landscape
     } else {
         let amb = ambient.color.to_linear();
         let amb_k = (ambient.brightness / AMBIENT_REF_LUX).clamp(0.0, 1.5);
@@ -373,33 +377,34 @@ fn update_zone_material_lighting(
     // research/xim EnvironmentSection.kt:163-164: zone geometry takes both terrain
     // sun(dir0)+moon(dir1) diffuse lights. The DirectionalLight's `forward` is the
     // -to-celestial direction, so negate the stored to-sun/to-moon vectors to match.
-    let (dir0_dir, dir0_color, dir1_dir, dir1_color) = if zone_lighting.valid {
-        let pack = |to_dir: Vec3, color: Vec3, k: f32| -> (Vec4, Vec4) {
-            if k <= 0.0 || to_dir == Vec3::ZERO {
-                return (Vec4::ZERO, Vec4::ZERO);
-            }
-            let f = (-to_dir).normalize_or_zero();
-            (
-                Vec4::new(f.x, f.y, f.z, 0.0),
-                Vec4::new(color.x, color.y, color.z, k.clamp(0.0, 1.0)),
-            )
+    let (dir0_dir, dir0_color, dir1_dir, dir1_color) =
+        if let Some(zone_lighting) = zone_lighting.as_deref() {
+            let pack = |to_dir: Vec3, color: Vec3, k: f32| -> (Vec4, Vec4) {
+                if k <= 0.0 || to_dir == Vec3::ZERO {
+                    return (Vec4::ZERO, Vec4::ZERO);
+                }
+                let f = (-to_dir).normalize_or_zero();
+                (
+                    Vec4::new(f.x, f.y, f.z, 0.0),
+                    Vec4::new(color.x, color.y, color.z, k.clamp(0.0, 1.0)),
+                )
+            };
+            let (d0d, d0c) = pack(
+                zone_lighting.sun_dir,
+                zone_lighting.sun_color,
+                zone_lighting.sun_k,
+            );
+            let (d1d, d1c) = pack(
+                zone_lighting.moon_dir,
+                zone_lighting.moon_color,
+                zone_lighting.moon_k,
+            );
+            (d0d, d0c, d1d, d1c)
+        } else {
+            let (d0d, d0c) = extract(q_sun.single().ok());
+            let (d1d, d1c) = extract(q_moon.single().ok());
+            (d0d, d0c, d1d, d1c)
         };
-        let (d0d, d0c) = pack(
-            zone_lighting.sun_dir,
-            zone_lighting.sun_color,
-            zone_lighting.sun_k,
-        );
-        let (d1d, d1c) = pack(
-            zone_lighting.moon_dir,
-            zone_lighting.moon_color,
-            zone_lighting.moon_k,
-        );
-        (d0d, d0c, d1d, d1c)
-    } else {
-        let (d0d, d0c) = extract(q_sun.single().ok());
-        let (d1d, d1c) = extract(q_moon.single().ok());
-        (d0d, d0c, d1d, d1c)
-    };
 
     global.0.ambient = ambient_v;
     global.0.dir0_dir = dir0_dir;
@@ -418,12 +423,18 @@ fn update_zone_material_lighting(
 // that, and the range cutoff in nearest_point_light_arrays keeps far geometry
 // dark.
 fn update_zone_material_point_lights(
-    active: Res<crate::zone_point_lights::ActiveSceneLights>,
+    // Optional: minimal apps (e.g. the zone-render-headless example) use
+    // FfxiZoneMaterialPlugin without ZonePointLightsPlugin, so the resource
+    // may not exist. No lights -> nothing to feed the material.
+    active: Option<Res<crate::zone_point_lights::ActiveSceneLights>>,
     q_self: Query<&GlobalTransform, With<crate::components::IsSelf>>,
     q_cam: Query<&GlobalTransform, With<Camera3d>>,
     mut global: ResMut<ZoneGlobalLighting>,
     mut selected: Local<Vec<Vec3>>,
 ) {
+    let Some(active) = active else {
+        return;
+    };
     let Some(focus) = q_self
         .iter()
         .next()

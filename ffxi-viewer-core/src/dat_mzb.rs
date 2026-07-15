@@ -392,6 +392,27 @@ pub struct PendingWaterSpawns {
     pub specs: std::collections::VecDeque<WaterSpec>,
 }
 
+// Vanilla-path scrolling water state: the shared procedural ripple texture
+// (created lazily on first spawn) and the per-pond material ids whose
+// `uv_transform` translation scroll_zone_water advances each frame. Ids are
+// weak (AssetId): when a pond entity despawns (zone change despawns the
+// AutoMzbOverlay parent tree) its material asset is freed and the id is pruned
+// on the next scroll tick — no explicit zone-change hook needed.
+#[derive(Resource, Default)]
+pub struct ZoneWaterScroll {
+    pub texture: Option<Handle<Image>>,
+    pub materials: Vec<AssetId<StandardMaterial>>,
+}
+
+// World units covered by one repeat of the water ripple texture. Pond mesh UVs
+// are normalised over the footprint bounds, so each pond material scales them
+// by footprint_size / WATER_TEX_TILE to get world-sized, pond-independent
+// ripples.
+const WATER_TEX_TILE: f32 = 16.0;
+
+// Scroll velocity in world units/sec (XZ). Gentle drift; sub-tile per second.
+const WATER_SCROLL_WORLD: Vec2 = Vec2::new(0.55, 0.35);
+
 #[derive(Message, Debug, Clone, Copy)]
 pub struct LoadMzbRequest {
     pub file_id: u32,
@@ -1009,12 +1030,60 @@ fn compute_init_visibility(mode: ZoneGeomMode) -> (Visibility, Visibility) {
     }
 }
 
-fn simple_water_material() -> StandardMaterial {
+// Tileable procedural ripple: low-contrast sum of integer-frequency sine bands
+// so opposite edges match exactly. Stands in until the DAT-sourced water
+// texture set is parsed; the scroll mechanism (uv_transform animation) is the
+// part that carries over.
+fn water_ripple_image() -> Image {
+    use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+
+    const N: usize = 64;
+    let mut data = Vec::with_capacity(N * N * 4);
+    let tau = std::f32::consts::TAU;
+    for y in 0..N {
+        for x in 0..N {
+            let u = x as f32 / N as f32;
+            let v = y as f32 / N as f32;
+            // Integer wave vectors -> exact tiling at the texture border.
+            let w = (tau * (3.0 * u + v)).sin()
+                + (tau * (u - 2.0 * v)).sin()
+                + 0.5 * (tau * (5.0 * u + 4.0 * v)).sin();
+            // w in [-2.5, 2.5] -> luma around 1.0 with subtle modulation, so
+            // the material's base_color tint still sets the overall look.
+            let l = 1.0 + 0.10 * (w / 2.5);
+            let b = (l.clamp(0.0, 1.0) * 255.0) as u8;
+            data.extend_from_slice(&[b, b, b, 255]);
+        }
+    }
+    let mut img = Image::new(
+        Extent3d {
+            width: N as u32,
+            height: N as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..ImageSamplerDescriptor::linear()
+    });
+    img
+}
+
+fn simple_water_material(texture: Handle<Image>, uv_scale: Vec2) -> StandardMaterial {
     StandardMaterial {
-        // Interim flat tint — placeholder for the real scrolling water texture.
         // Murky grey-teal, more transparent and less mirror-bright than a pure
-        // blue so the bed reads through.
+        // blue so the bed reads through. The ripple texture modulates this tint
+        // and scroll_zone_water drifts it via uv_transform.
         base_color: Color::srgba(0.20, 0.30, 0.31, 0.40),
+        base_color_texture: Some(texture),
+        // Mesh UVs are footprint-normalised; scale to world-sized ripples.
+        uv_transform: bevy::math::Affine2::from_scale(uv_scale),
         perceptual_roughness: 0.2,
         metallic: 0.0,
         reflectance: 0.38,
@@ -1072,7 +1141,10 @@ pub fn spawn_zone_water(
     mut pending: ResMut<PendingWaterSpawns>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut scroll: ResMut<ZoneWaterScroll>,
     settings: Res<crate::graphics::GraphicsSettings>,
+    draw: Res<DrawDistance>,
     self_q: Query<&GlobalTransform, With<IsSelf>>,
     #[cfg(feature = "enhanced-water")] mut water_materials: ResMut<
         Assets<crate::water_enhanced::StandardWaterMaterial>,
@@ -1091,7 +1163,16 @@ pub fn spawn_zone_water(
     let load_radius = settings.view_distance * MMB_LOAD_DISTANCE_MARGIN;
     let load_radius_sq = load_radius * load_radius;
     let enhanced = cfg!(feature = "enhanced-water") && settings.enhanced_water;
-    let simple_mat = materials.add(simple_water_material());
+    let ripple_tex = scroll
+        .texture
+        .get_or_insert_with(|| images.add(water_ripple_image()))
+        .clone();
+
+    // Water surfaces are visual, non-collision zone geometry: honor the current
+    // ZoneGeomMode at spawn time (a zone loaded while geom is Off/Collision must
+    // not show water), and tag MzbNonCollisionMesh so apply_zone_geom_visibility
+    // toggles them with the rest of the non-collision meshes.
+    let (_, water_vis) = compute_init_visibility(draw.zone_geom_mode);
 
     const WATER_SPAWN_BUDGET: usize = 32;
     let mut spawned = 0usize;
@@ -1126,10 +1207,11 @@ pub fn spawn_zone_water(
             e = commands.spawn((
                 MzbOverlay,
                 WaterPlane,
+                MzbNonCollisionMesh,
                 mesh,
                 mat,
                 Transform::IDENTITY,
-                Visibility::Inherited,
+                water_vis,
                 bevy::light::NotShadowReceiver,
                 ChildOf(spec.parent),
             ));
@@ -1139,13 +1221,26 @@ pub fn spawn_zone_water(
             continue;
         }
 
+        // Per-pond material: uv_transform scale converts the footprint-
+        // normalised mesh UVs to world-sized ripple tiles, so scroll speed and
+        // ripple size are identical across ponds of different extents. Only the
+        // spawned entity holds a strong handle — despawn frees the asset and
+        // scroll_zone_water prunes the id.
+        let dx = (spec.max.x - spec.min.x).max(0.01);
+        let dz = (spec.max.z - spec.min.z).max(0.01);
+        let mat = materials.add(simple_water_material(
+            ripple_tex.clone(),
+            Vec2::new(dx, dz) / WATER_TEX_TILE,
+        ));
+        scroll.materials.push(mat.id());
         e = commands.spawn((
             MzbOverlay,
             WaterPlane,
+            MzbNonCollisionMesh,
             mesh,
-            MeshMaterial3d(simple_mat.clone()),
+            MeshMaterial3d(mat),
             Transform::IDENTITY,
-            Visibility::Inherited,
+            water_vis,
             bevy::light::NotShadowReceiver,
             ChildOf(spec.parent),
         ));
@@ -1155,6 +1250,34 @@ pub fn spawn_zone_water(
     }
     pending.specs = retained;
     let _ = enhanced;
+}
+
+// Drifts the vanilla water ripple texture: same world-space velocity for every
+// pond (translation is in tile units because each material's uv_transform
+// scale already maps mesh UVs to world tiles). Ids whose assets are gone
+// (pond despawned on zone change / reload) are pruned here.
+pub fn scroll_zone_water(
+    time: Res<Time>,
+    mut scroll: ResMut<ZoneWaterScroll>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if scroll.materials.is_empty() {
+        return;
+    }
+    let t = time.elapsed_secs();
+    // fract() keeps the offset small so f32 precision holds over long sessions;
+    // the texture repeats, so a whole-tile jump is invisible.
+    let offset = Vec2::new(
+        (t * WATER_SCROLL_WORLD.x / WATER_TEX_TILE).fract(),
+        (t * WATER_SCROLL_WORLD.y / WATER_TEX_TILE).fract(),
+    );
+    scroll.materials.retain(|id| {
+        let Some(mat) = materials.get_mut(*id) else {
+            return false;
+        };
+        mat.uv_transform.translation = offset;
+        true
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

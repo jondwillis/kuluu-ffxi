@@ -3,14 +3,16 @@ use bevy::camera::ScalingMode;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Capturing, Screenshot};
 use ffxi_viewer_core::dat_mmb::{
-    process_load_mmb_requests, LoadMmbRequest, MmbHandleCache, MmbLoadQueue, MmbParseCache,
-    MmbTexPools,
+    process_load_mmb_requests, LoadMmbRequest, MmbHandleCache, MmbLoadInFlight, MmbLoadQueue,
+    MmbParseCache, MmbTexPools,
 };
 use ffxi_viewer_core::dat_mzb::{
-    kick_load_mzb_tasks, poll_load_mzb_tasks, DrawDistance, LoadMzbInFlight, LoadMzbRequest,
-    MzbCollisionGeometry, ZoneGeomCache, ZoneGeomMode,
+    kick_load_mzb_tasks, poll_load_mzb_tasks, scroll_zone_water, spawn_zone_water, DrawDistance,
+    LoadMzbInFlight, LoadMzbRequest, MzbCollisionGeometry, PendingWaterSpawns, ZoneGeomCache,
+    ZoneGeomMode, ZoneWaterScroll,
 };
 use ffxi_viewer_core::ffxi_zone_material::FfxiZoneMaterialPlugin;
+use ffxi_viewer_core::graphics::GraphicsSettings;
 use ffxi_viewer_core::scene::TrackedEntities;
 use ffxi_viewer_core::snapshot::ToastEvent;
 use ffxi_viewer_core::sun_moon::IsSun;
@@ -118,17 +120,24 @@ fn main() {
         .init_resource::<LoadMzbInFlight>()
         .init_resource::<ZoneGeomCache>()
         .init_resource::<MmbHandleCache>()
+        .init_resource::<MmbLoadInFlight>()
         .init_resource::<MmbLoadQueue>()
         .init_resource::<MmbParseCache>()
         .init_resource::<MmbTexPools>()
         .init_resource::<TrackedEntities>()
         .init_resource::<SceneState>()
+        .init_resource::<PendingWaterSpawns>()
+        .init_resource::<ZoneWaterScroll>()
+        .init_resource::<GraphicsSettings>()
         .add_systems(Startup, (setup, fire))
         .add_systems(
             Update,
             (
+                drain_toasts,
                 kick_load_mzb_tasks,
                 poll_load_mzb_tasks,
+                spawn_zone_water,
+                scroll_zone_water,
                 process_load_mmb_requests,
                 cap,
             )
@@ -183,6 +192,12 @@ fn fire(mut tx: MessageWriter<LoadMzbRequest>, p: Res<P>) {
         auto_loaded: false,
     });
 }
+fn drain_toasts(mut rx: MessageReader<ToastEvent>) {
+    for t in rx.read() {
+        eprintln!("[toast] {}", t.line.text);
+    }
+}
+
 fn cap(
     mut c: Commands,
     mut f: ResMut<FC>,
