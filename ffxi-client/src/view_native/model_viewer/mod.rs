@@ -224,6 +224,7 @@ pub fn run(args: ModelViewerArgs) -> Result<()> {
         .add_plugins(widgets::WidgetsPlugin);
 
     app.init_resource::<SceneState>()
+        .init_resource::<ffxi_viewer_core::GraphicsSettings>()
         .init_resource::<TrackedEntities>()
         .init_resource::<ffxi_viewer_core::combat_stance::EntityMotion>()
         .init_resource::<ffxi_viewer_core::combat_stance::AnimationBlends>()
