@@ -2616,13 +2616,13 @@ fn handle_menu_key(
     // matching the retail client, which never repurposes left/right for pane
     // changes.
     if matches!(kind, MenuKind::Items) {
-        use ffxi_viewer_core::hud::item_detail::{apply_sort_option, SORT_OPTIONS};
+        use ffxi_viewer_core::hud::item_detail::{sort_pane_key, SortPaneKey};
         if bindings.matches_logical(Action::SelectActiveWindow, key) {
             if ffxi_viewer_core::hud::item_screen::select_active_window(
                 &scene_state.snapshot,
                 item_bag,
                 item_menu_focus,
-                sort_options.auto,
+                sort_options,
             )
             .is_some()
             {
@@ -2632,39 +2632,28 @@ fn handle_menu_key(
             }
             return None;
         }
-        if item_menu_focus.sort_focused {
-            let count = SORT_OPTIONS.len();
-            if bindings.matches_logical(Action::NavUp, key) {
-                item_menu_focus.sort_cursor = if item_menu_focus.sort_cursor == 0 {
-                    count - 1
-                } else {
-                    item_menu_focus.sort_cursor - 1
-                };
-                return None;
-            }
-            if bindings.matches_logical(Action::NavDown, key) {
-                let next = item_menu_focus.sort_cursor + 1;
-                item_menu_focus.sort_cursor = if next >= count { 0 } else { next };
-                return None;
-            }
-            if bindings.matches_logical(Action::NavConfirm, key) {
-                if let Some(&id) = SORT_OPTIONS.get(item_menu_focus.sort_cursor) {
-                    apply_sort_option(sort_options, id);
-                }
+        if item_menu_focus.sort_focused() {
+            let pane_key = if bindings.matches_logical(Action::NavUp, key) {
+                SortPaneKey::Up
+            } else if bindings.matches_logical(Action::NavDown, key) {
+                SortPaneKey::Down
+            } else if bindings.matches_logical(Action::NavConfirm, key) {
+                SortPaneKey::Confirm
+            } else if bindings.matches_logical(Action::NavLeft, key)
+                || bindings.matches_logical(Action::NavCancel, key)
+            {
+                SortPaneKey::Exit
+            } else {
+                // Swallow any other key so it can't leak into list navigation.
+                SortPaneKey::Other
+            };
+            if sort_pane_key(item_menu_focus, sort_options, pane_key).is_some() {
                 if let Err(e) = cmd_tx.try_send(AgentCommand::StackInventory {
                     container: ffxi_proto::map::container::LOC_INVENTORY,
                 }) {
                     push_system_chat_line(scene_state, format!("sort dropped (channel): {e}"));
                 }
-                return None;
             }
-            if bindings.matches_logical(Action::NavLeft, key)
-                || bindings.matches_logical(Action::NavCancel, key)
-            {
-                item_menu_focus.sort_focused = false;
-                return None;
-            }
-            // Swallow any other key so it can't leak into list navigation.
             return None;
         }
         // Retail pages the item list with left/right: one viewport per press,

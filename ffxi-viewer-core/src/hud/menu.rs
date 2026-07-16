@@ -450,21 +450,26 @@ pub fn refresh_dynamic_menu_rows(
     };
 
     let mut rows = rows;
-    // Retail's Items window sorts by item id when "Auto" is on (grouping usable
-    // items, then weapons, then armor by their DAT id ranges) and otherwise
-    // shows raw inventory-slot order. The item context submenu keeps its built
-    // order; other dynamic menus stay alphabetical.
+    order_dynamic_rows(kind, sort.auto, &mut rows);
+    if rows != dynamic.rows {
+        dynamic.rows = rows;
+    }
+}
+
+/// Order the freshly built rows for one dynamic menu. Retail's Items window
+/// sorts by item id when "Auto" is on (grouping usable items, then weapons,
+/// then armor by their DAT id ranges) and otherwise shows raw inventory-slot
+/// order. The item context submenu keeps its built order; other dynamic menus
+/// stay alphabetical.
+fn order_dynamic_rows(kind: MenuKind, auto_sort: bool, rows: &mut [DynamicMenuRow]) {
     match kind {
         MenuKind::Items => {
-            if sort.auto {
+            if auto_sort {
                 rows.sort_by_key(item_row_sort_key);
             }
         }
         MenuKind::ItemAction { .. } => {}
         _ => rows.sort_by(|a, b| a.label.cmp(&b.label)),
-    }
-    if rows != dynamic.rows {
-        dynamic.rows = rows;
     }
 }
 
@@ -1037,14 +1042,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn item_rows_sort_by_id_when_auto() {
+    /// Two rows whose label order (Apple, Zeta) disagrees with their item-id
+    /// order (50, 10), so each ordering branch is distinguishable.
+    fn conflicting_item_rows() -> Vec<DynamicMenuRow> {
         let item_row = |item_no: u16| DynamicMenuAction::OpenItemAction {
             container: 0,
             index: 0,
             item_no,
         };
-        let mut rows = [
+        vec![
             DynamicMenuRow {
                 label: "Apple".to_string(),
                 action: item_row(50),
@@ -1053,10 +1059,48 @@ mod tests {
                 label: "Zeta".to_string(),
                 action: item_row(10),
             },
-        ];
-        rows.sort_by_key(item_row_sort_key);
-        assert_eq!(rows[0].label, "Zeta");
-        assert_eq!(rows[1].label, "Apple");
+        ]
+    }
+
+    fn labels(rows: &[DynamicMenuRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.label.as_str()).collect()
+    }
+
+    #[test]
+    fn item_rows_sort_by_id_when_auto() {
+        let mut rows = conflicting_item_rows();
+        order_dynamic_rows(MenuKind::Items, true, &mut rows);
+        assert_eq!(labels(&rows), ["Zeta", "Apple"]);
+    }
+
+    #[test]
+    fn item_rows_keep_slot_order_when_manual() {
+        let mut rows = conflicting_item_rows();
+        order_dynamic_rows(MenuKind::Items, false, &mut rows);
+        assert_eq!(labels(&rows), ["Apple", "Zeta"]);
+    }
+
+    #[test]
+    fn item_action_rows_keep_built_order() {
+        let mut rows = conflicting_item_rows();
+        order_dynamic_rows(
+            MenuKind::ItemAction {
+                container: 0,
+                index: 0,
+                item_no: 50,
+            },
+            true,
+            &mut rows,
+        );
+        assert_eq!(labels(&rows), ["Apple", "Zeta"]);
+    }
+
+    #[test]
+    fn other_dynamic_menus_sort_alphabetically() {
+        let mut rows = conflicting_item_rows();
+        rows.swap(0, 1); // start Zeta-first so the sort has work to do
+        order_dynamic_rows(MenuKind::Magic, true, &mut rows);
+        assert_eq!(labels(&rows), ["Apple", "Zeta"]);
     }
 
     #[test]

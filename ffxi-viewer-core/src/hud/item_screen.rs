@@ -112,12 +112,12 @@ pub fn select_active_window(
     snap: &ffxi_viewer_wire::SceneSnapshot,
     active: &mut ItemScreenContainer,
     focus: &mut ItemMenuFocus,
-    sort_auto: bool,
+    sort: &SortOptions,
 ) -> Option<u8> {
     let bags = accessible_containers(snap);
-    if focus.sort_focused {
+    if focus.sort_focused() {
         // The sort box is the last pane; wrap back to the first bag.
-        focus.sort_focused = false;
+        focus.exit_sort();
         let first = *bags.first()?;
         (first != active.0).then(|| {
             active.0 = first;
@@ -131,8 +131,8 @@ pub fn select_active_window(
                 Some(next)
             }
             None => {
-                focus.sort_focused = true;
-                focus.sort_cursor = if sort_auto { 0 } else { 1 };
+                // Keyboard entry lands the cursor on the active sort mode.
+                focus.enter_sort(sort.active());
                 None
             }
         }
@@ -474,8 +474,8 @@ pub(crate) fn update_item_screen(
     }
     if !open {
         // Leaving the window drops sort focus so it reopens on the list.
-        if focus.sort_focused {
-            focus.sort_focused = false;
+        if focus.sort_focused() {
+            focus.exit_sort();
         }
         return;
     }
@@ -633,11 +633,8 @@ fn role_value(
         ItemRole::SortTitle => (sort_title.to_string(), theme::TITLE, true),
         ItemRole::SortRow(i) => match SORT_OPTIONS.get(i).copied() {
             Some(id) => {
-                let active = match id {
-                    SortOptionId::Auto => sort.auto,
-                    SortOptionId::Manual => !sort.auto,
-                };
-                let cursor = focus.sort_focused && focus.sort_cursor == i;
+                let active = sort.active() == id;
+                let cursor = focus.sort_selection() == Some(id);
                 let name = match id {
                     SortOptionId::Auto => "Auto",
                     SortOptionId::Manual => "Manual",
@@ -683,8 +680,8 @@ pub(crate) fn item_row_mouse_hover_system(
         if list_idx < total {
             // Hovering the list returns focus here, mirroring the sort box
             // grabbing it on hover — so neither pane traps the keyboard.
-            if focus.sort_focused {
-                focus.sort_focused = false;
+            if focus.sort_focused() {
+                focus.exit_sort();
             }
             if level.cursor != list_idx {
                 level.cursor = list_idx;
@@ -832,17 +829,16 @@ pub(crate) fn sort_option_mouse_system(
         let ItemRole::SortRow(i) = tag.0 else {
             continue;
         };
+        let Some(&id) = SORT_OPTIONS.get(i) else {
+            continue;
+        };
         match interaction {
             Interaction::Hovered => {
-                focus.sort_focused = true;
-                focus.sort_cursor = i;
+                focus.enter_sort(id);
             }
             Interaction::Pressed => {
-                focus.sort_focused = true;
-                focus.sort_cursor = i;
-                if let Some(&id) = SORT_OPTIONS.get(i) {
-                    item_detail::apply_sort_option(&mut sort, id);
-                }
+                focus.enter_sort(id);
+                item_detail::apply_sort_option(&mut sort, id);
                 sort_req.write(item_detail::InventorySortRequested {
                     container: ffxi_proto::map::container::LOC_INVENTORY,
                 });
@@ -896,28 +892,28 @@ mod tests {
         ]);
         let mut active = ItemScreenContainer(c::LOC_INVENTORY);
         let mut focus = ItemMenuFocus::default();
+        let sort = SortOptions { auto: true };
         assert_eq!(
-            select_active_window(&snap, &mut active, &mut focus, true),
+            select_active_window(&snap, &mut active, &mut focus, &sort),
             Some(c::LOC_MOGCASE)
         );
         assert_eq!(
-            select_active_window(&snap, &mut active, &mut focus, true),
+            select_active_window(&snap, &mut active, &mut focus, &sort),
             Some(c::LOC_WARDROBE)
         );
         // Past the last bag: focus moves into the sort box, bag unchanged.
         assert_eq!(
-            select_active_window(&snap, &mut active, &mut focus, true),
+            select_active_window(&snap, &mut active, &mut focus, &sort),
             None
         );
-        assert!(focus.sort_focused);
-        assert_eq!(focus.sort_cursor, 0);
+        assert_eq!(focus.sort_selection(), Some(SortOptionId::Auto));
         assert_eq!(active.0, c::LOC_WARDROBE);
         // Next press wraps back to the first bag and leaves the sort box.
         assert_eq!(
-            select_active_window(&snap, &mut active, &mut focus, true),
+            select_active_window(&snap, &mut active, &mut focus, &sort),
             Some(c::LOC_INVENTORY)
         );
-        assert!(!focus.sort_focused);
+        assert!(!focus.sort_focused());
     }
 
     #[test]
@@ -926,18 +922,18 @@ mod tests {
         let snap = snapshot_with_bags(&[(c::LOC_INVENTORY, 30)]);
         let mut active = ItemScreenContainer(c::LOC_INVENTORY);
         let mut focus = ItemMenuFocus::default();
+        let sort = SortOptions { auto: false };
         assert_eq!(
-            select_active_window(&snap, &mut active, &mut focus, false),
+            select_active_window(&snap, &mut active, &mut focus, &sort),
             None
         );
-        assert!(focus.sort_focused);
         // Cursor starts on the current sort mode (Manual here).
-        assert_eq!(focus.sort_cursor, 1);
+        assert_eq!(focus.sort_selection(), Some(SortOptionId::Manual));
         assert_eq!(
-            select_active_window(&snap, &mut active, &mut focus, false),
+            select_active_window(&snap, &mut active, &mut focus, &sort),
             None
         );
-        assert!(!focus.sort_focused);
+        assert!(!focus.sort_focused());
         assert_eq!(active.0, c::LOC_INVENTORY);
     }
 
