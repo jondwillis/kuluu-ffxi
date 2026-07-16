@@ -463,6 +463,15 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             .collect()
     }));
 
+    // When GPU timing is enabled we're in a perf-capture session: show the perf HUD by
+    // default instead of requiring a manual toggle through the debug menu ("Perf" entry).
+    if std::env::var_os("FFXI_GPU_TIMING").is_some() {
+        app.insert_resource(ffxi_viewer_core::hud::HudPanels {
+            perf: true,
+            ..Default::default()
+        });
+    }
+
     app.init_resource::<input::TabCycleStack>();
     app.init_resource::<input::SelectTargetMode>();
 
