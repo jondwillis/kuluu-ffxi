@@ -9,6 +9,11 @@ use crate::opcode_meta::OPCODE_META;
 pub struct EventMessage {
     pub message_id: u32,
     pub speaker_index: u16,
+    /// The event's numeric parameters (`num[8]` from the 0x33/0x34 trigger
+    /// packet), consumed by the dialog string's parameterized control codes:
+    /// `{Num:N}` prints `params[N]`, `{Choice:N}[a/b/…]` selects alternative
+    /// `params[N]`. Empty for a 0x32 trigger (it carries no parameters).
+    pub params: Vec<i32>,
 }
 
 /// A choice menu the VM asked to present (0x24 QUERY). The selectable options
@@ -20,6 +25,8 @@ pub struct EventChoice {
     pub message_id: u32,
     pub speaker_index: u16,
     pub default_index: u32,
+    /// Event numeric parameters — see [`EventMessage::params`].
+    pub params: Vec<i32>,
 }
 
 /// Outcome of running the VM until it next needs the host (one `XiEvent::EventIdle`
@@ -87,19 +94,37 @@ pub struct EventVm {
     jump_table: [u16; JUMP_STACK_LEN],
     jump_index: usize,
     speaker_index: u16,
+    /// Event numeric parameters from the trigger packet — see
+    /// [`EventMessage::params`].
+    params: Vec<i32>,
     /// `CliEventMessOpenFlag`: 0 none, 1 awaiting dismissal, 2 invalid.
     message_open: u8,
     pending_message: Option<EventMessage>,
     pending_choice: Option<EventChoice>,
     selection_made: bool,
     finished: bool,
+    /// Diagnostics: execution ran off the end of the bytecode without an
+    /// END/EXECEND opcode. Retail treats this the same as END (the missing-
+    /// byte read yields 0 == OP_END), so it only signals a decode or
+    /// entry-point bug — see [`Self::ran_past_end`].
+    ran_past_end: bool,
+    /// Diagnostics: count of [`Self::eventgetcode`] operand reads that fell
+    /// (fully or partly) past the end of the bytecode; each read yields 0.
+    /// `Cell` because reads happen through `&self` accessors.
+    oob_reads: std::cell::Cell<u32>,
 }
 
 impl EventVm {
     /// Start `event_id` from `block` (the actor's event block), with
-    /// `speaker_index` as the talking entity's target index. `None` if the block
-    /// has no such event.
-    pub fn start(block: &EventBlock, event_id: u16, speaker_index: u16) -> Option<Self> {
+    /// `speaker_index` as the talking entity's target index and `params` the
+    /// trigger packet's numeric parameters (`num[8]`; empty for a 0x32 trigger).
+    /// `None` if the block has no such event.
+    pub fn start(
+        block: &EventBlock,
+        event_id: u16,
+        speaker_index: u16,
+        params: Vec<i32>,
+    ) -> Option<Self> {
         let exec_pointer = block.event_entry(event_id)?;
         Some(Self {
             event_data: block.event_data.clone(),
@@ -110,11 +135,14 @@ impl EventVm {
             jump_table: [0; JUMP_STACK_LEN],
             jump_index: 0,
             speaker_index,
+            params,
             message_open: 0,
             pending_message: None,
             pending_choice: None,
             selection_made: false,
             finished: false,
+            ran_past_end: false,
+            oob_reads: std::cell::Cell::new(0),
         })
     }
 
@@ -137,6 +165,20 @@ impl EventVm {
         self.exec_pointer
     }
 
+    /// True if the program counter ran off the end of the bytecode without an
+    /// END/EXECEND opcode. Retail treats this identically to END, so the event
+    /// still finishes with [`StepResult::Done`]; the flag distinguishes the
+    /// two for diagnostics.
+    pub fn ran_past_end(&self) -> bool {
+        self.ran_past_end
+    }
+
+    /// Number of `eventgetcode` operand reads that fell (fully or partly) past
+    /// the end of the bytecode; each such read yielded 0.
+    pub fn oob_reads(&self) -> u32 {
+        self.oob_reads.get()
+    }
+
     /// `Work_Zone[index]` as a signed value. `Work_Zone[1]` is the event-end
     /// result the client returns in the 0x05B `EndPara`
     /// (research/XiPackets/world/client/0x005B).
@@ -151,7 +193,17 @@ impl EventVm {
         }
         loop {
             let Some(&op) = self.event_data.get(self.exec_pointer) else {
+                // Retail reads 0 (== OP_END) here, so ending is faithful; flag
+                // it because a well-formed event always terminates via
+                // END/EXECEND and this usually means a bad entry point or a
+                // decode bug (kuluu-zkuf).
                 self.finished = true;
+                self.ran_past_end = true;
+                tracing::debug!(
+                    exec_pointer = self.exec_pointer,
+                    bytecode_len = self.event_data.len(),
+                    "event VM ran past end of bytecode without END opcode"
+                );
                 return StepResult::Done;
             };
             match op {
@@ -217,6 +269,7 @@ impl EventVm {
                     self.pending_message = Some(EventMessage {
                         message_id,
                         speaker_index: self.speaker_index,
+                        params: self.params.clone(),
                     });
                     self.exec_pointer += 3;
                 }
@@ -238,6 +291,7 @@ impl EventVm {
                         message_id: self.getworkofs(1, 0) as u32,
                         speaker_index: self.speaker_index,
                         default_index: self.getworkofs(3, 0) as u32,
+                        params: self.params.clone(),
                     });
                     self.selection_made = false;
                     self.exec_pointer += 7;
@@ -278,8 +332,23 @@ impl EventVm {
     }
 
     /// `XiEvent::eventgetcode`: little-endian u16 at `ExecPointer + index`.
+    /// Reads past the end of the bytecode yield 0 (retail reads unchecked
+    /// memory; 0 is our deterministic stand-in) — they are counted in
+    /// [`Self::oob_reads`] and the first one is logged (kuluu-zkuf).
     fn eventgetcode(&self, index: usize) -> u16 {
         let at = self.exec_pointer + index;
+        if at + 1 >= self.event_data.len() {
+            let seen = self.oob_reads.get();
+            self.oob_reads.set(seen.saturating_add(1));
+            if seen == 0 {
+                tracing::debug!(
+                    at,
+                    bytecode_len = self.event_data.len(),
+                    "eventgetcode read past end of bytecode (yields 0; \
+                     further out-of-bounds reads counted, not logged)"
+                );
+            }
+        }
         let lo = self.event_data.get(at).copied().unwrap_or(0);
         let hi = self.event_data.get(at + 1).copied().unwrap_or(0);
         u16::from_le_bytes([lo, hi])
@@ -400,7 +469,7 @@ mod tests {
     }
 
     fn vm(event_data: Vec<u8>, references: Vec<u32>) -> EventVm {
-        EventVm::start(&block(event_data, references), 7, 5).unwrap()
+        EventVm::start(&block(event_data, references), 7, 5, vec![]).unwrap()
     }
 
     #[test]
@@ -408,13 +477,29 @@ mod tests {
         let mut e = vm(vec![OP_END], vec![]);
         assert_eq!(e.step(), StepResult::Done);
         assert_eq!(e.step(), StepResult::Done);
+        assert!(!e.ran_past_end(), "END is a normal finish");
+        assert_eq!(e.oob_reads(), 0);
     }
 
     #[test]
-    fn running_off_the_end_is_done() {
+    fn running_off_the_end_is_done_and_flagged() {
         // A non-jumping, non-yield opcode (0x42, size 1) then off the end.
         let mut e = vm(vec![0x42], vec![]);
         assert_eq!(e.step(), StepResult::Done);
+        assert!(e.ran_past_end(), "no END opcode was executed");
+    }
+
+    #[test]
+    fn oob_operand_read_is_counted_and_yields_zero() {
+        // GOTO's u16 target has only its low byte in the data; the high byte
+        // is past the end and reads as 0, so the jump lands at 2 — which is
+        // itself past the end, finishing the event.
+        let mut e = vm(vec![OP_GOTO, 2], vec![]);
+        assert_eq!(e.oob_reads(), 0);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.oob_reads(), 1);
+        assert_eq!(e.exec_pointer(), 2);
+        assert!(e.ran_past_end());
     }
 
     #[test]
@@ -459,12 +544,53 @@ mod tests {
             StepResult::AwaitMessage(EventMessage {
                 message_id: 900,
                 speaker_index: 5,
+                params: vec![],
             })
         );
         // Still parked on MESWAIT until dismissed.
         assert_eq!(e.step(), StepResult::AwaitMessageAck);
         e.dismiss_message();
         assert_eq!(e.step(), StepResult::Done);
+    }
+
+    #[test]
+    fn params_flow_through_message_and_choice() {
+        // The trigger packet's num[8] must ride along on both yield kinds.
+        let params = vec![7, -1, 42];
+        let data = vec![
+            OP_MESSAGE,
+            0x00,
+            0x80, // msg: References[0]=900
+            OP_MESWAIT,
+            OP_QUERY,
+            0x00,
+            0x80,
+            0x01,
+            0x80,
+            0x00,
+            0x00, // QUERY(msg=ref0, default=ref1)
+            OP_QUERYWAIT,
+            OP_END,
+        ];
+        let mut e = EventVm::start(&block(data, vec![900, 0]), 7, 5, params.clone()).unwrap();
+        assert_eq!(
+            e.step(),
+            StepResult::AwaitMessage(EventMessage {
+                message_id: 900,
+                speaker_index: 5,
+                params: params.clone(),
+            })
+        );
+        e.dismiss_message();
+        assert_eq!(
+            e.step(),
+            StepResult::AwaitChoice(EventChoice {
+                message_id: 900,
+                speaker_index: 5,
+                default_index: 0,
+                params,
+            })
+        );
     }
 
     #[test]
@@ -476,6 +602,7 @@ mod tests {
             StepResult::AwaitMessage(EventMessage {
                 message_id: 0,
                 speaker_index: 5,
+                params: vec![],
             })
         );
     }
@@ -544,6 +671,7 @@ mod tests {
             message_id: 500,
             speaker_index: 5,
             default_index: 0,
+            params: vec![],
         });
         let mut e = vm(data, vec![500, 0]);
         assert_eq!(e.step(), expected);
@@ -592,6 +720,7 @@ mod tests {
             StepResult::AwaitMessage(EventMessage {
                 message_id: 55,
                 speaker_index: 5,
+                params: vec![],
             })
         );
     }
@@ -639,6 +768,7 @@ mod tests {
             StepResult::AwaitMessage(EventMessage {
                 message_id: 8,
                 speaker_index: 5,
+                params: vec![],
             })
         );
     }

@@ -15,6 +15,10 @@ pub struct DialogFrame {
     pub speaker_index: u16,
     pub text: String,
     pub choices: Vec<String>,
+    /// Event numeric parameters from the trigger packet (0x33/0x34 `num[8]`);
+    /// the render layer substitutes `{Num:N}` with `params[N]`. Empty for a
+    /// 0x32 trigger.
+    pub params: Vec<i32>,
 }
 
 /// Result of advancing the dialog one step.
@@ -51,10 +55,16 @@ pub struct DialogRunner {
 
 impl DialogRunner {
     /// Start `event_id` from `block` with `speaker_index` (the NPC's target
-    /// index). `None` if the block has no such event.
-    pub fn start(block: &EventBlock, event_id: u16, speaker_index: u16) -> Option<Self> {
+    /// index) and `params` the trigger packet's numeric parameters (empty for
+    /// a 0x32 trigger). `None` if the block has no such event.
+    pub fn start(
+        block: &EventBlock,
+        event_id: u16,
+        speaker_index: u16,
+        params: Vec<i32>,
+    ) -> Option<Self> {
         Some(Self {
-            vm: EventVm::start(block, event_id, speaker_index)?,
+            vm: EventVm::start(block, event_id, speaker_index, params)?,
             pending: Pending::Start,
         })
     }
@@ -74,18 +84,20 @@ impl DialogRunner {
                     self.pending = Pending::Message;
                     return DialogStep::Frame(DialogFrame {
                         speaker_index: m.speaker_index,
-                        text: message_text(strings, m.message_id),
+                        text: message_text(strings, m.message_id, &m.params),
                         choices: Vec::new(),
+                        params: m.params,
                     });
                 }
                 StepResult::AwaitMessageAck => self.vm.dismiss_message(),
                 StepResult::AwaitChoice(c) => {
                     self.pending = Pending::Choice;
-                    let (text, choices) = choice_text(strings, c.message_id);
+                    let (text, choices) = choice_text(strings, c.message_id, &c.params);
                     return DialogStep::Frame(DialogFrame {
                         speaker_index: c.speaker_index,
                         text,
                         choices,
+                        params: c.params,
                     });
                 }
                 StepResult::Done => {
@@ -104,23 +116,29 @@ impl DialogRunner {
     }
 }
 
-fn message_text(strings: &StringDat, message_id: u32) -> String {
-    clean_display(&strings.text(message_id as usize).unwrap_or_default())
+fn message_text(strings: &StringDat, message_id: u32, params: &[i32]) -> String {
+    clean_display(
+        &strings.text(message_id as usize).unwrap_or_default(),
+        params,
+    )
 }
 
 /// Split a menu entry into its prompt and selectable options via the faithful
 /// Selection marker (`StringDat::menu`); falls back to the first-line-is-prompt
 /// heuristic for entries that lack it.
-fn choice_text(strings: &StringDat, message_id: u32) -> (String, Vec<String>) {
+fn choice_text(strings: &StringDat, message_id: u32, params: &[i32]) -> (String, Vec<String>) {
     if let Some((prompt, options)) = strings.menu(message_id as usize) {
         let options: Vec<String> = options
             .iter()
-            .map(|o| clean_display(o))
+            .map(|o| clean_display(o, params))
             .filter(|o| !o.is_empty())
             .collect();
-        return (clean_display(&prompt), options);
+        return (clean_display(&prompt, params), options);
     }
-    let raw = clean_display(&strings.text(message_id as usize).unwrap_or_default());
+    let raw = clean_display(
+        &strings.text(message_id as usize).unwrap_or_default(),
+        params,
+    );
     let mut lines = raw.split('\n').filter(|l| !l.trim().is_empty());
     let prompt = lines.next().unwrap_or_default().to_string();
     let choices: Vec<String> = lines.map(str::to_string).collect();
@@ -132,10 +150,12 @@ fn choice_text(strings: &StringDat, message_id: u32) -> (String, Vec<String>) {
 /// alternatives (see [`resolve_choice_brackets`]). The remaining substitution
 /// placeholders (`{PlayerName}`, `{SpeakerName}`, `{Num:N}`, …) are left for the
 /// caller, which has the runtime names/parameters they need.
-fn clean_display(s: &str) -> String {
+fn clean_display(s: &str, params: &[i32]) -> String {
     let stripped = strip_marker(s, AUTO_MARKER_PREFIX);
     let stripped = strip_marker(&stripped, SET_COLOR_MARKER_PREFIX);
-    resolve_choice_brackets(&stripped).trim().to_string()
+    resolve_choice_brackets(&stripped, params)
+        .trim()
+        .to_string()
 }
 
 /// Remove every `prefix…}` run — a formatting marker with no visible text.
@@ -157,18 +177,19 @@ fn strip_marker(s: &str, prefix: &str) -> String {
 }
 
 /// Alternative picked for a `{Choice:N}[a/b/…]` run when the selecting message
-/// parameter isn't available. Retail reads message parameter `N` and shows that
-/// alternative; the parameter array isn't threaded through the VM yet (kuluu-6zy),
-/// so we take the first alternative, which is correct for the common case where a
+/// parameter isn't available (`params[N]` missing or negative). Retail reads
+/// message parameter `N` and shows that alternative; without it we take the
+/// first alternative, which is correct for the common case where a
 /// nation/gender variant simply lists its default first.
 const UNRESOLVED_CHOICE_ALT: usize = 0;
 
 /// Collapse `{Choice:N}[opt0/opt1/…]` runs to a single alternative — the dmsg
 /// decoder emits the `{Choice:N}` marker from control code 0x0C and leaves the
-/// following `[a/b]` bracket as literal text. `N` selects the alternative via a
-/// message parameter; lacking it we take [`UNRESOLVED_CHOICE_ALT`]. A `{Choice:N}`
-/// with no immediately-following bracket is left verbatim.
-fn resolve_choice_brackets(s: &str) -> String {
+/// following `[a/b]` bracket as literal text. `N` indexes `params` (the trigger
+/// packet's numeric parameters) and `params[N]` selects the alternative; when
+/// that parameter is unavailable we take [`UNRESOLVED_CHOICE_ALT`]. A
+/// `{Choice:N}` with no immediately-following bracket is left verbatim.
+fn resolve_choice_brackets(s: &str, params: &[i32]) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(pos) = rest.find(CHOICE_MARKER_PREFIX) {
@@ -184,8 +205,14 @@ fn resolve_choice_brackets(s: &str) -> String {
             Some((inner, end)) => {
                 out.push_str(&rest[..pos]);
                 let alts: Vec<&str> = inner[..end].split('/').collect();
+                let selected = after_tag[..close]
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| params.get(n))
+                    .and_then(|&v| usize::try_from(v).ok())
+                    .unwrap_or(UNRESOLVED_CHOICE_ALT);
                 let chosen = alts
-                    .get(UNRESOLVED_CHOICE_ALT)
+                    .get(selected)
                     .or_else(|| alts.first())
                     .copied()
                     .unwrap_or("");
@@ -212,18 +239,18 @@ mod tests {
 
     #[test]
     fn clean_display_strips_formatting_but_keeps_substitutions() {
-        assert_eq!(clean_display("Nothing.{Auto:49}"), "Nothing.");
-        assert_eq!(clean_display("a{Auto:1}b{Auto:2}c"), "abc");
+        assert_eq!(clean_display("Nothing.{Auto:49}", &[]), "Nothing.");
+        assert_eq!(clean_display("a{Auto:1}b{Auto:2}c", &[]), "abc");
         // {SetColor:N} is a text-color code, not visible text.
-        assert_eq!(clean_display("red{SetColor:5}text"), "redtext");
+        assert_eq!(clean_display("red{SetColor:5}text", &[]), "redtext");
         // Name substitutions are the caller's job (runtime names); left intact.
         assert_eq!(
-            clean_display("Hello, {PlayerName}."),
+            clean_display("Hello, {PlayerName}.", &[]),
             "Hello, {PlayerName}."
         );
         // A {Choice:N} with no following bracket has nothing to resolve.
         assert_eq!(
-            clean_display("Good luck, {Choice:0}!"),
+            clean_display("Good luck, {Choice:0}!", &[]),
             "Good luck, {Choice:0}!"
         );
     }
@@ -231,28 +258,47 @@ mod tests {
     #[test]
     fn clean_display_resolves_choice_alternatives() {
         assert_eq!(
-            clean_display("Good luck, {Choice:0}[citizen/comrade]. See you."),
+            clean_display("Good luck, {Choice:0}[citizen/comrade]. See you.", &[]),
             "Good luck, citizen. See you."
         );
     }
 
     #[test]
-    fn resolve_choice_brackets_takes_first_alternative() {
+    fn resolve_choice_brackets_takes_first_alternative_without_params() {
         // The baked N is the parameter index, not the alternative; without the
-        // parameter we always take the first alternative.
-        assert_eq!(resolve_choice_brackets("a {Choice:3}[x/y/z] b"), "a x b");
-        assert_eq!(resolve_choice_brackets("{Choice:0}[only]"), "only");
+        // parameter we take the first alternative.
+        assert_eq!(
+            resolve_choice_brackets("a {Choice:3}[x/y/z] b", &[]),
+            "a x b"
+        );
+        assert_eq!(resolve_choice_brackets("{Choice:0}[only]", &[]), "only");
+    }
+
+    #[test]
+    fn resolve_choice_brackets_selects_by_param() {
+        // params[N] picks the alternative.
+        assert_eq!(
+            resolve_choice_brackets("a {Choice:1}[x/y/z] b", &[9, 2]),
+            "a z b"
+        );
+        assert_eq!(
+            resolve_choice_brackets("{Choice:0}[he/she] told {Choice:0}[him/her]", &[1]),
+            "she told her"
+        );
+        // Out-of-range or negative param falls back to the first alternative.
+        assert_eq!(resolve_choice_brackets("{Choice:0}[x/y]", &[5]), "x");
+        assert_eq!(resolve_choice_brackets("{Choice:0}[x/y]", &[-1]), "x");
     }
 
     #[test]
     fn resolve_choice_brackets_handles_multiple_and_bare_markers() {
         assert_eq!(
-            resolve_choice_brackets("{Choice:0}[he/she] told {Choice:0}[him/her]"),
+            resolve_choice_brackets("{Choice:0}[he/she] told {Choice:0}[him/her]", &[]),
             "he told him"
         );
         // No bracket -> marker left verbatim.
         assert_eq!(
-            resolve_choice_brackets("plain {Choice:1} end"),
+            resolve_choice_brackets("plain {Choice:1} end", &[]),
             "plain {Choice:1} end"
         );
     }
@@ -316,7 +362,7 @@ mod tests {
                 .take(2)
             {
                 for &eid in block.event_ids.iter().take(2) {
-                    let Some(mut runner) = DialogRunner::start(block, eid, 0) else {
+                    let Some(mut runner) = DialogRunner::start(block, eid, 0, vec![]) else {
                         continue;
                     };
                     // Bound the interaction loop; auto-pick option 0 for menus.
@@ -371,8 +417,8 @@ mod tests {
         let block = edat
             .block_for_actor(HARARA)
             .unwrap_or_else(|| panic!("no event block for Harara 0x{HARARA:08X}"));
-        let mut runner =
-            DialogRunner::start(block, TALK_EVENT, ACT_INDEX).expect("Harara has talk event 32759");
+        let mut runner = DialogRunner::start(block, TALK_EVENT, ACT_INDEX, vec![])
+            .expect("Harara has talk event 32759");
 
         let mut frames = Vec::new();
         let mut ended = false;
@@ -424,7 +470,8 @@ mod tests {
         .expect("parse string dat");
 
         let block = edat.block_for_actor(HARARA).expect("harara block");
-        let mut runner = DialogRunner::start(block, TALK_EVENT, ACT_INDEX).expect("event 32759");
+        let mut runner =
+            DialogRunner::start(block, TALK_EVENT, ACT_INDEX, vec![]).expect("event 32759");
 
         let mut end_para = None;
         for _ in 0..32 {
