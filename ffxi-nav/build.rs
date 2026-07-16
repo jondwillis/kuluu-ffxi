@@ -56,7 +56,7 @@ fn main() -> Result<()> {
 
     fs::write(out_dir.join("zonelines_table.rs"), &out)?;
     println!(
-        "cargo:warning=ffxi-nav: scraped {} zone-lines across {} from_zones",
+        "ffxi-nav: scraped {} zone-lines across {} from_zones",
         entries.len(),
         index.len()
     );

@@ -77,7 +77,7 @@ fn main() -> Result<()> {
 
     fs::write(&out_path, &s).with_context(|| format!("writing {}", out_path.display()))?;
     println!(
-        "cargo:warning=ffxi-dat: generated zone_dat_table.rs with {} zones (formula: {})",
+        "ffxi-dat: generated zone_dat_table.rs with {} zones (formula: {})",
         rows.len(),
         formula.description()
     );
@@ -288,7 +288,7 @@ fn emit_string_dat_table(entries: &[(u16, u32)]) -> Result<()> {
 
     fs::write(&out_path, &s).with_context(|| format!("writing {}", out_path.display()))?;
     println!(
-        "cargo:warning=ffxi-dat: generated string_dat_table.rs with {} zones",
+        "ffxi-dat: generated string_dat_table.rs with {} zones",
         sorted.len()
     );
     Ok(())
@@ -348,7 +348,7 @@ fn emit_map_table(entries: &[MapEntry]) -> Result<()> {
 
     fs::write(&out_path, &s).with_context(|| format!("writing {}", out_path.display()))?;
     println!(
-        "cargo:warning=ffxi-dat: generated map_dat_table.rs with {} map entries",
+        "ffxi-dat: generated map_dat_table.rs with {} map entries",
         sorted.len()
     );
     Ok(())

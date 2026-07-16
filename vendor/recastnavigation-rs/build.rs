@@ -18,7 +18,11 @@ fn main() {
     ])
     .flag_if_supported("-std=c++14")
     .flag_if_supported("/fp:precise")
-    .flag_if_supported("-ffp-model=precise")
+    // Deterministic floating point on clang/gcc. Do NOT also pass
+    // `-ffp-model=precise`: clang's default FP model is already `precise`,
+    // and `-ffp-model=precise` re-enables `ffp-contract=on`, so a later
+    // `-ffp-contract=off` triggers `-Woverriding-option` on every TU.
+    // `-ffp-contract=off` alone yields the intended semantics warning-free.
     .flag_if_supported("-ffp-contract=off")
     .define("_CRT_SECURE_NO_WARNINGS", "1")
     .define("IS_ARCH_64", if is_arch_64 { "1" } else { "0" })
