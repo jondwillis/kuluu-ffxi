@@ -5,13 +5,13 @@ use bevy::render::view::screenshot::{save_to_disk, Capturing, Screenshot};
 use ffxi_dat::weather::collect_zone_weather_sets;
 use ffxi_viewer_core::camera::OperatorCamera;
 use ffxi_viewer_core::dat_mmb::{
-    process_load_mmb_requests, LoadMmbRequest, MmbHandleCache, MmbLoadQueue, MmbParseCache,
-    MmbTexPools,
+    process_load_mmb_requests, LoadMmbRequest, MmbHandleCache, MmbLoadInFlight, MmbLoadQueue,
+    MmbParseCache, MmbTexPools,
 };
 use ffxi_viewer_core::dat_mzb::{
-    kick_load_mzb_tasks, poll_load_mzb_tasks, spawn_zone_water, DrawDistance, LoadMzbInFlight,
-    LoadMzbRequest, MzbCollisionGeometry, PendingWaterSpawns, ZoneGeomCache, ZoneGeomMode,
-    ZoneWaterMaterial,
+    kick_load_mzb_tasks, poll_load_mzb_tasks, scroll_water_uv, spawn_zone_water, DrawDistance,
+    LoadMzbInFlight, LoadMzbRequest, MzbCollisionGeometry, PendingWaterSpawns, ZoneGeomCache,
+    ZoneGeomMode, ZoneWaterMaterial,
 };
 use ffxi_viewer_core::ffxi_zone_material::FfxiZoneMaterialPlugin;
 use ffxi_viewer_core::scene::TrackedEntities;
@@ -141,6 +141,7 @@ fn main() {
         .init_resource::<LoadMzbInFlight>()
         .init_resource::<ZoneGeomCache>()
         .init_resource::<MmbHandleCache>()
+        .init_resource::<MmbLoadInFlight>()
         .init_resource::<MmbLoadQueue>()
         .init_resource::<MmbParseCache>()
         .init_resource::<MmbTexPools>()
@@ -159,10 +160,12 @@ fn main() {
         .add_systems(
             Update,
             (
+                drain_toasts,
                 kick_load_mzb_tasks,
                 poll_load_mzb_tasks,
-                process_load_mmb_requests,
                 spawn_zone_water,
+                scroll_water_uv,
+                process_load_mmb_requests,
                 print_toasts,
                 cap,
             )
@@ -271,6 +274,11 @@ fn load_weather(p: Res<P>, mut zone_weather: ResMut<ZoneWeather>) {
     };
     zone_weather.file_id = Some(p.file_id);
     zone_weather.sets = collect_zone_weather_sets(&bytes);
+}
+fn drain_toasts(mut rx: MessageReader<ToastEvent>) {
+    for t in rx.read() {
+        eprintln!("[toast] {}", t.line.text);
+    }
 }
 #[allow(clippy::too_many_arguments)]
 fn cap(

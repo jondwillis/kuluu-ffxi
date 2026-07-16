@@ -392,6 +392,15 @@ pub struct PendingWaterSpawns {
     pub specs: std::collections::VecDeque<WaterSpec>,
 }
 
+// World units covered by one repeat of the water ripple texture. Vanilla water
+// mesh UVs are baked as world XZ / WATER_TEX_TILE, so ripple size and scroll
+// speed are world-sized and pond-independent, and a single material is shared
+// by every pond (see ZoneWaterMaterial).
+const WATER_TEX_TILE: f32 = 16.0;
+
+// Scroll velocity in world units/sec (XZ). Gentle drift; sub-tile per second.
+const WATER_SCROLL_WORLD: Vec2 = Vec2::new(0.55, 0.35);
+
 #[derive(Message, Debug, Clone, Copy)]
 pub struct LoadMzbRequest {
     pub file_id: u32,
@@ -1009,30 +1018,26 @@ fn compute_init_visibility(mode: ZoneGeomMode) -> (Visibility, Visibility) {
     }
 }
 
-// Interim flat water tint — linear-space conversion of the old
-// StandardMaterial placeholder srgba(0.20, 0.30, 0.31, 0.40). Placeholder
-// until the retail scrolling water texture (MMB 0x8000 section) is sourced
-// (Phase A1); unlike the old PBR material, this runs the FFXI zone lighting
-// model, so ponds track zone time-of-day/weather light like the terrain.
+// Flat water tint — linear-space conversion of the old StandardMaterial
+// placeholder srgba(0.20, 0.30, 0.31, 0.40). The procedural ripple texture
+// modulates it (a stand-in until the retail scrolling water texture set
+// (MMB 0x8000 section) is parsed); unlike the old PBR material, this runs the
+// FFXI zone lighting model, so ponds track zone time-of-day/weather light
+// like the terrain.
 const WATER_TINT: Vec4 = Vec4::new(0.033, 0.073, 0.078, 0.40);
-
-// Water UV scroll velocity, in footprint-normalised UV per second. Invisible
-// until a texture is sourced (texel = 1.0 without one), but wired now so the
-// texture drop-in is data-only. Rate is an aesthetic placeholder.
-const WATER_UV_SCROLL: Vec2 = Vec2::new(0.015, 0.009);
 
 /// Shared handle for the vanilla water-surface material, so `scroll_water_uv`
 /// can integrate `uv_offset` on one asset instead of per-spawn clones.
 #[derive(Resource, Default)]
 pub struct ZoneWaterMaterial(pub Option<Handle<crate::ffxi_zone_material::FfxiZoneMaterial>>);
 
-fn simple_water_material() -> crate::ffxi_zone_material::FfxiZoneMaterial {
+fn simple_water_material(texture: Handle<Image>) -> crate::ffxi_zone_material::FfxiZoneMaterial {
     crate::ffxi_zone_material::FfxiZoneMaterial::new(
-        None,
+        Some(texture),
         crate::skinned_ffxi_material::FfxiMaterialFlags {
             // (has_texture, blend-emit [0x8000 translucent path], unused,
             // discard threshold — 0 so the cutout test never fires).
-            flags: Vec4::new(0.0, 1.0, 0.0, 0.0),
+            flags: Vec4::new(1.0, 1.0, 0.0, 0.0),
         },
         WATER_TINT,
         Vec4::ZERO,
@@ -1066,22 +1071,82 @@ pub fn scroll_water_uv(
     // would needlessly rebuild its bind group every frame (same pattern as
     // zone_clouds).
     if let Some(material) = materials.get_mut_untracked(handle) {
-        let uv = WATER_UV_SCROLL * time.elapsed_secs();
+        // fract() keeps the offset small so f32 precision holds over long
+        // sessions; the texture repeats, so a whole-tile jump is invisible.
+        let t = time.elapsed_secs();
+        let uv = Vec2::new(
+            (t * WATER_SCROLL_WORLD.x / WATER_TEX_TILE).fract(),
+            (t * WATER_SCROLL_WORLD.y / WATER_TEX_TILE).fract(),
+        );
         material.uv_offset = Vec4::new(uv.x, uv.y, 0.0, 0.0);
     }
 }
 
-fn build_water_surface_mesh(spec: &WaterSpec) -> Mesh {
+// Tileable procedural ripple: low-contrast sum of integer-frequency sine bands
+// so opposite edges match exactly. Stands in until the DAT-sourced water
+// texture set is parsed; the scroll mechanism (uv_transform animation) is the
+// part that carries over.
+fn water_ripple_image() -> Image {
+    use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+
+    const N: usize = 64;
+    let mut data = Vec::with_capacity(N * N * 4);
+    let tau = std::f32::consts::TAU;
+    for y in 0..N {
+        for x in 0..N {
+            let u = x as f32 / N as f32;
+            let v = y as f32 / N as f32;
+            // Integer wave vectors -> exact tiling at the texture border.
+            let w = (tau * (3.0 * u + v)).sin()
+                + (tau * (u - 2.0 * v)).sin()
+                + 0.5 * (tau * (5.0 * u + 4.0 * v)).sin();
+            // w in [-2.5, 2.5] -> luma around 1.0 with subtle modulation, so
+            // the material's base_color tint still sets the overall look.
+            let l = 1.0 + 0.10 * (w / 2.5);
+            let b = (l.clamp(0.0, 1.0) * 255.0) as u8;
+            data.extend_from_slice(&[b, b, b, 255]);
+        }
+    }
+    let mut img = Image::new(
+        Extent3d {
+            width: N as u32,
+            height: N as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..ImageSamplerDescriptor::linear()
+    });
+    img
+}
+
+// `world_tile_uvs`: the vanilla FFXI water material wants world XZ /
+// WATER_TEX_TILE baked into the mesh, so the shared material's ripples are
+// world-sized and continuous across ponds. bevy_water (enhanced) instead wants
+// UVs normalised over the footprint bounds, so its `coord_offset`/
+// `coord_scale` recover world coords for a continuous, world-scaled wave
+// field.
+fn build_water_surface_mesh(spec: &WaterSpec, world_tile_uvs: bool) -> Mesh {
     let dx = (spec.max.x - spec.min.x).max(0.01);
     let dz = (spec.max.z - spec.min.z).max(0.01);
-    // UVs are world XZ normalised over the footprint bounds, so bevy_water's
-    // `coord_offset`/`coord_scale` recover world coords for a continuous,
-    // world-scaled wave field. The vanilla material ignores them.
-    let uvs: Vec<[f32; 2]> = spec
-        .positions
-        .iter()
-        .map(|p| [(p[0] - spec.min.x) / dx, (p[2] - spec.min.z) / dz])
-        .collect();
+    let uvs: Vec<[f32; 2]> = if world_tile_uvs {
+        spec.positions
+            .iter()
+            .map(|p| [p[0] / WATER_TEX_TILE, p[2] / WATER_TEX_TILE])
+            .collect()
+    } else {
+        spec.positions
+            .iter()
+            .map(|p| [(p[0] - spec.min.x) / dx, (p[2] - spec.min.z) / dz])
+            .collect()
+    };
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
@@ -1121,8 +1186,10 @@ pub fn spawn_zone_water(
     mut pending: ResMut<PendingWaterSpawns>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<crate::ffxi_zone_material::FfxiZoneMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     mut water_mat: ResMut<ZoneWaterMaterial>,
     settings: Res<crate::graphics::GraphicsSettings>,
+    draw: Res<DrawDistance>,
     self_q: Query<&GlobalTransform, With<IsSelf>>,
     #[cfg(feature = "enhanced-water")] mut water_materials: ResMut<
         Assets<crate::water_enhanced::StandardWaterMaterial>,
@@ -1143,8 +1210,16 @@ pub fn spawn_zone_water(
     let enhanced = cfg!(feature = "enhanced-water") && settings.enhanced_water;
     let simple_mat = water_mat
         .0
-        .get_or_insert_with(|| materials.add(simple_water_material()))
+        .get_or_insert_with(|| {
+            materials.add(simple_water_material(images.add(water_ripple_image())))
+        })
         .clone();
+
+    // Water surfaces are visual, non-collision zone geometry: honor the current
+    // ZoneGeomMode at spawn time (a zone loaded while geom is Off/Collision must
+    // not show water), and tag MzbNonCollisionMesh so apply_zone_geom_visibility
+    // toggles them with the rest of the non-collision meshes.
+    let (_, water_vis) = compute_init_visibility(draw.zone_geom_mode);
 
     const WATER_SPAWN_BUDGET: usize = 32;
     let mut spawned = 0usize;
@@ -1167,7 +1242,7 @@ pub fn spawn_zone_water(
         }
         spawned += 1;
 
-        let mesh = Mesh3d(meshes.add(build_water_surface_mesh(&spec)));
+        let mesh = Mesh3d(meshes.add(build_water_surface_mesh(&spec, !enhanced)));
         let mut e;
         #[cfg(feature = "enhanced-water")]
         if enhanced {
@@ -1179,10 +1254,11 @@ pub fn spawn_zone_water(
             e = commands.spawn((
                 MzbOverlay,
                 WaterPlane,
+                MzbNonCollisionMesh,
                 mesh,
                 mat,
                 Transform::IDENTITY,
-                Visibility::Inherited,
+                water_vis,
                 bevy::light::NotShadowReceiver,
                 ChildOf(spec.parent),
             ));
@@ -1195,10 +1271,11 @@ pub fn spawn_zone_water(
         e = commands.spawn((
             MzbOverlay,
             WaterPlane,
+            MzbNonCollisionMesh,
             mesh,
             MeshMaterial3d(simple_mat.clone()),
             Transform::IDENTITY,
-            Visibility::Inherited,
+            water_vis,
             bevy::light::NotShadowReceiver,
             ChildOf(spec.parent),
         ));
