@@ -48,8 +48,6 @@ impl EphemeralChar {
         let username = format!("it_{suffix:06x}");
         let charname = format!("It{suffix:06x}");
 
-        let target_accid = 1_000_000u32 + suffix;
-        let charid = 1_000_000u32 + suffix;
         let password = FIXTURE_PASSWORD.to_string();
 
         let pool = Pool::new(db_url.as_str());
@@ -57,14 +55,6 @@ impl EphemeralChar {
             .get_conn()
             .await
             .with_context(|| format!("connecting to xidb at {db_url}"))?;
-
-        let sentinel_login = format!("_fix_{suffix:06x}");
-        "INSERT INTO accounts(id, login, password, timecreate, status, priv) \
-         VALUES (?, ?, '', NOW(), 0, 0)"
-            .with((target_accid - 1, &sentinel_login))
-            .ignore(&mut conn)
-            .await
-            .context("inserting accid sentinel row")?;
 
         let auth = AuthClient::new(server_host.to_string(), auth_port);
         auth.ensure_account(&username, &password)
@@ -77,18 +67,6 @@ impl EphemeralChar {
             .await
             .context("looking up accid for new ephemeral account")?
             .ok_or_else(|| anyhow!("ensure_account succeeded but accid {username:?} not found"))?;
-        if accid != target_accid {
-            eprintln!(
-                "fixture: accounts AUTO_INCREMENT outran the sentinel scheme \
-                 (requested accid {target_accid}, got {accid}); proceeding with {accid}"
-            );
-        }
-
-        "DELETE FROM accounts WHERE login = ?"
-            .with((&sentinel_login,))
-            .ignore(&mut conn)
-            .await
-            .context("dropping accid sentinel row")?;
 
         const POS_ZONE: u32 = 230;
         const NATION: u8 = 0;
@@ -100,8 +78,8 @@ impl EphemeralChar {
 
         const MJOB: u8 = 1;
 
-        run_inserts(
-            &mut conn, accid, charid, &charname, POS_ZONE, NATION, GMLEVEL, FACE, RACE, SIZE, MJOB,
+        let charid = run_inserts(
+            &mut conn, accid, &charname, POS_ZONE, NATION, GMLEVEL, FACE, RACE, SIZE, MJOB,
         )
         .await
         .context("running LSB char-creation INSERT chain")?;
@@ -149,7 +127,6 @@ impl EphemeralChar {
 async fn run_inserts(
     conn: &mut Conn,
     accid: u32,
-    charid: u32,
     charname: &str,
     pos_zone: u32,
     nation: u8,
@@ -158,13 +135,28 @@ async fn run_inserts(
     race: u8,
     size: u8,
     mjob: u8,
-) -> Result<()> {
+) -> Result<u32> {
+    // Mirror LSB's own char creation (MAX(charid)+1) inside a single
+    // INSERT ... SELECT, then read the actual created row back. Precomputing
+    // an id from a sentinel scheme is unsound: nothing guarantees the next id,
+    // and a charid that doesn't match the created row makes the lobby reject
+    // char select with "mismatched character name".
     "INSERT INTO chars(charid, accid, charname, pos_zone, nation, gmlevel) \
-     VALUES (?, ?, ?, ?, ?, ?)"
-        .with((charid, accid, charname, pos_zone, nation, gmlevel))
+     SELECT COALESCE(MAX(c.charid), 1000000) + 1, ?, ?, ?, ?, ? FROM chars AS c"
+        .with((accid, charname, pos_zone, nation, gmlevel))
         .ignore(&mut *conn)
         .await
         .context("INSERT INTO chars")?;
+
+    let charid: u32 = "SELECT charid FROM chars WHERE accid = ? AND charname = ? \
+                       ORDER BY charid DESC LIMIT 1"
+        .with((accid, charname))
+        .first(&mut *conn)
+        .await
+        .context("reading back created charid")?
+        .ok_or_else(|| {
+            anyhow!("chars row for accid {accid} / charname {charname:?} not found after insert")
+        })?;
 
     "INSERT INTO char_look(charid, face, race, size) VALUES (?, ?, ?, ?)"
         .with((charid, face, race, size))
@@ -207,5 +199,5 @@ async fn run_inserts(
         .await
         .context("INSERT INTO char_inventory")?;
 
-    Ok(())
+    Ok(charid)
 }
