@@ -76,3 +76,7 @@ profile.json.gz
 
 # skill-creator eval scratch (transient benchmark runs)
 .claude/skills/*-workspace/
+
+# Verification evidence marker (stop.d/25-verify.sh gate) — per-machine,
+# ephemeral by design: stale the moment gated source is edited after it.
+.verify/

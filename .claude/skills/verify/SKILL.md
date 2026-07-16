@@ -21,6 +21,7 @@ work splits into four steps; each has a reference file with the exact recipes.
 2. Pick surface  → table below
 3. Drive + observe → references/drive-headless.md | references/drive-gui.md
 4. Evidence      → JSON events / tracing log / screenshots, quoted in the report
+5. Record it     → scripts/record-evidence.sh (feeds the stop-hook verify gate)
 ```
 
 ## Picking the surface
@@ -79,6 +80,25 @@ screenshot paths — and keep the raw capture files (`events.jsonl`,
 observed (e.g. a GUI leg that needs human eyes) gets named explicitly rather
 than silently skipped. Probes off the happy path (wrong zone, dead server,
 double-send) are worth a line each even when they hold.
+
+## Recording evidence (feeds the stop-hook gate)
+
+The stop-hook verify gate (`.claude/hooks/stop.d/25-verify.sh`) blocks session
+end when gated source (`*.rs`/`*.wgsl` outside tests/vendor) changed but no
+fresh evidence exists. After delivering the report, record the session:
+
+```
+.claude/skills/verify/scripts/record-evidence.sh \
+  --verdict pass --summary "<what was OBSERVED, one line>" \
+  --artifact artifacts/verify/events.jsonl --artifact artifacts/verify/zone.png
+```
+
+Rules the recorder enforces: `pass` requires ≥1 artifact; artifacts must exist
+non-empty; `--summary` records observations, not intentions. If runtime
+verification genuinely doesn't apply, `--verdict waived --summary "<why>"` —
+a waiver goes stale like any marker, so it only covers edits made before it.
+The marker (`.verify/latest.json`) is stale the moment gated source is edited
+after it; verify last, record last of all.
 
 ## Maintenance
 
