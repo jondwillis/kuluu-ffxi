@@ -95,18 +95,37 @@ fn log_pipeline_compiles(
 struct RenderSpanStamp {
     begin: Option<std::time::Instant>,
     prep_done: Option<std::time::Instant>,
+    /// Rolling mark for the rprep sub-span fences (xtr/ast/vws/que/prp).
+    last: Option<std::time::Instant>,
 }
 
 fn stamp_render_begin(mut s: ResMut<RenderSpanStamp>) {
-    s.begin = Some(std::time::Instant::now());
+    let now = std::time::Instant::now();
+    s.begin = Some(now);
     s.prep_done = None;
+    s.last = Some(now);
+}
+
+/// Fence between two RenderSystems sets: attributes time since the previous
+/// mark to rprep sub-span `I` (labels in `perf_probe::RPREP_SPAN_LABELS`).
+fn stamp_rprep_span<const I: usize>(mut s: ResMut<RenderSpanStamp>) {
+    let now = std::time::Instant::now();
+    if let Some(last) = s.last {
+        ffxi_viewer_core::perf_probe::note_rprep_span(I, now - last);
+    }
+    s.last = Some(now);
 }
 
 fn stamp_render_prep_done(mut s: ResMut<RenderSpanStamp>) {
     if let Some(begin) = s.begin {
         let now = std::time::Instant::now();
         ffxi_viewer_core::perf_probe::note_render_prep(now - begin);
+        if let Some(last) = s.last {
+            // Final rprep sub-span: the Prepare set itself.
+            ffxi_viewer_core::perf_probe::note_rprep_span(4, now - last);
+        }
         s.prep_done = Some(now);
+        s.last = Some(now);
     }
 }
 
@@ -247,6 +266,24 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         render_app.add_systems(
             Render,
             (
+                // rprep sub-span fences (order confirmed by bevy_render's
+                // configure_sets chain: ExtractCommands → PrepareAssets/
+                // PrepareMeshes → CreateViews → Specialize → PrepareViews →
+                // Queue → PhaseSort → Prepare).
+                stamp_rprep_span::<0>
+                    .after(RenderSystems::ExtractCommands)
+                    .before(RenderSystems::PrepareAssets)
+                    .before(RenderSystems::PrepareMeshes),
+                stamp_rprep_span::<1>
+                    .after(RenderSystems::PrepareAssets)
+                    .after(RenderSystems::PrepareMeshes)
+                    .before(RenderSystems::CreateViews),
+                stamp_rprep_span::<2>
+                    .after(RenderSystems::PrepareViews)
+                    .before(RenderSystems::Queue),
+                stamp_rprep_span::<3>
+                    .after(RenderSystems::PhaseSort)
+                    .before(RenderSystems::Prepare),
                 stamp_render_prep_done
                     .after(RenderSystems::Prepare)
                     .before(RenderSystems::Render),

@@ -54,6 +54,7 @@ pub struct PerfMonitor {
     prev_rprep_ns: u64,
     prev_rgraph_ns: u64,
     prev_rtotal_ns: u64,
+    prev_rspans_ns: [u64; 5],
     rebuild_rate: f32,
 
     last_d_model: u64,
@@ -63,6 +64,7 @@ pub struct PerfMonitor {
     last_d_rprep_us: u64,
     last_d_rgraph_us: u64,
     last_d_rtotal_us: u64,
+    last_d_rspans_us: [u64; 5],
 
     spike_model_loads: u64,
     spike_nameplate_rasters: u64,
@@ -72,6 +74,7 @@ pub struct PerfMonitor {
     spike_rprep_us: u64,
     spike_rgraph_us: u64,
     spike_rtotal_us: u64,
+    spike_rspans_us: [u64; 5],
 
     prev_churn: [u64; 6],
     last_d_churn: [u64; 6],
@@ -87,6 +90,7 @@ pub struct PerfMonitor {
     summary_max_rprep_us: u64,
     summary_max_rgraph_us: u64,
     summary_max_rtotal_us: u64,
+    summary_max_rspans_us: [u64; 5],
 }
 
 impl Default for PerfMonitor {
@@ -113,6 +117,7 @@ impl Default for PerfMonitor {
             prev_rprep_ns: 0,
             prev_rgraph_ns: 0,
             prev_rtotal_ns: 0,
+            prev_rspans_ns: [0; 5],
             rebuild_rate: 0.0,
             last_d_model: 0,
             last_d_rasters: 0,
@@ -121,6 +126,7 @@ impl Default for PerfMonitor {
             last_d_rprep_us: 0,
             last_d_rgraph_us: 0,
             last_d_rtotal_us: 0,
+            last_d_rspans_us: [0; 5],
             spike_model_loads: 0,
             spike_nameplate_rasters: 0,
             spike_rebuilt: false,
@@ -129,6 +135,7 @@ impl Default for PerfMonitor {
             spike_rprep_us: 0,
             spike_rgraph_us: 0,
             spike_rtotal_us: 0,
+            spike_rspans_us: [0; 5],
             prev_churn: [0; 6],
             last_d_churn: [0; 6],
             spike_churn: [0; 6],
@@ -141,6 +148,7 @@ impl Default for PerfMonitor {
             summary_max_rprep_us: 0,
             summary_max_rgraph_us: 0,
             summary_max_rtotal_us: 0,
+            summary_max_rspans_us: [0; 5],
         }
     }
 }
@@ -234,32 +242,38 @@ fn top_render_spans(diag: &DiagnosticsStore) -> String {
     format!("  peak render: {}", parts.join(", "))
 }
 
-/// One-shot dump of every `render/*` diagnostic path ~15s after startup, gated by
+/// Periodic dump (every 15s) of every `render/*` diagnostic path, gated by
 /// `FFXI_GPU_TIMING`. Positive confirmation that GPU spans (e.g. shadow passes) are
-/// recording, since spikes are the only other way spans reach the log.
+/// recording, since spikes are the only other way spans reach the log. Periodic
+/// (not one-shot) so the dump captures in-game steady state, not just the
+/// launcher scene that's up 15s after startup; `avg` is the steady-state signal
+/// over the diagnostic history window, `peak` catches spikes.
 pub fn dump_render_diagnostics(
     time: Res<Time<Real>>,
     diag: Res<DiagnosticsStore>,
-    mut done: Local<bool>,
+    mut next_dump: Local<f32>,
 ) {
-    if *done {
-        return;
-    }
     if std::env::var_os("FFXI_GPU_TIMING").is_none() {
-        *done = true;
         return;
     }
-    if time.elapsed_secs() < 15.0 {
+    if *next_dump == 0.0 {
+        *next_dump = 15.0;
+    }
+    if time.elapsed_secs() < *next_dump {
         return;
     }
-    *done = true;
+    *next_dump = time.elapsed_secs() + 15.0;
     let mut n = 0usize;
     for d in diag
         .iter()
         .filter(|d| d.path().as_str().starts_with("render/"))
     {
         let peak = d.values().copied().fold(0.0f64, f64::max);
-        info!(target: "perf", "diag {} peak={peak:.2}ms", d.path().as_str());
+        let (sum, count) = d
+            .values()
+            .fold((0.0f64, 0usize), |(s, c), v| (s + v, c + 1));
+        let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+        info!(target: "perf", "diag {} avg={avg:.2}ms peak={peak:.2}ms", d.path().as_str());
         n += 1;
     }
     info!(target: "perf", "diag dump complete ({n} render/* paths)");
@@ -293,6 +307,7 @@ pub fn update_perf_monitor(
     let rprep_ns = perf_probe::render_prep_ns();
     let rgraph_ns = perf_probe::render_graph_ns();
     let rtotal_ns = perf_probe::render_total_ns();
+    let rspans_ns = perf_probe::rprep_spans_ns();
     let d_model = model.wrapping_sub(m.prev_model_loads);
     let d_rasters = rasters.wrapping_sub(m.prev_nameplate_rasters);
     let d_rebuilds = rebuilds.wrapping_sub(m.prev_rebuilds);
@@ -300,6 +315,13 @@ pub fn update_perf_monitor(
     let d_rprep_us = rprep_ns.wrapping_sub(m.prev_rprep_ns) / 1000;
     let d_rgraph_us = rgraph_ns.wrapping_sub(m.prev_rgraph_ns) / 1000;
     let d_rtotal_us = rtotal_ns.wrapping_sub(m.prev_rtotal_ns) / 1000;
+    let mut d_rspans_us = [0u64; 5];
+    let mut w_rspans_us = [0u64; 5];
+    for i in 0..5 {
+        d_rspans_us[i] = rspans_ns[i].wrapping_sub(m.prev_rspans_ns[i]) / 1000;
+        w_rspans_us[i] = d_rspans_us[i] + m.last_d_rspans_us[i];
+        m.summary_max_rspans_us[i] = m.summary_max_rspans_us[i].max(d_rspans_us[i]);
+    }
     m.prev_model_loads = model;
     m.prev_nameplate_rasters = rasters;
     m.prev_rebuilds = rebuilds;
@@ -307,6 +329,8 @@ pub fn update_perf_monitor(
     m.prev_rprep_ns = rprep_ns;
     m.prev_rgraph_ns = rgraph_ns;
     m.prev_rtotal_ns = rtotal_ns;
+    m.prev_rspans_ns = rspans_ns;
+    m.last_d_rspans_us = d_rspans_us;
     m.rebuild_rate = m.rebuild_rate * 0.9 + (d_rebuilds as f32 / dt) * 0.1;
 
     let churn_now = [
@@ -337,11 +361,12 @@ pub fn update_perf_monitor(
         let avg_fps = m.summary_frames as f32 / m.summary_s;
         info!(
             target: "perf",
-            "summary {avg_fps:.1}fps baseline {:.1}ms max {:.1}ms spikes {} | max rprep {}\u{00b5}s rgraph {}\u{00b5}s rtotal {}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}",
+            "summary {avg_fps:.1}fps baseline {:.1}ms max {:.1}ms spikes {} | max rprep {}\u{00b5}s {} rgraph {}\u{00b5}s rtotal {}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}",
             m.baseline_ms,
             m.summary_max_ms,
             m.spikes_total,
             m.summary_max_rprep_us,
+            fmt_rprep_spans(&m.summary_max_rspans_us),
             m.summary_max_rgraph_us,
             m.summary_max_rtotal_us,
             m.summary_churn[0],
@@ -357,6 +382,7 @@ pub fn update_perf_monitor(
         m.summary_max_rprep_us = 0;
         m.summary_max_rgraph_us = 0;
         m.summary_max_rtotal_us = 0;
+        m.summary_max_rspans_us = [0; 5];
         m.summary_churn = [0; 6];
     }
 
@@ -409,6 +435,7 @@ pub fn update_perf_monitor(
     m.spike_rprep_us = w_rprep_us;
     m.spike_rgraph_us = w_rgraph_us;
     m.spike_rtotal_us = w_rtotal_us;
+    m.spike_rspans_us = w_rspans_us;
     m.spike_churn = w_churn;
     m.spike_cpu_us = cpu_us;
     m.spike_main_us = m.last_main_us;
@@ -438,10 +465,11 @@ pub fn update_perf_monitor(
     let render_spans = top_render_spans(&diag);
     warn!(
         target: "perf",
-        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s late {late_us}\u{00b5}s render~{render_us}\u{00b5}s [rprep {w_rprep_us}\u{00b5}s rgraph {w_rgraph_us}\u{00b5}s rtotal {w_rtotal_us}\u{00b5}s] | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}{extra}{render_spans}",
+        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s late {late_us}\u{00b5}s render~{render_us}\u{00b5}s [rprep {w_rprep_us}\u{00b5}s {} rgraph {w_rgraph_us}\u{00b5}s rtotal {w_rtotal_us}\u{00b5}s] | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}{extra}{render_spans}",
         m.baseline_ms,
         dt_ms - m.baseline_ms,
         cpu_us,
+        fmt_rprep_spans(&w_rspans_us),
         m.spike_churn[0],
         m.spike_churn[1] / 1024,
         m.spike_churn[2],
@@ -631,6 +659,11 @@ fn build_text_lines(
         theme::TEXT,
     );
 
+    let rp_split = (
+        format!("rp split: {}", fmt_rprep_spans(&m.spike_rspans_us)),
+        theme::MUTED,
+    );
+
     let cause = (
         format!(
             "on spike: {}  model+{} plate+{} probe {}\u{00b5}s   snap {}\u{00b5}s n:{}  {:.0} rebuild/s",
@@ -649,7 +682,22 @@ fn build_text_lines(
         theme::MUTED,
     );
 
-    vec![title, spike, split, cause]
+    vec![title, spike, split, rp_split, cause]
+}
+
+/// Formats the rprep sub-spans as "[xtr N ast N vws N que N prp N]" (µs).
+fn fmt_rprep_spans(us: &[u64; 5]) -> String {
+    let mut out = String::from("[");
+    for (i, (label, v)) in perf_probe::RPREP_SPAN_LABELS.iter().zip(us).enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(label);
+        out.push(' ');
+        out.push_str(&v.to_string());
+    }
+    out.push(']');
+    out
 }
 
 fn sample_color(ms: f32) -> Color {

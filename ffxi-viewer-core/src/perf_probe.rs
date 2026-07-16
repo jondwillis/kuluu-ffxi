@@ -8,6 +8,28 @@ static RENDER_PREP_NS: AtomicU64 = AtomicU64::new(0);
 static RENDER_GRAPH_NS: AtomicU64 = AtomicU64::new(0);
 static RENDER_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Sub-spans of the render-prep fence (see `RenderSpanStamp` in the client):
+/// xtr = extract→end of ExtractCommands, ast = PrepareAssets+PrepareMeshes,
+/// vws = CreateViews+Specialize+PrepareViews, que = Queue+PhaseSort,
+/// prp = Prepare (resources, batching, bind groups).
+pub const RPREP_SPAN_LABELS: [&str; 5] = ["xtr", "ast", "vws", "que", "prp"];
+
+static RPREP_SPANS_NS: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+pub fn note_rprep_span(idx: usize, elapsed: Duration) {
+    RPREP_SPANS_NS[idx].fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
+
+pub fn rprep_spans_ns() -> [u64; 5] {
+    core::array::from_fn(|i| RPREP_SPANS_NS[i].load(Ordering::Relaxed))
+}
+
 pub fn note_model_load() {
     MODEL_LOADS.fetch_add(1, Ordering::Relaxed);
 }
