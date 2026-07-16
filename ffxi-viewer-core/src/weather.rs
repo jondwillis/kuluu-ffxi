@@ -494,42 +494,27 @@ mod tests {
     }
 
     #[test]
-    fn volumetric_daytime_paints_daylight_scaled_fog_horizon() {
+    fn record_paints_the_zone_fog_horizon() {
+        // The keyframes are already sampled per Vana'diel minute, so the raw
+        // zone fog color is the backdrop in both fog modes.
         let rec = rec_with_fog([0.5, 0.6, 0.7, 1.0]);
-        let got = zone_clear_color(Some(&rec), true, 1.0, DEFAULT);
-        // lum = 0.03 + 0.97 * 1.0 = 1.0 -> the raw zone fog color.
+        let got = zone_clear_color(Some(&rec), DEFAULT);
         assert_color_close(got, Color::srgb(0.5, 0.6, 0.7));
-    }
-
-    #[test]
-    fn volumetric_night_dims_the_horizon() {
-        let rec = rec_with_fog([0.5, 0.6, 0.7, 1.0]);
-        let got = zone_clear_color(Some(&rec), true, 0.0, DEFAULT);
-        assert_color_close(got, Color::srgb(0.5 * 0.03, 0.6 * 0.03, 0.7 * 0.03));
     }
 
     #[test]
     fn foggy_to_weatherless_transition_restores_default() {
         // Foggy zone paints a non-default horizon...
         let rec = rec_with_fog([0.5, 0.6, 0.7, 1.0]);
-        let painted = zone_clear_color(Some(&rec), true, 1.0, DEFAULT);
+        let painted = zone_clear_color(Some(&rec), DEFAULT);
         assert_ne!(painted, DEFAULT);
         // ...then a zone line drops the record: the backdrop must snap back to
         // the startup default rather than leaking the previous zone's color.
-        assert_eq!(zone_clear_color(None, true, 1.0, DEFAULT), DEFAULT);
-    }
-
-    #[test]
-    fn volumetric_toggle_off_restores_default() {
-        // DistanceFog mode never owned the backdrop, so even with an active
-        // record the default is restored once volumetric fog deactivates.
-        let rec = rec_with_fog([0.5, 0.6, 0.7, 1.0]);
-        assert_eq!(zone_clear_color(Some(&rec), false, 1.0, DEFAULT), DEFAULT);
+        assert_eq!(zone_clear_color(None, DEFAULT), DEFAULT);
     }
 
     #[test]
     fn default_clear_color_matches_bevy_stock_until_captured() {
         assert_eq!(DefaultClearColor::default().0, ClearColor::default().0);
->>>>>>> worktree-eisenhower-beads
     }
 }
