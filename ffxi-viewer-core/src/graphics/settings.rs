@@ -1095,25 +1095,44 @@ pub fn apply_bloom_system(
     }
 }
 
-/// Keeps `VolumetricFog` *values* (step count) in sync on a camera that
-/// already has the component. Presence is NOT toggled here: adding/removing
-/// `VolumetricFog` on a live camera doesn't round-trip through bevy's
-/// insert-only render-world extraction, so on/off is handled by the camera
+/// Owns `VolumetricFog` presence + quality (step count) on the operator
+/// camera: inserts when the toggle is on and the component is missing (e.g.
+/// right after a camera respawn), removes it when toggled off, and keeps
+/// `step_count` in sync. Toggle-*off* additionally relies on the camera
 /// respawn in [`apply_anti_aliasing_system`] (which keys on
-/// `settings.volumetric_fog`) + the spawn path in
-/// `crate::camera::build_operator_camera`. Ambient color/intensity are owned
-/// by `crate::weather::apply_zone_weather`, which derives them from the zone
-/// fog DAT and time of day.
+/// `settings.volumetric_fog`), because bevy's render-world extraction is
+/// insert-only and a bare `remove` leaves stale render-world state. Ambient
+/// color/intensity are owned by `crate::weather::apply_zone_weather`, which
+/// derives them from the zone fog DAT and time of day.
 pub fn apply_volumetric_fog_system(
     settings: Res<GraphicsSettings>,
-    mut q_cam: Query<&mut VolumetricFog, With<OperatorCamera>>,
+    mut commands: Commands,
+    mut q_cam: Query<(Entity, Option<&mut VolumetricFog>), With<OperatorCamera>>,
 ) {
-    if !settings.volumetric_fog {
-        return;
-    }
-    for mut fog in q_cam.iter_mut() {
-        if fog.step_count != settings.fog_step_count {
-            fog.step_count = settings.fog_step_count;
+    for (entity, fog) in q_cam.iter_mut() {
+        match (settings.volumetric_fog, fog) {
+            (true, Some(mut fog)) => {
+                // Only own the quality knob here; ambient_color/intensity are
+                // zone/time/weather-derived in weather::apply_zone_weather and
+                // must survive settings changes.
+                if fog.step_count != settings.fog_step_count {
+                    fog.step_count = settings.fog_step_count;
+                }
+            }
+            (true, None) => {
+                // Ambient values are placeholders; apply_zone_weather rewrites
+                // them from the zone DAT + day/night curve every frame.
+                commands.entity(entity).insert(VolumetricFog {
+                    step_count: settings.fog_step_count,
+                    ambient_intensity: 0.1,
+                    ambient_color: Color::srgb(0.85, 0.88, 1.0),
+                    jitter: 0.0,
+                });
+            }
+            (false, Some(_)) => {
+                commands.entity(entity).remove::<VolumetricFog>();
+            }
+            (false, None) => {}
         }
     }
 }

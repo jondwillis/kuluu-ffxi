@@ -217,10 +217,64 @@ pub fn load_zone_weather(
     }
 }
 
+// FFXI's DAT fog is distance fog on zone geometry only — the sky dome is never
+// fogged. Bevy's raymarch instead clamps each ray by scene depth, and the
+// skybox sphere (radius 5500) writes depth beyond the volume, so sky pixels
+// used to traverse the volume's full chord and drown in fog ("sky hidden").
+// Approximate the client look with a height falloff: full density near the
+// ground, exponential decay with altitude, so overhead sky clears while
+// eye-level rays toward terrain still accumulate the DAT fog distance.
+pub const FOG_VOLUME_CENTER_Y: f32 = 100.0;
+pub const FOG_VOLUME_SCALE: Vec3 = Vec3::new(2000.0, 800.0, 2000.0);
+
+/// Builds the 1×64×1 R8 vertical-falloff density texture sampled by the
+/// volumetric fog raymarch (multiplies `density_factor` per step, volume-local
+/// UVW with `v` up). Shared by the viewer (scene.rs) and the headless example.
+pub fn height_fog_density_texture(images: &mut Assets<Image>) -> Handle<Image> {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+
+    const N: usize = 64;
+    // World-space falloff: full density below Y0, scale height H above it.
+    const Y0: f32 = 40.0;
+    const H: f32 = 110.0;
+    let y_min = FOG_VOLUME_CENTER_Y - FOG_VOLUME_SCALE.y * 0.5;
+    let data: Vec<u8> = (0..N)
+        .map(|i| {
+            let v = (i as f32 + 0.5) / N as f32;
+            let y = y_min + v * FOG_VOLUME_SCALE.y;
+            let d = if y <= Y0 { 1.0 } else { (-(y - Y0) / H).exp() };
+            (d.clamp(0.0, 1.0) * 255.0).round() as u8
+        })
+        .collect();
+    let mut image = Image::new(
+        Extent3d {
+            width: 1,
+            height: N as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D3,
+        data,
+        TextureFormat::R8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::ClampToEdge,
+        address_mode_v: ImageAddressMode::ClampToEdge,
+        address_mode_w: ImageAddressMode::ClampToEdge,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    images.add(image)
+}
+
 pub fn apply_zone_weather(
     zone_weather: Res<ZoneWeather>,
     active: Res<crate::weather_fx::ActiveWeatherModifier>,
-    mut fog_q: Query<&mut FogVolume>,
+    mut fog_q: Query<(&mut FogVolume, &mut Transform)>,
+    cam_tf_q: Query<&GlobalTransform, With<OperatorCamera>>,
     mut ambient: ResMut<GlobalAmbientLight>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     settings: Res<GraphicsSettings>,
@@ -248,21 +302,36 @@ pub fn apply_zone_weather(
     let daylight = ((horizon_hours + band) / (2.0 * band)).clamp(0.0, 1.0);
     let daylight_smooth = daylight * daylight * (3.0 - 2.0 * daylight);
 
-    if let Some(mut fog) = fog_q.iter_mut().next() {
+    if let Some((mut fog, mut fog_tf)) = fog_q.iter_mut().next() {
+        // Keep the camera inside the volume in XZ so the ground haze never
+        // ends at a visible box edge; Y stays world-anchored so the height
+        // falloff (density texture) tracks true altitude.
+        if let Ok(cam_tf) = cam_tf_q.single() {
+            let c = cam_tf.translation();
+            fog_tf.translation.x = c.x;
+            fog_tf.translation.z = c.z;
+        }
         let [r, g, b, _a] = rec.fog_landscape;
         fog.fog_color = Color::srgb(r, g, b);
         // Tint the in-scattered light with the zone fog palette so the volume
         // reads as the zone's atmosphere rather than a neutral gray wall.
         fog.light_tint = Color::srgb(0.5 + 0.5 * r, 0.5 + 0.5 * g, 0.5 + 0.5 * b);
 
-        // Extinction = density * (absorption + scattering) ≈ density * 0.6, so
-        // density = 5/D gives ~5% transmittance (e^-3) at the DAT max fog
-        // distance D. The old (15/dist).clamp(0.04, ..) floored at 0.04/unit for
-        // any D > 375, crushing visibility to ~100 units regardless of the zone's
-        // fog range; the extra twilight boost double-applied time-of-day (the
-        // weather keyframes are already sampled per Vana'diel minute).
+        // The volume is a low-density lit ground haze, NOT the DAT distance
+        // fog (DistanceFog owns that, below). It cannot be both: bevy's
+        // raymarch attenuates directional in-scatter by
+        // exp(-density * bounding_radius * (absorption + scattering))
+        // (volumetric_fog.wgsl), the same density*sigma product extinction
+        // needs, so a volume dense enough to reproduce DAT fog distances
+        // (density*sigma*D ~= 3) crushes its own lighting by e^-(3R/D) and
+        // renders black instead of fog-colored. Cap density so the light term
+        // survives (R ~= 1470 for the 2000x800x2000 volume) and let the haze
+        // scale gently with the zone's DAT fog range.
         let dist = rec.max_fog_dist_landscape.max(50.0);
-        fog.density_factor = (5.0 / dist).clamp(0.002, 0.03);
+        fog.density_factor = (0.9 / dist).clamp(0.0008, 0.0018);
+        // Recover the bounding-radius attenuation (~e^-1.3 at ground density)
+        // so the haze reads as lit fog, not soot.
+        fog.light_intensity = 3.0;
     }
 
     // research/xim EnvironmentManager.kt:399-445: ambient_landscape is the
@@ -279,57 +348,51 @@ pub fn apply_zone_weather(
     ambient.brightness =
         500.0 * rec.diffuse_mul_landscape.clamp(0.4, 1.5) * active.modifier.ambient_brightness_mul;
 
-    if !settings.volumetric_fog {
-        if let Ok((cam_entity, slot, _)) = cam_q.single_mut() {
-            let [fr, fg, fb, _] = rec.fog_landscape;
-            let color = Color::srgb(fr, fg, fb);
+    let [fr, fg, fb, _] = rec.fog_landscape;
+    let fog_color = Color::srgb(fr, fg, fb);
+    // The zone fog color is what the DAT expects at the far plane; use it as the
+    // clear color so both fog paths converge to the same horizon.
+    clear_color.0 = fog_color;
 
-            let inscatter = Color::srgb(
-                (fr * 1.08).min(1.0),
-                (fg * 1.06).min(1.0),
-                (fb * 1.02).min(1.0),
-            );
-            let visibility = rec.max_fog_dist_landscape.max(80.0);
-            let want = DistanceFog {
-                color,
-                directional_light_color: inscatter,
-                directional_light_exponent: 60.0,
-                falloff: FogFalloff::from_visibility_colors(visibility, color, inscatter),
-            };
-            match slot {
-                Some(mut existing) => *existing = want,
-                None => {
-                    commands.entity(cam_entity).insert(want);
-                }
+    // DistanceFog is the authoritative DAT distance fog in BOTH modes: it runs
+    // in the geometry materials only (the sky dome's custom materials never
+    // sample it), so like the client, fog swallows terrain but not the sky.
+    // The volumetric layer can't take this role — see the density_factor note
+    // above — it only adds the lit ground haze on top.
+    if let Ok((cam_entity, dist_slot, vol_slot)) = cam_q.single_mut() {
+        let inscatter = Color::srgb(
+            (fr * 1.08).min(1.0),
+            (fg * 1.06).min(1.0),
+            (fb * 1.02).min(1.0),
+        );
+        let visibility = rec.max_fog_dist_landscape.max(80.0);
+        let want = DistanceFog {
+            color: fog_color,
+            directional_light_color: inscatter,
+            directional_light_exponent: 60.0,
+            falloff: FogFalloff::from_visibility_colors(visibility, fog_color, inscatter),
+        };
+        match dist_slot {
+            Some(mut existing) => *existing = want,
+            None => {
+                commands.entity(cam_entity).insert(want);
             }
         }
-    } else if let Ok((cam_entity, dist_fog, vol_fog)) = cam_q.single_mut() {
-        // Volumetric fog owns the atmosphere now: a `DistanceFog` left over
-        // from before the toggle would keep crushing view distance on top of
-        // the volumetric pass, so strip it (this branch is what makes the menu
-        // toggle usable without a zone change).
-        if dist_fog.is_some() {
-            commands.entity(cam_entity).remove::<DistanceFog>();
-        }
 
-        // Derive the volumetric ambient term from the zone fog palette and
-        // time of day: at night the DAT fog should read as a dim haze lit by
-        // the (already dim) moon, not a hardcoded blue-gray wall.
-        if let Some(mut vol) = vol_fog {
-            let [fr, fg, fb, _] = rec.fog_landscape;
-            vol.ambient_color = Color::srgb(fr, fg, fb);
-            vol.ambient_intensity = 0.01 + 0.17 * daylight_smooth;
-        }
-
-        // Retail fades the horizon to the zone fog color (the sky mesh does
-        // this in the client; headless captures and skyless indoor zones have
-        // no sky). Clearing to the daylight-scaled fog color gives the
-        // raymarch a matching backdrop instead of a hard black wall past the
-        // last drawn geometry.
-        {
-            let [fr, fg, fb, _] = rec.fog_landscape;
-            let lum = 0.03 + 0.97 * daylight_smooth;
-            clear_color.0 = Color::srgb(fr * lum, fg * lum, fb * lum);
+        if settings.volumetric_fog {
+            // Ambient term for the raymarch: unlike DistanceFog's inscatter
+            // constant, VolumetricFog.ambient_intensity is the only luminance
+            // source at night (no sun contribution), so derive it from the
+            // day/night curve instead of a fixed value.
+            let ambient_intensity = 0.01 + 0.17 * daylight_smooth;
+            // Insert/remove of VolumetricFog (and step_count) is owned by
+            // graphics::settings::apply_volumetric_fog_system; we only steer the
+            // ambient fields on the component it manages. On the toggle frame
+            // the insert lands next frame and we pick it up then.
+            if let Some(mut vol) = vol_slot {
+                vol.ambient_color = fog_color;
+                vol.ambient_intensity = ambient_intensity;
+            }
         }
     }
 }
