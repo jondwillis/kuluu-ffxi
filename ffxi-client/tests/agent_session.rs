@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use tokio::{process::Command, time::timeout};
 
-use common::mcp_client::{ffxi_mcp_bin, is_reachable, read_text, McpClient};
+use common::mcp_client::{build_ffxi_mcp, ffxi_mcp_bin, is_reachable, read_text, McpClient};
 use common::EphemeralChar;
 
 #[tokio::test]
@@ -23,14 +23,15 @@ async fn agent_session_drives_mcp_end_to_end() {
         return;
     }
 
+    // ffxi-mcp is a separate crate, so CARGO_BIN_EXE_ isn't available here;
+    // rebuild it so a stale target/debug/ffxi-mcp is never spawned.
+    build_ffxi_mcp().expect("cargo build -p ffxi-mcp");
     let bin = ffxi_mcp_bin();
-    if !bin.exists() {
-        panic!(
-            "ffxi-mcp binary not found at {}.\n\
-             Build it first: `cargo build -p ffxi-mcp`",
-            bin.display()
-        );
-    }
+    assert!(
+        bin.exists(),
+        "ffxi-mcp binary not found at {} even after `cargo build -p ffxi-mcp`",
+        bin.display()
+    );
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

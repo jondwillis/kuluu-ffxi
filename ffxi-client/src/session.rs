@@ -438,6 +438,38 @@ fn classify_char_npc(
     }
 }
 
+/// Dedup'd warning for sub-packet payloads that fail to decode in
+/// [`handle_sub_packet`]: WARN on the first failure per opcode (per process),
+/// DEBUG thereafter, so a malformed stream cannot spam the log (kuluu-zkuf).
+fn warn_decode_err(opcode: u16, err: impl std::fmt::Display) {
+    if first_decode_err(opcode) {
+        tracing::warn!(
+            opcode = format_args!("{opcode:#06x}"),
+            error = %err,
+            "sub-packet decode failed; packet dropped \
+             (further failures for this opcode logged at DEBUG)"
+        );
+    } else {
+        tracing::debug!(
+            opcode = format_args!("{opcode:#06x}"),
+            error = %err,
+            "sub-packet decode failed; packet dropped"
+        );
+    }
+}
+
+/// True the first time `opcode` is seen (per process) — the dedup gate for
+/// [`warn_decode_err`].
+fn first_decode_err(opcode: u16) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut seen| seen.insert(opcode))
+        .unwrap_or(true)
+}
+
 fn handle_sub_packet(
     sub: &framing::SubPacket<'_>,
     event_tx: &broadcast::Sender<AgentEvent>,
@@ -614,7 +646,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::CHAR_PC || op == s2c::CHAR_NPC => {
-            if let Ok(head) = decode::PosHead::decode(sub.data) {
+            if let Ok(head) =
+                decode::PosHead::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 if decode::PosHead::is_entity_despawn(op, sub.data) {
                     claim_cache.remove(&head.unique_no);
                     let _ = event_tx.send(AgentEvent::EntityRemoved { id: head.unique_no });
@@ -802,7 +836,9 @@ fn handle_sub_packet(
         }
         op if op == s2c::ENTITY_UPDATE1 => match sub.data.first().copied() {
             Some(decode::EntitySetName::SUB_TYPE) => {
-                if let Ok(ent) = decode::EntitySetName::decode(sub.data) {
+                if let Ok(ent) = decode::EntitySetName::decode(sub.data)
+                    .inspect_err(|e| warn_decode_err(sub.opcode, e))
+                {
                     if let Some(name) = ent.name {
                         let _ = event_tx.send(AgentEvent::EntityPatched {
                             id: Some(ent.id),
@@ -816,7 +852,9 @@ fn handle_sub_packet(
                 }
             }
             Some(decode::CharSync::SUB_TYPE) => {
-                if let Ok(sync) = decode::CharSync::decode(sub.data) {
+                if let Ok(sync) = decode::CharSync::decode(sub.data)
+                    .inspect_err(|e| warn_decode_err(sub.opcode, e))
+                {
                     // The 2F bit is meaningful only on the SELF sync
                     // (vendor/server/src/map/packets/char_sync.cpp:61).
                     if sync.id == self_char_id {
@@ -830,7 +868,9 @@ fn handle_sub_packet(
             _ => {}
         },
         op if op == s2c::ENTITY_UPDATE2 => {
-            if let Ok(pet) = decode::PetSync::decode(sub.data) {
+            if let Ok(pet) =
+                decode::PetSync::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 if pet.pet_targid != 0 {
                     let _ = event_tx.send(AgentEvent::EntityPatched {
                         id: None,
@@ -898,7 +938,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::CHAR_STATUS => {
-            if let Ok(cs) = decode::CharStatus::decode(sub.data) {
+            if let Ok(cs) =
+                decode::CharStatus::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 if cs.unique_no == self_char_id {
                     // Self speed lands here, not in CHAR_PC — including bind's 0
                     // (vendor/server/scripts/effects/bind.lua setBaseSpeed(0)).
@@ -921,19 +963,25 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::FISH => {
-            if let Ok(f) = decode::FishPacket::decode(sub.data) {
+            if let Ok(f) =
+                decode::FishPacket::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let _ = event_tx.send(AgentEvent::FishHooked { params: f.into() });
             }
         }
         op if op == s2c::JOB_INFO => {
-            if let Ok(ji) = decode::JobInfo::decode(sub.data) {
+            if let Ok(ji) =
+                decode::JobInfo::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let info = crate::state::JobInfoState::from(ji);
                 mog.job_info = Some(info);
                 let _ = event_tx.send(AgentEvent::JobInfoUpdated { info });
             }
         }
         op if op == s2c::CLISTATUS => {
-            if let Ok(cs) = decode::CliStatus::decode(sub.data) {
+            if let Ok(cs) =
+                decode::CliStatus::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let _ = event_tx.send(AgentEvent::CharStatsUpdated {
                     stats: crate::state::CharStatsRaw {
                         hp_max: cs.hp_max,
@@ -961,7 +1009,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::WPOS || op == s2c::WPOS2 => {
-            if let Ok(fm) = decode::ForcedMove::decode(sub.data) {
+            if let Ok(fm) =
+                decode::ForcedMove::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 if fm.unique_no == self_char_id && fm.mode.carries_position() {
                     *self_pos = Position {
                         pos: Vec3 {
@@ -983,7 +1033,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::WEATHER => {
-            if let Ok(w) = decode::WeatherPacket::decode(sub.data) {
+            if let Ok(w) = decode::WeatherPacket::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let _ = event_tx.send(AgentEvent::WeatherUpdated {
                     weather_number: w.weather_number,
                 });
@@ -999,7 +1051,9 @@ fn handle_sub_packet(
             let _ = event_tx.send(AgentEvent::AbilityRecastsUpdated { recasts });
         }
         op if op == s2c::SCENARIO_ITEM => {
-            if let Ok(ki) = decode::ScenarioItem::decode(sub.data) {
+            if let Ok(ki) = decode::ScenarioItem::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let _ = event_tx.send(AgentEvent::KeyItemsUpdated {
                     table_index: ki.table_index,
                     ids: ki.owned_key_item_ids(),
@@ -1022,7 +1076,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::MESSAGE => {
-            if let Ok(text) = std::str::from_utf8(sub.data) {
+            if let Ok(text) =
+                std::str::from_utf8(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let line = ChatLine {
                     channel: ChatChannel::System,
                     sender: "<server>".into(),
@@ -1038,7 +1094,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::SYSTEMMES => {
-            if let Ok(m) = decode::SystemMessage::decode(sub.data) {
+            if let Ok(m) = decode::SystemMessage::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let line = build_system_message_line(m);
 
                 if m.message_id <= 4 {
@@ -1072,7 +1130,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::GROUP_LIST => {
-            if let Ok((attrs, extra)) = decode::PartyAttrs::decode_group_list(sub.data) {
+            if let Ok((attrs, extra)) = decode::PartyAttrs::decode_group_list(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 if attrs.unique_no == self_char_id {
                     note_mog_transition(attrs.moghouse_flg != 0, was_in_mog_house, event_tx);
                 }
@@ -1082,7 +1142,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::GROUP_ATTR => {
-            if let Ok(attrs) = decode::PartyAttrs::decode_group_attr(sub.data) {
+            if let Ok(attrs) = decode::PartyAttrs::decode_group_attr(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 if attrs.unique_no == self_char_id {
                     note_mog_transition(attrs.moghouse_flg != 0, was_in_mog_house, event_tx);
                 }
@@ -1092,7 +1154,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::ITEM_MAX => {
-            if let Ok(m) = decode::ItemMax::decode(sub.data) {
+            if let Ok(m) =
+                decode::ItemMax::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let summary: Vec<String> = m
                     .capacities
                     .iter()
@@ -1118,14 +1182,18 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::ITEM_SAME => {
-            if let Ok(s) = decode::ItemSame::decode(sub.data) {
+            if let Ok(s) =
+                decode::ItemSame::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 if matches!(s.state, decode::ItemSameState::AllLoaded) {
                     let _ = event_tx.send(AgentEvent::InventoryReady);
                 }
             }
         }
         op if op == s2c::ITEM_NUM => {
-            if let Ok(n) = decode::ItemNum::decode(sub.data) {
+            if let Ok(n) =
+                decode::ItemNum::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let _ = event_tx.send(AgentEvent::ChatLine {
                     line: ChatLine {
                         channel: ChatChannel::Debug,
@@ -1151,7 +1219,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::ITEM_LIST => {
-            if let Ok(l) = decode::ItemList::decode(sub.data) {
+            if let Ok(l) =
+                decode::ItemList::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let _ = event_tx.send(AgentEvent::ChatLine {
                     line: ChatLine {
                         channel: ChatChannel::Debug,
@@ -1179,7 +1249,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::ITEM_ATTR => {
-            if let Ok(a) = decode::ItemAttr::decode(sub.data) {
+            if let Ok(a) =
+                decode::ItemAttr::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let price_tag = if a.price != 0 {
                     format!(" price={}", a.price)
                 } else {
@@ -1214,7 +1286,9 @@ fn handle_sub_packet(
             let _ = event_tx.send(AgentEvent::EquipCleared);
         }
         op if op == s2c::EQUIP_LIST => {
-            if let Ok(e) = decode::EquipList::decode(sub.data) {
+            if let Ok(e) =
+                decode::EquipList::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let _ = event_tx.send(AgentEvent::EquipUpdated {
                     slot: e.equip_slot,
                     container: e.container,
@@ -1223,12 +1297,16 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::MAGIC_DATA => {
-            if let Ok(m) = decode::MagicData::decode(sub.data) {
+            if let Ok(m) =
+                decode::MagicData::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let _ = event_tx.send(AgentEvent::SpellsKnownUpdated { ids: m.known_ids() });
             }
         }
         op if op == s2c::COMMAND_DATA => {
-            if let Ok(c) = decode::CommandData::decode(sub.data) {
+            if let Ok(c) = decode::CommandData::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
                 let _ = event_tx.send(AgentEvent::CommandDataUpdated {
                     weapon_skills: decode::collect_set_bits(c.weapon_skills),
                     job_abilities: decode::collect_set_bits(c.job_abilities),
@@ -2569,7 +2647,13 @@ pub async fn run_event_folder(
     let mut total_dropped: u64 = 0;
     loop {
         match event_rx.recv().await {
-            Ok(event) => state_tx.send_modify(|s| s.apply_event(&event)),
+            // send_if_modified: only signal watch receivers when the event
+            // actually mutated the folded state, so per-frame no-op events
+            // (e.g. identical PositionChanged / EntityUpserted resends) do not
+            // trigger downstream scene rebuilds (kuluu-p09).
+            Ok(event) => {
+                state_tx.send_if_modified(|s| s.apply_event(&event));
+            }
             Err(RecvError::Lagged(n)) => {
                 total_dropped += n;
                 tracing::warn!(
@@ -4162,6 +4246,21 @@ fn apply_zoneline_spawn_fallback(seed: Vec3, fallback: Option<Vec3>) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_err_dedup_is_per_opcode() {
+        // Opcodes chosen well outside the retail range so parallel tests that
+        // exercise real decode paths cannot race on the same entries.
+        assert!(first_decode_err(0xFFFE), "first failure must pass the gate");
+        assert!(
+            !first_decode_err(0xFFFE),
+            "repeat failure for the same opcode must be deduped"
+        );
+        assert!(
+            first_decode_err(0xFFFD),
+            "dedup must be per-opcode, not global"
+        );
+    }
 
     #[test]
     fn origin_seed_with_valid_fallback_is_repaired() {

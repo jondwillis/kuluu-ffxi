@@ -114,6 +114,12 @@ impl Plugin for WeatherPlugin {
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(Update, load_zone_weather.before(WeatherSampleSet));
 
+        // kuluu-f1hk: remember the app's pre-weather backdrop so the fog
+        // horizon painted by apply_zone_weather can be undone when no weather
+        // record is active (weatherless zones, zone lines, volumetric off).
+        app.init_resource::<DefaultClearColor>()
+            .add_systems(PreStartup, capture_default_clear_color);
+
         app.init_resource::<ZoneWeather>().add_systems(
             Update,
             (
@@ -270,6 +276,47 @@ pub fn height_fog_density_texture(images: &mut Assets<Image>) -> Handle<Image> {
     images.add(image)
 }
 
+// kuluu-f1hk: the app's pre-weather backdrop, captured at startup so the
+// fog horizon can be restored instead of leaking a stale zone's color once
+// no weather record is active.
+#[derive(Resource, Clone, Copy)]
+pub struct DefaultClearColor(pub Color);
+
+impl Default for DefaultClearColor {
+    fn default() -> Self {
+        Self(ClearColor::default().0)
+    }
+}
+
+fn capture_default_clear_color(
+    clear_color: Option<Res<ClearColor>>,
+    mut default: ResMut<DefaultClearColor>,
+) {
+    if let Some(clear) = clear_color {
+        default.0 = clear.0;
+    }
+}
+
+// The backdrop is a pure function of the current weather state so it can be
+// written unconditionally every frame (kuluu-f1hk: the old code only wrote it
+// on the with-record path, so the painted horizon leaked across zone lines
+// into weatherless zones).
+//
+// The zone fog color is what the DAT expects at the far plane; using it as
+// the backdrop makes both fog paths (DistanceFog and volumetric) converge to
+// the same horizon. The weather keyframes are already sampled per Vana'diel
+// minute, so no extra time-of-day scaling is applied. With no record
+// (weatherless zone, wasm, mid-zone-line) the startup default is restored.
+pub(crate) fn zone_clear_color(rec: Option<&WeatherRecord>, default: Color) -> Color {
+    match rec {
+        Some(rec) => {
+            let [fr, fg, fb, _] = rec.fog_landscape;
+            Color::srgb(fr, fg, fb)
+        }
+        None => default,
+    }
+}
+
 pub fn apply_zone_weather(
     zone_weather: Res<ZoneWeather>,
     active: Res<crate::weather_fx::ActiveWeatherModifier>,
@@ -287,11 +334,9 @@ pub fn apply_zone_weather(
         With<OperatorCamera>,
     >,
     mut clear_color: ResMut<ClearColor>,
+    default_clear: Res<DefaultClearColor>,
     mut commands: Commands,
 ) {
-    let Some(rec) = zone_weather.current else {
-        return;
-    };
     let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
 
     // Signed hours from the nearer horizon crossing: negative at night,
@@ -301,6 +346,20 @@ pub fn apply_zone_weather(
     let horizon_hours = (sky.hour - 6.0).min(18.0 - sky.hour);
     let daylight = ((horizon_hours + band) / (2.0 * band)).clamp(0.0, 1.0);
     let daylight_smooth = daylight * daylight * (3.0 - 2.0 * daylight);
+
+    // kuluu-f1hk: derive the backdrop every frame — BEFORE the no-record early
+    // return — so crossing a zone line into a weatherless zone restores the
+    // startup default instead of leaking the previous zone's fog horizon.
+    // Guarded write to keep change detection quiet when the color is already
+    // correct.
+    let want_clear = zone_clear_color(zone_weather.current.as_ref(), default_clear.0);
+    if clear_color.0 != want_clear {
+        clear_color.0 = want_clear;
+    }
+
+    let Some(rec) = zone_weather.current else {
+        return;
+    };
 
     if let Some((mut fog, mut fog_tf)) = fog_q.iter_mut().next() {
         // Keep the camera inside the volume in XZ so the ground haze never
@@ -348,11 +407,10 @@ pub fn apply_zone_weather(
     ambient.brightness =
         500.0 * rec.diffuse_mul_landscape.clamp(0.4, 1.5) * active.modifier.ambient_brightness_mul;
 
+    // The matching ClearColor backdrop is written above by the unconditional
+    // zone_clear_color pass (kuluu-f1hk).
     let [fr, fg, fb, _] = rec.fog_landscape;
     let fog_color = Color::srgb(fr, fg, fb);
-    // The zone fog color is what the DAT expects at the far plane; use it as the
-    // clear color so both fog paths converge to the same horizon.
-    clear_color.0 = fog_color;
 
     // DistanceFog is the authoritative DAT distance fog in BOTH modes: it runs
     // in the geometry materials only (the sky dome's custom materials never
@@ -394,5 +452,84 @@ pub fn apply_zone_weather(
                 vol.ambient_intensity = ambient_intensity;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEFAULT: Color = Color::srgb(0.1, 0.2, 0.3);
+
+    fn rec_with_fog(fog_landscape: [f32; 4]) -> WeatherRecord {
+        WeatherRecord {
+            time_minutes: 0,
+            indoors: false,
+            sunlight_diffuse_entity: [0.0; 4],
+            moonlight_diffuse_entity: [0.0; 4],
+            ambient_entity: [0.0; 4],
+            fog_entity: [0.0; 4],
+            max_fog_dist_entity: 0.0,
+            min_fog_dist_entity: 0.0,
+            diffuse_mul_entity: 0.0,
+            sunlight_diffuse_landscape: [0.0; 4],
+            moonlight_diffuse_landscape: [0.0; 4],
+            ambient_landscape: [0.0; 4],
+            fog_landscape,
+            max_fog_dist_landscape: 0.0,
+            min_fog_dist_landscape: 0.0,
+            diffuse_mul_landscape: 0.0,
+            fog_offset: 0.0,
+            max_far_clip: 0.0,
+            skybox_colors: [[0.0; 4]; 8],
+            skybox_altitudes: [0.0; 8],
+        }
+    }
+
+    fn assert_color_close(got: Color, want: Color) {
+        let (g, w) = (got.to_srgba(), want.to_srgba());
+        for (a, b) in [(g.red, w.red), (g.green, w.green), (g.blue, w.blue)] {
+            assert!((a - b).abs() < 1e-5, "got {g:?}, want {w:?}");
+        }
+    }
+
+    #[test]
+    fn volumetric_daytime_paints_daylight_scaled_fog_horizon() {
+        let rec = rec_with_fog([0.5, 0.6, 0.7, 1.0]);
+        let got = zone_clear_color(Some(&rec), true, 1.0, DEFAULT);
+        // lum = 0.03 + 0.97 * 1.0 = 1.0 -> the raw zone fog color.
+        assert_color_close(got, Color::srgb(0.5, 0.6, 0.7));
+    }
+
+    #[test]
+    fn volumetric_night_dims_the_horizon() {
+        let rec = rec_with_fog([0.5, 0.6, 0.7, 1.0]);
+        let got = zone_clear_color(Some(&rec), true, 0.0, DEFAULT);
+        assert_color_close(got, Color::srgb(0.5 * 0.03, 0.6 * 0.03, 0.7 * 0.03));
+    }
+
+    #[test]
+    fn foggy_to_weatherless_transition_restores_default() {
+        // Foggy zone paints a non-default horizon...
+        let rec = rec_with_fog([0.5, 0.6, 0.7, 1.0]);
+        let painted = zone_clear_color(Some(&rec), true, 1.0, DEFAULT);
+        assert_ne!(painted, DEFAULT);
+        // ...then a zone line drops the record: the backdrop must snap back to
+        // the startup default rather than leaking the previous zone's color.
+        assert_eq!(zone_clear_color(None, true, 1.0, DEFAULT), DEFAULT);
+    }
+
+    #[test]
+    fn volumetric_toggle_off_restores_default() {
+        // DistanceFog mode never owned the backdrop, so even with an active
+        // record the default is restored once volumetric fog deactivates.
+        let rec = rec_with_fog([0.5, 0.6, 0.7, 1.0]);
+        assert_eq!(zone_clear_color(Some(&rec), false, 1.0, DEFAULT), DEFAULT);
+    }
+
+    #[test]
+    fn default_clear_color_matches_bevy_stock_until_captured() {
+        assert_eq!(DefaultClearColor::default().0, ClearColor::default().0);
+>>>>>>> worktree-eisenhower-beads
     }
 }

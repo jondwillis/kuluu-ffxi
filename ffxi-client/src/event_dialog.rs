@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use ffxi_dat::dmsg::{plain_marker, StringDat, MARKER_PLAYER_NAME, MARKER_SPEAKER_NAME};
+use ffxi_dat::dmsg::{
+    plain_marker, StringDat, MARKER_NUM, MARKER_PLAYER_NAME, MARKER_SPEAKER_NAME,
+};
 use ffxi_dat::event_dat::EventDat;
 use ffxi_dat::DatRoot;
 use ffxi_event::{DialogRunner, DialogStep};
@@ -110,7 +112,10 @@ impl DialogSession {
         else {
             return undriveable;
         };
-        let Some(mut runner) = DialogRunner::start(block, event_id, act_index) else {
+        // A 0x32 trigger carries no numeric parameters (`num[8]` arrives only
+        // on the 0x33/0x34 triggers), so the VM runs with an empty params
+        // array and any `{Num:N}` markers stay unresolved in the text.
+        let Some(mut runner) = DialogRunner::start(block, event_id, act_index, Vec::new()) else {
             return undriveable;
         };
         let step = runner.advance(None, strings);
@@ -186,7 +191,18 @@ fn frame_to_dialog(
     frame: ffxi_event::DialogFrame,
     player_name: &str,
 ) -> DialogState {
-    let substitute = |text: String| substitute_names(text, player_name, active.npc_name.as_deref());
+    let ffxi_event::DialogFrame {
+        text,
+        choices,
+        params,
+        ..
+    } = frame;
+    let substitute = |text: String| {
+        substitute_nums(
+            substitute_names(text, player_name, active.npc_name.as_deref()),
+            &params,
+        )
+    };
     DialogState {
         event_id: active.agent_event_id,
         npc_id: active.unique_no,
@@ -198,9 +214,9 @@ fn frame_to_dialog(
         event_num2: 0,
         event_para2: 0,
         strings: Vec::new(),
-        nums: Vec::new(),
-        prompt: Some(substitute(frame.text)),
-        choices: frame.choices.into_iter().map(substitute).collect(),
+        nums: params.clone(),
+        prompt: Some(substitute(text)),
+        choices: choices.into_iter().map(substitute).collect(),
     }
 }
 
@@ -215,19 +231,125 @@ fn substitute_names(text: String, player_name: &str, speaker_name: Option<&str>)
     }
 }
 
+/// Resolve the parameterized number markers the dmsg decoder leaves in dialog
+/// text: `{Num:N}` → `params[N]` (the event's numeric parameters). A marker
+/// whose index is out of range is left as-is so the missing parameter stays
+/// visible in fixtures instead of silently printing a wrong value.
+fn substitute_nums(text: String, params: &[i32]) -> String {
+    let open = format!("{{{MARKER_NUM}:");
+    if params.is_empty() || !text.contains(&open) {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find(&open) {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let resolved = rest[open.len()..].find('}').and_then(|end| {
+            let index: usize = rest[open.len()..open.len() + end].parse().ok()?;
+            let value = *params.get(index)?;
+            Some((value, open.len() + end + 1))
+        });
+        match resolved {
+            Some((value, consumed)) => {
+                out.push_str(&value.to_string());
+                rest = &rest[consumed..];
+            }
+            None => {
+                out.push_str(&open);
+                rest = &rest[open.len()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+// The load failures below are logged once per zone: `ensure_zone` only calls
+// these when `loaded_zone` changes, and caches the (None) result (kuluu-zkuf).
+
 fn load_event_dat(root: Option<&DatRoot>, zone: u16) -> Option<EventDat> {
     let root = root?;
-    let loc = ffxi_dat::event_locate::zone_id_to_event_location(zone)?;
-    let bytes = std::fs::read(loc.path_under(root.root())).ok()?;
-    EventDat::parse(&bytes).ok()
+    let Some(loc) = ffxi_dat::event_locate::zone_id_to_event_location(zone) else {
+        tracing::warn!(
+            zone,
+            "no event DAT mapping for zone; NPC dialog disabled for this zone"
+        );
+        return None;
+    };
+    let path = loc.path_under(root.root());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                zone,
+                path = %path.display(),
+                error = %e,
+                "failed to read event DAT; NPC dialog disabled for this zone"
+            );
+            return None;
+        }
+    };
+    match EventDat::parse(&bytes) {
+        Ok(dat) => Some(dat),
+        Err(e) => {
+            tracing::warn!(
+                zone,
+                path = %path.display(),
+                error = %e,
+                "failed to parse event DAT; NPC dialog disabled for this zone"
+            );
+            None
+        }
+    }
 }
 
 fn load_strings(root: Option<&DatRoot>, zone: u16) -> Option<StringDat> {
     let root = root?;
-    let file_id = ffxi_dat::zone_dat::zone_id_to_string_file_id(zone)?;
-    let loc = root.resolve(file_id).ok()?;
-    let bytes = std::fs::read(loc.path_under(root.root())).ok()?;
-    StringDat::parse(&bytes).ok()
+    let Some(file_id) = ffxi_dat::zone_dat::zone_id_to_string_file_id(zone) else {
+        tracing::warn!(
+            zone,
+            "no string DAT mapping for zone; NPC dialog disabled for this zone"
+        );
+        return None;
+    };
+    let loc = match root.resolve(file_id) {
+        Ok(loc) => loc,
+        Err(e) => {
+            tracing::warn!(
+                zone,
+                file_id,
+                error = %e,
+                "failed to resolve string DAT file id; NPC dialog disabled for this zone"
+            );
+            return None;
+        }
+    };
+    let path = loc.path_under(root.root());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                zone,
+                path = %path.display(),
+                error = %e,
+                "failed to read string DAT; NPC dialog disabled for this zone"
+            );
+            return None;
+        }
+    };
+    match StringDat::parse(&bytes) {
+        Ok(dat) => Some(dat),
+        Err(e) => {
+            tracing::warn!(
+                zone,
+                path = %path.display(),
+                error = %e,
+                "failed to parse string DAT; NPC dialog disabled for this zone"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -250,5 +372,41 @@ mod tests {
             substitute_names(text, "Zeid", None),
             "{SpeakerName} greets Zeid."
         );
+    }
+
+    #[test]
+    fn substitutes_num_markers_with_params() {
+        let text = "You need {Num:0} gil (balance {Num:2}).".to_string();
+        assert_eq!(
+            substitute_nums(text, &[500, 7, -3]),
+            "You need 500 gil (balance -3)."
+        );
+    }
+
+    #[test]
+    fn leaves_num_marker_when_param_missing() {
+        let text = "Pay {Num:5} gil.".to_string();
+        assert_eq!(substitute_nums(text, &[500]), "Pay {Num:5} gil.");
+    }
+
+    #[test]
+    fn frame_params_reach_dialog_nums_and_text() {
+        let active = ActiveEvent {
+            unique_no: 0x0102,
+            act_index: 4,
+            event_id: 9,
+            agent_event_id: (0x0102u32 << 16) | 9,
+            npc_name: Some("Trion".to_string()),
+        };
+        let frame = ffxi_event::DialogFrame {
+            speaker_index: 4,
+            text: "{SpeakerName}: {Num:1} gil, {PlayerName}.".to_string(),
+            choices: vec!["Pay {Num:1}.".to_string(), "Decline.".to_string()],
+            params: vec![0, 250],
+        };
+        let dialog = frame_to_dialog(&active, frame, "Zeid");
+        assert_eq!(dialog.nums, vec![0, 250]);
+        assert_eq!(dialog.prompt.as_deref(), Some("Trion: 250 gil, Zeid."));
+        assert_eq!(dialog.choices, vec!["Pay 250.", "Decline."]);
     }
 }

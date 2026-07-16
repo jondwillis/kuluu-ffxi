@@ -3164,6 +3164,7 @@ name = "ffxi-event"
 version = "0.2.0"
 dependencies = [
  "ffxi-dat",
+ "tracing",
 ]
 
 [[package]]

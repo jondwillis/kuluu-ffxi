@@ -181,10 +181,41 @@ impl Default for SortOptions {
 /// by default; the "Select active window" key (`Action::SelectActiveWindow`)
 /// steps focus through the bags and then into the sort-options box so Auto /
 /// Manual become navigable, and NavLeft / NavCancel returns to the list.
-#[derive(Resource, Debug, Clone, Copy, Default)]
-pub struct ItemMenuFocus {
-    pub sort_focused: bool,
-    pub sort_cursor: usize,
+///
+/// The sort cursor only exists while the sort box has focus, and it is always
+/// a valid `SortOptionId` — the invariant lives in this type rather than in a
+/// (bool, usize) pair every caller must keep in sync.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ItemMenuFocus {
+    #[default]
+    List,
+    Sort(SortOptionId),
+}
+
+impl ItemMenuFocus {
+    pub fn sort_focused(&self) -> bool {
+        matches!(self, Self::Sort(_))
+    }
+
+    /// The sort option under the cursor, if the sort box has focus.
+    pub fn sort_selection(&self) -> Option<SortOptionId> {
+        match *self {
+            Self::Sort(id) => Some(id),
+            Self::List => None,
+        }
+    }
+
+    /// Move focus into the sort box with the cursor on `id` (keyboard entry
+    /// lands on the currently active mode; mouse hover lands on the hovered
+    /// row).
+    pub fn enter_sort(&mut self, id: SortOptionId) {
+        *self = Self::Sort(id);
+    }
+
+    /// Return focus to the item list.
+    pub fn exit_sort(&mut self) {
+        *self = Self::List;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,11 +226,75 @@ pub enum SortOptionId {
 
 pub const SORT_OPTIONS: &[SortOptionId] = &[SortOptionId::Auto, SortOptionId::Manual];
 
+impl SortOptions {
+    /// The `SortOptionId` currently in effect.
+    pub fn active(&self) -> SortOptionId {
+        if self.auto {
+            SortOptionId::Auto
+        } else {
+            SortOptionId::Manual
+        }
+    }
+}
+
 /// Apply a sort choice. Auto keeps the list ordered by item id and consolidates
 /// partial stacks (see the ITEM_STACK request); Manual shows raw inventory order
 /// (see `menu::refresh_dynamic_menu_rows`).
 pub fn apply_sort_option(sort: &mut SortOptions, id: SortOptionId) {
     sort.auto = matches!(id, SortOptionId::Auto);
+}
+
+/// A keypress routed to the sort box while it has focus. `Other` is any key
+/// not bound to sort-box navigation; it must still reach [`sort_pane_key`] so
+/// the box swallows it instead of letting it leak into list navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortPaneKey {
+    Up,
+    Down,
+    Confirm,
+    Exit,
+    Other,
+}
+
+/// Handle one keypress while the sort box has focus: Up/Down step the cursor
+/// through [`SORT_OPTIONS`] with wrap-around, Confirm applies the option under
+/// the cursor, and Exit returns focus to the item list. Returns the confirmed
+/// option, if any — the caller sends the server ITEM_STACK request for it.
+/// No-op when the list has focus.
+pub fn sort_pane_key(
+    focus: &mut ItemMenuFocus,
+    sort: &mut SortOptions,
+    key: SortPaneKey,
+) -> Option<SortOptionId> {
+    let ItemMenuFocus::Sort(cursor) = *focus else {
+        return None;
+    };
+    match key {
+        SortPaneKey::Up => {
+            focus.enter_sort(step_sort_option(cursor, -1));
+            None
+        }
+        SortPaneKey::Down => {
+            focus.enter_sort(step_sort_option(cursor, 1));
+            None
+        }
+        SortPaneKey::Confirm => {
+            apply_sort_option(sort, cursor);
+            Some(cursor)
+        }
+        SortPaneKey::Exit => {
+            focus.exit_sort();
+            None
+        }
+        SortPaneKey::Other => None,
+    }
+}
+
+/// Step `delta` rows through [`SORT_OPTIONS`], wrapping at both ends.
+fn step_sort_option(id: SortOptionId, delta: isize) -> SortOptionId {
+    let len = SORT_OPTIONS.len() as isize;
+    let pos = SORT_OPTIONS.iter().position(|&o| o == id).unwrap_or(0) as isize;
+    SORT_OPTIONS[(pos + delta).rem_euclid(len) as usize]
 }
 
 /// Emitted when the user activates a sort option, so the client sends the
@@ -327,5 +422,104 @@ mod tests {
         assert!(!s.auto);
         apply_sort_option(&mut s, SortOptionId::Auto);
         assert!(s.auto);
+    }
+
+    #[test]
+    fn focus_defaults_to_list() {
+        let focus = ItemMenuFocus::default();
+        assert!(!focus.sort_focused());
+        assert_eq!(focus.sort_selection(), None);
+    }
+
+    #[test]
+    fn focus_enter_and_exit_sort() {
+        let mut focus = ItemMenuFocus::default();
+        focus.enter_sort(SortOptionId::Manual);
+        assert!(focus.sort_focused());
+        assert_eq!(focus.sort_selection(), Some(SortOptionId::Manual));
+        focus.exit_sort();
+        assert!(!focus.sort_focused());
+        assert_eq!(focus.sort_selection(), None);
+    }
+
+    #[test]
+    fn sort_pane_up_down_wrap_through_options() {
+        let mut focus = ItemMenuFocus::Sort(SortOptionId::Auto);
+        let mut sort = SortOptions::default();
+        // Up from the first row wraps to the last.
+        assert_eq!(sort_pane_key(&mut focus, &mut sort, SortPaneKey::Up), None);
+        assert_eq!(focus.sort_selection(), Some(SortOptionId::Manual));
+        // Down from the last row wraps back to the first.
+        assert_eq!(
+            sort_pane_key(&mut focus, &mut sort, SortPaneKey::Down),
+            None
+        );
+        assert_eq!(focus.sort_selection(), Some(SortOptionId::Auto));
+        assert_eq!(
+            sort_pane_key(&mut focus, &mut sort, SortPaneKey::Down),
+            None
+        );
+        assert_eq!(focus.sort_selection(), Some(SortOptionId::Manual));
+        // Navigation alone never touches the applied mode.
+        assert!(sort.auto);
+    }
+
+    #[test]
+    fn sort_pane_confirm_applies_and_reports_choice() {
+        let mut focus = ItemMenuFocus::Sort(SortOptionId::Manual);
+        let mut sort = SortOptions::default();
+        assert_eq!(
+            sort_pane_key(&mut focus, &mut sort, SortPaneKey::Confirm),
+            Some(SortOptionId::Manual)
+        );
+        assert!(!sort.auto);
+        // Confirm keeps the sort box focused, matching retail.
+        assert_eq!(focus.sort_selection(), Some(SortOptionId::Manual));
+    }
+
+    #[test]
+    fn sort_pane_exit_returns_focus_to_list() {
+        let mut focus = ItemMenuFocus::Sort(SortOptionId::Auto);
+        let mut sort = SortOptions::default();
+        assert_eq!(
+            sort_pane_key(&mut focus, &mut sort, SortPaneKey::Exit),
+            None
+        );
+        assert!(!focus.sort_focused());
+    }
+
+    #[test]
+    fn sort_pane_swallows_unbound_keys() {
+        let mut focus = ItemMenuFocus::Sort(SortOptionId::Auto);
+        let mut sort = SortOptions::default();
+        assert_eq!(
+            sort_pane_key(&mut focus, &mut sort, SortPaneKey::Other),
+            None
+        );
+        assert_eq!(focus, ItemMenuFocus::Sort(SortOptionId::Auto));
+        assert!(sort.auto);
+    }
+
+    #[test]
+    fn sort_pane_is_noop_while_list_focused() {
+        let mut focus = ItemMenuFocus::List;
+        let mut sort = SortOptions::default();
+        for key in [
+            SortPaneKey::Up,
+            SortPaneKey::Down,
+            SortPaneKey::Confirm,
+            SortPaneKey::Exit,
+            SortPaneKey::Other,
+        ] {
+            assert_eq!(sort_pane_key(&mut focus, &mut sort, key), None);
+            assert_eq!(focus, ItemMenuFocus::List);
+            assert!(sort.auto);
+        }
+    }
+
+    #[test]
+    fn sort_options_active_mirrors_auto_flag() {
+        assert_eq!(SortOptions { auto: true }.active(), SortOptionId::Auto);
+        assert_eq!(SortOptions { auto: false }.active(), SortOptionId::Manual);
     }
 }

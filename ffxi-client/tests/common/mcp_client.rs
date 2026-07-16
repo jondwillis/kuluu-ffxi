@@ -12,6 +12,27 @@ use tokio::{
     time::timeout,
 };
 
+/// Rebuild ffxi-mcp before spawning it. ffxi-mcp is a separate crate, so
+/// `CARGO_BIN_EXE_*` is not populated for ffxi-client's tests; without this a
+/// stale `target/debug/ffxi-mcp` (e.g. an old xiloader version string) is
+/// silently spawned and rejected by the current LSB.
+pub fn build_ffxi_mcp() -> Result<()> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| env!("CARGO").to_string());
+    let mut cmd = std::process::Command::new(cargo);
+    cmd.args(["build", "-p", "ffxi-mcp"]);
+    if !cfg!(debug_assertions) {
+        cmd.arg("--release");
+    }
+    let status = cmd
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .context("running `cargo build -p ffxi-mcp`")?;
+    if !status.success() {
+        return Err(anyhow!("`cargo build -p ffxi-mcp` failed: {status}"));
+    }
+    Ok(())
+}
+
 pub fn ffxi_mcp_bin() -> PathBuf {
     let mut p = std::env::current_exe().expect("test current_exe");
     p.pop();

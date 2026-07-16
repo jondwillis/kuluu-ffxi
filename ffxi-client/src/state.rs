@@ -40,7 +40,7 @@ pub struct Vec3 {
     pub z: f32,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Position {
     pub pos: Vec3,
 
@@ -142,7 +142,7 @@ fn merge_kind(existing: EntityKind, incoming: EntityKind) -> EntityKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entity {
     pub id: u32,
 
@@ -231,7 +231,7 @@ impl ChatChannel {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Diagnostics {
     pub stage: Option<Stage>,
     pub blowfish_status: Option<BlowfishStatus>,
@@ -560,7 +560,7 @@ pub struct NameExtractionMiss {
 
 const NAME_MISSES_CAP: usize = 64;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartyMember {
     pub id: u32,
     pub act_index: u16,
@@ -612,7 +612,11 @@ impl SessionState {
             })
     }
 
-    pub fn apply_event(&mut self, event: &AgentEvent) {
+    /// Folds `event` into the state, returning `true` only when the state
+    /// actually mutated. Paired with `watch::Sender::send_if_modified` in the
+    /// session loop so the watch channel only signals real changes and
+    /// downstream consumers (NativeSource scene rebuilds) skip no-op events.
+    pub fn apply_event(&mut self, event: &AgentEvent) -> bool {
         match event {
             AgentEvent::Connected {
                 account_id,
@@ -624,10 +628,13 @@ impl SessionState {
                 self.char_id = Some(*char_id);
                 self.character = Some(character.clone());
                 self.zone_id = Some(*zone_id);
+                true
             }
             AgentEvent::StageChanged { stage } => {
+                let changed = self.stage != *stage || self.diagnostics.stage != Some(*stage);
                 self.stage = *stage;
                 self.diagnostics.stage = Some(*stage);
+                changed
             }
             AgentEvent::ZoneChanged {
                 to,
@@ -647,19 +654,28 @@ impl SessionState {
                 self.party.clear();
 
                 self.current_weather = None;
+                true
             }
             AgentEvent::PositionChanged { pos } => {
+                let mut changed = false;
                 if let Some(char_id) = self.char_id {
                     if let Some(ent) = self.entities.iter_mut().find(|e| e.id == char_id) {
+                        changed = ent.pos != pos.pos
+                            || ent.heading != pos.heading
+                            || ent.speed != pos.speed
+                            || ent.speed_base != pos.speed_base;
                         ent.pos = pos.pos;
                         ent.heading = pos.heading;
                         ent.speed = pos.speed;
                         ent.speed_base = pos.speed_base;
                     }
                 }
+                changed
             }
             AgentEvent::CharStatsUpdated { stats } => {
+                let changed = self.char_stats != Some(*stats);
                 self.char_stats = Some(*stats);
+                changed
             }
             AgentEvent::EntityUpserted {
                 entity,
@@ -697,7 +713,7 @@ impl SessionState {
                             existing.face_target,
                         )
                     };
-                    *existing = Entity {
+                    let merged = Entity {
                         name: preserved_name,
                         kind: merged_kind,
                         hp_pct: preserved_hp_pct,
@@ -710,18 +726,28 @@ impl SessionState {
                         face_target: preserved_face_target,
                         ..entity.clone()
                     };
+                    if *existing == merged {
+                        false
+                    } else {
+                        *existing = merged;
+                        true
+                    }
                 } else {
                     self.entities.push(entity.clone());
+                    true
                 }
             }
             AgentEvent::EntityRemoved { id } => {
+                let before = self.entities.len();
                 self.entities.retain(|e| e.id != *id);
+                self.entities.len() != before
             }
             AgentEvent::NameExtractionMiss { miss } => {
                 self.name_misses.push_back(miss.clone());
                 while self.name_misses.len() > NAME_MISSES_CAP {
                     self.name_misses.pop_front();
                 }
+                true
             }
             AgentEvent::EntityPatched {
                 id,
@@ -734,17 +760,29 @@ impl SessionState {
                     id.is_some_and(|target| e.id == target)
                         || act_index.is_some_and(|target| e.act_index == target)
                 });
+                let mut changed = false;
                 if let Some(existing) = existing {
                     if let Some(n) = name {
-                        existing.name = Some(n.clone());
+                        if existing.name.as_deref() != Some(n.as_str()) {
+                            existing.name = Some(n.clone());
+                            changed = true;
+                        }
                     }
                     if let Some(k) = kind {
-                        existing.kind = merge_kind(existing.kind, *k);
+                        let merged = merge_kind(existing.kind, *k);
+                        if existing.kind != merged {
+                            existing.kind = merged;
+                            changed = true;
+                        }
                     }
                     if let Some(hp) = hp_pct {
-                        existing.hp_pct = Some(*hp);
+                        if existing.hp_pct != Some(*hp) {
+                            existing.hp_pct = Some(*hp);
+                            changed = true;
+                        }
                     }
                 }
+                changed
             }
             AgentEvent::ChatLine { line } => {
                 self.chat.push(line.clone());
@@ -752,30 +790,44 @@ impl SessionState {
                     let drop = self.chat.len() - CHAT_HISTORY_CAP;
                     self.chat.drain(0..drop);
                 }
+                true
             }
             AgentEvent::LogoutCountdown {
                 seconds_remaining,
                 shutdown,
             } => {
-                self.logout_countdown = Some(LogoutCountdown {
+                let next = LogoutCountdown {
                     seconds_remaining: *seconds_remaining,
                     shutdown: *shutdown,
-                });
+                };
+                let changed = self.logout_countdown != Some(next);
+                self.logout_countdown = Some(next);
+                changed
             }
             AgentEvent::Diagnostics { diagnostics } => {
+                let changed = self.diagnostics != *diagnostics;
                 self.diagnostics = diagnostics.clone();
+                changed
             }
             AgentEvent::NetStats { stats } => {
+                let changed = self.net_stats != *stats;
                 self.net_stats = *stats;
+                changed
             }
             AgentEvent::SetFps { max } => {
+                let changed = self.target_fps != *max;
                 self.target_fps = *max;
+                changed
             }
             AgentEvent::Disconnected { .. } => {
+                let changed = self.stage != Stage::Disconnected
+                    || self.diagnostics.stage != Some(Stage::Disconnected)
+                    || self.logout_countdown.is_some();
                 self.stage = Stage::Disconnected;
                 self.diagnostics.stage = Some(Stage::Disconnected);
 
                 self.logout_countdown = None;
+                changed
             }
 
             AgentEvent::Error { message } => {
@@ -789,6 +841,7 @@ impl SessionState {
                     let drop = self.chat.len() - CHAT_HISTORY_CAP;
                     self.chat.drain(0..drop);
                 }
+                true
             }
             AgentEvent::PartyMemberUpdated { member } => {
                 if let Some(existing) = self.party.iter_mut().find(|m| m.id == member.id) {
@@ -807,14 +860,21 @@ impl SessionState {
                     } else {
                         member.is_alliance_leader
                     };
-                    *existing = PartyMember {
+                    let merged = PartyMember {
                         name: preserved_name,
                         is_party_leader: preserved_leader,
                         is_alliance_leader: preserved_alliance,
                         ..member.clone()
                     };
+                    if *existing == merged {
+                        false
+                    } else {
+                        *existing = merged;
+                        true
+                    }
                 } else {
                     self.party.push(member.clone());
+                    true
                 }
             }
             AgentEvent::Reconnected { downtime_ms } => {
@@ -826,21 +886,29 @@ impl SessionState {
                     downtime_ms: *downtime_ms,
                     at_unix_ms,
                 });
+                true
             }
             AgentEvent::ReactorGoalChanged { goal } => {
+                let changed = self.current_goal.as_ref() != Some(goal);
                 self.current_goal = Some(goal.clone());
+                changed
             }
             AgentEvent::InventoryReady => {
+                let changed = !self.inventory.all_loaded;
                 self.inventory.all_loaded = true;
+                changed
             }
 
             AgentEvent::ForcedMove { target, .. } => {
+                let mut changed = false;
                 if let Some(char_id) = self.char_id {
                     if let Some(ent) = self.entities.iter_mut().find(|e| e.id == char_id) {
+                        changed = ent.pos != target.pos || ent.heading != target.heading;
                         ent.pos = target.pos;
                         ent.heading = target.heading;
                     }
                 }
+                changed
             }
             AgentEvent::LowHp { .. }
             | AgentEvent::PartyMemberLowHp { .. }
@@ -854,7 +922,7 @@ impl SessionState {
             | AgentEvent::MusicVolumeChanged { .. }
             | AgentEvent::LevelUp { .. }
             | AgentEvent::SkillLevelUp { .. }
-            | AgentEvent::VanaTimeSynced { .. } => {}
+            | AgentEvent::VanaTimeSynced { .. } => false,
             AgentEvent::InventoryUpdated { container, update } => {
                 let entry = self.inventory.containers.entry(*container).or_default();
                 match update {
@@ -897,40 +965,54 @@ impl SessionState {
                         }
                     }
                 }
+                true
             }
             AgentEvent::EquipUpdated {
                 slot,
                 container,
                 container_index,
             } => {
+                let mut changed = false;
                 if let Some(cell) = self.equipment.get_mut(*slot as usize) {
                     // The server reports an empty/unequipped slot as inventory
                     // index 0 (charutils.cpp:2268 queueEquipChange(LOC_INVENTORY,
                     // 0, ...)). Index 0 is reserved (Gil in LOC_INVENTORY) and is
                     // never a real equipped item, so treat it as cleared — else
                     // resolve_equipment joins it to Gil.
-                    *cell = (*container_index != 0).then_some(EquippedRef {
+                    let next = (*container_index != 0).then_some(EquippedRef {
                         container: *container,
                         container_index: *container_index,
                     });
+                    changed = *cell != next;
+                    *cell = next;
                 }
+                changed
             }
             AgentEvent::EquipCleared => {
+                let changed = self.equipment.iter().any(|c| c.is_some());
                 self.equipment = [None; EQUIPMENT_SLOTS];
+                changed
             }
             AgentEvent::SpellsKnownUpdated { ids } => {
+                let changed = self.spells_known != *ids;
                 self.spells_known = ids.clone();
+                changed
             }
             AgentEvent::CommandDataUpdated {
                 weapon_skills,
                 job_abilities,
                 pet_abilities,
             } => {
+                let changed = self.weaponskills_known != *weapon_skills
+                    || self.job_abilities_known != *job_abilities
+                    || self.pet_abilities_known != *pet_abilities;
                 self.weaponskills_known = weapon_skills.clone();
                 self.job_abilities_known = job_abilities.clone();
                 self.pet_abilities_known = pet_abilities.clone();
+                changed
             }
             AgentEvent::KeyItemsUpdated { table_index, ids } => {
+                let before = self.key_items.clone();
                 let base = *table_index as usize * KEY_ITEMS_PER_TABLE;
                 let table_range = base..base + KEY_ITEMS_PER_TABLE;
                 self.key_items
@@ -938,14 +1020,19 @@ impl SessionState {
                 self.key_items.extend(ids.iter().copied());
                 self.key_items.sort_unstable();
                 self.key_items.dedup();
+                self.key_items != before
             }
 
-            AgentEvent::EventStart { .. } | AgentEvent::KeyRotated { .. } => {}
+            AgentEvent::EventStart { .. } | AgentEvent::KeyRotated { .. } => false,
             AgentEvent::EventDialog { dialog } => {
+                let changed = self.dialog.as_ref() != Some(dialog);
                 self.dialog = Some(dialog.clone());
+                changed
             }
             AgentEvent::ShopUpdated { shop } => {
+                let changed = self.shop.as_ref() != Some(shop);
                 self.shop = Some(shop.clone());
+                changed
             }
             AgentEvent::ShopSellAppraisal {
                 price,
@@ -965,37 +1052,52 @@ impl SessionState {
                     let drop = self.chat.len() - CHAT_HISTORY_CAP;
                     self.chat.drain(0..drop);
                 }
+                true
             }
             AgentEvent::StatusIconsUpdated { icons, expiries } => {
+                let changed = self.status_icons != *icons || self.status_icon_expiries != *expiries;
                 self.status_icons = icons.clone();
                 self.status_icon_expiries = expiries.clone();
+                changed
             }
             AgentEvent::AbilityRecastsUpdated { recasts } => {
+                let changed = self.ability_recasts != *recasts;
                 self.ability_recasts = recasts.clone();
+                changed
             }
             AgentEvent::JobInfoUpdated { info } => {
+                let changed = self.job_info != Some(*info);
                 self.job_info = Some(*info);
+                changed
             }
             AgentEvent::MogHouse2fUnlockUpdated { unlocked } => {
+                let changed = self.mh_2f_unlocked != Some(*unlocked);
                 self.mh_2f_unlocked = Some(*unlocked);
+                changed
             }
             AgentEvent::DeathTimerUpdated {
                 seconds_until_homepoint,
             } => {
+                let changed = self.death_homepoint_secs != *seconds_until_homepoint;
                 self.death_homepoint_secs = *seconds_until_homepoint;
+                changed
             }
             AgentEvent::WeatherUpdated { weather_number } => {
+                let changed = self.current_weather != Some(*weather_number);
                 self.current_weather = Some(*weather_number);
+                changed
             }
             AgentEvent::EventEnded => {
+                let changed = self.dialog.is_some() || self.shop.is_some();
                 self.dialog = None;
 
                 self.shop = None;
+                changed
             }
             // Machine inputs (consumed by the reactor, not the rendered projection).
             AgentEvent::FishingCast { .. }
             | AgentEvent::FishingServerPhase { .. }
-            | AgentEvent::FishingEnded => {}
+            | AgentEvent::FishingEnded => false,
             AgentEvent::FishHooked { params } => {
                 let f = self.self_fishing.get_or_insert(SelfFishing {
                     phase: 1,
@@ -1003,11 +1105,14 @@ impl SessionState {
                     fish_hp: 0,
                     arrow: None,
                 });
+                let changed = f.fish != Some(*params) || f.fish_hp != params.stamina;
                 f.fish = Some(*params);
                 f.fish_hp = params.stamina;
+                changed
             }
             AgentEvent::FishingPhaseChanged { phase } => match phase {
                 Some(p) => {
+                    let changed = self.self_fishing.map(|f| f.phase) != Some(*p);
                     self.self_fishing
                         .get_or_insert(SelfFishing {
                             phase: *p,
@@ -1016,14 +1121,22 @@ impl SessionState {
                             arrow: None,
                         })
                         .phase = *p;
+                    changed
                 }
-                None => self.self_fishing = None,
+                None => {
+                    let changed = self.self_fishing.is_some();
+                    self.self_fishing = None;
+                    changed
+                }
             },
             AgentEvent::FishingProgress { fish_hp, arrow } => {
+                let mut changed = false;
                 if let Some(f) = self.self_fishing.as_mut() {
+                    changed = f.fish_hp != *fish_hp || f.arrow != *arrow;
                     f.fish_hp = *fish_hp;
                     f.arrow = *arrow;
                 }
+                changed
             }
         }
     }
@@ -2879,5 +2992,124 @@ mod tests {
         assert_eq!(s.chat.len(), CHAT_HISTORY_CAP);
 
         assert_eq!(s.chat[0].text, "msg 50");
+    }
+
+    #[test]
+    fn apply_event_reports_real_mutations_only() {
+        let mut s = SessionState::default();
+
+        // Machine-input / notification-only events never mutate folded state.
+        assert!(!s.apply_event(&AgentEvent::HumanReleased));
+        assert!(!s.apply_event(&AgentEvent::FishingEnded));
+
+        // Scalar fields: first fold mutates, identical resend is a no-op.
+        assert!(s.apply_event(&AgentEvent::WeatherUpdated { weather_number: 6 }));
+        assert!(!s.apply_event(&AgentEvent::WeatherUpdated { weather_number: 6 }));
+        assert!(s.apply_event(&AgentEvent::WeatherUpdated { weather_number: 7 }));
+
+        assert!(s.apply_event(&AgentEvent::StageChanged {
+            stage: Stage::Authenticating,
+        }));
+        assert!(!s.apply_event(&AgentEvent::StageChanged {
+            stage: Stage::Authenticating,
+        }));
+    }
+
+    #[test]
+    fn apply_event_dedupes_identical_entity_upserts() {
+        let mut s = SessionState::default();
+        let entity = Entity {
+            id: 999,
+            act_index: 1,
+            kind: EntityKind::Pc,
+            name: Some("Other".into()),
+            pos: Vec3 {
+                x: 1.0,
+                y: 0.0,
+                z: 2.0,
+            },
+            heading: 64,
+            hp_pct: Some(80),
+            bt_target_id: 0,
+            face_target: 0,
+            claim_id: 0,
+            speed: 0,
+            speed_base: 0,
+            look: None,
+            npc_state: None,
+            status: 0,
+        };
+
+        // First upsert inserts.
+        assert!(s.apply_event(&AgentEvent::EntityUpserted {
+            entity: entity.clone(),
+            pos_present: true,
+        }));
+        // Byte-identical resend folds to a no-op.
+        assert!(!s.apply_event(&AgentEvent::EntityUpserted {
+            entity: entity.clone(),
+            pos_present: true,
+        }));
+        // A real change signals again.
+        assert!(s.apply_event(&AgentEvent::EntityUpserted {
+            entity: Entity {
+                heading: 32,
+                ..entity
+            },
+            pos_present: true,
+        }));
+
+        // Removing a missing entity is a no-op; removing a present one is not.
+        assert!(!s.apply_event(&AgentEvent::EntityRemoved { id: 1234 }));
+        assert!(s.apply_event(&AgentEvent::EntityRemoved { id: 999 }));
+    }
+
+    #[test]
+    fn apply_event_dedupes_identical_self_position() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::Connected {
+            account_id: 1,
+            char_id: 7,
+            character: "Tester".into(),
+            zone_id: 100,
+        });
+
+        let pos = Position {
+            pos: Vec3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            heading: 10,
+            speed: 40,
+            speed_base: 40,
+        };
+        // No self entity folded yet: position update touches nothing.
+        assert!(!s.apply_event(&AgentEvent::PositionChanged { pos }));
+
+        s.apply_event(&AgentEvent::EntityUpserted {
+            entity: Entity {
+                id: 7,
+                act_index: 1,
+                kind: EntityKind::Pc,
+                name: Some("Tester".into()),
+                pos: Vec3::default(),
+                heading: 0,
+                hp_pct: Some(100),
+                bt_target_id: 0,
+                face_target: 0,
+                claim_id: 0,
+                speed: 40,
+                speed_base: 40,
+                look: None,
+                npc_state: None,
+                status: 0,
+            },
+            pos_present: true,
+        });
+
+        // First real move mutates; the identical resend does not.
+        assert!(s.apply_event(&AgentEvent::PositionChanged { pos }));
+        assert!(!s.apply_event(&AgentEvent::PositionChanged { pos }));
     }
 }
