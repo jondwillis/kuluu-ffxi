@@ -80,3 +80,7 @@ profile.json.gz
 # Verification evidence marker (stop.d/25-verify.sh gate) — per-machine,
 # ephemeral by design: stale the moment gated source is edited after it.
 .verify/
+
+# Retail-client captures (retail-observe skill) — SE-copyrighted, reference
+# only, NEVER commit. Same rationale as vendor/game-files/ above.
+/artifacts/retail/
