@@ -253,6 +253,33 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     }
     app.add_plugins(plugin_group);
 
+    // Bevy 0.19's GPU-driven mesh preprocessing is a large regression on Apple integrated GPUs
+    // (measured 2026-07: 12.8fps GPU path vs 34.3fps CPU path in the same scene; the GPU-path
+    // cost is resolution-independent — prp 53ms / rgraph 43ms stall on swapchain acquire and
+    // submit). Default to the CPU mesh-batching path (Bevy 0.18-style) on macOS;
+    // FFXI_GPU_PREPROCESS=1 opts back in. Two prongs are required to force the CPU path:
+    // (1) insert before dependent plugins' finish() bake their CPU-vs-GPU choice
+    //     (vendor/bevy_pbr render/mesh.rs reads it in finish), and
+    // (2) re-assert in RenderStartup because bevy_render's BatchingPlugin re-creates the
+    //     resource there via init_gpu_resource.
+    if cfg!(target_os = "macos") && std::env::var_os("FFXI_GPU_PREPROCESS").is_none() {
+        use bevy::render::batching::gpu_preprocessing::{
+            GpuPreprocessingMode, GpuPreprocessingSupport,
+        };
+        if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+            render_app.insert_resource(GpuPreprocessingSupport {
+                max_supported_mode: GpuPreprocessingMode::None,
+            });
+            render_app.add_systems(
+                bevy::render::RenderStartup,
+                (|mut support: bevy::prelude::ResMut<GpuPreprocessingSupport>| {
+                    support.max_supported_mode = GpuPreprocessingMode::None;
+                })
+                .after(bevy::render::init_gpu_resource::<GpuPreprocessingSupport>),
+            );
+        }
+    }
+
     if std::env::var_os("FFXI_GPU_TIMING").is_some() {
         if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
             render_app.add_systems(bevy::render::ExtractSchedule, log_pipeline_compiles);
