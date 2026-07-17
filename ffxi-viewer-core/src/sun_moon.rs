@@ -134,6 +134,37 @@ pub struct MoonTransitionState {
     pub prev_phase_bucket: Option<u8>,
     pub prev_illumination: Option<f32>,
     pub prev_disc_shown: Option<bool>,
+    // Perf: last-written celestial outputs. Unconditional per-frame writes to
+    // DirectionalLight/Transform and Assets::get_mut fire change detection /
+    // AssetEvent::Modified every frame; under vendored bevy 0.19's retained
+    // render world that re-specializes and re-prepares bins (incl. every
+    // shadow cascade view) each frame. Celestial motion is slow, so skip the
+    // writes until the target moves beyond a small epsilon. Asset ids are
+    // cached so a zone-reload material swap invalidates the cache.
+    pub sun_light_written: Option<(Vec3, f32, Vec3)>,
+    pub moon_light_written: Option<(Vec3, f32, Vec3)>,
+    pub moon_sphere_written: Option<(AssetId<StandardMaterial>, Vec3)>,
+    pub sun_disc_written: Option<(
+        AssetId<StandardMaterial>,
+        Vec3,
+        Vec4,
+        Option<AssetId<Image>>,
+    )>,
+    pub moon_disc_written: Option<(
+        AssetId<crate::moon_material::MoonMaterial>,
+        Vec4,
+        Vec4,
+        Option<Vec4>,
+    )>,
+}
+
+// ~half an 8-bit color step; light direction moves ~1.8e-3 rad/s of real time,
+// so 1e-4 turns per-frame writes into a few writes per second.
+const CELESTIAL_COLOR_EPS: f32 = 1.0 / 512.0;
+const CELESTIAL_DIR_EPS: f32 = 1e-4;
+
+fn celestial_scalar_changed(prev: f32, next: f32) -> bool {
+    (prev - next).abs() > prev.abs().max(1.0) * 1e-3
 }
 
 pub fn spawn_sun_and_moon(
@@ -457,6 +488,11 @@ pub fn sun_moon_system(
         prev_phase_bucket,
         prev_illumination,
         prev_disc_shown,
+        sun_light_written,
+        moon_light_written,
+        moon_sphere_written,
+        sun_disc_written,
+        moon_disc_written,
     } = &mut *transition_state;
     *sky = vana_sky_from_clock(&vana_clock);
 
@@ -530,10 +566,21 @@ pub fn sun_moon_system(
     // iter_mut over single_mut throughout: the InGame OnExit bulk-despawn can race
     // setup_world and leave duplicate/orphaned sun/moon entities; single_mut() then
     // returns Err and silently stops updating light, position and visibility.
-    for (mut light, mut xf) in q_sun.iter_mut() {
-        light.color = sun_color;
-        light.illuminance = sun_lux;
-        *xf = Transform::from_translation(sun_pos).looking_at(Vec3::ZERO, Vec3::Y);
+    let sun_rgb_lin = {
+        let c = sun_color.to_linear();
+        Vec3::new(c.red, c.green, c.blue)
+    };
+    if sun_light_written.map_or(true, |(rgb, lux, dir)| {
+        rgb.distance(sun_rgb_lin) > CELESTIAL_COLOR_EPS
+            || celestial_scalar_changed(lux, sun_lux)
+            || dir.distance(sun_dir) > CELESTIAL_DIR_EPS
+    }) {
+        for (mut light, mut xf) in q_sun.iter_mut() {
+            light.color = sun_color;
+            light.illuminance = sun_lux;
+            *xf = Transform::from_translation(sun_pos).looking_at(Vec3::ZERO, Vec3::Y);
+        }
+        *sun_light_written = Some((sun_rgb_lin, sun_lux, sun_dir));
     }
 
     let moon_dir = if sky_realism.physical_moon_orbit {
@@ -558,10 +605,21 @@ pub fn sun_moon_system(
         Some(_) => (Color::BLACK, 0.0),
         None => moon_color_for_phase(sky.moon_illumination, sky.moon_altitude),
     };
-    for (mut light, mut xf) in q_moon.iter_mut() {
-        light.color = moon_color;
-        light.illuminance = moon_lux;
-        *xf = Transform::from_translation(moon_pos).looking_at(Vec3::ZERO, Vec3::Y);
+    let moon_rgb_lin = {
+        let c = moon_color.to_linear();
+        Vec3::new(c.red, c.green, c.blue)
+    };
+    if moon_light_written.map_or(true, |(rgb, lux, dir)| {
+        rgb.distance(moon_rgb_lin) > CELESTIAL_COLOR_EPS
+            || celestial_scalar_changed(lux, moon_lux)
+            || dir.distance(moon_dir) > CELESTIAL_DIR_EPS
+    }) {
+        for (mut light, mut xf) in q_moon.iter_mut() {
+            light.color = moon_color;
+            light.illuminance = moon_lux;
+            *xf = Transform::from_translation(moon_pos).looking_at(Vec3::ZERO, Vec3::Y);
+        }
+        *moon_light_written = Some((moon_rgb_lin, moon_lux, moon_dir));
     }
 
     // Publish the entity(model) + landscape(terrain) split for the actor- and
@@ -715,20 +773,37 @@ pub fn sun_moon_system(
         };
     }
 
-    if let Some(handle) = moon_sphere_handle.as_deref() {
-        if let Some(mut mat) = materials.get_mut(&handle.0) {
-            let earth_since = (vana_clock.earth_unix_now()
-                - crate::hud::vana_clock::EARTH_EPOCH_UNIX as f64)
-                .max(0.0);
-            let total_v_days = (earth_since * 25.0 / 86400.0) as u64;
-            let t = celestial_moon_tint(&render_cfg.color_tables, total_v_days, sky.moon_phase);
+    // Perf A/B diagnostic: unconditional per-frame get_mut() on these two
+    // StandardMaterials fires AssetEvent::Modified every frame (std churn in
+    // the perf HUD). Set FFXI_FREEZE_CELESTIAL_MAT=1 to skip the writes.
+    let freeze_celestial_mat = std::env::var_os("FFXI_FREEZE_CELESTIAL_MAT").is_some();
 
-            mat.base_color = Color::linear_rgb(t[0] * 0.20, t[1] * 0.20, t[2] * 0.22);
+    if let Some(handle) = moon_sphere_handle
+        .as_deref()
+        .filter(|_| !freeze_celestial_mat)
+    {
+        let earth_since = (vana_clock.earth_unix_now()
+            - crate::hud::vana_clock::EARTH_EPOCH_UNIX as f64)
+            .max(0.0);
+        let total_v_days = (earth_since * 25.0 / 86400.0) as u64;
+        let t = celestial_moon_tint(&render_cfg.color_tables, total_v_days, sky.moon_phase);
+        let rgb = Vec3::new(t[0] * 0.20, t[1] * 0.20, t[2] * 0.22);
+        let id = handle.0.id();
+        if moon_sphere_written.map_or(true, |(prev_id, prev)| {
+            prev_id != id || prev.distance(rgb) > CELESTIAL_COLOR_EPS
+        }) {
+            if let Some(mut mat) = materials.get_mut(&handle.0) {
+                mat.base_color = Color::linear_rgb(rgb.x, rgb.y, rgb.z);
+                *moon_sphere_written = Some((id, rgb));
+            }
         }
     }
 
-    if let Some(handles) = materials_handle.as_deref() {
-        if let Some(mut sun_mat) = materials.get_mut(&handles.sun) {
+    if let Some(handles) = materials_handle
+        .as_deref()
+        .filter(|_| !freeze_celestial_mat)
+    {
+        {
             let visible = sky.sun_altitude.max(-0.2);
 
             let elev_norm = (visible / (PI / 2.0)).clamp(0.0, 1.0);
@@ -743,30 +818,43 @@ pub fn sun_moon_system(
             }
             let intensity = intensity.min(SUN_DISC_MAX_INTENSITY);
             let c = sun_color.to_linear();
-            sun_mat.base_color = Color::linear_rgb(
+            let rgb = Vec3::new(
                 c.red * intensity,
                 c.green * intensity * 0.95,
                 c.blue * intensity * 0.75,
             );
-            // With a retail "suns" sprite the disc renders as an additive textured
-            // billboard; without one it stays the untextured emissive sphere.
-            if sun_sprite_tex.is_some() {
-                if sun_mat.base_color_texture != sun_sprite_tex {
-                    sun_mat.base_color_texture = sun_sprite_tex.clone();
+            let frame = render_cfg.sun_sprite.frame_uv;
+            let sprite_id = sun_sprite_tex.as_ref().map(|h| h.id());
+            let id = handles.sun.id();
+            if sun_disc_written.map_or(true, |(prev_id, prev_rgb, prev_frame, prev_tex)| {
+                prev_id != id
+                    || prev_rgb.distance(rgb) > CELESTIAL_COLOR_EPS * rgb.length().max(1.0)
+                    || prev_frame != frame
+                    || prev_tex != sprite_id
+            }) {
+                if let Some(mut sun_mat) = materials.get_mut(&handles.sun) {
+                    sun_mat.base_color = Color::linear_rgb(rgb.x, rgb.y, rgb.z);
+                    // With a retail "suns" sprite the disc renders as an additive textured
+                    // billboard; without one it stays the untextured emissive sphere.
+                    if sun_sprite_tex.is_some() {
+                        if sun_mat.base_color_texture != sun_sprite_tex {
+                            sun_mat.base_color_texture = sun_sprite_tex.clone();
+                        }
+                        sun_mat.uv_transform = bevy::math::Affine2::from_scale_angle_translation(
+                            Vec2::new(frame.z - frame.x, frame.w - frame.y),
+                            0.0,
+                            Vec2::new(frame.x, frame.y),
+                        );
+                        sun_mat.alpha_mode = AlphaMode::Add;
+                    } else if sun_mat.base_color_texture.is_some() {
+                        sun_mat.base_color_texture = None;
+                        sun_mat.alpha_mode = AlphaMode::Opaque;
+                    }
+                    *sun_disc_written = Some((id, rgb, frame, sprite_id));
                 }
-                let f = render_cfg.sun_sprite.frame_uv;
-                sun_mat.uv_transform = bevy::math::Affine2::from_scale_angle_translation(
-                    Vec2::new(f.z - f.x, f.w - f.y),
-                    0.0,
-                    Vec2::new(f.x, f.y),
-                );
-                sun_mat.alpha_mode = AlphaMode::Add;
-            } else if sun_mat.base_color_texture.is_some() {
-                sun_mat.base_color_texture = None;
-                sun_mat.alpha_mode = AlphaMode::Opaque;
             }
         }
-        if let Some(mut moon_mat) = moon_materials.get_mut(&handles.moon) {
+        {
             let visibility = sky.moon_illumination.clamp(0.0, 1.0);
 
             let mut intensity = if sky.moon_altitude > 0.0 {
@@ -805,20 +893,34 @@ pub fn sun_moon_system(
                 0.0
             };
 
-            let mode = match render_cfg.moon_sprite.0 {
-                Some(frames) => {
-                    moon_mat.data.frame_uv = frames[moon_phase_frame(sky.moon_phase)];
-                    2.0
-                }
-                None => 0.0,
-            };
-            moon_mat.data.tint = Vec4::new(tint[0], tint[1], tint[2], mode);
-            moon_mat.data.params = Vec4::new(
+            let frame_uv = render_cfg
+                .moon_sprite
+                .0
+                .map(|frames| frames[moon_phase_frame(sky.moon_phase)]);
+            let mode = if frame_uv.is_some() { 2.0 } else { 0.0 };
+            let tint_v = Vec4::new(tint[0], tint[1], tint[2], mode);
+            let params_v = Vec4::new(
                 sky.moon_illumination,
                 if sky.moon_waxing { 1.0 } else { -1.0 },
                 intensity,
                 earthshine,
             );
+            let id = handles.moon.id();
+            if moon_disc_written.map_or(true, |(prev_id, prev_tint, prev_params, prev_frame)| {
+                prev_id != id
+                    || prev_tint.distance(tint_v) > CELESTIAL_COLOR_EPS
+                    || prev_params.distance(params_v) > 1e-3
+                    || prev_frame != frame_uv
+            }) {
+                if let Some(mut moon_mat) = moon_materials.get_mut(&handles.moon) {
+                    if let Some(f) = frame_uv {
+                        moon_mat.data.frame_uv = f;
+                    }
+                    moon_mat.data.tint = tint_v;
+                    moon_mat.data.params = params_v;
+                    *moon_disc_written = Some((id, tint_v, params_v, frame_uv));
+                }
+            }
         }
     }
 
