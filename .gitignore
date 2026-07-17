@@ -84,3 +84,4 @@ profile.json.gz
 # Retail-client captures (retail-observe skill) — SE-copyrighted, reference
 # only, NEVER commit. Same rationale as vendor/game-files/ above.
 /artifacts/retail/
+artifacts/

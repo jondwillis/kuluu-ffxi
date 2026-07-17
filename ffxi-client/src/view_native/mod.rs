@@ -146,6 +146,13 @@ fn gpu_timing_render_plugin() -> bevy::render::RenderPlugin {
     let mut settings = WgpuSettings::default();
     settings.features |=
         WgpuFeatures::TIMESTAMP_QUERY | WgpuFeatures::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    // Pass-level GPU spans (main_opaque_pass_3d etc.) require INSIDE_PASSES;
+    // bevy_render's recorder silently skips them otherwise. Apple GPUs may not
+    // expose this (no at-draw-boundary counter sampling) — requesting it on an
+    // adapter that lacks it aborts device creation, so keep it opt-in.
+    if std::env::var_os("FFXI_GPU_TIMING_PASSES").is_some() {
+        settings.features |= WgpuFeatures::TIMESTAMP_QUERY_INSIDE_PASSES;
+    }
     bevy::render::RenderPlugin {
         render_creation: RenderCreation::Automatic(Box::new(settings)),
         ..default()
@@ -244,10 +251,14 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         plugins = plugins.set(gpu_timing_render_plugin());
     }
     let mut plugin_group = plugins.build().disable::<LogPlugin>();
-    // Pipelined rendering (Bevy's macOS default) is disabled here by default; FFXI_PIPELINED_RENDER
-    // opts back in so CPU/GPU overlap can hide the serial present/GPU stalls that surface as
-    // render-bound frame spikes. Opt-in until proven safe against the native-window main-thread path.
-    if std::env::var_os("FFXI_PIPELINED_RENDER").is_none() {
+    // Pipelined rendering (Bevy's macOS default) overlaps the render sub-app with the next
+    // frame's main-world update. The render sub-app's rprep+rgraph is ~21ms here (rgraph alone
+    // ~16ms of CPU command-encode/submit that is resolution- and vsync-independent — not
+    // fill-bound); serially that caps the frame near 38fps. Measured 2026-07 in Bastok Mines:
+    // enabling pipelining restores a stable 60fps (native res, vsync on), vs ~38fps serial.
+    // Rendering is correct across zone-in/steady-state/exit. Kept default-on;
+    // FFXI_NO_PIPELINED_RENDER disables it to bisect any main-thread-path issue that surfaces.
+    if std::env::var_os("FFXI_NO_PIPELINED_RENDER").is_some() {
         plugin_group =
             plugin_group.disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>();
     }
