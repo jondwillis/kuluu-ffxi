@@ -1305,13 +1305,18 @@ fn spawn_mzb_overlay(
     let submeshes: &[MzbSubMesh] = geom.submeshes.as_slice();
     let instances: &[MzbInstance] = geom.instances.as_slice();
     if submeshes.is_empty() || instances.is_empty() {
+        let err_detail = match &geom.mmb_spawns {
+            Err(msg) => format!(" — load error: {msg}"),
+            Ok(_) => String::new(),
+        };
         push_system_msg(
             toasts,
             format!(
-                "/load_mzb {}: 0 renderable meshes ({} submeshes, {} instances)",
+                "/load_mzb {}: 0 renderable meshes ({} submeshes, {} instances){}",
                 req.file_id,
                 submeshes.len(),
                 instances.len(),
+                err_detail,
             ),
         );
         return;
