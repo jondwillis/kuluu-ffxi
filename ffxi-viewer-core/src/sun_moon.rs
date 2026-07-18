@@ -570,7 +570,7 @@ pub fn sun_moon_system(
         let c = sun_color.to_linear();
         Vec3::new(c.red, c.green, c.blue)
     };
-    if sun_light_written.map_or(true, |(rgb, lux, dir)| {
+    if sun_light_written.is_none_or(|(rgb, lux, dir)| {
         rgb.distance(sun_rgb_lin) > CELESTIAL_COLOR_EPS
             || celestial_scalar_changed(lux, sun_lux)
             || dir.distance(sun_dir) > CELESTIAL_DIR_EPS
@@ -609,7 +609,7 @@ pub fn sun_moon_system(
         let c = moon_color.to_linear();
         Vec3::new(c.red, c.green, c.blue)
     };
-    if moon_light_written.map_or(true, |(rgb, lux, dir)| {
+    if moon_light_written.is_none_or(|(rgb, lux, dir)| {
         rgb.distance(moon_rgb_lin) > CELESTIAL_COLOR_EPS
             || celestial_scalar_changed(lux, moon_lux)
             || dir.distance(moon_dir) > CELESTIAL_DIR_EPS
@@ -789,9 +789,9 @@ pub fn sun_moon_system(
         let t = celestial_moon_tint(&render_cfg.color_tables, total_v_days, sky.moon_phase);
         let rgb = Vec3::new(t[0] * 0.20, t[1] * 0.20, t[2] * 0.22);
         let id = handle.0.id();
-        if moon_sphere_written.map_or(true, |(prev_id, prev)| {
-            prev_id != id || prev.distance(rgb) > CELESTIAL_COLOR_EPS
-        }) {
+        if moon_sphere_written
+            .is_none_or(|(prev_id, prev)| prev_id != id || prev.distance(rgb) > CELESTIAL_COLOR_EPS)
+        {
             if let Some(mut mat) = materials.get_mut(&handle.0) {
                 mat.base_color = Color::linear_rgb(rgb.x, rgb.y, rgb.z);
                 *moon_sphere_written = Some((id, rgb));
@@ -826,7 +826,7 @@ pub fn sun_moon_system(
             let frame = render_cfg.sun_sprite.frame_uv;
             let sprite_id = sun_sprite_tex.as_ref().map(|h| h.id());
             let id = handles.sun.id();
-            if sun_disc_written.map_or(true, |(prev_id, prev_rgb, prev_frame, prev_tex)| {
+            if sun_disc_written.is_none_or(|(prev_id, prev_rgb, prev_frame, prev_tex)| {
                 prev_id != id
                     || prev_rgb.distance(rgb) > CELESTIAL_COLOR_EPS * rgb.length().max(1.0)
                     || prev_frame != frame
@@ -906,7 +906,7 @@ pub fn sun_moon_system(
                 earthshine,
             );
             let id = handles.moon.id();
-            if moon_disc_written.map_or(true, |(prev_id, prev_tint, prev_params, prev_frame)| {
+            if moon_disc_written.is_none_or(|(prev_id, prev_tint, prev_params, prev_frame)| {
                 prev_id != id
                     || prev_tint.distance(tint_v) > CELESTIAL_COLOR_EPS
                     || prev_params.distance(params_v) > 1e-3

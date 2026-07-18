@@ -6,10 +6,9 @@ use anyhow::{Context, Result};
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{
-        Annotated, CallToolResult, Content, ListResourcesResult, PaginatedRequestParams,
-        ProtocolVersion, RawResource, ReadResourceRequestParams, ReadResourceResult, Resource,
-        ResourceContents, ResourceUpdatedNotificationParam, ResourcesCapability,
-        ServerCapabilities, ServerInfo, SubscribeRequestParams, ToolsCapability,
+        CallToolResult, ContentBlock, ListResourcesResult, PaginatedRequestParams, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
+        ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
         UnsubscribeRequestParams,
     },
     service::{serve_server, Peer, RequestContext, RoleServer},
@@ -186,7 +185,7 @@ impl FfxiServer {
         let kind = cmd_kind_label(&cmd);
         let started = std::time::Instant::now();
         let result = match self.cmd_tx.send(cmd).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text("ok")])),
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text("ok")])),
             Err(_) => Err(McpError::internal_error(
                 "session command channel closed",
                 None,
@@ -487,7 +486,7 @@ impl FfxiServer {
                 "waited_ms": waited_ms,
             }),
         };
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             body.to_string(),
         )]))
     }
@@ -507,19 +506,18 @@ impl FfxiServer {
             .map_err(|e| McpError::internal_error(e, None))?;
         let elapsed_us = started.elapsed().as_micros() as u64;
         tracing::debug!(uri, elapsed_us, "mcp.tool_read_resource");
-        Ok(CallToolResult::success(vec![Content::text(content)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(content)]))
     }
 }
 
 #[tool_handler]
 impl ServerHandler for FfxiServer {
     fn get_info(&self) -> ServerInfo {
-        let mut caps = ServerCapabilities::default();
-        caps.tools = Some(ToolsCapability { list_changed: None });
-        caps.resources = Some(ResourcesCapability {
-            subscribe: Some(true),
-            list_changed: None,
-        });
+        let caps = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_resources_subscribe()
+            .build();
 
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::V_2025_11_25;
@@ -542,13 +540,9 @@ impl ServerHandler for FfxiServer {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
         let mk = |uri: &str, name: &str, mime: &str, desc: &str| -> Resource {
-            let raw = RawResource::new(uri, name)
+            Resource::new(uri, name)
                 .with_description(desc)
-                .with_mime_type(mime);
-            Annotated {
-                raw,
-                annotations: None,
-            }
+                .with_mime_type(mime)
         };
         let result = ListResourcesResult {
             resources: vec![
@@ -815,6 +809,8 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::LevelUp { .. } => "level_up",
         AgentEvent::SkillLevelUp { .. } => "skill_level_up",
         AgentEvent::ActionStarted { .. } => "action_started",
+        AgentEvent::EntityEmoted { .. } => "entity_emoted",
+        AgentEvent::EmoteListUpdated { .. } => "emote_list_updated",
         AgentEvent::VanaTimeSynced { .. } => "vana_time_synced",
         AgentEvent::KeyItemsUpdated { .. } => "key_items_updated",
         AgentEvent::CharStatsUpdated { .. } => "char_stats_updated",
@@ -827,6 +823,7 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::JobInfoUpdated { .. } => "job_info_updated",
         AgentEvent::MogHouse2fUnlockUpdated { .. } => "mog_house_2f_unlock_updated",
         AgentEvent::ShopSellAppraisal { .. } => "shop_sell_appraisal",
+        AgentEvent::DeliveryBoxUpdated { .. } => "delivery_box_updated",
     }
 }
 
@@ -838,6 +835,8 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         Chat { .. } => "chat",
         Tell { .. } => "tell",
         Action { .. } => "action",
+        Emote { .. } => "emote",
+        RequestEmoteList => "request_emote_list",
         EndEvent => "end_event",
         EndEventChoice { .. } => "end_event_choice",
         Snapshot => "snapshot",
@@ -850,6 +849,7 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         MogHouseExit { .. } => "mog_house_exit",
         ChangeJob { .. } => "change_job",
         OpenMogMenu => "open_mog_menu",
+        MarkKeyItemsSeen { .. } => "mark_key_items_seen",
         UseItem { .. } => "use_item",
         Equip { .. } => "equip",
         StackInventory { .. } => "stack_inventory",
@@ -866,6 +866,7 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         FishingRequest { .. } => "fishing_request",
         ShopSellReq { .. } => "shop_sell_req",
         ShopSellConfirm => "shop_sell_confirm",
+        DeliveryBox { .. } => "delivery_box",
     }
 }
 
@@ -892,7 +893,7 @@ async fn run_notifier(peer: Peer<RoleServer>, mut event_rx: broadcast::Receiver<
         match event_rx.recv().await {
             Ok(ev) => {
                 for uri in uris_for_event(&ev) {
-                    let params = ResourceUpdatedNotificationParam { uri: (*uri).into() };
+                    let params = ResourceUpdatedNotificationParam::new(*uri);
                     let send_result = peer.notify_resource_updated(params).await;
                     if let Err(e) = send_result {
                         tracing::warn!(error = %e, uri = uri, "notify_resource_updated failed");
@@ -1516,8 +1517,8 @@ mod tests {
         });
         let _ = event_tx.send(AgentEvent::LowHp { pct: 17 });
         let result = handle.await.unwrap().unwrap();
-        let text = match result.content.first().unwrap().raw {
-            rmcp::model::RawContent::Text(ref t) => t.text.clone(),
+        let text = match result.content.first().unwrap() {
+            ContentBlock::Text(t) => t.text.clone(),
             _ => panic!("expected text content"),
         };
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -1541,8 +1542,8 @@ mod tests {
             }))
             .await
             .unwrap();
-        let text = match result.content.first().unwrap().raw {
-            rmcp::model::RawContent::Text(ref t) => t.text.clone(),
+        let text = match result.content.first().unwrap() {
+            ContentBlock::Text(t) => t.text.clone(),
             _ => panic!("expected text content"),
         };
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
