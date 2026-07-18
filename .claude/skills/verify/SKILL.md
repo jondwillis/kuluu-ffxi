@@ -141,3 +141,7 @@ Verification runs (headless captures, GUI drives, retail comparisons) should run
 - `model: "sonnet"` (sonnet-5): judgment passes — driving the client through menus, comparing local output against retail references, deciding pass/fail per criterion.
 - Main agent receives only verdicts + evidence paths (artifacts/verify/...), not raw screenshot streams.
 - Give subagents the exact scripts (`scripts/`, `references/drive-headless.md`, `references/drive-gui.md`) and the specific criteria to check; they should not improvise scope.
+
+## Autonomy
+
+Run verification start-to-finish without pausing to ask "what next?": gather evidence, record the verdict, then tear down (kill launched processes, log out of GUI/retail sessions) as the default end state. Scope limits still apply — actions beyond the documented verification scope, or destructive actions outside the session's own artifacts, still need explicit approval.

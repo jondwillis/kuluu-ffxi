@@ -246,3 +246,7 @@ Observation loops are screenshot-heavy and burn main-agent context. Delegate the
 - The main agent should only receive the subagent's *findings* (text + paths to the few decisive screenshots), never the full capture stream.
 - Subagent prompts must include: window/scale info (`capture` prints it), the "divide px coords by scale for click" rule, key codes (36=Enter, up/down arrows), and hard limits on what game actions are allowed (which items/menus may be touched).
 - In-game actions that consume items or charges must be explicitly listed in the subagent prompt as allowed; anything else is read-only observation.
+
+## Autonomy
+
+Once the mission's observations are captured, wrap up without pausing to ask "what next?": close menus and log out to the title screen as the default end state. The scope boundaries above still apply — anything that consumes items/charges or otherwise exceeds the mission's stated scope still requires explicit approval before acting.
