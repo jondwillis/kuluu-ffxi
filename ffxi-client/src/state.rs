@@ -393,6 +393,9 @@ pub struct SessionState {
     /// (vendor/server/src/map/packets/char_sync.cpp:61); `None` until one lands.
     #[serde(default)]
     pub mh_2f_unlocked: Option<bool>,
+
+    #[serde(default)]
+    pub delivery_box: DeliveryBoxState,
 }
 
 pub const EQUIPMENT_SLOTS: usize = 16;
@@ -493,6 +496,133 @@ pub enum InventoryUpdate {
         index: u8,
         quantity: u32,
         locked: bool,
+    },
+}
+
+/// GP_CLI_COMMAND_PBX_BOXNO (vendor/server/src/map/packets/c2s/0x04d_pbx.h:45).
+/// Incoming = the inbox ("Delivery Box"), Outgoing = the send box ("Deliveries").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryBoxNo {
+    Incoming,
+    Outgoing,
+}
+
+impl DeliveryBoxNo {
+    pub fn wire(self) -> i8 {
+        match self {
+            DeliveryBoxNo::Incoming => ffxi_proto::map::pbx::boxno::INCOMING,
+            DeliveryBoxNo::Outgoing => ffxi_proto::map::pbx::boxno::OUTGOING,
+        }
+    }
+
+    pub fn from_wire(v: i8) -> Option<Self> {
+        match v {
+            v if v == ffxi_proto::map::pbx::boxno::INCOMING => Some(DeliveryBoxNo::Incoming),
+            v if v == ffxi_proto::map::pbx::boxno::OUTGOING => Some(DeliveryBoxNo::Outgoing),
+            _ => None,
+        }
+    }
+}
+
+/// One c2s 0x04D PBX request, named 1:1 after GP_CLI_COMMAND_PBX_COMMAND
+/// (vendor/server/src/map/packets/c2s/0x04d_pbx.h). Fields carry only what
+/// LSB's PacketValidator lets vary per command; everything else is fixed by
+/// the encoder ([`crate::session::build_subpacket_pbx`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum DeliveryBoxOp {
+    /// List a box's slots; the server replies with 8 per-slot Work results.
+    Work { box_no: DeliveryBoxNo },
+    /// Stage `quantity` of the LOC_INVENTORY item at `inventory_slot` into
+    /// outbox slot `slot`, addressed to `recipient`.
+    Set {
+        slot: u8,
+        inventory_slot: u8,
+        quantity: u32,
+        recipient: String,
+    },
+    /// Dispatch the staged item in outbox slot `slot`.
+    Send { slot: u8 },
+    /// Cancel the dispatched (not yet received) item in outbox slot `slot`.
+    Cancel { slot: u8 },
+    /// Ask for the new/delivered item count (answered in ResParam2/3).
+    Check { box_no: DeliveryBoxNo },
+    /// Move the oldest queued incoming item into inbox slot `slot`.
+    Recv { slot: u8 },
+    /// Remove the oldest delivered item from the outbox.
+    Confirm,
+    /// Select an inbox slot before removal (server echoes the item; retail
+    /// sends this ahead of Get). LSB pins its BoxNo to Incoming.
+    Accept { slot: u8 },
+    /// Return the incoming item in inbox slot `slot` to its sender.
+    Reject { slot: u8 },
+    /// Take the item in `slot` into LOC_INVENTORY.
+    Get { box_no: DeliveryBoxNo, slot: u8 },
+    /// Delete the incoming item in inbox slot `slot` without taking it.
+    Clear { box_no: DeliveryBoxNo, slot: u8 },
+    /// Verify `recipient` names an existing character before staging.
+    Query { recipient: String },
+    /// Enter delivery (send) mode — opens the outbox server-side.
+    DeliOpen,
+    /// Enter post (receive) mode — opens the inbox server-side.
+    PostOpen,
+    /// Exit delivery/post mode.
+    PostClose { box_no: DeliveryBoxNo },
+}
+
+/// An item occupying a delivery box slot. `counterpart` is the sender
+/// (Incoming) or recipient (Outgoing); `stat` is the raw GP_POST_BOX_STATE
+/// Stat byte (see ffxi_proto::map::pbx::stat).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryItem {
+    pub item_no: u16,
+    pub quantity: u32,
+    pub counterpart: Option<String>,
+    pub stat: u32,
+}
+
+impl DeliveryItem {
+    pub fn sent(&self) -> bool {
+        self.stat == ffxi_proto::map::pbx::stat::SENT
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryBoxState {
+    /// Which box the server currently has open for us, if any.
+    pub open: Option<DeliveryBoxNo>,
+    pub slots: Vec<Option<DeliveryItem>>,
+    /// Last Check answer: items still queued beyond the 8 visible slots.
+    pub queued: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeliveryBoxUpdate {
+    Opened,
+    Closed,
+    SlotChanged {
+        slot: u8,
+        item: Option<DeliveryItem>,
+    },
+    /// Check result: new items queued (Incoming) or delivered (Outgoing).
+    PendingCount {
+        count: u8,
+    },
+    /// Query result. `ok` = the name resolved to an account (a nonexistent
+    /// name answers Result 0xFB instead); `same_account` mirrors LSB's
+    /// ResParam1, which is 1 only when the recipient shares the sender's
+    /// account (dboxutils.cpp ConfirmNameBeforeSending) — NOT an existence
+    /// flag.
+    RecipientCheck {
+        ok: bool,
+        same_account: bool,
+    },
+    /// A non-OK Result byte (see ffxi_proto::map::pbx::result).
+    Failed {
+        command: u8,
+        result: u8,
     },
 }
 
@@ -967,6 +1097,36 @@ impl SessionState {
                 }
                 true
             }
+            AgentEvent::DeliveryBoxUpdated { box_no, update } => {
+                let dbox = &mut self.delivery_box;
+                match update {
+                    DeliveryBoxUpdate::Opened => {
+                        *dbox = DeliveryBoxState {
+                            open: Some(*box_no),
+                            slots: vec![None; ffxi_proto::map::pbx::SLOT_COUNT],
+                            queued: 0,
+                        };
+                    }
+                    DeliveryBoxUpdate::Closed => {
+                        *dbox = DeliveryBoxState::default();
+                    }
+                    DeliveryBoxUpdate::SlotChanged { slot, item } => {
+                        if dbox.slots.len() < ffxi_proto::map::pbx::SLOT_COUNT {
+                            dbox.slots.resize(ffxi_proto::map::pbx::SLOT_COUNT, None);
+                        }
+                        if let Some(cell) = dbox.slots.get_mut(*slot as usize) {
+                            *cell = item.clone();
+                        }
+                    }
+                    DeliveryBoxUpdate::PendingCount { count } => {
+                        dbox.queued = *count;
+                    }
+                    DeliveryBoxUpdate::RecipientCheck { .. } | DeliveryBoxUpdate::Failed { .. } => {
+                        return false
+                    }
+                }
+                true
+            }
             AgentEvent::EquipUpdated {
                 slot,
                 container,
@@ -1321,6 +1481,11 @@ pub enum AgentEvent {
 
     InventoryReady,
 
+    DeliveryBoxUpdated {
+        box_no: DeliveryBoxNo,
+        update: DeliveryBoxUpdate,
+    },
+
     EquipUpdated {
         slot: u8,
         container: u8,
@@ -1522,6 +1687,14 @@ pub enum AgentCommand {
     /// (LOC_INVENTORY = 0). See GP_CLI_COMMAND_ITEM_STACK (0x03A).
     StackInventory {
         container: u8,
+    },
+
+    /// One delivery box request (c2s 0x04D PBX). The session auto-sequences
+    /// the retail flows (open → Work → Check → Recv/Confirm) on the server's
+    /// 0x04B replies; explicit ops here are for agents driving it directly.
+    DeliveryBox {
+        #[serde(flatten)]
+        op: DeliveryBoxOp,
     },
 
     /// Move `quantity` of the item at `from_container`/`from_slot` into
@@ -2102,6 +2275,51 @@ mod tests {
             }
             _ => panic!("wrong variant: {cmd:?}"),
         }
+    }
+
+    /// The flattened op tag keeps delivery box commands one-level JSON for
+    /// headless agents: {"cmd":"delivery_box","op":"set",...}.
+    #[test]
+    fn delivery_box_command_roundtrip() {
+        let line = r#"{"cmd":"delivery_box","op":"set","slot":0,"inventory_slot":11,"quantity":1,"recipient":"Atti"}"#;
+        let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+        match &cmd {
+            AgentCommand::DeliveryBox {
+                op:
+                    DeliveryBoxOp::Set {
+                        slot,
+                        inventory_slot,
+                        quantity,
+                        recipient,
+                    },
+            } => {
+                assert_eq!((*slot, *inventory_slot, *quantity), (0, 11, 1));
+                assert_eq!(recipient, "Atti");
+            }
+            _ => panic!("wrong variant: {cmd:?}"),
+        }
+        let back = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(serde_json::from_str::<AgentCommand>(&back).unwrap(), cmd);
+
+        let line = r#"{"cmd":"delivery_box","op":"post_open"}"#;
+        let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+        assert!(matches!(
+            cmd,
+            AgentCommand::DeliveryBox {
+                op: DeliveryBoxOp::PostOpen
+            }
+        ));
+
+        let line = r#"{"cmd":"delivery_box","op":"check","box_no":"incoming"}"#;
+        let cmd: AgentCommand = serde_json::from_str(line).unwrap();
+        assert!(matches!(
+            cmd,
+            AgentCommand::DeliveryBox {
+                op: DeliveryBoxOp::Check {
+                    box_no: DeliveryBoxNo::Incoming
+                }
+            }
+        ));
     }
 
     #[test]

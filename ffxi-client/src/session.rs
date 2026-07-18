@@ -1537,6 +1537,8 @@ async fn keepalive_loop(
 
     let mut local_menu = crate::local_menu::LocalMenuSession::new();
 
+    let mut dbox = crate::delivery_box::DeliveryBoxSession::default();
+
     let mut is_healing = false;
 
     let mut last_keepalive_pos: Vec3 = self_pos.pos;
@@ -1674,6 +1676,20 @@ async fn keepalive_loop(
                                             server_ts: 0,
                                         },
                                     });
+                                }
+                                crate::local_menu::Advance::DeliveryOpen { box_no } => {
+                                    let _ = event_tx.send(AgentEvent::EventEnded);
+                                    let op = dbox.request_open(box_no, true);
+                                    send_pbx(map, &op, &mut sub_seq, server_last_seq, &event_tx).await;
+                                }
+                                crate::local_menu::Advance::DeliveryTake { box_no: _, slot } => {
+                                    let _ = event_tx.send(AgentEvent::EventEnded);
+                                    let op = dbox.request_take(slot);
+                                    send_pbx(map, &op, &mut sub_seq, server_last_seq, &event_tx).await;
+                                }
+                                crate::local_menu::Advance::Delivery { op } => {
+                                    let _ = event_tx.send(AgentEvent::EventEnded);
+                                    send_pbx(map, &op, &mut sub_seq, server_last_seq, &event_tx).await;
                                 }
                                 crate::local_menu::Advance::Close => {
                                     let _ = event_tx.send(AgentEvent::EventEnded);
@@ -2025,6 +2041,20 @@ async fn keepalive_loop(
                                 });
                             }
                         }
+                    }
+                    Some(AgentCommand::DeliveryBox { op }) => {
+                        // Track menu_driven=false so agent-driven flows don't
+                        // re-render dialog menus on settle.
+                        match op {
+                            crate::state::DeliveryBoxOp::PostOpen => {
+                                dbox.request_open(crate::state::DeliveryBoxNo::Incoming, false);
+                            }
+                            crate::state::DeliveryBoxOp::DeliOpen => {
+                                dbox.request_open(crate::state::DeliveryBoxNo::Outgoing, false);
+                            }
+                            _ => {}
+                        }
+                        send_pbx(map, &op, &mut sub_seq, server_last_seq, &event_tx).await;
                     }
                     Some(AgentCommand::MoveItem {
                         quantity,
@@ -2457,6 +2487,52 @@ async fn keepalive_loop(
                                     let dialog = local_menu
                                         .open_mog_menu(mog.job_info, mog.container_caps.as_ref().map(|c| c.as_slice()));
                                     let _ = event_tx.send(AgentEvent::EventDialog { dialog });
+                                }
+                                continue;
+                            }
+
+                            if sub.opcode == ffxi_proto::map::s2c::PBX_RESULT {
+                                match decode::PbxResult::decode(sub.data) {
+                                    Ok(r) => {
+                                        let out = dbox.on_result(&r);
+                                        for (box_no, update) in out.updates {
+                                            let _ = event_tx.send(
+                                                AgentEvent::DeliveryBoxUpdated { box_no, update },
+                                            );
+                                        }
+                                        for text in out.notices {
+                                            let _ = event_tx.send(AgentEvent::ChatLine {
+                                                line: ChatLine {
+                                                    channel: ChatChannel::System,
+                                                    sender: "<client>".into(),
+                                                    text: format!("[delivery] {text}"),
+                                                    server_ts: 0,
+                                                },
+                                            });
+                                        }
+                                        for op in &out.sends {
+                                            send_pbx(
+                                                map,
+                                                op,
+                                                &mut sub_seq,
+                                                server_last_seq,
+                                                &event_tx,
+                                            )
+                                            .await;
+                                        }
+                                        if out.settled && dbox.menu_driven() {
+                                            let dialog = match dbox.open() {
+                                                Some(box_no) => local_menu
+                                                    .open_delivery_box(box_no, dbox.slots()),
+                                                None => local_menu.open_delivery_submenu(),
+                                            };
+                                            let _ = event_tx
+                                                .send(AgentEvent::EventDialog { dialog });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = ?e, "could not decode 0x04B PBX_RESULT");
+                                    }
                                 }
                                 continue;
                             }
@@ -3867,6 +3943,83 @@ pub fn build_subpacket_item_move(
     buf[10] = from_slot;
     buf[11] = to_slot.unwrap_or(ITEM_MOVE_AUTO_SLOT);
     buf
+}
+
+// GP_CLI_COMMAND_PBX, vendor/server/src/map/packets/c2s/0x04d_pbx.h: Command u8
+// @4, BoxNo i8 @5, PostWorkNo i8 @6, ItemWorkNo i8 @7, ItemStacks i32 @8,
+// Result/ResParam1-3 i8 @12-15 (the validator requires all four zero c2s),
+// TargetName[16] @16 — 32 bytes (size_words = 8). Per-command field defaults
+// mirror the LSB PacketValidator (0x04d_pbx.cpp validate): unused numeric
+// fields are -1; Recv's ItemWorkNo must be 1; Set/Send/Cancel are pinned to the
+// Outgoing box, Recv/Accept/Reject to Incoming, Query/Confirm/*Open/Close to
+// BoxNo None.
+pub fn build_subpacket_pbx(sync: u16, op: &crate::state::DeliveryBoxOp) -> Vec<u8> {
+    use crate::state::DeliveryBoxOp as Op;
+    use ffxi_proto::map::pbx::{boxno, command};
+    type Fields<'a> = (u8, i8, i8, i8, i32, Option<&'a str>);
+    let (cmd, box_no, post_work_no, item_work_no, item_stacks, name): Fields = match op {
+        Op::Work { box_no } => (command::WORK, box_no.wire(), -1, -1, -1, None),
+        Op::Set {
+            slot,
+            inventory_slot,
+            quantity,
+            recipient,
+        } => (
+            command::SET,
+            boxno::OUTGOING,
+            *slot as i8,
+            *inventory_slot as i8,
+            *quantity as i32,
+            Some(recipient),
+        ),
+        Op::Send { slot } => (command::SEND, boxno::OUTGOING, *slot as i8, -1, -1, None),
+        Op::Cancel { slot } => (command::CANCEL, boxno::OUTGOING, *slot as i8, -1, -1, None),
+        Op::Check { box_no } => (command::CHECK, box_no.wire(), -1, -1, -1, None),
+        Op::Recv { slot } => (command::RECV, boxno::INCOMING, *slot as i8, 1, -1, None),
+        Op::Confirm => (command::CONFIRM, boxno::NONE, -1, -1, -1, None),
+        Op::Accept { slot } => (command::ACCEPT, boxno::INCOMING, *slot as i8, -1, -1, None),
+        Op::Reject { slot } => (command::REJECT, boxno::INCOMING, *slot as i8, -1, -1, None),
+        Op::Get { box_no, slot } => (command::GET, box_no.wire(), *slot as i8, -1, -1, None),
+        Op::Clear { box_no, slot } => (command::CLEAR, box_no.wire(), *slot as i8, -1, -1, None),
+        Op::Query { recipient } => (command::QUERY, boxno::NONE, -1, -1, -1, Some(recipient)),
+        Op::DeliOpen => (command::DELI_OPEN, boxno::NONE, -1, -1, -1, None),
+        Op::PostOpen => (command::POST_OPEN, boxno::NONE, -1, -1, -1, None),
+        Op::PostClose { .. } => (command::POST_CLOSE, boxno::NONE, -1, -1, -1, None),
+    };
+    let mut buf = vec![0u8; 32];
+    buf[0..4].copy_from_slice(&build_subpacket_header(ffxi_proto::map::c2s::PBX, 8, sync));
+    buf[4] = cmd;
+    buf[5] = box_no as u8;
+    buf[6] = post_work_no as u8;
+    buf[7] = item_work_no as u8;
+    buf[8..12].copy_from_slice(&item_stacks.to_le_bytes());
+    if let Some(name) = name {
+        let bytes = name.as_bytes();
+        let n = bytes.len().min(15); // NUL terminator stays inside TargetName[16]
+        buf[16..16 + n].copy_from_slice(&bytes[..n]);
+    }
+    buf
+}
+
+async fn send_pbx(
+    map: &mut MapClient,
+    op: &crate::state::DeliveryBoxOp,
+    sub_seq: &mut u16,
+    server_last_seq: u16,
+    event_tx: &broadcast::Sender<AgentEvent>,
+) {
+    let payload = build_subpacket_pbx(*sub_seq, op);
+    tracing::info!(?op, "sending 0x04D PBX");
+    *sub_seq = sub_seq.wrapping_add(1);
+    if let Err(e) = map
+        .send_encrypted(&payload, datagram_header_id(*sub_seq), server_last_seq)
+        .await
+    {
+        tracing::warn!(error = %e, "pbx send failed");
+        let _ = event_tx.send(AgentEvent::Error {
+            message: format!("delivery box send: {e}"),
+        });
+    }
 }
 
 // LSB kicks a character whose ITEM_STACK requests for one container arrive faster
@@ -5841,6 +5994,131 @@ mod tests {
 
         let buf = build_subpacket_item_move(0, 1, 2, 0, 3, Some(9));
         assert_eq!(buf[11], 9, "explicit ItemIndex2 = stack merge slot");
+    }
+
+    /// Pins every 0x04D encoding to LSB's PacketValidator rules
+    /// (vendor/server/src/map/packets/c2s/0x04d_pbx.cpp validate): a field the
+    /// validator mustEquals is hard-coded, unused numerics are -1, and
+    /// Result/ResParam1-3 are zero — any drift is a silent server-side drop.
+    #[test]
+    fn pbx_packet_layout_matches_lsb_validator() {
+        use crate::state::{DeliveryBoxNo, DeliveryBoxOp as Op};
+        use ffxi_proto::map::pbx::{boxno, command};
+
+        let fields = |op: &Op| {
+            let buf = build_subpacket_pbx(0xBEEF, op);
+            assert_eq!(buf.len(), 32, "GP_CLI_COMMAND_PBX is 32 bytes");
+            let hdr = u16::from_le_bytes(buf[0..2].try_into().unwrap());
+            assert_eq!(hdr & 0x01FF, 0x04D, "opcode = 0x04D PBX");
+            assert_eq!((hdr >> 9) & 0x7F, 8, "size_words = 8");
+            assert_eq!(&buf[12..16], &[0, 0, 0, 0], "Result/ResParam1-3 zero");
+            (
+                buf[4],
+                buf[5] as i8,
+                buf[6] as i8,
+                buf[7] as i8,
+                i32::from_le_bytes(buf[8..12].try_into().unwrap()),
+                buf[16..32].to_vec(),
+            )
+        };
+
+        let no_name = vec![0u8; 16];
+
+        let (cmd, b, pw, iw, st, name) = fields(&Op::PostOpen);
+        assert_eq!(
+            (cmd, b, pw, iw, st),
+            (command::POST_OPEN, boxno::NONE, -1, -1, -1)
+        );
+        assert_eq!(name, no_name);
+
+        let (cmd, b, pw, iw, st, _) = fields(&Op::Work {
+            box_no: DeliveryBoxNo::Incoming,
+        });
+        assert_eq!(
+            (cmd, b, pw, iw, st),
+            (command::WORK, boxno::INCOMING, -1, -1, -1)
+        );
+
+        let (cmd, b, pw, iw, st, _) = fields(&Op::Check {
+            box_no: DeliveryBoxNo::Outgoing,
+        });
+        assert_eq!(
+            (cmd, b, pw, iw, st),
+            (command::CHECK, boxno::OUTGOING, -1, -1, -1)
+        );
+
+        // Recv: BoxNo pinned Incoming, ItemWorkNo pinned 1.
+        let (cmd, b, pw, iw, st, _) = fields(&Op::Recv { slot: 3 });
+        assert_eq!(
+            (cmd, b, pw, iw, st),
+            (command::RECV, boxno::INCOMING, 3, 1, -1)
+        );
+
+        let (cmd, b, pw, iw, st, name) = fields(&Op::Set {
+            slot: 2,
+            inventory_slot: 11,
+            quantity: 12,
+            recipient: "Atti".into(),
+        });
+        assert_eq!(
+            (cmd, b, pw, iw, st),
+            (command::SET, boxno::OUTGOING, 2, 11, 12)
+        );
+        assert_eq!(&name[..5], b"Atti\0", "NUL-terminated TargetName");
+
+        let (cmd, b, pw, iw, st, _) = fields(&Op::Send { slot: 2 });
+        assert_eq!(
+            (cmd, b, pw, iw, st),
+            (command::SEND, boxno::OUTGOING, 2, -1, -1)
+        );
+
+        let (cmd, b, pw, ..) = fields(&Op::Cancel { slot: 4 });
+        assert_eq!((cmd, b, pw), (command::CANCEL, boxno::OUTGOING, 4));
+
+        let (cmd, b, pw, ..) = fields(&Op::Accept { slot: 5 });
+        assert_eq!((cmd, b, pw), (command::ACCEPT, boxno::INCOMING, 5));
+
+        let (cmd, b, pw, ..) = fields(&Op::Reject { slot: 6 });
+        assert_eq!((cmd, b, pw), (command::REJECT, boxno::INCOMING, 6));
+
+        let (cmd, b, pw, ..) = fields(&Op::Get {
+            box_no: DeliveryBoxNo::Outgoing,
+            slot: 7,
+        });
+        assert_eq!((cmd, b, pw), (command::GET, boxno::OUTGOING, 7));
+
+        let (cmd, b, pw, ..) = fields(&Op::Clear {
+            box_no: DeliveryBoxNo::Incoming,
+            slot: 0,
+        });
+        assert_eq!((cmd, b, pw), (command::CLEAR, boxno::INCOMING, 0));
+
+        let (cmd, b, pw, iw, st, name) = fields(&Op::Query {
+            recipient: "Nicotine".into(),
+        });
+        assert_eq!(
+            (cmd, b, pw, iw, st),
+            (command::QUERY, boxno::NONE, -1, -1, -1)
+        );
+        assert_eq!(&name[..9], b"Nicotine\0");
+
+        let (cmd, b, ..) = fields(&Op::Confirm);
+        assert_eq!((cmd, b), (command::CONFIRM, boxno::NONE));
+
+        let (cmd, b, ..) = fields(&Op::DeliOpen);
+        assert_eq!((cmd, b), (command::DELI_OPEN, boxno::NONE));
+
+        // PostClose: BoxNo pinned None regardless of which box is closing.
+        let (cmd, b, ..) = fields(&Op::PostClose {
+            box_no: DeliveryBoxNo::Outgoing,
+        });
+        assert_eq!((cmd, b), (command::POST_CLOSE, boxno::NONE));
+
+        // A 15-char name (FFXI max) still leaves its NUL terminator in place.
+        let (.., name) = fields(&Op::Query {
+            recipient: "Abcdefghijklmnop".into(),
+        });
+        assert_eq!(name[15], 0, "TargetName[15] stays NUL");
     }
 
     #[test]

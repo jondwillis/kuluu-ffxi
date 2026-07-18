@@ -7,8 +7,12 @@
 //! [`AgentCommand::ChangeJob`]: crate::state::AgentCommand::ChangeJob
 
 use ffxi_proto::decode::ServerLoginMyroom;
+use ffxi_proto::map::pbx;
 
-use crate::state::{DialogState, JobInfoState, MogHouseExit, MyRoomInfo};
+use crate::delivery_box::item_name;
+use crate::state::{
+    DeliveryBoxNo, DeliveryBoxOp, DeliveryItem, DialogState, JobInfoState, MogHouseExit, MyRoomInfo,
+};
 
 /// Synthetic client-local actor ids, kept in a reserved top-of-range block: LSB
 /// unique_no encodings ((4<<28)|(zone<<12)|targid at the largest) never reach
@@ -63,6 +67,25 @@ pub const DELIVERY_PROMPT: &str = "Use the delivery system.";
 pub const RECEIVE_ROW: &str = "Receive";
 pub const SEND_ROW: &str = "Send";
 
+// Retail Receive panel action buttons, observed order (moghouse-menu-notes.md
+// "Take / Drop / Return"); Return is disabled for auction-house senders.
+pub const TAKE_ROW: &str = "Take";
+pub const DROP_ROW: &str = "Drop";
+pub const RETURN_ROW: &str = "Return";
+pub const SEND_ITEM_ROW: &str = "Send";
+pub const TAKE_BACK_ROW: &str = "Take back";
+pub const CANCEL_DELIVERY_ROW: &str = "Cancel delivery";
+
+/// Retail panel headers ("Delivery Box" receive / "Deliveries" send),
+/// artifacts/retail/moghouse-menu-notes.md.
+pub const RECEIVE_PANEL_PROMPT: &str = "Select an item from the delivery box.";
+pub const SEND_PANEL_PROMPT: &str = "Deliveries";
+
+/// LSB marks auction-house mail by a sender starting with "AH"; the retail
+/// client disables Return for it (vendor/server/src/map/packets/s2c/
+/// 0x04b_pbx_result.cpp:91).
+const AH_SENDER_PREFIX: &str = "AH";
+
 pub const MAIN_JOB_ROW: &str = "Main Job";
 pub const SUPPORT_JOB_ROW: &str = "Support Job";
 
@@ -107,14 +130,43 @@ fn district_rows(exit_bit: u8) -> &'static [(&'static str, u8)] {
 enum Action {
     Close,
     Exit(MogHouseExit),
-    OpenAreas { exit_bit: u8 },
+    OpenAreas {
+        exit_bit: u8,
+    },
     OpenJobType,
-    OpenJobList { support: bool },
-    PickJob { support: bool, job: u8 },
+    OpenJobList {
+        support: bool,
+    },
+    PickJob {
+        support: bool,
+        job: u8,
+    },
     OpenStorageList,
-    OpenStorage { container: u8 },
+    OpenStorage {
+        container: u8,
+    },
     OpenDeliveryBox,
     OpenMogRoot,
+    /// Start the 0x04D open flow for `box_no` (Receive/Send rows).
+    DeliveryOpen {
+        box_no: DeliveryBoxNo,
+    },
+    /// Open the per-slot action submenu for an occupied box slot.
+    DeliverySlot {
+        box_no: DeliveryBoxNo,
+        slot: u8,
+    },
+    /// Rebuild the box-content menu from the stored slot snapshot.
+    DeliveryBack,
+    /// The retail Accept → Get take chain for an inbox slot.
+    DeliveryTake {
+        box_no: DeliveryBoxNo,
+        slot: u8,
+    },
+    /// A single pass-through 0x04D request (Reject/Clear/Send/Cancel/…).
+    Delivery {
+        op: DeliveryBoxOp,
+    },
     Stub(&'static str),
 }
 
@@ -126,6 +178,7 @@ struct Menu {
 }
 
 /// Outcome of feeding a player response to the active local menu.
+#[derive(Debug)]
 pub enum Advance {
     Frame(DialogState),
     Exit(MogHouseExit),
@@ -144,6 +197,20 @@ pub enum Advance {
         notice: &'static str,
         frame: DialogState,
     },
+    /// Receive/Send picked: the session opens the box (0x04D DeliOpen/PostOpen)
+    /// and renders the content menu once the server-side flow settles.
+    DeliveryOpen {
+        box_no: DeliveryBoxNo,
+    },
+    /// A slot Take: the session drives the Accept → Get chain.
+    DeliveryTake {
+        box_no: DeliveryBoxNo,
+        slot: u8,
+    },
+    /// A single 0x04D request the session sends as-is.
+    Delivery {
+        op: DeliveryBoxOp,
+    },
     Close,
 }
 
@@ -152,6 +219,9 @@ pub struct LocalMenuSession {
     menu: Option<Menu>,
     job_info: Option<JobInfoState>,
     container_caps: Option<Vec<u16>>,
+    /// Snapshot behind the open box-content menu, so slot submenus can offer
+    /// a Back row without re-querying the server.
+    delivery: Option<(DeliveryBoxNo, [Option<DeliveryItem>; pbx::SLOT_COUNT])>,
 }
 
 impl LocalMenuSession {
@@ -165,6 +235,7 @@ impl LocalMenuSession {
 
     pub fn clear(&mut self) {
         self.menu = None;
+        self.delivery = None;
     }
 
     /// The exit-door "Where to?" menu. "Change floors." shows when the player is
@@ -229,6 +300,52 @@ impl LocalMenuSession {
         self.set(mog_menu())
     }
 
+    /// The box-content menu, rendered once the 0x04D open flow settles: one row
+    /// per occupied slot, Cancel closes the box (PostClose). Retail shows this
+    /// as an 8-slot grid panel; the dialog list carries the same choices.
+    pub fn open_delivery_box(
+        &mut self,
+        box_no: DeliveryBoxNo,
+        slots: &[Option<DeliveryItem>; pbx::SLOT_COUNT],
+    ) -> DialogState {
+        self.delivery = Some((box_no, slots.clone()));
+        let mut rows: Vec<(String, Action)> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, cell)| {
+                cell.as_ref().map(|item| {
+                    (
+                        delivery_slot_label(box_no, item),
+                        Action::DeliverySlot {
+                            box_no,
+                            slot: i as u8,
+                        },
+                    )
+                })
+            })
+            .collect();
+        rows.push((
+            CANCEL_ROW.to_string(),
+            Action::Delivery {
+                op: DeliveryBoxOp::PostClose { box_no },
+            },
+        ));
+        self.set(Menu {
+            npc_id: MOG_MENU_ID,
+            npc_name: MOG_MENU_NPC_NAME,
+            prompt: match box_no {
+                DeliveryBoxNo::Incoming => RECEIVE_PANEL_PROMPT.to_string(),
+                DeliveryBoxNo::Outgoing => SEND_PANEL_PROMPT.to_string(),
+            },
+            rows,
+        })
+    }
+
+    /// Re-open the Receive/Send submenu (after a PostClose ack).
+    pub fn open_delivery_submenu(&mut self) -> DialogState {
+        self.set(delivery_menu())
+    }
+
     pub fn advance(&mut self, choice: Option<u32>) -> Advance {
         let Some(menu) = self.menu.as_ref() else {
             return Advance::Close;
@@ -280,6 +397,39 @@ impl LocalMenuSession {
             }
             Action::OpenDeliveryBox => Advance::Frame(self.set(delivery_menu())),
             Action::OpenMogRoot => Advance::Frame(self.set(mog_menu())),
+            Action::DeliveryOpen { box_no } => {
+                self.clear();
+                Advance::DeliveryOpen { box_no }
+            }
+            Action::DeliverySlot { box_no, slot } => {
+                let item = self
+                    .delivery
+                    .as_ref()
+                    .and_then(|(_, slots)| slots.get(slot as usize))
+                    .and_then(Clone::clone);
+                match item {
+                    Some(item) => Advance::Frame(self.set(delivery_slot_menu(box_no, slot, &item))),
+                    None => {
+                        self.clear();
+                        Advance::Close
+                    }
+                }
+            }
+            Action::DeliveryBack => match self.delivery.take() {
+                Some((box_no, slots)) => Advance::Frame(self.open_delivery_box(box_no, &slots)),
+                None => {
+                    self.clear();
+                    Advance::Close
+                }
+            },
+            Action::DeliveryTake { box_no, slot } => {
+                self.clear();
+                Advance::DeliveryTake { box_no, slot }
+            }
+            Action::Delivery { op } => {
+                self.clear();
+                Advance::Delivery { op }
+            }
             Action::Stub(notice) => Advance::Stub {
                 notice,
                 frame: frame(self.menu.as_ref().expect("menu still active")),
@@ -424,11 +574,15 @@ fn delivery_menu() -> Menu {
     let rows = vec![
         (
             RECEIVE_ROW.to_string(),
-            Action::Stub("Delivery Box receive is not yet implemented — tracked as kuluu-opg8."),
+            Action::DeliveryOpen {
+                box_no: DeliveryBoxNo::Incoming,
+            },
         ),
         (
             SEND_ROW.to_string(),
-            Action::Stub("Delivery Box send is not yet implemented — tracked as kuluu-opg8."),
+            Action::DeliveryOpen {
+                box_no: DeliveryBoxNo::Outgoing,
+            },
         ),
         (CANCEL_ROW.to_string(), Action::OpenMogRoot),
     ];
@@ -436,6 +590,85 @@ fn delivery_menu() -> Menu {
         npc_id: MOG_MENU_ID,
         npc_name: MOG_MENU_NPC_NAME,
         prompt: DELIVERY_PROMPT.to_string(),
+        rows,
+    }
+}
+
+/// Row label for an occupied slot: retail's grid cell (item, count,
+/// counterpart) plus the observed send-state suffixes "(preparing)"/"(sent)"
+/// (artifacts/retail/moghouse-menu-notes.md).
+fn delivery_slot_label(box_no: DeliveryBoxNo, item: &DeliveryItem) -> String {
+    let name = item_name(item.item_no);
+    let who = item.counterpart.as_deref().unwrap_or("?");
+    match box_no {
+        DeliveryBoxNo::Incoming => format!("{name} x{} — from {who}", item.quantity),
+        DeliveryBoxNo::Outgoing => {
+            let suffix = if item.sent() {
+                " (sent)"
+            } else {
+                " (preparing)"
+            };
+            format!("{name} x{} — to {who}{suffix}", item.quantity)
+        }
+    }
+}
+
+/// Per-slot actions: inbox Take / Drop / Return (retail button order; Return
+/// omitted for auction-house mail), outbox Send / Take back for staged items
+/// or Cancel delivery for dispatched ones.
+fn delivery_slot_menu(box_no: DeliveryBoxNo, slot: u8, item: &DeliveryItem) -> Menu {
+    let mut rows: Vec<(String, Action)> = Vec::new();
+    match box_no {
+        DeliveryBoxNo::Incoming => {
+            rows.push((TAKE_ROW.to_string(), Action::DeliveryTake { box_no, slot }));
+            rows.push((
+                DROP_ROW.to_string(),
+                Action::Delivery {
+                    op: DeliveryBoxOp::Clear { box_no, slot },
+                },
+            ));
+            let from_ah = item
+                .counterpart
+                .as_deref()
+                .is_some_and(|s| s.starts_with(AH_SENDER_PREFIX));
+            if !from_ah {
+                rows.push((
+                    RETURN_ROW.to_string(),
+                    Action::Delivery {
+                        op: DeliveryBoxOp::Reject { slot },
+                    },
+                ));
+            }
+        }
+        DeliveryBoxNo::Outgoing => {
+            if item.sent() {
+                rows.push((
+                    CANCEL_DELIVERY_ROW.to_string(),
+                    Action::Delivery {
+                        op: DeliveryBoxOp::Cancel { slot },
+                    },
+                ));
+            } else {
+                rows.push((
+                    SEND_ITEM_ROW.to_string(),
+                    Action::Delivery {
+                        op: DeliveryBoxOp::Send { slot },
+                    },
+                ));
+                rows.push((
+                    TAKE_BACK_ROW.to_string(),
+                    Action::Delivery {
+                        op: DeliveryBoxOp::Get { box_no, slot },
+                    },
+                ));
+            }
+        }
+    }
+    rows.push((CANCEL_ROW.to_string(), Action::DeliveryBack));
+    Menu {
+        npc_id: MOG_MENU_ID,
+        npc_name: MOG_MENU_NPC_NAME,
+        prompt: delivery_slot_label(box_no, item),
         rows,
     }
 }
@@ -882,25 +1115,129 @@ mod tests {
     }
 
     #[test]
-    fn delivery_box_opens_receive_send_stubs() {
-        let mut s = LocalMenuSession::new();
-        let f = s.open_mog_menu(None, None);
-        let sub = match pick(&mut s, &f, DELIVERY_BOX_ROW) {
-            Advance::Frame(f) => f,
-            _ => panic!("Delivery Box opens the Receive/Send submenu"),
-        };
-        assert_eq!(sub.prompt.as_deref(), Some(DELIVERY_PROMPT));
-        assert_eq!(sub.choices, vec![RECEIVE_ROW, SEND_ROW, CANCEL_ROW]);
-        for row in [RECEIVE_ROW, SEND_ROW] {
+    fn delivery_rows_open_their_boxes() {
+        for (row, expected) in [
+            (RECEIVE_ROW, DeliveryBoxNo::Incoming),
+            (SEND_ROW, DeliveryBoxNo::Outgoing),
+        ] {
+            let mut s = LocalMenuSession::new();
+            let f = s.open_mog_menu(None, None);
+            let sub = match pick(&mut s, &f, DELIVERY_BOX_ROW) {
+                Advance::Frame(f) => f,
+                _ => panic!("Delivery Box opens the Receive/Send submenu"),
+            };
+            assert_eq!(sub.prompt.as_deref(), Some(DELIVERY_PROMPT));
+            assert_eq!(sub.choices, vec![RECEIVE_ROW, SEND_ROW, CANCEL_ROW]);
             match pick(&mut s, &sub, row) {
-                Advance::Stub { notice, frame } => {
-                    assert!(notice.contains("kuluu-opg8"));
-                    assert_eq!(frame.choices, sub.choices);
-                }
-                _ => panic!("`{row}` must stub"),
+                Advance::DeliveryOpen { box_no } => assert_eq!(box_no, expected),
+                _ => panic!("`{row}` must start the open flow"),
             }
+            assert!(!s.active(), "protocol takes over until the flow settles");
         }
-        assert!(s.active());
+    }
+
+    fn incoming_item(from: &str) -> DeliveryItem {
+        DeliveryItem {
+            item_no: 4869,
+            quantity: 2,
+            counterpart: Some(from.to_string()),
+            stat: pbx::stat::INCOMING,
+        }
+    }
+
+    #[test]
+    fn delivery_box_menu_lists_slots_and_slot_actions() {
+        let mut slots: [Option<DeliveryItem>; pbx::SLOT_COUNT] = Default::default();
+        slots[1] = Some(incoming_item("Atti"));
+        slots[4] = Some(incoming_item("AH-Jeuno"));
+
+        let mut s = LocalMenuSession::new();
+        let f = s.open_delivery_box(DeliveryBoxNo::Incoming, &slots);
+        assert_eq!(f.prompt.as_deref(), Some(RECEIVE_PANEL_PROMPT));
+        assert_eq!(f.choices.len(), 3, "two occupied slots + Cancel");
+        assert!(f.choices[0].contains("from Atti"));
+
+        let sub = match pick(&mut s, &f, &f.choices[0].clone()) {
+            Advance::Frame(f) => f,
+            _ => panic!("occupied slot opens its action submenu"),
+        };
+        assert_eq!(
+            sub.choices,
+            vec![TAKE_ROW, DROP_ROW, RETURN_ROW, CANCEL_ROW],
+            "retail Take / Drop / Return order"
+        );
+        match pick(&mut s, &sub, TAKE_ROW) {
+            Advance::DeliveryTake { box_no, slot } => {
+                assert_eq!(box_no, DeliveryBoxNo::Incoming);
+                assert_eq!(slot, 1);
+            }
+            _ => panic!("Take must start the Accept→Get chain"),
+        }
+
+        // AH mail: Return is disabled (sender prefix rule).
+        let f = s.open_delivery_box(DeliveryBoxNo::Incoming, &slots);
+        let sub = match pick(&mut s, &f, &f.choices[1].clone()) {
+            Advance::Frame(f) => f,
+            _ => panic!(),
+        };
+        assert!(!sub.choices.iter().any(|c| c == RETURN_ROW));
+
+        // Back returns to the box menu without touching the server.
+        match pick(&mut s, &sub, CANCEL_ROW) {
+            Advance::Frame(back) => assert_eq!(back.choices, f.choices),
+            _ => panic!("slot Cancel must return to the box menu"),
+        }
+    }
+
+    #[test]
+    fn outbox_slot_actions_depend_on_sent_state() {
+        let mut slots: [Option<DeliveryItem>; pbx::SLOT_COUNT] = Default::default();
+        slots[0] = Some(DeliveryItem {
+            stat: pbx::stat::STAGED,
+            ..incoming_item("Atti")
+        });
+        slots[2] = Some(DeliveryItem {
+            stat: pbx::stat::SENT,
+            ..incoming_item("Atti")
+        });
+
+        let mut s = LocalMenuSession::new();
+        let f = s.open_delivery_box(DeliveryBoxNo::Outgoing, &slots);
+        assert!(f.choices[0].ends_with("(preparing)"));
+        assert!(f.choices[1].ends_with("(sent)"));
+
+        let sub = match pick(&mut s, &f, &f.choices[0].clone()) {
+            Advance::Frame(f) => f,
+            _ => panic!(),
+        };
+        assert_eq!(sub.choices, vec![SEND_ITEM_ROW, TAKE_BACK_ROW, CANCEL_ROW]);
+        match pick(&mut s, &sub, SEND_ITEM_ROW) {
+            Advance::Delivery {
+                op: DeliveryBoxOp::Send { slot },
+            } => assert_eq!(slot, 0),
+            other => panic!("staged Send must dispatch, got {other:?}"),
+        }
+
+        let f = s.open_delivery_box(DeliveryBoxNo::Outgoing, &slots);
+        let sub = match pick(&mut s, &f, &f.choices[1].clone()) {
+            Advance::Frame(f) => f,
+            _ => panic!(),
+        };
+        assert_eq!(sub.choices, vec![CANCEL_DELIVERY_ROW, CANCEL_ROW]);
+    }
+
+    #[test]
+    fn delivery_box_cancel_closes_via_post_close() {
+        let mut s = LocalMenuSession::new();
+        let slots: [Option<DeliveryItem>; pbx::SLOT_COUNT] = Default::default();
+        let f = s.open_delivery_box(DeliveryBoxNo::Incoming, &slots);
+        match pick(&mut s, &f, CANCEL_ROW) {
+            Advance::Delivery {
+                op: DeliveryBoxOp::PostClose { box_no },
+            } => assert_eq!(box_no, DeliveryBoxNo::Incoming),
+            other => panic!("box Cancel must PostClose, got {other:?}"),
+        }
+        assert!(!s.active());
     }
 
     #[test]

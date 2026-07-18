@@ -7,6 +7,7 @@ pub mod agent_socket;
 pub mod auth_binary;
 pub mod auth_client;
 pub mod config_dir;
+pub mod delivery_box;
 pub mod event_dialog;
 pub mod fishing;
 pub mod goal_store;

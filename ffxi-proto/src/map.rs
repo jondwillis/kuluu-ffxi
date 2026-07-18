@@ -50,7 +50,79 @@ pub mod c2s {
     // free slot (0x029_item_move.cpp process).
     pub const ITEM_MOVE: u16 = 0x029;
 
+    // GP_CLI_COMMAND_PBX, vendor/server/src/map/packets/c2s/0x04d_pbx.h.
+    // Delivery box sub-protocol; see [`crate::map::pbx`] for the Command bytes.
+    pub const PBX: u16 = 0x04D;
+
     pub const REQ_LOGOUT: u16 = 0x0E7;
+}
+
+/// Delivery box ("post box") wire vocabulary shared by c2s 0x04D and s2c 0x04B.
+pub mod pbx {
+    // GP_CLI_COMMAND_PBX_COMMAND, vendor/server/src/map/packets/c2s/0x04d_pbx.h:26-43.
+    pub mod command {
+        pub const WORK: u8 = 0x01;
+        pub const SET: u8 = 0x02;
+        pub const SEND: u8 = 0x03;
+        pub const CANCEL: u8 = 0x04;
+        pub const CHECK: u8 = 0x05;
+        pub const RECV: u8 = 0x06;
+        pub const CONFIRM: u8 = 0x07;
+        pub const ACCEPT: u8 = 0x08;
+        pub const REJECT: u8 = 0x09;
+        pub const GET: u8 = 0x0A;
+        pub const CLEAR: u8 = 0x0B;
+        pub const QUERY: u8 = 0x0C;
+        pub const DELI_OPEN: u8 = 0x0D;
+        pub const POST_OPEN: u8 = 0x0E;
+        pub const POST_CLOSE: u8 = 0x0F;
+    }
+
+    // GP_CLI_COMMAND_PBX_BOXNO, vendor/server/src/map/packets/c2s/0x04d_pbx.h:45-50.
+    pub mod boxno {
+        pub const NONE: i8 = -1;
+        pub const INCOMING: i8 = 1;
+        pub const OUTGOING: i8 = 2;
+    }
+
+    // s2c 0x04B Result byte, vendor/server/src/map/packets/s2c/0x04b_pbx_result.cpp
+    // and utils/dboxutils.cpp push sites. OK/PENDING form the dual-push pattern
+    // (the server answers most commands twice: Result=PENDING then Result=OK).
+    pub mod result {
+        pub const OK: u8 = 0x01;
+        pub const PENDING: u8 = 0x02;
+        /// TakeItemFromCell with a full inventory (dboxutils.cpp:638).
+        pub const INVENTORY_FULL: u8 = 0xB9;
+        /// TakeItemFromCell transaction failure (dboxutils.cpp:686).
+        pub const TAKE_FAILED: u8 = 0xBA;
+        /// SendNewItems/ReturnToSender transaction failure (dboxutils.cpp:477,616).
+        pub const DB_ERROR: u8 = 0xEB;
+        /// ConfirmNameBeforeSending: recipient account not found (dboxutils.cpp:751).
+        pub const NO_SUCH_CHAR: u8 = 0xFB;
+        /// Recipient's inflight queue at capacity (dboxutils.cpp:236-237,582-583).
+        pub const RECIPIENT_FULL: u8 = 0xFE;
+        /// CancelSendingItem fallback, pushed as -1: "Delivery orders are
+        /// currently backlogged." (dboxutils.cpp:335).
+        pub const BACKLOGGED: u8 = 0xFF;
+    }
+
+    // GP_POST_BOX_STATE::Stat values, vendor/server/src/map/packets/s2c/
+    // 0x04b_pbx_result.cpp:90-117.
+    pub mod stat {
+        /// Outgoing item staged in a slot, not yet dispatched (Set).
+        pub const STAGED: u32 = 0x01;
+        /// Outgoing item dispatched (Send / isSent).
+        pub const SENT: u32 = 0x03;
+        /// Cancel with message 0x02 (partial cancel state).
+        pub const CANCEL_PENDING: u32 = 0x04;
+        /// Outgoing item whose dispatch was canceled (back to sendable).
+        pub const CANCELED: u32 = 0x05;
+        /// Incoming item sitting in the inbox.
+        pub const INCOMING: u32 = 0x07;
+    }
+
+    /// PostWorkNo slot range on both boxes (LSB PacketValidator range 0..8).
+    pub const SLOT_COUNT: usize = 8;
 }
 
 // LSB CONTAINER_ID, vendor/server/src/map/item_container.h:32-49.
@@ -225,6 +297,10 @@ pub mod s2c {
     pub const SHOP_SELL: u16 = 0x03D;
 
     pub const SHOP_OPEN: u16 = 0x03E;
+
+    // GP_SERV_COMMAND_PBX_RESULT, vendor/server/src/map/packets/s2c/0x04b_pbx_result.h.
+    // Delivery box reply; short (0x14) or full (0x58, with item payload) form.
+    pub const PBX_RESULT: u16 = 0x04B;
 
     pub const MISCDATA: u16 = 0x063;
 
