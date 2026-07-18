@@ -35,6 +35,10 @@ struct P {
     tgt: Vec3,
     fog: bool,
     hour: f32,
+    // Reproduce the live client's sun exactly: sun_moon.rs bias values,
+    // cascade_config_from_settings(High preset), 4096 shadow map, and the
+    // hour-driven sun_direction() instead of the fixed debug sun position.
+    client_sun: bool,
 }
 #[derive(Resource, Default)]
 struct FC(u32);
@@ -54,6 +58,7 @@ fn main() {
         tgt: Vec3::ZERO,
         fog: false,
         hour: 12.0,
+        client_sun: false,
     };
     let f3 = |a: &[String], i: usize| {
         Vec3::new(
@@ -109,13 +114,17 @@ fn main() {
                 p.hour = a[i + 1].parse().unwrap();
                 i += 2;
             }
+            "--client-sun" => {
+                p.client_sun = true;
+                i += 1;
+            }
             _ => {
                 i += 1;
             }
         }
     }
-    App::new()
-        .insert_resource(VanaClock::anchored_at_hour(p.hour))
+    let mut app = App::new();
+    app.insert_resource(VanaClock::anchored_at_hour(p.hour))
         .insert_resource(p)
         .init_resource::<FC>()
         .init_resource::<CS>()
@@ -150,6 +159,7 @@ fn main() {
         .init_resource::<ZoneWeather>()
         .init_resource::<ffxi_viewer_core::weather_fx::CurrentWeather>()
         .init_resource::<ffxi_viewer_core::weather_fx::ActiveWeatherModifier>()
+        .init_resource::<ffxi_viewer_core::weather::DefaultClearColor>()
         .add_systems(
             Update,
             (sample_zone_weather, apply_zone_weather)
@@ -170,8 +180,12 @@ fn main() {
                 cap,
             )
                 .chain(),
-        )
-        .run();
+        );
+    // spawn_zone_water requires the bevy_water extended-material assets;
+    // without this plugin its param validation panics on any zone load.
+    #[cfg(feature = "enhanced-water")]
+    app.add_plugins(ffxi_viewer_core::water_enhanced::EnhancedWaterPlugin);
+    app.run();
 }
 fn print_toasts(mut rx: MessageReader<ToastEvent>) {
     for t in rx.read() {
@@ -246,8 +260,29 @@ fn setup(
         ..default()
     });
 
-    let sun = c
-        .spawn((
+    let sun = if p.client_sun {
+        // Mirror sun_moon.rs exactly: same bias values, same cascade config
+        // (High preset = default), 4096 map, hour-driven direction.
+        let gfx = ffxi_viewer_core::graphics::settings::GraphicsSettings::default();
+        c.insert_resource(bevy::light::DirectionalLightShadowMap {
+            size: gfx.shadow_map_size as usize,
+        });
+        let sun_dir = ffxi_viewer_core::sun_moon::sun_direction(p.hour);
+        c.spawn((
+            IsSun,
+            DirectionalLight {
+                illuminance: p.sun,
+                shadow_maps_enabled: true,
+                shadow_depth_bias: 0.2,
+                shadow_normal_bias: 0.6,
+                ..default()
+            },
+            ffxi_viewer_core::graphics::settings::cascade_config_from_settings(&gfx),
+            Transform::from_translation(sun_dir * 1000.0).looking_at(Vec3::ZERO, Vec3::Y),
+        ))
+        .id()
+    } else {
+        c.spawn((
             IsSun,
             DirectionalLight {
                 illuminance: p.sun,
@@ -256,7 +291,8 @@ fn setup(
             },
             Transform::from_xyz(300., 220., 120.).looking_at(Vec3::ZERO, Vec3::Y),
         ))
-        .id();
+        .id()
+    };
     if p.fog {
         c.entity(sun).insert(bevy::light::VolumetricLight);
     }
