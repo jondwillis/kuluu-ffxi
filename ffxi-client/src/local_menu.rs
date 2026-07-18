@@ -29,13 +29,39 @@ pub const CHANGE_FLOORS_ROW: &str = "Change floors.";
 pub const SELECT_AREA_ROW: &str = "Select an area to exit to.";
 pub const MOG_GARDEN_ROW: &str = "Mog Garden.";
 
+// Mog Menu labels, order, prompts, and disabled rules follow the retail client
+// as observed on HorizonXI 2026-07-17 (artifacts/retail/moghouse-menu-notes.md).
 pub const MOG_MENU_PROMPT: &str = "Mog Menu";
-pub const CHANGE_JOBS_ROW: &str = "Change Jobs";
-pub const MOG_SAFE_ROW: &str = "Mog Safe";
-pub const MOG_LOCKER_ROW: &str = "Mog Locker";
 pub const STORAGE_ROW: &str = "Storage";
 pub const DELIVERY_BOX_ROW: &str = "Delivery Box";
+pub const CHANGE_JOBS_ROW: &str = "Change Jobs";
+pub const GARDENING_ROW: &str = "Gardening";
+pub const LAYOUT_ROW: &str = "Layout";
+pub const OPEN_MOG_HOUSE_ROW: &str = "Open Mog House";
+pub const REMODEL_ROW: &str = "Remodel";
 pub const CANCEL_ROW: &str = "Cancel";
+
+pub const STORAGE_PROMPT: &str = "Check all items in your Mog Safe and other storage systems.";
+pub const MOG_SAFE_ROW: &str = "Mog Safe";
+pub const MOG_SAFE2_ROW: &str = "Mog Safe 2";
+pub const MOG_LOCKER_ROW: &str = "Mog Locker";
+pub const MOG_SATCHEL_ROW: &str = "Mog Satchel";
+pub const MOG_SACK_ROW: &str = "Mog Sack";
+pub const MOG_CASE_ROW: &str = "Mog Case";
+pub const MOG_WARDROBE_ROWS: [&str; 8] = [
+    "Mog Wardrobe",
+    "Mog Wardrobe 2",
+    "Mog Wardrobe 3",
+    "Mog Wardrobe 4",
+    "Mog Wardrobe 5",
+    "Mog Wardrobe 6",
+    "Mog Wardrobe 7",
+    "Mog Wardrobe 8",
+];
+
+pub const DELIVERY_PROMPT: &str = "Use the delivery system.";
+pub const RECEIVE_ROW: &str = "Receive";
+pub const SEND_ROW: &str = "Send";
 
 pub const MAIN_JOB_ROW: &str = "Main Job";
 pub const SUPPORT_JOB_ROW: &str = "Support Job";
@@ -85,7 +111,10 @@ enum Action {
     OpenJobType,
     OpenJobList { support: bool },
     PickJob { support: bool, job: u8 },
+    OpenStorageList,
     OpenStorage { container: u8 },
+    OpenDeliveryBox,
+    OpenMogRoot,
     Stub(&'static str),
 }
 
@@ -122,6 +151,7 @@ pub enum Advance {
 pub struct LocalMenuSession {
     menu: Option<Menu>,
     job_info: Option<JobInfoState>,
+    container_caps: Option<Vec<u16>>,
 }
 
 impl LocalMenuSession {
@@ -195,7 +225,8 @@ impl LocalMenuSession {
         container_caps: Option<&[u16]>,
     ) -> DialogState {
         self.job_info = job_info;
-        self.set(mog_menu(container_caps))
+        self.container_caps = container_caps.map(<[u16]>::to_vec);
+        self.set(mog_menu())
     }
 
     pub fn advance(&mut self, choice: Option<u32>) -> Advance {
@@ -240,10 +271,15 @@ impl LocalMenuSession {
                     sub_job: support.then_some(job),
                 }
             }
+            Action::OpenStorageList => {
+                Advance::Frame(self.set(storage_menu(self.container_caps.as_deref())))
+            }
             Action::OpenStorage { container } => {
                 self.clear();
                 Advance::OpenStorage { container }
             }
+            Action::OpenDeliveryBox => Advance::Frame(self.set(delivery_menu())),
+            Action::OpenMogRoot => Advance::Frame(self.set(mog_menu())),
             Action::Stub(notice) => Advance::Stub {
                 notice,
                 frame: frame(self.menu.as_ref().expect("menu still active")),
@@ -295,32 +331,111 @@ fn areas_menu(exit_bit: u8) -> Menu {
     }
 }
 
-fn mog_menu(container_caps: Option<&[u16]>) -> Menu {
-    use ffxi_proto::map::container::{LOC_MOGLOCKER, LOC_MOGSAFE, LOC_STORAGE};
-
-    // Unknown capacities (no 0x01C yet) show every row; the Items window then
-    // simply renders an empty bag.
-    let granted =
-        |id: u8| container_caps.is_none_or(|caps| caps.get(id as usize).copied().unwrap_or(0) > 0);
-    let mut rows = vec![(CHANGE_JOBS_ROW.to_string(), Action::OpenJobType)];
-    for (label, container) in [
-        (MOG_SAFE_ROW, LOC_MOGSAFE),
-        (STORAGE_ROW, LOC_STORAGE),
-        (MOG_LOCKER_ROW, LOC_MOGLOCKER),
-    ] {
-        if granted(container) {
-            rows.push((label.to_string(), Action::OpenStorage { container }));
-        }
-    }
-    rows.push((
-        DELIVERY_BOX_ROW.to_string(),
-        Action::Stub("Delivery Box is not yet implemented — tracked as kuluu-opg8."),
-    ));
-    rows.push((CANCEL_ROW.to_string(), Action::Close));
+fn mog_menu() -> Menu {
+    let rows = vec![
+        (STORAGE_ROW.to_string(), Action::OpenStorageList),
+        (DELIVERY_BOX_ROW.to_string(), Action::OpenDeliveryBox),
+        (CHANGE_JOBS_ROW.to_string(), Action::OpenJobType),
+        (
+            GARDENING_ROW.to_string(),
+            Action::Stub("Gardening is not yet implemented — tracked as kuluu-jdwl."),
+        ),
+        // Retail disables Layout/Open Mog House in a rent-a-room (non-home-nation
+        // MH); once implemented, gate them on that rule rather than stubbing.
+        (
+            LAYOUT_ROW.to_string(),
+            Action::Stub("Layout is not yet implemented — tracked as kuluu-6a0."),
+        ),
+        (
+            OPEN_MOG_HOUSE_ROW.to_string(),
+            Action::Stub("Open Mog House is not yet implemented — tracked as kuluu-6a0."),
+        ),
+        (
+            REMODEL_ROW.to_string(),
+            Action::Stub("Remodel is not yet implemented — tracked as kuluu-6a0."),
+        ),
+        (CANCEL_ROW.to_string(), Action::Close),
+    ];
     Menu {
         npc_id: MOG_MENU_ID,
         npc_name: MOG_MENU_NPC_NAME,
         prompt: MOG_MENU_PROMPT.to_string(),
+        rows,
+    }
+}
+
+/// Retail Storage submenu order: Safe, Safe 2, Storage, Locker, Satchel, Sack,
+/// Case, Wardrobe 1-8. The label→container pairs live here (the emitter);
+/// consumers map labels back via [`storage_row_container`].
+pub fn storage_rows() -> [(&'static str, u8); 15] {
+    use ffxi_proto::map::container as c;
+    [
+        (MOG_SAFE_ROW, c::LOC_MOGSAFE),
+        (MOG_SAFE2_ROW, c::LOC_MOGSAFE2),
+        (STORAGE_ROW, c::LOC_STORAGE),
+        (MOG_LOCKER_ROW, c::LOC_MOGLOCKER),
+        (MOG_SATCHEL_ROW, c::LOC_MOGSATCHEL),
+        (MOG_SACK_ROW, c::LOC_MOGSACK),
+        (MOG_CASE_ROW, c::LOC_MOGCASE),
+        (MOG_WARDROBE_ROWS[0], c::LOC_WARDROBE),
+        (MOG_WARDROBE_ROWS[1], c::LOC_WARDROBE2),
+        (MOG_WARDROBE_ROWS[2], c::LOC_WARDROBE3),
+        (MOG_WARDROBE_ROWS[3], c::LOC_WARDROBE4),
+        (MOG_WARDROBE_ROWS[4], c::LOC_WARDROBE5),
+        (MOG_WARDROBE_ROWS[5], c::LOC_WARDROBE6),
+        (MOG_WARDROBE_ROWS[6], c::LOC_WARDROBE7),
+        (MOG_WARDROBE_ROWS[7], c::LOC_WARDROBE8),
+    ]
+}
+
+pub fn storage_row_container(label: &str) -> Option<u8> {
+    storage_rows()
+        .iter()
+        .find(|(row, _)| *row == label)
+        .map(|&(_, container)| container)
+}
+
+/// `container_caps` (0x01C ITEM_MAX, indexed by CONTAINER_ID) hides containers
+/// the server never granted — e.g. the Mog Locker or wardrobes on a pre-ToAU
+/// era server — since LSB rejects moves into a zero-size container. Unknown
+/// capacities (no 0x01C yet) show every row; the Items window then simply
+/// renders an empty bag.
+fn storage_menu(container_caps: Option<&[u16]>) -> Menu {
+    let granted =
+        |id: u8| container_caps.is_none_or(|caps| caps.get(id as usize).copied().unwrap_or(0) > 0);
+    let rows = storage_rows()
+        .iter()
+        .filter(|&&(_, container)| granted(container))
+        .map(|&(label, container)| (label.to_string(), Action::OpenStorage { container }))
+        .chain(std::iter::once((
+            CANCEL_ROW.to_string(),
+            Action::OpenMogRoot,
+        )))
+        .collect();
+    Menu {
+        npc_id: MOG_MENU_ID,
+        npc_name: MOG_MENU_NPC_NAME,
+        prompt: STORAGE_PROMPT.to_string(),
+        rows,
+    }
+}
+
+fn delivery_menu() -> Menu {
+    let rows = vec![
+        (
+            RECEIVE_ROW.to_string(),
+            Action::Stub("Delivery Box receive is not yet implemented — tracked as kuluu-opg8."),
+        ),
+        (
+            SEND_ROW.to_string(),
+            Action::Stub("Delivery Box send is not yet implemented — tracked as kuluu-opg8."),
+        ),
+        (CANCEL_ROW.to_string(), Action::OpenMogRoot),
+    ];
+    Menu {
+        npc_id: MOG_MENU_ID,
+        npc_name: MOG_MENU_NPC_NAME,
+        prompt: DELIVERY_PROMPT.to_string(),
         rows,
     }
 }
@@ -670,33 +785,63 @@ mod tests {
         }
     }
 
-    /// Retail's Moogle menu lists the bags Safe → Storage → Locker; each row is
-    /// a terminal OpenStorage carrying its LSB CONTAINER_ID.
+    /// Retail top-level order as observed on HorizonXI 2026-07-17
+    /// (artifacts/retail/moghouse-menu-notes.md).
+    #[test]
+    fn mog_menu_matches_retail_order() {
+        let mut s = LocalMenuSession::new();
+        let f = s.open_mog_menu(None, None);
+        assert_eq!(
+            f.choices,
+            vec![
+                STORAGE_ROW,
+                DELIVERY_BOX_ROW,
+                CHANGE_JOBS_ROW,
+                GARDENING_ROW,
+                LAYOUT_ROW,
+                OPEN_MOG_HOUSE_ROW,
+                REMODEL_ROW,
+                CANCEL_ROW,
+            ]
+        );
+        s.clear();
+    }
+
+    /// Storage is a submenu (retail): Safe, Safe 2, Storage, Locker, Satchel,
+    /// Sack, Case, Wardrobe 1-8, each a terminal OpenStorage carrying its LSB
+    /// CONTAINER_ID; Cancel returns to the root Mog Menu.
     #[test]
     fn storage_rows_open_their_containers_in_retail_order() {
-        use ffxi_proto::map::container::{LOC_MOGLOCKER, LOC_MOGSAFE, LOC_STORAGE};
-        for (label, container) in [
-            (MOG_SAFE_ROW, LOC_MOGSAFE),
-            (STORAGE_ROW, LOC_STORAGE),
-            (MOG_LOCKER_ROW, LOC_MOGLOCKER),
-        ] {
+        let mut s = LocalMenuSession::new();
+        let f = s.open_mog_menu(None, None);
+        let sub = match pick(&mut s, &f, STORAGE_ROW) {
+            Advance::Frame(f) => f,
+            _ => panic!("Storage opens the container submenu"),
+        };
+        assert_eq!(sub.prompt.as_deref(), Some(STORAGE_PROMPT));
+        let expected: Vec<&str> = storage_rows()
+            .iter()
+            .map(|&(label, _)| label)
+            .chain(std::iter::once(CANCEL_ROW))
+            .collect();
+        assert_eq!(sub.choices, expected);
+
+        for (label, container) in storage_rows() {
             let mut s = LocalMenuSession::new();
             let f = s.open_mog_menu(None, None);
-            match pick(&mut s, &f, label) {
-                Advance::OpenStorage { container: c } => assert_eq!(c, container, "{label}"),
+            let sub = match pick(&mut s, &f, STORAGE_ROW) {
+                Advance::Frame(f) => f,
+                _ => panic!(),
+            };
+            match pick(&mut s, &sub, label) {
+                Advance::OpenStorage { container: c } => {
+                    assert_eq!(c, container, "{label}");
+                    assert_eq!(storage_row_container(label), Some(container));
+                }
                 _ => panic!("`{label}` must open storage"),
             }
             assert!(!s.active(), "storage rows close the menu");
         }
-
-        let mut s = LocalMenuSession::new();
-        let f = s.open_mog_menu(None, None);
-        let order: Vec<usize> = [MOG_SAFE_ROW, STORAGE_ROW, MOG_LOCKER_ROW]
-            .iter()
-            .map(|row| f.choices.iter().position(|c| c == row).expect(row))
-            .collect();
-        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
-        s.clear();
     }
 
     #[test]
@@ -710,22 +855,50 @@ mod tests {
 
         let mut s = LocalMenuSession::new();
         let f = s.open_mog_menu(None, Some(&caps));
-        assert!(f.choices.iter().any(|c| c == MOG_SAFE_ROW));
-        assert!(f.choices.iter().any(|c| c == STORAGE_ROW));
-        assert!(!f.choices.iter().any(|c| c == MOG_LOCKER_ROW));
+        let sub = match pick(&mut s, &f, STORAGE_ROW) {
+            Advance::Frame(f) => f,
+            _ => panic!(),
+        };
+        assert!(sub.choices.iter().any(|c| c == MOG_SAFE_ROW));
+        assert!(sub.choices.iter().any(|c| c == STORAGE_ROW));
+        assert!(!sub.choices.iter().any(|c| c == MOG_LOCKER_ROW));
+        assert!(!sub.choices.iter().any(|c| c == MOG_SAFE2_ROW));
         s.clear();
     }
 
     #[test]
-    fn delivery_box_stubs_and_keeps_menu_open() {
+    fn storage_cancel_returns_to_root() {
         let mut s = LocalMenuSession::new();
         let f = s.open_mog_menu(None, None);
-        match pick(&mut s, &f, DELIVERY_BOX_ROW) {
-            Advance::Stub { notice, frame } => {
-                assert!(notice.contains("kuluu-opg8"));
-                assert_eq!(frame.choices, f.choices);
+        let sub = match pick(&mut s, &f, STORAGE_ROW) {
+            Advance::Frame(f) => f,
+            _ => panic!(),
+        };
+        match pick(&mut s, &sub, CANCEL_ROW) {
+            Advance::Frame(root) => assert_eq!(root.choices, f.choices),
+            _ => panic!("submenu Cancel must return to the root Mog Menu"),
+        }
+        assert!(s.active());
+    }
+
+    #[test]
+    fn delivery_box_opens_receive_send_stubs() {
+        let mut s = LocalMenuSession::new();
+        let f = s.open_mog_menu(None, None);
+        let sub = match pick(&mut s, &f, DELIVERY_BOX_ROW) {
+            Advance::Frame(f) => f,
+            _ => panic!("Delivery Box opens the Receive/Send submenu"),
+        };
+        assert_eq!(sub.prompt.as_deref(), Some(DELIVERY_PROMPT));
+        assert_eq!(sub.choices, vec![RECEIVE_ROW, SEND_ROW, CANCEL_ROW]);
+        for row in [RECEIVE_ROW, SEND_ROW] {
+            match pick(&mut s, &sub, row) {
+                Advance::Stub { notice, frame } => {
+                    assert!(notice.contains("kuluu-opg8"));
+                    assert_eq!(frame.choices, sub.choices);
+                }
+                _ => panic!("`{row}` must stub"),
             }
-            _ => panic!("delivery box must stub"),
         }
         assert!(s.active());
     }

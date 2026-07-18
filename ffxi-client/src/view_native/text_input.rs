@@ -2425,17 +2425,16 @@ fn confirm_dialog_choice(
 }
 
 fn mog_menu_storage_choice(d: &ffxi_viewer_wire::DialogState, choice: u32) -> Option<u8> {
-    use ffxi_client::local_menu::{MOG_LOCKER_ROW, MOG_MENU_ID, MOG_SAFE_ROW, STORAGE_ROW};
-    use ffxi_proto::map::container as c;
+    use ffxi_client::local_menu::{storage_row_container, MOG_MENU_ID, STORAGE_PROMPT};
     if d.npc_id != MOG_MENU_ID {
         return None;
     }
-    match d.choices.get(choice as usize)?.as_str() {
-        MOG_SAFE_ROW => Some(c::LOC_MOGSAFE),
-        STORAGE_ROW => Some(c::LOC_STORAGE),
-        MOG_LOCKER_ROW => Some(c::LOC_MOGLOCKER),
-        _ => None,
+    // Storage rows only exist inside the Storage submenu; the prompt check keeps
+    // the root menu's "Storage" row (which opens that submenu) from matching.
+    if d.prompt.as_deref() != Some(STORAGE_PROMPT) {
+        return None;
     }
+    storage_row_container(d.choices.get(choice as usize)?.as_str())
 }
 
 /// The Items window opened directly on `container` (from a Mog Menu storage row).
