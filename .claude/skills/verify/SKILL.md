@@ -20,6 +20,7 @@ work splits into four steps; each has a reference file with the exact recipes.
 1. Stack up      → references/stack.md      (colima/docker bring-up + env gotchas)
 2. Pick surface  → table below
 3. Drive + observe → references/drive-headless.md | references/drive-gui.md
+                     (mechanical drive loops → haiku subagent, see below)
 4. Evidence      → JSON events / tracing log / screenshots, quoted in the report
 5. Record it     → scripts/record-evidence.sh (feeds the stop-hook verify gate)
 ```
@@ -49,6 +50,31 @@ Two constraints shape everything:
   set the scene up programmatically, then either capture screenshots externally
   or hand the window to the user for the input-driven part — say exactly which
   observations still need their eyes.
+
+## Delegating the drive loop (cheap models)
+
+Driving is mostly mechanical: long runs of small tool calls (MCP waits, stdio
+commands, capture/read cycles) with little reasoning per step. Don't spend the
+orchestrating model's time and context on that — spawn a subagent with the
+Agent tool using `model: haiku` to run the loop, and keep the judgment work
+(picking the surface, interpreting evidence, writing the report) here.
+
+The driver's brief must be self-contained — it inherits none of your context:
+
+- exact commands, not intent: paste the launch/attach/drive invocations from
+  the reference file rather than making a small model re-derive them;
+- the goal phrased observably ("stop when `zone_changed` fires with zone 231",
+  not "zone the character");
+- where to save artifacts (`artifacts/verify/…`) and what to return: artifact
+  paths plus the observed event/log lines — never a bare "done";
+- an escalation rule: if state is ambiguous, or two consecutive actions change
+  nothing, stop and report what it saw — a confused driver that keeps sending
+  commands destroys the scene you set up.
+
+Interpretation stays here: read the returned artifacts yourself before citing
+them as evidence. If the driving itself needs judgment (bisecting which layer
+is broken, probing off the happy path), do it inline — delegation is for the
+mechanical middle, not the thinking.
 
 ## Character strategy
 
