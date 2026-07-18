@@ -219,6 +219,24 @@ here: read the returned captures yourself before citing them for parity.
 When a drive session teaches something durable (launcher quirk, focus
 gotcha, better key recipe), fold it into this file in the same commit.
 
+## Opening the self Commands/Items menu (windowed VM mode)
+
+Hard-won recipe — do NOT rediscover this:
+
+1. If `hxi.sh show`/`window` reports no visible window, raise the VM: Parallels Desktop → Window menu → "Windows 11".
+2. **Click the game sub-window's titlebar** (not the 3D viewport) to give it host keyboard focus. Without this, keys behave erratically (Enter targets a random NPC, clicks miss the HUD).
+3. `key f1` — targets self. (Enter alone does NOT open a self menu; it targets the nearest NPC. Tab only cycles NPCs.)
+4. `key 36` (Enter) — opens the **Commands** menu. Order: Chat, Magic, Abilities, Trust, Items, Trade, Check.
+5. `key down` ×4 → Enter — opens **Items** (top bar `Items 10/20 Select an item.`; 10 items per page).
+6. **Using an item takes TWO Enters**: Enter on the item opens a flashing **sub-target cursor** over the character (looks like a small blue shield/arrow above the head) — press Enter AGAIN to confirm the target and actually use the item. If you stop after the first Enter, nothing is consumed and the cursor eventually times out. Do not mistake the flashing sub-target cursor for an activation/buff indicator.
+
+Logout: main menu (`-` key) → Log Out → confirm dialog **defaults to No** — press Left to reach Yes before Enter.
+
+## Chat log caveats
+
+- The colored in-game chat font is **not OCR-readable** via `hxi.sh ocr` under any observed condition.
+- The chat log **fully clears/fades ~30s after the last message**. Capture item-use confirmation lines within a few seconds of the action, or skip chat and verify via the inventory list / item tooltip (stack count, recast timer) instead.
+
 ## Subagent delegation (REQUIRED)
 
 Observation loops are screenshot-heavy and burn main-agent context. Delegate them:
