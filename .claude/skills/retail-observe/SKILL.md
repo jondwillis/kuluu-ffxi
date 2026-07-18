@@ -218,3 +218,13 @@ here: read the returned captures yourself before citing them for parity.
 
 When a drive session teaches something durable (launcher quirk, focus
 gotcha, better key recipe), fold it into this file in the same commit.
+
+## Subagent delegation (REQUIRED)
+
+Observation loops are screenshot-heavy and burn main-agent context. Delegate them:
+
+- Use the Agent tool with `model: "haiku"` (haiku-4-5) for mechanical capture loops — press key / capture / read image / report what changed. Give it the exact `scripts/hxi.sh` invocations and key codes it needs.
+- Use `model: "sonnet"` (sonnet-5) when the loop requires judgment (navigating unfamiliar menus, deciding next action from what's on screen, comparing against expected retail behavior).
+- The main agent should only receive the subagent's *findings* (text + paths to the few decisive screenshots), never the full capture stream.
+- Subagent prompts must include: window/scale info (`capture` prints it), the "divide px coords by scale for click" rule, key codes (36=Enter, up/down arrows), and hard limits on what game actions are allowed (which items/menus may be touched).
+- In-game actions that consume items or charges must be explicitly listed in the subagent prompt as allowed; anything else is read-only observation.

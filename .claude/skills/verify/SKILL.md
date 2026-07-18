@@ -132,3 +132,12 @@ When a verification session teaches something durable — a new env failure
 mode, a better drive recipe, a lifted blocker — fold it into the matching
 reference file in the same commit as the fix or finding. This skill rots
 fastest at the env-gotcha layer.
+
+## Subagent delegation (REQUIRED)
+
+Verification runs (headless captures, GUI drives, retail comparisons) should run in subagents to keep the main context clean:
+
+- `model: "haiku"` (haiku-4-5): mechanical evidence collection — run the documented commands, capture, read, report deltas.
+- `model: "sonnet"` (sonnet-5): judgment passes — driving the client through menus, comparing local output against retail references, deciding pass/fail per criterion.
+- Main agent receives only verdicts + evidence paths (artifacts/verify/...), not raw screenshot streams.
+- Give subagents the exact scripts (`scripts/`, `references/drive-headless.md`, `references/drive-gui.md`) and the specific criteria to check; they should not improvise scope.
