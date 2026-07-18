@@ -103,11 +103,24 @@ vm_window() {
 # Window menu. Focus (and the Space) snaps back to the terminal the moment a
 # shell invocation ends, so callers must raise AND act in the same invocation —
 # need_window does this automatically.
+# The System Events process name differs per install: GUI builds expose
+# "Parallels Desktop", others only the client/VM processes — try each, then
+# fall back to AXRaise on the VM console window directly.
 raise_window() {
-  osascript -e 'tell application "System Events" to tell process "Parallels Desktop"
-    set frontmost to true
-    click menu item "'"$VM_NAME"'" of menu "Window" of menu bar 1
-  end tell' >/dev/null 2>&1
+  local p
+  for p in "Parallels Desktop" "prl_client_app"; do
+    osascript -e 'tell application "System Events" to tell process "'"$p"'"
+      set frontmost to true
+      click menu item "'"$VM_NAME"'" of menu "Window" of menu bar 1
+    end tell' >/dev/null 2>&1 && return 0
+  done
+  for p in "prl_client_app" "prl_vm_app"; do
+    osascript -e 'tell application "System Events" to tell process "'"$p"'"
+      set frontmost to true
+      if (count of windows) > 0 then perform action "AXRaise" of window "'"$VM_NAME"'"
+    end tell' >/dev/null 2>&1 && return 0
+  done
+  return 1
 }
 
 need_window() {
