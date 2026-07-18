@@ -507,10 +507,47 @@ const COMMANDS: &[(&str, &[Command])] = &[
         ],
     ),
     (
-        "Status & Menus",
+        "Emotes",
         &[
             Command {
-                aliases: &["sit", "kneel"],
+                aliases: &["emote"],
+                usage: "<name> [motion|text]",
+                summary: "canned emote by name — every table emote also works directly (/wave, /bow, /dance1…)",
+                handler: |c| parse_named_emote_args(c.rest, c),
+            },
+            Command {
+                aliases: &["em"],
+                usage: "<text>",
+                summary: "free-form custom emote (zone chat channel 8)",
+                handler: |c| chat_or_empty(c.rest, ffxi_proto::map::chat_kind::EMOTION, "/em"),
+            },
+            Command {
+                aliases: &["jobemote"],
+                usage: "[war|mnk|…] [motion|text]",
+                summary: "job gesture (defaults to current main job; needs its JOB_GESTURE key item)",
+                handler: |c| parse_jobemote(c.rest, c),
+            },
+            Command {
+                aliases: &["bell"],
+                usage: "<c4..c6|6..30> [motion|text]",
+                summary: "ring an equipped bell at a note (two octaves from c4)",
+                handler: |c| parse_bell(c.rest, c),
+            },
+            Command {
+                aliases: &["emotelist"],
+                usage: "",
+                summary: "request job-emote/chair unlock flags (c2s 0x119)",
+                handler: |_| SlashOutcome::Command(AgentCommand::RequestEmoteList),
+            },
+        ],
+    ),
+    (
+        "Status & Menus",
+        &[
+            // "kneel" is deliberately NOT an alias here: retail /kneel is the
+            // canned emote (id 3), resolved via the emote fallback.
+            Command {
+                aliases: &["sit"],
                 usage: "[on|off]",
                 summary: "sit (locks movement; any movement key stands)",
 
@@ -602,6 +639,12 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 usage: "[show|hide|toggle|mode <top|retail|auto>|cull <N>|zoom ...]",
                 summary: "drive the minimap HUD (visibility, backend, cull, zoom)",
                 handler: |c| parse_minimap(c.rest),
+            },
+            Command {
+                aliases: &["clock"],
+                usage: "[show|hide|toggle]",
+                summary: "toggle the Vana'diel clock widget (same state as the Current Time menu entry)",
+                handler: |c| parse_clock(c.rest),
             },
             Command {
                 aliases: &["sound", "audio", "mute"],
@@ -960,6 +1003,8 @@ pub enum SlashOutcome {
 
     SetNetStatus(Option<bool>),
 
+    SetVanaClock(Option<bool>),
+
     /// `Some(scale)` sets the 3D render scale (0.25–2.0); `None` reports it.
     SetRenderScale(Option<f32>),
 
@@ -1125,8 +1170,172 @@ pub fn parse_slash(
         .find(|c| c.aliases.contains(&cmd.as_str()))
     {
         Some(command) => (command.handler)(&ctx),
-        None => unknown_command(&cmd),
+        // Every scraped emote name is its own command (/wave, /bow, …); the
+        // table lookup runs after the explicit commands so it can never shadow
+        // one.
+        None => match parse_canned_emote(&cmd, rest, &ctx) {
+            Some(outcome) => outcome,
+            None => unknown_command(&cmd),
+        },
     }
+}
+
+/// Resolve the emote target: the currently selected entity, or untargeted.
+fn emote_target(ctx: &SlashCtx) -> (Option<u32>, Option<u16>) {
+    let ent = ctx
+        .current_target
+        .and_then(|id| ctx.entities.iter().find(|e| e.id == id));
+    (ent.map(|e| e.id), ent.map(|e| e.act_index))
+}
+
+/// `[motion|text]` trailing argument → EmoteMode (default All; XiPackets
+/// client 0x005D: 'motion' → 2, 'text' → 1).
+fn parse_emote_mode(arg: &str) -> Option<u8> {
+    use ffxi_proto::map::emote::mode;
+    match arg {
+        "" => Some(mode::ALL),
+        "motion" => Some(mode::MOTION),
+        "text" => Some(mode::TEXT),
+        _ => None,
+    }
+}
+
+fn emote_outcome(ctx: &SlashCtx, emote_id: u8, mode_arg: &str, param: u16) -> SlashOutcome {
+    let Some(mode) = parse_emote_mode(mode_arg) else {
+        return SlashOutcome::SystemMessage(format!(
+            "/{}: expected `motion` or `text`, got `{mode_arg}`",
+            ctx.cmd
+        ));
+    };
+    let (target_id, target_index) = emote_target(ctx);
+    SlashOutcome::Command(AgentCommand::Emote {
+        emote_id,
+        mode,
+        param,
+        target_id,
+        target_index,
+    })
+}
+
+/// A bare `/wave`-style command: the word is a scraped emote name. `None` when
+/// it isn't one (falls through to unknown-command).
+fn parse_canned_emote(cmd: &str, rest: &str, ctx: &SlashCtx) -> Option<SlashOutcome> {
+    use ffxi_proto::map::emote;
+    let id = ffxi_proto::emote_names::id_for_command(cmd)?;
+    if emote::HELM_ONLY.contains(&id) || id == emote::BELL || id == emote::JOB {
+        // HELM ids are server-initiated; Bell/Job have their own commands.
+        return None;
+    }
+    Some(emote_outcome(ctx, id, rest, 0))
+}
+
+fn parse_named_emote_args(rest: &str, ctx: &SlashCtx) -> SlashOutcome {
+    let mut parts = rest.split_whitespace();
+    let Some(name) = parts.next() else {
+        return SlashOutcome::SystemMessage("/emote: usage `/emote <name> [motion|text]`".into());
+    };
+    match parse_canned_emote(name, parts.next().unwrap_or(""), ctx) {
+        Some(outcome) => outcome,
+        None => SlashOutcome::SystemMessage(format!("/emote: unknown emote `{name}`")),
+    }
+}
+
+fn parse_jobemote(rest: &str, ctx: &SlashCtx) -> SlashOutcome {
+    use ffxi_proto::map::emote;
+    let mut parts = rest.split_whitespace();
+    let job_arg = parts.next().unwrap_or("");
+    let mode_arg = parts.next().unwrap_or("");
+    let job_id = if job_arg.is_empty() {
+        ctx.self_char_id
+            .and_then(|id| ctx.party.iter().find(|m| m.id == id))
+            .map(|m| m.main_job as u16)
+            .unwrap_or(0)
+    } else {
+        resolve_job_id(job_arg).unwrap_or(0)
+    };
+    if job_id == 0 {
+        return SlashOutcome::SystemMessage(format!(
+            "/jobemote: unknown job `{job_arg}` (use WAR/MNK/… or omit for main job)"
+        ));
+    }
+    emote_outcome(
+        ctx,
+        emote::JOB,
+        mode_arg,
+        emote::JOB_PARAM_BASE + (job_id - 1),
+    )
+}
+
+fn resolve_job_id(arg: &str) -> Option<u16> {
+    if let Ok(id) = arg.parse::<u16>() {
+        return ffxi_proto::job_names::lookup(id).map(|_| id);
+    }
+    (1..=u8::MAX as u16).find(|&id| {
+        ffxi_proto::job_names::abbrev(id).is_some_and(|a| a.eq_ignore_ascii_case(arg))
+            || ffxi_proto::job_names::lookup(id).is_some_and(|n| n.eq_ignore_ascii_case(arg))
+    })
+}
+
+fn parse_bell(rest: &str, ctx: &SlashCtx) -> SlashOutcome {
+    use ffxi_proto::map::emote;
+    let mut parts = rest.split_whitespace();
+    let note_arg = parts.next().unwrap_or("");
+    let mode_arg = parts.next().unwrap_or("");
+    let Some(param) = parse_bell_note(note_arg) else {
+        return SlashOutcome::SystemMessage(format!(
+            "/bell: bad note `{note_arg}` (c4..c6, e.g. c4 d#4 eb5, or {}..{})",
+            emote::BELL_NOTE_MIN,
+            emote::BELL_NOTE_MAX
+        ));
+    };
+    emote_outcome(ctx, emote::BELL, mode_arg, param)
+}
+
+/// A bell note as its wire Param: raw 6..=30, or a note name over the
+/// two-octave c4..c6 range (c4 = 6, chromatic; the retail parser's exact
+/// syntax is a retail unknown, bead kuluu-d4u).
+fn parse_bell_note(arg: &str) -> Option<u16> {
+    use ffxi_proto::map::emote::{BELL_NOTE_MAX, BELL_NOTE_MIN};
+    let in_range = |p: u16| (BELL_NOTE_MIN..=BELL_NOTE_MAX).contains(&p).then_some(p);
+    if let Ok(raw) = arg.parse::<u16>() {
+        return in_range(raw);
+    }
+    let lower = arg.to_ascii_lowercase();
+    let mut chars = lower.chars();
+    let letter = chars.next()?;
+    let semitone: i16 = match letter {
+        'c' => 0,
+        'd' => 2,
+        'e' => 4,
+        'f' => 5,
+        'g' => 7,
+        'a' => 9,
+        'b' => 11,
+        _ => return None,
+    };
+    let mut next = chars.next()?;
+    let accidental = match next {
+        '#' => {
+            next = chars.next()?;
+            1
+        }
+        'b' => {
+            next = chars.next()?;
+            -1
+        }
+        _ => 0,
+    };
+    if chars.next().is_some() {
+        return None;
+    }
+    let octave = next.to_digit(10)? as i16;
+    const BASE_OCTAVE: i16 = 4;
+    const SEMITONES_PER_OCTAVE: i16 = 12;
+    let param = BELL_NOTE_MIN as i16
+        + (octave - BASE_OCTAVE) * SEMITONES_PER_OCTAVE
+        + semitone
+        + accidental;
+    u16::try_from(param).ok().and_then(in_range)
 }
 
 pub use ffxi_viewer_core::snapshot::system_chat_line;
@@ -2340,6 +2549,21 @@ fn parse_netstat(rest: &str) -> SlashOutcome {
     SlashOutcome::SetNetStatus(setting)
 }
 
+fn parse_clock(rest: &str) -> SlashOutcome {
+    let arg = rest.trim().to_ascii_lowercase();
+    let setting = match arg.as_str() {
+        "" | "toggle" => None,
+        "on" | "show" => Some(true),
+        "off" | "hide" => Some(false),
+        other => {
+            return SlashOutcome::SystemMessage(format!(
+                "/clock: bad arg `{other}` (use show|hide|toggle)"
+            ));
+        }
+    };
+    SlashOutcome::SetVanaClock(setting)
+}
+
 fn parse_renderscale(rest: &str) -> SlashOutcome {
     let a = rest.trim();
     if a.is_empty() {
@@ -3330,10 +3554,15 @@ mod tests {
             other => panic!("expected SetSitStance(Toggle), got {other:?}"),
         }
 
-        match parse_slash_t("/kneel", &empty_entities(), origin(), None, None) {
-            SlashOutcome::SetSitStance(t) => assert_eq!(t, SitToggle::Toggle),
-            other => panic!("expected SetSitStance(Toggle), got {other:?}"),
-        }
+        // /kneel is the canned emote (id 3) — no longer a /sit alias.
+        let (id, ..) = expect_emote(parse_slash_t(
+            "/kneel",
+            &empty_entities(),
+            origin(),
+            None,
+            None,
+        ));
+        assert_eq!(id, 3);
     }
 
     #[test]
@@ -4519,6 +4748,136 @@ mod tests {
                              fallthrough"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    fn expect_emote(outcome: SlashOutcome) -> (u8, u8, u16, Option<u32>, Option<u16>) {
+        match outcome {
+            SlashOutcome::Command(AgentCommand::Emote {
+                emote_id,
+                mode,
+                param,
+                target_id,
+                target_index,
+            }) => (emote_id, mode, param, target_id, target_index),
+            other => panic!("expected an Emote command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canned_emote_names_are_commands() {
+        use ffxi_proto::map::emote::mode;
+        let rabbit = ent(9, "Wild Rabbit", EntityKind::Mob, 1.0, 1.0);
+        let (id, mode, param, tid, tidx) = expect_emote(parse_slash_t(
+            "/wave",
+            std::slice::from_ref(&rabbit),
+            WireVec3::default(),
+            Some(9),
+            None,
+        ));
+        assert_eq!((id, mode, param), (8, mode::ALL, 0));
+        assert_eq!((tid, tidx), (Some(9), Some(9)));
+
+        let (_, mode, _, tid, _) = expect_emote(parse_slash_t(
+            "/wave motion",
+            &[],
+            WireVec3::default(),
+            None,
+            None,
+        ));
+        assert_eq!(mode, mode::MOTION);
+        assert_eq!(tid, None, "no selection → untargeted");
+
+        assert!(matches!(
+            parse_slash_t("/wave sideways", &[], WireVec3::default(), None, None),
+            SlashOutcome::SystemMessage(_)
+        ));
+        // /kneel is the emote, not a sit alias.
+        let (id, ..) = expect_emote(parse_slash_t(
+            "/kneel",
+            &[],
+            WireVec3::default(),
+            None,
+            None,
+        ));
+        assert_eq!(id, 3);
+        // HELM emotes are server-initiated only.
+        assert!(matches!(
+            parse_slash_t("/logging", &[], WireVec3::default(), None, None),
+            SlashOutcome::SystemMessage(_)
+        ));
+    }
+
+    #[test]
+    fn jobemote_maps_job_to_param_base() {
+        use ffxi_proto::map::emote;
+        let (id, _, param, ..) = expect_emote(parse_slash_t(
+            "/jobemote war",
+            &[],
+            WireVec3::default(),
+            None,
+            None,
+        ));
+        assert_eq!(id, emote::JOB);
+        assert_eq!(param, emote::JOB_PARAM_BASE, "WAR(1) → 0x1F");
+        let (_, _, param, ..) = expect_emote(parse_slash_t(
+            "/jobemote RUN",
+            &[],
+            WireVec3::default(),
+            None,
+            None,
+        ));
+        assert_eq!(param, emote::JOB_PARAM_BASE + 21, "RUN(22) → 0x34");
+        assert!(matches!(
+            parse_slash_t("/jobemote xyz", &[], WireVec3::default(), None, None),
+            SlashOutcome::SystemMessage(_)
+        ));
+    }
+
+    #[test]
+    fn bell_notes_span_the_two_octave_wire_range() {
+        use ffxi_proto::map::emote;
+        assert_eq!(parse_bell_note("c4"), Some(emote::BELL_NOTE_MIN));
+        assert_eq!(parse_bell_note("c#4"), Some(emote::BELL_NOTE_MIN + 1));
+        assert_eq!(parse_bell_note("db4"), Some(emote::BELL_NOTE_MIN + 1));
+        assert_eq!(parse_bell_note("c5"), Some(emote::BELL_NOTE_MIN + 12));
+        assert_eq!(parse_bell_note("c6"), Some(emote::BELL_NOTE_MAX));
+        assert_eq!(parse_bell_note("6"), Some(emote::BELL_NOTE_MIN));
+        assert_eq!(parse_bell_note("30"), Some(emote::BELL_NOTE_MAX));
+        assert_eq!(parse_bell_note("c#6"), None, "past the top octave");
+        assert_eq!(parse_bell_note("31"), None);
+        assert_eq!(parse_bell_note("h4"), None);
+
+        let (id, _, param, ..) = expect_emote(parse_slash_t(
+            "/bell e4",
+            &[],
+            WireVec3::default(),
+            None,
+            None,
+        ));
+        assert_eq!(id, emote::BELL);
+        assert_eq!(param, emote::BELL_NOTE_MIN + 4);
+    }
+
+    /// The emote fallback runs after the COMMANDS lookup, so an alias equal to
+    /// a scraped emote name would silently shadow the emote — forbid it
+    /// (Bell/Job keep dedicated commands with required args).
+    #[test]
+    fn no_alias_shadows_a_scraped_emote_name() {
+        use ffxi_proto::map::emote;
+        for &(id, name) in ffxi_proto::emote_names::EMOTES {
+            if emote::HELM_ONLY.contains(&id) || id == emote::BELL || id == emote::JOB {
+                continue;
+            }
+            let lower = name.to_lowercase();
+            for (category, cmds) in COMMANDS {
+                for cmd in *cmds {
+                    assert!(
+                        !cmd.aliases.contains(&lower.as_str()),
+                        "alias `/{lower}` in `{category}` shadows emote {id}"
+                    );
                 }
             }
         }

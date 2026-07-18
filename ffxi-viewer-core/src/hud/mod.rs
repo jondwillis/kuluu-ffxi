@@ -153,6 +153,7 @@ impl Plugin for HudPlugin {
         app.init_resource::<HudVerbosity>();
         app.init_resource::<HudPanels>();
         app.init_resource::<network_status::NetStatusVisible>();
+        app.init_resource::<vana_clock::VanaClockVisible>();
 
         app.init_resource::<menu::DynamicMenu>();
 
@@ -261,6 +262,7 @@ impl Plugin for HudPlugin {
             (
                 network_status::update_network_status,
                 network_status::apply_net_status_visibility,
+                vana_clock::apply_vana_clock_visibility,
             ),
         );
         app.add_systems(Update, chat_panel::chat_tab_click_system);

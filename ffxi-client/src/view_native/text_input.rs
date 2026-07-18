@@ -49,6 +49,10 @@ pub struct SlashWriters<'w, 's> {
 
     pub net_status_visible: ResMut<'w, ffxi_viewer_core::hud::network_status::NetStatusVisible>,
 
+    pub vana_clock: Res<'w, ffxi_viewer_core::vana_time::VanaClock>,
+
+    pub vana_clock_visible: ResMut<'w, ffxi_viewer_core::hud::vana_clock::VanaClockVisible>,
+
     pub minimap_mode: ResMut<'w, ffxi_viewer_core::minimap::MinimapMode>,
 
     pub minimap_visible: ResMut<'w, ffxi_viewer_core::minimap::MinimapVisible>,
@@ -88,6 +92,8 @@ pub struct MenuConfirmWriters<'w> {
     pub status_profile_open: ResMut<'w, ffxi_viewer_core::hud::status_panel::StatusProfileOpen>,
     pub hud_panels: ResMut<'w, ffxi_viewer_core::hud::HudPanels>,
     pub net_status: ResMut<'w, ffxi_viewer_core::hud::network_status::NetStatusVisible>,
+    pub vana_clock: Res<'w, ffxi_viewer_core::vana_time::VanaClock>,
+    pub vana_clock_visible: ResMut<'w, ffxi_viewer_core::hud::vana_clock::VanaClockVisible>,
     pub item_screen_container: ResMut<'w, ffxi_viewer_core::hud::item_screen::ItemScreenContainer>,
 }
 use tokio::sync::mpsc::Sender;
@@ -239,6 +245,8 @@ pub fn text_input_system(
                     &mut slash_writers.status_profile_open,
                     &mut slash_writers.hud_panels,
                     &mut slash_writers.net_status_visible,
+                    &slash_writers.vana_clock,
+                    &mut slash_writers.vana_clock_visible,
                     &mut slash_writers.sort_options,
                     &mut slash_writers.item_menu_focus,
                     &mut slash_writers.item_screen_container,
@@ -1259,6 +1267,14 @@ fn apply_slash_outcome(
                 format!("/netstat: {}", if next { "on" } else { "off" }),
             );
         }
+        SlashOutcome::SetVanaClock(setting) => {
+            let next = setting.unwrap_or(!slash_writers.vana_clock_visible.0);
+            slash_writers.vana_clock_visible.0 = next;
+            push_system_chat_line(
+                scene_state,
+                format!("/clock: {}", if next { "shown" } else { "hidden" }),
+            );
+        }
         SlashOutcome::SetRenderScale(setting) => {
             let g = &mut *slash_writers.graphics;
             if let Some(v) = setting {
@@ -1609,12 +1625,16 @@ fn apply_slash_outcome(
                 ffxi_viewer_core::MenuKind::Magic => "Magic".into(),
                 ffxi_viewer_core::MenuKind::Abilities => "Abilities".into(),
                 ffxi_viewer_core::MenuKind::Items => "Items".into(),
+                ffxi_viewer_core::MenuKind::KeyItems => "Key Items".into(),
                 ffxi_viewer_core::MenuKind::Equipment => "Equipment".into(),
                 ffxi_viewer_core::MenuKind::Root => "Root".into(),
                 ffxi_viewer_core::MenuKind::Config => "Config".into(),
                 ffxi_viewer_core::MenuKind::Debug => "Debug".into(),
                 ffxi_viewer_core::MenuKind::Graphics => "Graphics".into(),
                 ffxi_viewer_core::MenuKind::Status => "Status".into(),
+
+                ffxi_viewer_core::MenuKind::Communication => "Communication".into(),
+                ffxi_viewer_core::MenuKind::EmoteList => "Emote List".into(),
 
                 ffxi_viewer_core::MenuKind::ItemAction { item_no, .. } => {
                     format!("ItemAction({item_no})").into()
@@ -1914,6 +1934,7 @@ fn push_local_chat_line(scene_state: &mut SceneState, kind: u8, text: String) {
         4 => ChatChannel::Party,
         5 => ChatChannel::Linkshell,
         0x1A => ChatChannel::Yell,
+        k if k == ffxi_proto::map::chat_kind::EMOTION => ChatChannel::Emote,
         _ => ChatChannel::Other,
     };
     let sender = scene_state
@@ -1964,8 +1985,16 @@ fn apply_graphics_cycle(
 }
 
 fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
-    use ffxi_viewer_core::hud::menu::{ROOT_LOG_OUT, ROOT_SHUT_DOWN};
+    use ffxi_viewer_core::hud::menu::{
+        COMM_EMOTE_LIST, ROOT_COMMUNICATION, ROOT_LOG_OUT, ROOT_SHUT_DOWN,
+    };
     match (kind, label) {
+        (MenuKind::Root, l) if l == ROOT_COMMUNICATION => {
+            MenuDispatch::OpenSubmenu(MenuKind::Communication)
+        }
+        (MenuKind::Communication, l) if l == COMM_EMOTE_LIST => {
+            MenuDispatch::OpenSubmenu(MenuKind::EmoteList)
+        }
         (MenuKind::Root, ROOT_LOG_OUT) => MenuDispatch::CommandWithToast {
             cmd: AgentCommand::ReqLogout {
                 kind: ReqLogoutKind::LogoutToggle,
@@ -1993,9 +2022,7 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
         (MenuKind::Root, "Magic") => MenuDispatch::OpenSubmenu(MenuKind::Magic),
         (MenuKind::Root, "Abilities") => MenuDispatch::OpenSubmenu(MenuKind::Abilities),
         (MenuKind::Root, "Items") => MenuDispatch::OpenSubmenu(MenuKind::Items),
-        (MenuKind::Root, "Key Items") => {
-            MenuDispatch::NotImplemented("Key Items — pending submenu (s2c 0x055 decoded)".into())
-        }
+        (MenuKind::Root, "Key Items") => MenuDispatch::OpenSubmenu(MenuKind::KeyItems),
         (MenuKind::Root, "Equipment") => MenuDispatch::OpenSubmenu(MenuKind::Equipment),
 
         (MenuKind::Root, "Status") => MenuDispatch::OpenSubmenu(MenuKind::Status),
@@ -2042,6 +2069,8 @@ fn confirm_menu_at_cursor(
     status_profile_open: &mut ffxi_viewer_core::hud::status_panel::StatusProfileOpen,
     hud_panels: &mut ffxi_viewer_core::hud::HudPanels,
     net_status: &mut ffxi_viewer_core::hud::network_status::NetStatusVisible,
+    vana_clock: &ffxi_viewer_core::vana_time::VanaClock,
+    vana_clock_visible: &mut ffxi_viewer_core::hud::vana_clock::VanaClockVisible,
     dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
     target_id: Option<u32>,
     self_pos: ffxi_viewer_wire::Vec3,
@@ -2054,6 +2083,16 @@ fn confirm_menu_at_cursor(
     if matches!(kind, MenuKind::Debug) {
         let label = ffxi_viewer_core::hud::menu::entry_label(kind, cursor, dynamic);
         toggle_debug_panel(label, hud_panels, net_status, scene_state);
+        return None;
+    }
+
+    if matches!(kind, MenuKind::Root)
+        && ffxi_viewer_core::hud::menu::entry_label(kind, cursor, dynamic)
+            == ffxi_viewer_core::hud::menu::ROOT_CURRENT_TIME
+    {
+        activate_current_time(vana_clock, vana_clock_visible, scene_state);
+        // Mirrors the Debug toggles: the menu stays open (provisional pending
+        // retail capture, bead kuluu-y5hq retail_unknowns).
         return None;
     }
 
@@ -2125,6 +2164,19 @@ fn confirm_menu_at_cursor(
                 });
                 return None;
             }
+            // Retail's key-item detail pane needs a description DAT not yet
+            // identified (bead kuluu-h7x retail_unknowns); echo the name and
+            // keep the list open.
+            if let A::KeyItem { id } = action {
+                push_system_chat_line(
+                    scene_state,
+                    format!(
+                        "Key item: {}.",
+                        ffxi_viewer_core::hud::menu::key_item_row_label(id, true)
+                    ),
+                );
+                return None;
+            }
             let moved = matches!(action, A::MoveItem { .. });
             let entities = scene_state.snapshot.entities.clone();
             dispatch_dynamic_menu_action(
@@ -2164,6 +2216,11 @@ fn confirm_menu_at_cursor(
             Some(InputMode::World)
         }
         MenuDispatch::OpenSubmenu(submenu) => {
+            // Refresh the job-emote/chair unlock bits whenever the Emote List
+            // opens (c2s 0x119 → s2c 0x11A gates the Job row).
+            if submenu == MenuKind::EmoteList {
+                let _ = cmd_tx.try_send(AgentCommand::RequestEmoteList);
+            }
             stack.push(submenu);
             None
         }
@@ -2180,6 +2237,17 @@ fn confirm_menu_at_cursor(
             push_system_chat_line(scene_state, format!("[menu] {label} — not implemented"));
             None
         }
+    }
+}
+
+fn activate_current_time(
+    vana_clock: &ffxi_viewer_core::vana_time::VanaClock,
+    vana_clock_visible: &mut ffxi_viewer_core::hud::vana_clock::VanaClockVisible,
+    scene_state: &mut SceneState,
+) {
+    vana_clock_visible.0 = !vana_clock_visible.0;
+    for line in ffxi_viewer_core::hud::vana_clock::current_time_chat_lines(vana_clock) {
+        push_system_chat_line(scene_state, line);
     }
 }
 
@@ -2355,8 +2423,42 @@ fn dispatch_dynamic_menu_action(
                 to_slot: None,
             },
         ),
+        A::Emote { emote_id } => {
+            use ffxi_proto::map::emote;
+            // Untargeted unless something is selected (UniqueNo/ActIndex 0).
+            let target = target_id.and_then(|id| entities.iter().find(|e| e.id == id));
+            let param = match emote_id {
+                id if id == emote::BELL => emote::BELL_NOTE_MIN,
+                id if id == emote::JOB => {
+                    let main_job = scene_state
+                        .snapshot
+                        .self_char_id
+                        .and_then(|id| scene_state.snapshot.party.iter().find(|m| m.id == id))
+                        .map(|m| m.main_job)
+                        .unwrap_or(0);
+                    if main_job == 0 {
+                        push_system_chat_line(scene_state, "[menu] jobemote: job unknown".into());
+                        return;
+                    }
+                    emote::JOB_PARAM_BASE + (main_job as u16 - 1)
+                }
+                _ => 0,
+            };
+            (
+                "emote",
+                AgentCommand::Emote {
+                    emote_id,
+                    mode: emote::mode::ALL,
+                    param,
+                    target_id: target.map(|e| e.id),
+                    target_index: target.map(|e| e.act_index),
+                },
+            )
+        }
         // Pushed as a submenu by confirm_menu_at_cursor, never dispatched.
         A::OpenItemAction { .. } => return,
+        // Handled in confirm_menu_at_cursor (chat echo, menu stays open).
+        A::KeyItem { .. } => return,
         A::EquipItem {
             container,
             container_index,
@@ -2517,6 +2619,8 @@ pub fn mouse_nav_dispatch_system(
                 &mut menu_writers.status_profile_open,
                 &mut menu_writers.hud_panels,
                 &mut menu_writers.net_status,
+                &menu_writers.vana_clock,
+                &mut menu_writers.vana_clock_visible,
                 &dynamic_menu,
                 current_target,
                 self_pos,
@@ -2595,6 +2699,8 @@ fn handle_menu_key(
     status_profile_open: &mut ffxi_viewer_core::hud::status_panel::StatusProfileOpen,
     hud_panels: &mut ffxi_viewer_core::hud::HudPanels,
     net_status: &mut ffxi_viewer_core::hud::network_status::NetStatusVisible,
+    vana_clock: &ffxi_viewer_core::vana_time::VanaClock,
+    vana_clock_visible: &mut ffxi_viewer_core::hud::vana_clock::VanaClockVisible,
     sort_options: &mut ffxi_viewer_core::hud::item_detail::SortOptions,
     item_menu_focus: &mut ffxi_viewer_core::hud::item_detail::ItemMenuFocus,
     item_bag: &mut ffxi_viewer_core::hud::item_screen::ItemScreenContainer,
@@ -2737,6 +2843,8 @@ fn handle_menu_key(
             status_profile_open,
             hud_panels,
             net_status,
+            vana_clock,
+            vana_clock_visible,
             dynamic,
             target_id,
             self_pos,
@@ -3099,5 +3207,45 @@ mod menu_dispatch_tests {
                 "{label} should still be a stub"
             );
         }
+    }
+
+    #[test]
+    fn current_time_toggles_widget_and_prints_both_time_lines() {
+        use ffxi_viewer_core::hud::vana_clock::{
+            VanaClockVisible, EARTH_TIME_LINE_PREFIX, VANA_TIME_LINE_PREFIX,
+        };
+        let clock = ffxi_viewer_core::vana_time::VanaClock::anchored_at_hour(12.0);
+        let mut visible = VanaClockVisible::default();
+        let mut scene_state = SceneState::default();
+
+        activate_current_time(&clock, &mut visible, &mut scene_state);
+        assert!(
+            !visible.0,
+            "default-visible widget hides on first activation"
+        );
+        let lines: Vec<&str> = scene_state
+            .local_toasts
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with(VANA_TIME_LINE_PREFIX), "{lines:?}");
+        assert!(lines[1].starts_with(EARTH_TIME_LINE_PREFIX), "{lines:?}");
+
+        activate_current_time(&clock, &mut visible, &mut scene_state);
+        assert!(visible.0, "second activation shows the widget again");
+    }
+
+    #[test]
+    fn current_time_never_reaches_resolve_wired() {
+        // confirm_menu_at_cursor intercepts ROOT_CURRENT_TIME (a
+        // resource-touching entry) before resolve_menu_entry; this pins the
+        // fallback so a lost wiring degrades to a visible "not implemented"
+        // chat line rather than silently dispatching something else.
+        use ffxi_viewer_core::hud::menu::ROOT_CURRENT_TIME;
+        assert_eq!(
+            resolve_menu_entry(MenuKind::Root, ROOT_CURRENT_TIME),
+            MenuDispatch::NotImplemented(ROOT_CURRENT_TIME.into()),
+        );
     }
 }

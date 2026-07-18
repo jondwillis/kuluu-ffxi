@@ -6,6 +6,14 @@ use crate::input_mode::{InputMode, MenuKind};
 
 pub const ROOT_LOG_OUT: &str = "Log Out";
 pub const ROOT_SHUT_DOWN: &str = "Shut Down";
+// Label and position are provisional pending a retail main-menu capture
+// (bead kuluu-y5hq retail_unknowns).
+pub const ROOT_CURRENT_TIME: &str = "Current Time";
+
+// "Communication" position is provisional pending a retail main-menu capture
+// (bead kuluu-d4u retail_unknowns).
+pub const ROOT_COMMUNICATION: &str = "Communication";
+pub const COMM_EMOTE_LIST: &str = "Emote List";
 
 const ROOT_ENTRIES: &[&str] = &[
     "Magic",
@@ -16,13 +24,17 @@ const ROOT_ENTRIES: &[&str] = &[
     "Status",
     "Party",
     "Search",
+    ROOT_COMMUNICATION,
     "Macros",
     "Graphics",
     "Config",
+    ROOT_CURRENT_TIME,
     "Debug",
     ROOT_LOG_OUT,
     ROOT_SHUT_DOWN,
 ];
+
+const COMMUNICATION_ENTRIES: &[&str] = &[COMM_EMOTE_LIST];
 
 const ITEMS_ENTRIES_STUB: &[&str] = &["(Items — Stage 3: pending inventory submenu)"];
 
@@ -79,6 +91,34 @@ pub enum DynamicMenuAction {
         equip_slot: u8,
         item_no: u16,
     },
+
+    /// Terminal Key Items row; selecting it echoes the name to chat, and
+    /// cursoring over it marks the key item seen on menu close (c2s 0x064).
+    KeyItem {
+        id: u16,
+    },
+
+    /// Emote List row: dispatches the same AgentCommand::Emote as the slash
+    /// command, at the current target.
+    Emote {
+        emote_id: u8,
+    },
+}
+
+/// Unseen ("new") key-item indicator suffix. Retail shows a yellow-bubble
+/// glyph whose exact appearance is unverified (bead kuluu-h7x
+/// retail_unknowns); a text marker stands in until a retail capture.
+pub const KEY_ITEM_UNSEEN_SUFFIX: &str = " (new)";
+
+pub fn key_item_row_label(id: u16, seen: bool) -> String {
+    let name = ffxi_proto::key_item_names::lookup(id)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Key Item #{id}"));
+    if seen {
+        name
+    } else {
+        format!("{name}{KEY_ITEM_UNSEEN_SUFFIX}")
+    }
 }
 
 #[derive(bevy::prelude::Resource, Debug, Clone, Default)]
@@ -180,8 +220,10 @@ pub fn is_dynamic(kind: MenuKind) -> bool {
         MenuKind::Magic
             | MenuKind::Abilities
             | MenuKind::Items
+            | MenuKind::KeyItems
             | MenuKind::ItemAction { .. }
             | MenuKind::EquipSlot(_)
+            | MenuKind::EmoteList
     )
 }
 
@@ -226,8 +268,10 @@ fn empty_dynamic_hint(kind: MenuKind) -> &'static str {
         MenuKind::Magic => "(no spells learned yet)",
         MenuKind::Abilities => "(no abilities available — wrong job?)",
         MenuKind::Items => "(bag empty)",
+        MenuKind::KeyItems => "(no key items)",
         MenuKind::ItemAction { .. } => "(item no longer in this bag)",
         MenuKind::EquipSlot(_) => "(no equippable items for this slot)",
+        MenuKind::EmoteList => "(emote table unavailable)",
         _ => "(empty)",
     }
 }
@@ -242,6 +286,7 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
         MenuKind::Magic => &["(Magic — data pending)"],
         MenuKind::Abilities => &["(Abilities — data pending)"],
         MenuKind::Items => ITEMS_ENTRIES_STUB,
+        MenuKind::KeyItems => &[],
 
         MenuKind::Equipment => EQUIPMENT_ENTRIES,
 
@@ -249,6 +294,9 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
 
         MenuKind::ItemAction { .. } => &[],
         MenuKind::EquipSlot(_) => &["(loading equippable items…)"],
+
+        MenuKind::Communication => COMMUNICATION_ENTRIES,
+        MenuKind::EmoteList => &[],
     }
 }
 
@@ -262,9 +310,12 @@ fn menu_title(kind: MenuKind) -> &'static str {
         MenuKind::Magic => "Magic",
         MenuKind::Abilities => "Abilities",
         MenuKind::Items => "Items",
+        MenuKind::KeyItems => "Key Items",
         MenuKind::ItemAction { .. } => "Item",
         MenuKind::Status => "Status",
         MenuKind::EquipSlot(_) => "Equip",
+        MenuKind::Communication => "Communication",
+        MenuKind::EmoteList => "Emote List",
     }
 }
 
@@ -404,6 +455,8 @@ pub fn refresh_dynamic_menu_rows(
                 })
             })
             .collect(),
+        MenuKind::KeyItems => key_item_rows(snap),
+        MenuKind::EmoteList => emote_rows(snap),
         MenuKind::ItemAction {
             container,
             index,
@@ -468,9 +521,64 @@ fn order_dynamic_rows(kind: MenuKind, auto_sort: bool, rows: &mut [DynamicMenuRo
                 rows.sort_by_key(item_row_sort_key);
             }
         }
-        MenuKind::ItemAction { .. } => {}
+        // Key items keep id order: ascending global id groups the 512-id
+        // tables together (whether retail sections match the tables is an
+        // open question, bead kuluu-h7x retail_unknowns). Emotes keep the
+        // scraped-table (id) order.
+        MenuKind::ItemAction { .. } | MenuKind::KeyItems | MenuKind::EmoteList => {}
         _ => rows.sort_by(|a, b| a.label.cmp(&b.label)),
     }
+}
+
+/// One row per owned key item, ascending global id, name from the scraped LSB
+/// table, unseen ids suffixed with [`KEY_ITEM_UNSEEN_SUFFIX`].
+pub fn key_item_rows(snap: &ffxi_viewer_wire::SceneSnapshot) -> Vec<DynamicMenuRow> {
+    let mut ids: Vec<u16> = snap.key_items.clone();
+    ids.sort_unstable();
+    ids.into_iter()
+        .map(|id| DynamicMenuRow {
+            label: key_item_row_label(id, snap.key_items_seen.binary_search(&id).is_ok()),
+            action: DynamicMenuAction::KeyItem { id },
+        })
+        .collect()
+}
+
+/// One row per canned emote from the scraped LSB table (id order): label +
+/// "/command" column. HELM-only ids are server-initiated and skipped; the Job
+/// row appears only when the 0x11A bitfield unlocks the current main job's
+/// gesture (bit = job id - 1).
+pub fn emote_rows(snap: &ffxi_viewer_wire::SceneSnapshot) -> Vec<DynamicMenuRow> {
+    use ffxi_proto::map::emote;
+    let main_job = snap
+        .self_char_id
+        .and_then(|id| snap.party.iter().find(|m| m.id == id))
+        .map(|m| m.main_job)
+        .unwrap_or(0);
+    ffxi_proto::emote_names::EMOTES
+        .iter()
+        .filter(|&&(id, _)| !emote::HELM_ONLY.contains(&id))
+        .filter(|&&(id, _)| {
+            id != emote::JOB
+                || snap
+                    .emote_jobs
+                    .is_some_and(|bits| ffxi_proto::decode::EmoteList::job_bit_set(bits, main_job))
+        })
+        .map(|&(id, name)| DynamicMenuRow {
+            label: format!("{name} (/{})", emote_command_word(id)),
+            action: DynamicMenuAction::Emote { emote_id: id },
+        })
+        .collect()
+}
+
+/// The slash-command word for an emote id — the scraped name lowercased,
+/// except Job whose command is /jobemote.
+pub fn emote_command_word(id: u8) -> String {
+    if id == ffxi_proto::map::emote::JOB {
+        return "jobemote".to_string();
+    }
+    ffxi_proto::emote_names::lookup(id)
+        .map(str::to_lowercase)
+        .unwrap_or_else(|| format!("emote{id}"))
 }
 
 fn item_row_sort_key(row: &DynamicMenuRow) -> u16 {
@@ -985,6 +1093,72 @@ mod tests {
         );
     }
 
+    fn war_party_member(id: u32) -> ffxi_viewer_wire::PartyMember {
+        ffxi_viewer_wire::PartyMember {
+            id,
+            act_index: 0x100,
+            name: Some("Kupo".into()),
+            hp: 30,
+            mp: 0,
+            tp: 0,
+            hp_pct: 100,
+            mp_pct: 0,
+            zone_no: 230,
+            main_job: 1,
+            main_job_lv: 1,
+            sub_job: 0,
+            sub_job_lv: 0,
+            is_party_leader: true,
+            is_alliance_leader: false,
+            in_mog_house: false,
+        }
+    }
+
+    /// Pins the emote-list gating: HELM-only ids never appear (server-initiated,
+    /// emote.h), and the Job row needs both a known main job and its 0x11A bit.
+    #[test]
+    fn emote_rows_skip_helm_and_gate_job_on_0x11a_bits() {
+        use ffxi_proto::map::emote;
+        let mut snap = ffxi_viewer_wire::SceneSnapshot::default();
+        let rows = emote_rows(&snap);
+        assert!(rows.iter().any(|r| r.label == "Wave (/wave)"));
+        assert!(rows.iter().any(|r| r.label == "Aim (/aim)"));
+        assert!(
+            !rows.iter().any(|r| r.label.contains("Logging")),
+            "HELM-only emotes are server-initiated"
+        );
+        let is_job = |r: &DynamicMenuRow| matches!(r.action, DynamicMenuAction::Emote { emote_id } if emote_id == emote::JOB);
+        assert!(
+            !rows.iter().any(is_job),
+            "Job row hidden until 0x11A unlocks it"
+        );
+
+        snap.self_char_id = Some(1);
+        snap.party = vec![war_party_member(1)];
+        snap.emote_jobs = Some(0);
+        assert!(!emote_rows(&snap).iter().any(is_job), "WAR bit not set");
+        snap.emote_jobs = Some(1 << 0);
+        assert!(
+            emote_rows(&snap).iter().any(is_job),
+            "WAR main + WAR gesture bit shows the Job row"
+        );
+
+        snap.party[0].main_job = 33;
+        snap.emote_jobs = Some(u32::MAX);
+        assert!(
+            !emote_rows(&snap).iter().any(is_job),
+            "wire-supplied main job past the u32 bit width reads locked (no shift panic)"
+        );
+    }
+
+    #[test]
+    fn emote_command_words_lowercase_names_except_job() {
+        use ffxi_proto::map::emote;
+        assert_eq!(emote_command_word(8), "wave");
+        assert_eq!(emote_command_word(65), "dance1");
+        assert_eq!(emote_command_word(emote::JOB), "jobemote");
+    }
+
     #[test]
     fn status_labels_match_entries() {
         use crate::hud::status_panel::STATUS_ENTRIES;
@@ -1003,6 +1177,7 @@ mod tests {
             MenuKind::Graphics,
             MenuKind::Equipment,
             MenuKind::Status,
+            MenuKind::Communication,
         ] {
             let total = static_entries(kind).len();
             assert!(
@@ -1015,6 +1190,17 @@ mod tests {
                 "{kind:?} is static and must render every row"
             );
         }
+    }
+
+    #[test]
+    fn current_time_appears_exactly_once_in_root() {
+        assert_eq!(
+            ROOT_ENTRIES
+                .iter()
+                .filter(|l| **l == ROOT_CURRENT_TIME)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1064,6 +1250,34 @@ mod tests {
 
     fn labels(rows: &[DynamicMenuRow]) -> Vec<&str> {
         rows.iter().map(|r| r.label.as_str()).collect()
+    }
+
+    #[test]
+    fn key_item_rows_sorted_by_id_with_unseen_suffix() {
+        // Key items 1/8 = Zeruhn Report / Airship Pass
+        // (vendor/server/scripts/enum/key_item.lua).
+        let snap = ffxi_viewer_wire::SceneSnapshot {
+            key_items: vec![8, 1],
+            key_items_seen: vec![8],
+            ..Default::default()
+        };
+        let rows = key_item_rows(&snap);
+        assert_eq!(
+            labels(&rows),
+            [
+                format!("Zeruhn Report{KEY_ITEM_UNSEEN_SUFFIX}").as_str(),
+                "Airship Pass"
+            ]
+        );
+        assert_eq!(rows[0].action, DynamicMenuAction::KeyItem { id: 1 });
+
+        let mut rows = rows;
+        order_dynamic_rows(MenuKind::KeyItems, true, &mut rows);
+        assert_eq!(
+            rows[0].action,
+            DynamicMenuAction::KeyItem { id: 1 },
+            "key items keep id order, never alphabetical"
+        );
     }
 
     #[test]

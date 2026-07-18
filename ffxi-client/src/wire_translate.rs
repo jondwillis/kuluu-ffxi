@@ -50,6 +50,8 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         job_abilities_known: s.job_abilities_known.clone(),
         weaponskills_known: s.weaponskills_known.clone(),
         pet_abilities_known: s.pet_abilities_known.clone(),
+        key_items: s.key_items.clone(),
+        key_items_seen: s.key_items_seen.clone(),
 
         containers: project_containers(s),
 
@@ -73,6 +75,9 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         }),
 
         mh_2f_unlocked: s.mh_2f_unlocked,
+
+        emote_jobs: s.emote_jobs,
+        emote_chairs: s.emote_chairs,
     }
 }
 
@@ -213,6 +218,20 @@ pub fn event_to_viewer_event(ev: AgentEvent) -> Option<wire::ViewerEvent> {
             action_id,
             action_kind,
         }),
+        AgentEvent::EntityEmoted {
+            actor_id,
+            target_id,
+            emote_id,
+            param,
+            mode,
+            ..
+        } => Some(wire::ViewerEvent::EntityEmoted {
+            actor_id,
+            target_id,
+            emote_id,
+            param,
+            mode,
+        }),
         AgentEvent::VanaTimeSynced { game_time } => {
             Some(wire::ViewerEvent::VanaTimeSynced { game_time })
         }
@@ -336,6 +355,7 @@ pub fn channel_to_wire(c: ChatChannel) -> wire::ChatChannel {
         ChatChannel::Other => wire::ChatChannel::Other,
         ChatChannel::Battle => wire::ChatChannel::Battle,
         ChatChannel::Debug => wire::ChatChannel::Debug,
+        ChatChannel::Emote => wire::ChatChannel::Emote,
     }
 }
 

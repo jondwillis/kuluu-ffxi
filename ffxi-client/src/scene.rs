@@ -187,6 +187,7 @@ fn chat_channel_label(c: ChatChannel) -> &'static str {
         ChatChannel::Battle => "battle",
         ChatChannel::Debug => "dbg",
         ChatChannel::Other => "chat",
+        ChatChannel::Emote => "emote",
     }
 }
 

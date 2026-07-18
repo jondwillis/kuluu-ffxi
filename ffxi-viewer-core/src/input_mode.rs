@@ -58,6 +58,8 @@ pub enum MenuKind {
 
     Items,
 
+    KeyItems,
+
     /// Per-item context menu pushed from the Items window (retail's item
     /// submenu): Use / Take Out / Put in <bag> rows for the focused slot.
     ItemAction {
@@ -71,6 +73,12 @@ pub enum MenuKind {
     Status,
 
     EquipSlot(u8),
+
+    Communication,
+
+    /// Browsable canned-emote list under Communication; rows come from the
+    /// scraped LSB emote table, Job gated on the s2c 0x11A bits.
+    EmoteList,
 }
 
 #[derive(Debug, Clone)]

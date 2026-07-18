@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+// v3: SceneSnapshot emote_jobs/emote_chairs + ViewerEvent::EntityEmoted
+// (postcard frames are not self-describing, so any shape change bumps this).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Vec3 {
@@ -245,6 +247,11 @@ pub enum ChatChannel {
     Battle,
 
     Debug,
+
+    /// Chat kind 8 MESSAGE_EMOTION: canned-emote lines (caster name already
+    /// embedded in `text`, `sender` empty) and free-form /em (`sender` set,
+    /// `text` is the raw emote body).
+    Emote,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +397,16 @@ pub struct SceneSnapshot {
     #[serde(default)]
     pub pet_abilities_known: Vec<u16>,
 
+    /// Owned key-item ids (s2c 0x055 GetItemFlag bitsets), sorted ascending —
+    /// global id = table * 512 + bit.
+    #[serde(default)]
+    pub key_items: Vec<u16>,
+
+    /// Subset of `key_items` already examined (LookItemFlag); an owned id not
+    /// in here renders the unseen ("new") indicator.
+    #[serde(default)]
+    pub key_items_seen: Vec<u16>,
+
     /// Every known item container (main bag + Mog House/global storage), sorted
     /// by container id. Ids are LSB CONTAINER_ID (`ffxi_proto::map::container`).
     #[serde(default)]
@@ -419,6 +436,17 @@ pub struct SceneSnapshot {
     /// bit 0x20 (0x029_item_move.cpp validContainers). `None` = not yet known.
     #[serde(default)]
     pub mh_2f_unlocked: Option<bool>,
+
+    /// Job-emote unlock bitfield from s2c 0x11A (bit = job id - 1, bit 0 =
+    /// WAR); `None` until the server answers a 0x119 request. Gates the
+    /// emote-list menu's Job row.
+    #[serde(default)]
+    pub emote_jobs: Option<u32>,
+
+    /// Chair unlock bitfield from s2c 0x11A (/sitchair; unused until chairs
+    /// exist client-side).
+    #[serde(default)]
+    pub emote_chairs: Option<u16>,
 }
 
 impl SceneSnapshot {
@@ -658,6 +686,16 @@ pub enum ViewerEvent {
         action_kind: u8,
     },
 
+    /// One-shot emote broadcast (s2c 0x05A MOTIONMES): `emote_id` is the wire
+    /// MesNum (job emotes arrive as 74..=95), `mode` the EmoteMode byte.
+    EntityEmoted {
+        actor_id: u32,
+        target_id: u32,
+        emote_id: u16,
+        param: u16,
+        mode: u8,
+    },
+
     VanaTimeSynced {
         game_time: u32,
     },
@@ -840,6 +878,8 @@ mod tests {
             job_abilities_known: Vec::new(),
             weaponskills_known: Vec::new(),
             pet_abilities_known: Vec::new(),
+            key_items: Vec::new(),
+            key_items_seen: Vec::new(),
             containers: Vec::new(),
             stats: None,
             bazaar: Vec::new(),
@@ -850,6 +890,8 @@ mod tests {
                 sub_map: 0,
             }),
             mh_2f_unlocked: None,
+            emote_jobs: None,
+            emote_chairs: None,
         }
     }
 

@@ -2,11 +2,19 @@ use bevy::prelude::*;
 
 use crate::hud::style::{self, theme};
 
-pub const EARTH_EPOCH_UNIX: u64 = 1_009_810_800;
+pub use ffxi_proto::vana_time::VANA_EPOCH_UNIX as EARTH_EPOCH_UNIX;
 
 pub const EARTH_SECS_PER_VANA_HOUR: u64 = 144;
 
 pub const EARTH_SECS_PER_VANA_DAY: u64 = EARTH_SECS_PER_VANA_HOUR * 24;
+
+// vendor/server/src/common/vanadiel_clock.h:40-42 — week = 8 Vana days,
+// month = 30, year = 360; vendor/server/src/common/vana_time.h:129-135 —
+// get_year counts years since 886.
+pub const VANA_DAYS_PER_WEEK: u64 = 8;
+pub const VANA_DAYS_PER_MONTH: u64 = 30;
+pub const VANA_DAYS_PER_YEAR: u64 = 360;
+pub const VANA_BASE_YEAR: u64 = 886;
 
 // Placeholder cell when no PlayerMapGrid is available: pre-load on native, and
 // always on wasm, where crate::minimap (the grid's source) is compiled out
@@ -16,6 +24,15 @@ const GRID_CELL_UNKNOWN: &str = "(?-?)";
 const FRAMES_GROUP: &str = "menu    frames  ";
 const DAY_ORB_BASE_INDEX: usize = 106;
 const ORB_SIZE_PX: f32 = 14.0;
+
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct VanaClockVisible(pub bool);
+
+impl Default for VanaClockVisible {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 
 #[derive(Component)]
 pub struct VanaClockPanel;
@@ -85,7 +102,7 @@ impl VanaWeekday {
     ];
 
     pub fn from_vana_day(total_vana_days: u64) -> Self {
-        Self::ORDER[(total_vana_days % 8) as usize]
+        Self::ORDER[(total_vana_days % VANA_DAYS_PER_WEEK) as usize]
     }
 
     pub fn name(self) -> &'static str {
@@ -185,6 +202,94 @@ fn update_day_orb(
             node.display = Display::None;
         }
     }
+}
+
+// Also keyed off Added<VanaClockPanel>: the panel is despawned with the
+// BottomLeftStack's InGameEntity on zone change, and the respawned entity must
+// pick up a hidden state whose resource change tick has already been consumed.
+pub fn apply_vana_clock_visibility(
+    visible: Res<VanaClockVisible>,
+    added: Query<(), Added<VanaClockPanel>>,
+    mut q: Query<&mut Node, With<VanaClockPanel>>,
+) {
+    if !visible.is_changed() && added.is_empty() {
+        return;
+    }
+    let want = if visible.0 {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for mut node in q.iter_mut() {
+        if node.display != want {
+            node.display = want;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VanaDate {
+    pub year: u64,
+    pub month: u64,
+    pub day: u64,
+    pub weekday: VanaWeekday,
+}
+
+impl VanaDate {
+    // vendor/server/src/common/vana_time.h:106-143 calendar getters over the
+    // vendor/server/src/common/vanadiel_clock.h:35-42 ratios. LSB's
+    // get_monthday/get_month ceil partial days/months (vana_time.h:118,126),
+    // which transiently report the prior day/month during the exact boundary
+    // second; floor+1 agrees at every other instant.
+    pub fn from_earth_unix(earth_unix_secs: u64) -> Self {
+        let total_days = earth_unix_secs.saturating_sub(EARTH_EPOCH_UNIX) / EARTH_SECS_PER_VANA_DAY;
+        Self {
+            year: VANA_BASE_YEAR + total_days / VANA_DAYS_PER_YEAR,
+            month: (total_days % VANA_DAYS_PER_YEAR) / VANA_DAYS_PER_MONTH + 1,
+            day: total_days % VANA_DAYS_PER_MONTH + 1,
+            weekday: VanaWeekday::from_vana_day(total_days),
+        }
+    }
+}
+
+// Line wording is provisional pending a retail capture of the Current Time
+// menu output (bead kuluu-y5hq retail_unknowns); correct it here in one place.
+pub const VANA_TIME_LINE_PREFIX: &str = "Vana'diel Time: ";
+pub const EARTH_TIME_LINE_PREFIX: &str = "Earth Time: ";
+const EARTH_TIME_FORMAT: &str = "%Y/%m/%d %H:%M:%S";
+
+pub fn vana_time_chat_line(earth_unix_secs: u64) -> String {
+    let date = VanaDate::from_earth_unix(earth_unix_secs);
+    format!(
+        "{VANA_TIME_LINE_PREFIX}{}, {}, {}/{}/{} C.E.",
+        date.weekday.name(),
+        format_vana_time(earth_unix_secs),
+        date.day,
+        date.month,
+        date.year,
+    )
+}
+
+pub fn earth_time_chat_line(earth_unix_secs: u64) -> String {
+    format!(
+        "{EARTH_TIME_LINE_PREFIX}{}",
+        earth_time_text(&chrono::Local, earth_unix_secs)
+    )
+}
+
+fn earth_time_text<Tz: chrono::TimeZone>(tz: &Tz, earth_unix_secs: u64) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    match tz.timestamp_opt(earth_unix_secs as i64, 0).single() {
+        Some(dt) => dt.format(EARTH_TIME_FORMAT).to_string(),
+        None => format!("unix {earth_unix_secs}"),
+    }
+}
+
+pub fn current_time_chat_lines(clock: &crate::vana_time::VanaClock) -> [String; 2] {
+    let earth = clock.earth_unix_secs_now();
+    [vana_time_chat_line(earth), earth_time_chat_line(earth)]
 }
 
 pub fn vana_minutes_since_epoch(earth_unix_secs: u64) -> u64 {
@@ -310,5 +415,143 @@ mod tests {
         );
 
         assert_eq!(vana_minutes_since_epoch(0), 0);
+    }
+
+    #[test]
+    fn epoch_is_firesday_first_of_year_886() {
+        assert_eq!(
+            VanaDate::from_earth_unix(EARTH_EPOCH_UNIX),
+            VanaDate {
+                year: VANA_BASE_YEAR,
+                month: 1,
+                day: 1,
+                weekday: VanaWeekday::Firesday,
+            }
+        );
+        assert_eq!(format_vana_time(EARTH_EPOCH_UNIX), "0:00");
+    }
+
+    #[test]
+    fn one_vana_day_advances_the_monthday() {
+        // vendor/server/scripts/globals/chocobo_raising.lua:52 — one Vana'diel
+        // day is 3456 Earth seconds.
+        assert_eq!(EARTH_SECS_PER_VANA_DAY, 3456);
+        let date = VanaDate::from_earth_unix(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_DAY);
+        assert_eq!((date.day, date.month, date.year), (2, 1, VANA_BASE_YEAR));
+        assert_eq!(date.weekday, VanaWeekday::Earthsday);
+    }
+
+    #[test]
+    fn one_vana_week_wraps_the_weekday() {
+        // vendor/server/scripts/globals/chocobo_raising.lua:51 — one Vana'diel
+        // week is 27648 Earth seconds (8 days).
+        let week_secs = VANA_DAYS_PER_WEEK * EARTH_SECS_PER_VANA_DAY;
+        assert_eq!(week_secs, 27_648);
+        assert_eq!(
+            VanaDate::from_earth_unix(EARTH_EPOCH_UNIX + week_secs).weekday,
+            VanaWeekday::Firesday
+        );
+    }
+
+    #[test]
+    fn month_rolls_at_day_30_and_year_at_day_360() {
+        let day = EARTH_SECS_PER_VANA_DAY;
+        let last_of_month =
+            VanaDate::from_earth_unix(EARTH_EPOCH_UNIX + (VANA_DAYS_PER_MONTH - 1) * day);
+        assert_eq!((last_of_month.day, last_of_month.month), (30, 1));
+
+        let first_of_next = VanaDate::from_earth_unix(EARTH_EPOCH_UNIX + VANA_DAYS_PER_MONTH * day);
+        assert_eq!((first_of_next.day, first_of_next.month), (1, 2));
+
+        let last_of_year =
+            VanaDate::from_earth_unix(EARTH_EPOCH_UNIX + (VANA_DAYS_PER_YEAR - 1) * day);
+        assert_eq!(
+            (last_of_year.day, last_of_year.month, last_of_year.year),
+            (30, 12, VANA_BASE_YEAR)
+        );
+
+        let new_year = VanaDate::from_earth_unix(EARTH_EPOCH_UNIX + VANA_DAYS_PER_YEAR * day);
+        assert_eq!(
+            (new_year.day, new_year.month, new_year.year),
+            (1, 1, VANA_BASE_YEAR + 1)
+        );
+    }
+
+    #[test]
+    fn vana_chat_line_snapshot() {
+        let ts = EARTH_EPOCH_UNIX
+            + VANA_DAYS_PER_MONTH * EARTH_SECS_PER_VANA_DAY
+            + 13 * EARTH_SECS_PER_VANA_HOUR
+            + 5 * EARTH_SECS_PER_VANA_HOUR / 60;
+        assert_eq!(
+            vana_time_chat_line(ts),
+            "Vana'diel Time: Lightsday, 13:05, 1/2/886 C.E."
+        );
+        assert!(vana_time_chat_line(ts).starts_with(VANA_TIME_LINE_PREFIX));
+    }
+
+    #[test]
+    fn earth_chat_line_formats_a_civil_datetime() {
+        // The Vana'diel epoch is 2001-12-31 15:00:00 UTC (2002-01-01 00:00 JST,
+        // vendor/server/src/common/earth_time.h:40).
+        assert_eq!(
+            earth_time_text(&chrono::Utc, EARTH_EPOCH_UNIX),
+            "2001/12/31 15:00:00"
+        );
+        assert!(earth_time_chat_line(EARTH_EPOCH_UNIX).starts_with(EARTH_TIME_LINE_PREFIX));
+    }
+
+    #[test]
+    fn current_time_lines_use_the_exported_prefixes() {
+        let clock = crate::vana_time::VanaClock::anchored_at_hour(12.0);
+        let [vana, earth] = current_time_chat_lines(&clock);
+        assert!(vana.starts_with(VANA_TIME_LINE_PREFIX), "{vana:?}");
+        assert!(earth.starts_with(EARTH_TIME_LINE_PREFIX), "{earth:?}");
+    }
+
+    #[test]
+    fn visibility_apply_flips_display_and_covers_respawn() {
+        let mut app = App::new();
+        app.init_resource::<VanaClockVisible>();
+        app.add_systems(Update, apply_vana_clock_visibility);
+        let panel = app
+            .world_mut()
+            .spawn((VanaClockPanel, Node::default()))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().display,
+            Display::Flex
+        );
+
+        app.world_mut().resource_mut::<VanaClockVisible>().0 = false;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().display,
+            Display::None
+        );
+
+        // A zone-change respawn arrives after the resource change tick was
+        // consumed; the Added<VanaClockPanel> key must still hide it.
+        let respawned = app
+            .world_mut()
+            .spawn((VanaClockPanel, Node::default()))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(respawned).unwrap().display,
+            Display::None
+        );
+
+        app.world_mut().resource_mut::<VanaClockVisible>().0 = true;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(respawned).unwrap().display,
+            Display::Flex
+        );
     }
 }

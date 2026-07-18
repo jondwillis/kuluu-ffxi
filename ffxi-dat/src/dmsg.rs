@@ -32,7 +32,31 @@ const CC_KEY_ITEM: u8 = 0x1a;
 const CC_CHOCOBO_NAME: u8 = 0x1c;
 const CC_SET_COLOR: u8 = 0x1e;
 const CC_AUTO: u8 = 0x7f;
+/// The one 0x7f code POLUtils reads as two bytes (`7f 85`, player-gender
+/// choice); every other `7f <type>` carries one more parameter byte
+/// (POLUtils Things/DialogTableEntry.cs, the 0x7f branch).
+const AUTO_GENDER_CHOICE: u8 = 0x85;
 const PRINTABLE: std::ops::RangeInclusive<u8> = 0x20..=0x7e;
+
+// Inline substitution tag: `01 <len> <kind> <data…>` where `len` is the whole
+// tag's byte count and `data` holds `82 <0x80|param>` message-parameter
+// references — the newer FFXiMain tag family POLUtils predates and decodes as
+// garbage. Grammar verified byte-for-byte against the NA install's zone-230
+// DialogTable (ROM/25/39 entries 6428/6434/6437/6440/6446/6447) cross-checked
+// with the LSB messageSpecial call signatures that fill their parameters
+// (vendor/server/scripts/globals/npc_util.lua giveKeyItem,
+// vendor/server/scripts/globals/sparkshop.lua YOU_OBTAIN_ITEM(item, count)).
+const CC_INLINE_TAG: u8 = 0x01;
+/// `01 <len> <kind>` — anything shorter cannot be a tag.
+const INLINE_TAG_MIN_LEN: usize = 3;
+const INLINE_TAG_PARAM_REF: u8 = 0x82;
+/// Param indexes arrive offset into the high-bit range: `0x80 | index`.
+const INLINE_TAG_PARAM_BASE: u8 = 0x80;
+const INLINE_KIND_NUM: u8 = 0x03;
+const INLINE_KIND_ITEM: u8 = 0x23;
+const INLINE_KIND_ITEM_PLURAL: u8 = 0x25;
+const INLINE_KIND_ITEM_COUNTED: u8 = 0x29;
+const INLINE_KIND_KEY_ITEM: u8 = 0x33;
 
 /// Names [`StringDat::text`] wraps as `{Name}` (plain, via [`plain_marker`]) or
 /// `{Name:param}` (parameterized) for each control code. Render-layer
@@ -65,6 +89,175 @@ pub const CHOICE_MARKER_PREFIX: &str = "{Choice:";
 /// render layer that substitutes `{PlayerName}` / `{SpeakerName}`.
 pub fn plain_marker(name: &str) -> String {
     format!("{{{name}}}")
+}
+
+// Emote chat-text control sequences, observed in the NA install's emote
+// DialogTable (ROM/27/70.DAT; see [`EmoteTextDat`]). Each line wraps its slots
+// in CC_AUTO (0x7f) sequences the generic decoder only knows as `{Auto:N}`:
+//   7f fc <caster-name slot> 7f fb   — leading caster block
+//   7f 88 01 "[the /]" <target-name slot> — article alternative + target
+//   7f 90 "[his/her]"                — caster-gender alternative
+//   7f 31 00                          — line terminator
+// A name slot is the 3-byte sequence 01 01 <id>.
+// `emote_control_sequences_compose_observed_layout` guards this grammar.
+pub const AUTO_EMOTE_CASTER_OPEN: u8 = 0xFC;
+pub const AUTO_EMOTE_CASTER_CLOSE: u8 = 0xFB;
+pub const AUTO_EMOTE_TARGET_ARTICLE: u8 = 0x88;
+pub const AUTO_EMOTE_GENDER: u8 = 0x90;
+pub const AUTO_EMOTE_END: u8 = 0x31;
+const EMOTE_NAME_SLOT_PREFIX: [u8; 2] = [0x01, 0x01];
+const EMOTE_NAME_SLOT_CASTER: u8 = 0x10;
+const EMOTE_NAME_SLOT_TARGET: u8 = 0x11;
+const ALT_OPEN: u8 = b'[';
+const ALT_SPLIT: u8 = b'/';
+const ALT_CLOSE: u8 = b']';
+
+/// Names substituted into an emote line's control-code slots.
+#[derive(Debug, Clone, Copy)]
+pub struct EmoteLineContext<'a> {
+    pub caster: &'a str,
+    pub target: Option<&'a str>,
+    /// Keep the leading article of the target's `[the /]` alternative (NPC/mob
+    /// targets read "…points at the Wild Rabbit."; PCs drop it).
+    pub target_article: bool,
+}
+
+/// Which `[a/b]` alternative the pending 0x7f code selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmoteAlt {
+    None,
+    Article,
+    Gender,
+}
+
+/// Render one raw emote DialogTable entry to a finished chat line,
+/// substituting caster/target names and resolving `[a/b]` alternatives.
+/// Gender alternatives currently always pick the first branch ("his") — the
+/// caster's model gender is not plumbed here yet.
+pub fn compose_emote_line(entry: &[u8], ctx: &EmoteLineContext) -> String {
+    let mut out = String::with_capacity(entry.len());
+    let mut alt = EmoteAlt::None;
+    let mut i = 0;
+    while i < entry.len() {
+        let b = entry[i];
+        if b == CC_AUTO {
+            match entry.get(i + 1) {
+                Some(&AUTO_EMOTE_END) => break,
+                Some(&AUTO_EMOTE_TARGET_ARTICLE) => {
+                    alt = EmoteAlt::Article;
+                    // consumes one param byte after the code
+                    i += 3;
+                    continue;
+                }
+                Some(&AUTO_EMOTE_GENDER) => {
+                    alt = EmoteAlt::Gender;
+                    i += 2;
+                    continue;
+                }
+                Some(&AUTO_EMOTE_CASTER_OPEN) | Some(&AUTO_EMOTE_CASTER_CLOSE) => {
+                    i += 2;
+                    continue;
+                }
+                _ => {
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        if entry[i..].starts_with(&EMOTE_NAME_SLOT_PREFIX) {
+            match entry.get(2 + i) {
+                Some(&EMOTE_NAME_SLOT_CASTER) => {
+                    out.push_str(ctx.caster);
+                    i += 3;
+                    continue;
+                }
+                Some(&EMOTE_NAME_SLOT_TARGET) => {
+                    if let Some(t) = ctx.target {
+                        out.push_str(t);
+                    }
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if b == ALT_OPEN && alt != EmoteAlt::None {
+            if let Some((first, second, after)) = split_alternative(&entry[i..]) {
+                let keep_first = match alt {
+                    EmoteAlt::Article => ctx.target_article,
+                    _ => true,
+                };
+                out.push_str(if keep_first { first } else { second });
+                alt = EmoteAlt::None;
+                i += after;
+                continue;
+            }
+        }
+        if PRINTABLE.contains(&b) {
+            out.push(b as char);
+        }
+        i += 1;
+    }
+    // Untargeted /point carries an unresolved direction placeholder (0x1d)
+    // between "points" and "." — dropping it leaves a stray space.
+    if let Some(s) = out.strip_suffix(" .") {
+        out.truncate(s.len());
+        out.push('.');
+    }
+    out
+}
+
+/// Split a leading `[a/b]` run into its branches; returns the byte length of
+/// the whole bracketed block as the third element.
+fn split_alternative(bytes: &[u8]) -> Option<(&str, &str, usize)> {
+    let close = bytes.iter().position(|&b| b == ALT_CLOSE)?;
+    let split = bytes[..close].iter().position(|&b| b == ALT_SPLIT)?;
+    let first = std::str::from_utf8(&bytes[1..split]).ok()?;
+    let second = std::str::from_utf8(&bytes[split + 1..close]).ok()?;
+    Some((first, second, close + 1))
+}
+
+/// Entry index for a MesNum: lines come in (targeted, untargeted) pairs —
+/// entry = 2*MesNum + 0 for targeted, +1 for untargeted (verified against the
+/// NA install: 0/1 point, 2/3 bow, 4/5 salute, …).
+pub fn emote_line_index(mes_num: u16, targeted: bool) -> usize {
+    mes_num as usize * 2 + usize::from(!targeted)
+}
+
+/// MesNum 0..=96 (LSB Emote::Point..=Emote::Aim) each carry a
+/// (targeted, untargeted) line pair, so a plausible emote table holds at least
+/// 2*97 entries (the NA install's ROM/27/70.DAT has 198).
+pub const EMOTE_TABLE_MIN_ENTRIES: usize = 2 * 97;
+
+/// The canned-emote chat-text DialogTable. Located at ROM/27/70.DAT in the NA
+/// install (empirical — found by scan, not by a documented file id; other
+/// regions may relocate it, hence the parse-shape validation on open).
+pub struct EmoteTextDat {
+    dat: StringDat,
+}
+
+/// `<install root>/ROM/27/70.DAT` (FTABLE sub_path dir 27, file 70).
+pub const EMOTE_TEXT_SUB_PATH: (u16, u8) = (27, 70);
+
+impl EmoteTextDat {
+    pub fn open(root: &crate::DatRoot) -> Option<Self> {
+        let (dir, file) = EMOTE_TEXT_SUB_PATH;
+        let path = root
+            .root()
+            .join("ROM")
+            .join(dir.to_string())
+            .join(format!("{file}.DAT"));
+        let bytes = std::fs::read(path).ok()?;
+        let dat = StringDat::parse(&bytes).ok()?;
+        (dat.len() >= EMOTE_TABLE_MIN_ENTRIES).then_some(Self { dat })
+    }
+
+    /// The composed chat line for a MesNum, or `None` when the table has no
+    /// such entry.
+    pub fn line(&self, mes_num: u16, targeted: bool, ctx: &EmoteLineContext) -> Option<String> {
+        let raw = self.dat.raw(emote_line_index(mes_num, targeted))?;
+        Some(compose_emote_line(raw, ctx))
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -205,7 +398,25 @@ fn decode_dialog_text(bytes: &[u8]) -> String {
             CC_KEY_ITEM => push_param(&mut out, bytes, &mut i, MARKER_KEY_ITEM),
             CC_CHOCOBO_NAME => push_param(&mut out, bytes, &mut i, MARKER_CHOCOBO_NAME),
             CC_SET_COLOR => push_param(&mut out, bytes, &mut i, MARKER_SET_COLOR),
-            CC_AUTO => push_param(&mut out, bytes, &mut i, MARKER_AUTO),
+            CC_AUTO => match bytes.get(i + 1) {
+                Some(&kind) => {
+                    out.push_str(&format!("{{{MARKER_AUTO}:{kind}}}"));
+                    i += 1;
+                    if kind != AUTO_GENDER_CHOICE && i + 1 < bytes.len() {
+                        i += 1;
+                    }
+                }
+                None => push_plain(&mut out, MARKER_AUTO),
+            },
+            // A malformed tag drops only the 0x01, like other control bytes.
+            CC_INLINE_TAG => {
+                if let Some(tag) = parse_inline_tag(bytes, i) {
+                    if let Some(marker) = tag.marker {
+                        out.push_str(&format!("{{{marker}:{}}}", tag.param));
+                    }
+                    i += tag.len - 1;
+                }
+            }
             _ if PRINTABLE.contains(&b) => out.push(b as char),
             _ if is_sjis_lead(b) => {
                 out.push('\u{FFFD}'); // cp932 double-byte run not yet mapped
@@ -216,6 +427,42 @@ fn decode_dialog_text(bytes: &[u8]) -> String {
         i += 1;
     }
     out
+}
+
+struct InlineTag {
+    /// Marker name to emit, `None` for a recognized-but-unrenderable kind
+    /// (the tag is still consumed whole so its data bytes never leak as text).
+    marker: Option<&'static str>,
+    /// Message-parameter index from the tag's last `82 <0x80|n>` reference —
+    /// for item kinds that also carry a count/plural reference, the id ref
+    /// comes last (observed: `01 09 29 82 81 80 80 82 80` = count param 1,
+    /// item id param 0).
+    param: u8,
+    len: usize,
+}
+
+fn parse_inline_tag(bytes: &[u8], at: usize) -> Option<InlineTag> {
+    let len = *bytes.get(at + 1)? as usize;
+    if len < INLINE_TAG_MIN_LEN || at + len > bytes.len() {
+        return None;
+    }
+    let data = &bytes[at + 3..at + len];
+    if !data.iter().all(|&b| b & INLINE_TAG_PARAM_BASE != 0) {
+        return None; // tag data lives in the high-bit range; printable text does not
+    }
+    let marker = match bytes[at + 2] {
+        INLINE_KIND_NUM => Some(MARKER_NUM),
+        INLINE_KIND_ITEM | INLINE_KIND_ITEM_PLURAL | INLINE_KIND_ITEM_COUNTED => Some(MARKER_ITEM),
+        INLINE_KIND_KEY_ITEM => Some(MARKER_KEY_ITEM),
+        _ => None,
+    };
+    let param = data
+        .windows(2)
+        .rev()
+        .find(|w| w[0] == INLINE_TAG_PARAM_REF)
+        .map(|w| w[1] & !INLINE_TAG_PARAM_BASE)
+        .unwrap_or(0);
+    Some(InlineTag { marker, param, len })
 }
 
 /// Emit `{name}` for a control code with no parameter.
@@ -290,6 +537,15 @@ mod tests {
         assert!(choice.text(0).unwrap().starts_with(CHOICE_MARKER_PREFIX));
         let name = StringDat::parse(&synth(&[&[CC_PLAYER_NAME]])).expect("parse");
         assert_eq!(name.text(0).unwrap(), plain_marker(MARKER_PLAYER_NAME));
+        // The chat/dialog render layer resolves {KeyItem:N}/{Item:N} through
+        // the scraped name tables keyed on these exact prefixes.
+        let key_item = StringDat::parse(&synth(&[&[CC_KEY_ITEM, 0]])).expect("parse");
+        assert_eq!(
+            key_item.text(0).unwrap(),
+            format!("{{{MARKER_KEY_ITEM}:0}}")
+        );
+        let item = StringDat::parse(&synth(&[&[CC_ITEM, 1]])).expect("parse");
+        assert_eq!(item.text(0).unwrap(), format!("{{{MARKER_ITEM}:1}}"));
 
         assert!(AUTO_MARKER_PREFIX.ends_with(MARKER_AUTO));
         assert!(SET_COLOR_MARKER_PREFIX.ends_with(MARKER_SET_COLOR));
@@ -335,6 +591,241 @@ mod tests {
         assert_eq!(
             StringDat::parse(&[0u8; 4]),
             Err(StringDatError::TooShort(4))
+        );
+    }
+
+    const CASTER_SLOT: [u8; 3] = [0x01, 0x01, EMOTE_NAME_SLOT_CASTER];
+    const TARGET_SLOT: [u8; 3] = [0x01, 0x01, EMOTE_NAME_SLOT_TARGET];
+
+    /// Byte-for-byte the observed ROM/27/70 entry layouts (targeted /point,
+    /// untargeted /bow, untargeted /bell) — the grammar the AUTO_EMOTE_* consts
+    /// pin.
+    fn emote_entry(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    #[test]
+    fn emote_control_sequences_compose_observed_layout() {
+        let targeted_point = emote_entry(&[
+            &[CC_AUTO, AUTO_EMOTE_CASTER_OPEN],
+            &CASTER_SLOT,
+            &[CC_AUTO, AUTO_EMOTE_CASTER_CLOSE],
+            b" points at ",
+            &[CC_AUTO, AUTO_EMOTE_TARGET_ARTICLE, 0x01],
+            b"[the /]",
+            &TARGET_SLOT,
+            b".",
+            &[CC_AUTO, AUTO_EMOTE_END, 0x00, CC_NEWLINE],
+        ]);
+        let npc = EmoteLineContext {
+            caster: "Kupo",
+            target: Some("Wild Rabbit"),
+            target_article: true,
+        };
+        assert_eq!(
+            compose_emote_line(&targeted_point, &npc),
+            "Kupo points at the Wild Rabbit."
+        );
+        let pc = EmoteLineContext {
+            target_article: false,
+            ..npc
+        };
+        assert_eq!(
+            compose_emote_line(&targeted_point, &pc),
+            "Kupo points at Wild Rabbit."
+        );
+
+        let untargeted_bow = emote_entry(&[
+            &[CC_AUTO, AUTO_EMOTE_CASTER_OPEN],
+            &CASTER_SLOT,
+            &[CC_AUTO, AUTO_EMOTE_CASTER_CLOSE],
+            b" bows.",
+            &[CC_AUTO, AUTO_EMOTE_END, 0x00, CC_NEWLINE],
+        ]);
+        let solo = EmoteLineContext {
+            caster: "Kupo",
+            target: None,
+            target_article: false,
+        };
+        assert_eq!(compose_emote_line(&untargeted_bow, &solo), "Kupo bows.");
+
+        let untargeted_bell = emote_entry(&[
+            &[CC_AUTO, AUTO_EMOTE_CASTER_OPEN],
+            &CASTER_SLOT,
+            &[CC_AUTO, AUTO_EMOTE_CASTER_CLOSE],
+            b" rings ",
+            &[CC_AUTO, AUTO_EMOTE_GENDER],
+            b"[his/her] bell.",
+            &[CC_AUTO, AUTO_EMOTE_END, 0x00, CC_NEWLINE],
+        ]);
+        assert_eq!(
+            compose_emote_line(&untargeted_bell, &solo),
+            "Kupo rings his bell."
+        );
+    }
+
+    #[test]
+    fn stray_direction_placeholder_space_is_tidied() {
+        // Untargeted /point: "points <0x1d>." — the placeholder drops, and so
+        // must the space it leaves behind.
+        let entry = emote_entry(&[
+            &CASTER_SLOT,
+            b" points ",
+            &[0x1d],
+            b".",
+            &[CC_AUTO, AUTO_EMOTE_END],
+        ]);
+        let ctx = EmoteLineContext {
+            caster: "Kupo",
+            target: None,
+            target_article: false,
+        };
+        assert_eq!(compose_emote_line(&entry, &ctx), "Kupo points.");
+    }
+
+    /// The (targeted, untargeted) pairing invariant: entry = 2*MesNum + 0|1.
+    #[test]
+    fn emote_line_index_pairs_targeted_first() {
+        assert_eq!(emote_line_index(0, true), 0);
+        assert_eq!(emote_line_index(0, false), 1);
+        assert_eq!(emote_line_index(1, true), 2);
+        assert_eq!(emote_line_index(96, false), 193);
+        assert!(emote_line_index(96, false) < EMOTE_TABLE_MIN_ENTRIES);
+    }
+
+    /// Composes real lines from the retail install when present; self-skips
+    /// without game files.
+    #[test]
+    fn real_emote_table_composes_bow_lines() {
+        let Some(root) = crate::archive::open_test_install() else {
+            eprintln!("skipping: no FFXI install");
+            return;
+        };
+        let Some(table) = EmoteTextDat::open(&root) else {
+            eprintln!("skipping: no ROM/27/70.DAT emote table");
+            return;
+        };
+        let ctx = EmoteLineContext {
+            caster: "Kupo",
+            target: Some("Naji"),
+            target_article: false,
+        };
+        assert_eq!(
+            table.line(1, true, &ctx).as_deref(),
+            Some("Kupo bows courteously to Naji.")
+        );
+        assert_eq!(table.line(1, false, &ctx).as_deref(), Some("Kupo bows."));
+    }
+
+    #[test]
+    fn decodes_inline_substitution_tags() {
+        // Byte-for-byte the NA install's zone-230 DialogTable layouts:
+        // entry 6437 "Obtained key item: <keyitem>." wraps its tag in a
+        // three-byte `7f 80 01` code, entry 6440 "You obtain <n> <item>!"
+        // carries a number tag (param 1) and a counted item tag (id param 0).
+        let key_item = [
+            b'k',
+            b'i',
+            b':',
+            b' ',
+            CC_AUTO,
+            0x80,
+            0x01,
+            CC_INLINE_TAG,
+            0x05,
+            INLINE_KIND_KEY_ITEM,
+            0x82,
+            0x80,
+            0x80,
+            0x80,
+            b'.',
+        ];
+        let dat = StringDat::parse(&synth(&[&key_item])).expect("parse");
+        assert_eq!(dat.text(0).as_deref(), Some("ki: {Auto:128}{KeyItem:0}."));
+
+        let obtain = [
+            b'g',
+            b'e',
+            b't',
+            b' ',
+            CC_INLINE_TAG,
+            0x05,
+            INLINE_KIND_NUM,
+            0x82,
+            0x81,
+            b' ',
+            CC_INLINE_TAG,
+            0x09,
+            INLINE_KIND_ITEM_COUNTED,
+            0x82,
+            0x81,
+            0x80,
+            0x80,
+            0x82,
+            0x80,
+            b'!',
+        ];
+        let dat = StringDat::parse(&synth(&[&obtain])).expect("parse");
+        assert_eq!(dat.text(0).as_deref(), Some("get {Num:1} {Item:0}!"));
+
+        let singular = [CC_INLINE_TAG, 0x05, INLINE_KIND_ITEM, 0x82, 0x80];
+        let dat = StringDat::parse(&synth(&[&singular])).expect("parse");
+        assert_eq!(dat.text(0).as_deref(), Some("{Item:0}"));
+    }
+
+    #[test]
+    fn inline_tag_unknown_kind_is_consumed_silently() {
+        let entry = [b'a', CC_INLINE_TAG, 0x05, 0x77, 0x82, 0x81, b'b'];
+        let dat = StringDat::parse(&synth(&[&entry])).expect("parse");
+        assert_eq!(dat.text(0).as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn inline_tag_malformed_drops_only_the_control_byte() {
+        // Truncated length and printable-range "data" must not swallow text.
+        let overrun = [b'x', CC_INLINE_TAG, 0x41, b'A'];
+        let dat = StringDat::parse(&synth(&[&overrun])).expect("parse");
+        assert_eq!(dat.text(0).as_deref(), Some("xAA"));
+
+        let low_data = [CC_INLINE_TAG, 0x05, INLINE_KIND_ITEM, b'h', b'i'];
+        let dat = StringDat::parse(&synth(&[&low_data])).expect("parse");
+        assert_eq!(dat.text(0).as_deref(), Some("#hi"), "kind byte re-renders");
+    }
+
+    /// Southern San d'Oria (zone 230) KEYITEM_OBTAINED in the client era this
+    /// repo's default install carries: LSB pinned it at 6437 when its text-id
+    /// sync matched this DAT (LandSandBoat b3af49c62ae2, 2023-05-25,
+    /// scripts/zones/Southern_San_dOria/IDs.lua — every anchor id in that sync
+    /// equals this DAT's physical entry index, confirming ids are identity
+    /// DAT indexes). Newer LSB pins say 6438 because SE later inserted
+    /// entries; that is client-version skew, not an index-base convention.
+    const ZONE230_KEYITEM_OBTAINED_MAY2023: usize = 6437;
+    const ZONE230_ID: u16 = 230;
+
+    /// Decodes the real zone-230 KEYITEM_OBTAINED entry to the `{KeyItem:0}`
+    /// marker (pre-fix the inline tag leaked as `{Auto:128}3\u{FFFD}`);
+    /// self-skips without game files.
+    #[test]
+    fn real_zone230_keyitem_obtained_decodes_marker() {
+        let Some(root) = crate::archive::open_test_install() else {
+            eprintln!("skipping: no FFXI install");
+            return;
+        };
+        let file_id = crate::zone_dat::zone_id_to_string_file_id(ZONE230_ID)
+            .expect("zone 230 has a string DAT mapping");
+        let loc = root.resolve(file_id).expect("string DAT resolves");
+        let bytes = std::fs::read(loc.path_under(root.root())).expect("string DAT readable");
+        let dat = StringDat::parse(&bytes).expect("zone 230 dialog table parses");
+        let text = dat
+            .text(ZONE230_KEYITEM_OBTAINED_MAY2023)
+            .expect("entry present");
+        assert!(
+            text.contains("Obtained key item:"),
+            "expected the KEYITEM_OBTAINED entry, got {text:?}"
+        );
+        assert!(
+            text.contains(&format!("{{{MARKER_KEY_ITEM}:0}}")),
+            "expected a {{KeyItem:0}} marker, got {text:?}"
         );
     }
 

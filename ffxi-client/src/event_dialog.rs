@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use ffxi_dat::dmsg::{
-    plain_marker, StringDat, MARKER_NUM, MARKER_PLAYER_NAME, MARKER_SPEAKER_NAME,
+    plain_marker, StringDat, MARKER_ITEM, MARKER_KEY_ITEM, MARKER_NUM, MARKER_PLAYER_NAME,
+    MARKER_SPEAKER_NAME,
 };
 use ffxi_dat::event_dat::EventDat;
 use ffxi_dat::DatRoot;
@@ -184,6 +185,14 @@ impl DialogSession {
         self.runner = None;
         self.active = None;
     }
+
+    /// Entry `index` of `zone`'s dialog DAT, loading it if needed. `None` when
+    /// the zone has no available string DAT (missing FFXI_DAT_PATH, unmapped
+    /// zone) or the index is out of range.
+    pub fn zone_text(&mut self, zone: u16, index: usize) -> Option<String> {
+        self.ensure_zone(zone);
+        self.strings.as_ref()?.text(index)
+    }
 }
 
 fn frame_to_dialog(
@@ -198,8 +207,11 @@ fn frame_to_dialog(
         ..
     } = frame;
     let substitute = |text: String| {
-        substitute_nums(
-            substitute_names(text, player_name, active.npc_name.as_deref()),
+        substitute_entity_names(
+            substitute_nums(
+                substitute_names(text, player_name, active.npc_name.as_deref()),
+                &params,
+            ),
             &params,
         )
     };
@@ -223,7 +235,7 @@ fn frame_to_dialog(
 /// Resolve the plain name markers the dmsg decoder leaves in dialog text:
 /// `{PlayerName}` → the logged-in character, `{SpeakerName}` → the speaking NPC.
 /// A `{SpeakerName}` with no known speaker name is left as-is.
-fn substitute_names(text: String, player_name: &str, speaker_name: Option<&str>) -> String {
+pub fn substitute_names(text: String, player_name: &str, speaker_name: Option<&str>) -> String {
     let text = text.replace(&plain_marker(MARKER_PLAYER_NAME), player_name);
     match speaker_name {
         Some(name) => text.replace(&plain_marker(MARKER_SPEAKER_NAME), name),
@@ -235,9 +247,33 @@ fn substitute_names(text: String, player_name: &str, speaker_name: Option<&str>)
 /// text: `{Num:N}` → `params[N]` (the event's numeric parameters). A marker
 /// whose index is out of range is left as-is so the missing parameter stays
 /// visible in fixtures instead of silently printing a wrong value.
-fn substitute_nums(text: String, params: &[i32]) -> String {
-    let open = format!("{{{MARKER_NUM}:");
-    if params.is_empty() || !text.contains(&open) {
+pub fn substitute_nums(text: String, params: &[i32]) -> String {
+    substitute_param_marker(text, MARKER_NUM, &|index| {
+        params.get(index).map(|v| v.to_string())
+    })
+}
+
+/// Resolve `{KeyItem:N}` / `{Item:N}` (dmsg control codes 0x1a / 0x19):
+/// `params[N]` is a key-item / item id looked up in the scraped LSB name
+/// tables. Unresolvable markers are left as-is, like [`substitute_nums`].
+pub fn substitute_entity_names(text: String, params: &[i32]) -> String {
+    let text = substitute_param_marker(text, MARKER_KEY_ITEM, &|index| {
+        let id = u16::try_from(*params.get(index)?).ok()?;
+        ffxi_proto::key_item_names::lookup(id).map(str::to_string)
+    });
+    substitute_param_marker(text, MARKER_ITEM, &|index| {
+        let id = u16::try_from(*params.get(index)?).ok()?;
+        ffxi_proto::item_names::lookup(id).map(str::to_string)
+    })
+}
+
+fn substitute_param_marker(
+    text: String,
+    marker: &str,
+    resolve: &dyn Fn(usize) -> Option<String>,
+) -> String {
+    let open = format!("{{{marker}:");
+    if !text.contains(&open) {
         return text;
     }
     let mut out = String::with_capacity(text.len());
@@ -247,12 +283,12 @@ fn substitute_nums(text: String, params: &[i32]) -> String {
         rest = &rest[start..];
         let resolved = rest[open.len()..].find('}').and_then(|end| {
             let index: usize = rest[open.len()..open.len() + end].parse().ok()?;
-            let value = *params.get(index)?;
+            let value = resolve(index)?;
             Some((value, open.len() + end + 1))
         });
         match resolved {
             Some((value, consumed)) => {
-                out.push_str(&value.to_string());
+                out.push_str(&value);
                 rest = &rest[consumed..];
             }
             None => {
@@ -387,6 +423,27 @@ mod tests {
     fn leaves_num_marker_when_param_missing() {
         let text = "Pay {Num:5} gil.".to_string();
         assert_eq!(substitute_nums(text, &[500]), "Pay {Num:5} gil.");
+    }
+
+    #[test]
+    fn substitutes_key_item_and_item_markers_with_scraped_names() {
+        // Key item 1 = Zeruhn Report (vendor/server/scripts/enum/key_item.lua),
+        // item 4509 = Flask of Distilled Water (vendor/server/sql/item_basic.sql).
+        let text = "Obtained key item: {KeyItem:0}. Also {Item:1}.".to_string();
+        assert_eq!(
+            substitute_entity_names(text, &[1, 4509]),
+            "Obtained key item: Zeruhn Report. Also Flask of Distilled Water."
+        );
+    }
+
+    #[test]
+    fn leaves_entity_markers_when_unresolvable() {
+        let text = "Got {KeyItem:0} and {Item:3}.".to_string();
+        assert_eq!(
+            substitute_entity_names(text, &[-1]),
+            "Got {KeyItem:0} and {Item:3}.",
+            "negative id and out-of-range param both stay visible"
+        );
     }
 
     #[test]

@@ -47,6 +47,10 @@ ffxi-actor = { path = "../ffxi-actor" }
 # strings here so SceneSnapshot stays small (carries u16 ids only).
 ffxi-proto = { path = "../ffxi-proto" }
 serde = { workspace = true }
+# Local-timezone civil date for the Current Time menu's Earth-time chat line
+# (hud/vana_clock.rs). `clock` only — no serde/oldtime; on wasm (no wasmbind)
+# chrono's Local stubs to UTC, which is acceptable for the browser viewer.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Glyph rasterizer for the 3D nameplate billboards. Bevy's text path is
 # locked to the 2D pipeline (UI / Text2d), which doesn't depth-test
 # against 3D meshes — so for true world-space occluded labels we

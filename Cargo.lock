@@ -3227,6 +3227,7 @@ dependencies = [
  "ab_glyph",
  "bevy",
  "bevy_water",
+ "chrono",
  "ffxi-actor",
  "ffxi-audio",
  "ffxi-dat",

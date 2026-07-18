@@ -4,6 +4,7 @@ pub mod collision_bvh;
 pub mod debug_heights;
 pub mod exit_watchdog;
 pub mod input;
+pub mod key_items;
 pub mod launcher_backdrop;
 // 0.19 deprecated the feathers `*_bundle` spawn fns in favor of BSN scenes;
 // the launcher screens migrate to BSN in kuluu-dnr5, so tolerate the shims
@@ -458,6 +459,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             drain_mzb_load_state,
             drain_mmb_load_state,
             drain_particle_simulator,
+            key_items::drain_key_items_viewed,
         ),
     );
 
@@ -512,6 +514,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     app.init_resource::<input::TabCycleStack>();
     app.init_resource::<input::SelectTargetMode>();
+    app.init_resource::<key_items::KeyItemsViewed>();
 
     app.add_systems(
         Update,
@@ -522,6 +525,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             text_input::mouse_nav_dispatch_system,
             input::dispatch_target_change_system,
             input::tab_cycle_invalidate_system,
+            key_items::key_items_mark_seen_system,
         )
             .chain()
             .after(ffxi_viewer_core::chase_camera_system)

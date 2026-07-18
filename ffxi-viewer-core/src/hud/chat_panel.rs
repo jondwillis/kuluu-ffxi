@@ -437,6 +437,16 @@ pub fn format_chat_line(channel: ChatChannel, sender: &str, text: &str) -> Strin
 
         ChatChannel::System | ChatChannel::Battle => text.to_string(),
 
+        // Canned emotes arrive fully composed (empty sender); /em free text
+        // arrives as (sender, body) and retail renders "Name body".
+        ChatChannel::Emote => {
+            if sender.is_empty() {
+                text.to_string()
+            } else {
+                format!("{sender} {text}")
+            }
+        }
+
         ChatChannel::Debug => format!("[dbg] {text}"),
     }
 }
@@ -486,6 +496,10 @@ pub fn channel_color(c: ChatChannel) -> Color {
         ChatChannel::Battle => Color::srgb(1.00, 0.55, 0.10),
 
         ChatChannel::Debug => Color::srgb(0.55, 0.75, 0.80),
+
+        // Retail's channel-8 emote color is unverified (bead kuluu-d4u
+        // retail_unknowns); reuse the say color until captured.
+        ChatChannel::Emote => theme::TEXT,
     }
 }
 

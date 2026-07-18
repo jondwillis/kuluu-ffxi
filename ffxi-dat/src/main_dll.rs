@@ -11,6 +11,8 @@ const SCAN_WORDS: usize = 0xC000;
 
 const WEAPON_SKILL_HINT: u32 = 0xCB81_CB81;
 const DANCE_SKILL_HINT: u32 = 0xB9E2_B9E2;
+// research/xim MainDll.kt:47 emoteAnimationOffsetHint.
+const EMOTE_HINT: u32 = 0x4827_4827;
 
 // research/xim ZoneMapTable.kt
 const ZONE_MAP_HINT: u64 = 0x6400_0001_0001_0100;
@@ -31,6 +33,7 @@ pub struct MainDll {
     bytes: Vec<u8>,
     weapon_skill_base: usize,
     dance_skill_base: usize,
+    emote_base: Option<usize>,
     zone_map_base: Option<usize>,
 }
 
@@ -49,11 +52,13 @@ impl MainDll {
             find_offset(&bytes, DANCE_SKILL_HINT).ok_or(DatError::DllMarkerNotFound {
                 hint: DANCE_SKILL_HINT,
             })?;
+        let emote_base = find_offset(&bytes, EMOTE_HINT);
         let zone_map_base = find_offset_u64(&bytes, ZONE_MAP_HINT);
         Ok(Self {
             bytes,
             weapon_skill_base,
             dance_skill_base,
+            emote_base,
             zone_map_base,
         })
     }
@@ -89,6 +94,12 @@ impl MainDll {
 
     pub fn base_dance_skill_index(&self, race_index: u8) -> Option<u16> {
         self.read16(self.dance_skill_base + race_index as usize * 2)
+    }
+
+    /// First emote-animation file id for a race (the look race byte, HumeM=1);
+    /// research/xim MainDll.kt:120-121.
+    pub fn base_emote_index(&self, race_index: u8) -> Option<u16> {
+        self.read16(self.emote_base? + race_index as usize * 2)
     }
 
     fn read16(&self, off: usize) -> Option<u16> {
@@ -152,9 +163,23 @@ mod tests {
             bytes,
             weapon_skill_base: base,
             dance_skill_base: base,
+            emote_base: Some(base),
             zone_map_base: None,
         };
         assert_eq!(dll.base_weapon_skill_index(1), Some(0x1234));
+        assert_eq!(dll.base_emote_index(1), Some(0x1234));
+    }
+
+    #[test]
+    fn missing_emote_marker_yields_none() {
+        let dll = MainDll {
+            bytes: vec![0u8; 4],
+            weapon_skill_base: 0,
+            dance_skill_base: 0,
+            emote_base: None,
+            zone_map_base: None,
+        };
+        assert_eq!(dll.base_emote_index(1), None);
     }
 
     #[test]
@@ -175,6 +200,7 @@ mod tests {
             bytes,
             weapon_skill_base: 0,
             dance_skill_base: 0,
+            emote_base: None,
             zone_map_base: Some(base),
         };
         let rec = dll.zone_map(100, 0).expect("zone 100 record");

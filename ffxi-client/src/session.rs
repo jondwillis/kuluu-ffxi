@@ -44,6 +44,34 @@ impl NpcNameResolver {
     }
 }
 
+/// Lazy loader for the canned-emote chat-text DialogTable (ROM/27/70); when
+/// the install lacks it, emote chat degrades to a name-only line.
+struct EmoteTextResolver {
+    root: Option<std::sync::Arc<ffxi_dat::DatRoot>>,
+    table: Option<Option<ffxi_dat::dmsg::EmoteTextDat>>,
+}
+
+impl EmoteTextResolver {
+    fn new(root: Option<std::sync::Arc<ffxi_dat::DatRoot>>) -> Self {
+        Self { root, table: None }
+    }
+
+    fn table(&mut self) -> Option<&ffxi_dat::dmsg::EmoteTextDat> {
+        let root = self.root.as_ref();
+        self.table
+            .get_or_insert_with(|| {
+                let loaded = root.and_then(|r| ffxi_dat::dmsg::EmoteTextDat::open(r));
+                if loaded.is_none() {
+                    tracing::info!(
+                        "emote text DAT (ROM/27/70) unavailable — emote chat lines degrade to name-only"
+                    );
+                }
+                loaded
+            })
+            .as_ref()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum CharSelection {
     Id(u32),
@@ -68,6 +96,20 @@ struct SelfMogState {
     /// Cutscene embedded in the last 0x00A LOGIN ([`decode::ZoneInEvent`]);
     /// consumed by the keepalive loop, which must answer it with 0x05B.
     zone_in_event: Option<decode::ZoneInEvent>,
+    /// Last-received (GetItemFlag, LookItemFlag) per key-item table from s2c
+    /// 0x055; the c2s 0x064 mark-seen reply must carry the table's full
+    /// updated LookItemFlag bitset.
+    key_item_tables: [KeyItemTableFlags; decode::ScenarioItem::TABLE_COUNT],
+}
+
+/// `received` gates c2s 0x064: before this table's 0x055 arrives the local
+/// flags are default-zeroed, and marking seen against them would tell the
+/// server (and local state) the table is empty.
+#[derive(Debug, Default, Clone, Copy)]
+struct KeyItemTableFlags {
+    received: bool,
+    get_flags: [u32; decode::ScenarioItem::WORDS],
+    look_flags: [u32; decode::ScenarioItem::WORDS],
 }
 
 #[derive(Debug)]
@@ -291,6 +333,7 @@ async fn run_map_session(
     let mut claim_cache: std::collections::HashMap<u32, u32> = Default::default();
 
     let mut npc_name_resolver = NpcNameResolver::new(cfg.dat_root.clone());
+    let mut emote_text_resolver = EmoteTextResolver::new(cfg.dat_root.clone());
 
     let mut name_miss_dedup: std::collections::HashMap<
         (u32, crate::state::NameMissKind),
@@ -305,6 +348,15 @@ async fn run_map_session(
     let mut flood_in_mog_house = false;
 
     let mut mog = SelfMogState::default();
+
+    // s2c 0x02A TALKNUMWORK resolves against the zone dialog DAT owned by the
+    // keepalive loop's DialogSession, so bodies arriving during the flood are
+    // buffered and replayed once it exists — never dropped silently. The cap
+    // bounds memory against a misbehaving server; zone onZoneIn lua emits only
+    // a handful of messageSpecial lines (e.g.
+    // vendor/server/scripts/zones/Attohwa_Chasm/Zone.lua).
+    const FLOOD_TALKNUMWORK_MAX: usize = 32;
+    let mut flood_talknumwork: Vec<Vec<u8>> = Vec::new();
     while std::time::Instant::now() < flood_deadline {
         match tokio::time::timeout(std::time::Duration::from_millis(500), map.recv_decrypted())
             .await
@@ -314,6 +366,14 @@ async fn run_map_session(
                 server_last_seq = header.id_and_size;
                 for sub in framing::walk_sub_packets(&buf[framing::FFXI_HEADER_SIZE..]).flatten() {
                     total_subs += 1;
+                    if sub.opcode == ffxi_proto::map::s2c::TALKNUMWORK {
+                        if flood_talknumwork.len() < FLOOD_TALKNUMWORK_MAX {
+                            flood_talknumwork.push(sub.data.to_vec());
+                        } else {
+                            tracing::warn!("TALKNUMWORK flood buffer full; dropping zone message");
+                        }
+                        continue;
+                    }
                     handle_sub_packet(
                         &sub,
                         event_tx,
@@ -329,6 +389,7 @@ async fn run_map_session(
                         &mut self_pos,
                         &mut self_pos_seeded,
                         &mut npc_name_resolver,
+                        &mut emote_text_resolver,
                         &mut flood_in_mog_house,
                         &mut mog,
                         spawn_fallback,
@@ -403,7 +464,9 @@ async fn run_map_session(
         self_pos,
         self_pos_seeded,
         npc_name_resolver,
+        emote_text_resolver,
         mog,
+        flood_talknumwork,
     )
     .await
 }
@@ -496,6 +559,8 @@ fn handle_sub_packet(
     self_pos_seeded: &mut bool,
 
     npc_name_resolver: &mut NpcNameResolver,
+
+    emote_text: &mut EmoteTextResolver,
 
     was_in_mog_house: &mut bool,
 
@@ -921,6 +986,45 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
         }
+        op if op == s2c::MOTIONMES => {
+            if let Ok(m) =
+                decode::MotionMes::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                let _ = event_tx.send(AgentEvent::EntityEmoted {
+                    actor_id: m.cas_unique_no,
+                    actor_index: m.cas_act_index,
+                    target_id: m.tar_unique_no,
+                    target_index: m.tar_act_index,
+                    emote_id: m.mes_num,
+                    param: m.param,
+                    mode: m.mode,
+                });
+                // Bell already arrives as Motion ("No emote text for /bell",
+                // 0x05a_motionmes.cpp:74), so mode alone gates the text.
+                if m.mode != ffxi_proto::map::emote::mode::MOTION {
+                    let _ = event_tx.send(AgentEvent::ChatLine {
+                        line: emote_chat_line(
+                            &m,
+                            self_char_id,
+                            self_char_name,
+                            name_cache,
+                            kind_cache,
+                            emote_text,
+                        ),
+                    });
+                }
+            }
+        }
+        op if op == s2c::EMOTE_LIST => {
+            if let Ok(e) =
+                decode::EmoteList::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                let _ = event_tx.send(AgentEvent::EmoteListUpdated {
+                    job_bits: e.job_bits,
+                    chair_bits: e.chair_bits,
+                });
+            }
+        }
         op if op == s2c::MUSIC => {
             if sub.data.len() >= 4 {
                 let slot = u16::from_le_bytes([sub.data[0], sub.data[1]]) as u8;
@@ -1054,9 +1158,17 @@ fn handle_sub_packet(
             if let Ok(ki) = decode::ScenarioItem::decode(sub.data)
                 .inspect_err(|e| warn_decode_err(sub.opcode, e))
             {
+                if let Some(table) = mog.key_item_tables.get_mut(ki.table_index as usize) {
+                    *table = KeyItemTableFlags {
+                        received: true,
+                        get_flags: ki.get_flags,
+                        look_flags: ki.look_flags,
+                    };
+                }
                 let _ = event_tx.send(AgentEvent::KeyItemsUpdated {
                     table_index: ki.table_index,
                     ids: ki.owned_key_item_ids(),
+                    seen_ids: ki.seen_key_item_ids(),
                 });
             }
         }
@@ -1490,7 +1602,9 @@ async fn keepalive_loop(
 
     mut self_pos_seeded: bool,
     mut npc_name_resolver: NpcNameResolver,
+    mut emote_text_resolver: EmoteTextResolver,
     mut mog: SelfMogState,
+    flood_talknumwork: Vec<Vec<u8>>,
 ) -> Result<MapOutcome> {
     let mut last_recv = std::time::Instant::now();
 
@@ -1534,6 +1648,16 @@ async fn keepalive_loop(
         npc_name_resolver.root.clone(),
         character_name.clone(),
     );
+
+    for body in &flood_talknumwork {
+        emit_talknumwork_chat(
+            body,
+            &mut dialog_session,
+            current_zone_id,
+            &character_name,
+            &event_tx,
+        );
+    }
 
     let mut local_menu = crate::local_menu::LocalMenuSession::new();
 
@@ -1846,6 +1970,59 @@ async fn keepalive_loop(
                             tracing::warn!(error = %e, "action send failed");
                             let _ = event_tx.send(AgentEvent::Error {
                                 message: format!("action send: {e}"),
+                            });
+                        }
+                    }
+                    Some(AgentCommand::Emote {
+                        emote_id,
+                        mode,
+                        param,
+                        target_id,
+                        target_index,
+                    }) => {
+                        // Mirror of the LSB validator (0x05d_motion.cpp
+                        // validate + bell note range): a send the server would
+                        // drop silently is refused client-side with a reason.
+                        let in_event =
+                            dialog_session.active_end().is_some() || !pending_event_end.is_empty();
+                        if let Some(reason) = emote_send_block_reason(emote_id, mode, param, in_event)
+                        {
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("emote not sent: {reason}"),
+                            });
+                            continue;
+                        }
+                        let target_index = target_index.unwrap_or(0);
+                        self_face_target = face_target_for(target_index, self_act_index);
+                        let payload = build_subpacket_motion(
+                            sub_seq,
+                            target_id.unwrap_or(0),
+                            target_index,
+                            emote_id,
+                            mode,
+                            param,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "emote send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("emote send: {e}"),
+                            });
+                        }
+                    }
+                    Some(AgentCommand::RequestEmoteList) => {
+                        let payload = build_subpacket_emote_list_req(sub_seq);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "emote_list request send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("emote_list send: {e}"),
                             });
                         }
                     }
@@ -2173,6 +2350,88 @@ async fn keepalive_loop(
                             &event_tx,
                         )
                         .await;
+                    }
+                    Some(AgentCommand::MarkKeyItemsSeen { table_index, ids }) => {
+                        // LSB blockedBy(InEvent) rejects 0x064 while an event is
+                        // open, and mustEqual(UniqueNo/ActIndex) silently drops a
+                        // wrong self id (0x064_scenarioitem.cpp) — skip rather
+                        // than burn a seq slot on a silent drop; the unseen state
+                        // stays and a later menu close retries.
+                        let in_event = dialog_session.active_end().is_some()
+                            || !pending_event_end.is_empty();
+                        match mog.key_item_tables.get_mut(table_index as usize) {
+                            None => {
+                                tracing::warn!(
+                                    table_index,
+                                    "key-item mark-seen for out-of-range table"
+                                );
+                            }
+                            Some(table) => match mark_seen_send_block_reason(
+                                in_event,
+                                self_act_index,
+                                table.received,
+                            ) {
+                                Err(reason) => {
+                                    tracing::debug!(
+                                        table_index,
+                                        reason,
+                                        "skipping key-item mark-seen"
+                                    );
+                                }
+                                Ok(act_index) => {
+                                    let mut new_look = table.look_flags;
+                                    if fold_seen_ids_into_look_flags(
+                                        table_index,
+                                        &ids,
+                                        &mut new_look,
+                                    ) {
+                                        let payload = build_subpacket_scenario_item(
+                                            sub_seq,
+                                            self_char_id,
+                                            act_index,
+                                            table_index,
+                                            &new_look,
+                                        );
+                                        sub_seq = sub_seq.wrapping_add(1);
+                                        match map
+                                            .send_encrypted(
+                                                &payload,
+                                                datagram_header_id(sub_seq),
+                                                server_last_seq,
+                                            )
+                                            .await
+                                        {
+                                            // LSB sends no 0x055 echo for 0x064;
+                                            // fold the new seen bits into local
+                                            // state only after a successful send
+                                            // so a failed send leaves them unseen
+                                            // and a retry re-sends.
+                                            Ok(()) => {
+                                                table.look_flags = new_look;
+                                                let _ = event_tx.send(
+                                                    AgentEvent::KeyItemsUpdated {
+                                                        table_index,
+                                                        ids:
+                                                            decode::ScenarioItem::ids_from_flags(
+                                                                table_index,
+                                                                &table.get_flags,
+                                                            ),
+                                                        seen_ids:
+                                                            decode::ScenarioItem::ids_from_flags(
+                                                                table_index,
+                                                                &table.look_flags,
+                                                            ),
+                                                    },
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(error = %e, "key-item mark-seen send failed");
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                        }
                     }
                     Some(AgentCommand::OpenMogMenu) => {
                         if dialog_session.active_end().is_none() {
@@ -2537,6 +2796,20 @@ async fn keepalive_loop(
                                 continue;
                             }
 
+                            // TALKNUMWORK resolves against the zone dialog DAT
+                            // that dialog_session owns, so it can't live in
+                            // handle_sub_packet.
+                            if sub.opcode == ffxi_proto::map::s2c::TALKNUMWORK {
+                                emit_talknumwork_chat(
+                                    sub.data,
+                                    &mut dialog_session,
+                                    current_zone_id,
+                                    &character_name,
+                                    &event_tx,
+                                );
+                                continue;
+                            }
+
                             // Event triggers (0x32/0x33/0x34) route through the
                             // event VM, never the legacy raw dialog.
                             if matches!(
@@ -2584,6 +2857,7 @@ async fn keepalive_loop(
                                 &mut self_pos,
                                 &mut self_pos_seeded,
                                 &mut npc_name_resolver,
+                                &mut emote_text_resolver,
                                 &mut self_in_mog_house,
                                 &mut mog,
                                 None,
@@ -2764,6 +3038,67 @@ fn build_subpacket_zone_transition(sync: u16) -> Vec<u8> {
 
     buf[4] = 2;
     buf
+}
+
+/// Decode one s2c 0x02A TALKNUMWORK body and emit its chat line. Shared by the
+/// keepalive receive path and the zone-in flood replay so both honor the
+/// never-drop-silently invariant of [`talknumwork_chat_line`].
+fn emit_talknumwork_chat(
+    body: &[u8],
+    dialog_session: &mut crate::event_dialog::DialogSession,
+    zone_id: u16,
+    character_name: &str,
+    event_tx: &broadcast::Sender<AgentEvent>,
+) {
+    match decode::TalkNumWork::decode(body) {
+        Ok(tnw) => {
+            let zone_text = dialog_session.zone_text(zone_id, tnw.message_index() as usize);
+            let _ = event_tx.send(AgentEvent::ChatLine {
+                line: talknumwork_chat_line(&tnw, zone_text, character_name),
+            });
+        }
+        Err(e) => warn_decode_err(ffxi_proto::map::s2c::TALKNUMWORK, &e),
+    }
+}
+
+/// Render s2c 0x02A TALKNUMWORK as a chat line: the zone dialog DAT entry at
+/// `message_index()` with `num[]` params substituted ({Num:N}, {KeyItem:N},
+/// {Item:N}). Degrades to a placeholder when the zone's string DAT is
+/// unavailable — the message must never drop silently.
+fn talknumwork_chat_line(
+    tnw: &decode::TalkNumWork,
+    zone_text: Option<String>,
+    player_name: &str,
+) -> ChatLine {
+    let speaker = (!tnw.hide_name()).then(|| tnw.speaker_name()).flatten();
+    let text = match zone_text {
+        Some(raw) => crate::event_dialog::substitute_entity_names(
+            crate::event_dialog::substitute_nums(
+                crate::event_dialog::substitute_names(
+                    ffxi_event::clean_display(&raw, &tnw.num),
+                    player_name,
+                    speaker.as_deref(),
+                ),
+                &tnw.num,
+            ),
+            &tnw.num,
+        ),
+        None => format!(
+            "[zone message {} — dialog DAT unavailable; params {:?}]",
+            tnw.message_index(),
+            tnw.num,
+        ),
+    };
+    ChatLine {
+        channel: if speaker.is_some() {
+            ChatChannel::Say
+        } else {
+            ChatChannel::System
+        },
+        sender: speaker.unwrap_or_default(),
+        text,
+        server_ts: 0,
+    }
 }
 
 fn build_system_message_line(m: decode::SystemMessage) -> ChatLine {
@@ -3218,6 +3553,66 @@ fn is_pc(id: u32, kind_cache: &std::collections::HashMap<u32, crate::state::Enti
     matches!(kind_cache.get(&id), Some(crate::state::EntityKind::Pc))
 }
 
+/// Compose the chat line for a 0x05A MOTIONMES from the client-side emote
+/// DialogTable, third-person for everyone (self wording is a retail unknown,
+/// bead kuluu-d4u). Falls back to a name-only line when the DAT is absent or
+/// lacks the entry.
+fn emote_chat_line(
+    m: &decode::MotionMes,
+    self_char_id: u32,
+    self_char_name: &str,
+    name_cache: &std::collections::HashMap<u32, String>,
+    kind_cache: &std::collections::HashMap<u32, crate::state::EntityKind>,
+    emote_text: &mut EmoteTextResolver,
+) -> ChatLine {
+    let name_of = |id: u32| -> String {
+        if id == self_char_id {
+            self_char_name.to_string()
+        } else {
+            name_for_id(id, name_cache)
+        }
+    };
+    let cas_name = name_of(m.cas_unique_no);
+    let targeted = m.targeted();
+    let tar_name = targeted.then(|| name_of(m.tar_unique_no));
+    // The "[the /]" article: NPCs/mobs keep "the ", player characters drop it.
+    let target_article = targeted && !is_pc(m.tar_unique_no, kind_cache);
+    let text = emote_text
+        .table()
+        .and_then(|t| {
+            t.line(
+                m.mes_num,
+                targeted,
+                &ffxi_dat::dmsg::EmoteLineContext {
+                    caster: &cas_name,
+                    target: tar_name.as_deref(),
+                    target_article,
+                },
+            )
+        })
+        .unwrap_or_else(|| fallback_emote_text(&cas_name, m.mes_num));
+    ChatLine {
+        channel: ChatChannel::Emote,
+        sender: String::new(),
+        text,
+        server_ts: 0,
+    }
+}
+
+fn fallback_emote_text(cas_name: &str, mes_num: u16) -> String {
+    use ffxi_proto::map::emote::{JOB_MESNUM_BASE, JOB_MESNUM_MAX};
+    let command = if (JOB_MESNUM_BASE..=JOB_MESNUM_MAX).contains(&mes_num) {
+        "jobemote".to_string()
+    } else {
+        u8::try_from(mes_num)
+            .ok()
+            .and_then(ffxi_proto::emote_names::lookup)
+            .map(str::to_lowercase)
+            .unwrap_or_else(|| format!("emote{mes_num}"))
+    };
+    format!("{cas_name} uses /{command}.")
+}
+
 fn replace_named_token(s: &str, tok: &str, name: &str, entity_is_pc: bool) -> String {
     if entity_is_pc {
         s.replace(&format!("The {tok}"), name)
@@ -3543,8 +3938,7 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-// vendor/server/src/common/earth_time.h — Unix time of the Vana'diel epoch.
-const VANA_EPOCH_UNIX: u64 = 1_009_810_800;
+use ffxi_proto::vana_time::VANA_EPOCH_UNIX;
 
 // vendor/server/src/map/packets/s2c/0x063_miscdata_status_icons.cpp:
 // timestamp = (remaining_seconds + vanadiel_timestamp()) * 60, u32-wrapping;
@@ -3787,6 +4181,82 @@ fn build_subpacket_event_end(
     buf
 }
 
+// Inverse of the s2c 0x055 id decode — LSB reads the bits back as
+// keyItemId = TableIndex*512 + word*32 + bit (vendor/server/src/map/packets/
+// c2s/0x064_scenarioitem.cpp:44). Ids outside `table_index`'s range are
+// ignored; returns whether any bit changed.
+fn fold_seen_ids_into_look_flags(
+    table_index: u16,
+    ids: &[u16],
+    look_flags: &mut [u32; decode::ScenarioItem::WORDS],
+) -> bool {
+    let word_bits = u32::BITS as usize;
+    let mut changed = false;
+    for id in ids {
+        let global = *id as usize;
+        if global / decode::ScenarioItem::BITS_PER_TABLE != table_index as usize {
+            continue;
+        }
+        let local = global % decode::ScenarioItem::BITS_PER_TABLE;
+        let mask = 1u32 << (local % word_bits);
+        if look_flags[local / word_bits] & mask == 0 {
+            look_flags[local / word_bits] |= mask;
+            changed = true;
+        }
+    }
+    changed
+}
+
+// LSB gates c2s 0x064 with blockedBy(InEvent) and silently drops it unless
+// UniqueNo == char id and ActIndex == self targid (vendor/server/src/map/
+// packets/c2s/0x064_scenarioitem.cpp:31-33), so an unseeded targid must skip
+// the send; a table whose s2c 0x055 never arrived has only default-zeroed
+// local flags, so marking against it would report the table empty. Ok carries
+// the validated ActIndex.
+fn mark_seen_send_block_reason(
+    in_event: bool,
+    self_act_index: Option<u16>,
+    table_received: bool,
+) -> Result<u16, &'static str> {
+    if in_event {
+        return Err("InEvent blocks 0x064");
+    }
+    let act_index = self_act_index.ok_or("self act_index not yet seeded")?;
+    if !table_received {
+        return Err("table's 0x055 not received this session");
+    }
+    Ok(act_index)
+}
+
+// c2s 0x064 GP_CLI_COMMAND_SCENARIOITEM (vendor/server/src/map/packets/c2s/
+// 0x064_scenarioitem.h): UniqueNo u32, LookItemFlag u32[16], ActIndex u16,
+// TableIndex u16. The server ORs every set LookItemFlag bit into the table's
+// seen list and validates UniqueNo == char id, ActIndex == self targid,
+// TableIndex < tables.size() (0x064_scenarioitem.cpp); blocked while InEvent.
+fn build_subpacket_scenario_item(
+    sync: u16,
+    unique_no: u32,
+    act_index: u16,
+    table_index: u16,
+    look_flags: &[u32; decode::ScenarioItem::WORDS],
+) -> Vec<u8> {
+    const TOTAL: usize = 4 + 4 + decode::ScenarioItem::WORDS * 4 + 2 + 2;
+    let mut buf = vec![0u8; TOTAL];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::SCENARIO_ITEM,
+        (TOTAL / 4) as u16,
+        sync,
+    ));
+    buf[4..8].copy_from_slice(&unique_no.to_le_bytes());
+    for (i, w) in look_flags.iter().enumerate() {
+        let o = 8 + i * 4;
+        buf[o..o + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    buf[72..74].copy_from_slice(&act_index.to_le_bytes());
+    buf[74..76].copy_from_slice(&table_index.to_le_bytes());
+    buf
+}
+
 pub fn build_subpacket_action(
     sync: u16,
     unique_no: u32,
@@ -3802,6 +4272,38 @@ pub fn build_subpacket_action(
     kind.fill_action_buf(&mut action_buf);
     buf[12..28].copy_from_slice(&action_buf);
     buf
+}
+
+// c2s 0x05D GP_CLI_COMMAND_MOTION: UniqueNo u32 @4, ActIndex u16 @8, Number u8
+// @10 (emote id), Mode u8 @11, Param u16 @12, pad u16 @14
+// (vendor/server/src/map/packets/c2s/0x05d_motion.h:28-35). Note the c2s Mode
+// byte precedes Param, unlike the s2c 0x05A layout.
+pub fn build_subpacket_motion(
+    sync: u16,
+    unique_no: u32,
+    act_index: u16,
+    number: u8,
+    mode: u8,
+    param: u16,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 16];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::MOTION,
+        4,
+        sync,
+    ));
+    buf[4..8].copy_from_slice(&unique_no.to_le_bytes());
+    buf[8..10].copy_from_slice(&act_index.to_le_bytes());
+    buf[10] = number;
+    buf[11] = mode;
+    buf[12..14].copy_from_slice(&param.to_le_bytes());
+    buf
+}
+
+// c2s 0x119 GP_CLI_COMMAND_EMOTE_LIST — header only
+// (vendor/server/src/map/packets/c2s/0x119_emote_list.h declares no payload).
+pub fn build_subpacket_emote_list_req(sync: u16) -> Vec<u8> {
+    build_subpacket_header(ffxi_proto::map::c2s::EMOTE_LIST, 1, sync).to_vec()
 }
 
 /// c2s 0x110 GP_CLI_COMMAND_FISHING_2 — the mini-game request the client streams while
@@ -4227,6 +4729,31 @@ fn build_subpacket_maprect_mh_exit(
     buf
 }
 
+/// Client-side mirror of the LSB 0x05D validator: `blockedBy InEvent`,
+/// `oneOf<EmoteMode>`, `range Number Point..=Aim` (0x05d_motion.cpp:43-49) and
+/// the bell note range (:82). `None` = OK to send. The bell-equip and
+/// job-unlock checks stay server-side (the client lacks lockstyle state).
+fn emote_send_block_reason(emote_id: u8, mode: u8, param: u16, in_event: bool) -> Option<String> {
+    use ffxi_proto::map::emote;
+    if in_event {
+        return Some("busy with an event".into());
+    }
+    if mode > emote::mode::MOTION {
+        return Some(format!("invalid mode {mode}"));
+    }
+    if ffxi_proto::emote_names::lookup(emote_id).is_none() {
+        return Some(format!("unknown emote id {emote_id}"));
+    }
+    if emote_id == emote::BELL && !(emote::BELL_NOTE_MIN..=emote::BELL_NOTE_MAX).contains(&param) {
+        return Some(format!(
+            "bell note {param} out of range {}..={}",
+            emote::BELL_NOTE_MIN,
+            emote::BELL_NOTE_MAX
+        ));
+    }
+    None
+}
+
 // Head-look targid we broadcast: a target-bearing command aimed at ourselves (or
 // no target) reads as "looking at nothing", which retail encodes as facetarget 0.
 fn face_target_for(target_index: u16, self_act_index: Option<u16>) -> u16 {
@@ -4506,6 +5033,84 @@ mod tests {
         assert_eq!(&keep[4..6], &[0, 0], "None → 0 = keep current job");
     }
 
+    /// Pins the c2s 0x05D GP_CLI_COMMAND_MOTION layout
+    /// (vendor/server/src/map/packets/c2s/0x05d_motion.h): Mode at byte 11,
+    /// BEFORE Param — the s2c 0x05A layout puts Mode after Param, so a
+    /// transposition between the two must fail here.
+    #[test]
+    fn motion_packet_layout_matches_lsb_struct() {
+        use ffxi_proto::map::emote;
+        let buf = build_subpacket_motion(
+            0xBEEF,
+            0x0100_0F43,
+            0x0443,
+            emote::BELL,
+            emote::mode::MOTION,
+            emote::BELL_NOTE_MIN,
+        );
+        assert_eq!(
+            buf.len(),
+            16,
+            "hdr + UniqueNo + ActIndex + Number/Mode/Param/pad"
+        );
+        let id_and_size = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(id_and_size & 0x1FF, ffxi_proto::map::c2s::MOTION, "opcode");
+        assert_eq!(id_and_size >> 9, 4, "size_words");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0xBEEF, "sync");
+        assert_eq!(
+            u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            0x0100_0F43,
+            "UniqueNo"
+        );
+        assert_eq!(u16::from_le_bytes([buf[8], buf[9]]), 0x0443, "ActIndex");
+        assert_eq!(buf[10], emote::BELL, "Number");
+        assert_eq!(buf[11], emote::mode::MOTION, "Mode precedes Param (c2s)");
+        assert_eq!(
+            u16::from_le_bytes([buf[12], buf[13]]),
+            emote::BELL_NOTE_MIN,
+            "Param"
+        );
+        assert_eq!(&buf[14..16], &[0, 0], "padding00");
+    }
+
+    /// c2s 0x119 GP_CLI_COMMAND_EMOTE_LIST is header-only (4 bytes, 1 word).
+    #[test]
+    fn emote_list_req_is_header_only() {
+        let buf = build_subpacket_emote_list_req(0x1234);
+        assert_eq!(buf.len(), 4);
+        let id_and_size = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(id_and_size & 0x1FF, ffxi_proto::map::c2s::EMOTE_LIST);
+        assert_eq!(id_and_size >> 9, 1, "size_words");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x1234, "sync");
+    }
+
+    /// Mirrors the LSB 0x05D validator gate order (0x05d_motion.cpp).
+    #[test]
+    fn emote_send_block_mirrors_lsb_validator() {
+        use ffxi_proto::map::emote;
+        assert_eq!(emote_send_block_reason(8, emote::mode::ALL, 0, false), None);
+        assert!(
+            emote_send_block_reason(8, emote::mode::ALL, 0, true).is_some(),
+            "blockedBy InEvent"
+        );
+        assert!(
+            emote_send_block_reason(8, 3, 0, false).is_some(),
+            "oneOf<EmoteMode>"
+        );
+        assert!(
+            emote_send_block_reason(39, emote::mode::ALL, 0, false).is_some(),
+            "39 is a gap in the Emote enum"
+        );
+        assert!(
+            emote_send_block_reason(emote::BELL, emote::mode::ALL, 5, false).is_some(),
+            "bell note below 0x06"
+        );
+        assert_eq!(
+            emote_send_block_reason(emote::BELL, emote::mode::ALL, emote::BELL_NOTE_MAX, false),
+            None
+        );
+    }
+
     #[test]
     fn door_menu_picks_encode_zmrq_maprect_pairs() {
         use crate::local_menu::{Advance, LocalMenuSession, HOME_ROW, MOG_GARDEN_ROW};
@@ -4782,6 +5387,203 @@ mod tests {
             &230u16.to_le_bytes(),
             "EventNum carries the zone id (retail echoes LOGIN EventNum, \
              0x00a_login.cpp:187); LSB's 0x05B handler never reads it",
+        );
+    }
+
+    /// Pins the c2s 0x064 GP_CLI_COMMAND_SCENARIOITEM layout against
+    /// vendor/server/src/map/packets/c2s/0x064_scenarioitem.h: UniqueNo u32 @4,
+    /// LookItemFlag u32[16] @8, ActIndex u16 @72, TableIndex u16 @74.
+    #[test]
+    fn scenario_item_packet_layout_matches_lsb_struct() {
+        let mut look = [0u32; decode::ScenarioItem::WORDS];
+        look[0] = 0b101;
+        look[15] = 0x8000_0001;
+        let buf = build_subpacket_scenario_item(0x1234, 0xDEAD_BEEF, 0x4242, 6, &look);
+        assert_eq!(buf.len(), 76, "header(4) + body(72)");
+
+        let id_and_size = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(id_and_size & 0x1FF, ffxi_proto::map::c2s::SCENARIO_ITEM);
+        assert_eq!(id_and_size >> 9, 19, "size_words = 76/4");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x1234, "sync");
+
+        assert_eq!(&buf[4..8], &0xDEAD_BEEFu32.to_le_bytes(), "UniqueNo");
+        assert_eq!(&buf[8..12], &0b101u32.to_le_bytes(), "LookItemFlag[0]");
+        assert_eq!(
+            &buf[68..72],
+            &0x8000_0001u32.to_le_bytes(),
+            "LookItemFlag[15]"
+        );
+        assert_eq!(&buf[72..74], &0x4242u16.to_le_bytes(), "ActIndex");
+        assert_eq!(&buf[74..76], &6u16.to_le_bytes(), "TableIndex");
+    }
+
+    /// vendor/server/src/map/packets/c2s/0x064_scenarioitem.cpp:44 —
+    /// keyItemId = TableIndex*512 + i*32 + bit; the fold must be its inverse.
+    #[test]
+    fn mark_seen_bits_round_trip_through_ids_from_flags() {
+        let mut flags = [0u32; decode::ScenarioItem::WORDS];
+        assert!(fold_seen_ids_into_look_flags(
+            1,
+            &[513, 512 + 95, 3],
+            &mut flags
+        ));
+        assert_eq!(flags[0], 1 << 1, "id 513 = table 1 bit 1");
+        assert_eq!(flags[2], 1 << 31, "id 607 = word 2 bit 31");
+        assert_eq!(
+            decode::ScenarioItem::ids_from_flags(1, &flags),
+            vec![513, 607],
+            "round-trips through the tested decode oracle; id 3 (table 0) ignored"
+        );
+        assert!(
+            !fold_seen_ids_into_look_flags(1, &[513], &mut flags),
+            "already-set bits report no change"
+        );
+    }
+
+    /// vendor/server/src/map/packets/c2s/0x064_scenarioitem.cpp:31-33 —
+    /// UniqueNo must equal char id and ActIndex must equal targid, ActIndex 0
+    /// is always rejected, and the send is blocked while InEvent; every
+    /// blocked case must skip without mutating local seen-state.
+    #[test]
+    fn mark_seen_requires_self_targid() {
+        assert!(mark_seen_send_block_reason(false, None, true).is_err());
+        assert!(mark_seen_send_block_reason(true, Some(0x123), true).is_err());
+        assert!(
+            mark_seen_send_block_reason(false, Some(0x123), false).is_err(),
+            "table without a received 0x055 must not synthesize an empty update"
+        );
+        assert_eq!(
+            mark_seen_send_block_reason(false, Some(0x123), true),
+            Ok(0x123)
+        );
+    }
+
+    fn tnw(mes_num: u16, num: [i32; 4], name: &str) -> decode::TalkNumWork {
+        let mut name_buf = [0u8; decode::TalkNumWork::NAME_LEN];
+        name_buf[..name.len()].copy_from_slice(name.as_bytes());
+        decode::TalkNumWork {
+            unique_no: 0x100,
+            num,
+            act_index: 5,
+            mes_num,
+            kind: 0,
+            flag: 0,
+            name: name_buf,
+        }
+    }
+
+    #[test]
+    fn talknumwork_resolves_key_item_marker_from_zone_text() {
+        // Key item 1 = Zeruhn Report (vendor/server/scripts/enum/key_item.lua).
+        let line = talknumwork_chat_line(
+            &tnw(
+                6438 | decode::TalkNumWork::MESNUM_HIDE_NAME_FLAG,
+                [1, 0, 0, 0],
+                "",
+            ),
+            Some("Obtained key item: {KeyItem:0}.".to_string()),
+            "Zeid",
+        );
+        assert_eq!(line.text, "Obtained key item: Zeruhn Report.");
+        assert_eq!(line.channel, ChatChannel::System);
+        assert_eq!(line.sender, "");
+    }
+
+    /// Zone-230 KEYITEM_OBTAINED for the client era the default install
+    /// carries — LSB text ids are identity DAT entry indexes (LandSandBoat
+    /// b3af49c62ae2 IDs.lua pinned 6437 when its sync matched this DAT era;
+    /// newer pins say 6438 only because SE inserted entries in later clients —
+    /// see ffxi-dat dmsg::tests::real_zone230_keyitem_obtained_decodes_marker).
+    const ZONE230_KEYITEM_OBTAINED_MAY2023: u16 = 6437;
+
+    fn test_dat_root() -> Option<ffxi_dat::DatRoot> {
+        if let Ok(root) = ffxi_dat::DatRoot::from_env() {
+            return Some(root);
+        }
+        let default = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(ffxi_dat::archive::DEFAULT_INSTALL_DIR);
+        ffxi_dat::DatRoot::open(default).ok()
+    }
+
+    /// Full 0x02A chat composition against the retail DAT: the zone string's
+    /// inline key-item tag must decode to `{KeyItem:0}` and resolve through
+    /// `num[0]` (pre-fix this line rendered "Obtained key item: {Auto:128}3\u{FFFD}.").
+    /// Key item 1 = Zeruhn Report (vendor/server/scripts/enum/key_item.lua).
+    /// Self-skips without game files.
+    #[test]
+    fn talknumwork_composes_real_keyitem_line_from_zone_dat() {
+        let Some(root) = test_dat_root() else {
+            eprintln!("skipping: no FFXI install");
+            return;
+        };
+        let mut ds = crate::event_dialog::DialogSession::new(
+            Some(std::sync::Arc::new(root)),
+            "Tester".into(),
+        );
+        let zone_text = ds.zone_text(230, ZONE230_KEYITEM_OBTAINED_MAY2023 as usize);
+        assert!(zone_text.is_some(), "zone 230 string DAT must load");
+        let line = talknumwork_chat_line(
+            &tnw(
+                ZONE230_KEYITEM_OBTAINED_MAY2023 | decode::TalkNumWork::MESNUM_HIDE_NAME_FLAG,
+                [1, 0, 0, 0],
+                "",
+            ),
+            zone_text,
+            "Tester",
+        );
+        assert_eq!(line.text, "Obtained key item: Zeruhn Report.");
+        assert_eq!(line.channel, ChatChannel::System);
+    }
+
+    #[test]
+    fn talknumwork_shows_speaker_name_when_not_hidden() {
+        let line = talknumwork_chat_line(
+            &tnw(100, [7, 0, 0, 0], "Trion"),
+            Some("{SpeakerName} counts {Num:0}.".to_string()),
+            "Zeid",
+        );
+        assert_eq!(line.sender, "Trion");
+        assert_eq!(line.channel, ChatChannel::Say);
+        assert_eq!(line.text, "Trion counts 7.");
+    }
+
+    #[test]
+    fn talknumwork_degrades_to_placeholder_without_zone_strings() {
+        let line = talknumwork_chat_line(
+            &tnw(
+                6438 | decode::TalkNumWork::MESNUM_HIDE_NAME_FLAG,
+                [512, 0, 0, 0],
+                "",
+            ),
+            None,
+            "Zeid",
+        );
+        assert!(
+            line.text.contains("6438") && line.text.contains("512"),
+            "placeholder must expose the masked index and params: {}",
+            line.text
+        );
+    }
+
+    /// A 0x02A buffered during the zone-in flood must replay as a chat line
+    /// once the keepalive loop's DialogSession exists — degrading to the
+    /// placeholder without a DAT, never dropping silently.
+    #[test]
+    fn buffered_flood_talknumwork_replays_as_chat_line() {
+        let mut ds = crate::event_dialog::DialogSession::new(None, "Tester".into());
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut body = vec![0u8; decode::TalkNumWork::SIZE];
+        body[22..24].copy_from_slice(&42u16.to_le_bytes());
+        emit_talknumwork_chat(&body, &mut ds, 230, "Tester", &tx);
+        let AgentEvent::ChatLine { line } = rx.try_recv().expect("replay must emit an event")
+        else {
+            panic!("expected ChatLine");
+        };
+        assert!(
+            line.text.contains("zone message 42"),
+            "no-DAT replay degrades to the placeholder: {}",
+            line.text
         );
     }
 
@@ -6179,7 +6981,7 @@ mod tests {
             (k::YELL, ChatChannel::Yell),
             (k::SYSTEM_1, ChatChannel::System),
             (k::SYSTEM_3, ChatChannel::System),
-            (k::EMOTION, ChatChannel::Say),
+            (k::EMOTION, ChatChannel::Emote),
             (k::NS_PARTY, ChatChannel::Party),
             (k::LINKSHELL2, ChatChannel::Linkshell),
             (200u8, ChatChannel::Other),

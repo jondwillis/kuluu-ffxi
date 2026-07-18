@@ -13,6 +13,16 @@ pub mod c2s {
     pub const ACTION: u16 = 0x01A;
     pub const EVENT_END: u16 = 0x05B;
 
+    // GP_CLI_COMMAND_MOTION, vendor/server/src/map/enums/packet_c2s.h:71.
+    // Emote request: UniqueNo u32, ActIndex u16, Number u8 (emote id), Mode u8,
+    // Param u16 (vendor/server/src/map/packets/c2s/0x05d_motion.h:28-35).
+    pub const MOTION: u16 = 0x05D;
+
+    // GP_CLI_COMMAND_EMOTE_LIST, vendor/server/src/map/enums/packet_c2s.h:157.
+    // Header-only request for the job-emote/chair unlock flags; answered by
+    // s2c 0x11A (vendor/server/src/map/packets/c2s/0x119_emote_list.h).
+    pub const EMOTE_LIST: u16 = 0x119;
+
     pub const CHAT: u16 = 0x0B5;
 
     pub const SHOP_BUY: u16 = 0x083;
@@ -53,6 +63,11 @@ pub mod c2s {
     // GP_CLI_COMMAND_PBX, vendor/server/src/map/packets/c2s/0x04d_pbx.h.
     // Delivery box sub-protocol; see [`crate::map::pbx`] for the Command bytes.
     pub const PBX: u16 = 0x04D;
+
+    // GP_CLI_COMMAND_SCENARIOITEM, vendor/server/src/map/packets/c2s/
+    // 0x064_scenarioitem.h — mark key items seen (full LookItemFlag bitset
+    // for one table; the server ORs each set bit).
+    pub const SCENARIO_ITEM: u16 = 0x064;
 
     pub const REQ_LOGOUT: u16 = 0x0E7;
 }
@@ -223,6 +238,42 @@ pub mod eventucoff_mode {
     pub const FISHING: u32 = 4;
 }
 
+/// Emote wire vocabulary shared by c2s 0x05D MOTION and s2c 0x05A MOTIONMES.
+pub mod emote {
+    // EmoteMode, vendor/server/src/map/enums/emote.h.
+    pub mod mode {
+        pub const ALL: u8 = 0;
+        pub const TEXT: u8 = 1;
+        pub const MOTION: u8 = 2;
+    }
+
+    // Emote ids referenced by name in code; the full table is the build-time
+    // scrape of vendor/server/src/map/enums/emote.h
+    // (`crate::emote_names::EMOTES`), and `pinned_ids_match_scraped_table`
+    // guards these against it.
+    pub const BELL: u8 = 73;
+    pub const JOB: u8 = 74;
+    /// Server-initiated only ("Only used for HELM", emote.h) — no retail slash
+    /// command, so keep them out of slash aliases and the emote-list menu.
+    pub const HELM_ONLY: [u8; 3] = [40, 41, 42];
+
+    /// /bell note Param range (vendor/server/src/map/packets/c2s/
+    /// 0x05d_motion.cpp:82: `Param < 0x06 || Param > 0x1e` is rejected).
+    pub const BELL_NOTE_MIN: u16 = 0x06;
+    pub const BELL_NOTE_MAX: u16 = 0x1E;
+
+    /// /jobemote Param = job id + 0x1E, so WAR(1) → 0x1F
+    /// (vendor/server/src/map/packets/c2s/0x05d_motion.cpp:89 checks
+    /// `jobs.unlocked & (1 << (Param - 0x1E))`).
+    pub const JOB_PARAM_BASE: u16 = 0x1F;
+
+    /// s2c MesNum for a job emote = 74 + (Param - 0x1F), giving 74..=95
+    /// (vendor/server/src/map/packets/s2c/0x05a_motionmes.cpp:37; the 22-job
+    /// span WAR..RUN mirrors the 0x11A jobemotes_t bitfield).
+    pub const JOB_MESNUM_BASE: u16 = 74;
+    pub const JOB_MESNUM_MAX: u16 = 95;
+}
+
 pub mod chat_kind {
     pub const SAY: u8 = 0;
     pub const SHOUT: u8 = 1;
@@ -270,6 +321,15 @@ pub mod s2c {
 
     pub const CHAT: u16 = 0x017;
 
+    // GP_SERV_COMMAND_MOTIONMES, vendor/server/src/map/enums/packet_s2c.h:95.
+    // Emote broadcast (vendor/server/src/map/packets/s2c/0x05a_motionmes.h).
+    pub const MOTIONMES: u16 = 0x05A;
+
+    // GP_SERV_COMMAND_EMOTE_LIST, vendor/server/src/map/enums/packet_s2c.h:177.
+    // Job-emote (u32) + chair (u16) unlock bitfields
+    // (vendor/server/src/map/packets/s2c/0x11a_emote_list.h).
+    pub const EMOTE_LIST: u16 = 0x11A;
+
     pub const ITEM_MAX: u16 = 0x01C;
 
     pub const ITEM_SAME: u16 = 0x01D;
@@ -311,6 +371,11 @@ pub mod s2c {
     // end of fishing.
     pub const EVENTUCOFF: u16 = 0x052;
 
+    // GP_SERV_COMMAND_TALKNUMWORK, vendor/server/src/map/packets/s2c/
+    // 0x02a_talknumwork.h — zone-dialog message (lua messageSpecial) with
+    // numeric params; MesNum indexes the zone dialog DAT.
+    pub const TALKNUMWORK: u16 = 0x02A;
+
     pub const SCENARIO_ITEM: u16 = 0x055;
 
     // vendor/server/src/map/packets/s2c/0x057_weather.h
@@ -338,4 +403,39 @@ pub mod s2c {
     pub const GROUP_LIST: u16 = 0x0DD;
 
     pub const GROUP_ATTR: u16 = 0x0DF;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pinned_emote_ids_match_scraped_table() {
+        use super::emote;
+        assert_eq!(crate::emote_names::lookup(emote::BELL), Some("Bell"));
+        assert_eq!(crate::emote_names::lookup(emote::JOB), Some("Job"));
+        assert_eq!(
+            emote::HELM_ONLY.map(crate::emote_names::lookup),
+            [Some("Logging"), Some("Excavation"), Some("Harvesting")]
+        );
+    }
+
+    /// vendor/server/src/map/packets/s2c/0x05a_motionmes.cpp:37 —
+    /// `MesNum = Emote::Job + (extra - 0x1F)`, so the s2c job-emote span must
+    /// start at the scraped Emote::Job id and cover the 22-job jobemotes_t
+    /// width (WAR..RUN, 0x11a_emote_list.h).
+    #[test]
+    fn job_mesnum_rebase_matches_lsb_broadcast() {
+        use super::emote;
+        assert_eq!(
+            emote::JOB_MESNUM_BASE,
+            u16::from(emote::JOB),
+            "rebase starts at Emote::Job itself (WAR Param 0x1F adds 0)"
+        );
+        let run_job_id: u16 = 22;
+        let run_param = emote::JOB_PARAM_BASE + run_job_id - 1;
+        assert_eq!(
+            emote::JOB_MESNUM_BASE + (run_param - emote::JOB_PARAM_BASE),
+            emote::JOB_MESNUM_MAX,
+            "RUN (job 22, top jobemotes_t bit) lands on JOB_MESNUM_MAX"
+        );
+    }
 }

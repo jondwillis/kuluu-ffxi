@@ -150,7 +150,7 @@ fn choice_text(strings: &StringDat, message_id: u32, params: &[i32]) -> (String,
 /// alternatives (see [`resolve_choice_brackets`]). The remaining substitution
 /// placeholders (`{PlayerName}`, `{SpeakerName}`, `{Num:N}`, …) are left for the
 /// caller, which has the runtime names/parameters they need.
-fn clean_display(s: &str, params: &[i32]) -> String {
+pub fn clean_display(s: &str, params: &[i32]) -> String {
     let stripped = strip_marker(s, AUTO_MARKER_PREFIX);
     let stripped = strip_marker(&stripped, SET_COLOR_MARKER_PREFIX);
     resolve_choice_brackets(&stripped, params)

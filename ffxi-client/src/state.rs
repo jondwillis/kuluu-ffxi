@@ -211,6 +211,11 @@ pub enum ChatChannel {
     Battle,
 
     Debug,
+
+    /// Chat kind 8 MESSAGE_EMOTION: canned-emote lines the client composes
+    /// from its DAT, plus free-form /em text
+    /// (vendor/server/src/map/enums/chat_message_type.h:35).
+    Emote,
 }
 
 impl ChatChannel {
@@ -225,7 +230,7 @@ impl ChatChannel {
             k::YELL => Self::Yell,
             k::SYSTEM_1 | k::SYSTEM_2 | k::SYSTEM_3 => Self::System,
 
-            k::EMOTION => Self::Say,
+            k::EMOTION => Self::Emote,
             _ => Self::Other,
         }
     }
@@ -378,6 +383,9 @@ pub struct SessionState {
     pub key_items: Vec<u16>,
 
     #[serde(default)]
+    pub key_items_seen: Vec<u16>,
+
+    #[serde(default)]
     pub self_fishing: Option<SelfFishing>,
 
     #[serde(default)]
@@ -393,6 +401,15 @@ pub struct SessionState {
     /// (vendor/server/src/map/packets/char_sync.cpp:61); `None` until one lands.
     #[serde(default)]
     pub mh_2f_unlocked: Option<bool>,
+
+    /// Job-emote unlock bitfield from s2c 0x11A (bit = job id - 1); `None`
+    /// until the server answers a 0x119 EMOTE_LIST request.
+    #[serde(default)]
+    pub emote_jobs: Option<u32>,
+
+    /// Chair unlock bitfield from s2c 0x11A.
+    #[serde(default)]
+    pub emote_chairs: Option<u16>,
 
     #[serde(default)]
     pub delivery_box: DeliveryBoxState,
@@ -1046,6 +1063,7 @@ impl SessionState {
             | AgentEvent::TellReceived { .. }
             | AgentEvent::SceneSummary { .. }
             | AgentEvent::ActionStarted { .. }
+            | AgentEvent::EntityEmoted { .. }
             | AgentEvent::HumanInControl { .. }
             | AgentEvent::HumanReleased
             | AgentEvent::MusicChanged { .. }
@@ -1171,16 +1189,24 @@ impl SessionState {
                 self.pet_abilities_known = pet_abilities.clone();
                 changed
             }
-            AgentEvent::KeyItemsUpdated { table_index, ids } => {
-                let before = self.key_items.clone();
+            AgentEvent::KeyItemsUpdated {
+                table_index,
+                ids,
+                seen_ids,
+            } => {
                 let base = *table_index as usize * KEY_ITEMS_PER_TABLE;
                 let table_range = base..base + KEY_ITEMS_PER_TABLE;
-                self.key_items
-                    .retain(|id| !table_range.contains(&(*id as usize)));
-                self.key_items.extend(ids.iter().copied());
-                self.key_items.sort_unstable();
-                self.key_items.dedup();
-                self.key_items != before
+                let replace_table = |list: &mut Vec<u16>, incoming: &[u16]| {
+                    let before = list.clone();
+                    list.retain(|id| !table_range.contains(&(*id as usize)));
+                    list.extend(incoming.iter().copied());
+                    list.sort_unstable();
+                    list.dedup();
+                    *list != before
+                };
+                let owned_changed = replace_table(&mut self.key_items, ids);
+                let seen_changed = replace_table(&mut self.key_items_seen, seen_ids);
+                owned_changed || seen_changed
             }
 
             AgentEvent::EventStart { .. } | AgentEvent::KeyRotated { .. } => false,
@@ -1289,6 +1315,16 @@ impl SessionState {
                     changed
                 }
             },
+            AgentEvent::EmoteListUpdated {
+                job_bits,
+                chair_bits,
+            } => {
+                let changed =
+                    self.emote_jobs != Some(*job_bits) || self.emote_chairs != Some(*chair_bits);
+                self.emote_jobs = Some(*job_bits);
+                self.emote_chairs = Some(*chair_bits);
+                changed
+            }
             AgentEvent::FishingProgress { fish_hp, arrow } => {
                 let mut changed = false;
                 if let Some(f) = self.self_fishing.as_mut() {
@@ -1416,6 +1452,25 @@ pub enum AgentEvent {
         action_id: u32,
         action_kind: u8,
     },
+
+    /// s2c 0x05A MOTIONMES: an entity performed an emote. `emote_id` is the
+    /// wire MesNum (job emotes arrive rebased to 74..=95), `mode` the EmoteMode
+    /// byte, `target_id` 0 when untargeted.
+    EntityEmoted {
+        actor_id: u32,
+        actor_index: u16,
+        target_id: u32,
+        target_index: u16,
+        emote_id: u16,
+        param: u16,
+        mode: u8,
+    },
+
+    /// s2c 0x11A EMOTE_LIST: job-emote/chair unlock bitfields.
+    EmoteListUpdated {
+        job_bits: u32,
+        chair_bits: u16,
+    },
     KeyRotated {
         previous_status: BlowfishStatus,
     },
@@ -1507,6 +1562,8 @@ pub enum AgentEvent {
     KeyItemsUpdated {
         table_index: u16,
         ids: Vec<u16>,
+        #[serde(default)]
+        seen_ids: Vec<u16>,
     },
 
     ReactorGoalChanged {
@@ -1609,6 +1666,14 @@ pub enum AgentCommand {
     /// (vendor/server/src/map/packets/s2c/0x02e_openmogmenu.h).
     OpenMogMenu,
 
+    /// Mark key items seen — c2s 0x064 GP_CLI_COMMAND_SCENARIOITEM with the
+    /// table's full updated LookItemFlag bitset
+    /// (vendor/server/src/map/packets/c2s/0x064_scenarioitem.cpp ORs each set bit).
+    MarkKeyItemsSeen {
+        table_index: u16,
+        ids: Vec<u16>,
+    },
+
     EndEvent,
 
     EndEventChoice {
@@ -1641,6 +1706,23 @@ pub enum AgentCommand {
         target_index: u16,
         kind: ActionKind,
     },
+
+    /// c2s 0x05D MOTION: perform a canned emote. `target_id`/`target_index`
+    /// `None` = untargeted (wire UniqueNo/ActIndex 0, per
+    /// research/XiPackets/world/client/0x005D). `mode` is the EmoteMode byte
+    /// (`ffxi_proto::map::emote::mode`), `param` the emote extra (bell note,
+    /// job id + 0x1E, dance variant…).
+    Emote {
+        emote_id: u8,
+        mode: u8,
+        param: u16,
+        target_id: Option<u32>,
+        target_index: Option<u16>,
+    },
+
+    /// c2s 0x119 EMOTE_LIST: header-only request for the job-emote/chair
+    /// unlock bitfields (answered by s2c 0x11A).
+    RequestEmoteList,
 
     ReturnToHomePoint,
 
@@ -2227,18 +2309,47 @@ mod tests {
         s.apply_event(&AgentEvent::KeyItemsUpdated {
             table_index: 0,
             ids: vec![1, 5],
+            seen_ids: vec![1],
         });
         s.apply_event(&AgentEvent::KeyItemsUpdated {
             table_index: 1,
             ids: vec![KEY_ITEMS_PER_TABLE as u16],
+            seen_ids: Vec::new(),
         });
         assert_eq!(s.key_items, vec![1, 5, KEY_ITEMS_PER_TABLE as u16]);
+        assert_eq!(s.key_items_seen, vec![1]);
 
         s.apply_event(&AgentEvent::KeyItemsUpdated {
             table_index: 0,
             ids: vec![5],
+            seen_ids: vec![5],
         });
         assert_eq!(s.key_items, vec![5, KEY_ITEMS_PER_TABLE as u16]);
+        assert_eq!(s.key_items_seen, vec![5], "table 0 seen set replaced");
+    }
+
+    #[test]
+    fn key_items_seen_refresh_keeps_other_tables() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::KeyItemsUpdated {
+            table_index: 1,
+            ids: vec![KEY_ITEMS_PER_TABLE as u16 + 2],
+            seen_ids: vec![KEY_ITEMS_PER_TABLE as u16 + 2],
+        });
+        let changed = s.apply_event(&AgentEvent::KeyItemsUpdated {
+            table_index: 0,
+            ids: vec![3],
+            seen_ids: vec![3],
+        });
+        assert!(changed);
+        assert_eq!(s.key_items_seen, vec![3, KEY_ITEMS_PER_TABLE as u16 + 2]);
+
+        let unchanged = s.apply_event(&AgentEvent::KeyItemsUpdated {
+            table_index: 0,
+            ids: vec![3],
+            seen_ids: vec![3],
+        });
+        assert!(!unchanged, "identical refresh must not report a change");
     }
 
     #[test]
