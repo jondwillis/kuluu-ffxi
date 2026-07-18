@@ -150,8 +150,14 @@ impl DeliveryBoxSession {
             pbx::command::GET => {
                 let slot = r.post_work_no.max(0) as u8;
                 if let Some(item) = item_of(r).or_else(|| self.slots[slot as usize].clone()) {
-                    out.notices
-                        .push(format!("You take the {}.", item_name(item.item_no)));
+                    // Retail wording, observed on HorizonXI 2026-07-18: "You
+                    // take the <item> out of delivery slot <n>." — 1-based
+                    // slot (artifacts/retail/moghouse-menu-notes.md).
+                    out.notices.push(format!(
+                        "You take the {} out of delivery slot {}.",
+                        item_name(item.item_no),
+                        slot + 1,
+                    ));
                 }
                 self.set_slot(box_no, slot, None, &mut out);
                 out.settled = true;
@@ -436,7 +442,11 @@ mod tests {
         let out = s.on_result(&get);
         assert!(s.slots()[3].is_none(), "Get success empties the slot");
         assert!(out.settled);
-        assert!(out.notices.iter().any(|n| n.contains("You take")));
+        // Retail message shape: 1-based slot number.
+        assert!(out
+            .notices
+            .iter()
+            .any(|n| n.contains("You take") && n.ends_with("out of delivery slot 4.")));
     }
 
     /// Inventory-full Get (0xB9) keeps the slot and surfaces the retail error.

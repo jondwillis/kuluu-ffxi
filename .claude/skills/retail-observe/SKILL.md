@@ -116,6 +116,16 @@ Prefer `click-text` over raw `click` for anything you located by reading a
 screenshot; permission classifiers also accept it where a bare-coordinate
 click after an unseen screenshot gets denied.
 
+## Reading captures — the guest window drifts
+
+The FFXI window is a movable window INSIDE the guest desktop: its position in
+the capture changes between sessions (and when the user touches it). Don't
+reuse pixel-crop coordinates derived from an earlier capture — they go stale
+silently and you end up reading wallpaper. Either Read the full capture (large
+UI text is legible at full-image scale) or re-derive crop offsets from the
+current capture each time. In-game text that matters (help bar, target box,
+chat) is usually readable straight off the full screenshot.
+
 ## Driving the game
 
 - FFXI is keyboard-first; prefer keys over clicks (stable under resolution
@@ -137,6 +147,44 @@ click after an unseen screenshot gets denied.
   races with other apps. Experimental: confirm your Parallels build forwards
   guest input while unfocused.
 - Text (chat, launcher fields): `hxi.sh type "text"` — needs focus even under `--bg`.
+- **Slash commands don't land reliably**: pressing Enter opens the Commands
+  menu (or targets whatever's in front), NOT a chat input, and `type '/map'`
+  gets eaten by whichever menu is focused. Prefer keys + menus over chat
+  commands; if a menu opened unexpectedly, Esc repeatedly before continuing.
+- **Switching characters** needs no credentials while the launcher session
+  persists: Play HorizonXI → Enter (agreement) → Enter (Select Character) →
+  down×N — verify the char info panel (race/job/area) per press, the list
+  tooltips are unreadable — → Enter → Enter ("Log in with <name>?").
+- **City navigation by screenshot is slow and error-prone** (wall-hugging,
+  camera collisions). Before wandering: pull exact coords from LSB
+  (`vendor/server/sql/zonelines.sql`, npc_list) or the wiki, and if the user
+  is around, a 20-second walk from them beats 15 minutes of capture golf.
+
+## Delegating the drive loop (cheap models)
+
+A drive session is mostly long runs of cheap `hxi.sh` calls — capture, ocr,
+key, capture again — with little reasoning per step. Spawn a subagent with the
+Agent tool using `model: haiku` to run that loop instead of spending the
+orchestrating model's time and context on screenshot round-trips; keep the
+judgment work (what to observe, the retail-vs-remake comparison, the report)
+here.
+
+The driver's brief must be self-contained — it inherits none of your context:
+
+- exact commands, not intent: paste the `hxi.sh` invocations (including any
+  `HXI_OWNER_RE`/`HXI_GAME_RE` overrides) rather than describing them;
+- the goal phrased observably ("stop when `hxi.sh ocr` shows `Mog House`",
+  not "enter the Mog House"), plus the verify-between-keypress rule above —
+  a cheap model is *more* prone to blind-batching, so restate it explicitly;
+- save captures under `artifacts/retail/` and return the paths plus the OCR
+  lines that prove the goal state — never a bare "done";
+- hard stops: UAC dialogs and credential forms are human-only — on seeing
+  either, stop and report; likewise stop if two consecutive inputs change
+  nothing on screen (stalled pump or drifted menu — see the gotchas above).
+
+While a driver holds the VM window, don't run other focus-stealing automation
+from this session — you'd interleave into its keystrokes. Interpretation stays
+here: read the returned captures yourself before citing them for parity.
 
 ## Capturing evidence for parity work
 
