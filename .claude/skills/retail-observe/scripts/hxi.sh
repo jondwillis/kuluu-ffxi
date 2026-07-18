@@ -16,6 +16,10 @@
 #   hxi.sh type <text>             type a string (login fields, chat)
 #   hxi.sh [--bg] click <x> <y> [right|double]   click at WINDOW-RELATIVE POINTS
 #   hxi.sh [--bg] move <x> <y>     move mouse (hover) at window-relative points
+#   hxi.sh ocr                     capture + Vision OCR: TEXT<TAB>x<TAB>y (window points)
+#   hxi.sh [--bg] click-text <regex> [right|double]   OCR the window, click the
+#       matched text's center. Self-verifying: refuses outright if an elevation/
+#       consent dialog (UAC) is on screen — those clicks are human-only.
 #
 # --bg (or HXI_BG=1): deliver key/click/move to the VM process via
 #   CGEventPostToPid instead of the global focused tap — drives the guest
@@ -38,7 +42,7 @@ set -uo pipefail
 VM_NAME="${HXI_VM_NAME:-Windows 11}"
 # Coherence-mode windows are owned by the guest exe (e.g. horizon-loader.exe),
 # not prl_vm_app — [.]exe$ catches those.
-OWNER_RE="${HXI_OWNER_RE:-prl_vm_app|Parallels|[.]exe\$}"
+OWNER_RE="${HXI_OWNER_RE:-prl_vm_app|Parallels|[.]exe\$|^Windows 11\$}"
 GAME_RE="${HXI_GAME_RE:-FINAL FANTASY}"
 
 die() { printf 'hxi: %s\n' "$*" >&2; exit 1; }
@@ -64,12 +68,13 @@ post_prelude() {
 # CFArrayRef so deepUnwrap can convert it) --------------------------------
 windows_json() {
   osascript -l JavaScript -e '
+    function run(argv) {
     ObjC.import("CoreGraphics");
     ObjC.bindFunction("CFMakeCollectable", ["id", ["void *"]]);
     const opts = $.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements;
     const wins = ObjC.deepUnwrap($.CFMakeCollectable(
       $.CGWindowListCopyWindowInfo(opts, $.kCGNullWindowID))) || [];
-    const re = new RegExp('"'"$OWNER_RE"'"');   // shell splices OWNER_RE in *with* quotes
+    const re = new RegExp(argv[0]);   // argv, not shell splice: regex may contain spaces
     const out = wins
       .filter(w => re.test(w.kCGWindowOwnerName || "") && (w.kCGWindowLayer|0) === 0)
       .map(w => ({ id: w.kCGWindowNumber, name: w.kCGWindowName || "",
@@ -78,7 +83,8 @@ windows_json() {
                    w: w.kCGWindowBounds.Width, h: w.kCGWindowBounds.Height }))
       .filter(w => w.w > 200 && w.h > 200)    // skip toolbars/thumbnails
       .filter(w => !/Control Center/i.test(w.name));  // Parallels CC is not a VM
-    JSON.stringify(out);' 2>/dev/null
+    return JSON.stringify(out);
+    }' "$OWNER_RE" 2>/dev/null
 }
 
 # vm_window: prefer the game window itself (Coherence mode titles it after
@@ -93,8 +99,26 @@ vm_window() {
     (sort_by(-(.w * .h)) | first)'
 }
 
+# raise_window: pull the VM console onto the current Space via the Parallels
+# Window menu. Focus (and the Space) snaps back to the terminal the moment a
+# shell invocation ends, so callers must raise AND act in the same invocation —
+# need_window does this automatically.
+raise_window() {
+  osascript -e 'tell application "System Events" to tell process "Parallels Desktop"
+    set frontmost to true
+    click menu item "'"$VM_NAME"'" of menu "Window" of menu bar 1
+  end tell' >/dev/null 2>&1
+}
+
 need_window() {
-  WIN=$(vm_window) || die "no visible VM window (owner ~ /$OWNER_RE/). VM state:
+  WIN=$(vm_window) || {
+    raise_window
+    for _ in 1 2 3 4 5 6 7 8; do
+      sleep 1
+      WIN=$(vm_window) && break
+    done
+  }
+  [ -n "${WIN:-}" ] || die "no visible VM window (owner ~ /$OWNER_RE/), even after auto-raise. VM state:
 $(prlctl list "$VM_NAME" 2>&1)
 If running: the window is closed/minimized or on another Space — run \`hxi.sh show\`, or reopen it from Parallels Desktop (Window → $VM_NAME)."
   WID=$(jq -r .id   <<<"$WIN")
@@ -177,6 +201,7 @@ case "$cmd" in
     out=${1:-"artifacts/retail/$(date +%Y%m%d-%H%M%S).png"}
     need_window
     mkdir -p "$(dirname "$out")"
+    caffeinate -u -t 2   # wake the host display; asleep display => black/blank captures
     screencapture -x -o -l "$WID" "$out" || die "screencapture failed (Screen Recording permission?)"
     [ -s "$out" ] || die "empty capture — grant Screen Recording to this terminal"
     px=$(sips -g pixelWidth "$out" 2>/dev/null | awk '/pixelWidth/{print $2}')
@@ -188,6 +213,9 @@ case "$cmd" in
   key)
     name=${1:?usage: hxi.sh [--bg] key <name|code> [hold-seconds]}; dur=${2:-0.05}
     code=$(keycode "$name") || die "unknown key '$name' (use a macOS virtual keycode number)"
+    # focused-tap delivery: the VM must be frontmost, and focus snaps back to
+    # the terminal between invocations — re-raise before every press
+    [ -n "${BG:-}" ] || need_window
     osascript -l JavaScript -e "
       ObjC.import('CoreGraphics');
       $(post_prelude)
@@ -203,6 +231,30 @@ case "$cmd" in
     osascript -e 'on run argv
       tell application "System Events" to keystroke (item 1 of argv)
     end run' "$text" || die "keystroke failed (Accessibility permission?)"
+    ;;
+
+  ocr|click-text)
+    if [ "$cmd" = click-text ]; then
+      pat=${1:?usage: hxi.sh [--bg] click-text <regex> [right|double]}; kind=${2:-left}
+    fi
+    need_window
+    tmp=$(mktemp /tmp/hxi-ocr-XXXXXX).png
+    caffeinate -u -t 2
+    screencapture -x -o -l "$WID" "$tmp" || die "screencapture failed (Screen Recording permission?)"
+    px=$(sips -g pixelWidth "$tmp" 2>/dev/null | awk '/pixelWidth/{print $2}')
+    scale=$(awk -v p="${px:-0}" -v w="$WW" 'BEGIN{ if (w>0) printf "%.4f", p/w; else print 0 }')
+    ocr=$(swift "$(cd "$(dirname "$0")" && pwd)/hxi-ocr.swift" "$tmp") || die "Vision OCR failed"
+    ocr=$(awk -F'\t' -v s="$scale" 's>0 {printf "%s\t%d\t%d\n", $1, $2/s, $3/s}' <<<"$ocr")
+    if [ "$cmd" = ocr ]; then rm -f "$tmp"; printf '%s\n' "$ocr"; exit 0; fi
+    # Elevation/consent dialogs are human-only: never click through them.
+    if grep -qiE 'User Account Control|make changes to your device|Verified publisher' <<<"$ocr"; then
+      die "refusing click-text: an elevation/consent (UAC) dialog is on screen — that consent is human-only (capture kept: $tmp)"
+    fi
+    hit=$(grep -iE "$pat" <<<"$ocr" | head -1) || { die "no OCR text matching /$pat/ (capture kept: $tmp; run \`hxi.sh ocr\` to see what's on screen)"; }
+    rm -f "$tmp"
+    tx=$(cut -f2 <<<"$hit"); ty=$(cut -f3 <<<"$hit")
+    printf 'click-text: "%s" at %s,%s (window points)\n' "$(cut -f1 <<<"$hit")" "$tx" "$ty"
+    exec "$0" ${BG:+--bg} click "$tx" "$ty" "$kind"
     ;;
 
   click|move)

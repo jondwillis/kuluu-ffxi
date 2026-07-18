@@ -26,11 +26,26 @@ command table.
 
 ```
 1. hxi.sh status          → VM running? window visible?
-2. hxi.sh show            → focus + raise the VM window (input lands only when focused)
-3. hxi.sh capture         → artifacts/retail/<timestamp>.png (window-cropped)
-4. hxi.sh key/type/click  → drive the game
-5. capture again          → before/after pairs are the useful evidence
+2. hxi.sh capture         → artifacts/retail/<timestamp>.png (window-cropped)
+3. hxi.sh key/type/click  → drive the game (each auto-raises the window first)
+4. capture again          → before/after pairs are the useful evidence
 ```
+
+**The human/agent split (durable policy):** the human does the two security
+gates — clicking **Yes on UAC** and entering **account credentials** — and the
+agent does everything else: window wrangling, launcher click, lobby/character
+select, in-game navigation, menu driving, capture, and the code work. In
+practice the launcher session persists (`Autologin activated!` in the xiloader
+console), so a running session usually needs **no credential entry at all**:
+`hxi.sh click-text 'Play HorizonXI'` → lobby → `Select Character` → Enter ×2
+(select + "Log in with <name>?" confirm) lands in-game.
+
+**Focus/Space snaps back the moment each shell invocation ends** — the VM
+window lives on its own Space, and macOS returns to the terminal's Space
+between `hxi.sh` calls. `need_window` (used by capture/click/ocr/key) now
+auto-raises via the Parallels **Window → <VM name>** menu and polls up to 8s,
+so every subcommand is self-contained; never assume the window stays visible
+across separate invocations.
 
 - VM not running: `prlctl start "Windows 11"`, then wait for the launcher.
   Getting from Windows desktop → in-game goes through HorizonXI-Launcher, then
@@ -91,12 +106,30 @@ prints the exact scale factor; divide pixel coordinates you measured in a
 screenshot by it before clicking. Re-run `hxi.sh window` after any window
 move/resize — coordinates don't survive it.
 
+## OCR-verified clicking (`ocr` / `click-text`)
+
+`hxi.sh ocr` captures + Vision-OCRs the window, printing `TEXT<TAB>x<TAB>y` in
+window points. `hxi.sh click-text '<regex>'` clicks the matched text's center —
+self-verifying (no blind coordinates), and it **refuses outright if an
+elevation/consent (UAC) dialog is on screen** — that consent is human-only.
+Prefer `click-text` over raw `click` for anything you located by reading a
+screenshot; permission classifiers also accept it where a bare-coordinate
+click after an unseen screenshot gets denied.
+
 ## Driving the game
 
 - FFXI is keyboard-first; prefer keys over clicks (stable under resolution
   changes): arrows/tab for menus, `enter` confirm, `esc` cancel, `wasd`
   movement, `-`/numpad for camera. `hxi.sh key w 2.0` holds W for 2s —
   that's how you walk.
+- **Verify state between menu keypresses; never blind-batch.** In-game menus
+  drop inputs and close unexpectedly; a queued `down/enter` sequence drifts and
+  ends up interacting with the wrong entry. After each press, confirm via the
+  top help bar (`hxi.sh ocr`, or crop `-c 70 1500 --cropOffset 450 1360` at 2×
+  on a 1728pt window) — it shows `<Title> | <help>` for the highlighted item.
+- **Tab-target check:** the Tab cycle inside a Mog House includes the exit
+  Door ("Back to Town") — pressing Enter on it zones you out. Confirm the
+  target bar reads the NPC you want (e.g. `Moogle`) before Enter.
 - Focus is global by default: keys/clicks go to whatever window is frontmost,
   so `show` first and don't interleave with other host automation. To drive
   WITHOUT stealing focus, prefix input with `--bg` (`hxi.sh --bg key down`) —
@@ -121,11 +154,15 @@ move/resize — coordinates don't survive it.
 | Symptom | Cause → fix |
 |---|---|
 | `no visible VM window` | VM headless/minimized/other Space → `hxi.sh show`, else reopen in Parallels Desktop |
-| Black or empty capture | Terminal lacks **Screen Recording** permission (System Settings → Privacy & Security) |
+| Black or empty capture | Terminal lacks **Screen Recording** permission (System Settings → Privacy & Security); or the host display is asleep — hxi.sh now runs `caffeinate -u -t 2` before each capture, and for long sessions keep `caffeinate -d -u` running |
+| `no visible VM window` in Coherence | Coherence windows are owned by the VM name (e.g. `Windows 11`), not `prl_vm_app`/`.exe` — owner regex now includes `^Windows 11$`; override via `HXI_OWNER_RE` if the VM is renamed |
+| Session vanished between runs | Windows Update auto-restarted the VM (watch for "We've got an update for you" — dismiss with **Another time**); relaunch launcher + login afterwards |
 | Keys/clicks silently ignored | Terminal lacks **Accessibility** permission; or VM window not frontmost (`show`) |
 | Clicks land off-target | Pixel coords used as points — divide by the scale factor from `capture` |
 | Game ignores held keys | Hold too short for a frame poll — use durations ≥0.1s (`hxi.sh key w 0.3`) |
 | `prlctl exec/capture` errors | Parallels Standard — those are Pro-only; stay with hxi.sh |
+| `no visible VM window` but the window IS on screen | windows_json JXA silently erroring — run its osascript without `2>/dev/null`. Historic cause: OWNER_RE spliced into the JXA unquoted, so a regex containing a space (`^Windows 11$`) word-split the program into two osascript args; fixed by passing OWNER_RE as argv. Symptom of any such bug: EVERY window query fails, which reads as "wrong Space" |
+| Window on another Space right after you raised it | Focus/Space snapped back when the previous shell invocation ended — do raise+act in ONE hxi.sh call (automatic via need_window auto-raise) |
 | Frontmost reads as `WinAppHelper`/`prl_vm_app` after `show` | Expected in Coherence — that shim holds focus for the guest; input still lands |
 | `window` finds an `.exe`-owned window, not `prl_vm_app` | Expected in Coherence — the game window is guest-exe-owned; `hxi.sh` targets it on purpose |
 
