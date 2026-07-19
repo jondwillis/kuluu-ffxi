@@ -1022,7 +1022,9 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::MESSAGE => {
-            if let Ok(text) = std::str::from_utf8(sub.data) {
+            if let Some(line) = decode_std_message_examine(sub.data, name_cache) {
+                let _ = event_tx.send(AgentEvent::ChatLine { line });
+            } else if let Ok(text) = std::str::from_utf8(sub.data) {
                 let line = ChatLine {
                     channel: ChatChannel::System,
                     sender: "<server>".into(),
@@ -1032,6 +1034,29 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
         }
+        op if op == s2c::EQUIP_INSPECT => match decode::EquipInspect::decode(sub.data) {
+            Ok(decode::EquipInspect::Equipment(eq)) => {
+                let _ = event_tx.send(AgentEvent::CheckEquipReceived {
+                    target_id: eq.unique_no,
+                    act_index: eq.act_index,
+                    items: eq.items.iter().map(|i| (i.equip_kind, i.item_no)).collect(),
+                });
+            }
+            Ok(decode::EquipInspect::General(g)) => {
+                let _ = event_tx.send(AgentEvent::CheckGeneralReceived {
+                    target_id: g.unique_no,
+                    act_index: g.act_index,
+                    main_job: g.main_job,
+                    sub_job: g.sub_job,
+                    main_job_lv: g.main_job_lv,
+                    sub_job_lv: g.sub_job_lv,
+                    master_lv: g.master_lv,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, body_len = sub.data.len(), "0x0C9 EQUIP_INSPECT decode failed");
+            }
+        },
         op if op == s2c::CHAT => {
             if let Some(line) = decode_chat_std(sub.data) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
@@ -1862,6 +1887,9 @@ async fn keepalive_loop(
                         target_index,
                         kind,
                     }) => {
+                        if kind == crate::state::CheckKind::Check {
+                            let _ = event_tx.send(AgentEvent::CheckCleared);
+                        }
                         self_face_target = face_target_for(target_index, self_act_index);
                         let payload = build_subpacket_equip_inspect(
                             sub_seq,
@@ -2954,6 +2982,40 @@ fn template_for_id(message_num: u16) -> Option<&'static str> {
         }
     }
     ffxi_proto::msg_basic::lookup(message_num)
+}
+
+// vendor/server/src/map/enums/msg_std.h:48 — "<name> examines you.", sent to
+// the checked PC via 0x009 (vendor/server/src/map/packets/c2s/0x0dd_equip_inspect.cpp:131).
+const MSG_STD_EXAMINE: u16 = 89;
+
+// s2c 0x009 GP_SERV_COMMAND_MESSAGE body: UniqueNo u32 @0, ActIndex u16 @4,
+// MesNo u16 @6, Attr u8 @8 (vendor/server/src/map/packets/s2c/0x009_message.h:37-41).
+fn decode_std_message_examine(
+    data: &[u8],
+    name_cache: &std::collections::HashMap<u32, String>,
+) -> Option<ChatLine> {
+    const UNIQUE_NO_OFFSET: usize = 0;
+    const MES_NO_OFFSET: usize = 6;
+    let unique_no = u32::from_le_bytes(
+        data.get(UNIQUE_NO_OFFSET..UNIQUE_NO_OFFSET + 4)?
+            .try_into()
+            .ok()?,
+    );
+    let mes_no = u16::from_le_bytes(
+        data.get(MES_NO_OFFSET..MES_NO_OFFSET + 2)?
+            .try_into()
+            .ok()?,
+    );
+    if mes_no != MSG_STD_EXAMINE {
+        return None;
+    }
+    let name = name_for_id(unique_no, name_cache);
+    Some(ChatLine {
+        channel: ChatChannel::System,
+        sender: name.clone(),
+        text: format!("{name} examines you."),
+        server_ts: 0,
+    })
 }
 
 fn synth_check_line(
@@ -5447,6 +5509,33 @@ mod tests {
             "{}",
             line.text
         );
+    }
+
+    // 0x009 body: UniqueNo u32 @0, ActIndex u16 @4, MesNo u16 @6, Attr u8 @8
+    // (vendor/server/src/map/packets/s2c/0x009_message.h:37-41).
+    fn std_message_body(unique_no: u32, mes_no: u16) -> Vec<u8> {
+        let mut data = vec![0u8; 12];
+        data[0..4].copy_from_slice(&unique_no.to_le_bytes());
+        data[6..8].copy_from_slice(&mes_no.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn examine_message_renders_checker_name() {
+        use std::collections::HashMap;
+        let mut cache = HashMap::new();
+        cache.insert(0xCAFEu32, "Daisy".to_string());
+        let line = decode_std_message_examine(&std_message_body(0xCAFE, MSG_STD_EXAMINE), &cache)
+            .expect("Examine decodes");
+        assert_eq!(line.text, "Daisy examines you.");
+        assert_eq!(line.sender, "Daisy");
+    }
+
+    #[test]
+    fn non_examine_std_message_is_not_synthesized() {
+        let cache = std::collections::HashMap::new();
+        assert!(decode_std_message_examine(&std_message_body(1, 88), &cache).is_none());
+        assert!(decode_std_message_examine(&[0u8; 4], &cache).is_none());
     }
 
     #[test]

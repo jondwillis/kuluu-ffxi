@@ -73,6 +73,20 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         }),
 
         mh_2f_unlocked: s.mh_2f_unlocked,
+
+        check: s.check_result.as_ref().map(check_to_wire),
+    }
+}
+
+fn check_to_wire(c: &crate::state::CheckResult) -> wire::CheckResult {
+    wire::CheckResult {
+        target_id: c.target_id,
+        equipped: c.equipped,
+        main_job: c.main_job,
+        sub_job: c.sub_job,
+        main_job_lv: c.main_job_lv,
+        sub_job_lv: c.sub_job_lv,
+        master_lv: c.master_lv,
     }
 }
 
@@ -633,6 +647,35 @@ mod tests {
             snap.producer_monotonic_ms,
             snap2.producer_monotonic_ms,
         );
+    }
+
+    #[test]
+    fn check_result_crosses_the_wire_boundary() {
+        let mut s = SessionState::default();
+        assert!(state_to_snapshot(&s).check.is_none());
+
+        s.apply_event(&AgentEvent::CheckEquipReceived {
+            target_id: 0xCAFE,
+            act_index: 0x123,
+            items: vec![(0, 17440), (15, 13465)],
+        });
+        s.apply_event(&AgentEvent::CheckGeneralReceived {
+            target_id: 0xCAFE,
+            act_index: 0x123,
+            main_job: 1,
+            sub_job: 13,
+            main_job_lv: 75,
+            sub_job_lv: 37,
+            master_lv: 0,
+        });
+        let snap = state_to_snapshot(&s);
+        let c = snap.check.expect("check result on the wire");
+        assert_eq!(c.target_id, 0xCAFE);
+        assert_eq!(c.equipped[0], Some(17440));
+        assert_eq!(c.equipped[15], Some(13465));
+        assert_eq!(c.equipped[1], None);
+        assert_eq!((c.main_job, c.main_job_lv), (1, 75));
+        assert_eq!((c.sub_job, c.sub_job_lv), (13, 37));
     }
 
     #[test]

@@ -160,6 +160,10 @@ pub fn update_check_view(
     }
 
     let snap = &state.snapshot;
+    let check = snap
+        .check
+        .as_ref()
+        .filter(|c| target.target_id == Some(c.target_id));
 
     let bazaar = &snap.bazaar;
     if let Ok(mut wares_node) = wares_section_q.single_mut() {
@@ -195,7 +199,7 @@ pub fn update_check_view(
         let Some(&(slot_id, slot_label)) = CHECK_GRID_SLOTS.get(cell.grid_index) else {
             continue;
         };
-        let item_no = snap.equipped.get(slot_id as usize).copied().flatten();
+        let item_no = check.and_then(|c| c.equipped.get(slot_id as usize).copied().flatten());
         let (body, filled) = match item_no {
             Some(no) => {
                 let detail: ItemDetail = compose_item_detail(no, snap, None);
@@ -214,7 +218,7 @@ pub fn update_check_view(
     }
 
     if let Ok(mut text) = ribbon_q.single_mut() {
-        let want = job_ribbon(snap);
+        let want = job_ribbon(check);
         if **text != want {
             **text = want;
         }
@@ -232,14 +236,19 @@ fn item_label(item_no: u16, detail: &ItemDetail) -> String {
         .unwrap_or_else(|| format!("item #{item_no}"))
 }
 
-fn job_ribbon(snap: &ffxi_viewer_wire::SceneSnapshot) -> String {
-    let me = crate::hud::self_hud::resolve_self(&snap.party, snap.self_char_id);
-    match me {
-        Some(m) => {
-            let job = ffxi_proto::job_names::lookup(m.main_job as u16).unwrap_or("Adventurer");
-            format!("Lv.{} {job}", m.main_job_lv)
+fn job_ribbon(check: Option<&ffxi_viewer_wire::CheckResult>) -> String {
+    match check {
+        Some(c) if c.main_job != 0 => {
+            let job = ffxi_proto::job_names::lookup(c.main_job as u16).unwrap_or("Adventurer");
+            match c.sub_job {
+                0 => format!("Lv.{} {job}", c.main_job_lv),
+                sub => {
+                    let sub_job = ffxi_proto::job_names::lookup(sub as u16).unwrap_or("Adventurer");
+                    format!("Lv.{} {job}/{sub_job}", c.main_job_lv)
+                }
+            }
         }
-        None => "Lv.? —".to_string(),
+        _ => "Lv.? —".to_string(),
     }
 }
 

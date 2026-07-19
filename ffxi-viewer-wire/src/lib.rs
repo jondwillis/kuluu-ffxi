@@ -419,6 +419,24 @@ pub struct SceneSnapshot {
     /// bit 0x20 (0x029_item_move.cpp validContainers). `None` = not yet known.
     #[serde(default)]
     pub mh_2f_unlocked: Option<bool>,
+
+    /// Accumulated /check answer (s2c 0x0C9 EQUIP_INSPECT) for the last checked
+    /// PC; drives the Check panel grid and job ribbon.
+    #[serde(default)]
+    pub check: Option<CheckResult>,
+}
+
+/// `equipped` is indexed by SAVE_EQUIP_KIND slot id (0 = Main .. 15 = Back);
+/// jobs are zero while the target is /anon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckResult {
+    pub target_id: u32,
+    pub equipped: [Option<u16>; 16],
+    pub main_job: u8,
+    pub sub_job: u8,
+    pub main_job_lv: u8,
+    pub sub_job_lv: u8,
+    pub master_lv: u8,
 }
 
 impl SceneSnapshot {

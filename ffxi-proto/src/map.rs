@@ -262,4 +262,9 @@ pub mod s2c {
     pub const GROUP_LIST: u16 = 0x0DD;
 
     pub const GROUP_ATTR: u16 = 0x0DF;
+
+    // GP_SERV_COMMAND_EQUIP_INSPECT, vendor/server/src/map/enums/packet_s2c.h:143.
+    // /check answer for a PC target: EQUIPMENT batches then one GENERAL packet
+    // (vendor/server/src/map/packets/c2s/0x0dd_equip_inspect.cpp:135-136).
+    pub const EQUIP_INSPECT: u16 = 0x0C9;
 }

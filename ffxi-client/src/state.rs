@@ -393,6 +393,44 @@ pub struct SessionState {
     /// (vendor/server/src/map/packets/char_sync.cpp:61); `None` until one lands.
     #[serde(default)]
     pub mh_2f_unlocked: Option<bool>,
+
+    #[serde(default)]
+    pub check_result: Option<CheckResult>,
+}
+
+/// Accumulated s2c 0x0C9 EQUIP_INSPECT answer for the latest /check on a PC:
+/// EQUIPMENT batches and the GENERAL packet merge here keyed on `target_id`
+/// (vendor/server/src/map/packets/c2s/0x0dd_equip_inspect.cpp:135-136).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckResult {
+    pub target_id: u32,
+    pub act_index: u16,
+    #[serde(default = "default_check_equipped")]
+    pub equipped: [Option<u16>; EQUIPMENT_SLOTS],
+    pub main_job: u8,
+    pub sub_job: u8,
+    pub main_job_lv: u8,
+    pub sub_job_lv: u8,
+    pub master_lv: u8,
+}
+
+impl CheckResult {
+    fn new(target_id: u32, act_index: u16) -> Self {
+        Self {
+            target_id,
+            act_index,
+            equipped: default_check_equipped(),
+            main_job: 0,
+            sub_job: 0,
+            main_job_lv: 0,
+            sub_job_lv: 0,
+            master_lv: 0,
+        }
+    }
+}
+
+fn default_check_equipped() -> [Option<u16>; EQUIPMENT_SLOTS] {
+    [None; EQUIPMENT_SLOTS]
 }
 
 pub const EQUIPMENT_SLOTS: usize = 16;
@@ -612,6 +650,13 @@ impl SessionState {
             })
     }
 
+    fn check_result_mut(&mut self, target_id: u32, act_index: u16) -> &mut CheckResult {
+        if self.check_result.as_ref().map(|c| c.target_id) != Some(target_id) {
+            self.check_result = Some(CheckResult::new(target_id, act_index));
+        }
+        self.check_result.as_mut().expect("just ensured Some")
+    }
+
     pub fn apply_event(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::Connected {
@@ -647,6 +692,8 @@ impl SessionState {
                 self.party.clear();
 
                 self.current_weather = None;
+
+                self.check_result = None;
             }
             AgentEvent::PositionChanged { pos } => {
                 if let Some(char_id) = self.char_id {
@@ -940,6 +987,37 @@ impl SessionState {
                 self.key_items.dedup();
             }
 
+            AgentEvent::CheckEquipReceived {
+                target_id,
+                act_index,
+                items,
+            } => {
+                let r = self.check_result_mut(*target_id, *act_index);
+                for &(slot, item_no) in items {
+                    if let Some(cell) = r.equipped.get_mut(slot as usize) {
+                        *cell = Some(item_no);
+                    }
+                }
+            }
+            AgentEvent::CheckGeneralReceived {
+                target_id,
+                act_index,
+                main_job,
+                sub_job,
+                main_job_lv,
+                sub_job_lv,
+                master_lv,
+            } => {
+                let r = self.check_result_mut(*target_id, *act_index);
+                r.main_job = *main_job;
+                r.sub_job = *sub_job;
+                r.main_job_lv = *main_job_lv;
+                r.sub_job_lv = *sub_job_lv;
+                r.master_lv = *master_lv;
+            }
+            AgentEvent::CheckCleared => {
+                self.check_result = None;
+            }
             AgentEvent::EventStart { .. } | AgentEvent::KeyRotated { .. } => {}
             AgentEvent::EventDialog { dialog } => {
                 self.dialog = Some(dialog.clone());
@@ -1297,6 +1375,30 @@ pub enum AgentEvent {
     /// The server released the fishing lock (0x052 EVENTUCOFF mode Fishing): a rejected
     /// cast (no rod/bait/spot) or the end of fishing. Machine input that aborts to idle.
     FishingEnded,
+
+    /// One s2c 0x0C9 EQUIP_INSPECT EQUIPMENT batch (OptionFlag 0x03): up to 8
+    /// `(slot, item_no)` pairs of the checked PC's gear; slot ids follow
+    /// SAVE_EQUIP_KIND (0 = Main .. 15 = Back).
+    CheckEquipReceived {
+        target_id: u32,
+        act_index: u16,
+        items: Vec<(u8, u16)>,
+    },
+
+    /// s2c 0x0C9 EQUIP_INSPECT GENERAL (OptionFlag 0x01): the checked PC's jobs
+    /// and levels (zeroed while the target is /anon).
+    CheckGeneralReceived {
+        target_id: u32,
+        act_index: u16,
+        main_job: u8,
+        sub_job: u8,
+        main_job_lv: u8,
+        sub_job_lv: u8,
+        master_lv: u8,
+    },
+
+    /// Outbound /check dispatched: drop the previous target's accumulated result.
+    CheckCleared,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2861,6 +2963,88 @@ mod tests {
         assert_eq!(slot.quantity, 25);
         assert!(slot.locked, "lock flag updated");
         assert_eq!(slot.item_no, 4112, "item_no preserved (qty-only update)");
+    }
+
+    #[test]
+    fn check_result_accumulates_equipment_batches_and_general() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::CheckEquipReceived {
+            target_id: 0xCAFE,
+            act_index: 0x123,
+            items: vec![(0, 17440), (4, 12511)],
+        });
+        s.apply_event(&AgentEvent::CheckEquipReceived {
+            target_id: 0xCAFE,
+            act_index: 0x123,
+            items: vec![(15, 13465)],
+        });
+        s.apply_event(&AgentEvent::CheckGeneralReceived {
+            target_id: 0xCAFE,
+            act_index: 0x123,
+            main_job: 1,
+            sub_job: 13,
+            main_job_lv: 75,
+            sub_job_lv: 37,
+            master_lv: 0,
+        });
+        let r = s.check_result.as_ref().expect("accumulated");
+        assert_eq!(r.target_id, 0xCAFE);
+        assert_eq!(r.equipped[0], Some(17440), "batch 1 Main");
+        assert_eq!(r.equipped[4], Some(12511), "batch 1 Head");
+        assert_eq!(r.equipped[15], Some(13465), "batch 2 Back");
+        assert_eq!(r.equipped[1], None, "unsent slot stays empty");
+        assert_eq!((r.main_job, r.main_job_lv), (1, 75));
+        assert_eq!((r.sub_job, r.sub_job_lv), (13, 37));
+    }
+
+    #[test]
+    fn check_result_resets_on_new_target_and_clears() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::CheckEquipReceived {
+            target_id: 0xCAFE,
+            act_index: 0x123,
+            items: vec![(0, 17440)],
+        });
+        s.apply_event(&AgentEvent::CheckEquipReceived {
+            target_id: 0xBEEF,
+            act_index: 0x456,
+            items: vec![(4, 12511)],
+        });
+        let r = s.check_result.as_ref().expect("new target");
+        assert_eq!(r.target_id, 0xBEEF);
+        assert_eq!(r.equipped[0], None, "old target's gear dropped");
+        assert_eq!(r.equipped[4], Some(12511));
+
+        s.apply_event(&AgentEvent::CheckCleared);
+        assert!(
+            s.check_result.is_none(),
+            "outbound /check drops stale result"
+        );
+
+        s.apply_event(&AgentEvent::CheckEquipReceived {
+            target_id: 0xBEEF,
+            act_index: 0x456,
+            items: vec![(4, 12511)],
+        });
+        s.apply_event(&AgentEvent::ZoneChanged {
+            from: None,
+            to: 230,
+            myroom: None,
+            mog_zone_flag: false,
+        });
+        assert!(s.check_result.is_none(), "zone change drops stale result");
+    }
+
+    #[test]
+    fn check_equip_out_of_range_slot_is_ignored() {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::CheckEquipReceived {
+            target_id: 0xCAFE,
+            act_index: 0x123,
+            items: vec![(16, 17440), (0xFF, 1)],
+        });
+        let r = s.check_result.as_ref().expect("result created");
+        assert!(r.equipped.iter().all(|c| c.is_none()));
     }
 
     #[test]
