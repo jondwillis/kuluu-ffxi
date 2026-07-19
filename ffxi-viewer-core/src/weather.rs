@@ -185,9 +185,6 @@ pub fn load_zone_weather(
     zone_weather.records.clear();
     zone_weather.selected = None;
 
-    if scene_state.snapshot.myroom.is_some() {
-        return;
-    }
     let Some(file_id) = current else { return };
 
     let Ok(root) = DatRoot::from_env_or_default() else {
@@ -467,6 +464,7 @@ mod tests {
             indoors: false,
             sunlight_diffuse_entity: [0.0; 4],
             moonlight_diffuse_entity: [0.0; 4],
+            indoor_light_dir_entity: [0.0; 3],
             ambient_entity: [0.0; 4],
             fog_entity: [0.0; 4],
             max_fog_dist_entity: 0.0,
@@ -474,6 +472,7 @@ mod tests {
             diffuse_mul_entity: 0.0,
             sunlight_diffuse_landscape: [0.0; 4],
             moonlight_diffuse_landscape: [0.0; 4],
+            indoor_light_dir_landscape: [0.0; 3],
             ambient_landscape: [0.0; 4],
             fog_landscape,
             max_fog_dist_landscape: 0.0,

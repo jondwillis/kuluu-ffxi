@@ -141,7 +141,7 @@ pub struct MoonTransitionState {
     // shadow cascade view) each frame. Celestial motion is slow, so skip the
     // writes until the target moves beyond a small epsilon. Asset ids are
     // cached so a zone-reload material swap invalidates the cache.
-    pub sun_light_written: Option<(Vec3, f32, Vec3)>,
+    pub sun_light_written: Option<(Vec3, f32, Vec3, bool)>,
     pub moon_light_written: Option<(Vec3, f32, Vec3)>,
     pub moon_sphere_written: Option<(AssetId<StandardMaterial>, Vec3)>,
     pub sun_disc_written: Option<(
@@ -291,6 +291,12 @@ pub fn sun_color_for_hour(hour: f32, sun_altitude: f32) -> (Color, f32) {
 
     let lux = 1500.0 + 8500.0 * elev;
     (Color::srgb(r, g, b), lux)
+}
+
+// DAT-space (FFXI, Y-down/Z-flipped) direction -> Bevy, same axis mapping as
+// scene::mzb_to_bevy but for a direction (no translation).
+fn ffxi_dir_to_bevy(d: [f32; 3]) -> Vec3 {
+    Vec3::new(d[0], -d[1], -d[2])
 }
 
 // Split an F1 diffuse color [r,g,b,a] (already mul/bias-applied in ffxi-dat) into
@@ -545,7 +551,6 @@ pub fn sun_moon_system(
     *prev_phase_bucket = Some(phase_bucket);
 
     let sun_dir = sun_direction(sky.hour);
-    let sun_pos = sun_dir * LIGHT_DISTANCE;
 
     // research/xim EnvironmentSection.kt:151-159: the 0x2F terrain block's sun/moon
     // diffuse colors are authoritative when the zone ships records; the synthetic
@@ -553,14 +558,41 @@ pub fn sun_moon_system(
     let dat = render_cfg.zone_weather.current;
     let time_minutes = (sky.hour * 60.0).rem_euclid(1440.0) as u32;
 
-    let (sun_color, sun_lux) = match dat {
+    let indoors = dat.is_some_and(|rec| rec.indoors);
+
+    // research/xim EnvironmentSection.kt:139-149: indoors, the sun/moon arc is
+    // replaced by ONE static diffuse light (direction from the moon-color bytes,
+    // color from the sun diffuse) and cascade shadow-mapping has no retail
+    // equivalent inside — the sun must not reach through walls.
+    let (sun_color, sun_lux, sun_to_dir) = match dat {
+        Some(rec) if rec.indoors => {
+            let d = rec.sunlight_diffuse_entity;
+            let (hue, k) = diffuse_to_light([d[0], d[1], d[2]]);
+            let dir = ffxi_dir_to_bevy(rec.indoor_light_dir_entity);
+            if dir == Vec3::ZERO || k <= 0.0 {
+                (Color::BLACK, 0.0, sun_dir)
+            } else {
+                (
+                    Color::linear_rgb(hue.x, hue.y, hue.z),
+                    k * DAT_DIR_REF_LUX,
+                    dir,
+                )
+            }
+        }
         Some(rec) if sky.sun_altitude > 0.0 => {
             let d = rec.sunlight_diffuse_landscape;
             let (hue, k) = diffuse_to_light([d[0], d[1], d[2]]);
-            (Color::linear_rgb(hue.x, hue.y, hue.z), k * DAT_DIR_REF_LUX)
+            (
+                Color::linear_rgb(hue.x, hue.y, hue.z),
+                k * DAT_DIR_REF_LUX,
+                sun_dir,
+            )
         }
-        Some(_) => (Color::BLACK, 0.0),
-        None => sun_color_for_hour(sky.hour, sky.sun_altitude),
+        Some(_) => (Color::BLACK, 0.0, sun_dir),
+        None => {
+            let (c, lux) = sun_color_for_hour(sky.hour, sky.sun_altitude);
+            (c, lux, sun_dir)
+        }
     };
 
     // iter_mut over single_mut throughout: the InGame OnExit bulk-despawn can race
@@ -570,17 +602,20 @@ pub fn sun_moon_system(
         let c = sun_color.to_linear();
         Vec3::new(c.red, c.green, c.blue)
     };
-    if sun_light_written.is_none_or(|(rgb, lux, dir)| {
+    if sun_light_written.is_none_or(|(rgb, lux, dir, prev_indoors)| {
         rgb.distance(sun_rgb_lin) > CELESTIAL_COLOR_EPS
             || celestial_scalar_changed(lux, sun_lux)
-            || dir.distance(sun_dir) > CELESTIAL_DIR_EPS
+            || dir.distance(sun_to_dir) > CELESTIAL_DIR_EPS
+            || prev_indoors != indoors
     }) {
         for (mut light, mut xf) in q_sun.iter_mut() {
             light.color = sun_color;
             light.illuminance = sun_lux;
-            *xf = Transform::from_translation(sun_pos).looking_at(Vec3::ZERO, Vec3::Y);
+            light.shadow_maps_enabled = !indoors;
+            *xf = Transform::from_translation(sun_to_dir * LIGHT_DISTANCE)
+                .looking_at(Vec3::ZERO, Vec3::Y);
         }
-        *sun_light_written = Some((sun_rgb_lin, sun_lux, sun_dir));
+        *sun_light_written = Some((sun_rgb_lin, sun_lux, sun_to_dir, indoors));
     }
 
     let moon_dir = if sky_realism.physical_moon_orbit {
@@ -597,6 +632,7 @@ pub fn sun_moon_system(
     sky.moon_altitude = moon_altitude;
     let moon_pos = moon_dir * LIGHT_DISTANCE;
     let (moon_color, moon_lux) = match dat {
+        Some(_) if indoors => (Color::BLACK, 0.0),
         Some(rec) if sky.moon_altitude > 0.0 => {
             let d = rec.moonlight_diffuse_landscape;
             let (hue, k) = diffuse_to_light([d[0], d[1], d[2]]);
@@ -626,7 +662,59 @@ pub fn sun_moon_system(
     // zone-material lighting consumers. The model light is a single moon<->sun
     // blend (research/xim EnvironmentSection.kt:206-225); landscape feeds both
     // sun(dir0) and moon(dir1) slots from the terrain block.
-    if let Some(rec) = dat {
+    if let Some(rec) = dat.filter(|r| r.indoors) {
+        // research/xim EnvironmentSection.kt:139-149: both the model and terrain
+        // blocks collapse to one static indoor diffuse each — direction from the
+        // block's moon-color bytes, color from its sun diffuse, no time gating.
+        let model_dir = ffxi_dir_to_bevy(rec.indoor_light_dir_entity);
+        let model_rgb = Vec3::new(
+            rec.sunlight_diffuse_entity[0],
+            rec.sunlight_diffuse_entity[1],
+            rec.sunlight_diffuse_entity[2],
+        )
+        .max(Vec3::ZERO);
+        let model_k = model_rgb.x.max(model_rgb.y).max(model_rgb.z).max(0.0);
+        let model_color = if model_k > 1e-4 {
+            model_rgb / model_k
+        } else {
+            Vec3::ZERO
+        };
+
+        let (s_hue, s_k) = diffuse_to_light([
+            rec.sunlight_diffuse_landscape[0],
+            rec.sunlight_diffuse_landscape[1],
+            rec.sunlight_diffuse_landscape[2],
+        ]);
+        let land_dir = ffxi_dir_to_bevy(rec.indoor_light_dir_landscape);
+
+        *render_cfg.zone_lighting = crate::weather::ZoneDirectionalLighting {
+            valid: true,
+            indoors: true,
+            model_dir,
+            model_color,
+            model_k: if model_dir == Vec3::ZERO {
+                0.0
+            } else {
+                model_k
+            },
+            ambient_entity: Vec3::new(
+                rec.ambient_entity[0],
+                rec.ambient_entity[1],
+                rec.ambient_entity[2],
+            ),
+            sun_dir: land_dir,
+            sun_color: s_hue,
+            sun_k: if land_dir == Vec3::ZERO { 0.0 } else { s_k },
+            moon_dir,
+            moon_color: Vec3::ZERO,
+            moon_k: 0.0,
+            ambient_landscape: Vec3::new(
+                rec.ambient_landscape[0],
+                rec.ambient_landscape[1],
+                rec.ambient_landscape[2],
+            ),
+        };
+    } else if let Some(rec) = dat {
         let sun_up = sky.sun_altitude > 0.0;
         let moon_up = sky.moon_altitude > 0.0;
 

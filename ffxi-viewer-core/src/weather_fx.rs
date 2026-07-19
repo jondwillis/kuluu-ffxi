@@ -412,6 +412,12 @@ pub fn apply_weather_to_sun_system(
     lightning: Res<LightningState>,
     mut ambient: ResMut<GlobalAmbientLight>,
     mut q_sun: Query<&mut DirectionalLight, With<IsSun>>,
+    // (base, last written): sun_moon_system caches its writes, so an in-place
+    // `*=` here would compound every frame the sun target is unchanged and decay
+    // the sun to black under any weather with mul != 1. Track the pre-multiplied
+    // base instead: an illuminance that differs from our last write means
+    // sun_moon_system re-authored it and becomes the new base.
+    mut sun_base: Local<Option<(f32, f32)>>,
 ) {
     let flash_t = (lightning.flash_remaining / FLASH_DURATION).clamp(0.0, 1.0);
     let flash_curve = (flash_t * PI).sin();
@@ -419,7 +425,15 @@ pub fn apply_weather_to_sun_system(
     let amb_mul = 1.0 + (FLASH_AMBIENT_MUL - 1.0) * flash_curve;
 
     if let Ok(mut sun) = q_sun.single_mut() {
-        sun.illuminance *= sun_mul;
+        let base = match *sun_base {
+            Some((base, last)) if sun.illuminance == last => base,
+            _ => sun.illuminance,
+        };
+        let want = base * sun_mul;
+        if sun.illuminance != want {
+            sun.illuminance = want;
+        }
+        *sun_base = Some((base, want));
     }
     ambient.brightness *= amb_mul;
 }

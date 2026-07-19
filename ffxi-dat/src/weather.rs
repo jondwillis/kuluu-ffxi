@@ -15,6 +15,11 @@ pub struct WeatherRecord {
 
     pub sunlight_diffuse_entity: [f32; 4],
     pub moonlight_diffuse_entity: [f32; 4],
+    // research/xim EnvironmentSection.kt:251-256 getDirectionOfIndoorDiffuseLight:
+    // when indoors, the block's moonLightColor bytes are not a color but a SIGNED
+    // to-light direction (byte as i8 / 128, normalized, negated), and the single
+    // static indoor DiffuseLight replaces the sun/moon arc. FFXI (Y-down) space.
+    pub indoor_light_dir_entity: [f32; 3],
     pub ambient_entity: [f32; 4],
     pub fog_entity: [f32; 4],
     pub max_fog_dist_entity: f32,
@@ -24,6 +29,7 @@ pub struct WeatherRecord {
 
     pub sunlight_diffuse_landscape: [f32; 4],
     pub moonlight_diffuse_landscape: [f32; 4],
+    pub indoor_light_dir_landscape: [f32; 3],
     pub ambient_landscape: [f32; 4],
     pub fog_landscape: [f32; 4],
     pub max_fog_dist_landscape: f32,
@@ -78,6 +84,7 @@ pub fn parse_weather_record(name: &[u8; 4], body: &[u8]) -> Result<WeatherRecord
         indoors: u32_at(0) == 1,
         sunlight_diffuse_entity: diffuse_to_color(u32_at(12), diffuse_mul_entity),
         moonlight_diffuse_entity: diffuse_to_color(u32_at(16), diffuse_mul_entity),
+        indoor_light_dir_entity: indoor_light_direction(u32_at(16)),
         ambient_entity: ambient_to_color(u32_at(20)),
         fog_entity: u32_to_rgba(u32_at(24)),
         max_fog_dist_entity: f32_at(28),
@@ -86,6 +93,7 @@ pub fn parse_weather_record(name: &[u8; 4], body: &[u8]) -> Result<WeatherRecord
 
         sunlight_diffuse_landscape: diffuse_to_color(u32_at(44), diffuse_mul_landscape),
         moonlight_diffuse_landscape: diffuse_to_color(u32_at(48), diffuse_mul_landscape),
+        indoor_light_dir_landscape: indoor_light_direction(u32_at(48)),
         ambient_landscape: ambient_to_color(u32_at(52)),
         fog_landscape: u32_to_rgba(u32_at(56)),
         max_fog_dist_landscape: f32_at(60),
@@ -169,6 +177,20 @@ pub fn ambient_to_color(byte_rgba: u32) -> [f32; 4] {
     let b = (bias[2] * bb as f32 / 510.0).min(0.5);
     let a = (ab as f32 / 128.0).min(0.5);
     [r, g, b, a]
+}
+
+// research/xim EnvironmentSection.kt:251-256: signed bytes / 128, normalized,
+// negated. Degenerate (all-zero) input yields the zero vector; consumers treat a
+// zero direction as "no indoor diffuse light".
+pub fn indoor_light_direction(byte_rgba: u32) -> [f32; 3] {
+    let x = (byte_rgba & 0xFF) as u8 as i8 as f32 / 128.0;
+    let y = ((byte_rgba >> 8) & 0xFF) as u8 as i8 as f32 / 128.0;
+    let z = ((byte_rgba >> 16) & 0xFF) as u8 as i8 as f32 / 128.0;
+    let len = (x * x + y * y + z * z).sqrt();
+    if len <= f32::EPSILON {
+        return [0.0, 0.0, 0.0];
+    }
+    [-x / len, -y / len, -z / len]
 }
 
 fn parse_time_name(name: &[u8; 4]) -> Result<u32> {
@@ -422,6 +444,8 @@ fn lerp_records(a: &WeatherRecord, b: &WeatherRecord, t: f32, time_minutes: u32)
         indoors: a.indoors,
         sunlight_diffuse_entity: lerp4(a.sunlight_diffuse_entity, b.sunlight_diffuse_entity),
         moonlight_diffuse_entity: lerp4(a.moonlight_diffuse_entity, b.moonlight_diffuse_entity),
+        // Static per-zone direction, not a time-varying color: no interpolation.
+        indoor_light_dir_entity: a.indoor_light_dir_entity,
         ambient_entity: lerp4(a.ambient_entity, b.ambient_entity),
         fog_entity: lerp4(a.fog_entity, b.fog_entity),
         max_fog_dist_entity: lerp(a.max_fog_dist_entity, b.max_fog_dist_entity),
@@ -436,6 +460,7 @@ fn lerp_records(a: &WeatherRecord, b: &WeatherRecord, t: f32, time_minutes: u32)
             a.moonlight_diffuse_landscape,
             b.moonlight_diffuse_landscape,
         ),
+        indoor_light_dir_landscape: a.indoor_light_dir_landscape,
         ambient_landscape: lerp4(a.ambient_landscape, b.ambient_landscape),
         fog_landscape: lerp4(a.fog_landscape, b.fog_landscape),
         max_fog_dist_landscape: lerp(a.max_fog_dist_landscape, b.max_fog_dist_landscape),
@@ -539,6 +564,28 @@ mod tests {
         assert!((out2[2] - 0.5).abs() < 1e-6);
     }
 
+    // research/xim EnvironmentSection.kt:251-256: signed byte components / 128,
+    // normalized, negated; zero input is the "no indoor light" sentinel.
+    #[test]
+    fn indoor_direction_reads_signed_bytes() {
+        // r=0, g=0x80 (-128 -> -1.0), b=0: straight "down" in signed space,
+        // negated to the +y to-light vector (FFXI Y-down: light from below-ground
+        // bounce is -y; +y here means the light points from below the horizon up).
+        let d = indoor_light_direction(0x00_00_80_00);
+        assert!((d[0]).abs() < 1e-6 && (d[1] - 1.0).abs() < 1e-6 && (d[2]).abs() < 1e-6);
+
+        // r=0x7F (+127/128), g=b=0 -> unit -x after negation.
+        let d = indoor_light_direction(0x00_00_00_7F);
+        assert!((d[0] + 1.0).abs() < 1e-6);
+
+        assert_eq!(indoor_light_direction(0), [0.0, 0.0, 0.0]);
+
+        // Normalized regardless of magnitude.
+        let d = indoor_light_direction(0x00_20_40_40);
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        assert!((len - 1.0).abs() < 1e-5);
+    }
+
     #[test]
     fn weather_record_rejects_short_payload() {
         let short = [0u8; WEATHER_DATA_SIZE - 1];
@@ -552,6 +599,7 @@ mod tests {
             indoors: false,
             sunlight_diffuse_entity: [0.0; 4],
             moonlight_diffuse_entity: [0.0; 4],
+            indoor_light_dir_entity: [0.0; 3],
             ambient_entity: [0.0; 4],
             fog_entity: [0.0; 4],
             max_fog_dist_entity: 0.0,
@@ -559,6 +607,7 @@ mod tests {
             diffuse_mul_entity: brightness,
             sunlight_diffuse_landscape: [0.0; 4],
             moonlight_diffuse_landscape: [0.0; 4],
+            indoor_light_dir_landscape: [0.0; 3],
             ambient_landscape: [0.0; 4],
             fog_landscape: [0.0; 4],
             max_fog_dist_landscape: 0.0,
