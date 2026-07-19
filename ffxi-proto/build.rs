@@ -15,6 +15,7 @@ const LSB_ABILITIES_SQL: &str = "../vendor/server/sql/abilities.sql";
 const LSB_WEAPON_SKILLS_SQL: &str = "../vendor/server/sql/weapon_skills.sql";
 const LSB_ITEM_BASIC_SQL: &str = "../vendor/server/sql/item_basic.sql";
 const LSB_ITEM_EQUIPMENT_SQL: &str = "../vendor/server/sql/item_equipment.sql";
+const LSB_ITEM_USABLE_SQL: &str = "../vendor/server/sql/item_usable.sql";
 const LSB_PACKET_S2C_H: &str = "../vendor/server/src/map/enums/packet_s2c.h";
 const LSB_PACKET_C2S_H: &str = "../vendor/server/src/map/enums/packet_c2s.h";
 const LSB_AUTH_SESSION_H: &str = "../vendor/server/src/login/auth_session.h";
@@ -36,6 +37,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed={LSB_WEAPON_SKILLS_SQL}");
     println!("cargo:rerun-if-changed={LSB_ITEM_BASIC_SQL}");
     println!("cargo:rerun-if-changed={LSB_ITEM_EQUIPMENT_SQL}");
+    println!("cargo:rerun-if-changed={LSB_ITEM_USABLE_SQL}");
     println!("cargo:rerun-if-changed={LSB_PACKET_S2C_H}");
     println!("cargo:rerun-if-changed={LSB_PACKET_C2S_H}");
     println!("cargo:rerun-if-changed={LSB_AUTH_SESSION_H}");
@@ -309,6 +311,15 @@ fn main() -> Result<()> {
         equip_entries.len(),
     );
 
+    let usable_src = fs::read_to_string(LSB_ITEM_USABLE_SQL)
+        .with_context(|| format!("reading {LSB_ITEM_USABLE_SQL}"))?;
+    let usable_entries = parse_sql_usable_rows(&usable_src)?;
+    write_item_usable_table(&out_dir.join("item_usable_table.rs"), &usable_entries)?;
+    println!(
+        "cargo:warning=ffxi-proto: scraped {} item_usable entries",
+        usable_entries.len(),
+    );
+
     let pkt_s2c_src = fs::read_to_string(LSB_PACKET_S2C_H)
         .with_context(|| format!("reading {LSB_PACKET_S2C_H}"))?;
     let s2c_names = parse_packet_enum(&pkt_s2c_src, "GP_SERV_COMMAND_")?;
@@ -519,6 +530,81 @@ fn parse_equip_row(fields: &[&str]) -> Option<EquipRow> {
         jobs_mask,
         slot_mask,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsableRow {
+    item_id: u16,
+    valid_targets: u16,
+    max_charges: u8,
+}
+
+/// Scrapes LSB `item_usable` (itemId, name, validTargets, activation,
+/// animation, animationTime, maxCharges, useDelay, reuseDelay, aoe) — the
+/// table 0x037 item-use consults for whether an item can fire at all.
+fn parse_sql_usable_rows(src: &str) -> Result<Vec<UsableRow>> {
+    let needle = "INSERT INTO `item_usable` VALUES ";
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix(needle) else {
+            continue;
+        };
+        let mut cursor = rest;
+        while let Some(open) = cursor.find('(') {
+            cursor = &cursor[open + 1..];
+            let Some((tuple, after)) = split_sql_tuple(cursor) else {
+                break;
+            };
+            cursor = after;
+            let fields = split_sql_fields(tuple);
+            let Some(row) = parse_usable_row(&fields) else {
+                continue;
+            };
+            out.push(row);
+        }
+    }
+    if out.is_empty() {
+        bail!(
+            "parsed zero rows from `INSERT INTO item_usable` — \
+             SQL format may have changed"
+        );
+    }
+
+    out.sort_by_key(|e| e.item_id);
+    out.dedup_by_key(|e| e.item_id);
+    Ok(out)
+}
+
+fn parse_usable_row(fields: &[&str]) -> Option<UsableRow> {
+    let item_id: u16 = fields.first()?.trim().parse().ok()?;
+    let valid_targets: u16 = fields.get(2)?.trim().parse().ok()?;
+    let max_charges: u8 = fields.get(6)?.trim().parse::<u16>().ok()?.min(255) as u8;
+    Some(UsableRow {
+        item_id,
+        valid_targets,
+        max_charges,
+    })
+}
+
+fn write_item_usable_table(out_path: &PathBuf, entries: &[UsableRow]) -> Result<()> {
+    use std::io::Write;
+    let mut f =
+        fs::File::create(out_path).with_context(|| format!("creating {}", out_path.display()))?;
+    writeln!(
+        f,
+        "// Auto-generated from {LSB_ITEM_USABLE_SQL} by build.rs — do not edit."
+    )?;
+    writeln!(f, "pub static ITEM_USABLE: &[(u16, u16, u8)] = &[")?;
+    for row in entries {
+        writeln!(
+            f,
+            "    ({}, {}, {}),",
+            row.item_id, row.valid_targets, row.max_charges
+        )?;
+    }
+    writeln!(f, "];")?;
+    Ok(())
 }
 
 fn write_equip_info_table(out_path: &PathBuf, entries: &[EquipRow]) -> Result<()> {

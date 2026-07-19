@@ -280,6 +280,7 @@ pub fn click_to_target_system(
                     scene.snapshot.self_pos.pos,
                     scene.snapshot.self_char_id,
                     engaged,
+                    crate::hud::menu::any_usable_item(&scene.snapshot),
                 );
                 if !action_model::build_target_action_entries(&ctx, &crate::hud::overlay::RETAIL)
                     .is_empty()

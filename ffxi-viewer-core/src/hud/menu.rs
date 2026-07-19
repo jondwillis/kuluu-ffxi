@@ -221,6 +221,7 @@ pub fn is_dynamic(kind: MenuKind) -> bool {
             | MenuKind::Abilities
             | MenuKind::Items
             | MenuKind::KeyItems
+            | MenuKind::UsableItems
             | MenuKind::ItemAction { .. }
             | MenuKind::EquipSlot(_)
             | MenuKind::EmoteList
@@ -269,6 +270,7 @@ fn empty_dynamic_hint(kind: MenuKind) -> &'static str {
         MenuKind::Abilities => "(no abilities available — wrong job?)",
         MenuKind::Items => "(bag empty)",
         MenuKind::KeyItems => "(no key items)",
+        MenuKind::UsableItems => "(no usable items)",
         MenuKind::ItemAction { .. } => "(item no longer in this bag)",
         MenuKind::EquipSlot(_) => "(no equippable items for this slot)",
         MenuKind::EmoteList => "(emote table unavailable)",
@@ -287,6 +289,7 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
         MenuKind::Abilities => &["(Abilities — data pending)"],
         MenuKind::Items => ITEMS_ENTRIES_STUB,
         MenuKind::KeyItems => &[],
+        MenuKind::UsableItems => &[],
 
         MenuKind::Equipment => EQUIPMENT_ENTRIES,
 
@@ -311,6 +314,7 @@ fn menu_title(kind: MenuKind) -> &'static str {
         MenuKind::Abilities => "Abilities",
         MenuKind::Items => "Items",
         MenuKind::KeyItems => "Key Items",
+        MenuKind::UsableItems => "Items",
         MenuKind::ItemAction { .. } => "Item",
         MenuKind::Status => "Status",
         MenuKind::EquipSlot(_) => "Equip",
@@ -457,6 +461,7 @@ pub fn refresh_dynamic_menu_rows(
             .collect(),
         MenuKind::KeyItems => key_item_rows(snap),
         MenuKind::EmoteList => emote_rows(snap),
+        MenuKind::UsableItems => usable_item_rows(snap),
         MenuKind::ItemAction {
             container,
             index,
@@ -521,6 +526,8 @@ fn order_dynamic_rows(kind: MenuKind, auto_sort: bool, rows: &mut [DynamicMenuRo
                 rows.sort_by_key(item_row_sort_key);
             }
         }
+        // Retail's Command Menu Items list is always id-sorted.
+        MenuKind::UsableItems => rows.sort_by_key(item_row_sort_key),
         // Key items keep id order: ascending global id groups the 512-id
         // tables together (whether retail sections match the tables is an
         // open question, bead kuluu-h7x retail_unknowns). Emotes keep the
@@ -584,8 +591,76 @@ pub fn emote_command_word(id: u8) -> String {
 fn item_row_sort_key(row: &DynamicMenuRow) -> u16 {
     match row.action {
         DynamicMenuAction::OpenItemAction { item_no, .. } => item_no,
+        DynamicMenuAction::UseItem { item_no, .. } => item_no,
         _ => u16::MAX,
     }
+}
+
+/// LSB 0x037 item-use gate (vendor/server/src/map/packets/c2s — 0x037 item
+/// use → CState checks + `item_usable`): an item can fire right now iff it
+/// appears in `item_usable` and either
+/// - it is a plain consumable (maxCharges == 0) sitting unlocked in
+///   LOC_INVENTORY or LOC_TEMPITEMS, or
+/// - it is charged equipment (maxCharges > 0) that is currently equipped
+///   (equipping is what locks the slot; the equipped item ids are mirrored
+///   in `SceneSnapshot::equipped`).
+pub fn item_usable_now(
+    snap: &ffxi_viewer_wire::SceneSnapshot,
+    slot: &ffxi_viewer_wire::InventoryItem,
+) -> bool {
+    use ffxi_proto::map::container as c;
+
+    let Some(info) = ffxi_proto::item_usable::lookup(slot.item_no) else {
+        return false;
+    };
+    let is_equipment = ffxi_proto::equip_info::lookup(slot.item_no).is_some();
+    if is_equipment {
+        // Charged equipment: usable only while equipped. Equipment without
+        // charges never fires from the menu even though it may sit in
+        // item_usable (enchantment already consumed server-side).
+        info.max_charges > 0
+            && slot.locked
+            && snap.equipped.contains(&Some(slot.item_no))
+            && (slot.container == c::LOC_INVENTORY || c::is_wardrobe(slot.container))
+    } else {
+        // Consumables: LOC_INVENTORY / LOC_TEMPITEMS only, and never from a
+        // locked (bazaar/linkshell-reserved) slot.
+        (slot.container == c::LOC_INVENTORY || slot.container == c::LOC_TEMPITEMS) && !slot.locked
+    }
+}
+
+/// Rows for the Command Menu "Items" submenu: every currently-usable item
+/// across all containers, firing Use directly (kuluu-268h).
+pub fn usable_item_rows(snap: &ffxi_viewer_wire::SceneSnapshot) -> Vec<DynamicMenuRow> {
+    snap.containers
+        .iter()
+        .flat_map(|cont| cont.items.iter())
+        .filter(|slot| item_usable_now(snap, slot))
+        .filter_map(|slot| {
+            let name = ffxi_proto::item_names::lookup(slot.item_no)?;
+            let label = if slot.quantity > 1 {
+                format!("{name} x{}", slot.quantity)
+            } else {
+                name.to_string()
+            };
+            Some(DynamicMenuRow {
+                label,
+                action: DynamicMenuAction::UseItem {
+                    container: slot.container,
+                    index: slot.index,
+                    item_no: slot.item_no,
+                },
+            })
+        })
+        .collect()
+}
+
+/// Whether the quick-menu "Items" entry should be enabled at all.
+pub fn any_usable_item(snap: &ffxi_viewer_wire::SceneSnapshot) -> bool {
+    snap.containers
+        .iter()
+        .flat_map(|cont| cont.items.iter())
+        .any(|slot| item_usable_now(snap, slot))
 }
 
 /// Context rows for one slot, mirroring the LSB 0x029 move rules
@@ -609,7 +684,9 @@ pub fn item_action_rows(
     };
 
     let mut rows = Vec::new();
-    if container == c::LOC_INVENTORY || container == c::LOC_TEMPITEMS {
+    // Same predicate as the Command Menu Items list: only offer Use when the
+    // LSB 0x037 gate would accept it (kuluu-268h).
+    if item_usable_now(snap, slot) {
         rows.push(DynamicMenuRow {
             label: "Use".to_string(),
             action: DynamicMenuAction::UseItem {
@@ -975,7 +1052,9 @@ mod tests {
     }
 
     /// Pins LSB 0x029 isValidMovement's ITEM_LOCKED rejection: locked slots
-    /// (equipped / linkshell / bazaar-reserved) get no move rows.
+    /// (equipped / linkshell / bazaar-reserved) get no move rows. Since the
+    /// 0x037 gate (kuluu-268h), a locked consumable also loses its Use row:
+    /// the server rejects using bazaar/linkshell-reserved items.
     #[test]
     fn locked_slot_offers_no_moves() {
         use ffxi_proto::map::container as c;
@@ -988,7 +1067,7 @@ mod tests {
                 .any(|r| matches!(r.action, DynamicMenuAction::MoveItem { .. })),
             "{rows:?}"
         );
-        assert!(rows.iter().any(|r| r.label == "Use"));
+        assert!(!rows.iter().any(|r| r.label == "Use"), "{rows:?}");
     }
 
     /// Pins the LSB validContainers Safe-2F gate (mhflag & 0x20,
@@ -1337,5 +1416,111 @@ mod tests {
             GRAPHICS_ENTRIES[GRAPHICS_RESET_SLOT], "Reset to High",
             "the slot past the last field must be the Reset action"
         );
+    }
+
+    /// One-slot snapshot builder for the LSB 0x037 usability gate tests
+    /// (kuluu-268h). Item ids pinned against vendor/server/sql:
+    /// 4112 = potion (consumable), 15840 = kupofried's ring (charged
+    /// equipment), 13327 = silver earring (plain equipment, no activation).
+    fn slot_snapshot(container: u8, item_no: u16, locked: bool) -> ffxi_viewer_wire::SceneSnapshot {
+        ffxi_viewer_wire::SceneSnapshot {
+            containers: vec![ffxi_viewer_wire::ContainerView {
+                id: container,
+                capacity: 30,
+                items: vec![ffxi_viewer_wire::InventoryItem {
+                    container,
+                    index: 0,
+                    item_no,
+                    quantity: 1,
+                    locked,
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn only_slot(snap: &ffxi_viewer_wire::SceneSnapshot) -> &ffxi_viewer_wire::InventoryItem {
+        &snap.containers[0].items[0]
+    }
+
+    /// Consumables fire from LOC_INVENTORY and LOC_TEMPITEMS only
+    /// (0x037 → CState container check).
+    #[test]
+    fn consumable_usable_from_inventory_and_tempitems_only() {
+        use ffxi_proto::map::container as c;
+        for (container, expect) in [
+            (c::LOC_INVENTORY, true),
+            (c::LOC_TEMPITEMS, true),
+            (c::LOC_MOGSAFE, false),
+            (c::LOC_STORAGE, false),
+            (c::LOC_WARDROBE, false),
+        ] {
+            let snap = slot_snapshot(container, 4112, false);
+            assert_eq!(
+                item_usable_now(&snap, only_slot(&snap)),
+                expect,
+                "potion in container {container}"
+            );
+        }
+    }
+
+    /// Locked (bazaar/linkshell-reserved) consumables are rejected by the
+    /// server, so the menu must not offer them.
+    #[test]
+    fn locked_consumable_is_not_usable() {
+        use ffxi_proto::map::container as c;
+        let snap = slot_snapshot(c::LOC_INVENTORY, 4112, true);
+        assert!(!item_usable_now(&snap, only_slot(&snap)));
+    }
+
+    /// Charged equipment (kupofried's ring) is usable only while equipped:
+    /// locked slot + mirrored in SceneSnapshot::equipped.
+    #[test]
+    fn charged_equipment_usable_only_while_equipped() {
+        use ffxi_proto::map::container as c;
+        let mut snap = slot_snapshot(c::LOC_INVENTORY, 15840, true);
+        snap.equipped[13] = Some(15840);
+        assert!(item_usable_now(&snap, only_slot(&snap)));
+
+        // Sitting unequipped in the bag: not usable.
+        let unequipped = slot_snapshot(c::LOC_INVENTORY, 15840, false);
+        assert!(!item_usable_now(&unequipped, only_slot(&unequipped)));
+
+        // Equipped but stored via a non-wardrobe container: not usable.
+        let mut stored = slot_snapshot(c::LOC_MOGSAFE, 15840, true);
+        stored.equipped[13] = Some(15840);
+        assert!(!item_usable_now(&stored, only_slot(&stored)));
+    }
+
+    /// Plain equipment (no item_usable entry) never appears, even equipped.
+    #[test]
+    fn plain_equipment_is_never_usable() {
+        use ffxi_proto::map::container as c;
+        let mut snap = slot_snapshot(c::LOC_INVENTORY, 13327, true);
+        snap.equipped[11] = Some(13327);
+        assert!(!item_usable_now(&snap, only_slot(&snap)));
+    }
+
+    /// The quick-menu Items rows fire Use directly and skip unusable slots;
+    /// any_usable_item gates the entry itself.
+    #[test]
+    fn usable_item_rows_fire_use_directly() {
+        use ffxi_proto::map::container as c;
+        let snap = slot_snapshot(c::LOC_INVENTORY, 4112, false);
+        let rows = usable_item_rows(&snap);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(matches!(
+            rows[0].action,
+            DynamicMenuAction::UseItem {
+                container: c::LOC_INVENTORY,
+                index: 0,
+                item_no: 4112,
+            }
+        ));
+        assert!(any_usable_item(&snap));
+
+        let safe = slot_snapshot(c::LOC_MOGSAFE, 4112, false);
+        assert!(usable_item_rows(&safe).is_empty());
+        assert!(!any_usable_item(&safe));
     }
 }

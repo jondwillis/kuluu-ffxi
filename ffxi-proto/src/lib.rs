@@ -8,6 +8,7 @@ pub mod emote_names;
 pub mod equip_info;
 pub mod framing;
 pub mod item_names;
+pub mod item_usable;
 pub mod job_names;
 pub mod key_item_names;
 pub mod login;

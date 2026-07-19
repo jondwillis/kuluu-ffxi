@@ -104,6 +104,11 @@ pub enum MenuKind {
 
     KeyItems,
 
+    /// Retail Command Menu "Items": only items that can actually be used
+    /// right now (LSB 0x037 semantics — see `hud::menu::item_usable_now`),
+    /// each row firing Use directly instead of opening the full bag.
+    UsableItems,
+
     /// Per-item context menu pushed from the Items window (retail's item
     /// submenu): Use / Take Out / Put in <bag> rows for the focused slot.
     ItemAction {

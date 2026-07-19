@@ -42,6 +42,11 @@ pub struct TargetActionContext {
     pub trusts_available: bool,
 
     pub engaged: bool,
+
+    /// Whether any item currently passes the LSB 0x037 use gate
+    /// (`hud::menu::any_usable_item`); when false the "Items" entry is
+    /// greyed out (kuluu-268h).
+    pub usable_items_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +147,9 @@ pub fn build_target_action_entries(
 
         let needs_range = matches!(id, TargetActionId::Chat | TargetActionId::Trade);
         let out_of_range = needs_range && ctx.has_target && !ctx.in_range;
+        // Retail greys the Command Menu "Items" entry when nothing in the
+        // bags would pass the 0x037 use gate (kuluu-268h).
+        let no_usable_items = id == TargetActionId::Items && !ctx.usable_items_available;
 
         let (kind, label) = match id {
             TargetActionId::Attack => (ActionEntryKind::Plain, "Attack".to_string()),
@@ -176,6 +184,8 @@ pub fn build_target_action_entries(
 
         let hint = if out_of_range {
             Some("Target out of range.".to_string())
+        } else if no_usable_items {
+            Some("No usable items.".to_string())
         } else {
             None
         };
@@ -184,7 +194,7 @@ pub fn build_target_action_entries(
             id,
             label,
             kind,
-            enabled: !out_of_range,
+            enabled: !out_of_range && !no_usable_items,
             hint,
         });
     }
@@ -197,6 +207,7 @@ pub fn context_for_target(
     self_pos: ffxi_viewer_wire::Vec3,
     self_id: Option<u32>,
     engaged: bool,
+    usable_items_available: bool,
 ) -> TargetActionContext {
     use ffxi_viewer_wire::EntityKind;
 
@@ -225,6 +236,7 @@ pub fn context_for_target(
         in_range,
         trusts_available: false,
         engaged,
+        usable_items_available,
     }
 }
 
@@ -262,6 +274,7 @@ mod tests {
             in_range,
             trusts_available: false,
             engaged: false,
+            usable_items_available: true,
         }
     }
 
@@ -323,6 +336,26 @@ mod tests {
             ]
         );
         assert!(!ids.contains(&TargetActionId::Attack));
+    }
+
+    #[test]
+    fn items_entry_greyed_when_no_usable_items() {
+        let no_items = TargetActionContext {
+            usable_items_available: false,
+            ..ctx(TargetKindLite::Mob, true)
+        };
+        let entries = build_target_action_entries(&no_items, &RETAIL);
+        let items = entries
+            .iter()
+            .find(|e| e.id == TargetActionId::Items)
+            .expect("items entry still listed");
+        assert!(!items.enabled);
+        assert_eq!(items.hint.as_deref(), Some("No usable items."));
+        // Other entries stay enabled.
+        assert!(entries
+            .iter()
+            .filter(|e| e.id != TargetActionId::Items)
+            .all(|e| e.enabled));
     }
 
     #[test]
