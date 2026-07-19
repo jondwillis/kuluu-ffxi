@@ -29,6 +29,7 @@ pub fn spawn_nameplate(
     commands
         .spawn((
             crate::components::InGameEntity,
+            crate::hud_hide::HudHideExempt,
             Nameplate { entity_id, kind },
             Node {
                 position_type: PositionType::Absolute,

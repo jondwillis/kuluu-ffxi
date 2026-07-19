@@ -603,6 +603,15 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.add_message::<screenshot::ScreenshotRequest>()
         .add_systems(Update, screenshot::process_screenshot_requests);
 
+    app.init_resource::<ffxi_viewer_core::hud_hide::HudHidden>()
+        .init_resource::<ffxi_viewer_core::hud_hide::HudHideStash>()
+        .add_systems(
+            PostUpdate,
+            ffxi_viewer_core::hud_hide::apply_hud_hidden
+                .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate)
+                .run_if(in_state(AppPhase::InGame)),
+        );
+
     app.add_systems(
         Update,
         return_to_launcher_on_disconnect.run_if(in_state(AppPhase::InGame)),

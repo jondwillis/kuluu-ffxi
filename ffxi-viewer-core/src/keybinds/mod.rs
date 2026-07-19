@@ -38,6 +38,9 @@ pub enum Action {
 
     TogglePassiveCursor,
 
+    ToggleHud,
+    Screenshot,
+
     CycleTarget,
     ClearTarget,
     TargetSelf,

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
@@ -8,6 +9,13 @@ use ffxi_viewer_core::snapshot::ToastEvent;
 #[derive(Message, Debug, Clone)]
 pub struct ScreenshotRequest {
     pub path: PathBuf,
+}
+
+static DEFAULT_PATH_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+pub fn next_default_path() -> PathBuf {
+    let n = DEFAULT_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    PathBuf::from(format!("screenshot-{n}.png"))
 }
 
 pub fn process_screenshot_requests(
