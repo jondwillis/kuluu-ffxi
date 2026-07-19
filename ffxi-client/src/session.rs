@@ -949,16 +949,7 @@ fn handle_sub_packet(
             }
         }
         op if op == s2c::EVENTUCOFF => {
-            // Mode (u32) sits right after the 4-byte sub-header; the high bits may carry an
-            // event id, so match the low byte. Fishing release = a rejected cast (no rod /
-            // bait / fishing spot) or the end of fishing.
-            // vendor/server/src/map/packets/s2c/0x052_eventucoff.h
-            if sub.data.len() >= 4 {
-                let mode = u32::from_le_bytes([sub.data[0], sub.data[1], sub.data[2], sub.data[3]]);
-                if mode & 0xFF == ffxi_proto::map::eventucoff_mode::FISHING {
-                    let _ = event_tx.send(AgentEvent::FishingEnded);
-                }
-            }
+            handle_eventucoff(sub.data, pending_event_end, event_tx);
         }
         op if op == s2c::WPOS || op == s2c::WPOS2 => {
             if let Ok(fm) = decode::ForcedMove::decode(sub.data) {
@@ -1499,10 +1490,13 @@ async fn keepalive_loop(
                         if local_menu.active() {
                             local_menu.clear();
                             let _ = event_tx.send(AgentEvent::EventEnded);
-                        // VM-driven event: advance to the next frame, or send
-                        // EVENT_END only once the script ends.
+                        // VM-driven event: cancel — the VM reports the frame's
+                        // cancel result and EVENT_END carries the cancel
+                        // EndPara; the server script decides what it means
+                        // (OnEventFinish result, vendor/server/src/map/packets/
+                        // c2s/0x05b_eventend.cpp:36-70).
                         } else if let Some((u, a, n)) = dialog_session.active_end() {
-                            match dialog_session.advance(None) {
+                            match dialog_session.cancel() {
                                 crate::event_dialog::Advance::Frame(dialog) => {
                                     emit_event_speech_to_chat(&event_tx, &dialog);
                                     let _ = event_tx.send(AgentEvent::EventDialog { dialog });
@@ -1528,6 +1522,13 @@ async fn keepalive_loop(
                             }
                             let _ = event_tx.send(AgentEvent::EventEnded);
                         } else {
+                            // Nothing outstanding server-side: every tracked
+                            // event lives in dialog_session or
+                            // pending_event_end, and LSB drops a 0x05B whose
+                            // EventPara doesn't match currentEvent->eventId
+                            // (vendor/server/src/map/packets/c2s/
+                            // validation.cpp:58-77), so there is no valid
+                            // event-finish to fabricate here.
                             let _ = event_tx.send(AgentEvent::EventEnded);
                         }
                     }
@@ -2412,6 +2413,13 @@ async fn keepalive_loop(
                                     );
                                     continue;
                                 }
+                            }
+
+                            if sub.opcode == ffxi_proto::map::s2c::EVENTUCOFF
+                                && eventucoff_mode_of(sub.data)
+                                    == Some(ffxi_proto::map::eventucoff_mode::CANCEL_EVENT)
+                            {
+                                dialog_session.clear();
                             }
 
                             let prev_self_pos = self_pos.pos;
@@ -3519,6 +3527,40 @@ fn emit_event_speech_to_chat(
     });
 }
 
+/// Mode low byte of s2c 0x052 EVENTUCOFF (u32 right after the 4-byte
+/// sub-header); CancelEvent packs the cancelled event id in the high bits
+/// (vendor/server/src/map/packets/s2c/0x052_eventucoff.cpp:30-34).
+fn eventucoff_mode_of(data: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(0..4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes) & ffxi_proto::map::eventucoff_mode::MODE_MASK)
+}
+
+/// s2c 0x052 EVENTUCOFF releases the client from an event user-control lock
+/// (vendor/server/src/map/packets/s2c/0x052_eventucoff.h:26-33). CancelEvent
+/// arrives only after the server already dropped the event (release()/skipEvent
+/// call endCurrentEvent — vendor/server/src/map/lua/lua_baseentity.cpp:1374-1385,
+/// vendor/server/src/map/entities/charentity.cpp:3319-3336), so no 0x05B goes
+/// back; the local event state is dropped instead. Fishing release = a rejected
+/// cast (no rod / bait / fishing spot) or the end of fishing. EventRecvPending —
+/// the ack after every processed 0x05B (0x05b_eventend.cpp:71) — must NOT clear
+/// anything: a chained event's 0x032 trigger can precede it.
+fn handle_eventucoff(
+    data: &[u8],
+    pending_event_end: &mut Vec<(u32, u16, u16)>,
+    event_tx: &broadcast::Sender<AgentEvent>,
+) {
+    match eventucoff_mode_of(data) {
+        Some(ffxi_proto::map::eventucoff_mode::FISHING) => {
+            let _ = event_tx.send(AgentEvent::FishingEnded);
+        }
+        Some(ffxi_proto::map::eventucoff_mode::CANCEL_EVENT) => {
+            pending_event_end.clear();
+            let _ = event_tx.send(AgentEvent::EventEnded);
+        }
+        _ => {}
+    }
+}
+
 fn emit_event_dialog(
     event_tx: &broadcast::Sender<AgentEvent>,
     dialog: &crate::state::DialogState,
@@ -4531,6 +4573,72 @@ mod tests {
             "EventNum carries the zone id (retail echoes LOGIN EventNum, \
              0x00a_login.cpp:187); LSB's 0x05B handler never reads it",
         );
+    }
+
+    /// The Esc cancel EndPara crosses the wire exactly as LSB's
+    /// utils.EVENT_CANCELLED_OPTION (vendor/server/scripts/utils/utils.lua:8).
+    #[test]
+    fn event_end_cancel_writes_lsb_cancel_option() {
+        let buf = build_subpacket_event_end(
+            0x1234,
+            0xDEADBEEF,
+            0x4242,
+            230,
+            535,
+            ffxi_event::EVENT_CANCELLED_END_PARA,
+        );
+        assert_eq!(&buf[8..12], &0x4000_0000u32.to_le_bytes(), "EndPara");
+    }
+
+    #[test]
+    fn eventucoff_mode_strips_packed_event_id() {
+        use ffxi_proto::map::eventucoff_mode;
+        let packed = eventucoff_mode::CANCEL_EVENT | (535u32 << 8);
+        assert_eq!(
+            eventucoff_mode_of(&packed.to_le_bytes()),
+            Some(eventucoff_mode::CANCEL_EVENT)
+        );
+        assert_eq!(eventucoff_mode_of(&[2, 0]), None, "truncated body");
+    }
+
+    #[test]
+    fn eventucoff_cancel_event_clears_pending_and_emits_event_ended() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut pending = vec![(0xDEADBEEFu32, 7u16, 535u16)];
+        let packed = ffxi_proto::map::eventucoff_mode::CANCEL_EVENT | (535u32 << 8);
+        handle_eventucoff(&packed.to_le_bytes(), &mut pending, &tx);
+        assert!(
+            pending.is_empty(),
+            "server force-close drops tracked events"
+        );
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::EventEnded)));
+        assert!(rx.try_recv().is_err(), "exactly one event emitted");
+    }
+
+    #[test]
+    fn eventucoff_fishing_emits_fishing_ended_and_keeps_pending() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut pending = vec![(1u32, 2u16, 3u16)];
+        handle_eventucoff(
+            &ffxi_proto::map::eventucoff_mode::FISHING.to_le_bytes(),
+            &mut pending,
+            &tx,
+        );
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::FishingEnded)));
+    }
+
+    /// EventRecvPending follows every processed 0x05B
+    /// (vendor/server/src/map/packets/c2s/0x05b_eventend.cpp:71) and can land
+    /// after a chained event's 0x032 trigger — it must not clear anything.
+    #[test]
+    fn eventucoff_recv_pending_ack_is_inert() {
+        const EVENT_RECV_PENDING: u32 = 1;
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut pending = vec![(1u32, 2u16, 3u16)];
+        handle_eventucoff(&EVENT_RECV_PENDING.to_le_bytes(), &mut pending, &tx);
+        assert_eq!(pending.len(), 1);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

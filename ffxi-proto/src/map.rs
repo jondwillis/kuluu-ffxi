@@ -146,8 +146,11 @@ pub mod action_id {
 }
 
 pub mod eventucoff_mode {
-    // GP_SERV_COMMAND_EVENTUCOFF_MODE, vendor/server/src/map/packets/s2c/0x052_eventucoff.h.
-    // The high bits can carry an event id, so match on the low byte.
+    // GP_SERV_COMMAND_EVENTUCOFF_MODE, vendor/server/src/map/packets/s2c/0x052_eventucoff.h:26-33.
+    // CancelEvent packs the cancelled event id in the high bits
+    // (0x052_eventucoff.cpp:30-34), so match on the low byte.
+    pub const MODE_MASK: u32 = 0xFF;
+    pub const CANCEL_EVENT: u32 = 2;
     pub const FISHING: u32 = 4;
 }
 
