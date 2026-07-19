@@ -106,6 +106,51 @@ pub fn draw_target_arrow_system(
     }
 }
 
+/// Retail sub-target confirm flash rate: the arrow blinks fast while the
+/// client asks "on whom?" (task #3 capture).
+const SUB_TARGET_FLASH_HZ: f32 = 3.5;
+/// Fraction of each flash cycle the arrow is visible.
+const SUB_TARGET_FLASH_DUTY: f32 = 0.65;
+
+/// Draw the flashing sub-target cursor over the pending candidate while an
+/// action awaits its target confirm (InputMode::SubTarget). Same overhead
+/// arrow as the lock-on target, but blinking.
+pub fn draw_sub_target_cursor_system(
+    mode: Res<crate::InputMode>,
+    time: Res<Time>,
+    cam_q: Query<&Transform, With<OperatorCamera>>,
+    world_q: Query<(&Transform, &WorldEntity, Option<&BakedActor>)>,
+    mut gizmos: Gizmos,
+) {
+    let crate::InputMode::SubTarget(st) = &*mode else {
+        return;
+    };
+    let Some(candidate) = st.candidate else {
+        return;
+    };
+    if (time.elapsed_secs() * SUB_TARGET_FLASH_HZ).fract() > SUB_TARGET_FLASH_DUTY {
+        return;
+    }
+    let Ok(cam_t) = cam_q.single() else {
+        return;
+    };
+    let cam_pos = cam_t.translation;
+
+    for (t, w, baked) in &world_q {
+        if w.id != candidate {
+            continue;
+        }
+
+        let tip_y = t.translation.y
+            + nameplate_anchor_y(baked)
+            + ARROW_TIP_ABOVE_ANCHOR
+            + arrow_bob_offset(time.elapsed_secs());
+        let apex = Vec3::new(t.translation.x, tip_y, t.translation.z);
+        draw_camera_facing_arrow(&mut gizmos, apex, cam_pos, ARROW_COLOR, ARROW_BORDER_COLOR);
+        break;
+    }
+}
+
 fn draw_camera_facing_arrow(
     gizmos: &mut Gizmos,
     apex: Vec3,

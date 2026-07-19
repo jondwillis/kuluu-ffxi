@@ -16,6 +16,50 @@ pub enum InputMode {
     Dialog(DialogCursor),
 
     PassiveCursor(PassiveCursorState),
+
+    /// Retail sub-target confirm step: an action was chosen from a menu and
+    /// the flashing sub-target cursor is asking "on whom?". Esc returns to
+    /// `return_to`; confirm fires the action at `candidate`.
+    SubTarget(SubTargetState),
+}
+
+/// The action pending behind a sub-target cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubTargetAction {
+    Spell(u16),
+    Ability(u16),
+    WeaponSkill(u16),
+    Item {
+        container: u8,
+        index: u8,
+        item_no: u16,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SubTargetState {
+    pub action: SubTargetAction,
+
+    /// TARGETTYPE bitmask for the pending action (ffxi-proto valid_target).
+    pub flags: u16,
+
+    /// Entity currently under the sub-target cursor. None when no valid
+    /// candidate exists in range (cursor parks on self only if SELF is valid).
+    pub candidate: Option<u32>,
+
+    /// Mode to restore on Esc (retail: back to the menu, cursor preserved).
+    pub return_to: Box<InputMode>,
+}
+
+impl SubTargetState {
+    pub fn open(action: SubTargetAction, flags: u16, return_to: InputMode) -> Self {
+        Self {
+            action,
+            flags,
+            candidate: None,
+            return_to: Box::new(return_to),
+        }
+    }
 }
 
 pub const DIALOG_MAX_CHOICE: u32 = 7;

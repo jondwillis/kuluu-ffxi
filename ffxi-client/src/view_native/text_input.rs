@@ -309,6 +309,18 @@ pub fn text_input_system(
                     *mode = next;
                 }
             }
+            InputMode::SubTarget(state) => {
+                if let Some(next) = handle_sub_target_key(
+                    &ev.logical_key,
+                    &bindings,
+                    state,
+                    &mut scene_state,
+                    &entities,
+                    &cmd_tx.0,
+                ) {
+                    *mode = next;
+                }
+            }
         }
     }
 }
@@ -770,9 +782,17 @@ fn handle_abilities_group_key(
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
         if let Some(row) = rows.get(sub.cursor) {
+            let action = row.action;
+            if let Some(sub_action) = sub_target_action_for(action) {
+                // Retail: choosing the spell/ability does not fire it — the
+                // flashing sub-target cursor asks "on whom?" first. Esc
+                // returns here with the menu cursor preserved.
+                let return_to = InputMode::TargetAction(state.clone());
+                return open_sub_target(sub_action, current_target, scene_state, return_to);
+            }
             let self_pos = scene_state.snapshot.self_pos.pos;
             dispatch_dynamic_menu_action(
-                row.action,
+                action,
                 current_target,
                 self_pos,
                 entities,
@@ -2177,6 +2197,14 @@ fn confirm_menu_at_cursor(
                 );
                 return None;
             }
+            if let Some(sub_action) = sub_target_action_for(action) {
+                // Retail sub-target confirm step: the action fires only after
+                // the flashing cursor is confirmed. Esc restores this menu
+                // with its cursor intact. None = no qualified target in
+                // range; stay in the menu like retail.
+                let return_to = InputMode::Menu(stack.clone());
+                return open_sub_target(sub_action, target_id, scene_state, return_to);
+            }
             let moved = matches!(action, A::MoveItem { .. });
             let entities = scene_state.snapshot.entities.clone();
             dispatch_dynamic_menu_action(
@@ -2286,6 +2314,173 @@ fn toggle_debug_panel(
         scene_state,
         format!("[menu] {label}: {}", if on { "on" } else { "off" }),
     );
+}
+
+/// Menu actions that take retail's sub-target confirm step before firing
+/// (spells/abilities/weaponskills/items). Everything else (move, equip,
+/// emote, ...) dispatches immediately.
+fn sub_target_action_for(
+    action: ffxi_viewer_core::hud::menu::DynamicMenuAction,
+) -> Option<ffxi_viewer_core::input_mode::SubTargetAction> {
+    use ffxi_viewer_core::hud::menu::DynamicMenuAction as A;
+    use ffxi_viewer_core::input_mode::SubTargetAction as S;
+    match action {
+        A::CastSpell { spell_id } => Some(S::Spell(spell_id)),
+        A::JobAbility { ability_id } | A::PetAbility { ability_id } => Some(S::Ability(ability_id)),
+        A::Weaponskill { skill_id } => Some(S::WeaponSkill(skill_id)),
+        A::UseItem {
+            container,
+            index,
+            item_no,
+        } => Some(S::Item {
+            container,
+            index,
+            item_no,
+        }),
+        _ => None,
+    }
+}
+
+/// Inverse of `sub_target_action_for`, used to fire the pending action once
+/// the sub-target cursor is confirmed. Job vs pet ability collapses to
+/// JobAbility; their dispatch is identical.
+fn dynamic_action_for(
+    action: ffxi_viewer_core::input_mode::SubTargetAction,
+) -> ffxi_viewer_core::hud::menu::DynamicMenuAction {
+    use ffxi_viewer_core::hud::menu::DynamicMenuAction as A;
+    use ffxi_viewer_core::input_mode::SubTargetAction as S;
+    match action {
+        S::Spell(spell_id) => A::CastSpell { spell_id },
+        S::Ability(ability_id) => A::JobAbility { ability_id },
+        S::WeaponSkill(skill_id) => A::Weaponskill { skill_id },
+        S::Item {
+            container,
+            index,
+            item_no,
+        } => A::UseItem {
+            container,
+            index,
+            item_no,
+        },
+    }
+}
+
+/// Per-frame snapshot of targetable entities for sub-target candidate
+/// selection (ffxi-viewer-core::sub_target owns the pure logic).
+fn gather_sub_target_entities(
+    scene_state: &SceneState,
+) -> Vec<ffxi_viewer_core::sub_target::SubTargetEntity> {
+    use ffxi_viewer_wire::EntityKind;
+    let snap = &scene_state.snapshot;
+    let self_id = snap.self_char_id;
+    let self_pos = snap.self_pos.pos;
+    snap.entities
+        .iter()
+        .map(|e| {
+            let dx = e.pos.x - self_pos.x;
+            let dy = e.pos.y - self_pos.y;
+            let dz = e.pos.z - self_pos.z;
+            let is_party = snap.party.iter().any(|m| m.id == e.id);
+            ffxi_viewer_core::sub_target::SubTargetEntity {
+                id: e.id,
+                is_self: Some(e.id) == self_id,
+                is_pc: matches!(e.kind, EntityKind::Pc),
+                is_party,
+                // Alliance membership is not surfaced in the wire snapshot
+                // yet; party covers the common case (kuluu: revisit when
+                // alliance lists land).
+                is_alliance: is_party,
+                is_enemy: matches!(e.kind, EntityKind::Mob),
+                is_npc: matches!(e.kind, EntityKind::Npc),
+                is_dead: e.hp_pct == Some(0),
+                dist_sq: dx * dx + dy * dy + dz * dz,
+            }
+        })
+        .collect()
+}
+
+/// Open the retail sub-target confirm step for `action`. Returns None (stay
+/// in the current mode) when nothing in range qualifies, echoing retail's
+/// refusal line.
+fn open_sub_target(
+    action: ffxi_viewer_core::input_mode::SubTargetAction,
+    current_target: Option<u32>,
+    scene_state: &mut SceneState,
+    return_to: InputMode,
+) -> Option<InputMode> {
+    use ffxi_viewer_core::sub_target;
+    let flags = sub_target::action_flags(action);
+    let ents = gather_sub_target_entities(scene_state);
+    let Some(candidate) = sub_target::initial_candidate(flags, current_target, &ents) else {
+        push_system_chat_line(scene_state, "Unable to see any qualified targets.".into());
+        return None;
+    };
+    let mut st = ffxi_viewer_core::input_mode::SubTargetState::open(action, flags.0, return_to);
+    st.candidate = Some(candidate);
+    Some(InputMode::SubTarget(st))
+}
+
+/// Retail sub-target cursor keys: Tab/arrows cycle valid candidates in
+/// distance order, Enter fires the pending action at the candidate, Esc
+/// returns to the originating menu with its cursor preserved.
+fn handle_sub_target_key(
+    key: &Key,
+    bindings: &Bindings,
+    state: &mut ffxi_viewer_core::input_mode::SubTargetState,
+    scene_state: &mut SceneState,
+    entities: &[ffxi_viewer_wire::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+) -> Option<InputMode> {
+    use ffxi_proto::valid_target::TargetFlags;
+    use ffxi_viewer_core::sub_target;
+
+    let flags = TargetFlags(state.flags);
+    let ents = gather_sub_target_entities(scene_state);
+
+    // Entities move and die while the cursor is up; re-park on the nearest
+    // valid candidate if ours stopped qualifying.
+    if let Some(id) = state.candidate {
+        let still_valid = ents
+            .iter()
+            .any(|e| e.id == id && sub_target::entity_valid(flags, e));
+        if !still_valid {
+            state.candidate = sub_target::initial_candidate(flags, None, &ents);
+        }
+    }
+
+    let forward = bindings.matches_logical(Action::CycleTarget, key)
+        || bindings.matches_logical(Action::NavDown, key)
+        || bindings.matches_logical(Action::NavRight, key);
+    let reverse = bindings.matches_logical(Action::NavUp, key)
+        || bindings.matches_logical(Action::NavLeft, key);
+    if forward || reverse {
+        state.candidate = sub_target::cycle_candidate(flags, state.candidate, &ents, reverse);
+        return None;
+    }
+
+    if bindings.matches_logical(Action::NavConfirm, key)
+        || bindings.matches_logical(Action::ConfirmAction, key)
+    {
+        let Some(id) = state.candidate else {
+            push_system_chat_line(scene_state, "Unable to see any qualified targets.".into());
+            return None;
+        };
+        let self_pos = scene_state.snapshot.self_pos.pos;
+        dispatch_dynamic_menu_action(
+            dynamic_action_for(state.action),
+            Some(id),
+            self_pos,
+            entities,
+            cmd_tx,
+            scene_state,
+        );
+        return Some(InputMode::World);
+    }
+
+    if bindings.matches_logical(Action::NavCancel, key) {
+        return Some((*state.return_to).clone());
+    }
+    None
 }
 
 fn dispatch_dynamic_menu_action(

@@ -51,6 +51,7 @@ pub mod sky_realism;
 pub mod skybox;
 pub mod snapshot;
 pub mod source;
+pub mod sub_target;
 pub mod sun_moon;
 pub mod target_ring;
 #[cfg(not(target_arch = "wasm32"))]
@@ -257,6 +258,7 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
                         nameplate_billboard::update_nameplate_billboards_system,
                         target_ring::draw_target_arrow_system,
                         target_ring::draw_target_ring_system,
+                        target_ring::draw_sub_target_cursor_system,
                         sync_zone_lines_system,
                         atmosphere::apply_zone_atmosphere_system,
                     )
