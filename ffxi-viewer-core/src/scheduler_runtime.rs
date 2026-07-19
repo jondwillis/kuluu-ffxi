@@ -385,6 +385,168 @@ pub fn dispatch_action_started(
     }
 }
 
+pub const EMOTE_ROUTINES_PER_FILE: u16 = 8;
+
+const SALUTE_NATION_MAX: u16 = 2;
+
+fn em_routine(sub: u16) -> [u8; 4] {
+    [
+        b'e',
+        b'm',
+        b'0',
+        b'0' + (sub % EMOTE_ROUTINES_PER_FILE) as u8,
+    ]
+}
+
+/// Emote id → (emote-file offset from the FFXiMain.dll race base, `em0N`
+/// routine). Derived empirically from the retail HumeM emote DATs (dump:
+/// examples/zz-emote-probe.rs; each routine's Motion clip mnemonic names the
+/// emote — bow/poi/sl1-3/kne/lau/wee, den/nod/wav/wel/gla/che/clp, …) and
+/// pinned to XIM's only known points (Actor.kt:1080-1082 HELM: Logging=(5,0),
+/// Mining=(6,0), Harvesting=(7,0) — confirmed by the files' Japanese tool
+/// particles: ono0=axe, turu=pickaxe, kama=sickle). Notable non-uniformities
+/// the old id/8 hypothesis missed: Point/Bow are swapped in file 0, Salute
+/// occupies em02..em04 (one per nation, 0x05A Param = nation), and ids ≥ 6
+/// sit at (id+2)/8 only through id 37. Returns None when no body routine
+/// exists in the era DATs (face-only emotes, id gaps, unmapped job emotes).
+pub fn emote_routine(emote_id: u16, param: u16) -> Option<(u32, [u8; 4])> {
+    match emote_id {
+        0 => Some((0, *b"em01")),
+        1 => Some((0, *b"em00")),
+        2 => Some((0, em_routine(2 + param.min(SALUTE_NATION_MAX)))),
+        3 => Some((0, *b"em05")),
+        4 => Some((0, *b"em06")),
+        5 => Some((0, *b"em07")),
+        6..=37 => {
+            let shifted = emote_id + 2;
+            Some((
+                (shifted / EMOTE_ROUTINES_PER_FILE) as u32,
+                em_routine(shifted % EMOTE_ROUTINES_PER_FILE),
+            ))
+        }
+        // HELM (server-initiated): axe / pickaxe / sickle files.
+        40 => Some((5, *b"em00")),
+        41 => Some((6, *b"em00")),
+        42 => Some((7, *b"em00")),
+        // Hurray variants (xe0..xe6) are weapon-keyed; selection unmapped — em00 default.
+        43 => Some((8, *b"em00")),
+        44 => Some((11, *b"em00")),
+        // Dance1-4 (dc0..dc3).
+        65..=68 => Some((12, em_routine(emote_id - 65))),
+        // Bell-ring motion variants (rx/rs); note→variant selection unmapped.
+        73 => Some((10, *b"em00")),
+        // Aim variants (ye0..ye6) are ranged-weapon-keyed; selection unmapped — em00 default.
+        96 => Some((9, *b"em00")),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn dispatch_entity_emoted(
+    events: Res<crate::snapshot::EventLog>,
+    tracked: Res<crate::scene::TrackedEntities>,
+    q_look: Query<&crate::components::LookComp>,
+    q_children: Query<&Children>,
+    mut q_actors: Query<&mut crate::ffxi_actor_render::FfxiRenderActor>,
+    mut dll_cache: Local<MainDllCache>,
+    mut commands: Commands,
+    mut last_seen: Local<u64>,
+) {
+    use ffxi_proto::map::emote;
+
+    let new_count =
+        (events.pushed_total.saturating_sub(*last_seen)).min(events.recent.len() as u64) as usize;
+    *last_seen = events.pushed_total;
+    if new_count == 0 {
+        return;
+    }
+    for ev in events.recent.iter().rev().take(new_count).rev() {
+        let ffxi_viewer_wire::ViewerEvent::EntityEmoted {
+            actor_id,
+            emote_id,
+            param,
+            mode,
+            ..
+        } = *ev
+        else {
+            continue;
+        };
+        if mode == emote::mode::TEXT {
+            continue;
+        }
+        // Job emotes (MesNum 74..=95) live in a separate per-job file range
+        // not yet mapped (bead kuluu-d4u retail_unknowns) — text only for now.
+        if (emote::JOB_MESNUM_BASE..=emote::JOB_MESNUM_MAX).contains(&emote_id) {
+            continue;
+        }
+        let Some(&actor_entity) = tracked.by_id.get(&actor_id) else {
+            continue;
+        };
+        let Some((file_offset, routine)) = emote_routine(emote_id, param) else {
+            continue;
+        };
+        let race = q_look.get(actor_entity).ok().and_then(|l| look_race(&l.0));
+
+        if let Some(race) = race {
+            if !dll_cache.loaded {
+                dll_cache.loaded = true;
+                if let Ok(root) = ffxi_dat::DatRoot::from_env_or_default() {
+                    dll_cache.dll = ffxi_dat::main_dll::MainDll::load(root.root()).ok();
+                }
+            }
+            let base = dll_cache
+                .dll
+                .as_ref()
+                .and_then(|d| d.base_emote_index(race));
+            if let Some(base) = base {
+                let file_id = base as u32 + file_offset;
+                if let Some(active) = load_emote_scheduler(file_id, &routine) {
+                    commands
+                        .entity(actor_entity)
+                        .try_insert(active.0)
+                        .try_insert(active.1);
+                    continue;
+                }
+            }
+        }
+
+        // NPC casters (lua sendEmote) and PCs whose emote DAT failed to load:
+        // play the actor's own em0N clip when it has one; silent no-op
+        // otherwise (XIM findLocalAnimationRoutine, Actor.kt:695-697).
+        let clip = ffxi_dat::datid::DatId::from_name(&routine);
+        let Ok(children) = q_children.get(actor_entity) else {
+            continue;
+        };
+        for &child in children {
+            if let Ok(mut actor) = q_actors.get_mut(child) {
+                actor.begin_completion_motion(
+                    clip,
+                    crate::ffxi_actor_render::CompletionMotion {
+                        local_clips: &[],
+                        duration_frames: 0.0,
+                        max_loops: 1,
+                        transition_in: 0,
+                        transition_out: 0,
+                    },
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_emote_scheduler(
+    file_id: u32,
+    routine: &[u8; 4],
+) -> Option<(ActiveScheduler, ActionAssets)> {
+    let root = ffxi_dat::DatRoot::from_env_or_default().ok()?;
+    let loc = root.resolve(file_id).ok()?;
+    let bytes = std::fs::read(loc.path_under(root.root())).ok()?;
+    let (schedulers, assets) = parse_action_bytes(&bytes);
+    let active = ActiveScheduler::from_main(&schedulers, routine)?;
+    Some((active, assets))
+}
+
 pub struct SchedulerRuntimePlugin;
 
 impl Plugin for SchedulerRuntimePlugin {
@@ -399,6 +561,8 @@ impl Plugin for SchedulerRuntimePlugin {
                 Update,
                 (
                     dispatch_action_started,
+                    dispatch_entity_emoted,
+                    crate::particle_sim::spawn_actor_auto_run_particles,
                     crate::particle_sim::spawn_particle_generators,
                     crate::particle_sim::tick_particle_simulator,
                     crate::particle_sim::sync_particle_meshes,
@@ -481,6 +645,108 @@ mod tests {
         let a = ActiveScheduler::from_scheduler(&sched);
         assert!(a.finished());
         assert_eq!(a.last_frame(), 0);
+    }
+
+    /// End-to-end against the installed retail DATs (skips without them):
+    /// /bow on a HumeM resolves to a routine whose Motion fires at frame 0
+    /// with the bow? clip, and the file's assets carry the matching clips —
+    /// the two defects that made emotes play the wrong clip 5s late.
+    #[test]
+    fn real_dat_bow_routine_fires_bow_clip_at_frame_zero() {
+        let Ok(root) = ffxi_dat::DatRoot::from_env_or_default() else {
+            return;
+        };
+        let Ok(dll) = ffxi_dat::main_dll::MainDll::load(root.root()) else {
+            return;
+        };
+        let base = dll.base_emote_index(1).expect("HumeM emote base") as u32;
+        let (offset, routine) = emote_routine(1, 0).expect("bow is mapped");
+        let loc = root.resolve(base + offset).expect("emote file resolves");
+        let bytes = std::fs::read(loc.path_under(root.root())).expect("emote DAT readable");
+        let (schedulers, assets) = parse_action_bytes(&bytes);
+        let active = ActiveScheduler::from_main(&schedulers, &routine).expect("em00 exists");
+        let motion = active
+            .stages
+            .iter()
+            .find(|t| t.stage.kind == StageKind::Motion)
+            .expect("bow routine has a Motion stage");
+        assert_eq!(motion.frame, 0, "bow motion fires immediately");
+        assert_eq!(&motion.stage.id, b"bow?");
+        let clip_id = ffxi_dat::datid::DatId::from_name(&motion.stage.id);
+        assert!(
+            assets
+                .animations
+                .iter()
+                .any(|a| a.id.parameterized_match(&clip_id)),
+            "emote file carries bow clips matching the parameterized id"
+        );
+    }
+
+    /// Pins the empirically-derived emote table against the DAT dump
+    /// (examples/zz-emote-probe.rs clip mnemonics) and the XIM HELM points
+    /// (Actor.kt:1080-1082). Point/Bow swap and Salute nation variants are
+    /// the file-0 irregularities the old id/8 hypothesis got wrong.
+    #[test]
+    fn emote_table_matches_dat_clip_mnemonics() {
+        assert_eq!(emote_routine(1, 0), Some((0, *b"em00")), "bow → bow? clip");
+        assert_eq!(
+            emote_routine(0, 0),
+            Some((0, *b"em01")),
+            "point → poi? clip"
+        );
+        assert_eq!(
+            emote_routine(2, 0),
+            Some((0, *b"em02")),
+            "salute san d'oria → sl1?"
+        );
+        assert_eq!(
+            emote_routine(2, 2),
+            Some((0, *b"em04")),
+            "salute windurst → sl3?"
+        );
+        assert_eq!(
+            emote_routine(2, 9),
+            Some((0, *b"em04")),
+            "salute clamps unknown nations"
+        );
+        assert_eq!(emote_routine(3, 0), Some((0, *b"em05")), "kneel → kne?");
+        assert_eq!(emote_routine(5, 0), Some((0, *b"em07")), "cry → wee?");
+        assert_eq!(emote_routine(6, 0), Some((1, *b"em00")), "no → den?");
+        assert_eq!(emote_routine(8, 0), Some((1, *b"em02")), "wave → wav?");
+        assert_eq!(
+            emote_routine(9, 0),
+            Some((1, *b"em03")),
+            "goodbye → wav? (second)"
+        );
+        assert_eq!(emote_routine(13, 0), Some((1, *b"em07")), "clap → clp?");
+        assert_eq!(emote_routine(32, 0), Some((4, *b"em02")), "think → thk?");
+        assert_eq!(emote_routine(36, 0), Some((4, *b"em06")), "psych → gut?");
+        assert_eq!(emote_routine(37, 0), Some((4, *b"em07")));
+        assert_eq!(
+            emote_routine(40, 0),
+            Some((5, *b"em00")),
+            "logging → ono0 axe (XIM 5,0)"
+        );
+        assert_eq!(
+            emote_routine(41, 0),
+            Some((6, *b"em00")),
+            "excavation → turu pickaxe (XIM 6,0)"
+        );
+        assert_eq!(
+            emote_routine(42, 0),
+            Some((7, *b"em00")),
+            "harvesting → kama sickle (XIM 7,0)"
+        );
+        assert_eq!(emote_routine(44, 0), Some((11, *b"em00")), "toss → tos?");
+        assert_eq!(emote_routine(65, 0), Some((12, *b"em00")), "dance1 → dc0?");
+        assert_eq!(emote_routine(68, 0), Some((12, *b"em03")), "dance4 → dc3?");
+        assert_eq!(
+            emote_routine(38, 0),
+            None,
+            "shocked has no body routine in the era DATs"
+        );
+        assert_eq!(emote_routine(39, 0), None, "id gap");
+        assert_eq!(emote_routine(45, 0), None, "id gap");
     }
 
     #[test]

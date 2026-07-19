@@ -106,7 +106,11 @@ impl Scheduler {
                     } else {
                         (0, 0, 0)
                     };
-                running_frame = running_frame.saturating_add(delay as u32);
+                // research/xim EffectRoutineInstance.kt runEffects: `storedFrames -=
+                // head.delay` happens as each effect is popped and run, so a stage's
+                // delay gates the stages AFTER it — never itself. Fire frame is the
+                // sum of PRIOR delays (first stage always fires at 0: a lone Motion
+                // with delay 152, e.g. the emote bow routine, plays immediately).
                 stages.push(TimedStage {
                     frame: running_frame,
                     stage: SchedulerStage {
@@ -120,6 +124,7 @@ impl Scheduler {
                         transition_out,
                     },
                 });
+                running_frame = running_frame.saturating_add(delay as u32);
             }
             cursor += stage_bytes;
         }
@@ -201,27 +206,49 @@ mod tests {
         let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
 
         body.extend_from_slice(&[0x05, 0x03, 0, 0]);
-        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&30u16.to_le_bytes());
         body.extend_from_slice(&20u16.to_le_bytes());
         body.extend_from_slice(b"mot0");
 
         body.extend_from_slice(&[0x53, 0x03, 0, 0]);
-        body.extend_from_slice(&30u16.to_le_bytes());
+        body.extend_from_slice(&15u16.to_le_bytes());
         body.extend_from_slice(&1u16.to_le_bytes());
         body.extend_from_slice(b"snd0");
 
         let s = Scheduler::parse(*b"sdam", &body).unwrap();
         assert_eq!(s.stages.len(), 2);
         assert_eq!(s.stages[0].stage.kind, StageKind::Motion);
-        assert_eq!(s.stages[0].frame, 0);
+        assert_eq!(
+            s.stages[0].frame, 0,
+            "first stage fires at 0 despite its own delay"
+        );
+        assert_eq!(s.stages[0].stage.delay_frames, 30);
         assert_eq!(s.stages[1].stage.kind, StageKind::SoundOnCaster);
-        assert_eq!(s.stages[1].frame, 30);
+        assert_eq!(
+            s.stages[1].frame, 30,
+            "second stage fires after the first stage's delay"
+        );
         assert_eq!(&s.stages[1].stage.id, b"snd0");
 
         let snd: Vec<_> = s.sound_events().collect();
         assert_eq!(snd.len(), 1);
         assert!(snd[0].on_caster);
         assert_eq!(snd[0].frame, 30);
+    }
+
+    /// A lone Motion stage with a large delay (the emote-DAT shape, e.g. HumeM
+    /// bow = `Motion delay=152`) fires at frame 0 — the delay only pads the
+    /// routine tail (research/xim EffectRoutineInstance.kt runEffects).
+    #[test]
+    fn lone_delayed_motion_fires_immediately() {
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend_from_slice(&[0x05, 0x03, 0, 0]);
+        body.extend_from_slice(&152u16.to_le_bytes());
+        body.extend_from_slice(&152u16.to_le_bytes());
+        body.extend_from_slice(b"bow?");
+        let s = Scheduler::parse(*b"em00", &body).unwrap();
+        assert_eq!(s.stages[0].frame, 0);
+        assert_eq!(s.stages[0].stage.duration_frames, 152);
     }
 
     #[test]
