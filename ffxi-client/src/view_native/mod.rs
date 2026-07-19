@@ -570,7 +570,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         Update,
         collision_bvh::build_zone_collision_bvh_system
             .before(camera_collision::clamp_chase_camera_to_collision)
-            .run_if(in_state(AppPhase::InGame)),
+            .run_if(in_state(AppPhase::InGame).or_else(in_state(AppPhase::Launcher))),
     );
     app.add_systems(
         Update,

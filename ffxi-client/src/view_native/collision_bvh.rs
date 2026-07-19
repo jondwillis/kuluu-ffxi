@@ -329,13 +329,29 @@ pub fn build_collision_bvh_system(
     }
 }
 
+const BVH_REBUILD_QUIET_SECS: f32 = 1.0;
+
 pub fn build_zone_collision_bvh_system(
     geom: Res<MzbCollisionGeometry>,
     mut zone_bvh: ResMut<ZoneCollisionBvh>,
+    time: Res<Time>,
+    mut debounce: Local<Option<f32>>,
 ) {
-    if !geom.is_changed() {
+    // Zone geometry streams in chunk-by-chunk; rebuilding the full BVH on
+    // every chunk stalls the main thread for the whole load. Wait until the
+    // geometry has been quiet before building once.
+    if geom.is_changed() {
+        *debounce = Some(0.0);
         return;
     }
+    let Some(quiet) = debounce.as_mut() else {
+        return;
+    };
+    *quiet += time.delta_secs();
+    if *quiet < BVH_REBUILD_QUIET_SECS {
+        return;
+    }
+    *debounce = None;
     if geom.indices.is_empty() {
         zone_bvh.0 = None;
         return;
