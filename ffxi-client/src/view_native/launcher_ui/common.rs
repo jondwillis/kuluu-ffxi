@@ -1,8 +1,10 @@
 use bevy::ecs::spawn::Spawn;
 use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::input_focus::tab_navigation::TabGroup;
 use bevy::prelude::*;
+use bevy::ui::{ComputedNode, ScrollPosition};
 use bevy::ui_widgets::Activate;
 
 use super::{LauncherState, ServerInfo};
@@ -46,10 +48,12 @@ const PANEL_ROW_GAP: f32 = 12.0;
 const PANEL_PADDING: f32 = 24.0;
 const PANEL_BORDER: f32 = 1.0;
 const PANEL_RADIUS: f32 = 6.0;
+const SCREEN_EDGE_PADDING: f32 = 16.0;
 
 fn panel_layout(width_px: f32) -> Node {
     Node {
         width: Val::Px(width_px),
+        max_width: Val::Percent(100.0),
         flex_direction: FlexDirection::Column,
         align_items: AlignItems::Stretch,
         justify_content: JustifyContent::FlexStart,
@@ -92,6 +96,7 @@ pub(super) fn screen_root() -> impl Bundle {
         flex_direction: FlexDirection::Column,
         justify_content: JustifyContent::Center,
         align_items: AlignItems::Center,
+        padding: UiRect::all(Val::Px(SCREEN_EDGE_PADDING)),
         ..default()
     }
 }
@@ -131,8 +136,11 @@ pub(super) fn spawn_breadcrumb(
     parent
         .spawn(Node {
             flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::Wrap,
             align_items: AlignItems::Center,
+            max_width: Val::Percent(100.0),
             column_gap: Val::Px(6.0),
+            row_gap: Val::Px(4.0),
             padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
             margin: UiRect::bottom(Val::Px(12.0)),
             border: UiRect::all(Val::Px(1.0)),
@@ -229,9 +237,63 @@ pub(super) fn row() -> impl Bundle {
     Node {
         width: Val::Percent(100.0),
         flex_direction: FlexDirection::Row,
+        flex_wrap: FlexWrap::Wrap,
         column_gap: Val::Px(8.0),
+        row_gap: Val::Px(8.0),
         align_items: AlignItems::Center,
         ..default()
+    }
+}
+
+/// Visually attaches a value button and its companion action (e.g. a `×`
+/// remove button) into one bordered unit, and refuses to shrink so a wrapping
+/// parent moves the whole chip to the next line instead of squishing it.
+pub(super) fn chip_group() -> impl Bundle {
+    (
+        Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(2.0),
+            padding: UiRect::all(Val::Px(2.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(PANEL_RADIUS)),
+            flex_shrink: 0.0,
+            ..default()
+        },
+        BorderColor::all(Color::srgb(0.28, 0.28, 0.33)),
+        BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.04)),
+    )
+}
+
+/// Marks a `ScrollPosition` node whose wheel scrolling is handled by
+/// [`scroll_region_wheel_system`].
+#[derive(Component)]
+pub(super) struct ScrollRegion;
+
+const SCROLL_LINE_PX: f32 = 28.0;
+
+/// Scroll any visible [`ScrollRegion`] with the mouse wheel, clamped to its
+/// content so it never over- or under-scrolls. Bevy clamps the *rendered*
+/// offset but not the [`ScrollPosition`] component, so we clamp it here
+/// against [`ComputedNode`].
+pub(super) fn scroll_region_wheel_system(
+    mut wheel: MessageReader<MouseWheel>,
+    mut regions: Query<(&mut ScrollPosition, &ComputedNode), With<ScrollRegion>>,
+) {
+    let mut delta = 0.0;
+    for ev in wheel.read() {
+        delta += match ev.unit {
+            MouseScrollUnit::Line => ev.y * SCROLL_LINE_PX,
+            MouseScrollUnit::Pixel => ev.y,
+        };
+    }
+    if delta == 0.0 {
+        return;
+    }
+    for (mut scroll, node) in regions.iter_mut() {
+        let max = (node.content_size.y - node.size.y + node.scrollbar_size.y).max(0.0)
+            * node.inverse_scale_factor;
+        scroll.0.y = (scroll.0.y - delta).clamp(0.0, max);
     }
 }
 

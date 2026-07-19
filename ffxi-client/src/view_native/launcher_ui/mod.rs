@@ -594,7 +594,12 @@ pub(crate) fn register(
 
     app.add_systems(
         Update,
-        (sync_window_title, common::update_server_chips).run_if(in_state(AppPhase::Launcher)),
+        (
+            sync_window_title,
+            common::update_server_chips,
+            common::scroll_region_wheel_system,
+        )
+            .run_if(in_state(AppPhase::Launcher)),
     );
 
     app.add_systems(OnEnter(AppPhase::Launcher), restore_login_error_on_reentry);
@@ -665,7 +670,6 @@ pub(crate) fn register(
                 graphics::keyboard_input_system,
                 graphics::redraw_graphics_system,
                 graphics::redraw_advanced_visibility,
-                graphics::scroll_list_system,
                 graphics::update_scrollbar_visibility,
             )
                 .run_if(in_state(LauncherState::Graphics)),

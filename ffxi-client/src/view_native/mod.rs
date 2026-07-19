@@ -239,10 +239,19 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     } else {
         bevy::window::WindowMode::Windowed
     };
+    // FFXI_WINDOW_SIZE=WxH overrides the initial window size — lets scripted
+    // verification exercise responsive layouts without OS-level window control.
+    let resolution = std::env::var("FFXI_WINDOW_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
+        })
+        .unwrap_or((1280, 800));
     let mut plugins = DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: format!("ffxi-client — {server}"),
-            resolution: (1280u32, 800u32).into(),
+            resolution: resolution.into(),
             mode: window_mode,
             ..default()
         }),

@@ -385,125 +385,6 @@ pub fn dispatch_action_started(
     }
 }
 
-pub const EMOTE_ROUTINES_PER_FILE: u16 = 8;
-
-/// Emote id → (emote-file offset, `em0N` routine name). HYPOTHESIS
-/// (bead kuluu-d4u retail_unknowns): file = id/8, routine = em0(id%8). Grounded
-/// in XIM Actor.kt:674-693 playEmote (file = race base + mainId, routine
-/// `em0{subId}`) with HELM Logging id 40 → (5, em00), and in retail HumeM emote
-/// DATs (base..base+12, ROM/32/40…) each holding exactly em00..em07. Every
-/// call site must stay on this one function until retail verification.
-pub fn emote_file_offset_and_routine(emote_id: u16) -> (u32, [u8; 4]) {
-    let sub = (emote_id % EMOTE_ROUTINES_PER_FILE) as u8;
-    (
-        (emote_id / EMOTE_ROUTINES_PER_FILE) as u32,
-        [b'e', b'm', b'0', b'0' + sub],
-    )
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn dispatch_entity_emoted(
-    events: Res<crate::snapshot::EventLog>,
-    tracked: Res<crate::scene::TrackedEntities>,
-    q_look: Query<&crate::components::LookComp>,
-    q_children: Query<&Children>,
-    mut q_actors: Query<&mut crate::ffxi_actor_render::FfxiRenderActor>,
-    mut dll_cache: Local<MainDllCache>,
-    mut commands: Commands,
-    mut last_seen: Local<u64>,
-) {
-    use ffxi_proto::map::emote;
-
-    let new_count =
-        (events.pushed_total.saturating_sub(*last_seen)).min(events.recent.len() as u64) as usize;
-    *last_seen = events.pushed_total;
-    if new_count == 0 {
-        return;
-    }
-    for ev in events.recent.iter().rev().take(new_count).rev() {
-        let ffxi_viewer_wire::ViewerEvent::EntityEmoted {
-            actor_id,
-            emote_id,
-            mode,
-            ..
-        } = *ev
-        else {
-            continue;
-        };
-        if mode == emote::mode::TEXT {
-            continue;
-        }
-        // Job emotes (MesNum 74..=95) live in a separate per-job file range
-        // not yet mapped (bead kuluu-d4u retail_unknowns) — text only for now.
-        if (emote::JOB_MESNUM_BASE..=emote::JOB_MESNUM_MAX).contains(&emote_id) {
-            continue;
-        }
-        let Some(&actor_entity) = tracked.by_id.get(&actor_id) else {
-            continue;
-        };
-        let (file_offset, routine) = emote_file_offset_and_routine(emote_id);
-        let race = q_look.get(actor_entity).ok().and_then(|l| look_race(&l.0));
-
-        if let Some(race) = race {
-            if !dll_cache.loaded {
-                dll_cache.loaded = true;
-                if let Ok(root) = ffxi_dat::DatRoot::from_env_or_default() {
-                    dll_cache.dll = ffxi_dat::main_dll::MainDll::load(root.root()).ok();
-                }
-            }
-            let base = dll_cache
-                .dll
-                .as_ref()
-                .and_then(|d| d.base_emote_index(race));
-            if let Some(base) = base {
-                let file_id = base as u32 + file_offset;
-                if let Some(active) = load_emote_scheduler(file_id, &routine) {
-                    commands
-                        .entity(actor_entity)
-                        .try_insert(active.0)
-                        .try_insert(active.1);
-                    continue;
-                }
-            }
-        }
-
-        // NPC casters (lua sendEmote) and PCs whose emote DAT failed to load:
-        // play the actor's own em0N clip when it has one; silent no-op
-        // otherwise (XIM findLocalAnimationRoutine, Actor.kt:695-697).
-        let clip = ffxi_dat::datid::DatId::from_name(&routine);
-        let Ok(children) = q_children.get(actor_entity) else {
-            continue;
-        };
-        for &child in children {
-            if let Ok(mut actor) = q_actors.get_mut(child) {
-                actor.begin_completion_motion(
-                    clip,
-                    crate::ffxi_actor_render::CompletionMotion {
-                        local_clips: &[],
-                        duration_frames: 0.0,
-                        max_loops: 1,
-                        transition_in: 0,
-                        transition_out: 0,
-                    },
-                );
-            }
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn load_emote_scheduler(
-    file_id: u32,
-    routine: &[u8; 4],
-) -> Option<(ActiveScheduler, ActionAssets)> {
-    let root = ffxi_dat::DatRoot::from_env_or_default().ok()?;
-    let loc = root.resolve(file_id).ok()?;
-    let bytes = std::fs::read(loc.path_under(root.root())).ok()?;
-    let (schedulers, assets) = parse_action_bytes(&bytes);
-    let active = ActiveScheduler::from_main(&schedulers, routine)?;
-    Some((active, assets))
-}
-
 pub struct SchedulerRuntimePlugin;
 
 impl Plugin for SchedulerRuntimePlugin {
@@ -518,7 +399,6 @@ impl Plugin for SchedulerRuntimePlugin {
                 Update,
                 (
                     dispatch_action_started,
-                    dispatch_entity_emoted,
                     crate::particle_sim::spawn_particle_generators,
                     crate::particle_sim::tick_particle_simulator,
                     crate::particle_sim::sync_particle_meshes,
@@ -601,20 +481,6 @@ mod tests {
         let a = ActiveScheduler::from_scheduler(&sched);
         assert!(a.finished());
         assert_eq!(a.last_frame(), 0);
-    }
-
-    /// Pins the emote-mapping hypothesis at its only verified point — XIM
-    /// HELM Logging id 40 → file offset 5, routine em00 — plus the shape of
-    /// the division/modulo split across the id space.
-    #[test]
-    fn emote_mapping_hypothesis_pins_xim_helm_point() {
-        assert_eq!(emote_file_offset_and_routine(40), (5, *b"em00"));
-        assert_eq!(emote_file_offset_and_routine(0), (0, *b"em00"));
-        assert_eq!(emote_file_offset_and_routine(8), (1, *b"em00"));
-        assert_eq!(emote_file_offset_and_routine(31), (3, *b"em07"));
-        assert_eq!(emote_file_offset_and_routine(65), (8, *b"em01"));
-        assert_eq!(emote_file_offset_and_routine(73), (9, *b"em01"));
-        assert_eq!(emote_file_offset_and_routine(96), (12, *b"em00"));
     }
 
     #[test]

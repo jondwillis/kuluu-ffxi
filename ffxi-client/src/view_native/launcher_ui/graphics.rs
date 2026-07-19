@@ -2,7 +2,6 @@ use bevy::ecs::spawn::Spawn;
 use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
-use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui::{ComputedNode, Overflow, ScrollPosition};
@@ -10,7 +9,9 @@ use bevy::ui_widgets::{Activate, ControlOrientation, Scrollbar, ScrollbarThumb};
 
 use ffxi_viewer_core::{GraphicsField, GraphicsSettings, GRAPHICS_FIELDS};
 
-use super::common::{hint, panel_node_capped, row, screen_root, spawn_breadcrumb, title, Crumb};
+use super::common::{
+    hint, panel_node_capped, row, screen_root, spawn_breadcrumb, title, Crumb, ScrollRegion,
+};
 use super::{LauncherState, ServerInfo};
 
 /// Compact metrics for the graphics list. [`LABEL_WIDTH`]/[`ROW_FONT_SIZE`] are
@@ -27,9 +28,6 @@ const PANEL_WIDTH: f32 = 432.0;
 /// inside it instead of spilling off the top and bottom of the window.
 const PANEL_MAX_VH: f32 = 90.0;
 
-/// Logical pixels the list scrolls per mouse-wheel line notch.
-const SCROLL_LINE_PX: f32 = 28.0;
-
 /// Width of the scrollbar track/thumb reserved to the right of the list.
 const SCROLLBAR_WIDTH: f32 = 6.0;
 /// Shortest the thumb shrinks to on a long list, so it stays grabbable.
@@ -41,7 +39,8 @@ const SCROLLBAR_THUMB_COLOR: Color = Color::srgba(0.62, 0.62, 0.68, 0.9);
 pub(super) struct GraphicsRoot;
 
 /// The `Overflow::scroll_y` region holding the settings rows; scrolled by
-/// [`scroll_list_system`] while the title/hint/footer stay pinned.
+/// the shared [`ScrollRegion`] wheel system while the title/hint/footer stay
+/// pinned.
 #[derive(Component)]
 pub(super) struct GraphicsScrollList;
 
@@ -115,6 +114,7 @@ pub(super) fn spawn_ui(
                                         ..default()
                                     },
                                     ScrollPosition::default(),
+                                    ScrollRegion,
                                 ))
                                 .with_children(|list| {
                                     for &field in
@@ -342,30 +342,6 @@ pub(super) fn redraw_advanced_visibility(
         if text.0 != want {
             text.0 = want.to_string();
         }
-    }
-}
-
-/// Scroll the settings list with the mouse wheel, clamped to its content so it
-/// never over- or under-scrolls. Bevy clamps the *rendered* offset but not the
-/// [`ScrollPosition`] component, so we clamp it here against [`ComputedNode`].
-pub(super) fn scroll_list_system(
-    mut wheel: MessageReader<MouseWheel>,
-    mut lists: Query<(&mut ScrollPosition, &ComputedNode), With<GraphicsScrollList>>,
-) {
-    let mut delta = 0.0;
-    for ev in wheel.read() {
-        delta += match ev.unit {
-            MouseScrollUnit::Line => ev.y * SCROLL_LINE_PX,
-            MouseScrollUnit::Pixel => ev.y,
-        };
-    }
-    if delta == 0.0 {
-        return;
-    }
-    for (mut scroll, node) in lists.iter_mut() {
-        let max = (node.content_size.y - node.size.y + node.scrollbar_size.y).max(0.0)
-            * node.inverse_scale_factor;
-        scroll.0.y = (scroll.0.y - delta).clamp(0.0, max);
     }
 }
 

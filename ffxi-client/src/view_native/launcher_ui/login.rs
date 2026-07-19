@@ -4,14 +4,15 @@ use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
-use bevy::ui::Checked;
+use bevy::ui::{Checked, Overflow, ScrollPosition};
 use bevy::ui_widgets::{Activate, ValueChange};
 
 use ffxi_client::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
 use ffxi_client::secret_store::SecretStore;
 
 use super::common::{
-    hint, panel_node, row, screen_root, spawn_breadcrumb, spawn_close_titlebar, Crumb,
+    chip_group, hint, panel_node, row, screen_root, spawn_breadcrumb, spawn_close_titlebar, Crumb,
+    ScrollRegion,
 };
 use super::server_version_check::{ServerVersionStatus, VersionViolation};
 use super::{
@@ -204,111 +205,137 @@ fn spawn_saved_accounts_row(
         return;
     }
 
+    // Roughly three wrapped chip rows; more accounts scroll inside the region.
+    const SAVED_ACCOUNTS_MAX_HEIGHT: f32 = 110.0;
+
     panel.spawn(hint("Saved accounts on this server:"));
-    panel.spawn(row()).with_children(|r| {
-        for (u, remember) in accts.iter() {
-            let label = if *remember {
-                format!("{u}  [saved]")
-            } else {
-                u.clone()
-            };
-            let is_active = u == active_user;
-            let variant = if is_active {
-                ButtonVariant::Primary
-            } else {
-                ButtonVariant::Normal
-            };
-            let pick_user = u.clone();
-            let pick_server = server_key.to_string();
-            let pick_remember = *remember;
+    panel
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                flex_wrap: FlexWrap::Wrap,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(6.0),
+                row_gap: Val::Px(6.0),
+                max_height: Val::Px(SAVED_ACCOUNTS_MAX_HEIGHT),
+                overflow: Overflow::scroll_y(),
+                ..default()
+            },
+            ScrollPosition::default(),
+            ScrollRegion,
+        ))
+        .with_children(|r| {
+            for (u, remember) in accts.iter() {
+                let label = if *remember {
+                    format!("{u}  [saved]")
+                } else {
+                    u.clone()
+                };
+                let is_active = u == active_user;
+                let variant = if is_active {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Normal
+                };
+                let pick_user = u.clone();
+                let pick_server = server_key.to_string();
+                let pick_remember = *remember;
 
-            r.spawn(button_bundle(
-                ButtonBundleProps {
-                    variant,
-                    ..default()
-                },
-                (),
-                Spawn((Text::new(label), ThemedText)),
-            ))
-            .observe(
-                move |_ev: On<Activate>,
-                      mut login: ResMut<LoginForm>,
-                      mut dirty: ResMut<LoginUiDirty>| {
-                    login.user = pick_user.clone();
-                    login.pass.clear();
-                    login.remember_password = pick_remember;
-                    if pick_remember {
-                        if let Some(pw) = SecretStore::get(
-                            KEYRING_SERVICE,
-                            &keyring_account_key(&pick_server, &pick_user),
-                        ) {
-                            login.pass = pw;
-                        }
-                    }
-                    login.focus = if login.pass.is_empty() {
-                        LoginField::Password
-                    } else {
-                        LoginField::User
-                    };
+                let forget_user = u.clone();
+                let forget_server = server_key.to_string();
 
-                    dirty.0 = true;
-                },
-            );
+                r.spawn(chip_group()).with_children(|chip| {
+                    chip.spawn(button_bundle(
+                        ButtonBundleProps {
+                            variant,
+                            ..default()
+                        },
+                        (),
+                        Spawn((Text::new(label), ThemedText)),
+                    ))
+                    .observe(
+                        move |_ev: On<Activate>,
+                              mut login: ResMut<LoginForm>,
+                              mut dirty: ResMut<LoginUiDirty>| {
+                            login.user = pick_user.clone();
+                            login.pass.clear();
+                            login.remember_password = pick_remember;
+                            if pick_remember {
+                                if let Some(pw) = SecretStore::get(
+                                    KEYRING_SERVICE,
+                                    &keyring_account_key(&pick_server, &pick_user),
+                                ) {
+                                    login.pass = pw;
+                                }
+                            }
+                            login.focus = if login.pass.is_empty() {
+                                LoginField::Password
+                            } else {
+                                LoginField::User
+                            };
 
-            let forget_user = u.clone();
-            let forget_server = server_key.to_string();
-            r.spawn(button_bundle(
-                ButtonBundleProps::default(),
-                (),
-                Spawn((Text::new("×"), ThemedText)),
-            ))
-            .observe(
-                move |_ev: On<Activate>,
-                      mut login: ResMut<LoginForm>,
-                      mut dirty: ResMut<LoginUiDirty>| {
-                    let mut store = launcher_store::load();
-                    store
-                        .accounts
-                        .retain(|a| !(a.server_name == forget_server && a.username == forget_user));
-                    if let Some((s, u)) = &store.last_used {
-                        if *s == forget_server && *u == forget_user {
-                            store.last_used = None;
-                        }
-                    }
-                    if let Err(e) = launcher_store::save(&store) {
-                        tracing::warn!(error = %e, "launcher_store: save failed");
-                    }
-                    SecretStore::delete(
-                        KEYRING_SERVICE,
-                        &keyring_account_key(&forget_server, &forget_user),
+                            dirty.0 = true;
+                        },
                     );
 
-                    if login.user == forget_user {
+                    chip.spawn(button_bundle(
+                        ButtonBundleProps::default(),
+                        (),
+                        Spawn((Text::new("×"), ThemedText)),
+                    ))
+                    .observe(
+                        move |_ev: On<Activate>,
+                              mut login: ResMut<LoginForm>,
+                              mut dirty: ResMut<LoginUiDirty>| {
+                            let mut store = launcher_store::load();
+                            store.accounts.retain(|a| {
+                                !(a.server_name == forget_server && a.username == forget_user)
+                            });
+                            if let Some((s, u)) = &store.last_used {
+                                if *s == forget_server && *u == forget_user {
+                                    store.last_used = None;
+                                }
+                            }
+                            if let Err(e) = launcher_store::save(&store) {
+                                tracing::warn!(error = %e, "launcher_store: save failed");
+                            }
+                            SecretStore::delete(
+                                KEYRING_SERVICE,
+                                &keyring_account_key(&forget_server, &forget_user),
+                            );
+
+                            if login.user == forget_user {
+                                login.user.clear();
+                                login.pass.clear();
+                                login.remember_password = false;
+                                login.focus = LoginField::User;
+                            }
+                            dirty.0 = true;
+                        },
+                    );
+                });
+            }
+
+            r.spawn(chip_group()).with_children(|chip| {
+                chip.spawn(button_bundle(
+                    ButtonBundleProps::default(),
+                    (),
+                    Spawn((Text::new("+"), ThemedText)),
+                ))
+                .observe(
+                    |_ev: On<Activate>,
+                     mut login: ResMut<LoginForm>,
+                     mut dirty: ResMut<LoginUiDirty>| {
                         login.user.clear();
                         login.pass.clear();
                         login.remember_password = false;
                         login.focus = LoginField::User;
-                    }
-                    dirty.0 = true;
-                },
-            );
-        }
-
-        r.spawn(button_bundle(
-            ButtonBundleProps::default(),
-            (),
-            Spawn((Text::new("+ New"), ThemedText)),
-        ))
-        .observe(
-            |_ev: On<Activate>, mut login: ResMut<LoginForm>, mut dirty: ResMut<LoginUiDirty>| {
-                login.user.clear();
-                login.pass.clear();
-                login.remember_password = false;
-                login.focus = LoginField::User;
-                dirty.0 = true;
-            },
-        );
-    });
+                        dirty.0 = true;
+                    },
+                );
+            });
+        });
 }
 
 fn spawn_version_banner(panel: &mut ChildSpawnerCommands, version: &ServerVersionStatus) {
