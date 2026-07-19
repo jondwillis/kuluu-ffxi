@@ -153,6 +153,17 @@ impl DialogSession {
     ///
     /// [`active_end`]: Self::active_end
     pub fn advance(&mut self, choice: Option<u32>) -> Advance {
+        self.drive(|runner, strings| runner.advance(choice, strings))
+    }
+
+    /// Cancel the in-progress event from any frame (the Esc path): the VM
+    /// reports the frame's cancel result and ends with
+    /// [`ffxi_event::EVENT_CANCELLED_END_PARA`].
+    pub fn cancel(&mut self) -> Advance {
+        self.drive(|runner, strings| runner.cancel(strings))
+    }
+
+    fn drive(&mut self, step: impl FnOnce(&mut DialogRunner, &StringDat) -> DialogStep) -> Advance {
         let (Some(strings), Some(runner), Some(active)) = (
             self.strings.as_ref(),
             self.runner.as_mut(),
@@ -161,7 +172,7 @@ impl DialogSession {
             self.clear();
             return Advance::Ended { end_para: 0 };
         };
-        match runner.advance(choice, strings) {
+        match step(runner, strings) {
             DialogStep::Frame(frame) => {
                 let dialog = frame_to_dialog(active, frame, &self.player_name);
                 Advance::Frame(dialog)

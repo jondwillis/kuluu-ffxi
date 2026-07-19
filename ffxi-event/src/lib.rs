@@ -17,5 +17,5 @@ pub mod opcode_meta;
 pub mod runner;
 pub mod vm;
 
-pub use runner::{clean_display, DialogFrame, DialogRunner, DialogStep};
+pub use runner::{clean_display, DialogFrame, DialogRunner, DialogStep, EVENT_CANCELLED_END_PARA};
 pub use vm::{EventChoice, EventMessage, EventVm, StepResult};

@@ -50,18 +50,18 @@ pub enum StepResult {
     Unimplemented(u8),
 }
 
-const OP_END: u8 = 0x00;
+pub(crate) const OP_END: u8 = 0x00;
 const OP_GOTO: u8 = 0x01;
 const OP_IF: u8 = 0x02;
 const OP_GET_STORE: u8 = 0x03;
 const OP_WAIT: u8 = 0x1C;
 const OP_JUMP: u8 = 0x1A;
 const OP_RETURN: u8 = 0x1B;
-const OP_MESSAGE: u8 = 0x1D;
+pub(crate) const OP_MESSAGE: u8 = 0x1D;
 const OP_EXECEND: u8 = 0x21;
-const OP_MESWAIT: u8 = 0x23;
-const OP_QUERY: u8 = 0x24;
-const OP_QUERYWAIT: u8 = 0x25;
+pub(crate) const OP_MESWAIT: u8 = 0x23;
+pub(crate) const OP_QUERY: u8 = 0x24;
+pub(crate) const OP_QUERYWAIT: u8 = 0x25;
 const OP_REQSET: u8 = 0x27;
 const OP_REQSET_CHECKED: u8 = 0x28;
 const OP_REQSET_PRIORITY: u8 = 0x29;
@@ -71,6 +71,12 @@ const OP_GETBITWORK: u8 = 0x41;
 const OP_SENDTAG: u8 = 0x43;
 const OP_SLEEP: u8 = 0x6F;
 const OP_TURNWAIT: u8 = 0x70;
+
+const MESSAGE_OPEN_NONE: u8 = 0;
+const MESSAGE_OPEN_AWAITING: u8 = 1;
+// CliEventMessOpenFlag = 2 is the invalid-open state MESWAIT force-cancels on
+// (XiEvents OpCodes/0x0023.md).
+const MESSAGE_OPEN_INVALID: u8 = 2;
 
 const WORK_LOCAL_LEN: usize = 80;
 const WORK_ZONE_LEN: usize = 96;
@@ -136,7 +142,7 @@ impl EventVm {
             jump_index: 0,
             speaker_index,
             params,
-            message_open: 0,
+            message_open: MESSAGE_OPEN_NONE,
             pending_message: None,
             pending_choice: None,
             selection_made: false,
@@ -149,7 +155,13 @@ impl EventVm {
     /// Clear the open-dialog flag after the player dismisses a message, so the
     /// next [`step`](Self::step) advances past MESWAIT.
     pub fn dismiss_message(&mut self) {
-        self.message_open = 0;
+        self.message_open = MESSAGE_OPEN_NONE;
+    }
+
+    /// Mark the open message invalid so the next MESWAIT force-cancels the
+    /// event (XiEvents OpCodes/0x0023.md) — the Esc-on-message path.
+    pub fn cancel_message(&mut self) {
+        self.message_open = MESSAGE_OPEN_INVALID;
     }
 
     /// Record the player's menu selection (0-based, or [`u32::MAX`] to cancel)
@@ -265,7 +277,7 @@ impl EventVm {
                 }
                 OP_MESSAGE => {
                     let message_id = self.getworkofs(1, 0) as u32;
-                    self.message_open = 1;
+                    self.message_open = MESSAGE_OPEN_AWAITING;
                     self.pending_message = Some(EventMessage {
                         message_id,
                         speaker_index: self.speaker_index,
@@ -274,8 +286,8 @@ impl EventVm {
                     self.exec_pointer += 3;
                 }
                 OP_MESWAIT => match self.message_open {
-                    0 => self.exec_pointer += 1,
-                    2 => {
+                    MESSAGE_OPEN_NONE => self.exec_pointer += 1,
+                    MESSAGE_OPEN_INVALID => {
                         self.finished = true;
                         return StepResult::Cancelled;
                     }
@@ -678,6 +690,14 @@ mod tests {
         assert_eq!(e.step(), expected, "still awaiting until a choice is made");
         e.select_choice(Some(1));
         assert_eq!(e.step(), StepResult::Done);
+    }
+
+    #[test]
+    fn cancelled_message_ends_event_at_meswait() {
+        let mut e = vm(vec![OP_MESSAGE, 0x00, 0x80, OP_MESWAIT, OP_END], vec![900]);
+        assert!(matches!(e.step(), StepResult::AwaitMessage(_)));
+        e.cancel_message();
+        assert_eq!(e.step(), StepResult::Cancelled);
     }
 
     #[test]

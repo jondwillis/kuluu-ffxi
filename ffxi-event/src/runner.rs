@@ -8,6 +8,11 @@ use ffxi_dat::event_dat::EventBlock;
 
 use crate::vm::{EventVm, StepResult};
 
+/// 0x05B `EndPara` the client returns for a cancelled event in place of
+/// `Work_Zone[1]` (research/XiPackets/world/client/0x005B); LSB scripts match
+/// it as `utils.EVENT_CANCELLED_OPTION` (vendor/server/scripts/utils/utils.lua:8).
+pub const EVENT_CANCELLED_END_PARA: u32 = 1 << 30;
+
 /// One renderable dialog frame: NPC speech (and, for a menu, the selectable
 /// `choices`). `text` is already decoded from the dialog DAT.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,8 +34,8 @@ pub enum DialogStep {
     Frame(DialogFrame),
     /// The event finished — the session sends EVENT_END with `end_para`, the
     /// value the client returns in the 0x05B `EndPara`: `Work_Zone[1]` for a
-    /// normal end, `0x40000000` for a cancel (research/XiPackets/world/client/
-    /// 0x005B).
+    /// normal end, [`EVENT_CANCELLED_END_PARA`] for a cancel
+    /// (research/XiPackets/world/client/0x005B).
     Ended { end_para: u32 },
     /// Hit an opcode the VM can't run; the session falls back (EVENT_END) rather
     /// than render a wrong frame. `op` is the opcode value.
@@ -78,6 +83,21 @@ impl DialogRunner {
             Pending::Choice => self.vm.select_choice(choice),
             Pending::Start => {}
         }
+        self.run(strings)
+    }
+
+    /// Cancel out of the current frame (the Esc path): a menu reports the
+    /// cancel selection, a message invalidates the open dialog; either way the
+    /// VM ends the event with [`EVENT_CANCELLED_END_PARA`].
+    pub fn cancel(&mut self, strings: &StringDat) -> DialogStep {
+        match self.pending {
+            Pending::Message | Pending::Start => self.vm.cancel_message(),
+            Pending::Choice => self.vm.select_choice(None),
+        }
+        self.run(strings)
+    }
+
+    fn run(&mut self, strings: &StringDat) -> DialogStep {
         loop {
             match self.vm.step() {
                 StepResult::AwaitMessage(m) => {
@@ -107,7 +127,7 @@ impl DialogRunner {
                 }
                 StepResult::Cancelled => {
                     return DialogStep::Ended {
-                        end_para: 0x4000_0000,
+                        end_para: EVENT_CANCELLED_END_PARA,
                     }
                 }
                 StepResult::Unimplemented(op) => return DialogStep::Stopped(op),
@@ -301,6 +321,84 @@ mod tests {
             resolve_choice_brackets("plain {Choice:1} end", &[]),
             "plain {Choice:1} end"
         );
+    }
+
+    use crate::vm::{OP_END, OP_MESSAGE, OP_MESWAIT, OP_QUERY, OP_QUERYWAIT};
+
+    fn one_event_block(
+        event_data: Vec<u8>,
+        references: Vec<u32>,
+    ) -> ffxi_dat::event_dat::EventBlock {
+        ffxi_dat::event_dat::EventBlock {
+            actor: ZONE_PLAYER_ACTOR,
+            event_ids: vec![1],
+            event_offsets: vec![0],
+            references,
+            event_data,
+        }
+    }
+
+    /// Minimal valid DialogTable with a single zero-length entry, in the dmsg
+    /// header layout ([`StringDat::parse`] validating it pins the format —
+    /// magic = 0x1000_0000 + data_len, offsets XOR 0x8080_8080).
+    fn empty_strings() -> StringDat {
+        let data_len = 4u32;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(0x1000_0000u32 + data_len).to_le_bytes());
+        buf.extend_from_slice(&(4u32 ^ 0x8080_8080).to_le_bytes());
+        StringDat::parse(&buf).expect("synthetic DialogTable")
+    }
+
+    /// Regression: Esc on a message frame must genuinely cancel — advance would
+    /// dismiss and surface the second message frame (Esc == Enter, kuluu-76z).
+    #[test]
+    fn cancel_on_message_frame_ends_cancelled_not_next_frame() {
+        let data = vec![
+            OP_MESSAGE, 0x00, 0x80, OP_MESWAIT, OP_MESSAGE, 0x01, 0x80, OP_MESWAIT, OP_END,
+        ];
+        let strings = empty_strings();
+        let mut r =
+            DialogRunner::start(&one_event_block(data, vec![10, 11]), 1, 0, vec![]).unwrap();
+        assert!(matches!(r.advance(None, &strings), DialogStep::Frame(_)));
+        assert_eq!(
+            r.cancel(&strings),
+            DialogStep::Ended {
+                end_para: EVENT_CANCELLED_END_PARA,
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_on_choice_frame_ends_cancelled() {
+        let data = vec![
+            OP_QUERY,
+            0x00,
+            0x80,
+            0x01,
+            0x80,
+            0x00,
+            0x00,
+            OP_QUERYWAIT,
+            OP_END,
+        ];
+        let strings = empty_strings();
+        let mut r =
+            DialogRunner::start(&one_event_block(data, vec![500, 0]), 1, 0, vec![]).unwrap();
+        assert!(matches!(r.advance(None, &strings), DialogStep::Frame(_)));
+        assert_eq!(
+            r.cancel(&strings),
+            DialogStep::Ended {
+                end_para: EVENT_CANCELLED_END_PARA,
+            }
+        );
+    }
+
+    /// Guard: the cancel sentinel is the exact value LSB scripts branch on
+    /// (utils.EVENT_CANCELLED_OPTION = bit.lshift(1, 30),
+    /// vendor/server/scripts/utils/utils.lua:8).
+    #[test]
+    fn cancel_sentinel_is_lsb_event_cancelled_option() {
+        assert_eq!(EVENT_CANCELLED_END_PARA, 0x4000_0000);
     }
 
     fn install() -> Option<DatRoot> {
