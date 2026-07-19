@@ -123,6 +123,7 @@ fn spawn_zone_overlay(
         .spawn((
             super::InGameEntity,
             ZoneOverlayRoot,
+            ffxi_viewer_core::hud_hide::HudHideExempt,
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Px(0.0),

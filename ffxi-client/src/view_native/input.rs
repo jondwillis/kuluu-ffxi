@@ -14,6 +14,12 @@ pub struct StanceParams<'w> {
 }
 
 #[derive(SystemParam)]
+pub struct HudCaptureParams<'w> {
+    pub hud_hidden: ResMut<'w, ffxi_viewer_core::hud_hide::HudHidden>,
+    pub screenshot: MessageWriter<'w, super::screenshot::ScreenshotRequest>,
+}
+
+#[derive(SystemParam)]
 pub struct CameraInputParams<'w> {
     pub mode: ResMut<'w, CameraMode>,
     pub chase: ResMut<'w, ChaseCamera>,
@@ -133,6 +139,7 @@ pub fn handle_input_system(
     mut walk_mode: ResMut<ffxi_viewer_core::combat_stance::WalkMode>,
     mut tab_stack: ResMut<TabCycleStack>,
     select_target: Res<SelectTargetMode>,
+    mut hud_capture: HudCaptureParams,
 ) {
     let camera_mode = &mut camera.mode;
     let chase = &mut camera.chase;
@@ -155,6 +162,19 @@ pub fn handle_input_system(
     {
         camera_transition.begin(**camera_mode, chase.distance);
         cursor_lock.locked = false;
+    }
+
+    if !matches!(*mode, InputMode::Chat(_)) {
+        if bindings.just_pressed(Action::ToggleHud, &keys) {
+            hud_capture.hud_hidden.0 = !hud_capture.hud_hidden.0;
+        }
+        if bindings.just_pressed(Action::Screenshot, &keys) {
+            hud_capture
+                .screenshot
+                .write(super::screenshot::ScreenshotRequest {
+                    path: super::screenshot::next_default_path(),
+                });
+        }
     }
 
     if bindings.just_pressed(Action::TogglePassiveCursor, &keys) {

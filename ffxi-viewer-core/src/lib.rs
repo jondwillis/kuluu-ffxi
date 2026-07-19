@@ -24,6 +24,7 @@ pub mod ffxi_zone_material;
 pub mod graphics;
 pub use graphics::settings as graphics_settings;
 pub mod hud;
+pub mod hud_hide;
 pub mod input_mode;
 pub mod keybinds;
 pub mod lens_flare;

@@ -64,6 +64,8 @@ fn shared() -> Vec<(Action, KeyBind)> {
         (Action::CameraZoomIn, KeyBind::new(KeyCode::Period)),
         (Action::CameraZoomOut, KeyBind::new(KeyCode::Comma)),
         (Action::TogglePassiveCursor, KeyBind::new(KeyCode::Insert)),
+        (Action::ToggleHud, KeyBind::new(KeyCode::ScrollLock)),
+        (Action::Screenshot, KeyBind::new(KeyCode::PrintScreen)),
         (Action::CycleTarget, KeyBind::new(KeyCode::Tab)),
         (Action::ClearTarget, KeyBind::new(KeyCode::Escape)),
         (Action::SelectActiveWindow, KeyBind::new(KeyCode::KeyF)),
@@ -252,6 +254,21 @@ mod tests {
             assert_eq!(
                 b.get(Action::NavCancel),
                 Some(KeyBind::new(KeyCode::Escape))
+            );
+        }
+    }
+
+    #[test]
+    fn hud_toggle_and_screenshot_bound_in_every_preset() {
+        for preset in [Preset::Compact1, Preset::Compact2, Preset::Standard] {
+            let b = preset.bindings();
+            assert_eq!(
+                b.get(Action::ToggleHud),
+                Some(KeyBind::new(KeyCode::ScrollLock))
+            );
+            assert_eq!(
+                b.get(Action::Screenshot),
+                Some(KeyBind::new(KeyCode::PrintScreen))
             );
         }
     }
