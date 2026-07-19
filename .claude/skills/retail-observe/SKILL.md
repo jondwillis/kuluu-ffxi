@@ -132,6 +132,16 @@ chat) is usually readable straight off the full screenshot.
   changes): arrows/tab for menus, `enter` confirm, `esc` cancel, `wasd`
   movement, `-`/numpad for camera. `hxi.sh key w 2.0` holds W for 2s —
   that's how you walk.
+- **`hxi.sh key` accepts raw macOS keycodes as numbers** (unmapped names pass
+  through): `key 44` = `/` (opens chat entry), `key 107` = Scroll Lock (retail
+  toggles full-UI hide — HUD windows vanish, nameplates persist), `key 105` =
+  PrintScreen. **`hxi.sh type` silently drops `/`** (and likely other
+  AppleScript-special chars): to send a slash command, `key 44` first, then
+  `type 'check <t>'`, then `enter`. Typing `<t>` literally works — the client
+  expands it against the current target.
+- After Esc closes a dialog the target is ALSO cleared — re-Tab before the
+  next Enter or it re-opens nothing (a stale queued Enter can fire on the
+  wrong target, e.g. the MH exit door).
 - **Verify state between menu keypresses; never blind-batch.** In-game menus
   drop inputs and close unexpectedly; a queued `down/enter` sequence drifts and
   ends up interacting with the wrong entry. After each press, confirm via the
