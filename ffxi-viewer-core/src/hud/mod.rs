@@ -15,6 +15,7 @@ pub mod item_screen;
 pub mod item_ui;
 pub mod logout_countdown;
 pub mod menu;
+pub mod menu_help_bar;
 pub mod mesh_debug;
 pub mod network_status;
 pub mod overlay;
@@ -240,6 +241,11 @@ impl Plugin for HudPlugin {
             menu::refresh_dynamic_menu_rows.before(menu::update_main_menu),
         );
 
+        app.add_systems(
+            Update,
+            menu_help_bar::update_menu_help_bar.after(menu::refresh_dynamic_menu_rows),
+        );
+
         app.add_systems(Update, logout_countdown::update_logout_countdown);
 
         app.add_systems(
@@ -330,6 +336,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             roster::spawn_roster_panel,
             chat_input::spawn_chat_input,
             menu::spawn_main_menu,
+            menu_help_bar::spawn_menu_help_bar,
             quick_action::spawn_quick_action,
             target_panel::spawn_target_panel,
             dialog::spawn_dialog_panel,

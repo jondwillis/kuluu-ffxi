@@ -179,9 +179,9 @@ const GRAPHICS_ENTRIES: &[&str] = &[
     "Sky Style",
     "Water Style",
     "Dynamic Lights",
-    "  Threshold",
-    "  Intensity",
-    "  Range",
+    "  Emitter Threshold",
+    "  Emitter Intensity",
+    "  Emitter Range",
     "  Flicker",
     "Shading",
     "Model Shadow Receiving",
@@ -303,7 +303,7 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
     }
 }
 
-fn menu_title(kind: MenuKind) -> &'static str {
+pub fn menu_title(kind: MenuKind) -> &'static str {
     match kind {
         MenuKind::Root => "Commands",
         MenuKind::Config => "Config",
