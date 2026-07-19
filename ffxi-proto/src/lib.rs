@@ -7,6 +7,7 @@ pub mod decode;
 pub mod equip_info;
 pub mod framing;
 pub mod item_names;
+pub mod item_usable;
 pub mod job_names;
 pub mod login;
 pub mod magic;

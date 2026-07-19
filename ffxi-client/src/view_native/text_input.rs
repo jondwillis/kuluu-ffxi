@@ -199,6 +199,7 @@ pub fn text_input_system(
                     scene_state.snapshot.self_char_id,
                     target_changed,
                     engaged,
+                    ffxi_viewer_core::hud::menu::any_usable_item(&scene_state.snapshot),
                     &cmd_tx.0,
                 ) {
                     *mode = next;
@@ -328,6 +329,7 @@ fn handle_world_key(
     self_id: Option<u32>,
     target_changed: bool,
     engaged: bool,
+    usable_items_available: bool,
     cmd_tx: &Sender<AgentCommand>,
 ) -> Option<InputMode> {
     if bindings.matches_logical(Action::OpenChat, key) {
@@ -356,7 +358,14 @@ fn handle_world_key(
                     }
                     None
                 } else {
-                    open_target_action_menu(current_target, entities, self_pos, self_id, engaged)
+                    open_target_action_menu(
+                        current_target,
+                        entities,
+                        self_pos,
+                        self_id,
+                        engaged,
+                        usable_items_available,
+                    )
                 }
             }
             None => None,
@@ -371,10 +380,17 @@ fn open_target_action_menu(
     self_pos: ffxi_viewer_wire::Vec3,
     self_id: Option<u32>,
     engaged: bool,
+    usable_items_available: bool,
 ) -> Option<InputMode> {
     use ffxi_viewer_core::hud::action_model;
-    let ctx =
-        action_model::context_for_target(current_target, entities, self_pos, self_id, engaged);
+    let ctx = action_model::context_for_target(
+        current_target,
+        entities,
+        self_pos,
+        self_id,
+        engaged,
+        usable_items_available,
+    );
     if action_model::build_target_action_entries(&ctx, &ffxi_viewer_core::hud::overlay::RETAIL)
         .is_empty()
     {
@@ -672,7 +688,7 @@ fn confirm_target_action_at_cursor(
             state.sub = Some(SubActionStack::with(SubAction::AbilitiesGroup(group)));
             None
         }
-        TargetActionId::Items => Some(open_submenu(MenuKind::Items)),
+        TargetActionId::Items => Some(open_submenu(MenuKind::UsableItems)),
         TargetActionId::Check => {
             use ffxi_viewer_core::hud::action_model::TargetKindLite;
             match target_ent {
@@ -1609,6 +1625,7 @@ fn apply_slash_outcome(
                 ffxi_viewer_core::MenuKind::Magic => "Magic".into(),
                 ffxi_viewer_core::MenuKind::Abilities => "Abilities".into(),
                 ffxi_viewer_core::MenuKind::Items => "Items".into(),
+                ffxi_viewer_core::MenuKind::UsableItems => "Items (usable)".into(),
                 ffxi_viewer_core::MenuKind::Equipment => "Equipment".into(),
                 ffxi_viewer_core::MenuKind::Root => "Root".into(),
                 ffxi_viewer_core::MenuKind::Config => "Config".into(),

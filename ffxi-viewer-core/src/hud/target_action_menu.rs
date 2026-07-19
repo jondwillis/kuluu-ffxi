@@ -343,6 +343,7 @@ mod tests {
             in_range,
             trusts_available: false,
             engaged: false,
+            usable_items_available: true,
         }
     }
 
