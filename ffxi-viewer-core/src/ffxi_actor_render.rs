@@ -2052,7 +2052,13 @@ pub fn tick_live_ffxi_actors(
                 .unwrap_or(RestKind::None)
         };
 
-        let (forward_vel, strafe_vel) = if engaged && !is_self {
+        let (forward_vel, strafe_vel) = if is_self {
+            if self_reactor_driven {
+                (0.0, 0.0)
+            } else {
+                (self_move.forward, self_move.strafe)
+            }
+        } else if engaged {
             (sample.forward_component, sample.strafe_component)
         } else {
             (0.0, 0.0)

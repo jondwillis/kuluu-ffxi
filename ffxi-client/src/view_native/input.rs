@@ -39,6 +39,12 @@ use crate::state::{ActionKind, AgentCommand, FishingInput};
 
 pub const HEADING_TURN_RATE: f32 = 0.86;
 
+// Retail A/D turn-in-place is fast (sub-second about-turn, carving tight W+A
+// arcs), unlike the slow Q/E-style rotate above. Exact retail rate is
+// unmeasured (kuluu-ltns follow-up); 5.0 rad/s matches the responsiveness of
+// the steer scheme this replaced.
+pub const TURN_KEY_RATE_RAD_PER_SEC: f32 = 5.0;
+
 const CAMERA_YAW_RATE: f32 = HEADING_TURN_RATE * 4.0;
 
 const PITCH_STEP_HELD: f32 = 0.015;
@@ -50,11 +56,9 @@ const SPEED_TO_YPS: f32 = 0.1;
 const BACKPEDAL_SCALE: f32 = 0.5;
 const STRAFE_SCALE: f32 = 0.75;
 
-const HEADING_LERP_RATE_RAD_PER_SEC: f32 = 5.0;
-
-const CHASE_TRACK_RATE_RAD_PER_SEC: f32 = 5.0;
-
 const PREDICTION_RESYNC_YALMS: f32 = 5.0;
+
+const ABOUT_FACE_HEADING_DELTA: u8 = 128;
 
 #[derive(Resource, Clone)]
 pub struct CommandTx(pub mpsc::Sender<AgentCommand>);
@@ -90,10 +94,13 @@ pub fn reset_interaction_flags_on_zone_change(
     *rest = ffxi_viewer_core::combat_stance::RestStance::default();
 }
 
-pub fn advance_heading_turn(accum_units: &mut f32, dir: i32, dt_secs: f32) -> (i32, f32) {
-    let turn_units_per_sec = HEADING_TURN_RATE * 256.0 / std::f32::consts::TAU;
-    let float_delta = dir as f32 * turn_units_per_sec * dt_secs;
-    if dir == 0 {
+pub fn advance_heading_turn(
+    accum_units: &mut f32,
+    rate_rad_per_sec: f32,
+    dt_secs: f32,
+) -> (i32, f32) {
+    let float_delta = rate_rad_per_sec * (256.0 / std::f32::consts::TAU) * dt_secs;
+    if rate_rad_per_sec == 0.0 {
         *accum_units = 0.0;
         return (0, 0.0);
     }
@@ -101,6 +108,61 @@ pub fn advance_heading_turn(accum_units: &mut f32, dir: i32, dt_secs: f32) -> (i
     let whole = accum_units.trunc();
     *accum_units -= whole;
     (whole as i32, float_delta)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedMoveInputs {
+    pub forward: i32,
+    pub strafe: i32,
+    pub turn_dir: i32,
+    pub rotate_dir: i32,
+    pub about_face: bool,
+}
+
+/// Retail keyboard movement is character-relative (tank controls, observed
+/// HorizonXI 2026-07-19): unlocked Turn keys rotate the character in place,
+/// Back turns the character 180° and runs forward (no unlocked backpedal).
+/// Locked on, the character faces the target, so Turn keys strafe and Back
+/// backpedals instead.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_tank_inputs(
+    forward_held: bool,
+    backward_held: bool,
+    backward_just_pressed: bool,
+    turn_left: bool,
+    turn_right: bool,
+    strafe_left: bool,
+    strafe_right: bool,
+    rotate_left: bool,
+    rotate_right: bool,
+    autorun_forward: bool,
+    locked: bool,
+) -> ResolvedMoveInputs {
+    let mut forward = i32::from(forward_held) - i32::from(backward_held);
+    if autorun_forward {
+        forward = forward.max(1);
+    }
+    let mut strafe = i32::from(strafe_right) - i32::from(strafe_left);
+    let rotate_dir = i32::from(rotate_right) - i32::from(rotate_left);
+    let mut turn_dir = 0;
+    let turn = i32::from(turn_right) - i32::from(turn_left);
+    if locked {
+        strafe = (strafe + turn).clamp(-1, 1);
+    } else {
+        turn_dir = turn;
+    }
+    let mut about_face = false;
+    if !locked && forward < 0 {
+        about_face = backward_just_pressed;
+        forward = 1;
+    }
+    ResolvedMoveInputs {
+        forward,
+        strafe,
+        turn_dir,
+        rotate_dir,
+        about_face,
+    }
 }
 
 pub fn autorun_after_toggle(phantom_forward: bool, toggle_just_pressed: bool) -> bool {
@@ -510,56 +572,16 @@ pub fn dispatch_movement_system(
         }
     }
 
-    let mut forward: i32 = 0;
-    if bindings.pressed(Action::MoveForward, &keys) {
-        forward += 1;
-    }
-    if bindings.pressed(Action::MoveBackward, &keys) {
-        forward -= 1;
-    }
-
-    if bindings.just_pressed(Action::MoveBackward, &keys) {
+    let backward_just_pressed = bindings.just_pressed(Action::MoveBackward, &keys);
+    if backward_just_pressed {
         autorun.phantom_forward = false;
     }
 
-    let mut player_rotate_dir: i32 = 0;
-    if bindings.pressed(Action::RotateLeft, &keys) {
-        player_rotate_dir -= 1;
-    }
-    if bindings.pressed(Action::RotateRight, &keys) {
-        player_rotate_dir += 1;
-    }
-    if matches!(*camera_mode, CameraMode::FirstPerson) {
-        if bindings.pressed(Action::TurnLeft, &keys) {
-            player_rotate_dir -= 1;
-        }
-        if bindings.pressed(Action::TurnRight, &keys) {
-            player_rotate_dir += 1;
-        }
-    }
-    let (player_rotate_u8, heading_delta_units) =
-        advance_heading_turn(&mut turn_accum.units, player_rotate_dir, time.delta_secs());
-
-    let mut strafe: i32 = 0;
-    if bindings.pressed(Action::StrafeLeft, &keys) {
-        strafe -= 1;
-    }
-    if bindings.pressed(Action::StrafeRight, &keys) {
-        strafe += 1;
-    }
-
-    let mut turn: i32 = 0;
-    if bindings.pressed(Action::TurnLeft, &keys) {
-        turn -= 1;
-    }
-    if bindings.pressed(Action::TurnRight, &keys) {
-        turn += 1;
-    }
-
-    let any_strafe_or_rotate = bindings.pressed(Action::RotateLeft, &keys)
-        || bindings.pressed(Action::RotateRight, &keys)
-        || strafe != 0;
-    if any_strafe_or_rotate {
+    // Retail autorun is steerable: Turn/Rotate keys carve the run without
+    // cancelling it. Only a held strafe (lock-on sidestep) cancels.
+    let any_strafe =
+        bindings.pressed(Action::StrafeLeft, &keys) || bindings.pressed(Action::StrafeRight, &keys);
+    if any_strafe {
         let now = Instant::now();
         let started = *autorun.strafe_held_since.get_or_insert(now);
         if autorun.phantom_forward
@@ -571,11 +593,25 @@ pub fn dispatch_movement_system(
         autorun.strafe_held_since = None;
     }
 
-    if autorun.phantom_forward {
-        forward = forward.max(1);
-    }
-
-    let turn_in_chase = turn != 0 && matches!(*camera_mode, CameraMode::Chase);
+    let resolved = resolve_tank_inputs(
+        bindings.pressed(Action::MoveForward, &keys),
+        bindings.pressed(Action::MoveBackward, &keys),
+        backward_just_pressed,
+        bindings.pressed(Action::TurnLeft, &keys),
+        bindings.pressed(Action::TurnRight, &keys),
+        bindings.pressed(Action::StrafeLeft, &keys),
+        bindings.pressed(Action::StrafeRight, &keys),
+        bindings.pressed(Action::RotateLeft, &keys),
+        bindings.pressed(Action::RotateRight, &keys),
+        autorun.phantom_forward,
+        lock_on.target_id.is_some(),
+    );
+    let forward = resolved.forward;
+    let strafe = resolved.strafe;
+    let turn_rate = HEADING_TURN_RATE * resolved.rotate_dir as f32
+        + TURN_KEY_RATE_RAD_PER_SEC * resolved.turn_dir as f32;
+    let (player_rotate_u8, heading_delta_units) =
+        advance_heading_turn(&mut turn_accum.units, turn_rate, time.delta_secs());
 
     let self_pos = state.snapshot.self_pos;
 
@@ -632,11 +668,15 @@ pub fn dispatch_movement_system(
             })
     });
 
-    if player_rotate_dir != 0 {
+    // First person: the view IS the facing, so rotation moves the camera
+    // rigidly and forward motion follows the view (mouse-look included). In
+    // chase mode the camera instead trails the turn via auto-recenter.
+    let first_person = matches!(*camera_mode, CameraMode::FirstPerson);
+    if (resolved.turn_dir != 0 || resolved.rotate_dir != 0) && first_person {
         chase.yaw -= heading_delta_units * std::f32::consts::TAU / 256.0;
     }
 
-    if forward == 0 && strafe == 0 && player_rotate_u8 == 0 && !turn_in_chase {
+    if forward == 0 && strafe == 0 && player_rotate_u8 == 0 {
         if let Some(h) = locked_heading {
             if h != self_pos.heading {
                 chase.yaw = ffxi_viewer_core::yaw_for_heading(h);
@@ -653,58 +693,24 @@ pub fn dispatch_movement_system(
     }
 
     **move_intent = ffxi_viewer_core::combat_stance::SelfMoveIntent {
-        moving: forward != 0 || strafe != 0 || turn_in_chase,
+        moving: forward != 0 || strafe != 0,
+        forward: forward as f32,
+        strafe: strafe as f32,
     };
 
     let mut heading = self_pos.heading;
-    if forward != 0 {
-        heading = heading_for_yaw(chase.yaw);
+    if resolved.about_face {
+        heading = heading.wrapping_add(ABOUT_FACE_HEADING_DELTA);
+        if first_person {
+            chase.yaw = yaw_for_heading(heading);
+        }
     }
     if player_rotate_u8 != 0 {
         let delta = player_rotate_u8.rem_euclid(256) as u8;
         heading = heading.wrapping_add(delta);
     }
-
-    let mut turn_dx: f32 = 0.0;
-    let mut turn_dy: f32 = 0.0;
-    if turn_in_chase {
-        let camera_forward_h = heading_for_yaw(chase.yaw);
-        let (cf_x, cf_y) = heading_to_forward(camera_forward_h);
-
-        let (cr_x, cr_y) = heading_to_forward(camera_forward_h.wrapping_add(64));
-
-        let fwd_signed = forward as f32;
-        let lat_signed = turn as f32;
-        let mx = cf_x * fwd_signed + cr_x * lat_signed;
-        let my = cf_y * fwd_signed + cr_y * lat_signed;
-        let len = (mx * mx + my * my).sqrt();
-
-        let step_magnitude =
-            self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs() * walk_mode.scale();
-        if len > 1e-3 && step_magnitude > 0.0 {
-            let inv = 1.0 / len;
-            turn_dx = mx * inv * step_magnitude;
-            turn_dy = my * inv * step_magnitude;
-
-            let motion_radians = my.atan2(mx);
-            let motion_raw = motion_radians * -(128.0 / std::f32::consts::PI);
-            let motion_h = (motion_raw.round() as i32).rem_euclid(256) as u8;
-
-            let h_target = yaw_for_heading(motion_h);
-            let h_current = yaw_for_heading(heading);
-            let h_diff = wrap_signed_pi(h_target - h_current);
-
-            let h_alpha = 1.0 - (-HEADING_LERP_RATE_RAD_PER_SEC * time.delta_secs()).exp();
-            heading = heading_for_yaw(h_current + h_diff * h_alpha);
-        }
-
-        let chase_target = yaw_for_heading(heading);
-        let c_diff = wrap_signed_pi(chase_target - chase.yaw);
-        let c_alpha = 1.0 - (-CHASE_TRACK_RATE_RAD_PER_SEC * time.delta_secs()).exp();
-        chase.yaw += c_diff * c_alpha;
-
-        forward = 0;
-        strafe = 0;
+    if forward != 0 && first_person {
+        heading = heading_for_yaw(chase.yaw);
     }
 
     if let Some(h) = locked_heading {
@@ -727,8 +733,6 @@ pub fn dispatch_movement_system(
     let mut x = basis_pos.x;
     let mut y = basis_pos.y;
 
-    x += turn_dx;
-    y += turn_dy;
     if forward != 0 && step > 0.0 {
         let (fwd_x, fwd_y) = heading_to_forward(heading);
 
@@ -825,12 +829,6 @@ fn forward_allowance(from_xy: (f32, f32), target_xy: (f32, f32), stop: f32) -> f
     let dy = target_xy.1 - from_xy.1;
     let dist = (dx * dx + dy * dy).sqrt();
     (dist - stop).max(0.0)
-}
-
-#[inline]
-fn wrap_signed_pi(x: f32) -> f32 {
-    use std::f32::consts::{PI, TAU};
-    (x + PI).rem_euclid(TAU) - PI
 }
 
 #[derive(Resource, Default)]
@@ -1006,7 +1004,9 @@ pub fn camera_polish_system(
         || bindings.pressed(Action::StrafeLeft, &keys)
         || bindings.pressed(Action::StrafeRight, &keys)
         || bindings.pressed(Action::TurnLeft, &keys)
-        || bindings.pressed(Action::TurnRight, &keys);
+        || bindings.pressed(Action::TurnRight, &keys)
+        || bindings.pressed(Action::RotateLeft, &keys)
+        || bindings.pressed(Action::RotateRight, &keys);
     if movement_input {
         recenter.manual_override = false;
     }
@@ -1146,6 +1146,120 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TankKeys {
+        forward: bool,
+        backward: bool,
+        backward_just: bool,
+        turn_left: bool,
+        turn_right: bool,
+        autorun: bool,
+        locked: bool,
+    }
+
+    fn resolve(k: TankKeys) -> ResolvedMoveInputs {
+        resolve_tank_inputs(
+            k.forward,
+            k.backward,
+            k.backward_just,
+            k.turn_left,
+            k.turn_right,
+            false,
+            false,
+            false,
+            false,
+            k.autorun,
+            k.locked,
+        )
+    }
+
+    #[test]
+    fn unlocked_turn_rotates_in_place_not_strafe() {
+        let r = resolve(TankKeys {
+            turn_left: true,
+            ..Default::default()
+        });
+        assert_eq!(r.turn_dir, -1);
+        assert_eq!(r.strafe, 0);
+        assert_eq!(r.forward, 0);
+    }
+
+    #[test]
+    fn unlocked_forward_plus_turn_carves_arc_at_full_speed() {
+        let r = resolve(TankKeys {
+            forward: true,
+            turn_left: true,
+            ..Default::default()
+        });
+        assert_eq!(r.forward, 1);
+        assert_eq!(r.turn_dir, -1);
+        assert_eq!(r.strafe, 0, "unlocked W+A must not strafe");
+    }
+
+    #[test]
+    fn unlocked_backward_is_about_face_then_forward_run() {
+        let press = resolve(TankKeys {
+            backward: true,
+            backward_just: true,
+            ..Default::default()
+        });
+        assert!(press.about_face, "S press must flip the character 180");
+        assert_eq!(press.forward, 1, "no unlocked backpedal: S runs forward");
+
+        let held = resolve(TankKeys {
+            backward: true,
+            ..Default::default()
+        });
+        assert!(!held.about_face, "held S must not keep flipping");
+        assert_eq!(held.forward, 1);
+    }
+
+    #[test]
+    fn locked_backward_backpedals() {
+        let r = resolve(TankKeys {
+            backward: true,
+            backward_just: true,
+            locked: true,
+            ..Default::default()
+        });
+        assert!(!r.about_face);
+        assert_eq!(r.forward, -1);
+    }
+
+    #[test]
+    fn locked_turn_strafes_not_rotates() {
+        let r = resolve(TankKeys {
+            turn_right: true,
+            locked: true,
+            ..Default::default()
+        });
+        assert_eq!(r.strafe, 1);
+        assert_eq!(r.turn_dir, 0);
+    }
+
+    #[test]
+    fn forward_and_backward_cancel_without_flip() {
+        let r = resolve(TankKeys {
+            forward: true,
+            backward: true,
+            backward_just: true,
+            ..Default::default()
+        });
+        assert_eq!(r.forward, 0);
+        assert!(!r.about_face);
+    }
+
+    #[test]
+    fn autorun_keeps_running_while_turning() {
+        let r = resolve(TankKeys {
+            autorun: true,
+            turn_left: true,
+            ..Default::default()
+        });
+        assert_eq!(r.forward, 1);
+        assert_eq!(r.turn_dir, -1);
+    }
+
     #[test]
     fn autorun_toggle_engages_from_standstill() {
         assert!(autorun_after_toggle(false, true));
@@ -1168,7 +1282,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         let mut total_u8: i32 = 0;
         for _ in 0..60 {
-            let (whole, _f) = advance_heading_turn(&mut accum, 1, dt);
+            let (whole, _f) = advance_heading_turn(&mut accum, HEADING_TURN_RATE, dt);
             total_u8 += whole;
         }
         let expected = (HEADING_TURN_RATE * 256.0 / std::f32::consts::TAU).round() as i32;
@@ -1190,14 +1304,14 @@ mod tests {
         let mut accum = 0.0_f32;
         let dt = 1.0 / 60.0;
 
-        let (whole_1, float_1) = advance_heading_turn(&mut accum, 1, dt);
+        let (whole_1, float_1) = advance_heading_turn(&mut accum, HEADING_TURN_RATE, dt);
         assert_eq!(whole_1, 0, "first 60Hz tick must not yet flip a u8");
         assert!(float_1 > 0.0 && float_1 < 1.0);
         assert!(accum > 0.0, "fractional units must carry over");
 
         let mut flipped = false;
         for _ in 0..10 {
-            let (w, _) = advance_heading_turn(&mut accum, 1, dt);
+            let (w, _) = advance_heading_turn(&mut accum, HEADING_TURN_RATE, dt);
             if w != 0 {
                 flipped = true;
                 break;
@@ -1211,10 +1325,10 @@ mod tests {
         let mut accum = 0.0_f32;
         let dt = 1.0 / 60.0;
 
-        let _ = advance_heading_turn(&mut accum, 1, dt);
+        let _ = advance_heading_turn(&mut accum, HEADING_TURN_RATE, dt);
         assert!(accum > 0.0);
 
-        let (whole, fdelta) = advance_heading_turn(&mut accum, 0, dt);
+        let (whole, fdelta) = advance_heading_turn(&mut accum, 0.0, dt);
         assert_eq!(whole, 0);
         assert_eq!(fdelta, 0.0);
         assert_eq!(accum, 0.0);
@@ -1228,8 +1342,8 @@ mod tests {
         let mut total_l: i32 = 0;
         let mut total_r: i32 = 0;
         for _ in 0..30 {
-            total_l += advance_heading_turn(&mut accum_l, -1, dt).0;
-            total_r += advance_heading_turn(&mut accum_r, 1, dt).0;
+            total_l += advance_heading_turn(&mut accum_l, -HEADING_TURN_RATE, dt).0;
+            total_r += advance_heading_turn(&mut accum_r, HEADING_TURN_RATE, dt).0;
         }
         assert_eq!(total_l, -total_r);
     }

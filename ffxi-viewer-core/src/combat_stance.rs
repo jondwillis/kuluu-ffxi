@@ -144,9 +144,16 @@ impl WalkMode {
 /// can hover above `MOVE_EXIT` and hold the run cycle after the keys are
 /// released. Not authoritative while a reactor goal (follow/goto/engage) moves
 /// the player with no keys held — the pose falls back to inference there.
-#[derive(Resource, Default, Debug, Clone, Copy, Eq, PartialEq)]
+///
+/// `forward`/`strafe` are character-frame intent components feeding directional
+/// gait selection (mvb/mvl/mvr). Under the retail tank-control model they are
+/// only ever non-(1,0) while locked on: unlocked movement is always
+/// velocity-parallel-to-facing, so unlocked gait stays run/wlk.
+#[derive(Resource, Default, Debug, Clone, Copy, PartialEq)]
 pub struct SelfMoveIntent {
     pub moving: bool,
+    pub forward: f32,
+    pub strafe: f32,
 }
 
 pub fn directional_anim_for_skel(skel_file_id: u32, prefix: &[u8; 3]) -> Option<Arc<Mo2Animation>> {
