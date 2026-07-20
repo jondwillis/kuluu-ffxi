@@ -628,12 +628,20 @@ pub fn dispatch_movement_system(
     );
     let mut forward = resolved.forward;
     let mut strafe = resolved.strafe;
-    let fp_rotate = if first_person { resolved.steer } else { 0 };
+    // Steer with no forward is a turn-in-place in retail (HorizonXI video
+    // 2026-07-20: solo A/D pivots on the same tile, zero translation, camera
+    // trails behind). It shares the first-person arrow-turn machinery; only
+    // steer *combined with* W/S becomes a camera-relative run direction.
+    let pivot_steer = if first_person || forward == 0 {
+        resolved.steer
+    } else {
+        0
+    };
     let turn_rate = ROTATE_KEY_RATE_RAD_PER_SEC * resolved.rotate_dir as f32
-        + HEADING_TURN_RATE * fp_rotate as f32;
+        + HEADING_TURN_RATE * pivot_steer as f32;
     let (player_rotate_u8, heading_delta_units) =
         advance_heading_turn(&mut turn_accum.units, turn_rate, time.delta_secs());
-    let steer_in_chase = !first_person && !locked && (forward != 0 || resolved.steer != 0);
+    let steer_in_chase = !first_person && !locked && forward != 0;
     // A/D carve and Q/E rotate need the run direction recomputed against the
     // live camera every frame; anything else invalidates the pure-W/S latch.
     if !steer_in_chase || resolved.steer != 0 || resolved.rotate_dir != 0 {
