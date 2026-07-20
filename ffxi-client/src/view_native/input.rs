@@ -64,6 +64,11 @@ const PREDICTION_RESYNC_YALMS: f32 = 5.0;
 // by this lerp.
 const HEADING_LERP_RATE_RAD_PER_SEC: f32 = 2.5;
 
+// S from a forward-facing stance is an instant about-face in retail
+// (HorizonXI video 2026-07-20), not a carved arc; turns sharper than this
+// snap instead of lerping.
+const ABOUT_FACE_SNAP_RAD: f32 = 2.0;
+
 #[derive(Resource, Clone)]
 pub struct CommandTx(pub mpsc::Sender<AgentCommand>);
 
@@ -628,15 +633,19 @@ pub fn dispatch_movement_system(
     );
     let mut forward = resolved.forward;
     let mut strafe = resolved.strafe;
-    // Steer pivots in place only in first person (arrow-turn machinery). In
-    // 3rd-person chase mode A/D never pivot: they are a camera-relative steer,
-    // with or without W/S held.
-    let fp_rotate = if first_person { resolved.steer } else { 0 };
+    // Solo A/D pivots on the same tile in retail chase mode too (HorizonXI
+    // video 2026-07-20: zero translation, camera trails behind); only steer
+    // combined with W/S becomes a camera-relative run direction.
+    let pivot_steer = if first_person || forward == 0 {
+        resolved.steer
+    } else {
+        0
+    };
     let turn_rate = ROTATE_KEY_RATE_RAD_PER_SEC * resolved.rotate_dir as f32
-        + HEADING_TURN_RATE * fp_rotate as f32;
+        + HEADING_TURN_RATE * pivot_steer as f32;
     let (player_rotate_u8, heading_delta_units) =
         advance_heading_turn(&mut turn_accum.units, turn_rate, time.delta_secs());
-    let steer_in_chase = !first_person && !locked && (forward != 0 || resolved.steer != 0);
+    let steer_in_chase = !first_person && !locked && forward != 0;
     // A/D carve and Q/E rotate need the run direction recomputed against the
     // live camera every frame; anything else invalidates the pure-W/S latch.
     if !steer_in_chase || resolved.steer != 0 || resolved.rotate_dir != 0 {
@@ -769,8 +778,12 @@ pub fn dispatch_movement_system(
             let h_current = yaw_for_heading(heading);
             let h_diff = wrap_signed_pi(h_target - h_current);
 
-            let h_alpha = 1.0 - (-HEADING_LERP_RATE_RAD_PER_SEC * time.delta_secs()).exp();
-            heading = heading_for_yaw(h_current + h_diff * h_alpha);
+            heading = if h_diff.abs() >= ABOUT_FACE_SNAP_RAD {
+                motion_h
+            } else {
+                let h_alpha = 1.0 - (-HEADING_LERP_RATE_RAD_PER_SEC * time.delta_secs()).exp();
+                heading_for_yaw(h_current + h_diff * h_alpha)
+            };
 
             // Translate along the body's current (lerped) heading, not the
             // target run direction. Retail velocity is always body-aligned:
