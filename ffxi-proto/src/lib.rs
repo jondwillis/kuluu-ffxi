@@ -7,6 +7,7 @@ pub mod decode;
 pub mod emote_names;
 pub mod equip_info;
 pub mod framing;
+pub mod item_flags;
 pub mod item_names;
 pub mod item_usable;
 pub mod job_names;
