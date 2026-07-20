@@ -602,7 +602,14 @@ pub(crate) fn register(
             .run_if(in_state(AppPhase::Launcher)),
     );
 
-    app.add_systems(OnEnter(AppPhase::Launcher), restore_login_error_on_reentry);
+    app.add_systems(
+        OnEnter(AppPhase::Launcher),
+        (
+            restore_login_error_on_reentry,
+            resume_char_list_after_logout,
+        )
+            .chain(),
+    );
 
     app.add_systems(
         OnEnter(LauncherState::Login),
@@ -958,6 +965,30 @@ fn restore_login_error_on_reentry(
         *ret = LoginErrorReturn::Login;
         next.set(LauncherState::LoginError);
     }
+}
+
+/// After a clean `/logout`, bounce through `AuthInFlight` with the stored
+/// credentials so the user lands back on the character list (same pattern as
+/// the post-char-create/-delete re-auth bounce). The old lobby handle is gone
+/// by this point, so a fresh auth + lobby open is required regardless.
+fn resume_char_list_after_logout(
+    mut commands: Commands,
+    resume: Option<Res<super::ResumeCharListAfterLogout>>,
+    err: Res<LoginErrorMsg>,
+    creds: Res<Credentials>,
+    mut form: ResMut<LoginForm>,
+    mut next: ResMut<NextState<LauncherState>>,
+) {
+    if resume.is_none() {
+        return;
+    }
+    commands.remove_resource::<super::ResumeCharListAfterLogout>();
+    if !err.0.is_empty() || creds.user.is_empty() || creds.pass.is_empty() {
+        return;
+    }
+    form.user = creds.user.clone();
+    form.pass = creds.pass.clone();
+    next.set(LauncherState::AuthInFlight);
 }
 
 fn decide_initial_screen(

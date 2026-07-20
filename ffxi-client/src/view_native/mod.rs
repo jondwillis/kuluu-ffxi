@@ -637,6 +637,11 @@ pub(crate) enum DisconnectKind {
     Forced,
 }
 
+/// Marker inserted on a clean `/logout` so the launcher re-auths and returns
+/// to the character list instead of the login/server-select screen.
+#[derive(Resource)]
+pub(crate) struct ResumeCharListAfterLogout;
+
 fn classify_disconnect_reason(reason: &str) -> DisconnectKind {
     if reason.starts_with("server logout state=") {
         DisconnectKind::Clean
@@ -763,6 +768,7 @@ fn drain_particle_simulator(mut sim: ResMut<ffxi_viewer_core::particle_sim::Part
 }
 
 fn return_to_launcher_on_disconnect(
+    mut commands: Commands,
     scene: Option<Res<SceneState>>,
     events: Option<Res<EventLog>>,
     mut err: ResMut<LoginErrorMsg>,
@@ -785,6 +791,9 @@ fn return_to_launcher_on_disconnect(
 
     if matches!(kind, DisconnectKind::Forced) && err.0.is_empty() {
         err.0 = "Disconnected from server. Press Esc to return to login.".into();
+    }
+    if matches!(kind, DisconnectKind::Clean) {
+        commands.insert_resource(ResumeCharListAfterLogout);
     }
     tracing::info!(?kind, "disconnect-watcher: returning AppPhase to Launcher");
     next_phase.set(AppPhase::Launcher);
