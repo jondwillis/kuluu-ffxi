@@ -64,9 +64,13 @@ impl SubTargetState {
 
 pub const DIALOG_MAX_CHOICE: u32 = 7;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DialogCursor {
     pub cursor: u32,
+    /// Line buffer for a free-text dialog frame (`DialogState::text_entry`,
+    /// e.g. the delivery-box recipient prompt). `None` for choice/speech
+    /// frames; initialized when the text-entry frame is first handled.
+    pub entry: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

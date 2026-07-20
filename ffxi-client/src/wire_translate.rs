@@ -195,6 +195,7 @@ pub fn dialog_to_wire(d: &DialogState) -> wire::DialogState {
         nums: d.nums.clone(),
         prompt: d.prompt.clone(),
         choices: d.choices.clone(),
+        text_entry: d.text_entry,
     }
 }
 

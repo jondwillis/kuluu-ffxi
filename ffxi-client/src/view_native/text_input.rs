@@ -2841,6 +2841,15 @@ pub fn mouse_nav_dispatch_system(
 
     for ev in dialog_events.read() {
         if let InputMode::Dialog(cursor) = &mut *mode {
+            // Text-entry frames have no clickable choices; typing owns the frame.
+            if scene_state
+                .snapshot
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.text_entry)
+            {
+                continue;
+            }
             cursor.cursor = ev.choice;
             if let Some(container) = confirm_dialog_choice(ev.choice, &mut scene_state, &cmd_tx.0) {
                 *mode = open_items_on_bag(container, &mut menu_writers.item_screen_container);
@@ -3080,6 +3089,49 @@ fn handle_dialog_key(
     cmd_tx: &Sender<AgentCommand>,
     item_bag: &mut ffxi_viewer_core::hud::item_screen::ItemScreenContainer,
 ) -> Option<InputMode> {
+    // Free-text frame (delivery-box recipient prompt): edit a line buffer and
+    // answer with TextInput; characters must not fall through to nav bindings.
+    if scene_state
+        .snapshot
+        .dialog
+        .as_ref()
+        .is_some_and(|d| d.text_entry)
+    {
+        let entry = cursor.entry.get_or_insert_with(String::new);
+        if bindings.matches_logical(Action::ChatSubmit, key) {
+            let text = std::mem::take(entry);
+            cursor.entry = None;
+            let _ = cmd_tx.try_send(AgentCommand::TextInput { text });
+            return None;
+        }
+        if bindings.matches_logical(Action::ChatExit, key) {
+            // Esc: retail closes the name-entry box back to the Send panel;
+            // an empty answer clears any staged recipient and re-renders it.
+            cursor.entry = None;
+            let _ = cmd_tx.try_send(AgentCommand::TextInput {
+                text: String::new(),
+            });
+            return None;
+        }
+        if bindings.matches_logical(Action::ChatBackspace, key) {
+            entry.pop();
+            return None;
+        }
+        match key {
+            Key::Space => entry.push(' '),
+            Key::Character(s) => {
+                for c in s.chars() {
+                    if !c.is_control() {
+                        entry.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+        return None;
+    }
+    cursor.entry = None;
+
     // Plain speech (no choices) clamps to 0 and still confirms/advances on Enter.
     let max_index = scene_state
         .snapshot

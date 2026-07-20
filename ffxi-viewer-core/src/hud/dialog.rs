@@ -300,6 +300,7 @@ mod tests {
             nums: vec![],
             prompt: None,
             choices: vec![],
+            text_entry: false,
         }
     }
 

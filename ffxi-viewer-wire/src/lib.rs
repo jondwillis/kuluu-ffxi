@@ -612,6 +612,12 @@ pub struct DialogState {
 
     #[serde(default)]
     pub choices: Vec<String>,
+
+    /// Free-text entry frame (e.g. the delivery-box recipient prompt):
+    /// the viewer collects a line of text and answers with
+    /// `AgentCommand::TextInput` instead of a menu choice.
+    #[serde(default)]
+    pub text_entry: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

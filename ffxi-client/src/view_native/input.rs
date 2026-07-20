@@ -633,19 +633,14 @@ pub fn dispatch_movement_system(
     );
     let mut forward = resolved.forward;
     let mut strafe = resolved.strafe;
-    // Solo A/D pivots on the same tile in retail chase mode too (HorizonXI
-    // video 2026-07-20: zero translation, camera trails behind); only steer
-    // combined with W/S becomes a camera-relative run direction.
-    let pivot_steer = if first_person || forward == 0 {
-        resolved.steer
-    } else {
-        0
-    };
+    // In chase mode steer is always a camera-relative run component (solo A/D
+    // runs sideways); only first person keeps the arrow-turn pivot.
+    let fp_rotate = if first_person { resolved.steer } else { 0 };
     let turn_rate = ROTATE_KEY_RATE_RAD_PER_SEC * resolved.rotate_dir as f32
-        + HEADING_TURN_RATE * pivot_steer as f32;
+        + HEADING_TURN_RATE * fp_rotate as f32;
     let (player_rotate_u8, heading_delta_units) =
         advance_heading_turn(&mut turn_accum.units, turn_rate, time.delta_secs());
-    let steer_in_chase = !first_person && !locked && forward != 0;
+    let steer_in_chase = !first_person && !locked && (forward != 0 || resolved.steer != 0);
     // A/D carve and Q/E rotate need the run direction recomputed against the
     // live camera every frame; anything else invalidates the pure-W/S latch.
     if !steer_in_chase || resolved.steer != 0 || resolved.rotate_dir != 0 {
@@ -730,6 +725,7 @@ pub fn dispatch_movement_system(
         return;
     }
 
+    let was_moving = move_intent.moving;
     let moving = forward != 0 || strafe != 0 || steer_in_chase;
     let (intent_forward, intent_strafe) = if locked {
         (forward as f32, strafe as f32)
@@ -778,7 +774,10 @@ pub fn dispatch_movement_system(
             let h_current = yaw_for_heading(heading);
             let h_diff = wrap_signed_pi(h_target - h_current);
 
-            heading = if h_diff.abs() >= ABOUT_FACE_SNAP_RAD {
+            // From standstill the model faces the run direction on the first
+            // step (HorizonXI video 2026-07-20); the carve lerp only applies
+            // to direction changes while already running.
+            heading = if !was_moving || h_diff.abs() >= ABOUT_FACE_SNAP_RAD {
                 motion_h
             } else {
                 let h_alpha = 1.0 - (-HEADING_LERP_RATE_RAD_PER_SEC * time.delta_secs()).exp();
