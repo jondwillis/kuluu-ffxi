@@ -96,3 +96,11 @@ a movement test.
 - **Don't run `scripts/checks.sh test` while a GUI session is live** — the
   `agent_session` integration test logs into the same local LSB and kicks
   the running session mid-verify. Gate first, then launch.
+
+## Session gotchas (2026-07-19)
+
+- **Console lock kills capture**: if the macOS session locks (`CGSSessionScreenIsLocked=1` via `Quartz.CGSessionCopyCurrentDictionary()`), `screencapture` returns hard errors or solid black and System Events sees 0 windows — regardless of TCC grants. Check this FIRST when captures come back black; only a human unlock fixes it.
+- **Agent-socket `chat` bypasses the client's local `/`-command parser** — it sends a raw wire SAY. Server-side `!` GM commands work through it; client-side `/` commands (e.g. `/lights`) need real keystrokes into the chat bar.
+- **Agent-socket `move` persists server-side** (position survives relaunch); it is not a client-only hack. It also doesn't guarantee nearby NPCs stream in — prefer walking the last stretch for entity-visual checks.
+- **GM drive char**: `Verilamp` (gmlevel 5) on the local throwaway `verilight` account; `!zone`/`!settime` work as socket chat. Fresh `create-char` chars have gmlevel 0 and the server silently ignores `!zone`.
+- **Known intermittent**: `slab_allocator Use-after-free` burst at zone-in can black out all zone geometry for the whole session (kuluu-172i); relaunch once before diagnosing rendering changes.
