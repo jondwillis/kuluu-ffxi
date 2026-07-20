@@ -496,6 +496,10 @@ pub struct DialogState {
     /// Event-VM-rendered menu option labels for a choice frame.
     #[serde(default)]
     pub choices: Vec<String>,
+    /// Free-text entry frame (delivery-box recipient prompt): the viewer
+    /// answers with `AgentCommand::TextInput` instead of a menu choice.
+    #[serde(default)]
+    pub text_entry: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1762,6 +1766,13 @@ pub enum AgentCommand {
     },
 
     StopMove,
+
+    /// Free-text answer to a client-local text-entry dialog frame (currently
+    /// only the delivery-box recipient prompt). Ignored when no text entry is
+    /// pending.
+    TextInput {
+        text: String,
+    },
 
     RequestZoneChange {
         line_id: u32,

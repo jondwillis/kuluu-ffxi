@@ -1679,6 +1679,19 @@ async fn keepalive_loop(
 
     let mut dbox = crate::delivery_box::DeliveryBoxSession::default();
 
+    // Delivery-box recipient entry: `awaiting_recipient` is set while the
+    // name-entry frame is up (the next TextInput answers it);
+    // `pending_recipient` holds the name sent in a 0x04D Query until its
+    // PBX_RESULT RecipientCheck settles.
+    let mut awaiting_recipient = false;
+    let mut pending_recipient: Option<String> = None;
+
+    // LOC_INVENTORY mirror for the delivery-box item picker:
+    // slot -> (item_no, quantity, locked). Maintained inline from
+    // ITEM_LIST/ITEM_ATTR/ITEM_NUM before they reach handle_sub_packet.
+    let mut inv_mirror: std::collections::BTreeMap<u8, (u16, u32, bool)> =
+        std::collections::BTreeMap::new();
+
     let mut is_healing = false;
 
     let mut last_keepalive_pos: Vec3 = self_pos.pos;
@@ -1840,6 +1853,36 @@ async fn keepalive_loop(
                                 crate::local_menu::Advance::Delivery { op } => {
                                     let _ = event_tx.send(AgentEvent::EventEnded);
                                     send_pbx(map, &op, &mut sub_seq, server_last_seq, &event_tx).await;
+                                }
+                                crate::local_menu::Advance::DeliveryRecipient { frame } => {
+                                    // The next TextInput answers this frame.
+                                    awaiting_recipient = true;
+                                    let _ = event_tx.send(AgentEvent::EventDialog { dialog: frame });
+                                }
+                                crate::local_menu::Advance::DeliveryPut { slot } => {
+                                    // Offer sendable LOC_INVENTORY stacks: skip Gil
+                                    // (index 0), empty slots, equipped/locked gear,
+                                    // and NoDelivery items without CanSendAccount
+                                    // (dboxutils.cpp AddItemsToBeSent).
+                                    let items: Vec<crate::local_menu::PickableItem> = inv_mirror
+                                        .iter()
+                                        .filter(|&(&inv_slot, &(item_no, quantity, locked))| {
+                                            inv_slot != 0
+                                                && item_no != 0
+                                                && quantity != 0
+                                                && !locked
+                                                && ffxi_proto::item_flags::deliverable(item_no)
+                                        })
+                                        .map(|(&inv_slot, &(item_no, quantity, _))| {
+                                            crate::local_menu::PickableItem {
+                                                inventory_slot: inv_slot,
+                                                item_no,
+                                                quantity,
+                                            }
+                                        })
+                                        .collect();
+                                    let dialog = local_menu.open_delivery_pick(slot, &items);
+                                    let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                                 }
                                 crate::local_menu::Advance::Close => {
                                     let _ = event_tx.send(AgentEvent::EventEnded);
@@ -2245,6 +2288,27 @@ async fn keepalive_loop(
                                 let _ = event_tx.send(AgentEvent::Error {
                                     message: format!("item_stack send: {e}"),
                                 });
+                            }
+                        }
+                    }
+                    Some(AgentCommand::TextInput { text }) => {
+                        // Only the delivery-box recipient prompt takes free
+                        // text; ignore stray input otherwise.
+                        if awaiting_recipient {
+                            awaiting_recipient = false;
+                            let name = text.trim().to_string();
+                            if name.is_empty() {
+                                // Cleared entry: unlock any recipient and
+                                // re-render the Send panel.
+                                if let Some(dialog) = local_menu.set_recipient(None) {
+                                    let _ = event_tx.send(AgentEvent::EventDialog { dialog });
+                                }
+                            } else {
+                                // Verify the name server-side (0x04D Query)
+                                // before locking it; PBX_RESULT settles it.
+                                pending_recipient = Some(name.clone());
+                                let op = crate::state::DeliveryBoxOp::Query { recipient: name };
+                                send_pbx(map, &op, &mut sub_seq, server_last_seq, &event_tx).await;
                             }
                         }
                     }
@@ -2783,6 +2847,30 @@ async fn keepalive_loop(
                                 match decode::PbxResult::decode(sub.data) {
                                     Ok(r) => {
                                         let out = dbox.on_result(&r);
+                                        // Settle a pending recipient Query: an OK
+                                        // check locks the name into the Send panel
+                                        // (re-rendered with slots activated); a miss
+                                        // drops it (dbox already emits the notice).
+                                        for (_, update) in &out.updates {
+                                            if let crate::state::DeliveryBoxUpdate::RecipientCheck {
+                                                ok,
+                                                ..
+                                            } = update
+                                            {
+                                                if let Some(name) = pending_recipient.take() {
+                                                    let dialog = if *ok {
+                                                        local_menu.set_recipient(Some(name))
+                                                    } else {
+                                                        local_menu.set_recipient(None)
+                                                    };
+                                                    if let Some(dialog) = dialog {
+                                                        let _ = event_tx.send(
+                                                            AgentEvent::EventDialog { dialog },
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
                                         for (box_no, update) in out.updates {
                                             let _ = event_tx.send(
                                                 AgentEvent::DeliveryBoxUpdated { box_no, update },
@@ -2875,6 +2963,47 @@ async fn keepalive_loop(
                                     == Some(ffxi_proto::map::eventucoff_mode::CANCEL_EVENT)
                             {
                                 dialog_session.clear();
+                            }
+
+                            // Keep the LOC_INVENTORY mirror for the delivery-box
+                            // item picker current (category 0; index 0 is Gil).
+                            if sub.opcode == ffxi_proto::map::s2c::ITEM_LIST {
+                                if let Ok(l) = decode::ItemList::decode(sub.data) {
+                                    if l.category == 0 {
+                                        if l.item_no == 0 || l.quantity == 0 {
+                                            inv_mirror.remove(&l.index);
+                                        } else {
+                                            inv_mirror.insert(
+                                                l.index,
+                                                (l.item_no, l.quantity, l.lock_flg != 0),
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if sub.opcode == ffxi_proto::map::s2c::ITEM_ATTR {
+                                if let Ok(a) = decode::ItemAttr::decode(sub.data) {
+                                    if a.category == 0 {
+                                        if a.item_no == 0 || a.quantity == 0 {
+                                            inv_mirror.remove(&a.index);
+                                        } else {
+                                            inv_mirror.insert(
+                                                a.index,
+                                                (a.item_no, a.quantity, a.lock_flg != 0),
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if sub.opcode == ffxi_proto::map::s2c::ITEM_NUM {
+                                if let Ok(n) = decode::ItemNum::decode(sub.data) {
+                                    if n.category == 0 {
+                                        if n.quantity == 0 {
+                                            inv_mirror.remove(&n.index);
+                                        } else if let Some(e) = inv_mirror.get_mut(&n.index) {
+                                            e.1 = n.quantity;
+                                            e.2 = n.lock_flg != 0;
+                                        }
+                                    }
+                                }
                             }
 
                             let prev_self_pos = self_pos.pos;
@@ -3851,6 +3980,7 @@ fn decode_event_0x032(data: &[u8]) -> Option<crate::state::DialogState> {
         nums: Vec::new(),
         prompt: None,
         choices: Vec::new(),
+        text_entry: false,
     })
 }
 
@@ -3896,6 +4026,7 @@ fn decode_event_0x033(data: &[u8]) -> Option<crate::state::DialogState> {
         nums,
         prompt: None,
         choices: Vec::new(),
+        text_entry: false,
     })
 }
 
@@ -3930,6 +4061,7 @@ fn decode_event_0x034(data: &[u8]) -> Option<crate::state::DialogState> {
         nums,
         prompt: None,
         choices: Vec::new(),
+        text_entry: false,
     })
 }
 

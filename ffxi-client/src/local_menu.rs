@@ -79,7 +79,22 @@ pub const CANCEL_DELIVERY_ROW: &str = "Cancel delivery";
 /// Retail panel headers ("Delivery Box" receive / "Deliveries" send),
 /// artifacts/retail/moghouse-menu-notes.md.
 pub const RECEIVE_PANEL_PROMPT: &str = "Select an item from the delivery box.";
-pub const SEND_PANEL_PROMPT: &str = "Deliveries";
+/// Retail Send-panel header (artifacts/retail/moghouse-menu-notes.md:55).
+pub const SEND_PANEL_PROMPT: &str =
+    "Deliveries | After specifying recipient, place items in empty slots to send them to recipient's delivery box.";
+/// Send-panel recipient field, mirroring retail's text box above the grid.
+pub const RECIPIENT_ROW_PREFIX: &str = "Recipient: ";
+/// Prompt for the recipient name-entry frame.
+pub const RECIPIENT_PROMPT: &str = "Enter a recipient name.";
+pub const RECIPIENT_UNSET: &str = "(not specified)";
+/// An empty outbox grid cell (rows appear once the recipient is locked, like
+/// retail's cursor order: recipient OK first, then the slot grid activates).
+pub const EMPTY_SLOT_SUFFIX: &str = "(empty)";
+/// Retail's item list header once an empty slot is entered
+/// (artifacts/retail/moghouse-menu-notes.md:63 — `Items | Select an item.`).
+pub const PICK_ITEM_PROMPT: &str = "Items | Select an item.";
+pub const QUANTITY_PROMPT: &str = "Select a quantity.";
+pub const BACK_ROW: &str = "Back";
 
 /// LSB marks auction-house mail by a sender starting with "AH"; the retail
 /// client disables Return for it (vendor/server/src/map/packets/s2c/
@@ -167,6 +182,27 @@ enum Action {
     Delivery {
         op: DeliveryBoxOp,
     },
+    /// The Send-panel recipient field: the session prompts for a name.
+    DeliveryRecipient,
+    /// An empty outbox grid cell: the session opens the item picker from its
+    /// LOC_INVENTORY mirror.
+    DeliveryPut {
+        slot: u8,
+    },
+    /// An item-picker row: stage into `slot`, asking for a quantity first when
+    /// the stack holds more than one.
+    DeliveryPickItem {
+        slot: u8,
+        inventory_slot: u8,
+        item_no: u16,
+        quantity: u32,
+    },
+    /// A quantity row: emit the 0x04D Set for the stored recipient.
+    DeliveryStage {
+        slot: u8,
+        inventory_slot: u8,
+        quantity: u32,
+    },
     Stub(&'static str),
 }
 
@@ -211,6 +247,16 @@ pub enum Advance {
     Delivery {
         op: DeliveryBoxOp,
     },
+    /// The recipient field was picked: the session raises a text-entry dialog
+    /// frame; the answer comes back through [`LocalMenuSession::set_recipient`].
+    DeliveryRecipient {
+        frame: DialogState,
+    },
+    /// An empty outbox slot was picked: the session opens the item picker from
+    /// its LOC_INVENTORY mirror via [`LocalMenuSession::open_delivery_pick`].
+    DeliveryPut {
+        slot: u8,
+    },
     Close,
 }
 
@@ -222,6 +268,10 @@ pub struct LocalMenuSession {
     /// Snapshot behind the open box-content menu, so slot submenus can offer
     /// a Back row without re-querying the server.
     delivery: Option<(DeliveryBoxNo, [Option<DeliveryItem>; pbx::SLOT_COUNT])>,
+    /// Send-panel recipient, kept across per-op menu rebuilds (retail keeps the
+    /// locked name until the panel closes). Server-verified via 0x04D Query
+    /// before empty-slot rows activate.
+    recipient: Option<String>,
 }
 
 impl LocalMenuSession {
@@ -236,6 +286,7 @@ impl LocalMenuSession {
     pub fn clear(&mut self) {
         self.menu = None;
         self.delivery = None;
+        self.recipient = None;
     }
 
     /// The exit-door "Where to?" menu. "Change floors." shows when the player is
@@ -309,21 +360,32 @@ impl LocalMenuSession {
         slots: &[Option<DeliveryItem>; pbx::SLOT_COUNT],
     ) -> DialogState {
         self.delivery = Some((box_no, slots.clone()));
-        let mut rows: Vec<(String, Action)> = slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, cell)| {
-                cell.as_ref().map(|item| {
-                    (
-                        delivery_slot_label(box_no, item),
-                        Action::DeliverySlot {
-                            box_no,
-                            slot: i as u8,
-                        },
-                    )
-                })
-            })
-            .collect();
+        let mut rows: Vec<(String, Action)> = Vec::new();
+        if box_no == DeliveryBoxNo::Outgoing {
+            rows.push((
+                format!(
+                    "{RECIPIENT_ROW_PREFIX}{}",
+                    self.recipient.as_deref().unwrap_or(RECIPIENT_UNSET)
+                ),
+                Action::DeliveryRecipient,
+            ));
+        }
+        rows.extend(slots.iter().enumerate().filter_map(|(i, cell)| match cell {
+            Some(item) => Some((
+                delivery_slot_label(box_no, item),
+                Action::DeliverySlot {
+                    box_no,
+                    slot: i as u8,
+                },
+            )),
+            // Empty outbox cells activate only once the recipient is locked,
+            // matching retail's cursor order (recipient OK → grid).
+            None if box_no == DeliveryBoxNo::Outgoing && self.recipient.is_some() => Some((
+                format!("Slot {} {EMPTY_SLOT_SUFFIX}", i + 1),
+                Action::DeliveryPut { slot: i as u8 },
+            )),
+            None => None,
+        }));
         rows.push((
             CANCEL_ROW.to_string(),
             Action::Delivery {
@@ -344,6 +406,71 @@ impl LocalMenuSession {
     /// Re-open the Receive/Send submenu (after a PostClose ack).
     pub fn open_delivery_submenu(&mut self) -> DialogState {
         self.set(delivery_menu())
+    }
+
+    /// The Query-verified recipient, if one is locked.
+    pub fn recipient(&self) -> Option<&str> {
+        self.recipient.as_deref()
+    }
+
+    /// Lock a Query-verified recipient (`None` clears it) and rebuild the open
+    /// Send panel so its empty-slot rows (de)activate accordingly.
+    pub fn set_recipient(&mut self, name: Option<String>) -> Option<DialogState> {
+        self.recipient = name;
+        match self.delivery.clone() {
+            Some((DeliveryBoxNo::Outgoing, slots)) => {
+                Some(self.open_delivery_box(DeliveryBoxNo::Outgoing, &slots))
+            }
+            _ => None,
+        }
+    }
+
+    /// The item picker for an empty outbox `slot`. `items` is the session's
+    /// LOC_INVENTORY view, already filtered to sendable stacks (no EX, no
+    /// equipped gear; FLAG_CAN_SEND_ACCT gating happens server-side too).
+    pub fn open_delivery_pick(&mut self, slot: u8, items: &[PickableItem]) -> DialogState {
+        let rows = items
+            .iter()
+            .map(|it| {
+                (
+                    format!("{} x{}", item_name(it.item_no), it.quantity),
+                    Action::DeliveryPickItem {
+                        slot,
+                        inventory_slot: it.inventory_slot,
+                        item_no: it.item_no,
+                        quantity: it.quantity,
+                    },
+                )
+            })
+            .chain(std::iter::once((
+                BACK_ROW.to_string(),
+                Action::DeliveryBack,
+            )))
+            .collect();
+        self.set(Menu {
+            npc_id: MOG_MENU_ID,
+            npc_name: MOG_MENU_NPC_NAME,
+            prompt: PICK_ITEM_PROMPT.to_string(),
+            rows,
+        })
+    }
+
+    /// Emit the 0x04D Set for a staged pick; the recipient must still be
+    /// locked (it is menu-gated, so a miss means state was torn down under us).
+    fn stage(&mut self, slot: u8, inventory_slot: u8, quantity: u32) -> Advance {
+        let Some(recipient) = self.recipient.clone() else {
+            self.clear();
+            return Advance::Close;
+        };
+        self.menu = None;
+        Advance::Delivery {
+            op: DeliveryBoxOp::Set {
+                slot,
+                inventory_slot,
+                quantity,
+                recipient,
+            },
+        }
     }
 
     pub fn advance(&mut self, choice: Option<u32>) -> Advance {
@@ -427,9 +554,36 @@ impl LocalMenuSession {
                 Advance::DeliveryTake { box_no, slot }
             }
             Action::Delivery { op } => {
+                // Retail keeps the locked recipient until the Send panel
+                // closes; PostClose is the panel closing.
+                let recipient = (!matches!(op, DeliveryBoxOp::PostClose { .. }))
+                    .then(|| self.recipient.take())
+                    .flatten();
                 self.clear();
+                self.recipient = recipient;
                 Advance::Delivery { op }
             }
+            Action::DeliveryRecipient => Advance::DeliveryRecipient {
+                frame: recipient_entry_frame(),
+            },
+            Action::DeliveryPut { slot } => Advance::DeliveryPut { slot },
+            Action::DeliveryPickItem {
+                slot,
+                inventory_slot,
+                item_no,
+                quantity,
+            } => {
+                if quantity > 1 {
+                    Advance::Frame(self.set(quantity_menu(slot, inventory_slot, item_no, quantity)))
+                } else {
+                    self.stage(slot, inventory_slot, 1)
+                }
+            }
+            Action::DeliveryStage {
+                slot,
+                inventory_slot,
+                quantity,
+            } => self.stage(slot, inventory_slot, quantity),
             Action::Stub(notice) => Advance::Stub {
                 notice,
                 frame: frame(self.menu.as_ref().expect("menu still active")),
@@ -459,6 +613,7 @@ fn frame(menu: &Menu) -> DialogState {
         nums: Vec::new(),
         prompt: Some(menu.prompt.clone()),
         choices: menu.rows.iter().map(|(label, _)| label.clone()).collect(),
+        text_entry: false,
     }
 }
 
@@ -597,6 +752,63 @@ fn delivery_menu() -> Menu {
 /// Row label for an occupied slot: retail's grid cell (item, count,
 /// counterpart) plus the observed send-state suffixes "(preparing)"/"(sent)"
 /// (artifacts/retail/moghouse-menu-notes.md).
+/// One sendable LOC_INVENTORY stack offered by the item picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickableItem {
+    pub inventory_slot: u8,
+    pub item_no: u16,
+    pub quantity: u32,
+}
+
+/// The recipient text-entry frame. No choice rows: the session treats an
+/// empty `choices` frame with this prompt as free-text input (retail pops a
+/// name-entry box over the Send panel).
+fn recipient_entry_frame() -> DialogState {
+    DialogState {
+        event_id: MOG_MENU_ID,
+        npc_id: MOG_MENU_ID,
+        npc_name: Some(MOG_MENU_NPC_NAME.to_string()),
+        act_index: 0,
+        event_num: 0,
+        event_para: 0,
+        mode: 0,
+        event_num2: 0,
+        event_para2: 0,
+        strings: Vec::new(),
+        nums: Vec::new(),
+        prompt: Some(RECIPIENT_PROMPT.to_string()),
+        choices: Vec::new(),
+        text_entry: true,
+    }
+}
+
+/// Quantity rows 1..=stack for a picked stack. Retail uses a numeric spinner;
+/// the dialog list carries the same range.
+fn quantity_menu(slot: u8, inventory_slot: u8, item_no: u16, quantity: u32) -> Menu {
+    let rows = (1..=quantity)
+        .map(|q| {
+            (
+                format!("{} x{q}", item_name(item_no)),
+                Action::DeliveryStage {
+                    slot,
+                    inventory_slot,
+                    quantity: q,
+                },
+            )
+        })
+        .chain(std::iter::once((
+            BACK_ROW.to_string(),
+            Action::DeliveryBack,
+        )))
+        .collect();
+    Menu {
+        npc_id: MOG_MENU_ID,
+        npc_name: MOG_MENU_NPC_NAME,
+        prompt: QUANTITY_PROMPT.to_string(),
+        rows,
+    }
+}
+
 fn delivery_slot_label(box_no: DeliveryBoxNo, item: &DeliveryItem) -> String {
     let name = item_name(item.item_no);
     let who = item.counterpart.as_deref().unwrap_or("?");
@@ -1203,10 +1415,12 @@ mod tests {
 
         let mut s = LocalMenuSession::new();
         let f = s.open_delivery_box(DeliveryBoxNo::Outgoing, &slots);
-        assert!(f.choices[0].ends_with("(preparing)"));
-        assert!(f.choices[1].ends_with("(sent)"));
+        // choices[0] is the recipient row; occupied slots follow.
+        assert!(f.choices[0].starts_with(RECIPIENT_ROW_PREFIX));
+        assert!(f.choices[1].ends_with("(preparing)"));
+        assert!(f.choices[2].ends_with("(sent)"));
 
-        let sub = match pick(&mut s, &f, &f.choices[0].clone()) {
+        let sub = match pick(&mut s, &f, &f.choices[1].clone()) {
             Advance::Frame(f) => f,
             _ => panic!(),
         };
@@ -1219,7 +1433,7 @@ mod tests {
         }
 
         let f = s.open_delivery_box(DeliveryBoxNo::Outgoing, &slots);
-        let sub = match pick(&mut s, &f, &f.choices[1].clone()) {
+        let sub = match pick(&mut s, &f, &f.choices[2].clone()) {
             Advance::Frame(f) => f,
             _ => panic!(),
         };

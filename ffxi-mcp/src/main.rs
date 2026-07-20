@@ -870,6 +870,7 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         ShopSellReq { .. } => "shop_sell_req",
         ShopSellConfirm => "shop_sell_confirm",
         DeliveryBox { .. } => "delivery_box",
+        TextInput { .. } => "text_input",
     }
 }
 
