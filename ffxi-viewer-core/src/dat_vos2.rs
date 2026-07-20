@@ -20,7 +20,7 @@ use crate::skeleton_instance::{
     eval_bind_pose, eval_pose, pc_pivot_rotation, pc_pivot_translation, FfxiActor,
 };
 use crate::skinned_ffxi_material::{
-    FfxiJointMatrices, FfxiLightingUniform, FfxiMaterialFlags, FfxiSkinnedMaterial, ATTR_COLOR,
+    FfxiJointMatrices, FfxiLightingUniform, FfxiSkinnedFlags, FfxiSkinnedMaterial, ATTR_COLOR,
     ATTR_JOINT0, ATTR_JOINT1, ATTR_JOINT_WEIGHT, ATTR_NORMAL0, ATTR_NORMAL1, ATTR_POSITION0,
     ATTR_POSITION1,
 };
@@ -1373,7 +1373,7 @@ fn spawn_ffxi_actor(
             FfxiLightingUniform::default(),
             tex_handle,
             bind_joints.clone(),
-            FfxiMaterialFlags::default(),
+            FfxiSkinnedFlags::default(),
         ));
         out_materials.push(mat.clone());
 

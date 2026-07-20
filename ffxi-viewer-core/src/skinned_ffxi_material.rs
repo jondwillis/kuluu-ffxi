@@ -118,6 +118,38 @@ impl Default for FfxiMaterialFlags {
     }
 }
 
+// research/xim SkeletonMeshSection.kt:61 — skinned meshes alpha-test at 69/255.
+pub const SKINNED_ALPHA_DISCARD: f32 = 69.0 / 255.0;
+
+// FFXI half-color convention: 0x80 is the neutral multiplier (research/xim
+// ByteColor.half; GLDrawer.kt:329-331 feeds the mesh t_factor as uEffectColor).
+pub const T_FACTOR_NEUTRAL: f32 = 128.0;
+
+pub fn t_factor_tint(t_factor: [u8; 4]) -> Vec4 {
+    Vec4::new(
+        t_factor[0] as f32 / T_FACTOR_NEUTRAL,
+        t_factor[1] as f32 / T_FACTOR_NEUTRAL,
+        t_factor[2] as f32 / T_FACTOR_NEUTRAL,
+        t_factor[3] as f32 / T_FACTOR_NEUTRAL,
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, ShaderType)]
+pub struct FfxiSkinnedFlags {
+    pub flags: Vec4,
+    // Per-mesh t_factor modulation color (skel_mesh RenderProperties), neutral = 1.0.
+    pub tint: Vec4,
+}
+
+impl Default for FfxiSkinnedFlags {
+    fn default() -> Self {
+        Self {
+            flags: Vec4::new(1.0, 0.0, 0.0, 0.0),
+            tint: Vec4::ONE,
+        }
+    }
+}
+
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Asset, TypePath, Clone, Debug)]
@@ -125,7 +157,7 @@ pub struct FfxiSkinnedMaterial {
     pub lighting: FfxiLightingUniform,
     pub base_color_texture: Option<Handle<Image>>,
     pub joints: FfxiJointMatrices,
-    pub material_flags: FfxiMaterialFlags,
+    pub material_flags: FfxiSkinnedFlags,
     // All of one actor's sub-mesh materials share this id (the actor root entity
     // bits). joints + lighting are identical across them, so they share one set of
     // persistent GPU buffers uploaded ONCE per actor per frame.
@@ -143,7 +175,7 @@ impl FfxiSkinnedMaterial {
         lighting: FfxiLightingUniform,
         base_color_texture: Option<Handle<Image>>,
         joints: FfxiJointMatrices,
-        material_flags: FfxiMaterialFlags,
+        material_flags: FfxiSkinnedFlags,
     ) -> Self {
         Self {
             lighting,
@@ -163,7 +195,7 @@ struct SkinBuffers {
 
 struct FlagsBuffer {
     buffer: Buffer,
-    last: Vec4,
+    last: FfxiSkinnedFlags,
 }
 
 /// Render-world owner of the persistent material uniform buffers, written every
@@ -268,7 +300,7 @@ impl AsBindGroup for FfxiSkinnedMaterial {
                 count: None,
             },
             uniform(3, FfxiJointMatrices::min_size()),
-            uniform(4, FfxiMaterialFlags::min_size()),
+            uniform(4, FfxiSkinnedFlags::min_size()),
         ]
     }
 }
@@ -283,7 +315,7 @@ impl Material for FfxiSkinnedMaterial {
     }
 
     fn alpha_mode(&self) -> AlphaMode {
-        AlphaMode::Mask(0.271)
+        AlphaMode::Mask(SKINNED_ALPHA_DISCARD)
     }
 
     fn enable_prepass() -> bool {
@@ -380,17 +412,17 @@ fn upload_ffxi_material_buffers(
         match cache.flags.entry(mat.instance_id) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 let fb = e.get_mut();
-                if fb.last != mat.material_flags.flags {
+                if fb.last != mat.material_flags {
                     write_uniform(&queue, &fb.buffer, &mat.material_flags);
-                    fb.last = mat.material_flags.flags;
+                    fb.last = mat.material_flags.clone();
                 }
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                let buffer = uniform_buffer("ffxi_mat_flags", FfxiMaterialFlags::min_size());
+                let buffer = uniform_buffer("ffxi_mat_flags", FfxiSkinnedFlags::min_size());
                 write_uniform(&queue, &buffer, &mat.material_flags);
                 e.insert(FlagsBuffer {
                     buffer,
-                    last: mat.material_flags.flags,
+                    last: mat.material_flags.clone(),
                 });
             }
         }
@@ -412,5 +444,19 @@ impl Plugin for FfxiMaterialPlugin {
                 .init_resource::<FfxiMaterialBuffers>()
                 .add_systems(ExtractSchedule, upload_ffxi_material_buffers);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn t_factor_half_color_is_neutral() {
+        assert_eq!(t_factor_tint([0x80, 0x80, 0x80, 0x80]), Vec4::ONE);
+        assert_eq!(
+            t_factor_tint([0x00, 0x40, 0x80, 0xFF]),
+            Vec4::new(0.0, 0.5, 1.0, 255.0 / T_FACTOR_NEUTRAL)
+        );
     }
 }

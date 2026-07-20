@@ -29,7 +29,7 @@ use ffxi_dat::{walk_tree, ChunkKind, ChunkNode, DatRoot};
 use crate::combat_stance;
 use crate::dat_vos2::skeleton_file_id_for_race;
 use crate::skinned_ffxi_material::{
-    FfxiJointMatrices, FfxiLightingUniform, FfxiMaterialFlags, FfxiSkinnedMaterial, ATTR_COLOR,
+    FfxiJointMatrices, FfxiLightingUniform, FfxiSkinnedFlags, FfxiSkinnedMaterial, ATTR_COLOR,
     ATTR_JOINT0, ATTR_JOINT1, ATTR_JOINT_WEIGHT, ATTR_NORMAL0, ATTR_NORMAL1, ATTR_POSITION0,
     ATTR_POSITION1,
 };
@@ -93,6 +93,10 @@ pub struct LoadedActor {
     battle_clips: Arc<Vec<SkeletonAnimation>>,
 
     routines: Arc<HashMap<DatId, Scheduler>>,
+
+    // Particle generators + their sprite meshes/textures embedded in the actor
+    // DAT; auto-run generators (research/xim Actor.kt:724-734) start at spawn.
+    action_assets: Arc<crate::scheduler_runtime::ActionAssets>,
 }
 
 // Clip/scheduler parsing is the expensive tail of an actor load; deriving it here
@@ -173,6 +177,9 @@ fn prepare_actor_parts(
             skel_built.push(BuiltGroup {
                 mesh: build_mesh(buffer, joint_count),
                 texture_name: buffer.texture_name.clone(),
+                tint: crate::skinned_ffxi_material::t_factor_tint(
+                    buffer.render_properties.t_factor,
+                ),
             });
         }
     }
@@ -185,6 +192,7 @@ fn prepare_actor_parts(
         d3m_built.push(BuiltGroup {
             mesh: build_d3m_mesh(d3m),
             texture_name: d3m.texture_name_str(),
+            tint: Vec4::ONE,
         });
     }
 
@@ -349,6 +357,17 @@ pub fn load_npc(file_id: u32) -> Result<LoadedActor, String> {
     let mut effect_meshes = Vec::new();
     collect_d3m(&tree, &mut effect_meshes);
 
+    let (_schedulers, action_assets) = crate::scheduler_runtime::parse_action_bytes(&bytes);
+    // A D3m referenced by a particle generator is a particle sprite (XIM's
+    // ParticleMeshResource, drawn only by the particle stream — Particle.kt:577);
+    // rendering it as a static child too would double-draw it as an opaque slab.
+    let particle_meshes: std::collections::HashSet<[u8; 4]> = action_assets
+        .particle_defs
+        .values()
+        .map(|d| d.mesh_id)
+        .collect();
+    effect_meshes.retain(|d| !particle_meshes.contains(&d.name));
+
     let anim_dirs = vec![ResourceDir::from_bytes(bytes)];
     let (animations, battle_clips, routines) = derive_animation_sets(&anim_dirs, &[]);
     Ok(LoadedActor {
@@ -359,6 +378,7 @@ pub fn load_npc(file_id: u32) -> Result<LoadedActor, String> {
         animations,
         battle_clips,
         routines,
+        action_assets: Arc::new(action_assets),
     })
 }
 
@@ -492,6 +512,7 @@ pub fn load_pc(
         animations,
         battle_clips,
         routines,
+        action_assets: Arc::default(),
     })
 }
 
@@ -519,6 +540,13 @@ fn is_occluded(buffer: &MeshBuffer, occlusion: &std::collections::HashSet<u8>) -
 struct BuiltGroup {
     mesh: Mesh,
     texture_name: String,
+    // Per-mesh t_factor tint, neutral 1.0 (research/xim GLDrawer.kt:329-331; D3M
+    // children carry no RenderProperties record). displayTypeFlag is slot
+    // occlusion (ActorModel.kt:246-259, `is_occluded`), not a blend selector —
+    // skinned meshes always alpha-test at SKINNED_ALPHA_DISCARD
+    // (SkeletonMeshSection.kt:216); translucency/glow comes from the particle
+    // stream, never the static mesh.
+    tint: Vec4,
 }
 
 fn clamp_joint(idx: u16, joint_count: usize) -> u32 {
@@ -876,8 +904,25 @@ pub fn spawn_loaded_actor(
         facing_dir,
         scale,
     ));
+    insert_auto_run_effects(commands, actor_root, loaded);
 
     actor_root
+}
+
+// research/xim Actor.kt:127 — auto-run generators start at model-ready.
+fn insert_auto_run_effects(commands: &mut Commands, actor_root: Entity, loaded: &LoadedActor) {
+    if loaded
+        .action_assets
+        .particle_defs
+        .values()
+        .any(|d| d.auto_run)
+    {
+        commands
+            .entity(actor_root)
+            .insert(crate::particle_sim::ActorAutoRunEffects {
+                assets: Arc::clone(&loaded.action_assets),
+            });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -937,8 +982,9 @@ fn build_actor_children(
             FfxiLightingUniform::default(),
             tex_handle,
             parts.bind_joints.clone(),
-            FfxiMaterialFlags {
+            FfxiSkinnedFlags {
                 flags: Vec4::new(has_texture, 0.0, 0.0, 0.0),
+                tint: built.tint,
             },
         ));
         material_handles.push(mat.clone());
@@ -1062,6 +1108,7 @@ pub fn spawn_live_actor(
         facing_dir,
         scale,
     ));
+    insert_auto_run_effects(commands, actor_root, &prepared.loaded);
 
     actor_root
 }

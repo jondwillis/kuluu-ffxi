@@ -16,6 +16,10 @@ use crate::{DatError, Result};
 // Only section 2 (particle initializers) is needed for the visible stream.
 const HEADER_LEN: usize = 0x80;
 const PARTICLE_LINKED_DATA: u8 = 0x0B;
+// research/xim ParticleGeneratorParser.kt:68-70 (genFlags at body[0x69]);
+// continuous singleton + auto-run-at-model-ready semantics: Actor.kt:724-734.
+const GEN_FLAG_CONTINUOUS: u8 = 0x04;
+const GEN_FLAG_AUTO_RUN: u8 = 0x10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatId(pub [u8; 4]);
@@ -48,6 +52,9 @@ pub struct ParticleGeneratorDef {
     pub max_life_frames: f32,
     pub camera_billboard: bool,
 
+    pub continuous: bool,
+    pub auto_run: bool,
+
     pub init_scale: [f32; 3],
     pub init_color: [f32; 4],
     pub init_velocity: [f32; 3],
@@ -79,6 +86,9 @@ impl ParticleGeneratorDef {
         let frames_per_emission = u16_le(body, 0x66) as f32 + 1.0;
         let particles_per_emission = (body[0x68] as u32).max(1);
         let emission_variance = u16_le(body, 0x64) as f32;
+        let gen_flags = body[0x69];
+        let continuous = gen_flags & GEN_FLAG_CONTINUOUS != 0;
+        let auto_run = gen_flags & GEN_FLAG_AUTO_RUN != 0;
 
         // Section 2 = particle initializers.
         let sec2_raw = u32_le(body, 0x74) as usize;
@@ -226,6 +236,8 @@ impl ParticleGeneratorDef {
             base_position,
             max_life_frames,
             camera_billboard,
+            continuous,
+            auto_run,
             init_scale,
             init_color,
             init_velocity,
@@ -397,6 +409,23 @@ mod tests {
         assert!((def.init_velocity[1] + 0.005).abs() < 1e-6);
         assert_eq!(def.alpha_track, Some(*b"k1a0"));
         assert_eq!(def.scale_x_track, None);
+    }
+
+    #[test]
+    fn gen_flags_decode_auto_run_and_continuous() {
+        let mut setup = op(0x01, 12, &[]);
+        setup[4 + 29] = PARTICLE_LINKED_DATA;
+        let mut body = build(&setup, 1, 1);
+        body[0x69] = GEN_FLAG_AUTO_RUN | GEN_FLAG_CONTINUOUS;
+        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+        assert!(def.auto_run);
+        assert!(def.continuous);
+
+        let mut body = build(&setup, 1, 1);
+        body[0x69] = 0;
+        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+        assert!(!def.auto_run);
+        assert!(!def.continuous);
     }
 
     #[test]

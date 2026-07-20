@@ -46,9 +46,10 @@ struct FfxiJoints {
     matrices: array<mat4x4<f32>, 128>,
 };
 
-// Mirror of `FfxiMaterialFlags`. `flags.x` = has_texture (1.0 / 0.0).
-struct FfxiMaterialFlags {
+// Mirror of `FfxiSkinnedFlags`. `flags.x` = has_texture (1.0 / 0.0).
+struct FfxiSkinnedFlags {
     flags: vec4<f32>,
+    tint: vec4<f32>,
 };
 
 // Only the bindings this pass needs (the lighting uniform at binding 0 is part
@@ -56,7 +57,7 @@ struct FfxiMaterialFlags {
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var base_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var base_samp: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> joints: FfxiJoints;
-@group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> material_flags: FfxiMaterialFlags;
+@group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> material_flags: FfxiSkinnedFlags;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -132,7 +133,7 @@ fn prepass_alpha_discard(uv: vec2<f32>) {
     let has_texture = material_flags.flags.x > 0.5;
     if (has_texture) {
         let texel = textureSample(base_tex, base_samp, uv);
-        if (texel.a < 0.271) {
+        if (texel.a < 69.0 / 255.0) {
             discard;
         }
     }

@@ -46,6 +46,23 @@ struct LiveGenerator {
     emit_window_frames: f32,
     mesh: Handle<Mesh>,
     entity: Entity,
+    // research/xim ParticleGenerator.kt:56 — auto-run generators never finish
+    // emitting; they live until their mesh entity (a child of the actor root)
+    // is despawned.
+    auto_run: bool,
+    // Fixed particle orientation (init_rotation); None = camera billboard.
+    orientation: Option<Quat>,
+    // The mesh entity is a child of the actor root, so vertex positions are
+    // built in the actor's FFXI-local frame instead of world space.
+    actor_local: bool,
+}
+
+// Auto-run particle generators embedded in an actor DAT (research/xim
+// Actor.kt:724-734 startAutoRunParticles), attached at actor spawn by
+// ffxi_actor_render and started by `spawn_actor_auto_run_particles`.
+#[derive(Component)]
+pub struct ActorAutoRunEffects {
+    pub assets: std::sync::Arc<ActionAssets>,
 }
 
 struct Particle {
@@ -137,7 +154,95 @@ pub fn spawn_particle_generators(
             emit_window_frames,
             mesh,
             entity,
+            auto_run: false,
+            orientation: None,
+            actor_local: false,
         });
+    }
+}
+
+// research/xim Actor.kt:127,724-734 — at model-ready, every generator in the
+// actor DAT flagged auto-run starts immediately and emits forever. The mesh
+// entity is a child of the actor root (which carries the FFXI->Bevy basis), so
+// particle math stays in the DAT's own FFXI-local frame and the effect follows
+// and despawns with the actor.
+pub fn spawn_actor_auto_run_particles(
+    q_added: Query<(Entity, &ActorAutoRunEffects), Added<ActorAutoRunEffects>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut mats: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut sim: ResMut<ParticleSimulator>,
+    mut commands: Commands,
+) {
+    for (actor_root, fx) in &q_added {
+        for (name, def) in fx.assets.particle_defs.iter() {
+            if !def.auto_run {
+                continue;
+            }
+            let def = *def;
+            let Some(d3m) = fx.assets.d3ms.get(&def.mesh_id) else {
+                continue;
+            };
+            let Some(template) = sprite_template(d3m) else {
+                continue;
+            };
+
+            let tex = d3m.texture_name[8..12]
+                .try_into()
+                .ok()
+                .and_then(|tex_name: [u8; 4]| fx.assets.images.get(&tex_name))
+                .map(|t| images.add(decoded_texture_to_image(t)));
+            let blend = match def.blend {
+                ffxi_dat::particle_gen::ParticleBlend::Additive => D3mBlendMode::Additive,
+                ffxi_dat::particle_gen::ParticleBlend::Blend => D3mBlendMode::Blended,
+                ffxi_dat::particle_gen::ParticleBlend::Subtract => D3mBlendMode::Subtractive,
+            };
+            let mat = mats.add(d3m_material(blend, tex));
+            let mesh = meshes.add(empty_mesh());
+
+            let entity = commands
+                .spawn((
+                    InGameEntity,
+                    Mesh3d(mesh.clone()),
+                    MeshMaterial3d(mat),
+                    Transform::IDENTITY,
+                    ChildOf(actor_root),
+                    bevy::camera::visibility::NoFrustumCulling,
+                    bevy::light::NotShadowCaster,
+                    bevy::light::NotShadowReceiver,
+                ))
+                .id();
+
+            debug!(
+                "auto-run particle generator {} mesh {} blend {:?}",
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(&def.mesh_id),
+                def.blend,
+            );
+
+            let resolve = |id: Option<[u8; 4]>| -> Option<KeyFrameTrack> {
+                id.and_then(|i| fx.assets.keyframes.get(&i).cloned())
+            };
+            let rot = def.init_rotation;
+            sim.generators.push(LiveGenerator {
+                scale_x: resolve(def.scale_x_track),
+                scale_y: resolve(def.scale_y_track),
+                alpha: resolve(def.alpha_track),
+                template,
+                origin: Vec3::from_array(def.base_position),
+                particles: Vec::new(),
+                emit_accum: 0.0,
+                age_frames: 0.0,
+                emit_window_frames: 0.0,
+                mesh,
+                entity,
+                auto_run: true,
+                orientation: (!def.camera_billboard)
+                    .then(|| Quat::from_euler(EulerRot::XYZ, rot[0], rot[1], rot[2])),
+                actor_local: true,
+                def,
+            });
+        }
     }
 }
 
@@ -146,9 +251,14 @@ pub fn tick_particle_simulator(time: Res<Time>, mut sim: ResMut<ParticleSimulato
     for g in &mut sim.generators {
         g.age_frames += frames;
 
+        // research/xim ParticleGenerator.kt:66 — completed particles are swept
+        // before emission, so a continuous singleton re-emits the same tick its
+        // predecessor expires.
+        g.particles.retain(|p| p.age_frames < p.life_frames);
+
         // research/xim: a maxLifeSpan of 0 marks a singleton — emit one particle once.
         let singleton = g.def.is_singleton();
-        let emitting = g.age_frames <= g.emit_window_frames.max(1.0);
+        let emitting = g.auto_run || g.age_frames <= g.emit_window_frames.max(1.0);
         if singleton {
             if g.particles.is_empty() && g.age_frames <= frames {
                 emit(g, g.emit_window_frames.max(g.def.max_life_frames).max(1.0));
@@ -156,9 +266,19 @@ pub fn tick_particle_simulator(time: Res<Time>, mut sim: ResMut<ParticleSimulato
         } else if emitting {
             g.emit_accum += frames;
             while g.emit_accum >= g.def.frames_per_emission {
+                // research/xim ParticleGenerator.kt:80 — a continuous-singleton
+                // generator holds one live particle and re-emits the moment it
+                // expires (the accumulator stays primed, capped to one period).
+                if g.def.continuous && !g.particles.is_empty() {
+                    g.emit_accum = g.def.frames_per_emission;
+                    break;
+                }
                 g.emit_accum -= g.def.frames_per_emission;
                 for _ in 0..g.def.particles_per_emission {
                     emit(g, g.def.max_life_frames);
+                    if g.def.continuous {
+                        break;
+                    }
                 }
             }
         }
@@ -184,30 +304,50 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
 
 pub fn sync_particle_meshes(
     cam: Query<&GlobalTransform, With<OperatorCamera>>,
+    q_mesh_xf: Query<&GlobalTransform, With<Mesh3d>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut sim: ResMut<ParticleSimulator>,
     mut commands: Commands,
 ) {
     let cam_rot = cam.iter().next().map(|t| t.rotation()).unwrap_or_default();
 
-    let mut dead = Vec::new();
+    // (index, despawn-needed); indices ascending so the reverse sweep below can
+    // swap_remove safely.
+    let mut reap: Vec<(usize, bool)> = Vec::new();
     for (i, g) in sim.generators.iter().enumerate() {
+        // The mesh entity despawns with its actor (auto-run generators are
+        // children of the actor root); reap the simulator entry when it's gone.
+        let Ok(entity_xf) = q_mesh_xf.get(g.entity) else {
+            reap.push((i, false));
+            continue;
+        };
+        // In the actor-local frame a billboard must cancel the parent's
+        // FFXI->Bevy basis: parent_rot * rot == cam_rot. Fixed-orientation
+        // meshes use their DAT rotation directly in the local frame.
+        let rot = match (g.orientation, g.actor_local) {
+            (Some(q), _) => q,
+            (None, true) => entity_xf.rotation().inverse() * cam_rot,
+            (None, false) => cam_rot,
+        };
         if let Some(mut mesh) = meshes.get_mut(&g.mesh) {
-            rebuild_mesh(g, cam_rot, &mut mesh);
+            rebuild_mesh(g, rot, &mut mesh);
         }
-        let done = g.particles.is_empty() && g.age_frames > g.emit_window_frames.max(1.0);
+        let done =
+            !g.auto_run && g.particles.is_empty() && g.age_frames > g.emit_window_frames.max(1.0);
         if done {
-            dead.push(i);
+            reap.push((i, true));
         }
     }
 
-    for &i in dead.iter().rev() {
+    for &(i, despawn) in reap.iter().rev() {
         let g = sim.generators.swap_remove(i);
-        commands.entity(g.entity).despawn();
+        if despawn {
+            commands.entity(g.entity).despawn();
+        }
     }
 }
 
-fn rebuild_mesh(g: &LiveGenerator, cam_rot: Quat, mesh: &mut Mesh) {
+fn rebuild_mesh(g: &LiveGenerator, rot: Quat, mesh: &mut Mesh) {
     let verts_per = g.template.positions.len();
     let n = g.particles.len();
     let mut positions = Vec::with_capacity(n * verts_per);
@@ -242,10 +382,17 @@ fn rebuild_mesh(g: &LiveGenerator, cam_rot: Quat, mesh: &mut Mesh) {
         };
         let world = g.origin + p.pos;
 
+        // Billboard sprites are flat (z unused); a fixed-orientation 3D particle
+        // mesh keeps its DAT depth axis scaled by the untracked init z-scale.
+        let sz = if g.orientation.is_some() {
+            g.def.init_scale[2]
+        } else {
+            1.0
+        };
         let base = positions.len() as u32;
         for (tp, uv) in g.template.positions.iter().zip(&g.template.uvs) {
-            let local = Vec3::new(tp.x * sx, tp.y * sy, tp.z);
-            positions.push((world + cam_rot * local).to_array());
+            let local = Vec3::new(tp.x * sx, tp.y * sy, tp.z * sz);
+            positions.push((world + rot * local).to_array());
             uvs.push(*uv);
             colors.push([rgb.x, rgb.y, rgb.z, vert_a]);
         }
@@ -304,6 +451,8 @@ mod tests {
             base_position: [0.0, 0.5, 0.0],
             max_life_frames: life,
             camera_billboard: true,
+            continuous: false,
+            auto_run: false,
             init_scale: [0.1, 0.1, 1.0],
             init_color: [0.2, 0.2, 0.6, 0.5],
             init_velocity: [0.0, 0.01, 0.0],
@@ -336,23 +485,35 @@ mod tests {
             emit_window_frames: window,
             mesh: Handle::default(),
             entity: Entity::PLACEHOLDER,
+            auto_run: false,
+            orientation: None,
+            actor_local: false,
         }
     }
 
     // Drive the emission math directly (no Bevy world): one frame's worth of advance per call.
+    // Mirrors tick_particle_simulator's per-generator body.
     fn advance(g: &mut LiveGenerator, frames: f32) {
         g.age_frames += frames;
+        g.particles.retain(|p| p.age_frames < p.life_frames);
         if g.def.is_singleton() {
             if g.particles.is_empty() && g.age_frames <= frames {
                 let l = g.emit_window_frames.max(g.def.max_life_frames).max(1.0);
                 emit(g, l);
             }
-        } else if g.age_frames <= g.emit_window_frames.max(1.0) {
+        } else if g.auto_run || g.age_frames <= g.emit_window_frames.max(1.0) {
             g.emit_accum += frames;
             while g.emit_accum >= g.def.frames_per_emission {
+                if g.def.continuous && !g.particles.is_empty() {
+                    g.emit_accum = g.def.frames_per_emission;
+                    break;
+                }
                 g.emit_accum -= g.def.frames_per_emission;
                 for _ in 0..g.def.particles_per_emission {
                     emit(g, g.def.max_life_frames);
+                    if g.def.continuous {
+                        break;
+                    }
                 }
             }
         }
@@ -391,6 +552,48 @@ mod tests {
         }
         assert_eq!(g.particles.len(), 1, "singleton emits exactly once");
         assert!(g.particles[0].pos.y > 0.0, "velocity integrated");
+    }
+
+    #[test]
+    fn auto_run_keeps_emitting_past_window() {
+        let mut g = live(def(2.0, 1.0, 1), 3.0);
+        g.auto_run = true;
+        for _ in 0..30 {
+            advance(&mut g, 1.0);
+        }
+        assert!(
+            !g.particles.is_empty(),
+            "auto-run generators never stop emitting"
+        );
+    }
+
+    #[test]
+    fn continuous_singleton_holds_one_particle_and_replaces_on_expiry() {
+        let mut d = def(4.0, 1.0, 3);
+        d.continuous = true;
+        let mut g = live(d, 1.0);
+        g.auto_run = true;
+        let mut max_alive = 0usize;
+        let mut empty_streak = 0usize;
+        let mut max_empty_streak = 0usize;
+        for _ in 0..20 {
+            advance(&mut g, 1.0);
+            max_alive = max_alive.max(g.particles.len());
+            if g.particles.is_empty() {
+                empty_streak += 1;
+                max_empty_streak = max_empty_streak.max(empty_streak);
+            } else {
+                empty_streak = 0;
+            }
+        }
+        assert_eq!(
+            max_alive, 1,
+            "continuous singleton caps at one live particle"
+        );
+        assert!(
+            max_empty_streak <= 1,
+            "an expired particle is replaced within one tick (gap was {max_empty_streak})"
+        );
     }
 
     #[test]

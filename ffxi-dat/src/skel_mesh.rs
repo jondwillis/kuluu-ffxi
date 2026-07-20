@@ -13,6 +13,10 @@ pub struct RenderProperties {
     pub specular_highlight_power: f32,
     pub display_type_flag: u8,
     pub ambient_multiplier: f32,
+    // Undecoded (research/xim SkeletonMeshSection.kt:363-366: flag0, displayType, flag2, flag3).
+    pub flag0: u8,
+    pub flag2: u8,
+    pub flag3: u8,
 }
 
 impl Default for RenderProperties {
@@ -23,6 +27,9 @@ impl Default for RenderProperties {
             specular_highlight_power: 0.0,
             display_type_flag: 0,
             ambient_multiplier: 1.0,
+            flag0: 0,
+            flag2: 0,
+            flag3: 0,
         }
     }
 }
@@ -434,10 +441,10 @@ fn read_render_properties(c: &mut Cursor) -> RenderProperties {
     let t_factor = c.next_bgra();
     let _f0 = c.next_f32();
     let _f1 = c.next_f32();
-    let _flag0 = c.next8();
+    let flag0 = c.next8();
     let display_type = c.next8();
-    let _flag2 = c.next8();
-    let _flag3 = c.next8();
+    let flag2 = c.next8();
+    let flag3 = c.next8();
     let ambient_multiplier = c.next_f32();
     let _unk0 = c.next32();
     let _unk1 = c.next32();
@@ -452,6 +459,9 @@ fn read_render_properties(c: &mut Cursor) -> RenderProperties {
         specular_highlight_power,
         display_type_flag: display_type,
         ambient_multiplier,
+        flag0,
+        flag2,
+        flag3,
     }
 }
 
