@@ -1,8 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
-use ffxi_viewer_core::snapshot::ToastEvent;
-use ffxi_viewer_core::{InputMode, SceneState, WorldEntity};
+use ffxi_viewer_core::{SceneState, WorldEntity};
 
 use super::AppPhase;
 
@@ -16,7 +15,6 @@ impl Plugin for NavmeshOverlayPlugin {
                 Update,
                 (
                     swap_navmesh_on_zone_change,
-                    toggle_navmesh_overlay,
                     draw_navmesh_overlay.run_if(overlay_visible),
                 )
                     .run_if(in_state(AppPhase::InGame)),
@@ -48,27 +46,6 @@ pub struct NavmeshState {
 
 fn overlay_visible(visible: Res<NavmeshOverlayVisible>) -> bool {
     visible.0
-}
-
-fn toggle_navmesh_overlay(
-    keys: Res<ButtonInput<KeyCode>>,
-    mode: Res<InputMode>,
-    mut visible: ResMut<NavmeshOverlayVisible>,
-    mut toasts: MessageWriter<ToastEvent>,
-) {
-    if !matches!(*mode, InputMode::World) {
-        return;
-    }
-    if !keys.just_pressed(KeyCode::KeyN) {
-        return;
-    }
-    visible.0 = !visible.0;
-    let msg = if visible.0 {
-        "navmesh overlay: ON".to_string()
-    } else {
-        "navmesh overlay: OFF".to_string()
-    };
-    toasts.write(ToastEvent::debug(msg));
 }
 
 fn swap_navmesh_on_zone_change(scene: Res<SceneState>, mut state: ResMut<NavmeshState>) {

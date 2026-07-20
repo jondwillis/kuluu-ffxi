@@ -313,6 +313,7 @@ pub fn update_chat_panel(
     rows: Query<(&ChatRow, &Children), Without<ChatPanel>>,
     body_q: Query<&Children, With<ChatRowBody>>,
     mut span_q: Query<(&mut TextSpan, &mut TextColor), With<ChatRowSpan>>,
+    verbosity: Res<super::HudVerbosity>,
 ) {
     let now = time.elapsed_secs();
 
@@ -322,7 +323,10 @@ pub fn update_chat_panel(
         let filtered: Vec<&ChatLine> = all
             .iter()
             .copied()
-            .filter(|l| panel.kind.accepts(l.channel))
+            .filter(|l| {
+                panel.kind.accepts(l.channel)
+                    && crate::snapshot::chat_line_visible(l.channel, verbosity.dev_hud)
+            })
             .collect();
 
         let scroll_offset = match panel.kind {
@@ -538,6 +542,7 @@ pub fn chat_wheel_scroll_system(
     mut battle_accum: ResMut<BattleScrollAccum>,
     mut debug_accum: ResMut<DebugScrollAccum>,
     mut pointer: ResMut<MousePointer>,
+    verbosity: Res<super::HudVerbosity>,
 ) {
     let mut delta: f32 = 0.0;
     for ev in wheel.read() {
@@ -559,7 +564,13 @@ pub fn chat_wheel_scroll_system(
     };
 
     let all = rendered_chat(&state);
-    let buffer_len = all.iter().filter(|l| kind.accepts(l.channel)).count();
+    let buffer_len = all
+        .iter()
+        .filter(|l| {
+            kind.accepts(l.channel)
+                && crate::snapshot::chat_line_visible(l.channel, verbosity.dev_hud)
+        })
+        .count();
     match kind {
         ChatKind::Social => {
             let (rows, frac) = apply_wheel_delta(scroll.rows, accum.frac, delta, buffer_len);
@@ -611,9 +622,17 @@ pub fn chat_auto_switch_and_unread_system(
     mut active: ResMut<ActiveChatTab>,
     mut unread: ResMut<ChatUnread>,
     mut tracker: ResMut<ChatActivityTracker>,
+    verbosity: Res<super::HudVerbosity>,
 ) {
     let all = rendered_chat(&state);
-    let count = |kind: ChatKind| all.iter().filter(|l| kind.accepts(l.channel)).count();
+    let count = |kind: ChatKind| {
+        all.iter()
+            .filter(|l| {
+                kind.accepts(l.channel)
+                    && crate::snapshot::chat_line_visible(l.channel, verbosity.dev_hud)
+            })
+            .count()
+    };
     let kinds = [
         (ChatKind::Social, count(ChatKind::Social), tracker.social),
         (ChatKind::Battle, count(ChatKind::Battle), tracker.battle),

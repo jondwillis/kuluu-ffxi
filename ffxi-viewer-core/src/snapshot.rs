@@ -95,6 +95,10 @@ impl ToastEvent {
     }
 }
 
+pub fn chat_line_visible(channel: ChatChannel, dev_hud: bool) -> bool {
+    dev_hud || channel != ChatChannel::Debug
+}
+
 pub fn drain_toast_events(mut state: ResMut<SceneState>, mut events: MessageReader<ToastEvent>) {
     for ev in events.read() {
         state.push_local_toast(ev.line.clone());
@@ -259,6 +263,20 @@ mod tests {
             animation: 0,
             animationsub: 0,
             status: 0,
+        }
+    }
+
+    #[test]
+    fn debug_lines_hidden_unless_dev_hud() {
+        assert!(!chat_line_visible(ChatChannel::Debug, false));
+        assert!(chat_line_visible(ChatChannel::Debug, true));
+    }
+
+    #[test]
+    fn non_debug_lines_visible_regardless_of_dev_hud() {
+        for channel in [ChatChannel::System, ChatChannel::Say, ChatChannel::Battle] {
+            assert!(chat_line_visible(channel, false));
+            assert!(chat_line_visible(channel, true));
         }
     }
 
