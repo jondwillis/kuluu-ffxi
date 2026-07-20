@@ -330,6 +330,10 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
             Update,
             combat_stance::predict_entities_system.after(sync_entities_system),
         );
+        app.add_systems(
+            Update,
+            scene::self_visual_yaw_system.after(sync_entities_system),
+        );
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,

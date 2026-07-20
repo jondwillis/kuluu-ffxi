@@ -272,7 +272,9 @@ pub fn sync_entities_system(
                             t.translation.y
                         };
                         t.translation = Vec3::new(world_pos.x, y, world_pos.z);
-                        t.rotation = heading_to_quat(wire.heading);
+                        // Rotation is owned by self_visual_yaw_system: the
+                        // movement heading snaps (about-face, first step) but
+                        // the rendered body should whip around, not teleport.
                     } else if matches!(wire.kind, EntityKind::Npc | EntityKind::Other) {
                         let smoothed = apply_visual_smoothing(t.translation, world_pos);
                         t.translation = Vec3::new(smoothed.x, t.translation.y, smoothed.z);
@@ -476,6 +478,26 @@ pub fn pick_mob_material(
 fn heading_to_quat(heading: u8) -> Quat {
     let angle = (heading as f32) * std::f32::consts::TAU / 256.0;
     Quat::from_rotation_y(-angle)
+}
+
+/// Retail snaps the *movement* heading instantly (about-face, first step from
+/// standstill), but the rendered body whips around rather than teleporting.
+/// This slerps only the self model's visible yaw toward the logical heading;
+/// travel direction is unaffected. Rate is tuned so a 180° flip completes in
+/// roughly a quarter second.
+const SELF_VISUAL_YAW_RATE: f32 = 14.0;
+
+pub fn self_visual_yaw_system(
+    time: Res<Time>,
+    state: Res<SceneState>,
+    mut q_self: Query<&mut Transform, With<IsSelf>>,
+) {
+    let Ok(mut t) = q_self.single_mut() else {
+        return;
+    };
+    let target = heading_to_quat(state.snapshot.self_pos.heading);
+    let alpha = 1.0 - (-SELF_VISUAL_YAW_RATE * time.delta_secs()).exp();
+    t.rotation = t.rotation.slerp(target, alpha);
 }
 
 #[derive(Resource, Default, Debug, Clone)]

@@ -1071,6 +1071,16 @@ const CARVE_FOLLOW_RATE: f32 = 0.55;
 
 const AUTO_RECENTER_RATE: f32 = 2.5;
 
+/// Retail plants the chase camera when the character deliberately runs toward
+/// it (unlocked S / about-face): the follow must not swing around to the
+/// character's back mid-run. A/D carves sit near ±π/2 and must still follow,
+/// so the hold only engages past this threshold.
+const RECENTER_HOLD_RAD: f32 = 2.0;
+
+pub fn recenter_follow_allowed(yaw_diff: f32) -> bool {
+    yaw_diff.abs() < RECENTER_HOLD_RAD
+}
+
 const FP_LOCK_PITCH_RATE: f32 = 3.0;
 
 const TARGET_HEAD_OFFSET_Y: f32 = 1.5;
@@ -1131,7 +1141,9 @@ pub fn camera_polish_system(
             diff -= tau;
         }
         let alpha = 1.0 - (-rate * time.delta_secs()).exp();
-        chase.yaw += diff * alpha;
+        if recenter_follow_allowed(diff) {
+            chase.yaw += diff * alpha;
+        }
     }
 
     if !matches!(*camera_mode, CameraMode::FirstPerson) {
@@ -1378,6 +1390,22 @@ mod tests {
                 "cam={cam}"
             );
         }
+    }
+
+    #[test]
+    fn recenter_holds_camera_when_running_toward_it() {
+        // S about-face: heading is a full π from the camera yaw — camera stays put.
+        assert!(!recenter_follow_allowed(std::f32::consts::PI));
+        assert!(!recenter_follow_allowed(-std::f32::consts::PI));
+        assert!(!recenter_follow_allowed(2.5));
+    }
+
+    #[test]
+    fn recenter_follows_carves_and_forward_travel() {
+        // A/D carves sit near ±π/2; forward travel near 0. Both must follow.
+        assert!(recenter_follow_allowed(0.0));
+        assert!(recenter_follow_allowed(std::f32::consts::FRAC_PI_2));
+        assert!(recenter_follow_allowed(-std::f32::consts::FRAC_PI_2));
     }
 
     #[test]
