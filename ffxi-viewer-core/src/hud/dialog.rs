@@ -308,6 +308,7 @@ mod tests {
             prompt: None,
             choices: vec![],
             text_entry: false,
+            grid: None,
         }
     }
 
