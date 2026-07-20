@@ -762,16 +762,21 @@ pub fn dispatch_movement_system(
         };
 
         if raw_step > 0.0 {
-            let (mv_x, mv_y) = heading_to_forward(motion_h);
-            turn_dx = mv_x * raw_step;
-            turn_dy = mv_y * raw_step;
-
             let h_target = yaw_for_heading(motion_h);
             let h_current = yaw_for_heading(heading);
             let h_diff = wrap_signed_pi(h_target - h_current);
 
             let h_alpha = 1.0 - (-HEADING_LERP_RATE_RAD_PER_SEC * time.delta_secs()).exp();
             heading = heading_for_yaw(h_current + h_diff * h_alpha);
+
+            // Translate along the body's current (lerped) heading, not the
+            // target run direction. Retail velocity is always body-aligned:
+            // a direction change carves an arc as the model turns. Stepping
+            // along motion_h while heading still lerps decouples facing from
+            // travel and reads as ice-skating.
+            let (mv_x, mv_y) = heading_to_forward(heading);
+            turn_dx = mv_x * raw_step;
+            turn_dy = mv_y * raw_step;
         }
 
         // Camera follow while carving is camera_polish_system's auto-recenter
