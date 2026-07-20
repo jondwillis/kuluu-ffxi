@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use bevy::window::{PresentMode, PrimaryWindow};
 use ffxi_viewer_core::dat_mmb::LoadMmbRequest;
 use ffxi_viewer_core::dat_mzb::LoadMzbRequest;
-use ffxi_viewer_core::hud::chat_panel::ChatScroll;
+use ffxi_viewer_core::hud::chat_panel::{ActiveChatTab, ChatScroll};
 use ffxi_viewer_core::{
     Action, Bindings, ChatBuffer, DialogCursor, InputMode, MenuKind, MenuStack, Preset,
     QuickActionState, SceneState, Target,
@@ -84,6 +84,8 @@ pub struct SlashWriters<'w, 's> {
     pub trade_intent: MessageWriter<'w, ffxi_viewer_core::hud::trade::TradeIntent>,
 
     pub select_target: ResMut<'w, SelectTargetMode>,
+
+    pub active_chat_tab: ResMut<'w, ActiveChatTab>,
 }
 
 #[derive(SystemParam)]
@@ -195,6 +197,10 @@ pub fn text_input_system(
                         slash_writers.select_target.active = false;
                         continue;
                     }
+                }
+                if bindings.matches_logical(Action::SelectActiveWindow, &ev.logical_key) {
+                    slash_writers.active_chat_tab.0 = slash_writers.active_chat_tab.0.cycle_next();
+                    continue;
                 }
                 if let Some(next) = handle_world_key(
                     &ev.logical_key,

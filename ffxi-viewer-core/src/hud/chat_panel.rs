@@ -123,6 +123,25 @@ pub struct ChatAutoSwitchToggle;
 pub struct ChatAutoSwitchLabel;
 
 impl ChatKind {
+    /// The display order of the tab bar (`spawn_chat_tab_bar_as_child`): Chat,
+    /// Battle, System. Retail's "Select active window" key (`SelectActiveWindow`)
+    /// steps focus along this order and wraps, the field-state analog of the
+    /// item window's `select_active_window` pane stepping.
+    pub const TAB_ORDER: [ChatKind; 3] = [ChatKind::Social, ChatKind::Battle, ChatKind::Debug];
+
+    pub fn cycle_next(self) -> ChatKind {
+        let pos = Self::TAB_ORDER.iter().position(|&k| k == self).unwrap_or(0);
+        Self::TAB_ORDER[(pos + 1) % Self::TAB_ORDER.len()]
+    }
+
+    pub fn tab_label(self) -> &'static str {
+        match self {
+            ChatKind::Social => "Chat",
+            ChatKind::Battle => "Battle",
+            ChatKind::Debug => "System",
+        }
+    }
+
     pub fn accepts(self, c: ChatChannel) -> bool {
         match self {
             ChatKind::Battle => matches!(c, ChatChannel::Battle),
@@ -173,9 +192,9 @@ pub fn spawn_chat_tab_bar_as_child(p: &mut ChildSpawnerCommands) {
         },
     ))
     .with_children(|p| {
-        spawn_tab_button(p, ChatKind::Social, "Chat", true);
-        spawn_tab_button(p, ChatKind::Battle, "Battle", false);
-        spawn_tab_button(p, ChatKind::Debug, "System", false);
+        for kind in ChatKind::TAB_ORDER {
+            spawn_tab_button(p, kind, kind.tab_label(), kind == ChatKind::default());
+        }
         spawn_auto_switch_toggle(p);
     });
 }
@@ -752,6 +771,13 @@ pub fn update_chat_tab_visuals_system(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cycle_next_steps_all_tabs_and_wraps() {
+        assert_eq!(ChatKind::Social.cycle_next(), ChatKind::Battle);
+        assert_eq!(ChatKind::Battle.cycle_next(), ChatKind::Debug);
+        assert_eq!(ChatKind::Debug.cycle_next(), ChatKind::Social);
+    }
 
     #[test]
     fn segment_plain_text_is_single_base_span() {
