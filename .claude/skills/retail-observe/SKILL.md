@@ -225,6 +225,7 @@ here: read the returned captures yourself before citing them for parity.
 | `window` finds an `.exe`-owned window, not `prl_vm_app` | Expected in Coherence — the game window is guest-exe-owned; `hxi.sh` targets it on purpose |
 | Auto-raise/`show` never raises (every query reads as wrong Space) | Some installs expose no System Events process named "Parallels Desktop" — only `prl_client_app`/`prl_vm_app`. `raise_window` now tries all of them plus a direct AXRaise on the VM console window |
 | Launcher/game clicks land (OCR-verified) but have zero effect; game closes by itself | Another agent/human session is driving the same VM concurrently — inputs interleave and sessions step on each other. Do not fight for focus: stop, report the contention, and coordinate who owns the VM |
+| Native Win32 popup ignores `hxi.sh click`/`key` entirely (e.g. the standalone "FINAL FANTASY XI GAMEPAD Config" tool launched from Config → Gamepad) | CGEventPostToPid input doesn't reach guest-spawned native dialogs — fall back to `osascript` `System Events` `key code …` after activating Parallels Desktop; answer its "Save changes?" prompt No unless changes were intended |
 
 ## Maintenance
 
