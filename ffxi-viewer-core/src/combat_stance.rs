@@ -146,9 +146,9 @@ impl WalkMode {
 /// the player with no keys held — the pose falls back to inference there.
 ///
 /// `forward`/`strafe` are character-frame intent components feeding directional
-/// gait selection (mvb/mvl/mvr). Under the retail tank-control model they are
-/// only ever non-(1,0) while locked on: unlocked movement is always
-/// velocity-parallel-to-facing, so unlocked gait stays run/wlk.
+/// gait selection (mvb/mvl/mvr). They are only ever non-(1,0) while locked on —
+/// matching retail, where unlocked movement steers the character into the run
+/// direction (run/wlk gait only) and directional gait exists only under lock-on.
 #[derive(Resource, Default, Debug, Clone, Copy, PartialEq)]
 pub struct SelfMoveIntent {
     pub moving: bool,

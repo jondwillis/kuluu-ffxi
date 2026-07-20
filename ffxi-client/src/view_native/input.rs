@@ -37,13 +37,13 @@ use tokio::sync::mpsc;
 
 use crate::state::{ActionKind, AgentCommand, FishingInput};
 
+// Matches the retail first-person A/D view-rotate rate (HorizonXI video
+// 2026-07-20: ~71 heading-units over a 2s hold ≈ 0.87 rad/s).
 pub const HEADING_TURN_RATE: f32 = 0.86;
 
-// Retail A/D turn-in-place is fast (sub-second about-turn, carving tight W+A
-// arcs), unlike the slow Q/E-style rotate above. Exact retail rate is
-// unmeasured (kuluu-ltns follow-up); 5.0 rad/s matches the responsiveness of
-// the steer scheme this replaced.
-pub const TURN_KEY_RATE_RAD_PER_SEC: f32 = 5.0;
+// Q/E rotate-in-place has no retail 3rd-person counterpart; 0.86 felt too
+// sluggish in play-testing, so it gets its own snappier rate.
+pub const ROTATE_KEY_RATE_RAD_PER_SEC: f32 = 2.0;
 
 const CAMERA_YAW_RATE: f32 = HEADING_TURN_RATE * 4.0;
 
@@ -58,7 +58,11 @@ const STRAFE_SCALE: f32 = 0.75;
 
 const PREDICTION_RESYNC_YALMS: f32 = 5.0;
 
-const ABOUT_FACE_HEADING_DELTA: u8 = 128;
+// Retail body turn into a new camera-relative run direction takes ~0.5-0.7s
+// for 90° (HorizonXI video 2026-07-20, D-press frames). The carve rate of a
+// held A/D is then paced by the lazy camera follow (AUTO_RECENTER_RATE), not
+// by this lerp.
+const HEADING_LERP_RATE_RAD_PER_SEC: f32 = 2.5;
 
 #[derive(Resource, Clone)]
 pub struct CommandTx(pub mpsc::Sender<AgentCommand>);
@@ -114,21 +118,20 @@ pub fn advance_heading_turn(
 pub struct ResolvedMoveInputs {
     pub forward: i32,
     pub strafe: i32,
-    pub turn_dir: i32,
+    pub steer: i32,
     pub rotate_dir: i32,
-    pub about_face: bool,
 }
 
-/// Retail keyboard movement is character-relative (tank controls, observed
-/// HorizonXI 2026-07-19): unlocked Turn keys rotate the character in place,
-/// Back turns the character 180° and runs forward (no unlocked backpedal).
-/// Locked on, the character faces the target, so Turn keys strafe and Back
+/// Retail 3rd-person movement is camera-relative (HorizonXI video, 2026-07-20):
+/// W/A/S/D pick a run direction in the camera frame and the character turns
+/// into it at full speed — S runs toward the camera, A/D never rotate in place
+/// (that's Q/E, and A/D only in first person), and there is no unlocked
+/// backpedal. Locked on, the character faces the target: A/D strafe and S
 /// backpedals instead.
 #[allow(clippy::too_many_arguments)]
-pub fn resolve_tank_inputs(
+pub fn resolve_move_inputs(
     forward_held: bool,
     backward_held: bool,
-    backward_just_pressed: bool,
     turn_left: bool,
     turn_right: bool,
     strafe_left: bool,
@@ -144,24 +147,18 @@ pub fn resolve_tank_inputs(
     }
     let mut strafe = i32::from(strafe_right) - i32::from(strafe_left);
     let rotate_dir = i32::from(rotate_right) - i32::from(rotate_left);
-    let mut turn_dir = 0;
+    let mut steer = 0;
     let turn = i32::from(turn_right) - i32::from(turn_left);
     if locked {
         strafe = (strafe + turn).clamp(-1, 1);
     } else {
-        turn_dir = turn;
-    }
-    let mut about_face = false;
-    if !locked && forward < 0 {
-        about_face = backward_just_pressed;
-        forward = 1;
+        steer = turn;
     }
     ResolvedMoveInputs {
         forward,
         strafe,
-        turn_dir,
+        steer,
         rotate_dir,
-        about_face,
     }
 }
 
@@ -577,10 +574,12 @@ pub fn dispatch_movement_system(
         autorun.phantom_forward = false;
     }
 
-    // Retail autorun is steerable: Turn/Rotate keys carve the run without
-    // cancelling it. Only a held strafe (lock-on sidestep) cancels.
-    let any_strafe =
-        bindings.pressed(Action::StrafeLeft, &keys) || bindings.pressed(Action::StrafeRight, &keys);
+    // Retail autorun is steerable: A/D carve the run without cancelling it.
+    // Held strafe or Q/E rotate cancels after a short grace.
+    let any_strafe = bindings.pressed(Action::StrafeLeft, &keys)
+        || bindings.pressed(Action::StrafeRight, &keys)
+        || bindings.pressed(Action::RotateLeft, &keys)
+        || bindings.pressed(Action::RotateRight, &keys);
     if any_strafe {
         let now = Instant::now();
         let started = *autorun.strafe_held_since.get_or_insert(now);
@@ -593,10 +592,12 @@ pub fn dispatch_movement_system(
         autorun.strafe_held_since = None;
     }
 
-    let resolved = resolve_tank_inputs(
+    let locked = lock_on.target_id.is_some();
+    let first_person = matches!(*camera_mode, CameraMode::FirstPerson);
+
+    let resolved = resolve_move_inputs(
         bindings.pressed(Action::MoveForward, &keys),
         bindings.pressed(Action::MoveBackward, &keys),
-        backward_just_pressed,
         bindings.pressed(Action::TurnLeft, &keys),
         bindings.pressed(Action::TurnRight, &keys),
         bindings.pressed(Action::StrafeLeft, &keys),
@@ -604,14 +605,16 @@ pub fn dispatch_movement_system(
         bindings.pressed(Action::RotateLeft, &keys),
         bindings.pressed(Action::RotateRight, &keys),
         autorun.phantom_forward,
-        lock_on.target_id.is_some(),
+        locked,
     );
-    let forward = resolved.forward;
-    let strafe = resolved.strafe;
-    let turn_rate = HEADING_TURN_RATE * resolved.rotate_dir as f32
-        + TURN_KEY_RATE_RAD_PER_SEC * resolved.turn_dir as f32;
+    let mut forward = resolved.forward;
+    let mut strafe = resolved.strafe;
+    let fp_rotate = if first_person { resolved.steer } else { 0 };
+    let turn_rate = ROTATE_KEY_RATE_RAD_PER_SEC * resolved.rotate_dir as f32
+        + HEADING_TURN_RATE * fp_rotate as f32;
     let (player_rotate_u8, heading_delta_units) =
         advance_heading_turn(&mut turn_accum.units, turn_rate, time.delta_secs());
+    let steer_in_chase = !first_person && !locked && (forward != 0 || resolved.steer != 0);
 
     let self_pos = state.snapshot.self_pos;
 
@@ -668,15 +671,14 @@ pub fn dispatch_movement_system(
             })
     });
 
-    // First person: the view IS the facing, so rotation moves the camera
-    // rigidly and forward motion follows the view (mouse-look included). In
-    // chase mode the camera instead trails the turn via auto-recenter.
-    let first_person = matches!(*camera_mode, CameraMode::FirstPerson);
-    if (resolved.turn_dir != 0 || resolved.rotate_dir != 0) && first_person {
+    // First person: the view IS the facing, so rotation (Q/E and A/D alike)
+    // moves the camera rigidly and forward motion follows the view (mouse-look
+    // included). In chase mode the camera instead trails via auto-recenter.
+    if player_rotate_u8 != 0 && first_person {
         chase.yaw -= heading_delta_units * std::f32::consts::TAU / 256.0;
     }
 
-    if forward == 0 && strafe == 0 && player_rotate_u8 == 0 {
+    if forward == 0 && strafe == 0 && player_rotate_u8 == 0 && !steer_in_chase {
         if let Some(h) = locked_heading {
             if h != self_pos.heading {
                 chase.yaw = ffxi_viewer_core::yaw_for_heading(h);
@@ -692,19 +694,21 @@ pub fn dispatch_movement_system(
         return;
     }
 
+    let moving = forward != 0 || strafe != 0 || steer_in_chase;
+    let (intent_forward, intent_strafe) = if locked {
+        (forward as f32, strafe as f32)
+    } else if moving {
+        (1.0, 0.0)
+    } else {
+        (0.0, 0.0)
+    };
     **move_intent = ffxi_viewer_core::combat_stance::SelfMoveIntent {
-        moving: forward != 0 || strafe != 0,
-        forward: forward as f32,
-        strafe: strafe as f32,
+        moving,
+        forward: intent_forward,
+        strafe: intent_strafe,
     };
 
     let mut heading = self_pos.heading;
-    if resolved.about_face {
-        heading = heading.wrapping_add(ABOUT_FACE_HEADING_DELTA);
-        if first_person {
-            chase.yaw = yaw_for_heading(heading);
-        }
-    }
     if player_rotate_u8 != 0 {
         let delta = player_rotate_u8.rem_euclid(256) as u8;
         heading = heading.wrapping_add(delta);
@@ -713,12 +717,47 @@ pub fn dispatch_movement_system(
         heading = heading_for_yaw(chase.yaw);
     }
 
+    let raw_step = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs() * walk_mode.scale();
+
+    let mut turn_dx: f32 = 0.0;
+    let mut turn_dy: f32 = 0.0;
+    if steer_in_chase {
+        let camera_forward_h = heading_for_yaw(chase.yaw);
+        let (cf_x, cf_y) = heading_to_forward(camera_forward_h);
+        let (cr_x, cr_y) = heading_to_forward(camera_forward_h.wrapping_add(64));
+
+        let mx = cf_x * forward as f32 + cr_x * resolved.steer as f32;
+        let my = cf_y * forward as f32 + cr_y * resolved.steer as f32;
+        let len = (mx * mx + my * my).sqrt();
+
+        if len > 1e-3 && raw_step > 0.0 {
+            let inv = 1.0 / len;
+            turn_dx = mx * inv * raw_step;
+            turn_dy = my * inv * raw_step;
+
+            let motion_radians = my.atan2(mx);
+            let motion_raw = motion_radians * -(128.0 / std::f32::consts::PI);
+            let motion_h = (motion_raw.round() as i32).rem_euclid(256) as u8;
+
+            let h_target = yaw_for_heading(motion_h);
+            let h_current = yaw_for_heading(heading);
+            let h_diff = wrap_signed_pi(h_target - h_current);
+
+            let h_alpha = 1.0 - (-HEADING_LERP_RATE_RAD_PER_SEC * time.delta_secs()).exp();
+            heading = heading_for_yaw(h_current + h_diff * h_alpha);
+        }
+
+        // Camera follow while carving is camera_polish_system's auto-recenter
+        // (the single camera-follow authority); adding a second tug here would
+        // tighten the carve circle below the retail-observed rate.
+        forward = 0;
+        strafe = 0;
+    }
+
     if let Some(h) = locked_heading {
         heading = h;
         chase.yaw = ffxi_viewer_core::yaw_for_heading(h);
     }
-
-    let raw_step = self_pos.speed as f32 * SPEED_TO_YPS * time.delta_secs() * walk_mode.scale();
 
     let dir_scale = if forward > 0 && strafe != 0 {
         std::f32::consts::FRAC_1_SQRT_2
@@ -733,6 +772,8 @@ pub fn dispatch_movement_system(
     let mut x = basis_pos.x;
     let mut y = basis_pos.y;
 
+    x += turn_dx;
+    y += turn_dy;
     if forward != 0 && step > 0.0 {
         let (fwd_x, fwd_y) = heading_to_forward(heading);
 
@@ -829,6 +870,12 @@ fn forward_allowance(from_xy: (f32, f32), target_xy: (f32, f32), stop: f32) -> f
     let dy = target_xy.1 - from_xy.1;
     let dist = (dx * dx + dy * dy).sqrt();
     (dist - stop).max(0.0)
+}
+
+#[inline]
+fn wrap_signed_pi(x: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    (x + PI).rem_euclid(TAU) - PI
 }
 
 #[derive(Resource, Default)]
@@ -968,7 +1015,14 @@ pub struct CameraAutoRecenter {
     pub manual_override: bool,
 }
 
-const AUTO_RECENTER_RATE: f32 = 3.0;
+// Retail's camera swings behind a carving character at ~0.55 rad/s (HorizonXI
+// video 2026-07-20: ~150-180° over a ~5s held D). This lazy follow is what
+// makes a held A/D trace a wide circle — the camera-relative run direction
+// only rotates as fast as the camera catches up. When no lateral steer is
+// held (plain W/S), the camera snaps behind faster (play-testing feedback).
+const CARVE_FOLLOW_RATE: f32 = 0.55;
+
+const AUTO_RECENTER_RATE: f32 = 2.5;
 
 const FP_LOCK_PITCH_RATE: f32 = 3.0;
 
@@ -1016,13 +1070,20 @@ pub fn camera_polish_system(
         && !recenter.manual_override
         && matches!(*camera_mode, CameraMode::Chase)
     {
+        let carving =
+            bindings.pressed(Action::TurnLeft, &keys) || bindings.pressed(Action::TurnRight, &keys);
+        let rate = if carving {
+            CARVE_FOLLOW_RATE
+        } else {
+            AUTO_RECENTER_RATE
+        };
         let target_yaw = yaw_for_heading(state.snapshot.self_pos.heading);
         let tau = std::f32::consts::TAU;
         let mut diff = (target_yaw - chase.yaw).rem_euclid(tau);
         if diff > std::f32::consts::PI {
             diff -= tau;
         }
-        let alpha = 1.0 - (-AUTO_RECENTER_RATE * time.delta_secs()).exp();
+        let alpha = 1.0 - (-rate * time.delta_secs()).exp();
         chase.yaw += diff * alpha;
     }
 
@@ -1147,26 +1208,25 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct TankKeys {
+    struct MoveKeys {
         forward: bool,
         backward: bool,
-        backward_just: bool,
         turn_left: bool,
         turn_right: bool,
+        rotate_left: bool,
         autorun: bool,
         locked: bool,
     }
 
-    fn resolve(k: TankKeys) -> ResolvedMoveInputs {
-        resolve_tank_inputs(
+    fn resolve(k: MoveKeys) -> ResolvedMoveInputs {
+        resolve_move_inputs(
             k.forward,
             k.backward,
-            k.backward_just,
             k.turn_left,
             k.turn_right,
             false,
             false,
-            false,
+            k.rotate_left,
             false,
             k.autorun,
             k.locked,
@@ -1174,90 +1234,91 @@ mod tests {
     }
 
     #[test]
-    fn unlocked_turn_rotates_in_place_not_strafe() {
-        let r = resolve(TankKeys {
+    fn unlocked_turn_steers_not_strafes_not_rotates() {
+        let r = resolve(MoveKeys {
             turn_left: true,
             ..Default::default()
         });
-        assert_eq!(r.turn_dir, -1);
+        assert_eq!(r.steer, -1);
         assert_eq!(r.strafe, 0);
+        assert_eq!(r.rotate_dir, 0);
         assert_eq!(r.forward, 0);
     }
 
     #[test]
-    fn unlocked_forward_plus_turn_carves_arc_at_full_speed() {
-        let r = resolve(TankKeys {
+    fn unlocked_forward_plus_turn_steers_at_full_speed() {
+        let r = resolve(MoveKeys {
             forward: true,
             turn_left: true,
             ..Default::default()
         });
         assert_eq!(r.forward, 1);
-        assert_eq!(r.turn_dir, -1);
+        assert_eq!(r.steer, -1);
         assert_eq!(r.strafe, 0, "unlocked W+A must not strafe");
     }
 
     #[test]
-    fn unlocked_backward_is_about_face_then_forward_run() {
-        let press = resolve(TankKeys {
-            backward: true,
-            backward_just: true,
-            ..Default::default()
-        });
-        assert!(press.about_face, "S press must flip the character 180");
-        assert_eq!(press.forward, 1, "no unlocked backpedal: S runs forward");
-
-        let held = resolve(TankKeys {
+    fn unlocked_backward_steers_toward_camera_full_speed() {
+        let r = resolve(MoveKeys {
             backward: true,
             ..Default::default()
         });
-        assert!(!held.about_face, "held S must not keep flipping");
-        assert_eq!(held.forward, 1);
+        assert_eq!(r.forward, -1, "S feeds the camera-relative steer, no flip");
+        assert_eq!(r.strafe, 0);
     }
 
     #[test]
     fn locked_backward_backpedals() {
-        let r = resolve(TankKeys {
+        let r = resolve(MoveKeys {
             backward: true,
-            backward_just: true,
             locked: true,
             ..Default::default()
         });
-        assert!(!r.about_face);
         assert_eq!(r.forward, -1);
+        assert_eq!(r.steer, 0);
     }
 
     #[test]
-    fn locked_turn_strafes_not_rotates() {
-        let r = resolve(TankKeys {
+    fn locked_turn_strafes_not_steers() {
+        let r = resolve(MoveKeys {
             turn_right: true,
             locked: true,
             ..Default::default()
         });
         assert_eq!(r.strafe, 1);
-        assert_eq!(r.turn_dir, 0);
+        assert_eq!(r.steer, 0);
     }
 
     #[test]
-    fn forward_and_backward_cancel_without_flip() {
-        let r = resolve(TankKeys {
+    fn rotate_key_is_independent_of_steer() {
+        let r = resolve(MoveKeys {
+            rotate_left: true,
+            turn_right: true,
+            ..Default::default()
+        });
+        assert_eq!(r.rotate_dir, -1);
+        assert_eq!(r.steer, 1);
+    }
+
+    #[test]
+    fn forward_and_backward_cancel() {
+        let r = resolve(MoveKeys {
             forward: true,
             backward: true,
-            backward_just: true,
             ..Default::default()
         });
         assert_eq!(r.forward, 0);
-        assert!(!r.about_face);
     }
 
     #[test]
-    fn autorun_keeps_running_while_turning() {
-        let r = resolve(TankKeys {
+    fn autorun_keeps_running_while_steering() {
+        let r = resolve(MoveKeys {
             autorun: true,
             turn_left: true,
             ..Default::default()
         });
         assert_eq!(r.forward, 1);
-        assert_eq!(r.turn_dir, -1);
+        assert_eq!(r.steer, -1);
     }
 
     #[test]
