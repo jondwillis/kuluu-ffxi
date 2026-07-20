@@ -322,10 +322,10 @@ pub fn sync_entities_system(
             }
         }
 
-        // No self plate: retail never draws the local player's own overhead
-        // name, and the self plate's overhead projection sits just above the
-        // first-person eye where frame skew makes it dip/jitter (kuluu-gr2).
-        if let Some(name) = wire.name.as_deref().filter(|s| !s.is_empty() && !is_self) {
+        // Retail draws the local player's own overhead name in the same PC
+        // styling as other PCs (kuluu-hof); the update system hides it in
+        // first-person mode where the plate would sit at the camera eye.
+        if let Some(name) = wire.name.as_deref().filter(|s| !s.is_empty()) {
             if !nameplated.contains(&wire.id) {
                 crate::nameplate_billboard::spawn_nameplate_billboard(
                     &mut commands,

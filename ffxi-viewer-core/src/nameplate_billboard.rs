@@ -8,7 +8,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use ffxi_viewer_wire::EntityKind;
 
-use crate::camera::{nameplate_anchor_y, OperatorCamera};
+use crate::camera::{nameplate_anchor_y, CameraMode, OperatorCamera};
 use crate::components::{InGameEntity, Nameplate, WorldEntity};
 use crate::scene::BakedActor;
 use crate::snapshot::SceneState;
@@ -118,12 +118,16 @@ pub fn spawn_nameplate_billboard(
         .id()
 }
 
-/// Retail never draws the local player's own overhead name, so the self plate
-/// is suppressed entirely. This also removes the near-degenerate overhead
-/// projection (plate anchored just above the first-person eye) whose 1-frame
-/// camera/plate skew dips and jitters on stutter frames (kuluu-gr2).
 pub fn is_self_billboard(entity_id: u32, self_char_id: Option<u32>) -> bool {
     self_char_id.is_some_and(|cid| cid != 0 && cid == entity_id)
+}
+
+/// Retail draws the self plate in the same PC styling as other players
+/// (kuluu-hof), but in first-person the plate anchors just above the camera
+/// eye — a near-degenerate projection that dips/jitters on stutter frames
+/// (kuluu-gr2) and occludes the view — so it is hidden there.
+pub fn self_plate_hidden(is_self: bool, mode: CameraMode) -> bool {
+    is_self && matches!(mode, CameraMode::FirstPerson)
 }
 
 pub fn nameplate_color(kind: EntityKind, engaged: bool, dead: bool) -> Color {
@@ -150,6 +154,7 @@ pub fn format_billboard_label(base_name: &str, _hp_pct: Option<u8>, _kind: Entit
 
 pub fn update_nameplate_billboards_system(
     state: Res<SceneState>,
+    camera_mode: Res<CameraMode>,
     cam_q: Query<&Transform, (With<OperatorCamera>, Without<NameplateBillboard>)>,
     world_q: Query<(&Transform, &WorldEntity, Option<&BakedActor>), Without<NameplateBillboard>>,
     mut billboards: Query<(
@@ -183,10 +188,8 @@ pub fn update_nameplate_billboards_system(
     }
 
     for (ui_entity, mut np, mut aspect, mut transform, mut vis, mat) in &mut billboards {
-        // Covers plates spawned before self_char_id was known; the spawn path
-        // in scene.rs already skips self once the id is resolved (kuluu-gr2).
-        if is_self_billboard(np.entity_id, self_char_id) {
-            commands.entity(ui_entity).try_despawn();
+        if self_plate_hidden(is_self_billboard(np.entity_id, self_char_id), *camera_mode) {
+            *vis = Visibility::Hidden;
             continue;
         }
 
@@ -453,22 +456,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn self_billboard_suppressed_for_known_self_id() {
+    fn self_billboard_matches_known_self_id() {
         assert!(is_self_billboard(0xCAFE, Some(0xCAFE)));
     }
 
     #[test]
-    fn other_entities_keep_billboards() {
+    fn other_entities_are_not_self() {
         assert!(!is_self_billboard(0x4242, Some(0xCAFE)));
     }
 
     #[test]
-    fn unknown_self_id_suppresses_nothing() {
+    fn unknown_self_id_matches_nothing() {
         assert!(!is_self_billboard(0xCAFE, None));
     }
 
     #[test]
     fn zero_self_id_is_unresolved_not_a_match() {
         assert!(!is_self_billboard(0, Some(0)));
+    }
+
+    #[test]
+    fn self_plate_hidden_only_in_first_person() {
+        assert!(self_plate_hidden(true, CameraMode::FirstPerson));
+        assert!(!self_plate_hidden(true, CameraMode::Chase));
+    }
+
+    #[test]
+    fn other_plates_visible_in_both_camera_modes() {
+        assert!(!self_plate_hidden(false, CameraMode::FirstPerson));
+        assert!(!self_plate_hidden(false, CameraMode::Chase));
     }
 }
