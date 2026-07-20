@@ -406,6 +406,19 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     app.add_systems(OnEnter(AppPhase::Connecting), bridge_connecting);
 
+    // World-click targeting must not run during the launcher / character-select
+    // phases: a UI-button click there resolves to an empty world hit and would
+    // open the no-target action menu, which then leaks into the game on zone-in.
+    app.insert_resource(ffxi_viewer_core::WorldPickingEnabled(false));
+    app.add_systems(
+        OnEnter(AppPhase::InGame),
+        |mut e: ResMut<ffxi_viewer_core::WorldPickingEnabled>| e.0 = true,
+    );
+    app.add_systems(
+        OnExit(AppPhase::InGame),
+        |mut e: ResMut<ffxi_viewer_core::WorldPickingEnabled>| e.0 = false,
+    );
+
     app.add_systems(
         OnEnter(AppPhase::InGame),
         (setup_world, spawn_camera, setup_zone_line_assets),

@@ -24,11 +24,26 @@ pub struct PickBridgePointer(pub Option<PointerId>);
 
 pub struct PickingPlugin;
 
+/// Gate for world-click targeting. When false, `click_to_target_system`
+/// ignores pointer clicks so UI clicks outside the game world (launcher /
+/// character-select buttons) can't leak into world targeting and spuriously
+/// open the target-action menu. Defaults true for the launcher-less wasm
+/// viewer; the native client toggles it per `AppPhase::InGame`.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct WorldPickingEnabled(pub bool);
+
+impl Default for WorldPickingEnabled {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
 impl Plugin for PickingPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MeshPickingPlugin)
             .init_resource::<HoveredEntity>()
             .init_resource::<PickBridgePointer>()
+            .init_resource::<WorldPickingEnabled>()
             .add_systems(
                 Update,
                 (
@@ -239,9 +254,14 @@ pub fn click_to_target_system(
     q_nameplate: Query<&Nameplate>,
     pointer: Res<crate::mouse::MousePointer>,
     scene: Res<crate::snapshot::SceneState>,
+    enabled: Res<WorldPickingEnabled>,
     mut target: ResMut<Target>,
     mut input_mode: ResMut<InputMode>,
 ) {
+    if !enabled.0 {
+        clicks.clear();
+        return;
+    }
     for ev in clicks.read() {
         if ev.button != PointerButton::Primary {
             continue;

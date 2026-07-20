@@ -98,6 +98,7 @@ pub use lock_on::{LockOn, ToggleResult as LockOnToggle};
 pub use mouse::{CursorLockRequest, MousePlugin, MousePointer};
 pub use picking::{
     click_to_target_system, resolve_click_target, ClickResolution, HoveredEntity, PickingPlugin,
+    WorldPickingEnabled,
 };
 pub use scene::{
     entity_visual_height, ffxi_to_bevy, process_entity_look_changes, setup_world,
