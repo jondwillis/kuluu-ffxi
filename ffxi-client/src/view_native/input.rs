@@ -162,6 +162,19 @@ pub fn resolve_move_inputs(
     }
 }
 
+/// World-space run heading for a camera-relative move: `forward` along the
+/// camera's forward axis, `steer` along camera-right. Callers guarantee at
+/// least one component is non-zero (steer_in_chase requires it).
+pub fn camera_relative_motion_heading(camera_forward_h: u8, forward: i32, steer: i32) -> u8 {
+    let (cf_x, cf_y) = heading_to_forward(camera_forward_h);
+    let (cr_x, cr_y) = heading_to_forward(camera_forward_h.wrapping_add(64));
+    let mx = cf_x * forward as f32 + cr_x * steer as f32;
+    let my = cf_y * forward as f32 + cr_y * steer as f32;
+    let motion_radians = my.atan2(mx);
+    let motion_raw = motion_radians * -(128.0 / std::f32::consts::PI);
+    (motion_raw.round() as i32).rem_euclid(256) as u8
+}
+
 pub fn autorun_after_toggle(phantom_forward: bool, toggle_just_pressed: bool) -> bool {
     if toggle_just_pressed {
         !phantom_forward
@@ -467,6 +480,12 @@ pub fn dispatch_movement_system(
     mut autorun: ResMut<AutoRun>,
     mut chase: ResMut<ChaseCamera>,
     mut turn_accum: ResMut<HeadingTurnAccum>,
+    // Latched world-space run heading for pure W/S: (forward sign, motion heading).
+    // Sampled from the camera frame when the key state changes, then held fixed so
+    // the camera's auto-recenter can swing behind without dragging the run
+    // direction with it (S would otherwise chase a target that stays 180° away —
+    // the sideways-circle bug from the 2026-07-20 10.19 recording).
+    mut steer_latch: Local<Option<(i32, u8)>>,
     mut prediction: ResMut<LocalPlayerPrediction>,
     navmesh: Res<super::navmesh_overlay::NavmeshState>,
     minimap_hover: Res<ffxi_viewer_core::minimap::input::MinimapHoverGate>,
@@ -615,6 +634,11 @@ pub fn dispatch_movement_system(
     let (player_rotate_u8, heading_delta_units) =
         advance_heading_turn(&mut turn_accum.units, turn_rate, time.delta_secs());
     let steer_in_chase = !first_person && !locked && (forward != 0 || resolved.steer != 0);
+    // A/D carve and Q/E rotate need the run direction recomputed against the
+    // live camera every frame; anything else invalidates the pure-W/S latch.
+    if !steer_in_chase || resolved.steer != 0 || resolved.rotate_dir != 0 {
+        *steer_latch = None;
+    }
 
     let self_pos = state.snapshot.self_pos;
 
@@ -723,21 +747,24 @@ pub fn dispatch_movement_system(
     let mut turn_dy: f32 = 0.0;
     if steer_in_chase {
         let camera_forward_h = heading_for_yaw(chase.yaw);
-        let (cf_x, cf_y) = heading_to_forward(camera_forward_h);
-        let (cr_x, cr_y) = heading_to_forward(camera_forward_h.wrapping_add(64));
+        let continuous = resolved.steer != 0 || resolved.rotate_dir != 0;
+        let motion_h = if continuous {
+            camera_relative_motion_heading(camera_forward_h, forward, resolved.steer)
+        } else {
+            match *steer_latch {
+                Some((f, h)) if f == forward => h,
+                _ => {
+                    let h = camera_relative_motion_heading(camera_forward_h, forward, 0);
+                    *steer_latch = Some((forward, h));
+                    h
+                }
+            }
+        };
 
-        let mx = cf_x * forward as f32 + cr_x * resolved.steer as f32;
-        let my = cf_y * forward as f32 + cr_y * resolved.steer as f32;
-        let len = (mx * mx + my * my).sqrt();
-
-        if len > 1e-3 && raw_step > 0.0 {
-            let inv = 1.0 / len;
-            turn_dx = mx * inv * raw_step;
-            turn_dy = my * inv * raw_step;
-
-            let motion_radians = my.atan2(mx);
-            let motion_raw = motion_radians * -(128.0 / std::f32::consts::PI);
-            let motion_h = (motion_raw.round() as i32).rem_euclid(256) as u8;
+        if raw_step > 0.0 {
+            let (mv_x, mv_y) = heading_to_forward(motion_h);
+            turn_dx = mv_x * raw_step;
+            turn_dy = mv_y * raw_step;
 
             let h_target = yaw_for_heading(motion_h);
             let h_current = yaw_for_heading(heading);
@@ -1319,6 +1346,38 @@ mod tests {
         });
         assert_eq!(r.forward, 1);
         assert_eq!(r.steer, -1);
+    }
+
+    #[test]
+    fn backward_motion_heading_is_toward_camera() {
+        // S runs at the camera: motion heading = camera forward + 180° (128 units).
+        for cam in [0u8, 64, 128, 200] {
+            assert_eq!(
+                camera_relative_motion_heading(cam, -1, 0),
+                cam.wrapping_add(128),
+                "cam={cam}"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_motion_heading_matches_camera_forward() {
+        for cam in [0u8, 33, 100, 250] {
+            assert_eq!(camera_relative_motion_heading(cam, 1, 0), cam, "cam={cam}");
+        }
+    }
+
+    #[test]
+    fn steer_motion_heading_is_camera_right() {
+        // D alone runs along camera-right (+64 heading units); A camera-left.
+        assert_eq!(camera_relative_motion_heading(0, 0, 1), 64);
+        assert_eq!(camera_relative_motion_heading(0, 0, -1), 192);
+    }
+
+    #[test]
+    fn forward_steer_motion_heading_is_diagonal() {
+        assert_eq!(camera_relative_motion_heading(0, 1, 1), 32);
+        assert_eq!(camera_relative_motion_heading(0, -1, 1), 96);
     }
 
     #[test]
