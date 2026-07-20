@@ -144,7 +144,8 @@ pub fn spawn_status_ribbon(mut commands: Commands, mut images: ResMut<Assets<Ima
             Node {
                 position_type: PositionType::Absolute,
 
-                top: Val::Px(8.0),
+                // Below the menu help bar so chips never overlap it when open.
+                top: Val::Px(crate::hud::menu_help_bar::BAR_HEIGHT + 6.0),
                 left: Val::Px(8.0),
                 width: Val::Px(row_width),
                 flex_direction: FlexDirection::Row,

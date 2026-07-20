@@ -22,9 +22,17 @@ pub struct MenuHelpCounter;
 #[derive(Component)]
 pub struct MenuHelpHint;
 
-const BAR_HEIGHT: f32 = 26.0;
-// Keeps the "Help" label clear of the network S/R panel pinned at top-right.
-const HELP_RIGHT_MARGIN: f32 = 150.0;
+pub const BAR_HEIGHT: f32 = 26.0;
+/// Retail frames the active menu title in its own boxed segment, flush left.
+const TITLE_BOX_W: f32 = 118.0;
+
+/// Single-line text that truncates instead of wrapping when the bar is narrow.
+fn text_nowrap() -> TextLayout {
+    TextLayout {
+        linebreak: LineBreak::NoWrap,
+        ..default()
+    }
+}
 
 pub fn spawn_menu_help_bar(mut commands: Commands) {
     commands
@@ -37,11 +45,9 @@ pub fn spawn_menu_help_bar(mut commands: Commands) {
                 left: Val::Px(0.0),
                 right: Val::Px(0.0),
                 height: Val::Px(BAR_HEIGHT),
-                padding: UiRect::axes(Val::Px(10.0), Val::Px(2.0)),
                 border: UiRect::bottom(Val::Px(1.0)),
                 flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(10.0),
+                align_items: AlignItems::Stretch,
                 display: Display::None,
                 ..default()
             },
@@ -50,37 +56,70 @@ pub fn spawn_menu_help_bar(mut commands: Commands) {
             GlobalZIndex(style::WINDOW_Z),
         ))
         .with_children(|p| {
+            // Framed title segment (retail draws this as its own box).
             p.spawn((
-                MenuHelpTitle,
-                Text::new(""),
-                style::text_font(14.0),
-                TextColor(theme::TITLE),
-            ));
-            p.spawn((
-                MenuHelpCounter,
-                Text::new(""),
-                style::text_font(12.0),
-                TextColor(theme::MUTED),
-            ));
-            p.spawn((
-                MenuHelpHint,
-                Text::new(""),
-                style::text_font(14.0),
-                TextColor(theme::TEXT),
-            ));
-            p.spawn(Node {
-                flex_grow: 1.0,
-                ..default()
-            });
-            p.spawn((
-                Text::new("Help"),
-                style::text_font(12.0),
-                TextColor(theme::MUTED),
                 Node {
-                    margin: UiRect::right(Val::Px(HELP_RIGHT_MARGIN)),
+                    width: Val::Px(TITLE_BOX_W),
+                    flex_shrink: 0.0,
+                    padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+                    border: UiRect::right(Val::Px(1.0)),
+                    align_items: AlignItems::Center,
                     ..default()
                 },
-            ));
+                BorderColor::all(theme::FRAME_EDGE),
+            ))
+            .with_children(|seg| {
+                seg.spawn((
+                    MenuHelpTitle,
+                    Text::new(""),
+                    text_nowrap(),
+                    style::text_font(14.0),
+                    TextColor(theme::TITLE),
+                ));
+            });
+            // Counter + help text clip instead of wrapping over the world view.
+            p.spawn(Node {
+                flex_grow: 1.0,
+                flex_shrink: 1.0,
+                min_width: Val::Px(0.0),
+                overflow: Overflow::clip_x(),
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(10.0),
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(2.0)),
+                ..default()
+            })
+            .with_children(|mid| {
+                mid.spawn((
+                    MenuHelpCounter,
+                    Text::new(""),
+                    text_nowrap(),
+                    style::text_font(12.0),
+                    TextColor(theme::MUTED),
+                ));
+                mid.spawn((
+                    MenuHelpHint,
+                    Text::new(""),
+                    text_nowrap(),
+                    style::text_font(14.0),
+                    TextColor(theme::TEXT),
+                ));
+            });
+            // "Help" sits just left of the network S/R panel (fixed width,
+            // pinned at top-right), so reserve exactly that much space.
+            p.spawn(Node {
+                flex_shrink: 0.0,
+                align_items: AlignItems::Center,
+                margin: UiRect::right(Val::Px(crate::hud::network_status::NET_PANEL_W + 8.0)),
+                ..default()
+            })
+            .with_children(|seg| {
+                seg.spawn((
+                    Text::new("Help"),
+                    text_nowrap(),
+                    style::text_font(12.0),
+                    TextColor(theme::MUTED),
+                ));
+            });
         });
 }
 

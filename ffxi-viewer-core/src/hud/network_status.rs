@@ -12,6 +12,10 @@ impl Default for NetStatusVisible {
     }
 }
 
+/// Fixed panel width so the menu help bar can reserve space for it exactly
+/// (retail pins the S/R readout at top-right, overlapping the bar's frame).
+pub const NET_PANEL_W: f32 = 122.0;
+
 #[derive(Component)]
 pub struct NetworkStatusPanel;
 
@@ -37,18 +41,21 @@ pub fn spawn_network_status(mut commands: Commands) {
             NetworkStatusPanel,
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(4.0),
-                right: Val::Px(4.0),
+                top: Val::Px(0.0),
+                right: Val::Px(0.0),
+                width: Val::Px(NET_PANEL_W),
                 padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
                 border: UiRect::all(Val::Px(1.0)),
                 flex_direction: FlexDirection::Row,
                 align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
                 column_gap: Val::Px(6.0),
                 ..default()
             },
             BackgroundColor(theme::FRAME_BG),
             BorderColor::all(theme::FRAME_EDGE),
-            GlobalZIndex(10),
+            // Above the menu help bar so the panel frames over it, as retail does.
+            GlobalZIndex(style::WINDOW_Z + 1),
         ))
         .with_children(|p| {
             p.spawn(Node {
