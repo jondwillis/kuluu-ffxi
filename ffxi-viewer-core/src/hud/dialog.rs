@@ -159,11 +159,11 @@ pub fn update_dialog_panel_system(
     }
 
     if let Ok(mut text) = body_q.single_mut() {
-        let cursor = match &*mode {
-            InputMode::Dialog(c) => Some(c.cursor),
-            _ => None,
+        let (cursor, entry) = match &*mode {
+            InputMode::Dialog(c) => (Some(c.cursor), c.entry.as_deref()),
+            _ => (None, None),
         };
-        let want = format_body(dialog, cursor);
+        let want = format_body(dialog, cursor, entry);
         if **text != want {
             **text = want;
         }
@@ -249,7 +249,14 @@ pub fn dialog_mouse_click_system(
     }
 }
 
-fn format_body(d: &DialogState, cursor: Option<u32>) -> String {
+fn format_body(d: &DialogState, cursor: Option<u32>, entry: Option<&str>) -> String {
+    if d.text_entry {
+        // Free-text frame (delivery-box recipient prompt): show the typed line
+        // with a caret, retail-style.
+        let prompt = d.prompt.as_deref().unwrap_or("Enter a name.");
+        let typed = entry.unwrap_or("");
+        return format!("{prompt}\n\n{typed}_\n\nEnter send · Esc cancel");
+    }
     if let Some(prompt) = &d.prompt {
         // A menu's options render as separate rows, so the body is the prompt
         // alone; plain speech gets an advance hint.
@@ -306,14 +313,14 @@ mod tests {
 
     #[test]
     fn body_with_no_extras_is_just_mode_para() {
-        assert_eq!(format_body(&d(), None), "mode=0  para=1");
+        assert_eq!(format_body(&d(), None, None), "mode=0  para=1");
     }
 
     #[test]
     fn body_includes_para2_only_when_nonzero() {
         let mut x = d();
         x.event_num2 = 5;
-        let body = format_body(&x, None);
+        let body = format_body(&x, None, None);
         assert!(body.contains("para2=5/0"));
     }
 
@@ -322,14 +329,14 @@ mod tests {
         let mut x = d();
         x.strings = vec!["Selh".into(), "Bastok".into()];
         x.nums = vec![100, 0, -1];
-        let body = format_body(&x, None);
+        let body = format_body(&x, None, None);
         assert!(body.contains("strings: Selh | Bastok"));
         assert!(body.contains("nums: 100, 0, -1"));
     }
 
     #[test]
     fn body_shows_cursor_and_hint_when_in_dialog_mode() {
-        let body = format_body(&d(), Some(2));
+        let body = format_body(&d(), Some(2), None);
         assert!(body.contains("→ choice = 2"), "got: {body}");
         assert!(body.contains("Enter send"));
     }
@@ -338,7 +345,7 @@ mod tests {
     fn message_body_is_speech_plus_advance_hint() {
         let mut x = d();
         x.prompt = Some("Good luck, citizen.".into());
-        let body = format_body(&x, None);
+        let body = format_body(&x, None, None);
         assert!(body.starts_with("Good luck, citizen."), "got: {body}");
         assert!(body.contains("Enter to continue"));
     }
@@ -348,8 +355,30 @@ mod tests {
         let mut x = d();
         x.prompt = Some("What do you want?".into());
         x.choices = vec!["Cast Signet".into(), "Set home point".into()];
-        let body = format_body(&x, Some(0));
+        let body = format_body(&x, Some(0), None);
         assert_eq!(body, "What do you want?");
         assert!(!body.contains("Cast Signet"));
+    }
+
+    #[test]
+    fn text_entry_body_shows_prompt_typed_line_and_caret() {
+        let mut x = d();
+        x.text_entry = true;
+        x.prompt = Some("Who will you send it to?".into());
+        let body = format_body(&x, Some(0), Some("Selh"));
+        assert!(body.starts_with("Who will you send it to?"), "got: {body}");
+        assert!(body.contains("Selh_"), "got: {body}");
+        assert!(body.contains("Enter send · Esc cancel"));
+        // Choice-cursor hint must not leak into the text-entry frame.
+        assert!(!body.contains("→ choice"));
+    }
+
+    #[test]
+    fn text_entry_body_defaults_prompt_and_empty_line() {
+        let mut x = d();
+        x.text_entry = true;
+        let body = format_body(&x, None, None);
+        assert!(body.starts_with("Enter a name."), "got: {body}");
+        assert!(body.contains("\n\n_\n"), "got: {body}");
     }
 }
