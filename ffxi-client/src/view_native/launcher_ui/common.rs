@@ -306,9 +306,10 @@ fn spawn_titlebar(
     parent: &mut ChildSpawnerCommands,
     title_text: impl Into<String>,
     action: NavAction,
+    show_settings: bool,
 ) {
     let label = match &action {
-        NavAction::Close => "×",
+        NavAction::Close => "X",
         NavAction::Back(_) => "Back to login",
     };
     parent
@@ -333,6 +334,18 @@ fn spawn_titlebar(
                 TextColor(Color::srgb(0.0, 1.0, 1.0)),
                 ThemedText,
             ));
+            if show_settings {
+                bar.spawn(button_bundle(
+                    ButtonBundleProps::default(),
+                    (),
+                    Spawn((Text::new("Settings"), ThemedText)),
+                ))
+                .observe(
+                    |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                        next.set(LauncherState::Settings);
+                    },
+                );
+            }
             bar.spawn(Node::default()).with_children(|slot| {
                 let mut btn = slot.spawn(button_bundle(
                     ButtonBundleProps::default(),
@@ -357,16 +370,22 @@ fn spawn_titlebar(
         });
 }
 
-pub(super) fn spawn_close_titlebar(
+/// Close titlebar with a "Settings" entry point next to the close button.
+pub(super) fn spawn_settings_close_titlebar(
     parent: &mut ChildSpawnerCommands,
     title_text: impl Into<String>,
 ) {
-    spawn_titlebar(parent, title_text, NavAction::Close);
+    spawn_titlebar(parent, title_text, NavAction::Close, true);
 }
 
 pub(super) fn spawn_back_titlebar(
     parent: &mut ChildSpawnerCommands,
     title_text: impl Into<String>,
 ) {
-    spawn_titlebar(parent, title_text, NavAction::Back(LauncherState::Login));
+    spawn_titlebar(
+        parent,
+        title_text,
+        NavAction::Back(LauncherState::Login),
+        false,
+    );
 }

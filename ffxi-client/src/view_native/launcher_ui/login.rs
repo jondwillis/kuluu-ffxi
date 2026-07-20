@@ -11,8 +11,8 @@ use ffxi_client::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
 use ffxi_client::secret_store::SecretStore;
 
 use super::common::{
-    chip_group, hint, panel_node, row, screen_root, spawn_breadcrumb, spawn_close_titlebar, Crumb,
-    ScrollRegion,
+    chip_group, hint, panel_node, row, screen_root, spawn_breadcrumb,
+    spawn_settings_close_titlebar, Crumb, ScrollRegion,
 };
 use super::server_version_check::{ServerVersionStatus, VersionViolation};
 use super::{
@@ -95,7 +95,10 @@ fn build_login_ui(
         .with_children(|root| {
             spawn_breadcrumb(root, server, &[Crumb::Sign(None)]);
             root.spawn(panel_node(560.0)).with_children(|panel| {
-                spawn_close_titlebar(panel, format!("Sign in to {}", server.display_label()));
+                spawn_settings_close_titlebar(
+                    panel,
+                    format!("Sign in to {}", server.display_label()),
+                );
 
                 spawn_version_banner(panel, version);
 
@@ -168,28 +171,6 @@ fn build_login_ui(
                             next.set(LauncherState::ChangePassword);
                         },
                     );
-
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Settings"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::Settings);
-                        },
-                    );
-
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Graphics"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::Graphics);
-                        },
-                    );
                 });
             });
         });
@@ -205,8 +186,10 @@ fn spawn_saved_accounts_row(
         return;
     }
 
-    // Roughly three wrapped chip rows; more accounts scroll inside the region.
-    const SAVED_ACCOUNTS_MAX_HEIGHT: f32 = 110.0;
+    // Grows with content up to roughly five wrapped chip rows; beyond that,
+    // accounts scroll inside the region. Matters most at narrow widths where
+    // chips wrap onto many rows.
+    const SAVED_ACCOUNTS_MAX_HEIGHT: f32 = 190.0;
 
     panel.spawn(hint("Saved accounts on this server:"));
     panel
@@ -282,7 +265,7 @@ fn spawn_saved_accounts_row(
                     chip.spawn(button_bundle(
                         ButtonBundleProps::default(),
                         (),
-                        Spawn((Text::new("×"), ThemedText)),
+                        Spawn((Text::new("X"), ThemedText)),
                     ))
                     .observe(
                         move |_ev: On<Activate>,

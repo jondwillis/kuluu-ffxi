@@ -9,7 +9,9 @@ use bevy::ui_widgets::Activate;
 use ffxi_client::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
 use ffxi_client::secret_store::SecretStore;
 
-use super::common::{hint, panel_node, row, screen_root, spawn_close_titlebar};
+use super::common::{
+    chip_group, hint, panel_node, row, screen_root, spawn_settings_close_titlebar,
+};
 use super::{LauncherState, ServerSelectCursor, ServerSelectForm};
 
 #[derive(Component)]
@@ -48,7 +50,7 @@ pub(super) fn spawn_ui(
         .spawn((ServerSelectRoot, screen_root()))
         .with_children(|root| {
             root.spawn(panel_node(620.0)).with_children(|panel| {
-                spawn_close_titlebar(panel, "Servers");
+                spawn_settings_close_titlebar(panel, "Servers");
                 if n == 0 {
                     panel.spawn(hint("No servers saved yet — click '+ Add server' below."));
                 }
@@ -63,7 +65,8 @@ pub(super) fn spawn_ui(
                     };
                     let armed = pending_name.as_deref() == Some(s.name.as_str());
 
-                    panel.spawn(row()).with_children(|r| {
+                    // One visually-connected unit: select chip + Edit + Delete.
+                    panel.spawn(chip_group()).with_children(|r| {
                         let pick_name = server_name.clone();
 
                         r.spawn(Node {
@@ -227,28 +230,6 @@ pub(super) fn spawn_ui(
                             *edit = super::ServerEditForm::default();
                             edit.editing_index = None;
                             next.set(LauncherState::ServerEdit);
-                        },
-                    );
-
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Settings"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::Settings);
-                        },
-                    );
-
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Graphics"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::Graphics);
                         },
                     );
 

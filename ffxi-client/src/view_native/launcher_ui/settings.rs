@@ -173,6 +173,17 @@ fn build_ui(commands: &mut Commands, form: &SettingsForm, server: &ServerInfo) {
                     r.spawn(button_bundle(
                         ButtonBundleProps::default(),
                         (),
+                        Spawn((Text::new("Graphics"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(LauncherState::Graphics);
+                        },
+                    );
+
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
+                        (),
                         Spawn((Text::new("Back"), ThemedText)),
                     ))
                     .observe(
