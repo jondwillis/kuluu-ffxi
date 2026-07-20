@@ -824,6 +824,9 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::MogHouse2fUnlockUpdated { .. } => "mog_house_2f_unlock_updated",
         AgentEvent::ShopSellAppraisal { .. } => "shop_sell_appraisal",
         AgentEvent::DeliveryBoxUpdated { .. } => "delivery_box_updated",
+        AgentEvent::CheckEquipReceived { .. } => "check_equip_received",
+        AgentEvent::CheckGeneralReceived { .. } => "check_general_received",
+        AgentEvent::CheckCleared => "check_cleared",
     }
 }
 
