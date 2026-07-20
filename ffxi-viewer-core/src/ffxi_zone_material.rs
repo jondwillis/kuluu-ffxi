@@ -4,7 +4,7 @@ use bevy::asset::embedded_asset;
 use bevy::ecs::system::lifetimeless::SRes;
 use bevy::ecs::system::SystemParamItem;
 use bevy::mesh::{Mesh, MeshVertexBufferLayoutRef};
-use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin};
+use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin, MeshPipelineKey};
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::{
@@ -362,7 +362,15 @@ impl Material for FfxiZoneMaterial {
         // sets frontFace(CW), flipping to CCW for mirrored instances
         // (scale.x * scale.y * scale.z < 0). Using Bevy's CCW default here
         // culled every non-mirrored tile: inverted-checkerboard zone geometry.
-        descriptor.primitive.cull_mode = if rk.back_face_culling {
+        // Directional shadow views (UNCLIPPED_DEPTH_ORTHO is set only there —
+        // vendor/bevy_pbr/src/render/light.rs:2230) render single-sided walls
+        // unculled: from the sun's viewpoint a wall's one sheet of triangles is
+        // back-facing, so Face::Back culling writes no shadow-map depth — walls
+        // cast nothing and sunlight leaks indoors (kuluu-lchx).
+        let shadow_view = key
+            .mesh_key
+            .contains(MeshPipelineKey::UNCLIPPED_DEPTH_ORTHO);
+        descriptor.primitive.cull_mode = if rk.back_face_culling && !shadow_view {
             Some(Face::Back)
         } else {
             None
