@@ -37,7 +37,7 @@ impl Default for ZoneLightConfig {
             overbright_threshold: 1.15,
             warm_only: true,
             max_per_mesh: 3,
-            max_total: 48,
+            max_total: crate::graphics_settings::DYNAMIC_LIGHTS_MAX_TOTAL,
             point_intensity: 25_000.0,
             point_range: 8.0,
 
@@ -302,13 +302,9 @@ fn apply_lights_settings(settings: Res<GraphicsSettings>, mut cfg: ResMut<ZoneLi
     if !settings.is_changed() {
         return;
     }
-    let enabled = settings.dynamic_lights.enabled();
-    let max_total = settings.dynamic_lights.max_total();
+    let enabled = settings.dynamic_lights.emitters_enabled();
     if cfg.enabled != enabled {
         cfg.enabled = enabled;
-    }
-    if cfg.max_total != max_total {
-        cfg.max_total = max_total;
     }
     if (cfg.overbright_threshold - settings.light_threshold).abs() > f32::EPSILON {
         cfg.overbright_threshold = settings.light_threshold;
@@ -406,5 +402,17 @@ mod tests {
         assert!((d.point_intensity - gs::DEFAULT_LIGHT_INTENSITY).abs() < 1e-3);
         assert!((d.point_range - gs::DEFAULT_LIGHT_RANGE).abs() < 1e-6);
         assert_eq!(d.flicker, gs::DEFAULT_LIGHT_FLICKER);
+        assert_eq!(d.max_total, gs::DYNAMIC_LIGHTS_MAX_TOTAL);
+    }
+
+    #[test]
+    fn emitters_gated_to_enhanced_only() {
+        use crate::graphics_settings::DynamicLights;
+        assert!(!DynamicLights::Off.emitters_enabled());
+        assert!(!DynamicLights::Vanilla.emitters_enabled());
+        assert!(DynamicLights::Enhanced.emitters_enabled());
+        assert!(DynamicLights::Enhanced.faithful_enabled());
+        assert!(DynamicLights::Vanilla.faithful_enabled());
+        assert!(!DynamicLights::Off.faithful_enabled());
     }
 }

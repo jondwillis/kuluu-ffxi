@@ -40,6 +40,41 @@ pub fn lamp_night_factor(sun_altitude: f32) -> f32 {
     let t = ((HI - sun_altitude) / (HI - LO)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
+
+/// Indoor zones (DAT F1 indoors flag) never see the sun, so their lamps burn
+/// around the clock; so do zones whose DAT sun diffuse is black in daylight
+/// (Upper Jeuno's covered streets — retail 2026-07-19 capture: lamps lit at
+/// 08:14). Only true open-sky zones follow the dusk/dawn ramp.
+/// `day_sun_k` is the zone record's daytime landscape sun brightness (None when
+/// no record is loaded).
+pub fn lamp_lit_factor(indoors: bool, day_sun_k: Option<f32>, sun_altitude: f32) -> f32 {
+    if indoors {
+        return 1.0;
+    }
+    if sun_altitude > 0.0 && day_sun_k.is_some_and(|k| k <= f32::EPSILON) {
+        return 1.0;
+    }
+    lamp_night_factor(sun_altitude)
+}
+
+// Retail lamps/braziers visibly waver (2026-07-19 MH capture); the DAT ships no
+// flicker keyframes to scrape, so the shape is hand-tuned to the footage: a slow
+// deep wave plus a faster shimmer, peaking at 1.0 so the mean sits just under
+// the steady level.
+const LAMP_FLICKER_BASE: f32 = 0.90;
+const LAMP_FLICKER_SLOW_AMP: f32 = 0.07;
+const LAMP_FLICKER_SLOW_RATE: f32 = 7.3;
+const LAMP_FLICKER_FAST_AMP: f32 = 0.03;
+const LAMP_FLICKER_FAST_RATE: f32 = 23.3;
+// De-syncs neighbouring lamps so a room full of lights doesn't pulse in unison.
+const LAMP_FLICKER_PHASE_STRIDE: f32 = 1.7;
+
+pub fn lamp_flicker(t: f32, seed: f32) -> f32 {
+    LAMP_FLICKER_BASE
+        + LAMP_FLICKER_SLOW_AMP * (t * LAMP_FLICKER_SLOW_RATE + seed).sin()
+        + LAMP_FLICKER_FAST_AMP
+            * (t * LAMP_FLICKER_FAST_RATE + seed * LAMP_FLICKER_PHASE_STRIDE).sin()
+}
 // `/lights` emitters are Bevy PointLights with lumen intensity; fold intensity
 // into colour magnitude against the faithful reference so a default-intensity
 // emitter reads like a colour~1 Generator light.
@@ -77,21 +112,37 @@ pub fn build_active_scene_lights(
     faithful: Res<ZonePointLights>,
     q_emitters: Query<(&GlobalTransform, &PointLight), With<crate::zone_lights::ZoneLightEmitter>>,
     vana_clock: Res<crate::vana_time::VanaClock>,
+    zone_lighting: Option<Res<crate::weather::ZoneDirectionalLighting>>,
+    time: Res<bevy::time::Time>,
     settings: Res<crate::graphics_settings::GraphicsSettings>,
     mut active: ResMut<ActiveSceneLights>,
 ) {
     active.lights.clear();
+    if !settings.dynamic_lights.faithful_enabled() {
+        return;
+    }
     let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
-    let night = lamp_night_factor(sky.sun_altitude);
+    let (indoors, day_sun_k) = zone_lighting
+        .as_deref()
+        .filter(|z| z.valid)
+        .map(|z| (z.indoors, Some(z.sun_k)))
+        .unwrap_or((false, None));
+    let night = lamp_lit_factor(indoors, day_sun_k, sky.sun_altitude);
     if night <= LAMP_OFF_EPSILON {
         return;
     }
-    let reach = ZONE_LIGHT_REACH_SCALE * settings.light_reach_scale();
-    for l in &faithful.lights {
-        let range = l.range * reach;
+    let t = time.elapsed_secs_wrapped();
+    let flicker_on = settings.light_flicker;
+    for (i, l) in faithful.lights.iter().enumerate() {
+        let range = l.range * ZONE_LIGHT_REACH_SCALE;
+        let flick = if flicker_on {
+            lamp_flicker(t, i as f32)
+        } else {
+            1.0
+        };
         active.lights.push(ZonePointLight {
             world_pos: l.world_pos,
-            color: l.color * night,
+            color: l.color * night * flick,
             range,
             attenuation: SCENE_LIGHT_FALLOFF_K / (range * range),
             is_character: l.is_character,
@@ -266,6 +317,7 @@ fn load_zone_point_lights(scene_state: Res<SceneState>, mut store: ResMut<ZonePo
 struct FaithfulZoneLight {
     base_intensity: f32,
     base_range: f32,
+    flicker_seed: f32,
 }
 
 fn sync_faithful_zone_light_entities(
@@ -279,7 +331,7 @@ fn sync_faithful_zone_light_entities(
     for e in &existing {
         commands.entity(e).try_despawn();
     }
-    for l in &store.lights {
+    for (i, l) in store.lights.iter().enumerate() {
         if l.is_character {
             continue;
         }
@@ -291,6 +343,7 @@ fn sync_faithful_zone_light_entities(
             FaithfulZoneLight {
                 base_intensity,
                 base_range: l.range,
+                flicker_seed: i as f32,
             },
             InGameEntity,
             PointLight {
@@ -311,15 +364,33 @@ fn sync_faithful_zone_light_entities(
 // ramp as the custom-material feed so towns light up only at night.
 fn animate_faithful_zone_lights(
     vana_clock: Res<crate::vana_time::VanaClock>,
+    zone_lighting: Option<Res<crate::weather::ZoneDirectionalLighting>>,
+    time: Res<bevy::time::Time>,
     settings: Res<crate::graphics_settings::GraphicsSettings>,
     mut q: Query<(&FaithfulZoneLight, &mut PointLight)>,
 ) {
     let sky = crate::sun_moon::vana_sky_from_clock(&vana_clock);
-    let night = lamp_night_factor(sky.sun_altitude);
-    let reach = ZONE_LIGHT_REACH_SCALE * settings.light_reach_scale();
+    let (indoors, day_sun_k) = zone_lighting
+        .as_deref()
+        .filter(|z| z.valid)
+        .map(|z| (z.indoors, Some(z.sun_k)))
+        .unwrap_or((false, None));
+    let night = lamp_lit_factor(indoors, day_sun_k, sky.sun_altitude);
+    let t = time.elapsed_secs_wrapped();
+    let flicker_on = settings.light_flicker;
+    let faithful_on = settings.dynamic_lights.faithful_enabled();
     for (l, mut pl) in &mut q {
-        pl.intensity = l.base_intensity * night;
-        pl.range = l.base_range * reach;
+        let flick = if flicker_on {
+            lamp_flicker(t, l.flicker_seed)
+        } else {
+            1.0
+        };
+        pl.intensity = if faithful_on {
+            l.base_intensity * night * flick
+        } else {
+            0.0
+        };
+        pl.range = l.base_range * ZONE_LIGHT_REACH_SCALE;
     }
 }
 
@@ -369,6 +440,42 @@ mod tests {
             lamp_night_factor(-0.05) > lamp_night_factor(0.05),
             "ramp rises as the sun sinks"
         );
+    }
+
+    #[test]
+    fn indoor_lamps_ignore_the_sun() {
+        assert_eq!(
+            lamp_lit_factor(true, Some(0.8), 1.0),
+            1.0,
+            "indoors: lit at high noon"
+        );
+        assert_eq!(
+            lamp_lit_factor(false, Some(0.8), 1.0),
+            0.0,
+            "open sky: day gate applies"
+        );
+        assert_eq!(
+            lamp_lit_factor(false, Some(0.0), 1.0),
+            1.0,
+            "black daytime sun diffuse (covered streets): lit all day"
+        );
+        assert_eq!(
+            lamp_lit_factor(false, None, 1.0),
+            0.0,
+            "no record: day gate"
+        );
+        assert_eq!(lamp_lit_factor(false, Some(0.8), -1.0), 1.0);
+    }
+
+    #[test]
+    fn lamp_flicker_bounded_and_never_dark() {
+        for i in 0..400 {
+            let t = i as f32 * 0.037;
+            for seed in 0..8 {
+                let f = lamp_flicker(t, seed as f32);
+                assert!((0.7..=1.0 + 1e-5).contains(&f), "flicker {f} out of band");
+            }
+        }
     }
 
     #[test]

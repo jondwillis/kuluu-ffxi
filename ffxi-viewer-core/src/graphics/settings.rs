@@ -114,33 +114,35 @@ impl ZoneLineDisplay {
     }
 }
 
+/// `Vanilla` renders only the faithful DAT Generator lights; `Enhanced` adds
+/// the heuristic over-bright-vertex emitters on top; `Off` disables both.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DynamicLights {
     Off,
-    Few,
+    #[serde(alias = "Few", alias = "Many")]
     #[default]
-    Many,
+    Vanilla,
+    Enhanced,
 }
+
+/// Clustered-lighting budget for the heuristic emitters.
+pub const DYNAMIC_LIGHTS_MAX_TOTAL: u32 = 48;
 
 impl DynamicLights {
     pub const fn label(self) -> &'static str {
         match self {
             DynamicLights::Off => "Off",
-            DynamicLights::Few => "Few",
-            DynamicLights::Many => "Many",
+            DynamicLights::Vanilla => "Vanilla",
+            DynamicLights::Enhanced => "Enhanced",
         }
     }
 
-    pub const fn max_total(self) -> u32 {
-        match self {
-            DynamicLights::Off => 0,
-            DynamicLights::Few => 24,
-            DynamicLights::Many => 48,
-        }
-    }
-
-    pub const fn enabled(self) -> bool {
+    pub const fn faithful_enabled(self) -> bool {
         !matches!(self, DynamicLights::Off)
+    }
+
+    pub const fn emitters_enabled(self) -> bool {
+        matches!(self, DynamicLights::Enhanced)
     }
 }
 
@@ -259,9 +261,9 @@ impl GraphicsField {
             GraphicsField::SkyStyle => "Sky Style",
             GraphicsField::WaterStyle => "Water Style",
             GraphicsField::DynamicLights => "Dynamic Lights",
-            GraphicsField::LightThreshold => "  Threshold",
-            GraphicsField::LightIntensity => "  Intensity",
-            GraphicsField::LightRange => "  Range",
+            GraphicsField::LightThreshold => "  Emitter Threshold",
+            GraphicsField::LightIntensity => "  Emitter Intensity",
+            GraphicsField::LightRange => "  Emitter Range",
             GraphicsField::LightFlicker => "  Flicker",
             GraphicsField::CharacterLighting => "Shading",
             GraphicsField::CharacterShadowReceive => "Model Shadow Receiving",
@@ -442,8 +444,11 @@ const LIGHT_THRESHOLD_SLOTS: &[f32] = &[1.05, 1.15, 1.30, 1.50, 1.80];
 const LIGHT_INTENSITY_SLOTS: &[f32] = &[5_000.0, 10_000.0, 25_000.0, 50_000.0, 100_000.0];
 const LIGHT_RANGE_SLOTS: &[f32] = &[4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0];
 
-const DYNAMIC_LIGHTS_CYCLE: &[DynamicLights] =
-    &[DynamicLights::Off, DynamicLights::Few, DynamicLights::Many];
+const DYNAMIC_LIGHTS_CYCLE: &[DynamicLights] = &[
+    DynamicLights::Off,
+    DynamicLights::Vanilla,
+    DynamicLights::Enhanced,
+];
 
 const ZONE_LINE_DISPLAY_CYCLE: &[ZoneLineDisplay] = &[
     ZoneLineDisplay::Off,
@@ -476,7 +481,7 @@ impl GraphicsSettings {
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
                 enhanced_water: false,
-                dynamic_lights: DynamicLights::Many,
+                dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
@@ -505,7 +510,7 @@ impl GraphicsSettings {
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
                 enhanced_water: false,
-                dynamic_lights: DynamicLights::Many,
+                dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
@@ -534,7 +539,7 @@ impl GraphicsSettings {
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
                 enhanced_water: false,
-                dynamic_lights: DynamicLights::Many,
+                dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
@@ -567,7 +572,7 @@ impl GraphicsSettings {
                 fov_deg: 50.0,
                 sky_style: SkyStyle::Enhanced,
                 enhanced_water: false,
-                dynamic_lights: DynamicLights::Many,
+                dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
                 light_range: DEFAULT_LIGHT_RANGE,
@@ -628,10 +633,11 @@ impl GraphicsSettings {
             .into(),
 
             GraphicsField::DynamicLights => {
-                if self.lights_fine_is_default() {
-                    self.dynamic_lights.label().to_string()
-                } else {
+                if self.dynamic_lights == DynamicLights::Enhanced && !self.lights_fine_is_default()
+                {
                     "Custom".to_string()
+                } else {
+                    self.dynamic_lights.label().to_string()
                 }
             }
             GraphicsField::LightThreshold => format!("{:.2}", self.light_threshold),
@@ -748,7 +754,7 @@ impl GraphicsSettings {
             }
             GraphicsField::DynamicLights => {
                 self.dynamic_lights = cycle_slot(self.dynamic_lights, DYNAMIC_LIGHTS_CYCLE, delta)
-                    .unwrap_or(DynamicLights::Many);
+                    .unwrap_or(DynamicLights::Vanilla);
                 self.light_threshold = DEFAULT_LIGHT_THRESHOLD;
                 self.light_intensity = DEFAULT_LIGHT_INTENSITY;
                 self.light_range = DEFAULT_LIGHT_RANGE;
@@ -820,13 +826,6 @@ impl GraphicsSettings {
 
     pub fn sky_embellishments_enabled(&self) -> bool {
         self.sky_style == SkyStyle::Enhanced
-    }
-
-    /// Lamp reach as a multiple of the default range, so the GUI "Range" knob
-    /// scales every lamp feed (faithful Generator lights + `/lights` emitters)
-    /// uniformly rather than only the emitters.
-    pub fn light_reach_scale(&self) -> f32 {
-        self.light_range / DEFAULT_LIGHT_RANGE
     }
 
     fn lights_fine_is_default(&self) -> bool {
@@ -1428,16 +1427,32 @@ mod tests {
     }
 
     #[test]
-    fn tuning_a_light_knob_marks_custom() {
+    fn tuning_a_light_knob_marks_custom_only_in_enhanced() {
         let mut s = GraphicsSettings::default();
-        assert_eq!(s.value_label(GraphicsField::DynamicLights), "Many");
+        assert_eq!(s.value_label(GraphicsField::DynamicLights), "Vanilla");
+        s.cycle(GraphicsField::LightIntensity, 1);
+        assert_eq!(
+            s.value_label(GraphicsField::DynamicLights),
+            "Vanilla",
+            "emitter knobs are inert in Vanilla, so the mode label must not read Custom"
+        );
+        assert_eq!(s.preset, QualityPreset::High, "light knob ⟂ quality tier");
+
+        s.cycle(GraphicsField::DynamicLights, 1);
+        assert_eq!(s.dynamic_lights, DynamicLights::Enhanced);
+        assert!(
+            s.lights_fine_is_default(),
+            "mode cycle reset the fine knobs"
+        );
+        assert_eq!(s.value_label(GraphicsField::DynamicLights), "Enhanced");
+
         s.cycle(GraphicsField::LightIntensity, 1);
         assert_eq!(s.value_label(GraphicsField::DynamicLights), "Custom");
-        assert_eq!(s.dynamic_lights, DynamicLights::Many, "cap tier unchanged");
-        assert_eq!(s.preset, QualityPreset::High, "light knob ⟂ quality tier");
-        s.cycle(GraphicsField::DynamicLights, 1);
-        assert!(s.lights_fine_is_default());
-        assert_eq!(s.value_label(GraphicsField::DynamicLights), "Off");
+        assert_eq!(
+            s.dynamic_lights,
+            DynamicLights::Enhanced,
+            "mode unchanged by knob tuning"
+        );
     }
 
     #[test]
@@ -1476,27 +1491,62 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_lights_cycles_without_custom() {
+    fn dynamic_lights_cycles_off_vanilla_enhanced() {
         let mut s = GraphicsSettings::default();
-        assert_eq!(s.dynamic_lights, DynamicLights::Many);
+        assert_eq!(s.dynamic_lights, DynamicLights::Vanilla);
+        assert!(s.dynamic_lights.faithful_enabled());
+        assert!(!s.dynamic_lights.emitters_enabled());
+
         s.cycle(GraphicsField::DynamicLights, 1);
-        assert_eq!(s.dynamic_lights, DynamicLights::Off);
+        assert_eq!(s.dynamic_lights, DynamicLights::Enhanced);
         assert_eq!(s.preset, QualityPreset::High, "lights must not flip preset");
-        assert!(!s.dynamic_lights.enabled());
-        assert_eq!(s.dynamic_lights.max_total(), 0);
+        assert!(s.dynamic_lights.faithful_enabled());
+        assert!(s.dynamic_lights.emitters_enabled());
+
         s.cycle(GraphicsField::DynamicLights, 1);
-        assert_eq!(s.dynamic_lights, DynamicLights::Few);
-        assert_eq!(s.dynamic_lights.max_total(), 24);
-        assert!(s.dynamic_lights.enabled());
+        assert_eq!(s.dynamic_lights, DynamicLights::Off, "wrapped");
+        assert!(!s.dynamic_lights.faithful_enabled());
+        assert!(!s.dynamic_lights.emitters_enabled());
+
+        s.cycle(GraphicsField::DynamicLights, 1);
+        assert_eq!(s.dynamic_lights, DynamicLights::Vanilla, "full cycle");
     }
 
     #[test]
     fn preset_cycle_preserves_dynamic_lights() {
         let mut s = GraphicsSettings::default();
-        s.cycle(GraphicsField::DynamicLights, 1);
+        s.cycle(GraphicsField::DynamicLights, -1);
         assert_eq!(s.dynamic_lights, DynamicLights::Off);
         s.cycle(GraphicsField::Preset, 1);
         assert_eq!(s.dynamic_lights, DynamicLights::Off, "preset cycle kept it");
+    }
+
+    #[test]
+    fn presets_pin_dynamic_lights_vanilla() {
+        for &preset in PRESET_CYCLE {
+            assert_eq!(
+                GraphicsSettings::for_preset(preset).dynamic_lights,
+                DynamicLights::Vanilla,
+                "preset {preset:?} must pin the faithful-only light mode"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_dynamic_lights_strings_load_as_vanilla() {
+        for legacy in ["\"Few\"", "\"Many\""] {
+            let v: DynamicLights = serde_json::from_str(legacy).unwrap();
+            assert_eq!(v, DynamicLights::Vanilla, "legacy {legacy} maps to Vanilla");
+        }
+        for (json, want) in [
+            ("\"Off\"", DynamicLights::Off),
+            ("\"Vanilla\"", DynamicLights::Vanilla),
+            ("\"Enhanced\"", DynamicLights::Enhanced),
+        ] {
+            let v: DynamicLights = serde_json::from_str(json).unwrap();
+            assert_eq!(v, want);
+            assert_eq!(serde_json::to_string(&v).unwrap(), json, "roundtrip");
+        }
     }
 
     #[test]

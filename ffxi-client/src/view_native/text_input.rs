@@ -1368,45 +1368,42 @@ fn apply_slash_outcome(
             use ffxi_viewer_core::graphics_settings::DynamicLights;
 
             let g = &mut *slash_writers.graphics;
-            let chat =
-                match op {
-                    LightsOp::Status => format!(
+            let chat = match op {
+                LightsOp::Status => format!(
                     "/lights: {} · threshold {:.2} · intensity {:.0} · range {:.1} · flicker {}",
-                    if g.dynamic_lights.enabled() { "on" } else { "off" },
+                    g.dynamic_lights.label(),
                     g.light_threshold,
                     g.light_intensity,
                     g.light_range,
                     if g.light_flicker { "on" } else { "off" },
                 ),
-                    LightsOp::Enable(v) => {
-                        let on = v.unwrap_or(!g.dynamic_lights.enabled());
-                        g.dynamic_lights = if !on {
-                            DynamicLights::Off
-                        } else if g.dynamic_lights == DynamicLights::Off {
-                            DynamicLights::Many
-                        } else {
-                            g.dynamic_lights
-                        };
-                        format!("/lights: {}", if on { "on" } else { "off" })
-                    }
-                    LightsOp::Threshold(v) => {
-                        g.light_threshold = v;
-                        format!("/lights threshold: {v:.2} (re-enter zone to re-detect)")
-                    }
-                    LightsOp::Intensity(v) => {
-                        g.light_intensity = v;
-                        format!("/lights intensity: {v:.0}")
-                    }
-                    LightsOp::Range(v) => {
-                        g.light_range = v;
-                        format!("/lights range: {v:.1}")
-                    }
-                    LightsOp::Flicker(v) => {
-                        let f = v.unwrap_or(!g.light_flicker);
-                        g.light_flicker = f;
-                        format!("/lights flicker: {}", if f { "on" } else { "off" })
-                    }
-                };
+                LightsOp::Enable(v) => {
+                    let on = v.unwrap_or(!g.dynamic_lights.emitters_enabled());
+                    g.dynamic_lights = if on {
+                        DynamicLights::Enhanced
+                    } else {
+                        DynamicLights::Off
+                    };
+                    format!("/lights: {}", g.dynamic_lights.label())
+                }
+                LightsOp::Threshold(v) => {
+                    g.light_threshold = v;
+                    format!("/lights threshold: {v:.2} (re-enter zone to re-detect)")
+                }
+                LightsOp::Intensity(v) => {
+                    g.light_intensity = v;
+                    format!("/lights intensity: {v:.0}")
+                }
+                LightsOp::Range(v) => {
+                    g.light_range = v;
+                    format!("/lights range: {v:.1}")
+                }
+                LightsOp::Flicker(v) => {
+                    let f = v.unwrap_or(!g.light_flicker);
+                    g.light_flicker = f;
+                    format!("/lights flicker: {}", if f { "on" } else { "off" })
+                }
+            };
             push_system_chat_line(scene_state, chat);
         }
         SlashOutcome::SetMinimap(op) => {
