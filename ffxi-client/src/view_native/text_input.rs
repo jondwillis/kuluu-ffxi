@@ -3026,20 +3026,21 @@ fn handle_menu_key(
         // Retail pages the item list with left/right: one viewport per press,
         // clamped at the ends (no wrap).
         let page = if bindings.matches_logical(Action::NavLeft, key) {
-            Some(-1isize)
+            Some(false)
         } else if bindings.matches_logical(Action::NavRight, key) {
-            Some(1)
+            Some(true)
         } else {
             None
         };
-        if let Some(dir) = page {
-            let rows = ffxi_viewer_core::hud::item_screen::ITEM_LIST_ROWS;
+        if let Some(forward) = page {
+            let rows = ffxi_viewer_core::hud::menu::list_page_rows(kind);
             if let Some(level) = stack.current_mut() {
-                level.cursor = if dir < 0 {
-                    level.cursor.saturating_sub(rows)
-                } else {
-                    (level.cursor + rows).min(entry_count.saturating_sub(1))
-                };
+                level.cursor = ffxi_viewer_core::hud::menu::page_cursor(
+                    level.cursor,
+                    entry_count,
+                    rows,
+                    forward,
+                );
             }
             return None;
         }
@@ -3075,6 +3076,28 @@ fn handle_menu_key(
             level.cursor =
                 ffxi_viewer_core::hud::equipment_screen::grid_move(level.cursor as u8, dx, dy)
                     as usize;
+            return None;
+        }
+    }
+
+    // Retail pages every other vertical list menu (the action-ring Usable list,
+    // Magic/Abilities/Key Items/Emotes, the equip-slot picker) with Left/Right,
+    // one visible page per press, clamped at the ends. Items handled its own
+    // paging above; Graphics (value cycles) and the Equipment grid consumed
+    // Left/Right in their blocks.
+    if ffxi_viewer_core::hud::menu::is_dynamic(kind) {
+        let page = if bindings.matches_logical(Action::NavLeft, key) {
+            Some(false)
+        } else if bindings.matches_logical(Action::NavRight, key) {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(forward) = page {
+            let rows = ffxi_viewer_core::hud::menu::list_page_rows(kind);
+            let level = stack.current_mut()?;
+            level.cursor =
+                ffxi_viewer_core::hud::menu::page_cursor(level.cursor, entry_count, rows, forward);
             return None;
         }
     }

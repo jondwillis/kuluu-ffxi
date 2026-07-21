@@ -262,6 +262,28 @@ pub fn entry_count(kind: MenuKind, dynamic: &DynamicMenu) -> usize {
     }
 }
 
+/// Rows to jump per Left/Right page in a vertical list menu — the visible-row
+/// count of whichever panel renders `kind`, so one page-press scrolls a single
+/// screenful (retail Left/Right paging). Items and the action-ring Usable list
+/// ride the item_screen panel; everything else the generic panel.
+pub fn list_page_rows(kind: MenuKind) -> usize {
+    match kind {
+        MenuKind::Items | MenuKind::UsableItems => crate::hud::item_screen::ITEM_LIST_ROWS,
+        _ => DYNAMIC_VISIBLE_ROWS,
+    }
+}
+
+/// New cursor after a Left/Right page press: jump `rows` toward `forward`
+/// (Right/Down = true), clamped to the list — retail pages with no wrap, unlike
+/// Up/Down which wrap one row at a time.
+pub fn page_cursor(cursor: usize, entry_count: usize, rows: usize, forward: bool) -> usize {
+    if forward {
+        (cursor + rows).min(entry_count.saturating_sub(1))
+    } else {
+        cursor.saturating_sub(rows)
+    }
+}
+
 pub fn entry_label(kind: MenuKind, idx: usize, dynamic: &DynamicMenu) -> &str {
     if is_dynamic(kind) {
         if dynamic.rows.is_empty() {
@@ -1031,6 +1053,37 @@ pub fn debug_panel_state(label: &str, panels: &crate::hud::HudPanels, net_status
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_page_rows_matches_owning_panel_viewport() {
+        assert_eq!(
+            list_page_rows(MenuKind::Items),
+            crate::hud::item_screen::ITEM_LIST_ROWS
+        );
+        assert_eq!(
+            list_page_rows(MenuKind::UsableItems),
+            crate::hud::item_screen::ITEM_LIST_ROWS
+        );
+        assert_eq!(list_page_rows(MenuKind::Magic), DYNAMIC_VISIBLE_ROWS);
+        assert_eq!(list_page_rows(MenuKind::KeyItems), DYNAMIC_VISIBLE_ROWS);
+    }
+
+    #[test]
+    fn page_cursor_jumps_a_page_and_clamps_without_wrap() {
+        // Forward jumps by `rows`, clamped to the last index (no wrap past end).
+        assert_eq!(page_cursor(0, 30, 13, true), 13);
+        assert_eq!(page_cursor(13, 30, 13, true), 26);
+        assert_eq!(page_cursor(26, 30, 13, true), 29);
+        assert_eq!(page_cursor(29, 30, 13, true), 29);
+        // Backward jumps by `rows`, clamped to 0 (no wrap past start).
+        assert_eq!(page_cursor(29, 30, 13, false), 16);
+        assert_eq!(page_cursor(5, 30, 13, false), 0);
+        assert_eq!(page_cursor(0, 30, 13, false), 0);
+        // A page press moves more than one row — the whole point of the bug fix.
+        assert!(page_cursor(0, 30, 13, true) > 1);
+        // Empty list stays put.
+        assert_eq!(page_cursor(0, 0, 13, true), 0);
+    }
 
     #[test]
     fn item_qty_label_suffixes_only_real_stacks() {
