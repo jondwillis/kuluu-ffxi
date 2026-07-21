@@ -65,17 +65,12 @@ pub(super) fn spawn_ui(
                     };
                     let armed = pending_name.as_deref() == Some(s.name.as_str());
 
-                    // One visually-connected unit: select chip + Edit + Delete.
-                    panel.spawn(chip_group()).with_children(|r| {
-                        let pick_name = server_name.clone();
+                    // One visually-connected pill: select chip + Edit + Delete.
+                    panel.spawn(row()).with_children(|r| {
+                        r.spawn(chip_group()).with_children(|chip| {
+                            let pick_name = server_name.clone();
 
-                        r.spawn(Node {
-                            flex_grow: 1.0,
-                            flex_direction: FlexDirection::Row,
-                            ..default()
-                        })
-                        .with_children(|wrap| {
-                            wrap.spawn(button_bundle(
+                            chip.spawn(button_bundle(
                                 ButtonBundleProps {
                                     variant,
                                     ..default()
@@ -130,10 +125,9 @@ pub(super) fn spawn_ui(
                                     next.set(LauncherState::Login);
                                 },
                             );
-                        });
 
-                        let edit_name = server_name.clone();
-                        r.spawn(button_bundle(
+                            let edit_name = server_name.clone();
+                            chip.spawn(button_bundle(
                             ButtonBundleProps::default(),
                             (),
                             Spawn((Text::new("Edit"), ThemedText)),
@@ -156,13 +150,13 @@ pub(super) fn spawn_ui(
                             },
                         );
 
-                        let del_name = server_name.clone();
-                        let (del_label, del_variant) = if armed {
-                            ("Confirm?", ButtonVariant::Primary)
-                        } else {
-                            ("Delete", ButtonVariant::Normal)
-                        };
-                        r.spawn(button_bundle(
+                            let del_name = server_name.clone();
+                            let (del_label, del_variant) = if armed {
+                                ("Confirm?", ButtonVariant::Primary)
+                            } else {
+                                ("Delete", ButtonVariant::Normal)
+                            };
+                            chip.spawn(button_bundle(
                             ButtonBundleProps {
                                 variant: del_variant,
                                 ..default()
@@ -211,6 +205,7 @@ pub(super) fn spawn_ui(
                                 next.set(LauncherState::ServerSelect);
                             },
                         );
+                        });
                     });
                 }
 

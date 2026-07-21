@@ -8,7 +8,7 @@ use bevy::prelude::*;
 use bevy::ui_widgets::Activate;
 
 use super::common::{
-    hint, panel_node, row, screen_root, spawn_back_titlebar, spawn_breadcrumb, Crumb,
+    chip_group, hint, panel_node, row, screen_root, spawn_back_titlebar, spawn_breadcrumb, Crumb,
 };
 use super::{CharListData, Credentials, DefaultCharName, LauncherState, SelectedChar, ServerInfo};
 
@@ -76,14 +76,10 @@ pub(super) fn spawn_char_list_ui(
                     } else {
                         ButtonVariant::Normal
                     };
+                    // One visually-connected pill: select chip + Delete.
                     panel.spawn(row()).with_children(|r| {
-                        r.spawn(Node {
-                            flex_grow: 1.0,
-                            flex_direction: FlexDirection::Row,
-                            ..default()
-                        })
-                        .with_children(|wrap| {
-                            wrap.spawn(button_bundle(
+                        r.spawn(chip_group()).with_children(|chip| {
+                            chip.spawn(button_bundle(
                                 ButtonBundleProps {
                                     variant,
                                     ..default()
@@ -111,26 +107,26 @@ pub(super) fn spawn_char_list_ui(
                                     }
                                 },
                             );
-                        });
 
-                        r.spawn(button_bundle(
-                            ButtonBundleProps::default(),
-                            (),
-                            Spawn((Text::new("Delete"), ThemedText)),
-                        ))
-                        .observe(
-                            move |_ev: On<Activate>,
-                                  chars: Res<CharListData>,
-                                  mut cursor: ResMut<CharCursor>,
-                                  mut sel: ResMut<SelectedChar>,
-                                  mut next: ResMut<NextState<LauncherState>>| {
-                                cursor.0 = idx;
-                                if let Some(slot) = chars.0.get(idx).cloned() {
-                                    sel.0 = Some(slot);
-                                    next.set(LauncherState::CharDeleteConfirm);
-                                }
-                            },
-                        );
+                            chip.spawn(button_bundle(
+                                ButtonBundleProps::default(),
+                                (),
+                                Spawn((Text::new("Delete"), ThemedText)),
+                            ))
+                            .observe(
+                                move |_ev: On<Activate>,
+                                      chars: Res<CharListData>,
+                                      mut cursor: ResMut<CharCursor>,
+                                      mut sel: ResMut<SelectedChar>,
+                                      mut next: ResMut<NextState<LauncherState>>| {
+                                    cursor.0 = idx;
+                                    if let Some(slot) = chars.0.get(idx).cloned() {
+                                        sel.0 = Some(slot);
+                                        next.set(LauncherState::CharDeleteConfirm);
+                                    }
+                                },
+                            );
+                        });
                     });
                 }
 
