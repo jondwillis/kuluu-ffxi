@@ -676,6 +676,20 @@ impl DeliveryItem {
     }
 }
 
+/// Resolution state of the outgoing recipient name. Mirrors
+/// `ffxi_viewer_wire::RecipientStatus`; `Ok.same_account` is LSB ResParam1.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipientStatus {
+    #[default]
+    Unset,
+    Pending,
+    Ok {
+        same_account: bool,
+    },
+    NoSuchChar,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeliveryBoxState {
     /// Which box the server currently has open for us, if any.
@@ -683,6 +697,11 @@ pub struct DeliveryBoxState {
     pub slots: Vec<Option<DeliveryItem>>,
     /// Last Check answer: items still queued beyond the 8 visible slots.
     pub queued: u8,
+    /// Outgoing: the typed/locked recipient name (authoritative here so it
+    /// reaches the wire snapshot; `local_menu` mirrors it for the legacy path).
+    pub recipient: Option<String>,
+    /// Outgoing: recipient name resolution state.
+    pub recipient_status: RecipientStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -697,6 +716,11 @@ pub enum DeliveryBoxUpdate {
     /// Check result: new items queued (Incoming) or delivered (Outgoing).
     PendingCount {
         count: u8,
+    },
+    /// The session just sent a recipient Query: record the name and mark the
+    /// resolution pending so the screen shows "(checking…)".
+    RecipientPending {
+        name: String,
     },
     /// Query result. `ok` = the name resolved to an account (a nonexistent
     /// name answers Result 0xFB instead); `same_account` mirrors LSB's
@@ -1202,6 +1226,8 @@ impl SessionState {
                             open: Some(*box_no),
                             slots: vec![None; ffxi_proto::map::pbx::SLOT_COUNT],
                             queued: 0,
+                            recipient: None,
+                            recipient_status: RecipientStatus::Unset,
                         };
                     }
                     DeliveryBoxUpdate::Closed => {
@@ -1218,9 +1244,21 @@ impl SessionState {
                     DeliveryBoxUpdate::PendingCount { count } => {
                         dbox.queued = *count;
                     }
-                    DeliveryBoxUpdate::RecipientCheck { .. } | DeliveryBoxUpdate::Failed { .. } => {
-                        return false
+                    DeliveryBoxUpdate::RecipientPending { name } => {
+                        dbox.recipient = Some(name.clone());
+                        dbox.recipient_status = RecipientStatus::Pending;
                     }
+                    DeliveryBoxUpdate::RecipientCheck { ok, same_account } => {
+                        if *ok {
+                            dbox.recipient_status = RecipientStatus::Ok {
+                                same_account: *same_account,
+                            };
+                        } else {
+                            dbox.recipient = None;
+                            dbox.recipient_status = RecipientStatus::NoSuchChar;
+                        }
+                    }
+                    DeliveryBoxUpdate::Failed { .. } => return false,
                 }
                 true
             }
@@ -1943,6 +1981,13 @@ pub enum AgentCommand {
     DeliveryBox {
         #[serde(flatten)]
         op: DeliveryBoxOp,
+    },
+
+    /// Take an incoming parcel from inbox `slot`. The session runs the retail
+    /// Accept→Get chain (`DeliveryBoxSession::request_take`) rather than a raw
+    /// single op, since Get depends on the Accept ack.
+    DeliveryTake {
+        slot: u8,
     },
 
     /// Move `quantity` of the item at `from_container`/`from_slot` into

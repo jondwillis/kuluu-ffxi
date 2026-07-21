@@ -29,6 +29,8 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
 
         shop: s.shop.as_ref().map(shop_to_wire),
 
+        delivery_box: delivery_box_to_wire(&s.delivery_box),
+
         status_icons: s.status_icons.clone(),
 
         status_icon_expiries: s.status_icon_expiries.clone(),
@@ -198,6 +200,38 @@ pub fn dialog_to_wire(d: &DialogState) -> wire::DialogState {
         text_entry: d.text_entry,
         grid: d.grid.as_ref().map(grid_to_wire),
     }
+}
+
+fn delivery_box_to_wire(d: &crate::state::DeliveryBoxState) -> Option<wire::DeliveryBoxState> {
+    let box_no = d.open?;
+    Some(wire::DeliveryBoxState {
+        box_no: match box_no {
+            crate::state::DeliveryBoxNo::Incoming => wire::DeliveryBoxNo::Incoming,
+            crate::state::DeliveryBoxNo::Outgoing => wire::DeliveryBoxNo::Outgoing,
+        },
+        slots: d
+            .slots
+            .iter()
+            .map(|cell| {
+                cell.as_ref().map(|item| wire::DeliverySlot {
+                    item_no: item.item_no,
+                    quantity: item.quantity,
+                    counterpart: item.counterpart.clone(),
+                    stat: item.stat,
+                })
+            })
+            .collect(),
+        queued: d.queued,
+        recipient: d.recipient.clone(),
+        recipient_status: match d.recipient_status {
+            crate::state::RecipientStatus::Unset => wire::RecipientStatus::Unset,
+            crate::state::RecipientStatus::Pending => wire::RecipientStatus::Pending,
+            crate::state::RecipientStatus::Ok { same_account } => {
+                wire::RecipientStatus::Ok { same_account }
+            }
+            crate::state::RecipientStatus::NoSuchChar => wire::RecipientStatus::NoSuchChar,
+        },
+    })
 }
 
 fn grid_to_wire(g: &crate::state::DialogGrid) -> wire::DialogGrid {

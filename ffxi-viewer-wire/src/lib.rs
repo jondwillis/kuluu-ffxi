@@ -2,9 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-// v3: SceneSnapshot emote_jobs/emote_chairs + ViewerEvent::EntityEmoted
+// v4: SceneSnapshot.delivery_box (dedicated delivery screen) + ViewerCommand::DeliveryBox
 // (postcard frames are not self-describing, so any shape change bumps this).
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Vec3 {
@@ -364,6 +364,10 @@ pub struct SceneSnapshot {
     #[serde(default)]
     pub shop: Option<ShopState>,
 
+    /// `Some` while a delivery box is open (drives the dedicated delivery screen).
+    #[serde(default)]
+    pub delivery_box: Option<DeliveryBoxState>,
+
     #[serde(default)]
     pub status_icons: Vec<u16>,
 
@@ -650,6 +654,68 @@ pub struct DialogGridCell {
     pub sent: bool,
 }
 
+/// Which delivery box the server has open. Mirrors the client-side
+/// `DeliveryBoxNo` and LSB `GP_CLI_COMMAND_PBX_BOXNO` (Outgoing = send,
+/// Incoming = receive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryBoxNo {
+    Incoming,
+    Outgoing,
+}
+
+impl Default for DeliveryBoxNo {
+    fn default() -> Self {
+        Self::Outgoing
+    }
+}
+
+/// Resolution state of the outgoing recipient name (send box only). `Ok`'s
+/// `same_account` mirrors LSB ResParam1 (recipient shares the sender's
+/// account), which unlocks account-bound item delivery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipientStatus {
+    #[default]
+    Unset,
+    Pending,
+    Ok {
+        same_account: bool,
+    },
+    NoSuchChar,
+}
+
+/// One occupied delivery box slot. `counterpart` is the sender (Incoming) or
+/// recipient (Outgoing); `stat` is the raw GP_POST_BOX_STATE Stat byte
+/// (`ffxi_proto::map::pbx::stat`), which the viewer reads for staged/sent dimming.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliverySlot {
+    pub item_no: u16,
+    pub quantity: u32,
+    #[serde(default)]
+    pub counterpart: Option<String>,
+    pub stat: u32,
+}
+
+/// The dedicated delivery box screen model. `Some` on `SceneSnapshot` ⇒ the box
+/// is open and the viewer renders the delivery screen. Inventory list and
+/// current gil are read from `containers` (gil = LOC_INVENTORY slot 0), not
+/// duplicated here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryBoxState {
+    pub box_no: DeliveryBoxNo,
+    /// `pbx::SLOT_COUNT` (8) entries, row-major over the retail 2x4 grid.
+    pub slots: Vec<Option<DeliverySlot>>,
+    /// Items still queued beyond the 8 visible slots (last Check answer).
+    pub queued: u8,
+    /// Outgoing: the typed/locked recipient name.
+    #[serde(default)]
+    pub recipient: Option<String>,
+    /// Outgoing: recipient name resolution state.
+    #[serde(default)]
+    pub recipient_status: RecipientStatus,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShopState {
     pub offset_index: u16,
@@ -838,6 +904,42 @@ pub enum ViewerCommand {
         threshold: u8,
         mog_house_zoneline: u32,
     },
+
+    /// Delivery box interaction from the dedicated screen. Maps 1:1 to the
+    /// session's `AgentCommand::DeliveryBox` / take chain (see `relay.rs`).
+    DeliveryBox {
+        op: DeliveryOp,
+    },
+}
+
+/// Viewer-issued delivery box operations. A thinner vocabulary than the
+/// session's `DeliveryBoxOp`: the recipient is pulled from the session's locked
+/// name (never re-sent by the viewer), and Open/Take fan out to the right
+/// per-box command server-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum DeliveryOp {
+    /// DeliOpen (Outgoing) / PostOpen (Incoming).
+    Open { box_no: DeliveryBoxNo },
+    /// PostClose the open box.
+    Close,
+    /// Verify a recipient name before staging (Outgoing).
+    Query { recipient: String },
+    /// Stage `quantity` of LOC_INVENTORY `inventory_slot` (0 = gil) into outbox
+    /// `slot`. Recipient comes from the locked name server-side.
+    Set {
+        slot: u8,
+        inventory_slot: u8,
+        quantity: u32,
+    },
+    /// Dispatch the staged item in outbox `slot`.
+    Send { slot: u8 },
+    /// Cancel a staged (take back) or dispatched item in outbox `slot`.
+    CancelSlot { slot: u8 },
+    /// Take an incoming parcel in inbox `slot` (session runs Accept→Get).
+    Take { slot: u8 },
+    /// Return an incoming parcel in inbox `slot` to its sender.
+    Reject { slot: u8 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -921,6 +1023,7 @@ mod tests {
             self_char_id: Some(0xCAFE_F00D),
             dialog: None,
             shop: None,
+            delivery_box: None,
             status_icons: Vec::new(),
             status_icon_expiries: Vec::new(),
             ability_recasts: Vec::new(),

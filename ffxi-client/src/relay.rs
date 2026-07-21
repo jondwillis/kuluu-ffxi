@@ -305,7 +305,48 @@ fn viewer_command_to_agent(cmd: wire::ViewerCommand) -> Option<AgentCommand> {
             threshold,
             mog_house_zoneline,
         },
+
+        wire::ViewerCommand::DeliveryBox { op } => match op {
+            // Take runs the session-side Accept→Get chain.
+            wire::DeliveryOp::Take { slot } => AgentCommand::DeliveryTake { slot },
+            other => AgentCommand::DeliveryBox {
+                op: delivery_op_to_agent(other),
+            },
+        },
     })
+}
+
+/// Map the viewer's thinner `DeliveryOp` onto the session's `DeliveryBoxOp`.
+/// The recipient is left empty on `Set`: the session injects its authoritative
+/// locked recipient, so the viewer never re-sends it.
+fn delivery_op_to_agent(op: wire::DeliveryOp) -> crate::state::DeliveryBoxOp {
+    use crate::state::{DeliveryBoxNo, DeliveryBoxOp};
+    match op {
+        wire::DeliveryOp::Open { box_no } => match box_no {
+            wire::DeliveryBoxNo::Incoming => DeliveryBoxOp::PostOpen,
+            wire::DeliveryBoxNo::Outgoing => DeliveryBoxOp::DeliOpen,
+        },
+        // BoxNo on PostClose is pinned to None by the encoder; the value is vestigial.
+        wire::DeliveryOp::Close => DeliveryBoxOp::PostClose {
+            box_no: DeliveryBoxNo::Outgoing,
+        },
+        wire::DeliveryOp::Query { recipient } => DeliveryBoxOp::Query { recipient },
+        wire::DeliveryOp::Set {
+            slot,
+            inventory_slot,
+            quantity,
+        } => DeliveryBoxOp::Set {
+            slot,
+            inventory_slot,
+            quantity,
+            recipient: String::new(),
+        },
+        wire::DeliveryOp::Send { slot } => DeliveryBoxOp::Send { slot },
+        wire::DeliveryOp::CancelSlot { slot } => DeliveryBoxOp::Cancel { slot },
+        wire::DeliveryOp::Reject { slot } => DeliveryBoxOp::Reject { slot },
+        // Take is handled before this fn (needs the Accept→Get chain).
+        wire::DeliveryOp::Take { slot } => DeliveryBoxOp::Accept { slot },
+    }
 }
 
 #[cfg(test)]

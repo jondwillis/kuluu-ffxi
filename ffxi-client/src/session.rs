@@ -1685,6 +1685,9 @@ async fn keepalive_loop(
     // PBX_RESULT RecipientCheck settles.
     let mut awaiting_recipient = false;
     let mut pending_recipient: Option<String> = None;
+    // The recipient locked by a successful Query; the session injects it into
+    // outgoing `Set` so the dedicated screen (and relay) never re-send it.
+    let mut locked_recipient: Option<String> = None;
 
     // LOC_INVENTORY mirror for the delivery-box item picker:
     // slot -> (item_no, quantity, locked). Maintained inline from
@@ -2328,15 +2331,43 @@ async fn keepalive_loop(
                     Some(AgentCommand::DeliveryBox { op }) => {
                         // Track menu_driven=false so agent-driven flows don't
                         // re-render dialog menus on settle.
-                        match op {
+                        let mut op = op;
+                        match &op {
                             crate::state::DeliveryBoxOp::PostOpen => {
                                 dbox.request_open(crate::state::DeliveryBoxNo::Incoming, false);
+                                locked_recipient = None;
                             }
                             crate::state::DeliveryBoxOp::DeliOpen => {
                                 dbox.request_open(crate::state::DeliveryBoxNo::Outgoing, false);
+                                locked_recipient = None;
+                            }
+                            crate::state::DeliveryBoxOp::PostClose { .. } => {
+                                locked_recipient = None;
                             }
                             _ => {}
                         }
+                        // The recipient Query records the name so RecipientCheck
+                        // settles it, and projects "(checking…)" to the screen.
+                        if let crate::state::DeliveryBoxOp::Query { recipient } = &op {
+                            let name = recipient.clone();
+                            pending_recipient = Some(name.clone());
+                            let _ = event_tx.send(AgentEvent::DeliveryBoxUpdated {
+                                box_no: crate::state::DeliveryBoxNo::Outgoing,
+                                update: crate::state::DeliveryBoxUpdate::RecipientPending { name },
+                            });
+                        }
+                        // Inject the session-authoritative locked recipient so the
+                        // viewer never has to re-supply it on Set.
+                        if let crate::state::DeliveryBoxOp::Set { recipient, .. } = &mut op {
+                            if let Some(locked) = &locked_recipient {
+                                *recipient = locked.clone();
+                            }
+                        }
+                        send_pbx(map, &op, &mut sub_seq, server_last_seq, &event_tx).await;
+                    }
+                    Some(AgentCommand::DeliveryTake { slot }) => {
+                        // Accept→Get chain (Get depends on the Accept ack).
+                        let op = dbox.request_take(slot);
                         send_pbx(map, &op, &mut sub_seq, server_last_seq, &event_tx).await;
                     }
                     Some(AgentCommand::MoveItem {
@@ -2871,6 +2902,11 @@ async fn keepalive_loop(
                                             } = update
                                             {
                                                 if let Some(name) = pending_recipient.take() {
+                                                    // Authoritative locked recipient the
+                                                    // session injects into Set (so neither
+                                                    // viewer nor relay must re-send it).
+                                                    locked_recipient =
+                                                        ok.then(|| name.clone());
                                                     let dialog = if *ok {
                                                         local_menu.set_recipient(Some(name))
                                                     } else {
