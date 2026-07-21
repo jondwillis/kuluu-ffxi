@@ -111,6 +111,7 @@ pub fn mouse_camera_system(
     pointer: Res<MousePointer>,
     camera_mode: Res<CameraMode>,
     state: Res<SceneState>,
+    move_intent: Option<Res<crate::combat_stance::SelfMoveIntent>>,
     mut chase: ResMut<ChaseCamera>,
 
     mut prev_drag: Local<bool>,
@@ -128,7 +129,12 @@ pub fn mouse_camera_system(
         chase.pitch = (chase.pitch + pitch_d).clamp(lo, hi);
     }
 
-    if matches!(mode, CameraMode::FirstPerson) && *prev_drag && !drag_active {
+    // FP mouse-look is a temporary glance that snaps back to facing on
+    // release — but only from a standstill. While moving, the pan steers the
+    // heading (dispatch_movement_system commits chase.yaw as the run heading),
+    // so snapping back to the lagged server heading would jerk the view.
+    let moving = move_intent.is_some_and(|m| m.moving);
+    if matches!(mode, CameraMode::FirstPerson) && *prev_drag && !drag_active && !moving {
         chase.yaw = yaw_for_heading(state.snapshot.self_pos.heading);
         chase.pitch = 0.0;
     }

@@ -1122,7 +1122,10 @@ pub fn camera_polish_system(
         recenter.manual_override = false;
     }
 
-    if !yaw_input
+    // Recenter only tracks the character while it is actually moving; idle,
+    // the camera holds wherever the player left it (retail behavior).
+    if movement_input
+        && !yaw_input
         && !drag_active
         && !recenter.manual_override
         && matches!(*camera_mode, CameraMode::Chase)
