@@ -15,7 +15,11 @@ pub struct StanceParams<'w> {
 
 #[derive(SystemParam)]
 pub struct MoveEnvParams<'w> {
-    pub navmesh: Res<'w, super::navmesh_overlay::NavmeshState>,
+    // Player movement grounds height on the retail MZB zone collision (the real
+    // .dat floor, which has the stairs). The coarse LSB Recast navmesh is a
+    // mob-pathing mesh that flattens stairs, so it is NOT used here — only for
+    // /pathto and minimap culling (kuluu-oe8y; see AGENTS.md).
+    pub collision: Res<'w, ffxi_viewer_core::dat_mzb::MzbCollisionGeometry>,
     pub minimap_hover: Res<'w, ffxi_viewer_core::minimap::input::MinimapHoverGate>,
     pub pointer: Res<'w, ffxi_viewer_core::MousePointer>,
     // Focus-less GUI driving (kuluu-0pof): remote movement injection.
@@ -66,16 +70,6 @@ const BACKPEDAL_SCALE: f32 = 0.5;
 const STRAFE_SCALE: f32 = 0.75;
 
 const PREDICTION_RESYNC_YALMS: f32 = 5.0;
-
-// Cap how far a single movement re-ground may drop the player below their feet.
-// `nearest_height_at` snaps to the nearest navmesh poly within a 100-yalm
-// vertical window, so where two walkable layers stack (Bastok Markets' walkway
-// over its water canal) and the upper poly is momentarily absent at a column,
-// the query latches onto the lower layer and teleports the player into the
-// water (kuluu-nvqx). Legit descent is continuous — each per-frame query lands
-// on the same connected surface a fraction of a yalm lower — so any drop past
-// this is the query jumping floors, not the player walking downhill.
-const MAX_GROUND_STEP_DOWN: f32 = 4.0;
 
 // Retail body turn into a new camera-relative run direction takes ~0.5-0.7s
 // for 90° (HorizonXI video 2026-07-20, D-press frames). The carve rate of a
@@ -904,56 +898,24 @@ pub fn dispatch_movement_system(
         y += right_y * step * strafe as f32;
     }
 
-    let (final_x, final_y, final_z) = if let Some(nav) = &env.navmesh.nav {
-        let from = ffxi_nav::glam::Vec3::new(basis_pos.x, basis_pos.y, basis_pos.z);
-        let to = ffxi_nav::glam::Vec3::new(x, y, basis_pos.z);
-        let slid = nav
-            .lock()
-            .ok()
-            .and_then(|guard| guard.slide_along(from, to));
-
-        let proposed = ((x - basis_pos.x).powi(2) + (y - basis_pos.y).powi(2)).sqrt();
-        if proposed > 0.1 {
-            let (resulting, branch) = match &slid {
-                Some(p) => {
-                    let r = ((p.x - basis_pos.x).powi(2) + (p.y - basis_pos.y).powi(2)).sqrt();
-                    (r, "slide_some")
-                }
-                None => (proposed, "slide_none_passthrough"),
-            };
-            if resulting < 0.1 {
-                tracing::warn!(
-                    branch,
-                    from_xy = format!("({:.2},{:.2},{:.2})", from.x, from.y, from.z),
-                    to_xy = format!("({:.2},{:.2})", to.x, to.y),
-                    slid_xy = ?slid.as_ref().map(|p| (p.x, p.y, p.z)),
-                    proposed_step = proposed,
-                    resulting_step = resulting,
-                    "wall-slide probe: proposed move but stuck (resulting <0.1)"
-                );
-            }
-        }
-        match slid {
-            Some(p) => (p.x, p.y, p.z),
-            None => (x, y, basis_pos.z),
-        }
-    } else {
-        (x, y, basis_pos.z)
-    };
-
-    // slide_along passes Z through; the server's engage range is 3D, so an
-    // off-ground reported Y inflates distance to grounded mobs. Re-ground here.
+    // Ground height on the MZB zone collision — the retail `.dat` floor, which
+    // has the stairs and ramps the coarse LSB pathing navmesh flattens away
+    // (kuluu-oe8y). `ground_nearest` picks the floor closest to our current feet,
+    // so a small stair step climbs (nearest floor is the next step) and a
+    // stacked column (Bastok Markets' walkway over its canal) resolves to the
+    // level we're on rather than teleporting to the layer below. MZB collision
+    // is in Bevy space (bevy.x = ffxi.x, bevy.z = -ffxi.y, bevy.y = -ffxi.z).
+    //
+    // Horizontal movement is unconstrained here: the navmesh no longer gates it
+    // (it's mob-pathing only now). Client-side wall collision from MZB walls is
+    // the follow-up (kuluu-q5sn); walls are server-authoritative until then.
+    let final_x = x;
+    let final_y = y;
     let final_z = env
-        .navmesh
-        .nav
-        .as_ref()
-        .and_then(|nav| {
-            nav.lock()
-                .ok()?
-                .nearest_height_at(final_x, final_y, basis_pos.z)
-        })
-        .filter(|&h| h >= basis_pos.z - MAX_GROUND_STEP_DOWN)
-        .unwrap_or(final_z);
+        .collision
+        .ground_nearest(bevy::math::Vec2::new(final_x, -final_y), -basis_pos.z)
+        .map(|floor_bevy_y| -floor_bevy_y)
+        .unwrap_or(basis_pos.z);
 
     let _ = cmd_tx.0.try_send(AgentCommand::Move {
         x: final_x,

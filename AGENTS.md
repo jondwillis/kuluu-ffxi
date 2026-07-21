@@ -86,7 +86,7 @@ Bevy systems: scene graph, chase camera + collision, HUD (`hud/`), minimap, pick
 - `ffxi-dat` — retail file parsers (VTABLE/FTABLE resolution, MZB/MMB zone+model geometry, ANI/skeleton animation, textures, weather, NPC names). Applies the **FFXI→Bevy coordinate transform**; get this wrong and geometry/actors render mirrored or sideways.
 - `ffxi-proto` — the wire protocol (login, framing, blowfish, zlib, the `msg_*` packet families, autotranslate).
 - `ffxi-actor` — skeleton + animation state (`actor_state`, `animation`, `skeleton_instance`) shared by the renderer for posing skinned meshes.
-- `ffxi-audio` — BGW/SPW containers + ADPCM/PCM decode. `ffxi-nav` (in-house grid pathing) / `ffxi-nav-recast` (Recast/Detour navmesh from LSB xiNavmeshes).
+- `ffxi-audio` — BGW/SPW containers + ADPCM/PCM decode. `ffxi-nav` (in-house grid pathing) / `ffxi-nav-recast` (Recast/Detour navmesh from LSB xiNavmeshes). **The LSB Recast navmesh is a coarse mob-pathing mesh — it flattens/omits stairs and ramps, so it is NOT the authority for client-side player movement.** Player movement (height *and* horizontal wall-collision) grounds on the retail **MZB zone collision** (`ffxi-viewer-core::dat_mzb`, the real `.dat` floor that has the stairs). The navmesh is used only for `/pathto` (reactor straight-line/goal pathing) and minimap culling — grounding player Y on it pins the character to the flattened floor and makes stairs unclimbable (kuluu-oe8y). Don't reintroduce it into `input.rs` movement.
 - `ffxi-mcp` / `ffxi-agent` — MCP bridge + the LLM-agent harness. `ffxi-agent/CLAUDE.md` is a **runtime playbook for the agent**, not dev guidance for this repo.
 
 ### The LSB boundary is the critical correctness surface
