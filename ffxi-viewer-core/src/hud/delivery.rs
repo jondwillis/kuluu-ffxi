@@ -641,7 +641,7 @@ pub(crate) fn rebuild_delivery_inventory(
             .map(|s| s.flags & (FLAG_RARE | FLAG_EX) != 0)
             .unwrap_or(false)
     };
-    inv.rows = build_inventory(snap, |id| ffxi_proto::item_flags::deliverable(id), ex_rare);
+    inv.rows = build_inventory(snap, ffxi_proto::item_flags::deliverable, ex_rare);
 }
 
 fn recipient_value_text(d: &DeliveryBoxState, editing: Option<&String>) -> String {
