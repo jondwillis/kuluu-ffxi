@@ -6,10 +6,18 @@ drives the session underneath, screenshots are the evidence**.
 
 ## Launch with the agent socket
 
+Default to the local GM drive account — **do not ask the user for
+credentials** (see SKILL.md "Character strategy"):
+
 ```bash
 cargo run -p ffxi-client --features native-window -- \
-  --agent-listen auto play <user> '<password>' '<Char Name>'
+  --agent-listen auto play verilight 'TestPass!1234' Verilamp
 ```
+
+`verilight`/`TestPass!1234`/`Verilamp` (gmlevel 5) is this machine's throwaway
+dev account — a documented local example credential, not a secret; type it
+into launch commands freely. Use the user's real env-var account only when the
+check needs their own character.
 
 Credentials are **positional args to `play`** — the GUI path reads no
 `FFXI_USER`/`FFXI_PASS`/`FFXI_CHAR` env vars (only headless test fixtures
@@ -102,7 +110,7 @@ a movement test.
 - **Console lock kills capture**: if the macOS session locks (`CGSSessionScreenIsLocked=1` via `Quartz.CGSessionCopyCurrentDictionary()`), `screencapture` returns hard errors or solid black and System Events sees 0 windows — regardless of TCC grants. Check this FIRST when captures come back black; only a human unlock fixes it.
 - **Agent-socket `chat` bypasses the client's local `/`-command parser** — it sends a raw wire SAY. Server-side `!` GM commands work through it; client-side `/` commands (e.g. `/lights`) need real keystrokes into the chat bar.
 - **Agent-socket `move` persists server-side** (position survives relaunch); it is not a client-only hack. It also doesn't guarantee nearby NPCs stream in — prefer walking the last stretch for entity-visual checks.
-- **GM drive char**: `Verilamp` (gmlevel 5) on the local throwaway `verilight` account; `!zone`/`!settime` work as socket chat. Fresh `create-char` chars have gmlevel 0 and the server silently ignores `!zone`. There is no `!settime`; use `!addtime <offset_in_seconds>` (LSB `scripts/commands/addtime.lua`, permission 5) — it resets-then-adds an earth-clock offset that indirectly drives Vana'diel time, so the same offset issued later in the session (after real time has elapsed) lands at a later Vana'diel time than the first call. `!setweather NONE` (permission 1) clears overcast/rain so directional shadows are actually visible — cloudy weather flattens lighting enough to hide cast shadows.
+- **GM drive char**: `Verilamp` (gmlevel 5) on the local throwaway `verilight` account (password `TestPass!1234`, the provisioning-doc example — not a secret); `!zone`/`!settime` work as socket chat. Fresh `create-char` chars have gmlevel 0 and the server silently ignores `!zone`. There is no `!settime`; use `!addtime <offset_in_seconds>` (LSB `scripts/commands/addtime.lua`, permission 5) — it resets-then-adds an earth-clock offset that indirectly drives Vana'diel time, so the same offset issued later in the session (after real time has elapsed) lands at a later Vana'diel time than the first call. `!setweather NONE` (permission 1) clears overcast/rain so directional shadows are actually visible — cloudy weather flattens lighting enough to hide cast shadows.
 - **Known intermittent**: `slab_allocator Use-after-free` burst at zone-in can black out all zone geometry for the whole session (kuluu-172i); relaunch once before diagnosing rendering changes.
 - **`nc -U` hangs the harness**: BSD `nc` (macOS) has no `-q`/idle-timeout that reliably closes after one command; `nc -U -w N <sock>` still blocks past N waiting on the socket, gets backgrounded by the harness, and — worse — the abandoned connection holds the agent socket's single-peer slot open so every subsequent send silently no-ops (`agent socket peer connected` never logs again) until you kill the stray `nc`. Use a one-shot Python `socket.socket(AF_UNIX, SOCK_STREAM)` with `settimeout()` + explicit `close()` instead of shelling out to `nc`.
 - **`screencapture -l <window_id>` can return a stale cached frame for an occluded/background window** — HUD clock and other live state won't advance across captures even though the process is healthy and ticking. Bring the target frontmost first (`osascript … set frontmost of process "ffxi-client" to true`) and give it a beat before each capture, not just once at the start.

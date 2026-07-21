@@ -78,8 +78,23 @@ mechanical middle, not the thinking.
 
 ## Character strategy
 
+**Never ask the user for credentials.** This is a local dev stack with
+throwaway accounts; verification is expected to launch sessions on its own.
+Default to one of the documented local accounts below (or provision a fresh
+one) — do not stop to request a login. The only credentials that are secret
+are the user's *real* env-var account, which you use only when a check needs
+their actual character; even then it comes from the environment, never a
+prompt.
+
+- **Local GM drive account** (default for GUI drives that need `!zone`/
+  `!addtime`/`!setweather`): account `verilight`, password `TestPass!1234`,
+  char `Verilamp` (gmlevel 5). This is the LSB provisioning-doc example
+  credential for this machine's dev DB — safe to type into launch commands and
+  logs, not a real secret. Launch:
+  `cargo run -p ffxi-client --features native-window -- --agent-listen auto play verilight 'TestPass!1234' Verilamp`
 - **Real character** (the user's) — credentials come from env
-  (`FFXI_USER`/`FFXI_PASS`/`FFXI_CHAR`); never commit or log them.
+  (`FFXI_USER`/`FFXI_PASS`/`FFXI_CHAR`); never commit or log them. Use only
+  when the check specifically needs the user's own character/progress.
 - **Fresh provisioned chars** (`provision` + `create-char`, no DB teleport
   needed) — full E2E vehicle including zone changes and Mog House entry. The
   old "fresh chars get all c2s silently ignored" blocker was two client bugs,
