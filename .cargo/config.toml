@@ -2,12 +2,17 @@
 #
 # NOTE: a `[env] CXXFLAGS = "-isysroot /Library/Developer/CommandLineTools/..."`
 # block used to live here as a workaround for a stale macOS Command Line Tools
-# layout on one developer's machine (see git history). Cargo's `[env]` table
-# is global — it can't be scoped to a target triple — so it silently broke
-# `cxx`/`recastnavigation-rs` builds on every non-macOS platform (Linux,
-# Steam Deck, Windows) by pointing every C++ compile at a macOS-only sysroot.
-# Removed; that fix belongs in the affected developer's personal
-# `~/.cargo/config.toml`, not this shared, cross-platform config.
+# layout on one developer's machine (see git history). Cargo's `[env]` table is
+# process-global — it can't be scoped to a target triple — so it pointed every
+# C++ compile at a macOS-only sysroot. CI and the docker build already override
+# `CXXFLAGS` per-platform (`.github/build-setup.yml`, `docker/build-linux.sh`),
+# so the breakage was confined to native local dev builds off the docker path:
+# a non-macOS developer building `cxx`/`recastnavigation-rs` directly (e.g. the
+# Fedora-toolbox Steam Deck build) had the sysroot leak in.
+# Removed. A developer whose local Command Line Tools layout still needs the
+# override should set `CXXFLAGS` in their personal `~/.cargo/config.toml` (or
+# export `CXXFLAGS="-isysroot $(xcrun --show-sdk-path)"`), not in this shared,
+# cross-platform config.
 #
 # ## Build-speed tuning
 #
