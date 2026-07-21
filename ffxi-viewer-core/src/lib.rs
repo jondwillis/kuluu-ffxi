@@ -69,6 +69,8 @@ pub mod zone_clouds;
 pub mod zone_lights;
 pub mod zone_lines;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod zone_particles;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod zone_point_lights;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod zone_texture;
@@ -197,6 +199,9 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(zone_point_lights::ZonePointLightsPlugin);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins(zone_particles::ZoneParticlesPlugin);
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(zone_clouds::ZoneCloudsPlugin);

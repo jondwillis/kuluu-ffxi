@@ -43,8 +43,9 @@ pub fn d3m_to_mesh(d3m: &D3m) -> Mesh {
 }
 
 pub fn decoded_texture_to_image(t: &ffxi_dat::texture::DecodedTexture) -> Image {
+    use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
     use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-    Image::new(
+    let mut image = Image::new(
         Extent3d {
             width: t.width,
             height: t.height,
@@ -54,7 +55,15 @@ pub fn decoded_texture_to_image(t: &ffxi_dat::texture::DecodedTexture) -> Image 
         t.rgba.clone(),
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::default(),
-    )
+    );
+    // Scrolling water sheets (zone-static generators) drive UVs past [0,1]; Repeat
+    // tiles the sprite instead of smearing the edge texel.
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..default()
+    });
+    image
 }
 
 pub fn d3m_material(blend: D3mBlendMode, texture: Option<Handle<Image>>) -> StandardMaterial {

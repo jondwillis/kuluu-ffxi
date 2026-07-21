@@ -71,6 +71,14 @@ pub struct ParticleGeneratorDef {
     // applied as a 2x modulate (Particle.kt:218). RGBA in 0..=1.
     pub day_of_week_color: Option<[[f32; 4]; 8]>,
     pub moon_phase_color: Option<[[f32; 4]; 12]>,
+
+    // research/xim ParticleUpdaters.kt section-3 updaters (offset at body[0x78], same
+    // sectionHeader+offset-0x10 convention as the setup section). TextureCoordinateUpdater
+    // 0x27/0x28 carry the per-frame UV-translate velocity that scrolls the sprite/sheet
+    // texture (cascade/moat water). VelocityAccelerator 0x03/0x06/0x09 read a Vector3f at
+    // payload+0; only 0x03 (gravity) affects the visible arc. [0,0]/None = static.
+    pub uv_scroll: [f32; 2],
+    pub accel: Option<[f32; 3]>,
 }
 
 impl ParticleGeneratorDef {
@@ -228,6 +236,43 @@ impl ParticleGeneratorDef {
         if !is_particle {
             return Ok(None);
         }
+
+        // Section 3 (body[0x78]) — per-frame updaters (same walk as
+        // generator.rs::parse_cloud_generator). 0x27/0x28 TextureCoordinateUpdater UV
+        // scroll; 0x03 VelocityAccelerator gravity (Vector3f at payload+0).
+        let mut uv_scroll = [0.0f32; 2];
+        let mut accel = None;
+        let sec3_raw = u32_le(body, 0x78) as usize;
+        if sec3_raw >= 0x10 && sec3_raw - 0x10 < body.len() {
+            let mut cursor = sec3_raw - 0x10;
+            while cursor + 4 <= body.len() {
+                let cfg = u32_le(body, cursor);
+                let opcode = (cfg & 0xFF) as u8;
+                let size_words = ((cfg >> 8) & 0x1F) as usize;
+                if opcode == 0x00 || size_words == 0 {
+                    break;
+                }
+                let block_len = size_words * 4;
+                let payload = cursor + 4;
+                if cursor + block_len > body.len() {
+                    break;
+                }
+                match opcode {
+                    0x27 if payload + 4 <= body.len() => uv_scroll[0] = f32_le(body, payload),
+                    0x28 if payload + 4 <= body.len() => uv_scroll[1] = f32_le(body, payload),
+                    0x03 if payload + 12 <= body.len() => {
+                        accel = Some([
+                            f32_le(body, payload),
+                            f32_le(body, payload + 4),
+                            f32_le(body, payload + 8),
+                        ]);
+                    }
+                    _ => {}
+                }
+                cursor += block_len;
+            }
+        }
+
         Ok(Some(Self {
             frames_per_emission,
             particles_per_emission,
@@ -248,6 +293,8 @@ impl ParticleGeneratorDef {
             alpha_track,
             day_of_week_color,
             moon_phase_color,
+            uv_scroll,
+            accel,
         }))
     }
 
@@ -409,6 +456,49 @@ mod tests {
         assert!((def.init_velocity[1] + 0.005).abs() < 1e-6);
         assert_eq!(def.alpha_track, Some(*b"k1a0"));
         assert_eq!(def.scale_x_track, None);
+    }
+
+    #[test]
+    fn parses_section3_uv_scroll_and_accel() {
+        // Minimal particle setup in section 2, terminated, then a section-3 stream at
+        // body[0x78] with TextureCoordinateUpdater 0x27/0x28 and VelocityAccelerator 0x03.
+        let mut setup = op(0x01, 12, &[]);
+        setup[4 + 29] = PARTICLE_LINKED_DATA;
+        let mut body = build(&setup, 1, 1);
+        body.extend_from_slice(&[0u8; 4]); // terminate section 2
+        let sec3_body_index = body.len();
+        body[0x78..0x7C].copy_from_slice(&((sec3_body_index + 0x10) as u32).to_le_bytes());
+        let mut sec3 = op(0x27, 2, &(-0.015f32).to_le_bytes());
+        sec3.extend(op(0x28, 2, &0.001f32.to_le_bytes()));
+        sec3.extend(op(0x03, 4, &{
+            let mut p = Vec::new();
+            p.extend_from_slice(&0.0f32.to_le_bytes());
+            p.extend_from_slice(&(-0.02f32).to_le_bytes());
+            p.extend_from_slice(&0.0f32.to_le_bytes());
+            p
+        }));
+        body.extend_from_slice(&sec3);
+
+        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+        assert!(
+            (def.uv_scroll[0] + 0.015).abs() < 1e-9,
+            "0x27 -> uv_scroll[0]"
+        );
+        assert!(
+            (def.uv_scroll[1] - 0.001).abs() < 1e-9,
+            "0x28 -> uv_scroll[1]"
+        );
+        assert_eq!(def.accel, Some([0.0, -0.02, 0.0]), "0x03 -> accel");
+    }
+
+    #[test]
+    fn no_section3_leaves_defaults() {
+        let mut setup = op(0x01, 12, &[]);
+        setup[4 + 29] = PARTICLE_LINKED_DATA;
+        let body = build(&setup, 1, 1);
+        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+        assert_eq!(def.uv_scroll, [0.0, 0.0]);
+        assert_eq!(def.accel, None);
     }
 
     #[test]

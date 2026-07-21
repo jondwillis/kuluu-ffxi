@@ -55,6 +55,13 @@ struct LiveGenerator {
     // The mesh entity is a child of the actor root, so vertex positions are
     // built in the actor's FFXI-local frame instead of world space.
     actor_local: bool,
+    // Accumulated UV-translate (def.uv_scroll integrated over life) added to every
+    // template UV so a scrolling water sheet/cascade slides its texture.
+    tex_translate: Vec2,
+    // Per-axis sign applied to init_velocity/accel. Actor-local generators integrate
+    // in the DAT frame (ONE); world-space zone generators build positions directly in
+    // Bevy space, so velocity gets the same mzb->bevy basis (x,-y,-z) as the origin.
+    vel_basis: Vec3,
 }
 
 // Auto-run particle generators embedded in an actor DAT (research/xim
@@ -157,6 +164,8 @@ pub fn spawn_particle_generators(
             auto_run: false,
             orientation: None,
             actor_local: false,
+            tex_translate: Vec2::ZERO,
+            vel_basis: Vec3::ONE,
         });
     }
 }
@@ -240,10 +249,82 @@ pub fn spawn_actor_auto_run_particles(
                 orientation: (!def.camera_billboard)
                     .then(|| Quat::from_euler(EulerRot::XYZ, rot[0], rot[1], rot[2])),
                 actor_local: true,
+                tex_translate: Vec2::ZERO,
+                vel_basis: Vec3::ONE,
                 def,
             });
         }
     }
+}
+
+// research/xim EnvironmentManager zone-static Generator: an auto-run particle
+// generator embedded in the zone MZB DAT (Bastok Mines pump spray), placed in
+// world space rather than parented to an actor. `origin` is already mzb->bevy;
+// velocity/accel take the same basis so the spray arcs in Bevy space.
+pub fn spawn_zone_particle_generator(
+    def: ParticleGeneratorDef,
+    assets: &ActionAssets,
+    origin: Vec3,
+    meshes: &mut Assets<Mesh>,
+    mats: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    sim: &mut ParticleSimulator,
+    commands: &mut Commands,
+) -> Option<Entity> {
+    let d3m = assets.d3ms.get(&def.mesh_id)?;
+    let template = sprite_template(d3m)?;
+
+    let tex = d3m.texture_name[8..12]
+        .try_into()
+        .ok()
+        .and_then(|name: [u8; 4]| assets.images.get(&name))
+        .map(|t| images.add(decoded_texture_to_image(t)));
+    let blend = match def.blend {
+        ffxi_dat::particle_gen::ParticleBlend::Additive => D3mBlendMode::Additive,
+        ffxi_dat::particle_gen::ParticleBlend::Blend => D3mBlendMode::Blended,
+        ffxi_dat::particle_gen::ParticleBlend::Subtract => D3mBlendMode::Subtractive,
+    };
+    let mat = mats.add(d3m_material(blend, tex));
+    let mesh = meshes.add(empty_mesh());
+
+    let entity = commands
+        .spawn((
+            InGameEntity,
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(mat),
+            Transform::IDENTITY,
+            Visibility::default(),
+            bevy::camera::visibility::NoFrustumCulling,
+            bevy::light::NotShadowCaster,
+            bevy::light::NotShadowReceiver,
+        ))
+        .id();
+
+    let resolve = |id: Option<[u8; 4]>| -> Option<KeyFrameTrack> {
+        id.and_then(|i| assets.keyframes.get(&i).cloned())
+    };
+    let rot = def.init_rotation;
+    sim.generators.push(LiveGenerator {
+        scale_x: resolve(def.scale_x_track),
+        scale_y: resolve(def.scale_y_track),
+        alpha: resolve(def.alpha_track),
+        template,
+        origin,
+        particles: Vec::new(),
+        emit_accum: 0.0,
+        age_frames: 0.0,
+        emit_window_frames: 0.0,
+        mesh,
+        entity,
+        auto_run: true,
+        orientation: (!def.camera_billboard)
+            .then(|| Quat::from_euler(EulerRot::XYZ, rot[0], rot[1], rot[2])),
+        actor_local: false,
+        tex_translate: Vec2::ZERO,
+        vel_basis: Vec3::new(1.0, -1.0, -1.0),
+        def,
+    });
+    Some(entity)
 }
 
 pub fn tick_particle_simulator(time: Res<Time>, mut sim: ResMut<ParticleSimulator>) {
@@ -283,8 +364,19 @@ pub fn tick_particle_simulator(time: Res<Time>, mut sim: ResMut<ParticleSimulato
             }
         }
 
+        // research/xim ParticleUpdaters TextureCoordinateUpdater: scroll velocity is
+        // per-generator (frames of life advance the shared UV offset), not per-particle.
+        g.tex_translate += Vec2::from_array(g.def.uv_scroll) * frames;
+
+        let accel = g
+            .def
+            .accel
+            .map(|a| Vec3::from_array(a) * g.vel_basis * frames);
         for p in &mut g.particles {
             p.age_frames += frames;
+            if let Some(a) = accel {
+                p.vel += a;
+            }
             p.pos += p.vel * frames;
         }
         g.particles.retain(|p| p.age_frames < p.life_frames);
@@ -294,7 +386,7 @@ pub fn tick_particle_simulator(time: Res<Time>, mut sim: ResMut<ParticleSimulato
 fn emit(g: &mut LiveGenerator, life_frames: f32) {
     g.particles.push(Particle {
         pos: Vec3::ZERO,
-        vel: Vec3::from_array(g.def.init_velocity),
+        vel: Vec3::from_array(g.def.init_velocity) * g.vel_basis,
         age_frames: 0.0,
         life_frames: life_frames.max(1.0),
         rgb: Vec3::from_slice(&g.def.init_color[..3]),
@@ -393,7 +485,7 @@ fn rebuild_mesh(g: &LiveGenerator, rot: Quat, mesh: &mut Mesh) {
         for (tp, uv) in g.template.positions.iter().zip(&g.template.uvs) {
             let local = Vec3::new(tp.x * sx, tp.y * sy, tp.z * sz);
             positions.push((world + rot * local).to_array());
-            uvs.push(*uv);
+            uvs.push([uv[0] + g.tex_translate.x, uv[1] + g.tex_translate.y]);
             colors.push([rgb.x, rgb.y, rgb.z, vert_a]);
         }
         indices.extend(g.template.indices.iter().map(|&idx| base + idx));
@@ -463,6 +555,8 @@ mod tests {
             alpha_track: None,
             day_of_week_color: None,
             moon_phase_color: None,
+            uv_scroll: [0.0, 0.0],
+            accel: None,
         }
     }
 
@@ -488,6 +582,8 @@ mod tests {
             auto_run: false,
             orientation: None,
             actor_local: false,
+            tex_translate: Vec2::ZERO,
+            vel_basis: Vec3::ONE,
         }
     }
 
