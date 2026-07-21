@@ -4,6 +4,7 @@ pub mod chat_panel;
 pub mod check_view;
 pub mod compass;
 pub mod death_prompt;
+pub mod delivery;
 pub mod diagnostics;
 pub mod dialog;
 pub mod entity_hover_card;
@@ -184,6 +185,9 @@ impl Plugin for HudPlugin {
 
         app.init_resource::<trade::TradeState>();
 
+        app.init_resource::<delivery::DeliveryScreenState>();
+        app.init_resource::<delivery::DeliveryInventory>();
+
         app.add_message::<target_action_menu::TargetActionActivated>();
         app.add_message::<trade::TradeIntent>();
         app.init_resource::<target_panel::SwingPulse>();
@@ -264,6 +268,8 @@ impl Plugin for HudPlugin {
                 check_view::update_check_view,
                 status_panel::update_status_panel,
                 equipment_screen::update_equipment_screen.after(menu::refresh_dynamic_menu_rows),
+                delivery::rebuild_delivery_inventory,
+                delivery::update_delivery_screen.after(delivery::rebuild_delivery_inventory),
             ),
         );
         app.add_systems(Update, apply_dev_hud_visibility);
@@ -371,6 +377,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             check_view::spawn_check_view,
             status_panel::spawn_status_panel,
             equipment_screen::spawn_equipment_screen,
+            delivery::spawn_delivery_screen,
         ),
     );
 }
