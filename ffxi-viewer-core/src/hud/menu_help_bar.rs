@@ -8,7 +8,7 @@ use bevy::prelude::*;
 
 use crate::hud::menu::{self, DynamicMenu, DynamicMenuAction};
 use crate::hud::style::{self, theme};
-use crate::input_mode::{InputMode, MenuKind};
+use crate::input_mode::{InputMode, MenuKind, PassiveCursorFocus};
 
 #[derive(Component)]
 pub struct MenuHelpBar;
@@ -219,12 +219,22 @@ pub fn update_menu_help_bar(
         return;
     };
 
-    let active = match &*mode {
-        InputMode::Menu(stack) => stack.current().map(|l| (l.kind, l.cursor)),
+    let content = match &*mode {
+        InputMode::Menu(stack) => stack.current().map(|l| BarContent {
+            title: menu::menu_title(l.kind).to_string(),
+            counter: match bag_counter(l.kind, &scene.snapshot, active_bag.0) {
+                Some((used, capacity)) => format!("{used}/{capacity}"),
+                None => String::new(),
+            },
+            hint: entry_help(l.kind, l.cursor, &dynamic),
+        }),
+        InputMode::PassiveCursor(s) if s.focus == PassiveCursorFocus::StatusIcons => {
+            buff_bar_content(&scene.snapshot, s.status_cursor)
+        }
         _ => None,
     };
 
-    let Some((kind, cursor)) = active else {
+    let Some(content) = content else {
         if node.display != Display::None {
             node.display = Display::None;
         }
@@ -235,28 +245,47 @@ pub fn update_menu_help_bar(
     }
 
     if let Ok(mut text) = title_q.single_mut() {
-        let want = menu::menu_title(kind);
-        if **text != *want {
-            **text = want.to_string();
+        if **text != content.title {
+            **text = content.title;
         }
     }
 
     if let Ok(mut text) = counter_q.single_mut() {
-        let want = match bag_counter(kind, &scene.snapshot, active_bag.0) {
-            Some((used, capacity)) => format!("{used}/{capacity}"),
-            None => String::new(),
-        };
-        if **text != want {
-            **text = want;
+        if **text != content.counter {
+            **text = content.counter;
         }
     }
 
     if let Ok(mut text) = hint_q.single_mut() {
-        let want = entry_help(kind, cursor, &dynamic);
-        if **text != want {
-            **text = want;
+        if **text != content.hint {
+            **text = content.hint;
         }
     }
+}
+
+struct BarContent {
+    title: String,
+    counter: String,
+    hint: String,
+}
+
+/// Retail's status window names the highlighted buff in the top bar. We mirror
+/// it while the F-cycle cursor sits on the ribbon: title "Status", a
+/// position/total counter, and the buff's name (from the scraped effect table)
+/// as the help line. Returns `None` when the player has no active effects.
+fn buff_bar_content(snap: &ffxi_viewer_wire::SceneSnapshot, cursor: usize) -> Option<BarContent> {
+    let icons = &snap.status_icons;
+    if icons.is_empty() {
+        return None;
+    }
+    let cursor = cursor.min(icons.len() - 1);
+    let icon = icons[cursor];
+    let name = ffxi_proto::status_names::lookup(icon).unwrap_or("(Unknown effect)");
+    Some(BarContent {
+        title: menu::menu_title(MenuKind::Status).to_string(),
+        counter: format!("{}/{}", cursor + 1, icons.len()),
+        hint: name.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -302,5 +331,90 @@ mod tests {
             Some((2, 58))
         );
         assert_eq!(bag_counter(MenuKind::Root, &snap, inv), None);
+    }
+
+    #[test]
+    fn buff_bar_names_the_cursor_slot() {
+        use ffxi_viewer_wire::SceneSnapshot;
+        // 40 = Protect, 41 = Shell (status_names scrape).
+        let snap = SceneSnapshot {
+            status_icons: vec![40, 41],
+            ..Default::default()
+        };
+        let c = buff_bar_content(&snap, 1).expect("has effects");
+        assert_eq!(c.title, "Status");
+        assert_eq!(c.counter, "2/2");
+        assert_eq!(c.hint, "Shell");
+    }
+
+    #[test]
+    fn ribbon_focus_drives_the_live_bar_system() {
+        use crate::hud::item_screen::ItemScreenContainer;
+        use crate::input_mode::{PassiveCursorFocus, PassiveCursorState};
+        use crate::snapshot::SceneState;
+        use ffxi_viewer_wire::SceneSnapshot;
+
+        let mut app = App::new();
+        app.init_resource::<InputMode>()
+            .init_resource::<DynamicMenu>()
+            .init_resource::<ItemScreenContainer>();
+
+        let mut scene = SceneState::default();
+        scene.snapshot = SceneSnapshot {
+            status_icons: vec![40, 41],
+            ..Default::default()
+        };
+        app.insert_resource(scene);
+        app.insert_resource(InputMode::PassiveCursor(PassiveCursorState {
+            focus: PassiveCursorFocus::StatusIcons,
+            status_cursor: 1,
+            chat_expanded: false,
+        }));
+
+        app.add_systems(Startup, spawn_menu_help_bar);
+        app.add_systems(Update, update_menu_help_bar);
+        app.update();
+
+        // The bar unhides and its title/counter/hint reflect the highlighted buff.
+        let bar_shown = app
+            .world_mut()
+            .query_filtered::<&Node, With<MenuHelpBar>>()
+            .single(app.world())
+            .map(|n| n.display == Display::Flex)
+            .unwrap();
+        assert!(
+            bar_shown,
+            "bar must be visible while ribbon holds the cursor"
+        );
+
+        let title = app
+            .world_mut()
+            .query_filtered::<&Text, With<MenuHelpTitle>>()
+            .single(app.world())
+            .unwrap()
+            .0
+            .clone();
+        let hint = app
+            .world_mut()
+            .query_filtered::<&Text, With<MenuHelpHint>>()
+            .single(app.world())
+            .unwrap()
+            .0
+            .clone();
+        assert_eq!(title, "Status");
+        assert_eq!(hint, "Shell", "cursor 1 names the second effect");
+    }
+
+    #[test]
+    fn buff_bar_clamps_stale_cursor_and_hides_when_empty() {
+        use ffxi_viewer_wire::SceneSnapshot;
+        let snap = SceneSnapshot {
+            status_icons: vec![40],
+            ..Default::default()
+        };
+        // Cursor past the end (e.g. a buff expired) clamps to the last slot.
+        assert_eq!(buff_bar_content(&snap, 9).unwrap().hint, "Protect");
+        let empty = SceneSnapshot::default();
+        assert!(buff_bar_content(&empty, 0).is_none());
     }
 }
