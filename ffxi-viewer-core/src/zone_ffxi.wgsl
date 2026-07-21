@@ -22,6 +22,17 @@
     shadows,
 }
 
+// Distance fog. FFXI fades distant terrain/water into the horizon backdrop
+// (the weather-DAT `fog_landscape` colour, also painted as ClearColor). Bevy
+// sets the `DistanceFog` on the camera (weather.rs), but this custom material
+// bypasses the StandardMaterial fragment that would apply it — without this the
+// far terrain falls straight to the void behind the sky dome. The `fog` binding
+// (mesh_view_bindings group 0 @binding 13) and this def exist only when the
+// view carries a DistanceFog (mesh.rs pushes the DISTANCE_FOG shaderdef).
+#ifdef DISTANCE_FOG
+#import bevy_pbr::fog as fog_fns
+#endif
+
 // Mirror of `FfxiLightingUniform` in skinned_ffxi_material.rs — field
 // order/types must stay identical so AsBindGroup's std140 layout matches.
 struct FfxiLighting {
@@ -136,6 +147,28 @@ fn sun_shadow_factor(world_pos: vec3<f32>, world_normal: vec3<f32>, frag_coord_x
     return factor;
 }
 
+// Fade a lit fragment toward the fog colour by view distance. Scattering is
+// left at zero (the weather DAT drives a flat horizon colour, not sun-inscatter
+// fog), so this is the plain distance blend Bevy's `apply_fog` does. No-op when
+// the view has no DistanceFog (the whole body compiles out).
+fn apply_distance_fog(color: vec4<f32>, world_pos: vec3<f32>) -> vec4<f32> {
+#ifdef DISTANCE_FOG
+    let fog_params = view_bindings::fog;
+    let dist = length(world_pos - view_bindings::view.world_position);
+    let scattering = vec3<f32>(0.0);
+    if (fog_params.mode == mesh_view_types::FOG_MODE_LINEAR) {
+        return fog_fns::linear_fog(fog_params, color, dist, scattering);
+    } else if (fog_params.mode == mesh_view_types::FOG_MODE_EXPONENTIAL) {
+        return fog_fns::exponential_fog(fog_params, color, dist, scattering);
+    } else if (fog_params.mode == mesh_view_types::FOG_MODE_EXPONENTIAL_SQUARED) {
+        return fog_fns::exponential_squared_fog(fog_params, color, dist, scattering);
+    } else if (fog_params.mode == mesh_view_types::FOG_MODE_ATMOSPHERIC) {
+        return fog_fns::atmospheric_fog(fog_params, color, dist, scattering);
+    }
+#endif
+    return color;
+}
+
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let has_texture = material_flags.flags.x > 0.5;
@@ -168,5 +201,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if (material_flags.flags.y > 0.5) {
         out_alpha = combined_a;
     }
-    return vec4<f32>(rgb, out_alpha * tint.w);
+    var out_color = vec4<f32>(rgb, out_alpha * tint.w);
+    out_color = apply_distance_fog(out_color, in.world_position);
+    return out_color;
 }

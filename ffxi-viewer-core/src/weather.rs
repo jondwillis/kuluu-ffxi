@@ -409,11 +409,12 @@ pub fn apply_zone_weather(
     let [fr, fg, fb, _] = rec.fog_landscape;
     let fog_color = Color::srgb(fr, fg, fb);
 
-    // DistanceFog is the authoritative DAT distance fog in BOTH modes: it runs
-    // in the geometry materials only (the sky dome's custom materials never
-    // sample it), so like the client, fog swallows terrain but not the sky.
-    // The volumetric layer can't take this role — see the density_factor note
-    // above — it only adds the lit ground haze on top.
+    // DistanceFog is the authoritative DAT distance fog in BOTH modes. The
+    // geometry materials sample it (zone_ffxi.wgsl / skinned_ffxi.wgsl call
+    // apply_distance_fog under DISTANCE_FOG); the sky-dome material does not, so
+    // like the client, fog swallows terrain but not the sky. The volumetric
+    // layer can't take this role — see the density_factor note above — it only
+    // adds the lit ground haze on top.
     if let Ok((cam_entity, dist_slot, vol_slot)) = cam_q.single_mut() {
         let inscatter = Color::srgb(
             (fr * 1.08).min(1.0),

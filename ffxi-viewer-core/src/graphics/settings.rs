@@ -479,7 +479,7 @@ impl GraphicsSettings {
                 view_distance: 500.0,
                 vsync: true,
                 fov_deg: 50.0,
-                sky_style: SkyStyle::Enhanced,
+                sky_style: SkyStyle::Vanilla,
                 enhanced_water: false,
                 dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
@@ -508,7 +508,7 @@ impl GraphicsSettings {
                 view_distance: 1100.0,
                 vsync: true,
                 fov_deg: 50.0,
-                sky_style: SkyStyle::Enhanced,
+                sky_style: SkyStyle::Vanilla,
                 enhanced_water: false,
                 dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
@@ -537,7 +537,7 @@ impl GraphicsSettings {
                 view_distance: 6100.0,
                 vsync: true,
                 fov_deg: 50.0,
-                sky_style: SkyStyle::Enhanced,
+                sky_style: SkyStyle::Vanilla,
                 enhanced_water: false,
                 dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
@@ -570,7 +570,7 @@ impl GraphicsSettings {
                 view_distance: 6100.0,
                 vsync: true,
                 fov_deg: 50.0,
-                sky_style: SkyStyle::Enhanced,
+                sky_style: SkyStyle::Vanilla,
                 enhanced_water: false,
                 dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
@@ -1388,28 +1388,32 @@ mod tests {
     #[test]
     fn sky_style_toggles_two_modes() {
         let mut s = GraphicsSettings::default();
-        assert_eq!(s.sky_style(), SkyStyle::Enhanced);
-        assert!(s.sky_embellishments_enabled());
-        s.cycle(GraphicsField::SkyStyle, 1);
+        // Vanilla is the retail-faithful default (painterly sun flare, no
+        // embellishments); Enhanced is the opt-in realism polish.
         assert_eq!(s.sky_style(), SkyStyle::Vanilla);
         assert!(!s.sky_embellishments_enabled());
+        s.cycle(GraphicsField::SkyStyle, 1);
+        assert_eq!(s.sky_style(), SkyStyle::Enhanced);
+        assert!(s.sky_embellishments_enabled());
         assert_eq!(s.preset, QualityPreset::High, "style must not flip preset");
         // Cycling in either direction just flips the two modes.
         s.cycle(GraphicsField::SkyStyle, -1);
-        assert_eq!(s.sky_style(), SkyStyle::Enhanced);
+        assert_eq!(s.sky_style(), SkyStyle::Vanilla);
         assert!(
-            s.sky_embellishments_enabled(),
-            "Enhanced adds the realism polish"
+            !s.sky_embellishments_enabled(),
+            "Vanilla is retail-faithful, no embellishments"
         );
     }
 
     #[test]
     fn embellishments_off_only_for_vanilla() {
         let mut s = GraphicsSettings::default();
-        assert!(s.sky_embellishments_enabled());
-        s.cycle(GraphicsField::SkyStyle, 1);
+        // Default is Vanilla → embellishments off.
         assert_eq!(s.sky_style(), SkyStyle::Vanilla);
         assert!(!s.sky_embellishments_enabled());
+        s.cycle(GraphicsField::SkyStyle, 1);
+        assert_eq!(s.sky_style(), SkyStyle::Enhanced);
+        assert!(s.sky_embellishments_enabled());
     }
 
     #[test]
@@ -1480,12 +1484,12 @@ mod tests {
     #[test]
     fn preset_cycle_preserves_sky_style() {
         let mut s = GraphicsSettings::default();
-        s.cycle(GraphicsField::SkyStyle, 1);
-        assert_eq!(s.sky_style(), SkyStyle::Vanilla);
+        s.cycle(GraphicsField::SkyStyle, 1); // Vanilla -> Enhanced
+        assert_eq!(s.sky_style(), SkyStyle::Enhanced);
         s.cycle(GraphicsField::Preset, 1);
         assert_eq!(
             s.sky_style(),
-            SkyStyle::Vanilla,
+            SkyStyle::Enhanced,
             "preset cycle kept the style"
         );
     }
@@ -1681,8 +1685,8 @@ mod tests {
 
         // Toggling Sky Style is orthogonal to the quality tier.
         let mut s = GraphicsSettings::default();
-        s.cycle(GraphicsField::SkyStyle, 1); // Enhanced -> Vanilla
-        assert_eq!(s.sky_style(), SkyStyle::Vanilla);
+        s.cycle(GraphicsField::SkyStyle, 1); // Vanilla -> Enhanced
+        assert_eq!(s.sky_style(), SkyStyle::Enhanced);
         assert_eq!(s.preset, QualityPreset::High, "sky style ⟂ quality tier");
     }
 
@@ -1715,8 +1719,8 @@ mod tests {
     fn preset_cycle_resets_dof_keeps_sky_style() {
         let mut s = GraphicsSettings::default();
         s.cycle(GraphicsField::DepthOfField, 1); // on -> Custom
-        s.cycle(GraphicsField::SkyStyle, 1); // Enhanced -> Vanilla
-        assert_eq!(s.sky_style(), SkyStyle::Vanilla);
+        s.cycle(GraphicsField::SkyStyle, 1); // Vanilla -> Enhanced
+        assert_eq!(s.sky_style(), SkyStyle::Enhanced);
 
         s.cycle(GraphicsField::Preset, 1); // Custom -> Medium
         assert_eq!(s.preset, QualityPreset::Medium);
@@ -1726,7 +1730,7 @@ mod tests {
         );
         assert_eq!(
             s.sky_style(),
-            SkyStyle::Vanilla,
+            SkyStyle::Enhanced,
             "preset cycle kept the sky style"
         );
     }

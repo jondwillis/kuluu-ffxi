@@ -29,6 +29,13 @@
     shadows,
 }
 
+// Distance fog — see zone_ffxi.wgsl for the rationale. Applied so a distant
+// actor fades into the same horizon backdrop as the terrain behind it; near
+// the camera (the usual case) the distance term is ~0, a no-op.
+#ifdef DISTANCE_FOG
+#import bevy_pbr::fog as fog_fns
+#endif
+
 // Mirror of `FfxiLightingUniform` in skinned_ffxi_material.rs — keep the
 // field order/types identical so AsBindGroup's std140 layout matches.
 struct FfxiLighting {
@@ -177,6 +184,26 @@ fn sun_shadow_factor(world_pos: vec3<f32>, world_normal: vec3<f32>, frag_coord_x
     return factor;
 }
 
+// Fade a lit fragment toward the fog colour by view distance (see
+// zone_ffxi.wgsl). No-op when the view carries no DistanceFog.
+fn apply_distance_fog(color: vec4<f32>, world_pos: vec3<f32>) -> vec4<f32> {
+#ifdef DISTANCE_FOG
+    let fog_params = view_bindings::fog;
+    let dist = length(world_pos - view_bindings::view.world_position);
+    let scattering = vec3<f32>(0.0);
+    if (fog_params.mode == mesh_view_types::FOG_MODE_LINEAR) {
+        return fog_fns::linear_fog(fog_params, color, dist, scattering);
+    } else if (fog_params.mode == mesh_view_types::FOG_MODE_EXPONENTIAL) {
+        return fog_fns::exponential_fog(fog_params, color, dist, scattering);
+    } else if (fog_params.mode == mesh_view_types::FOG_MODE_EXPONENTIAL_SQUARED) {
+        return fog_fns::exponential_squared_fog(fog_params, color, dist, scattering);
+    } else if (fog_params.mode == mesh_view_types::FOG_MODE_ATMOSPHERIC) {
+        return fog_fns::atmospheric_fog(fog_params, color, dist, scattering);
+    }
+#endif
+    return color;
+}
+
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Untextured FFXI meshes (C/CS ops) carry a null TextureLink: treat the
@@ -236,7 +263,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         // Opaque output (AlphaMode::Mask already discarded cut-out texels). A
         // sub-1 alpha here would let the preview camera composite the character
         // see-through over the launcher backdrop.
-        return vec4<f32>(rgb + highlight, 1.0);
+        return apply_distance_fog(vec4<f32>(rgb + highlight, 1.0), in.world_position);
     }
 
     // FFXI-faithful: flat per-vertex light * vertex color, composited at 2x the
@@ -266,5 +293,5 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // alpha here would let the preview camera composite the character see-
     // through over the launcher backdrop. The depth-only cast-shadow / prepass
     // path lives in the separate skinned_ffxi_prepass.wgsl module.
-    return vec4<f32>(rgb + highlight, 1.0);
+    return apply_distance_fog(vec4<f32>(rgb + highlight, 1.0), in.world_position);
 }
