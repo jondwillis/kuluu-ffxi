@@ -1371,6 +1371,8 @@ fn handle_sub_packet(
                             locked: l.lock_flg != 0,
 
                             price: 0,
+                            charges_remaining: None,
+                            next_use_vana_ts: None,
                         },
                     },
                 });
@@ -1396,6 +1398,7 @@ fn handle_sub_packet(
                         server_ts: 0,
                     },
                 });
+                let ci = a.charge_info();
                 let _ = event_tx.send(AgentEvent::InventoryUpdated {
                     container: a.category,
                     update: InventoryUpdate::SlotChanged {
@@ -1405,6 +1408,8 @@ fn handle_sub_packet(
                             quantity: a.quantity,
                             locked: a.lock_flg != 0,
                             price: a.price,
+                            charges_remaining: ci.map(|c| c.charges),
+                            next_use_vana_ts: ci.map(|c| c.next_use_vana_ts),
                         },
                     },
                 });
@@ -2373,6 +2378,11 @@ async fn keepalive_loop(
                         // Accept→Get chain (Get depends on the Accept ack).
                         let op = dbox.request_take(slot);
                         send_pbx(map, &op, &mut sub_seq, server_last_seq, &event_tx).await;
+                    }
+                    Some(AgentCommand::DebugDrive { .. }) | Some(AgentCommand::DebugHeights) => {
+                        // GUI-only debug driving: consumed by the native input
+                        // path via DebugControlHandle (the agent-socket decoder),
+                        // never the network session. No-op here (headless/mcp).
                     }
                     Some(AgentCommand::MoveItem {
                         quantity,

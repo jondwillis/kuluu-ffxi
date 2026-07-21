@@ -184,7 +184,10 @@ pub fn update_dialog_panel_system(
     };
 
     let snap = &state.snapshot;
-    let Some(dialog) = snap.dialog.as_ref() else {
+    // The dedicated delivery screen owns the UI while a box is open; suppress
+    // the generic dialog panel so a settling Mog-menu frame can't double-render.
+    let dialog = snap.dialog.as_ref().filter(|_| snap.delivery_box.is_none());
+    let Some(dialog) = dialog else {
         if panel_node.display != Display::None {
             panel_node.display = Display::None;
         }

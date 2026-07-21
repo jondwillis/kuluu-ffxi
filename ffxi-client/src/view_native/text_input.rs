@@ -406,13 +406,16 @@ pub fn delivery_mode_sync_system(
     mut screen: ResMut<ffxi_viewer_core::hud::delivery::DeliveryScreenState>,
 ) {
     let open = state.snapshot.delivery_box.is_some();
-    let dialog_open = state.snapshot.dialog.is_some();
     match (&*mode, open) {
         (InputMode::DeliveryBox, false) => {
             *mode = InputMode::World;
             screen.close();
         }
-        (m, true) if !matches!(m, InputMode::DeliveryBox) && !dialog_open => {
+        // Enter the modal delivery mode whenever the server has a box open,
+        // regardless of any dialog still settling — the box owns the screen and
+        // suppresses world movement. The dialog panel hides itself when the box
+        // is open (see `update_dialog_panel_system`).
+        (m, true) if !matches!(m, InputMode::DeliveryBox) => {
             *mode = InputMode::DeliveryBox;
             screen.open();
         }
