@@ -362,7 +362,6 @@ fn cap(
     mut e: MessageWriter<AppExit>,
     queue: Res<MmbLoadQueue>,
     water: Res<PendingWaterSpawns>,
-    q_aabb: Query<(&bevy::camera::primitives::Aabb, &GlobalTransform)>,
     target: Res<CapTarget>,
 ) {
     f.0 += 1;
@@ -373,18 +372,6 @@ fn cap(
             queue.pending.len(),
             water.specs.len()
         );
-    }
-    if f.0 == 60 {
-        let mut min = Vec3::splat(f32::INFINITY);
-        let mut max = Vec3::splat(f32::NEG_INFINITY);
-        let mut n = 0usize;
-        for (aabb, gt) in q_aabb.iter() {
-            let c = gt.transform_point(Vec3::from(aabb.center));
-            min = min.min(c);
-            max = max.max(c);
-            n += 1;
-        }
-        eprintln!("mesh centers n={n} min={min:?} max={max:?}");
     }
     if !s.0 && f.0 >= p.cap {
         c.spawn(Screenshot::image(target.0.clone()))
