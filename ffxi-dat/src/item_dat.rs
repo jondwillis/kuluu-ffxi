@@ -46,7 +46,7 @@ pub struct ItemStatic {
 
     pub max_charges: u8,
 
-    pub recast_base: u16,
+    pub recast_base: u32,
 
     pub item_type: u8,
 
@@ -105,7 +105,7 @@ fn decode_item_static(block: &[u8]) -> Option<ItemStatic> {
                 jobs,
                 (level.min(u8::MAX as u16)) as u8,
                 max_charges,
-                reuse_delay.min(u16::MAX as u32) as u16,
+                reuse_delay,
             )
         } else {
             (0, 0, 0, 0, 0, 0)

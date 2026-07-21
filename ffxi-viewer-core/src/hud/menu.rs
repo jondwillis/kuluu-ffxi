@@ -118,6 +118,26 @@ impl DynamicMenuAction {
             _ => None,
         }
     }
+
+    /// The source `(container, index)` of an item-bearing action, so per-slot
+    /// state (charges, recast) resolves the exact instance rather than the
+    /// first item of the same id.
+    pub fn item_slot(&self) -> Option<(u8, u8)> {
+        match *self {
+            DynamicMenuAction::UseItem {
+                container, index, ..
+            }
+            | DynamicMenuAction::OpenItemAction {
+                container, index, ..
+            } => Some((container, index)),
+            DynamicMenuAction::EquipItem {
+                container,
+                container_index,
+                ..
+            } => Some((container, container_index)),
+            _ => None,
+        }
+    }
 }
 
 /// One item row's label: the name, suffixed " xN" only for a real stack. Shared
@@ -1125,6 +1145,8 @@ mod tests {
                             item_no,
                             quantity,
                             locked: false,
+                            charges_remaining: None,
+                            next_use_vana_ts: None,
                         },
                     )
                     .collect(),
@@ -1532,6 +1554,8 @@ mod tests {
                     item_no,
                     quantity: 1,
                     locked,
+                    charges_remaining: None,
+                    next_use_vana_ts: None,
                 }],
             }],
             ..Default::default()

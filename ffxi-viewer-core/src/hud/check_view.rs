@@ -202,7 +202,7 @@ pub fn update_check_view(
         let item_no = check.and_then(|c| c.equipped.get(slot_id as usize).copied().flatten());
         let (body, filled) = match item_no {
             Some(no) => {
-                let detail: ItemDetail = compose_item_detail(no, snap, None);
+                let detail: ItemDetail = compose_item_detail(no, None, snap, None);
                 let name = item_label(no, &detail);
                 (format!("{slot_label:<6}: {name}"), true)
             }

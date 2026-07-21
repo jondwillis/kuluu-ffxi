@@ -567,6 +567,10 @@ pub struct ItemSlot {
     pub quantity: u32,
     pub locked: bool,
     pub price: u32,
+    #[serde(default)]
+    pub charges_remaining: Option<u8>,
+    #[serde(default)]
+    pub next_use_vana_ts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3441,6 +3445,8 @@ mod tests {
             quantity: 5,
             locked: false,
             price: 0,
+            charges_remaining: None,
+            next_use_vana_ts: None,
         };
 
         s.apply_event(&AgentEvent::InventoryUpdated {
@@ -3499,6 +3505,8 @@ mod tests {
                     quantity: 1,
                     locked: false,
                     price: 0,
+                    charges_remaining: None,
+                    next_use_vana_ts: None,
                 },
             },
         });

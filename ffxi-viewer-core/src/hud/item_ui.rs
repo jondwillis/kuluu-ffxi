@@ -35,6 +35,7 @@ pub fn transparent_placeholder(images: &mut Assets<Image>) -> Handle<Image> {
 /// "Select an item." prompt.
 pub fn focus_detail(
     item_no: Option<u16>,
+    focused_slot: Option<(u8, u8)>,
     snap: &ffxi_viewer_wire::SceneSnapshot,
     dat_root: &ItemDatRoot,
     icon_cache: &mut ItemIconCache,
@@ -45,7 +46,7 @@ pub fn focus_detail(
     let dat = icon_cache
         .table(dat_root)
         .and_then(|table| item_detail::lookup_static(&table, item_no));
-    let detail = item_meta::compose_item_detail(item_no, snap, dat.clone());
+    let detail = item_meta::compose_item_detail(item_no, focused_slot, snap, dat.clone());
     let name = dat
         .as_ref()
         .map(|s| s.name.clone())

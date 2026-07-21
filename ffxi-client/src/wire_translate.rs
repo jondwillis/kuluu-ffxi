@@ -115,6 +115,8 @@ fn project_containers(s: &SessionState) -> Vec<wire::ContainerView> {
                     item_no: slot.item_no,
                     quantity: slot.quantity,
                     locked: slot.locked,
+                    charges_remaining: slot.charges_remaining,
+                    next_use_vana_ts: slot.next_use_vana_ts,
                 })
                 .collect(),
         })
@@ -539,6 +541,8 @@ mod tests {
                     quantity: 3,
                     locked: false,
                     price: 0,
+                    charges_remaining: None,
+                    next_use_vana_ts: None,
                 })
                 .collect();
             s.inventory
@@ -784,6 +788,8 @@ mod tests {
             quantity: 1,
             locked: false,
             price: 0,
+            charges_remaining: None,
+            next_use_vana_ts: None,
         });
         s.inventory.containers.insert(0, inv0);
 

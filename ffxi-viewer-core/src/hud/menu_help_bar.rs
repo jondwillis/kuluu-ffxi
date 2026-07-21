@@ -316,6 +316,8 @@ mod tests {
             item_no,
             quantity: 1,
             locked: false,
+            charges_remaining: None,
+            next_use_vana_ts: None,
         };
         let snap = SceneSnapshot {
             containers: vec![ContainerView {

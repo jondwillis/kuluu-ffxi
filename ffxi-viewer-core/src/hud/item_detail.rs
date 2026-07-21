@@ -47,23 +47,28 @@ fn format_rare_ex(flags: u16) -> Option<String> {
     }
 }
 
-fn format_uses(max_charges: Option<u8>, remaining: Option<u8>) -> Option<String> {
-    let max = max_charges?;
-
-    let used = remaining.unwrap_or(max);
-    Some(format!("{used}/{max}"))
+/// Retail item-tooltip charge/recast line: `<cur/max HH:MM:SS/[HH:MM:SS]>`,
+/// shown only for charged (usable/enchanted) items. The first HH:MM:SS is the
+/// live countdown to next use; the bracketed value is the static reuse delay.
+/// Retail also carries the activation (cast) time as a second bracket value
+/// (`[24:00:00, 0:30]`); that DAT field is not yet parsed (kuluu-ng3o), so the
+/// bracket shows the reuse delay alone.
+fn format_charge_line(detail: &ItemDetail) -> Option<String> {
+    let charges = detail.charges_remaining?;
+    let max = detail.static_.as_ref().and_then(|s| s.max_charges)?;
+    let (remaining, base) = detail.recast?;
+    Some(format!(
+        "<{charges}/{max} {}/[{}]>",
+        hhmmss(remaining),
+        hhmmss(base)
+    ))
 }
 
-fn format_recast(recast_base: Option<u16>, live: Option<(u16, u16)>) -> Option<String> {
-    let base = recast_base.or_else(|| live.map(|(_, total)| total))?;
-    let current = live.map(|(remaining, _)| remaining).unwrap_or(0);
-    Some(format!("{}/({})", mmss(current), mmss(base)))
-}
-
-fn mmss(secs: u16) -> String {
-    let m = secs / 60;
+fn hhmmss(secs: u32) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
     let s = secs % 60;
-    format!("{m}:{s:02}")
+    format!("{h}:{m:02}:{s:02}")
 }
 
 pub(crate) fn lookup_static(
@@ -101,11 +106,8 @@ pub(crate) fn detail_rows(detail: &ItemDetail) -> Vec<String> {
     if s.level > 0 {
         rows.push(format!("Lv. {}", s.level));
     }
-    if let Some(uses) = format_uses(s.max_charges, detail.charges_remaining) {
-        rows.push(format!("Uses: {uses}"));
-    }
-    if let Some(recast) = format_recast(s.recast_base, detail.recast) {
-        rows.push(format!("Recast: {recast}"));
+    if let Some(line) = format_charge_line(detail) {
+        rows.push(line);
     }
     if detail.equipped {
         rows.push("(equipped)".to_string());
@@ -329,6 +331,23 @@ pub(crate) fn selected_item_no(
     dynamic.rows.get(level.cursor)?.action.item_no()
 }
 
+/// The focused row's source `(container, index)`, so the detail panel reads the
+/// exact instance's charges/recast rather than the first item of that id.
+pub(crate) fn selected_slot(
+    mode: &InputMode,
+    dynamic: &crate::hud::menu::DynamicMenu,
+) -> Option<(u8, u8)> {
+    let stack = match mode {
+        InputMode::Menu(stack) => stack,
+        _ => return None,
+    };
+    let level = stack.current()?;
+    if !matches!(level.kind, MenuKind::Items | MenuKind::UsableItems) {
+        return None;
+    }
+    dynamic.rows.get(level.cursor)?.action.item_slot()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,25 +371,60 @@ mod tests {
     }
 
     #[test]
-    fn uses_shows_remaining_over_max() {
-        assert_eq!(format_uses(None, None), None);
-        assert_eq!(format_uses(Some(10), Some(9)), Some("9/10".to_string()));
+    fn hhmmss_handles_24h_reuse() {
+        assert_eq!(hhmmss(0), "0:00:00");
+        assert_eq!(hhmmss(30), "0:00:30");
+        assert_eq!(hhmmss(3600), "1:00:00");
+        assert_eq!(hhmmss(86_400), "24:00:00");
+        assert_eq!(hhmmss(82_557), "22:55:57");
+    }
 
-        assert_eq!(format_uses(Some(10), None), Some("10/10".to_string()));
+    fn charged_detail(
+        charges: Option<u8>,
+        max: Option<u8>,
+        recast: Option<(u32, u32)>,
+    ) -> ItemDetail {
+        ItemDetail {
+            static_: Some(ItemStatic {
+                max_charges: max,
+                ..Default::default()
+            }),
+            charges_remaining: charges,
+            recast,
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn recast_formats_current_over_base() {
-        assert_eq!(format_recast(None, None), None);
-
+    fn charge_line_none_for_non_charged_item() {
+        // No live charges (extdata header not 0x01) => no line.
         assert_eq!(
-            format_recast(Some(60), None),
-            Some("0:00/(1:00)".to_string())
+            format_charge_line(&charged_detail(None, Some(1), Some((0, 86_400)))),
+            None
         );
+    }
 
+    #[test]
+    fn charge_line_ready_item_zero_countdown() {
         assert_eq!(
-            format_recast(Some(60), Some((30, 60))),
-            Some("0:30/(1:00)".to_string())
+            format_charge_line(&charged_detail(Some(1), Some(1), Some((0, 86_400)))),
+            Some("<1/1 0:00:00/[24:00:00]>".to_string())
+        );
+    }
+
+    #[test]
+    fn charge_line_on_cooldown_shows_live_countdown() {
+        assert_eq!(
+            format_charge_line(&charged_detail(Some(1), Some(1), Some((82_557, 86_400)))),
+            Some("<1/1 22:55:57/[24:00:00]>".to_string())
+        );
+    }
+
+    #[test]
+    fn charge_line_multi_charge_partial() {
+        assert_eq!(
+            format_charge_line(&charged_detail(Some(2), Some(3), Some((0, 1800)))),
+            Some("<2/3 0:00:00/[0:30:00]>".to_string())
         );
     }
 

@@ -2790,6 +2790,8 @@ mod tests {
                     quantity: 1,
                     locked: false,
                     price: 0,
+                    charges_remaining: None,
+                    next_use_vana_ts: None,
                 },
             },
         }

@@ -1676,6 +1676,33 @@ pub struct ItemAttr {
     pub extdata: [u8; 24],
 }
 
+/// Charges + live recast decoded from the 24-byte item extdata of a charged
+/// (usable/enchanted) item. `next_use_vana_ts` is an absolute Vana'diel
+/// timestamp (Earth seconds since [`crate::vana_time::VANA_EPOCH_UNIX`]).
+/// Readiness is signaled by `ready` (extdata flags-hi bit 0x40), NOT by a zero
+/// timestamp: LSB only writes Attr[4..8] on the cooldown path and leaves stale
+/// m_extra bytes there when ready (0x020_item_attr.cpp:57-68), so consumers
+/// must gate on `ready` / `ts > now` rather than `ts == 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChargeInfo {
+    pub charges: u8,
+    pub next_use_vana_ts: u32,
+    pub ready: bool,
+}
+
+/// Item extdata byte layout for charged items.
+/// vendor/server/src/map/items/exdata/timer_info.h:29-41 and
+/// vendor/server/src/map/packets/s2c/0x020_item_attr.cpp:47-82.
+mod extdata {
+    use core::ops::Range;
+    pub const HEADER_CHARGED: u8 = 0x01;
+    pub const OFF_HEADER: usize = 0;
+    pub const OFF_CHARGES: usize = 1;
+    pub const OFF_FLAGS_HI: usize = 3;
+    pub const NEXT_USE: Range<usize> = 4..8;
+    pub const FLAG_READY: u8 = 0x40;
+}
+
 impl ItemAttr {
     pub const SIZE: usize = 37;
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
@@ -1692,6 +1719,21 @@ impl ItemAttr {
             index: body[11],
             lock_flg: body[12],
             extdata,
+        })
+    }
+
+    /// Charge/recast info for a charged (usable/enchanted) item, or `None` when
+    /// the extdata header marks it as non-charged.
+    pub fn charge_info(&self) -> Option<ChargeInfo> {
+        if self.extdata[extdata::OFF_HEADER] != extdata::HEADER_CHARGED {
+            return None;
+        }
+        Some(ChargeInfo {
+            charges: self.extdata[extdata::OFF_CHARGES],
+            next_use_vana_ts: u32::from_le_bytes(
+                self.extdata[extdata::NEXT_USE].try_into().unwrap(),
+            ),
+            ready: self.extdata[extdata::OFF_FLAGS_HI] & extdata::FLAG_READY != 0,
         })
     }
 }
@@ -2839,6 +2881,46 @@ mod tests {
             ItemAttr::decode(&buf),
             Err(DecodeError::Truncated(37, _))
         ));
+    }
+
+    fn item_attr_with_extdata(ext: [u8; 24]) -> ItemAttr {
+        let mut buf = vec![0u8; ItemAttr::SIZE];
+        buf[13..37].copy_from_slice(&ext);
+        ItemAttr::decode(&buf).unwrap()
+    }
+
+    #[test]
+    fn charge_info_none_for_non_charged_header() {
+        let mut ext = [0u8; 24];
+        ext[0] = 0x00;
+        assert_eq!(item_attr_with_extdata(ext).charge_info(), None);
+    }
+
+    #[test]
+    fn charge_info_reads_charges_next_use_and_ready() {
+        // 0x020_item_attr.cpp:47-68 — header 0x01, charges at [1], ready bit
+        // 0x40 in flags-hi [3], next-use vana timestamp at [4..8].
+        let mut ext = [0u8; 24];
+        ext[0] = 0x01;
+        ext[1] = 2;
+        ext[3] = 0x90;
+        ext[4..8].copy_from_slice(&123_456u32.to_le_bytes());
+        let ci = item_attr_with_extdata(ext).charge_info().unwrap();
+        assert_eq!(ci.charges, 2);
+        assert_eq!(ci.next_use_vana_ts, 123_456);
+        assert!(!ci.ready);
+    }
+
+    #[test]
+    fn charge_info_ready_bit_set_and_zero_timestamp() {
+        let mut ext = [0u8; 24];
+        ext[0] = 0x01;
+        ext[1] = 1;
+        ext[3] = 0xC0;
+        let ci = item_attr_with_extdata(ext).charge_info().unwrap();
+        assert_eq!(ci.charges, 1);
+        assert_eq!(ci.next_use_vana_ts, 0);
+        assert!(ci.ready);
     }
 
     #[test]

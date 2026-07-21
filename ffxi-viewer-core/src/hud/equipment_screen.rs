@@ -415,7 +415,7 @@ pub(crate) fn update_equipment_screen(
     };
 
     let (detail_name, detail_rows) =
-        item_ui::focus_detail(focused_item, snap, &dat_root, &mut icon_cache);
+        item_ui::focus_detail(focused_item, None, snap, &dat_root, &mut icon_cache);
 
     // Storage list viewport (keep the cursor in view).
     let storage_total = dynamic.rows.len();

@@ -541,9 +541,23 @@ pub(crate) fn update_item_screen(
     let cursor = items_cursor(&mode);
     let start = viewport_start(cursor, total);
 
+    let now_vana = crate::hud::item_meta::now_vana_ts();
+    let unusable: Vec<bool> = rows
+        .iter()
+        .map(|row| {
+            row.action
+                .item_slot()
+                .and_then(|(container, index)| {
+                    crate::hud::item_meta::find_slot(snap, container, index)
+                })
+                .is_some_and(|it| crate::hud::item_meta::item_unusable(it, now_vana))
+        })
+        .collect();
+
     let focused_item = item_detail::selected_item_no(&mode, &dynamic);
+    let focused_slot = item_detail::selected_slot(&mode, &dynamic);
     let (detail_name, detail_rows) =
-        item_ui::focus_detail(focused_item, snap, &dat_root, &mut icon_cache);
+        item_ui::focus_detail(focused_item, focused_slot, snap, &dat_root, &mut icon_cache);
     // The Usable list spans every container, so it has no single bag/capacity —
     // it shows a plain "Items" header like retail's command-menu list.
     let header = if inventory {
@@ -589,6 +603,7 @@ pub(crate) fn update_item_screen(
             &sort_title,
             &sort,
             &focus,
+            &unusable,
         );
         let display = if visible {
             Display::Flex
@@ -651,6 +666,7 @@ fn role_value(
     sort_title: &str,
     sort: &SortOptions,
     focus: &ItemMenuFocus,
+    unusable: &[bool],
 ) -> (String, Color, bool) {
     match role {
         ItemRole::ListHeader => (header.to_string(), theme::TITLE, true),
@@ -668,6 +684,8 @@ fn role_value(
                     let is_cursor = list_idx == cursor;
                     let color = if is_cursor {
                         theme::CURSOR
+                    } else if unusable.get(list_idx) == Some(&true) {
+                        theme::MUTED
                     } else {
                         theme::TEXT
                     };

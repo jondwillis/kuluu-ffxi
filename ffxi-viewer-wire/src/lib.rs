@@ -2,9 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+// v5: InventoryItem.charges_remaining + next_use_vana_ts (item recast/charges).
 // v4: SceneSnapshot.delivery_box (dedicated delivery screen) + ViewerCommand::DeliveryBox
 // (postcard frames are not self-describing, so any shape change bumps this).
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Vec3 {
@@ -572,6 +573,15 @@ pub struct InventoryItem {
     /// rejects moving locked items (0x029_item_move.cpp isValidMovement).
     #[serde(default)]
     pub locked: bool,
+    /// Current charges of a charged (usable/enchanted) item; `None` for
+    /// non-charged items. From item extdata (0x020_item_attr.cpp:50).
+    #[serde(default)]
+    pub charges_remaining: Option<u8>,
+    /// Absolute Vana'diel next-use timestamp (Earth seconds since the vanadiel
+    /// epoch); 0 when ready, `None` for non-charged items
+    /// (0x020_item_attr.cpp:63-68).
+    #[serde(default)]
+    pub next_use_vana_ts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]

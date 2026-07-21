@@ -277,6 +277,7 @@ pub fn focused_tooltip(
     let item = state.slots[i]?;
     Some(item_meta::compose_item_detail(
         item.item_no,
+        None,
         snapshot,
         dat_lookup(item.item_no),
     ))
