@@ -737,7 +737,7 @@ pub(crate) fn update_delivery_screen(
         _ => None,
     };
     let (detail_name, detail_rows) =
-        item_ui::focus_detail(focus_item, snap, &dat_root, &mut icon_cache);
+        item_ui::focus_detail(focus_item, None, snap, &dat_root, &mut icon_cache);
 
     // Inventory list viewport.
     let total = inv.rows.len();
@@ -953,7 +953,14 @@ fn text_value(
             }
         }
         Role::Button(id) => (id.caption().to_string(), theme::TEXT, false),
-        Role::Hint => ("Enter select · Esc close".to_string(), theme::MUTED, true),
+        Role::Hint => {
+            let other = if outgoing { "Received" } else { "Send" };
+            (
+                format!("Enter select · Esc close · window key → {other}"),
+                theme::MUTED,
+                true,
+            )
+        }
     }
 }
 

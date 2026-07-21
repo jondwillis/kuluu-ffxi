@@ -557,7 +557,14 @@ impl LocalMenuSession {
                 self.clear();
                 Advance::OpenStorage { container }
             }
-            Action::OpenDeliveryBox => Advance::Frame(self.set(delivery_menu())),
+            // Retail opens the Receive box by default; the dedicated screen has
+            // an in-window toggle to the Send box (no Receive/Send chooser menu).
+            Action::OpenDeliveryBox => {
+                self.clear();
+                Advance::DeliveryOpen {
+                    box_no: DeliveryBoxNo::Incoming,
+                }
+            }
             Action::OpenMogRoot => Advance::Frame(self.set(mog_menu())),
             Action::DeliveryOpen { box_no } => {
                 self.clear();
@@ -1364,25 +1371,18 @@ mod tests {
     }
 
     #[test]
-    fn delivery_rows_open_their_boxes() {
-        for (row, expected) in [
-            (RECEIVE_ROW, DeliveryBoxNo::Incoming),
-            (SEND_ROW, DeliveryBoxNo::Outgoing),
-        ] {
-            let mut s = LocalMenuSession::new();
-            let f = s.open_mog_menu(None, None);
-            let sub = match pick(&mut s, &f, DELIVERY_BOX_ROW) {
-                Advance::Frame(f) => f,
-                _ => panic!("Delivery Box opens the Receive/Send submenu"),
-            };
-            assert_eq!(sub.prompt.as_deref(), Some(DELIVERY_PROMPT));
-            assert_eq!(sub.choices, vec![RECEIVE_ROW, SEND_ROW, CANCEL_ROW]);
-            match pick(&mut s, &sub, row) {
-                Advance::DeliveryOpen { box_no } => assert_eq!(box_no, expected),
-                _ => panic!("`{row}` must start the open flow"),
+    fn delivery_box_opens_receive_directly() {
+        // Retail default: the Delivery Box row opens the Receive box straight
+        // away (the dedicated screen toggles to Send in-window).
+        let mut s = LocalMenuSession::new();
+        let f = s.open_mog_menu(None, None);
+        match pick(&mut s, &f, DELIVERY_BOX_ROW) {
+            Advance::DeliveryOpen { box_no } => {
+                assert_eq!(box_no, DeliveryBoxNo::Incoming)
             }
-            assert!(!s.active(), "protocol takes over until the flow settles");
+            _ => panic!("Delivery Box must open the Receive box directly"),
         }
+        assert!(!s.active(), "protocol takes over until the flow settles");
     }
 
     fn incoming_item(from: &str) -> DeliveryItem {

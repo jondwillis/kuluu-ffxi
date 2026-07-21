@@ -550,6 +550,23 @@ fn handle_delivery_key(
         return;
     }
 
+    // 2b. Toggle Received/Send box (retail's in-window switch; same key as the
+    // item-window bag tabs). Closes the current box and opens the other.
+    if bindings.matches_logical(Action::SelectActiveWindow, key) {
+        let _ = cmd_tx.try_send(AgentCommand::DeliveryBox {
+            op: crate::state::DeliveryBoxOp::PostClose {
+                box_no: wire_to_client_box(d.box_no),
+            },
+        });
+        let other = if outgoing {
+            crate::state::DeliveryBoxOp::PostOpen
+        } else {
+            crate::state::DeliveryBoxOp::DeliOpen
+        };
+        let _ = cmd_tx.try_send(AgentCommand::DeliveryBox { op: other });
+        return;
+    }
+
     // 3. Navigation + confirm/cancel.
     if bindings.matches_logical(Action::NavUp, key) {
         delivery::focus_up(screen, &ctx);
