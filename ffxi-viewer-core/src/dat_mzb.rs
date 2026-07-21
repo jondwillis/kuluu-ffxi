@@ -657,6 +657,24 @@ pub fn build_zone_mmb_spawns(
         }
     }
 
+    // A generator's linked model resolves by the MMB chunk's 4-byte DatId (chunk
+    // name), which is NOT the same as the MMB header's zone_mesh_name — e.g. Port
+    // Windurst "taki" (DatId) carries zone_mesh_name "takin". Keyed on chunks index
+    // so it maps straight to ZoneMmbSpawn.chunk_idx.
+    let mut datid_to_chunk_idx: HashMap<String, usize> = HashMap::new();
+    for (idx, c) in chunks.iter().enumerate() {
+        if c.kind != ChunkKind::Mmb as u8 {
+            continue;
+        }
+        let id = String::from_utf8_lossy(&c.name)
+            .trim_end_matches('\0')
+            .trim_end()
+            .to_string();
+        if !id.is_empty() {
+            datid_to_chunk_idx.entry(id).or_insert(idx);
+        }
+    }
+
     let (_, mzb_chunk) = match chunk_idx {
         Some(i) => (
             i,
@@ -732,13 +750,25 @@ pub fn build_zone_mmb_spawns(
         if ms.uv_scroll == [0.0, 0.0] {
             continue;
         }
-        let name = ms.model_name_str();
-        // Only names that resolve to an MMB zone-mesh are water sheets; the many
-        // other 0x0B generators link D3M particle billboards (handled elsewhere).
-        let Some(local_idx) = mzb::resolve_mmb_index(name, &zone_prefix, &mmb_names) else {
+        // Singletons (max_life_frames == 0) are static sheets. life > 0 generators
+        // (e.g. Port Windurst "rivs", Bastok "tki*") emit particles over time and
+        // belong to the particle path; taking them here would double-render them.
+        let is_singleton = ffxi_dat::particle_gen::ParticleGeneratorDef::parse(c.data)
+            .ok()
+            .flatten()
+            .is_none_or(|d| d.max_life_frames == 0.0);
+        if !is_singleton {
+            continue;
+        }
+        let name = ms.model_name_str().trim_end();
+        // Resolve by the MMB DatId first (the generator's own linkage), then fall
+        // back to the header zone_mesh_name path. Only names that resolve to an MMB
+        // zone-mesh are water sheets; other 0x0B generators link D3M billboards.
+        let Some(chunk_idx) = datid_to_chunk_idx.get(name).copied().or_else(|| {
+            mzb::resolve_mmb_index(name, &zone_prefix, &mmb_names).map(|local| mmb_indices[local])
+        }) else {
             continue;
         };
-        let chunk_idx = mmb_indices[local_idx];
         let b = ms.base_position;
         // Same basis as object placements: to_bevy * (FFXI model-local -> world).
         // A pre-flipped translation would move the origin correctly but leave the
