@@ -491,10 +491,35 @@ fn rebuild_mesh(g: &LiveGenerator, rot: Quat, mesh: &mut Mesh) {
         indices.extend(g.template.indices.iter().map(|&idx| base + idx));
     }
 
+    if positions.is_empty() {
+        push_hidden_primitive(&mut positions, &mut uvs, &mut colors, &mut indices);
+    }
+
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(indices));
+}
+
+// A generator with zero live particles (on spawn, and in the gaps between emit
+// windows) would otherwise rebuild an empty mesh. Bevy's MeshAllocator skips the
+// slab allocation for a zero-length vertex buffer but still runs the upload copy,
+// logging "Use-after-free: attempted to copy element data for an unallocated key"
+// (bevy_render slab_allocator.rs) every such frame. Keep the buffer non-empty with
+// one zero-area, fully-transparent triangle so it uploads cleanly and draws nothing.
+fn push_hidden_primitive(
+    positions: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+) {
+    let base = positions.len() as u32;
+    for _ in 0..3 {
+        positions.push([0.0, 0.0, 0.0]);
+        uvs.push([0.0, 0.0]);
+        colors.push([0.0, 0.0, 0.0, 0.0]);
+    }
+    indices.extend([base, base + 1, base + 2]);
 }
 
 fn sprite_template(d3m: &ffxi_dat::d3m::D3m) -> Option<SpriteTemplate> {
@@ -522,10 +547,13 @@ fn empty_mesh() -> Mesh {
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
     );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, Vec::<[f32; 2]>::new());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, Vec::<[f32; 4]>::new());
-    mesh.insert_indices(Indices::U32(Vec::new()));
+    let (mut positions, mut uvs, mut colors, mut indices) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    push_hidden_primitive(&mut positions, &mut uvs, &mut colors, &mut indices);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_indices(Indices::U32(indices));
     mesh
 }
 
@@ -618,6 +646,24 @@ mod tests {
             p.pos += p.vel * frames;
         }
         g.particles.retain(|p| p.age_frames < p.life_frames);
+    }
+
+    #[test]
+    fn mesh_is_never_zero_length() {
+        // Bevy's MeshAllocator errors on a zero-length vertex buffer, so an
+        // empty generator (fresh spawn / between emit windows) must still
+        // upload a non-empty mesh. Covers empty_mesh() and the empty rebuild.
+        let count = |m: &Mesh| m.count_vertices();
+        assert!(
+            count(&empty_mesh()) > 0,
+            "empty_mesh must not be zero-length"
+        );
+
+        let g = live(def(2.0, 1.0, 1), 3.0);
+        assert!(g.particles.is_empty());
+        let mut mesh = empty_mesh();
+        rebuild_mesh(&g, Quat::IDENTITY, &mut mesh);
+        assert!(count(&mesh) > 0, "empty rebuild must not be zero-length");
     }
 
     #[test]
