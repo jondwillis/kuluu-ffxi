@@ -1,11 +1,25 @@
 use bevy::prelude::*;
 
 use ffxi_viewer_core::components::IsSelf;
-use ffxi_viewer_core::dat_mzb::{DrawDistance, ZoneGeomMode};
+use ffxi_viewer_core::dat_mzb::{CameraCollisionSource, DrawDistance, ZoneGeomMode};
 use ffxi_viewer_core::scene::BakedActor;
+use ffxi_viewer_core::snapshot::SceneState;
 use ffxi_viewer_core::{third_person_anchor_y, CameraMode, ChaseCamera, OperatorCamera};
 
 use super::collision_bvh::{CollisionBvh, ZoneCollisionBvh};
+
+/// Whether the chase camera should collide with zone MMB static placements (Mog
+/// House furniture and the exit-door model). Inside a Mog House this is always
+/// on — retail's "furniture camera collision" — because the interior is sealed
+/// only by ~two dozen MMB placements and the closed door is one of them; without
+/// this the camera slips through the doorway gap in the MZB wall and escapes the
+/// room. Enabling it zone-wide would raycast thousands of city placements every
+/// frame, so outside a Mog House it stays gated on the explicit source setting.
+/// The BVH-build gate ([`super::collision_bvh::build_collision_bvh_system`]) and
+/// the camera raycast MUST use this same predicate or they disagree on coverage.
+pub fn camera_collides_with_mmb(source: CameraCollisionSource, in_mog_house: bool) -> bool {
+    source.uses_mmb() || in_mog_house
+}
 
 // research/xim/src/jsMain/kotlin/xim/poc/camera/PolarCamera.kt:209 —
 // `(distance - 0.25f).coerceAtLeast(0.5f)`: pad off the wall, but never pull the
@@ -24,6 +38,7 @@ pub fn clamp_chase_camera_to_collision(
     chase: Res<ChaseCamera>,
     time: Res<Time>,
     draw: Res<DrawDistance>,
+    scene_state: Res<SceneState>,
     zone_bvh: Res<ZoneCollisionBvh>,
     self_q: Query<(&Transform, Option<&BakedActor>), (With<IsSelf>, Without<OperatorCamera>)>,
     mut cam_q: Query<&mut Transform, (With<OperatorCamera>, Without<IsSelf>)>,
@@ -43,6 +58,7 @@ pub fn clamp_chase_camera_to_collision(
     mut smoothed_effective: Local<Option<f32>>,
 ) {
     let source = draw.camera_collision_source;
+    let use_mmb = camera_collides_with_mmb(source, scene_state.snapshot.myroom.is_some());
     let bvh_count = bvh_q.iter().count();
     let pending_count = pending_q.iter().count();
     let summary = (bvh_count, pending_count);
@@ -101,7 +117,7 @@ pub fn clamp_chase_camera_to_collision(
         }
     }
 
-    if source.uses_mmb() {
+    if use_mmb {
         for bvh in bvh_q.iter() {
             if let Some(t) = bvh.ray_cast(anchor, dir, hit_t) {
                 if t < hit_t {
@@ -131,7 +147,7 @@ pub fn clamp_chase_camera_to_collision(
                 }
             }
         }
-        if source.uses_mmb() {
+        if use_mmb {
             for bvh in bvh_q.iter() {
                 total_tris += bvh.tri_count();
                 if let Some(t) = bvh.ray_cast_brute_force(anchor, dir, brute_hit_t) {
@@ -275,5 +291,16 @@ mod tests {
     fn camera_distance_pads_off_walls_and_caps_at_wanted() {
         assert_eq!(clamped_camera_distance(3.0, 6.0), 3.0 - WALL_PAD);
         assert_eq!(clamped_camera_distance(100.0, 6.0), 6.0);
+    }
+
+    #[test]
+    fn mog_house_camera_always_collides_with_mmb_furniture() {
+        // The MH exit door is a zone MMB static placement, not MZB wall geometry;
+        // with the default Mzb source the camera would slip through the doorway
+        // gap. Inside a Mog House, MMB collision must be on regardless of source.
+        assert!(camera_collides_with_mmb(CameraCollisionSource::Mzb, true));
+        assert!(!camera_collides_with_mmb(CameraCollisionSource::Mzb, false));
+        assert!(camera_collides_with_mmb(CameraCollisionSource::Mmb, false));
+        assert!(camera_collides_with_mmb(CameraCollisionSource::Both, false));
     }
 }

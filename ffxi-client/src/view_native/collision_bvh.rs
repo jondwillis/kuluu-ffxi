@@ -281,13 +281,18 @@ fn ray_tri_intersect(orig: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> Opt
 pub fn build_collision_bvh_system(
     mut commands: Commands,
     draw: Res<DrawDistance>,
+    scene_state: Res<ffxi_viewer_core::snapshot::SceneState>,
     query: Query<
         (Entity, &Mesh3d, &GlobalTransform),
         (With<CameraOccluder>, Without<CollisionBvh>),
     >,
     meshes: Res<Assets<Mesh>>,
 ) {
-    if !draw.camera_collision_source.uses_mmb() {
+    let in_mog_house = scene_state.snapshot.myroom.is_some();
+    if !super::camera_collision::camera_collides_with_mmb(
+        draw.camera_collision_source,
+        in_mog_house,
+    ) {
         return;
     }
     for (entity, mesh3d, global) in query.iter() {
