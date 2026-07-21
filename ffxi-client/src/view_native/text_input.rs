@@ -332,17 +332,50 @@ pub fn text_input_system(
     }
 }
 
-pub fn dialog_mode_sync_system(state: Res<SceneState>, mut mode: ResMut<InputMode>) {
-    let dialog_open = state.snapshot.dialog.is_some();
-    match (&*mode, dialog_open) {
+pub fn dialog_mode_sync_system(
+    state: Res<SceneState>,
+    mut mode: ResMut<InputMode>,
+    mut last_grid_id: Local<Option<(u32, u16)>>,
+) {
+    let dialog = state.snapshot.dialog.as_ref();
+    match (&*mode, dialog.is_some()) {
         (InputMode::World, true) => {
-            *mode = InputMode::Dialog(DialogCursor::default());
+            let mut cursor = DialogCursor::default();
+            if let Some(choice) = dialog.and_then(default_grid_choice) {
+                cursor.cursor = choice;
+            }
+            *mode = InputMode::Dialog(cursor);
         }
         (InputMode::Dialog(_), false) => {
             *mode = InputMode::World;
         }
         _ => {}
     }
+
+    // A grid frame (delivery box) can open while already in Dialog mode (from
+    // the Mog Menu), so the transition arm above never fires for it. Snap the
+    // cursor onto the first grid cell the first time each grid frame appears so
+    // the box — not the trailing Cancel row — is focused by default.
+    let grid_id = dialog.and_then(|d| {
+        d.grid
+            .as_ref()
+            .map(|_| (d.event_id, d.choices.len() as u16))
+    });
+    if grid_id != *last_grid_id {
+        *last_grid_id = grid_id;
+        if let (InputMode::Dialog(cursor), Some(dialog)) = (&mut *mode, dialog) {
+            if let Some(choice) = default_grid_choice(dialog) {
+                cursor.cursor = choice;
+            }
+        }
+    }
+}
+
+/// The choice index the cursor should default to for a grid dialog: the first
+/// selectable grid cell (retail focuses the slot grid, not the surrounding
+/// recipient / Cancel rows). `None` when the frame has no grid.
+fn default_grid_choice(dialog: &ffxi_viewer_wire::DialogState) -> Option<u32> {
+    dialog.grid.as_ref()?.cells.iter().find_map(|c| c.choice)
 }
 
 #[allow(clippy::too_many_arguments)]

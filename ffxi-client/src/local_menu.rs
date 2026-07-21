@@ -393,19 +393,26 @@ impl LocalMenuSession {
                         },
                     ));
                 }
-                // Empty outbox cells activate only once the recipient is
-                // locked, matching retail's cursor order (recipient OK → grid).
-                None if box_no == DeliveryBoxNo::Outgoing && self.recipient.is_some() => {
+                // Empty cells stay focusable so the cursor always lands on the
+                // grid (even for an empty box) instead of skipping to Cancel.
+                // Placing an item requires a locked recipient; otherwise
+                // activation is a no-op notice.
+                None => {
+                    let action = match box_no {
+                        DeliveryBoxNo::Outgoing if self.recipient.is_some() => {
+                            Action::DeliveryPut { slot: i as u8 }
+                        }
+                        DeliveryBoxNo::Outgoing => {
+                            Action::Stub("Specify a recipient before placing items.")
+                        }
+                        DeliveryBoxNo::Incoming => Action::Stub("This slot is empty."),
+                    };
                     cells.push(DialogGridCell {
                         choice: Some(rows.len() as u32),
                         ..DialogGridCell::default()
                     });
-                    rows.push((
-                        format!("Slot {} {EMPTY_SLOT_SUFFIX}", i + 1),
-                        Action::DeliveryPut { slot: i as u8 },
-                    ));
+                    rows.push((format!("Slot {} {EMPTY_SLOT_SUFFIX}", i + 1), action));
                 }
-                None => cells.push(DialogGridCell::default()),
             }
         }
         rows.push((
@@ -1396,10 +1403,15 @@ mod tests {
         let mut s = LocalMenuSession::new();
         let f = s.open_delivery_box(DeliveryBoxNo::Incoming, &slots);
         assert_eq!(f.prompt.as_deref(), Some(RECEIVE_PANEL_PROMPT));
-        assert_eq!(f.choices.len(), 3, "two occupied slots + Cancel");
-        assert!(f.choices[0].contains("from Atti"));
+        assert_eq!(
+            f.choices.len(),
+            pbx::SLOT_COUNT + 1,
+            "all 8 slots focusable (even empty) + Cancel"
+        );
+        assert!(f.choices[0].ends_with(EMPTY_SLOT_SUFFIX));
+        assert!(f.choices[1].contains("from Atti"));
 
-        let sub = match pick(&mut s, &f, &f.choices[0].clone()) {
+        let sub = match pick(&mut s, &f, &f.choices[1].clone()) {
             Advance::Frame(f) => f,
             _ => panic!("occupied slot opens its action submenu"),
         };
@@ -1418,7 +1430,7 @@ mod tests {
 
         // AH mail: Return is disabled (sender prefix rule).
         let f = s.open_delivery_box(DeliveryBoxNo::Incoming, &slots);
-        let sub = match pick(&mut s, &f, &f.choices[1].clone()) {
+        let sub = match pick(&mut s, &f, &f.choices[4].clone()) {
             Advance::Frame(f) => f,
             _ => panic!(),
         };
@@ -1445,10 +1457,12 @@ mod tests {
 
         let mut s = LocalMenuSession::new();
         let f = s.open_delivery_box(DeliveryBoxNo::Outgoing, &slots);
-        // choices[0] is the recipient row; occupied slots follow.
+        // choices[0] is the recipient row; slot rows follow (empty slots
+        // included, so slot N maps to choice N+1).
         assert!(f.choices[0].starts_with(RECIPIENT_ROW_PREFIX));
         assert!(f.choices[1].ends_with("(preparing)"));
-        assert!(f.choices[2].ends_with("(sent)"));
+        assert!(f.choices[2].ends_with(EMPTY_SLOT_SUFFIX));
+        assert!(f.choices[3].ends_with("(sent)"));
 
         let sub = match pick(&mut s, &f, &f.choices[1].clone()) {
             Advance::Frame(f) => f,
@@ -1463,7 +1477,7 @@ mod tests {
         }
 
         let f = s.open_delivery_box(DeliveryBoxNo::Outgoing, &slots);
-        let sub = match pick(&mut s, &f, &f.choices[2].clone()) {
+        let sub = match pick(&mut s, &f, &f.choices[3].clone()) {
             Advance::Frame(f) => f,
             _ => panic!(),
         };
