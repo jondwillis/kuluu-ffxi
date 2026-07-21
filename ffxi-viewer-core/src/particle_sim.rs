@@ -7,7 +7,7 @@ use ffxi_dat::particle_gen::{KeyFrameTrack, ParticleGeneratorDef};
 use crate::camera::OperatorCamera;
 use crate::components::InGameEntity;
 use crate::dat_d3m::{d3m_material, decoded_texture_to_image, D3mBlendMode};
-use crate::scheduler_runtime::{ActionAssets, SchedulerStageEvent, FFXI_FPS};
+use crate::scheduler_runtime::{ActionAssets, MmbSpriteMesh, SchedulerStageEvent, FFXI_FPS};
 use ffxi_dat::scheduler::StageKind;
 
 // CPU particle simulation. research/xim ParticleGenerator + Particle: a Particle stage (0x02)
@@ -271,14 +271,25 @@ pub fn spawn_zone_particle_generator(
     sim: &mut ParticleSimulator,
     commands: &mut Commands,
 ) -> Option<Entity> {
-    let d3m = assets.d3ms.get(&def.mesh_id)?;
-    let template = sprite_template(d3m)?;
-
-    let tex = d3m.texture_name[8..12]
-        .try_into()
-        .ok()
-        .and_then(|name: [u8; 4]| assets.images.get(&name))
-        .map(|t| images.add(decoded_texture_to_image(t)));
+    // Zone sprays link either a D3M billboard or an MMB mesh by DatId (e.g. Bastok
+    // "abuk", Port Windurst "rivsea"); the MMB texture resolves by internal name.
+    let (template, tex) = if let Some(d3m) = assets.d3ms.get(&def.mesh_id) {
+        let template = sprite_template(d3m)?;
+        let tex = d3m.texture_name[8..12]
+            .try_into()
+            .ok()
+            .and_then(|name: [u8; 4]| assets.images.get(&name))
+            .map(|t| images.add(decoded_texture_to_image(t)));
+        (template, tex)
+    } else {
+        let mmb = assets.mmbs.get(&def.mesh_id)?;
+        let template = mmb_sprite_template(mmb)?;
+        let tex = assets
+            .images_by_name
+            .get(&mmb.texture_name)
+            .map(|t| images.add(decoded_texture_to_image(t)));
+        (template, tex)
+    };
     let blend = match def.blend {
         ffxi_dat::particle_gen::ParticleBlend::Additive => D3mBlendMode::Additive,
         ffxi_dat::particle_gen::ParticleBlend::Blend => D3mBlendMode::Blended,
@@ -539,6 +550,18 @@ fn sprite_template(d3m: &ffxi_dat::d3m::D3m) -> Option<SpriteTemplate> {
         uvs,
         indices,
         brightness: Vec3::new(c[0], c[1], c[2]),
+    })
+}
+
+fn mmb_sprite_template(mmb: &MmbSpriteMesh) -> Option<SpriteTemplate> {
+    if mmb.positions.is_empty() || mmb.indices.is_empty() {
+        return None;
+    }
+    Some(SpriteTemplate {
+        positions: mmb.positions.iter().map(|p| Vec3::from_array(*p)).collect(),
+        uvs: mmb.uvs.clone(),
+        indices: mmb.indices.clone(),
+        brightness: Vec3::from_array(mmb.brightness),
     })
 }
 

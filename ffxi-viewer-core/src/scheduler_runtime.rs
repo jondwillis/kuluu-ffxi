@@ -108,15 +108,34 @@ pub fn tick_active_schedulers(
     }
 }
 
+// A zone-spray generator (e.g. Bastok "abuk", Port Windurst "rivsea") links an MMB
+// mesh by its 4-byte DatId, not a D3M. Flattened here to sprite geometry so the
+// particle sim can build a SpriteTemplate without re-parsing the MMB.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Default)]
+pub struct MmbSpriteMesh {
+    pub positions: Vec<[f32; 3]>,
+    pub uvs: Vec<[f32; 2]>,
+    pub indices: Vec<u32>,
+    pub brightness: [f32; 3],
+    pub texture_name: String,
+}
+
 #[derive(Component, Debug, Clone, Default)]
 pub struct ActionAssets {
     pub generators: HashMap<[u8; 4], Generator>,
     #[cfg(not(target_arch = "wasm32"))]
     pub d3ms: HashMap<[u8; 4], ffxi_dat::d3m::D3m>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub mmbs: HashMap<[u8; 4], MmbSpriteMesh>,
     pub seps: HashMap<[u8; 4], Sep>,
     pub animations: Vec<ffxi_dat::skel_anim::SkeletonAnimation>,
     #[cfg(not(target_arch = "wasm32"))]
     pub images: HashMap<[u8; 4], ffxi_dat::texture::DecodedTexture>,
+    // Img chunks keyed by their INTERNAL name (bytes 0x09..0x11), which is what an
+    // MMB model's texture_name references — distinct from the Img chunk's DatId.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub images_by_name: HashMap<String, ffxi_dat::texture::DecodedTexture>,
     pub emitters: HashMap<[u8; 4], ffxi_dat::generator::ParticleEmitter>,
     pub particle_defs: HashMap<[u8; 4], ffxi_dat::particle_gen::ParticleGeneratorDef>,
     pub keyframes: HashMap<[u8; 4], ffxi_dat::particle_gen::KeyFrameTrack>,
@@ -183,6 +202,12 @@ pub fn parse_action_bytes(bytes: &[u8]) -> (Vec<Scheduler>, ActionAssets) {
                     assets.d3ms.insert(c.name, d);
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            ChunkKind::Mmb => {
+                if let Some(mesh) = mmb_sprite_mesh(c.data) {
+                    assets.mmbs.insert(c.name, mesh);
+                }
+            }
             ChunkKind::Sep => {
                 if let Ok(s) = Sep::parse(c.name, c.data) {
                     assets.seps.insert(c.name, s);
@@ -197,6 +222,9 @@ pub fn parse_action_bytes(bytes: &[u8]) -> (Vec<Scheduler>, ActionAssets) {
             #[cfg(not(target_arch = "wasm32"))]
             ChunkKind::Img => {
                 if let Ok(tex) = ffxi_dat::texture::decode_texture(c.data) {
+                    if let Some(name) = ffxi_dat::texture::extract_texture_name(c.data) {
+                        assets.images_by_name.insert(name, tex.clone());
+                    }
                     assets.images.insert(c.name, tex);
                 }
             }
@@ -204,6 +232,54 @@ pub fn parse_action_bytes(bytes: &[u8]) -> (Vec<Scheduler>, ActionAssets) {
         }
     }
     (schedulers, assets)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn mmb_sprite_mesh(data: &[u8]) -> Option<MmbSpriteMesh> {
+    let dec = ffxi_dat::mmb::decrypt(data).ok()?;
+    let models = ffxi_dat::mmb::parse_models(&dec);
+    let mut positions = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    let mut texture_name = String::new();
+    for m in &models {
+        if m.vertices.is_empty() || m.indices.is_empty() {
+            continue;
+        }
+        if texture_name.is_empty() && !m.texture_name.is_empty() {
+            texture_name = m.texture_name.clone();
+        }
+        let base = positions.len() as u32;
+        let vert_count = m.vertices.len() as u16;
+        for v in &m.vertices {
+            positions.push(v.pos);
+            uvs.push(v.uv);
+        }
+        for tri in m.indices.chunks_exact(3) {
+            if tri.iter().all(|&i| i < vert_count) {
+                indices.extend(tri.iter().map(|&i| base + i as u32));
+            }
+        }
+    }
+    if positions.is_empty() || indices.is_empty() {
+        return None;
+    }
+    let c = models
+        .iter()
+        .find(|m| !m.vertices.is_empty())
+        .map(|m| m.vertices[0].rgba)
+        .unwrap_or([128, 128, 128, 128]);
+    Some(MmbSpriteMesh {
+        positions,
+        uvs,
+        indices,
+        brightness: [
+            c[0] as f32 / 128.0,
+            c[1] as f32 / 128.0,
+            c[2] as f32 / 128.0,
+        ],
+        texture_name,
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -16,11 +16,29 @@ pub struct ZoneParticles {
     entities: Vec<Entity>,
 }
 
-// A zone-static emitter is an auto-run Generator embedded in the zone MZB DAT with
-// a real world placement; the ~110 defs at [0,0,0] are action templates reused by
-// the effect scheduler, not placed emitters (Bastok Mines DAT 334 keeps exactly 6).
-fn is_placed_zone_generator(def: &ParticleGeneratorDef) -> bool {
-    def.auto_run && def.base_position != [0.0, 0.0, 0.0]
+// Water sprays are placed, timed emitters (life > 0) whose MMB mesh carries a water
+// texture. No DAT field flags a generator as water, so the surface is identified by
+// its mesh's texture (or mesh DatId) — cloud/star/window/flower/lamp sheets share
+// the placed+auto-run shape but are life==0 or non-water-textured.
+const WATER_MESH_PREFIXES: [&str; 11] = [
+    "sea", "riv", "taki", "wat", "muzu", "mz0", "abuk", "sib", "spl", "spr", "oomi",
+];
+
+fn is_water_name(name: &str) -> bool {
+    let n = name.trim_end().to_ascii_lowercase();
+    WATER_MESH_PREFIXES.iter().any(|p| n.starts_with(p)) || n.contains("water")
+}
+
+fn water_spray_mesh<'a>(
+    def: &ParticleGeneratorDef,
+    assets: &'a crate::scheduler_runtime::ActionAssets,
+) -> Option<&'a crate::scheduler_runtime::MmbSpriteMesh> {
+    if !def.auto_run || def.base_position == [0.0, 0.0, 0.0] || def.max_life_frames <= 0.0 {
+        return None;
+    }
+    let mmb = assets.mmbs.get(&def.mesh_id)?;
+    let mesh_id = String::from_utf8_lossy(&def.mesh_id);
+    (is_water_name(&mmb.texture_name) || is_water_name(&mesh_id)).then_some(mmb)
 }
 
 fn sync_zone_particles(
@@ -62,7 +80,7 @@ fn sync_zone_particles(
     let (_schedulers, assets) = parse_action_bytes(&bytes);
     let mut spawned = 0usize;
     for def in assets.particle_defs.values() {
-        if !is_placed_zone_generator(def) {
+        if water_spray_mesh(def, &assets).is_none() {
             continue;
         }
         let bp = def.base_position;
