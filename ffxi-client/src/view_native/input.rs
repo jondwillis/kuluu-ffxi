@@ -14,6 +14,13 @@ pub struct StanceParams<'w> {
 }
 
 #[derive(SystemParam)]
+pub struct MoveEnvParams<'w> {
+    pub navmesh: Res<'w, super::navmesh_overlay::NavmeshState>,
+    pub minimap_hover: Res<'w, ffxi_viewer_core::minimap::input::MinimapHoverGate>,
+    pub pointer: Res<'w, ffxi_viewer_core::MousePointer>,
+}
+
+#[derive(SystemParam)]
 pub struct HudCaptureParams<'w> {
     pub hud_hidden: ResMut<'w, ffxi_viewer_core::hud_hide::HudHidden>,
     pub screenshot: MessageWriter<'w, super::screenshot::ScreenshotRequest>,
@@ -57,6 +64,16 @@ const BACKPEDAL_SCALE: f32 = 0.5;
 const STRAFE_SCALE: f32 = 0.75;
 
 const PREDICTION_RESYNC_YALMS: f32 = 5.0;
+
+// Cap how far a single movement re-ground may drop the player below their feet.
+// `nearest_height_at` snaps to the nearest navmesh poly within a 100-yalm
+// vertical window, so where two walkable layers stack (Bastok Markets' walkway
+// over its water canal) and the upper poly is momentarily absent at a column,
+// the query latches onto the lower layer and teleports the player into the
+// water (kuluu-nvqx). Legit descent is continuous — each per-frame query lands
+// on the same connected surface a fraction of a yalm lower — so any drop past
+// this is the query jumping floors, not the player walking downhill.
+const MAX_GROUND_STEP_DOWN: f32 = 4.0;
 
 // Retail body turn into a new camera-relative run direction takes ~0.5-0.7s
 // for 90° (HorizonXI video 2026-07-20, D-press frames). The carve rate of a
@@ -492,8 +509,7 @@ pub fn dispatch_movement_system(
     // the sideways-circle bug from the 2026-07-20 10.19 recording).
     mut steer_latch: Local<Option<(i32, u8)>>,
     mut prediction: ResMut<LocalPlayerPrediction>,
-    navmesh: Res<super::navmesh_overlay::NavmeshState>,
-    minimap_hover: Res<ffxi_viewer_core::minimap::input::MinimapHoverGate>,
+    env: MoveEnvParams,
     mut stance: StanceParams,
 ) {
     let rest_stance = &mut stance.rest_stance;
@@ -543,7 +559,7 @@ pub fn dispatch_movement_system(
         chase.yaw += yaw_d;
     }
 
-    if matches!(*camera_mode, CameraMode::Chase) && !in_picker && !minimap_hover.hovered {
+    if matches!(*camera_mode, CameraMode::Chase) && !in_picker && !env.minimap_hover.hovered {
         let mut zoom_d = 0.0;
         let step = ChaseCamera::KEYBOARD_ZOOM_RATE * time.delta_secs();
         if bindings.pressed(Action::CameraZoomIn, &keys) {
@@ -635,15 +651,22 @@ pub fn dispatch_movement_system(
     let mut strafe = resolved.strafe;
     // In chase mode steer is always a camera-relative run component (solo A/D
     // runs sideways); only first person keeps the arrow-turn pivot.
+    // In first person A/D rotate the view like Q/E, at the same snappy rate.
     let fp_rotate = if first_person { resolved.steer } else { 0 };
-    let turn_rate = ROTATE_KEY_RATE_RAD_PER_SEC * resolved.rotate_dir as f32
-        + HEADING_TURN_RATE * fp_rotate as f32;
+    let turn_rate = ROTATE_KEY_RATE_RAD_PER_SEC * (resolved.rotate_dir + fp_rotate) as f32;
     let (player_rotate_u8, heading_delta_units) =
         advance_heading_turn(&mut turn_accum.units, turn_rate, time.delta_secs());
     let steer_in_chase = !first_person && !locked && (forward != 0 || resolved.steer != 0);
-    // A/D carve and Q/E rotate need the run direction recomputed against the
-    // live camera every frame; anything else invalidates the pure-W/S latch.
-    if !steer_in_chase || resolved.steer != 0 || resolved.rotate_dir != 0 {
+    // Deliberate camera pan (yaw keys / mouse drag) re-aims a pure W/S run;
+    // the latch only holds the run direction against the passive
+    // auto-recenter, not against the player actively steering the camera.
+    let camera_panning = bindings.pressed(Action::CameraYawLeft, &keys)
+        || bindings.pressed(Action::CameraYawRight, &keys)
+        || env.pointer.left
+        || env.pointer.right;
+    // A/D carve, Q/E rotate, and camera panning recompute the run direction
+    // against the live camera every frame; anything else holds the latch.
+    if !steer_in_chase || resolved.steer != 0 || resolved.rotate_dir != 0 || camera_panning {
         *steer_latch = None;
     }
 
@@ -755,7 +778,7 @@ pub fn dispatch_movement_system(
     let mut turn_dy: f32 = 0.0;
     if steer_in_chase {
         let camera_forward_h = heading_for_yaw(chase.yaw);
-        let continuous = resolved.steer != 0 || resolved.rotate_dir != 0;
+        let continuous = resolved.steer != 0 || resolved.rotate_dir != 0 || camera_panning;
         let motion_h = if continuous {
             camera_relative_motion_heading(camera_forward_h, forward, resolved.steer)
         } else {
@@ -838,7 +861,7 @@ pub fn dispatch_movement_system(
         y += right_y * step * strafe as f32;
     }
 
-    let (final_x, final_y, final_z) = if let Some(nav) = &navmesh.nav {
+    let (final_x, final_y, final_z) = if let Some(nav) = &env.navmesh.nav {
         let from = ffxi_nav::glam::Vec3::new(basis_pos.x, basis_pos.y, basis_pos.z);
         let to = ffxi_nav::glam::Vec3::new(x, y, basis_pos.z);
         let slid = nav
@@ -877,7 +900,8 @@ pub fn dispatch_movement_system(
 
     // slide_along passes Z through; the server's engage range is 3D, so an
     // off-ground reported Y inflates distance to grounded mobs. Re-ground here.
-    let final_z = navmesh
+    let final_z = env
+        .navmesh
         .nav
         .as_ref()
         .and_then(|nav| {
@@ -885,6 +909,7 @@ pub fn dispatch_movement_system(
                 .ok()?
                 .nearest_height_at(final_x, final_y, basis_pos.z)
         })
+        .filter(|&h| h >= basis_pos.z - MAX_GROUND_STEP_DOWN)
         .unwrap_or(final_z);
 
     let _ = cmd_tx.0.try_send(AgentCommand::Move {
