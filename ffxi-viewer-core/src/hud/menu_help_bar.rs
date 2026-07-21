@@ -22,12 +22,13 @@ pub struct MenuHelpCounter;
 #[derive(Component)]
 pub struct MenuHelpHint;
 
-/// The persistent "- : switch pane" affordance segment; shown only while a
-/// menu (two-pane) is open, hidden during the status-ribbon buff bar.
+/// The persistent "- : page" affordance segment; shown while a menu is open,
+/// hidden during the status-ribbon buff bar. "-" flips the Command menu's two
+/// pages (and toggles map/list focus on the Map screen).
 #[derive(Component)]
 pub struct MenuHelpPaneSwitch;
 
-const PANE_SWITCH_HINT: &str = "- : switch pane";
+const PANE_SWITCH_HINT: &str = "- : page";
 
 pub const BAR_HEIGHT: f32 = 26.0;
 /// Retail frames the active menu title in its own boxed segment, flush left.

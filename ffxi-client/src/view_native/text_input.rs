@@ -3224,15 +3224,10 @@ pub fn mouse_nav_dispatch_system(
 
     for ev in menu_events.read() {
         if let InputMode::Menu(stack) = &mut *mode {
-            // A click focuses the clicked pane and drops its cursor on the row,
-            // then confirms — a left-pane click re-drills like the keyboard path.
-            stack.active_pane = ev.pane;
-            let level_idx = stack.pane_level_index(ev.pane);
-            if let Some(level) = stack.levels.get_mut(level_idx) {
+            // A click drops the cursor on the clicked row of the current level,
+            // then confirms — same as pressing Enter there.
+            if let Some(level) = stack.current_mut() {
                 level.cursor = ev.slot;
-            }
-            if ev.pane == ffxi_viewer_core::input_mode::Pane::Left && stack.levels.len() >= 2 {
-                stack.pop();
             }
             if let Some(next) = confirm_menu_at_cursor(
                 &mut bindings,
@@ -3346,8 +3341,6 @@ fn handle_menu_key(
     minimap_view: &mut ffxi_viewer_core::minimap::MinimapView,
     minimap_state: &ffxi_viewer_core::minimap::MinimapState,
 ) -> Option<InputMode> {
-    use ffxi_viewer_core::input_mode::Pane;
-
     let top_kind = stack.current()?.kind;
 
     // The Map screen is a bespoke two-pane surface (map + wide-scan list) with
@@ -3365,26 +3358,48 @@ fn handle_menu_key(
             minimap_state,
         );
     }
-    let two_pane = !ffxi_viewer_core::hud::menu::renders_bespoke_screen(top_kind);
+    let (kind, cursor) = {
+        let level = stack.current()?;
+        (level.kind, level.cursor)
+    };
+    let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind, dynamic);
 
-    // Menu context (not text input), so reading the raw keycode is correct:
-    // Minus toggles the active pane of the generic two-pane menu. Bespoke
-    // full-screen screens draw a single layout, so it does not apply there.
+    // Menu context (not text input), so reading the raw keycode is correct.
+    // "-" flips the Command menu's two pages (retail HorizonXI); single-list
+    // submenus have no pages, and the Map screen handles "-" in its own path.
     if key_code == KeyCode::Minus {
-        if two_pane {
-            stack.toggle_pane();
+        if kind == MenuKind::Root {
+            if let Some(level) = stack.current_mut() {
+                level.cursor = ffxi_viewer_core::hud::menu::root_other_page_cursor(level.cursor);
+            }
         }
         return None;
     }
 
-    // Route Up/Down/Confirm/Cancel to the active pane's level: the current
-    // (top) level on the right, its parent (or the Root list) on the left.
-    let on_left = two_pane && stack.active_pane == Pane::Left;
-    let (kind, cursor) = {
-        let level = stack.active_level()?;
-        (level.kind, level.cursor)
-    };
-    let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind, dynamic);
+    // Root Command menu paging: Left/Right flip pages (like "-"); Up/Down wrap
+    // within the current page so navigation never crosses a page boundary.
+    if kind == MenuKind::Root {
+        let (start, end) = ffxi_viewer_core::hud::menu::root_page_bounds(cursor);
+        if bindings.matches_logical(Action::NavLeft, key)
+            || bindings.matches_logical(Action::NavRight, key)
+        {
+            if let Some(level) = stack.current_mut() {
+                level.cursor = ffxi_viewer_core::hud::menu::root_other_page_cursor(level.cursor);
+            }
+            return None;
+        }
+        if bindings.matches_logical(Action::NavUp, key) {
+            let level = stack.current_mut()?;
+            level.cursor = if cursor <= start { end - 1 } else { cursor - 1 };
+            return None;
+        }
+        if bindings.matches_logical(Action::NavDown, key) {
+            let level = stack.current_mut()?;
+            let next = cursor + 1;
+            level.cursor = if next >= end { start } else { next };
+            return None;
+        }
+    }
 
     // The Items window is a stack of panes: one per accessible bag plus the
     // sort-options box. Retail's "Select active window" key (F in the compact
@@ -3528,12 +3543,6 @@ fn handle_menu_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        // Confirm on a left-pane row re-drills: drop the current child so the
-        // parent (the left pane) becomes the level the confirm drills from,
-        // then the push moves focus back to the right pane.
-        if on_left && stack.levels.len() >= 2 {
-            stack.pop();
-        }
         return confirm_menu_at_cursor(
             bindings,
             stack,
@@ -3555,13 +3564,7 @@ fn handle_menu_key(
         if matches!(kind, MenuKind::Status) {
             status_profile_open.0 = false;
         }
-        // Cancel from the right pane of a drilled-in menu moves focus left
-        // before it would pop; from the left pane (or a single-level/bespoke
-        // menu) it pops, closing back to the world at the root.
-        if !on_left && two_pane && stack.levels.len() >= 2 {
-            stack.active_pane = Pane::Left;
-            return None;
-        }
+        // Cancel pops one level; from Root it closes back to the world.
         return if !stack.pop() {
             Some(InputMode::World)
         } else {

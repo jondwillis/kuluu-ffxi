@@ -786,10 +786,7 @@ pub(crate) fn item_row_mouse_click_system(
         }
         let list_idx = start + row.0;
         if list_idx < total {
-            out.write(MenuRowActivated {
-                pane: crate::input_mode::Pane::Right,
-                slot: list_idx,
-            });
+            out.write(MenuRowActivated { slot: list_idx });
         }
     }
 }

@@ -2,7 +2,7 @@ use bevy::prelude::*;
 
 use crate::graphics_settings::{GraphicsSettings, GRAPHICS_FIELDS};
 use crate::hud::style::{self, theme};
-use crate::input_mode::{InputMode, MenuKind, MenuStack, Pane};
+use crate::input_mode::{InputMode, MenuKind, MenuStack};
 
 pub const ROOT_LOG_OUT: &str = "Log Out";
 pub const ROOT_SHUT_DOWN: &str = "Shut Down";
@@ -15,28 +15,59 @@ pub const ROOT_CURRENT_TIME: &str = "Current Time";
 pub const ROOT_COMMUNICATION: &str = "Communication";
 pub const COMM_EMOTE_LIST: &str = "Emote List";
 
+// Retail's Command menu is a single pane with two pages, flipped with "-" (or
+// the Left/Right arrows). ROOT_ENTRIES is page 1 followed by page 2; the page a
+// cursor is on is derived from its index (root_page_bounds), so no separate page
+// state is needed. Order mirrors retail HorizonXI for the commands we implement
+// (Synthesis/Trade/Linkshell/Region Info/Missions/Quests/View House/Bazaar/Help
+// Desk are dropped; Graphics/Debug are ours, grouped with the page-2 config-like
+// commands).
 const ROOT_ENTRIES: &[&str] = &[
-    "Magic",
-    "Abilities",
-    "Items",
-    "Key Items",
-    "Equipment",
+    // Page 1
     "Status",
+    "Equipment",
+    "Magic",
+    "Items",
+    "Abilities",
     "Party",
     "Search",
     "Map",
-    ROOT_COMMUNICATION,
+    // Page 2
+    "Key Items",
     "Macros",
-    "Graphics",
     "Config",
     ROOT_CURRENT_TIME,
+    ROOT_COMMUNICATION,
+    "Graphics",
     "Debug",
-    ROOT_LOG_OUT,
     ROOT_SHUT_DOWN,
+    ROOT_LOG_OUT,
 ];
 
+const ROOT_PAGE_1_LEN: usize = 8;
+
+/// The half-open `[start, end)` range of `ROOT_ENTRIES` the page containing
+/// `cursor` occupies. The Command menu shows one page at a time; "-" and the
+/// Left/Right arrows flip between them, Up/Down wrap within the current page.
+pub fn root_page_bounds(cursor: usize) -> (usize, usize) {
+    if cursor < ROOT_PAGE_1_LEN {
+        (0, ROOT_PAGE_1_LEN)
+    } else {
+        (ROOT_PAGE_1_LEN, ROOT_ENTRIES.len())
+    }
+}
+
+/// The cursor index that flips to the other Root page, landing on its first row.
+pub fn root_other_page_cursor(cursor: usize) -> usize {
+    if cursor < ROOT_PAGE_1_LEN {
+        ROOT_PAGE_1_LEN
+    } else {
+        0
+    }
+}
+
 /// The Root command list, for callers that enumerate the top-level entries
-/// (e.g. the drill/preview parity guard) without matching each label.
+/// (e.g. the drill parity guard) without matching each label.
 pub fn root_entries() -> &'static [&'static str] {
     ROOT_ENTRIES
 }
@@ -446,25 +477,20 @@ pub fn renders_bespoke_screen(kind: MenuKind) -> bool {
 pub struct MainMenu;
 
 #[derive(Component)]
-pub struct MainMenuTitle {
-    pub pane: Pane,
-}
+pub struct MainMenuTitle;
 
 #[derive(Component)]
 pub struct MainMenuRow {
-    pub pane: Pane,
     pub slot: usize,
 }
 
 #[derive(Message, Debug, Clone, Copy)]
 pub struct MenuRowActivated {
-    pub pane: Pane,
     pub slot: usize,
 }
 
-/// Each column matches the old single-pane width; two of them sit side by side
-/// under the top help bar (retail's Command Menu is two equal columns). Bespoke
-/// screens (Map wide-scan column) reuse this so the pane widths can't drift.
+/// The single Command-menu column width; the Map screen's wide-scan column
+/// reuses it so the pane widths can't drift.
 pub const MENU_PANE_WIDTH: f32 = 220.0;
 
 pub fn spawn_main_menu(mut commands: Commands) {
@@ -476,25 +502,19 @@ pub fn spawn_main_menu(mut commands: Commands) {
                 position_type: PositionType::Absolute,
                 top: Val::Px(48.0),
                 right: Val::Px(8.0),
-                column_gap: Val::Px(6.0),
-                flex_direction: FlexDirection::Row,
                 display: Display::None,
                 ..default()
             },
         ))
-        .with_children(|p| {
-            for pane in [Pane::Left, Pane::Right] {
-                spawn_pane_column(p, pane);
-            }
-        });
+        .with_children(spawn_pane_column);
 }
 
-fn spawn_pane_column(parent: &mut ChildSpawnerCommands, pane: Pane) {
+fn spawn_pane_column(parent: &mut ChildSpawnerCommands) {
     let (mut node, bg, border) = style::window_frame();
     node.width = Val::Px(MENU_PANE_WIDTH);
     parent.spawn((node, bg, border)).with_children(|c| {
         c.spawn((
-            MainMenuTitle { pane },
+            MainMenuTitle,
             Text::new(""),
             style::text_font(14.0),
             TextColor(theme::TITLE),
@@ -502,7 +522,7 @@ fn spawn_pane_column(parent: &mut ChildSpawnerCommands, pane: Pane) {
 
         for slot in 0..MAX_ENTRY_COUNT {
             c.spawn((
-                MainMenuRow { pane, slot },
+                MainMenuRow { slot },
                 Button,
                 Text::new(""),
                 style::text_font(14.0),
@@ -908,49 +928,19 @@ pub fn ability_group_empty_hint(group: crate::hud::action_model::AbilityGroup) -
     }
 }
 
-/// What one column renders this frame. `interactive` distinguishes a real
-/// (navigable) level from the Root right-pane preview.
+/// What the single Command-menu column renders this frame: the current (top)
+/// level of the stack.
 struct PaneView {
     kind: MenuKind,
-    cursor: Option<usize>,
-    interactive: bool,
+    cursor: usize,
 }
 
-fn pane_view(stack: &MenuStack, pane: Pane, dynamic: &DynamicMenu) -> Option<PaneView> {
-    let depth = stack.levels.len();
-    if depth == 0 {
-        return None;
-    }
-    match pane {
-        Pane::Left => {
-            let idx = stack.pane_level_index(Pane::Left);
-            let level = &stack.levels[idx];
-            Some(PaneView {
-                kind: level.kind,
-                cursor: Some(level.cursor),
-                interactive: true,
-            })
-        }
-        Pane::Right if depth >= 2 => {
-            let level = &stack.levels[depth - 1];
-            Some(PaneView {
-                kind: level.kind,
-                cursor: Some(level.cursor),
-                interactive: true,
-            })
-        }
-        // At Root the right column previews the highlighted category's child
-        // rows, non-interactive until a drill-in makes it the current level.
-        Pane::Right => {
-            let root = &stack.levels[0];
-            let label = entry_label(root.kind, root.cursor, dynamic);
-            root_child_kind(label).map(|kind| PaneView {
-                kind,
-                cursor: None,
-                interactive: false,
-            })
-        }
-    }
+fn current_view(stack: &MenuStack) -> Option<PaneView> {
+    let level = stack.current()?;
+    Some(PaneView {
+        kind: level.kind,
+        cursor: level.cursor,
+    })
 }
 
 #[allow(clippy::type_complexity)]
@@ -1006,32 +996,26 @@ pub fn update_main_menu(
         node.display = Display::Flex;
     }
 
-    let active_idx = stack.active_level_index();
-    let left = pane_view(stack, Pane::Left, &dynamic);
-    let right = pane_view(stack, Pane::Right, &dynamic);
-    let view_for = |pane: Pane| match pane {
-        Pane::Left => &left,
-        Pane::Right => &right,
-    };
+    let view = current_view(stack);
 
-    for (title, mut text) in title_q.iter_mut() {
-        let want = view_for(title.pane)
-            .as_ref()
-            .map(|v| menu_title(v.kind))
-            .unwrap_or("");
-        if **text != *want {
-            **text = want.to_string();
+    for (_, mut text) in title_q.iter_mut() {
+        let want = view.as_ref().map(root_aware_title).unwrap_or_default();
+        if **text != want {
+            **text = want;
         }
     }
 
-    for (row, mut row_node, mut text, mut color, mut bg) in row_q.iter_mut() {
-        let Some(view) = view_for(row.pane) else {
+    let Some(view) = view else {
+        for (_, mut row_node, _, _, _) in row_q.iter_mut() {
             hide(&mut row_node);
-            continue;
-        };
-        let (total, viewport_start) =
-            resolve_viewport(view.kind, view.cursor.unwrap_or(0), &dynamic);
-        let window = visible_window(view.kind, total);
+        }
+        return;
+    };
+
+    let (total, viewport_start) = resolve_viewport(view.kind, view.cursor, &dynamic);
+    let window = visible_window(view.kind, total);
+
+    for (row, mut row_node, mut text, mut color, mut bg) in row_q.iter_mut() {
         let list_idx = viewport_start + row.slot;
         if row.slot >= window || list_idx >= total {
             hide(&mut row_node);
@@ -1060,19 +1044,11 @@ pub fn update_main_menu(
             &scene.snapshot,
         );
 
-        let is_cursor = view.cursor == Some(list_idx);
-        // Only the active pane paints a gold cursor + caret; the inactive
-        // interactive pane dims its cursor row (MUTED / CURSOR_BG, no caret);
-        // the non-interactive preview stays muted throughout.
-        let gold = view.interactive && stack.pane_level_index(row.pane) == active_idx;
-        let (want, want_color, want_bg) = if is_cursor && gold {
+        let is_cursor = view.cursor == list_idx;
+        let (want, want_color, want_bg) = if is_cursor {
             (format!("> {body}"), theme::CURSOR, Color::NONE)
-        } else if is_cursor && view.interactive {
-            (format!("  {body}"), theme::MUTED, theme::CURSOR_BG)
-        } else if view.interactive {
-            (format!("  {body}"), theme::TEXT, Color::NONE)
         } else {
-            (format!("  {body}"), theme::MUTED, Color::NONE)
+            (format!("  {body}"), theme::TEXT, Color::NONE)
         };
         if **text != want {
             **text = want;
@@ -1086,6 +1062,18 @@ pub fn update_main_menu(
     }
 }
 
+/// The pane title, with a `‹1/2›` page marker appended for the Root Command
+/// menu so the two-page flip (retail's "-") is discoverable.
+fn root_aware_title(view: &PaneView) -> String {
+    let title = menu_title(view.kind);
+    if view.kind == MenuKind::Root {
+        let page = if view.cursor < ROOT_PAGE_1_LEN { 1 } else { 2 };
+        format!("{title}  \u{2039}{page}/2\u{203a}")
+    } else {
+        title.to_string()
+    }
+}
+
 fn visible_window(kind: MenuKind, total: usize) -> usize {
     if is_dynamic(kind) {
         DYNAMIC_VISIBLE_ROWS
@@ -1095,6 +1083,11 @@ fn visible_window(kind: MenuKind, total: usize) -> usize {
 }
 
 fn resolve_viewport(kind: MenuKind, cursor: usize, dynamic: &DynamicMenu) -> (usize, usize) {
+    if kind == MenuKind::Root {
+        // Show only the page the cursor is on: rows [start, end).
+        let (start, end) = root_page_bounds(cursor);
+        return (end, start);
+    }
     if is_dynamic(kind) {
         let total = dynamic.rows.len().max(1);
         if total <= DYNAMIC_VISIBLE_ROWS {
@@ -1110,24 +1103,6 @@ fn resolve_viewport(kind: MenuKind, cursor: usize, dynamic: &DynamicMenu) -> (us
     }
 }
 
-/// The level index and kind a pane navigates, or `None` for a non-interactive
-/// pane (the Root right-pane preview). Mirrors `pane_view`'s interactivity so
-/// mouse and render agree on which rows respond.
-fn interactive_pane_level(stack: &MenuStack, pane: Pane) -> Option<(usize, MenuKind)> {
-    let depth = stack.levels.len();
-    if depth == 0 {
-        return None;
-    }
-    match pane {
-        Pane::Left => {
-            let idx = stack.pane_level_index(Pane::Left);
-            Some((idx, stack.levels[idx].kind))
-        }
-        Pane::Right if depth >= 2 => Some((depth - 1, stack.levels[depth - 1].kind)),
-        Pane::Right => None,
-    }
-}
-
 pub fn menu_mouse_hover_system(
     mut mode: ResMut<InputMode>,
     dynamic: Res<DynamicMenu>,
@@ -1136,22 +1111,20 @@ pub fn menu_mouse_hover_system(
     let InputMode::Menu(stack) = &mut *mode else {
         return;
     };
+    let Some(level_idx) = stack.levels.len().checked_sub(1) else {
+        return;
+    };
+    let kind = stack.levels[level_idx].kind;
     for (interaction, row) in &rows {
         if !matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
             continue;
         }
-        let Some((level_idx, kind)) = interactive_pane_level(stack, row.pane) else {
-            continue;
-        };
         let cursor = stack.levels[level_idx].cursor;
         let (total, viewport_start) = resolve_viewport(kind, cursor, &dynamic);
         let window = visible_window(kind, total);
         let list_idx = viewport_start + row.slot;
         if list_idx >= total || row.slot >= window {
             continue;
-        }
-        if stack.active_pane != row.pane {
-            stack.active_pane = row.pane;
         }
         if stack.levels[level_idx].cursor != list_idx {
             stack.levels[level_idx].cursor = list_idx;
@@ -1168,22 +1141,19 @@ pub fn menu_mouse_click_system(
     let InputMode::Menu(stack) = &*mode else {
         return;
     };
+    let Some(level) = stack.current() else {
+        return;
+    };
+    let kind = level.kind;
     for (interaction, row) in &rows {
         if *interaction != Interaction::Pressed {
             continue;
         }
-        let Some((level_idx, kind)) = interactive_pane_level(stack, row.pane) else {
-            continue;
-        };
-        let cursor = stack.levels[level_idx].cursor;
-        let (total, viewport_start) = resolve_viewport(kind, cursor, &dynamic);
+        let (total, viewport_start) = resolve_viewport(kind, level.cursor, &dynamic);
         let window = visible_window(kind, total);
         let list_idx = viewport_start + row.slot;
         if list_idx < total && row.slot < window {
-            out.write(MenuRowActivated {
-                pane: row.pane,
-                slot: list_idx,
-            });
+            out.write(MenuRowActivated { slot: list_idx });
         }
     }
 }
@@ -1240,33 +1210,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn two_pane_focus_toggles_and_resets_on_drill() {
-        let mut stack = MenuStack::root();
-        assert_eq!(stack.active_pane, Pane::Right, "menus open focused right");
+    fn root_pages_split_and_flip_by_cursor() {
+        // Page 1 is the first ROOT_PAGE_1_LEN entries; page 2 the rest.
+        let (s1, e1) = root_page_bounds(0);
+        assert_eq!((s1, e1), (0, ROOT_PAGE_1_LEN));
+        let (s2, e2) = root_page_bounds(ROOT_PAGE_1_LEN);
+        assert_eq!((s2, e2), (ROOT_PAGE_1_LEN, ROOT_ENTRIES.len()));
 
-        stack.toggle_pane();
-        assert_eq!(stack.active_pane, Pane::Left);
-        stack.toggle_pane();
-        assert_eq!(stack.active_pane, Pane::Right);
+        // "Map" lives on page 1, "Config" on page 2 (retail grouping).
+        let map = ROOT_ENTRIES.iter().position(|e| *e == "Map").unwrap();
+        let config = ROOT_ENTRIES.iter().position(|e| *e == "Config").unwrap();
+        assert!(map < ROOT_PAGE_1_LEN && config >= ROOT_PAGE_1_LEN);
 
-        // Drill in: focus resets to the new child (right column).
-        stack.toggle_pane();
-        stack.push(MenuKind::Graphics);
-        assert_eq!(stack.active_pane, Pane::Right);
-        assert_eq!(
-            stack.active_level_index(),
-            1,
-            "right focus is the top level"
-        );
-
-        // Focus left → the active level is the parent (Root at index 0).
-        stack.toggle_pane();
-        assert_eq!(stack.active_level_index(), 0);
-        assert_eq!(stack.active_level().map(|l| l.kind), Some(MenuKind::Root));
-
-        // Popping restores the right focus.
-        assert!(stack.pop());
-        assert_eq!(stack.active_pane, Pane::Right);
+        // Flipping from either page lands on the other page's first row.
+        assert_eq!(root_other_page_cursor(0), ROOT_PAGE_1_LEN);
+        assert_eq!(root_other_page_cursor(ROOT_PAGE_1_LEN), 0);
     }
 
     fn root_menu_app(cursor: usize) -> App {
@@ -1290,19 +1248,19 @@ mod tests {
         app
     }
 
-    fn pane_title(app: &mut App, pane: Pane) -> String {
+    fn title_text(app: &mut App) -> String {
         let mut q = app.world_mut().query::<(&MainMenuTitle, &Text)>();
         q.iter(app.world())
-            .find(|(t, _)| t.pane == pane)
             .map(|(_, text)| text.0.clone())
-            .expect("pane title exists")
+            .next()
+            .expect("title exists")
     }
 
-    fn pane_rows(app: &mut App, pane: Pane) -> Vec<(usize, String)> {
+    fn visible_rows(app: &mut App) -> Vec<(usize, String)> {
         let mut q = app.world_mut().query::<(&MainMenuRow, &Text, &Node)>();
         let mut rows: Vec<(usize, String)> = q
             .iter(app.world())
-            .filter(|(row, _, node)| row.pane == pane && node.display != Display::None)
+            .filter(|(_, _, node)| node.display != Display::None)
             .map(|(row, text, _)| (row.slot, text.0.clone()))
             .collect();
         rows.sort_by_key(|(slot, _)| *slot);
@@ -1310,37 +1268,29 @@ mod tests {
     }
 
     #[test]
-    fn root_right_pane_previews_the_highlighted_left_category() {
-        let graphics_idx = ROOT_ENTRIES.iter().position(|e| *e == "Graphics").unwrap();
-        let status_idx = ROOT_ENTRIES.iter().position(|e| *e == "Status").unwrap();
-
-        let mut app = root_menu_app(graphics_idx);
-        // Left column = Root command list; its highlighted row wears the gold caret.
-        assert_eq!(pane_title(&mut app, Pane::Left), menu_title(MenuKind::Root));
-        let left = pane_rows(&mut app, Pane::Left);
-        assert_eq!(left[graphics_idx], (graphics_idx, "> Graphics".to_string()));
-        // Right column previews the highlighted category's submenu.
-        assert_eq!(
-            pane_title(&mut app, Pane::Right),
-            menu_title(MenuKind::Graphics)
-        );
-        let right = pane_rows(&mut app, Pane::Right);
+    fn single_pane_shows_only_the_cursors_root_page() {
+        // Cursor on page 1 (Status at index 0): only page-1 entries render, and
+        // the title carries the ‹1/2› marker.
+        let mut app = root_menu_app(0);
+        assert!(title_text(&mut app).contains("Commands"));
+        assert!(title_text(&mut app).contains("1/2"));
+        let rows = visible_rows(&mut app);
+        assert_eq!(rows.len(), ROOT_PAGE_1_LEN, "only page 1 rows: {rows:?}");
+        assert_eq!(rows[0].1, "> Status");
+        assert!(rows.iter().any(|(_, t)| t.contains("Map")));
         assert!(
-            right[0].1.contains("Preset"),
-            "right pane previews Graphics rows: {right:?}"
+            !rows.iter().any(|(_, t)| t.contains("Config")),
+            "page 2 entries stay hidden on page 1"
         );
 
-        // Move the left cursor to Status: the preview follows.
-        let mut app = root_menu_app(status_idx);
-        assert_eq!(
-            pane_title(&mut app, Pane::Right),
-            menu_title(MenuKind::Status)
-        );
-        let right = pane_rows(&mut app, Pane::Right);
-        assert!(
-            right.iter().any(|(_, t)| t.contains("Profile")),
-            "Status preview lists its categories: {right:?}"
-        );
+        // Cursor on page 2 (Config): only page-2 entries render, marker flips.
+        let config = ROOT_ENTRIES.iter().position(|e| *e == "Config").unwrap();
+        let mut app = root_menu_app(config);
+        assert!(title_text(&mut app).contains("2/2"));
+        let rows = visible_rows(&mut app);
+        assert_eq!(rows.len(), ROOT_ENTRIES.len() - ROOT_PAGE_1_LEN);
+        assert!(rows.iter().any(|(_, t)| t.contains("Config")));
+        assert!(!rows.iter().any(|(_, t)| t.contains("Status")));
     }
 
     #[test]
