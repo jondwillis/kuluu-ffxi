@@ -317,7 +317,7 @@ pub fn spawn_minimap_as_child(p: &mut ChildSpawnerCommands, images: &mut Assets<
             border: UiRect::all(Val::Px(1.0)),
             ..default()
         },
-        BackgroundColor(theme::FRAME_BG),
+        BackgroundColor(theme::MAP_BACKING),
         BorderColor::all(theme::FRAME_EDGE),
         bevy::ui::RelativeCursorPosition::default(),
     ))

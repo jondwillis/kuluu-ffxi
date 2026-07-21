@@ -161,7 +161,7 @@ fn spawn_map_column(root: &mut ChildSpawnerCommands, placeholder: Handle<Image>)
                 overflow: Overflow::clip(),
                 ..default()
             },
-            BackgroundColor(theme::FRAME_BG),
+            BackgroundColor(theme::MAP_BACKING),
         ))
         .with_children(|view| {
             view.spawn((

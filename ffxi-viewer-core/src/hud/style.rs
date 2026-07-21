@@ -18,6 +18,11 @@ pub mod theme {
     use bevy::prelude::Color;
 
     pub const FRAME_BG: Color = Color::srgba(0.05, 0.07, 0.16, 0.88);
+    // Opaque FRAME_BG for map surfaces only: a translucent backing behind the
+    // minimap/map image shimmers where the map texture is transparent, because
+    // the alpha composites over the live moving 3D scene as the player walks
+    // (kuluu-bi1s.1). Opaque backing = static fill, no edge flash.
+    pub const MAP_BACKING: Color = Color::srgb(0.05, 0.07, 0.16);
     pub const FRAME_EDGE: Color = Color::srgb(0.60, 0.69, 0.85);
     pub const TITLE: Color = Color::srgb(0.80, 0.89, 1.0);
     pub const TEXT: Color = Color::srgb(0.91, 0.92, 0.95);
