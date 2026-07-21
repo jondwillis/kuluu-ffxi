@@ -260,6 +260,7 @@ pub fn handle_input_system(
     if !matches!(*mode, InputMode::Chat(_))
         && bindings.just_pressed(Action::ToggleFirstPerson, &keys)
     {
+        chase.yaw = ffxi_viewer_core::yaw_for_heading(state.snapshot.self_pos.heading);
         camera_transition.begin(**camera_mode, chase.distance);
         cursor_lock.locked = false;
     }
@@ -524,7 +525,10 @@ pub fn dispatch_movement_system(
     // Default to stopped so every early return below reports no movement.
     **move_intent = ffxi_viewer_core::combat_stance::SelfMoveIntent::default();
 
-    if matches!(*mode, InputMode::Chat(_) | InputMode::Dialog(_)) {
+    if matches!(
+        *mode,
+        InputMode::Chat(_) | InputMode::Dialog(_) | InputMode::DeliveryBox
+    ) {
         autorun.phantom_forward = false;
         autorun.strafe_held_since = None;
         return;
