@@ -107,6 +107,7 @@ pub fn reset_interaction_flags_on_zone_change(
     mut lock_on: ResMut<LockOn>,
     mut target: ResMut<Target>,
     mut rest: ResMut<ffxi_viewer_core::combat_stance::RestStance>,
+    mut chase: ResMut<ChaseCamera>,
 ) {
     let zone = state.snapshot.zone_id;
     let changed = matches!(*prev_zone, Some(p) if p != zone);
@@ -118,6 +119,9 @@ pub fn reset_interaction_flags_on_zone_change(
     lock_on.target_id = None;
     target.id = None;
     *rest = ffxi_viewer_core::combat_stance::RestStance::default();
+    // Swing the camera behind the character's new facing on every zone-in,
+    // in both chase and first person (retail resets the view to look ahead).
+    chase.yaw = ffxi_viewer_core::yaw_for_heading(state.snapshot.self_pos.heading);
 }
 
 pub fn advance_heading_turn(
