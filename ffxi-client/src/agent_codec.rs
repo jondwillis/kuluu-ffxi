@@ -13,6 +13,7 @@ pub async fn run<R, W>(
     cmd_tx: mpsc::Sender<AgentCommand>,
     event_rx: broadcast::Receiver<AgentEvent>,
     pause: Option<Arc<AtomicBool>>,
+    debug_ctrl: Option<crate::debug_control::SharedDebugControl>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -21,10 +22,40 @@ where
     let writer = Arc::new(Mutex::new(writer));
     let writer_for_reader = Arc::clone(&writer);
     tokio::try_join!(
-        read_commands(reader, cmd_tx, writer_for_reader, pause),
+        read_commands(reader, cmd_tx, writer_for_reader, pause, debug_ctrl),
         write_events(event_rx, writer),
     )?;
     Ok(())
+}
+
+// Focus-less GUI driving (kuluu-0pof): these route to the Bevy input path via
+// the shared handle, never to the session. Returns true if consumed here.
+fn apply_debug_command(
+    cmd: &AgentCommand,
+    debug_ctrl: &Option<crate::debug_control::SharedDebugControl>,
+) -> bool {
+    let Some(ctrl) = debug_ctrl.as_ref() else {
+        return false;
+    };
+    match cmd {
+        AgentCommand::DebugDrive {
+            forward,
+            strafe,
+            duration_ms,
+        } => {
+            if let Ok(mut c) = ctrl.lock() {
+                c.set_drive(*forward, *strafe, *duration_ms);
+            }
+            true
+        }
+        AgentCommand::DebugHeights => {
+            if let Ok(mut c) = ctrl.lock() {
+                c.request_heights();
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 async fn read_commands<R, W>(
@@ -32,6 +63,7 @@ async fn read_commands<R, W>(
     cmd_tx: mpsc::Sender<AgentCommand>,
     writer: Arc<Mutex<W>>,
     pause: Option<Arc<AtomicBool>>,
+    debug_ctrl: Option<crate::debug_control::SharedDebugControl>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -45,6 +77,9 @@ where
         }
         match serde_json::from_str::<AgentCommand>(trimmed) {
             Ok(cmd) => {
+                if apply_debug_command(&cmd, &debug_ctrl) {
+                    continue;
+                }
                 if let Some(flag) = pause.as_ref() {
                     if flag.load(Ordering::Acquire) {
                         tracing::debug!(?cmd, "agent paused — dropping command");

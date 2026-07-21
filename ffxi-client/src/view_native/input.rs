@@ -18,6 +18,8 @@ pub struct MoveEnvParams<'w> {
     pub navmesh: Res<'w, super::navmesh_overlay::NavmeshState>,
     pub minimap_hover: Res<'w, ffxi_viewer_core::minimap::input::MinimapHoverGate>,
     pub pointer: Res<'w, ffxi_viewer_core::MousePointer>,
+    // Focus-less GUI driving (kuluu-0pof): remote movement injection.
+    pub debug_ctrl: Option<Res<'w, super::DebugControlHandle>>,
 }
 
 #[derive(SystemParam)]
@@ -653,6 +655,17 @@ pub fn dispatch_movement_system(
     );
     let mut forward = resolved.forward;
     let mut strafe = resolved.strafe;
+    // Focus-less GUI driving (kuluu-0pof): a socket `debug_drive` overrides the
+    // key-derived axes, so a remote driver walks the real input path (heading,
+    // wall-slide, re-ground) exactly as WASD would.
+    if let Some(handle) = env.debug_ctrl.as_ref() {
+        if let Ok(ctrl) = handle.0.lock() {
+            if let Some((f, s)) = ctrl.active_drive(std::time::Instant::now()) {
+                forward = f;
+                strafe = s;
+            }
+        }
+    }
     // In chase mode steer is always a camera-relative run component (solo A/D
     // runs sideways); only first person keeps the arrow-turn pivot.
     // In first person A/D rotate the view like Q/E, at the same snappy rate.

@@ -195,6 +195,11 @@ pub(crate) struct DatRootRes(pub Option<std::sync::Arc<ffxi_dat::DatRoot>>);
 #[derive(Resource, Clone)]
 pub(crate) struct AgentPaused(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
 
+/// Focus-less GUI driving (kuluu-0pof): shared with the agent socket decoder so
+/// remote `debug_drive`/`debug_heights` commands reach the Bevy input path.
+#[derive(Resource, Clone)]
+pub(crate) struct DebugControlHandle(pub ffxi_client::debug_control::SharedDebugControl);
+
 pub struct NativeRunArgs {
     pub server: String,
     pub ports: SessionPorts,
@@ -611,7 +616,12 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.add_message::<debug_heights::DebugHeightsRequest>()
         .add_systems(
             Update,
-            debug_heights::process_debug_heights.run_if(in_state(AppPhase::InGame)),
+            (
+                debug_heights::trigger_debug_heights_from_socket,
+                debug_heights::process_debug_heights,
+            )
+                .chain()
+                .run_if(in_state(AppPhase::InGame)),
         );
 
     app.add_message::<screenshot::ScreenshotRequest>()
@@ -984,6 +994,12 @@ fn bridge_connecting(
     #[cfg(not(feature = "relay"))]
     let _ = relay;
 
+    // Focus-less GUI driving (kuluu-0pof): the socket writes movement/heights
+    // requests into this handle; GUI systems read it. Always present so input
+    // systems can depend on it even when no socket is listening.
+    let debug_ctrl = ffxi_client::debug_control::DebugControl::new_shared();
+    commands.insert_resource(DebugControlHandle(debug_ctrl.clone()));
+
     #[cfg(unix)]
     if let Some(arg) = agent.0.clone() {
         let listen = ffxi_client::agent_socket::resolve_listen(&arg);
@@ -993,12 +1009,14 @@ fn bridge_connecting(
 
         commands.insert_resource(crate::view_native::AgentPaused(pause.clone()));
         let pause_for_socket = pause;
+        let debug_ctrl_socket = debug_ctrl.clone();
         runtime.0.spawn(async move {
             if let Err(err) = ffxi_client::agent_socket::serve(
                 listen,
                 cmd_tx_agent,
                 event_tx_agent,
                 Some(pause_for_socket),
+                Some(debug_ctrl_socket),
             )
             .await
             {

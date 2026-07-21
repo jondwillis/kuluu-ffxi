@@ -51,6 +51,16 @@ struct PathToParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct WalkParams {
+    /// Forward axis: 1 = forward, -1 = backpedal, 0 = none.
+    forward: i32,
+    /// Strafe axis: 1 = right, -1 = left, 0 = none.
+    strafe: i32,
+    /// How long to hold the input, in milliseconds.
+    duration_ms: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct ChatParams {
     kind: u8,
     text: String,
@@ -237,6 +247,28 @@ impl FfxiServer {
             force: p.force,
         })
         .await
+    }
+
+    #[tool(
+        description = "Focus-less GUI driving: inject a WASD-equivalent movement input (forward/strafe in {-1,0,1}) for `duration_ms`, walking the real client input path (heading, wall-slide, re-ground) — unlike `path_to`/`move`, which route through the reactor/session and can't reproduce input-driven movement bugs. GUI session only."
+    )]
+    async fn walk(
+        &self,
+        Parameters(p): Parameters<WalkParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(AgentCommand::DebugDrive {
+            forward: p.forward,
+            strafe: p.strafe,
+            duration_ms: p.duration_ms,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Focus-less GUI driving: trigger the client's `/debug heights` grounding dump at the current position. Server/nav/mzb heights are written to the client log under target `debug_heights` (grep the client log; not returned here). GUI session only."
+    )]
+    async fn debug_heights(&self) -> Result<CallToolResult, McpError> {
+        self.send(AgentCommand::DebugHeights).await
     }
 
     #[tool(
@@ -873,6 +905,8 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         DeliveryBox { .. } => "delivery_box",
         DeliveryTake { .. } => "delivery_box",
         TextInput { .. } => "text_input",
+        DebugDrive { .. } => "debug_drive",
+        DebugHeights => "debug_heights",
     }
 }
 

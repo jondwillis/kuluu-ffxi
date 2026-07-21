@@ -1899,6 +1899,21 @@ pub enum AgentCommand {
 
     Snapshot,
 
+    /// Focus-less GUI driving (kuluu-0pof): hold a simulated movement input
+    /// (`forward`/`strafe` in {-1,0,1}) for `duration_ms`, fed through the same
+    /// `input.rs` path as WASD. Intercepted by the socket decoder, never
+    /// forwarded to the session.
+    DebugDrive {
+        forward: i32,
+        strafe: i32,
+        duration_ms: u64,
+    },
+
+    /// Focus-less GUI driving (kuluu-0pof): trigger the `/debug heights` grounding
+    /// dump; the numbers are logged (`target: "debug_heights"`) so they are
+    /// readable without a screenshot. Intercepted by the socket decoder.
+    DebugHeights,
+
     Chat {
         kind: u8,
         text: String,

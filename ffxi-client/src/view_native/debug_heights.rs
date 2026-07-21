@@ -10,6 +10,26 @@ use super::navmesh_overlay::NavmeshState;
 #[derive(Message, Debug, Clone, Copy)]
 pub struct DebugHeightsRequest;
 
+/// Focus-less GUI driving (kuluu-0pof): a socket `debug_heights` command bumps
+/// the shared handle's seq; fire the request when it changes.
+pub fn trigger_debug_heights_from_socket(
+    handle: Option<Res<super::DebugControlHandle>>,
+    mut last_seq: Local<u64>,
+    mut requests: MessageWriter<DebugHeightsRequest>,
+) {
+    let Some(handle) = handle else {
+        return;
+    };
+    let Ok(ctrl) = handle.0.lock() else {
+        return;
+    };
+    let seq = ctrl.heights_seq();
+    if seq != *last_seq {
+        *last_seq = seq;
+        requests.write(DebugHeightsRequest);
+    }
+}
+
 pub fn process_debug_heights(
     mut events: MessageReader<DebugHeightsRequest>,
     nav: Res<NavmeshState>,
@@ -85,6 +105,17 @@ pub fn process_debug_heights(
             ),
             None => "  baked actor: <not loaded yet — capsule placeholder>".to_string(),
         };
+
+        // Focus-less GUI driving (kuluu-0pof): mirror the grounding numbers to the
+        // log so a socket-triggered `debug_heights` is readable without a screenshot.
+        tracing::info!(
+            target: "debug_heights",
+            server_x = server_pos.x, server_y = server_pos.y, server_z = server_pos.z,
+            player_bevy_y = player_t.translation.y,
+            mzb_floor_bevy_y = mzb_h_bevy,
+            nav_bevy_y = nav_h_bevy,
+            "debug heights (server z=height; bevy y=-z)"
+        );
 
         push(&mut toasts, server_line);
         push(&mut toasts, player_line);

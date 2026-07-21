@@ -357,9 +357,14 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                 let sock_cmd_tx = cmd_tx.clone();
                 let sock_event_tx = event_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(err) =
-                        ffxi_client::agent_socket::serve(listen, sock_cmd_tx, sock_event_tx, None)
-                            .await
+                    if let Err(err) = ffxi_client::agent_socket::serve(
+                        listen,
+                        sock_cmd_tx,
+                        sock_event_tx,
+                        None,
+                        None,
+                    )
+                    .await
                     {
                         tracing::warn!(error = %err, "agent socket listener exited");
                     }

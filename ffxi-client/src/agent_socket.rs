@@ -37,6 +37,7 @@ pub async fn serve(
     cmd_tx: mpsc::Sender<AgentCommand>,
     event_tx: broadcast::Sender<AgentEvent>,
     pause: Option<Arc<AtomicBool>>,
+    debug_ctrl: Option<crate::debug_control::SharedDebugControl>,
 ) -> Result<()> {
     let ResolvedListen { sock, pidfile } = listen;
 
@@ -91,8 +92,11 @@ pub async fn serve(
         let cmd_tx = cmd_tx.clone();
         let event_rx = event_tx.subscribe();
         let pause = pause.clone();
+        let debug_ctrl = debug_ctrl.clone();
 
-        if let Err(err) = agent_codec::run(reader, writer, cmd_tx, event_rx, pause).await {
+        if let Err(err) =
+            agent_codec::run(reader, writer, cmd_tx, event_rx, pause, debug_ctrl).await
+        {
             tracing::debug!(error = %err, "agent socket peer ended with error");
         } else {
             tracing::info!("agent socket peer disconnected");
