@@ -1632,6 +1632,16 @@ fn datagram_header_id(next_sub_sync: u16) -> u16 {
     next_sub_sync.wrapping_sub(1)
 }
 
+/// Reactor-local model of the self player's in-flight action (see
+/// `keepalive_loop`). `has_bar` is true only for spells, which get a cast bar;
+/// instant JA/WS/ranged set only the `lock_until` re-issue gate.
+struct CastInFlight {
+    started_at: std::time::Instant,
+    lock_until: std::time::Instant,
+    total_ms: u32,
+    has_bar: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn keepalive_loop(
     map: &mut MapClient,
@@ -1752,6 +1762,21 @@ async fn keepalive_loop(
     let mut last_rubber_band_step: std::time::Instant = std::time::Instant::now();
 
     let mut self_in_mog_house = false;
+
+    // In-flight self action: gates re-issuing another action until `lock_until`,
+    // and (for spells) drives the cast bar via Self Cast* events. Optimistic on
+    // send; cleared by the timer, by movement (spell interrupt), or on a fresh
+    // action. See ActionKind::{cast_bar, action_lock_ms}.
+    let mut cast_in_flight: Option<CastInFlight> = None;
+
+    // Per-spell recast expiry, tracked entirely client-side: LSB's 0x119 sends
+    // ability recasts only (RECAST_ABILITY), never magic, so the client owns
+    // spell-recast timing from the scraped base recastTime — as retail's client
+    // does. (Base recast doesn't model recast-down gear, so this can over-block
+    // a hasted caster; refine when recast-down is modeled.)
+    let mut spell_recast_until: std::collections::HashMap<u16, std::time::Instant> =
+        std::collections::HashMap::new();
+
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
@@ -1761,8 +1786,23 @@ async fn keepalive_loop(
                 match cmd {
                     None => break,
                     Some(AgentCommand::Move { x, y, z, heading }) => {
+                        // Translation (not a turn-in-place) interrupts a spell in
+                        // flight — retail cancels the cast when the caster moves.
+                        // Instant JA/WS/ranged locks are unaffected.
+                        let moved = (x - self_pos.pos.x).abs() > f32::EPSILON
+                            || (y - self_pos.pos.y).abs() > f32::EPSILON
+                            || (z - self_pos.pos.z).abs() > f32::EPSILON;
                         self_pos = Position { pos: Vec3 { x, y, z }, heading, ..self_pos };
                         let _ = event_tx.send(AgentEvent::PositionChanged { pos: self_pos });
+                        if moved {
+                            if let Some(c) = &cast_in_flight {
+                                if c.has_bar {
+                                    let _ = event_tx
+                                        .send(AgentEvent::SelfCastEnded { interrupted: true });
+                                    cast_in_flight = None;
+                                }
+                            }
+                        }
                     }
                      Some(AgentCommand::StopMove) => {  }
                      Some(AgentCommand::SetFps { max }) => {
@@ -2073,6 +2113,49 @@ async fn keepalive_loop(
                             }
                             continue;
                         }
+                        // Reject a fresh action while the previous one is still
+                        // locked in (retail refuses the cast/ability rather than
+                        // queueing it). Non-locking actions (Attack/Talk/…) pass.
+                        if kind.action_lock_ms().is_some() {
+                            if let Some(c) = &cast_in_flight {
+                                if std::time::Instant::now() < c.lock_until {
+                                    let text = if matches!(
+                                        kind,
+                                        crate::state::ActionKind::CastMagic { .. }
+                                    ) {
+                                        "Unable to cast spells at this time."
+                                    } else {
+                                        "You must wait longer to perform that action."
+                                    };
+                                    let _ = event_tx.send(AgentEvent::ChatLine {
+                                        line: ChatLine {
+                                            channel: ChatChannel::System,
+                                            sender: "<client>".into(),
+                                            text: text.into(),
+                                            server_ts: 0,
+                                        },
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                        // Reject a spell still on its client-tracked recast (LSB
+                        // never sends magic recasts, so the client owns the timer).
+                        if let crate::state::ActionKind::CastMagic { spell_id, .. } = &kind {
+                            if let Some(&until) = spell_recast_until.get(&(*spell_id as u16)) {
+                                if std::time::Instant::now() < until {
+                                    let _ = event_tx.send(AgentEvent::ChatLine {
+                                        line: ChatLine {
+                                            channel: ChatChannel::System,
+                                            sender: "<client>".into(),
+                                            text: "Unable to cast spells at this time.".into(),
+                                            server_ts: 0,
+                                        },
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
                         self_face_target = face_target_for(target_index, self_act_index);
                         let payload =
                             build_subpacket_action(sub_seq, target_id, target_index, &kind);
@@ -2085,6 +2168,43 @@ async fn keepalive_loop(
                             let _ = event_tx.send(AgentEvent::Error {
                                 message: format!("action send: {e}"),
                             });
+                        } else {
+                            let now = std::time::Instant::now();
+                            // Start the client-side recast clock for a spell.
+                            if let crate::state::ActionKind::CastMagic { spell_id, .. } = &kind {
+                                if let Some(rms) = ffxi_proto::cast_time::spell_recast_time_ms(
+                                    *spell_id as u16,
+                                ) {
+                                    if rms > 0 {
+                                        spell_recast_until.insert(
+                                            *spell_id as u16,
+                                            now + std::time::Duration::from_millis(u64::from(rms)),
+                                        );
+                                    }
+                                }
+                            }
+                            // Optimistically arm the cast lock/bar; the reactor
+                            // tick advances and clears it (movement interrupts a
+                            // spell in the Move arm).
+                            if let Some(lock_ms) = kind.action_lock_ms() {
+                                let (has_bar, total_ms) = match kind.cast_bar() {
+                                    Some((name, total)) => {
+                                        let _ = event_tx.send(AgentEvent::SelfCastStarted {
+                                            name,
+                                            total_ms: total,
+                                        });
+                                        (true, total)
+                                    }
+                                    None => (false, 0),
+                                };
+                                cast_in_flight = Some(CastInFlight {
+                                    started_at: now,
+                                    lock_until: now
+                                        + std::time::Duration::from_millis(u64::from(lock_ms)),
+                                    total_ms,
+                                    has_bar,
+                                });
+                            }
                         }
                     }
                     Some(AgentCommand::Emote {
@@ -2682,6 +2802,24 @@ async fn keepalive_loop(
                 }
             }
             _ = tick.tick() => {
+
+                // Advance the cast bar and clear the action lock when it expires.
+                if let Some(c) = &cast_in_flight {
+                    let now = std::time::Instant::now();
+                    if c.has_bar {
+                        let elapsed = c.started_at.elapsed().as_millis() as u32;
+                        let _ = event_tx.send(AgentEvent::SelfCastProgress {
+                            elapsed_ms: elapsed.min(c.total_ms),
+                        });
+                    }
+                    if now >= c.lock_until {
+                        if c.has_bar {
+                            let _ = event_tx
+                                .send(AgentEvent::SelfCastEnded { interrupted: false });
+                        }
+                        cast_in_flight = None;
+                    }
+                }
 
                 {
                     let (total_sent, total_recv) = map.traffic_totals();

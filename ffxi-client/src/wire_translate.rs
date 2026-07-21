@@ -71,6 +71,13 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
             }),
         }),
 
+        self_casting: s.self_casting.as_ref().map(|c| wire::SelfCasting {
+            name: c.name.clone(),
+            elapsed_ms: c.elapsed_ms,
+            total_ms: c.total_ms,
+            interrupted: c.interrupted,
+        }),
+
         myroom: s.myroom.map(|m| wire::MyRoom {
             model: m.model,
             sub_map: m.sub_map,

@@ -21,6 +21,12 @@ enhanced-water = ["dep:bevy_water"]
 # status-effect name table.
 enhanced-buff-tooltips = []
 
+# Enhanced (non-retail) spell cast bar: an addon-style filling progress bar
+# shown while the player casts. Retail's classic client has no built-in cast
+# bar (players get one via Windower/Ashita); this reproduces it from the
+# scraped spell castTime.
+enhanced-cast-bar = []
+
 # Bevy ECS plugins, world model, camera, and HUD shared by both the native
 # windowed viewer (ffxi-client/src/view_native/) and the browser viewer
 # (ffxi-viewer-wasm/). No tokio, no I/O — state arrives through the

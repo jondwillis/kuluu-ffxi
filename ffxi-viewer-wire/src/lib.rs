@@ -431,6 +431,12 @@ pub struct SceneSnapshot {
     #[serde(default)]
     pub self_fishing: Option<SelfFishing>,
 
+    /// Self casting/action state, present while an issued spell/ability is in
+    /// flight. Drives the Enhanced cast bar. Optimistic on send, reconciled by
+    /// the server's BATTLE2 start/finish/interrupt.
+    #[serde(default)]
+    pub self_casting: Option<SelfCasting>,
+
     /// `Some` while the server has the player inside a Mog House (same zone_id as
     /// the surrounding city); the renderer must re-key zone resources on it.
     #[serde(default)]
@@ -553,6 +559,21 @@ pub struct MyRoom {
 pub struct FishingArrow {
     pub left: bool,
     pub golden: bool,
+}
+
+/// Self casting/action view for the renderer/HUD cast bar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfCasting {
+    /// Display name of the spell/ability being performed (already resolved).
+    pub name: String,
+    /// Milliseconds elapsed since the action started.
+    pub elapsed_ms: u32,
+    /// Total expected duration in milliseconds (spell castTime, or the JA/WS/RA
+    /// animation lock). The bar fill fraction is `elapsed_ms / total_ms`.
+    pub total_ms: u32,
+    /// Set once the action was interrupted (moved mid-cast, paralyzed, …); the
+    /// bar flashes then clears.
+    pub interrupted: bool,
 }
 
 /// Self fishing view for the renderer/HUD.
@@ -1086,6 +1107,7 @@ mod tests {
             bazaar: Vec::new(),
             play_time_s: 0,
             self_fishing: None,
+            self_casting: None,
             myroom: Some(MyRoom {
                 model: 257,
                 sub_map: 0,

@@ -388,6 +388,12 @@ pub struct SessionState {
     #[serde(default)]
     pub self_fishing: Option<SelfFishing>,
 
+    /// Projection of the reactor's in-flight cast/action for the Enhanced cast
+    /// bar. The reactor's `CastInFlight` is the authoritative owner; this is the
+    /// serializable view it republishes each tick (mirrors `self_fishing`).
+    #[serde(default)]
+    pub self_casting: Option<SelfCasting>,
+
     #[serde(default)]
     pub myroom: Option<MyRoomInfo>,
 
@@ -972,6 +978,7 @@ impl SessionState {
 
                 self.current_weather = None;
                 self.check_result = None;
+                self.self_casting = None;
 
                 // Wide-scan is per-zone (server rebuilds it from the new zone's
                 // entities); drop stale entries/track on any zone change or
@@ -1596,6 +1603,33 @@ impl SessionState {
                 self.widescan.tracked = *tracked;
                 changed
             }
+            AgentEvent::SelfCastStarted { name, total_ms } => {
+                self.self_casting = Some(SelfCasting {
+                    name: name.clone(),
+                    elapsed_ms: 0,
+                    total_ms: *total_ms,
+                    interrupted: false,
+                });
+                true
+            }
+            AgentEvent::SelfCastProgress { elapsed_ms } => {
+                let mut changed = false;
+                if let Some(c) = self.self_casting.as_mut() {
+                    changed = c.elapsed_ms != *elapsed_ms;
+                    c.elapsed_ms = *elapsed_ms;
+                }
+                changed
+            }
+            AgentEvent::SelfCastEnded { interrupted } => {
+                let changed = self.self_casting.is_some();
+                if *interrupted {
+                    if let Some(c) = self.self_casting.as_mut() {
+                        c.interrupted = true;
+                    }
+                }
+                self.self_casting = None;
+                changed
+            }
         }
     }
 }
@@ -1713,6 +1747,24 @@ pub enum AgentEvent {
         actor_id: u32,
         action_id: u32,
         action_kind: u8,
+    },
+
+    /// The self player began casting a spell (optimistic, on send). Drives the
+    /// Enhanced cast bar. Only emitted for spells with a non-zero cast time.
+    SelfCastStarted {
+        name: String,
+        total_ms: u32,
+    },
+
+    /// Per-tick cast-bar progress while a spell is in flight.
+    SelfCastProgress {
+        elapsed_ms: u32,
+    },
+
+    /// The self cast resolved (`interrupted` = false) or was interrupted
+    /// (moved/paralyzed/rejected). Clears the cast bar.
+    SelfCastEnded {
+        interrupted: bool,
     },
 
     /// s2c 0x05A MOTIONMES: an entity performed an emote. `emote_id` is the
@@ -2435,6 +2487,22 @@ pub struct SelfFishing {
     pub arrow: Option<FishingArrow>,
 }
 
+/// The self player's in-flight cast/action, as a serializable view for the cast
+/// bar. `None` when idle. The reactor's `CastInFlight` machine owns the truth
+/// and republishes this each tick with a freshly-computed `elapsed_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfCasting {
+    /// Resolved display name of the spell/ability being performed.
+    pub name: String,
+    /// Milliseconds elapsed since the action started (reactor-computed).
+    pub elapsed_ms: u32,
+    /// Total expected duration (spell castTime, or JA/WS/RA animation lock).
+    pub total_ms: u32,
+    /// Set once interrupted (moved mid-cast, paralyzed, server reject); the bar
+    /// flashes then clears.
+    pub interrupted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActionKind {
@@ -2570,7 +2638,49 @@ impl ActionKind {
             _ => {}
         }
     }
+
+    /// Cast-bar plan for this action: the resolved spell name and its server
+    /// cast time (ms), present only for spells with a non-zero cast time. Instant
+    /// spells and non-spell actions have no cast bar (retail shows a bar only
+    /// while a spell winds up).
+    pub fn cast_bar(&self) -> Option<(String, u32)> {
+        match self {
+            ActionKind::CastMagic { spell_id, .. } => {
+                let ms = ffxi_proto::cast_time::spell_cast_time_ms(*spell_id as u16)?;
+                if ms == 0 {
+                    return None;
+                }
+                let name = ffxi_proto::spell_names::lookup(*spell_id as u16)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("spell #{spell_id}"));
+                Some((name, u32::from(ms)))
+            }
+            _ => None,
+        }
+    }
+
+    /// How long the reactor should refuse a new action after issuing this one:
+    /// a spell's cast time, or the fixed animation lock for instant JA/WS/ranged.
+    /// `None` for actions that impose no lock (movement/menu/etc).
+    pub fn action_lock_ms(&self) -> Option<u32> {
+        match self {
+            ActionKind::CastMagic { spell_id, .. } => {
+                ffxi_proto::cast_time::spell_cast_time_ms(*spell_id as u16)
+                    .filter(|ms| *ms > 0)
+                    .map(u32::from)
+            }
+            ActionKind::JobAbility { .. } | ActionKind::Weaponskill { .. } | ActionKind::Shoot => {
+                Some(INSTANT_ACTION_LOCK_MS)
+            }
+            _ => None,
+        }
+    }
 }
+
+/// Client-side animation lock for instant actions (job abilities, weapon skills,
+/// ranged attack): retail plays a short action animation during which the next
+/// command is ignored. A feel tuning the LSB data doesn't expose as one value.
+pub const INSTANT_ACTION_LOCK_MS: u32 = 1000;
 
 #[cfg(test)]
 mod tests {

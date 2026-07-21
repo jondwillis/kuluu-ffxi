@@ -1,4 +1,6 @@
 pub mod action_model;
+#[cfg(feature = "enhanced-cast-bar")]
+pub mod cast_bar;
 pub mod chat_input;
 pub mod chat_panel;
 pub mod check_view;
@@ -295,6 +297,8 @@ impl Plugin for HudPlugin {
         );
         #[cfg(feature = "enhanced-buff-tooltips")]
         app.add_systems(Update, status_ribbon::tooltip::update_buff_tooltip);
+        #[cfg(feature = "enhanced-cast-bar")]
+        app.add_systems(Update, cast_bar::update_cast_bar);
 
         app.add_systems(Update, chat_panel::chat_tab_click_system);
         app.add_systems(Update, chat_panel::chat_auto_switch_click_system);
@@ -380,6 +384,9 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
 
     #[cfg(feature = "enhanced-buff-tooltips")]
     app.add_systems(schedule.clone(), status_ribbon::tooltip::spawn_buff_tooltip);
+
+    #[cfg(feature = "enhanced-cast-bar")]
+    app.add_systems(schedule.clone(), cast_bar::spawn_cast_bar);
 
     app.add_systems(
         schedule,
