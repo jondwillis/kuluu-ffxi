@@ -26,11 +26,13 @@ use crate::zone_texture::{decoded_texture_to_image, TextureQuality};
 // rather than being a second, opaque blend mesh fighting it.
 
 // The authored 0x0F canopy scale (research/xim ParticleGeneratorParser.kt) varies per
-// zone/weather and often leaves the canopy rim nearer than the terrain, so the cloud
-// sheet draped over zone geometry. Enforce a minimum rim radius (just inside
-// skybox::SKYBOX_RADIUS=5500) so terrain is always nearer and depth-occludes the
-// clouds — the same "sky is the farthest thing" rule the skybox dome relies on.
-const CLOUD_MIN_RIM: f32 = 4000.0;
+// zone/weather and often leaves the canopy rim nearer than the terrain, so the blended
+// (non-depth-writing) cloud sheet drapes over zone geometry farther out than the rim.
+// Push the rim to just inside the gradient sky dome so all terrain — which fits within
+// that dome — is nearer and depth-occludes the clouds (the "sky is the farthest thing"
+// rule). Derived from SKYBOX_RADIUS so this can't drift from the dome it must sit under.
+const CLOUD_RIM_MARGIN: f32 = 100.0;
+const CLOUD_MIN_RIM: f32 = crate::skybox::SKYBOX_RADIUS - CLOUD_RIM_MARGIN;
 
 // research/xim ParticleUpdaters.kt: TextureCoordinateUpdater velocities are per frame
 // of the retail/vanilla client, which runs at 30 fps.

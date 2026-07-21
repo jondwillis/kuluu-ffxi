@@ -7,7 +7,7 @@ use bevy::shader::ShaderRef;
 use crate::components::InGameEntity;
 use crate::weather::ZoneWeather;
 
-const SKYBOX_RADIUS: f32 = 5500.0;
+pub const SKYBOX_RADIUS: f32 = 5500.0;
 
 #[derive(Clone, Debug, ShaderType)]
 pub struct SkyboxUniform {
