@@ -105,6 +105,32 @@ pub enum DynamicMenuAction {
     },
 }
 
+impl DynamicMenuAction {
+    /// The item id a row acts on, for rows that carry one (item list, usable
+    /// list, per-item context, equip). Lets the item window resolve icon +
+    /// detail without matching each variant at every call site.
+    pub fn item_no(&self) -> Option<u16> {
+        match *self {
+            DynamicMenuAction::UseItem { item_no, .. }
+            | DynamicMenuAction::MoveItem { item_no, .. }
+            | DynamicMenuAction::OpenItemAction { item_no, .. }
+            | DynamicMenuAction::EquipItem { item_no, .. } => Some(item_no),
+            _ => None,
+        }
+    }
+}
+
+/// One item row's label: the name, suffixed " xN" only for a real stack. Shared
+/// by the inventory list and the usable-item list so partial stacks read the
+/// same wherever an item appears.
+pub fn item_qty_label(name: &str, quantity: u32) -> String {
+    if quantity > 1 {
+        format!("{name} x{quantity}")
+    } else {
+        name.to_string()
+    }
+}
+
 /// Unseen ("new") key-item indicator suffix. Retail shows a yellow-bubble
 /// glyph whose exact appearance is unverified (bead kuluu-h7x
 /// retail_unknowns); a text marker stands in until a retail capture.
@@ -443,12 +469,7 @@ pub fn refresh_dynamic_menu_rows(
             .iter()
             .filter_map(|slot| {
                 let name = ffxi_proto::item_names::lookup(slot.item_no)?;
-
-                let label = if slot.quantity > 1 {
-                    format!("{name} x{}", slot.quantity)
-                } else {
-                    name.to_string()
-                };
+                let label = item_qty_label(name, slot.quantity);
                 Some(DynamicMenuRow {
                     label,
                     action: DynamicMenuAction::OpenItemAction {
@@ -638,11 +659,7 @@ pub fn usable_item_rows(snap: &ffxi_viewer_wire::SceneSnapshot) -> Vec<DynamicMe
         .filter(|slot| item_usable_now(snap, slot))
         .filter_map(|slot| {
             let name = ffxi_proto::item_names::lookup(slot.item_no)?;
-            let label = if slot.quantity > 1 {
-                format!("{name} x{}", slot.quantity)
-            } else {
-                name.to_string()
-            };
+            let label = item_qty_label(name, slot.quantity);
             Some(DynamicMenuRow {
                 label,
                 action: DynamicMenuAction::UseItem {
@@ -804,8 +821,12 @@ pub fn update_main_menu(
     match active {
         // The Equipment screen (hud::equipment_screen) and the Items screen
         // (hud::item_screen) render their own framed multi-panel layouts for
-        // these kinds; suppress the generic text panel.
-        Some((MenuKind::Equipment | MenuKind::EquipSlot(_) | MenuKind::Items, _)) => {
+        // these kinds; suppress the generic text panel. UsableItems (the action
+        // ring's Items list) now rides the item_screen panel too.
+        Some((
+            MenuKind::Equipment | MenuKind::EquipSlot(_) | MenuKind::Items | MenuKind::UsableItems,
+            _,
+        )) => {
             if node.display != Display::None {
                 node.display = Display::None;
             }
@@ -1010,6 +1031,31 @@ pub fn debug_panel_state(label: &str, panels: &crate::hud::HudPanels, net_status
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn item_qty_label_suffixes_only_real_stacks() {
+        assert_eq!(item_qty_label("Bird Egg", 1), "Bird Egg");
+        assert_eq!(item_qty_label("Bird Egg", 0), "Bird Egg");
+        assert_eq!(item_qty_label("Bird Egg", 12), "Bird Egg x12");
+    }
+
+    #[test]
+    fn action_item_no_covers_item_bearing_variants() {
+        let use_it = DynamicMenuAction::UseItem {
+            container: 0,
+            index: 3,
+            item_no: 4096,
+        };
+        let open = DynamicMenuAction::OpenItemAction {
+            container: 0,
+            index: 3,
+            item_no: 4096,
+        };
+        assert_eq!(use_it.item_no(), Some(4096));
+        assert_eq!(open.item_no(), Some(4096));
+        assert_eq!(DynamicMenuAction::KeyItem { id: 5 }.item_no(), None);
+        assert_eq!(DynamicMenuAction::CastSpell { spell_id: 1 }.item_no(), None);
+    }
 
     fn mh_snapshot() -> ffxi_viewer_wire::SceneSnapshot {
         use ffxi_proto::map::container as c;

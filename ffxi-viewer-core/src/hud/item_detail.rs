@@ -323,13 +323,10 @@ pub(crate) fn selected_item_no(
         _ => return None,
     };
     let level = stack.current()?;
-    if !matches!(level.kind, MenuKind::Items) {
+    if !matches!(level.kind, MenuKind::Items | MenuKind::UsableItems) {
         return None;
     }
-    match dynamic.rows.get(level.cursor)?.action {
-        crate::hud::menu::DynamicMenuAction::OpenItemAction { item_no, .. } => Some(item_no),
-        _ => None,
-    }
+    dynamic.rows.get(level.cursor)?.action.item_no()
 }
 
 #[cfg(test)]

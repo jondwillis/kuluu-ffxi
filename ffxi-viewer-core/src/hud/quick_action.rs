@@ -110,11 +110,7 @@ pub fn update_quick_action(
                             node.display = Display::Flex;
                         }
                         let is_cursor = row.slot == cursor;
-                        let want = if is_cursor {
-                            format!("> {label}")
-                        } else {
-                            format!("  {label}")
-                        };
+                        let want = format!("{}{label}", style::cursor_prefix(is_cursor));
                         if **text != want {
                             **text = want;
                         }

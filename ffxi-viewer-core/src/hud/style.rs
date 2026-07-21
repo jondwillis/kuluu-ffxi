@@ -32,6 +32,17 @@ pub mod theme {
     pub const FAINT: Color = Color::srgb(0.44, 0.48, 0.58);
 }
 
+/// The row prefix marking the cursor in every list menu — "> " on the selected
+/// row, two spaces otherwise — so the items, main-menu, quick-action and
+/// target-action lists all indent identically.
+pub fn cursor_prefix(is_cursor: bool) -> &'static str {
+    if is_cursor {
+        "> "
+    } else {
+        "  "
+    }
+}
+
 pub fn text_font(size: f32) -> TextFont {
     TextFont {
         font_size: size.into(),

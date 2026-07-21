@@ -7,7 +7,9 @@ use bevy::prelude::*;
 use crate::hud::item_dat_root::{ItemDatRoot, ItemIconCache};
 use crate::hud::{item_detail, item_meta};
 
-pub use crate::hud::style::{text_font, theme, window_frame as framed_box, WINDOW_Z};
+pub use crate::hud::style::{
+    cursor_prefix, text_font, theme, window_frame as framed_box, WINDOW_Z,
+};
 
 pub fn transparent_placeholder(images: &mut Assets<Image>) -> Handle<Image> {
     use bevy::asset::RenderAssetUsages;

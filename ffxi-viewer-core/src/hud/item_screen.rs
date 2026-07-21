@@ -2,8 +2,8 @@ use bevy::prelude::*;
 
 use crate::hud::item_dat_root::{ItemDatRoot, ItemIconCache};
 use crate::hud::item_detail::{self, ItemMenuFocus, SortOptionId, SortOptions, SORT_OPTIONS};
-use crate::hud::item_ui::{self, framed_box, text_font, theme};
-use crate::hud::menu::{DynamicMenu, DynamicMenuAction, MenuRowActivated};
+use crate::hud::item_ui::{self, cursor_prefix, framed_box, text_font, theme};
+use crate::hud::menu::{DynamicMenu, MenuRowActivated};
 use crate::input_mode::{InputMode, MenuKind};
 use crate::snapshot::SceneState;
 
@@ -182,18 +182,40 @@ pub(crate) struct BagTab(usize);
 #[derive(Component, Clone, Copy)]
 pub(crate) struct BagTabText(usize);
 
+/// The sort-options box beside the list. Shown only in Inventory mode; the
+/// action-ring Usable list has no sort pane.
+#[derive(Component)]
+pub(crate) struct ItemSortBox;
+
+/// Which list the item window is showing. Inventory is the full main-menu bag
+/// browser (tabs + sort + per-item context on select); Usable is the action
+/// ring's cross-container "Items" list (no tabs, no sort, use-on-select).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ItemScreenMode {
+    Inventory,
+    Usable,
+}
+
+pub(crate) fn item_screen_mode(mode: &InputMode) -> Option<ItemScreenMode> {
+    let InputMode::Menu(stack) = mode else {
+        return None;
+    };
+    match stack.current()?.kind {
+        MenuKind::Items => Some(ItemScreenMode::Inventory),
+        MenuKind::UsableItems => Some(ItemScreenMode::Usable),
+        _ => None,
+    }
+}
+
 pub fn items_open(mode: &InputMode) -> bool {
-    matches!(mode, InputMode::Menu(stack)
-        if stack.current().is_some_and(|l| matches!(l.kind, MenuKind::Items)))
+    item_screen_mode(mode).is_some()
 }
 
 fn items_cursor(mode: &InputMode) -> usize {
     match mode {
-        InputMode::Menu(stack) => stack
-            .current()
-            .filter(|l| matches!(l.kind, MenuKind::Items))
-            .map(|l| l.cursor)
-            .unwrap_or(0),
+        InputMode::Menu(stack) if items_open(mode) => {
+            stack.current().map(|l| l.cursor).unwrap_or(0)
+        }
         _ => 0,
     }
 }
@@ -210,10 +232,7 @@ pub fn viewport_start(cursor: usize, total: usize) -> usize {
 }
 
 fn row_item_no(rows: &[crate::hud::menu::DynamicMenuRow], idx: usize) -> Option<u16> {
-    match rows.get(idx)?.action {
-        DynamicMenuAction::OpenItemAction { item_no, .. } => Some(item_no),
-        _ => None,
-    }
+    rows.get(idx)?.action.item_no()
 }
 
 pub(crate) fn spawn_item_screen(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
@@ -383,7 +402,7 @@ fn spawn_detail_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) 
 fn spawn_sort_box(root: &mut ChildSpawnerCommands) {
     let (mut n, bg, bd) = framed_box();
     n.width = Val::Px(SORT_WIDTH_PX);
-    root.spawn((n, bg, bd)).with_children(|p| {
+    root.spawn((ItemSortBox, n, bg, bd)).with_children(|p| {
         spawn_text(p, ItemRole::SortTitle, 13.0, theme::TITLE);
         for i in 0..SORT_OPTIONS.len() {
             p.spawn((
@@ -464,20 +483,47 @@ pub(crate) fn update_item_screen(
             Without<ItemListRow>,
         ),
     >,
+    mut sortbox_q: Query<
+        &mut Node,
+        (
+            With<ItemSortBox>,
+            Without<ItemWindowRoot>,
+            Without<ItemText>,
+            Without<ItemIcon>,
+            Without<ItemListRow>,
+        ),
+    >,
 ) {
-    let open = items_open(&mode);
+    let screen_mode = item_screen_mode(&mode);
+    let open = screen_mode.is_some();
     if let Ok(mut node) = root_q.single_mut() {
         let want = if open { Display::Flex } else { Display::None };
         if node.display != want {
             node.display = want;
         }
     }
-    if !open {
-        // Leaving the window drops sort focus so it reopens on the list.
+    // The sort pane belongs to the full inventory browser only; the action-ring
+    // Usable list hides it (and never takes sort focus).
+    let inventory = screen_mode == Some(ItemScreenMode::Inventory);
+    if let Ok(mut node) = sortbox_q.single_mut() {
+        let want = if inventory {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != want {
+            node.display = want;
+        }
+    }
+    if !open || !inventory {
+        // Leaving the window, or showing the Usable list, drops sort focus so
+        // the inventory browser reopens on the list.
         if focus.sort_focused() {
             focus.exit_sort();
         }
-        return;
+        if !open {
+            return;
+        }
     }
 
     let snap = &state.snapshot;
@@ -498,12 +544,18 @@ pub(crate) fn update_item_screen(
     let focused_item = item_detail::selected_item_no(&mode, &dynamic);
     let (detail_name, detail_rows) =
         item_ui::focus_detail(focused_item, snap, &dat_root, &mut icon_cache);
-    let bag_name = ffxi_proto::map::container::name(active_bag.0).unwrap_or("Items");
-    let (used, capacity) = snap
-        .container(active_bag.0)
-        .map(|c| (c.items.len(), c.capacity))
-        .unwrap_or((0, 0));
-    let header = format!("{bag_name}  {used}/{capacity}");
+    // The Usable list spans every container, so it has no single bag/capacity —
+    // it shows a plain "Items" header like retail's command-menu list.
+    let header = if inventory {
+        let bag_name = ffxi_proto::map::container::name(active_bag.0).unwrap_or("Items");
+        let (used, capacity) = snap
+            .container(active_bag.0)
+            .map(|c| (c.items.len(), c.capacity))
+            .unwrap_or((0, 0));
+        format!("{bag_name}  {used}/{capacity}")
+    } else {
+        "Items".to_string()
+    };
     // Sort-pane hint follows whatever key SelectActiveWindow (FFXI's window-change
     // key) is currently bound to, rather than a hard-coded key name.
     let sort_title = match bindings.key_label(crate::keybinds::Action::SelectActiveWindow) {
@@ -614,13 +666,16 @@ fn role_value(
             match rows.get(list_idx) {
                 Some(entry) => {
                     let is_cursor = list_idx == cursor;
-                    let prefix = if is_cursor { "> " } else { "  " };
                     let color = if is_cursor {
                         theme::CURSOR
                     } else {
                         theme::TEXT
                     };
-                    (format!("{prefix}{}", entry.label), color, true)
+                    (
+                        format!("{}{}", cursor_prefix(is_cursor), entry.label),
+                        color,
+                        true,
+                    )
                 }
                 None => (String::new(), theme::TEXT, false),
             }
@@ -667,7 +722,7 @@ pub(crate) fn item_row_mouse_hover_system(
     let Some(level) = stack.current_mut() else {
         return;
     };
-    if !matches!(level.kind, MenuKind::Items) {
+    if !matches!(level.kind, MenuKind::Items | MenuKind::UsableItems) {
         return;
     }
     let total = dynamic.rows.len();
@@ -702,7 +757,7 @@ pub(crate) fn item_row_mouse_click_system(
     let Some(level) = stack.current() else {
         return;
     };
-    if !matches!(level.kind, MenuKind::Items) {
+    if !matches!(level.kind, MenuKind::Items | MenuKind::UsableItems) {
         return;
     }
     let total = dynamic.rows.len();
@@ -732,8 +787,11 @@ pub(crate) fn update_bag_tabs(
     if !items_open(&mode) {
         return;
     }
+    // Bag tabs belong to the full inventory browser; the action-ring Usable list
+    // is a flat cross-container list with no bags to flip.
+    let inventory = item_screen_mode(&mode) == Some(ItemScreenMode::Inventory);
     let bags = accessible_containers(&state.snapshot);
-    let strip_visible = bags.len() > 1;
+    let strip_visible = inventory && bags.len() > 1;
     if let Ok(mut node) = strip_q.single_mut() {
         let want = if strip_visible {
             Display::Flex

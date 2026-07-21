@@ -193,7 +193,7 @@ pub fn update_target_action_menu(
                 }
             } else if let Some(leaf) = rows.get(row.slot) {
                 let is_cursor = row.slot == sub_cursor;
-                let caret = if is_cursor { "> " } else { "  " };
+                let caret = style::cursor_prefix(is_cursor);
                 let now = vana_clock.earth_unix_secs_now() as u32;
                 match recast_remaining(&scene.snapshot.ability_recasts, &leaf.action, now) {
                     Some(remaining) => (
@@ -239,7 +239,7 @@ pub fn update_target_action_menu(
                     node.display = Display::Flex;
                 }
                 let is_cursor = row.slot == cursor && sub_active.is_none();
-                let caret = if is_cursor { "> " } else { "  " };
+                let caret = style::cursor_prefix(is_cursor);
                 let want = format!("{caret}{}", entry_text(entry));
                 if **text != want {
                     **text = want;
