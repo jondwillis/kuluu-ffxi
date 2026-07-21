@@ -3,6 +3,7 @@ pub mod camera_collision;
 pub mod collision_bvh;
 pub mod debug_heights;
 pub mod exit_watchdog;
+mod gamepad_input;
 pub mod input;
 pub mod key_items;
 pub mod launcher_backdrop;
@@ -258,6 +259,9 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             title: format!("ffxi-client — {server}"),
             resolution: resolution.into(),
             mode: window_mode,
+            // Lets gamescope surface the Steam Deck's on-screen keyboard when a
+            // text field gains focus (off by default, so it never appeared).
+            ime_enabled: true,
             ..default()
         }),
         ..default()
@@ -542,6 +546,30 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.init_resource::<input::TabCycleStack>();
     app.init_resource::<input::SelectTargetMode>();
     app.init_resource::<key_items::KeyItemsViewed>();
+
+    app.init_resource::<gamepad_input::GamepadAxisHeld>();
+    app.init_resource::<gamepad_input::PrimaryGamepad>();
+    app.add_systems(
+        PreUpdate,
+        gamepad_input::track_primary_gamepad_system.before(bevy::input::InputSystems),
+    );
+    app.add_systems(
+        Update,
+        gamepad_input::gamepad_launcher_nav_system.run_if(in_state(AppPhase::Launcher)),
+    );
+    // bevy::input::keyboard::keyboard_input_system::clear() must run first.
+    app.add_systems(
+        PreUpdate,
+        gamepad_input::gamepad_movement_camera_system
+            .after(bevy::input::InputSystems)
+            .run_if(in_state(AppPhase::InGame)),
+    );
+    app.add_systems(
+        PreUpdate,
+        gamepad_input::gamepad_ingame_action_system
+            .after(bevy::input::InputSystems)
+            .run_if(in_state(AppPhase::InGame)),
+    );
 
     app.add_systems(
         Update,
