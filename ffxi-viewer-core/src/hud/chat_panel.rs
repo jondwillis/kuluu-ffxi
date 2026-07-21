@@ -10,7 +10,14 @@ use crate::snapshot::{rendered_chat, SceneState};
 
 pub const VISIBLE_ROWS: usize = 12;
 
+/// Rows shown when the focused log is expanded to the full-screen window
+/// (retail: confirm on the focused Log Window). Also the number of rows
+/// pre-spawned per panel, since the extra rows above the compact viewport are
+/// simply clipped until an expand reveals them.
+pub const EXPANDED_ROWS: usize = 24;
+
 pub const PANEL_MAX_HEIGHT_PX: f32 = 220.0;
+pub const PANEL_EXPANDED_HEIGHT_PX: f32 = 440.0;
 pub const PANEL_MIN_HEIGHT_PX: f32 = 60.0;
 pub const FULL_HOLD_SECS: f32 = 10.0;
 pub const FADE_SECS: f32 = 10.0;
@@ -132,6 +139,12 @@ impl ChatKind {
     pub fn cycle_next(self) -> ChatKind {
         let pos = Self::TAB_ORDER.iter().position(|&k| k == self).unwrap_or(0);
         Self::TAB_ORDER[(pos + 1) % Self::TAB_ORDER.len()]
+    }
+
+    pub fn cycle_prev(self) -> ChatKind {
+        let n = Self::TAB_ORDER.len();
+        let pos = Self::TAB_ORDER.iter().position(|&k| k == self).unwrap_or(0);
+        Self::TAB_ORDER[(pos + n - 1) % n]
     }
 
     pub fn tab_label(self) -> &'static str {
@@ -273,7 +286,7 @@ fn spawn_panel(parent: &mut ChildSpawnerCommands, kind: ChatKind, initial_displa
             BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
-            for slot in 0..VISIBLE_ROWS {
+            for slot in 0..EXPANDED_ROWS {
                 p.spawn((
                     ChatRow { slot },
                     Node {
@@ -354,16 +367,19 @@ pub fn update_chat_panel(
             ChatKind::Debug => debug_scroll.rows,
         };
 
-        let focused = match panel.kind {
-            ChatKind::Social => {
-                scroll_offset != 0
-                    || matches!(
-                        &*mode,
-                        InputMode::PassiveCursor(s) if matches!(s.focus, PassiveCursorFocus::Chat)
-                    )
-            }
-            ChatKind::Battle | ChatKind::Debug => scroll_offset != 0,
-        };
+        // The whole tabbed log is one retail "Log Window": when the active-
+        // window cursor focuses Chat, the shown panel gets the focus border and
+        // Confirm expands it. (Battle/Debug panels are Display::None off-tab, so
+        // treating them as focused too is harmless.)
+        let chat_focused = matches!(
+            &*mode,
+            InputMode::PassiveCursor(s) if matches!(s.focus, PassiveCursorFocus::Chat)
+        );
+        let chat_expanded = matches!(
+            &*mode,
+            InputMode::PassiveCursor(s) if s.chat_expanded && matches!(s.focus, PassiveCursorFocus::Chat)
+        );
+        let focused = scroll_offset != 0 || chat_focused;
         let want_border = if focused {
             theme::CURSOR
         } else {
@@ -379,15 +395,22 @@ pub fn update_chat_panel(
         if new_msg || interacted {
             decay.last_active_secs = now;
         }
-        let idle = (now - decay.last_active_secs).max(0.0);
-        let t = ((idle - FULL_HOLD_SECS) / FADE_SECS).clamp(0.0, 1.0);
-        let target_h = PANEL_MAX_HEIGHT_PX + (PANEL_MIN_HEIGHT_PX - PANEL_MAX_HEIGHT_PX) * t;
+        let target_h = if chat_expanded {
+            PANEL_EXPANDED_HEIGHT_PX
+        } else {
+            let idle = (now - decay.last_active_secs).max(0.0);
+            let t = ((idle - FULL_HOLD_SECS) / FADE_SECS).clamp(0.0, 1.0);
+            PANEL_MAX_HEIGHT_PX + (PANEL_MIN_HEIGHT_PX - PANEL_MAX_HEIGHT_PX) * t
+        };
         let want_h = Val::Px(target_h);
         if node.height != want_h {
             node.height = want_h;
         }
 
-        let visible: Vec<Option<&ChatLine>> = (0..VISIBLE_ROWS)
+        // Fill every pre-spawned row (newest at the bottom); the panel height +
+        // overflow clip windows how many actually show, so compact reveals the
+        // newest ~VISIBLE_ROWS and expand grows the height to reveal the rest.
+        let visible: Vec<Option<&ChatLine>> = (0..EXPANDED_ROWS)
             .rev()
             .map(|i| {
                 let n = filtered.len();

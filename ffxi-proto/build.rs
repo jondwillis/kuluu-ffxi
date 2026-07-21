@@ -16,6 +16,7 @@ const LSB_WEAPON_SKILLS_SQL: &str = "../vendor/server/sql/weapon_skills.sql";
 const LSB_ITEM_BASIC_SQL: &str = "../vendor/server/sql/item_basic.sql";
 const LSB_ITEM_EQUIPMENT_SQL: &str = "../vendor/server/sql/item_equipment.sql";
 const LSB_ITEM_USABLE_SQL: &str = "../vendor/server/sql/item_usable.sql";
+const LSB_STATUS_EFFECTS_SQL: &str = "../vendor/server/sql/status_effects.sql";
 const LSB_PACKET_S2C_H: &str = "../vendor/server/src/map/enums/packet_s2c.h";
 const LSB_PACKET_C2S_H: &str = "../vendor/server/src/map/enums/packet_c2s.h";
 const LSB_AUTH_SESSION_H: &str = "../vendor/server/src/login/auth_session.h";
@@ -38,6 +39,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed={LSB_ITEM_BASIC_SQL}");
     println!("cargo:rerun-if-changed={LSB_ITEM_EQUIPMENT_SQL}");
     println!("cargo:rerun-if-changed={LSB_ITEM_USABLE_SQL}");
+    println!("cargo:rerun-if-changed={LSB_STATUS_EFFECTS_SQL}");
     println!("cargo:rerun-if-changed={LSB_PACKET_S2C_H}");
     println!("cargo:rerun-if-changed={LSB_PACKET_C2S_H}");
     println!("cargo:rerun-if-changed={LSB_AUTH_SESSION_H}");
@@ -312,6 +314,20 @@ fn main() -> Result<()> {
     println!(
         "ffxi-proto: scraped {} nonzero item-flag entries",
         item_flag_entries.len(),
+    );
+
+    let status_effects_src = fs::read_to_string(LSB_STATUS_EFFECTS_SQL)
+        .with_context(|| format!("reading {LSB_STATUS_EFFECTS_SQL}"))?;
+    let status_flag_entries = parse_sql_status_effect_flags(&status_effects_src)?;
+    write_u16_u32_table(
+        &out_dir.join("status_effect_flags_table.rs"),
+        "STATUS_EFFECT_FLAGS",
+        LSB_STATUS_EFFECTS_SQL,
+        &status_flag_entries,
+    )?;
+    println!(
+        "ffxi-proto: scraped {} nonzero status-effect flag entries",
+        status_flag_entries.len(),
     );
 
     let equip_src = fs::read_to_string(LSB_ITEM_EQUIPMENT_SQL)
@@ -1217,6 +1233,81 @@ fn parse_sql_item_flags(src: &str) -> Result<Vec<(u16, u32)>> {
     }
     if out.is_empty() {
         bail!("parsed zero item_basic flag rows — SQL format may have changed");
+    }
+    Ok(out)
+}
+
+/// Scrape `status_effects` rows into (id, flags), resolving the `SET @FLAG_* = n;`
+/// variables the flags column references (e.g. `@FLAG_DEATH | @FLAG_NO_CANCEL`).
+/// The client keys the buff-cancel packet (0x0F1) and its status icons on the
+/// effect id, so this table is consumed by icon id (icon == effect id in LSB's
+/// default assignment). Zero-flag rows are dropped: lookup defaults to 0.
+fn parse_sql_status_effect_flags(src: &str) -> Result<Vec<(u16, u32)>> {
+    let mut vars: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for line in src.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("SET @") else {
+            continue;
+        };
+        let Some((name, value)) = rest.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_end_matches(';');
+        let value = value.split("--").next().unwrap_or("").trim();
+        let value = value.trim_end_matches(';').trim();
+        if let Ok(v) = value.parse::<u32>() {
+            vars.insert(name.trim().to_string(), v);
+        }
+    }
+
+    let eval = |expr: &str| -> Option<u32> {
+        let mut acc = 0u32;
+        for term in expr.split('|') {
+            let term = term.trim();
+            if term.is_empty() || term == "0" {
+                continue;
+            }
+            let v = if let Some(name) = term.strip_prefix('@') {
+                *vars.get(name)?
+            } else {
+                term.parse::<u32>().ok()?
+            };
+            acc |= v;
+        }
+        Some(acc)
+    };
+
+    let needle = "INSERT INTO `status_effects` VALUES ";
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix(needle) else {
+            continue;
+        };
+        let mut cursor = rest;
+        while let Some(open) = cursor.find('(') {
+            cursor = &cursor[open + 1..];
+            let Some((tuple, after)) = split_sql_tuple(cursor) else {
+                break;
+            };
+            cursor = after;
+            let fields = split_sql_fields(tuple);
+            let Some(Ok(id)) = fields.first().map(|s| s.trim().parse::<u16>()) else {
+                continue;
+            };
+            let Some(flags) = fields.get(2).and_then(|s| eval(s.trim())) else {
+                bail!(
+                    "status_effects row {id}: unresolvable flags expression {:?}",
+                    fields.get(2)
+                );
+            };
+            if flags != 0 {
+                out.push((id, flags));
+            }
+        }
+    }
+    if out.is_empty() {
+        bail!("parsed zero status_effects flag rows — SQL format may have changed");
     }
     Ok(out)
 }

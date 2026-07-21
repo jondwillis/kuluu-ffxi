@@ -41,6 +41,7 @@ native-window = [
     "dep:rfd",
     "dep:ffxi-viewer-core",
     "ffxi-viewer-core/enhanced-water",
+    "ffxi-viewer-core/enhanced-buff-tooltips",
     "dep:ffxi-viewer-wire",
 ]
 # Enable the WebSocket relay listener (`--relay-listen <addr>` global flag).

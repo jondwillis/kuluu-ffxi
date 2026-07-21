@@ -230,6 +230,7 @@ impl Plugin for HudPlugin {
                 (
                     status_ribbon::update_status_ribbon,
                     status_ribbon::update_status_timers,
+                    status_ribbon::update_status_ribbon_selection,
                 ),
                 (
                     death_prompt::update_death_prompt_system,
@@ -273,6 +274,9 @@ impl Plugin for HudPlugin {
                 vana_clock::apply_vana_clock_visibility,
             ),
         );
+        #[cfg(feature = "enhanced-buff-tooltips")]
+        app.add_systems(Update, status_ribbon::tooltip::update_buff_tooltip);
+
         app.add_systems(Update, chat_panel::chat_tab_click_system);
         app.add_systems(Update, chat_panel::chat_auto_switch_click_system);
 
@@ -354,6 +358,9 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             network_status::spawn_network_status,
         ),
     );
+
+    #[cfg(feature = "enhanced-buff-tooltips")]
+    app.add_systems(schedule.clone(), status_ribbon::tooltip::spawn_buff_tooltip);
 
     app.add_systems(
         schedule,

@@ -199,7 +199,9 @@ pub fn text_input_system(
                     }
                 }
                 if bindings.matches_logical(Action::SelectActiveWindow, &ev.logical_key) {
-                    slash_writers.active_chat_tab.0 = slash_writers.active_chat_tab.0.cycle_next();
+                    *mode = InputMode::PassiveCursor(
+                        ffxi_viewer_core::input_mode::PassiveCursorState::fresh_chat(),
+                    );
                     continue;
                 }
                 if let Some(next) = handle_world_key(
@@ -289,12 +291,15 @@ pub fn text_input_system(
                     *mode = next;
                 }
             }
-            InputMode::PassiveCursor(_state) => {
+            InputMode::PassiveCursor(state) => {
                 if let Some(next) = handle_passive_cursor_key(
                     &ev.logical_key,
                     &bindings,
+                    state,
                     &mut chat_scroll,
+                    &mut slash_writers.active_chat_tab,
                     &scene_state,
+                    &cmd_tx.0,
                 ) {
                     *mode = next;
                 }
@@ -3402,38 +3407,116 @@ fn handle_quick_action_key(
     None
 }
 
+/// Drives the "active window" cursor (retail's Select-active-window / F key).
+/// F steps focus across the on-screen windows; within the focused window the
+/// Nav keys scroll/select and confirm/cancel act on it.
 fn handle_passive_cursor_key(
     key: &Key,
     bindings: &Bindings,
+    state: &mut ffxi_viewer_core::input_mode::PassiveCursorState,
     chat_scroll: &mut ChatScroll,
+    active_chat_tab: &mut ActiveChatTab,
     scene_state: &SceneState,
+    cmd_tx: &Sender<AgentCommand>,
 ) -> Option<InputMode> {
-    let max_back = ffxi_viewer_core::snapshot::rendered_chat(scene_state).len();
+    use ffxi_viewer_core::input_mode::{PassiveCursorFocus, PassiveCursorState};
 
-    if bindings.matches_logical(Action::NavUp, key) {
-        if chat_scroll.rows + 1 < max_back {
-            chat_scroll.rows += 1;
+    let icons = &scene_state.snapshot.status_icons;
+
+    // F advances focus across windows: Chat -> StatusIcons (when buffs exist)
+    // -> World (unfocused), matching retail's window-change cycle.
+    if bindings.matches_logical(Action::SelectActiveWindow, key) {
+        return Some(match state.focus {
+            PassiveCursorFocus::Chat if !icons.is_empty() => {
+                InputMode::PassiveCursor(PassiveCursorState::fresh_status())
+            }
+            _ => InputMode::World,
+        });
+    }
+
+    match state.focus {
+        PassiveCursorFocus::Chat => {
+            let max_back = ffxi_viewer_core::snapshot::rendered_chat(scene_state).len();
+            if bindings.matches_logical(Action::NavUp, key) {
+                if chat_scroll.rows + 1 < max_back {
+                    chat_scroll.rows += 1;
+                }
+                return None;
+            }
+            if bindings.matches_logical(Action::NavDown, key) {
+                chat_scroll.rows = chat_scroll.rows.saturating_sub(1);
+                return None;
+            }
+            if bindings.matches_logical(Action::PageUp, key) {
+                let next = chat_scroll.rows.saturating_add(8);
+                chat_scroll.rows = next.min(max_back.saturating_sub(1));
+                return None;
+            }
+            if bindings.matches_logical(Action::PageDown, key) {
+                chat_scroll.rows = chat_scroll.rows.saturating_sub(8);
+                return None;
+            }
+            // Left/Right cycle which chat tab the focused log shows.
+            if bindings.matches_logical(Action::NavLeft, key) {
+                active_chat_tab.0 = active_chat_tab.0.cycle_prev();
+                return None;
+            }
+            if bindings.matches_logical(Action::NavRight, key) {
+                active_chat_tab.0 = active_chat_tab.0.cycle_next();
+                return None;
+            }
+            // Confirm expands the log to full-screen; cancel contracts it,
+            // then a second cancel releases focus (retail's log window).
+            if bindings.matches_logical(Action::NavConfirm, key) {
+                state.chat_expanded = true;
+                return None;
+            }
+            if bindings.matches_logical(Action::NavCancel, key) {
+                if state.chat_expanded {
+                    state.chat_expanded = false;
+                    return None;
+                }
+                return Some(InputMode::World);
+            }
+            None
         }
-        return None;
+        PassiveCursorFocus::StatusIcons => {
+            if icons.is_empty() {
+                return Some(InputMode::World);
+            }
+            let last = icons.len() - 1;
+            state.status_cursor = state.status_cursor.min(last);
+            const ROW: usize = ffxi_viewer_core::hud::status_ribbon::ICONS_PER_ROW;
+            if bindings.matches_logical(Action::NavLeft, key) {
+                state.status_cursor = state.status_cursor.saturating_sub(1);
+                return None;
+            }
+            if bindings.matches_logical(Action::NavRight, key) {
+                state.status_cursor = (state.status_cursor + 1).min(last);
+                return None;
+            }
+            if bindings.matches_logical(Action::NavUp, key) {
+                state.status_cursor = state.status_cursor.saturating_sub(ROW);
+                return None;
+            }
+            if bindings.matches_logical(Action::NavDown, key) {
+                state.status_cursor = (state.status_cursor + ROW).min(last);
+                return None;
+            }
+            if bindings.matches_logical(Action::NavConfirm, key) {
+                if let Some(&icon) = icons.get(state.status_cursor) {
+                    if ffxi_proto::status_effects::is_cancelable(icon) {
+                        let _ = cmd_tx.try_send(AgentCommand::CancelBuff { icon });
+                    }
+                }
+                return None;
+            }
+            if bindings.matches_logical(Action::NavCancel, key) {
+                return Some(InputMode::World);
+            }
+            None
+        }
     }
-    if bindings.matches_logical(Action::NavDown, key) {
-        chat_scroll.rows = chat_scroll.rows.saturating_sub(1);
-        return None;
-    }
-    if bindings.matches_logical(Action::PageUp, key) {
-        let next = chat_scroll.rows.saturating_add(8);
-        chat_scroll.rows = next.min(max_back.saturating_sub(1));
-        return None;
-    }
-    if bindings.matches_logical(Action::PageDown, key) {
-        chat_scroll.rows = chat_scroll.rows.saturating_sub(8);
-        return None;
-    }
-    if bindings.matches_logical(Action::NavCancel, key) {
-        return Some(InputMode::World);
-    }
-
-    None
 }
 
 #[cfg(test)]

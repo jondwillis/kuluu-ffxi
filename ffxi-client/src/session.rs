@@ -2197,6 +2197,19 @@ async fn keepalive_loop(
                             });
                         }
                     }
+                    Some(AgentCommand::CancelBuff { icon }) => {
+                        let payload = build_subpacket_buffcancel(sub_seq, icon);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "buffcancel send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("buff cancel send: {e}"),
+                            });
+                        }
+                    }
                     Some(AgentCommand::CheckTarget {
                         target_id,
                         target_index,
@@ -4219,6 +4232,18 @@ fn decode_abil_recast(data: &[u8]) -> Vec<(u16, u32)> {
         out.push((timer_id, (now_unix + timer as u64) as u32));
     }
     out
+}
+
+// GP_CLI_COMMAND_BUFFCANCEL, vendor/server/src/map/packets/c2s/0x0f1_buffcancel.h:
+// BuffNo u16 (the status icon id), padding u16. The server runs
+// DelStatusEffectsByIcon(BuffNo) and blocks the packet only while InEvent
+// (0x0f1_buffcancel.cpp); it does NOT re-check cancelability, so the caller
+// gates on ffxi_proto::status_effects::is_cancelable.
+pub fn build_subpacket_buffcancel(sync: u16, buff_no: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(0x0F1, 2, sync));
+    buf[4..6].copy_from_slice(&buff_no.to_le_bytes());
+    buf
 }
 
 pub fn build_subpacket_shop_buy(sync: u16, qty: u32, shop_no: u16, shop_index: u8) -> Vec<u8> {
@@ -6912,6 +6937,21 @@ mod tests {
         assert_eq!(shop.items[1].item_no, 256);
         assert_eq!(shop.items[1].price, 99999);
         assert!(!shop.opened);
+    }
+
+    #[test]
+    fn buffcancel_packet_layout_matches_server_struct() {
+        let buf = build_subpacket_buffcancel(0x1234, 40);
+        assert_eq!(buf.len(), 8);
+        let hdr = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(hdr & 0x01FF, 0x0F1, "opcode");
+        assert_eq!((hdr >> 9) & 0x7F, 2, "size in words");
+        assert_eq!(
+            u16::from_le_bytes(buf[4..6].try_into().unwrap()),
+            40,
+            "BuffNo"
+        );
+        assert_eq!(&buf[6..8], &[0u8; 2], "padding00");
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub mod packet_names;
 pub mod recast;
 pub mod skill_names;
 pub mod spell_names;
+pub mod status_effects;
 pub mod status_names;
 pub mod valid_target;
 pub mod vana_time;

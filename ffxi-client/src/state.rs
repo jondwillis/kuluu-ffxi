@@ -1831,6 +1831,15 @@ pub enum AgentCommand {
         ids: Vec<u16>,
     },
 
+    /// c2s 0x0F1 GP_CLI_COMMAND_BUFFCANCEL — click a status effect off by its
+    /// icon id. The server deletes every effect with that icon
+    /// (DelStatusEffectsByIcon) and does NOT re-check cancelability, so the
+    /// caller must gate on `ffxi_proto::status_effects::is_cancelable`
+    /// (vendor/server/src/map/packets/c2s/0x0f1_buffcancel.cpp).
+    CancelBuff {
+        icon: u16,
+    },
+
     EndEvent,
 
     EndEventChoice {

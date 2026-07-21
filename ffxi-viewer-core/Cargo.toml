@@ -16,6 +16,11 @@ default = []
 # material, selectable at runtime in the graphics menu. Native-only.
 enhanced-water = ["dep:bevy_water"]
 
+# Enhanced (non-retail) mouse-over tooltips on the status-effect ribbon showing
+# each buff's name. Retail has no such tooltip; the info comes from the scraped
+# status-effect name table.
+enhanced-buff-tooltips = []
+
 # Bevy ECS plugins, world model, camera, and HUD shared by both the native
 # windowed viewer (ffxi-client/src/view_native/) and the browser viewer
 # (ffxi-viewer-wasm/). No tokio, no I/O — state arrives through the

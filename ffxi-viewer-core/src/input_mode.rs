@@ -192,21 +192,42 @@ impl QuickActionState {
     }
 }
 
+/// Which on-screen window the "active window" cursor (retail's Select-active-
+/// window / F key) is focused on. The cycle order below matches how F steps
+/// through the windows; World (unfocused) is the wrap-around resting state.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum PassiveCursorFocus {
     #[default]
     Chat,
+    StatusIcons,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PassiveCursorState {
     pub focus: PassiveCursorFocus,
+
+    /// Selection index into the status-icon ribbon while `focus == StatusIcons`.
+    pub status_cursor: usize,
+
+    /// Chat log expanded to the full-screen scrollback window (retail: confirm
+    /// on the focused log window expands it, cancel contracts).
+    pub chat_expanded: bool,
 }
 
 impl PassiveCursorState {
     pub fn fresh_chat() -> Self {
         Self {
             focus: PassiveCursorFocus::Chat,
+            status_cursor: 0,
+            chat_expanded: false,
+        }
+    }
+
+    pub fn fresh_status() -> Self {
+        Self {
+            focus: PassiveCursorFocus::StatusIcons,
+            status_cursor: 0,
+            chat_expanded: false,
         }
     }
 }

@@ -131,7 +131,7 @@ const ICON_SIZE_PX: f32 = 20.0;
 
 const ICON_GAP_PX: f32 = 1.0;
 
-const ICONS_PER_ROW: usize = 16;
+pub const ICONS_PER_ROW: usize = 16;
 
 pub fn spawn_status_ribbon(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let placeholder = transparent_placeholder(&mut images);
@@ -154,8 +154,10 @@ pub fn spawn_status_ribbon(mut commands: Commands, mut images: ResMut<Assets<Ima
                 align_content: AlignContent::FlexStart,
                 column_gap: Val::Px(ICON_GAP_PX),
                 row_gap: Val::Px(ICON_GAP_PX),
+                border: UiRect::all(Val::Px(1.0)),
                 ..default()
             },
+            BorderColor::all(Color::NONE),
         ))
         .with_children(|p| {
             for slot in 0..MAX_VISIBLE {
@@ -166,11 +168,14 @@ pub fn spawn_status_ribbon(mut commands: Commands, mut images: ResMut<Assets<Ima
                         height: Val::Px(ICON_SIZE_PX),
                         justify_content: JustifyContent::Center,
                         align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
                         display: Display::None,
                         ..default()
                     },
                     ImageNode::new(placeholder.clone()),
                     BackgroundColor(Color::NONE),
+                    BorderColor::all(Color::NONE),
+                    Interaction::default(),
                 ))
                 .with_children(|chip| {
                     chip.spawn((
@@ -254,6 +259,58 @@ pub fn update_status_ribbon(
     }
 }
 
+/// Highlights the status ribbon while it holds the active-window cursor: a
+/// frame border on the ribbon and a cursor border on the selected chip — bright
+/// (`CURSOR`) when that buff is player-cancelable, muted otherwise, so the
+/// player can see which buffs Confirm will click off (retail's status window).
+pub fn update_status_ribbon_selection(
+    mode: Res<crate::input_mode::InputMode>,
+    state: Res<SceneState>,
+    mut ribbon_q: Query<&mut BorderColor, (With<StatusRibbon>, Without<StatusChip>)>,
+    mut chips: Query<(&StatusChip, &mut BorderColor), Without<StatusRibbon>>,
+) {
+    use crate::input_mode::{InputMode, PassiveCursorFocus};
+
+    if !mode.is_changed() && !state.is_changed() {
+        return;
+    }
+
+    let (focused, cursor) = match &*mode {
+        InputMode::PassiveCursor(s) if matches!(s.focus, PassiveCursorFocus::StatusIcons) => {
+            (true, s.status_cursor)
+        }
+        _ => (false, usize::MAX),
+    };
+
+    let ribbon_border = if focused {
+        theme::FRAME_EDGE
+    } else {
+        Color::NONE
+    };
+    for mut border in ribbon_q.iter_mut() {
+        if border.left != ribbon_border {
+            *border = BorderColor::all(ribbon_border);
+        }
+    }
+
+    let icons = &state.snapshot.status_icons;
+    for (chip, mut border) in chips.iter_mut() {
+        let want = if focused && chip.slot == cursor {
+            let icon = icons.get(chip.slot).copied().unwrap_or(0);
+            if ffxi_proto::status_effects::is_cancelable(icon) {
+                theme::CURSOR
+            } else {
+                theme::MUTED
+            }
+        } else {
+            Color::NONE
+        };
+        if border.left != want {
+            *border = BorderColor::all(want);
+        }
+    }
+}
+
 fn set_fallback_text(
     children: &Children,
     text_q: &mut Query<&mut Text, With<StatusChipFallback>>,
@@ -290,6 +347,95 @@ pub fn update_status_timers(
                 if **text != want {
                     **text = want.clone();
                 }
+            }
+        }
+    }
+}
+
+/// Enhanced (non-retail) hover tooltip for the status ribbon: shows the buff's
+/// name from the scraped status-effect table when the pointer is over a chip.
+#[cfg(feature = "enhanced-buff-tooltips")]
+pub mod tooltip {
+    use super::*;
+    use crate::mouse::MousePointer;
+
+    #[derive(Component)]
+    pub struct BuffTooltip;
+
+    #[derive(Component)]
+    pub struct BuffTooltipText;
+
+    const TOOLTIP_OFFSET_PX: Vec2 = Vec2::new(16.0, 16.0);
+
+    pub fn spawn_buff_tooltip(mut commands: Commands) {
+        commands
+            .spawn((
+                crate::components::InGameEntity,
+                BuffTooltip,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(-1000.0),
+                    top: Val::Px(-1000.0),
+                    padding: UiRect::axes(Val::Px(6.0), Val::Px(3.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    display: Display::None,
+                    ..default()
+                },
+                BackgroundColor(theme::FRAME_BG),
+                BorderColor::all(theme::FRAME_EDGE),
+                ZIndex(i32::MAX - 1),
+            ))
+            .with_children(|p| {
+                p.spawn((
+                    BuffTooltipText,
+                    Text::new(""),
+                    style::text_font(12.0),
+                    TextColor(theme::TEXT),
+                ));
+            });
+    }
+
+    pub fn update_buff_tooltip(
+        state: Res<SceneState>,
+        pointer: Res<MousePointer>,
+        chips: Query<(&StatusChip, &Interaction)>,
+        mut card_q: Query<&mut Node, With<BuffTooltip>>,
+        mut text_q: Query<&mut Text, With<BuffTooltipText>>,
+    ) {
+        let Ok(mut card) = card_q.single_mut() else {
+            return;
+        };
+
+        let icons = &state.snapshot.status_icons;
+        let hovered_icon = chips
+            .iter()
+            .find(|(_, i)| matches!(i, Interaction::Hovered | Interaction::Pressed))
+            .and_then(|(chip, _)| icons.get(chip.slot).copied());
+
+        let name = hovered_icon.and_then(ffxi_proto::status_names::lookup);
+        let Some(name) = name else {
+            if card.display != Display::None {
+                card.display = Display::None;
+            }
+            return;
+        };
+
+        if card.display == Display::None {
+            card.display = Display::Flex;
+        }
+        if let Some(pos) = pointer.cursor_pos {
+            let want_left = Val::Px(pos.x + TOOLTIP_OFFSET_PX.x);
+            let want_top = Val::Px(pos.y + TOOLTIP_OFFSET_PX.y);
+            if card.left != want_left {
+                card.left = want_left;
+            }
+            if card.top != want_top {
+                card.top = want_top;
+            }
+        }
+        if let Ok(mut text) = text_q.single_mut() {
+            if text.as_str() != name {
+                **text = name.to_string();
             }
         }
     }
