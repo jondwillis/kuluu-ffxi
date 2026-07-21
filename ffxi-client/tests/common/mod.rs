@@ -13,6 +13,9 @@ pub const DEFAULT_DB_URL: &str = "mysql://xiadmin:password@127.0.0.1:3306/xidb";
 const FIXTURE_PASSWORD: &str = "TestPass!1234";
 
 const CHAR_TABLES: &[&str] = &[
+    // Populated by LSB's `char_insert` trigger on `chars`; must be cleaned
+    // explicitly or the next MAX(charid)+1 insert hits a 1062 duplicate.
+    "char_history",
     "char_inventory",
     "char_storage",
     "char_profile",
