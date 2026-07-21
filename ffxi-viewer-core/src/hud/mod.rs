@@ -25,6 +25,7 @@ pub mod roster;
 pub mod self_fishing;
 pub mod self_hud;
 pub mod shop;
+pub mod spinner;
 pub mod stage_bar;
 pub mod status_panel;
 pub mod status_ribbon;
