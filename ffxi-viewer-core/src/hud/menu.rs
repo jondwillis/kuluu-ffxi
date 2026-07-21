@@ -70,6 +70,10 @@ pub enum DynamicMenuAction {
         ability_id: u16,
     },
 
+    /// Ranged attack (c2s action 0x10). Carries no id — only a target, picked
+    /// through the same sub-target cursor as a weapon skill.
+    RangedAttack,
+
     UseItem {
         container: u8,
         index: u8,
@@ -885,7 +889,11 @@ pub fn ability_group_rows(
                 })
             })
             .collect(),
-        G::RangedAttack | G::Mount => Vec::new(),
+        G::RangedAttack => vec![DynamicMenuRow {
+            label: "Ranged Attack".to_string(),
+            action: DynamicMenuAction::RangedAttack,
+        }],
+        G::Mount => Vec::new(),
     };
     rows.sort_by(|a, b| a.label.cmp(&b.label));
     rows

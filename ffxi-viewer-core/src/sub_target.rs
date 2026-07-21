@@ -124,7 +124,9 @@ pub fn action_flags(action: SubTargetAction) -> TargetFlags {
         SubTargetAction::Ability(id) => {
             ffxi_proto::valid_target::ability(id).unwrap_or(TargetFlags(TargetFlags::SELF))
         }
-        SubTargetAction::WeaponSkill(_) => TargetFlags(TargetFlags::ENEMY),
+        SubTargetAction::WeaponSkill(_) | SubTargetAction::Ranged => {
+            TargetFlags(TargetFlags::ENEMY)
+        }
         SubTargetAction::Item { .. } => TargetFlags(TargetFlags::SELF),
     }
 }

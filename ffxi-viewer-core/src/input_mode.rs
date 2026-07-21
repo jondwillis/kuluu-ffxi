@@ -34,6 +34,8 @@ pub enum SubTargetAction {
     Spell(u16),
     Ability(u16),
     WeaponSkill(u16),
+    /// Ranged attack — targets an enemy, carries no id.
+    Ranged,
     Item {
         container: u8,
         index: u8,

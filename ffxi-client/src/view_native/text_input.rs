@@ -2732,6 +2732,7 @@ fn sub_target_action_for(
         A::CastSpell { spell_id } => Some(S::Spell(spell_id)),
         A::JobAbility { ability_id } | A::PetAbility { ability_id } => Some(S::Ability(ability_id)),
         A::Weaponskill { skill_id } => Some(S::WeaponSkill(skill_id)),
+        A::RangedAttack => Some(S::Ranged),
         A::UseItem {
             container,
             index,
@@ -2757,6 +2758,7 @@ fn dynamic_action_for(
         S::Spell(spell_id) => A::CastSpell { spell_id },
         S::Ability(ability_id) => A::JobAbility { ability_id },
         S::WeaponSkill(skill_id) => A::Weaponskill { skill_id },
+        S::Ranged => A::RangedAttack,
         S::Item {
             container,
             index,
@@ -2986,6 +2988,23 @@ fn dispatch_dynamic_menu_action(
                     kind: ActionKind::Weaponskill {
                         skill_id: skill_id as u32,
                     },
+                },
+            )
+        }
+        A::RangedAttack => {
+            let Some((tid, tidx)) = pick_target(true) else {
+                push_system_chat_line(
+                    scene_state,
+                    "[menu] ranged attack: requires a battle target".into(),
+                );
+                return;
+            };
+            (
+                "ranged",
+                AgentCommand::Action {
+                    target_id: tid,
+                    target_index: tidx,
+                    kind: ActionKind::Shoot,
                 },
             )
         }

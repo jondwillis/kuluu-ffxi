@@ -397,6 +397,12 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 handler: |c| parse_job_ability(c.rest, c.entities, c.self_pos, c.current_target),
             },
             Command {
+                aliases: &["ra", "shoot", "rangedattack"],
+                usage: "[target]",
+                summary: "ranged attack",
+                handler: |c| parse_ranged_attack(c.rest, c.entities, c.self_pos, c.current_target),
+            },
+            Command {
                 aliases: &["useitem", "use"],
                 usage: "<name> [target]",
                 summary: "use an item",
@@ -1757,6 +1763,27 @@ fn parse_weaponskill(
         target_id,
         target_index,
         kind: ActionKind::Weaponskill { skill_id },
+    })
+}
+
+/// `/ra [target]` — ranged attack (c2s action 0x10). Takes no id, only a target
+/// (defaults to the current target).
+fn parse_ranged_attack(
+    rest: &str,
+    entities: &[WireEntity],
+    self_pos: WireVec3,
+    current_target: Option<u32>,
+) -> SlashOutcome {
+    let parts: Vec<&str> = rest.split_ascii_whitespace().collect();
+    let (target_id, target_index) =
+        match resolve_target_args(&parts, entities, self_pos, current_target) {
+            Ok(pair) => pair,
+            Err(msg) => return SlashOutcome::SystemMessage(format!("/ra: {msg}")),
+        };
+    SlashOutcome::Command(AgentCommand::Action {
+        target_id,
+        target_index,
+        kind: ActionKind::Shoot,
     })
 }
 
