@@ -83,6 +83,10 @@ pub struct SlashWriters<'w, 's> {
 
     pub trade_intent: MessageWriter<'w, ffxi_viewer_core::hud::trade::TradeIntent>,
 
+    pub delivery_state: ResMut<'w, ffxi_viewer_core::hud::delivery::DeliveryScreenState>,
+
+    pub delivery_inv: Res<'w, ffxi_viewer_core::hud::delivery::DeliveryInventory>,
+
     pub select_target: ResMut<'w, SelectTargetMode>,
 
     pub active_chat_tab: ResMut<'w, ActiveChatTab>,
@@ -333,6 +337,16 @@ pub fn text_input_system(
                     *mode = next;
                 }
             }
+            InputMode::DeliveryBox => {
+                handle_delivery_key(
+                    &ev.logical_key,
+                    &bindings,
+                    &mut slash_writers.delivery_state,
+                    &mut scene_state,
+                    &slash_writers.delivery_inv,
+                    &cmd_tx.0,
+                );
+            }
         }
     }
 }
@@ -381,6 +395,278 @@ pub fn dialog_mode_sync_system(
 /// recipient / Cancel rows). `None` when the frame has no grid.
 fn default_grid_choice(dialog: &ffxi_viewer_wire::DialogState) -> Option<u32> {
     dialog.grid.as_ref()?.cells.iter().find_map(|c| c.choice)
+}
+
+/// Drive `InputMode` in lock-step with the server-owned delivery box: enter
+/// `DeliveryBox` once the box is open (and no dialog is mid-transition), leave
+/// on PostClose ack. Resets the transient screen state on each edge.
+pub fn delivery_mode_sync_system(
+    state: Res<SceneState>,
+    mut mode: ResMut<InputMode>,
+    mut screen: ResMut<ffxi_viewer_core::hud::delivery::DeliveryScreenState>,
+) {
+    let open = state.snapshot.delivery_box.is_some();
+    let dialog_open = state.snapshot.dialog.is_some();
+    match (&*mode, open) {
+        (InputMode::DeliveryBox, false) => {
+            *mode = InputMode::World;
+            screen.close();
+        }
+        (m, true) if !matches!(m, InputMode::DeliveryBox) && !dialog_open => {
+            *mode = InputMode::DeliveryBox;
+            screen.open();
+        }
+        _ => {}
+    }
+}
+
+fn wire_to_client_box(box_no: ffxi_viewer_wire::DeliveryBoxNo) -> crate::state::DeliveryBoxNo {
+    match box_no {
+        ffxi_viewer_wire::DeliveryBoxNo::Incoming => crate::state::DeliveryBoxNo::Incoming,
+        ffxi_viewer_wire::DeliveryBoxNo::Outgoing => crate::state::DeliveryBoxNo::Outgoing,
+    }
+}
+
+const RECIPIENT_NAME_MAX: usize = 15;
+
+/// Keyboard handling for the dedicated delivery screen. Reads the snapshot +
+/// `DeliveryScreenState` + deliverable inventory, drives focus/spinner/recipient
+/// entry, and emits delivery `AgentCommand`s. Mode transitions are owned by
+/// `delivery_mode_sync_system`, so this never changes `InputMode` directly.
+fn handle_delivery_key(
+    key: &Key,
+    bindings: &Bindings,
+    screen: &mut ffxi_viewer_core::hud::delivery::DeliveryScreenState,
+    scene_state: &mut SceneState,
+    inv: &ffxi_viewer_core::hud::delivery::DeliveryInventory,
+    cmd_tx: &Sender<AgentCommand>,
+) {
+    use ffxi_viewer_core::hud::delivery::{self, DeliveryCtx, DeliveryFocus};
+    use ffxi_viewer_wire::{DeliveryBoxNo as WireBox, RecipientStatus};
+
+    let Some(d) = scene_state.snapshot.delivery_box.clone() else {
+        return;
+    };
+    let gil = delivery::current_gil(&scene_state.snapshot);
+    let outgoing = d.box_no == WireBox::Outgoing;
+    let recipient_ok = matches!(d.recipient_status, RecipientStatus::Ok { .. });
+    let ctx = DeliveryCtx {
+        box_no: d.box_no,
+        inv_len: inv.rows.len(),
+        recipient_ok,
+    };
+    let sent = ffxi_proto::map::pbx::stat::SENT;
+    let send = |op: crate::state::DeliveryBoxOp| {
+        let _ = cmd_tx.try_send(AgentCommand::DeliveryBox { op });
+    };
+    let close = || {
+        let _ = cmd_tx.try_send(AgentCommand::DeliveryBox {
+            op: crate::state::DeliveryBoxOp::PostClose {
+                box_no: wire_to_client_box(d.box_no),
+            },
+        });
+    };
+
+    // 1. Active quantity/gil spinner.
+    if screen.selector.is_some() {
+        if bindings.matches_logical(Action::NavConfirm, key) {
+            let binding = screen.selector.take().expect("selector present");
+            let qty = binding.spinner.confirm();
+            let inv_slot = binding.target.inventory_slot();
+            let out_slot = binding.target.out_slot();
+            screen.focus = DeliveryFocus::Slot(out_slot as usize);
+            if qty > 0 {
+                send(crate::state::DeliveryBoxOp::Set {
+                    slot: out_slot,
+                    inventory_slot: inv_slot,
+                    quantity: qty,
+                    recipient: String::new(),
+                });
+            }
+            return;
+        }
+        if bindings.matches_logical(Action::NavCancel, key) {
+            screen.selector = None;
+            return;
+        }
+        if let Some(b) = screen.selector.as_mut() {
+            if bindings.matches_logical(Action::NavUp, key) {
+                b.spinner.up();
+            } else if bindings.matches_logical(Action::NavDown, key) {
+                b.spinner.down();
+            } else if bindings.matches_logical(Action::NavRight, key) {
+                b.spinner.jump_up();
+            } else if bindings.matches_logical(Action::NavLeft, key) {
+                b.spinner.jump_down();
+            } else if matches!(key, Key::Tab) {
+                b.spinner.set_all();
+            } else if matches!(key, Key::Backspace) {
+                b.spinner.backspace();
+            } else if let Key::Character(s) = key {
+                for c in s.chars() {
+                    b.spinner.push_digit(c);
+                }
+            }
+        }
+        return;
+    }
+
+    // 2. Recipient text entry.
+    if screen.recipient_buf.is_some() {
+        if bindings.matches_logical(Action::NavConfirm, key) {
+            let name = screen
+                .recipient_buf
+                .take()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !name.is_empty() {
+                send(crate::state::DeliveryBoxOp::Query { recipient: name });
+            }
+            return;
+        }
+        if bindings.matches_logical(Action::NavCancel, key) {
+            screen.recipient_buf = None;
+            return;
+        }
+        if let Some(buf) = screen.recipient_buf.as_mut() {
+            if matches!(key, Key::Backspace) {
+                buf.pop();
+            } else if matches!(key, Key::Space) {
+                if buf.len() < RECIPIENT_NAME_MAX {
+                    buf.push(' ');
+                }
+            } else if let Key::Character(s) = key {
+                for c in s.chars() {
+                    if !c.is_control() && buf.len() < RECIPIENT_NAME_MAX {
+                        buf.push(c);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // 3. Navigation + confirm/cancel.
+    if bindings.matches_logical(Action::NavUp, key) {
+        delivery::focus_up(screen, &ctx);
+        return;
+    }
+    if bindings.matches_logical(Action::NavDown, key) {
+        delivery::focus_down(screen, &ctx);
+        return;
+    }
+    if bindings.matches_logical(Action::NavLeft, key) {
+        delivery::focus_left(screen, &ctx);
+        return;
+    }
+    if bindings.matches_logical(Action::NavRight, key) {
+        delivery::focus_right(screen, &ctx);
+        return;
+    }
+    if bindings.matches_logical(Action::NavCancel, key) {
+        match screen.focus {
+            DeliveryFocus::TakeBtn | DeliveryFocus::RejectBtn => {
+                screen.focus = DeliveryFocus::Slot(screen.last_in_slot);
+            }
+            _ => close(),
+        }
+        return;
+    }
+    if !bindings.matches_logical(Action::NavConfirm, key) {
+        return;
+    }
+
+    // NavConfirm dispatch by focused region.
+    let notice = |scene: &mut SceneState, msg: &str| {
+        push_system_chat_line(scene, format!("[delivery] {msg}"));
+    };
+    match screen.focus {
+        DeliveryFocus::Recipient => {
+            screen.recipient_buf = Some(d.recipient.clone().unwrap_or_default());
+        }
+        DeliveryFocus::Slot(i) if outgoing => match d.slots.get(i).and_then(|c| c.as_ref()) {
+            None => {
+                if !recipient_ok {
+                    notice(scene_state, "Specify a recipient first.");
+                } else if inv.rows.is_empty() {
+                    notice(scene_state, "No deliverable items.");
+                } else {
+                    let row = screen.last_inv_row.min(inv.rows.len() - 1);
+                    screen.focus = DeliveryFocus::InvRow(row);
+                }
+            }
+            Some(item) if item.stat == sent => {
+                send(crate::state::DeliveryBoxOp::Cancel { slot: i as u8 });
+            }
+            Some(_) => {
+                send(crate::state::DeliveryBoxOp::Get {
+                    box_no: crate::state::DeliveryBoxNo::Outgoing,
+                    slot: i as u8,
+                });
+            }
+        },
+        DeliveryFocus::Slot(i) => {
+            if d.slots.get(i).and_then(|c| c.as_ref()).is_some() {
+                screen.last_in_slot = i;
+                screen.focus = DeliveryFocus::TakeBtn;
+            }
+        }
+        DeliveryFocus::Gil => {
+            if !recipient_ok {
+                notice(scene_state, "Specify a recipient first.");
+            } else {
+                match delivery::first_free_slot(&d) {
+                    Some(free) => screen.selector = delivery::begin_gil_stage(gil, Some(free)),
+                    None => notice(scene_state, "The delivery box is full."),
+                }
+            }
+        }
+        DeliveryFocus::InvRow(i) => {
+            if !recipient_ok {
+                notice(scene_state, "Specify a recipient first.");
+            } else if let Some(row) = inv.rows.get(i).cloned() {
+                if !row.deliverable {
+                    notice(scene_state, "That item cannot be delivered.");
+                } else {
+                    match delivery::first_free_slot(&d) {
+                        None => notice(scene_state, "The delivery box is full."),
+                        Some(free) if row.quantity <= 1 => {
+                            send(crate::state::DeliveryBoxOp::Set {
+                                slot: free as u8,
+                                inventory_slot: row.inv_slot,
+                                quantity: 1,
+                                recipient: String::new(),
+                            });
+                        }
+                        Some(free) => {
+                            screen.selector = delivery::begin_item_stage(&row, Some(free));
+                        }
+                    }
+                }
+            }
+        }
+        DeliveryFocus::SendOk => {
+            for (i, cell) in d.slots.iter().enumerate() {
+                if let Some(it) = cell {
+                    if it.stat != sent {
+                        send(crate::state::DeliveryBoxOp::Send { slot: i as u8 });
+                    }
+                }
+            }
+        }
+        DeliveryFocus::Exit => close(),
+        DeliveryFocus::TakeBtn => {
+            let _ = cmd_tx.try_send(AgentCommand::DeliveryTake {
+                slot: screen.last_in_slot as u8,
+            });
+        }
+        DeliveryFocus::RejectBtn => {
+            send(crate::state::DeliveryBoxOp::Reject {
+                slot: screen.last_in_slot as u8,
+            });
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

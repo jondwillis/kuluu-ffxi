@@ -21,6 +21,11 @@ pub enum InputMode {
     /// the flashing sub-target cursor is asking "on whom?". Esc returns to
     /// `return_to`; confirm fires the action at `candidate`.
     SubTarget(SubTargetState),
+
+    /// The dedicated delivery box screen is open and modal. Focus/selector
+    /// state lives in `hud::delivery::DeliveryScreenState`; this variant just
+    /// suppresses world movement/camera and routes keys to the delivery handler.
+    DeliveryBox,
 }
 
 /// The action pending behind a sub-target cursor.

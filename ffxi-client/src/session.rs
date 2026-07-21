@@ -1844,8 +1844,12 @@ async fn keepalive_loop(
                                     });
                                 }
                                 crate::local_menu::Advance::DeliveryOpen { box_no } => {
+                                    // Cutover: the dedicated screen (gated on the
+                                    // snapshot's delivery_box) now owns the UI, so
+                                    // open non-menu-driven — no legacy DialogState
+                                    // grid re-render on settle.
                                     let _ = event_tx.send(AgentEvent::EventEnded);
-                                    let op = dbox.request_open(box_no, true);
+                                    let op = dbox.request_open(box_no, false);
                                     send_pbx(map, &op, &mut sub_seq, server_last_seq, &event_tx).await;
                                 }
                                 crate::local_menu::Advance::DeliveryTake { box_no: _, slot } => {
@@ -2907,15 +2911,20 @@ async fn keepalive_loop(
                                                     // viewer nor relay must re-send it).
                                                     locked_recipient =
                                                         ok.then(|| name.clone());
-                                                    let dialog = if *ok {
-                                                        local_menu.set_recipient(Some(name))
-                                                    } else {
-                                                        local_menu.set_recipient(None)
-                                                    };
-                                                    if let Some(dialog) = dialog {
-                                                        let _ = event_tx.send(
-                                                            AgentEvent::EventDialog { dialog },
-                                                        );
+                                                    // Legacy DialogState re-render only for
+                                                    // the old menu-driven path; the dedicated
+                                                    // screen reads recipient from the snapshot.
+                                                    if dbox.menu_driven() {
+                                                        let dialog = if *ok {
+                                                            local_menu.set_recipient(Some(name))
+                                                        } else {
+                                                            local_menu.set_recipient(None)
+                                                        };
+                                                        if let Some(dialog) = dialog {
+                                                            let _ = event_tx.send(
+                                                                AgentEvent::EventDialog { dialog },
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
