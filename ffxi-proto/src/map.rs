@@ -70,6 +70,43 @@ pub mod c2s {
     pub const SCENARIO_ITEM: u16 = 0x064;
 
     pub const REQ_LOGOUT: u16 = 0x0E7;
+
+    // GP_CLI_COMMAND_TRACKING_LIST, vendor/server/src/map/packets/c2s/0x0f4_tracking_list.h.
+    // Wide-scan list request: uint32 SendFlg (must be 1, `crate::map::tracking::SEND_FLG_REQUEST`).
+    pub const TRACKING_LIST: u16 = 0x0F4;
+
+    // GP_CLI_COMMAND_TRACKING_START, vendor/server/src/map/packets/c2s/0x0f5_tracking_start.h.
+    // Begin tracking one entity: uint32 ActIndex.
+    pub const TRACKING_START: u16 = 0x0F5;
+
+    // GP_CLI_COMMAND_TRACKING_END, vendor/server/src/map/packets/c2s/0x0f6_tracking_end.h.
+    // Stop tracking: uint32 padding (Dammy).
+    pub const TRACKING_END: u16 = 0x0F6;
+}
+
+/// Wide-scan (tracking) State bytes shared by the s2c 0x0F5/0x0F6 decoders and
+/// the c2s 0x0F4 request flag.
+pub mod tracking {
+    // GP_TRACKING_POS_STATE, vendor/server/src/map/packets/s2c/0x0f5_tracking_pos.h.
+    pub mod pos_state {
+        pub const NONE: u8 = 0;
+        pub const START: u8 = 1;
+        pub const LOSE: u8 = 2;
+        pub const END: u8 = 3;
+    }
+
+    // GP_TRACKING_STATE, vendor/server/src/map/packets/s2c/0x0f6_tracking_state.h.
+    pub mod list_state {
+        pub const NONE: u8 = 0x00;
+        pub const LIST_START: u8 = 0x01;
+        pub const LIST_END: u8 = 0x02;
+        pub const END: u8 = 0x03;
+        pub const ERR_ETC: u8 = 0x0A;
+    }
+
+    /// c2s 0x0F4 SendFlg must equal 1 to request the wide-scan list
+    /// (vendor/server/src/map/packets/c2s/0x0f4_tracking_list.h SendFlg).
+    pub const SEND_FLG_REQUEST: u32 = 1;
 }
 
 /// Delivery box ("post box") wire vocabulary shared by c2s 0x04D and s2c 0x04B.
@@ -411,6 +448,18 @@ pub mod s2c {
     // /check answer for a PC target: EQUIPMENT batches then one GENERAL packet
     // (vendor/server/src/map/packets/c2s/0x0dd_equip_inspect.cpp:135-136).
     pub const EQUIP_INSPECT: u16 = 0x0C9;
+
+    // GP_SERV_COMMAND_TRACKING_LIST, vendor/server/src/map/packets/s2c/0x0f4_tracking_list.h.
+    // One wide-scan entry (ActIndex/Level/Type + relative x/z + sName[16]).
+    pub const TRACKING_LIST: u16 = 0x0F4;
+
+    // GP_SERV_COMMAND_TRACKING_POS, vendor/server/src/map/packets/s2c/0x0f5_tracking_pos.h.
+    // Tracked-entity absolute position update (State Start/Lose).
+    pub const TRACKING_POS: u16 = 0x0F5;
+
+    // GP_SERV_COMMAND_TRACKING_STATE, vendor/server/src/map/packets/s2c/0x0f6_tracking_state.h.
+    // Wide-scan list framing (ListStart/ListEnd).
+    pub const TRACKING_STATE: u16 = 0x0F6;
 }
 
 #[cfg(test)]

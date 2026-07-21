@@ -22,6 +22,13 @@ pub struct MenuHelpCounter;
 #[derive(Component)]
 pub struct MenuHelpHint;
 
+/// The persistent "- : switch pane" affordance segment; shown only while a
+/// menu (two-pane) is open, hidden during the status-ribbon buff bar.
+#[derive(Component)]
+pub struct MenuHelpPaneSwitch;
+
+const PANE_SWITCH_HINT: &str = "- : switch pane";
+
 pub const BAR_HEIGHT: f32 = 26.0;
 /// Retail frames the active menu title in its own boxed segment, flush left.
 const TITLE_BOX_W: f32 = 118.0;
@@ -104,6 +111,25 @@ pub fn spawn_menu_help_bar(mut commands: Commands) {
                     TextColor(theme::TEXT),
                 ));
             });
+            // Persistent pane-toggle affordance (retail's two-pane menus map
+            // it to the Minus key); shown only while a menu is open.
+            p.spawn((
+                MenuHelpPaneSwitch,
+                Node {
+                    flex_shrink: 0.0,
+                    align_items: AlignItems::Center,
+                    margin: UiRect::right(Val::Px(12.0)),
+                    ..default()
+                },
+            ))
+            .with_children(|seg| {
+                seg.spawn((
+                    Text::new(PANE_SWITCH_HINT),
+                    text_nowrap(),
+                    style::text_font(12.0),
+                    TextColor(theme::MUTED),
+                ));
+            });
             // "Help" sits just left of the network S/R panel (fixed width,
             // pinned at top-right), so reserve exactly that much space.
             p.spawn(Node {
@@ -136,6 +162,7 @@ fn root_entry_help(label: &str) -> &'static str {
         "Status" => "Check current status.",
         "Party" => "Organize your party.",
         "Search" => "Search for players.",
+        "Map" => "Display the map.",
         menu::ROOT_COMMUNICATION => "Communicate with other players.",
         "Macros" => "Edit macros.",
         "Graphics" => "Adjust graphics settings.",
@@ -214,24 +241,30 @@ pub fn update_menu_help_bar(
             Without<MenuHelpCounter>,
         ),
     >,
+    mut pane_switch_q: Query<&mut Node, (With<MenuHelpPaneSwitch>, Without<MenuHelpBar>)>,
 ) {
     let Ok(mut node) = bar_q.single_mut() else {
         return;
     };
 
-    let content = match &*mode {
-        InputMode::Menu(stack) => stack.current().map(|l| BarContent {
-            title: menu::menu_title(l.kind).to_string(),
-            counter: match bag_counter(l.kind, &scene.snapshot, active_bag.0) {
-                Some((used, capacity)) => format!("{used}/{capacity}"),
-                None => String::new(),
-            },
-            hint: entry_help(l.kind, l.cursor, &dynamic),
-        }),
+    // The help line follows the active pane's level: at Root the left column,
+    // after a drill the right column, and the parent again once focus toggles.
+    let (content, is_menu) = match &*mode {
+        InputMode::Menu(stack) => (
+            stack.active_level().map(|l| BarContent {
+                title: menu::menu_title(l.kind).to_string(),
+                counter: match bag_counter(l.kind, &scene.snapshot, active_bag.0) {
+                    Some((used, capacity)) => format!("{used}/{capacity}"),
+                    None => String::new(),
+                },
+                hint: entry_help(l.kind, l.cursor, &dynamic),
+            }),
+            true,
+        ),
         InputMode::PassiveCursor(s) if s.focus == PassiveCursorFocus::StatusIcons => {
-            buff_bar_content(&scene.snapshot, s.status_cursor)
+            (buff_bar_content(&scene.snapshot, s.status_cursor), false)
         }
-        _ => None,
+        _ => (None, false),
     };
 
     let Some(content) = content else {
@@ -242,6 +275,17 @@ pub fn update_menu_help_bar(
     };
     if node.display != Display::Flex {
         node.display = Display::Flex;
+    }
+
+    if let Ok(mut pane_node) = pane_switch_q.single_mut() {
+        let want = if is_menu {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if pane_node.display != want {
+            pane_node.display = want;
+        }
     }
 
     if let Ok(mut text) = title_q.single_mut() {
@@ -361,9 +405,11 @@ mod tests {
             .init_resource::<DynamicMenu>()
             .init_resource::<ItemScreenContainer>();
 
-        let mut scene = SceneState::default();
-        scene.snapshot = SceneSnapshot {
-            status_icons: vec![40, 41],
+        let scene = SceneState {
+            snapshot: SceneSnapshot {
+                status_icons: vec![40, 41],
+                ..Default::default()
+            },
             ..Default::default()
         };
         app.insert_resource(scene);

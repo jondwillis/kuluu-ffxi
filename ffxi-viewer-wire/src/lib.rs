@@ -457,6 +457,45 @@ pub struct SceneSnapshot {
     /// PC; drives the Check panel grid and job ribbon.
     #[serde(default)]
     pub check: Option<CheckResult>,
+
+    /// Server-driven wide-scan (tracking) list and currently tracked target.
+    /// Populated from s2c 0x0F4/0x0F5/0x0F6; the viewer renders it without
+    /// touching `SessionState` (see `ffxi_proto::map::tracking`).
+    #[serde(default)]
+    pub widescan: WidescanList,
+}
+
+/// Mirror of `ffxi_client`'s wide-scan model across the wire boundary. Entries
+/// arrive between s2c 0x0F6 ListStart/ListEnd frames; `tracked` follows 0x0F5.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WidescanList {
+    pub entries: Vec<WidescanEntry>,
+    pub tracked: Option<WidescanTracked>,
+}
+
+/// One wide-scan list row. Mirrors `ffxi_proto::decode::WidescanEntry`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WidescanEntry {
+    pub act_index: u16,
+    pub level: u8,
+    /// Marker category: 0 = char, 1 = npc, 2 = mob (0x0f4_tracking_list.cpp).
+    pub kind: u8,
+    /// Entity minus self position, server units.
+    pub rel_x: i16,
+    pub rel_z: i16,
+    /// Server sName (empty from current LSB); the viewer falls back to the
+    /// local entity name keyed on `act_index`.
+    pub name: String,
+}
+
+/// The currently tracked entity's absolute position. Mirrors
+/// `ffxi_proto::decode::WidescanPos` (raw server coordinates).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WidescanTracked {
+    pub act_index: u16,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
 }
 
 /// `equipped` is indexed by SAVE_EQUIP_KIND slot id (0 = Main .. 15 = Back);
@@ -1055,6 +1094,7 @@ mod tests {
             emote_jobs: None,
             emote_chairs: None,
             check: None,
+            widescan: WidescanList::default(),
         }
     }
 

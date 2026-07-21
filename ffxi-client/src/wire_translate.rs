@@ -82,6 +82,31 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         emote_chairs: s.emote_chairs,
 
         check: s.check_result.as_ref().map(check_to_wire),
+
+        widescan: widescan_to_wire(&s.widescan),
+    }
+}
+
+fn widescan_to_wire(w: &crate::state::WidescanList) -> wire::WidescanList {
+    wire::WidescanList {
+        entries: w
+            .entries
+            .iter()
+            .map(|e| wire::WidescanEntry {
+                act_index: e.act_index,
+                level: e.level,
+                kind: e.kind,
+                rel_x: e.rel_x,
+                rel_z: e.rel_z,
+                name: e.name.clone(),
+            })
+            .collect(),
+        tracked: w.tracked.map(|t| wire::WidescanTracked {
+            act_index: t.act_index,
+            x: t.x,
+            y: t.y,
+            z: t.z,
+        }),
     }
 }
 

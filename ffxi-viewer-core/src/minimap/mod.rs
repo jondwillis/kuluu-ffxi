@@ -240,6 +240,7 @@ impl Plugin for MinimapPlugin {
             .init_resource::<input::MinimapHoverGate>()
             .init_resource::<input::MinimapDrag>()
             .init_resource::<overlay::MinimapDots>()
+            .init_resource::<overlay::MarkerFilters>()
             .add_plugins((topdown::TopdownBackendPlugin, retail::RetailBackendPlugin))
             .add_systems(
                 Update,
@@ -482,9 +483,22 @@ pub fn update_minimap_crop_rect(
         return;
     };
     let size = image.size_f32();
+    let Some(pixel_rect) = crop_pixel_rect(full, visible, size) else {
+        return;
+    };
+
+    if image_node.rect != Some(pixel_rect) {
+        image_node.rect = Some(pixel_rect);
+    }
+}
+
+/// Pixel sub-rect of a full-zone map image that `visible` covers, for
+/// `ImageNode.rect` cropping. Shared by the minimap widget and the full Map
+/// screen so both crop the same DAT image identically.
+pub fn crop_pixel_rect(full: MinimapAabb, visible: MinimapAabb, image_size: Vec2) -> Option<Rect> {
     let full_span = full.max - full.min;
     if full_span.x.abs() < f32::EPSILON || full_span.y.abs() < f32::EPSILON {
-        return;
+        return None;
     }
     let uv_min = Vec2::new(
         (visible.min.x - full.min.x) / full_span.x,
@@ -494,15 +508,10 @@ pub fn update_minimap_crop_rect(
         (visible.max.x - full.min.x) / full_span.x,
         (visible.max.y - full.min.y) / full_span.y,
     );
-
-    let pixel_rect = Rect {
-        min: (uv_min * size).max(Vec2::ZERO),
-        max: (uv_max * size).min(size),
-    };
-
-    if image_node.rect != Some(pixel_rect) {
-        image_node.rect = Some(pixel_rect);
-    }
+    Some(Rect {
+        min: (uv_min * image_size).max(Vec2::ZERO),
+        max: (uv_max * image_size).min(image_size),
+    })
 }
 
 pub fn update_minimap_visibility(

@@ -22,6 +22,19 @@ use ffxi_viewer_core::weather::{apply_zone_weather, sample_zone_weather, ZoneWea
 use ffxi_viewer_core::SceneState;
 use std::env;
 
+// --sky reuses the REAL client sky pipeline (no reimplementation): the skybox
+// gradient dome, the sun/moon discs + directional lights, and the lens flare,
+// all driven by sun_moon_system exactly as ViewerCorePlugin wires them. Lets us
+// tune the daytime sun glow + warm tone deterministically at a fixed --hour.
+use bevy::core_pipeline::prepass::DepthPrepass;
+use bevy::post_process::bloom::{Bloom, BloomPrefilter};
+use ffxi_viewer_core::graphics::settings::{GraphicsSettings, SkyStyle};
+use ffxi_viewer_core::lens_flare::LensFlarePlugin;
+use ffxi_viewer_core::moon_material::{MoonMaterial, MoonMaterialPlugin};
+use ffxi_viewer_core::skybox::SkyboxPlugin;
+use ffxi_viewer_core::sun_moon::{spawn_sun_and_moon, sun_moon_system, VanaSky};
+use ffxi_viewer_core::weather::ZoneDirectionalLighting;
+
 #[derive(Resource, Clone)]
 struct P {
     file_id: u32,
@@ -34,6 +47,9 @@ struct P {
     cam: Option<Vec3>,
     tgt: Vec3,
     fog: bool,
+    sky: bool,
+    vanilla_sky: bool,
+    enhanced_sky: bool,
     hour: f32,
     // Reproduce the live client's sun exactly: sun_moon.rs bias values,
     // cascade_config_from_settings(High preset), 4096 shadow map, and the
@@ -61,6 +77,9 @@ fn main() {
         cam: None,
         tgt: Vec3::ZERO,
         fog: false,
+        sky: false,
+        vanilla_sky: false,
+        enhanced_sky: false,
         hour: 12.0,
         client_sun: false,
     };
@@ -112,6 +131,20 @@ fn main() {
             }
             "--fog" => {
                 p.fog = true;
+                i += 1;
+            }
+            "--sky" => {
+                p.sky = true;
+                i += 1;
+            }
+            "--vanilla-sky" => {
+                p.sky = true;
+                p.vanilla_sky = true;
+                i += 1;
+            }
+            "--enhanced-sky" => {
+                p.sky = true;
+                p.enhanced_sky = true;
                 i += 1;
             }
             "--hour" => {
@@ -168,7 +201,7 @@ fn main() {
             Update,
             (sample_zone_weather, apply_zone_weather)
                 .chain()
-                .run_if(|p: Res<P>| p.fog),
+                .run_if(|p: Res<P>| p.fog || p.sky),
         )
         .add_systems(Startup, (setup, fire, load_weather))
         .add_systems(
@@ -189,6 +222,42 @@ fn main() {
     // without this plugin its param validation panics on any zone load.
     #[cfg(feature = "enhanced-water")]
     app.add_plugins(ffxi_viewer_core::water_enhanced::EnhancedWaterPlugin);
+
+    // --sky pulls in the real client sky pipeline. spawn_sun_and_moon runs in
+    // setup (below); sun_moon_system drives the discs/lights each frame after
+    // the weather record is sampled, and LensFlarePlugin chains its own system
+    // after sun_moon_system, exactly as ViewerCorePlugin orders them.
+    let (sky, sky_style) = {
+        let p = app.world().resource::<P>();
+        // Default is now Vanilla (retail-faithful painterly sun flare); --sky
+        // renders that default, --enhanced-sky forces the Enhanced realism style.
+        let style = if p.enhanced_sky {
+            SkyStyle::Enhanced
+        } else if p.vanilla_sky {
+            SkyStyle::Vanilla
+        } else {
+            GraphicsSettings::default().sky_style
+        };
+        (p.sky, style)
+    };
+    if sky {
+        let settings = GraphicsSettings {
+            sky_style,
+            ..GraphicsSettings::default()
+        };
+        // Derive SkyRealism from the style via the real mapping (the same one
+        // apply_sky_realism_system uses), so the two never drift.
+        let realism = sky_style.sky_realism();
+        app.insert_resource(settings)
+            .insert_resource(realism)
+            .add_plugins(SkyboxPlugin)
+            .add_plugins(MoonMaterialPlugin)
+            .add_plugins(LensFlarePlugin)
+            .init_resource::<VanaSky>()
+            .init_resource::<ZoneDirectionalLighting>()
+            .add_systems(Startup, spawn_celestials)
+            .add_systems(Update, sun_moon_system.after(sample_zone_weather));
+    }
     app.run();
 }
 fn print_toasts(mut rx: MessageReader<ToastEvent>) {
@@ -201,6 +270,7 @@ fn setup(
     p: Res<P>,
     mut d: ResMut<DrawDistance>,
     mut images: ResMut<Assets<Image>>,
+    settings: Res<GraphicsSettings>,
 ) {
     d.zone_geom_mode = p.mode;
     d.world = 1e5;
@@ -279,11 +349,47 @@ fn setup(
                 .with_scale(ffxi_viewer_core::weather::FOG_VOLUME_SCALE),
         ));
     }
+    if p.sky {
+        // Same post-processing the client camera carries (camera.rs
+        // build_operator_camera): HDR + Bloom give the sun disc its bloom halo,
+        // tonemapping matches the active sky style, and the far plane must clear
+        // the skybox dome (radius SKYBOX_RADIUS 5500) or the sky is clipped away.
+        // OperatorCamera is what sun_moon_system tracks to place the discs and
+        // what apply_zone_weather attaches DistanceFog to.
+        c.entity(cam).insert((
+            OperatorCamera,
+            bevy::camera::Hdr,
+            settings.tonemapping(),
+            Bloom {
+                intensity: settings.bloom_intensity,
+                prefilter: BloomPrefilter {
+                    threshold: 1.0,
+                    threshold_softness: 0.4,
+                },
+                ..Bloom::NATURAL
+            },
+            Projection::Perspective(PerspectiveProjection {
+                far: settings.view_distance.max(12000.0),
+                fov: settings.fov_deg.to_radians(),
+                ..default()
+            }),
+            // The Vanilla lens flare samples the depth prepass to fade behind
+            // terrain (lens_flare.wgsl #ifdef DEPTH_PREPASS); the client turns
+            // this on while the sun is up (apply_camera_prepass_system).
+            DepthPrepass,
+        ));
+    }
     c.insert_resource(GlobalAmbientLight {
         color: Color::WHITE,
         brightness: p.amb,
         ..default()
     });
+
+    // --sky spawns the real sun/moon/disc rig via spawn_celestials; skip the
+    // debug single-light sun so there is exactly one IsSun in the scene.
+    if p.sky {
+        return;
+    }
 
     let sun = if p.client_sun {
         // Mirror sun_moon.rs exactly: same bias values, same cascade config
@@ -329,6 +435,29 @@ fn fire(mut tx: MessageWriter<LoadMzbRequest>, p: Res<P>) {
         world_pos: Vec3::ZERO,
         auto_loaded: false,
     });
+}
+
+// The real client spawner (sun_moon.rs), used verbatim so the harness renders
+// the same sun/moon directional lights + emissive discs the client does.
+// Only registered under --sky, so Assets<MoonMaterial> (from MoonMaterialPlugin)
+// is guaranteed present.
+fn spawn_celestials(
+    mut c: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut std_mats: ResMut<Assets<StandardMaterial>>,
+    mut moon_mats: ResMut<Assets<MoonMaterial>>,
+    settings: Res<GraphicsSettings>,
+) {
+    c.insert_resource(bevy::light::DirectionalLightShadowMap {
+        size: settings.shadow_map_size as usize,
+    });
+    spawn_sun_and_moon(
+        &mut c,
+        &mut meshes,
+        &mut std_mats,
+        &mut moon_mats,
+        &settings,
+    );
 }
 // Headless mirror of weather::load_zone_weather: that system derives the zone
 // from the live SceneState snapshot, but this example has no login flow — the

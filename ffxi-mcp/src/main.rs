@@ -859,6 +859,10 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::CheckEquipReceived { .. } => "check_equip_received",
         AgentEvent::CheckGeneralReceived { .. } => "check_general_received",
         AgentEvent::CheckCleared => "check_cleared",
+        AgentEvent::WidescanListStart => "widescan_list_start",
+        AgentEvent::WidescanEntryReceived { .. } => "widescan_entry_received",
+        AgentEvent::WidescanListEnd => "widescan_list_end",
+        AgentEvent::WidescanTrackUpdated { .. } => "widescan_track_updated",
     }
 }
 
@@ -907,6 +911,10 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         TextInput { .. } => "text_input",
         DebugDrive { .. } => "debug_drive",
         DebugHeights => "debug_heights",
+        SetTargetLock { .. } => "set_target_lock",
+        WidescanRequest => "widescan_request",
+        WidescanTrack { .. } => "widescan_track",
+        WidescanEnd => "widescan_end",
     }
 }
 
@@ -1363,6 +1371,8 @@ mod tests {
                     quantity: 1,
                     locked: false,
                     price: 0,
+                    charges_remaining: None,
+                    next_use_vana_ts: None,
                 },
             },
         };

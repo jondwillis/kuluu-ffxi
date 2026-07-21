@@ -641,6 +641,26 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 handler: |c| parse_minimap(c.rest),
             },
             Command {
+                aliases: &["map", "m"],
+                usage: "",
+                summary: "open the full-screen Map + Widescan menu",
+                handler: |c| {
+                    if c.rest.is_empty() {
+                        SlashOutcome::OpenMenu(MenuKind::Map)
+                    } else {
+                        unknown_command(c.cmd)
+                    }
+                },
+            },
+            Command {
+                // /ws is the weaponskill command; widescan takes /wscan to avoid
+                // shadowing it.
+                aliases: &["widescan", "wscan"],
+                usage: "",
+                summary: "request the server wide-scan tracking list and echo it to chat",
+                handler: |_| SlashOutcome::Widescan,
+            },
+            Command {
                 aliases: &["clock"],
                 usage: "[show|hide|toggle]",
                 summary: "toggle the Vana'diel clock widget (same state as the Current Time menu entry)",
@@ -974,6 +994,8 @@ pub enum SlashOutcome {
     ApplyKeybinds(KeybindUpdate),
 
     OpenMenu(MenuKind),
+
+    Widescan,
 
     NavInfo,
 
@@ -3304,6 +3326,47 @@ mod tests {
             SlashOutcome::SystemMessage(s) => assert!(s.contains("/blarg")),
             _ => panic!("expected SystemMessage"),
         }
+    }
+
+    #[test]
+    fn map_and_alias_open_map_menu() {
+        for slash in ["/map", "/m"] {
+            assert!(
+                matches!(
+                    parse_slash_t(slash, &empty_entities(), origin(), None, None),
+                    SlashOutcome::OpenMenu(MenuKind::Map)
+                ),
+                "{slash} should open the Map menu"
+            );
+        }
+        assert!(matches!(
+            parse_slash_t("/map foo", &empty_entities(), origin(), None, None),
+            SlashOutcome::SystemMessage(_)
+        ));
+    }
+
+    #[test]
+    fn widescan_requests_list() {
+        for slash in ["/widescan", "/wscan"] {
+            assert!(
+                matches!(
+                    parse_slash_t(slash, &empty_entities(), origin(), None, None),
+                    SlashOutcome::Widescan
+                ),
+                "{slash} should fire a wide-scan request"
+            );
+        }
+    }
+
+    #[test]
+    fn ws_alias_stays_weaponskill() {
+        assert!(
+            !matches!(
+                parse_slash_t("/ws Fast Blade", &empty_entities(), origin(), None, None),
+                SlashOutcome::Widescan
+            ),
+            "/ws must remain the weaponskill command, not widescan"
+        );
     }
 
     #[test]

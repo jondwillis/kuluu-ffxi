@@ -249,6 +249,7 @@ pub fn text_input_system(
             InputMode::Menu(stack) => {
                 if let Some(next) = handle_menu_key(
                     &ev.logical_key,
+                    ev.key_code,
                     &mut bindings,
                     stack,
                     &mut scene_state,
@@ -266,6 +267,9 @@ pub fn text_input_system(
                     &dynamic_menu,
                     current_target,
                     self_pos,
+                    &mut slash_writers.minimap_zoom,
+                    &mut slash_writers.minimap_view,
+                    &slash_writers.minimap_state,
                 ) {
                     *mode = next;
                 }
@@ -348,6 +352,28 @@ pub fn text_input_system(
                 );
             }
         }
+    }
+}
+
+/// Seconds between wide-scan list re-requests while the Map screen is open.
+const WIDESCAN_REFRESH_SECS: f32 = 4.0;
+
+/// Retail streams wide-scan updates; while the Map screen is open we re-issue
+/// the 0x0F4 list request on an interval so the roster and distances stay fresh.
+pub fn widescan_refresh_system(
+    mode: Res<InputMode>,
+    time: Res<Time>,
+    cmd_tx: Res<CommandTx>,
+    mut timer: Local<Option<Timer>>,
+) {
+    if !ffxi_viewer_core::hud::map_screen::map_open(&mode) {
+        *timer = None;
+        return;
+    }
+    let timer = timer
+        .get_or_insert_with(|| Timer::from_seconds(WIDESCAN_REFRESH_SECS, TimerMode::Repeating));
+    if timer.tick(time.delta()).just_finished() {
+        let _ = cmd_tx.0.try_send(AgentCommand::WidescanRequest);
     }
 }
 
@@ -2004,6 +2030,21 @@ fn apply_slash_outcome(
         SlashOutcome::CopyToasts { n } => {
             apply_copy_toasts(n, scene_state);
         }
+        SlashOutcome::Widescan => {
+            let _ = cmd_tx.try_send(AgentCommand::WidescanRequest);
+            let rows = ffxi_viewer_core::hud::map_screen::widescan_rows(&scene_state.snapshot);
+            if rows.is_empty() {
+                push_system_chat_line(
+                    scene_state,
+                    "[widescan] no targets (requesting refresh…)".into(),
+                );
+            } else {
+                push_system_chat_line(scene_state, format!("[widescan] {} target(s):", rows.len()));
+                for row in rows {
+                    push_system_chat_line(scene_state, format!("  {}", row.label));
+                }
+            }
+        }
         SlashOutcome::OpenMenu(kind) => {
             let label: std::borrow::Cow<'static, str> = match kind {
                 ffxi_viewer_core::MenuKind::Magic => "Magic".into(),
@@ -2025,6 +2066,7 @@ fn apply_slash_outcome(
                     format!("ItemAction({item_no})").into()
                 }
                 ffxi_viewer_core::MenuKind::EquipSlot(slot) => format!("EquipSlot({slot})").into(),
+                ffxi_viewer_core::MenuKind::Map => "Map".into(),
             };
             push_system_chat_line(scene_state, format!("[menu] opened {label}"));
         }
@@ -2370,13 +2412,8 @@ fn apply_graphics_cycle(
 }
 
 fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
-    use ffxi_viewer_core::hud::menu::{
-        COMM_EMOTE_LIST, ROOT_COMMUNICATION, ROOT_LOG_OUT, ROOT_SHUT_DOWN,
-    };
+    use ffxi_viewer_core::hud::menu::{COMM_EMOTE_LIST, ROOT_LOG_OUT, ROOT_SHUT_DOWN};
     match (kind, label) {
-        (MenuKind::Root, l) if l == ROOT_COMMUNICATION => {
-            MenuDispatch::OpenSubmenu(MenuKind::Communication)
-        }
         (MenuKind::Communication, l) if l == COMM_EMOTE_LIST => {
             MenuDispatch::OpenSubmenu(MenuKind::EmoteList)
         }
@@ -2398,19 +2435,16 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
                 .into(),
         },
 
-        (MenuKind::Root, "Config") => MenuDispatch::OpenSubmenu(MenuKind::Config),
+        // The Map screen is a bespoke pane (no generic right-pane preview via
+        // root_child_kind), so it needs its own drill arm ahead of the catch-all.
+        (MenuKind::Root, "Map") => MenuDispatch::OpenSubmenu(MenuKind::Map),
 
-        (MenuKind::Root, "Debug") => MenuDispatch::OpenSubmenu(MenuKind::Debug),
-
-        (MenuKind::Root, "Graphics") => MenuDispatch::OpenSubmenu(MenuKind::Graphics),
-
-        (MenuKind::Root, "Magic") => MenuDispatch::OpenSubmenu(MenuKind::Magic),
-        (MenuKind::Root, "Abilities") => MenuDispatch::OpenSubmenu(MenuKind::Abilities),
-        (MenuKind::Root, "Items") => MenuDispatch::OpenSubmenu(MenuKind::Items),
-        (MenuKind::Root, "Key Items") => MenuDispatch::OpenSubmenu(MenuKind::KeyItems),
-        (MenuKind::Root, "Equipment") => MenuDispatch::OpenSubmenu(MenuKind::Equipment),
-
-        (MenuKind::Root, "Status") => MenuDispatch::OpenSubmenu(MenuKind::Status),
+        // Root categories that drill into a browsable submenu share their
+        // mapping with the right-pane preview (single source of truth).
+        (MenuKind::Root, label) => match ffxi_viewer_core::hud::menu::root_child_kind(label) {
+            Some(submenu) => MenuDispatch::OpenSubmenu(submenu),
+            None => MenuDispatch::NotImplemented(label.to_string()),
+        },
 
         (MenuKind::Magic, _) => {
             MenuDispatch::NotImplemented("Magic — pending Stage 2 (learned-spell decoder)".into())
@@ -2613,6 +2647,11 @@ fn confirm_menu_at_cursor(
             // opens (c2s 0x119 → s2c 0x11A gates the Job row).
             if submenu == MenuKind::EmoteList {
                 let _ = cmd_tx.try_send(AgentCommand::RequestEmoteList);
+            }
+            // Entering the Map screen pulls a fresh wide-scan list (0x0F4
+            // SendFlg=1); a client interval re-requests while it stays open.
+            if submenu == MenuKind::Map {
+                let _ = cmd_tx.try_send(AgentCommand::WidescanRequest);
             }
             stack.push(submenu);
             None
@@ -3166,8 +3205,15 @@ pub fn mouse_nav_dispatch_system(
 
     for ev in menu_events.read() {
         if let InputMode::Menu(stack) = &mut *mode {
-            if let Some(level) = stack.current_mut() {
+            // A click focuses the clicked pane and drops its cursor on the row,
+            // then confirms — a left-pane click re-drills like the keyboard path.
+            stack.active_pane = ev.pane;
+            let level_idx = stack.pane_level_index(ev.pane);
+            if let Some(level) = stack.levels.get_mut(level_idx) {
                 level.cursor = ev.slot;
+            }
+            if ev.pane == ffxi_viewer_core::input_mode::Pane::Left && stack.levels.len() >= 2 {
+                stack.pop();
             }
             if let Some(next) = confirm_menu_at_cursor(
                 &mut bindings,
@@ -3259,6 +3305,7 @@ pub fn mouse_nav_dispatch_system(
 
 fn handle_menu_key(
     key: &Key,
+    key_code: KeyCode,
     bindings: &mut Bindings,
     stack: &mut MenuStack,
     scene_state: &mut SceneState,
@@ -3276,9 +3323,46 @@ fn handle_menu_key(
     dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
     target_id: Option<u32>,
     self_pos: ffxi_viewer_wire::Vec3,
+    minimap_zoom: &mut ffxi_viewer_core::minimap::MinimapZoom,
+    minimap_view: &mut ffxi_viewer_core::minimap::MinimapView,
+    minimap_state: &ffxi_viewer_core::minimap::MinimapState,
 ) -> Option<InputMode> {
+    use ffxi_viewer_core::input_mode::Pane;
+
+    let top_kind = stack.current()?.kind;
+
+    // The Map screen is a bespoke two-pane surface (map + wide-scan list) with
+    // its own navigation, so it intercepts before the generic menu routing.
+    if top_kind == MenuKind::Map {
+        return handle_map_screen_key(
+            key,
+            key_code,
+            bindings,
+            stack,
+            scene_state,
+            cmd_tx,
+            minimap_zoom,
+            minimap_view,
+            minimap_state,
+        );
+    }
+    let two_pane = !ffxi_viewer_core::hud::menu::renders_bespoke_screen(top_kind);
+
+    // Menu context (not text input), so reading the raw keycode is correct:
+    // Minus toggles the active pane of the generic two-pane menu. Bespoke
+    // full-screen screens draw a single layout, so it does not apply there.
+    if key_code == KeyCode::Minus {
+        if two_pane {
+            stack.toggle_pane();
+        }
+        return None;
+    }
+
+    // Route Up/Down/Confirm/Cancel to the active pane's level: the current
+    // (top) level on the right, its parent (or the Root list) on the left.
+    let on_left = two_pane && stack.active_pane == Pane::Left;
     let (kind, cursor) = {
-        let level = stack.current()?;
+        let level = stack.active_level()?;
         (level.kind, level.cursor)
     };
     let entry_count = ffxi_viewer_core::hud::menu::entry_count(kind, dynamic);
@@ -3402,7 +3486,7 @@ fn handle_menu_key(
         };
         if let Some(forward) = page {
             let rows = ffxi_viewer_core::hud::menu::list_page_rows(kind);
-            let level = stack.current_mut()?;
+            let level = stack.active_level_mut()?;
             level.cursor =
                 ffxi_viewer_core::hud::menu::page_cursor(level.cursor, entry_count, rows, forward);
             return None;
@@ -3410,7 +3494,7 @@ fn handle_menu_key(
     }
 
     if bindings.matches_logical(Action::NavUp, key) {
-        let level = stack.current_mut()?;
+        let level = stack.active_level_mut()?;
         level.cursor = if cursor == 0 {
             entry_count.saturating_sub(1)
         } else {
@@ -3419,12 +3503,18 @@ fn handle_menu_key(
         return None;
     }
     if bindings.matches_logical(Action::NavDown, key) {
-        let level = stack.current_mut()?;
+        let level = stack.active_level_mut()?;
         let next = cursor + 1;
         level.cursor = if next >= entry_count { 0 } else { next };
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
+        // Confirm on a left-pane row re-drills: drop the current child so the
+        // parent (the left pane) becomes the level the confirm drills from,
+        // then the push moves focus back to the right pane.
+        if on_left && stack.levels.len() >= 2 {
+            stack.pop();
+        }
         return confirm_menu_at_cursor(
             bindings,
             stack,
@@ -3446,6 +3536,13 @@ fn handle_menu_key(
         if matches!(kind, MenuKind::Status) {
             status_profile_open.0 = false;
         }
+        // Cancel from the right pane of a drilled-in menu moves focus left
+        // before it would pop; from the left pane (or a single-level/bespoke
+        // menu) it pops, closing back to the world at the root.
+        if !on_left && two_pane && stack.levels.len() >= 2 {
+            stack.active_pane = Pane::Left;
+            return None;
+        }
         return if !stack.pop() {
             Some(InputMode::World)
         } else {
@@ -3453,6 +3550,116 @@ fn handle_menu_key(
         };
     }
     None
+}
+
+/// Yalms panned per arrow press while the map pane is focused.
+const MAP_PAN_STEP_YALMS: f32 = 8.0;
+
+#[allow(clippy::too_many_arguments)]
+fn handle_map_screen_key(
+    key: &Key,
+    key_code: KeyCode,
+    bindings: &Bindings,
+    stack: &mut MenuStack,
+    scene_state: &mut SceneState,
+    cmd_tx: &Sender<AgentCommand>,
+    minimap_zoom: &mut ffxi_viewer_core::minimap::MinimapZoom,
+    minimap_view: &mut ffxi_viewer_core::minimap::MinimapView,
+    minimap_state: &ffxi_viewer_core::minimap::MinimapState,
+) -> Option<InputMode> {
+    use ffxi_viewer_core::hud::map_screen::{widescan_rows, MAP_PANE};
+
+    // Minus toggles map-vs-list focus (the shared two-pane affordance).
+    if key_code == KeyCode::Minus {
+        stack.toggle_pane();
+        return None;
+    }
+
+    if stack.active_pane == MAP_PANE {
+        // Map focused: arrows pan and the camera-zoom keys zoom, reusing the
+        // minimap's MinimapView/MinimapZoom so the two surfaces stay in sync.
+        let pan = if bindings.matches_logical(Action::NavLeft, key) {
+            Some(bevy::math::Vec2::new(-MAP_PAN_STEP_YALMS, 0.0))
+        } else if bindings.matches_logical(Action::NavRight, key) {
+            Some(bevy::math::Vec2::new(MAP_PAN_STEP_YALMS, 0.0))
+        } else if bindings.matches_logical(Action::NavUp, key) {
+            Some(bevy::math::Vec2::new(0.0, -MAP_PAN_STEP_YALMS))
+        } else if bindings.matches_logical(Action::NavDown, key) {
+            Some(bevy::math::Vec2::new(0.0, MAP_PAN_STEP_YALMS))
+        } else {
+            None
+        };
+        if let Some(delta) = pan {
+            minimap_view.pan_offset_xz += delta;
+            minimap_view.idle_frames = 0;
+            return None;
+        }
+        let half = ffxi_viewer_core::minimap::zone_half_span(
+            minimap_state.retail_aabb.or(minimap_state.aabb),
+        );
+        if bindings.matches_logical(Action::CameraZoomIn, key) {
+            minimap_zoom.zoom_by(1.0 / ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR, half);
+            return None;
+        }
+        if bindings.matches_logical(Action::CameraZoomOut, key) {
+            minimap_zoom.zoom_by(ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR, half);
+            return None;
+        }
+        if bindings.matches_logical(Action::NavCancel, key) {
+            return close_map_screen(stack, cmd_tx);
+        }
+        return None;
+    }
+
+    // Wide-scan list focused: cursor the sorted rows; Confirm tracks the row's
+    // act_index (0x0F5), Cancel closes the screen.
+    let rows = widescan_rows(&scene_state.snapshot);
+    let count = rows.len();
+    let cursor = stack.current().map(|l| l.cursor).unwrap_or(0);
+    if bindings.matches_logical(Action::NavUp, key) {
+        if let Some(level) = stack.current_mut() {
+            level.cursor = if count == 0 {
+                0
+            } else if cursor == 0 {
+                count - 1
+            } else {
+                cursor - 1
+            };
+        }
+        return None;
+    }
+    if bindings.matches_logical(Action::NavDown, key) {
+        if let Some(level) = stack.current_mut() {
+            let next = cursor + 1;
+            level.cursor = if count == 0 || next >= count { 0 } else { next };
+        }
+        return None;
+    }
+    if bindings.matches_logical(Action::NavConfirm, key) {
+        if let Some(row) = rows.get(cursor) {
+            if let Err(e) = cmd_tx.try_send(AgentCommand::WidescanTrack {
+                act_index: row.act_index,
+            }) {
+                push_system_chat_line(scene_state, format!("[widescan] track dropped: {e}"));
+            }
+        }
+        return None;
+    }
+    if bindings.matches_logical(Action::NavCancel, key) {
+        return close_map_screen(stack, cmd_tx);
+    }
+    None
+}
+
+/// Close the Map screen: stop tracking (0x0F6) and pop back to the menu it
+/// opened from, or to the world if it was the only level.
+fn close_map_screen(stack: &mut MenuStack, cmd_tx: &Sender<AgentCommand>) -> Option<InputMode> {
+    let _ = cmd_tx.try_send(AgentCommand::WidescanEnd);
+    if stack.pop() {
+        None
+    } else {
+        Some(InputMode::World)
+    }
 }
 
 fn handle_dialog_key(
@@ -4032,6 +4239,40 @@ mod menu_dispatch_tests {
                 MenuDispatch::NotImplemented(label.into()),
                 "{label} should still be a stub"
             );
+        }
+    }
+
+    /// The right-pane preview (`menu::root_child_kind`) and the drill dispatch
+    /// share one Root → submenu mapping; pin that they can't drift apart.
+    #[test]
+    fn root_drill_matches_preview_child_kind() {
+        use ffxi_viewer_core::hud::menu::{self, ROOT_LOG_OUT, ROOT_SHUT_DOWN};
+        for &label in menu::root_entries() {
+            // Log Out / Shut Down fire commands, not a browsable submenu.
+            if label == ROOT_LOG_OUT || label == ROOT_SHUT_DOWN {
+                continue;
+            }
+            match (
+                resolve_menu_entry(MenuKind::Root, label),
+                menu::root_child_kind(label),
+            ) {
+                (MenuDispatch::OpenSubmenu(dispatched), Some(preview)) => {
+                    assert_eq!(dispatched, preview, "{label} drill vs preview drift");
+                }
+                // A drill with no right-pane preview is only legal when it opens
+                // a bespoke full-screen menu (e.g. Map), which renders its own
+                // panes instead of the generic preview.
+                (MenuDispatch::OpenSubmenu(dispatched), None) => {
+                    assert!(
+                        menu::renders_bespoke_screen(dispatched),
+                        "{label}: preview-less drill into non-bespoke {dispatched:?}"
+                    );
+                }
+                (MenuDispatch::NotImplemented(_), None) => {}
+                (dispatch, preview) => {
+                    panic!("{label}: dispatch {dispatch:?} disagrees with preview {preview:?}")
+                }
+            }
         }
     }
 

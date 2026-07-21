@@ -155,7 +155,7 @@ mod tests {
         };
         let serve_event_tx = client_event_tx.clone();
         let _serve = tokio::spawn(async move {
-            let _ = agent_socket::serve(listen, client_cmd_tx, serve_event_tx, None).await;
+            let _ = agent_socket::serve(listen, client_cmd_tx, serve_event_tx, None, None).await;
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;

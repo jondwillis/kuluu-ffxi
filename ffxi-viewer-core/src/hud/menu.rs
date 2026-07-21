@@ -2,7 +2,7 @@ use bevy::prelude::*;
 
 use crate::graphics_settings::{GraphicsSettings, GRAPHICS_FIELDS};
 use crate::hud::style::{self, theme};
-use crate::input_mode::{InputMode, MenuKind};
+use crate::input_mode::{InputMode, MenuKind, MenuStack, Pane};
 
 pub const ROOT_LOG_OUT: &str = "Log Out";
 pub const ROOT_SHUT_DOWN: &str = "Shut Down";
@@ -24,6 +24,7 @@ const ROOT_ENTRIES: &[&str] = &[
     "Status",
     "Party",
     "Search",
+    "Map",
     ROOT_COMMUNICATION,
     "Macros",
     "Graphics",
@@ -33,6 +34,12 @@ const ROOT_ENTRIES: &[&str] = &[
     ROOT_LOG_OUT,
     ROOT_SHUT_DOWN,
 ];
+
+/// The Root command list, for callers that enumerate the top-level entries
+/// (e.g. the drill/preview parity guard) without matching each label.
+pub fn root_entries() -> &'static [&'static str] {
+    ROOT_ENTRIES
+}
 
 const COMMUNICATION_ENTRIES: &[&str] = &[COMM_EMOTE_LIST];
 
@@ -368,6 +375,8 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
 
         MenuKind::Communication => COMMUNICATION_ENTRIES,
         MenuKind::EmoteList => &[],
+        // The Map screen renders its own bespoke panes; it has no generic list.
+        MenuKind::Map => &[],
     }
 }
 
@@ -388,24 +397,71 @@ pub fn menu_title(kind: MenuKind) -> &'static str {
         MenuKind::EquipSlot(_) => "Equip",
         MenuKind::Communication => "Communication",
         MenuKind::EmoteList => "Emote List",
+        MenuKind::Map => "Map",
     }
+}
+
+/// The submenu a Root category drills into, and thus the level the right pane
+/// previews while that category is highlighted at Root. Single source for the
+/// Root → submenu mapping: `text_input::resolve_menu_entry` drills through this
+/// so the client dispatch and the preview can't disagree (guarded by a test in
+/// the client). `None` = a Root entry with no browsable submenu (Party/Search/
+/// Macros fire commands or aren't built; Current Time/Log Out/Shut Down act
+/// directly), so the right pane shows no preview.
+pub fn root_child_kind(label: &str) -> Option<MenuKind> {
+    Some(match label {
+        "Magic" => MenuKind::Magic,
+        "Abilities" => MenuKind::Abilities,
+        "Items" => MenuKind::Items,
+        "Key Items" => MenuKind::KeyItems,
+        "Equipment" => MenuKind::Equipment,
+        "Status" => MenuKind::Status,
+        ROOT_COMMUNICATION => MenuKind::Communication,
+        "Graphics" => MenuKind::Graphics,
+        "Config" => MenuKind::Config,
+        "Debug" => MenuKind::Debug,
+        _ => return None,
+    })
+}
+
+/// Kinds that render their own framed multi-panel screen (item_screen /
+/// equipment_screen) instead of the generic two-pane list, so the generic pane
+/// is suppressed and its pane-toggle does not apply while one is on top.
+pub fn renders_bespoke_screen(kind: MenuKind) -> bool {
+    matches!(
+        kind,
+        MenuKind::Equipment
+            | MenuKind::EquipSlot(_)
+            | MenuKind::Items
+            | MenuKind::UsableItems
+            | MenuKind::Map
+    )
 }
 
 #[derive(Component)]
 pub struct MainMenu;
 
 #[derive(Component)]
-pub struct MainMenuTitle;
+pub struct MainMenuTitle {
+    pub pane: Pane,
+}
 
 #[derive(Component)]
 pub struct MainMenuRow {
+    pub pane: Pane,
     pub slot: usize,
 }
 
 #[derive(Message, Debug, Clone, Copy)]
 pub struct MenuRowActivated {
+    pub pane: Pane,
     pub slot: usize,
 }
+
+/// Each column matches the old single-pane width; two of them sit side by side
+/// under the top help bar (retail's Command Menu is two equal columns). Bespoke
+/// screens (Map wide-scan column) reuse this so the pane widths can't drift.
+pub const MENU_PANE_WIDTH: f32 = 220.0;
 
 pub fn spawn_main_menu(mut commands: Commands) {
     commands
@@ -416,36 +472,41 @@ pub fn spawn_main_menu(mut commands: Commands) {
                 position_type: PositionType::Absolute,
                 top: Val::Px(48.0),
                 right: Val::Px(8.0),
-
-                width: Val::Px(240.0),
-                padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
-                border: UiRect::all(Val::Px(1.0)),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(2.0),
+                column_gap: Val::Px(6.0),
+                flex_direction: FlexDirection::Row,
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(theme::FRAME_BG),
-            BorderColor::all(theme::FRAME_EDGE),
         ))
         .with_children(|p| {
-            p.spawn((
-                MainMenuTitle,
-                Text::new(""),
-                style::text_font(14.0),
-                TextColor(theme::TITLE),
-            ));
-
-            for slot in 0..MAX_ENTRY_COUNT {
-                p.spawn((
-                    MainMenuRow { slot },
-                    Button,
-                    Text::new(""),
-                    style::text_font(14.0),
-                    TextColor(theme::TEXT),
-                ));
+            for pane in [Pane::Left, Pane::Right] {
+                spawn_pane_column(p, pane);
             }
         });
+}
+
+fn spawn_pane_column(parent: &mut ChildSpawnerCommands, pane: Pane) {
+    let (mut node, bg, border) = style::window_frame();
+    node.width = Val::Px(MENU_PANE_WIDTH);
+    parent.spawn((node, bg, border)).with_children(|c| {
+        c.spawn((
+            MainMenuTitle { pane },
+            Text::new(""),
+            style::text_font(14.0),
+            TextColor(theme::TITLE),
+        ));
+
+        for slot in 0..MAX_ENTRY_COUNT {
+            c.spawn((
+                MainMenuRow { pane, slot },
+                Button,
+                Text::new(""),
+                style::text_font(14.0),
+                TextColor(theme::TEXT),
+                BackgroundColor(Color::NONE),
+            ));
+        }
+    });
 }
 
 pub fn refresh_dynamic_menu_rows(
@@ -839,6 +900,52 @@ pub fn ability_group_empty_hint(group: crate::hud::action_model::AbilityGroup) -
     }
 }
 
+/// What one column renders this frame. `interactive` distinguishes a real
+/// (navigable) level from the Root right-pane preview.
+struct PaneView {
+    kind: MenuKind,
+    cursor: Option<usize>,
+    interactive: bool,
+}
+
+fn pane_view(stack: &MenuStack, pane: Pane, dynamic: &DynamicMenu) -> Option<PaneView> {
+    let depth = stack.levels.len();
+    if depth == 0 {
+        return None;
+    }
+    match pane {
+        Pane::Left => {
+            let idx = stack.pane_level_index(Pane::Left);
+            let level = &stack.levels[idx];
+            Some(PaneView {
+                kind: level.kind,
+                cursor: Some(level.cursor),
+                interactive: true,
+            })
+        }
+        Pane::Right if depth >= 2 => {
+            let level = &stack.levels[depth - 1];
+            Some(PaneView {
+                kind: level.kind,
+                cursor: Some(level.cursor),
+                interactive: true,
+            })
+        }
+        // At Root the right column previews the highlighted category's child
+        // rows, non-interactive until a drill-in makes it the current level.
+        Pane::Right => {
+            let root = &stack.levels[0];
+            let label = entry_label(root.kind, root.cursor, dynamic);
+            root_child_kind(label).map(|kind| PaneView {
+                kind,
+                cursor: None,
+                interactive: false,
+            })
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
 pub fn update_main_menu(
     mode: Res<InputMode>,
     settings: Res<GraphicsSettings>,
@@ -848,98 +955,125 @@ pub fn update_main_menu(
     scene: Res<crate::snapshot::SceneState>,
     dynamic: Res<DynamicMenu>,
     mut menu_q: Query<&mut Node, (With<MainMenu>, Without<MainMenuRow>)>,
-    mut row_q: Query<(&MainMenuRow, &mut Node, &mut Text, &mut TextColor), Without<MainMenuTitle>>,
-    mut title_q: Query<&mut Text, (With<MainMenuTitle>, Without<MainMenuRow>)>,
+    mut row_q: Query<
+        (
+            &MainMenuRow,
+            &mut Node,
+            &mut Text,
+            &mut TextColor,
+            &mut BackgroundColor,
+        ),
+        Without<MainMenuTitle>,
+    >,
+    mut title_q: Query<(&MainMenuTitle, &mut Text), Without<MainMenuRow>>,
 ) {
     let Ok(mut node) = menu_q.single_mut() else {
         return;
     };
 
-    let active: Option<(MenuKind, usize)> = match &*mode {
-        InputMode::Menu(stack) => stack.current().map(|l| (l.kind, l.cursor)),
-        _ => None,
+    let hide = |node: &mut Node| {
+        if node.display != Display::None {
+            node.display = Display::None;
+        }
     };
 
-    match active {
-        // The Equipment screen (hud::equipment_screen) and the Items screen
-        // (hud::item_screen) render their own framed multi-panel layouts for
-        // these kinds; suppress the generic text panel. UsableItems (the action
-        // ring's Items list) now rides the item_screen panel too.
-        Some((
-            MenuKind::Equipment | MenuKind::EquipSlot(_) | MenuKind::Items | MenuKind::UsableItems,
-            _,
-        )) => {
-            if node.display != Display::None {
-                node.display = Display::None;
-            }
+    let stack = match &*mode {
+        InputMode::Menu(stack) => stack,
+        _ => {
+            hide(&mut node);
+            return;
         }
-        Some((kind, c)) => {
-            node.display = Display::Flex;
+    };
+    let Some(top_kind) = stack.current().map(|l| l.kind) else {
+        hide(&mut node);
+        return;
+    };
+    // The Equipment / Items screens render their own framed multi-panel layout;
+    // suppress the generic two-pane while one is on top.
+    if renders_bespoke_screen(top_kind) {
+        hide(&mut node);
+        return;
+    }
+    if node.display != Display::Flex {
+        node.display = Display::Flex;
+    }
 
-            if let Ok(mut text) = title_q.single_mut() {
-                let want = menu_title(kind);
-                if **text != *want {
-                    **text = want.to_string();
-                }
-            }
+    let active_idx = stack.active_level_index();
+    let left = pane_view(stack, Pane::Left, &dynamic);
+    let right = pane_view(stack, Pane::Right, &dynamic);
+    let view_for = |pane: Pane| match pane {
+        Pane::Left => &left,
+        Pane::Right => &right,
+    };
 
-            let (total_count, viewport_start) = resolve_viewport(kind, c, &dynamic);
-
-            let window = visible_window(kind, total_count);
-            for (row, mut row_node, mut text, mut color) in row_q.iter_mut() {
-                let list_idx = viewport_start + row.slot;
-                let visible = row.slot < window && list_idx < total_count;
-                if !visible {
-                    if row_node.display != Display::None {
-                        row_node.display = Display::None;
-                    }
-                    continue;
-                }
-                let label_owned: String = if is_dynamic(kind) {
-                    entry_label(kind, list_idx, &dynamic).to_string()
-                } else {
-                    static_entries(kind)
-                        .get(list_idx)
-                        .copied()
-                        .unwrap_or("<unknown>")
-                        .to_string()
-                };
-                if row_node.display != Display::Flex {
-                    row_node.display = Display::Flex;
-                }
-                let is_cursor = list_idx == c;
-                let body = format_row_body(
-                    kind,
-                    list_idx,
-                    &label_owned,
-                    &settings,
-                    &panels,
-                    net_status.0,
-                    &scene.snapshot,
-                );
-                let want = if is_cursor {
-                    format!("> {body}")
-                } else {
-                    format!("  {body}")
-                };
-                if **text != want {
-                    **text = want;
-                }
-
-                let want_color = if is_cursor {
-                    theme::CURSOR
-                } else {
-                    theme::TEXT
-                };
-                if color.0 != want_color {
-                    color.0 = want_color;
-                }
-            }
+    for (title, mut text) in title_q.iter_mut() {
+        let want = view_for(title.pane)
+            .as_ref()
+            .map(|v| menu_title(v.kind))
+            .unwrap_or("");
+        if **text != *want {
+            **text = want.to_string();
         }
-        None => {
-            if node.display != Display::None {
-                node.display = Display::None;
-            }
+    }
+
+    for (row, mut row_node, mut text, mut color, mut bg) in row_q.iter_mut() {
+        let Some(view) = view_for(row.pane) else {
+            hide(&mut row_node);
+            continue;
+        };
+        let (total, viewport_start) =
+            resolve_viewport(view.kind, view.cursor.unwrap_or(0), &dynamic);
+        let window = visible_window(view.kind, total);
+        let list_idx = viewport_start + row.slot;
+        if row.slot >= window || list_idx >= total {
+            hide(&mut row_node);
+            continue;
+        }
+        if row_node.display != Display::Flex {
+            row_node.display = Display::Flex;
+        }
+
+        let label_owned: String = if is_dynamic(view.kind) {
+            entry_label(view.kind, list_idx, &dynamic).to_string()
+        } else {
+            static_entries(view.kind)
+                .get(list_idx)
+                .copied()
+                .unwrap_or("<unknown>")
+                .to_string()
+        };
+        let body = format_row_body(
+            view.kind,
+            list_idx,
+            &label_owned,
+            &settings,
+            &panels,
+            net_status.0,
+            &scene.snapshot,
+        );
+
+        let is_cursor = view.cursor == Some(list_idx);
+        // Only the active pane paints a gold cursor + caret; the inactive
+        // interactive pane dims its cursor row (MUTED / CURSOR_BG, no caret);
+        // the non-interactive preview stays muted throughout.
+        let gold = view.interactive && stack.pane_level_index(row.pane) == active_idx;
+        let (want, want_color, want_bg) = if is_cursor && gold {
+            (format!("> {body}"), theme::CURSOR, Color::NONE)
+        } else if is_cursor && view.interactive {
+            (format!("  {body}"), theme::MUTED, theme::CURSOR_BG)
+        } else if view.interactive {
+            (format!("  {body}"), theme::TEXT, Color::NONE)
+        } else {
+            (format!("  {body}"), theme::MUTED, Color::NONE)
+        };
+        if **text != want {
+            **text = want;
+        }
+        if color.0 != want_color {
+            color.0 = want_color;
+        }
+        if bg.0 != want_bg {
+            bg.0 = want_bg;
         }
     }
 }
@@ -968,6 +1102,24 @@ fn resolve_viewport(kind: MenuKind, cursor: usize, dynamic: &DynamicMenu) -> (us
     }
 }
 
+/// The level index and kind a pane navigates, or `None` for a non-interactive
+/// pane (the Root right-pane preview). Mirrors `pane_view`'s interactivity so
+/// mouse and render agree on which rows respond.
+fn interactive_pane_level(stack: &MenuStack, pane: Pane) -> Option<(usize, MenuKind)> {
+    let depth = stack.levels.len();
+    if depth == 0 {
+        return None;
+    }
+    match pane {
+        Pane::Left => {
+            let idx = stack.pane_level_index(Pane::Left);
+            Some((idx, stack.levels[idx].kind))
+        }
+        Pane::Right if depth >= 2 => Some((depth - 1, stack.levels[depth - 1].kind)),
+        Pane::Right => None,
+    }
+}
+
 pub fn menu_mouse_hover_system(
     mut mode: ResMut<InputMode>,
     dynamic: Res<DynamicMenu>,
@@ -976,23 +1128,25 @@ pub fn menu_mouse_hover_system(
     let InputMode::Menu(stack) = &mut *mode else {
         return;
     };
-    let Some(level) = stack.current_mut() else {
-        return;
-    };
-    let kind = level.kind;
-
-    let (total, viewport_start) = resolve_viewport(kind, level.cursor, &dynamic);
-    let window = visible_window(kind, total);
     for (interaction, row) in &rows {
         if !matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
             continue;
         }
+        let Some((level_idx, kind)) = interactive_pane_level(stack, row.pane) else {
+            continue;
+        };
+        let cursor = stack.levels[level_idx].cursor;
+        let (total, viewport_start) = resolve_viewport(kind, cursor, &dynamic);
+        let window = visible_window(kind, total);
         let list_idx = viewport_start + row.slot;
         if list_idx >= total || row.slot >= window {
             continue;
         }
-        if level.cursor != list_idx {
-            level.cursor = list_idx;
+        if stack.active_pane != row.pane {
+            stack.active_pane = row.pane;
+        }
+        if stack.levels[level_idx].cursor != list_idx {
+            stack.levels[level_idx].cursor = list_idx;
         }
     }
 }
@@ -1006,19 +1160,22 @@ pub fn menu_mouse_click_system(
     let InputMode::Menu(stack) = &*mode else {
         return;
     };
-    let Some(level) = stack.current() else {
-        return;
-    };
-    let kind = level.kind;
-    let (total, viewport_start) = resolve_viewport(kind, level.cursor, &dynamic);
-    let window = visible_window(kind, total);
     for (interaction, row) in &rows {
         if *interaction != Interaction::Pressed {
             continue;
         }
+        let Some((level_idx, kind)) = interactive_pane_level(stack, row.pane) else {
+            continue;
+        };
+        let cursor = stack.levels[level_idx].cursor;
+        let (total, viewport_start) = resolve_viewport(kind, cursor, &dynamic);
+        let window = visible_window(kind, total);
         let list_idx = viewport_start + row.slot;
         if list_idx < total && row.slot < window {
-            out.write(MenuRowActivated { slot: list_idx });
+            out.write(MenuRowActivated {
+                pane: row.pane,
+                slot: list_idx,
+            });
         }
     }
 }
@@ -1073,6 +1230,110 @@ pub fn debug_panel_state(label: &str, panels: &crate::hud::HudPanels, net_status
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_pane_focus_toggles_and_resets_on_drill() {
+        let mut stack = MenuStack::root();
+        assert_eq!(stack.active_pane, Pane::Right, "menus open focused right");
+
+        stack.toggle_pane();
+        assert_eq!(stack.active_pane, Pane::Left);
+        stack.toggle_pane();
+        assert_eq!(stack.active_pane, Pane::Right);
+
+        // Drill in: focus resets to the new child (right column).
+        stack.toggle_pane();
+        stack.push(MenuKind::Graphics);
+        assert_eq!(stack.active_pane, Pane::Right);
+        assert_eq!(
+            stack.active_level_index(),
+            1,
+            "right focus is the top level"
+        );
+
+        // Focus left → the active level is the parent (Root at index 0).
+        stack.toggle_pane();
+        assert_eq!(stack.active_level_index(), 0);
+        assert_eq!(stack.active_level().map(|l| l.kind), Some(MenuKind::Root));
+
+        // Popping restores the right focus.
+        assert!(stack.pop());
+        assert_eq!(stack.active_pane, Pane::Right);
+    }
+
+    fn root_menu_app(cursor: usize) -> App {
+        use crate::hud::network_status::NetStatusVisible;
+        use crate::snapshot::SceneState;
+
+        let mut app = App::new();
+        app.init_resource::<GraphicsSettings>()
+            .init_resource::<crate::hud::HudPanels>()
+            .init_resource::<NetStatusVisible>()
+            .init_resource::<SceneState>()
+            .init_resource::<DynamicMenu>();
+
+        let mut stack = MenuStack::root();
+        stack.current_mut().unwrap().cursor = cursor;
+        app.insert_resource(InputMode::Menu(stack));
+
+        app.add_systems(Startup, spawn_main_menu);
+        app.add_systems(Update, update_main_menu);
+        app.update();
+        app
+    }
+
+    fn pane_title(app: &mut App, pane: Pane) -> String {
+        let mut q = app.world_mut().query::<(&MainMenuTitle, &Text)>();
+        q.iter(app.world())
+            .find(|(t, _)| t.pane == pane)
+            .map(|(_, text)| text.0.clone())
+            .expect("pane title exists")
+    }
+
+    fn pane_rows(app: &mut App, pane: Pane) -> Vec<(usize, String)> {
+        let mut q = app.world_mut().query::<(&MainMenuRow, &Text, &Node)>();
+        let mut rows: Vec<(usize, String)> = q
+            .iter(app.world())
+            .filter(|(row, _, node)| row.pane == pane && node.display != Display::None)
+            .map(|(row, text, _)| (row.slot, text.0.clone()))
+            .collect();
+        rows.sort_by_key(|(slot, _)| *slot);
+        rows
+    }
+
+    #[test]
+    fn root_right_pane_previews_the_highlighted_left_category() {
+        let graphics_idx = ROOT_ENTRIES.iter().position(|e| *e == "Graphics").unwrap();
+        let status_idx = ROOT_ENTRIES.iter().position(|e| *e == "Status").unwrap();
+
+        let mut app = root_menu_app(graphics_idx);
+        // Left column = Root command list; its highlighted row wears the gold caret.
+        assert_eq!(pane_title(&mut app, Pane::Left), menu_title(MenuKind::Root));
+        let left = pane_rows(&mut app, Pane::Left);
+        assert_eq!(left[graphics_idx], (graphics_idx, "> Graphics".to_string()));
+        // Right column previews the highlighted category's submenu.
+        assert_eq!(
+            pane_title(&mut app, Pane::Right),
+            menu_title(MenuKind::Graphics)
+        );
+        let right = pane_rows(&mut app, Pane::Right);
+        assert!(
+            right[0].1.contains("Preset"),
+            "right pane previews Graphics rows: {right:?}"
+        );
+
+        // Move the left cursor to Status: the preview follows.
+        let mut app = root_menu_app(status_idx);
+        assert_eq!(
+            pane_title(&mut app, Pane::Right),
+            menu_title(MenuKind::Status)
+        );
+        let right = pane_rows(&mut app, Pane::Right);
+        assert!(
+            right.iter().any(|(_, t)| t.contains("Profile")),
+            "Status preview lists its categories: {right:?}"
+        );
+    }
 
     #[test]
     fn list_page_rows_matches_owning_panel_viewport() {

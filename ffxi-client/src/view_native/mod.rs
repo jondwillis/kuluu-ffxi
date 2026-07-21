@@ -563,6 +563,11 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     app.add_systems(
         Update,
+        text_input::widescan_refresh_system.run_if(in_state(AppPhase::InGame)),
+    );
+
+    app.add_systems(
+        Update,
         input::camera_polish_system
             .before(ffxi_viewer_core::chase_camera_system)
             .before(ffxi_viewer_core::firstperson_camera_system)

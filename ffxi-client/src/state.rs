@@ -416,6 +416,70 @@ pub struct SessionState {
 
     #[serde(default)]
     pub check_result: Option<CheckResult>,
+
+    /// Server-driven wide-scan (tracking) list, accumulated between the s2c 0x0F6
+    /// ListStart/ListEnd frames; `tracked` follows s2c 0x0F5.
+    #[serde(default)]
+    pub widescan: WidescanList,
+}
+
+/// Faithful wide-scan model: the server owns membership, order, and gating
+/// (job/range/floor — vendor/server/src/map/zone_entities.cpp:1578 WideScan).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WidescanList {
+    pub entries: Vec<WidescanEntry>,
+    pub tracked: Option<WidescanPos>,
+    /// `true` while entries are still arriving (between 0x0F6 ListStart and ListEnd).
+    pub building: bool,
+}
+
+/// One wide-scan list row. Serde mirror of `ffxi_proto::decode::WidescanEntry`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WidescanEntry {
+    pub act_index: u16,
+    pub level: u8,
+    /// Marker category: 0 = char, 1 = npc, 2 = mob (0x0f4_tracking_list.cpp).
+    pub kind: u8,
+    /// Entity minus self position in server units.
+    pub rel_x: i16,
+    pub rel_z: i16,
+    /// Server sName; empty from current LSB (0x0f4_tracking_list.cpp TODO). The
+    /// viewer falls back to the local entity name keyed on `act_index`.
+    pub name: String,
+}
+
+impl From<ffxi_proto::decode::WidescanEntry> for WidescanEntry {
+    fn from(e: ffxi_proto::decode::WidescanEntry) -> Self {
+        Self {
+            act_index: e.act_index,
+            level: e.level,
+            kind: e.kind,
+            rel_x: e.rel_x,
+            rel_z: e.rel_z,
+            name: e.name,
+        }
+    }
+}
+
+/// Tracked-entity absolute position. Serde mirror of
+/// `ffxi_proto::decode::WidescanPos` (raw server coordinates).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WidescanPos {
+    pub act_index: u16,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl From<ffxi_proto::decode::WidescanPos> for WidescanPos {
+    fn from(p: ffxi_proto::decode::WidescanPos) -> Self {
+        Self {
+            act_index: p.act_index,
+            x: p.x,
+            y: p.y,
+            z: p.z,
+        }
+    }
 }
 
 /// Accumulated s2c 0x0C9 EQUIP_INSPECT answer for the latest /check on a PC:
@@ -908,6 +972,11 @@ impl SessionState {
 
                 self.current_weather = None;
                 self.check_result = None;
+
+                // Wide-scan is per-zone (server rebuilds it from the new zone's
+                // entities); drop stale entries/track on any zone change or
+                // home-point warp.
+                self.widescan = WidescanList::default();
                 true
             }
             AgentEvent::PositionChanged { pos } => {
@@ -1076,11 +1145,13 @@ impl SessionState {
             AgentEvent::Disconnected { .. } => {
                 let changed = self.stage != Stage::Disconnected
                     || self.diagnostics.stage != Some(Stage::Disconnected)
-                    || self.logout_countdown.is_some();
+                    || self.logout_countdown.is_some()
+                    || self.widescan != WidescanList::default();
                 self.stage = Stage::Disconnected;
                 self.diagnostics.stage = Some(Stage::Disconnected);
 
                 self.logout_countdown = None;
+                self.widescan = WidescanList::default();
                 changed
             }
 
@@ -1502,6 +1573,29 @@ impl SessionState {
                 }
                 changed
             }
+            AgentEvent::WidescanListStart => {
+                let changed = !self.widescan.entries.is_empty() || !self.widescan.building;
+                self.widescan.entries.clear();
+                self.widescan.building = true;
+                changed
+            }
+            AgentEvent::WidescanEntryReceived { entry } => {
+                if !self.widescan.building {
+                    return false;
+                }
+                self.widescan.entries.push(entry.clone());
+                true
+            }
+            AgentEvent::WidescanListEnd => {
+                let changed = self.widescan.building;
+                self.widescan.building = false;
+                changed
+            }
+            AgentEvent::WidescanTrackUpdated { tracked } => {
+                let changed = self.widescan.tracked != *tracked;
+                self.widescan.tracked = *tracked;
+                changed
+            }
         }
     }
 }
@@ -1824,6 +1918,24 @@ pub enum AgentEvent {
 
     /// Outbound /check dispatched: drop the previous target's accumulated result.
     CheckCleared,
+
+    /// s2c 0x0F6 ListStart: a fresh wide-scan list is about to arrive — clear the
+    /// accumulator and mark it building.
+    WidescanListStart,
+
+    /// s2c 0x0F4: one wide-scan entry, appended while the list is building.
+    WidescanEntryReceived {
+        entry: WidescanEntry,
+    },
+
+    /// s2c 0x0F6 ListEnd: the wide-scan list is complete.
+    WidescanListEnd,
+
+    /// s2c 0x0F5: the tracked entity moved (`Some`) or was lost/`State == Lose`
+    /// (`None`, which clears the tracked marker).
+    WidescanTrackUpdated {
+        tracked: Option<WidescanPos>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2078,6 +2190,22 @@ pub enum AgentCommand {
         para: i32,
         para2: i32,
     },
+
+    /// c2s 0x0F4 TRACKING_LIST (SendFlg = 1): request the wide-scan list. The
+    /// server answers with 0x0F6 ListStart, a run of 0x0F4 entries, then 0x0F6
+    /// ListEnd (vendor/server/src/map/packets/c2s/0x0f4_tracking_list.h).
+    WidescanRequest,
+
+    /// c2s 0x0F5 TRACKING_START: begin tracking `act_index`; the server then
+    /// streams 0x0F5 position updates
+    /// (vendor/server/src/map/packets/c2s/0x0f5_tracking_start.h).
+    WidescanTrack {
+        act_index: u16,
+    },
+
+    /// c2s 0x0F6 TRACKING_END: stop tracking
+    /// (vendor/server/src/map/packets/c2s/0x0f6_tracking_end.h).
+    WidescanEnd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2461,6 +2589,64 @@ mod tests {
             mog_zone_flag: false,
         });
         assert_eq!(s.current_weather, None);
+    }
+
+    #[test]
+    fn widescan_list_builds_between_start_and_end_and_clears_on_zone_change() {
+        let mut s = SessionState::default();
+        let entry = |act: u16| WidescanEntry {
+            act_index: act,
+            level: 10,
+            kind: 2,
+            rel_x: 1,
+            rel_z: 2,
+            name: String::new(),
+        };
+
+        // An entry outside a build window is dropped (server frames every list).
+        s.apply_event(&AgentEvent::WidescanEntryReceived { entry: entry(1) });
+        assert!(s.widescan.entries.is_empty());
+
+        s.apply_event(&AgentEvent::WidescanListStart);
+        assert!(s.widescan.building);
+        s.apply_event(&AgentEvent::WidescanEntryReceived { entry: entry(1) });
+        s.apply_event(&AgentEvent::WidescanEntryReceived { entry: entry(2) });
+        s.apply_event(&AgentEvent::WidescanListEnd);
+        assert!(!s.widescan.building);
+        assert_eq!(s.widescan.entries.len(), 2);
+
+        // A fresh ListStart clears the previous list.
+        s.apply_event(&AgentEvent::WidescanListStart);
+        assert!(s.widescan.entries.is_empty());
+        s.apply_event(&AgentEvent::WidescanEntryReceived { entry: entry(3) });
+        s.apply_event(&AgentEvent::WidescanListEnd);
+        assert_eq!(s.widescan.entries.len(), 1);
+
+        let pos = WidescanPos {
+            act_index: 3,
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        };
+        s.apply_event(&AgentEvent::WidescanTrackUpdated { tracked: Some(pos) });
+        assert_eq!(s.widescan.tracked, Some(pos));
+        // State == Lose clears the tracked marker.
+        s.apply_event(&AgentEvent::WidescanTrackUpdated { tracked: None });
+        assert_eq!(s.widescan.tracked, None);
+
+        s.apply_event(&AgentEvent::WidescanListStart);
+        s.apply_event(&AgentEvent::WidescanEntryReceived { entry: entry(4) });
+        s.apply_event(&AgentEvent::ZoneChanged {
+            from: Some(230),
+            to: 231,
+            myroom: None,
+            mog_zone_flag: false,
+        });
+        assert_eq!(
+            s.widescan,
+            WidescanList::default(),
+            "zone change clears widescan"
+        );
     }
 
     #[test]

@@ -137,6 +137,12 @@ pub enum MenuKind {
     /// Browsable canned-emote list under Communication; rows come from the
     /// scraped LSB emote table, Job gated on the s2c 0x11A bits.
     EmoteList,
+
+    /// Full-screen Map screen: a bespoke two-pane layout (map + wide-scan list)
+    /// rendered by `hud::map_screen`, so the generic menu is suppressed while it
+    /// is on top. `active_pane` selects map-vs-list focus; the top level's
+    /// `cursor` indexes the wide-scan list.
+    Map,
 }
 
 #[derive(Debug, Clone)]
@@ -145,9 +151,21 @@ pub struct MenuLevel {
     pub cursor: usize,
 }
 
+/// Retail's Command Menu draws two columns: the left holds the parent level
+/// (the Root command list at depth 1), the right the current/top level (a
+/// preview of the highlighted category at depth 1). `active_pane` says which
+/// column the cursor keys drive.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum Pane {
+    Left,
+    #[default]
+    Right,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MenuStack {
     pub levels: Vec<MenuLevel>,
+    pub active_pane: Pane,
 }
 
 impl MenuStack {
@@ -157,6 +175,7 @@ impl MenuStack {
                 kind: MenuKind::Root,
                 cursor: 0,
             }],
+            active_pane: Pane::Right,
         }
     }
 
@@ -170,15 +189,48 @@ impl MenuStack {
 
     pub fn push(&mut self, kind: MenuKind) {
         self.levels.push(MenuLevel { kind, cursor: 0 });
+        self.active_pane = Pane::Right;
     }
 
     pub fn pop(&mut self) -> bool {
         if self.levels.len() > 1 {
             self.levels.pop();
+            self.active_pane = Pane::Right;
             true
         } else {
             false
         }
+    }
+
+    pub fn toggle_pane(&mut self) {
+        self.active_pane = match self.active_pane {
+            Pane::Left => Pane::Right,
+            Pane::Right => Pane::Left,
+        };
+    }
+
+    /// Level index a pane renders. Right = the top level; Left = its parent
+    /// (or, at depth 1, the Root list itself). Both collapse to level 0 for a
+    /// single-level stack, so Root navigation acts on the same cursor either
+    /// way while the right column shows a non-interactive preview.
+    pub fn pane_level_index(&self, pane: Pane) -> usize {
+        match pane {
+            Pane::Right => self.levels.len().saturating_sub(1),
+            Pane::Left => self.levels.len().saturating_sub(2),
+        }
+    }
+
+    pub fn active_level_index(&self) -> usize {
+        self.pane_level_index(self.active_pane)
+    }
+
+    pub fn active_level(&self) -> Option<&MenuLevel> {
+        self.levels.get(self.active_level_index())
+    }
+
+    pub fn active_level_mut(&mut self) -> Option<&mut MenuLevel> {
+        let idx = self.active_level_index();
+        self.levels.get_mut(idx)
     }
 }
 

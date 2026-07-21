@@ -1145,6 +1145,39 @@ fn handle_sub_packet(
             let recasts = decode_abil_recast(sub.data);
             let _ = event_tx.send(AgentEvent::AbilityRecastsUpdated { recasts });
         }
+        // Wide-scan (tracking): the server frames a list with 0x0F6 ListStart, a
+        // run of 0x0F4 entries, then 0x0F6 ListEnd; 0x0F5 streams the tracked
+        // entity's position (vendor/server/src/map/packets/s2c/0x0f4..0x0f6*).
+        op if op == s2c::TRACKING_STATE => {
+            if let Ok(st) = decode::WidescanState::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                if st.list_start {
+                    let _ = event_tx.send(AgentEvent::WidescanListStart);
+                }
+                if st.list_end {
+                    let _ = event_tx.send(AgentEvent::WidescanListEnd);
+                }
+            }
+        }
+        op if op == s2c::TRACKING_LIST => {
+            if let Ok(e) = decode::WidescanEntry::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                let _ = event_tx.send(AgentEvent::WidescanEntryReceived {
+                    entry: crate::state::WidescanEntry::from(e),
+                });
+            }
+        }
+        op if op == s2c::TRACKING_POS => {
+            if let Ok(p) = decode::WidescanPos::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                let _ = event_tx.send(AgentEvent::WidescanTrackUpdated {
+                    tracked: (!p.lost).then(|| crate::state::WidescanPos::from(p)),
+                });
+            }
+        }
         op if op == s2c::SCENARIO_ITEM => {
             if let Ok(ki) = decode::ScenarioItem::decode(sub.data)
                 .inspect_err(|e| warn_decode_err(sub.opcode, e))
@@ -2104,6 +2137,45 @@ async fn keepalive_loop(
                             tracing::warn!(error = %e, "emote_list request send failed");
                             let _ = event_tx.send(AgentEvent::Error {
                                 message: format!("emote_list send: {e}"),
+                            });
+                        }
+                    }
+                    Some(AgentCommand::WidescanRequest) => {
+                        let payload = build_subpacket_tracking_list(sub_seq);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "widescan list request send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("widescan request send: {e}"),
+                            });
+                        }
+                    }
+                    Some(AgentCommand::WidescanTrack { act_index }) => {
+                        let payload = build_subpacket_tracking_start(sub_seq, act_index);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "widescan track send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("widescan track send: {e}"),
+                            });
+                        }
+                    }
+                    Some(AgentCommand::WidescanEnd) => {
+                        let payload = build_subpacket_tracking_end(sub_seq);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "widescan end send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("widescan end send: {e}"),
                             });
                         }
                     }
@@ -4626,6 +4698,46 @@ pub fn build_subpacket_emote_list_req(sync: u16) -> Vec<u8> {
     build_subpacket_header(ffxi_proto::map::c2s::EMOTE_LIST, 1, sync).to_vec()
 }
 
+// c2s 0x0F4 GP_CLI_COMMAND_TRACKING_LIST: uint32 SendFlg (must be 1). Requests
+// the wide-scan list; the server frames the reply with 0x0F6 ListStart/ListEnd.
+// vendor/server/src/map/packets/c2s/0x0f4_tracking_list.h.
+pub fn build_subpacket_tracking_list(sync: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::TRACKING_LIST,
+        2,
+        sync,
+    ));
+    buf[4..8].copy_from_slice(&ffxi_proto::map::tracking::SEND_FLG_REQUEST.to_le_bytes());
+    buf
+}
+
+// c2s 0x0F5 GP_CLI_COMMAND_TRACKING_START: uint32 ActIndex. Begins tracking one
+// entity; the server then streams 0x0F5 position updates.
+// vendor/server/src/map/packets/c2s/0x0f5_tracking_start.h.
+pub fn build_subpacket_tracking_start(sync: u16, act_index: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::TRACKING_START,
+        2,
+        sync,
+    ));
+    buf[4..8].copy_from_slice(&u32::from(act_index).to_le_bytes());
+    buf
+}
+
+// c2s 0x0F6 GP_CLI_COMMAND_TRACKING_END: uint32 padding (Dammy). Stops tracking.
+// vendor/server/src/map/packets/c2s/0x0f6_tracking_end.h.
+pub fn build_subpacket_tracking_end(sync: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::TRACKING_END,
+        2,
+        sync,
+    ));
+    buf
+}
+
 /// c2s 0x110 GP_CLI_COMMAND_FISHING_2 — the mini-game request the client streams while
 /// fishing (check-hook, end-game, release, timeout). `mode`/`para`/`para2` follow the
 /// LSB validator: vendor/server/src/map/packets/c2s/0x110_fishing_2.{h,cpp}.
@@ -5402,6 +5514,26 @@ mod tests {
         assert_eq!(id_and_size & 0x1FF, ffxi_proto::map::c2s::EMOTE_LIST);
         assert_eq!(id_and_size >> 9, 1, "size_words");
         assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x1234, "sync");
+    }
+
+    // Citation: vendor/server/src/map/packets/c2s/0x0f4_tracking_list.h — the
+    // wide-scan list request carries uint32 SendFlg and LSB only frames a reply
+    // when SendFlg == 1. A drive-by edit that zeroed/dropped it would silently
+    // stop wide-scan from ever populating.
+    #[test]
+    fn tracking_list_req_carries_sendflg_one() {
+        let buf = build_subpacket_tracking_list(0x1234);
+        assert_eq!(buf.len(), 8);
+        let id_and_size = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(id_and_size & 0x1FF, ffxi_proto::map::c2s::TRACKING_LIST);
+        assert_eq!(id_and_size >> 9, 2, "size_words");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x1234, "sync");
+        assert_eq!(
+            u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            ffxi_proto::map::tracking::SEND_FLG_REQUEST,
+            "SendFlg must be 1",
+        );
+        assert_eq!(ffxi_proto::map::tracking::SEND_FLG_REQUEST, 1);
     }
 
     /// Mirrors the LSB 0x05D validator gate order (0x05d_motion.cpp).
