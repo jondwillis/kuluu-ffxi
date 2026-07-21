@@ -605,6 +605,9 @@ fn load_decrypted(
 pub struct ZoneMmbSpawn {
     pub chunk_idx: usize,
     pub bevy_transform: Mat4,
+    // Set for generator-driven water sheets (sea1/sea2): translucent tint +
+    // per-layer UV-scroll. None for ordinary object-placed models.
+    pub water: Option<crate::dat_mmb::GenWater>,
 }
 
 pub fn build_zone_mmb_spawns(
@@ -705,6 +708,55 @@ pub fn build_zone_mmb_spawns(
         out.push(ZoneMmbSpawn {
             chunk_idx,
             bevy_transform,
+            water: None,
+        });
+    }
+
+    // Generator-driven water sheets: FFXI instances the broad canal/harbor water
+    // (e.g. Port Windurst tshimonosea1/2) via zone Generator chunks whose linked
+    // model name resolves to an MMB zone-mesh — NOT via the object list above.
+    // Each carries a translucent tint (alpha < 1) and per-layer UV-scroll. See
+    // ffxi-dat Generator::parse_model_spawn.
+    let zone_prefix = mzb::infer_zone_prefix(&mmb_names);
+    for c in &chunks {
+        if c.kind != ChunkKind::Generator as u8 {
+            continue;
+        }
+        let Ok(Some(ms)) = ffxi_dat::generator::Generator::parse_model_spawn(c.data) else {
+            continue;
+        };
+        // Scrolling sheets are the water surfaces (sea1/sea2 scroll their UVs);
+        // static model-spawns (ships, floors, collision hulls) have zero scroll
+        // and are left to the normal geometry path — spawning them here would
+        // give them the translucent water material.
+        if ms.uv_scroll == [0.0, 0.0] {
+            continue;
+        }
+        let name = ms.model_name_str();
+        // Only names that resolve to an MMB zone-mesh are water sheets; the many
+        // other 0x0B generators link D3M particle billboards (handled elsewhere).
+        let Some(local_idx) = mzb::resolve_mmb_index(name, &zone_prefix, &mmb_names) else {
+            continue;
+        };
+        let chunk_idx = mmb_indices[local_idx];
+        let b = ms.base_position;
+        // Same basis as object placements: to_bevy * (FFXI model-local -> world).
+        // A pre-flipped translation would move the origin correctly but leave the
+        // model geometry unflipped (mirrored/sunk out of view).
+        let to_bevy = Mat4::from_cols(
+            Vec4::new(1.0, 0.0, 0.0, 0.0),
+            Vec4::new(0.0, -1.0, 0.0, 0.0),
+            Vec4::new(0.0, 0.0, -1.0, 0.0),
+            Vec4::new(0.0, 0.0, 0.0, 1.0),
+        );
+        let bevy_transform = to_bevy * Mat4::from_translation(Vec3::new(b[0], b[1], b[2]));
+        out.push(ZoneMmbSpawn {
+            chunk_idx,
+            bevy_transform,
+            water: Some(crate::dat_mmb::GenWater {
+                tint: Vec4::from_array(ms.tint),
+                uv_scroll: Vec2::new(ms.uv_scroll[0], ms.uv_scroll[1]),
+            }),
         });
     }
 
@@ -1567,6 +1619,7 @@ fn spawn_mzb_overlay(
                     world_pos: Vec3::ZERO,
                     entity_id: None,
                     world_transform: Some(offset * s.bevy_transform),
+                    water: s.water,
                 });
             }
             push_system_msg(

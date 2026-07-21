@@ -371,6 +371,140 @@ impl Generator {
     }
 }
 
+// A generator whose linked data (type 0x0B) names a full zone MMB model rather
+// than a D3M billboard — FFXI uses this for positioned scrolling water sheets
+// (Port Windurst harbor "sea1"/"sea2" -> tshimonosea1/2), the broad canal/harbor
+// water that is NOT in the MZB object-placement list. 0x0B is shared with
+// particle-billboard emitters (parse_particle_emitter); the discriminator is
+// that the linked name resolves to an MMB zone-mesh, which the caller checks via
+// resolve_mmb_indices. research/xim ParticleGeneratorParser sec1 0x01
+// StandardParticleSetup: linked model name (8 bytes) at payload+8, base_position
+// at payload+16, linked_type at payload+29; 0x16 carries the RGBA tint (alpha <
+// 255 = translucent water); section-3 0x27/0x28 carry the per-layer UV-scroll.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelSpawnDef {
+    pub model_name: [u8; 8],
+    pub base_position: [f32; 3],
+    pub tint: [f32; 4],
+    pub uv_scroll: [f32; 2],
+}
+
+impl ModelSpawnDef {
+    pub fn model_name_str(&self) -> &str {
+        let end = self
+            .model_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.model_name.len());
+        std::str::from_utf8(&self.model_name[..end]).unwrap_or("")
+    }
+}
+
+impl Generator {
+    // The linked model / billboard class. 0x0B covers both a full MMB zone-mesh
+    // (sea water sheets) and D3M particle billboards; the caller disambiguates by
+    // whether model_name resolves to an MMB chunk.
+    const LINKED_DATA_MODEL: u8 = 0x0B;
+
+    pub fn parse_model_spawn(body: &[u8]) -> Result<Option<ModelSpawnDef>> {
+        const HEADER_LEN: usize = 0x80;
+        if body.len() < HEADER_LEN {
+            return Err(DatError::TruncatedChunk {
+                offset: 0,
+                needed: HEADER_LEN,
+                available: body.len(),
+            });
+        }
+        let creation_offset = u32_le(body, 0x74) as usize;
+        if creation_offset < 16 || creation_offset - 16 >= body.len() {
+            return Ok(None);
+        }
+        let mut cursor = creation_offset - 16;
+
+        let mut is_model = false;
+        let mut model_name = [0u8; 8];
+        let mut base_position = [0.0f32; 3];
+        let mut tint = [1.0f32; 4];
+
+        while cursor + 4 <= body.len() {
+            let opcode = body[cursor];
+            if opcode == 0x00 {
+                break;
+            }
+            let size_words = (body[cursor + 1] & 0x1F) as usize;
+            if size_words == 0 {
+                break;
+            }
+            let block_len = size_words * 4;
+            let payload = cursor + 4;
+            if cursor + block_len > body.len() {
+                break;
+            }
+            match opcode {
+                0x01 if payload + 30 <= body.len() => {
+                    model_name.copy_from_slice(&body[payload + 8..payload + 16]);
+                    base_position = [
+                        f32_le(body, payload + 16),
+                        f32_le(body, payload + 20),
+                        f32_le(body, payload + 24),
+                    ];
+                    is_model = body[payload + 29] == Self::LINKED_DATA_MODEL;
+                }
+                0x16 if payload + 4 <= body.len() => {
+                    tint = [
+                        body[payload] as f32 / 255.0,
+                        body[payload + 1] as f32 / 255.0,
+                        body[payload + 2] as f32 / 255.0,
+                        body[payload + 3] as f32 / 255.0,
+                    ];
+                }
+                _ => {}
+            }
+            cursor += block_len;
+        }
+
+        if !is_model {
+            return Ok(None);
+        }
+
+        // Section 3 (body[0x78]) — the per-frame TextureCoordinateUpdater velocity
+        // that scrolls the water texture (same walk as parse_cloud_generator).
+        let mut uv_scroll = [0.0f32; 2];
+        let sec3 = u32_le(body, 0x78) as usize;
+        if sec3 >= 16 && sec3 - 16 < body.len() {
+            let mut cursor = sec3 - 16;
+            while cursor + 4 <= body.len() {
+                let opcode = body[cursor];
+                if opcode == 0x00 {
+                    break;
+                }
+                let size_words = (body[cursor + 1] & 0x1F) as usize;
+                if size_words == 0 {
+                    break;
+                }
+                let block_len = size_words * 4;
+                let payload = cursor + 4;
+                if cursor + block_len > body.len() {
+                    break;
+                }
+                match opcode {
+                    0x27 if payload + 4 <= body.len() => uv_scroll[0] = f32_le(body, payload),
+                    0x28 if payload + 4 <= body.len() => uv_scroll[1] = f32_le(body, payload),
+                    _ => {}
+                }
+                cursor += block_len;
+            }
+        }
+
+        Ok(Some(ModelSpawnDef {
+            model_name,
+            base_position,
+            tint,
+            uv_scroll,
+        }))
+    }
+}
+
 impl Generator {
     const LINKED_DATA_POINT_LIGHT: u8 = 0x47;
 
@@ -564,6 +698,58 @@ mod tests {
         assert!((e.base_position[1] - 0.7).abs() < 1e-6);
         assert!((e.scale[0] - 0.024).abs() < 1e-6);
         assert!((e.color[2] - 158.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parses_model_spawn_water() {
+        // 0x01 setup: 8-byte model name, base position, linked_type 0x0B; then a
+        // 0x16 tint (alpha 0x80); then section-3 0x27/0x28 UV-scroll. Layout tuned
+        // so the creation walk (cursor 0x80) and sec3 walk (cursor 0xB0) don't
+        // overlap: c1 (36 bytes) + tint (8) + terminator (4) = 0x80..0xB0.
+        let mut body = make_body();
+        let mut c1 = vec![0u8; 36];
+        c1[0] = 0x01;
+        c1[1] = 0x09; // size_words 9 -> 36 bytes
+        c1[4 + 8..4 + 16].copy_from_slice(b"sea1\0\0\0\0");
+        c1[4 + 16..4 + 20].copy_from_slice(&(-17.0f32).to_le_bytes());
+        c1[4 + 24..4 + 28].copy_from_slice(&166.0f32.to_le_bytes());
+        c1[4 + 29] = 0x0B;
+        body.extend_from_slice(&c1);
+        let mut tint = vec![0u8; 8];
+        tint[0] = 0x16;
+        tint[1] = 0x02;
+        tint[4..8].copy_from_slice(&[0x58, 0x58, 0x58, 0x80]);
+        body.extend_from_slice(&tint);
+        body.extend_from_slice(&[0u8; 4]); // terminate creation section, pad to 0xB0
+        let mut cu = vec![0u8; 8];
+        cu[0] = 0x27;
+        cu[1] = 0x02;
+        cu[4..8].copy_from_slice(&0.0006f32.to_le_bytes());
+        body.extend_from_slice(&cu);
+        let mut cv = vec![0u8; 8];
+        cv[0] = 0x28;
+        cv[1] = 0x02;
+        cv[4..8].copy_from_slice(&0.0004f32.to_le_bytes());
+        body.extend_from_slice(&cv);
+
+        let m = Generator::parse_model_spawn(&body).unwrap().unwrap();
+        assert_eq!(m.model_name_str(), "sea1");
+        assert!((m.base_position[0] - -17.0).abs() < 1e-6);
+        assert!((m.base_position[2] - 166.0).abs() < 1e-6);
+        assert!((m.tint[3] - 128.0 / 255.0).abs() < 1e-6);
+        assert!((m.uv_scroll[0] - 0.0006).abs() < 1e-9);
+        assert!((m.uv_scroll[1] - 0.0004).abs() < 1e-9);
+    }
+
+    #[test]
+    fn model_spawn_rejects_non_model_linked_type() {
+        let mut body = make_body();
+        let mut c1 = vec![0u8; 36];
+        c1[0] = 0x01;
+        c1[1] = 0x09;
+        c1[4 + 29] = 0x47; // point light, not a linked model
+        body.extend_from_slice(&c1);
+        assert!(Generator::parse_model_spawn(&body).unwrap().is_none());
     }
 
     #[test]

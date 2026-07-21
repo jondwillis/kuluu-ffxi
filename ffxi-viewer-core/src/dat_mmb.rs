@@ -66,6 +66,17 @@ pub struct AppliedTextureFiltering {
     pub anisotropy: Option<u16>,
 }
 
+// A generator-driven water sheet (ffxi-dat Generator::parse_model_spawn): the
+// broad canal/harbor water (e.g. Port Windurst tshimonosea1/2) is instanced by a
+// zone Generator, not the MZB object list, and carries its own translucent tint
+// (alpha < 1) and per-layer UV-scroll velocity. When a LoadMmbRequest carries
+// this, the spawned submeshes render blended with the tint and scroll their UVs.
+#[derive(Debug, Clone, Copy)]
+pub struct GenWater {
+    pub tint: Vec4,
+    pub uv_scroll: Vec2,
+}
+
 #[derive(Message, Debug, Clone, Copy)]
 pub struct LoadMmbRequest {
     pub file_id: u32,
@@ -75,6 +86,36 @@ pub struct LoadMmbRequest {
     pub entity_id: Option<u32>,
 
     pub world_transform: Option<Mat4>,
+
+    pub water: Option<GenWater>,
+}
+
+// Animates one generator water sheet's UV scroll. Each sheet owns its material
+// (never the shared cache), so the two stacked Port Windurst layers scroll at
+// their own velocities. uv_offset flows to the GPU through FfxiZoneMaterial's
+// persistent instance buffer; get_mut_untracked avoids rebuilding the bind group
+// every frame (same pattern as scroll_water_uv / zone_clouds).
+#[derive(Component)]
+pub struct GenWaterScroll {
+    pub material: Handle<FfxiZoneMaterial>,
+    pub uv_scroll: Vec2,
+}
+
+pub fn scroll_gen_water_uv(
+    time: Res<Time>,
+    q: Query<&GenWaterScroll>,
+    mut materials: ResMut<Assets<FfxiZoneMaterial>>,
+) {
+    let t = time.elapsed_secs();
+    for gw in q.iter() {
+        if let Some(mat) = materials.get_mut_untracked(&gw.material) {
+            // fract keeps the offset small for f32 precision over long sessions;
+            // the texture repeats so a whole-tile jump is invisible.
+            let u = (gw.uv_scroll.x * t).fract();
+            let v = (gw.uv_scroll.y * t).fract();
+            mat.uv_offset = Vec4::new(u, v, 0.0, 0.0);
+        }
+    }
 }
 
 pub struct DatOverlayPlugin;
@@ -120,6 +161,7 @@ impl Plugin for DatOverlayPlugin {
                     crate::dat_mzb::cull_entities_by_distance,
                     crate::dat_mzb::apply_zone_geom_visibility,
                     crate::dat_mzb::scroll_water_uv,
+                    scroll_gen_water_uv,
                 ),
             )
             .add_systems(
@@ -574,35 +616,71 @@ pub fn process_load_mmb_requests(
                         depth_write: rs.depth_write(),
                     };
 
-                    let mat_handle = handle_cache
-                        .material
-                        .entry((cache_key.0, cache_key.1, cache_key.2, mirrored))
-                        .or_insert_with(|| {
-                            materials.add(FfxiZoneMaterial::new(
-                                sub_texture,
-                                crate::skinned_ffxi_material::FfxiMaterialFlags {
-                                    flags: Vec4::new(
-                                        has_texture,
-                                        blend_flag,
-                                        0.0,
-                                        discard_threshold,
-                                    ),
-                                },
-                                Vec4::ONE,
-                                Vec4::ZERO,
-                                alpha_mode,
-                                render_key,
-                            ))
-                        })
-                        .clone();
+                    // Generator water (sea sheets): force the translucent blend
+                    // path and apply the generator tint (alpha < 1). Each water
+                    // sheet gets its OWN material (never the shared cache) so its
+                    // per-layer UV-scroll animates independently.
+                    let mat_handle = if let Some(w) = req.water {
+                        materials.add(FfxiZoneMaterial::new(
+                            sub_texture,
+                            crate::skinned_ffxi_material::FfxiMaterialFlags {
+                                flags: Vec4::new(has_texture, 1.0, 0.0, 0.0),
+                            },
+                            w.tint,
+                            Vec4::ZERO,
+                            AlphaMode::Blend,
+                            crate::ffxi_zone_material::FfxiZoneMaterialKey {
+                                back_face_culling: false,
+                                mirrored,
+                                // A full water sheet is not a coplanar decal:
+                                // decal z-bias would pull it toward the camera and
+                                // let it float over terrain that should occlude it.
+                                z_bias_level: 0,
+                                depth_write: false,
+                            },
+                        ))
+                    } else {
+                        handle_cache
+                            .material
+                            .entry((cache_key.0, cache_key.1, cache_key.2, mirrored))
+                            .or_insert_with(|| {
+                                materials.add(FfxiZoneMaterial::new(
+                                    sub_texture,
+                                    crate::skinned_ffxi_material::FfxiMaterialFlags {
+                                        flags: Vec4::new(
+                                            has_texture,
+                                            blend_flag,
+                                            0.0,
+                                            discard_threshold,
+                                        ),
+                                    },
+                                    Vec4::ONE,
+                                    Vec4::ZERO,
+                                    alpha_mode,
+                                    render_key,
+                                ))
+                            })
+                            .clone()
+                    };
 
                     let mut child = commands.spawn((
                         MmbOverlay,
                         Mesh3d(mesh_handle),
-                        MeshMaterial3d(mat_handle),
+                        MeshMaterial3d(mat_handle.clone()),
                         Transform::default(),
                         ChildOf(parent),
                     ));
+
+                    if let Some(w) = req.water {
+                        child.insert((
+                            GenWaterScroll {
+                                material: mat_handle,
+                                uv_scroll: Vec2::from_array([w.uv_scroll.x, w.uv_scroll.y]),
+                            },
+                            bevy::light::NotShadowCaster,
+                            bevy::light::NotShadowReceiver,
+                        ));
+                    }
 
                     if is_static_placement {
                         child.insert(crate::components::CameraOccluder);
@@ -779,6 +857,7 @@ mod tests {
             world_pos: Vec3::ZERO,
             entity_id: None,
             world_transform: Some(Mat4::from_translation(pos)),
+            water: None,
         }
     }
 
@@ -789,6 +868,7 @@ mod tests {
             world_pos: pos,
             entity_id: Some(7),
             world_transform: None,
+            water: None,
         }
     }
 
