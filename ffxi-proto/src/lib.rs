@@ -2,6 +2,7 @@ pub mod ability_names;
 pub mod action_anim;
 pub mod autotranslate;
 pub mod blowfish;
+pub mod cast_time;
 pub mod checksum;
 pub mod decode;
 pub mod emote_names;

@@ -232,6 +232,31 @@ fn main() -> Result<()> {
         spell_anim_entries.len(),
     );
 
+    // vendor/server/sql/spell_list.sql fields 10 castTime / 11 recastTime (ms).
+    let spell_cast_entries = parse_u16_pair_rows(&spell_src, "spell_list", 10)?;
+    write_u16_u16_table(
+        &out_dir.join("spell_cast_time_table.rs"),
+        "SPELL_CAST_TIME_MS",
+        LSB_SPELL_LIST_SQL,
+        &spell_cast_entries,
+    )?;
+    println!(
+        "ffxi-proto: scraped {} spell castTime entries",
+        spell_cast_entries.len(),
+    );
+
+    let spell_recast_entries = parse_u32_pair_rows(&spell_src, "spell_list", 11)?;
+    write_u16_u32_table(
+        &out_dir.join("spell_recast_time_table.rs"),
+        "SPELL_RECAST_TIME_MS",
+        LSB_SPELL_LIST_SQL,
+        &spell_recast_entries,
+    )?;
+    println!(
+        "ffxi-proto: scraped {} spell recastTime entries",
+        spell_recast_entries.len(),
+    );
+
     let abil_src = fs::read_to_string(LSB_ABILITIES_SQL)
         .with_context(|| format!("reading {LSB_ABILITIES_SQL}"))?;
     let abil_entries = parse_sql_insert_rows(&abil_src, "abilities", 0, 1)?;
@@ -1026,6 +1051,38 @@ fn parse_u16_pair_rows(src: &str, table: &str, value_field: usize) -> Result<Vec
             let value = fields
                 .get(value_field)
                 .and_then(|s| s.trim().parse::<u16>().ok())
+                .unwrap_or(0);
+            out.push((id, value));
+        }
+    }
+    if out.is_empty() {
+        bail!("parsed zero rows from `INSERT INTO {table}` — SQL format may have changed");
+    }
+    Ok(out)
+}
+
+fn parse_u32_pair_rows(src: &str, table: &str, value_field: usize) -> Result<Vec<(u16, u32)>> {
+    let needle = format!("INSERT INTO `{table}` VALUES ");
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix(needle.as_str()) else {
+            continue;
+        };
+        let mut cursor = rest;
+        while let Some(open) = cursor.find('(') {
+            cursor = &cursor[open + 1..];
+            let Some((tuple, after)) = split_sql_tuple(cursor) else {
+                break;
+            };
+            cursor = after;
+            let fields = split_sql_fields(tuple);
+            let Some(Ok(id)) = fields.first().map(|s| s.trim().parse::<u16>()) else {
+                continue;
+            };
+            let value = fields
+                .get(value_field)
+                .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(0);
             out.push((id, value));
         }
