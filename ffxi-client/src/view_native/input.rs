@@ -497,6 +497,28 @@ pub fn dispatch_target_change_system(
     });
 }
 
+/// Mirror the viewer's lock-on state into the reactor so it only squares the
+/// engaged target up while locked. Without this the reactor's per-tick facing
+/// snaps the player back toward the mob every 200ms even after the human
+/// unlocks (kuluu-j03o).
+pub fn sync_target_lock_system(
+    lock_on: Res<LockOn>,
+    cmd_tx: Res<CommandTx>,
+    mut last_sent: Local<Option<bool>>,
+) {
+    let locked = lock_on.is_active();
+    if *last_sent == Some(locked) {
+        return;
+    }
+    if cmd_tx
+        .0
+        .try_send(AgentCommand::SetTargetLock { locked })
+        .is_ok()
+    {
+        *last_sent = Some(locked);
+    }
+}
+
 pub fn dispatch_movement_system(
     keys: Res<ButtonInput<KeyCode>>,
     bindings: Res<Bindings>,

@@ -187,6 +187,12 @@ pub struct Reactor {
 
     reactor_override: Option<ReactorOverride>,
 
+    // Whether the engaged target is kept squared up each tick. Mirrors the
+    // viewer's lock-on: the human unlocks to turn away mid-fight. Defaults true
+    // so headless agents (which never emit SetTargetLock) still face to land
+    // auto-attack.
+    target_locked: bool,
+
     fishing: FishingMachine,
     fishing_phase_pub: Option<u8>,
     fishing_pending: Vec<AgentCommand>,
@@ -215,6 +221,7 @@ impl Reactor {
             zoneline_trigger_latched: None,
             needs_zone_seed: false,
             reactor_override: None,
+            target_locked: true,
             // Auto-play: the reactor reacts to arrows itself so an agent that issues `/fish`
             // lands the fish without further input. A UI front-end drives via FishingInput.
             fishing: FishingMachine::new(true),
@@ -495,6 +502,10 @@ impl Reactor {
                     attack_issued: false,
                 };
                 CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
+            }
+            AgentCommand::SetTargetLock { locked } => {
+                self.target_locked = locked;
+                CommandRouting::default()
             }
             AgentCommand::PathTo { x, y, z, force } => {
                 let target = Vec3 { x, y, z };
@@ -796,8 +807,10 @@ impl Reactor {
                         }
                     }
                 }
-                if let Some(m) = self.face_entity(target_id) {
-                    commands.push(m);
+                if self.target_locked {
+                    if let Some(m) = self.face_entity(target_id) {
+                        commands.push(m);
+                    }
                 }
                 TickOutput {
                     commands,
@@ -1612,6 +1625,54 @@ mod tests {
         assert_eq!(attacks_t2, 0, "tick 2 does not re-issue Attack");
 
         assert!(t2.iter().any(|c| matches!(c, AgentCommand::Move { .. })));
+    }
+
+    #[test]
+    fn unlocking_stops_facing_the_engaged_target() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        r.observe_event(&connected(1));
+        r.observe_event(&upsert(1, Vec3::default(), 100, EntityKind::Pc, 1));
+        r.observe_event(&upsert(
+            99,
+            Vec3 {
+                x: 5.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            100,
+            EntityKind::Mob,
+            7,
+        ));
+        r.handle_command(AgentCommand::Engage { target_id: 99 });
+        let _ = r.tick();
+
+        r.handle_command(AgentCommand::SetTargetLock { locked: false });
+        let unlocked = r.tick().commands;
+        assert!(
+            !unlocked
+                .iter()
+                .any(|c| matches!(c, AgentCommand::Move { .. })),
+            "unlocked engage must not force the heading to face the target"
+        );
+
+        r.handle_command(AgentCommand::SetTargetLock { locked: true });
+        let relocked = r.tick().commands;
+        assert!(
+            relocked
+                .iter()
+                .any(|c| matches!(c, AgentCommand::Move { .. })),
+            "re-locking resumes facing the target"
+        );
+    }
+
+    #[test]
+    fn set_target_lock_is_not_forwarded_to_server() {
+        let mut r = Reactor::new(ReactorConfig::default());
+        let routing = r.handle_command(AgentCommand::SetTargetLock { locked: false });
+        assert!(
+            routing.forward.is_none(),
+            "lock-on is client/reactor state, never a server packet"
+        );
     }
 
     #[test]

@@ -1962,6 +1962,15 @@ pub enum AgentCommand {
         target_id: u32,
     },
 
+    /// Client lock-on (target lock) state. The reactor keeps the engaged target
+    /// squared up only while locked; clearing it frees the heading so the player
+    /// can turn away mid-fight. Reactor-only (never forwarded to the server), and
+    /// only the viewer emits it — headless agents never do, so the reactor's
+    /// default keeps facing so auto-attack lands.
+    SetTargetLock {
+        locked: bool,
+    },
+
     PathTo {
         x: f32,
         y: f32,

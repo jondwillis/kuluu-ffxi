@@ -154,7 +154,14 @@ mod tests {
         let (event_tx, _) = broadcast::channel::<AgentEvent>(8);
         let event_rx = event_tx.subscribe();
 
-        let codec_task = tokio::spawn(run(codec_reader, codec_writer, cmd_tx, event_rx, None));
+        let codec_task = tokio::spawn(run(
+            codec_reader,
+            codec_writer,
+            cmd_tx,
+            event_rx,
+            None,
+            None,
+        ));
 
         let line = serde_json::to_string(&AgentCommand::Cancel).unwrap() + "\n";
         peer_writer.write_all(line.as_bytes()).await.unwrap();
@@ -208,6 +215,7 @@ mod tests {
             cmd_tx,
             event_rx,
             Some(pause.clone()),
+            None,
         ));
 
         let line = serde_json::to_string(&AgentCommand::Cancel).unwrap() + "\n";
@@ -243,7 +251,14 @@ mod tests {
         let (event_tx, _) = broadcast::channel::<AgentEvent>(8);
         let event_rx = event_tx.subscribe();
 
-        let _codec_task = tokio::spawn(run(codec_reader, codec_writer, cmd_tx, event_rx, None));
+        let _codec_task = tokio::spawn(run(
+            codec_reader,
+            codec_writer,
+            cmd_tx,
+            event_rx,
+            None,
+            None,
+        ));
 
         peer_writer.write_all(b"not json\n").await.unwrap();
         peer_writer.flush().await.unwrap();

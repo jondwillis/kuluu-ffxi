@@ -2151,6 +2151,7 @@ async fn keepalive_loop(
                     }
                     Some(AgentCommand::Follow { .. })
                     | Some(AgentCommand::Engage { .. })
+                    | Some(AgentCommand::SetTargetLock { .. })
                     | Some(AgentCommand::PathTo { .. })
                     | Some(AgentCommand::Cancel)
                     | Some(AgentCommand::BankWhenFull { .. }) => {

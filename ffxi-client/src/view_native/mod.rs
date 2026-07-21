@@ -552,6 +552,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             text_input::text_input_system,
             text_input::mouse_nav_dispatch_system,
             input::dispatch_target_change_system,
+            input::sync_target_lock_system,
             input::tab_cycle_invalidate_system,
             key_items::key_items_mark_seen_system,
         )

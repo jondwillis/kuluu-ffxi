@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use ffxi_viewer_wire::{Entity as WireEntity, EntityKind, ReactorGoal};
 
 use crate::hud::style::{self, theme};
+use crate::lock_on::LockOn;
 use crate::scene::Target;
 use crate::snapshot::SceneState;
 
@@ -22,6 +23,9 @@ pub struct TargetDistText;
 
 #[derive(Component)]
 pub struct TargetEngagedBadge;
+
+#[derive(Component)]
+pub struct TargetLockBadge;
 
 #[derive(Resource, Debug, Default, Clone, Copy)]
 pub struct SwingPulse {
@@ -63,6 +67,13 @@ pub fn spawn_target_panel(mut commands: Commands) {
                 Text::new(""),
                 style::text_font(14.0),
                 TextColor(theme::TEXT),
+            ));
+
+            p.spawn((
+                TargetLockBadge,
+                Text::new(""),
+                style::text_font(12.0),
+                TextColor(theme::CURSOR),
             ));
 
             p.spawn((
@@ -119,6 +130,7 @@ pub fn spawn_target_panel(mut commands: Commands) {
 pub fn update_target_panel_system(
     target: Res<Target>,
     state: Res<SceneState>,
+    lock_on: Res<LockOn>,
     mut panel_q: Query<(&mut Node, &mut BorderColor), (With<TargetPanel>, Without<TargetHpFill>)>,
     mut header_q: Query<
         &mut Text,
@@ -127,6 +139,7 @@ pub fn update_target_panel_system(
             Without<TargetHpText>,
             Without<TargetDistText>,
             Without<TargetEngagedBadge>,
+            Without<TargetLockBadge>,
         ),
     >,
     mut hp_fill_q: Query<
@@ -140,6 +153,7 @@ pub fn update_target_panel_system(
             Without<TargetHeader>,
             Without<TargetDistText>,
             Without<TargetEngagedBadge>,
+            Without<TargetLockBadge>,
         ),
     >,
     mut dist_q: Query<
@@ -149,6 +163,7 @@ pub fn update_target_panel_system(
             Without<TargetHeader>,
             Without<TargetHpText>,
             Without<TargetEngagedBadge>,
+            Without<TargetLockBadge>,
         ),
     >,
     mut engaged_q: Query<
@@ -158,10 +173,21 @@ pub fn update_target_panel_system(
             Without<TargetHeader>,
             Without<TargetHpText>,
             Without<TargetDistText>,
+            Without<TargetLockBadge>,
+        ),
+    >,
+    mut lock_q: Query<
+        &mut Text,
+        (
+            With<TargetLockBadge>,
+            Without<TargetHeader>,
+            Without<TargetHpText>,
+            Without<TargetDistText>,
+            Without<TargetEngagedBadge>,
         ),
     >,
 ) {
-    if !state.is_changed() && !target.is_changed() {
+    if !state.is_changed() && !target.is_changed() && !lock_on.is_changed() {
         return;
     }
 
@@ -219,6 +245,17 @@ pub fn update_target_panel_system(
     }
     if let Ok(mut text) = engaged_q.single_mut() {
         let want = if engaged_on_this { "⚔ Engaged" } else { "" };
+        if text.as_str() != want {
+            **text = want.to_string();
+        }
+    }
+
+    if let Ok(mut text) = lock_q.single_mut() {
+        let want = if lock_on.target_id == Some(target_id) {
+            "🔒 Locked"
+        } else {
+            ""
+        };
         if text.as_str() != want {
             **text = want.to_string();
         }
