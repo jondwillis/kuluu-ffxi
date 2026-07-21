@@ -863,6 +863,9 @@ fn event_kind_label(ev: &AgentEvent) -> &'static str {
         AgentEvent::WidescanEntryReceived { .. } => "widescan_entry_received",
         AgentEvent::WidescanListEnd => "widescan_list_end",
         AgentEvent::WidescanTrackUpdated { .. } => "widescan_track_updated",
+        AgentEvent::SelfCastStarted { .. } => "self_cast_started",
+        AgentEvent::SelfCastProgress { .. } => "self_cast_progress",
+        AgentEvent::SelfCastEnded { .. } => "self_cast_ended",
     }
 }
 
