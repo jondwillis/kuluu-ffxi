@@ -3147,16 +3147,34 @@ fn handle_dialog_key(
         .unwrap_or(0)
         .min(ffxi_viewer_core::hud::dialog::MAX_OPTION_ROWS)
         .saturating_sub(1);
-    if bindings.matches_logical(Action::NavUp, key) {
-        if cursor.cursor > 0 {
-            cursor.cursor -= 1;
-        }
-        return None;
-    }
-    if bindings.matches_logical(Action::NavDown, key) {
-        if cursor.cursor < max_index {
-            cursor.cursor += 1;
-        }
+    let grid = scene_state
+        .snapshot
+        .dialog
+        .as_ref()
+        .and_then(|d| d.grid.clone());
+    let nav_delta = if bindings.matches_logical(Action::NavUp, key) {
+        Some((0i32, -1i32))
+    } else if bindings.matches_logical(Action::NavDown, key) {
+        Some((0, 1))
+    } else if bindings.matches_logical(Action::NavLeft, key) {
+        Some((-1, 0))
+    } else if bindings.matches_logical(Action::NavRight, key) {
+        Some((1, 0))
+    } else {
+        None
+    };
+    if let Some((dx, dy)) = nav_delta {
+        cursor.cursor = match &grid {
+            // Delivery-box style panel: the cursor walks the 2x4 icon grid
+            // itself (retail behavior), with any pre-grid rows (recipient)
+            // above and post-grid rows (Cancel) below.
+            Some(grid) => grid_nav_choice(grid, max_index, cursor.cursor, dx, dy),
+            None => match dy {
+                -1 => cursor.cursor.saturating_sub(1),
+                1 => (cursor.cursor + 1).min(max_index),
+                _ => cursor.cursor,
+            },
+        };
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
@@ -3173,6 +3191,101 @@ fn handle_dialog_key(
         return None;
     }
     None
+}
+
+/// Spatial cursor movement over a [`ffxi_viewer_wire::DialogGrid`]: choices
+/// referenced by grid cells are navigated as a 2D grid (nearest-column rule on
+/// row changes), while choices before/after the grid's range (recipient row,
+/// Cancel) behave as flat rows above/below it. Returns the new choice index
+/// (unchanged when the move has nowhere to go, like retail).
+fn grid_nav_choice(
+    grid: &ffxi_viewer_wire::DialogGrid,
+    max_index: u32,
+    cur: u32,
+    dx: i32,
+    dy: i32,
+) -> u32 {
+    let cols = i32::from(grid.cols.max(1));
+    // Selectable cells as (x, y, choice).
+    let sel: Vec<(i32, i32, u32)> = grid
+        .cells
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            c.choice
+                .map(|ch| ((i as i32) % cols, (i as i32) / cols, ch))
+        })
+        .collect();
+    let grid_min = sel.iter().map(|&(_, _, c)| c).min();
+    let grid_max = sel.iter().map(|&(_, _, c)| c).max();
+
+    // Nearest selectable cell to column `x` on row `y` (if the row has any).
+    let cell_on_row = |y: i32, x: i32| -> Option<u32> {
+        sel.iter()
+            .filter(|&&(_, cy, _)| cy == y)
+            .min_by_key(|&&(cx, _, _)| (cx - x).abs())
+            .map(|&(_, _, c)| c)
+    };
+    // First selectable row scanning from `y` in `dir`, exclusive.
+    let next_row = |y: i32, dir: i32| -> Option<i32> {
+        let mut ny = y + dir;
+        while (0..i32::from(grid.rows.max(1))).contains(&ny) {
+            if sel.iter().any(|&(_, cy, _)| cy == ny) {
+                return Some(ny);
+            }
+            ny += dir;
+        }
+        None
+    };
+
+    if let Some(&(x, y, _)) = sel.iter().find(|&&(_, _, c)| c == cur) {
+        if dx != 0 {
+            // Stay on the row; step to the nearest selectable cell that way.
+            return sel
+                .iter()
+                .filter(|&&(cx, cy, _)| cy == y && (cx - x).signum() == dx)
+                .min_by_key(|&&(cx, _, _)| (cx - x).abs())
+                .map_or(cur, |&(_, _, c)| c);
+        }
+        return match next_row(y, dy) {
+            Some(ny) => cell_on_row(ny, x).unwrap_or(cur),
+            // Off the top: pre-grid rows (recipient). Off the bottom:
+            // post-grid rows (Cancel).
+            None if dy < 0 => grid_min.filter(|&m| m > 0).map_or(cur, |m| m - 1),
+            None => grid_max
+                .filter(|&m| m < max_index)
+                .map_or(cur, |m| (m + 1).min(max_index)),
+        };
+    }
+
+    // Cursor sits on a flat row outside the grid.
+    let before_grid = grid_min.is_some_and(|m| cur < m);
+    match (dy, before_grid) {
+        // Down from the pre-grid rows: into the grid once we run out of them,
+        // otherwise the next flat row.
+        (1, true) => {
+            if grid_min == Some(cur + 1) {
+                next_row(-1, 1)
+                    .and_then(|y| cell_on_row(y, 0))
+                    .unwrap_or((cur + 1).min(max_index))
+            } else {
+                (cur + 1).min(max_index)
+            }
+        }
+        // Up from the post-grid rows: back into the grid's bottom row.
+        (-1, false) => {
+            if grid_max == Some(cur.saturating_sub(1)) && cur > 0 {
+                next_row(i32::from(grid.rows.max(1)), -1)
+                    .and_then(|y| cell_on_row(y, 0))
+                    .unwrap_or(cur - 1)
+            } else {
+                cur.saturating_sub(1)
+            }
+        }
+        (-1, true) => cur.saturating_sub(1),
+        (1, false) => (cur + 1).min(max_index),
+        _ => cur,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3514,5 +3627,68 @@ mod menu_dispatch_tests {
             resolve_menu_entry(MenuKind::Root, ROOT_CURRENT_TIME),
             MenuDispatch::NotImplemented(ROOT_CURRENT_TIME.into()),
         );
+    }
+
+    /// Send-panel shape: choice 0 = recipient row (above the grid), choices
+    /// 1..=8 = the 2x4 slot grid, choice 9 = Cancel (below the grid).
+    fn send_panel_grid() -> ffxi_viewer_wire::DialogGrid {
+        ffxi_viewer_wire::DialogGrid {
+            cols: 4,
+            rows: 2,
+            cells: (0..8u32)
+                .map(|i| ffxi_viewer_wire::DialogGridCell {
+                    choice: Some(i + 1),
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn grid_nav_walks_cells_spatially() {
+        let g = send_panel_grid();
+        // Right along the top row; clamped at the edge.
+        assert_eq!(grid_nav_choice(&g, 9, 1, 1, 0), 2);
+        assert_eq!(grid_nav_choice(&g, 9, 4, 1, 0), 4);
+        // Down keeps the column; up returns.
+        assert_eq!(grid_nav_choice(&g, 9, 2, 0, 1), 6);
+        assert_eq!(grid_nav_choice(&g, 9, 6, 0, -1), 2);
+    }
+
+    #[test]
+    fn grid_nav_bridges_flat_rows_above_and_below() {
+        let g = send_panel_grid();
+        // Up off the top row lands on the recipient row (choice 0)…
+        assert_eq!(grid_nav_choice(&g, 9, 3, 0, -1), 0);
+        // …and down from it re-enters the grid.
+        assert_eq!(grid_nav_choice(&g, 9, 0, 0, 1), 1);
+        // Down off the bottom row lands on Cancel (choice 9)…
+        assert_eq!(grid_nav_choice(&g, 9, 7, 0, 1), 9);
+        // …and up from Cancel re-enters the grid's bottom row.
+        assert_eq!(grid_nav_choice(&g, 9, 9, 0, -1), 5);
+        // Left/right on flat rows do nothing.
+        assert_eq!(grid_nav_choice(&g, 9, 0, 1, 0), 0);
+        assert_eq!(grid_nav_choice(&g, 9, 9, -1, 0), 9);
+    }
+
+    #[test]
+    fn grid_nav_skips_inert_cells() {
+        // Incoming-box shape: only slots 0 and 6 occupied, no flat rows
+        // besides the trailing Cancel (choice 2).
+        let mut g = send_panel_grid();
+        for (i, cell) in g.cells.iter_mut().enumerate() {
+            cell.choice = match i {
+                0 => Some(0),
+                6 => Some(1),
+                _ => None,
+            };
+        }
+        // Down from (0,0) reaches (2,1) — nearest selectable on the next row.
+        assert_eq!(grid_nav_choice(&g, 2, 0, 0, 1), 1);
+        // Right from (0,0) has no selectable neighbor on that row.
+        assert_eq!(grid_nav_choice(&g, 2, 0, 1, 0), 0);
+        // Down off the bottom row hits Cancel; up from Cancel returns.
+        assert_eq!(grid_nav_choice(&g, 2, 1, 0, 1), 2);
+        assert_eq!(grid_nav_choice(&g, 2, 2, 0, -1), 1);
     }
 }
