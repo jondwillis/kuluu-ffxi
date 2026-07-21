@@ -170,6 +170,10 @@ pub struct MinimapState {
     /// interior and the surrounding city share a zone_id but not a file id).
     pub baked_file_id: Option<u32>,
 
+    /// Quantized time-of-day lighting the current top-down bake was rendered
+    /// under; a change re-bakes so the lit map tracks Vana'diel time.
+    pub baked_lighting_bucket: Option<u64>,
+
     pub topdown_image: Option<Handle<Image>>,
 
     pub aabb: Option<MinimapAabb>,

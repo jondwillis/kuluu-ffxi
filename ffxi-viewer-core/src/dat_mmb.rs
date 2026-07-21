@@ -683,7 +683,15 @@ pub fn process_load_mmb_requests(
                     }
 
                     if is_static_placement {
-                        child.insert(crate::components::CameraOccluder);
+                        child.insert((
+                            crate::components::CameraOccluder,
+                            // Static world geometry also renders to the minimap's
+                            // offscreen top-down bake camera (RenderLayers::layer(
+                            // MINIMAP_BAKE_LAYER)); actors/sky/weather stay on the
+                            // default layer only, so the bake captures the zone.
+                            bevy::camera::visibility::RenderLayers::default()
+                                .with(crate::minimap::topdown::MINIMAP_BAKE_LAYER),
+                        ));
                     }
 
                     child.insert(crate::hud::mesh_debug::mesh_debug_bundle(

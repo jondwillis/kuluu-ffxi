@@ -1,7 +1,6 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::ScalingMode;
 use bevy::camera::{ClearColorConfig, RenderTarget};
-use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 
@@ -9,6 +8,7 @@ pub const MINIMAP_BAKE_LAYER: usize = 3;
 
 use crate::components::InGameEntity;
 use crate::dat_mzb::{LoadMzbInFlight, MzbCollisionGeometry};
+use crate::ffxi_zone_material::ZoneGlobalLighting;
 use crate::snapshot::SceneState;
 
 use super::{MinimapAabb, MinimapState, MINIMAP_TEX_SIZE};
@@ -24,6 +24,26 @@ impl Default for TopdownCullPolicy {
             top_cull_yalms: 6.0,
         }
     }
+}
+
+// Re-bake the lit top-down map when time-of-day lighting crosses one of these
+// quantized brightness buckets, so a night-baked interior doesn't stay frozen
+// as dawn breaks. Coarse on purpose: a full Vana'diel day is ~57 real minutes,
+// so a few buckets re-bake only a handful of times per cycle instead of every
+// frame the sun creeps past an epsilon.
+const LIGHTING_REBAKE_BUCKETS: f32 = 12.0;
+
+// Only ambient + the two directional (sun/moon) terms drive the bucket; point
+// lights (braziers) flicker every frame and would thrash the re-bake trigger.
+pub(crate) fn lighting_bucket(l: &crate::skinned_ffxi_material::FfxiLightingUniform) -> u64 {
+    let q = |x: f32| (x.clamp(0.0, 4.0) * LIGHTING_REBAKE_BUCKETS).round() as u64;
+    let mut sig = 0u64;
+    for v in [l.ambient, l.dir0_color, l.dir1_color] {
+        for c in [v.x, v.y, v.z, v.w] {
+            sig = sig.wrapping_mul(97).wrapping_add(q(c));
+        }
+    }
+    sig
 }
 
 #[derive(Resource, Debug, Default)]
@@ -48,9 +68,6 @@ const BAKE_MIN_WARMUP_FRAMES: u8 = 4;
 #[derive(Component)]
 pub struct MinimapBakeCamera;
 
-#[derive(Component)]
-pub struct MinimapBakeMesh;
-
 pub struct TopdownBackendPlugin;
 
 impl Plugin for TopdownBackendPlugin {
@@ -72,24 +89,28 @@ impl Plugin for TopdownBackendPlugin {
 pub fn bake_topdown_on_zone_or_policy_change(
     geom: Res<MzbCollisionGeometry>,
     policy: Res<TopdownCullPolicy>,
+    lighting: Res<ZoneGlobalLighting>,
     scene_state: Res<SceneState>,
     state: Res<MinimapState>,
     mut stage: ResMut<BakeStage>,
 ) {
-    let geom_changed = geom.is_changed();
-    let policy_changed = policy.is_changed();
-    if !geom_changed && !policy_changed {
-        return;
-    }
     if geom.positions.is_empty() {
         return;
     }
+    let policy_changed = policy.is_changed();
     let snapshot_file_id = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
+    let zone_changed = snapshot_file_id != state.baked_file_id;
 
-    if !matches!(*stage, BakeStage::Idle) {
+    // A re-bake keeps the lit map current as Vana'diel time shifts, but only
+    // once a zone is already baked — the first bake is the zone/geom trigger.
+    let bucket = lighting_bucket(&lighting.0);
+    let lighting_changed =
+        state.baked_file_id.is_some() && state.baked_lighting_bucket != Some(bucket);
+
+    if !geom.is_changed() && !policy_changed && !zone_changed && !lighting_changed {
         return;
     }
-    if snapshot_file_id == state.baked_file_id && !policy_changed {
+    if !matches!(*stage, BakeStage::Idle) {
         return;
     }
     *stage = BakeStage::Requested { waited: 0 };
@@ -98,13 +119,12 @@ pub fn bake_topdown_on_zone_or_policy_change(
 pub fn spawn_bake_camera(
     geom: Res<MzbCollisionGeometry>,
     policy: Res<TopdownCullPolicy>,
+    lighting: Res<ZoneGlobalLighting>,
     scene_state: Res<SceneState>,
     mzb_in_flight: Res<LoadMzbInFlight>,
     mut state: ResMut<MinimapState>,
     mut stage: ResMut<BakeStage>,
     mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut commands: Commands,
 ) {
     let BakeStage::Requested { waited } = *stage else {
@@ -138,23 +158,10 @@ pub fn spawn_bake_camera(
         max: Vec2::new(aabb_3d.max_x, aabb_3d.max_z),
     };
 
-    let bake_mesh = meshes.add(build_bake_mesh(&geom.positions, &geom.indices, &aabb_3d));
-    let bake_material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        unlit: true,
-        cull_mode: None,
-        ..default()
-    });
-    commands.spawn((
-        InGameEntity,
-        MinimapBakeMesh,
-        Mesh3d(bake_mesh),
-        MeshMaterial3d(bake_material),
-        Transform::IDENTITY,
-        Visibility::Visible,
-        bevy::camera::visibility::RenderLayers::layer(MINIMAP_BAKE_LAYER),
-    ));
-
+    // No synthetic mesh: the offscreen camera renders the real textured static
+    // zone geometry, which carries MINIMAP_BAKE_LAYER (see dat_mmb.rs). The
+    // ceiling-clamped camera below places the near plane under the roof so roof
+    // triangles are clipped and the interior floor/walls read from above.
     let camera_entity = commands
         .spawn((
             InGameEntity,
@@ -183,6 +190,7 @@ pub fn spawn_bake_camera(
         .id();
 
     state.baked_file_id = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
+    state.baked_lighting_bucket = Some(lighting_bucket(&lighting.0));
     state.topdown_image = Some(render_target);
     state.aabb = Some(aabb);
 
@@ -192,11 +200,7 @@ pub fn spawn_bake_camera(
     };
 }
 
-pub fn despawn_bake_camera(
-    mut stage: ResMut<BakeStage>,
-    bake_meshes: Query<Entity, With<MinimapBakeMesh>>,
-    mut commands: Commands,
-) {
+pub fn despawn_bake_camera(mut stage: ResMut<BakeStage>, mut commands: Commands) {
     let BakeStage::Awaiting {
         entity,
         frames_remaining,
@@ -214,44 +218,7 @@ pub fn despawn_bake_camera(
     if let Ok(mut ec) = commands.get_entity(entity) {
         ec.despawn();
     }
-    for mesh in &bake_meshes {
-        if let Ok(mut ec) = commands.get_entity(mesh) {
-            ec.despawn();
-        }
-    }
     *stage = BakeStage::Idle;
-}
-
-fn build_bake_mesh(positions: &[Vec3], indices: &[u32], aabb: &WorldAabb3) -> Mesh {
-    let verts: Vec<[f32; 3]> = positions.iter().map(|p| [p.x, p.y, p.z]).collect();
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, verts);
-    mesh.insert_indices(Indices::U32(indices.to_vec()));
-    mesh.compute_smooth_normals();
-
-    let span_y = (aabb.max_y - aabb.min_y).max(1.0);
-    if let Some(normals) = mesh
-        .attribute(Mesh::ATTRIBUTE_NORMAL)
-        .and_then(|a| a.as_float3())
-    {
-        let colors: Vec<[f32; 4]> = normals
-            .iter()
-            .zip(positions.iter())
-            .map(|(n, p)| {
-                let height = ((p.y - aabb.min_y) / span_y).clamp(0.0, 1.0);
-                let shade = 0.45 + 0.55 * (n[1] * 0.5 + 0.5);
-                let lo = Vec3::new(0.32, 0.40, 0.46);
-                let hi = Vec3::new(0.62, 0.66, 0.58);
-                let c = lo.lerp(hi, height) * shade;
-                [c.x, c.y, c.z, 1.0]
-            })
-            .collect();
-        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-    }
-    mesh
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
