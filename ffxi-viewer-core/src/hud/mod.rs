@@ -10,6 +10,7 @@ pub mod entity_hover_card;
 pub mod equipment_screen;
 pub mod item_dat_root;
 pub mod item_detail;
+pub mod item_grid;
 pub mod item_meta;
 pub mod item_screen;
 pub mod item_ui;
@@ -214,6 +215,7 @@ impl Plugin for HudPlugin {
                     diagnostics::update_draws_system,
                 ),
                 dialog::update_dialog_panel_system,
+                dialog::update_dialog_grid_system,
                 dialog::update_dialog_options_system,
                 shop::update_shop_panel_system,
                 compass::update_compass,

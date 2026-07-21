@@ -1,6 +1,9 @@
 use bevy::prelude::*;
 use ffxi_viewer_wire::DialogState;
 
+use crate::hud::item_dat_root::{ItemDatRoot, ItemIconCache};
+use crate::hud::item_grid::{spawn_item_cell, CELL_GAP_PX, CELL_PX};
+use crate::hud::item_ui::transparent_placeholder;
 use crate::hud::style::{self, theme};
 use crate::input_mode::InputMode;
 use crate::snapshot::SceneState;
@@ -28,6 +31,29 @@ pub struct DialogOptionText {
     pub choice: u32,
 }
 
+/// Container for the delivery-box style item grid shown inside the dialog
+/// panel when the server exposes a `DialogGrid` in the dialog state.
+#[derive(Component)]
+pub struct DialogGridBox;
+
+#[derive(Component)]
+pub struct DialogGridCellFrame {
+    pub index: usize,
+}
+
+#[derive(Component)]
+pub struct DialogGridIcon {
+    pub index: usize,
+}
+
+#[derive(Component)]
+pub struct DialogGridLabel {
+    pub index: usize,
+}
+
+/// Retail delivery box is a 2x4 grid.
+pub const MAX_GRID_CELLS: usize = 8;
+
 #[derive(Message, Debug, Clone, Copy)]
 pub struct DialogChoiceActivated {
     pub choice: u32,
@@ -40,7 +66,8 @@ const CONTINUE_MARKER: &str = "▶";
 /// stay well under this; longer lists are clamped (and logged) at the input.
 pub const MAX_OPTION_ROWS: u32 = 16;
 
-pub fn spawn_dialog_panel(mut commands: Commands) {
+pub fn spawn_dialog_panel(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    let placeholder = transparent_placeholder(&mut images);
     commands
         .spawn((
             crate::components::InGameEntity,
@@ -78,6 +105,33 @@ pub fn spawn_dialog_panel(mut commands: Commands) {
                 style::text_font(13.0),
                 TextColor(theme::TEXT),
             ));
+
+            p.spawn((
+                DialogGridBox,
+                Node {
+                    display: Display::None,
+                    flex_wrap: FlexWrap::Wrap,
+                    column_gap: Val::Px(CELL_GAP_PX),
+                    row_gap: Val::Px(CELL_GAP_PX),
+                    margin: UiRect {
+                        top: Val::Px(6.0),
+                        ..default()
+                    },
+                    ..default()
+                },
+            ))
+            .with_children(|g| {
+                for index in 0..MAX_GRID_CELLS {
+                    spawn_item_cell(
+                        g,
+                        DialogGridCellFrame { index },
+                        DialogGridIcon { index },
+                        DialogGridLabel { index },
+                        "",
+                        placeholder.clone(),
+                    );
+                }
+            });
 
             p.spawn(Node {
                 flex_direction: FlexDirection::Column,
@@ -170,6 +224,121 @@ pub fn update_dialog_panel_system(
     }
 }
 
+/// Drive the delivery-box style item grid from `DialogState::grid`: show the
+/// container when a grid is present, size it to `cols`, and fill each cell's
+/// frame/icon/label (cursor highlight follows the choice cursor; sent cells
+/// are dimmed).
+#[allow(clippy::too_many_arguments)]
+pub fn update_dialog_grid_system(
+    state: Res<SceneState>,
+    mode: Res<InputMode>,
+    dat_root: Res<ItemDatRoot>,
+    mut icon_cache: ResMut<ItemIconCache>,
+    mut images: ResMut<Assets<Image>>,
+    mut box_q: Query<&mut Node, With<DialogGridBox>>,
+    mut cell_q: Query<
+        (&DialogGridCellFrame, &mut Node, &mut BorderColor),
+        (Without<DialogGridBox>, Without<DialogGridIcon>),
+    >,
+    mut icon_q: Query<
+        (&DialogGridIcon, &mut Node, &mut ImageNode),
+        (Without<DialogGridBox>, Without<DialogGridCellFrame>),
+    >,
+    mut label_q: Query<(&DialogGridLabel, &mut Text)>,
+) {
+    if !state.is_changed() && !mode.is_changed() {
+        return;
+    }
+    let Ok(mut box_node) = box_q.single_mut() else {
+        return;
+    };
+    let grid = state.snapshot.dialog.as_ref().and_then(|d| d.grid.as_ref());
+    let Some(grid) = grid else {
+        if box_node.display != Display::None {
+            box_node.display = Display::None;
+        }
+        return;
+    };
+
+    let cols = grid.cols.max(1) as f32;
+    let want_width = Val::Px(cols * CELL_PX + (cols - 1.0) * CELL_GAP_PX);
+    if box_node.width != want_width {
+        box_node.width = want_width;
+    }
+    if box_node.display != Display::Flex {
+        box_node.display = Display::Flex;
+    }
+
+    let cursor = match &*mode {
+        InputMode::Dialog(c) => Some(c.cursor),
+        _ => None,
+    };
+
+    for (frame, mut node, mut border) in &mut cell_q {
+        let cell = grid.cells.get(frame.index);
+        let display = if cell.is_some() {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != display {
+            node.display = display;
+        }
+        let selected = cell
+            .and_then(|c| c.choice)
+            .is_some_and(|choice| Some(choice) == cursor);
+        let want_edge = if selected {
+            theme::CURSOR
+        } else {
+            theme::CELL_EDGE
+        };
+        let want_border = BorderColor::all(want_edge);
+        if *border != want_border {
+            *border = want_border;
+        }
+    }
+
+    for (icon, mut node, mut image) in &mut icon_q {
+        let cell = grid.cells.get(icon.index);
+        let item = cell.and_then(|c| c.item_no);
+        let handle = item.and_then(|n| icon_cache.ensure(n, &dat_root, &mut images));
+        match handle {
+            Some(h) => {
+                if image.image != h {
+                    image.image = h;
+                }
+                let want_color = if cell.is_some_and(|c| c.sent) {
+                    Color::srgba(1.0, 1.0, 1.0, 0.35)
+                } else {
+                    Color::WHITE
+                };
+                if image.color != want_color {
+                    image.color = want_color;
+                }
+                if node.display != Display::Flex {
+                    node.display = Display::Flex;
+                }
+            }
+            None => {
+                if node.display != Display::None {
+                    node.display = Display::None;
+                }
+            }
+        }
+    }
+
+    for (label, mut text) in &mut label_q {
+        let cell = grid.cells.get(label.index);
+        let want = match cell {
+            Some(c) if c.item_no.is_some() && c.quantity > 1 => c.quantity.to_string(),
+            _ => String::new(),
+        };
+        if **text != want {
+            **text = want;
+        }
+    }
+}
+
 /// Fill the pooled option rows from the current menu's choices (with a cursor
 /// marker on the selected one) and hide unused rows. For plain speech (no
 /// choices) all rows are hidden.
@@ -182,19 +351,23 @@ pub fn update_dialog_options_system(
     if !state.is_changed() && !mode.is_changed() {
         return;
     }
-    let choices: &[String] = state
-        .snapshot
-        .dialog
-        .as_ref()
-        .map(|d| d.choices.as_slice())
-        .unwrap_or(&[]);
+    let dialog = state.snapshot.dialog.as_ref();
+    let choices: &[String] = dialog.map(|d| d.choices.as_slice()).unwrap_or(&[]);
+    // Choices represented by grid cells are navigated (and highlighted) on the
+    // icon grid itself; suppress their duplicate flat rows so only the
+    // non-grid rows (recipient, Cancel) render as a list.
+    let in_grid = |choice: u32| -> bool {
+        dialog
+            .and_then(|d| d.grid.as_ref())
+            .is_some_and(|g| g.cells.iter().any(|c| c.choice == Some(choice)))
+    };
     let cursor = match &*mode {
         InputMode::Dialog(c) => c.cursor,
         _ => 0,
     };
 
     for (btn, mut node) in &mut rows {
-        let want = if (btn.choice as usize) < choices.len() {
+        let want = if (btn.choice as usize) < choices.len() && !in_grid(btn.choice) {
             Display::Flex
         } else {
             Display::None
@@ -205,6 +378,7 @@ pub fn update_dialog_options_system(
     }
     for (lbl, mut text, mut color) in &mut labels {
         let (want_text, want_color) = match choices.get(lbl.choice as usize) {
+            _ if in_grid(lbl.choice) => (String::new(), theme::TEXT),
             Some(opt) if lbl.choice == cursor => (format!("{CURSOR_MARKER} {opt}"), theme::CURSOR),
             Some(opt) => (format!("  {opt}"), theme::TEXT),
             None => (String::new(), theme::TEXT),

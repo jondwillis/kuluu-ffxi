@@ -107,8 +107,7 @@ pub fn grid_move(slot: u8, dx: i32, dy: i32) -> u8 {
 
 const DETAIL_ROWS: usize = 10;
 const STORAGE_ROWS: usize = 16;
-const CELL_PX: f32 = 36.0;
-const ICON_PX: f32 = 30.0;
+use crate::hud::item_grid::spawn_item_cell;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EquipRole {
@@ -309,37 +308,14 @@ fn spawn_row(p: &mut ChildSpawnerCommands, role: EquipRole, size: f32, color: Co
 }
 
 fn spawn_cell(p: &mut ChildSpawnerCommands, slot: EquipmentIndex, placeholder: Handle<Image>) {
-    p.spawn((
+    spawn_item_cell(
+        p,
         EquipCellFrame(slot),
-        Node {
-            width: Val::Px(CELL_PX),
-            height: Val::Px(CELL_PX),
-            border: UiRect::all(Val::Px(1.0)),
-            justify_content: JustifyContent::Center,
-            align_items: AlignItems::Center,
-            ..default()
-        },
-        BackgroundColor(theme::CELL_BG),
-        BorderColor::all(theme::CELL_EDGE),
-    ))
-    .with_children(|c| {
-        c.spawn((
-            EquipIcon(IconSlot::Cell(slot)),
-            Node {
-                width: Val::Px(ICON_PX),
-                height: Val::Px(ICON_PX),
-                display: Display::None,
-                ..default()
-            },
-            ImageNode::new(placeholder),
-        ));
-        c.spawn((
-            EquipText(EquipRole::CellLabel(slot)),
-            Text::new(slot.abbr()),
-            text_font(11.0),
-            TextColor(theme::MUTED),
-        ));
-    });
+        EquipIcon(IconSlot::Cell(slot)),
+        EquipText(EquipRole::CellLabel(slot)),
+        slot.abbr(),
+        placeholder,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

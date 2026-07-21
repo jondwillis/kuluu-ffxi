@@ -334,9 +334,18 @@ pub struct MzbNonCollisionMesh;
 pub fn apply_zone_geom_visibility(
     draw: Res<DrawDistance>,
     mut q_collision: Query<&mut Visibility, (With<MzbCollisionMesh>, Without<MzbNonCollisionMesh>)>,
+    // WaterPlane is excluded: water surfaces are real visual geometry (the
+    // retail client always draws them), not part of the MZB debug overlay.
+    // The client leaves `zone_geom_mode` at the default `Off` (the visible
+    // world comes from MMB placements), so gating water on it hid every pond
+    // in the normal game.
     mut q_noncollision: Query<
         &mut Visibility,
-        (With<MzbNonCollisionMesh>, Without<MzbCollisionMesh>),
+        (
+            With<MzbNonCollisionMesh>,
+            Without<MzbCollisionMesh>,
+            Without<WaterPlane>,
+        ),
     >,
 ) {
     if !draw.is_changed() {
@@ -1189,7 +1198,6 @@ pub fn spawn_zone_water(
     mut images: ResMut<Assets<Image>>,
     mut water_mat: ResMut<ZoneWaterMaterial>,
     settings: Res<crate::graphics::GraphicsSettings>,
-    draw: Res<DrawDistance>,
     self_q: Query<&GlobalTransform, With<IsSelf>>,
     #[cfg(feature = "enhanced-water")] mut water_materials: ResMut<
         Assets<crate::water_enhanced::StandardWaterMaterial>,
@@ -1215,11 +1223,14 @@ pub fn spawn_zone_water(
         })
         .clone();
 
-    // Water surfaces are visual, non-collision zone geometry: honor the current
-    // ZoneGeomMode at spawn time (a zone loaded while geom is Off/Collision must
-    // not show water), and tag MzbNonCollisionMesh so apply_zone_geom_visibility
-    // toggles them with the rest of the non-collision meshes.
-    let (_, water_vis) = compute_init_visibility(draw.zone_geom_mode);
+    // Water surfaces are real visual geometry, not part of the MZB debug
+    // overlay: the retail client always draws them regardless of the debug
+    // zone-geom mode, and the client leaves `zone_geom_mode` at the default
+    // `Off` (the visible world comes from MMB placements). Gating on the mode
+    // here spawned every pond Hidden in the normal game. WaterPlane is also
+    // excluded from apply_zone_geom_visibility's non-collision query so the
+    // debug toggle never hides water after the fact.
+    let water_vis = Visibility::Inherited;
 
     const WATER_SPAWN_BUDGET: usize = 32;
     let mut spawned = 0usize;

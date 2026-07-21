@@ -44,6 +44,10 @@ struct P {
 struct FC(u32);
 #[derive(Resource, Default)]
 struct CS(bool);
+/// Off-screen render target; `Screenshot::primary_window()` returns black on
+/// macOS when the window is never presented, so we capture this image instead.
+#[derive(Resource)]
+struct CapTarget(Handle<Image>);
 fn main() {
     let a: Vec<String> = env::args().collect();
     let mut p = P {
@@ -201,10 +205,30 @@ fn setup(
     d.zone_geom_mode = p.mode;
     d.world = 1e5;
     d.mob = 1e5;
+    // Off-screen render target (see CapTarget).
+    let size = bevy::render::render_resource::Extent3d {
+        width: 1280,
+        height: 1280,
+        depth_or_array_layers: 1,
+    };
+    let mut target = Image::new_fill(
+        size,
+        bevy::render::render_resource::TextureDimension::D2,
+        &[0, 0, 0, 255],
+        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    target.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::TEXTURE_BINDING
+        | bevy::render::render_resource::TextureUsages::COPY_SRC
+        | bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT;
+    let target = images.add(target);
+    c.insert_resource(CapTarget(target.clone()));
+    let cam_target = bevy::camera::RenderTarget::Image(target.into());
     let cam = match p.cam {
         Some(pos) => c
             .spawn((
                 Camera3d::default(),
+                cam_target.clone(),
                 Transform::from_translation(pos).looking_at(p.tgt, Vec3::Y),
             ))
             .id(),
@@ -215,6 +239,7 @@ fn setup(
             };
             c.spawn((
                 Camera3d::default(),
+                cam_target.clone(),
                 Projection::Orthographic(proj),
                 Transform::from_xyz(0., p.cy, 0.).looking_at(Vec3::new(0., 0., -0.001), Vec3::Z),
             ))
@@ -337,6 +362,8 @@ fn cap(
     mut e: MessageWriter<AppExit>,
     queue: Res<MmbLoadQueue>,
     water: Res<PendingWaterSpawns>,
+    q_aabb: Query<(&bevy::camera::primitives::Aabb, &GlobalTransform)>,
+    target: Res<CapTarget>,
 ) {
     f.0 += 1;
     if f.0.is_multiple_of(40) {
@@ -347,8 +374,20 @@ fn cap(
             water.specs.len()
         );
     }
+    if f.0 == 60 {
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        let mut n = 0usize;
+        for (aabb, gt) in q_aabb.iter() {
+            let c = gt.transform_point(Vec3::from(aabb.center));
+            min = min.min(c);
+            max = max.max(c);
+            n += 1;
+        }
+        eprintln!("mesh centers n={n} min={min:?} max={max:?}");
+    }
     if !s.0 && f.0 >= p.cap {
-        c.spawn(Screenshot::primary_window())
+        c.spawn(Screenshot::image(target.0.clone()))
             .observe(save_to_disk(p.out.clone()));
         s.0 = true;
         eprintln!("captured -> {}", p.out);
