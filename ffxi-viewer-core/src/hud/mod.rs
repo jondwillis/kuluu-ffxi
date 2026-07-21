@@ -18,6 +18,8 @@ pub mod item_meta;
 pub mod item_screen;
 pub mod item_ui;
 pub mod logout_countdown;
+// Depends on `crate::minimap`, which is itself gated off wasm (lib.rs).
+#[cfg(not(target_arch = "wasm32"))]
 pub mod map_screen;
 pub mod menu;
 pub mod menu_help_bar;
@@ -182,6 +184,7 @@ impl Plugin for HudPlugin {
         app.init_resource::<item_detail::SortOptions>();
         app.init_resource::<item_detail::ItemMenuFocus>();
         app.init_resource::<item_screen::ItemScreenContainer>();
+        #[cfg(not(target_arch = "wasm32"))]
         app.init_resource::<map_screen::MapScreenDots>();
 
         app.init_resource::<check_view::CheckTarget>();
@@ -272,16 +275,18 @@ impl Plugin for HudPlugin {
                 check_view::update_check_view,
                 status_panel::update_status_panel,
                 equipment_screen::update_equipment_screen.after(menu::refresh_dynamic_menu_rows),
-                map_screen::update_map_screen_image,
-                map_screen::update_map_screen_markers,
-                map_screen::update_map_widescan_list,
                 delivery::rebuild_delivery_inventory,
                 delivery::update_delivery_screen.after(delivery::rebuild_delivery_inventory),
             ),
         );
+        // Map screen + minimap markers depend on `crate::minimap` (wasm-gated).
+        #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,
             (
+                map_screen::update_map_screen_image,
+                map_screen::update_map_screen_markers,
+                map_screen::update_map_widescan_list,
                 crate::minimap::overlay::update_marker_legend,
                 crate::minimap::overlay::handle_marker_legend_click,
             ),
@@ -389,15 +394,17 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
     app.add_systems(schedule.clone(), cast_bar::spawn_cast_bar);
 
     app.add_systems(
-        schedule,
+        schedule.clone(),
         (
             item_screen::spawn_item_screen,
             trade::spawn_trade_window,
             check_view::spawn_check_view,
             status_panel::spawn_status_panel,
             equipment_screen::spawn_equipment_screen,
-            map_screen::spawn_map_screen,
             delivery::spawn_delivery_screen,
         ),
     );
+    // Depends on `crate::minimap` (wasm-gated).
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(schedule, map_screen::spawn_map_screen);
 }
