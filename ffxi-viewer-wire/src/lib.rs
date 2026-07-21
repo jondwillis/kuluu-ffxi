@@ -618,6 +618,36 @@ pub struct DialogState {
     /// `AgentCommand::TextInput` instead of a menu choice.
     #[serde(default)]
     pub text_entry: bool,
+
+    /// Grid presentation metadata for a choice frame (delivery-box 2x4 slot
+    /// grid). Cells are row-major; each active cell maps back to an index in
+    /// `choices`, so answering works identically to a plain list frame.
+    #[serde(default)]
+    pub grid: Option<DialogGrid>,
+}
+
+/// Row-major grid overlay for a choice frame (`cells.len() == rows * cols`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DialogGrid {
+    pub cols: u8,
+    pub rows: u8,
+    pub cells: Vec<DialogGridCell>,
+}
+
+/// One cell of a [`DialogGrid`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DialogGridCell {
+    /// Index into `DialogState::choices` this cell activates; `None` for an
+    /// inert cell (empty slot that is not currently selectable).
+    pub choice: Option<u32>,
+
+    /// Item occupying the cell, if any (drives the icon in the viewer).
+    pub item_no: Option<u16>,
+
+    pub quantity: u32,
+
+    /// True once an outgoing item has been dispatched to the server.
+    pub sent: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

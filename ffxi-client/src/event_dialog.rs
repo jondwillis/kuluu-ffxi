@@ -241,6 +241,7 @@ fn frame_to_dialog(
         prompt: Some(substitute(text)),
         choices: choices.into_iter().map(substitute).collect(),
         text_entry: false,
+        grid: None,
     }
 }
 

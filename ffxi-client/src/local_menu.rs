@@ -11,7 +11,8 @@ use ffxi_proto::map::pbx;
 
 use crate::delivery_box::item_name;
 use crate::state::{
-    DeliveryBoxNo, DeliveryBoxOp, DeliveryItem, DialogState, JobInfoState, MogHouseExit, MyRoomInfo,
+    DeliveryBoxNo, DeliveryBoxOp, DeliveryItem, DialogGrid, DialogGridCell, DialogState,
+    JobInfoState, MogHouseExit, MyRoomInfo,
 };
 
 /// Synthetic client-local actor ids, kept in a reserved top-of-range block: LSB
@@ -90,6 +91,8 @@ pub const RECIPIENT_UNSET: &str = "(not specified)";
 /// An empty outbox grid cell (rows appear once the recipient is locked, like
 /// retail's cursor order: recipient OK first, then the slot grid activates).
 pub const EMPTY_SLOT_SUFFIX: &str = "(empty)";
+/// Retail delivery panels lay the 8 slots out as a 2-row x 4-column grid.
+pub const DELIVERY_GRID_COLS: u8 = 4;
 /// Retail's item list header once an empty slot is entered
 /// (artifacts/retail/moghouse-menu-notes.md:63 — `Items | Select an item.`).
 pub const PICK_ITEM_PROMPT: &str = "Items | Select an item.";
@@ -370,29 +373,48 @@ impl LocalMenuSession {
                 Action::DeliveryRecipient,
             ));
         }
-        rows.extend(slots.iter().enumerate().filter_map(|(i, cell)| match cell {
-            Some(item) => Some((
-                delivery_slot_label(box_no, item),
-                Action::DeliverySlot {
-                    box_no,
-                    slot: i as u8,
-                },
-            )),
-            // Empty outbox cells activate only once the recipient is locked,
-            // matching retail's cursor order (recipient OK → grid).
-            None if box_no == DeliveryBoxNo::Outgoing && self.recipient.is_some() => Some((
-                format!("Slot {} {EMPTY_SLOT_SUFFIX}", i + 1),
-                Action::DeliveryPut { slot: i as u8 },
-            )),
-            None => None,
-        }));
+        // Build the retail 2x4 grid overlay alongside the flat rows: each
+        // selectable cell records the choice index of the row it activates.
+        let mut cells: Vec<DialogGridCell> = Vec::with_capacity(pbx::SLOT_COUNT);
+        for (i, cell) in slots.iter().enumerate() {
+            match cell {
+                Some(item) => {
+                    cells.push(DialogGridCell {
+                        choice: Some(rows.len() as u32),
+                        item_no: Some(item.item_no),
+                        quantity: item.quantity,
+                        sent: item.sent(),
+                    });
+                    rows.push((
+                        delivery_slot_label(box_no, item),
+                        Action::DeliverySlot {
+                            box_no,
+                            slot: i as u8,
+                        },
+                    ));
+                }
+                // Empty outbox cells activate only once the recipient is
+                // locked, matching retail's cursor order (recipient OK → grid).
+                None if box_no == DeliveryBoxNo::Outgoing && self.recipient.is_some() => {
+                    cells.push(DialogGridCell {
+                        choice: Some(rows.len() as u32),
+                        ..DialogGridCell::default()
+                    });
+                    rows.push((
+                        format!("Slot {} {EMPTY_SLOT_SUFFIX}", i + 1),
+                        Action::DeliveryPut { slot: i as u8 },
+                    ));
+                }
+                None => cells.push(DialogGridCell::default()),
+            }
+        }
         rows.push((
             CANCEL_ROW.to_string(),
             Action::Delivery {
                 op: DeliveryBoxOp::PostClose { box_no },
             },
         ));
-        self.set(Menu {
+        let mut f = self.set(Menu {
             npc_id: MOG_MENU_ID,
             npc_name: MOG_MENU_NPC_NAME,
             prompt: match box_no {
@@ -400,7 +422,13 @@ impl LocalMenuSession {
                 DeliveryBoxNo::Outgoing => SEND_PANEL_PROMPT.to_string(),
             },
             rows,
-        })
+        });
+        f.grid = Some(DialogGrid {
+            cols: DELIVERY_GRID_COLS,
+            rows: (pbx::SLOT_COUNT as u8).div_ceil(DELIVERY_GRID_COLS),
+            cells,
+        });
+        f
     }
 
     /// Re-open the Receive/Send submenu (after a PostClose ack).
@@ -614,6 +642,7 @@ fn frame(menu: &Menu) -> DialogState {
         prompt: Some(menu.prompt.clone()),
         choices: menu.rows.iter().map(|(label, _)| label.clone()).collect(),
         text_entry: false,
+        grid: None,
     }
 }
 
@@ -779,6 +808,7 @@ fn recipient_entry_frame() -> DialogState {
         prompt: Some(RECIPIENT_PROMPT.to_string()),
         choices: Vec::new(),
         text_entry: true,
+        grid: None,
     }
 }
 

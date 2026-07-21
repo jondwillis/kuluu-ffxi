@@ -196,6 +196,24 @@ pub fn dialog_to_wire(d: &DialogState) -> wire::DialogState {
         prompt: d.prompt.clone(),
         choices: d.choices.clone(),
         text_entry: d.text_entry,
+        grid: d.grid.as_ref().map(grid_to_wire),
+    }
+}
+
+fn grid_to_wire(g: &crate::state::DialogGrid) -> wire::DialogGrid {
+    wire::DialogGrid {
+        cols: g.cols,
+        rows: g.rows,
+        cells: g
+            .cells
+            .iter()
+            .map(|c| wire::DialogGridCell {
+                choice: c.choice,
+                item_no: c.item_no,
+                quantity: c.quantity,
+                sent: c.sent,
+            })
+            .collect(),
     }
 }
 
