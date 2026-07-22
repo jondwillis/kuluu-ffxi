@@ -1208,11 +1208,13 @@ fn handle_abilities_group_key(
         if let Some(row) = rows.get(sub.cursor) {
             let action = row.action;
             if let Some(sub_action) = sub_target_action_for(action) {
-                // Retail: choosing the spell/ability does not fire it — the
-                // flashing sub-target cursor asks "on whom?" first. Esc
-                // returns here with the menu cursor preserved.
-                let return_to = InputMode::TargetAction(state.clone());
-                return open_sub_target(sub_action, current_target, scene_state, return_to);
+                if !selected_target_valid(sub_action, current_target, scene_state) {
+                    // No valid target selected: retail's flashing sub-target
+                    // cursor asks "on whom?" first. Esc returns here with the
+                    // menu cursor preserved.
+                    let return_to = InputMode::TargetAction(state.clone());
+                    return open_sub_target(sub_action, current_target, scene_state, return_to);
+                }
             }
             let self_pos = scene_state.snapshot.self_pos.pos;
             dispatch_dynamic_menu_action(
@@ -2629,12 +2631,13 @@ fn confirm_menu_at_cursor(
                 return None;
             }
             if let Some(sub_action) = sub_target_action_for(action) {
-                // Retail sub-target confirm step: the action fires only after
-                // the flashing cursor is confirmed. Esc restores this menu
-                // with its cursor intact. None = no qualified target in
-                // range; stay in the menu like retail.
-                let return_to = InputMode::Menu(stack.clone());
-                return open_sub_target(sub_action, target_id, scene_state, return_to);
+                if !selected_target_valid(sub_action, target_id, scene_state) {
+                    // No valid target selected: retail's sub-target confirm step
+                    // fires the action only after the flashing cursor is confirmed.
+                    // Esc restores this menu with its cursor intact.
+                    let return_to = InputMode::Menu(stack.clone());
+                    return open_sub_target(sub_action, target_id, scene_state, return_to);
+                }
             }
             let moved = matches!(action, A::MoveItem { .. });
             let entities = scene_state.snapshot.entities.clone();
@@ -2850,6 +2853,26 @@ fn gather_sub_target_entities(
 /// Open the retail sub-target confirm step for `action`. Returns None (stay
 /// in the current mode) when nothing in range qualifies, echoing retail's
 /// refusal line.
+/// Retail: with a valid target already selected, confirming an action casts on it
+/// immediately — the flashing sub-target cursor is only for choosing a *different*
+/// target. True when `current_target` satisfies the action's validTarget flags, so
+/// the caller dispatches directly instead of opening the cursor. (Self-only actions
+/// never reach here — sub_target_action_for already routed them to <me>.)
+fn selected_target_valid(
+    action: ffxi_viewer_core::input_mode::SubTargetAction,
+    current_target: Option<u32>,
+    scene_state: &SceneState,
+) -> bool {
+    use ffxi_viewer_core::sub_target;
+    let Some(tid) = current_target else {
+        return false;
+    };
+    let flags = sub_target::action_flags(action);
+    gather_sub_target_entities(scene_state)
+        .iter()
+        .any(|e| e.id == tid && sub_target::entity_valid(flags, e))
+}
+
 fn open_sub_target(
     action: ffxi_viewer_core::input_mode::SubTargetAction,
     current_target: Option<u32>,
