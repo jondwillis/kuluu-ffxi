@@ -2116,6 +2116,7 @@ async fn keepalive_loop(
                         // the context and only awaits the `_CUSTOM_MENU` tell, so
                         // clear the prompt locally rather than waiting for an event.
                         let text = custom_menu_reply(&character_name, &title, option.as_deref());
+                        tracing::info!(sub_seq, reply = %text, "custom menu reply send (0x0B6)");
                         let payload = build_subpacket_tell(sub_seq, CUSTOM_MENU_SENDER, &text);
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
