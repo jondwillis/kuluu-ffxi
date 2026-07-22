@@ -90,6 +90,10 @@ pub struct SlashWriters<'w, 's> {
     pub select_target: ResMut<'w, SelectTargetMode>,
 
     pub active_chat_tab: ResMut<'w, ActiveChatTab>,
+
+    pub map_screen_state: ResMut<'w, ffxi_viewer_core::hud::map_screen::MapScreenState>,
+
+    pub map_markers: ResMut<'w, ffxi_viewer_core::hud::map_screen::MapMarkers>,
 }
 
 #[derive(SystemParam)]
@@ -267,9 +271,9 @@ pub fn text_input_system(
                     &dynamic_menu,
                     current_target,
                     self_pos,
-                    &mut slash_writers.minimap_zoom,
                     &mut slash_writers.minimap_view,
-                    &slash_writers.minimap_state,
+                    &mut slash_writers.map_screen_state,
+                    &mut slash_writers.map_markers,
                 ) {
                     *mode = next;
                 }
@@ -358,15 +362,19 @@ pub fn text_input_system(
 /// Seconds between wide-scan list re-requests while the Map screen is open.
 const WIDESCAN_REFRESH_SECS: f32 = 4.0;
 
-/// Retail streams wide-scan updates; while the Map screen is open we re-issue
-/// the 0x0F4 list request on an interval so the roster and distances stay fresh.
+/// Retail streams wide-scan updates; while the Map screen's Wide Scan submode is
+/// active we re-issue the 0x0F4 list request on an interval so the roster and
+/// distances stay fresh. Other submodes (or a closed screen) hold no tracking.
 pub fn widescan_refresh_system(
     mode: Res<InputMode>,
+    map_state: Res<ffxi_viewer_core::hud::map_screen::MapScreenState>,
     time: Res<Time>,
     cmd_tx: Res<CommandTx>,
     mut timer: Local<Option<Timer>>,
 ) {
-    if !ffxi_viewer_core::hud::map_screen::map_open(&mode) {
+    let active = ffxi_viewer_core::hud::map_screen::map_open(&mode)
+        && map_state.mode == ffxi_viewer_core::hud::map_screen::MapSubMode::WideScan;
+    if !active {
         *timer = None;
         return;
     }
@@ -2672,11 +2680,9 @@ fn confirm_menu_at_cursor(
             if submenu == MenuKind::EmoteList {
                 let _ = cmd_tx.try_send(AgentCommand::RequestEmoteList);
             }
-            // Entering the Map screen pulls a fresh wide-scan list (0x0F4
-            // SendFlg=1); a client interval re-requests while it stays open.
-            if submenu == MenuKind::Map {
-                let _ = cmd_tx.try_send(AgentCommand::WidescanRequest);
-            }
+            // The Map screen opens on its command submenu; the wide-scan request
+            // (0x0F4) fires only when the player selects "Wide Scan", not on open.
+            // `reset_map_screen_on_open` clears the submode as the screen appears.
             stack.push(submenu);
             None
         }
@@ -3361,25 +3367,25 @@ fn handle_menu_key(
     dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
     target_id: Option<u32>,
     self_pos: ffxi_viewer_wire::Vec3,
-    minimap_zoom: &mut ffxi_viewer_core::minimap::MinimapZoom,
     minimap_view: &mut ffxi_viewer_core::minimap::MinimapView,
-    minimap_state: &ffxi_viewer_core::minimap::MinimapState,
+    map_state: &mut ffxi_viewer_core::hud::map_screen::MapScreenState,
+    map_markers: &mut ffxi_viewer_core::hud::map_screen::MapMarkers,
 ) -> Option<InputMode> {
     let top_kind = stack.current()?.kind;
 
-    // The Map screen is a bespoke two-pane surface (map + wide-scan list) with
-    // its own navigation, so it intercepts before the generic menu routing.
+    // The Map screen is a bespoke full-screen surface (full-screen map + a
+    // top-right command submenu drilling into Markers/Wide Scan/Change Map),
+    // with its own submode navigation, so it intercepts before generic routing.
     if top_kind == MenuKind::Map {
-        return handle_map_screen_key(
+        return handle_map_key(
             key,
-            key_code,
             bindings,
             stack,
             scene_state,
             cmd_tx,
-            minimap_zoom,
+            map_state,
+            map_markers,
             minimap_view,
-            minimap_state,
         );
     }
     let (kind, cursor) = {
@@ -3598,109 +3604,258 @@ fn handle_menu_key(
     None
 }
 
-/// Yalms panned per arrow press while the map pane is focused.
-const MAP_PAN_STEP_YALMS: f32 = 8.0;
+/// UV moved per arrow press by the Markers placement crosshair.
+const MAP_CURSOR_STEP_UV: f32 = 0.02;
 
 #[allow(clippy::too_many_arguments)]
-fn handle_map_screen_key(
+fn handle_map_key(
     key: &Key,
-    key_code: KeyCode,
     bindings: &Bindings,
     stack: &mut MenuStack,
     scene_state: &mut SceneState,
     cmd_tx: &Sender<AgentCommand>,
-    minimap_zoom: &mut ffxi_viewer_core::minimap::MinimapZoom,
+    map_state: &mut ffxi_viewer_core::hud::map_screen::MapScreenState,
+    map_markers: &mut ffxi_viewer_core::hud::map_screen::MapMarkers,
     minimap_view: &mut ffxi_viewer_core::minimap::MinimapView,
-    minimap_state: &ffxi_viewer_core::minimap::MinimapState,
 ) -> Option<InputMode> {
-    use ffxi_viewer_core::hud::map_screen::{widescan_rows, MAP_PANE};
+    use ffxi_viewer_core::hud::map_screen::{
+        change_map_targets, widescan_rows, MapSubMode, COMMAND_ROWS,
+    };
 
-    // Minus toggles map-vs-list focus (the shared two-pane affordance).
-    if key_code == KeyCode::Minus {
-        stack.toggle_pane();
-        return None;
-    }
-
-    if stack.active_pane == MAP_PANE {
-        // Map focused: arrows pan and the camera-zoom keys zoom, reusing the
-        // minimap's MinimapView/MinimapZoom so the two surfaces stay in sync.
-        let pan = if bindings.matches_logical(Action::NavLeft, key) {
-            Some(bevy::math::Vec2::new(-MAP_PAN_STEP_YALMS, 0.0))
-        } else if bindings.matches_logical(Action::NavRight, key) {
-            Some(bevy::math::Vec2::new(MAP_PAN_STEP_YALMS, 0.0))
-        } else if bindings.matches_logical(Action::NavUp, key) {
-            Some(bevy::math::Vec2::new(0.0, -MAP_PAN_STEP_YALMS))
-        } else if bindings.matches_logical(Action::NavDown, key) {
-            Some(bevy::math::Vec2::new(0.0, MAP_PAN_STEP_YALMS))
-        } else {
+    match map_state.mode {
+        MapSubMode::Command => {
+            if let Some(dir) = nav_dir(bindings, key) {
+                map_state.cursor = wrap_cursor(map_state.cursor, COMMAND_ROWS.len(), dir);
+                return None;
+            }
+            if bindings.matches_logical(Action::NavConfirm, key) {
+                if let Some((_, sub)) = COMMAND_ROWS.get(map_state.cursor) {
+                    enter_submode(*sub, map_state, cmd_tx);
+                }
+                return None;
+            }
+            if bindings.matches_logical(Action::NavCancel, key) {
+                return close_map_screen(stack, map_state, cmd_tx);
+            }
             None
-        };
-        if let Some(delta) = pan {
-            minimap_view.pan_offset_xz += delta;
-            minimap_view.idle_frames = 0;
+        }
+        MapSubMode::WideScan => {
+            let rows = widescan_rows(&scene_state.snapshot);
+            if let Some(dir) = nav_dir(bindings, key) {
+                map_state.cursor = wrap_cursor(map_state.cursor, rows.len(), dir);
+                return None;
+            }
+            if bindings.matches_logical(Action::NavConfirm, key) {
+                if let Some(row) = rows.get(map_state.cursor) {
+                    if let Err(e) = cmd_tx.try_send(AgentCommand::WidescanTrack {
+                        act_index: row.act_index,
+                    }) {
+                        push_system_chat_line(
+                            scene_state,
+                            format!("[widescan] track dropped: {e}"),
+                        );
+                    }
+                }
+                return None;
+            }
+            if bindings.matches_logical(Action::NavCancel, key) {
+                let _ = cmd_tx.try_send(AgentCommand::WidescanEnd);
+                return_to_command(map_state);
+                None
+            } else {
+                None
+            }
+        }
+        MapSubMode::Markers => handle_markers_key(
+            key,
+            bindings,
+            scene_state,
+            map_state,
+            map_markers,
+            minimap_view.visible_aabb,
+        ),
+        MapSubMode::ChangeMap => {
+            let targets = change_map_targets(map_state, &scene_state.snapshot);
+            if let Some(dir) = nav_dir(bindings, key) {
+                map_state.cursor = wrap_cursor(map_state.cursor, targets.len(), dir);
+                return None;
+            }
+            if bindings.matches_logical(Action::NavConfirm, key) {
+                if let Some(&(zone, idx)) = targets.get(map_state.cursor) {
+                    map_state.viewed = Some((zone, idx));
+                    map_state.cursor = 0;
+                }
+                return None;
+            }
+            if bindings.matches_logical(Action::NavCancel, key) {
+                map_state.viewed = None;
+                return_to_command(map_state);
+                None
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Markers submode: a placement crosshair (arrow keys), Confirm to name+place a
+/// marker (text entry), and the placed-marker list (delete with Confirm on a row
+/// once naming is done). Cancel exits text entry, then the submode.
+fn handle_markers_key(
+    key: &Key,
+    bindings: &Bindings,
+    scene_state: &mut SceneState,
+    map_state: &mut ffxi_viewer_core::hud::map_screen::MapScreenState,
+    map_markers: &mut ffxi_viewer_core::hud::map_screen::MapMarkers,
+    visible_aabb: Option<ffxi_viewer_core::minimap::MinimapAabb>,
+) -> Option<InputMode> {
+    use ffxi_viewer_core::hud::map_screen::MapMarker;
+
+    // Text-entry step: naming the marker being placed at the crosshair.
+    if let Some(entry) = map_state.marker_entry.as_mut() {
+        if bindings.matches_logical(Action::ChatSubmit, key)
+            || bindings.matches_logical(Action::NavConfirm, key)
+        {
+            let label = std::mem::take(entry);
+            map_state.marker_entry = None;
+            let label = if label.trim().is_empty() {
+                "Marker".to_string()
+            } else {
+                label.trim().to_string()
+            };
+            if let (Some(zone), Some(uv), Some(aabb)) = (
+                scene_state.snapshot.zone_id,
+                map_state.map_cursor,
+                visible_aabb,
+            ) {
+                let xz = aabb.uv_to_world(uv);
+                map_markers
+                    .by_zone
+                    .entry(zone)
+                    .or_default()
+                    .push(MapMarker {
+                        world: ffxi_viewer_wire::Vec3 {
+                            x: xz.x,
+                            y: 0.0,
+                            z: xz.y,
+                        },
+                        label,
+                    });
+            }
             return None;
         }
-        let half = ffxi_viewer_core::minimap::zone_half_span(
-            minimap_state.retail_aabb.or(minimap_state.aabb),
-        );
-        if bindings.matches_logical(Action::CameraZoomIn, key) {
-            minimap_zoom.zoom_by(1.0 / ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR, half);
+        if bindings.matches_logical(Action::ChatExit, key)
+            || bindings.matches_logical(Action::NavCancel, key)
+        {
+            map_state.marker_entry = None;
             return None;
         }
-        if bindings.matches_logical(Action::CameraZoomOut, key) {
-            minimap_zoom.zoom_by(ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR, half);
+        if bindings.matches_logical(Action::ChatBackspace, key) {
+            entry.pop();
             return None;
         }
-        if bindings.matches_logical(Action::NavCancel, key) {
-            return close_map_screen(stack, cmd_tx);
+        match key {
+            Key::Space => entry.push(' '),
+            Key::Character(s) => {
+                for c in s.chars() {
+                    if !c.is_control() {
+                        entry.push(c);
+                    }
+                }
+            }
+            _ => {}
         }
         return None;
     }
 
-    // Wide-scan list focused: cursor the sorted rows; Confirm tracks the row's
-    // act_index (0x0F5), Cancel closes the screen.
-    let rows = widescan_rows(&scene_state.snapshot);
-    let count = rows.len();
-    let cursor = stack.current().map(|l| l.cursor).unwrap_or(0);
-    if bindings.matches_logical(Action::NavUp, key) {
-        if let Some(level) = stack.current_mut() {
-            level.cursor = if count == 0 {
-                0
-            } else if cursor == 0 {
-                count - 1
-            } else {
-                cursor - 1
-            };
-        }
-        return None;
-    }
-    if bindings.matches_logical(Action::NavDown, key) {
-        if let Some(level) = stack.current_mut() {
-            let next = cursor + 1;
-            level.cursor = if count == 0 || next >= count { 0 } else { next };
-        }
+    // Crosshair movement across the map (UV space, clamped).
+    let cursor = map_state
+        .map_cursor
+        .get_or_insert(bevy::math::Vec2::splat(0.5));
+    let delta = if bindings.matches_logical(Action::NavLeft, key) {
+        Some(bevy::math::Vec2::new(-MAP_CURSOR_STEP_UV, 0.0))
+    } else if bindings.matches_logical(Action::NavRight, key) {
+        Some(bevy::math::Vec2::new(MAP_CURSOR_STEP_UV, 0.0))
+    } else if bindings.matches_logical(Action::NavUp, key) {
+        Some(bevy::math::Vec2::new(0.0, -MAP_CURSOR_STEP_UV))
+    } else if bindings.matches_logical(Action::NavDown, key) {
+        Some(bevy::math::Vec2::new(0.0, MAP_CURSOR_STEP_UV))
+    } else {
+        None
+    };
+    if let Some(d) = delta {
+        *cursor = (*cursor + d).clamp(bevy::math::Vec2::ZERO, bevy::math::Vec2::ONE);
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        if let Some(row) = rows.get(cursor) {
-            if let Err(e) = cmd_tx.try_send(AgentCommand::WidescanTrack {
-                act_index: row.act_index,
-            }) {
-                push_system_chat_line(scene_state, format!("[widescan] track dropped: {e}"));
-            }
-        }
+        map_state.marker_entry = Some(String::new());
         return None;
     }
     if bindings.matches_logical(Action::NavCancel, key) {
-        return close_map_screen(stack, cmd_tx);
+        map_state.map_cursor = None;
+        return_to_command(map_state);
     }
     None
 }
 
-/// Close the Map screen: stop tracking (0x0F6) and pop back to the menu it
-/// opened from, or to the world if it was the only level.
-fn close_map_screen(stack: &mut MenuStack, cmd_tx: &Sender<AgentCommand>) -> Option<InputMode> {
+/// A single up/down navigation step, or `None` if the key isn't up/down.
+fn nav_dir(bindings: &Bindings, key: &Key) -> Option<i32> {
+    if bindings.matches_logical(Action::NavUp, key) {
+        Some(-1)
+    } else if bindings.matches_logical(Action::NavDown, key) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Move a wrapping list cursor by `dir` (±1); empty lists park at 0.
+fn wrap_cursor(cursor: usize, len: usize, dir: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let n = len as i32;
+    (((cursor as i32 + dir) % n + n) % n) as usize
+}
+
+/// Drill from the command submenu into a submode, initializing its cursor and
+/// firing the wide-scan request (0x0F4) only when Wide Scan is chosen.
+fn enter_submode(
+    sub: ffxi_viewer_core::hud::map_screen::MapSubMode,
+    map_state: &mut ffxi_viewer_core::hud::map_screen::MapScreenState,
+    cmd_tx: &Sender<AgentCommand>,
+) {
+    use ffxi_viewer_core::hud::map_screen::MapSubMode;
+    map_state.mode = sub;
+    map_state.cursor = 0;
+    match sub {
+        MapSubMode::WideScan => {
+            let _ = cmd_tx.try_send(AgentCommand::WidescanRequest);
+        }
+        MapSubMode::Markers => {
+            map_state.map_cursor = Some(bevy::math::Vec2::splat(0.5));
+        }
+        _ => {}
+    }
+}
+
+/// Return from a submode to the command submenu, restoring the command cursor.
+fn return_to_command(map_state: &mut ffxi_viewer_core::hud::map_screen::MapScreenState) {
+    map_state.mode = ffxi_viewer_core::hud::map_screen::MapSubMode::Command;
+    map_state.cursor = 0;
+    map_state.map_cursor = None;
+    map_state.marker_entry = None;
+}
+
+/// Close the Map screen: stop tracking (0x0F6), reset the submode, and pop back
+/// to the menu it opened from, or to the world if it was the only level.
+fn close_map_screen(
+    stack: &mut MenuStack,
+    map_state: &mut ffxi_viewer_core::hud::map_screen::MapScreenState,
+    cmd_tx: &Sender<AgentCommand>,
+) -> Option<InputMode> {
     let _ = cmd_tx.try_send(AgentCommand::WidescanEnd);
+    map_state.reset();
     if stack.pop() {
         None
     } else {

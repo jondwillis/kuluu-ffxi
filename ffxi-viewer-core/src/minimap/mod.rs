@@ -148,6 +148,14 @@ impl MinimapAabb {
         Some(Vec2::new(u, v))
     }
 
+    /// Inverse of `world_to_uv` on the XZ plane: a UV in 0..1 back to world
+    /// `(x, z)`. Height is not recoverable from a 2D map, so callers supply their
+    /// own Y. Used to place map markers at the crosshair.
+    pub fn uv_to_world(&self, uv: Vec2) -> Vec2 {
+        let span = self.max - self.min;
+        Vec2::new(self.min.x + uv.x * span.x, self.min.y + uv.y * span.y)
+    }
+
     pub fn world_to_grid(&self, world: Vec3) -> (char, u8) {
         let uv = self.world_to_uv(world);
         let col = (MAP_GRID_LAST_INDEX * uv.x).floor() as u8;
@@ -547,6 +555,19 @@ mod tests {
         let uv = aabb.world_to_uv(Vec3::new(0.0, 5.0, 0.0));
         assert!((uv.x - 0.5).abs() < 1e-6);
         assert!((uv.y - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn uv_to_world_inverts_world_to_uv() {
+        let aabb = MinimapAabb {
+            min: Vec2::new(-120.0, 40.0),
+            max: Vec2::new(80.0, 300.0),
+        };
+        let world = Vec3::new(-30.0, 12.0, 210.0);
+        let uv = aabb.world_to_uv(world);
+        let back = aabb.uv_to_world(uv);
+        assert!((back.x - world.x).abs() < 1e-3, "x round-trips");
+        assert!((back.y - world.z).abs() < 1e-3, "z round-trips into y");
     }
 
     #[test]

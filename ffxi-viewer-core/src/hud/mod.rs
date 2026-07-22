@@ -185,7 +185,11 @@ impl Plugin for HudPlugin {
         app.init_resource::<item_detail::ItemMenuFocus>();
         app.init_resource::<item_screen::ItemScreenContainer>();
         #[cfg(not(target_arch = "wasm32"))]
-        app.init_resource::<map_screen::MapScreenDots>();
+        {
+            app.init_resource::<map_screen::MapScreenDots>();
+            app.init_resource::<map_screen::MapScreenState>();
+            app.init_resource::<map_screen::MapMarkers>();
+        }
 
         app.init_resource::<check_view::CheckTarget>();
         app.init_resource::<status_panel::StatusProfileOpen>();
@@ -284,11 +288,10 @@ impl Plugin for HudPlugin {
         app.add_systems(
             Update,
             (
+                map_screen::reset_map_screen_on_open,
                 map_screen::update_map_screen_image,
                 map_screen::update_map_screen_markers,
-                map_screen::update_map_widescan_list,
-                crate::minimap::overlay::update_marker_legend,
-                crate::minimap::overlay::handle_marker_legend_click,
+                map_screen::update_map_panel,
             ),
         );
         app.add_systems(Update, apply_dev_hud_visibility);

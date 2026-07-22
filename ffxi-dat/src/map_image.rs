@@ -22,6 +22,19 @@ pub fn map_count_for_zone(zone_id: u16) -> usize {
         .count()
 }
 
+/// Every zone id that ships at least one map DAT, ascending and deduplicated.
+/// `MAP_DAT_TABLE` is sorted by `(zone, map_index)`, so equal zone ids are
+/// contiguous and dropping consecutive duplicates yields each zone once.
+pub fn zones_with_maps() -> Vec<u16> {
+    let mut out = Vec::new();
+    for (zone, _, _) in MAP_DAT_TABLE.iter() {
+        if out.last() != Some(zone) {
+            out.push(*zone);
+        }
+    }
+    out
+}
+
 pub const STATUS_ICON_FILE_ID: u32 = 87;
 
 pub const STATUS_ICON_BLOCK_STRIDE: usize = 0x1800;

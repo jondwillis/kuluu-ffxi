@@ -140,10 +140,11 @@ pub enum MenuKind {
     /// scraped LSB emote table, Job gated on the s2c 0x11A bits.
     EmoteList,
 
-    /// Full-screen Map screen: a bespoke two-pane layout (map + wide-scan list)
-    /// rendered by `hud::map_screen`, so the generic menu is suppressed while it
-    /// is on top. `active_pane` selects map-vs-list focus; the top level's
-    /// `cursor` indexes the wide-scan list.
+    /// Full-screen Map screen rendered by `hud::map_screen`: a full-screen map
+    /// with a top-right command submenu (Markers / Wide Scan / Change Map). The
+    /// stack only carries this level; the submode + cursor live in the bespoke
+    /// `hud::map_screen::MapScreenState`, so the generic menu is suppressed while
+    /// it is on top.
     Map,
 }
 
@@ -202,13 +203,6 @@ impl MenuStack {
         } else {
             false
         }
-    }
-
-    pub fn toggle_pane(&mut self) {
-        self.active_pane = match self.active_pane {
-            Pane::Left => Pane::Right,
-            Pane::Right => Pane::Left,
-        };
     }
 
     /// Level index a pane renders. Right = the top level; Left = its parent
