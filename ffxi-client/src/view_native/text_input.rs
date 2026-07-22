@@ -94,6 +94,8 @@ pub struct SlashWriters<'w, 's> {
     pub map_screen_state: ResMut<'w, ffxi_viewer_core::hud::map_screen::MapScreenState>,
 
     pub map_markers: ResMut<'w, ffxi_viewer_core::hud::map_screen::MapMarkers>,
+
+    pub map_view: Res<'w, ffxi_viewer_core::hud::map_screen::MapView>,
 }
 
 #[derive(SystemParam)]
@@ -271,9 +273,10 @@ pub fn text_input_system(
                     &dynamic_menu,
                     current_target,
                     self_pos,
-                    &mut slash_writers.minimap_view,
                     &mut slash_writers.map_screen_state,
                     &mut slash_writers.map_markers,
+                    &slash_writers.map_view,
+                    &slash_writers.minimap_state,
                 ) {
                     *mode = next;
                 }
@@ -356,32 +359,6 @@ pub fn text_input_system(
                 );
             }
         }
-    }
-}
-
-/// Seconds between wide-scan list re-requests while the Map screen is open.
-const WIDESCAN_REFRESH_SECS: f32 = 4.0;
-
-/// Retail streams wide-scan updates; while the Map screen's Wide Scan submode is
-/// active we re-issue the 0x0F4 list request on an interval so the roster and
-/// distances stay fresh. Other submodes (or a closed screen) hold no tracking.
-pub fn widescan_refresh_system(
-    mode: Res<InputMode>,
-    map_state: Res<ffxi_viewer_core::hud::map_screen::MapScreenState>,
-    time: Res<Time>,
-    cmd_tx: Res<CommandTx>,
-    mut timer: Local<Option<Timer>>,
-) {
-    let active = ffxi_viewer_core::hud::map_screen::map_open(&mode)
-        && map_state.mode == ffxi_viewer_core::hud::map_screen::MapSubMode::WideScan;
-    if !active {
-        *timer = None;
-        return;
-    }
-    let timer = timer
-        .get_or_insert_with(|| Timer::from_seconds(WIDESCAN_REFRESH_SECS, TimerMode::Repeating));
-    if timer.tick(time.delta()).just_finished() {
-        let _ = cmd_tx.0.try_send(AgentCommand::WidescanRequest);
     }
 }
 
@@ -3411,9 +3388,10 @@ fn handle_menu_key(
     dynamic: &ffxi_viewer_core::hud::menu::DynamicMenu,
     target_id: Option<u32>,
     self_pos: ffxi_viewer_wire::Vec3,
-    minimap_view: &mut ffxi_viewer_core::minimap::MinimapView,
     map_state: &mut ffxi_viewer_core::hud::map_screen::MapScreenState,
     map_markers: &mut ffxi_viewer_core::hud::map_screen::MapMarkers,
+    map_view: &ffxi_viewer_core::hud::map_screen::MapView,
+    minimap_state: &ffxi_viewer_core::minimap::MinimapState,
 ) -> Option<InputMode> {
     let top_kind = stack.current()?.kind;
 
@@ -3437,7 +3415,8 @@ fn handle_menu_key(
             cmd_tx,
             map_state,
             map_markers,
-            minimap_view,
+            map_view,
+            minimap_state,
         );
     }
     let (kind, cursor) = {
@@ -3668,11 +3647,26 @@ fn handle_map_key(
     cmd_tx: &Sender<AgentCommand>,
     map_state: &mut ffxi_viewer_core::hud::map_screen::MapScreenState,
     map_markers: &mut ffxi_viewer_core::hud::map_screen::MapMarkers,
-    minimap_view: &mut ffxi_viewer_core::minimap::MinimapView,
+    map_view: &ffxi_viewer_core::hud::map_screen::MapView,
+    minimap_state: &ffxi_viewer_core::minimap::MinimapState,
 ) -> Option<InputMode> {
     use ffxi_viewer_core::hud::map_screen::{
         change_map_targets, widescan_rows, MapSubMode, COMMAND_ROWS,
     };
+
+    // Zoom the map with the camera-zoom keys in any submode (dedicated keys, so
+    // they never clash with the arrow-driven cursor/crosshair). The Map keeps its
+    // own zoom, independent of the minimap (kuluu-bi1s.3).
+    let zone_half =
+        ffxi_viewer_core::minimap::zone_half_span(minimap_state.retail_aabb.or(minimap_state.aabb));
+    if bindings.matches_logical(Action::CameraZoomIn, key) {
+        map_state.zoom_by(1.0 / ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR, zone_half);
+        return None;
+    }
+    if bindings.matches_logical(Action::CameraZoomOut, key) {
+        map_state.zoom_by(ffxi_viewer_core::minimap::ZOOM_STEP_FACTOR, zone_half);
+        return None;
+    }
 
     match map_state.mode {
         MapSubMode::Command => {
@@ -3724,7 +3718,7 @@ fn handle_map_key(
             scene_state,
             map_state,
             map_markers,
-            minimap_view.visible_aabb,
+            map_view.visible_aabb,
         ),
         MapSubMode::ChangeMap => {
             let targets = change_map_targets(map_state, &scene_state.snapshot);

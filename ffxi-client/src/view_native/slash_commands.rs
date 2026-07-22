@@ -658,12 +658,16 @@ const COMMANDS: &[(&str, &[Command])] = &[
                     }
                 },
             },
+            // Not a retail command — a dev/diagnostic convenience (echoes the raw
+            // 0x0F4 tracking list to chat for copying). Debug builds only; the
+            // retail-faithful path is the Map screen's Wide Scan submenu.
+            #[cfg(debug_assertions)]
             Command {
                 // /ws is the weaponskill command; widescan takes /wscan to avoid
                 // shadowing it.
                 aliases: &["widescan", "wscan"],
                 usage: "",
-                summary: "request the server wide-scan tracking list and echo it to chat",
+                summary: "(dev) request the server wide-scan tracking list and echo it to chat",
                 handler: |_| SlashOutcome::Widescan,
             },
             Command {
@@ -3372,6 +3376,7 @@ mod tests {
         ));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn widescan_requests_list() {
         for slash in ["/widescan", "/wscan"] {

@@ -11,7 +11,7 @@ use crate::hud::zone_flash::ZoneNameResolver;
 use crate::input_mode::{InputMode, MenuKind};
 use crate::lock_on::LockOn;
 use crate::minimap::overlay::{self, MarkerFilters, MinimapDot};
-use crate::minimap::{crop_pixel_rect, MinimapMode, MinimapState, MinimapView, MinimapZoom};
+use crate::minimap::{crop_pixel_rect, MinimapMode, MinimapState};
 use crate::scene::Target;
 use crate::snapshot::SceneState;
 
@@ -112,12 +112,29 @@ pub struct MapScreenState {
     pub viewed: Option<(u16, u8)>,
     /// Active text-entry buffer while naming a new marker.
     pub marker_entry: Option<String>,
+    /// Map zoom radius in yalms. `None` = fit the whole zone (the default, so
+    /// the Map opens showing the full map, not a close crop); `Some(r)` = a
+    /// player-centered window of half-span `r`. Independent of the minimap zoom.
+    pub zoom_radius: Option<f32>,
 }
 
 impl MapScreenState {
     /// Reset to the default command submenu (Map open / logout).
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Step the map zoom by `factor` (>1 zooms out), snapping to fit when it
+    /// reaches the zone span — mirrors `MinimapZoom::zoom_by`.
+    pub fn zoom_by(&mut self, factor: f32, zone_half_span: Option<f32>) {
+        let full = zone_half_span.unwrap_or(crate::minimap::ZOOM_DEFAULT_RADIUS);
+        let current = self.zoom_radius.unwrap_or(full);
+        let next = current * factor;
+        if next >= full {
+            self.zoom_radius = None;
+        } else {
+            self.zoom_radius = Some(next.max(crate::minimap::ZOOM_MIN_RADIUS));
+        }
     }
 
     /// The `(zone, index)` being previewed via Change Map, or `None` when the
@@ -135,6 +152,56 @@ pub struct ViewedMap {
     pub key: Option<(u16, u8)>,
     pub image: Option<Handle<Image>>,
     pub aabb: Option<crate::minimap::MinimapAabb>,
+}
+
+/// The Map screen's own visible AABB, computed from `MapScreenState.zoom_radius`
+/// independent of the minimap widget (which keeps its own zoom). Fit-to-zone by
+/// default so the Map opens showing the whole map, zoomable via the map's zoom.
+#[derive(Resource, Default)]
+pub struct MapView {
+    pub visible_aabb: Option<crate::minimap::MinimapAabb>,
+}
+
+/// Recompute the Map screen's visible AABB each frame it's open, mirroring
+/// `update_minimap_view` but driven by the map's own zoom (kuluu-bi1s.3).
+pub(crate) fn update_map_view(
+    mode: Res<InputMode>,
+    map_state: Res<MapScreenState>,
+    minimap_state: Res<MinimapState>,
+    minimap_mode: Res<MinimapMode>,
+    viewed: Res<ViewedMap>,
+    scene_state: Res<SceneState>,
+    q_self: Query<&Transform, With<IsSelf>>,
+    mut map_view: ResMut<MapView>,
+) {
+    if !map_open(&mode) {
+        return;
+    }
+    let live_zone = scene_state.snapshot.zone_id.unwrap_or(0);
+    if map_state.viewed_override(live_zone).is_some() {
+        // Change Map preview: show the viewed map whole against its own AABB.
+        map_view.visible_aabb = viewed.aabb;
+        return;
+    }
+    let Some(full) = minimap_state.active_aabb(*minimap_mode) else {
+        map_view.visible_aabb = None;
+        return;
+    };
+    let visible = match map_state.zoom_radius {
+        None => full,
+        Some(r) => {
+            let center = q_self
+                .single()
+                .ok()
+                .map(|t| Vec2::new(t.translation.x, t.translation.z))
+                .unwrap_or_else(|| (full.min + full.max) * 0.5);
+            crate::minimap::MinimapAabb {
+                min: center - Vec2::splat(r),
+                max: center + Vec2::splat(r),
+            }
+        }
+    };
+    map_view.visible_aabb = Some(visible);
 }
 
 /// Map-screen dot store, disjoint from the minimap widget's `MinimapDots`; both
@@ -212,7 +279,11 @@ pub struct WidescanRow {
 
 /// Build the sorted wide-scan rows from the snapshot: nearest first by the
 /// server-relative offset, colored by kind, named from the server `sName` or —
-/// when empty (current LSB) — the local entity keyed on `act_index`.
+/// when empty (current LSB, which omits sName by design; see
+/// `ffxi-proto 0x0f4_tracking_list`) — the local entity keyed on `act_index`.
+/// Entries we can't name either way are dropped rather than shown as bare
+/// `#<index>` placeholders: LSB can't name entities we haven't locally spawned,
+/// so a wall of numbered rows is noise, not signal (kuluu-bi1s.6).
 pub fn widescan_rows(snap: &SceneSnapshot) -> Vec<WidescanRow> {
     let mut entries: Vec<&ffxi_viewer_wire::WidescanEntry> = snap.widescan.entries.iter().collect();
     entries.sort_by_key(|e| {
@@ -221,26 +292,25 @@ pub fn widescan_rows(snap: &SceneSnapshot) -> Vec<WidescanRow> {
     });
     entries
         .into_iter()
-        .map(|e| {
+        .filter_map(|e| {
             let name = if !e.name.is_empty() {
                 e.name.clone()
             } else {
                 snap.entities
                     .iter()
                     .find(|ent| ent.act_index == e.act_index)
-                    .and_then(|ent| ent.name.clone())
-                    .unwrap_or_else(|| format!("#{}", e.act_index))
+                    .and_then(|ent| ent.name.clone())?
             };
             let label = if e.level > 0 {
                 format!("{name} (Lv{})", e.level)
             } else {
                 name
             };
-            WidescanRow {
+            Some(WidescanRow {
                 act_index: e.act_index,
                 label,
                 color: overlay::widescan_color(e.kind),
-            }
+            })
         })
         .collect()
 }
@@ -625,8 +695,7 @@ pub(crate) fn update_map_screen_image(
     viewed: Res<ViewedMap>,
     state: Res<MinimapState>,
     minimap_mode: Res<MinimapMode>,
-    view: Res<MinimapView>,
-    zoom: Res<MinimapZoom>,
+    map_view: Res<MapView>,
     images: Res<Assets<Image>>,
     mut q: Query<&mut ImageNode, With<MapScreenImage>>,
 ) {
@@ -660,7 +729,14 @@ pub(crate) fn update_map_screen_image(
             image_node.image = h;
         }
     }
-    let rect = match (zoom.radius_yalms, view.visible_aabb, full_aabb, handle) {
+    // Crop only when the map is zoomed in; fit (zoom_radius None) shows the whole
+    // image so the Map opens on the full zone (kuluu-bi1s.3).
+    let rect = match (
+        map_state.zoom_radius,
+        map_view.visible_aabb,
+        full_aabb,
+        handle,
+    ) {
         (Some(_), Some(visible), Some(full), Some(h)) => images
             .get(&h)
             .and_then(|img| crop_pixel_rect(full, visible, img.size_f32())),
@@ -687,7 +763,7 @@ pub(crate) struct MarkerInputs<'w> {
 pub(crate) fn update_map_screen_markers(
     mode: Res<InputMode>,
     scene_state: Res<SceneState>,
-    view: Res<MinimapView>,
+    map_view: Res<MapView>,
     markers: MarkerInputs,
     mut dots: ResMut<MapScreenDots>,
     mut commands: Commands,
@@ -785,7 +861,7 @@ pub(crate) fn update_map_screen_markers(
         }
         return;
     }
-    let (Some(aabb), Ok(overlay_layer)) = (view.visible_aabb, q_overlay_layer.single()) else {
+    let (Some(aabb), Ok(overlay_layer)) = (map_view.visible_aabb, q_overlay_layer.single()) else {
         return;
     };
     let self_char_id = snap.self_char_id.unwrap_or(0);
@@ -868,7 +944,7 @@ pub(crate) fn update_map_placed_markers(
     scene_state: Res<SceneState>,
     map_markers: Res<MapMarkers>,
     viewed: Res<ViewedMap>,
-    view: Res<MinimapView>,
+    map_view: Res<MapView>,
     mut dot_q: Query<(&MapPlacedMarker, &mut Node), Without<MapPlacedLabel>>,
     mut label_q: Query<(&MapPlacedLabel, &mut Text)>,
 ) {
@@ -884,7 +960,7 @@ pub(crate) fn update_map_placed_markers(
     // Change Map preview shows the viewed zone's own markers against its AABB.
     let (zone, aabb) = match map_state.viewed_override(live_zone) {
         Some((z, _)) => (z, viewed.aabb),
-        None => (live_zone, view.visible_aabb),
+        None => (live_zone, map_view.visible_aabb),
     };
     let markers = map_markers.for_zone(zone);
 
@@ -1032,14 +1108,21 @@ mod tests {
         }
     }
 
+    fn named_entry(act_index: u16, level: u8, kind: u8, rel_x: i16, rel_z: i16) -> WidescanEntry {
+        WidescanEntry {
+            name: format!("E{act_index}"),
+            ..entry(act_index, level, kind, rel_x, rel_z)
+        }
+    }
+
     #[test]
     fn widescan_rows_sort_nearest_first() {
         let snap = SceneSnapshot {
             widescan: WidescanList {
                 entries: vec![
-                    entry(1, 5, 2, 30, 40), // dist 50
-                    entry(2, 3, 2, 3, 4),   // dist 5
-                    entry(3, 9, 1, 6, 8),   // dist 10
+                    named_entry(1, 5, 2, 30, 40), // dist 50
+                    named_entry(2, 3, 2, 3, 4),   // dist 5
+                    named_entry(3, 9, 1, 6, 8),   // dist 10
                 ],
                 tracked: None,
             },
@@ -1048,6 +1131,22 @@ mod tests {
         let rows = widescan_rows(&snap);
         let order: Vec<u16> = rows.iter().map(|r| r.act_index).collect();
         assert_eq!(order, vec![2, 3, 1], "nearest by rel offset comes first");
+    }
+
+    #[test]
+    fn widescan_drops_unnameable_entries() {
+        // No server sName and no local entity → not a row (kuluu-bi1s.6).
+        let snap = SceneSnapshot {
+            widescan: WidescanList {
+                entries: vec![entry(48, 0, 2, 1, 1), entry(190, 0, 1, 2, 2)],
+                tracked: None,
+            },
+            ..Default::default()
+        };
+        assert!(
+            widescan_rows(&snap).is_empty(),
+            "bare #index rows are dropped"
+        );
     }
 
     #[test]
@@ -1093,6 +1192,19 @@ mod tests {
         assert_eq!(rows[0].text, "Markers");
         assert!(rows[1].is_cursor, "cursor on Wide Scan");
         assert!(!rows[0].is_cursor);
+    }
+
+    #[test]
+    fn zoom_defaults_to_fit_and_snaps_back_out() {
+        let mut s = MapScreenState::default();
+        assert_eq!(s.zoom_radius, None, "opens fit-to-zone");
+        s.zoom_by(1.0 / crate::minimap::ZOOM_STEP_FACTOR, Some(100.0));
+        assert!(s.zoom_radius.is_some(), "zoom in leaves fit");
+        // Zooming back out past the zone span snaps to fit (None) again.
+        for _ in 0..12 {
+            s.zoom_by(crate::minimap::ZOOM_STEP_FACTOR, Some(100.0));
+        }
+        assert_eq!(s.zoom_radius, None, "zoom out past the zone span refits");
     }
 
     #[test]
