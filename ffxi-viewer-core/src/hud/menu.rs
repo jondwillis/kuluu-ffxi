@@ -374,6 +374,30 @@ pub fn entry_action(
     dynamic.rows.get(idx).map(|r| r.action)
 }
 
+/// Remaining recast (seconds) for a menu action, or `None` if ready. `now` is
+/// absolute Unix seconds (matching the 0x119 ABIL_RECAST expiry). The single
+/// source of truth for both greying a menu row and blocking its confirm. Spells
+/// have no snapshot recast field yet (LSB never sends magic recasts), so only
+/// job/pet abilities resolve here.
+pub fn action_recast_remaining(
+    ability_recasts: &[(u16, u32)],
+    action: &DynamicMenuAction,
+    now: u32,
+) -> Option<u32> {
+    let ability_id = match action {
+        DynamicMenuAction::JobAbility { ability_id }
+        | DynamicMenuAction::PetAbility { ability_id } => *ability_id,
+        _ => return None,
+    };
+    let recast_id = ffxi_proto::recast::ability_recast_id(ability_id)?;
+    let expiry = ability_recasts
+        .iter()
+        .find(|(rid, _)| *rid == recast_id)
+        .map(|(_, e)| *e)?;
+    let remaining = expiry.saturating_sub(now);
+    (remaining > 0).then_some(remaining)
+}
+
 fn empty_dynamic_hint(kind: MenuKind) -> &'static str {
     match kind {
         MenuKind::Magic => "(no spells learned yet)",
@@ -1208,6 +1232,30 @@ pub fn debug_panel_state(label: &str, panels: &crate::hud::HudPanels, net_status
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_recast_remaining_gates_on_cooldown_abilities() {
+        let provoke = DynamicMenuAction::JobAbility { ability_id: 35 };
+        let rid = ffxi_proto::recast::ability_recast_id(35).expect("provoke has a recast group");
+        // On cooldown: expiry 30s in the future -> Some(remaining).
+        assert_eq!(
+            action_recast_remaining(&[(rid, 1030)], &provoke, 1000),
+            Some(30)
+        );
+        // Ready: expiry in the past -> None.
+        assert_eq!(action_recast_remaining(&[(rid, 990)], &provoke, 1000), None);
+        // No recast entry -> None.
+        assert_eq!(action_recast_remaining(&[], &provoke, 1000), None);
+        // Non-ability action -> None.
+        assert_eq!(
+            action_recast_remaining(
+                &[(rid, 1030)],
+                &DynamicMenuAction::CastSpell { spell_id: 1 },
+                1000
+            ),
+            None
+        );
+    }
 
     #[test]
     fn root_pages_split_and_flip_by_cursor() {

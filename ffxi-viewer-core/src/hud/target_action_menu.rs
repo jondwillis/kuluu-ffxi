@@ -195,7 +195,11 @@ pub fn update_target_action_menu(
                 let is_cursor = row.slot == sub_cursor;
                 let caret = style::cursor_prefix(is_cursor);
                 let now = vana_clock.earth_unix_secs_now() as u32;
-                match recast_remaining(&scene.snapshot.ability_recasts, &leaf.action, now) {
+                match crate::hud::menu::action_recast_remaining(
+                    &scene.snapshot.ability_recasts,
+                    &leaf.action,
+                    now,
+                ) {
                     Some(remaining) => (
                         format!(
                             "{caret}{} ({})",
@@ -263,25 +267,6 @@ pub fn update_target_action_menu(
             }
         }
     }
-}
-
-fn recast_remaining(
-    recasts: &[(u16, u32)],
-    action: &crate::hud::menu::DynamicMenuAction,
-    now: u32,
-) -> Option<u32> {
-    use crate::hud::menu::DynamicMenuAction as A;
-    let ability_id = match action {
-        A::JobAbility { ability_id } | A::PetAbility { ability_id } => *ability_id,
-        _ => return None,
-    };
-    let recast_id = ffxi_proto::recast::ability_recast_id(ability_id)?;
-    let expiry = recasts
-        .iter()
-        .find(|(rid, _)| *rid == recast_id)
-        .map(|(_, e)| *e)?;
-    let remaining = expiry.saturating_sub(now);
-    (remaining > 0).then_some(remaining)
 }
 
 pub fn target_action_mouse_hover_system(

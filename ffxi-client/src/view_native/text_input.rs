@@ -2940,6 +2940,27 @@ fn dispatch_dynamic_menu_action(
     scene_state: &mut SceneState,
 ) {
     use ffxi_viewer_core::hud::menu::DynamicMenuAction as A;
+    // Refuse an ability still on recast client-side (retail blocks it locally rather
+    // than sending it and getting the server's "wait longer" reject). 0x119 recasts
+    // are absolute Unix expiry, so compare against wall-clock Unix seconds.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    if let Some(remaining) = ffxi_viewer_core::hud::menu::action_recast_remaining(
+        &scene_state.snapshot.ability_recasts,
+        &action,
+        now_unix,
+    ) {
+        push_system_chat_line(
+            scene_state,
+            format!(
+                "Unable to use that ability. ({} remaining)",
+                ffxi_viewer_core::hud::format_timer(remaining)
+            ),
+        );
+        return;
+    }
     let self_char_id = scene_state.snapshot.self_char_id;
     let pick_target = |require: bool| -> Option<(u32, u16)> {
         if let Some(id) = target_id {
