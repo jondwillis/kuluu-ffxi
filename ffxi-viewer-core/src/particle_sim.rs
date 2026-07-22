@@ -473,14 +473,14 @@ fn rebuild_mesh(g: &LiveGenerator, rot: Quat, mesh: &mut Mesh) {
         // Additive blend ignores alpha, so the alpha track drives brightness. With
         // no track, a transient spray fades linearly to nothing over life; a
         // continuous generator (one particle re-emitted on expiry — the steady
-        // crystal body/glow) instead holds its init opacity, or each cycle would
-        // fade the single particle out and strobe the whole model transparent.
+        // crystal body) holds full opacity, or each re-emit cycle would fade the
+        // single particle out and strobe the whole model transparent.
         let alpha = g
             .alpha
             .as_ref()
             .map(|t| t.sample_from(progress, Some(g.def.init_color[3])))
             .unwrap_or(if g.def.continuous {
-                g.def.init_color[3]
+                1.0
             } else {
                 1.0 - progress
             });
@@ -771,9 +771,9 @@ mod tests {
     #[test]
     fn continuous_trackless_generator_holds_constant_alpha() {
         // A continuous generator holds one particle re-emitted on expiry (the
-        // steady crystal body/glow). Track-less, it must hold its init opacity —
-        // if it fell back to the 1.0-progress spray fade, the single particle
-        // would fade out each cycle and strobe the whole model transparent.
+        // steady crystal body). Track-less, it must stay fully opaque — if it fell
+        // back to the 1.0-progress spray fade, the single particle would fade out
+        // each cycle and strobe the whole model transparent.
         use ffxi_dat::particle_gen::ParticleBlend;
         let mut base = def(4.0, 1.0, 1);
         base.blend = ParticleBlend::Blend;
@@ -804,8 +804,8 @@ mod tests {
         };
 
         assert!(
-            (alpha_of(&cont) - 0.8).abs() < 1e-4,
-            "continuous body holds its init opacity, not the life fade"
+            (alpha_of(&cont) - 1.0).abs() < 1e-4,
+            "continuous body stays fully opaque, not the life fade"
         );
         assert!(
             (alpha_of(&spray) - 0.25).abs() < 1e-4,
