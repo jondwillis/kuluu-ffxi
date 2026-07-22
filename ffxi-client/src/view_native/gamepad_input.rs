@@ -10,6 +10,10 @@ use bevy::window::PrimaryWindow;
 
 use ffxi_viewer_core::{Action, Bindings, InputMode};
 
+// Analog sticks are treated as digital d-pad presses (hold/release the bound
+// KeyCode), so the threshold is deliberately high: it must sit past the Steam
+// Deck sticks' resting drift and light-touch noise to avoid phantom
+// movement/camera input, while staying reachable on a normal push.
 const STICK_DEADZONE: f32 = 0.35;
 
 /// Pins gamepad-reading systems to one physical device, rather than each
