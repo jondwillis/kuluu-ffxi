@@ -1099,10 +1099,10 @@ fn root_aware_title(view: &PaneView) -> String {
 }
 
 fn visible_window(kind: MenuKind, total: usize) -> usize {
-    if is_dynamic(kind) {
-        DYNAMIC_VISIBLE_ROWS
-    } else {
+    if kind == MenuKind::Root {
         total
+    } else {
+        total.min(DYNAMIC_VISIBLE_ROWS)
     }
 }
 
@@ -1112,19 +1112,21 @@ fn resolve_viewport(kind: MenuKind, cursor: usize, dynamic: &DynamicMenu) -> (us
         let (start, end) = root_page_bounds(cursor);
         return (end, start);
     }
-    if is_dynamic(kind) {
-        let total = dynamic.rows.len().max(1);
-        if total <= DYNAMIC_VISIBLE_ROWS {
-            return (total, 0);
-        }
-
-        let half = DYNAMIC_VISIBLE_ROWS / 2;
-        let max_start = total.saturating_sub(DYNAMIC_VISIBLE_ROWS);
-        let start = cursor.saturating_sub(half).min(max_start);
-        (total, start)
+    let total = if is_dynamic(kind) {
+        dynamic.rows.len().max(1)
     } else {
-        (static_entries(kind).len(), 0)
+        static_entries(kind).len()
+    };
+    if total <= DYNAMIC_VISIBLE_ROWS {
+        return (total, 0);
     }
+    // A list taller than the viewport (e.g. the 27-row Graphics menu) scrolls a
+    // fixed window that keeps the cursor centered, so its bottom rows stay
+    // reachable at the default window height instead of overflowing off-screen.
+    let half = DYNAMIC_VISIBLE_ROWS / 2;
+    let max_start = total.saturating_sub(DYNAMIC_VISIBLE_ROWS);
+    let start = cursor.saturating_sub(half).min(max_start);
+    (total, start)
 }
 
 pub fn menu_mouse_hover_system(
@@ -1636,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn static_menus_fit_pool_and_show_all_rows() {
+    fn static_menus_fit_pool_and_window_when_taller_than_viewport() {
         for kind in [
             MenuKind::Root,
             MenuKind::Config,
@@ -1651,12 +1653,39 @@ mod tests {
                 total <= MAX_ENTRY_COUNT,
                 "{kind:?} has {total} rows, exceeds row pool {MAX_ENTRY_COUNT}"
             );
+            // Root pages internally; every other static menu that outgrows the
+            // viewport must scroll a DYNAMIC_VISIBLE_ROWS window rather than
+            // render every row off the bottom of the screen (kuluu-b9kr).
+            let expected = if kind == MenuKind::Root {
+                total
+            } else {
+                total.min(DYNAMIC_VISIBLE_ROWS)
+            };
             assert_eq!(
                 visible_window(kind, total),
-                total,
-                "{kind:?} is static and must render every row"
+                expected,
+                "{kind:?} visible window must cap at the viewport height"
             );
         }
+    }
+
+    #[test]
+    fn graphics_menu_scrolls_bottom_rows_into_view() {
+        let total = GRAPHICS_ENTRIES.len();
+        assert!(
+            total > DYNAMIC_VISIBLE_ROWS,
+            "test presumes Graphics outgrows the viewport"
+        );
+        let dynamic = DynamicMenu::default();
+        // Cursor on the last row (Reset to High) must land inside the window.
+        let last = total - 1;
+        let (t, start) = resolve_viewport(MenuKind::Graphics, last, &dynamic);
+        let window = visible_window(MenuKind::Graphics, t);
+        assert!(
+            last >= start && last < start + window,
+            "bottom row {last} not in window [{start}, {})",
+            start + window
+        );
     }
 
     #[test]
