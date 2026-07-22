@@ -3373,6 +3373,14 @@ fn handle_menu_key(
 ) -> Option<InputMode> {
     let top_kind = stack.current()?.kind;
 
+    // The very key that opened this menu (Action::OpenMenu on "-", handled by the
+    // input system chained just before this one) also arrives here on the same
+    // frame; absorb it once so it doesn't immediately flip Root to page 2
+    // (kuluu-bi1s.2). Clear the one-shot flag on the first menu key regardless.
+    if stack.take_absorb_open_minus() && key_code == KeyCode::Minus {
+        return None;
+    }
+
     // The Map screen is a bespoke full-screen surface (full-screen map + a
     // top-right command submenu drilling into Markers/Wide Scan/Change Map),
     // with its own submode navigation, so it intercepts before generic routing.

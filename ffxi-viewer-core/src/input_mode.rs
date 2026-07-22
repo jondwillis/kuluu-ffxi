@@ -169,6 +169,11 @@ pub enum Pane {
 pub struct MenuStack {
     pub levels: Vec<MenuLevel>,
     pub active_pane: Pane,
+    /// The `-` keypress that opens the menu (Action::OpenMenu, handled in the
+    /// input system that runs just before the text handler) also reaches the
+    /// menu's `-` page-flip on the same frame. This absorbs exactly that opening
+    /// press so the Commands menu lands on page 1, not page 2 (kuluu-bi1s.2).
+    pub absorb_open_minus: bool,
 }
 
 impl MenuStack {
@@ -179,7 +184,14 @@ impl MenuStack {
                 cursor: 0,
             }],
             active_pane: Pane::Right,
+            absorb_open_minus: true,
         }
+    }
+
+    /// Consume the one-shot open-`-` absorb flag; returns true the first time
+    /// (the opening frame) and false thereafter.
+    pub fn take_absorb_open_minus(&mut self) -> bool {
+        std::mem::take(&mut self.absorb_open_minus)
     }
 
     pub fn current(&self) -> Option<&MenuLevel> {
@@ -349,5 +361,29 @@ impl SubActionStack {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absorb_open_minus_fires_once_then_clears() {
+        let mut stack = MenuStack::root();
+        assert!(
+            stack.take_absorb_open_minus(),
+            "opening frame absorbs the '-'"
+        );
+        assert!(
+            !stack.take_absorb_open_minus(),
+            "subsequent '-' presses flip pages normally"
+        );
+    }
+
+    #[test]
+    fn pushed_stack_does_not_absorb() {
+        let mut stack = MenuStack::default();
+        assert!(!stack.take_absorb_open_minus());
     }
 }
