@@ -752,6 +752,7 @@ impl FfxiRenderActor {
             num_loops,
             transition_in: half_frames(motion.transition_in),
             transition_out: half_frames(motion.transition_out),
+            cast_pose: false,
         });
     }
 }
@@ -789,6 +790,8 @@ struct ActionPlayback {
     num_loops: Option<u32>,
     transition_in: f32,
     transition_out: f32,
+
+    cast_pose: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1253,13 +1256,16 @@ fn routine_motion_clip(routines: &HashMap<DatId, Scheduler>, routine: DatId) -> 
         .map(|t| DatId::from_name(&t.stage.id))
 }
 
+// vendor/server/src/map/utils/battleutils.cpp action categories: 8 = magic cast start.
+const MAGIC_START_CATEGORY: u8 = 8;
+
 fn action_routine(action_kind: u8, action_id: u32) -> Option<(DatId, bool)> {
     Some(match action_kind {
         1 => (DatId::from_str("ati0"), false),
 
         7 => (DatId::from_str("ati0"), false),
 
-        8 => {
+        MAGIC_START_CATEGORY => {
             let id = ffxi_proto::magic::cast_suffix(action_id)
                 .map(|s| DatId::from_str(&format!("ca{s}")))
                 .unwrap_or_else(|| DatId::from_str("cast"));
@@ -2129,6 +2135,18 @@ pub fn tick_live_ffxi_actors(
                 (actor_global.to_matrix(), world)
             });
 
+        if is_self && actor.action.map(|a| a.cast_pose).unwrap_or(false) {
+            let casting = state
+                .snapshot
+                .self_casting
+                .as_ref()
+                .is_some_and(|c| !c.interrupted);
+            if !casting {
+                actor.action = None;
+                actor.action_clips.clear();
+            }
+        }
+
         advance_actor_pose(&mut actor, elapsed_frames, &mut materials, look);
     }
 }
@@ -2186,6 +2204,7 @@ pub fn dispatch_action_overlay(
                     num_loops: None,
                     transition_in: LOCOMOTION_XFADE_IN,
                     transition_out: LOCOMOTION_XFADE_OUT,
+                    cast_pose: action_kind == MAGIC_START_CATEGORY,
                 });
             }
         }
