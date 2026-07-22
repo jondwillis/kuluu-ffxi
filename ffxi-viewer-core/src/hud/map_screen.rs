@@ -290,6 +290,15 @@ fn panel_rows(
                 .collect()
         }
         MapSubMode::Markers => {
+            // While naming a marker, the panel is the live text field so the
+            // player sees what they type (retail shows an inline entry box).
+            if let Some(entry) = &state.marker_entry {
+                return vec![PanelRow {
+                    text: format!("Name: {entry}_"),
+                    color: theme::CURSOR,
+                    is_cursor: false,
+                }];
+            }
             if markers.is_empty() {
                 return vec![PanelRow {
                     text: "(no markers — Confirm to place)".to_string(),
@@ -1084,6 +1093,19 @@ mod tests {
         assert_eq!(rows[0].text, "Markers");
         assert!(rows[1].is_cursor, "cursor on Wide Scan");
         assert!(!rows[0].is_cursor);
+    }
+
+    #[test]
+    fn marker_entry_renders_as_live_text_field() {
+        let state = MapScreenState {
+            mode: MapSubMode::Markers,
+            marker_entry: Some("Camp".to_string()),
+            ..Default::default()
+        };
+        let snap = SceneSnapshot::default();
+        let rows = panel_rows(&state, &snap, &[], &|_| None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "Name: Camp_");
     }
 
     #[test]
