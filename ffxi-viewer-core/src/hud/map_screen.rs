@@ -119,6 +119,22 @@ impl MapScreenState {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+
+    /// The `(zone, index)` being previewed via Change Map, or `None` when the
+    /// map shows the live zone's floor 0 (the minimap's own image). Used to gate
+    /// the on-demand viewed-map loader and to suppress live entity markers.
+    pub fn viewed_override(&self, live_zone: u16) -> Option<(u16, u8)> {
+        self.viewed.filter(|&(z, i)| (z, i) != (live_zone, 0))
+    }
+}
+
+/// The Change Map preview image + calibration for a non-live `(zone, index)`,
+/// loaded on demand so the live `MinimapState` is never disturbed (kuluu-ziru).
+#[derive(Resource, Default)]
+pub struct ViewedMap {
+    pub key: Option<(u16, u8)>,
+    pub image: Option<Handle<Image>>,
+    pub aabb: Option<crate::minimap::MinimapAabb>,
 }
 
 /// Map-screen dot store, disjoint from the minimap widget's `MinimapDots`; both
@@ -553,9 +569,51 @@ pub(crate) fn reset_map_screen_on_open(
     *was_open = open;
 }
 
+/// Load the Change Map preview image when `MapScreenState.viewed` points at a
+/// non-live zone/floor, decoding it off to the side of `MinimapState`.
+pub(crate) fn load_viewed_map(
+    mode: Res<InputMode>,
+    map_state: Res<MapScreenState>,
+    scene_state: Res<SceneState>,
+    dat_root: Res<crate::minimap::retail::MinimapDatRoot>,
+    mut calib: ResMut<crate::minimap::retail::MapCalibration>,
+    mut viewed: ResMut<ViewedMap>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if !map_open(&mode) {
+        return;
+    }
+    let live_zone = scene_state.snapshot.zone_id.unwrap_or(0);
+    let want = map_state.viewed_override(live_zone);
+    if want == viewed.key {
+        return;
+    }
+    let Some((zone, idx)) = want else {
+        *viewed = ViewedMap::default();
+        return;
+    };
+    let Some(root) = dat_root.0.as_ref() else {
+        return;
+    };
+    let dll = calib.ensure_dll(root.root());
+    match crate::minimap::retail::load_zone_map_image(root, dll.as_deref(), zone, idx, &mut images)
+    {
+        Some((image, aabb)) => {
+            *viewed = ViewedMap {
+                key: Some((zone, idx)),
+                image: Some(image),
+                aabb,
+            };
+        }
+        None => *viewed = ViewedMap::default(),
+    }
+}
+
 pub(crate) fn update_map_screen_image(
     mode: Res<InputMode>,
     map_state: Res<MapScreenState>,
+    scene_state: Res<SceneState>,
+    viewed: Res<ViewedMap>,
     state: Res<MinimapState>,
     minimap_mode: Res<MinimapMode>,
     view: Res<MinimapView>,
@@ -569,9 +627,19 @@ pub(crate) fn update_map_screen_image(
     let Ok(mut image_node) = q.single_mut() else {
         return;
     };
-    // Change Map viewing a non-live zone/floor is served by the map-screen loader
-    // (kuluu-ziru); until then the surface mirrors the live minimap image.
-    let _ = map_state.viewed;
+    let live_zone = scene_state.snapshot.zone_id.unwrap_or(0);
+    // Change Map preview: show the whole foreign map (no live-minimap crop).
+    if map_state.viewed_override(live_zone).is_some() {
+        if let Some(h) = viewed.image.clone() {
+            if image_node.image != h {
+                image_node.image = h;
+            }
+        }
+        if image_node.rect.is_some() {
+            image_node.rect = None;
+        }
+        return;
+    }
     let resolved = state.resolved_mode(*minimap_mode);
     let (handle, full_aabb) = match resolved {
         MinimapMode::Retail => (state.retail_image.clone(), state.retail_aabb),
@@ -683,6 +751,31 @@ pub(crate) fn update_map_screen_markers(
     }
 
     let snap = &scene_state.snapshot;
+    // Change Map preview of a foreign zone: its entities aren't ours, so drop the
+    // live entity dots, tracked target, and placement crosshair (the viewed
+    // zone's placed markers still render via `update_map_placed_markers`).
+    if markers
+        .map_state
+        .viewed_override(snap.zone_id.unwrap_or(0))
+        .is_some()
+    {
+        for (_, dot) in dots.by_id.drain() {
+            if let Ok(mut ec) = commands.get_entity(dot) {
+                ec.despawn();
+            }
+        }
+        if let Ok(mut node) = tracked_q.single_mut() {
+            if node.display != Display::None {
+                node.display = Display::None;
+            }
+        }
+        if let Ok(mut node) = place_q.single_mut() {
+            if node.display != Display::None {
+                node.display = Display::None;
+            }
+        }
+        return;
+    }
     let (Some(aabb), Ok(overlay_layer)) = (view.visible_aabb, q_overlay_layer.single()) else {
         return;
     };
@@ -762,8 +855,10 @@ fn set_overlay_marker(node: &mut Node, uv: Option<Vec2>) {
 #[allow(clippy::type_complexity)]
 pub(crate) fn update_map_placed_markers(
     mode: Res<InputMode>,
+    map_state: Res<MapScreenState>,
     scene_state: Res<SceneState>,
     map_markers: Res<MapMarkers>,
+    viewed: Res<ViewedMap>,
     view: Res<MinimapView>,
     mut dot_q: Query<(&MapPlacedMarker, &mut Node), Without<MapPlacedLabel>>,
     mut label_q: Query<(&MapPlacedLabel, &mut Text)>,
@@ -776,9 +871,13 @@ pub(crate) fn update_map_placed_markers(
         }
         return;
     }
-    let zone = scene_state.snapshot.zone_id.unwrap_or(0);
+    let live_zone = scene_state.snapshot.zone_id.unwrap_or(0);
+    // Change Map preview shows the viewed zone's own markers against its AABB.
+    let (zone, aabb) = match map_state.viewed_override(live_zone) {
+        Some((z, _)) => (z, viewed.aabb),
+        None => (live_zone, view.visible_aabb),
+    };
     let markers = map_markers.for_zone(zone);
-    let aabb = view.visible_aabb;
 
     for (dot, mut node) in dot_q.iter_mut() {
         let uv = markers.get(dot.slot).zip(aabb).and_then(|(m, a)| {

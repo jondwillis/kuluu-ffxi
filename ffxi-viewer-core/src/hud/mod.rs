@@ -189,6 +189,7 @@ impl Plugin for HudPlugin {
             app.init_resource::<map_screen::MapScreenDots>();
             app.init_resource::<map_screen::MapScreenState>();
             app.init_resource::<map_screen::MapMarkers>();
+            app.init_resource::<map_screen::ViewedMap>();
         }
 
         app.init_resource::<check_view::CheckTarget>();
@@ -289,6 +290,7 @@ impl Plugin for HudPlugin {
             Update,
             (
                 map_screen::reset_map_screen_on_open,
+                map_screen::load_viewed_map,
                 map_screen::update_map_screen_image,
                 map_screen::update_map_screen_markers,
                 map_screen::update_map_placed_markers,

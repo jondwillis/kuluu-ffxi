@@ -15,7 +15,7 @@ pub struct MapCalibration {
 }
 
 impl MapCalibration {
-    fn ensure_dll(&mut self, root: &std::path::Path) -> Option<std::sync::Arc<MainDll>> {
+    pub(crate) fn ensure_dll(&mut self, root: &std::path::Path) -> Option<std::sync::Arc<MainDll>> {
         if !self.tried {
             self.tried = true;
             self.dll = MainDll::load(root).ok().map(std::sync::Arc::new);
@@ -42,6 +42,40 @@ pub(crate) fn zone_map_to_aabb(rec: &ZoneMapRecord) -> MinimapAabb {
         min: Vec2::new(min_x, min_y),
         max: Vec2::new(min_x + size, min_y + size),
     }
+}
+
+/// Load and decode one zone's map DAT (any floor) into an RGBA image plus its
+/// calibrated AABB, without touching the live `MinimapState`. The Map screen's
+/// Change Map browser uses this to preview other zones/floors (kuluu-ziru); the
+/// live minimap keeps its own event-driven loader below.
+pub fn load_zone_map_image(
+    dat_root: &ffxi_dat::DatRoot,
+    dll: Option<&MainDll>,
+    zone: u16,
+    idx: u8,
+    images: &mut Assets<Image>,
+) -> Option<(Handle<Image>, Option<MinimapAabb>)> {
+    let file_id = ffxi_dat::map_image::map_dat_for(zone, idx)?;
+    let path = dat_root.resolve(file_id).ok()?.path_under(dat_root.root());
+    let bytes = std::fs::read(&path).ok()?;
+    let graphic = scan_graphics(&bytes).max_by_key(|g| g.width * g.height)?;
+    let mut image = Image::new(
+        Extent3d {
+            width: graphic.width,
+            height: graphic.height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        graphic.rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = bevy::image::ImageSampler::linear();
+    let handle = images.add(image);
+    let aabb = dll
+        .and_then(|d| d.zone_map(zone, idx))
+        .map(|rec| zone_map_to_aabb(&rec));
+    Some((handle, aabb))
 }
 
 #[derive(Resource, Default, Clone)]
