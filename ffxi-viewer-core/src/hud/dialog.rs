@@ -486,6 +486,7 @@ mod tests {
             choices: vec![],
             text_entry: false,
             grid: None,
+            custom_menu: false,
         }
     }
 

@@ -1253,7 +1253,20 @@ fn handle_sub_packet(
             }
         },
         op if op == s2c::CHAT => {
-            if let Some(line) = decode_chat_std(sub.data) {
+            if let Some((title, options)) = decode_custom_menu(sub.data) {
+                // Retail renders a GMPROMPT/_CUSTOM_MENU as an interactive prompt,
+                // not a chat line (the packet's speaker is the player entity).
+                let dialog = crate::state::DialogState {
+                    // A customMenu carries no speaker entity, so blank the header
+                    // (otherwise npc_id 0 renders as `#00000000`).
+                    npc_name: Some(String::new()),
+                    prompt: Some(title),
+                    choices: options,
+                    custom_menu: true,
+                    ..Default::default()
+                };
+                let _ = event_tx.send(AgentEvent::EventDialog { dialog });
+            } else if let Some(line) = decode_chat_std(sub.data) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
         }
@@ -2097,6 +2110,21 @@ async fn keepalive_loop(
                                 message: format!("tell send: {e}"),
                             });
                         }
+                    }
+                    Some(AgentCommand::CustomMenuRespond { title, option }) => {
+                        // The customMenu is fully client-driven: the server holds
+                        // the context and only awaits the `_CUSTOM_MENU` tell, so
+                        // clear the prompt locally rather than waiting for an event.
+                        let text = custom_menu_reply(&character_name, &title, option.as_deref());
+                        let payload = build_subpacket_tell(sub_seq, CUSTOM_MENU_SENDER, &text);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "custom menu reply send failed");
+                        }
+                        let _ = event_tx.send(AgentEvent::EventEnded);
                     }
                     Some(AgentCommand::Action {
                         target_id,
@@ -4274,6 +4302,7 @@ fn decode_event_0x032(data: &[u8]) -> Option<crate::state::DialogState> {
         choices: Vec::new(),
         text_entry: false,
         grid: None,
+        custom_menu: false,
     })
 }
 
@@ -4321,6 +4350,7 @@ fn decode_event_0x033(data: &[u8]) -> Option<crate::state::DialogState> {
         choices: Vec::new(),
         text_entry: false,
         grid: None,
+        custom_menu: false,
     })
 }
 
@@ -4357,6 +4387,7 @@ fn decode_event_0x034(data: &[u8]) -> Option<crate::state::DialogState> {
         choices: Vec::new(),
         text_entry: false,
         grid: None,
+        custom_menu: false,
     })
 }
 
@@ -4651,6 +4682,53 @@ fn decode_chat_std(data: &[u8]) -> Option<ChatLine> {
         text,
         server_ts: 0,
     })
+}
+
+// Server customMenu prompt (home point Set/Yes/No, quest confirmations, …):
+// GP_SERV_COMMAND_CHAT_STD with type MESSAGE_GMPROMPT and sender name
+// `_CUSTOM_MENU`, message = quoted-concat `"Title""Opt1""Opt2"…`
+// (vendor/server/src/map/lua/lua_baseentity.cpp:621 customMenu +
+// luautils.cpp SetCustomMenuContext). The reply round-trips as a `_CUSTOM_MENU`
+// tell whose body the server parses in HandleCustomMenu (0x0b6_chat_name.cpp:79).
+const CUSTOM_MENU_SENDER: &str = "_CUSTOM_MENU";
+const MESSAGE_GMPROMPT: u8 = 12; // vendor/server/src/map/enums/chat_message_type.h:37
+                                 // HandleCustomMenu extracts the result after this marker and drops the trailing
+                                 // `)`; the "Canceled." payload takes the onCancelled branch (luautils.cpp NA).
+const CUSTOM_MENU_RESULT_MARKER: &str = ": Result (";
+const CUSTOM_MENU_CANCEL: &str = "Canceled.";
+
+/// Decode a customMenu prompt from a chat-std body, returning `(title, options)`.
+/// `None` for any non-customMenu chat so the caller falls back to a plain line.
+fn decode_custom_menu(data: &[u8]) -> Option<(String, Vec<String>)> {
+    const PREFIX: usize = 4 + 15;
+    if data.len() < PREFIX || data[0] != MESSAGE_GMPROMPT {
+        return None;
+    }
+    if trim_nul_string(&data[4..PREFIX]) != CUSTOM_MENU_SENDER {
+        return None;
+    }
+    let text = decode_chat_text(&data[PREFIX..]);
+    let mut parts = parse_quoted_concat(&text).into_iter();
+    let title = parts.next()?;
+    Some((title, parts.collect()))
+}
+
+/// Split the server's `"a""b""c"` quoted-concatenation into its segments.
+fn parse_quoted_concat(s: &str) -> Vec<String> {
+    s.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `_CUSTOM_MENU` tell body the server's HandleCustomMenu parser expects:
+/// retail's `GMTELL(name): Question(title): Result (option)`. The option (or the
+/// "Canceled." sentinel) must be the final token so the server's trailing-`)`
+/// strip recovers it exactly.
+fn custom_menu_reply(player: &str, title: &str, option: Option<&str>) -> String {
+    let result = option.unwrap_or(CUSTOM_MENU_CANCEL);
+    format!("GMTELL({player}): Question({title}){CUSTOM_MENU_RESULT_MARKER}{result})")
 }
 
 fn decode_chat_text(bytes: &[u8]) -> String {
@@ -7727,6 +7805,61 @@ mod tests {
         assert!(decode_chat_std(&[0u8; 5]).is_none());
         assert!(decode_chat_std(&[0u8; 18]).is_none());
         assert!(decode_chat_std(&[0u8; 19]).is_some());
+    }
+
+    fn chat_std_body(kind: u8, sender: &str, message: &str) -> Vec<u8> {
+        let mut body = vec![0u8; 4 + 15];
+        body[0] = kind;
+        let s = sender.as_bytes();
+        body[4..4 + s.len()].copy_from_slice(s);
+        body.extend_from_slice(message.as_bytes());
+        body.push(0);
+        body
+    }
+
+    #[test]
+    fn custom_menu_decodes_title_and_options() {
+        let body = chat_std_body(
+            MESSAGE_GMPROMPT,
+            CUSTOM_MENU_SENDER,
+            r#""Set this as your current home point?""Yes""No""#,
+        );
+        let (title, options) = decode_custom_menu(&body).expect("customMenu decodes");
+        assert_eq!(title, "Set this as your current home point?");
+        assert_eq!(options, vec!["Yes".to_string(), "No".to_string()]);
+    }
+
+    #[test]
+    fn custom_menu_gated_on_type_and_sender() {
+        // Right sender, wrong type (a plain say) is an ordinary chat line.
+        let say = chat_std_body(0, CUSTOM_MENU_SENDER, r#""Title""Yes""#);
+        assert!(decode_custom_menu(&say).is_none());
+        // Right type, ordinary sender is not a menu either.
+        let other = chat_std_body(MESSAGE_GMPROMPT, "Oldman", r#""Title""Yes""#);
+        assert!(decode_custom_menu(&other).is_none());
+    }
+
+    // Mirror the server's HandleCustomMenu extraction (luautils.cpp NA path):
+    // find `: Result (`, take the tail, drop the trailing `)`.
+    fn server_extract_result(selection: &str) -> Option<String> {
+        let pos = selection.find(CUSTOM_MENU_RESULT_MARKER)?;
+        let mut tail = selection[pos + CUSTOM_MENU_RESULT_MARKER.len()..].to_string();
+        tail.pop(); // trailing ')'
+        Some(tail)
+    }
+
+    #[test]
+    fn custom_menu_reply_round_trips_through_server_parser() {
+        let reply = custom_menu_reply("Zeid", "Set this as your current home point?", Some("Yes"));
+        assert_eq!(server_extract_result(&reply).as_deref(), Some("Yes"));
+
+        // Cancel takes the onCancelled branch: the "Canceled." marker is present.
+        let cancel = custom_menu_reply("Zeid", "Set this as your current home point?", None);
+        assert!(cancel.contains(&format!("{CUSTOM_MENU_RESULT_MARKER}{CUSTOM_MENU_CANCEL})")));
+        assert_eq!(
+            server_extract_result(&cancel).as_deref(),
+            Some(CUSTOM_MENU_CANCEL)
+        );
     }
 
     #[test]

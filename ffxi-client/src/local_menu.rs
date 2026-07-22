@@ -652,6 +652,7 @@ fn frame(menu: &Menu) -> DialogState {
         choices: menu.rows.iter().map(|(label, _)| label.clone()).collect(),
         text_entry: false,
         grid: None,
+        custom_menu: false,
     }
 }
 
@@ -818,6 +819,7 @@ fn recipient_entry_frame() -> DialogState {
         choices: Vec::new(),
         text_entry: true,
         grid: None,
+        custom_menu: false,
     }
 }
 

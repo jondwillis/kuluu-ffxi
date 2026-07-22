@@ -577,6 +577,11 @@ pub struct DialogState {
     /// ordinary list rows around the grid.
     #[serde(default)]
     pub grid: Option<DialogGrid>,
+    /// Server customMenu (GMPROMPT/`_CUSTOM_MENU`) prompt rather than an event-VM
+    /// or client-local frame. A selection round-trips as a `_CUSTOM_MENU` tell
+    /// (`AgentCommand::CustomMenuRespond`), not an `EndEventChoice`.
+    #[serde(default)]
+    pub custom_menu: bool,
 }
 
 /// Row-major grid overlay for a choice frame (`cells.len() == rows * cols`).
@@ -2053,6 +2058,15 @@ pub enum AgentCommand {
         act_index: u16,
         event_num: u16,
         choice: u32,
+    },
+
+    /// Answer a server customMenu (GMPROMPT/`_CUSTOM_MENU`). `option = Some(label)`
+    /// picks that row; `None` cancels. The session builds the `_CUSTOM_MENU` tell
+    /// the server's HandleCustomMenu parser expects (vendor/server/src/map/packets/
+    /// c2s/0x0b6_chat_name.cpp, luautils.cpp HandleCustomMenu).
+    CustomMenuRespond {
+        title: String,
+        option: Option<String>,
     },
 
     Disconnect,

@@ -233,6 +233,7 @@ pub fn dialog_to_wire(d: &DialogState) -> wire::DialogState {
         choices: d.choices.clone(),
         text_entry: d.text_entry,
         grid: d.grid.as_ref().map(grid_to_wire),
+        custom_menu: d.custom_menu,
     }
 }
 

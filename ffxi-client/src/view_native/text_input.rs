@@ -3161,6 +3161,15 @@ fn confirm_dialog_choice(
 ) -> Option<u8> {
     let mut open_storage = None;
     if let Some(d) = scene_state.snapshot.dialog.as_ref() {
+        // A server customMenu answers with a `_CUSTOM_MENU` tell, not an
+        // EndEventChoice — the server owns the context, not an event.
+        if d.custom_menu {
+            let _ = cmd_tx.try_send(AgentCommand::CustomMenuRespond {
+                title: d.prompt.clone().unwrap_or_default(),
+                option: d.choices.get(choice as usize).cloned(),
+            });
+            return None;
+        }
         open_storage = mog_menu_storage_choice(d, choice);
         // EVENT_END validates against the event id, which the trigger carries in
         // EventPara (event_num is the zone) — see event_trigger_ids in session.rs.
@@ -3970,6 +3979,20 @@ fn handle_dialog_key(
         return None;
     }
     if bindings.matches_logical(Action::NavCancel, key) {
+        // A server customMenu cancels with a "Canceled." `_CUSTOM_MENU` tell
+        // (its onCancelled branch); a plain EndEvent would leave it dangling.
+        if let Some(d) = scene_state
+            .snapshot
+            .dialog
+            .as_ref()
+            .filter(|d| d.custom_menu)
+        {
+            let _ = cmd_tx.try_send(AgentCommand::CustomMenuRespond {
+                title: d.prompt.clone().unwrap_or_default(),
+                option: None,
+            });
+            return None;
+        }
         // Reconcile via the session snapshot; clearing here flickers multi-frame events.
         let _ = cmd_tx.try_send(AgentCommand::EndEvent);
         return None;

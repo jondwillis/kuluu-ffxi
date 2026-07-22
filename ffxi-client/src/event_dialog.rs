@@ -242,6 +242,7 @@ fn frame_to_dialog(
         choices: choices.into_iter().map(substitute).collect(),
         text_entry: false,
         grid: None,
+        custom_menu: false,
     }
 }
 

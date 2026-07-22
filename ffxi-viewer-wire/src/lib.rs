@@ -698,6 +698,11 @@ pub struct DialogState {
     /// `choices`, so answering works identically to a plain list frame.
     #[serde(default)]
     pub grid: Option<DialogGrid>,
+
+    /// Server customMenu (GMPROMPT/`_CUSTOM_MENU`) prompt: the viewer answers
+    /// with `AgentCommand::CustomMenuRespond` instead of an `EndEventChoice`.
+    #[serde(default)]
+    pub custom_menu: bool,
 }
 
 /// Row-major grid overlay for a choice frame (`cells.len() == rows * cols`).

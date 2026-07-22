@@ -881,6 +881,7 @@ fn cmd_kind_label(cmd: &AgentCommand) -> &'static str {
         RequestEmoteList => "request_emote_list",
         EndEvent => "end_event",
         EndEventChoice { .. } => "end_event_choice",
+        CustomMenuRespond { .. } => "custom_menu_respond",
         Snapshot => "snapshot",
         Disconnect => "disconnect",
         Follow { .. } => "follow",
