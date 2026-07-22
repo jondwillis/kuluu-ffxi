@@ -779,7 +779,7 @@ mod tests {
         base.blend = ParticleBlend::Blend;
         base.init_color = [1.0, 1.0, 1.0, 0.8];
 
-        let mut cont = live(base.clone(), 1.0);
+        let mut cont = live(base, 1.0);
         cont.def.continuous = true;
         let mut spray = live(base, 1.0);
 
