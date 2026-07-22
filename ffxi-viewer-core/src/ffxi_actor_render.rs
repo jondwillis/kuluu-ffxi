@@ -1259,14 +1259,14 @@ fn routine_motion_clip(routines: &HashMap<DatId, Scheduler>, routine: DatId) -> 
 // vendor/server/src/map/utils/battleutils.cpp action categories: 8 = magic cast start.
 const MAGIC_START_CATEGORY: u8 = 8;
 
-fn action_routine(action_kind: u8, action_id: u32) -> Option<(DatId, bool)> {
+fn action_routine(action_kind: u8, cast_suffix: Option<&str>) -> Option<(DatId, bool)> {
     Some(match action_kind {
         1 => (DatId::from_str("ati0"), false),
 
         7 => (DatId::from_str("ati0"), false),
 
         MAGIC_START_CATEGORY => {
-            let id = ffxi_proto::magic::cast_suffix(action_id)
+            let id = cast_suffix
                 .map(|s| DatId::from_str(&format!("ca{s}")))
                 .unwrap_or_else(|| DatId::from_str("cast"));
             (id, true)
@@ -2155,10 +2155,36 @@ const TARGET_LOOK_HEIGHT: f32 = 1.4;
 
 const CAST_TIMEOUT_FRAMES: f32 = 60.0 * FRAME_RATE;
 
+// The cast-motion clip keys on the retail spell DAT's magicType (research/xim
+// DatResource.kt::castSuffix), which splits enfeebling across white/black — unlike
+// the LSB magic skill. Fall back to the skill-derived suffix when the DAT is absent.
+#[derive(Default)]
+pub struct SpellSuffixCache {
+    loaded: bool,
+    table: Option<ffxi_dat::spell_info::SpellTable>,
+}
+
+impl SpellSuffixCache {
+    fn suffix(&mut self, spell_id: u32) -> Option<&'static str> {
+        if !self.loaded {
+            self.loaded = true;
+            if let Ok(root) = DatRoot::from_env_or_default() {
+                self.table = Some(ffxi_dat::spell_info::SpellTable::open(root.root()));
+            }
+        }
+        self.table
+            .as_ref()
+            .and_then(|t| t.lookup(spell_id as u16))
+            .and_then(|s| s.magic_type.cast_suffix())
+            .or_else(|| ffxi_proto::magic::cast_suffix(spell_id))
+    }
+}
+
 pub fn dispatch_action_overlay(
     events: Res<crate::snapshot::EventLog>,
     mut q_actors: Query<&mut FfxiRenderActor>,
     mut last_seen: Local<u64>,
+    mut spell_suffix: Local<SpellSuffixCache>,
 ) {
     let new_count =
         (events.pushed_total.saturating_sub(*last_seen)).min(events.recent.len() as u64) as usize;
@@ -2179,7 +2205,10 @@ pub fn dispatch_action_overlay(
             continue;
         };
 
-        match action_routine(action_kind, action_id) {
+        let cast_suffix = (action_kind == MAGIC_START_CATEGORY)
+            .then(|| spell_suffix.suffix(action_id))
+            .flatten();
+        match action_routine(action_kind, cast_suffix) {
             None => {
                 if actor.action.map(|a| a.looping).unwrap_or(false) {
                     actor.action = None;
@@ -2689,22 +2718,22 @@ mod pose_resolution_tests {
 
     #[test]
     fn action_routing_maps_categories() {
-        let r = |k, id| action_routine(k, id).map(|(d, looping)| (d.as_str(), looping));
+        let r = |k, suffix| action_routine(k, suffix).map(|(d, looping)| (d.as_str(), looping));
 
-        assert_eq!(r(1, 0), Some(("ati0".to_string(), false)));
+        assert_eq!(r(1, None), Some(("ati0".to_string(), false)));
 
-        assert_eq!(r(8, 1), Some(("cawh".to_string(), true)));
+        assert_eq!(r(8, Some("wh")), Some(("cawh".to_string(), true)));
 
-        assert_eq!(r(8, 144), Some(("cabk".to_string(), true)));
+        assert_eq!(r(8, Some("bk")), Some(("cabk".to_string(), true)));
 
-        assert_eq!(r(8, 0xFFFF), Some(("cast".to_string(), true)));
+        assert_eq!(r(8, None), Some(("cast".to_string(), true)));
 
-        assert_eq!(r(10, 0), Some(("cast".to_string(), true)));
-        assert_eq!(r(12, 0), Some(("calg".to_string(), true)));
-        assert_eq!(r(9, 0), Some(("cait".to_string(), false)));
+        assert_eq!(r(10, None), Some(("cast".to_string(), true)));
+        assert_eq!(r(12, None), Some(("calg".to_string(), true)));
+        assert_eq!(r(9, None), Some(("cait".to_string(), false)));
 
         for finish in [2u8, 3, 4, 5, 6, 0] {
-            assert_eq!(r(finish, 0), None, "category {finish} should not pose");
+            assert_eq!(r(finish, None), None, "category {finish} should not pose");
         }
     }
 

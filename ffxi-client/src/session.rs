@@ -467,6 +467,9 @@ async fn run_map_session(
         emote_text_resolver,
         mog,
         flood_talknumwork,
+        cfg.dat_root
+            .as_ref()
+            .map(|r| ffxi_dat::spell_info::SpellTable::open(r.root())),
     )
     .await
 }
@@ -1669,6 +1672,7 @@ async fn keepalive_loop(
     mut emote_text_resolver: EmoteTextResolver,
     mut mog: SelfMogState,
     flood_talknumwork: Vec<Vec<u8>>,
+    spell_table: Option<ffxi_dat::spell_info::SpellTable>,
 ) -> Result<MapOutcome> {
     let mut last_recv = std::time::Instant::now();
 
@@ -2113,10 +2117,19 @@ async fn keepalive_loop(
                             }
                             continue;
                         }
+                        // Retail client cast time comes from the spell DAT, not LSB.
+                        let dat_cast_ms = match &kind {
+                            crate::state::ActionKind::CastMagic { spell_id, .. } => spell_table
+                                .as_ref()
+                                .and_then(|t| t.lookup(*spell_id as u16))
+                                .map(|s| s.cast_time_ms)
+                                .filter(|ms| *ms > 0),
+                            _ => None,
+                        };
                         // Reject a fresh action while the previous one is still
                         // locked in (retail refuses the cast/ability rather than
                         // queueing it). Non-locking actions (Attack/Talk/…) pass.
-                        if kind.action_lock_ms().is_some() {
+                        if kind.action_lock_ms(dat_cast_ms).is_some() {
                             if let Some(c) = &cast_in_flight {
                                 if std::time::Instant::now() < c.lock_until {
                                     let text = if matches!(
@@ -2186,8 +2199,8 @@ async fn keepalive_loop(
                             // Optimistically arm the cast lock/bar; the reactor
                             // tick advances and clears it (movement interrupts a
                             // spell in the Move arm).
-                            if let Some(lock_ms) = kind.action_lock_ms() {
-                                let (has_bar, total_ms) = match kind.cast_bar() {
+                            if let Some(lock_ms) = kind.action_lock_ms(dat_cast_ms) {
+                                let (has_bar, total_ms) = match kind.cast_bar(dat_cast_ms) {
                                     Some((name, total)) => {
                                         let _ = event_tx.send(AgentEvent::SelfCastStarted {
                                             name,

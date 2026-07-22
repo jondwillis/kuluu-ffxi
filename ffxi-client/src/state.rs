@@ -2643,17 +2643,17 @@ impl ActionKind {
     /// cast time (ms), present only for spells with a non-zero cast time. Instant
     /// spells and non-spell actions have no cast bar (retail shows a bar only
     /// while a spell winds up).
-    pub fn cast_bar(&self) -> Option<(String, u32)> {
+    /// `dat_cast_ms` is the retail client's own cast time (from the spell DAT); when
+    /// present it wins, since the real client displays and locks on that value. Falls
+    /// back to the LSB-scraped cast time when the DAT is unavailable.
+    pub fn cast_bar(&self, dat_cast_ms: Option<u32>) -> Option<(String, u32)> {
         match self {
             ActionKind::CastMagic { spell_id, .. } => {
-                let ms = ffxi_proto::cast_time::spell_cast_time_ms(*spell_id as u16)?;
-                if ms == 0 {
-                    return None;
-                }
+                let ms = self.spell_cast_ms(*spell_id, dat_cast_ms)?;
                 let name = ffxi_proto::spell_names::lookup(*spell_id as u16)
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("spell #{spell_id}"));
-                Some((name, u32::from(ms)))
+                Some((name, ms))
             }
             _ => None,
         }
@@ -2662,18 +2662,20 @@ impl ActionKind {
     /// How long the reactor should refuse a new action after issuing this one:
     /// a spell's cast time, or the fixed animation lock for instant JA/WS/ranged.
     /// `None` for actions that impose no lock (movement/menu/etc).
-    pub fn action_lock_ms(&self) -> Option<u32> {
+    pub fn action_lock_ms(&self, dat_cast_ms: Option<u32>) -> Option<u32> {
         match self {
-            ActionKind::CastMagic { spell_id, .. } => {
-                ffxi_proto::cast_time::spell_cast_time_ms(*spell_id as u16)
-                    .filter(|ms| *ms > 0)
-                    .map(u32::from)
-            }
+            ActionKind::CastMagic { spell_id, .. } => self.spell_cast_ms(*spell_id, dat_cast_ms),
             ActionKind::JobAbility { .. } | ActionKind::Weaponskill { .. } | ActionKind::Shoot => {
                 Some(INSTANT_ACTION_LOCK_MS)
             }
             _ => None,
         }
+    }
+
+    fn spell_cast_ms(&self, spell_id: u32, dat_cast_ms: Option<u32>) -> Option<u32> {
+        dat_cast_ms
+            .or_else(|| ffxi_proto::cast_time::spell_cast_time_ms(spell_id as u16).map(u32::from))
+            .filter(|ms| *ms > 0)
     }
 }
 

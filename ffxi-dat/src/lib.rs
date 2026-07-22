@@ -26,6 +26,7 @@ pub mod sep;
 pub mod skel;
 pub mod skel_anim;
 pub mod skel_mesh;
+pub mod spell_info;
 pub mod sprite_sheet;
 pub mod texture;
 pub mod ui_element;
