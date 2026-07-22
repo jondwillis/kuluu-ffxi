@@ -565,7 +565,12 @@ pub const OPCODE_META: &[OpMeta] = &[
         valid: true,
     }, // 0x005A
     OpMeta {
-        size: 17,
+        // research/XiEvents/OpCodes/0x005B.md:33,144 — dispatched with param3=0,
+        // so every ExecPointer path advances 15 (the +2 is param3-gated and unused
+        // by 0x5B/0x66). atom0s's size table ambiguously lists "15, 17"; the
+        // param3=0 call site is authoritative. Confirm against a captured event
+        // stream if one containing 0x5B/0x66 becomes available.
+        size: 15,
         jumps: false,
         sets_ret: true,
         valid: true,
@@ -631,7 +636,9 @@ pub const OPCODE_META: &[OpMeta] = &[
         valid: true,
     }, // 0x0065
     OpMeta {
-        size: 17,
+        // See 0x005B: 0x0066 dispatches to the same helper with param3=0, so it
+        // advances 15 too (research/XiEvents/OpCodes/0x0066.md:22).
+        size: 15,
         jumps: false,
         sets_ret: true,
         valid: true,
