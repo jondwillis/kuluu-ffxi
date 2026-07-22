@@ -42,6 +42,14 @@ const RETAIL_FPS: f32 = 30.0;
 // between the old and new weat/<type>/ effect sets on a 0x0057 weather change.
 const WEATHER_FADE_SECS: f32 = 3.33;
 
+// The weat/<type>/ camera-follow canopy generators. These are the sky clouds
+// this module owns (spawned camera-relative). They carry a nonzero UV-scroll and
+// a singleton lifetime, which is ALSO the water-sheet signature, so dat_mzb's
+// generator-water path must exclude these names or it double-spawns the cloud
+// dome as a static world sheet at the zone origin (kuluu-nfrp). The guard test
+// `cloud_generator_names_match_canopy_filter` pins this coupling.
+pub const CLOUD_CANOPY_GENERATOR_NAMES: [[u8; 4]; 2] = [*b"cld1", *b"cld2"];
+
 #[derive(Component)]
 pub struct CloudMesh;
 
@@ -263,7 +271,7 @@ fn build_cloud_layers(
         // Only the cld1/cld2 camera canopies render here (attach 0x0 or 0x5, both
         // camera-relative). The sun (sun1, attach=0xE) is the additive SunDisc in
         // sun_moon.rs; moon/star/lens-flare live in their own subdirs.
-        if c.chunk.name != *b"cld1" && c.chunk.name != *b"cld2" {
+        if !CLOUD_CANOPY_GENERATOR_NAMES.contains(&c.chunk.name) {
             continue;
         }
         let Ok(Some(def)) = Generator::parse_cloud_generator(c.chunk.name, c.chunk.data) else {
@@ -713,5 +721,22 @@ impl Plugin for ZoneCloudsPlugin {
             .init_resource::<ZoneStarState>()
             .add_systems(Update, (rebuild_zone_clouds, drive_zone_clouds).chain())
             .add_systems(Update, (rebuild_zone_stars, drive_zone_stars).chain());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pins the emitter/consumer contract: the names this module renders as the
+    // camera-relative canopy are exactly the names dat_mzb's water-sheet path
+    // excludes. If a new cloud generator name is handled below, add it to the
+    // shared const so it can't leak back into the world-water path (kuluu-nfrp).
+    #[test]
+    fn cloud_generator_names_match_canopy_filter() {
+        for name in [*b"cld1", *b"cld2"] {
+            assert!(CLOUD_CANOPY_GENERATOR_NAMES.contains(&name));
+        }
+        assert_eq!(CLOUD_CANOPY_GENERATOR_NAMES.len(), 2);
     }
 }
