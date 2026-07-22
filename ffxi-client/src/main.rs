@@ -8,6 +8,8 @@ use ffxi_client::{agent_io, auth_client, lobby_client, session};
 use ffxi_client::graphics_store;
 #[cfg(feature = "native-window")]
 use ffxi_client::keybinds_store;
+#[cfg(feature = "native-window")]
+use ffxi_client::marker_store;
 #[cfg(feature = "relay")]
 use ffxi_client::relay;
 #[cfg(feature = "native-window")]

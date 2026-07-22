@@ -511,6 +511,8 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         store: graphics_store_obj,
     });
 
+    app.insert_resource(crate::marker_store::load_or_default());
+
     app.add_plugins((
         ViewerCorePlugin::<NativeSource>::default(),
         HudPlugin,
@@ -611,6 +613,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
 
     app.add_systems(Update, crate::graphics_store::persist_graphics_on_change);
+    app.add_systems(Update, crate::marker_store::sync_markers);
 
     app.add_systems(
         PostUpdate,

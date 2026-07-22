@@ -265,6 +265,7 @@ impl Plugin for MinimapPlugin {
                         update_reset_button_visibility,
                         handle_reset_button_click,
                         overlay::update_minimap_overlay,
+                        overlay::update_minimap_placed_markers,
                     ),
                 )
                     .chain()
@@ -353,7 +354,8 @@ pub fn spawn_minimap_as_child(p: &mut ChildSpawnerCommands, images: &mut Assets<
                 height: Val::Percent(100.0),
                 ..default()
             },
-        ));
+        ))
+        .with_children(overlay::spawn_minimap_placed_markers);
 
         crate::hud::compass::spawn_compass_overlay_as_child(p);
 

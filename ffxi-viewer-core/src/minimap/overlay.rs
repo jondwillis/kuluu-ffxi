@@ -6,7 +6,6 @@ use ffxi_viewer_wire::EntityKind;
 
 use crate::camera::ChaseCamera;
 use crate::components::{InGameEntity, IsSelf, WorldEntity};
-use crate::hud::style::{self, theme};
 use crate::lock_on::LockOn;
 use crate::scene::Target;
 use crate::snapshot::SceneState;
@@ -31,13 +30,7 @@ const TARGET_MARKER_COLOR: Color = Color::srgb(1.0, 0.95, 0.2);
 
 const TARGET_RING_PX: f32 = 2.0;
 
-const LEGEND_SWATCH_PX: f32 = 10.0;
-
-/// Alpha the legend swatch/label fade to when a category filter is off, so a
-/// disabled row still reads as a toggle rather than vanishing.
-const LEGEND_OFF_ALPHA: f32 = 0.30;
-
-/// Legend/filter buckets. `SelfMarker` and `Target` are role overlays that win
+/// Marker categories. `SelfMarker` and `Target` are role overlays that win
 /// over kind; `Party` is snapshot party-list membership; the rest are per
 /// `EntityKind`. The `MarkerFilters` bitset and the legend both key off this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,6 +165,69 @@ pub struct MinimapDot {
 }
 
 pub const SELF_MARKER_ID: u32 = u32::MAX;
+
+/// Placed user markers drawn on the live minimap (same source as the Map
+/// screen), so a dropped marker shows on both surfaces (kuluu-qfmx).
+const MINIMAP_PLACED_PX: f32 = 6.0;
+const MINIMAP_PLACED_POOL: usize = 32;
+const MINIMAP_PLACED_COLOR: Color = Color::srgb(1.0, 0.55, 0.10);
+
+#[derive(Component, Clone, Copy)]
+pub struct MinimapPlacedMarker {
+    pub slot: usize,
+}
+
+pub fn spawn_minimap_placed_markers(layer: &mut ChildSpawnerCommands) {
+    let half = MINIMAP_PLACED_PX * 0.5;
+    for slot in 0..MINIMAP_PLACED_POOL {
+        layer.spawn((
+            MinimapPlacedMarker { slot },
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Px(MINIMAP_PLACED_PX),
+                height: Val::Px(MINIMAP_PLACED_PX),
+                margin: UiRect {
+                    left: Val::Px(-half),
+                    top: Val::Px(-half),
+                    ..default()
+                },
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(MINIMAP_PLACED_COLOR),
+        ));
+    }
+}
+
+pub fn update_minimap_placed_markers(
+    view: Res<MinimapView>,
+    scene_state: Res<SceneState>,
+    markers: Res<crate::hud::map_screen::MapMarkers>,
+    mut q: Query<(&MinimapPlacedMarker, &mut Node)>,
+) {
+    let zone = scene_state.snapshot.zone_id.unwrap_or(0);
+    let placed = markers.for_zone(zone);
+    let aabb = view.visible_aabb;
+    for (marker, mut node) in q.iter_mut() {
+        let uv = placed.get(marker.slot).zip(aabb).and_then(|(m, a)| {
+            a.world_to_uv_or_offscreen(bevy::math::Vec3::new(m.world.x, m.world.y, m.world.z))
+        });
+        match uv {
+            Some(uv) => {
+                node.left = Val::Percent(uv.x * 100.0);
+                node.top = Val::Percent(uv.y * 100.0);
+                if node.display != Display::Flex {
+                    node.display = Display::Flex;
+                }
+            }
+            None => {
+                if node.display != Display::None {
+                    node.display = Display::None;
+                }
+            }
+        }
+    }
+}
 
 pub fn update_minimap_overlay(
     view: Res<MinimapView>,
@@ -464,103 +520,6 @@ pub fn dot_color(kind: EntityKind, is_target: bool, is_locked: bool, is_party: b
         EntityKind::Mob => Color::srgb(0.95, 0.40, 0.40),
         EntityKind::Pet => Color::srgb(0.40, 0.85, 0.50),
         EntityKind::Other => Color::srgb(0.60, 0.60, 0.60),
-    }
-}
-
-#[derive(Component, Clone, Copy)]
-pub struct MarkerLegendRow {
-    pub category: MarkerCategory,
-}
-
-#[derive(Component, Clone, Copy)]
-pub struct MarkerLegendSwatch {
-    pub category: MarkerCategory,
-}
-
-#[derive(Component, Clone, Copy)]
-pub struct MarkerLegendLabel {
-    pub category: MarkerCategory,
-}
-
-/// Spawn a compact color→category legend whose rows are clickable filter
-/// toggles. Reused by the Map screen right pane and available as a small
-/// minimap overlay block; `update_marker_legend`/`handle_marker_legend_click`
-/// drive it from `MarkerFilters`.
-pub fn spawn_marker_legend(parent: &mut ChildSpawnerCommands) {
-    parent.spawn((
-        Text::new("Markers"),
-        style::text_font(13.0),
-        TextColor(theme::TITLE),
-    ));
-    for category in MarkerCategory::ALL {
-        parent
-            .spawn((
-                Button,
-                MarkerLegendRow { category },
-                Node {
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(5.0),
-                    ..default()
-                },
-            ))
-            .with_children(|row| {
-                row.spawn((
-                    MarkerLegendSwatch { category },
-                    Node {
-                        width: Val::Px(LEGEND_SWATCH_PX),
-                        height: Val::Px(LEGEND_SWATCH_PX),
-                        ..default()
-                    },
-                    BackgroundColor(category.swatch_color()),
-                ));
-                row.spawn((
-                    MarkerLegendLabel { category },
-                    Text::new(category.label()),
-                    style::text_font(12.0),
-                    TextColor(theme::TEXT),
-                ));
-            });
-    }
-}
-
-pub fn update_marker_legend(
-    filters: Res<MarkerFilters>,
-    mut q_swatch: Query<(&MarkerLegendSwatch, &mut BackgroundColor)>,
-    mut q_label: Query<(&MarkerLegendLabel, &mut TextColor)>,
-) {
-    if !filters.is_changed() {
-        return;
-    }
-    for (swatch, mut bg) in q_swatch.iter_mut() {
-        let mut color = swatch.category.swatch_color();
-        if !filters.is_visible(swatch.category) {
-            color = color.with_alpha(LEGEND_OFF_ALPHA);
-        }
-        if bg.0 != color {
-            bg.0 = color;
-        }
-    }
-    for (label, mut color) in q_label.iter_mut() {
-        let want = if filters.is_visible(label.category) {
-            theme::TEXT
-        } else {
-            theme::MUTED
-        };
-        if color.0 != want {
-            color.0 = want;
-        }
-    }
-}
-
-pub fn handle_marker_legend_click(
-    interactions: Query<(&Interaction, &MarkerLegendRow), Changed<Interaction>>,
-    mut filters: ResMut<MarkerFilters>,
-) {
-    for (interaction, row) in &interactions {
-        if *interaction == Interaction::Pressed {
-            filters.toggle(row.category);
-        }
     }
 }
 

@@ -291,6 +291,7 @@ impl Plugin for HudPlugin {
                 map_screen::reset_map_screen_on_open,
                 map_screen::update_map_screen_image,
                 map_screen::update_map_screen_markers,
+                map_screen::update_map_placed_markers,
                 map_screen::update_map_panel,
             ),
         );

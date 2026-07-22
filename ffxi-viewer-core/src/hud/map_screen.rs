@@ -35,6 +35,13 @@ const TRACKED_MARKER_RING_PX: f32 = 2.0;
 /// Marker placement crosshair size (Markers submode).
 const PLACE_CURSOR_PX: f32 = 16.0;
 
+/// Placed-marker dot size and pool cap (per-zone user markers drawn on the map).
+const PLACED_MARKER_PX: f32 = 9.0;
+const PLACED_MARKER_POOL: usize = 32;
+
+/// Placed-marker fill, distinct from entity dots and the tracked-target color.
+const PLACED_MARKER_COLOR: Color = Color::srgb(1.0, 0.55, 0.10);
+
 /// Distinct color for the currently tracked (0x0F5) target, kept clear of the
 /// per-kind list palette and the minimap's target/lock colors.
 const TRACKED_MARKER_COLOR: Color = Color::srgb(1.0, 0.30, 0.95);
@@ -72,7 +79,7 @@ pub const COMMAND_ROWS: [(&str, MapSubMode); 3] = [
 
 /// A user-placed map marker. Rendered on both the full-screen map and the
 /// minimap; persisted per character + zone by the client's marker store.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MapMarker {
     pub world: ffxi_viewer_wire::Vec3,
     pub label: String,
@@ -147,6 +154,16 @@ pub struct MapTrackedMarker;
 
 #[derive(Component)]
 pub struct MapPlaceCursor;
+
+#[derive(Component, Clone, Copy)]
+pub struct MapPlacedMarker {
+    pub slot: usize,
+}
+
+#[derive(Component, Clone, Copy)]
+pub struct MapPlacedLabel {
+    pub slot: usize,
+}
 
 #[derive(Component)]
 pub struct MapPanelRoot;
@@ -418,6 +435,43 @@ pub(crate) fn spawn_map_screen(mut commands: Commands, mut images: ResMut<Assets
                     },
                     BorderColor::all(theme::CURSOR),
                 ));
+                let mhalf = PLACED_MARKER_PX * 0.5;
+                for slot in 0..PLACED_MARKER_POOL {
+                    overlay_layer
+                        .spawn((
+                            MapPlacedMarker { slot },
+                            Node {
+                                position_type: PositionType::Absolute,
+                                width: Val::Px(PLACED_MARKER_PX),
+                                height: Val::Px(PLACED_MARKER_PX),
+                                margin: UiRect {
+                                    left: Val::Px(-mhalf),
+                                    top: Val::Px(-mhalf),
+                                    ..default()
+                                },
+                                border: UiRect::all(Val::Px(1.0)),
+                                flex_direction: FlexDirection::Column,
+                                display: Display::None,
+                                ..default()
+                            },
+                            BackgroundColor(PLACED_MARKER_COLOR),
+                            BorderColor::all(Color::WHITE),
+                        ))
+                        .with_children(|dot| {
+                            dot.spawn((
+                                MapPlacedLabel { slot },
+                                Text::new(""),
+                                style::text_font(11.0),
+                                TextColor(theme::TITLE),
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left: Val::Px(PLACED_MARKER_PX),
+                                    top: Val::Px(-2.0),
+                                    ..default()
+                                },
+                            ));
+                        });
+                }
             });
             root.spawn((
                 Node {
@@ -699,6 +753,46 @@ fn set_overlay_marker(node: &mut Node, uv: Option<Vec2>) {
             if node.display != Display::None {
                 node.display = Display::None;
             }
+        }
+    }
+}
+
+/// Position the placed-marker dots (and their labels) from `MapMarkers` for the
+/// live zone, using the same visible AABB as the entity overlay so both align.
+#[allow(clippy::type_complexity)]
+pub(crate) fn update_map_placed_markers(
+    mode: Res<InputMode>,
+    scene_state: Res<SceneState>,
+    map_markers: Res<MapMarkers>,
+    view: Res<MinimapView>,
+    mut dot_q: Query<(&MapPlacedMarker, &mut Node), Without<MapPlacedLabel>>,
+    mut label_q: Query<(&MapPlacedLabel, &mut Text)>,
+) {
+    if !map_open(&mode) {
+        for (_, mut node) in dot_q.iter_mut() {
+            if node.display != Display::None {
+                node.display = Display::None;
+            }
+        }
+        return;
+    }
+    let zone = scene_state.snapshot.zone_id.unwrap_or(0);
+    let markers = map_markers.for_zone(zone);
+    let aabb = view.visible_aabb;
+
+    for (dot, mut node) in dot_q.iter_mut() {
+        let uv = markers.get(dot.slot).zip(aabb).and_then(|(m, a)| {
+            a.world_to_uv_or_offscreen(Vec3::new(m.world.x, m.world.y, m.world.z))
+        });
+        set_overlay_marker(&mut node, uv);
+    }
+    for (label, mut text) in label_q.iter_mut() {
+        let want = markers
+            .get(label.slot)
+            .map(|m| m.label.as_str())
+            .unwrap_or("");
+        if text.as_str() != want {
+            **text = want.to_string();
         }
     }
 }
