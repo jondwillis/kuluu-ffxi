@@ -468,6 +468,21 @@ pub fn update_chat_panel(
 }
 
 pub fn format_chat_line(channel: ChatChannel, sender: &str, text: &str) -> String {
+    // A blank sender is the "No speaker object displayed" (NS_*) case: retail
+    // renders the text with no name prefix, keeping the channel's color.
+    if sender.is_empty()
+        && matches!(
+            channel,
+            ChatChannel::Say
+                | ChatChannel::Shout
+                | ChatChannel::Party
+                | ChatChannel::Linkshell
+                | ChatChannel::Yell
+                | ChatChannel::Other
+        )
+    {
+        return text.to_string();
+    }
     match channel {
         ChatChannel::Say | ChatChannel::Shout | ChatChannel::Other => {
             format!("{sender} : {text}")
@@ -929,6 +944,20 @@ mod tests {
     #[test]
     fn empty_text_still_renders_sender_layout() {
         assert_eq!(format_chat_line(ChatChannel::Say, "Daisy", ""), "Daisy : ");
+    }
+
+    #[test]
+    fn blank_sender_renders_unattributed() {
+        // NS_* ("No speaker object displayed") chat: text only, no prefix.
+        assert_eq!(
+            format_chat_line(
+                ChatChannel::Say,
+                "",
+                "You can set this as your current home point."
+            ),
+            "You can set this as your current home point."
+        );
+        assert_eq!(format_chat_line(ChatChannel::Party, "", "hi"), "hi");
     }
 
     #[test]

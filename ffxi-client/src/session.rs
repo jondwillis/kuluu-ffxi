@@ -4682,7 +4682,15 @@ fn decode_chat_std(data: &[u8]) -> Option<ChatLine> {
         return None;
     }
     let kind = data[0];
-    let sender = trim_nul_string(&data[4..PREFIX]);
+    // "NS" chat kinds mean "No speaker object displayed" — retail renders the
+    // text with no speaker attribution (used for unattributed NPC narration like
+    // the Home Point description). Blank the sender so the HUD omits the prefix
+    // (vendor/server/src/map/enums/chat_message_type.h:38-41,53).
+    let sender = if is_no_speaker_chat_kind(kind) {
+        String::new()
+    } else {
+        trim_nul_string(&data[4..PREFIX])
+    };
     let text = decode_chat_text(&data[PREFIX..]);
     Some(ChatLine {
         channel: ChatChannel::from_chat_kind(kind),
@@ -4690,6 +4698,17 @@ fn decode_chat_std(data: &[u8]) -> Option<ChatLine> {
         text,
         server_ts: 0,
     })
+}
+
+/// The `MESSAGE_NS_*` "No speaker object displayed" chat kinds
+/// (chat_message_type.h): same channel/color as their base kind but with no
+/// speaker attribution.
+fn is_no_speaker_chat_kind(kind: u8) -> bool {
+    use ffxi_proto::map::chat_kind as k;
+    matches!(
+        kind,
+        k::NS_SAY | k::NS_SHOUT | k::NS_PARTY | k::NS_LINKSHELL | k::NS_LINKSHELL2
+    )
 }
 
 // Server customMenu prompt (home point Set/Yes/No, quest confirmations, …):
@@ -4779,12 +4798,19 @@ fn build_subpacket_tell(sync: u16, recipient: &str, text: &str) -> Vec<u8> {
 
     let mut buf = vec![0u8; total];
     buf[0..4].copy_from_slice(&build_subpacket_header(0x0B6, size_words, sync));
+    // GP_CLI_COMMAND_CHAT_NAME.unknown00 must be 3 or the server rejects the
+    // packet (PacketValidator .mustEqual(unknown00, 3), 0x0b6_chat_name.cpp:60);
+    // the retail client always sends 3. Without it every tell — and the
+    // customMenu reply — is silently dropped.
+    buf[4] = CHAT_NAME_UNKNOWN00;
 
     buf[6..6 + r_len].copy_from_slice(&r_bytes[..r_len]);
 
     buf[21..21 + t_len].copy_from_slice(&t_bytes[..t_len]);
     buf
 }
+
+const CHAT_NAME_UNKNOWN00: u8 = 3;
 
 // c2s 0x05B GP_CLI_COMMAND_EVENTEND (vendor/server/src/map/packets/c2s/
 // 0x05b_eventend.h:34-41): UniqueNo u32, EndPara u32, ActIndex u16, Mode u16
@@ -6353,7 +6379,9 @@ mod tests {
         let sync = u16::from_le_bytes([buf[2], buf[3]]);
         assert_eq!(sync, 0xABCD, "sync passed through");
 
-        assert_eq!(buf[4], 0, "unknown00");
+        // The server's PacketValidator requires unknown00 == 3 (0x0b6_chat_name.cpp:60);
+        // a 0 here is what silently dropped every tell / customMenu reply.
+        assert_eq!(buf[4], 3, "unknown00 == 3 (server-required)");
         assert_eq!(buf[5], 0, "unknown01");
         assert_eq!(&buf[6..12], b"Vanari", "recipient name");
         assert!(buf[12..21].iter().all(|&b| b == 0), "sName NUL-padded");
@@ -7836,6 +7864,24 @@ mod tests {
         body.extend_from_slice(message.as_bytes());
         body.push(0);
         body
+    }
+
+    #[test]
+    fn ns_chat_kind_blanks_sender() {
+        // NS_SAY carries a sender name in the packet, but retail shows the text
+        // unattributed — the decoder must drop it so the HUD omits the prefix.
+        let body = chat_std_body(
+            ffxi_proto::map::chat_kind::NS_SAY,
+            "Oldman",
+            "You can set this.",
+        );
+        let line = decode_chat_std(&body).unwrap();
+        assert_eq!(line.sender, "");
+        assert_eq!(line.text, "You can set this.");
+        assert_eq!(line.channel, ChatChannel::Say);
+        // A plain SAY from the same NPC keeps its attribution.
+        let say = chat_std_body(ffxi_proto::map::chat_kind::SAY, "Oldman", "hi");
+        assert_eq!(decode_chat_std(&say).unwrap().sender, "Oldman");
     }
 
     #[test]
