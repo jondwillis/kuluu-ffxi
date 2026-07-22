@@ -910,6 +910,7 @@ pub(crate) fn update_map_panel(
             With<MapPanelTitle>,
             Without<MapGridLabel>,
             Without<MapTitleLabel>,
+            Without<MapPanelRow>,
         ),
     >,
     mut screen_title_q: Query<
@@ -918,9 +919,18 @@ pub(crate) fn update_map_panel(
             With<MapTitleLabel>,
             Without<MapPanelTitle>,
             Without<MapGridLabel>,
+            Without<MapPanelRow>,
         ),
     >,
-    mut row_q: Query<(&MapPanelRow, &mut Text, &mut TextColor, &mut Node), Without<MapPanelRoot>>,
+    mut row_q: Query<
+        (&MapPanelRow, &mut Text, &mut TextColor, &mut Node),
+        (
+            Without<MapPanelRoot>,
+            Without<MapPanelTitle>,
+            Without<MapTitleLabel>,
+            Without<MapGridLabel>,
+        ),
+    >,
 ) {
     let open = map_open(&mode);
     if let Ok(mut node) = panel_root_q.single_mut() {
