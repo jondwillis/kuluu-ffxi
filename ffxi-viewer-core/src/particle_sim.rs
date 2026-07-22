@@ -470,13 +470,20 @@ fn rebuild_mesh(g: &LiveGenerator, rot: Quat, mesh: &mut Mesh) {
             .as_ref()
             .map(|t| t.sample_from(progress, Some(p.scale.y)))
             .unwrap_or(p.scale.y);
-        // Additive blend ignores alpha, so the alpha track drives brightness; with no track,
-        // fade linearly to nothing over life.
+        // Additive blend ignores alpha, so the alpha track drives brightness. With
+        // no track, a transient spray fades linearly to nothing over life; a
+        // continuous generator (one particle re-emitted on expiry — the steady
+        // crystal body/glow) instead holds its init opacity, or each cycle would
+        // fade the single particle out and strobe the whole model transparent.
         let alpha = g
             .alpha
             .as_ref()
             .map(|t| t.sample_from(progress, Some(g.def.init_color[3])))
-            .unwrap_or(1.0 - progress);
+            .unwrap_or(if g.def.continuous {
+                g.def.init_color[3]
+            } else {
+                1.0 - progress
+            });
         // Additive/subtract ignore the alpha channel, so the alpha curve modulates brightness;
         // alpha-blended particles keep full-brightness colour and use the alpha channel.
         let (rgb, vert_a) = match g.def.blend {
@@ -758,6 +765,51 @@ mod tests {
         assert!(
             max_empty_streak <= 1,
             "an expired particle is replaced within one tick (gap was {max_empty_streak})"
+        );
+    }
+
+    #[test]
+    fn continuous_trackless_generator_holds_constant_alpha() {
+        // A continuous generator holds one particle re-emitted on expiry (the
+        // steady crystal body/glow). Track-less, it must hold its init opacity —
+        // if it fell back to the 1.0-progress spray fade, the single particle
+        // would fade out each cycle and strobe the whole model transparent.
+        use ffxi_dat::particle_gen::ParticleBlend;
+        let mut base = def(4.0, 1.0, 1);
+        base.blend = ParticleBlend::Blend;
+        base.init_color = [1.0, 1.0, 1.0, 0.8];
+
+        let mut cont = live(base.clone(), 1.0);
+        cont.def.continuous = true;
+        let mut spray = live(base, 1.0);
+
+        let particle = |age: f32| Particle {
+            pos: Vec3::ZERO,
+            vel: Vec3::ZERO,
+            age_frames: age,
+            life_frames: 4.0,
+            rgb: Vec3::ONE,
+            scale: Vec2::splat(0.1),
+        };
+        cont.particles = vec![particle(3.0)];
+        spray.particles = vec![particle(3.0)];
+
+        let alpha_of = |g: &LiveGenerator| -> f32 {
+            let mut mesh = empty_mesh();
+            rebuild_mesh(g, Quat::IDENTITY, &mut mesh);
+            match mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap() {
+                bevy::mesh::VertexAttributeValues::Float32x4(c) => c[0][3],
+                _ => panic!("expected Float32x4 colours"),
+            }
+        };
+
+        assert!(
+            (alpha_of(&cont) - 0.8).abs() < 1e-4,
+            "continuous body holds its init opacity, not the life fade"
+        );
+        assert!(
+            (alpha_of(&spray) - 0.25).abs() < 1e-4,
+            "a transient spray still fades 1.0-progress over life"
         );
     }
 
