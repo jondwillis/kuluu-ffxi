@@ -561,8 +561,8 @@ mod tests {
         for op in [OP_LOADEXTSCHEDULER, OP_LOADEXTSCHEDULER2] {
             let size = OPCODE_META[op as usize].size as usize;
             assert_eq!(
-                size, 17,
-                "op 0x{op:02X} size drifted from research/XiEvents/OpCodes"
+                size, 15,
+                "op 0x{op:02X} size drifted from research/XiEvents/OpCodes (param3=0 advance)"
             );
             let mut data = vec![op];
             data.extend(std::iter::repeat_n(0u8, size - 1));
