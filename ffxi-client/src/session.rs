@@ -4052,7 +4052,15 @@ fn render_check_mob(message_num: u16, data1: u32, data2: u32, tar_name: &str) ->
     line
 }
 
-const TEMPLATE_OVERRIDES: &[(u16, &str)] = &[(565, "<target> obtains <amount> gil.")];
+// LSB's msg_basic.h enum omits id 116 (the generic "uses <ability>" line shared by
+// no-numeric buff JAs like Boost id39 / Warcry id32; abilities.sql message1=116), so
+// ffxi_proto::msg_basic::lookup(116) is None and the self-JA battle line goes missing.
+// Retail's full mesbasic table (ROM/27/72.DAT) carries it; until that is scraped, pin
+// the wording here. vendor/server/src/map/utils/battleutils.cpp getMessage() -> message1.
+const TEMPLATE_OVERRIDES: &[(u16, &str)] = &[
+    (116, "<player> uses <ability>."),
+    (565, "<target> obtains <amount> gil."),
+];
 
 fn subject_is_tar(message_num: u16) -> bool {
     matches!(message_num, 97)
@@ -6801,6 +6809,19 @@ mod tests {
         cache.insert(0xCAFEu32, "Mithy".to_string());
         let line = decode_battle_message(&data, &cache, &HashMap::new(), true).expect("decoded");
         assert_eq!(line.text, "Mithy obtains 4 gil.", "got: {}", line.text);
+    }
+
+    #[test]
+    fn battle2_self_ja_uses_ability_line_resolves_from_override() {
+        // msg 116 (Boost/Warcry "uses" line) is absent from LSB's msg_basic.h; the
+        // TEMPLATE_OVERRIDES entry must fill it so a self JA-finish (category 6) still logs.
+        let line = build_battle2_line(116, "Nicotine", "Nicotine", true, true, 0, 39, 6)
+            .expect("msg 116 must resolve via override");
+        assert!(
+            line.text.contains("uses") && line.text.contains("Boost"),
+            "got: {}",
+            line.text
+        );
     }
 
     #[test]

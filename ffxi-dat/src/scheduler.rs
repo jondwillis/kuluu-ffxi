@@ -36,8 +36,13 @@ pub enum StageKind {
     Unknown,
 }
 
+// research/xim EffectRoutineParser.kt:64,141-154 — opcode 0x0A is overloaded: a
+// 32-byte stage (length_words 8, XIM numArgs 7) is a Source (caster) sound emitter,
+// while any other length is a LinkedEffectRoutine sub-routine. Disambiguate by length.
+const SOUND_EMITTER_LENGTH_WORDS: usize = 8;
+
 impl StageKind {
-    fn from_byte(b: u8) -> Self {
+    fn from_stage(b: u8, length_words: usize) -> Self {
         match b {
             // Opcodes empirically confirmed against retail spell DATs (e.g. Cure = file 0xAF1):
             // 0x02 spawns a particle generator, 0x03 calls a sub-routine, 0x05 plays motion,
@@ -45,6 +50,8 @@ impl StageKind {
             0x02 => Self::Particle,
             0x03 => Self::SubRoutine,
             0x05 => Self::Motion,
+            0x0A if length_words == SOUND_EMITTER_LENGTH_WORDS => Self::SoundOnCaster,
+            0x0A => Self::SubRoutine,
             0x0B => Self::SoundOnTarget,
             0x53 => Self::SoundOnCaster,
             _ => Self::Unknown,
@@ -94,7 +101,7 @@ impl Scheduler {
                     body[cursor + 10],
                     body[cursor + 11],
                 ];
-                let kind = StageKind::from_byte(raw_type);
+                let kind = StageKind::from_stage(raw_type, length_words);
                 // research/xim EffectRoutineParser.kt:115-130: after id(+8) and a zero32(+12)
                 // and two floats(+16,+20), the 0x05 motion payload carries transitionIn(+24),
                 // a zero u16(+26), transitionOut(+28), maxLoop(+30).
@@ -234,6 +241,29 @@ mod tests {
         assert_eq!(snd.len(), 1);
         assert!(snd[0].on_caster);
         assert_eq!(snd[0].frame, 30);
+    }
+
+    // Boost's effect DAT (ROM/16/0.DAT) plays its caster sound via opcode 0x0A with
+    // length_words 8 (32-byte stage); a 0x0A of any other length is a sub-routine link.
+    #[test]
+    fn opcode_0a_len8_is_sound_else_subroutine() {
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        // 0x0A, length 8 words (32 bytes): a caster sound emitter.
+        body.extend_from_slice(&[0x0A, 0x08, 0, 0]);
+        body.extend_from_slice(&0u16.to_le_bytes()); // +4 delay
+        body.extend_from_slice(&0u16.to_le_bytes()); // +6 duration
+        body.extend_from_slice(b"7047"); // +8 id -> se_id 7047
+        body.extend(std::iter::repeat_n(0u8, 20)); // pad to 32 bytes
+                                                   // 0x0A, length 3 words (12 bytes): a sub-routine link, not a sound.
+        body.extend_from_slice(&[0x0A, 0x03, 0, 0]);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(b"sub0");
+
+        let s = Scheduler::parse(*b"main", &body).unwrap();
+        assert_eq!(s.stages[0].stage.kind, StageKind::SoundOnCaster);
+        assert_eq!(&s.stages[0].stage.id, b"7047");
+        assert_eq!(s.stages[1].stage.kind, StageKind::SubRoutine);
     }
 
     /// A lone Motion stage with a large delay (the emote-DAT shape, e.g. HumeM

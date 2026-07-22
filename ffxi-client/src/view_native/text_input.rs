@@ -2751,14 +2751,26 @@ fn toggle_debug_panel(
 }
 
 /// Menu actions that take retail's sub-target confirm step before firing
-/// (spells/abilities/weaponskills/items). Everything else (move, equip,
-/// emote, ...) dispatches immediately.
+/// (spells/abilities/weaponskills/items). Everything else — move, equip, emote,
+/// and self-only spells/abilities (validTarget SELF, e.g. Boost) — dispatches
+/// immediately; dispatch_dynamic_menu_action routes the self-only ones to <me>.
+/// (vendor/server/sql/{abilities,spell_list}.sql validTarget, TARGET_SELF=0x01.)
 fn sub_target_action_for(
     action: ffxi_viewer_core::hud::menu::DynamicMenuAction,
 ) -> Option<ffxi_viewer_core::input_mode::SubTargetAction> {
     use ffxi_viewer_core::hud::menu::DynamicMenuAction as A;
     use ffxi_viewer_core::input_mode::SubTargetAction as S;
     match action {
+        A::CastSpell { spell_id }
+            if ffxi_proto::valid_target::spell(spell_id).is_some_and(|f| f.is_self_only()) =>
+        {
+            None
+        }
+        A::JobAbility { ability_id } | A::PetAbility { ability_id }
+            if ffxi_proto::valid_target::ability(ability_id).is_some_and(|f| f.is_self_only()) =>
+        {
+            None
+        }
         A::CastSpell { spell_id } => Some(S::Spell(spell_id)),
         A::JobAbility { ability_id } | A::PetAbility { ability_id } => Some(S::Ability(ability_id)),
         A::Weaponskill { skill_id } => Some(S::WeaponSkill(skill_id)),
@@ -4609,5 +4621,26 @@ mod menu_dispatch_tests {
         // Down off the bottom row hits Cancel; up from Cancel returns.
         assert_eq!(grid_nav_choice(&g, 2, 1, 0, 1), 2);
         assert_eq!(grid_nav_choice(&g, 2, 2, 0, -1), 1);
+    }
+
+    #[test]
+    fn self_only_actions_skip_sub_target() {
+        use ffxi_viewer_core::hud::menu::DynamicMenuAction as A;
+        use ffxi_viewer_core::input_mode::SubTargetAction as S;
+        // Boost (ability 39, validTarget SELF) casts on <me> — no <st> prompt.
+        assert_eq!(
+            sub_target_action_for(A::JobAbility { ability_id: 39 }),
+            None
+        );
+        // Provoke (ability 35, ENEMY) still opens the sub-target cursor.
+        assert_eq!(
+            sub_target_action_for(A::JobAbility { ability_id: 35 }),
+            Some(S::Ability(35))
+        );
+        // Cure (spell 1, PARTY) still prompts.
+        assert_eq!(
+            sub_target_action_for(A::CastSpell { spell_id: 1 }),
+            Some(S::Spell(1))
+        );
     }
 }
