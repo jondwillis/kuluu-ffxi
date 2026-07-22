@@ -175,6 +175,20 @@ pub fn spawn_particle_generators(
 // entity is a child of the actor root (which carries the FFXI->Bevy basis), so
 // particle math stays in the DAT's own FFXI-local frame and the effect follows
 // and despawns with the actor.
+// A continuous, un-keyframed Blend generator is a steady solid body (the Home
+// Point crystal core), not a translucent sprite: alpha-test it so the scene does
+// not show through the texture's partial alpha. Keyframed glows and transient
+// sprays keep their DAT blend; Additive/Subtract already ignore alpha.
+fn actor_blend_mode(def: &ParticleGeneratorDef) -> D3mBlendMode {
+    use ffxi_dat::particle_gen::ParticleBlend;
+    match def.blend {
+        ParticleBlend::Additive => D3mBlendMode::Additive,
+        ParticleBlend::Subtract => D3mBlendMode::Subtractive,
+        ParticleBlend::Blend if def.continuous && def.alpha_track.is_none() => D3mBlendMode::Masked,
+        ParticleBlend::Blend => D3mBlendMode::Blended,
+    }
+}
+
 pub fn spawn_actor_auto_run_particles(
     q_added: Query<(Entity, &ActorAutoRunEffects), Added<ActorAutoRunEffects>>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -201,12 +215,7 @@ pub fn spawn_actor_auto_run_particles(
                 .ok()
                 .and_then(|tex_name: [u8; 4]| fx.assets.images.get(&tex_name))
                 .map(|t| images.add(decoded_texture_to_image(t)));
-            let blend = match def.blend {
-                ffxi_dat::particle_gen::ParticleBlend::Additive => D3mBlendMode::Additive,
-                ffxi_dat::particle_gen::ParticleBlend::Blend => D3mBlendMode::Blended,
-                ffxi_dat::particle_gen::ParticleBlend::Subtract => D3mBlendMode::Subtractive,
-            };
-            let mat = mats.add(d3m_material(blend, tex));
+            let mat = mats.add(d3m_material(actor_blend_mode(&def), tex));
             let mesh = meshes.add(empty_mesh());
 
             let entity = commands
@@ -391,7 +400,20 @@ pub fn tick_particle_simulator(time: Res<Time>, mut sim: ResMut<ParticleSimulato
             p.pos += p.vel * frames;
         }
         g.particles.retain(|p| p.age_frames < p.life_frames);
+
+        // A continuous generator re-emits "the moment its particle expires"
+        // (research/xim ParticleGenerator.kt:80). The aging above can push the lone
+        // particle past its life within this same tick, after the pre-emit sweep
+        // already ran — replace it now so the mesh is never empty at render and the
+        // body does not blink out for a frame.
+        if g.def.continuous && g.particles.is_empty() && continuous_active(g) {
+            emit(g, g.def.max_life_frames);
+        }
     }
+}
+
+fn continuous_active(g: &LiveGenerator) -> bool {
+    g.auto_run || g.age_frames <= g.emit_window_frames.max(1.0)
 }
 
 fn emit(g: &mut LiveGenerator, life_frames: f32) {
@@ -676,6 +698,9 @@ mod tests {
             p.pos += p.vel * frames;
         }
         g.particles.retain(|p| p.age_frames < p.life_frames);
+        if g.def.continuous && g.particles.is_empty() && continuous_active(g) {
+            emit(g, g.def.max_life_frames);
+        }
     }
 
     #[test]
@@ -762,9 +787,10 @@ mod tests {
             max_alive, 1,
             "continuous singleton caps at one live particle"
         );
-        assert!(
-            max_empty_streak <= 1,
-            "an expired particle is replaced within one tick (gap was {max_empty_streak})"
+        assert_eq!(
+            max_empty_streak, 0,
+            "a continuous generator is never empty at render — the expired particle \
+             is replaced the same tick, so the body never blinks out for a frame"
         );
     }
 
@@ -811,6 +837,29 @@ mod tests {
             (alpha_of(&spray) - 0.25).abs() < 1e-4,
             "a transient spray still fades 1.0-progress over life"
         );
+    }
+
+    #[test]
+    fn continuous_trackless_blend_body_is_alpha_masked() {
+        use ffxi_dat::particle_gen::ParticleBlend;
+        let mut d = def(4.0, 1.0, 1);
+        d.blend = ParticleBlend::Blend;
+
+        // A transient spray keeps soft alpha-blending.
+        assert_eq!(actor_blend_mode(&d), D3mBlendMode::Blended);
+
+        // The steady body (continuous, no alpha track) becomes an alpha-masked solid.
+        d.continuous = true;
+        assert_eq!(actor_blend_mode(&d), D3mBlendMode::Masked);
+
+        // A keyframed continuous glow stays soft-blended so its track can pulse.
+        d.alpha_track = Some(*b"al00");
+        assert_eq!(actor_blend_mode(&d), D3mBlendMode::Blended);
+
+        // Additive never alpha-tests regardless of continuity.
+        d.blend = ParticleBlend::Additive;
+        d.alpha_track = None;
+        assert_eq!(actor_blend_mode(&d), D3mBlendMode::Additive);
     }
 
     #[test]
