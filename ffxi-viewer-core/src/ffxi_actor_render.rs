@@ -358,12 +358,18 @@ pub fn load_npc(file_id: u32) -> Result<LoadedActor, String> {
     collect_d3m(&tree, &mut effect_meshes);
 
     let (_schedulers, action_assets) = crate::scheduler_runtime::parse_action_bytes(&bytes);
-    // A D3m referenced by a particle generator is a particle sprite (XIM's
-    // ParticleMeshResource, drawn only by the particle stream — Particle.kt:577);
-    // rendering it as a static child too would double-draw it as an opaque slab.
+    // A D3m referenced by a *camera-billboard* generator is a throwaway particle
+    // sprite (XIM ParticleMeshResource, drawn only by the particle stream —
+    // Particle.kt:577). An oriented (non-billboard) generator's D3m is real 3D
+    // geometry — e.g. the Home Point crystal shard `sil` and its rune ring `bind` —
+    // and must stay in effect_meshes so it renders as a solid, depth-writing body
+    // (FfxiSkinnedMaterial alpha-Mask) instead of a faint additive aura the scene
+    // shows through. Diverting every referenced mesh sent the whole gem to the
+    // non-occluding additive stream (kuluu-xvym).
     let particle_meshes: std::collections::HashSet<[u8; 4]> = action_assets
         .particle_defs
         .values()
+        .filter(|d| d.camera_billboard)
         .map(|d| d.mesh_id)
         .collect();
     effect_meshes.retain(|d| !particle_meshes.contains(&d.name));
