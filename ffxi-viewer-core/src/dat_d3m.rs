@@ -4,12 +4,6 @@ use bevy::prelude::*;
 
 use ffxi_dat::d3m::D3m;
 
-// A steady, un-keyframed body particle (the Home Point crystal core) reads as a
-// solid object, not a translucent sprite. Alpha-Blend would let the texture's own
-// partial alpha show the scene through the crystal even at full vertex alpha, so
-// the body is alpha-TESTED instead: texels clip or render fully opaque.
-const BODY_MASK_CUTOFF: f32 = 0.5;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum D3mBlendMode {
     #[default]
@@ -18,8 +12,6 @@ pub enum D3mBlendMode {
     Blended,
 
     Subtractive,
-
-    Masked,
 }
 
 impl D3mBlendMode {
@@ -28,7 +20,6 @@ impl D3mBlendMode {
             Self::Additive => AlphaMode::Add,
             Self::Blended => AlphaMode::Blend,
             Self::Subtractive => AlphaMode::Multiply,
-            Self::Masked => AlphaMode::Mask(BODY_MASK_CUTOFF),
         }
     }
 }
@@ -114,10 +105,6 @@ mod tests {
         assert_eq!(D3mBlendMode::Additive.alpha_mode(), AlphaMode::Add);
         assert_eq!(D3mBlendMode::Blended.alpha_mode(), AlphaMode::Blend);
         assert_eq!(D3mBlendMode::Subtractive.alpha_mode(), AlphaMode::Multiply);
-        assert_eq!(
-            D3mBlendMode::Masked.alpha_mode(),
-            AlphaMode::Mask(BODY_MASK_CUTOFF)
-        );
     }
 
     #[test]
