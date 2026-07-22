@@ -60,6 +60,43 @@ pub fn target_ring_color(engaged_on_target: bool) -> Color {
     }
 }
 
+// research/xim UiState.kt:1289-1300 getSubTargetColorMask: the sub-target cursor is
+// tinted by RANGE, not target type (invalid types are never candidates, so they get no
+// cursor). Three states vs the action's max range: <80% in-range, <100% edge, else out.
+const SUB_TARGET_IN_RANGE: Color = Color::srgb(0.502, 0.502, 1.0);
+const SUB_TARGET_EDGE_RANGE: Color = Color::srgb(0.784, 0.784, 0.502);
+const SUB_TARGET_OUT_OF_RANGE: Color = Color::srgb(1.0, 0.502, 0.502);
+const SUB_TARGET_NO_RANGE: Color = Color::srgb(1.0, 1.0, 1.0);
+const SUB_TARGET_EDGE_FRACTION: f32 = 0.8;
+
+// Fallback max target distance per action family (yalms), from research/xim GameV0.kt
+// (spells/ranged 24, abilities 8, items 10) pending an LSB per-action range scrape.
+const RANGE_SPELL_RANGED: f32 = 24.0;
+const RANGE_ABILITY_WS: f32 = 8.0;
+const RANGE_ITEM: f32 = 10.0;
+
+fn action_max_range(action: crate::input_mode::SubTargetAction) -> f32 {
+    use crate::input_mode::SubTargetAction as S;
+    match action {
+        S::Spell(_) | S::Ranged => RANGE_SPELL_RANGED,
+        S::Ability(_) | S::WeaponSkill(_) => RANGE_ABILITY_WS,
+        S::Item { .. } => RANGE_ITEM,
+    }
+}
+
+pub fn sub_target_cursor_color(distance: f32, max_range: f32) -> Color {
+    if max_range <= 0.0 {
+        return SUB_TARGET_NO_RANGE;
+    }
+    if distance < max_range * SUB_TARGET_EDGE_FRACTION {
+        SUB_TARGET_IN_RANGE
+    } else if distance < max_range {
+        SUB_TARGET_EDGE_RANGE
+    } else {
+        SUB_TARGET_OUT_OF_RANGE
+    }
+}
+
 pub fn arrow_bob_offset(seconds: f32) -> f32 {
     (seconds * ARROW_BOB_FREQUENCY).sin() * ARROW_BOB_AMPLITUDE
 }
@@ -117,6 +154,7 @@ const SUB_TARGET_FLASH_DUTY: f32 = 0.65;
 /// arrow as the lock-on target, but blinking.
 pub fn draw_sub_target_cursor_system(
     mode: Res<crate::InputMode>,
+    state: Res<SceneState>,
     time: Res<Time>,
     cam_q: Query<&Transform, With<OperatorCamera>>,
     world_q: Query<(&Transform, &WorldEntity, Option<&BakedActor>)>,
@@ -136,17 +174,32 @@ pub fn draw_sub_target_cursor_system(
     };
     let cam_pos = cam_t.translation;
 
+    let self_pos = state
+        .snapshot
+        .self_char_id
+        .and_then(|sid| world_q.iter().find(|(_, w, _)| w.id == sid))
+        .map(|(t, _, _)| t.translation);
+
     for (t, w, baked) in &world_q {
         if w.id != candidate {
             continue;
         }
+
+        // research/xim UiState.kt:604 — the cursor is tinted by range to the
+        // candidate; full 3D distance vs the action's max range.
+        let fill = match self_pos {
+            Some(sp) => {
+                sub_target_cursor_color(sp.distance(t.translation), action_max_range(st.action))
+            }
+            None => ARROW_COLOR,
+        };
 
         let tip_y = t.translation.y
             + nameplate_anchor_y(baked)
             + ARROW_TIP_ABOVE_ANCHOR
             + arrow_bob_offset(time.elapsed_secs());
         let apex = Vec3::new(t.translation.x, tip_y, t.translation.z);
-        draw_camera_facing_arrow(&mut gizmos, apex, cam_pos, ARROW_COLOR, ARROW_BORDER_COLOR);
+        draw_camera_facing_arrow(&mut gizmos, apex, cam_pos, fill, ARROW_BORDER_COLOR);
         break;
     }
 }
@@ -323,6 +376,17 @@ mod tests {
     #[test]
     fn unengaged_target_uses_neutral() {
         assert_eq!(target_ring_color(false), ARROW_COLOR);
+    }
+
+    #[test]
+    fn sub_target_cursor_color_is_range_tri_state() {
+        // max 24: <19.2 in-range, [19.2,24) edge, >=24 out (XIM strict `<`).
+        assert_eq!(sub_target_cursor_color(0.0, 24.0), SUB_TARGET_IN_RANGE);
+        assert_eq!(sub_target_cursor_color(19.0, 24.0), SUB_TARGET_IN_RANGE);
+        assert_eq!(sub_target_cursor_color(20.0, 24.0), SUB_TARGET_EDGE_RANGE);
+        assert_eq!(sub_target_cursor_color(24.0, 24.0), SUB_TARGET_OUT_OF_RANGE);
+        assert_eq!(sub_target_cursor_color(30.0, 24.0), SUB_TARGET_OUT_OF_RANGE);
+        assert_eq!(sub_target_cursor_color(5.0, 0.0), SUB_TARGET_NO_RANGE);
     }
 
     #[test]
