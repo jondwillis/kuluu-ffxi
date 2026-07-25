@@ -10,4 +10,4 @@ ffxi-dat = { path = "../ffxi-dat" }
 # Pinned to the exact version Bevy 0.18 resolves in Cargo.lock so that
 # ffxi-actor::Mat4 and bevy::Mat4 are the same type when ffxi-viewer-core
 # depends on ffxi-actor in Phase 3.
-glam = "0.32"
+glam = "0.33"
