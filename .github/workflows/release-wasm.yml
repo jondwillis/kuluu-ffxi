@@ -44,7 +44,7 @@ jobs:
           cache-key: release-wasm
 
       # Trunk auto-downloads matching wasm-bindgen-cli and wasm-opt at build time.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.85.3
         with:
           tool: trunk
 
