@@ -118,7 +118,7 @@ bevy = { version = "0.19", default-features = false, features = [
 ] }
 
 # MCP server SDK for the kuluu-mcp crate (Stage 4).
-rmcp = { version = "2.2", features = ["server", "macros", "schemars", "transport-io"] }
+rmcp = { version = "3.1", features = ["server", "macros", "schemars", "transport-io"] }
 schemars = "1"
 
 # Test fixtures: direct MariaDB access so each integration test can stamp
