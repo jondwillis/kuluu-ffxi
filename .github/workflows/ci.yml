@@ -16,6 +16,19 @@ concurrency:
 permissions:
   contents: read
 
+# scripts/checks.sh routes cargo through scripts/cargo-guard.sh, which SIGKILLs
+# a healthy cold-cache build here: its tree_cpu_secs sums only LIVE processes,
+# so exiting rustc units remove their CPU from the total, while last_cpu is only
+# ever raised. Once the wide parallel dep phase peaks and drains, the sum stays
+# under that high-water mark and the guard declares a wedge at exactly 180s --
+# twice so far, both mid-bevy_pbr (runs 32397132673, 33635418305), the second
+# masking a real compile error. The guard also has nothing to catch on a runner:
+# it exists for contention from a second cargo (agent session, rust-analyzer,
+# pre-push hook), and a job has exactly one. Bounding the job is timeout-minutes'
+# job, below. Re-enable only if kuluu-52q3 lands and earns it back.
+env:
+  CARGO_GUARD: "0"
+
 jobs:
   # fmt compiles nothing — no submodules, no C++ toolchain — so it gets its own
   # seconds-long job and runs in parallel with the heavier jobs below for fast
@@ -25,6 +38,8 @@ jobs:
   format:
     name: fmt
     runs-on: ubuntu-latest
+    # Compiles nothing; measured in seconds. Anything near this is a hang.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - run: scripts/checks.sh harness
@@ -51,6 +66,9 @@ jobs:
   lint:
     name: clippy
     runs-on: ubuntu-latest
+    # Warm-cache clippy measures ~5m; the ceiling has to clear a full cold-cache
+    # run (fork PRs restore but never save) with room for the dep tree to grow.
+    timeout-minutes: 45
     # Neutralise the macOS -isysroot CXXFLAGS in the committed .cargo/config.toml
     # (a dev-machine workaround); on Linux it points the C++ Recast bridge at a
     # non-existent macOS SDK. Cargo's non-forced [env] won't override a var
@@ -80,6 +98,8 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    # Codegen + link, so strictly heavier than clippy's check-mode pass.
+    timeout-minutes: 45
     env:
       CXXFLAGS: ""
     steps:
