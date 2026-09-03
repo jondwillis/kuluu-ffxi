@@ -52,17 +52,27 @@ pub fn update_stair_debug_hud(
     mut hud_q: Query<&mut Visibility, With<StairDebugHud>>,
     mut text_q: Query<&mut Text, With<StairDebugHudText>>,
 ) {
-    let Ok(mut vis) = hud_q.single_mut() else { return; };
-    let Ok(mut text) = text_q.single_mut() else { return; };
+    let Ok(mut vis) = hud_q.single_mut() else {
+        return;
+    };
+    let Ok(mut text) = text_q.single_mut() else {
+        return;
+    };
 
     if !panels.stair_debug {
-        if *vis != Visibility::Hidden { *vis = Visibility::Hidden; }
+        if *vis != Visibility::Hidden {
+            *vis = Visibility::Hidden;
+        }
         return;
     }
-    if *vis != Visibility::Inherited { *vis = Visibility::Inherited; }
+    if *vis != Visibility::Inherited {
+        *vis = Visibility::Inherited;
+    }
 
     let want = build_status_text(&snap);
-    if **text != want { **text = want; }
+    if **text != want {
+        **text = want;
+    }
 }
 
 /// Build the multi-line status string. Layout:
@@ -95,15 +105,36 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
             out.push_str("  <none>\n");
             return;
         }
-        out.push_str(&format!("  is_a_stop   = {}   why = {}\n", d.is_a_stop as u8, d.reason));
-        out.push_str(&format!("  block_n     = ({:+.2},{:+.2},{:+.2})\n", d.block_nx, d.block_ny, d.block_nz));
-        out.push_str(&format!("  hit_pt      = ({:+.1},{:+.1},{:+.1})\n", d.hit_x, d.hit_y, d.hit_z));
-        out.push_str(&format!("  start_xz    = ({:+.1},{:+.1})\n", d.start_x, d.start_z));
-        out.push_str(&format!("  stop_slope  = {}   angle = {:.1}\n", d.stop_slope as u8, d.slope_angle));
+        out.push_str(&format!(
+            "  is_a_stop   = {}   why = {}\n",
+            d.is_a_stop as u8, d.reason
+        ));
+        out.push_str(&format!(
+            "  block_n     = ({:+.2},{:+.2},{:+.2})\n",
+            d.block_nx, d.block_ny, d.block_nz
+        ));
+        out.push_str(&format!(
+            "  hit_pt      = ({:+.1},{:+.1},{:+.1})\n",
+            d.hit_x, d.hit_y, d.hit_z
+        ));
+        out.push_str(&format!(
+            "  start_xz    = ({:+.1},{:+.1})\n",
+            d.start_x, d.start_z
+        ));
+        out.push_str(&format!(
+            "  stop_slope  = {}   angle = {:.1}\n",
+            d.stop_slope as u8, d.slope_angle
+        ));
         out.push_str(&format!("  stop_steps  = {}   step_h = {:+.2}  step_slope = {:+.2}  tall_wall_before_step = {}\n", d.stop_steps as u8, d.step_height, d.step_slope, d.tall_wall as u8));
-        out.push_str(&format!("  stop_wall   = {}   wall_h = {:+.2}\n", d.stop_wall as u8, d.wall_height));
+        out.push_str(&format!(
+            "  stop_wall   = {}   wall_h = {:+.2}\n",
+            d.stop_wall as u8, d.wall_height
+        ));
         out.push_str(&format!("  stop_door   = {}\n", d.stop_door as u8));
-        out.push_str(&format!("  stop_mob    = {}   soft = {:.2}\n", d.stop_mob as u8, d.soft_timer));
+        out.push_str(&format!(
+            "  stop_mob    = {}   soft = {:.2}\n",
+            d.stop_mob as u8, d.soft_timer
+        ));
     };
     let mut line = |left: String, right: &str| {
         out.push_str(&format!("{:<width$}{}\n", left, right, width = LW));
@@ -111,7 +142,10 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
 
     line("=== STAIR DEBUG ===".to_string(), "");
     line(
-        format!("drawing : {}", if snap.drawing_enabled { "on" } else { "off" }),
+        format!(
+            "drawing : {}",
+            if snap.drawing_enabled { "on" } else { "off" }
+        ),
         "",
     );
     line(
@@ -124,7 +158,11 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
     line(
         format!(
             "zone    : {} (id={})",
-            if snap.zone_name.is_empty() { "?" } else { snap.zone_name.as_str() },
+            if snap.zone_name.is_empty() {
+                "?"
+            } else {
+                snap.zone_name.as_str()
+            },
             snap.zone_id,
         ),
         "",
@@ -132,12 +170,20 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
     line(
         format!(
             "dat     : {}",
-            if snap.dat_path.is_empty() { "?" } else { snap.dat_path.as_str() },
+            if snap.dat_path.is_empty() {
+                "?"
+            } else {
+                snap.dat_path.as_str()
+            },
         ),
         "",
     );
     line(
-        format!("slope   : up={}  down={}", fmt_opt(snap.slope_up), fmt_opt(snap.slope_down)),
+        format!(
+            "slope   : up={}  down={}",
+            fmt_opt(snap.slope_up),
+            fmt_opt(snap.slope_down)
+        ),
         "",
     );
 
@@ -152,11 +198,7 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
     out.push('\n');
     out.push_str(&format!(
         "counts  : green={}  up={}  down={}  gray={}  red={}\n",
-        snap.count_green,
-        snap.count_up,
-        snap.count_down,
-        snap.count_gray,
-        snap.count_red,
+        snap.count_green, snap.count_up, snap.count_down, snap.count_gray, snap.count_red,
     ));
 
     // per-orb dump, grouped by tag so you can scan a category at a glance
@@ -165,11 +207,21 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
 
     let live = &snap.orbs[..snap.orb_count.min(snap.orbs.len())];
 
-    push_group(&mut out, "green",   live, snap.player_y, |t| matches!(t, OrbTag::Green));
-    push_group(&mut out, "up-band", live, snap.player_y, |t| matches!(t, OrbTag::UpBand(_)));
-    push_group(&mut out, "down-band", live, snap.player_y, |t| matches!(t, OrbTag::DownBand(_)));
-    push_group(&mut out, "gray",    live, snap.player_y, |t| matches!(t, OrbTag::Gray));
-    push_group(&mut out, "red",     live, snap.player_y, |t| matches!(t, OrbTag::Red));
+    push_group(&mut out, "green", live, snap.player_y, |t| {
+        matches!(t, OrbTag::Green)
+    });
+    push_group(&mut out, "up-band", live, snap.player_y, |t| {
+        matches!(t, OrbTag::UpBand(_))
+    });
+    push_group(&mut out, "down-band", live, snap.player_y, |t| {
+        matches!(t, OrbTag::DownBand(_))
+    });
+    push_group(&mut out, "gray", live, snap.player_y, |t| {
+        matches!(t, OrbTag::Gray)
+    });
+    push_group(&mut out, "red", live, snap.player_y, |t| {
+        matches!(t, OrbTag::Red)
+    });
 
     // Pin the panel to a CONSTANT line count: the orbs listing varies per tick,
     // and a height that changes every frame makes the panel column reflow --
@@ -343,7 +395,11 @@ impl Default for StairDebugSnapshot {
             count_gray: 0,
             count_red: 0,
             orb_count: 0,
-            orbs: [OrbInfo { xz: Vec2::ZERO, y: 0.0, tag: OrbTag::Empty }; 60],
+            orbs: [OrbInfo {
+                xz: Vec2::ZERO,
+                y: 0.0,
+                tag: OrbTag::Empty,
+            }; 60],
             orch: [OrchDecision::default(); 2],
             door_name: String::new(),
             zone_name: String::new(),
@@ -352,7 +408,6 @@ impl Default for StairDebugSnapshot {
         }
     }
 }
-
 
 /// Marks the stair debug panel's root node so the metrics system can measure
 /// its own laid-out rect.

@@ -423,7 +423,9 @@ fn sync_mob_colliders(
     }
     // Park each collider on its visual's current position.
     for (visual, link) in links.iter() {
-        let Ok(vt) = visuals.get(visual) else { continue };
+        let Ok(vt) = visuals.get(visual) else {
+            continue;
+        };
         if let Ok(mut ct) = collider_tf.get_mut(link.0) {
             ct.translation = vt.translation;
         }
@@ -503,7 +505,14 @@ fn capsule() -> Collider {
 /// Vertical probe: distance the capsule travels along `dir` before contact,
 /// capped at `max`, restricted to the given layer mask. Raw shape cast.
 #[allow(dead_code)]
-fn probe(sq: &SpatialQuery, col: &Collider, from: Vec3, dir: Dir3, max: f32, mask: LayerMask) -> f32 {
+fn probe(
+    sq: &SpatialQuery,
+    col: &Collider,
+    from: Vec3,
+    dir: Dir3,
+    max: f32,
+    mask: LayerMask,
+) -> f32 {
     match sq.cast_shape(
         col,
         from,
@@ -589,12 +598,20 @@ fn door_mask() -> LayerMask {
 /// True if a capsule sweep from `start` along `want` hits anything in `mask`.
 /// (Superseded by entity_in_layer for stop classification; kept for reference.)
 #[allow(dead_code)]
-fn layer_ahead(sq: &SpatialQuery, col: &Collider, start: Vec3, want: Vec3, mask: LayerMask) -> bool {
+fn layer_ahead(
+    sq: &SpatialQuery,
+    col: &Collider,
+    start: Vec3,
+    want: Vec3,
+    mask: LayerMask,
+) -> bool {
     let len = want.length();
     if len < 1e-6 {
         return false;
     }
-    let Ok(dir) = Dir3::new(want / len) else { return false; };
+    let Ok(dir) = Dir3::new(want / len) else {
+        return false;
+    };
     sq.cast_shape(
         col,
         start,
@@ -621,7 +638,9 @@ fn entity_in_layer(
     if len < 1e-6 {
         return false;
     }
-    let Ok(dir) = Dir3::new(want / len) else { return false; };
+    let Ok(dir) = Dir3::new(want / len) else {
+        return false;
+    };
     sq.cast_shape(
         col,
         start,
@@ -814,7 +833,7 @@ pub fn resolve_position(
     // SAME classification, so the HUD can never disagree with what moved us.
     // =====================================================================
     const STEP_HEIGHT: f32 = 0.4; // max auto-climb
-    const SNAP_DOWN: f32 = 0.4;   // ground-snap reach below feet
+    const SNAP_DOWN: f32 = 0.4; // ground-snap reach below feet
     let move_dir = Vec2::new(want.x, want.z).normalize_or_zero();
     let here = Vec2::new(x, -y);
 
@@ -868,7 +887,14 @@ pub fn resolve_position(
     let mut block_entity: Option<Entity> = None;
     let mut block_point: Option<Vec3> = None;
     let p1 = slide_walls_only(
-        &av.mas, &col, start, want / dt, dt, &hfilter, &mut block_normal, &mut block_entity,
+        &av.mas,
+        &col,
+        start,
+        want / dt,
+        dt,
+        &hfilter,
+        &mut block_normal,
+        &mut block_entity,
         &mut block_point,
     );
     let slide_xz = Vec2::new(p1.x, p1.z);
@@ -1036,29 +1062,28 @@ pub fn resolve_position(
         // walls+doors. If NOTHING is really in front of us, avian's move_and_slide
         // fabricated the contact (depenetration artifact) -- we should NOT block.
         let probe_from = Vec3::new(start.x, start.y, start.z);
-        let clean_hit = Dir3::new(want / want.length().max(1e-6)).ok().and_then(|d| {
-            av.sq.cast_ray(
-                probe_from,
-                d,
-                RADIUS + 0.6, // just in front (capsule radius + a little)
-                true,
-                &SpatialQueryFilter::from_mask(LayerMask::from([
-                    GameLayer::Wall,
-                    GameLayer::Door,
-                ])),
-            )
-        });
+        let clean_hit = Dir3::new(want / want.length().max(1e-6))
+            .ok()
+            .and_then(|d| {
+                av.sq.cast_ray(
+                    probe_from,
+                    d,
+                    RADIUS + 0.6, // just in front (capsule radius + a little)
+                    true,
+                    &SpatialQueryFilter::from_mask(LayerMask::from([
+                        GameLayer::Wall,
+                        GameLayer::Door,
+                    ])),
+                )
+            });
         // Record for debug: did the clean forward ray actually find a face?
         let real = clean_hit.is_some();
 
         let ent = block_entity;
-        let door_hit = ent.is_some_and(|e| {
-            entity_in_layer(&av.sq, &col, start, want, door_mask(), e)
-        });
+        let door_hit =
+            ent.is_some_and(|e| entity_in_layer(&av.sq, &col, start, want, door_mask(), e));
         let mob_hit = excluded_mob.is_none()
-            && ent.is_some_and(|e| {
-                entity_in_layer(&av.sq, &col, start, want, mob_mask(), e)
-            });
+            && ent.is_some_and(|e| entity_in_layer(&av.sq, &col, start, want, mob_mask(), e));
 
         if door_hit {
             dbg_reason = if real { "door-REAL" } else { "door-PHANTOM" };
@@ -1276,11 +1301,8 @@ fn slide_walls_only(
                     // depenetration artifact or degenerate trimesh contact
                     // returning garbage coords), it is NOT in front of us --
                     // ignore it instead of treating distant geometry as a wall.
-                    let pt: Vec3 = Vec3::new(
-                        hit.point.x as f32,
-                        hit.point.y as f32,
-                        hit.point.z as f32,
-                    );
+                    let pt: Vec3 =
+                        Vec3::new(hit.point.x as f32, hit.point.y as f32, hit.point.z as f32);
                     let reach = RADIUS + HALF + 0.5; // capsule reach + margin
                     let horiz = Vec2::new(pt.x - from.x, pt.z - from.z).length();
                     if horiz > reach {

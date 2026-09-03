@@ -151,7 +151,10 @@ fn reconcile_render_scale_system(
     mut images: ResMut<Assets<Image>>,
     mut state: ResMut<RenderScaleState>,
     mut commands: Commands,
-    q_op: Query<(Entity, Option<&RenderTarget>), (With<OperatorCamera>, Without<RenderScaleCompositeCamera>)>,
+    q_op: Query<
+        (Entity, Option<&RenderTarget>),
+        (With<OperatorCamera>, Without<RenderScaleCompositeCamera>),
+    >,
     q_composite: Query<Entity, With<RenderScaleCompositeCamera>>,
     mut q_display: Query<(Entity, &mut ImageNode), With<RenderScaleDisplayNode>>,
     mut dbg_snap: ResMut<crate::hud::graphics_debug::GraphicsDebugState>,
@@ -402,7 +405,6 @@ fn mirror_pointer_to_render_target_system(
     }
 }
 
-
 /// WINDOW EVEN-SNAP. Odd physical window dimensions put every centered and
 /// percent-sized UI element on a half-pixel, and half-pixel positions round
 /// unstably under relayout -- with the debug text churning every frame, glyphs
@@ -417,10 +419,7 @@ fn snap_window_to_even_system(
     monitors: Query<&bevy::window::Monitor>,
     mut cameras: Query<
         (&mut Camera, Option<&RenderTarget>),
-        bevy::ecs::query::Or<(
-            With<OperatorCamera>,
-            With<RenderScaleCompositeCamera>,
-        )>,
+        bevy::ecs::query::Or<(With<OperatorCamera>, With<RenderScaleCompositeCamera>)>,
     >,
 ) {
     let Ok(mut window) = windows.single_mut() else {

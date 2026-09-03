@@ -677,9 +677,9 @@ impl GraphicsSettings {
                 vsync: true,
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
-            ui_scale: 1.0,
-            camera_spring: false,
-            menu_scale: true,
+                ui_scale: 1.0,
+                camera_spring: false,
+                menu_scale: true,
                 dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
@@ -713,9 +713,9 @@ impl GraphicsSettings {
                 vsync: true,
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
-            ui_scale: 1.0,
-            camera_spring: false,
-            menu_scale: true,
+                ui_scale: 1.0,
+                camera_spring: false,
+                menu_scale: true,
                 dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
@@ -749,9 +749,9 @@ impl GraphicsSettings {
                 vsync: true,
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
-            ui_scale: 1.0,
-            camera_spring: false,
-            menu_scale: true,
+                ui_scale: 1.0,
+                camera_spring: false,
+                menu_scale: true,
                 dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
@@ -789,9 +789,9 @@ impl GraphicsSettings {
                 vsync: true,
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
-            ui_scale: 1.0,
-            camera_spring: false,
-            menu_scale: true,
+                ui_scale: 1.0,
+                camera_spring: false,
+                menu_scale: true,
                 dynamic_lights: DynamicLights::Vanilla,
                 light_threshold: DEFAULT_LIGHT_THRESHOLD,
                 light_intensity: DEFAULT_LIGHT_INTENSITY,
@@ -860,7 +860,9 @@ impl GraphicsSettings {
             },
             GraphicsField::Fov => format!("{:.0}°", self.fov_deg),
             GraphicsField::UiScale => format!("{:.0}%", self.ui_scale * 100.0),
-            GraphicsField::CameraSpring => (if self.camera_spring { "on" } else { "off" }).to_string(),
+            GraphicsField::CameraSpring => {
+                (if self.camera_spring { "on" } else { "off" }).to_string()
+            }
             GraphicsField::MenuScale => (if self.menu_scale { "on" } else { "off" }).to_string(),
 
             GraphicsField::DynamicLights => {
@@ -1037,14 +1039,21 @@ impl GraphicsSettings {
                 self.fps_cap = cycle_slot_u32(self.fps_cap, FPS_CAP_SLOTS, delta);
             }
             GraphicsField::CameraSpring => {
-                if delta != 0 { self.camera_spring = !self.camera_spring; }
+                if delta != 0 {
+                    self.camera_spring = !self.camera_spring;
+                }
             }
             GraphicsField::MenuScale => {
-                if delta != 0 { self.menu_scale = !self.menu_scale; }
+                if delta != 0 {
+                    self.menu_scale = !self.menu_scale;
+                }
             }
             GraphicsField::UiScale => {
-                self.ui_scale =
-                    cycle_slot_f32(self.ui_scale, &[0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0], delta);
+                self.ui_scale = cycle_slot_f32(
+                    self.ui_scale,
+                    &[0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0],
+                    delta,
+                );
             }
             GraphicsField::Fov => {
                 self.fov_deg = cycle_slot_f32(self.fov_deg, FOV_SLOTS, delta);
@@ -2366,7 +2375,6 @@ mod tests {
         assert_eq!(back.value_label(GraphicsField::AntiAliasing), "DLSS (N/A)");
     }
 }
-
 
 /// Resolution-relative HUD scaling: UiScale = (logical height / 1080) x the
 /// user's UI Scale setting, so panels authored against a 1080p baseline grow

@@ -15,7 +15,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use bevy::input::keyboard::{KeyCode, Key, KeyboardInput};
+use bevy::input::keyboard::{Key, KeyCode, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -134,8 +134,6 @@ fn digit_keycode(c: char) -> Option<KeyCode> {
     })
 }
 
-
-
 /// Shared queue written by the listener task, drained by `key_drive_system`.
 #[derive(Resource)]
 pub struct KeyDriveQueue(pub Arc<Mutex<Vec<KeyMsg>>>);
@@ -156,7 +154,9 @@ pub async fn serve_key_drive(addr: SocketAddr, queue: Arc<Mutex<Vec<KeyMsg>>>) {
     };
     tracing::info!(%addr, "FFXI_KEY_DRIVE listening");
     loop {
-        let Ok((sock, _)) = listener.accept().await else { break };
+        let Ok((sock, _)) = listener.accept().await else {
+            break;
+        };
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut lines = BufReader::new(tokio::io::BufWriter::new(sock)).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -235,7 +235,13 @@ fn write_state(
 fn write_tap(events: &mut MessageWriter<KeyboardInput>, window: Entity, name: &str) {
     match KeyMsg::resolve(name) {
         Some(pair) => {
-            write_state(events, window, pair.0.clone(), pair.1.clone(), ButtonState::Pressed);
+            write_state(
+                events,
+                window,
+                pair.0.clone(),
+                pair.1.clone(),
+                ButtonState::Pressed,
+            );
             write_state(events, window, pair.0, pair.1, ButtonState::Released);
         }
         None => tracing::warn!(%name, "FFXI_KEY_DRIVE: unknown key name"),
@@ -246,11 +252,7 @@ fn write_tap(events: &mut MessageWriter<KeyboardInput>, window: Entity, name: &s
 /// physical `KeyCode`; anything else rides on an inert physical code while the
 /// logical `Key::Character` + `text` fields deliver the glyph to raw-event
 /// handlers (chat buffers, launcher text fields).
-fn write_tap_char(
-    events: &mut MessageWriter<KeyboardInput>,
-    window: Entity,
-    c: char,
-) {
+fn write_tap_char(events: &mut MessageWriter<KeyboardInput>, window: Entity, c: char) {
     let name = c.to_string();
     let mapped = KeyMsg::resolve(&name);
     let (kc, lk) = match mapped {
@@ -310,10 +312,7 @@ mod tests {
 
     #[test]
     fn resolve_named_and_chars() {
-        assert_eq!(
-            KeyMsg::resolve("Enter").unwrap().0,
-            KeyCode::Enter
-        );
+        assert_eq!(KeyMsg::resolve("Enter").unwrap().0, KeyCode::Enter);
         let (kc, lk) = KeyMsg::resolve("w").unwrap();
         assert_eq!(kc, KeyCode::KeyW);
         match lk {

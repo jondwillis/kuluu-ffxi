@@ -352,6 +352,9 @@ mod group_tbl_tests {
         assert_eq!(tbl.kind, GroupKind::Alliance);
         assert!(tbl.members[0].is_alliance_leader);
 
-        assert!(matches!(GroupTbl::decode(&[0, 0, 0]), Err(DecodeError::Truncated(4, 3))));
+        assert!(matches!(
+            GroupTbl::decode(&[0, 0, 0]),
+            Err(DecodeError::Truncated(4, 3))
+        ));
     }
 }

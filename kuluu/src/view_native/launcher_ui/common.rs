@@ -368,7 +368,9 @@ fn spawn_titlebar(
                     NavAction::Close => {
                         btn.observe(|_ev: On<Activate>, mut exit: MessageWriter<AppExit>| {
                             // TEMP (exit-hunt): identify which close path fired.
-                            tracing::info!("TEMP common.rs: launcher UI X/close button activated -> AppExit");
+                            tracing::info!(
+                                "TEMP common.rs: launcher UI X/close button activated -> AppExit"
+                            );
                             exit.write_default();
                         });
                     }

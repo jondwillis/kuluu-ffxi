@@ -1665,7 +1665,8 @@ impl SessionState {
                     Some(m.id) == self_id || members.iter().any(|e| e.unique_no == m.id)
                 });
                 for entry in members {
-                    if let Some(existing) = self.party.iter_mut().find(|m| m.id == entry.unique_no) {
+                    if let Some(existing) = self.party.iter_mut().find(|m| m.id == entry.unique_no)
+                    {
                         existing.act_index = entry.act_index;
                         existing.zone_no = entry.zone_no;
                         existing.is_party_leader = entry.is_party_leader;

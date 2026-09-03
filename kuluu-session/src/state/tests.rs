@@ -431,7 +431,9 @@ fn party_table_reset_solo_empty_table_keeps_self() {
         char_id: Some(42),
         ..Default::default()
     };
-    s.apply_event(&AgentEvent::PartyMemberUpdated { member: party_member(42, "Sylvie", 1500) });
+    s.apply_event(&AgentEvent::PartyMemberUpdated {
+        member: party_member(42, "Sylvie", 1500),
+    });
 
     let changed = s.apply_event(&AgentEvent::PartyTableReset { members: vec![] });
     assert!(!changed, "no-op reset reports no change");
@@ -485,14 +487,25 @@ fn party_table_reset_drops_unlisted_keeps_stats_seeds_skeletons() {
     });
     assert!(changed);
 
-    let by_id = |id: u32| s.party.iter().find(|m| m.id == id).unwrap_or_else(|| panic!("missing {id}"));
+    let by_id = |id: u32| {
+        s.party
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("missing {id}"))
+    };
     assert_eq!(s.party.len(), 3, "unlisted member dropped, new id seeded");
     assert!(s.party.iter().all(|m| m.id != 99), "stale member gone");
 
     let self_row = by_id(42);
-    assert_eq!(self_row.hp, 1500, "listed member keeps stats until the 0x0DD burst");
+    assert_eq!(
+        self_row.hp, 1500,
+        "listed member keeps stats until the 0x0DD burst"
+    );
     assert_eq!(self_row.name.as_deref(), Some("Sylvie"));
-    assert_eq!(self_row.act_index, 3, "roster fields refreshed from the table");
+    assert_eq!(
+        self_row.act_index, 3,
+        "roster fields refreshed from the table"
+    );
     assert_eq!(self_row.zone_no, 235);
 
     let mate = by_id(7);
@@ -501,7 +514,10 @@ fn party_table_reset_drops_unlisted_keeps_stats_seeds_skeletons() {
     assert!(!mate.is_party_leader);
 
     let skeleton = by_id(55);
-    assert_eq!(skeleton.name, None, "new id is a skeleton row until its 0x0DD lands");
+    assert_eq!(
+        skeleton.name, None,
+        "new id is a skeleton row until its 0x0DD lands"
+    );
     assert_eq!(skeleton.hp, 0);
 }
 

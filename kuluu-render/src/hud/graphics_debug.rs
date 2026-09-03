@@ -89,7 +89,10 @@ pub fn update_graphics_debug_hud(
     } else {
         format!("{}x{}", state.img.0, state.img.1)
     };
-    let (sw, sh) = (SURFACE_W.load(Ordering::Relaxed), SURFACE_H.load(Ordering::Relaxed));
+    let (sw, sh) = (
+        SURFACE_W.load(Ordering::Relaxed),
+        SURFACE_H.load(Ordering::Relaxed),
+    );
     let agree = if sw == state.win.0 && sh == state.win.1 {
         "MATCH"
     } else {
@@ -213,7 +216,10 @@ fn nameplate_snap_line(tag: &str, s: NameplateFrameSnap) -> String {
     } else {
         // Main line stays short (panel width): draws + pipeline state only.
         let main = match s.target_fmt {
-            Some(f) => format!("draws={} pipe=ok fmt={:?} samples={}", s.draws, f, s.samples),
+            Some(f) => format!(
+                "draws={} pipe=ok fmt={:?} samples={}",
+                s.draws, f, s.samples
+            ),
             None => format!("draws={} pipe=ok samples={}", s.draws, s.samples),
         };
         // Farthest plate (head of the blend order): on screen = ndc xy inside
@@ -237,13 +243,7 @@ fn nameplate_snap_line(tag: &str, s: NameplateFrameSnap) -> String {
         // {tag} captures the `tag` parameter from scope; the bare specifiers
         // take the seven counters in order.
         "{tag}: plates={} hidden={} nogpuimg={} nodata={} bound={} gputex={} | {}",
-        s.plates_total,
-        s.hidden,
-        s.no_gpu_image,
-        s.not_had_data,
-        s.bound,
-        s.gpu_images_total,
-        draw
+        s.plates_total, s.hidden, s.no_gpu_image, s.not_had_data, s.bound, s.gpu_images_total, draw
     )
 }
 
@@ -292,7 +292,9 @@ pub fn update_nameplate_debug_hud(
     // Render-thread-owned ring of the last two ticks; held only for this brief
     // read, never across a system boundary.
     let s = {
-        let dbg = NAMEPLATE_PASS_DEBUG.lock().unwrap_or_else(|p| p.into_inner());
+        let dbg = NAMEPLATE_PASS_DEBUG
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         format!(
             "=== NAMEPLATE DEBUG (last 2 ticks) ===\n{}\n{}",
             nameplate_snap_line(&format!("f{:>7}", dbg.frame.saturating_sub(1)), dbg.prev),

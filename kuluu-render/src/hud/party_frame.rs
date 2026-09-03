@@ -20,10 +20,10 @@
 
 use bevy::prelude::*;
 
-use crate::hud::HudPanels;
 use crate::hud::panel_column::ColumnPanel;
 use crate::hud::status_panel::job_abbrev;
 use crate::hud::style::{self, theme};
+use crate::hud::HudPanels;
 use crate::nameplate_color::{ncol, NameColorTable};
 use crate::scene::Target;
 use crate::snapshot::SceneState;
@@ -287,7 +287,11 @@ fn cycle_setting(key: UiSettingKey, s: &mut PartyFrameSettings) {
         UiSettingKey::HpDisplayMode => s.hp_display_mode = (s.hp_display_mode + 1) % 3,
         UiSettingKey::MinRows => s.min_rows = (s.min_rows + 1) % 7, // 0..=6
         UiSettingKey::Scale => {
-            let next = match s.scale.partial_cmp(&0.85).unwrap_or(std::cmp::Ordering::Less) {
+            let next = match s
+                .scale
+                .partial_cmp(&0.85)
+                .unwrap_or(std::cmp::Ordering::Less)
+            {
                 std::cmp::Ordering::Less => 1.0,
                 std::cmp::Ordering::Equal => 1.25,
                 _ => 0.75,
@@ -346,7 +350,11 @@ pub fn spawn_party_frames(mut commands: Commands) {
         let is_l1_default = party_no == 0;
         // Window padding per layout (spec §4/§5): L1 {10,6}, L2 {3,3}.
         let pad_x = if is_l1_default { 10.0 } else { 3.0 };
-        let top_pad = if is_l1_default { TITLE_PX * 0.75 + 3.0 } else { 8.0 };
+        let top_pad = if is_l1_default {
+            TITLE_PX * 0.75 + 3.0
+        } else {
+            8.0
+        };
         commands
             .spawn((
                 crate::components::InGameEntity,
@@ -519,8 +527,7 @@ pub fn update_party_frame_system(
     // runtime (B0001) — Bevy can't prove the entities disjoint. Distance texts
     // are NOT touched here; update_party_dist_text_system keeps them fresh in
     // place every frame.
-    mut title_q:
-        Query<(&mut Text, Option<&PartyTitle>, Option<&PartyTreasureFlag>)>,
+    mut title_q: Query<(&mut Text, Option<&PartyTitle>, Option<&PartyTreasureFlag>)>,
     host_q: Query<(Entity, &PartyRowsHost, Option<&Children>)>,
     mut last_key: Local<Option<PartyContentKey>>,
 ) {
@@ -735,7 +742,9 @@ fn target_dist_text(
     snap: &kuluu_snapshot::SceneSnapshot,
     self_pos: kuluu_snapshot::Vec3,
 ) -> String {
-    let Some(tid) = target_id else { return String::new() };
+    let Some(tid) = target_id else {
+        return String::new();
+    };
     let Some(ent) = snap.entities.iter().find(|e| e.id == tid) else {
         return String::new();
     };
@@ -849,7 +858,16 @@ fn spawn_member_row(
             is_target,
         );
     } else {
-        spawn_row_l2(parent, m, s, name_label, name_color, flag, out_of_zone, is_target);
+        spawn_row_l2(
+            parent,
+            m,
+            s,
+            name_label,
+            name_color,
+            flag,
+            out_of_zone,
+            is_target,
+        );
     }
 }
 
@@ -892,10 +910,7 @@ fn spawn_row_l1(
         Interaction::None,
     ));
     if s.selection_box && is_target {
-        row.insert((
-            BackgroundColor(TARGET_BG),
-            BorderColor::all(TARGET_BORDER),
-        ));
+        row.insert((BackgroundColor(TARGET_BG), BorderColor::all(TARGET_BORDER)));
     } else if s.alternating_bands && m.act_index % 2 == 1 {
         row.insert(BackgroundColor(BAND_COLOR));
     }
@@ -911,25 +926,22 @@ fn spawn_row_l1(
             align_items: AlignItems::Center,
             ..default()
         },))
-        .with_children(|icon| {
-            icon.spawn((
-                Text::new(job_abbrev(m.main_job)),
-                style::text_font(JOB_PX * sc.max(0.75)),
-                TextColor(theme::MUTED),
-            ));
-        });
+            .with_children(|icon| {
+                icon.spawn((
+                    Text::new(job_abbrev(m.main_job)),
+                    style::text_font(JOB_PX * sc.max(0.75)),
+                    TextColor(theme::MUTED),
+                ));
+            });
 
         // Bars column: HP on top, MP right-aligned under it (XIUI L1).
-        row.spawn((
-            Node {
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(1.0),
-                ..default()
-            },
-        ))
-        .with_children(|bars| {
-            bars.spawn(bar_track(hp_w, bar_h))
-                .with_children(|hp| {
+        row.spawn((Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(1.0),
+            ..default()
+        },))
+            .with_children(|bars| {
+                bars.spawn(bar_track(hp_w, bar_h)).with_children(|hp| {
                     fill_or_block(
                         hp,
                         out_of_zone,
@@ -940,30 +952,29 @@ fn spawn_row_l1(
                     );
                 });
 
-            // [TP value] [MP bar] on ONE line, right-aligned under the HP
-            // bar's right edge. TP is a bare number (gold at 1000) — no label.
-            let show_mp = s.always_show_mp_bar || m.mp > 0;
-            if show_mp || s.show_tp {
-                bars.spawn(Node {
-                    position_type: PositionType::Relative,
-                    width: Val::Px(hp_w),
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    justify_content: JustifyContent::FlexEnd,
-                    column_gap: Val::Px(4.0),
-                    ..default()
-                })
-                .with_children(|line| {
-                    if s.show_tp {
-                        line.spawn((
-                            Text::new(format!("{}", m.tp)),
-                            style::text_font(JOB_PX * sc.max(0.75)),
-                            TextColor(if m.tp >= 1000 { TP_FULL } else { TP_DIM }),
-                        ));
-                    }
-                    if show_mp {
-                        line.spawn(bar_track(mp_w, bar_h))
-                            .with_children(|mp| {
+                // [TP value] [MP bar] on ONE line, right-aligned under the HP
+                // bar's right edge. TP is a bare number (gold at 1000) — no label.
+                let show_mp = s.always_show_mp_bar || m.mp > 0;
+                if show_mp || s.show_tp {
+                    bars.spawn(Node {
+                        position_type: PositionType::Relative,
+                        width: Val::Px(hp_w),
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::FlexEnd,
+                        column_gap: Val::Px(4.0),
+                        ..default()
+                    })
+                    .with_children(|line| {
+                        if s.show_tp {
+                            line.spawn((
+                                Text::new(format!("{}", m.tp)),
+                                style::text_font(JOB_PX * sc.max(0.75)),
+                                TextColor(if m.tp >= 1000 { TP_FULL } else { TP_DIM }),
+                            ));
+                        }
+                        if show_mp {
+                            line.spawn(bar_track(mp_w, bar_h)).with_children(|mp| {
                                 fill_or_block(
                                     mp,
                                     out_of_zone,
@@ -973,59 +984,55 @@ fn spawn_row_l1(
                                     JOB_PX * sc.max(0.75),
                                 );
                             });
-                    }
-                });
-            }
-        });
+                        }
+                    });
+                }
+            });
 
         // Name line overlaid on the HP bar's top edge (straddles it):
         // [leader dot(s)] [name] ......... [distance].
-        row.spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                right: Val::Px(0.0),
-                top: Val::Px(-NAME_PX * 0.45),
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(4.0),
-                ..default()
-            },
-        ))
-        .with_children(|line| {
-            if m.is_alliance_leader {
-                line.spawn(dot_node(LEADER_DOT));
-                line.spawn(dot_node(LEADER_DOT));
-            } else if m.is_party_leader {
-                line.spawn(dot_node(LEADER_DOT));
-            }
-            line.spawn((
-                Text::new(name_label),
-                style::text_font(NAME_PX * s.scale.max(0.75)),
-                TextColor(name_color),
-            ));
-            if let Some((label, color)) = flag {
+        row.spawn((Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            top: Val::Px(-NAME_PX * 0.45),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(4.0),
+            ..default()
+        },))
+            .with_children(|line| {
+                if m.is_alliance_leader {
+                    line.spawn(dot_node(LEADER_DOT));
+                    line.spawn(dot_node(LEADER_DOT));
+                } else if m.is_party_leader {
+                    line.spawn(dot_node(LEADER_DOT));
+                }
                 line.spawn((
-                    Text::new(label.to_string()),
-                    style::text_font(JOB_PX * s.scale.max(0.75)),
-                    TextColor(color),
+                    Text::new(name_label),
+                    style::text_font(NAME_PX * s.scale.max(0.75)),
+                    TextColor(name_color),
                 ));
-            }
-            if let Some(d) = member_dist {
-                line.spawn((
-                    Node {
+                if let Some((label, color)) = flag {
+                    line.spawn((
+                        Text::new(label.to_string()),
+                        style::text_font(JOB_PX * s.scale.max(0.75)),
+                        TextColor(color),
+                    ));
+                }
+                if let Some(d) = member_dist {
+                    line.spawn((Node {
                         flex_grow: 1.0,
                         ..default()
-                    },
-                ));
-                line.spawn((
-                    MemberDistText(m.id),
-                    Text::new(d),
-                    style::text_font(JOB_PX * s.scale.max(0.75)),
-                    TextColor(theme::MUTED),
-                ));
-            }
-        });
+                    },));
+                    line.spawn((
+                        MemberDistText(m.id),
+                        Text::new(d),
+                        style::text_font(JOB_PX * s.scale.max(0.75)),
+                        TextColor(theme::MUTED),
+                    ));
+                }
+            });
     });
 }
 
@@ -1065,10 +1072,7 @@ fn spawn_row_l2(
         Interaction::None,
     ));
     if s.selection_box && is_target {
-        row.insert((
-            BackgroundColor(TARGET_BG),
-            BorderColor::all(TARGET_BORDER),
-        ));
+        row.insert((BackgroundColor(TARGET_BG), BorderColor::all(TARGET_BORDER)));
     } else if s.alternating_bands && m.act_index % 2 == 1 {
         row.insert(BackgroundColor(BAND_COLOR));
     }
@@ -1076,54 +1080,52 @@ fn spawn_row_l2(
     row.with_children(|row| {
         // Text row: [leader dot(s)] [name] ......... [HP value]. Dips into the
         // HP bar top by `overlap` px (the bar starts at hp_top).
-        row.spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                right: Val::Px(0.0),
-                top: Val::Px(0.0),
-                height: Val::Px(name_row_h),
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(3.0),
-                padding: UiRect {
-                    left: Val::Px(4.0),
-                    ..default()
-                },
+        row.spawn((Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            top: Val::Px(0.0),
+            height: Val::Px(name_row_h),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(3.0),
+            padding: UiRect {
+                left: Val::Px(4.0),
                 ..default()
             },
-        ))
-        .with_children(|line| {
-            if m.is_alliance_leader {
-                line.spawn(dot_node(LEADER_DOT));
-                line.spawn(dot_node(LEADER_DOT));
-            } else if m.is_party_leader {
-                line.spawn(dot_node(LEADER_DOT));
-            }
-            line.spawn((
-                Text::new(name_label),
-                style::text_font(NAME_PX * sc.max(0.75)),
-                TextColor(name_color),
-            ));
-            if let Some((label, color)) = flag {
+            ..default()
+        },))
+            .with_children(|line| {
+                if m.is_alliance_leader {
+                    line.spawn(dot_node(LEADER_DOT));
+                    line.spawn(dot_node(LEADER_DOT));
+                } else if m.is_party_leader {
+                    line.spawn(dot_node(LEADER_DOT));
+                }
                 line.spawn((
-                    Text::new(label.to_string()),
-                    style::text_font(JOB_PX * sc.max(0.75)),
-                    TextColor(color),
+                    Text::new(name_label),
+                    style::text_font(NAME_PX * sc.max(0.75)),
+                    TextColor(name_color),
                 ));
-            }
-            line.spawn(Node {
-                flex_grow: 1.0,
-                ..default()
+                if let Some((label, color)) = flag {
+                    line.spawn((
+                        Text::new(label.to_string()),
+                        style::text_font(JOB_PX * sc.max(0.75)),
+                        TextColor(color),
+                    ));
+                }
+                line.spawn(Node {
+                    flex_grow: 1.0,
+                    ..default()
+                });
+                if !out_of_zone {
+                    line.spawn((
+                        Text::new(hp_value_text(m, s.hp_display_mode)),
+                        style::text_font(JOB_PX * sc.max(0.75)),
+                        TextColor(Color::WHITE),
+                    ));
+                }
             });
-            if !out_of_zone {
-                line.spawn((
-                    Text::new(hp_value_text(m, s.hp_display_mode)),
-                    style::text_font(JOB_PX * sc.max(0.75)),
-                    TextColor(Color::WHITE),
-                ));
-            }
-        });
 
         // HP bar: right-aligned in the entry box.
         row.spawn(Node {
@@ -1190,8 +1192,8 @@ fn spawn_placeholder_row(parent: &mut ChildSpawnerCommands, is_l1: bool, s: &Par
         L2_HP_BASE_W * BASE_MULT * sc
     };
     let bar_h = (if is_l1 { L1_BAR_H } else { L2_BAR_H }) * sc;
-    parent.spawn((
-        Node {
+    parent
+        .spawn((Node {
             position_type: PositionType::Relative,
             width: Val::Px(if is_l1 {
                 L1_ICON_SIZE * sc + L1_BAR_INSET * sc + hp_w
@@ -1201,13 +1203,12 @@ fn spawn_placeholder_row(parent: &mut ChildSpawnerCommands, is_l1: bool, s: &Par
             height: Val::Px(bar_h),
             padding: UiRect::all(Val::Px(if is_l1 { 2.0 } else { 1.0 })),
             ..default()
-        },
-    ))
-    .with_children(|row| {
-        // Empty track (no fill) reads as a dimmed empty slot; Bevy's Node has
-        // no per-node opacity in 0.19, so we don't fake it with an overlay.
-        row.spawn(bar_track(hp_w, bar_h));
-    });
+        },))
+        .with_children(|row| {
+            // Empty track (no fill) reads as a dimmed empty slot; Bevy's Node has
+            // no per-node opacity in 0.19, so we don't fake it with an overlay.
+            row.spawn(bar_track(hp_w, bar_h));
+        });
 }
 
 // ---- small builders -------------------------------------------------------------
@@ -1257,8 +1258,8 @@ fn fill_or_block(
         BackgroundColor(color),
     ));
     if value_font_px > 0.0 && !value.is_empty() {
-        parent.spawn((
-            Node {
+        parent
+            .spawn((Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(4.0),
                 top: Val::Px(0.0),
@@ -1266,15 +1267,14 @@ fn fill_or_block(
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 ..default()
-            },
-        ))
-        .with_children(|v| {
-            v.spawn((
-                Text::new(value.to_string()),
-                style::text_font(value_font_px),
-                TextColor(Color::WHITE),
-            ));
-        });
+            },))
+            .with_children(|v| {
+                v.spawn((
+                    Text::new(value.to_string()),
+                    style::text_font(value_font_px),
+                    TextColor(Color::WHITE),
+                ));
+            });
     }
 }
 
@@ -1304,11 +1304,7 @@ fn short_zone(zone_no: u16, resolver: Option<&crate::hud::zone_flash::ZoneNameRe
         0 => format!("Z{zone_no}"),
         1 => words[0].to_string(),
         _ if words.get(1) == Some(&"of") => words.last().copied().unwrap_or(words[0]).to_string(),
-        2 => format!(
-            "{}{}",
-            &words[0][..words[0].len().min(2)],
-            words[1]
-        ),
+        2 => format!("{}{}", &words[0][..words[0].len().min(2)], words[1]),
         _ => {
             let initials: String = words[..words.len() - 1]
                 .iter()
@@ -1345,7 +1341,9 @@ pub fn update_ui_settings_system(
     mut panel_q: Query<&mut Node, With<UiSettingsPanel>>,
     mut rows_q: Query<(&UiSettingsRow, &mut Text)>,
 ) {
-    let Ok(mut node) = panel_q.single_mut() else { return };
+    let Ok(mut node) = panel_q.single_mut() else {
+        return;
+    };
     let want = if panels.ui_settings {
         Display::Flex
     } else {

@@ -487,7 +487,11 @@ async fn run_map_session(
             .await?;
         // `ack` must equal the server's current server_packet_id or parse()
         // drops this c2s and re-sends its cached last s2c instead.
-        tracing::info!(sub_seq, ack = server_last_seq, "sent 0x00C GAMEOK (zone-in)");
+        tracing::info!(
+            sub_seq,
+            ack = server_last_seq,
+            "sent 0x00C GAMEOK (zone-in)"
+        );
     }
     quiesce!();
     // c2s 0x076 GROUP_LIST_REQ: request the full party table. The server
@@ -1624,8 +1628,8 @@ fn handle_sub_packet(
             }
         }
         s2c::GROUP_TBL => {
-            if let Ok(tbl) = decode::GroupTbl::decode(sub.data)
-                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            if let Ok(tbl) =
+                decode::GroupTbl::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
             {
                 tracing::info!(
                     kind = ?tbl.kind,

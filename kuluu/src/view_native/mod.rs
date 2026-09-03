@@ -742,8 +742,14 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.init_resource::<input::FootprintDebug>();
     app.init_resource::<input::LastStairDetection>();
     app.init_resource::<input::StairDebugZoneCache>();
-    app.add_systems(Update, (input::draw_footprint_debug_system, input::update_stair_debug_snapshot_system)
-        .run_if(in_state(AppPhase::InGame)));
+    app.add_systems(
+        Update,
+        (
+            input::draw_footprint_debug_system,
+            input::update_stair_debug_snapshot_system,
+        )
+            .run_if(in_state(AppPhase::InGame)),
+    );
     app.add_systems(
         FixedUpdate,
         (
@@ -1235,7 +1241,9 @@ fn bridge_connecting(
     let stair_drive = std::sync::Arc::new(std::sync::Mutex::new(
         crate::view_native::input::StairDrive::default(),
     ));
-    commands.insert_resource(crate::view_native::input::StairDriveHandle(stair_drive.clone()));
+    commands.insert_resource(crate::view_native::input::StairDriveHandle(
+        stair_drive.clone(),
+    ));
     if let Ok(spec) = std::env::var("FFXI_STAIR_DRIVE") {
         let addr: std::net::SocketAddr = spec.parse().unwrap_or_else(|_| {
             let port: u16 = spec.trim_start_matches(':').parse().unwrap_or(9537);

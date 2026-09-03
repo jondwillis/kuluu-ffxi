@@ -5,7 +5,9 @@ use bevy::picking::Pickable;
 use bevy::prelude::*;
 use kuluu_snapshot::{EntityKind, EntityLook, Vec3 as WireVec3};
 
-use crate::components::{CurrRenderPos, IsSelf, LookComp, MorphIn, Nameplate, PrevRenderPos, WorldEntity};
+use crate::components::{
+    CurrRenderPos, IsSelf, LookComp, MorphIn, Nameplate, PrevRenderPos, WorldEntity,
+};
 use crate::graphics_settings::GraphicsSettings;
 use crate::snapshot::SceneState;
 
@@ -639,10 +641,9 @@ pub fn ensure_self_render_pos_system(
     mut commands: Commands,
 ) {
     for (e, t) in &q {
-        commands.entity(e).insert((
-            PrevRenderPos(t.translation),
-            CurrRenderPos(t.translation),
-        ));
+        commands
+            .entity(e)
+            .insert((PrevRenderPos(t.translation), CurrRenderPos(t.translation)));
     }
 }
 

@@ -54,7 +54,6 @@ pub mod particle_sim;
 pub mod perf_probe;
 pub mod picking;
 pub mod scene;
-pub mod wobble_trace;
 pub mod scheduler_runtime;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod skeleton_instance;
@@ -77,6 +76,7 @@ pub mod weather;
 pub mod weather_fx;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod weather_particles;
+pub mod wobble_trace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod zone_clouds;
 #[cfg(not(target_arch = "wasm32"))]

@@ -609,13 +609,13 @@ impl MzbCollisionGeometry {
         // so they sit ON the circle of `radius`, not outside it.
         let d = radius * std::f32::consts::FRAC_1_SQRT_2;
         let offsets: [Vec2; 8] = [
-            Vec2::new( radius,  0.0),
-            Vec2::new(-radius,  0.0),
-            Vec2::new( 0.0,  radius),
-            Vec2::new( 0.0, -radius),
-            Vec2::new( d,  d),
-            Vec2::new( d, -d),
-            Vec2::new(-d,  d),
+            Vec2::new(radius, 0.0),
+            Vec2::new(-radius, 0.0),
+            Vec2::new(0.0, radius),
+            Vec2::new(0.0, -radius),
+            Vec2::new(d, d),
+            Vec2::new(d, -d),
+            Vec2::new(-d, d),
             Vec2::new(-d, -d),
         ];
         let mut hits: Vec<f32> = offsets
@@ -641,7 +641,6 @@ impl MzbCollisionGeometry {
         }
         Some(kept.iter().sum::<f32>() / kept.len() as f32)
     }
-
 
     /// [`Self::ground_step`] with an escape hatch for a walker already beneath
     /// every floor in its column. Walking cannot reach that state — descent is
@@ -4773,14 +4772,17 @@ impl MzbCollisionGeometry {
                     ];
                     let fan_probe = |angle_rad: f32| -> Option<f32> {
                         let (sn, cs) = angle_rad.sin_cos();
-                        let probe_dir =
-                            Vec2::new(fan_dir.x * cs - fan_dir.y * sn, fan_dir.x * sn + fan_dir.y * cs);
+                        let probe_dir = Vec2::new(
+                            fan_dir.x * cs - fan_dir.y * sn,
+                            fan_dir.x * sn + fan_dir.y * cs,
+                        );
                         for r in FAN_RADII {
                             let probe_pos = p + probe_dir * r;
                             // A legal tread: a floor above our feet but within one
                             // step, that the capsule fits on (grazing the next riser
                             // is allowed; only tall geometry rejects).
-                            let Some(f0) = self.ground_raycast(probe_pos, feet + MAX_GROUND_STEP_UP)
+                            let Some(f0) =
+                                self.ground_raycast(probe_pos, feet + MAX_GROUND_STEP_UP)
                             else {
                                 continue;
                             };
@@ -4869,7 +4871,11 @@ impl MzbCollisionGeometry {
                         // direction perpendicular to both). In 2D that's the
                         // perpendicular of one normal, oriented downstream.
                         let crease = Vec2::new(-normals[i].y, normals[i].x);
-                        let crease = if crease.dot(rem) < 0.0 { -crease } else { crease };
+                        let crease = if crease.dot(rem) < 0.0 {
+                            -crease
+                        } else {
+                            crease
+                        };
                         // If the crease still points into plane j, it's a real
                         // dead-end pocket. Otherwise ride it.
                         if crease.dot(normals[j]) < -1e-3 {

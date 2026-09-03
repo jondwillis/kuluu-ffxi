@@ -22,17 +22,17 @@ pub mod item_screen;
 pub mod item_ui;
 pub mod logout_countdown;
 // Depends on `crate::minimap`, which is itself gated off wasm (lib.rs).
+pub mod graphics_debug;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod map_screen;
 pub mod menu;
 pub mod menu_help_bar;
 pub mod mesh_debug;
-pub mod stair_debug;
-pub mod graphics_debug;
 pub mod network_status;
 pub mod overlay;
 pub mod panel_column;
 pub mod quick_action;
+pub mod stair_debug;
 // (roster mockup deleted — real party/self HUD is party_frame.rs)
 pub mod party_frame;
 pub mod self_fishing;
@@ -477,10 +477,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
     // already at 20 above.
     app.add_systems(schedule.clone(), stair_debug::spawn_stair_debug_hud);
     app.add_systems(schedule.clone(), graphics_debug::spawn_graphics_debug_hud);
-    app.add_systems(
-        schedule.clone(),
-        graphics_debug::spawn_nameplate_debug_hud,
-    );
+    app.add_systems(schedule.clone(), graphics_debug::spawn_nameplate_debug_hud);
 
     #[cfg(feature = "enhanced-buff-tooltips")]
     app.add_systems(schedule.clone(), status_ribbon::tooltip::spawn_buff_tooltip);

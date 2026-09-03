@@ -129,11 +129,7 @@ mod tests {
     #[test]
     fn default_path_uses_player_facing_dir() {
         let path = AudioStore::default_path().unwrap();
-        assert!(
-            path.ends_with("kuluu/audio.json"),
-            "got {}",
-            path.display()
-        );
+        assert!(path.ends_with("kuluu/audio.json"), "got {}", path.display());
     }
 
     #[test]

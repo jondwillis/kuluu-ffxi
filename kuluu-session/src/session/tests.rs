@@ -172,18 +172,27 @@ fn far_carrier_snaps_in_steady_state_but_not_during_settle() {
     let stale = v(579.5, -305.1, -1.9); // an old-zone coordinate (>10 yalms away)
 
     assert!(
-        matches!(reconcile_self_pos(local, stale, false), SelfPosReconcile::Snap),
+        matches!(
+            reconcile_self_pos(local, stale, false),
+            SelfPosReconcile::Snap
+        ),
         "steady state: a far carrier snaps to the server"
     );
     assert!(
-        matches!(reconcile_self_pos(local, stale, true), SelfPosReconcile::KeepLocal),
+        matches!(
+            reconcile_self_pos(local, stale, true),
+            SelfPosReconcile::KeepLocal
+        ),
         "settle window: a far (out-of-order) carrier keeps our local seed"
     );
 
     // A close carrier is unaffected by the settle gate — it still keeps/rubber-bands.
     let near = v(-14.0, -132.8, -4.2); // ~1 yalm away
     assert!(
-        matches!(reconcile_self_pos(local, near, true), SelfPosReconcile::KeepLocal),
+        matches!(
+            reconcile_self_pos(local, near, true),
+            SelfPosReconcile::KeepLocal
+        ),
         "close carrier keeps local regardless of settle window"
     );
 }
@@ -618,10 +627,19 @@ fn should_emit_pos_bypasses_rate_limit_on_heading_change() {
 #[test]
 fn flood_drain_waits_for_self_pos_seed() {
     // Pre-GAMEOK drain (break_on_idle=false): keep reading until the seed lands.
-    assert!(!should_break_flood(false, false), "unseeded pre-GAMEOK drain must wait");
-    assert!(should_break_flood(false, true), "seeded pre-GAMEOK drain may break on idle");
+    assert!(
+        !should_break_flood(false, false),
+        "unseeded pre-GAMEOK drain must wait"
+    );
+    assert!(
+        should_break_flood(false, true),
+        "seeded pre-GAMEOK drain may break on idle"
+    );
     // Quiescence drains (break_on_idle=true): stop on idle regardless of seed.
-    assert!(should_break_flood(true, false), "quiescence drain breaks on idle unconditionally");
+    assert!(
+        should_break_flood(true, false),
+        "quiescence drain breaks on idle unconditionally"
+    );
 }
 
 #[test]
@@ -674,7 +692,10 @@ fn reconcile_self_pos_snap_above_10_yalms() {
     let local = v(0.0, 0.0, 0.0);
     let server = v(12.0, 5.0, 0.0);
     // Steady state (refuse_snap=false): a far carrier snaps to the server.
-    assert_eq!(reconcile_self_pos(local, server, false), SelfPosReconcile::Snap,);
+    assert_eq!(
+        reconcile_self_pos(local, server, false),
+        SelfPosReconcile::Snap,
+    );
 }
 
 #[test]

@@ -55,9 +55,9 @@ pub fn layout_panel_column_system(
         }
         let prev = last_seen.insert(*e, h);
         match prev {
-            None => heights.push(h),                       // first sighting
+            None => heights.push(h), // first sighting
             Some(p) if (p - h).abs() <= 0.5 => heights.push(h),
-            Some(_) => return,                             // unconfirmed: hold
+            Some(_) => return, // unconfirmed: hold
         }
     }
 

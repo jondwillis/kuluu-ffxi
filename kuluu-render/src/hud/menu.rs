@@ -1945,7 +1945,12 @@ mod tests {
             ..Default::default()
         };
         assert!(debug_panel_state(DEBUG_PERF, &panels, false, false));
-        assert!(!debug_panel_state(DEBUG_TARGET_CYCLE, &panels, false, false));
+        assert!(!debug_panel_state(
+            DEBUG_TARGET_CYCLE,
+            &panels,
+            false,
+            false
+        ));
         assert!(debug_panel_state(DEBUG_MESH, &panels, false, false));
         assert!(debug_panel_state(DEBUG_NOCLIP, &panels, false, false));
         assert!(debug_panel_state(DEBUG_NET_STATUS, &panels, true, false));
