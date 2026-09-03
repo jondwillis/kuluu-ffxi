@@ -842,8 +842,7 @@ fn spawn_member_row(
         .entities
         .iter()
         .find(|e| e.id == m.id)
-        .map(|e| activity_marker(&e.char_flags))
-        .flatten();
+        .and_then(|e| activity_marker(&e.char_flags));
 
     if is_l1 {
         spawn_row_l1(
@@ -1294,7 +1293,7 @@ fn dot_node(color: Color) -> (Node, BackgroundColor) {
 /// XIUI shortenZoneName over the resolved zone display name; falls back to a
 /// stable "Z{id}" placeholder when no name is known (spec §6.3).
 fn short_zone(zone_no: u16, resolver: Option<&crate::hud::zone_flash::ZoneNameResolver>) -> String {
-    let Some(name) = resolver.map(|r| r.0(zone_no)).flatten() else {
+    let Some(name) = resolver.and_then(|r| r.0(zone_no)) else {
         return format!("Z{zone_no}");
     };
     // Strip apostrophes.
@@ -1420,8 +1419,10 @@ mod tests {
         use kuluu_snapshot::CharFlags;
         let label = |f: &CharFlags| activity_marker(f).map(|(l, _)| l);
         assert!(label(&CharFlags::default()).is_none());
-        let mut f = CharFlags::default();
-        f.bazaar = true;
+        let mut f = CharFlags {
+            bazaar: true,
+            ..Default::default()
+        };
         assert_eq!(label(&f), Some("Baz"));
         f.lfg = true; // outranks bazaar
         assert_eq!(label(&f), Some("LFP"));

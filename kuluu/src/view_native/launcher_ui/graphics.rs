@@ -69,7 +69,7 @@ pub(super) struct GraphicsAdvancedOpen(pub bool);
 const ADVANCED_COLLAPSED: &str = "> Advanced - light tuning";
 const ADVANCED_EXPANDED: &str = "v Advanced - light tuning";
 
-/// A field row inside the "DLSS configuration" disclosure — the launcher's
+/// A field row inside the "DLSS configuration" disclosure -- the launcher's
 /// counterpart of the in-game DLSS Config submenu. Same show/hide treatment as
 /// [`AdvancedRow`], driven by [`redraw_dlss_visibility`].
 #[derive(Component)]
@@ -486,7 +486,7 @@ pub(super) fn redraw_advanced_visibility(
 }
 
 /// Show/hide the DLSS config rows and flip the `>`/`v` disclosure label when
-/// the user toggles the DLSS configuration row — the [`redraw_advanced_visibility`]
+/// the user toggles the DLSS configuration row -- the [`redraw_advanced_visibility`]
 /// twin for [`DlssRow`]/[`GraphicsDlssOpen`].
 pub(super) fn redraw_dlss_visibility(
     open: Res<GraphicsDlssOpen>,

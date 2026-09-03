@@ -318,10 +318,12 @@ pub fn build_operator_camera(
     // Depth texture is allocated per (target, msaa) with the OR of every view's usage on
     // that target (bevy core_3d prepare_core_3d_depth_textures), and re-created when MSAA
     // toggles — so this flag follows the current sample count for free.
-    let mut camera_3d = Camera3d::default();
-    camera_3d.depth_texture_usages = Camera3dDepthTextureUsage::from(
-        TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
-    );
+    let camera_3d = Camera3d {
+        depth_texture_usages: Camera3dDepthTextureUsage::from(
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        ),
+        ..default()
+    };
 
     let mut camera = commands.spawn((
         crate::components::InGameEntity,

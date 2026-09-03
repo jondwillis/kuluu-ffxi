@@ -552,7 +552,7 @@ fn ground_normal(sq: &SpatialQuery, center: Vec3, max: f32) -> Option<Vec3> {
         &ShapeCastConfig::from_max_distance(max),
         &SpatialQueryFilter::from_mask(ground_mask()),
     )?;
-    Some(hit.normal1.into())
+    Some(hit.normal1)
 }
 
 /// Multi-sampled walkability for a swept-step landing: center and +/- along
@@ -940,7 +940,7 @@ pub fn resolve_position(
                 // Sub-band lip: UP only (drops are ground-snap's job), CLOSE
                 // ahead only (step when we reach it, not from a yalm out).
                 let rise = oy - plane_y;
-                if along >= -0.2 && along <= 0.9 && rise > 0.02 && rise <= STEP_HEIGHT {
+                if (-0.2..=0.9).contains(&along) && rise > 0.02 && rise <= STEP_HEIGHT {
                     lip_h = lip_h.max(rise);
                 }
                 continue;
@@ -1249,7 +1249,7 @@ fn probe_hit(
         &ShapeCastConfig::from_max_distance(max),
         &SpatialQueryFilter::from_mask(mask),
     )?;
-    Some((hit.distance, hit.normal1.into()))
+    Some((hit.distance, hit.normal1))
 }
 
 /// move_and_slide that only treats WALLS as blocking. Any contact whose surface
@@ -1301,8 +1301,7 @@ fn slide_walls_only(
                     // depenetration artifact or degenerate trimesh contact
                     // returning garbage coords), it is NOT in front of us --
                     // ignore it instead of treating distant geometry as a wall.
-                    let pt: Vec3 =
-                        Vec3::new(hit.point.x as f32, hit.point.y as f32, hit.point.z as f32);
+                    let pt: Vec3 = Vec3::new(hit.point.x, hit.point.y, hit.point.z);
                     let reach = RADIUS + HALF + 0.5; // capsule reach + margin
                     let horiz = Vec2::new(pt.x - from.x, pt.z - from.z).length();
                     if horiz > reach {

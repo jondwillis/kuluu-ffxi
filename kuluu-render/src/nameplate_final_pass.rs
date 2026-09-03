@@ -485,20 +485,11 @@ impl Default for NameplateFrameSnap {
 
 /// Ring of the last two completed ticks for the panel: `prev` is the previous
 /// frame, `cur` fills during this tick and rotates on extract's start.
+#[derive(Default)]
 pub struct NameplatePassDebug {
     pub frame: u64,
     pub cur: NameplateFrameSnap,
     pub prev: NameplateFrameSnap,
-}
-
-impl Default for NameplatePassDebug {
-    fn default() -> Self {
-        Self {
-            frame: 0,
-            cur: NameplateFrameSnap::default(),
-            prev: NameplateFrameSnap::default(),
-        }
-    }
 }
 
 /// All-zero snapshot (the pass has not produced a tick yet) — const so the
@@ -897,7 +888,7 @@ fn draw_nameplate_final_pass(
             // Farthest plate (head of the blend order): where it lands in clip
             // space — ndc xy inside [-1, 1] with w > 0 means on screen.
             // glam has no Mat4*Vec3 — project with a w=1 Vec4.
-            let c = &clip * far.center.extend(1.0);
+            let c = clip * far.center.extend(1.0);
             dbg.cur.far_alpha = far.alpha;
             dbg.cur.far_w = c.w;
             if c.w != 0.0 {
@@ -1096,7 +1087,7 @@ mod tests {
         struct P(usize, Vec3);
         // World-space plate centers; under this view each maps to z_view = −x,
         // so x=50 is farthest (most-negative), x=1 nearest.
-        let mut plates = vec![
+        let mut plates = [
             P(0, Vec3::new(1.0, 0.0, 0.0)),  // view z -1   (nearest)
             P(1, Vec3::new(50.0, 0.0, 0.0)), // view z -50  (farthest)
             P(2, Vec3::new(20.0, 0.0, 0.0)), // view z -20

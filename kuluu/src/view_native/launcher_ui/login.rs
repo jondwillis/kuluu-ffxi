@@ -468,16 +468,15 @@ pub(super) fn keyboard_input_system(
             // Real keyboard Enter: submits whenever BOTH fields are filled,
             // regardless of which widget (if any) holds UI focus. The
             // per-field TextFieldSubmitted path only fires for a FOCUSED field
-            // and stays silent when the other side is still empty — that was
+            // and stays silent when the other side is still empty -- that was
             // the "pressing enter does nothing" dead end.
-            Key::Enter => {
+            Key::Enter
                 if version.violation != VersionViolation::BelowMinimum
                     && !form.user.is_empty()
-                    && !form.pass.is_empty()
-                {
-                    next.set(LauncherState::AuthInFlight);
-                    return;
-                }
+                    && !form.pass.is_empty() =>
+            {
+                next.set(LauncherState::AuthInFlight);
+                return;
             }
             _ => {}
         }
@@ -487,7 +486,7 @@ pub(super) fn keyboard_input_system(
 /// Initial keyboard focus for this screen: land on the `DefaultFocusTarget`
 /// widget once per spawned instance. The blue outline then starts on "Log in"
 /// instead of nowhere, so a bare Enter activates it right away (in addition to
-/// the global both-fields-filled handler). Tab can move away freely — we never
+/// the global both-fields-filled handler). Tab can move away freely -- we never
 /// steal focus back until a new screen instance appears (rebuild or re-entry).
 pub(super) fn focus_default_target_system(
     mut input_focus: ResMut<InputFocus>,
@@ -571,13 +570,13 @@ pub(super) fn arrow_nav_system(
             if along > 0.25 {
                 // Ahead of us: nearest in direction wins.
                 let score = along + cross * CROSS_W;
-                if best_forward.map_or(true, |(s, _)| score < s) {
+                if best_forward.is_none_or(|(s, _)| score < s) {
                     best_forward = Some((score, *e));
                 }
             } else if along < 0.0 {
                 // Behind us: wrap candidate. Farthest behind on this axis wins
                 // (top edge + Up jumps to the far row), misaligned loses.
-                if best_wrap.map_or(true, |(a, c, _)| (along, cross) < (a, c)) {
+                if best_wrap.is_none_or(|(a, c, _)| (along, cross) < (a, c)) {
                     best_wrap = Some((along, cross, *e));
                 }
             }

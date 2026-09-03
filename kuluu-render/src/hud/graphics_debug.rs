@@ -154,7 +154,7 @@ pub fn graphics_debug_metrics_system(
             while history.len() > 500 {
                 history.pop_front();
             }
-            if *frame % 30 == 0 {
+            if (*frame).is_multiple_of(30) {
                 let mut out = String::with_capacity(history.len() * 48 + 40);
                 out.push_str("frame\tcenter_x\tcenter_y\tw\th\n");
                 for (f, x, y, w, h) in history.iter() {

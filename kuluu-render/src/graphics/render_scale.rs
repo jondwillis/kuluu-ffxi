@@ -448,7 +448,7 @@ fn snap_window_to_even_system(
         // Max), rendering and UI layout see 2560x1368 instead of 2560x1369,
         // and the 1px dead row is invisible. Cleared when dimensions are
         // already even.
-        let want_viewport = (even != p).then(|| bevy::camera::Viewport {
+        let want_viewport = (even != p).then_some(bevy::camera::Viewport {
             physical_position: UVec2::ZERO,
             physical_size: even,
             depth: 0.0..1.0,

@@ -1663,9 +1663,9 @@ pub fn detect_stairs(
     // 12 bearings at 30° spacing (was 8 at 45°). Finer angular resolution
     // for detecting stair direction; generated procedurally.
     let mut bearings: [bevy::math::Vec2; RING_SAMPLES] = [bevy::math::Vec2::ZERO; RING_SAMPLES];
-    for i in 0..RING_SAMPLES {
+    for (i, b) in bearings.iter_mut().enumerate() {
         let angle = (i as f32) * std::f32::consts::TAU / (RING_SAMPLES as f32);
-        bearings[i] = bevy::math::Vec2::new(angle.cos(), angle.sin());
+        *b = bevy::math::Vec2::new(angle.cos(), angle.sin());
     }
 
     // Sample all three rings. Store as [ring][bearing] = (world xz, y).
@@ -1907,8 +1907,7 @@ pub fn detect_stairs(
     // for that bearing, in ring order. NaN = ring slot invalid on this
     // bearing. Used by the per-bearing slope fits below.
     let mut valid_by_bearing: [[f32; 5]; RING_SAMPLES] = [[f32::NAN; 5]; RING_SAMPLES];
-    for k in 0..valid_count {
-        let (ri, bi, _xz, y, _b) = valid_samples[k];
+    for &(ri, bi, _xz, y, _b) in valid_samples.iter().take(valid_count) {
         valid_by_bearing[bi][ri] = y;
     }
 
@@ -2003,8 +2002,7 @@ pub fn detect_stairs(
         // Skip same-tread (band == 0 but green) samples too — they anchor at
         // 0-slope and pull the fit shallow on landings; only actual banded
         // stair samples feed the slope.
-        for k in 0..valid_count {
-            let (_ri, _bi, xz, y, band) = valid_samples[k];
+        for &(_ri, _bi, xz, y, band) in valid_samples.iter().take(valid_count) {
             if band == 0 {
                 continue;
             } // same-tread, skip for slope
@@ -2027,14 +2025,14 @@ pub fn detect_stairs(
         // (with sign flipped on their distance). Same-tread filter applies:
         // a probe that lands on the character's landing doesn't reveal
         // staircase shape.
-        for i in 0..11usize {
+        for (i, slot) in fwd_probes_dbg.iter_mut().enumerate() {
             let dist = -5.0 + i as f32;
             if dist.abs() < 0.5 {
                 continue;
             }
             let probe_xz = center_xz + up_dir * dist;
             let y = collision.ground_raycast(probe_xz, center_y_raw + 2.0);
-            fwd_probes_dbg[i] = (probe_xz, y.unwrap_or(f32::NAN));
+            *slot = (probe_xz, y.unwrap_or(f32::NAN));
             if let Some(y) = y {
                 if same_tread(y) {
                     continue;
@@ -2145,8 +2143,8 @@ pub fn detect_stairs(
     // Detect a descent: any validated sample with a down-band. Reads only
     // from the validated dataset.
     let mut down_drop_detected = false;
-    for k in 0..valid_count {
-        if valid_samples[k].4 < 0 {
+    for s in valid_samples.iter().take(valid_count) {
+        if s.4 < 0 {
             down_drop_detected = true;
             break;
         }
@@ -2154,8 +2152,7 @@ pub fn detect_stairs(
     // Direction of the descent — weighted sum of DOWN-BAND sample bearings
     // from the validated dataset. Weight by band depth (|band| ∈ 1..=5).
     let mut descent_dir = bevy::math::Vec2::ZERO;
-    for k in 0..valid_count {
-        let (_ri, _bi, xz, _y, band) = valid_samples[k];
+    for &(_ri, _bi, xz, _y, band) in valid_samples.iter().take(valid_count) {
         if band >= 0 {
             continue;
         }
@@ -2220,8 +2217,8 @@ pub fn detect_stairs(
             // sample red. Break the march: we can't chain further out through
             // bad ground.
             let mut near_red = false;
-            for k in 0..red_count {
-                if probe_xz.distance_squared(red_xz[k]) < RED_PROX * RED_PROX {
+            for r in red_xz.iter().take(red_count) {
+                if probe_xz.distance_squared(*r) < RED_PROX * RED_PROX {
                     near_red = true;
                     break;
                 }
@@ -2245,7 +2242,7 @@ pub fn detect_stairs(
             }
             // Cumulative drop from the current tread level.
             let tread_drop = current_tread_y - y; // positive = below tread
-            if tread_drop >= RISER_MIN && tread_drop <= RISER_MAX {
+            if (RISER_MIN..=RISER_MAX).contains(&tread_drop) {
                 // Found a full riser: the ground settled one measured step
                 // below the tread we were on. Record it AND its true Y and
                 // treat this as the new tread.
@@ -2336,8 +2333,8 @@ pub fn detect_stairs(
     let mut up_first_riser_y: f32 = 0.0;
     let mut up_last_riser_y: f32 = 0.0;
     let mut up_rise_detected = false;
-    for k in 0..valid_count {
-        if valid_samples[k].4 > 0 {
+    for s in valid_samples.iter().take(valid_count) {
+        if s.4 > 0 {
             up_rise_detected = true;
             break;
         }
@@ -2345,8 +2342,7 @@ pub fn detect_stairs(
     // Direction of the ascent — weighted sum of UP-BAND sample bearings from
     // the validated dataset. Weight by band height (|band| ∈ 1..=5).
     let mut ascent_dir = bevy::math::Vec2::ZERO;
-    for k in 0..valid_count {
-        let (_ri, _bi, xz, _y, band) = valid_samples[k];
+    for &(_ri, _bi, xz, _y, band) in valid_samples.iter().take(valid_count) {
         if band <= 0 {
             continue;
         }
@@ -2403,8 +2399,8 @@ pub fn detect_stairs(
             let along = STEP * i as f32;
             let probe_xz = center_xz + up_march_dir * along;
             let mut near_red = false;
-            for k in 0..red_count {
-                if probe_xz.distance_squared(red_xz[k]) < RED_PROX * RED_PROX {
+            for r in red_xz.iter().take(red_count) {
+                if probe_xz.distance_squared(*r) < RED_PROX * RED_PROX {
                     near_red = true;
                     break;
                 }
@@ -2434,7 +2430,7 @@ pub fn detect_stairs(
             }
             // Cumulative rise from the current tread level.
             let tread_rise = y - current_tread_y; // positive = above tread
-            if tread_rise >= RISER_MIN && tread_rise <= RISER_MAX {
+            if (RISER_MIN..=RISER_MAX).contains(&tread_rise) {
                 if up_riser_count < 5 {
                     if up_riser_count == 0 {
                         up_first_riser_y = y;
@@ -3946,7 +3942,9 @@ pub async fn serve_stair_drive(
             let w = v.get("w").and_then(|x| x.as_f64());
             if (f, s, t, c) == (0, 0, 0, 0) && ms == 0 {
                 // Clear: expire the hold immediately.
-                drive.lock().ok().map(|mut d| d.until = None);
+                if let Ok(mut d) = drive.lock() {
+                    d.until = None;
+                }
             } else {
                 if let Ok(mut d) = drive.lock() {
                     d.f = f as i32;
@@ -3957,10 +3955,9 @@ pub async fn serve_stair_drive(
                 }
             }
             if let Some(target) = w {
-                drive
-                    .lock()
-                    .ok()
-                    .map(|mut d| d.yaw_warp = Some(target as f32));
+                if let Ok(mut d) = drive.lock() {
+                    d.yaw_warp = Some(target as f32);
+                }
             }
         }
     }
@@ -4033,7 +4030,7 @@ pub fn stair_capture_system(
     };
 
     let line = format!(
-        "{{\"tick\":{},\"t_ms\":{},{},\"wx\":{:.9e},\"wy\":{:.9e},\"wz\":{:.9e},\
+        "{{\"tick\":{},\"t_ms\":{},\"cyaw\":{:.9e},\"wx\":{:.9e},\"wy\":{:.9e},\"wz\":{:.9e},\
          \"rx\":{:.9e},\"ry\":{:.9e},\"rz\":{:.9e},\"heading\":{},\
          \"lock\":{},\"slope\":{},\"streak\":{},\
          \"pslope\":{},\"pslope_up\":{},\"dir\":\"{}\",\
@@ -4044,7 +4041,7 @@ pub fn stair_capture_system(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
-        format!("\"cyaw\":{:.9e}", camera.yaw),
+        camera.yaw,
         wire.x,
         wire.y,
         wire.z,

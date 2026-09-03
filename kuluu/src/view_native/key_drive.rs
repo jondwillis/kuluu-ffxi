@@ -235,13 +235,7 @@ fn write_state(
 fn write_tap(events: &mut MessageWriter<KeyboardInput>, window: Entity, name: &str) {
     match KeyMsg::resolve(name) {
         Some(pair) => {
-            write_state(
-                events,
-                window,
-                pair.0.clone(),
-                pair.1.clone(),
-                ButtonState::Pressed,
-            );
+            write_state(events, window, pair.0, pair.1.clone(), ButtonState::Pressed);
             write_state(events, window, pair.0, pair.1, ButtonState::Released);
         }
         None => tracing::warn!(%name, "FFXI_KEY_DRIVE: unknown key name"),
@@ -304,10 +298,10 @@ mod tests {
 
     #[test]
     fn unknown_lines_rejected() {
-        // matches! (not assert_eq!(.., None)): rkyv's cross-type PartialEq
+        // is_none() (not assert_eq!(.., None)): rkyv's cross-type PartialEq
         // impls (via ffxi-nav-recast) break bare-None inference in assert_eq!
-        assert!(matches!(KeyMsg::from_json_line("not json"), None));
-        assert!(matches!(KeyMsg::from_json_line(r#"{"foo":1}"#), None));
+        assert!(KeyMsg::from_json_line("not json").is_none());
+        assert!(KeyMsg::from_json_line(r#"{"foo":1}"#).is_none());
     }
 
     #[test]
