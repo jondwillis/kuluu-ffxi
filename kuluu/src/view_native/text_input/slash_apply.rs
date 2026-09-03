@@ -36,7 +36,7 @@ pub(super) fn apply_slash_outcome(
     bindings: &mut Bindings,
     keybinds_state: &mut KeybindsStateRes,
     #[cfg(unix)] agent_paused: Option<&crate::view_native::AgentPaused>,
-    _session_event_tx: Option<&crate::view_native::SessionEventTx>,
+    #[cfg(unix)] session_event_tx: Option<&crate::view_native::SessionEventTx>,
     slash_writers: &mut SlashWriters,
     draw_distance: &mut kuluu_render::dat_mzb::DrawDistance,
 ) {
@@ -93,7 +93,10 @@ pub(super) fn apply_slash_outcome(
         }
         SlashOutcome::QuitWithLogout(kind) => {
             // TEMP (exit-hunt): identify which close path fired.
-            tracing::info!(?kind, "TEMP slash_apply.rs: SlashOutcome::QuitWithLogout -> AppExit");
+            tracing::info!(
+                ?kind,
+                "TEMP slash_apply.rs: SlashOutcome::QuitWithLogout -> AppExit"
+            );
             let req = AgentCommand::ReqLogout { kind };
             if let Some(toast) = reqlogout_ack_text(&req) {
                 push_system_chat_line(scene_state, toast.into());
@@ -967,6 +970,7 @@ fn apply_agent_control(
     session_event_tx: Option<&crate::view_native::SessionEventTx>,
     scene_state: &mut SceneState,
 ) {
+    use crate::state::AgentEvent;
     use crate::view_native::slash_commands::AgentControlOp;
     use std::sync::atomic::Ordering;
     let Some(paused) = agent_paused else {

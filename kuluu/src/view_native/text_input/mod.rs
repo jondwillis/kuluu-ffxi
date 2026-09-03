@@ -796,6 +796,7 @@ fn apply_chat_action(
                     keybinds_state,
                     #[cfg(unix)]
                     agent_paused,
+                    #[cfg(unix)]
                     session_event_tx,
                     slash_writers,
                     draw_distance,
