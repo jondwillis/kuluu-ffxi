@@ -1477,6 +1477,7 @@ mod tests {
             .init_resource::<crate::hud::HudPanels>()
             .init_resource::<NetStatusVisible>()
             .init_resource::<SceneState>()
+            .init_resource::<crate::audio::AudioMuteState>()
             .init_resource::<DynamicMenu>();
 
         let mut stack = MenuStack::root();

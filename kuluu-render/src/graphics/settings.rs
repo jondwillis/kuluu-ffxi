@@ -2381,13 +2381,13 @@ mod tests {
         };
         s.cycle(GraphicsField::Dlss, 1);
         s.cycle(GraphicsField::DlssQuality, 1);
-        assert_eq!(s.dlss_quality, DlssQuality::Quality);
+        assert_eq!(s.dlss_quality, DlssQuality::Dlaa);
 
         // Presets never own DLSS: cycling a preset keeps on-state, tier, and
         // capability.
         s.cycle(GraphicsField::Preset, 1);
         assert!(s.dlss_active(), "preset cycle kept DLSS on");
-        assert_eq!(s.dlss_quality, DlssQuality::Quality);
+        assert_eq!(s.dlss_quality, DlssQuality::Dlaa);
         assert!(s.dlss_supported);
 
         // DLSS Config reset touches only the tier.
