@@ -197,6 +197,7 @@ impl PosHead {
 /// (research/XIClient/.../ActorTelemetry.cpp `NameColorSet`) and the icon
 /// markers prefixed to the name
 /// (research/XIClient/.../ActorTelemetry.cpp `GetPrimaryActorNameMarker`).
+/// `untargetable` is the targetability authority, not a nameplate concern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CharFlags {
     pub monster: bool,
@@ -231,6 +232,15 @@ pub struct CharFlags {
 
     pub new_character: bool,
     pub mentor: bool,
+
+    /// `Flags1.TargetOffFlag` (bit 19): the server's untargetable bit. For
+    /// NPC/MOB/PET/TRUST that word carries `m_flags` — LSB writes it at
+    /// `ref<uint32>(0x21)` under UPDATE_HP, so ENTITYFLAGS
+    /// `FLAG_UNTARGETABLE = 0x800` (vendor/server/src/map/entities/baseentity.h)
+    /// lands exactly on this bit; for CHAR_PC it is char_update's explicit
+    /// "Untargetable player" field. vendor/server/src/map/packets/
+    /// entity_update.cpp `flags1_t`, char_update.cpp:312.
+    pub untargetable: bool,
 }
 
 impl CharFlags {
@@ -261,6 +271,7 @@ impl CharFlags {
             allegiance: field(f3, flags3::BALLISTA_TEAM, flags3::BALLISTA_TEAM_BITS) as u8,
             new_character: bit(f3, flags3::NEW_CHARACTER),
             mentor: bit(f3, flags3::MENTOR),
+            untargetable: bit(f1, flags1::TARGET_OFF),
         }
     }
 }
@@ -286,6 +297,11 @@ mod flags1 {
     pub const GM_LEVEL: u32 = 24;
     pub const GM_LEVEL_BITS: u32 = 3;
     pub const BAZAAR: u32 = 31;
+    /// `TargetOffFlag` — bit 19 in both char_update.cpp and entity_update.cpp
+    /// `flags1_t`. For NPC/MOB this is where `m_flags & FLAG_UNTARGETABLE`
+    /// (0x800) lands: LSB writes the u16 at upstream offset 0x21, i.e. bytes
+    /// 1-2 of this word.
+    pub const TARGET_OFF: u32 = 19;
 }
 
 // vendor/server/src/map/packets/char_update.cpp `flags2_t`
@@ -769,7 +785,7 @@ mod char_flags_tests {
     /// one field only. Catches a shift that silently aliases a neighbour.
     #[test]
     fn each_flag1_bit_is_isolated() {
-        let probes: [FlagProbe; 9] = [
+        let probes: [FlagProbe; 10] = [
             (flags1::MONSTER, |f| f.monster),
             (flags1::LFG, |f| f.lfg),
             (flags1::ANONYMOUS, |f| f.anonymous),
@@ -778,6 +794,7 @@ mod char_flags_tests {
             (flags1::PLAY_ONLINE, |f| f.play_online),
             (flags1::LINKSHELL, |f| f.linkshell),
             (flags1::LINKDEAD, |f| f.linkdead),
+            (flags1::TARGET_OFF, |f| f.untargetable),
             (flags1::BAZAAR, |f| f.bazaar),
         ];
         for (shift, get) in probes {
@@ -790,6 +807,36 @@ mod char_flags_tests {
                 .count();
             assert_eq!(others, 0, "flags1 bit {shift} bled into another field");
             assert_eq!(flags.gm_level, 0, "flags1 bit {shift} bled into GmLevel");
+        }
+    }
+
+    /// Pins the byte mapping against LSB's write site: for NPC/MOB the
+    /// `m_flags` u16 is written at upstream offset 0x21 — four bytes before our
+    /// body base, i.e. our 0x1D — so ENTITYFLAGS bit N lands on flags1 word bit
+    /// N+8. FLAG_UNTARGETABLE (0x800) must therefore light `untargetable` and
+    /// nothing else.
+    #[test]
+    fn mob_m_flags_untargetable_lands_on_target_off() {
+        let mut body = vec![0u8; PosHead::SIZE];
+        // vendor/server/src/map/packets/entity_update.cpp:348/:387
+        // `ref<uint32>(0x21) = m_flags` under UPDATE_HP.
+        const M_FLAGS_OFFSET: usize = 0x1D;
+        body[M_FLAGS_OFFSET..M_FLAGS_OFFSET + 4].copy_from_slice(&0x800u32.to_le_bytes());
+        let flags = CharFlags::from_pos_head(&PosHead::decode(&body).unwrap());
+        assert!(
+            flags.untargetable,
+            "FLAG_UNTARGETABLE did not light TargetOffFlag"
+        );
+        // The neighbouring ENTITYFLAGS bits (HIDE_NAME 0x8, CALL_FOR_HELP 0x20,
+        // HIDE_MODEL 0x80, HIDE_HP 0x100) must not bleed into any decoded field.
+        for m_flags in [0x008u32, 0x020, 0x080, 0x100] {
+            let mut body = vec![0u8; PosHead::SIZE];
+            body[M_FLAGS_OFFSET..M_FLAGS_OFFSET + 4].copy_from_slice(&m_flags.to_le_bytes());
+            let flags = CharFlags::from_pos_head(&PosHead::decode(&body).unwrap());
+            assert!(
+                !flags.untargetable,
+                "m_flags {m_flags:#x} bled into untargetable"
+            );
         }
     }
 

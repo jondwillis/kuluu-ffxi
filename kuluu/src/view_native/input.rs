@@ -20,11 +20,21 @@ pub struct MoveEnvParams<'w> {
     // mob-pathing mesh that flattens stairs, so it is NOT used here — only for
     // /pathto and minimap culling (kuluu-oe8y; see AGENTS.md).
     pub collision: Res<'w, kuluu_render::dat_mzb::MzbCollisionGeometry>,
+    /// Dynamic obstacles rebuilt every fixed tick before dispatch (plan §2.5):
+    /// closed door leaves (walls + floors) and mob circles. Bundled here — this
+    /// fn sits at bevy's 16-param SystemParam ceiling.
+    pub obstacles: Res<'w, super::walker::obstacles::ObstacleSet>,
+    /// Debug noclip: when on, the wall clamp in dispatch_movement is bypassed
+    /// (grounding stays on). Toggled from the Debug menu NoClip row or /noclip.
+    pub hud_panels: Res<'w, kuluu_render::hud::HudPanels>,
     pub minimap_hover: Res<'w, kuluu_render::minimap::input::MinimapHoverGate>,
     pub pointer: Res<'w, kuluu_render::MousePointer>,
     pub pad: Res<'w, super::gamepad_input::PadStickIntent>,
     // Focus-less GUI driving (kuluu-0pof): remote movement injection.
-    pub debug_ctrl: Option<Res<'w, super::DebugControlHandle>>,
+    pub(crate) debug_ctrl: Option<Res<'w, super::DebugControlHandle>>,
+    // Stair-capture drive channel (FFXI_STAIR_DRIVE): forward/strafe holds plus
+    // a Q/E-style turn axis for the external driver. None unless wired at connect.
+    pub stair_drive: Option<Res<'w, StairDriveHandle>>,
 }
 
 /// Rising-edge memory for the pad stick, standing in for `just_pressed` where
@@ -33,6 +43,23 @@ pub struct MoveEnvParams<'w> {
 pub struct PadEdges {
     move_active: bool,
     back_active: bool,
+}
+
+/// Bundled per-tick locals for [`dispatch_movement_system`]. Kept as a
+/// single `Local<DispatchLocals>` because bevy's `SystemParam` derive tops
+/// out at 16 params per system and this fn was already at the ceiling.
+#[derive(Default)]
+pub struct DispatchLocals {
+    /// Latched world-space run heading for pure W/S: (forward sign, motion
+    /// heading). Sampled from the camera frame when the key state changes,
+    /// then held fixed so the camera's auto-recenter can swing behind
+    /// without dragging the run direction with it.
+    pub steer_latch: Option<(i32, u8)>,
+    /// Rising-edge memory for pad stick just_pressed emulation.
+    pub pad_edges: PadEdges,
+    /// Cross-tick walker state (modes, push-through accrual, fall velocity);
+    /// the stub is stateless until the real step lands.
+    pub walker: super::walker::Walker,
 }
 
 #[derive(SystemParam)]
@@ -64,7 +91,7 @@ use kuluu_render::{
 use kuluu_snapshot::{Entity as WireEntity, EntityKind, Vec3 as WireVec3};
 use tokio::sync::mpsc;
 
-use crate::state::{ActionKind, AgentCommand, FishingInput};
+use kuluu_session::state::{ActionKind, AgentCommand, FishingInput};
 
 // Matches the retail first-person A/D view-rotate rate (HorizonXI video
 // 2026-07-20: ~71 heading-units over a 2s hold ≈ 0.87 rad/s).
@@ -480,7 +507,7 @@ pub fn handle_input_system(
 
             RestKind::Heal => {
                 let _ = cmd_tx.0.try_send(AgentCommand::Heal {
-                    mode: crate::state::HealMode::Off,
+                    mode: kuluu_session::state::HealMode::Off,
                 });
                 RestKind::None
             }
@@ -540,9 +567,9 @@ pub fn handle_input_system(
 fn toggle_heal(rest_stance: &mut kuluu_render::combat_stance::RestStance, cmd_tx: &CommandTx) {
     use kuluu_render::combat_stance::RestKind;
     let (next_kind, wire_mode) = match rest_stance.kind {
-        RestKind::Heal => (RestKind::None, crate::state::HealMode::Off),
+        RestKind::Heal => (RestKind::None, kuluu_session::state::HealMode::Off),
 
-        _ => (RestKind::Heal, crate::state::HealMode::On),
+        _ => (RestKind::Heal, kuluu_session::state::HealMode::On),
     };
     let _ = cmd_tx.0.try_send(AgentCommand::Heal { mode: wire_mode });
     rest_stance.kind = next_kind;
@@ -619,16 +646,17 @@ pub fn dispatch_movement_system(
     mut autorun: ResMut<AutoRun>,
     mut chase: ResMut<ChaseCamera>,
     mut turn_accum: ResMut<HeadingTurnAccum>,
-    // Latched world-space run heading for pure W/S: (forward sign, motion heading).
-    // Sampled from the camera frame when the key state changes, then held fixed so
-    // the camera's auto-recenter can swing behind without dragging the run
-    // direction with it (S would otherwise chase a target that stays 180° away —
-    // the sideways-circle bug from the 2026-07-20 10.19 recording).
-    mut steer_latch: Local<Option<(i32, u8)>>,
-    mut pad_edges: Local<PadEdges>,
+    // Bundled per-tick locals (steer_latch + pad_edges + walker state) so this
+    // fn stays under bevy's 16-param SystemParam ceiling. See `DispatchLocals`
+    // for the field-level docs the individual `Local`s used to carry.
+    mut locals: Local<DispatchLocals>,
     mut prediction: ResMut<LocalPlayerPrediction>,
     env: MoveEnvParams,
     mut stance: StanceParams,
+    // Ramp-field debug record (plan §4 step 2): the gizmo and snapshot systems
+    // read what this tick's walker::step saw. At bevy's 16-param ceiling; a new
+    // param here must bundle into an existing SystemParam struct.
+    mut field_dbg: ResMut<super::walker::debug::FieldDebug>,
 ) {
     let rest_stance = &mut stance.rest_stance;
     let walk_mode = &stance.walk_mode;
@@ -662,11 +690,11 @@ pub fn dispatch_movement_system(
     // menu is open (menus are the d-pad's domain, not the sticks').
     let pad_move = env.pad.movement;
     let pad_cam = env.pad.camera;
-    let pad_move_started = pad_move != Vec2::ZERO && !pad_edges.move_active;
-    pad_edges.move_active = pad_move != Vec2::ZERO;
+    let pad_move_started = pad_move != Vec2::ZERO && !locals.pad_edges.move_active;
+    locals.pad_edges.move_active = pad_move != Vec2::ZERO;
     let pad_back = pad_move.y < -PAD_BACK_CANCEL_DEFLECTION;
-    let pad_back_started = pad_back && !pad_edges.back_active;
-    pad_edges.back_active = pad_back;
+    let pad_back_started = pad_back && !locals.pad_edges.back_active;
+    locals.pad_edges.back_active = pad_back;
 
     let mut pitch_d = 0.0;
     if !in_picker && bindings.pressed(Action::CameraPitchUp, keys) {
@@ -706,6 +734,14 @@ pub fn dispatch_movement_system(
         if bindings.pressed(Action::CameraZoomOut, keys) {
             zoom_d += step;
         }
+        // PgUp/PgDn drive the same chase zoom: Action::PageUp/PageDown are bound to those
+        // keys in every preset and were previously unconsumed.
+        if bindings.pressed(Action::PageUp, keys) {
+            zoom_d -= step;
+        }
+        if bindings.pressed(Action::PageDown, keys) {
+            zoom_d += step;
+        }
         if zoom_d != 0.0 {
             chase.distance =
                 (chase.distance + zoom_d).clamp(ChaseCamera::DIST_MIN, ChaseCamera::DIST_MAX);
@@ -735,7 +771,7 @@ pub fn dispatch_movement_system(
         if pressed_move {
             if matches!(rest_stance.kind, RestKind::Heal) {
                 let _ = cmd_tx.0.try_send(AgentCommand::Heal {
-                    mode: crate::state::HealMode::Off,
+                    mode: kuluu_session::state::HealMode::Off,
                 });
             }
             rest_stance.begin_exit();
@@ -782,7 +818,7 @@ pub fn dispatch_movement_system(
     let locked = lock_on.target_id.is_some();
     let first_person = matches!(*camera_mode, CameraMode::FirstPerson);
 
-    let resolved = resolve_move_inputs(
+    let mut resolved = resolve_move_inputs(
         bindings.pressed(Action::MoveForward, keys),
         bindings.pressed(Action::MoveBackward, keys),
         bindings.pressed(Action::TurnLeft, keys),
@@ -806,6 +842,21 @@ pub fn dispatch_movement_system(
                 strafe = s;
             }
         }
+    }
+    // Stair-capture drive channel (FFXI_STAIR_DRIVE): remote holds fold into the
+    // real input pipeline exactly like held WASD/Q/E keys — steer-latch, heading
+    // carve and re-ground all see them as normal movement. The one-shot `w` warp
+    // is applied to chase.yaw in the yaw section below (exact aim, no timed pan).
+    let drive_axes = env
+        .stair_drive
+        .as_ref()
+        .and_then(|h| h.0.lock().ok())
+        .and_then(|d| d.active());
+    let drive_c = drive_axes.map(|a| a.3).unwrap_or(0);
+    if let Some((df, ds, dt, _dc)) = drive_axes {
+        forward = df;
+        strafe = ds;
+        resolved.rotate_dir += dt;
     }
     // Pad-vs-keyboard analog resolution is retail's larger-magnitude rule
     // (pick_mag). `pf`/`ps` keep the stick's direction ratio for the
@@ -842,14 +893,20 @@ pub fn dispatch_movement_system(
         || bindings.pressed(Action::CameraYawRight, keys)
         || pad_cam.x != 0.0
         || env.pointer.left
-        || env.pointer.right;
+        || env.pointer.right
+        || drive_c != 0;
     // A/D carve, Q/E rotate, and camera panning recompute the run direction
     // against the live camera every frame; anything else holds the latch.
     if !steer_in_chase || ps != 0.0 || resolved.rotate_dir != 0 || camera_panning {
-        *steer_latch = None;
+        locals.steer_latch = None;
     }
 
     let self_pos = state.snapshot.self_pos;
+
+    // The one speed variable (yalms/s): paces the horizontal step and every
+    // vertical move inside the step band (walk mode merges slower than run).
+    let speed_yps =
+        move_speed_yps(self_pos.speed, state.snapshot.self_mount.is_some()) * walk_mode.scale();
 
     let self_present = state
         .snapshot
@@ -897,9 +954,9 @@ pub fn dispatch_movement_system(
             .iter()
             .find(|e| e.id == id)
             .map(|ent| {
-                let stop = crate::state::MODEL_RADIUS_PC
+                let stop = kuluu_session::state::MODEL_RADIUS_PC
                     + radius_for_wire_kind(ent.kind)
-                    + crate::state::CONTACT_GAP;
+                    + kuluu_session::state::CONTACT_GAP;
                 forward_allowance((basis_pos.x, basis_pos.y), (ent.pos.x, ent.pos.y), stop)
             })
     });
@@ -909,6 +966,20 @@ pub fn dispatch_movement_system(
     // included). In chase mode the camera instead trails via auto-recenter.
     if player_rotate_u8 != 0 && first_person {
         chase.yaw -= heading_delta_units * std::f32::consts::TAU / 256.0;
+    }
+
+    // Stair-capture drive camera axes: remote pan at the key yaw rate, plus a
+    // one-shot exact warp (the "cheat": snap instead of timed presses fighting
+    // latency). Runs before the idle early-return so aiming works while stopped.
+    if drive_c != 0 {
+        chase.yaw += drive_c as f32 * CAMERA_YAW_RATE * time.delta_secs();
+    }
+    if let Some(handle) = env.stair_drive.as_ref() {
+        if let Ok(mut d) = handle.0.lock() {
+            if let Some(target) = d.take_warp() {
+                chase.yaw += wrap_signed_pi(target - chase.yaw);
+            }
+        }
     }
 
     if forward == 0 && strafe == 0 && player_rotate_u8 == 0 && !steer_in_chase {
@@ -924,6 +995,41 @@ pub fn dispatch_movement_system(
                 });
             }
         }
+        // Idle tick: no horizontal move, but the walker still runs its vertical
+        // step (settle onto the floor under the feet). Send a Move only when z
+        // actually changed — session emits POS on its own 100 ms cadence anyway.
+        let res = super::walker::step(
+            &env.collision,
+            &env.obstacles,
+            &mut locals.walker,
+            basis_pos.x,
+            basis_pos.y,
+            basis_pos.z,
+            0.0,
+            0.0,
+            speed_yps,
+            time.delta_secs(),
+            env.hud_panels.noclip,
+        );
+        super::walker::debug::record_tick(
+            &mut field_dbg,
+            &env.collision,
+            basis_pos.x,
+            basis_pos.y,
+            res.feet_z,
+            self_pos.heading,
+            speed_yps,
+            &res,
+        );
+        if (res.feet_z - basis_pos.z).abs() > 1e-3 {
+            let _ = cmd_tx.0.try_send(AgentCommand::Move {
+                x: basis_pos.x,
+                y: basis_pos.y,
+                z: res.feet_z,
+                heading: self_pos.heading,
+            });
+        }
+        prediction.pos = Vec3::new(basis_pos.x, basis_pos.y, res.feet_z);
         return;
     }
 
@@ -951,9 +1057,7 @@ pub fn dispatch_movement_system(
         heading = heading_for_yaw(chase.yaw);
     }
 
-    let raw_step = move_speed_yps(self_pos.speed, state.snapshot.self_mount.is_some())
-        * time.delta_secs()
-        * walk_mode.scale();
+    let raw_step = speed_yps * time.delta_secs();
 
     let mut turn_dx: f32 = 0.0;
     let mut turn_dy: f32 = 0.0;
@@ -964,11 +1068,11 @@ pub fn dispatch_movement_system(
             camera_relative_motion_heading(camera_forward_h, pf, ps)
         } else {
             let pf_sign = if pf > 0.0 { 1 } else { -1 };
-            match *steer_latch {
+            match locals.steer_latch {
                 Some((f, h)) if f == pf_sign => h,
                 _ => {
                     let h = camera_relative_motion_heading(camera_forward_h, pf_sign as f32, 0.0);
-                    *steer_latch = Some((pf_sign, h));
+                    locals.steer_latch = Some((pf_sign, h));
                     h
                 }
             }
@@ -1043,37 +1147,44 @@ pub fn dispatch_movement_system(
         y += right_y * step * strafe as f32;
     }
 
-    // Ground height on the MZB zone collision — the retail `.dat` floor, which
-    // has the stairs and ramps the coarse LSB pathing navmesh flattens away
-    // (kuluu-oe8y). `ground_step` picks the up-facing floor closest to our feet
-    // that we could climb to, so a stair step climbs (nearest floor is the next
-    // step) and a stacked column (Bastok Markets' walkway over its canal)
-    // resolves to the level we're on rather than teleporting to another layer.
-    // MZB collision is in Bevy space (bevy.x = ffxi.x, bevy.z = -ffxi.y,
-    // bevy.y = -ffxi.z).
-    //
-    // The step-up bound is what keeps a gap in the floor from launching us: with
-    // it unbounded, one tick in Lower Jeuno snapped 5.5 units onto a roof and the
-    // ratcheted reference height kept us there (kuluu-0nnl). No floor within
-    // reach means hold our height for this tick; `recover_self_ground_system` is
-    // the only thing that may break that hold, because the server never corrects
-    // a bad z — it persists and echoes back whatever c2s 0x015 sends
-    // (kuluu-mo4q).
-    //
-    // Horizontal movement is unconstrained here: the navmesh no longer gates it
-    // (it's mob-pathing only now). Client-side wall collision from MZB walls is
-    // the follow-up (kuluu-q5sn); walls are server-authoritative until then.
-    let final_x = x;
-    let final_y = y;
-    let final_z = env
-        .collision
-        .ground_step(
-            bevy::math::Vec2::new(final_x, -final_y),
-            -basis_pos.z,
-            kuluu_render::dat_mzb::MAX_GROUND_STEP_UP,
-        )
-        .map(|floor_bevy_y| -floor_bevy_y)
-        .unwrap_or(basis_pos.z);
+    // The walker owns this tick's horizontal clamp and vertical authority
+    // (plan §2.3/§2.4): wall sweep + slide, then the mode-driven vertical step
+    // (MZB collision is in Bevy space, bevy.x = ffxi.x, bevy.z = -ffxi.y,
+    // bevy.y = -ffxi.z). No floor within one step of reach means airborne;
+    // a PERSISTENT wedge (a column with floors but none within
+    // MAX_GROUND_STEP_UP) is broken by `recover_self_ground_system`, which runs
+    // right after this one — the server never corrects a bad z, it persists and
+    // echoes back whatever c2s 0x015 sends (kuluu-mo4q).
+    let wall_dx = x - basis_pos.x;
+    let wall_dy = y - basis_pos.y;
+    let res = super::walker::step(
+        &env.collision,
+        &env.obstacles,
+        &mut locals.walker,
+        basis_pos.x,
+        basis_pos.y,
+        basis_pos.z,
+        wall_dx,
+        wall_dy,
+        speed_yps,
+        time.delta_secs(),
+        env.hud_panels.noclip,
+    );
+
+    let final_x = basis_pos.x + res.dx;
+    let final_y = basis_pos.y + res.dy;
+    let final_z = res.feet_z;
+
+    super::walker::debug::record_tick(
+        &mut field_dbg,
+        &env.collision,
+        final_x,
+        final_y,
+        final_z,
+        heading,
+        speed_yps,
+        &res,
+    );
 
     let _ = cmd_tx.0.try_send(AgentCommand::Move {
         x: final_x,
@@ -1150,7 +1261,11 @@ impl GroundRecoveryTracker {
 /// (`vendor/server/src/map/packets/c2s/0x015_pos.cpp`).
 /// Being under every floor in the column is unreachable by walking, so it is
 /// always a wedge and always safe to recover upward.
-pub fn recover_self_ground_system(
+///
+/// `pub(crate)` rather than `pub`: view_native is library-public now (the
+/// walker's headless examples), so a bare `pub` would expose the crate-private
+/// GroundRecoveryTracker through this signature.
+pub(crate) fn recover_self_ground_system(
     time: Res<Time<Fixed>>,
     state: Res<SceneState>,
     cmd_tx: Res<CommandTx>,
@@ -1255,18 +1370,65 @@ fn ground_recovery_candidate(
     })
 }
 
-fn heading_to_forward(heading: u8) -> (f32, f32) {
+/// Publish the tick's authoritative render position to the interpolation
+/// buffer. Runs in FixedUpdate right after `dispatch_movement_system` so the
+/// rendered player follows the walker deterministically at 60 Hz;
+/// interpolate_self_transform_system (RunFixedMainLoop) lerps
+/// Transform.translation between prev and curr every render frame, so the
+/// chase camera sees smooth motion instead of stair-stepped 60Hz updates.
+/// Render Y == wire Y: no vertical smoothing here — the walker's stop settle
+/// owns the "don't dip when we stop mid-step" job.
+pub fn apply_self_prediction_system(
+    prediction: Res<LocalPlayerPrediction>,
+    mut q_self: Query<
+        (
+            &mut kuluu_render::PrevRenderPos,
+            &mut kuluu_render::CurrRenderPos,
+        ),
+        (With<IsSelf>, Without<OperatorCamera>),
+    >,
+) {
+    if !prediction.initialized {
+        return;
+    }
+    let Ok((mut prev, mut curr)) = q_self.single_mut() else {
+        return;
+    };
+    // prediction.pos is in wire (ffxi) space; convert to Bevy for the Transform.
+    let wire = kuluu_snapshot::Vec3 {
+        x: prediction.pos.x,
+        y: prediction.pos.y,
+        z: prediction.pos.z,
+    };
+    // Preserve rotation — self_visual_yaw_system owns it.
+    let target = kuluu_render::ffxi_to_bevy(wire);
+
+    // Uninitialized state: ensure_self_render_pos_system attaches PrevRenderPos
+    // + CurrRenderPos seeded from the spawn Transform, but the spawn Transform
+    // may still be the placeholder ZERO if this is the frame before scene sync.
+    // Detect that (both exactly ZERO) and seed to this tick's target so the
+    // first render doesn't warp from origin.
+    if prev.0 == bevy::math::Vec3::ZERO && curr.0 == bevy::math::Vec3::ZERO {
+        prev.0 = target;
+        curr.0 = target;
+    } else {
+        prev.0 = curr.0;
+        curr.0 = target;
+    }
+}
+
+pub(super) fn heading_to_forward(heading: u8) -> (f32, f32) {
     let angle = (heading as f32) * std::f32::consts::TAU / 256.0;
     (angle.cos(), -angle.sin())
 }
 
 fn radius_for_wire_kind(kind: EntityKind) -> f32 {
     match kind {
-        EntityKind::Pc => crate::state::MODEL_RADIUS_PC,
-        EntityKind::Npc => crate::state::MODEL_RADIUS_NPC,
-        EntityKind::Mob => crate::state::MODEL_RADIUS_MOB,
-        EntityKind::Pet => crate::state::MODEL_RADIUS_PET,
-        EntityKind::Other => crate::state::MODEL_RADIUS_OTHER,
+        EntityKind::Pc => kuluu_session::state::MODEL_RADIUS_PC,
+        EntityKind::Npc => kuluu_session::state::MODEL_RADIUS_NPC,
+        EntityKind::Mob => kuluu_session::state::MODEL_RADIUS_MOB,
+        EntityKind::Pet => kuluu_session::state::MODEL_RADIUS_PET,
+        EntityKind::Other => kuluu_session::state::MODEL_RADIUS_OTHER,
     }
 }
 
@@ -1843,8 +2005,8 @@ mod tests {
 
     #[test]
     fn heal_toggle_alternates_stance_and_wire_mode() {
-        use crate::state::HealMode;
         use kuluu_render::combat_stance::{RestKind, RestStance};
+        use kuluu_session::state::HealMode;
 
         let (tx, mut rx) = mpsc::channel(4);
         let cmd_tx = CommandTx(tx);
@@ -1888,15 +2050,15 @@ mod tests {
     fn radius_for_wire_kind_matches_state_source() {
         assert_eq!(
             radius_for_wire_kind(EntityKind::Pc),
-            crate::state::MODEL_RADIUS_PC
+            kuluu_session::state::MODEL_RADIUS_PC
         );
         assert_eq!(
             radius_for_wire_kind(EntityKind::Mob),
-            crate::state::MODEL_RADIUS_MOB
+            kuluu_session::state::MODEL_RADIUS_MOB
         );
         assert_eq!(
             radius_for_wire_kind(EntityKind::Pet),
-            crate::state::MODEL_RADIUS_PET
+            kuluu_session::state::MODEL_RADIUS_PET
         );
     }
 
@@ -1914,6 +2076,7 @@ mod tests {
             heading: 0,
             hp_pct: None,
             bt_target_id: 0,
+            name_vis: None,
             face_target: 0,
             claim_id: 0,
             speed: 0,
@@ -2601,5 +2764,213 @@ mod tests {
 
         let entities = vec![ent(1, 100.0, 0.0), ent(2, 200.0, 0.0)];
         assert_eq!(first_pick(&entities, None, culled_proj), None);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Stair-capture harness (FFXI_STAIR_DRIVE / FFXI_STAIR_CAPTURE) — rebuild #3.
+// An external driver holds {-1,0,1} axes over a TCP JSON line; dispatch folds
+// them into the real input pipeline, and `stair_capture_system` writes one JSON
+// position sample per FixedUpdate tick while capturing. See
+// archive/docs/stair_capture.md (archived) for the protocol, run recipe and
+// coordinate facts.
+// -----------------------------------------------------------------------------
+
+/// Remote drive state: axis holds from the external driver. Same {-1,0,1}
+/// forward/strafe semantics as held keys, plus a Q/E-style turn axis (folded
+/// into rotate_dir) and a chase-camera pan axis; `yaw_warp` is a one-shot exact
+/// camera-aim target consumed on the next dispatch tick.
+#[derive(Default)]
+pub struct StairDrive {
+    pub f: i32,
+    pub s: i32,
+    pub t: i32,
+    /// Chase-camera yaw pan axis (W is camera-relative in chase mode; the body
+    /// turn `t` does NOT re-aim forward).
+    pub c: i32,
+    /// Hold expiry; `None` means never armed (fresh handle has no live hold).
+    until: Option<Instant>,
+    /// One-shot exact chase.yaw target (radians); applied once, then cleared.
+    yaw_warp: Option<f32>,
+}
+
+impl StairDrive {
+    /// Live override axes (f, s, t, c), or `None` once the hold expired.
+    pub fn active(&self) -> Option<(i32, i32, i32, i32)> {
+        match self.until {
+            Some(u) if Instant::now() < u => Some((self.f, self.s, self.t, self.c)),
+            _ => None,
+        }
+    }
+
+    /// Consume the pending one-shot camera warp, if any.
+    pub fn take_warp(&mut self) -> Option<f32> {
+        self.yaw_warp.take()
+    }
+}
+
+/// Shared with the `FFXI_STAIR_DRIVE` TCP listener so driver holds reach the Bevy
+/// input path without OS keystrokes. Always inserted; only listened on when the
+/// env var names an address.
+#[derive(Resource)]
+pub struct StairDriveHandle(pub std::sync::Arc<std::sync::Mutex<StairDrive>>);
+
+/// One TCP line per hold: `{"f":1,"s":0,"t":0,"c":0,"ms":8000}`. `f`/`s` are the
+/// run axes (W/S, A/D), `t` is Q/E-style rotate-in-place, `c` pans the chase
+/// camera at the key yaw rate; optional `"w"` sets a one-shot exact yaw target.
+/// Replaces any prior hold; all-zero with `ms == 0` clears.
+pub async fn serve_stair_drive(
+    addr: std::net::SocketAddr,
+    drive: std::sync::Arc<std::sync::Mutex<StairDrive>>,
+) {
+    let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
+        tracing::warn!(%addr, "FFXI_STAIR_DRIVE bind failed");
+        return;
+    };
+    tracing::info!(%addr, "FFXI_STAIR_DRIVE listening");
+    loop {
+        let Ok((sock, _)) = listener.accept().await else {
+            break;
+        };
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(tokio::io::BufWriter::new(sock)).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            // One hold per line; each line fully replaces the previous one.
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let f = v.get("f").and_then(|x| x.as_i64()).unwrap_or(0);
+            let s = v.get("s").and_then(|x| x.as_i64()).unwrap_or(0);
+            let t = v.get("t").and_then(|x| x.as_i64()).unwrap_or(0);
+            let c = v.get("c").and_then(|x| x.as_i64()).unwrap_or(0);
+            let ms = v.get("ms").and_then(|x| x.as_u64()).unwrap_or(0);
+            let w = v.get("w").and_then(|x| x.as_f64());
+            if (f, s, t, c) == (0, 0, 0, 0) && ms == 0 {
+                // Clear: expire the hold immediately.
+                if let Ok(mut d) = drive.lock() {
+                    d.until = None;
+                }
+            } else {
+                if let Ok(mut d) = drive.lock() {
+                    d.f = f as i32;
+                    d.s = s as i32;
+                    d.t = t as i32;
+                    d.c = c as i32;
+                    d.until = Some(Instant::now() + Duration::from_millis(ms));
+                }
+            }
+            if let Some(target) = w {
+                if let Ok(mut d) = drive.lock() {
+                    d.yaw_warp = Some(target as f32);
+                }
+            }
+        }
+    }
+}
+
+/// Per-tick capture state: tick counter + direction hysteresis memory.
+#[derive(Default)]
+pub struct CaptureState {
+    tick: u64,
+    last_z: Option<f32>,
+    dir: &'static str,
+}
+
+/// One JSON position sample per FixedUpdate tick while FFXI_STAIR_CAPTURE names
+/// an output file. Emits rendered transform, wire (FFXI-space) prediction +
+/// heading, derived up/down direction,
+/// and gate diagnostics (active drive axes + dispatch early-return conditions)
+/// so a frozen run can be diagnosed from the stream itself.
+pub fn stair_capture_system(
+    state: Res<SceneState>,
+    prediction: Res<LocalPlayerPrediction>,
+    mode: Res<InputMode>,
+    rest: Res<kuluu_render::combat_stance::RestStance>,
+    camera: Res<ChaseCamera>,
+    drive: Option<Res<'_, StairDriveHandle>>,
+    q_self: Query<&kuluu_render::CurrRenderPos, (With<IsSelf>, Without<OperatorCamera>)>,
+    mut cap: Local<CaptureState>,
+) {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("FFXI_STAIR_CAPTURE").ok()) else {
+        return;
+    };
+    let Some(curr_pos) = q_self.single().ok() else {
+        return; // no rendered self yet (zone transition / not logged in)
+    };
+    if state.snapshot.self_char_id.is_none() {
+        return;
+    }
+    let wire = prediction.pos;
+    cap.tick += 1;
+
+    // Direction hysteresis: |dwz| > 0.015/tick flips dir, otherwise hold last.
+    let dz = match cap.last_z {
+        Some(last) => wire.z - last,
+        None => 0.0,
+    };
+    if dz.abs() > 0.015 {
+        cap.dir = if dz < 0.0 { "up" } else { "down" };
+    }
+    cap.last_z = Some(wire.z);
+
+    // Active drive axes (diagnostics): what the driver is holding right now.
+    let axes = drive
+        .as_ref()
+        .and_then(|h| h.0.lock().ok())
+        .and_then(|d| d.active())
+        .unwrap_or((0, 0, 0, 0));
+    let rest_on = !matches!(rest.kind, kuluu_render::combat_stance::RestKind::None);
+    // The purple-march slopes are gone with the old detector; emit JSON null
+    // so the harness schema stays stable until the walker's field debug feeds
+    // real values.
+    let pslope_json = String::from("null");
+    let pslope_up_json = String::from("null");
+
+    let line = format!(
+        "{{\"tick\":{},\"t_ms\":{},\"cyaw\":{:.9e},\"wx\":{:.9e},\"wy\":{:.9e},\"wz\":{:.9e},\
+         \"rx\":{:.9e},\"ry\":{:.9e},\"rz\":{:.9e},\"heading\":{},\
+         \"lock\":{},\"slope\":{},\"streak\":{},\
+         \"pslope\":{},\"pslope_up\":{},\"dir\":\"{}\",\
+         \"cancel\":{},\"swallow\":{},\"rest\":{},\
+         \"df\":{},\"ds\":{},\"dt\":{},\"dc\":{}}}",
+        cap.tick,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        camera.yaw,
+        wire.x,
+        wire.y,
+        wire.z,
+        // rx/ry/rz = per-tick authoritative render position (pre-interpolation).
+        // Transform.translation is what the camera SEES (lerped between ticks);
+        // CurrRenderPos.0 is what apply_self_prediction wrote THIS tick.
+        curr_pos.0.x,
+        curr_pos.0.y,
+        curr_pos.0.z,
+        state.snapshot.self_pos.heading,
+        false, // lock (removed; harness JSON schema kept for tool compat)
+        0.0,   // slope (removed)
+        0u8,   // streak (removed)
+        pslope_json,
+        pslope_up_json,
+        cap.dir,
+        mode_cancels_autorun(&mode),
+        mode_swallows_keys(&mode),
+        rest_on,
+        axes.0,
+        axes.1,
+        axes.2,
+        axes.3,
+    );
+
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
     }
 }

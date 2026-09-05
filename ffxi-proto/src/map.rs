@@ -5,6 +5,13 @@ pub const MAX_DATAGRAM: usize = 2500;
 pub mod c2s {
     pub const LOGIN: u16 = 0x00A;
 
+    // GP_CLI_COMMAND_CLISTATUS, vendor/server/src/map/packets/c2s/0x061_clistatus.h.
+    // Requests the local player's status block; the server answers with
+    // SendLocalPlayerPackets (charutils.cpp) — s2c GROUP_ATTR (0x0DF) for self +
+    // CLISTATUS + ... This is how a solo player gets its own group entry after
+    // zone-in/login: LSB pushes no 0x0DD/0x0DF to players without a party.
+    pub const CLISTATUS: u16 = 0x061;
+
     pub const GAMEOK: u16 = 0x00C;
     pub const NETEND: u16 = 0x00D;
     pub const ZONE_TRANSITION: u16 = 0x011;
@@ -120,6 +127,12 @@ pub mod c2s {
     // GP_CLI_COMMAND_AUC, vendor/server/src/map/packets/c2s/0x04e_auc.h.
     // Auction house sub-protocol; command bytes: [`crate::decode::AuctionCommand`].
     pub const AUC: u16 = 0x04E;
+
+    // GP_CLI_COMMAND_GROUP_LIST_REQ, vendor/server/src/map/packets/c2s/0x076_group_list_req.h.
+    // Requests the full party table; the server answers with GROUP_TBL (0x0C8) +
+    // GROUP_LIST (0x0DD) for every member. The retail client sends this on zone-in
+    // to guarantee the party HUD gets a clean refresh.
+    pub const GROUP_LIST_REQ: u16 = 0x076;
 }
 
 /// Wide-scan (tracking) State bytes shared by the s2c 0x0F5/0x0F6 decoders and
@@ -520,6 +533,13 @@ pub mod s2c {
     pub const ABIL_RECAST: u16 = 0x119;
     pub const ENTITY_UPDATE1: u16 = 0x067;
     pub const ENTITY_UPDATE2: u16 = 0x068;
+
+    // GP_SERV_COMMAND_GROUP_TBL, vendor/server/src/map/packets/s2c/0x0c8_group_tbl.h.
+    // Party definition: member IDs, targids, party numbers, zones, leader flags.
+    // Sent before every GROUP_LIST burst as a "here is the full party roster" header.
+    // The client should clear its party table on receipt and repopulate from the
+    // subsequent GROUP_LIST (0x0DD) packets.
+    pub const GROUP_TBL: u16 = 0x0C8;
 
     pub const GROUP_LIST: u16 = 0x0DD;
 

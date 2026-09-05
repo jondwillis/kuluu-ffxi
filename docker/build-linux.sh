@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Build `kuluu --features native-window` for x86_64 Linux (Steam Deck)
-# from an Apple-Silicon Mac, using an emulated linux/amd64 container.
+# Build `kuluu` for x86_64 Linux (Steam Deck) from an Apple-Silicon Mac,
+# using an emulated linux/amd64 container.
 #
 # Usage:  docker/build-linux.sh [cargo-args...]
-#   default: build --release --locked -p kuluu --features native-window
+#   default: build --release --locked -p kuluu --no-default-features
+#            --features native-window
+#   (--no-default-features keeps dlss out: the container has no DLSS SDK, and
+#   streamline/llvm is a Windows toolchain — see docs/DLSS.md)
 #
 # Why this shape:
 #  * Target is x86_64 (Steam Deck) but the host is aarch64, so every docker
@@ -38,7 +41,7 @@ TARGET_VOL="ffxi-linux-target"
 
 CARGO_ARGS=("$@")
 if [ "${#CARGO_ARGS[@]}" -eq 0 ]; then
-    CARGO_ARGS=(build --release --locked -p kuluu --features native-window)
+    CARGO_ARGS=(build --release --locked -p kuluu --no-default-features --features native-window)
 fi
 
 echo ">> [1/5] staging build source into $STAGE (excluding vendor/game-files, target, .git)..."

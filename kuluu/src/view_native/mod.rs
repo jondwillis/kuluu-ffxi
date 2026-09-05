@@ -5,6 +5,7 @@ pub mod debug_heights;
 pub mod exit_watchdog;
 mod gamepad_input;
 pub mod input;
+pub mod key_drive;
 pub mod key_items;
 pub mod launcher_backdrop;
 // 0.19 deprecated the feathers `*_bundle` spawn fns in favor of BSN scenes;
@@ -24,6 +25,7 @@ pub mod sub_area_report;
 pub mod sun_occlusion;
 pub mod target_list_hud;
 pub mod text_input;
+pub mod walker;
 #[allow(deprecated)]
 pub mod widgets;
 pub mod zone_transition;
@@ -186,7 +188,7 @@ pub enum AppPhase {
 }
 
 #[derive(Resource, Clone)]
-pub(crate) struct SessionPorts {
+pub struct SessionPorts {
     pub auth_port: u16,
     pub data_port: u16,
     pub view_port: u16,
@@ -304,16 +306,30 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     let mut app = App::new();
 
+    // Load persisted graphics settings up here (rather than after DefaultPlugins)
+    // so the initial window mode can honour `GraphicsSettings::fullscreen`. The
+    // load is disk-only and doesn't touch app state; we hand the loaded value
+    // straight to insert_resource further down. FFXI_FULLSCREEN env var still
+    // wins — Direct-presentation diagnostics and remote-launch scripts rely on
+    // it, and it shouldn't be overridden by whatever the last session saved.
+    let (loaded_graphics, graphics_store_obj) = crate::graphics_store::load_or_default();
+
     // FFXI_FULLSCREEN forces exclusive fullscreen so macOS presents Direct instead of Composited
     // (native ⌃⌘F stays Composited); the Metal HUD's Composited/Direct flag then isolates whether
     // the periodic frame spikes are WindowServer compositor pacing.
-    let window_mode = if std::env::var_os("FFXI_FULLSCREEN").is_some() {
+    let force_exclusive = std::env::var_os("FFXI_FULLSCREEN").is_some();
+    let want_fullscreen = force_exclusive || loaded_graphics.fullscreen;
+    let window_mode = if !want_fullscreen {
+        bevy::window::WindowMode::Windowed
+    } else if loaded_graphics.windowed_fullscreen && !force_exclusive {
+        // Saved preference is borderless windowed-fullscreen. The env-var
+        // override always means exclusive, so it wins over this.
+        bevy::window::WindowMode::BorderlessFullscreen(bevy::window::MonitorSelection::Primary)
+    } else {
         bevy::window::WindowMode::Fullscreen(
             bevy::window::MonitorSelection::Primary,
             bevy::window::VideoModeSelection::Current,
         )
-    } else {
-        bevy::window::WindowMode::Windowed
     };
     // FFXI_WINDOW_SIZE=WxH overrides the initial window size — lets scripted
     // verification exercise responsive layouts without OS-level window control.
@@ -327,6 +343,13 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // Before DefaultPlugins so these pools win get_or_init and TaskPoolPlugin's
     // create_default_pools no-ops (kuluu-3q8t).
     qos::init_task_pools_with_qos();
+    // Bevy's DefaultPlugins add DlssInitPlugin themselves under `dlss` (ahead
+    // of RenderPlugin, whose build consumes its raw-Vulkan callbacks), but it
+    // panics without the project id resource — so insert that first. Runtime
+    // support is reported via DlssSuperResolutionSupported, which kuluu-render's
+    // availability probe folds into the graphics menu.
+    #[cfg(feature = "dlss")]
+    app.insert_resource(kuluu_render::graphics::dlss::project_id());
     let mut plugins = DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: format!("kuluu — {server}"),
@@ -359,13 +382,29 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             plugin_group.disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>();
     }
     app.add_plugins(plugin_group);
+    app.add_plugins(walker::WalkerPlugin);
 
-    if mute {
-        app.insert_resource(kuluu_render::audio::AudioMuteState {
+    // Persisted audio settings: /debug Sound off (or /sound off) writes to
+    // audio.json alongside graphics.json; restarts read it back here. CLI
+    // `--mute` still wins — if the flag was passed, force both muted
+    // regardless of what was on disk (a user asking for silence on launch
+    // shouldn't get music because their last session left it on).
+    let (loaded_audio_raw, audio_store_obj) = crate::audio_store::load_or_default();
+    let loaded_audio = if mute {
+        kuluu_render::audio::AudioMuteState {
             bgm: true,
             sfx: true,
-        });
-    }
+            // Keep whatever master volume was persisted; --mute only forces the
+            // category mutes, it isn't a volume reset.
+            ..loaded_audio_raw
+        }
+    } else {
+        loaded_audio_raw
+    };
+    app.insert_resource(loaded_audio);
+    app.insert_resource(crate::audio_store::AudioStateRes {
+        store: audio_store_obj,
+    });
 
     // Bevy 0.19's GPU-driven mesh preprocessing is a large regression on Apple integrated GPUs
     // (measured 2026-07: 12.8fps GPU path vs 34.3fps CPU path in the same scene; the GPU-path
@@ -481,8 +520,8 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         .insert_resource(ports)
         .insert_resource(RelayListen(relay_listen));
     insert_dat_roots(&mut app, dat_root);
-    if let Some(store) = kuluu::overlay_store::default_store() {
-        app.insert_resource(kuluu::overlay_store::OverlayStoreRes { store });
+    if let Some(store) = crate::overlay_store::default_store() {
+        app.insert_resource(crate::overlay_store::OverlayStoreRes { store });
     }
     #[cfg(unix)]
     app.insert_resource(AgentListen(agent_listen));
@@ -593,7 +632,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.insert_resource(loaded_bindings);
     app.insert_resource(crate::keybinds_store::KeybindsStateRes { store, persisted });
 
-    let (loaded_graphics, graphics_store_obj) = crate::graphics_store::load_or_default();
+    // (graphics settings were loaded above so the initial window mode could honour `fullscreen`.)
     app.insert_resource(loaded_graphics);
     app.insert_resource(crate::graphics_store::GraphicsStateRes {
         store: graphics_store_obj,
@@ -695,7 +734,13 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         FixedUpdate,
         (
             input::dispatch_movement_system,
+            // Breaks a persistent wire-z wedge (kuluu-mo4q): runs right after
+            // dispatch so it sees this tick's held height, before the render
+            // smoother follows prediction.
             input::recover_self_ground_system,
+            input::apply_self_prediction_system,
+            // FFXI_STAIR_CAPTURE: one JSON position line per tick (no-op unless set).
+            input::stair_capture_system,
         )
             .chain()
             .run_if(in_state(AppPhase::InGame))
@@ -707,6 +752,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
 
     app.add_systems(Update, crate::graphics_store::persist_graphics_on_change);
+    app.add_systems(Update, crate::audio_store::persist_audio_on_change);
     app.add_systems(Update, crate::marker_store::sync_markers);
 
     app.add_systems(
@@ -719,7 +765,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.add_systems(
         Update,
         collision_bvh::build_zone_collision_bvh_system
-            .before(camera_collision::clamp_chase_camera_to_collision)
+            .before(camera_collision::resolve_camera)
             .run_if(in_state(AppPhase::InGame).or_else(in_state(AppPhase::Launcher))),
     );
     app.add_systems(
@@ -730,8 +776,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
     app.add_systems(
         Update,
-        camera_collision::clamp_chase_camera_to_collision
-            .after(kuluu_render::chase_camera_system)
+        camera_collision::resolve_camera
             .before(kuluu_render::nameplate_billboard::update_nameplate_billboards_system)
             .run_if(in_state(AppPhase::InGame)),
     );
@@ -739,14 +784,14 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.add_systems(
         Update,
         camera_collision::draw_camera_collision_debug
-            .after(camera_collision::clamp_chase_camera_to_collision)
+            .after(camera_collision::resolve_camera)
             .run_if(in_state(AppPhase::InGame)),
     );
 
     app.add_systems(
         PostUpdate,
         nameplate_occlude::occlude_nameplates_system
-            .after(camera_collision::clamp_chase_camera_to_collision)
+            .after(camera_collision::resolve_camera)
             .run_if(in_state(AppPhase::InGame)),
     );
 
@@ -1175,6 +1220,25 @@ fn bridge_connecting(
     let debug_ctrl = kuluu_session::debug_control::DebugControl::new_shared();
     commands.insert_resource(DebugControlHandle(debug_ctrl.clone()));
 
+    // Stair-capture drive channel (FFXI_STAIR_DRIVE): always present so the input
+    // path can depend on it; only listens when the env var names an address.
+    let stair_drive = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::view_native::input::StairDrive::default(),
+    ));
+    commands.insert_resource(crate::view_native::input::StairDriveHandle(
+        stair_drive.clone(),
+    ));
+    if let Ok(spec) = std::env::var("FFXI_STAIR_DRIVE") {
+        let addr: std::net::SocketAddr = spec.parse().unwrap_or_else(|_| {
+            let port: u16 = spec.trim_start_matches(':').parse().unwrap_or(9537);
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))
+        });
+        let drive = stair_drive.clone();
+        runtime.0.spawn(async move {
+            crate::view_native::input::serve_stair_drive(addr, drive).await;
+        });
+    }
+
     #[cfg(unix)]
     if let Some(arg) = agent.0.clone() {
         let listen = kuluu_session::agent_socket::resolve_listen(&arg);
@@ -1210,5 +1274,5 @@ fn bridge_connecting(
 
 #[derive(Resource)]
 pub(crate) struct SessionEventTx(
-    #[allow(dead_code)] pub tokio::sync::broadcast::Sender<crate::state::AgentEvent>,
+    #[allow(dead_code)] pub tokio::sync::broadcast::Sender<kuluu_session::state::AgentEvent>,
 );

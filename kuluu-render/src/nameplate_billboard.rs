@@ -138,6 +138,24 @@ pub struct NameplateBillboard {
     pub last_alpha: f32,
 }
 
+/// Per-frame billboard visibility breakdown for the Debug menu "Nameplate
+/// Debug" panel: main-world mirror of what `Visibility::Hidden` is hiding,
+/// with the reason — extract can only read the flag, not why it was set.
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct NameplateBillboardDebug {
+    /// Billboard entities present this frame.
+    pub total: u32,
+    /// Self-plate camera-mode cull (overhead self name in first person).
+    pub hide_self: u32,
+    /// View-depth gate: behind the camera forward plane or within
+    /// MIN_VIEW_DEPTH_YALMS of it. This is a half-plane test, not frustum.
+    pub hidden_depth: u32,
+    /// Plates set Visible + transformed this frame.
+    pub visible: u32,
+    /// Billboards whose actor no longer exists — despawned mid-frame.
+    pub despawned: u32,
+}
+
 #[derive(Component)]
 pub struct BillboardAspect {
     pub width: u32,
@@ -232,6 +250,7 @@ pub const NAMEPLATE_FALLBACK_COLOR: Color = Color::WHITE;
 
 pub fn update_nameplate_billboards_system(
     state: Res<SceneState>,
+    settings: Res<crate::graphics::settings::GraphicsSettings>,
     camera_mode: Res<CameraMode>,
     time: Res<Time>,
     target: Res<Target>,
@@ -259,7 +278,7 @@ pub fn update_nameplate_billboards_system(
     name_colors: Res<crate::nameplate_color::NameColorTable>,
     icons: Res<crate::nameplate_icons::NameplateIcons>,
     mut commands: Commands,
-    mut hp_by_id: Local<std::collections::HashMap<u32, Option<u8>>>,
+    mut dbg_out: ResMut<NameplateBillboardDebug>,
     mut raster_inputs: Local<std::collections::HashMap<u32, RasterKey>>,
 ) {
     let Ok((cam_t, projection)) = cam_q.single() else {
@@ -287,27 +306,44 @@ pub fn update_nameplate_billboards_system(
     // The retail colour table and icon glyphs are read from the DAT a few
     // frames into the session, after the first plates have already rastered
     // against the fallback; their arrival has to re-raster them.
-    let dirty = state.dirty || name_colors.is_changed() || icons.is_changed();
+    // A Retail+ gate flip (mob HP under) must re-raster on the spot, not wait
+    // for the next snapshot: settings changes are user actions, and the key
+    // comparison below keeps unaffected plates from re-running.
+    let dirty =
+        state.dirty || name_colors.is_changed() || icons.is_changed() || settings.is_changed();
     if dirty {
-        hp_by_id.clear();
         raster_inputs.clear();
         let ctx = crate::nameplate_color::SelfContext {
             self_id: self_char_id,
             party: &state.snapshot.party,
         };
         for ent in &state.snapshot.entities {
-            hp_by_id.insert(ent.id, ent.hp_pct);
-            raster_inputs.insert(ent.id, raster_key_for(ent, ctx, &name_colors));
+            raster_inputs.insert(
+                ent.id,
+                raster_key_for(ent, ctx, &name_colors, settings.mob_hp_under),
+            );
         }
     }
 
+    // Debug breakdown mirrors each gate below; see NameplateBillboardDebug.
+    let mut total = 0u32;
+    let mut hide_self = 0u32;
+    let mut hidden_depth = 0u32;
+    let mut visible_n = 0u32;
+    let mut despawned = 0u32;
+
     for (ui_entity, mut np, mut aspect, mut transform, mut vis, mat) in &mut billboards {
-        if self_plate_hidden(is_self_billboard(np.entity_id, self_char_id), *camera_mode) {
+        total += 1;
+        let self_cull =
+            self_plate_hidden(is_self_billboard(np.entity_id, self_char_id), *camera_mode);
+        if self_cull {
+            hide_self += 1;
             *vis = Visibility::Hidden;
             continue;
         }
 
         let Some(&(entity_pos, head_y_offset)) = pos_by_id.get(&np.entity_id) else {
+            despawned += 1;
             commands.entity(ui_entity).try_despawn();
             continue;
         };
@@ -315,6 +351,7 @@ pub fn update_nameplate_billboards_system(
         let head_pos = entity_pos + Vec3::Y * head_y_offset;
         let view_depth = (head_pos - cam_pos).dot(cam_forward);
         let Some(scale) = legibility_scale_for_view_depth(view_depth) else {
+            hidden_depth += 1;
             *vis = Visibility::Hidden;
             continue;
         };
@@ -339,6 +376,7 @@ pub fn update_nameplate_billboards_system(
         transform.rotation = cam_t.rotation;
         transform.scale = Vec3::new(world_width, world_height, 1.0);
         *vis = Visibility::Visible;
+        visible_n += 1;
 
         // Pulse is time-driven (steps at RETAIL_FPS via pulse_frame, so the
         // last_alpha guard bounds writes to 30/s) and must run on non-snapshot
@@ -379,6 +417,19 @@ pub fn update_nameplate_billboards_system(
             text: np.base_name.clone(),
             ..inputs.clone()
         };
+        // mob_hp diagnostic: fires only when the re-raster is driven by an hp
+        // change (name/color/marker changes do not log). Paired with the
+        // session-side "0x0E UPDATE_HP" line, this proves or breaks the
+        // snapshot -> billboard link.
+        if np.rastered.as_ref().map(|done| done.hp) != Some(want.hp) {
+            tracing::info!(
+                target: "mob_hp",
+                id = np.entity_id,
+                old = ?np.rastered.as_ref().map(|done| done.hp),
+                new = ?want.hp,
+                "nameplate re-raster (hp change)"
+            );
+        }
         let Some(mat_data) = materials.get_mut(&mat.0) else {
             continue;
         };
@@ -402,21 +453,42 @@ pub fn update_nameplate_billboards_system(
         let _ = images.insert(&handle, new_img.image);
         np.rastered = Some(want.clone());
     }
+
+    dbg_out.total = total;
+    dbg_out.hide_self = hide_self;
+    dbg_out.hidden_depth = hidden_depth;
+    dbg_out.visible = visible_n;
+    dbg_out.despawned = despawned;
 }
 
 /// The full raster input for one entity: retail's name colour, its icon
-/// markers, and the pearl tint those icons draw with.
+/// markers, the pearl tint those icons draw with, and — when the Retail+ gate
+/// is on — the mob/pet HP bar.
 fn raster_key_for(
     ent: &kuluu_snapshot::Entity,
     ctx: crate::nameplate_color::SelfContext<'_>,
     name_colors: &crate::nameplate_color::NameColorTable,
+    show_mob_hp: bool,
 ) -> RasterKey {
     let color = crate::nameplate_color::name_color_choice(ent, ctx)
         .resolve(name_colors)
         .unwrap_or(NAMEPLATE_FALLBACK_COLOR);
-    let hp = matches!(ent.kind, EntityKind::Mob | EntityKind::Pet)
-        .then_some(ent.hp_pct)
-        .flatten();
+    // `enhanced-mob-hp-under` is the compile-time half of this gate: without
+    // it a persisted `mob_hp_under` from an enhanced build can never light a
+    // bar in a plain one.
+    #[cfg(feature = "enhanced-mob-hp-under")]
+    let hp = if show_mob_hp {
+        matches!(ent.kind, EntityKind::Mob | EntityKind::Pet)
+            .then_some(ent.hp_pct)
+            .flatten()
+    } else {
+        None
+    };
+    #[cfg(not(feature = "enhanced-mob-hp-under"))]
+    let hp: Option<u8> = {
+        let _ = show_mob_hp;
+        None
+    };
     RasterKey {
         text: String::new(),
         color: color_to_rgba8(color),

@@ -77,3 +77,17 @@ pub struct MorphIn {
 
 #[derive(Component, Debug, Clone, Copy)]
 pub struct CameraOccluder;
+
+/// Fixed-tick render-position history used to smooth self movement between
+/// FixedUpdate ticks. `apply_self_prediction_system` writes the authoritative
+/// per-tick render position into `CurrRenderPos` (and rolls the old value
+/// into `PrevRenderPos`) instead of mutating Transform directly.
+/// `interpolate_self_transform_system` runs every render frame and lerps
+/// Transform.translation between the two using `Time<Fixed>::overstep_fraction`,
+/// so the camera (which reads Transform) never sees the 60Hz-quantized wobble
+/// that used to shake the world as you walked up stairs.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct PrevRenderPos(pub Vec3);
+
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct CurrRenderPos(pub Vec3);

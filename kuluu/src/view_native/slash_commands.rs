@@ -1,7 +1,7 @@
 use kuluu_render::{MenuKind, Preset};
 use kuluu_snapshot::{Entity as WireEntity, Vec3 as WireVec3};
 
-use crate::state::{ActionKind, AgentCommand, CheckKind, HealMode, ReqLogoutKind};
+use kuluu_session::state::{ActionKind, AgentCommand, CheckKind, HealMode, ReqLogoutKind};
 
 const MAX_ZONE_ID: u16 = 600;
 
@@ -719,7 +719,7 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 usage: "",
                 summary: "set the hook once a fish bites",
                 handler: |_| SlashOutcome::Command(AgentCommand::FishingInput {
-                    input: crate::state::FishingInput::Hook,
+                    input: kuluu_session::state::FishingInput::Hook,
                 }),
             },
             Command {
@@ -727,7 +727,7 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 usage: "",
                 summary: "react to a left fishing arrow",
                 handler: |_| SlashOutcome::Command(AgentCommand::FishingInput {
-                    input: crate::state::FishingInput::Left,
+                    input: kuluu_session::state::FishingInput::Left,
                 }),
             },
             Command {
@@ -735,7 +735,7 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 usage: "",
                 summary: "react to a right fishing arrow",
                 handler: |_| SlashOutcome::Command(AgentCommand::FishingInput {
-                    input: crate::state::FishingInput::Right,
+                    input: kuluu_session::state::FishingInput::Right,
                 }),
             },
             Command {
@@ -743,7 +743,7 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 usage: "",
                 summary: "abandon the cast / mini-game",
                 handler: |_| SlashOutcome::Command(AgentCommand::FishingInput {
-                    input: crate::state::FishingInput::Cancel,
+                    input: kuluu_session::state::FishingInput::Cancel,
                 }),
             },
         ],
@@ -948,6 +948,12 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 handler: |c| parse_netstat(c.rest),
             },
             Command {
+                aliases: &["noclip"],
+                usage: "[on|off|toggle]",
+                summary: "debug: bypass client-side wall collision (grounding stays on); same state as the Debug menu NoClip row",
+                handler: |c| parse_noclip(c.rest),
+            },
+            Command {
                 aliases: &["renderscale", "rscale"],
                 usage: "[25-200 | 0.25-2.0]",
                 summary: "3D render scale: <100% renders the world at lower res and upscales (perf); >100% supersamples. HUD stays native. Bare `/renderscale` reports it.",
@@ -1075,6 +1081,8 @@ pub enum SlashOutcome {
     SetDevHud(Option<bool>),
 
     SetNetStatus(Option<bool>),
+
+    SetNoClip(Option<bool>),
 
     SetVanaClock(Option<bool>),
 
@@ -2115,20 +2123,22 @@ fn parse_mhexit(rest: &str, zone_id: Option<u16>) -> SlashOutcome {
     let slot: u8 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
 
     let kind = match first {
-        None | Some("home") | Some("") => crate::state::MogHouseExit::Home {
+        None | Some("home") | Some("") => kuluu_session::state::MogHouseExit::Home {
             exit_bit: zone_id.and_then(home_region_bit_for_zone).unwrap_or(0),
         },
-        Some("1f") | Some("mog1f") => crate::state::MogHouseExit::Mog1F,
-        Some("2f") | Some("mog2f") => crate::state::MogHouseExit::Mog2F,
-        Some("garden") | Some("moggarden") => crate::state::MogHouseExit::MogGarden,
-        Some("sandoria") | Some("sandy") => crate::state::MogHouseExit::Sandoria { slot },
-        Some("bastok") => crate::state::MogHouseExit::Bastok { slot },
-        Some("windurst") | Some("windy") => crate::state::MogHouseExit::Windurst { slot },
-        Some("jeuno") => crate::state::MogHouseExit::Jeuno { slot },
-        Some("whitegate") | Some("aht_urhgan") => crate::state::MogHouseExit::Whitegate { slot },
-        Some("adoulin") => crate::state::MogHouseExit::Adoulin { slot },
+        Some("1f") | Some("mog1f") => kuluu_session::state::MogHouseExit::Mog1F,
+        Some("2f") | Some("mog2f") => kuluu_session::state::MogHouseExit::Mog2F,
+        Some("garden") | Some("moggarden") => kuluu_session::state::MogHouseExit::MogGarden,
+        Some("sandoria") | Some("sandy") => kuluu_session::state::MogHouseExit::Sandoria { slot },
+        Some("bastok") => kuluu_session::state::MogHouseExit::Bastok { slot },
+        Some("windurst") | Some("windy") => kuluu_session::state::MogHouseExit::Windurst { slot },
+        Some("jeuno") => kuluu_session::state::MogHouseExit::Jeuno { slot },
+        Some("whitegate") | Some("aht_urhgan") => {
+            kuluu_session::state::MogHouseExit::Whitegate { slot }
+        }
+        Some("adoulin") => kuluu_session::state::MogHouseExit::Adoulin { slot },
         Some("auto") => match zone_id.and_then(home_region_bit_for_zone) {
-            Some(bit) => crate::state::MogHouseExit::from_bit_slot(bit, 1),
+            Some(bit) => kuluu_session::state::MogHouseExit::from_bit_slot(bit, 1),
             None => {
                 return SlashOutcome::SystemMessage(format!(
                     "/mhexit auto: zone {} isn't in the home-region table — \
@@ -2476,9 +2486,13 @@ fn render_debug_entity(arg: &str, entities: &[WireEntity], self_pos: WireVec3) -
         Some(EntityLook::Door { size, .. }) => s.push_str(&format!(" door size={size}")),
         Some(EntityLook::Transport { size }) => s.push_str(&format!(" transport size={size}")),
     }
+    // n/a = no General-block update has carried the byte yet (it rides UPDATE_HP).
+    let namevis = e
+        .name_vis
+        .map_or_else(|| "n/a".to_string(), |v| v.to_string());
     s.push('\n');
     s.push_str(&format!(
-        "  anim={} animsub={} status={}{}",
+        "  anim={} animsub={} status={} namevis={namevis}{}",
         e.animation,
         e.animationsub,
         e.status,
@@ -2701,6 +2715,21 @@ fn parse_devhud(rest: &str) -> SlashOutcome {
         }
     };
     SlashOutcome::SetDevHud(setting)
+}
+
+fn parse_noclip(rest: &str) -> SlashOutcome {
+    let arg = rest.trim().to_ascii_lowercase();
+    let setting = match arg.as_str() {
+        "" | "toggle" => None,
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        other => {
+            return SlashOutcome::SystemMessage(format!(
+                "/noclip: bad arg `{other}` (use on|off|toggle)"
+            ));
+        }
+    };
+    SlashOutcome::SetNoClip(setting)
 }
 
 fn parse_netstat(rest: &str) -> SlashOutcome {
@@ -3287,6 +3316,7 @@ mod tests {
             heading: 0,
             hp_pct: None,
             bt_target_id: 0,
+            name_vis: None,
             face_target: 0,
             claim_id: 0,
             speed: 0,
@@ -4718,7 +4748,7 @@ mod tests {
             SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
                 assert!(matches!(
                     kind,
-                    crate::state::MogHouseExit::Home { exit_bit: 0 }
+                    kuluu_session::state::MogHouseExit::Home { exit_bit: 0 }
                 ));
                 assert_eq!(kind.wire_pair(), (0, 0));
             }
@@ -4741,7 +4771,7 @@ mod tests {
             SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
                 assert!(matches!(
                     kind,
-                    crate::state::MogHouseExit::Bastok { slot: 2 }
+                    kuluu_session::state::MogHouseExit::Bastok { slot: 2 }
                 ));
                 assert_eq!(kind.wire_pair(), (2, 2));
             }
@@ -4772,7 +4802,7 @@ mod tests {
             SlashOutcome::Command(AgentCommand::MogHouseExit { kind }) => {
                 assert!(matches!(
                     kind,
-                    crate::state::MogHouseExit::Sandoria { slot: 1 }
+                    kuluu_session::state::MogHouseExit::Sandoria { slot: 1 }
                 ));
                 assert_eq!(kind.wire_pair(), (1, 1));
             }

@@ -16,8 +16,8 @@ use super::{
     ServerSelectForm,
 };
 
-use kuluu::launcher_store::{self, keyring_account_key, SavedAccount, KEYRING_SERVICE};
-use kuluu::secret_store::SecretStore;
+use crate::launcher_store::{self, keyring_account_key, SavedAccount, KEYRING_SERVICE};
+use crate::secret_store::SecretStore;
 
 fn save_on_success(server_name: &str, username: &str, password: &str, remember: bool) {
     let mut store = launcher_store::load();

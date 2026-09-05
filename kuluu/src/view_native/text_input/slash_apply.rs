@@ -36,7 +36,7 @@ pub(super) fn apply_slash_outcome(
     bindings: &mut Bindings,
     keybinds_state: &mut KeybindsStateRes,
     #[cfg(unix)] agent_paused: Option<&crate::view_native::AgentPaused>,
-    session_event_tx: Option<&crate::view_native::SessionEventTx>,
+    _session_event_tx: Option<&crate::view_native::SessionEventTx>,
     slash_writers: &mut SlashWriters,
     draw_distance: &mut kuluu_render::dat_mzb::DrawDistance,
 ) {
@@ -124,7 +124,7 @@ pub(super) fn apply_slash_outcome(
 
                     RestKind::Heal => {
                         let _ = cmd_tx.try_send(AgentCommand::Heal {
-                            mode: crate::state::HealMode::Off,
+                            mode: kuluu_session::state::HealMode::Off,
                         });
                         RestKind::Sit
                     }
@@ -328,6 +328,18 @@ pub(super) fn apply_slash_outcome(
             push_system_chat_line(
                 scene_state,
                 format!("/netstat: {}", if next { "on" } else { "off" }),
+            );
+        }
+        SlashOutcome::SetNoClip(setting) => {
+            let next = setting.unwrap_or(!slash_writers.hud_panels.noclip);
+            slash_writers.hud_panels.noclip = next;
+            push_system_chat_line(
+                scene_state,
+                format!(
+                    "/noclip: {} (wall collision {})",
+                    if next { "on" } else { "off" },
+                    if next { "bypassed" } else { "active" }
+                ),
             );
         }
         SlashOutcome::SetVanaClock(setting) => {
@@ -818,6 +830,7 @@ pub(super) fn apply_slash_outcome(
                 kuluu_render::MenuKind::Config => "Config".into(),
                 kuluu_render::MenuKind::Debug => "Debug".into(),
                 kuluu_render::MenuKind::Graphics => "Graphics".into(),
+                kuluu_render::MenuKind::GraphicsDlss => "DLSS Config".into(),
                 kuluu_render::MenuKind::Status => "Status".into(),
 
                 kuluu_render::MenuKind::Communication => "Communication".into(),
@@ -1201,12 +1214,12 @@ fn mirror_heal_stance(cmd: &AgentCommand, rest: &mut kuluu_render::combat_stance
         return;
     };
     let next = match mode {
-        crate::state::HealMode::On => RestKind::Heal,
-        crate::state::HealMode::Off => match rest.kind {
+        kuluu_session::state::HealMode::On => RestKind::Heal,
+        kuluu_session::state::HealMode::Off => match rest.kind {
             RestKind::Heal => RestKind::None,
             other => other,
         },
-        crate::state::HealMode::Toggle => match rest.kind {
+        kuluu_session::state::HealMode::Toggle => match rest.kind {
             RestKind::Heal => RestKind::None,
             _ => RestKind::Heal,
         },

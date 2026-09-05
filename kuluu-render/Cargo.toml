@@ -12,6 +12,15 @@ dist = false
 
 [features]
 default = []
+# NVIDIA DLSS Super Resolution (native Vulkan/RTX only). Compiles the runtime
+# plumbing in graphics/dlss.rs and chains to bevy's dlss feature (which pulls
+# dlss_wgpu; building it needs the DLSS SDK checked out and DLSS_SDK set — see
+# docs/DLSS.md). The settings/menu surface exists on every build; without this
+# feature it permanently reads N/A.
+# `dep:kuluu-dlss-nr` is the DLSS 5 Neural Uplift FFI crate (safe wrapper
+# around nvngx_dlssnr.dll). It must only ever be built when nvsdk_ngx_s.lib
+# is in the link graph — which is exactly what bevy/dlss -> dlss_wgpu does.
+dlss = ["bevy/dlss", "dep:kuluu-dlss-nr"]
 # Enhanced (non-retail) mouse-over tooltips on the status-effect ribbon showing
 # each buff's name. Retail has no such tooltip; the info comes from the scraped
 # status-effect name table.
@@ -22,6 +31,22 @@ enhanced-buff-tooltips = []
 # bar (players get one via Windower/Ashita); this reproduces it from the
 # scraped spell castTime.
 enhanced-cast-bar = []
+
+# Enhanced (non-retail) mob/pet HP readout on nameplates: the green bar under
+# the billboard plate plus the "{name} {pct}%" suffix in the UI plates. Retail
+# shows no mob HP; without this feature a persisted `mob_hp_under` can never
+# light either, and the Debug -> Retail+ row does not exist.
+enhanced-mob-hp-under = []
+
+# Enhanced (non-retail) party-frame Job column: L1 rows gain a job-icon column.
+# Retail's party frame shows no jobs; without this feature a persisted
+# `job_display` can never light it, and the Debug -> Retail+ row does not exist.
+enhanced-job-display = []
+
+# DEV-ONLY: renders the "Debug" entry (and its Retail+ section) on page 2 of
+# the Command menu. Shipped release builds never enable this, so retail parity
+# holds by construction; dev/test builds pass `--features debug-menu` explicitly.
+debug-menu = []
 
 # Bevy ECS plugins, world model, camera, and HUD shared by both the native
 # windowed viewer (kuluu/src/view_native/) and the browser viewer
@@ -58,6 +83,8 @@ ffxi-actor = { path = "../ffxi-actor" }
 ffxi-proto = { path = "../ffxi-proto" }
 ffxi-vocab = { path = "../ffxi-vocab" }
 serde = { workspace = true }
+# Diagnostic lines (target "mob_hp") in the nameplate billboard system.
+tracing = { workspace = true }
 # Local-timezone civil date for the Current Time menu's Earth-time chat line
 # (hud/vana_clock.rs). `clock` only — no serde/oldtime; on wasm (no wasmbind)
 # chrono's Local stubs to UTC, which is acceptable for the browser viewer.
@@ -77,6 +104,13 @@ ab_glyph = "0.2"
 # over the websocket if/when that's wanted.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ffxi-audio = { path = "../ffxi-audio" }
+# DLSS 5 Neural Uplift FFI (see the `dlss` feature above). Optional: without
+# the feature it is not in the dependency graph at all.
+kuluu-dlss-nr = { path = "../kuluu-dlss-nr", optional = true }
+# Same pinned copy as bevy's wgpu (29.x in the lockfile — zero new compile):
+# graphics/dlss_nr.rs names a few raw wgpu types that bevy does not re-export
+# (TextureTransition/TextureUses). Native-only; wasm never sees it.
+wgpu = { version = "29", default-features = false, features = ["std"] }
 # Stable id for the synthetic picking pointer that bridges window-space mouse
 # input onto the off-screen render-scale target (graphics::render_scale, which
 # is itself native-only). from_u128 only — no getrandom needed.

@@ -158,6 +158,7 @@ mod tests {
             hp_pct: Some(100),
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 25,
             speed_base: 25,

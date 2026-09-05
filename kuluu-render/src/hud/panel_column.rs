@@ -26,26 +26,51 @@ fn logical_height(computed: &ComputedNode) -> f32 {
     computed.size().y * computed.inverse_scale_factor()
 }
 
-pub fn layout_panel_column_system(mut panels: Query<(&ColumnPanel, &mut Node, &ComputedNode)>) {
+pub fn layout_panel_column_system(
+    mut panels: Query<(Entity, &ColumnPanel, &mut Node, &ComputedNode)>,
+    mut last_seen: Local<std::collections::HashMap<Entity, f32>>,
+) {
     let mut stack: Vec<_> = panels.iter_mut().collect();
-    stack.sort_by_key(|(slot, _, _)| **slot);
+    stack.sort_by_key(|(_, slot, _, _)| **slot);
 
-    let mut bottom = style::PANEL_COLUMN_BOTTOM_PX;
-    for (_, node, computed) in stack.iter_mut() {
+    // ONE-FRAME HEIGHT CONFIRM. With the render-scale composite active,
+    // `ComputedNode` can transiently mismeasure while camera targets
+    // re-resolve (physical size and inverse_scale_factor land a frame apart),
+    // and trusting each frame's reading restacked the whole column every
+    // frame -- the "bouncing bottoms" at any non-default UI scale. A height
+    // must repeat (within half a pixel) on two consecutive frames before the
+    // column accepts it; a genuine content change lands one frame late,
+    // which is invisible, and a flip-flopping reading never moves anything.
+    let mut heights: Vec<f32> = Vec::with_capacity(stack.len());
+    for (e, _, node, computed) in stack.iter() {
         if node.display == Display::None {
+            heights.push(0.0);
             continue;
         }
-        let height = logical_height(computed);
+        let h = logical_height(computed);
         // A panel shown this frame has not been laid out yet. Hold the previous
         // frame's stacking rather than collapsing everything above it onto zero.
-        if height <= 0.0 {
+        if h <= 0.0 {
             return;
+        }
+        let prev = last_seen.insert(*e, h);
+        match prev {
+            None => heights.push(h), // first sighting
+            Some(p) if (p - h).abs() <= 0.5 => heights.push(h),
+            Some(_) => return, // unconfirmed: hold
+        }
+    }
+
+    let mut bottom = style::PANEL_COLUMN_BOTTOM_PX;
+    for (i, (_, _, node, _)) in stack.iter_mut().enumerate() {
+        if node.display == Display::None {
+            continue;
         }
         let want = Val::Px(bottom);
         if node.bottom != want {
             node.bottom = want;
         }
-        bottom += height + style::PANEL_COLUMN_GAP_PX;
+        bottom += heights[i] + style::PANEL_COLUMN_GAP_PX;
     }
 }
 

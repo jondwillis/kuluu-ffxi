@@ -23,6 +23,10 @@ on:
 permissions:
   contents: write
 
+# Every build leg passes --no-default-features: dlss is opt-in and its runners
+# have no DLSS SDK (dlss_wgpu's build.rs panics without DLSS_SDK), so the
+# shipped binaries are built native-window-only. See docs/DLSS.md.
+
 jobs:
   setup:
     name: Resolve tag
@@ -73,7 +77,7 @@ jobs:
           cache-key: release-linux
 
       - name: Build binary
-        run: cargo build --release --locked -p kuluu --features native-window
+        run: cargo build --release --locked -p kuluu --no-default-features --features native-window
 
       - name: Package
         env:
@@ -103,7 +107,7 @@ jobs:
           cache-key: release-linux-arm
 
       - name: Build binary
-        run: cargo build --release --locked -p kuluu --features native-window
+        run: cargo build --release --locked -p kuluu --no-default-features --features native-window
 
       - name: Package
         env:
@@ -145,7 +149,7 @@ jobs:
           cache-key: release-macos
 
       - name: Build binary
-        run: cargo build --release --locked -p kuluu --features native-window
+        run: cargo build --release --locked -p kuluu --no-default-features --features native-window
 
       - name: Package
         env:
@@ -190,7 +194,7 @@ jobs:
           cache-key: release-windows
 
       - name: Build binary
-        run: cargo build --release --locked -p kuluu --features native-window
+        run: cargo build --release --locked -p kuluu --no-default-features --features native-window
 
       - name: Package
         env:
@@ -242,7 +246,7 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
 
       - name: Build binary
-        run: cargo build --release --locked -p kuluu --features native-window
+        run: cargo build --release --locked -p kuluu --no-default-features --features native-window
 
       - name: Package
         env:

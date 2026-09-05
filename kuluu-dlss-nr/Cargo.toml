@@ -1,0 +1,33 @@
+[package]
+name = "kuluu-dlss-nr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# NVIDIA DLSS 5 Neural Rendering ("Neural Uplift", a.k.a. DLSSNR) FFI — the
+# only crate in the workspace that touches nvngx_dlssnr.dll or raw Vulkan
+# handles, so kuluu-render's `#![forbid(unsafe_code)]` stays intact.
+#
+# Two link sources with different lifetimes:
+# * The static host layer (`NVSDK_NGX_VULKAN_AllocateParameters`, the
+#   `NVSDK_NGX_Parameter_Set*` accessors) comes from nvsdk_ngx_s.lib, which
+#   dlss_wgpu links into the final binary under bevy's `dlss` feature. This
+#   crate only *declares* those externs; they resolve at final link time. It
+#   must therefore only ever be built when that static lib is in the link
+#   graph — kuluu-render gates this dep behind its own `dlss` feature, which
+#   chains to bevy/dlss -> dlss_wgpu.
+# * The NR runtime itself (nvngx_dlssnr.dll, NVIDIA-signed v310.8.x) is loaded
+#   at RUNTIME from next to the executable via LoadLibraryW. Missing DLL =>
+#   NR unavailable; the SR path is unaffected.
+
+[dependencies]
+# Same major as bevy's wgpu so cargo unifies on one copy (29.x in the lockfile).
+# Only the Vulkan HAL surface is needed: `as_hal::<Vulkan>()` raw-handle
+# extraction. Feature set is a subset of what bevy_render already enables, so
+# no extra backend code gets compiled into the final binary.
+wgpu = { version = "29", default-features = false, features = ["std", "vulkan"] }
+# Same copy wgpu-hal already builds (0.38 in the lockfile) — only used for the
+# public `Handle` trait: ash handle tuple fields are private, so raw u64
+# extraction goes through `as_raw()`.
+ash = "0.38"

@@ -26,10 +26,12 @@ pub fn delivery_mode_sync_system(
     }
 }
 
-fn wire_to_client_box(box_no: kuluu_snapshot::DeliveryBoxNo) -> crate::state::DeliveryBoxNo {
+fn wire_to_client_box(
+    box_no: kuluu_snapshot::DeliveryBoxNo,
+) -> kuluu_session::state::DeliveryBoxNo {
     match box_no {
-        kuluu_snapshot::DeliveryBoxNo::Incoming => crate::state::DeliveryBoxNo::Incoming,
-        kuluu_snapshot::DeliveryBoxNo::Outgoing => crate::state::DeliveryBoxNo::Outgoing,
+        kuluu_snapshot::DeliveryBoxNo::Incoming => kuluu_session::state::DeliveryBoxNo::Incoming,
+        kuluu_snapshot::DeliveryBoxNo::Outgoing => kuluu_session::state::DeliveryBoxNo::Outgoing,
     }
 }
 
@@ -62,12 +64,12 @@ pub(super) fn handle_delivery_key(
         recipient_ok,
     };
     let sent = ffxi_proto::map::pbx::stat::SENT;
-    let send = |op: crate::state::DeliveryBoxOp| {
+    let send = |op: kuluu_session::state::DeliveryBoxOp| {
         let _ = cmd_tx.try_send(AgentCommand::DeliveryBox { op });
     };
     let close = || {
         let _ = cmd_tx.try_send(AgentCommand::DeliveryBox {
-            op: crate::state::DeliveryBoxOp::PostClose {
+            op: kuluu_session::state::DeliveryBoxOp::PostClose {
                 box_no: wire_to_client_box(d.box_no),
             },
         });
@@ -82,7 +84,7 @@ pub(super) fn handle_delivery_key(
             let out_slot = binding.target.out_slot();
             screen.focus = DeliveryFocus::Slot(out_slot as usize);
             if qty > 0 {
-                send(crate::state::DeliveryBoxOp::Set {
+                send(kuluu_session::state::DeliveryBoxOp::Set {
                     slot: out_slot,
                     inventory_slot: inv_slot,
                     quantity: qty,
@@ -127,7 +129,7 @@ pub(super) fn handle_delivery_key(
                 .trim()
                 .to_string();
             if !name.is_empty() {
-                send(crate::state::DeliveryBoxOp::Query { recipient: name });
+                send(kuluu_session::state::DeliveryBoxOp::Query { recipient: name });
             }
             return;
         }
@@ -157,14 +159,14 @@ pub(super) fn handle_delivery_key(
     // item-window bag tabs). Closes the current box and opens the other.
     if bindings.matches_logical(Action::SelectActiveWindow, key) {
         let _ = cmd_tx.try_send(AgentCommand::DeliveryBox {
-            op: crate::state::DeliveryBoxOp::PostClose {
+            op: kuluu_session::state::DeliveryBoxOp::PostClose {
                 box_no: wire_to_client_box(d.box_no),
             },
         });
         let other = if outgoing {
-            crate::state::DeliveryBoxOp::PostOpen
+            kuluu_session::state::DeliveryBoxOp::PostOpen
         } else {
-            crate::state::DeliveryBoxOp::DeliOpen
+            kuluu_session::state::DeliveryBoxOp::DeliOpen
         };
         let _ = cmd_tx.try_send(AgentCommand::DeliveryBox { op: other });
         return;
@@ -220,11 +222,11 @@ pub(super) fn handle_delivery_key(
                 }
             }
             Some(item) if item.stat == sent => {
-                send(crate::state::DeliveryBoxOp::Cancel { slot: i as u8 });
+                send(kuluu_session::state::DeliveryBoxOp::Cancel { slot: i as u8 });
             }
             Some(_) => {
-                send(crate::state::DeliveryBoxOp::Get {
-                    box_no: crate::state::DeliveryBoxNo::Outgoing,
+                send(kuluu_session::state::DeliveryBoxOp::Get {
+                    box_no: kuluu_session::state::DeliveryBoxNo::Outgoing,
                     slot: i as u8,
                 });
             }
@@ -255,7 +257,7 @@ pub(super) fn handle_delivery_key(
                     match delivery::first_free_slot(&d) {
                         None => notice(scene_state, "The delivery box is full."),
                         Some(free) if row.quantity <= 1 => {
-                            send(crate::state::DeliveryBoxOp::Set {
+                            send(kuluu_session::state::DeliveryBoxOp::Set {
                                 slot: free as u8,
                                 inventory_slot: row.inv_slot,
                                 quantity: 1,
@@ -273,7 +275,7 @@ pub(super) fn handle_delivery_key(
             for (i, cell) in d.slots.iter().enumerate() {
                 if let Some(it) = cell {
                     if it.stat != sent {
-                        send(crate::state::DeliveryBoxOp::Send { slot: i as u8 });
+                        send(kuluu_session::state::DeliveryBoxOp::Send { slot: i as u8 });
                     }
                 }
             }
@@ -285,7 +287,7 @@ pub(super) fn handle_delivery_key(
             });
         }
         DeliveryFocus::RejectBtn => {
-            send(crate::state::DeliveryBoxOp::Reject {
+            send(kuluu_session::state::DeliveryBoxOp::Reject {
                 slot: screen.last_in_slot as u8,
             });
         }

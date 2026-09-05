@@ -1,6 +1,7 @@
 use bevy::prelude::*;
-use kuluu_snapshot::SceneSnapshot;
+use kuluu_snapshot::{LogoutCountdown, SceneSnapshot};
 
+use crate::combat_stance::{RestKind, RestStance};
 use crate::hud::style::{self, theme};
 use crate::snapshot::SceneState;
 
@@ -72,6 +73,12 @@ pub struct LogoutCountdownAnchor {
     pub server_seconds: Option<u16>,
     pub shutdown: bool,
     pub anchor_secs: f64,
+
+    /// The last tick value captured at a local stand-up. Stand-up cancels
+    /// leavegame server-side WITHOUT any cancel packet, so that stale tick
+    /// keeps sitting in the snapshot — suppress exactly that value until a NEW
+    /// tick proves the countdown survived (or it is cleared on re-anchor).
+    pub suppress_stale: Option<LogoutCountdown>,
 }
 
 #[derive(Component)]
@@ -177,6 +184,8 @@ fn compute_display(
 pub fn update_logout_countdown(
     mut requests: MessageReader<LogoutRequested>,
     time: Res<Time>,
+    rest: Res<RestStance>,
+    mut prev_rest: Local<RestKind>,
     mut anchor: ResMut<LogoutCountdownAnchor>,
     mut optimistic: ResMut<OptimisticLogoutCountdown>,
 
@@ -186,6 +195,25 @@ pub fn update_logout_countdown(
     mut label_q: Query<&mut Text, With<LogoutCountdownLabel>>,
 ) {
     let now = time.elapsed_secs_f64();
+
+    // Stand-up is LOCAL knowledge (Sit key, heal toggle, movement exit, /sit):
+    // the server cancels leavegame on stand-up WITHOUT sending any cancel
+    // packet, so we just stop drawing — send-and-assume. If the countdown was
+    // actually still live, the next 0x053 tick carries a NEW value and
+    // re-anchors within a second; if it was cancelled, nothing does. Checked
+    // BEFORE request handling so a /shutdown on the same frame as stand-up
+    // still arms fresh.
+    let stood_up = rest.kind == RestKind::None && *prev_rest != RestKind::None;
+    *prev_rest = rest.kind;
+    if stood_up {
+        optimistic.state = OptimisticState::None;
+        anchor.server_seconds = None;
+        // The pre-stand-up tick is still sitting in the snapshot (no cancel
+        // packet exists to clear it); suppress exactly that value so it cannot
+        // re-anchor. A new /shutdown or a surviving countdown ticks a different
+        // value and anchors as usual.
+        anchor.suppress_stale = scene_state.snapshot.logout_countdown;
+    }
 
     let mut latest_request: Option<LogoutRequested> = None;
     for ev in requests.read() {
@@ -204,12 +232,18 @@ pub fn update_logout_countdown(
         };
     }
 
-    let countdown = scene_state.snapshot.logout_countdown;
-    match countdown {
+    // The stand-up-suppressed stale tick must not re-anchor; any other value is
+    // a live tick and anchors as usual (clearing the suppression with it).
+    let live = match scene_state.snapshot.logout_countdown {
+        Some(c) if anchor.suppress_stale == Some(c) => None,
+        other => other,
+    };
+    match live {
         Some(c) if anchor.server_seconds != Some(c.seconds_remaining) => {
             anchor.server_seconds = Some(c.seconds_remaining);
             anchor.shutdown = c.shutdown;
             anchor.anchor_secs = now;
+            anchor.suppress_stale = None;
 
             if matches!(optimistic.state, OptimisticState::Optimistic { .. }) {
                 optimistic.state = OptimisticState::None;

@@ -192,6 +192,41 @@ fn myroom_login_keeps_forced_origin_seed() {
     );
 }
 
+/// A far (>snap) self-position carrier snaps us to the server in steady state, but
+/// during the post-zone-in settle window (`refuse_snap`) it is an out-of-order /
+/// duplicate position from around the transition and must keep our local seed instead
+/// of yanking us into another zone's coordinate space ("same spot, different zone").
+#[test]
+fn far_carrier_snaps_in_steady_state_but_not_during_settle() {
+    let local = v(-15.0, -132.8, -4.2); // where we actually stand (Bastok)
+    let stale = v(579.5, -305.1, -1.9); // an old-zone coordinate (>10 yalms away)
+
+    assert!(
+        matches!(
+            reconcile_self_pos(local, stale, false),
+            SelfPosReconcile::Snap
+        ),
+        "steady state: a far carrier snaps to the server"
+    );
+    assert!(
+        matches!(
+            reconcile_self_pos(local, stale, true),
+            SelfPosReconcile::KeepLocal
+        ),
+        "settle window: a far (out-of-order) carrier keeps our local seed"
+    );
+
+    // A close carrier is unaffected by the settle gate — it still keeps/rubber-bands.
+    let near = v(-14.0, -132.8, -4.2); // ~1 yalm away
+    assert!(
+        matches!(
+            reconcile_self_pos(local, near, true),
+            SelfPosReconcile::KeepLocal
+        ),
+        "close carrier keeps local regardless of settle window"
+    );
+}
+
 /// Pins the XIM doorOffset branches (AssetViewer.kt:654-663): 2F interiors
 /// shift the door 3.15 yalms along native z, the [S]-city/Adoulin bases shift
 /// along x.
@@ -621,8 +656,20 @@ fn should_emit_pos_bypasses_rate_limit_on_heading_change() {
 
 #[test]
 fn flood_drain_waits_for_self_pos_seed() {
-    assert!(!should_break_flood(false));
-    assert!(should_break_flood(true));
+    // Pre-GAMEOK drain (break_on_idle=false): keep reading until the seed lands.
+    assert!(
+        !should_break_flood(false, false),
+        "unseeded pre-GAMEOK drain must wait"
+    );
+    assert!(
+        should_break_flood(false, true),
+        "seeded pre-GAMEOK drain may break on idle"
+    );
+    // Quiescence drains (break_on_idle=true): stop on idle regardless of seed.
+    assert!(
+        should_break_flood(true, false),
+        "quiescence drain breaks on idle unconditionally"
+    );
 }
 
 #[test]
@@ -653,7 +700,7 @@ fn reconcile_self_pos_keep_local_under_2_yalms() {
     let local = v(0.0, 0.0, 0.0);
     let server = v(1.0, 1.0, 0.5);
     assert_eq!(
-        reconcile_self_pos(local, server),
+        reconcile_self_pos(local, server, false),
         SelfPosReconcile::KeepLocal,
     );
 }
@@ -662,7 +709,7 @@ fn reconcile_self_pos_keep_local_under_2_yalms() {
 fn reconcile_self_pos_rubberband_between_2_and_10() {
     let local = v(0.0, 0.0, 0.0);
     let server = v(3.0, 4.0, 0.0);
-    match reconcile_self_pos(local, server) {
+    match reconcile_self_pos(local, server, false) {
         SelfPosReconcile::Rubberband { target } => {
             assert_eq!(target, server);
         }
@@ -674,7 +721,11 @@ fn reconcile_self_pos_rubberband_between_2_and_10() {
 fn reconcile_self_pos_snap_above_10_yalms() {
     let local = v(0.0, 0.0, 0.0);
     let server = v(12.0, 5.0, 0.0);
-    assert_eq!(reconcile_self_pos(local, server), SelfPosReconcile::Snap,);
+    // Steady state (refuse_snap=false): a far carrier snaps to the server.
+    assert_eq!(
+        reconcile_self_pos(local, server, false),
+        SelfPosReconcile::Snap,
+    );
 }
 
 #[test]
@@ -682,13 +733,13 @@ fn reconcile_self_pos_boundaries() {
     let local = v(0.0, 0.0, 0.0);
     let just_inside = v(2.0, 0.0, 0.0);
     assert_eq!(
-        reconcile_self_pos(local, just_inside),
+        reconcile_self_pos(local, just_inside, false),
         SelfPosReconcile::KeepLocal,
     );
 
     let edge = v(10.0, 0.0, 0.0);
     assert!(matches!(
-        reconcile_self_pos(local, edge),
+        reconcile_self_pos(local, edge, false),
         SelfPosReconcile::Rubberband { .. },
     ));
 }

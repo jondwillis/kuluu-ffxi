@@ -837,7 +837,7 @@ pub fn sync_particle_meshes(
     for &(i, despawn) in reap.iter().rev() {
         let g = sim.generators.swap_remove(i);
         if despawn {
-            commands.entity(g.entity).despawn();
+            commands.entity(g.entity).try_despawn();
         }
     }
 }

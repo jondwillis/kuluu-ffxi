@@ -21,13 +21,21 @@ path = "src/lib.rs"
 name = "kuluu"
 path = "src/main.rs"
 
+[[example]]
+# Headless replay of the single-authority walker over real MZB geometry
+# (plan §4). Needs the viewer feature: the walker lives in `view_native`.
+name = "zz-field-walk"
+required-features = ["native-window"]
+
 [features]
 # The native windowed viewer is the mode we develop and ship by default, so
 # enable it out of the box: a bare `cargo build`/`cargo test -p kuluu`
 # then compiles `view_native` and runs its tests instead of silently skipping
-# them (its tests only exist under this feature). CI / release / checks.sh
-# still pass `--features native-window` explicitly, so this only affects bare
-# invocations. For the lean headless/relay-only binary (no Bevy), build with
+# them (its tests only exist under this feature). DLSS is OPT-IN — local
+# dev/test builds pass `--features dlss` explicitly; SDK-less environments
+# (CI runners, release legs, Steam Deck docker) build with
+# `--no-default-features --features native-window` so bevy/dlss never enters
+# their link graph; the lean headless/relay-only binary (no Bevy) uses plain
 # `--no-default-features`.
 default = ["native-window"]
 # Enable the native windowed viewer (`native` subcommand). Opens a real
@@ -47,6 +55,15 @@ native-window = [
 # force-enabling the viewer dep outside native-window builds.
 enhanced-buff-tooltips = ["kuluu-render?/enhanced-buff-tooltips"]
 enhanced-cast-bar = ["kuluu-render?/enhanced-cast-bar"]
+# Enhanced (non-retail) mob/pet HP readout on nameplates: the green bar under
+# the billboard plate plus the "{name} {pct}%" suffix in the UI plates. Retail
+# shows no mob HP; without this feature a persisted `mob_hp_under` can never
+# light either, and the Debug -> Retail+ row does not exist.
+enhanced-mob-hp-under = ["kuluu-render?/enhanced-mob-hp-under"]
+# Enhanced (non-retail) party-frame Job column: L1 rows gain a job-icon column.
+# Retail's party frame shows no jobs; without this feature a persisted
+# `job_display` can never light it, and the Debug -> Retail+ row does not exist.
+enhanced-job-display = ["kuluu-render?/enhanced-job-display"]
 # Enable the WebSocket relay listener (`--relay-listen <addr>` global flag).
 # Publishes the same `kuluu-snapshot` frames the in-process bridge produces,
 # so external tools (and the future wasm browser viewer) can consume the
@@ -66,6 +83,20 @@ trace = ["bevy/trace_chrome", "dep:tracing-chrome"]
 # Combine with native-window, e.g.:
 #   cargo run -p kuluu --features=native-window,relay,dynamic_linking
 dynamic_linking = ["bevy/dynamic_linking"]
+# NVIDIA DLSS Super Resolution. Implies the native viewer (DLSS is meaningless
+# without a window) and lights up the DLSS rows in both graphics menus when
+# the runtime supports it. OPT-IN: local dev/test builds pass `--features dlss`
+# explicitly; SDK-less environments (CI runners, release legs, Steam Deck
+# docker) simply don't, so bevy/dlss stays out of their link graph.
+# Build-time requirements (DLSS SDK + Vulkan SDK + clang; dlss_wgpu's build.rs
+# panics without DLSS_SDK) and the runtime DLL story live in docs/DLSS.md.
+dlss = ["native-window", "kuluu-render/dlss", "bevy/dlss"]
+# DEV-ONLY: the in-game Debug menu (page 2 of Commands, incl. its Retail+
+# section with the DLSS/Job Display gates). Never part of a shipped release
+# build — retail parity holds by construction; dev builds pass it explicitly,
+# e.g. `cargo build -p kuluu --features debug-menu`. See kuluu-render's
+# `debug-menu`.
+debug-menu = ["kuluu-render?/debug-menu"]
 
 [dependencies]
 kuluu-session = { path = "../kuluu-session" }

@@ -220,7 +220,7 @@ pub fn despawn_bake_camera(mut stage: ResMut<BakeStage>, mut commands: Commands)
         return;
     }
     if let Ok(mut ec) = commands.get_entity(entity) {
-        ec.despawn();
+        ec.try_despawn();
     }
     *stage = BakeStage::Idle;
 }

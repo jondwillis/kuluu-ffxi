@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape", "xtask"]
+members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-dlss-nr", "kuluu-ngx-fwd", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape", "xtask"]
 # `xtask` is project automation run on demand via `cargo xtask` — exclude it
 # from the default set so plain `cargo build`/`test` don't compile it.
-default-members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape"]
+default-members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-dlss-nr", "kuluu-ngx-fwd", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape"]
 
 # Vendored fork of recastnavigation-rs 0.1.0 with a one-line `#include
 # <cstddef>` in Deterministic.h. Without it, `cargo test` fails with
@@ -136,9 +136,11 @@ targets = [
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
 ]
-# Mirror the hand-rolled legs' `cargo build -p kuluu --features native-window`.
+# Mirror the hand-rolled legs' `cargo build -p kuluu --no-default-features
+# --features native-window` (dlss is a default feature now; dist's runners have
+# no DLSS SDK, so it stays out of the shipped binaries).
 features = ["native-window"]
-default-features = true
+default-features = false
 # A YAML array of steps injected before `dist build`. The path is resolved
 # relative to .github/workflows/, so `../` keeps the fragment OUT of that dir —
 # GitHub Actions runs every *.yml under .github/workflows/ as a workflow, and a

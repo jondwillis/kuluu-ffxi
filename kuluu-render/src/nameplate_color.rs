@@ -64,11 +64,21 @@ const MODULATE_2X: f32 = 2.0;
 pub struct NameColorTable {
     colors: Vec<Color>,
     loaded: bool,
+    /// Bumped every time the table content actually changes. Consumers fold it
+    /// into their change keys so a late load (the DAT root can land after the
+    /// first HUD draw) forces exactly one rebuild instead of waiting for an
+    /// unrelated key field to move; idempotent reloads do not bump.
+    generation: u64,
 }
 
 impl NameColorTable {
     pub fn is_loaded(&self) -> bool {
         self.loaded
+    }
+
+    /// Content version: 0 until the first successful load, +1 per content change.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn len(&self) -> usize {
@@ -102,7 +112,7 @@ impl NameColorTable {
         let Some(group) = find_ui_element_group(dat_bytes, NCOL_GROUP) else {
             return false;
         };
-        self.colors = group
+        let colors = group
             .elements
             .iter()
             .take(NAME_COLOR_COUNT)
@@ -113,7 +123,11 @@ impl NameColorTable {
                     .unwrap_or(Color::WHITE)
             })
             .collect();
-        self.loaded = !self.colors.is_empty();
+        if colors != self.colors {
+            self.colors = colors;
+            self.loaded = !self.colors.is_empty();
+            self.generation += 1;
+        }
         self.loaded
     }
 }
@@ -369,6 +383,7 @@ mod tests {
             heading: 0,
             hp_pct: Some(100),
             bt_target_id: 0,
+            name_vis: None,
             face_target: 0,
             claim_id: 0,
             speed: 25,

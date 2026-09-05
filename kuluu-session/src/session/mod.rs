@@ -350,7 +350,19 @@ async fn run_map_session(
     }
     emit_stage(event_tx, Stage::Zoning);
 
-    let flood_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    // Safety cap for the pre-GAMEOK drain (the self-seed normally lands well
+    // before it). The post-send quiescence drains below are short by design:
+    // each only needs to observe one s2c stamped AFTER the server accepted the
+    // previous send so the next c2s carries a fresh ack — parse() drops any
+    // non-LOGIN c2s whose ack != server_packet_id (vendor/server/src/map/
+    // map_networking.cpp:478), and that counter advances once per processed
+    // c2s (:499) — never per s2c sent. Breaking on the fresh stamp instead of
+    // waiting for socket idle keeps each inter-c2s gap to milliseconds; a full
+    // 8 s cap drain in a busy zone would exceed LSB's 5 s link-dead window
+    // (vendor/server/src/map/map_session_container.cpp:206-220) and mark us
+    // disconnecting mid-zone-in.
+    const FLOOD_DRAIN_CAP: std::time::Duration = std::time::Duration::from_secs(8);
+    let flood_deadline = std::time::Instant::now() + FLOOD_DRAIN_CAP;
     let mut server_last_seq: u16 = 0;
     let mut total_subs = 0usize;
     let mut pending_event_end: Vec<(u32, u16, u16)> = Vec::new();
@@ -385,69 +397,37 @@ async fn run_map_session(
 
     let mut mog = SelfMogState::default();
 
-    // The TALKNUM family resolves against the zone dialog DAT owned by the
-    // keepalive loop's DialogSession, so bodies arriving during the flood are
-    // buffered and replayed once it exists — never dropped silently. The cap
-    // bounds memory against a misbehaving server; zone onZoneIn lua emits only
-    // a handful of messageSpecial lines (e.g.
-    // vendor/server/scripts/zones/Attohwa_Chasm/Zone.lua).
-    const FLOOD_ZONE_MESSAGE_MAX: usize = 32;
     let mut flood_zone_messages: Vec<(u16, Vec<u8>)> = Vec::new();
-    while std::time::Instant::now() < flood_deadline {
-        match tokio::time::timeout(std::time::Duration::from_millis(500), map.recv_decrypted())
-            .await
-        {
-            Ok(Ok(buf)) => {
-                let header = framing::Header::read(&buf[..framing::FFXI_HEADER_SIZE]);
-                server_last_seq = header.id_and_size;
-                for sub in framing::walk_sub_packets(&buf[framing::FFXI_HEADER_SIZE..]).flatten() {
-                    total_subs += 1;
-                    if ZONE_MESSAGE_OPCODES.contains(&sub.opcode) {
-                        if flood_zone_messages.len() < FLOOD_ZONE_MESSAGE_MAX {
-                            flood_zone_messages.push((sub.opcode, sub.data.to_vec()));
-                        } else {
-                            tracing::warn!(
-                                opcode = format!("{:#05X}", sub.opcode),
-                                "zone-message flood buffer full; dropping zone message"
-                            );
-                        }
-                        continue;
-                    }
-                    handle_sub_packet(
-                        &sub,
-                        event_tx,
-                        &mut pending_event_end,
-                        &mut cutscene,
-                        bootstrap.char_id,
-                        bootstrap.char_name,
-                        &mut self_act_index,
-                        &mut name_cache,
-                        &mut kind_cache,
-                        &mut claim_cache,
-                        &mut name_miss_dedup,
-                        &mut current_zone_id,
-                        &mut self_pos,
-                        &mut self_pos_seeded,
-                        &mut npc_name_resolver,
-                        &mut emote_text_resolver,
-                        &mut sysmes_resolver,
-                        &mut treasure_pool,
-                        &mut flood_in_mog_house,
-                        &mut mog,
-                        spawn_fallback,
-                    );
-                }
-            }
-
-            Ok(Err(_)) => break,
-
-            Err(_elapsed) => {
-                if should_break_flood(self_pos_seeded) {
-                    break;
-                }
-            }
-        }
-    }
+    drain_zone_flood(
+        map,
+        flood_deadline,
+        false,
+        None,
+        &mut server_last_seq,
+        &mut total_subs,
+        &mut self_pos_seeded,
+        event_tx,
+        &mut pending_event_end,
+        &mut cutscene,
+        bootstrap.char_id,
+        bootstrap.char_name,
+        &mut self_act_index,
+        &mut name_cache,
+        &mut kind_cache,
+        &mut claim_cache,
+        &mut name_miss_dedup,
+        &mut current_zone_id,
+        &mut self_pos,
+        &mut npc_name_resolver,
+        &mut emote_text_resolver,
+        &mut sysmes_resolver,
+        &mut treasure_pool,
+        &mut flood_in_mog_house,
+        &mut mog,
+        spawn_fallback,
+        &mut flood_zone_messages,
+    )
+    .await;
     tracing::info!(
         iteration,
         total_subs,
@@ -467,12 +447,110 @@ async fn run_map_session(
 
     let mut sub_seq: u16 = map_client::BOOTSTRAP_SUB_SYNC.wrapping_add(1);
 
+    // Each c2s below is followed by a quiescence drain of the server's reply:
+    // parse() advances server_packet_id once per processed c2s and stamps that
+    // value on its response, so the next send must carry the ack observed in
+    // that reply — firing back-to-back with one captured ack gets every send
+    // after the first eaten by the retransmit guard above.
+    macro_rules! quiesce {
+        () => {
+            drain_zone_flood(
+                map,
+                std::time::Instant::now() + FLOOD_DRAIN_CAP,
+                true,
+                Some(server_last_seq),
+                &mut server_last_seq,
+                &mut total_subs,
+                &mut self_pos_seeded,
+                event_tx,
+                &mut pending_event_end,
+                &mut cutscene,
+                bootstrap.char_id,
+                bootstrap.char_name,
+                &mut self_act_index,
+                &mut name_cache,
+                &mut kind_cache,
+                &mut claim_cache,
+                &mut name_miss_dedup,
+                &mut current_zone_id,
+                &mut self_pos,
+                &mut npc_name_resolver,
+                &mut emote_text_resolver,
+                &mut sysmes_resolver,
+                &mut treasure_pool,
+                &mut flood_in_mog_house,
+                &mut mog,
+                spawn_fallback,
+                &mut flood_zone_messages,
+            )
+            .await;
+        };
+    }
+
     {
         let payload = build_subpacket_gameok(sub_seq);
         sub_seq = sub_seq.wrapping_add(1);
         map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
             .await?;
-        tracing::info!(sub_seq, "sent 0x00C GAMEOK (zone-in)");
+        // `ack` must equal the server's current server_packet_id or parse()
+        // drops this c2s and re-sends its cached last s2c instead.
+        tracing::info!(
+            sub_seq,
+            ack = server_last_seq,
+            "sent 0x00C GAMEOK (zone-in)"
+        );
+    }
+    quiesce!();
+    // c2s 0x076 GROUP_LIST_REQ: request the full party table. The server
+    // answers with GROUP_TBL (0x0C8) + GROUP_LIST (0x0DD) for every member.
+    // Sent BEFORE 0x061 so the roster (GROUP_TBL) lands ahead of self's
+    // GROUP_ATTR, matching the order LSB's own ReloadParty() uses. For a solo
+    // player LSB answers with an empty GROUP_TBL(nullptr); the state merge
+    // keeps self through that (see PartyTableReset).
+    //
+    // Skipped while InEvent: LSB validates 0x076 against BlockedState::InEvent
+    // and drops it silently during a cutscene (vendor/server/src/map/packets/
+    // c2s/0x076_group_list_req.cpp:31). Zone-in events start ~4 s after the
+    // bootstrap 0x00A (AfterZoneIn queue, vendor/server/src/map/packets/c2s/
+    // 0x00a_login.cpp), so a dragged flood can land this send inside one —
+    // by then the event's dialog packets already sit in pending_event_end.
+    // The keepalive loop fires the request once that drains; any 0x05B it
+    // flushes first precedes us in the same datagram, so the server sees the
+    // event end before the request.
+    let mut group_list_deferred = false;
+    if pending_event_end.is_empty() {
+        let payload = build_subpacket_group_list_req(sub_seq);
+        sub_seq = sub_seq.wrapping_add(1);
+        map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+            .await?;
+        tracing::info!(
+            sub_seq,
+            ack = server_last_seq,
+            "sent 0x076 GROUP_LIST_REQ (zone-in party request)"
+        );
+    } else {
+        group_list_deferred = true;
+        tracing::info!(
+            pending_events = pending_event_end.len(),
+            "in-event at zone-in — deferring 0x076 GROUP_LIST_REQ until the event clears"
+        );
+    }
+    quiesce!();
+    // c2s 0x061 CLISTATUS: request the local player's status block. The server
+    // answers with SendLocalPlayerPackets — including s2c GROUP_ATTR (0x0DF) for
+    // self, which is the ONLY source of group data on zone-in for a solo player
+    // (LSB pushes no 0x0DD/0x0DF to players without a party). Without this the
+    // party frame would sit on its default 0/0 draw until the next zone.
+    {
+        let payload = build_subpacket_clistatus(sub_seq);
+        sub_seq = sub_seq.wrapping_add(1);
+        map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+            .await?;
+        tracing::info!(
+            sub_seq,
+            ack = server_last_seq,
+            "sent 0x061 CLISTATUS (zone-in self status request)"
+        );
     }
     emit_stage(event_tx, Stage::InZone);
     let _ = event_tx.send(AgentEvent::Diagnostics {
@@ -492,6 +570,7 @@ async fn run_map_session(
         sub_seq,
         server_last_seq,
         pending_event_end,
+        group_list_deferred,
         cutscene,
         bootstrap.char_id,
         bootstrap.char_name.to_string(),
@@ -516,6 +595,130 @@ async fn run_map_session(
         cfg.server.clone(),
     )
     .await
+}
+
+/// The TALKNUM family resolves against the zone dialog DAT owned by the
+/// keepalive loop's DialogSession, so bodies arriving during the flood are
+/// buffered and replayed once it exists — never dropped silently. This cap
+/// bounds memory against a misbehaving server; zone onZoneIn lua emits only
+/// a handful of messageSpecial lines (e.g.
+/// vendor/server/scripts/zones/Attohwa_Chasm/Zone.lua).
+const FLOOD_ZONE_MESSAGE_MAX: usize = 32;
+
+/// Whether the zone-in flood drain should stop on an idle recv window. Unconditional
+/// when `break_on_idle` (the short post-send quiescence drains), otherwise only once
+/// the self position seed has landed — so the pre-GAMEOK drain keeps reading until it
+/// holds our authoritative spawn before letting the next c2s fire.
+fn should_break_flood(break_on_idle: bool, self_pos_seeded: bool) -> bool {
+    break_on_idle || self_pos_seeded
+}
+
+/// Drains and processes zone-in traffic until `deadline`, or earlier once the
+/// socket has been idle for one recv window: unconditionally when
+/// `break_on_idle`, otherwise only after the self position seed has landed.
+/// When `ack_at_send` is Some (post-send quiescence), also breaks as soon as a
+/// datagram stamped differently from that ack arrives — the server's id only
+/// advances when it accepts one of our c2s, so any post-acceptance stamp is
+/// exactly the next fresh ack and there is no reason to keep waiting for idle.
+/// Every received datagram refreshes `*server_last_seq` so the next c2s can
+/// carry a fresh ack (see parse()'s retransmit guard).
+#[allow(clippy::too_many_arguments)]
+async fn drain_zone_flood(
+    map: &MapClient,
+    deadline: std::time::Instant,
+    break_on_idle: bool,
+    ack_at_send: Option<u16>,
+    server_last_seq: &mut u16,
+    total_subs: &mut usize,
+    self_pos_seeded: &mut bool,
+    event_tx: &broadcast::Sender<AgentEvent>,
+    pending_event_end: &mut Vec<(u32, u16, u16)>,
+    cutscene: &mut crate::event_dialog::CutsceneScope,
+    self_char_id: u32,
+    self_char_name: &str,
+    self_act_index: &mut Option<u16>,
+    name_cache: &mut std::collections::HashMap<u32, String>,
+    kind_cache: &mut std::collections::HashMap<u32, crate::state::EntityKind>,
+    claim_cache: &mut std::collections::HashMap<u32, u32>,
+    name_miss_dedup: &mut std::collections::HashMap<
+        (u32, crate::state::NameMissKind),
+        std::time::Instant,
+    >,
+    current_zone_id: &mut u16,
+    self_pos: &mut Position,
+    npc_name_resolver: &mut NpcNameResolver,
+    emote_text: &mut EmoteTextResolver,
+    sysmes: &mut treasure::SysMesResolver,
+    pool: &mut treasure::TreasurePool,
+    was_in_mog_house: &mut bool,
+    mog: &mut SelfMogState,
+    zoneline_spawn_fallback: Option<Vec3>,
+    flood_zone_messages: &mut Vec<(u16, Vec<u8>)>,
+) {
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), map.recv_decrypted())
+            .await
+        {
+            Ok(Ok(buf)) => {
+                let header = framing::Header::read(&buf[..framing::FFXI_HEADER_SIZE]);
+                *server_last_seq = header.id_and_size;
+                for sub in framing::walk_sub_packets(&buf[framing::FFXI_HEADER_SIZE..]).flatten() {
+                    *total_subs += 1;
+                    if ZONE_MESSAGE_OPCODES.contains(&sub.opcode) {
+                        if flood_zone_messages.len() < FLOOD_ZONE_MESSAGE_MAX {
+                            flood_zone_messages.push((sub.opcode, sub.data.to_vec()));
+                        } else {
+                            tracing::warn!(
+                                opcode = format!("{:#05X}", sub.opcode),
+                                "zone-message flood buffer full; dropping zone message"
+                            );
+                        }
+                        continue;
+                    }
+                    handle_sub_packet(
+                        &sub,
+                        event_tx,
+                        pending_event_end,
+                        cutscene,
+                        self_char_id,
+                        self_char_name,
+                        self_act_index,
+                        name_cache,
+                        kind_cache,
+                        claim_cache,
+                        name_miss_dedup,
+                        current_zone_id,
+                        self_pos,
+                        self_pos_seeded,
+                        npc_name_resolver,
+                        emote_text,
+                        sysmes,
+                        pool,
+                        was_in_mog_house,
+                        mog,
+                        zoneline_spawn_fallback,
+                    );
+                }
+                // Post-send quiesce: the server's id only advances when it accepts one of our c2s
+                // (vendor/server/src/map/map_networking.cpp:499), so any datagram stamped differently
+                // from the ack we just sent proves acceptance — break instead of waiting for idle.
+                // Waiting for idle in a busy zone runs the full FLOOD_DRAIN_CAP with zero c2s sent,
+                // and LSB flips isLinkDead at 5 s of c2s silence (vendor/server/src/map/
+                // map_session_container.cpp:206-220) — marking us disconnecting mid-zone-in.
+                if ack_at_send.is_some_and(|ack| *server_last_seq != ack) {
+                    break;
+                }
+            }
+
+            Ok(Err(_)) => break,
+
+            Err(_) => {
+                if should_break_flood(break_on_idle, *self_pos_seeded) {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn classify_char_npc(
@@ -777,6 +980,10 @@ fn handle_sub_packet(
                             hp_pct: Some(head.hpp),
                             bt_target_id: head.bt_target_id,
                             face_target: head.facetarget(),
+                            // 0x00A's PosHead leaves flags3 zeroed — upstream never
+                            // writes namevis in the login packet (only entity_update.cpp
+                            // does, under UPDATE_HP). The first General-block 0x00E sets it.
+                            name_vis: None,
                             claim_id: 0,
                             speed: head.speed,
                             speed_base: head.speed_base,
@@ -883,13 +1090,19 @@ fn handle_sub_packet(
                     );
                 }
 
-                let name = wire_name.or_else(|| {
-                    if op == s2c::CHAR_NPC {
-                        npc_name_resolver.lookup(head.unique_no).map(str::to_string)
-                    } else {
-                        None
-                    }
-                });
+                // Retail resolves static NPC names from the zone's NPC-name
+                // DAT by id and IGNORES the wire name field for them -- on the
+                // wire that field carries the door FourCC for doors ("_6i3")
+                // and the internal script name for helpers ("blank"). DAT
+                // first; wire only as fallback for ids the DAT does not cover.
+                let name = if op == s2c::CHAR_NPC {
+                    npc_name_resolver
+                        .lookup(head.unique_no)
+                        .map(str::to_string)
+                        .or(wire_name)
+                } else {
+                    wire_name
+                };
 
                 let name = name.map(|n| n.replace('_', " "));
                 if let Some(n) = name.as_ref() {
@@ -914,6 +1127,22 @@ fn handle_sub_packet(
 
                 let send_flag = sub.data.get(6).copied().unwrap_or(0);
                 let hp_pct = (send_flag & 0x04 != 0).then_some(head.hpp);
+
+                // mob_hp diagnostic: UPDATE_HP on a Mob/Pet is event-driven —
+                // the server only sets the bit when HP actually changes, so this
+                // logs once per real change. If these lines stop arriving while
+                // you hit a mob, the break is upstream of the fold; if they
+                // arrive but the bar still does not move, it is downstream.
+                if hp_pct.is_some() && matches!(kind, EntityKind::Mob | EntityKind::Pet) {
+                    tracing::info!(
+                        target: "mob_hp",
+                        id = head.unique_no,
+                        ?kind,
+                        send_flag = format!("0x{:02x}", send_flag),
+                        hpp = head.hpp,
+                        "0x0E UPDATE_HP"
+                    );
+                }
 
                 let look = if op == s2c::CHAR_NPC {
                     decode::LookData::decode_char_npc(sub.data)
@@ -958,6 +1187,10 @@ fn handle_sub_packet(
                         hp_pct,
                         bt_target_id,
                         face_target: head.facetarget(),
+                        // UPDATE_HP-gated like its neighbours: entity_update.cpp:357/:408
+                        // write byte 0x2B only inside `if (updatemask & UPDATE_HP)`, and the
+                        // packet buffer is zero-filled, so a POS-only update carries no namevis.
+                        name_vis: (send_flag & UPDATE_HP != 0).then_some((head.flags3 >> 24) as u8),
                         claim_id,
                         speed: head.speed,
                         speed_base: head.speed_base,
@@ -1462,6 +1695,20 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
         }
+        s2c::GROUP_TBL => {
+            if let Ok(tbl) =
+                decode::GroupTbl::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                tracing::info!(
+                    kind = ?tbl.kind,
+                    member_count = tbl.members.len(),
+                    "0x0C8 GROUP_TBL (party definition)",
+                );
+                let _ = event_tx.send(AgentEvent::PartyTableReset {
+                    members: tbl.members,
+                });
+            }
+        }
         s2c::GROUP_LIST => {
             if let Ok((attrs, extra)) = decode::PartyAttrs::decode_group_list(sub.data)
                 .inspect_err(|e| warn_decode_err(sub.opcode, e))
@@ -1478,6 +1725,14 @@ fn handle_sub_packet(
             if let Ok(attrs) = decode::PartyAttrs::decode_group_attr(sub.data)
                 .inspect_err(|e| warn_decode_err(sub.opcode, e))
             {
+                tracing::info!(
+                    id = attrs.unique_no,
+                    is_self = attrs.unique_no == self_char_id,
+                    hp = attrs.hp,
+                    hpp = attrs.hpp,
+                    zone_no = attrs.zone_no,
+                    "0x0DF GROUP_ATTR",
+                );
                 if attrs.unique_no == self_char_id {
                     note_mog_transition(attrs.moghouse_flg != 0, was_in_mog_house, event_tx);
                 }
@@ -1944,6 +2199,9 @@ async fn keepalive_loop(
     mut sub_seq: u16,
     mut server_last_seq: u16,
     mut pending_event_end: Vec<(u32, u16, u16)>,
+    // 0x076 GROUP_LIST_REQ was skipped at zone-in because we were InEvent;
+    // fire it on the first tick after the event clears.
+    mut group_list_deferred: bool,
     mut cutscene: crate::event_dialog::CutsceneScope,
     self_char_id: u32,
     character_name: String,
@@ -2067,6 +2325,14 @@ async fn keepalive_loop(
 
     let mut rubber_band_target: Option<Vec3> = None;
     let mut last_rubber_band_step: std::time::Instant = std::time::Instant::now();
+
+    // Post-zone-in settle window (see ZONE_IN_SETTLE): for the first moments of a
+    // zone-generation, refuse to snap self_pos to a far-away carrier so an
+    // out-of-order/duplicate position from around the transition cannot drop us in
+    // the wrong zone. Anchored at main-loop start — by then the flood has seeded (or
+    // will shortly), and this covers the vulnerable period while late carriers can
+    // still arrive.
+    let zone_in_settle_until = std::time::Instant::now() + ZONE_IN_SETTLE;
 
     let mut self_in_mog_house = false;
 
@@ -3667,6 +3933,17 @@ async fn keepalive_loop(
                     pending_event_end_anchor = None;
                 }
 
+                // Deferred 0x076 GROUP_LIST_REQ (skipped at zone-in while InEvent —
+                // LSB drops it there, vendor/server/src/map/packets/c2s/
+                // 0x076_group_list_req.cpp:31). Fire now that the event has cleared;
+                // any 0x05B this tick's flush sent precedes us in the same datagram.
+                if group_list_deferred && pending_event_end.is_empty() {
+                    group_list_deferred = false;
+                    payload.extend(build_subpacket_group_list_req(sub_seq));
+                    sub_seq = sub_seq.wrapping_add(1);
+                    tracing::info!("sent deferred 0x076 GROUP_LIST_REQ (zone-in party request, event cleared)");
+                }
+
                 if let Some(target) = rubber_band_target {
                     let dt = last_rubber_band_step.elapsed().as_secs_f32();
                     last_rubber_band_step = std::time::Instant::now();
@@ -4042,7 +4319,13 @@ async fn keepalive_loop(
                                 if let Ok(head) = decode::PosHead::decode(sub.data) {
                                     if head.unique_no == self_char_id {
                                         let server_pos = self_pos.pos;
-                                        match reconcile_self_pos(prev_self_pos, server_pos) {
+                                        // During the post-zone-in settle window a far (>snap)
+                                        // carrier is an out-of-order/duplicate position from around
+                                        // the transition, not a real teleport — keep our local seed
+                                        // (see ZONE_IN_SETTLE).
+                                        let refuse_snap = self_pos_seeded
+                                            && std::time::Instant::now() < zone_in_settle_until;
+                                        match reconcile_self_pos(prev_self_pos, server_pos, refuse_snap) {
                                             SelfPosReconcile::KeepLocal => {
 
                                                 self_pos.pos = prev_self_pos;
@@ -4099,6 +4382,14 @@ async fn keepalive_loop(
                                                 animation = head.server_status,
                                                 "heal state synced from CHAR_PC"
                                             );
+                                            // Stand-up drops the LEAVEGAME effect
+                                            // server-side with no 0x053 cancel packet, so a
+                                            // heal→walk transition is the client-visible
+                                            // "logout/shutdown cancelled" signal.
+                                            if !server_healing {
+                                                let _ =
+                                                    event_tx.send(AgentEvent::LogoutCountdownCancelled);
+                                            }
                                             is_healing = server_healing;
                                         }
                                     }
@@ -5939,6 +6230,16 @@ const MOVE_EMISSION_PERIOD: std::time::Duration = std::time::Duration::from_mill
 
 const MOVE_BIG_JUMP_YALMS: f32 = 0.5;
 
+/// How long after a zone-in that out-of-order / duplicate self-position carriers
+/// from around the transition are still expected to arrive (the double-bootstrap
+/// re-floods, and pre-transition echoes can land late). Within this window a carrier
+/// whose position is far (> snap threshold) from where we actually stand is treated as
+/// stale — an old-zone coordinate or re-sent snapshot — and must not yank us across
+/// zones (see reconcile_self_pos `refuse_snap`). A legitimate server teleport never
+/// happens in the first moments of a zone, so refusing Snap here cannot mask a real
+/// correction.
+const ZONE_IN_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SelfPosReconcile {
     KeepLocal,
@@ -5948,7 +6249,7 @@ enum SelfPosReconcile {
     Snap,
 }
 
-fn reconcile_self_pos(local: Vec3, server: Vec3) -> SelfPosReconcile {
+fn reconcile_self_pos(local: Vec3, server: Vec3, refuse_snap: bool) -> SelfPosReconcile {
     let dx = server.x - local.x;
     let dy = server.y - local.y;
     let dz = server.z - local.z;
@@ -5958,6 +6259,14 @@ fn reconcile_self_pos(local: Vec3, server: Vec3) -> SelfPosReconcile {
         SelfPosReconcile::KeepLocal
     } else if dist_sq <= 10.0 * 10.0 {
         SelfPosReconcile::Rubberband { target: server }
+    } else if refuse_snap {
+        // Post-zone-in settle window: a far (>snap) self-position carrier is an
+        // out-of-order/duplicate position from around the transition (an old-zone
+        // coordinate or re-sent pre-transition snapshot), not a real teleport —
+        // keep our local seed instead of snapping across zones. A legitimate server
+        // teleport never lands in the first moments of a zone, so this cannot mask a
+        // genuine correction.
+        SelfPosReconcile::KeepLocal
     } else {
         SelfPosReconcile::Snap
     }
@@ -6074,10 +6383,6 @@ fn take_pending_event_end(
     before != pending_event_end.len()
 }
 
-fn should_break_flood(self_pos_seeded: bool) -> bool {
-    self_pos_seeded
-}
-
 /// LSB force-places the player at exactly (0,0,0) rot 192 on Mog House zone-in
 /// (vendor/server/scripts/globals/moghouse.lua:290), so a MYROOM login's origin
 /// seed is authoritative and the near-origin "repair" must not fire.
@@ -6124,6 +6429,7 @@ fn mh_door_entity(model: u16) -> Entity {
         hp_pct: None,
         bt_target_id: 0,
         face_target: 0,
+        name_vis: None,
         claim_id: 0,
         speed: 0,
         speed_base: 0,

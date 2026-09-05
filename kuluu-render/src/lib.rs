@@ -46,6 +46,7 @@ pub mod mouse;
 pub mod nameplate;
 pub mod nameplate_billboard;
 pub mod nameplate_color;
+pub mod nameplate_final_pass;
 pub mod nameplate_icons;
 pub mod nameplate_marker;
 pub mod nameplate_overlay;
@@ -98,13 +99,14 @@ pub use camera::{
     WORLD_GIZMO_LAYER,
 };
 pub use components::{
-    EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate, WorldEntity,
+    CurrRenderPos, EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate,
+    PrevRenderPos, WorldEntity,
 };
 pub use cursor::{system_cursor_icon, CursorPlugin, CursorRequests, CursorStyle};
 pub use cutscene::{CutsceneMode, CutscenePlugin, ScreenFade};
 pub use graphics_settings::{
-    AaMode, CharacterRenderPath, DynamicLights, GraphicsField, GraphicsSettings, QualityPreset,
-    TextureFiltering, ZoneLineDisplay, GRAPHICS_FIELDS,
+    AaMode, CharacterRenderPath, DlssQuality, DynamicLights, GraphicsField, GraphicsSettings,
+    QualityPreset, TextureFiltering, ZoneLineDisplay, DLSS_CONFIG_FIELDS, GRAPHICS_FIELDS,
 };
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
@@ -211,6 +213,9 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
 
         app.add_plugins(lens_flare::LensFlarePlugin);
 
+        // Nameplates: final in-view pass (replaces the retired overlay camera).
+        app.add_plugins(nameplate_final_pass::NameplateFinalPassPlugin);
+
         app.add_plugins(zone_lights::ZoneLightsPlugin);
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -238,6 +243,8 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
 
         app.add_plugins(debug_chat::DebugChatPlugin);
         app.init_resource::<SceneState>()
+            .init_resource::<camera::CameraStepSmoothing>()
+            .init_resource::<camera::AnchorFollow>()
             // Read by sun_moon_system on every platform; only celestial_particles (native)
             // ever sets it true.
             .init_resource::<sun_moon::DatCelestials>()
@@ -270,6 +277,7 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
             .init_resource::<fishing_spot::FishingSpot>()
             .init_resource::<scene::SelfAppearance>()
             .init_resource::<nameplate_billboard::BillboardFont>()
+            .init_resource::<nameplate_billboard::NameplateBillboardDebug>()
             .init_resource::<ui_font::UiFont>()
             .add_plugins(nameplate_color::NameColorPlugin)
             .add_plugins(nameplate_icons::NameplateIconsPlugin)
@@ -280,16 +288,9 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
             .add_systems(Update, ui_font::apply_ui_font)
             .add_systems(PreUpdate, ingest_system::<S>.run_if(resource_exists::<S>))
             .add_systems(PostUpdate, drain_toast_events)
-            // After every Update-schedule camera writer (chase, first-person,
-            // the client's wall-collision clamp), before propagation computes
-            // the GlobalTransforms the renderer extracts — a copy taken any
-            // earlier lags the collision clamp and the plates jiggle against
-            // the world (kuluu-wupy follow-up).
-            .add_systems(
-                PostUpdate,
-                nameplate_overlay::sync_nameplate_overlay_camera
-                    .before(bevy::transform::TransformSystems::Propagate),
-            )
+            // (The nameplate overlay camera used to need a PostUpdate mirror system
+            // here; the final pass in nameplate_final_pass reads each plate's
+            // GlobalTransform from extraction instead.)
             .add_systems(
                 PreUpdate,
                 vana_time::ingest_vana_time.after(ingest_system::<S>),
@@ -301,6 +302,7 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
                         sync_entities_system,
                         sync_entity_looks_system,
                         scene::ensure_self_lookcomp_system,
+                        scene::ensure_self_render_pos_system,
                         process_entity_look_changes,
                         camera_transition_system,
                         chase_camera_system,
@@ -329,6 +331,17 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
                 )
                     .chain()
                     .run_if(resource_exists::<EntityMesh>),
+            )
+            // Runs every rendered frame in the fixed-loop tail, after any
+            // fixed tick may have fired, before Update systems that read
+            // Transform (chase camera, nameplates). Lerps the visual position
+            // between the last two authoritative render Ys so a display frame
+            // rate faster than the 60Hz fixed step doesn't quantize the
+            // chase-camera anchor into visible stair-shake.
+            .add_systems(
+                bevy::prelude::RunFixedMainLoop,
+                scene::interpolate_self_transform_system
+                    .in_set(bevy::prelude::RunFixedMainLoopSystems::AfterFixedMainLoop),
             );
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -465,12 +478,37 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
                 graphics_settings::apply_volumetric_fog_system,
                 graphics_settings::apply_projection_system,
                 graphics_settings::apply_vsync_system,
+                graphics_settings::apply_fullscreen_system,
                 graphics_settings::apply_anti_aliasing_system,
                 graphics_settings::apply_tonemapping_system,
             )
                 .chain()
                 .run_if(resource_changed::<GraphicsSettings>),
         );
+
+        // UNGATED: reacts to window resizes frame-over-frame, so it cannot
+        // live inside the resource_changed tuple above (that only runs when
+        // the settings menu writes -- the "HUD only rescales when I open the
+        // menu" bug).
+        app.add_systems(Update, graphics_settings::apply_ui_scale_system);
+
+        // UNGATED for the same reason: the capability probe writes the
+        // settings resource itself (once, on the frame the renderer's
+        // DlssSuperResolutionSupported marker is seen), which then makes the
+        // resource_changed apply chain run. Ordered before it so the AA
+        // respawn key sees the capability the same frame.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "dlss"))]
+        app.add_systems(
+            Update,
+            graphics::dlss::update_dlss_availability_system
+                .before(graphics_settings::apply_anti_aliasing_system),
+        );
+
+        // DLSS 5 Neural Uplift (NR): registers its main-world apply system +
+        // component extraction plugin, and the render-world prepare/node
+        // systems (see graphics/dlss_nr.rs). No-op without nvngx_dlssnr.dll.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "dlss"))]
+        graphics::dlss_nr::register(app);
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(

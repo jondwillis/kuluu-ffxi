@@ -1,6 +1,6 @@
 [submodule "server"]
 	path = vendor/server
-	url = git@github.com:LandSandBoat/server.git
+	url = https://github.com/LandSandBoat/server.git
 	branch = base
 [submodule "vendor/POLUtils"]
 	path = vendor/POLUtils

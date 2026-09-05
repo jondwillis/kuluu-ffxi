@@ -9,6 +9,7 @@ use bevy::prelude::*;
 use bevy::reflect::TypePath;
 use ffxi_audio::{decode_file, find_audio, AudioKind, DecodedAudio};
 use kuluu_snapshot::ViewerEvent;
+use serde::{Deserialize, Serialize};
 
 #[derive(Asset, Debug, Clone, TypePath)]
 pub struct PcmAudio {
@@ -204,11 +205,52 @@ fn resolve_audible_slot(slots: &BgmSlots, state: &BgmPlaybackState) -> Option<(u
     None
 }
 
-#[derive(Resource, Debug, Clone, Copy, Default)]
+#[derive(Resource, Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct AudioMuteState {
     pub bgm: bool,
 
     pub sfx: bool,
+
+    /// Master volume, 0.0..=1.0. Multiplied into every BGM and SFX gain at
+    /// playback. Mute still hard-overrides to silence regardless of this.
+    /// `#[serde(default = ...)]` keeps old audio.json (pre-volume) loading at
+    /// full volume instead of silent.
+    #[serde(default = "default_master_volume")]
+    pub master: f32,
+}
+
+impl Default for AudioMuteState {
+    fn default() -> Self {
+        // Not muted, full volume. The derived default would give master = 0.0
+        // (f32::default), i.e. silent — wrong for a fresh install.
+        Self {
+            bgm: false,
+            sfx: false,
+            master: default_master_volume(),
+        }
+    }
+}
+
+/// Full volume. New installs and pre-volume `audio.json` files both start here.
+fn default_master_volume() -> f32 {
+    1.0
+}
+
+/// Volume menu step: 0..=100 in fives, stored as 0.0..=1.0.
+pub const VOLUME_STEP: i32 = 5;
+
+impl AudioMuteState {
+    /// Master volume as an integer 0..=100 for menu display.
+    pub fn master_pct(&self) -> i32 {
+        (self.master * 100.0).round().clamp(0.0, 100.0) as i32
+    }
+
+    /// Nudge master volume by `delta` steps of [`VOLUME_STEP`] percent,
+    /// clamped to 0..=100. `delta` is +1 / -1 from the menu left/right.
+    pub fn cycle_master(&mut self, delta: i32) {
+        let pct = (self.master_pct() + delta * VOLUME_STEP).clamp(0, 100);
+        self.master = pct as f32 / 100.0;
+    }
 }
 
 #[derive(Resource, Debug, Clone, Copy, Default)]
@@ -729,7 +771,7 @@ pub fn play_sfx_system(
         listener_camera.iter().next().map(|xf| xf.translation()),
     );
     for ev in events.read() {
-        let volume = sfx_mix_volume(ev, listener_pos);
+        let volume = sfx_mix_volume(ev, listener_pos) * mute.master;
         if volume <= 0.0 {
             continue;
         }
@@ -1049,14 +1091,19 @@ pub fn observe_zone_ambient_bed(
 
 pub fn tick_audio_fades(
     time: Res<Time>,
+    mute: Res<AudioMuteState>,
     mut q: Query<(Entity, &mut AudioFade, Option<&mut bevy::audio::AudioSink>)>,
     mut commands: Commands,
 ) {
+    // BGM fades are the only thing carrying AudioFade today. Master volume (and
+    // the bgm mute) scale the fade curve so a fade-in lands on the user's chosen
+    // level, not a hard 1.0.
+    let master = if mute.bgm { 0.0 } else { mute.master };
     let dt = time.delta_secs();
     for (entity, mut fade, sink) in q.iter_mut() {
         fade.t += dt;
         let t = (fade.t / fade.duration).clamp(0.0, 1.0);
-        let vol = fade.from + (fade.to - fade.from) * t;
+        let vol = (fade.from + (fade.to - fade.from) * t) * master;
         if let Some(mut s) = sink {
             s.set_volume(bevy::audio::Volume::Linear(vol));
         }
@@ -1067,6 +1114,33 @@ pub fn tick_audio_fades(
                 commands.entity(entity).try_remove::<AudioFade>();
             }
         }
+    }
+}
+
+/// Live-apply master volume (and bgm mute) to the currently playing BGM sink
+/// when [`AudioMuteState`] changes. The fade tick owns volume while a fade is
+/// active; once the fade component is gone the steady sink is untouched by
+/// anything else, so this is what makes a mid-song volume change audible
+/// immediately instead of only after the next track swap.
+pub fn apply_master_volume_on_change(
+    mute: Res<AudioMuteState>,
+    slots: Res<BgmSlots>,
+    fades: Query<(), With<AudioFade>>,
+    mut sinks: Query<&mut bevy::audio::AudioSink>,
+) {
+    if !mute.is_changed() {
+        return;
+    }
+    let Some(e) = slots.active_entity else {
+        return;
+    };
+    // A fade is mid-flight on this entity — let tick_audio_fades drive it.
+    if fades.get(e).is_ok() {
+        return;
+    }
+    if let Ok(mut sink) = sinks.get_mut(e) {
+        let vol = if mute.bgm { 0.0 } else { mute.master };
+        sink.set_volume(bevy::audio::Volume::Linear(vol));
     }
 }
 
@@ -1101,6 +1175,7 @@ impl Plugin for AudioPlugin {
                     observe_zone_ambient_bed.run_if(crate::camera::in_game),
                     play_sfx_system,
                     tick_audio_fades,
+                    apply_master_volume_on_change,
                 )
                     .chain()
                     // The bed reads the environment set `sample_zone_weather` selects, so
@@ -1463,6 +1538,7 @@ mod tests {
         let mute = AudioMuteState {
             bgm: true,
             sfx: false,
+            ..Default::default()
         };
         let resolved = if mute.bgm {
             None

@@ -12,7 +12,7 @@ pub struct DebugHeightsRequest;
 
 /// Focus-less GUI driving (kuluu-0pof): a socket `debug_heights` command bumps
 /// the shared handle's seq; fire the request when it changes.
-pub fn trigger_debug_heights_from_socket(
+pub(crate) fn trigger_debug_heights_from_socket(
     handle: Option<Res<super::DebugControlHandle>>,
     mut last_seq: Local<u64>,
     mut requests: MessageWriter<DebugHeightsRequest>,

@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
+use bevy::ecs::system::SystemParam;
 use bevy::light::FogVolume;
 use bevy::picking::Pickable;
 use bevy::prelude::*;
 use kuluu_snapshot::{EntityKind, EntityLook, Vec3 as WireVec3};
 
-use crate::components::{IsSelf, LookComp, MorphIn, Nameplate, WorldEntity};
+use crate::components::{
+    CurrRenderPos, IsSelf, LookComp, MorphIn, Nameplate, PrevRenderPos, WorldEntity,
+};
 use crate::graphics_settings::GraphicsSettings;
 use crate::snapshot::SceneState;
 
@@ -214,6 +217,27 @@ pub fn setup_world(
     });
 }
 
+/// Bundled so [`sync_entities_system`] stays under bevy's 16-param SystemParam
+/// ceiling (it was already at it before the floor gate landed).
+#[derive(SystemParam)]
+pub struct EntitySyncQueries<'w, 's> {
+    xform: Query<'w, 's, &'static mut Transform, With<WorldEntity>>,
+    mat: Query<
+        'w,
+        's,
+        &'static mut MeshMaterial3d<StandardMaterial>,
+        (With<WorldEntity>, Without<MorphIn>),
+    >,
+}
+
+/// The two signals that say "this zone's floor has landed" — the same pair the
+/// loading overlay's `ready` reads. Bundled for the 16-param ceiling.
+#[derive(SystemParam)]
+pub struct ZoneFloorGate<'w> {
+    last_auto: Res<'w, crate::dat_mzb::LastAutoLoadedZone>,
+    in_flight: Res<'w, crate::dat_mzb::LoadMzbInFlight>,
+}
+
 pub fn sync_entities_system(
     state: Res<SceneState>,
     mesh: Res<EntityMesh>,
@@ -227,9 +251,9 @@ pub fn sync_entities_system(
     mut motion: ResMut<crate::combat_stance::EntityMotion>,
     mut blends: ResMut<crate::combat_stance::AnimationBlends>,
     mut commands: Commands,
-    mut q_xform: Query<&mut Transform, With<WorldEntity>>,
-    mut q_mat: Query<&mut MeshMaterial3d<StandardMaterial>, (With<WorldEntity>, Without<MorphIn>)>,
+    mut queries: EntitySyncQueries,
     q_nameplates: Query<&Nameplate>,
+    floor_gate: ZoneFloorGate,
     mut prev_zone: Local<Option<Option<u32>>>,
 ) {
     if !state.dirty {
@@ -237,6 +261,18 @@ pub fn sync_entities_system(
     }
 
     let snap = &state.snapshot;
+
+    // Hard load-order gate: no NPC/character visuals may exist before this
+    // zone's floor has landed. The main-zone MZB streams in asynchronously
+    // AFTER the first InZone snapshot, and an actor spawned ahead of it has
+    // nothing to ground against — it falls at walker terminal velocity while
+    // under-floor recovery is deliberately inert mid-load (and the server
+    // echoes back whatever c2s 0x015 reports, so that fall sticks). The
+    // overlay's `ready` reads this same pair of signals, so the gate opens
+    // exactly when the loading screen lifts. Existing entities keep updating
+    // and stale ones still despawn below; only NEW visuals wait.
+    let floor_ready =
+        crate::dat_mzb::main_zone_floor_ready(snap, &floor_gate.last_auto, &floor_gate.in_flight);
 
     // Keyed on the resolved DAT file id, not zone_id: Mog House entry/exit keeps
     // the city zone_id but teleports the player into a different interior.
@@ -280,7 +316,7 @@ pub fn sync_entities_system(
 
         match tracked.by_id.get(&wire.id).copied() {
             Some(existing) => {
-                if let Ok(mut t) = q_xform.get_mut(existing) {
+                if let Ok(mut t) = queries.xform.get_mut(existing) {
                     if is_self {
                         trace!(
                             target: "self_sync",
@@ -290,30 +326,23 @@ pub fn sync_entities_system(
                             cur_z = t.translation.z,
                             "self ingest"
                         );
-                        // Same visual smoothing every other entity gets: a
-                        // snapshot-cadence hiccup delivers several movement
-                        // ticks in one ingest, and a hard snap renders that as
-                        // a single-frame leap of the actor and its nameplate
-                        // (the camera smooths, so it reads as jiggle). The
-                        // 2-yalm snap threshold still passes real teleports
-                        // through instantly.
-                        let y = if zone_changed {
-                            world_pos.y
-                        } else {
-                            t.translation.y
-                        };
-                        let stepped = if zone_changed {
-                            world_pos
-                        } else {
-                            apply_visual_smoothing(
-                                Vec3::new(t.translation.x, world_pos.y, t.translation.z),
-                                world_pos,
-                            )
-                        };
-                        t.translation = Vec3::new(stepped.x, y, stepped.z);
-                        // Rotation is owned by self_visual_yaw_system: the
-                        // movement heading snaps (about-face, first step) but
-                        // the rendered body should whip around, not teleport.
+                        // Self Transform is owned by apply_self_prediction_system
+                        // (FixedUpdate, driven by LocalPlayerPrediction). The
+                        // server just echoes our c2s 0x015, so ingesting the echo
+                        // here would fight the walker and re-introduce the
+                        // horizontal jiggle the smoothing was meant to hide, and
+                        // stall self.y on stairs (held from prev frame).
+                        //
+                        // Zone change is the one case where the wire is
+                        // authoritative: the walker resyncs from snapshot on
+                        // init or big deltas (PREDICTION_RESYNC_YALMS), but
+                        // seeding the Transform here avoids a one-frame flicker
+                        // at the old zone's coords before the next FixedUpdate
+                        // tick lands. Rotation is owned by
+                        // self_visual_yaw_system.
+                        if zone_changed {
+                            t.translation = world_pos;
+                        }
                     } else if matches!(wire.kind, EntityKind::Other) {
                         // Doors/transports and other non-actor entities keep the
                         // simple visual lerp; pathed NPCs are dead-reckoned by
@@ -324,7 +353,7 @@ pub fn sync_entities_system(
                         t.rotation = heading_to_quat(wire.heading);
                     }
                 }
-                if let Ok(mut m) = q_mat.get_mut(existing) {
+                if let Ok(mut m) = queries.mat.get_mut(existing) {
                     m.0 = mat;
                 }
                 // The spawn arm can only tag self once the id is known, and the
@@ -336,6 +365,9 @@ pub fn sync_entities_system(
                 }
             }
             None => {
+                if !floor_ready {
+                    continue;
+                }
                 // Doors/transports have no client model — their visual is the
                 // zone/MMB geometry — so the placeholder orb would render as a
                 // floating sphere over them (kuluu-nf56). Suppress the orb mesh
@@ -425,7 +457,7 @@ pub fn sync_entities_system(
         if tracked.by_id.contains_key(&id) {
             continue;
         }
-        let rider_tf = q_xform.get(rider_e).copied().unwrap_or_default();
+        let rider_tf = queries.xform.get(rider_e).copied().unwrap_or_default();
         let bevy_e = commands
             .spawn((
                 crate::components::InGameEntity,
@@ -634,6 +666,40 @@ pub fn self_visual_yaw_system(
     let target = heading_to_quat(state.snapshot.self_pos.heading);
     let alpha = 1.0 - (-SELF_VISUAL_YAW_RATE * time.delta_secs()).exp();
     t.rotation = t.rotation.slerp(target, alpha);
+}
+
+/// Attaches [`PrevRenderPos`] and [`CurrRenderPos`] to the local player entity
+/// on the frame it becomes IsSelf, seeded from its current Transform so the
+/// very first interpolation lerps between two identical points (no origin
+/// warp). Runs every frame; the query filter makes it a no-op once the
+/// components exist. Mirrors [`ensure_self_lookcomp_system`].
+pub fn ensure_self_render_pos_system(
+    q: Query<(Entity, &Transform), (With<IsSelf>, Without<CurrRenderPos>)>,
+    mut commands: Commands,
+) {
+    for (e, t) in &q {
+        commands
+            .entity(e)
+            .insert((PrevRenderPos(t.translation), CurrRenderPos(t.translation)));
+    }
+}
+
+/// Runs every rendered frame in `RunFixedMainLoopSystems::AfterFixedMainLoop`.
+/// Lerps the visual Transform between the last two authoritative render
+/// positions (produced by `apply_self_prediction_system` at 60Hz) using the
+/// fixed-timestep overstep fraction. This decouples the visible character
+/// motion from the fixed-tick cadence so the chase camera, which reads
+/// Transform every render frame, no longer sees stair-step Y jitter as the
+/// display frame rate races ahead of FixedUpdate.
+pub fn interpolate_self_transform_system(
+    fixed_time: Res<Time<Fixed>>,
+    mut q: Query<(&mut Transform, &PrevRenderPos, &CurrRenderPos), With<IsSelf>>,
+) {
+    let Ok((mut t, prev, curr)) = q.single_mut() else {
+        return;
+    };
+    let alpha = fixed_time.overstep_fraction();
+    t.translation = prev.0.lerp(curr.0, alpha);
 }
 
 #[derive(Resource, Default, Debug, Clone)]
@@ -902,6 +968,7 @@ mod tests {
             hp_pct,
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 0,
             speed_base: 0,

@@ -22,7 +22,7 @@ pub fn next_default_path() -> PathBuf {
 /// shared handle's seq; fire the request when it changes. Bevy captures by
 /// reading back the render target, so the window can stay buried and the human
 /// keeps working uninterrupted.
-pub fn trigger_screenshot_from_socket(
+pub(crate) fn trigger_screenshot_from_socket(
     handle: Option<Res<super::DebugControlHandle>>,
     mut last_seq: Local<u64>,
     mut requests: MessageWriter<ScreenshotRequest>,

@@ -16,6 +16,7 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         self_pos,
         entities: s.entities.iter().map(entity_to_wire).collect(),
         party: s.party.iter().map(party_to_wire).collect(),
+        zone_generation: s.zone_generation,
         chat: s.chat.iter().map(chat_to_wire).collect(),
         chat_base_seq: s.chat_dropped,
         diagnostics: diagnostics_to_wire(&s.diagnostics),
@@ -633,6 +634,7 @@ pub fn entity_to_wire(e: &Entity) -> wire::Entity {
         hp_pct: e.hp_pct,
         bt_target_id: e.bt_target_id,
         face_target: e.face_target,
+        name_vis: e.name_vis,
         claim_id: e.claim_id,
         speed: e.speed,
         speed_base: e.speed_base,
@@ -670,6 +672,7 @@ pub fn char_flags_to_wire(f: ffxi_proto::decode::CharFlags) -> wire::CharFlags {
         allegiance: f.allegiance,
         new_character: f.new_character,
         mentor: f.mentor,
+        untargetable: f.untargetable,
     }
 }
 
@@ -905,6 +908,7 @@ mod tests {
                 hp_pct: Some(100),
                 bt_target_id: 0,
                 face_target: 0,
+                name_vis: None,
                 claim_id: 0,
                 speed: 0,
                 speed_base: 0,

@@ -158,8 +158,8 @@ pub const BASE_PACKET_SPEED: u8 = 50;
 /// retail keeps but never spends on the movement rate — `StepControl` reads only
 /// the doubled-and-clamped `speed`, so scaling by `speed / speed_base` would
 /// under-drive a mounted PC rather than over-drive it.
-pub fn move_speed_yps(packet_speed: u8, mounted: bool) -> f32 {
-    let speed = f32::from(packet_speed) * SPEED_TO_YPS;
+pub const fn move_speed_yps(packet_speed: u8, mounted: bool) -> f32 {
+    let speed = packet_speed as f32 * SPEED_TO_YPS;
     let speed = if mounted {
         speed * MOUNTED_SPEED_MULTIPLIER
     } else {
@@ -202,6 +202,15 @@ pub struct Entity {
     /// Position block, so preserved across non-position updates (like `pos`).
     #[serde(default)]
     pub face_target: u16,
+
+    /// entity_update namevis byte (PosHead flags3 top byte), written under
+    /// UPDATE_HP — vendor/server/src/map/packets/entity_update.cpp:357/:408 put
+    /// `ref<uint8>(0x2B) = PEntity->namevis` inside `if (updatemask & UPDATE_HP)`.
+    /// The packet buffer is zero-filled, so a POS-only update carries no namevis:
+    /// `None` until the first General-block update does, preserved across
+    /// pos-only updates like `char_flags`.
+    #[serde(default)]
+    pub name_vis: Option<u8>,
 
     #[serde(default)]
     pub claim_id: u32,
@@ -448,6 +457,13 @@ pub struct SessionState {
     pub zone_id: Option<u16>,
     pub entities: Vec<Entity>,
     pub party: Vec<PartyMember>,
+
+    /// Monotonically increasing counter, bumped on every `ZoneChanged`. The
+    /// renderer's party-frame content key includes this so a zone transition
+    /// always forces a UI rebuild, even when the party data looks identical.
+    #[serde(default)]
+    pub zone_generation: u64,
+
     pub chat: Vec<ChatLine>,
 
     /// Lines already evicted from `chat` by [`CHAT_HISTORY_CAP`], so
@@ -1414,6 +1430,7 @@ impl SessionState {
 
                 self.entities.clear();
                 self.party.clear();
+                self.zone_generation = self.zone_generation.wrapping_add(1);
 
                 self.current_weather = None;
                 self.check_result = None;
@@ -1483,6 +1500,9 @@ impl SessionState {
                     let preserved_npc_state = entity.npc_state.or(existing.npc_state);
                     let preserved_char_flags = entity.char_flags.or(existing.char_flags);
                     let preserved_mount_id = entity.mount_id.or(existing.mount_id);
+                    // UPDATE_HP-gated at the source (entity_update.cpp:357/:408), so
+                    // merge like char_flags — never off pos_present.
+                    let preserved_name_vis = entity.name_vis.or(existing.name_vis);
 
                     let (
                         preserved_pos,
@@ -1520,6 +1540,7 @@ impl SessionState {
                         speed: preserved_speed,
                         speed_base: preserved_speed_base,
                         face_target: preserved_face_target,
+                        name_vis: preserved_name_vis,
                         ..entity.clone()
                     };
                     if *existing == merged {
@@ -1598,6 +1619,11 @@ impl SessionState {
                 self.logout_countdown = Some(next);
                 changed
             }
+            AgentEvent::LogoutCountdownCancelled => {
+                let changed = self.logout_countdown.is_some();
+                self.logout_countdown = None;
+                changed
+            }
             AgentEvent::Diagnostics { diagnostics } => {
                 let changed = self.diagnostics != *diagnostics;
                 self.diagnostics = diagnostics.clone();
@@ -1635,6 +1661,54 @@ impl SessionState {
                     server_ts: 0,
                 });
                 true
+            }
+            AgentEvent::PartyTableReset { members } => {
+                // GROUP_TBL arrived. Two shapes matter:
+                //  - solo: LSB answers 0x076 with GROUP_TBL(nullptr) — Kind 0,
+                //    no entries. Self is NOT in the table, and self's only
+                //    source of stats is GROUP_ATTR (0x061 reply / UPDATE_HP),
+                //    so wiping here would leave the frame on 0/0 until the
+                //    next HP change. Self is always retained.
+                //  - party: the table is the authoritative roster. Members it
+                //    no longer lists are dropped; members it still lists keep
+                //    their stats (the 0x0DD burst that follows refreshes them);
+                //    new ids get a skeleton row.
+                let self_id = self.char_id;
+                let before = self.party.clone();
+                self.party.retain(|m| {
+                    Some(m.id) == self_id || members.iter().any(|e| e.unique_no == m.id)
+                });
+                for entry in members {
+                    if let Some(existing) = self.party.iter_mut().find(|m| m.id == entry.unique_no)
+                    {
+                        existing.act_index = entry.act_index;
+                        existing.zone_no = entry.zone_no;
+                        existing.is_party_leader = entry.is_party_leader;
+                        existing.is_alliance_leader = entry.is_alliance_leader;
+                        existing.party_no = entry.party_no;
+                    } else {
+                        self.party.push(PartyMember {
+                            id: entry.unique_no,
+                            act_index: entry.act_index,
+                            name: None,
+                            hp: 0,
+                            mp: 0,
+                            tp: 0,
+                            hp_pct: 0,
+                            mp_pct: 0,
+                            zone_no: entry.zone_no,
+                            main_job: 0,
+                            main_job_lv: 0,
+                            sub_job: 0,
+                            sub_job_lv: 0,
+                            is_party_leader: entry.is_party_leader,
+                            is_alliance_leader: entry.is_alliance_leader,
+                            party_no: entry.party_no,
+                            in_mog_house: false,
+                        });
+                    }
+                }
+                before != self.party
             }
             AgentEvent::PartyMemberUpdated { member } => {
                 if let Some(existing) = self.party.iter_mut().find(|m| m.id == member.id) {
@@ -2445,6 +2519,11 @@ pub enum AgentEvent {
 
         shutdown: bool,
     },
+    /// Stand-up cancels leavegame server-side (`MakeEntityStandUp` drops the
+    /// HEALING effect, `healing.onEffectLose` removes LEAVEGAME) without any
+    /// 0x053 cancel packet — the client sees it as its own CHAR_PC status
+    /// flipping off HEALING and clears the countdown here.
+    LogoutCountdownCancelled,
     EventEnded,
 
     ActionStarted {
@@ -2511,6 +2590,13 @@ pub enum AgentEvent {
 
     PartyMemberUpdated {
         member: PartyMember,
+    },
+
+    /// GROUP_TBL (s2c 0x0C8) arrived: the server is sending a fresh party
+    /// definition. Clear the party list and seed it with the skeleton entries
+    /// from the table; the full stats follow in GROUP_LIST (0x0DD) packets.
+    PartyTableReset {
+        members: Vec<ffxi_proto::decode::GroupTblEntry>,
     },
 
     LowHp {

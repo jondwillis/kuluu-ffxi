@@ -594,19 +594,25 @@ pub fn process_load_vos2_requests(
 
                 let actor_height = (actor_max_y - actor_min_y).max(0.1);
 
-                commands.entity(bevy_e).try_insert(SkinnedActor {
+                // REPLACE semantics on purpose: an actor's outfit arrives as several
+                // VOS2 files, and each of them can widen the running min/max above.
+                // `try_insert` would freeze both components at the FIRST file's extent
+                // (its insert wins, later ones silently no-op) — the nameplate anchor,
+                // chase-camera anchor and pick hitbox all read this height, so an
+                // armor chunk that loads after the body left plates floating above
+                // short models or buried under tall ones. Every arrival rewrites the
+                // full cumulative range; the last file to land is authoritative.
+                commands.entity(bevy_e).insert(SkinnedActor {
                     dat_id: raw_dat_id_for_skeleton(raw),
                     bone_entities,
                     pivot,
                     min_local_y: actor_min_y,
                     max_local_y: actor_max_y,
                 });
-                commands
-                    .entity(bevy_e)
-                    .try_insert(crate::scene::BakedActor {
-                        min_mesh_y: actor_min_y,
-                        actor_height,
-                    });
+                commands.entity(bevy_e).insert(crate::scene::BakedActor {
+                    min_mesh_y: actor_min_y,
+                    actor_height,
+                });
                 info!(
                     "skinned actor spawn: file_id={} entity_id={} verts={} groups={} \
                      slot=[{:.2}..{:.2}] actor=[{:.2}..{:.2}] actor_height={:.2}",
@@ -659,12 +665,12 @@ pub fn process_load_vos2_requests(
                 let merged_max = prev_max.max(slot_max);
                 cpu_extent.insert(req.entity_id, (merged_min, merged_max));
 
-                commands
-                    .entity(bevy_e)
-                    .try_insert(crate::scene::BakedActor {
-                        min_mesh_y: merged_min,
-                        actor_height: (merged_max - merged_min).max(0.1),
-                    });
+                // Replace, same as the skinned path above: later mesh files for this
+                // entity merge into `cpu_extent`/this range and must be able to move it.
+                commands.entity(bevy_e).insert(crate::scene::BakedActor {
+                    min_mesh_y: merged_min,
+                    actor_height: (merged_max - merged_min).max(0.1),
+                });
             }
         }
     }
@@ -2333,7 +2339,9 @@ pub fn spawn_prepared_equipped(
             "equipped actor spawn: parent={:?} race={} mesh=[{:.2}..{:.2}] actor_height={:.2}",
             parent, prepared.race, prepared.min_mesh_y, prepared.max_mesh_y, actor_height,
         );
-        commands.entity(parent).try_insert(BakedActor {
+        // Replace, not try-insert: re-equipping/re-spawning must move the anchor
+        // height to the freshly assembled range instead of keeping a stale one.
+        commands.entity(parent).insert(BakedActor {
             min_mesh_y: prepared.min_mesh_y,
             actor_height,
         });

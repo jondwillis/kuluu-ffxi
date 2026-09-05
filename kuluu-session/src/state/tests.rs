@@ -32,6 +32,22 @@ fn zone_in_weather_survives_the_zone_change_clear() {
     assert_eq!(s.current_weather, Some(4));
 }
 
+// Stand-up cancels leavegame server-side with no 0x053 cancel packet; the
+// heal→walk transition folds in as LogoutCountdownCancelled and must drop a
+// live countdown. A cancel with nothing active is a no-op fold (no churn).
+#[test]
+fn logout_countdown_cancelled_clears_the_live_countdown() {
+    let mut s = SessionState::default();
+    assert!(!s.apply_event(&AgentEvent::LogoutCountdownCancelled));
+    s.apply_event(&AgentEvent::LogoutCountdown {
+        seconds_remaining: 25,
+        shutdown: true,
+    });
+    assert_eq!(s.logout_countdown.map(|c| c.seconds_remaining), Some(25));
+    assert!(s.apply_event(&AgentEvent::LogoutCountdownCancelled));
+    assert_eq!(s.logout_countdown, None);
+}
+
 #[test]
 fn widescan_list_builds_between_start_and_end_and_clears_on_zone_change() {
     let mut s = SessionState::default();
@@ -400,6 +416,127 @@ fn party_member_upsert_preserves_name_across_attr_only_update() {
     assert_eq!(s.party[0].hp_pct, 75);
 }
 
+fn party_member(id: u32, name: &str, hp: u32) -> PartyMember {
+    PartyMember {
+        id,
+        act_index: 1,
+        name: Some(name.into()),
+        hp,
+        mp: 50,
+        tp: 0,
+        hp_pct: 80,
+        mp_pct: 100,
+        zone_no: 230,
+        main_job: 1,
+        main_job_lv: 75,
+        sub_job: 0,
+        sub_job_lv: 0,
+        is_party_leader: id == 42,
+        is_alliance_leader: false,
+        in_mog_house: false,
+        party_no: 0,
+    }
+}
+
+#[test]
+fn party_table_reset_solo_empty_table_keeps_self() {
+    // LSB answers a solo player's 0x076 with GROUP_TBL(nullptr): Kind 0, zero
+    // entries. Self is not in the table and its only stats source is
+    // GROUP_ATTR, so an empty reset must not wipe self.
+    let mut s = SessionState {
+        char_id: Some(42),
+        ..Default::default()
+    };
+    s.apply_event(&AgentEvent::PartyMemberUpdated {
+        member: party_member(42, "Sylvie", 1500),
+    });
+
+    let changed = s.apply_event(&AgentEvent::PartyTableReset { members: vec![] });
+    assert!(!changed, "no-op reset reports no change");
+    assert_eq!(s.party.len(), 1);
+    assert_eq!(s.party[0].id, 42);
+    assert_eq!(s.party[0].hp, 1500, "self stats survive the empty table");
+}
+
+#[test]
+fn party_table_reset_drops_unlisted_keeps_stats_seeds_skeletons() {
+    let mut s = SessionState {
+        char_id: Some(42),
+        ..Default::default()
+    };
+    for m in [
+        party_member(42, "Sylvie", 1500),
+        party_member(7, "Vanari", 900),
+        party_member(99, "LeftTheParty", 300),
+    ] {
+        s.apply_event(&AgentEvent::PartyMemberUpdated { member: m });
+    }
+
+    use ffxi_proto::decode::GroupTblEntry;
+    let changed = s.apply_event(&AgentEvent::PartyTableReset {
+        members: vec![
+            GroupTblEntry {
+                unique_no: 42,
+                act_index: 3,
+                party_no: 0,
+                is_party_leader: true,
+                is_alliance_leader: false,
+                zone_no: 235,
+            },
+            GroupTblEntry {
+                unique_no: 7,
+                act_index: 9,
+                party_no: 1,
+                is_party_leader: false,
+                is_alliance_leader: true,
+                zone_no: 0,
+            },
+            GroupTblEntry {
+                unique_no: 55,
+                act_index: 4,
+                party_no: 0,
+                is_party_leader: false,
+                is_alliance_leader: false,
+                zone_no: 235,
+            },
+        ],
+    });
+    assert!(changed);
+
+    let by_id = |id: u32| {
+        s.party
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("missing {id}"))
+    };
+    assert_eq!(s.party.len(), 3, "unlisted member dropped, new id seeded");
+    assert!(s.party.iter().all(|m| m.id != 99), "stale member gone");
+
+    let self_row = by_id(42);
+    assert_eq!(
+        self_row.hp, 1500,
+        "listed member keeps stats until the 0x0DD burst"
+    );
+    assert_eq!(self_row.name.as_deref(), Some("Sylvie"));
+    assert_eq!(
+        self_row.act_index, 3,
+        "roster fields refreshed from the table"
+    );
+    assert_eq!(self_row.zone_no, 235);
+
+    let mate = by_id(7);
+    assert_eq!(mate.party_no, 1);
+    assert!(mate.is_alliance_leader);
+    assert!(!mate.is_party_leader);
+
+    let skeleton = by_id(55);
+    assert_eq!(
+        skeleton.name, None,
+        "new id is a skeleton row until its 0x0DD lands"
+    );
+    assert_eq!(skeleton.hp, 0);
+}
+
 #[test]
 fn action_kind_raise_menu_accept_zero_reject_one() {
     let mut buf = [0u8; 16];
@@ -446,6 +583,7 @@ fn apply_event_folds_in_documented_order() {
             hp_pct: Some(80),
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 0,
             speed_base: 0,
@@ -474,6 +612,7 @@ fn apply_event_folds_in_documented_order() {
             hp_pct: Some(50),
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 0,
             speed_base: 0,
@@ -562,6 +701,7 @@ fn make_test_entity(id: u32, name: Option<&str>, kind: EntityKind) -> Entity {
         hp_pct: Some(100),
         bt_target_id: 0,
         face_target: 0,
+        name_vis: None,
         claim_id: 0,
         speed: 0,
         speed_base: 0,
@@ -709,6 +849,62 @@ fn entity_upserted_preserves_hp_pct_across_position_only_update() {
         s.entities[0].hp_pct,
         Some(0),
         "Some(0) (mob died) must overwrite, not get preserved as Some(50)"
+    );
+}
+
+#[test]
+fn entity_upserted_name_vis_survives_pos_only_tick() {
+    // #512-4: namevis is written under UPDATE_HP (entity_update.cpp:357/:408), and a
+    // POS-only 0x00E carries the byte zero-filled. Merging off pos_present would
+    // un-hide a hidden entity the moment it moved.
+    let mut s = SessionState::default();
+    let mut ent = make_test_entity(42, Some("Survival Guide"), EntityKind::Npc);
+    ent.name_vis = Some(0x08); // FLAG_HIDE_NAME
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: ent,
+        pos_present: true,
+    });
+    assert_eq!(s.entities[0].name_vis, Some(0x08));
+
+    let mut moved = make_test_entity(42, None, EntityKind::Npc); // POS-only: no namevis byte
+    moved.pos = Vec3 {
+        x: 50.0,
+        y: 1.0,
+        z: -20.0,
+    };
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: moved,
+        pos_present: true,
+    });
+    assert_eq!(
+        s.entities[0].name_vis,
+        Some(0x08),
+        "a POS-only tick must not un-hide a hidden entity (zero-filled byte is not data)"
+    );
+}
+
+#[test]
+fn entity_upserted_name_vis_applies_on_hp_only_tick() {
+    // #512-4: HideName(true) sets UPDATE_HP, not UPDATE_POS. Merging off pos_present
+    // kept the stale visible value for a static NPC the server just hid.
+    let mut s = SessionState::default();
+    let ent = make_test_entity(42, Some("Unity Master"), EntityKind::Npc);
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: ent,
+        pos_present: true,
+    });
+    assert_eq!(s.entities[0].name_vis, None);
+
+    let mut hidden = make_test_entity(42, None, EntityKind::Npc);
+    hidden.name_vis = Some(0x08); // HideName(true) -> updatemask |= UPDATE_HP only
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: hidden,
+        pos_present: false,
+    });
+    assert_eq!(
+        s.entities[0].name_vis,
+        Some(0x08),
+        "an HP-only tick must apply the new namevis even without UPDATE_POS"
     );
 }
 
@@ -1090,6 +1286,7 @@ fn self_position_returns_self_entity_pos() {
             hp_pct: Some(100),
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 40,
             speed_base: 40,
@@ -1644,6 +1841,7 @@ fn apply_event_dedupes_identical_entity_upserts() {
         hp_pct: Some(80),
         bt_target_id: 0,
         face_target: 0,
+        name_vis: None,
         claim_id: 0,
         speed: 0,
         speed_base: 0,
@@ -1712,6 +1910,7 @@ fn apply_event_dedupes_identical_self_position() {
             hp_pct: Some(100),
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 40,
             speed_base: 40,
@@ -1911,6 +2110,7 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
         AgentEvent::WeatherUpdated { .. } => (),
         AgentEvent::VanaTimeSynced { .. } => (),
         AgentEvent::LogoutCountdown { .. } => (),
+        AgentEvent::LogoutCountdownCancelled { .. } => (),
         AgentEvent::EventEnded { .. } => (),
         AgentEvent::ActionStarted { .. } => (),
         AgentEvent::SelfCastStarted { .. } => (),
@@ -1924,6 +2124,7 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
         AgentEvent::Diagnostics { .. } => (),
         AgentEvent::NetStats { .. } => (),
         AgentEvent::PartyMemberUpdated { .. } => (),
+        AgentEvent::PartyTableReset { .. } => (),
         AgentEvent::LowHp { .. } => (),
         AgentEvent::PartyMemberLowHp { .. } => (),
         AgentEvent::EngagedBy { .. } => (),

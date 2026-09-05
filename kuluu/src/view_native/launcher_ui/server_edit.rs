@@ -6,7 +6,7 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use kuluu::launcher_store::{self, AuthFlavorKind, ServerProfile};
+use crate::launcher_store::{self, AuthFlavorKind, ServerProfile};
 use kuluu_session::auth_client;
 
 use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};

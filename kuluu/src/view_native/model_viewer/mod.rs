@@ -337,7 +337,7 @@ fn do_rebake(
     existing_parent: Option<Entity>,
 ) -> Option<Entity> {
     if let Some(prev) = existing_parent {
-        commands.entity(prev).despawn();
+        commands.entity(prev).try_despawn();
         tracked.by_id.remove(&PREVIEW_ENTITY_ID);
     }
 

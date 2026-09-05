@@ -1,6 +1,13 @@
-# Rust workspace artifacts (defense-in-depth; component .gitignores cover this too)
+﻿# Rust workspace artifacts (defense-in-depth; component .gitignores cover this too)
 **/target/
 **/*.rs.bk
+
+# Working backups made during edits (*.rs.bak, *.rs.bak-<tag>) — local only.
+**/*.rs.bak*
+
+# Root release exe — build artifact, ~120MB (over GitHub's 100MB blob limit).
+# Regenerate: cargo build -p kuluu --release && logs/sync_exe.ps1
+/kuluu.exe
 
 # Node / abandoned scaffolds
 **/node_modules/
@@ -18,10 +25,12 @@
 # Claude Code per-user settings + plugin runtime state
 .claude/settings.local.json
 .claude/.*/
+.claude/worktrees/
 
 # OpenCode / sibling-agent harness session state — ephemeral, per-user.
 .omo/
 .omc/
+.functional-emotions
 
 # Environment / credentials
 .env
@@ -31,40 +40,27 @@
 # Logs
 *.log
 log/
+/logs/
 
 # jacq build output — regenerate via `jacq build` in ffxi-agent/.
 ffxi-agent/dist/
 
-# FFXI client DATs — SE-copyrighted, NEVER commit. Local copy of the user's
-# HorizonXI install lives here (see ffxi-dat/README or the async-watching-waffle
-# plan for layout). See README "Getting the game files"; FFXI_DAT_PATH points at
-# vendor/game-files/SquareEnix/FINAL FANTASY XI/.
+# FFXI client DATs — SE-copyrighted, NEVER commit.
 vendor/game-files/
 
 # xi-tinkerer — vendored as AGPL-3 reference only (read-only, never linked).
-# See vendor/xi-tinkerer/CLAIM.md and memory note `xi_tinkerer_agpl_reference`.
 vendor/xi-tinkerer/
 
-# RZN MapViewer (galkareeve/ffxi backup) — STRICT cite-only. NO LICENSE in repo,
-# and mapViewer/mapViewer/model_ff11.cpp is verbatim Noesis plugin source
-# (Rich Whitehouse, "all rights to be taken to the grave"). Treat as
-# all-rights-reserved: do NOT copy, derive, paste, or link from any crate.
-# See vendor/RZN-mapviewer/CLAIM.md and memory note `rzn_mapviewer_cite_only`.
+# RZN MapViewer — STRICT cite-only, all-rights-reserved. Never copy/derive/link.
 vendor/RZN-mapviewer/
 
-# XIM browser FFXI client (GPL-3) — read-only feature reference, NEVER commit.
-# Fetch a local copy with `research/fetch-xim.sh`. See research/README.md.
+# XIM browser FFXI client (GPL-3) — read-only reference, NEVER commit.
 research/xim/
-# Phoenix server (GPL-3) — private upstream, so not a submodule. Clone it here
-# yourself for the wire-protocol divergence signal. See research/AGENTS.md.
+# Phoenix server (GPL-3) — private upstream, clone locally.
 research/Phoenix/
-# stray top-level copy (older fetch location)
 /xim/
-.functional-emotions
-.claude/worktrees/
 
-# WASM build outputs — each bundle is ~150MB and exceeds GitHub's 100MB
-# blob limit. Regenerate locally via the wasm toolchain.
+# WASM build outputs — ~150MB, over GitHub blob limit. Regenerate locally.
 ffxi-viewer-wasm/dist/
 profile.json.gz
 
@@ -80,14 +76,18 @@ profile.json.gz
 # skill-creator eval scratch (transient benchmark runs)
 .agents/skills/*-workspace/
 
-# Verification evidence marker (stop.d/25-verify.sh gate) — per-machine,
-# ephemeral by design: stale the moment gated source is edited after it.
+# Verification evidence marker — per-machine, ephemeral.
 .verify/
 
-# Retail-client captures (retail-observe skill) — SE-copyrighted, reference
-# only, NEVER commit. Same rationale as vendor/game-files/ above.
+# Retail-client captures — SE-copyrighted, reference only, NEVER commit.
 /artifacts/retail/
 artifacts/
 
-# Chrome/Perfetto traces from --features trace runs — runtime artifacts
+# Chrome/Perfetto traces from --features trace runs
 /trace-*.json
+
+# Editor/tool backups
+*.bak
+
+# Session scratch + crash dumps (rustc ICE logs, saved pre-rewrite file versions) — local only.
+archive/scratch/

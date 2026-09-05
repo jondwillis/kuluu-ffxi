@@ -2,8 +2,19 @@
 
 use serde::{Deserialize, Serialize};
 
-// v20: SceneSnapshot.death_menu_offer — the durable s2c 0x0F9 Raise/Reraise or
-// Tractor offer shown while dead.
+// v23: SceneSnapshot.death_menu_offer — the durable s2c 0x0F9 Raise/Reraise or
+// Tractor offer shown while dead. (Upstream's "v20"; renumbered on merge because our
+// side had already spent 20-22 on zone_generation / untargetable / name_vis.)
+// v22: Entity.name_vis is now Option<u8> — None until a General-block update carries
+// it. The byte rides UPDATE_HP (entity_update.cpp:357/:408), not the Position block,
+// so a POS-only 0x00E must not clobber the last known value with its zero-filled byte.
+// v21: Entity.char_flags.untargetable — flags1 TargetOffFlag, the server's
+// targetability authority (LSB m_flags FLAG_UNTARGETABLE for NPC/MOB, the explicit
+// "Untargetable player" bit for PCs). namevis no longer gates targeting.
+// v20: SceneSnapshot.zone_generation — a counter bumped on every zone change so the
+// party frame's content key differs after a transition even when the roster is
+// byte-identical to the previous zone (the fast-path race where the 0x0DD/0x0DF refill
+// lands in the same poll as the ZoneChanged clear).
 // v19: the cutscene channel — ViewerEvent::{CutsceneStarted,CutsceneCue,CutsceneEnded} plus
 // CutsceneCue/CutsceneActor. The event VM's staging opcodes (actor motion, screen fade,
 // camera lock, event-hide, mount) had no way across the boundary at all before this.
@@ -37,7 +48,7 @@ use serde::{Deserialize, Serialize};
 // v5: InventoryItem.charges_remaining + next_use_vana_ts (item recast/charges).
 // v4: SceneSnapshot.delivery_box (dedicated delivery screen) + ViewerCommand::DeliveryBox
 // (postcard frames are not self-describing, so any shape change bumps this).
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Longest countdown `SceneSnapshot::status_icon_expiries` can carry. The
 /// producer rejects anything beyond it as a corrupt 0x063 timestamp, and the HUD
@@ -237,6 +248,13 @@ pub struct CharFlags {
     pub allegiance: u8,
     pub new_character: bool,
     pub mentor: bool,
+
+    /// `Flags1.TargetOffFlag` (bit 19): the server's untargetable bit — LSB
+    /// `m_flags & FLAG_UNTARGETABLE` for NPC/MOB, char_update's "Untargetable
+    /// player" field for PCs. The targetability authority; see
+    /// [`Entity::is_targetable`] and ffxi-proto's decode citation.
+    #[serde(default)]
+    pub untargetable: bool,
 }
 
 /// A mount being ridden. Retail draws the two arms from different model families
@@ -316,6 +334,16 @@ pub struct Entity {
 
     #[serde(default)]
     pub char_flags: CharFlags,
+
+    /// entity_update byte 0x2B (LSB `namevis`; PosHead `flags3 >> 24`), written
+    /// under UPDATE_HP — vendor/server/src/map/packets/entity_update.cpp:357/:408.
+    /// `None` until the first General-block update carries it; treated as visible,
+    /// matching the server's VIS_NONE default (baseentity.cpp:45). LSB NAMEVIS
+    /// (vendor/server/src/map/entities/baseentity.h): 0x01 icon, 0x08 hide-name,
+    /// 0x80 ghost-phase — the other bits in the data are render-phase flags on real
+    /// NPCs (Survival Guides carry 0x20), so only 0x08 suppresses anything.
+    #[serde(default)]
+    pub name_vis: Option<u8>,
 }
 
 // LSB STATUS_TYPE. vendor/server/src/map/entities/baseentity.h
@@ -331,6 +359,15 @@ mod status_type {
 impl Entity {
     pub fn is_dead(&self) -> bool {
         self.hp_pct == Some(0)
+    }
+
+    /// Retail-hidden helper NPC: VIS_HIDE_NAME set — mannequins, "blank"
+    /// cutscene actors. vendor/server/src/map/entities/baseentity.cpp:159
+    /// `IsNameHidden() = namevis & FLAG_HIDE_NAME` (0x08); the NAMEVIS enum
+    /// defines only 0x01/0x08/0x80, so the other bits are render-phase flags,
+    /// not name suppression. Suppresses the nameplate only — never targeting.
+    pub fn name_hidden(&self) -> bool {
+        self.name_vis.is_some_and(|v| v & 0x08 != 0)
     }
 
     // Blacklist (not whitelist) so an undecoded byte fails open, staying targetable.
@@ -355,8 +392,14 @@ impl Entity {
     /// Selectable by click / `<t>`. Dead players stay selectable so a healer can
     /// target them to Raise; dead mobs/NPCs do not. `Other` entities are not
     /// selectable except doors, whose Talk interaction is the retail door flow.
+    /// Targetability authority is the server's untargetable bit (flags1
+    /// TargetOffFlag = LSB m_flags FLAG_UNTARGETABLE for NPC/MOB) — namevis
+    /// never gates targeting upstream.
     pub fn is_targetable(&self) -> bool {
         if !self.status_selectable() {
+            return false;
+        }
+        if self.char_flags.untargetable {
             return false;
         }
         if matches!(self.kind, EntityKind::Other) && !self.is_door() {
@@ -459,7 +502,7 @@ pub struct ChatLine {
     pub spans: Vec<ChatSpan>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartyMember {
     pub id: u32,
     pub act_index: u16,
@@ -541,6 +584,12 @@ pub struct SceneSnapshot {
     pub self_pos: Position,
     pub entities: Vec<Entity>,
     pub party: Vec<PartyMember>,
+
+    /// Monotonically increasing counter, bumped on every zone change. Forces
+    /// the party-frame content key to differ after a zone transition even when
+    /// the party data is byte-identical.
+    #[serde(default)]
+    pub zone_generation: u64,
 
     pub chat: Vec<ChatLine>,
 
@@ -1649,8 +1698,10 @@ mod tests {
                 mount: None,
                 status: 0,
                 char_flags: CharFlags::default(),
+                name_vis: None,
             }],
             party: vec![],
+            zone_generation: 7,
             chat: vec![ChatLine {
                 channel: ChatChannel::Say,
                 sender: "Other".into(),
@@ -2084,6 +2135,7 @@ mod tests {
             "self_pos",
             "entities",
             "party",
+            "zone_generation",
             "chat",
             "chat_base_seq",
             "diagnostics",

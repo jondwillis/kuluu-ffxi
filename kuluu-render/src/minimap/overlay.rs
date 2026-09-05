@@ -454,7 +454,7 @@ pub fn sync_marker_layer<F>(
     for id in stale {
         if let Some(dot_entity) = by_id.remove(&id) {
             if let Ok(mut ec) = commands.get_entity(dot_entity) {
-                ec.despawn();
+                ec.try_despawn();
             }
         }
     }

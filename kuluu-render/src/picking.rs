@@ -225,7 +225,7 @@ pub fn update_hovered_entity_system(
         &world_q,
         &parent_q,
         &nameplate_q,
-        scene.snapshot.self_char_id,
+        &scene.snapshot,
     );
     if hovered.id != id {
         hovered.id = id;
@@ -242,7 +242,7 @@ fn priority_hover_id(
     world_q: &Query<&WorldEntity>,
     parent_q: &Query<&ChildOf>,
     nameplate_q: &Query<&Nameplate>,
-    self_id: Option<u32>,
+    snap: &kuluu_snapshot::SceneSnapshot,
 ) -> Option<u32> {
     let hits = [Some(PointerId::Mouse), bridge.0]
         .into_iter()
@@ -252,8 +252,21 @@ fn priority_hover_id(
         .filter_map(|(entity, hit)| {
             let id = resolve_hit_entity_id(*entity, world_q, parent_q, nameplate_q)?;
             (id != 0).then_some((id, hit.depth))
+        })
+        // Untargetable entities (invisible "[obj]" event points, hidden NPCs)
+        // never hover: the mouse behaves exactly like the click path, which
+        // already refuses to select them -- no hover card, no cursor swap,
+        // and they can't mask a real entity behind them. Unknown ids
+        // (snapshot mid-sync) stay hoverable. Doors pass: is_targetable
+        // carves them out for the retail Talk flow.
+        .filter(|(id, _)| {
+            snap.entities
+                .iter()
+                .find(|e| e.id == *id)
+                .map(|e| e.is_targetable())
+                .unwrap_or(true)
         });
-    choose_hovered_id(hits, self_id)
+    choose_hovered_id(hits, snap.self_char_id)
 }
 
 /// Any non-self hit outranks self at any depth — the self box is oversized on
@@ -371,7 +384,7 @@ pub fn click_to_target_system(
         &q_world,
         &q_parent,
         &q_nameplate,
-        scene.snapshot.self_char_id,
+        &scene.snapshot,
     );
     // One physical click emits one Click per hovered entity — the priority
     // winner's surface, self's non-blocking box beside it, and the full-window

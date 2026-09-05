@@ -53,6 +53,7 @@ fn upsert_with_speed(
             hp_pct: Some(hp_pct),
             bt_target_id,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed,
             speed_base,

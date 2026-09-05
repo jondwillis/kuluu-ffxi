@@ -992,7 +992,7 @@ pub(crate) fn update_map_screen_markers(
     if !open {
         for (_, dot) in dots.by_id.drain() {
             if let Ok(mut ec) = commands.get_entity(dot) {
-                ec.despawn();
+                ec.try_despawn();
             }
         }
         if let Ok(mut node) = tracked_q.single_mut() {
@@ -1019,7 +1019,7 @@ pub(crate) fn update_map_screen_markers(
     {
         for (_, dot) in dots.by_id.drain() {
             if let Ok(mut ec) = commands.get_entity(dot) {
-                ec.despawn();
+                ec.try_despawn();
             }
         }
         if let Ok(mut node) = tracked_q.single_mut() {
@@ -1115,7 +1115,7 @@ pub(crate) fn update_map_widescan_dots(
     let Some(((aabb, self_t), overlay_layer)) = inputs else {
         for (_, dot) in dots.by_index.drain() {
             if let Ok(mut ec) = commands.get_entity(dot) {
-                ec.despawn();
+                ec.try_despawn();
             }
         }
         if let Ok(mut node) = cursor_q.single_mut() {
@@ -1204,7 +1204,7 @@ pub(crate) fn update_map_widescan_dots(
     for idx in stale {
         if let Some(dot) = dots.by_index.remove(&idx) {
             if let Ok(mut ec) = commands.get_entity(dot) {
-                ec.despawn();
+                ec.try_despawn();
             }
         }
     }
@@ -1511,6 +1511,7 @@ mod tests {
             heading: 0,
             hp_pct: None,
             bt_target_id: 0,
+            name_vis: None,
             face_target: 0,
             claim_id: 0,
             speed: 0,
