@@ -130,10 +130,12 @@ pub struct SlashWriters<'w, 's> {
 
     pub map_view: Res<'w, kuluu_render::hud::map_screen::MapView>,
 
-    pub dat_root: Res<'w, super::DatRootRes>,
+    pub death_prompt: ResMut<'w, kuluu_render::hud::death_prompt::DeathPromptSelection>,
+
+    pub(crate) dat_root: Res<'w, super::DatRootRes>,
 
     /// Absent when no config dir resolved, which makes `/overlay` read-only.
-    pub overlay_store: Option<Res<'w, kuluu::overlay_store::OverlayStoreRes>>,
+    pub overlay_store: Option<Res<'w, crate::overlay_store::OverlayStoreRes>>,
 }
 
 /// Real keyboard events plus the pad-synthesized ones
@@ -151,6 +153,7 @@ pub struct MenuConfirmWriters<'w> {
     pub status_profile_open: ResMut<'w, kuluu_render::hud::status_panel::StatusProfileOpen>,
     pub hud_panels: ResMut<'w, kuluu_render::hud::HudPanels>,
     pub net_status: ResMut<'w, kuluu_render::hud::network_status::NetStatusVisible>,
+    pub audio_mute: ResMut<'w, kuluu_render::audio::AudioMuteState>,
     pub vana_clock: Res<'w, kuluu_render::vana_time::VanaClock>,
     pub vana_clock_visible: ResMut<'w, kuluu_render::hud::vana_clock::VanaClockVisible>,
     pub item_screen_container: ResMut<'w, kuluu_render::hud::item_screen::ItemScreenContainer>,
@@ -158,13 +161,15 @@ pub struct MenuConfirmWriters<'w> {
 use tokio::sync::mpsc::Sender;
 
 use crate::keybinds_store::KeybindsStateRes;
-use crate::state::{ActionKind, AgentCommand, AgentEvent, CheckKind, ReqLogoutKind};
 use crate::view_native::input::{CommandTx, SelectTargetMode};
 use crate::view_native::slash_commands::{
     parse_slash, system_chat_line, KeybindUpdate, SlashOutcome, SubAreaOp,
 };
+#[cfg(unix)]
+use kuluu_session::state::AgentEvent;
+use kuluu_session::state::{ActionKind, AgentCommand, CheckKind, ReqLogoutKind};
 
-pub fn text_input_system(
+pub(crate) fn text_input_system(
     mut events: KeyEventStreams,
     cmd_tx: Res<CommandTx>,
     mut bindings: ResMut<Bindings>,
@@ -204,16 +209,45 @@ pub fn text_input_system(
         }
         match &mut *mode {
             InputMode::World => {
-                if kuluu_render::hud::death_prompt::is_dead(&scene_state)
-                    && bindings.matches_logical(Action::ConfirmAction, &ev.logical_key)
-                {
-                    if let Err(e) = cmd_tx.0.try_send(AgentCommand::ReturnToHomePoint) {
-                        push_system_chat_line(
-                            &mut scene_state,
-                            format!("/return dropped (channel issue): {e}"),
-                        );
+                if kuluu_render::hud::death_prompt::is_dead(&scene_state) {
+                    let offer = scene_state.snapshot.death_menu_offer;
+                    slash_writers.death_prompt.sync(offer);
+                    if let Some(offer) = offer {
+                        if bindings.matches_logical(Action::NavUp, &ev.logical_key)
+                            || bindings.matches_logical(Action::NavDown, &ev.logical_key)
+                        {
+                            slash_writers.death_prompt.toggle();
+                            continue;
+                        }
+                        let accept =
+                            if bindings.matches_logical(Action::NavConfirm, &ev.logical_key) {
+                                Some(slash_writers.death_prompt.accepts_offer())
+                            } else if bindings.matches_logical(Action::NavCancel, &ev.logical_key) {
+                                Some(false)
+                            } else {
+                                None
+                            };
+                        if let Some(accept) = accept {
+                            if let Err(e) = cmd_tx
+                                .0
+                                .try_send(death_menu_response_command(offer, accept))
+                            {
+                                push_system_chat_line(
+                                    &mut scene_state,
+                                    format!("death-menu response dropped (channel issue): {e}"),
+                                );
+                            }
+                            continue;
+                        }
+                    } else if bindings.matches_logical(Action::ConfirmAction, &ev.logical_key) {
+                        if let Err(e) = cmd_tx.0.try_send(AgentCommand::ReturnToHomePoint) {
+                            push_system_chat_line(
+                                &mut scene_state,
+                                format!("/return dropped (channel issue): {e}"),
+                            );
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 if slash_writers.select_target.active {
                     if bindings.matches_logical(Action::ConfirmAction, &ev.logical_key) {
@@ -295,6 +329,7 @@ pub fn text_input_system(
                     &mut slash_writers.status_profile_open,
                     &mut slash_writers.hud_panels,
                     &mut slash_writers.net_status_visible,
+                    &mut slash_writers.audio_mute,
                     &slash_writers.vana_clock,
                     &mut slash_writers.vana_clock_visible,
                     &mut slash_writers.sort_options,
@@ -424,6 +459,53 @@ pub fn text_input_system(
                 }
             }
         }
+    }
+}
+
+fn death_menu_response_command(
+    offer: kuluu_snapshot::DeathMenuOffer,
+    accept: bool,
+) -> AgentCommand {
+    let kind = match offer {
+        kuluu_snapshot::DeathMenuOffer::Raise => ActionKind::RaiseMenu { accept },
+        kuluu_snapshot::DeathMenuOffer::Tractor => ActionKind::TractorMenu { accept },
+    };
+    AgentCommand::Action {
+        target_id: 0,
+        target_index: 0,
+        kind,
+    }
+}
+
+#[cfg(test)]
+mod death_menu_tests {
+    use super::*;
+    use kuluu_snapshot::DeathMenuOffer;
+
+    #[test]
+    fn raise_offer_dispatches_the_existing_raise_reply_action() {
+        let cmd = death_menu_response_command(DeathMenuOffer::Raise, true);
+        assert!(matches!(
+            cmd,
+            AgentCommand::Action {
+                target_id: 0,
+                target_index: 0,
+                kind: ActionKind::RaiseMenu { accept: true },
+            }
+        ));
+    }
+
+    #[test]
+    fn tractor_offer_dispatches_the_existing_tractor_reply_action() {
+        let cmd = death_menu_response_command(DeathMenuOffer::Tractor, false);
+        assert!(matches!(
+            cmd,
+            AgentCommand::Action {
+                target_id: 0,
+                target_index: 0,
+                kind: ActionKind::TractorMenu { accept: false },
+            }
+        ));
     }
 }
 
@@ -764,7 +846,7 @@ fn apply_chat_action(
                     // does; the other check kinds answer in chat only.
                     SlashOutcome::Command(AgentCommand::CheckTarget {
                         target_id,
-                        kind: crate::state::CheckKind::Check,
+                        kind: kuluu_session::state::CheckKind::Check,
                         ..
                     }) if entities.iter().any(|e| {
                         e.id == *target_id && e.kind == kuluu_snapshot::EntityKind::Pc
@@ -1478,6 +1560,7 @@ pub fn mouse_nav_dispatch_system(
                 &mut menu_writers.status_profile_open,
                 &mut menu_writers.hud_panels,
                 &mut menu_writers.net_status,
+                &mut menu_writers.audio_mute,
                 &menu_writers.vana_clock,
                 &mut menu_writers.vana_clock_visible,
                 &dynamic_menu,
@@ -2067,6 +2150,7 @@ mod quick_action_tests {
             heading: 0,
             hp_pct: None,
             bt_target_id: 0,
+            name_vis: None,
             face_target: 0,
             claim_id: 0,
             speed: 0,
@@ -2077,6 +2161,7 @@ mod quick_action_tests {
             mount: None,
             status: 0,
             char_flags: Default::default(),
+            monstrosity: false,
         }
     }
 

@@ -6,7 +6,7 @@
 # cargo flags themselves, so the two can't drift: a green pre-push run uses
 # the *exact* fmt/clippy invocation CI will, and vice versa.
 #
-# Usage: scripts/checks.sh <stage>...   stage ∈ {harness, fmt, clippy, test, build, doc}
+# Usage: scripts/checks.sh <stage>...   stage ∈ {harness, fmt, clippy, test, build, wasm, doc}
 #   scripts/checks.sh harness fmt clippy      # pre-push default
 #   scripts/checks.sh harness fmt clippy test # the CI gate (ci.yml runs these)
 #   scripts/checks.sh build                   # local-only: see run_build below
@@ -28,9 +28,16 @@ fi
 
 cd "$(git rev-parse --show-toplevel)"
 
-# The single feature set the client/viewer build under. Keep in lockstep with
-# the release workflow's build flags.
-FEATURES=(--features native-window)
+# Installing an SDK must not change the vanilla gate's feature graph.
+FEATURES=(--no-default-features --features native-window)
+if [ "${KULUU_CHECK_DLSS:-0}" = "1" ]; then
+  export DLSS_SDK="${DLSS_SDK:-$PWD/vendor/DLSS}"
+  if [ ! -f "$DLSS_SDK/include/nvsdk_ngx.h" ] || [ -z "${VULKAN_SDK:-}" ]; then
+    echo "checks: DLSS needs its SDK and VULKAN_SDK; see cargo xtask dlss check" >&2
+    exit 1
+  fi
+  FEATURES=(--no-default-features --features native-window,dlss)
+fi
 
 # Route every cargo invocation through the stall watchdog so a jobserver wedge
 # fails loudly instead of hanging the gate — a wedged run here previously sat
@@ -103,7 +110,8 @@ run_harness() {
   # Pure shell, no cargo — runs first in pre-push because it costs ~nothing.
   # ffxi-agent/ is deliberately out of scope: it ships its own real .claude/
   # tree as the runtime playbook for an agent playing the game.
-  local settings=".claude/settings.json" bad=0 link target cmd path doc
+  local settings=".claude/settings.json" codex_hooks=".codex/hooks.json"
+  local codex_config=".codex/config.toml" bad=0 link target cmd path doc
 
   # 1. Every tracked entry under .claude/ is a symlink resolving inside
   #    .agents/, or settings.json itself. Content never lives here.
@@ -144,6 +152,16 @@ run_harness() {
     fi
   done < <(jq -r '.hooks | to_entries[].value[].hooks[]?.command // empty' "$settings" 2>/dev/null)
 
+  if ! grep -qx 'hooks = true' "$codex_config" 2>/dev/null; then
+    echo "checks: harness — $codex_config does not enable native hooks" >&2
+    bad=1
+  fi
+  if ! jq -e '.hooks.SessionStart[0].hooks[0].command == ".agents/hooks/beads-prime-start.sh"' \
+    "$codex_hooks" >/dev/null 2>&1; then
+    echo "checks: harness — $codex_hooks must register the shared Beads context hook" >&2
+    bad=1
+  fi
+
   # 3. No tracked doc points readers at a root .claude/ path that isn't one the
   #    harness really owns — that is exactly the drift this stage exists to kill
   #    (AGENTS.md long claimed the hooks lived in .claude/hooks/). `~/.claude/…`
@@ -156,6 +174,19 @@ run_harness() {
   done < <(git grep -nE '(^|[^/a-zA-Z])\.claude/[a-z]' -- '*.md' \
       ':!ffxi-agent/**' ':!.agents/AGENTS.md' ':!.agents/CLAUDE.md' \
     | grep -vE '\.claude/(settings\.json|settings\.local\.json|skills|agents|worktrees)\b' || true)
+
+  # Cargo records path overrides that no longer match the resolved dependency
+  # graph here. Fail before an engine upgrade can silently bypass a required
+  # vendor fix while leaving its [patch.crates-io] declaration in place.
+  if grep -q '^\[\[patch\.unused\]\]' Cargo.lock; then
+    echo "checks: harness - Cargo.lock contains unused [patch.crates-io] overrides:" >&2
+    awk '
+      /^\[\[patch\.unused\]\]$/ { unused=1; next }
+      /^\[\[/ { unused=0 }
+      unused && /^(name|version) = / { print "  " $0 }
+    ' Cargo.lock >&2
+    bad=1
+  fi
 
   return $bad
 }
@@ -180,6 +211,10 @@ run_build() {
   # real per-OS --release artifacts. This is a fast local proxy for the latter,
   # but note it is dev-profile/Cranelift, not the release LLVM build.
   cargo build --workspace --locked "${FEATURES[@]}"
+}
+
+run_wasm() {
+  cargo check -p kuluu-viewer-wasm --locked --target wasm32-unknown-unknown
 }
 
 run_doc() {
@@ -216,6 +251,7 @@ for stage in "$@"; do
     harness) echo "checks: harness"; run_harness ;;
     test)   echo "checks: test";   run_test ;;
     build)  echo "checks: build";  run_build ;;
+    wasm)   echo "checks: wasm";   run_wasm ;;
     doc)    echo "checks: doc";    run_doc ;;
     *) echo "checks: unknown stage '$stage'" >&2; exit 2 ;;
   esac

@@ -41,42 +41,35 @@ pub enum ToggleResult {
     NoTarget,
 }
 
-pub fn auto_lock_transition(
-    engaged: Option<u32>,
-    prev_engaged: Option<u32>,
-    current_lock: Option<u32>,
-) -> Option<Option<u32>> {
-    if engaged == prev_engaged {
-        return None;
-    }
-    match engaged {
-        Some(t) => Some(Some(t)),
-        None if current_lock == prev_engaged => Some(None),
-        None => None,
-    }
-}
-
-pub fn auto_lock_on_when_engaged(
-    scene: Res<crate::snapshot::SceneState>,
-    mut lock_on: ResMut<LockOn>,
-    mut prev_engaged: Local<Option<u32>>,
-) {
-    let engaged = match scene.snapshot.current_goal {
-        Some(kuluu_snapshot::ReactorGoal::Engaged { target_id, .. }) => Some(target_id),
-        _ => None,
-    };
-    if engaged == *prev_engaged {
-        return;
-    }
-    if let Some(new_lock) = auto_lock_transition(engaged, *prev_engaged, lock_on.target_id) {
-        lock_on.target_id = new_lock;
-    }
-    *prev_engaged = engaged;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+
+    fn targetable_entity(id: u32) -> kuluu_snapshot::Entity {
+        kuluu_snapshot::Entity {
+            id,
+            act_index: 0,
+            kind: kuluu_snapshot::EntityKind::Mob,
+            name: None,
+            pos: kuluu_snapshot::Vec3::default(),
+            heading: 0,
+            hp_pct: Some(100),
+            bt_target_id: 0,
+            face_target: 0,
+            claim_id: 0,
+            speed: 0,
+            speed_base: 0,
+            look: None,
+            animation: 0,
+            animationsub: 0,
+            mount: None,
+            status: 0,
+            char_flags: Default::default(),
+            monstrosity: false,
+            name_vis: None,
+        }
+    }
 
     #[test]
     fn toggle_locks_then_clears() {
@@ -115,31 +108,27 @@ mod tests {
     }
 
     #[test]
-    fn engaging_auto_locks_the_engaged_target() {
-        assert_eq!(auto_lock_transition(Some(42), None, None), Some(Some(42)));
-    }
+    fn engaged_goal_does_not_create_or_replace_a_camera_lock() {
+        let mut scene = crate::snapshot::SceneState::default();
+        scene.snapshot.current_goal = Some(kuluu_snapshot::ReactorGoal::Engaged {
+            target_id: 42,
+            attack_issued: true,
+        });
+        scene.snapshot.entities = vec![targetable_entity(7), targetable_entity(42)];
 
-    #[test]
-    fn re_engaging_a_new_target_relocks_onto_it() {
-        assert_eq!(
-            auto_lock_transition(Some(7), Some(42), Some(42)),
-            Some(Some(7))
-        );
-    }
+        let mut world = World::new();
+        world.insert_resource(scene);
+        world.insert_resource(crate::scene::Target::default());
+        world.insert_resource(LockOn::default());
+        world
+            .run_system_once(crate::scene::auto_clear_target_system)
+            .unwrap();
+        assert_eq!(world.resource::<LockOn>().target_id, None);
 
-    #[test]
-    fn disengaging_releases_the_auto_lock() {
-        assert_eq!(auto_lock_transition(None, Some(42), Some(42)), Some(None));
-    }
-
-    #[test]
-    fn disengaging_leaves_a_manual_relock_untouched() {
-        assert_eq!(auto_lock_transition(None, Some(42), Some(99)), None);
-    }
-
-    #[test]
-    fn no_engage_transition_is_a_noop() {
-        assert_eq!(auto_lock_transition(Some(42), Some(42), Some(42)), None);
-        assert_eq!(auto_lock_transition(None, None, Some(99)), None);
+        world.resource_mut::<LockOn>().target_id = Some(7);
+        world
+            .run_system_once(crate::scene::auto_clear_target_system)
+            .unwrap();
+        assert_eq!(world.resource::<LockOn>().target_id, Some(7));
     }
 }

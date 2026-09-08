@@ -107,6 +107,52 @@ cargo run -p kuluu --no-default-features -- play --headless
 If any credential env var is unset, the launcher prompts for it and lists
 characters on the account so you can pick by name.
 
+### Optional DLSS builds
+
+DLSS Super Resolution is an opt-in enhancement, absent from standard builds
+and off in Graphics settings until selected. It requires an NVIDIA RTX GPU
+and Vulkan on x86_64 Windows or Linux; macOS and browser builds do not support it.
+
+The optional `vendor/DLSS` submodule pins NVIDIA's SDK v310.5.3, matching
+[`dlss_wgpu` 4.0.0](https://github.com/bevyengine/dlss_wgpu/tree/323ba14a80b26718093ca4bebe9f6c1b6fef5e57).
+Normal submodule setup skips it. Install the Vulkan SDK and libclang, set
+`VULKAN_SDK` to the SDK root, and set `LIBCLANG_PATH` if automatic discovery
+fails. Then run:
+
+```bash
+cargo xtask dlss build
+```
+
+This initializes the pinned SDK, builds the release client with `dlss`, and
+stages its matching SR runtime, license, and programming guide (including
+upstream attribution notices) beside the executable under
+`target/<host-target>/release/` (or `CARGO_TARGET_DIR`). It uses the Windows
+MSVC or Linux GNU target. `DLSS_SDK` can override the pinned SDK directory;
+`cargo xtask dlss check` checks SDK files and Vulkan headers without downloading
+or building. The SDK and its runtime remain subject to
+[NVIDIA's license](https://github.com/NVIDIA/DLSS/blob/v310.5.3/LICENSE.txt).
+
+Enable DLSS in Graphics and choose its quality in `DLSS Config`. It owns
+anti-aliasing and render resolution while active. An installed SDK never
+changes the normal check gate; explicitly include SR with
+`KULUU_CHECK_DLSS=1 scripts/checks.sh clippy test build`.
+
+**Neural Uplift is a separate experimental Windows-only enhancement**, gated by
+`enhanced-neural-uplift` and off by default. Its runtime is not included in the
+SDK or downloaded by the build helper. To test it, first stage SR with the
+helper above, then build the client and forwarder into that same directory:
+
+```powershell
+if (-not $env:DLSS_SDK) { $env:DLSS_SDK = (Resolve-Path vendor/DLSS).Path }
+cargo build -p kuluu -p kuluu-ngx-fwd --locked --release --target x86_64-pc-windows-msvc --features native-window,enhanced-neural-uplift
+Copy-Item target/x86_64-pc-windows-msvc/release/kuluu_ngx_fwd.dll target/x86_64-pc-windows-msvc/release/nvngx.dll_kuluu.dll
+```
+
+Supply `nvngx_dlssnr.dll` beside the executable and enable `Neural Uplift` in
+`DLSS Config` with DLSS active. Adjust these paths when using `CARGO_TARGET_DIR`.
+The forwarder's staged filename must remain `nvngx.dll_kuluu.dll`. Camera-motion
+quality still needs validation; the current NR path supplies zero motion vectors.
+
 ### Getting the game files
 
 The FFXI client DATs (geometry, textures, audio, animations) are Square Enix

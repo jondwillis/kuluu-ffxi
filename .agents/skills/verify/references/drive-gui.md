@@ -46,6 +46,21 @@ That is the whole launch. It uses the local GM drive account, passes
 Export `FFXI_VERIFY_SOUND=1` to keep audio on when the change under test is
 audio; `FFXI_VERIFY_USER`/`_PASS`/`_CHAR` override the character.
 
+**Verify against `--release`.** launch.sh runs `target/release/kuluu` by default
+and errors with the build line if it is missing:
+
+```bash
+cargo build -p kuluu --features native-window --release
+```
+
+The dev profile is Cranelift with no optimisation; measured on this repo it
+zones in at **0.5-0.6 fps with 1.5-2.5s frame spikes**. Anything short-lived —
+a cutscene fade, a cast bar, a hit flash, a weather transition — is then
+unsamplable, and you will misread "I never caught it" as "it never happened".
+The longer one-off release build pays for itself in the first drive. Set
+`FFXI_VERIFY_PROFILE=debug` only when the check genuinely needs
+`debug_assertions` or a dev-only feature.
+
 It also hands focus back to whatever app was frontmost. This matters: macOS
 activates a newly launched app at the *process* level, which winit's
 `focused: false` does not suppress — so a bare launch yanks the user out of
@@ -59,7 +74,7 @@ Doing it by hand instead — **do not ask the user for credentials** (see
 SKILL.md "Character strategy"):
 
 ```bash
-target/debug/kuluu --agent-listen auto play --unfocused --mute \
+target/release/kuluu --agent-listen auto play --unfocused --mute \
   verilight 'TestPass!1234' Verilamp
 ```
 
@@ -89,9 +104,85 @@ stops growing mid-run.
 | Need | Command | Notes |
 |---|---|---|
 | Session state, chat, GM `!cmds`, actions, zoning | agent socket `AgentCommand` | pure IPC, never touches the window |
+| **Talking to an NPC / triggering its event** | `action` + `kind: talk` | see below — no keystrokes needed |
+| **Answering an event's dialog choice** | `end_event_choice` / `end_event` | see below |
 | Movement through the real `input.rs` path | `debug_drive` / MCP `walk` | kuluu-0pof; exercises heading, wall-slide, re-ground |
 | Grounding numbers | `debug_heights` / MCP `debug_heights` | logged under `tracing target: debug_heights` |
 | **Screen capture** | `scripts/capture.sh <out.png>` or MCP `screenshot` | kuluu-wwwv; GPU readback, see below |
+
+### Driving NPC events (no keystrokes)
+
+Talking to an NPC is a socket command, not a keypress — `Tab`+`Enter` through
+System Events is never needed for this, and trying it is a dead end (the
+synthesised `Enter` does not reach the client's interact binding, so no 0x01A
+goes out and the log stays silent):
+
+```jsonc
+// talk to Camereine (the San d'Oria chocobo renter)
+{"cmd":"action","target_id":17719343,"target_index":47,"kind":{"kind":"talk"}}
+// answer her prompt: fields come from the event_dialog payload, NOT from the
+// socket's own event_id -- see the field-name trap below
+{"cmd":"end_event_choice","event_id":17719343,"act_index":47,"event_num":599,"choice":0}
+{"cmd":"end_event"}
+```
+
+`ActionKind` is internally tagged, so `Talk` nests as `{"kind":"talk"}` inside
+the `kind` field. Watch for `cutscene_started` / `event_start` / `event_dialog`
+on the socket to confirm the event actually opened, and read `event_para` — it
+tells you *which* event the server picked (e.g. a chocobo renter sends 602
+"you lack the license" rather than 599 "rent" until the key item exists, and
+the two look identical from the outside until you read that field).
+
+**`EndEventChoice`'s field names lie, and getting them wrong fails silently.**
+Two of the four do not mean what they are called
+(`kuluu/src/view_native/text_input/mod.rs::confirm_dialog_choice`, which is the
+only correct reference):
+
+| Field | What to send | NOT |
+|---|---|---|
+| `event_id` | the dialog's **`npc_id`** | the socket's `event_id` |
+| `act_index` | the dialog's `act_index` | |
+| `event_num` | the dialog's **`event_para`** (e.g. 599) | `0`, or the zone |
+| `choice` | 0-based index into the prompt's options | |
+
+EVENT_END validates against the event id the trigger carried in `EventPara`.
+Send the wrong pair and the server **ignores the choice with no error on either
+side** — the client stays in the event, nothing advances, and it looks exactly
+like the scene is broken. This cost a whole verification session: a chocobo
+rental was reported as "no fade renders" when in truth the choice never landed,
+and picking the same option by hand fades, zones, and mounts correctly. If a
+choice appears to do nothing, re-check these two fields before you believe a
+rendering bug.
+
+Getting `target_id`: `snapshot` only replays entities that recently *upserted*,
+so a static NPC standing still is usually absent from it. Ask the DB instead
+and pick the id in the zone's range (neighbouring NPCs in the same zone share
+the high bits):
+
+```bash
+docker exec server-database-1 mariadb -uxiadmin -ppassword xidb -N -B \
+  -e "SELECT npcid, name FROM npc_list WHERE name='Camereine';"
+```
+
+`target_index` is `npcid & 0x7FF` **for NPCs** — verify it against a
+neighbouring NPC's `act_index` in the snapshot before relying on it. (This does
+*not* hold for player characters; see the `accounts_sessions.targid` gotcha
+below.)
+
+### GM `!cs <id>` cannot verify a cutscene
+
+`!cs` starts the event on the **player** entity. The client then looks the id up
+on the player's block, misses, and falls back to the zone master block — where a
+different copy of that id may live. The observable result is an event that
+"fires" (the log shows `event_dialog: resolved elsewhere source=ZoneMasterBlock`)
+while nothing renders, which reads exactly like a broken renderer. Always
+trigger through the real NPC with `action`/`talk`. Confirm the block you wanted
+is the one that ran with the offline harness first:
+
+```bash
+cargo run -q -p ffxi-event --example zz-event-drive -- <zone> <event id> [params...]
+# prints which blocks own the id, then every frame/choice/wait to the end
+```
 
 ### Capture
 
@@ -130,6 +221,33 @@ System Events `AXRaise` action on the window (or `set value of attribute
 Read every PNG back with the Read tool before citing it. A guard reporting
 `lit=100%` only proves the GPU drew *something*.
 
+**Never cite a black frame captured by the raw `{"cmd":"screenshot"}` socket
+command.** That path skips capture.sh's blank check, and an occluded window
+returns solid black — indistinguishable from a successful fade-to-black, which
+is precisely the change you would be trying to verify. Confirm with capture.sh
+(it raises and re-captures) before concluding a fade rendered. The safe pattern
+for sampling a short-lived visual is: capture.sh once to prove the window is
+live, then burst raw screenshot commands, then capture.sh again.
+
+To sample faster than capture.sh's ~700ms round trip, send the burst down **one**
+socket connection — the client services them back-to-back at roughly frame pace:
+
+```python
+cmds = [{"cmd": "action", ...}]
+cmds += [{"cmd": "screenshot", "path": f"artifacts/verify/f{i:02d}.png"} for i in range(14)]
+send(cmds, collect=9.0)   # ~200ms apart in practice
+```
+
+Then compare frames numerically rather than by eye — a fade is a luminance
+change, and 13 near-identical means say "nothing happened" far more clearly than
+13 screenshots do:
+
+```python
+from PIL import Image
+im = Image.open(p).convert("L").resize((160, 100))
+px = list(im.getdata()); print(p, sum(px) / len(px))
+```
+
 ### Talking to the socket
 
 Use a one-shot Python `AF_UNIX` client with `settimeout()` and an explicit
@@ -151,9 +269,17 @@ is internally tagged, so a cast nests as
 ## What still needs focus
 
 **Menu navigation and anything typed.** The socket carries session-level
-commands, not keystrokes, so the target-action menu, main menu, chat bar, and
-Tab-targeting need real key events through System Events — which requires the
-process frontmost:
+commands, not keystrokes, so the main menu, chat bar, and Tab-targeting need
+real key events through System Events — which requires the process frontmost.
+
+Reach for this only after checking that no `AgentCommand` covers what you want:
+the socket vocabulary is wider than it looks, and several things that read like
+"menu navigation" are commands (`action`/`talk` for NPC interaction,
+`end_event_choice` for a dialog prompt, `treasure_lot`, `custom_menu_respond`,
+`change_job`, `mog_house_exit`). Read the `AgentCommand` enum in
+`kuluu-session/src/state.rs` before synthesising a keystroke — it is
+`#[serde(tag = "cmd", rename_all = "snake_case")]`, so each variant's wire name
+is its snake_case name.
 
 ```bash
 osascript -e 'tell application "System Events"
@@ -163,7 +289,7 @@ osascript -e 'tell application "System Events"
 end tell'
 ```
 
-Resolve `<pid>` with `pgrep -f "^target/debug/kuluu"` — a bare
+Resolve `<pid>` with `pgrep -f "^target/(release|debug)/kuluu"` — a bare
 `pgrep -f kuluu` also matches the harness's own shell wrapper, and the
 `osascript` then fails with "Invalid index". Needs Accessibility permission.
 Keep delays ≥0.3s, capture after each step, and Read the result — keystrokes

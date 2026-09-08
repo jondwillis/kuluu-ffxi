@@ -34,6 +34,134 @@ pub enum RestKind {
     Kneel,
 }
 
+/// Burrowing-mob animation phase. Driven by the entity's `status`/`animationsub`
+/// transitions (see [`burrow_clip`]); `None` for every non-burrowing actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BurrowPhase {
+    /// On the surface and idle, or not a burrowing entity — no clip override.
+    None,
+
+    /// Digging into the ground: plays `sp1?` (the DAT's dig-down clip) once and holds
+    /// the buried end frame. Retail needs no status byte for this — the held pose is
+    /// already underground; `status == INVISIBLE` only destroys the actor.
+    DigDown,
+
+    /// Fully underground. The model is hidden by `status == INVISIBLE`, so no clip.
+    Underground,
+
+    /// Emerging from the ground: plays `sp0?` (the DAT's pop-up clip) once, then returns
+    /// to idle. In retail this moment is a fresh model load running the DAT's `init`
+    /// routine; we replay the same routine + clip on our hidden actor instead.
+    PopUp,
+}
+
+/// Maps a burrow phase to its model clip. FFXI burrowing mobs (tunnel worms and
+/// kin) ship two dedicated clips in their model DAT: `sp1?` drives the body down
+/// into the ground, `sp0?` raises it back out (verified against ROM/5/64.DAT joint
+/// deltas and the retail client's parsed records — F19-F22).
+///
+/// Retail runs these via the DAT's effect routines. Dig is a sub set on a live
+/// actor, which plays `ini1` (Motion sp1? + dirt generators + sound); pop-up is a
+/// visible status on an entity with no actor — a fresh model load running `init`
+/// (Motion sp0? + dirt generators + sound). We drive the clip directly from the
+/// entity's status/animationsub transitions so no per-mob action code is needed.
+pub fn burrow_clip(phase: BurrowPhase) -> Option<DatId> {
+    match phase {
+        BurrowPhase::None | BurrowPhase::Underground => None,
+        BurrowPhase::DigDown => Some(DatId::from_str("sp1?")),
+        BurrowPhase::PopUp => Some(DatId::from_str("sp0?")),
+    }
+}
+
+/// LSB `STATUS_TYPE::INVISIBLE` (vendor/server/src/map/entities/baseentity.h):
+/// the server hides the model entirely while a burrowing mob is underground.
+pub const BURROW_INVISIBLE_STATUS: u8 = 3;
+
+/// Advance a burrowing entity's [`BurrowPhase`] from its previous phase to the new
+/// one, given the current `status` byte and raw `animationsub` byte. Pure so it can
+/// be unit-tested without a render context.
+///
+/// The server (vendor/server/src/map/ai/controllers/mob_controller.cpp) drives the
+/// cycle: dig-down sets `animationsub = 1` while still visible, then flips
+/// `status -> INVISIBLE` ~3s later; pop-up sends an explicit position update (which
+/// carries the still-INVISIBLE status byte) and then flips `status` back to visible
+/// with `animationsub` still set for ~2s before it returns to 0. The status
+/// transition is the reliable discriminator between "digging" and "just surfaced",
+/// because `animationsub != 0` is true in both windows.
+///
+/// Retail semantics (FFXiMain.dll, findings F19-F22): dig = sub set on a live actor,
+/// which runs the DAT's `ini1` routine; its clip ends underground and holds — no
+/// status byte is needed to hide. `status == INVISIBLE` destroys the actor outright.
+/// Pop-up = visible status on an entity with *no* actor: the client constructs a
+/// fresh model and runs the load routine (`init`). A sub-clear arriving mid-routine
+/// does nothing — the routine finishes; there is no early-cancel path. Our port
+/// keeps one hidden actor instead of destroying/rebuilding it, so `Underground`
+/// stands in for "actor destroyed" and `DigDown` holding its buried end frame stands
+/// in for retail's clip-hold.
+///
+/// Interruption: if the worm gets engaged mid-cycle, the server's queued sub-clear
+/// still fires (LSB runs its action queue every tick regardless of battle state), so
+/// the client sees `animationsub` return to 0 while the model is visible. A cleared
+/// sub with a visible status means "no burrow state" in any phase — that is how an
+/// interrupted dig or pop-up settles back to idle instead of holding its pose.
+/// (The dirt/sound routine keeps running out; only the clip selection stops.)
+pub fn next_burrow_phase(prev: BurrowPhase, status: u8, animationsub: u8) -> BurrowPhase {
+    // Bit 2 (0x04) of the raw byte is a spawn flag LSB ORs in on spawn; mask it so
+    // only the bare sub-selector counts as an active effect.
+    let sub = animationsub & !0b100;
+    match prev {
+        BurrowPhase::None => {
+            if status == BURROW_INVISIBLE_STATUS {
+                BurrowPhase::Underground
+            } else if sub != 0 {
+                // On the surface with an active sub-animation: starting to dig.
+                BurrowPhase::DigDown
+            } else {
+                BurrowPhase::None
+            }
+        }
+        BurrowPhase::DigDown => {
+            if status == BURROW_INVISIBLE_STATUS {
+                BurrowPhase::Underground
+            } else if sub != 0 {
+                // Still in the visible dig window: hold buried. (Mobs serialize their
+                // raw status byte, so visible ticks carry UPDATE=1 — a visible+sub
+                // state is indistinguishable from "just surfaced" on values alone;
+                // what separates them is that the pop-up's explicit position update
+                // carries the still-INVISIBLE byte first, which lands us in
+                // Underground before the status flip arrives ~250ms later.)
+                BurrowPhase::DigDown
+            } else {
+                // The server cleared the sub while still visible — the dig was aborted
+                // (the worm got engaged mid-dig): back to idle, not a ghost holding the
+                // buried pose on the surface.
+                BurrowPhase::None
+            }
+        }
+        BurrowPhase::Underground => {
+            if status == BURROW_INVISIBLE_STATUS {
+                BurrowPhase::Underground
+            } else {
+                // Surfaced: play the pop-up clip.
+                BurrowPhase::PopUp
+            }
+        }
+        BurrowPhase::PopUp => {
+            if status == BURROW_INVISIBLE_STATUS {
+                // The server re-hid the worm mid-settle (it burrows again before the sub
+                // clears): back underground, so the next surface transition replays the
+                // pop-up clip instead of holding the emerged pose visible.
+                BurrowPhase::Underground
+            } else if sub != 0 {
+                // Still settling after emerging (server keeps animationsub set ~2s).
+                BurrowPhase::PopUp
+            } else {
+                BurrowPhase::None
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ActorAnimInputs {
     pub moving: bool,
@@ -68,6 +196,10 @@ pub struct ActorAnimInputs {
     /// Driven by the entity's server_status animation byte for observed players, and by
     /// the local mini-game state machine for self.
     pub fishing_phase: Option<u8>,
+
+    /// Burrowing-mob phase (see [`burrow_clip`]); `None` for non-burrowers. Driven by
+    /// the entity's status/animationsub transitions in the render layer.
+    pub burrow: BurrowPhase,
 }
 
 impl Default for ActorAnimInputs {
@@ -91,6 +223,7 @@ impl Default for ActorAnimInputs {
             walking_mode: 0,
             running_mode: 0,
             fishing_phase: None,
+            burrow: BurrowPhase::None,
         }
     }
 }
@@ -547,5 +680,166 @@ mod tests {
         let sel = selected_animation(&moving);
         assert_eq!(idstr(sel.id), "run?");
         assert!(!sel.idle);
+    }
+
+    #[test]
+    fn burrow_clip_maps_phases() {
+        assert!(burrow_clip(BurrowPhase::None).is_none());
+        assert!(burrow_clip(BurrowPhase::Underground).is_none());
+        assert_eq!(idstr(burrow_clip(BurrowPhase::DigDown).unwrap()), "sp1?");
+        assert_eq!(idstr(burrow_clip(BurrowPhase::PopUp).unwrap()), "sp0?");
+    }
+
+    #[test]
+    fn burrow_none_transitions() {
+        // Idle on the surface: no sub, visible -> stays idle.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::None, 0, 0),
+            BurrowPhase::None
+        );
+        // Surface with an active sub-animation: start digging down.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::None, 0, 1),
+            BurrowPhase::DigDown
+        );
+        // First observed already hidden -> straight to underground (no dig clip).
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::None, BURROW_INVISIBLE_STATUS, 0),
+            BurrowPhase::Underground
+        );
+        // Status takes priority over sub: an invisible entity is buried even if the
+        // server still carries a sub-selector.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::None, BURROW_INVISIBLE_STATUS, 1),
+            BurrowPhase::Underground
+        );
+    }
+
+    #[test]
+    fn burrow_spawn_flag_is_masked() {
+        // Bit 2 (0x04) is a spawn flag LSB ORs in on spawn; it must not read as an
+        // active sub-animation. A bare 0x04 therefore means "no effect".
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::None, 0, 0b100),
+            BurrowPhase::None
+        );
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::PopUp, 0, 0b100),
+            BurrowPhase::None
+        );
+        // A real sub-selector combined with the spawn flag still counts as active.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::None, 0, 0b101),
+            BurrowPhase::DigDown
+        );
+    }
+
+    #[test]
+    fn burrow_digdown_holds_until_hidden() {
+        // Still in the visible dig window: hold buried.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::DigDown, 0, 1),
+            BurrowPhase::DigDown
+        );
+        // Server flips to INVISIBLE ~3s later -> fully underground.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::DigDown, BURROW_INVISIBLE_STATUS, 1),
+            BurrowPhase::Underground
+        );
+    }
+
+    #[test]
+    fn burrow_digdown_aborted_by_sub_clear() {
+        // The server cleared animationsub while the worm is still visible — the dig was
+        // interrupted (engaged mid-dig): back to idle, not a ghost holding the buried pose.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::DigDown, 0, 0),
+            BurrowPhase::None
+        );
+        // STATUS_TYPE::UPDATE (1) is the visible status LSB uses for surfaced mobs.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::DigDown, 1, 0),
+            BurrowPhase::None
+        );
+    }
+
+    #[test]
+    fn burrow_cycle_interrupted_mid_pop() {
+        // Dig -> underground -> pop up; the worm gets engaged during the settle window.
+        let mut phase = BurrowPhase::None;
+        phase = next_burrow_phase(phase, 0, 1);
+        assert_eq!(phase, BurrowPhase::DigDown);
+        phase = next_burrow_phase(phase, BURROW_INVISIBLE_STATUS, 1);
+        assert_eq!(phase, BurrowPhase::Underground);
+        // Pop-up starts: visible again, sub still set.
+        phase = next_burrow_phase(phase, 0, 1);
+        assert_eq!(phase, BurrowPhase::PopUp);
+        // The server's queued sub-clear fires ~2s later even mid-battle ("poof"): the
+        // worm settles to idle while visible and targetable.
+        phase = next_burrow_phase(phase, 0, 0);
+        assert_eq!(phase, BurrowPhase::None);
+    }
+
+    #[test]
+    fn burrow_underground_pops_on_surface() {
+        // Still buried: stays underground.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::Underground, BURROW_INVISIBLE_STATUS, 0),
+            BurrowPhase::Underground
+        );
+        // Surfaced with the sub still set (~2s settle window) -> pop-up clip.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::Underground, 0, 1),
+            BurrowPhase::PopUp
+        );
+        // Surfaced even if the sub already cleared -> still pops up (status is the
+        // discriminator, not the sub).
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::Underground, 0, 0),
+            BurrowPhase::PopUp
+        );
+    }
+
+    #[test]
+    fn burrow_popup_settles_to_idle() {
+        // Still settling after emerging: hold the pop-up pose.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::PopUp, 0, 1),
+            BurrowPhase::PopUp
+        );
+        // Sub cleared -> back to idle.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::PopUp, 0, 0),
+            BurrowPhase::None
+        );
+    }
+
+    #[test]
+    fn burrow_popup_rehides_to_underground() {
+        // Server flips back to INVISIBLE while still settling -> buried again, so the
+        // next surface transition replays the pop-up clip.
+        assert_eq!(
+            next_burrow_phase(BurrowPhase::PopUp, BURROW_INVISIBLE_STATUS, 1),
+            BurrowPhase::Underground
+        );
+    }
+
+    #[test]
+    fn burrow_full_cycle() {
+        let mut phase = BurrowPhase::None;
+        // Idle on the surface.
+        assert_eq!(phase, next_burrow_phase(phase, 0, 0));
+        // Server starts the dig: sub set while still visible.
+        phase = next_burrow_phase(phase, 0, 1);
+        assert_eq!(phase, BurrowPhase::DigDown);
+        // ~3s later the model is hidden underground.
+        phase = next_burrow_phase(phase, BURROW_INVISIBLE_STATUS, 1);
+        assert_eq!(phase, BurrowPhase::Underground);
+        // It surfaces: visible again with the sub still set for a moment.
+        phase = next_burrow_phase(phase, 0, 1);
+        assert_eq!(phase, BurrowPhase::PopUp);
+        // ~2s later the sub clears and it settles back to idle.
+        phase = next_burrow_phase(phase, 0, 0);
+        assert_eq!(phase, BurrowPhase::None);
     }
 }

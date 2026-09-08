@@ -62,6 +62,13 @@ pub enum StepResult {
     /// [`crate::opcode_meta::is_input_wait`]); execution stops rather than
     /// desyncing `ExecPointer` or inventing the answer.
     Unimplemented(u8),
+    /// The step burned [`OPCODE_BUDGET_PER_STEP`] without reaching a yield: a
+    /// loop whose condition only an unmodelled opcode would have moved. The
+    /// payload is whatever the VM was sitting on when the budget ran out, *not*
+    /// a refusal — it names no work. Hosts treat this exactly like
+    /// [`StepResult::Unimplemented`]; it is split off so the corpus sweep can
+    /// rank real refusals without these drowning them (kuluu-cjct).
+    Spun(u8),
     /// Blocked on a timed wait; the host runs its clock into [`EventVm::tick`]
     /// and steps again. Only the pure timers yield here — an actor-gated wait
     /// would block on state this VM never models, turning a dropped scene into a
@@ -73,6 +80,23 @@ pub(crate) const OP_END: u8 = 0x00;
 const OP_GOTO: u8 = 0x01;
 const OP_IF: u8 = 0x02;
 const OP_GET_STORE: u8 = 0x03;
+const OP_SET_ONE: u8 = 0x05;
+const OP_SET_ZERO: u8 = 0x06;
+const OP_ADD: u8 = 0x07;
+const OP_SUB: u8 = 0x08;
+const OP_BIT_SET: u8 = 0x09;
+const OP_BIT_CLEAR: u8 = 0x0A;
+const OP_INC: u8 = 0x0B;
+const OP_DEC: u8 = 0x0C;
+const OP_AND: u8 = 0x0D;
+const OP_OR: u8 = 0x0E;
+const OP_XOR: u8 = 0x0F;
+const OP_SHL: u8 = 0x10;
+const OP_SHR: u8 = 0x11;
+const OP_MUL: u8 = 0x14;
+const OP_DIV: u8 = 0x15;
+const OP_SWAP: u8 = 0x19;
+const OP_BITARRAY_SET: u8 = 0x3C;
 pub(crate) const OP_WAIT: u8 = 0x1C;
 const OP_JUMP: u8 = 0x1A;
 const OP_RETURN: u8 = 0x1B;
@@ -406,9 +430,7 @@ impl EventVm {
             // and authored events always reach one. Ours can miss it, because
             // the opcodes it steps over blind include the ones that would have
             // moved a loop's condition along; without a budget that is a hung
-            // client rather than a dropped scene. Report it as the opcode we
-            // were spinning on, which is the same signal the host already logs
-            // and releases on.
+            // client rather than a dropped scene.
             budget -= 1;
             if budget == 0 {
                 self.finished = true;
@@ -418,7 +440,7 @@ impl EventVm {
                     "event VM exceeded its opcode budget; the script is looping \
                      on state this VM does not model"
                 );
-                return StepResult::Unimplemented(op);
+                return StepResult::Spun(op);
             }
             match op {
                 OP_END => {
@@ -436,8 +458,65 @@ impl EventVm {
                 OP_IF => self.op_if(),
                 OP_GET_STORE => {
                     let val = self.getworkofs(3, 0);
-                    self.setworkofs(1, val);
+                    self.setworkofs(1, val, 0);
                     self.exec_pointer += 5;
+                }
+                // The work-slot arithmetic family (XiEvents OpCodes/0x0005-0x0019).
+                // Pure integer math on the work stores, no host state — but a
+                // counter these advance is what an authored loop tests, so
+                // skipping them by width is what turns a `for` into a spin
+                // (kuluu-cjct). Wrapping throughout: retail is C++ `int` on x86,
+                // and a panicking client is worse than a wrong scene.
+                OP_SET_ONE => self.store_unary(1, 3),
+                OP_SET_ZERO => self.store_unary(0, 3),
+                OP_INC => {
+                    let val = self.getworkofs(1, 0);
+                    self.store_unary(val.wrapping_add(1), 3);
+                }
+                OP_DEC => {
+                    let val = self.getworkofs(1, 0);
+                    self.store_unary(val.wrapping_sub(1), 3);
+                }
+                OP_ADD => self.store_binary(|a, b| a.wrapping_add(b)),
+                OP_SUB => self.store_binary(|a, b| a.wrapping_sub(b)),
+                OP_MUL => self.store_binary(|a, b| a.wrapping_mul(b)),
+                // Retail guards on both operands, so a zero numerator yields 0
+                // rather than dividing; wrapping_div additionally spares us the
+                // i32::MIN / -1 panic where x86 idiv would trap.
+                OP_DIV => self.store_binary(|a, b| {
+                    if a != 0 && b != 0 {
+                        a.wrapping_div(b)
+                    } else {
+                        0
+                    }
+                }),
+                OP_AND => self.store_binary(|a, b| a & b),
+                OP_OR => self.store_binary(|a, b| a | b),
+                OP_XOR => self.store_binary(|a, b| a ^ b),
+                // `wrapping_shl`/`shr` mask the shift to 5 bits, which is what
+                // the x86 shift retail compiles to already does.
+                OP_SHL => self.store_binary(|a, b| a.wrapping_shl(b as u32)),
+                OP_SHR => self.store_binary(|a, b| a.wrapping_shr(b as u32)),
+                OP_BIT_SET => self.store_binary(|a, b| 1i32.wrapping_shl(b as u32) | a),
+                OP_BIT_CLEAR => self.store_binary(|a, b| !1i32.wrapping_shl(b as u32) & a),
+                OP_SWAP => {
+                    let v1 = self.getworkofs(1, 0);
+                    let v2 = self.getworkofs(3, 0);
+                    self.setworkofs(1, v2, 0);
+                    self.setworkofs(3, v1, 0);
+                    self.exec_pointer += 5;
+                }
+                // Sets one bit in a work-slot bit array: operand 3 is the flat
+                // bit index, so `>> 5` picks the slot and `& 0x1F` the bit, and
+                // operand 5 bounds the array (XiEvents OpCodes/0x003C.md).
+                OP_BITARRAY_SET => {
+                    let bit = self.getworkofs(3, 0);
+                    let slot = bit >> 5;
+                    if slot < self.getworkofs(5, 0) {
+                        let prev = self.getworkofs(1, slot);
+                        self.setworkofs(1, 1i32.wrapping_shl((bit & 0x1F) as u32) | prev, slot);
+                    }
+                    self.exec_pointer += 7;
                 }
                 OP_SETBITWORK => {
                     self.op_bitwork(true);
@@ -851,8 +930,8 @@ impl EventVm {
     /// `ExecPointer + index` selects. Mirrors [`getworkofs`](Self::getworkofs)'
     /// routing; References are read-only and the unmodeled zone/entity stores are
     /// no-ops.
-    fn setworkofs(&mut self, index: usize, value: i32) {
-        let val = self.eventgetcode(index) as u32;
+    fn setworkofs(&mut self, index: usize, value: i32, shift: i32) {
+        let val = (self.eventgetcode(index) as i32).wrapping_add(shift) as u32;
         if val & REFERENCE_FLAG != 0 {
             return;
         }
@@ -865,6 +944,21 @@ impl EventVm {
         if (WORK_ZONE_BASE..WORK_ZONE_BASE + WORK_ZONE_LEN as u32).contains(&val) {
             self.work_zone[(val - WORK_ZONE_BASE) as usize] = value as u32;
         }
+    }
+
+    /// Store `value` into the slot operand 1 selects and advance `width`, the
+    /// shape every one-operand arithmetic opcode shares.
+    fn store_unary(&mut self, value: i32, width: usize) {
+        self.setworkofs(1, value, 0);
+        self.exec_pointer += width;
+    }
+
+    /// Apply `f` to the slots operands 1 and 3 select, store into operand 1, and
+    /// advance 5 — the shape every two-operand arithmetic opcode shares.
+    fn store_binary(&mut self, f: impl Fn(i32, i32) -> i32) {
+        let v1 = self.getworkofs(1, 0);
+        let v2 = self.getworkofs(3, 0);
+        self.store_unary(f(v1, v2), 5);
     }
 
     /// `XiEvent::CodeSETBITWORK` (0x40) / `CodeGETBITWORK` (0x41): build a
@@ -886,10 +980,10 @@ impl EventVm {
         if set {
             let v3 = !mask & self.getworkofs(5, 0);
             let v4 = self.getworkofs(7, 0);
-            self.setworkofs(5, v3 | (mask & v4.wrapping_shl(shift)));
+            self.setworkofs(5, v3 | (mask & v4.wrapping_shl(shift)), 0);
         } else {
             let v3 = self.getworkofs(5, 0);
-            self.setworkofs(7, (mask & v3).wrapping_shr(shift));
+            self.setworkofs(7, (mask & v3).wrapping_shr(shift), 0);
         }
     }
 
@@ -946,6 +1040,115 @@ mod tests {
 
     fn vm(event_data: Vec<u8>, references: Vec<u32>) -> EventVm {
         EventVm::start(&block(event_data, references), 7, 5, vec![]).unwrap()
+    }
+
+    /// Operand selecting `work_zone[0]`, little-endian.
+    const DST: [u8; 2] = [0x00, 0x10];
+    /// Operand selecting `references[1]`, little-endian.
+    const SRC: [u8; 2] = [0x01, 0x80];
+
+    /// `work_zone[0] = references[0]`, so a test can seed the destination the
+    /// arithmetic opcodes read-modify-write.
+    fn seed() -> [u8; 5] {
+        [OP_GET_STORE, DST[0], DST[1], 0x00, 0x80]
+    }
+
+    /// The two-operand work-slot arithmetic family, against the pseudo-code
+    /// bodies in research/XiEvents/OpCodes/. These touch no host state, so a
+    /// wrong result is a wrong branch in every event that loops on one.
+    #[test]
+    fn two_operand_arithmetic_matches_retail() {
+        for (op, a, b, want) in [
+            (OP_ADD, 7i32, 5i32, 12i32),
+            (OP_SUB, 7, 5, 2),
+            (OP_MUL, 7, 5, 35),
+            (OP_DIV, 30, 5, 6),
+            (OP_AND, 0b1100, 0b1010, 0b1000),
+            (OP_OR, 0b1100, 0b1010, 0b1110),
+            (OP_XOR, 0b1100, 0b1010, 0b0110),
+            (OP_SHL, 1, 4, 16),
+            (OP_SHR, 16, 4, 1),
+            (OP_BIT_SET, 0b0001, 2, 0b0101),
+            (OP_BIT_CLEAR, 0b0101, 2, 0b0001),
+        ] {
+            let mut data = seed().to_vec();
+            data.extend_from_slice(&[op, DST[0], DST[1], SRC[0], SRC[1], OP_END]);
+            let mut e = vm(data, vec![a as u32, b as u32]);
+
+            assert_eq!(e.step(), StepResult::Done, "op 0x{op:02X} must reach END");
+            assert_eq!(e.work_zone(0), want, "op 0x{op:02X}({a}, {b})");
+        }
+    }
+
+    /// 0x15 guards on *both* operands, so a zero numerator stores 0 rather than
+    /// dividing, and a zero denominator never reaches the divide.
+    #[test]
+    fn divide_by_zero_and_of_zero_both_store_zero() {
+        for (a, b) in [(0i32, 5i32), (30, 0)] {
+            let mut data = seed().to_vec();
+            data.extend_from_slice(&[OP_DIV, DST[0], DST[1], SRC[0], SRC[1], OP_END]);
+            let mut e = vm(data, vec![a as u32, b as u32]);
+
+            assert_eq!(e.step(), StepResult::Done);
+            assert_eq!(e.work_zone(0), 0, "{a} / {b}");
+        }
+    }
+
+    /// The one-operand family. 0x0B is the loop counter that, while it was only
+    /// being skipped by width, left ~1200 corpus events spinning until the
+    /// opcode budget killed them (kuluu-cjct).
+    #[test]
+    fn one_operand_arithmetic_matches_retail() {
+        for (op, seed_val, want) in [
+            (OP_SET_ONE, 9i32, 1i32),
+            (OP_SET_ZERO, 9, 0),
+            (OP_INC, 9, 10),
+            (OP_DEC, 9, 8),
+        ] {
+            let mut data = seed().to_vec();
+            data.extend_from_slice(&[op, DST[0], DST[1], OP_END]);
+            let mut e = vm(data, vec![seed_val as u32]);
+
+            assert_eq!(e.step(), StepResult::Done, "op 0x{op:02X} must reach END");
+            assert_eq!(e.work_zone(0), want, "op 0x{op:02X}({seed_val})");
+        }
+    }
+
+    /// 0x19 swaps the two slots rather than storing a computed value.
+    #[test]
+    fn endian_swap_exchanges_both_slots() {
+        let data = vec![OP_SWAP, DST[0], DST[1], 0x01, 0x10, OP_END];
+        let mut e = vm(data, vec![]);
+        e.work_zone[0] = 11;
+        e.work_zone[1] = 22;
+
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!((e.work_zone(0), e.work_zone(1)), (22, 11));
+    }
+
+    /// 0x3C addresses a bit array: operand 3 is the flat bit index, so `>> 5`
+    /// picks the slot and `& 0x1F` the bit within it, and operand 5 bounds the
+    /// array (research/XiEvents/OpCodes/0x003C.md).
+    #[test]
+    fn bitarray_set_addresses_slot_and_bit() {
+        // Bit 33 == slot 1, bit 1. Bound 2 admits it; bound 1 does not.
+        for (bound, want_slot1) in [(2i32, 0b10i32), (1, 0)] {
+            let data = vec![
+                OP_BITARRAY_SET,
+                DST[0],
+                DST[1],
+                0x00,
+                0x80,
+                0x01,
+                0x80,
+                OP_END,
+            ];
+            let mut e = vm(data, vec![33, bound as u32]);
+
+            assert_eq!(e.step(), StepResult::Done);
+            assert_eq!(e.work_zone(1), want_slot1, "bound {bound}");
+            assert_eq!(e.work_zone(0), 0, "bound {bound} must not touch slot 0");
+        }
     }
 
     /// One authored second of wait must cost a second of host clock. Before the
@@ -1081,9 +1284,10 @@ mod tests {
 
     #[test]
     fn a_script_that_loops_forever_stops_instead_of_hanging() {
-        // GOTO 0: the tightest loop the bytecode can express.
+        // GOTO 0: the tightest loop the bytecode can express. GOTO is
+        // implemented, so this must report as a spin, not as work to do.
         let mut e = vm(vec![OP_GOTO, 0x00, 0x00], vec![]);
-        assert_eq!(e.step(), StepResult::Unimplemented(OP_GOTO));
+        assert_eq!(e.step(), StepResult::Spun(OP_GOTO));
         // And it stays stopped rather than spinning again on the next tick.
         assert_eq!(e.step(), StepResult::Done);
     }

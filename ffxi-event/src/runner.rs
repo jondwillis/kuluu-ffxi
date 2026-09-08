@@ -157,7 +157,9 @@ impl DialogRunner {
                         end_para: EVENT_CANCELLED_END_PARA,
                     }
                 }
-                StepResult::Unimplemented(op) => return DialogStep::Stopped(op),
+                StepResult::Unimplemented(op) | StepResult::Spun(op) => {
+                    return DialogStep::Stopped(op)
+                }
                 StepResult::Waiting => return DialogStep::Waiting,
             }
         }

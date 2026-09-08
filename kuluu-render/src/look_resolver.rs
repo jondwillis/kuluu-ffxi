@@ -19,9 +19,9 @@ const EQUIP_SLOT_SUB: u8 = 7;
 const EQUIP_SLOT_RANGED: u8 = 8;
 const WEAPON_SLOTS: [u8; 3] = [EQUIP_SLOT_MAIN, EQUIP_SLOT_SUB, EQUIP_SLOT_RANGED];
 
-// FFXiMain `.text` VA 0x100C513D, quoted at
-// research/cexi-docs/reference/ffximain.md:288-300: four ranges split at 1500 /
-// 3000 / 3500, the top one computed as `(m - 3500) + 101739`.
+// FFXiMain `.text` VA 0x100C513D (retail client disassembly; the full quote
+// lives in out-of-tree cexi research notes, not in this repo): four ranges
+// split at 1500 / 3000 / 3500, the top one computed as `(m - 3500) + 101739`.
 //
 // The 3000-range is only *registered* for 3000..=3193 — every fid for 3194..3499
 // is VTABLE=0 and no retail mob_pools row uses one — so range 3's extent looks

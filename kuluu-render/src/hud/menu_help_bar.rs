@@ -385,7 +385,7 @@ mod tests {
         // A root entry without a help line renders an empty bar segment —
         // catch new entries that forget to add one.
         let dynamic = DynamicMenu::default();
-        for idx in 0..menu::entry_count(MenuKind::Root, &dynamic) {
+        for idx in 0..menu::entry_count(MenuKind::Root, &dynamic, true) {
             let label = menu::entry_label(MenuKind::Root, idx, &dynamic);
             assert!(
                 !root_entry_help(label).is_empty(),

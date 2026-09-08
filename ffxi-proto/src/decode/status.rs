@@ -26,6 +26,14 @@ pub struct CharStatus {
     /// `packet->mount_id` in CCharStatusPacket's constructor,
     /// vendor/server/src/map/packets/char_status.cpp.
     pub mount_id: u8,
+    /// The allegiance byte retail's own nameplate keys off for self:
+    /// `Flags2.BallistaFlg`. LSB writes `PChar->allegiance` there and ORs in the
+    /// belligerence bit (0x08) while a monstrosity is outside the Ferretory, so 8/9
+    /// are MOB/PLAYER | belligerent. Self never receives its own 0x0D —
+    /// `CZoneEntities::UpdateEntityPacket` skips the sender
+    /// (vendor/server/src/map/zone_entities.cpp) — this packet is the only channel.
+    /// vendor/server/src/map/packets/char_status.cpp.
+    pub allegiance: u8,
 }
 
 impl CharStatus {
@@ -36,6 +44,16 @@ impl CharStatus {
     pub(crate) const DEAD_COUNTER1_OFFSET: usize = 0x38;
     pub(crate) const DEAD_COUNTER2_OFFSET: usize = 0x3C;
     pub(crate) const FISHING_TIMER_OFFSET: usize = 0x46;
+    /// The `Flags2` word. Struct layout in char_status.cpp: BufStatus[32] @0x04,
+    /// UniqueNo @0x24, Flags0 @0x28, Flags1 @0x2C, server_status/r/g/b
+    /// @0x30..0x34, Flags2 @0x34 — the "Flags3 starts at 0x38" comment there is
+    /// struct-relative. Retail's 0x037.h static_asserts the same word at body
+    /// 0x30 (`MoreFlags`) and its handler reads `AUDIT_1FF = MoreFlags.dummy & 0xFF`
+    /// (research/XIClient .../Game/Net/Packets/s2c/0x037.cpp).
+    pub(crate) const FLAGS2_OFFSET: usize = 0x30;
+    /// `BallistaFlg`'s position inside the Flags2 word (bits 21..28),
+    /// char_status.cpp `flags2_t`.
+    pub(crate) const BALLISTA_FLG_SHIFT: u32 = 21;
     /// `field_57`, the byte the disassembly's own struct puts right before
     /// `Field58Flags` (research/XIClient .../Game/Net/Packets/s2c/0x037.h
     /// static_asserts), which LSB fills from the mount effect's power.
@@ -61,6 +79,7 @@ impl CharStatus {
             speed: u16::from_le_bytes([body[Self::SPEED_OFFSET], body[Self::SPEED_OFFSET + 1]])
                 & Self::SPEED_MASK,
             mount_id: body.get(Self::MOUNT_ID_OFFSET).copied().unwrap_or(0),
+            allegiance: ((rd(Self::FLAGS2_OFFSET) >> Self::BALLISTA_FLG_SHIFT) & 0xFF) as u8,
         })
     }
 
@@ -76,6 +95,7 @@ impl CharStatus {
 }
 
 const _: () = assert!(CharStatus::SPEED_OFFSET + 2 <= CharStatus::MIN_LEN);
+const _: () = assert!(CharStatus::FLAGS2_OFFSET + 4 <= CharStatus::MIN_LEN);
 
 /// s2c 0x061 GP_SERV_COMMAND_CLISTATUS — the self-character stat block.
 /// Field offsets follow the `CLISTATUS` struct in
@@ -375,6 +395,7 @@ mod char_status_tests {
                 fishing_timer: 0,
                 speed: 0,
                 mount_id: 0,
+                allegiance: 0,
             }
             .seconds_until_homepoint()
         };
@@ -452,5 +473,30 @@ mod char_status_tests {
     fn char_status_bound_speed_zero_decodes() {
         let body = vec![0u8; CharStatus::MIN_LEN];
         assert_eq!(CharStatus::decode(&body).unwrap().speed, 0);
+    }
+
+    /// Pins allegiance to LSB's Flags2 word and BallistaFlg's bit position,
+    /// since the decode tests build buffers through these same consts.
+    #[test]
+    fn char_status_allegiance_offsets_match_char_status_layout() {
+        assert_eq!(CharStatus::FLAGS2_OFFSET, 0x30);
+        assert_eq!(CharStatus::BALLISTA_FLG_SHIFT, 21);
+    }
+
+    #[test]
+    fn char_status_decodes_allegiance_from_flags2_ballista_flg() {
+        let mut body = vec![0u8; CharStatus::MIN_LEN];
+        // BallistaFlg at bits 21..28, with a PetIndex (bits 3..18) that must
+        // not leak into the byte.
+        let flags2 = (5u32 << 21) | 0x1234;
+        body[CharStatus::FLAGS2_OFFSET..CharStatus::FLAGS2_OFFSET + 4]
+            .copy_from_slice(&flags2.to_le_bytes());
+        assert_eq!(CharStatus::decode(&body).unwrap().allegiance, 5);
+
+        // The belligerence case: base allegiance OR'd with the 0x08 bit that
+        // char_status.cpp sets outside the Ferretory.
+        body[CharStatus::FLAGS2_OFFSET..CharStatus::FLAGS2_OFFSET + 4]
+            .copy_from_slice(&((9u32 << 21) | 0x1234).to_le_bytes());
+        assert_eq!(CharStatus::decode(&body).unwrap().allegiance, 9);
     }
 }

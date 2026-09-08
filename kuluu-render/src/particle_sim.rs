@@ -48,23 +48,18 @@ impl ParticleSimulator {
         self.clock = clock;
     }
 
-    // research/xim Particle.kt:238-254 — the two camera flags place differently. followCamera
-    // pins the generator to the camera position outright (the base offset then lands per
-    // particle through the billboard transform; the shipped curtains author pure-Y bases, so the
-    // yaw-invariant vel_basis fold below is equivalent). cameraAttachedBasePosition rotates the
-    // base offset by the view matrix — xim's `left*-x + up*y + forward*-z` with its
-    // backward-pointing lookAtForward is `rot * (-x, y, -z)` here (Matrix4f.kt:265-327) — so
-    // the mist/dust sheet is born in front of the viewer however they are turned (+z authors a
-    // placement ahead of the camera). Both refresh every frame, but a cameraAttachedBasePosition
-    // particle reads the result once — see `Particle::spawn_origin`.
-    pub fn set_camera_relative_origins(&mut self, cam_pos: Vec3, cam_rot: Quat) {
+    // research/cexi-viewer ui/js/particle/runtime.js updateAssociatedPosition:
+    // cameraAttachedBasePosition adds the base in fixed world axes, while followCamera anchors at
+    // the camera itself. Both refresh every frame, but a cameraAttachedBasePosition particle reads
+    // the result once — see `Particle::spawn_origin`.
+    pub fn set_camera_relative_origins(&mut self, cam_pos: Vec3) {
         for g in &mut self.generators {
             if !g.camera_relative {
                 continue;
             }
             let bp = g.def.base_position;
             g.origin = if g.def.camera_attached_base {
-                cam_pos + cam_rot * Vec3::new(-bp[0], bp[1], -bp[2])
+                cam_pos + Vec3::new(-bp[0], bp[1], -bp[2])
             } else {
                 cam_pos + Vec3::from_array(bp) * g.vel_basis
             };
@@ -837,7 +832,7 @@ pub fn sync_particle_meshes(
     for &(i, despawn) in reap.iter().rev() {
         let g = sim.generators.swap_remove(i);
         if despawn {
-            commands.entity(g.entity).despawn();
+            commands.entity(g.entity).try_despawn();
         }
     }
 }
@@ -1522,14 +1517,12 @@ mod tests {
         assert_eq!(ambient.particles.len(), routine.particles.len());
     }
 
-    // La Theine's `~1ra` curtain is followCamera with a pure-Y base: it rides the camera with
-    // its 35-up offset however the camera yaws. The `rai2`/`~1du` sheets are
-    // cameraAttachedBasePosition: the authored offset is view-space, so a +z placement stays in
-    // front of the viewer as the camera turns (research/xim Particle.kt:238-254).
+    // La Theine's `~1ra` curtain is followCamera with a pure-Y base. The `rai2`/`~1du` sheets are
+    // cameraAttachedBasePosition, whose base stays in fixed world axes (research/cexi-viewer
+    // ui/js/particle/runtime.js updateAssociatedPosition).
     #[test]
-    fn camera_relative_origins_split_by_flag() {
+    fn camera_relative_origins_stay_in_world_axes() {
         let cam_pos = Vec3::new(100.0, 5.0, 200.0);
-        let yaw180 = Quat::from_rotation_y(std::f32::consts::PI);
 
         let mut curtain = def(60.0, 30.0, 1);
         curtain.camera_relative = true;
@@ -1550,26 +1543,26 @@ mod tests {
         sim.generators.push(curtain);
         sim.generators.push(sheet);
 
-        sim.set_camera_relative_origins(cam_pos, Quat::IDENTITY);
+        let moved_cam = cam_pos + Vec3::new(5.0, -3.0, 9.0);
+        sim.set_camera_relative_origins(moved_cam);
+        assert_eq!(
+            sim.generators[0].origin,
+            moved_cam + Vec3::new(0.0, 35.0, 0.0)
+        );
+        assert_eq!(
+            sim.generators[1].origin,
+            moved_cam + Vec3::new(0.0, -10.0, -10.0)
+        );
+
+        sim.set_camera_relative_origins(cam_pos);
         assert_eq!(
             sim.generators[0].origin,
             cam_pos + Vec3::new(0.0, 35.0, 0.0)
         );
-        // Identity view looks along -Z: the authored (0, -10, 10) lands 10 below and 10 ahead.
         assert_eq!(
             sim.generators[1].origin,
             cam_pos + Vec3::new(0.0, -10.0, -10.0)
         );
-
-        sim.set_camera_relative_origins(cam_pos, yaw180);
-        // The curtain's vertical fold is yaw-invariant; the sheet swings behind the turn.
-        assert_eq!(
-            sim.generators[0].origin,
-            cam_pos + Vec3::new(0.0, 35.0, 0.0)
-        );
-        let got = sim.generators[1].origin;
-        let want = cam_pos + Vec3::new(0.0, -10.0, 10.0);
-        assert!((got - want).length() < 1e-4, "{got} != {want}");
     }
 
     // research/xim Particle.kt:238-241 — a cameraAttachedBasePosition particle reads the offset
@@ -1589,14 +1582,14 @@ mod tests {
         let mut sim = ParticleSimulator::default();
         sim.generators.push(sheet);
 
-        sim.set_camera_relative_origins(Vec3::ZERO, Quat::IDENTITY);
+        sim.set_camera_relative_origins(Vec3::ZERO);
         advance(&mut sim.generators[0], 10.0);
         let born = sim.generators[0].particles.len();
         assert!(born > 0);
 
-        // The camera walks 100 yalms and turns to look the other way.
+        // The camera walks 100 yalms.
         let moved = Vec3::new(100.0, 0.0, 0.0);
-        sim.set_camera_relative_origins(moved, Quat::from_rotation_y(std::f32::consts::PI));
+        sim.set_camera_relative_origins(moved);
         advance(&mut sim.generators[0], 10.0);
 
         let g = &sim.generators[0];
@@ -1614,7 +1607,7 @@ mod tests {
         }
         for w in &worlds[born..] {
             assert!(
-                (*w - (moved + Vec3::new(0.0, 0.0, 13.0))).length() < 1e-3,
+                (*w - (moved + Vec3::new(0.0, 0.0, -13.0))).length() < 1e-3,
                 "new emission did not follow the camera: {w}"
             );
         }

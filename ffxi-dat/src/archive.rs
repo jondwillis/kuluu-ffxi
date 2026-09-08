@@ -128,13 +128,15 @@ impl DatLocation {
             .join(format!("{}.{ext}", self.sub_path.file))
     }
 
-    /// First existing spelling of this file under `overlay`. Overlays are
-    /// hand-assembled and mix `.DAT` with `.dat`, which only matters on a
-    /// case-sensitive filesystem.
-    fn find_under(&self, overlay: &Path) -> Option<PathBuf> {
+    /// First existing spelling of this file under `dir`. Retail runs on
+    /// Windows, whose fopen is case-insensitive, so an install (or a
+    /// hand-assembled overlay) can mix `.DAT` with `.dat` and the real client
+    /// never notices; only a case-sensitive filesystem — a Linux user's
+    /// wine/launcher-managed install (kuluu-39fi) — can tell them apart.
+    fn find_under(&self, dir: &Path) -> Option<PathBuf> {
         ["DAT", "dat"]
             .into_iter()
-            .map(|ext| self.join_under_ext(overlay, ext))
+            .map(|ext| self.join_under_ext(dir, ext))
             .find(|p| p.is_file())
     }
 }
@@ -221,15 +223,16 @@ impl DatRoot {
     }
 
     /// Resolve a location to a real file: each overlay in order, then the base
-    /// install. The base install is returned unconditionally when no overlay
-    /// claims the file, so a missing file still surfaces as a read error at the
-    /// install path the caller expects.
+    /// install under either `.DAT` spelling. The raw `.DAT` join is returned
+    /// unconditionally when no spelling exists, so a missing file still
+    /// surfaces as a read error at the install path the caller expects.
     pub fn path_of(&self, loc: &DatLocation) -> PathBuf {
         self.overlays
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .find_map(|overlay| loc.find_under(overlay))
+            .or_else(|| loc.find_under(&self.root))
             .unwrap_or_else(|| loc.join_under(&self.root))
     }
 
@@ -499,6 +502,18 @@ mod tests {
 
         let root = root.with_overlays(vec![overlay.path().into()]);
         assert_eq!(served_bytes(&root), b"lower");
+    }
+
+    // The base install mixes spellings too: retail's Windows fopen is
+    // case-insensitive, so an install assembled by wine or a third-party
+    // launcher can carry `127.dat` and the real client never notices. A
+    // case-sensitive filesystem (the Linux field report in kuluu-39fi) must
+    // not turn that file into a missing body part.
+    #[test]
+    fn base_install_matches_a_lowercase_extension() {
+        let (tmp, root) = overlay_root();
+        write_overlay_entry(tmp.path(), "dat", b"base-lower");
+        assert_eq!(served_bytes(&root), b"base-lower");
     }
 
     /// The shape XI-Pivot actually ships, from the HorizonXI install measured

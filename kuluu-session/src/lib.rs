@@ -38,6 +38,10 @@ pub struct SessionHandle {
     pub state_rx: watch::Receiver<state::SessionState>,
     pub cmd_tx: mpsc::Sender<state::AgentCommand>,
     pub event_tx: broadcast::Sender<state::AgentEvent>,
+    /// Drained entity-change batches for the translator's delta path (piece 1
+    /// of the entity-table refactor): one batch per state-mutating event, in
+    /// fold order. The native viewer hands this to NativeSource; unused here.
+    pub entity_changes_rx: mpsc::UnboundedReceiver<state::EntityChanges>,
     pub session_task: JoinHandle<anyhow::Result<()>>,
     pub folder_task: JoinHandle<()>,
 }
@@ -46,15 +50,21 @@ pub fn spawn_session(cfg: session::Config) -> SessionHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (event_tx, _) = broadcast::channel(1024);
     let (state_tx, state_rx) = watch::channel(state::SessionState::default());
+    let (changes_tx, entity_changes_rx) = mpsc::unbounded_channel();
 
     let event_rx_for_folder = event_tx.subscribe();
     let session_task = tokio::spawn(session::run(cfg, cmd_rx, event_tx.clone()));
-    let folder_task = tokio::spawn(session::run_event_folder(event_rx_for_folder, state_tx));
+    let folder_task = tokio::spawn(session::run_event_folder(
+        event_rx_for_folder,
+        state_tx,
+        changes_tx,
+    ));
 
     SessionHandle {
         state_rx,
         cmd_tx,
         event_tx,
+        entity_changes_rx,
         session_task,
         folder_task,
     }
@@ -67,15 +77,21 @@ pub fn spawn_session_with_reactor(
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (event_tx, _) = broadcast::channel(1024);
     let (state_tx, state_rx) = watch::channel(state::SessionState::default());
+    let (changes_tx, entity_changes_rx) = mpsc::unbounded_channel();
 
     let event_rx_for_folder = event_tx.subscribe();
     let session_task = tokio::spawn(reactor::run(cfg, cmd_rx, event_tx.clone(), reactor_cfg));
-    let folder_task = tokio::spawn(session::run_event_folder(event_rx_for_folder, state_tx));
+    let folder_task = tokio::spawn(session::run_event_folder(
+        event_rx_for_folder,
+        state_tx,
+        changes_tx,
+    ));
 
     SessionHandle {
         state_rx,
         cmd_tx,
         event_tx,
+        entity_changes_rx,
         session_task,
         folder_task,
     }

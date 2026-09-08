@@ -117,15 +117,6 @@
           }
         ],
         "matcher": "startup|resume|clear|compact"
-      },
-      {
-        "hooks": [
-          {
-            "command": "bd prime --hook-json",
-            "type": "command"
-          }
-        ],
-        "matcher": ""
       }
     ],
     "Stop": [

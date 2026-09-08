@@ -9,9 +9,10 @@ use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::{
     AsBindGroup, AsBindGroupError, BindGroupLayout, BindGroupLayoutEntry, BindingResources,
-    BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages, Face, FrontFace,
-    OwnedBindingResource, RenderPipelineDescriptor, SamplerBindingType, ShaderStages, ShaderType,
-    SpecializedMeshPipelineError, TextureSampleType, TextureViewDimension, UnpreparedBindGroup,
+    BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages, DepthBiasState, Face,
+    FrontFace, OwnedBindingResource, RenderPipelineDescriptor, SamplerBindingType, ShaderStages,
+    ShaderType, SpecializedMeshPipelineError, TextureSampleType, TextureViewDimension,
+    UnpreparedBindGroup,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::texture::{FallbackImage, GpuImage};
@@ -57,8 +58,8 @@ pub struct ZoneGlobalLighting(pub FfxiLightingUniform);
 /// xim references:
 /// - ZoneMeshSection.kt:120-123 — blended zone meshes render at
 ///   `ZBiasLevel.High` (1), opaque at `Normal` (0).
-/// - GLDrawer.kt:198-201 — blended meshes disable depth write; GLDrawer.kt:216-219
-///   applies `glPolygonOffset(zBias * -1, 1)` to pull decals over the base terrain.
+/// - XIClient ZoneRenderer.cpp:1269-1275 — blended meshes disable depth write and use
+///   the integer `TransparentZBias` layer to pull decals over the base terrain.
 /// - Bit `0x2000` CLEAR enables back-face culling.
 /// - GLDrawer.kt:186 — front face is `CW` (D3D-era winding), flipped to `CCW`
 ///   when the instance is mirrored (`scale.x * scale.y * scale.z < 0`).
@@ -75,7 +76,7 @@ pub struct FfxiZoneMaterialKey {
     /// Zone tiles are routinely placed mirrored in alternating checkerboard
     /// patterns, so this must be per-placement, not per-chunk.
     pub mirrored: bool,
-    /// 0 = Normal, 1 = High (blended decal layers).
+    /// Legacy D3D8 integer Z-bias layer; 0 for opaque and 8 for blended terrain.
     pub z_bias_level: u8,
     /// `false` for blended decals (they must not occlude later layers).
     pub depth_write: bool,
@@ -105,6 +106,25 @@ impl FfxiZoneMaterialKey {
 /// Shader def `specialize` pushes for [`FfxiZoneMaterialKey::generator_stage_chain`];
 /// `zone_ffxi.wgsl` matches on it.
 pub const GENERATOR_STAGE_CHAIN_DEF: &str = "FFXI_GENERATOR_STAGE_CHAIN";
+
+const WGPU_FORWARD_DECAL_BIAS: i32 = 1;
+const WGPU_FORWARD_DECAL_SLOPE_SCALE: f32 = 1.0;
+
+fn d3d8_z_bias(level: u8) -> DepthBiasState {
+    DepthBiasState {
+        constant: if level == 0 {
+            0
+        } else {
+            WGPU_FORWARD_DECAL_BIAS
+        },
+        slope_scale: if level == 0 {
+            0.0
+        } else {
+            WGPU_FORWARD_DECAL_SLOPE_SCALE
+        },
+        clamp: 0.0,
+    }
+}
 
 #[derive(Asset, TypePath, Clone, Debug)]
 pub struct FfxiZoneMaterial {
@@ -414,7 +434,7 @@ impl Material for FfxiZoneMaterial {
         // (scale.x * scale.y * scale.z < 0). Using Bevy's CCW default here
         // culled every non-mirrored tile: inverted-checkerboard zone geometry.
         // Directional shadow views (UNCLIPPED_DEPTH_ORTHO is set only there —
-        // vendor/bevy_pbr/src/render/light.rs:2230) render single-sided walls
+        // vendor/bevy_pbr/src/render/light.rs:2277) render single-sided walls
         // unculled: from the sun's viewpoint a wall's one sheet of triangles is
         // back-facing, so Face::Back culling writes no shadow-map depth — walls
         // cast nothing and sunlight leaks indoors (kuluu-lchx).
@@ -440,14 +460,12 @@ impl Material for FfxiZoneMaterial {
             ds.depth_write_enabled =
                 Some(ds.depth_write_enabled.unwrap_or(false) && rk.depth_write);
 
-            // GLDrawer.kt: glPolygonOffset(zBias * -1, 1) pulls ZBiasLevel::High
-            // decal layers toward the camera over the coplanar base terrain.
-            // Bevy uses a reversed-Z depth buffer (closer = larger depth,
-            // GreaterEqual compare), so both GL terms flip sign: slope +zBias,
-            // constant -1.
+            // D3D8 ZBIAS is a driver-defined ordering level, not a portable WGPU
+            // depth-unit magnitude. Preserve its forward ordering with the minimum
+            // reversed-Z constant and slope terms; applying the raw level pulls
+            // decals through neighboring terrain.
             if rk.z_bias_level > 0 {
-                ds.bias.slope_scale = rk.z_bias_level as f32;
-                ds.bias.constant = -1;
+                ds.bias = d3d8_z_bias(rk.z_bias_level);
             }
         }
 
@@ -608,6 +626,14 @@ mod tests {
     fn fog_flag_maps_the_generator_bit() {
         assert_eq!(zone_fog_flag(true), ZONE_FLAG_FOGGED);
         assert_eq!(zone_fog_flag(false), ZONE_FLAG_UNFOGGED);
+    }
+
+    #[test]
+    fn d3d8_transparent_bias_moves_forward_by_one_portable_step() {
+        let bias = d3d8_z_bias(ffxi_dat::mmb::TRANSPARENT_Z_BIAS_LEVEL);
+        assert_eq!(bias.constant, WGPU_FORWARD_DECAL_BIAS);
+        assert_eq!(bias.slope_scale, WGPU_FORWARD_DECAL_SLOPE_SCALE);
+        assert_eq!(bias.clamp, 0.0);
     }
 
     // The lane crosses into WGSL, where no type holds the two sides together: if the

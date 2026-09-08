@@ -32,6 +32,22 @@ fn zone_in_weather_survives_the_zone_change_clear() {
     assert_eq!(s.current_weather, Some(4));
 }
 
+// Stand-up cancels leavegame server-side with no 0x053 cancel packet; the
+// heal→walk transition folds in as LogoutCountdownCancelled and must drop a
+// live countdown. A cancel with nothing active is a no-op fold (no churn).
+#[test]
+fn logout_countdown_cancelled_clears_the_live_countdown() {
+    let mut s = SessionState::default();
+    assert!(!s.apply_event(&AgentEvent::LogoutCountdownCancelled));
+    s.apply_event(&AgentEvent::LogoutCountdown {
+        seconds_remaining: 25,
+        shutdown: true,
+    });
+    assert_eq!(s.logout_countdown.map(|c| c.seconds_remaining), Some(25));
+    assert!(s.apply_event(&AgentEvent::LogoutCountdownCancelled));
+    assert_eq!(s.logout_countdown, None);
+}
+
 #[test]
 fn widescan_list_builds_between_start_and_end_and_clears_on_zone_change() {
     let mut s = SessionState::default();
@@ -400,6 +416,127 @@ fn party_member_upsert_preserves_name_across_attr_only_update() {
     assert_eq!(s.party[0].hp_pct, 75);
 }
 
+fn party_member(id: u32, name: &str, hp: u32) -> PartyMember {
+    PartyMember {
+        id,
+        act_index: 1,
+        name: Some(name.into()),
+        hp,
+        mp: 50,
+        tp: 0,
+        hp_pct: 80,
+        mp_pct: 100,
+        zone_no: 230,
+        main_job: 1,
+        main_job_lv: 75,
+        sub_job: 0,
+        sub_job_lv: 0,
+        is_party_leader: id == 42,
+        is_alliance_leader: false,
+        in_mog_house: false,
+        party_no: 0,
+    }
+}
+
+#[test]
+fn party_table_reset_solo_empty_table_keeps_self() {
+    // LSB answers a solo player's 0x076 with GROUP_TBL(nullptr): Kind 0, zero
+    // entries. Self is not in the table and its only stats source is
+    // GROUP_ATTR, so an empty reset must not wipe self.
+    let mut s = SessionState {
+        char_id: Some(42),
+        ..Default::default()
+    };
+    s.apply_event(&AgentEvent::PartyMemberUpdated {
+        member: party_member(42, "Sylvie", 1500),
+    });
+
+    let changed = s.apply_event(&AgentEvent::PartyTableReset { members: vec![] });
+    assert!(!changed, "no-op reset reports no change");
+    assert_eq!(s.party.len(), 1);
+    assert_eq!(s.party[0].id, 42);
+    assert_eq!(s.party[0].hp, 1500, "self stats survive the empty table");
+}
+
+#[test]
+fn party_table_reset_drops_unlisted_keeps_stats_seeds_skeletons() {
+    let mut s = SessionState {
+        char_id: Some(42),
+        ..Default::default()
+    };
+    for m in [
+        party_member(42, "Sylvie", 1500),
+        party_member(7, "Vanari", 900),
+        party_member(99, "LeftTheParty", 300),
+    ] {
+        s.apply_event(&AgentEvent::PartyMemberUpdated { member: m });
+    }
+
+    use ffxi_proto::decode::GroupTblEntry;
+    let changed = s.apply_event(&AgentEvent::PartyTableReset {
+        members: vec![
+            GroupTblEntry {
+                unique_no: 42,
+                act_index: 3,
+                party_no: 0,
+                is_party_leader: true,
+                is_alliance_leader: false,
+                zone_no: 235,
+            },
+            GroupTblEntry {
+                unique_no: 7,
+                act_index: 9,
+                party_no: 1,
+                is_party_leader: false,
+                is_alliance_leader: true,
+                zone_no: 0,
+            },
+            GroupTblEntry {
+                unique_no: 55,
+                act_index: 4,
+                party_no: 0,
+                is_party_leader: false,
+                is_alliance_leader: false,
+                zone_no: 235,
+            },
+        ],
+    });
+    assert!(changed);
+
+    let by_id = |id: u32| {
+        s.party
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("missing {id}"))
+    };
+    assert_eq!(s.party.len(), 3, "unlisted member dropped, new id seeded");
+    assert!(s.party.iter().all(|m| m.id != 99), "stale member gone");
+
+    let self_row = by_id(42);
+    assert_eq!(
+        self_row.hp, 1500,
+        "listed member keeps stats until the 0x0DD burst"
+    );
+    assert_eq!(self_row.name.as_deref(), Some("Sylvie"));
+    assert_eq!(
+        self_row.act_index, 3,
+        "roster fields refreshed from the table"
+    );
+    assert_eq!(self_row.zone_no, 235);
+
+    let mate = by_id(7);
+    assert_eq!(mate.party_no, 1);
+    assert!(mate.is_alliance_leader);
+    assert!(!mate.is_party_leader);
+
+    let skeleton = by_id(55);
+    assert_eq!(
+        skeleton.name, None,
+        "new id is a skeleton row until its 0x0DD lands"
+    );
+    assert_eq!(skeleton.hp, 0);
+}
+
 #[test]
 fn action_kind_raise_menu_accept_zero_reject_one() {
     let mut buf = [0u8; 16];
@@ -446,6 +583,7 @@ fn apply_event_folds_in_documented_order() {
             hp_pct: Some(80),
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 0,
             speed_base: 0,
@@ -454,6 +592,8 @@ fn apply_event_folds_in_documented_order() {
             status: 0,
             char_flags: Default::default(),
             mount_id: None,
+            monstrosity: None,
+            job_master_display: None,
         },
         pos_present: true,
     });
@@ -474,6 +614,7 @@ fn apply_event_folds_in_documented_order() {
             hp_pct: Some(50),
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 0,
             speed_base: 0,
@@ -482,6 +623,8 @@ fn apply_event_folds_in_documented_order() {
             status: 0,
             char_flags: Default::default(),
             mount_id: None,
+            monstrosity: None,
+            job_master_display: None,
         },
         pos_present: true,
     });
@@ -547,6 +690,54 @@ fn merge_kind_specialized_wins_over_other() {
     assert_eq!(merge_kind(Other, Other), Other);
 }
 
+/// `Flags4.JobMasterFlag` is written on every non-despawn 0x0D outside all
+/// SendFlg blocks (char_update.cpp), so a pos-only upsert (`char_flags: None`)
+/// must still refresh the preserved flags — unlike the General words.
+#[test]
+fn job_master_flag_refreshes_on_pos_only_updates() {
+    let mut s = SessionState::default();
+
+    // A General-block update establishes the flags with the star off...
+    let mut e = make_test_entity(9, Some("Star"), EntityKind::Pc);
+    e.char_flags = Some(ffxi_proto::decode::CharFlags::default());
+    e.job_master_display = Some(false);
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: e,
+        pos_present: true,
+    });
+
+    // ...and a later pos-only tick (no General words) turns it on.
+    let mut e = make_test_entity(9, None, EntityKind::Pc);
+    e.char_flags = None;
+    e.job_master_display = Some(true);
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: e,
+        pos_present: true,
+    });
+
+    assert!(
+        s.entities[0]
+            .char_flags
+            .expect("the General update materialized the flags")
+            .job_master_display,
+        "a pos-only tick must carry the fresh star"
+    );
+
+    // ...and a later pos-only 'off' clears it again.
+    let mut e = make_test_entity(9, None, EntityKind::Pc);
+    e.char_flags = None;
+    e.job_master_display = Some(false);
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: e,
+        pos_present: true,
+    });
+
+    assert!(
+        !s.entities[0].char_flags.unwrap().job_master_display,
+        "a pos-only 'off' must clear the star"
+    );
+}
+
 fn make_test_entity(id: u32, name: Option<&str>, kind: EntityKind) -> Entity {
     Entity {
         id,
@@ -562,6 +753,7 @@ fn make_test_entity(id: u32, name: Option<&str>, kind: EntityKind) -> Entity {
         hp_pct: Some(100),
         bt_target_id: 0,
         face_target: 0,
+        name_vis: None,
         claim_id: 0,
         speed: 0,
         speed_base: 0,
@@ -570,6 +762,8 @@ fn make_test_entity(id: u32, name: Option<&str>, kind: EntityKind) -> Entity {
         status: 0,
         char_flags: Default::default(),
         mount_id: None,
+        monstrosity: None,
+        job_master_display: None,
     }
 }
 
@@ -709,6 +903,62 @@ fn entity_upserted_preserves_hp_pct_across_position_only_update() {
         s.entities[0].hp_pct,
         Some(0),
         "Some(0) (mob died) must overwrite, not get preserved as Some(50)"
+    );
+}
+
+#[test]
+fn entity_upserted_name_vis_survives_pos_only_tick() {
+    // #512-4: namevis is written under UPDATE_HP (entity_update.cpp:357/:408), and a
+    // POS-only 0x00E carries the byte zero-filled. Merging off pos_present would
+    // un-hide a hidden entity the moment it moved.
+    let mut s = SessionState::default();
+    let mut ent = make_test_entity(42, Some("Survival Guide"), EntityKind::Npc);
+    ent.name_vis = Some(0x08); // FLAG_HIDE_NAME
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: ent,
+        pos_present: true,
+    });
+    assert_eq!(s.entities[0].name_vis, Some(0x08));
+
+    let mut moved = make_test_entity(42, None, EntityKind::Npc); // POS-only: no namevis byte
+    moved.pos = Vec3 {
+        x: 50.0,
+        y: 1.0,
+        z: -20.0,
+    };
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: moved,
+        pos_present: true,
+    });
+    assert_eq!(
+        s.entities[0].name_vis,
+        Some(0x08),
+        "a POS-only tick must not un-hide a hidden entity (zero-filled byte is not data)"
+    );
+}
+
+#[test]
+fn entity_upserted_name_vis_applies_on_hp_only_tick() {
+    // #512-4: HideName(true) sets UPDATE_HP, not UPDATE_POS. Merging off pos_present
+    // kept the stale visible value for a static NPC the server just hid.
+    let mut s = SessionState::default();
+    let ent = make_test_entity(42, Some("Unity Master"), EntityKind::Npc);
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: ent,
+        pos_present: true,
+    });
+    assert_eq!(s.entities[0].name_vis, None);
+
+    let mut hidden = make_test_entity(42, None, EntityKind::Npc);
+    hidden.name_vis = Some(0x08); // HideName(true) -> updatemask |= UPDATE_HP only
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: hidden,
+        pos_present: false,
+    });
+    assert_eq!(
+        s.entities[0].name_vis,
+        Some(0x08),
+        "an HP-only tick must apply the new namevis even without UPDATE_POS"
     );
 }
 
@@ -887,6 +1137,7 @@ fn entity_patched_by_id_sets_name_on_existing_entity() {
         name: Some("Mihli Aliapoh".into()),
         kind: Some(EntityKind::Pet),
         hp_pct: None,
+        allegiance: None,
     });
     assert_eq!(s.entities[0].name.as_deref(), Some("Mihli Aliapoh"));
     assert_eq!(s.entities[0].kind, EntityKind::Pet);
@@ -907,10 +1158,57 @@ fn entity_patched_by_act_index_resolves_when_id_unknown() {
         name: Some("Crab Familiar".into()),
         kind: Some(EntityKind::Pet),
         hp_pct: Some(75),
+        allegiance: None,
     });
     assert_eq!(s.entities[0].name.as_deref(), Some("Crab Familiar"));
     assert_eq!(s.entities[0].kind, EntityKind::Pet);
     assert_eq!(s.entities[0].hp_pct, Some(75));
+}
+
+#[test]
+fn entity_patched_allegiance_materializes_flags_and_preserves_the_rest() {
+    let mut s = SessionState::default();
+    // Self's entity carries no flags until its first 0x037 — the patch must
+    // materialize rather than skip.
+    s.apply_event(&AgentEvent::EntityUpserted {
+        entity: make_test_entity(1, None, EntityKind::Pc),
+        pos_present: true,
+    });
+    assert!(s.entities[0].char_flags.is_none());
+
+    let changed = s.apply_event(&AgentEvent::EntityPatched {
+        id: Some(1),
+        act_index: None,
+        name: None,
+        kind: None,
+        hp_pct: None,
+        allegiance: Some(9),
+    });
+    assert!(changed);
+    let flags = s.entities[0].char_flags.expect("materialized by the patch");
+    assert_eq!(flags.allegiance, 9);
+
+    // A repeat of the same value is a no-op (0x037 arrives every non-pos tick).
+    assert!(!s.apply_event(&AgentEvent::EntityPatched {
+        id: Some(1),
+        act_index: None,
+        name: None,
+        kind: None,
+        hp_pct: None,
+        allegiance: Some(9),
+    }));
+
+    // A later value updates in place without zeroing the other flags.
+    s.apply_event(&AgentEvent::EntityPatched {
+        id: Some(1),
+        act_index: None,
+        name: None,
+        kind: None,
+        hp_pct: None,
+        allegiance: Some(3),
+    });
+    let flags = s.entities[0].char_flags.expect("still materialized");
+    assert_eq!(flags.allegiance, 3);
 }
 
 #[test]
@@ -970,6 +1268,7 @@ fn entity_patched_for_unknown_entity_is_dropped() {
         name: Some("Ghost".into()),
         kind: Some(EntityKind::Pet),
         hp_pct: None,
+        allegiance: None,
     });
     assert!(s.entities.is_empty());
 }
@@ -1090,6 +1389,7 @@ fn self_position_returns_self_entity_pos() {
             hp_pct: Some(100),
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 40,
             speed_base: 40,
@@ -1098,6 +1398,8 @@ fn self_position_returns_self_entity_pos() {
             status: 0,
             char_flags: Default::default(),
             mount_id: None,
+            monstrosity: None,
+            job_master_display: None,
         },
         pos_present: true,
     });
@@ -1644,6 +1946,7 @@ fn apply_event_dedupes_identical_entity_upserts() {
         hp_pct: Some(80),
         bt_target_id: 0,
         face_target: 0,
+        name_vis: None,
         claim_id: 0,
         speed: 0,
         speed_base: 0,
@@ -1652,6 +1955,8 @@ fn apply_event_dedupes_identical_entity_upserts() {
         status: 0,
         char_flags: Default::default(),
         mount_id: None,
+        monstrosity: None,
+        job_master_display: None,
     };
 
     // First upsert inserts.
@@ -1712,6 +2017,7 @@ fn apply_event_dedupes_identical_self_position() {
             hp_pct: Some(100),
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 40,
             speed_base: 40,
@@ -1720,6 +2026,8 @@ fn apply_event_dedupes_identical_self_position() {
             status: 0,
             char_flags: Default::default(),
             mount_id: None,
+            monstrosity: None,
+            job_master_display: None,
         },
         pos_present: true,
     });
@@ -1806,6 +2114,72 @@ fn _agentcommand_is_additive_only(x: &AgentCommand) {
     }
 }
 
+#[test]
+fn death_menu_offer_is_durable_and_clears_on_revive_or_zone_change() {
+    use ffxi_proto::decode::DeathMenuOffer;
+
+    let mut state = SessionState::default();
+    assert!(state.apply_event(&AgentEvent::DeathMenuUpdated {
+        offer: Some(DeathMenuOffer::Raise),
+    }));
+    assert_eq!(state.death_menu_offer, Some(DeathMenuOffer::Raise));
+
+    assert!(state.apply_event(&AgentEvent::DeathTimerUpdated {
+        seconds_until_homepoint: None,
+    }));
+    assert_eq!(state.death_menu_offer, None);
+
+    state.apply_event(&AgentEvent::DeathMenuUpdated {
+        offer: Some(DeathMenuOffer::Tractor),
+    });
+    state.apply_event(&AgentEvent::ZoneChanged {
+        from: Some(100),
+        to: 101,
+        myroom: None,
+        mog_zone_flag: false,
+    });
+    assert_eq!(state.death_menu_offer, None);
+}
+
+#[test]
+fn ground_height_correction_is_same_column_and_height_only() {
+    let mut position = Position {
+        pos: Vec3 {
+            x: 10.0,
+            y: 20.0,
+            z: 0.0,
+        },
+        heading: 73,
+        speed: 4,
+        speed_base: 5,
+    };
+    assert!(!apply_ground_height_correction(
+        &mut position,
+        11.0,
+        20.0,
+        -5.319
+    ));
+    assert_eq!(position.pos.z, 0.0);
+
+    assert!(apply_ground_height_correction(
+        &mut position,
+        10.0,
+        20.0,
+        -5.319
+    ));
+    assert_eq!(
+        position.pos,
+        Vec3 {
+            x: 10.0,
+            y: 20.0,
+            z: -5.319
+        }
+    );
+    assert_eq!(position.heading, 73);
+    assert_eq!(position.speed, 4);
+    assert_eq!(position.speed_base, 5);
+}
+
 /// AgentEvent is an EXTENSION SURFACE: its serde tags ("cmd"/"type",
 /// snake_case variant names) are the agent-socket/MCP wire contract, so it
 /// evolves additive-only. This match is exhaustive on purpose — adding,
@@ -1845,6 +2219,7 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
         AgentEvent::WeatherUpdated { .. } => (),
         AgentEvent::VanaTimeSynced { .. } => (),
         AgentEvent::LogoutCountdown { .. } => (),
+        AgentEvent::LogoutCountdownCancelled { .. } => (),
         AgentEvent::EventEnded { .. } => (),
         AgentEvent::ActionStarted { .. } => (),
         AgentEvent::SelfCastStarted { .. } => (),
@@ -1858,6 +2233,7 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
         AgentEvent::Diagnostics { .. } => (),
         AgentEvent::NetStats { .. } => (),
         AgentEvent::PartyMemberUpdated { .. } => (),
+        AgentEvent::PartyTableReset { .. } => (),
         AgentEvent::LowHp { .. } => (),
         AgentEvent::PartyMemberLowHp { .. } => (),
         AgentEvent::EngagedBy { .. } => (),
@@ -1880,6 +2256,7 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
         AgentEvent::HumanReleased { .. } => (),
         AgentEvent::MusicChanged { .. } => (),
         AgentEvent::DeathTimerUpdated { .. } => (),
+        AgentEvent::DeathMenuUpdated { .. } => (),
         AgentEvent::MusicVolumeChanged { .. } => (),
         AgentEvent::LevelUp { .. } => (),
         AgentEvent::SkillLevelUp { .. } => (),
@@ -1916,4 +2293,179 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
         AgentEvent::AuctionSalesSlot { .. } => (),
         AgentEvent::AuctionCancelResult { .. } => (),
     }
+}
+
+// Piece 0 (entity-table): the wire-id index must stay in lockstep with the
+// entities Vec across every mutation path, and the pending sets must carry
+// exactly the ids that changed since the last drain.
+
+#[test]
+fn entity_index_stays_in_lockstep_with_the_vec() {
+    let mut s = SessionState::default();
+    for id in [10u32, 20, 30] {
+        assert!(s.apply_event(&AgentEvent::EntityUpserted {
+            entity: make_test_entity(id, Some("m"), EntityKind::Mob),
+            pos_present: true,
+        }));
+    }
+    for (i, e) in s.entities.iter().enumerate() {
+        assert_eq!(s.entity_index.get(&e.id), Some(&i));
+    }
+
+    // Removing the middle one shifts every later slot; the index must follow.
+    assert!(s.apply_event(&AgentEvent::EntityRemoved { id: 20 }));
+    for (i, e) in s.entities.iter().enumerate() {
+        assert_eq!(s.entity_index.get(&e.id), Some(&i));
+    }
+    assert!(!s.entity_index.contains_key(&20));
+
+    // A fresh insert lands at the tail.
+    assert!(s.apply_event(&AgentEvent::EntityUpserted {
+        entity: make_test_entity(40, None, EntityKind::Npc),
+        pos_present: true,
+    }));
+    for (i, e) in s.entities.iter().enumerate() {
+        assert_eq!(s.entity_index.get(&e.id), Some(&i));
+    }
+
+    // A zone change wipes the Vec and the index together.
+    s.apply_event(&AgentEvent::ZoneChanged {
+        from: None,
+        to: 103,
+        myroom: None,
+        mog_zone_flag: false,
+    });
+    assert!(s.entities.is_empty());
+    assert!(s.entity_index.is_empty());
+}
+
+#[test]
+fn pending_entity_sets_carry_exactly_the_changed_ids() {
+    let mut s = SessionState::default();
+
+    // Insert stamps; an identical re-upsert is a no-op fold and stamps nothing.
+    assert!(s.apply_event(&AgentEvent::EntityUpserted {
+        entity: make_test_entity(1, Some("a"), EntityKind::Mob),
+        pos_present: true,
+    }));
+    let (up, rem) = s.take_pending_entities();
+    assert_eq!(up, std::collections::HashSet::from([1u32]));
+    assert!(rem.is_empty());
+
+    let same = make_test_entity(1, Some("a"), EntityKind::Mob);
+    assert!(!s.apply_event(&AgentEvent::EntityUpserted {
+        entity: same,
+        pos_present: true,
+    }));
+    let (up, rem) = s.take_pending_entities();
+    assert!(up.is_empty(), "no-op upsert must not stamp");
+    assert!(rem.is_empty());
+
+    // A real change stamps again; removing an absent id stamps nothing.
+    let mut moved = make_test_entity(1, Some("a"), EntityKind::Mob);
+    moved.pos.z += 5.0;
+    assert!(s.apply_event(&AgentEvent::EntityUpserted {
+        entity: moved,
+        pos_present: true,
+    }));
+    assert!(!s.apply_event(&AgentEvent::EntityRemoved { id: 999 }));
+    let (up, rem) = s.take_pending_entities();
+    assert_eq!(up, std::collections::HashSet::from([1u32]));
+    assert!(rem.is_empty());
+
+    // Upsert-then-remove in one batch nets to a removal.
+    assert!(s.apply_event(&AgentEvent::EntityUpserted {
+        entity: make_test_entity(2, None, EntityKind::Npc),
+        pos_present: true,
+    }));
+    assert!(s.apply_event(&AgentEvent::EntityRemoved { id: 2 }));
+    let (up, rem) = s.take_pending_entities();
+    assert!(up.is_empty(), "voided upsert must not survive the drain");
+    assert_eq!(rem, std::collections::HashSet::from([2u32]));
+
+    // A zone change marks every live id removed and clears pending upserts.
+    assert!(s.apply_event(&AgentEvent::EntityUpserted {
+        entity: make_test_entity(3, None, EntityKind::Mob),
+        pos_present: true,
+    }));
+    s.apply_event(&AgentEvent::ZoneChanged {
+        from: Some(103),
+        to: 104,
+        myroom: None,
+        mog_zone_flag: false,
+    });
+    let (up, rem) = s.take_pending_entities();
+    assert!(up.is_empty());
+    // Entity 1 is still live at the wipe, so both ids are marked removed.
+    assert_eq!(rem, std::collections::HashSet::from([1u32, 3]));
+
+    // Repopulating upserts after the wipe stamp back in.
+    assert!(s.apply_event(&AgentEvent::EntityUpserted {
+        entity: make_test_entity(4, None, EntityKind::Mob),
+        pos_present: true,
+    }));
+    let (up, rem) = s.take_pending_entities();
+    assert_eq!(up, std::collections::HashSet::from([4u32]));
+    assert!(rem.is_empty());
+}
+
+#[test]
+fn self_position_events_stamp_the_self_id() {
+    let mut s = SessionState::default();
+    s.apply_event(&AgentEvent::Connected {
+        account_id: 1,
+        char_id: 7,
+        character: "Cow".into(),
+        zone_id: 103,
+    });
+    assert!(s.apply_event(&AgentEvent::EntityUpserted {
+        entity: make_test_entity(7, Some("Cow"), EntityKind::Pc),
+        pos_present: true,
+    }));
+    s.take_pending_entities();
+
+    // A moved self position stamps the self id; an identical one does not.
+    let p1 = Position {
+        pos: Vec3 {
+            x: 1.0,
+            y: 2.0,
+            z: 9.0,
+        },
+        heading: 4,
+        speed: 5,
+        speed_base: 5,
+    };
+    assert!(s.apply_event(&AgentEvent::PositionChanged { pos: p1 }));
+    let (up, rem) = s.take_pending_entities();
+    assert_eq!(up, std::collections::HashSet::from([7u32]));
+    assert!(rem.is_empty());
+
+    assert!(!s.apply_event(&AgentEvent::PositionChanged { pos: p1 }));
+    let (up, _) = s.take_pending_entities();
+    assert!(up.is_empty(), "identical self position must not stamp");
+}
+
+#[test]
+fn respawn_cancels_pending_removal_before_batch_drain() {
+    let mut state = SessionState::default();
+    for event in [
+        AgentEvent::EntityUpserted {
+            entity: make_test_entity(9, Some("old"), EntityKind::Mob),
+            pos_present: true,
+        },
+        AgentEvent::EntityRemoved { id: 9 },
+        AgentEvent::EntityUpserted {
+            entity: make_test_entity(9, Some("new"), EntityKind::Mob),
+            pos_present: true,
+        },
+    ] {
+        assert!(state.apply_event(&event));
+    }
+    let (upserts, removals) = state.take_pending_entities();
+    assert_eq!(upserts, std::collections::HashSet::from([9]));
+    assert!(removals.is_empty());
+    assert_eq!(
+        state.entities[state.entity_index[&9]].name.as_deref(),
+        Some("new")
+    );
 }

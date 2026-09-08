@@ -71,7 +71,7 @@ shoot || exit 1
 if ! lit_check; then
   echo "capture.sh: blank frame — client window is fully occluded, so macOS stopped" >&2
   echo "            rendering it. Raising it once to get a real frame; FOCUS WILL BLIP." >&2
-  pid=$(pgrep -f "^target/debug/kuluu" | head -1 || true)
+  pid=$(pgrep -f "^target/(release|debug)/kuluu" | head -1 || true)
   prev=$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' 2>/dev/null || true)
   if [ -n "$pid" ]; then
     osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $pid) to true" >/dev/null 2>&1 || true

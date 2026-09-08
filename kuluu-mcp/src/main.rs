@@ -1,3 +1,4 @@
+#[cfg(unix)]
 mod attach;
 
 use std::sync::Arc;
@@ -1065,26 +1066,37 @@ async fn main() -> Result<()> {
 
     let event_tx_for_producer = event_tx.clone();
     let supervisor_handle = if let Some(arg) = attach_arg {
-        let sock = match attach::resolve_attach(&arg) {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!("error: FFXI_ATTACH={arg:?}: {err:#}");
-                std::process::exit(2);
-            }
-        };
+        #[cfg(unix)]
+        {
+            let sock = match attach::resolve_attach(&arg) {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!("error: FFXI_ATTACH={arg:?}: {err:#}");
+                    std::process::exit(2);
+                }
+            };
 
-        tokio::spawn(async move {
-            if let Err(e) = attach::run(sock, cmd_rx, event_tx_for_producer).await {
-                tracing::error!(error = %e, "attach bridge exited with error");
-            }
-        })
+            tokio::spawn(async move {
+                if let Err(e) = attach::run(sock, cmd_rx, event_tx_for_producer).await {
+                    tracing::error!(error = %e, "attach bridge exited with error");
+                }
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (arg, cmd_rx, event_tx_for_producer);
+            eprintln!(
+                "error: FFXI_ATTACH is not supported on Windows (requires Unix domain sockets)"
+            );
+            std::process::exit(2);
+        }
     } else {
         let cfg = cfg.expect("non-attach mode constructs cfg above");
         let sup_cfg = SupervisorConfig {
             goal_store: Some(goal_store.clone()),
             ..SupervisorConfig::default()
         };
-        let reactor_cfg = ReactorConfig::default();
+        let reactor_cfg = ReactorConfig::agent();
         tokio::spawn(async move {
             if let Err(e) =
                 supervisor::run(cfg, cmd_rx, event_tx_for_producer, sup_cfg, reactor_cfg).await
@@ -1099,11 +1111,17 @@ async fn main() -> Result<()> {
     let relay_handles = if let Some(addr) = relay_addr {
         let (state_tx, state_rx) = tokio::sync::watch::channel(SessionState::default());
         let folder_rx = event_tx.subscribe();
-        let folder_h = tokio::spawn(session::run_event_folder(folder_rx, state_tx));
+        // The relay path has no translator: change batches are drained
+        // by the folder but never consumed.
+        let (changes_tx, _entity_changes_rx) = tokio::sync::mpsc::unbounded_channel();
+        let folder_h = tokio::spawn(session::run_event_folder(folder_rx, state_tx, changes_tx));
         let relay_event_tx = event_tx.clone();
         let relay_cmd_tx = cmd_tx.clone();
         let serve_h = tokio::spawn(async move {
-            if let Err(err) = relay::serve(addr, state_rx, relay_event_tx, relay_cmd_tx).await {
+            // No GUI in the MCP path: screenshot requests have no
+            // DebugControl to land on (same as the headless main.rs path).
+            if let Err(err) = relay::serve(addr, state_rx, relay_event_tx, relay_cmd_tx, None).await
+            {
                 tracing::warn!(error = %err, "relay listener exited");
             }
         });
@@ -1358,7 +1376,10 @@ mod tests {
             npc_state: None,
             status: 0,
             char_flags: Default::default(),
+            monstrosity: None,
+            job_master_display: None,
             mount_id: None,
+            name_vis: None,
         });
 
         for i in 0..35u32 {
@@ -1383,7 +1404,10 @@ mod tests {
                 npc_state: None,
                 status: 0,
                 char_flags: Default::default(),
+                monstrosity: None,
+                job_master_display: None,
                 mount_id: None,
+                name_vis: None,
             });
         }
         let v = entities_view(&s);
@@ -1416,7 +1440,10 @@ mod tests {
             npc_state: None,
             status: 0,
             char_flags: Default::default(),
+            monstrosity: None,
+            job_master_display: None,
             mount_id: None,
+            name_vis: None,
         });
         s.entities.push(Entity {
             id: 100,
@@ -1439,7 +1466,10 @@ mod tests {
             npc_state: None,
             status: 0,
             char_flags: Default::default(),
+            monstrosity: None,
+            job_master_display: None,
             mount_id: None,
+            name_vis: None,
         });
         let v = entities_view(&s);
         assert_eq!(v["entities"][0]["claimed_by"], 4242);

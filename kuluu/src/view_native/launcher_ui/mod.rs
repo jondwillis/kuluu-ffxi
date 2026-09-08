@@ -18,9 +18,9 @@ mod updater;
 
 use std::sync::{Arc, Mutex};
 
+use crate::launcher_store::{AuthFlavorKind, ServerProfile};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use kuluu::launcher_store::{AuthFlavorKind, ServerProfile};
 use kuluu_session::auth_client::{AuthClient, AuthFlavor};
 use kuluu_session::lobby_client::LobbyClient;
 use tokio::runtime::Handle as RtHandle;
@@ -120,6 +120,7 @@ pub(crate) enum CharCreateField {
     Face,
     Hair,
     Size,
+    SkipIntroCs,
 }
 
 #[allow(dead_code)]
@@ -132,18 +133,20 @@ impl CharCreateField {
             Self::Nation => Self::Face,
             Self::Face => Self::Hair,
             Self::Hair => Self::Size,
-            Self::Size => Self::Name,
+            Self::Size => Self::SkipIntroCs,
+            Self::SkipIntroCs => Self::Name,
         }
     }
     pub(crate) fn prev(self) -> Self {
         match self {
-            Self::Name => Self::Size,
+            Self::Name => Self::SkipIntroCs,
             Self::Race => Self::Name,
             Self::Job => Self::Race,
             Self::Nation => Self::Job,
             Self::Face => Self::Nation,
             Self::Hair => Self::Face,
             Self::Size => Self::Hair,
+            Self::SkipIntroCs => Self::Size,
         }
     }
 }
@@ -156,6 +159,10 @@ pub(crate) struct CharCreateForm {
     pub nation: u8,
     pub face: u8,
     pub size: u8,
+    /// Skip the opening new-character cutscene. Default on: the CS is a
+    /// client-side playback that Kuluu does not run yet, and leaving it on
+    /// strands fresh characters in their start zone.
+    pub skip_intro_cs: bool,
     #[allow(dead_code)]
     pub focus: CharCreateField,
 }
@@ -169,6 +176,7 @@ impl Default for CharCreateForm {
             nation: 0,
             face: 0,
             size: 1,
+            skip_intro_cs: true,
             focus: CharCreateField::default(),
         }
     }
@@ -204,6 +212,7 @@ impl CharCreateForm {
             CharCreateField::Face => self.face / 2,
             CharCreateField::Hair => self.face % 2,
             CharCreateField::Size => self.size,
+            CharCreateField::SkipIntroCs => u8::from(self.skip_intro_cs),
         }
     }
 
@@ -216,6 +225,7 @@ impl CharCreateForm {
             CharCreateField::Face => self.face = value * 2 + (self.face % 2),
             CharCreateField::Hair => self.face = (self.face / 2) * 2 + value,
             CharCreateField::Size => self.size = value,
+            CharCreateField::SkipIntroCs => self.skip_intro_cs = value != 0,
         }
     }
 
@@ -229,6 +239,7 @@ impl CharCreateForm {
             CharCreateField::Face => char_create::FACES,
             CharCreateField::Hair => char_create::HAIRS,
             CharCreateField::Size => char_create::SIZES,
+            CharCreateField::SkipIntroCs => char_create::SKIP_OPTIONS,
         };
         let next = cycle_table(table, self.field_selection(self.focus), delta);
         self.set_field(self.focus, next);
@@ -307,7 +318,7 @@ pub(crate) struct ServerEditForm {
     pub auth_port: String,
     pub data_port: String,
     pub view_port: String,
-    pub flavor: kuluu::launcher_store::AuthFlavorKind,
+    pub flavor: crate::launcher_store::AuthFlavorKind,
 
     pub xiloader_version: String,
     pub version_check_url: String,
@@ -324,7 +335,7 @@ impl Default for ServerEditForm {
             auth_port: String::from("54231"),
             data_port: String::from("54230"),
             view_port: String::from("54001"),
-            flavor: kuluu::launcher_store::AuthFlavorKind::Json,
+            flavor: crate::launcher_store::AuthFlavorKind::Json,
             xiloader_version: String::new(),
             version_check_url: String::new(),
             focus: ServerEditField::default(),
@@ -334,7 +345,7 @@ impl Default for ServerEditForm {
 }
 
 impl ServerEditForm {
-    pub fn from_profile(p: &kuluu::launcher_store::ServerProfile) -> Self {
+    pub fn from_profile(p: &crate::launcher_store::ServerProfile) -> Self {
         Self {
             name: p.name.clone(),
             host: p.host.clone(),
@@ -564,7 +575,7 @@ pub(crate) fn register(
         .insert_resource(login::LoginUiDirty::default())
         .insert_resource(LoginErrorMsg::default())
         .insert_resource(LoginErrorReturn::default())
-        .insert_resource(RuntimeHandle(runtime))
+        .insert_resource(RuntimeHandle(runtime.clone()))
         .insert_resource(ServerInfo {
             server: server.to_string(),
             profile_name: None,
@@ -589,6 +600,24 @@ pub(crate) fn register(
         .insert_resource(dat_setup::DatSetupUiDirty::default())
         .insert_resource(ChangePasswordForm::default())
         .insert_resource(DefaultCharName(defaults.char_name));
+
+    // FFXI_KEY_DRIVE: synthetic-key injection listener (see view_native::key_drive).
+    // The queue is always present so systems can depend on it; only listens when the
+    // env var names an address. Lets a remote driver operate launcher UI screens
+    // with no OS keystrokes and no window focus.
+    let key_msgs: Arc<Mutex<Vec<super::key_drive::KeyMsg>>> = Arc::new(Mutex::new(Vec::new()));
+    app.insert_resource(super::key_drive::KeyDriveQueue(key_msgs.clone()))
+        .add_systems(PreUpdate, super::key_drive::key_drive_system);
+    if let Ok(spec) = std::env::var("FFXI_KEY_DRIVE") {
+        let addr: std::net::SocketAddr = spec.parse().unwrap_or_else(|_| {
+            let port: u16 = spec.trim_start_matches(':').parse().unwrap_or(9538);
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))
+        });
+        let queue = key_msgs.clone();
+        runtime.spawn(async move {
+            super::key_drive::serve_key_drive(addr, queue).await;
+        });
+    }
 
     app.add_systems(OnEnter(AppPhase::Launcher), spawn_launcher_camera)
         .add_systems(OnExit(AppPhase::Launcher), despawn_launcher_camera);
@@ -678,6 +707,7 @@ pub(crate) fn register(
     );
 
     app.init_resource::<graphics::GraphicsAdvancedOpen>()
+        .init_resource::<graphics::GraphicsDlssOpen>()
         .add_systems(OnEnter(LauncherState::Graphics), graphics::spawn_ui)
         .add_systems(OnExit(LauncherState::Graphics), graphics::despawn_ui)
         .add_systems(
@@ -686,6 +716,7 @@ pub(crate) fn register(
                 graphics::keyboard_input_system,
                 graphics::redraw_graphics_system,
                 graphics::redraw_advanced_visibility,
+                graphics::redraw_dlss_visibility,
                 graphics::update_scrollbar_visibility,
             )
                 .run_if(in_state(LauncherState::Graphics)),
@@ -738,6 +769,17 @@ pub(crate) fn register(
             )
                 .run_if(in_state(LauncherState::Login)),
         );
+
+    // Initial keyboard focus + arrow-key navigation for the login form (see
+    // login::focus_default_target_system / login::arrow_nav_system): the blue
+    // outline starts on "Log in" so a bare Enter activates it; arrows move
+    // between tabbable widgets in visual order, wrapping at the edges.
+    app.add_systems(
+        Update,
+        (login::focus_default_target_system, login::arrow_nav_system)
+            .chain()
+            .run_if(in_state(LauncherState::Login)),
+    );
 
     app.add_systems(
         OnEnter(LauncherState::AuthInFlight),
@@ -1038,7 +1080,7 @@ fn decide_initial_screen(
     if overrides.is_some() {
         return;
     }
-    let store = kuluu::launcher_store::load();
+    let store = crate::launcher_store::load();
     if let Some(prefill) = store.login_prefill() {
         form.user = prefill.account.username.clone();
         form.remember_password = prefill.account.remember_password;

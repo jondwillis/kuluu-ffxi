@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": ".agents/hooks/beads-prime-start.sh",
+            "statusMessage": "Loading project Beads context",
+            "type": "command"
+          }
+        ],
+        "matcher": "startup|resume|clear"
+      }
+    ]
+  }
+}

@@ -6,8 +6,8 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui_widgets::Activate;
 
-use kuluu::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
-use kuluu::secret_store::SecretStore;
+use crate::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
+use crate::secret_store::SecretStore;
 
 use super::common::{
     chip_group, hint, panel_node, row, screen_root, spawn_settings_close_titlebar,

@@ -1,5 +1,8 @@
 pub mod animation;
 
+mod death_menu;
+pub use death_menu::*;
+
 mod widescan;
 pub use widescan::*;
 

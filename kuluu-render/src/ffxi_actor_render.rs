@@ -31,6 +31,7 @@ use ffxi_dat::{walk_tree, ChunkKind, ChunkNode, DatRoot};
 
 use crate::combat_stance;
 use crate::dat_vos2::skeleton_file_id_for_race;
+use crate::scene::BakedActor;
 use crate::skinned_ffxi_material::{
     FfxiInstance, FfxiInstanceSlot, FfxiJointMatrices, FfxiLightingUniform, FfxiSkinRegistry,
     FfxiSkinSlot, FfxiSkinnedMaterial, FfxiSkinnedMaterialCache, ATTR_COLOR, ATTR_JOINT0,
@@ -84,6 +85,20 @@ pub const FRAME_RATE: f32 =
 pub const LOCOMOTION_XFADE_IN: f32 = 9.0;
 
 pub const LOCOMOTION_XFADE_OUT: f32 = 7.5;
+
+// Gated burrow diagnostics (`KULUU_BURROW_LOG=1`): FSM transitions plus clip selection for
+// entities in a burrow phase, added to track down the dig-down pose releasing back to idle
+// before `status -> INVISIBLE`. Off by default; read once.
+fn burrow_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(std::env::var("KULUU_BURROW_LOG").as_deref(), Ok(v) if !v.is_empty() && v != "0")
+    })
+}
+
+// Tick counter for the gated hold probe below; advanced once per snapshot tick in
+// `tick_live_ffxi_actors` (serial section), read from the parallel pose pass.
+static BURROW_LOG_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub const WALK_RUN_BOUNDARY: f32 = 3.0;
 
@@ -188,6 +203,12 @@ pub struct PreparedParts {
     d3m_built: Vec<BuiltGroup>,
 
     bind_joints: FfxiJointMatrices,
+
+    /// Bind-pose bounds of the assembled actor in bevy space (feet at y≈0),
+    /// computed with the same facing/scale as `bind_joints` — i.e. the mesh as
+    /// drawn. Feeds BakedActor on spawn so nameplate/camera/hitbox anchors are
+    /// per-model instead of the 2.3 fallback (kuluu-81r8).
+    pub bounds: Option<(Vec3, Vec3)>,
 }
 
 pub struct PreparedActor {
@@ -259,6 +280,7 @@ fn prepare_actor_parts(
         skel_built,
         d3m_built,
         bind_joints,
+        bounds: loaded.bind_pose_bounds(facing_dir, scale),
     }
 }
 
@@ -1100,6 +1122,12 @@ pub struct FfxiRenderActor {
     pose_work: PoseScratch,
 
     point_light_selection: Option<ActorPointLightSelection>,
+
+    /// Set while a burrower's dig-down clip has played to its buried end frame but the server
+    /// hasn't hidden it yet; `tick_live_ffxi_actors` hides the model root on this flag so the
+    /// completed one-shot can't release back to idle and flash fully-up for the ~3s before
+    /// `status -> INVISIBLE` arrives.
+    pub burrow_holding: bool,
 }
 
 impl FfxiRenderActor {
@@ -1556,6 +1584,7 @@ fn make_render_actor(
         world_pose: Vec::new(),
         pose_work: PoseScratch::default(),
         point_light_selection: None,
+        burrow_holding: false,
     }
 }
 
@@ -1974,6 +2003,13 @@ fn advance_actor_pose(
             })
         });
 
+    // Burrowing-mob dig-down / pop-up clip. Overrides idle/movement/rest the way
+    // fishing does; a worm is never moving or attacking while it burrows, so this
+    // only ever wins for entities actually in a burrow phase. Resolves to `None`
+    // (no override) when the model has no matching sp0?/sp1? clip — i.e. every
+    // non-burrowing actor and any burrower whose DAT lacks the clips.
+    let burrow_clip_id = actor_state::burrow_clip(inputs.burrow);
+
     let mut one_shot_rest = false;
     let (selected_id, is_idle) = if let Some(id) = action_id {
         (id, false)
@@ -1981,6 +2017,9 @@ fn advance_actor_pose(
         (id, false)
     } else if let Some(fc) = fishing {
         (fc.id, fc.looping)
+    } else if let Some(id) = burrow_clip_id {
+        // One-shot: dig-down holds buried until hidden; pop-up holds the emerged pose.
+        (id, false)
     } else {
         let rest_id = advance_rest_phase(rest_phase, inputs.rest, animations, elapsed_frames);
         match rest_id {
@@ -2014,6 +2053,34 @@ fn advance_actor_pose(
     } else {
         select_pose_clips_layered(animations, overlay.iter(), selected_id)
     };
+
+    // Gated burrow diagnostics: log every pose-selection change that touches a burrow clip or
+    // happens while a burrow phase is active. Catches a silent idle fallback (sp0? missing from
+    // the DAT) or a higher-priority override releasing the one-shot before INVISIBLE arrives.
+    if burrow_log_enabled() && !matches.is_empty() {
+        let changed = *current_clip != Some((selected_id, use_battle));
+        if changed {
+            let sp0 = DatId::from_str("sp0?");
+            let sp1 = DatId::from_str("sp1?");
+            let touches_burrow = selected_id.parameterized_match(&sp0)
+                || selected_id.parameterized_match(&sp1)
+                || current_clip.is_some_and(|(id, _)| {
+                    id.parameterized_match(&sp0) || id.parameterized_match(&sp1)
+                })
+                || !matches!(inputs.burrow, actor_state::BurrowPhase::None);
+            if touches_burrow {
+                tracing::info!(
+                    target: "burrow",
+                    id = actor.world_id,
+                    ?inputs.burrow,
+                    selected = %selected_id.as_str(),
+                    use_battle,
+                    matches_count = matches.len(),
+                    "pose-select"
+                );
+            }
+        }
+    }
 
     if !matches.is_empty() && *current_clip != Some((selected_id, use_battle)) {
         *current_clip = Some((selected_id, use_battle));
@@ -2049,11 +2116,14 @@ fn advance_actor_pose(
             // explicit single loop they would default to looping forever — they must play
             // once and hold the final frame until the server advances the state.
             let one_shot_fishing = matches!(fishing, Some(fc) if !fc.looping);
+            // Burrow clips are always one-shots (dig-down holds buried; pop-up holds
+            // the emerged pose until the server clears the phase).
             let loop_params = LoopParams {
                 loop_duration: None,
-                num_loops: action
-                    .and_then(|a| a.num_loops)
-                    .or((one_shot_fishing || one_shot_rest).then_some(1)),
+                num_loops: action.and_then(|a| a.num_loops).or((one_shot_fishing
+                    || one_shot_rest
+                    || burrow_clip_id.is_some())
+                .then_some(1)),
                 low_priority: false,
             };
             for &clip in &matches {
@@ -2077,6 +2147,40 @@ fn advance_actor_pose(
         .filter_map(|a| a.current_animation.as_ref().map(|c| c.current_frame))
         .next_back()
         .unwrap_or(0.0);
+
+    // Dig-down hold: once the one-shot sp0? has played to its buried end frame, keep this flag
+    // up so tick_live_ffxi_actors hides the model root until the server's INVISIBLE (or a new
+    // phase) takes over — otherwise the completed clip releases back to idle and the worm
+    // flashes fully-up for the ~3s before it is hidden.
+    let burrow_holding = matches!(inputs.burrow, actor_state::BurrowPhase::DigDown)
+        && burrow_clip_id.is_some_and(|id| {
+            coordinator.animations.iter().flatten().any(|a| {
+                a.current_animation
+                    .as_ref()
+                    .is_some_and(|c| c.animation.id.parameterized_match(&id) && c.is_done_looping())
+            })
+        });
+    actor.burrow_holding = burrow_holding;
+
+    // Gated hold probe: while a burrow phase is active, sample the pinned frame every 30 ticks
+    // so a released one-shot (suspect E) shows up as last_frame drifting back toward 0.
+    if burrow_log_enabled()
+        && !matches!(inputs.burrow, actor_state::BurrowPhase::None)
+        && BURROW_LOG_TICK
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(30)
+    {
+        tracing::info!(
+            target: "burrow",
+            id = actor.world_id,
+            ?inputs.burrow,
+            selected = %selected_id.as_str(),
+            last_frame,
+            holding = burrow_holding,
+            transitioning = coordinator.is_transitioning(),
+            "hold-probe"
+        );
+    }
 
     pose_world_mounted_into(
         world_pose,
@@ -2470,7 +2574,10 @@ pub fn poll_load_actor_tasks(
                         Mesh3d(entity_mesh.morph_orb.clone()),
                         MeshMaterial3d(handle.clone()),
                         Transform::from_xyz(0.0, MORPH_COLUMN_PIVOT_Y, 0.0),
-                        Visibility::Visible,
+                        // Inherited (not Visible): an INVISIBLE entity's root is
+                        // Hidden and must not leak the morph column through it —
+                        // Visible would override the parent hide.
+                        Visibility::Inherited,
                         bevy::light::NotShadowCaster,
                         ChildOf(wire_entity),
                     ))
@@ -2494,6 +2601,31 @@ pub fn poll_load_actor_tasks(
                 orb_emissive: orb.map(|(_, _, e)| e).unwrap_or(LinearRgba::BLACK),
             },
         ));
+
+        // The live path is the only model source that never reached a BakedActor
+        // write site, so every plate/camera/hitbox anchored at
+        // FALLBACK_ACTOR_HEIGHT (2.3) — one height for a Tarutaru and a Galka
+        // alike (kuluu-81r8). The bind-pose bounds are the mesh as drawn:
+        // actor_root sits at zero translation on the wire entity, so this local
+        // Y range is exactly what nameplate_anchor_y / hitbox_dims /
+        // third_person_anchor_y need. Replace semantics: re-equipping must move
+        // the anchor to the new outfit's extent (same rule as the VOS2 paths).
+        //
+        // NPCs are excluded: mob bind poses do not describe the model as drawn —
+        // the idle/hover routine lifts the body clear of its rest position, so a
+        // span-based anchor lands inside or below the silhouette (Huge Hornet,
+        // dat 1556: bind span 0.68 vs drawn range [1.4, 2.4]; pinned in
+        // pose_resolution_tests). Retail anchors on the AboveHead locator that
+        // moves with the animation; until we track it per frame, mobs keep the
+        // flat fallback.
+        if !matches!(key.as_ref(), Some(ActorPrepKey::Npc { .. })) {
+            if let Some((lo, hi)) = prepared.parts.bounds {
+                commands.entity(wire_entity).insert(BakedActor {
+                    min_mesh_y: lo.y,
+                    actor_height: (hi.y - lo.y).max(0.1),
+                });
+            }
+        }
     }
 }
 
@@ -2694,6 +2826,10 @@ pub struct SnapshotActorState {
     /// Set on a mount actor's entry when it is a ridden chocobo, whose rider is
     /// seated by their animation rather than pinned to a saddle joint.
     mount_is_chocobo: bool,
+    /// Burrowing-mob phase (dig-down / underground / pop-up), advanced from the
+    /// entity's status/animationsub transitions. `None` for non-burrowers; drives
+    /// the `sp0?`/`sp1?` clip override in [`advance_actor_pose`].
+    burrow: ffxi_actor::actor_state::BurrowPhase,
 }
 
 /// Per-entity lookups derived from `SceneState.snapshot.entities`, rebuilt only
@@ -2705,6 +2841,16 @@ pub struct LiveSnapshotIndex {
     id_by_targid: HashMap<u16, u32>,
 }
 
+/// Per-frame scratch maps rebuilt every tick by [`tick_live_ffxi_actors`]. Grouped into one
+/// `Local` so the system stays within Bevy's 16-parameter fn-item arity limit. `pub` like
+/// [`LiveSnapshotIndex`]: a Local parameter type must be visible to modules that schedule this
+/// system with `.before()`/`.after()`.
+#[derive(Default)]
+pub struct FrameScratch {
+    actor_world: HashMap<u32, Vec3>,
+    mount_attach: HashMap<u32, MountAttach>,
+}
+
 pub fn tick_live_ffxi_actors(
     time: Res<Time>,
     state: Res<crate::snapshot::SceneState>,
@@ -2714,23 +2860,75 @@ pub fn tick_live_ffxi_actors(
     self_move: Res<combat_stance::SelfMoveIntent>,
     mut registry: ResMut<FfxiSkinRegistry>,
     target: Res<crate::scene::Target>,
-    mut q_actors: Query<(&mut FfxiRenderActor, &GlobalTransform)>,
+    tracked: Res<crate::scene::TrackedEntities>,
+    // Model-root Visibility is written here only for entities in a burrow phase; every other
+    // entity's root stays owned by scene::apply_invis_flag_system (invis-flag PCs).
+    mut q_actors: Query<(&mut FfxiRenderActor, &GlobalTransform, &mut Visibility)>,
+    mut commands: Commands,
 
     mut prev_zone: Local<Option<Option<u16>>>,
     mut index: Local<LiveSnapshotIndex>,
-    mut actor_world_scratch: Local<HashMap<u32, Vec3>>,
-    mut mount_attach_scratch: Local<HashMap<u32, MountAttach>>,
+    // Per-frame scratch maps (see FrameScratch); one Local instead of two keeps the system
+    // within Bevy's 16-parameter fn-item arity limit.
+    mut frame_scratch: Local<FrameScratch>,
+    // Last-observed burrow phase per entity. Persists across frames (a `Local`), so the FSM
+    // can advance from the previous snapshot's state; rebuilt entries read their prior phase
+    // here rather than resetting to idle on every change.
+    mut burrow_mem: Local<HashMap<u32, ffxi_actor::actor_state::BurrowPhase>>,
 ) {
     use ffxi_actor::actor_state::RestKind;
 
     let elapsed_frames = time.delta_secs() * FRAME_RATE;
     let self_id = state.snapshot.self_char_id;
 
+    // Burrow effect routines queued by this frame's FSM transitions, mirroring retail
+    // (FFXiMain.dll F19-F22): dig = sub set on a live actor -> the DAT's `ini1` routine
+    // (Motion sp1? + dirt generators + sound); pop-up = visible status with no actor ->
+    // fresh model load running `init` (Motion sp0? + dirt generators + sound). We keep one
+    // hidden actor instead of destroying/rebuilding it, so both fire on the same entity.
+    // Motion stages are suppressed when flattened — the sp1?/sp0? clips stay owned by the
+    // pose pass, so only VFX/sound come from the routine. A sub-clear arriving mid-routine
+    // does nothing in retail (the routine finishes), so there is no early-cancel path here.
+    let mut burrow_routines: Vec<(u32, [u8; 4])> = Vec::new();
+
     if state.is_changed() {
+        use ffxi_actor::actor_state::{next_burrow_phase, BurrowPhase};
+
         index.by_id.clear();
         index.id_by_targid.clear();
+        let mut live_ids = std::collections::HashSet::new();
         for e in &state.snapshot.entities {
+            live_ids.insert(e.id);
             let mounted = state.snapshot.mount_of(e).is_some();
+            // Advance the burrow FSM from last frame's phase to this snapshot's
+            // status/animationsub. A no-op (stays `None`) for every non-burrowing
+            // entity, so it is safe to run for all of them.
+            let prev_burrow = burrow_mem.get(&e.id).copied().unwrap_or(BurrowPhase::None);
+            let burrow = next_burrow_phase(prev_burrow, e.status, e.animationsub);
+            match (prev_burrow, burrow) {
+                (BurrowPhase::None, BurrowPhase::DigDown) => {
+                    burrow_routines.push((e.id, *b"ini1"));
+                }
+                (BurrowPhase::Underground, BurrowPhase::PopUp) => {
+                    burrow_routines.push((e.id, *b"init"));
+                }
+                _ => {}
+            }
+            if burrow_log_enabled()
+                && burrow != prev_burrow
+                && (prev_burrow != BurrowPhase::None || burrow != BurrowPhase::None)
+            {
+                tracing::info!(
+                    target: "burrow",
+                    id = e.id,
+                    ?prev_burrow,
+                    new = ?burrow,
+                    status = e.status,
+                    sub = e.animationsub,
+                    "fsm"
+                );
+            }
+            burrow_mem.insert(e.id, burrow);
             index.by_id.insert(
                 e.id,
                 SnapshotActorState {
@@ -2744,6 +2942,7 @@ pub fn tick_live_ffxi_actors(
                     motion_from: None,
                     rider_race: 0,
                     mount_is_chocobo: false,
+                    burrow,
                 },
             );
             index.id_by_targid.insert(e.act_index, e.id);
@@ -2768,12 +2967,51 @@ pub fn tick_live_ffxi_actors(
                             .snapshot
                             .mount_of(e)
                             .is_some_and(|m| m.is_chocobo()),
+                        burrow: BurrowPhase::None,
                     },
                 );
             }
         }
+        // Drop phases for entities that despawned so the cache stays bounded.
+        burrow_mem.retain(|id, _| live_ids.contains(id));
+    }
+
+    // Fire the queued routines on their wire entities: it carries a world-space Transform (the
+    // particle/sound origin) and is what the stage-dispatch systems read `(Transform,
+    // Option<ActionAssets>)` off. The actor's own ActionAssets hold this DAT's SEPs and dirt
+    // generators, so they ride along for resolution.
+    for (world_id, routine) in burrow_routines {
+        let Some(&wire_e) = tracked.by_id.get(&world_id) else {
+            continue;
+        };
+        // Model not loaded yet: the clip still plays from the pose pass; only the dirt and
+        // sound are lost. Acceptable degradation — the load lands within a few frames.
+        let Some((actor, _, _)) = q_actors.iter().find(|(a, _, _)| a.world_id == world_id) else {
+            continue;
+        };
+        let lookup = crate::scheduler_runtime::RoutineLookup::new().with_actor(actor.routines());
+        let Some(active) =
+            crate::scheduler_runtime::ActiveScheduler::effects_only(&lookup, &routine)
+        else {
+            continue;
+        };
+        commands
+            .entity(wire_e)
+            .try_insert(active)
+            .try_insert(actor.action_assets().clone())
+            .try_insert(crate::scheduler_runtime::ActionTarget(None));
+    }
+
+    if burrow_log_enabled() {
+        BURROW_LOG_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let index: &LiveSnapshotIndex = &index;
+    // Split borrows of the scratch fields: each `.field` access through the Local's DerefMut
+    // would take its own whole-value mutable borrow, so materialize one plain `&mut`
+    // first and borrow disjoint fields from it.
+    let frame_scratch = &mut *frame_scratch;
+    let actor_world_scratch = &mut frame_scratch.actor_world;
+    let mount_attach_scratch = &mut frame_scratch.mount_attach;
 
     // Head-look must aim at where the target is *rendered* (grounded), not its
     // raw wire Y — the server sends pathing NPCs a flat reference Y, so wire and
@@ -2782,9 +3020,9 @@ pub fn tick_live_ffxi_actors(
     actor_world_scratch.extend(
         q_actors
             .iter()
-            .map(|(a, gt)| (a.world_id, gt.translation())),
+            .map(|(a, gt, _)| (a.world_id, gt.translation())),
     );
-    let actor_world_by_id: &HashMap<u32, Vec3> = &actor_world_scratch;
+    let actor_world_by_id: &HashMap<u32, Vec3> = actor_world_scratch;
 
     // Where each rider's body has to be pinned, for the mounts that pin one.
     // Read off the mount actor's posed skeleton, which shares the rider's root
@@ -2793,7 +3031,7 @@ pub fn tick_live_ffxi_actors(
     // the two actors are posed in the same pass and a frame of lag on a seat is
     // not visible.
     mount_attach_scratch.clear();
-    for (a, _) in &q_actors {
+    for (a, _, _) in &q_actors {
         let Some(rider_id) = crate::scene::mount_actor_rider(a.world_id) else {
             continue;
         };
@@ -2818,7 +3056,7 @@ pub fn tick_live_ffxi_actors(
             );
         }
     }
-    let mount_attach_by_rider: &HashMap<u32, MountAttach> = &mount_attach_scratch;
+    let mount_attach_by_rider: &HashMap<u32, MountAttach> = mount_attach_scratch;
 
     let self_engaged_predicted = matches!(
         state.snapshot.current_goal,
@@ -2863,7 +3101,7 @@ pub fn tick_live_ffxi_actors(
     let motion = &*motion;
     q_actors
         .par_iter_mut()
-        .for_each(|(mut actor, actor_global)| {
+        .for_each(|(mut actor, actor_global, mut vis)| {
             let world_id = actor.world_id;
             if world_id == 0 {
                 return;
@@ -2924,6 +3162,15 @@ pub fn tick_live_ffxi_actors(
                 snap.and_then(|s| s.fishing_phase)
             };
 
+            // Burrowing-mob phase (dig-down / pop-up). Self never burrows; observed
+            // entities carry the FSM state advanced in the snapshot index above.
+            let burrow = if is_self {
+                ffxi_actor::actor_state::BurrowPhase::None
+            } else {
+                snap.map(|s| s.burrow)
+                    .unwrap_or(ffxi_actor::actor_state::BurrowPhase::None)
+            };
+
             let engage_state = {
                 let actor: &mut FfxiRenderActor = &mut actor;
                 advance_engage(
@@ -2950,6 +3197,7 @@ pub fn tick_live_ffxi_actors(
                 dead,
                 rest: rest_kind,
                 fishing_phase,
+                burrow,
                 mount_or_chocobo: snap.is_some_and(|s| s.mount_or_chocobo),
                 ..Default::default()
             };
@@ -2984,9 +3232,23 @@ pub fn tick_live_ffxi_actors(
             let mount_attach = mount_attach_by_rider.get(&world_id).copied();
 
             advance_actor_pose(&mut actor, elapsed_frames, look, mount_attach);
+
+            // Burrow visibility hold (see FfxiRenderActor::burrow_holding): once the dig-down
+            // one-shot has completed but the server hasn't hidden it yet, keep the model root
+            // invisible; Underground is hidden by status. Never write for burrow == None —
+            // those roots belong to scene::apply_invis_flag_system.
+            if !matches!(burrow, ffxi_actor::actor_state::BurrowPhase::None) {
+                let hide = matches!(burrow, ffxi_actor::actor_state::BurrowPhase::Underground)
+                    || actor.burrow_holding;
+                *vis = if hide {
+                    Visibility::Hidden
+                } else {
+                    Visibility::default()
+                };
+            }
         });
 
-    for (actor, _) in &q_actors {
+    for (actor, _, _) in &q_actors {
         registry
             .skin_mut(actor.skin_slot)
             .joints
@@ -2994,7 +3256,7 @@ pub fn tick_live_ffxi_actors(
     }
 
     if let Some(self_id) = self_id {
-        if let Some((actor, _)) = q_actors.iter().find(|(a, _)| a.world_id == self_id) {
+        if let Some((actor, _, _)) = q_actors.iter().find(|(a, _, _)| a.world_id == self_id) {
             rest.observe_exit_clip(matches!(actor.rest_phase, RestPlayback::Stopping { .. }));
         }
     }
@@ -3474,6 +3736,7 @@ mod mesh_dedup_tests {
                 skel_built,
                 d3m_built: Vec::new(),
                 bind_joints: FfxiJointMatrices::default(),
+                bounds: None,
             },
         })
     }
@@ -3546,6 +3809,122 @@ mod pose_resolution_tests {
         }
 
         Some(load_pc(1, false, &[], None, None, None).expect("load Hume M"))
+    }
+
+    /// Pins the live-path anchor source against the real DAT (kuluu-81r8):
+    /// bind-pose bounds must put feet at y≈0 and differ per race — that is what
+    /// BakedActor carries to nameplate_anchor_y / hitbox_dims /
+    /// third_person_anchor_y. Before this test's fix the live path never wrote
+    /// BakedActor at all, so every plate anchored at FALLBACK_ACTOR_HEIGHT (2.3):
+    /// one height for a Tarutaru and a Galka alike. Self-skips without an install.
+    #[test]
+    fn bind_pose_bounds_are_feet_origin_and_race_specific() {
+        if DatRoot::from_env_or_default().is_err() {
+            return;
+        }
+        let mut heights: std::collections::HashMap<u8, f32> = std::collections::HashMap::new();
+        for race in 1..=8u8 {
+            let Ok(actor) = load_pc(race, false, &[], None, None, None) else {
+                continue;
+            };
+            let Some((lo, hi)) = actor.bind_pose_bounds(0.0, 1.0) else {
+                panic!("race {race}: no bind-pose bounds");
+            };
+            assert!(
+                lo.y.abs() < 0.05,
+                "race {race} feet not at the origin: min.y={:.3}",
+                lo.y
+            );
+            let h = hi.y - lo.y;
+            assert!(
+                h.is_finite() && h > 0.5,
+                "race {race}: implausible height {h}"
+            );
+            heights.insert(race, h);
+        }
+        // Hume M (1) vs Elvaan M (3): the bead's own anchor — Elvaan bakes to
+        // ~2.08 (vendor/server CharRace order, charentity.h:221).
+        let hume = *heights.get(&1).expect("Hume M loaded");
+        let elvaan = *heights.get(&3).expect("Elvaan M loaded");
+        assert!(
+            (1.5..2.1).contains(&hume),
+            "Hume M height {hume} drifted out of band"
+        );
+        assert!(
+            (1.9..2.4).contains(&elvaan),
+            "Elvaan M height {elvaan} drifted out of the ~2.08 band"
+        );
+        // The whole point: races must not all anchor at one height.
+        let hs = heights.values().copied();
+        let (lo_h, hi_h) = (
+            hs.clone().fold(f32::INFINITY, f32::min),
+            hs.fold(f32::NEG_INFINITY, f32::max),
+        );
+        assert!(
+            hi_h - lo_h > 0.5,
+            "races collapsed to one height: {heights:?}"
+        );
+    }
+
+    /// Skinned Y extent of one posed actor, the same skinning as
+    /// `bind_pose_bounds`.
+    fn skinned_y_range(loaded: &LoadedActor, pose: &[Mat4]) -> (f32, f32) {
+        let basis = ffxi_to_bevy_basis();
+        let joint_count = loaded.skeleton.joints.len();
+        let occlusion: std::collections::HashSet<u8> =
+            loaded.skel_meshes.iter().map(|m| m.occlude_type).collect();
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for skel_mesh in &loaded.skel_meshes {
+            for buffer in &skel_mesh.meshes {
+                if is_occluded(buffer, &occlusion) {
+                    continue;
+                }
+                for v in &buffer.vertices {
+                    let w = v.joint0_weight;
+                    let j0 = clamp_joint(v.joint_index0, joint_count) as usize;
+                    let j1 = clamp_joint(v.joint_index1, joint_count) as usize;
+                    let m0 = pose.get(j0).copied().unwrap_or(Mat4::IDENTITY);
+                    let m1 = pose.get(j1).copied().unwrap_or(Mat4::IDENTITY);
+                    let p = m0 * Vec4::new(v.p0[0], v.p0[1], v.p0[2], w)
+                        + m1 * Vec4::new(v.p1[0], v.p1[1], v.p1[2], 1.0 - w);
+                    let wp = basis * p.truncate();
+                    lo = lo.min(wp.y);
+                    hi = hi.max(wp.y);
+                }
+            }
+        }
+        (lo, hi)
+    }
+
+    /// Why the live path withholds BakedActor from NPCs (kuluu-81r8): a mob's
+    /// bind pose does not describe the model as drawn. Huge Hornet's rest-pose
+    /// span is 0.68, but its idle routine draws the body at [1.4, 2.4] above
+    /// the wire position — a span-based anchor would sit below the silhouette.
+    /// Retail anchors on the AboveHead locator that moves with the animation;
+    /// until we track it per frame, mobs keep the flat fallback. Self-skips
+    /// without an install.
+    #[test]
+    fn npc_bind_pose_does_not_describe_the_drawn_extent() {
+        if DatRoot::from_env_or_default().is_err() {
+            return;
+        }
+        let loaded = load_npc(1556).expect("load Huge Hornet dat 1556");
+        let Some((bind_lo, bind_hi)) = loaded.bind_pose_bounds(0.0, 1.0) else {
+            panic!("Huge Hornet: no bind-pose bounds");
+        };
+        let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+        // The idle hover bobs between two heights; the lowest drawn point
+        // across sampled frames is what a static anchor must clear.
+        let mut drawn_lo = f32::INFINITY;
+        for frame in [0.0f32, 8.0, 16.0] {
+            advance_actor_pose_standalone(&mut actor, frame, None);
+            let (lo, _) = skinned_y_range(&loaded, actor.world_pose());
+            drawn_lo = drawn_lo.min(lo);
+        }
+        assert!(
+            drawn_lo > bind_hi.y + 0.5,
+            "Huge Hornet idle no longer lifts off its rest pose: drawn lo {drawn_lo:.3} vs bind [{bind_lo:.3}, {bind_hi:.3}]"
+        );
     }
 
     #[test]
@@ -4210,6 +4589,7 @@ mod actor_bounds_tests {
             }],
             d3m_built: Vec::new(),
             bind_joints: FfxiJointMatrices::default(),
+            bounds: None,
         };
         let mesh_handles = add_part_meshes(&parts, &mut meshes);
         let skin_slot = registry.alloc_skin();

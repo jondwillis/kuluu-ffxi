@@ -31,11 +31,15 @@ pub fn preflight_bind(addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
+/// `debug_ctrl` (native GUI builds only) receives the viewer's
+/// [`wire::ViewerCommand::Screenshot`] requests — they drive Bevy render-target
+/// readback and must never reach the session, which treats them as a no-op.
 pub async fn serve(
     addr: SocketAddr,
     state_rx: watch::Receiver<SessionState>,
     event_tx: broadcast::Sender<AgentEvent>,
     cmd_tx: mpsc::Sender<AgentCommand>,
+    debug_ctrl: Option<crate::debug_control::SharedDebugControl>,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
@@ -62,8 +66,11 @@ pub async fn serve(
         let state_rx = state_rx.clone();
         let event_rx = event_tx.subscribe();
         let cmd_tx = cmd_tx.clone();
+        let debug_ctrl = debug_ctrl.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, peer, state_rx, event_rx, cmd_tx).await {
+            if let Err(err) =
+                handle_connection(stream, peer, state_rx, event_rx, cmd_tx, debug_ctrl).await
+            {
                 tracing::debug!(peer = %peer, error = %err, "relay connection ended");
             }
         });
@@ -77,6 +84,7 @@ async fn handle_connection(
     mut state_rx: watch::Receiver<SessionState>,
     mut event_rx: broadcast::Receiver<AgentEvent>,
     cmd_tx: Arc<mpsc::Sender<AgentCommand>>,
+    debug_ctrl: Option<crate::debug_control::SharedDebugControl>,
 ) -> Result<()> {
     let mut want_json = false;
     let want_json_ref = &mut want_json;
@@ -153,11 +161,24 @@ async fn handle_connection(
             msg = stream.next() => match msg {
                 Some(Ok(Message::Binary(data))) => {
                     match postcard::from_bytes::<ClientFrame>(&data) {
-                        Ok(ClientFrame::Command(cmd)) => {
-                            if let Some(translated) = viewer_command_to_agent(cmd) {
-                                if cmd_tx.send(translated).await.is_err() {
+                        Ok(ClientFrame::Command(cmd)) => match &cmd {
+                            // GUI-side only: bump the shared handle's seq; the Bevy
+                            // system fires the capture. Never forwarded to the session.
+                            wire::ViewerCommand::Screenshot { path } => {
+                                if let Some(ctrl) = debug_ctrl.as_ref() {
+                                    if let Ok(mut c) = ctrl.lock() {
+                                        c.request_screenshot(
+                                            path.as_ref().map(std::path::PathBuf::from),
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                if let Some(translated) = viewer_command_to_agent(cmd) {
+                                    if cmd_tx.send(translated).await.is_err() {
 
-                                    break;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -313,6 +334,10 @@ fn viewer_command_to_agent(cmd: wire::ViewerCommand) -> Option<AgentCommand> {
                 op: delivery_op_to_agent(other),
             },
         },
+
+        // GUI-side only: handle_connection routes it into DebugControl before
+        // reaching here. Never a session command.
+        wire::ViewerCommand::Screenshot { .. } => return None,
     })
 }
 

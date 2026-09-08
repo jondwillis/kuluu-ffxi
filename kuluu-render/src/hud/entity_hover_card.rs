@@ -24,6 +24,7 @@ pub fn spawn_entity_hover_card(mut commands: Commands) {
         .spawn((
             crate::components::InGameEntity,
             EntityHoverCard,
+            bevy::picking::Pickable::IGNORE,
             Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(-1000.0),
@@ -43,12 +44,14 @@ pub fn spawn_entity_hover_card(mut commands: Commands) {
         .with_children(|p| {
             p.spawn((
                 EntityHoverCardName,
+                bevy::picking::Pickable::IGNORE,
                 Text::new(""),
                 style::text_font(13.0),
                 TextColor(theme::TEXT),
             ));
             p.spawn((
                 EntityHoverCardHp,
+                bevy::picking::Pickable::IGNORE,
                 Text::new(""),
                 style::text_font(12.0),
                 TextColor(theme::MUTED),
@@ -61,6 +64,7 @@ pub fn update_entity_hover_card_system(
     target: Res<Target>,
     state: Res<SceneState>,
     pointer: Res<MousePointer>,
+    ui_scale: Res<UiScale>,
     mut card_q: Query<&mut Node, With<EntityHoverCard>>,
     mut name_q: Query<
         &mut Text,
@@ -104,8 +108,9 @@ pub fn update_entity_hover_card_system(
         card.display = Display::Flex;
     }
     if let Some(pos) = pointer.cursor_pos {
-        let want_left = Val::Px(pos.x + CARD_OFFSET_PX.x);
-        let want_top = Val::Px(pos.y + CARD_OFFSET_PX.y);
+        let ui_pos = (pos + CARD_OFFSET_PX) / ui_scale.0;
+        let want_left = Val::Px(ui_pos.x);
+        let want_top = Val::Px(ui_pos.y);
         if card.left != want_left {
             card.left = want_left;
         }
@@ -161,6 +166,101 @@ fn kind_tag(kind: EntityKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_card_cannot_intercept_its_own_world_hover() {
+        use bevy::ecs::system::RunSystemOnce;
+        use bevy::picking::{
+            backend::{HitData, PointerHits},
+            hover::{generate_hovermap, HoverMap, PreviousHoverMap},
+            pointer::{PointerId, PointerInput},
+        };
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<PointerHits>()
+            .add_message::<PointerInput>()
+            .init_resource::<HoverMap>()
+            .init_resource::<PreviousHoverMap>()
+            .init_resource::<HoveredEntity>()
+            .init_resource::<crate::picking::PickBridgePointer>()
+            .init_resource::<Target>()
+            .init_resource::<UiScale>()
+            .insert_resource(MousePointer {
+                cursor_pos: Some(Vec2::new(600.0, 300.0)),
+                ..default()
+            })
+            .init_resource::<SceneState>()
+            .add_systems(
+                Update,
+                (
+                    generate_hovermap,
+                    crate::picking::update_hovered_entity_system,
+                    update_entity_hover_card_system,
+                )
+                    .chain(),
+            );
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .snapshot
+            .entities
+            .push(
+                serde_json::from_value(serde_json::json!({
+                    "id":42, "act_index":1, "kind":"npc", "name":"Guide",
+                    "pos":{"x":0.0,"y":0.0,"z":0.0}, "heading":0, "hp_pct":100, "bt_target_id":0
+                }))
+                .unwrap(),
+            );
+        app.world_mut().spawn(PointerId::Mouse);
+        let plate = app
+            .world_mut()
+            .spawn(crate::components::Nameplate {
+                entity_id: 42,
+                kind: EntityKind::Npc,
+            })
+            .id();
+        app.world_mut()
+            .run_system_once(spawn_entity_hover_card)
+            .unwrap();
+        let card = app
+            .world_mut()
+            .query_filtered::<Entity, With<EntityHoverCard>>()
+            .single(app.world())
+            .unwrap();
+        let mut surfaces = vec![card];
+        surfaces.extend(app.world().get::<Children>(card).unwrap().iter());
+        for _ in 0..6 {
+            if app.world().get::<Node>(card).unwrap().display != Display::None {
+                for surface in &surfaces {
+                    app.world_mut().write_message(PointerHits::new(
+                        PointerId::Mouse,
+                        vec![(*surface, HitData::new(Entity::PLACEHOLDER, 0.0, None, None))],
+                        0.5,
+                    ));
+                }
+            }
+            app.world_mut().write_message(PointerHits::new(
+                PointerId::Mouse,
+                vec![(plate, HitData::new(Entity::PLACEHOLDER, 5.0, None, None))],
+                0.0,
+            ));
+            app.update();
+            assert_eq!(app.world().resource::<HoveredEntity>().id, Some(42));
+            assert_eq!(
+                app.world().get::<Node>(card).unwrap().display,
+                Display::Flex
+            );
+        }
+        for scale in [0.5, 1.0, 1.5] {
+            app.world_mut().resource_mut::<UiScale>().0 = scale;
+            app.world_mut()
+                .run_system_once(update_entity_hover_card_system)
+                .unwrap();
+            let card = app.world().get::<Node>(card).unwrap();
+            assert_eq!(card.left, Val::Px(618.0 / scale));
+            assert_eq!(card.top, Val::Px(318.0 / scale));
+        }
+    }
 
     #[test]
     fn self_hover_shows_no_card() {

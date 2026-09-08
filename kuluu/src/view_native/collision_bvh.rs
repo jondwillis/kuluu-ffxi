@@ -19,10 +19,12 @@ impl CollisionBvh {
         self.nodes.first().map(|n| (n.aabb_min, n.aabb_max))
     }
 
+    #[allow(dead_code)]
     pub fn tri_count(&self) -> usize {
         self.triangles.len()
     }
 
+    #[allow(dead_code)]
     pub fn ray_cast_brute_force(&self, origin: Vec3, dir: Vec3, max_t: f32) -> Option<f32> {
         let mut hit_t = max_t;
         let mut hit_any = false;

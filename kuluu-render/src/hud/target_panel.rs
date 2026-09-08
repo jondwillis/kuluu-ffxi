@@ -364,6 +364,7 @@ mod tests {
             heading: 0,
             hp_pct: hp,
             bt_target_id: 0,
+            name_vis: None,
             face_target: 0,
             claim_id: 0,
             speed: 0,
@@ -374,6 +375,7 @@ mod tests {
             mount: None,
             status: 0,
             char_flags: Default::default(),
+            monstrosity: false,
         }
     }
 

@@ -7,7 +7,7 @@ use bevy::prelude::*;
 use kuluu_render::sub_area_activation::SubAreaChanged;
 
 use super::input::CommandTx;
-use crate::state::AgentCommand;
+use kuluu_session::state::AgentCommand;
 
 /// The 280 sub-area ids the retail zone DATs declare run 293..640, so the `u32`
 /// the latch carries always fits the wire's `u16` `SubMapNumber`.

@@ -10,7 +10,9 @@ use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title,
 use crate::view_native::widgets::text_field::text_field;
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
-use super::{CharCreateError, CharCreateField, CharCreateForm, LauncherState, ServerInfo};
+use super::{
+    CharCreateError, CharCreateField, CharCreateForm, LauncherState, OpenedLobby, ServerInfo,
+};
 
 // The create screen reserves the right MODEL_AREA_PCT of the width for the 3D
 // character preview (char_create_preview.rs frames the model into it), centring
@@ -70,6 +72,10 @@ pub(super) const FACES: &[(u8, &str)] = &[
 
 pub(super) const HAIRS: &[(u8, &str)] = &[(0, "A"), (1, "B")];
 
+/// The "Skip Intro CS" toggle row. 1 = skip the opening new-character
+/// cutscene (default), 0 = play it.
+pub(super) const SKIP_OPTIONS: &[(u8, &str)] = &[(1, "On"), (0, "Off")];
+
 #[derive(Component)]
 pub(super) struct CharCreateRoot;
 
@@ -82,7 +88,21 @@ pub(super) struct EnumChoice {
     value: u8,
 }
 
-pub(super) fn spawn_ui(mut commands: Commands, form: Res<CharCreateForm>, server: Res<ServerInfo>) {
+pub(super) fn spawn_ui(
+    mut commands: Commands,
+    form: Res<CharCreateForm>,
+    server: Res<ServerInfo>,
+    lobby: Res<OpenedLobby>,
+) {
+    // The row only exists when this lobby connection's char-list reply
+    // advertised CAP_SKIP_INTRO_CS - vanilla servers leave the cap slot zero.
+    let skip_cs_supported = lobby
+        .0
+        .lock()
+        .unwrap()
+        .handle
+        .as_ref()
+        .is_some_and(|h| h.supports_skip_intro_cs());
     let snap = (
         form.name.clone(),
         form.race,
@@ -90,6 +110,7 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<CharCreateForm>, server
         form.nation,
         form.face,
         form.size,
+        u8::from(form.skip_intro_cs),
     );
     let initial_msg = form.validation_msg().unwrap_or_default();
 
@@ -163,6 +184,15 @@ pub(super) fn spawn_ui(mut commands: Commands, form: Res<CharCreateForm>, server
                 spawn_enum_row(panel, "Build", CharCreateField::Size, SIZES, snap.5);
                 spawn_enum_row(panel, "Face", CharCreateField::Face, FACES, snap.4 / 2);
                 spawn_enum_row(panel, "Hair", CharCreateField::Hair, HAIRS, snap.4 % 2);
+                if skip_cs_supported {
+                    spawn_enum_row(
+                        panel,
+                        "Skip Intro CS",
+                        CharCreateField::SkipIntroCs,
+                        SKIP_OPTIONS,
+                        snap.6,
+                    );
+                }
 
                 panel.spawn((
                     StatusText,

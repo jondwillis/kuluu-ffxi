@@ -102,6 +102,7 @@ impl WeatherParticles {
 fn sync_weather_particles(
     scene_state: Res<SceneState>,
     zone_weather: Res<crate::weather::ZoneWeather>,
+    panels: Res<crate::hud::HudPanels>,
     mut store: ResMut<WeatherParticles>,
     global: Option<Res<crate::scheduler_runtime::GlobalEffectDir>>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -110,6 +111,17 @@ fn sync_weather_particles(
     mut sim: ResMut<ParticleSimulator>,
     mut commands: Commands,
 ) {
+    // Debug gate (Debug menu Weather row): while off, despawn any live
+    // precipitation generators and drop the load key so re-enabling rebuilds
+    // the set for whatever weather is active then.
+    if panels.weather_off {
+        for e in store.entities.drain(..) {
+            commands.entity(e).try_despawn();
+        }
+        store.clear();
+        return;
+    }
+
     let file_id = effective_zone_file_id(&scene_state.snapshot);
     let weather = zone_weather
         .active_weather_type()
@@ -204,7 +216,7 @@ fn track_weather_particles(
     let Some(cam) = cam.iter().next() else {
         return;
     };
-    sim.set_camera_relative_origins(cam.translation(), cam.rotation());
+    sim.set_camera_relative_origins(cam.translation());
 }
 
 pub struct WeatherParticlesPlugin;

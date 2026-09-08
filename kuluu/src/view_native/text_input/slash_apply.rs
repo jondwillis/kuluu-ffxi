@@ -40,6 +40,8 @@ pub(super) fn apply_slash_outcome(
     slash_writers: &mut SlashWriters,
     draw_distance: &mut kuluu_render::dat_mzb::DrawDistance,
 ) {
+    #[cfg(not(unix))]
+    let _ = session_event_tx;
     match outcome {
         SlashOutcome::Command(cmd) => {
             if let Some(toast) = reqlogout_ack_text(&cmd) {
@@ -124,7 +126,7 @@ pub(super) fn apply_slash_outcome(
 
                     RestKind::Heal => {
                         let _ = cmd_tx.try_send(AgentCommand::Heal {
-                            mode: crate::state::HealMode::Off,
+                            mode: kuluu_session::state::HealMode::Off,
                         });
                         RestKind::Sit
                     }
@@ -330,6 +332,18 @@ pub(super) fn apply_slash_outcome(
                 format!("/netstat: {}", if next { "on" } else { "off" }),
             );
         }
+        SlashOutcome::SetNoClip(setting) => {
+            let next = setting.unwrap_or(!slash_writers.hud_panels.noclip);
+            slash_writers.hud_panels.noclip = next;
+            push_system_chat_line(
+                scene_state,
+                format!(
+                    "/noclip: {} (wall collision {})",
+                    if next { "on" } else { "off" },
+                    if next { "bypassed" } else { "active" }
+                ),
+            );
+        }
         SlashOutcome::SetVanaClock(setting) => {
             let next = setting.unwrap_or(!slash_writers.vana_clock_visible.0);
             slash_writers.vana_clock_visible.0 = next;
@@ -518,6 +532,31 @@ pub(super) fn apply_slash_outcome(
                 }
             };
             push_system_chat_line(scene_state, chat);
+        }
+        SlashOutcome::ActorDiag { use_target } => {
+            let id = if use_target {
+                target.id
+            } else {
+                scene_state.snapshot.self_char_id
+            };
+            let lines = match id {
+                None if use_target => vec!["/actordiag: no target selected".to_string()],
+                None => vec!["/actordiag: self id unknown (not in game yet?)".to_string()],
+                Some(id) => match scene_state.snapshot.entities.iter().find(|e| e.id == id) {
+                    None => vec![format!("/actordiag: entity {id} not in the snapshot")],
+                    Some(e) => match &e.look {
+                        None => vec![format!("/actordiag: entity {id} carries no look data")],
+                        Some(look) => kuluu_render::actor_diag::report(
+                            id,
+                            e.name.as_deref().unwrap_or("?"),
+                            look,
+                        ),
+                    },
+                },
+            };
+            for line in lines {
+                push_system_chat_line(scene_state, line);
+            }
         }
         SlashOutcome::Overlay(op) => {
             use crate::view_native::slash_commands::OverlayOp;
@@ -793,6 +832,7 @@ pub(super) fn apply_slash_outcome(
                 kuluu_render::MenuKind::Config => "Config".into(),
                 kuluu_render::MenuKind::Debug => "Debug".into(),
                 kuluu_render::MenuKind::Graphics => "Graphics".into(),
+                kuluu_render::MenuKind::GraphicsDlss => "DLSS Config".into(),
                 kuluu_render::MenuKind::Status => "Status".into(),
 
                 kuluu_render::MenuKind::Communication => "Communication".into(),
@@ -1176,12 +1216,12 @@ fn mirror_heal_stance(cmd: &AgentCommand, rest: &mut kuluu_render::combat_stance
         return;
     };
     let next = match mode {
-        crate::state::HealMode::On => RestKind::Heal,
-        crate::state::HealMode::Off => match rest.kind {
+        kuluu_session::state::HealMode::On => RestKind::Heal,
+        kuluu_session::state::HealMode::Off => match rest.kind {
             RestKind::Heal => RestKind::None,
             other => other,
         },
-        crate::state::HealMode::Toggle => match rest.kind {
+        kuluu_session::state::HealMode::Toggle => match rest.kind {
             RestKind::Heal => RestKind::None,
             _ => RestKind::Heal,
         },

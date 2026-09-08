@@ -32,12 +32,27 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::fishing::{FishingMachine, FishingOut};
 use crate::state::{
-    model_radius, ActionKind, AgentCommand, AgentEvent, ChatChannel, ChatLine, EntityKind,
-    ReactorGoalSnapshot, SessionState, Vec3, CONTACT_GAP,
+    ground_correction_matches, model_radius, ActionKind, AgentCommand, AgentEvent, ChatChannel,
+    ChatLine, EntityKind, ReactorGoalSnapshot, SessionState, Vec3, CONTACT_GAP,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReactorProfile {
+    #[default]
+    Player,
+    Agent,
+}
+
+impl ReactorProfile {
+    fn automates_player_input(self) -> bool {
+        matches!(self, Self::Agent)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ReactorConfig {
+    pub profile: ReactorProfile,
+
     pub tick: Duration,
 
     pub low_hp_threshold: u8,
@@ -48,10 +63,24 @@ pub struct ReactorConfig {
 impl Default for ReactorConfig {
     fn default() -> Self {
         Self {
+            profile: ReactorProfile::Player,
             tick: Duration::from_millis(33),
             low_hp_threshold: 25,
 
             max_step_per_tick: 0.165,
+        }
+    }
+}
+
+impl ReactorConfig {
+    pub fn player() -> Self {
+        Self::default()
+    }
+
+    pub fn agent() -> Self {
+        Self {
+            profile: ReactorProfile::Agent,
+            ..Self::default()
         }
     }
 }
@@ -188,10 +217,6 @@ pub struct Reactor {
 
     reactor_override: Option<ReactorOverride>,
 
-    // Whether the engaged target is kept squared up each tick. Mirrors the
-    // viewer's lock-on: the human unlocks to turn away mid-fight. Defaults true
-    // so headless agents (which never emit SetTargetLock) still face to land
-    // auto-attack.
     target_locked: bool,
 
     fishing: FishingMachine,
@@ -210,6 +235,7 @@ pub struct ReactorOverride {
 
 impl Reactor {
     pub fn new(cfg: ReactorConfig) -> Self {
+        let automates_player_input = cfg.profile.automates_player_input();
         Self {
             cfg,
             state: SessionState::default(),
@@ -222,10 +248,8 @@ impl Reactor {
             zoneline_trigger_latched: None,
             needs_zone_seed: false,
             reactor_override: None,
-            target_locked: true,
-            // Auto-play: the reactor reacts to arrows itself so an agent that issues `/fish`
-            // lands the fish without further input. A UI front-end drives via FishingInput.
-            fishing: FishingMachine::new(true),
+            target_locked: automates_player_input,
+            fishing: FishingMachine::new(automates_player_input),
             fishing_phase_pub: None,
             fishing_pending: Vec::new(),
         }
@@ -555,13 +579,22 @@ impl Reactor {
                 };
                 CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
-            AgentCommand::GroundCorrection { z, .. } => {
-                // A height repair is not player movement (kuluu-mo4q): it must
-                // not cancel a Following/Pathing/Banking goal the player asked
-                // for, and it must reach the wire even mid-override — the
-                // override replays its own target every tick, so its height is
-                // rebased too or the correction is undone before it lands.
-                if let Some(ov) = self.reactor_override.as_mut() {
+            AgentCommand::GroundCorrection {
+                zone_id,
+                self_id,
+                x,
+                y,
+                z,
+                ..
+            } => {
+                if self.state.zone_id != Some(zone_id) || self.state.char_id != Some(self_id) {
+                    return CommandRouting::default();
+                }
+                if self.override_active() {
+                    let ov = self.reactor_override.as_mut().unwrap();
+                    if !ground_correction_matches(x, y, ov.target.x, ov.target.y) {
+                        return CommandRouting::default();
+                    }
                     ov.target.z = z;
                 }
                 CommandRouting::forward(cmd)

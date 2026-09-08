@@ -9,7 +9,7 @@ use kuluu_render::input_mode::{InputMode, MenuKind};
 use kuluu_render::snapshot::SceneState;
 
 use super::input::CommandTx;
-use crate::state::{AgentCommand, KEY_ITEMS_PER_TABLE};
+use kuluu_session::state::{AgentCommand, KEY_ITEMS_PER_TABLE};
 
 #[derive(Resource, Default)]
 pub struct KeyItemsViewed(pub std::collections::BTreeSet<u16>);

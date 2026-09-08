@@ -1,4 +1,5 @@
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
+use bevy::picking::backend::{ray::RayMap, HitData, PointerHits};
 use bevy::picking::hover::HoverMap;
 use bevy::picking::mesh_picking::MeshPickingPlugin;
 use bevy::picking::pointer::{PointerButton, PointerId};
@@ -60,6 +61,10 @@ impl Plugin for PickingPlugin {
             .init_resource::<PickBridgePointer>()
             .init_resource::<WorldPickingEnabled>()
             .add_systems(
+                PreUpdate,
+                pick_nameplates.in_set(bevy::picking::PickingSystems::Backend),
+            )
+            .add_systems(
                 Update,
                 (
                     click_to_target_system,
@@ -67,6 +72,53 @@ impl Plugin for PickingPlugin {
                     sync_entity_hitboxes.run_if(resource_exists::<HitboxAssets>),
                 ),
             );
+    }
+}
+
+const NAMEPLATE_QUAD_HALF_EXTENT: f32 = 0.5;
+
+fn nameplate_hit_distance(ray: Ray3d, transform: &GlobalTransform) -> Option<f32> {
+    let inverse = transform.affine().inverse();
+    let origin = inverse.transform_point3(ray.origin);
+    let direction = inverse.transform_vector3(*ray.direction);
+    if direction.z.abs() <= f32::EPSILON {
+        return None;
+    }
+    let distance = -origin.z / direction.z;
+    let point = origin + distance * direction;
+    (distance >= 0.0
+        && point.x.abs() <= NAMEPLATE_QUAD_HALF_EXTENT
+        && point.y.abs() <= NAMEPLATE_QUAD_HALF_EXTENT)
+        .then_some(distance)
+}
+
+fn pick_nameplates(
+    rays: Res<RayMap>,
+    cameras: Query<&Camera, With<crate::camera::OperatorCamera>>,
+    plates: Query<(Entity, &GlobalTransform, &Visibility, &Pickable), With<Nameplate>>,
+    mut hits: MessageWriter<PointerHits>,
+) {
+    // The final pass draws plates outside the operator camera's render layers.
+    for (id, ray) in rays.iter() {
+        let Ok(camera) = cameras.get(id.camera) else {
+            continue;
+        };
+        let picks = plates
+            .iter()
+            .filter(|(_, _, visibility, pickable)| {
+                !matches!(visibility, Visibility::Hidden) && pickable.is_hoverable
+            })
+            .filter_map(|(entity, transform, _, _)| {
+                let distance = nameplate_hit_distance(*ray, transform)?;
+                Some((
+                    entity,
+                    HitData::new(id.camera, distance, Some(ray.get_point(distance)), None),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if !picks.is_empty() {
+            hits.write(PointerHits::new(id.pointer, picks, camera.order as f32));
+        }
     }
 }
 
@@ -225,7 +277,7 @@ pub fn update_hovered_entity_system(
         &world_q,
         &parent_q,
         &nameplate_q,
-        scene.snapshot.self_char_id,
+        &scene.snapshot,
     );
     if hovered.id != id {
         hovered.id = id;
@@ -242,7 +294,7 @@ fn priority_hover_id(
     world_q: &Query<&WorldEntity>,
     parent_q: &Query<&ChildOf>,
     nameplate_q: &Query<&Nameplate>,
-    self_id: Option<u32>,
+    snap: &kuluu_snapshot::SceneSnapshot,
 ) -> Option<u32> {
     let hits = [Some(PointerId::Mouse), bridge.0]
         .into_iter()
@@ -252,8 +304,21 @@ fn priority_hover_id(
         .filter_map(|(entity, hit)| {
             let id = resolve_hit_entity_id(*entity, world_q, parent_q, nameplate_q)?;
             (id != 0).then_some((id, hit.depth))
+        })
+        // Untargetable entities (invisible "[obj]" event points, hidden NPCs)
+        // never hover: the mouse behaves exactly like the click path, which
+        // already refuses to select them -- no hover card, no cursor swap,
+        // and they can't mask a real entity behind them. Unknown ids
+        // (snapshot mid-sync) stay hoverable. Doors pass: is_targetable
+        // carves them out for the retail Talk flow.
+        .filter(|(id, _)| {
+            snap.entities
+                .iter()
+                .find(|e| e.id == *id)
+                .map(|e| e.is_targetable())
+                .unwrap_or(true)
         });
-    choose_hovered_id(hits, self_id)
+    choose_hovered_id(hits, snap.self_char_id)
 }
 
 /// Any non-self hit outranks self at any depth — the self box is oversized on
@@ -353,6 +418,7 @@ pub fn click_to_target_system(
     q_nameplate: Query<&Nameplate>,
     pointer: Res<crate::mouse::MousePointer>,
     scene: Res<crate::snapshot::SceneState>,
+    table: Res<crate::entity_table::EntityTable>,
     enabled: Res<WorldPickingEnabled>,
     lock_on: Res<crate::lock_on::LockOn>,
     fishing_spot: Res<crate::fishing_spot::FishingSpot>,
@@ -371,7 +437,7 @@ pub fn click_to_target_system(
         &q_world,
         &q_parent,
         &q_nameplate,
-        scene.snapshot.self_char_id,
+        &scene.snapshot,
     );
     // One physical click emits one Click per hovered entity — the priority
     // winner's surface, self's non-blocking box beside it, and the full-window
@@ -424,11 +490,13 @@ pub fn click_to_target_system(
                 scene.snapshot.current_goal,
                 Some(kuluu_snapshot::ReactorGoal::Engaged { .. })
             );
+            // Piece 3: self identity for the context comes from the table's
+            // self slot, not a snapshot field read.
             let ctx = action_model::context_for_target(
                 target.id,
                 &scene.snapshot.entities,
                 scene.snapshot.self_pos.pos,
-                scene.snapshot.self_char_id,
+                table.self_id(),
                 engaged,
                 crate::hud::menu::any_usable_item(&scene.snapshot),
                 fishing_spot.0.is_ready(),
@@ -448,8 +516,70 @@ mod tests {
 
     use bevy::camera::NormalizedRenderTarget;
     use bevy::ecs::system::RunSystemOnce;
-    use bevy::picking::backend::HitData;
     use bevy::picking::pointer::Location;
+
+    #[test]
+    fn nameplate_ray_uses_transformed_quad_bounds_and_world_distance() {
+        let transform = GlobalTransform::from(
+            Transform::from_xyz(3.0, 4.0, -8.0).with_scale(Vec3::new(4.0, 2.0, 1.0)),
+        );
+        let ray = Ray3d::new(Vec3::new(4.5, 4.5, 0.0), Dir3::NEG_Z);
+        assert_eq!(nameplate_hit_distance(ray, &transform), Some(8.0));
+        let miss = Ray3d::new(Vec3::new(5.1, 4.0, 0.0), Dir3::NEG_Z);
+        assert_eq!(nameplate_hit_distance(miss, &transform), None);
+        assert_eq!(
+            nameplate_hit_distance(Ray3d::new(ray.origin, Dir3::Z), &transform),
+            None
+        );
+    }
+
+    #[test]
+    fn backend_picks_visible_nameplate_without_body_or_plate_camera_layer() {
+        use bevy::camera::visibility::RenderLayers;
+        use bevy::picking::backend::ray::RayId;
+        let mut world = World::new();
+        world.init_resource::<Messages<PointerHits>>();
+        let camera = world
+            .spawn((
+                Camera::default(),
+                crate::camera::OperatorCamera,
+                RenderLayers::layer(0),
+            ))
+            .id();
+        let mut rays = RayMap::default();
+        rays.map.insert(
+            RayId::new(camera, PointerId::Mouse),
+            Ray3d::new(Vec3::ZERO, Dir3::NEG_Z),
+        );
+        world.insert_resource(rays);
+        let plate = world
+            .spawn((
+                Nameplate {
+                    entity_id: 42,
+                    kind: EntityKind::Npc,
+                },
+                crate::nameplate_overlay::nameplate_render_layers(),
+                GlobalTransform::from_translation(Vec3::new(0.0, 0.0, -5.0)),
+                Visibility::Visible,
+                Pickable::default(),
+            ))
+            .id();
+        world.run_system_once(pick_nameplates).unwrap();
+        let events: Vec<_> = world
+            .resource_mut::<Messages<PointerHits>>()
+            .drain()
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].picks[0].0, plate);
+        assert_eq!(events[0].picks[0].1.depth, 5.0);
+        world.entity_mut(plate).insert(Visibility::Hidden);
+        world.run_system_once(pick_nameplates).unwrap();
+        assert!(world
+            .resource_mut::<Messages<PointerHits>>()
+            .drain()
+            .next()
+            .is_none());
+    }
 
     fn click_world() -> World {
         let mut world = World::new();
@@ -458,6 +588,11 @@ mod tests {
         let mut scene = crate::snapshot::SceneState::default();
         scene.snapshot.self_char_id = Some(7);
         world.insert_resource(scene);
+        // Piece 3: click_to_target_system reads self from the table; stamp it
+        // to match the snapshot field above.
+        let mut table = crate::entity_table::EntityTable::default();
+        table.set_self_id(Some(7));
+        world.insert_resource(table);
         world.insert_resource(WorldPickingEnabled(true));
         world.insert_resource(crate::lock_on::LockOn::default());
         world.insert_resource(crate::fishing_spot::FishingSpot::default());

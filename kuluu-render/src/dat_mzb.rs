@@ -15,6 +15,7 @@ use ffxi_dat::zone_interaction::ZoneInteraction;
 use ffxi_dat::{mmb, mzb, sub_area, walk, ChunkKind, DatRoot};
 
 use crate::components::{IsSelf, WorldEntity};
+use crate::entity_table::EntityTable;
 use crate::snapshot::SceneState;
 use kuluu_snapshot::EntityKind;
 
@@ -217,6 +218,32 @@ pub struct MzbCollisionGeometry {
     suppressed: Option<u32>,
 }
 
+impl MzbCollisionGeometry {
+    /// Merged triangle soup of every loaded block (suppressed slot skipped),
+    /// already in Bevy space, for mirroring the zone into an external physics
+    /// trimesh (avian3d bridge).
+    pub fn trimesh_data(&self) -> (Vec<Vec3>, Vec<[u32; 3]>) {
+        let mut positions: Vec<Vec3> = Vec::new();
+        let mut tris: Vec<[u32; 3]> = Vec::new();
+        for block in self.slots.iter() {
+            if block.indices.is_empty() {
+                continue;
+            }
+            let base = positions.len() as u32;
+            positions.extend_from_slice(&block.positions);
+            for (i, t) in block.indices.chunks_exact(3).enumerate() {
+                // Suppressed shell triangles are walk-through in every MZB query;
+                // the physics mesh must mirror that or interiors get invisible walls.
+                if block.is_suppressed(i) {
+                    continue;
+                }
+                tris.push([base + t[0], base + t[1], base + t[2]]);
+            }
+        }
+        (positions, tris)
+    }
+}
+
 #[derive(Clone)]
 pub struct LoadedZoneGeom {
     pub submeshes: Arc<Vec<MzbSubMesh>>,
@@ -300,9 +327,17 @@ const NORMAL_MATRIX_MIN_DET: f32 = 1e-6;
 /// Sized from the rise distribution over 120 lattice walks across Lower Jeuno
 /// (`zz-ground-walk` with `KULUU_RISE_HIST`): stairs and ramps are 77% of rises
 /// and all fall under 0.5, structural jumps between separate surfaces cluster at
-/// 1.75 and above, and 0.5..1.5 is a sparse trough. This sits in that trough —
-/// double the tallest stair riser, well under the shortest storey.
-pub const MAX_GROUND_STEP_UP: f32 = 1.0;
+/// 1.75 and above, and 0.5..1.5 is a sparse trough. Set AT the top of the stair
+/// band: 1.0 (the old "double the riser" margin) let the walker climb flower
+/// pots and other sub-yalm props, which retail rejects.
+pub const MAX_GROUND_STEP_UP: f32 = 0.4;
+
+/// f32 slack on the step-up reach boundary. The column ray is cast from a fixed
+/// high origin, so reported hit heights carry ~1e-4-yalm numerical noise at zone
+/// coordinate magnitudes — without this slack, a floor sitting exactly at
+/// `feet + max_rise` (or exactly at current level) is coin-flipped in and out of
+/// reach. Half a millimetre: invisible to gameplay, decisive over the noise.
+const STEP_UP_REACH_EPSILON: f32 = 5e-4;
 
 impl MzbCollisionBlock {
     pub fn tri_count(&self) -> usize {
@@ -515,7 +550,11 @@ impl MzbCollisionGeometry {
     pub fn ground_step(&self, xz: Vec2, feet_y: f32, max_rise: f32) -> Option<f32> {
         let mut best: Option<(u8, f32)> = None;
         self.for_each_hit_in_column(xz, |slot, _, hit_y, normal| {
-            if normal.y < FLOOR_NORMAL_MIN || hit_y > feet_y + max_rise {
+            // STEP_UP_REACH_EPSILON: the column ray's fixed high origin leaves
+            // ~1e-4-yalm f32 noise in reported hit heights, so a riser sitting
+            // EXACTLY at the bound (a real stair step right at MAX_GROUND_STEP_UP)
+            // must not be coin-flipped out of reach.
+            if normal.y < FLOOR_NORMAL_MIN || hit_y > feet_y + max_rise + STEP_UP_REACH_EPSILON {
                 return;
             }
             let cand = (slot, hit_y);
@@ -543,6 +582,25 @@ impl MzbCollisionGeometry {
     pub fn ground_or_recover_wire_z(&self, x: f32, y: f32, z: f32) -> Option<f32> {
         self.ground_or_recover(Vec2::new(x, -y), -z, MAX_GROUND_STEP_UP)
             .map(|floor_bevy_y| -floor_bevy_y)
+    }
+
+    /// Highest up-facing floor in `xz`'s column at or below `ceiling_y + slack`.
+    /// The slack above the nominal ceiling keeps a coplanar slab that meets its
+    /// neighbour along a shared edge (quantized f32 vertices differ by ~1e-4) from
+    /// flickering out of reach — the same edge noise that made Bastok's stair edge
+    /// coin-flip grounding.
+    pub fn ground_floor_at(&self, xz: Vec2, ceiling_y: f32, slack: f32) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        self.for_each_hit_in_column(xz, |_, _, hit_y, normal| {
+            if normal.y < FLOOR_NORMAL_MIN || hit_y > ceiling_y + slack {
+                return;
+            }
+            best = Some(match best {
+                Some(prev) if prev >= hit_y => prev,
+                _ => hit_y,
+            });
+        });
+        best
     }
 
     pub fn ground_raycast_all(&self, xz: Vec2) -> Vec<(f32, Vec3)> {
@@ -2285,7 +2343,7 @@ fn simple_water_material(texture: Handle<Image>) -> crate::ffxi_zone_material::F
             // the shoreline; the decal polygon-offset pulls the surface toward
             // the camera so it wins the depth test there (replaces the old
             // constant `depth_bias: 1000.0`).
-            z_bias_level: 1,
+            z_bias_level: ffxi_dat::mmb::TRANSPARENT_Z_BIAS_LEVEL,
             depth_write: false,
             // A reconstructed plane over the MZB water height, not a generator mesh.
             generator_stage_chain: false,
@@ -2878,7 +2936,7 @@ impl ZoneBlockRetire<'_, '_> {
         for (e, s) in self.slots.iter() {
             if s.0 == slot {
                 if let Ok(mut ec) = self.commands.get_entity(e) {
-                    ec.despawn();
+                    ec.try_despawn();
                 }
             }
         }
@@ -2953,7 +3011,7 @@ pub fn auto_load_zone_geometry_system(
 
     for e in auto_q.iter() {
         if let Ok(mut ec) = commands.get_entity(e) {
-            ec.despawn();
+            ec.try_despawn();
         }
     }
 
@@ -3018,6 +3076,26 @@ pub fn auto_load_zone_geometry_system(
                 &mut toasts,
                 format!("auto-load: no DAT mapping for zone {zone_id} (Phase 11b table pending)"),
             );
+        }
+    }
+}
+
+/// Hard load-order gate for zone entry: true once the main-zone MZB load has
+/// COMPLETED — success, empty DAT, or parse failure all count, because a
+/// completion is what leaves [`LoadMzbInFlight`], and a zone whose floor never
+/// materializes must not hold its characters hostage behind the loading screen
+/// either. The loading overlay's `ready` reads this same pair of signals, so
+/// the gate opens exactly when that screen lifts. Zones without a DAT mapping
+/// have no floor to wait for and are ready by definition.
+pub fn main_zone_floor_ready(
+    snapshot: &kuluu_snapshot::SceneSnapshot,
+    last: &LastAutoLoadedZone,
+    in_flight: &LoadMzbInFlight,
+) -> bool {
+    match crate::snapshot::effective_zone_file_id(snapshot) {
+        None => true,
+        Some(file_id) => {
+            last.file_id == Some(file_id) && !in_flight.pending_in_slot(ZONE_SLOT_MAIN)
         }
     }
 }
@@ -3087,6 +3165,7 @@ pub fn cull_mzb_by_distance(
 
 pub fn cull_entities_by_distance(
     draw: Res<DrawDistance>,
+    table: Res<EntityTable>,
     self_q: Query<&GlobalTransform, With<IsSelf>>,
     mut ent_q: Query<(&WorldEntity, &GlobalTransform, &mut Visibility), Without<IsSelf>>,
 ) {
@@ -3097,6 +3176,11 @@ pub fn cull_entities_by_distance(
     let cull_sq = draw.mob * draw.mob;
 
     for (ent, ent_t, mut vis) in ent_q.iter_mut() {
+        // Server-invisible models are owned by sync_entities_system; resetting them to
+        // Inherited would re-show the model every frame. Kind-agnostic on purpose.
+        if table.get(ent.id).is_some_and(|r| r.is_invisible()) {
+            continue;
+        }
         if matches!(ent.kind, EntityKind::Pc) {
             if *vis != Visibility::Inherited {
                 *vis = Visibility::Inherited;
@@ -4113,6 +4197,263 @@ mod real_dat_sub_area_tests {
             open.sub_area_shells.len(),
             "the shell bounds are measured ahead of the render gate, so the latch keeps \
              its clear volume for the interior it is standing in"
+        );
+    }
+}
+
+// ===================== MZB-native wall contact helpers (walker sweep source) =====================
+//
+// Geometry-side half of the player walker: `nearest_wall_contact` finds the
+// nearest wall-class triangle to a point; `point_tri_dist_sq` is its distance
+// primitive. The sweep that consumes them lives in kuluu::view_native::walker.
+
+impl MzbCollisionBlock {
+    /// Nearest wall-class triangle (authored normal.y < FLOOR_NORMAL_MIN — the
+    /// 60 degree floor/wall rule) within `r` of `center`, by full
+    /// point-to-triangle distance. Suppressed shell triangles are walked past,
+    /// same as every collision query. Returns `(dist_sq, normal)` for the
+    /// walker sweep's slide re-projection.
+    pub fn nearest_wall_contact(&self, center: Vec3, r: f32) -> Option<(f32, Vec3)> {
+        let r2 = r * r;
+        let mut best: Option<(f32, Vec3)> = None;
+        let mut test = |tri_id: usize| {
+            if self.is_suppressed(tri_id) {
+                return;
+            }
+            let normal = match self.tri_normals.get(tri_id) {
+                Some(n) => *n,
+                None => {
+                    let base = tri_id * 3;
+                    let v0 = self.positions[self.indices[base] as usize];
+                    let v1 = self.positions[self.indices[base + 1] as usize];
+                    let v2 = self.positions[self.indices[base + 2] as usize];
+                    (v1 - v0).cross(v2 - v0).normalize_or_zero()
+                }
+            };
+            if normal.y >= FLOOR_NORMAL_MIN {
+                return;
+            }
+            let base = tri_id * 3;
+            let v0 = self.positions[self.indices[base] as usize];
+            let v1 = self.positions[self.indices[base + 1] as usize];
+            let v2 = self.positions[self.indices[base + 2] as usize];
+            let d2 = point_tri_dist_sq(center, v0, v1, v2);
+            if d2 >= r2 {
+                return;
+            }
+            if best.is_none_or(|(bd, _)| d2 < bd) {
+                best = Some((d2, normal));
+            }
+        };
+        if self.cell_index.is_empty() {
+            for tri_id in 0..self.tri_count() {
+                test(tri_id);
+            }
+            return best;
+        }
+        let lo = center - Vec3::splat(r);
+        let hi = center + Vec3::splat(r);
+        let cx0 = (lo.x / MZB_GRID_CELL).floor() as i32;
+        let cx1 = (hi.x / MZB_GRID_CELL).floor() as i32;
+        let cz0 = (lo.z / MZB_GRID_CELL).floor() as i32;
+        let cz1 = (hi.z / MZB_GRID_CELL).floor() as i32;
+        for cx in cx0..=cx1 {
+            for cz in cz0..=cz1 {
+                if let Some(ids) = self.cell_index.get(&(cx, cz)) {
+                    for &id in ids {
+                        test(id as usize);
+                    }
+                }
+            }
+        }
+        best
+    }
+}
+/// Squared distance from `p` to triangle (a, b, c) — Ericson,
+/// "Real-Time Collision Detection" §1.3.6: vertex regions, edge projections,
+/// then the plane interior.
+pub fn point_tri_dist_sq(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f32 {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = ab.dot(ap);
+    let d2 = ac.dot(ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return ap.length_squared();
+    }
+    let bp = p - b;
+    let d3 = ab.dot(bp);
+    let d4 = ac.dot(bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return bp.length_squared();
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return ((a + ab * v) - p).length_squared();
+    }
+    let cp = p - c;
+    let d5 = ab.dot(cp);
+    let d6 = ac.dot(cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return cp.length_squared();
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return ((a + ac * w) - p).length_squared();
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return ((b + (c - b) * w) - p).length_squared();
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    ((a + ab * v + ac * w) - p).length_squared()
+}
+
+impl MzbCollisionGeometry {
+    /// Nearest wall-class triangle within `r` of `center`, across every loaded
+    /// block (parent + active interior): the best of each block's
+    /// [`MzbCollisionBlock::nearest_wall_contact`]. The walker sweep queries
+    /// its two body spheres through this.
+    pub fn nearest_wall_contact(&self, center: Vec3, r: f32) -> Option<(f32, Vec3)> {
+        let mut best: Option<(f32, Vec3)> = None;
+        for block in &self.slots {
+            if let Some(c) = block.nearest_wall_contact(center, r) {
+                if best.is_none_or(|(bd, _)| c.0 < bd) {
+                    best = Some(c);
+                }
+            }
+        }
+        best
+    }
+
+    /// True when any triangle (any face class — a ceiling is usually an
+    /// underside) crosses the vertical slab `(lo_y, hi_y]` at `xz`. The walker
+    /// uses this as its ceiling hold: a rise that would push the body top into
+    /// geometry is rejected for the tick.
+    pub fn any_tri_in_column_slab(&self, xz: Vec2, lo_y: f32, hi_y: f32) -> bool {
+        let mut found = false;
+        self.for_each_hit_in_column(xz, |_, _, hit_y, _| {
+            if !found && hit_y > lo_y && hit_y <= hi_y {
+                found = true;
+            }
+        });
+        found
+    }
+}
+
+#[cfg(test)]
+mod cull_tests {
+    use super::*;
+    use kuluu_snapshot::{Entity, Vec3 as WireVec3};
+
+    fn wire_entity(id: u32, status: u8) -> Entity {
+        Entity {
+            id,
+            act_index: 0,
+            kind: EntityKind::Mob,
+            name: None,
+            pos: WireVec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            heading: 0,
+            hp_pct: Some(100),
+            bt_target_id: 0,
+            face_target: 0,
+            name_vis: None,
+            claim_id: 0,
+            speed: 0,
+            speed_base: 0,
+            look: None,
+            animation: 0,
+            animationsub: 0,
+            mount: None,
+            status,
+            char_flags: Default::default(),
+            monstrosity: false,
+        }
+    }
+
+    /// A server-invisible entity (status INVISIBLE) is hidden by sync_entities_system;
+    /// distance-culling must not reset its Visibility back to Inherited every frame, or
+    /// the model re-appears. Visible entities keep normal cull behavior.
+    #[test]
+    fn cull_respects_server_invisible_entities() {
+        let mut app = App::new();
+        app.init_resource::<DrawDistance>()
+            .init_resource::<EntityTable>()
+            .add_systems(Update, cull_entities_by_distance);
+
+        // Self at origin; cull needs exactly one IsSelf.
+        app.world_mut().spawn((
+            IsSelf,
+            GlobalTransform::from(Transform::from_xyz(0.0, 0.0, 0.0)),
+        ));
+
+        let invis = app
+            .world_mut()
+            .spawn((
+                WorldEntity {
+                    id: 1,
+                    act_index: 0,
+                    kind: EntityKind::Mob,
+                },
+                GlobalTransform::from(Transform::from_xyz(5.0, 0.0, 0.0)),
+                Visibility::Hidden,
+            ))
+            .id();
+        let vis_in_range = app
+            .world_mut()
+            .spawn((
+                WorldEntity {
+                    id: 2,
+                    act_index: 0,
+                    kind: EntityKind::Mob,
+                },
+                GlobalTransform::from(Transform::from_xyz(5.0, 0.0, 0.0)),
+                Visibility::Hidden,
+            ))
+            .id();
+        let vis_out_of_range = app
+            .world_mut()
+            .spawn((
+                WorldEntity {
+                    id: 3,
+                    act_index: 0,
+                    kind: EntityKind::Mob,
+                },
+                GlobalTransform::from(Transform::from_xyz(100.0, 0.0, 0.0)),
+                Visibility::Inherited,
+            ))
+            .id();
+
+        let mut table = app.world_mut().resource_mut::<EntityTable>();
+        table.upsert(&wire_entity(1, kuluu_snapshot::status_type::INVISIBLE));
+        table.upsert(&wire_entity(2, 0));
+        table.upsert(&wire_entity(3, 0));
+
+        app.update();
+
+        assert_eq!(
+            *app.world().get::<Visibility>(invis).unwrap(),
+            Visibility::Hidden,
+            "server-invisible entity must stay hidden; cull must not reset it to Inherited"
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(vis_in_range).unwrap(),
+            Visibility::Inherited,
+            "in-range visible entity is un-hidden by distance-culling (control)"
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(vis_out_of_range).unwrap(),
+            Visibility::Hidden,
+            "out-of-range visible entity is hidden by distance-culling (control)"
         );
     }
 }

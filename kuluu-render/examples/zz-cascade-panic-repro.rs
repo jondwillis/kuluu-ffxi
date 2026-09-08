@@ -6,8 +6,8 @@
 //! aggregation loop then indexes ALL thread-locals by cascade index, hitting
 //! stale queues sized by an earlier (smaller) cascade count.
 //!
-//! Expected: panics on stock bevy_light 0.19.0, prints REPRO-OK with the
-//! vendored patch in vendor/bevy_light (see [patch.crates-io] in Cargo.toml).
+//! Fixed upstream in bevy_light 0.19.1 by resizing every thread-local queue
+//! before collection. Expected: prints REPRO-OK with the stock crate.
 //!
 //! Run: cargo run --example zz-cascade-panic-repro
 

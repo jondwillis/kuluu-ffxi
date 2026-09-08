@@ -5,6 +5,7 @@ use bevy::ui::UiTransform;
 use kuluu_snapshot::EntityKind;
 
 use crate::components::{InGameEntity, IsSelf, WorldEntity};
+use crate::entity_table::EntityTable;
 use crate::lock_on::LockOn;
 use crate::nameplate_color::{name_color_choice, NameColorTable, SelfContext};
 use crate::scene::Target;
@@ -265,6 +266,7 @@ pub struct MarkerContext<'a> {
 impl<'a> MarkerContext<'a> {
     pub fn new(
         scene_state: &'a SceneState,
+        table: &'a EntityTable,
         target: &'a Target,
         lock_on: &'a LockOn,
         filters: &'a MarkerFilters,
@@ -272,7 +274,9 @@ impl<'a> MarkerContext<'a> {
     ) -> Self {
         let snapshot = &scene_state.snapshot;
         Self {
-            self_char_id: snapshot.self_char_id.unwrap_or(0),
+            // Piece 3: self identity from the table's self slot (stamped by
+            // ingest from the same snapshot field).
+            self_char_id: table.self_id().unwrap_or(0),
             target,
             lock_on,
             filters,
@@ -291,13 +295,13 @@ impl<'a> MarkerContext<'a> {
         }
     }
 
-    /// The fill for one world dot: the same retail `ncol` colour its nameplate
-    /// draws in, or the per-kind stand-in until that table loads.
+    /// The fill for one world dot: the same `ncol` colour its nameplate draws
+    /// in (retail row once loaded, built-in stand-in until then), or the
+    /// per-kind fallback when there is no live record at all.
     fn fill(&self, entity_id: u32, kind: EntityKind) -> Color {
         self.entities
             .get(&entity_id)
-            .map(|e| name_color_choice(e, self.color_ctx))
-            .and_then(|choice| choice.resolve(self.name_colors))
+            .map(|e| name_color_choice(e, self.color_ctx).resolve(self.name_colors))
             .unwrap_or_else(|| fill_fallback(kind))
     }
 }
@@ -329,6 +333,7 @@ pub fn widescan_color(kind: u8) -> Color {
 pub fn update_minimap_overlay(
     view: Res<MinimapView>,
     scene_state: Res<SceneState>,
+    table: Res<EntityTable>,
     target: Res<Target>,
     lock_on: Res<LockOn>,
     filters: Res<MarkerFilters>,
@@ -346,7 +351,14 @@ pub fn update_minimap_overlay(
     let Ok(overlay_layer) = q_overlay_layer.single() else {
         return;
     };
-    let ctx = MarkerContext::new(&scene_state, &target, &lock_on, &filters, &name_colors);
+    let ctx = MarkerContext::new(
+        &scene_state,
+        &table,
+        &target,
+        &lock_on,
+        &filters,
+        &name_colors,
+    );
     sync_marker_layer(
         aabb,
         overlay_layer,
@@ -454,7 +466,7 @@ pub fn sync_marker_layer<F>(
     for id in stale {
         if let Some(dot_entity) = by_id.remove(&id) {
             if let Ok(mut ec) = commands.get_entity(dot_entity) {
-                ec.despawn();
+                ec.try_despawn();
             }
         }
     }
@@ -726,6 +738,7 @@ mod tests {
 
         fn run_layer(
             scene_state: Res<SceneState>,
+            table: Res<EntityTable>,
             filters: Res<MarkerFilters>,
             name_colors: Res<NameColorTable>,
             q_layer: Query<Entity, With<TestLayer>>,
@@ -741,7 +754,14 @@ mod tests {
                 max: Vec2::splat(100.0),
             };
             let (target, lock_on) = (Target::default(), LockOn::default());
-            let ctx = MarkerContext::new(&scene_state, &target, &lock_on, &filters, &name_colors);
+            let ctx = MarkerContext::new(
+                &scene_state,
+                &table,
+                &target,
+                &lock_on,
+                &filters,
+                &name_colors,
+            );
             sync_marker_layer(
                 aabb,
                 layer,
@@ -756,6 +776,7 @@ mod tests {
 
         let mut world = World::new();
         world.init_resource::<SceneState>();
+        world.init_resource::<EntityTable>();
         world.insert_resource(MarkerFilters::default());
         world.init_resource::<NameColorTable>();
         world.init_resource::<TestStore>();

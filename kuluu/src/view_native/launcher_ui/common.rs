@@ -42,6 +42,12 @@ impl Crumb {
     }
 }
 
+/// Marker for the widget that should receive initial keyboard focus when its
+/// screen is shown (see `login::focus_default_target_system`). The blue focus
+/// outline starts here instead of nowhere, so Enter activates it immediately.
+#[derive(Component)]
+pub(super) struct DefaultFocusTarget;
+
 pub(super) const PANEL_BG: Color = Color::srgba(0.04, 0.04, 0.05, 0.85);
 pub(super) const PANEL_BORDER_COLOR: Color = Color::srgb(0.20, 0.20, 0.24);
 

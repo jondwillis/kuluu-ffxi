@@ -3,6 +3,7 @@ use kuluu_snapshot::{
     ChatChannel, ChatLine, Entity, PartyMember, SceneDelta, SceneSnapshot, ViewerEvent,
 };
 
+use crate::entity_table::EntityTable;
 use crate::source::SceneSource;
 
 pub const CHAT_HISTORY_CAP: usize = 256;
@@ -134,6 +135,7 @@ pub fn ingest_system<
     mut source: ResMut<S>,
     mut state: ResMut<SceneState>,
     mut events: ResMut<EventLog>,
+    mut table: ResMut<EntityTable>,
 ) {
     // Clearing through the tracked ResMut would tick SceneState every frame,
     // poisoning is_changed()/resource_changed gating for every consumer.
@@ -143,12 +145,21 @@ pub fn ingest_system<
         state.snapshot = *snap;
         state.observe_server_chat();
         state.dirty = true;
+        // Piece 2: mirror the authoritative frame into the entity table.
+        table.apply_snapshot(&state.snapshot);
+        // Piece 3: keep the self slot in sync with the authoritative frame —
+        // char_id only changes on connect/zone entry, and full snapshots carry
+        // it. `0` is not a valid character id; filtering it keeps is_self()
+        // equivalent to the old `self_char_id != 0 && ...` comparisons.
+        table.set_self_id(state.snapshot.self_char_id.filter(|&c| c != 0));
     }
 
     for delta in source.drain_deltas() {
         apply_delta(&mut state.snapshot, &delta);
         state.observe_server_chat();
         state.dirty = true;
+        // Piece 2: mirror the O(changed) frame into the entity table.
+        table.apply_delta(&delta);
     }
 
     for ev in source.drain_events() {
@@ -279,6 +290,7 @@ mod tests {
             hp_pct: Some(100),
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 0,
             speed_base: 0,
@@ -288,6 +300,7 @@ mod tests {
             mount: None,
             status: 0,
             char_flags: Default::default(),
+            monstrosity: false,
         }
     }
 
@@ -622,6 +635,7 @@ mod tests {
         app.init_resource::<TestSource>();
         app.init_resource::<SceneState>();
         app.init_resource::<EventLog>();
+        app.init_resource::<EntityTable>();
         app.add_systems(Update, ingest_system::<TestSource>);
 
         app.world_mut()
@@ -684,6 +698,7 @@ mod tests {
         app.init_resource::<TestSource>();
         app.init_resource::<SceneState>();
         app.init_resource::<EventLog>();
+        app.init_resource::<EntityTable>();
         app.add_systems(Update, ingest_system::<TestSource>);
 
         let s = SceneSnapshot {
@@ -730,6 +745,7 @@ mod tests {
         app.init_resource::<SceneState>();
         app.init_resource::<EventLog>();
         app.init_resource::<ChangedProbe>();
+        app.init_resource::<EntityTable>();
         app.add_systems(Update, (ingest_system::<TestSource>, probe).chain());
 
         app.world_mut().resource_mut::<TestSource>().next_snapshot =

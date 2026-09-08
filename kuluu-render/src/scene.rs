@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
+use bevy::ecs::system::SystemParam;
 use bevy::light::FogVolume;
 use bevy::picking::Pickable;
 use bevy::prelude::*;
 use kuluu_snapshot::{EntityKind, EntityLook, Vec3 as WireVec3};
 
-use crate::components::{IsSelf, LookComp, MorphIn, Nameplate, WorldEntity};
+use crate::components::{CurrRenderPos, IsSelf, LookComp, MorphIn, PrevRenderPos, WorldEntity};
+use crate::entity_table::EntityTable;
 use crate::graphics_settings::GraphicsSettings;
 use crate::snapshot::SceneState;
 
@@ -63,6 +65,11 @@ pub struct EntityMaterials {
     pub mob_claimed_self: Handle<StandardMaterial>,
 
     pub mob_claimed_other: Handle<StandardMaterial>,
+
+    /// Fully transparent stand-in for a placeholder orb whose owner must not be
+    /// drawn (Flags1.InvisFlag). Shared, so blanking an orb is a handle swap,
+    /// never a per-entity asset.
+    pub invis_orb: Handle<StandardMaterial>,
 }
 
 #[derive(Component)]
@@ -156,6 +163,16 @@ pub fn setup_world(
         mob_claimed_self: orb(Color::srgb(0.96, 0.96, 0.96), 6.0, &mut materials),
 
         mob_claimed_other: orb(Color::srgb(0.80, 0.18, 0.18), 7.0, &mut materials),
+
+        invis_orb: {
+            let mut m = StandardMaterial {
+                unlit: true,
+                ..default()
+            };
+            m.base_color = Color::srgba(0.0, 0.0, 0.0, 0.0);
+            m.alpha_mode = AlphaMode::Blend;
+            materials.add(m)
+        },
     });
 
     let orb_mesh = |radius: f32, center_y: f32, m: &mut Assets<Mesh>| {
@@ -214,29 +231,70 @@ pub fn setup_world(
     });
 }
 
+/// Bundled so [`sync_entities_system`] stays under bevy's 16-param SystemParam
+/// ceiling (it was already at it before the floor gate landed).
+#[derive(SystemParam)]
+pub struct EntitySyncQueries<'w, 's> {
+    xform: Query<'w, 's, &'static mut Transform, With<WorldEntity>>,
+    mat: Query<
+        'w,
+        's,
+        &'static mut MeshMaterial3d<StandardMaterial>,
+        (With<WorldEntity>, Without<MorphIn>),
+    >,
+    vis: Query<'w, 's, &'static mut Visibility, (With<WorldEntity>, Without<IsSelf>)>,
+}
+
+#[derive(SystemParam)]
+pub struct ZoneFloorGate<'w> {
+    snapshot: Res<'w, SceneState>,
+    #[cfg(not(target_arch = "wasm32"))]
+    last_auto: Res<'w, crate::dat_mzb::LastAutoLoadedZone>,
+    #[cfg(not(target_arch = "wasm32"))]
+    in_flight: Res<'w, crate::dat_mzb::LoadMzbInFlight>,
+}
+
+impl ZoneFloorGate<'_> {
+    pub fn ready(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return crate::dat_mzb::main_zone_floor_ready(
+            &self.snapshot.snapshot,
+            &self.last_auto,
+            &self.in_flight,
+        );
+        #[cfg(target_arch = "wasm32")]
+        true
+    }
+
+    fn changed(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.last_auto.is_changed() || self.in_flight.is_changed();
+        #[cfg(target_arch = "wasm32")]
+        self.snapshot.is_changed()
+    }
+}
+
 pub fn sync_entities_system(
     state: Res<SceneState>,
+    table: Res<EntityTable>,
     mesh: Res<EntityMesh>,
     mats: Res<EntityMaterials>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut images: ResMut<Assets<Image>>,
-    billboard_font: Res<crate::nameplate_billboard::BillboardFont>,
     mut tracked: ResMut<TrackedEntities>,
     mut prediction: ResMut<crate::combat_stance::EntityPrediction>,
     mut motion: ResMut<crate::combat_stance::EntityMotion>,
     mut blends: ResMut<crate::combat_stance::AnimationBlends>,
     mut commands: Commands,
-    mut q_xform: Query<&mut Transform, With<WorldEntity>>,
-    mut q_mat: Query<&mut MeshMaterial3d<StandardMaterial>, (With<WorldEntity>, Without<MorphIn>)>,
-    q_nameplates: Query<&Nameplate>,
+    mut queries: EntitySyncQueries,
+    floor_gate: ZoneFloorGate,
     mut prev_zone: Local<Option<Option<u32>>>,
 ) {
-    if !state.dirty {
+    if !state.dirty && !floor_gate.changed() {
         return;
     }
 
     let snap = &state.snapshot;
+
+    let floor_ready = floor_gate.ready();
 
     // Keyed on the resolved DAT file id, not zone_id: Mog House entry/exit keeps
     // the city zone_id but teleports the player into a different interior.
@@ -244,19 +302,18 @@ pub fn sync_entities_system(
     let zone_changed = matches!(*prev_zone, Some(p) if p != zone_key);
     *prev_zone = Some(zone_key);
 
-    let mut nameplated: std::collections::HashSet<u32> =
-        q_nameplates.iter().map(|n| n.entity_id).collect();
-
     let mut seen: std::collections::HashSet<u32> =
         std::collections::HashSet::with_capacity(snap.entities.len() + 1);
     let mut hp_by_id: HashMap<u32, Option<u8>> = HashMap::new();
 
-    let self_char_id = snap.self_char_id.unwrap_or(0);
+    // Piece 3: identity comes from the table's self slot (stamped by ingest
+    // from the same snapshot field), not a per-entity comparison.
+    let self_char_id = table.self_id().unwrap_or(0);
     for wire in &snap.entities {
         seen.insert(wire.id);
         hp_by_id.insert(wire.id, wire.hp_pct);
         let world_pos = ffxi_to_bevy(wire.pos);
-        let is_self = self_char_id != 0 && wire.id == self_char_id;
+        let is_self = table.is_self(wire.id);
 
         if !is_self
             && matches!(
@@ -280,40 +337,12 @@ pub fn sync_entities_system(
 
         match tracked.by_id.get(&wire.id).copied() {
             Some(existing) => {
-                if let Ok(mut t) = q_xform.get_mut(existing) {
+                if let Ok(mut t) = queries.xform.get_mut(existing) {
                     if is_self {
-                        trace!(
-                            target: "self_sync",
-                            echo_x = world_pos.x,
-                            echo_z = world_pos.z,
-                            cur_x = t.translation.x,
-                            cur_z = t.translation.z,
-                            "self ingest"
-                        );
-                        // Same visual smoothing every other entity gets: a
-                        // snapshot-cadence hiccup delivers several movement
-                        // ticks in one ingest, and a hard snap renders that as
-                        // a single-frame leap of the actor and its nameplate
-                        // (the camera smooths, so it reads as jiggle). The
-                        // 2-yalm snap threshold still passes real teleports
-                        // through instantly.
-                        let y = if zone_changed {
-                            world_pos.y
-                        } else {
-                            t.translation.y
-                        };
-                        let stepped = if zone_changed {
-                            world_pos
-                        } else {
-                            apply_visual_smoothing(
-                                Vec3::new(t.translation.x, world_pos.y, t.translation.z),
-                                world_pos,
-                            )
-                        };
-                        t.translation = Vec3::new(stepped.x, y, stepped.z);
-                        // Rotation is owned by self_visual_yaw_system: the
-                        // movement heading snaps (about-face, first step) but
-                        // the rendered body should whip around, not teleport.
+                        // Native fixed-tick prediction owns self; the relay viewer consumes snapshots.
+                        if zone_changed || cfg!(target_arch = "wasm32") {
+                            t.translation = world_pos;
+                        }
                     } else if matches!(wire.kind, EntityKind::Other) {
                         // Doors/transports and other non-actor entities keep the
                         // simple visual lerp; pathed NPCs are dead-reckoned by
@@ -324,8 +353,21 @@ pub fn sync_entities_system(
                         t.rotation = heading_to_quat(wire.heading);
                     }
                 }
-                if let Ok(mut m) = q_mat.get_mut(existing) {
+                if let Ok(mut m) = queries.mat.get_mut(existing) {
                     m.0 = mat;
+                }
+                // LSB STATUS_TYPE::INVISIBLE hides the model entirely (worms
+                // between dive and surface); hiding the root takes the skinned
+                // model child and the placeholder orb with it. The nameplate is
+                // culled on the same signals by update_nameplate_billboards_system.
+                // Self is exempt — the server never sets INVISIBLE on players,
+                // and a stray byte must not delete our own model.
+                if let Ok(mut v) = queries.vis.get_mut(existing) {
+                    *v = if !is_self && wire.is_invisible() {
+                        Visibility::Hidden
+                    } else {
+                        Visibility::default()
+                    };
                 }
                 // The spawn arm can only tag self once the id is known, and the
                 // player's own entity routinely arrives before it — every reader
@@ -336,6 +378,9 @@ pub fn sync_entities_system(
                 }
             }
             None => {
+                if !floor_ready {
+                    continue;
+                }
                 // Doors/transports have no client model — their visual is the
                 // zone/MMB geometry — so the placeholder orb would render as a
                 // floating sphere over them (kuluu-nf56). Suppress the orb mesh
@@ -346,6 +391,13 @@ pub fn sync_entities_system(
                     wire.look,
                     Some(EntityLook::Door { .. } | EntityLook::Transport { .. })
                 );
+                // A worm can be underground (INVISIBLE) when we zone in; hide it
+                // from the first frame instead of flashing orb/model for a beat.
+                let spawn_vis = if !is_self && wire.is_invisible() {
+                    Visibility::Hidden
+                } else {
+                    Visibility::default()
+                };
                 let mut spawn = commands.spawn((
                     crate::components::InGameEntity,
                     WorldEntity {
@@ -359,7 +411,7 @@ pub fn sync_entities_system(
                         rotation: heading_to_quat(wire.heading),
                         ..default()
                     },
-                    Visibility::default(),
+                    spawn_vis,
                 ));
                 if !suppress_orb {
                     spawn.insert((Mesh3d(pick_mesh(&mesh, wire.kind)), MeshMaterial3d(mat)));
@@ -381,25 +433,9 @@ pub fn sync_entities_system(
             }
         }
 
-        // Retail draws the local player's own overhead name in the same PC
-        // styling as other PCs (kuluu-hof); the update system hides it in
-        // first-person mode where the plate would sit at the camera eye.
-        if let Some(name) = wire.name.as_deref().filter(|s| !s.is_empty()) {
-            if !nameplated.contains(&wire.id) {
-                crate::nameplate_billboard::spawn_nameplate_billboard(
-                    &mut commands,
-                    &mut meshes,
-                    &mut materials,
-                    &mut images,
-                    &billboard_font.0,
-                    wire.id,
-                    wire.kind,
-                    name,
-                    crate::nameplate_billboard::NAMEPLATE_FALLBACK_COLOR,
-                );
-                nameplated.insert(wire.id);
-            }
-        }
+        // Nameplate billboards are spawned by
+        // update_nameplate_billboards_system's ensure pass (every frame, from
+        // the live entity table) — sync no longer owns plate existence.
     }
 
     // A mount is a second actor standing exactly where its rider stands; the
@@ -425,7 +461,7 @@ pub fn sync_entities_system(
         if tracked.by_id.contains_key(&id) {
             continue;
         }
-        let rider_tf = q_xform.get(rider_e).copied().unwrap_or_default();
+        let rider_tf = queries.xform.get(rider_e).copied().unwrap_or_default();
         let bevy_e = commands
             .spawn((
                 crate::components::InGameEntity,
@@ -458,6 +494,76 @@ pub fn sync_entities_system(
     }
 }
 
+/// LSB `Flags1.InvisFlag` (bit 29): player-invisibility — a GM hiding themselves or an
+/// EFFECTFLAG_INVISIBLE status effect. The server sets it for PCs only
+/// (vendor/server/src/map/packets/char_update.cpp:316). Retail keeps such players
+/// targetable but draws nothing: no model, no nameplate (the plate gate lives in
+/// `update_nameplate_billboards_system`).
+///
+/// Unlike STATUS_TYPE::INVISIBLE mobs — where sync_entities_system hides the wire root and
+/// takes the hitbox child with it (correct there: those entities are untargetable) — an
+/// invisible PC's root must stay visible, or its transparent EntityHitbox child stops being
+/// mouse-pickable. So this hides the actor root and blanks the placeholder orb instead;
+/// targeting is untouched.
+///
+/// Runs every frame; it owns nodes nothing else writes (the actor root's Visibility is set
+/// only at spawn and here, the morph column's at spawn and here), so there is no fight. The
+/// orb material restore is owned by sync_entities_system: the same UPDATE_HP delta that
+/// clears the bit marks state dirty and resets it to the kind handle.
+pub fn apply_invis_flag_system(
+    table: Res<EntityTable>,
+    materials: Res<EntityMaterials>,
+    mut q_roots: Query<(
+        Entity,
+        &WorldEntity,
+        Option<&MorphIn>,
+        Option<&mut MeshMaterial3d<StandardMaterial>>,
+    )>,
+    mut other_vis: Query<&mut Visibility, Without<WorldEntity>>,
+    #[cfg(not(target_arch = "wasm32"))] model_roots: Query<
+        &crate::ffxi_actor_render::FfxiRenderRoot,
+    >,
+) {
+    for (_bevy_entity, ent, morph, orb_mat) in &mut q_roots {
+        let hide = table.get(ent.id).is_some_and(|r| r.invis_flag());
+
+        // The skinned model is a separate root synced by world_id; hiding it never
+        // touches the wire entity or its hitbox.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(rr) = model_roots.get(_bevy_entity) {
+            if let Ok(mut v) = other_vis.get_mut(rr.0) {
+                *v = if hide {
+                    Visibility::Hidden
+                } else {
+                    Visibility::default()
+                };
+            }
+        }
+
+        // The morph-in light column (transient child, <= MORPH_DURATION after model load):
+        // an invisible player's model arriving must not flash a pillar where retail shows
+        // nothing. Spawn value is Inherited, so both directions are owned here.
+        if let Some(orb_e) = morph.and_then(|m| m.orb) {
+            if let Ok(mut v) = other_vis.get_mut(orb_e) {
+                *v = if hide {
+                    Visibility::Hidden
+                } else {
+                    Visibility::Inherited
+                };
+            }
+        }
+
+        // The placeholder orb, present until model load removes Mesh3d. While hidden it is
+        // blanked to the shared transparent handle; sync_entities_system restores the kind
+        // handle on the dirty frame that clears the flag.
+        if let Some(mut mm) = orb_mat {
+            if hide && mm.0 != materials.invis_orb {
+                mm.0 = materials.invis_orb.clone();
+            }
+        }
+    }
+}
+
 /// Holds each mount actor on its rider. Deliberately not part of
 /// `sync_entities_system`: the rider's transform is still being written after
 /// that runs (dead reckoning), and the floor snap that follows must see both
@@ -485,6 +591,7 @@ pub fn pin_mount_actors_system(
 pub fn sync_aggro_system(
     mut commands: Commands,
     state: Res<SceneState>,
+    table: Res<EntityTable>,
     mats: Res<EntityMaterials>,
 
     self_q: Query<&Transform, With<IsSelf>>,
@@ -504,7 +611,8 @@ pub fn sync_aggro_system(
     let self_id = snap.diagnostics.sync_in;
     let Some(self_uid) = self_id else { return };
 
-    let self_char_id = snap.self_char_id.unwrap_or(0);
+    // Piece 3: claim comparison reads the table's self slot.
+    let self_char_id = table.self_id().unwrap_or(0);
 
     // Aggro state derives from the snapshot, so the map rebuild + material
     // reconciliation only run on snapshot frames; the gizmo line still draws
@@ -636,6 +744,43 @@ pub fn self_visual_yaw_system(
     t.rotation = t.rotation.slerp(target, alpha);
 }
 
+/// Attaches [`PrevRenderPos`] and [`CurrRenderPos`] to the local player entity
+/// on the frame it becomes IsSelf, seeded from its current Transform so the
+/// very first interpolation lerps between two identical points (no origin
+/// warp). Runs every frame; the query filter makes it a no-op once the
+/// components exist. Mirrors [`ensure_self_lookcomp_system`].
+pub fn ensure_self_render_pos_system(
+    q: Query<(Entity, &Transform), (With<IsSelf>, Without<CurrRenderPos>)>,
+    mut commands: Commands,
+) {
+    if cfg!(target_arch = "wasm32") {
+        return;
+    }
+    for (e, t) in &q {
+        commands
+            .entity(e)
+            .insert((PrevRenderPos(t.translation), CurrRenderPos(t.translation)));
+    }
+}
+
+/// Runs every rendered frame in `RunFixedMainLoopSystems::AfterFixedMainLoop`.
+/// Lerps the visual Transform between the last two authoritative render
+/// positions (produced by `apply_self_prediction_system` at 60Hz) using the
+/// fixed-timestep overstep fraction. This decouples the visible character
+/// motion from the fixed-tick cadence so the chase camera, which reads
+/// Transform every render frame, no longer sees stair-step Y jitter as the
+/// display frame rate races ahead of FixedUpdate.
+pub fn interpolate_self_transform_system(
+    fixed_time: Res<Time<Fixed>>,
+    mut q: Query<(&mut Transform, &PrevRenderPos, &CurrRenderPos), With<IsSelf>>,
+) {
+    let Ok((mut t, prev, curr)) = q.single_mut() else {
+        return;
+    };
+    let alpha = fixed_time.overstep_fraction();
+    t.translation = prev.0.lerp(curr.0, alpha);
+}
+
 #[derive(Resource, Default, Debug, Clone)]
 pub struct SelfAppearance {
     pub look: Option<kuluu_snapshot::EntityLook>,
@@ -705,6 +850,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn entity_sync_preserves_first_person_self_visibility() {
+        let mut app = App::new();
+        app.init_resource::<SceneState>()
+            .init_resource::<EntityTable>()
+            .init_resource::<TrackedEntities>()
+            .init_resource::<crate::combat_stance::EntityPrediction>()
+            .init_resource::<crate::combat_stance::EntityMotion>()
+            .init_resource::<crate::combat_stance::AnimationBlends>()
+            .insert_resource(EntityMesh {
+                default: Handle::default(),
+                pc: Handle::default(),
+                mob: Handle::default(),
+                pet: Handle::default(),
+                morph_orb: Handle::default(),
+            })
+            .insert_resource(dummy_materials())
+            .add_systems(Update, sync_entities_system);
+        #[cfg(not(target_arch = "wasm32"))]
+        app.init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
+            .init_resource::<crate::dat_mzb::LoadMzbInFlight>();
+        let player = app
+            .world_mut()
+            .spawn((
+                WorldEntity {
+                    id: 7,
+                    act_index: 0,
+                    kind: EntityKind::Pc,
+                },
+                IsSelf,
+                Transform::default(),
+                Visibility::Hidden,
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<TrackedEntities>()
+            .by_id
+            .insert(7, player);
+        app.world_mut()
+            .resource_mut::<EntityTable>()
+            .set_self_id(Some(7));
+        for x in [0.0, 1.0, 2.0] {
+            let mut entity = pc_entity(7, false);
+            entity.pos.x = x;
+            let mut scene = app.world_mut().resource_mut::<SceneState>();
+            scene.snapshot.entities = vec![entity];
+            scene.dirty = true;
+            app.update();
+            assert_eq!(
+                app.world().get::<Visibility>(player),
+                Some(&Visibility::Hidden)
+            );
+        }
+    }
+
+    #[test]
     fn mount_actor_id_is_reversible_and_disjoint_from_server_ids() {
         // Largest unique_no LSB can build: (4<<28) | (zone<<12) | targid.
         let max_server_id = (4u32 << 28) | (0xFFFF << 12) | 0xFFF;
@@ -743,6 +943,7 @@ mod tests {
             aggro: Handle::default(),
             mob_claimed_self: Handle::default(),
             mob_claimed_other: Handle::default(),
+            invis_orb: Handle::default(),
         }
     }
 
@@ -887,6 +1088,164 @@ mod tests {
         );
     }
 
+    fn pc_entity(id: u32, invis: bool) -> kuluu_snapshot::Entity {
+        kuluu_snapshot::Entity {
+            id,
+            act_index: 0,
+            kind: EntityKind::Pc,
+            name: None,
+            pos: WireVec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            heading: 0,
+            hp_pct: Some(100),
+            bt_target_id: 0,
+            face_target: 0,
+            name_vis: None,
+            claim_id: 0,
+            speed: 0,
+            speed_base: 0,
+            look: None,
+            animation: 0,
+            animationsub: 0,
+            mount: None,
+            status: 0,
+            char_flags: kuluu_snapshot::CharFlags {
+                invis,
+                ..Default::default()
+            },
+            monstrosity: false,
+        }
+    }
+
+    /// Flags1.InvisFlag (bit 29) hides the actor root and blanks the placeholder orb,
+    /// but must NOT hide the wire root — its transparent EntityHitbox child is what keeps
+    /// an invisible player targetable. Kind-gated: a stray bit on a mob changes nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn invis_flag_hides_actor_root_but_keeps_wire_root_pickable() {
+        let mut app = App::new();
+        app.init_resource::<EntityTable>();
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        app.add_systems(Update, apply_invis_flag_system);
+
+        let (pc_handle, invis_handle) = {
+            let mut assets = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
+            (
+                assets.add(StandardMaterial::default()),
+                assets.add(StandardMaterial::default()),
+            )
+        };
+        app.insert_resource(EntityMaterials {
+            pc: pc_handle.clone(),
+            invis_orb: invis_handle.clone(),
+            ..dummy_materials()
+        });
+
+        // Another player's wire root, shaped like scene.rs spawns it: visible root,
+        // placeholder orb material, transparent hitbox child with explicit Visible.
+        let root = app
+            .world_mut()
+            .spawn((
+                WorldEntity {
+                    id: 7,
+                    act_index: 0,
+                    kind: EntityKind::Pc,
+                },
+                Visibility::default(),
+                MeshMaterial3d(pc_handle.clone()),
+            ))
+            .id();
+        let hitbox = app
+            .world_mut()
+            .spawn((Visibility::Visible, ChildOf(root)))
+            .id();
+
+        // The skinned model is a separate root (ffxi_actor_render's shape).
+        let actor_root = app.world_mut().spawn(Visibility::default()).id();
+        app.world_mut()
+            .entity_mut(root)
+            .insert(crate::ffxi_actor_render::FfxiRenderRoot(actor_root));
+
+        // A mob carrying the same bit must be untouched (LSB sets InvisFlag for PCs only).
+        let mob_root = app
+            .world_mut()
+            .spawn((
+                WorldEntity {
+                    id: 8,
+                    act_index: 0,
+                    kind: EntityKind::Mob,
+                },
+                Visibility::default(),
+            ))
+            .id();
+        let mob_actor = app.world_mut().spawn(Visibility::default()).id();
+        app.world_mut()
+            .entity_mut(mob_root)
+            .insert(crate::ffxi_actor_render::FfxiRenderRoot(mob_actor));
+
+        {
+            let mut table = app.world_mut().resource_mut::<EntityTable>();
+            table.upsert(&pc_entity(7, true));
+            table.upsert(&kuluu_snapshot::Entity {
+                kind: EntityKind::Mob,
+                char_flags: kuluu_snapshot::CharFlags {
+                    invis: true,
+                    ..Default::default()
+                },
+                ..pc_entity(8, false)
+            });
+        }
+
+        app.update();
+
+        assert_eq!(
+            *app.world().get::<Visibility>(actor_root).unwrap(),
+            Visibility::Hidden,
+            "InvisFlag PC: the actor root must be hidden"
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(root).unwrap(),
+            Visibility::default(),
+            "InvisFlag PC: the wire root stays visible so its hitbox child remains pickable"
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(hitbox).unwrap(),
+            Visibility::Visible,
+            "the transparent hitbox must keep its explicit Visible"
+        );
+        let orb_mat = app
+            .world()
+            .get::<MeshMaterial3d<StandardMaterial>>(root)
+            .unwrap();
+        assert_eq!(
+            orb_mat.0.id(),
+            invis_handle.id(),
+            "placeholder orb is blanked to the shared transparent handle"
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(mob_actor).unwrap(),
+            Visibility::default(),
+            "a stray InvisFlag bit on a mob must not hide it (PCs only)"
+        );
+
+        // Clearing the flag restores the actor root. The orb material restore is owned by
+        // sync_entities_system's dirty frame, so it stays blanked here — that split is the
+        // design, not an oversight.
+        app.world_mut()
+            .resource_mut::<EntityTable>()
+            .upsert(&pc_entity(7, false));
+        app.update();
+
+        assert_eq!(
+            *app.world().get::<Visibility>(actor_root).unwrap(),
+            Visibility::default(),
+            "flag cleared: the actor root comes back"
+        );
+    }
+
     fn entity_with_hp(id: u32, hp_pct: Option<u8>) -> kuluu_snapshot::Entity {
         kuluu_snapshot::Entity {
             id,
@@ -902,6 +1261,7 @@ mod tests {
             hp_pct,
             bt_target_id: 0,
             face_target: 0,
+            name_vis: None,
             claim_id: 0,
             speed: 0,
             speed_base: 0,
@@ -911,6 +1271,7 @@ mod tests {
             mount: None,
             status: 0,
             char_flags: Default::default(),
+            monstrosity: false,
         }
     }
 }

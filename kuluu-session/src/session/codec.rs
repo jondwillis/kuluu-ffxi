@@ -555,6 +555,41 @@ pub(crate) fn build_subpacket_gameok(sync: u16) -> Vec<u8> {
     buf
 }
 
+// c2s 0x061 GP_CLI_COMMAND_CLISTATUS: unknown00 u8 @4 (validated 0..=1), padded
+// to a word. The server answers with SendLocalPlayerPackets — GROUP_ATTR for
+// self, CLISTATUS, ... (vendor/server/src/map/packets/c2s/0x061_clistatus.cpp).
+// Wire size is header(4) + body(4) = 8 bytes per the C++ struct
+// (0x061_clistatus.h: unknown00 u8, padding00 u8, padding01 u16), so
+// size_words must be 2 — declaring 1 makes LSB reject the packet at
+// validation before dispatch.
+pub(crate) fn build_subpacket_clistatus(sync: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::CLISTATUS,
+        2,
+        sync,
+    ));
+    // unknown00 stays 0 (validate: range 0..=1).
+    buf
+}
+
+// c2s 0x076 GP_CLI_COMMAND_GROUP_LIST_REQ: Kind u8 @4 (validated == 0).
+// Requests the full party table; the server answers with GROUP_TBL (0x0C8) +
+// GROUP_LIST (0x0DD) for every member.
+// Wire size is header(4) + body(4) = 8 bytes per the C++ struct
+// (0x076_group_list_req.h: uint8_t Kind), so size_words must be 2 — declaring
+// 1 makes LSB reject the packet at validation before dispatch.
+pub(crate) fn build_subpacket_group_list_req(sync: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::GROUP_LIST_REQ,
+        2,
+        sync,
+    ));
+    // Kind = 0 (the only valid value per LSB's validator).
+    buf
+}
+
 pub(crate) fn build_subpacket_zone_transition(sync: u16) -> Vec<u8> {
     let mut buf = vec![0u8; 8];
     buf[0..4].copy_from_slice(&build_subpacket_header(

@@ -845,7 +845,10 @@ mod tests {
 
     /// Decodes the real zone-230 KEYITEM_OBTAINED entry to the `{KeyItem:0}`
     /// marker (pre-fix the inline tag leaked as `{Auto:128}3\u{FFFD}`);
-    /// self-skips without game files.
+    /// self-skips without game files. The entry's physical index drifts with
+    /// client patch level (SE inserts dialog entries over time), so locate it
+    /// by content in a window around the May-2023 pin instead of asserting
+    /// the exact index.
     #[test]
     fn real_zone230_keyitem_obtained_decodes_marker() {
         let Some(root) = crate::archive::open_test_install() else {
@@ -857,13 +860,20 @@ mod tests {
         let loc = root.resolve(file_id).expect("string DAT resolves");
         let bytes = std::fs::read(loc.path_under(&root)).expect("string DAT readable");
         let dat = StringDat::parse(&bytes).expect("zone 230 dialog table parses");
-        let text = dat
-            .text(ZONE230_KEYITEM_OBTAINED_MAY2023)
-            .expect("entry present");
-        assert!(
-            text.contains("Obtained key item:"),
-            "expected the KEYITEM_OBTAINED entry, got {text:?}"
-        );
+        let pin = ZONE230_KEYITEM_OBTAINED_MAY2023;
+        let lo = pin.saturating_sub(256);
+        let hi = pin + 512;
+        let text = (lo..hi.min(dat.len()))
+            .filter_map(|i| dat.text(i))
+            .find(|t| t.contains("Obtained key item:"));
+        let Some(text) = text else {
+            panic!(
+                "no 'Obtained key item:' entry in {lo}..{hi} of a {}-entry table; \
+                 install patch skew beyond the window (pin {pin} holds {:?})",
+                dat.len(),
+                dat.text(pin)
+            );
+        };
         assert!(
             text.contains(&format!("{{{MARKER_KEY_ITEM}:0}}")),
             "expected a {{KeyItem:0}} marker, got {text:?}"

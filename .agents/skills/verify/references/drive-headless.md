@@ -33,7 +33,9 @@ spawning its own — that's the GUI path, see `drive-gui.md`.
 ## 2. Raw stdio (`play --headless`)
 
 Zero extra deps; JSON commands on stdin, typed JSON events on stdout, tracing
-on stderr. **No reactor** — send explicit commands only.
+on stderr. This path uses the reactor's explicit agent profile, so goal commands
+and fishing automation behave like MCP; it has no supervisor/reconnect layer or
+event-driven MCP waits.
 
 ```bash
 D=$(mktemp -d); mkfifo $D/in; (exec 3>$D/in; sleep 900 & wait) &   # hold write end open

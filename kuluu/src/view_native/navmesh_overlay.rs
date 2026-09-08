@@ -137,7 +137,16 @@ fn snap_entities_to_mzb_floor_system(
     // cutoff sat right where the server reference Y and the MZB floor disagree,
     // so sub-unit per-frame Y wobble flipped the entity in and out of the cutoff
     // and the body bobbed every frame.
-    for (_we, mut t, _is_self) in q.iter_mut() {
+    //
+    // EXCEPTION: the IsSelf entity's Y is owned by
+    // `apply_self_prediction_system` (walker) + `interpolate_self_transform_system`
+    // (fixed-tick interpolator) + the stair-plane cache. Snapping self here
+    // yanks the mesh back to the raw tread every render frame, undoing every
+    // smooth-slope render we compute. NPCs still need it.
+    for (_we, mut t, is_self) in q.iter_mut() {
+        if is_self {
+            continue;
+        }
         if let Some(ground) = collision_geom
             .ground_nearest(Vec2::new(t.translation.x, t.translation.z), t.translation.y)
         {

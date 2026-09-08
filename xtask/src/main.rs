@@ -29,6 +29,8 @@
 //! Std-only by design — see Cargo.toml; HTTP and the installer run by shelling
 //! out to `curl` and `wine`.
 
+mod dlss;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -44,6 +46,13 @@ const SEARCH_DEPTH: usize = 6;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("dlss") => match dlss::run(&args[1..], &workspace_root()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("game") => match cmd_game(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -83,6 +92,8 @@ fn usage() {
          --download  download SE's official client installer and launch it\n\
          --region    us (default) or eu, for --download\n\
          --yes       skip the --download confirmation prompt\n\
+         \n\
+         DLSS: cargo xtask dlss <check|build>\n\
          \n\
          Activate the versioned git hooks (.githooks/) for this clone.\n\
          --check     verify the pre-push gate is active; non-zero exit if not"

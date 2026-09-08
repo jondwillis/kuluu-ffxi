@@ -1,6 +1,6 @@
 [submodule "server"]
 	path = vendor/server
-	url = git@github.com:LandSandBoat/server.git
+	url = https://github.com/LandSandBoat/server.git
 	branch = base
 [submodule "vendor/POLUtils"]
 	path = vendor/POLUtils
@@ -26,3 +26,7 @@
 [submodule "research/XIClient"]
 	path = research/XIClient
 	url = https://gitlab.com/Aenge/XIClient
+[submodule "vendor/DLSS"]
+	path = vendor/DLSS
+	url = https://github.com/NVIDIA/DLSS.git
+	update = none

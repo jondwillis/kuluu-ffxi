@@ -403,6 +403,10 @@ pub struct MmbRenderState {
     pub back_face_culling: bool,
 }
 
+// research/XIClient Rendering/ZoneRenderer.cpp:198-200, 1269-1275 — blended terrain
+// uses the legacy D3D8 integer Z-bias layer 8 so it stays in front of its coplanar base.
+pub const TRANSPARENT_Z_BIAS_LEVEL: u8 = 8;
+
 impl MmbRenderState {
     pub fn from_blending(blending: u16) -> Self {
         Self {
@@ -411,11 +415,11 @@ impl MmbRenderState {
         }
     }
 
-    /// ZoneMeshSection.kt:120-123 — blended zone meshes render at
-    /// `ZBiasLevel.High` (1), opaque at `Normal` (0).
+    /// XIClient ZoneRenderer.cpp:198-200, 1269-1275 — blended zone meshes use
+    /// `TransparentZBias` (8), opaque meshes use `OpaqueZBias` (0).
     pub fn z_bias_level(&self) -> u8 {
         if self.blend_enabled {
-            1
+            TRANSPARENT_Z_BIAS_LEVEL
         } else {
             0
         }
@@ -858,7 +862,7 @@ mod tests {
         let blended = MmbRenderState::from_blending(0x8000);
         assert!(blended.blend_enabled);
         assert!(blended.back_face_culling);
-        assert_eq!(blended.z_bias_level(), 1);
+        assert_eq!(blended.z_bias_level(), TRANSPARENT_Z_BIAS_LEVEL);
         assert!(!blended.depth_write());
 
         let no_cull = MmbRenderState::from_blending(0x2000);

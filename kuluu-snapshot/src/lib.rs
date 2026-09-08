@@ -2,6 +2,20 @@
 
 use serde::{Deserialize, Serialize};
 
+// v24: Entity.monstrosity and CharFlags.{invis, job_master_display}.
+// v23: SceneSnapshot.death_menu_offer — the durable s2c 0x0F9 Raise/Reraise or
+// Tractor offer shown while dead. (Upstream's "v20"; renumbered on merge because our
+// side had already spent 20-22 on zone_generation / untargetable / name_vis.)
+// v22: Entity.name_vis is now Option<u8> — None until a General-block update carries
+// it. The byte rides UPDATE_HP (entity_update.cpp:357/:408), not the Position block,
+// so a POS-only 0x00E must not clobber the last known value with its zero-filled byte.
+// v21: Entity.char_flags.untargetable — flags1 TargetOffFlag, the server's
+// targetability authority (LSB m_flags FLAG_UNTARGETABLE for NPC/MOB, the explicit
+// "Untargetable player" bit for PCs). namevis no longer gates targeting.
+// v20: SceneSnapshot.zone_generation — a counter bumped on every zone change so the
+// party frame's content key differs after a transition even when the roster is
+// byte-identical to the previous zone (the fast-path race where the 0x0DD/0x0DF refill
+// lands in the same poll as the ZoneChanged clear).
 // v19: the cutscene channel — ViewerEvent::{CutsceneStarted,CutsceneCue,CutsceneEnded} plus
 // CutsceneCue/CutsceneActor. The event VM's staging opcodes (actor motion, screen fade,
 // camera lock, event-hide, mount) had no way across the boundary at all before this.
@@ -35,7 +49,7 @@ use serde::{Deserialize, Serialize};
 // v5: InventoryItem.charges_remaining + next_use_vana_ts (item recast/charges).
 // v4: SceneSnapshot.delivery_box (dedicated delivery screen) + ViewerCommand::DeliveryBox
 // (postcard frames are not self-describing, so any shape change bumps this).
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Longest countdown `SceneSnapshot::status_icon_expiries` can carry. The
 /// producer rejects anything beyond it as a corrupt 0x063 timestamp, and the HUD
@@ -235,6 +249,29 @@ pub struct CharFlags {
     pub allegiance: u8,
     pub new_character: bool,
     pub mentor: bool,
+
+    /// `Flags4.JobMasterFlag` (bit 6 of the u8 at body offset 0x2F): LSB's
+    /// job-master display toggle — `SUPERIOR_LEVEL == 5 && m_jobMasterDisplay`
+    /// (vendor/server/src/map/packets/char_update.cpp:441), written on every
+    /// non-despawn 0x0D outside all SendFlg blocks. Drives the same nameplate
+    /// star as `lfg_master`, which retail keys off `Flags3.LfgMasterFlag` — a
+    /// flag LSB hardcodes to 0 (char_update.cpp:339).
+    #[serde(default)]
+    pub job_master_display: bool,
+
+    /// `Flags1.InvisFlag` (bit 29): the server's player-invisibility bit — set
+    /// for PCs only, when a GM hides themselves or an EFFECTFLAG_INVISIBLE
+    /// status effect is active. Retail keeps such players targetable but draws
+    /// nothing: no model, no nameplate.
+    #[serde(default)]
+    pub invis: bool,
+
+    /// `Flags1.TargetOffFlag` (bit 19): the server's untargetable bit — LSB
+    /// `m_flags & FLAG_UNTARGETABLE` for NPC/MOB, char_update's "Untargetable
+    /// player" field for PCs. The targetability authority; see
+    /// [`Entity::is_targetable`] and ffxi-proto's decode citation.
+    #[serde(default)]
+    pub untargetable: bool,
 }
 
 /// A mount being ridden. Retail draws the two arms from different model families
@@ -314,10 +351,28 @@ pub struct Entity {
 
     #[serde(default)]
     pub char_flags: CharFlags,
+
+    /// `GP_SERV_CHAR_PC.MonstrosityFlags` (body 0x3A) — the character is a
+    /// monstrosity (Feretory). Written in the Model block only; drives the retail
+    /// Monstrosity nameplate marker. See ffxi-proto's `PosHead::monstrosity`.
+    #[serde(default)]
+    pub monstrosity: bool,
+
+    /// entity_update byte 0x2B (LSB `namevis`; PosHead `flags3 >> 24`), written
+    /// under UPDATE_HP — vendor/server/src/map/packets/entity_update.cpp:357/:408.
+    /// `None` until the first General-block update carries it; treated as visible,
+    /// matching the server's VIS_NONE default (baseentity.cpp:45). LSB NAMEVIS
+    /// (vendor/server/src/map/entities/baseentity.h): 0x01 icon, 0x08 hide-name,
+    /// 0x80 ghost-phase — the other bits in the data are render-phase flags on real
+    /// NPCs (Survival Guides carry 0x20), so only 0x08 suppresses anything.
+    #[serde(default)]
+    pub name_vis: Option<u8>,
 }
 
-// LSB STATUS_TYPE. vendor/server/src/map/entities/baseentity.h
-mod status_type {
+// LSB STATUS_TYPE. vendor/server/src/map/entities/baseentity.h.
+// Public so the renderer can hide models on INVISIBLE without re-declaring
+// the byte (single source of truth).
+pub mod status_type {
     pub const DISAPPEAR: u8 = 2;
     pub const INVISIBLE: u8 = 3;
     pub const STATUS_4: u8 = 4;
@@ -329,6 +384,34 @@ mod status_type {
 impl Entity {
     pub fn is_dead(&self) -> bool {
         self.hp_pct == Some(0)
+    }
+
+    /// Retail-hidden helper NPC: VIS_HIDE_NAME set — mannequins, "blank"
+    /// cutscene actors. vendor/server/src/map/entities/baseentity.cpp:159
+    /// `IsNameHidden() = namevis & FLAG_HIDE_NAME` (0x08); the NAMEVIS enum
+    /// defines only 0x01/0x08/0x80, so the other bits are render-phase flags,
+    /// not name suppression. Suppresses the nameplate only — never targeting.
+    pub fn name_hidden(&self) -> bool {
+        self.name_vis.is_some_and(|v| v & 0x08 != 0)
+    }
+
+    /// LSB STATUS_TYPE::INVISIBLE: the server hides the model entirely —
+    /// worms between dive and surface (vendor/server/src/map/ai/controllers/
+    /// mob_controller.cpp). The vendored source only sets it on mobs; players
+    /// phase via namevis 0x80 instead. Hides model + nameplate; targeting is
+    /// already gated by [`Entity::status_selectable`].
+    pub fn is_invisible(&self) -> bool {
+        self.status == status_type::INVISIBLE
+    }
+
+    /// LSB `Flags1.InvisFlag` (bit 29): player-invisibility — a GM hiding
+    /// themselves or an EFFECTFLAG_INVISIBLE status effect. The server sets it
+    /// for PCs only (vendor/server/src/map/packets/char_update.cpp:316), so the
+    /// kind gate is part of the fact, not a render preference. Unlike
+    /// [`Entity::is_invisible`] (STATUS_TYPE on mobs) this never gates targeting:
+    /// retail keeps invisible players targetable and draws nothing instead.
+    pub fn invis_flag(&self) -> bool {
+        matches!(self.kind, EntityKind::Pc) && self.char_flags.invis
     }
 
     // Blacklist (not whitelist) so an undecoded byte fails open, staying targetable.
@@ -353,8 +436,14 @@ impl Entity {
     /// Selectable by click / `<t>`. Dead players stay selectable so a healer can
     /// target them to Raise; dead mobs/NPCs do not. `Other` entities are not
     /// selectable except doors, whose Talk interaction is the retail door flow.
+    /// Targetability authority is the server's untargetable bit (flags1
+    /// TargetOffFlag = LSB m_flags FLAG_UNTARGETABLE for NPC/MOB) — namevis
+    /// never gates targeting upstream.
     pub fn is_targetable(&self) -> bool {
         if !self.status_selectable() {
+            return false;
+        }
+        if self.char_flags.untargetable {
             return false;
         }
         if matches!(self.kind, EntityKind::Other) && !self.is_door() {
@@ -457,7 +546,7 @@ pub struct ChatLine {
     pub spans: Vec<ChatSpan>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartyMember {
     pub id: u32,
     pub act_index: u16,
@@ -539,6 +628,12 @@ pub struct SceneSnapshot {
     pub self_pos: Position,
     pub entities: Vec<Entity>,
     pub party: Vec<PartyMember>,
+
+    /// Monotonically increasing counter, bumped on every zone change. Forces
+    /// the party-frame content key to differ after a zone transition even when
+    /// the party data is byte-identical.
+    #[serde(default)]
+    pub zone_generation: u64,
 
     pub chat: Vec<ChatLine>,
 
@@ -714,6 +809,18 @@ pub struct SceneSnapshot {
     /// touching `SessionState` (see `ffxi_proto::map::tracking`).
     #[serde(default)]
     pub widescan: WidescanList,
+
+    /// Server-offered alternative to returning to the home point while dead.
+    /// `None` is the ordinary home-point-only menu.
+    #[serde(default)]
+    pub death_menu_offer: Option<DeathMenuOffer>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeathMenuOffer {
+    Raise,
+    Tractor,
 }
 
 /// Mirror of `kuluu`'s wide-scan model across the wire boundary. Entries
@@ -1504,6 +1611,15 @@ pub enum ViewerCommand {
     DeliveryBox {
         op: DeliveryOp,
     },
+
+    /// Capture the native client's primary window to PNG via Bevy render-target
+    /// readback — no focus or screen-recording permission needed. GUI-side only:
+    /// the relay routes it into `DebugControl`, never the session (which treats
+    /// `AgentCommand::Screenshot` as a no-op). `None` leaves default naming
+    /// (`screenshot-N.png`) to the GUI side.
+    Screenshot {
+        path: Option<String>,
+    },
 }
 
 /// Viewer-issued delivery box operations. A thinner vocabulary than the
@@ -1635,8 +1751,11 @@ mod tests {
                 mount: None,
                 status: 0,
                 char_flags: CharFlags::default(),
+                monstrosity: false,
+                name_vis: None,
             }],
             party: vec![],
+            zone_generation: 7,
             chat: vec![ChatLine {
                 channel: ChatChannel::Say,
                 sender: "Other".into(),
@@ -1707,6 +1826,7 @@ mod tests {
             check: None,
             check_message: None,
             widescan: WidescanList::default(),
+            death_menu_offer: None,
         }
     }
 
@@ -1874,6 +1994,24 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_extensions_survive_the_postcard_relay() {
+        let mut snapshot = sample_snapshot();
+        snapshot.zone_generation = 128;
+        snapshot.entities[0].char_flags.untargetable = true;
+        snapshot.entities[0].name_vis = Some(0x08);
+        snapshot.death_menu_offer = Some(DeathMenuOffer::Tractor);
+        let bytes = postcard::to_allocvec(&Frame::Snapshot(Box::new(snapshot))).unwrap();
+        let Frame::Snapshot(decoded) = postcard::from_bytes(&bytes).unwrap() else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(decoded.zone_generation, 128);
+        assert!(decoded.entities[0].char_flags.untargetable);
+        assert_eq!(decoded.entities[0].name_vis, Some(0x08));
+        assert_eq!(decoded.chat[0].text, "hi");
+        assert_eq!(decoded.death_menu_offer, Some(DeathMenuOffer::Tractor));
     }
 
     #[test]
@@ -2069,6 +2207,7 @@ mod tests {
             "self_pos",
             "entities",
             "party",
+            "zone_generation",
             "chat",
             "chat_base_seq",
             "diagnostics",
@@ -2111,12 +2250,13 @@ mod tests {
             "check",
             "check_message",
             "widescan",
+            "death_menu_offer",
         ];
         want.sort();
         assert_eq!(got, want, "SceneSnapshot fields changed: additive-only, update this pin deliberately and rebuild relay consumers together");
     }
 
-    const SNAPSHOT_DEFAULT_POSTCARD_HEX: &str = "00000000000000000000000000000000191900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    const SNAPSHOT_DEFAULT_POSTCARD_HEX: &str = "000000000000000000000000000000001919000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
     /// Postcard is positional, not self-describing: field ORDER and TYPES are
     /// the wire format. Any reorder/retype (and any append) changes these

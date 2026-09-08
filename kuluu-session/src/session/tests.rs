@@ -38,6 +38,36 @@ fn sub_packet_events(opcode: u16, body: &[u8]) -> Vec<AgentEvent> {
     out
 }
 
+#[test]
+fn death_menu_packet_emits_the_server_offer() {
+    use ffxi_proto::decode::DeathMenuOffer;
+
+    const DEATH_MENU_BODY_SIZE: usize = 8;
+    const DEATH_MENU_TRACTOR_TYPE: u16 = 2;
+    let mut body = [0u8; DEATH_MENU_BODY_SIZE];
+    body[0..4].copy_from_slice(&0x0102_0304u32.to_le_bytes());
+    body[4..6].copy_from_slice(&0x0506u16.to_le_bytes());
+    body[6..8].copy_from_slice(&DEATH_MENU_TRACTOR_TYPE.to_le_bytes());
+
+    let events = sub_packet_events(ffxi_proto::map::s2c::DEATH_MENU, &body);
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::DeathMenuUpdated {
+            offer: Some(DeathMenuOffer::Tractor),
+        }]
+    ));
+}
+
+#[test]
+fn death_menu_packet_rejects_a_truncated_body() {
+    let events = sub_packet_events(ffxi_proto::map::s2c::DEATH_MENU, &[0; 7]);
+    assert!(events.is_empty());
+    assert!(
+        !first_decode_err(ffxi_proto::map::s2c::DEATH_MENU),
+        "the decode failure must have passed through the warning dedup gate"
+    );
+}
+
 /// `ZoneChanged` clears `SessionState::current_weather`, so the LOGIN arm
 /// must emit the 0x00A zone-in weather *after* it. Reversed, a zoning
 /// character renders the default sky until the next 0x057 — which LSB only
@@ -159,6 +189,41 @@ fn myroom_login_keeps_forced_origin_seed() {
         spawn_seed_pos(v(0.0, 0.0, 0.0), Some(town_side), false),
         town_side,
         "outside MYROOM the origin repair still applies"
+    );
+}
+
+/// A far (>snap) self-position carrier snaps us to the server in steady state, but
+/// during the post-zone-in settle window (`refuse_snap`) it is an out-of-order /
+/// duplicate position from around the transition and must keep our local seed instead
+/// of yanking us into another zone's coordinate space ("same spot, different zone").
+#[test]
+fn far_carrier_snaps_in_steady_state_but_not_during_settle() {
+    let local = v(-15.0, -132.8, -4.2); // where we actually stand (Bastok)
+    let stale = v(579.5, -305.1, -1.9); // an old-zone coordinate (>10 yalms away)
+
+    assert!(
+        matches!(
+            reconcile_self_pos(local, stale, false),
+            SelfPosReconcile::Snap
+        ),
+        "steady state: a far carrier snaps to the server"
+    );
+    assert!(
+        matches!(
+            reconcile_self_pos(local, stale, true),
+            SelfPosReconcile::KeepLocal
+        ),
+        "settle window: a far (out-of-order) carrier keeps our local seed"
+    );
+
+    // A close carrier is unaffected by the settle gate — it still keeps/rubber-bands.
+    let near = v(-14.0, -132.8, -4.2); // ~1 yalm away
+    assert!(
+        matches!(
+            reconcile_self_pos(local, near, true),
+            SelfPosReconcile::KeepLocal
+        ),
+        "close carrier keeps local regardless of settle window"
     );
 }
 
@@ -399,6 +464,152 @@ fn equipped_models_are_npcs_and_furniture_is_other() {
     );
 }
 
+/// A 0x0E CHAR_NPC body crafted exactly as LSB writes it —
+/// vendor/server/src/map/packets/entity_update.cpp `updateWith`, sub.data base = LSB 0x04:
+/// `[26]` hpp (LSB 0x1E), `[27]` animation (LSB 0x1F), `[28]` status (LSB 0x20, written on
+/// EVERY update regardless of mask), `[29..33)` m_flags u32 (LSB 0x21, UPDATE_HP only),
+/// `[39]` namevis (LSB 0x2B, UPDATE_HP only).
+fn worm_body(send_flag: u8, status: u8, m_flags: u32, namevis: u8) -> Vec<u8> {
+    // 48 bytes: PosHead::SIZE_WITH_BT_TARGET (44) plus the look-size word at
+    // sub.data[0x2C..0x2E] (LSB 0x30, entity_update.cpp `ref<uint16>(0x30)`),
+    // which classify_char_npc needs to see Some(0) = standard mob mesh.
+    let mut b = vec![0u8; 48];
+    b[0..4].copy_from_slice(&1000u32.to_le_bytes()); // unique_no
+    b[4..6].copy_from_slice(&DYNAMIC_TARGID.to_le_bytes()); // act_index -> Mob classify
+    b[6] = send_flag;
+    b[8..12].copy_from_slice(&1.5f32.to_le_bytes()); // x
+    b[12..16].copy_from_slice(&(-2.0f32).to_le_bytes()); // z
+    b[16..20].copy_from_slice(&0.0f32.to_le_bytes()); // y
+    b[24] = 5; // speed
+    b[26] = 100; // hpp
+    b[28] = status;
+    b[29..33].copy_from_slice(&m_flags.to_le_bytes());
+    b[39] = namevis;
+    b[0x2C] = 0; // look size: standard mob mesh (classify -> Mob)
+    b[0x2D] = 0;
+    b
+}
+
+fn feed_worm(s: &mut crate::state::SessionState, body: &[u8]) {
+    for ev in sub_packet_events(ffxi_proto::map::s2c::CHAR_NPC, body) {
+        if matches!(ev, AgentEvent::EntityUpserted { .. }) {
+            s.apply_event(&ev);
+        }
+    }
+}
+
+fn worm_entity(s: &crate::state::SessionState) -> &crate::state::Entity {
+    s.entities
+        .iter()
+        .find(|e| e.id == 1000)
+        .expect("worm present")
+}
+
+/// The worm's full dive/surface cycle as LSB drives it (mob_controller.cpp:1176-1290):
+/// spawn above ground -> dive (name hidden + untargetable; status stays NORMAL for the first
+/// 3 s) -> move underground (status INVISIBLE piggybacks on POS ticks) -> surface (one UPDATE_HP
+/// packet carries status=UPDATE(1) with the flag cleared; name stays hidden ~2 more seconds).
+/// The surfaced worm must be targetable again — this is the "stale targeting info" regression.
+#[test]
+fn worm_dive_surface_lifecycle_stays_targetable_after_emerging() {
+    const FLAG_UNTARGETABLE: u32 = 0x800; // ENTITYFLAGS, baseentity.h
+
+    let mut s = crate::state::SessionState::default();
+
+    // 1. Spawn above ground (UPDATE_ALL_MOB): NORMAL, targetable.
+    feed_worm(&mut s, &worm_body(0x0F, 0, 0, 0));
+    assert_eq!(worm_entity(&s).status, 0);
+    assert!(
+        crate::wire_translate::entity_to_wire(worm_entity(&s)).is_targetable(),
+        "spawned worm must be targetable"
+    );
+
+    // 2. Dive: UPDATE_HP carries name hidden + untargetable; status is still NORMAL for 3 s.
+    feed_worm(&mut s, &worm_body(0x04, 0, FLAG_UNTARGETABLE, 0x08));
+    assert!(
+        !crate::wire_translate::entity_to_wire(worm_entity(&s)).is_targetable(),
+        "diving worm must be untargetable"
+    );
+
+    // 3. Moving underground: the POS-only tick now carries status INVISIBLE(3); its flag bytes
+    // are zero-filled and must NOT clobber the preserved untargetable/namevis.
+    feed_worm(&mut s, &worm_body(0x01, 3, 0, 0));
+    assert_eq!(
+        worm_entity(&s).status,
+        3,
+        "POS-only tick must refresh status"
+    );
+    assert!(
+        !crate::wire_translate::entity_to_wire(worm_entity(&s)).is_targetable(),
+        "underground worm must stay untargetable"
+    );
+
+    // 4. Surface: one UPDATE_HP packet sets status=UPDATE(1) and clears the flag; name is still
+    // hidden for ~2 more seconds (HideName(false) carries no updatemask of its own).
+    feed_worm(&mut s, &worm_body(0x04, 1, 0, 0x08));
+    assert_eq!(worm_entity(&s).status, 1);
+    assert!(
+        crate::wire_translate::entity_to_wire(worm_entity(&s)).is_targetable(),
+        "surfaced worm must be targetable again (stale-info regression)"
+    );
+
+    // 5. Surfaced and roaming: POS-only ticks keep status=UPDATE(1).
+    feed_worm(&mut s, &worm_body(0x01, 1, 0, 0));
+    assert!(
+        crate::wire_translate::entity_to_wire(worm_entity(&s)).is_targetable(),
+        "surfaced worm must stay targetable while roaming"
+    );
+}
+
+/// End-to-end HP chain for the delta bridge: when a mob takes damage, LSB sets UPDATE_HP on
+/// its next 0x00E (battleentity.cpp `addHP` -> updatemask |= UPDATE_HP; entity_update.cpp
+/// writes HPP at 0x1E under that bit and broadcasts to every char who spawned the entity).
+/// The fold must mark the entity pending so the O(changed) delta carries the new hpp — this
+/// is what drives the live nameplate HP bar. Regression: "HP bars never move".
+#[test]
+fn hp_update_packet_marks_entity_pending_with_new_hpp() {
+    let mut s = crate::state::SessionState::default();
+
+    // 1. Spawn (UPDATE_ALL_MOB): full block, hpp=100.
+    feed_worm(&mut s, &worm_body(0x0F, 0, 0, 0));
+    assert_eq!(worm_entity(&s).hp_pct, Some(100), "spawn carries hpp");
+    let spawn_pos = worm_entity(&s).pos;
+    let (upserts, _) = s.take_pending_entities();
+    assert!(
+        upserts.contains(&1000),
+        "spawn must be pending for the delta bridge"
+    );
+
+    // 2. Damage tick: UPDATE_HP only (send_flag=0x04) with hpp=42; the position bytes are
+    //    stale and must not move the entity.
+    let mut body = worm_body(0x04, 0, 0, 0);
+    body[26] = 42; // HPP (LSB 0x1E), written under UPDATE_HP
+    feed_worm(&mut s, &body);
+    assert_eq!(
+        worm_entity(&s).hp_pct,
+        Some(42),
+        "UPDATE_HP tick must apply the new hpp"
+    );
+    assert_eq!(
+        worm_entity(&s).pos,
+        spawn_pos,
+        "HP-only tick must not move the entity"
+    );
+    let (upserts, _) = s.take_pending_entities();
+    assert!(
+        upserts.contains(&1000),
+        "the HP change must reach the delta bridge as a pending upsert"
+    );
+
+    // 3. A subsequent POS-only tick zero-fills HPP; the merge must preserve 42.
+    feed_worm(&mut s, &worm_body(0x01, 0, 0, 0));
+    assert_eq!(
+        worm_entity(&s).hp_pct,
+        Some(42),
+        "POS-only tick must not clobber hpp"
+    );
+}
+
 fn v(x: f32, y: f32, z: f32) -> Vec3 {
     Vec3 { x, y, z }
 }
@@ -591,8 +802,20 @@ fn should_emit_pos_bypasses_rate_limit_on_heading_change() {
 
 #[test]
 fn flood_drain_waits_for_self_pos_seed() {
-    assert!(!should_break_flood(false));
-    assert!(should_break_flood(true));
+    // Pre-GAMEOK drain (break_on_idle=false): keep reading until the seed lands.
+    assert!(
+        !should_break_flood(false, false),
+        "unseeded pre-GAMEOK drain must wait"
+    );
+    assert!(
+        should_break_flood(false, true),
+        "seeded pre-GAMEOK drain may break on idle"
+    );
+    // Quiescence drains (break_on_idle=true): stop on idle regardless of seed.
+    assert!(
+        should_break_flood(true, false),
+        "quiescence drain breaks on idle unconditionally"
+    );
 }
 
 #[test]
@@ -623,7 +846,7 @@ fn reconcile_self_pos_keep_local_under_2_yalms() {
     let local = v(0.0, 0.0, 0.0);
     let server = v(1.0, 1.0, 0.5);
     assert_eq!(
-        reconcile_self_pos(local, server),
+        reconcile_self_pos(local, server, false),
         SelfPosReconcile::KeepLocal,
     );
 }
@@ -632,7 +855,7 @@ fn reconcile_self_pos_keep_local_under_2_yalms() {
 fn reconcile_self_pos_rubberband_between_2_and_10() {
     let local = v(0.0, 0.0, 0.0);
     let server = v(3.0, 4.0, 0.0);
-    match reconcile_self_pos(local, server) {
+    match reconcile_self_pos(local, server, false) {
         SelfPosReconcile::Rubberband { target } => {
             assert_eq!(target, server);
         }
@@ -644,7 +867,11 @@ fn reconcile_self_pos_rubberband_between_2_and_10() {
 fn reconcile_self_pos_snap_above_10_yalms() {
     let local = v(0.0, 0.0, 0.0);
     let server = v(12.0, 5.0, 0.0);
-    assert_eq!(reconcile_self_pos(local, server), SelfPosReconcile::Snap,);
+    // Steady state (refuse_snap=false): a far carrier snaps to the server.
+    assert_eq!(
+        reconcile_self_pos(local, server, false),
+        SelfPosReconcile::Snap,
+    );
 }
 
 #[test]
@@ -652,13 +879,13 @@ fn reconcile_self_pos_boundaries() {
     let local = v(0.0, 0.0, 0.0);
     let just_inside = v(2.0, 0.0, 0.0);
     assert_eq!(
-        reconcile_self_pos(local, just_inside),
+        reconcile_self_pos(local, just_inside, false),
         SelfPosReconcile::KeepLocal,
     );
 
     let edge = v(10.0, 0.0, 0.0);
     assert!(matches!(
-        reconcile_self_pos(local, edge),
+        reconcile_self_pos(local, edge, false),
         SelfPosReconcile::Rubberband { .. },
     ));
 }

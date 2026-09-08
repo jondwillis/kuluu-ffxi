@@ -16,6 +16,7 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         self_pos,
         entities: s.entities.iter().map(entity_to_wire).collect(),
         party: s.party.iter().map(party_to_wire).collect(),
+        zone_generation: s.zone_generation,
         chat: s.chat.iter().map(chat_to_wire).collect(),
         chat_base_seq: s.chat_dropped,
         diagnostics: diagnostics_to_wire(&s.diagnostics),
@@ -113,6 +114,11 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         }),
 
         widescan: widescan_to_wire(&s.widescan),
+
+        death_menu_offer: s.death_menu_offer.map(|offer| match offer {
+            ffxi_proto::decode::DeathMenuOffer::Raise => wire::DeathMenuOffer::Raise,
+            ffxi_proto::decode::DeathMenuOffer::Tractor => wire::DeathMenuOffer::Tractor,
+        }),
     }
 }
 
@@ -628,6 +634,7 @@ pub fn entity_to_wire(e: &Entity) -> wire::Entity {
         hp_pct: e.hp_pct,
         bt_target_id: e.bt_target_id,
         face_target: e.face_target,
+        name_vis: e.name_vis,
         claim_id: e.claim_id,
         speed: e.speed,
         speed_base: e.speed_base,
@@ -640,6 +647,9 @@ pub fn entity_to_wire(e: &Entity) -> wire::Entity {
         ),
         status: e.status,
         char_flags: e.char_flags.map(char_flags_to_wire).unwrap_or_default(),
+        // Preserved across non-Model updates in state.rs, so this is always the
+        // last Model-block value; default to not-a-monstrosity before it arrives.
+        monstrosity: e.monstrosity.unwrap_or(false),
     }
 }
 
@@ -665,6 +675,9 @@ pub fn char_flags_to_wire(f: ffxi_proto::decode::CharFlags) -> wire::CharFlags {
         allegiance: f.allegiance,
         new_character: f.new_character,
         mentor: f.mentor,
+        job_master_display: f.job_master_display,
+        invis: f.invis,
+        untargetable: f.untargetable,
     }
 }
 
@@ -900,6 +913,7 @@ mod tests {
                 hp_pct: Some(100),
                 bt_target_id: 0,
                 face_target: 0,
+                name_vis: None,
                 claim_id: 0,
                 speed: 0,
                 speed_base: 0,
@@ -908,6 +922,8 @@ mod tests {
                 char_flags: None,
                 status: 0,
                 mount_id: None,
+                monstrosity: None,
+                job_master_display: None,
             },
             pos_present: true,
         });

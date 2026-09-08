@@ -9,7 +9,7 @@ use bevy::ui_widgets::{Activate, ValueChange};
 
 use std::sync::Arc;
 
-use kuluu::launcher_store::{self, EnvOverride, Settings};
+use crate::launcher_store::{self, EnvOverride, Settings};
 
 use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
 use super::{LauncherState, ServerInfo};
@@ -364,7 +364,7 @@ fn persist_and_reload(
 
     let root = ffxi_dat::DatRoot::from_env_or_default()
         .map_err(|e| format!("DAT path rejected: {e}. Settings saved but assets not reloaded."))?;
-    kuluu::overlay_store::apply_saved(&root);
+    crate::overlay_store::apply_saved(&root);
     let root_path = root.root().display().to_string();
     let app_count = root.app_summary().len();
     let arc = Arc::new(root);

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 
-use kuluu::launcher_store;
+use crate::launcher_store;
 
 use super::{LauncherState, ServerInfo, ServerSelectForm};
 

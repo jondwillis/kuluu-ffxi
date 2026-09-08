@@ -8,8 +8,8 @@ use bevy::ui_widgets::{Activate, ValueChange};
 
 use std::path::Path;
 
+use crate::launcher_store::{self, EnvOverride};
 use ffxi_dat::install_detect;
-use kuluu::launcher_store::{self, EnvOverride};
 
 use super::common::{hint, panel_node, row, screen_root, title};
 use super::{DatGateDone, LauncherState};

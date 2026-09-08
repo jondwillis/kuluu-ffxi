@@ -3,6 +3,12 @@
 #
 #   launch.sh <logfile> [extra kuluu play args...]
 #
+# Runs the RELEASE binary by default. The dev profile is Cranelift + no opt and
+# renders zone-in at well under 1fps with multi-second frame spikes, which makes
+# anything short-lived (a fade, a cast bar, a hit flash) unsamplable and turns
+# every drive into a wall-clock sink. Override with FFXI_VERIFY_PROFILE=debug
+# when the change under test needs debug_assertions or a dev-only feature.
+#
 # Passes --unfocused --mute by default (drop --mute by exporting FFXI_VERIFY_SOUND=1
 # when the change under test is audio). Then restores whatever app was frontmost:
 # macOS activates a newly launched app at the process level, which winit's
@@ -25,10 +31,20 @@ shift || true
 flags=(--unfocused)
 [ "${FFXI_VERIFY_SOUND:-0}" = "1" ] || flags+=(--mute)
 
+profile="${FFXI_VERIFY_PROFILE:-release}"
+bin="target/$profile/kuluu"
+if [ ! -x "$bin" ]; then
+  cargo_flag=$([ "$profile" = release ] && echo " --release")
+  echo "launch.sh: $bin missing — build it with:" >&2
+  echo "  cargo build -p kuluu --features native-window$cargo_flag" >&2
+  exit 1
+fi
+echo "launch.sh: using $bin" >&2
+
 prev=$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' 2>/dev/null || true)
 
 rm -f "$log"
-target/debug/kuluu --agent-listen auto play "${flags[@]}" "$@" \
+"$bin" --agent-listen auto play "${flags[@]}" "$@" \
   "$FFXI_VERIFY_USER" "$FFXI_VERIFY_PASS" "$FFXI_VERIFY_CHAR" > "$log" 2>&1 &
 client_pid=$!
 

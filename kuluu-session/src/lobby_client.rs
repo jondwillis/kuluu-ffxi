@@ -15,6 +15,16 @@ const IXFF_HEADER_SIZE: usize = 28;
 const DATA_CMD_CHAR_LIST: u8 = 0xA1;
 const DATA_CMD_HANDOFF: u8 = 0xA2;
 
+/// Capability marker + word in bytes [2..10) of the 0xA1 char-list response.
+/// vendor/server/src/login/data_session.cpp zero-inits `uList[500]` and only
+/// writes [0], [1] and entries at 16*(i+1), so vanilla LSB always sends zeros
+/// here; a patched build stamps KULUU_CAP_KEY plus the caps it honors.
+const CAP_KEY_OFFSET: usize = 2;
+const CAP_WORD_OFFSET: usize = 6;
+
+const KULUU_CAP_KEY: u32 = 867309;
+pub const CAP_SKIP_INTRO_CS: u32 = 1 << 0;
+
 const VIEW_CMD_REGISTER: u32 = 0x00;
 const VIEW_CMD_SELECT: u32 = 0x07;
 
@@ -107,11 +117,23 @@ pub struct LobbyHandle {
 
     chars: Vec<CharSlot>,
     session_hash: [u8; 16],
+    server_caps: u32,
 }
 
 impl LobbyHandle {
     pub fn chars(&self) -> &[CharSlot] {
         &self.chars
+    }
+
+    /// Caps word echoed by this lobby connection's char-list reply. Zero until
+    /// (and unless) the server stamps KULUU_CAP_KEY — never carried across
+    /// connections, so a server switch can't serve stale caps.
+    pub fn server_caps(&self) -> u32 {
+        self.server_caps
+    }
+
+    pub fn supports_skip_intro_cs(&self) -> bool {
+        self.server_caps & CAP_SKIP_INTRO_CS != 0
     }
 
     pub async fn create_character(
@@ -127,12 +149,19 @@ impl LobbyHandle {
             .await
             .context("0x22 name check response")?;
 
+        let skip_intro_cs = spec.skip_intro_cs & u8::from(self.supports_skip_intro_cs());
+        if spec.skip_intro_cs != 0 && !self.supports_skip_intro_cs() {
+            tracing::warn!(
+                "server did not advertise CAP_SKIP_INTRO_CS; register sent without the skip flag"
+            );
+        }
         let register_char = build_view_register_char(
             spec.race,
             spec.job,
             spec.nation,
             spec.size,
             spec.face,
+            skip_intro_cs,
             &self.session_hash,
         );
         self.view.write_all(&register_char).await?;
@@ -143,6 +172,7 @@ impl LobbyHandle {
             nation = spec.nation,
             size = spec.size,
             face = spec.face,
+            skip_intro_cs = skip_intro_cs != 0,
             "lobby handle: 0x21 register sent"
         );
         read_create_reply(&mut self.view, "register character")
@@ -154,9 +184,10 @@ impl LobbyHandle {
         self.data.flush().await?;
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = read_data_charlist(&mut self.data)
+        let (_, caps) = read_data_charlist(&mut self.data)
             .await
             .context("reading 0xA1 char-list refresh after create")?;
+        self.server_caps = caps;
         let slots = parse_view_chr_info2(&mut self.view)
             .await
             .context("reading chr_info2 refresh after create")?;
@@ -188,9 +219,10 @@ impl LobbyHandle {
         self.data.write_all(&req_a1).await?;
         self.data.flush().await?;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = read_data_charlist(&mut self.data)
+        let (_, caps) = read_data_charlist(&mut self.data)
             .await
             .context("reading 0xA1 char-list refresh after delete")?;
+        self.server_caps = caps;
         let slots = parse_view_chr_info2(&mut self.view)
             .await
             .context("reading chr_info2 refresh after delete")?;
@@ -320,7 +352,8 @@ impl LobbyClient {
             "lobby: 0xA1 char-list request sent"
         );
 
-        let charlist = lobby_io("0xA1 char-list (data)", read_data_charlist(&mut data)).await?;
+        let (charlist, server_caps) =
+            lobby_io("0xA1 char-list (data)", read_data_charlist(&mut data)).await?;
         tracing::info!(
             count = charlist.characters.len(),
             "lobby: 0xA1 char-list received"
@@ -338,6 +371,7 @@ impl LobbyClient {
             data,
             chars,
             session_hash: auth.session_hash,
+            server_caps,
         })
     }
 
@@ -403,6 +437,7 @@ impl LobbyClient {
             spec.nation,
             spec.size,
             spec.face,
+            spec.skip_intro_cs,
             &auth.session_hash,
         );
         view.write_all(&register_char).await?;
@@ -413,6 +448,7 @@ impl LobbyClient {
             nation = spec.nation,
             size = spec.size,
             face = spec.face,
+            skip_intro_cs = spec.skip_intro_cs != 0,
             "create_character: 0x21 register sent"
         );
         read_create_reply(&mut view, "register character")
@@ -514,6 +550,11 @@ pub struct CharCreateSpec {
     pub size: u8,
 
     pub face: u8,
+
+    /// 1 = skip the opening (new-character) cutscene. Carried in spare byte 58
+    /// of the C2L 0x21 register packet; retail leaves that byte zero, which
+    /// the server reads as "play it".
+    pub skip_intro_cs: u8,
 }
 
 fn build_view_name_check(name: &str, session_hash: &[u8; 16]) -> Vec<u8> {
@@ -536,6 +577,7 @@ fn build_view_register_char(
     nation: u8,
     size: u8,
     face: u8,
+    skip_intro_cs: u8,
     session_hash: &[u8; 16],
 ) -> Vec<u8> {
     let packet_size = 0x40u32;
@@ -548,6 +590,9 @@ fn build_view_register_char(
     buf[50] = job;
     buf[54] = nation;
     buf[57] = size;
+    // Byte 58 is unused by retail and ignored by the server's field reads —
+    // our kuluu<->LSB extension: 1 = skip the intro cutscene.
+    buf[58] = skip_intro_cs;
     buf[60] = face;
     buf
 }
@@ -599,7 +644,7 @@ fn login_error_name(code: u16) -> &'static str {
     }
 }
 
-async fn read_data_charlist(stream: &mut TcpStream) -> Result<CharList> {
+async fn read_data_charlist(stream: &mut TcpStream) -> Result<(CharList, u32)> {
     let mut buf = vec![0u8; DATA_CHARLIST_SIZE];
     stream
         .read_exact(&mut buf)
@@ -620,7 +665,20 @@ async fn read_data_charlist(stream: &mut TcpStream) -> Result<CharList> {
         };
         chars.push(entry);
     }
-    Ok(CharList { characters: chars })
+    Ok((CharList { characters: chars }, parse_server_caps(&buf)))
+}
+
+fn parse_server_caps(buf: &[u8]) -> u32 {
+    let key = u32::from_le_bytes(buf[CAP_KEY_OFFSET..CAP_WORD_OFFSET].try_into().unwrap());
+    if key == KULUU_CAP_KEY {
+        u32::from_le_bytes(
+            buf[CAP_WORD_OFFSET..CAP_WORD_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        )
+    } else {
+        0
+    }
 }
 
 /// Offsets into the lpkt_chr_info2 body (the packet past its 4-byte size
@@ -889,6 +947,30 @@ mod tests {
         buf[0] = 0x03;
         buf[1] = count;
         buf
+    }
+
+    #[test]
+    fn vanilla_charlist_advertises_no_caps() {
+        // vendor/server/src/login/data_session.cpp zero-inits uList and only
+        // writes [0], [1] and the 16-byte entries — [2..10) stay zero.
+        assert_eq!(parse_server_caps(&charlist_packet(2)), 0);
+    }
+
+    #[test]
+    fn patched_charlist_echoes_key_and_caps() {
+        let mut buf = charlist_packet(2);
+        buf[CAP_KEY_OFFSET..CAP_WORD_OFFSET].copy_from_slice(&KULUU_CAP_KEY.to_le_bytes());
+        let caps = CAP_SKIP_INTRO_CS | (1 << 3);
+        buf[CAP_WORD_OFFSET..CAP_WORD_OFFSET + 4].copy_from_slice(&caps.to_le_bytes());
+        assert_eq!(parse_server_caps(&buf), caps);
+    }
+
+    #[test]
+    fn foreign_key_in_cap_slot_is_not_our_echo() {
+        let mut buf = charlist_packet(0);
+        buf[CAP_KEY_OFFSET..CAP_WORD_OFFSET].copy_from_slice(&999u32.to_le_bytes());
+        buf[CAP_WORD_OFFSET..CAP_WORD_OFFSET + 4].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(parse_server_caps(&buf), 0);
     }
 
     fn next_login_packet(char_id: u32, name: &str) -> Vec<u8> {

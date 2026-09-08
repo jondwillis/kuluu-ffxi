@@ -16,8 +16,8 @@ use super::{
     ServerSelectForm,
 };
 
-use kuluu::launcher_store::{self, keyring_account_key, SavedAccount, KEYRING_SERVICE};
-use kuluu::secret_store::SecretStore;
+use crate::launcher_store::{self, keyring_account_key, SavedAccount, KEYRING_SERVICE};
+use crate::secret_store::SecretStore;
 
 fn save_on_success(server_name: &str, username: &str, password: &str, remember: bool) {
     let mut store = launcher_store::load();
@@ -447,6 +447,7 @@ pub(super) fn spawn_char_create_task(
         nation: form.nation,
         size: form.size,
         face: form.face,
+        skip_intro_cs: u8::from(form.skip_intro_cs),
     };
 
     let (Some(handle), Some(auth)) = (handle, auth) else {

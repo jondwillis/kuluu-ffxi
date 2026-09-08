@@ -51,3 +51,12 @@ futures-util = { version = "0.3", optional = true }
 mysql_async.workspace = true
 tempfile = "3"
 tracing-subscriber.workspace = true
+
+[[example]]
+# Live relay probe for verification sessions (.agents/skills/verify): attaches
+# to a running client's WebSocket relay (`--relay-listen`) and either streams
+# the frame feed as compact per-entity update lines (snapshot diffs — the
+# cross-platform replacement for the unix-socket agent-probe) or sends one
+# viewer command (chat / screenshot).
+name = "relay-probe"
+required-features = ["relay"]

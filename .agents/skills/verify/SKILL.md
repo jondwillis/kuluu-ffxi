@@ -40,11 +40,10 @@ an event stream.
 
 Two constraints shape everything:
 
-- **The reactor is not wired in `play --headless`** (main.rs spawns the bare
-  session). Anything reactor-driven — zoneline auto-trigger, follow, engage,
-  pathing — only runs under `kuluu-mcp` standalone (which spawns
-  supervisor→reactor→session) or in the GUI. Raw stdio can still send explicit
-  `AgentCommand`s like `request_zone_change`.
+- **`play --headless` uses the agent reactor profile.** Reactor-driven follow,
+  engage, pathing, fishing automation, and explicit commands such as
+  `request_zone_change` are available over raw stdio. Unlike `kuluu-mcp`, this
+  path still has no supervisor/reconnect or event-driven MCP waits.
 - **Verification runs on the human's desktop while they're using it, so drive
   focus-free.** Session commands, real-input movement (`debug_drive`), grounding
   readback (`debug_heights`), and screen capture (`scripts/capture.sh`) all work

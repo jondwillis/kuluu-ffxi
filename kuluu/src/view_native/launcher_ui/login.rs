@@ -3,23 +3,25 @@ use bevy::feathers::controls::{button_bundle, checkbox_bundle, ButtonBundleProps
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
+use bevy::input_focus::tab_navigation::TabIndex;
+use bevy::input_focus::{FocusCause, InputFocus};
 use bevy::prelude::*;
-use bevy::ui::{Checked, Overflow, ScrollPosition};
+use bevy::ui::{Checked, ComputedNode, Overflow, ScrollPosition, UiGlobalTransform};
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use kuluu::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
-use kuluu::secret_store::SecretStore;
+use crate::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
+use crate::secret_store::SecretStore;
 
 use super::common::{
     chip_group, hint, panel_node, row, screen_root, spawn_breadcrumb,
-    spawn_settings_close_titlebar, Crumb, ScrollRegion,
+    spawn_settings_close_titlebar, Crumb, DefaultFocusTarget, ScrollRegion,
 };
 use super::server_version_check::{ServerVersionStatus, VersionViolation};
 use super::{
     Credentials, LauncherState, LoginErrorMsg, LoginErrorReturn, LoginField, LoginForm, ServerInfo,
     ServerSelectForm,
 };
-use crate::view_native::widgets::text_field::{text_field, TextFieldSubmitted};
+use crate::view_native::widgets::text_field::{text_field, TextField, TextFieldSubmitted};
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
 #[derive(Component)]
@@ -139,6 +141,7 @@ fn build_login_ui(
                             (),
                             Spawn((Text::new("Log in"), ThemedText)),
                         ))
+                        .insert(DefaultFocusTarget)
                         .observe(
                             |_ev: On<Activate>,
                              form: Res<LoginForm>,
@@ -450,15 +453,135 @@ pub(super) fn despawn_login_ui(mut commands: Commands, q: Query<Entity, With<Log
 pub(super) fn keyboard_input_system(
     mut events: MessageReader<KeyboardInput>,
     mut form: ResMut<LoginForm>,
+    version: Res<ServerVersionStatus>,
+    mut next: ResMut<NextState<LauncherState>>,
 ) {
     for ev in events.read() {
         if ev.state != ButtonState::Pressed {
             continue;
         }
-        if matches!(ev.logical_key, Key::Escape) {
-            form.user.clear();
-            form.pass.clear();
+        match ev.logical_key {
+            Key::Escape => {
+                form.user.clear();
+                form.pass.clear();
+            }
+            // Real keyboard Enter: submits whenever BOTH fields are filled,
+            // regardless of which widget (if any) holds UI focus. The
+            // per-field TextFieldSubmitted path only fires for a FOCUSED field
+            // and stays silent when the other side is still empty - that was
+            // the "pressing enter does nothing" dead end.
+            Key::Enter
+                if version.violation != VersionViolation::BelowMinimum
+                    && !form.user.is_empty()
+                    && !form.pass.is_empty() =>
+            {
+                next.set(LauncherState::AuthInFlight);
+                return;
+            }
+            _ => {}
         }
+    }
+}
+
+/// Initial keyboard focus for this screen: land on the `DefaultFocusTarget`
+/// widget once per spawned instance. The blue outline then starts on "Log in"
+/// instead of nowhere, so a bare Enter activates it right away (in addition to
+/// the global both-fields-filled handler). Tab can move away freely - we never
+/// steal focus back until a new screen instance appears (rebuild or re-entry).
+pub(super) fn focus_default_target_system(
+    mut input_focus: ResMut<InputFocus>,
+    mut last: Local<Option<Entity>>,
+    q: Query<Entity, With<DefaultFocusTarget>>,
+) {
+    let Some(target) = q.iter().next() else {
+        *last = None;
+        return;
+    };
+    if *last == Some(target) {
+        return;
+    }
+    input_focus.set(target, FocusCause::Navigated);
+    *last = Some(target);
+}
+
+/// Arrow-key navigation for the login form: move the blue focus outline between
+/// tabbable widgets (saved-account chips, fields, remember checkbox, buttons)
+/// in visual order, wrapping at the edges. While a text field holds focus,
+/// Left/Right stay with the caret; Up/Down still navigate.
+pub(super) fn arrow_nav_system(
+    mut events: MessageReader<KeyboardInput>,
+    mut input_focus: ResMut<InputFocus>,
+    q_tabs: Query<(Entity, &ComputedNode, &UiGlobalTransform), With<TabIndex>>,
+    q_fields: Query<(), With<TextField>>,
+) {
+    for ev in events.read() {
+        if ev.state != ButtonState::Pressed {
+            continue;
+        }
+        let dir = match ev.logical_key {
+            Key::ArrowUp => Vec2::new(0.0, -1.0),
+            Key::ArrowDown => Vec2::new(0.0, 1.0),
+            Key::ArrowLeft => Vec2::new(-1.0, 0.0),
+            Key::ArrowRight => Vec2::new(1.0, 0.0),
+            _ => continue,
+        };
+
+        let cur = input_focus.get();
+        // Left/Right inside a focused field moves the caret, not the selection.
+        if dir.x != 0.0 && cur.is_some_and(|e| q_fields.contains(e)) {
+            continue;
+        }
+
+        // Center estimate per tabbable widget (uniform convention across all
+        // nodes; only relative positions matter for scoring).
+        let cands: Vec<(Vec2, Entity)> = q_tabs
+            .iter()
+            .map(|(e, cn, gt)| (gt.affine().translation + cn.size * 0.5, e))
+            .collect();
+        if cands.is_empty() {
+            continue;
+        }
+
+        let cur_pos = match cur.and_then(|c| cands.iter().find(|(_, e)| *e == c)) {
+            Some(c) => c.0,
+            // Focus is on the window/panel (nothing selected): anchor to the
+            // group's center so any arrow lands on a sensible first element.
+            None => cands.iter().map(|(p, _)| *p).sum::<Vec2>() / cands.len() as f32,
+        };
+
+        const CROSS_W: f32 = 2.5; // perpendicular misalignment is heavily penalized
+        let mut best_forward: Option<(f32, Entity)> = None;
+        let mut best_wrap: Option<(f32, f32, Entity)> = None; // (along, cross)
+        for (p, e) in &cands {
+            if cur.is_some_and(|ce| *e == ce) {
+                continue;
+            }
+            let d = *p - cur_pos;
+            let along = d.dot(dir);
+            let cross = (d.x * dir.y - d.y * dir.x).abs();
+            if along > 0.25 {
+                // Ahead of us: nearest in direction wins.
+                let score = along + cross * CROSS_W;
+                if best_forward.is_none_or(|(s, _)| score < s) {
+                    best_forward = Some((score, *e));
+                }
+            } else if along < 0.0 {
+                // Behind us: wrap candidate. Farthest behind on this axis wins
+                // (top edge + Up jumps to the far row), misaligned loses.
+                if best_wrap.is_none_or(|(a, c, _)| (along, cross) < (a, c)) {
+                    best_wrap = Some((along, cross, *e));
+                }
+            }
+        }
+
+        let target = match best_forward
+            .map(|(_, e)| e)
+            .or(best_wrap.map(|(_, _, e)| e))
+        {
+            Some(e) => e,
+            None => continue,
+        };
+        input_focus.set(target, FocusCause::Navigated);
     }
 }
 
