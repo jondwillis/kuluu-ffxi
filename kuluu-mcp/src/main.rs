@@ -8,9 +8,9 @@ use rmcp::{
     handler::server::wrapper::Parameters,
     model::{
         CallToolResult, ContentBlock, ListResourcesResult, PaginatedRequestParams, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
-        ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-        UnsubscribeRequestParams,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+        ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
+        SubscribeRequestParams, UnsubscribeRequestParams,
     },
     service::{serve_server, Peer, RequestContext, RoleServer},
     tool, tool_handler, tool_router,
@@ -667,7 +667,7 @@ impl ServerHandler for FfxiServer {
         &self,
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         let uri = request.uri.as_str();
         let started = std::time::Instant::now();
         let state = self.state.read().await;
@@ -676,9 +676,7 @@ impl ServerHandler for FfxiServer {
             .map_err(|e| McpError::internal_error(e, None))?;
         let elapsed_us = started.elapsed().as_micros() as u64;
         tracing::debug!(uri, elapsed_us, "mcp.resource_read");
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(
-            body, uri,
-        )]))
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(body, uri)]).into())
     }
 }
 
@@ -1177,6 +1175,49 @@ mod tests {
     use kuluu_session::state::{
         ActionKind, Entity, EntityKind, PartyMember, Position, Stage, Vec3,
     };
+
+    #[tokio::test]
+    async fn legacy_mcp_resource_wire_contract() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        const BUFFER_BYTES: usize = 16 * 1024;
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+        tokio::time::timeout(DEADLINE, async {
+            let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+            let state = SessionState::default();
+            let expected_party = serde_json::to_string_pretty(&state.party).unwrap();
+            let server = FfxiServer::new(
+                cmd_tx,
+                Arc::new(RwLock::new(state)),
+                GoalStore::new(std::env::temp_dir().join("kuluu-mcp-wire-unused-goal.json")),
+            );
+            let (client_io, server_io) = tokio::io::duplex(BUFFER_BYTES);
+            let task = tokio::spawn(async move {
+                serve_server(server, server_io).await.unwrap().waiting().await.unwrap();
+            });
+            let (reader, mut writer) = tokio::io::split(client_io);
+            let mut reader = BufReader::new(reader).lines();
+            writer.write_all(
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"wire-test\",\"version\":\"1\"}}}\n"
+            .as_bytes()).await.unwrap();
+            let init: serde_json::Value = serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+            writer.write_all(concat!(
+                "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{\"uri\":\"party://members\"}}\n"
+            ).as_bytes()).await.unwrap();
+            let response: serde_json::Value = serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(response, serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": { "contents": [{
+                    "uri": "party://members", "mimeType": "text/plain", "text": expected_party
+                }] }
+            }));
+            drop(writer);
+            drop(reader);
+            task.await.unwrap();
+        }).await.expect("MCP wire exchange timed out");
+    }
 
     #[test]
     fn cmd_kind_label_for_action_surface_tools() {
