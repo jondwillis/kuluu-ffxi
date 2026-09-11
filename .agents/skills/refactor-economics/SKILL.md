@@ -1,6 +1,6 @@
 ---
 name: refactor-economics
-description: Rank a refactor by what actually pays before doing it, and execute mechanical migrations safely behind a validated oracle. Use when a file is called too big, when asked to split/reorganize/modularize code, to migrate/rename/upgrade across many files, or to execute a handed-over refactoring plan — especially across a protocol or wire-format boundary. Refusing work is a first-class deliverable here.
+description: Ranks a proposed refactor by what actually pays before any code moves, and executes mechanical migrations behind a validated oracle rather than asserting behaviour was preserved. Use when a file is called too big or hard to work in, for file/module splits, codemods, dependency upgrades, cross-codebase renames, or executing a refactoring plan someone hands you — especially across a protocol, wire-format, or other boundary where a silent behaviour change surfaces hours later. Refusing unprofitable work is a first-class deliverable.
 user-invocable: true
 ---
 
