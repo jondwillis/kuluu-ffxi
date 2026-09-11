@@ -291,6 +291,14 @@ fn run_pol_updater(root: &Path) -> Result<(), String> {
             pol.display()
         ));
     }
+    if !cfg!(target_os = "windows") {
+        require_tool("wine").map_err(|_| {
+            "wine not found — PlayOnline Viewer is a Windows executable. Install Wine and \
+             re-run, or launch PlayOnlineViewer/pol.exe yourself."
+                .to_string()
+        })?;
+    }
+    register_install(game_dir, &root)?;
     println!(
         "Launching {}.\nIn the viewer choose FINAL FANTASY XI -> Check Files / Update and let it \
          finish (no account is needed for the update step), then quit.",
@@ -299,11 +307,6 @@ fn run_pol_updater(root: &Path) -> Result<(), String> {
     let mut cmd = if cfg!(target_os = "windows") {
         Command::new(&pol)
     } else {
-        require_tool("wine").map_err(|_| {
-            "wine not found — PlayOnline Viewer is a Windows executable. Install Wine and \
-             re-run, or launch PlayOnlineViewer/pol.exe yourself."
-                .to_string()
-        })?;
         let mut c = Command::new("wine");
         c.arg(&pol);
         c
@@ -322,6 +325,89 @@ fn run_pol_updater(root: &Path) -> Result<(), String> {
          Identify the patched build with:\n  \
          cargo run -p ffxi-dat --example dat-client-profile -- \"{}\"",
         root.display()
+    );
+    Ok(())
+}
+
+/// The registry state SE's installer leaves behind and PlayOnline Viewer
+/// refuses to run without (its ID=1000 error is the missing viewer entry).
+/// Mirrors the `Switch_Horizon.bat` HorizonXI ships for the same purpose:
+/// `InstallFolder` values 0001 (FFXI), 0002 (TetraMaster), 1000 (the viewer),
+/// `Interface\0001 = "0"`, plus COM registration of the three FFXi DLLs.
+const POL_INSTALL_FOLDER_KEY: &str = "HKLM\\SOFTWARE\\PlayOnlineUS\\InstallFolder";
+const POL_INTERFACE_KEY: &str = "HKLM\\SOFTWARE\\PlayOnlineUS\\Interface";
+const POL_REGSVR_DLLS: [&str; 3] = ["FFXi.dll", "FFXiMain.dll", "FFXiVersions.dll"];
+
+fn windows_command(program: &str) -> Command {
+    if cfg!(target_os = "windows") {
+        Command::new(program)
+    } else {
+        let mut c = Command::new("wine");
+        c.arg(program);
+        c
+    }
+}
+
+/// A host path as the Windows side sees it (`winepath -w` under Wine).
+fn windows_path(p: &Path) -> Result<String, String> {
+    if cfg!(target_os = "windows") {
+        return Ok(p.display().to_string());
+    }
+    let out = Command::new("winepath")
+        .arg("-w")
+        .arg(p)
+        .output()
+        .map_err(|e| format!("running winepath: {e}"))?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || s.is_empty() {
+        return Err(format!("winepath -w failed for {}", p.display()));
+    }
+    Ok(s)
+}
+
+fn quiet(cmd: &mut Command) -> Result<(), String> {
+    let status = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("{cmd:?}: {e}"))?;
+    if !status.success() {
+        return Err(format!("{cmd:?} exited with {status}"));
+    }
+    Ok(())
+}
+
+fn register_install(se_dir: &Path, ffxi_root: &Path) -> Result<(), String> {
+    let entries = [
+        (POL_INSTALL_FOLDER_KEY, "0001", windows_path(ffxi_root)?),
+        (
+            POL_INSTALL_FOLDER_KEY,
+            "0002",
+            windows_path(&se_dir.join("TetraMaster"))?,
+        ),
+        (
+            POL_INSTALL_FOLDER_KEY,
+            "1000",
+            windows_path(&se_dir.join("PlayOnlineViewer"))?,
+        ),
+        (POL_INTERFACE_KEY, "0001", "0".to_string()),
+    ];
+    for (key, name, value) in &entries {
+        quiet(windows_command("reg").args(["add", key, "/v", name, "/d", value, "/f"]))?;
+    }
+    for dll in POL_REGSVR_DLLS {
+        let path = ffxi_root.join(dll);
+        if path.is_file() {
+            quiet(
+                windows_command("regsvr32")
+                    .arg("/s")
+                    .arg(windows_path(&path)?),
+            )?;
+        }
+    }
+    println!(
+        "Registered {} under {POL_INSTALL_FOLDER_KEY}",
+        show(ffxi_root)
     );
     Ok(())
 }
