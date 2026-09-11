@@ -53,8 +53,12 @@ mkdir -p "$SYNC_DIR"
 echo ">> dropping $(basename "$SRC") ($(du -h "$SRC" | cut -f1)) into $SYNC_DIR/kuluu"
 # Write to a temp name then rename, so Syncthing never publishes a half-copied
 # binary (it would happily sync a truncated file mid-cp).
-cp -f "$SRC" "$SYNC_DIR/.kuluu.tmp"
-mv -f "$SYNC_DIR/.kuluu.tmp" "$SYNC_DIR/kuluu"
+# The temp name carries this PID so two concurrent runs (parallel sessions in
+# one checkout) cannot steal each other's file between cp and mv.
+TMP="$SYNC_DIR/.kuluu.tmp.$$"
+cp -f "$SRC" "$TMP"
+chmod 755 "$TMP"
+mv -f "$TMP" "$SYNC_DIR/kuluu"
 
 if [[ $do_wait == 0 ]]; then
     echo ">> queued for Syncthing. (skipped delivery wait)"; exit 0
