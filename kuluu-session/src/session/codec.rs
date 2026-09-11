@@ -371,6 +371,22 @@ pub fn build_subpacket_item_move(
     buf
 }
 
+// GP_CLI_COMMAND_ITEM_DUMP, vendor/server/src/map/packets/c2s/0x028_item_dump.h:
+// ItemNum u32 @4, Category u8 @8, ItemIndex u8 @9; 12 bytes because
+// packet_system.cpp packetSizeRange rounds sizeof up to four.
+pub fn build_subpacket_item_dump(sync: u16, quantity: u32, container: u8, index: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 12];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::ITEM_DUMP,
+        3,
+        sync,
+    ));
+    buf[4..8].copy_from_slice(&quantity.to_le_bytes());
+    buf[8] = container;
+    buf[9] = index;
+    buf
+}
+
 // GP_CLI_COMMAND_PBX, vendor/server/src/map/packets/c2s/0x04d_pbx.h: Command u8
 // @4, BoxNo i8 @5, PostWorkNo i8 @6, ItemWorkNo i8 @7, ItemStacks i32 @8,
 // Result/ResParam1-3 i8 @12-15 (the validator requires all four zero c2s),

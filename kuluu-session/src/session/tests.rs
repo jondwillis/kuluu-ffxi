@@ -3469,6 +3469,35 @@ fn item_move_packet_layout_matches_server_struct() {
     assert_eq!(buf[11], 9, "explicit ItemIndex2 = stack merge slot");
 }
 
+#[test]
+fn item_dump_packet_layout_matches_server_struct() {
+    // GP_CLI_COMMAND_ITEM_DUMP (vendor/server/src/map/packets/c2s/0x028_item_dump.h):
+    // ItemNum u32, Category u8, ItemIndex u8; packet_system.cpp packetSizeRange
+    // accepts exactly sizeof rounded up to four = 12 bytes.
+    let buf = build_subpacket_item_dump(0xBEEF, 12, 0, 7);
+    assert_eq!(buf.len(), 12, "header (4) + ItemNum (4) + 2 bytes + pad");
+    let hdr_word = u16::from_le_bytes([buf[0], buf[1]]);
+    assert_eq!(
+        hdr_word & framing::SUBPACKET_OPCODE_MASK,
+        ffxi_proto::map::c2s::ITEM_DUMP,
+        "opcode ITEM_DUMP"
+    );
+    assert_eq!(
+        (hdr_word >> framing::SUBPACKET_SIZE_WORDS_SHIFT) & framing::SUBPACKET_SIZE_WORDS_MASK,
+        3,
+        "size_words = 3 (12 bytes)"
+    );
+    assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0xBEEF, "sync");
+    assert_eq!(
+        u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        12,
+        "ItemNum = quantity"
+    );
+    assert_eq!(buf[8], 0, "Category = LOC_INVENTORY");
+    assert_eq!(buf[9], 7, "ItemIndex = slot");
+    assert_eq!(&buf[10..12], &[0, 0], "padding");
+}
+
 /// Pins every 0x04D encoding to LSB's PacketValidator rules
 /// (vendor/server/src/map/packets/c2s/0x04d_pbx.cpp validate): a field the
 /// validator mustEquals is hard-coded, unused numerics are -1, and

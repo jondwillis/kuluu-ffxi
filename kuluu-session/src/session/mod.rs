@@ -3629,6 +3629,24 @@ async fn keepalive_loop(
                             });
                         }
                     }
+                    Some(AgentCommand::DropItem {
+                        container,
+                        index,
+                        quantity,
+                    }) => {
+                        let payload =
+                            build_subpacket_item_dump(sub_seq, quantity, container, index);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "item_dump send failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("item_dump send: {e}"),
+                            });
+                        }
+                    }
                     Some(AgentCommand::UseItem {
                         container,
                         slot,

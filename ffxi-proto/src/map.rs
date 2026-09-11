@@ -67,6 +67,12 @@ pub mod c2s {
     // free slot (0x029_item_move.cpp process).
     pub const ITEM_MOVE: u16 = 0x029;
 
+    // GP_CLI_COMMAND_ITEM_DUMP, vendor/server/src/map/packets/c2s/0x028_item_dump.h.
+    // Throws ItemNum of Category/ItemIndex away (retail "Drop"); inventory drops
+    // land in the recycle bin when the server enables it (0x028_item_dump.cpp
+    // process).
+    pub const ITEM_DUMP: u16 = 0x028;
+
     // GP_CLI_COMMAND_PBX, vendor/server/src/map/packets/c2s/0x04d_pbx.h.
     // Delivery box sub-protocol; see [`crate::map::pbx`] for the Command bytes.
     pub const PBX: u16 = 0x04D;

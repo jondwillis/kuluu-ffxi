@@ -2119,6 +2119,7 @@ fn _agentcommand_is_additive_only(x: &AgentCommand) {
         AgentCommand::DeliveryBox { .. } => (),
         AgentCommand::DeliveryTake { .. } => (),
         AgentCommand::MoveItem { .. } => (),
+        AgentCommand::DropItem { .. } => (),
         AgentCommand::BankWhenFull { .. } => (),
         AgentCommand::ShopBuy { .. } => (),
         AgentCommand::ShopSellReq { .. } => (),

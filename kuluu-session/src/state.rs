@@ -3354,6 +3354,16 @@ pub enum AgentCommand {
         to_slot: Option<u8>,
     },
 
+    /// c2s 0x028 ITEM_DUMP: throw `quantity` of the item at `container`/`index`
+    /// away (retail's Items > Drop). Gil, locked slots and filled storage slips
+    /// are refused server-side
+    /// (vendor/server/src/map/packets/c2s/0x028_item_dump.cpp process).
+    DropItem {
+        container: u8,
+        index: u8,
+        quantity: u32,
+    },
+
     BankWhenFull {
         threshold: u8,
         mog_house_zoneline: u32,
