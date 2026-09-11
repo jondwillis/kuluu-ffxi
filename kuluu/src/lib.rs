@@ -4,6 +4,7 @@ pub mod ffxi_client;
 pub mod launcher;
 pub mod launcher_store;
 pub mod secret_store;
+pub mod steam_shortcut;
 
 #[cfg(feature = "native-window")]
 pub mod audio_store;

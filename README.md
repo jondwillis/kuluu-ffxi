@@ -271,6 +271,30 @@ cargo run -p ffxi-dat --example dat-client-profile -- "/path/to/FINAL FANTASY XI
 When you measure a new build, add its row to `KNOWN_CLIENTS` and cite that
 row's name (not a date) next to any offset or constant verified on it.
 
+### Steam Deck
+
+The Deck runs the plain x86_64 Linux binary. Launch it from Game Mode, not
+Desktop mode: Steam keeps its desktop controller layout active for anything
+started outside Game Mode, so the d-pad and left stick arrive as arrow keys
+on top of the gamepad. `kuluu steam-shortcut` registers the binary as a
+non-Steam shortcut named Kuluu (with `play` as its launch options) so Game
+Mode can start it under its own controller layout. Run it once from Desktop
+mode with Steam fully quit; rerun it after moving the binary.
+
+```bash
+./kuluu steam-shortcut install                  # add or update the Kuluu shortcut (Steam must be closed)
+./kuluu steam-shortcut install --layout deck.vdf  # also install a Steam Input layout for it
+./kuluu steam-shortcut install --live           # hand the path to a running Steam instead (no rename/layout)
+./kuluu steam-shortcut status                   # which Steam install and account, and whether the entry matches
+./kuluu steam-shortcut remove
+```
+
+Without a layout file, pick the Gamepad template in the shortcut's
+controller settings the first time you launch. In-game the pad follows
+retail's Pattern E: A confirm, B cancel, X main menu, Y active window, LB
+autorun, L3 heal/lock, R3 first person, d-pad targets in the field and moves
+the cursor in menus, left stick moves, right stick is the camera.
+
 ## AI-generated code
 
 Kuluu is, to a first approximation, **written by AI coding agents.** The large

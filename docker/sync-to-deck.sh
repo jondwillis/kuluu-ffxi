@@ -85,7 +85,7 @@ for _ in range(60):
         c = get(f"/rest/db/completion?folder={folder}&device={dev}")
         worst = min(worst, c.get("completion", 0))
     if worst >= 100.0:
-        print(">> delivered to Deck (100%). Re-run ./kuluu on the Deck.", flush=True); sys.exit(0)
+        print(">> delivered to Deck (100%). Re-run ./kuluu on the Deck (first time: ./kuluu steam-shortcut install with Steam quit, then launch Kuluu from Game Mode).", flush=True); sys.exit(0)
     print(f"   {worst:5.1f}% ...", flush=True); time.sleep(3)
 print(">> still syncing after 3 min — it'll finish in the background.", flush=True)
 PY

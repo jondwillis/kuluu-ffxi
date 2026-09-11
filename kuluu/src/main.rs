@@ -58,6 +58,12 @@ enum Command {
         action: kuluu::ffxi_client::cli::Action,
     },
 
+    /// Register this binary as a non-Steam shortcut (Steam Deck Game Mode).
+    SteamShortcut {
+        #[command(subcommand)]
+        action: kuluu::steam_shortcut::cli::Action,
+    },
+
     Provision {
         user: String,
         password: String,
@@ -168,6 +174,9 @@ fn main() -> Result<()> {
     if let Command::FfxiClient { action } = &args.command {
         return kuluu::ffxi_client::cli::run(action).map_err(|e| anyhow::anyhow!(e));
     }
+    if let Command::SteamShortcut { action } = &args.command {
+        return kuluu::steam_shortcut::cli::run(action);
+    }
 
     match kuluu::ffxi_client::export(&kuluu::launcher_store::load().settings) {
         Ok(located) => tracing::info!(
@@ -254,7 +263,9 @@ fn resolve_dat_root(require_dat: bool) -> Result<Option<std::sync::Arc<ffxi_dat:
 
 async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<()> {
     match args.command {
-        Command::FfxiClient { .. } => unreachable!("handled before the runtime starts"),
+        Command::FfxiClient { .. } | Command::SteamShortcut { .. } => {
+            unreachable!("handled before the runtime starts")
+        }
         Command::Provision { user, password } => {
             auth.ensure_account(&user, &password)
                 .await
