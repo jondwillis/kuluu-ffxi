@@ -91,6 +91,9 @@
 //! ```
 
 #![warn(missing_docs)]
+// Upstream style predates this lint; the vendored copy only adds streaming
+// folder reads (see the workspace Cargo.toml patch note).
+#![allow(mismatched_lifetime_syntaxes)]
 
 pub use lzxd::WindowSize;
 

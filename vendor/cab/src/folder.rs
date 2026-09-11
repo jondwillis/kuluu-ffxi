@@ -121,6 +121,8 @@ impl<'a, R: Read + Seek> FolderReader<'a, R> {
         Ok(folder_reader)
     }
 
+    /// Position the reader at `new_offset` bytes into the folder's
+    /// uncompressed stream, decoding forward as needed.
     pub fn seek_to_uncompressed_offset(
         &mut self,
         new_offset: u64,

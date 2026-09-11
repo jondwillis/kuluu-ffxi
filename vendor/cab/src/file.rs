@@ -71,10 +71,12 @@ impl FileEntry {
         self.uncompressed_offset
     }
 
+    /// Index of the folder this file is stored in.
     pub fn folder_index(&self) -> u16 {
         self.folder_index
     }
 
+    /// Size of the file once decompressed.
     pub fn uncompressed_size(&self) -> u32 {
         self.uncompressed_size
     }

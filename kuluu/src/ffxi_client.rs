@@ -185,7 +185,7 @@ fn env_string(var: &str) -> Option<String> {
 /// `FFXI_DAT_PATH` as the shell handed it to us, captured before [`export`]
 /// writes the settled choice back into the environment, so a later resolve
 /// (settings saved mid-session) still sees the user's value, not our own.
-fn shell_dat_path() -> Option<&'static str> {
+pub fn shell_dat_path() -> Option<&'static str> {
     static SHELL: OnceLock<Option<String>> = OnceLock::new();
     SHELL.get_or_init(|| env_string(DAT_PATH_ENV)).as_deref()
 }

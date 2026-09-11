@@ -5,6 +5,7 @@ mod char_create;
 mod char_create_preview;
 pub(crate) mod char_list;
 mod char_preview;
+mod client_job;
 mod common;
 mod dat_setup;
 mod footer;
@@ -553,6 +554,11 @@ pub(crate) struct CliOverridesPresent;
 #[derive(Resource)]
 pub(crate) struct DatGateDone;
 
+/// Where the install screen returns to; `None` means it is the startup gate
+/// and continues to Login.
+#[derive(Resource, Default)]
+pub(crate) struct DatSetupReturn(pub Option<LauncherState>);
+
 #[derive(Component)]
 pub(crate) struct LauncherCamera;
 
@@ -600,6 +606,7 @@ pub(crate) fn register(
         .insert_resource(settings::SettingsUiDirty::default())
         .insert_resource(dat_setup::DatSetupForm::default())
         .insert_resource(dat_setup::DatSetupUiDirty::default())
+        .insert_resource(DatSetupReturn::default())
         .insert_resource(ChangePasswordForm::default())
         .insert_resource(DefaultCharName(defaults.char_name));
 
@@ -689,8 +696,10 @@ pub(crate) fn register(
         Update,
         (
             dat_setup::keyboard_input_system,
+            client_job::poll_system,
             dat_setup::rebuild_ui_system,
         )
+            .chain()
             .run_if(in_state(LauncherState::DatSetup)),
     );
 

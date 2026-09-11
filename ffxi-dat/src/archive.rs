@@ -36,7 +36,10 @@ fn is_install(dir: &Path) -> bool {
 /// resolved from this crate's manifest dir is the fallback (absent in a
 /// shipped binary, which is why cwd is still tried first).
 fn workspace_bases() -> Vec<PathBuf> {
-    let mut bases = vec![PathBuf::new()];
+    let mut bases = Vec::new();
+    if let Ok(cwd) = env::current_dir() {
+        bases.push(cwd);
+    }
     if let Some(root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
         bases.push(root.to_path_buf());
     }

@@ -30,6 +30,8 @@ const MSI_DIRS: [&str; 2] = ["PlayOnline", "FINAL_FANTASY_XI"];
 /// above it (`Program Files`, `PlayOnline`) is the installer's choice, not
 /// the client's layout.
 const SQUARE_ENIX_DIR: &str = "SquareEnix";
+/// The game directory the MSI Directory table places under `SquareEnix/`.
+const FFXI_DIR: &str = "FINAL FANTASY XI";
 const STAGING_DIR: &str = ".staging";
 const MSI_TABLE_FILE: &str = "File";
 const MSI_TABLE_COMPONENT: &str = "Component";
@@ -561,12 +563,34 @@ pub struct Plan<'a> {
     pub target_root: &'a Path,
 }
 
+/// The base image ships no `patch.cfg`; one under the DAT root means the
+/// patch client has been through this target. Unpacking the installer over
+/// it would revert every file the installer ships to 2019 while `patch.cfg`
+/// kept claiming the newer version, and `update::run`'s stamp fast path would
+/// then trust it.
+pub fn refuse_patched_target(target_root: &Path) -> Result<(), String> {
+    let manifest = target_root
+        .join(SQUARE_ENIX_DIR)
+        .join(FFXI_DIR)
+        .join(manifest::MANIFEST_FILE);
+    if manifest.exists() {
+        return Err(format!(
+            "{} already holds a patched install ({} present); refusing to unpack the base \
+             image over it. Use a different name, or update it instead.",
+            target_root.display(),
+            manifest::MANIFEST_FILE
+        ));
+    }
+    Ok(())
+}
+
 pub fn download_and_unpack(plan: &Plan, report: &Reporter) -> Result<(), String> {
     let Plan {
         region,
         installer_dir,
         target_root,
     } = plan;
+    refuse_patched_target(target_root)?;
     fs::create_dir_all(installer_dir).map_err(|e| format!("{}: {e}", installer_dir.display()))?;
     fs::create_dir_all(target_root).map_err(|e| format!("{}: {e}", target_root.display()))?;
     let base = format!("{CDN_BASE}/{}", region.sub);
@@ -759,6 +783,22 @@ pub fn download_and_unpack(plan: &Plan, report: &Reporter) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpack_refuses_a_target_that_was_already_patched() {
+        let dir = std::env::temp_dir().join(format!("ffxi-install-patched-{}", std::process::id()));
+        let root = dir.join(SQUARE_ENIX_DIR).join(FFXI_DIR);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(manifest::MANIFEST_FILE), "end\n").unwrap();
+        let plan = Plan {
+            region: region("us").unwrap(),
+            installer_dir: &dir.join("cache"),
+            target_root: &dir,
+        };
+        let err = download_and_unpack(&plan, &|_| {}).unwrap_err();
+        assert!(err.contains("patched"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn long_name_takes_the_part_after_the_pipe() {

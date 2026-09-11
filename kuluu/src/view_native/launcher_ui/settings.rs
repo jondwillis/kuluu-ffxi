@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::launcher_store::{self, EnvOverride, Settings};
 
 use super::common::{hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb};
-use super::{LauncherState, ServerInfo};
+use super::{DatSetupReturn, LauncherState, ServerInfo};
 use crate::view_native::widgets::text_field::text_field;
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
 
@@ -64,6 +64,20 @@ pub(super) fn load_settings_form(mut form: ResMut<SettingsForm>) {
     form.mac = s.mac.value;
     form.mac_override = s.mac.override_env;
     form.feedback = None;
+}
+
+/// What the client will load and why, from the same resolver the CLI's
+/// `ffxi-client which` uses.
+fn in_effect_line() -> String {
+    match crate::ffxi_client::resolve(&launcher_store::load().settings) {
+        Ok(l) => format!(
+            "In effect: {} ({}) - via {}",
+            l.path.display(),
+            crate::ffxi_client::describe(&l.path),
+            l.source
+        ),
+        Err(u) => format!("No install will load: {u}"),
+    }
 }
 
 fn current_effective(var: &str) -> String {
@@ -124,6 +138,22 @@ fn build_ui(commands: &mut Commands, form: &SettingsForm, server: &ServerInfo) {
                     dat_ov,
                     true,
                 );
+                panel.spawn(hint(in_effect_line()));
+                panel.spawn(row()).with_children(|r| {
+                    r.spawn(button_bundle(
+                        ButtonBundleProps::default(),
+                        (),
+                        Spawn((Text::new("Installs..."), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>,
+                         mut ret: ResMut<DatSetupReturn>,
+                         mut next: ResMut<NextState<LauncherState>>| {
+                            ret.0 = Some(LauncherState::Settings);
+                            next.set(LauncherState::DatSetup);
+                        },
+                    );
+                });
                 spawn_path_field(
                     panel,
                     "Navmesh dir",
